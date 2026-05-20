@@ -33,28 +33,27 @@ test('findTriggerAt ignores trigger after a newline boundary between caret and t
     assert.equal(result, null);
 });
 
-test('extractMentionTokenAt returns the selected mention before trailing space', () => {
-    assert.equal(extractMentionTokenAt('@open-interpreter ', 18), '@open-interpreter');
+test('extractMentionTokenAt returns file mentions and ignores provider-looking tokens', () => {
+    assert.equal(extractMentionTokenAt('@open-interpreter ', 18), '');
     assert.equal(extractMentionTokenAt('see @file:docs/notes.md ', 24), '@file:docs/notes.md');
 });
 
-test('renderMentionHighlightHtml bolds only recorded mention tokens', () => {
+test('renderMentionHighlightHtml bolds only recorded file mention tokens', () => {
     const html = renderMentionHighlightHtml('ask @open-interpreter about @op', ['@open-interpreter']);
-    assert.match(html, /<strong class="wa-composer-mention">@open-interpreter<\/strong>/);
+    assert.doesNotMatch(html, /<strong class="wa-composer-mention">@open-interpreter<\/strong>/);
     assert.match(html, /about @op$/);
+
+    const fileHtml = renderMentionHighlightHtml('read @file:docs/notes.md', ['@file:docs/notes.md']);
+    assert.match(fileHtml, /<strong class="wa-composer-mention">@file:docs\/notes\.md<\/strong>/);
 });
 
-test('findMentionRanges detects sent-message agent and path mentions', () => {
-    assert.deepEqual(findMentionRanges('ask @open-interpreter hello'), [
-        { start: 4, end: 21, token: '@open-interpreter' },
-    ]);
+test('findMentionRanges detects file mentions and ignores provider-looking tokens', () => {
+    assert.deepEqual(findMentionRanges('ask @open-interpreter hello'), []);
     assert.deepEqual(findMentionRanges('read @file:ploinky/cli/server'), [
         { start: 5, end: 29, token: '@file:ploinky/cli/server' },
     ]);
 });
 
 test('findMentionRanges ignores embedded email-like at signs', () => {
-    assert.deepEqual(findMentionRanges('email user@example.com about @open-interpreter'), [
-        { start: 29, end: 46, token: '@open-interpreter' },
-    ]);
+    assert.deepEqual(findMentionRanges('email user@example.com about @open-interpreter'), []);
 });

@@ -9,7 +9,7 @@ function escapeHtml(value) {
 
 function normalizeToken(token) {
     const value = String(token || '').trim();
-    if (!value.startsWith('@') || value.length < 2 || /\s/.test(value)) return '';
+    if (!value.startsWith('@file:') || value.length <= '@file:'.length || /\s/.test(value)) return '';
     return value;
 }
 
@@ -51,7 +51,7 @@ export function findMentionRanges(value) {
     if (!text) return [];
 
     const ranges = [];
-    const mentionPattern = /@(?:file:[^\s<>()),;:!?]+|[A-Za-z][A-Za-z0-9_-]{0,63})/g;
+    const mentionPattern = /@file:[^\s<>()),;:!?]+/g;
     let match;
     while ((match = mentionPattern.exec(text)) !== null) {
         const token = normalizeToken(match[0]);

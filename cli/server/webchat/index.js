@@ -8,7 +8,6 @@ import { createNetwork } from './network.js';
 import { createUploader } from './upload.js';
 import { createComposerAutocomplete } from './composerAutocomplete.js';
 import { createSlashCommandsProvider } from './autocompleteProviders/slashCommands.js';
-import { createTagCatalogProvider } from './autocompleteProviders/tagCatalog.js';
 import { createWorkspacePathsProvider } from './autocompleteProviders/workspacePaths.js';
 import { createAutocompleteState } from './autocompleteState.js';
 import { createComposerMentionHighlighter } from './composerMentionHighlights.js';
@@ -142,11 +141,6 @@ const slashProvider = createSlashCommandsProvider({
     agentName: dom.agentName,
     dlog
 });
-const tagCatalogProvider = createTagCatalogProvider({
-    agentName: dom.agentName,
-    launchConfig: dom.launchConfig || {},
-    dlog
-});
 const workspacePathsProvider = createWorkspacePathsProvider({
     basePath,
     state: autocompleteState,
@@ -156,7 +150,7 @@ const workspacePathsProvider = createWorkspacePathsProvider({
 const composerAutocomplete = createComposerAutocomplete({
     cmdInput
 }, {
-    providers: [slashProvider, tagCatalogProvider, workspacePathsProvider],
+    providers: [slashProvider, workspacePathsProvider],
     onSelectionApplied: ({ next }) => {
         mentionHighlighter.recordSelection(next?.value || '', next?.cursor ?? 0);
     },

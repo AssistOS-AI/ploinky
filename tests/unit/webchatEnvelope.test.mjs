@@ -13,13 +13,13 @@ import { WORKSPACE_ROOT } from '../../cli/services/config.js';
 
 test('resolveWebchatLaunchOptions forwards agent-owned launch flags unchanged', () => {
     const parsedUrl = new URL(
-        '/webchat?agent=achilles-cli&workspace-dir=projects/demo&feature-tags=1&tag-relay-agent=exampleRelay',
+        '/webchat?agent=achilles-cli&workspace-dir=projects/demo&feature-tags=1&forward-envelope=1',
         'http://localhost'
     );
     const { cliArgs } = resolveWebchatLaunchOptions(parsedUrl);
     assert.ok(cliArgs.includes(`--dir=${path.resolve(WORKSPACE_ROOT, 'projects/demo')}`));
     assert.ok(cliArgs.includes('--feature-tags=1'));
-    assert.ok(cliArgs.includes('--tag-relay-agent=exampleRelay'));
+    assert.ok(cliArgs.includes('--forward-envelope=1'));
     assert.equal(cliArgs.some((arg) => arg.startsWith('--workspace-dir=')), false);
 });
 
