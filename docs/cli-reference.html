@@ -112,7 +112,7 @@ enable repo cloud</code></pre>
                         <pre><code>list repos</code></pre>
 
                         <h3>update</h3>
-                        <p>Update Ploinky-managed repositories and project repositories. The all-repository form first pulls repositories under <code>.ploinky/repos/</code>; if an installed repository is missing direct git metadata but has a known source URL, Ploinky reclones it on the recorded branch through a temporary sibling path and replaces the broken installed directory in place. It then recursively discovers git repositories from the provided folder path, pulls each one, refreshes Achilles default skills in each discovered project repository, and updates each project repository's managed <code>.gitignore</code> block.</p>
+                        <p>Update Ploinky-managed repositories and project repositories. The all-repository form first pulls repositories under <code>.ploinky/repos/</code>; if an installed repository is missing direct git metadata but has a known source URL, Ploinky reclones it on the recorded branch through a temporary sibling path and replaces the broken installed directory in place. It then recursively discovers git repositories from the provided folder path, pulls each one when its remote is reachable, logs and skips project repositories with missing or unreachable remotes, refreshes Achilles default skills in each discovered project repository, and updates each project repository's managed <code>.gitignore</code> block.</p>
                         <pre><code>update [folderPath]
 update all [folderPath]
 update repos [folderPath]

@@ -43,6 +43,12 @@ function logRepoUpdateSuccess(repoName, result, indent = '') {
     console.log(`${indent}✓ ${repoName}`);
 }
 
+function formatWorkspaceRepoSkip(repo, remoteCheck) {
+    const location = remoteCheck?.remoteUrl ? ` (${remoteCheck.remoteUrl})` : '';
+    const reason = remoteCheck?.reason || 'remote unavailable';
+    return `  - ${repo.name}: skipped update, ${reason}${location}`;
+}
+
 function getAgentNames() {
     const summary = collectAgentsSummary();
     if (!summary.length) return [];
@@ -161,6 +167,7 @@ async function updateAllRepos(folderPath, options = {}) {
         .filter(repo => !pathsReferToSameLocation(repo.path, ploinkyRoot));
     const ploinkyRepos = getGitRepoNames();
     const failed = [];
+    const skipped = [];
     let updated = 0;
 
     console.log('Updating Ploinky...');
@@ -212,6 +219,12 @@ async function updateAllRepos(folderPath, options = {}) {
         console.log(`Updating workspace repositories in ${projectsRoot}...`);
         for (const repo of workspaceRepos) {
             try {
+                const remoteCheck = reposSvc.checkGitRemoteReachable(repo.path);
+                if (!remoteCheck.reachable) {
+                    skipped.push({ repoName: repo.name, ...remoteCheck });
+                    console.warn(formatWorkspaceRepoSkip(repo, remoteCheck));
+                    continue;
+                }
                 reposSvc.pullGitRepo(repo.path);
                 console.log(`  ✓ ${repo.name}`);
                 updated += 1;
@@ -255,6 +268,10 @@ async function updateAllRepos(folderPath, options = {}) {
 
     const totalRepos = 1 + ploinkyRepos.length + workspaceRepos.length;
     console.log(`Update summary: ${updated}/${totalRepos} repositories updated.`);
+    if (skipped.length) {
+        const skippedNames = skipped.map(entry => entry.repoName).join(', ');
+        console.log(`Workspace repository update skipped: ${skippedNames}`);
+    }
     if (achilles.total) {
         console.log(`Achilles dependency summary: ${achilles.refreshed.length}/${achilles.total} package(s) refreshed.`);
     }
@@ -264,7 +281,7 @@ async function updateAllRepos(folderPath, options = {}) {
         throw new Error(`Failed to update ${failed.length} repository(s): ${failedNames}`);
     }
 
-    return { total: totalRepos, updated, failed, selfUpdate, achilles };
+    return { total: totalRepos, updated, failed, skipped, selfUpdate, achilles };
 }
 
 function pathsReferToSameLocation(first, second) {

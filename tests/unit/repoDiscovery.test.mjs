@@ -8,6 +8,7 @@ import { execFileSync } from 'child_process';
 import {
     REPO_SOURCES_FILE,
     addRepo,
+    checkGitRemoteReachable,
     findWorkspaceGitRepos,
     isGitRepository,
     resolveRepoSource,
@@ -77,6 +78,57 @@ test('isGitRepository detects only directories with git metadata', () => {
         assert.equal(isGitRepository(gitRepo), true);
         assert.equal(isGitRepository(plainDir), false);
         assert.equal(isGitRepository(path.join(root, 'missing')), false);
+    } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+    }
+});
+
+test('checkGitRemoteReachable accepts an accessible origin remote', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-remote-check-'));
+    try {
+        const remote = path.join(root, 'remote.git');
+        const repo = path.join(root, 'repo');
+        execFileSync('git', ['init', '--bare', '-q', remote], { stdio: 'ignore' });
+        mkdir(repo);
+        execFileSync('git', ['init', '-q'], { cwd: repo, stdio: 'ignore' });
+        execFileSync('git', ['remote', 'add', 'origin', remote], { cwd: repo, stdio: 'ignore' });
+
+        const result = checkGitRemoteReachable(repo);
+
+        assert.equal(result.reachable, true);
+        assert.equal(result.skipped, false);
+        assert.equal(result.remote, 'origin');
+        assert.equal(result.remoteUrl, remote);
+    } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+    }
+});
+
+test('checkGitRemoteReachable reports missing or unreachable origin remotes without throwing', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-remote-missing-'));
+    try {
+        const missingRemoteRepo = path.join(root, 'missing-remote');
+        mkdir(missingRemoteRepo);
+        execFileSync('git', ['init', '-q'], { cwd: missingRemoteRepo, stdio: 'ignore' });
+
+        const missingRemote = checkGitRemoteReachable(missingRemoteRepo);
+
+        assert.equal(missingRemote.reachable, false);
+        assert.equal(missingRemote.skipped, true);
+        assert.equal(missingRemote.reason, 'missing origin remote');
+
+        const unreachableRemoteRepo = path.join(root, 'unreachable-remote');
+        const missingRemotePath = path.join(root, 'does-not-exist.git');
+        mkdir(unreachableRemoteRepo);
+        execFileSync('git', ['init', '-q'], { cwd: unreachableRemoteRepo, stdio: 'ignore' });
+        execFileSync('git', ['remote', 'add', 'origin', missingRemotePath], { cwd: unreachableRemoteRepo, stdio: 'ignore' });
+
+        const unreachableRemote = checkGitRemoteReachable(unreachableRemoteRepo);
+
+        assert.equal(unreachableRemote.reachable, false);
+        assert.equal(unreachableRemote.skipped, true);
+        assert.equal(unreachableRemote.reason, 'remote not reachable');
+        assert.equal(unreachableRemote.remoteUrl, missingRemotePath);
     } finally {
         fs.rmSync(root, { recursive: true, force: true });
     }

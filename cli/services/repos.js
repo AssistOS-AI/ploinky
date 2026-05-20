@@ -338,6 +338,12 @@ function recloneNonGitRepo(name, repoPath, url, { branch = null, stdio = 'inheri
     return { recloned: true, replaced: true };
 }
 
+function gitCommandErrorMessage(err) {
+    const stderr = err?.stderr ? String(err.stderr).trim() : '';
+    if (stderr) return stderr;
+    return err?.message || String(err);
+}
+
 export function updateRepo(name, { rebase = true, autostash = true, stdio = 'inherit' } = {}) {
     if (!name) throw new Error('Missing repository name.');
     const REPOS_DIR = ensureReposDir();
@@ -407,10 +413,50 @@ export function findWorkspaceGitRepos(workspaceRoot) {
     return repos;
 }
 
-export function pullGitRepo(repoPath, { rebase = true, autostash = true } = {}) {
+export function checkGitRemoteReachable(repoPath, { remote = 'origin' } = {}) {
+    const remoteName = String(remote || 'origin').trim() || 'origin';
+    let remoteUrl = '';
+
+    try {
+        remoteUrl = String(execFileSync('git', ['-C', repoPath, 'remote', 'get-url', remoteName], {
+            stdio: ['ignore', 'pipe', 'pipe'],
+        }) || '').trim();
+    } catch (err) {
+        return {
+            reachable: false,
+            skipped: true,
+            reason: `missing ${remoteName} remote`,
+            remote: remoteName,
+            message: gitCommandErrorMessage(err),
+        };
+    }
+
+    try {
+        execFileSync('git', ['-C', repoPath, 'ls-remote', '--quiet', remoteName], {
+            stdio: ['ignore', 'ignore', 'pipe'],
+        });
+        return {
+            reachable: true,
+            skipped: false,
+            remote: remoteName,
+            remoteUrl,
+        };
+    } catch (err) {
+        return {
+            reachable: false,
+            skipped: true,
+            reason: 'remote not reachable',
+            remote: remoteName,
+            remoteUrl,
+            message: gitCommandErrorMessage(err),
+        };
+    }
+}
+
+export function pullGitRepo(repoPath, { rebase = true, autostash = true, stdio = 'inherit' } = {}) {
     const args = ['-C', repoPath, 'pull'];
     if (rebase) args.push('--rebase');
     if (autostash) args.push('--autostash');
-    execFileSync('git', args, { stdio: 'inherit' });
+    execFileSync('git', args, { stdio });
     return true;
 }

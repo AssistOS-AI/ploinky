@@ -12,7 +12,7 @@ Ploinky is a workspace-local runtime for repository-backed agents.
 ## Common CLI commands
 
 - `ploinky add repo <name> [url] [branch]`: clone a repository into `.ploinky/repos/`.
-- `ploinky update [folderPath]` and `ploinky update all [folderPath]`: update `.ploinky/repos/`, repairing non-git installed repo directories by recloning on the recorded branch when a source URL is known, recursively update discovered git repositories, and refresh Achilles default skills in those project repositories. When no folder path is provided, discovery starts at the current working directory.
+- `ploinky update [folderPath]` and `ploinky update all [folderPath]`: update `.ploinky/repos/`, repairing non-git installed repo directories by recloning on the recorded branch when a source URL is known, recursively update discovered git repositories, and refresh Achilles default skills in those project repositories. Discovered project repositories with missing or unreachable remotes are logged and skipped for the pull step while still receiving default skills. When no folder path is provided, discovery starts at the current working directory.
 - `ploinky update repo <name>`: update one repository under `.ploinky/repos/`.
 - `ploinky enable repo <name> [branch]`: enable a repository for discovery and listings.
 - `ploinky enable agent <name|repo/name> [global|devel [repo]] [--auth none|pwd|sso] [as <alias>]`: register an agent in `.ploinky/agents.json`.
