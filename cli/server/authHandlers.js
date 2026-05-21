@@ -597,7 +597,8 @@ function resolveAuthRouteKey(parsedUrl) {
 
 function resolveAuthContext(parsedUrl) {
     const pathname = parsedUrl?.pathname || '';
-    const serviceRoute = resolveHttpServiceRoute(pathname, readRouting());
+    const routing = readRouting();
+    const serviceRoute = resolveHttpServiceRoute(pathname, routing);
     if (serviceRoute) {
         if (serviceRoute.authMode === 'none') {
             return { routeKey: serviceRoute.routeKey, mode: 'none', policy: { mode: 'none' }, record: null };
@@ -614,7 +615,27 @@ function resolveAuthContext(parsedUrl) {
                 record: null
             };
         }
-        return resolveAuthContextForRouteKey(serviceRoute.routeKey);
+        const ownerContext = resolveAuthContextForRouteKey(serviceRoute.routeKey);
+        if (ownerContext.mode !== 'none') {
+            return ownerContext;
+        }
+        const staticRouteKey = String(routing.static?.agent || '').trim();
+        if (staticRouteKey && staticRouteKey !== serviceRoute.routeKey) {
+            const staticContext = resolveAuthContextForRouteKey(staticRouteKey);
+            if (staticContext.mode !== 'none') {
+                return {
+                    ...staticContext,
+                    serviceRouteKey: serviceRoute.routeKey
+                };
+            }
+        }
+        return {
+            routeKey: serviceRoute.routeKey,
+            mode: 'protected-unconfigured',
+            policy: { mode: 'protected-unconfigured' },
+            record: ownerContext.record || null,
+            error: 'protected_http_service_auth_not_configured'
+        };
     }
     const routeKey = resolveAuthRouteKey(parsedUrl);
     if (!routeKey) {
@@ -837,6 +858,14 @@ export async function ensureAgentAuthenticated(req, res, parsedUrl) {
 
 export async function ensureAuthenticated(req, res, parsedUrl) {
     const authContext = resolveAuthContext(parsedUrl);
+    if (authContext.error === 'protected_http_service_auth_not_configured') {
+        sendJson(res, 503, {
+            ok: false,
+            error: authContext.error,
+            detail: 'Protected HTTP service routes require an authenticated route or static-agent auth policy.'
+        });
+        return { ok: false, error: authContext.error };
+    }
     if (authContext.mode === 'none') {
         return { ok: true };
     }

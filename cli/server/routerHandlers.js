@@ -93,7 +93,7 @@ export function proxyMcpPassthrough(req, res, targetPort, agentPath) {
 export function proxyHttpPassthrough(req, res, targetPort, agentPath, extraHeaders = {}) {
     const pathWithLeadingSlash = agentPath.startsWith('/') ? agentPath : `/${agentPath}`;
     const headers = {
-        ...req.headers,
+        ...stripCallerRouterIdentityHeaders(req.headers),
         ...extraHeaders,
         host: `127.0.0.1:${targetPort}`
     };
@@ -121,6 +121,25 @@ export function proxyHttpPassthrough(req, res, targetPort, agentPath, extraHeade
     });
 
     req.pipe(upstream, { end: true });
+}
+
+const ROUTER_IDENTITY_HEADERS = new Set([
+    'x-ploinky-auth-info',
+    'x-ploinky-user-id',
+    'x-ploinky-user',
+    'x-ploinky-user-email',
+    'x-ploinky-user-roles',
+    'x-ploinky-session-id',
+    'x-ploinky-caller-jwt'
+]);
+
+function stripCallerRouterIdentityHeaders(headers = {}) {
+    const sanitized = {};
+    for (const [name, value] of Object.entries(headers || {})) {
+        if (ROUTER_IDENTITY_HEADERS.has(String(name || '').toLowerCase())) continue;
+        sanitized[name] = value;
+    }
+    return sanitized;
 }
 
 export function buildPlainAuthInfoHeader(req, invocation = null) {
@@ -161,6 +180,11 @@ export function handleHttpServiceRoute(req, res, parsedUrl, apiRoutes = loadApiR
         res.end(JSON.stringify({ error: definition.notFoundMessage }));
         return true;
     }
+    if (definition.authMode !== 'none' && (!req.user || typeof req.user !== 'object')) {
+        sendJson(res, 401, { ok: false, error: 'not_authenticated' });
+        return true;
+    }
+    req.headers = stripCallerRouterIdentityHeaders(req.headers);
 
     const serviceAgentRef = route.repo && route.agent
         ? `${route.repo}/${route.agent}`

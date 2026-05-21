@@ -5,6 +5,7 @@ import path from 'node:path';
 import {
     flushPendingSseEvents,
     resolveWebchatLaunchOptions,
+    resolveRequestPublicOrigin,
     resolveWorkspaceScopedQueryPath,
     serializeWebchatEnvelopeForAgent,
     writeOrBufferSseEvent
@@ -30,7 +31,7 @@ test('resolveWorkspaceScopedQueryPath rejects absolute and escaping launch paths
 
 test('serializeWebchatEnvelopeForAgent does not name a concrete downstream agent', () => {
     const text = serializeWebchatEnvelopeForAgent({
-        req: {},
+        req: { headers: { host: '127.0.0.1:8080' } },
         effectiveConfig: { agentName: '' },
         tabId: 'tab-1',
         envelope: {
@@ -49,8 +50,35 @@ test('serializeWebchatEnvelopeForAgent does not name a concrete downstream agent
         downloadUrl: null,
         localPath: 'shared/blob-1'
     }]);
+    assert.deepEqual(payload.origin, { publicBaseUrl: 'http://127.0.0.1:8080' });
     assert.equal(payload.invocation, undefined);
     assert.doesNotMatch(text, /concreteDownstreamAgent|concrete_downstream_tool/);
+});
+
+test('serializeWebchatEnvelopeForAgent prefers forwarded public origin headers', () => {
+    const text = serializeWebchatEnvelopeForAgent({
+        req: {
+            headers: {
+                host: 'host.containers.internal:8080',
+                'x-forwarded-host': 'workspace.example.test',
+                'x-forwarded-proto': 'https',
+            }
+        },
+        effectiveConfig: { agentName: '' },
+        tabId: 'tab-1',
+        envelope: { text: 'hello', attachments: [] }
+    });
+    const payload = JSON.parse(text);
+    assert.deepEqual(payload.origin, { publicBaseUrl: 'https://workspace.example.test' });
+});
+
+test('resolveRequestPublicOrigin rejects malformed public origin input', () => {
+    assert.equal(resolveRequestPublicOrigin({
+        headers: {
+            host: '127.0.0.1:8080/path',
+            'x-forwarded-proto': 'javascript',
+        }
+    }), '');
 });
 
 test('writeOrBufferSseEvent buffers disconnected WebChat output and flushes on reconnect', () => {

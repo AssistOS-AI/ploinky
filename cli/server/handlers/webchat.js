@@ -206,14 +206,47 @@ function buildWebchatInvocationToken({ req, effectiveConfig, tabId, envelope }) 
     }
 }
 
+function firstHeaderValue(value) {
+    const raw = Array.isArray(value) ? value[0] : value;
+    return String(raw || '').split(',')[0].trim();
+}
+
+function resolveRequestPublicOrigin(req) {
+    const headers = req?.headers || {};
+    const proto = firstHeaderValue(headers['x-forwarded-proto'])
+        || (req?.socket?.encrypted ? 'https' : 'http');
+    const host = firstHeaderValue(headers['x-forwarded-host'])
+        || firstHeaderValue(headers.host);
+    const normalizedProto = String(proto || '').toLowerCase().replace(/:$/, '');
+    if (!/^(http|https)$/.test(normalizedProto) || !host) {
+        return '';
+    }
+    if (/[\r\n/?#\\]/.test(host)) {
+        return '';
+    }
+    try {
+        const parsed = new URL(`${normalizedProto}://${host}`);
+        if (!parsed.hostname) {
+            return '';
+        }
+        return parsed.origin;
+    } catch (_) {
+        return '';
+    }
+}
+
 function serializeWebchatEnvelopeForAgent({ req, effectiveConfig, tabId, envelope, fallbackText = '' }) {
     const sanitizedReferences = sanitizeWebchatReferencesForEnvelope(envelope?.references);
+    const publicBaseUrl = resolveRequestPublicOrigin(req);
     const payload = {
         __webchatMessage: 1,
         version: 1,
         text: (envelope && typeof envelope.text === 'string') ? envelope.text : String(fallbackText || ''),
         attachments: sanitizeWebchatAttachmentsForEnvelope(envelope?.attachments)
     };
+    if (publicBaseUrl) {
+        payload.origin = { publicBaseUrl };
+    }
     if (sanitizedReferences.length) {
         payload.references = sanitizedReferences;
     }
@@ -1571,6 +1604,7 @@ async function handleWebChat(req, res, appConfig, appState) {
 export {
     handleWebChat,
     resolveWebchatLaunchOptions,
+    resolveRequestPublicOrigin,
     serializeWebchatEnvelopeForAgent,
     resolveWorkspaceScopedQueryPath,
     sanitizeWebchatReferencesForEnvelope,
