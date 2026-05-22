@@ -67,6 +67,7 @@ function createAgentClient(baseUrl, options = {}) {
   }
 
   async function close() {
+    try { if (transport?.terminateSession) await transport.terminateSession(); } catch (_) {}
     try { if (client) await client.close(); } catch (_) {}
     try { if (transport) await transport.close?.(); } catch (_) {}
     connected = false; client = null; transport = null;

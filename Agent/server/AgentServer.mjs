@@ -638,8 +638,45 @@ async function main() {
     taskQueue.initialize();
     const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 7000;
     const sessions = {};
+    const parsePositiveInt = (value, fallback) => {
+        const parsed = Number.parseInt(String(value || ''), 10);
+        return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+    };
 
-    const serverHttp = http.createServer((req, res) => {
+    // Idle-session GC: MCP clients that initialize but never send DELETE leak
+    // their full McpServer (plus per-tool zod schemas and closures). Sweep
+    // periodically and close idle transports; the SDK-wrapped onclose then
+    // removes the dict entry and lets V8 collect the rest.
+    const SESSION_IDLE_TIMEOUT_MS = parsePositiveInt(process.env.MCP_SESSION_IDLE_TIMEOUT_MS, 5 * 60 * 1000);
+    const SESSION_GC_INTERVAL_MS = parsePositiveInt(process.env.MCP_SESSION_GC_INTERVAL_MS, 60 * 1000);
+    const sessionGcTimer = setInterval(() => {
+        const now = Date.now();
+        for (const sid of Object.keys(sessions)) {
+            const entry = sessions[sid];
+            if (entry?.transport && entry.activeRequests === 0 && entry.lastAccess && now - entry.lastAccess > SESSION_IDLE_TIMEOUT_MS) {
+                Promise.resolve(entry.transport.close()).catch(() => {});
+            }
+        }
+    }, SESSION_GC_INTERVAL_MS);
+    sessionGcTimer.unref?.();
+
+    const markSessionRequestActive = (entry, res) => {
+        if (!entry) return () => {};
+        entry.activeRequests = (entry.activeRequests || 0) + 1;
+        entry.lastAccess = Date.now();
+        let finished = false;
+        const finish = () => {
+            if (finished) return;
+            finished = true;
+            entry.activeRequests = Math.max(0, (entry.activeRequests || 0) - 1);
+            entry.lastAccess = Date.now();
+        };
+        res.once('finish', finish);
+        res.once('close', finish);
+        return finish;
+    };
+
+    const serverHttp = http.createServer(async (req, res) => {
         const { method, url } = req;
         const sendJson = (code, obj, extraHeaders = {}) => {
             const data = Buffer.from(JSON.stringify(obj));
@@ -673,6 +710,24 @@ async function main() {
                 }
                 return sendJson(200, { task });
             }
+            if ((method === 'GET' || method === 'DELETE') && u.pathname === '/mcp') {
+                const sessionId = req.headers['mcp-session-id'];
+                const entry = sessionId && sessions[sessionId] ? sessions[sessionId] : null;
+                if (!entry?.transport) {
+                    const status = sessionId ? 404 : 400;
+                    const message = sessionId ? 'Session not found' : 'Bad Request: Mcp-Session-Id header is required';
+                    const code = sessionId ? -32001 : -32000;
+                    return sendJson(status, { jsonrpc: '2.0', error: { code, message }, id: null });
+                }
+                markSessionRequestActive(entry, res);
+                try {
+                    await entry.transport.handleRequest(req, res);
+                } catch (err) {
+                    console.error('[AgentServer/MCP] error:', err);
+                    if (!res.headersSent) return sendJson(500, { jsonrpc: '2.0', error: { code: -32603, message: 'Internal server error' }, id: null });
+                }
+                return;
+            }
             if (method === 'POST' && u.pathname === '/mcp') {
                 const chunks = [];
                 req.on('data', c => chunks.push(c));
@@ -686,21 +741,34 @@ async function main() {
                             if (!isInitializeRequest(body)) {
                                 return sendJson(400, { jsonrpc: '2.0', error: { code: -32000, message: 'Missing session; send initialize first' }, id: null });
                             }
+                            // Build the per-session record outside the transport closures so
+                            // its `server` field is the *only* strong reference to the McpServer.
+                            // Deleting sessions[sid] is then sufficient for V8 to collect the
+                            // McpServer + per-tool zod schemas + closures.
+                            const sessionRecord = { transport: null, server: null, lastAccess: Date.now(), activeRequests: 0 };
                             const transport = new StreamableHTTPServerTransport({
                                 sessionIdGenerator: () => randomUUID(),
                                 enableJsonResponse: true,
-                                onsessioninitialized: (sid) => { sessions[sid] = { transport, server }; }
+                                onsessioninitialized: (sid) => { sessions[sid] = sessionRecord; }
                             });
-                            const server = await createServerInstance();
-                            await server.connect(transport);
+                            // Set onclose BEFORE server.connect so the SDK wraps (not overwrites)
+                            // our handler. Protocol._onclose() must run to clear
+                            // _responseHandlers, _progressHandlers, and null _transport.
                             transport.onclose = () => {
-                                try { server.close(); } catch (_) {}
                                 const sid = transport.sessionId;
                                 if (sid && sessions[sid]) delete sessions[sid];
+                                sessionRecord.transport = null;
+                                sessionRecord.server = null;
                             };
+                            sessionRecord.transport = transport;
+                            const server = await createServerInstance();
+                            sessionRecord.server = server;
+                            await server.connect(transport);
+                            markSessionRequestActive(sessionRecord, res);
                             await transport.handleRequest(req, res, body);
                             return; // handled
                         }
+                        markSessionRequestActive(entry, res);
                         await entry.transport.handleRequest(req, res, body);
                     } catch (err) {
                         console.error('[AgentServer/MCP] error:', err);
