@@ -89,7 +89,7 @@
       "args": ["/code/openai-chat.js"],
       "supportsStream": true
     },
-    "capabilities": {                // Optional agent capability metadata
+    "capabilities": {                // Optional open-ended capability metadata
       "tags": ["fast", "coding"],
       "summary": "Short agent summary",
       "whenToUse": "Use for quick code-focused requests.",
@@ -203,7 +203,7 @@
                             <tr>
                                 <td><code>endpoints</code></td>
                                 <td>No</td>
-                                <td>Endpoint configuration for <code>/v1/chat/completions</code> and <code>/capabilities</code>, including <code>chatCompletions</code> command specs and <code>capabilities</code> metadata.</td>
+                                <td>Endpoint configuration for <code>/v1/chat/completions</code> and <code>/capabilities</code>, including <code>chatCompletions</code> command specs and open-ended <code>capabilities</code> metadata. RoutingServer also aggregates agent capability responses at <code>/capabilities</code> without enforcing a fixed metadata schema.</td>
                             </tr>
                             <tr>
                                 <td><code>env</code></td>

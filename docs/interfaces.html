@@ -81,6 +81,8 @@
         <section class="chapter-section">
           <h2>Capabilities and Secure Delegation</h2>
           <p>Ploinky reads installed manifests into a small agent index for route names, principals, runtime resources, and SSO-provider markers. Provider-specific domain authorization lives in the target agent.</p>
+          <p>The router exposes capability discovery at <code>/capabilities</code> and <code>/capabilities/&lt;agent&gt;</code>. The aggregate endpoint queries each active route's agent-side <code>/capabilities</code> endpoint and returns successful responses without requiring a fixed metadata schema; per-agent failures are reported separately. Agent metadata can include tags, summaries, input conventions, schemas, or any other JSON fields useful to an orchestration layer.</p>
+          <p>OpenAI-compatible agent calls are routed through <code>/v1/chat/completions/&lt;agent&gt;</code>. The request body controls response mode: <code>stream: true</code> preserves the agent's SSE stream, while an absent or false stream flag returns the normal JSON completion response.</p>
           <p>For delegated tool calls, the router signs short-lived invocation tokens with <code>PLOINKY_DERIVED_MASTER_KEY</code>, forwards user claims when needed, and requires agents to verify the target audience, tool, body hash, expiry, and replay id.</p>
         </section>
 

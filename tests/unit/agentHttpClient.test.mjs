@@ -4,6 +4,7 @@ import http from 'node:http';
 
 import {
     createAgentHttpClient,
+    getCapabilitiesUrl,
     getAgentCapabilitiesUrl,
     getAgentChatCompletionsUrl,
     getRouterUrl
@@ -44,12 +45,24 @@ test('AgentHttpClient resolves router and agent endpoint URLs', () => {
         getAgentCapabilitiesUrl('openaiAgent', { routerUrl: 'http://127.0.0.1:8080/' }),
         'http://127.0.0.1:8080/capabilities/openaiAgent'
     );
+    assert.equal(
+        getCapabilitiesUrl({ routerUrl: 'http://127.0.0.1:8080/' }),
+        'http://127.0.0.1:8080/capabilities'
+    );
 });
 
 test('AgentHttpClient calls router capabilities and chat completions endpoints', async () => {
     const seen = [];
     const server = http.createServer(async (req, res) => {
         seen.push({ method: req.method, url: req.url, auth: req.headers['x-test-auth'] || '' });
+        if (req.method === 'GET' && req.url === '/capabilities') {
+            res.writeHead(200, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({
+                agents: [{ name: 'openaiAgent', payload: { anyShape: { ok: true } } }],
+                errors: []
+            }));
+            return;
+        }
         if (req.method === 'GET' && req.url === '/capabilities/openaiAgent') {
             res.writeHead(200, { 'content-type': 'application/json' });
             res.end(JSON.stringify({ agent: 'openaiAgent', capabilities: { tags: ['fast'] } }));
@@ -75,6 +88,10 @@ test('AgentHttpClient calls router capabilities and chat completions endpoints',
             routerUrl: `http://127.0.0.1:${port}`,
             requestHeaders: { 'x-test-auth': 'router-issued' }
         });
+        const aggregate = await client.capabilities();
+        assert.equal(aggregate.agents[0].name, 'openaiAgent');
+        assert.deepEqual(aggregate.agents[0].payload.anyShape, { ok: true });
+
         const capabilities = await client.capabilities('openaiAgent');
         assert.deepEqual(capabilities.capabilities.tags, ['fast']);
 
@@ -89,6 +106,7 @@ test('AgentHttpClient calls router capabilities and chat completions endpoints',
     }
 
     assert.deepEqual(seen.map(entry => entry.url), [
+        '/capabilities',
         '/capabilities/openaiAgent',
         '/v1/chat/completions/openaiAgent'
     ]);

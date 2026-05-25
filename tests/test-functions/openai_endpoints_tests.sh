@@ -65,15 +65,19 @@ const agentLibDir = process.env.PLOINKY_AGENT_LIB_DIR || '/Agent';
 const { createAgentHttpClient } = await import(`${agentLibDir}/client/AgentHttpClient.mjs`);
 
 const client = createAgentHttpClient();
-const response = await client.capabilities(process.env.TEST_OPENAI_AGENT_NAME);
+const response = await client.capabilities();
 process.stdout.write(JSON.stringify(response));
 NODE
   )
-  if ! echo "$output" | jq -e '.capabilities.tags | index("fast")' >/dev/null; then
+  if ! echo "$output" | jq -e --arg agent "$TEST_OPENAI_AGENT_NAME" '.agents | map(select(.name == $agent)) | length == 1' >/dev/null; then
+    echo "Capabilities missing expected agent: $output" >&2
+    return 1
+  fi
+  if ! echo "$output" | jq -e --arg agent "$TEST_OPENAI_AGENT_NAME" '.agents[] | select(.name == $agent) | .payload.capabilities.tags | index("fast")' >/dev/null; then
     echo "Capabilities missing expected tags: $output" >&2
     return 1
   fi
-  if ! echo "$output" | jq -e '.capabilities.summary | length > 0' >/dev/null; then
+  if ! echo "$output" | jq -e --arg agent "$TEST_OPENAI_AGENT_NAME" '.agents[] | select(.name == $agent) | .payload.capabilities.summary | length > 0' >/dev/null; then
     echo "Capabilities missing summary: $output" >&2
     return 1
   fi

@@ -56,6 +56,9 @@ The router must also expose:
 - `/health` for health status.
 - `/upload` and `/blobs` for workspace and agent blob flows.
 - `/webchat/uploads` for WebChat session-scoped file storage and download under `<cwd>/uploads/<sessionId>`.
+- `/capabilities` for aggregate discovery of routable agents that expose capability metadata. The router must query each active route's internal `/capabilities` endpoint, include successful responses without validating their field shape, and report per-agent errors separately.
+- `/capabilities/<agent>` for direct proxy access to one agent's capability metadata.
+- `/v1/chat/completions/<agent>` for OpenAI-compatible chat-completions requests routed to one agent. The request body controls normal JSON versus SSE streaming through its `stream` field.
 - `/mcp` for router-level MCP aggregation.
 - `/mcps/<agent>/mcp` and `/mcp/<agent>/mcp` for agent MCP proxying.
 - `/mcps/<agent>/task` for task-status passthrough.
