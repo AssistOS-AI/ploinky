@@ -48,6 +48,8 @@ Ploinky is a workspace-local runtime for repository-backed agents.
 - Local auth stores hashed credentials in a workspace variable such as `PLOINKY_AUTH_<ROUTE>_USERS`.
 - SSO stores a configured provider agent in workspace SSO config; provider manifests use `"ssoProvider": true`.
 - The installed-agent index tracks route names, principals, runtime resources, and SSO-provider markers.
+- `GET /capabilities` on the router lists successful capability responses from active agents without enforcing a fixed payload shape; `GET /capabilities/<agent>` proxies one agent's metadata.
+- `POST /v1/chat/completions/<agent>` routes OpenAI-compatible requests to one agent, with `stream: true` selecting SSE streaming and normal JSON returned otherwise.
 - Delegated MCP tool calls use router-signed invocation tokens.
 
 ## Dependency and profile commands

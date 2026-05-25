@@ -31,6 +31,11 @@ export function getAgentCapabilitiesUrl(agentName, options = {}) {
     return `${routerUrl}/capabilities/${encodeAgentName(agentName)}`;
 }
 
+export function getCapabilitiesUrl(options = {}) {
+    const routerUrl = stripTrailingSlash(options.routerUrl || getRouterUrl(options.env || process.env));
+    return `${routerUrl}/capabilities`;
+}
+
 export function getAgentChatCompletionsUrl(agentName, options = {}) {
     const routerUrl = stripTrailingSlash(options.routerUrl || getRouterUrl(options.env || process.env));
     return `${routerUrl}/v1/chat/completions/${encodeAgentName(agentName)}`;
@@ -210,7 +215,11 @@ export function createAgentHttpClient(options = {}) {
     }
 
     async function capabilities(agentName, callOptions = {}) {
-        const response = await requestBuffer(getAgentCapabilitiesUrl(agentName, { routerUrl }), {
+        const hasAgent = typeof agentName === 'string' && agentName.trim();
+        const url = hasAgent
+            ? getAgentCapabilitiesUrl(agentName, { routerUrl })
+            : getCapabilitiesUrl({ routerUrl });
+        const response = await requestBuffer(url, {
             method: 'GET',
             headers: normalizeHeaders({
                 ...requestHeaders,

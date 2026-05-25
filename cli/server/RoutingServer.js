@@ -196,6 +196,97 @@ function resolveAgentRouteOrRespond(res, apiRoutes, agentName) {
     return route;
 }
 
+function requestAgentCapabilities(route, agentName, identityHeaders = {}) {
+    return new Promise((resolve) => {
+        const upstream = http.request({
+            hostname: '127.0.0.1',
+            port: route.hostPort,
+            path: '/capabilities',
+            method: 'GET',
+            headers: {
+                accept: 'application/json',
+                ...identityHeaders
+            },
+            timeout: 5000
+        }, upstreamRes => {
+            const chunks = [];
+            upstreamRes.on('data', chunk => chunks.push(chunk));
+            upstreamRes.on('end', () => {
+                const body = Buffer.concat(chunks).toString('utf8');
+                const statusCode = upstreamRes.statusCode || 0;
+                if (statusCode < 200 || statusCode >= 300) {
+                    resolve({
+                        ok: false,
+                        error: {
+                            name: agentName,
+                            statusCode,
+                            error: body || `HTTP ${statusCode}`
+                        }
+                    });
+                    return;
+                }
+                try {
+                    resolve({
+                        ok: true,
+                        agent: {
+                            name: agentName,
+                            statusCode,
+                            payload: body ? JSON.parse(body) : null
+                        }
+                    });
+                } catch (_) {
+                    resolve({
+                        ok: true,
+                        agent: {
+                            name: agentName,
+                            statusCode,
+                            body
+                        }
+                    });
+                }
+            });
+        });
+        upstream.on('timeout', () => {
+            upstream.destroy(new Error('capabilities request timed out'));
+        });
+        upstream.on('error', err => {
+            resolve({
+                ok: false,
+                error: {
+                    name: agentName,
+                    error: err?.message || String(err)
+                }
+            });
+        });
+        upstream.end();
+    });
+}
+
+async function handleRoutedAggregateCapabilities(req, res) {
+    const method = (req.method || 'GET').toUpperCase();
+    if (method !== 'GET') {
+        sendJsonResponse(res, 405, { error: 'method_not_allowed' }, { Allow: 'GET' });
+        return;
+    }
+    const apiRoutes = loadApiRoutes();
+    const identityHeaders = buildPlainAuthInfoHeader(req);
+    const candidates = Object.entries(apiRoutes || {})
+        .filter(([, route]) => route && !route.disabled && route.hostPort);
+    const results = await Promise.all(candidates.map(([agentName, route]) =>
+        requestAgentCapabilities(route, agentName, identityHeaders)
+    ));
+    const agents = [];
+    const errors = [];
+    for (const result of results) {
+        if (result.ok) {
+            agents.push(result.agent);
+        } else {
+            errors.push(result.error);
+        }
+    }
+    sendJsonResponse(res, 200, { agents, errors });
+}
+
 function handleRoutedOpenAiChatCompletions(req, res, parsedUrl, agentName) {
     const method = (req.method || 'GET').toUpperCase();
     if (method !== 'POST') {
@@ -236,6 +327,7 @@ function isAgentMcpProxyRoute(pathname) {
 async function processRequest(req, res) {
     const parsedUrl = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
     const pathname = parsedUrl.pathname || '/';
+    const routedAggregateCapabilities = pathname === '/capabilities' || pathname === '/capabilities/';
     const routedOpenAiAgent = matchSingleAgentRoute(pathname, ['v1', 'chat', 'completions']);
     const routedCapabilitiesAgent = matchSingleAgentRoute(pathname, ['capabilities']);
     appendLog('http_request', { method: req.method, path: pathname });
@@ -322,6 +414,8 @@ async function processRequest(req, res) {
         return handleBlobs(req, res);
     } else if (handleHttpServiceRoute(req, res, parsedUrl)) {
         return;
+    } else if (routedAggregateCapabilities) {
+        return handleRoutedAggregateCapabilities(req, res);
     } else if (routedOpenAiAgent) {
         return handleRoutedOpenAiChatCompletions(req, res, parsedUrl, routedOpenAiAgent);
     } else if (routedCapabilitiesAgent) {
