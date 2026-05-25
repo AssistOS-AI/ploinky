@@ -35,6 +35,11 @@
         </section>
 
         <section class="chapter-section">
+          <h2>Branch-Aware Startup</h2>
+          <p><code>ploinky start</code> accepts <code>--branch &lt;branch&gt;</code> to set a candidate branch for managed repos involved in startup, <code>--repo-branch &lt;repo=branch&gt;</code> to override the candidate per repo, <code>--branch-fallback default|fail</code> to control missing-branch behavior, and <code>--reset-repos</code> to permit hard reset of dirty checkouts. Bootstrap applies the global branch only to the prefixed static-agent repo and applies explicit per-repo overrides to default boot repos. Manifest <code>repos</code> values may be objects with an explicit <code>branch</code> field, and prefixed <code>enable</code> entries auto-install missing repos through the normal source lookup. Branch metadata is recorded in <code>.ploinky/repo_sources.json</code> for reproducible restarts.</p>
+        </section>
+
+        <section class="chapter-section">
           <h2>Dependency Cache Maintenance</h2>
           <p><code>ploinky deps prepare</code>, <code>deps status</code>, and <code>deps clean</code> manage runtime-keyed Node caches under <code>.ploinky/deps/</code>. Global caches are prepared from <code>globalDeps/package.json</code>. Per-agent caches merge that baseline with an agent-local <code>package.json</code> when one exists. A cache is valid only when the runtime key, merged-package hash, and stamp version all match the current inputs. <code>ploinky start</code> prepares or refreshes missing and stale caches before launching agents, so first startup may require npm, git, network access, and native build tools.</p>
           <p>Container runtimes prepare caches inside a short-lived install container for the target image. Sandbox runtimes prepare caches on the host, but only when the runtime key matches the host runtime family and platform.</p>

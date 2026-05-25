@@ -13,7 +13,7 @@ import { debugLog } from './services/utils.js';
 import * as inputState from './services/inputState.js';
 import { bootstrap } from './services/ploinkyboot.js';
 import { enableMultilineNavigation } from './services/multilineNavigation.js';
-import { getPredefinedRepos } from './services/repos.js';
+import { getPredefinedRepos, parseStartArgs } from './services/repos.js';
 
 const COMMANDS = getCommandRegistry();
 
@@ -397,7 +397,19 @@ function main() {
 
         debugLog('Raw arguments:', args);
         initEnvironment();
-        try { bootstrap(); } catch (_) {}
+        let startParsed;
+        let branchPolicy;
+        if (args.length && args[0] === 'start') {
+            try {
+                startParsed = parseStartArgs(args.slice(1));
+                branchPolicy = startParsed.branchPolicy;
+            } catch (_) {}
+        }
+        try {
+            bootstrap({ branchPolicy, staticAgent: startParsed?.staticAgent });
+        } catch (err) {
+            if (branchPolicy?.fallback === 'fail') throw err;
+        }
 
         if (args.length === 0) {
             startInteractiveMode();

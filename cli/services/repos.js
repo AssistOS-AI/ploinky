@@ -460,3 +460,266 @@ export function pullGitRepo(repoPath, { rebase = true, autostash = true, stdio =
     execFileSync('git', args, { stdio });
     return true;
 }
+
+// ---------------------------------------------------------------------------
+// Branch policy — used by `ploinky start --branch`
+// ---------------------------------------------------------------------------
+
+export function parseBranchPolicy(args) {
+    const policy = {
+        branch: null,
+        repoBranches: {},
+        fallback: 'default',
+        resetRepos: false,
+    };
+    if (!Array.isArray(args) || !args.length) return policy;
+
+    for (let i = 0; i < args.length; i += 1) {
+        const arg = String(args[i] || '');
+
+        if (arg === '--branch' && i + 1 < args.length) {
+            policy.branch = String(args[++i]);
+            continue;
+        }
+        if (arg.startsWith('--branch=')) {
+            policy.branch = arg.slice('--branch='.length);
+            continue;
+        }
+
+        if (arg === '--repo-branch' && i + 1 < args.length) {
+            const pair = String(args[++i]);
+            const eqIdx = pair.indexOf('=');
+            if (eqIdx < 1) {
+                throw new Error(`Malformed --repo-branch value '${pair}'. Expected repo=branch.`);
+            }
+            policy.repoBranches[pair.slice(0, eqIdx)] = pair.slice(eqIdx + 1);
+            continue;
+        }
+        if (arg.startsWith('--repo-branch=')) {
+            const pair = arg.slice('--repo-branch='.length);
+            const eqIdx = pair.indexOf('=');
+            if (eqIdx < 1) {
+                throw new Error(`Malformed --repo-branch value '${pair}'. Expected repo=branch.`);
+            }
+            policy.repoBranches[pair.slice(0, eqIdx)] = pair.slice(eqIdx + 1);
+            continue;
+        }
+
+        if (arg === '--branch-fallback' && i + 1 < args.length) {
+            policy.fallback = String(args[++i]);
+            continue;
+        }
+        if (arg.startsWith('--branch-fallback=')) {
+            policy.fallback = arg.slice('--branch-fallback='.length);
+            continue;
+        }
+
+        if (arg === '--reset-repos') {
+            policy.resetRepos = true;
+            continue;
+        }
+    }
+
+    if (policy.fallback !== 'default' && policy.fallback !== 'fail') {
+        throw new Error(`Invalid --branch-fallback value '${policy.fallback}'. Use 'default' or 'fail'.`);
+    }
+    return policy;
+}
+
+export function parseStartArgs(rawArgs) {
+    const args = (rawArgs || []).map(a => String(a));
+    let staticAgent = null;
+    let port = null;
+    const policyArgs = [];
+    const positional = [];
+
+    for (let i = 0; i < args.length; i += 1) {
+        const arg = args[i];
+        if (arg === '--branch' || arg === '--repo-branch' || arg === '--branch-fallback') {
+            policyArgs.push(arg);
+            if (i + 1 < args.length) policyArgs.push(args[++i]);
+            continue;
+        }
+        if (arg.startsWith('--branch=') || arg.startsWith('--repo-branch=') || arg.startsWith('--branch-fallback=')) {
+            policyArgs.push(arg);
+            continue;
+        }
+        if (arg === '--reset-repos') {
+            policyArgs.push(arg);
+            continue;
+        }
+        if (arg.startsWith('--')) continue;
+        positional.push(arg);
+    }
+
+    if (positional.length >= 1) staticAgent = positional[0];
+    if (positional.length >= 2) {
+        const candidate = Number(positional[1]);
+        if (!Number.isNaN(candidate) && candidate > 0) {
+            port = positional[1];
+        }
+    }
+
+    return {
+        staticAgent,
+        port,
+        branchPolicy: parseBranchPolicy(policyArgs),
+    };
+}
+
+export function resolveBranchForRepo(repoName, source, branchPolicy) {
+    if (!branchPolicy) return source?.branch || null;
+    if (branchPolicy.repoBranches[repoName]) {
+        return branchPolicy.repoBranches[repoName];
+    }
+    if (source?.branch) return source.branch;
+    if (branchPolicy.branch) return branchPolicy.branch;
+    const stored = readStoredRepoSource(repoName);
+    if (stored?.branch) return stored.branch;
+    return null;
+}
+
+export function remoteBranchExists(repoPathOrUrl, branch) {
+    if (!branch) return false;
+    try {
+        const output = execFileSync('git', ['ls-remote', '--heads', repoPathOrUrl, `refs/heads/${branch}`], {
+            stdio: ['ignore', 'pipe', 'pipe'],
+        });
+        return String(output).trim().length > 0;
+    } catch (_) {
+        return false;
+    }
+}
+
+function repoIsDirty(repoPath) {
+    try {
+        const status = String(execFileSync('git', ['-C', repoPath, 'status', '--porcelain'], {
+            stdio: ['ignore', 'pipe', 'pipe'],
+        }));
+        return status.trim().length > 0;
+    } catch (_) {
+        return false;
+    }
+}
+
+function currentBranch(repoPath) {
+    try {
+        return String(execFileSync('git', ['-C', repoPath, 'rev-parse', '--abbrev-ref', 'HEAD'], {
+            stdio: ['ignore', 'pipe', 'pipe'],
+        })).trim();
+    } catch (_) {
+        return null;
+    }
+}
+
+export function ensureRepoInstalled(name, url, { branchPolicy, branch, stdio = 'inherit' } = {}) {
+    const reposDir = ensureReposDir();
+    const repoPath = path.join(reposDir, name);
+    const source = resolveRepoSource(name, url, branch);
+    const actualUrl = source?.url || url || null;
+    const resolvedBranch = resolveBranchForRepo(name, { branch: branch || source?.branch }, branchPolicy);
+
+    if (fs.existsSync(repoPath)) {
+        let actualBranch = resolvedBranch || currentBranch(repoPath);
+        if (resolvedBranch && isGitRepository(repoPath)) {
+            const switchResult = ensureRepoOnBranch(name, {
+                branch: resolvedBranch,
+                resetRepos: branchPolicy?.resetRepos || false,
+                fallback: branchPolicy?.fallback || 'default',
+                stdio,
+            });
+            actualBranch = switchResult?.branch || currentBranch(repoPath);
+        }
+        recordRepoSource(name, actualUrl, actualBranch);
+        return { status: 'exists', path: repoPath, branch: actualBranch };
+    }
+
+    if (!actualUrl) throw new Error(`Missing repository URL for '${name}'.`);
+
+    let cloneBranch = resolvedBranch;
+    if (cloneBranch && !remoteBranchExists(actualUrl, cloneBranch)) {
+        if (branchPolicy?.fallback === 'fail') {
+            throw new Error(`Branch '${cloneBranch}' does not exist on remote for repo '${name}'. Aborting (--branch-fallback fail).`);
+        }
+        console.log(`[repos] Branch '${cloneBranch}' not found on remote for '${name}'; falling back to default branch.`);
+        cloneBranch = null;
+    }
+
+    const args = ['clone'];
+    if (cloneBranch) args.push('--branch', cloneBranch);
+    args.push(actualUrl, repoPath);
+    execFileSync('git', args, { stdio });
+    recordRepoSource(name, actualUrl, cloneBranch);
+    return { status: 'cloned', path: repoPath, branch: cloneBranch || 'default' };
+}
+
+export function ensureRepoOnBranch(name, { branch, resetRepos = false, fallback = 'default', stdio = 'inherit' } = {}) {
+    if (!branch) return { status: 'noop', branch: null };
+    const repoPath = path.join(PLOINKY_DIR, 'repos', name);
+    if (!fs.existsSync(repoPath) || !isGitRepository(repoPath)) return { status: 'missing', branch: null };
+
+    const current = currentBranch(repoPath);
+    if (current === branch) {
+        recordRepoSource(name, resolveRepoSourceUrl(name), branch);
+        return { status: 'current', branch };
+    }
+
+    if (repoIsDirty(repoPath)) {
+        if (!resetRepos) {
+            throw new Error(
+                `Repository '${name}' has uncommitted changes and is on branch '${current}', ` +
+                `not '${branch}'. Use --reset-repos to force checkout, or commit/stash changes first.`
+            );
+        }
+    }
+
+    try {
+        execFileSync('git', ['-C', repoPath, 'fetch', '--prune'], { stdio });
+    } catch (_) {}
+
+    const localBranchExists = (() => {
+        try {
+            execFileSync('git', ['-C', repoPath, 'rev-parse', '--verify', `refs/heads/${branch}`], {
+                stdio: ['ignore', 'pipe', 'pipe'],
+            });
+            return true;
+        } catch (_) {
+            return false;
+        }
+    })();
+
+    const remoteBranch = (() => {
+        try {
+            execFileSync('git', ['-C', repoPath, 'rev-parse', '--verify', `refs/remotes/origin/${branch}`], {
+                stdio: ['ignore', 'pipe', 'pipe'],
+            });
+            return true;
+        } catch (_) {
+            return false;
+        }
+    })();
+
+    if (!localBranchExists && !remoteBranch) {
+        if (fallback === 'fail') {
+            throw new Error(`Branch '${branch}' does not exist locally or on remote for repo '${name}'. Aborting (--branch-fallback fail).`);
+        }
+        console.log(`[repos] Branch '${branch}' not available for '${name}'; keeping current branch '${current}'.`);
+        return { status: 'fallback', branch: current, requestedBranch: branch };
+    }
+
+    if (resetRepos) {
+        const target = remoteBranch ? `origin/${branch}` : branch;
+        execFileSync('git', ['-C', repoPath, 'checkout', '-B', branch, target], { stdio });
+        execFileSync('git', ['-C', repoPath, 'reset', '--hard', target], { stdio });
+        execFileSync('git', ['-C', repoPath, 'clean', '-fd'], { stdio });
+    } else {
+        if (localBranchExists) {
+            execFileSync('git', ['-C', repoPath, 'checkout', branch], { stdio });
+        } else {
+            execFileSync('git', ['-C', repoPath, 'checkout', '-b', branch, `origin/${branch}`], { stdio });
+        }
+    }
+
+    recordRepoSource(name, resolveRepoSourceUrl(name), branch);
+    return { status: 'switched', branch };
+}

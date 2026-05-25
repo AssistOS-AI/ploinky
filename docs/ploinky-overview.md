@@ -16,7 +16,7 @@ Ploinky is a workspace-local runtime for repository-backed agents.
 - `ploinky update repo <name>`: update one repository under `.ploinky/repos/`.
 - `ploinky enable repo <name> [branch]`: enable a repository for discovery and listings.
 - `ploinky enable agent <name|repo/name> [global|devel [repo]] [--auth none|pwd|sso] [as <alias>]`: register an agent in `.ploinky/agents.json`.
-- `ploinky start [staticAgent] [port]`: resolve dependency waves, start enabled agents, write `routing.json`, and launch the router under the watchdog.
+- `ploinky start [staticAgent] [port] [--branch <branch>] [--repo-branch <repo=branch>]... [--branch-fallback default|fail] [--reset-repos]`: resolve dependency waves, start enabled agents, write `routing.json`, and launch the router under the watchdog. `--branch` sets a candidate branch for all repos involved in this start; `--repo-branch` overrides it per repo. `--branch-fallback default` (the default) keeps repos on their configured branch when the candidate is missing; `fail` aborts. `--reset-repos` permits hard reset of dirty managed repos.
 - `ploinky status`: show SSO state, router listening state, installed and enabled repositories, and running agent containers.
 - `ploinky list routes`: inspect the current `.ploinky/routing.json` route table.
 - `ploinky restart`: restart enabled agents and the router.
