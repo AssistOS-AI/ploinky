@@ -102,7 +102,7 @@ export function buildInvocationContextForProviderCall({ req, agentName, toolName
                 providerAgentRef,
                 callerJwt
             });
-        return buildDelegatedInvocation({
+        const invocation = buildDelegatedInvocation({
             providerPrincipal: verified.providerPrincipal,
             callerPrincipal: verified.callerPrincipal,
             tool: toolName,
@@ -110,14 +110,16 @@ export function buildInvocationContextForProviderCall({ req, agentName, toolName
             bodyObject,
             delegatedUser: verified.user
         });
+        return { ...invocation, bodyObject };
     }
-    return buildFirstPartyInvocation({
+    const invocation = buildFirstPartyInvocation({
         providerAgentRef,
         tool: toolName,
         bodyObject,
         delegatedUser: extractDelegatedUser(req),
         scope: []
     });
+    return { ...invocation, bodyObject };
 }
 
 /**

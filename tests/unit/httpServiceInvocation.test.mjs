@@ -219,6 +219,14 @@ test('protected HTTP service falls back to static auth and injects router auth i
     assert.deepEqual(authInfo.user?.roles, ['local', 'admin']);
     assert.ok(authInfo.sessionId);
     assert.ok(authInfo.invocationToken);
+    assert.deepEqual(authInfo.invocationBody, {
+        tool: '__http_service__',
+        arguments: {
+            method: 'GET',
+            path: '/services/browser-use/sessions/sess_1',
+            search: '?view=1'
+        }
+    });
 });
 
 test('protected HTTP service auth info carries router invocation token', async () => {
@@ -232,7 +240,15 @@ test('protected HTTP service auth info carries router invocation token', async (
         },
         sessionId: 'session-1'
     }, {
-        token: 'router-issued-invocation'
+        token: 'router-issued-invocation',
+        bodyObject: {
+            tool: '__http_service__',
+            arguments: {
+                method: 'GET',
+                path: '/services/browser-use/sessions/sess_1',
+                search: '?view=1'
+            }
+        }
     });
 
     const authInfo = JSON.parse(headers['x-ploinky-auth-info']);
@@ -245,4 +261,12 @@ test('protected HTTP service auth info carries router invocation token', async (
     });
     assert.equal(authInfo.sessionId, 'session-1');
     assert.equal(authInfo.invocationToken, 'router-issued-invocation');
+    assert.deepEqual(authInfo.invocationBody, {
+        tool: '__http_service__',
+        arguments: {
+            method: 'GET',
+            path: '/services/browser-use/sessions/sess_1',
+            search: '?view=1'
+        }
+    });
 });

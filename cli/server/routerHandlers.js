@@ -158,6 +158,9 @@ export function buildPlainAuthInfoHeader(req, invocation = null) {
     if (invocation?.token) {
         authInfo.invocationToken = invocation.token;
     }
+    if (invocation?.bodyObject && typeof invocation.bodyObject === 'object') {
+        authInfo.invocationBody = invocation.bodyObject;
+    }
     return {
         'x-ploinky-auth-info': JSON.stringify(authInfo)
     };

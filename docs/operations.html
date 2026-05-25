@@ -30,7 +30,7 @@
 
         <section class="chapter-section">
           <h2>Secrets and Variable Resolution</h2>
-          <p>Workspace-managed secrets live in <code>.ploinky/.secrets</code>. The secret injector also walks upward to find the nearest <code>.env</code> file and prefers process environment variables over both file-based sources. This precedence model is shared by auth config, runtime resource templating, dependency tooling, and the LLM helper.</p>
+          <p>Workspace-managed secrets live in <code>.ploinky/.secrets</code>. The secret injector also walks upward to find the nearest <code>.env</code> file and prefers process environment variables over both file-based sources. This precedence model is shared by auth config, runtime resource templating, dependency tooling, and the LLM helper. Manifest entries marked <code>generatedSecret: true</code> are intentionally different: Ploinky derives them from the agent identity and ignores same-named operator variables.</p>
           <p><code>var</code>, <code>vars</code>, <code>echo</code>, and <code>expose</code> are the operator-facing commands for that layer. Variable exposure supports wildcard expansion, but the all-match <code>*</code> pattern deliberately excludes names containing <code>API_KEY</code> so sensitive values are never exposed accidentally through a broad manifest pattern.</p>
         </section>
 

@@ -7,6 +7,23 @@ import { isSsoProviderManifest } from './agentRegistry.js';
 
 export function parseEnableDirective(entry) {
     if (entry === null || entry === undefined) return null;
+    if (typeof entry === 'object' && !Array.isArray(entry)) {
+        const rawSpec = entry.agent ?? entry.ref ?? entry.spec ?? entry.name;
+        const parsed = parseEnableDirective(rawSpec);
+        if (!parsed) return null;
+        const alias = entry.alias ?? entry.as ?? parsed.alias;
+        const profile = typeof entry.profile === 'string' && entry.profile.trim()
+            ? entry.profile.trim().toLowerCase()
+            : undefined;
+        const noWait = entry.noWait === true || entry['no-wait'] === true || parsed.noWait;
+        const result = {
+            spec: parsed.spec,
+            alias,
+            noWait,
+        };
+        if (profile) result.profile = profile;
+        return result;
+    }
     const raw = typeof entry === 'string' ? entry : String(entry || '').trim();
     const trimmed = raw.trim();
     if (!trimmed) return null;
@@ -123,7 +140,9 @@ export async function applyManifestDirectives(agentNameOrPath) {
                 if (!shouldEnableDirectiveForManifest(parsed, manifest)) {
                     continue;
                 }
-                enableAgent(parsed.spec, undefined, undefined, parsed.alias);
+                enableAgent(parsed.spec, undefined, undefined, parsed.alias, undefined, {
+                    profile: parsed.profile,
+                });
             } catch (err) {
                 const message = err && err.message ? err.message : String(err);
                 console.error(`[manifest enable] Failed to enable agent '${rawEntry}': ${message}`);

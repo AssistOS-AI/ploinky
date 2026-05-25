@@ -79,6 +79,42 @@ function toBool(value, defaultValue = false) {
     return defaultValue;
 }
 
+function buildDerivedEnvSpec({
+    insideName,
+    sourceName,
+    derive,
+    generatedSecret,
+    deriveName,
+    deriveRepoName,
+    deriveRepo,
+    deriveAgentName,
+    deriveAgent,
+    deriveBytes,
+    deriveFormat,
+} = {}) {
+    if (derive === 'derived-master') {
+        return {
+            type: 'derived-master',
+            name: typeof deriveName === 'string' && deriveName.trim() ? deriveName.trim() : sourceName,
+            repoName: typeof deriveRepoName === 'string' && deriveRepoName.trim()
+                ? deriveRepoName.trim()
+                : (typeof deriveRepo === 'string' && deriveRepo.trim() ? deriveRepo.trim() : ''),
+            agentName: typeof deriveAgentName === 'string' && deriveAgentName.trim()
+                ? deriveAgentName.trim()
+                : (typeof deriveAgent === 'string' && deriveAgent.trim() ? deriveAgent.trim() : ''),
+            bytes: deriveBytes,
+            format: deriveFormat,
+        };
+    }
+    if (toBool(generatedSecret, false)) {
+        return {
+            type: 'generated-secret',
+            name: insideName,
+        };
+    }
+    return null;
+}
+
 /**
  * Check if a string is a wildcard pattern (contains * character).
  * @param {string} pattern - The pattern to check
@@ -286,25 +322,25 @@ export function getManifestEnvSpecs(manifest, profileConfig) {
                     deriveAgent,
                     deriveBytes,
                     deriveFormat,
+                    generatedSecret,
                 } = entry;
                 const insideName = typeof name === 'string' ? name.trim() : '';
                 if (!insideName) continue;
                 const sourceName = typeof varName === 'string' && varName.trim() ? varName.trim() : insideName;
                 const resolvedDefault = value !== undefined ? value : defaultValue;
-                const deriveSpec = derive === 'derived-master'
-                    ? {
-                        type: 'derived-master',
-                        name: typeof deriveName === 'string' && deriveName.trim() ? deriveName.trim() : sourceName,
-                        repoName: typeof deriveRepoName === 'string' && deriveRepoName.trim()
-                            ? deriveRepoName.trim()
-                            : (typeof deriveRepo === 'string' && deriveRepo.trim() ? deriveRepo.trim() : ''),
-                        agentName: typeof deriveAgentName === 'string' && deriveAgentName.trim()
-                            ? deriveAgentName.trim()
-                            : (typeof deriveAgent === 'string' && deriveAgent.trim() ? deriveAgent.trim() : ''),
-                        bytes: deriveBytes,
-                        format: deriveFormat,
-                    }
-                    : null;
+                const deriveSpec = buildDerivedEnvSpec({
+                    insideName,
+                    sourceName,
+                    derive,
+                    generatedSecret,
+                    deriveName,
+                    deriveRepoName,
+                    deriveRepo,
+                    deriveAgentName,
+                    deriveAgent,
+                    deriveBytes,
+                    deriveFormat,
+                });
                 addSpec(insideName, sourceName, toBool(required, false), resolvedDefault, deriveSpec);
                 continue;
             }
@@ -347,22 +383,19 @@ export function getManifestEnvSpecs(manifest, profileConfig) {
                 } else if (Object.prototype.hasOwnProperty.call(rawSpec, 'value')) {
                     defaultValue = rawSpec.value;
                 }
-                if (rawSpec.derive === 'derived-master') {
-                    deriveSpec = {
-                        type: 'derived-master',
-                        name: typeof rawSpec.deriveName === 'string' && rawSpec.deriveName.trim()
-                            ? rawSpec.deriveName.trim()
-                            : sourceName,
-                        repoName: typeof rawSpec.deriveRepoName === 'string' && rawSpec.deriveRepoName.trim()
-                            ? rawSpec.deriveRepoName.trim()
-                            : (typeof rawSpec.deriveRepo === 'string' && rawSpec.deriveRepo.trim() ? rawSpec.deriveRepo.trim() : ''),
-                        agentName: typeof rawSpec.deriveAgentName === 'string' && rawSpec.deriveAgentName.trim()
-                            ? rawSpec.deriveAgentName.trim()
-                            : (typeof rawSpec.deriveAgent === 'string' && rawSpec.deriveAgent.trim() ? rawSpec.deriveAgent.trim() : ''),
-                        bytes: rawSpec.deriveBytes,
-                        format: rawSpec.deriveFormat,
-                    };
-                }
+                deriveSpec = buildDerivedEnvSpec({
+                    insideName,
+                    sourceName,
+                    derive: rawSpec.derive,
+                    generatedSecret: rawSpec.generatedSecret,
+                    deriveName: rawSpec.deriveName,
+                    deriveRepoName: rawSpec.deriveRepoName,
+                    deriveRepo: rawSpec.deriveRepo,
+                    deriveAgentName: rawSpec.deriveAgentName,
+                    deriveAgent: rawSpec.deriveAgent,
+                    deriveBytes: rawSpec.deriveBytes,
+                    deriveFormat: rawSpec.deriveFormat,
+                });
                 addSpec(insideName, sourceName, required, defaultValue, deriveSpec);
                 continue;
             } else {
@@ -391,7 +424,7 @@ function formatEnvSpecName(spec) {
 export function getIncompleteManifestEnvProfileEntries(manifest, profileConfig) {
     return getManifestEnvSpecs(manifest, profileConfig).filter(spec => {
         if (!spec.required) return false;
-        if (spec.derive?.type === 'derived-master') return false;
+        if (spec.derive?.type === 'derived-master' || spec.derive?.type === 'generated-secret') return false;
         if (!isEmptyValue(spec.defaultValue)) return false;
         return !isSensitiveEnvVariableName(spec.insideName)
             && !isSensitiveEnvVariableName(spec.sourceName);
@@ -461,6 +494,12 @@ function resolveManifestEnv(manifest, secrets, options = {}) {
                 name: spec.derive.name || spec.sourceName || spec.insideName,
                 length: spec.derive.bytes,
                 encoding: spec.derive.format || 'hex',
+            });
+        } else if (spec.derive?.type === 'generated-secret') {
+            resolvedValue = deriveAgentSecret({
+                repoName,
+                agentName,
+                name: spec.derive.name || spec.insideName,
             });
         } else if (hasSecret) {
             resolvedValue = resolveAlias(secrets[spec.sourceName], secrets);

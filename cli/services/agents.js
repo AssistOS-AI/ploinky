@@ -228,6 +228,9 @@ export function enableAgent(agentName, mode, repoNameParam, aliasParam, authMode
     const password = typeof authOptions?.password === 'string' && authOptions.password.length
         ? authOptions.password
         : '';
+    const profile = typeof authOptions?.profile === 'string' && authOptions.profile.trim()
+        ? authOptions.profile.trim().toLowerCase()
+        : '';
     if ((username || password) && authMode !== 'local') {
         throw new Error('The --user and --password options are only valid with --auth pwd.');
     }
@@ -331,6 +334,9 @@ export function enableAgent(agentName, mode, repoNameParam, aliasParam, authMode
     }
     if (alias) {
         record.alias = alias;
+    }
+    if (profile) {
+        record.profile = profile;
     }
 
     for (const key of Object.keys(map)) {

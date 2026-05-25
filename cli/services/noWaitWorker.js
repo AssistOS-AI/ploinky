@@ -65,6 +65,7 @@ async function main() {
     const manifestPath = args.manifestPath;
     const agentPath = args.agentPath || (manifestPath ? path.dirname(manifestPath) : '');
     const routerPort = args.routerPort || '';
+    const profileName = args.profile || '';
 
     if (!containerName || !shortAgent || !repoName || !manifestPath || !agentPath) {
         console.error('[no-wait] missing required arguments; refusing to run.');
@@ -95,6 +96,7 @@ async function main() {
             alias: alias || undefined,
         };
         if (routerPort) ensureOptions.routerPort = routerPort;
+        if (profileName) ensureOptions.profileName = profileName;
         const result = await dockerSvc.ensureAgentService(shortAgent, manifest, agentPath, ensureOptions);
         const resolvedContainerName = (result && result.containerName) || containerName;
         const hostPort = result && result.hostPort;

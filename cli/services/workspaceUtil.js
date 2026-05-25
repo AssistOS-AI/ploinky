@@ -85,6 +85,9 @@ function spawnNoWaitWorker({ node, registryName, routeKey, registryAlias, router
   if (registryAlias) {
     args.push('--alias', registryAlias);
   }
+  if (node.profile) {
+    args.push('--profile', node.profile);
+  }
   if (routerPort) {
     args.push('--router-port', String(routerPort));
   }
@@ -240,10 +243,18 @@ function ensureGraphNodesEnabled(graph, reg) {
     .sort((a, b) => a.id.localeCompare(b.id));
 
   for (const node of nodes) {
-    if (findRegistryEntryForGraphNode(reg, node, dockerSvc.getAgentContainerName)) {
+    const existing = findRegistryEntryForGraphNode(reg, node, dockerSvc.getAgentContainerName);
+    if (existing) {
+      if (node.profile && existing.rec.profile !== node.profile) {
+        existing.rec.profile = node.profile;
+        reg[existing.key] = existing.rec;
+        workspaceSvc.saveAgents(reg);
+      }
       continue;
     }
-    agentsSvc.enableAgent(node.enableSpec || node.agentRef, undefined, undefined, node.alias || undefined);
+    agentsSvc.enableAgent(node.enableSpec || node.agentRef, undefined, undefined, node.alias || undefined, undefined, {
+      profile: node.profile || undefined,
+    });
   }
 }
 

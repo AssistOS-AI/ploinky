@@ -374,7 +374,7 @@ DATABASE_URL=postgres://localhost/db</code></pre>
                         </ul>
 
                         <h3>Secure Wire Protocol</h3>
-                        <p>Agent-to-agent and browser-to-agent calls use HS256-signed invocation JWTs (60-second TTL) for request authentication. The shared agent runtime key (<code>PLOINKY_DERIVED_MASTER_KEY</code>) is derived from <code>PLOINKY_MASTER_KEY</code> and also roots agent-owned generated secrets. Replay protection is enforced via a memory cache.</p>
+                        <p>Agent-to-agent and browser-to-agent calls use HS256-signed invocation JWTs (60-second TTL) for request authentication. The shared agent runtime key (<code>PLOINKY_DERIVED_MASTER_KEY</code>) is derived from <code>PLOINKY_MASTER_KEY</code> and also roots agent-owned generated secrets declared with <code>generatedSecret: true</code>. Replay protection is enforced via a memory cache.</p>
                     </div>
 
                     <div class="doc-section" id="web-services">
