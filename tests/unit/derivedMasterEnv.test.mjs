@@ -7,13 +7,15 @@ import path from 'node:path';
 const originalCwd = process.cwd();
 const originalMasterKey = process.env.PLOINKY_MASTER_KEY;
 const originalDerivedTestSecret = process.env.DERIVED_MASTER_TEST_SECRET;
+const originalGeneratedTestSecret = process.env.GENERATED_SECRET_TEST_SECRET;
 const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-derived-env-'));
 process.chdir(tempDir);
 process.env.PLOINKY_MASTER_KEY = '7'.repeat(64);
 process.env.DERIVED_MASTER_TEST_SECRET = 'operator-value';
+process.env.GENERATED_SECRET_TEST_SECRET = 'operator-value';
 
 const moduleSuffix = `?test=${Date.now()}`;
-const { buildEnvMap } = await import(`../../cli/services/secretVars.js${moduleSuffix}`);
+const { buildEnvMap, validateManifestEnvProfileCompleteness } = await import(`../../cli/services/secretVars.js${moduleSuffix}`);
 const { deriveAgentSecret } = await import(`../../cli/services/masterKey.js${moduleSuffix}`);
 
 test.after(() => {
@@ -28,6 +30,11 @@ test.after(() => {
         delete process.env.DERIVED_MASTER_TEST_SECRET;
     } else {
         process.env.DERIVED_MASTER_TEST_SECRET = originalDerivedTestSecret;
+    }
+    if (originalGeneratedTestSecret === undefined) {
+        delete process.env.GENERATED_SECRET_TEST_SECRET;
+    } else {
+        process.env.GENERATED_SECRET_TEST_SECRET = originalGeneratedTestSecret;
     }
 });
 
@@ -78,4 +85,86 @@ test('buildEnvMap can share a derived-master identity across agents', () => {
         agentName: 'logical-agent',
         name: 'shared-secret',
     }));
+});
+
+test('buildEnvMap derives generatedSecret entries from the current agent identity', () => {
+    const manifest = {
+        env: [
+            {
+                name: 'GENERATED_SECRET_TEST_SECRET',
+                generatedSecret: true,
+            },
+        ],
+    };
+    const env = buildEnvMap(manifest, null, {
+        repoName: 'repo-one',
+        agentName: 'agent-one',
+    });
+    assert.equal(env.GENERATED_SECRET_TEST_SECRET, deriveAgentSecret({
+        repoName: 'repo-one',
+        agentName: 'agent-one',
+        name: 'GENERATED_SECRET_TEST_SECRET',
+    }));
+    assert.notEqual(env.GENERATED_SECRET_TEST_SECRET, 'operator-value');
+});
+
+test('generatedSecret entries are scoped per agent by default', () => {
+    const manifest = {
+        env: [
+            {
+                name: 'GENERATED_SECRET_TEST_SECRET',
+                generatedSecret: true,
+            },
+        ],
+    };
+    const first = buildEnvMap(manifest, null, {
+        repoName: 'repo-one',
+        agentName: 'agent-one',
+    });
+    const second = buildEnvMap(manifest, null, {
+        repoName: 'repo-one',
+        agentName: 'agent-two',
+    });
+    assert.notEqual(first.GENERATED_SECRET_TEST_SECRET, second.GENERATED_SECRET_TEST_SECRET);
+});
+
+test('generatedSecret works in object-form env declarations', () => {
+    const manifest = {
+        env: {
+            GENERATED_SECRET_TEST_SECRET: {
+                generatedSecret: true,
+            },
+        },
+    };
+    const env = buildEnvMap(manifest, null, {
+        repoName: 'repo-one',
+        agentName: 'agent-one',
+    });
+    assert.equal(env.GENERATED_SECRET_TEST_SECRET, deriveAgentSecret({
+        repoName: 'repo-one',
+        agentName: 'agent-one',
+        name: 'GENERATED_SECRET_TEST_SECRET',
+    }));
+});
+
+test('required generatedSecret entries do not need profile defaults', () => {
+    const manifest = {
+        profiles: {
+            prod: {
+                env: [
+                    {
+                        name: 'GENERATED_SECRET_TEST_SECRET',
+                        required: true,
+                        generatedSecret: true,
+                    },
+                ],
+            },
+        },
+    };
+
+    const result = validateManifestEnvProfileCompleteness(manifest, manifest.profiles.prod, {
+        profileName: 'prod',
+    });
+
+    assert.equal(result.valid, true);
 });

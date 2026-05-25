@@ -74,6 +74,28 @@ test('planRuntimeResources resolves derived-master secret templates', () => {
     assert.notEqual(plan.env.DPU_MASTER_KEY, 'test-master-key-123');
 });
 
+test('planRuntimeResources resolves generatedSecret templates', () => {
+    const plan = planRuntimeResources({
+        runtime: {
+            resources: {
+                env: {
+                    DPU_MASTER_KEY: '{{generatedSecret:DPU_MASTER_KEY}}'
+                }
+            }
+        }
+    }, {
+        repoName: 'AssistOSExplorer',
+        agentName: 'dpuAgent',
+    });
+
+    assert.equal(plan.env.DPU_MASTER_KEY, deriveAgentSecret({
+        repoName: 'AssistOSExplorer',
+        agentName: 'dpuAgent',
+        name: 'DPU_MASTER_KEY',
+    }));
+    assert.notEqual(plan.env.DPU_MASTER_KEY, 'test-master-key-123');
+});
+
 test('planRuntimeResources can expand storage container path to host path for host sandboxes', () => {
     const plan = planRuntimeResources({
         runtime: {

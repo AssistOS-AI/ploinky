@@ -4,9 +4,28 @@ import * as repos from './repos.js';
 import { enableAgent } from './agents.js';
 import { findAgent } from './utils.js';
 import { isSsoProviderManifest } from './agentRegistry.js';
+import { PLOINKY_DIR } from './config.js';
+import { getActiveProfile } from './profileService.js';
 
 export function parseEnableDirective(entry) {
     if (entry === null || entry === undefined) return null;
+    if (typeof entry === 'object' && !Array.isArray(entry)) {
+        const rawSpec = entry.agent ?? entry.ref ?? entry.spec ?? entry.name;
+        const parsed = parseEnableDirective(rawSpec);
+        if (!parsed) return null;
+        const alias = entry.alias ?? entry.as ?? parsed.alias;
+        const profile = typeof entry.profile === 'string' && entry.profile.trim()
+            ? entry.profile.trim().toLowerCase()
+            : undefined;
+        const noWait = entry.noWait === true || entry['no-wait'] === true || parsed.noWait;
+        const result = {
+            spec: parsed.spec,
+            alias,
+            noWait,
+        };
+        if (profile) result.profile = profile;
+        return result;
+    }
     const raw = typeof entry === 'string' ? entry : String(entry || '').trim();
     const trimmed = raw.trim();
     if (!trimmed) return null;
@@ -90,42 +109,130 @@ function shouldEnableDirectiveForManifest(parsedDirective, manifest) {
     return true;
 }
 
-export async function applyManifestDirectives(agentNameOrPath) {
+function isStrictBranchPolicy(branchPolicy) {
+    return branchPolicy?.fallback === 'fail'
+        && (Boolean(branchPolicy.branch) || Object.keys(branchPolicy.repoBranches || {}).length > 0);
+}
+
+function errorMessage(err) {
+    return err && err.message ? err.message : String(err);
+}
+
+function manifestEnableEntries(manifest) {
+    const entries = [];
+    if (Array.isArray(manifest?.enable)) {
+        entries.push(...manifest.enable);
+    }
+    try {
+        const activeProfile = getActiveProfile();
+        const profileBlock = manifest?.profiles?.[activeProfile];
+        if (profileBlock && Array.isArray(profileBlock.enable)) {
+            entries.push(...profileBlock.enable);
+        }
+    } catch (_) {}
+    return entries;
+}
+
+function ensurePrefixedRepoInstalled(spec, branchPolicy) {
+    if (!spec || typeof spec !== 'string') return;
+    const slashIdx = spec.indexOf('/');
+    const colonIdx = spec.indexOf(':');
+    const sepIdx = slashIdx > 0 ? slashIdx : (colonIdx > 0 ? colonIdx : -1);
+    if (sepIdx < 1) return;
+
+    const repoName = spec.slice(0, sepIdx);
+    const repoPath = path.join(PLOINKY_DIR, 'repos', repoName);
+    if (fs.existsSync(repoPath)) return;
+
+    const source = repos.resolveRepoSource(repoName);
+    if (!source?.url) {
+        if (isStrictBranchPolicy(branchPolicy)) {
+            throw new Error(`No URL configured for repo '${repoName}'.`);
+        }
+        return;
+    }
+
+    try {
+        repos.ensureRepoInstalled(repoName, source.url, {
+            branchPolicy,
+            branch: source.branch,
+            stdio: 'inherit',
+        });
+        repos.enableRepo(repoName);
+    } catch (err) {
+        if (isStrictBranchPolicy(branchPolicy)) {
+            throw new Error(`Auto-install repo '${repoName}' failed: ${errorMessage(err)}`);
+        }
+        console.error(`[manifest] Auto-install repo '${repoName}' failed: ${errorMessage(err)}`);
+    }
+}
+
+export async function applyManifestDirectives(agentNameOrPath, { branchPolicy } = {}) {
     let manifest;
-    let baseDir;
     if (agentNameOrPath.endsWith('.json')) {
         manifest = JSON.parse(fs.readFileSync(agentNameOrPath, 'utf8'));
-        baseDir = path.dirname(agentNameOrPath);
     } else {
         const { manifestPath } = findAgent(agentNameOrPath);
         manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
-        baseDir = path.dirname(manifestPath);
     }
 
     const r = manifest.repos;
     if (r && typeof r === 'object') {
-        for (const [name, url] of Object.entries(r)) {
+        for (const [name, value] of Object.entries(r)) {
             try {
-                repos.addRepo(name, url);
-            } catch (_) {}
+                if (value && typeof value === 'object' && !Array.isArray(value)) {
+                    const manifestBranch = value.branch || null;
+                    const resolvedBranch = repos.resolveBranchForRepo(
+                        name,
+                        { branch: manifestBranch },
+                        branchPolicy,
+                    );
+                    repos.ensureRepoInstalled(name, value.url, {
+                        branchPolicy,
+                        branch: resolvedBranch,
+                        stdio: 'inherit',
+                    });
+                } else {
+                    repos.ensureRepoInstalled(name, value, {
+                        branchPolicy,
+                        stdio: 'inherit',
+                    });
+                }
+            } catch (err) {
+                if (isStrictBranchPolicy(branchPolicy)) {
+                    throw new Error(`[manifest repos] Failed to install repo '${name}': ${errorMessage(err)}`);
+                }
+                console.error(`[manifest repos] Failed to install repo '${name}': ${errorMessage(err)}`);
+            }
             try {
                 repos.enableRepo(name);
-            } catch (e) {}
+            } catch (err) {
+                if (isStrictBranchPolicy(branchPolicy)) {
+                    throw new Error(`[manifest repos] Failed to enable repo '${name}': ${errorMessage(err)}`);
+                }
+                console.error(`[manifest repos] Failed to enable repo '${name}': ${errorMessage(err)}`);
+            }
         }
     }
 
-    const en = manifest.enable;
+    const en = manifestEnableEntries(manifest);
     if (Array.isArray(en)) {
         for (const rawEntry of en) {
             try {
                 const parsed = parseEnableDirective(rawEntry);
                 if (!parsed) continue;
+                ensurePrefixedRepoInstalled(parsed.spec, branchPolicy);
                 if (!shouldEnableDirectiveForManifest(parsed, manifest)) {
                     continue;
                 }
-                enableAgent(parsed.spec, undefined, undefined, parsed.alias);
+                enableAgent(parsed.spec, undefined, undefined, parsed.alias, undefined, {
+                    profile: parsed.profile,
+                });
             } catch (err) {
-                const message = err && err.message ? err.message : String(err);
+                const message = errorMessage(err);
+                if (isStrictBranchPolicy(branchPolicy)) {
+                    throw new Error(`[manifest enable] Failed to enable agent '${rawEntry}': ${message}`);
+                }
                 console.error(`[manifest enable] Failed to enable agent '${rawEntry}': ${message}`);
             }
         }

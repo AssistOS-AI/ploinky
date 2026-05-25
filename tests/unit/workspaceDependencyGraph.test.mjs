@@ -199,6 +199,33 @@ test('parseEnableDirective strips no-wait modifier from any position', () => {
     );
 });
 
+test('parseEnableDirective accepts object entries with profile overrides', () => {
+    assert.deepEqual(
+        parseEnableDirective({
+            agent: 'proxies/soul-gateway',
+            profile: 'Embedded',
+        }),
+        {
+            spec: 'proxies/soul-gateway',
+            alias: undefined,
+            noWait: false,
+            profile: 'embedded',
+        }
+    );
+    assert.deepEqual(
+        parseEnableDirective({
+            agent: 'worker global no-wait as ai',
+            profile: 'embedded',
+        }),
+        {
+            spec: 'worker global',
+            alias: 'ai',
+            noWait: true,
+            profile: 'embedded',
+        }
+    );
+});
+
 test('resolveWorkspaceDependencyGraph records no-wait metadata on the requesting edge only', () => {
     writeManifest('nw', 'leaf', { container: 'node:20-alpine' });
     writeManifest('nw', 'worker', {
@@ -334,6 +361,59 @@ test('AssistOSExplorer-shaped wiring routes the LiveKit AI worker as no-wait whi
     // truncated by the existing cycle handling, not promoted to a hard error.
     assert.equal(errors.length, 1);
     assert.match(errors[0], /Dependency cycle detected:/);
+});
+
+test('resolveWorkspaceDependencyGraph resolves profile-specific enable[] for semantic profiles', () => {
+    const profilePath = path.join(tempDir, '.ploinky', 'profile');
+    fs.mkdirSync(path.dirname(profilePath), { recursive: true });
+    fs.writeFileSync(profilePath, 'embedded');
+
+    writeManifest('proxies', 'soul-gateway', {
+        container: 'node:20-slim',
+        profiles: {
+            default: {},
+            embedded: {},
+        },
+    });
+    writeManifest('AchillesIDE', 'explorer-semantic', {
+        container: 'node:20',
+        enable: ['demo/leaf'],
+        profiles: {
+            default: {},
+            embedded: {
+                enable: ['proxies/soul-gateway'],
+            },
+        },
+    });
+
+    const graph = resolveWorkspaceDependencyGraph({ staticAgentRef: 'AchillesIDE/explorer-semantic' });
+    assert.ok(graph.nodes.has('proxies/soul-gateway'));
+    assert.ok(graph.nodes.has('demo/leaf'));
+    assert.ok(graph.nodes.get('AchillesIDE/explorer-semantic').dependencies.has('proxies/soul-gateway'));
+
+    fs.writeFileSync(profilePath, 'dev');
+});
+
+test('resolveWorkspaceDependencyGraph records dependency-local profile overrides', () => {
+    writeManifest('profileEdge', 'worker', {
+        container: 'node:20',
+        profiles: {
+            default: {},
+            embedded: {},
+        },
+    });
+    writeManifest('profileEdge', 'app', {
+        container: 'node:20',
+        enable: [
+            {
+                agent: 'profileEdge/worker',
+                profile: 'embedded',
+            },
+        ],
+    });
+
+    const graph = resolveWorkspaceDependencyGraph({ staticAgentRef: 'profileEdge/app' });
+    assert.equal(graph.nodes.get('profileEdge/worker').profile, 'embedded');
 });
 
 test('resolveWorkspaceDependencyGraph still truncates cycles instead of throwing', () => {

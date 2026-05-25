@@ -24,6 +24,7 @@ import { deriveAgentSecret } from './masterKey.js';
  *       {{STORAGE_HOST_PATH}}
  *       {{secret:<NAME>}}            (ensurePersistentSecret)
  *       {{derivedMasterSecret:<NAME>}}        (HKDF from PLOINKY_DERIVED_MASTER_KEY)
+ *       {{generatedSecret:<NAME>}}            (per-agent generated secret)
  *       {{var:<NAME>}}               (resolveVarValue / process.env)
  *
  * The plan is pure: planRuntimeResources reads the manifest only. Applying
@@ -69,6 +70,15 @@ function expandTemplate(raw, { hostPath, containerPath, useHostStoragePath = fal
         }
         if (expr.startsWith('derivedMasterSecret:')) {
             const name = expr.slice('derivedMasterSecret:'.length).trim();
+            if (!name) return '';
+            try {
+                return deriveAgentSecret({ repoName, agentName, name });
+            } catch (_) {
+                return '';
+            }
+        }
+        if (expr.startsWith('generatedSecret:')) {
+            const name = expr.slice('generatedSecret:'.length).trim();
             if (!name) return '';
             try {
                 return deriveAgentSecret({ repoName, agentName, name });

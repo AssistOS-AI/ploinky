@@ -33,7 +33,9 @@ const {
     listProfiles,
     validateProfile,
     getDefaultMountModes,
-    getProfileEnvVars
+    getProfileEnvVars,
+    getValidProfiles,
+    isValidProfile,
 } = profileService;
 
 const {
@@ -72,8 +74,8 @@ test.after(() => {
     fs.rmSync(tempDir, { recursive: true, force: true });
 });
 
-test('getActiveProfile defaults to dev when profile file is missing', () => {
-    assert.strictEqual(getActiveProfile(), 'dev');
+test('getActiveProfile defaults to default when profile file is missing', () => {
+    assert.strictEqual(getActiveProfile(), 'default');
 });
 
 test('setActiveProfile rejects invalid profile names', () => {
@@ -83,6 +85,10 @@ test('setActiveProfile rejects invalid profile names', () => {
 });
 
 test('setActiveProfile writes profile file and getActiveProfile reads it', () => {
+    writeManifest('repo-setprofile', 'agent-setprofile', {
+        profiles: { default: {}, qa: {} },
+    });
+
     const result = setActiveProfile('qa');
     assert.strictEqual(result.success, true);
     assert.strictEqual(getActiveProfile(), 'qa');
@@ -256,9 +262,11 @@ test('validateProfile accepts secrets from .env', () => {
     assert.strictEqual(result.valid, true);
 });
 
-test('getDefaultMountModes returns rw for dev and ro for prod', () => {
+test('getDefaultMountModes returns rw for default and ro for others', () => {
+    assert.deepStrictEqual(getDefaultMountModes('default'), { code: 'rw', skills: 'rw' });
     assert.deepStrictEqual(getDefaultMountModes('dev'), { code: 'rw', skills: 'rw' });
     assert.deepStrictEqual(getDefaultMountModes('prod'), { code: 'ro', skills: 'ro' });
+    assert.deepStrictEqual(getDefaultMountModes('embedded'), { code: 'ro', skills: 'ro' });
 });
 
 test('getProfileEnvVars includes profile metadata', () => {
@@ -417,4 +425,130 @@ test('createAgentWorkDir creates agent workspace folder', () => {
 
     assert.strictEqual(workDir, getAgentWorkDir(agentName));
     assert.ok(fs.statSync(workDir).isDirectory());
+});
+
+// --- Semantic (manifest-declared) profile tests ---
+
+test('isValidProfile always accepts default', () => {
+    assert.strictEqual(isValidProfile('default'), true);
+});
+
+test('isValidProfile rejects unknown profiles when no manifest declares them', () => {
+    assert.strictEqual(isValidProfile('staging'), false);
+    assert.strictEqual(isValidProfile('canary'), false);
+});
+
+test('isValidProfile accepts manifest-declared semantic profiles', () => {
+    writeManifest('proxies', 'soul-gateway', {
+        profiles: {
+            default: { env: {} },
+            embedded: { env: { PORT: '7000' } },
+            standalone: { env: { PORT: '8042' } },
+        },
+    });
+
+    assert.strictEqual(isValidProfile('embedded'), true);
+    assert.strictEqual(isValidProfile('standalone'), true);
+    assert.strictEqual(isValidProfile('nonexistent'), false);
+});
+
+test('getValidProfiles includes manifest-declared profiles', () => {
+    writeManifest('semantic', 'test-agent', {
+        profiles: {
+            default: {},
+            embedded: {},
+        },
+    });
+
+    const valid = getValidProfiles();
+    assert.ok(valid.includes('default'));
+    assert.ok(valid.includes('embedded'));
+});
+
+test('setActiveProfile accepts manifest-declared semantic profiles', () => {
+    writeManifest('semantic-set', 'agent-set', {
+        profiles: {
+            default: {},
+            embedded: { env: { MODE: 'embedded' } },
+        },
+    });
+
+    const result = setActiveProfile('embedded');
+    assert.strictEqual(result.success, true);
+    assert.strictEqual(getActiveProfile(), 'embedded');
+});
+
+test('getProfileConfig merges default with semantic profile', () => {
+    writeManifest('semantic-merge', 'agent-merge', {
+        profiles: {
+            default: {
+                env: { BASE: 'value', PORT: '8042' },
+            },
+            embedded: {
+                env: { PORT: '7000', MODE: 'embedded' },
+            },
+        },
+    });
+
+    const config = getProfileConfig('semantic-merge/agent-merge', 'embedded');
+    assert.deepStrictEqual(config.env, { BASE: 'value', PORT: '7000', MODE: 'embedded' });
+});
+
+test('getProfileConfig preserves structured object env specs when merged with array profile env', () => {
+    writeManifest('semantic-mixed-env', 'agent-mixed-env', {
+        profiles: {
+            default: {
+                env: {
+                    PGHOST: {
+                        required: false,
+                        default: 'host.containers.internal',
+                    },
+                    API_TOKEN: {
+                        name: 'HOST_API_TOKEN',
+                        required: false,
+                    },
+                },
+            },
+            embedded: {
+                env: [
+                    {
+                        name: 'PORT',
+                        required: false,
+                        default: '7000',
+                    },
+                ],
+            },
+        },
+    });
+
+    const config = getProfileConfig('semantic-mixed-env/agent-mixed-env', 'embedded');
+    assert.deepStrictEqual(config.env, [
+        {
+            name: 'PORT',
+            required: false,
+            default: '7000',
+        },
+        {
+            name: 'PGHOST',
+            required: false,
+            default: 'host.containers.internal',
+        },
+        {
+            name: 'API_TOKEN',
+            required: false,
+            varName: 'HOST_API_TOKEN',
+        },
+    ]);
+});
+
+test('getProfileConfig falls back to default when agent has no matching semantic profile', () => {
+    writeManifest('semantic-fallback', 'agent-fallback', {
+        profiles: {
+            default: { env: { PORT: '8042' } },
+            standalone: { env: { PORT: '8042' } },
+        },
+    });
+
+    const config = getProfileConfig('semantic-fallback/agent-fallback', 'embedded');
+    assert.deepStrictEqual(config.env, { PORT: '8042' });
 });

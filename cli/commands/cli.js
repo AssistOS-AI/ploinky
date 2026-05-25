@@ -37,6 +37,7 @@ import {
     enableAgent,
     findAgentManifest,
 } from './repoAgentCommands.js';
+import { parseStartArgs } from '../services/repos.js';
 import {
     handleVarsCommand,
     handleVarCommand,
@@ -302,9 +303,17 @@ async function handleCommand(args) {
             break;
         }
         // 'run' legacy commands removed; use 'start', 'cli', 'shell', 'console'.
-        case 'start':
-            await startWorkspace(options[0], options[1], { refreshComponentToken, ensureComponentToken, enableAgent, killRouterIfRunning });
+        case 'start': {
+            const startParsed = parseStartArgs(options);
+            await startWorkspace(startParsed.staticAgent, startParsed.port, {
+                refreshComponentToken,
+                ensureComponentToken,
+                enableAgent,
+                killRouterIfRunning,
+                branchPolicy: startParsed.branchPolicy,
+            });
             break;
+        }
         // 'route' and 'probe' commands removed (replaced by start/status and client commands)
         case 'webconsole': {
             // Alias of webtty; supports optional shell and --rotate

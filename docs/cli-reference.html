@@ -199,7 +199,7 @@ disable repoName/demo      # remove agent using repo-qualified name</code></pre>
                         
                         <h3>start</h3>
                         <p>Start agents from .ploinky/agents.json and launch Router.</p>
-                        <pre><code>start [staticAgent] [port]</code></pre>
+                        <pre><code>start [staticAgent] [port] [--branch &lt;branch&gt;] [--repo-branch &lt;repo=branch&gt;]... [--branch-fallback default|fail] [--reset-repos]</code></pre>
                         <table class="command-table">
                             <tr>
                                 <th>Parameter</th>
@@ -213,12 +213,37 @@ disable repoName/demo      # remove agent using repo-qualified name</code></pre>
                                 <td><code>[port]</code></td>
                                 <td>Router port (default: 8080)</td>
                             </tr>
+                            <tr>
+                                <td><code>--branch &lt;branch&gt;</code></td>
+                                <td>Candidate branch for all repos involved in this start</td>
+                            </tr>
+                            <tr>
+                                <td><code>--repo-branch &lt;repo=branch&gt;</code></td>
+                                <td>Override the candidate branch for one repo (repeatable)</td>
+                            </tr>
+                            <tr>
+                                <td><code>--branch-fallback</code></td>
+                                <td><code>default</code> (keep configured branch when candidate is missing) or <code>fail</code> (abort startup). Default: <code>default</code></td>
+                            </tr>
+                            <tr>
+                                <td><code>--reset-repos</code></td>
+                                <td>Allow hard reset of dirty managed repos under <code>.ploinky/repos/</code></td>
+                            </tr>
                         </table>
                         <pre><code># First time setup
 start demo 8080
 
 # Subsequent starts (uses saved configuration)
-start</code></pre>
+start
+
+# Branch-aware fresh workspace
+start AchillesIDE/explorer 8080 --branch embedded-soul-gateway
+
+# Per-repo branch override
+start AchillesIDE/explorer 8080 --branch embedded-soul-gateway --repo-branch webmeetInfra=main
+
+# Strict CI/deploy mode
+start AchillesIDE/explorer 8097 --branch embedded-soul-gateway --branch-fallback fail --reset-repos</code></pre>
 
                         <h3>shell</h3>
                         <p>Open interactive shell session in agent container.</p>

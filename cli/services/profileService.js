@@ -5,8 +5,36 @@ import { validateSecrets } from './secretInjector.js';
 import { validateManifestEnvProfileCompleteness } from './secretVars.js';
 import { debugLog, findAgent } from './utils.js';
 
-// Valid profile names (default is always applied as base)
-const VALID_PROFILES = ['default', 'dev', 'qa', 'prod'];
+// Discover all valid profile names from installed agent manifests.
+// Any profile name declared in a manifest's "profiles" section is valid.
+// "default" is always valid — it's the base profile every agent must have.
+function discoverManifestProfiles() {
+    const discovered = new Set(['default']);
+    try {
+        if (!fs.existsSync(REPOS_DIR)) return discovered;
+        for (const repo of fs.readdirSync(REPOS_DIR)) {
+            const repoDir = path.join(REPOS_DIR, repo);
+            if (!fs.statSync(repoDir).isDirectory()) continue;
+            for (const agent of fs.readdirSync(repoDir)) {
+                const manifestPath = path.join(repoDir, agent, 'manifest.json');
+                try {
+                    if (!fs.existsSync(manifestPath)) continue;
+                    const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+                    if (manifest?.profiles && typeof manifest.profiles === 'object') {
+                        for (const profileName of Object.keys(manifest.profiles)) {
+                            discovered.add(profileName);
+                        }
+                    }
+                } catch (_) {}
+            }
+        }
+    } catch (_) {}
+    return discovered;
+}
+
+function isValidProfile(profileName) {
+    return discoverManifestProfiles().has(profileName);
+}
 
 // Hook names in execution order
 // preinstall: HOST hook that runs BEFORE container creation (can set ploinky vars)
@@ -75,13 +103,24 @@ function mergeEnv(defaultEnv, activeEnv) {
         return { ...(defaultEnv || {}), ...(activeEnv || {}) };
     }
 
-    // Mixed formats - convert object to array entries and merge as arrays
+    // Mixed formats - convert object specs to array specs without flattening
+    // structured entries into "[object Object]" strings.
     const toArray = (env) => {
         if (Array.isArray(env)) return env;
         if (!env || typeof env !== 'object') return [];
-        return Object.entries(env).map(([key, val]) =>
-            val === '' || val === undefined ? key : `${key}=${val}`
-        );
+        return Object.entries(env).map(([key, val]) => {
+            if (val && typeof val === 'object' && !Array.isArray(val)) {
+                const { name: sourceName, varName, ...rest } = val;
+                return {
+                    name: key,
+                    ...rest,
+                    ...(varName !== undefined
+                        ? { varName }
+                        : (sourceName !== undefined ? { varName: sourceName } : {})),
+                };
+            }
+            return val === '' || val === undefined ? key : `${key}=${val}`;
+        });
     };
 
     return mergeEnv(toArray(defaultEnv), toArray(activeEnv));
@@ -147,12 +186,12 @@ export function getActiveProfile() {
     try {
         if (fs.existsSync(PROFILE_FILE)) {
             const profile = fs.readFileSync(PROFILE_FILE, 'utf8').trim();
-            if (profile && VALID_PROFILES.includes(profile)) {
+            if (profile && isValidProfile(profile)) {
                 return profile;
             }
         }
     } catch (_) {}
-    return 'dev';
+    return 'default';
 }
 
 /**
@@ -163,10 +202,10 @@ export function getActiveProfile() {
 export function setActiveProfile(profileName) {
     const normalizedProfile = profileName.toLowerCase().trim();
 
-    if (!VALID_PROFILES.includes(normalizedProfile)) {
+    if (!isValidProfile(normalizedProfile)) {
         return {
             success: false,
-            message: `Invalid profile '${profileName}'. Valid profiles are: ${VALID_PROFILES.join(', ')}`
+            message: `Invalid profile '${profileName}'. Valid profiles are: ${getValidProfiles().join(', ')}`,
         };
     }
 
@@ -352,10 +391,9 @@ export function listProfiles(agentName) {
  * @returns {{ code: string, skills: string }}
  */
 export function getDefaultMountModes(profile) {
-    if (profile === 'dev') {
+    if (profile === 'default' || profile === 'dev') {
         return { code: 'rw', skills: 'rw' };
     }
-    // qa and prod default to read-only
     return { code: 'ro', skills: 'ro' };
 }
 
@@ -365,13 +403,8 @@ export function getDefaultMountModes(profile) {
  * @returns {string} Environment identifier
  */
 export function getProfileEnvironment(profile) {
-    const envMap = {
-        'default': 'development',
-        'dev': 'development',
-        'qa': 'qa',
-        'prod': 'production'
-    };
-    return envMap[profile] || 'development';
+    if (profile === 'default') return 'development';
+    return profile;
 }
 
 /**
@@ -399,8 +432,10 @@ export function getProfileEnvVars(agentName, repoName, profile, containerInfo = 
  * @returns {string[]} Array of valid profile names
  */
 export function getValidProfiles() {
-    return [...VALID_PROFILES];
+    return [...discoverManifestProfiles()];
 }
+
+export { isValidProfile };
 
 /**
  * Get the list of hook names in execution order.

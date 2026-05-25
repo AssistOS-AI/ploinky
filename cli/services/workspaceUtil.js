@@ -85,6 +85,9 @@ function spawnNoWaitWorker({ node, registryName, routeKey, registryAlias, router
   if (registryAlias) {
     args.push('--alias', registryAlias);
   }
+  if (node.profile) {
+    args.push('--profile', node.profile);
+  }
   if (routerPort) {
     args.push('--router-port', String(routerPort));
   }
@@ -240,10 +243,18 @@ function ensureGraphNodesEnabled(graph, reg) {
     .sort((a, b) => a.id.localeCompare(b.id));
 
   for (const node of nodes) {
-    if (findRegistryEntryForGraphNode(reg, node, dockerSvc.getAgentContainerName)) {
+    const existing = findRegistryEntryForGraphNode(reg, node, dockerSvc.getAgentContainerName);
+    if (existing) {
+      if (node.profile && existing.rec.profile !== node.profile) {
+        existing.rec.profile = node.profile;
+        reg[existing.key] = existing.rec;
+        workspaceSvc.saveAgents(reg);
+      }
       continue;
     }
-    agentsSvc.enableAgent(node.enableSpec || node.agentRef, undefined, undefined, node.alias || undefined);
+    agentsSvc.enableAgent(node.enableSpec || node.agentRef, undefined, undefined, node.alias || undefined, undefined, {
+      profile: node.profile || undefined,
+    });
   }
 }
 
@@ -409,7 +420,7 @@ async function waitForReadinessEntries(readinessEntries) {
   }));
 }
 
-async function startWorkspace(staticAgentArg, portArg, { refreshComponentToken, ensureComponentToken, enableAgent, killRouterIfRunning } = {}) {
+async function startWorkspace(staticAgentArg, portArg, { refreshComponentToken, ensureComponentToken, enableAgent, killRouterIfRunning, branchPolicy } = {}) {
   // Clear the in-process preinstall dedup set so each workspace start (e.g.
   // a `restart` re-entering this function in the same CLI process) re-runs
   // hooks that may need to regenerate runtime files.
@@ -542,7 +553,11 @@ async function startWorkspace(staticAgentArg, portArg, { refreshComponentToken, 
       console.error(`[start] Preinstall hook error: ${preErr.message}`);
     }
 
-    try { await applyManifestDirectives(cfg0.static.agent); } catch (_) {}
+    try {
+      await applyManifestDirectives(cfg0.static.agent, { branchPolicy });
+    } catch (err) {
+      throw new Error(`Failed to apply manifest directives for '${cfg0.static.agent}': ${err?.message || err}`);
+    }
     let reg = deduplicateAgentRegistry(workspaceSvc.loadAgents(), dockerSvc.getAgentContainerName);
     workspaceSvc.saveAgents(reg);
 

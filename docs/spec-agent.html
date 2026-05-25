@@ -294,6 +294,15 @@
                             <li><code>LOG_LEVEL</code> will be set to <code>"info"</code> if not otherwise defined in the workspace.</li>
                             <li>If <code>DATABASE_URL</code> is not defined in the workspace, it will be treated as a required variable because its default value is <code>null</code>.</li>
                         </ul>
+                        <h5>3. Generated Agent Secrets</h5>
+                        <p>For workspace-owned secrets that belong to one agent, set <code>generatedSecret: true</code>. Ploinky derives the value from <code>PLOINKY_DERIVED_MASTER_KEY</code>, the current repo name, the current agent name, and the env name, and ignores operator-provided values with the same name.</p>
+                        <pre><code>"env": [
+  {
+    "name": "AGENT_ENCRYPTION_KEY",
+    "required": true,
+    "generatedSecret": true
+  }
+]</code></pre>
                     </div>
 
                     <div class="doc-section" id="lifecycle">
@@ -608,7 +617,7 @@ client task MyAgent</code></pre>
                         <h3>Security</h3>
                         <ul style="margin-left: 2rem;">
                             <li>Never hardcode secrets in manifest.json</li>
-                            <li>Use environment variables for sensitive data</li>
+                            <li>Use environment variables for sensitive data, and <code>generatedSecret: true</code> for agent-owned generated secrets</li>
                             <li>Run processes as non-root user when possible</li>
                             <li>Validate all input in API endpoints</li>
                         </ul>

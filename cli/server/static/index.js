@@ -118,8 +118,8 @@ function getBaseDirs(appName, fallbackDir) {
     return dedupe(dirs);
 }
 
-function isPathWithinAllowedRoots(allowedRoots, targetPath) {
-    return isPathWithinRoots(allowedRoots, targetPath);
+function isPathWithinAllowedRoots(allowedRoots, targetPath, options = {}) {
+    return isPathWithinRoots(allowedRoots, targetPath, options);
 }
 
 function getStaticAllowedRoots() {
@@ -437,7 +437,7 @@ function resolveWorkspaceFile(requestPath) {
     const allowedRoots = [workspaceRoot];
 
     try {
-        if (!isPathWithinAllowedRoots(allowedRoots, candidate)) {
+        if (!isPathWithinAllowedRoots(allowedRoots, candidate, { allowMissing: true })) {
             return { status: 'denied', filePath: null };
         }
         const stat = fs.statSync(candidate);

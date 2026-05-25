@@ -37,7 +37,7 @@ export async function handleProfileCommand(args) {
             console.log('Usage: ploinky profile [<profileName>|list|validate|show]');
             console.log('');
             console.log('Commands:');
-            console.log('  ploinky profile <name>        Set active profile (dev, qa, prod)');
+            console.log('  ploinky profile <name>        Set active profile');
             console.log('  ploinky profile show          Show current profile');
             console.log('  ploinky profile list [agent]  List available profiles');
             console.log('  ploinky profile validate <profile> [agent]  Validate profile config');
@@ -65,9 +65,9 @@ function handleSetProfile(profileName) {
         console.log(`  Code mount:  ${mountModes.code === 'rw' ? colorize('read-write', 'yellow') : colorize('read-only', 'cyan')}`);
         console.log(`  Skills mount: ${mountModes.skills === 'rw' ? colorize('read-write', 'yellow') : colorize('read-only', 'cyan')}`);
 
-        if (profile !== 'dev') {
+        if (mountModes.code === 'ro') {
             console.log('');
-            console.log(colorize('Note:', 'yellow'), 'In qa/prod profiles, code and skills are read-only.');
+            console.log(colorize('Note:', 'yellow'), 'Code and skills are read-only in this profile.');
             console.log('       Restart running agents to apply the new profile.');
         }
     } else {
@@ -91,7 +91,7 @@ function showCurrentProfile() {
     console.log('');
     console.log('Valid profiles:', getValidProfiles().join(', '));
     console.log('');
-    console.log('To change profile: ploinky profile <dev|qa|prod>');
+    console.log('To change profile: ploinky profile <name>');
 }
 
 /**
@@ -107,7 +107,6 @@ function handleListProfiles(args) {
 
         if (profiles.length === 0) {
             console.log(`Agent '${agentName}' has no defined profiles.`);
-            console.log('Using global profiles: dev, qa, prod');
             return;
         }
 
@@ -140,7 +139,7 @@ function handleListProfiles(args) {
             console.log('Enabled agents:');
             for (const [containerName, record] of agentEntries) {
                 const agentName = record.agentName;
-                const agentProfile = record.profile || 'dev';
+                const agentProfile = record.profile || 'default';
                 const { profiles } = listProfiles(`${record.repoName}/${agentName}`);
                 const profileInfo = profiles.length > 0
                     ? `profiles: ${profiles.join(', ')}`
@@ -251,12 +250,8 @@ function showProfileConfigSummary(config) {
  * @returns {string}
  */
 function getProfileEnvironmentLabel(profile) {
-    const labels = {
-        'dev': colorize('Development', 'green'),
-        'qa': colorize('QA/Testing', 'yellow'),
-        'prod': colorize('Production', 'red')
-    };
-    return labels[profile] || profile;
+    if (profile === 'default') return colorize('Development', 'green');
+    return profile;
 }
 
 export { handleSetProfile, showCurrentProfile, handleListProfiles, handleValidateProfile };

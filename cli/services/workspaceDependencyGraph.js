@@ -113,6 +113,11 @@ function findRegistryRecord(registry, { repoName, shortAgentName, alias = '' }) 
     )) || null;
 }
 
+function normalizeProfileOverride(profile) {
+    const normalized = String(profile || '').trim().toLowerCase();
+    return normalized || '';
+}
+
 function resolveWorkspaceDependencyGraph({ staticAgentRef, registry = {} } = {}) {
     if (!staticAgentRef || typeof staticAgentRef !== 'string') {
         throw new Error('Missing static agent reference.');
@@ -121,9 +126,10 @@ function resolveWorkspaceDependencyGraph({ staticAgentRef, registry = {} } = {})
     const nodes = new Map();
     const state = new Map();
 
-    function visit(agentRef, { alias = '', enableSpec = '', isStatic = false, stack = [] } = {}) {
+    function visit(agentRef, { alias = '', enableSpec = '', profile = '', isStatic = false, stack = [] } = {}) {
         const resolved = findAgent(agentRef);
         const nodeId = createGraphNodeId(resolved.repo, resolved.shortAgentName, alias);
+        const requestedProfile = normalizeProfileOverride(profile);
 
         if (stack.includes(nodeId)) {
             throw new Error(`Dependency cycle detected: ${[...stack, nodeId].join(' -> ')}`);
@@ -137,10 +143,12 @@ function resolveWorkspaceDependencyGraph({ staticAgentRef, registry = {} } = {})
                 shortAgentName: resolved.shortAgentName,
                 alias
             });
+            const profileName = requestedProfile || normalizeProfileOverride(registryRecord?.profile);
             node = {
                 id: nodeId,
                 agentRef: `${resolved.repo}/${resolved.shortAgentName}`,
                 enableSpec: String(enableSpec || agentRef || `${resolved.repo}/${resolved.shortAgentName}`).trim(),
+                profile: profileName,
                 repoName: resolved.repo,
                 shortAgentName: resolved.shortAgentName,
                 alias,
@@ -161,6 +169,8 @@ function resolveWorkspaceDependencyGraph({ staticAgentRef, registry = {} } = {})
             nodes.set(nodeId, node);
         } else if (isStatic) {
             node.isStatic = true;
+        } else if (requestedProfile && node.profile !== requestedProfile) {
+            node.profile = requestedProfile;
         }
 
         const status = state.get(nodeId);
@@ -176,7 +186,7 @@ function resolveWorkspaceDependencyGraph({ staticAgentRef, registry = {} } = {})
         const baseEnable = Array.isArray(node.manifest.enable) ? node.manifest.enable : [];
         let profileEnable = [];
         try {
-            const activeProfile = getActiveProfile();
+            const activeProfile = node.profile || getActiveProfile();
             const profileBlock = node.manifest?.profiles?.[activeProfile];
             if (profileBlock && Array.isArray(profileBlock.enable)) {
                 profileEnable = profileBlock.enable;
@@ -198,6 +208,7 @@ function resolveWorkspaceDependencyGraph({ staticAgentRef, registry = {} } = {})
                 const childId = visit(dependencyRef, {
                     alias: parsedDependency.alias || '',
                     enableSpec: parsedDependency.spec || dependencyRef,
+                    profile: parsedDependency.profile || '',
                     stack: nextStack
                 });
                 node.dependencies.add(childId);
