@@ -14,7 +14,14 @@ import * as staticSrv from './static/index.js';
 
 // Authentication and routing
 import { ensureAuthenticated, handleAuthRoutes, handleUserAdminRoutes } from './authHandlers.js';
-import { loadApiRoutes, handleRouterMcp, handleHttpServiceRoute, isPublicHttpServiceRoute } from './routerHandlers.js';
+import {
+    buildPlainAuthInfoHeader,
+    loadApiRoutes,
+    handleRouterMcp,
+    handleHttpServiceRoute,
+    isPublicHttpServiceRoute,
+    proxyHttpPassthrough
+} from './routerHandlers.js';
 
 // Logging
 import { appendLog, logBootEvent, logMemoryUsage } from './utils/logger.js';
@@ -152,6 +159,69 @@ async function proxyAgentTaskStatus(req, res, route, parsedUrl, agentName) {
     upstream.end();
 }
 
+function sendJsonResponse(res, statusCode, body, extraHeaders = {}) {
+    const data = Buffer.from(JSON.stringify(body));
+    res.writeHead(statusCode, {
+        'Content-Type': 'application/json',
+        'Content-Length': data.length,
+        ...extraHeaders
+    });
+    res.end(data);
+}
+
+function decodePathSegment(value) {
+    try {
+        return decodeURIComponent(value || '');
+    } catch (_) {
+        return '';
+    }
+}
+
+function matchSingleAgentRoute(pathname, prefixParts) {
+    const parts = String(pathname || '').split('/').filter(Boolean);
+    if (parts.length !== prefixParts.length + 1) return null;
+    for (let i = 0; i < prefixParts.length; i += 1) {
+        if (parts[i] !== prefixParts[i]) return null;
+    }
+    const agentName = decodePathSegment(parts[prefixParts.length]).trim();
+    return agentName || null;
+}
+
+function resolveAgentRouteOrRespond(res, apiRoutes, agentName) {
+    const route = apiRoutes[agentName];
+    if (!route || !route.hostPort) {
+        sendJsonResponse(res, 404, { error: 'agent_not_found', agent: agentName });
+        return null;
+    }
+    return route;
+}
+
+function handleRoutedOpenAiChatCompletions(req, res, parsedUrl, agentName) {
+    const method = (req.method || 'GET').toUpperCase();
+    if (method !== 'POST') {
+        sendJsonResponse(res, 405, { error: 'method_not_allowed' }, { Allow: 'POST' });
+        return;
+    }
+    const apiRoutes = loadApiRoutes();
+    const route = resolveAgentRouteOrRespond(res, apiRoutes, agentName);
+    if (!route) return;
+    const identityHeaders = buildPlainAuthInfoHeader(req);
+    proxyHttpPassthrough(req, res, route.hostPort, `/v1/chat/completions${parsedUrl.search || ''}`, identityHeaders);
+}
+
+function handleRoutedAgentCapabilities(req, res, parsedUrl, agentName) {
+    const method = (req.method || 'GET').toUpperCase();
+    if (method !== 'GET') {
+        sendJsonResponse(res, 405, { error: 'method_not_allowed' }, { Allow: 'GET' });
+        return;
+    }
+    const apiRoutes = loadApiRoutes();
+    const route = resolveAgentRouteOrRespond(res, apiRoutes, agentName);
+    if (!route) return;
+    const identityHeaders = buildPlainAuthInfoHeader(req);
+    proxyHttpPassthrough(req, res, route.hostPort, `/capabilities${parsedUrl.search || ''}`, identityHeaders);
+}
+
 function isAgentMcpProxyRoute(pathname) {
     if (!(pathname.startsWith('/mcps/') || pathname.startsWith('/mcp/'))) {
         return false;
@@ -166,6 +236,8 @@ function isAgentMcpProxyRoute(pathname) {
 async function processRequest(req, res) {
     const parsedUrl = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
     const pathname = parsedUrl.pathname || '/';
+    const routedOpenAiAgent = matchSingleAgentRoute(pathname, ['v1', 'chat', 'completions']);
+    const routedCapabilitiesAgent = matchSingleAgentRoute(pathname, ['capabilities']);
     appendLog('http_request', { method: req.method, path: pathname });
 
     // Health check endpoint (no auth required)
@@ -250,6 +322,10 @@ async function processRequest(req, res) {
         return handleBlobs(req, res);
     } else if (handleHttpServiceRoute(req, res, parsedUrl)) {
         return;
+    } else if (routedOpenAiAgent) {
+        return handleRoutedOpenAiChatCompletions(req, res, parsedUrl, routedOpenAiAgent);
+    } else if (routedCapabilitiesAgent) {
+        return handleRoutedAgentCapabilities(req, res, parsedUrl, routedCapabilitiesAgent);
     } else if (pathname === '/mcp' || pathname === '/mcp/') {
         return handleRouterMcp(req, res);
     } else if (pathname.startsWith('/mcps/') || pathname.startsWith('/mcp/')) {

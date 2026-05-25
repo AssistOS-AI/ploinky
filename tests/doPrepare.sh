@@ -28,6 +28,8 @@ ENABLE_ALIAS_AGENT_NAME="enableAliasAgent"
 ENABLE_ALIAS_AGENT_ALIAS="aliasAgent"
 write_state_var "TEST_ENABLE_ALIAS_AGENT_NAME" "$ENABLE_ALIAS_AGENT_NAME"
 write_state_var "TEST_ENABLE_ALIAS_AGENT_ALIAS" "$ENABLE_ALIAS_AGENT_ALIAS"
+OPENAI_AGENT_NAME="openaiAgent"
+write_state_var "TEST_OPENAI_AGENT_NAME" "$OPENAI_AGENT_NAME"
 
 if [[ -z "${TEST_RUN_DIR:-}" ]]; then
   TEST_RUN_DIR=$(mktemp -d -t ploinky-fast-XXXXXX)
@@ -90,6 +92,81 @@ cp "${TESTS_DIR}/testAgent/start_script.sh" "${agent_root}/start_script.sh"
 printf 'fast-static-ok' >"${agent_root}/fast-static.txt"
 write_state_var "TEST_STATIC_ASSET_PATH" "/${TEST_AGENT_NAME}/fast-static.txt"
 write_state_var "TEST_STATIC_ASSET_EXPECTED" "fast-static-ok"
+
+openai_agent_root="${repo_root}/${OPENAI_AGENT_NAME}"
+mkdir -p "$openai_agent_root"
+
+cat >"${openai_agent_root}/openai-chat.js" <<'EOF'
+let input = '';
+process.stdin.on('data', chunk => { input += chunk; });
+process.stdin.on('end', () => {
+  let payload = {};
+  try { payload = JSON.parse(input || '{}'); } catch (_) { payload = {}; }
+  const request = payload.request && typeof payload.request === 'object' ? payload.request : {};
+  const messages = Array.isArray(request.messages) ? request.messages : [];
+  let lastUser = 'hello';
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const msg = messages[i];
+    if (msg && msg.role === 'user' && typeof msg.content === 'string') {
+      lastUser = msg.content;
+      break;
+    }
+  }
+  const created = Math.floor(Date.now() / 1000);
+  const content = `echo:${lastUser}`;
+  const model = typeof request.model === 'string' && request.model.trim() ? request.model.trim() : 'demo-chat';
+  if (request.stream === true) {
+    const chunk = {
+      id: 'chatcmpl-stream-demo',
+      object: 'chat.completion.chunk',
+      created,
+      model,
+      choices: [{ index: 0, delta: { content }, finish_reason: null }]
+    };
+    process.stdout.write(`data: ${JSON.stringify(chunk)}\n\n`);
+    process.stdout.write('data: [DONE]\n\n');
+    return;
+  }
+  const response = {
+    id: 'chatcmpl-demo',
+    object: 'chat.completion',
+    created,
+    model,
+    choices: [{ index: 0, message: { role: 'assistant', content }, finish_reason: 'stop' }],
+    usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
+  };
+  process.stdout.write(JSON.stringify(response));
+});
+EOF
+
+cat >"${openai_agent_root}/manifest.json" <<EOF
+{
+  "lite-sandbox": true,
+  "container": "node:20-bullseye",
+  "endpoints": {
+    "chatCompletions": {
+      "command": "node",
+      "args": ["/code/openai-chat.js"],
+      "supportsStream": true
+    },
+    "capabilities": {
+      "tags": ["fast", "coding"],
+      "summary": "Test agent for OpenAI-compatible chat completions.",
+      "whenToUse": "Use for validating AgentServer OpenAI endpoints in the test suite.",
+      "input": {
+        "conventions": "Send OpenAI chat-completions payloads with messages[].content.",
+        "schema": {
+          "type": "object",
+          "properties": {
+            "messages": { "type": "array" },
+            "stream": { "type": "boolean" }
+          }
+        }
+      }
+    }
+  }
+}
+EOF
 
 # Agent used to exercise disable flows later in the suite
 disable_agent_root="${repo_root}/${TEST_AGENT_TO_DISABLE_NAME}"
@@ -219,6 +296,9 @@ set_manifest_readiness_protocol ".ploinky/repos/webmeet/moderator/manifest.json"
 
 test_info "Enabling agent ${TEST_AGENT_QUALIFIED}."
 ploinky enable agent "$TEST_AGENT_QUALIFIED"
+
+test_info "Enabling OpenAI test agent ${TEST_REPO_NAME}/${OPENAI_AGENT_NAME}."
+ploinky enable agent "${TEST_REPO_NAME}/${OPENAI_AGENT_NAME}"
 
 test_info "Enabling agent ${TEST_AGENT_TO_DISABLE_QUALIFIED}."
 ploinky enable agent "$TEST_AGENT_TO_DISABLE_QUALIFIED"

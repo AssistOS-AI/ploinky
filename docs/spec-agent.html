@@ -83,6 +83,28 @@
 
   // Metadata
   "about": "Express API server",      // Description shown in listings
+  "endpoints": {                     // OpenAI + capability endpoints
+    "chatCompletions": {
+      "command": "node",
+      "args": ["/code/openai-chat.js"],
+      "supportsStream": true
+    },
+    "capabilities": {                // Optional agent capability metadata
+      "tags": ["fast", "coding"],
+      "summary": "Short agent summary",
+      "whenToUse": "Use for quick code-focused requests.",
+      "input": {
+        "conventions": "Natural language prompt; supports OpenAI chat payloads.",
+        "schema": {
+          "type": "object",
+          "properties": {
+            "messages": { "type": "array" },
+            "stream": { "type": "boolean" }
+          }
+        }
+      }
+    }
+  },
 
   // Sandbox and runtime
   "lite-sandbox": true,               // Enable sandbox runtime auto-detection
@@ -177,6 +199,11 @@
                                 <td><code>about</code></td>
                                 <td>No</td>
                                 <td>Human-readable description</td>
+                            </tr>
+                            <tr>
+                                <td><code>endpoints</code></td>
+                                <td>No</td>
+                                <td>Endpoint configuration for <code>/v1/chat/completions</code> and <code>/capabilities</code>, including <code>chatCompletions</code> command specs and <code>capabilities</code> metadata.</td>
                             </tr>
                             <tr>
                                 <td><code>env</code></td>

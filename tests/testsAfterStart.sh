@@ -31,6 +31,7 @@ source "$TESTS_DIR/test-functions/volume_mount_tests.sh"
 source "$TESTS_DIR/test-functions/dashboard_tests.sh"
 source "$TESTS_DIR/test-functions/manifest_ports_test.sh"
 source "$TESTS_DIR/test-functions/workspace_dependency_startup_tests.sh"
+source "$TESTS_DIR/test-functions/openai_endpoints_tests.sh"
 
 load_state
 require_var "TEST_RUN_DIR"
@@ -40,6 +41,7 @@ require_var "TEST_AGENT_HOST_PORT"
 require_var "TEST_AGENT_HEALTH_URL"
 require_var "TEST_AGENT_LOG"
 require_var "TEST_AGENT_NAME"
+require_var "TEST_OPENAI_AGENT_NAME"
 require_var "TEST_PERSIST_FILE"
 require_var "TEST_AGENT_CONTAINER_PORT"
 require_var "TEST_AGENT_DEP_GLOBAL_NAME"
@@ -69,6 +71,11 @@ test_check "Container exposes AGENT_NAME" assert_container_env "$TEST_AGENT_CONT
 test_check "Container exposes FAST_TEST_MARKER" assert_container_env "$TEST_AGENT_CONT_NAME" "FAST_TEST_MARKER" "fast-suite"
 test_check "Agent log file created" assert_file_contains "$TEST_AGENT_LOG" "listening"
 test_check "Persisted data file created" assert_file_exists "$TEST_PERSIST_FILE"
+
+stage_header "RoutingServer OpenAI Endpoints"
+test_check "Chat completions returns response" fast_openai_chat_completions
+test_check "Chat completions supports stream" fast_openai_chat_completions_stream
+test_check "Capabilities endpoint returns metadata" fast_openai_capabilities
 
 stage_header "Health Probes Agent"
 test_check "Health probes agent container is running" assert_container_running "$TEST_HEALTH_AGENT_CONT_NAME"

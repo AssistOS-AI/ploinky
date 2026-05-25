@@ -19,6 +19,9 @@ const DEFAULT_MAX_CONCURRENT_TASKS = 10;
 const DEFAULT_TASK_LOG_TAIL_BYTES = 128 * 1024;
 const TASK_QUEUE_FILE = path.resolve(process.cwd(), '.tasksQueue');
 const invocationReplayCache = createMemoryReplayCache({ maxSize: 4096 });
+const OPENAI_CHAT_COMPLETIONS_PATH = '/v1/chat/completions';
+const CAPABILITIES_PATH = '/capabilities';
+const TAG_NAME_RE = /^[a-z][a-z0-9_-]{0,63}$/;
 
 function verifyInvocationForRequest({ requestHeaders, bodyObject, expectedTool }) {
     return verifyInvocationFromHeaders(requestHeaders, bodyObject, {
@@ -87,6 +90,49 @@ function getConfigResult() {
     return cachedConfigResult;
 }
 
+function resolveManifestPaths() {
+    const explicit = [
+        process.env.PLOINKY_AGENT_MANIFEST,
+        process.env.PLOINKY_MANIFEST_FILE,
+        process.env.AGENT_MANIFEST_FILE
+    ].filter(Boolean);
+    const defaults = [
+        `${process.env.PLOINKY_CODE_DIR || '/code'}/manifest.json`,
+        path.join(process.cwd(), 'manifest.json')
+    ];
+    return [...explicit, ...defaults];
+}
+
+function loadManifest() {
+    const candidates = resolveManifestPaths();
+    for (const candidate of candidates) {
+        if (!candidate) continue;
+        try {
+            const stat = fs.statSync(candidate);
+            if (!stat.isFile()) continue;
+            const raw = fs.readFileSync(candidate, 'utf8');
+            const parsed = JSON.parse(raw);
+            return { source: candidate, manifest: parsed };
+        } catch (err) {
+            if (err.code === 'ENOENT') continue;
+            if (err instanceof SyntaxError) {
+                console.error(`[AgentServer/manifest] Failed to parse manifest '${candidate}': ${err.message}`);
+            } else {
+                console.error(`[AgentServer/manifest] Cannot read manifest '${candidate}': ${err.message}`);
+            }
+        }
+    }
+    return null;
+}
+
+let cachedManifestResult = null;
+function getManifestResult() {
+    if (!cachedManifestResult) {
+        cachedManifestResult = loadManifest();
+    }
+    return cachedManifestResult;
+}
+
 function resolveMaxConcurrent(config) {
     if (config && config.maxParallelTasks) {
         const candidate = Number(config.maxParallelTasks);
@@ -112,7 +158,10 @@ function resolveTaskLogTailBytes(config) {
 function buildCommandSpec(entry, defaultCwd) {
     const commandValue = typeof entry?.command === 'string' ? entry.command.trim() : null;
     if (!commandValue) return null;
-    const command = path.isAbsolute(commandValue) ? commandValue : path.resolve(defaultCwd, commandValue);
+    const needsResolution = commandValue.includes('/') || commandValue.includes('\\');
+    const command = path.isAbsolute(commandValue)
+        ? commandValue
+        : (needsResolution ? path.resolve(defaultCwd, commandValue) : commandValue);
     const args = Array.isArray(entry?.args)
         ? entry.args
             .map((value) => (typeof value === 'string' ? value : String(value ?? '')))
@@ -127,6 +176,73 @@ function buildCommandSpec(entry, defaultCwd) {
     const env = entry?.env && typeof entry.env === 'object' ? entry.env : {};
     const timeoutMs = Number.isFinite(entry?.timeoutMs) ? entry.timeoutMs : undefined;
     return { command, args, cwd, env, timeoutMs };
+}
+
+function normalizeTagList(value) {
+    const raw = Array.isArray(value) ? value : typeof value === 'string' ? value.split(/[,\s]+/) : [];
+    const seen = new Set();
+    const tags = [];
+    for (const entry of raw) {
+        if (typeof entry !== 'string') continue;
+        const normalized = entry.trim().replace(/^@+/, '').toLowerCase();
+        if (!TAG_NAME_RE.test(normalized)) continue;
+        if (seen.has(normalized)) continue;
+        seen.add(normalized);
+        tags.push(normalized);
+    }
+    return tags;
+}
+
+function normalizeCapabilities(value) {
+    if (!value || typeof value !== 'object') return null;
+    const capabilities = { ...value };
+    if ('tags' in capabilities) {
+        const normalizedTags = normalizeTagList(capabilities.tags);
+        if (normalizedTags.length) {
+            capabilities.tags = normalizedTags;
+        } else {
+            delete capabilities.tags;
+        }
+    }
+    const maybeStrings = ['summary', 'description', 'whenToUse', 'whenNotToUse', 'inputConventions', 'outputConventions'];
+    for (const field of maybeStrings) {
+        if (typeof capabilities[field] === 'string') {
+            const trimmed = capabilities[field].trim();
+            if (trimmed) {
+                capabilities[field] = trimmed;
+            } else {
+                delete capabilities[field];
+            }
+        }
+    }
+    if (Object.keys(capabilities).length === 0) return null;
+    return capabilities;
+}
+
+function resolveOpenAiChatConfig(manifest) {
+    if (!manifest || typeof manifest !== 'object') return null;
+    const endpoints = manifest.endpoints;
+    if (!endpoints || typeof endpoints !== 'object') return null;
+    const chatConfig = endpoints.chatCompletions;
+    if (!chatConfig || typeof chatConfig !== 'object') return null;
+    const commandSpec = buildCommandSpec(chatConfig, process.env.PLOINKY_CODE_DIR || '/code');
+    if (!commandSpec) return null;
+    return {
+        commandSpec,
+        supportsStream: chatConfig.supportsStream === true || chatConfig.stream === true
+    };
+}
+
+function parseAuthInfoHeader(requestHeaders) {
+    if (!requestHeaders || typeof requestHeaders !== 'object') return null;
+    const raw = requestHeaders['x-ploinky-auth-info'];
+    const value = Array.isArray(raw) ? raw[0] : raw;
+    if (!value || typeof value !== 'string') return null;
+    try {
+        return JSON.parse(value);
+    } catch (_) {
+        return null;
+    }
 }
 
 function createLiteralUnionSchema(values) {
@@ -310,6 +426,154 @@ function executeShell(spec, payload, options = {}) {
             // ignore broken pipes
         }
     });
+}
+
+function readJsonBody(req) {
+    return new Promise((resolve) => {
+        const chunks = [];
+        req.on('data', chunk => chunks.push(chunk));
+        req.on('end', () => {
+            if (!chunks.length) {
+                resolve({ ok: true, body: {} });
+                return;
+            }
+            const raw = Buffer.concat(chunks).toString('utf8');
+            try {
+                resolve({ ok: true, body: JSON.parse(raw) });
+            } catch (error) {
+                resolve({ ok: false, error });
+            }
+        });
+        req.on('error', (error) => resolve({ ok: false, error }));
+    });
+}
+
+function sendOpenAiError(res, statusCode, message, type = 'server_error') {
+    const payload = { error: { message, type } };
+    const data = Buffer.from(JSON.stringify(payload));
+    res.writeHead(statusCode, { 'Content-Type': 'application/json', 'Content-Length': data.length });
+    res.end(data);
+}
+
+function writeSseError(res, message, type = 'server_error') {
+    const payload = JSON.stringify({ error: { message, type } });
+    res.write(`data: ${payload}\n\n`);
+    res.write('data: [DONE]\n\n');
+}
+
+async function handleOpenAiChatCompletions(req, res, body) {
+    if (!body || typeof body !== 'object') {
+        sendOpenAiError(res, 400, 'Invalid request body', 'invalid_request_error');
+        return;
+    }
+    const manifestResult = getManifestResult();
+    const manifest = manifestResult ? manifestResult.manifest : null;
+    const openAiConfig = resolveOpenAiChatConfig(manifest);
+    if (!openAiConfig) {
+        sendOpenAiError(res, 404, 'OpenAI chat completions not configured', 'not_found_error');
+        return;
+    }
+    const wantsStream = body.stream === true;
+    if (wantsStream && !openAiConfig.supportsStream) {
+        sendOpenAiError(res, 400, 'Streaming is not enabled for this agent', 'invalid_request_error');
+        return;
+    }
+
+    const payload = {
+        endpoint: 'openai.chat.completions',
+        request: body,
+        metadata: {
+            agent: process.env.AGENT_NAME || '',
+            authInfo: parseAuthInfoHeader(req.headers)
+        }
+    };
+
+    if (!wantsStream) {
+        const result = await executeShell(openAiConfig.commandSpec, payload);
+        if (result.code !== 0) {
+            sendOpenAiError(res, 500, describeShellFailure(result));
+            return;
+        }
+        let parsed;
+        try {
+            parsed = JSON.parse(result.stdout || '{}');
+        } catch (error) {
+            sendOpenAiError(res, 502, 'Chat completions handler did not return valid JSON');
+            return;
+        }
+        const data = Buffer.from(JSON.stringify(parsed));
+        res.writeHead(200, { 'Content-Type': 'application/json', 'Content-Length': data.length });
+        res.end(data);
+        return;
+    }
+
+    const headers = {
+        'Content-Type': 'text/event-stream; charset=utf-8',
+        'Cache-Control': 'no-cache',
+        'Connection': 'keep-alive'
+    };
+    res.writeHead(200, headers);
+    if (typeof res.flushHeaders === 'function') {
+        res.flushHeaders();
+    }
+
+    const { command, args = [], cwd, env, timeoutMs } = openAiConfig.commandSpec;
+    const child = spawn(command, args, {
+        cwd,
+        env: { ...process.env, ...env },
+        stdio: ['pipe', 'pipe', 'pipe']
+    });
+    let stdoutBytes = 0;
+    const stderrChunks = [];
+    let timeout = null;
+    if (Number.isFinite(timeoutMs) && timeoutMs > 0) {
+        timeout = setTimeout(() => {
+            try { child.kill('SIGTERM'); } catch (_) { }
+        }, timeoutMs);
+    }
+    child.stdout.on('data', chunk => {
+        stdoutBytes += chunk.length;
+        res.write(chunk);
+    });
+    child.stderr.on('data', chunk => {
+        stderrChunks.push(chunk);
+    });
+    child.on('error', err => {
+        if (!res.writableEnded) {
+            if (stdoutBytes === 0) {
+                writeSseError(res, `Stream handler error: ${err.message}`);
+            }
+            res.end();
+        }
+    });
+    child.on('close', (code, signal) => {
+        if (timeout) clearTimeout(timeout);
+        if (!res.writableEnded) {
+            if (code !== 0 && stdoutBytes === 0) {
+                const stderr = Buffer.concat(stderrChunks).toString('utf8');
+                const failure = describeShellFailure({ code, signal, stdout: '', stderr });
+                writeSseError(res, failure);
+            }
+            res.end();
+        }
+    });
+    req.on('aborted', () => {
+        try { child.kill('SIGTERM'); } catch (_) { }
+    });
+    child.stdin.on('error', err => {
+        if (err?.code === 'EPIPE') return;
+        if (!res.writableEnded) {
+            if (stdoutBytes === 0) {
+                writeSseError(res, `Stream handler error: ${err.message}`);
+            }
+            res.end();
+        }
+    });
+    try {
+        child.stdin.end(JSON.stringify(payload ?? {}) + '\n');
+    } catch (_) {
+        // ignore broken pipes
+    }
 }
 
 function sanitizeAuthInfoForLog(authInfo = null) {
@@ -688,6 +952,19 @@ async function main() {
             if (method === 'GET' && u.pathname === '/health') {
                 return sendJson(200, { ok: true, server: 'ploinky-agent-mcp' });
             }
+            if (method === 'GET' && u.pathname === CAPABILITIES_PATH) {
+                const manifestResult = getManifestResult();
+                const manifest = manifestResult ? manifestResult.manifest : null;
+                const capabilities = normalizeCapabilities(manifest?.endpoints?.capabilities);
+                if (!capabilities) {
+                    return sendJson(404, { error: 'capabilities not configured' });
+                }
+                return sendJson(200, {
+                    agent: process.env.AGENT_NAME || manifest?.name || 'unknown-agent',
+                    about: typeof manifest?.about === 'string' ? manifest.about : '',
+                    capabilities
+                });
+            }
             if (method === 'GET' && u.pathname === '/getTaskStatus') {
                 const taskId = u.searchParams.get('taskId');
                 if (!taskId) {
@@ -775,6 +1052,25 @@ async function main() {
                         if (!res.headersSent) return sendJson(500, { jsonrpc: '2.0', error: { code: -32603, message: 'Internal server error' }, id: null });
                     }
                 });
+                return;
+            }
+            if (method === 'POST' && u.pathname === OPENAI_CHAT_COMPLETIONS_PATH) {
+                readJsonBody(req)
+                    .then(result => {
+                        if (!result.ok) {
+                            sendOpenAiError(res, 400, 'Invalid JSON body', 'invalid_request_error');
+                            return;
+                        }
+                        return handleOpenAiChatCompletions(req, res, result.body);
+                    })
+                    .catch(err => {
+                        console.error('[AgentServer/OpenAI] request error:', err);
+                        if (!res.headersSent) {
+                            sendOpenAiError(res, 500, 'Internal server error');
+                        } else if (!res.writableEnded) {
+                            res.end();
+                        }
+                    });
                 return;
             }
             // Not found
