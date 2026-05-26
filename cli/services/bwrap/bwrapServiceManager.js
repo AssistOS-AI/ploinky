@@ -470,6 +470,25 @@ function buildBwrapEntryCommand(agentName, manifest, profileConfig) {
     return entryCmd;
 }
 
+function shellQuote(value) {
+    return `'${String(value).replace(/'/g, `'\\''`)}'`;
+}
+
+function buildBwrapInteractiveCommand(workdir, entryCommand, options = {}) {
+    const wd = workdir || '/code';
+    const rawCommand = entryCommand && String(entryCommand).trim()
+        ? String(entryCommand).trim()
+        : 'exec /bin/bash || exec /bin/sh';
+    const command = options.forceInteractiveShell && rawCommand === '/bin/sh'
+        ? 'if command -v /bin/bash >/dev/null 2>&1; then exec /bin/bash -i; else exec /bin/sh -i; fi'
+        : rawCommand;
+    return `cd ${shellQuote(wd)} && ${command}`;
+}
+
+function sanitizeHistoryName(value) {
+    return String(value || 'agent').replace(/[^A-Za-z0-9_.-]/g, '_');
+}
+
 /**
  * Start a bwrap-sandboxed agent process.
  */
@@ -813,6 +832,15 @@ function attachBwrapInteractive(agentName, manifest, agentPath, workdir, entryCo
     delete envMap.__PLOINKY_AGENT_PRIVATE_KEY_HOST_PATH;
     const hostPort = record.config?.ports?.[0]?.hostPort;
     if (hostPort) envMap.PORT = String(hostPort);
+    const forceInteractiveShell = entryCommand && String(entryCommand).trim() === '/bin/sh' && process.stdin.isTTY;
+    if (forceInteractiveShell) {
+        for (const key of ['TERM', 'COLORTERM', 'LINES', 'COLUMNS']) {
+            if (process.env[key]) envMap[key] = process.env[key];
+        }
+        envMap.HISTFILE = `/shared/.ploinky-${sanitizeHistoryName(agentName)}-shell-history`;
+        envMap.HISTSIZE = '5000';
+        envMap.HISTFILESIZE = '10000';
+    }
 
     // Build bwrap args (same mounts as the running agent)
     const bwrapArgs = buildBwrapArgs({
@@ -836,13 +864,10 @@ function attachBwrapInteractive(agentName, manifest, agentPath, workdir, entryCo
     bwrapArgs.push('--die-with-parent');
 
     // Build command
-    const wd = workdir || '/code';
-    const cmd = entryCommand && String(entryCommand).trim()
-        ? entryCommand
-        : 'exec /bin/bash || exec /bin/sh';
-    bwrapArgs.push('--', 'sh', '-lc', `cd '${wd}' && ${cmd}`);
+    const shellCommand = buildBwrapInteractiveCommand(workdir, entryCommand, { forceInteractiveShell });
+    bwrapArgs.push('--', 'sh', '-lc', shellCommand);
 
-    debugLog(`[bwrap] ${agentName}: interactive session: sh -lc "cd '${wd}' && ${cmd}"`);
+    debugLog(`[bwrap] ${agentName}: interactive session: sh -lc ${JSON.stringify(shellCommand)}`);
 
     const result = spawnSync(BWRAP_PATH, bwrapArgs, { stdio: 'inherit' });
     return result.status ?? 0;
@@ -853,6 +878,7 @@ export {
     startBwrapProcess,
     buildBwrapArgs,
     buildFullEnvMap,
+    buildBwrapInteractiveCommand,
     attachBwrapInteractive,
     BWRAP_PATH
 };

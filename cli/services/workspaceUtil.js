@@ -8,6 +8,7 @@ import * as workspaceSvc from './workspace.js';
 import * as dockerSvc from './docker/index.js';
 import { getRuntimeForAgent, isSandboxRuntime, loadAgentsMap } from './docker/common.js';
 import { isBwrapProcessRunning, stopBwrapProcess } from './bwrap/bwrapFleet.js';
+import * as inputState from './inputState.js';
 import { applyManifestDirectives } from './bootstrapManifest.js';
 import { executeHostHook, markPreinstallRunInProcess, resetPreinstallRunInProcess, isInlineCommand } from './lifecycleHooks.js';
 import { getActiveProfile, getProfileConfig, getProfileEnvVars } from './profileService.js';
@@ -115,6 +116,15 @@ function spawnWatchdog(routerPath, port, routerPidFile) {
   });
   logStdio.closeParentFds();
   return child;
+}
+
+function runWithSuspendedInput(callback) {
+  const restoreInput = inputState.prepareForExternalCommand?.() || (() => {});
+  try {
+    return callback();
+  } finally {
+    restoreInput();
+  }
 }
 
 function getCliCmd(manifest) {
@@ -862,12 +872,18 @@ async function runCli(agentName, args) {
 
   if (actualRuntime === 'bwrap') {
     const { attachBwrapInteractive } = await import('./bwrap/bwrapServiceManager.js');
-    attachBwrapInteractive(shortAgentName, manifest, agentDir, projPath, cmd, { containerName });
+    runWithSuspendedInput(() => {
+      attachBwrapInteractive(shortAgentName, manifest, agentDir, projPath, cmd, { containerName });
+    });
   } else if (actualRuntime === 'seatbelt') {
     const { attachSeatbeltInteractive } = await import('./seatbelt/seatbeltServiceManager.js');
-    attachSeatbeltInteractive(shortAgentName, manifest, agentDir, projPath, cmd, { containerName });
+    runWithSuspendedInput(() => {
+      attachSeatbeltInteractive(shortAgentName, manifest, agentDir, projPath, cmd, { containerName });
+    });
   } else {
-    attachInteractive(containerName, projPath, cmd);
+    runWithSuspendedInput(() => {
+      attachInteractive(containerName, projPath, cmd);
+    });
   }
 }
 
@@ -905,17 +921,23 @@ async function runShell(agentName) {
     console.log(`[shell] bwrap agent: ${shortAgentName}`);
     console.log(`[shell] command: ${cmd}`);
     const { attachBwrapInteractive } = await import('./bwrap/bwrapServiceManager.js');
-    attachBwrapInteractive(shortAgentName, manifest, agentDir, projPath, cmd, { containerName });
+    runWithSuspendedInput(() => {
+      attachBwrapInteractive(shortAgentName, manifest, agentDir, projPath, cmd, { containerName });
+    });
   } else if (actualRuntime === 'seatbelt') {
     console.log(`[shell] seatbelt agent: ${shortAgentName}`);
     console.log(`[shell] command: ${cmd}`);
     const { attachSeatbeltInteractive } = await import('./seatbelt/seatbeltServiceManager.js');
-    attachSeatbeltInteractive(shortAgentName, manifest, agentDir, projPath, cmd, { containerName });
+    runWithSuspendedInput(() => {
+      attachSeatbeltInteractive(shortAgentName, manifest, agentDir, projPath, cmd, { containerName });
+    });
   } else {
     console.log(`[shell] container: ${containerName}`);
     console.log(`[shell] command: ${cmd}`);
     console.log(`[shell] agent: ${shortAgentName}`);
-    attachInteractive(containerName, projPath, cmd);
+    runWithSuspendedInput(() => {
+      attachInteractive(containerName, projPath, cmd);
+    });
   }
 }
 

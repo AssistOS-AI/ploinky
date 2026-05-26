@@ -6,6 +6,7 @@ import path from 'node:path';
 
 import {
     buildBwrapArgs,
+    buildBwrapInteractiveCommand,
 } from '../../cli/services/bwrap/bwrapServiceManager.js';
 
 function tempDir(prefix = 'bwrap-args-') {
@@ -53,4 +54,22 @@ test('buildBwrapArgs overlays protected workspace paths read-only after cwd bind
     } finally {
         fs.rmSync(root, { recursive: true, force: true });
     }
+});
+
+test('buildBwrapInteractiveCommand forces interactive shell only for TTY shell sessions', () => {
+    assert.equal(
+        buildBwrapInteractiveCommand('/work', '/bin/sh', { forceInteractiveShell: true }),
+        "cd '/work' && if command -v /bin/bash >/dev/null 2>&1; then exec /bin/bash -i; else exec /bin/sh -i; fi"
+    );
+    assert.equal(
+        buildBwrapInteractiveCommand('/work', '/bin/sh', { forceInteractiveShell: false }),
+        "cd '/work' && /bin/sh"
+    );
+});
+
+test('buildBwrapInteractiveCommand preserves non-shell commands and quotes workdir', () => {
+    assert.equal(
+        buildBwrapInteractiveCommand("/tmp/it's-here", 'node /code/src/index.mjs', { forceInteractiveShell: true }),
+        "cd '/tmp/it'\\''s-here' && node /code/src/index.mjs"
+    );
 });
