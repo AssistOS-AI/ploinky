@@ -4,7 +4,7 @@ import { getConfig } from './workspace.js';
 import { findAgent } from './utils.js';
 import { loadSecretsFile, loadEnvFile } from './secretInjector.js';
 import { deleteSecretValue, readSecretsFile, setSecretValue } from './encryptedSecretsFile.js';
-import { deriveAgentSecret } from './masterKey.js';
+import { deriveAgentSecret, deriveWorkspaceSecret } from './masterKey.js';
 
 export function parseSecrets() {
     return readSecretsFile();
@@ -79,40 +79,84 @@ function toBool(value, defaultValue = false) {
     return defaultValue;
 }
 
-function buildDerivedEnvSpec({
+const LEGACY_DERIVED_ENV_KEYS = [
+    'derive',
+    'deriveName',
+    'deriveRepoName',
+    'deriveRepo',
+    'deriveAgentName',
+    'deriveAgent',
+    'deriveBytes',
+    'deriveFormat',
+];
+
+function assertNoLegacyDerivedEnvFields(rawSpec, insideName) {
+    if (!rawSpec || typeof rawSpec !== 'object') return;
+    const legacyKeys = LEGACY_DERIVED_ENV_KEYS.filter(key =>
+        Object.prototype.hasOwnProperty.call(rawSpec, key)
+        && rawSpec[key] !== undefined
+    );
+    if (!legacyKeys.length) return;
+    const target = insideName ? ` '${insideName}'` : '';
+    const error = new Error(
+        `Manifest env${target} uses removed legacy derivation keys (${legacyKeys.join(', ')}). `
+        + 'Use generatedSecret: true for agent-owned secrets, or sharedGeneratedSecret: true for shared generated secrets.'
+    );
+    error.code = 'PLOINKY_LEGACY_DERIVED_MASTER_ENV';
+    error.legacyKeys = legacyKeys;
+    throw error;
+}
+
+function assertNoRemovedGeneratedScope(rawSpec, insideName) {
+    if (!rawSpec || typeof rawSpec !== 'object') return;
+    if (!Object.prototype.hasOwnProperty.call(rawSpec, 'generatedSecretScope')
+        || rawSpec.generatedSecretScope === undefined) {
+        return;
+    }
+    const target = insideName ? ` '${insideName}'` : '';
+    const error = new Error(
+        `Manifest env${target} uses removed generatedSecretScope. `
+        + 'Use sharedGeneratedSecret: true for shared generated secrets.'
+    );
+    error.code = 'PLOINKY_REMOVED_GENERATED_SECRET_SCOPE';
+    throw error;
+}
+
+function buildGeneratedEnvSpec({
     insideName,
     sourceName,
-    derive,
     generatedSecret,
-    deriveName,
-    deriveRepoName,
-    deriveRepo,
-    deriveAgentName,
-    deriveAgent,
-    deriveBytes,
-    deriveFormat,
+    sharedGeneratedSecret,
+    explicitOverride,
+    explicitOverrideRequires,
 } = {}) {
-    if (derive === 'derived-master') {
+    if (toBool(sharedGeneratedSecret, false)) {
         return {
-            type: 'derived-master',
-            name: typeof deriveName === 'string' && deriveName.trim() ? deriveName.trim() : sourceName,
-            repoName: typeof deriveRepoName === 'string' && deriveRepoName.trim()
-                ? deriveRepoName.trim()
-                : (typeof deriveRepo === 'string' && deriveRepo.trim() ? deriveRepo.trim() : ''),
-            agentName: typeof deriveAgentName === 'string' && deriveAgentName.trim()
-                ? deriveAgentName.trim()
-                : (typeof deriveAgent === 'string' && deriveAgent.trim() ? deriveAgent.trim() : ''),
-            bytes: deriveBytes,
-            format: deriveFormat,
+            type: 'generated-secret',
+            scope: 'workspace',
+            name: sourceName,
+            explicitOverride: toBool(explicitOverride, false),
+            explicitOverrideRequires: normalizeExplicitOverrideRequires(explicitOverrideRequires),
         };
     }
     if (toBool(generatedSecret, false)) {
         return {
             type: 'generated-secret',
+            scope: 'agent',
             name: insideName,
+            explicitOverride: toBool(explicitOverride, false),
+            explicitOverrideRequires: normalizeExplicitOverrideRequires(explicitOverrideRequires),
         };
     }
     return null;
+}
+
+function normalizeExplicitOverrideRequires(value) {
+    if (value === undefined || value === null) return [];
+    const values = Array.isArray(value) ? value : [value];
+    return values
+        .map(entry => String(entry || '').trim())
+        .filter(Boolean);
 }
 
 /**
@@ -274,7 +318,7 @@ export function getManifestEnvSpecs(manifest, profileConfig) {
      * @param {boolean} required - Whether the variable is required
      * @param {*} defaultValue - Default value if not found
      */
-    function addSpec(insideName, sourceName, required, defaultValue, derive = null) {
+    function addSpec(insideName, sourceName, required, defaultValue, generated = null) {
         // Check if this is a wildcard pattern
         if (isWildcardPattern(insideName)) {
             // Expand the wildcard into matching variable names
@@ -287,7 +331,7 @@ export function getManifestEnvSpecs(manifest, profileConfig) {
                     sourceName: expandedName,
                     required: false, // Wildcards are not required by default
                     defaultValue: undefined,
-                    derive: null
+                    generated: null
                 });
             }
         } else {
@@ -299,7 +343,7 @@ export function getManifestEnvSpecs(manifest, profileConfig) {
                 sourceName,
                 required,
                 defaultValue,
-                derive
+                generated
             });
         }
     }
@@ -314,34 +358,26 @@ export function getManifestEnvSpecs(manifest, profileConfig) {
                     default: defaultValue,
                     varName,
                     required,
-                    derive,
-                    deriveName,
-                    deriveRepoName,
-                    deriveRepo,
-                    deriveAgentName,
-                    deriveAgent,
-                    deriveBytes,
-                    deriveFormat,
                     generatedSecret,
+                    sharedGeneratedSecret,
+                    explicitOverride,
+                    explicitOverrideRequires,
                 } = entry;
                 const insideName = typeof name === 'string' ? name.trim() : '';
                 if (!insideName) continue;
+                assertNoLegacyDerivedEnvFields(entry, insideName);
+                assertNoRemovedGeneratedScope(entry, insideName);
                 const sourceName = typeof varName === 'string' && varName.trim() ? varName.trim() : insideName;
                 const resolvedDefault = value !== undefined ? value : defaultValue;
-                const deriveSpec = buildDerivedEnvSpec({
+                const generatedSpec = buildGeneratedEnvSpec({
                     insideName,
                     sourceName,
-                    derive,
                     generatedSecret,
-                    deriveName,
-                    deriveRepoName,
-                    deriveRepo,
-                    deriveAgentName,
-                    deriveAgent,
-                    deriveBytes,
-                    deriveFormat,
+                    sharedGeneratedSecret,
+                    explicitOverride,
+                    explicitOverrideRequires,
                 });
-                addSpec(insideName, sourceName, toBool(required, false), resolvedDefault, deriveSpec);
+                addSpec(insideName, sourceName, toBool(required, false), resolvedDefault, generatedSpec);
                 continue;
             }
             const text = String(entry).trim();
@@ -368,8 +404,10 @@ export function getManifestEnvSpecs(manifest, profileConfig) {
             let sourceName = insideName;
             let required = false;
             let defaultValue;
-            let deriveSpec = null;
+            let generatedSpec = null;
             if (rawSpec && typeof rawSpec === 'object' && !Array.isArray(rawSpec)) {
+                assertNoLegacyDerivedEnvFields(rawSpec, insideName);
+                assertNoRemovedGeneratedScope(rawSpec, insideName);
                 if (typeof rawSpec.varName === 'string' && rawSpec.varName.trim()) {
                     sourceName = rawSpec.varName.trim();
                 } else if (typeof rawSpec.name === 'string' && rawSpec.name.trim()) {
@@ -383,26 +421,21 @@ export function getManifestEnvSpecs(manifest, profileConfig) {
                 } else if (Object.prototype.hasOwnProperty.call(rawSpec, 'value')) {
                     defaultValue = rawSpec.value;
                 }
-                deriveSpec = buildDerivedEnvSpec({
+                generatedSpec = buildGeneratedEnvSpec({
                     insideName,
                     sourceName,
-                    derive: rawSpec.derive,
                     generatedSecret: rawSpec.generatedSecret,
-                    deriveName: rawSpec.deriveName,
-                    deriveRepoName: rawSpec.deriveRepoName,
-                    deriveRepo: rawSpec.deriveRepo,
-                    deriveAgentName: rawSpec.deriveAgentName,
-                    deriveAgent: rawSpec.deriveAgent,
-                    deriveBytes: rawSpec.deriveBytes,
-                    deriveFormat: rawSpec.deriveFormat,
+                    sharedGeneratedSecret: rawSpec.sharedGeneratedSecret,
+                    explicitOverride: rawSpec.explicitOverride,
+                    explicitOverrideRequires: rawSpec.explicitOverrideRequires,
                 });
-                addSpec(insideName, sourceName, required, defaultValue, deriveSpec);
+                addSpec(insideName, sourceName, required, defaultValue, generatedSpec);
                 continue;
             } else {
                 defaultValue = rawSpec;
             }
 
-            addSpec(insideName, sourceName, required, defaultValue, deriveSpec);
+            addSpec(insideName, sourceName, required, defaultValue, generatedSpec);
         }
     }
 
@@ -421,10 +454,40 @@ function formatEnvSpecName(spec) {
         : spec.insideName;
 }
 
+function resolveExplicitEnvSource(name, secrets, getEnvFile) {
+    if (!name) return undefined;
+    if (Object.prototype.hasOwnProperty.call(secrets, name)) {
+        return resolveAlias(secrets[name], secrets);
+    }
+    if (Object.prototype.hasOwnProperty.call(process.env, name)) {
+        return process.env[name];
+    }
+    const envFile = getEnvFile();
+    if (Object.prototype.hasOwnProperty.call(envFile, name)) {
+        return envFile[name];
+    }
+    return undefined;
+}
+
+function shouldUseExplicitGeneratedOverride(spec, explicitValue, secrets, getEnvFile) {
+    const requiredNames = spec.generated?.explicitOverrideRequires || [];
+    if (isEmptyValue(explicitValue)) {
+        return false;
+    }
+    if (!requiredNames.length) {
+        return spec.generated?.explicitOverride === true;
+    }
+    return requiredNames.every(name => !isEmptyValue(resolveExplicitEnvSource(name, secrets, getEnvFile)));
+}
+
+function envSourceMetadataName(name) {
+    return `PLOINKY_ENV_SOURCE_${String(name || '').replace(/[^A-Za-z0-9_]/g, '_')}`;
+}
+
 export function getIncompleteManifestEnvProfileEntries(manifest, profileConfig) {
     return getManifestEnvSpecs(manifest, profileConfig).filter(spec => {
         if (!spec.required) return false;
-        if (spec.derive?.type === 'derived-master' || spec.derive?.type === 'generated-secret') return false;
+        if (spec.generated?.type === 'generated-secret') return false;
         if (!isEmptyValue(spec.defaultValue)) return false;
         return !isSensitiveEnvVariableName(spec.insideName)
             && !isSensitiveEnvVariableName(spec.sourceName);
@@ -485,22 +548,27 @@ function resolveManifestEnv(manifest, secrets, options = {}) {
     for (const spec of specs) {
         let resolvedValue;
         let usedDefault = false;
+        let valueSource;
         const hasSecret = spec.sourceName
             && Object.prototype.hasOwnProperty.call(secrets, spec.sourceName);
-        if (spec.derive?.type === 'derived-master') {
-            resolvedValue = deriveAgentSecret({
-                repoName: spec.derive.repoName || repoName,
-                agentName: spec.derive.agentName || agentName,
-                name: spec.derive.name || spec.sourceName || spec.insideName,
-                length: spec.derive.bytes,
-                encoding: spec.derive.format || 'hex',
-            });
-        } else if (spec.derive?.type === 'generated-secret') {
-            resolvedValue = deriveAgentSecret({
-                repoName,
-                agentName,
-                name: spec.derive.name || spec.insideName,
-            });
+        if (spec.generated?.type === 'generated-secret') {
+            const explicitValue = resolveExplicitEnvSource(spec.sourceName, secrets, getEnvFile);
+            if (shouldUseExplicitGeneratedOverride(spec, explicitValue, secrets, getEnvFile)) {
+                resolvedValue = explicitValue;
+                valueSource = 'explicit';
+            } else if (spec.generated.scope === 'workspace') {
+                resolvedValue = deriveWorkspaceSecret({
+                    name: spec.generated.name || spec.sourceName || spec.insideName,
+                });
+                valueSource = 'generated';
+            } else {
+                resolvedValue = deriveAgentSecret({
+                    repoName,
+                    agentName,
+                    name: spec.generated.name || spec.sourceName || spec.insideName,
+                });
+                valueSource = 'generated';
+            }
         } else if (hasSecret) {
             resolvedValue = resolveAlias(secrets[spec.sourceName], secrets);
         } else if (spec.sourceName && Object.prototype.hasOwnProperty.call(process.env, spec.sourceName)) {
@@ -533,7 +601,8 @@ function resolveManifestEnv(manifest, secrets, options = {}) {
             required: spec.required,
             value: normalizedValue,
             defaultValue: Object.prototype.hasOwnProperty.call(spec, 'defaultValue') ? spec.defaultValue : undefined,
-            usedDefault
+            usedDefault,
+            source: valueSource
         });
     }
 
@@ -599,6 +668,9 @@ export function buildEnvFlags(manifest, profileConfig, options = {}) {
     for (const entry of envEntries) {
         if (entry.value !== undefined) {
             out.push(formatEnvFlag(entry.insideName, entry.value));
+            if (entry.source) {
+                out.push(formatEnvFlag(envSourceMetadataName(entry.insideName), entry.source));
+            }
         }
     }
     const exp = manifest?.expose;
@@ -637,6 +709,9 @@ export function buildEnvMap(manifest, profileConfig, options = {}) {
     for (const entry of envEntries) {
         if (entry.value !== undefined) {
             out[entry.insideName] = entry.value;
+            if (entry.source) {
+                out[envSourceMetadataName(entry.insideName)] = entry.source;
+            }
         }
     }
     const exp = manifest?.expose;

@@ -378,9 +378,9 @@ test('validateManifestEnvProfileCompleteness allows derived and sensitive requir
                         required: true
                     },
                     {
-                        name: 'DERIVED_SECRET',
+                        name: 'GENERATED_SECRET',
                         required: true,
-                        derive: 'derived-master'
+                        generatedSecret: true
                     }
                 ]
             }

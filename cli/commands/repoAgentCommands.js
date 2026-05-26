@@ -7,6 +7,7 @@ import * as agentsSvc from '../services/agents.js';
 import * as skillsSvc from '../services/skills.js';
 import {
     refreshAchillesDependenciesInRepos,
+    refreshPloinkyRuntimeAchillesDependency,
     resolvePloinkyRoot,
     updatePloinkySelf,
 } from '../services/updateService.js';
@@ -47,6 +48,23 @@ function formatWorkspaceRepoSkip(repo, remoteCheck) {
     const location = remoteCheck?.remoteUrl ? ` (${remoteCheck.remoteUrl})` : '';
     const reason = remoteCheck?.reason || 'remote unavailable';
     return `  - ${repo.name}: skipped update, ${reason}${location}`;
+}
+
+function refreshRuntimeAchillesForUpdate(failed, ploinkyRoot = resolvePloinkyRoot()) {
+    console.log('Refreshing Ploinky Achilles runtime dependency...');
+    try {
+        const result = refreshPloinkyRuntimeAchillesDependency({ ploinkyRoot });
+        console.log(`  ✓ ${path.relative(ploinkyRoot, result.installedPath)} (${result.method})`);
+        return result;
+    } catch (err) {
+        const message = err?.message || String(err);
+        failed.push({
+            repoName: 'ploinky/node_modules/achillesAgentLib',
+            message,
+        });
+        console.error(`  ✗ node_modules/achillesAgentLib: ${message}`);
+        return null;
+    }
 }
 
 function getAgentNames() {
@@ -119,6 +137,7 @@ async function updatePloinkyRepos() {
     const ploinkyRepos = getGitRepoNames();
     const failed = [];
     let updated = 0;
+    const runtimeAchilles = refreshRuntimeAchillesForUpdate(failed);
 
     if (ploinkyRepos.length) {
         console.log('Updating ploinky repositories...');
@@ -157,7 +176,7 @@ async function updatePloinkyRepos() {
         throw new Error(`Failed to update ${failed.length} repository(s): ${failedNames}`);
     }
 
-    return { total: ploinkyRepos.length, updated, failed, achilles };
+    return { total: ploinkyRepos.length, updated, failed, runtimeAchilles, achilles };
 }
 
 async function updateAllRepos(folderPath, options = {}) {
@@ -169,6 +188,7 @@ async function updateAllRepos(folderPath, options = {}) {
     const failed = [];
     const skipped = [];
     let updated = 0;
+    let runtimeAchilles = null;
 
     console.log('Updating Ploinky...');
     let selfUpdate = null;
@@ -199,6 +219,8 @@ async function updateAllRepos(folderPath, options = {}) {
         failed.push({ repoName: 'ploinky', message });
         console.error(`  ✗ Ploinky: ${message}`);
     }
+
+    runtimeAchilles = refreshRuntimeAchillesForUpdate(failed, ploinkyRoot);
 
     if (ploinkyRepos.length) {
         console.log('Updating ploinky repositories...');
@@ -281,7 +303,7 @@ async function updateAllRepos(folderPath, options = {}) {
         throw new Error(`Failed to update ${failed.length} repository(s): ${failedNames}`);
     }
 
-    return { total: totalRepos, updated, failed, skipped, selfUpdate, achilles };
+    return { total: totalRepos, updated, failed, skipped, selfUpdate, runtimeAchilles, achilles };
 }
 
 function pathsReferToSameLocation(first, second) {

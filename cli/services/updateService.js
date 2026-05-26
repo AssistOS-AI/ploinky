@@ -5,6 +5,7 @@ import { fileURLToPath } from 'url';
 import { PLOINKY_DIR } from './config.js';
 
 const ACHILLES_PACKAGE_NAME = 'achillesAgentLib';
+const ACHILLES_REPO_URL = 'https://github.com/OutfinityResearch/achillesAgentLib.git';
 const DEPENDENCY_SECTIONS = [
     'dependencies',
     'devDependencies',
@@ -214,6 +215,75 @@ function runCommand(command, args, {
         throw new Error(`${command} ${args.join(' ')} exited with code ${result.status}`);
     }
     return result;
+}
+
+function cloneAchillesDependency(targetPath, {
+    sourceUrl = ACHILLES_REPO_URL,
+    spawn = spawnSync,
+    stdio = 'inherit',
+} = {}) {
+    const nodeModulesDir = path.dirname(targetPath);
+    fs.mkdirSync(nodeModulesDir, { recursive: true });
+
+    const tempPath = path.join(
+        nodeModulesDir,
+        `.${ACHILLES_PACKAGE_NAME}.clone-${process.pid}-${Date.now()}`,
+    );
+    const backupPath = path.join(
+        nodeModulesDir,
+        `.${ACHILLES_PACKAGE_NAME}.replace-${process.pid}-${Date.now()}`,
+    );
+
+    let backedUp = false;
+    let installed = false;
+
+    try {
+        runCommand('git', ['clone', '--quiet', sourceUrl, tempPath], {
+            cwd: nodeModulesDir,
+            spawn,
+            stdio,
+        });
+        if (fs.existsSync(targetPath)) {
+            fs.renameSync(targetPath, backupPath);
+            backedUp = true;
+        }
+        fs.renameSync(tempPath, targetPath);
+        installed = true;
+        if (backedUp) {
+            fs.rmSync(backupPath, { recursive: true, force: true });
+        }
+    } catch (err) {
+        if (!installed && backedUp && !fs.existsSync(targetPath)) {
+            try { fs.renameSync(backupPath, targetPath); } catch (_) {}
+        }
+        try { fs.rmSync(tempPath, { recursive: true, force: true }); } catch (_) {}
+        if (installed) {
+            try { fs.rmSync(backupPath, { recursive: true, force: true }); } catch (_) {}
+        }
+        throw err;
+    }
+}
+
+export function refreshPloinkyRuntimeAchillesDependency({
+    ploinkyRoot = resolvePloinkyRoot(),
+    sourceUrl = ACHILLES_REPO_URL,
+    spawn = spawnSync,
+    stdio = 'inherit',
+} = {}) {
+    const packageDir = path.resolve(ploinkyRoot);
+    const installedPath = path.join(packageDir, 'node_modules', ACHILLES_PACKAGE_NAME);
+
+    if (isGitRepo(installedPath)) {
+        runCommand('git', ['pull', '--rebase', '--autostash'], {
+            cwd: installedPath,
+            spawn,
+            stdio,
+        });
+        return { packageDir, installedPath, method: 'git-pull' };
+    }
+
+    cloneAchillesDependency(installedPath, { sourceUrl, spawn, stdio });
+    return { packageDir, installedPath, method: 'git-clone' };
 }
 
 export function refreshAchillesDependencyPackage(packageDir, {

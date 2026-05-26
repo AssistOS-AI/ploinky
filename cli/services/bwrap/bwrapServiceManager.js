@@ -373,7 +373,7 @@ function buildFullEnvMap(agentName, manifest, profileConfig, agentWorkDir, repoN
     const profileEnv = profileConfig?.env;
     if (profileEnv && typeof profileEnv === 'object' && !Array.isArray(profileEnv)) {
         for (const [key, value] of Object.entries(profileEnv)) {
-            if (key && value !== undefined && typeof value !== 'object') {
+            if (key && value !== undefined && typeof value !== 'object' && !Object.prototype.hasOwnProperty.call(env, key)) {
                 env[key] = String(value);
             }
         }

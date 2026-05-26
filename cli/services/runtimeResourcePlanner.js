@@ -23,7 +23,6 @@ import { deriveAgentSecret } from './masterKey.js';
  *       {{STORAGE_CONTAINER_PATH}}   (only when persistentStorage declared)
  *       {{STORAGE_HOST_PATH}}
  *       {{secret:<NAME>}}            (ensurePersistentSecret)
- *       {{derivedMasterSecret:<NAME>}}        (HKDF from PLOINKY_DERIVED_MASTER_KEY)
  *       {{generatedSecret:<NAME>}}            (per-agent generated secret)
  *       {{var:<NAME>}}               (resolveVarValue / process.env)
  *
@@ -69,13 +68,12 @@ function expandTemplate(raw, { hostPath, containerPath, useHostStoragePath = fal
             }
         }
         if (expr.startsWith('derivedMasterSecret:')) {
-            const name = expr.slice('derivedMasterSecret:'.length).trim();
-            if (!name) return '';
-            try {
-                return deriveAgentSecret({ repoName, agentName, name });
-            } catch (_) {
-                return '';
-            }
+            const error = new Error(
+                'The {{derivedMasterSecret:NAME}} runtime-resource template has been removed. '
+                + 'Use {{generatedSecret:NAME}} for agent-owned generated secrets.'
+            );
+            error.code = 'PLOINKY_LEGACY_DERIVED_MASTER_TEMPLATE';
+            throw error;
         }
         if (expr.startsWith('generatedSecret:')) {
             const name = expr.slice('generatedSecret:'.length).trim();

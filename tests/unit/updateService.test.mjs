@@ -8,6 +8,7 @@ import {
     INTERACTIVE_PLOINKY_UPDATE_MESSAGE,
     findAchillesDependencyPackages,
     refreshAchillesDependenciesInRepos,
+    refreshPloinkyRuntimeAchillesDependency,
     updatePloinkySelf,
 } from '../../cli/services/updateService.js';
 
@@ -149,6 +150,68 @@ test('refreshAchillesDependenciesInRepos updates installed git dependency or fal
         assert.ok(calls.some(call => call.command === 'npm'
             && call.args.join(' ') === 'update achillesAgentLib --no-package-lock'
             && call.cwd === npmBacked));
+    } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+    }
+});
+
+test('refreshPloinkyRuntimeAchillesDependency pulls the canonical runtime checkout', () => {
+    const root = tempDir();
+    const calls = [];
+
+    try {
+        const installedPath = path.join(root, 'node_modules', 'achillesAgentLib');
+        fs.mkdirSync(path.join(installedPath, '.git'), { recursive: true });
+
+        const result = refreshPloinkyRuntimeAchillesDependency({
+            ploinkyRoot: root,
+            stdio: 'ignore',
+            spawn(command, args, options) {
+                calls.push({ command, args, cwd: options.cwd });
+                return { status: 0 };
+            },
+        });
+
+        assert.equal(result.method, 'git-pull');
+        assert.equal(result.installedPath, installedPath);
+        assert.deepEqual(calls, [{
+            command: 'git',
+            args: ['pull', '--rebase', '--autostash'],
+            cwd: installedPath,
+        }]);
+    } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+    }
+});
+
+test('refreshPloinkyRuntimeAchillesDependency reclones the canonical runtime checkout when missing', () => {
+    const root = tempDir();
+    const sourceUrl = 'https://example.invalid/achillesAgentLib.git';
+    const calls = [];
+
+    try {
+        const installedPath = path.join(root, 'node_modules', 'achillesAgentLib');
+
+        const result = refreshPloinkyRuntimeAchillesDependency({
+            ploinkyRoot: root,
+            sourceUrl,
+            stdio: 'ignore',
+            spawn(command, args, options) {
+                calls.push({ command, args, cwd: options.cwd });
+                if (command === 'git' && args[0] === 'clone') {
+                    fs.mkdirSync(path.join(args[args.length - 1], '.git'), { recursive: true });
+                }
+                return { status: 0 };
+            },
+        });
+
+        assert.equal(result.method, 'git-clone');
+        assert.equal(result.installedPath, installedPath);
+        assert.equal(fs.existsSync(path.join(installedPath, '.git')), true);
+        assert.equal(calls.length, 1);
+        assert.equal(calls[0].command, 'git');
+        assert.deepEqual(calls[0].args.slice(0, 3), ['clone', '--quiet', sourceUrl]);
+        assert.equal(calls[0].cwd, path.join(root, 'node_modules'));
     } finally {
         fs.rmSync(root, { recursive: true, force: true });
     }
