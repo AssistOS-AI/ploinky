@@ -57,7 +57,7 @@ function buildLifecycleHookEnv({ agentName, repoName, profileName, profileConfig
     try {
         derivedMasterEnv = { PLOINKY_DERIVED_MASTER_KEY: deriveDerivedMasterKey().toString('hex') };
     } catch (_) { }
-    return createEnvWithSecrets({ ...envVars, ...derivedMasterEnv, ...manifestEnv, ...profileEnv }, secrets);
+    return createEnvWithSecrets({ ...envVars, ...derivedMasterEnv, ...profileEnv, ...manifestEnv }, secrets);
 }
 
 function getPreinstallRunKey(agentName, repoName, profileName) {

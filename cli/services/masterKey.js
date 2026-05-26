@@ -143,10 +143,40 @@ function deriveAgentSecret({
     return raw.toString('hex');
 }
 
+function deriveWorkspaceSecret({
+    name,
+    purpose,
+    length = 32,
+    encoding = 'hex',
+} = {}) {
+    const secretName = normalizeDerivationPart(name || purpose, '');
+    if (!secretName) {
+        throw new Error('deriveWorkspaceSecret: name is required');
+    }
+    const byteLength = Number.isFinite(Number(length)) && Number(length) > 0
+        ? Math.floor(Number(length))
+        : 32;
+    const derivedMasterSecret = deriveDerivedMasterKey();
+    const info = Buffer.from([
+        'ploinky/workspace-secret',
+        secretName,
+        'v1',
+    ].join('/'), 'utf8');
+    const raw = Buffer.from(crypto.hkdfSync('sha256', derivedMasterSecret, Buffer.alloc(0), info, byteLength));
+    if (encoding === 'base64') {
+        return raw.toString('base64');
+    }
+    if (encoding === 'base64url') {
+        return raw.toString('base64url');
+    }
+    return raw.toString('hex');
+}
+
 export {
     deriveAgentSecret,
     deriveSubkey,
     deriveDerivedMasterKey,
+    deriveWorkspaceSecret,
     findEnvFile,
     loadEnvFile,
     MASTER_KEY_VAR,

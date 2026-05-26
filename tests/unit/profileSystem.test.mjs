@@ -190,7 +190,7 @@ test('validateProfile reports required non-sensitive env without profile default
     assert.ok(!result.issues.some(issue => issue.includes('SERVICE_API_KEY')));
 });
 
-test('validateProfile accepts complete non-sensitive env defaults and derived secrets', () => {
+test('validateProfile accepts complete non-sensitive env defaults and generated secrets', () => {
     writeManifest('repo-profile-complete', 'agent-profile-complete', {
         profiles: {
             default: {},
@@ -206,9 +206,9 @@ test('validateProfile accepts complete non-sensitive env defaults and derived se
                         required: true
                     },
                     {
-                        name: 'DERIVED_MASTER_SECRET',
+                        name: 'GENERATED_SECRET',
                         required: true,
-                        derive: 'derived-master'
+                        generatedSecret: true
                     }
                 ]
             }

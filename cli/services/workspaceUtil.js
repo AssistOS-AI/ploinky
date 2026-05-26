@@ -14,6 +14,7 @@ import { executeHostHook, markPreinstallRunInProcess, resetPreinstallRunInProces
 import { getActiveProfile, getProfileConfig, getProfileEnvVars } from './profileService.js';
 import { getSecrets, createEnvWithSecrets, loadEnvFile } from './secretInjector.js';
 import { readSecretsFile } from './encryptedSecretsFile.js';
+import { buildEnvMap } from './secretVars.js';
 import { resolveAgentReadinessProtocol } from './startupReadiness.js';
 import { LOGS_DIR, ROUTING_FILE, RUNNING_DIR } from './config.js';
 import { classifyDependencyGraphWaitMode, resolveWorkspaceDependencyGraph, topologicallyGroupDependencyGraph } from './workspaceDependencyGraph.js';
@@ -545,10 +546,16 @@ async function startWorkspace(staticAgentArg, portArg, { refreshComponentToken, 
             
             // Build environment for the hook
             const envVars = getProfileEnvVars(resolved.shortAgentName, resolved.repo, activeProfile, {});
-            const profileEnv = profileConfig.env && typeof profileConfig.env === 'object' && !Array.isArray(profileConfig.env) 
-              ? profileConfig.env : {};
+            let manifestEnv = {};
+            try {
+              const manifest = JSON.parse(fs.readFileSync(resolved.manifestPath, 'utf8'));
+              manifestEnv = buildEnvMap(manifest, profileConfig, {
+                agentName: resolved.shortAgentName,
+                repoName: resolved.repo
+              });
+            } catch (_) { }
             const secrets = profileConfig.secrets ? getSecrets(profileConfig.secrets) : {};
-            const hookEnv = createEnvWithSecrets({ ...envVars, ...profileEnv }, secrets);
+            const hookEnv = createEnvWithSecrets({ ...envVars, ...manifestEnv }, secrets);
             
             const result = executeHostHook(hookValue, hookEnv, { cwd: process.cwd() });
             if (!result.success) {

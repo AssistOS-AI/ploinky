@@ -52,28 +52,6 @@ test('planRuntimeResources resolves persistentStorage and templated env', () => 
     assert.equal(plan.env.DPU_MASTER_KEY, 'test-master-key-123');
 });
 
-test('planRuntimeResources resolves derived-master secret templates', () => {
-    const plan = planRuntimeResources({
-        runtime: {
-            resources: {
-                env: {
-                    DPU_MASTER_KEY: '{{derivedMasterSecret:DPU_MASTER_KEY}}'
-                }
-            }
-        }
-    }, {
-        repoName: 'AssistOSExplorer',
-        agentName: 'dpuAgent',
-    });
-
-    assert.equal(plan.env.DPU_MASTER_KEY, deriveAgentSecret({
-        repoName: 'AssistOSExplorer',
-        agentName: 'dpuAgent',
-        name: 'DPU_MASTER_KEY',
-    }));
-    assert.notEqual(plan.env.DPU_MASTER_KEY, 'test-master-key-123');
-});
-
 test('planRuntimeResources resolves generatedSecret templates', () => {
     const plan = planRuntimeResources({
         runtime: {
@@ -119,36 +97,23 @@ test('generatedSecret template produces different values for different agents', 
     assert.notEqual(planA.env.MY_KEY, planB.env.MY_KEY);
 });
 
-test('generatedSecret and derivedMasterSecret produce same values for migrated agent secrets', () => {
-    const cases = [
-        {
-            repoName: 'AssistOSExplorer',
-            agentName: 'dpuAgent',
-            secretName: 'DPU_MASTER_KEY',
-        },
-        {
-            repoName: 'AssistOSExplorer',
-            agentName: 'webmeetAgent',
-            secretName: 'PLOINKY_WEBMEET_MASTER_KEY',
-        },
-    ];
-
-    for (const { repoName, agentName, secretName } of cases) {
-        const genPlan = planRuntimeResources({
-            runtime: { resources: { env: { [secretName]: `{{generatedSecret:${secretName}}}` } } }
-        }, { repoName, agentName });
-
-        const derivedPlan = planRuntimeResources({
-            runtime: { resources: { env: { [secretName]: `{{derivedMasterSecret:${secretName}}}` } } }
-        }, { repoName, agentName });
-
-        assert.equal(genPlan.env[secretName], derivedPlan.env[secretName]);
-        assert.equal(genPlan.env[secretName], deriveAgentSecret({
-            repoName,
-            agentName,
-            name: secretName,
-        }));
-    }
+test('planRuntimeResources rejects removed derivedMasterSecret templates', () => {
+    assert.throws(() => planRuntimeResources({
+        runtime: {
+            resources: {
+                env: {
+                    OLD_KEY: '{{derivedMasterSecret:OLD_KEY}}'
+                }
+            }
+        }
+    }, {
+        repoName: 'AssistOSExplorer',
+        agentName: 'dpuAgent',
+    }), error => {
+        assert.equal(error.code, 'PLOINKY_LEGACY_DERIVED_MASTER_TEMPLATE');
+        assert.match(error.message, /generatedSecret/);
+        return true;
+    });
 });
 
 test('planRuntimeResources can expand storage container path to host path for host sandboxes', () => {

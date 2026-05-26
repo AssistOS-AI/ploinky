@@ -747,7 +747,9 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     }
 
     const profileEnv = normalizeProfileEnv(profileConfig?.env);
-    appendEnvFlagsFromMap(envStrings, profileEnv);
+    // Primitive profile env values are already resolved by buildEnvFlags above.
+    // Appending them again here would let defaults override operator-provided
+    // vars, for example clearing an explicit SOUL_GATEWAY_BASE_URL with "".
 
     const profileEnvVars = getProfileEnvVars(agentName, repoName, activeProfile, {
         containerName,
