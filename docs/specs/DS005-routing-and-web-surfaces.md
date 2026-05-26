@@ -56,15 +56,15 @@ The router must also expose:
 - `/health` for health status.
 - `/upload` and `/blobs` for workspace and agent blob flows.
 - `/webchat/uploads` for WebChat session-scoped file storage and download under `<cwd>/uploads/<sessionId>`.
-- `/capabilities` for aggregate discovery of routable agents that expose capability metadata. The router must query each active route's internal `/capabilities` endpoint, include successful responses without validating their field shape, and report per-agent errors separately.
-- `/capabilities/<agent>` for direct proxy access to one agent's capability metadata.
+- `/agent-card` for aggregate discovery of routable agents that expose capability metadata. The router must query each active route's internal `/agent-card` endpoint, include successful responses without validating their field shape, and report per-agent errors separately.
+- `/agent-card/<agent>` for direct proxy access to one agent's capability metadata.
 - `/v1/chat/completions/<agent>` for OpenAI-compatible chat-completions requests routed to one agent. The request body controls normal JSON versus SSE streaming through its `stream` field.
 - `/mcp` for router-level MCP aggregation.
 - `/mcps/<agent>/mcp` and `/mcp/<agent>/mcp` for agent MCP proxying.
 - `/mcps/<agent>/task` for task-status passthrough.
 - manifest-declared HTTP service prefixes for downstream HTTP services.
 
-Agent-to-agent callers may access `/capabilities`, `/capabilities/<agent>`, and `/v1/chat/completions/<agent>` with `X-Ploinky-Caller-JWT` instead of browser cookies. The router must verify the caller token through the secure-wire model, mint a fresh target invocation token, strip caller-supplied router identity headers, and forward authoritative identity headers to the target agent.
+Agent-to-agent callers may access `/agent-card`, `/agent-card/<agent>`, and `/v1/chat/completions/<agent>` with `X-Ploinky-Caller-JWT` instead of browser cookies. The router must verify the caller token through the secure-wire model, mint a fresh target invocation token, strip caller-supplied router identity headers, and forward authoritative identity headers to the target agent.
 
 Agent MCP sessions are runtime-owned and ephemeral. Clients that finish with a session should send `DELETE /mcp` with the `mcp-session-id` header so the agent runtime can close the SDK transport immediately. The shared `AgentServer` must also reap idle sessions defensively for clients that disconnect without a delete, but it must treat any session with an open HTTP response as active so long-running tool calls and SSE streams are not closed by idle cleanup.
 

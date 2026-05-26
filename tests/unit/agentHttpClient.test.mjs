@@ -4,8 +4,8 @@ import http from 'node:http';
 
 import {
     createAgentHttpClient,
-    getCapabilitiesUrl,
-    getAgentCapabilitiesUrl,
+    getAgentCardsUrl,
+    getAgentCardUrl,
     getAgentChatCompletionsUrl,
     getRouterUrl
 } from '../../Agent/client/AgentHttpClient.mjs';
@@ -42,16 +42,16 @@ test('AgentHttpClient resolves router and agent endpoint URLs', () => {
         'http://127.0.0.1:8080/v1/chat/completions/openaiAgent'
     );
     assert.equal(
-        getAgentCapabilitiesUrl('openaiAgent', { routerUrl: 'http://127.0.0.1:8080/' }),
-        'http://127.0.0.1:8080/capabilities/openaiAgent'
+        getAgentCardUrl('openaiAgent', { routerUrl: 'http://127.0.0.1:8080/' }),
+        'http://127.0.0.1:8080/agent-card/openaiAgent'
     );
     assert.equal(
-        getCapabilitiesUrl({ routerUrl: 'http://127.0.0.1:8080/' }),
-        'http://127.0.0.1:8080/capabilities'
+        getAgentCardsUrl({ routerUrl: 'http://127.0.0.1:8080/' }),
+        'http://127.0.0.1:8080/agent-card'
     );
 });
 
-test('AgentHttpClient calls router capabilities and chat completions endpoints', async () => {
+test('AgentHttpClient calls router agent-card and chat completions endpoints', async () => {
     const seen = [];
     const server = http.createServer(async (req, res) => {
         seen.push({
@@ -60,7 +60,7 @@ test('AgentHttpClient calls router capabilities and chat completions endpoints',
             auth: req.headers['x-test-auth'] || '',
             callerJwt: req.headers['x-ploinky-caller-jwt'] || ''
         });
-        if (req.method === 'GET' && req.url === '/capabilities') {
+        if (req.method === 'GET' && req.url === '/agent-card') {
             res.writeHead(200, { 'content-type': 'application/json' });
             res.end(JSON.stringify({
                 agents: [{ name: 'openaiAgent', payload: { anyShape: { ok: true } } }],
@@ -68,7 +68,7 @@ test('AgentHttpClient calls router capabilities and chat completions endpoints',
             }));
             return;
         }
-        if (req.method === 'GET' && req.url === '/capabilities/openaiAgent') {
+        if (req.method === 'GET' && req.url === '/agent-card/openaiAgent') {
             res.writeHead(200, { 'content-type': 'application/json' });
             res.end(JSON.stringify({ agent: 'openaiAgent', capabilities: { tags: ['fast'] } }));
             return;
@@ -94,11 +94,11 @@ test('AgentHttpClient calls router capabilities and chat completions endpoints',
             invocationToken: 'caller-token',
             requestHeaders: { 'x-test-auth': 'router-issued' }
         });
-        const aggregate = await client.capabilities();
+        const aggregate = await client.agentCard();
         assert.equal(aggregate.agents[0].name, 'openaiAgent');
         assert.deepEqual(aggregate.agents[0].payload.anyShape, { ok: true });
 
-        const capabilities = await client.capabilities('openaiAgent');
+        const capabilities = await client.agentCard('openaiAgent');
         assert.deepEqual(capabilities.capabilities.tags, ['fast']);
 
         const completion = await client.chatCompletions('openaiAgent', {
@@ -112,8 +112,8 @@ test('AgentHttpClient calls router capabilities and chat completions endpoints',
     }
 
     assert.deepEqual(seen.map(entry => entry.url), [
-        '/capabilities',
-        '/capabilities/openaiAgent',
+        '/agent-card',
+        '/agent-card/openaiAgent',
         '/v1/chat/completions/openaiAgent'
     ]);
     assert.ok(seen.every(entry => entry.auth === 'router-issued'));

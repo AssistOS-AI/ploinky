@@ -43,12 +43,12 @@ Ploinky is a workspace-local runtime for repository-backed agents.
 
 `/webtty`, `/webchat`, and `/webmeet` use the normal router login flow. `/dashboard` still supports `WEBDASHBOARD_TOKEN`, and `/status` reuses the dashboard token or dashboard invitation link for read-only access.
 
-## Auth and capabilities
+## Auth and agent cards
 
 - Local auth stores hashed credentials in a workspace variable such as `PLOINKY_AUTH_<ROUTE>_USERS`.
 - SSO stores a configured provider agent in workspace SSO config; provider manifests use `"ssoProvider": true`.
 - The installed-agent index tracks route names, principals, runtime resources, and SSO-provider markers.
-- `GET /capabilities` on the router lists successful capability responses from active agents without enforcing a fixed payload shape; `GET /capabilities/<agent>` proxies one agent's metadata.
+- `GET /agent-card` on the router lists successful capability responses from active agents without enforcing a fixed payload shape; `GET /agent-card/<agent>` proxies one agent's metadata.
 - `POST /v1/chat/completions/<agent>` routes OpenAI-compatible requests to one agent, with `stream: true` selecting SSE streaming and normal JSON returned otherwise.
 - Delegated MCP and routed HTTP agent calls use router-signed invocation tokens. Backend callers send `X-Ploinky-Caller-JWT`; the router verifies it and forwards a fresh target invocation.
 

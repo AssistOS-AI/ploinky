@@ -26,14 +26,14 @@ function encodeAgentName(agentName) {
     return encodeURIComponent(normalized);
 }
 
-export function getAgentCapabilitiesUrl(agentName, options = {}) {
+export function getAgentCardUrl(agentName, options = {}) {
     const routerUrl = stripTrailingSlash(options.routerUrl || getRouterUrl(options.env || process.env));
-    return `${routerUrl}/capabilities/${encodeAgentName(agentName)}`;
+    return `${routerUrl}/agent-card/${encodeAgentName(agentName)}`;
 }
 
-export function getCapabilitiesUrl(options = {}) {
+export function getAgentCardsUrl(options = {}) {
     const routerUrl = stripTrailingSlash(options.routerUrl || getRouterUrl(options.env || process.env));
-    return `${routerUrl}/capabilities`;
+    return `${routerUrl}/agent-card`;
 }
 
 export function getAgentChatCompletionsUrl(agentName, options = {}) {
@@ -220,11 +220,11 @@ export function createAgentHttpClient(options = {}) {
         });
     }
 
-    async function capabilities(agentName, callOptions = {}) {
+    async function agentCard(agentName, callOptions = {}) {
         const hasAgent = typeof agentName === 'string' && agentName.trim();
         const url = hasAgent
-            ? getAgentCapabilitiesUrl(agentName, { routerUrl })
-            : getCapabilitiesUrl({ routerUrl });
+            ? getAgentCardUrl(agentName, { routerUrl })
+            : getAgentCardsUrl({ routerUrl });
         const response = await requestBuffer(url, {
             method: 'GET',
             headers: normalizeHeaders({
@@ -235,7 +235,7 @@ export function createAgentHttpClient(options = {}) {
             timeoutMs: callOptions.timeoutMs ?? timeoutMs,
             signal: callOptions.signal || null
         });
-        return parseJsonResponse(response, 'capabilities');
+        return parseJsonResponse(response, 'agent-card');
     }
 
     async function chatCompletions(agentName, payload = {}, callOptions = {}) {
@@ -279,7 +279,7 @@ export function createAgentHttpClient(options = {}) {
 
     return {
         routerUrl,
-        capabilities,
+        agentCard,
         chatCompletions,
         chatCompletionsStream
     };

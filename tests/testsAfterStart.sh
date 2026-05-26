@@ -75,7 +75,7 @@ test_check "Persisted data file created" assert_file_exists "$TEST_PERSIST_FILE"
 stage_header "RoutingServer OpenAI Endpoints"
 test_check "Chat completions returns response" fast_openai_chat_completions
 test_check "Chat completions supports stream" fast_openai_chat_completions_stream
-test_check "Capabilities endpoint returns metadata" fast_openai_capabilities
+test_check "Agent-card endpoint returns metadata" fast_openai_agent_card
 
 stage_header "Health Probes Agent"
 test_check "Health probes agent container is running" assert_container_running "$TEST_HEALTH_AGENT_CONT_NAME"

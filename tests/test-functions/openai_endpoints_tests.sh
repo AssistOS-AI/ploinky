@@ -55,7 +55,7 @@ NODE
   fi
 }
 
-fast_openai_capabilities() {
+fast_openai_agent_card() {
   local output
   output=$(PLOINKY_ROUTER_URL="http://127.0.0.1:${TEST_ROUTER_PORT}" \
     PLOINKY_AGENT_LIB_DIR="${PLOINKY_AGENT_LIB_DIR:-$TESTS_DIR/../Agent}" \
@@ -65,20 +65,20 @@ const agentLibDir = process.env.PLOINKY_AGENT_LIB_DIR || '/Agent';
 const { createAgentHttpClient } = await import(`${agentLibDir}/client/AgentHttpClient.mjs`);
 
 const client = createAgentHttpClient();
-const response = await client.capabilities();
+const response = await client.agentCard();
 process.stdout.write(JSON.stringify(response));
 NODE
   )
   if ! echo "$output" | jq -e --arg agent "$TEST_OPENAI_AGENT_NAME" '.agents | map(select(.name == $agent)) | length == 1' >/dev/null; then
-    echo "Capabilities missing expected agent: $output" >&2
+    echo "Agent-card missing expected agent: $output" >&2
     return 1
   fi
   if ! echo "$output" | jq -e --arg agent "$TEST_OPENAI_AGENT_NAME" '.agents[] | select(.name == $agent) | .payload.capabilities.tags | index("fast")' >/dev/null; then
-    echo "Capabilities missing expected tags: $output" >&2
+    echo "Agent-card missing expected tags: $output" >&2
     return 1
   fi
   if ! echo "$output" | jq -e --arg agent "$TEST_OPENAI_AGENT_NAME" '.agents[] | select(.name == $agent) | .payload.capabilities.summary | length > 0' >/dev/null; then
-    echo "Capabilities missing summary: $output" >&2
+    echo "Agent-card missing summary: $output" >&2
     return 1
   fi
 }

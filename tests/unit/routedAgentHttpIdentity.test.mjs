@@ -74,7 +74,7 @@ test('routed agent HTTP identity headers mint target invocation from caller JWT'
 
     const headers = buildRoutedAgentIdentityHeaders({
         headers: { 'x-ploinky-caller-jwt': callerToken }
-    }, 'target', 'capabilities', { agent: 'target' });
+    }, 'target', 'agent-card', { agent: 'target' });
 
     assert.match(headers.authorization, /^Bearer\s+/);
     assert.notEqual(withBearerPrefix(headers.authorization), callerToken);
@@ -88,8 +88,8 @@ test('routed agent HTTP identity headers mint target invocation from caller JWT'
     const verified = verifyInvocationToken(withBearerPrefix(headers.authorization), {
         secret: deriveDerivedMasterKey(),
         expectedAudience: 'agent:targetRepo/target',
-        expectedTool: 'capabilities',
-        bodyObject: { tool: 'capabilities', arguments: { agent: 'target' } }
+        expectedTool: 'agent-card',
+        bodyObject: { tool: 'agent-card', arguments: { agent: 'target' } }
     });
     assert.equal(verified.payload.caller, 'agent:callerRepo/caller');
     assert.equal(verified.payload.aud, 'agent:targetRepo/target');

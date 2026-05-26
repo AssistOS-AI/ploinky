@@ -20,7 +20,7 @@ const DEFAULT_TASK_LOG_TAIL_BYTES = 128 * 1024;
 const TASK_QUEUE_FILE = path.resolve(process.cwd(), '.tasksQueue');
 const invocationReplayCache = createMemoryReplayCache({ maxSize: 4096 });
 const OPENAI_CHAT_COMPLETIONS_PATH = '/v1/chat/completions';
-const CAPABILITIES_PATH = '/capabilities';
+const AGENT_CARD_PATH = '/agent-card';
 const TAG_NAME_RE = /^[a-z][a-z0-9_-]{0,63}$/;
 
 function verifyInvocationForRequest({ requestHeaders, bodyObject, expectedTool }) {
@@ -952,7 +952,7 @@ async function main() {
             if (method === 'GET' && u.pathname === '/health') {
                 return sendJson(200, { ok: true, server: 'ploinky-agent-mcp' });
             }
-            if (method === 'GET' && u.pathname === CAPABILITIES_PATH) {
+            if (method === 'GET' && u.pathname === AGENT_CARD_PATH) {
                 const manifestResult = getManifestResult();
                 const manifest = manifestResult ? manifestResult.manifest : null;
                 const capabilities = normalizeCapabilities(manifest?.endpoints?.capabilities);

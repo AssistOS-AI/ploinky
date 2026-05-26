@@ -197,12 +197,12 @@ function resolveAgentRouteOrRespond(res, apiRoutes, agentName) {
     return route;
 }
 
-function requestAgentCapabilities(route, agentName, identityHeaders = {}) {
+function requestAgentCard(route, agentName, identityHeaders = {}) {
     return new Promise((resolve) => {
         const upstream = http.request({
             hostname: '127.0.0.1',
             port: route.hostPort,
-            path: '/capabilities',
+            path: '/agent-card',
             method: 'GET',
             headers: {
                 accept: 'application/json',
@@ -248,7 +248,7 @@ function requestAgentCapabilities(route, agentName, identityHeaders = {}) {
             });
         });
         upstream.on('timeout', () => {
-            upstream.destroy(new Error('capabilities request timed out'));
+            upstream.destroy(new Error('agent-card request timed out'));
         });
         upstream.on('error', err => {
             resolve({
@@ -263,7 +263,7 @@ function requestAgentCapabilities(route, agentName, identityHeaders = {}) {
     });
 }
 
-async function handleRoutedAggregateCapabilities(req, res) {
+async function handleRoutedAggregateAgentCard(req, res) {
     const method = (req.method || 'GET').toUpperCase();
     if (method !== 'GET') {
         sendJsonResponse(res, 405, { error: 'method_not_allowed' }, { Allow: 'GET' });
@@ -274,8 +274,8 @@ async function handleRoutedAggregateCapabilities(req, res) {
         .filter(([, route]) => route && !route.disabled && route.hostPort);
     const results = await Promise.all(candidates.map(([agentName, route]) =>
         Promise.resolve()
-            .then(() => buildRoutedAgentIdentityHeaders(req, agentName, 'capabilities', { agent: agentName }))
-            .then(identityHeaders => requestAgentCapabilities(route, agentName, identityHeaders))
+            .then(() => buildRoutedAgentIdentityHeaders(req, agentName, 'agent-card', { agent: agentName }))
+            .then(identityHeaders => requestAgentCard(route, agentName, identityHeaders))
             .catch(error => ({
                 ok: false,
                 error: {
@@ -318,7 +318,7 @@ function handleRoutedOpenAiChatCompletions(req, res, parsedUrl, agentName) {
     proxyHttpPassthrough(req, res, route.hostPort, `/v1/chat/completions${parsedUrl.search || ''}`, identityHeaders);
 }
 
-function handleRoutedAgentCapabilities(req, res, parsedUrl, agentName) {
+function handleRoutedAgentCard(req, res, parsedUrl, agentName) {
     const method = (req.method || 'GET').toUpperCase();
     if (method !== 'GET') {
         sendJsonResponse(res, 405, { error: 'method_not_allowed' }, { Allow: 'GET' });
@@ -329,12 +329,12 @@ function handleRoutedAgentCapabilities(req, res, parsedUrl, agentName) {
     if (!route) return;
     let identityHeaders;
     try {
-        identityHeaders = buildRoutedAgentIdentityHeaders(req, agentName, 'capabilities', { agent: agentName });
+        identityHeaders = buildRoutedAgentIdentityHeaders(req, agentName, 'agent-card', { agent: agentName });
     } catch (error) {
         sendJsonResponse(res, 401, { error: 'invocation_rejected', reason: error?.message || String(error) });
         return;
     }
-    proxyHttpPassthrough(req, res, route.hostPort, `/capabilities${parsedUrl.search || ''}`, identityHeaders);
+    proxyHttpPassthrough(req, res, route.hostPort, `/agent-card${parsedUrl.search || ''}`, identityHeaders);
 }
 
 function isAgentMcpProxyRoute(pathname) {
@@ -351,9 +351,9 @@ function isAgentMcpProxyRoute(pathname) {
 async function processRequest(req, res) {
     const parsedUrl = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
     const pathname = parsedUrl.pathname || '/';
-    const routedAggregateCapabilities = pathname === '/capabilities' || pathname === '/capabilities/';
+    const routedAggregateAgentCard = pathname === '/agent-card' || pathname === '/agent-card/';
     const routedOpenAiAgent = matchSingleAgentRoute(pathname, ['v1', 'chat', 'completions']);
-    const routedCapabilitiesAgent = matchSingleAgentRoute(pathname, ['capabilities']);
+    const routedAgentCard = matchSingleAgentRoute(pathname, ['agent-card']);
     appendLog('http_request', { method: req.method, path: pathname });
 
     // Health check endpoint (no auth required)
@@ -405,7 +405,7 @@ async function processRequest(req, res) {
     const isPublicServiceRoute = isPublicHttpServiceRoute(pathname);
     const isDelegatedAgentMcpRoute = isAgentMcpProxyRoute(pathname);
     const isDelegatedAgentHttpRoute = hasDelegatedCallerJwtHeader(req)
-        && (routedAggregateCapabilities || routedOpenAiAgent || routedCapabilitiesAgent);
+        && (routedAggregateAgentCard || routedOpenAiAgent || routedAgentCard);
 
     // Agent MCP proxy routes authenticate inside handleAgentMcpRequest after the
     // JSON-RPC payload is available, so direct signed requests can be verified
@@ -440,12 +440,12 @@ async function processRequest(req, res) {
         return handleBlobs(req, res);
     } else if (handleHttpServiceRoute(req, res, parsedUrl)) {
         return;
-    } else if (routedAggregateCapabilities) {
-        return handleRoutedAggregateCapabilities(req, res);
+    } else if (routedAggregateAgentCard) {
+        return handleRoutedAggregateAgentCard(req, res);
     } else if (routedOpenAiAgent) {
         return handleRoutedOpenAiChatCompletions(req, res, parsedUrl, routedOpenAiAgent);
-    } else if (routedCapabilitiesAgent) {
-        return handleRoutedAgentCapabilities(req, res, parsedUrl, routedCapabilitiesAgent);
+    } else if (routedAgentCard) {
+        return handleRoutedAgentCard(req, res, parsedUrl, routedAgentCard);
     } else if (pathname === '/mcp' || pathname === '/mcp/') {
         return handleRouterMcp(req, res);
     } else if (pathname.startsWith('/mcps/') || pathname.startsWith('/mcp/')) {
