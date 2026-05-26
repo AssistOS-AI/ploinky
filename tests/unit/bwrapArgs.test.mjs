@@ -7,6 +7,7 @@ import path from 'node:path';
 import {
     buildBwrapArgs,
     buildBwrapInteractiveCommand,
+    buildShellCommand,
 } from '../../cli/services/bwrap/bwrapServiceManager.js';
 
 function tempDir(prefix = 'bwrap-args-') {
@@ -71,5 +72,12 @@ test('buildBwrapInteractiveCommand preserves non-shell commands and quotes workd
     assert.equal(
         buildBwrapInteractiveCommand("/tmp/it's-here", 'node /code/src/index.mjs', { forceInteractiveShell: true }),
         "cd '/tmp/it'\\''s-here' && node /code/src/index.mjs"
+    );
+});
+
+test('buildShellCommand quotes argv for script pty wrapper', () => {
+    assert.equal(
+        buildShellCommand(['cmd', 'a b', "it's"]),
+        "'cmd' 'a b' 'it'\\''s'"
     );
 });

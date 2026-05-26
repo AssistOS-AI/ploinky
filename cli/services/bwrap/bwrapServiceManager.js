@@ -474,6 +474,10 @@ function shellQuote(value) {
     return `'${String(value).replace(/'/g, `'\\''`)}'`;
 }
 
+function buildShellCommand(argv) {
+    return argv.map((arg) => shellQuote(arg)).join(' ');
+}
+
 function buildBwrapInteractiveCommand(workdir, entryCommand, options = {}) {
     const wd = workdir || '/code';
     const rawCommand = entryCommand && String(entryCommand).trim()
@@ -487,6 +491,16 @@ function buildBwrapInteractiveCommand(workdir, entryCommand, options = {}) {
 
 function sanitizeHistoryName(value) {
     return String(value || 'agent').replace(/[^A-Za-z0-9_.-]/g, '_');
+}
+
+function spawnBwrapInteractive(bwrapArgs, options = {}) {
+    const usePty = options.usePty === true;
+    const scriptPath = '/usr/bin/script';
+    if (usePty && fs.existsSync(scriptPath)) {
+        const command = buildShellCommand([BWRAP_PATH, ...bwrapArgs]);
+        return spawnSync(scriptPath, ['-qfec', command, '/dev/null'], { stdio: 'inherit' });
+    }
+    return spawnSync(BWRAP_PATH, bwrapArgs, { stdio: 'inherit' });
 }
 
 /**
@@ -840,6 +854,7 @@ function attachBwrapInteractive(agentName, manifest, agentPath, workdir, entryCo
         envMap.HISTFILE = `/shared/.ploinky-${sanitizeHistoryName(agentName)}-shell-history`;
         envMap.HISTSIZE = '5000';
         envMap.HISTFILESIZE = '10000';
+        envMap.PS1 = '$ ';
     }
 
     // Build bwrap args (same mounts as the running agent)
@@ -869,7 +884,7 @@ function attachBwrapInteractive(agentName, manifest, agentPath, workdir, entryCo
 
     debugLog(`[bwrap] ${agentName}: interactive session: sh -lc ${JSON.stringify(shellCommand)}`);
 
-    const result = spawnSync(BWRAP_PATH, bwrapArgs, { stdio: 'inherit' });
+    const result = spawnBwrapInteractive(bwrapArgs, { usePty: process.stdin.isTTY });
     return result.status ?? 0;
 }
 
@@ -879,6 +894,7 @@ export {
     buildBwrapArgs,
     buildFullEnvMap,
     buildBwrapInteractiveCommand,
+    buildShellCommand,
     attachBwrapInteractive,
     BWRAP_PATH
 };
