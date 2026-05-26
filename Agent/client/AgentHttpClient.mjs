@@ -202,7 +202,13 @@ async function* iterateSse(stream) {
 
 export function createAgentHttpClient(options = {}) {
     const routerUrl = stripTrailingSlash(options.routerUrl || getRouterUrl(options.env || process.env));
-    const requestHeaders = normalizeHeaders(options.requestHeaders || {});
+    const invocationToken = typeof options.invocationToken === 'string' && options.invocationToken.trim()
+        ? options.invocationToken.trim()
+        : '';
+    const requestHeaders = normalizeHeaders({
+        ...(invocationToken ? { 'x-ploinky-caller-jwt': invocationToken } : {}),
+        ...(options.requestHeaders || {})
+    });
     const timeoutMs = Number.isFinite(options.timeoutMs) ? options.timeoutMs : 0;
 
     function buildJsonHeaders(extraHeaders = {}) {

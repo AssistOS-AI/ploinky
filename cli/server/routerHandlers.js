@@ -1,6 +1,7 @@
 import http from 'http';
 import { randomUUID } from 'node:crypto';
 
+import { authInfoFromInvocation } from '../../Agent/lib/invocation-auth.mjs';
 import { sendJson } from './authHandlers.js';
 import { createAgentClient } from './AgentClient.js';
 import { buildInvocationContextForProviderCall } from './mcp-proxy/index.js';
@@ -164,6 +165,45 @@ export function buildPlainAuthInfoHeader(req, invocation = null) {
     return {
         'x-ploinky-auth-info': JSON.stringify(authInfo)
     };
+}
+
+export function readHeaderValue(headers = {}, headerName) {
+    const direct = headers?.[headerName];
+    if (typeof direct === 'string' && direct.trim()) return direct.trim();
+    const lower = headers?.[String(headerName || '').toLowerCase()];
+    return typeof lower === 'string' && lower.trim() ? lower.trim() : '';
+}
+
+export function hasDelegatedCallerJwtHeader(req) {
+    return Boolean(readHeaderValue(req?.headers || {}, 'x-ploinky-caller-jwt'));
+}
+
+function buildAuthInfoHeaderFromInvocation(invocation) {
+    const authInfo = authInfoFromInvocation(invocation?.payload, {
+        invocationToken: invocation?.token || ''
+    });
+    if (!authInfo) return {};
+    return { 'x-ploinky-auth-info': JSON.stringify(authInfo) };
+}
+
+export function buildRoutedAgentIdentityHeaders(req, agentName, toolName, toolArgs = {}) {
+    const invocation = buildInvocationContextForProviderCall({
+        req,
+        agentName,
+        toolName,
+        toolArgs
+    });
+    if (!invocation?.token) {
+        return buildPlainAuthInfoHeader(req);
+    }
+    const headers = {
+        ...buildPlainAuthInfoHeader(req, invocation),
+        authorization: `Bearer ${invocation.token}`
+    };
+    if (!headers['x-ploinky-auth-info']) {
+        Object.assign(headers, buildAuthInfoHeaderFromInvocation(invocation));
+    }
+    return headers;
 }
 
 export function isPublicHttpServiceRoute(pathname) {

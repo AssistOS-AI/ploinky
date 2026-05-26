@@ -54,7 +54,12 @@ test('AgentHttpClient resolves router and agent endpoint URLs', () => {
 test('AgentHttpClient calls router capabilities and chat completions endpoints', async () => {
     const seen = [];
     const server = http.createServer(async (req, res) => {
-        seen.push({ method: req.method, url: req.url, auth: req.headers['x-test-auth'] || '' });
+        seen.push({
+            method: req.method,
+            url: req.url,
+            auth: req.headers['x-test-auth'] || '',
+            callerJwt: req.headers['x-ploinky-caller-jwt'] || ''
+        });
         if (req.method === 'GET' && req.url === '/capabilities') {
             res.writeHead(200, { 'content-type': 'application/json' });
             res.end(JSON.stringify({
@@ -86,6 +91,7 @@ test('AgentHttpClient calls router capabilities and chat completions endpoints',
         const { port } = server.address();
         const client = createAgentHttpClient({
             routerUrl: `http://127.0.0.1:${port}`,
+            invocationToken: 'caller-token',
             requestHeaders: { 'x-test-auth': 'router-issued' }
         });
         const aggregate = await client.capabilities();
@@ -111,6 +117,7 @@ test('AgentHttpClient calls router capabilities and chat completions endpoints',
         '/v1/chat/completions/openaiAgent'
     ]);
     assert.ok(seen.every(entry => entry.auth === 'router-issued'));
+    assert.ok(seen.every(entry => entry.callerJwt === 'caller-token'));
 });
 
 test('AgentHttpClient streams chat completions SSE events through router endpoint', async () => {
