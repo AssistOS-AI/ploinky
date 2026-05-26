@@ -47,6 +47,16 @@ function extractManifestCli(manifest) {
     return '';
 }
 
+function extractManifestWebchatOptions(manifest) {
+    const webchat = manifest && typeof manifest === 'object' && manifest.webchat && typeof manifest.webchat === 'object'
+        ? manifest.webchat
+        : {};
+    return {
+        forwardEnvelope: webchat.forwardEnvelope === true || webchat.forwardEnvelope === 'true'
+            || webchat.forwardEnvelope === 1 || webchat.forwardEnvelope === '1'
+    };
+}
+
 function resolveStaticAgentDetails(routingFilePath) {
     const cfg = readRoutingConfig(routingFilePath);
     if (!cfg || !cfg.static) {
@@ -95,10 +105,12 @@ function resolveWebchatCommands(options = {}) {
 
     const manifestPath = options.manifestPathOverride || path.join(hostPath, 'manifest.json');
     let manifestCli = '';
+    let webchatOptions = { forwardEnvelope: false };
     try {
         if (fs.existsSync(manifestPath)) {
             const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
             manifestCli = extractManifestCli(manifest);
+            webchatOptions = extractManifestWebchatOptions(manifest);
         }
     } catch (_) {
         manifestCli = '';
@@ -108,7 +120,7 @@ function resolveWebchatCommands(options = {}) {
         // If we have an agent but no manifest command, we should still return the agent name
         // as other features like blob storage might depend on it.
         // The TTY factory will simply have no command to run, which is handled elsewhere.
-        return { host: '', container: '', source: 'unset', agentName: staticAgentName };
+        return { host: '', container: '', source: 'unset', agentName: staticAgentName, ...webchatOptions };
     }
 
     const cliTarget = resolveCliTarget({ alias, container: containerName }, staticAgentName);
@@ -119,6 +131,7 @@ function resolveWebchatCommands(options = {}) {
         source: 'manifest',
         agentName: staticAgentName,
         cliTarget,
+        ...webchatOptions,
         cacheKey: 'webchat'
     };
 }
@@ -142,10 +155,12 @@ function resolveWebchatCommandsForAgent(agentRef, options = {}) {
 
     const manifestPath = path.join(record.hostPath, 'manifest.json');
     let manifestCli = '';
+    let webchatOptions = { forwardEnvelope: false };
     try {
         if (fs.existsSync(manifestPath)) {
             const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
             manifestCli = extractManifestCli(manifest);
+            webchatOptions = extractManifestWebchatOptions(manifest);
         }
     } catch (_) {
         manifestCli = '';
@@ -159,6 +174,7 @@ function resolveWebchatCommandsForAgent(agentRef, options = {}) {
         source: 'manifest',
         agentName: agentRef,
         cliTarget,
+        ...webchatOptions,
         cacheKey: cacheSuffix ? `webchat:${agentRef}:${cacheSuffix}` : `webchat:${agentRef}`
     };
 }
@@ -167,5 +183,6 @@ export {
     resolveWebchatCommands,
     resolveWebchatCommandsForAgent,
     extractManifestCli,
+    extractManifestWebchatOptions,
     trimCommand
 };

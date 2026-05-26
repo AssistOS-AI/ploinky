@@ -267,6 +267,9 @@ export function createComposerAutocomplete({ cmdInput }, { providers = [], dlog,
             renderMenu();
             return true;
         }
+        if (event.key === 'Enter' && (event.ctrlKey || event.metaKey || event.shiftKey || event.altKey)) {
+            return false;
+        }
         if ((event.key === 'Enter' || event.key === 'Tab') && selectedIndex >= 0) {
             event.preventDefault();
             applySelection(suggestionsCache[selectedIndex]);

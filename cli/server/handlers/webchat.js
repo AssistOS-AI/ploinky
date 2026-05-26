@@ -266,9 +266,10 @@ function isTruthyQueryValue(value) {
     return /^(1|true|yes|on)$/i.test(String(value || '').trim());
 }
 
-function shouldForwardWebchatEnvelope(parsedUrl) {
+function shouldForwardWebchatEnvelope(parsedUrl, effectiveConfig = null) {
     return isTruthyQueryValue(parsedUrl.searchParams.get('forward-envelope'))
-        || isTruthyQueryValue(parsedUrl.searchParams.get('forwardEnvelope'));
+        || isTruthyQueryValue(parsedUrl.searchParams.get('forwardEnvelope'))
+        || effectiveConfig?.forwardEnvelope === true;
 }
 
 function buildTranscriptContext(req, appState, tabId) {
@@ -1566,7 +1567,7 @@ async function handleWebChat(req, res, appConfig, appState) {
             } catch (_) {
                 // Ignore transcript capture errors.
             }
-            const text = shouldForwardWebchatEnvelope(parsedUrl)
+            const text = shouldForwardWebchatEnvelope(parsedUrl, effectiveConfig)
                 ? serializeWebchatEnvelopeForAgent({
                     req,
                     effectiveConfig,
@@ -1606,6 +1607,7 @@ export {
     resolveWebchatLaunchOptions,
     resolveRequestPublicOrigin,
     serializeWebchatEnvelopeForAgent,
+    shouldForwardWebchatEnvelope,
     resolveWorkspaceScopedQueryPath,
     sanitizeWebchatReferencesForEnvelope,
     parseInputEnvelope

@@ -8,8 +8,12 @@ import {
     resolveRequestPublicOrigin,
     resolveWorkspaceScopedQueryPath,
     serializeWebchatEnvelopeForAgent,
+    shouldForwardWebchatEnvelope,
     writeOrBufferSseEvent
 } from '../../cli/server/handlers/webchat.js';
+import {
+    extractManifestWebchatOptions
+} from '../../cli/server/webchat/commandResolver.js';
 import { WORKSPACE_ROOT } from '../../cli/services/config.js';
 
 test('resolveWebchatLaunchOptions forwards agent-owned launch flags unchanged', () => {
@@ -22,6 +26,20 @@ test('resolveWebchatLaunchOptions forwards agent-owned launch flags unchanged', 
     assert.ok(cliArgs.includes('--feature-tags=1'));
     assert.ok(cliArgs.includes('--forward-envelope=1'));
     assert.equal(cliArgs.some((arg) => arg.startsWith('--workspace-dir=')), false);
+});
+
+test('manifest webchat forwardEnvelope opts an agent into WebChat envelopes', () => {
+    assert.deepEqual(extractManifestWebchatOptions({ webchat: { forwardEnvelope: true } }), {
+        forwardEnvelope: true
+    });
+    assert.equal(
+        shouldForwardWebchatEnvelope(new URL('/webchat?agent=achilles-cli', 'http://localhost'), { forwardEnvelope: true }),
+        true
+    );
+    assert.equal(
+        shouldForwardWebchatEnvelope(new URL('/webchat?agent=basic', 'http://localhost'), { forwardEnvelope: false }),
+        false
+    );
 });
 
 test('resolveWorkspaceScopedQueryPath rejects absolute and escaping launch paths', () => {

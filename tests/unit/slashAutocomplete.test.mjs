@@ -65,6 +65,29 @@ test('buildSuggestions uses generic argument completions for first command argum
     }]);
 });
 
+test('buildSuggestions stops suggesting an exact first argument after trailing space', () => {
+    const commands = [{
+        name: '/exec',
+        description: 'Execute any skill directly',
+        subCommands: [],
+        argCompletions: [
+            { value: 'chat-completion', label: 'chat-completion', description: '' },
+            { value: 'get-capabilities', label: 'get-capabilities', description: '' }
+        ]
+    }];
+
+    assert.deepEqual(buildSuggestions(commands, {
+        currentToken: 'exec',
+        hasSubToken: true,
+        subToken: 'chat-completion '
+    }), []);
+    assert.deepEqual(buildSuggestions(commands, {
+        currentToken: 'exec',
+        hasSubToken: true,
+        subToken: 'chat-completion h'
+    }), []);
+});
+
 test('buildSuggestions keeps multiline skill help ahead of the command description', () => {
     const help = [
         'Use this for WebAdmin requests.',

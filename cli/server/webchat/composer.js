@@ -38,13 +38,12 @@ export function createComposer({ cmdInput, sendBtn, cancelBtn }, { purgeTriggerR
             return;
         }
         const { preserveSelection = false } = options;
-        if (document.activeElement === cmdInput) {
-            return;
-        }
-        try {
-            cmdInput.focus({ preventScroll: true });
-        } catch (_) {
-            cmdInput.focus();
+        if (document.activeElement !== cmdInput) {
+            try {
+                cmdInput.focus({ preventScroll: true });
+            } catch (_) {
+                cmdInput.focus();
+            }
         }
         if (preserveSelection) {
             return;
@@ -54,6 +53,17 @@ export function createComposer({ cmdInput, sendBtn, cancelBtn }, { purgeTriggerR
             cmdInput.setSelectionRange(pos, pos);
         } catch (_) {
             // Ignore selection issues
+        }
+    }
+
+    function emitInputChange() {
+        if (!cmdInput) {
+            return;
+        }
+        try {
+            cmdInput.dispatchEvent(new Event('input', { bubbles: true }));
+        } catch (_) {
+            // Ignore event dispatch failures
         }
     }
 
@@ -104,7 +114,7 @@ export function createComposer({ cmdInput, sendBtn, cancelBtn }, { purgeTriggerR
         } catch (_) {
             // Ignore selection issues
         }
-        autoResize();
+        emitInputChange();
         return true;
     }
 
@@ -113,7 +123,12 @@ export function createComposer({ cmdInput, sendBtn, cancelBtn }, { purgeTriggerR
             return;
         }
         cmdInput.value = '';
-        autoResize();
+        try {
+            cmdInput.setSelectionRange(0, 0);
+        } catch (_) {
+            // Ignore selection issues
+        }
+        emitInputChange();
         focusAfterAction();
     }
 
@@ -170,7 +185,7 @@ export function createComposer({ cmdInput, sendBtn, cancelBtn }, { purgeTriggerR
             }
         }
         cmdInput.scrollTop = prevScroll;
-        autoResize();
+        emitInputChange();
         if (purgeTriggerRe.test(cmdInput.value)) {
             purge({ resetVoice: true });
         }
@@ -200,7 +215,13 @@ export function createComposer({ cmdInput, sendBtn, cancelBtn }, { purgeTriggerR
             return;
         }
         cmdInput.value = value;
-        autoResize();
+        try {
+            const pos = cmdInput.value.length;
+            cmdInput.setSelectionRange(pos, pos);
+        } catch (_) {
+            // Ignore selection issues
+        }
+        emitInputChange();
     }
 
     const getValue = () => (cmdInput ? cmdInput.value : '');
@@ -228,6 +249,11 @@ export function createComposer({ cmdInput, sendBtn, cancelBtn }, { purgeTriggerR
         });
         cmdInput.addEventListener('keydown', (event) => {
             if (event.defaultPrevented) {
+                return;
+            }
+            if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) {
+                event.preventDefault();
+                insertTextAtCursor('\n');
                 return;
             }
             if (event.key === 'Enter' && !event.shiftKey) {

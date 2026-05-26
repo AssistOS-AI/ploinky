@@ -165,6 +165,7 @@ function createWebchatFactoryConfig(pty, webchatTTYModule, resolvedWebchatComman
         containerCommand: commands?.container || '',
         source: commands?.source || 'unset',
         agentName: commands?.agentName || '',
+        forwardEnvelope: commands?.forwardEnvelope === true,
         unsupportedReason: commands?.unsupportedReason || ''
     });
     const resolveHostWorkdir = (config) => {
@@ -196,6 +197,7 @@ function createWebchatFactoryConfig(pty, webchatTTYModule, resolvedWebchatComman
                 label: command ? command : 'local shell',
                 runtime: 'local',
                 agentName: config.agentName || '',
+                forwardEnvelope: config.forwardEnvelope === true,
                 unavailableReason: ''
             };
         }
@@ -219,6 +221,7 @@ function createWebchatFactoryConfig(pty, webchatTTYModule, resolvedWebchatComman
                 label: containerLabel,
                 runtime: 'docker',
                 agentName: config.agentName || '',
+                forwardEnvelope: config.forwardEnvelope === true,
                 unavailableReason: ''
             };
         }
@@ -282,6 +285,7 @@ function createServiceConfig(getWebttyFactory, getWebchatFactory) {
             agentName: factoryResult.agentName || appName || 'ChatAgent',
             containerName: factoryResult.label,
             runtime: factoryResult.runtime,
+            forwardEnvelope: factoryResult.forwardEnvelope === true,
             unavailableReason: factoryResult.unavailableReason || ''
         };
         base.getFactoryForCommands = (commands) => {

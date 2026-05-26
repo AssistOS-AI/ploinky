@@ -139,6 +139,17 @@ function getRemainingAfterFirstToken(value) {
     return match ? match[1] : '';
 }
 
+function isCompletedKnownToken(rawToken, completions) {
+    const text = String(rawToken || '');
+    if (!/\s$/.test(text)) return false;
+    const token = text.trim().toLowerCase();
+    if (!token) return false;
+    return normalizeArgCompletions(completions).some((completion) =>
+        completion.value.toLowerCase() === token
+        || completion.label.toLowerCase() === token
+    );
+}
+
 function appendArgCompletionSuggestions(suggestions, { cmdName, cmd, argCompletions, argToken, prefixText = '' }) {
     const normalizedArgToken = String(argToken || '').trim().toLowerCase();
     const matchingArgs = argCompletions.filter((completion) =>
@@ -229,7 +240,8 @@ export function buildSuggestions(commands, {
                 }
             }
 
-            const isCompletingFirstArg = !rawSubToken.trim().includes(' ');
+            const isCompletingFirstArg = !rawSubToken.trim().includes(' ')
+                && !isCompletedKnownToken(rawSubToken, argCompletions);
             if (argCompletions.length > 0 && isCompletingFirstArg) {
                 appendArgCompletionSuggestions(suggestions, {
                     cmdName,
@@ -239,9 +251,7 @@ export function buildSuggestions(commands, {
                 });
             }
 
-            if (suggestions.length > suggestionCountBeforeCommand) {
-                continue;
-            }
+            continue;
         }
 
         if (normalizedCmdName.includes(normalizedToken)) {
