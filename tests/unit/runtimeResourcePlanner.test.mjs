@@ -96,6 +96,61 @@ test('planRuntimeResources resolves generatedSecret templates', () => {
     assert.notEqual(plan.env.DPU_MASTER_KEY, 'test-master-key-123');
 });
 
+test('generatedSecret template produces different values for different agents', () => {
+    const manifest = {
+        runtime: {
+            resources: {
+                env: {
+                    MY_KEY: '{{generatedSecret:MY_KEY}}'
+                }
+            }
+        }
+    };
+    const planA = planRuntimeResources(manifest, {
+        repoName: 'AssistOSExplorer',
+        agentName: 'agentA',
+    });
+    const planB = planRuntimeResources(manifest, {
+        repoName: 'AssistOSExplorer',
+        agentName: 'agentB',
+    });
+    assert.ok(planA.env.MY_KEY, 'agentA key should be non-empty');
+    assert.ok(planB.env.MY_KEY, 'agentB key should be non-empty');
+    assert.notEqual(planA.env.MY_KEY, planB.env.MY_KEY);
+});
+
+test('generatedSecret and derivedMasterSecret produce same values for migrated agent secrets', () => {
+    const cases = [
+        {
+            repoName: 'AssistOSExplorer',
+            agentName: 'dpuAgent',
+            secretName: 'DPU_MASTER_KEY',
+        },
+        {
+            repoName: 'AssistOSExplorer',
+            agentName: 'webmeetAgent',
+            secretName: 'PLOINKY_WEBMEET_MASTER_KEY',
+        },
+    ];
+
+    for (const { repoName, agentName, secretName } of cases) {
+        const genPlan = planRuntimeResources({
+            runtime: { resources: { env: { [secretName]: `{{generatedSecret:${secretName}}}` } } }
+        }, { repoName, agentName });
+
+        const derivedPlan = planRuntimeResources({
+            runtime: { resources: { env: { [secretName]: `{{derivedMasterSecret:${secretName}}}` } } }
+        }, { repoName, agentName });
+
+        assert.equal(genPlan.env[secretName], derivedPlan.env[secretName]);
+        assert.equal(genPlan.env[secretName], deriveAgentSecret({
+            repoName,
+            agentName,
+            name: secretName,
+        }));
+    }
+});
+
 test('planRuntimeResources can expand storage container path to host path for host sandboxes', () => {
     const plan = planRuntimeResources({
         runtime: {

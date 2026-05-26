@@ -108,6 +108,38 @@ test('buildEnvMap derives generatedSecret entries from the current agent identit
     assert.notEqual(env.GENERATED_SECRET_TEST_SECRET, 'operator-value');
 });
 
+test('generatedSecret and derived-master env entries produce same value for migrated manifest secrets', () => {
+    const generatedManifest = {
+        env: [
+            {
+                name: 'PLOINKY_WEBMEET_MASTER_KEY',
+                generatedSecret: true,
+            },
+        ],
+    };
+    const derivedManifest = {
+        env: [
+            {
+                name: 'PLOINKY_WEBMEET_MASTER_KEY',
+                derive: 'derived-master',
+            },
+        ],
+    };
+    const options = {
+        repoName: 'AssistOSExplorer',
+        agentName: 'webmeetAgent',
+    };
+
+    const generatedEnv = buildEnvMap(generatedManifest, null, options);
+    const derivedEnv = buildEnvMap(derivedManifest, null, options);
+
+    assert.equal(generatedEnv.PLOINKY_WEBMEET_MASTER_KEY, derivedEnv.PLOINKY_WEBMEET_MASTER_KEY);
+    assert.equal(generatedEnv.PLOINKY_WEBMEET_MASTER_KEY, deriveAgentSecret({
+        ...options,
+        name: 'PLOINKY_WEBMEET_MASTER_KEY',
+    }));
+});
+
 test('generatedSecret entries are scoped per agent by default', () => {
     const manifest = {
         env: [
