@@ -1,11 +1,11 @@
 fast_openai_chat_completions() {
   local output
   output=$(PLOINKY_ROUTER_URL="http://127.0.0.1:${TEST_ROUTER_PORT}" \
-    PLOINKY_AGENT_LIB_DIR="${PLOINKY_AGENT_LIB_DIR:-$TESTS_DIR/../Agent}" \
+    PLOINKY_AGENT_LIB_DIR="${PLOINKY_AGENT_LIB_DIR:-$TESTS_DIR/../node_modules/achillesAgentLib}" \
     TEST_OPENAI_AGENT_NAME="$TEST_OPENAI_AGENT_NAME" \
     node --input-type=module <<'NODE'
-const agentLibDir = process.env.PLOINKY_AGENT_LIB_DIR || '/Agent';
-const { createAgentHttpClient } = await import(`${agentLibDir}/client/AgentHttpClient.mjs`);
+const agentLibDir = process.env.PLOINKY_AGENT_LIB_DIR || '/code/node_modules/achillesAgentLib';
+const { createAgentHttpClient } = await import(`${agentLibDir}/PloinkyAgentSkillsSubsystem/AgentHttpClient.mjs`);
 
 const client = createAgentHttpClient();
 const response = await client.chatCompletions(process.env.TEST_OPENAI_AGENT_NAME, {
@@ -24,11 +24,11 @@ NODE
 fast_openai_chat_completions_stream() {
   local output
   output=$(PLOINKY_ROUTER_URL="http://127.0.0.1:${TEST_ROUTER_PORT}" \
-    PLOINKY_AGENT_LIB_DIR="${PLOINKY_AGENT_LIB_DIR:-$TESTS_DIR/../Agent}" \
+    PLOINKY_AGENT_LIB_DIR="${PLOINKY_AGENT_LIB_DIR:-$TESTS_DIR/../node_modules/achillesAgentLib}" \
     TEST_OPENAI_AGENT_NAME="$TEST_OPENAI_AGENT_NAME" \
     node --input-type=module <<'NODE'
-const agentLibDir = process.env.PLOINKY_AGENT_LIB_DIR || '/Agent';
-const { createAgentHttpClient } = await import(`${agentLibDir}/client/AgentHttpClient.mjs`);
+const agentLibDir = process.env.PLOINKY_AGENT_LIB_DIR || '/code/node_modules/achillesAgentLib';
+const { createAgentHttpClient } = await import(`${agentLibDir}/PloinkyAgentSkillsSubsystem/AgentHttpClient.mjs`);
 
 const client = createAgentHttpClient();
 const events = [];
@@ -58,11 +58,11 @@ NODE
 fast_openai_agent_card() {
   local output
   output=$(PLOINKY_ROUTER_URL="http://127.0.0.1:${TEST_ROUTER_PORT}" \
-    PLOINKY_AGENT_LIB_DIR="${PLOINKY_AGENT_LIB_DIR:-$TESTS_DIR/../Agent}" \
+    PLOINKY_AGENT_LIB_DIR="${PLOINKY_AGENT_LIB_DIR:-$TESTS_DIR/../node_modules/achillesAgentLib}" \
     TEST_OPENAI_AGENT_NAME="$TEST_OPENAI_AGENT_NAME" \
     node --input-type=module <<'NODE'
-const agentLibDir = process.env.PLOINKY_AGENT_LIB_DIR || '/Agent';
-const { createAgentHttpClient } = await import(`${agentLibDir}/client/AgentHttpClient.mjs`);
+const agentLibDir = process.env.PLOINKY_AGENT_LIB_DIR || '/code/node_modules/achillesAgentLib';
+const { createAgentHttpClient } = await import(`${agentLibDir}/PloinkyAgentSkillsSubsystem/AgentHttpClient.mjs`);
 
 const client = createAgentHttpClient();
 const response = await client.agentCard();

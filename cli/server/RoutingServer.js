@@ -384,16 +384,15 @@ async function processRequest(req, res) {
     const isPublicServiceRoute = isPublicHttpServiceRoute(pathname);
     const isDelegatedAgentMcpRoute = isAgentMcpProxyRoute(pathname);
 
+    // Agent-card and chat-completions routes are public at the router level;
+    // the target agent decides whether to accept or reject the request.
     // Agent MCP proxy routes authenticate inside handleAgentMcpRequest after the
     // JSON-RPC payload is available, so direct signed requests can be verified
     // against the exact tool body they signed.
-    // Agent-card and chat-completions routes use normal browser/API-key auth.
     if (isDelegatedAgentMcpRoute) {
         // no-op; handled downstream
     } else if (routedAggregateAgentCard || routedOpenAiAgent || routedAgentCard) {
-        // Agent discovery and chat completions use normal auth (browser cookies or API key)
-        const authResult = await ensureAuthenticated(req, res, parsedUrl);
-        if (!authResult.ok) return;
+        // Public proxy routes; the agent handles its own access control.
     } else if (pathname === '/mcp' || pathname === '/mcp/') {
         const authResult = await ensureAuthenticated(req, res, parsedUrl);
         if (!authResult.ok) return;
