@@ -15,8 +15,6 @@ import * as staticSrv from './static/index.js';
 // Authentication and routing
 import { ensureAuthenticated, handleAuthRoutes, handleUserAdminRoutes } from './authHandlers.js';
 import {
-    buildRoutedAgentIdentityHeaders,
-    hasDelegatedCallerJwtHeader,
     loadApiRoutes,
     handleRouterMcp,
     handleHttpServiceRoute,
@@ -29,7 +27,7 @@ import { appendLog, logBootEvent, logMemoryUsage } from './utils/logger.js';
 import { isRouteMount } from './utils/routeMounts.js';
 
 // New modular components
-import { agentSessionStore, buildInvocationContextForProviderCall, handleAgentMcpRequest } from './mcp-proxy/index.js';
+import { agentSessionStore, handleAgentMcpRequest } from './mcp-proxy/index.js';
 import { initializeTTYFactories, createServiceConfig } from './utils/ttyFactories.js';
 import { setupProcessLifecycle } from './utils/processLifecycle.js';
 
@@ -273,9 +271,7 @@ async function handleRoutedAggregateAgentCard(req, res) {
     const candidates = Object.entries(apiRoutes || {})
         .filter(([, route]) => route && !route.disabled && route.hostPort);
     const results = await Promise.all(candidates.map(([agentName, route]) =>
-        Promise.resolve()
-            .then(() => buildRoutedAgentIdentityHeaders(req, agentName, 'agent-card', { agent: agentName }))
-            .then(identityHeaders => requestAgentCard(route, agentName, identityHeaders))
+        requestAgentCard(route, agentName, req.headers)
             .catch(error => ({
                 ok: false,
                 error: {
@@ -305,17 +301,7 @@ function handleRoutedOpenAiChatCompletions(req, res, parsedUrl, agentName) {
     const apiRoutes = loadApiRoutes();
     const route = resolveAgentRouteOrRespond(res, apiRoutes, agentName);
     if (!route) return;
-    let identityHeaders;
-    try {
-        identityHeaders = buildRoutedAgentIdentityHeaders(req, agentName, 'openai.chat.completions', {
-            agent: agentName,
-            path: '/v1/chat/completions'
-        });
-    } catch (error) {
-        sendJsonResponse(res, 401, { error: 'invocation_rejected', reason: error?.message || String(error) });
-        return;
-    }
-    proxyHttpPassthrough(req, res, route.hostPort, `/v1/chat/completions${parsedUrl.search || ''}`, identityHeaders);
+    proxyHttpPassthrough(req, res, route.hostPort, `/v1/chat/completions${parsedUrl.search || ''}`, req.headers);
 }
 
 function handleRoutedAgentCard(req, res, parsedUrl, agentName) {
@@ -327,14 +313,7 @@ function handleRoutedAgentCard(req, res, parsedUrl, agentName) {
     const apiRoutes = loadApiRoutes();
     const route = resolveAgentRouteOrRespond(res, apiRoutes, agentName);
     if (!route) return;
-    let identityHeaders;
-    try {
-        identityHeaders = buildRoutedAgentIdentityHeaders(req, agentName, 'agent-card', { agent: agentName });
-    } catch (error) {
-        sendJsonResponse(res, 401, { error: 'invocation_rejected', reason: error?.message || String(error) });
-        return;
-    }
-    proxyHttpPassthrough(req, res, route.hostPort, `/agent-card${parsedUrl.search || ''}`, identityHeaders);
+    proxyHttpPassthrough(req, res, route.hostPort, `/agent-card${parsedUrl.search || ''}`, req.headers);
 }
 
 function isAgentMcpProxyRoute(pathname) {
@@ -404,14 +383,17 @@ async function processRequest(req, res) {
 
     const isPublicServiceRoute = isPublicHttpServiceRoute(pathname);
     const isDelegatedAgentMcpRoute = isAgentMcpProxyRoute(pathname);
-    const isDelegatedAgentHttpRoute = hasDelegatedCallerJwtHeader(req)
-        && (routedAggregateAgentCard || routedOpenAiAgent || routedAgentCard);
 
     // Agent MCP proxy routes authenticate inside handleAgentMcpRequest after the
     // JSON-RPC payload is available, so direct signed requests can be verified
     // against the exact tool body they signed.
-    if (isDelegatedAgentMcpRoute || isDelegatedAgentHttpRoute) {
+    // Agent-card and chat-completions routes use normal browser/API-key auth.
+    if (isDelegatedAgentMcpRoute) {
         // no-op; handled downstream
+    } else if (routedAggregateAgentCard || routedOpenAiAgent || routedAgentCard) {
+        // Agent discovery and chat completions use normal auth (browser cookies or API key)
+        const authResult = await ensureAuthenticated(req, res, parsedUrl);
+        if (!authResult.ok) return;
     } else if (pathname === '/mcp' || pathname === '/mcp/') {
         const authResult = await ensureAuthenticated(req, res, parsedUrl);
         if (!authResult.ok) return;

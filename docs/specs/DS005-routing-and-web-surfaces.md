@@ -64,7 +64,7 @@ The router must also expose:
 - `/mcps/<agent>/task` for task-status passthrough.
 - manifest-declared HTTP service prefixes for downstream HTTP services.
 
-Agent-to-agent callers may access `/agent-card`, `/agent-card/<agent>`, and `/v1/chat/completions/<agent>` with `X-Ploinky-Caller-JWT` instead of browser cookies. The router must verify the caller token through the secure-wire model, mint a fresh target invocation token, strip caller-supplied router identity headers, and forward authoritative identity headers to the target agent.
+Agent-to-agent callers may access `/agent-card`, `/agent-card/<agent>`, and `/v1/chat/completions/<agent>` through standard router authentication (session cookie or API key). The router verifies the caller's session, strips caller-supplied router identity headers, and forwards authoritative identity headers to the target agent. Orchestrators can discover remote agents via `PloinkyAgentSkillsSubsystem` and include them as tools through `## Allowed Agents` declarations.
 
 Agent MCP sessions are runtime-owned and ephemeral. Clients that finish with a session should send `DELETE /mcp` with the `mcp-session-id` header so the agent runtime can close the SDK transport immediately. The shared `AgentServer` must also reap idle sessions defensively for clients that disconnect without a delete, but it must treat any session with an open HTTP response as active so long-running tool calls and SSE streams are not closed by idle cleanup.
 

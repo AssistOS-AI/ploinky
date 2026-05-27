@@ -1,7 +1,6 @@
 import http from 'http';
 import { randomUUID } from 'node:crypto';
 
-import { authInfoFromInvocation } from '../../Agent/lib/invocation-auth.mjs';
 import { sendJson } from './authHandlers.js';
 import { createAgentClient } from './AgentClient.js';
 import { buildInvocationContextForProviderCall } from './mcp-proxy/index.js';
@@ -94,7 +93,7 @@ export function proxyMcpPassthrough(req, res, targetPort, agentPath) {
 export function proxyHttpPassthrough(req, res, targetPort, agentPath, extraHeaders = {}) {
     const pathWithLeadingSlash = agentPath.startsWith('/') ? agentPath : `/${agentPath}`;
     const headers = {
-        ...stripCallerRouterIdentityHeaders(req.headers),
+        ...stripRouterIdentityHeaders(req.headers),
         ...extraHeaders,
         host: `127.0.0.1:${targetPort}`
     };
@@ -130,11 +129,10 @@ const ROUTER_IDENTITY_HEADERS = new Set([
     'x-ploinky-user',
     'x-ploinky-user-email',
     'x-ploinky-user-roles',
-    'x-ploinky-session-id',
-    'x-ploinky-caller-jwt'
+    'x-ploinky-session-id'
 ]);
 
-function stripCallerRouterIdentityHeaders(headers = {}) {
+function stripRouterIdentityHeaders(headers = {}) {
     const sanitized = {};
     for (const [name, value] of Object.entries(headers || {})) {
         if (ROUTER_IDENTITY_HEADERS.has(String(name || '').toLowerCase())) continue;
@@ -143,7 +141,7 @@ function stripCallerRouterIdentityHeaders(headers = {}) {
     return sanitized;
 }
 
-export function buildPlainAuthInfoHeader(req, invocation = null) {
+export function buildPlainAuthInfoHeader(req) {
     if (!req.user || typeof req.user !== 'object') {
         return {};
     }
@@ -156,12 +154,6 @@ export function buildPlainAuthInfoHeader(req, invocation = null) {
         },
         sessionId: req.sessionId || ''
     };
-    if (invocation?.token) {
-        authInfo.invocationToken = invocation.token;
-    }
-    if (invocation?.bodyObject && typeof invocation.bodyObject === 'object') {
-        authInfo.invocationBody = invocation.bodyObject;
-    }
     return {
         'x-ploinky-auth-info': JSON.stringify(authInfo)
     };
@@ -172,38 +164,6 @@ export function readHeaderValue(headers = {}, headerName) {
     if (typeof direct === 'string' && direct.trim()) return direct.trim();
     const lower = headers?.[String(headerName || '').toLowerCase()];
     return typeof lower === 'string' && lower.trim() ? lower.trim() : '';
-}
-
-export function hasDelegatedCallerJwtHeader(req) {
-    return Boolean(readHeaderValue(req?.headers || {}, 'x-ploinky-caller-jwt'));
-}
-
-function buildAuthInfoHeaderFromInvocation(invocation) {
-    const authInfo = authInfoFromInvocation(invocation?.payload, {
-        invocationToken: invocation?.token || ''
-    });
-    if (!authInfo) return {};
-    return { 'x-ploinky-auth-info': JSON.stringify(authInfo) };
-}
-
-export function buildRoutedAgentIdentityHeaders(req, agentName, toolName, toolArgs = {}) {
-    const invocation = buildInvocationContextForProviderCall({
-        req,
-        agentName,
-        toolName,
-        toolArgs
-    });
-    if (!invocation?.token) {
-        return buildPlainAuthInfoHeader(req);
-    }
-    const headers = {
-        ...buildPlainAuthInfoHeader(req, invocation),
-        authorization: `Bearer ${invocation.token}`
-    };
-    if (!headers['x-ploinky-auth-info']) {
-        Object.assign(headers, buildAuthInfoHeaderFromInvocation(invocation));
-    }
-    return headers;
 }
 
 export function isPublicHttpServiceRoute(pathname) {
@@ -227,25 +187,10 @@ export function handleHttpServiceRoute(req, res, parsedUrl, apiRoutes = loadApiR
         sendJson(res, 401, { ok: false, error: 'not_authenticated' });
         return true;
     }
-    req.headers = stripCallerRouterIdentityHeaders(req.headers);
+    req.headers = stripRouterIdentityHeaders(req.headers);
 
-    const serviceAgentRef = route.repo && route.agent
-        ? `${route.repo}/${route.agent}`
-        : definition.routeKey;
-    const invocation = definition.issueInvocation
-        ? buildInvocationContextForProviderCall({
-            req,
-            agentName: serviceAgentRef,
-            toolName: '__http_service__',
-            toolArgs: {
-                method: req.method || 'GET',
-                path: pathname,
-                search: parsedUrl?.search || ''
-            }
-        })
-        : null;
     const identityHeaders = definition.includeAuthInfo
-        ? buildPlainAuthInfoHeader(req, invocation)
+        ? buildPlainAuthInfoHeader(req)
         : {};
 
     proxyHttpPassthrough(

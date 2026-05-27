@@ -192,8 +192,7 @@ test('protected HTTP service falls back to static auth and injects router auth i
         url: '/services/browser-use/sessions/sess_1?view=1',
         cookie: `ploinky_jwt=${login.sessionId}`,
         headers: {
-            'x-ploinky-auth-info': '{"user":{"id":"spoofed"}}',
-            'x-ploinky-caller-jwt': 'spoofed-token'
+            'x-ploinky-auth-info': '{"user":{"id":"spoofed"}}'
         }
     });
     const res = new MockWritableResponse();
@@ -211,25 +210,17 @@ test('protected HTTP service falls back to static auth and injects router auth i
     assert.equal(res.statusCode, 200);
     assert.equal(res.body, 'ok');
     assert.equal(captured?.url, '/browser-use/sessions/sess_1?view=1');
-    assert.equal(captured?.headers['x-ploinky-caller-jwt'], undefined);
 
     const authInfo = JSON.parse(captured?.headers['x-ploinky-auth-info'] || '{}');
     assert.equal(authInfo.user?.id, 'local:admin');
     assert.equal(authInfo.user?.username, 'admin');
     assert.deepEqual(authInfo.user?.roles, ['local', 'admin']);
     assert.ok(authInfo.sessionId);
-    assert.ok(authInfo.invocationToken);
-    assert.deepEqual(authInfo.invocationBody, {
-        tool: '__http_service__',
-        arguments: {
-            method: 'GET',
-            path: '/services/browser-use/sessions/sess_1',
-            search: '?view=1'
-        }
-    });
+    assert.ok(!authInfo.invocationToken);
+    assert.ok(!authInfo.invocationBody);
 });
 
-test('protected HTTP service auth info carries router invocation token', async () => {
+test('protected HTTP service auth info carries user identity', async () => {
     const { buildPlainAuthInfoHeader } = await import(`${pathToFileURL(path.join(REPO_ROOT, 'cli/server/routerHandlers.js')).href}?plain=${Date.now()}`);
     const headers = buildPlainAuthInfoHeader({
         user: {
@@ -239,16 +230,6 @@ test('protected HTTP service auth info carries router invocation token', async (
             roles: ['admin']
         },
         sessionId: 'session-1'
-    }, {
-        token: 'router-issued-invocation',
-        bodyObject: {
-            tool: '__http_service__',
-            arguments: {
-                method: 'GET',
-                path: '/services/browser-use/sessions/sess_1',
-                search: '?view=1'
-            }
-        }
     });
 
     const authInfo = JSON.parse(headers['x-ploinky-auth-info']);
@@ -260,13 +241,4 @@ test('protected HTTP service auth info carries router invocation token', async (
         roles: ['admin']
     });
     assert.equal(authInfo.sessionId, 'session-1');
-    assert.equal(authInfo.invocationToken, 'router-issued-invocation');
-    assert.deepEqual(authInfo.invocationBody, {
-        tool: '__http_service__',
-        arguments: {
-            method: 'GET',
-            path: '/services/browser-use/sessions/sess_1',
-            search: '?view=1'
-        }
-    });
 });
