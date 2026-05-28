@@ -16,7 +16,7 @@ Ploinky no longer treats dependency installation as an incidental side effect of
 
 Global Node dependencies must be prepared from `globalDeps/package.json` into `.ploinky/deps/global/<runtime-key>/`. Per-agent Node dependencies must be prepared into `.ploinky/deps/agents/<repo>/<agent>/<runtime-key>/` using a merged package definition in which agent dependencies override the global baseline for conflicts.
 
-A cache is valid only when the runtime key, the relevant package hash, the stamp version, and the core marker module all match the current workspace inputs. Cache preparation must use the correct installation backend for the target runtime family. Container-family runtime keys must install inside an install container for the target image. Sandbox-family runtime keys must install on the host and must reject preparation for a foreign host runtime key.
+A cache is valid only when the runtime key, the relevant package hash, the stamp version, the installer metadata, and the core marker module all match the current workspace inputs. Cache preparation must use the correct installation backend for the target runtime family. Container-family runtime keys must install inside an install container for the target image, and the prepared stamp must record that image so a manifest image change refreshes the cache even when Node major, platform, libc, and package hashes are otherwise unchanged. Sandbox-family runtime keys must install on the host and must reject preparation for a foreign host runtime key.
 
 The `deps prepare`, `deps status`, and `deps clean` commands form the operator-facing contract for cache maintenance. When no explicit target is provided to `deps prepare`, the command must prepare caches for every enabled agent that actually requires a Node dependency cache. Startup must also prepare or refresh missing and stale caches before runtime launch rather than letting agents run `npm install` inside their service runtime. Cache installs must avoid nonessential startup-time network work such as npm audit/funding checks, use noninteractive package-manager settings inside install containers, and keep long cold installs visibly alive with progress output. Operators should expect cold startup to require npm, git, network access, and native build tools when caches are absent.
 
@@ -63,6 +63,11 @@ Some agent dependencies pull large native runtime packages, and the package mana
 
 Response:
 The blocking wave path produces visible startup output: the wave list, the readiness summary, and any failure message. A no-wait dependency runs after the CLI has already moved on, so an operator who only watches stdout cannot tell whether the worker eventually came up or quietly crashed. Writing the launch into `.ploinky/logs/no-wait/<container>.log` and the lifecycle into `.ploinky/running/no-wait/<container>.json` gives the same level of inspectability without forcing the main start command to block. It also keeps `ploinky start` idempotent: re-running it after a no-wait failure overwrites the previous status with the new run instead of hiding the prior failure inside ephemeral console output.
+
+### Question #6: Why does the cache stamp include installer image metadata?
+
+Response:
+Container runtime keys intentionally group compatible images by Node major, platform, architecture, and libc so cache directories stay understandable and reusable across patch updates. That grouping alone is not enough when a manifest moves to a different image that preinstalls different system libraries or native build prerequisites. Recording the installer image in the stamp lets startup invalidate the cache on an image switch without broadening the runtime-key format.
 
 ## Conclusion
 

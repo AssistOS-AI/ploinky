@@ -123,6 +123,43 @@ test('isGlobalCacheValid: stale when globalPackageHash changes', () => {
     }
 });
 
+test('isGlobalCacheValid: stale when installer image changes', () => {
+    const dir = tempDir();
+    try {
+        seedCoreMarker(dir);
+        writeStamp(dir, {
+            runtimeKey: 'container-linux-arm64-glibc-node24',
+            globalPackageHash: 'h1',
+            installer: {
+                runtimeFamily: 'container',
+                nodeMajor: 24,
+                platform: 'linux',
+                arch: 'arm64',
+                variant: 'glibc',
+                installerRuntime: 'podman',
+                image: 'node:24.15.0-bullseye',
+            },
+        });
+        const check = isGlobalCacheValid(dir, {
+            runtimeKey: 'container-linux-arm64-glibc-node24',
+            globalPackageHash: 'h1',
+            installer: {
+                runtimeFamily: 'container',
+                nodeMajor: 24,
+                platform: 'linux',
+                arch: 'arm64',
+                variant: 'glibc',
+                installerRuntime: 'podman',
+                image: 'docker.io/assistos/ploinky-node:24-bookworm-tools',
+            },
+        });
+        assert.equal(check.valid, false);
+        assert.match(check.reason, /installer image changed/);
+    } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
+});
+
 test('isGlobalCacheValid: stale when runtimeKey changes', () => {
     const dir = tempDir();
     try {
@@ -172,6 +209,34 @@ test('isAgentCacheValid: stale when mergedPackageHash changes', () => {
         const check = isAgentCacheValid(dir, { runtimeKey: 'bwrap-linux-x64-node20', mergedPackageHash: 'm2' });
         assert.equal(check.valid, false);
         assert.match(check.reason, /mergedPackageHash/);
+    } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+test('isAgentCacheValid: stale when installer metadata is missing', () => {
+    const dir = tempDir();
+    try {
+        seedCoreMarker(dir);
+        writeStamp(dir, {
+            runtimeKey: 'container-linux-x64-glibc-node24',
+            mergedPackageHash: 'm1',
+        });
+        const check = isAgentCacheValid(dir, {
+            runtimeKey: 'container-linux-x64-glibc-node24',
+            mergedPackageHash: 'm1',
+            installer: {
+                runtimeFamily: 'container',
+                nodeMajor: 24,
+                platform: 'linux',
+                arch: 'x64',
+                variant: 'glibc',
+                installerRuntime: 'docker',
+                image: 'docker.io/assistos/ploinky-node:24-bookworm-tools',
+            },
+        });
+        assert.equal(check.valid, false);
+        assert.match(check.reason, /installer metadata missing/);
     } finally {
         fs.rmSync(dir, { recursive: true, force: true });
     }

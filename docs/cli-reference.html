@@ -559,7 +559,7 @@ logs last 100           # Last 100 lines from router</code></pre>
                         <h2>Dependency Management</h2>
 
                         <h3>deps prepare</h3>
-                        <p>Build dependency caches for agents. Merges <code>globalDeps/package.json</code> with agent <code>package.json</code> and runs <code>npm install</code> in the container.</p>
+                        <p>Build dependency caches for agents. Merges <code>globalDeps/package.json</code> with agent <code>package.json</code> and runs <code>npm install</code> in the target runtime's install backend.</p>
                         <pre><code>deps prepare [&lt;repo&gt;/&lt;agent&gt;]</code></pre>
 
                         <h3>deps status</h3>
@@ -570,7 +570,7 @@ logs last 100           # Last 100 lines from router</code></pre>
                         <p>Remove dependency caches.</p>
                         <pre><code>deps clean &lt;repo&gt;/&lt;agent&gt;|--global|--all</code></pre>
                         <div class="alert alert-info">
-                            Caches are stored under <code>.ploinky/deps/</code> and bucketed by runtime key (container image + runtime family).
+                            Caches are stored under <code>.ploinky/deps/</code>, bucketed by runtime key, and stamped with installer metadata such as the container image.
                         </div>
                     </div>
 

@@ -101,23 +101,43 @@ export function writeStamp(cachePath, stamp) {
     return payload;
 }
 
-export function isGlobalCacheValid(cachePath, { runtimeKey, globalPackageHash }) {
+function installerMismatchReason(stamp, expectedInstaller = null) {
+    if (!expectedInstaller) return '';
+    const stampInstaller = stamp?.installer || null;
+    if (!stampInstaller || typeof stampInstaller !== 'object') {
+        return 'installer metadata missing';
+    }
+    for (const key of ['runtimeFamily', 'nodeMajor', 'platform', 'arch', 'variant', 'installerRuntime', 'image']) {
+        const actual = stampInstaller[key] == null ? null : String(stampInstaller[key]);
+        const expected = expectedInstaller[key] == null ? null : String(expectedInstaller[key]);
+        if (actual !== expected) {
+            return `installer ${key} changed (${actual ?? 'null'} != ${expected ?? 'null'})`;
+        }
+    }
+    return '';
+}
+
+export function isGlobalCacheValid(cachePath, { runtimeKey, globalPackageHash, installer = null }) {
     const stamp = readStamp(cachePath);
     if (!stamp) return { valid: false, reason: 'stamp missing' };
     if (stamp.version !== STAMP_VERSION) return { valid: false, reason: `stamp version ${stamp.version} != ${STAMP_VERSION}` };
     if (stamp.runtimeKey !== runtimeKey) return { valid: false, reason: `runtime key mismatch (${stamp.runtimeKey} != ${runtimeKey})` };
     if (stamp.globalPackageHash !== globalPackageHash) return { valid: false, reason: 'globalPackageHash changed' };
+    const installerReason = installerMismatchReason(stamp, installer);
+    if (installerReason) return { valid: false, reason: installerReason };
     const marker = path.join(cachePath, 'node_modules', CORE_MARKER_MODULE);
     if (!fs.existsSync(marker)) return { valid: false, reason: `core marker ${CORE_MARKER_MODULE} missing` };
     return { valid: true, reason: 'ok' };
 }
 
-export function isAgentCacheValid(cachePath, { runtimeKey, mergedPackageHash }) {
+export function isAgentCacheValid(cachePath, { runtimeKey, mergedPackageHash, installer = null }) {
     const stamp = readStamp(cachePath);
     if (!stamp) return { valid: false, reason: 'stamp missing' };
     if (stamp.version !== STAMP_VERSION) return { valid: false, reason: `stamp version ${stamp.version} != ${STAMP_VERSION}` };
     if (stamp.runtimeKey !== runtimeKey) return { valid: false, reason: `runtime key mismatch (${stamp.runtimeKey} != ${runtimeKey})` };
     if (stamp.mergedPackageHash !== mergedPackageHash) return { valid: false, reason: 'mergedPackageHash changed' };
+    const installerReason = installerMismatchReason(stamp, installer);
+    if (installerReason) return { valid: false, reason: installerReason };
     const marker = path.join(cachePath, 'node_modules', CORE_MARKER_MODULE);
     if (!fs.existsSync(marker)) return { valid: false, reason: `core marker ${CORE_MARKER_MODULE} missing` };
     return { valid: true, reason: 'ok' };
@@ -311,6 +331,7 @@ function runNpmInstallInContainer(cwd, { image, runtime = null, log = debugLog }
 
 export function prepareGlobalCache(runtimeKey, { force = false, log = debugLog, image = '', runtime = null } = {}) {
     const backend = resolveInstallBackend(runtimeKey, { image, runtime, log });
+    const expectedInstaller = installerMetadata(runtimeKey, backend);
 
     const globalPackageFile = getGlobalPackagePath();
     if (!fs.existsSync(globalPackageFile)) {
@@ -320,7 +341,7 @@ export function prepareGlobalCache(runtimeKey, { force = false, log = debugLog, 
     const cachePath = getGlobalCachePath(runtimeKey);
 
     if (!force) {
-        const check = isGlobalCacheValid(cachePath, { runtimeKey, globalPackageHash });
+        const check = isGlobalCacheValid(cachePath, { runtimeKey, globalPackageHash, installer: expectedInstaller });
         if (check.valid) {
             log(`[deps-cache] global cache hit (${runtimeKey})`);
             return { cachePath, reused: true, reason: check.reason };
@@ -336,7 +357,7 @@ export function prepareGlobalCache(runtimeKey, { force = false, log = debugLog, 
         const stamp = writeStamp(cachePath, {
             runtimeKey,
             globalPackageHash,
-            installer: installerMetadata(runtimeKey, backend),
+            installer: expectedInstaller,
         });
         log(`[deps-cache] global cache prepared at ${cachePath}`);
         return { cachePath, reused: false, stamp };
@@ -369,6 +390,7 @@ export function prepareAgentCache({
     runtime = null,
 } = {}) {
     const backend = resolveInstallBackend(runtimeKey, { image, runtime, log });
+    const expectedInstaller = installerMetadata(runtimeKey, backend);
     if (!repoName || !agentName) {
         throw new Error('prepareAgentCache requires repoName and agentName');
     }
@@ -387,7 +409,7 @@ export function prepareAgentCache({
     const cachePath = getAgentCachePath(repoName, agentName, runtimeKey);
 
     if (!force) {
-        const check = isAgentCacheValid(cachePath, { runtimeKey, mergedPackageHash });
+        const check = isAgentCacheValid(cachePath, { runtimeKey, mergedPackageHash, installer: expectedInstaller });
         if (check.valid) {
             log(`[deps-cache] agent cache hit ${repoName}/${agentName} (${runtimeKey})`);
             return { cachePath, reused: true, reason: check.reason, mergedPackageHash };
@@ -411,7 +433,7 @@ export function prepareAgentCache({
             globalPackageHash,
             agentPackageHash,
             mergedPackageHash,
-            installer: installerMetadata(runtimeKey, backend),
+            installer: expectedInstaller,
         });
         log(`[deps-cache] agent cache prepared at ${cachePath}`);
         return { cachePath, reused: false, stamp, mergedPackageHash };

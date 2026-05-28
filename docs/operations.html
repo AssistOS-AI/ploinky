@@ -41,8 +41,8 @@
 
         <section class="chapter-section">
           <h2>Dependency Cache Maintenance</h2>
-          <p><code>ploinky deps prepare</code>, <code>deps status</code>, and <code>deps clean</code> manage runtime-keyed Node caches under <code>.ploinky/deps/</code>. Global caches are prepared from <code>globalDeps/package.json</code>. Per-agent caches merge that baseline with an agent-local <code>package.json</code> when one exists. A cache is valid only when the runtime key, merged-package hash, and stamp version all match the current inputs. <code>ploinky start</code> prepares or refreshes missing and stale caches before launching agents, so first startup may require npm, git, network access, and native build tools.</p>
-          <p>Container runtimes prepare caches inside a short-lived install container for the target image. Sandbox runtimes prepare caches on the host, but only when the runtime key matches the host runtime family and platform.</p>
+          <p><code>ploinky deps prepare</code>, <code>deps status</code>, and <code>deps clean</code> manage runtime-keyed Node caches under <code>.ploinky/deps/</code>. Global caches are prepared from <code>globalDeps/package.json</code>. Per-agent caches merge that baseline with an agent-local <code>package.json</code> when one exists. A cache is valid only when the runtime key, merged-package hash, stamp version, installer metadata, and core marker module all match the current inputs. <code>ploinky start</code> prepares or refreshes missing and stale caches before launching agents, so first startup may require npm, git, network access, and native build tools.</p>
+          <p>Container runtimes prepare caches inside a short-lived install container for the target image and record that image in the cache stamp so manifest image changes refresh stale native dependencies. Sandbox runtimes prepare caches on the host, but only when the runtime key matches the host runtime family and platform.</p>
         </section>
 
         <section class="chapter-section">
