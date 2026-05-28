@@ -237,13 +237,13 @@ start demo 8080
 start
 
 # Branch-aware fresh workspace
-start AchillesIDE/explorer 8080 --branch embedded-soul-gateway
+start AchillesIDE/explorer 8080 --branch feature-branch
 
 # Per-repo branch override
-start AchillesIDE/explorer 8080 --branch embedded-soul-gateway --repo-branch webmeetInfra=main
+start AchillesIDE/explorer 8080 --branch feature-branch --repo-branch webmeetInfra=main
 
 # Strict CI/deploy mode
-start AchillesIDE/explorer 8097 --branch embedded-soul-gateway --branch-fallback fail --reset-repos</code></pre>
+start AchillesIDE/explorer 8097 --branch feature-branch --branch-fallback fail --reset-repos</code></pre>
 
                         <h3>shell</h3>
                         <p>Open interactive shell session in agent container.</p>

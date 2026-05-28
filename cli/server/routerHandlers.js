@@ -4,12 +4,14 @@ import { randomUUID } from 'node:crypto';
 import { sendJson } from './authHandlers.js';
 import { createAgentClient } from './AgentClient.js';
 import { buildInvocationContextForProviderCall } from './mcp-proxy/index.js';
+import { buildFirstPartyInvocation } from './mcp-proxy/invocationMinter.js';
 import {
     buildServiceAgentPath,
     isAnonymousHttpServiceRoute,
     loadRoutingConfig,
     resolveHttpServiceRoute
 } from './httpServiceRoutes.js';
+import { deriveAgentPrincipalId } from '../services/agentIdentity.js';
 import { ROUTING_FILE } from '../services/config.js';
 
 const ROUTER_PROTOCOL_VERSION = '2025-06-18';
@@ -145,7 +147,13 @@ export function buildPlainAuthInfoHeader(req) {
     if (!req.user || typeof req.user !== 'object') {
         return {};
     }
-    const authInfo = {
+    return {
+        'x-ploinky-auth-info': JSON.stringify(buildPlainAuthInfo(req))
+    };
+}
+
+function buildPlainAuthInfo(req) {
+    return {
         user: {
             id: req.user.id || '',
             username: req.user.username || req.user.name || req.user.email || '',
@@ -154,6 +162,48 @@ export function buildPlainAuthInfoHeader(req) {
         },
         sessionId: req.sessionId || ''
     };
+}
+
+function buildHttpServiceInvocationBody(req, parsedUrl, definition) {
+    return {
+        method: String(req.method || 'GET').toUpperCase(),
+        externalPath: parsedUrl?.pathname || '',
+        search: parsedUrl?.search || '',
+        routeKey: definition.routeKey || ''
+    };
+}
+
+function resolveHttpServicePrincipal(definition) {
+    const repoName = String(definition?.route?.repo || '').trim();
+    const agentName = String(definition?.route?.agent || '').trim();
+    if (!repoName || !agentName) return null;
+    try {
+        return deriveAgentPrincipalId(repoName, agentName);
+    } catch (_) {
+        return null;
+    }
+}
+
+export function buildHttpServiceAuthInfoHeader(req, parsedUrl, definition) {
+    if (!definition?.includeAuthInfo || !req.user || typeof req.user !== 'object') {
+        return {};
+    }
+
+    const authInfo = buildPlainAuthInfo(req);
+    if (definition.issueInvocation) {
+        const invocationBody = buildHttpServiceInvocationBody(req, parsedUrl, definition);
+        const invocation = buildFirstPartyInvocation({
+            providerAgentRef: definition.routeKey,
+            providerPrincipal: resolveHttpServicePrincipal(definition),
+            tool: '__http_service__',
+            bodyObject: invocationBody,
+            delegatedUser: authInfo.user,
+            scope: [`http-service:${definition.routeKey}`],
+        });
+        authInfo.invocationToken = invocation.token;
+        authInfo.invocationBody = invocationBody;
+    }
+
     return {
         'x-ploinky-auth-info': JSON.stringify(authInfo)
     };
@@ -189,9 +239,17 @@ export function handleHttpServiceRoute(req, res, parsedUrl, apiRoutes = loadApiR
     }
     req.headers = stripRouterIdentityHeaders(req.headers);
 
-    const identityHeaders = definition.includeAuthInfo
-        ? buildPlainAuthInfoHeader(req)
-        : {};
+    let identityHeaders = {};
+    try {
+        identityHeaders = buildHttpServiceAuthInfoHeader(req, parsedUrl, definition);
+    } catch (err) {
+        sendJson(res, 500, {
+            ok: false,
+            error: 'http_service_invocation_unavailable',
+            message: err?.message || String(err),
+        });
+        return true;
+    }
 
     proxyHttpPassthrough(
         req,

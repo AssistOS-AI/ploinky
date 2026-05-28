@@ -36,7 +36,7 @@ import { clearLivenessState } from './healthProbes.js';
 import { stopAndRemove } from './containerFleet.js';
 import { buildContainerSecurityArgs, resolveContainerSecurity } from './containerSecurity.js';
 import { DEFAULT_AGENT_ENTRY, launchAgentSidecar, readManifestAgentCommand, readManifestStartCommand, splitCommandArgs } from './agentCommands.js';
-import { PLOINKY_DIR, ROUTING_FILE, WORKSPACE_ROOT } from '../config.js';
+import { AGENTS_WORK_DIR, PLOINKY_DIR, ROUTING_FILE, WORKSPACE_ROOT } from '../config.js';
 import {
     planRuntimeResources,
     applyRuntimeResourceEnv,
@@ -81,10 +81,15 @@ import {
     readManifestVolumeOptions,
     resolveManifestVolumeHostPath
 } from '../manifestVolumePolicy.js';
+import {
+    isLlmRuntimeManifest,
+    prepareLlmStartup,
+} from '../llmRuntimeIntegration.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const AGENT_LIB_PATH = path.resolve(__dirname, '../../../Agent');
+const LLM_RUNTIME_SHARED_PATH = path.join(WORKSPACE_ROOT, 'llm-runtime', 'shared');
 const AGENT_PRIVATE_KEY_CONTAINER_PATH = '/run/ploinky-agent.key';
 const PODMAN_STAGED_NODE_OPTIONS = ['--preserve-symlinks', '--preserve-symlinks-main'];
 const PODMAN_RUNTIME_ROOT = path.join(PLOINKY_DIR, 'container-runtime');
@@ -503,10 +508,37 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         throw new Error(`[profile] ${agentName}: profile '${activeProfile}' not found. Available: ${availableProfiles.join(', ')}`);
     }
     assertManifestEnvProfileCompleteness(manifest, profileConfig, { agentName, repoName, profileName: activeProfile });
-    const image = resolveManifestImage(manifest, profileConfig, { agentName, repoName });
+    const manifestImage = resolveManifestImage(manifest, profileConfig, { agentName, repoName });
+    let image = manifestImage;
     const useProfileLifecycle = Boolean(profileConfig);
     const runtimeRouterEnv = buildRuntimeRouterEnv(runtime, options);
     const envHash = computeEnvHash(manifest, profileConfig, runtimeRouterEnv, { agentName, repoName });
+
+    // LLM runtime opt-in: catalog-driven image, hardware-aware policy, reuse hash.
+    // Resolved BEFORE dependency cache prep so the cache uses the selected image.
+    let llmStartup = { enabled: false };
+    if (isLlmRuntimeManifest(manifest, profileConfig)) {
+        const effectiveNetworkForLlm = profileConfig?.network ?? manifest?.network ?? null;
+        llmStartup = prepareLlmStartup({
+            runtime,
+            manifest,
+            profileConfig,
+            agentName,
+            alias: options.alias,
+            env: process.env,
+            agentWorkDirRoot: AGENTS_WORK_DIR,
+            manifestEnvNames: [
+                ...getManifestEnvNames(manifest, profileConfig),
+                ...getExposedNames(manifest, profileConfig),
+            ],
+            envHash,
+            effectiveNetwork: effectiveNetworkForLlm,
+        });
+        if (llmStartup.enabled && llmStartup.imageRef) {
+            image = llmStartup.imageRef;
+            debugLog(`[llm-runtime] ${agentName}: catalog-selected image ${image} (arch ${llmStartup.selection.architectureId})`);
+        }
+    }
 
     // Get profile mount modes (profile overrides default if provided)
     const {
@@ -657,6 +689,19 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         args.push('-v', `${agentWorkDir}:${agentWorkDir}${runtime === 'podman' ? ':z' : ''}`);
     }
 
+    // LLM runtime: expose persistent model storage at /models and selected
+    // architecture/runtime state at /runtime. These are identity-specific so
+    // agent aliases keep separate caches and process state.
+    if (llmStartup.enabled && llmStartup.modelDir) {
+        args.push('-v', `${llmStartup.modelDir}:/models${runtime === 'podman' ? ':z' : ''}`);
+    }
+    if (llmStartup.enabled && llmStartup.stateDir) {
+        args.push('-v', `${llmStartup.stateDir}:/runtime${runtime === 'podman' ? ':z' : ''}`);
+    }
+    if (llmStartup.enabled && fs.existsSync(LLM_RUNTIME_SHARED_PATH)) {
+        args.push('-v', `${LLM_RUNTIME_SHARED_PATH}:/Agent/llm-runtime${runtime === 'podman' ? ':z,ro' : ':ro'}`);
+    }
+
     if (runtime === 'podman') {
         for (const mount of podmanStagedTargetMounts) {
             args.push('-v', `${mount.source}:${mount.target}${podmanMountSuffix(mount.ro)}`);
@@ -681,6 +726,20 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     const containerSecurityArgs = buildContainerSecurityArgs(resolveContainerSecurity(manifest, profileConfig));
     if (containerSecurityArgs.length) {
         args.splice(1, 0, ...containerSecurityArgs);
+    }
+
+    // LLM runtime: emit catalog-derived runtime policy args (platform, devices,
+    // memory, shm, gpus, ipc) and labels (architecture, catalog, policy hash,
+    // image digest, reuse hash). These go BEFORE the image so they apply to
+    // `run`. Non-LLM agents are untouched.
+    if (llmStartup.enabled) {
+        if (Array.isArray(llmStartup.runArgs) && llmStartup.runArgs.length) {
+            args.splice(1, 0, ...llmStartup.runArgs);
+        }
+        for (const [labelKey, labelValue] of Object.entries(llmStartup.labels || {})) {
+            if (labelValue === '' || labelValue === null || labelValue === undefined) continue;
+            args.splice(1, 0, '--label', `${labelKey}=${labelValue}`);
+        }
     }
 
     if (useHostNetwork) {
@@ -779,6 +838,18 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     }
 
     appendRuntimeRouterEnvFlags(envStrings, runtimeRouterEnv);
+    if (llmStartup.enabled) {
+        envStrings.push(formatEnvFlag('HF_HOME', '/models/hf-cache'));
+        envStrings.push(formatEnvFlag('PLOINKY_MODELS_DIR', '/models/artifacts'));
+        envStrings.push(formatEnvFlag('PLOINKY_DERIVED_DIR', '/models/derived'));
+        envStrings.push(formatEnvFlag('PLOINKY_RUNTIME_DIR', '/runtime'));
+        envStrings.push(formatEnvFlag('PLOINKY_LAUNCHERS_DIR', '/opt/ploinky/launchers'));
+        envStrings.push(formatEnvFlag('PLOINKY_MCP_PORT', '9000'));
+        envStrings.push(formatEnvFlag('PLOINKY_LLM_PUBLIC_PORT', '9000'));
+        envStrings.push(formatEnvFlag('PLOINKY_LLM_MCP_PORT', '9001'));
+        envStrings.push(formatEnvFlag('PLOINKY_LLM_CONTROL_PORT', '9002'));
+        envStrings.push(formatEnvFlag('PLOINKY_INFERENCE_PORT', '8080'));
+    }
 
     const envFlags = flagsToArgs(envStrings);
     if (envFlags.length) args.push(...envFlags);
@@ -849,11 +920,26 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         ...getExposedNames(manifest, profileConfig),
         ...Object.keys(profileEnv)
     ];
+    const llmRuntimeEnvNames = llmStartup.enabled
+        ? ['HF_HOME', 'PLOINKY_MODELS_DIR', 'PLOINKY_DERIVED_DIR', 'PLOINKY_RUNTIME_DIR', 'PLOINKY_LAUNCHERS_DIR', 'PLOINKY_MCP_PORT', 'PLOINKY_LLM_PUBLIC_PORT', 'PLOINKY_LLM_MCP_PORT', 'PLOINKY_LLM_CONTROL_PORT', 'PLOINKY_INFERENCE_PORT']
+        : [];
     const existingRecord = agents[containerName] || {};
     agents[containerName] = {
         agentName,
         repoName,
         containerImage: image,
+        ...(manifestImage && manifestImage !== image ? { manifestImage } : {}),
+        ...(llmStartup.enabled ? {
+            llmRuntime: {
+                architectureId: llmStartup.selection.architectureId,
+                catalogId: llmStartup.selection.catalogId,
+                catalogRef: llmStartup.selection.catalogRef,
+                platform: llmStartup.selection.platform,
+                imageDigest: llmStartup.imageDigest,
+                policyHash: llmStartup.policyHash,
+                reuseHash: llmStartup.reuseHash,
+            },
+        } : {}),
         createdAt: existingRecord.createdAt || new Date().toISOString(),
         projectPath: cwd,
         runMode: existingRecord.runMode,
@@ -870,10 +956,13 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
                 ] : []),
                 ...(runtime === 'podman' ? podmanStagedTargetMounts : []),
                 { source: sharedDir, target: '/shared' },
+                ...(llmStartup.enabled && llmStartup.modelDir ? [{ source: llmStartup.modelDir, target: '/models' }] : []),
+                ...(llmStartup.enabled && llmStartup.stateDir ? [{ source: llmStartup.stateDir, target: '/runtime' }] : []),
+                ...(llmStartup.enabled && fs.existsSync(LLM_RUNTIME_SHARED_PATH) ? [{ source: LLM_RUNTIME_SHARED_PATH, target: '/Agent/llm-runtime', ro: true }] : []),
                 ...(skillsPathExists && !skillsPathInsideCode && runtime !== 'podman' ? [{ source: agentSkillsPath, target: '/code/skills', ro: skillsReadOnly }] : []),
                 { source: cwd, target: cwd }
             ],
-            env: Array.from(new Set(declaredEnvNames2)).map((name) => ({ name })),
+            env: Array.from(new Set([...declaredEnvNames2, ...llmRuntimeEnvNames])).map((name) => ({ name })),
             ports: portMappings
         }
     };
@@ -1040,6 +1129,39 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
             removeContainerForRecreate(runtime, containerName, `ensureAgentService:${agentName}:envHashChanged`);
         }
     }
+
+    // LLM runtime: include architecture/catalog/digest/policy in reuse comparison.
+    if (containerExists(containerName) && isLlmRuntimeManifest(manifest, profileConfig)) {
+        try {
+            const desiredEnvHash = computeEnvHash(manifest, profileConfig, runtimeRouterEnv, { agentName, repoName });
+            const effectiveNetworkForLlm = profileConfig?.network ?? manifest?.network ?? null;
+            const probe = prepareLlmStartup({
+                runtime,
+                manifest,
+                profileConfig,
+                agentName,
+                alias: aliasOverride,
+                env: process.env,
+                agentWorkDirRoot: AGENTS_WORK_DIR,
+                manifestEnvNames: [
+                    ...getManifestEnvNames(manifest, profileConfig),
+                    ...getExposedNames(manifest, profileConfig),
+                ],
+                envHash: desiredEnvHash,
+                effectiveNetwork: effectiveNetworkForLlm,
+                writeState: false,
+            });
+            if (probe.enabled) {
+                const currentReuse = getContainerLabel(containerName, 'ploinky.reusehash');
+                if (probe.reuseHash && probe.reuseHash !== currentReuse) {
+                    debugLog(`[ensureAgentService] ${agentName}: LLM reuse hash changed (current=${currentReuse || '<none>'}, desired=${probe.reuseHash.slice(0, 12)}…), recreating container`);
+                    removeContainerForRecreate(runtime, containerName, `ensureAgentService:${agentName}:llmReuseHashChanged`);
+                }
+            }
+        } catch (err) {
+            debugLog(`[ensureAgentService] ${agentName}: LLM reuse-hash check skipped: ${err?.message || err}`);
+        }
+    }
     if (containerExists(containerName)) {
         debugLog(`[ensureAgentService] ${agentName}: container exists, checking if running...`);
         let canReuseExisting = true;
@@ -1107,6 +1229,9 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
         projPath = existingRecord.projectPath;
     }
     const hasStartedBinds = Array.isArray(startedRecord.config?.binds) && startedRecord.config.binds.length > 0;
+    const startedEnvNames = Array.isArray(startedRecord.config?.env)
+        ? startedRecord.config.env.map((entry) => String(entry?.name || '').trim()).filter(Boolean)
+        : [];
     if (!hasStartedBinds && runtime === 'podman') {
         // Podman relies on the staged code/Agent dirs and the per-target
         // self-mounts created in startAgentContainer. The literal fallback
@@ -1119,7 +1244,9 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
     agents[containerName] = {
         agentName,
         repoName,
-        containerImage: image,
+        containerImage: startedRecord.containerImage || image,
+        ...(startedRecord.manifestImage ? { manifestImage: startedRecord.manifestImage } : {}),
+        ...(startedRecord.llmRuntime ? { llmRuntime: startedRecord.llmRuntime } : {}),
         createdAt: existingRecord.createdAt || new Date().toISOString(),
         projectPath: projPath,
         runMode: existingRecord.runMode,
@@ -1133,7 +1260,7 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
                 ...(fs.existsSync(agentSkillsPath) ? [{ source: agentSkillsPath, target: '/code/skills', ro: skillsReadOnly }] : []),
                 { source: projPath, target: projPath }
             ],
-            env: Array.from(new Set(declaredEnvNames3)).map((name) => ({ name })),
+            env: Array.from(new Set([...declaredEnvNames3, ...startedEnvNames])).map((name) => ({ name })),
             ports: allPortMappings
         }
     };

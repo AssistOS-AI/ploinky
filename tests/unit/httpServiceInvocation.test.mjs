@@ -7,6 +7,12 @@ import path from 'node:path';
 import { Readable, Writable } from 'node:stream';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
+import {
+    createMemoryReplayCache,
+    verifyInvocationToken,
+} from '../../Agent/lib/jwtVerify.mjs';
+import { deriveDerivedMasterKey } from '../../cli/services/masterKey.js';
+
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const REPO_ROOT = path.resolve(__dirname, '../..');
@@ -216,8 +222,23 @@ test('protected HTTP service falls back to static auth and injects router auth i
     assert.equal(authInfo.user?.username, 'admin');
     assert.deepEqual(authInfo.user?.roles, ['local', 'admin']);
     assert.ok(authInfo.sessionId);
-    assert.ok(!authInfo.invocationToken);
-    assert.ok(!authInfo.invocationBody);
+    assert.equal(typeof authInfo.invocationToken, 'string');
+    assert.deepEqual(authInfo.invocationBody, {
+        method: 'GET',
+        externalPath: '/services/browser-use/sessions/sess_1',
+        search: '?view=1',
+        routeKey: 'browserUseAgent'
+    });
+
+    const verified = verifyInvocationToken(authInfo.invocationToken, {
+        secret: deriveDerivedMasterKey(),
+        expectedAudience: 'agent:services/browserUseAgent',
+        expectedTool: '__http_service__',
+        bodyObject: authInfo.invocationBody,
+        replayCache: createMemoryReplayCache(),
+    });
+    assert.equal(verified.payload.caller, 'router:first-party');
+    assert.equal(verified.payload.usr?.username, 'admin');
 });
 
 test('protected HTTP service auth info carries user identity', async () => {

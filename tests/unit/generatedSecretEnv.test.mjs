@@ -241,6 +241,35 @@ test('sharedGeneratedSecret companion requirements can still require a complete 
     });
 });
 
+test('generated local Soul Gateway key can coexist with remote provider key alias', () => {
+    const manifest = {
+        env: {
+            SOUL_GATEWAY_API_KEY: {
+                sharedGeneratedSecret: true,
+            },
+            SOUL_GATEWAY_PROVIDER_API_KEY: {
+                varName: 'SOUL_GATEWAY_API_KEY',
+                default: '',
+            },
+        },
+    };
+
+    withSoulGatewayEnv({
+        SOUL_GATEWAY_API_KEY: 'external-soul-key',
+    }, () => {
+        const env = buildEnvMap(manifest, null, {
+            repoName: 'proxies',
+            agentName: 'soul-gateway',
+        });
+
+        assert.equal(env.SOUL_GATEWAY_API_KEY, deriveWorkspaceSecret({
+            name: 'SOUL_GATEWAY_API_KEY',
+        }));
+        assert.equal(env.PLOINKY_ENV_SOURCE_SOUL_GATEWAY_API_KEY, 'generated');
+        assert.equal(env.SOUL_GATEWAY_PROVIDER_API_KEY, 'external-soul-key');
+    });
+});
+
 test('sharedGeneratedSecret override can resolve from workspace .env', () => {
     withSoulGatewayEnv({}, () => {
         const envFilePath = path.join(tempDir, '.env');
