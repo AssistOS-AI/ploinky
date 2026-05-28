@@ -89,6 +89,8 @@ test('parseAgentApiRoute rejects global routes', () => {
     // These paths start with global prefixes and should not be treated as agent routes
     assert.equal(parseAgentApiRoute('/mcp'), null);
     assert.equal(parseAgentApiRoute('/mcp/session'), null);
+    assert.equal(parseAgentApiRoute('/mcps/dpuAgent/mcp'), null);
+    assert.equal(parseAgentApiRoute('/mcp/dpuAgent/mcp'), null);
     assert.equal(parseAgentApiRoute('/agent-card'), null);
     assert.equal(parseAgentApiRoute('/health'), null);
     assert.equal(parseAgentApiRoute('/webtty'), null);

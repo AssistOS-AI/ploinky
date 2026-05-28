@@ -53,7 +53,7 @@ function resolveBaseUrl(baseUrl) {
 function isAgentProxyMcpEndpoint(endpoint) {
     try {
         const url = new URL(endpoint);
-        return /^\/mcps\/[^/]+\/mcp$/.test(url.pathname || '');
+        return /^\/[^/]+\/mcp$/.test(url.pathname || '');
     } catch {
         return false;
     }
@@ -238,9 +238,9 @@ function createAgentClient(baseUrl, options = {}) {
         if (normalized.endsWith('/')) {
             normalized = normalized.slice(0, -1);
         }
-        const match = normalized.match(/^(.*\/mcps\/[^/]+)\/mcp$/);
+        const match = normalized.match(/^\/([^/]+)\/mcp$/);
         if (match && match[1]) {
-            return `${match[1]}/task`;
+            return `/${match[1]}/task`;
         }
         return '/getTaskStatus';
     }
