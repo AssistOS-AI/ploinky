@@ -460,8 +460,8 @@ function getExposedEnv(manifest) {
 /upload                    // File upload endpoint
 /blobs                     // Blob storage endpoint
 /mcp                       // Root MCP endpoint
-/mcps/&lt;agent&gt;/mcp          // Per-agent MCP proxy
-/mcps/&lt;agent&gt;/task         // Per-agent task endpoint
+/&lt;agent&gt;/mcp          // Per-agent MCP proxy
+/&lt;agent&gt;/task         // Per-agent task endpoint
 /auth/*                    // Authentication routes
 /MCPBrowserClient.js       // Browser MCP client script</code></pre>
 
@@ -482,8 +482,8 @@ const proxy = httpProxy.createProxyServer({});
 const server = http.createServer((req, res) => {
     const url = req.url;
     
-    // API routing: /mcps/{agent}/{path}
-    if (url.startsWith('/mcps/')) {
+    // API routing: /{agent}/{path}
+    if (url.startsWith('/')) {
         const parts = url.substring(6).split('/');
         const agentName = parts[0];
         const apiPath = '/' + parts.slice(1).join('/');

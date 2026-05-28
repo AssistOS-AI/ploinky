@@ -573,19 +573,17 @@ function resolveAuthRouteKey(parsedUrl) {
             return surfaceAuthRoute;
         }
     }
-    if (pathname.startsWith('/mcps/') || pathname.startsWith('/mcp/')) {
+    if (parts.length >= 2 && (parts[1] === 'mcp' || parts[1] === 'task' || parts[1] === 'agent-card' || (parts[1] === 'v1' && parts[2] === 'chat'))) {
+        const pathAgent = parts[0];
         if (explicit) return explicit;
-        if (parts.length >= 2) {
-            const pathAgent = parts[1];
-            try {
-                const resolved = resolveEnabledAgentRecord(pathAgent);
-                const pathAuthMode = String(resolved?.record?.auth?.mode || 'none').trim().toLowerCase() || 'none';
-                if (pathAuthMode !== 'none') {
-                    return pathAgent;
-                }
-            } catch (_) { }
-            if (!staticAgent) return pathAgent;
-        }
+        try {
+            const resolved = resolveEnabledAgentRecord(pathAgent);
+            const pathAuthMode = String(resolved?.record?.auth?.mode || 'none').trim().toLowerCase() || 'none';
+            if (pathAuthMode !== 'none') {
+                return pathAgent;
+            }
+        } catch (_) { }
+        if (!staticAgent) return pathAgent;
         if (staticAgent) return staticAgent;
     }
     if (parts.length >= 1 && routes[parts[0]]) {

@@ -264,7 +264,7 @@ test_agent_token_validation() {
     local response
     response=$(curl -sS -w "\n%{http_code}" \
         -H "Authorization: Bearer ${token}" \
-        "${ROUTER_URL}/mcps/test-agent/mcp" 2>/dev/null || echo "")
+        "${ROUTER_URL}/test-agent/mcp" 2>/dev/null || echo "")
     
     local http_code
     http_code=$(echo "$response" | tail -n1)

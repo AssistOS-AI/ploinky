@@ -29,7 +29,7 @@ export function getRouterUrl() {
  */
 export function getAgentMcpUrl(agentName) {
     const routerUrl = getRouterUrl();
-    return `${routerUrl}/mcps/${agentName}/mcp`;
+    return `${routerUrl}/${agentName}/mcp`;
 }
 
 /**

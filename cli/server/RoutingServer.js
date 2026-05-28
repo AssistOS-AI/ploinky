@@ -115,49 +115,6 @@ function serveMcpBrowserClient(req, res) {
     stream.pipe(res);
 }
 
-async function proxyAgentTaskStatus(req, res, route, parsedUrl, agentName) {
-    const method = (req.method || 'GET').toUpperCase();
-    if (method !== 'GET') {
-        res.writeHead(405, { 'Content-Type': 'application/json', Allow: 'GET' });
-        res.end(JSON.stringify({ error: 'method_not_allowed' }));
-        return;
-    }
-    const pathWithQuery = `/getTaskStatus${parsedUrl.search || ''}`;
-    const taskId = parsedUrl.searchParams.get('taskId') || '';
-    const invocation = buildInvocationContextForProviderCall({
-        req,
-        agentName,
-        toolName: '__task_status__',
-        toolArgs: { taskId }
-    });
-    if (!invocation?.token) {
-        res.writeHead(401, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'invocation_required' }));
-        return;
-    }
-    const upstream = http.request({
-        hostname: '127.0.0.1',
-        port: route.hostPort,
-        path: pathWithQuery,
-        method: 'GET',
-        headers: {
-            accept: 'application/json',
-            authorization: `Bearer ${invocation.token}`
-        }
-    }, upstreamRes => {
-        res.writeHead(upstreamRes.statusCode || 200, upstreamRes.headers);
-        upstreamRes.pipe(res, { end: true });
-    });
-    upstream.on('error', err => {
-        appendLog('agent_task_proxy_error', { agent: agentName, error: err?.message || String(err) });
-        if (!res.headersSent) {
-            res.writeHead(502, { 'Content-Type': 'application/json' });
-        }
-        res.end(JSON.stringify({ error: 'upstream error', detail: String(err) }));
-    });
-    upstream.end();
-}
-
 function sendJsonResponse(res, statusCode, body, extraHeaders = {}) {
     const data = Buffer.from(JSON.stringify(body));
     res.writeHead(statusCode, {
@@ -176,23 +133,40 @@ function decodePathSegment(value) {
     }
 }
 
-function matchSingleAgentRoute(pathname, prefixParts) {
-    const parts = String(pathname || '').split('/').filter(Boolean);
-    if (parts.length !== prefixParts.length + 1) return null;
-    for (let i = 0; i < prefixParts.length; i += 1) {
-        if (parts[i] !== prefixParts[i]) return null;
+const GLOBAL_ROUTE_PREFIXES = [
+    '/health',
+    '/MCPBrowserClient.js',
+    '/auth/',
+    '/api/agents/',
+    '/agent-card',
+    '/mcp',
+    '/webtty',
+    '/webchat',
+    '/dashboard',
+    '/webmeet',
+    '/status',
+    '/upload',
+    '/blobs',
+];
+
+function isGlobalRoute(pathname) {
+    for (const prefix of GLOBAL_ROUTE_PREFIXES) {
+        if (prefix.endsWith('/')) {
+            if (pathname.startsWith(prefix)) return true;
+        } else {
+            if (pathname === prefix || pathname.startsWith(prefix + '/')) return true;
+        }
     }
-    const agentName = decodePathSegment(parts[prefixParts.length]).trim();
-    return agentName || null;
+    return false;
 }
 
-function resolveAgentRouteOrRespond(res, apiRoutes, agentName) {
-    const route = apiRoutes[agentName];
-    if (!route || !route.hostPort) {
-        sendJsonResponse(res, 404, { error: 'agent_not_found', agent: agentName });
-        return null;
-    }
-    return route;
+function extractAgentPrefix(pathname) {
+    const parts = String(pathname || '').split('/').filter(Boolean);
+    if (parts.length < 2) return null;
+    const agentName = decodePathSegment(parts[0]).trim();
+    if (!agentName) return null;
+    if (isGlobalRoute(pathname)) return null;
+    return agentName;
 }
 
 function requestAgentCard(route, agentName, identityHeaders = {}) {
@@ -292,38 +266,6 @@ async function handleRoutedAggregateAgentCard(req, res) {
     sendJsonResponse(res, 200, { agents, errors });
 }
 
-function handleRoutedOpenAiChatCompletions(req, res, parsedUrl, agentName) {
-    const method = (req.method || 'GET').toUpperCase();
-    if (method !== 'POST') {
-        sendJsonResponse(res, 405, { error: 'method_not_allowed' }, { Allow: 'POST' });
-        return;
-    }
-    const apiRoutes = loadApiRoutes();
-    const route = resolveAgentRouteOrRespond(res, apiRoutes, agentName);
-    if (!route) return;
-    proxyHttpPassthrough(req, res, route.hostPort, `/v1/chat/completions${parsedUrl.search || ''}`, req.headers);
-}
-
-function handleRoutedAgentCard(req, res, parsedUrl, agentName) {
-    const method = (req.method || 'GET').toUpperCase();
-    if (method !== 'GET') {
-        sendJsonResponse(res, 405, { error: 'method_not_allowed' }, { Allow: 'GET' });
-        return;
-    }
-    const apiRoutes = loadApiRoutes();
-    const route = resolveAgentRouteOrRespond(res, apiRoutes, agentName);
-    if (!route) return;
-    proxyHttpPassthrough(req, res, route.hostPort, `/agent-card${parsedUrl.search || ''}`, req.headers);
-}
-
-function isAgentMcpProxyRoute(pathname) {
-    if (!(pathname.startsWith('/mcps/') || pathname.startsWith('/mcp/'))) {
-        return false;
-    }
-    const parts = pathname.split('/');
-    return parts[3] === 'mcp' || String(parts[3] || '').startsWith('mcp/');
-}
-
 /**
  * Main request processor
  */
@@ -331,8 +273,7 @@ async function processRequest(req, res) {
     const parsedUrl = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
     const pathname = parsedUrl.pathname || '/';
     const routedAggregateAgentCard = pathname === '/agent-card' || pathname === '/agent-card/';
-    const routedOpenAiAgent = matchSingleAgentRoute(pathname, ['v1', 'chat', 'completions']);
-    const routedAgentCard = matchSingleAgentRoute(pathname, ['agent-card']);
+    const agentPrefix = extractAgentPrefix(pathname);
     appendLog('http_request', { method: req.method, path: pathname });
 
     // Health check endpoint (no auth required)
@@ -381,22 +322,18 @@ async function processRequest(req, res) {
         if (handled) return;
     }
 
-    const isPublicServiceRoute = isPublicHttpServiceRoute(pathname);
-    const isDelegatedAgentMcpRoute = isAgentMcpProxyRoute(pathname);
-
-    // Agent-card and chat-completions routes are public at the router level;
+    // Agent-prefixed routes are public at the router level;
     // the target agent decides whether to accept or reject the request.
-    // Agent MCP proxy routes authenticate inside handleAgentMcpRequest after the
-    // JSON-RPC payload is available, so direct signed requests can be verified
-    // against the exact tool body they signed.
-    if (isDelegatedAgentMcpRoute) {
-        // no-op; handled downstream
-    } else if (routedAggregateAgentCard || routedOpenAiAgent || routedAgentCard) {
-        // Public proxy routes; the agent handles its own access control.
+    const isAgentRoute = agentPrefix !== null;
+
+    if (routedAggregateAgentCard) {
+        // Public aggregate route
+    } else if (isAgentRoute) {
+        // no-op; transparent proxy handled downstream
     } else if (pathname === '/mcp' || pathname === '/mcp/') {
         const authResult = await ensureAuthenticated(req, res, parsedUrl);
         if (!authResult.ok) return;
-    } else if (isPublicServiceRoute) {
+    } else if (isPublicHttpServiceRoute(pathname)) {
         // Tokenized public service routes are intentionally public.
     } else {
         // Ensure authenticated for other protected routes
@@ -423,42 +360,22 @@ async function processRequest(req, res) {
         return;
     } else if (routedAggregateAgentCard) {
         return handleRoutedAggregateAgentCard(req, res);
-    } else if (routedOpenAiAgent) {
-        return handleRoutedOpenAiChatCompletions(req, res, parsedUrl, routedOpenAiAgent);
-    } else if (routedAgentCard) {
-        return handleRoutedAgentCard(req, res, parsedUrl, routedAgentCard);
+    } else if (agentPrefix) {
+        const apiRoutes = loadApiRoutes();
+        const route = apiRoutes[agentPrefix];
+        if (!route || !route.hostPort) {
+            sendJsonResponse(res, 404, { error: 'agent_not_found', agent: agentPrefix });
+            return;
+        }
+
+        // Transparent proxy: forward the remaining path to the agent
+        const parts = pathname.split('/').filter(Boolean);
+        const subPath = parts.slice(1).join('/');
+        const pathWithQuery = subPath ? `/${subPath}${parsedUrl.search || ''}` : parsedUrl.search || '/';
+        proxyHttpPassthrough(req, res, route.hostPort, pathWithQuery, req.headers);
+        return;
     } else if (pathname === '/mcp' || pathname === '/mcp/') {
         return handleRouterMcp(req, res);
-    } else if (pathname.startsWith('/mcps/') || pathname.startsWith('/mcp/')) {
-        // Agent MCP routing
-        const apiRoutes = loadApiRoutes();
-        const parts = pathname.split('/');
-        const agent = parts[2];
-
-        if (!agent) {
-            res.writeHead(404);
-            return res.end('API Route not found');
-        }
-
-        const route = apiRoutes[agent];
-        if (!route || !route.hostPort) {
-            res.writeHead(404);
-            return res.end('API Route not found');
-        }
-
-        const subPath = parts.slice(3).join('/');
-        if (subPath === 'task') {
-            await proxyAgentTaskStatus(req, res, route, parsedUrl, agent);
-            return;
-        }
-        if (subPath === 'mcp' || subPath.startsWith('mcp/')) {
-            handleAgentMcpRequest(req, res, route, agent);
-            return;
-        }
-
-        res.writeHead(404, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'Endpoint not found. Use /mcps/<agent>/mcp for MCP access.' }));
-        return;
     } else {
         // Static file serving
         if (staticSrv.serveWorkspaceFileRequest(req, res)) return;
@@ -525,12 +442,14 @@ server.on('clientError', (error, socket) => {
 const port = process.env.PORT ? parseInt(process.env.PORT, 10) : 8080;
 server.listen(port, () => {
     console.log(`[RoutingServer] Ploinky server running on http://127.0.0.1:${port}`);
-    console.log('  Dashboard: /dashboard');
-    console.log('  WebTTY:    /webtty');
-    console.log('  WebChat:   /webchat');
-    console.log('  WebMeet:   /webmeet');
-    console.log('  Status:    /status');
-    console.log('  Health:    /health');
+    console.log('  Dashboard:       /dashboard');
+    console.log('  WebTTY:          /webtty');
+    console.log('  WebChat:         /webchat');
+    console.log('  WebMeet:         /webmeet');
+    console.log('  Status:          /status');
+    console.log('  Health:          /health');
+    console.log('  Agent routes:    /<agent>/{mcp,task,agent-card,v1/chat/completions}');
+    console.log('  Aggregate cards: /agent-card');
     appendLog('server_start', { port });
     logBootEvent('server_listening', { port });
 

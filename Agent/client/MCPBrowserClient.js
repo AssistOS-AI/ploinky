@@ -654,7 +654,7 @@ function createAgentClient(baseUrl, options = {}) {
                     error.task = task;
                     reject(error);
                 }
-            }, { statusPath: statusAgent ? `/mcps/${statusAgent}/task` : undefined });
+            }, { statusPath: statusAgent ? `/${statusAgent}/task` : undefined });
         });
 
             const metadata = {

@@ -30,7 +30,7 @@ WebChat's EventSource stream must tolerate brief browser reconnects without kill
 
 WebChat must provide a generic composer autocomplete surface driven by trigger providers. The composer controller owns menu lifecycle, keyboard navigation (Arrow Up/Down, Enter, Tab, Escape), pointer selection, grouped rendering, positioning, and insertion. Trigger providers supply suggestions:
 
-- `/` opens the slash-command provider. The client queries the selected agent's MCP endpoint (`/mcps/<agent>/mcp`) for available tools. When the agent advertises a structured slash-command catalog tool, the provider uses that catalog and may send preserved launch query parameters such as `dir`; otherwise it maps `execute_<skill>` tool names to slash commands. Structured catalogs may declare subcommands and generic argument completions without WebChat hardcoding agent-specific command names. If the catalog fetch fails or returns no tools, the slash group remains silent.
+- `/` opens the slash-command provider. The client queries the selected agent's MCP endpoint (`/<agent>/mcp`) for available tools. When the agent advertises a structured slash-command catalog tool, the provider uses that catalog and may send preserved launch query parameters such as `dir`; otherwise it maps `execute_<skill>` tool names to slash commands. Structured catalogs may declare subcommands and generic argument completions without WebChat hardcoding agent-specific command names. If the catalog fetch fails or returns no tools, the slash group remains silent.
 - `@` opens the workspace-paths provider only. The workspace-paths provider queries `/webchat/suggestions/files` and shows files/folders under a `Files and folders` group scoped to the current WebChat session upload directory (`<cwd>/uploads/<sessionId>`, where `sessionId` is the value of the `webchat_sid` cookie minted by the authenticated WebChat session). Bare path searches such as `@rep` return matches inside that session upload directory only; explicit folder browsing such as `@file:reports/` drills further into the same session scope. Sibling session upload directories never appear. Selecting a file inserts a stable cwd-relative `@file:uploads/<sessionId>/<path>` token and records a structured `workspace-path` reference on the outgoing envelope.
 Selected `@file:` path mentions should be visually emphasized in the composer while preserving the plain textarea value that is submitted to the selected chat agent.
 
@@ -57,14 +57,14 @@ The router must also expose:
 - `/upload` and `/blobs` for workspace and agent blob flows.
 - `/webchat/uploads` for WebChat session-scoped file storage and download under `<cwd>/uploads/<sessionId>`.
 - `/agent-card` for aggregate discovery of routable agents that expose capability metadata. The router must query each active route's internal `/agent-card` endpoint, include successful responses without validating their field shape, and report per-agent errors separately.
-- `/agent-card/<agent>` for direct proxy access to one agent's capability metadata.
-- `/v1/chat/completions/<agent>` for OpenAI-compatible chat-completions requests routed to one agent. The request body controls normal JSON versus SSE streaming through its `stream` field.
+- `/<agent>/agent-card` for direct proxy access to one agent's capability metadata.
+- `/<agent>/v1/chat/completions` for OpenAI-compatible chat-completions requests routed to one agent. The request body controls normal JSON versus SSE streaming through its `stream` field.
 - `/mcp` for router-level MCP aggregation.
-- `/mcps/<agent>/mcp` and `/mcp/<agent>/mcp` for agent MCP proxying.
-- `/mcps/<agent>/task` for task-status passthrough.
+- `/<agent>/mcp` for agent MCP proxying.
+- `/<agent>/task` for task-status passthrough.
 - manifest-declared HTTP service prefixes for downstream HTTP services.
 
-Agent-to-agent callers may access `/agent-card`, `/agent-card/<agent>`, and `/v1/chat/completions/<agent>` without router-level authentication; the target agent decides whether to accept or reject the request. The router acts as a transparent proxy for these endpoints. Orchestrators can discover remote agents via `PloinkyAgentSkillsSubsystem` and include them as tools through `## Allowed Agents` declarations.
+Agent-to-agent callers may access `/agent-card`, `/<agent>/agent-card`, and `/<agent>/v1/chat/completions` without router-level authentication; the target agent decides whether to accept or reject the request. The router acts as a transparent proxy for these endpoints. Orchestrators can discover remote agents via `PloinkyAgentSkillsSubsystem` and include them as tools through `## Allowed Agents` declarations.
 
 Agent MCP sessions are runtime-owned and ephemeral. Clients that finish with a session should send `DELETE /mcp` with the `mcp-session-id` header so the agent runtime can close the SDK transport immediately. The shared `AgentServer` must also reap idle sessions defensively for clients that disconnect without a delete, but it must treat any session with an open HTTP response as active so long-running tool calls and SSE streams are not closed by idle cleanup.
 

@@ -366,7 +366,7 @@ async function fetchStructuredCatalog(mcpEndpoint, sessionId, tools, catalogArgu
 async function fetchCommandsFromAgent(agentName, dlog) {
     if (!agentName) return [];
     try {
-        const mcpEndpoint = `/mcps/${agentName}/mcp`;
+        const mcpEndpoint = `/${agentName}/mcp`;
         const sessionId = await callMcpInitialize(mcpEndpoint);
         if (sessionId === null) return [];
 

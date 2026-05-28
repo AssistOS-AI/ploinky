@@ -49,9 +49,9 @@ Ploinky is a workspace-local runtime for repository-backed agents.
 - Local auth stores hashed credentials in a workspace variable such as `PLOINKY_AUTH_<ROUTE>_USERS`.
 - SSO stores a configured provider agent in workspace SSO config; provider manifests use `"ssoProvider": true`.
 - The installed-agent index tracks route names, principals, runtime resources, and SSO-provider markers.
-- `GET /agent-card` on the router lists successful capability responses from active agents without enforcing a fixed payload shape; `GET /agent-card/<agent>` proxies one agent's metadata.
-- `POST /v1/chat/completions/<agent>` routes OpenAI-compatible requests to one agent, with `stream: true` selecting SSE streaming and normal JSON returned otherwise.
-- `/agent-card` and `/v1/chat/completions/<agent>` are public at the router level; the target agent decides whether to accept or reject the request. Orchestrators discover remote agents through `PloinkyAgentSkillsSubsystem` and declare them via `## Allowed Agents` in `oskill.md`.
+- `GET /agent-card` on the router lists successful capability responses from active agents without enforcing a fixed payload shape; `GET /<agent>/agent-card` proxies one agent's metadata.
+- `POST /<agent>/v1/chat/completions` routes OpenAI-compatible requests to one agent, with `stream: true` selecting SSE streaming and normal JSON returned otherwise.
+- `/agent-card` and `/<agent>/v1/chat/completions` are public at the router level; the target agent decides whether to accept or reject the request. Orchestrators discover remote agents through `PloinkyAgentSkillsSubsystem` and declare them via `## Allowed Agents` in `oskill.md`.
 - Delegated MCP calls use router-minted invocation JWTs. The router verifies the caller's session and forwards a fresh target invocation token.
 
 ## Dependency and profile commands

@@ -562,7 +562,7 @@
 
     try {
       // Use port if provided, otherwise let routing handle it
-      const endpoint = port ? `http://localhost:${port}/mcp` : `/mcp/${agentName}`;
+      const endpoint = port ? `http://localhost:${port}/mcp` : `/${agentName}/mcp`;
 
       const response = await fetch(endpoint, {
         method: 'POST',

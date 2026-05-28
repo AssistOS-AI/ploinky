@@ -154,7 +154,7 @@ test('guest routes use the guest agent policy instead of the static Explorer pol
     const { authHandlers } = await withAuthModules(t);
     const mcpReq = makeRequest({
         method: 'POST',
-        url: '/mcps/webAssist/mcp',
+        url: '/webAssist/mcp',
     });
     const mcpRes = new MockResponse();
     const mcpParsedUrl = new URL(mcpReq.url, 'http://localhost');
@@ -191,7 +191,7 @@ test('guest routes use the guest agent policy instead of the static Explorer pol
 
     const noAuthMcpReq = makeRequest({
         method: 'POST',
-        url: '/mcps/webAdmin/mcp',
+        url: '/webAdmin/mcp',
     });
     const noAuthMcpRes = new MockResponse();
     const noAuthMcpParsedUrl = new URL(noAuthMcpReq.url, 'http://localhost');

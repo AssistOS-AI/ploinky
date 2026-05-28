@@ -479,7 +479,7 @@ observability.js    // Monitoring views</code></pre>
                             <li><strong>RouterServer abstraction:</strong> RouterServer talks to agents through <code>cli/server/AgentClient.js</code>, which wraps MCP transports.</li>
                             <li><strong>MCP protocol:</strong> AgentClient builds a <code>StreamableHTTPClientTransport</code> towards <code>http://127.0.0.1:&lt;hostPort&gt;/mcp</code> and exposes <code>listTools()</code>, <code>callTool()</code>, <code>listResources()</code>, and <code>readResource()</code>.</li>
                             <li><strong>Unified routing:</strong> Requests hitting <code>/mcp</code> carry commands such as <code>list_tools</code>, <code>list_resources</code>, or <code>tool</code>. RouterServer fans these calls out to every registered MCP endpoint and aggregates the replies.</li>
-                            <li><strong>Per-agent routes:</strong> Legacy paths like <code>/mcps/&lt;agent&gt;</code> remain available for direct calls when needed.</li>
+                            <li><strong>Per-agent routes:</strong> Agent-prefixed paths like <code>/&lt;agent&gt;/mcp</code> provide direct access when needed.</li>
                             <li><strong>Transport independence:</strong> RouterServer stays agnostic of protocol details; AgentClient encapsulates the MCP implementation.</li>
                         </ul>
 
@@ -540,7 +540,7 @@ observability.js    // Monitoring views</code></pre>
                         <h3>Task Status Polling</h3>
                         <p>The Router/CLI side uses <code>Agent/client/MCPBrowserClient.js</code> to follow long-running jobs.</p>
                         <ul style="margin-left: 2rem;">
-                            <li><strong>Polling endpoint:</strong> After a task is enqueued, the client hits <code>/mcps/&lt;agent&gt;/task?taskId=...</code> (falling back to <code>/getTaskStatus</code>) every 30 seconds and adds a timestamp query parameter to avoid caching.</li>
+                            <li><strong>Polling endpoint:</strong> After a task is enqueued, the client hits <code>/&lt;agent&gt;/task?taskId=...</code> (falling back to <code>/getTaskStatus</code>) every 30 seconds and adds a timestamp query parameter to avoid caching.</li>
                             <li><strong>Incremental updates:</strong> Each  status response (HTTP 200) updates the console only if the task status changed (pending → running → completed/failed). Terminal states stop the poller immediately.</li>
                             <li><strong>Error handling:</strong> Non-200 responses are logged and the poller keeps retrying (except <code>404 task not found</code>, which stops polling and reports failure), so status checks continue even across transient outages.</li>
                         </ul>
