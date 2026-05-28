@@ -11,7 +11,7 @@
         "start": "cd test_run_dir node bin/p-cloud",
         "clean": "rm -rf test_run_dir",
         "test": "./tests/run-all.sh",
-        "postinstall": "cd node_modules; git clone https://github.com/OutfinityResearch/achillesAgentLib.git"
+        "postinstall": "cd node_modules; git clone https://github.com/AssistOS-AI/AchillesAgentLib.git"
     },
     "keywords": [
         "ploinky",
@@ -28,10 +28,10 @@
     },
     "repository": {
         "type": "git",
-        "url": "https://github.com/PloinkyCloud/ploinky.git"
+        "url": "https://github.com/AssistOS-AI/ploinky.git"
     },
     "dependencies": {
-        "mcp-sdk": "github:PloinkyRepos/MCPSDK#main",
+        "mcp-sdk": "github:AssistOS-AI/MCPSDK#main",
         "node-pty": "^1.0.0"
     }
 }
