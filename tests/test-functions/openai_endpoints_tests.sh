@@ -73,11 +73,11 @@ NODE
     echo "Agent-card missing expected agent: $output" >&2
     return 1
   fi
-  if ! echo "$output" | jq -e --arg agent "$TEST_OPENAI_AGENT_NAME" '.agents[] | select(.name == $agent) | .payload.capabilities.tags | index("fast")' >/dev/null; then
+  if ! echo "$output" | jq -e --arg agent "$TEST_OPENAI_AGENT_NAME" '.agents[] | select(.name == $agent) | .payload["agent-card"].tags | index("fast")' >/dev/null; then
     echo "Agent-card missing expected tags: $output" >&2
     return 1
   fi
-  if ! echo "$output" | jq -e --arg agent "$TEST_OPENAI_AGENT_NAME" '.agents[] | select(.name == $agent) | .payload.capabilities.summary | length > 0' >/dev/null; then
+  if ! echo "$output" | jq -e --arg agent "$TEST_OPENAI_AGENT_NAME" '.agents[] | select(.name == $agent) | .payload["agent-card"].summary | length > 0' >/dev/null; then
     echo "Agent-card missing summary: $output" >&2
     return 1
   fi

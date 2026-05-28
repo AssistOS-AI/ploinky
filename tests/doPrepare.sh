@@ -149,7 +149,7 @@ cat >"${openai_agent_root}/manifest.json" <<EOF
       "args": ["/code/openai-chat.js"],
       "supportsStream": true
     },
-    "capabilities": {
+    "agent-card": {
       "tags": ["fast", "coding"],
       "summary": "Test agent for OpenAI-compatible chat completions.",
       "whenToUse": "Use for validating AgentServer OpenAI endpoints in the test suite.",

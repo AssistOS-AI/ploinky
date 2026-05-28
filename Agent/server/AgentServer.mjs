@@ -955,14 +955,14 @@ async function main() {
             if (method === 'GET' && u.pathname === AGENT_CARD_PATH) {
                 const manifestResult = getManifestResult();
                 const manifest = manifestResult ? manifestResult.manifest : null;
-                const capabilities = normalizeCapabilities(manifest?.endpoints?.capabilities);
-                if (!capabilities) {
-                    return sendJson(404, { error: 'capabilities not configured' });
+                const agentCard = normalizeCapabilities(manifest?.endpoints?.['agent-card']);
+                if (!agentCard) {
+                    return sendJson(404, { error: 'agent-card not configured' });
                 }
                 return sendJson(200, {
                     agent: process.env.AGENT_NAME || manifest?.name || 'unknown-agent',
                     about: typeof manifest?.about === 'string' ? manifest.about : '',
-                    capabilities
+                    'agent-card': agentCard
                 });
             }
             if (method === 'GET' && u.pathname === '/getTaskStatus') {
