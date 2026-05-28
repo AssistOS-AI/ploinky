@@ -160,13 +160,22 @@ function isGlobalRoute(pathname) {
     return false;
 }
 
-function extractAgentPrefix(pathname) {
+const AGENT_API_SUBPATHS = ['mcp', 'task', 'agent-card', 'v1/chat/completions'];
+
+function parseAgentApiRoute(pathname) {
     const parts = String(pathname || '').split('/').filter(Boolean);
     if (parts.length < 2) return null;
     const agentName = decodePathSegment(parts[0]).trim();
     if (!agentName) return null;
     if (isGlobalRoute(pathname)) return null;
-    return agentName;
+
+    const subPath = parts.slice(1).join('/');
+    for (const apiSubpath of AGENT_API_SUBPATHS) {
+        if (subPath === apiSubpath || subPath.startsWith(apiSubpath + '/')) {
+            return { agentName, subPath };
+        }
+    }
+    return null;
 }
 
 function requestAgentCard(route, agentName, identityHeaders = {}) {
@@ -266,6 +275,21 @@ async function handleRoutedAggregateAgentCard(req, res) {
     sendJsonResponse(res, 200, { agents, errors });
 }
 
+function handleRoutedOpenAiChatCompletions(req, res, route) {
+    const pathWithQuery = `/v1/chat/completions${new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`).search || ''}`;
+    proxyHttpPassthrough(req, res, route.hostPort, pathWithQuery, req.headers);
+}
+
+function handleRoutedAgentCard(req, res, route) {
+    const pathWithQuery = `/agent-card${new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`).search || ''}`;
+    proxyHttpPassthrough(req, res, route.hostPort, pathWithQuery, req.headers);
+}
+
+function proxyAgentTaskStatus(req, res, route) {
+    const pathWithQuery = `/getTaskStatus${new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`).search || ''}`;
+    proxyHttpPassthrough(req, res, route.hostPort, pathWithQuery, req.headers);
+}
+
 /**
  * Main request processor
  */
@@ -273,7 +297,7 @@ async function processRequest(req, res) {
     const parsedUrl = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
     const pathname = parsedUrl.pathname || '/';
     const routedAggregateAgentCard = pathname === '/agent-card' || pathname === '/agent-card/';
-    const agentPrefix = extractAgentPrefix(pathname);
+    const agentApiRoute = parseAgentApiRoute(pathname);
     appendLog('http_request', { method: req.method, path: pathname });
 
     // Health check endpoint (no auth required)
@@ -324,7 +348,7 @@ async function processRequest(req, res) {
 
     // Agent-prefixed routes are public at the router level;
     // the target agent decides whether to accept or reject the request.
-    const isAgentRoute = agentPrefix !== null;
+    const isAgentRoute = agentApiRoute !== null;
 
     if (routedAggregateAgentCard) {
         // Public aggregate route
@@ -360,20 +384,27 @@ async function processRequest(req, res) {
         return;
     } else if (routedAggregateAgentCard) {
         return handleRoutedAggregateAgentCard(req, res);
-    } else if (agentPrefix) {
+    } else if (agentApiRoute) {
         const apiRoutes = loadApiRoutes();
-        const route = apiRoutes[agentPrefix];
+        const route = apiRoutes[agentApiRoute.agentName];
         if (!route || !route.hostPort) {
-            sendJsonResponse(res, 404, { error: 'agent_not_found', agent: agentPrefix });
+            sendJsonResponse(res, 404, { error: 'agent_not_found', agent: agentApiRoute.agentName });
             return;
         }
 
-        // Transparent proxy: forward the remaining path to the agent
-        const parts = pathname.split('/').filter(Boolean);
-        const subPath = parts.slice(1).join('/');
-        const pathWithQuery = subPath ? `/${subPath}${parsedUrl.search || ''}` : parsedUrl.search || '/';
-        proxyHttpPassthrough(req, res, route.hostPort, pathWithQuery, req.headers);
-        return;
+        const { subPath } = agentApiRoute;
+        if (subPath === 'mcp' || subPath.startsWith('mcp/')) {
+            return handleAgentMcpRequest(req, res, route, agentApiRoute.agentName);
+        } else if (subPath === 'task' || subPath.startsWith('task/')) {
+            return proxyAgentTaskStatus(req, res, route);
+        } else if (subPath === 'agent-card' || subPath.startsWith('agent-card/')) {
+            return handleRoutedAgentCard(req, res, route);
+        } else if (subPath === 'v1/chat/completions' || subPath.startsWith('v1/chat/completions/')) {
+            return handleRoutedOpenAiChatCompletions(req, res, route);
+        } else {
+            sendJsonResponse(res, 404, { error: 'unknown_agent_route', path: subPath });
+            return;
+        }
     } else if (pathname === '/mcp' || pathname === '/mcp/') {
         return handleRouterMcp(req, res);
     } else {
