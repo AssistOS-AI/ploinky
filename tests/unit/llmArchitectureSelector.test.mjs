@@ -120,6 +120,23 @@ test('selectArchitecture honors compatible PLOINKY_LLM_ARCHITECTURE_ID override'
     assert.equal(selected.explanation.mode, 'override-architecture');
 });
 
+test('selectArchitecture ignores stale per-agent architecture override env vars', () => {
+    const catalog = makeCatalog();
+    const hardware = {
+        runtime: 'docker',
+        ociPlatform: 'linux/amd64',
+        nodePlatform: 'linux/amd64',
+        acceleratorFamilies: ['cpu', 'nvidia-cuda'],
+        probes: { nvidiaSmi: { ok: true } },
+    };
+    const selected = selectArchitecture(catalog, hardware, {
+        agentName: 'planning-local',
+        env: { PLOINKY_PLANNING_LOCAL_ARCHITECTURE_ID: '../etc/shadow' },
+    });
+    assert.equal(selected.architectureId, 'nvidia-cuda-amd64');
+    assert.equal(selected.explanation.mode, 'auto');
+});
+
 test('selectArchitecture rejects architecture override when platform or probes do not match', () => {
     const catalog = makeCatalog();
     const hardware = {

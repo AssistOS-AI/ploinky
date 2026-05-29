@@ -131,6 +131,74 @@ process.stdout.write(JSON.stringify({
     }
 });
 
+test('parseManifestPorts emits runtime-chosen localhost ports for host port 0', () => {
+    const workspaceDir = tempDir();
+    try {
+        const result = runModuleSnippet(
+            `const { parseManifestPorts } = await import(${JSON.stringify(dockerCommonUrl)});
+const manifest = {};
+const profile = { ports: ['127.0.0.1:0:9000', '127.0.0.1:18080:8080'] };
+process.stdout.write(JSON.stringify(parseManifestPorts(manifest, profile)));`,
+            {},
+            { cwd: workspaceDir },
+        );
+
+        assert.equal(result.status, 0, result.stderr);
+        assert.deepEqual(JSON.parse(result.stdout), {
+            publishArgs: ['127.0.0.1::9000', '127.0.0.1:18080:8080'],
+            portMappings: [
+                { hostPort: 0, containerPort: 9000, hostIp: '127.0.0.1', protocol: 'tcp' },
+                { hostPort: 18080, containerPort: 8080, hostIp: '127.0.0.1', protocol: 'tcp' },
+            ],
+        });
+    } finally {
+        fs.rmSync(workspaceDir, { recursive: true, force: true });
+    }
+});
+
+test('resolvePublishedPortMappings records host ports assigned by the container runtime', () => {
+    const binDir = tempDir();
+    try {
+        const podmanPath = path.join(binDir, 'podman');
+        fs.writeFileSync(
+            podmanPath,
+            `#!/bin/sh
+case "$1" in
+  port)
+    if [ "$3" = "9000/tcp" ]; then
+      printf '%s\\n' '127.0.0.1:49152'
+      exit 0
+    fi
+    exit 1
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+`,
+        );
+        fs.chmodSync(podmanPath, 0o755);
+
+        const result = runModuleSnippet(
+            `const { resolvePublishedPortMappings } = await import(${JSON.stringify(agentServiceManagerUrl)});
+const mappings = [
+  { hostPort: 0, containerPort: 9000, hostIp: '127.0.0.1', protocol: 'tcp' },
+  { hostPort: 18080, containerPort: 8080, hostIp: '127.0.0.1', protocol: 'tcp' },
+];
+process.stdout.write(JSON.stringify(resolvePublishedPortMappings('demo-container', mappings)));`,
+            { PATH: binDir },
+        );
+
+        assert.equal(result.status, 0, result.stderr);
+        assert.deepEqual(JSON.parse(result.stdout), [
+            { hostPort: 49152, containerPort: 9000, hostIp: '127.0.0.1', protocol: 'tcp' },
+            { hostPort: 18080, containerPort: 8080, hostIp: '127.0.0.1', protocol: 'tcp' },
+        ]);
+    } finally {
+        fs.rmSync(binDir, { recursive: true, force: true });
+    }
+});
+
 test('collectLiveAgentContainers probes the runtime before listing live containers', () => {
     const binDir = tempDir();
     try {

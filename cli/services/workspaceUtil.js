@@ -799,7 +799,9 @@ async function startWorkspace(staticAgentArg, portArg, { refreshComponentToken, 
       if (!blockingNodes.length) continue;
 
       const readinessEntries = blockingNodes.map((node) => {
-        const routeKey = node.alias || node.shortAgentName;
+        const registryName = registryNameByNodeId.get(node.id);
+        const registryRecord = registryName ? reg[registryName] : null;
+        const routeKey = registryRecord?.alias || node.alias || node.shortAgentName;
         const route = cfg.routes?.[routeKey] || null;
         if (!route?.hostPort) {
           throw new Error(`${node.isStatic ? 'Static agent' : 'Dependent agent'} '${formatGraphNodeLabel(node, staticAgent)}' did not expose a host port.`);

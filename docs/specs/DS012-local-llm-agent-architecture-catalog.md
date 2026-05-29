@@ -42,6 +42,39 @@ Each image record declares: `id`, `ref` (image reference; may use the literal te
 
 Catalog loading rejects architecture/image records whose platforms disagree and rejects `runtimePolicy.platform` when it differs from the architecture platform. `allowExperimental` does not bypass this consistency check.
 
+### Architecture ID Format
+
+`PLOINKY_LLM_ARCHITECTURE_ID` must be the literal `id` of an architecture record in the active catalog. The enforced syntax is `[a-z0-9][a-z0-9._-]{0,63}`. The recommended semantic shape is:
+
+```text
+<accelerator-family>[-runtime-or-backend-variant]-<cpu-architecture>
+```
+
+The id normally includes the accelerator family for operator readability, but the id string is not the security boundary. The authoritative accelerator value remains the architecture record's `accelerator.family`, and Ploinky still validates that family, platform, required probes, runtime compatibility, image platform, and runtime policy before accepting an override.
+
+Examples:
+
+| Value | Meaning |
+| --- | --- |
+| `cpu-amd64` | CPU fallback image for OCI platform `linux/amd64`. |
+| `cpu-arm64` | CPU fallback image for OCI platform `linux/arm64`. |
+| `nvidia-cuda-amd64` | NVIDIA CUDA image for Docker on `linux/amd64`, using Docker `--gpus`. |
+| `nvidia-cuda-cdi-amd64` | NVIDIA CUDA image for Podman on `linux/amd64`, using NVIDIA CDI devices. |
+| `amd-rocm-amd64` | AMD ROCm image for `linux/amd64`. |
+| `intel-openvino-amd64` | Intel/OpenVINO image for `linux/amd64`. |
+| `vulkan-amd64` | Vulkan image for `linux/amd64`. |
+| `vulkan-arm64` | Vulkan image for `linux/arm64`, currently experimental in the default catalog. |
+
+Usage examples:
+
+```bash
+PLOINKY_LLM_ARCHITECTURE_ID=cpu-amd64 ploinky start base-local
+PLOINKY_LLM_ARCHITECTURE_ID=nvidia-cuda-amd64 ploinky start planning-local
+PLOINKY_LLM_ARCHITECTURE_ID=nvidia-cuda-cdi-amd64 ploinky start planning-local
+```
+
+There is intentionally no per-agent architecture env var such as `PLOINKY_PLANNING_LOCAL_ARCHITECTURE_ID`. Architecture forcing is host/runtime policy applied consistently to LLM agents. Per-agent differences should use manifests, aliases, model profiles, launcher priorities, or image overrides, not separate architecture ids.
+
 ### Selection Algorithm
 
 For each enabled LLM agent, Ploinky core:
@@ -52,7 +85,7 @@ For each enabled LLM agent, Ploinky core:
 4. Filters catalog architectures by platform compatibility, status (experimental architectures only win when explicitly enabled), container runtime compatibility, accelerator family availability, required probes, image/platform consistency, and runtime policy validity for the selected Docker or Podman backend. The selector then prefers lower `fallbackPriority` and then a canonical accelerator ordering (`nvidia-cuda` > `amd-rocm` > `intel-openvino` > `vulkan` > `cpu`).
 5. Falls back to the catalog `defaultFallback` (or any CPU architecture matching the host platform) when no accelerator architecture passes.
 6. Applies validated overrides without bypassing compatibility:
-   - `PLOINKY_LLM_ARCHITECTURE_ID` (must exist in the catalog and match `[a-z0-9][a-z0-9._-]{0,63}`).
+   - `PLOINKY_LLM_ARCHITECTURE_ID` (single workspace-level architecture override; must exist in the catalog and match `[a-z0-9][a-z0-9._-]{0,63}`). There is intentionally no `PLOINKY_<AGENT>_ARCHITECTURE_ID`; architecture forcing is a host/runtime policy applied consistently to LLM agents.
    - `PLOINKY_LLM_FORCE_PLATFORM` (must be `linux/amd64` or `linux/arm64`).
    - `PLOINKY_LLM_ACCELERATOR` (must be a known family).
    - `PLOINKY_LLM_AGENT_IMAGE` or `PLOINKY_<AGENT>_IMAGE` (replaces the image ref; runtime policy validation still applies; loses the catalog digest).

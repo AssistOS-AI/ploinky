@@ -574,7 +574,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     // INSTALL PHASE — runtime containers never run npm install. Dependency
     // preparation happens here, before runtime boot, via a dedicated cache.
     const agentHasPackageJson = fs.existsSync(path.join(agentCodePath, 'package.json'));
-    const needsCoreDeps = !useStartEntry || agentHasPackageJson;
+    const needsCoreDeps = !useStartEntry || agentHasPackageJson || isLlmRuntimeManifest(manifest, profileConfig);
     let preparedNodeModulesDir = path.join(agentWorkDir, 'node_modules');
     if (needsCoreDeps) {
         const runtimeKey = detectRuntimeKeyForAgent(manifest, repoName, agentName, profileConfig);
@@ -1042,6 +1042,26 @@ function resolveHostPortFromRuntime(containerName, containerPortCandidates) {
     return 0;
 }
 
+function resolvePublishedPortMappings(containerName, portMappings) {
+    if (!Array.isArray(portMappings) || portMappings.length === 0) {
+        return [];
+    }
+    return portMappings.map((mapping) => {
+        const hostPort = Number(mapping?.hostPort);
+        const containerPort = Number(mapping?.containerPort);
+        if (!Number.isFinite(containerPort) || containerPort <= 0) {
+            return mapping;
+        }
+        if (Number.isFinite(hostPort) && hostPort > 0) {
+            return mapping;
+        }
+        const resolvedHostPort = resolveHostPortFromRuntime(containerName, [containerPort]);
+        return resolvedHostPort > 0
+            ? { ...mapping, hostPort: resolvedHostPort }
+            : mapping;
+    });
+}
+
 function ensureAgentService(agentName, manifest, agentPath, options = {}) {
     // Check if this agent should use a sandbox runtime instead of containers
     const agentRuntime = getRuntimeForAgent(manifest);
@@ -1209,6 +1229,7 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
         routerPort: runtimeRouterEnv.PLOINKY_ROUTER_PORT,
         routerHost: runtimeRouterEnv.PLOINKY_ROUTER_HOST
     });
+    allPortMappings = resolvePublishedPortMappings(containerName, allPortMappings);
 
     // Get paths for the new workspace structure
     const agentWorkDir = getAgentWorkDir(agentName);
@@ -1291,5 +1312,6 @@ export {
     resolveHostPort,
     resolveHostPortFromRecord,
     resolveHostPortFromRuntime,
+    resolvePublishedPortMappings,
     startAgentContainer
 };

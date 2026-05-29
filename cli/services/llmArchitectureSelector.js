@@ -186,8 +186,7 @@ function selectArchitecture(catalog, hardware, options = {}) {
     const env = options.env || {};
     const identity = safeAgentIdentity({ agentName: options.agentName, alias: options.alias });
 
-    const archOverride = envOverride(env, 'PLOINKY_LLM_ARCHITECTURE_ID')
-        || envOverride(env, `PLOINKY_${String(options.agentName || '').toUpperCase().replace(/[^A-Z0-9]/g, '_')}_ARCHITECTURE_ID`);
+    const archOverride = envOverride(env, 'PLOINKY_LLM_ARCHITECTURE_ID');
     if (archOverride && !ARCH_ID_RE.test(archOverride)) {
         throw new ArchitectureSelectionError(`PLOINKY_LLM_ARCHITECTURE_ID: invalid value`);
     }

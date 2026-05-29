@@ -358,16 +358,21 @@ function parseManifestPorts(manifest, profileConfig = null) {
 }
 
 function parsePortPublishSpec(hostPortSpec, containerPortSpec) {
-    if (!hostPortSpec || !containerPortSpec) return null;
+    if (hostPortSpec === undefined || hostPortSpec === null || containerPortSpec === undefined || containerPortSpec === null) {
+        return null;
+    }
     const container = splitPortProtocol(containerPortSpec);
     const host = splitPortProtocol(hostPortSpec);
     const protocol = container.protocol || host.protocol || 'tcp';
     if ((container.protocol && host.protocol && container.protocol !== host.protocol) || !['tcp', 'udp'].includes(protocol)) {
         return null;
     }
-    const hostRange = parsePortRange(host.portSpec);
+    const hostRange = parsePortRange(host.portSpec, { allowEphemeral: true });
     const containerRange = parsePortRange(container.portSpec);
     if (!hostRange || !containerRange || hostRange.length !== containerRange.length) {
+        return null;
+    }
+    if (hostRange.ephemeral && containerRange.length !== 1) {
         return null;
     }
     const portMappings = [];
@@ -378,7 +383,7 @@ function parsePortPublishSpec(hostPortSpec, containerPortSpec) {
         });
     }
     return {
-        hostPortSpec: formatPortRange(hostRange),
+        hostPortSpec: hostRange.ephemeral ? '' : formatPortRange(hostRange),
         containerPortSpec: formatPortRange(containerRange),
         protocol,
         protocolSuffix: protocol === 'tcp' ? '' : `/${protocol}`,
@@ -395,11 +400,18 @@ function splitPortProtocol(portSpec) {
     };
 }
 
-function parsePortRange(portSpec) {
-    const match = String(portSpec || '').trim().match(/^(\d+)(?:-(\d+))?$/);
+function parsePortRange(portSpec, options = {}) {
+    const raw = String(portSpec || '').trim();
+    if (options.allowEphemeral && raw === '') {
+        return { start: 0, end: 0, length: 1, ephemeral: true };
+    }
+    const match = raw.match(/^(\d+)(?:-(\d+))?$/);
     if (!match) return null;
     const start = parseInt(match[1], 10);
     const end = match[2] ? parseInt(match[2], 10) : start;
+    if (options.allowEphemeral && start === 0 && end === 0 && !match[2]) {
+        return { start: 0, end: 0, length: 1, ephemeral: true };
+    }
     if (!Number.isInteger(start) || !Number.isInteger(end) || start <= 0 || end <= 0 || end < start) {
         return null;
     }
