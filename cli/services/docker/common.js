@@ -1,4 +1,4 @@
-import { execSync } from 'child_process';
+import { execSync, spawnSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
@@ -92,6 +92,82 @@ function requireContainerRuntime() {
     }
     return rt;
 }
+
+const DEFAULT_IMAGE_PULL_TIMEOUT_MS = 30 * 60 * 1000;
+
+function imagePullTimeoutMs() {
+    const raw = Number(process.env.PLOINKY_IMAGE_PULL_TIMEOUT_MS);
+    return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_IMAGE_PULL_TIMEOUT_MS;
+}
+
+function imageExists(image, runtime) {
+    const rt = runtime || getRuntime();
+    const img = String(image || '').trim();
+    if (!img) return false;
+    const res = spawnSync(rt, ['image', 'inspect', img], { stdio: 'ignore' });
+    return res.status === 0;
+}
+
+function getImageSizeBytes(image, runtime) {
+    const rt = runtime || getRuntime();
+    const res = spawnSync(rt, ['image', 'inspect', image, '--format', '{{.Size}}'], {
+        stdio: ['ignore', 'pipe', 'ignore'],
+    });
+    if (res.status !== 0) return 0;
+    const n = Number(String(res.stdout || '').trim());
+    return Number.isFinite(n) ? n : 0;
+}
+
+// Pull a container image as an explicit step, streaming the runtime's native
+// progress (per-layer bars + download rate) straight to the terminal. Uses a
+// generous, env-overridable timeout (PLOINKY_IMAGE_PULL_TIMEOUT_MS) because a
+// large image on a throttled link can legitimately take many minutes — the live
+// progress keeps the wait visible instead of looking frozen.
+function pullImage(image, options = {}) {
+    const rt = options.runtime || getRuntime();
+    const img = String(image || '').trim();
+    if (!img) throw new Error('pullImage: image is required');
+    const log = typeof options.log === 'function' ? options.log : ((msg) => console.log(msg));
+    const timeoutMs = Number.isFinite(options.timeoutMs) && options.timeoutMs > 0
+        ? options.timeoutMs
+        : imagePullTimeoutMs();
+    log(`[pull] ${rt} pull ${img} (timeout ${Math.round(timeoutMs / 1000)}s)`);
+    const startedAt = Date.now();
+    const res = spawnSync(rt, ['pull', img], { stdio: ['ignore', 'inherit', 'inherit'], timeout: timeoutMs });
+    const elapsedSec = Math.max(1, Math.round((Date.now() - startedAt) / 1000));
+    if (res.error) {
+        if (res.error.code === 'ETIMEDOUT') {
+            throw new Error(`Image pull for '${img}' timed out after ${Math.round(timeoutMs / 1000)}s. `
+                + `Increase PLOINKY_IMAGE_PULL_TIMEOUT_MS or pre-pull it: '${rt} pull ${img}'.`);
+        }
+        throw new Error(`Image pull for '${img}' failed: ${res.error.message}`);
+    }
+    if (res.status !== 0) {
+        throw new Error(`Image pull for '${img}' exited with code ${res.status}.`);
+    }
+    const bytes = getImageSizeBytes(img, rt);
+    if (bytes > 0) {
+        const mb = bytes / (1024 * 1024);
+        log(`[pull] ${img} ready — ${(mb / 1024).toFixed(2)} GB unpacked in ${elapsedSec}s `
+            + `(avg ${(mb / elapsedSec).toFixed(1)} MB/s)`);
+    } else {
+        log(`[pull] ${img} ready in ${elapsedSec}s`);
+    }
+}
+
+// Ensure an image is present locally, pulling it (with streamed progress) only
+// when missing. Returns true if a pull happened, false if it was already cached.
+function ensureImagePresent(image, options = {}) {
+    const rt = options.runtime || getRuntime();
+    const img = String(image || '').trim();
+    if (!img) throw new Error('ensureImagePresent: image is required');
+    if (imageExists(img, rt)) return false;
+    const log = typeof options.log === 'function' ? options.log : ((msg) => console.log(msg));
+    log(`[pull] image '${img}' not present locally — pulling before runtime probe...`);
+    pullImage(img, { runtime: rt, log, timeoutMs: options.pullTimeoutMs });
+    return true;
+}
+
 const SLEEP_ARRAY = new Int32Array(new SharedArrayBuffer(4));
 const CONTAINER_CONFIG_DIR = '/code';
 const CONTAINER_CONFIG_PATH = `${CONTAINER_CONFIG_DIR}/mcp-config.json`;
@@ -451,6 +527,9 @@ export {
     REPOS_DIR,
     containerRuntime,
     containerExists,
+    ensureImagePresent,
+    imageExists,
+    pullImage,
     computeEnvHash,
     getAgentContainerName,
     getAgentMcpConfigPath,

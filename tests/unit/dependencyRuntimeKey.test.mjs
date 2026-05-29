@@ -96,10 +96,28 @@ test('detectContainerRuntimeKey accepts injected probe executor', () => {
     const key = detectContainerRuntimeKey({
         image: 'node:20-alpine',
         runtime: 'podman',
+        ensureImage() {},
         execProbe() {
             return '{"platform":"linux","arch":"x64","nodeMajor":20,"libc":"musl"}';
         },
     });
+    assert.equal(key, 'container-linux-x64-musl-node20');
+});
+
+test('detectContainerRuntimeKey ensures the image is present before probing', () => {
+    const calls = [];
+    const key = detectContainerRuntimeKey({
+        image: 'node:20-alpine',
+        runtime: 'podman',
+        ensureImage({ image }) {
+            calls.push(`ensure:${image}`);
+        },
+        execProbe({ image }) {
+            calls.push(`probe:${image}`);
+            return '{"platform":"linux","arch":"x64","nodeMajor":20,"libc":"musl"}';
+        },
+    });
+    assert.deepEqual(calls, ['ensure:node:20-alpine', 'probe:node:20-alpine']);
     assert.equal(key, 'container-linux-x64-musl-node20');
 });
 
@@ -116,6 +134,7 @@ test('detectContainerRuntimeKey resolves manifest image templates before probing
             ],
         },
         runtime: 'podman',
+        ensureImage() {},
         execProbe({ image }) {
             probedImage = image;
             return '{"platform":"linux","arch":"x64","nodeMajor":20,"libc":"glibc"}';

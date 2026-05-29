@@ -1,8 +1,19 @@
 import { spawnSync } from 'child_process';
-import { getRuntime, getRuntimeForAgent } from './docker/common.js';
+import { getRuntime, getRuntimeForAgent, ensureImagePresent } from './docker/common.js';
 import { resolveManifestImage } from './secretVars.js';
 
 const SUPPORTED_FAMILIES = new Set(['bwrap', 'seatbelt', 'container']);
+
+// The probe only starts a container and runs a tiny `node -e` script, so it
+// should finish in seconds. Keep the timeout short (env-overridable) so it
+// catches a genuinely hung runtime instead of silently absorbing a multi-minute
+// image pull — pulling is handled separately by ensureImagePresent().
+const DEFAULT_PROBE_TIMEOUT_MS = 90 * 1000;
+
+function probeTimeoutMs() {
+    const raw = Number(process.env.PLOINKY_RUNTIME_PROBE_TIMEOUT_MS);
+    return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_PROBE_TIMEOUT_MS;
+}
 
 function normalizeRuntimeFamily(runtime) {
     if (runtime === 'bwrap' || runtime === 'seatbelt') return runtime;
@@ -85,16 +96,33 @@ function defaultContainerProbe({ image, runtime }) {
         '  libc',
         '}));',
     ].join('');
-    const args = ['run', '--rm', '--entrypoint', 'node', image, '-e', probeScript];
-    const res = spawnSync(runtime, args, { stdio: ['ignore', 'pipe', 'pipe'], timeout: 120000 });
+    // --pull=never: the image must already be present locally (ensureImagePresent
+    // pulls it as an explicit, progress-streamed step before we get here). This
+    // keeps the probe fast and turns a missing image into an instant, clear error
+    // instead of a silent multi-minute pull that trips the timeout.
+    const args = ['run', '--rm', '--pull=never', '--entrypoint', 'node', image, '-e', probeScript];
+    const timeoutMs = probeTimeoutMs();
+    const res = spawnSync(runtime, args, { stdio: ['ignore', 'pipe', 'pipe'], timeout: timeoutMs });
     if (res.error) {
+        if (res.error.code === 'ETIMEDOUT') {
+            throw new Error(`Container runtime-key probe timed out after ${Math.round(timeoutMs / 1000)}s for image '${image}'. `
+                + `The image is present, so '${runtime} run' itself is not responding — check the container runtime.`);
+        }
         throw new Error(`Container runtime-key probe failed: ${res.error.message}`);
     }
     if (res.status !== 0) {
         const stderr = String(res.stderr || '').trim();
+        if (/image not known|no such image|unable to find image|image not present/i.test(stderr)) {
+            throw new Error(`Container image '${image}' is not present locally (probe uses --pull=never). `
+                + `Pull it first: '${runtime} pull ${image}'.`);
+        }
         throw new Error(`Container runtime-key probe exited with code ${res.status}${stderr ? `: ${stderr}` : ''}`);
     }
     return String(res.stdout || '').trim();
+}
+
+function defaultEnsureImage({ image, runtime }) {
+    ensureImagePresent(image, { runtime });
 }
 
 export function detectContainerRuntimeKey({
@@ -105,12 +133,16 @@ export function detectContainerRuntimeKey({
     runtime = null,
     image = '',
     execProbe = defaultContainerProbe,
+    ensureImage = defaultEnsureImage,
 } = {}) {
     const resolvedImage = String(image || (manifest ? resolveManifestImage(manifest, profileConfig, { repoName, agentName }) : '')).trim();
     if (!resolvedImage) {
         throw new Error(`Container runtime-key detection requires an image${repoName || agentName ? ` for ${repoName}/${agentName}` : ''}.`);
     }
     const resolvedRuntime = runtime || getRuntime();
+    // Explicit pull step (streamed progress, generous timeout) BEFORE the probe,
+    // so the probe can safely run with --pull=never under a short timeout.
+    ensureImage({ image: resolvedImage, runtime: resolvedRuntime, manifest, repoName, agentName });
     const output = execProbe({ image: resolvedImage, runtime: resolvedRuntime, manifest, repoName, agentName });
     const probe = parseContainerProbeOutput(output);
     return buildRuntimeKey({
