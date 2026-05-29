@@ -148,7 +148,7 @@ Router logs and agent logs are diagnostic surfaces and must not intentionally re
 
 ### Browser Media and Third-Party API Keys
 
-WebChat server-side speech-to-text uses `OPENAI_API_KEY` from the router process environment when the OpenAI STT provider is selected. The Realtime token endpoint currently returns that API key to an authenticated browser as `client_secret.value` for direct browser use. This is acceptable only for trusted local users and must not be documented as a production-safe ephemeral-token implementation. A production deployment must replace this behavior with short-lived provider-issued client credentials or disable the endpoint.
+Ploinky WebChat does not expose first-party browser dictation, spoken-reply synthesis, or browser-facing realtime provider-token endpoints. Browser-facing routes must not return external provider API keys or direct browser media credentials from the router process. Any future browser media or provider-token surface must be owned by an explicit agent manifest/service contract and documented with the same route-auth, token-lifetime, logging, and deployment constraints as other protected browser media flows.
 
 The SSO `/auth/token` endpoint can return provider access-token information for an authenticated SSO session. That endpoint is a browser-facing token surface and must remain protected by the active session cookie and route auth context.
 
