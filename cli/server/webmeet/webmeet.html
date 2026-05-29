@@ -17,8 +17,6 @@
     .vc-row.right{justify-content:flex-end}
     .vc-select{background:var(--wa-bg-input);color:var(--wa-text-primary);border:1px solid var(--wa-border);border-radius:6px;padding:6px 8px}
     .vc-hint{color:var(--wa-text-secondary);font-size:12px}
-    .wa-tts-btn{cursor:pointer;border:none;background:transparent;color:inherit;opacity:.7;transition:opacity .2s}
-    .wa-tts-btn:hover{opacity:1}
     .vc-demo{opacity:.6}
     .vc-disconnect-mask{position:fixed;bottom:0;left:0;right:0;height:var(--wa-composer-height);background:rgba(0,0,0,0.7);z-index:15;display:none;pointer-events:none}
     .vc-disconnect-mask.show{display:block}
@@ -38,8 +36,6 @@
     body[data-page="chat"] .wa-main-content { padding-right: 0; }
     body[data-page="chat"] .wa-composer { margin-right: 0; }
     .wa-message.in { display: flex; align-items: center; gap: 8px; }
-    .wa-message.in .wa-tts-btn { opacity: 0; }
-    .wa-message.in:hover .wa-tts-btn { opacity: 0.7; }
     .wa-message.moderator .wa-message-bubble { border-color: var(--wa-accent); background: rgba(75,158,255,0.12); }
     .wa-message.moderator .wa-message-author { color: var(--wa-accent); }
     .wa-message.command .wa-message-bubble { font-style: italic; opacity: 0.85; }
@@ -119,22 +115,14 @@
       <button class="wa-icon-btn" id="participantsToggle" title="Toggle participants">
         <svg width="24" height="24" viewBox="0 0 24 24" fill="currentColor"><path d="M16 11c1.66 0 2.99-1.34 2.99-3S17.66 5 16 5s-3 1.34-3 3 1.34 3 3 3zm-8 0c1.66 0 2.99-1.34 2.99-3S9.66 5 8 5 5 6.34 5 8s1.34 3 3 3zm0 2c-2.33 0-7 1.17-7 3.5V19h14v-2.5C15 14.17 10.33 13 8 13zm8 0c-.29 0-.62.02-.97.05 1.16.84 1.97 1.96 1.97 3.45V19h6v-2.5c0-2.33-4.67-3.5-7-3.5z"/></svg>
       </button>
-      <button class="wa-icon-btn" id="settingsBtn" title="Voice settings">
+      <button class="wa-icon-btn" id="settingsBtn" title="Settings">
         <svg width="24" height="24" viewBox="0 0 24 24" fill="currentColor"><path d="M19.14 12.94c.04-.3.06-.61.06-.94s-.02-.64-.06-.94l2.03-1.58a.5.5 0 0 0 .12-.64l-1.92-3.32a.5.5 0 0 0-.6-.22l-2.39.96a7.07 7.07 0 0 0-1.63-.94l-.36-2.54A.5.5 0 0 0 14.9 2h-3.8a.5.5 0 0 0-.5.43l-.36 2.54a7.07 7.07 0 0 0-1.63.94l-2.39-.96a.5.5 0 0 0-.6.22L3.2 8.49a.5.5 0 0 0 .12.64l2.03 1.58c-.04.3-.06.61-.06.94s.02.64.06.94l-2.03 1.58a.5.5 0 0 0-.12.64l1.92 3.32a.5.5 0 0 0 .6.22l2.39-.96c.5.38 1.05.7 1.63.94l.36 2.54a.5.5 0 0 0 .5.43h3.8a.5.5 0 0 0 .5-.43l.36-2.54c.58-.24 1.13-.56 1.63-.94l2.39.96a.5.5 0 0 0 .6-.22l1.92-3.32a.5.5 0 0 0-.12-.64l-2.03-1.58zm-7.14 2.56a2.5 2.5 0 1 1 0-5 2.5 2.5 0 0 1 0 5z"/></svg>
       </button>
     </div>
   </div>
 
   <div class="wa-settings-panel" id="settingsPanel">
-    <div class="wa-settings-header">Voice Settings</div>
-    <label class="wa-settings-row">
-      <input type="checkbox" id="sttEnable" checked />
-      <span>Enable speech dictation</span>
-    </label>
-    <label class="wa-settings-row">
-      <span class="wa-settings-label">Recognition language</span>
-      <select id="sttLang"></select>
-    </label>
+    <div class="wa-settings-header">Settings</div>
     <label class="wa-settings-row">
       <span class="wa-settings-label">Theme</span>
       <select id="themeSelect">
@@ -214,18 +202,12 @@
   </div>
 
   <div class="wa-composer">
-    <div class="wa-voice-control">
-      <button class="wa-icon-btn" id="sttBtn" title="Voice dictation">
-        <svg width="24" height="24" viewBox="0 0 24 24" fill="currentColor"><path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3zm-1.2-9.1c0-.66.54-1.2 1.2-1.2s1.2.54 1.2 1.2v6.2c0 .66-.54 1.2-1.2 1.2s-1.2-.54-1.2-1.2V4.9zm6.5 6.1c0 3-2.54 5.1-5.3 5.1S6.7 14 6.7 11H5c0 3.41 2.72 6.23 6 6.72V21h2v-3.28c3.28-.49 6-3.31 6-6.72h-1.7z"/></svg>
-      </button>
-      <span class="wa-voice-status" id="sttStatus">Off</span>
-    </div>
     <div class="wa-composer-input-wrapper">
       <textarea 
         id="cmd" 
         class="wa-composer-input" 
         rows="1" 
-        placeholder="Type or dictate a message"
+        placeholder="Type a message"
         autocomplete="off"
       ></textarea>
     </div>
@@ -254,7 +236,6 @@
   </div>
 
   <!-- Load modular scripts -->
-  <script src="__ASSET_BASE__/audio.js"></script>
   <script src="__ASSET_BASE__/showdemo.js"></script>
   <script src="__ASSET_BASE__/webmeet-store.js"></script>
   <script src="__ASSET_BASE__/webmeet-ui.js"></script>

@@ -134,7 +134,7 @@ const DEFAULT_DEMO_SCRIPT = [
     { who: 'Me', text: 'Just clicked the button. Waiting for my turn...', delayMs: 1800 },
     { who: 'Agent', text: 'I see your request. Let me check the queue.', delayMs: 1500 },
     { who: 'Moderator', text: 'You\'re next in line. Get ready to present!', delayMs: 2200 },
-    { who: 'Agent', text: 'Remember, you can use speech-to-text or type your message.', delayMs: 2000 },
+    { who: 'Agent', text: 'Remember, you can type your message or request to speak.', delayMs: 2000 },
     { who: 'Me', text: 'Thanks! I\'ll share my screen and start the presentation.', delayMs: 1800 },
     { who: 'Moderator', text: 'Your turn to speak is now active. Go ahead!', delayMs: 2500 }
 ];

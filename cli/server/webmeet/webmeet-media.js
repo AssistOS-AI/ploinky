@@ -3,9 +3,6 @@
   let store;
   let ui;
   let tabId = null;
-  let sttRecognition = null;
-  let finalSegments = [];
-  let interimTranscript = '';
   let localCameraTrack = null;
   let localCameraStream = null;
   let localScreenTrack = null;
@@ -13,16 +10,6 @@
   let previewPeer = 'self';
   let previewKind = 'none';
   let overlayPeer = null;
-
-  const SpeechRecognitionClass = window.SpeechRecognition || window.webkitSpeechRecognition;
-
-  function voiceStatus(text) {
-    store.patchPath('stt.status', text);
-  }
-
-  function updateSttState(patch) {
-    store.update((state) => ({ stt: { ...state.stt, ...patch } }));
-  }
 
   function updateRemoteMedia(peerId, kind, active) {
     store.update((state) => {
@@ -200,108 +187,6 @@
   function setDeafened(deafened) {
     store.setState({ isDeafened: deafened });
     try { window.webMeetWebRTC?.muteAllRemoteAudio(deafened); } catch (_) {}
-    if (deafened) voiceStatus('Deafened');
-    else voiceStatus(store.getState().stt.active ? 'Listening…' : store.getState().stt.status);
-  }
-
-  function stopRecognition() {
-    if (!sttRecognition) return;
-    try {
-      sttRecognition.onresult = null;
-      sttRecognition.onerror = null;
-      sttRecognition.onend = null;
-      sttRecognition.stop();
-    } catch (_) {}
-    sttRecognition = null;
-    finalSegments = [];
-    interimTranscript = '';
-    updateSttState({ listening: false, active: false });
-  }
-
-  function currentTranscript() {
-    const finals = finalSegments.join(' ');
-    return interimTranscript ? `${finals} ${interimTranscript}`.trim() : finals.trim();
-  }
-
-  function handleDictationSend(sendFn) {
-    const text = currentTranscript().replace(/\bsend\b/gi, ' ').trim();
-    if (text) sendFn(text);
-    finalSegments = [];
-    interimTranscript = '';
-  }
-
-  function startRecognition(sendFn) {
-    if (!SpeechRecognitionClass || !store.getState().stt.enabled) return;
-    if (sttRecognition) return;
-    const { stt } = store.getState();
-    sttRecognition = new SpeechRecognitionClass();
-    sttRecognition.lang = stt.lang || 'en-GB';
-    sttRecognition.continuous = true;
-    sttRecognition.interimResults = true;
-    finalSegments = [];
-    interimTranscript = '';
-
-    sttRecognition.onresult = (event) => {
-      interimTranscript = '';
-      let triggerSend = false;
-      for (let i = event.resultIndex; i < event.results.length; i += 1) {
-        const res = event.results[i];
-        const transcript = (res[0]?.transcript || '').trim();
-        if (!transcript) continue;
-        if (res.isFinal) {
-          finalSegments.push(transcript);
-          if (/\bsend\b/i.test(finalSegments.join(' '))) triggerSend = true;
-        } else {
-          interimTranscript = interimTranscript ? `${interimTranscript} ${transcript}` : transcript;
-        }
-      }
-      if (triggerSend) {
-        handleDictationSend(sendFn);
-      }
-      if (ui?.elements?.textarea) {
-        ui.elements.textarea.value = currentTranscript();
-      }
-    };
-
-    sttRecognition.onerror = (e) => {
-      voiceStatus(`Error: ${e.error || e.message || 'unknown'}`);
-      updateSttState({ listening: false, active: false });
-      sttRecognition = null;
-    };
-
-    sttRecognition.onend = () => {
-      updateSttState({ listening: false, active: false });
-      voiceStatus(store.getState().stt.enabled ? 'Paused' : 'Disabled');
-      sttRecognition = null;
-    };
-
-    try {
-      sttRecognition.start();
-      updateSttState({ listening: true, active: true });
-      voiceStatus('Listening…');
-    } catch (err) {
-      console.error('STT start failed', err);
-      voiceStatus('Mic blocked');
-      stopRecognition();
-    }
-  }
-
-  function toggleDictation(sendFn) {
-    const { stt } = store.getState();
-    if (!stt.supported) {
-      voiceStatus('Unsupported');
-      return;
-    }
-    if (!stt.enabled) {
-      updateSttState({ enabled: true });
-      try { localStorage.setItem('vc_stt_enabled', 'true'); } catch (_) {}
-    }
-    if (stt.active) {
-      stopRecognition();
-      voiceStatus('Off');
-    } else {
-      startRecognition(sendFn);
-    }
   }
 
   function determineStreamKind(stream) {
@@ -425,8 +310,6 @@
     setCamera,
     setScreenShare,
     setDeafened,
-    toggleDictation,
-    stopRecognition,
     handleRemoteStream,
     handlePeerClosed,
     selectParticipant,

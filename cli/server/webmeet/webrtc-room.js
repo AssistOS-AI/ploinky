@@ -32,11 +32,6 @@
     },
 
     stopMic() {
-      // Stop STT if it's running
-      try {
-        window.WebMeetMedia?.stopRecognition?.();
-      } catch (_) {}
-
       // Stop microphone stream
       if (this.micStream) {
         this.micStream.getTracks().forEach(track => {

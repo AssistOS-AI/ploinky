@@ -183,10 +183,6 @@
     }
 
     wrapper.appendChild(bubble);
-    if (!isSelf && window.webMeetAudio?.createTTSButton) {
-      const ttsBtn = window.webMeetAudio.createTTSButton(cleanText);
-      wrapper.appendChild(ttsBtn);
-    }
     return wrapper;
   }
 
@@ -286,7 +282,7 @@
     if (textarea) {
       textarea.disabled = !(state.connected && state.joined);
       textarea.placeholder = state.connected
-        ? (state.joined ? 'Type or dictate a message' : 'Enter email to join the meeting')
+        ? (state.joined ? 'Type a message' : 'Enter email to join the meeting')
         : 'Press Connect to start';
     }
     if (sendBtn) sendBtn.disabled = !(state.connected && state.joined);
@@ -479,7 +475,6 @@
     if (window.WebMeetMedia?.setScreenShare) {
       window.WebMeetMedia.setScreenShare(false).catch(() => {});
     }
-    window.WebMeetMedia?.stopRecognition?.();
   }
 
   function disconnectSSE() {
@@ -550,24 +545,7 @@
   }
 
   async function handleButtonBindings() {
-    const { sttBtn, sttEnable, sttLang, themeSelect, muteBtn, cameraBtn, screenBtn, deafenBtn, micBtn } = uiElements;
-    if (sttBtn) sttBtn.addEventListener('click', () => window.WebMeetMedia.toggleDictation(sendTextMessage));
-    if (sttEnable) sttEnable.addEventListener('change', () => {
-      const enabled = !!sttEnable.checked;
-      store.update((state) => ({ stt: { ...state.stt, enabled } }));
-      try { localStorage.setItem('vc_stt_enabled', enabled ? 'true' : 'false'); } catch (_) {}
-      if (!enabled) {
-        window.WebMeetMedia.stopRecognition();
-        store.patchPath('stt.status', 'Disabled');
-      } else {
-        store.patchPath('stt.status', 'Off');
-      }
-    });
-    if (sttLang) sttLang.addEventListener('change', () => {
-      const value = sttLang.value || 'en-GB';
-      store.update((state) => ({ stt: { ...state.stt, lang: value } }));
-      try { localStorage.setItem('vc_stt_lang', value); } catch (_) {}
-    });
+    const { themeSelect, muteBtn, cameraBtn, screenBtn, deafenBtn, micBtn } = uiElements;
     if (themeSelect) themeSelect.addEventListener('change', () => {
       const value = themeSelect.value || 'light';
       store.setState({ theme: value });

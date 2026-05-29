@@ -3,49 +3,7 @@
   let onParticipantSelect = () => {};
   let onParticipantsToggle = () => {};
 
-  const commonLanguages = [
-    'en-US', 'en-GB', 'ro-RO', 'fr-FR', 'de-DE', 'es-ES',
-    'it-IT', 'pt-PT', 'pt-BR', 'nl-NL', 'pl-PL', 'tr-TR',
-    'ru-RU', 'zh-CN', 'ja-JP', 'ko-KR'
-  ];
-
   function query(id) { return document.getElementById(id); }
-
-  function currentSttLang() {
-    try {
-      return window.WebMeetStore?.getState()?.stt?.lang || 'en-GB';
-    } catch (_) {
-      return 'en-GB';
-    }
-  }
-
-  function populateSpeechLanguages() {
-    if (!elements.sttLang) return;
-    try {
-      const voices = window.speechSynthesis?.getVoices?.() || [];
-      const voiceLangs = voices.map((v) => v.lang).filter(Boolean);
-      const langs = Array.from(new Set([...voiceLangs, ...commonLanguages]))
-        .sort((a, b) => {
-          const aEn = a.startsWith('en-');
-          const bEn = b.startsWith('en-');
-          if (aEn && !bEn) return -1;
-          if (!aEn && bEn) return 1;
-          return a.localeCompare(b);
-        });
-
-      const selected = currentSttLang();
-      elements.sttLang.innerHTML = '';
-      langs.forEach((code) => {
-        const opt = document.createElement('option');
-        opt.value = code;
-        opt.textContent = code;
-        if (code === selected) opt.selected = true;
-        elements.sttLang.appendChild(opt);
-      });
-    } catch (err) {
-      console.warn('[WebMeetUI] Failed to populate speech languages', err);
-    }
-  }
 
   function init({ participantSelect, participantsToggle }) {
     onParticipantSelect = participantSelect || (() => {});
@@ -62,10 +20,6 @@
       videoHint: query('vc_video_hint'),
       videoPreview: query('vc_video_preview'),
       videoShell: document.querySelector('.wa-video-shell'),
-      sttBtn: query('sttBtn'),
-      sttStatus: query('sttStatus'),
-      sttEnable: query('sttEnable'),
-      sttLang: query('sttLang'),
       themeSelect: query('themeSelect'),
       muteBtn: query('vc_mute_btn'),
       cameraBtn: query('vc_camera_btn'),
@@ -81,11 +35,6 @@
       screenOverlayClose: query('screenOverlayClose'),
       screenOverlayTitle: query('screenOverlayTitle')
     });
-
-    populateSpeechLanguages();
-    try {
-      window.speechSynthesis?.addEventListener?.('voiceschanged', populateSpeechLanguages);
-    } catch (_) {}
 
     if (elements.participantsToggle) {
       elements.participantsToggle.addEventListener('click', () => {
@@ -211,26 +160,8 @@
       elements.deafenBtn.setAttribute('aria-disabled', controlsDisabled ? 'true' : 'false');
     }
 
-    if (elements.sttBtn) {
-      elements.sttBtn.classList.toggle('active', state.stt.active);
-      elements.sttBtn.setAttribute('aria-pressed', state.stt.active ? 'true' : 'false');
-      elements.sttBtn.disabled = !(state.connected && state.joined && state.stt.enabled && state.stt.supported);
-      elements.sttBtn.setAttribute('aria-disabled', elements.sttBtn.disabled ? 'true' : 'false');
-    }
-    if (elements.sttEnable) {
-      elements.sttEnable.checked = state.stt.enabled;
-    }
-    if (elements.sttLang) {
-      elements.sttLang.value = state.stt.lang || 'en-GB';
-    }
     if (elements.themeSelect) {
       elements.themeSelect.value = state.theme || 'light';
-    }
-  }
-
-  function renderVoice(state) {
-    if (elements.sttStatus) {
-      elements.sttStatus.textContent = state.stt.status;
     }
   }
 
@@ -256,7 +187,6 @@
     renderStatus(state);
     renderParticipants(state);
     renderButtons(state);
-    renderVoice(state);
     renderVideo(state);
     renderBanner(state);
   }

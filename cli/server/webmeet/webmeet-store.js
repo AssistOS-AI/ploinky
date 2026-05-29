@@ -1,11 +1,6 @@
 (() => {
   const subscribers = new Set();
 
-  const initialLang = (() => {
-    try { return localStorage.getItem('vc_stt_lang') || 'en-GB'; }
-    catch (_) { return 'en-GB'; }
-  })();
-
   const initialTheme = (() => {
     try { return localStorage.getItem('webmeet_theme') || 'light'; }
     catch (_) { return 'light'; }
@@ -26,14 +21,6 @@
     screenOn: false,
     remoteMedia: {},
     theme: initialTheme,
-    stt: {
-      supported: typeof (window.SpeechRecognition || window.webkitSpeechRecognition) === 'function',
-      enabled: (() => { try { return localStorage.getItem('vc_stt_enabled') !== 'false'; } catch (_) { return true; } })(),
-      active: false,
-      listening: false,
-      status: 'Off',
-      lang: initialLang
-    }
   };
 
   function notify() {
