@@ -9,6 +9,7 @@ const ALLOWED_GPUS_RE = /^all$|^device=[A-Za-z0-9._,-]+$/;
 const ALLOWED_CDI_RE = /^[A-Za-z0-9._/-]+=([A-Za-z0-9._,-]+|all)$/;
 const SIZE_RE = /^[0-9]+[bkmgtBKMGT]?$/;
 const CPU_RE = /^[0-9]+(\.[0-9]+)?$/;
+const MAX_PIDS_LIMIT = 1048576;
 
 class RuntimePolicyError extends Error {
     constructor(message, details = {}) {
@@ -69,7 +70,7 @@ function validateResources(resources, label) {
         throw new RuntimePolicyError(`${label}.shmSize: invalid size value`);
     }
     if (resources.pidsLimit !== undefined) {
-        if (!Number.isInteger(resources.pidsLimit) || resources.pidsLimit < 1) {
+        if (!Number.isInteger(resources.pidsLimit) || resources.pidsLimit < 1 || resources.pidsLimit > MAX_PIDS_LIMIT) {
             throw new RuntimePolicyError(`${label}.pidsLimit: invalid value`);
         }
     }
@@ -184,7 +185,7 @@ function validatePolicyShape(policy, label, options = {}) {
     return normalized;
 }
 
-function safetyFloor() {
+function policyDefaults() {
     return {
         ipc: 'default',
     };
@@ -213,7 +214,7 @@ function mergePolicy(base, overlay) {
 
 function buildEffectivePolicy(sources, options = {}) {
     const layers = [
-        safetyFloor(),
+        policyDefaults(),
         validatePolicyShape(sources.manifestPolicy || null, 'manifest.llmRuntime.runtimePolicy', options),
         validatePolicyShape(sources.catalogPolicy || null, 'catalog.runtimePolicy', options),
         validatePolicyShape(sources.profilePolicy || null, 'profile.llmRuntime.runtimePolicy', options),
@@ -316,6 +317,6 @@ export {
     computeRuntimePolicyHash,
     emitRunArgs,
     mergePolicy,
-    safetyFloor,
+    policyDefaults,
     validatePolicyShape,
 };

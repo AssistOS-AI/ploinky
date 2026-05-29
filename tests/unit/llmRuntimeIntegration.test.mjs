@@ -82,7 +82,14 @@ test('prepareLlmStartup selects catalog architecture and writes state file', () 
                 PLOINKY_LLM_FORCE_PLATFORM: 'linux/amd64',
             },
             agentWorkDirRoot: agentsRoot,
-            manifestEnvNames: ['HF_TOKEN', 'PLOINKY_AGENT_PRINCIPAL'],
+            manifestEnvNames: [
+                'HF_TOKEN',
+                'HUGGING_FACE_HUB_TOKEN',
+                'OPENAI_API_KEY',
+                'ANTHROPIC_API_KEY',
+                'PLOINKY_MASTER_KEY',
+                'PLOINKY_AGENT_PRINCIPAL',
+            ],
             envHash: 'envhash-abc',
             effectiveNetwork: null,
         });
@@ -108,6 +115,10 @@ test('prepareLlmStartup selects catalog architecture and writes state file', () 
         assert.equal(stateJson.catalog.id, 'test/catalog');
         assert.ok(Array.isArray(stateJson.envExposed));
         assert.ok(!stateJson.envExposed.includes('HF_TOKEN'));
+        assert.ok(!stateJson.envExposed.includes('HUGGING_FACE_HUB_TOKEN'));
+        assert.ok(!stateJson.envExposed.includes('OPENAI_API_KEY'));
+        assert.ok(!stateJson.envExposed.includes('ANTHROPIC_API_KEY'));
+        assert.ok(!stateJson.envExposed.includes('PLOINKY_MASTER_KEY'));
         assert.ok(stateJson.envExposed.includes('PLOINKY_AGENT_PRINCIPAL'));
     });
 });

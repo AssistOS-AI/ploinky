@@ -20,9 +20,34 @@ const ALLOWED_DEVICE_TYPES = ['cdi', 'hostDevice'];
 const ALLOWED_SECURITY_OPT = new Set(['label=disable']);
 const ALLOWED_IPC = new Set(['default', 'host']);
 const HOST_DEVICE_PATH_RE = /^\/dev\/[A-Za-z0-9._/-]+$/;
+const ARCHITECTURE_PATH_RE = /^architectures\/[A-Za-z0-9._-]+\.json$/;
+const IMAGE_PATH_RE = /^images\/[A-Za-z0-9._-]+\.json$/;
 const SIZE_RE = /^[0-9]+[bkmgtBKMGT]?$/;
 const CPU_RE = /^[0-9]+(\.[0-9]+)?$/;
 const GPUS_RE = /^all$|^device=[A-Za-z0-9._,-]+$/;
+const MAX_PIDS_LIMIT = 1048576;
+const CATALOG_VALIDATION_CONTRACT = Object.freeze({
+    catalogKeys: Object.freeze(['schemaVersion', 'catalogId', 'updatedAt', 'defaultFallback', 'architectures', 'images']),
+    catalogEntryKeys: Object.freeze(['id', 'path']),
+    architectureKeys: Object.freeze(['id', 'status', 'platform', 'accelerator', 'match', 'image', 'runtimePolicy', 'engineDefaults', 'fallbackPriority']),
+    architectureStatuses: Object.freeze(['stable', 'experimental']),
+    platforms: Object.freeze(ALLOWED_PLATFORMS.slice()),
+    acceleratorKeys: Object.freeze(['family', 'minimumComputeCapability']),
+    acceleratorFamilies: Object.freeze(ALLOWED_ACCELERATORS.slice()),
+    matchKeys: Object.freeze(['requiredProbes', 'containerRuntimes']),
+    containerRuntimes: Object.freeze(ALLOWED_CONTAINER_RUNTIMES.slice()),
+    runtimePolicyKeys: Object.freeze(['platform', 'resources', 'devices', 'securityOpt', 'ipc', 'gpus']),
+    resourceKeys: Object.freeze(['memory', 'cpus', 'pidsLimit', 'shmSize', 'ulimits']),
+    ulimitKeys: Object.freeze(['memlock']),
+    memlockKeys: Object.freeze(['soft', 'hard']),
+    deviceKeys: Object.freeze(['type', 'value', 'hostPath']),
+    deviceTypes: Object.freeze(ALLOWED_DEVICE_TYPES.slice()),
+    securityOpt: Object.freeze(Array.from(ALLOWED_SECURITY_OPT)),
+    ipc: Object.freeze(Array.from(ALLOWED_IPC)),
+    imageKeys: Object.freeze(['id', 'ref', 'digest', 'platform', 'build']),
+    imageBuildKeys: Object.freeze(['context', 'dockerfile']),
+    engineDefaultKeys: Object.freeze(['enginePort', 'runtimePort']),
+});
 
 class CatalogValidationError extends Error {
     constructor(message, details = {}) {
@@ -89,34 +114,29 @@ function ensurePathInsideRoot(candidatePath, root, label) {
 function validateRuntimePolicy(policy, label) {
     if (policy === undefined || policy === null) return null;
     ensureObject(policy, `${label}.runtimePolicy`);
-    const allowed = new Set([
-        'platform', 'resources', 'devices', 'securityOpt', 'ipc', 'gpus',
-    ]);
-    rejectUnknownKeys(policy, allowed, `${label}.runtimePolicy`);
+    rejectUnknownKeys(policy, new Set(CATALOG_VALIDATION_CONTRACT.runtimePolicyKeys), `${label}.runtimePolicy`);
 
     if (policy.platform !== undefined && !ALLOWED_PLATFORMS.includes(policy.platform)) {
         throw new CatalogValidationError(`${label}.runtimePolicy.platform: unsupported`);
     }
     if (policy.resources !== undefined) {
         ensureObject(policy.resources, `${label}.runtimePolicy.resources`);
-        rejectUnknownKeys(policy.resources, new Set([
-            'memory', 'cpus', 'pidsLimit', 'shmSize', 'ulimits',
-        ]), `${label}.runtimePolicy.resources`);
+        rejectUnknownKeys(policy.resources, new Set(CATALOG_VALIDATION_CONTRACT.resourceKeys), `${label}.runtimePolicy.resources`);
         if (policy.resources.memory !== undefined) ensureStringPattern(policy.resources.memory, SIZE_RE, `${label}.runtimePolicy.resources.memory`);
         if (policy.resources.cpus !== undefined) ensureStringPattern(policy.resources.cpus, CPU_RE, `${label}.runtimePolicy.resources.cpus`);
         if (policy.resources.shmSize !== undefined) ensureStringPattern(policy.resources.shmSize, SIZE_RE, `${label}.runtimePolicy.resources.shmSize`);
         if (policy.resources.pidsLimit !== undefined) {
-            if (!Number.isInteger(policy.resources.pidsLimit) || policy.resources.pidsLimit < 1) {
+            if (!Number.isInteger(policy.resources.pidsLimit) || policy.resources.pidsLimit < 1 || policy.resources.pidsLimit > MAX_PIDS_LIMIT) {
                 throw new CatalogValidationError(`${label}.runtimePolicy.resources.pidsLimit: invalid`);
             }
         }
         if (policy.resources.ulimits !== undefined) {
             ensureObject(policy.resources.ulimits, `${label}.runtimePolicy.resources.ulimits`);
-            rejectUnknownKeys(policy.resources.ulimits, new Set(['memlock']), `${label}.runtimePolicy.resources.ulimits`);
+            rejectUnknownKeys(policy.resources.ulimits, new Set(CATALOG_VALIDATION_CONTRACT.ulimitKeys), `${label}.runtimePolicy.resources.ulimits`);
             if (policy.resources.ulimits.memlock !== undefined) {
                 const memlock = policy.resources.ulimits.memlock;
                 ensureObject(memlock, `${label}.runtimePolicy.resources.ulimits.memlock`);
-                rejectUnknownKeys(memlock, new Set(['soft', 'hard']), `${label}.runtimePolicy.resources.ulimits.memlock`);
+                rejectUnknownKeys(memlock, new Set(CATALOG_VALIDATION_CONTRACT.memlockKeys), `${label}.runtimePolicy.resources.ulimits.memlock`);
                 if (!Number.isInteger(memlock.soft) || memlock.soft < -1) {
                     throw new CatalogValidationError(`${label}.runtimePolicy.resources.ulimits.memlock.soft: invalid`);
                 }
@@ -131,7 +151,7 @@ function validateRuntimePolicy(policy, label) {
         for (const [idx, dev] of policy.devices.entries()) {
             const devLabel = `${label}.runtimePolicy.devices[${idx}]`;
             ensureObject(dev, devLabel);
-            rejectUnknownKeys(dev, new Set(['type', 'value', 'hostPath']), devLabel);
+            rejectUnknownKeys(dev, new Set(CATALOG_VALIDATION_CONTRACT.deviceKeys), devLabel);
             if (!ALLOWED_DEVICE_TYPES.includes(dev.type)) {
                 throw new CatalogValidationError(`${devLabel}.type: unsupported`);
             }
@@ -168,27 +188,28 @@ function validateRuntimePolicy(policy, label) {
 
 function validateArchitectureRecord(record, label) {
     ensureObject(record, label);
-    const allowed = new Set([
-        'id', 'status', 'platform', 'accelerator', 'match', 'image',
-        'runtimePolicy', 'engineDefaults', 'fallbackPriority',
-    ]);
-    rejectUnknownKeys(record, allowed, label);
+    rejectUnknownKeys(record, new Set(CATALOG_VALIDATION_CONTRACT.architectureKeys), label);
 
     ensureStringPattern(record.id, ARCH_ID_RE, `${label}.id`);
-    if (!['stable', 'experimental'].includes(record.status)) {
+    if (!CATALOG_VALIDATION_CONTRACT.architectureStatuses.includes(record.status)) {
         throw new CatalogValidationError(`${label}.status: must be stable|experimental`);
     }
     if (!ALLOWED_PLATFORMS.includes(record.platform)) {
         throw new CatalogValidationError(`${label}.platform: unsupported`);
     }
     ensureObject(record.accelerator, `${label}.accelerator`);
-    rejectUnknownKeys(record.accelerator, new Set(['family', 'minimumComputeCapability']), `${label}.accelerator`);
+    rejectUnknownKeys(record.accelerator, new Set(CATALOG_VALIDATION_CONTRACT.acceleratorKeys), `${label}.accelerator`);
     if (!ALLOWED_ACCELERATORS.includes(record.accelerator.family)) {
         throw new CatalogValidationError(`${label}.accelerator.family: unsupported`);
     }
+    if (record.accelerator.minimumComputeCapability !== undefined) {
+        if (typeof record.accelerator.minimumComputeCapability !== 'string' || record.accelerator.minimumComputeCapability.length > 16) {
+            throw new CatalogValidationError(`${label}.accelerator.minimumComputeCapability: invalid`);
+        }
+    }
     if (record.match !== undefined) {
         ensureObject(record.match, `${label}.match`);
-        rejectUnknownKeys(record.match, new Set(['requiredProbes', 'containerRuntimes']), `${label}.match`);
+        rejectUnknownKeys(record.match, new Set(CATALOG_VALIDATION_CONTRACT.matchKeys), `${label}.match`);
         if (record.match.requiredProbes !== undefined) {
             ensureArray(record.match.requiredProbes, `${label}.match.requiredProbes`);
             for (const probe of record.match.requiredProbes) {
@@ -210,7 +231,7 @@ function validateArchitectureRecord(record, label) {
     validateRuntimePolicy(record.runtimePolicy, label);
     if (record.engineDefaults !== undefined) {
         ensureObject(record.engineDefaults, `${label}.engineDefaults`);
-        rejectUnknownKeys(record.engineDefaults, new Set(['enginePort', 'runtimePort']), `${label}.engineDefaults`);
+        rejectUnknownKeys(record.engineDefaults, new Set(CATALOG_VALIDATION_CONTRACT.engineDefaultKeys), `${label}.engineDefaults`);
         for (const portField of ['enginePort', 'runtimePort']) {
             if (record.engineDefaults[portField] !== undefined) {
                 const port = record.engineDefaults[portField];
@@ -230,7 +251,7 @@ function validateArchitectureRecord(record, label) {
 
 function validateImageRecord(record, label) {
     ensureObject(record, label);
-    rejectUnknownKeys(record, new Set(['id', 'ref', 'digest', 'platform', 'build']), label);
+    rejectUnknownKeys(record, new Set(CATALOG_VALIDATION_CONTRACT.imageKeys), label);
     ensureStringPattern(record.id, ARCH_ID_RE, `${label}.id`);
     if (typeof record.ref !== 'string' || record.ref.length < 1 || record.ref.length > 512) {
         throw new CatalogValidationError(`${label}.ref: invalid`);
@@ -245,17 +266,21 @@ function validateImageRecord(record, label) {
     }
     if (record.build !== undefined) {
         ensureObject(record.build, `${label}.build`);
-        rejectUnknownKeys(record.build, new Set(['context', 'dockerfile']), `${label}.build`);
+        rejectUnknownKeys(record.build, new Set(CATALOG_VALIDATION_CONTRACT.imageBuildKeys), `${label}.build`);
+        for (const field of CATALOG_VALIDATION_CONTRACT.imageBuildKeys) {
+            if (record.build[field] !== undefined) {
+                if (typeof record.build[field] !== 'string' || record.build[field].length > 256) {
+                    throw new CatalogValidationError(`${label}.build.${field}: invalid`);
+                }
+            }
+        }
     }
     return record;
 }
 
 function validateCatalogRoot(catalog) {
     ensureObject(catalog, 'catalog.json');
-    rejectUnknownKeys(catalog, new Set([
-        'schemaVersion', 'catalogId', 'updatedAt', 'defaultFallback',
-        'architectures', 'images',
-    ]), 'catalog.json');
+    rejectUnknownKeys(catalog, new Set(CATALOG_VALIDATION_CONTRACT.catalogKeys), 'catalog.json');
 
     if (catalog.schemaVersion !== 1) {
         throw new CatalogValidationError('catalog.json.schemaVersion: must be 1');
@@ -263,12 +288,25 @@ function validateCatalogRoot(catalog) {
     if (typeof catalog.catalogId !== 'string' || catalog.catalogId.length < 1 || catalog.catalogId.length > 200) {
         throw new CatalogValidationError('catalog.json.catalogId: invalid');
     }
+    if (catalog.updatedAt !== undefined) {
+        if (typeof catalog.updatedAt !== 'string' || catalog.updatedAt.length > 64) {
+            throw new CatalogValidationError('catalog.json.updatedAt: invalid');
+        }
+    }
     ensureArray(catalog.architectures, 'catalog.json.architectures', { minItems: 1 });
     ensureArray(catalog.images, 'catalog.json.images', { minItems: 1 });
     if (catalog.defaultFallback !== undefined) {
         ensureStringPattern(catalog.defaultFallback, ARCH_ID_RE, 'catalog.json.defaultFallback');
     }
     return catalog;
+}
+
+function validateCatalogEntry(entry, label, pathRegex) {
+    ensureObject(entry, label);
+    rejectUnknownKeys(entry, new Set(CATALOG_VALIDATION_CONTRACT.catalogEntryKeys), label);
+    ensureStringPattern(entry.id, ARCH_ID_RE, `${label}.id`);
+    ensureStringPattern(entry.path, pathRegex, `${label}.path`);
+    return entry;
 }
 
 function readDirHashSnapshot(rootPath) {
@@ -376,7 +414,8 @@ function loadCatalog(options = {}) {
     const catalog = validateCatalogRoot(catalogRaw);
 
     const architectures = new Map();
-    for (const entry of catalog.architectures) {
+    for (const [idx, rawEntry] of catalog.architectures.entries()) {
+        const entry = validateCatalogEntry(rawEntry, `catalog.json.architectures[${idx}]`, ARCHITECTURE_PATH_RE);
         const archPath = ensurePathInsideRoot(entry.path, resolvedRoot, `catalog.json.architectures[${entry.id}]`);
         const archRaw = readJsonFile(archPath, `architectures/${entry.id}`);
         const archRecord = validateArchitectureRecord(archRaw, `architectures/${entry.id}`);
@@ -392,7 +431,8 @@ function loadCatalog(options = {}) {
     }
 
     const images = new Map();
-    for (const entry of catalog.images) {
+    for (const [idx, rawEntry] of catalog.images.entries()) {
+        const entry = validateCatalogEntry(rawEntry, `catalog.json.images[${idx}]`, IMAGE_PATH_RE);
         const imgPath = ensurePathInsideRoot(entry.path, resolvedRoot, `catalog.json.images[${entry.id}]`);
         const imgRaw = readJsonFile(imgPath, `images/${entry.id}`);
         const imgRecord = validateImageRecord(imgRaw, `images/${entry.id}`);
@@ -447,12 +487,14 @@ function loadCatalog(options = {}) {
 }
 
 export {
+    CATALOG_VALIDATION_CONTRACT,
     CatalogValidationError,
     DEFAULT_CATALOG_PATH,
     loadCatalog,
     resolveCatalogRootFromEnv,
     validateArchitectureRecord,
     validateCatalogRoot,
+    validateCatalogEntry,
     validateImageRecord,
     validateRuntimePolicy,
 };

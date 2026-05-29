@@ -92,7 +92,7 @@ test('loadCatalog rejects path traversal in architecture references', () => {
         }));
         assert.throws(
             () => loadCatalog({ env: { PLOINKY_LLM_ARCHITECTURES_PATH: tmp } }),
-            /escapes catalog root|architectures\/\.\.\/\.\./i,
+            /catalog\.json\.architectures\[0\]\.path: invalid value|escapes catalog root/i,
         );
     } finally {
         fs.rmSync(tmp, { recursive: true, force: true });

@@ -125,12 +125,31 @@ function writeWorkspaceConfig(ploinkyDir, servicePort) {
     }, null, 2));
 }
 
-async function withRouterModules(t, servicePort) {
+function writeBrokenPrincipalConfig(ploinkyDir, servicePort) {
+    writeFileSync(path.join(ploinkyDir, 'agents.json'), JSON.stringify({}, null, 2));
+    writeFileSync(path.join(ploinkyDir, 'routing.json'), JSON.stringify({
+        routes: {
+            brokenService: {
+                hostPort: servicePort,
+                httpServices: [
+                    {
+                        slug: 'broken',
+                        externalPrefix: '/services/broken/',
+                        internalPrefix: '/broken/',
+                        auth: 'protected',
+                    },
+                ],
+            },
+        },
+    }, null, 2));
+}
+
+async function withRouterModules(t, servicePort, writeConfig = writeWorkspaceConfig) {
     const workspace = mkdtempSync(path.join(os.tmpdir(), 'ploinky-http-service-'));
     const ploinkyDir = path.join(workspace, '.ploinky');
     mkdirSync(ploinkyDir, { recursive: true });
     writeFileSync(path.join(ploinkyDir, '.secrets'), '# test secrets\n');
-    writeWorkspaceConfig(ploinkyDir, servicePort);
+    writeConfig(ploinkyDir, servicePort);
 
     const previousCwd = process.cwd();
     const previousMasterKey = process.env.PLOINKY_MASTER_KEY;
@@ -239,6 +258,42 @@ test('protected HTTP service falls back to static auth and injects router auth i
     });
     assert.equal(verified.payload.caller, 'router:first-party');
     assert.equal(verified.payload.usr?.username, 'admin');
+});
+
+test('protected HTTP service fails closed when invocation principal cannot be resolved', async (t) => {
+    let reached = false;
+    const upstream = http.createServer((_req, res) => {
+        reached = true;
+        res.writeHead(200, { 'Content-Type': 'text/plain' });
+        res.end('unexpected');
+    });
+    const servicePort = await listen(upstream);
+    t.after(async () => {
+        await close(upstream);
+    });
+
+    const { routerHandlers } = await withRouterModules(t, servicePort, writeBrokenPrincipalConfig);
+    const req = makeRequest({
+        url: '/services/broken/session',
+    });
+    req.user = {
+        id: 'local:admin',
+        username: 'admin',
+        roles: ['local', 'admin'],
+    };
+    req.sessionId = 'session-1';
+    const res = new MockWritableResponse();
+    const parsedUrl = new URL(req.url, 'http://localhost');
+
+    const handled = routerHandlers.handleHttpServiceRoute(req, res, parsedUrl);
+    assert.equal(handled, true);
+    await res.done;
+
+    assert.equal(reached, false);
+    assert.equal(res.statusCode, 500);
+    const body = JSON.parse(res.body);
+    assert.equal(body.error, 'http_service_invocation_unavailable');
+    assert.match(body.message, /could not resolve provider 'brokenService'/);
 });
 
 test('protected HTTP service auth info carries user identity', async () => {

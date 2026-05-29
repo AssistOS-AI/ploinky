@@ -97,14 +97,14 @@ Non-LLM agents are unchanged and continue to carry only `ploinky.envhash`.
 
 The agent-owned `agent-models.json` describes profiles and launcher candidates. Each profile lists one or more candidates with a launcher name, optional priority, and optional `requiredAccelerators` list. The in-container runtime validates the document, intersects candidates with discovered launchers (`modelLauncher_*.sh describe`) and the selected architecture's accelerator family, and picks the first eligible candidate. Priority overrides are applied through MCP tools exposed by the shared AgentServer sidecar and stored under `/runtime/priority-overrides.json`. Ploinky core does not read these files.
 
-LLM runtime agents use a three-port internal layout. The public agent port is `9000` and is served by a lightweight proxy. The proxy forwards `/mcp` to the shared AgentServer sidecar on `9001`, and forwards `/health`, `/agent-card`, `/runtime/*`, and `/v1/chat/completions` to the runtime control service on `9002`. State-changing orchestration should use MCP tools; `/runtime/*` remains a diagnostic compatibility surface.
+LLM runtime agents use a three-port internal layout. The public agent port is `9000` and is served by a lightweight proxy. The proxy forwards `/mcp` to the shared AgentServer sidecar on `9001`, and forwards `/health`, `/agent-card`, `/runtime/*`, and `/v1/chat/completions` to the runtime control service on `9002`. The control service must bind to container loopback only; the proxy is the only intended listener for other containers or host-published traffic. State-changing orchestration should use MCP tools; `/runtime/*` remains a diagnostic compatibility surface.
 
 ## Decisions & Questions
 
 ### Question #1: Why is the architecture catalog an external repository rather than data baked into Ploinky?
 
 Response:
-Hardware support, image references, and runtime policy recommendations need to evolve faster and more independently than Ploinky's runtime contract. Keeping the catalog outside Ploinky lets operators fork it, pin it to a specific commit, or replace it entirely without modifying Ploinky. The selection contract — strict schema, no executable hooks, no raw container args — is enforced by Ploinky regardless of the catalog source.
+Hardware support, image references, and runtime policy recommendations need to evolve faster and more independently than Ploinky's runtime contract. Keeping the catalog outside Ploinky lets operators fork it, pin it to a specific commit, or replace it entirely without modifying Ploinky. The selection contract — strict JSON-schema-equivalent validation, no executable hooks, no raw container args — is enforced by Ploinky regardless of the catalog source, with catalog tests keeping the published schemas in parity with Ploinky's runtime validators.
 
 ### Question #2: Why is the runtime policy contract typed and allowlisted instead of allowing pass-through container flags?
 

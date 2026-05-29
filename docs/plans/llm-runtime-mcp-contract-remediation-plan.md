@@ -426,7 +426,7 @@ Update these manifests:
 Required changes:
 
 - Replace `start: "node /Agent/llm-runtime/runtime-agent/mcp-server.mjs"` with:
-  - `start: "sh /Agent/llm-runtime/runtime-agent/start-runtime-agent.sh"`
+  - `start: "bash /Agent/llm-runtime/runtime-agent/start-runtime-agent.sh"`
 - Keep the public manifest port mapped to container port `9000`.
 - Add `readiness.protocol = "mcp"` for LLM runtime agents.
 - Correct agent-card metadata to the form expected by the shared AgentServer if the AgentServer becomes the source of `/agent-card` later:

@@ -10,13 +10,9 @@ import {
     emitRunArgs,
 } from './containerRuntimePolicy.js';
 import { detectHardware } from './hardwareDetection.js';
+import { isSensitiveEnvVariableName } from './secretVars.js';
 
 const SAFE_AGENT_KEY_RE = /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$/;
-const REDACTED_ENV_NAMES = new Set([
-    'HF_TOKEN',
-    'HUGGINGFACE_TOKEN',
-    'HUGGINGFACEHUB_API_TOKEN',
-]);
 
 function isLlmRuntimeManifest(manifest, profileConfig) {
     const profileFlag = profileConfig?.llmRuntime?.enabled === true;
@@ -28,28 +24,6 @@ function extractManifestPolicy(manifest, profileConfig) {
     const profilePolicy = profileConfig?.llmRuntime?.runtimePolicy;
     const manifestPolicy = manifest?.llmRuntime?.runtimePolicy;
     return profilePolicy || manifestPolicy || null;
-}
-
-function redactedEnvForRecord(env, manifest, profileConfig) {
-    if (!env || typeof env !== 'object') return {};
-    const allowed = new Set();
-    const collect = (envSpec) => {
-        if (!Array.isArray(envSpec)) return;
-        for (const entry of envSpec) {
-            const name = typeof entry === 'string' ? entry : entry?.name;
-            if (typeof name === 'string' && name) allowed.add(name);
-        }
-    };
-    collect(manifest?.env);
-    collect(profileConfig?.env);
-    const out = {};
-    for (const name of allowed) {
-        if (REDACTED_ENV_NAMES.has(name)) continue;
-        if (Object.prototype.hasOwnProperty.call(env, name)) {
-            out[name] = env[name];
-        }
-    }
-    return out;
 }
 
 function safeIdentity({ agentName, alias }) {
@@ -93,7 +67,9 @@ function buildSelectedArchitectureState({ selection, hardware, policy, policyHas
             probes: safeProbes,
         },
         explanation: selection.explanation || {},
-        envExposed: Array.isArray(manifestEnvNames) ? manifestEnvNames.filter((name) => !REDACTED_ENV_NAMES.has(name)) : [],
+        envExposed: Array.isArray(manifestEnvNames)
+            ? manifestEnvNames.filter((name) => !isSensitiveEnvVariableName(name))
+            : [],
     };
 }
 
@@ -228,5 +204,4 @@ function prepareLlmStartup(input) {
 export {
     isLlmRuntimeManifest,
     prepareLlmStartup,
-    redactedEnvForRecord,
 };
