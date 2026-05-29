@@ -2,8 +2,6 @@ import { initDom } from './domSetup.js';
 import { createSidePanel } from './sidePanel.js';
 import { createMessages } from './messages.js';
 import { createComposer } from './composer.js';
-import { initSpeechToText } from './speechToText.js';
-import { initTextToSpeech } from './textToSpeech.js';
 import { createNetwork } from './network.js';
 import { createUploader } from './upload.js';
 import { createComposerAutocomplete } from './composerAutocomplete.js';
@@ -12,7 +10,6 @@ import { createWorkspacePathsProvider } from './autocompleteProviders/workspaceP
 import { createAutocompleteState } from './autocompleteState.js';
 import { createComposerMentionHighlighter } from './composerMentionHighlights.js';
 
-const SEND_TRIGGER_RE = /\bsend\b/i;
 const PURGE_TRIGGER_RE = /\bpurge\b/i;
 const EDITABLE_TAGS = ['INPUT', 'TEXTAREA', 'SELECT', 'OPTION'];
 
@@ -45,17 +42,8 @@ const {
     statusDot,
     cmdInput,
     sendBtn,
-    sttBtn,
-    sttStatus,
-    sttLang,
-    sttEnable,
-    ttsEnable,
-    ttsVoice,
-    ttsRate,
-    ttsRateValue,
     settingsBtn,
     logoutBtn,
-    settingsPanel,
     attachmentBtn,
     attachmentMenu,
     uploadFileBtn,
@@ -78,13 +66,6 @@ const sidePanelApi = createSidePanel({
     sidePanelResizer
 }, { markdown });
 
-const textToSpeech = initTextToSpeech({
-    ttsEnable,
-    ttsVoice,
-    ttsRate,
-    ttsRateValue
-}, { dlog, toEndpoint, provider: dom.ttsProvider });
-
 const messages = createMessages({
     chatList,
     typingIndicator
@@ -92,7 +73,6 @@ const messages = createMessages({
     markdown,
     initialViewMoreLineLimit: getViewMoreLineLimit(),
     sidePanel: sidePanelApi,
-    onServerOutput: textToSpeech.handleServerOutput,
     onQuickCommand: null,
     onTypingStateChange: (typing) => {
         composer.setProcessingState(Boolean(typing));
@@ -546,7 +526,6 @@ function initMessageToolbar() {
 
 refocusComposerAfterIcon(attachmentBtn);
 refocusComposerAfterIcon(settingsBtn);
-refocusComposerAfterIcon(sttBtn);
 initMessageToolbar();
 
 function resolveLogoutRedirect(payload) {
@@ -617,21 +596,6 @@ messages.setQuickCommandHandler((command) => {
     // Route quick actions through the same path as user typing + Send.
     composer.setValue(command);
     return composer.submit();
-});
-
-initSpeechToText({
-    sttBtn,
-    sttStatus,
-    sttLang,
-    sttEnable,
-    settingsBtn,
-    settingsPanel
-}, {
-    composer,
-    purgeTriggerRe: PURGE_TRIGGER_RE,
-    sendTriggerRe: SEND_TRIGGER_RE,
-    dlog,
-    provider: dom.sttProvider
 });
 
 const isEditableTarget = (target) => {

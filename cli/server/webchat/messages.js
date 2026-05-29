@@ -18,7 +18,6 @@ export function createMessages({
     markdown,
     initialViewMoreLineLimit,
     sidePanel,
-    onServerOutput,
     onQuickCommand,
     onTypingStateChange
 }) {
@@ -26,10 +25,8 @@ export function createMessages({
     let userInputSent = false;
     let lastClientCommand = '';
     let viewMoreLineLimit = Math.max(1, initialViewMoreLineLimit || 1);
-    let serverSpeechHandler = typeof onServerOutput === 'function' ? onServerOutput : null;
     let quickCommandHandler = typeof onQuickCommand === 'function' ? onQuickCommand : null;
     let typingStateHandler = typeof onTypingStateChange === 'function' ? onTypingStateChange : null;
-    let speechDebounceTimer = null;
     let autoScrollLocked = true;
     let programmaticScroll = false;
     let pendingProgressItems = [];
@@ -1030,35 +1027,6 @@ export function createMessages({
         });
     }
 
-    function emitServerOutput(text) {
-        if (!serverSpeechHandler) {
-            return;
-        }
-        const safe = typeof text === 'string' ? text.trim() : '';
-        if (!safe) {
-            return;
-        }
-        try {
-            serverSpeechHandler(safe);
-        } catch (error) {
-            console.warn('[webchat] tts handler error:', error);
-        }
-    }
-
-    function scheduleSpeech(text) {
-        if (!serverSpeechHandler) {
-            return;
-        }
-        if (speechDebounceTimer) {
-            clearTimeout(speechDebounceTimer);
-        }
-        const captured = typeof text === 'string' ? text : '';
-        speechDebounceTimer = setTimeout(() => {
-            speechDebounceTimer = null;
-            emitServerOutput(captured);
-        }, 250);
-    }
-
     function addClientMsg(text) {
         lastClientCommand = text;
         const wrapper = document.createElement('div');
@@ -1332,7 +1300,6 @@ export function createMessages({
                 attachProgressPanel(lastServerMsg.bubble, pendingProgressItems);
                 resetProgressEvents();
             }
-            scheduleSpeech(combined);
         } else {
             const wrapper = document.createElement('div');
             wrapper.className = 'wa-message in';
@@ -1355,7 +1322,6 @@ export function createMessages({
                 timeNode.textContent = formatTime();
             }
             appendMessageEl(wrapper);
-            scheduleSpeech(normalized);
         }
 
         scrollToBottomIfLocked();
@@ -1382,13 +1348,6 @@ export function createMessages({
         markUserInputSent: () => {
             userInputSent = true;
             resetProgressEvents();
-        },
-        setServerSpeechHandler: (fn) => {
-            serverSpeechHandler = typeof fn === 'function' ? fn : null;
-            if (!serverSpeechHandler && speechDebounceTimer) {
-                clearTimeout(speechDebounceTimer);
-                speechDebounceTimer = null;
-            }
         },
         setQuickCommandHandler: (fn) => {
             quickCommandHandler = typeof fn === 'function' ? fn : null;

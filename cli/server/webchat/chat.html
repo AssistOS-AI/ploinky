@@ -8,19 +8,7 @@
 </head>
 <body data-page="chat" data-theme="explorer" data-agent="__AGENT_NAME__" data-title="__DISPLAY_NAME__"
       data-runtime="__RUNTIME__" data-auth="__REQUIRES_AUTH__" data-base="__BASE_PATH__"
-      data-tts-provider="__TTS_PROVIDER__" data-stt-provider="__STT_PROVIDER__" data-agent-query="__AGENT_QUERY__">
-<svg width="0" height="0" style="position:absolute" aria-hidden="true" focusable="false">
-    <defs>
-        <symbol id="i-mic" viewBox="0 0 24 24">
-            <path d="M12 2.25a3 3 0 0 0-3 3v6a3 3 0 0 0 6 0v-6a3 3 0 0 0-3-3z"/>
-            <path d="M5.25 11.25a.75.75 0 0 1 1.5 0 5.25 5.25 0 0 0 10.5 0 .75.75 0 0 1 1.5 0 6.75 6.75 0 0 1-6 6.708V21a.75.75 0 0 1-1.5 0v-3.042a6.75 6.75 0 0 1-6-6.708z"/>
-        </symbol>
-        <symbol id="i-mic-off" viewBox="0 0 24 24">
-            <path d="M15 10.78V5a3 3 0 0 0-5.248-1.936l8.968 8.968A4.5 4.5 0 0 0 15 10.78z"/>
-            <path d="M19.22 19.22a.75.75 0 0 1-1.06 0l-1.414-1.415A6.718 6.718 0 0 1 12 18.75V21a.75.75 0 0 1-1.5 0v-2.25a6.752 6.752 0 0 1-5.25-6.592.75.75 0 0 1 1.5 0 5.25 5.25 0 0 0 5.25 5.25c.892 0 1.735-.22 2.475-.607l-1.54-1.54A3 3 0 0 1 9 12.75V10.5a.75.75 0 0 1 1.5 0v2.25a1.5 1.5 0 0 0 2.506 1.1l-7.7-7.7a.75.75 0 0 1 1.06-1.06l12.854 12.85a.75.75 0 0 1 0 1.06z"/>
-        </symbol>
-    </defs>
-</svg>
+      data-agent-query="__AGENT_QUERY__">
 <div class="wa-header">
     <div class="wa-header-avatar">
         <span id="avatarInitial"></span>
@@ -48,31 +36,6 @@
 </div>
 
 <div class="wa-settings-panel" id="settingsPanel">
-    <div class="wa-settings-section">
-        <div class="wa-settings-header">Voice</div>
-        <label class="wa-settings-row">
-            <input type="checkbox" id="sttEnable"/>
-            <span>Enable speech dictation</span>
-        </label>
-        <label class="wa-settings-row">
-            <span class="wa-settings-label">Recognition language</span>
-            <select id="sttLang"></select>
-        </label>
-        <label class="wa-settings-row">
-            <input type="checkbox" id="ttsEnable"/>
-            <span>Enable spoken replies</span>
-        </label>
-        <label class="wa-settings-row">
-            <span class="wa-settings-label">Voice</span>
-            <select id="ttsVoice"></select>
-        </label>
-        <label class="wa-settings-row">
-            <span class="wa-settings-label">Speech rate</span>
-            <input type="range" id="ttsRate" min="0.5" max="2" step="0.1" value="1"/>
-            <span class="wa-settings-value" id="ttsRateValue">1.0×</span>
-        </label>
-    </div>
-    <div class="wa-settings-divider"></div>
     <div class="wa-settings-section">
         <div class="wa-settings-header">Appearance</div>
         <label class="wa-settings-row">
@@ -163,16 +126,6 @@
                     <span>Camera</span>
                 </button>
             </div>
-        </div>
-        <div class="wa-voice-control">
-            <button class="wa-icon-btn" id="sttBtn" title="Voice input" aria-pressed="false">
-        <span class="wa-mic-icon on" aria-hidden="true">
-          <svg width="24" height="24" role="img" aria-label="Microphone"><use href="#i-mic"/></svg>
-        </span>
-                <span class="wa-mic-icon off" aria-hidden="true">
-          <svg width="24" height="24" role="img" aria-label="Mute"><use href="#i-mic-off"/></svg>
-        </span>
-            </button>
         </div>
         <div class="wa-composer-input-wrapper">
       <textarea

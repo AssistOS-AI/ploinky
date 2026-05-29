@@ -5,7 +5,6 @@ const INITIAL_FOCUS_DELAY_MS = 120;
 
 export function createComposer({ cmdInput, sendBtn, cancelBtn }, { purgeTriggerRe }) {
     let onSend = null;
-    let onPurge = null;
     let onCancel = null;
     let isProcessing = false;
     const composerEl = cmdInput?.closest?.('.wa-composer') || null;
@@ -132,12 +131,8 @@ export function createComposer({ cmdInput, sendBtn, cancelBtn }, { purgeTriggerR
         focusAfterAction();
     }
 
-    function purge(options = {}) {
-        const { resetVoice = false } = options;
+    function purge() {
         clear();
-        if (typeof onPurge === 'function') {
-            onPurge({ resetVoice });
-        }
     }
 
     function submit() {
@@ -158,37 +153,6 @@ export function createComposer({ cmdInput, sendBtn, cancelBtn }, { purgeTriggerR
         }
         focusAfterAction();
         return false;
-    }
-
-    function appendVoiceText(addition) {
-        if (!cmdInput || !addition) {
-            return;
-        }
-        const current = cmdInput.value;
-        let insert = addition;
-        const additionHasLeadingSpace = /^\s/.test(insert);
-        const additionStartsPunct = /^[.,!?;:]/.test(insert);
-        if (!additionHasLeadingSpace && current && !/\s$/.test(current) && !additionStartsPunct) {
-            insert = ` ${insert}`;
-        }
-        const selStart = cmdInput.selectionStart;
-        const selEnd = cmdInput.selectionEnd;
-        const hadFocus = document.activeElement === cmdInput;
-        const prevScroll = cmdInput.scrollTop;
-        cmdInput.value = current + insert;
-        if (hadFocus) {
-            if (selStart !== current.length || selEnd !== current.length) {
-                cmdInput.setSelectionRange(selStart, selEnd);
-            } else {
-                const pos = cmdInput.value.length;
-                cmdInput.setSelectionRange(pos, pos);
-            }
-        }
-        cmdInput.scrollTop = prevScroll;
-        emitInputChange();
-        if (purgeTriggerRe.test(cmdInput.value)) {
-            purge({ resetVoice: true });
-        }
     }
 
     function typeFromKeyEvent(event) {
@@ -293,7 +257,6 @@ export function createComposer({ cmdInput, sendBtn, cancelBtn }, { purgeTriggerR
         submit,
         clear,
         purge,
-        appendVoiceText,
         setValue,
         getValue,
         autoResize,
@@ -302,9 +265,6 @@ export function createComposer({ cmdInput, sendBtn, cancelBtn }, { purgeTriggerR
         setProcessingState,
         setSendHandler: (handler) => {
             onSend = typeof handler === 'function' ? handler : null;
-        },
-        setPurgeHandler: (handler) => {
-            onPurge = typeof handler === 'function' ? handler : null;
         },
         setCancelHandler: (handler) => {
             onCancel = typeof handler === 'function' ? handler : null;

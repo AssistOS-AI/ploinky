@@ -56,19 +56,10 @@ export function initDom() {
     const sidePanelClose = document.getElementById('sidePanelClose');
     const sidePanelTitle = document.querySelector('.wa-side-panel-title');
     const sidePanelResizer = document.getElementById('sidePanelResizer');
-    const sttBtn = document.getElementById('sttBtn');
-    const sttStatus = document.getElementById('sttStatus');
-    const sttLang = document.getElementById('sttLang');
-    const sttEnable = document.getElementById('sttEnable');
     const settingsBtn = document.getElementById('settingsBtn');
     const logoutBtn = document.getElementById('logoutBtn');
     const settingsPanel = document.getElementById('settingsPanel');
     const viewMoreLinesInput = document.getElementById('viewMoreLines');
-    const ttsEnable = document.getElementById('ttsEnable');
-    const ttsVoice = document.getElementById('ttsVoice');
-    const ttsRate = document.getElementById('ttsRate');
-    const ttsRateValue = document.getElementById('ttsRateValue');
-
     const attachmentBtn = document.getElementById('attachmentBtn');
     const attachmentMenu = document.getElementById('attachmentMenu');
     const uploadFileBtn = document.getElementById('uploadFileBtn');
@@ -84,8 +75,6 @@ export function initDom() {
     const displayName = (body.dataset.title || '').trim();
     const basePath = (body.dataset.base || '').replace(/\/$/, '') || '';
     const agentQuery = (body.dataset.agentQuery || '').trim();
-    const ttsProvider = (body.dataset.ttsProvider || '').trim().toLowerCase();
-    const sttProvider = (body.dataset.sttProvider || '').trim().toLowerCase();
 
     const launchConfig = {};
     try {
@@ -215,8 +204,6 @@ export function initDom() {
         basePath,
         agentName,
         displayName: appTitle,
-        ttsProvider,
-        sttProvider,
         launchConfig,
         toEndpoint,
         showBanner,
@@ -244,14 +231,6 @@ export function initDom() {
             sidePanelClose,
             sidePanelTitle,
             sidePanelResizer,
-            sttBtn,
-            sttStatus,
-            sttLang,
-            sttEnable,
-            ttsEnable,
-            ttsVoice,
-            ttsRate,
-            ttsRateValue,
             settingsBtn,
             logoutBtn,
             settingsPanel,
