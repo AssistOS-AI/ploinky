@@ -3,7 +3,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import crypto from 'crypto';
 import { resolveWebchatCommandsForAgent } from '../webchat/commandResolver.js';
-import { parseCookies, buildCookie, appendSetCookie, parseMultipartFormData } from './common.js';
+import { parseCookies, buildCookie, appendSetCookie } from './common.js';
 import * as staticSrv from '../static/index.js';
 import { WORKSPACE_ROOT } from '../../services/config.js';
 import {
@@ -18,7 +18,6 @@ import {
     handleWebchatUploadPost,
     resolveWebchatUploadContext,
 } from './webchatUploads.js';
-import { createServerTtsStrategy } from './ttsStrategies/index.js';
 import { buildInvocationContextForProviderCall } from '../mcp-proxy/index.js';
 import {
     appendMessage as appendTranscriptMessage,
@@ -37,8 +36,6 @@ const SID_COOKIE = `${appName}_sid`;
 const STREAM_RECONNECT_GRACE_MS = 120000;
 const MAX_PENDING_SSE_EVENTS = 200;
 
-const DEFAULT_TTS_PROVIDER = (process.env.WEBCHAT_TTS_PROVIDER || 'browser').trim().toLowerCase();
-const DEFAULT_STT_PROVIDER = (process.env.WEBCHAT_STT_PROVIDER || 'browser').trim().toLowerCase();
 const PROCESS_PREFIX_RE = /^(?:\s*\.+\s*){3,}/;
 
 function renderTemplate(filenames, replacements) {
