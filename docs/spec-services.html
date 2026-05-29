@@ -459,85 +459,36 @@ function getExposedEnv(manifest) {
 /health                    // Server health check
 /upload                    // File upload endpoint
 /blobs                     // Blob storage endpoint
+/workspace-files           // Workspace-confined file reads
 /mcp                       // Root MCP endpoint
-/&lt;agent&gt;/mcp          // Per-agent MCP proxy
-/&lt;agent&gt;/task         // Per-agent task endpoint
+/&lt;agent&gt;/...          // Transparent per-agent proxy
+/&lt;agent&gt;/mcp          // Per-agent MCP proxy with secure-wire minting
 /auth/*                    // Authentication routes
 /MCPBrowserClient.js       // Browser MCP client script</code></pre>
 
                         <h3>Server Implementation</h3>
-                        <pre><code>const http = require('http');
-const httpProxy = require('http-proxy');
-const fs = require('fs');
-const path = require('path');
+                        <pre><code>// RoutingServer dispatches router-owned paths first.
+if (pathname === '/health') return health();
+if (pathname.startsWith('/auth/')) return auth();
+if (pathname === '/workspace-files' || pathname.startsWith('/workspace-files/')) {
+    return serveWorkspaceFileRequest(req, res);
+}
+if (pathname === '/mcp') return handleRouterMcp(req, res);
 
-// Load routing configuration
-const configPath = path.join(process.cwd(), '.ploinky/routing.json');
-const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
-
-// Create proxy
-const proxy = httpProxy.createProxyServer({});
-
-// Create server
-const server = http.createServer((req, res) => {
-    const url = req.url;
-    
-    // API routing: /{agent}/{path}
-    if (url.startsWith('/')) {
-        const parts = url.substring(6).split('/');
-        const agentName = parts[0];
-        const apiPath = '/' + parts.slice(1).join('/');
-        
-        const route = config.routes[agentName];
-        if (route && route.hostPort) {
-            // Proxy to agent container
-            req.url = '/mcp' + apiPath;
-            proxy.web(req, res, {
-                target: `http://localhost:${route.hostPort}`
-            });
-        } else {
-            res.writeHead(404);
-            res.end('Agent not found');
-        }
+// After router-owned paths, the first path segment is a route key.
+const agentName = extractAgentName(pathname, routing.routes);
+if (agentName) {
+    const route = routing.routes[agentName];
+    const upstreamPath = stripMountPrefix(pathname, agentName);
+    if (upstreamPath === '/mcp') {
+        return handleAgentMcpRequest(req, res, route, agentName);
     }
-    // Static file serving
-    else if (config.static && config.static.hostPath) {
-        const filePath = path.join(config.static.hostPath, url);
-        
-        if (fs.existsSync(filePath) && fs.statSync(filePath).isFile()) {
-            const stream = fs.createReadStream(filePath);
-            stream.pipe(res);
-        } else {
-            // Try index.html for directories
-            const indexPath = path.join(filePath, 'index.html');
-            if (fs.existsSync(indexPath)) {
-                fs.createReadStream(indexPath).pipe(res);
-            } else {
-                res.writeHead(404);
-                res.end('Not found');
-            }
-        }
-    }
-    else {
-        res.writeHead(404);
-        res.end('Not found');
-    }
-});
+    return proxyHttpPassthrough(req, res, route.hostPort, upstreamPath);
+}
 
-// Error handling
-proxy.on('error', (err, req, res) => {
-    console.error('Proxy error:', err);
-    res.writeHead(502);
-    res.end('Bad Gateway');
-});
-
-// Start server
-const port = config.port || process.env.PORT || 8088;
-server.listen(port, () => {
-    console.log(`RoutingServer listening on port ${port}`);
-    console.log(`Static files: ${config.static?.hostPath || 'none'}`);
-    console.log(`API routes: ${Object.keys(config.routes).join(', ')}`);
-});</code></pre>
+if (pathname === '/' || pathname === '/index.html') {
+    return redirect(`/${routing.static.agent}/index.html`);
+}</code></pre>
 
                         <h3>Routing Configuration</h3>
                         <pre><code>// .ploinky/routing.json
@@ -545,17 +496,18 @@ server.listen(port, () => {
     "port": 8088,
     "static": {
         "agent": "demo",
-        "container": "ploinky_basic_demo_myproject_a3f1c9",
-        "hostPath": "/home/user/project/.ploinky/repos/basic/demo"
+        "container": "ploinky_basic_demo_myproject_a3f1c9"
     },
     "routes": {
         "agent1": {
             "container": "ploinky_basic_agent1_myproject_a3f1c9",
-            "hostPort": 7001
+            "hostPort": 7001,
+            "hostPath": ".ploinky/repos/basic/agent1"
         },
         "agent2": {
             "container": "ploinky_basic_agent2_myproject_a3f1c9",
-            "hostPort": 7002
+            "hostPort": 7002,
+            "hostPath": ".ploinky/repos/basic/agent2"
         }
     }
 }</code></pre>

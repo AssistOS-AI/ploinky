@@ -584,15 +584,11 @@ async function startWorkspace(staticAgentArg, portArg, { refreshComponentToken, 
 
     const staticAgent = normalizedStaticAgent || cfg0.static.agent;
     const staticPort = cfg0.static.port;
-    let staticManifestPath = null;
-    let staticAgentPath = null;
     let staticRepoName = null;
     let staticShortAgent = null;
 
     try {
       const resolvedStaticAgent = utils.findAgent(staticAgent);
-      staticManifestPath = resolvedStaticAgent.manifestPath;
-      staticAgentPath = path.dirname(staticManifestPath);
       staticRepoName = resolvedStaticAgent.repo;
       staticShortAgent = resolvedStaticAgent.shortAgentName;
     } catch (e) {
@@ -642,7 +638,7 @@ async function startWorkspace(staticAgentArg, portArg, { refreshComponentToken, 
     const staticContainer = staticRegistryEntry?.key || getAgentContainerName(staticShortAgent || staticAgent, staticRepoName || '');
 
     cfg.port = staticPort;
-    cfg.static = { agent: staticAgent, container: staticContainer, hostPath: staticAgentPath };
+    cfg.static = { agent: staticAgent, container: staticContainer };
     cfg = await mergeRoutingConfig((current) => ({
       ...current,
       ...cfg,
@@ -1043,7 +1039,6 @@ async function reinstallAgent(agentName) {
                 }
                 if (matches.has(staticAgent)) {
                     cfg.static.container = newContainerName;
-                    cfg.static.hostPath = agentPath;
                 }
             }
             

@@ -78,21 +78,31 @@ function collectWorkspaceAgents() {
 function collectStaticInfo() {
     try {
         const routing = JSON.parse(fs.readFileSync(ROUTING_FILE, 'utf8')) || {};
+        const staticAgent = routing?.static?.agent || null;
+        const shortAgentName = typeof staticAgent === 'string' && staticAgent.includes('/')
+            ? staticAgent.split('/').pop()
+            : staticAgent;
+        const routes = routing?.routes && typeof routing.routes === 'object' ? routing.routes : {};
+        const routeEntry = routes[staticAgent] || routes[shortAgentName] || Object.values(routes).find((route) => {
+            const routeRef = route?.repo && route?.agent ? `${route.repo}/${route.agent}` : '';
+            return routeRef === staticAgent;
+        }) || {};
+        const hostPath = routing?.static?.hostPath || routeEntry.hostPath || null;
         let repo = null;
-        if (routing?.static?.hostPath) {
+        if (hostPath) {
             // Extract repo name from path like /path/to/.ploinky/repos/repoName/agentName
-            const pathParts = routing.static.hostPath.split(path.sep);
+            const pathParts = hostPath.split(path.sep);
             const reposIndex = pathParts.indexOf('repos');
             if (reposIndex !== -1 && reposIndex < pathParts.length - 1) {
                 repo = pathParts[reposIndex + 1];
             } else {
                 // Fallback: get parent directory name
-                repo = path.basename(path.dirname(routing.static.hostPath));
+                repo = path.basename(path.dirname(hostPath));
             }
         }
         return {
-            agent: routing?.static?.agent || null,
-            hostPath: routing?.static?.hostPath || null,
+            agent: staticAgent,
+            hostPath,
             port: routing?.port || null,
             repo: repo
         };

@@ -573,7 +573,7 @@ function resolveAuthRouteKey(parsedUrl) {
             return surfaceAuthRoute;
         }
     }
-    if (parts.length >= 2 && (parts[1] === 'mcp' || parts[1] === 'task' || parts[1] === 'agent-card' || (parts[1] === 'v1' && parts[2] === 'chat'))) {
+    if (parts.length >= 1 && routes[parts[0]]) {
         const pathAgent = parts[0];
         if (explicit) return explicit;
         try {
@@ -585,9 +585,6 @@ function resolveAuthRouteKey(parsedUrl) {
         } catch (_) { }
         if (!staticAgent) return pathAgent;
         if (staticAgent) return staticAgent;
-    }
-    if (parts.length >= 1 && routes[parts[0]]) {
-        return parts[0];
     }
     if (explicit) return explicit;
     return staticAgent || null;

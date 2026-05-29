@@ -538,7 +538,6 @@ async function handleCommand(args) {
                                 }
                                 if (matches.has(staticAgent)) {
                                     cfg.static.container = newContainerName;
-                                    cfg.static.hostPath = agentPath;
                                 }
                             }
 
@@ -593,7 +592,6 @@ async function handleCommand(args) {
                                     }
                                     if (matches.has(staticAgent)) {
                                         cfg.static.container = containerName;
-                                        cfg.static.hostPath = path.dirname(resolved.manifestPath);
                                     }
                                 }
 

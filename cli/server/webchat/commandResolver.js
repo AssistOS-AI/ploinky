@@ -63,9 +63,15 @@ function resolveStaticAgentDetails(routingFilePath) {
         return { agentName: '', hostPath: '', containerName: '', alias: '' };
     }
     const agentName = trimCommand(cfg.static.agent);
-    const hostPath = trimCommand(cfg.static.hostPath);
+    const routes = cfg.routes && typeof cfg.routes === 'object' ? cfg.routes : {};
+    const shortAgentName = agentName.includes('/') ? agentName.split('/').pop() : agentName;
+    const routeEntry = routes[agentName] || routes[shortAgentName] || Object.values(routes).find((route) => {
+        const routeRef = route?.repo && route?.agent ? `${route.repo}/${route.agent}` : '';
+        return routeRef === agentName;
+    }) || {};
+    const hostPath = trimCommand(routeEntry.hostPath || cfg.static.hostPath);
     const containerName = trimCommand(cfg.static.container);
-    const alias = trimCommand(cfg.static.alias);
+    const alias = trimCommand(routeEntry.alias || cfg.static.alias);
     return { agentName, hostPath, containerName, alias };
 }
 
@@ -145,7 +151,8 @@ function resolveWebchatCommandsForAgent(agentRef, options = {}) {
     if (!record) {
         const staticAgent = trimCommand(routing.static?.agent);
         if (staticAgent && staticAgent === agentRef) {
-            record = routing.static;
+            const shortAgentName = staticAgent.includes('/') ? staticAgent.split('/').pop() : staticAgent;
+            record = routes[staticAgent] || routes[shortAgentName] || routing.static;
         }
     }
 

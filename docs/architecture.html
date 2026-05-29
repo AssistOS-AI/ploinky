@@ -247,19 +247,13 @@ handleCommand(args) {
                             <li>Returns response to client</li>
                         </ol>
 
-                        <h3>Static File Serving</h3>
-                        <p>The router serves static files from the host filesystem in two ways:</p>
-                        <ul>
-                            <li><strong>Static agent root</strong> (existing): requests like <code>/index.html</code> map to <code>static.hostPath</code> in <code>routing.json</code>.</li>
-                            <li><strong>Agent-specific static routing</strong> (new): requests like <code>/demo/ui/index.html</code> map to the <code>hostPath</code> of the <code>demo</code> agent from <code>routes.demo.hostPath</code>.</li>
-                        </ul>
-                        <pre><code>// Static agent root
-GET /index.html            → routing.static.hostPath/index.html
-GET /assets/app.js         → routing.static.hostPath/assets/app.js
-
-// Agent-specific static routing
-GET /demo/ui/index.html    → routing.routes.demo.hostPath/ui/index.html
-GET /simulator/app.js      → routing.routes.simulator.hostPath/app.js</code></pre>
+                        <h3>Agent Static Serving</h3>
+                        <p>The router no longer reads agent application files from the host filesystem. It owns workspace-global routes such as <code>/workspace-files</code> and the management surfaces, then proxies agent-prefixed requests to the selected agent. The agent receives the path with the mount prefix removed and is responsible for serving its own application files.</p>
+                        <pre><code>GET /index.html             → 302 /&lt;static-agent&gt;/index.html
+GET /explorer/index.html    → explorer upstream /index.html
+GET /explorer/assets/app.js → explorer upstream /assets/app.js
+GET /workspace-files/doc.md → router workspace-file handler</code></pre>
+                        <p>The shared <code>AgentServer</code> serves static files from <code>PLOINKY_CODE_DIR</code> or <code>/code</code> after its built-in endpoints. Agents that use a custom <code>manifest.agent</code> command must implement equivalent static serving themselves.</p>
 
                         <h3>Blob Storage API</h3>
                         <p>The router exposes a simple blob storage API for large files with streaming upload/download.</p>

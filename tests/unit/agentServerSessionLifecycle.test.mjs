@@ -169,6 +169,49 @@ test('AgentServer routes DELETE /mcp to the active SDK transport', async (t) => 
     assert.match(afterDelete.text, /Missing session/);
 });
 
+test('AgentServer serves static files from the agent code directory', async (t) => {
+    const tmp = await createTempDir(t);
+    const configPath = path.join(tmp, 'mcp-config.json');
+    await fs.writeFile(configPath, JSON.stringify({ tools: [] }));
+    await fs.mkdir(path.join(tmp, 'assets'), { recursive: true });
+    await fs.writeFile(path.join(tmp, 'index.html'), '<!doctype html><title>Agent App</title>');
+    await fs.writeFile(path.join(tmp, 'assets', 'app.css'), 'body { color: black; }');
+
+    const { port } = await startAgentServer(t, {
+        tmp,
+        configPath,
+        env: { PLOINKY_CODE_DIR: tmp }
+    });
+
+    const index = await fetch(`http://127.0.0.1:${port}/index.html`);
+    assert.equal(index.status, 200);
+    assert.match(index.headers.get('content-type') || '', /text\/html/);
+    assert.match(await index.text(), /Agent App/);
+
+    const asset = await fetch(`http://127.0.0.1:${port}/assets/app.css`);
+    assert.equal(asset.status, 200);
+    assert.match(asset.headers.get('content-type') || '', /text\/css/);
+    assert.match(await asset.text(), /color: black/);
+});
+
+test('AgentServer rejects static path traversal', async (t) => {
+    const tmp = await createTempDir(t);
+    const outside = await createTempDir(t);
+    const configPath = path.join(tmp, 'mcp-config.json');
+    await fs.writeFile(configPath, JSON.stringify({ tools: [] }));
+    await fs.writeFile(path.join(tmp, 'index.html'), '<!doctype html>');
+    await fs.writeFile(path.join(outside, 'secret.txt'), 'secret');
+
+    const { port } = await startAgentServer(t, {
+        tmp,
+        configPath,
+        env: { PLOINKY_CODE_DIR: tmp }
+    });
+
+    const response = await fetch(`http://127.0.0.1:${port}/..%2F${path.basename(outside)}%2Fsecret.txt`);
+    assert.equal(response.status, 404);
+});
+
 test('AgentServer idle GC reaps sessions that are not explicitly deleted', async (t) => {
     const tmp = await createTempDir(t);
     const configPath = path.join(tmp, 'mcp-config.json');

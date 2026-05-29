@@ -133,47 +133,55 @@ function decodePathSegment(value) {
     }
 }
 
-const GLOBAL_ROUTE_PREFIXES = [
-    '/health',
-    '/MCPBrowserClient.js',
-    '/auth/',
-    '/api/agents/',
-    '/agent-card',
-    '/mcp',
-    '/webtty',
-    '/webchat',
-    '/dashboard',
-    '/webmeet',
-    '/status',
-    '/upload',
-    '/blobs',
-];
-
-function isGlobalRoute(pathname) {
-    for (const prefix of GLOBAL_ROUTE_PREFIXES) {
-        if (prefix.endsWith('/')) {
-            if (pathname.startsWith(prefix)) return true;
-        } else {
-            if (pathname === prefix || pathname.startsWith(prefix + '/')) return true;
-        }
-    }
-    return false;
+function extractAgentName(pathname, routes = loadApiRoutes()) {
+    const parts = String(pathname || '').split('/').filter(Boolean);
+    if (!parts.length) return null;
+    const agentName = decodePathSegment(parts[0]).trim();
+    if (!agentName || !routes?.[agentName]) return null;
+    return agentName;
 }
 
-const AGENT_API_SUBPATHS = ['mcp', 'task', 'agent-card', 'v1/chat/completions'];
+function isRouterOwnedPath(pathname) {
+    return pathname === '/agent-card'
+        || pathname === '/agent-card/'
+        || pathname === '/mcp'
+        || pathname === '/mcp/'
+        || pathname.startsWith('/auth/')
+        || pathname.startsWith('/api/agents/')
+        || isRouteMount(pathname, '/webtty')
+        || isRouteMount(pathname, '/webchat')
+        || isRouteMount(pathname, '/dashboard')
+        || isRouteMount(pathname, '/webmeet')
+        || isRouteMount(pathname, '/status')
+        || pathname === '/upload'
+        || isRouteMount(pathname, '/blobs')
+        || pathname === '/workspace-files'
+        || pathname.startsWith('/workspace-files/');
+}
 
-function parseAgentApiRoute(pathname) {
-    const parts = String(pathname || '').split('/').filter(Boolean);
-    if (parts.length < 2) return null;
-    const agentName = decodePathSegment(parts[0]).trim();
-    if (!agentName) return null;
-    if (isGlobalRoute(pathname)) return null;
+function buildAgentProxyPath(agentName, parsedUrl) {
+    const pathname = parsedUrl?.pathname || '/';
+    const prefix = `/${encodeURIComponent(agentName)}`;
+    let upstreamPath = pathname;
+    if (pathname === `/${agentName}` || pathname === prefix) {
+        upstreamPath = '/';
+    } else if (pathname.startsWith(`/${agentName}/`)) {
+        upstreamPath = pathname.slice(agentName.length + 1) || '/';
+    } else if (pathname.startsWith(`${prefix}/`)) {
+        upstreamPath = pathname.slice(prefix.length) || '/';
+    }
+    return `${upstreamPath || '/'}${parsedUrl?.search || ''}`;
+}
 
-    const subPath = parts.slice(1).join('/');
-    for (const apiSubpath of AGENT_API_SUBPATHS) {
-        if (subPath === apiSubpath || subPath.startsWith(apiSubpath + '/')) {
-            return { agentName, subPath };
-        }
+function getStaticRouteName(routes = loadApiRoutes()) {
+    const staticAgent = staticSrv.getStaticAgentName();
+    if (!staticAgent) return null;
+    const shortName = staticAgent.includes('/') ? staticAgent.split('/').pop() : staticAgent;
+    if (routes[staticAgent]) return staticAgent;
+    if (routes[shortName]) return shortName;
+    for (const [routeName, route] of Object.entries(routes || {})) {
+        const routeRef = route?.repo && route?.agent ? `${route.repo}/${route.agent}` : '';
+        if (routeRef === staticAgent) return routeName;
     }
     return null;
 }
@@ -275,21 +283,6 @@ async function handleRoutedAggregateAgentCard(req, res) {
     sendJsonResponse(res, 200, { agents, errors });
 }
 
-function handleRoutedOpenAiChatCompletions(req, res, route) {
-    const pathWithQuery = `/v1/chat/completions${new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`).search || ''}`;
-    proxyHttpPassthrough(req, res, route.hostPort, pathWithQuery, req.headers);
-}
-
-function handleRoutedAgentCard(req, res, route) {
-    const pathWithQuery = `/agent-card${new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`).search || ''}`;
-    proxyHttpPassthrough(req, res, route.hostPort, pathWithQuery, req.headers);
-}
-
-function proxyAgentTaskStatus(req, res, route) {
-    const pathWithQuery = `/getTaskStatus${new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`).search || ''}`;
-    proxyHttpPassthrough(req, res, route.hostPort, pathWithQuery, req.headers);
-}
-
 /**
  * Main request processor
  */
@@ -297,7 +290,11 @@ async function processRequest(req, res) {
     const parsedUrl = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
     const pathname = parsedUrl.pathname || '/';
     const routedAggregateAgentCard = pathname === '/agent-card' || pathname === '/agent-card/';
-    const agentApiRoute = parseAgentApiRoute(pathname);
+    const apiRoutes = loadApiRoutes();
+    const agentName = isRouterOwnedPath(pathname) ? null : extractAgentName(pathname, apiRoutes);
+    const route = agentName ? apiRoutes[agentName] : null;
+    const agentProxyPath = agentName ? buildAgentProxyPath(agentName, parsedUrl) : '';
+    const isAgentMcpRoute = Boolean(agentName && (agentProxyPath === '/mcp' || agentProxyPath.startsWith('/mcp?') || agentProxyPath.startsWith('/mcp/')));
     appendLog('http_request', { method: req.method, path: pathname });
 
     // Health check endpoint (no auth required)
@@ -346,15 +343,12 @@ async function processRequest(req, res) {
         if (handled) return;
     }
 
-    // Agent-prefixed routes are public at the router level;
-    // the target agent decides whether to accept or reject the request.
-    const isAgentRoute = agentApiRoute !== null;
-
     if (routedAggregateAgentCard) {
         // Public aggregate route
-    } else if (isAgentRoute) {
-        // no-op; transparent proxy handled downstream
     } else if (pathname === '/mcp' || pathname === '/mcp/') {
+        const authResult = await ensureAuthenticated(req, res, parsedUrl);
+        if (!authResult.ok) return;
+    } else if (agentName) {
         const authResult = await ensureAuthenticated(req, res, parsedUrl);
         if (!authResult.ok) return;
     } else if (isPublicHttpServiceRoute(pathname)) {
@@ -380,38 +374,34 @@ async function processRequest(req, res) {
         return handleWorkspaceUpload(req, res);
     } else if (isRouteMount(pathname, '/blobs')) {
         return handleBlobs(req, res);
+    } else if (staticSrv.serveWorkspaceFileRequest(req, res)) {
+        return;
     } else if (handleHttpServiceRoute(req, res, parsedUrl)) {
         return;
     } else if (routedAggregateAgentCard) {
         return handleRoutedAggregateAgentCard(req, res);
-    } else if (agentApiRoute) {
-        const apiRoutes = loadApiRoutes();
-        const route = apiRoutes[agentApiRoute.agentName];
+    } else if (agentName) {
         if (!route || !route.hostPort) {
-            sendJsonResponse(res, 404, { error: 'agent_not_found', agent: agentApiRoute.agentName });
+            sendJsonResponse(res, 404, { error: 'agent_not_found', agent: agentName });
             return;
         }
-
-        const { subPath } = agentApiRoute;
-        if (subPath === 'mcp' || subPath.startsWith('mcp/')) {
-            return handleAgentMcpRequest(req, res, route, agentApiRoute.agentName);
-        } else if (subPath === 'task' || subPath.startsWith('task/')) {
-            return proxyAgentTaskStatus(req, res, route);
-        } else if (subPath === 'agent-card' || subPath.startsWith('agent-card/')) {
-            return handleRoutedAgentCard(req, res, route);
-        } else if (subPath === 'v1/chat/completions' || subPath.startsWith('v1/chat/completions/')) {
-            return handleRoutedOpenAiChatCompletions(req, res, route);
-        } else {
-            sendJsonResponse(res, 404, { error: 'unknown_agent_route', path: subPath });
-            return;
+        if (isAgentMcpRoute) {
+            return handleAgentMcpRequest(req, res, route, agentName);
         }
+        return proxyHttpPassthrough(req, res, route.hostPort, agentProxyPath);
     } else if (pathname === '/mcp' || pathname === '/mcp/') {
         return handleRouterMcp(req, res);
     } else {
-        // Static file serving
-        if (staticSrv.serveWorkspaceFileRequest(req, res)) return;
-        if (staticSrv.serveAgentStaticRequest(req, res)) return;
-        if (await staticSrv.serveStaticRequest(req, res)) return;
+        if (pathname === '/' || pathname === '/index.html') {
+            const staticRouteName = getStaticRouteName(apiRoutes);
+            if (staticRouteName) {
+                res.writeHead(302, {
+                    Location: `/${encodeURIComponent(staticRouteName)}/index.html`,
+                    'Cache-Control': 'no-store'
+                });
+                return res.end();
+            }
+        }
 
         res.writeHead(404);
         return res.end('Not Found');

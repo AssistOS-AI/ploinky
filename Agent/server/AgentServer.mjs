@@ -21,6 +21,7 @@ const TASK_QUEUE_FILE = path.resolve(process.cwd(), '.tasksQueue');
 const invocationReplayCache = createMemoryReplayCache({ maxSize: 4096 });
 const OPENAI_CHAT_COMPLETIONS_PATH = '/v1/chat/completions';
 const AGENT_CARD_PATH = '/agent-card';
+const TASK_STATUS_PATHS = new Set(['/getTaskStatus', '/task']);
 const TAG_NAME_RE = /^[a-z][a-z0-9_-]{0,63}$/;
 
 function verifyInvocationForRequest({ requestHeaders, bodyObject, expectedTool }) {
@@ -131,6 +132,131 @@ function getManifestResult() {
         cachedManifestResult = loadManifest();
     }
     return cachedManifestResult;
+}
+
+function resolveStaticRoot() {
+    return process.env.PLOINKY_CODE_DIR || '/code';
+}
+
+function sanitizeStaticRequestPath(requestPath) {
+    let decoded = '';
+    try {
+        decoded = decodeURIComponent(String(requestPath || '/'));
+    } catch (_) {
+        return null;
+    }
+    if (decoded.includes('\0')) return null;
+    if (decoded.replace(/\\/g, '/').split('/').some((part) => part === '..')) return null;
+    const normalized = path.posix.normalize(`/${decoded.replace(/\\/g, '/')}`);
+    if (normalized.includes('/../') || normalized === '/..') return null;
+    return normalized.replace(/^\/+/, '');
+}
+
+function isPathInsideRoot(root, candidate, { allowMissing = false } = {}) {
+    const resolvedRoot = path.resolve(root);
+    let resolvedCandidate;
+    try {
+        resolvedCandidate = allowMissing
+            ? path.resolve(candidate)
+            : fs.realpathSync(candidate);
+    } catch (_) {
+        if (!allowMissing) return false;
+        resolvedCandidate = path.resolve(candidate);
+    }
+    const relative = path.relative(resolvedRoot, resolvedCandidate);
+    return relative === '' || (!!relative && !relative.startsWith('..') && !path.isAbsolute(relative));
+}
+
+function resolveStaticFile(requestPath) {
+    const root = resolveStaticRoot();
+    if (!root) return null;
+    const rel = sanitizeStaticRequestPath(requestPath);
+    if (rel === null) return null;
+    const candidate = path.join(root, rel || 'index.html');
+    if (!isPathInsideRoot(root, candidate, { allowMissing: true })) return null;
+    try {
+        const stat = fs.statSync(candidate);
+        if (stat.isDirectory()) {
+            for (const name of ['index.html', 'index.htm', 'default.html']) {
+                const indexPath = path.join(candidate, name);
+                if (fs.existsSync(indexPath)
+                    && fs.statSync(indexPath).isFile()
+                    && isPathInsideRoot(root, indexPath)) {
+                    return indexPath;
+                }
+            }
+            return null;
+        }
+        if (stat.isFile() && isPathInsideRoot(root, candidate)) return candidate;
+    } catch (_) {
+        return null;
+    }
+    return null;
+}
+
+function getStaticMimeType(filePath) {
+    const ext = path.extname(filePath).toLowerCase();
+    const types = {
+        '.html': 'text/html; charset=utf-8',
+        '.htm': 'text/html; charset=utf-8',
+        '.js': 'application/javascript',
+        '.mjs': 'application/javascript',
+        '.css': 'text/css',
+        '.json': 'application/json',
+        '.svg': 'image/svg+xml',
+        '.png': 'image/png',
+        '.jpg': 'image/jpeg',
+        '.jpeg': 'image/jpeg',
+        '.gif': 'image/gif',
+        '.ico': 'image/x-icon',
+        '.webp': 'image/webp',
+        '.woff2': 'font/woff2',
+        '.woff': 'font/woff',
+        '.ttf': 'font/ttf',
+        '.otf': 'font/otf',
+        '.pdf': 'application/pdf'
+    };
+    return types[ext] || 'application/octet-stream';
+}
+
+function getStaticCacheControl(filePath) {
+    const ext = path.extname(filePath).toLowerCase();
+    if (['.woff2', '.woff', '.ttf', '.otf'].includes(ext)) {
+        return 'public, max-age=31536000, immutable';
+    }
+    if (['.png', '.jpg', '.jpeg', '.gif', '.ico', '.svg', '.webp'].includes(ext)) {
+        return 'public, max-age=86400';
+    }
+    if (['.js', '.mjs', '.css'].includes(ext)) {
+        return 'public, max-age=300';
+    }
+    return 'public, max-age=60';
+}
+
+function serveStaticFile(req, res, pathname) {
+    const method = String(req.method || 'GET').toUpperCase();
+    if (method !== 'GET' && method !== 'HEAD') return false;
+    const filePath = resolveStaticFile(pathname);
+    if (!filePath) return false;
+    const stat = fs.statSync(filePath);
+    res.writeHead(200, {
+        'Content-Type': getStaticMimeType(filePath),
+        'Content-Length': stat.size,
+        'Cache-Control': getStaticCacheControl(filePath)
+    });
+    if (method === 'HEAD') {
+        res.end();
+        return true;
+    }
+    const stream = fs.createReadStream(filePath);
+    stream.on('error', () => {
+        if (!res.headersSent) {
+            res.writeHead(500, { 'Content-Type': 'text/plain' });
+        }
+        res.end('Internal Server Error');
+    });
+    stream.pipe(res);
+    return true;
 }
 
 function resolveMaxConcurrent(config) {
@@ -965,7 +1091,7 @@ async function main() {
                     'agent-card': agentCard
                 });
             }
-            if (method === 'GET' && u.pathname === '/getTaskStatus') {
+            if (method === 'GET' && TASK_STATUS_PATHS.has(u.pathname)) {
                 const taskId = u.searchParams.get('taskId');
                 if (!taskId) {
                     return sendJson(400, { error: 'missing taskId' });
@@ -1071,6 +1197,9 @@ async function main() {
                             res.end();
                         }
                     });
+                return;
+            }
+            if (serveStaticFile(req, res, u.pathname)) {
                 return;
             }
             // Not found

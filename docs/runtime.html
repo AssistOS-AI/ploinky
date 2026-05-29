@@ -114,8 +114,8 @@
 
         <section class="chapter-section">
           <h2>Static Agent Responsibilities</h2>
-          <p>The static agent determines the router port and the static asset host path recorded in <code>.ploinky/routing.json</code>. Requests for <code>/</code>, <code>/index.html</code>, and the static agent alias resolve against that host root, while the router also keeps serving first-party management surfaces under their fixed prefixes.</p>
-          <p>If the static site is requested before the agent is ready, the router serves a short bootstrap page that retries automatically rather than exposing a broken asset path.</p>
+          <p>The static agent determines the router port and the default browser entry route recorded in <code>.ploinky/routing.json</code>. Requests for <code>/</code> and <code>/index.html</code> redirect to the static agent's routed <code>/&lt;agent&gt;/index.html</code> path. The router does not read the static agent's files from <code>static.hostPath</code>; it strips the <code>/&lt;agent&gt;</code> mount prefix and proxies the request to the agent server.</p>
+          <p>The agent server must serve its own <code>index.html</code> and related assets. The shared <code>AgentServer</code> serves static files from <code>PLOINKY_CODE_DIR</code> or <code>/code</code> after its built-in endpoints. Agents that use a custom <code>manifest.agent</code> command must implement the same static-file responsibility in that command.</p>
         </section>
       </article>
     </div>

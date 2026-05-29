@@ -16,7 +16,7 @@ The routed interface is the operator-visible face of a running Ploinky workspace
 
 The router must be supervised by `cli/server/Watchdog.js`, which launches and restarts `cli/server/RoutingServer.js`, records restart events, performs health checks against `/health`, and writes watchdog logs under `.ploinky/logs/watchdog.log`. The router itself must write request and lifecycle logs under `.ploinky/logs/router.log`.
 
-The route table must be persisted in `.ploinky/routing.json`. It must contain the router port, the static agent metadata, and the current per-agent route entries resolved during startup. Static requests for `/`, `/index.html`, and static-agent entry aliases must resolve against the configured static host path from that file.
+The route table must be persisted in `.ploinky/routing.json`. It must contain the router port, static agent metadata, and the current per-agent route entries resolved during startup. Per-agent route entries provide the upstream host port and metadata such as repository, agent name, container name, alias, and host path. The static-agent metadata identifies the workspace entry agent and container; it is not the router's static-file root.
 
 The router must provide first-party browser surfaces at `/webtty`, `/webchat`, `/webmeet`, `/dashboard`, and `/status`. Each surface owns its own session cookie and fallback asset directory under `cli/server/<surface>/`. `/webtty`, `/webchat`, and `/webmeet` must rely on the router login flow and the authenticated router session; they no longer accept surface-specific token login. `/dashboard` and the read-only `/status` surface continue to support dashboard-token access through `WEBDASHBOARD_TOKEN`. Asset resolution may also consult the static host root and `webLibs/`, but the documented fallback implementation for the first-party surfaces lives under `cli/server/`.
 
@@ -55,22 +55,20 @@ The router must also expose:
 
 - `/health` for health status.
 - `/upload` and `/blobs` for workspace and agent blob flows.
+- `/workspace-files/...` for authenticated, workspace-confined file reads owned by the router.
 - `/webchat/uploads` for WebChat session-scoped file storage and download under `<cwd>/uploads/<sessionId>`.
 - `/agent-card` for aggregate discovery of routable agents that expose capability metadata. The router must query each active route's internal `/agent-card` endpoint, include successful responses without validating their field shape, and report per-agent errors separately.
-- `/<agent>/agent-card` for direct proxy access to one agent's capability metadata.
-- `/<agent>/v1/chat/completions` for OpenAI-compatible chat-completions requests routed to one agent. The request body controls normal JSON versus SSE streaming through its `stream` field.
 - `/mcp` for router-level MCP aggregation.
-- `/<agent>/mcp` for agent MCP proxying.
-- `/<agent>/task` for task-status passthrough.
 - manifest-declared HTTP service prefixes for downstream HTTP services.
+- `/<agent>/...` for transparent per-agent proxying after the router-owned paths above have been considered. The router strips the `/<agent>` mount prefix and forwards the remaining path and query string to the route's upstream host port. The target agent owns paths such as `/index.html`, `/agent-card`, `/v1/chat/completions`, `/task`, and any custom HTTP endpoints. `/<agent>/mcp` remains the special MCP proxy path because the router must preserve MCP session mediation and secure-wire invocation-token minting for tool, resource, and task-status operations.
 
-Agent-to-agent callers may access `/agent-card`, `/<agent>/agent-card`, and `/<agent>/v1/chat/completions` without router-level authentication; the target agent decides whether to accept or reject the request. The router acts as a transparent proxy for these endpoints. Orchestrators can discover remote agents via `PloinkyAgentSkillsSubsystem` and include them as tools through `## Allowed Agents` declarations.
+Agent-to-agent callers may access `/agent-card` and direct per-agent HTTP routes without router-level endpoint-specific logic; the target agent decides whether to accept or reject the request once proxying reaches it. Orchestrators can discover remote agents via `PloinkyAgentSkillsSubsystem` and include them as tools through `## Allowed Agents` declarations.
 
 Agent MCP sessions are runtime-owned and ephemeral. Clients that finish with a session should send `DELETE /mcp` with the `mcp-session-id` header so the agent runtime can close the SDK transport immediately. The shared `AgentServer` must also reap idle sessions defensively for clients that disconnect without a delete, but it must treat any session with an open HTTP response as active so long-running tool calls and SSE streams are not closed by idle cleanup.
 
 HTTP service routes must be declared by the target agent rather than hard-coded into router handlers. An enabled agent may provide `httpServices` entries with an external prefix, internal upstream prefix, and auth mode. The router resolves those declarations from the route table and agent manifest, then forwards matching requests to the owning agent route. Public service declarations with `auth: "none"` intentionally run without router identity; `auth: "guest"` follows the normal guest policy, honoring an existing local session unless the declaration explicitly sets `forceGuest: true`, and otherwise mints a scoped guest session. Protected declarations must establish an authenticated router identity before proxying: the router prefers the owning route's auth policy, falls back to the static route's authenticated policy when the service-owning agent is otherwise unauthenticated, and rejects the request when no authenticated policy is available. Protected and guest HTTP services receive a scoped `__http_service__` invocation token by default unless the manifest entry explicitly sets `invocation: false`. Router-owned identity headers are stripped from caller input and regenerated by the router for protected or guest service requests. If a service route requests invocation minting but the owning route cannot be resolved to an installed-agent principal, the router fails the request closed instead of forwarding unsigned identity metadata.
 
-When the static agent is not yet ready to serve its own static assets, the router may serve a temporary bootstrap page that reloads until the agent becomes ready. This bootstrap behavior is part of the current user-facing contract and should remain documented.
+The default workspace entry paths `/` and `/index.html` redirect to the configured static agent's routed `/<agent>/index.html` URL. The router does not read application assets from `static.hostPath`; the target agent server is responsible for serving `index.html` and related static resources from its own runtime code root. The shared `AgentServer` serves static files from `PLOINKY_CODE_DIR` or `/code` after its built-in API endpoints, while agents with custom `manifest.agent` commands must implement equivalent static serving themselves.
 
 ## Decisions & Questions
 
