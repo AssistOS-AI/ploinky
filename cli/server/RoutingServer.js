@@ -173,6 +173,14 @@ function buildAgentProxyPath(agentName, parsedUrl) {
     return `${upstreamPath || '/'}${parsedUrl?.search || ''}`;
 }
 
+function hasDelegatedCallerJwt(req) {
+    const value = req?.headers?.['x-ploinky-caller-jwt'];
+    if (Array.isArray(value)) {
+        return value.some((entry) => typeof entry === 'string' && entry.trim());
+    }
+    return typeof value === 'string' && value.trim().length > 0;
+}
+
 function getStaticRouteName(routes = loadApiRoutes()) {
     const staticAgent = staticSrv.getStaticAgentName();
     if (!staticAgent) return null;
@@ -348,6 +356,9 @@ async function processRequest(req, res) {
     } else if (pathname === '/mcp' || pathname === '/mcp/') {
         const authResult = await ensureAuthenticated(req, res, parsedUrl);
         if (!authResult.ok) return;
+    } else if (agentName && isAgentMcpRoute && hasDelegatedCallerJwt(req)) {
+        // Delegated agent-to-agent MCP calls do not carry browser cookies.
+        // The MCP proxy validates X-Ploinky-Caller-JWT before forwarding.
     } else if (agentName) {
         const authResult = await ensureAuthenticated(req, res, parsedUrl);
         if (!authResult.ok) return;
