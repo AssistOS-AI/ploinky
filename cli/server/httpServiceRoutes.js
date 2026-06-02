@@ -134,7 +134,8 @@ export function collectHttpServiceRoutes(routing = loadRoutingConfig()) {
 export function resolveHttpServiceRoute(pathname, routing = loadRoutingConfig()) {
     const normalizedPathname = String(pathname || '');
     return collectHttpServiceRoutes(routing).find((definition) =>
-        normalizedPathname.startsWith(definition.externalPrefix)
+        normalizedPathname === definition.externalPrefix.replace(/\/$/, '')
+        || normalizedPathname.startsWith(definition.externalPrefix)
     ) || null;
 }
 

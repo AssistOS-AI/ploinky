@@ -224,7 +224,7 @@ test('protected HTTP service falls back to static auth and injects router auth i
     const parsedUrl = new URL(req.url, 'http://localhost');
 
     const authResult = await authHandlers.ensureAuthenticated(req, res, parsedUrl);
-    assert.equal(authResult.ok, true);
+    assert.equal(authResult.ok, true, res.body);
     assert.equal(req.authMode, 'local');
     assert.equal(req.user?.id, 'local:admin');
 
@@ -258,6 +258,25 @@ test('protected HTTP service falls back to static auth and injects router auth i
     });
     assert.equal(verified.payload.caller, 'router:first-party');
     assert.equal(verified.payload.usr?.username, 'admin');
+
+    captured = null;
+    const rootReq = makeRequest({
+        url: '/services/browser-use',
+        cookie: `ploinky_jwt=${login.sessionId}`,
+    });
+    const rootRes = new MockWritableResponse();
+    const rootParsedUrl = new URL(rootReq.url, 'http://localhost');
+
+    const rootAuthResult = await authHandlers.ensureAuthenticated(rootReq, rootRes, rootParsedUrl);
+    assert.equal(rootAuthResult.ok, true, rootRes.body);
+
+    const rootHandled = routerHandlers.handleHttpServiceRoute(rootReq, rootRes, rootParsedUrl);
+    assert.equal(rootHandled, true);
+    await rootRes.done;
+
+    assert.equal(rootRes.statusCode, 200);
+    assert.equal(rootRes.body, 'ok');
+    assert.equal(captured?.url, '/browser-use/');
 });
 
 test('protected HTTP service fails closed when invocation principal cannot be resolved', async (t) => {
