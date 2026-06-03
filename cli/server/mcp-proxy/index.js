@@ -69,6 +69,33 @@ function extractDelegatedUser(req) {
     };
 }
 
+function extractInvocationScope(req) {
+    const values = [
+        req?.session?.tokens?.scope,
+        req?.session?._jwtPayload?.scope,
+        req?.session?._jwtPayload?.scp
+    ];
+    const scopes = new Set();
+    for (const value of values) {
+        if (Array.isArray(value)) {
+            for (const entry of value) {
+                const normalized = String(entry || '').trim();
+                if (normalized) scopes.add(normalized);
+            }
+            continue;
+        }
+        const normalized = String(value || '').trim();
+        if (!normalized) {
+            continue;
+        }
+        for (const entry of normalized.split(/[\s,]+/)) {
+            const scope = String(entry || '').trim();
+            if (scope) scopes.add(scope);
+        }
+    }
+    return Array.from(scopes);
+}
+
 async function getToolSchemasForAgent(agentName, agentClient) {
     const now = Date.now();
     const cached = agentToolSchemaCache.get(agentName);
@@ -106,7 +133,7 @@ export function buildInvocationContextForProviderCall({ req, agentName, toolName
             providerPrincipal: verified.providerPrincipal,
             callerPrincipal: verified.callerPrincipal,
             tool: toolName,
-            scope: [],
+            scope: extractInvocationScope(req),
             bodyObject,
             delegatedUser: verified.user
         });
@@ -117,7 +144,7 @@ export function buildInvocationContextForProviderCall({ req, agentName, toolName
         tool: toolName,
         bodyObject,
         delegatedUser: extractDelegatedUser(req),
-        scope: []
+        scope: extractInvocationScope(req)
     });
     return { ...invocation, bodyObject };
 }

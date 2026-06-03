@@ -7,7 +7,6 @@ import { fileURLToPath } from 'url';
 import { handleWebTTY } from './handlers/webtty.js';
 import { handleWebChat } from './handlers/webchat.js';
 import { handleDashboard } from './handlers/dashboard.js';
-import { handleWebMeet } from './handlers/webmeet.js';
 import { handleStatus } from './handlers/status.js';
 import { handleBlobs, handleWorkspaceUpload } from './handlers/blobs.js';
 import * as staticSrv from './static/index.js';
@@ -65,15 +64,6 @@ const globalState = {
     webtty: { sessions: new Map() },
     webchat: { sessions: new Map() },
     dashboard: { sessions: new Map() },
-    webmeet: {
-        sessions: new Map(),
-        participants: new Map(),
-        chatHistory: [],
-        privateHistory: new Map(),
-        nextMsgId: 1,
-        queue: [],
-        currentSpeaker: null
-    },
     status: { sessions: new Map() }
 };
 
@@ -151,7 +141,6 @@ function isRouterOwnedPath(pathname) {
         || isRouteMount(pathname, '/webtty')
         || isRouteMount(pathname, '/webchat')
         || isRouteMount(pathname, '/dashboard')
-        || isRouteMount(pathname, '/webmeet')
         || isRouteMount(pathname, '/status')
         || pathname === '/upload'
         || isRouteMount(pathname, '/blobs')
@@ -324,7 +313,6 @@ async function processRequest(req, res) {
                 webtty: globalState.webtty.sessions.size,
                 webchat: globalState.webchat.sessions.size,
                 dashboard: globalState.dashboard.sessions.size,
-                webmeet: globalState.webmeet.sessions.size,
                 status: globalState.status.sessions.size,
                 agent: agentSessionStore.size
             }
@@ -377,8 +365,6 @@ async function processRequest(req, res) {
         return handleWebChat(req, res, config.webchat, globalState.webchat);
     } else if (isRouteMount(pathname, '/dashboard')) {
         return handleDashboard(req, res, config.dashboard, globalState.dashboard);
-    } else if (isRouteMount(pathname, '/webmeet')) {
-        return handleWebMeet(req, res, config.webmeet, globalState.webmeet);
     } else if (isRouteMount(pathname, '/status')) {
         return handleStatus(req, res, config.status, globalState.status);
     } else if (pathname === '/upload') {
@@ -477,7 +463,6 @@ server.listen(port, () => {
     console.log('  Dashboard:       /dashboard');
     console.log('  WebTTY:          /webtty');
     console.log('  WebChat:         /webchat');
-    console.log('  WebMeet:         /webmeet');
     console.log('  Status:          /status');
     console.log('  Health:          /health');
     console.log('  Agent routes:    /<agent>/{mcp,task,agent-card,v1/chat/completions}');
