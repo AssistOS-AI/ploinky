@@ -532,7 +532,7 @@ function safeJoin(base, rel) {
     return abs;
 }
 
-function resolveAgentStaticFile(agentName, agentRelPath) {
+async function resolveAgentStaticFile(agentName, agentRelPath) {
     const root = getAgentHostPath(agentName);
     if (!root) return null;
     const allowedRoots = getAgentAllowedRoots(agentName);
@@ -542,14 +542,17 @@ function resolveAgentStaticFile(agentName, agentRelPath) {
         if (!isPathWithinAllowedRoots(allowedRoots, candidate)) {
             return null;
         }
-        const stat = fs.statSync(candidate);
+        const stat = await fs.promises.stat(candidate);
         if (stat.isDirectory()) {
             const indexFiles = ['index.html', 'index.htm', 'default.html'];
             for (const name of indexFiles) {
                 const idx = path.join(candidate, name);
-                if (fs.existsSync(idx)
-                    && fs.statSync(idx).isFile()
-                    && isPathWithinAllowedRoots(allowedRoots, idx)) return idx;
+                try {
+                    const idxStat = await fs.promises.stat(idx);
+                    if (idxStat.isFile() && isPathWithinAllowedRoots(allowedRoots, idx)) return idx;
+                } catch (_) {
+                    continue;
+                }
             }
             return null;
         }
@@ -558,15 +561,15 @@ function resolveAgentStaticFile(agentName, agentRelPath) {
     return null;
 }
 
-function serveAgentStaticRequest(req, res) {
+async function serveAgentStaticRequest(req, res) {
     try {
         const parsed = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
         const pathname = decodeURIComponent(parsed.pathname || '/');
         const parts = pathname.split('/').filter(Boolean);
-        if (parts.length < 2) return false; // need /agent/...
+        if (parts.length < 2) return false;
         const agent = parts[0];
         const rest = parts.slice(1).join('/');
-        const target = resolveAgentStaticFile(agent, rest);
+        const target = await resolveAgentStaticFile(agent, rest);
         if (target && sendFile(res, target)) return true;
     } catch (_) { }
     return false;
@@ -583,7 +586,7 @@ function isPublicAssetPath(pathname) {
     return PUBLIC_ASSET_EXTS.has(ext);
 }
 
-function servePublicAssetRequest(req, res) {
+async function servePublicAssetRequest(req, res) {
     try {
         const parsed = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
         const pathname = decodeURIComponent(parsed.pathname || '/');
@@ -593,7 +596,7 @@ function servePublicAssetRequest(req, res) {
         if (parts.length >= 2) {
             const agent = parts[0];
             const rest = parts.slice(1).join('/');
-            const target = resolveAgentStaticFile(agent, rest);
+            const target = await resolveAgentStaticFile(agent, rest);
             if (target && sendFile(res, target)) return true;
         }
 

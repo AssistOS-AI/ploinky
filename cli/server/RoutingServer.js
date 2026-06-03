@@ -385,6 +385,9 @@ async function processRequest(req, res) {
         if (isAgentMcpRoute) {
             return handleAgentMcpRequest(req, res, route, agentName);
         }
+        if (await staticSrv.serveAgentStaticRequest(req, res)) {
+            return;
+        }
         return proxyHttpPassthrough(req, res, route.hostPort, agentProxyPath);
     } else if (pathname === '/mcp' || pathname === '/mcp/') {
         return handleRouterMcp(req, res);

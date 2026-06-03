@@ -154,20 +154,14 @@ function sanitizeStaticRequestPath(requestPath) {
 
 function isPathInsideRoot(root, candidate, { allowMissing = false } = {}) {
     const resolvedRoot = path.resolve(root);
-    let resolvedCandidate;
-    try {
-        resolvedCandidate = allowMissing
-            ? path.resolve(candidate)
-            : fs.realpathSync(candidate);
-    } catch (_) {
-        if (!allowMissing) return false;
-        resolvedCandidate = path.resolve(candidate);
-    }
+    const resolvedCandidate = allowMissing
+        ? path.resolve(candidate)
+        : path.resolve(candidate);
     const relative = path.relative(resolvedRoot, resolvedCandidate);
     return relative === '' || (!!relative && !relative.startsWith('..') && !path.isAbsolute(relative));
 }
 
-function resolveStaticFile(requestPath) {
+async function resolveStaticFile(requestPath) {
     const root = resolveStaticRoot();
     if (!root) return null;
     const rel = sanitizeStaticRequestPath(requestPath);
@@ -175,14 +169,17 @@ function resolveStaticFile(requestPath) {
     const candidate = path.join(root, rel || 'index.html');
     if (!isPathInsideRoot(root, candidate, { allowMissing: true })) return null;
     try {
-        const stat = fs.statSync(candidate);
+        const stat = await fs.promises.stat(candidate);
         if (stat.isDirectory()) {
             for (const name of ['index.html', 'index.htm', 'default.html']) {
                 const indexPath = path.join(candidate, name);
-                if (fs.existsSync(indexPath)
-                    && fs.statSync(indexPath).isFile()
-                    && isPathInsideRoot(root, indexPath)) {
-                    return indexPath;
+                try {
+                    const indexStat = await fs.promises.stat(indexPath);
+                    if (indexStat.isFile() && isPathInsideRoot(root, indexPath)) {
+                        return indexPath;
+                    }
+                } catch (_) {
+                    continue;
                 }
             }
             return null;
@@ -233,12 +230,12 @@ function getStaticCacheControl(filePath) {
     return 'public, max-age=60';
 }
 
-function serveStaticFile(req, res, pathname) {
+async function serveStaticFile(req, res, pathname) {
     const method = String(req.method || 'GET').toUpperCase();
     if (method !== 'GET' && method !== 'HEAD') return false;
-    const filePath = resolveStaticFile(pathname);
+    const filePath = await resolveStaticFile(pathname);
     if (!filePath) return false;
-    const stat = fs.statSync(filePath);
+    const stat = await fs.promises.stat(filePath);
     res.writeHead(200, {
         'Content-Type': getStaticMimeType(filePath),
         'Content-Length': stat.size,
@@ -1199,7 +1196,7 @@ async function main() {
                     });
                 return;
             }
-            if (serveStaticFile(req, res, u.pathname)) {
+            if (await serveStaticFile(req, res, u.pathname)) {
                 return;
             }
             // Not found
