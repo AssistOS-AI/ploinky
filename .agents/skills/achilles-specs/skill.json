@@ -1,0 +1,24 @@
+{
+  "title": "Achilles Specs",
+  "family": "anthropic",
+  "summary": "Defines AchillesAgentLib integration rules, dependency resolution, runtime configuration, and coding-style additions for Achilles-oriented projects.",
+  "aliases": [
+    "achilles-specs"
+  ],
+  "dependsOn": [
+    "gamp-specs"
+  ],
+  "outputs": [
+    "examples/depsLoader.mjs",
+    "examples/runtimeConfig.mjs",
+    "AGENTS.md",
+    "docs/specs/DS001-coding-style.md"
+  ],
+  "entrypoints": [
+    "SKILL.md",
+    "DS.md",
+    "examples/depsLoader.mjs",
+    "examples/runtimeConfig.mjs"
+  ],
+  "selfContained": true
+}

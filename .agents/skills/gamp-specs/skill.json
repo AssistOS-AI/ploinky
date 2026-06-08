@@ -1,0 +1,31 @@
+{
+  "title": "GAMP Specs",
+  "family": "anthropic",
+  "summary": "Bootstraps AGENTS guidance, DS specifications, HTML documentation, and repository-wide documentation synchronization rules.",
+  "aliases": [
+    "gamp-structure",
+    "docs-builder",
+    "gamp-specs"
+  ],
+  "dependsOn": [],
+  "outputs": [
+    "AGENTS.md",
+    "fileSizesCheck.sh",
+    "docs/index.html",
+    "docs/specs/",
+    "docs/specs/matrix.md"
+  ],
+  "entrypoints": [
+    "SKILL.md",
+    "examples/skillCatalog.mjs",
+    "references/docs-structure.md",
+    "references/specs-guidelines.md",
+    "references/technical-docs-guidelines.md",
+    "scripts/generate_specs_matrix.mjs",
+    "scripts/verify_docs_links.mjs",
+    "scripts/verify_static_site.js",
+    "assets/specsLoader.html",
+    "assets/fileSizesCheck.sh"
+  ],
+  "selfContained": true
+}

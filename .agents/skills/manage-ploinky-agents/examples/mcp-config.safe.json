@@ -1,0 +1,81 @@
+{
+  "tools": [
+    {
+      "name": "docs_search",
+      "title": "Search documents",
+      "description": "Search workspace documents visible to the authenticated user.",
+      "command": "node",
+      "args": ["tools/docs-search.mjs"],
+      "cwd": "/code",
+      "timeoutMs": 60000,
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "query": { "type": "string", "minLength": 1 },
+          "limit": { "type": "integer", "minimum": 1, "maximum": 20 }
+        },
+        "required": ["query"],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "index_refresh_internal",
+      "title": "Refresh search index",
+      "description": "Internal agent-to-agent index refresh. Not callable by users or admins.",
+      "command": "node",
+      "args": ["tools/index-refresh.mjs"],
+      "cwd": "/code",
+      "timeoutMs": 300000,
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "scope": { "type": "string", "enum": ["changed", "full"] }
+        },
+        "required": ["scope"],
+        "additionalProperties": false
+      },
+      "tags": ["internal"],
+      "async": true
+    },
+    {
+      "name": "agent_policy_get",
+      "title": "Get agent policy metadata",
+      "description": "Returns administrative policy metadata for this agent.",
+      "command": "node",
+      "args": ["tools/policy-get.mjs"],
+      "cwd": "/code",
+      "timeoutMs": 30000,
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false
+      },
+      "tags": ["admin"]
+    }
+  ],
+  "resources": [
+    {
+      "name": "agent_status",
+      "title": "Agent status",
+      "uri": "ploinky://agent/status",
+      "command": "node",
+      "args": ["tools/status-resource.mjs"],
+      "cwd": "/code"
+    }
+  ],
+  "prompts": [
+    {
+      "name": "search-docs",
+      "description": "Prompt for using docs_search safely.",
+      "arguments": [
+        { "name": "query", "required": true }
+      ],
+      "messages": [
+        {
+          "role": "user",
+          "content": { "type": "text", "text": "Search for: {{query}}" }
+        }
+      ]
+    }
+  ]
+}

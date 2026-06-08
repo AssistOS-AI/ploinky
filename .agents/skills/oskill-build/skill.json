@@ -1,0 +1,20 @@
+{
+  "title": "O-Skill Build",
+  "family": "anthropic",
+  "summary": "Defines orchestration-skill conventions for planner skills that coordinate downstream capabilities through explicit loops or SOP sessions.",
+  "aliases": [
+    "oskill-build"
+  ],
+  "dependsOn": [
+    "gamp-specs",
+    "achilles-specs"
+  ],
+  "outputs": [
+    "oskill.md"
+  ],
+  "entrypoints": [
+    "SKILL.md",
+    "DS.md"
+  ],
+  "selfContained": true
+}

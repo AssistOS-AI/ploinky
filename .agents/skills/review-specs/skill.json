@@ -1,0 +1,21 @@
+{
+  "title": "Review Specs",
+  "family": "anthropic",
+  "summary": "Defines a step-by-step review workflow for reconciling affected DS files with new context, instructions, and observed issues.",
+  "aliases": [
+    "review-specs",
+    "spec-review"
+  ],
+  "dependsOn": [
+    "gamp-specs"
+  ],
+  "outputs": [
+    "updated docs/specs/*.md",
+    "updated synchronized documentation surfaces when affected"
+  ],
+  "entrypoints": [
+    "SKILL.md",
+    "DS.md"
+  ],
+  "selfContained": true
+}

@@ -1,0 +1,23 @@
+{
+  "title": "Article Build",
+  "family": "anthropic",
+  "summary": "Rebuilds article outputs from article-owned plans, SVG assets, bibliography evidence, and generated chapter markdown while staying self-contained.",
+  "aliases": [
+    "article-build"
+  ],
+  "dependsOn": [],
+  "outputs": [
+    "<articleRoot>/index.html",
+    "<articleRoot>/assets/",
+    "<articleRoot>/plan/build-manifest.json"
+  ],
+  "entrypoints": [
+    "SKILL.md",
+    "skill.mjs",
+    "bibliography.mjs",
+    "referenceCatalog.mjs",
+    "renderHtml.mjs",
+    "svgValidation.mjs"
+  ],
+  "selfContained": true
+}
