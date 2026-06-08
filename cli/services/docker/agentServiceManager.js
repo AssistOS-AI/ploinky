@@ -11,7 +11,7 @@ import {
     resolveManifestImage,
     resolveVarValue
 } from '../secretVars.js';
-import { deriveDerivedMasterKey } from '../masterKey.js';
+import { buildAgentIdentityEnv, RESERVED_AGENT_ENV_NAMES } from '../agentIdentityEnv.js';
 import { debugLog } from '../utils.js';
 import {
     CONTAINER_CONFIG_PATH,
@@ -797,10 +797,12 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
 
     try {
         const repoName = path.basename(path.dirname(agentPath));
-        const principalId = deriveAgentPrincipalId(repoName, agentName);
-        const derivedMasterSecret = deriveDerivedMasterKey().toString('hex');
-        envStrings.push(formatEnvFlag('PLOINKY_AGENT_PRINCIPAL', principalId));
-        envStrings.push(formatEnvFlag('PLOINKY_DERIVED_MASTER_KEY', derivedMasterSecret));
+        // Per-agent request-signing identity (DS013). Each agent receives ONLY
+        // its own id + secret — never the master key, never the shared
+        // derived-master key, never another agent's secret.
+        for (const [key, value] of Object.entries(buildAgentIdentityEnv(deriveAgentPrincipalId(repoName, agentName)))) {
+            envStrings.push(formatEnvFlag(key, value));
+        }
     } catch (err) {
         debugLog(`[invocationAuth] could not set agent identity for ${agentName}: ${err?.message || err}`);
     }
@@ -849,6 +851,24 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         envStrings.push(formatEnvFlag('PLOINKY_LLM_MCP_PORT', '9001'));
         envStrings.push(formatEnvFlag('PLOINKY_LLM_CONTROL_PORT', '9002'));
         envStrings.push(formatEnvFlag('PLOINKY_INFERENCE_PORT', '8080'));
+    }
+
+    // DS013/DS011: strip any reserved identity/master env FLAG a config layer
+    // emitted (manifest env, runtime resources, profile env/secrets), then
+    // re-assert the authoritative agent identity LAST so no config can inject a
+    // master key or override the agent's derived secret.
+    const reservedEnvPrefixes = RESERVED_AGENT_ENV_NAMES.map((name) => `-e ${name}=`);
+    for (let i = envStrings.length - 1; i >= 0; i -= 1) {
+        if (reservedEnvPrefixes.some((prefix) => String(envStrings[i] || '').startsWith(prefix))) {
+            envStrings.splice(i, 1);
+        }
+    }
+    try {
+        for (const [key, value] of Object.entries(buildAgentIdentityEnv(deriveAgentPrincipalId(path.basename(path.dirname(agentPath)), agentName)))) {
+            envStrings.push(formatEnvFlag(key, value));
+        }
+    } catch (err) {
+        debugLog(`[invocationAuth] could not set agent identity for ${agentName}: ${err?.message || err}`);
     }
 
     const envFlags = flagsToArgs(envStrings);

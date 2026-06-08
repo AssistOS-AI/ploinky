@@ -110,6 +110,33 @@ function deriveDerivedMasterKey() {
     return deriveSubkey('derived-master');
 }
 
+// Per-agent request-signing secret. Router-only: the router/launcher derives
+// this for each enabled agent and injects ONLY that agent's own value as
+// PLOINKY_AGENT_SECRET. The domain separation is the canonical agent id
+// (`agent:<repo>/<agent>`), so no two agents share a signing key and one agent
+// reading its own environment cannot forge tokens for another agent. This is
+// the replacement for the shared `derived-master` invocation key (DS013):
+//   PLOINKY_AGENT_SECRET = HKDF_SHA256(master, salt="", info="ploinky/agent-secret/<agentId>/v1", 32)
+// Reuses deriveSubkey so the whole workspace keeps one derivation story; the
+// master key itself never leaves the router.
+function deriveAgentRequestSecret(agentId, { encoding = 'hex' } = {}) {
+    const id = String(agentId || '').trim();
+    if (!id) {
+        throw new Error('deriveAgentRequestSecret: agentId is required');
+    }
+    const raw = deriveSubkey(`agent-secret/${id}`, 32);
+    if (encoding === 'buffer') {
+        return raw;
+    }
+    if (encoding === 'base64') {
+        return raw.toString('base64');
+    }
+    if (encoding === 'base64url') {
+        return raw.toString('base64url');
+    }
+    return raw.toString('hex');
+}
+
 function deriveAgentSecret({
     repoName = 'unknown',
     agentName = 'unknown',
@@ -173,6 +200,7 @@ function deriveWorkspaceSecret({
 }
 
 export {
+    deriveAgentRequestSecret,
     deriveAgentSecret,
     deriveSubkey,
     deriveDerivedMasterKey,

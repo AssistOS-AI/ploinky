@@ -10,7 +10,7 @@ import {
     getManifestEnvNames,
     resolveVarValue
 } from '../secretVars.js';
-import { deriveDerivedMasterKey } from '../masterKey.js';
+import { buildAgentIdentityEnv, stripReservedAgentEnv } from '../agentIdentityEnv.js';
 import { debugLog } from '../utils.js';
 import {
     CONTAINER_CONFIG_PATH,
@@ -361,13 +361,8 @@ function buildFullEnvMap(agentName, manifest, profileConfig, agentWorkDir, repoN
         }
     }
 
-    try {
-        const principalId = deriveAgentPrincipalId(repoName, agentName);
-        env.PLOINKY_AGENT_PRINCIPAL = principalId;
-        env.PLOINKY_DERIVED_MASTER_KEY = deriveDerivedMasterKey().toString('hex');
-    } catch (err) {
-        debugLog(`[invocationAuth/bwrap] could not set agent identity: ${err?.message || err}`);
-    }
+    // Per-agent identity is asserted LAST (below), after all config layers, so it
+    // cannot be overridden by profile/manifest/secret env.
 
     // Profile env vars
     const profileEnv = profileConfig?.env;
@@ -430,6 +425,16 @@ function buildFullEnvMap(agentName, manifest, profileConfig, agentWorkDir, repoN
     env.NODE_PATH = '/code/node_modules';
     env.HOME = '/tmp';
     env.PATH = '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin';
+
+    // Final, authoritative agent identity (DS013): strip any reserved name a
+    // config layer may have set (master keys, or an identity override) and assert
+    // this agent's id + derived secret last so nothing can override them.
+    stripReservedAgentEnv(env);
+    try {
+        Object.assign(env, buildAgentIdentityEnv(deriveAgentPrincipalId(repoName, agentName)));
+    } catch (err) {
+        debugLog(`[invocationAuth/bwrap] could not set agent identity: ${err?.message || err}`);
+    }
 
     return env;
 }

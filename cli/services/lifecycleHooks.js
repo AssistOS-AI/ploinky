@@ -6,7 +6,8 @@ import { debugLog } from './utils.js';
 import { getProfileConfig, getProfileEnvVars, getHookNames, getActiveProfile } from './profileService.js';
 import { validateSecrets, getSecrets, createEnvWithSecrets, formatMissingSecretsError } from './secretInjector.js';
 import { buildEnvMap } from './secretVars.js';
-import { deriveDerivedMasterKey } from './masterKey.js';
+import { buildAgentIdentityEnv, stripReservedAgentEnv } from './agentIdentityEnv.js';
+import { deriveAgentPrincipalId } from './agentIdentity.js';
 import { installDependencies } from './dependencyInstaller.js';
 import {
     initWorkspaceStructure,
@@ -53,11 +54,15 @@ function buildLifecycleHookEnv({ agentName, repoName, profileName, profileConfig
     const manifestEnv = buildEnvMap(manifest, profileConfig, { agentName, repoName });
     const profileEnv = normalizeProfileEnv(profileConfig?.env);
     const secrets = profileConfig?.secrets ? getSecrets(profileConfig.secrets) : {};
-    let derivedMasterEnv = {};
+    const merged = createEnvWithSecrets({ ...envVars, ...profileEnv, ...manifestEnv }, secrets);
+    // Host lifecycle hooks run as the owning agent, so they receive that agent's
+    // own per-agent identity + signing secret (DS013), asserted LAST — never the
+    // shared key, and never an override from profile/manifest/secret config.
+    stripReservedAgentEnv(merged);
     try {
-        derivedMasterEnv = { PLOINKY_DERIVED_MASTER_KEY: deriveDerivedMasterKey().toString('hex') };
+        Object.assign(merged, buildAgentIdentityEnv(deriveAgentPrincipalId(repoName, agentName)));
     } catch (_) { }
-    return createEnvWithSecrets({ ...envVars, ...derivedMasterEnv, ...profileEnv, ...manifestEnv }, secrets);
+    return merged;
 }
 
 function getPreinstallRunKey(agentName, repoName, profileName) {
