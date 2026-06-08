@@ -229,7 +229,7 @@ test('user admin routes enforce admin access, CRUD, rev invalidation, and agent 
     });
     assert.equal(result.statusCode, 201);
     assert.equal(result.body.user.username, 'editor');
-    assert.deepEqual(result.body.user.roles, ['local', 'editor']);
+    assert.deepEqual(result.body.user.roles, ['user', 'editor']);
 
     const editorLogin = localService.authenticateLocalUser({
         username: 'editor',
@@ -248,7 +248,7 @@ test('user admin routes enforce admin access, CRUD, rev invalidation, and agent 
         },
     });
     assert.equal(result.statusCode, 200);
-    assert.deepEqual(result.body.user.roles, ['local', 'admin']);
+    assert.deepEqual(result.body.user.roles, ['user', 'admin']);
     assert.equal(localService.getSession(editorLogin.sessionId, { policy: explorerPolicy }), null);
 
     result = await invoke(authHandlers.handleUserAdminRoutes, {

@@ -1,58 +1,44 @@
 import crypto from 'node:crypto';
 
-import { signHmacJwt, bodyHashForRequest } from '../../../Agent/lib/jwtSign.mjs';
-import { verifyInvocationToken } from '../../../Agent/lib/jwtVerify.mjs';
-import { deriveDerivedMasterKey } from '../../services/masterKey.js';
+import { signHmacJwt } from '../../../Agent/lib/jwtSign.mjs';
+import { verifyAgentAssertionToken } from '../../../Agent/lib/requestSignedTokens.mjs';
+import { deriveAgentRequestSecret } from '../../services/masterKey.js';
 import { resolveAgentDescriptor } from '../../services/agentRegistry.js';
 
 /**
  * invocationMinter.js (router side)
  *
- * Mints HS256 invocation JWTs for agents. The router is the sole token
- * issuer. Two entry points:
+ * The router is the sole issuer of Router Request JWTs (typ:"router-request").
+ * Each is signed with the TARGET agent's own per-agent secret and bound to one
+ * concrete request via `rch` (request-content-hash), so a token minted for one
+ * agent/operation cannot be replayed against another. The legacy shared-key
+ * `typ:"invocation"` families are removed; the DS013 per-agent model replaces them.
  *
- *   - buildFirstPartyInvocation: browser/core calls an agent.
- *     The router acts as caller = "router:first-party".
- *
- *   - verifyDelegatedToolCall: an agent calls another agent.
- *     The calling agent presents its own invocation JWT as identity proof.
- *     The router verifies it and mints a fresh invocation JWT for the target.
+ * `verifyAgentAssertion` authenticates a source agent for agent-to-agent calls by
+ * deriving THAT agent's secret from its (untrusted) issuer claim and verifying
+ * the assertion — an agent cannot forge an assertion for another agent because it
+ * does not hold that agent's secret.
  */
 
-const DEFAULT_INVOCATION_TTL_SECONDS = 60;
-
-function getDerivedMasterKeyBuffer() {
-    return deriveDerivedMasterKey();
-}
+const ROUTER_REQUEST_TTL_SECONDS = 30;
+// `agent:<repo>/<agent>` — repo/agent segments contain no `/`, `:`, or whitespace.
+const AGENT_PRINCIPAL_RE = /^agent:[^/\s:]+\/[^/\s:]+$/;
 
 function nowSec() { return Math.floor(Date.now() / 1000); }
 
-function normalizeScopeList(input) {
-    if (!Array.isArray(input)) return [];
-    const out = [];
-    const seen = new Set();
-    for (const entry of input) {
-        const v = String(entry || '').trim().toLowerCase();
-        if (v && !seen.has(v)) {
-            seen.add(v);
-            out.push(v);
-        }
+function normalizeActor(actor) {
+    if (!actor || typeof actor !== 'object') {
+        return { kind: 'user', id: '', roles: [] };
     }
-    return out;
-}
-
-function normalizeDelegatedUser(user) {
-    if (!user || typeof user !== 'object') return null;
+    const kind = actor.kind === 'agent' || actor.kind === 'guest' ? actor.kind : 'user';
     return {
-        sub: String(user.id || user.sub || ''),
-        id: String(user.id || user.sub || ''),
-        email: String(user.email || ''),
-        username: String(user.username || user.preferred_username || user.name || ''),
-        roles: Array.isArray(user.roles) ? [...user.roles] : []
+        kind,
+        id: String(actor.id || ''),
+        roles: Array.isArray(actor.roles) ? actor.roles.map((r) => String(r || '')).filter(Boolean) : [],
     };
 }
 
-function resolveProviderPrincipal({ providerAgentRef, providerPrincipal }) {
+export function resolveProviderPrincipal({ providerAgentRef, providerPrincipal }) {
     if (providerPrincipal) return String(providerPrincipal).trim();
     const descriptor = resolveAgentDescriptor(providerAgentRef);
     if (!descriptor) {
@@ -61,99 +47,104 @@ function resolveProviderPrincipal({ providerAgentRef, providerPrincipal }) {
     return descriptor.principalId;
 }
 
-const FIRST_PARTY_DEFAULT_SCOPES = [
-    'secret:read', 'secret:write', 'secret:access',
-    'secret:grant', 'secret:revoke'
-];
-
-export function buildFirstPartyInvocation({
-    providerAgentRef,
-    providerPrincipal,
+/**
+ * Mint a Router Request JWT (router -> target agent), signed with the target
+ * agent's own secret. The caller computes `rch` over the exact request surface
+ * the target will execute; the target recomputes and rejects any mismatch.
+ */
+export function buildRouterRequest({
+    targetAgentId,
+    sub,
+    actor,
+    method,
+    path,
     tool,
-    scope,
-    bodyObject,
-    delegatedUser,
-    ttlSeconds
+    rch,
+    ttlSeconds,
 }) {
-    const resolvedScope = Array.isArray(scope) && scope.length ? scope : FIRST_PARTY_DEFAULT_SCOPES;
-    const resolvedProvider = resolveProviderPrincipal({ providerAgentRef, providerPrincipal });
-    if (!tool) throw new Error('invocationMinter: tool required');
+    const target = String(targetAgentId || '').trim();
+    if (!target) throw new Error('invocationMinter: targetAgentId required');
+    if (!method) throw new Error('invocationMinter: method required');
+    if (!path) throw new Error('invocationMinter: path required');
+    if (!rch) throw new Error('invocationMinter: rch required');
     const iat = nowSec();
+    const ttl = Math.max(5, Math.min(Number(ttlSeconds) || ROUTER_REQUEST_TTL_SECONDS, ROUTER_REQUEST_TTL_SECONDS));
     const payload = {
-        typ: 'invocation',
+        typ: 'router-request',
         iss: 'ploinky-router',
-        aud: String(resolvedProvider),
-        sub: String(delegatedUser?.id || delegatedUser?.sub || ''),
-        caller: 'router:first-party',
-        tool: String(tool),
-        scope: normalizeScopeList(resolvedScope),
-        bh: bodyHashForRequest(bodyObject ?? {}),
-        usr: normalizeDelegatedUser(delegatedUser),
+        aud: target,
+        sub: String(sub || ''),
+        actor: normalizeActor(actor),
+        method: String(method),
+        path: String(path),
+        rch: String(rch),
         jti: crypto.randomBytes(16).toString('base64url'),
         iat,
-        exp: iat + Math.max(5, Math.min(Number(ttlSeconds) || DEFAULT_INVOCATION_TTL_SECONDS, 120))
+        exp: iat + ttl,
     };
-    const token = signHmacJwt({ payload, secret: getDerivedMasterKeyBuffer() });
-    return { token, payload };
-}
-
-export function buildDelegatedInvocation({
-    providerPrincipal,
-    callerPrincipal,
-    tool,
-    scope,
-    bodyObject,
-    delegatedUser,
-    ttlSeconds
-}) {
-    if (!providerPrincipal) throw new Error('invocationMinter: providerPrincipal required');
-    if (!tool) throw new Error('invocationMinter: tool required');
-    const resolvedScope = Array.isArray(scope) && scope.length ? scope : FIRST_PARTY_DEFAULT_SCOPES;
-    const iat = nowSec();
-    const payload = {
-        typ: 'invocation',
-        iss: 'ploinky-router',
-        aud: String(providerPrincipal),
-        sub: String(delegatedUser?.id || delegatedUser?.sub || ''),
-        caller: String(callerPrincipal),
-        tool: String(tool),
-        scope: normalizeScopeList(resolvedScope),
-        bh: bodyHashForRequest(bodyObject ?? {}),
-        usr: normalizeDelegatedUser(delegatedUser),
-        jti: crypto.randomBytes(16).toString('base64url'),
-        iat,
-        exp: iat + Math.max(5, Math.min(Number(ttlSeconds) || DEFAULT_INVOCATION_TTL_SECONDS, 120))
-    };
-    const token = signHmacJwt({ payload, secret: getDerivedMasterKeyBuffer() });
-    return { token, payload };
-}
-
-export function verifyDelegatedToolCall({
-    providerAgentRef,
-    providerPrincipal,
-    callerJwt
-}) {
-    const resolvedProvider = resolveProviderPrincipal({ providerAgentRef, providerPrincipal });
-    if (!callerJwt) {
-        throw new Error('invocationMinter: caller JWT required');
+    if (tool !== undefined && tool !== null && String(tool) !== '') {
+        payload.tool = String(tool);
     }
-    const { payload } = verifyInvocationToken(callerJwt, {
-        secret: getDerivedMasterKeyBuffer(),
-        maxTtlSeconds: 120
+    const secret = deriveAgentRequestSecret(target, { encoding: 'buffer' });
+    const token = signHmacJwt({ payload, secret });
+    return { token, payload };
+}
+
+/**
+ * Verify an Agent Assertion JWT presented by a source agent for an
+ * agent-to-agent call. The issuer claim is UNTRUSTED until verified: the router
+ * derives the claimed agent's per-agent secret and verifies the signature with
+ * it, so an agent that only knows its own secret cannot forge an assertion for
+ * another agent. The assertion is bound to this exact request (method/path/tool/
+ * `rch`) and, when provided, to the intended target agent.
+ *
+ * `token` is the raw assertion; `method`/`path`/`tool`/`rch` describe the actual
+ * request; `targetAgentId` is the resolved target principal; `replayCache`
+ * prevents reuse. Returns `{ callerPrincipal, payload }`.
+ */
+export function verifyAgentAssertion({ token, method, path, tool, rch, targetAgentId, replayCache }) {
+    if (!token) {
+        throw new Error('invocationMinter: agent assertion required');
+    }
+    const parts = String(token).split('.');
+    if (parts.length !== 3) {
+        throw new Error('invocationMinter: malformed agent assertion');
+    }
+    let claims;
+    try {
+        claims = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8'));
+    } catch {
+        throw new Error('invocationMinter: malformed agent assertion payload');
+    }
+    const iss = String(claims?.iss || '');
+    if (!AGENT_PRINCIPAL_RE.test(iss)) {
+        throw new Error('invocationMinter: agent assertion issuer is not a valid agent id');
+    }
+    const secret = deriveAgentRequestSecret(iss, { encoding: 'buffer' });
+    const { payload } = verifyAgentAssertionToken(token, {
+        secret,
+        expectedAudience: 'ploinky-router',
+        method,
+        path,
+        tool,
+        rch,
+        replayCache,
     });
-    const callerPrincipal = String(payload.aud || '').trim();
-    if (!callerPrincipal) {
-        throw new Error('invocationMinter: caller token missing audience (caller identity)');
+    // The assertion MUST be bound to the addressed target (DS013): require the
+    // claim, require a resolved target, and require they match. A target-less
+    // assertion (or one for a different agent) is rejected — never accepted as
+    // valid for whatever target the router happened to resolve from the URL.
+    if (!payload.targetAgent) {
+        throw new Error('invocationMinter: agent assertion is missing targetAgent');
     }
-    return {
-        providerPrincipal: resolvedProvider,
-        callerPrincipal,
-        user: payload.usr || null
-    };
+    if (!targetAgentId || String(payload.targetAgent) !== String(targetAgentId)) {
+        throw new Error('invocationMinter: agent assertion targetAgent mismatch');
+    }
+    return { callerPrincipal: iss, payload };
 }
 
 export default {
-    buildFirstPartyInvocation,
-    buildDelegatedInvocation,
-    verifyDelegatedToolCall
+    buildRouterRequest,
+    resolveProviderPrincipal,
+    verifyAgentAssertion
 };

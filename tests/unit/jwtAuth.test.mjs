@@ -8,25 +8,25 @@ import {
     canonicalJson
 } from '../../Agent/lib/jwtSign.mjs';
 import {
-    verifyInvocationToken,
     createMemoryReplayCache,
     verifyJws,
     MAX_TTL_SECONDS
 } from '../../Agent/lib/jwtVerify.mjs';
 
+// This suite covers the shared HS256 JWS primitive layer that every DS013 token
+// family (User Session, Agent Assertion, Router Request) is built on:
+// signing, audience binding, request-body binding (`bh`), replay/jti, and TTL.
+// The per-family `typ`/`iss`/`tool`/`rch` checks live in the dedicated
+// routerRequestJwt / agentAssertion / userSessionJwt suites; the retired
+// `typ:"invocation"` model is intentionally not exercised here.
 const SECRET = crypto.randomBytes(32);
 const EXAMPLE_BODY = { tool: 'secret_get', arguments: { key: 'X' } };
 
-function mintInvocation(overrides = {}) {
+function mintJws(overrides = {}) {
     const now = Math.floor(Date.now() / 1000);
     const payload = {
-        typ: 'invocation',
-        iss: 'ploinky-router',
         aud: 'agent:AssistOSExplorer/dpuAgent',
         sub: 'user:local:admin',
-        caller: 'router:first-party',
-        tool: 'secret_get',
-        scope: ['secret:read'],
         bh: bodyHashForRequest(EXAMPLE_BODY),
         usr: { id: 'local:admin', username: 'admin', roles: ['local'] },
         jti: crypto.randomBytes(12).toString('base64url'),
@@ -37,29 +37,28 @@ function mintInvocation(overrides = {}) {
     return { token: signHmacJwt({ payload, secret: SECRET }), payload };
 }
 
-test('signHmacJwt / verifyJws round-trip', () => {
-    const { token, payload } = mintInvocation();
+test('signHmacJwt / verifyJws round-trip preserves claims and uses HS256', () => {
+    const { token } = mintJws();
     const result = verifyJws(token, {
         secret: SECRET,
         expectedAudience: 'agent:AssistOSExplorer/dpuAgent',
         bodyObject: EXAMPLE_BODY,
         replayCache: createMemoryReplayCache()
     });
-    assert.equal(result.payload.tool, 'secret_get');
-    assert.equal(result.payload.caller, 'router:first-party');
+    assert.equal(result.payload.sub, 'user:local:admin');
     assert.equal(result.payload.usr.username, 'admin');
     assert.equal(result.header.alg, 'HS256');
 });
 
-test('verifyInvocationToken enforces audience', () => {
-    const { token } = mintInvocation();
-    verifyInvocationToken(token, {
+test('verifyJws enforces audience', () => {
+    const { token } = mintJws();
+    verifyJws(token, {
         secret: SECRET,
         expectedAudience: 'agent:AssistOSExplorer/dpuAgent',
         bodyObject: EXAMPLE_BODY,
         replayCache: createMemoryReplayCache()
     });
-    assert.throws(() => verifyInvocationToken(token, {
+    assert.throws(() => verifyJws(token, {
         secret: SECRET,
         expectedAudience: 'agent:otherAgent',
         bodyObject: EXAMPLE_BODY,
@@ -67,47 +66,9 @@ test('verifyInvocationToken enforces audience', () => {
     }), /audience mismatch/);
 });
 
-test('verifyInvocationToken enforces invocation type, issuer, and tool', () => {
-    const wrongType = mintInvocation({ typ: 'session' }).token;
-    assert.throws(() => verifyInvocationToken(wrongType, {
-        secret: SECRET,
-        expectedAudience: 'agent:AssistOSExplorer/dpuAgent',
-        expectedTool: 'secret_get',
-        bodyObject: EXAMPLE_BODY,
-        replayCache: createMemoryReplayCache()
-    }), /token type is not invocation/);
-
-    const wrongIssuer = mintInvocation({ iss: 'other-issuer' }).token;
-    assert.throws(() => verifyInvocationToken(wrongIssuer, {
-        secret: SECRET,
-        expectedAudience: 'agent:AssistOSExplorer/dpuAgent',
-        expectedTool: 'secret_get',
-        bodyObject: EXAMPLE_BODY,
-        replayCache: createMemoryReplayCache()
-    }), /issuer mismatch/);
-
-    const wrongTool = mintInvocation({ tool: 'secret_put' }).token;
-    assert.throws(() => verifyInvocationToken(wrongTool, {
-        secret: SECRET,
-        expectedAudience: 'agent:AssistOSExplorer/dpuAgent',
-        expectedTool: 'secret_get',
-        bodyObject: EXAMPLE_BODY,
-        replayCache: createMemoryReplayCache()
-    }), /tool mismatch/);
-});
-
-test('buildFirstPartyInvocation embeds usr claim', () => {
-    const { payload } = mintInvocation({
-        usr: { id: 'local:bob', username: 'bob', roles: ['developer'] }
-    });
-    assert.equal(payload.usr.username, 'bob');
-    assert.deepEqual(payload.usr.roles, ['developer']);
-    assert.equal(payload.caller, 'router:first-party');
-});
-
-test('verifyInvocationToken rejects mutated body', () => {
-    const { token } = mintInvocation();
-    assert.throws(() => verifyInvocationToken(token, {
+test('verifyJws rejects a mutated request body (bh binding)', () => {
+    const { token } = mintJws();
+    assert.throws(() => verifyJws(token, {
         secret: SECRET,
         expectedAudience: 'agent:AssistOSExplorer/dpuAgent',
         bodyObject: { tool: 'secret_get', arguments: { key: 'Y' } },
@@ -115,16 +76,16 @@ test('verifyInvocationToken rejects mutated body', () => {
     }), /body hash mismatch/);
 });
 
-test('verifyInvocationToken rejects replay within ttl window', () => {
-    const { token } = mintInvocation({ jti: 'replay-test-1' });
+test('verifyJws rejects replay within the ttl window', () => {
+    const { token } = mintJws({ jti: 'replay-test-1' });
     const cache = createMemoryReplayCache();
-    verifyInvocationToken(token, {
+    verifyJws(token, {
         secret: SECRET,
         expectedAudience: 'agent:AssistOSExplorer/dpuAgent',
         bodyObject: EXAMPLE_BODY,
         replayCache: cache
     });
-    assert.throws(() => verifyInvocationToken(token, {
+    assert.throws(() => verifyJws(token, {
         secret: SECRET,
         expectedAudience: 'agent:AssistOSExplorer/dpuAgent',
         bodyObject: EXAMPLE_BODY,
@@ -132,19 +93,16 @@ test('verifyInvocationToken rejects replay within ttl window', () => {
     }), /jti has already been consumed/);
 });
 
-test('verifyInvocationToken rejects token without jti', () => {
+test('verifyJws rejects a token without jti', () => {
     const now = Math.floor(Date.now() / 1000);
     const payload = {
-        typ: 'invocation',
-        iss: 'ploinky-router',
         aud: 'agent:AssistOSExplorer/dpuAgent',
-        tool: 'secret_get',
         bh: bodyHashForRequest(EXAMPLE_BODY),
         iat: now,
         exp: now + 60
     };
     const token = signHmacJwt({ payload, secret: SECRET });
-    assert.throws(() => verifyInvocationToken(token, {
+    assert.throws(() => verifyJws(token, {
         secret: SECRET,
         expectedAudience: 'agent:AssistOSExplorer/dpuAgent',
         bodyObject: EXAMPLE_BODY,
@@ -152,10 +110,10 @@ test('verifyInvocationToken rejects token without jti', () => {
     }), /jti missing/);
 });
 
-test('verifyInvocationToken rejects token with excessive lifetime', () => {
+test('verifyJws rejects a token with excessive lifetime', () => {
     const now = Math.floor(Date.now() / 1000);
-    const { token } = mintInvocation({ iat: now, exp: now + MAX_TTL_SECONDS + 30 });
-    assert.throws(() => verifyInvocationToken(token, {
+    const { token } = mintJws({ iat: now, exp: now + MAX_TTL_SECONDS + 30 });
+    assert.throws(() => verifyJws(token, {
         secret: SECRET,
         expectedAudience: 'agent:AssistOSExplorer/dpuAgent',
         bodyObject: EXAMPLE_BODY,
@@ -163,8 +121,8 @@ test('verifyInvocationToken rejects token with excessive lifetime', () => {
     }), /lifetime exceeds max/);
 });
 
-test('verifyJws rejects wrong secret', () => {
-    const { token } = mintInvocation();
+test('verifyJws rejects a wrong secret', () => {
+    const { token } = mintJws();
     const wrongSecret = crypto.randomBytes(32);
     assert.throws(() => verifyJws(token, {
         secret: wrongSecret,
@@ -173,8 +131,8 @@ test('verifyJws rejects wrong secret', () => {
     }), /signature invalid/);
 });
 
-test('verifyJws rejects tampered payload', () => {
-    const { token } = mintInvocation();
+test('verifyJws rejects a tampered payload', () => {
+    const { token } = mintJws();
     const parts = token.split('.');
     const payloadBuf = Buffer.from(JSON.stringify({ iss: 'attacker' }));
     parts[1] = payloadBuf.toString('base64url');

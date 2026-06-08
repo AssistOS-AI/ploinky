@@ -10,8 +10,9 @@ import {
 } from '../lib/jwtVerify.mjs';
 import {
     hasInvocationTokenHeader,
-    verifyInvocationFromHeaders
+    verifyRouterRequestFromHeaders
 } from '../lib/invocationAuth.mjs';
+import { computeRchTool } from '../lib/requestHash.mjs';
 import { describeShellFailure } from '../lib/toolError.mjs';
 const { z } = zod;
 
@@ -24,11 +25,17 @@ const AGENT_CARD_PATH = '/agent-card';
 const TASK_STATUS_PATHS = new Set(['/getTaskStatus', '/task']);
 const TAG_NAME_RE = /^[a-z][a-z0-9_-]{0,63}$/;
 
-function verifyInvocationForRequest({ requestHeaders, bodyObject, expectedTool }) {
-    return verifyInvocationFromHeaders(requestHeaders, bodyObject, {
+function verifyInvocationForRequest({ requestHeaders, method, path, tool, argumentsObj }) {
+    // Recompute the request-content-hash from the actual request surface and
+    // verify the router-minted token binds exactly this method/path/tool/rch.
+    const rch = computeRchTool({ method, path, tool, arguments: argumentsObj || {} });
+    return verifyRouterRequestFromHeaders(requestHeaders, {
         env: process.env,
         replayCache: invocationReplayCache,
-        expectedTool
+        method,
+        path,
+        tool,
+        rch,
     });
 }
 
@@ -769,9 +776,9 @@ function rejectInvocation(helpers, reason) {
     throw new ErrorCtor(code, `Invocation rejected: ${reason}`);
 }
 
-function requireVerifiedInvocation({ requestHeaders, bodyObject, expectedTool, context = {}, helpers }) {
+function requireVerifiedInvocation({ requestHeaders, method, path, tool, argumentsObj, context = {}, helpers }) {
     const invocationResult = hasInvocationTokenHeader(requestHeaders)
-        ? verifyInvocationForRequest({ requestHeaders, bodyObject, expectedTool })
+        ? verifyInvocationForRequest({ requestHeaders, method, path, tool, argumentsObj })
         : { ok: false, reason: 'missing secure wire headers' };
     if (!invocationResult.ok) {
         rejectInvocation(helpers, invocationResult.reason);
@@ -845,11 +852,12 @@ async function registerFromConfig(server, config, helpers) {
                 // Secure wire: verify router-minted invocation token before
                 // exposing any caller context. On success, attach the verified
                 // grant to the metadata so tools can rely on it.
-                const bodyObject = { tool: name, arguments: args || {} };
                 context = requireVerifiedInvocation({
                     requestHeaders,
-                    bodyObject,
-                    expectedTool: name,
+                    method: 'POST',
+                    path: '/mcp',
+                    tool: name,
+                    argumentsObj: args || {},
                     context,
                     helpers
                 });
@@ -932,11 +940,12 @@ async function registerFromConfig(server, config, helpers) {
             if (resource.template && typeof resource.template === 'string') {
                 const template = new ResourceTemplate(resource.template, extractTemplateParams(resource.template));
                 server.registerResource(name, template, metadata, async (uri, params = {}, extra = {}) => {
-                    const bodyObject = { tool: 'resources/read', arguments: { uri: uri.href } };
                     requireVerifiedInvocation({
                         requestHeaders: extra?.requestInfo?.headers || null,
-                        bodyObject,
-                        expectedTool: 'resources/read',
+                        method: 'POST',
+                        path: '/mcp',
+                        tool: 'resources/read',
+                        argumentsObj: { uri: uri.href },
                         context: extra,
                         helpers
                     });
@@ -951,11 +960,12 @@ async function registerFromConfig(server, config, helpers) {
                 });
             } else if (resource.uri && typeof resource.uri === 'string') {
                 server.registerResource(name, resource.uri, metadata, async (uri, extra = {}) => {
-                    const bodyObject = { tool: 'resources/read', arguments: { uri: uri.href } };
                     requireVerifiedInvocation({
                         requestHeaders: extra?.requestInfo?.headers || null,
-                        bodyObject,
-                        expectedTool: 'resources/read',
+                        method: 'POST',
+                        path: '/mcp',
+                        tool: 'resources/read',
+                        argumentsObj: { uri: uri.href },
                         context: extra,
                         helpers
                     });
@@ -1093,12 +1103,13 @@ async function main() {
                 if (!taskId) {
                     return sendJson(400, { error: 'missing taskId' });
                 }
-                const bodyObject = { tool: '__task_status__', arguments: { taskId } };
                 const invocationResult = hasInvocationTokenHeader(req.headers)
                     ? verifyInvocationForRequest({
                         requestHeaders: req.headers,
-                        bodyObject,
-                        expectedTool: '__task_status__'
+                        method: 'GET',
+                        path: u.pathname,
+                        tool: '__task_status__',
+                        argumentsObj: { taskId },
                     })
                     : { ok: false, reason: 'missing secure wire headers' };
                 if (!invocationResult.ok) {

@@ -11,6 +11,7 @@ import { readRouterSettings, updateRouterSettings } from '../services/routerSett
 import { resolveHttpServiceRoute } from './httpServiceRoutes.js';
 import { createAuthService } from './auth/service.js';
 import { authenticateLocalUser, createLocalAuthUser, deleteLocalAuthUser, GUEST_SESSION_TTL_SECONDS, getSession as getLocalSession, getSessionCookieMaxAge as getLocalSessionCookieMaxAge, isLocalAdminUser, listLocalAuthUsers, mintGuestSessionJwt, mintSessionJwt, resolveLocalAuthConfig, resolveUserRev, revokeSession as revokeLocalSession, updateLocalAuthUser, updateLocalCredentials, verifySessionJwt } from './auth/localService.js';
+import { revokeSessionId } from './auth/sessionRevocations.js';
 import { waitForAgentReady } from './utils/agentReadiness.js';
 
 const SSO_AUTH_COOKIE_NAME = 'ploinky_sso';
@@ -847,7 +848,7 @@ export async function ensureAgentAuthenticated(req, res, parsedUrl) {
     return {
         ok: false,
         error: 'legacy_agent_bearer_auth_removed',
-        detail: 'Use X-Ploinky-Caller-JWT delegated requests via the router secure wire.'
+        detail: 'Agent-to-agent calls use an Agent Assertion JWT carried as `Authorization: Bearer`, verified by the router (DS013).'
     };
 }
 
@@ -948,7 +949,8 @@ export async function ensureAuthenticated(req, res, parsedUrl) {
     try {
         if (authContext.mode === 'local' && session.user) {
             const refreshedJwt = mintSessionJwt(session.user, session._jwtPayload?.rev || 1, {
-                usersVar: session.localAuth?.usersVar || authContext.policy?.usersVar || ''
+                usersVar: session.localAuth?.usersVar || authContext.policy?.usersVar || '',
+                sid: session._jwtPayload?.sid || ''
             });
             const cookie = buildCookie(cookieName, refreshedJwt, req, '/', {
                 maxAge: getLocalSessionCookieMaxAge(),
@@ -1436,6 +1438,14 @@ export async function handleAuthRoutes(req, res, parsedUrl) {
             const cookieName = getCookieNameForMode(authContext.mode);
             const sessionId = cookies.get(cookieName) || '';
             const requestedReturnTo = normalizeRelativePath(parsedUrl.searchParams.get('returnTo') || '/', '/');
+            // For stateless JWT sessions (local + guest), add the session's sid to
+            // the persistent revocation list so the cookie cannot be replayed.
+            if (sessionId && (authContext.mode === 'local' || authContext.mode === 'guest')) {
+                try {
+                    const payload = verifySessionJwt(sessionId);
+                    revokeSessionId({ sid: payload.sid, jti: payload.jti, reason: 'logout' });
+                } catch { /* already invalid/expired — nothing to revoke */ }
+            }
             const outcome = authContext.mode === 'local'
                 ? (revokeLocalSession(sessionId), { redirect: requestedReturnTo || '/' })
                 : await authService.logout(sessionId, {

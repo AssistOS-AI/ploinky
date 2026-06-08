@@ -9,7 +9,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 
-import { signHmacJwt, bodyHashForRequest } from '../../Agent/lib/jwtSign.mjs';
+import { signHmacJwt } from '../../Agent/lib/jwtSign.mjs';
+import { computeRchTool } from '../../Agent/lib/requestHash.mjs';
 
 const REPO_ROOT = path.resolve(new URL('../..', import.meta.url).pathname);
 const AGENT_SERVER = path.join(REPO_ROOT, 'Agent/server/AgentServer.mjs');
@@ -120,24 +121,24 @@ async function initializeSession(port) {
     return sessionId;
 }
 
-function mintInvocation({ secret, audience, tool, args = {} }) {
+function mintRouterRequest({ secret, audience, tool, args = {}, method = 'POST', reqPath = '/mcp' }) {
     const now = Math.floor(Date.now() / 1000);
-    const bodyObject = { tool, arguments: args };
+    const rch = computeRchTool({ method, path: reqPath, tool, arguments: args });
     return signHmacJwt({
         secret,
         payload: {
-            typ: 'invocation',
+            typ: 'router-request',
             iss: 'ploinky-router',
             aud: audience,
             sub: 'user:test',
-            caller: 'router:first-party',
+            actor: { kind: 'user', id: 'user:test', roles: ['user'] },
+            method,
+            path: reqPath,
             tool,
-            scope: [],
-            bh: bodyHashForRequest(bodyObject),
-            usr: { id: 'test', username: 'test', roles: ['local'] },
+            rch,
             jti: crypto.randomBytes(12).toString('base64url'),
             iat: now,
-            exp: now + 60
+            exp: now + 30
         }
     });
 }
@@ -264,8 +265,8 @@ test('AgentServer idle GC does not close a session while a tool response is in f
         env: {
             MCP_SESSION_IDLE_TIMEOUT_MS: '100',
             MCP_SESSION_GC_INTERVAL_MS: '25',
-            PLOINKY_DERIVED_MASTER_KEY: secret.toString('hex'),
-            PLOINKY_AGENT_PRINCIPAL: audience
+            PLOINKY_AGENT_SECRET: secret.toString('hex'),
+            PLOINKY_AGENT_ID: audience
         }
     });
 
@@ -275,7 +276,7 @@ test('AgentServer idle GC does not close a session while a tool response is in f
         method: 'notifications/initialized'
     }, { sessionId });
 
-    const token = mintInvocation({ secret, audience, tool: 'slow', args: {} });
+    const token = mintRouterRequest({ secret, audience, tool: 'slow', args: {} });
     const call = await mcpPost(port, {
         jsonrpc: '2.0',
         id: 'call-slow',

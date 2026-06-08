@@ -18,6 +18,15 @@ export function authInfoFromInvocation(grant, { invocationToken = '' } = {}) {
     };
   }
   out.invocation = {
+    issuer: String(grant.iss || ''),
+    subject: String(grant.sub || grant.actor?.id || ''),
+    actor: grant.actor && typeof grant.actor === 'object'
+      ? {
+          kind: String(grant.actor.kind || ''),
+          id: String(grant.actor.id || ''),
+          roles: Array.isArray(grant.actor.roles) ? [...grant.actor.roles] : []
+        }
+      : null,
     scope: Array.isArray(grant.scope) ? [...grant.scope] : [],
     tool: String(grant.tool || ''),
     workspaceId: String(grant.workspace_id || '')

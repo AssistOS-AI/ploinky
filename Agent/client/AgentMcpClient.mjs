@@ -1,20 +1,17 @@
-// AgentMcpClient: MCP client helper for agents to call other agents via RoutingServer.
-// Uses mcp-sdk Client and StreamableHTTPClientTransport, similar to cli/server/AgentClient.js.
-// Includes OAuth token management for agent-to-agent authentication.
+// AgentMcpClient: lets an agent call another agent's tools THROUGH the router.
+//
+// Agent-to-agent is always router-mediated (DS013): the source agent signs a
+// per-call Agent Assertion with its OWN PLOINKY_AGENT_SECRET, posts a direct
+// JSON-RPC tools/call to the router at /<target>/mcp with the assertion as
+// `Authorization: Bearer`, and the router verifies the assertion, applies MCP
+// policy, and mints a Router Request for the target. There is no shared key and
+// no client-credentials token exchange; the legacy /auth/agent-token flow is gone.
 
-import { client as mcpClient, StreamableHTTPClientTransport } from 'mcp-sdk';
-import http from 'http';
-import https from 'https';
+import http from 'node:http';
+import https from 'node:https';
 
-const { Client } = mcpClient;
+import { signAgentAssertion } from '../lib/agentAssertion.mjs';
 
-// Token cache
-let cachedToken = null;
-let tokenExpiresAt = 0;
-
-/**
- * Get router URL from environment variables
- */
 export function getRouterUrl() {
     const routerUrl = process.env.PLOINKY_ROUTER_URL;
     if (routerUrl && typeof routerUrl === 'string' && routerUrl.trim()) {
@@ -24,159 +21,87 @@ export function getRouterUrl() {
     return `http://127.0.0.1:${routerPort}`;
 }
 
-/**
- * Get agent MCP endpoint URL for a target agent
- */
 export function getAgentMcpUrl(agentName) {
-    const routerUrl = getRouterUrl();
-    return `${routerUrl}/${agentName}/mcp`;
+    return `${getRouterUrl()}/${agentName}/mcp`;
 }
 
-/**
- * Get OAuth access token for agent authentication
- * Caches token and refreshes when expired
- */
-export async function getAgentAccessToken() {
-    const now = Date.now();
-    
-    // Return cached token if still valid (with 60 second buffer)
-    if (cachedToken && tokenExpiresAt > now + 60000) {
-        return cachedToken;
-    }
-    
-    const clientId = process.env.PLOINKY_AGENT_CLIENT_ID;
-    const clientSecret = process.env.PLOINKY_AGENT_CLIENT_SECRET;
-    
-    if (!clientId || !clientSecret) {
-        throw new Error('PLOINKY_AGENT_CLIENT_ID and PLOINKY_AGENT_CLIENT_SECRET must be set');
-    }
-    
-    const routerUrl = getRouterUrl();
-    const tokenUrl = `${routerUrl}/auth/agent-token`;
-    
-    // Request token from router
-    const tokenData = await new Promise((resolve, reject) => {
-        const body = JSON.stringify({ client_id: clientId, client_secret: clientSecret });
-        const url = new URL(tokenUrl);
-        const httpModule = url.protocol === 'https:' ? https : http;
-        const pathWithQuery = `${url.pathname}${url.search || ''}`;
-        const options = {
+function postToolCall(agentName, jsonRpcBody, assertion) {
+    const url = new URL(getAgentMcpUrl(agentName));
+    const httpModule = url.protocol === 'https:' ? https : http;
+    const payload = Buffer.from(JSON.stringify(jsonRpcBody), 'utf8');
+    return new Promise((resolve, reject) => {
+        const req = httpModule.request({
             hostname: url.hostname,
             port: url.port || (url.protocol === 'https:' ? 443 : 80),
-            path: pathWithQuery,
+            path: `${url.pathname}${url.search || ''}`,
             method: 'POST',
             headers: {
-                'Content-Type': 'application/json',
-                'Content-Length': Buffer.byteLength(body),
+                'content-type': 'application/json',
+                'content-length': payload.length,
+                accept: 'application/json',
+                authorization: `Bearer ${assertion}`,
             },
-        };
-        
-        const req = httpModule.request(options, (res) => {
+        }, (res) => {
             const chunks = [];
             res.on('data', (chunk) => chunks.push(chunk));
             res.on('end', () => {
-                const responseText = Buffer.concat(chunks).toString('utf8');
-                try {
-                    const parsed = JSON.parse(responseText);
-                    if (!parsed.ok) {
-                        reject(new Error(parsed.error || 'Token request failed'));
-                        return;
-                    }
-                    resolve(parsed);
-                } catch (err) {
-                    reject(new Error(`Invalid token response: ${responseText}`));
-                }
+                const text = Buffer.concat(chunks).toString('utf8');
+                let json = null;
+                try { json = text ? JSON.parse(text) : null; } catch { json = null; }
+                resolve({ status: res.statusCode, json, text });
             });
         });
-        
         req.on('error', reject);
-        req.write(body);
-        req.end();
+        req.end(payload);
     });
-    
-    cachedToken = tokenData.access_token;
-    const expiresIn = tokenData.expires_in || 3600;
-    tokenExpiresAt = now + (expiresIn * 1000);
-    
-    return cachedToken;
 }
 
 /**
- * Create MCP client for calling another agent via router
+ * Create a router-mediated client for calling `agentName`'s tools. Only
+ * `callTool` is supported: the router's delegated path accepts a direct
+ * tools/call, so listing/initialization over agent-to-agent is intentionally
+ * unavailable (use a user/session surface for discovery).
  */
 export async function createAgentClient(agentName) {
-    const agentUrl = getAgentMcpUrl(agentName);
-    let client = null;
-    let transport = null;
-    let connected = false;
-    
-    // Get OAuth token
-    const accessToken = await getAgentAccessToken();
-    
-    async function connect() {
-        if (connected && client && transport) return;
-        
-        // Create transport with Authorization header in requestInit
-        const url = new URL(agentUrl);
-        transport = new StreamableHTTPClientTransport(url, {
-            requestInit: {
-                headers: {
-                    'Authorization': `Bearer ${accessToken}`
-                }
-            }
+    async function callTool(name, args = {}) {
+        const toolArgs = args && typeof args === 'object' && !Array.isArray(args) ? args : {};
+        const assertion = signAgentAssertion({
+            method: 'POST',
+            path: '/mcp',
+            targetAgent: agentName,
+            tool: name,
+            argumentsObj: toolArgs,
         });
-        
-        client = new Client({ name: 'ploinky-agent-client', version: '1.0.0' });
-        await client.connect(transport);
-        connected = true;
+        const body = {
+            jsonrpc: '2.0',
+            id: `a2a-${Math.floor(Date.now() / 1000)}-${Math.random().toString(36).slice(2)}`,
+            method: 'tools/call',
+            params: { name, arguments: toolArgs },
+        };
+        const { status, json, text } = await postToolCall(agentName, body, assertion);
+        if (json && json.error) {
+            const err = new Error(json.error.message || 'agent-to-agent call failed');
+            err.code = json.error.code;
+            err.data = json.error.data;
+            throw err;
+        }
+        if (status >= 400 || !json) {
+            throw new Error(`agent-to-agent call failed (status ${status}): ${(text || '').slice(0, 200)}`.trim());
+        }
+        return json.result;
     }
-    
-    async function listTools() {
-        await connect();
-        const { tools } = await client.listTools({});
-        return tools || [];
-    }
-    
-    async function callTool(name, args) {
-        await connect();
-        const result = await client.callTool({ name, arguments: args || {} });
-        return result;
-    }
-    
-    async function listResources() {
-        await connect();
-        const { resources } = await client.listResources({});
-        return resources || [];
-    }
-    
-    async function readResource(uri) {
-        await connect();
-        const res = await client.readResource({ uri });
-        return res?.resource ?? res;
-    }
-    
-    async function ping() {
-        await connect();
-        return await client.ping();
-    }
-    
-    async function close() {
-        try {
-            if (client) await client.close();
-        } catch (_) {}
-        try {
-            if (transport) await transport.close?.();
-        } catch (_) {}
-        connected = false;
-        client = null;
-        transport = null;
-    }
-    
-    return { connect, listTools, callTool, listResources, readResource, ping, close };
-}
 
-// Test helper to reset cached token state (used by automated tests)
-export function __resetAgentClientTestState() {
-    cachedToken = null;
-    tokenExpiresAt = 0;
+    const unsupported = (op) => async () => {
+        throw new Error(`${op} is not available via agent-to-agent calls; use callTool`);
+    };
+
+    return {
+        callTool,
+        connect: async () => {},
+        listTools: unsupported('listTools'),
+        listResources: unsupported('listResources'),
+        readResource: unsupported('readResource'),
+        ping: unsupported('ping'),
+        close: async () => {},
+    };
 }

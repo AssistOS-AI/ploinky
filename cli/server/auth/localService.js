@@ -6,8 +6,15 @@ import { hashPassword, verifyPasswordHash } from '../../services/localAuthPasswo
 import { signHmacJwt } from '../../../Agent/lib/jwtSign.mjs';
 import { verifyJws } from '../../../Agent/lib/jwtVerify.mjs';
 import { createSessionStore } from './sessionStore.js';
+import { isSessionRevoked } from './sessionRevocations.js';
 
 const sessionStore = createSessionStore();
+
+const SESSION_AUDIENCE = 'ploinky-router';
+
+function newSessionId() {
+    return `sess_${crypto.randomBytes(16).toString('base64url')}`;
+}
 
 const SESSION_TTL_SECONDS = 4 * 60 * 60;
 
@@ -17,17 +24,22 @@ function getSessionSigningKey() {
 
 function mintSessionJwt(user, rev = 1, options = {}) {
     const usersVar = String(options?.usersVar || options?.policy?.usersVar || '').trim();
+    // `sid` is stable for the life of a login: callers pass the existing sid
+    // when refreshing the sliding-window cookie so revocation by sid persists.
+    const sid = String(options?.sid || '').trim() || newSessionId();
     const iat = Math.floor(Date.now() / 1000);
     const payload = {
-        typ: 'session',
+        typ: 'user-session',
         iss: 'ploinky-router',
+        aud: SESSION_AUDIENCE,
         sub: String(user.id || ''),
+        sid,
         usr: {
             id: String(user.id || ''),
             username: String(user.username || ''),
             name: String(user.name || user.username || ''),
             email: String(user.email || ''),
-            roles: Array.isArray(user.roles) ? [...user.roles] : ['local']
+            roles: Array.isArray(user.roles) ? [...user.roles] : ['user']
         },
         rev: Number(rev) || 1,
         uvar: usersVar || undefined,
@@ -38,12 +50,15 @@ function mintSessionJwt(user, rev = 1, options = {}) {
     return signHmacJwt({ payload, secret: getSessionSigningKey() });
 }
 
+const SESSION_TOKEN_TYPES = new Set(['user-session', 'guest-session']);
+
 function verifySessionJwt(token) {
     const { payload } = verifyJws(token, {
         secret: getSessionSigningKey(),
+        expectedAudience: SESSION_AUDIENCE,
         maxTtlSeconds: SESSION_TTL_SECONDS + 1
     });
-    if (payload.typ !== 'session') {
+    if (!SESSION_TOKEN_TYPES.has(payload.typ)) {
         throw new Error('Not a session JWT');
     }
     if (payload.iss !== 'ploinky-router') {
@@ -59,9 +74,11 @@ function mintGuestSessionJwt(options = {}) {
     const guestScope = String(options?.guestScope || options?.policy?.guestScope || '').trim();
     const iat = Math.floor(Date.now() / 1000);
     const payload = {
-        typ: 'session',
+        typ: 'guest-session',
         iss: 'ploinky-router',
+        aud: SESSION_AUDIENCE,
         sub: `user:guest:${guestId}`,
+        sid: `gsess_${guestId}`,
         gscope: guestScope || undefined,
         usr: {
             id: `guest:${guestId}`,
@@ -113,13 +130,17 @@ function normalizeRoles(input) {
     const raw = Array.isArray(input) ? input : [];
     const values = [];
     for (const entry of raw) {
-        const normalized = String(entry || '').trim();
+        let normalized = String(entry || '').trim();
+        // Map the legacy base role `local` to the canonical `user` (DS013).
+        if (normalized === 'local') {
+            normalized = 'user';
+        }
         if (normalized && !values.includes(normalized)) {
             values.push(normalized);
         }
     }
-    if (!values.includes('local')) {
-        values.unshift('local');
+    if (!values.includes('user')) {
+        values.unshift('user');
     }
     return values;
 }
@@ -258,6 +279,11 @@ function getSession(sessionId, options = {}) {
     } catch {
         return null;
     }
+    // Stateless session JWTs are revoked out-of-band via the persistent
+    // revocation list (logout / forced revocation).
+    if (isSessionRevoked({ sid: payload.sid, jti: payload.jti })) {
+        return null;
+    }
     const usersVar = String(options?.usersVar || options?.policy?.usersVar || payload.uvar || '').trim();
     const payloadUsersVar = String(payload.uvar || '').trim();
     if (usersVar && payloadUsersVar !== usersVar) {
@@ -289,7 +315,7 @@ function getSession(sessionId, options = {}) {
             username: payload.usr.username,
             name: payload.usr.name || payload.usr.username,
             email: payload.usr.email || null,
-            roles: Array.isArray(payload.usr.roles) ? payload.usr.roles : ['local']
+            roles: Array.isArray(payload.usr.roles) ? payload.usr.roles : ['user']
         } : null,
         localAuth: { usersVar, username: payload.usr?.username || '' },
         createdAt: payload.iat * 1000,
