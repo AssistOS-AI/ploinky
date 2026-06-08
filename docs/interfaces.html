@@ -84,12 +84,12 @@
           <p>The router exposes agent-card discovery at <code>/agent-card</code> and <code>/&lt;agent&gt;/agent-card</code>. The aggregate endpoint queries each active route's agent-side <code>/agent-card</code> endpoint and returns successful responses without requiring a fixed metadata schema; per-agent failures are reported separately. Agent metadata can include tags, summaries, input conventions, schemas, or any other JSON fields useful to an orchestration layer.</p>
           <p>OpenAI-compatible agent calls are routed through <code>/&lt;agent&gt;/v1/chat/completions</code>. The request body controls response mode: <code>stream: true</code> preserves the agent's SSE stream, while an absent or false stream flag returns the normal JSON completion response.</p>
           <p><code>/agent-card</code> and <code>/&lt;agent&gt;/v1/chat/completions</code> are public at the router level; the target agent decides whether to accept or reject the request. Orchestrators discover remote agents through <code>PloinkyAgentSkillsSubsystem</code> and declare them via <code>## Allowed Agents</code> in <code>oskill.md</code>.</p>
-          <p>For delegated MCP tool calls, the router signs short-lived invocation tokens with <code>PLOINKY_DERIVED_MASTER_KEY</code>, forwards user claims when needed, and requires agents to verify the target audience, tool, body hash, expiry, and replay id.</p>
+          <p>For delegated MCP and protected service calls, the router mints short-lived Router Request JWTs signed with the target agent's own <code>PLOINKY_AGENT_SECRET</code>. Agents and services verify audience, method, path, optional tool, request-content hash, expiry, and replay id before trusting forwarded identity.</p>
         </section>
 
         <section class="chapter-section">
           <h2>MCP and HTTP Service Paths</h2>
-          <p>The router aggregates tools and resources at <code>/mcp</code>, while agent-specific MCP endpoints are exposed under <code>/&lt;agent&gt;/mcp</code>. Agent task-status passthrough lives at <code>/&lt;agent&gt;/task</code>. Public and authenticated HTTP service routes are defined separately and may inject compact auth headers for downstream agents.</p>
+          <p>The router aggregates tools and resources at <code>/mcp</code>, while agent-specific MCP endpoints are exposed under <code>/&lt;agent&gt;/mcp</code>. Agent task-status passthrough lives at <code>/&lt;agent&gt;/task</code>. Public and authenticated HTTP service routes are defined separately and may inject compact auth headers for downstream agents; protected service invocation tokens bind the forwarded method, rewritten service path, query string, and body hash.</p>
           <p>This split lets Ploinky expose first-party routing behavior and agent-specific protocol proxies without forcing every browser surface through the same transport semantics.</p>
         </section>
       </article>

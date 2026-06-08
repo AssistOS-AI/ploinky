@@ -1,7 +1,7 @@
 ---
 id: DS006
 title: Auth, SSO Provider Selection, and Secure Wire
-status: implemented (wire protocol superseded by DS011)
+status: implemented (wire protocol superseded by DS011 and DS013)
 owner: ploinky-team
 summary: Defines local auth, SSO provider selection, and the signed secure-wire path for delegated agent calls.
 ---
@@ -20,7 +20,7 @@ Local auth users must be stored as hashed user records rather than plain-text cr
 
 Agent discovery must be built from installed manifests. The agent index records installed agent references, deterministic principals, runtime resources, and SSO-provider markers. Provider-specific permissions are enforced by the target agent rather than by workspace-level provider negotiation.
 
-Secure delegated tool calls must use router-minted invocation JWTs. The router signs tokens with `PLOINKY_DERIVED_MASTER_KEY` (the `derived-master` HKDF subkey). Invocation tokens bind the target audience, tool name, body hash, scopes, delegated user claims, and expiry. Agents verify tokens through `Agent/lib/invocationAuth.mjs` using the same derived key injected as `PLOINKY_DERIVED_MASTER_KEY`. The `/agent-card` and `/<agent>/v1/chat/completions` routes are public at the router level; the target agent handles its own access control.
+**The secure-wire portion of this section is superseded by DS013.** The original model used a single shared `PLOINKY_DERIVED_MASTER_KEY` to sign `typ:"invocation"` tokens binding audience, tool, body hash, scopes, and user claims. That is replaced by per-agent secrets and three direction-typed, request-bound JWT families: the router mints a Router Request signed with the TARGET agent's own `PLOINKY_AGENT_SECRET`, and agent-to-agent calls present an Agent Assertion the source agent signs with its own secret. Agents verify through `Agent/lib/invocationAuth.mjs` using only their own `PLOINKY_AGENT_SECRET`. The `/agent-card` and `/<agent>/v1/chat/completions` routes are public at the router level; the target agent handles its own access control, and `/v1/chat/completions` never receives implicit `admin`/`internal` tool access. See DS013 (JWT families) and DS014 (MCP tool policy).
 
 Secure wire is enabled by default and is only disabled when `PLOINKY_SECURE_WIRE` explicitly turns it off. This default matters because first-party calls and delegated calls share the same agent-side verification expectations once secure wire is active.
 
