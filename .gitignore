@@ -151,12 +151,5 @@ test_run_dir/
 CLAUDE.md
 # >>> ploinky default-skills >>>
 .claude
-.agents/skills/achilles_specs/
-.agents/skills/antropic_skill_build/
-.agents/skills/article_build/
-.agents/skills/cskill_build/
-.agents/skills/dgskill_build/
-.agents/skills/gamp_specs/
-.agents/skills/oskill_build/
-.agents/skills/review_specs/
+.agents/
 # <<< ploinky default-skills <<<
