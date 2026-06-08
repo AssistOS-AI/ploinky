@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import crypto from 'node:crypto';
 import http from 'node:http';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
@@ -7,11 +8,10 @@ import path from 'node:path';
 import { Readable, Writable } from 'node:stream';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
-import {
-    createMemoryReplayCache,
-    verifyInvocationToken,
-} from '../../Agent/lib/jwtVerify.mjs';
-import { deriveDerivedMasterKey } from '../../cli/services/masterKey.js';
+import { createMemoryReplayCache } from '../../Agent/lib/jwtVerify.mjs';
+import { verifyRouterRequestToken } from '../../Agent/lib/requestSignedTokens.mjs';
+import { deriveAgentRequestSecret } from '../../cli/services/masterKey.js';
+import { computeRchHttp } from '../../Agent/lib/requestHash.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -48,18 +48,24 @@ class MockWritableResponse extends Writable {
     }
 }
 
-function makeRequest({ method = 'GET', url, cookie = '', headers = {} }) {
-    const req = Readable.from([]);
+function makeRequest({ method = 'GET', url, cookie = '', headers = {}, body = null }) {
+    const bodyBuffer = body === null || body === undefined ? null : Buffer.from(body);
+    const req = Readable.from(bodyBuffer ? [bodyBuffer] : []);
     req.method = method;
     req.url = url;
     req.headers = {
         accept: 'application/json',
         host: 'localhost',
         ...headers,
+        ...(bodyBuffer ? { 'content-length': String(bodyBuffer.length) } : {}),
         ...(cookie ? { cookie } : {})
     };
     req.socket = { encrypted: false };
     return req;
+}
+
+function sha256BodyHash(body) {
+    return crypto.createHash('sha256').update(Buffer.from(body)).digest('base64url');
 }
 
 function listen(server) {
@@ -71,6 +77,35 @@ function listen(server) {
 
 function close(server) {
     return new Promise((resolve) => server.close(() => resolve()));
+}
+
+function requestBody({ port, path: requestPath, method = 'GET', body = '', headers = {} }) {
+    const bytes = Buffer.from(body);
+    return new Promise((resolve, reject) => {
+        const req = http.request({
+            hostname: '127.0.0.1',
+            port,
+            path: requestPath,
+            method,
+            headers: {
+                ...headers,
+                ...(bytes.length ? { 'content-length': String(bytes.length) } : {}),
+            },
+        }, (res) => {
+            const chunks = [];
+            res.on('data', (chunk) => chunks.push(Buffer.from(chunk)));
+            res.on('end', () => {
+                resolve({
+                    statusCode: res.statusCode,
+                    headers: res.headers,
+                    body: Buffer.concat(chunks).toString('utf8'),
+                });
+            });
+        });
+        req.setTimeout(2000, () => req.destroy(new Error('request timed out')));
+        req.on('error', reject);
+        req.end(bytes);
+    });
 }
 
 function writeWorkspaceConfig(ploinkyDir, servicePort) {
@@ -239,25 +274,35 @@ test('protected HTTP service falls back to static auth and injects router auth i
     const authInfo = JSON.parse(captured?.headers['x-ploinky-auth-info'] || '{}');
     assert.equal(authInfo.user?.id, 'local:admin');
     assert.equal(authInfo.user?.username, 'admin');
-    assert.deepEqual(authInfo.user?.roles, ['local', 'admin']);
+    assert.deepEqual(authInfo.user?.roles, ['user', 'admin']);
     assert.ok(authInfo.sessionId);
     assert.equal(typeof authInfo.invocationToken, 'string');
     assert.deepEqual(authInfo.invocationBody, {
         method: 'GET',
         externalPath: '/services/browser-use/sessions/sess_1',
+        path: '/browser-use/sessions/sess_1',
         search: '?view=1',
-        routeKey: 'browserUseAgent'
+        routeKey: 'browserUseAgent',
+        bodyHash: sha256BodyHash(''),
     });
 
-    const verified = verifyInvocationToken(authInfo.invocationToken, {
-        secret: deriveDerivedMasterKey(),
+    const verified = verifyRouterRequestToken(authInfo.invocationToken, {
+        secret: deriveAgentRequestSecret('agent:services/browserUseAgent', { encoding: 'buffer' }),
         expectedAudience: 'agent:services/browserUseAgent',
-        expectedTool: '__http_service__',
-        bodyObject: authInfo.invocationBody,
+        tool: '__http_service__',
+        method: authInfo.invocationBody.method,
+        path: authInfo.invocationBody.path,
+        rch: computeRchHttp({
+            method: authInfo.invocationBody.method,
+            path: authInfo.invocationBody.path,
+            query: authInfo.invocationBody.search,
+            bodyHash: authInfo.invocationBody.bodyHash,
+        }),
         replayCache: createMemoryReplayCache(),
     });
-    assert.equal(verified.payload.caller, 'router:first-party');
-    assert.equal(verified.payload.usr?.username, 'admin');
+    assert.equal(verified.payload.typ, 'router-request');
+    assert.equal(verified.payload.actor?.kind, 'user');
+    assert.equal(verified.payload.sub, 'user:local:admin');
 
     captured = null;
     const rootReq = makeRequest({
@@ -277,6 +322,326 @@ test('protected HTTP service falls back to static auth and injects router auth i
     assert.equal(rootRes.statusCode, 200);
     assert.equal(rootRes.body, 'ok');
     assert.equal(captured?.url, '/browser-use/');
+});
+
+test('protected HTTP service invocation rch binds the forwarded request body', async (t) => {
+    let captured = null;
+    const upstream = http.createServer((req, res) => {
+        const chunks = [];
+        req.on('data', (chunk) => chunks.push(chunk));
+        req.on('end', () => {
+            captured = {
+                url: req.url,
+                headers: req.headers,
+                body: Buffer.concat(chunks),
+            };
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: true }));
+        });
+    });
+    const servicePort = await listen(upstream);
+    t.after(async () => {
+        await close(upstream);
+    });
+
+    const { routerHandlers } = await withRouterModules(t, servicePort);
+    const requestBody = JSON.stringify({ action: 'create', name: 'body-bound' });
+    const req = makeRequest({
+        method: 'POST',
+        url: '/services/browser-use/sessions/sess_1?view=1',
+        headers: {
+            'content-type': 'application/json',
+        },
+        body: requestBody,
+    });
+    req.user = {
+        id: 'local:admin',
+        username: 'admin',
+        roles: ['user', 'admin'],
+    };
+    req.sessionId = 'session-1';
+    const res = new MockWritableResponse();
+    const parsedUrl = new URL(req.url, 'http://localhost');
+
+    const handled = routerHandlers.handleHttpServiceRoute(req, res, parsedUrl);
+    assert.equal(handled, true);
+    await res.done;
+
+    assert.equal(res.statusCode, 200);
+    assert.equal(captured?.url, '/browser-use/sessions/sess_1?view=1');
+    assert.equal(captured?.body.toString('utf8'), requestBody);
+
+    const authInfo = JSON.parse(captured?.headers['x-ploinky-auth-info'] || '{}');
+    assert.equal(typeof authInfo.invocationToken, 'string');
+    assert.deepEqual(authInfo.invocationBody, {
+        method: 'POST',
+        externalPath: '/services/browser-use/sessions/sess_1',
+        path: '/browser-use/sessions/sess_1',
+        search: '?view=1',
+        routeKey: 'browserUseAgent',
+        bodyHash: sha256BodyHash(requestBody),
+    });
+
+    const verified = verifyRouterRequestToken(authInfo.invocationToken, {
+        secret: deriveAgentRequestSecret('agent:services/browserUseAgent', { encoding: 'buffer' }),
+        expectedAudience: 'agent:services/browserUseAgent',
+        tool: '__http_service__',
+        method: authInfo.invocationBody.method,
+        path: authInfo.invocationBody.path,
+        rch: computeRchHttp({
+            method: authInfo.invocationBody.method,
+            path: authInfo.invocationBody.path,
+            query: authInfo.invocationBody.search,
+            bodyHash: authInfo.invocationBody.bodyHash,
+        }),
+        replayCache: createMemoryReplayCache(),
+    });
+    assert.equal(verified.payload.typ, 'router-request');
+
+    assert.throws(() => verifyRouterRequestToken(authInfo.invocationToken, {
+        secret: deriveAgentRequestSecret('agent:services/browserUseAgent', { encoding: 'buffer' }),
+        expectedAudience: 'agent:services/browserUseAgent',
+        tool: '__http_service__',
+        method: authInfo.invocationBody.method,
+        path: authInfo.invocationBody.path,
+        rch: computeRchHttp({
+            method: authInfo.invocationBody.method,
+            path: authInfo.invocationBody.path,
+            query: authInfo.invocationBody.search,
+            bodyHash: sha256BodyHash(JSON.stringify({ action: 'tampered' })),
+        }),
+        replayCache: createMemoryReplayCache(),
+    }), /request hash mismatch/);
+});
+
+test('HTTP service invocation signs the internal path observed by the service', async (t) => {
+    let captured = null;
+    const upstream = http.createServer((req, res) => {
+        const chunks = [];
+        req.on('data', (chunk) => chunks.push(chunk));
+        req.on('end', () => {
+            captured = {
+                url: req.url,
+                headers: req.headers,
+                body: Buffer.concat(chunks),
+            };
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: true }));
+        });
+    });
+    const servicePort = await listen(upstream);
+    t.after(async () => {
+        await close(upstream);
+    });
+
+    const { routerHandlers } = await withRouterModules(t, servicePort);
+    const requestBody = JSON.stringify({ action: 'create' });
+    const req = makeRequest({
+        method: 'POST',
+        url: '/services/browser-use/sessions/sess_2?view=1',
+        body: requestBody,
+    });
+    req.user = {
+        id: 'local:admin',
+        username: 'admin',
+        roles: ['user', 'admin'],
+    };
+    req.sessionId = 'session-1';
+    const res = new MockWritableResponse();
+    const parsedUrl = new URL(req.url, 'http://localhost');
+
+    assert.equal(routerHandlers.handleHttpServiceRoute(req, res, parsedUrl), true);
+    await res.done;
+
+    assert.equal(captured?.url, '/browser-use/sessions/sess_2?view=1');
+    const authInfo = JSON.parse(captured?.headers['x-ploinky-auth-info'] || '{}');
+    assert.equal(authInfo.invocationBody.externalPath, '/services/browser-use/sessions/sess_2');
+    assert.equal(authInfo.invocationBody.path, '/browser-use/sessions/sess_2');
+
+    assert.doesNotThrow(() => verifyRouterRequestToken(authInfo.invocationToken, {
+        secret: deriveAgentRequestSecret('agent:services/browserUseAgent', { encoding: 'buffer' }),
+        expectedAudience: 'agent:services/browserUseAgent',
+        tool: '__http_service__',
+        method: 'POST',
+        path: '/browser-use/sessions/sess_2',
+        rch: computeRchHttp({
+            method: 'POST',
+            path: '/browser-use/sessions/sess_2',
+            query: '?view=1',
+            bodyHash: sha256BodyHash(requestBody),
+        }),
+        replayCache: createMemoryReplayCache(),
+    }));
+
+    assert.throws(() => verifyRouterRequestToken(authInfo.invocationToken, {
+        secret: deriveAgentRequestSecret('agent:services/browserUseAgent', { encoding: 'buffer' }),
+        expectedAudience: 'agent:services/browserUseAgent',
+        tool: '__http_service__',
+        method: 'POST',
+        path: '/services/browser-use/sessions/sess_2',
+        rch: computeRchHttp({
+            method: 'POST',
+            path: '/services/browser-use/sessions/sess_2',
+            query: '?view=1',
+            bodyHash: sha256BodyHash(requestBody),
+        }),
+        replayCache: createMemoryReplayCache(),
+    }), /path mismatch|request hash mismatch/);
+});
+
+test('HTTP service invocation rejects oversized buffered bodies before proxying', async (t) => {
+    let reached = false;
+    const upstream = http.createServer((_req, res) => {
+        reached = true;
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true }));
+    });
+    const servicePort = await listen(upstream);
+    t.after(async () => {
+        await close(upstream);
+    });
+
+    const previousLimit = process.env.PLOINKY_HTTP_SERVICE_INVOCATION_MAX_BODY_BYTES;
+    process.env.PLOINKY_HTTP_SERVICE_INVOCATION_MAX_BODY_BYTES = '8';
+    t.after(() => {
+        if (previousLimit === undefined) {
+            delete process.env.PLOINKY_HTTP_SERVICE_INVOCATION_MAX_BODY_BYTES;
+        } else {
+            process.env.PLOINKY_HTTP_SERVICE_INVOCATION_MAX_BODY_BYTES = previousLimit;
+        }
+    });
+
+    const { routerHandlers } = await withRouterModules(t, servicePort);
+    const req = makeRequest({
+        method: 'POST',
+        url: '/services/browser-use/sessions/sess_1',
+        body: '0123456789',
+    });
+    req.user = {
+        id: 'local:admin',
+        username: 'admin',
+        roles: ['user', 'admin'],
+    };
+    req.sessionId = 'session-1';
+    const res = new MockWritableResponse();
+    const parsedUrl = new URL(req.url, 'http://localhost');
+
+    assert.equal(routerHandlers.handleHttpServiceRoute(req, res, parsedUrl), true);
+    await res.done;
+
+    assert.equal(reached, false);
+    assert.equal(res.statusCode, 413);
+    const body = JSON.parse(res.body);
+    assert.equal(body.error, 'http_service_body_too_large');
+    assert.equal(body.limitBytes, 8);
+});
+
+test('HTTP service oversized body returns 413 on a real socket', async (t) => {
+    let reached = false;
+    const upstream = http.createServer((_req, res) => {
+        reached = true;
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true }));
+    });
+    const servicePort = await listen(upstream);
+    t.after(async () => {
+        await close(upstream);
+    });
+
+    const previousLimit = process.env.PLOINKY_HTTP_SERVICE_INVOCATION_MAX_BODY_BYTES;
+    process.env.PLOINKY_HTTP_SERVICE_INVOCATION_MAX_BODY_BYTES = '8';
+    t.after(() => {
+        if (previousLimit === undefined) {
+            delete process.env.PLOINKY_HTTP_SERVICE_INVOCATION_MAX_BODY_BYTES;
+        } else {
+            process.env.PLOINKY_HTTP_SERVICE_INVOCATION_MAX_BODY_BYTES = previousLimit;
+        }
+    });
+
+    const { routerHandlers } = await withRouterModules(t, servicePort);
+    const router = http.createServer((req, res) => {
+        req.user = {
+            id: 'local:admin',
+            username: 'admin',
+            roles: ['user', 'admin'],
+        };
+        req.sessionId = 'session-1';
+        const parsedUrl = new URL(req.url, 'http://localhost');
+        if (!routerHandlers.handleHttpServiceRoute(req, res, parsedUrl)) {
+            res.writeHead(404, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, error: 'not_found' }));
+        }
+    });
+    const routerPort = await listen(router);
+    t.after(async () => {
+        await close(router);
+    });
+
+    const response = await requestBody({
+        port: routerPort,
+        method: 'POST',
+        path: '/services/browser-use/sessions/sess_1',
+        body: '0123456789',
+        headers: { accept: 'application/json' },
+    });
+
+    assert.equal(reached, false);
+    assert.equal(response.statusCode, 413);
+    const body = JSON.parse(response.body);
+    assert.equal(body.error, 'http_service_body_too_large');
+    assert.equal(body.limitBytes, 8);
+});
+
+test('guest HTTP service invocation records guest actor kind', async (t) => {
+    let captured = null;
+    const upstream = http.createServer((req, res) => {
+        captured = {
+            url: req.url,
+            headers: req.headers,
+        };
+        res.writeHead(200, { 'Content-Type': 'text/plain' });
+        res.end('ok');
+    });
+    const servicePort = await listen(upstream);
+    t.after(async () => {
+        await close(upstream);
+    });
+
+    const { routerHandlers } = await withRouterModules(t, servicePort);
+    const req = makeRequest({
+        url: '/services/browser-use/sessions/sess_guest?view=1',
+    });
+    req.user = {
+        id: 'guest:abc',
+        username: 'visitor',
+        roles: ['guest'],
+    };
+    req.sessionId = 'guest-session-1';
+    req.authMode = 'guest';
+    const res = new MockWritableResponse();
+    const parsedUrl = new URL(req.url, 'http://localhost');
+
+    assert.equal(routerHandlers.handleHttpServiceRoute(req, res, parsedUrl), true);
+    await res.done;
+
+    const authInfo = JSON.parse(captured?.headers['x-ploinky-auth-info'] || '{}');
+    const verified = verifyRouterRequestToken(authInfo.invocationToken, {
+        secret: deriveAgentRequestSecret('agent:services/browserUseAgent', { encoding: 'buffer' }),
+        expectedAudience: 'agent:services/browserUseAgent',
+        tool: '__http_service__',
+        method: 'GET',
+        path: '/browser-use/sessions/sess_guest',
+        rch: computeRchHttp({
+            method: 'GET',
+            path: '/browser-use/sessions/sess_guest',
+            query: '?view=1',
+            bodyHash: sha256BodyHash(''),
+        }),
+        replayCache: createMemoryReplayCache(),
+    });
+
+    assert.equal(verified.payload.actor.kind, 'guest');
+    assert.deepEqual(verified.payload.actor.roles, ['guest']);
 });
 
 test('protected HTTP service fails closed when invocation principal cannot be resolved', async (t) => {

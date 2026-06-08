@@ -3,17 +3,21 @@ import { sendJson, ensureAuthenticated } from '../authHandlers.js';
 import { createAgentClient } from '../AgentClient.js';
 import { waitForAgentReady } from '../utils/agentReadiness.js';
 import {
-    buildFirstPartyInvocation,
-    buildDelegatedInvocation,
-    verifyDelegatedToolCall
+    buildRouterRequest,
+    resolveProviderPrincipal,
+    verifyAgentAssertion
 } from './invocationMinter.js';
+import { computeRchTool } from '../../../Agent/lib/requestHash.mjs';
+import { createMemoryReplayCache } from '../../../Agent/lib/jwtVerify.mjs';
 import { sanitizeArgumentsForTool } from './toolArguments.js';
 import { getAgentDescriptorByPrincipal } from '../../services/agentRegistry.js';
+import { policy } from '../policy/index.js';
 
 const AGENT_PROXY_PROTOCOL_VERSION = '2025-06-18';
 const AGENT_PROXY_SERVER_INFO = { name: 'ploinky-router-proxy', version: '1.0.0' };
-const CALLER_JWT_HEADER = 'x-ploinky-caller-jwt';
 const TOOL_SCHEMA_CACHE_TTL_MS = 30_000;
+// Replay cache for verified Agent Assertions (agent-to-agent jti single-use).
+const assertionReplayCache = createMemoryReplayCache({ maxSize: 4096 });
 
 // Session store for agent MCP connections
 const agentSessionStore = new Map();
@@ -54,9 +58,17 @@ function resolveProviderAgentRef(agentName) {
     return agentName;
 }
 
-function readCallerJwt(req) {
-    const raw = req.headers?.[CALLER_JWT_HEADER] || req.headers?.[CALLER_JWT_HEADER.toLowerCase()];
-    return typeof raw === 'string' && raw.trim() ? raw.trim() : '';
+// Agent-to-agent calls arrive at /<agent>/mcp carrying an Agent Assertion as
+// `Authorization: Bearer <assertion>` (browser callers use session cookies, and
+// the router→agent hop is a separate internal request). Reading the bearer here
+// only detects an a2a attempt; the assertion is verified before anything runs.
+function readAuthorizationBearer(req) {
+    const raw = req.headers?.authorization ?? req.headers?.Authorization;
+    const value = Array.isArray(raw) ? raw[0] : raw;
+    if (typeof value === 'string' && value.toLowerCase().startsWith('bearer ')) {
+        return value.slice(7).trim();
+    }
+    return '';
 }
 
 function extractDelegatedUser(req) {
@@ -67,33 +79,6 @@ function extractDelegatedUser(req) {
         email: req.user.email || '',
         roles: Array.isArray(req.user.roles) ? [...req.user.roles] : []
     };
-}
-
-function extractInvocationScope(req) {
-    const values = [
-        req?.session?.tokens?.scope,
-        req?.session?._jwtPayload?.scope,
-        req?.session?._jwtPayload?.scp
-    ];
-    const scopes = new Set();
-    for (const value of values) {
-        if (Array.isArray(value)) {
-            for (const entry of value) {
-                const normalized = String(entry || '').trim();
-                if (normalized) scopes.add(normalized);
-            }
-            continue;
-        }
-        const normalized = String(value || '').trim();
-        if (!normalized) {
-            continue;
-        }
-        for (const entry of normalized.split(/[\s,]+/)) {
-            const scope = String(entry || '').trim();
-            if (scope) scopes.add(scope);
-        }
-    }
-    return Array.from(scopes);
 }
 
 async function getToolSchemasForAgent(agentName, agentClient) {
@@ -116,37 +101,42 @@ async function canonicalizeToolArguments(agentName, agentClient, toolName, args)
     }
 }
 
-export function buildInvocationContextForProviderCall({ req, agentName, toolName, toolArgs }) {
+export function buildInvocationContextForProviderCall({ req, agentName, toolName, toolArgs, method = 'POST', path = '/mcp' }) {
     if (!isSecureWireEnabled()) return null;
-    const providerAgentRef = resolveProviderAgentRef(agentName);
-    const bodyObject = { tool: toolName, arguments: toolArgs || {} };
+    const targetAgentId = resolveProviderPrincipal({ providerAgentRef: resolveProviderAgentRef(agentName) });
+    const canonicalArgs = toolArgs && typeof toolArgs === 'object' && !Array.isArray(toolArgs) ? toolArgs : {};
+    // rch binds the token to exactly the {method, path, tool, arguments} the
+    // agent will execute. For MCP the transport is always POST /mcp.
+    const rch = computeRchTool({ method, path, tool: toolName, arguments: canonicalArgs });
 
-    const callerJwt = readCallerJwt(req);
-    if (callerJwt) {
-        const verified = req.delegatedAgentVerified && typeof req.delegatedAgentVerified === 'object'
-            ? req.delegatedAgentVerified
-            : verifyDelegatedToolCall({
-                providerAgentRef,
-                callerJwt
-            });
-        const invocation = buildDelegatedInvocation({
-            providerPrincipal: verified.providerPrincipal,
-            callerPrincipal: verified.callerPrincipal,
-            tool: toolName,
-            scope: extractInvocationScope(req),
-            bodyObject,
-            delegatedUser: verified.user
-        });
-        return { ...invocation, bodyObject };
+    // Resolve the acting principal. A verified source agent (agent-to-agent)
+    // takes precedence over the browser user. The raw User Session JWT is never
+    // forwarded — only this freshly minted, target-scoped Router Request is.
+    let sub = '';
+    let actor;
+    const delegated = req?.delegatedAgentVerified && typeof req.delegatedAgentVerified === 'object'
+        ? req.delegatedAgentVerified
+        : null;
+    if (delegated) {
+        const caller = String(delegated.callerPrincipal || '');
+        sub = caller;
+        actor = { kind: 'agent', id: caller, roles: [] };
+    } else {
+        const user = extractDelegatedUser(req);
+        sub = user?.id ? `user:${user.id}` : '';
+        actor = { kind: 'user', id: sub, roles: user?.roles || [] };
     }
-    const invocation = buildFirstPartyInvocation({
-        providerAgentRef,
+
+    const { token, payload } = buildRouterRequest({
+        targetAgentId,
+        sub,
+        actor,
+        method,
+        path,
         tool: toolName,
-        bodyObject,
-        delegatedUser: extractDelegatedUser(req),
-        scope: extractInvocationScope(req)
+        rch,
     });
-    return { ...invocation, bodyObject };
+    return { token, payload, rch };
 }
 
 /**
@@ -231,12 +221,19 @@ async function handleAgentJsonRpc(req, res, route, agentName, payload) {
         switch (message.method) {
             case 'tools/list': {
                 const tools = await agentClient.listTools();
+                // Cache the full schema set for argument canonicalization, but only
+                // advertise the tools this caller is permitted to invoke.
                 agentToolSchemaCache.set(agentName, { loadedAt: Date.now(), tools });
-                sendResponse(200, { jsonrpc: '2.0', id: message.id ?? null, result: { tools } }, sessionIdHeader);
+                const visibleTools = policy.mcpToolPolicy.filterTools(agentName, tools, policy.resolveCaller(req));
+                sendResponse(200, { jsonrpc: '2.0', id: message.id ?? null, result: { tools: visibleTools } }, sessionIdHeader);
                 break;
             }
             case 'resources/list': {
-                const resources = await agentClient.listResources();
+                // Resources are an authenticated-class capability (DS014): a
+                // session caller sees them, an internal/agent or anonymous
+                // caller sees an empty list (mirrors tools/list filtering).
+                const listDecision = policy.mcpToolPolicy.evaluateResource({ caller: policy.resolveCaller(req) });
+                const resources = listDecision.allow ? await agentClient.listResources() : [];
                 sendResponse(200, { jsonrpc: '2.0', id: message.id ?? null, result: { resources } }, sessionIdHeader);
                 break;
             }
@@ -245,6 +242,12 @@ async function handleAgentJsonRpc(req, res, route, agentName, payload) {
                 const name = typeof params.name === 'string' ? params.name : typeof params.tool === 'string' ? params.tool : null;
                 if (!name) {
                     sendResponse(200, { jsonrpc: '2.0', id: message.id ?? null, error: { code: -32602, message: 'Missing tool name' } }, sessionIdHeader);
+                    break;
+                }
+                // MCP tool policy (fail-closed) gates the call before any token is minted.
+                const callDecision = policy.mcpToolPolicy.evaluate({ agent: agentName, tool: name, caller: policy.resolveCaller(req) });
+                if (!callDecision.allow) {
+                    sendResponse(200, { jsonrpc: '2.0', id: message.id ?? null, error: { code: -32003, message: 'Access denied', data: { code: callDecision.code } } }, sessionIdHeader);
                     break;
                 }
                 const argPayload = params && typeof params === 'object' ? params['arguments'] : null;
@@ -271,6 +274,12 @@ async function handleAgentJsonRpc(req, res, route, agentName, payload) {
                 const uri = typeof params.uri === 'string' ? params.uri : null;
                 if (!uri) {
                     sendResponse(200, { jsonrpc: '2.0', id: message.id ?? null, error: { code: -32602, message: 'Missing resource uri' } }, sessionIdHeader);
+                    break;
+                }
+                // Fail-closed resource gate (DS014) before any token is minted.
+                const readDecision = policy.mcpToolPolicy.evaluateResource({ caller: policy.resolveCaller(req) });
+                if (!readDecision.allow) {
+                    sendResponse(200, { jsonrpc: '2.0', id: message.id ?? null, error: { code: -32003, message: 'Access denied', data: { code: readDecision.code } } }, sessionIdHeader);
                     break;
                 }
                 const resourceHeaders = buildRequestHeadersForToolCall('resources/read', { uri });
@@ -304,7 +313,7 @@ async function handleAgentJsonRpc(req, res, route, agentName, payload) {
  */
 async function handleAgentMcpRequest(req, res, route, agentName) {
     const method = (req.method || 'GET').toUpperCase();
-    const isDelegatedAgentRequest = Boolean(readCallerJwt(req));
+    const isDelegatedAgentRequest = Boolean(readAuthorizationBearer(req));
 
     if (method === 'GET') {
         res.writeHead(405, { 'Content-Type': 'application/json', Allow: 'POST, DELETE' });
@@ -359,9 +368,26 @@ async function handleAgentMcpRequest(req, res, route, agentName) {
                 return;
             }
             try {
-                req.delegatedAgentVerified = verifyDelegatedToolCall({
-                    providerAgentRef: agentName,
-                    callerJwt: readCallerJwt(req)
+                const params = message.params && typeof message.params === 'object' ? message.params : {};
+                const toolName = typeof params.name === 'string'
+                    ? params.name
+                    : (typeof params.tool === 'string' ? params.tool : '');
+                const rawArgs = params['arguments'] && typeof params['arguments'] === 'object' && !Array.isArray(params['arguments'])
+                    ? params['arguments']
+                    : {};
+                // Verify the assertion against the exact request the source agent
+                // signed (raw args, as sent). The source binds the target by its
+                // route name; MCP policy for the agent caller is enforced later in
+                // handleAgentJsonRpc before any token is minted.
+                const rch = computeRchTool({ method: 'POST', path: '/mcp', tool: toolName, arguments: rawArgs });
+                req.delegatedAgentVerified = verifyAgentAssertion({
+                    token: readAuthorizationBearer(req),
+                    method: 'POST',
+                    path: '/mcp',
+                    tool: toolName,
+                    rch,
+                    targetAgentId: agentName,
+                    replayCache: assertionReplayCache,
                 });
             } catch (error) {
                 res.writeHead(200, { 'Content-Type': 'application/json' });

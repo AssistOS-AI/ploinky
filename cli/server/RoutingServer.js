@@ -29,6 +29,8 @@ import { isRouteMount } from './utils/routeMounts.js';
 import { agentSessionStore, handleAgentMcpRequest } from './mcp-proxy/index.js';
 import { initializeTTYFactories, createServiceConfig } from './utils/ttyFactories.js';
 import { setupProcessLifecycle } from './utils/processLifecycle.js';
+import { policy } from './policy/index.js';
+import { hasInternalAgentSegment } from './internalAgentPath.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -138,6 +140,14 @@ function isRouterOwnedPath(pathname) {
         || pathname === '/mcp/'
         || pathname.startsWith('/auth/')
         || pathname.startsWith('/api/agents/')
+        // Internal, non-whitelistable router-owned routes (DS014).
+        || pathname === '/whitelist/command'
+        || pathname === '/metrics'
+        || pathname === '/health/internal'
+        || pathname === '/admin'
+        || pathname.startsWith('/admin/')
+        || pathname === '/__agent'
+        || pathname.startsWith('/__agent/')
         || isRouteMount(pathname, '/webtty')
         || isRouteMount(pathname, '/webchat')
         || isRouteMount(pathname, '/dashboard')
@@ -162,12 +172,13 @@ function buildAgentProxyPath(agentName, parsedUrl) {
     return `${upstreamPath || '/'}${parsedUrl?.search || ''}`;
 }
 
-function hasDelegatedCallerJwt(req) {
-    const value = req?.headers?.['x-ploinky-caller-jwt'];
-    if (Array.isArray(value)) {
-        return value.some((entry) => typeof entry === 'string' && entry.trim());
-    }
-    return typeof value === 'string' && value.trim().length > 0;
+function hasDelegatedAgentAssertion(req) {
+    // Agent-to-agent calls carry an Agent Assertion as `Authorization: Bearer`.
+    // Browser callers use session cookies, so a bearer at /<agent>/mcp signals an
+    // a2a attempt; the MCP proxy verifies the assertion before anything runs.
+    const raw = req?.headers?.authorization ?? req?.headers?.Authorization;
+    const value = Array.isArray(raw) ? raw[0] : raw;
+    return typeof value === 'string' && value.toLowerCase().startsWith('bearer ');
 }
 
 function getStaticRouteName(routes = loadApiRoutes()) {
@@ -328,6 +339,17 @@ async function processRequest(req, res) {
         return;
     }
 
+    // DS014: any `__agent` segment is a router-owned agent control-plane path
+    // (e.g. the share authorizer). The router reaches those itself over a direct
+    // loopback call carrying a minted Router Request — the PUBLIC listener never
+    // serves them. Refuse here, before any auth, http-service route, or
+    // passthrough handling can forward one to an agent. Generic 404 so the reply
+    // does not confirm the internal route exists.
+    if (hasInternalAgentSegment(pathname)) {
+        sendJsonResponse(res, 404, { error: 'not_found' });
+        return;
+    }
+
     // Authentication routes
     if (pathname.startsWith('/auth/')) {
         const handled = await handleAuthRoutes(req, res, parsedUrl);
@@ -339,14 +361,25 @@ async function processRequest(req, res) {
         if (handled) return;
     }
 
+    // Single administrative endpoint for router access-control policy (DS014).
+    // Authenticated + never whitelistable; handles its own authorization.
+    if (pathname === '/whitelist/command') {
+        const handled = await policy.commandInvoker.handle(req, res);
+        if (handled) return;
+    }
+
     if (routedAggregateAgentCard) {
         // Public aggregate route
     } else if (pathname === '/mcp' || pathname === '/mcp/') {
         const authResult = await ensureAuthenticated(req, res, parsedUrl);
         if (!authResult.ok) return;
-    } else if (agentName && isAgentMcpRoute && hasDelegatedCallerJwt(req)) {
+    } else if (agentName && isAgentMcpRoute && hasDelegatedAgentAssertion(req)) {
         // Delegated agent-to-agent MCP calls do not carry browser cookies.
-        // The MCP proxy validates X-Ploinky-Caller-JWT before forwarding.
+        // The MCP proxy verifies the Agent Assertion before forwarding.
+    } else if (agentName && !isAgentMcpRoute && policy.httpWhitelist.isReachableByGuest(pathname, req.method)) {
+        // Whitelisted read-only public HTTP route: a guest may reach it without
+        // authentication. The path-based whitelist already excluded internal
+        // routes and non-readonly methods; the query string never participates.
     } else if (agentName) {
         const authResult = await ensureAuthenticated(req, res, parsedUrl);
         if (!authResult.ok) return;
@@ -385,6 +418,9 @@ async function processRequest(req, res) {
         if (isAgentMcpRoute) {
             return handleAgentMcpRequest(req, res, route, agentName);
         }
+        // `__agent` control-plane paths are already refused at the top of the
+        // dispatch (before http-service/passthrough handling), so anything that
+        // reaches here is a normal agent request.
         if (await staticSrv.serveAgentStaticRequest(req, res)) {
             return;
         }
@@ -472,6 +508,16 @@ server.listen(port, () => {
     console.log('  Aggregate cards: /agent-card');
     appendLog('server_start', { port });
     logBootEvent('server_listening', { port });
+
+    // Bootstrap MCP tool policy from each enabled agent's mcp-config tags
+    // (persisted admin policy always wins). Without this, fail-closed
+    // enforcement would deny every tool call because no entries exist yet.
+    try {
+        const { added } = policy.mcpToolPolicy.bootstrap(loadApiRoutes());
+        appendLog('mcp_policy_bootstrap', { added });
+    } catch (err) {
+        appendLog('mcp_policy_bootstrap_error', { error: err?.message || String(err) });
+    }
 
     // Log initial memory usage
     logMemoryUsage();

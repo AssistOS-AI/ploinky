@@ -4,7 +4,10 @@ import { randomUUID } from 'node:crypto';
 import { sendJson } from './authHandlers.js';
 import { createAgentClient } from './AgentClient.js';
 import { buildInvocationContextForProviderCall } from './mcp-proxy/index.js';
-import { buildFirstPartyInvocation } from './mcp-proxy/invocationMinter.js';
+import { buildRouterRequest } from './mcp-proxy/invocationMinter.js';
+import { computeRchHttp, sha256RawBodyHash } from '../../Agent/lib/requestHash.mjs';
+import { policy } from './policy/index.js';
+import { hasInternalAgentSegment } from './internalAgentPath.js';
 import {
     buildServiceAgentPath,
     isAnonymousHttpServiceRoute,
@@ -17,6 +20,7 @@ import { ROUTING_FILE } from '../services/config.js';
 const ROUTER_PROTOCOL_VERSION = '2025-06-18';
 const ROUTER_SERVER_INFO = { name: 'ploinky-router', version: '1.0.0' };
 const ROUTER_INSTRUCTIONS = 'Ploinky Router aggregates tools and resources from registered agents.';
+const DEFAULT_HTTP_SERVICE_INVOCATION_MAX_BODY_BYTES = 10 * 1024 * 1024;
 
 const routerSessions = new Map();
 
@@ -125,6 +129,90 @@ export function proxyHttpPassthrough(req, res, targetPort, agentPath, extraHeade
     req.pipe(upstream, { end: true });
 }
 
+function resolveHttpServiceInvocationMaxBodyBytes(env = process.env) {
+    const raw = String(env?.PLOINKY_HTTP_SERVICE_INVOCATION_MAX_BODY_BYTES || '').trim();
+    if (!raw) return DEFAULT_HTTP_SERVICE_INVOCATION_MAX_BODY_BYTES;
+    const parsed = Number(raw);
+    return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : DEFAULT_HTTP_SERVICE_INVOCATION_MAX_BODY_BYTES;
+}
+
+function pathOnly(pathWithQuery = '') {
+    const value = String(pathWithQuery || '');
+    const index = value.indexOf('?');
+    return index >= 0 ? value.slice(0, index) : value;
+}
+
+function buildBufferedProxyHeaders(req, targetPort, body, extraHeaders = {}) {
+    const headers = {
+        ...stripRouterIdentityHeaders(req.headers),
+        ...extraHeaders,
+        host: `127.0.0.1:${targetPort}`,
+    };
+    for (const name of Object.keys(headers)) {
+        const normalized = String(name).toLowerCase();
+        if (normalized === 'transfer-encoding' || normalized === 'content-length') {
+            delete headers[name];
+        }
+    }
+    headers['content-length'] = String(body.length);
+    return headers;
+}
+
+function proxyHttpBuffered(req, res, targetPort, agentPath, body, extraHeaders = {}) {
+    const pathWithLeadingSlash = agentPath.startsWith('/') ? agentPath : `/${agentPath}`;
+    const upstream = http.request({
+        hostname: '127.0.0.1',
+        port: targetPort,
+        path: pathWithLeadingSlash,
+        method: req.method,
+        headers: buildBufferedProxyHeaders(req, targetPort, body, extraHeaders),
+    }, upstreamRes => {
+        res.writeHead(upstreamRes.statusCode || 200, upstreamRes.headers);
+        upstreamRes.pipe(res, { end: true });
+    });
+
+    upstream.on('error', err => {
+        if (!res.headersSent) {
+            res.writeHead(502, { 'Content-Type': 'application/json' });
+        }
+        res.end(JSON.stringify({ error: 'upstream error', detail: String(err) }));
+    });
+
+    upstream.end(body);
+}
+
+function readRequestBody(req, {
+    maxBytes = DEFAULT_HTTP_SERVICE_INVOCATION_MAX_BODY_BYTES,
+    onSuccess,
+    onError,
+    onTooLarge,
+}) {
+    const chunks = [];
+    const limit = Number(maxBytes) || DEFAULT_HTTP_SERVICE_INVOCATION_MAX_BODY_BYTES;
+    let total = 0;
+    let settled = false;
+    const finish = (callback, value) => {
+        if (settled) return;
+        settled = true;
+        callback(value);
+    };
+    req.on('data', chunk => {
+        const buffered = Buffer.from(chunk);
+        total += buffered.length;
+        if (total > limit) {
+            finish(onTooLarge || onError, { limitBytes: limit, actualBytes: total });
+            if (typeof req.destroy === 'function') {
+                req.destroy();
+            }
+            return;
+        }
+        chunks.push(buffered);
+    });
+    req.on('end', () => finish(onSuccess, Buffer.concat(chunks)));
+    req.on('error', err => finish(onError, err));
+    req.on('aborted', () => finish(onError, new Error('request aborted')));
+}
+
 const ROUTER_IDENTITY_HEADERS = new Set([
     'x-ploinky-auth-info',
     'x-ploinky-user-id',
@@ -164,12 +252,21 @@ function buildPlainAuthInfo(req) {
     };
 }
 
-function buildHttpServiceInvocationBody(req, parsedUrl, definition) {
+function resolveHttpServiceActorKind(authInfo = {}) {
+    const roles = Array.isArray(authInfo.user?.roles)
+        ? authInfo.user.roles.map(role => String(role || '').trim().toLowerCase())
+        : [];
+    return roles.includes('guest') ? 'guest' : 'user';
+}
+
+function buildHttpServiceInvocationBody(req, parsedUrl, definition, { bodyHash = '', servicePath = '' } = {}) {
     return {
         method: String(req.method || 'GET').toUpperCase(),
         externalPath: parsedUrl?.pathname || '',
+        path: pathOnly(servicePath || parsedUrl?.pathname || ''),
         search: parsedUrl?.search || '',
-        routeKey: definition.routeKey || ''
+        routeKey: definition.routeKey || '',
+        bodyHash: String(bodyHash || sha256RawBodyHash())
     };
 }
 
@@ -184,23 +281,42 @@ function resolveHttpServicePrincipal(definition) {
     }
 }
 
-export function buildHttpServiceAuthInfoHeader(req, parsedUrl, definition) {
+export function buildHttpServiceAuthInfoHeader(req, parsedUrl, definition, { bodyHash = '', servicePath = '' } = {}) {
     if (!definition?.includeAuthInfo || !req.user || typeof req.user !== 'object') {
         return {};
     }
 
     const authInfo = buildPlainAuthInfo(req);
     if (definition.issueInvocation) {
-        const invocationBody = buildHttpServiceInvocationBody(req, parsedUrl, definition);
-        const invocation = buildFirstPartyInvocation({
-            providerAgentRef: definition.routeKey,
-            providerPrincipal: resolveHttpServicePrincipal(definition),
+        const invocationBody = buildHttpServiceInvocationBody(req, parsedUrl, definition, { bodyHash, servicePath });
+        // Fail closed if the service route cannot be resolved to an installed
+        // agent principal — never forward unsigned identity metadata.
+        const servicePrincipal = resolveHttpServicePrincipal(definition);
+        if (!servicePrincipal) {
+            throw new Error(`invocationMinter: could not resolve provider '${definition.routeKey}'`);
+        }
+        // Router Request signed with the SERVICE agent's own secret; rch binds
+        // the token to the HTTP request surface, including the raw body hash.
+        const sub = authInfo.user?.id ? `user:${authInfo.user.id}` : '';
+        const { token } = buildRouterRequest({
+            targetAgentId: servicePrincipal,
+            sub,
+            actor: {
+                kind: resolveHttpServiceActorKind(authInfo),
+                id: sub,
+                roles: Array.isArray(authInfo.user?.roles) ? authInfo.user.roles : [],
+            },
+            method: invocationBody.method,
+            path: invocationBody.path,
             tool: '__http_service__',
-            bodyObject: invocationBody,
-            delegatedUser: authInfo.user,
-            scope: [`http-service:${definition.routeKey}`],
+            rch: computeRchHttp({
+                method: invocationBody.method,
+                path: invocationBody.path,
+                query: invocationBody.search,
+                bodyHash: invocationBody.bodyHash,
+            }),
         });
-        authInfo.invocationToken = invocation.token;
+        authInfo.invocationToken = token;
         authInfo.invocationBody = invocationBody;
     }
 
@@ -239,6 +355,52 @@ export function handleHttpServiceRoute(req, res, parsedUrl, apiRoutes = loadApiR
     }
     req.headers = stripRouterIdentityHeaders(req.headers);
 
+    const upstreamPath = buildServiceAgentPath(pathname, parsedUrl?.search, definition.externalPrefix, definition.internalPrefix);
+    // DS014: an http-service `internalPrefix` must never rewrite a request into a
+    // router-owned `__agent` control-plane path. The early dispatch guard only
+    // sees the external request path, so re-check the synthesized upstream here.
+    if (hasInternalAgentSegment(upstreamPath)) {
+        sendJson(res, 404, { ok: false, error: 'not_found' });
+        return true;
+    }
+
+    if (definition.includeAuthInfo && definition.issueInvocation) {
+        readRequestBody(req, {
+            maxBytes: resolveHttpServiceInvocationMaxBodyBytes(),
+            onSuccess: (body) => {
+                let identityHeaders = {};
+                try {
+                    identityHeaders = buildHttpServiceAuthInfoHeader(req, parsedUrl, definition, {
+                        bodyHash: sha256RawBodyHash(body),
+                        servicePath: upstreamPath,
+                    });
+                } catch (err) {
+                    sendJson(res, 500, {
+                        ok: false,
+                        error: 'http_service_invocation_unavailable',
+                        message: err?.message || String(err),
+                    });
+                    return;
+                }
+                proxyHttpBuffered(req, res, route.hostPort, upstreamPath, body, identityHeaders);
+            },
+            onTooLarge: ({ limitBytes }) => {
+                sendJson(res, 413, {
+                    ok: false,
+                    error: 'http_service_body_too_large',
+                    limitBytes,
+                });
+            },
+            onError: (err) => {
+                if (!res.headersSent) {
+                    res.writeHead(500, { 'Content-Type': 'application/json' });
+                }
+                res.end(JSON.stringify({ error: 'request error', detail: String(err) }));
+            },
+        });
+        return true;
+    }
+
     let identityHeaders = {};
     try {
         identityHeaders = buildHttpServiceAuthInfoHeader(req, parsedUrl, definition);
@@ -250,14 +412,7 @@ export function handleHttpServiceRoute(req, res, parsedUrl, apiRoutes = loadApiR
         });
         return true;
     }
-
-    proxyHttpPassthrough(
-        req,
-        res,
-        route.hostPort,
-        buildServiceAgentPath(pathname, parsedUrl?.search, definition.externalPrefix, definition.internalPrefix),
-        identityHeaders
-    );
+    proxyHttpPassthrough(req, res, route.hostPort, upstreamPath, identityHeaders);
     return true;
 }
 
@@ -532,13 +687,15 @@ async function executeRouterCommand(command, payload = {}, req = null) {
         switch (normalized) {
             case 'list_tools': {
                 const { toolsByAgent, errors, failures } = await collectTools(entries);
+                const caller = policy.resolveCaller(req);
                 const aggregated = [];
                 const emptyAgents = [];
                 for (const entry of entries) {
                     if (failures.has(entry.agentName)) {
                         continue;
                     }
-                    const tools = toolsByAgent.get(entry.agentName) || [];
+                    // Only advertise tools this caller is permitted to invoke.
+                    const tools = policy.mcpToolPolicy.filterTools(entry.agentName, toolsByAgent.get(entry.agentName) || [], caller);
                     if (!tools.length) {
                         emptyAgents.push(entry.agentName);
                         continue;
@@ -550,6 +707,11 @@ async function executeRouterCommand(command, payload = {}, req = null) {
                 return { statusCode: 200, body: { tools: aggregated, emptyAgents, errors } };
             }
             case 'list_resources': {
+                // Resources are an authenticated-class capability (DS014): an
+                // internal/agent or anonymous caller gets an empty list.
+                if (!policy.mcpToolPolicy.evaluateResource({ caller: policy.resolveCaller(req) }).allow) {
+                    return { statusCode: 200, body: { resources: [], errors: [] } };
+                }
                 const { resourcesByAgent, errors, failures } = await collectResources(entries);
                 const aggregated = [];
                 for (const entry of entries) {
@@ -616,6 +778,15 @@ async function executeRouterCommand(command, payload = {}, req = null) {
                     }
                 }
 
+                // MCP tool policy (fail-closed) gates the aggregate call too.
+                const aggDecision = policy.mcpToolPolicy.evaluate({
+                    agent: resolved.entry.agentName,
+                    tool: toolName,
+                    caller: policy.resolveCaller(req),
+                });
+                if (!aggDecision.allow) {
+                    return { statusCode: aggDecision.status || 403, body: { error: 'access_denied', code: aggDecision.code } };
+                }
                 const response = await callEntryTool(resolved.entry, toolName, args, req);
                 return {
                     statusCode: 200,
@@ -631,6 +802,11 @@ async function executeRouterCommand(command, payload = {}, req = null) {
                 const uri = payload && typeof payload.uri === 'string' ? payload.uri : null;
                 if (!uri) {
                     return { statusCode: 400, body: { error: 'missing uri' } };
+                }
+                // Fail-closed resource gate (DS014) before any lookup or mint.
+                const readDecision = policy.mcpToolPolicy.evaluateResource({ caller: policy.resolveCaller(req) });
+                if (!readDecision.allow) {
+                    return { statusCode: readDecision.status || 403, body: { error: 'access_denied', code: readDecision.code } };
                 }
                 const requestedAgent = payload && payload.agent ? String(payload.agent) : null;
                 const candidateEntries = requestedAgent
