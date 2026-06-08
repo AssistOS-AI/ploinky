@@ -1,3 +1,21 @@
+/**
+ * invocation-auth.mjs
+ *
+ * Normalizes a VERIFIED router-request grant (the payload the AgentServer places
+ * in `metadata.invocation` after secure-wire verification) into the `authInfo`
+ * shape agents consume for ACL checks. It performs no verification and must only
+ * ever be called with an already-verified grant.
+ *
+ * Identity precedence:
+ *   1. Delegated-user claims (`usr`/`user`) — authoritative for identity + roles.
+ *   2. A user `actor` (`actor.kind === 'user'` with a non-empty `actor.id`).
+ *   3. A user-shaped `sub` (`user:<id>`) when no actor identity applies.
+ * An explicit non-user actor ('guest'/'agent') is never promoted to a user.
+ *
+ * NOTE: This module is mirrored byte-for-byte at
+ * AssistOSExplorer/shared/invocation-auth.mjs (the dev/local fallback load path).
+ * Keep the two identical; shared/tests/invocationAuthParity.test.mjs guards drift.
+ */
 function normalizeRoles(value) {
   return Array.isArray(value) ? value.map((role) => String(role || '').trim()).filter(Boolean) : [];
 }
@@ -21,6 +39,12 @@ function deriveUserIdentity(grant, actor) {
   if (actorKind === 'user' && actorId) {
     return normalizeUserPrincipal(actorId);
   }
+  // An explicit non-user actor (e.g. 'guest'/'agent') is never promoted to an
+  // authenticated user, even when `sub` is user-shaped. Only fall back to `sub`
+  // when the actor is absent, kindless, or a user actor missing its id.
+  if (actorKind && actorKind !== 'user') {
+    return null;
+  }
   const subject = String(grant?.sub || '').trim();
   if (/^user:/i.test(subject)) {
     return normalizeUserPrincipal(subject);
@@ -39,6 +63,11 @@ export function authInfoFromInvocation(grant, { invocationToken = '' } = {}) {
     };
   }
   const actor = grant.actor && typeof grant.actor === 'object' ? grant.actor : null;
+  // Precedence: explicit delegated-user claims (`usr`/`user`) are authoritative
+  // for the resolved user identity AND its roles. When present, the router-signed
+  // `actor.roles` are intentionally NOT merged — an actor must not widen a
+  // delegated user's privileges. `actor`/`sub` seed the identity only when no
+  // user claims exist.
   const userClaims = grant.usr || grant.user;
   if (userClaims && typeof userClaims === 'object') {
     const fallbackIdentity = deriveUserIdentity(grant, actor);
