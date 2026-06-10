@@ -6,6 +6,7 @@ import { sendJson } from './authHandlers.js';
 import { createAgentClient } from './AgentClient.js';
 import { buildInvocationContextForProviderCall } from './mcp-proxy/index.js';
 import { buildRouterRequest } from './mcp-proxy/invocationMinter.js';
+import { deriveDelegationKey } from './mcp-proxy/mcpDelegations.js';
 import { computeRchHttp, sha256RawBodyHash } from '../../Agent/lib/requestHash.mjs';
 import { policy } from './policy/index.js';
 import { hasInternalAgentSegment } from './internalAgentPath.js';
@@ -287,23 +288,6 @@ function resolveHttpServicePrincipal(definition) {
 
 function resolveUserDelegationSigningSecret() {
     return deriveSubkey('router-user-delegation', 32);
-}
-
-function deriveDelegationKey(entry = {}, index = 0) {
-    const explicit = String(entry.key || '').trim();
-    if (explicit) {
-        return explicit;
-    }
-    const scope = Array.isArray(entry.scope) ? String(entry.scope[0] || '').trim() : '';
-    const parts = scope.split(':').filter(Boolean);
-    if (parts.length >= 2) {
-        const [first, second] = parts;
-        return `${first}${second.slice(0, 1).toUpperCase()}${second.slice(1)}`;
-    }
-    const target = String(entry.targetAgentId || '').split('/').pop() || `delegation${index + 1}`;
-    return target
-        .replace(/Agent$/i, '')
-        .replace(/[^A-Za-z0-9]+([A-Za-z0-9])/g, (_match, letter) => letter.toUpperCase());
 }
 
 function normalizeConditionPath(value) {
