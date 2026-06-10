@@ -38,6 +38,7 @@ test('authInfoFromInvocation leaves agent callers on the agent path with no user
         iss: 'ploinky-router',
         sub: 'agent:AssistOSExplorer/gitAgent',
         actor: { kind: 'agent', id: 'agent:AssistOSExplorer/gitAgent', roles: [] },
+        caller: { kind: 'agent', id: 'agent:AssistOSExplorer/gitAgent', roles: ['agent'] },
         tool: 'git_status'
     });
 
@@ -48,6 +49,7 @@ test('authInfoFromInvocation leaves agent callers on the agent path with no user
     assert.equal(authInfo.user, undefined);
     assert.equal(authInfo.principalId, undefined);
     assert.equal(authInfo.invocation.actor.kind, 'agent');
+    assert.equal(authInfo.invocation.caller.id, 'agent:AssistOSExplorer/gitAgent');
 });
 
 test('authInfoFromInvocation leaves a guest actor unauthenticated', () => {
@@ -118,4 +120,66 @@ test('authInfoFromInvocation ignores a malformed user actor with an empty id', (
 
     assert.equal(authInfo.user, undefined);
     assert.equal(authInfo.principalId, undefined);
+});
+
+test('authInfoFromInvocation exposes caller and delegation metadata while keeping usr authoritative', () => {
+    const authInfo = authInfoFromInvocation({
+        iss: 'ploinky-router',
+        sub: 'agent:AssistOSExplorer/onlyOffice',
+        actor: { kind: 'agent', id: 'agent:AssistOSExplorer/onlyOffice', roles: ['agent'] },
+        caller: { kind: 'agent', id: 'agent:AssistOSExplorer/onlyOffice', roles: ['agent'] },
+        usr: { id: 'local:alice', username: 'alice', roles: ['user'] },
+        delegation: {
+            jti: 'delegation-1',
+            scope: ['dpu:confidential:read'],
+            sourceAgentId: 'agent:AssistOSExplorer/onlyOffice'
+        },
+        tool: 'dpu_confidential_get'
+    });
+
+    assert.equal(authInfo.user.id, 'local:alice');
+    assert.equal(authInfo.agent.principalId, 'agent:AssistOSExplorer/onlyOffice');
+    assert.equal(authInfo.invocation.caller.id, 'agent:AssistOSExplorer/onlyOffice');
+    assert.equal(authInfo.invocation.delegation.jti, 'delegation-1');
+});
+
+test('authInfoFromInvocation exposes router-minted delegations for a user actor', () => {
+    const authInfo = authInfoFromInvocation({
+        iss: 'ploinky-router',
+        sub: 'user:local:admin',
+        actor: { kind: 'user', id: 'user:local:admin', roles: ['admin'] },
+        tool: 'git_auth_store_token',
+        delegations: {
+            dpuGitSecrets: {
+                token: 'delegation.jwt.value',
+                expiresAt: '2026-06-10T12:00:00.000Z',
+                targetAgentId: 'agent:AchillesIDE/dpuAgent',
+                tools: ['dpu_secret_put', 'dpu_secret_grant'],
+                scope: ['secret:write', 'secret:grant'],
+            },
+        },
+    });
+
+    assert.equal(authInfo.delegations.dpuGitSecrets.token, 'delegation.jwt.value');
+    assert.equal(authInfo.delegations.dpuGitSecrets.targetAgentId, 'agent:AchillesIDE/dpuAgent');
+    assert.equal(authInfo.user.id, 'local:admin');
+    assert.equal(authInfo.agent, undefined);
+});
+
+test('authInfoFromInvocation keeps the singular delegation and plural delegations independent', () => {
+    const authInfo = authInfoFromInvocation({
+        iss: 'ploinky-router',
+        sub: 'agent:AchillesIDE/gitAgent',
+        actor: { kind: 'agent', id: 'agent:AchillesIDE/gitAgent', roles: [] },
+        caller: { kind: 'agent', id: 'agent:AchillesIDE/gitAgent', roles: ['agent'] },
+        usr: { id: 'local:admin', username: 'admin', roles: ['admin'] },
+        delegation: { jti: 'grant-jti', scope: ['secret:write'], sourceAgentId: 'agent:AchillesIDE/gitAgent' },
+        tool: 'dpu_secret_put',
+    });
+
+    assert.equal(authInfo.invocation.delegation.jti, 'grant-jti');
+    assert.deepEqual(authInfo.invocation.delegation.scope, ['secret:write']);
+    assert.equal(authInfo.delegations, undefined);
+    assert.equal(authInfo.user.id, 'local:admin');
+    assert.equal(authInfo.agent.principalId, 'agent:AchillesIDE/gitAgent');
 });

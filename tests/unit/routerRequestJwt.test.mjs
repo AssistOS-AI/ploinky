@@ -161,3 +161,49 @@ test('router-request TTL is capped at 30s by the minter', () => {
     const { payload } = mintFor();
     assert.ok(payload.exp - payload.iat <= 30, `ttl ${payload.exp - payload.iat} should be <= 30`);
 });
+
+test('buildRouterRequest carries router-minted delegation grants without touching the singular delegation claim', () => {
+    const rch = computeRchTool({ method: 'POST', path: '/mcp', tool: 'git_auth_store_token', arguments: { token: 'redacted-by-test' } });
+    const { token, payload } = buildRouterRequest({
+        targetAgentId: 'agent:AchillesIDE/gitAgent',
+        sub: 'user:local:admin',
+        actor: { kind: 'user', id: 'user:local:admin', roles: ['admin'] },
+        method: 'POST',
+        path: '/mcp',
+        tool: 'git_auth_store_token',
+        rch,
+        delegation: { jti: 'upstream-jti', scope: ['secret:read'], sourceAgentId: 'agent:AchillesIDE/explorer' },
+        delegations: {
+            dpuGitSecrets: {
+                token: 'delegation.jwt.value',
+                expiresAt: '2026-06-10T12:00:00.000Z',
+                targetAgentId: 'agent:AchillesIDE/dpuAgent',
+                tools: ['dpu_secret_put', 'dpu_secret_grant'],
+                scope: ['secret:write', 'secret:grant'],
+            },
+            '': { token: 'must-be-dropped', targetAgentId: 'agent:AchillesIDE/dpuAgent' },
+            badEntry: { token: '', targetAgentId: 'agent:AchillesIDE/dpuAgent' },
+        },
+    });
+
+    assert.match(token, /^\S+\.\S+\.\S+$/);
+    assert.equal(payload.delegations.dpuGitSecrets.token, 'delegation.jwt.value');
+    assert.deepEqual(payload.delegations.dpuGitSecrets.tools, ['dpu_secret_put', 'dpu_secret_grant']);
+    assert.deepEqual(Object.keys(payload.delegations), ['dpuGitSecrets']);
+    assert.deepEqual(payload.delegation, { jti: 'upstream-jti', scope: ['secret:read'], sourceAgentId: 'agent:AchillesIDE/explorer' });
+});
+
+test('buildRouterRequest omits delegations when none are valid', () => {
+    const rch = computeRchTool({ method: 'POST', path: '/mcp', tool: 'git_status', arguments: {} });
+    const { payload } = buildRouterRequest({
+        targetAgentId: 'agent:AchillesIDE/gitAgent',
+        sub: 'user:local:admin',
+        actor: { kind: 'user', id: 'user:local:admin', roles: [] },
+        method: 'POST',
+        path: '/mcp',
+        tool: 'git_status',
+        rch,
+        delegations: { broken: { token: '', targetAgentId: '' } },
+    });
+    assert.equal(payload.delegations, undefined);
+});

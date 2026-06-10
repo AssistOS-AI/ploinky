@@ -1,10 +1,12 @@
 import http from 'http';
+import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 
 import { sendJson } from './authHandlers.js';
 import { createAgentClient } from './AgentClient.js';
 import { buildInvocationContextForProviderCall } from './mcp-proxy/index.js';
 import { buildRouterRequest } from './mcp-proxy/invocationMinter.js';
+import { deriveDelegationKey } from './mcp-proxy/mcpDelegations.js';
 import { computeRchHttp, sha256RawBodyHash } from '../../Agent/lib/requestHash.mjs';
 import { policy } from './policy/index.js';
 import { hasInternalAgentSegment } from './internalAgentPath.js';
@@ -16,6 +18,8 @@ import {
 } from './httpServiceRoutes.js';
 import { deriveAgentPrincipalId } from '../services/agentIdentity.js';
 import { ROUTING_FILE } from '../services/config.js';
+import { deriveSubkey } from '../services/masterKey.js';
+import { mintUserDelegationGrant } from './mcp-proxy/userDelegationGrant.js';
 
 const ROUTER_PROTOCOL_VERSION = '2025-06-18';
 const ROUTER_SERVER_INFO = { name: 'ploinky-router', version: '1.0.0' };
@@ -215,6 +219,7 @@ function readRequestBody(req, {
 
 const ROUTER_IDENTITY_HEADERS = new Set([
     'x-ploinky-auth-info',
+    'x-ploinky-user-delegation',
     'x-ploinky-user-id',
     'x-ploinky-user',
     'x-ploinky-user-email',
@@ -281,6 +286,85 @@ function resolveHttpServicePrincipal(definition) {
     }
 }
 
+function resolveUserDelegationSigningSecret() {
+    return deriveSubkey('router-user-delegation', 32);
+}
+
+function normalizeConditionPath(value) {
+    const raw = String(value || '').trim().replace(/\\/g, '/');
+    if (!raw) return '';
+    const prefixed = raw.startsWith('/') ? raw : `/${raw}`;
+    const normalized = path.posix.normalize(prefixed);
+    if (!normalized || normalized === '.') return '';
+    return normalized === '/' ? '/' : normalized.replace(/\/+$/g, '');
+}
+
+function isWithinPathRoot(value, root) {
+    const normalizedValue = normalizeConditionPath(value);
+    const normalizedRoot = normalizeConditionPath(root);
+    if (!normalizedValue || !normalizedRoot) return false;
+    if (normalizedRoot === '/') return true;
+    return normalizedValue === normalizedRoot || normalizedValue.startsWith(`${normalizedRoot}/`);
+}
+
+function serviceDelegationMatchesRequest(entry = {}, { parsedUrl } = {}) {
+    const when = entry.when;
+    if (!when) {
+        return true;
+    }
+    const queryParam = String(when.queryParam || 'path').trim();
+    const pathValue = parsedUrl?.searchParams?.get(queryParam) || '';
+    if (!pathValue) {
+        return false;
+    }
+    const roots = Array.isArray(when.pathRoots) ? when.pathRoots : [];
+    return roots.some((root) => isWithinPathRoot(pathValue, root));
+}
+
+function buildServiceDelegations(req, definition, { servicePath = '', parsedUrl = null } = {}) {
+    const authInfo = buildPlainAuthInfo(req);
+    const actorKind = resolveHttpServiceActorKind(authInfo);
+    if (actorKind !== 'user') {
+        return undefined;
+    }
+    const user = authInfo.user;
+    if (!user?.id || !Array.isArray(definition?.delegations) || !definition.delegations.length) {
+        return undefined;
+    }
+
+    const signingSecret = resolveUserDelegationSigningSecret();
+    const out = {};
+    for (let index = 0; index < definition.delegations.length; index += 1) {
+        const entry = definition.delegations[index];
+        if (!serviceDelegationMatchesRequest(entry, { parsedUrl })) {
+            continue;
+        }
+        const { token, payload } = mintUserDelegationGrant({
+            signingSecret,
+            ttlSeconds: entry.ttlSeconds,
+            sourceAgentId: resolveHttpServicePrincipal(definition),
+            service: {
+                routeKey: definition.routeKey,
+                externalPrefix: definition.externalPrefix,
+                internalPrefix: definition.internalPrefix,
+                internalPath: pathOnly(servicePath),
+            },
+            user,
+            targetAgentId: entry.targetAgentId,
+            tools: entry.tools,
+            scopes: entry.scope,
+        });
+        out[deriveDelegationKey(entry, index)] = {
+            token,
+            expiresAt: new Date(Number(payload.exp || 0) * 1000).toISOString(),
+            targetAgentId: entry.targetAgentId,
+            tools: [...entry.tools],
+            scope: [...entry.scope],
+        };
+    }
+    return Object.keys(out).length ? out : undefined;
+}
+
 export function buildHttpServiceAuthInfoHeader(req, parsedUrl, definition, { bodyHash = '', servicePath = '' } = {}) {
     if (!definition?.includeAuthInfo || !req.user || typeof req.user !== 'object') {
         return {};
@@ -318,6 +402,13 @@ export function buildHttpServiceAuthInfoHeader(req, parsedUrl, definition, { bod
         });
         authInfo.invocationToken = token;
         authInfo.invocationBody = invocationBody;
+    }
+    const delegations = buildServiceDelegations(req, definition, {
+        servicePath: servicePath || parsedUrl?.pathname || '',
+        parsedUrl,
+    });
+    if (delegations) {
+        authInfo.delegations = delegations;
     }
 
     return {

@@ -7,11 +7,14 @@ import {
     resolveProviderPrincipal,
     verifyAgentAssertion
 } from './invocationMinter.js';
+import { buildMcpDelegationsForUserCall } from './mcpDelegations.js';
 import { computeRchTool } from '../../../Agent/lib/requestHash.mjs';
 import { createMemoryReplayCache } from '../../../Agent/lib/jwtVerify.mjs';
 import { sanitizeArgumentsForTool } from './toolArguments.js';
 import { getAgentDescriptorByPrincipal } from '../../services/agentRegistry.js';
 import { policy } from '../policy/index.js';
+import { deriveSubkey } from '../../services/masterKey.js';
+import { verifyUserDelegationGrant } from './userDelegationGrant.js';
 
 const AGENT_PROXY_PROTOCOL_VERSION = '2025-06-18';
 const AGENT_PROXY_SERVER_INFO = { name: 'ploinky-router-proxy', version: '1.0.0' };
@@ -71,6 +74,16 @@ function readAuthorizationBearer(req) {
     return '';
 }
 
+function readUserDelegationHeader(req) {
+    const raw = req.headers?.['x-ploinky-user-delegation'] ?? req.headers?.['X-PLOINKY-USER-DELEGATION'];
+    const value = Array.isArray(raw) ? raw[0] : raw;
+    return typeof value === 'string' ? value.trim() : '';
+}
+
+function resolveUserDelegationSigningSecret() {
+    return deriveSubkey('router-user-delegation', 32);
+}
+
 function extractDelegatedUser(req) {
     if (!req.user || typeof req.user !== 'object') return null;
     return {
@@ -103,7 +116,6 @@ async function canonicalizeToolArguments(agentName, agentClient, toolName, args)
 
 export function buildInvocationContextForProviderCall({ req, agentName, toolName, toolArgs, method = 'POST', path = '/mcp' }) {
     if (!isSecureWireEnabled()) return null;
-    const targetAgentId = resolveProviderPrincipal({ providerAgentRef: resolveProviderAgentRef(agentName) });
     const canonicalArgs = toolArgs && typeof toolArgs === 'object' && !Array.isArray(toolArgs) ? toolArgs : {};
     // rch binds the token to exactly the {method, path, tool, arguments} the
     // agent will execute. For MCP the transport is always POST /mcp.
@@ -119,24 +131,75 @@ export function buildInvocationContextForProviderCall({ req, agentName, toolName
         : null;
     if (delegated) {
         const caller = String(delegated.callerPrincipal || '');
+        const targetAgentId = String(delegated.userDelegation?.delegation?.targetAgentId || '').trim()
+            || resolveProviderPrincipal({ providerAgentRef: resolveProviderAgentRef(agentName) });
         sub = caller;
         actor = { kind: 'agent', id: caller, roles: [] };
+        const callerInfo = { kind: 'agent', id: caller, roles: ['agent'] };
+        const verifiedDelegation = delegated.userDelegation;
+        const { token, payload } = buildRouterRequest({
+            targetAgentId,
+            sub,
+            actor,
+            caller: callerInfo,
+            usr: verifiedDelegation?.user || undefined,
+            delegation: verifiedDelegation?.delegation || undefined,
+            method,
+            path,
+            tool: toolName,
+            rch,
+        });
+        return { token, payload, rch };
     } else {
+        const targetAgentId = resolveProviderPrincipal({ providerAgentRef: resolveProviderAgentRef(agentName) });
         const user = extractDelegatedUser(req);
         sub = user?.id ? `user:${user.id}` : '';
         actor = { kind: 'user', id: sub, roles: user?.roles || [] };
+        const delegations = buildMcpDelegationsForUserCall({ req, routeKey: agentName, toolName });
+        const { token, payload } = buildRouterRequest({
+            targetAgentId,
+            sub,
+            actor,
+            delegations,
+            method,
+            path,
+            tool: toolName,
+            rch,
+        });
+        return { token, payload, rch };
     }
+}
 
-    const { token, payload } = buildRouterRequest({
-        targetAgentId,
-        sub,
-        actor,
-        method,
-        path,
+export function verifyDelegatedAgentToolCall({
+    req,
+    agentName,
+    toolName,
+    rawArgs = {},
+    assertionCache = assertionReplayCache,
+}) {
+    const rch = computeRchTool({ method: 'POST', path: '/mcp', tool: toolName, arguments: rawArgs });
+    const verifiedAgent = verifyAgentAssertion({
+        token: readAuthorizationBearer(req),
+        method: 'POST',
+        path: '/mcp',
         tool: toolName,
         rch,
+        targetAgentId: agentName,
+        replayCache: assertionCache,
     });
-    return { token, payload, rch };
+    const delegationToken = readUserDelegationHeader(req);
+    if (!delegationToken) {
+        return { ...verifiedAgent, userDelegation: null };
+    }
+    const targetAgentId = resolveProviderPrincipal({ providerAgentRef: resolveProviderAgentRef(agentName) });
+    const userDelegation = verifyUserDelegationGrant({
+        signingSecret: resolveUserDelegationSigningSecret(),
+        token: delegationToken,
+        expectedSourceAgentId: verifiedAgent.callerPrincipal,
+        expectedTargetAgentId: targetAgentId,
+        expectedTool: toolName,
+    });
+    return { ...verifiedAgent, userDelegation };
 }
 
 /**
@@ -379,15 +442,12 @@ async function handleAgentMcpRequest(req, res, route, agentName) {
                 // signed (raw args, as sent). The source binds the target by its
                 // route name; MCP policy for the agent caller is enforced later in
                 // handleAgentJsonRpc before any token is minted.
-                const rch = computeRchTool({ method: 'POST', path: '/mcp', tool: toolName, arguments: rawArgs });
-                req.delegatedAgentVerified = verifyAgentAssertion({
-                    token: readAuthorizationBearer(req),
-                    method: 'POST',
-                    path: '/mcp',
-                    tool: toolName,
-                    rch,
-                    targetAgentId: agentName,
-                    replayCache: assertionReplayCache,
+                req.delegatedAgentVerified = verifyDelegatedAgentToolCall({
+                    req,
+                    agentName,
+                    toolName,
+                    rawArgs,
+                    assertionCache: assertionReplayCache,
                 });
             } catch (error) {
                 res.writeHead(200, { 'Content-Type': 'application/json' });
