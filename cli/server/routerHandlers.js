@@ -16,6 +16,8 @@ import {
 } from './httpServiceRoutes.js';
 import { deriveAgentPrincipalId } from '../services/agentIdentity.js';
 import { ROUTING_FILE } from '../services/config.js';
+import { deriveSubkey } from '../services/masterKey.js';
+import { mintUserDelegationGrant } from './mcp-proxy/userDelegationGrant.js';
 
 const ROUTER_PROTOCOL_VERSION = '2025-06-18';
 const ROUTER_SERVER_INFO = { name: 'ploinky-router', version: '1.0.0' };
@@ -215,6 +217,7 @@ function readRequestBody(req, {
 
 const ROUTER_IDENTITY_HEADERS = new Set([
     'x-ploinky-auth-info',
+    'x-ploinky-user-delegation',
     'x-ploinky-user-id',
     'x-ploinky-user',
     'x-ploinky-user-email',
@@ -281,6 +284,64 @@ function resolveHttpServicePrincipal(definition) {
     }
 }
 
+function resolveUserDelegationSigningSecret() {
+    return deriveSubkey('router-user-delegation', 32);
+}
+
+function deriveDelegationKey(entry = {}, index = 0) {
+    const scope = Array.isArray(entry.scope) ? String(entry.scope[0] || '').trim() : '';
+    const parts = scope.split(':').filter(Boolean);
+    if (parts.length >= 2) {
+        const [first, second] = parts;
+        return `${first}${second.slice(0, 1).toUpperCase()}${second.slice(1)}`;
+    }
+    const target = String(entry.targetAgentId || '').split('/').pop() || `delegation${index + 1}`;
+    return target
+        .replace(/Agent$/i, '')
+        .replace(/[^A-Za-z0-9]+([A-Za-z0-9])/g, (_match, letter) => letter.toUpperCase());
+}
+
+function buildServiceDelegations(req, definition, servicePath) {
+    const authInfo = buildPlainAuthInfo(req);
+    const actorKind = resolveHttpServiceActorKind(authInfo);
+    if (actorKind !== 'user') {
+        return undefined;
+    }
+    const user = authInfo.user;
+    if (!user?.id || !Array.isArray(definition?.delegations) || !definition.delegations.length) {
+        return undefined;
+    }
+
+    const signingSecret = resolveUserDelegationSigningSecret();
+    const out = {};
+    for (let index = 0; index < definition.delegations.length; index += 1) {
+        const entry = definition.delegations[index];
+        const { token, payload } = mintUserDelegationGrant({
+            signingSecret,
+            ttlSeconds: entry.ttlSeconds,
+            sourceAgentId: resolveHttpServicePrincipal(definition),
+            service: {
+                routeKey: definition.routeKey,
+                externalPrefix: definition.externalPrefix,
+                internalPrefix: definition.internalPrefix,
+                internalPath: pathOnly(servicePath),
+            },
+            user,
+            targetAgentId: entry.targetAgentId,
+            tools: entry.tools,
+            scopes: entry.scope,
+        });
+        out[deriveDelegationKey(entry, index)] = {
+            token,
+            expiresAt: new Date(Number(payload.exp || 0) * 1000).toISOString(),
+            targetAgentId: entry.targetAgentId,
+            tools: [...entry.tools],
+            scope: [...entry.scope],
+        };
+    }
+    return Object.keys(out).length ? out : undefined;
+}
+
 export function buildHttpServiceAuthInfoHeader(req, parsedUrl, definition, { bodyHash = '', servicePath = '' } = {}) {
     if (!definition?.includeAuthInfo || !req.user || typeof req.user !== 'object') {
         return {};
@@ -318,6 +379,10 @@ export function buildHttpServiceAuthInfoHeader(req, parsedUrl, definition, { bod
         });
         authInfo.invocationToken = token;
         authInfo.invocationBody = invocationBody;
+    }
+    const delegations = buildServiceDelegations(req, definition, servicePath || parsedUrl?.pathname || '');
+    if (delegations) {
+        authInfo.delegations = delegations;
     }
 
     return {

@@ -20,6 +20,14 @@ function normalizeRoles(value) {
   return Array.isArray(value) ? value.map((role) => String(role || '').trim()).filter(Boolean) : [];
 }
 
+function extractCallerPrincipal(grant) {
+  const caller = grant?.caller;
+  if (caller && typeof caller === 'object') {
+    return String(caller.id || '').trim();
+  }
+  return String(caller || grant?.sub || '').trim();
+}
+
 function normalizeUserPrincipal(value) {
   const raw = String(value || '').trim();
   if (!raw) return null;
@@ -55,7 +63,7 @@ function deriveUserIdentity(grant, actor) {
 export function authInfoFromInvocation(grant, { invocationToken = '' } = {}) {
   if (!grant || typeof grant !== 'object') return null;
   const out = {};
-  const callerPrincipal = grant.caller || grant.sub || '';
+  const callerPrincipal = extractCallerPrincipal(grant);
   if (callerPrincipal && /^agent:/i.test(callerPrincipal)) {
     out.agent = {
       principalId: callerPrincipal,
@@ -105,7 +113,21 @@ export function authInfoFromInvocation(grant, { invocationToken = '' } = {}) {
       : null,
     scope: Array.isArray(grant.scope) ? [...grant.scope] : [],
     tool: String(grant.tool || ''),
-    workspaceId: String(grant.workspace_id || '')
+    workspaceId: String(grant.workspace_id || ''),
+    caller: grant.caller && typeof grant.caller === 'object'
+      ? {
+          kind: String(grant.caller.kind || ''),
+          id: String(grant.caller.id || ''),
+          roles: normalizeRoles(grant.caller.roles)
+        }
+      : (callerPrincipal ? { kind: 'agent', id: callerPrincipal, roles: [] } : null),
+    delegation: grant.delegation && typeof grant.delegation === 'object'
+      ? {
+          jti: String(grant.delegation.jti || ''),
+          scope: normalizeRoles(grant.delegation.scope),
+          sourceAgentId: String(grant.delegation.sourceAgentId || '')
+        }
+      : null
   };
   out.invocationToken = String(invocationToken || '');
   return out;

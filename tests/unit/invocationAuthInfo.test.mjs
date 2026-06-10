@@ -38,6 +38,7 @@ test('authInfoFromInvocation leaves agent callers on the agent path with no user
         iss: 'ploinky-router',
         sub: 'agent:AssistOSExplorer/gitAgent',
         actor: { kind: 'agent', id: 'agent:AssistOSExplorer/gitAgent', roles: [] },
+        caller: { kind: 'agent', id: 'agent:AssistOSExplorer/gitAgent', roles: ['agent'] },
         tool: 'git_status'
     });
 
@@ -48,6 +49,7 @@ test('authInfoFromInvocation leaves agent callers on the agent path with no user
     assert.equal(authInfo.user, undefined);
     assert.equal(authInfo.principalId, undefined);
     assert.equal(authInfo.invocation.actor.kind, 'agent');
+    assert.equal(authInfo.invocation.caller.id, 'agent:AssistOSExplorer/gitAgent');
 });
 
 test('authInfoFromInvocation leaves a guest actor unauthenticated', () => {
@@ -118,4 +120,25 @@ test('authInfoFromInvocation ignores a malformed user actor with an empty id', (
 
     assert.equal(authInfo.user, undefined);
     assert.equal(authInfo.principalId, undefined);
+});
+
+test('authInfoFromInvocation exposes caller and delegation metadata while keeping usr authoritative', () => {
+    const authInfo = authInfoFromInvocation({
+        iss: 'ploinky-router',
+        sub: 'agent:AssistOSExplorer/onlyOffice',
+        actor: { kind: 'agent', id: 'agent:AssistOSExplorer/onlyOffice', roles: ['agent'] },
+        caller: { kind: 'agent', id: 'agent:AssistOSExplorer/onlyOffice', roles: ['agent'] },
+        usr: { id: 'local:alice', username: 'alice', roles: ['user'] },
+        delegation: {
+            jti: 'delegation-1',
+            scope: ['dpu:confidential:read'],
+            sourceAgentId: 'agent:AssistOSExplorer/onlyOffice'
+        },
+        tool: 'dpu_confidential_get'
+    });
+
+    assert.equal(authInfo.user.id, 'local:alice');
+    assert.equal(authInfo.agent.principalId, 'agent:AssistOSExplorer/onlyOffice');
+    assert.equal(authInfo.invocation.caller.id, 'agent:AssistOSExplorer/onlyOffice');
+    assert.equal(authInfo.invocation.delegation.jti, 'delegation-1');
 });

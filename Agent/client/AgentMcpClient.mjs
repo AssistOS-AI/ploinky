@@ -25,10 +25,19 @@ export function getAgentMcpUrl(agentName) {
     return `${getRouterUrl()}/${agentName}/mcp`;
 }
 
-function postToolCall(agentName, jsonRpcBody, assertion) {
+function normalizeDelegationToken(token) {
+    if (token === undefined || token === null || token === '') return '';
+    if (typeof token !== 'string') {
+        throw new Error('AgentMcpClient: userDelegationToken must be a string');
+    }
+    return token.trim();
+}
+
+function postToolCall(agentName, jsonRpcBody, assertion, userDelegationToken = '') {
     const url = new URL(getAgentMcpUrl(agentName));
     const httpModule = url.protocol === 'https:' ? https : http;
     const payload = Buffer.from(JSON.stringify(jsonRpcBody), 'utf8');
+    const delegationToken = normalizeDelegationToken(userDelegationToken);
     return new Promise((resolve, reject) => {
         const req = httpModule.request({
             hostname: url.hostname,
@@ -40,6 +49,7 @@ function postToolCall(agentName, jsonRpcBody, assertion) {
                 'content-length': payload.length,
                 accept: 'application/json',
                 authorization: `Bearer ${assertion}`,
+                ...(delegationToken ? { 'x-ploinky-user-delegation': delegationToken } : {}),
             },
         }, (res) => {
             const chunks = [];
@@ -56,14 +66,32 @@ function postToolCall(agentName, jsonRpcBody, assertion) {
     });
 }
 
+function unwrapToolResult(result) {
+    const content = Array.isArray(result?.content) ? result.content : [];
+    if (content.length !== 1) {
+        return result;
+    }
+    const entry = content[0];
+    if (!entry || String(entry.type || '') !== 'text' || typeof entry.text !== 'string') {
+        return result;
+    }
+    try {
+        return JSON.parse(entry.text);
+    } catch (_) {
+        return result;
+    }
+}
+
 /**
  * Create a router-mediated client for calling `agentName`'s tools. Only
  * `callTool` is supported: the router's delegated path accepts a direct
  * tools/call, so listing/initialization over agent-to-agent is intentionally
  * unavailable (use a user/session surface for discovery).
  */
-export async function createAgentClient(agentName) {
-    async function callTool(name, args = {}) {
+export async function createAgentClient(agentName, options = {}) {
+    const defaultDelegationToken = normalizeDelegationToken(options?.userDelegationToken);
+
+    async function callTool(name, args = {}, callOptions = {}) {
         const toolArgs = args && typeof args === 'object' && !Array.isArray(args) ? args : {};
         const assertion = signAgentAssertion({
             method: 'POST',
@@ -78,7 +106,10 @@ export async function createAgentClient(agentName) {
             method: 'tools/call',
             params: { name, arguments: toolArgs },
         };
-        const { status, json, text } = await postToolCall(agentName, body, assertion);
+        const delegationToken = Object.prototype.hasOwnProperty.call(callOptions || {}, 'userDelegationToken')
+            ? callOptions.userDelegationToken
+            : defaultDelegationToken;
+        const { status, json, text } = await postToolCall(agentName, body, assertion, delegationToken);
         if (json && json.error) {
             const err = new Error(json.error.message || 'agent-to-agent call failed');
             err.code = json.error.code;
@@ -88,7 +119,7 @@ export async function createAgentClient(agentName) {
         if (status >= 400 || !json) {
             throw new Error(`agent-to-agent call failed (status ${status}): ${(text || '').slice(0, 200)}`.trim());
         }
-        return json.result;
+        return unwrapToolResult(json.result);
     }
 
     const unsupported = (op) => async () => {

@@ -38,6 +38,40 @@ function normalizeActor(actor) {
     };
 }
 
+function normalizeCaller(caller) {
+    if (!caller || typeof caller !== 'object') return undefined;
+    const id = String(caller.id || '').trim();
+    if (!id) return undefined;
+    return {
+        kind: caller.kind === 'user' || caller.kind === 'guest' ? caller.kind : 'agent',
+        id,
+        roles: Array.isArray(caller.roles) ? caller.roles.map((r) => String(r || '')).filter(Boolean) : [],
+    };
+}
+
+function normalizeUserClaims(usr) {
+    if (!usr || typeof usr !== 'object') return undefined;
+    const id = String(usr.id || usr.sub || '').trim();
+    if (!id) return undefined;
+    return {
+        id,
+        username: String(usr.username || usr.preferred_username || '').trim(),
+        email: String(usr.email || '').trim(),
+        roles: Array.isArray(usr.roles) ? usr.roles.map((role) => String(role || '')).filter(Boolean) : [],
+    };
+}
+
+function normalizeDelegation(delegation) {
+    if (!delegation || typeof delegation !== 'object') return undefined;
+    const jti = String(delegation.jti || '').trim();
+    if (!jti) return undefined;
+    return {
+        jti,
+        scope: Array.isArray(delegation.scope) ? delegation.scope.map((scope) => String(scope || '')).filter(Boolean) : [],
+        sourceAgentId: String(delegation.sourceAgentId || '').trim(),
+    };
+}
+
 export function resolveProviderPrincipal({ providerAgentRef, providerPrincipal }) {
     if (providerPrincipal) return String(providerPrincipal).trim();
     const descriptor = resolveAgentDescriptor(providerAgentRef);
@@ -56,6 +90,9 @@ export function buildRouterRequest({
     targetAgentId,
     sub,
     actor,
+    caller,
+    usr,
+    delegation,
     method,
     path,
     tool,
@@ -84,6 +121,18 @@ export function buildRouterRequest({
     };
     if (tool !== undefined && tool !== null && String(tool) !== '') {
         payload.tool = String(tool);
+    }
+    const normalizedCaller = normalizeCaller(caller);
+    if (normalizedCaller) {
+        payload.caller = normalizedCaller;
+    }
+    const normalizedUser = normalizeUserClaims(usr);
+    if (normalizedUser) {
+        payload.usr = normalizedUser;
+    }
+    const normalizedDelegation = normalizeDelegation(delegation);
+    if (normalizedDelegation) {
+        payload.delegation = normalizedDelegation;
     }
     const secret = deriveAgentRequestSecret(target, { encoding: 'buffer' });
     const token = signHmacJwt({ payload, secret });

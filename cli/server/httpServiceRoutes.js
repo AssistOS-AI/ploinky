@@ -81,6 +81,96 @@ function normalizeAuthMode(value, fallback = '') {
     return fallback || 'protected';
 }
 
+function uniqueTrimmedStrings(values) {
+    if (!Array.isArray(values)) return [];
+    const out = [];
+    const seen = new Set();
+    for (const raw of values) {
+        const value = String(raw || '').trim();
+        if (!value || seen.has(value.toLowerCase())) continue;
+        seen.add(value.toLowerCase());
+        out.push(value);
+    }
+    return out;
+}
+
+function normalizeDelegation(spec) {
+    const hasDelegations = Array.isArray(spec.delegations);
+    const delegations = hasDelegations ? spec.delegations.map((entry) => {
+        const targetAgentId = String(entry?.targetAgentId || '').trim();
+        const tools = uniqueTrimmedStrings(entry?.tools);
+        const scopes = uniqueTrimmedStrings(entry?.scopes || entry?.scope || []);
+        const ttlRaw = Number.parseInt(String(entry?.ttlSeconds || ''), 10);
+        const ttlSeconds = Number.isFinite(ttlRaw) ? ttlRaw : 1800;
+        return {
+            targetAgentId,
+            tools,
+            scopes,
+            ttlSeconds,
+        };
+    }) : [];
+
+    return {
+        hasDelegations,
+        entries: delegations.filter((entry) => entry.targetAgentId || entry.tools.length || entry.scopes.length || entry.ttlSeconds !== 1800),
+        rawSource: spec.delegations,
+    };
+}
+
+function validateAndNormalizeDelegations(spec, authMode) {
+    const normalized = normalizeDelegation(spec);
+    if (!normalized.hasDelegations) {
+        return [];
+    }
+
+    if (authMode !== 'protected') {
+        throw new Error(`Delegations are only supported for protected HTTP services. Route '${spec.slug || ''}' is '${authMode}'.`);
+    }
+
+    const out = [];
+    const errors = [];
+
+    for (const delegation of normalized.entries) {
+        const targetAgentId = String(delegation.targetAgentId || '').trim();
+        const targetValid = /^agent:[^/\s:]+\/[^/\s:]+$/.test(targetAgentId);
+        if (!targetValid) {
+            errors.push(`invalid targetAgentId '${targetAgentId}'`);
+            continue;
+        }
+
+        const tools = uniqueTrimmedStrings(delegation.tools);
+        if (!tools.length) {
+            errors.push(`empty delegation tools for '${targetAgentId}'`);
+            continue;
+        }
+
+        const scopes = uniqueTrimmedStrings(delegation.scopes);
+        if (!scopes.length) {
+            errors.push(`empty delegation scopes for '${targetAgentId}'`);
+            continue;
+        }
+
+        const ttlRaw = Number.parseInt(String(delegation.ttlSeconds), 10);
+        const ttlSeconds = Number.isFinite(ttlRaw) ? ttlRaw : 1800;
+        if (!Number.isInteger(ttlSeconds) || ttlSeconds < 30 || ttlSeconds > 1800) {
+            errors.push(`invalid ttlSeconds for '${targetAgentId}'`);
+            continue;
+        }
+
+        out.push({
+            targetAgentId,
+            tools,
+            scope: scopes,
+            ttlSeconds,
+        });
+    }
+
+    if (errors.length) {
+        throw new Error(`Invalid service delegations: ${errors.join('; ')}`);
+    }
+    return out;
+}
+
 function normalizeServiceSpec(routeKey, route, spec, defaultAuthMode = '') {
     if (!spec || typeof spec !== 'object') return null;
     const slug = String(spec.slug || spec.name || '').trim().replace(/^\/+|\/+$/g, '');
@@ -105,9 +195,12 @@ function normalizeServiceSpec(routeKey, route, spec, defaultAuthMode = '') {
         forceGuest: spec.forceGuest === true,
         issueInvocation: spec.invocation !== false && authMode !== 'none',
         includeAuthInfo: spec.includeAuthInfo !== false && authMode !== 'none',
-        notFoundMessage: String(spec.notFoundMessage || 'HTTP service route not found.')
+        notFoundMessage: String(spec.notFoundMessage || 'HTTP service route not found.'),
+        delegations: validateAndNormalizeDelegations(spec, authMode),
     };
 }
+
+export { normalizeServiceSpec };
 
 function collectRouteServiceSpecs(routeKey, route, routes) {
     const manifest = readEnabledAgentManifest(routeKey, routes) || {};

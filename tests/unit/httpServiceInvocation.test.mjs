@@ -10,13 +10,257 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import { createMemoryReplayCache } from '../../Agent/lib/jwtVerify.mjs';
 import { verifyRouterRequestToken } from '../../Agent/lib/requestSignedTokens.mjs';
-import { deriveAgentRequestSecret } from '../../cli/services/masterKey.js';
+import { deriveAgentRequestSecret, deriveSubkey } from '../../cli/services/masterKey.js';
 import { computeRchHttp } from '../../Agent/lib/requestHash.mjs';
+import { normalizeServiceSpec } from '../../cli/server/httpServiceRoutes.js';
+import { verifyUserDelegationGrant } from '../../cli/server/mcp-proxy/userDelegationGrant.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const REPO_ROOT = path.resolve(__dirname, '../..');
 const MASTER_KEY = '5'.repeat(64);
+
+const VALID_DELEGATION_SPEC = {
+    externalPrefix: '/services/onlyoffice/',
+    internalPrefix: '/control/',
+    auth: 'protected',
+    slug: 'onlyoffice',
+    delegations: [{
+        targetAgentId: 'agent:AssistOSExplorer/dpuAgent',
+        tools: [
+            'dpu_workspace_roots',
+            'dpu_confidential_list',
+            'dpu_confidential_get',
+            'dpu_confidential_update',
+        ],
+        scopes: [
+            'dpu:confidential:read',
+            'dpu:confidential:write',
+        ],
+    }],
+};
+
+test('normalizeServiceSpec preserves protected service delegations with canonical target ids', () => {
+    const definition = normalizeServiceSpec('onlyOffice', { agent: 'onlyOffice', repo: 'AssistOSExplorer' }, VALID_DELEGATION_SPEC);
+
+    assert.equal(Array.isArray(definition?.delegations), true);
+    assert.equal(definition.delegations.length, 1);
+    assert.deepEqual(definition.delegations[0], {
+        targetAgentId: 'agent:AssistOSExplorer/dpuAgent',
+        tools: [
+            'dpu_workspace_roots',
+            'dpu_confidential_list',
+            'dpu_confidential_get',
+            'dpu_confidential_update',
+        ],
+        scope: [
+            'dpu:confidential:read',
+            'dpu:confidential:write',
+        ],
+        ttlSeconds: 1800,
+    });
+});
+
+test('normalizeServiceSpec rejects delegations on auth none services', () => {
+    assert.throws(() => normalizeServiceSpec('explorer', { agent: 'explorer', repo: 'AchillesIDE' }, {
+        slug: 'office',
+        auth: 'none',
+        delegations: [{
+            targetAgentId: 'agent:AssistOSExplorer/dpuAgent',
+            tools: ['dpu_workspace_roots'],
+            scopes: ['dpu:confidential:read'],
+        }],
+    }), /Delegations are only supported/);
+});
+
+test('normalizeServiceSpec rejects delegation targets that are not canonical agent ids', () => {
+    assert.throws(() => normalizeServiceSpec('onlyOffice', { agent: 'onlyOffice', repo: 'AssistOSExplorer' }, {
+        slug: 'onlyoffice',
+        auth: 'protected',
+        delegations: [{
+            targetAgentId: 'invalid-target',
+            tools: ['dpu_workspace_roots'],
+            scopes: ['dpu:confidential:read'],
+        }],
+    }), /invalid targetAgentId/);
+});
+
+test('normalizeServiceSpec rejects empty delegation tool lists', () => {
+    assert.throws(() => normalizeServiceSpec('onlyOffice', { agent: 'onlyOffice', repo: 'AssistOSExplorer' }, {
+        slug: 'onlyoffice',
+        auth: 'protected',
+        delegations: [{
+            targetAgentId: 'agent:AssistOSExplorer/dpuAgent',
+            tools: [],
+            scopes: ['dpu:confidential:read'],
+        }],
+    }), /empty delegation tools/);
+});
+
+test('protected http service auth info includes configured user delegation grant', async (t) => {
+    let captured = null;
+    const upstream = http.createServer((req, res) => {
+        captured = {
+            url: req.url,
+            headers: req.headers,
+        };
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true }));
+    });
+    const servicePort = await listen(upstream);
+    t.after(async () => {
+        await close(upstream);
+    });
+
+    const { routerHandlers } = await withRouterModules(t, servicePort, writeOnlyOfficeDelegationConfig);
+    const req = makeRequest({
+        url: '/services/onlyoffice/office/session?path=%2FConfidential%2FReport.docx',
+    });
+    req.user = {
+        id: 'local:alice',
+        username: 'alice',
+        roles: ['user'],
+    };
+    req.sessionId = 'session-alice';
+    const res = new MockWritableResponse();
+    const parsedUrl = new URL(req.url, 'http://localhost');
+
+    assert.equal(routerHandlers.handleHttpServiceRoute(req, res, parsedUrl), true);
+    await res.done;
+
+    const authInfo = JSON.parse(captured?.headers['x-ploinky-auth-info'] || '{}');
+    assert.equal(authInfo.user.id, 'local:alice');
+    assert.equal(authInfo.delegations?.dpuConfidential?.targetAgentId, 'agent:AssistOSExplorer/dpuAgent');
+    const verified = verifyUserDelegationGrant({
+        signingSecret: deriveSubkey('router-user-delegation', 32),
+        token: authInfo.delegations.dpuConfidential.token,
+        expectedSourceAgentId: 'agent:AssistOSExplorer/onlyOffice',
+        expectedTargetAgentId: 'agent:AssistOSExplorer/dpuAgent',
+        expectedTool: 'dpu_confidential_get',
+        replayCache: createMemoryReplayCache(),
+    });
+    assert.equal(verified.user.id, 'local:alice');
+});
+
+test('http service grant is omitted for anonymous and guest actors', async (t) => {
+    let captured = null;
+    const upstream = http.createServer((req, res) => {
+        captured = {
+            url: req.url,
+            headers: req.headers,
+        };
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true }));
+    });
+    const servicePort = await listen(upstream);
+    t.after(async () => {
+        await close(upstream);
+    });
+
+    const { routerHandlers } = await withRouterModules(t, servicePort, writeOnlyOfficeDelegationConfig);
+    const guestReq = makeRequest({
+        url: '/services/onlyoffice/office/session?path=%2FConfidential%2FGuest.docx',
+    });
+    guestReq.user = {
+        id: 'guest:anon',
+        username: 'anon',
+        roles: ['guest'],
+    };
+    guestReq.sessionId = 'guest-session';
+    guestReq.authMode = 'guest';
+    const guestRes = new MockWritableResponse();
+    const guestParsed = new URL(guestReq.url, 'http://localhost');
+
+    assert.equal(routerHandlers.handleHttpServiceRoute(guestReq, guestRes, guestParsed), true);
+    await guestRes.done;
+
+    let authInfo = JSON.parse(captured?.headers['x-ploinky-auth-info'] || '{}');
+    assert.equal(authInfo.delegations, undefined);
+
+    captured = null;
+    const publicReq = makeRequest({
+        url: '/public-services/onlyoffice/editor-status',
+    });
+    const publicRes = new MockWritableResponse();
+    const publicParsed = new URL(publicReq.url, 'http://localhost');
+    assert.equal(routerHandlers.handleHttpServiceRoute(publicReq, publicRes, publicParsed), true);
+    await publicRes.done;
+
+    assert.equal(captured?.headers['x-ploinky-auth-info'], undefined);
+});
+
+test('router strips caller-supplied x-ploinky-user-delegation before proxying', async (t) => {
+    let captured = null;
+    const upstream = http.createServer((req, res) => {
+        captured = {
+            url: req.url,
+            headers: req.headers,
+        };
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true }));
+    });
+    const servicePort = await listen(upstream);
+    t.after(async () => {
+        await close(upstream);
+    });
+
+    const { routerHandlers } = await withRouterModules(t, servicePort, writeOnlyOfficeDelegationConfig);
+    const req = makeRequest({
+        url: '/services/onlyoffice/office/session',
+        headers: {
+            'x-ploinky-user-delegation': 'spoofed-token',
+        },
+    });
+    req.user = {
+        id: 'local:alice',
+        username: 'alice',
+        roles: ['user'],
+    };
+    req.sessionId = 'session-alice';
+    const res = new MockWritableResponse();
+    const parsedUrl = new URL(req.url, 'http://localhost');
+
+    assert.equal(routerHandlers.handleHttpServiceRoute(req, res, parsedUrl), true);
+    await res.done;
+
+    assert.equal(captured?.headers['x-ploinky-user-delegation'], undefined);
+});
+
+test('http service grant expiry is capped by the service delegation ttl', async (t) => {
+    let captured = null;
+    const upstream = http.createServer((req, res) => {
+        captured = {
+            url: req.url,
+            headers: req.headers,
+        };
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true }));
+    });
+    const servicePort = await listen(upstream);
+    t.after(async () => {
+        await close(upstream);
+    });
+
+    const { routerHandlers } = await withRouterModules(t, servicePort, writeOnlyOfficeDelegationConfig);
+    const req = makeRequest({
+        url: '/services/onlyoffice/office/session',
+    });
+    req.user = {
+        id: 'local:alice',
+        username: 'alice',
+        roles: ['user'],
+    };
+    req.sessionId = 'session-alice';
+    const res = new MockWritableResponse();
+    const parsedUrl = new URL(req.url, 'http://localhost');
+
+    assert.equal(routerHandlers.handleHttpServiceRoute(req, res, parsedUrl), true);
+    await res.done;
+
+    const authInfo = JSON.parse(captured?.headers['x-ploinky-auth-info'] || '{}');
+    const claims = JSON.parse(Buffer.from(authInfo.delegations.dpuConfidential.token.split('.')[1], 'base64url').toString('utf8'));
+    assert.ok((Number(claims.exp) - Number(claims.iat)) <= 45);
+});
 
 class MockWritableResponse extends Writable {
     constructor() {
@@ -156,6 +400,61 @@ function writeWorkspaceConfig(ploinkyDir, servicePort) {
         static: {
             agent: 'explorer',
             hostPath: explorerManifestDir
+        }
+    }, null, 2));
+}
+
+function writeOnlyOfficeDelegationConfig(ploinkyDir, servicePort) {
+    const onlyOfficeManifestDir = path.join(ploinkyDir, 'repos', 'AssistOSExplorer', 'onlyOffice');
+    mkdirSync(onlyOfficeManifestDir, { recursive: true });
+    writeFileSync(path.join(onlyOfficeManifestDir, 'manifest.json'), JSON.stringify({
+        httpServices: [
+            {
+                slug: 'onlyoffice',
+                externalPrefix: '/services/onlyoffice/',
+                internalPrefix: '/control/',
+                auth: 'protected',
+                delegations: [{
+                    targetAgentId: 'agent:AssistOSExplorer/dpuAgent',
+                    tools: [
+                        'dpu_workspace_roots',
+                        'dpu_confidential_list',
+                        'dpu_confidential_get',
+                        'dpu_confidential_update',
+                    ],
+                    scopes: [
+                        'dpu:confidential:read',
+                        'dpu:confidential:write',
+                    ],
+                    ttlSeconds: 45,
+                }],
+            },
+        ],
+        publicServices: [
+            {
+                slug: 'public-office',
+                externalPrefix: '/public-services/onlyoffice/',
+                internalPrefix: '/public/',
+                auth: 'none',
+            },
+        ],
+    }, null, 2));
+    writeFileSync(path.join(ploinkyDir, 'agents.json'), JSON.stringify({
+        onlyOffice: {
+            type: 'agent',
+            agentName: 'onlyOffice',
+            repoName: 'AssistOSExplorer',
+            auth: { mode: 'none' }
+        }
+    }, null, 2));
+    writeFileSync(path.join(ploinkyDir, 'routing.json'), JSON.stringify({
+        routes: {
+            onlyOffice: {
+                agent: 'onlyOffice',
+                repo: 'AssistOSExplorer',
+                hostPort: servicePort,
+                hostPath: onlyOfficeManifestDir
+            }
         }
     }, null, 2));
 }
