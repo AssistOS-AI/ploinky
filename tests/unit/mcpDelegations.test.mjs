@@ -103,3 +103,34 @@ test('buildMcpDelegationsForUserCall mints verifiable grants for non-guest users
     assert.equal(buildMcpDelegationsForUserCall({ req: {}, routeKey: 'gitAgent', toolName: 'git_auth_store_token', routes: ROUTES }), undefined);
     assert.equal(buildMcpDelegationsForUserCall({ req, routeKey: 'gitAgent', toolName: 'git_status', routes: ROUTES }), undefined);
 });
+
+test('real gitAgent mcp-config declares the dpuGitSecrets delegations', (t) => {
+    const realConfigUrl = new URL('../../../AssistOSExplorer/gitAgent/mcp-config.json', import.meta.url);
+    if (!fs.existsSync(realConfigUrl)) {
+        t.skip('AssistOSExplorer checkout not present');
+        return;
+    }
+    const config = JSON.parse(fs.readFileSync(realConfigUrl, 'utf8'));
+    const byName = new Map(config.tools.map((tool) => [tool.name, tool]));
+    const expected = {
+        git_auth_status: ['dpu_secret_get'],
+        git_auth_begin: ['dpu_secret_get'],
+        git_auth_poll: ['dpu_secret_get', 'dpu_secret_put', 'dpu_secret_grant'],
+        git_auth_disconnect: ['dpu_secret_delete'],
+        git_auth_store_token: ['dpu_secret_put', 'dpu_secret_grant'],
+        git_push: ['dpu_secret_get'],
+        git_pull: ['dpu_secret_get'],
+    };
+    for (const [toolName, dpuTools] of Object.entries(expected)) {
+        const entries = normalizeMcpDelegationEntries(byName.get(toolName)?.delegations, {
+            route: { repo: 'AchillesIDE', agent: 'gitAgent' },
+            toolName,
+            sourceAgentId: 'agent:AchillesIDE/gitAgent',
+        });
+        assert.equal(entries.length, 1, `${toolName} must declare exactly one delegation`);
+        assert.equal(entries[0].key, 'dpuGitSecrets');
+        assert.equal(entries[0].targetAgentId, 'agent:AchillesIDE/dpuAgent');
+        assert.deepEqual(entries[0].tools, dpuTools);
+        assert.equal(entries[0].ttlSeconds, 120);
+    }
+});
