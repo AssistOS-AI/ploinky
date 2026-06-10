@@ -60,6 +60,24 @@ function deriveUserIdentity(grant, actor) {
   return null;
 }
 
+function normalizeDelegationTokens(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const out = {};
+  for (const [key, entry] of Object.entries(value)) {
+    const normalizedKey = String(key || '').trim();
+    const token = String(entry?.token || '').trim();
+    if (!normalizedKey || !token) continue;
+    out[normalizedKey] = {
+      token,
+      expiresAt: String(entry?.expiresAt || ''),
+      targetAgentId: String(entry?.targetAgentId || ''),
+      tools: Array.isArray(entry?.tools) ? entry.tools.map((item) => String(item || '').trim()).filter(Boolean) : [],
+      scope: Array.isArray(entry?.scope) ? entry.scope.map((item) => String(item || '').trim()).filter(Boolean) : []
+    };
+  }
+  return Object.keys(out).length ? out : undefined;
+}
+
 export function authInfoFromInvocation(grant, { invocationToken = '' } = {}) {
   if (!grant || typeof grant !== 'object') return null;
   const out = {};
@@ -129,6 +147,10 @@ export function authInfoFromInvocation(grant, { invocationToken = '' } = {}) {
         }
       : null
   };
+  const delegationTokens = normalizeDelegationTokens(grant.delegations);
+  if (delegationTokens) {
+    out.delegations = delegationTokens;
+  }
   out.invocationToken = String(invocationToken || '');
   return out;
 }

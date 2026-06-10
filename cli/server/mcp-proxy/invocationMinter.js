@@ -72,6 +72,29 @@ function normalizeDelegation(delegation) {
     };
 }
 
+// Plural `delegations` — router-minted downstream grants the target agent may
+// present back to the router later. Distinct from the singular `delegation`
+// claim above, which is metadata about the delegation this call ran under.
+function normalizeDelegations(delegations) {
+    if (!delegations || typeof delegations !== 'object' || Array.isArray(delegations)) return undefined;
+    const out = {};
+    for (const [key, entry] of Object.entries(delegations)) {
+        const normalizedKey = String(key || '').trim();
+        if (!/^[A-Za-z0-9_.-]+$/.test(normalizedKey)) continue;
+        const token = String(entry?.token || '').trim();
+        const targetAgentId = String(entry?.targetAgentId || '').trim();
+        if (!token || !targetAgentId) continue;
+        out[normalizedKey] = {
+            token,
+            expiresAt: String(entry?.expiresAt || '').trim(),
+            targetAgentId,
+            tools: Array.isArray(entry?.tools) ? entry.tools.map((value) => String(value || '').trim()).filter(Boolean) : [],
+            scope: Array.isArray(entry?.scope) ? entry.scope.map((value) => String(value || '').trim()).filter(Boolean) : [],
+        };
+    }
+    return Object.keys(out).length ? out : undefined;
+}
+
 export function resolveProviderPrincipal({ providerAgentRef, providerPrincipal }) {
     if (providerPrincipal) return String(providerPrincipal).trim();
     const descriptor = resolveAgentDescriptor(providerAgentRef);
@@ -93,6 +116,7 @@ export function buildRouterRequest({
     caller,
     usr,
     delegation,
+    delegations,
     method,
     path,
     tool,
@@ -133,6 +157,10 @@ export function buildRouterRequest({
     const normalizedDelegation = normalizeDelegation(delegation);
     if (normalizedDelegation) {
         payload.delegation = normalizedDelegation;
+    }
+    const normalizedDelegations = normalizeDelegations(delegations);
+    if (normalizedDelegations) {
+        payload.delegations = normalizedDelegations;
     }
     const secret = deriveAgentRequestSecret(target, { encoding: 'buffer' });
     const token = signHmacJwt({ payload, secret });
