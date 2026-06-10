@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import net from 'node:net';
 
-import { waitForAgentReady } from './agentReadiness.js';
+import { waitForAgentReady } from '../../cli/server/utils/agentReadiness.js';
 
 function listenOnEphemeralPort() {
     return new Promise((resolve, reject) => {
