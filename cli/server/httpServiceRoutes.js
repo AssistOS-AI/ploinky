@@ -4,6 +4,7 @@ import path from 'path';
 import { ROUTING_FILE } from '../services/config.js';
 import { resolveEnabledAgentRecord } from '../services/agents.js';
 import { findAgent } from '../services/utils.js';
+import { resolveMaxTtlSeconds } from './mcp-proxy/userDelegationGrant.js';
 
 export function loadRoutingConfig() {
     const dynamicRoutingFile = process.env.PLOINKY_ROUTING_FILE
@@ -152,7 +153,7 @@ function validateAndNormalizeDelegations(spec, authMode) {
 
         const ttlRaw = Number.parseInt(String(delegation.ttlSeconds), 10);
         const ttlSeconds = Number.isFinite(ttlRaw) ? ttlRaw : 1800;
-        if (!Number.isInteger(ttlSeconds) || ttlSeconds < 30 || ttlSeconds > 1800) {
+        if (!Number.isInteger(ttlSeconds) || ttlSeconds < 30 || ttlSeconds > resolveMaxTtlSeconds()) {
             errors.push(`invalid ttlSeconds for '${targetAgentId}'`);
             continue;
         }

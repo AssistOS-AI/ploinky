@@ -3,6 +3,13 @@ import crypto from 'node:crypto';
 import { signHmacJwt } from '../../../Agent/lib/jwtSign.mjs';
 import { verifyJws } from '../../../Agent/lib/jwtVerify.mjs';
 
+const DEFAULT_MAX_TTL_SECONDS = 1800;
+
+export function resolveMaxTtlSeconds(env = process.env) {
+    const raw = Number.parseInt(String(env?.PLOINKY_USER_DELEGATION_MAX_TTL_SECONDS || ''), 10);
+    return Number.isInteger(raw) && raw >= 30 && raw <= 86400 ? raw : DEFAULT_MAX_TTL_SECONDS;
+}
+
 function asDate(value) {
     return value instanceof Date ? value : new Date(value || Date.now());
 }
@@ -61,7 +68,8 @@ export function mintUserDelegationGrant({
         throw new Error('delegation user missing');
     }
     const iat = toUnixSeconds(now);
-    const ttl = Math.max(30, Math.min(Number.parseInt(String(ttlSeconds || ''), 10) || 1800, 1800));
+    const maxTtl = resolveMaxTtlSeconds();
+    const ttl = Math.max(30, Math.min(Number.parseInt(String(ttlSeconds || ''), 10) || DEFAULT_MAX_TTL_SECONDS, maxTtl));
     const payload = {
         typ: 'user-delegation',
         iss: 'ploinky-router',
@@ -104,7 +112,7 @@ export function verifyUserDelegationGrant({
         ({ payload } = verifyJws(token, {
             secret,
             expectedAudience: 'ploinky-router',
-            maxTtlSeconds: 1800,
+            maxTtlSeconds: resolveMaxTtlSeconds(),
         }));
     } catch (error) {
         const message = String(error?.message || error || '');

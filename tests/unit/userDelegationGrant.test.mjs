@@ -210,3 +210,51 @@ test('verifyUserDelegationGrant returns normalized claims and delegation metadat
     assert.equal(verified.delegation.tool, TOOL);
     assert.deepEqual(verified.delegation.scope, ['dpu:confidential:read', 'dpu:confidential:write']);
 });
+
+test('mint+verify honor PLOINKY_USER_DELEGATION_MAX_TTL_SECONDS over the 1800 default', () => {
+    const prev = process.env.PLOINKY_USER_DELEGATION_MAX_TTL_SECONDS;
+    process.env.PLOINKY_USER_DELEGATION_MAX_TTL_SECONDS = '7200';
+    try {
+        const signingSecret = Buffer.from('test-delegation-secret-please-rotate');
+        const { token, payload } = mintUserDelegationGrant({
+            signingSecret,
+            ttlSeconds: 7200,
+            sourceAgentId: 'agent:AchillesIDE/onlyOffice',
+            user: { id: 'local:alice', username: 'alice', roles: ['user'] },
+            targetAgentId: 'agent:AchillesIDE/dpuAgent',
+            tools: ['dpu_confidential_get'],
+            scopes: ['dpu:confidential:read'],
+        });
+        assert.equal(payload.exp - payload.iat, 7200);
+        const verified = verifyUserDelegationGrant({
+            signingSecret,
+            token,
+            expectedSourceAgentId: 'agent:AchillesIDE/onlyOffice',
+            expectedTargetAgentId: 'agent:AchillesIDE/dpuAgent',
+            expectedTool: 'dpu_confidential_get',
+        });
+        assert.equal(verified.user.id, 'local:alice');
+    } finally {
+        if (prev === undefined) delete process.env.PLOINKY_USER_DELEGATION_MAX_TTL_SECONDS;
+        else process.env.PLOINKY_USER_DELEGATION_MAX_TTL_SECONDS = prev;
+    }
+});
+
+test('mint still clamps to the default 1800 ceiling when env is unset', () => {
+    const prev = process.env.PLOINKY_USER_DELEGATION_MAX_TTL_SECONDS;
+    delete process.env.PLOINKY_USER_DELEGATION_MAX_TTL_SECONDS;
+    try {
+        const { payload } = mintUserDelegationGrant({
+            signingSecret: Buffer.from('test-delegation-secret-please-rotate'),
+            ttlSeconds: 7200,
+            sourceAgentId: 'agent:AchillesIDE/onlyOffice',
+            user: { id: 'local:alice', roles: ['user'] },
+            targetAgentId: 'agent:AchillesIDE/dpuAgent',
+            tools: ['dpu_confidential_get'],
+            scopes: ['dpu:confidential:read'],
+        });
+        assert.equal(payload.exp - payload.iat, 1800);
+    } finally {
+        if (prev !== undefined) process.env.PLOINKY_USER_DELEGATION_MAX_TTL_SECONDS = prev;
+    }
+});
