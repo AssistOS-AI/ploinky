@@ -7,6 +7,7 @@ import {
     resolveProviderPrincipal,
     verifyAgentAssertion
 } from './invocationMinter.js';
+import { buildMcpDelegationsForUserCall } from './mcpDelegations.js';
 import { computeRchTool } from '../../../Agent/lib/requestHash.mjs';
 import { createMemoryReplayCache } from '../../../Agent/lib/jwtVerify.mjs';
 import { sanitizeArgumentsForTool } from './toolArguments.js';
@@ -154,10 +155,12 @@ export function buildInvocationContextForProviderCall({ req, agentName, toolName
         const user = extractDelegatedUser(req);
         sub = user?.id ? `user:${user.id}` : '';
         actor = { kind: 'user', id: sub, roles: user?.roles || [] };
+        const delegations = buildMcpDelegationsForUserCall({ req, routeKey: agentName, toolName });
         const { token, payload } = buildRouterRequest({
             targetAgentId,
             sub,
             actor,
+            delegations,
             method,
             path,
             tool: toolName,
