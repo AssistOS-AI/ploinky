@@ -6,6 +6,8 @@ import { resolveEnabledAgentRecord } from '../services/agents.js';
 import { findAgent } from '../services/utils.js';
 import { resolveMaxTtlSeconds } from './mcp-proxy/userDelegationGrant.js';
 
+const DEFAULT_DELEGATION_TTL_SECONDS = 1800;
+
 export function loadRoutingConfig() {
     const dynamicRoutingFile = process.env.PLOINKY_ROUTING_FILE
         || path.join(process.cwd(), '.ploinky', 'routing.json');
@@ -102,8 +104,9 @@ function normalizeDelegation(spec) {
         const tools = uniqueTrimmedStrings(entry?.tools);
         const scopes = uniqueTrimmedStrings(entry?.scopes || entry?.scope || []);
         const ttlRaw = Number.parseInt(String(entry?.ttlSeconds || ''), 10);
-        const ttlSeconds = Number.isFinite(ttlRaw) ? ttlRaw : 1800;
+        const ttlSeconds = Number.isFinite(ttlRaw) ? ttlRaw : DEFAULT_DELEGATION_TTL_SECONDS;
         return {
+            key: String(entry?.key || '').trim(),
             targetAgentId,
             tools,
             scopes,
@@ -113,7 +116,7 @@ function normalizeDelegation(spec) {
 
     return {
         hasDelegations,
-        entries: delegations.filter((entry) => entry.targetAgentId || entry.tools.length || entry.scopes.length || entry.ttlSeconds !== 1800),
+        entries: delegations.filter((entry) => entry.targetAgentId || entry.tools.length || entry.scopes.length || entry.ttlSeconds !== DEFAULT_DELEGATION_TTL_SECONDS),
         rawSource: spec.delegations,
     };
 }
@@ -163,13 +166,14 @@ function validateAndNormalizeDelegations(spec, authMode, route = {}) {
         }
 
         const ttlRaw = Number.parseInt(String(delegation.ttlSeconds), 10);
-        const ttlSeconds = Number.isFinite(ttlRaw) ? ttlRaw : 1800;
+        const ttlSeconds = Number.isFinite(ttlRaw) ? ttlRaw : DEFAULT_DELEGATION_TTL_SECONDS;
         if (!Number.isInteger(ttlSeconds) || ttlSeconds < 30 || ttlSeconds > resolveMaxTtlSeconds()) {
             errors.push(`invalid ttlSeconds for '${targetAgentId}'`);
             continue;
         }
 
         out.push({
+            key: String(delegation.key || '').trim(),
             targetAgentId,
             tools,
             scope: scopes,

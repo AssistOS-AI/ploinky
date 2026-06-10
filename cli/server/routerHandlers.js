@@ -289,6 +289,10 @@ function resolveUserDelegationSigningSecret() {
 }
 
 function deriveDelegationKey(entry = {}, index = 0) {
+    const explicit = String(entry.key || '').trim();
+    if (explicit) {
+        return explicit;
+    }
     const scope = Array.isArray(entry.scope) ? String(entry.scope[0] || '').trim() : '';
     const parts = scope.split(':').filter(Boolean);
     if (parts.length >= 2) {

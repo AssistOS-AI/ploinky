@@ -46,6 +46,7 @@ test('normalizeServiceSpec preserves protected service delegations with canonica
     assert.equal(Array.isArray(definition?.delegations), true);
     assert.equal(definition.delegations.length, 1);
     assert.deepEqual(definition.delegations[0], {
+        key: '',
         targetAgentId: 'agent:AssistOSExplorer/dpuAgent',
         tools: [
             'dpu_workspace_roots',
@@ -1044,4 +1045,13 @@ test('delegation targets with dot-only path segments are rejected', () => {
         };
         assert.throws(() => normalizeServiceSpec('onlyOffice', { repo: 'CustomRepoName', agent: 'onlyOffice' }, spec, 'protected'), /invalid targetAgentId/);
     }
+});
+
+test('explicit delegation key is preserved through normalization', () => {
+    const spec = {
+        slug: 'onlyoffice', externalPrefix: '/services/onlyoffice/', internalPrefix: '/control/', auth: 'protected',
+        delegations: [{ key: 'dpuConfidential', targetAgentId: 'agent:AchillesIDE/dpuAgent', tools: ['dpu_confidential_get'], scopes: ['dpu:confidential:read'], ttlSeconds: 1800 }],
+    };
+    const def = normalizeServiceSpec('onlyOffice', { repo: 'AchillesIDE', agent: 'onlyOffice' }, spec, 'protected');
+    assert.equal(def.delegations[0].key, 'dpuConfidential');
 });
