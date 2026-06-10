@@ -1001,3 +1001,37 @@ test('protected HTTP service auth info carries user identity', async () => {
     });
     assert.equal(authInfo.sessionId, 'session-1');
 });
+
+test('service delegation target "." expands to the source route repo', () => {
+    const spec = {
+        slug: 'onlyoffice',
+        externalPrefix: '/services/onlyoffice/',
+        internalPrefix: '/control/',
+        auth: 'protected',
+        delegations: [{
+            targetAgentId: 'agent:./dpuAgent',
+            tools: ['dpu_confidential_get'],
+            scopes: ['dpu:confidential:read'],
+            ttlSeconds: 1800,
+        }],
+    };
+    const def = normalizeServiceSpec('onlyOffice', { repo: 'CustomRepoName', agent: 'onlyOffice' }, spec, 'protected');
+    assert.equal(def.delegations[0].targetAgentId, 'agent:CustomRepoName/dpuAgent');
+});
+
+test('service delegation target with explicit repo is left unchanged', () => {
+    const spec = {
+        slug: 'onlyoffice', externalPrefix: '/services/onlyoffice/', internalPrefix: '/control/', auth: 'protected',
+        delegations: [{ targetAgentId: 'agent:AchillesIDE/dpuAgent', tools: ['dpu_confidential_get'], scopes: ['dpu:confidential:read'], ttlSeconds: 1800 }],
+    };
+    const def = normalizeServiceSpec('onlyOffice', { repo: 'CustomRepoName', agent: 'onlyOffice' }, spec, 'protected');
+    assert.equal(def.delegations[0].targetAgentId, 'agent:AchillesIDE/dpuAgent');
+});
+
+test('relative delegation target without a source repo is rejected', () => {
+    const spec = {
+        slug: 'onlyoffice', externalPrefix: '/services/onlyoffice/', internalPrefix: '/control/', auth: 'protected',
+        delegations: [{ targetAgentId: 'agent:./dpuAgent', tools: ['dpu_confidential_get'], scopes: ['dpu:confidential:read'], ttlSeconds: 1800 }],
+    };
+    assert.throws(() => normalizeServiceSpec('onlyOffice', {}, spec, 'protected'), /cannot expand relative target/);
+});

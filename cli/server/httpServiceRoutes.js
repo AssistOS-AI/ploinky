@@ -118,7 +118,7 @@ function normalizeDelegation(spec) {
     };
 }
 
-function validateAndNormalizeDelegations(spec, authMode) {
+function validateAndNormalizeDelegations(spec, authMode, route = {}) {
     const normalized = normalizeDelegation(spec);
     if (!normalized.hasDelegations) {
         return [];
@@ -132,7 +132,16 @@ function validateAndNormalizeDelegations(spec, authMode) {
     const errors = [];
 
     for (const delegation of normalized.entries) {
-        const targetAgentId = String(delegation.targetAgentId || '').trim();
+        let targetAgentId = String(delegation.targetAgentId || '').trim();
+        const sourceRepo = String(route?.repo || '').trim();
+        const relativeMatch = targetAgentId.match(/^agent:\.\/([^/\s:]+)$/);
+        if (relativeMatch) {
+            if (!sourceRepo) {
+                errors.push(`cannot expand relative target '${targetAgentId}' without a source repo`);
+                continue;
+            }
+            targetAgentId = `agent:${sourceRepo}/${relativeMatch[1]}`;
+        }
         const targetValid = /^agent:[^/\s:]+\/[^/\s:]+$/.test(targetAgentId);
         if (!targetValid) {
             errors.push(`invalid targetAgentId '${targetAgentId}'`);
@@ -197,7 +206,7 @@ function normalizeServiceSpec(routeKey, route, spec, defaultAuthMode = '') {
         issueInvocation: spec.invocation !== false && authMode !== 'none',
         includeAuthInfo: spec.includeAuthInfo !== false && authMode !== 'none',
         notFoundMessage: String(spec.notFoundMessage || 'HTTP service route not found.'),
-        delegations: validateAndNormalizeDelegations(spec, authMode),
+        delegations: validateAndNormalizeDelegations(spec, authMode, route),
     };
 }
 
