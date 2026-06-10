@@ -165,7 +165,6 @@ export function buildInvocationContextForProviderCall({ req, agentName, toolName
         });
         return { token, payload, rch };
     }
-    return null;
 }
 
 export function verifyDelegatedAgentToolCall({
