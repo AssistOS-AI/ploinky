@@ -62,6 +62,24 @@ test('normalizeServiceSpec preserves protected service delegations with canonica
     });
 });
 
+test('normalizeServiceSpec preserves delegation request path conditions', () => {
+    const definition = normalizeServiceSpec('onlyOffice', { agent: 'onlyOffice', repo: 'AssistOSExplorer' }, {
+        ...VALID_DELEGATION_SPEC,
+        delegations: [{
+            ...VALID_DELEGATION_SPEC.delegations[0],
+            when: {
+                queryParam: 'path',
+                pathRoots: ['/Confidential'],
+            },
+        }],
+    });
+
+    assert.deepEqual(definition.delegations[0].when, {
+        queryParam: 'path',
+        pathRoots: ['/Confidential'],
+    });
+});
+
 test('normalizeServiceSpec rejects delegations on auth none services', () => {
     assert.throws(() => normalizeServiceSpec('explorer', { agent: 'explorer', repo: 'AchillesIDE' }, {
         slug: 'office',
@@ -141,6 +159,44 @@ test('protected http service auth info includes configured user delegation grant
         replayCache: createMemoryReplayCache(),
     });
     assert.equal(verified.user.id, 'local:alice');
+});
+
+test('protected http service grant is omitted when the configured request path root does not match', async (t) => {
+    let captured = null;
+    const upstream = http.createServer((req, res) => {
+        captured = {
+            url: req.url,
+            headers: req.headers,
+        };
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true }));
+    });
+    const servicePort = await listen(upstream);
+    t.after(async () => {
+        await close(upstream);
+    });
+
+    const { routerHandlers } = await withRouterModules(t, servicePort, writeOnlyOfficeDelegationConfig);
+    for (const requestPath of ['/workspace/Report.docx', '/Confidentialfoo/Report.docx']) {
+        captured = null;
+        const req = makeRequest({
+            url: `/services/onlyoffice/office/session?path=${encodeURIComponent(requestPath)}`,
+        });
+        req.user = {
+            id: 'local:alice',
+            username: 'alice',
+            roles: ['user'],
+        };
+        req.sessionId = 'session-alice';
+        const res = new MockWritableResponse();
+        const parsedUrl = new URL(req.url, 'http://localhost');
+
+        assert.equal(routerHandlers.handleHttpServiceRoute(req, res, parsedUrl), true);
+        await res.done;
+
+        const authInfo = JSON.parse(captured?.headers['x-ploinky-auth-info'] || '{}');
+        assert.equal(authInfo.delegations, undefined, `${requestPath} must not receive a DPU grant`);
+    }
 });
 
 test('http service grant is omitted for anonymous and guest actors', async (t) => {
@@ -244,7 +300,7 @@ test('http service grant expiry is capped by the service delegation ttl', async 
 
     const { routerHandlers } = await withRouterModules(t, servicePort, writeOnlyOfficeDelegationConfig);
     const req = makeRequest({
-        url: '/services/onlyoffice/office/session',
+        url: '/services/onlyoffice/office/session?path=%2FConfidential%2FReport.docx',
     });
     req.user = {
         id: 'local:alice',
@@ -428,6 +484,10 @@ function writeOnlyOfficeDelegationConfig(ploinkyDir, servicePort) {
                         'dpu:confidential:write',
                     ],
                     ttlSeconds: 45,
+                    when: {
+                        queryParam: 'path',
+                        pathRoots: ['/Confidential'],
+                    },
                 }],
             },
         ],

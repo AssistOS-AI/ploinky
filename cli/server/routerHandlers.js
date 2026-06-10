@@ -1,4 +1,5 @@
 import http from 'http';
+import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 
 import { sendJson } from './authHandlers.js';
@@ -305,7 +306,38 @@ function deriveDelegationKey(entry = {}, index = 0) {
         .replace(/[^A-Za-z0-9]+([A-Za-z0-9])/g, (_match, letter) => letter.toUpperCase());
 }
 
-function buildServiceDelegations(req, definition, servicePath) {
+function normalizeConditionPath(value) {
+    const raw = String(value || '').trim().replace(/\\/g, '/');
+    if (!raw) return '';
+    const prefixed = raw.startsWith('/') ? raw : `/${raw}`;
+    const normalized = path.posix.normalize(prefixed);
+    if (!normalized || normalized === '.') return '';
+    return normalized === '/' ? '/' : normalized.replace(/\/+$/g, '');
+}
+
+function isWithinPathRoot(value, root) {
+    const normalizedValue = normalizeConditionPath(value);
+    const normalizedRoot = normalizeConditionPath(root);
+    if (!normalizedValue || !normalizedRoot) return false;
+    if (normalizedRoot === '/') return true;
+    return normalizedValue === normalizedRoot || normalizedValue.startsWith(`${normalizedRoot}/`);
+}
+
+function serviceDelegationMatchesRequest(entry = {}, { parsedUrl } = {}) {
+    const when = entry.when;
+    if (!when) {
+        return true;
+    }
+    const queryParam = String(when.queryParam || 'path').trim();
+    const pathValue = parsedUrl?.searchParams?.get(queryParam) || '';
+    if (!pathValue) {
+        return false;
+    }
+    const roots = Array.isArray(when.pathRoots) ? when.pathRoots : [];
+    return roots.some((root) => isWithinPathRoot(pathValue, root));
+}
+
+function buildServiceDelegations(req, definition, { servicePath = '', parsedUrl = null } = {}) {
     const authInfo = buildPlainAuthInfo(req);
     const actorKind = resolveHttpServiceActorKind(authInfo);
     if (actorKind !== 'user') {
@@ -320,6 +352,9 @@ function buildServiceDelegations(req, definition, servicePath) {
     const out = {};
     for (let index = 0; index < definition.delegations.length; index += 1) {
         const entry = definition.delegations[index];
+        if (!serviceDelegationMatchesRequest(entry, { parsedUrl })) {
+            continue;
+        }
         const { token, payload } = mintUserDelegationGrant({
             signingSecret,
             ttlSeconds: entry.ttlSeconds,
@@ -384,7 +419,10 @@ export function buildHttpServiceAuthInfoHeader(req, parsedUrl, definition, { bod
         authInfo.invocationToken = token;
         authInfo.invocationBody = invocationBody;
     }
-    const delegations = buildServiceDelegations(req, definition, servicePath || parsedUrl?.pathname || '');
+    const delegations = buildServiceDelegations(req, definition, {
+        servicePath: servicePath || parsedUrl?.pathname || '',
+        parsedUrl,
+    });
     if (delegations) {
         authInfo.delegations = delegations;
     }

@@ -3,7 +3,7 @@ import crypto from 'node:crypto';
 import { signHmacJwt } from '../../../Agent/lib/jwtSign.mjs';
 import { verifyJws } from '../../../Agent/lib/jwtVerify.mjs';
 
-const DEFAULT_MAX_TTL_SECONDS = 1800;
+const DEFAULT_MAX_TTL_SECONDS = 8 * 60 * 60;
 
 export function resolveMaxTtlSeconds(env = process.env) {
     const raw = Number.parseInt(String(env?.PLOINKY_USER_DELEGATION_MAX_TTL_SECONDS || ''), 10);

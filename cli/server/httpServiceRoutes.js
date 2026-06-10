@@ -97,6 +97,49 @@ function uniqueTrimmedStrings(values) {
     return out;
 }
 
+function normalizePathRoot(value) {
+    const raw = String(value || '').trim().replace(/\\/g, '/');
+    if (!raw) return '';
+    const prefixed = raw.startsWith('/') ? raw : `/${raw}`;
+    const collapsed = path.posix.normalize(prefixed);
+    if (!collapsed || collapsed === '.') return '';
+    return collapsed === '/' ? '/' : collapsed.replace(/\/+$/g, '');
+}
+
+function uniquePathRoots(values) {
+    if (!Array.isArray(values)) return [];
+    const out = [];
+    const seen = new Set();
+    for (const raw of values) {
+        const value = normalizePathRoot(raw);
+        if (!value || seen.has(value)) continue;
+        seen.add(value);
+        out.push(value);
+    }
+    return out;
+}
+
+function normalizeDelegationWhen(value) {
+    if (value === undefined || value === null) {
+        return null;
+    }
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+        return { error: 'invalid delegation when condition' };
+    }
+    const queryParam = String(value.queryParam || 'path').trim();
+    if (!/^[A-Za-z0-9_.-]+$/.test(queryParam)) {
+        return { error: `invalid delegation condition queryParam '${queryParam}'` };
+    }
+    const pathRoots = uniquePathRoots(value.pathRoots || value.queryPathRoots || []);
+    if (!pathRoots.length) {
+        return { error: 'delegation when condition requires non-empty pathRoots' };
+    }
+    return {
+        queryParam,
+        pathRoots,
+    };
+}
+
 function normalizeDelegation(spec) {
     const hasDelegations = Array.isArray(spec.delegations);
     const delegations = hasDelegations ? spec.delegations.map((entry) => {
@@ -111,12 +154,13 @@ function normalizeDelegation(spec) {
             tools,
             scopes,
             ttlSeconds,
+            when: normalizeDelegationWhen(entry?.when),
         };
     }) : [];
 
     return {
         hasDelegations,
-        entries: delegations.filter((entry) => entry.targetAgentId || entry.tools.length || entry.scopes.length || entry.ttlSeconds !== DEFAULT_DELEGATION_TTL_SECONDS),
+        entries: delegations.filter((entry) => entry.targetAgentId || entry.tools.length || entry.scopes.length || entry.ttlSeconds !== DEFAULT_DELEGATION_TTL_SECONDS || entry.when),
         rawSource: spec.delegations,
     };
 }
@@ -171,6 +215,10 @@ function validateAndNormalizeDelegations(spec, authMode, route = {}) {
             errors.push(`invalid ttlSeconds for '${targetAgentId}'`);
             continue;
         }
+        if (delegation.when?.error) {
+            errors.push(`${delegation.when.error} for '${targetAgentId}'`);
+            continue;
+        }
 
         out.push({
             key: String(delegation.key || '').trim(),
@@ -178,6 +226,7 @@ function validateAndNormalizeDelegations(spec, authMode, route = {}) {
             tools,
             scope: scopes,
             ttlSeconds,
+            ...(delegation.when ? { when: delegation.when } : {}),
         });
     }
 

@@ -211,7 +211,7 @@ test('verifyUserDelegationGrant returns normalized claims and delegation metadat
     assert.deepEqual(verified.delegation.scope, ['dpu:confidential:read', 'dpu:confidential:write']);
 });
 
-test('mint+verify honor PLOINKY_USER_DELEGATION_MAX_TTL_SECONDS over the 1800 default', () => {
+test('mint+verify honor PLOINKY_USER_DELEGATION_MAX_TTL_SECONDS over the default ceiling', () => {
     const prev = process.env.PLOINKY_USER_DELEGATION_MAX_TTL_SECONDS;
     process.env.PLOINKY_USER_DELEGATION_MAX_TTL_SECONDS = '7200';
     try {
@@ -240,20 +240,20 @@ test('mint+verify honor PLOINKY_USER_DELEGATION_MAX_TTL_SECONDS over the 1800 de
     }
 });
 
-test('mint still clamps to the default 1800 ceiling when env is unset', () => {
+test('mint still clamps to the default 28800 ceiling when env is unset', () => {
     const prev = process.env.PLOINKY_USER_DELEGATION_MAX_TTL_SECONDS;
     delete process.env.PLOINKY_USER_DELEGATION_MAX_TTL_SECONDS;
     try {
         const { payload } = mintUserDelegationGrant({
             signingSecret: Buffer.from('test-delegation-secret-please-rotate'),
-            ttlSeconds: 7200,
+            ttlSeconds: 86400,
             sourceAgentId: 'agent:AchillesIDE/onlyOffice',
             user: { id: 'local:alice', roles: ['user'] },
             targetAgentId: 'agent:AchillesIDE/dpuAgent',
             tools: ['dpu_confidential_get'],
             scopes: ['dpu:confidential:read'],
         });
-        assert.equal(payload.exp - payload.iat, 1800);
+        assert.equal(payload.exp - payload.iat, 28800);
     } finally {
         if (prev !== undefined) process.env.PLOINKY_USER_DELEGATION_MAX_TTL_SECONDS = prev;
     }

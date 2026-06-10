@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import net from 'node:net';
 
 import { waitForAgentReady } from '../../cli/server/utils/agentReadiness.js';
+import { buildBlockingReadinessEntryFromNode } from '../../cli/services/workspaceUtil.js';
 
 function listenOnEphemeralPort() {
     return new Promise((resolve, reject) => {
@@ -64,4 +65,29 @@ test('waitForAgentReady resolves false within the timeout for a closed port (tcp
     assert.equal(ready, false);
     // Must give up around the timeout, not hang indefinitely.
     assert.ok(elapsedMs < 4000, `expected to bail out fast, took ${elapsedMs}ms`);
+});
+
+test('blocking startup readiness allows protocol none without a host port', () => {
+    const entry = buildBlockingReadinessEntryFromNode({
+        id: 'worker',
+        shortAgentName: 'worker',
+        isStatic: false,
+        manifest: {
+            readiness: { protocol: 'none' },
+        },
+    }, {}, 'explorer');
+
+    assert.equal(entry.protocol, 'none');
+    assert.equal(entry.route?.hostPort, undefined);
+});
+
+test('blocking startup readiness still requires a host port for tcp agents', () => {
+    assert.throws(() => buildBlockingReadinessEntryFromNode({
+        id: 'api',
+        shortAgentName: 'api',
+        isStatic: false,
+        manifest: {
+            readiness: { protocol: 'tcp' },
+        },
+    }, {}, 'explorer'), /did not expose a host port/);
 });
