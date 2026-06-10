@@ -1035,3 +1035,13 @@ test('relative delegation target without a source repo is rejected', () => {
     };
     assert.throws(() => normalizeServiceSpec('onlyOffice', {}, spec, 'protected'), /cannot expand relative target/);
 });
+
+test('delegation targets with dot-only path segments are rejected', () => {
+    for (const target of ['agent:../dpuAgent', 'agent:./../dpuAgent', 'agent:CustomRepoName/..', 'agent:CustomRepoName/.']) {
+        const spec = {
+            slug: 'onlyoffice', externalPrefix: '/services/onlyoffice/', internalPrefix: '/control/', auth: 'protected',
+            delegations: [{ targetAgentId: target, tools: ['dpu_confidential_get'], scopes: ['dpu:confidential:read'], ttlSeconds: 1800 }],
+        };
+        assert.throws(() => normalizeServiceSpec('onlyOffice', { repo: 'CustomRepoName', agent: 'onlyOffice' }, spec, 'protected'), /invalid targetAgentId/);
+    }
+});

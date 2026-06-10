@@ -142,7 +142,9 @@ function validateAndNormalizeDelegations(spec, authMode, route = {}) {
             }
             targetAgentId = `agent:${sourceRepo}/${relativeMatch[1]}`;
         }
-        const targetValid = /^agent:[^/\s:]+\/[^/\s:]+$/.test(targetAgentId);
+        const targetMatch = targetAgentId.match(/^agent:([^/\s:]+)\/([^/\s:]+)$/);
+        const targetValid = Boolean(targetMatch)
+            && targetMatch.slice(1).every((segment) => segment !== '.' && segment !== '..');
         if (!targetValid) {
             errors.push(`invalid targetAgentId '${targetAgentId}'`);
             continue;
