@@ -53,7 +53,7 @@ There is one narrow exception to the plain `agent` deny for `authenticated`: a v
 - the grant names the exact target agent and exact tool being invoked
 - the tool policy for that `agent + tool` is `authenticated`
 
-This delegated-user path is intentionally narrower than a direct authenticated browser call because it is tool-scoped, source-bound, scope-bound, time-bound, and router-verified.
+The User Delegation Grant may have reached the source agent through a protected HTTP-service `x-ploinky-auth-info` carrier or through the plural `delegations` claim on a Router Request for a user-originated MCP tool. In the MCP case the grant is minted only after the router has already accepted the user's session, allowed the source tool under `mcpTools`, and matched a configured `mcp-config.json` delegation entry for that exact source tool. Guests never receive MCP-minted delegations. This delegated-user path is intentionally narrower than a direct authenticated browser call because it is tool-scoped, source-bound, scope-bound, time-bound, and router-verified.
 
 Enforcement runs before any Router Request is minted, on both the per-agent proxy (`cli/server/mcp-proxy/index.js`, `tools/call`) and the aggregate surface (`cli/server/routerHandlers.js`, `callEntryTool`). `tools/list` on both surfaces is filtered to the caller's class so a caller never sees a tool it cannot invoke.
 
