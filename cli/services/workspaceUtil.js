@@ -1054,6 +1054,15 @@ async function reinstallAgent(agentName) {
             fs.mkdirSync(path.dirname(routingFile), { recursive: true });
             fs.writeFileSync(routingFile, JSON.stringify(cfg, null, 2));
 
+            const readinessProtocol = resolveAgentReadinessProtocol(manifest);
+            const ready = await waitForAgentReady({ hostPort }, {
+                timeoutMs: 15000,
+                protocol: readinessProtocol,
+            });
+            if (!ready) {
+                console.error(`[reinstall] warning: agent '${short}' (host port ${hostPort}) is not ready yet; if requests 502, run 'ploinky restart'.`);
+            }
+
             const isRouterUp = (p) => {
                 try {
                     const out = execSync(`lsof -t -i :${p} -sTCP:LISTEN`, { stdio: 'pipe' }).toString().trim();
