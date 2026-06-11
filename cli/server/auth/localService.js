@@ -47,13 +47,13 @@ function mintSessionJwt(user, rev = 1, options = {}) {
         exp: iat + SESSION_TTL_SECONDS,
         jti: crypto.randomBytes(16).toString('base64url')
     };
-    return jwsCodec.signHmacJwt({ payload, secret: getSessionSigningKey() });
+    return jwsCodec.sign({ payload, secret: getSessionSigningKey() });
 }
 
 const SESSION_TOKEN_TYPES = new Set(['user-session', 'guest-session']);
 
 function verifySessionJwt(token) {
-    const { payload } = jwsCodec.verifyJws(token, {
+    const { payload } = jwsCodec.verify(token, {
         secret: getSessionSigningKey(),
         expectedAudience: SESSION_AUDIENCE,
         maxTtlSeconds: SESSION_TTL_SECONDS + 1
@@ -92,7 +92,7 @@ function mintGuestSessionJwt(options = {}) {
         exp: iat + GUEST_SESSION_TTL_SECONDS,
         jti: crypto.randomBytes(16).toString('base64url')
     };
-    return jwsCodec.signHmacJwt({ payload, secret: getSessionSigningKey() });
+    return jwsCodec.sign({ payload, secret: getSessionSigningKey() });
 }
 
 let revCache = null;

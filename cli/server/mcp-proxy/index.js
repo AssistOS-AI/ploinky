@@ -9,7 +9,7 @@ import {
 } from './invocationMinter.js';
 import { buildMcpDelegationsForUserCall } from './mcpDelegations.js';
 import { computeRchTool } from '../../../Agent/lib/requestHash.mjs';
-import { createMemoryReplayCache } from '../../../Agent/lib/jwtVerify.mjs';
+import { createTokenReplayCache } from '../security/tokens/JwsCodec.js';
 import { sanitizeArgumentsForTool } from './toolArguments.js';
 import { getAgentDescriptorByPrincipal } from '../../services/agentRegistry.js';
 import { policy } from '../policy/index.js';
@@ -20,7 +20,7 @@ const AGENT_PROXY_PROTOCOL_VERSION = '2025-06-18';
 const AGENT_PROXY_SERVER_INFO = { name: 'ploinky-router-proxy', version: '1.0.0' };
 const TOOL_SCHEMA_CACHE_TTL_MS = 30_000;
 // Replay cache for verified Agent Assertions (agent-to-agent jti single-use).
-const assertionReplayCache = createMemoryReplayCache({ maxSize: 4096 });
+const assertionReplayCache = createTokenReplayCache({ maxSize: 4096 });
 
 // Session store for agent MCP connections
 const agentSessionStore = new Map();

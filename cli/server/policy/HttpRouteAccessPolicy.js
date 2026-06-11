@@ -37,9 +37,8 @@ function decisionForEntry(entry, source) {
         access,
         routeKey: String(entry.routeKey || HttpRouteAccessPath.routeKeyForPath(normalized.path)),
         source: String(entry.source || source),
-        // The guest executor needs the service-declared scope to mint
-        // service-scoped guest sessions (current behavior via
-        // httpServiceRoutes.js guestScope).
+        // The guest executor needs the service-declared scope when it creates
+        // a guest identity for this service route.
         ...(entry.guestScope ? { guestScope: String(entry.guestScope) } : {}),
     };
 }
