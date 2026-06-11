@@ -12,7 +12,7 @@ import { createMemoryReplayCache } from '../../Agent/lib/jwtVerify.mjs';
 import { verifyRouterRequestToken } from '../../Agent/lib/requestSignedTokens.mjs';
 import { deriveAgentRequestSecret, deriveSubkey } from '../../cli/services/masterKey.js';
 import { computeRchHttp } from '../../Agent/lib/requestHash.mjs';
-import { normalizeServiceSpec } from '../../cli/server/httpServiceRoutes.js';
+import { collectHttpServiceRoutes, normalizeServiceSpec } from '../../cli/server/httpServiceRoutes.js';
 import { verifyUserDelegationGrant } from '../../cli/server/mcp-proxy/userDelegationGrant.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -23,7 +23,7 @@ const MASTER_KEY = '5'.repeat(64);
 const VALID_DELEGATION_SPEC = {
     externalPrefix: '/services/onlyoffice/',
     internalPrefix: '/control/',
-    auth: 'protected',
+    access: 'authenticated',
     slug: 'onlyoffice',
     delegations: [{
         targetAgentId: 'agent:AssistOSExplorer/dpuAgent',
@@ -40,7 +40,7 @@ const VALID_DELEGATION_SPEC = {
     }],
 };
 
-test('normalizeServiceSpec preserves protected service delegations with canonical target ids', () => {
+test('normalizeServiceSpec preserves authenticated service delegations with canonical target ids', () => {
     const definition = normalizeServiceSpec('onlyOffice', { agent: 'onlyOffice', repo: 'AssistOSExplorer' }, VALID_DELEGATION_SPEC);
 
     assert.equal(Array.isArray(definition?.delegations), true);
@@ -80,10 +80,10 @@ test('normalizeServiceSpec preserves delegation request path conditions', () => 
     });
 });
 
-test('normalizeServiceSpec rejects delegations on auth none services', () => {
+test('normalizeServiceSpec rejects delegations on public services', () => {
     assert.throws(() => normalizeServiceSpec('explorer', { agent: 'explorer', repo: 'AchillesIDE' }, {
         slug: 'office',
-        auth: 'none',
+        access: 'public',
         delegations: [{
             targetAgentId: 'agent:AssistOSExplorer/dpuAgent',
             tools: ['dpu_workspace_roots'],
@@ -92,10 +92,66 @@ test('normalizeServiceSpec rejects delegations on auth none services', () => {
     }), /Delegations are only supported/);
 });
 
+test('normalizeServiceSpec rejects removed auth fields', () => {
+    for (const removed of [
+        { auth: 'protected' },
+        { mode: 'guest' },
+        { forceGuest: true },
+    ]) {
+        assert.throws(() => normalizeServiceSpec('explorer', { agent: 'explorer', repo: 'AchillesIDE' }, {
+            slug: 'old-service',
+            internalPrefix: '/old/',
+            ...removed,
+        }), /field '.+' was removed/);
+    }
+});
+
+test('collectHttpServiceRoutes skips one invalid service spec without dropping valid siblings', () => {
+    const errors = [];
+    const originalError = console.error;
+    console.error = (...args) => errors.push(args.join(' '));
+    try {
+        const definitions = collectHttpServiceRoutes({
+            routes: {
+                explorer: {
+                    agent: 'explorer',
+                    repo: 'AchillesIDE',
+                    hostPort: 7011,
+                    httpServices: [
+                        {
+                            slug: 'old-service',
+                            internalPrefix: '/old/',
+                            auth: 'protected',
+                        },
+                        {
+                            slug: 'public-service',
+                            internalPrefix: '/public/',
+                            access: 'public',
+                        },
+                    ],
+                },
+            },
+        });
+        assert.deepEqual(definitions.map((definition) => ({
+            externalPrefix: definition.externalPrefix,
+            internalPrefix: definition.internalPrefix,
+            access: definition.access,
+        })), [{
+            externalPrefix: '/public-services/public-service/',
+            internalPrefix: '/public/',
+            access: 'public',
+        }]);
+        assert.equal(errors.length, 1);
+        assert.match(errors[0], /service not mounted \(fail closed\)/);
+    } finally {
+        console.error = originalError;
+    }
+});
+
 test('normalizeServiceSpec rejects delegation targets that are not canonical agent ids', () => {
     assert.throws(() => normalizeServiceSpec('onlyOffice', { agent: 'onlyOffice', repo: 'AssistOSExplorer' }, {
         slug: 'onlyoffice',
-        auth: 'protected',
+        access: 'authenticated',
         delegations: [{
             targetAgentId: 'invalid-target',
             tools: ['dpu_workspace_roots'],
@@ -107,7 +163,7 @@ test('normalizeServiceSpec rejects delegation targets that are not canonical age
 test('normalizeServiceSpec rejects empty delegation tool lists', () => {
     assert.throws(() => normalizeServiceSpec('onlyOffice', { agent: 'onlyOffice', repo: 'AssistOSExplorer' }, {
         slug: 'onlyoffice',
-        auth: 'protected',
+        access: 'authenticated',
         delegations: [{
             targetAgentId: 'agent:AssistOSExplorer/dpuAgent',
             tools: [],
@@ -116,7 +172,7 @@ test('normalizeServiceSpec rejects empty delegation tool lists', () => {
     }), /empty delegation tools/);
 });
 
-test('protected http service auth info includes configured user delegation grant', async (t) => {
+test('authenticated http service auth info includes configured user delegation grant', async (t) => {
     let captured = null;
     const upstream = http.createServer((req, res) => {
         captured = {
@@ -161,7 +217,7 @@ test('protected http service auth info includes configured user delegation grant
     assert.equal(verified.user.id, 'local:alice');
 });
 
-test('protected http service grant is omitted when the configured request path root does not match', async (t) => {
+test('authenticated http service grant is omitted when the configured request path root does not match', async (t) => {
     let captured = null;
     const upstream = http.createServer((req, res) => {
         captured = {
@@ -421,7 +477,13 @@ function writeWorkspaceConfig(ploinkyDir, servicePort) {
                 slug: 'browser-use',
                 externalPrefix: '/services/browser-use/',
                 internalPrefix: '/browser-use/',
-                auth: 'protected'
+                access: 'authenticated'
+            },
+            {
+                slug: 'browser-use-guest',
+                externalPrefix: '/public-services/browser-use-guest/',
+                internalPrefix: '/browser-use/',
+                access: 'guest'
             }
         ]
     }, null, 2));
@@ -470,7 +532,7 @@ function writeOnlyOfficeDelegationConfig(ploinkyDir, servicePort) {
                 slug: 'onlyoffice',
                 externalPrefix: '/services/onlyoffice/',
                 internalPrefix: '/control/',
-                auth: 'protected',
+                access: 'authenticated',
                 delegations: [{
                     targetAgentId: 'agent:AssistOSExplorer/dpuAgent',
                     tools: [
@@ -490,13 +552,11 @@ function writeOnlyOfficeDelegationConfig(ploinkyDir, servicePort) {
                     },
                 }],
             },
-        ],
-        publicServices: [
             {
                 slug: 'public-office',
                 externalPrefix: '/public-services/onlyoffice/',
                 internalPrefix: '/public/',
-                auth: 'none',
+                access: 'public',
             },
         ],
     }, null, 2));
@@ -531,7 +591,7 @@ function writeBrokenPrincipalConfig(ploinkyDir, servicePort) {
                         slug: 'broken',
                         externalPrefix: '/services/broken/',
                         internalPrefix: '/broken/',
-                        auth: 'protected',
+                        access: 'authenticated',
                     },
                 ],
             },
@@ -567,7 +627,7 @@ async function withRouterModules(t, servicePort, writeConfig = writeWorkspaceCon
     return { authHandlers, localService, routerHandlers };
 }
 
-test('protected HTTP service falls back to static auth and injects router auth info', async (t) => {
+test('authenticated HTTP service falls back to static auth and injects router auth info', async (t) => {
     let captured = null;
     const upstream = http.createServer((req, res) => {
         captured = {
@@ -684,7 +744,7 @@ test('protected HTTP service falls back to static auth and injects router auth i
     assert.equal(captured?.url, '/browser-use/');
 });
 
-test('protected HTTP service invocation rch binds the forwarded request body', async (t) => {
+test('authenticated HTTP service invocation rch binds the forwarded request body', async (t) => {
     let captured = null;
     const upstream = http.createServer((req, res) => {
         const chunks = [];
@@ -969,7 +1029,7 @@ test('guest HTTP service invocation records guest actor kind', async (t) => {
 
     const { routerHandlers } = await withRouterModules(t, servicePort);
     const req = makeRequest({
-        url: '/services/browser-use/sessions/sess_guest?view=1',
+        url: '/public-services/browser-use-guest/sessions/sess_guest?view=1',
     });
     req.user = {
         id: 'guest:abc',
@@ -1004,7 +1064,7 @@ test('guest HTTP service invocation records guest actor kind', async (t) => {
     assert.deepEqual(verified.payload.actor.roles, ['guest']);
 });
 
-test('protected HTTP service fails closed when invocation principal cannot be resolved', async (t) => {
+test('authenticated HTTP service fails closed when invocation principal cannot be resolved', async (t) => {
     let reached = false;
     const upstream = http.createServer((_req, res) => {
         reached = true;
@@ -1040,7 +1100,7 @@ test('protected HTTP service fails closed when invocation principal cannot be re
     assert.match(body.message, /could not resolve provider 'brokenService'/);
 });
 
-test('protected HTTP service auth info carries user identity', async () => {
+test('authenticated HTTP service auth info carries user identity', async () => {
     const { buildPlainAuthInfoHeader } = await import(`${pathToFileURL(path.join(REPO_ROOT, 'cli/server/routerHandlers.js')).href}?plain=${Date.now()}`);
     const headers = buildPlainAuthInfoHeader({
         user: {
@@ -1068,7 +1128,7 @@ test('service delegation target "." expands to the source route repo', () => {
         slug: 'onlyoffice',
         externalPrefix: '/services/onlyoffice/',
         internalPrefix: '/control/',
-        auth: 'protected',
+        access: 'authenticated',
         delegations: [{
             targetAgentId: 'agent:./dpuAgent',
             tools: ['dpu_confidential_get'],
@@ -1076,42 +1136,42 @@ test('service delegation target "." expands to the source route repo', () => {
             ttlSeconds: 1800,
         }],
     };
-    const def = normalizeServiceSpec('onlyOffice', { repo: 'CustomRepoName', agent: 'onlyOffice' }, spec, 'protected');
+    const def = normalizeServiceSpec('onlyOffice', { repo: 'CustomRepoName', agent: 'onlyOffice' }, spec);
     assert.equal(def.delegations[0].targetAgentId, 'agent:CustomRepoName/dpuAgent');
 });
 
 test('service delegation target with explicit repo is left unchanged', () => {
     const spec = {
-        slug: 'onlyoffice', externalPrefix: '/services/onlyoffice/', internalPrefix: '/control/', auth: 'protected',
+        slug: 'onlyoffice', externalPrefix: '/services/onlyoffice/', internalPrefix: '/control/', access: 'authenticated',
         delegations: [{ targetAgentId: 'agent:AchillesIDE/dpuAgent', tools: ['dpu_confidential_get'], scopes: ['dpu:confidential:read'], ttlSeconds: 1800 }],
     };
-    const def = normalizeServiceSpec('onlyOffice', { repo: 'CustomRepoName', agent: 'onlyOffice' }, spec, 'protected');
+    const def = normalizeServiceSpec('onlyOffice', { repo: 'CustomRepoName', agent: 'onlyOffice' }, spec);
     assert.equal(def.delegations[0].targetAgentId, 'agent:AchillesIDE/dpuAgent');
 });
 
 test('relative delegation target without a source repo is rejected', () => {
     const spec = {
-        slug: 'onlyoffice', externalPrefix: '/services/onlyoffice/', internalPrefix: '/control/', auth: 'protected',
+        slug: 'onlyoffice', externalPrefix: '/services/onlyoffice/', internalPrefix: '/control/', access: 'authenticated',
         delegations: [{ targetAgentId: 'agent:./dpuAgent', tools: ['dpu_confidential_get'], scopes: ['dpu:confidential:read'], ttlSeconds: 1800 }],
     };
-    assert.throws(() => normalizeServiceSpec('onlyOffice', {}, spec, 'protected'), /cannot expand relative target/);
+    assert.throws(() => normalizeServiceSpec('onlyOffice', {}, spec), /cannot expand relative target/);
 });
 
 test('delegation targets with dot-only path segments are rejected', () => {
     for (const target of ['agent:../dpuAgent', 'agent:./../dpuAgent', 'agent:CustomRepoName/..', 'agent:CustomRepoName/.']) {
         const spec = {
-            slug: 'onlyoffice', externalPrefix: '/services/onlyoffice/', internalPrefix: '/control/', auth: 'protected',
+            slug: 'onlyoffice', externalPrefix: '/services/onlyoffice/', internalPrefix: '/control/', access: 'authenticated',
             delegations: [{ targetAgentId: target, tools: ['dpu_confidential_get'], scopes: ['dpu:confidential:read'], ttlSeconds: 1800 }],
         };
-        assert.throws(() => normalizeServiceSpec('onlyOffice', { repo: 'CustomRepoName', agent: 'onlyOffice' }, spec, 'protected'), /invalid targetAgentId/);
+        assert.throws(() => normalizeServiceSpec('onlyOffice', { repo: 'CustomRepoName', agent: 'onlyOffice' }, spec), /invalid targetAgentId/);
     }
 });
 
 test('explicit delegation key is preserved through normalization', () => {
     const spec = {
-        slug: 'onlyoffice', externalPrefix: '/services/onlyoffice/', internalPrefix: '/control/', auth: 'protected',
+        slug: 'onlyoffice', externalPrefix: '/services/onlyoffice/', internalPrefix: '/control/', access: 'authenticated',
         delegations: [{ key: 'dpuConfidential', targetAgentId: 'agent:AchillesIDE/dpuAgent', tools: ['dpu_confidential_get'], scopes: ['dpu:confidential:read'], ttlSeconds: 1800 }],
     };
-    const def = normalizeServiceSpec('onlyOffice', { repo: 'AchillesIDE', agent: 'onlyOffice' }, spec, 'protected');
+    const def = normalizeServiceSpec('onlyOffice', { repo: 'AchillesIDE', agent: 'onlyOffice' }, spec);
     assert.equal(def.delegations[0].key, 'dpuConfidential');
 });

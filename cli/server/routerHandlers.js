@@ -440,7 +440,7 @@ export function handleHttpServiceRoute(req, res, parsedUrl, apiRoutes = loadApiR
         res.end(JSON.stringify({ error: definition.notFoundMessage }));
         return true;
     }
-    if (definition.authMode !== 'none' && (!req.user || typeof req.user !== 'object')) {
+    if (definition.access !== 'public' && (!req.user || typeof req.user !== 'object')) {
         sendJson(res, 401, { ok: false, error: 'not_authenticated' });
         return true;
     }

@@ -5,8 +5,10 @@ import { ROUTING_FILE } from '../services/config.js';
 import { resolveEnabledAgentRecord } from '../services/agents.js';
 import { findAgent } from '../services/utils.js';
 import { resolveMaxTtlSeconds } from './mcp-proxy/userDelegationGrant.js';
+import { normalizeHttpRouteAccess } from './policy/HttpRouteAccessDecision.js';
 
 const DEFAULT_DELEGATION_TTL_SECONDS = 1800;
+const REMOVED_SERVICE_SPEC_FIELDS = ['auth', 'mode', 'forceGuest'];
 
 export function loadRoutingConfig() {
     const dynamicRoutingFile = process.env.PLOINKY_ROUTING_FILE
@@ -53,17 +55,16 @@ function readEnabledAgentManifest(routeKey, routes = {}) {
     }
 }
 
-function asServiceSpecEntries(value, defaultAuthMode = '') {
+function asServiceSpecEntries(value) {
     if (!value) return [];
     if (Array.isArray(value)) {
-        return value.map((entry) => ({ spec: entry, defaultAuthMode }));
+        return value.map((entry) => ({ spec: entry }));
     }
     if (typeof value === 'object') {
         return Object.entries(value).map(([key, entry]) => ({
             spec: typeof entry === 'object' && entry !== null
                 ? { slug: key, ...entry }
                 : { slug: key, internalPrefix: String(entry || '/') },
-            defaultAuthMode
         }));
     }
     return [];
@@ -76,12 +77,8 @@ function normalizePrefix(value, fallback) {
     return prefixed.endsWith('/') ? prefixed : `${prefixed}/`;
 }
 
-function normalizeAuthMode(value, fallback = '') {
-    const normalized = String(value || fallback || '').trim().toLowerCase();
-    if (['none', 'public', 'anonymous'].includes(normalized)) return 'none';
-    if (['guest', 'visitor'].includes(normalized)) return 'guest';
-    if (['protected', 'authenticated', 'auth', 'local', 'sso'].includes(normalized)) return 'protected';
-    return fallback || 'protected';
+function normalizeServiceAccess(value) {
+    return normalizeHttpRouteAccess(value);
 }
 
 function uniqueTrimmedStrings(values) {
@@ -165,14 +162,14 @@ function normalizeDelegation(spec) {
     };
 }
 
-function validateAndNormalizeDelegations(spec, authMode, route = {}) {
+function validateAndNormalizeDelegations(spec, access, route = {}) {
     const normalized = normalizeDelegation(spec);
     if (!normalized.hasDelegations) {
         return [];
     }
 
-    if (authMode !== 'protected') {
-        throw new Error(`Delegations are only supported for protected HTTP services. Route '${spec.slug || ''}' is '${authMode}'.`);
+    if (access !== 'authenticated') {
+        throw new Error(`Delegations are only supported for authenticated HTTP services. Route '${spec.slug || ''}' is '${access}'.`);
     }
 
     const out = [];
@@ -236,16 +233,22 @@ function validateAndNormalizeDelegations(spec, authMode, route = {}) {
     return out;
 }
 
-function normalizeServiceSpec(routeKey, route, spec, defaultAuthMode = '') {
+function normalizeServiceSpec(routeKey, route, spec) {
     if (!spec || typeof spec !== 'object') return null;
+    for (const field of REMOVED_SERVICE_SPEC_FIELDS) {
+        if (Object.prototype.hasOwnProperty.call(spec, field)) {
+            throw new Error(`HTTP service spec field '${field}' was removed; declare access: public | guest | authenticated`);
+        }
+    }
     const slug = String(spec.slug || spec.name || '').trim().replace(/^\/+|\/+$/g, '');
-    const authMode = normalizeAuthMode(spec.auth || spec.mode, defaultAuthMode);
+    const access = normalizeServiceAccess(spec.access);
+    if (!access) {
+        throw new Error(`HTTP service '${slug || routeKey}' requires access: public | guest | authenticated`);
+    }
     const explicitExternalPrefix = String(spec.externalPrefix || spec.prefix || spec.path || '').trim();
     const externalPrefix = normalizePrefix(
         explicitExternalPrefix,
-        slug
-            ? `${authMode === 'protected' ? '/services' : '/public-services'}/${slug}/`
-            : ''
+        slug ? `${access === 'authenticated' ? '/services' : '/public-services'}/${slug}/` : ''
     );
     const internalPrefix = normalizePrefix(spec.internalPrefix || spec.targetPrefix || spec.upstreamPrefix, '/');
     if (!externalPrefix || !internalPrefix) return null;
@@ -255,28 +258,38 @@ function normalizeServiceSpec(routeKey, route, spec, defaultAuthMode = '') {
         route,
         externalPrefix,
         internalPrefix,
-        authMode,
+        access,
         guestScope: String(spec.guestScope || `http-service:${routeKey}:${externalPrefix}`).trim(),
-        forceGuest: spec.forceGuest === true,
-        issueInvocation: spec.invocation !== false && authMode !== 'none',
-        includeAuthInfo: spec.includeAuthInfo !== false && authMode !== 'none',
+        issueInvocation: spec.invocation !== false && access !== 'public',
+        includeAuthInfo: spec.includeAuthInfo !== false && access !== 'public',
         notFoundMessage: String(spec.notFoundMessage || 'HTTP service route not found.'),
-        delegations: validateAndNormalizeDelegations(spec, authMode, route),
+        delegations: validateAndNormalizeDelegations(spec, access, route),
     };
 }
 
 export { normalizeServiceSpec };
 
+const loggedInvalidServiceSpecs = new Set();
+
 function collectRouteServiceSpecs(routeKey, route, routes) {
     const manifest = readEnabledAgentManifest(routeKey, routes) || {};
-    return [
+    const collected = [];
+    for (const { spec } of [
         ...asServiceSpecEntries(route?.httpServices),
         ...asServiceSpecEntries(manifest?.httpServices),
-        ...asServiceSpecEntries(route?.publicServices, 'none'),
-        ...asServiceSpecEntries(manifest?.publicServices, 'none')
-    ]
-        .map(({ spec, defaultAuthMode }) => normalizeServiceSpec(routeKey, route, spec, defaultAuthMode))
-        .filter(Boolean);
+    ]) {
+        try {
+            const definition = normalizeServiceSpec(routeKey, route, spec);
+            if (definition) collected.push(definition);
+        } catch (err) {
+            const key = `${routeKey}:${String(spec?.slug || spec?.name || spec?.externalPrefix || '')}`;
+            if (!loggedInvalidServiceSpecs.has(key)) {
+                loggedInvalidServiceSpecs.add(key);
+                console.error(`[ploinky] invalid httpServices spec for route '${routeKey}': ${err?.message || err} - service not mounted (fail closed)`);
+            }
+        }
+    }
+    return collected;
 }
 
 export function collectHttpServiceRoutes(routing = loadRoutingConfig()) {
@@ -299,7 +312,7 @@ export function resolveHttpServiceRoute(pathname, routing = loadRoutingConfig())
 
 export function isAnonymousHttpServiceRoute(pathname, routing = loadRoutingConfig()) {
     const definition = resolveHttpServiceRoute(pathname, routing);
-    return definition?.authMode === 'none';
+    return definition?.access === 'public';
 }
 
 export function buildServiceAgentPath(pathname, search = '', externalPrefix, internalPrefix) {

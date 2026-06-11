@@ -596,29 +596,28 @@ function resolveAuthContext(parsedUrl) {
     const routing = readRouting();
     const serviceRoute = resolveHttpServiceRoute(pathname, routing);
     if (serviceRoute) {
-        if (serviceRoute.authMode === 'none') {
+        if (serviceRoute.access === 'public') {
             return { routeKey: serviceRoute.routeKey, mode: 'none', policy: { mode: 'none' }, record: null };
         }
-        if (serviceRoute.authMode === 'guest') {
+        if (serviceRoute.access === 'guest') {
             return {
                 routeKey: serviceRoute.routeKey,
                 mode: 'guest',
                 policy: {
                     mode: 'guest',
-                    guestScope: serviceRoute.guestScope,
-                    forceGuest: serviceRoute.forceGuest
+                    guestScope: serviceRoute.guestScope
                 },
                 record: null
             };
         }
         const ownerContext = resolveAuthContextForRouteKey(serviceRoute.routeKey);
-        if (ownerContext.mode !== 'none') {
+        if (isUserAuthenticatedAuthMode(ownerContext.mode)) {
             return ownerContext;
         }
         const staticRouteKey = String(routing.static?.agent || '').trim();
         if (staticRouteKey && staticRouteKey !== serviceRoute.routeKey) {
             const staticContext = resolveAuthContextForRouteKey(staticRouteKey);
-            if (staticContext.mode !== 'none') {
+            if (isUserAuthenticatedAuthMode(staticContext.mode)) {
                 return {
                     ...staticContext,
                     serviceRouteKey: serviceRoute.routeKey
@@ -654,6 +653,11 @@ function resolveAuthContextForRouteKey(routeKey) {
     const policy = record?.auth || { mode: 'none' };
     const mode = String(policy.mode || 'none').trim().toLowerCase() || 'none';
     return { routeKey: normalizedRouteKey, mode, policy, record };
+}
+
+function isUserAuthenticatedAuthMode(mode) {
+    const normalized = String(mode || '').trim().toLowerCase();
+    return Boolean(normalized && normalized !== 'none' && normalized !== 'guest');
 }
 
 function getLocalRouteKey(parsedUrl, session = null, fallback = '') {
