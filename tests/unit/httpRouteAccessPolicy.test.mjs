@@ -144,6 +144,17 @@ test('manifest route access accepts public, guest, and authenticated entries', (
     );
 });
 
+test('manifest route access defaults missing access to authenticated', () => {
+    assert.deepEqual(
+        normalizeManifestHttpRouteAccess({ path: '/implicit/*' }, { routeKey: 'explorer' }),
+        { ok: true, path: '/explorer/implicit/*', access: 'authenticated', routeKey: 'explorer', source: 'manifest' },
+    );
+    assert.equal(
+        normalizeManifestHttpRouteAccess({ path: '/empty', access: '' }, { routeKey: 'explorer' }).code,
+        'INVALID_ACCESS',
+    );
+});
+
 test('manifest route access keeps the root-relative and encoded __agent rejections', () => {
     for (const pathValue of ['/', '/*', '']) {
         assert.equal(
@@ -185,6 +196,7 @@ test('collects manifest route access from routing hostPath entries', () => {
                     { path: '/public/*', access: 'public' },
                     { path: '/work/*', access: 'guest' },
                     { path: '/account/*', access: 'authenticated' },
+                    { path: '/implicit/*' },
                     { path: '/legacy/*', mode: 'guest' },
                     { path: '/old/*', access: ['pro', 'tected'].join('') },
                 ],
@@ -203,6 +215,7 @@ test('collects manifest route access from routing hostPath entries', () => {
             { path: '/explorer/public/*', access: 'public', source: 'manifest' },
             { path: '/explorer/work/*', access: 'guest', source: 'manifest' },
             { path: '/explorer/account/*', access: 'authenticated', source: 'manifest' },
+            { path: '/explorer/implicit/*', access: 'authenticated', source: 'manifest' },
         ]);
     } finally {
         fs.rmSync(tempDir, { recursive: true, force: true });

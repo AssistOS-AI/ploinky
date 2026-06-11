@@ -62,6 +62,17 @@ test('normalizeServiceSpec preserves authenticated service delegations with cano
     });
 });
 
+test('normalizeServiceSpec requires explicit service access', () => {
+    assert.throws(
+        () => normalizeServiceSpec('explorer', { agent: 'explorer', repo: 'AchillesIDE' }, {
+            slug: 'avatar-settings',
+            externalPrefix: '/services/explorer/avatar-settings/',
+            internalPrefix: '/avatar-settings/',
+        }),
+        /requires access: public \| guest \| authenticated/,
+    );
+});
+
 test('normalizeServiceSpec preserves delegation request path conditions', () => {
     const definition = normalizeServiceSpec('onlyOffice', { agent: 'onlyOffice', repo: 'AssistOSExplorer' }, {
         ...VALID_DELEGATION_SPEC,

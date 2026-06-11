@@ -57,7 +57,8 @@ export function normalizeManifestHttpRouteAccess(spec, { routeKey } = {}) {
     if (Object.prototype.hasOwnProperty.call(spec || {}, 'mode')) {
         return { ok: false, code: 'INVALID_FIELD', error: 'routerAccess.httpRoutes entries must use access, not mode' };
     }
-    const access = normalizeHttpRouteAccess(spec?.access);
+    const hasAccess = Object.prototype.hasOwnProperty.call(spec || {}, 'access');
+    const access = hasAccess ? normalizeHttpRouteAccess(spec?.access) : 'authenticated';
     if (!access) return { ok: false, code: 'INVALID_ACCESS', error: 'access must be public, guest, or authenticated' };
 
     const rawPath = String(spec?.path || '').trim();

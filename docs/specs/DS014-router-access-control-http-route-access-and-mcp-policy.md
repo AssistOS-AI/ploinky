@@ -35,14 +35,14 @@ This model still accounts for the five caller classes Ploinky cares about:
 
 ### HTTP Route Access
 
-The only valid HTTP route access values are `public`, `guest`, and `authenticated`. Missing values, retired values, unknown values, disabled entries, corrupt state, and invalid paths deny.
+The only valid HTTP route access values are `public`, `guest`, and `authenticated`. Manifest `routerAccess.httpRoutes` entries that omit `access` default to `authenticated`; this is a manifest-route default only. Persisted `httpRoutes`, declared `httpServices`, retired values, unknown values, disabled entries, corrupt state, and invalid paths deny when access is missing or invalid.
 
 An HTTP route decision may come from four sources:
 
 | Source | Ownership | Notes |
 | --- | --- | --- |
 | Persisted `httpRoutes` | Operator/admin policy in `policy-state.json` | Written by `http.route.set`; listed by `http.route.list`. |
-| Manifest `routerAccess.httpRoutes` | Agent self-declaration | Evaluated at runtime from enabled manifests; never written to policy state. |
+| Manifest `routerAccess.httpRoutes` | Agent self-declaration | Evaluated at runtime from enabled manifests; never written to policy state. Omitted `access` is `authenticated`; explicit values must be `public`, `guest`, or `authenticated`. |
 | Manifest `httpServices` | Agent service declaration | Converted to route access for the external service prefix. |
 | Route default | Router fallback for ordinary transparent routes | Preserves static-agent deference: `auth.mode: "none"` behind a user-authenticated static agent becomes `authenticated`; otherwise it becomes `guest`. Defaults never produce `public`. |
 
@@ -63,6 +63,8 @@ Persisted `httpRoutes` are exclusively operator/admin policy written through `PO
 ### HTTP Services
 
 Declared HTTP services use the same evaluator as ordinary routes. A valid service declaration must provide an external prefix, an internal upstream prefix, and `access` with one of `public`, `guest`, or `authenticated`. Invalid service declarations are logged and only that service is left unmounted; collection never throws into the request path.
+
+The manifest-route omitted-access default does not apply to HTTP services. A service without explicit `access` is invalid and is not mounted.
 
 `public` services run without router identity. `guest` services use an existing local or SSO user session when present, otherwise they mint or reuse a scoped guest session. `authenticated` services require user authentication using the owning route policy first and the static route policy as fallback. Only authenticated services may receive user delegation grants. Authenticated and guest services receive scoped `__http_service__` invocation metadata unless the manifest disables invocation minting.
 
