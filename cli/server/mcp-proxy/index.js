@@ -94,6 +94,13 @@ function extractDelegatedUser(req) {
     };
 }
 
+function actorKindForRequestUser(user) {
+    const roles = Array.isArray(user?.roles)
+        ? user.roles.map((role) => String(role || '').toLowerCase())
+        : [];
+    return roles.includes('guest') ? 'guest' : 'user';
+}
+
 async function getToolSchemasForAgent(agentName, agentClient) {
     const now = Date.now();
     const cached = agentToolSchemaCache.get(agentName);
@@ -154,7 +161,7 @@ export function buildInvocationContextForProviderCall({ req, agentName, toolName
         const targetAgentId = resolveProviderPrincipal({ providerAgentRef: resolveProviderAgentRef(agentName) });
         const user = extractDelegatedUser(req);
         sub = user?.id ? `user:${user.id}` : '';
-        actor = { kind: 'user', id: sub, roles: user?.roles || [] };
+        actor = { kind: actorKindForRequestUser(req.user), id: sub, roles: user?.roles || [] };
         const delegations = buildMcpDelegationsForUserCall({ req, routeKey: agentName, toolName });
         const { token, payload } = buildRouterRequest({
             targetAgentId,

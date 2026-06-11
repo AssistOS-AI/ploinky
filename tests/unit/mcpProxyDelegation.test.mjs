@@ -267,12 +267,14 @@ test('user call to an unconfigured tool mints no delegations', () => {
     assert.equal(ctx.payload.delegations, undefined);
 });
 
-test('guest call to a configured tool mints no delegations', () => {
+test('browser guest MCP invocation carries guest actor kind and no delegations', () => {
     const ctx = buildInvocationContextForProviderCall({
         req: { user: { id: 'guest-1', username: 'guest', roles: ['guest'] } },
         agentName: 'gitAgent',
         toolName: 'git_auth_store_token',
         toolArgs: { token: 'redacted-by-test' },
     });
+    assert.equal(ctx.payload.actor.kind, 'guest');
+    assert.equal(ctx.payload.usr, undefined);
     assert.equal(ctx.payload.delegations, undefined);
 });
