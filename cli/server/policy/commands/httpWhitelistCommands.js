@@ -53,7 +53,7 @@ export class HttpWhitelistAddCommand extends HttpWhitelistMutationCommand {
             this._repo.mutate((state) => {
                 if (state.httpRoutes.some((entry) => entry.path === norm.path)) { existed = true; return state; }
                 const now = new Date().toISOString();
-                state.httpRoutes.push({ path: norm.path, enabled: true, createdAt: now, createdBy: actorId, updatedAt: now, updatedBy: actorId });
+                state.httpRoutes.push({ path: norm.path, access: 'public', enabled: true, createdAt: now, createdBy: actorId, updatedAt: now, updatedBy: actorId });
                 return state;
             });
             if (existed) return this._fail(409, 'POLICY_ENTRY_EXISTS', 'Route is already whitelisted.', { path: norm.path });

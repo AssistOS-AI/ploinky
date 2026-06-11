@@ -14,7 +14,8 @@ import { FileSystemPolicyStateStore } from './FileSystemPolicyStateStore.js';
  */
 
 const SCHEMA = 'router-policy';
-const ACCESS_VALUES = new Set(['authenticated', 'internal', 'admin']);
+const MCP_ACCESS_VALUES = new Set(['authenticated', 'internal', 'admin']);
+const HTTP_ROUTE_ACCESS_VALUES = new Set(['public', 'guest', 'authenticated']);
 
 function emptyState() {
     return { schema: SCHEMA, httpRoutes: [], mcpTools: [] };
@@ -40,12 +41,13 @@ function validateState(parsed) {
     for (const entry of mcpTools) {
         if (!entry || typeof entry.agent !== 'string' || !entry.agent
             || typeof entry.tool !== 'string' || !entry.tool
-            || !ACCESS_VALUES.has(entry.access)) {
+            || !MCP_ACCESS_VALUES.has(entry.access)) {
             throw new Error('policy-state: invalid mcpTools entry');
         }
     }
     for (const entry of httpRoutes) {
-        if (!entry || typeof entry.path !== 'string' || !entry.path) {
+        if (!entry || typeof entry.path !== 'string' || !entry.path
+            || !HTTP_ROUTE_ACCESS_VALUES.has(String(entry.access || '').trim().toLowerCase())) {
             throw new Error('policy-state: invalid httpRoutes entry');
         }
     }
@@ -160,5 +162,5 @@ export class PolicyStateRepository {
     }
 }
 
-export { SCHEMA, ACCESS_VALUES };
+export { SCHEMA, MCP_ACCESS_VALUES, HTTP_ROUTE_ACCESS_VALUES };
 export default PolicyStateRepository;

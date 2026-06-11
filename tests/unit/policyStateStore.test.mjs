@@ -80,7 +80,7 @@ test('repository over in-memory store: empty store is a valid empty state', () =
 });
 
 test('repository over in-memory store: loads, indexes, and mutates with no filesystem', () => {
-    const store = new InMemoryPolicyStateStore({ document: doc([mcp('explorer', 'docs', 'authenticated')], [{ path: '/x/*', enabled: true }]) });
+    const store = new InMemoryPolicyStateStore({ document: doc([mcp('explorer', 'docs', 'authenticated')], [{ path: '/x/*', access: 'public', enabled: true }]) });
     const repo = new PolicyStateRepository({ store });
     assert.equal(repo.getMcpToolEntry('explorer', 'docs').access, 'authenticated');
     assert.equal(repo.getHttpRouteEntry('/x/*').enabled, true);

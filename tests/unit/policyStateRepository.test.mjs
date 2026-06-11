@@ -33,10 +33,21 @@ test('missing file is a valid empty state, not corrupt', () => {
 });
 
 test('reads entries and indexes by agent+tool and by path', () => {
-    writeState([mcp('explorer', 'docs', 'authenticated')], [{ path: '/x/*', enabled: true }]);
+    writeState([mcp('explorer', 'docs', 'authenticated')], [{ path: '/x/*', access: 'public', enabled: true }]);
     const repo = new PolicyStateRepository();
     assert.equal(repo.getMcpToolEntry('explorer', 'docs').access, 'authenticated');
     assert.equal(repo.getHttpRouteEntry('/x/*').enabled, true);
+});
+
+test('httpRoutes entries without access mark the whole document corrupt (no legacy public default)', () => {
+    writeState([mcp('explorer', 'docs', 'authenticated')], [{ path: '/x/*', enabled: true }]);
+    const repo = new PolicyStateRepository();
+    assert.equal(repo.isCorrupt(), true);
+    assert.deepEqual(repo.listHttpRoutes(), { corrupt: true, entries: [] });
+    // The corrupt document also blocks MCP reads and mutations; operators
+    // must delete policy-state.json (documented remediation), not patch it.
+    assert.deepEqual(repo.getMcpToolEntry('explorer', 'docs'), { corrupt: true });
+    assert.throws(() => repo.mutate((state) => state), /POLICY_PERSISTENCE_ERROR|refusing to overwrite/);
 });
 
 test('corrupt file fails closed: isCorrupt true, accessors signal corrupt, mutate refuses & keeps file', () => {
