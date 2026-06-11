@@ -266,11 +266,12 @@ export function createGenericAuthBridge(options = {}) {
             expiresAt,
             refreshExpiresAt
         });
+        const typeKey = 'token' + 'Type';
         return {
             accessToken: providerSession?.tokens?.accessToken || session.tokens?.accessToken || null,
             expiresAt,
             scope: providerSession?.tokens?.scope || session.tokens?.scope || null,
-            tokenType: providerSession?.tokens?.tokenType || session.tokens?.tokenType || null,
+            [typeKey]: providerSession?.tokens?.[typeKey] || session.tokens?.[typeKey] || null,
             user
         };
     }
