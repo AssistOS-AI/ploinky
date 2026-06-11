@@ -12,14 +12,20 @@ import { handleBlobs, handleWorkspaceUpload } from './handlers/blobs.js';
 import * as staticSrv from './static/index.js';
 
 // Authentication and routing
-import { ensureAuthenticated, handleAuthRoutes, handleUserAdminRoutes } from './authHandlers.js';
+import {
+    ensureAuthenticated,
+    ensureHttpRouteAccess,
+    handleAuthRoutes,
+    handleUserAdminRoutes,
+    resolveRouteDefaultHttpAccess,
+} from './authHandlers.js';
 import {
     loadApiRoutes,
     handleRouterMcp,
     handleHttpServiceRoute,
-    isPublicHttpServiceRoute,
     proxyHttpPassthrough
 } from './routerHandlers.js';
+import { collectHttpServiceRoutes, resolveHttpServiceRoute } from './httpServiceRoutes.js';
 
 // Logging
 import { appendLog, logBootEvent, logMemoryUsage } from './utils/logger.js';
@@ -30,6 +36,7 @@ import { agentSessionStore, handleAgentMcpRequest } from './mcp-proxy/index.js';
 import { initializeTTYFactories, createServiceConfig } from './utils/ttyFactories.js';
 import { setupProcessLifecycle } from './utils/processLifecycle.js';
 import { policy } from './policy/index.js';
+import { createHttpServiceProvider, createManifestRouteProvider } from './policy/HttpRouteProviders.js';
 import { hasInternalAgentSegment } from './internalAgentPath.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -140,8 +147,8 @@ function isRouterOwnedPath(pathname) {
         || pathname === '/mcp/'
         || pathname.startsWith('/auth/')
         || pathname.startsWith('/api/agents/')
-        // Internal, non-whitelistable router-owned routes (DS014).
-        || pathname === '/whitelist/command'
+        // Internal, non-policy-routable router-owned routes (DS014).
+        || pathname === '/policy/command'
         || pathname === '/metrics'
         || pathname === '/health/internal'
         || pathname === '/admin'
@@ -303,6 +310,19 @@ async function processRequest(req, res) {
     const route = agentName ? apiRoutes[agentName] : null;
     const agentProxyPath = agentName ? buildAgentProxyPath(agentName, parsedUrl) : '';
     const isAgentMcpRoute = Boolean(agentName && (agentProxyPath === '/mcp' || agentProxyPath.startsWith('/mcp?') || agentProxyPath.startsWith('/mcp/')));
+    const serviceDefinition = !agentName && !isRouterOwnedPath(pathname)
+        ? resolveHttpServiceRoute(pathname)
+        : null;
+    const policyGatedRouteKey = agentName && !isAgentMcpRoute
+        ? agentName
+        : serviceDefinition?.routeKey || '';
+    const httpRouteAccess = (agentName && !isAgentMcpRoute) || serviceDefinition
+        ? policy.httpRouteAccessPolicy.evaluate({
+            pathname,
+            method: req.method || 'GET',
+            routeKey: policyGatedRouteKey,
+        })
+        : null;
     appendLog('http_request', { method: req.method, path: pathname });
 
     // Health check endpoint (no auth required)
@@ -362,8 +382,8 @@ async function processRequest(req, res) {
     }
 
     // Single administrative endpoint for router access-control policy (DS014).
-    // Authenticated + never whitelistable; handles its own authorization.
-    if (pathname === '/whitelist/command') {
+    // Authenticated + never policy-routable; handles its own authorization.
+    if (pathname === '/policy/command') {
         const handled = await policy.commandInvoker.handle(req, res);
         if (handled) return;
     }
@@ -374,19 +394,16 @@ async function processRequest(req, res) {
         const authResult = await ensureAuthenticated(req, res, parsedUrl);
         if (!authResult.ok) return;
     } else if (agentName && isAgentMcpRoute && hasDelegatedAgentAssertion(req)) {
-        // Delegated agent-to-agent MCP calls do not carry browser cookies.
-        // The MCP proxy verifies the Agent Assertion before forwarding.
-    } else if (agentName && !isAgentMcpRoute && policy.httpWhitelist.isReachableByGuest(pathname, req.method)) {
-        // Whitelisted read-only public HTTP route: a guest may reach it without
-        // authentication. The path-based whitelist already excluded internal
-        // routes and non-readonly methods; the query string never participates.
-    } else if (agentName) {
+        // Agent-to-agent MCP: the MCP proxy verifies the Agent Assertion.
+    } else if (agentName && isAgentMcpRoute) {
+        // Browser MCP keeps the existing surface auth (static fallback included).
         const authResult = await ensureAuthenticated(req, res, parsedUrl);
         if (!authResult.ok) return;
-    } else if (isPublicHttpServiceRoute(pathname)) {
-        // Tokenized public service routes are intentionally public.
+    } else if (httpRouteAccess) {
+        // One executor for transparent agent routes and declared HTTP services.
+        const accessResult = await ensureHttpRouteAccess(req, res, parsedUrl, httpRouteAccess);
+        if (!accessResult.ok) return;
     } else {
-        // Ensure authenticated for other protected routes
         const authResult = await ensureAuthenticated(req, res, parsedUrl);
         if (!authResult.ok) return;
     }
@@ -517,6 +534,17 @@ server.listen(port, () => {
         appendLog('mcp_policy_bootstrap', { added });
     } catch (err) {
         appendLog('mcp_policy_bootstrap_error', { error: err?.message || String(err) });
+    }
+
+    try {
+        policy.httpRouteAccessPolicy.bindProviders({
+            manifestRouteProvider: createManifestRouteProvider(() => loadApiRoutes()),
+            httpServiceProvider: createHttpServiceProvider(() => collectHttpServiceRoutes()),
+            routeDefaultProvider: ({ routeKey }) => resolveRouteDefaultHttpAccess(routeKey),
+        });
+        appendLog('http_route_access_providers_bound', {});
+    } catch (err) {
+        appendLog('http_route_access_providers_bind_error', { error: err?.message || String(err) });
     }
 
     // Log initial memory usage

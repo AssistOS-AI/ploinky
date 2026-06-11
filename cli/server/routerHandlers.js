@@ -12,7 +12,6 @@ import { policy } from './policy/index.js';
 import { hasInternalAgentSegment } from './internalAgentPath.js';
 import {
     buildServiceAgentPath,
-    isAnonymousHttpServiceRoute,
     loadRoutingConfig,
     resolveHttpServiceRoute
 } from './httpServiceRoutes.js';
@@ -421,10 +420,6 @@ export function readHeaderValue(headers = {}, headerName) {
     if (typeof direct === 'string' && direct.trim()) return direct.trim();
     const lower = headers?.[String(headerName || '').toLowerCase()];
     return typeof lower === 'string' && lower.trim() ? lower.trim() : '';
-}
-
-export function isPublicHttpServiceRoute(pathname) {
-    return isAnonymousHttpServiceRoute(pathname);
 }
 
 export function handleHttpServiceRoute(req, res, parsedUrl, apiRoutes = loadApiRoutes()) {

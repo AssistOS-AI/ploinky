@@ -8,7 +8,6 @@ import { resolveEnabledAgentRecord } from '../services/agents.js';
 import { ROUTING_FILE } from '../services/config.js';
 import { findAgent } from '../services/utils.js';
 import { readRouterSettings, updateRouterSettings } from '../services/routerSettings.js';
-import { resolveHttpServiceRoute } from './httpServiceRoutes.js';
 import { createAuthService } from './auth/service.js';
 import { authenticateLocalUser, createLocalAuthUser, deleteLocalAuthUser, GUEST_SESSION_TTL_SECONDS, getSession as getLocalSession, getSessionCookieMaxAge as getLocalSessionCookieMaxAge, isLocalAdminUser, listLocalAuthUsers, mintGuestSessionJwt, mintSessionJwt, resolveLocalAuthConfig, resolveUserRev, revokeSession as revokeLocalSession, updateLocalAuthUser, updateLocalCredentials, verifySessionJwt } from './auth/localService.js';
 import { revokeSessionId } from './auth/sessionRevocations.js';
@@ -592,46 +591,6 @@ function resolveAuthRouteKey(parsedUrl) {
 }
 
 function resolveAuthContext(parsedUrl) {
-    const pathname = parsedUrl?.pathname || '';
-    const routing = readRouting();
-    const serviceRoute = resolveHttpServiceRoute(pathname, routing);
-    if (serviceRoute) {
-        if (serviceRoute.access === 'public') {
-            return { routeKey: serviceRoute.routeKey, mode: 'none', policy: { mode: 'none' }, record: null };
-        }
-        if (serviceRoute.access === 'guest') {
-            return {
-                routeKey: serviceRoute.routeKey,
-                mode: 'guest',
-                policy: {
-                    mode: 'guest',
-                    guestScope: serviceRoute.guestScope,
-                },
-                record: null
-            };
-        }
-        const ownerContext = resolveAuthContextForRouteKey(serviceRoute.routeKey);
-        if (isUserAuthenticatedAuthMode(ownerContext.mode)) {
-            return ownerContext;
-        }
-        const staticRouteKey = String(routing.static?.agent || '').trim();
-        if (staticRouteKey && staticRouteKey !== serviceRoute.routeKey) {
-            const staticContext = resolveAuthContextForRouteKey(staticRouteKey);
-            if (isUserAuthenticatedAuthMode(staticContext.mode)) {
-                return {
-                    ...staticContext,
-                    serviceRouteKey: serviceRoute.routeKey
-                };
-            }
-        }
-        return {
-            routeKey: serviceRoute.routeKey,
-            mode: 'protected-unconfigured',
-            policy: { mode: 'protected-unconfigured' },
-            record: ownerContext.record || null,
-            error: 'protected_http_service_auth_not_configured'
-        };
-    }
     const routeKey = resolveAuthRouteKey(parsedUrl);
     if (!routeKey) {
         return { routeKey: null, mode: 'none', policy: { mode: 'none' }, record: null };
@@ -925,14 +884,6 @@ async function ensureAuthenticatedWithContext(req, res, parsedUrl, authContext) 
         });
         return { ok: false, error: authContext.error };
     }
-    if (authContext.error === 'protected_http_service_auth_not_configured') {
-        sendJson(res, 503, {
-            ok: false,
-            error: authContext.error,
-            detail: authContext.errorDetail || 'Protected HTTP service routes require an authenticated route or static-agent auth policy.'
-        });
-        return { ok: false, error: authContext.error };
-    }
     if (authContext.mode === 'none') {
         return { ok: true };
     }
@@ -1074,10 +1025,6 @@ export async function ensureHttpRouteAccess(req, res, parsedUrl, decision) {
     const code = decision?.access === 'deny' ? (decision.code || 'HTTP_ROUTE_ACCESS_DENIED') : 'HTTP_ROUTE_ACCESS_DENIED';
     sendJson(res, status, { ok: false, error: code });
     return { ok: false, error: code };
-}
-
-export async function ensureAuthenticatedForRouteKey(req, res, parsedUrl, routeKey) {
-    return ensureAuthenticatedWithContext(req, res, parsedUrl, resolveAuthenticatedRouteAuthContext(routeKey));
 }
 
 function parseUserAdminPath(pathname = '') {

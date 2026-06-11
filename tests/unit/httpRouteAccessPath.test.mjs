@@ -2,7 +2,10 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 const moduleSuffix = `?t=${Date.now()}-${Math.random()}`;
-const { HttpRouteAccessPath } = await import(`../../cli/server/policy/HttpRouteAccessPath.js${moduleSuffix}`);
+const {
+    HttpRouteAccessPath,
+    ROUTER_OWNED_FIRST_SEGMENTS,
+} = await import(`../../cli/server/policy/HttpRouteAccessPath.js${moduleSuffix}`);
 
 test('normalizes concrete and trailing wildcard route access paths', () => {
     assert.deepEqual(HttpRouteAccessPath.normalize('/explorer/public/*'), {
@@ -42,6 +45,15 @@ test('rejects router-owned first segments so policy entries cannot shadow router
         assert.equal(result.ok, false, value);
         assert.equal(result.code, 'INTERNAL_ROUTE_NOT_ALLOWED', value);
     }
+});
+
+test('ROUTER_OWNED_FIRST_SEGMENTS stays in sync with isRouterOwnedPath', () => {
+    const expected = [
+        'agent-card', 'mcp', 'auth', 'admin', 'webtty', 'webchat', 'dashboard',
+        'status', 'upload', 'blobs', 'workspace-files', 'api', 'health',
+        'metrics', 'MCPBrowserClient.js',
+    ];
+    assert.deepEqual([...ROUTER_OWNED_FIRST_SEGMENTS].sort(), expected.sort());
 });
 
 test('matches trailing wildcard by path boundary', () => {

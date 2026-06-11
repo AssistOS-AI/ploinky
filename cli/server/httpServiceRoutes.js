@@ -310,11 +310,6 @@ export function resolveHttpServiceRoute(pathname, routing = loadRoutingConfig())
     ) || null;
 }
 
-export function isAnonymousHttpServiceRoute(pathname, routing = loadRoutingConfig()) {
-    const definition = resolveHttpServiceRoute(pathname, routing);
-    return definition?.access === 'public';
-}
-
 export function buildServiceAgentPath(pathname, search = '', externalPrefix, internalPrefix) {
     const suffix = String(pathname || '').startsWith(externalPrefix)
         ? String(pathname || '').slice(externalPrefix.length)
