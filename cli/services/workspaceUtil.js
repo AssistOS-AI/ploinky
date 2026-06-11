@@ -519,9 +519,6 @@ async function startWorkspace(staticAgentArg, portArg, { refreshComponentToken, 
           ensureComponentToken('webchat', { quiet: true });
         }
         refreshComponentToken && refreshComponentToken('dashboard', { quiet: true });
-        if (ensureComponentToken) {
-          ensureComponentToken('webmeet', { quiet: true });
-        }
       } catch (e) {
         utils.debugLog('Failed to refresh component tokens:', e.message);
       }

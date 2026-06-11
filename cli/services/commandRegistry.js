@@ -17,7 +17,6 @@ const rawCommands = {
     list: ['agents', 'repos', 'routes'],
     webconsole: [],
     webtty: [],
-    webmeet: [],
     '/settings': [],
     settings: [],
     client: ['methods', 'status', 'list', 'task', 'task-status'],

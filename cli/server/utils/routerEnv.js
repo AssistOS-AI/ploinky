@@ -6,8 +6,7 @@ import { ROUTING_FILE } from '../../services/config.js';
 const COMPONENTS = {
   webtty: { label: 'WebTTY', path: '/webtty', authMode: 'login' },
   webchat: { label: 'WebChat', path: '/webchat', authMode: 'login' },
-  dashboard: { varName: 'WEBDASHBOARD_TOKEN', label: 'Dashboard', path: '/dashboard', authMode: 'token' },
-  webmeet: { label: 'WebMeet', path: '/webmeet', authMode: 'login' }
+  dashboard: { varName: 'WEBDASHBOARD_TOKEN', label: 'Dashboard', path: '/dashboard', authMode: 'token' }
 };
 
 function getRouterPort() {

@@ -314,11 +314,6 @@ function createServiceConfig(getWebttyFactory, getWebchatFactory) {
             containerName: '-',
             runtime: 'local'
         },
-        webmeet: {
-            agentName: 'WebMeet',
-            containerName: '-',
-            runtime: 'local'
-        },
         status: {
             agentName: 'Status',
             containerName: '-',

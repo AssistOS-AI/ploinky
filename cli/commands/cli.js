@@ -9,7 +9,7 @@ import * as agentsSvc from '../services/agents.js';
 import { listRepos, listAgents, listCurrentAgents, listRoutes, statusWorkspace } from '../services/status.js';
 import { logsTail, showLast } from '../services/logUtils.js';
 import { startWorkspace, runCli, runShell, reinstallAgent } from '../services/workspaceUtil.js';
-import { refreshComponentToken, ensureComponentToken, getComponentToken } from '../server/utils/routerEnv.js';
+import { refreshComponentToken, ensureComponentToken } from '../server/utils/routerEnv.js';
 import {
     getAgentContainerName,
     getRuntime,
@@ -391,33 +391,6 @@ async function handleCommand(args) {
             const rotate = (options || []).includes('--rotate');
             if (rotate) await refreshComponentToken('dashboard');
             else ensureComponentToken('dashboard');
-            break;
-        }
-        case 'webmeet': {
-            const argsList = (options || []).filter(Boolean);
-            let moderator = null;
-            let rotate = false;
-            for (const arg of argsList) {
-                if (String(arg).startsWith('--')) {
-                    if (arg === '--rotate') rotate = true;
-                    continue;
-                }
-                if (!moderator) moderator = arg;
-            }
-            if (moderator) {
-                try {
-                    await enableAgent(moderator);
-                    envSvc.setEnvVar('WEBMEET_AGENT', moderator);
-                    console.log(`✓ Stored WebMeet moderator agent: ${moderator}`);
-                } catch (e) {
-                    console.error(`webmeet: failed to configure agent '${moderator}': ${e?.message || e}`);
-                }
-            }
-            if (rotate) {
-                refreshComponentToken('webmeet');
-            } else {
-                ensureComponentToken('webmeet');
-            }
             break;
         }
         case 'list':

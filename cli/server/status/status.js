@@ -61,11 +61,7 @@
       const configured = Boolean(info.hasToken || info.agent || info.command || info.port);
       const pillClass = configured ? '' : ' default';
       const label = configured ? 'service' : 'built-in';
-      let details = '';
-      if (key === 'webmeet' && info.agent) {
-        details = `moderator: ${info.agent}`;
-      }
-      cards.push(`<div class="ps-item"><div class="ps-item-title">${name}<span class="ps-pill${pillClass}">${label}</span></div><div class="ps-item-status">${details || ''}</div></div>`);
+      cards.push(`<div class="ps-item"><div class="ps-item-title">${name}<span class="ps-pill${pillClass}">${label}</span></div><div class="ps-item-status"></div></div>`);
     });
 
     // Add static agent if present
@@ -96,8 +92,7 @@
     const entries = [
       { label: 'Dashboard', href: '/dashboard', note: 'through router' },
       { label: 'Web Console', href: '/webtty', note: 'through router' },
-      { label: 'WebChat', href: '/webchat', note: 'through router' },
-      { label: 'WebMeet', href: '/webmeet', note: servers.webmeet && servers.webmeet.agent ? `moderator ${servers.webmeet.agent}` : 'run "webmeet <agent>" to configure' }
+      { label: 'WebChat', href: '/webchat', note: 'through router' }
     ];
     linksList.innerHTML = entries.map(entry => (
       `<a class="ps-link" href="${entry.href}" target="_blank" rel="noopener noreferrer">` +

@@ -43,7 +43,6 @@ export function loadServersConfig() {
     return {
         webtty: { port: null, token: null, command: null },
         webchat: { port: null, token: null, command: null },
-        webmeet: { port: null, token: null, agent: null },
         dashboard: { port: null, token: null }
     };
 }
@@ -164,7 +163,6 @@ export function getAllServerStatuses() {
     const servers = [
         { name: 'webtty', pidFile: 'webtty.pid', displayName: 'Dashboard Console' },
         { name: 'webchat', pidFile: 'webchat.pid', displayName: 'WebChat' },
-        { name: 'webmeet', pidFile: 'webmeet.pid', displayName: 'WebMeet' },
         { name: 'dashboard', pidFile: 'dashboard.pid', displayName: 'Dashboard' }
     ];
 

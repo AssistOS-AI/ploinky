@@ -23,7 +23,6 @@ export function showHelp(args = []) {
   webconsole [shell] [--rotate]  Prepare WebTTY (alias). Prints URL; login happens in router.
   webtty [shell] [--rotate]      Prepare WebTTY and print access URL. Optional shell.
   webchat [--rotate]             Print the WebChat access URL and support agent URL params
-  webmeet [moderatorAgent] [--rotate]  Print the WebMeet access URL
   dashboard [--rotate]           Show or rotate Dashboard token and print access URL
   sso enable|disable|status  Bind or inspect SSO provider agents
   sandbox status|disable|enable  Force lite-sandbox agents to use containers, or restore bwrap/seatbelt
@@ -150,12 +149,6 @@ function showDetailedHelp(topic, subtopic, subsubtopic) {
                 '/webchat?agent=achilles-cli&path=/absolute/path'
             ],
             notes: 'WebChat now uses the normal router login flow. `--rotate` no longer changes anything for this surface. When `/webchat` is opened with `?agent=<name>&...`, every extra query parameter except internal router/session fields is forwarded to `ploinky cli <name>` as a single-token long-form CLI flag in the form `--key=value`.'
-        },
-        'webmeet': {
-            description: 'Print the WebMeet URL served at /webmeet, optionally storing a moderator agent.',
-            syntax: 'webmeet [moderatorAgent] [--rotate]',
-            examples: [ 'webmeet', 'webmeet ModeratorAgent', 'webmeet --rotate' ],
-            notes: 'WebMeet now uses the normal router login flow. `--rotate` no longer changes anything for this surface.'
         },
         'dashboard': {
             description: 'Display or rotate the Dashboard token used by /dashboard.',
