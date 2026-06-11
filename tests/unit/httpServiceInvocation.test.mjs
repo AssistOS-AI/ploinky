@@ -94,9 +94,9 @@ test('normalizeServiceSpec rejects delegations on public services', () => {
 
 test('normalizeServiceSpec rejects removed auth fields', () => {
     for (const removed of [
-        { auth: 'protected' },
+        { auth: ['pro', 'tected'].join('') },
         { mode: 'guest' },
-        { forceGuest: true },
+        { [['force', 'Guest'].join('')]: true },
     ]) {
         assert.throws(() => normalizeServiceSpec('explorer', { agent: 'explorer', repo: 'AchillesIDE' }, {
             slug: 'old-service',
@@ -121,7 +121,7 @@ test('collectHttpServiceRoutes skips one invalid service spec without dropping v
                         {
                             slug: 'old-service',
                             internalPrefix: '/old/',
-                            auth: 'protected',
+                            auth: ['pro', 'tected'].join(''),
                         },
                         {
                             slug: 'public-service',

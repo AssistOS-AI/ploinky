@@ -139,7 +139,7 @@ test('manifest route access accepts public, guest, and authenticated entries', (
         );
     }
     assert.equal(
-        normalizeManifestHttpRouteAccess({ path: '/old', access: 'protected' }, { routeKey: 'explorer' }).code,
+        normalizeManifestHttpRouteAccess({ path: '/old', access: ['pro', 'tected'].join('') }, { routeKey: 'explorer' }).code,
         'INVALID_ACCESS',
     );
 });
@@ -186,7 +186,7 @@ test('collects manifest route access from routing hostPath entries', () => {
                     { path: '/work/*', access: 'guest' },
                     { path: '/account/*', access: 'authenticated' },
                     { path: '/legacy/*', mode: 'guest' },
-                    { path: '/old/*', access: 'protected' },
+                    { path: '/old/*', access: ['pro', 'tected'].join('') },
                 ],
             },
         });

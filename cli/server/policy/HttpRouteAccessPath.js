@@ -40,10 +40,9 @@ export class HttpRouteAccessPath {
         if (INTERNAL_EXACT.has(core)) return true;
         if (core === '/auth' || core.startsWith('/auth/')) return true;
         if (core === '/admin' || core.startsWith('/admin/')) return true;
-        // Literal AND percent-encoded `__agent` segments (multi-pass decode),
-        // matching the current isUnsafeInternalPath behavior in
-        // HttpRouteWhitelist.js:21-23. The agent HTTP server decodes the path
-        // before routing, so an encoded segment is as dangerous as a literal one.
+        // Literal AND percent-encoded `__agent` segments (multi-pass decode).
+        // The agent HTTP server decodes the path before routing, so an encoded
+        // segment is as dangerous as a literal one.
         if (hasInternalAgentSegment(core)) return true;
         const firstSegment = core.split('/').filter(Boolean)[0] || '';
         if (ROUTER_OWNED_FIRST_SEGMENTS.has(firstSegment)) return true;

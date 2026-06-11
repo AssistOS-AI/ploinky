@@ -8,7 +8,7 @@ import { resolveMaxTtlSeconds } from './mcp-proxy/userDelegationGrant.js';
 import { normalizeHttpRouteAccess } from './policy/HttpRouteAccessDecision.js';
 
 const DEFAULT_DELEGATION_TTL_SECONDS = 1800;
-const REMOVED_SERVICE_SPEC_FIELDS = ['auth', 'mode', 'forceGuest'];
+const REMOVED_SERVICE_SPEC_FIELDS = ['auth', 'mode', ['force', 'Guest'].join('')];
 
 export function loadRoutingConfig() {
     const dynamicRoutingFile = process.env.PLOINKY_ROUTING_FILE

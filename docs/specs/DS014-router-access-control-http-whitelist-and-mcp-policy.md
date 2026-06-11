@@ -3,14 +3,14 @@ id: DS014
 title: Router Access Control - HTTP Whitelist and MCP Tool Policy
 status: implemented
 owner: ploinky-team
-summary: Defines the router's two access-control collections - the httpRoutes read-only public whitelist and the mcpTools agent+tool policy - their fail-closed evaluation, tag bootstrap, single administrative endpoint, and persistence.
+summary: Defines the router's two access-control collections - the httpRoutes route-access policy and the mcpTools agent+tool policy - their fail-closed evaluation, tag bootstrap, single administrative endpoint, and persistence.
 ---
 
 # DS014 Router Access Control: HTTP Whitelist and MCP Tool Policy
 
 ## Introduction
 
-The router is the only public control point. Previously it decided access per-request from `routing.json` + manifest `auth.mode` + invocation-JWT claims, with no persisted, operator-managed access policy. This document defines two independent, fail-closed policy collections the router owns: `httpRoutes` (may a guest reach a read-only HTTP route?) and `mcpTools` (may a user or agent invoke an MCP tool?), administered through a single endpoint. It builds on the per-agent identity model of DS013 and the routing surfaces of DS005. Both collections live in `cli/server/policy/`, composed by `index.js` from focused classes: `PolicyStateRepository` (policy-state domain logic over a pluggable `PolicyStateStore`), `HttpRouteWhitelist` + `WhitelistPath` (HTTP rules), `McpToolPolicy` + `Caller` (MCP decisions), `HttpShareAuthorizer` (the share bridge), `PolicyAuditLog` (audit, over a pluggable `PolicyAuditSink`), and a Command bus (`PolicyCommandInvoker`, `PolicyCommandRegistry`, `commands/`) behind the admin endpoint.
+The router is the only public control point. Previously it decided access per-request from `routing.json` + manifest `auth.mode` + invocation-JWT claims, with no persisted, operator-managed access policy. This document defines two independent, fail-closed policy collections the router owns: `httpRoutes` (may a route be anonymous read-only, or must it force router authentication?) and `mcpTools` (may a user or agent invoke an MCP tool?), administered through a single endpoint. It builds on the per-agent identity model of DS013 and the routing surfaces of DS005. Both collections live in `cli/server/policy/`, composed by `index.js` from focused classes: `PolicyStateRepository` (policy-state domain logic over a pluggable `PolicyStateStore`), `HttpRouteWhitelist` + `WhitelistPath` (HTTP rules), `McpToolPolicy` + `Caller` (MCP decisions), `HttpShareAuthorizer` (the share bridge), `PolicyAuditLog` (audit, over a pluggable `PolicyAuditSink`), and a Command bus (`PolicyCommandInvoker`, `PolicyCommandRegistry`, `commands/`) behind the admin endpoint.
 
 ## Core Content
 
@@ -18,7 +18,7 @@ The router is the only public control point. Previously it decided access per-re
 
 | Type | Caller | Rule |
 | --- | --- | --- |
-| Fully public | guest | path in `httpRoutes` and method is `GET`/`HEAD` |
+| Fully public | guest | path in persisted `httpRoutes` or manifest `routerAccess.httpRoutes` and method is `GET`/`HEAD` |
 | Protected public | anonymous token / limited API key | technical identity for rate-limit/expiry/revocation _(deferred — plan Phase 8)_ |
 | Authenticated | user (or a guest that passed the agent's route auth) | valid session and `mcpTools` permits |
 | Internal MCP | agent | valid Agent Assertion and `mcpTools` permits |
@@ -26,15 +26,19 @@ The router is the only public control point. Previously it decided access per-re
 
 Classes are narrow: an admin user does not get `internal`; an agent does not get `admin` or `authenticated`. The `authenticated` class admits both `user` and `guest` callers because a guest only reaches an agent's MCP surface after passing that agent's route-level guest auth (DS005); sensitive tools must be tagged `admin` or `internal`, which deny guests. `McpToolPolicy.evaluate({ agent, tool, caller })` (`McpToolPolicy.js`) is the single decision function; `Caller.fromRequest` (`Caller.js`) classifies the request as `user`/`guest`/`agent`/`none` and computes admin status (a guest is never admin).
 
-### HTTP Route Whitelist (`httpRoutes`)
+### HTTP Route Access Policy (`httpRoutes`)
 
 The identifier is the normalized path. `WhitelistPath.normalize` (`WhitelistPath.js`) requires a leading `/` and rejects URL schemes, fragments, backslashes, NUL bytes, double slashes, encoded slashes/backslashes (`%2f`/`%5c`), `.`/`..` segments, and the bare root `/`. The query string is stripped and never participates. A wildcard is valid only as a trailing `/*` (a prefix match), never a glob; any other `*` is `INVALID_WILDCARD`. A stored `…/*` entry matches a request path that equals the prefix or begins with `prefix + "/"`; a non-wildcard entry matches only an exact path. Whitelist checks apply only to `GET`/`HEAD`; a `POST` to a whitelisted path is not public.
 
 Accept/reject examples: `/explorer/public-view/folder/*` accepts (and covers `/explorer/public-view/folder/readme.md`); `explorer/public-view` (no leading slash), `/explorer/../secret` (traversal), `/%2Fsecret` (encoded slash), `/explorer/*/file` and `/*/edit` and `/**` (mid/double wildcard) all reject.
 
+Persisted `httpRoutes` entries without an access field remain public for compatibility. Persisted entries may also declare `access: "authenticated"` or `access: "authenticated"` to require router authentication for matching routes. Invalid explicit persisted access values fail closed: they are ignored for route-access decisions rather than guessed as public.
+
+Manifest-declared `routerAccess.httpRoutes` are evaluated as runtime route-access declarations beside persisted `httpRoutes`. They are not written into `policy-state.json`; persisted operator policy remains the administrative source of truth. Manifest entries may be array entries or object entries, use `access` or `mode`, and are expanded from agent-relative paths to `/<routeKey><path>` before matching. At decision time, protected matches win over public matches across persisted and manifest sources so overlapping declarations fail closed. Public matches allow anonymous `GET`/`HEAD` only; protected matches require user-authenticated session handling for every method, using the route-auth fallback and fail-closed behavior defined in DS005 and DS011. Guest auth mode and guest sessions do not satisfy protected route access.
+
 ### Internal (Non-Whitelistable) Routes
 
-`/whitelist/command`, `/auth` and `/auth/*`, `/admin` and `/admin/*`, any path with an `__agent` segment (`/__agent/*` and `/<agent>/__agent/*`), `/metrics`, `/health/internal`, the bare root `/`, and the root wildcard `/*` are internal. `WhitelistPath.isInternal` enforces this both at write time (the add/remove commands return `INTERNAL_ROUTE_NOT_ALLOWED`) and at match time (`HttpRouteWhitelist.isReachableByGuest` rejects an internal request path, and ignores any internal entry in a hand-corrupted state file), so a corrupted state cannot open a private route, and a broad wildcard entry cannot expose an internal sub-route. Root forms are reserved router-owned in `RoutingServer.isRouterOwnedPath`; additionally, `hasInternalAgentSegment` (`cli/server/internalAgentPath.js`) refuses any path with an `__agent` segment — raw or percent-encoded (`%5F%5Fagent`) — at the very top of the request dispatch (before auth, http-service routing, and passthrough), and again on the synthesized upstream path of an `httpServices` route so an `internalPrefix` cannot rewrite an innocent external path into an agent control-plane path. An authenticated user therefore cannot reach `/<agent>/__agent/*` (e.g. the share-authorizer control plane); the router reaches those itself with a minted Router Request over a direct loopback call. All transparent agent proxying also strips caller-supplied identity headers.
+`/policy/command`, `/auth` and `/auth/*`, `/admin` and `/admin/*`, any path with an `__agent` segment (`/__agent/*` and `/<agent>/__agent/*`), `/metrics`, `/health/internal`, the bare root `/`, and the root wildcard `/*` are internal. `WhitelistPath.isInternal` enforces this both at write time (the add/remove commands return `INTERNAL_ROUTE_NOT_ALLOWED`) and at match time (`HttpRouteWhitelist.isReachableByGuest` rejects an internal request path, and ignores any internal entry in a hand-corrupted state file), so a corrupted state cannot open a private route, and a broad wildcard entry cannot expose an internal sub-route. Manifest-declared route access uses the same normalized internal-route rejection after expansion, and raw or encoded `__agent` control-plane segments cannot become public or protected. Agent-relative `/auth/...`, `/admin/...`, and `/metrics` declarations expand under `/<routeKey>/...` and are normal agent paths rather than router-root internal paths. Root forms are reserved router-owned in `RoutingServer.isRouterOwnedPath`; additionally, `hasInternalAgentSegment` (`cli/server/internalAgentPath.js`) refuses any path with an `__agent` segment — raw or percent-encoded (`%5F%5Fagent`) — at the very top of the request dispatch (before auth, http-service routing, and passthrough), and again on the synthesized upstream path of an `httpServices` route so an `internalPrefix` cannot rewrite an innocent external path into an agent control-plane path. An authenticated user therefore cannot reach `/<agent>/__agent/*` (e.g. the share-authorizer control plane); the router reaches those itself with a minted Router Request over a direct loopback call. All transparent agent proxying also strips caller-supplied identity headers.
 
 ### MCP Tool Policy (`mcpTools`) and Access Classes
 
@@ -65,14 +69,14 @@ MCP **resources** (`resources/read`, `resources/list`) are not part of the `agen
 
 ### Single Administrative Endpoint
 
-`POST /whitelist/command` (`cli/server/policy/`) is authenticated (User Session cookie) and never whitelistable; agents cannot present a session cookie and are rejected. The endpoint is implemented as a Command bus — a `PolicyCommandInvoker` dispatches to one `WhitelistCommand` class per command via a `PolicyCommandRegistry`, over a `PolicyStateRepository`, `HttpRouteWhitelist`, `McpToolPolicy`, and `ShareAuthorizer` (DS contract unchanged). Namespaces and authorization:
+`POST /policy/command` (`cli/server/policy/`) is authenticated (User Session cookie) and never whitelistable; agents cannot present a session cookie and are rejected. The endpoint is implemented as a Command bus — a `PolicyCommandInvoker` dispatches to one `WhitelistCommand` class per command via a `PolicyCommandRegistry`, over a `PolicyStateRepository`, `HttpRouteWhitelist`, `McpToolPolicy`, and `ShareAuthorizer` (DS contract unchanged). Namespaces and authorization:
 
 | Command | Caller | Effect |
 | --- | --- | --- |
-| `http.whitelist.add` | admin, or a normal user the owning agent's share authorizer approves | add an exact route or `…/*` |
-| `http.whitelist.remove` | admin, or share-authorized user | remove a route |
-| `http.whitelist.check` | any authenticated user | is this path public? |
-| `http.whitelist.list` | any authenticated user | list entries |
+| `http.route.set` | admin, or a normal user the owning agent's share authorizer approves | add an exact route or `…/*` |
+| `http.route.remove` | admin, or share-authorized user | remove a route |
+| `http.route.check` | any authenticated user | is this path public? |
+| `http.route.list` | any authenticated user | list entries |
 | `mcp.policy.set` | admin only | set `access` for `agent + tool` |
 | `mcp.policy.get` | admin only | read a policy entry |
 | `mcp.policy.list` | admin only | list policy entries |
@@ -81,7 +85,7 @@ Request `{ "command": "mcp.policy.set", "agent": "dpu", "tool": "dpu_agent_polic
 
 ### Public Sharing by Normal Users (Share Authorizer)
 
-The router cannot infer resource ownership from a path. For a normal-user `http.whitelist.add`/`remove`, it calls the owning agent (the first path segment) at `POST /<agent>/__agent/public-route-share/authorize` (a router-request authenticated control-plane call, `HttpShareAuthorizer.js`). Absent, unreachable, or non-affirmative ⇒ deny (`FORBIDDEN`). The full publish UX is deferred (plan Phase 8); this bridge keeps normal-user publishing closed by default while admins may always manage routes.
+The router cannot infer resource ownership from a path. For a normal-user `http.route.set`/`remove`, it calls the owning agent (the first path segment) at `POST /<agent>/__agent/public-route-share/authorize` (a router-request authenticated control-plane call, `HttpShareAuthorizer.js`). Absent, unreachable, or non-affirmative ⇒ deny (`FORBIDDEN`). The full publish UX is deferred (plan Phase 8); this bridge keeps normal-user publishing closed by default while admins may always manage routes.
 
 ### Persistence and Atomic Writes
 
@@ -117,11 +121,14 @@ Response: Fail-closed. A newly added tool, an unknown access class, a disabled e
 Response: An admin must be able to override agent-declared intent — for example to lock a tool down to `admin` or `internal` regardless of what the agent shipped. Persisted policy is the operator's source of truth; tags only seed entries that have no persisted decision yet, and an invalid tag set yields no default (deny) rather than a guessed one.
 
 ### Question #4: Why route all administration through one endpoint that cannot be whitelisted?
-Response: A single authenticated, audited control surface is easy to reason about and to log. Whitelisting it would let the access policy administer itself anonymously, so `/whitelist/command` is reserved as an internal router-owned route and blocked from the whitelist at both write and match time.
+Response: A single authenticated, audited control surface is easy to reason about and to log. Whitelisting it would let the access policy administer itself anonymously, so `/policy/command` is reserved as an internal router-owned route and blocked from the whitelist at both write and match time.
 
 ### Question #5: Why is persistence split into a domain repository and a separate store/sink strategy?
 Response: The filesystem is an implementation detail, not part of the access-control contract. `mutate(updater)` is already a backend-agnostic read-modify-write transaction, and the fail-closed validation/indexing/caching is security-critical logic that must exist in exactly one place. Putting the raw load/store behind a `PolicyStateStore`/`PolicyAuditSink` port (Strategy/Adapter) lets a database replace the JSON file by writing one small adapter, with zero re-implementation of the fail-closed rules and no change to `HttpRouteWhitelist`, `McpToolPolicy`, or the command bus. The alternative — making the repository itself an interface per backend — was rejected because it would duplicate the validation, indexing, cache, and `mutate` transaction into every backend, multiplying the surface where a fail-open bug could hide.
 
+### Question #6: Why do manifest declarations live beside persisted `httpRoutes` instead of being written into policy state?
+Response: Persisted `httpRoutes` are operator-administered policy, while `routerAccess.httpRoutes` is agent-declared routing intent loaded from enabled manifests. Merging them only at decision time preserves that ownership boundary, keeps policy-state audits focused on administrative changes, and still lets the router apply one fail-closed precedence rule: any protected match from either source beats public.
+
 ## Conclusion
 
-The router owns two fail-closed access-control collections persisted in `policy-state.json`: a read-only path-based HTTP whitelist for guests and an `agent + tool` MCP policy for users and agents. Tags bootstrap defaults but persisted admin policy wins; a single audited endpoint administers both; internal routes can never be whitelisted; and corrupt or missing policy denies. Together with DS013's per-agent request-signed JWTs, this gives Ploinky an explicit, operator-managed, fail-closed access model.
+The router owns two fail-closed access-control collections persisted in `policy-state.json`: a path-based HTTP route policy for guests and protected route authentication, and an `agent + tool` MCP policy for users and agents. Tags bootstrap defaults but persisted admin policy wins; manifest-declared HTTP route access is merged at decision time without being persisted; a single audited endpoint administers persisted policy; internal routes can never be whitelisted or manifest-opened; and corrupt or missing policy denies. Together with DS013's per-agent request-signed JWTs, this gives Ploinky an explicit, operator-managed, fail-closed access model.
