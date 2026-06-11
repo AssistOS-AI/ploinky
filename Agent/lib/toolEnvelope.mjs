@@ -89,7 +89,9 @@ export function deriveActor(envelope) {
     const grant = extractInvocationGrant(envelope);
     const metadata = extractMetadata(envelope);
     if (grant) {
-        const callerPrincipal = String(grant.caller || grant.sub || '').trim();
+        const callerPrincipal = grant.caller && typeof grant.caller === 'object'
+            ? String(grant.caller.id || '').trim()
+            : String(grant.caller || grant.sub || '').trim();
         const delegated = (grant.usr || grant.user) && typeof (grant.usr || grant.user) === 'object' ? (grant.usr || grant.user) : null;
         return {
             authenticated: true,

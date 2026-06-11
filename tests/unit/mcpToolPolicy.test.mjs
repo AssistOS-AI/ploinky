@@ -36,6 +36,13 @@ const USER = new Caller({ kind: 'user', isAdmin: false, roles: ['user'] });
 const ADMIN = new Caller({ kind: 'user', isAdmin: true, roles: ['user', 'admin'] });
 const GUEST = new Caller({ kind: 'guest', isAdmin: false, roles: ['guest'] });
 const AGENT = new Caller({ kind: 'agent', id: 'agent:a/b' });
+const DELEGATED_AGENT = new Caller({
+    kind: 'agent',
+    id: 'agent:AssistOSExplorer/onlyOffice',
+    delegatedUser: { id: 'local:alice', username: 'alice', roles: ['user'] },
+    delegatedTool: 'authed',
+    sourceAgentId: 'agent:AssistOSExplorer/onlyOffice',
+});
 
 test('accessFromTags maps tags and rejects invalid combos', () => {
     assert.deepEqual(policy.accessFromTags([]), { access: 'authenticated' });
@@ -95,6 +102,43 @@ test('evaluate enforces the access-class matrix (fail-closed on missing/disabled
     assert.equal(policy.evaluate({ agent: 'a', tool: 'missing', caller: USER }).code, 'AGENT_POLICY_DENIED');
 });
 
+test('plain agent is denied for authenticated tools', () => {
+    writePolicy([mcpEntry('a', 'authed', 'authenticated')]);
+    const result = policy.evaluate({ agent: 'a', tool: 'authed', caller: AGENT });
+    assert.equal(result.allow, false);
+    assert.equal(result.code, 'AGENT_POLICY_DENIED');
+});
+
+test('agent with verified user delegation may call listed authenticated tool', () => {
+    writePolicy([mcpEntry('a', 'authed', 'authenticated')]);
+    const result = policy.evaluate({ agent: 'a', tool: 'authed', caller: DELEGATED_AGENT });
+    assert.equal(result.allow, true);
+    assert.equal(result.delegated, true);
+});
+
+test('delegated agent is denied for tools outside the grant', () => {
+    writePolicy([mcpEntry('a', 'other', 'authenticated')]);
+    const result = policy.evaluate({ agent: 'a', tool: 'other', caller: DELEGATED_AGENT });
+    assert.equal(result.allow, false);
+    assert.equal(result.code, 'AGENT_POLICY_DENIED');
+});
+
+test('delegated agent is denied when mcp policy denies the source target tool tuple', () => {
+    writePolicy([mcpEntry('a', 'authed', 'internal')]);
+    const result = policy.evaluate({ agent: 'a', tool: 'authed', caller: DELEGATED_AGENT });
+    assert.equal(result.allow, false);
+    assert.equal(result.code, 'AGENT_POLICY_DENIED');
+});
+
+test('delegated agent does not gain admin or internal access', () => {
+    writePolicy([
+        mcpEntry('a', 'adminTool', 'admin'),
+        mcpEntry('a', 'internalTool', 'internal'),
+    ]);
+    assert.equal(policy.evaluate({ agent: 'a', tool: 'adminTool', caller: DELEGATED_AGENT }).code, 'AGENT_POLICY_DENIED');
+    assert.equal(policy.evaluate({ agent: 'a', tool: 'internalTool', caller: DELEGATED_AGENT }).code, 'AGENT_POLICY_DENIED');
+});
+
 test('Caller.fromRequest classifies users, admins, guests, and agents', () => {
     assert.equal(Caller.fromRequest({ user: { roles: ['user'] } }).kind, 'user');
     assert.equal(Caller.fromRequest({ user: { roles: ['user'] } }).isAdmin, false);
@@ -102,6 +146,17 @@ test('Caller.fromRequest classifies users, admins, guests, and agents', () => {
     assert.equal(Caller.fromRequest({ user: { roles: ['guest'] } }).kind, 'guest');
     assert.equal(Caller.fromRequest({ user: { roles: ['guest', 'admin'] } }).isAdmin, false);
     assert.equal(Caller.fromRequest({ delegatedAgentVerified: { callerPrincipal: 'agent:x/y' } }).kind, 'agent');
+    const delegated = Caller.fromRequest({
+        delegatedAgentVerified: {
+            callerPrincipal: 'agent:x/y',
+            userDelegation: {
+                user: { id: 'local:alice', username: 'alice', roles: ['user'] },
+                delegation: { tool: 'docs_search', sourceAgentId: 'agent:x/y' },
+            },
+        },
+    });
+    assert.equal(delegated.delegatedUser.id, 'local:alice');
+    assert.equal(delegated.delegatedTool, 'docs_search');
     assert.equal(Caller.fromRequest({}).kind, 'none');
 });
 

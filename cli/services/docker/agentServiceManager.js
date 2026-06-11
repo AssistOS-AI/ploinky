@@ -508,6 +508,15 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         throw new Error(`[profile] ${agentName}: profile '${activeProfile}' not found. Available: ${availableProfiles.join(', ')}`);
     }
     assertManifestEnvProfileCompleteness(manifest, profileConfig, { agentName, repoName, profileName: activeProfile });
+
+    // Ensure workspace structure exists and run preinstall [HOST] before any
+    // image-dependent work. Hooks may build local images or seed vars that image
+    // resolution and dependency-cache probes consume.
+    const preLifecycle = runPreContainerLifecycle(agentName, repoName, agentPath, activeProfile);
+    if (!preLifecycle.success) {
+        throw new Error(`[profile] ${agentName}: pre-container lifecycle failed: ${preLifecycle.errors.join('; ')}`);
+    }
+
     const manifestImage = resolveManifestImage(manifest, profileConfig, { agentName, repoName });
     let image = manifestImage;
     const useProfileLifecycle = Boolean(profileConfig);
@@ -557,14 +566,6 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     // The paths might be symlinks like $CWD/code/agent -> .ploinky/repos/repo/agent
     const agentCodePath = resolveSymlinkPath(agentCodePathSymlink);
     const agentSkillsPath = resolveSymlinkPath(agentSkillsPathSymlink);
-
-    // Ensure workspace structure exists and run preinstall [HOST] hook before container creation
-    // The preinstall hook can set ploinky vars that will be available when the container is created
-    const preLifecycle = runPreContainerLifecycle(agentName, repoName, agentPath, activeProfile);
-    if (!preLifecycle.success) {
-        // preinstall failure is fatal - don't create the container
-        throw new Error(`[profile] ${agentName}: pre-container lifecycle failed: ${preLifecycle.errors.join('; ')}`);
-    }
 
     // Ensure agent work directory exists
     createAgentWorkDir(agentName);

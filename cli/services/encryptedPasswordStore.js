@@ -23,6 +23,14 @@ function defaultStore() {
     };
 }
 
+function resolvePasswordStoreFile() {
+    try {
+        return path.join(path.resolve(process.cwd()), '.ploinky', 'passwords.enc');
+    } catch (_) {
+        return PASSWORD_STORE_FILE;
+    }
+}
+
 function resolveMasterKey() {
     return resolveConfiguredMasterKey({ purpose: 'local password storage' });
 }
@@ -72,12 +80,13 @@ function encryptStoreToPacked(store) {
 }
 
 function readPasswordStore() {
-    if (!fs.existsSync(PASSWORD_STORE_FILE)) {
+    const passwordStoreFile = resolvePasswordStoreFile();
+    if (!fs.existsSync(passwordStoreFile)) {
         return defaultStore();
     }
     let raw;
     try {
-        raw = fs.readFileSync(PASSWORD_STORE_FILE, 'utf8').trim();
+        raw = fs.readFileSync(passwordStoreFile, 'utf8').trim();
     } catch (error) {
         throw new Error(`Unable to read encrypted password store: ${error?.message || String(error)}`);
     }
@@ -94,13 +103,14 @@ function readPasswordStore() {
 }
 
 function writePasswordStore(store) {
+    const passwordStoreFile = resolvePasswordStoreFile();
     const packed = encryptStoreToPacked(store);
-    fs.mkdirSync(path.dirname(PASSWORD_STORE_FILE), { recursive: true });
-    const tempPath = `${PASSWORD_STORE_FILE}.${process.pid}.${Date.now()}.tmp`;
+    fs.mkdirSync(path.dirname(passwordStoreFile), { recursive: true });
+    const tempPath = `${passwordStoreFile}.${process.pid}.${Date.now()}.tmp`;
     fs.writeFileSync(tempPath, `${packed}\n`, { encoding: 'utf8', mode: 0o600 });
-    fs.renameSync(tempPath, PASSWORD_STORE_FILE);
+    fs.renameSync(tempPath, passwordStoreFile);
     try {
-        fs.chmodSync(PASSWORD_STORE_FILE, 0o600);
+        fs.chmodSync(passwordStoreFile, 0o600);
     } catch (_) { }
 }
 

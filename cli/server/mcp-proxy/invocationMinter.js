@@ -38,6 +38,63 @@ function normalizeActor(actor) {
     };
 }
 
+function normalizeCaller(caller) {
+    if (!caller || typeof caller !== 'object') return undefined;
+    const id = String(caller.id || '').trim();
+    if (!id) return undefined;
+    return {
+        kind: caller.kind === 'user' || caller.kind === 'guest' ? caller.kind : 'agent',
+        id,
+        roles: Array.isArray(caller.roles) ? caller.roles.map((r) => String(r || '')).filter(Boolean) : [],
+    };
+}
+
+function normalizeUserClaims(usr) {
+    if (!usr || typeof usr !== 'object') return undefined;
+    const id = String(usr.id || usr.sub || '').trim();
+    if (!id) return undefined;
+    return {
+        id,
+        username: String(usr.username || usr.preferred_username || '').trim(),
+        email: String(usr.email || '').trim(),
+        roles: Array.isArray(usr.roles) ? usr.roles.map((role) => String(role || '')).filter(Boolean) : [],
+    };
+}
+
+function normalizeDelegation(delegation) {
+    if (!delegation || typeof delegation !== 'object') return undefined;
+    const jti = String(delegation.jti || '').trim();
+    if (!jti) return undefined;
+    return {
+        jti,
+        scope: Array.isArray(delegation.scope) ? delegation.scope.map((scope) => String(scope || '')).filter(Boolean) : [],
+        sourceAgentId: String(delegation.sourceAgentId || '').trim(),
+    };
+}
+
+// Plural `delegations` — router-minted downstream grants the target agent may
+// present back to the router later. Distinct from the singular `delegation`
+// claim above, which is metadata about the delegation this call ran under.
+function normalizeDelegations(delegations) {
+    if (!delegations || typeof delegations !== 'object' || Array.isArray(delegations)) return undefined;
+    const out = {};
+    for (const [key, entry] of Object.entries(delegations)) {
+        const normalizedKey = String(key || '').trim();
+        if (!/^[A-Za-z0-9_.-]+$/.test(normalizedKey)) continue;
+        const token = String(entry?.token || '').trim();
+        const targetAgentId = String(entry?.targetAgentId || '').trim();
+        if (!token || !targetAgentId) continue;
+        out[normalizedKey] = {
+            token,
+            expiresAt: String(entry?.expiresAt || '').trim(),
+            targetAgentId,
+            tools: Array.isArray(entry?.tools) ? entry.tools.map((value) => String(value || '').trim()).filter(Boolean) : [],
+            scope: Array.isArray(entry?.scope) ? entry.scope.map((value) => String(value || '').trim()).filter(Boolean) : [],
+        };
+    }
+    return Object.keys(out).length ? out : undefined;
+}
+
 export function resolveProviderPrincipal({ providerAgentRef, providerPrincipal }) {
     if (providerPrincipal) return String(providerPrincipal).trim();
     const descriptor = resolveAgentDescriptor(providerAgentRef);
@@ -56,6 +113,10 @@ export function buildRouterRequest({
     targetAgentId,
     sub,
     actor,
+    caller,
+    usr,
+    delegation,
+    delegations,
     method,
     path,
     tool,
@@ -84,6 +145,22 @@ export function buildRouterRequest({
     };
     if (tool !== undefined && tool !== null && String(tool) !== '') {
         payload.tool = String(tool);
+    }
+    const normalizedCaller = normalizeCaller(caller);
+    if (normalizedCaller) {
+        payload.caller = normalizedCaller;
+    }
+    const normalizedUser = normalizeUserClaims(usr);
+    if (normalizedUser) {
+        payload.usr = normalizedUser;
+    }
+    const normalizedDelegation = normalizeDelegation(delegation);
+    if (normalizedDelegation) {
+        payload.delegation = normalizedDelegation;
+    }
+    const normalizedDelegations = normalizeDelegations(delegations);
+    if (normalizedDelegations) {
+        payload.delegations = normalizedDelegations;
     }
     const secret = deriveAgentRequestSecret(target, { encoding: 'buffer' });
     const token = signHmacJwt({ payload, secret });

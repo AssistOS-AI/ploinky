@@ -1,17 +1,29 @@
 import fs from 'fs';
-import { AGENTS_FILE, PLOINKY_DIR } from './config.js';
+
+function resolveWorkspaceRoot() {
+    return process.env.PLOINKY_WORKSPACE_ROOT || process.cwd();
+}
+
+function resolvePloinkyDir() {
+    return `${resolveWorkspaceRoot()}/.ploinky`;
+}
+
+function resolveAgentsFile() {
+    return `${resolvePloinkyDir()}/agents.json`;
+}
 
 function ensureDirs() {
     try {
-        fs.mkdirSync(PLOINKY_DIR, { recursive: true });
+        fs.mkdirSync(resolvePloinkyDir(), { recursive: true });
     } catch (_) {}
 }
 
 export function loadAgents() {
     ensureDirs();
     try {
-        if (!fs.existsSync(AGENTS_FILE)) return {};
-        const data = fs.readFileSync(AGENTS_FILE, 'utf8');
+        const agentsFile = resolveAgentsFile();
+        if (!fs.existsSync(agentsFile)) return {};
+        const data = fs.readFileSync(agentsFile, 'utf8');
         return JSON.parse(data || '{}') || {};
     } catch (_) {
         return {};
@@ -21,7 +33,7 @@ export function loadAgents() {
 export function saveAgents(map) {
     ensureDirs();
     try {
-        fs.writeFileSync(AGENTS_FILE, JSON.stringify(map || {}, null, 2));
+        fs.writeFileSync(resolveAgentsFile(), JSON.stringify(map || {}, null, 2));
     } catch (_) {}
 }
 

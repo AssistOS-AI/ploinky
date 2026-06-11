@@ -136,6 +136,15 @@ export class McpToolPolicy {
         const access = entry.access;
         const kind = caller?.kind;
         if (kind === 'agent') {
+            const delegatedUser = caller?.delegatedUser && typeof caller.delegatedUser === 'object'
+                ? caller.delegatedUser
+                : null;
+            if (delegatedUser) {
+                if (access === 'authenticated' && String(caller?.delegatedTool || '') === String(tool || '')) {
+                    return { allow: true, access, delegated: true };
+                }
+                return { allow: false, code: 'AGENT_POLICY_DENIED', status: 403 };
+            }
             return access === 'internal'
                 ? { allow: true, access }
                 : { allow: false, code: 'AGENT_POLICY_DENIED', status: 403 };

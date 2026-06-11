@@ -314,6 +314,14 @@ function buildReadinessEntryFromNode(node, route, staticLabel) {
   };
 }
 
+function buildBlockingReadinessEntryFromNode(node, route, staticLabel) {
+  const entry = buildReadinessEntryFromNode(node, route, staticLabel);
+  if (!route?.hostPort && entry.protocol !== 'none') {
+    throw new Error(`${node.isStatic ? 'Static agent' : 'Dependent agent'} '${formatGraphNodeLabel(node, staticLabel)}' did not expose a host port.`);
+  }
+  return entry;
+}
+
 function formatReadyProgress({ elapsedMs, timeoutMs, portOpen, protocol, stage, lastError }) {
   const elapsedSec = Math.floor(Math.max(0, elapsedMs) / 1000);
   const timeoutSec = Math.floor(Math.max(0, timeoutMs) / 1000);
@@ -796,10 +804,7 @@ async function startWorkspace(staticAgentArg, portArg, { refreshComponentToken, 
         const registryRecord = registryName ? reg[registryName] : null;
         const routeKey = registryRecord?.alias || node.alias || node.shortAgentName;
         const route = cfg.routes?.[routeKey] || null;
-        if (!route?.hostPort) {
-          throw new Error(`${node.isStatic ? 'Static agent' : 'Dependent agent'} '${formatGraphNodeLabel(node, staticAgent)}' did not expose a host port.`);
-        }
-        return buildReadinessEntryFromNode(node, route, staticAgent);
+        return buildBlockingReadinessEntryFromNode(node, route, staticAgent);
       });
 
       await waitForReadinessEntries(readinessEntries);
@@ -1003,7 +1008,8 @@ async function reinstallAgent(agentName) {
             forceRecreate: true
         });
 
-        if (!hostPort) {
+        const readinessProtocol = resolveAgentReadinessProtocol(manifest);
+        if (!hostPort && readinessProtocol !== 'none') {
             throw new Error(`Failed to resolve host port for restarted agent '${short}'.`);
         }
         console.log(`[reinstall] reinstalled '${short}' [container: ${newContainerName}]`);
@@ -1022,7 +1028,11 @@ async function reinstallAgent(agentName) {
             cfg.routes[routeKey].repo = repoName;
             cfg.routes[routeKey].agent = short;
             if (registryRecord?.record.alias) cfg.routes[routeKey].alias = registryRecord.record.alias;
-            cfg.routes[routeKey].hostPort = hostPort;
+            if (hostPort) {
+                cfg.routes[routeKey].hostPort = hostPort;
+            } else {
+                delete cfg.routes[routeKey].hostPort;
+            }
 
             const savedCfg = workspaceSvc.getConfig();
             if (!cfg.static && savedCfg?.static?.agent) {
@@ -1050,6 +1060,16 @@ async function reinstallAgent(agentName) {
             cfg.port = port;
             fs.mkdirSync(path.dirname(routingFile), { recursive: true });
             fs.writeFileSync(routingFile, JSON.stringify(cfg, null, 2));
+
+            if (readinessProtocol !== 'none') {
+                const ready = await waitForAgentReady({ hostPort }, {
+                    timeoutMs: 15000,
+                    protocol: readinessProtocol,
+                });
+                if (!ready) {
+                    console.error(`[reinstall] warning: agent '${short}' (host port ${hostPort}) is not ready yet; if requests 502, run 'ploinky restart'.`);
+                }
+            }
 
             const isRouterUp = (p) => {
                 try {
@@ -1081,6 +1101,7 @@ async function reinstallAgent(agentName) {
 }
 
 export {
+  buildBlockingReadinessEntryFromNode,
   startWorkspace,
   runCli,
   runShell,

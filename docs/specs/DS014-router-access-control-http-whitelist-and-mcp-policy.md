@@ -46,6 +46,15 @@ The identifier is `agent + tool`. `access ∈ {authenticated, internal, admin}`.
 | `admin` | `ADMIN_REQUIRED` | allow | `ADMIN_REQUIRED` | deny |
 | `internal` | deny | deny | deny | allow |
 
+There is one narrow exception to the plain `agent` deny for `authenticated`: a verified delegated-user agent call may satisfy `authenticated` only when all of the following are true at once:
+
+- the source agent first proves its identity with a valid Agent Assertion
+- the router also verifies a router-issued User Delegation Grant bound to that same source agent
+- the grant names the exact target agent and exact tool being invoked
+- the tool policy for that `agent + tool` is `authenticated`
+
+The User Delegation Grant may have reached the source agent through a protected HTTP-service `x-ploinky-auth-info` carrier or through the plural `delegations` claim on a Router Request for a user-originated MCP tool. In the MCP case the grant is minted only after the router has already accepted the user's session, allowed the source tool under `mcpTools`, and matched a configured `mcp-config.json` delegation entry for that exact source tool. Guests never receive MCP-minted delegations. This delegated-user path is intentionally narrower than a direct authenticated browser call because it is tool-scoped, source-bound, scope-bound, time-bound, and router-verified.
+
 Enforcement runs before any Router Request is minted, on both the per-agent proxy (`cli/server/mcp-proxy/index.js`, `tools/call`) and the aggregate surface (`cli/server/routerHandlers.js`, `callEntryTool`). `tools/list` on both surfaces is filtered to the caller's class so a caller never sees a tool it cannot invoke.
 
 MCP **resources** (`resources/read`, `resources/list`) are not part of the `agent + tool` model — per-resource `admin`/`internal` tagging is deferred (plan Phase 8). They are gated as an `authenticated`-class capability (`McpToolPolicy.evaluateResource`): a router-authenticated session caller (`user`/`guest`/admin) may read, while an `agent` (internal) caller is denied `AGENT_POLICY_DENIED` and an anonymous caller `AUTH_REQUIRED`. The gate runs before any Router Request is minted, on both surfaces: a denied `resources/read` is rejected, and `resources/list` returns an empty list (mirroring `tools/list` filtering) rather than leaking resource metadata.

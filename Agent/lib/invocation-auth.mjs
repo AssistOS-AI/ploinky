@@ -20,6 +20,14 @@ function normalizeRoles(value) {
   return Array.isArray(value) ? value.map((role) => String(role || '').trim()).filter(Boolean) : [];
 }
 
+function extractCallerPrincipal(grant) {
+  const caller = grant?.caller;
+  if (caller && typeof caller === 'object') {
+    return String(caller.id || '').trim();
+  }
+  return String(caller || grant?.sub || '').trim();
+}
+
 function normalizeUserPrincipal(value) {
   const raw = String(value || '').trim();
   if (!raw) return null;
@@ -52,10 +60,28 @@ function deriveUserIdentity(grant, actor) {
   return null;
 }
 
+function normalizeDelegationTokens(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const out = {};
+  for (const [key, entry] of Object.entries(value)) {
+    const normalizedKey = String(key || '').trim();
+    const token = String(entry?.token || '').trim();
+    if (!normalizedKey || !token) continue;
+    out[normalizedKey] = {
+      token,
+      expiresAt: String(entry?.expiresAt || ''),
+      targetAgentId: String(entry?.targetAgentId || ''),
+      tools: Array.isArray(entry?.tools) ? entry.tools.map((item) => String(item || '').trim()).filter(Boolean) : [],
+      scope: Array.isArray(entry?.scope) ? entry.scope.map((item) => String(item || '').trim()).filter(Boolean) : []
+    };
+  }
+  return Object.keys(out).length ? out : undefined;
+}
+
 export function authInfoFromInvocation(grant, { invocationToken = '' } = {}) {
   if (!grant || typeof grant !== 'object') return null;
   const out = {};
-  const callerPrincipal = grant.caller || grant.sub || '';
+  const callerPrincipal = extractCallerPrincipal(grant);
   if (callerPrincipal && /^agent:/i.test(callerPrincipal)) {
     out.agent = {
       principalId: callerPrincipal,
@@ -105,8 +131,26 @@ export function authInfoFromInvocation(grant, { invocationToken = '' } = {}) {
       : null,
     scope: Array.isArray(grant.scope) ? [...grant.scope] : [],
     tool: String(grant.tool || ''),
-    workspaceId: String(grant.workspace_id || '')
+    workspaceId: String(grant.workspace_id || ''),
+    caller: grant.caller && typeof grant.caller === 'object'
+      ? {
+          kind: String(grant.caller.kind || ''),
+          id: String(grant.caller.id || ''),
+          roles: normalizeRoles(grant.caller.roles)
+        }
+      : (callerPrincipal ? { kind: 'agent', id: callerPrincipal, roles: [] } : null),
+    delegation: grant.delegation && typeof grant.delegation === 'object'
+      ? {
+          jti: String(grant.delegation.jti || ''),
+          scope: normalizeRoles(grant.delegation.scope),
+          sourceAgentId: String(grant.delegation.sourceAgentId || '')
+        }
+      : null
   };
+  const delegationTokens = normalizeDelegationTokens(grant.delegations);
+  if (delegationTokens) {
+    out.delegations = delegationTokens;
+  }
   out.invocationToken = String(invocationToken || '');
   return out;
 }
