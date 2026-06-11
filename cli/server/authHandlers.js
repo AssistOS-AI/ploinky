@@ -605,7 +605,7 @@ function resolveAuthContext(parsedUrl) {
                 mode: 'guest',
                 policy: {
                     mode: 'guest',
-                    guestScope: serviceRoute.guestScope
+                    guestScope: serviceRoute.guestScope,
                 },
                 record: null
             };
@@ -658,6 +658,66 @@ function resolveAuthContextForRouteKey(routeKey) {
 function isUserAuthenticatedAuthMode(mode) {
     const normalized = String(mode || '').trim().toLowerCase();
     return Boolean(normalized && normalized !== 'none' && normalized !== 'guest');
+}
+
+function resolveAuthenticatedRouteAuthContext(routeKey) {
+    const normalizedRouteKey = String(routeKey || '').trim();
+    const routing = readRouting();
+    const ownerContext = resolveAuthContextForRouteKey(normalizedRouteKey);
+    if (isUserAuthenticatedAuthMode(ownerContext.mode)) return ownerContext;
+
+    const staticRouteKey = String(routing.static?.agent || '').trim();
+    if (staticRouteKey && staticRouteKey !== normalizedRouteKey) {
+        const staticContext = resolveAuthContextForRouteKey(staticRouteKey);
+        if (isUserAuthenticatedAuthMode(staticContext.mode)) {
+            return { ...staticContext, serviceRouteKey: normalizedRouteKey };
+        }
+    }
+
+    return {
+        routeKey: normalizedRouteKey,
+        mode: 'authenticated-unconfigured',
+        policy: { mode: 'authenticated-unconfigured' },
+        record: ownerContext.record || null,
+        error: 'authenticated_http_route_auth_not_configured',
+        errorDetail: 'Authenticated HTTP routes require a user-authenticated route or static-agent auth policy.'
+    };
+}
+
+function resolveGuestRouteAuthContext(routeKey, options = {}) {
+    return {
+        routeKey: String(routeKey || '').trim(),
+        mode: 'guest',
+        policy: {
+            mode: 'guest',
+            guestScope: String(options.guestScope || `http-route:${routeKey || ''}`).trim(),
+        },
+        record: null,
+    };
+}
+
+export function resolveRouteDefaultHttpAccess(routeKey) {
+    const normalizedRouteKey = String(routeKey || '').trim();
+    const context = resolveAuthContextForRouteKey(normalizedRouteKey);
+    if (context.mode === 'guest') {
+        return { access: 'guest', routeKey: normalizedRouteKey, source: 'routeDefault' };
+    }
+    if (isUserAuthenticatedAuthMode(context.mode)) {
+        return { access: 'authenticated', routeKey: normalizedRouteKey, source: 'routeDefault' };
+    }
+
+    const staticRouteKey = String(readRouting().static?.agent || '').trim();
+    if (staticRouteKey && staticRouteKey !== normalizedRouteKey) {
+        const staticContext = resolveAuthContextForRouteKey(staticRouteKey);
+        if (isUserAuthenticatedAuthMode(staticContext.mode)) {
+            return { access: 'authenticated', routeKey: normalizedRouteKey, source: 'routeDefault' };
+        }
+        if (staticContext.mode === 'guest') {
+            return { access: 'guest', routeKey: normalizedRouteKey, source: 'routeDefault' };
+        }
+    }
+
+    return { access: 'guest', routeKey: normalizedRouteKey, source: 'routeDefault' };
 }
 
 function getLocalRouteKey(parsedUrl, session = null, fallback = '') {
@@ -856,13 +916,20 @@ export async function ensureAgentAuthenticated(req, res, parsedUrl) {
     };
 }
 
-export async function ensureAuthenticated(req, res, parsedUrl) {
-    const authContext = resolveAuthContext(parsedUrl);
+async function ensureAuthenticatedWithContext(req, res, parsedUrl, authContext) {
+    if (authContext.error === 'authenticated_http_route_auth_not_configured') {
+        sendJson(res, 503, {
+            ok: false,
+            error: authContext.error,
+            detail: authContext.errorDetail || 'Authenticated HTTP routes require a user-authenticated route or static-agent auth policy.',
+        });
+        return { ok: false, error: authContext.error };
+    }
     if (authContext.error === 'protected_http_service_auth_not_configured') {
         sendJson(res, 503, {
             ok: false,
             error: authContext.error,
-            detail: 'Protected HTTP service routes require an authenticated route or static-agent auth policy.'
+            detail: authContext.errorDetail || 'Protected HTTP service routes require an authenticated route or static-agent auth policy.'
         });
         return { ok: false, error: authContext.error };
     }
@@ -876,18 +943,26 @@ export async function ensureAuthenticated(req, res, parsedUrl) {
     const cookies = parseCookies(req);
 
     if (authContext.mode === 'guest') {
-        const forceGuest = authContext.policy?.forceGuest === true;
-        if (!forceGuest) {
-            const existingAuth = cookies.get(LOCAL_AUTH_COOKIE_NAME);
-            if (existingAuth) {
-                const authSession = getLocalSession(existingAuth, { policy: authContext.policy });
-                if (authSession) {
-                    req.user = authSession.user;
-                    req.session = authSession;
-                    req.sessionId = existingAuth;
-                    req.authMode = 'local';
-                    return { ok: true, session: authSession };
-                }
+        const existingAuth = cookies.get(LOCAL_AUTH_COOKIE_NAME);
+        if (existingAuth) {
+            const authSession = getLocalSession(existingAuth, { policy: authContext.policy });
+            if (authSession) {
+                req.user = authSession.user;
+                req.session = authSession;
+                req.sessionId = existingAuth;
+                req.authMode = 'local';
+                return { ok: true, session: authSession };
+            }
+        }
+        const ssoCookie = cookies.get(SSO_AUTH_COOKIE_NAME);
+        if (ssoCookie && authService.isConfigured()) {
+            const ssoSession = authService.getSession(ssoCookie);
+            if (ssoSession && (!ssoSession.expiresAt || Date.now() <= ssoSession.expiresAt)) {
+                req.user = ssoSession.user;
+                req.session = ssoSession;
+                req.sessionId = ssoCookie;
+                req.authMode = 'sso';
+                return { ok: true, session: ssoSession };
             }
         }
         const guestCookie = cookies.get(GUEST_AUTH_COOKIE_NAME);
@@ -970,6 +1045,39 @@ export async function ensureAuthenticated(req, res, parsedUrl) {
         }
     } catch (_) { }
     return { ok: true, session };
+}
+
+export async function ensureAuthenticated(req, res, parsedUrl) {
+    return ensureAuthenticatedWithContext(req, res, parsedUrl, resolveAuthContext(parsedUrl));
+}
+
+export async function ensureHttpRouteAccess(req, res, parsedUrl, decision) {
+    if (decision?.access === 'public') return { ok: true };
+    if (decision?.access === 'guest') {
+        return ensureAuthenticatedWithContext(
+            req,
+            res,
+            parsedUrl,
+            resolveGuestRouteAuthContext(decision.routeKey, decision),
+        );
+    }
+    if (decision?.access === 'authenticated') {
+        return ensureAuthenticatedWithContext(
+            req,
+            res,
+            parsedUrl,
+            resolveAuthenticatedRouteAuthContext(decision.routeKey),
+        );
+    }
+
+    const status = decision?.access === 'deny' ? (decision.status || 403) : 403;
+    const code = decision?.access === 'deny' ? (decision.code || 'HTTP_ROUTE_ACCESS_DENIED') : 'HTTP_ROUTE_ACCESS_DENIED';
+    sendJson(res, status, { ok: false, error: code });
+    return { ok: false, error: code };
+}
+
+export async function ensureAuthenticatedForRouteKey(req, res, parsedUrl, routeKey) {
+    return ensureAuthenticatedWithContext(req, res, parsedUrl, resolveAuthenticatedRouteAuthContext(routeKey));
 }
 
 function parseUserAdminPath(pathname = '') {

@@ -53,7 +53,7 @@ function makeRequest({ method = 'GET', url, body, cookie = '', accept = 'applica
     return req;
 }
 
-function writeWorkspaceConfig(ploinkyDir) {
+function writeWorkspaceConfig(ploinkyDir, { staticAuthMode = 'local' } = {}) {
     writeFileSync(path.join(ploinkyDir, '.secrets'), '# test secrets\n');
     const webAdminManifestDir = path.join(ploinkyDir, 'repos', 'webassist', 'webAdmin');
     const serviceManifestDir = path.join(ploinkyDir, 'repos', 'services', 'guestAgent');
@@ -62,20 +62,35 @@ function writeWorkspaceConfig(ploinkyDir) {
     writeFileSync(path.join(webAdminManifestDir, 'manifest.json'), JSON.stringify({
         webchat: { auth: 'static' },
     }, null, 2));
+    const webAssistManifestDir = path.join(ploinkyDir, 'repos', 'webassist', 'webAssist');
+    mkdirSync(webAssistManifestDir, { recursive: true });
+    writeFileSync(path.join(webAssistManifestDir, 'manifest.json'), JSON.stringify({
+        httpServices: [
+            {
+                externalPrefix: '/services/guest-owned/',
+                internalPrefix: '/api/',
+                access: 'authenticated',
+            },
+        ],
+    }, null, 2));
     writeFileSync(path.join(serviceManifestDir, 'manifest.json'), JSON.stringify({
         httpServices: [
             {
                 externalPrefix: '/public-services/meeting-room/',
                 internalPrefix: '/api/',
-                auth: 'guest',
+                access: 'guest',
                 guestScope: 'meeting-room-public-service',
-                forceGuest: true,
             },
             {
                 externalPrefix: '/public-services/visitor-support/',
                 internalPrefix: '/api/',
-                auth: 'guest',
+                access: 'guest',
                 guestScope: 'visitor-support-public-service',
+            },
+            {
+                externalPrefix: '/services/locked/',
+                internalPrefix: '/api/',
+                access: 'authenticated',
             },
         ],
     }, null, 2));
@@ -84,7 +99,9 @@ function writeWorkspaceConfig(ploinkyDir) {
             type: 'agent',
             agentName: 'explorer',
             repoName: 'AchillesIDE',
-            auth: { mode: 'local', usersVar: 'PLOINKY_AUTH_EXPLORER_USERS' },
+            auth: staticAuthMode === 'local'
+                ? { mode: 'local', usersVar: 'PLOINKY_AUTH_EXPLORER_USERS' }
+                : { mode: 'none' },
         },
         webAssist: {
             type: 'agent',
@@ -108,7 +125,7 @@ function writeWorkspaceConfig(ploinkyDir) {
     writeFileSync(path.join(ploinkyDir, 'routing.json'), JSON.stringify({
         routes: {
             explorer: { agent: 'explorer', repo: 'AchillesIDE', hostPort: 55289 },
-            webAssist: { agent: 'webAssist', repo: 'webassist', hostPort: 53659 },
+            webAssist: { agent: 'webAssist', repo: 'webassist', hostPort: 53659, hostPath: webAssistManifestDir },
             webAdmin: { agent: 'webAdmin', repo: 'webassist', hostPort: 41155 },
             guestAgent: {
                 agent: 'guestAgent',
@@ -124,11 +141,11 @@ function writeWorkspaceConfig(ploinkyDir) {
     }, null, 2));
 }
 
-async function withAuthModules(t) {
+async function withAuthModules(t, options = {}) {
     const workspace = mkdtempSync(path.join(os.tmpdir(), 'ploinky-guest-auth-'));
     const ploinkyDir = path.join(workspace, '.ploinky');
     mkdirSync(ploinkyDir, { recursive: true });
-    writeWorkspaceConfig(ploinkyDir);
+    writeWorkspaceConfig(ploinkyDir, options);
 
     const previousCwd = process.cwd();
     const previousMasterKey = process.env.PLOINKY_MASTER_KEY;
@@ -147,7 +164,7 @@ async function withAuthModules(t) {
     const nonce = `${Date.now()}-${Math.random()}`;
     const authHandlers = await import(`${pathToFileURL(path.join(REPO_ROOT, 'cli/server/authHandlers.js')).href}?test=${nonce}`);
     const localService = await import(`${pathToFileURL(path.join(REPO_ROOT, 'cli/server/auth/localService.js')).href}?test=${nonce}`);
-    return { authHandlers, localService };
+    return { authHandlers, localService, authService: authHandlers.authService };
 }
 
 test('guest routes use the guest agent policy instead of the static Explorer policy', async (t) => {
@@ -237,78 +254,160 @@ test('guest routes use the guest agent policy instead of the static Explorer pol
     assert.match(String(webAssistChatRes.getHeader('set-cookie') || ''), /^ploinky_guest=/);
 });
 
-test('guest public services use scoped forced guest sessions', async (t) => {
-    const { authHandlers, localService } = await withAuthModules(t);
-    const localJwt = localService.mintSessionJwt({
-        id: 'local:admin',
-        username: 'admin',
-        name: 'Admin',
-        roles: ['local', 'admin']
-    }, 1);
+test('route default keeps static-agent auth for routes with auth mode none', async (t) => {
+    const { authHandlers } = await withAuthModules(t);
+    const decision = authHandlers.resolveRouteDefaultHttpAccess('webAdmin');
+    assert.deepEqual(decision, { access: 'authenticated', routeKey: 'webAdmin', source: 'routeDefault' });
 
-    const guestServiceReq = makeRequest({
-        url: '/public-services/meeting-room/guest?room=room-1&token=invite',
-        cookie: `ploinky_jwt=${localJwt}`
+    const req = makeRequest({
+        method: 'GET',
+        url: '/webAdmin/index.html',
     });
-    const guestServiceRes = new MockResponse();
-    const guestServiceParsedUrl = new URL(guestServiceReq.url, 'http://localhost');
+    const res = new MockResponse();
+    const parsedUrl = new URL(req.url, 'http://localhost');
 
-    const guestServiceResult = await authHandlers.ensureAuthenticated(guestServiceReq, guestServiceRes, guestServiceParsedUrl);
+    const result = await authHandlers.ensureHttpRouteAccess(req, res, parsedUrl, decision);
 
-    assert.equal(guestServiceResult.ok, true);
-    assert.equal(guestServiceReq.authMode, 'guest');
-    assert.equal(guestServiceReq.user?.username, 'visitor');
-    assert.deepEqual(guestServiceReq.user?.roles, ['guest']);
-    assert.match(String(guestServiceRes.getHeader('set-cookie') || ''), /^ploinky_guest=/);
-
-    const guestServiceJwt = String(guestServiceReq.sessionId || '');
-    assert.equal(localService.getSession(guestServiceJwt, { policy: { mode: 'guest' } }), null);
-    assert.equal(
-        localService.getSession(guestServiceJwt, { policy: { mode: 'guest', guestScope: 'meeting-room-public-service' } })?.user?.username,
-        'visitor'
-    );
+    assert.equal(result.ok, false);
+    assert.equal(res.statusCode, 401);
 });
 
-test('guest public services follow normal guest policy unless forceGuest is set', async (t) => {
+test('route default falls back to guest when no user-authenticated static agent exists', async (t) => {
+    const { authHandlers } = await withAuthModules(t, { staticAuthMode: 'none' });
+    const decision = authHandlers.resolveRouteDefaultHttpAccess('webAdmin');
+    assert.deepEqual(decision, { access: 'guest', routeKey: 'webAdmin', source: 'routeDefault' });
+});
+
+test('ensureHttpRouteAccess denies none, deny, missing, and unknown decisions', async (t) => {
+    const { authHandlers } = await withAuthModules(t);
+    for (const decision of [
+        null,
+        { access: 'none', routeKey: 'webAdmin', source: 'routeDefault' },
+        { access: 'deny', status: 404, code: 'UNROUTABLE_PATH', routeKey: '', source: 'policy' },
+        { access: 'banana', routeKey: 'webAdmin', source: 'policy' },
+    ]) {
+        const req = makeRequest({ method: 'GET', url: '/webAdmin/x' });
+        const res = new MockResponse();
+        const result = await authHandlers.ensureHttpRouteAccess(req, res, new URL(req.url, 'http://localhost'), decision);
+        assert.equal(result.ok, false, JSON.stringify(decision));
+        assert.equal(res.statusCode >= 400, true, JSON.stringify(decision));
+        assert.doesNotMatch(String(res.getHeader('set-cookie') || ''), /^ploinky_guest=/);
+    }
+});
+
+test('a guest-session JWT in the ploinky_jwt cookie never satisfies an authenticated route', async (t) => {
     const { authHandlers, localService } = await withAuthModules(t);
-    const localJwt = localService.mintSessionJwt({
-        id: 'local:admin',
-        username: 'admin',
-        name: 'Admin',
-        roles: ['local', 'admin']
-    }, 1);
-
-    const localReq = makeRequest({
-        url: '/public-services/visitor-support/chat',
-        cookie: `ploinky_jwt=${localJwt}`
+    const guestJwt = localService.mintGuestSessionJwt({});
+    const req = makeRequest({
+        method: 'GET',
+        url: '/explorer/settings',
+        cookie: `ploinky_jwt=${guestJwt}`,
     });
-    const localRes = new MockResponse();
-    const localParsedUrl = new URL(localReq.url, 'http://localhost');
+    const res = new MockResponse();
+    const parsedUrl = new URL(req.url, 'http://localhost');
 
-    const localResult = await authHandlers.ensureAuthenticated(localReq, localRes, localParsedUrl);
-
-    assert.equal(localResult.ok, true);
-    assert.equal(localReq.authMode, 'local');
-    assert.equal(localReq.user?.username, 'admin');
-    assert.doesNotMatch(String(localRes.getHeader('set-cookie') || ''), /^ploinky_guest=/);
-
-    const guestReq = makeRequest({
-        url: '/public-services/visitor-support/chat',
-    });
-    const guestRes = new MockResponse();
-    const guestParsedUrl = new URL(guestReq.url, 'http://localhost');
-
-    const guestResult = await authHandlers.ensureAuthenticated(guestReq, guestRes, guestParsedUrl);
-
-    assert.equal(guestResult.ok, true);
-    assert.equal(guestReq.authMode, 'guest');
-    assert.equal(guestReq.user?.username, 'visitor');
-    assert.match(String(guestRes.getHeader('set-cookie') || ''), /^ploinky_guest=/);
-
-    const guestJwt = String(guestReq.sessionId || '');
-    assert.equal(localService.getSession(guestJwt, { policy: { mode: 'guest' } }), null);
-    assert.equal(
-        localService.getSession(guestJwt, { policy: { mode: 'guest', guestScope: 'visitor-support-public-service' } })?.user?.username,
-        'visitor'
+    const result = await authHandlers.ensureHttpRouteAccess(
+        req,
+        res,
+        parsedUrl,
+        { access: 'authenticated', routeKey: 'explorer', source: 'policy' },
     );
+
+    assert.equal(result.ok, false);
+    assert.equal(res.statusCode, 401);
+});
+
+test('an SSO user session takes precedence over guest minting on guest routes', async (t) => {
+    const { authHandlers, authService } = await withAuthModules(t);
+    const originalIsConfigured = authService.isConfigured;
+    const originalGetSession = authService.getSession;
+    authService.isConfigured = () => true;
+    authService.getSession = (id) => id === 'sso-cookie-1'
+        ? { user: { id: 'sso:alice', username: 'alice', roles: ['user'] }, expiresAt: Date.now() + 60_000 }
+        : null;
+    t.after(() => {
+        authService.isConfigured = originalIsConfigured;
+        authService.getSession = originalGetSession;
+    });
+
+    const req = makeRequest({ method: 'GET', url: '/webAssist/page', cookie: 'ploinky_sso=sso-cookie-1' });
+    const res = new MockResponse();
+    const result = await authHandlers.ensureHttpRouteAccess(
+        req,
+        res,
+        new URL(req.url, 'http://localhost'),
+        { access: 'guest', routeKey: 'webAssist', source: 'policy' },
+    );
+    assert.equal(result.ok, true);
+    assert.equal(req.authMode, 'sso');
+    assert.equal(req.user.username, 'alice');
+    assert.doesNotMatch(String(res.getHeader('set-cookie') || ''), /^ploinky_guest=/);
+});
+
+test('authenticated route key with guest auth falls back to static route auth instead of minting guest', async (t) => {
+    const { authHandlers } = await withAuthModules(t);
+    const req = makeRequest({
+        url: '/webAssist/private/profile',
+    });
+    const res = new MockResponse();
+    const parsedUrl = new URL(req.url, 'http://localhost');
+
+    const result = await authHandlers.ensureHttpRouteAccess(
+        req,
+        res,
+        parsedUrl,
+        { access: 'authenticated', routeKey: 'webAssist', source: 'policy' },
+    );
+    const body = JSON.parse(res.body || '{}');
+
+    assert.equal(result.ok, false);
+    assert.equal(res.statusCode, 401);
+    assert.equal(body.error, 'not_authenticated');
+    assert.match(String(body.login || ''), /agent=explorer/);
+    assert.doesNotMatch(String(res.getHeader('set-cookie') || ''), /^ploinky_guest=/);
+});
+
+test('authenticated route key without configured auth uses route-specific detail', async (t) => {
+    const { authHandlers } = await withAuthModules(t, { staticAuthMode: 'none' });
+    const req = makeRequest({
+        url: '/guestAgent/account/profile',
+    });
+    const res = new MockResponse();
+    const parsedUrl = new URL(req.url, 'http://localhost');
+
+    const result = await authHandlers.ensureHttpRouteAccess(
+        req,
+        res,
+        parsedUrl,
+        { access: 'authenticated', routeKey: 'guestAgent', source: 'policy' },
+    );
+    const body = JSON.parse(res.body || '{}');
+
+    assert.equal(result.ok, false);
+    assert.equal(res.statusCode, 503);
+    assert.equal(body.error, 'authenticated_http_route_auth_not_configured');
+    assert.equal(body.detail, 'Authenticated HTTP routes require a user-authenticated route or static-agent auth policy.');
+});
+
+test('authenticated guest route key without static user auth fails closed', async (t) => {
+    const { authHandlers } = await withAuthModules(t, { staticAuthMode: 'none' });
+    const req = makeRequest({
+        url: '/webAssist/private/profile',
+    });
+    const res = new MockResponse();
+    const parsedUrl = new URL(req.url, 'http://localhost');
+
+    const result = await authHandlers.ensureHttpRouteAccess(
+        req,
+        res,
+        parsedUrl,
+        { access: 'authenticated', routeKey: 'webAssist', source: 'policy' },
+    );
+    const body = JSON.parse(res.body || '{}');
+
+    assert.equal(result.ok, false);
+    assert.equal(res.statusCode, 503);
+    assert.equal(body.error, 'authenticated_http_route_auth_not_configured');
+    assert.equal(body.detail, 'Authenticated HTTP routes require a user-authenticated route or static-agent auth policy.');
+    assert.doesNotMatch(String(res.getHeader('set-cookie') || ''), /^ploinky_guest=/);
 });
