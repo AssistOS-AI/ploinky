@@ -3,12 +3,12 @@ import crypto from 'node:crypto';
 import { getUsersPayload, setUsersPayload } from '../../services/encryptedPasswordStore.js';
 import { deriveSubkey } from '../../services/masterKey.js';
 import { hashPassword, verifyPasswordHash } from '../../services/localAuthPasswords.js';
-import { signHmacJwt } from '../../../Agent/lib/jwtSign.mjs';
-import { verifyJws } from '../../../Agent/lib/jwtVerify.mjs';
+import { JwsCodec } from '../security/tokens/JwsCodec.js';
 import { createSessionStore } from './sessionStore.js';
 import { isSessionRevoked } from './sessionRevocations.js';
 
 const sessionStore = createSessionStore();
+const jwsCodec = new JwsCodec();
 
 const SESSION_AUDIENCE = 'ploinky-router';
 
@@ -47,13 +47,13 @@ function mintSessionJwt(user, rev = 1, options = {}) {
         exp: iat + SESSION_TTL_SECONDS,
         jti: crypto.randomBytes(16).toString('base64url')
     };
-    return signHmacJwt({ payload, secret: getSessionSigningKey() });
+    return jwsCodec.signHmacJwt({ payload, secret: getSessionSigningKey() });
 }
 
 const SESSION_TOKEN_TYPES = new Set(['user-session', 'guest-session']);
 
 function verifySessionJwt(token) {
-    const { payload } = verifyJws(token, {
+    const { payload } = jwsCodec.verifyJws(token, {
         secret: getSessionSigningKey(),
         expectedAudience: SESSION_AUDIENCE,
         maxTtlSeconds: SESSION_TTL_SECONDS + 1
@@ -92,7 +92,7 @@ function mintGuestSessionJwt(options = {}) {
         exp: iat + GUEST_SESSION_TTL_SECONDS,
         jti: crypto.randomBytes(16).toString('base64url')
     };
-    return signHmacJwt({ payload, secret: getSessionSigningKey() });
+    return jwsCodec.signHmacJwt({ payload, secret: getSessionSigningKey() });
 }
 
 let revCache = null;

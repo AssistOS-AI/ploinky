@@ -10,13 +10,22 @@ import { findAgent } from '../services/utils.js';
 import { readRouterSettings, updateRouterSettings } from '../services/routerSettings.js';
 import { createAuthService } from './auth/service.js';
 import { authenticateLocalUser, createLocalAuthUser, deleteLocalAuthUser, GUEST_SESSION_TTL_SECONDS, getSession as getLocalSession, getSessionCookieMaxAge as getLocalSessionCookieMaxAge, isLocalAdminUser, listLocalAuthUsers, mintGuestSessionJwt, mintSessionJwt, resolveLocalAuthConfig, resolveUserRev, revokeSession as revokeLocalSession, updateLocalAuthUser, updateLocalCredentials, verifySessionJwt } from './auth/localService.js';
-import { revokeSessionId } from './auth/sessionRevocations.js';
+import { isSessionRevoked, revokeSessionId } from './auth/sessionRevocations.js';
+import { SessionTokenService } from './security/tokens/SessionTokenService.js';
 import { waitForAgentReady } from './utils/agentReadiness.js';
 
 const SSO_AUTH_COOKIE_NAME = 'ploinky_sso';
 const LOCAL_AUTH_COOKIE_NAME = 'ploinky_jwt';
 const GUEST_AUTH_COOKIE_NAME = 'ploinky_guest';
 const authService = createAuthService();
+const sessionTokenService = new SessionTokenService({
+    mintUserSession: mintSessionJwt,
+    mintGuestSession: mintGuestSessionJwt,
+    verifySessionJwt,
+    resolveUserRev,
+    revokeSession: revokeLocalSession,
+    isSessionRevoked,
+});
 
 export function sendJson(res, statusCode, body) {
     const payload = JSON.stringify(body || {});
@@ -704,7 +713,7 @@ function getLocalAuthPolicyFromSession(session = null, fallbackPolicy = null) {
 async function resolveSessionForAuthContext(authContext, sessionId) {
     if (!sessionId) return null;
     let session = authContext.mode === 'local'
-        ? getLocalSession(sessionId, { policy: authContext.policy })
+        ? await sessionTokenService.getUserSession(sessionId, { policy: authContext.policy })
         : authService.getSession(sessionId);
     if (authContext.mode === 'sso' && (!session || (session.expiresAt && Date.now() > session.expiresAt))) {
         try {
@@ -896,7 +905,7 @@ async function ensureAuthenticatedWithContext(req, res, parsedUrl, authContext) 
     if (authContext.mode === 'guest') {
         const existingAuth = cookies.get(LOCAL_AUTH_COOKIE_NAME);
         if (existingAuth) {
-            const authSession = getLocalSession(existingAuth, { policy: authContext.policy });
+            const authSession = await sessionTokenService.getUserSession(existingAuth, { policy: authContext.policy });
             if (authSession) {
                 req.user = authSession.user;
                 req.session = authSession;
@@ -918,7 +927,7 @@ async function ensureAuthenticatedWithContext(req, res, parsedUrl, authContext) 
         }
         const guestCookie = cookies.get(GUEST_AUTH_COOKIE_NAME);
         if (guestCookie) {
-            const guestSession = getLocalSession(guestCookie, { policy: authContext.policy });
+            const guestSession = await sessionTokenService.getGuestSession(guestCookie, { policy: authContext.policy });
             if (guestSession) {
                 req.user = guestSession.user;
                 req.session = guestSession;
@@ -928,7 +937,7 @@ async function ensureAuthenticatedWithContext(req, res, parsedUrl, authContext) 
             }
         }
         const guestJwt = mintGuestSessionJwt({ policy: authContext.policy });
-        const guestSession = getLocalSession(guestJwt, { policy: authContext.policy });
+        const guestSession = await sessionTokenService.getGuestSession(guestJwt, { policy: authContext.policy });
         const cookie = buildCookie(GUEST_AUTH_COOKIE_NAME, guestJwt, req, '/', {
             maxAge: GUEST_SESSION_TTL_SECONDS,
             sameSite: 'Lax'
@@ -949,7 +958,7 @@ async function ensureAuthenticatedWithContext(req, res, parsedUrl, authContext) 
         return respondUnauthenticated(req, res, parsedUrl, authContext);
     }
     let session = authContext.mode === 'local'
-        ? getLocalSession(sessionId, { policy: authContext.policy })
+        ? await sessionTokenService.getUserSession(sessionId, { policy: authContext.policy })
         : authService.getSession(sessionId);
     if (authContext.mode === 'sso' && (!session || (session.expiresAt && Date.now() > session.expiresAt))) {
         try {
@@ -962,15 +971,6 @@ async function ensureAuthenticatedWithContext(req, res, parsedUrl, authContext) 
     if (!session) {
         appendLog('auth_session_invalid', { sessionId: '[redacted]', mode: authContext.mode });
         return respondUnauthenticated(req, res, parsedUrl, authContext);
-    }
-    if (authContext.mode === 'local' && session._jwtPayload) {
-        const jwtPayload = session._jwtPayload;
-        const usersVar = authContext.policy?.usersVar || '';
-        const currentRev = resolveUserRev(usersVar, jwtPayload.usr?.username || '');
-        if (currentRev !== (jwtPayload.rev || 1)) {
-            appendLog('auth_rev_mismatch', { username: jwtPayload.usr?.username });
-            return respondUnauthenticated(req, res, parsedUrl, authContext);
-        }
     }
     req.user = session.user;
     req.session = session;
