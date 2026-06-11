@@ -29,7 +29,7 @@ PLOINKY_AGENT_SECRET = HKDF_SHA256(ikm = master, salt = "", info = "ploinky/agen
 
 `deriveAgentRequestSecret(agentId, { encoding })` in `cli/services/masterKey.js` implements this by delegating to `deriveSubkey('agent-secret/' + agentId)`, keeping the workspace's single derivation story; it is router/launcher-only. It is distinct from the pre-existing `deriveAgentSecret` (which derives agent-OWNED generated secrets from the `derived-master` subkey and a per-secret name) and from `deriveDerivedMasterKey`, which remains in use only for agent-owned generated secrets (`generatedSecret`/`sharedGeneratedSecret`), never for invocation signing.
 
-The master key never enters an agent. At startup the runtime managers inject only `PLOINKY_AGENT_ID` (the principal) and `PLOINKY_AGENT_SECRET` (hex), plus the retained compatibility var `PLOINKY_AGENT_PRINCIPAL`; the shared `PLOINKY_DERIVED_MASTER_KEY` is no longer injected. Injection sites: `cli/services/docker/agentServiceManager.js`, `cli/services/bwrap/bwrapServiceManager.js`, and `cli/services/lifecycleHooks.js` (host lifecycle hooks act as the owning agent and receive that agent's id + secret).
+The master key never enters an agent. At startup the runtime managers inject only `PLOINKY_AGENT_ID` (the principal) and `PLOINKY_AGENT_SECRET` (hex), plus the retained principal alias `PLOINKY_AGENT_PRINCIPAL`; the shared `PLOINKY_DERIVED_MASTER_KEY` is no longer injected. Injection sites: `cli/services/docker/agentServiceManager.js`, `cli/services/bwrap/bwrapServiceManager.js`, and `cli/services/lifecycleHooks.js` (host lifecycle hooks act as the owning agent and receive that agent's id + secret).
 
 ### The Three JWT Families
 
@@ -67,7 +67,7 @@ Direct agent-to-agent calls are forbidden. The source agent signs an Agent Asser
 
 ### Secret Boundaries and Injected Environment
 
-Each agent receives only `PLOINKY_AGENT_ID` + `PLOINKY_AGENT_SECRET` (+ compatibility `PLOINKY_AGENT_PRINCIPAL`). `PLOINKY_MASTER_KEY` and `PLOINKY_DERIVED_MASTER_KEY` are never injected into an agent (asserted by `tests/unit/agentEnvInjection.test.mjs`). The agent verifier reads only `PLOINKY_AGENT_SECRET` and intentionally has no fallback to the master or a shared key. Router and agent logs must not record secrets or whole JWTs.
+Each agent receives only `PLOINKY_AGENT_ID` + `PLOINKY_AGENT_SECRET` (+ principal alias `PLOINKY_AGENT_PRINCIPAL`). `PLOINKY_MASTER_KEY` and `PLOINKY_DERIVED_MASTER_KEY` are never injected into an agent (asserted by `tests/unit/agentEnvInjection.test.mjs`). The agent verifier reads only `PLOINKY_AGENT_SECRET` and intentionally has no fallback to the master or a shared key. Router and agent logs must not record secrets or whole JWTs.
 
 This remains true even for delegated-user flows. Agents do not receive the router's session key or delegation-signing key and cannot mint User Delegation Grants themselves; they still receive only their own per-agent secret.
 
@@ -90,8 +90,8 @@ Response: Per-agent HMAC gives inter-agent isolation with no key-distribution or
 ### Question #2: Why does `rch` cover method, path, and tool rather than only the body?
 Response: The old `bh` covered only `{tool, arguments}`, so a token was reusable for any request with the same body shape. Binding method, path, and tool (and, for HTTP, query + body hash) ties a token to one operation, preventing a signed token from being moved across operations or surfaces.
 
-### Question #3: Why a clean cutover with no compatibility window?
-Response: Migration is a non-goal: the workspace is operator-controlled and restarts as a unit, and the old agent-to-agent path was already non-functional. The shared `derived-master` invocation mint/verify was deleted in the same change that landed per-agent signing — no `PLOINKY_SECUREWIRE_COMPAT`, no dual-stack, no legacy-token acceptance — so there is no window in which a forgeable shared key remains valid.
+### Question #3: Why a clean cutover with no dual-stack window?
+Response: Migration is a non-goal: the workspace is operator-controlled and restarts as a unit, and the old agent-to-agent path was already non-functional. The shared `derived-master` invocation mint/verify was deleted in the same change that landed per-agent signing, with no dual-stack and no old-token acceptance, so there is no window in which a forgeable shared key remains valid.
 
 ### Question #4: Why does an agent's own secret derive from the master while the agent never sees the master?
 Response: HKDF is one-way, so the router/launcher derive and inject only the per-agent result; an agent cannot recover the master or another agent's secret from its own. This keeps a single configured root key while giving every agent an isolated, non-repudiable signing identity.
