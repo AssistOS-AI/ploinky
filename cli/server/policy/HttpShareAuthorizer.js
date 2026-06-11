@@ -84,13 +84,18 @@ function postJson(hostPort, requestPath, headers, bodyObject, timeoutMs = 2000) 
 }
 
 export class HttpShareAuthorizer extends ShareAuthorizer {
-    async authorize({ agentName, normalizedPath, user }) {
+    async authorize({ agentName, normalizedPath, access = '', verb = '', user }) {
         const owning = resolveOwningRoute(agentName);
         if (!owning) {
             return { allowed: false, reason: 'no_authorizer' };
         }
         try {
-            const bodyObject = { path: normalizedPath, user: { id: String(user?.id || ''), username: String(user?.username || '') } };
+            const bodyObject = {
+                path: normalizedPath,
+                access: String(access || ''),
+                verb: String(verb || ''),
+                user: { id: String(user?.id || ''), username: String(user?.username || '') },
+            };
             const built = buildRouterRequest({
                 targetAgentId: owning.principalId,
                 sub: user?.id ? `user:${user.id}` : '',

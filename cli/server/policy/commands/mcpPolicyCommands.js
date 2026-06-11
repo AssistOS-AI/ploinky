@@ -1,4 +1,4 @@
-import { WhitelistCommand } from './WhitelistCommand.js';
+import { PolicyCommand } from './PolicyCommand.js';
 
 /**
  * The three `mcp.policy.*` commands (DS014) — admin-only. They share the
@@ -8,7 +8,7 @@ import { WhitelistCommand } from './WhitelistCommand.js';
 
 const ACCESS_VALUES = ['authenticated', 'internal', 'admin'];
 
-class McpPolicyCommand extends WhitelistCommand {
+class McpPolicyCommand extends PolicyCommand {
     constructor({ repository }) {
         super();
         this._repo = repository;

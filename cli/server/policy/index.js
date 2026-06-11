@@ -4,18 +4,18 @@ import { PolicyStateRepository } from './PolicyStateRepository.js';
 import { FileSystemPolicyStateStore } from './FileSystemPolicyStateStore.js';
 import { PolicyAuditLog } from './PolicyAuditLog.js';
 import { FileSystemPolicyAuditSink } from './FileSystemPolicyAuditSink.js';
-import { HttpRouteWhitelist } from './HttpRouteWhitelist.js';
+import { HttpRouteAccessPolicy } from './HttpRouteAccessPolicy.js';
 import { McpToolPolicy } from './McpToolPolicy.js';
 import { Caller } from './Caller.js';
 import { HttpShareAuthorizer } from './HttpShareAuthorizer.js';
 import { PolicyCommandRegistry } from './PolicyCommandRegistry.js';
 import { PolicyCommandInvoker } from './PolicyCommandInvoker.js';
 import {
-    HttpWhitelistAddCommand,
-    HttpWhitelistRemoveCommand,
-    HttpWhitelistCheckCommand,
-    HttpWhitelistListCommand,
-} from './commands/httpWhitelistCommands.js';
+    HttpRouteSetCommand,
+    HttpRouteRemoveCommand,
+    HttpRouteCheckCommand,
+    HttpRouteListCommand,
+} from './commands/httpRouteCommands.js';
 import {
     McpPolicySetCommand,
     McpPolicyGetCommand,
@@ -34,15 +34,15 @@ import {
 // here; nothing else in policy/ changes.
 const repository = new PolicyStateRepository({ store: new FileSystemPolicyStateStore() });
 const auditLog = new PolicyAuditLog({ sink: new FileSystemPolicyAuditSink() });
-const httpWhitelist = new HttpRouteWhitelist({ repository });
+const httpRouteAccessPolicy = new HttpRouteAccessPolicy({ repository });
 const mcpToolPolicy = new McpToolPolicy({ repository });
 const shareAuthorizer = new HttpShareAuthorizer();
 
 const registry = new PolicyCommandRegistry()
-    .register(new HttpWhitelistAddCommand({ repository, authorizer: shareAuthorizer }))
-    .register(new HttpWhitelistRemoveCommand({ repository, authorizer: shareAuthorizer }))
-    .register(new HttpWhitelistCheckCommand({ whitelist: httpWhitelist }))
-    .register(new HttpWhitelistListCommand({ repository }))
+    .register(new HttpRouteSetCommand({ repository, authorizer: shareAuthorizer }))
+    .register(new HttpRouteRemoveCommand({ repository, authorizer: shareAuthorizer }))
+    .register(new HttpRouteCheckCommand({ routeAccessPolicy: httpRouteAccessPolicy }))
+    .register(new HttpRouteListCommand({ repository }))
     .register(new McpPolicySetCommand({ repository }))
     .register(new McpPolicyGetCommand({ repository }))
     .register(new McpPolicyListCommand({ repository }));
@@ -52,7 +52,7 @@ const commandInvoker = new PolicyCommandInvoker({ registry, auditLog, getSession
 export const policy = {
     repository,
     auditLog,
-    httpWhitelist,
+    httpRouteAccessPolicy,
     mcpToolPolicy,
     shareAuthorizer,
     commandInvoker,
