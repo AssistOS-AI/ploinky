@@ -25,6 +25,7 @@ export const ROUTER_OWNED_FIRST_SEGMENTS = new Set([
     'health',
     'metrics',
     'MCPBrowserClient.js',
+    'whitelist',
 ]);
 
 export class HttpRouteAccessPath {

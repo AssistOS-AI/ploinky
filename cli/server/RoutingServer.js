@@ -149,6 +149,8 @@ function isRouterOwnedPath(pathname) {
         || pathname.startsWith('/api/agents/')
         // Internal, non-policy-routable router-owned routes (DS014).
         || pathname === '/policy/command'
+        || pathname === '/whitelist'
+        || pathname.startsWith('/whitelist/')
         || pathname === '/metrics'
         || pathname === '/health/internal'
         || pathname === '/admin'
@@ -366,6 +368,11 @@ async function processRequest(req, res) {
     // passthrough handling can forward one to an agent. Generic 404 so the reply
     // does not confirm the internal route exists.
     if (hasInternalAgentSegment(pathname)) {
+        sendJsonResponse(res, 404, { error: 'not_found' });
+        return;
+    }
+
+    if (pathname === '/whitelist' || pathname.startsWith('/whitelist/')) {
         sendJsonResponse(res, 404, { error: 'not_found' });
         return;
     }
