@@ -14,6 +14,10 @@ import {
 } from '../lib/invocationAuth.mjs';
 import { computeRchTool } from '../lib/requestHash.mjs';
 import { describeShellFailure } from '../lib/toolError.mjs';
+import {
+    buildDefaultOpenAiChatResponse,
+    buildDefaultStreamRejection
+} from './openAiDefaultResponder.mjs';
 const { z } = zod;
 
 const DEFAULT_MAX_CONCURRENT_TASKS = 10;
@@ -363,6 +367,19 @@ function resolveOpenAiChatConfig(manifest) {
     };
 }
 
+function collectMcpToolNames() {
+    const configResult = getConfigResult();
+    const config = configResult ? configResult.config : null;
+    if (!config || !Array.isArray(config.tools)) return [];
+    const names = [];
+    for (const tool of config.tools) {
+        if (tool && typeof tool.name === 'string' && tool.name.trim()) {
+            names.push(tool.name.trim());
+        }
+    }
+    return names;
+}
+
 function parseAuthInfoHeader(requestHeaders) {
     if (!requestHeaders || typeof requestHeaders !== 'object') return null;
     const raw = requestHeaders['x-ploinky-auth-info'];
@@ -600,7 +617,23 @@ async function handleOpenAiChatCompletions(req, res, body) {
     const manifest = manifestResult ? manifestResult.manifest : null;
     const openAiConfig = resolveOpenAiChatConfig(manifest);
     if (!openAiConfig) {
-        sendOpenAiError(res, 404, 'OpenAI chat completions not configured', 'not_found_error');
+        // No manifest-specific chat handler: fall back to the inert default
+        // capability/listability responder so this agent stays discoverable and
+        // routable. Streaming is not supported by the default responder.
+        if (body.stream === true) {
+            const rejection = buildDefaultStreamRejection();
+            sendOpenAiError(res, rejection.statusCode, rejection.message, rejection.type);
+            return;
+        }
+        const response = buildDefaultOpenAiChatResponse({
+            requestBody: body,
+            manifest,
+            toolNames: collectMcpToolNames(),
+            agentId: process.env.PLOINKY_AGENT_ID
+        });
+        const data = Buffer.from(JSON.stringify(response));
+        res.writeHead(200, { 'Content-Type': 'application/json', 'Content-Length': data.length });
+        res.end(data);
         return;
     }
     const wantsStream = body.stream === true;
