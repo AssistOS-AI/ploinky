@@ -19,6 +19,7 @@ import { verifyUserDelegationGrant } from './userDelegationGrant.js';
 const AGENT_PROXY_PROTOCOL_VERSION = '2025-06-18';
 const AGENT_PROXY_SERVER_INFO = { name: 'ploinky-router-proxy', version: '1.0.0' };
 const TOOL_SCHEMA_CACHE_TTL_MS = 30_000;
+const TASK_STATUS_TOOL = '__task_status__';
 // Replay cache for verified Agent Assertions (agent-to-agent jti single-use).
 const assertionReplayCache = createTokenReplayCache({ maxSize: 4096 });
 
@@ -207,6 +208,36 @@ export function verifyDelegatedAgentToolCall({
         expectedTool: toolName,
     });
     return { ...verifiedAgent, userDelegation };
+}
+
+export function verifyDelegatedAgentTaskStatusCall({
+    req,
+    agentName,
+    taskId,
+    path = '/task',
+    assertionCache = assertionReplayCache,
+}) {
+    const normalizedTaskId = String(taskId || '').trim();
+    if (!normalizedTaskId) {
+        throw new Error('missing taskId');
+    }
+    return {
+        ...verifyAgentAssertion({
+            token: readAuthorizationBearer(req),
+            method: 'GET',
+            path,
+            tool: TASK_STATUS_TOOL,
+            rch: computeRchTool({
+                method: 'GET',
+                path,
+                tool: TASK_STATUS_TOOL,
+                arguments: { taskId: normalizedTaskId },
+            }),
+            targetAgentId: agentName,
+            replayCache: assertionCache,
+        }),
+        userDelegation: null,
+    };
 }
 
 /**

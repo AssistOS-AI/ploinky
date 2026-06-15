@@ -25,6 +25,24 @@ export function getAgentMcpUrl(agentName) {
     return `${getRouterUrl()}/${agentName}/mcp`;
 }
 
+const DEFAULT_TASK_POLL_INTERVAL_MS = 5000;
+const TASK_POLL_INTERVAL_MS = (() => {
+    try {
+        if (typeof process !== 'undefined' && process.env) {
+            const raw = process.env.PLOINKY_MCP_TASK_POLL_INTERVAL_MS;
+            const parsed = Number.parseInt(raw, 10);
+            if (Number.isFinite(parsed) && parsed > 0) {
+                return parsed;
+            }
+        }
+    } catch {
+        // ignore env parsing errors
+    }
+    return DEFAULT_TASK_POLL_INTERVAL_MS;
+})();
+
+const taskPollers = new Map();
+
 function normalizeDelegationToken(token) {
     if (token === undefined || token === null || token === '') return '';
     if (typeof token !== 'string') {
@@ -66,6 +84,55 @@ function postToolCall(agentName, jsonRpcBody, assertion, userDelegationToken = '
     });
 }
 
+function getTaskStatus(agentName, taskId) {
+    const normalizedTaskId = String(taskId || '').trim();
+    if (!normalizedTaskId) {
+        throw new Error('AgentMcpClient: taskId is required');
+    }
+    const url = new URL(getRouterUrl());
+    url.pathname = `/${agentName}/task`;
+    url.searchParams.set('taskId', normalizedTaskId);
+    const httpModule = url.protocol === 'https:' ? https : http;
+    const assertion = signAgentAssertion({
+        method: 'GET',
+        path: '/task',
+        targetAgent: agentName,
+        tool: '__task_status__',
+        argumentsObj: { taskId: normalizedTaskId },
+    });
+    return new Promise((resolve, reject) => {
+        const req = httpModule.request({
+            hostname: url.hostname,
+            port: url.port || (url.protocol === 'https:' ? 443 : 80),
+            path: `${url.pathname}${url.search || ''}`,
+            method: 'GET',
+            headers: {
+                accept: 'application/json',
+                authorization: `Bearer ${assertion}`,
+            },
+        }, (res) => {
+            const chunks = [];
+            res.on('data', (chunk) => chunks.push(chunk));
+            res.on('end', () => {
+                const text = Buffer.concat(chunks).toString('utf8');
+                let json = null;
+                try { json = text ? JSON.parse(text) : null; } catch { json = null; }
+                if (res.statusCode >= 400 || !json) {
+                    reject(new Error(`agent task status failed (status ${res.statusCode}): ${(text || '').slice(0, 200)}`.trim()));
+                    return;
+                }
+                if (json.error) {
+                    reject(new Error(json.error.reason || json.error.detail || json.error.message || json.error));
+                    return;
+                }
+                resolve(json.task || json);
+            });
+        });
+        req.on('error', reject);
+        req.end();
+    });
+}
+
 function unwrapToolResult(result) {
     const content = Array.isArray(result?.content) ? result.content : [];
     if (content.length !== 1) {
@@ -80,6 +147,155 @@ function unwrapToolResult(result) {
     } catch (_) {
         return result;
     }
+}
+
+function parseTaskPayload(rawTask) {
+    if (!rawTask || typeof rawTask !== 'object') {
+        return rawTask;
+    }
+
+    const resultSource = rawTask.result || rawTask;
+    const parsed = unwrapToolResult(resultSource);
+    if (parsed && typeof parsed === 'object' && parsed !== rawTask) {
+        return {
+            ...rawTask,
+            ...parsed,
+        };
+    }
+    return rawTask;
+}
+
+function normalizeTaskId(payload) {
+    const candidate = payload?.metadata?.taskId || payload?.result?.metadata?.taskId;
+    if (typeof candidate === 'string' && candidate.trim()) {
+        return candidate.trim();
+    }
+    return '';
+}
+
+function taskError(task) {
+    const status = typeof task?.status === 'string' ? task.status : 'failed';
+    const message = typeof task?.error === 'string' && task.error.trim() ? task.error.trim() : `Task ${task?.id || 'execution'} ${status}`;
+    const error = new Error(message);
+    error.task = task;
+    return error;
+}
+
+function emitTaskUpdate(onTaskUpdate, task) {
+    if (typeof onTaskUpdate !== 'function') {
+        return;
+    }
+    try {
+        onTaskUpdate(task);
+    } catch (error) {
+        console.warn('[AgentMcpClient] onTaskUpdate callback failed', error);
+    }
+}
+
+function isTaskNotFoundError(error) {
+    const message = error?.message || error?.toString?.() || '';
+    if (typeof message !== 'string') {
+        return false;
+    }
+    const normalized = message.toLowerCase();
+    return normalized.includes('not_found') || normalized.includes('task not found') || normalized.includes('status 404');
+}
+
+function stopTaskPoller(taskId) {
+    const poller = taskPollers.get(taskId);
+    if (!poller) {
+        return;
+    }
+    if (poller.timer) {
+        clearTimeout(poller.timer);
+    }
+    taskPollers.delete(taskId);
+}
+
+function stopAllTaskPollers() {
+    for (const poller of taskPollers.values()) {
+        if (poller.timer) {
+            clearTimeout(poller.timer);
+        }
+    }
+    taskPollers.clear();
+}
+
+function parseTaskStatusResponse(agentName, taskId) {
+    return getTaskStatus(agentName, taskId)
+        .then((task) => ({ state: 'ok', task }))
+        .catch((error) => {
+            if (isTaskNotFoundError(error)) {
+                return { state: 'not_found', error };
+            }
+            return { state: 'error', error };
+        });
+}
+
+async function pollTaskStatus(agentName, taskId, callback, options = {}) {
+    const poller = taskPollers.get(taskId);
+    if (!poller) {
+        return;
+    }
+    try {
+        const result = await parseTaskStatusResponse(agentName, taskId);
+        if (result.state === 'not_found') {
+            stopTaskPoller(taskId);
+            callback({
+                id: taskId,
+                status: 'failed',
+                error: 'task not found'
+            });
+            return;
+        }
+        if (result.state === 'error') {
+            poller.lastError = result.error || null;
+            console.warn('[AgentMcpClient] Task status poll failed, retrying', result.error);
+        } else if (result.task) {
+            const task = result.task;
+            const status = typeof task.status === 'string' ? task.status : null;
+            const logSeqValue = Number(task?.logSeq);
+            const logSeq = Number.isFinite(logSeqValue) ? logSeqValue : null;
+            const statusChanged = poller.lastStatus !== status;
+            const logChanged = poller.lastLogSeq !== logSeq;
+            if (statusChanged || logChanged) {
+                poller.lastStatus = status;
+                poller.lastLogSeq = logSeq;
+                callback(task);
+            }
+            const isTerminal = status === 'completed' || status === 'failed' || status === 'cancelled';
+            if (isTerminal) {
+                stopTaskPoller(taskId);
+                return;
+            }
+        }
+    } catch (error) {
+        poller.lastError = error;
+        console.warn('[AgentMcpClient] Task status poll failed', error);
+    }
+
+    if (taskPollers.has(taskId)) {
+        const timer = setTimeout(() => {
+            void pollTaskStatus(agentName, taskId, callback, options);
+        }, TASK_POLL_INTERVAL_MS);
+        const pollerRef = taskPollers.get(taskId);
+        if (pollerRef) {
+            pollerRef.timer = timer;
+        }
+    }
+}
+
+function startTaskPolling(agentName, taskId, callback, _options = {}) {
+    if (!taskId || typeof callback !== 'function' || taskPollers.has(taskId)) {
+        return;
+    }
+    taskPollers.set(taskId, {
+        timer: null,
+        lastStatus: null,
+        lastLogSeq: null,
+        lastError: null,
+    });
+    void pollTaskStatus(agentName, taskId, callback, _options);
 }
 
 /**
@@ -119,7 +335,52 @@ export async function createAgentClient(agentName, options = {}) {
         if (status >= 400 || !json) {
             throw new Error(`agent-to-agent call failed (status ${status}): ${(text || '').slice(0, 200)}`.trim());
         }
-        return unwrapToolResult(json.result);
+        const result = unwrapToolResult(json.result);
+        const taskId = normalizeTaskId(result);
+        if (typeof callOptions.onTaskUpdate !== 'function' || !taskId) {
+            return result;
+        }
+
+        const metadata = result?.metadata;
+        const initialUpdate = {
+            id: taskId,
+            status: typeof metadata?.status === 'string' ? metadata.status : 'queued',
+            createdAt: metadata?.createdAt,
+            updatedAt: metadata?.updatedAt,
+            toolName: metadata?.toolName || name,
+        };
+        emitTaskUpdate(callOptions.onTaskUpdate, initialUpdate);
+
+        const finalTask = await new Promise((resolve, reject) => {
+            let settled = false;
+            const finalize = (task, isError = false) => {
+                if (settled) {
+                    return;
+                }
+                settled = true;
+                stopTaskPoller(taskId);
+                if (isError) {
+                    reject(task);
+                } else {
+                    resolve(task);
+                }
+            };
+
+            startTaskPolling(agentName, taskId, (task) => {
+                emitTaskUpdate(callOptions.onTaskUpdate, task);
+                if (!task || typeof task !== 'object') {
+                    return;
+                }
+                const status = typeof task.status === 'string' ? task.status.toLowerCase() : '';
+                if (status === 'completed') {
+                    finalize(task);
+                } else if (status === 'failed' || status === 'cancelled' || status === 'not_found') {
+                    finalize(taskError(task), true);
+                }
+            });
+        });
+
+        return parseTaskPayload(finalTask);
     }
 
     const unsupported = (op) => async () => {
@@ -128,11 +389,14 @@ export async function createAgentClient(agentName, options = {}) {
 
     return {
         callTool,
+        getTaskStatus: (taskId) => getTaskStatus(agentName, taskId),
         connect: async () => {},
         listTools: unsupported('listTools'),
         listResources: unsupported('listResources'),
         readResource: unsupported('readResource'),
         ping: unsupported('ping'),
-        close: async () => {},
+        close: async () => {
+            stopAllTaskPollers();
+        },
     };
 }

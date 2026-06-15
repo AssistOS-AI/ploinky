@@ -63,7 +63,7 @@ User → router (User Session cookie) → router verifies the session, resolves 
 
 ### Agent-to-Agent Flow
 
-Direct agent-to-agent calls are forbidden. The source agent signs an Agent Assertion with its own secret (`Agent/client/AgentMcpClient.mjs`) and posts a direct `tools/call` to the router at `/<target>/mcp` with `Authorization: Bearer <assertion>`. The router verifies the source identity and `rch`, applies MCP policy for `(source agent, target agent, tool)` — agents may invoke only `internal`-classed tools — and mints a Router Request for the target. The target AgentServer verifies and executes. The legacy `/auth/agent-token` client-credentials exchange and the shared-key `x-ploinky-caller-jwt` carrier are retired; the carrier is now `Authorization: Bearer`.
+Direct agent-to-agent calls are forbidden. The source agent signs an Agent Assertion with its own secret (`Agent/client/AgentMcpClient.mjs`) and posts a direct `tools/call` to the router at `/<target>/mcp` with `Authorization: Bearer <assertion>`. The router verifies the source identity and `rch`, applies MCP policy for `(source agent, target agent, tool)` — agents may invoke only `internal`-classed tools — and mints a Router Request for the target. The same assertion pattern is used for async MCP task polling: the source signs `GET /task` or `GET /getTaskStatus` with pseudo-tool `__task_status__` and `{ taskId }`, and the router mints a matching target-scoped Router Request before proxying the status read. The target AgentServer verifies and executes. The legacy `/auth/agent-token` client-credentials exchange and the shared-key `x-ploinky-caller-jwt` carrier are retired; the carrier is now `Authorization: Bearer`.
 
 ### Secret Boundaries and Injected Environment
 

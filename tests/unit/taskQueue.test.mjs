@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 
@@ -106,6 +106,30 @@ test('TaskQueue captures task failures and surfaces stderr', async (t) => {
 
     const failed = queue.getTask(id);
     assert.equal(failed?.error, 'boom');
+});
+
+test('TaskQueue preserves async command args across queue persistence', async (t) => {
+    const storagePath = makeTempStorage(t);
+    const queue = new TaskQueue({
+        maxConcurrent: 1,
+        storagePath,
+        executor: (_spec, _payload, options = {}) => {
+            options.onStdoutChunk?.('ok');
+            return Promise.resolve({ code: 0, stdout: 'ok', stderr: '' });
+        }
+    });
+
+    const { id } = queue.enqueueTask({
+        toolName: 'execute-task',
+        commandSpec: { command: '/usr/bin/node', args: ['/tmp/script.mjs'], cwd: '/code', env: {} },
+        payload: { prompt: 'test' },
+    });
+
+    const snapshot = JSON.parse(readFileSync(storagePath, 'utf8'));
+    const restoredEntry = snapshot.find((entry) => entry?.id === id);
+
+    assert.deepEqual(restoredEntry?.commandSpec?.args, ['/tmp/script.mjs']);
+    assert.equal(restoredEntry?.toolName, 'execute-task');
 });
 
 test('TaskQueue exposes live log tail updates while task is running', async (t) => {

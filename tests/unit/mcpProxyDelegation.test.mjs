@@ -45,7 +45,11 @@ process.chdir(tempDir);
 process.env.PLOINKY_MASTER_KEY = '9'.repeat(64);
 
 const moduleSuffix = `?test=${Date.now()}`;
-const { verifyDelegatedAgentToolCall, buildInvocationContextForProviderCall } = await import(`../../cli/server/mcp-proxy/index.js${moduleSuffix}`);
+const {
+    verifyDelegatedAgentToolCall,
+    verifyDelegatedAgentTaskStatusCall,
+    buildInvocationContextForProviderCall,
+} = await import(`../../cli/server/mcp-proxy/index.js${moduleSuffix}`);
 const { deriveSubkey } = await import(`../../cli/services/masterKey.js${moduleSuffix}`);
 const { verifyUserDelegationGrant } = await import(`../../cli/server/mcp-proxy/userDelegationGrant.js${moduleSuffix}`);
 
@@ -143,6 +147,56 @@ test('mcp proxy mints router request with caller agent and usr user claims', () 
     assert.equal(ctx.payload.delegation.sourceAgentId, SOURCE_AGENT);
     assert.equal(ctx.payload.delegations, undefined);
     assert.equal(ctx.payload.delegation.sourceAgentId, SOURCE_AGENT);
+});
+
+test('mcp proxy mints router request for delegated async task status polling', () => {
+    const taskId = 'task-open-code-1';
+    const assertion = signAgentAssertion({
+        method: 'GET',
+        path: '/task',
+        targetAgent: TARGET_ROUTE,
+        tool: '__task_status__',
+        argumentsObj: { taskId },
+        env: envFor(SOURCE_AGENT),
+    });
+    const verified = verifyDelegatedAgentTaskStatusCall({
+        req: makeReq({ assertion }),
+        agentName: TARGET_ROUTE,
+        taskId,
+        assertionCache: createMemoryReplayCache(),
+    });
+    const ctx = buildInvocationContextForProviderCall({
+        req: { delegatedAgentVerified: verified },
+        agentName: TARGET_ROUTE,
+        toolName: '__task_status__',
+        toolArgs: { taskId },
+        method: 'GET',
+        path: '/task',
+    });
+
+    assert.equal(ctx.payload.sub, SOURCE_AGENT);
+    assert.equal(ctx.payload.actor.kind, 'agent');
+    assert.equal(ctx.payload.method, 'GET');
+    assert.equal(ctx.payload.path, '/task');
+    assert.equal(ctx.payload.tool, '__task_status__');
+});
+
+test('mcp proxy rejects delegated async task status polling for a different taskId', () => {
+    const assertion = signAgentAssertion({
+        method: 'GET',
+        path: '/task',
+        targetAgent: TARGET_ROUTE,
+        tool: '__task_status__',
+        argumentsObj: { taskId: 'task-original' },
+        env: envFor(SOURCE_AGENT),
+    });
+
+    assert.throws(() => verifyDelegatedAgentTaskStatusCall({
+        req: makeReq({ assertion }),
+        agentName: TARGET_ROUTE,
+        taskId: 'task-tampered',
+        assertionCache: createMemoryReplayCache(),
+    }), /request hash mismatch/);
 });
 
 test('mcp proxy rejects a valid grant from the wrong source agent', () => {

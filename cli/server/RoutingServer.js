@@ -32,7 +32,12 @@ import { appendLog, logBootEvent, logMemoryUsage } from './utils/logger.js';
 import { isRouteMount } from './utils/routeMounts.js';
 
 // New modular components
-import { agentSessionStore, handleAgentMcpRequest } from './mcp-proxy/index.js';
+import {
+    agentSessionStore,
+    buildInvocationContextForProviderCall,
+    handleAgentMcpRequest,
+    verifyDelegatedAgentTaskStatusCall,
+} from './mcp-proxy/index.js';
 import { initializeTTYFactories, createServiceConfig } from './utils/ttyFactories.js';
 import { setupProcessLifecycle } from './utils/processLifecycle.js';
 import { policy } from './policy/index.js';
@@ -203,6 +208,17 @@ function hasDelegatedAgentAssertion(req) {
     return typeof value === 'string' && value.toLowerCase().startsWith('bearer ');
 }
 
+function pathOnly(pathWithQuery = '') {
+    const value = String(pathWithQuery || '');
+    const index = value.indexOf('?');
+    return index >= 0 ? value.slice(0, index) : value;
+}
+
+function isAgentTaskStatusProxyPath(agentProxyPath) {
+    const value = pathOnly(agentProxyPath);
+    return value === '/task' || value === '/getTaskStatus';
+}
+
 function getStaticRouteName(routes = loadApiRoutes()) {
     const staticAgent = staticSrv.getStaticAgentName();
     if (!staticAgent) return null;
@@ -346,6 +362,13 @@ async function processRequest(req, res) {
             routeKey: policyGatedRouteKey,
         })
         : null;
+    const isDelegatedAgentTaskStatusRoute = Boolean(
+        agentName
+        && !isAgentMcpRoute
+        && isAgentTaskStatusProxyPath(agentProxyPath)
+        && hasDelegatedAgentAssertion(req)
+    );
+    let agentProxyExtraHeaders = {};
     appendLog('http_request', { method: req.method, path: pathname });
 
     // Health check endpoint (no auth required)
@@ -432,6 +455,36 @@ async function processRequest(req, res) {
         if (!authResult.ok) return;
     } else if (agentName && isAgentMcpRoute && hasDelegatedAgentAssertion(req)) {
         // Agent-to-agent MCP: the MCP proxy verifies the Agent Assertion.
+    } else if (isDelegatedAgentTaskStatusRoute) {
+        // Agent-to-agent async task polling: verify the source assertion, then
+        // replace it with a target-scoped Router Request for AgentServer.
+        const statusPath = pathOnly(agentProxyPath);
+        const taskId = parsedUrl.searchParams.get('taskId');
+        try {
+            req.delegatedAgentVerified = verifyDelegatedAgentTaskStatusCall({
+                req,
+                agentName,
+                taskId,
+                path: statusPath,
+            });
+            const ctx = buildInvocationContextForProviderCall({
+                req,
+                agentName,
+                toolName: '__task_status__',
+                toolArgs: { taskId },
+                method: 'GET',
+                path: statusPath,
+            });
+            if (ctx?.token) {
+                agentProxyExtraHeaders = { authorization: `Bearer ${ctx.token}` };
+            }
+        } catch (error) {
+            sendJsonResponse(res, 401, {
+                error: 'delegated_task_status_rejected',
+                reason: error?.message || 'delegated task status verification failed',
+            });
+            return;
+        }
     } else if (agentName && isAgentMcpRoute) {
         // Browser MCP keeps the existing surface auth (static fallback included).
         const authResult = await ensureAuthenticated(req, res, parsedUrl);
@@ -493,7 +546,7 @@ async function processRequest(req, res) {
         if (await staticSrv.serveAgentStaticRequest(req, res)) {
             return;
         }
-        return proxyHttpPassthrough(req, res, route.hostPort, agentProxyPath);
+        return proxyHttpPassthrough(req, res, route.hostPort, agentProxyPath, agentProxyExtraHeaders);
     } else if (pathname === '/mcp' || pathname === '/mcp/') {
         return handleRouterMcp(req, res);
     } else {
