@@ -35,6 +35,19 @@
   const views = ['status', 'logs', 'transcripts', 'feedback', 'agents', 'control'];
   let transcriptListLoaded = false;
   let feedbackLoaded = false;
+
+  const dashboardBasePath = (() => {
+    const rawBase = String(body.dataset.base || '/dashboard').trim();
+    const safeBase = rawBase.startsWith('/') && !rawBase.startsWith('//')
+      ? rawBase
+      : '/dashboard';
+    return safeBase.replace(/\/+$/, '') || '/dashboard';
+  })();
+
+  function dashboardPath(path) {
+    const suffix = String(path || '').replace(/^\/+/, '');
+    return `${dashboardBasePath}/${suffix}`;
+  }
   
   function setTab(name) { 
     tabs.forEach(t => t.classList.toggle('active', t.dataset.tab === name)); 
@@ -54,9 +67,10 @@
 
   // /run helper
   async function run(cmd) { 
-    const res = await fetch('run', { 
+    const res = await fetch(dashboardPath('run'), { 
       method: 'POST', 
       headers: {'Content-Type': 'application/json'}, 
+      keepalive: true,
       body: JSON.stringify({ cmd }) 
     }); 
     const j = await res.json().catch(() => ({ok: false})); 
@@ -212,7 +226,7 @@
     }
     transcriptDetail.innerHTML = '<div class="wa-transcript-empty">Loading transcript…</div>';
     try {
-      const response = await fetch(`api/transcripts/${encodeURIComponent(conversationId)}`, {
+      const response = await fetch(dashboardPath(`api/transcripts/${encodeURIComponent(conversationId)}`), {
         credentials: 'same-origin'
       });
       const payload = await response.json().catch(() => ({}));
@@ -229,7 +243,7 @@
     transcriptListLoaded = true;
     transcriptList.innerHTML = '<div class="wa-transcript-empty">Loading…</div>';
     try {
-      const response = await fetch('api/transcripts?limit=100', {
+      const response = await fetch(dashboardPath('api/transcripts?limit=100'), {
         credentials: 'same-origin'
       });
       const payload = await response.json().catch(() => ({}));
@@ -370,7 +384,7 @@
     feedbackTurns.innerHTML = '<div class="wa-transcript-empty">Loading…</div>';
     try {
       const filter = feedbackFilter?.value || 'all';
-      const url = `api/feedback?limit=1000&rating=${encodeURIComponent(filter)}`;
+      const url = dashboardPath(`api/feedback?limit=1000&rating=${encodeURIComponent(filter)}`);
       const response = await fetch(url, {
         credentials: 'same-origin'
       });
