@@ -17,6 +17,7 @@ const { deriveAgentRequestSecret, deriveDerivedMasterKey } = await import(`../..
 const { deriveAgentPrincipalId } = await import(`../../cli/services/agentIdentity.js${moduleSuffix}`);
 // The single identity injector that docker, bwrap, and lifecycle all route through.
 const { buildAgentIdentityEnv, stripReservedAgentEnv } = await import(`../../cli/services/agentIdentityEnv.js${moduleSuffix}`);
+const { verifySoulGatewayApiKey, getSoulGatewayPublicKey } = await import(`../../cli/services/soulGatewaySubjectKey.js${moduleSuffix}`);
 
 test.after(() => {
     process.chdir(originalCwd);
@@ -60,13 +61,57 @@ test('the workspace master key is NEVER injected into an agent', () => {
 test('buildAgentIdentityEnv is the single shared injector (docker, bwrap, lifecycle)', () => {
     const principal = deriveAgentPrincipalId('AssistOSExplorer', 'dpuAgent');
     const idEnv = buildAgentIdentityEnv(principal);
-    // Exactly the three identity keys — no master / derived-master ever leaks.
-    assert.deepEqual(Object.keys(idEnv).sort(), ['PLOINKY_AGENT_ID', 'PLOINKY_AGENT_PRINCIPAL', 'PLOINKY_AGENT_SECRET']);
+    // Exactly this key set — no master / derived-master / private material ever
+    // leaks, and no unexpected key sneaks in. Updated for the signed Soul Gateway
+    // identity material (signed key + alias + public verification key + provenance).
+    assert.deepEqual(Object.keys(idEnv).sort(), [
+        'PLOINKY_AGENT_API_KEY',
+        'PLOINKY_AGENT_ID',
+        'PLOINKY_AGENT_PRINCIPAL',
+        'PLOINKY_AGENT_SECRET',
+        'PLOINKY_ENV_SOURCE_PLOINKY_AGENT_API_KEY',
+        'PLOINKY_ENV_SOURCE_PLOINKY_SOUL_GATEWAY_API_PUBLIC_KEY',
+        'PLOINKY_ENV_SOURCE_SOUL_GATEWAY_API_KEY',
+        'PLOINKY_SOUL_GATEWAY_API_PUBLIC_KEY',
+        'SOUL_GATEWAY_API_KEY',
+    ]);
     assert.equal(idEnv.PLOINKY_AGENT_ID, principal);
     assert.equal(idEnv.PLOINKY_AGENT_PRINCIPAL, principal);
     assert.equal(idEnv.PLOINKY_AGENT_SECRET, deriveAgentRequestSecret(principal));
     assert.match(idEnv.PLOINKY_AGENT_SECRET, /^[0-9a-f]{64}$/);
     assert.notEqual(idEnv.PLOINKY_AGENT_SECRET, deriveDerivedMasterKey().toString('hex'));
+    // Provenance markers flag the generated identity material.
+    assert.equal(idEnv.PLOINKY_ENV_SOURCE_PLOINKY_AGENT_API_KEY, 'generated');
+    assert.equal(idEnv.PLOINKY_ENV_SOURCE_SOUL_GATEWAY_API_KEY, 'generated');
+    assert.equal(idEnv.PLOINKY_ENV_SOURCE_PLOINKY_SOUL_GATEWAY_API_PUBLIC_KEY, 'generated');
+});
+
+test('the signed Soul Gateway key + alias are minted from the canonical subject and verify', () => {
+    const principal = deriveAgentPrincipalId('AssistOSExplorer', 'dpuAgent');
+    const idEnv = buildAgentIdentityEnv(principal);
+    // The canonical key and the compatibility alias are the SAME signed key.
+    assert.equal(idEnv.PLOINKY_AGENT_API_KEY, idEnv.SOUL_GATEWAY_API_KEY);
+    // It starts with the canonical subject id followed by the `|` delimiter.
+    assert.ok(idEnv.PLOINKY_AGENT_API_KEY.startsWith(`${principal}|`));
+    assert.ok(idEnv.SOUL_GATEWAY_API_KEY.startsWith('agent:AssistOSExplorer/dpuAgent|'));
+    // The public verification key is present and non-empty.
+    assert.equal(typeof idEnv.PLOINKY_SOUL_GATEWAY_API_PUBLIC_KEY, 'string');
+    assert.ok(idEnv.PLOINKY_SOUL_GATEWAY_API_PUBLIC_KEY.length > 0);
+    assert.equal(idEnv.PLOINKY_SOUL_GATEWAY_API_PUBLIC_KEY, getSoulGatewayPublicKey());
+    // The signature actually verifies against the injected public key, and the
+    // recovered subject is exactly the canonical agent principal.
+    assert.deepEqual(
+        verifySoulGatewayApiKey(idEnv.PLOINKY_AGENT_API_KEY, idEnv.PLOINKY_SOUL_GATEWAY_API_PUBLIC_KEY),
+        { subjectId: principal, subjectType: 'agent' },
+    );
+    assert.deepEqual(
+        verifySoulGatewayApiKey(idEnv.SOUL_GATEWAY_API_KEY, idEnv.PLOINKY_SOUL_GATEWAY_API_PUBLIC_KEY),
+        { subjectId: principal, subjectType: 'agent' },
+    );
+    // No private signing material is ever exposed in the env object.
+    for (const value of Object.values(idEnv)) {
+        assert.ok(!String(value).includes('PRIVATE KEY'), 'no private key material in identity env');
+    }
 });
 
 test('buildAgentIdentityEnv fails closed without a principal id', () => {
@@ -98,6 +143,42 @@ test('profile config cannot inject a master key or override the agent secret (bw
     assert.equal(env.PLOINKY_AGENT_SECRET, deriveAgentRequestSecret(principal)); // authoritative wins
 });
 
+test('manifest/profile cannot override the generated Soul Gateway signed key, alias, or public key (bwrap)', () => {
+    const workDir = path.join(tempDir, 'work', 'hardened-soul');
+    fs.mkdirSync(workDir, { recursive: true });
+    const principal = deriveAgentPrincipalId('AssistOSExplorer', 'dpuAgent');
+    const idEnv = buildAgentIdentityEnv(principal);
+    // A manifest env and a profile env that both try to substitute their own signed
+    // key / alias / public key and forge a provenance marker. The reserved-name
+    // strip runs before the authoritative identity is asserted, so all are dropped.
+    const env = buildFullEnvMap('dpuAgent', {
+        env: {
+            PLOINKY_AGENT_API_KEY: 'agent:AssistOSExplorer/dpuAgent|forged',
+            PLOINKY_SOUL_GATEWAY_API_PUBLIC_KEY: 'attacker-public-key',
+        },
+    }, {
+        env: {
+            SOUL_GATEWAY_API_KEY: 'agent:AssistOSExplorer/dpuAgent|forged-alias',
+            PLOINKY_ENV_SOURCE_PLOINKY_AGENT_API_KEY: 'manifest',
+            SAFE: 'ok',
+        },
+    }, workDir, 'AssistOSExplorer', 'dev');
+    assert.equal(env.SAFE, 'ok');                                     // ordinary env survives
+    // The authoritative generated values win for every reserved name.
+    assert.equal(env.PLOINKY_AGENT_API_KEY, idEnv.PLOINKY_AGENT_API_KEY);
+    assert.equal(env.SOUL_GATEWAY_API_KEY, idEnv.SOUL_GATEWAY_API_KEY);
+    assert.equal(env.PLOINKY_AGENT_API_KEY, env.SOUL_GATEWAY_API_KEY);
+    assert.equal(env.PLOINKY_SOUL_GATEWAY_API_PUBLIC_KEY, idEnv.PLOINKY_SOUL_GATEWAY_API_PUBLIC_KEY);
+    assert.equal(env.PLOINKY_ENV_SOURCE_PLOINKY_AGENT_API_KEY, 'generated');
+    // The forged values are gone; the surviving key still verifies as the agent.
+    assert.ok(!env.PLOINKY_AGENT_API_KEY.includes('forged'));
+    assert.notEqual(env.PLOINKY_SOUL_GATEWAY_API_PUBLIC_KEY, 'attacker-public-key');
+    assert.deepEqual(
+        verifySoulGatewayApiKey(env.PLOINKY_AGENT_API_KEY, env.PLOINKY_SOUL_GATEWAY_API_PUBLIC_KEY),
+        { subjectId: principal, subjectType: 'agent' },
+    );
+});
+
 test('the bwrap full env map matches the shared identity injector exactly', () => {
     // Docker and lifecycle build identity env through the same helper, so proving
     // bwrap's full env map equals buildAgentIdentityEnv covers all three paths.
@@ -106,4 +187,11 @@ test('the bwrap full env map matches the shared identity injector exactly', () =
     assert.equal(env.PLOINKY_AGENT_ID, idEnv.PLOINKY_AGENT_ID);
     assert.equal(env.PLOINKY_AGENT_PRINCIPAL, idEnv.PLOINKY_AGENT_PRINCIPAL);
     assert.equal(env.PLOINKY_AGENT_SECRET, idEnv.PLOINKY_AGENT_SECRET);
+    // The generated Soul Gateway identity material flows through the bwrap path too.
+    assert.equal(env.PLOINKY_AGENT_API_KEY, idEnv.PLOINKY_AGENT_API_KEY);
+    assert.equal(env.SOUL_GATEWAY_API_KEY, idEnv.SOUL_GATEWAY_API_KEY);
+    assert.equal(env.PLOINKY_SOUL_GATEWAY_API_PUBLIC_KEY, idEnv.PLOINKY_SOUL_GATEWAY_API_PUBLIC_KEY);
+    assert.equal(env.PLOINKY_ENV_SOURCE_PLOINKY_AGENT_API_KEY, 'generated');
+    assert.equal(env.PLOINKY_ENV_SOURCE_SOUL_GATEWAY_API_KEY, 'generated');
+    assert.equal(env.PLOINKY_ENV_SOURCE_PLOINKY_SOUL_GATEWAY_API_PUBLIC_KEY, 'generated');
 });
