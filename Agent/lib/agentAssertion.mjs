@@ -1,7 +1,7 @@
 import crypto from 'node:crypto';
 
 import { signHmacJwt } from './jwtSign.mjs';
-import { computeRchTool } from './requestHash.mjs';
+import { computeRchTool, computeRchHttp, sha256RawBodyHash } from './requestHash.mjs';
 import { readAgentSecret, expectedAudienceForSelf } from './invocationAuth.mjs';
 
 /**
@@ -17,19 +17,17 @@ import { readAgentSecret, expectedAudienceForSelf } from './invocationAuth.mjs';
 
 const ASSERTION_TTL_SECONDS = 60;
 
-export function signAgentAssertion({
-    method = 'POST',
-    path = '/mcp',
-    targetAgent,
-    tool,
-    argumentsObj = {},
-    env = process.env,
-}) {
-    const secret = readAgentSecret(env);
+/**
+ * Internal helper that builds and signs the `typ:'agent-assertion'` payload from
+ * an already-computed `rch`. Both the MCP signer (`computeRchTool`) and the HTTP
+ * signer (`computeRchHttp`) funnel through here so the payload shape, the
+ * `tool`-optional behavior, and the empty-target/empty-secret guards stay
+ * identical regardless of how `rch` was derived.
+ */
+function signAgentAssertionWithRch({ secret, self, method, path, targetAgent, tool, rch }) {
     if (!secret) {
         throw new Error('agentAssertion: PLOINKY_AGENT_SECRET not configured');
     }
-    const self = expectedAudienceForSelf(env);
     if (!self) {
         throw new Error('agentAssertion: PLOINKY_AGENT_ID not configured');
     }
@@ -40,7 +38,6 @@ export function signAgentAssertion({
         throw new Error('agentAssertion: targetAgent is required');
     }
     const iat = Math.floor(Date.now() / 1000);
-    const rch = computeRchTool({ method, path, tool, arguments: argumentsObj });
     const payload = {
         typ: 'agent-assertion',
         iss: self,
@@ -60,6 +57,57 @@ export function signAgentAssertion({
     return signHmacJwt({ payload, secret });
 }
 
+export function signAgentAssertion({
+    method = 'POST',
+    path = '/mcp',
+    targetAgent,
+    tool,
+    argumentsObj = {},
+    env = process.env,
+}) {
+    // MCP transport: the signed surface is {method, path, tool, arguments}.
+    const rch = computeRchTool({ method, path, tool, arguments: argumentsObj });
+    return signAgentAssertionWithRch({
+        secret: readAgentSecret(env),
+        self: expectedAudienceForSelf(env),
+        method,
+        path,
+        targetAgent,
+        tool,
+        rch,
+    });
+}
+
+/**
+ * HTTP-surface signer for agent-to-agent OpenAI calls. The signed `rch` binds the
+ * exact raw request body bytes (`sha256RawBodyHash(body)`) plus method/path/query,
+ * NOT a canonical-JSON argument set — so this path uses `computeRchHttp`, never
+ * `computeRchTool`. The router verifies against the same buffered bytes before it
+ * proxies and mints its own Router Request token.
+ */
+export function signAgentHttpAssertion({
+    method = 'POST',
+    path,
+    query = '',
+    body = Buffer.alloc(0),
+    targetAgent,
+    tool,
+    env = process.env,
+}) {
+    const bodyHash = sha256RawBodyHash(body);
+    const rch = computeRchHttp({ method, path, query, bodyHash });
+    return signAgentAssertionWithRch({
+        secret: readAgentSecret(env),
+        self: expectedAudienceForSelf(env),
+        method,
+        path,
+        targetAgent,
+        tool,
+        rch,
+    });
+}
+
 export default {
     signAgentAssertion,
+    signAgentHttpAssertion,
 };

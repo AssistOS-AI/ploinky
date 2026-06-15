@@ -132,7 +132,7 @@ export function proxyHttpPassthrough(req, res, targetPort, agentPath, extraHeade
     req.pipe(upstream, { end: true });
 }
 
-function resolveHttpServiceInvocationMaxBodyBytes(env = process.env) {
+export function resolveHttpServiceInvocationMaxBodyBytes(env = process.env) {
     const raw = String(env?.PLOINKY_HTTP_SERVICE_INVOCATION_MAX_BODY_BYTES || '').trim();
     if (!raw) return DEFAULT_HTTP_SERVICE_INVOCATION_MAX_BODY_BYTES;
     const parsed = Number(raw);
@@ -161,7 +161,7 @@ function buildBufferedProxyHeaders(req, targetPort, body, extraHeaders = {}) {
     return headers;
 }
 
-function proxyHttpBuffered(req, res, targetPort, agentPath, body, extraHeaders = {}) {
+export function proxyHttpBuffered(req, res, targetPort, agentPath, body, extraHeaders = {}) {
     const pathWithLeadingSlash = agentPath.startsWith('/') ? agentPath : `/${agentPath}`;
     const upstream = http.request({
         hostname: '127.0.0.1',
@@ -184,7 +184,7 @@ function proxyHttpBuffered(req, res, targetPort, agentPath, body, extraHeaders =
     upstream.end(body);
 }
 
-function readRequestBody(req, {
+export function readRequestBody(req, {
     maxBytes = DEFAULT_HTTP_SERVICE_INVOCATION_MAX_BODY_BYTES,
     onSuccess,
     onError,

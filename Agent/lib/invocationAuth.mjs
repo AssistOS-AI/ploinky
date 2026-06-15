@@ -3,6 +3,14 @@ import { verifyRouterRequestToken } from './requestSignedTokens.mjs';
 import { computeRchHttp, sha256RawBodyHash } from './requestHash.mjs';
 
 const httpServiceReplayCache = createMemoryReplayCache({ maxSize: 4096 });
+const openAiServiceReplayCache = createMemoryReplayCache({ maxSize: 4096 });
+
+// Tool name the router binds into the Router Request token it mints for a
+// verified agent-to-agent OpenAI call. Kept here so router (minter) and agent
+// (verifier) share the single source of truth. The HTTP path of an OpenAI chat
+// completion is always the agent-internal `/v1/chat/completions`.
+export const OPENAI_CHAT_COMPLETIONS_TOOL = '__openai_chat_completions__';
+export const OPENAI_CHAT_COMPLETIONS_PATH = '/v1/chat/completions';
 
 export function readHeaderValue(headers = {}, headerName) {
     const unwrap = (value) => {
@@ -187,6 +195,63 @@ export function verifyHttpServiceAuthInfoFromHeaders(headers = {}, {
     };
 }
 
+// Verify the router-minted Router Request token for an agent-to-agent OpenAI
+// chat-completions call. The router places the token inside `x-ploinky-auth-info`
+// (an `{ invocationToken, invocationBody }` envelope, like the HTTP-service flow)
+// and the receiving agent rebinds it to the EXACT raw request body bytes it
+// received. The signed surface is the fixed OpenAI tool/path, so a token minted
+// for any other surface (a different path, the `__http_service__` tool, an MCP
+// call) is rejected even when its HMAC is valid.
+export function verifyOpenAiServiceAuthInfoFromHeaders(headers = {}, {
+    env = process.env,
+    replayCache,
+    body = Buffer.alloc(0),
+    bodyHash,
+} = {}) {
+    const parsed = parseHttpServiceAuthInfo(headers);
+    if (!parsed.ok) {
+        return parsed;
+    }
+
+    const authInfo = parsed.authInfo;
+    const rawToken = typeof authInfo.invocationToken === 'string' ? authInfo.invocationToken.trim() : '';
+    if (!rawToken) {
+        return { ok: false, reason: 'missing OpenAI service invocation token' };
+    }
+
+    const expectedMethod = 'POST';
+    const expectedPath = OPENAI_CHAT_COMPLETIONS_PATH;
+    const expectedQuery = '';
+    const expectedBodyHash = bodyHash === undefined || bodyHash === null
+        ? sha256RawBodyHash(body)
+        : String(bodyHash);
+
+    const verified = verifyRouterRequestFromHeaders(
+        { authorization: `Bearer ${rawToken}` },
+        {
+            env,
+            replayCache: replayCache || openAiServiceReplayCache,
+            method: expectedMethod,
+            path: expectedPath,
+            tool: OPENAI_CHAT_COMPLETIONS_TOOL,
+            rch: computeRchHttp({
+                method: expectedMethod,
+                path: expectedPath,
+                query: expectedQuery,
+                bodyHash: expectedBodyHash,
+            }),
+        },
+    );
+    if (!verified.ok) {
+        return verified;
+    }
+    return {
+        ...verified,
+        authInfo,
+        bodyHash: expectedBodyHash,
+    };
+}
+
 export default {
     readHeaderValue,
     hasInvocationTokenHeader,
@@ -196,5 +261,8 @@ export default {
     hashHttpServiceBody,
     parseHttpServiceAuthInfo,
     verifyHttpServiceAuthInfoFromHeaders,
+    verifyOpenAiServiceAuthInfoFromHeaders,
     verifyRouterRequestFromHeaders,
+    OPENAI_CHAT_COMPLETIONS_TOOL,
+    OPENAI_CHAT_COMPLETIONS_PATH,
 };

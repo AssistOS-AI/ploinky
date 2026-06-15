@@ -10,9 +10,10 @@ import {
 } from '../lib/jwtVerify.mjs';
 import {
     hasInvocationTokenHeader,
-    verifyRouterRequestFromHeaders
+    verifyRouterRequestFromHeaders,
+    verifyOpenAiServiceAuthInfoFromHeaders
 } from '../lib/invocationAuth.mjs';
-import { computeRchTool } from '../lib/requestHash.mjs';
+import { computeRchTool, sha256RawBodyHash } from '../lib/requestHash.mjs';
 import { describeShellFailure } from '../lib/toolError.mjs';
 import {
     buildDefaultOpenAiChatResponse,
@@ -593,6 +594,56 @@ function readJsonBody(req) {
         });
         req.on('error', (error) => resolve({ ok: false, error }));
     });
+}
+
+// Buffer the raw request bytes ONCE and also parse them as JSON. The OpenAI
+// chat-completions path needs the exact raw bytes (for sha256RawBodyHash, to
+// rebind the router-minted token) AND the parsed body (for the handler). Parsing
+// the SAME buffer guarantees the hash matches what the router signed.
+function readRawAndJsonBody(req) {
+    return new Promise((resolve) => {
+        const chunks = [];
+        req.on('data', chunk => chunks.push(chunk));
+        req.on('end', () => {
+            const rawBody = Buffer.concat(chunks);
+            if (!rawBody.length) {
+                resolve({ ok: true, rawBody, body: {} });
+                return;
+            }
+            try {
+                resolve({ ok: true, rawBody, body: JSON.parse(rawBody.toString('utf8')) });
+            } catch (error) {
+                resolve({ ok: false, rawBody, error });
+            }
+        });
+        req.on('error', (error) => resolve({ ok: false, rawBody: Buffer.alloc(0), error }));
+    });
+}
+
+// When the router proxies a verified agent-to-agent OpenAI call it carries a
+// Router Request token in `x-ploinky-auth-info`. The plan is "verify when one is
+// present": if the header is absent, preserve the existing behavior (Task 5
+// default responder / configured handler). When present, the token MUST verify
+// against this agent's own secret, the fixed OpenAI surface, and the EXACT raw
+// body bytes — any mismatch (method/path/tool/audience/expiry/replay/body-hash)
+// is a 401 BEFORE the handler runs. Returns true when the request was rejected.
+function rejectInvalidOpenAiRouterToken(req, res, rawBody) {
+    const raw = req.headers ? req.headers['x-ploinky-auth-info'] : undefined;
+    const present = (Array.isArray(raw) ? raw[0] : raw);
+    if (!present || typeof present !== 'string' || !present.trim()) {
+        return false;
+    }
+    const verified = verifyOpenAiServiceAuthInfoFromHeaders(req.headers, {
+        env: process.env,
+        replayCache: invocationReplayCache,
+        body: rawBody,
+        bodyHash: sha256RawBodyHash(rawBody),
+    });
+    if (!verified.ok) {
+        sendOpenAiError(res, 401, 'invocation_rejected', 'invalid_request_error');
+        return true;
+    }
+    return false;
 }
 
 function sendOpenAiError(res, statusCode, message, type = 'server_error') {
@@ -1222,8 +1273,14 @@ async function main() {
                 return;
             }
             if (method === 'POST' && u.pathname === OPENAI_CHAT_COMPLETIONS_PATH) {
-                readJsonBody(req)
+                readRawAndJsonBody(req)
                     .then(result => {
+                        // Verify the router-minted token (if present) against the
+                        // EXACT raw bytes BEFORE parsing/handling. A bad token is a
+                        // 401 even when the JSON itself is well-formed.
+                        if (rejectInvalidOpenAiRouterToken(req, res, result.rawBody)) {
+                            return;
+                        }
                         if (!result.ok) {
                             sendOpenAiError(res, 400, 'Invalid JSON body', 'invalid_request_error');
                             return;

@@ -46,6 +46,10 @@ import {
     OPENAI_AGENT_DISCOVERY_PATH,
     handleOpenAiAgentDiscoveryRoute,
 } from './openAiAgentDiscovery.js';
+import {
+    isDelegatedAgentOpenAiCall,
+    handleDelegatedAgentOpenAiCall,
+} from './agentOpenAiDelegation.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -321,6 +325,14 @@ async function processRequest(req, res) {
     const route = agentName ? apiRoutes[agentName] : null;
     const agentProxyPath = agentName ? buildAgentProxyPath(agentName, parsedUrl) : '';
     const isAgentMcpRoute = Boolean(agentName && (agentProxyPath === '/mcp' || agentProxyPath.startsWith('/mcp?') || agentProxyPath.startsWith('/mcp/')));
+    // Path-exact delegated agent OpenAI bypass: ONLY POST /<routeKey>/v1/chat/completions
+    // with an Agent Assertion. No other agent-prefixed HTTP path uses this bypass.
+    const isDelegatedAgentOpenAi = isDelegatedAgentOpenAiCall({
+        agentName,
+        method: req.method,
+        agentProxyPath,
+        req,
+    });
     const serviceDefinition = !agentName && !isRouterOwnedPath(pathname)
         ? resolveHttpServiceRoute(pathname)
         : null;
@@ -424,6 +436,10 @@ async function processRequest(req, res) {
         // Browser MCP keeps the existing surface auth (static fallback included).
         const authResult = await ensureAuthenticated(req, res, parsedUrl);
         if (!authResult.ok) return;
+    } else if (isDelegatedAgentOpenAi) {
+        // Agent-to-agent OpenAI call: the delegation handler verifies the HTTP
+        // Agent Assertion against the buffered body and mints a router-request
+        // token. Skip browser/session auth for this path-exact bypass only.
     } else if (httpRouteAccess) {
         // One executor for transparent agent routes and declared HTTP services.
         const accessResult = await ensureHttpRouteAccess(req, res, parsedUrl, httpRouteAccess);
@@ -467,6 +483,9 @@ async function processRequest(req, res) {
         }
         if (isAgentMcpRoute) {
             return handleAgentMcpRequest(req, res, route, agentName);
+        }
+        if (isDelegatedAgentOpenAi) {
+            return handleDelegatedAgentOpenAiCall(req, res, route, agentName, agentProxyPath);
         }
         // `__agent` control-plane paths are already refused at the top of the
         // dispatch (before http-service/passthrough handling), so anything that
