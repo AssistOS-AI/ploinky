@@ -66,6 +66,55 @@ function postToolCall(agentName, jsonRpcBody, assertion, userDelegationToken = '
     });
 }
 
+function getTaskStatus(agentName, taskId) {
+    const normalizedTaskId = String(taskId || '').trim();
+    if (!normalizedTaskId) {
+        throw new Error('AgentMcpClient: taskId is required');
+    }
+    const url = new URL(getRouterUrl());
+    url.pathname = `/${agentName}/task`;
+    url.searchParams.set('taskId', normalizedTaskId);
+    const httpModule = url.protocol === 'https:' ? https : http;
+    const assertion = signAgentAssertion({
+        method: 'GET',
+        path: '/task',
+        targetAgent: agentName,
+        tool: '__task_status__',
+        argumentsObj: { taskId: normalizedTaskId },
+    });
+    return new Promise((resolve, reject) => {
+        const req = httpModule.request({
+            hostname: url.hostname,
+            port: url.port || (url.protocol === 'https:' ? 443 : 80),
+            path: `${url.pathname}${url.search || ''}`,
+            method: 'GET',
+            headers: {
+                accept: 'application/json',
+                authorization: `Bearer ${assertion}`,
+            },
+        }, (res) => {
+            const chunks = [];
+            res.on('data', (chunk) => chunks.push(chunk));
+            res.on('end', () => {
+                const text = Buffer.concat(chunks).toString('utf8');
+                let json = null;
+                try { json = text ? JSON.parse(text) : null; } catch { json = null; }
+                if (res.statusCode >= 400 || !json) {
+                    reject(new Error(`agent task status failed (status ${res.statusCode}): ${(text || '').slice(0, 200)}`.trim()));
+                    return;
+                }
+                if (json.error) {
+                    reject(new Error(json.error.reason || json.error.detail || json.error.message || json.error));
+                    return;
+                }
+                resolve(json.task || json);
+            });
+        });
+        req.on('error', reject);
+        req.end();
+    });
+}
+
 function unwrapToolResult(result) {
     const content = Array.isArray(result?.content) ? result.content : [];
     if (content.length !== 1) {
@@ -128,6 +177,7 @@ export async function createAgentClient(agentName, options = {}) {
 
     return {
         callTool,
+        getTaskStatus: (taskId) => getTaskStatus(agentName, taskId),
         connect: async () => {},
         listTools: unsupported('listTools'),
         listResources: unsupported('listResources'),

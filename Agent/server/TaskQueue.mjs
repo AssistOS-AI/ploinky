@@ -69,10 +69,17 @@ export class TaskQueue {
                     if (!entry || typeof entry !== 'object' || typeof entry.id !== 'string') {
                         continue;
                     }
+                    const commandSpec = entry.commandSpec || {};
                     const task = {
                         id: entry.id,
                         toolName: entry.toolName,
-                        commandSpec: entry.commandSpec,
+                        commandSpec: {
+                            command: commandSpec.command,
+                            args: Array.isArray(commandSpec.args) ? [...commandSpec.args] : [],
+                            cwd: commandSpec.cwd,
+                            env: commandSpec.env ? { ...(commandSpec.env) } : {},
+                            timeoutMs: commandSpec.timeoutMs,
+                        },
                         payload: entry.payload,
                         status: entry.status || 'pending',
                         timeoutMs: entry.timeoutMs ?? null,
@@ -205,6 +212,9 @@ export class TaskQueue {
             toolName,
             commandSpec: {
                 command: commandSpec.command,
+                args: Array.isArray(commandSpec.args)
+                    ? [...commandSpec.args]
+                    : [],
                 cwd: commandSpec.cwd,
                 env: { ...(commandSpec.env || {}) },
                 timeoutMs: commandSpec.timeoutMs
@@ -280,6 +290,13 @@ export class TaskQueue {
             if (!task.commandSpec || !task.commandSpec.command) {
                 throw new Error('Missing command specification for task');
             }
+            const forwardToHostLog = (target, chunk) => {
+                try {
+                    target.write(chunk);
+                } catch (_) {
+                    // Ignore log forwarding failures.
+                }
+            };
             const result = await this.executor(task.commandSpec, task.payload, {
                 onSpawn: (child) => {
                     if (Number.isFinite(task.timeoutMs) && task.timeoutMs > 0) {
@@ -296,9 +313,11 @@ export class TaskQueue {
                     }
                 },
                 onStdoutChunk: (chunk) => {
+                    forwardToHostLog(process.stdout, chunk);
                     this.appendTaskLog(task.id, chunk);
                 },
                 onStderrChunk: (chunk) => {
+                    forwardToHostLog(process.stderr, chunk);
                     this.appendTaskLog(task.id, chunk);
                 }
             });
