@@ -42,6 +42,10 @@ import {
     SOUL_GATEWAY_USER_API_KEY_PATH,
     handleSoulGatewayUserApiKeyRoute,
 } from './soulGatewayUserKeyRoute.js';
+import {
+    OPENAI_AGENT_DISCOVERY_PATH,
+    handleOpenAiAgentDiscoveryRoute,
+} from './openAiAgentDiscovery.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -397,6 +401,15 @@ async function processRequest(req, res) {
     // Authenticated + never policy-routable; handles its own authorization.
     if (pathname === '/policy/command') {
         const handled = await policy.commandInvoker.handle(req, res);
+        if (handled) return;
+    }
+
+    // Router-owned, agent-authenticated discovery of enabled OpenAI-style chat
+    // backends for Soul Gateway. Dispatched here (before the session-auth gate)
+    // because it authenticates an HTTP Agent Assertion itself, not a browser
+    // session: a session is neither sufficient nor required.
+    if (pathname === OPENAI_AGENT_DISCOVERY_PATH) {
+        const handled = handleOpenAiAgentDiscoveryRoute(req, res, parsedUrl);
         if (handled) return;
     }
 

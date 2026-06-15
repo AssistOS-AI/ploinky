@@ -30,7 +30,7 @@ function readJsonFileIfExists(filePath) {
     }
 }
 
-function readEnabledAgentManifest(routeKey, routes = {}) {
+export function readEnabledAgentManifest(routeKey, routes = {}) {
     const normalizedRouteKey = String(routeKey || '').trim();
     if (!normalizedRouteKey) return null;
 
