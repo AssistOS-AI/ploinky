@@ -67,9 +67,54 @@ Direct agent-to-agent calls are forbidden. The source agent signs an Agent Asser
 
 ### Secret Boundaries and Injected Environment
 
-Each agent receives only `PLOINKY_AGENT_ID` + `PLOINKY_AGENT_SECRET` (+ principal alias `PLOINKY_AGENT_PRINCIPAL`). `PLOINKY_MASTER_KEY` and `PLOINKY_DERIVED_MASTER_KEY` are never injected into an agent (asserted by `tests/unit/agentEnvInjection.test.mjs`). The agent verifier reads only `PLOINKY_AGENT_SECRET` and intentionally has no fallback to the master or a shared key. Router and agent logs must not record secrets or whole JWTs.
+Every agent container receives the following reserved environment variables from the Ploinky launcher. Manifest-declared values with these names are stripped before injection:
+
+| Variable | Description |
+| --- | --- |
+| `PLOINKY_AGENT_ID` | Canonical agent principal: `agent:<repo>/<agentName>` |
+| `PLOINKY_AGENT_PRINCIPAL` | Alias for `PLOINKY_AGENT_ID` |
+| `PLOINKY_AGENT_SECRET` | Per-agent HMAC signing secret (hex) derived from master via HKDF |
+| `PLOINKY_AGENT_API_KEY` | Signed-subject Soul Gateway API key: `<subjectId>|<base64url-ed25519-sig>` |
+| `SOUL_GATEWAY_API_KEY` | Compatibility alias — same value as `PLOINKY_AGENT_API_KEY` |
+| `PLOINKY_SOUL_GATEWAY_API_PUBLIC_KEY` | Ed25519 public key for verifying signed-subject keys (Soul Gateway uses this) |
+| `PLOINKY_ENV_SOURCE_PLOINKY_AGENT_API_KEY` | Always `generated` (provenance marker) |
+| `PLOINKY_ENV_SOURCE_SOUL_GATEWAY_API_KEY` | Always `generated` (provenance marker) |
+
+`PLOINKY_MASTER_KEY` and `PLOINKY_DERIVED_MASTER_KEY` are never injected into an agent (asserted by `tests/unit/agentEnvInjection.test.mjs`). The agent verifier reads only `PLOINKY_AGENT_SECRET` with no fallback to the master or a shared key. Router and agent logs must not record secrets or whole JWTs.
+
+The `SOUL_GATEWAY_API_KEY` alias is injected by the launcher as a signed-subject value, NOT as a manifest `sharedGeneratedSecret`. Agents that already consume `SOUL_GATEWAY_API_KEY` for Soul Gateway calls continue to work without changes.
 
 This remains true even for delegated-user flows. Agents do not receive the router's session key or delegation-signing key and cannot mint User Delegation Grants themselves; they still receive only their own per-agent secret.
+
+### Router Discovery Endpoint and Delegated OpenAI Route
+
+**Discovery endpoint:** `GET /api/router/openai-agent-discovery` is an agent-only endpoint. To call it, an agent signs an HTTP Agent Assertion bound to the request surface with `computeRchHttp()` (NOT `computeRchTool()`), declaring tool `__openai_agent_discovery__`, target `ploinky-router`, and a single-use `jti`. The router returns:
+
+```json
+{
+  "complete": true,
+  "agents": [
+    {
+      "subjectId": "agent:<repo>/<agent>",
+      "routeKey": "...",
+      "repo": "...",
+      "agent": "...",
+      "name": "...",
+      "routerPath": "/<routeKey>",
+      "chatCompletionsPath": "/<routeKey>/v1/chat/completions",
+      "supportsStreaming": false,
+      "usesDefaultOpenAiResponder": true,
+      "manifest": {}
+    }
+  ]
+}
+```
+
+No container-internal `127.0.0.1` URLs appear in the response; all paths are router-relative.
+
+**Delegated OpenAI route:** Agent-to-agent calls to `POST /<routeKey>/v1/chat/completions` are router-mediated. The source agent presents a delegated HTTP Agent Assertion (bound via `computeRchHttp()` over the buffered body). The router verifies the assertion, strips `x-ploinky-auth-info`, mints a Router Request token bound to the exact body, and proxies to the target AgentServer. The target verifies the Router Request before running its `/v1/chat/completions` handler.
+
+**Default AgentServer OpenAI responder:** Every agent answers `POST /v1/chat/completions`. When a manifest has no `endpoints.chatCompletions`, AgentServer uses a DEFAULT capability/listability responder: it describes the agent and its MCP tools in an OpenAI-compatible message, does NOT invoke tools, and rejects `stream: true`. Manifest `endpoints.chatCompletions` is the only way to provide real chat behavior; it replaces the default responder for that agent.
 
 ### Errors
 
