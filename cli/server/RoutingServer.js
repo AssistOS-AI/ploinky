@@ -38,6 +38,10 @@ import { setupProcessLifecycle } from './utils/processLifecycle.js';
 import { policy } from './policy/index.js';
 import { createHttpServiceProvider, createManifestRouteProvider } from './policy/HttpRouteProviders.js';
 import { hasInternalAgentSegment } from './internalAgentPath.js';
+import {
+    SOUL_GATEWAY_USER_API_KEY_PATH,
+    handleSoulGatewayUserApiKeyRoute,
+} from './soulGatewayUserKeyRoute.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -147,6 +151,7 @@ function isRouterOwnedPath(pathname) {
         || pathname === '/mcp/'
         || pathname.startsWith('/auth/')
         || pathname.startsWith('/api/agents/')
+        || pathname.startsWith('/api/router/')
         // Internal, non-policy-routable router-owned routes (DS014).
         || pathname === '/policy/command'
         || pathname === '/whitelist'
@@ -413,6 +418,14 @@ async function processRequest(req, res) {
     } else {
         const authResult = await ensureAuthenticated(req, res, parsedUrl);
         if (!authResult.ok) return;
+    }
+
+    // Router-owned: mint a signed Soul Gateway user API key. Reached only after
+    // the auth gate above populated req.user (the handler enforces its own 401
+    // for any unauthenticated caller and derives admin status internally).
+    if (pathname === SOUL_GATEWAY_USER_API_KEY_PATH) {
+        const handled = await handleSoulGatewayUserApiKeyRoute(req, res, parsedUrl);
+        if (handled) return;
     }
 
     // Route to appropriate handler
