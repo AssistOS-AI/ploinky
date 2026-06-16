@@ -36,6 +36,8 @@ Profiles must be deploy-complete for non-sensitive configuration. A required man
 
 Generated env entries ignore same-named operator values by default. A generated entry may opt into an explicit override by declaring `explicitOverride: true`; Ploinky then uses the explicit value when present and injects `PLOINKY_ENV_SOURCE_<ENV_NAME>=explicit`. If a generated entry declares `explicitOverrideRequires: ["OTHER_ENV_NAME"]`, Ploinky uses the explicit value only when the generated entry and every listed companion are present in the normal explicit env sources. Generated values are injected with `PLOINKY_ENV_SOURCE_<ENV_NAME>=generated` so shared runtime libraries can distinguish an embedded generated credential from an operator-supplied external credential without inspecting secret values. Cross-agent generated credentials must use `sharedGeneratedSecret: true` and share by source env name, not by custom repo/agent/name fields.
 
+The `SOUL_GATEWAY_API_KEY` explicit-override behavior used by AchillesCLI is a temporary compatibility exception, not a canonical Ploinky manifest pattern. It exists only to let an operator-provided hosted Soul Gateway key win over the generated local signed-subject alias while `soul.axiologic.dev` is still required. The canonical direction remains the local deployed Soul Gateway reached with generated Ploinky agent credentials; new agents must not copy this exception unless they are part of the same migration window.
+
 The manifest `network` object selects the container's network namespace. The default is a workspace-defined bridge selected by `network.name` (with optional `network.aliases` for sibling DNS). When an agent declares `network.mode: "host"`, the runtime must run the container with `--network host`, must not create or attach a named bridge, must not emit `-p` port publishes, and must not register network aliases. Host-network agents still declare `ports` for documentation and readiness probing; the runtime treats those declarations as probe metadata only. Sibling agents on a bridge can reach a host-network agent through the runtime-provided host gateway entry (for example `host.containers.internal`) rather than through a bridge alias.
 
 The `network` object may also be set inside a profile block (`manifest.profiles.<profile>.network`) and overrides the root manifest `network` when the active profile defines one. This mirrors how `ports`, `env`, and `enable` already specialize per profile and is the supported way to vary the network namespace across deployment targets — for example, a media SFU that needs `network.mode: "host"` in `prod` (where the platform supports it and the UDP/SRC-NAT workaround applies) while keeping a bridge-network configuration in `dev` and `default` (so a developer workstation that cannot expose host-network container ports — notably macOS where podman runs inside a VM — can still serve the readiness probe and reach sibling agents through bridge aliases).
@@ -128,6 +130,19 @@ The manifest belongs to an agent, but the router-visible path belongs to the ena
 
 Response:
 The agent that declares a dependency is the right owner for that dependency's repository sources. If the root agent had to duplicate every transitive child repository, fresh deployments would become brittle whenever an intermediate agent added or reorganized its own dependencies. Recursively applying child manifests before dependency graph resolution keeps bootstrap generic, lets transitive manifests remain self-contained, and still fails closed through the normal missing-agent or strict branch-policy errors when no source exists.
+
+### Question #12: Why is the hosted Soul Gateway explicit override documented as temporary?
+
+Response:
+The override preserves current AchillesCLI startup behavior while the workspace still depends on `soul.axiologic.dev`. It deliberately lets an explicit `SOUL_GATEWAY_API_KEY` survive after generated agent identity is reasserted, but this is a migration bridge rather than a reusable manifest capability. Once the local Soul Gateway deployment is the only supported path, this exception should be removed and `SOUL_GATEWAY_API_KEY` should return to being only the generated compatibility alias described by DS013.
+
+Temporary implementation offsets:
+
+```text
+cli/services/docker/agentServiceManager.js:L295-L310
+cli/services/docker/agentServiceManager.js:L804-L812
+cli/services/docker/agentServiceManager.js:L875-L890
+```
 
 ## Conclusion
 
