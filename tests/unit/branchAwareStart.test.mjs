@@ -478,6 +478,80 @@ test('applyManifestDirectives: profile enable auto-installs missing prefixed rep
     fs.writeFileSync(path.join(tempDir, '.ploinky', 'profile'), 'default');
 });
 
+test('applyManifestDirectives: child manifest repos are applied before recursive enables resolve', async () => {
+    const workerRemote = createBareAgentRepo('childWorkerRepo', 'worker');
+    writeAgentManifest('toolRepo', 'tool', {
+        container: 'node:20',
+        repos: {
+            childWorkerRepo: workerRemote,
+        },
+        enable: ['childWorkerRepo/worker global'],
+    });
+    writeAgentManifest('staticChildRepos', 'app', {
+        container: 'node:20',
+        enable: ['toolRepo/tool global'],
+    });
+
+    await applyManifestDirectives('staticChildRepos/app');
+
+    const workerRepoPath = path.join(tempDir, '.ploinky', 'repos', 'childWorkerRepo');
+    assert.equal(fs.existsSync(workerRepoPath), true);
+    assert.equal(loadEnabledRepos().includes('childWorkerRepo'), true);
+
+    const agentsPath = path.join(tempDir, '.ploinky', 'agents.json');
+    const agents = JSON.parse(fs.readFileSync(agentsPath, 'utf8'));
+    assert.ok(
+        Object.values(agents).some((record) => (
+            record
+            && record.type === 'agent'
+            && record.repoName === 'childWorkerRepo'
+            && record.agentName === 'worker'
+            && record.runMode === 'global'
+        ))
+    );
+});
+
+test('applyManifestDirectives: duplicate aliased child enables are idempotent under strict policy', async () => {
+    writeAgentManifest('leafRepo', 'leaf', {
+        container: 'node:20',
+    });
+    writeAgentManifest('diamondARepo', 'a', {
+        container: 'node:20',
+        enable: ['leafRepo/leaf as diamondLeaf global'],
+    });
+    writeAgentManifest('diamondBRepo', 'b', {
+        container: 'node:20',
+        enable: ['leafRepo/leaf as diamondLeaf global'],
+    });
+    writeAgentManifest('staticDiamond', 'app', {
+        container: 'node:20',
+        enable: [
+            'diamondARepo/a global',
+            'diamondBRepo/b global',
+        ],
+    });
+
+    await assert.doesNotReject(() => applyManifestDirectives('staticDiamond/app', {
+        branchPolicy: {
+            branch: 'main',
+            repoBranches: {},
+            fallback: 'fail',
+            resetRepos: false,
+        },
+    }));
+
+    const agentsPath = path.join(tempDir, '.ploinky', 'agents.json');
+    const agents = JSON.parse(fs.readFileSync(agentsPath, 'utf8'));
+    const leafRecords = Object.values(agents).filter((record) => (
+        record
+        && record.type === 'agent'
+        && record.repoName === 'leafRepo'
+        && record.agentName === 'leaf'
+        && record.alias === 'diamondLeaf'
+    ));
+    assert.equal(leafRecords.length, 1);
+});
+
 // ---------------------------------------------------------------------------
 // Cleanup
 // ---------------------------------------------------------------------------

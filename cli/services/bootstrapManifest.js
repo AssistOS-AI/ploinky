@@ -3,6 +3,7 @@ import path from 'path';
 import * as repos from './repos.js';
 import { enableAgent } from './agents.js';
 import { findAgent } from './utils.js';
+import { loadAgents, saveAgents } from './workspace.js';
 import { isSsoProviderManifest } from './agentRegistry.js';
 import { PLOINKY_DIR } from './config.js';
 import { getActiveProfile } from './profileService.js';
@@ -85,10 +86,22 @@ function resolveManifestAuthMode(manifest) {
     return 'none';
 }
 
+function agentRefFromEnableSpec(spec) {
+    const raw = String(spec || '').trim();
+    if (!raw) return '';
+    const token = raw.split(/\s+/).filter(Boolean)[0] || '';
+    const slashIndex = token.indexOf('/');
+    const colonIndex = token.indexOf(':');
+    if (slashIndex !== -1 && colonIndex > slashIndex) {
+        return token.slice(0, colonIndex).trim();
+    }
+    return token;
+}
+
 function manifestForDirective(parsedDirective) {
     const spec = String(parsedDirective?.spec || '').trim();
     if (!spec) return null;
-    const agentRef = spec.split(/\s+/).filter(Boolean)[0] || '';
+    const agentRef = agentRefFromEnableSpec(spec);
     if (!agentRef) return null;
     try {
         const resolved = findAgent(agentRef);
@@ -118,13 +131,13 @@ function errorMessage(err) {
     return err && err.message ? err.message : String(err);
 }
 
-function manifestEnableEntries(manifest) {
+function manifestEnableEntries(manifest, profileOverride = '') {
     const entries = [];
     if (Array.isArray(manifest?.enable)) {
         entries.push(...manifest.enable);
     }
     try {
-        const activeProfile = getActiveProfile();
+        const activeProfile = profileOverride || getActiveProfile();
         const profileBlock = manifest?.profiles?.[activeProfile];
         if (profileBlock && Array.isArray(profileBlock.enable)) {
             entries.push(...profileBlock.enable);
@@ -167,14 +180,78 @@ function ensurePrefixedRepoInstalled(spec, branchPolicy) {
     }
 }
 
-export async function applyManifestDirectives(agentNameOrPath, { branchPolicy } = {}) {
+function readManifestTarget(agentNameOrPath) {
     let manifest;
+    let manifestPath;
     if (agentNameOrPath.endsWith('.json')) {
-        manifest = JSON.parse(fs.readFileSync(agentNameOrPath, 'utf8'));
+        manifestPath = agentNameOrPath;
+        manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
     } else {
-        const { manifestPath } = findAgent(agentNameOrPath);
+        const resolved = findAgent(agentRefFromEnableSpec(agentNameOrPath) || agentNameOrPath);
+        manifestPath = resolved.manifestPath;
         manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
     }
+    return { manifest, manifestPath };
+}
+
+function findEnabledDirectiveRecord(parsedDirective) {
+    const agentRef = agentRefFromEnableSpec(parsedDirective?.spec);
+    if (!agentRef) return null;
+    let resolved;
+    try {
+        resolved = findAgent(agentRef);
+    } catch (_) {
+        return null;
+    }
+    const alias = typeof parsedDirective?.alias === 'string' && parsedDirective.alias.trim()
+        ? parsedDirective.alias.trim()
+        : '';
+    const agents = loadAgents();
+    for (const [key, record] of Object.entries(agents || {})) {
+        if (key === '_config' || !record || record.type !== 'agent') continue;
+        if (record.repoName !== resolved.repo || record.agentName !== resolved.shortAgentName) continue;
+        if (alias) {
+            if (record.alias === alias) {
+                return { agents, key, record };
+            }
+            continue;
+        }
+        if (!record.alias) {
+            return { agents, key, record };
+        }
+    }
+    return null;
+}
+
+function ensureDirectiveEnabled(parsedDirective) {
+    const existing = findEnabledDirectiveRecord(parsedDirective);
+    if (existing) {
+        const profile = typeof parsedDirective?.profile === 'string' && parsedDirective.profile.trim()
+            ? parsedDirective.profile.trim().toLowerCase()
+            : '';
+        if (profile && existing.record.profile !== profile) {
+            existing.record.profile = profile;
+            existing.agents[existing.key] = existing.record;
+            saveAgents(existing.agents);
+        }
+        return;
+    }
+    enableAgent(parsedDirective.spec, undefined, undefined, parsedDirective.alias, undefined, {
+        profile: parsedDirective.profile,
+    });
+}
+
+async function applyManifestDirectivesInternal(agentNameOrPath, {
+    branchPolicy,
+    profile = '',
+    visited,
+} = {}) {
+    const { manifest, manifestPath } = readManifestTarget(agentNameOrPath);
+    const visitKey = `${path.resolve(manifestPath)}::${profile || ''}`;
+    if (visited.has(visitKey)) {
+        return;
+    }
+    visited.add(visitKey);
 
     const r = manifest.repos;
     if (r && typeof r === 'object') {
@@ -215,7 +292,7 @@ export async function applyManifestDirectives(agentNameOrPath, { branchPolicy } 
         }
     }
 
-    const en = manifestEnableEntries(manifest);
+    const en = manifestEnableEntries(manifest, profile);
     if (Array.isArray(en)) {
         for (const rawEntry of en) {
             try {
@@ -225,9 +302,15 @@ export async function applyManifestDirectives(agentNameOrPath, { branchPolicy } 
                 if (!shouldEnableDirectiveForManifest(parsed, manifest)) {
                     continue;
                 }
-                enableAgent(parsed.spec, undefined, undefined, parsed.alias, undefined, {
-                    profile: parsed.profile,
-                });
+                ensureDirectiveEnabled(parsed);
+                const childRef = agentRefFromEnableSpec(parsed.spec);
+                if (childRef) {
+                    await applyManifestDirectivesInternal(childRef, {
+                        branchPolicy,
+                        profile: parsed.profile || '',
+                        visited,
+                    });
+                }
             } catch (err) {
                 const message = errorMessage(err);
                 if (isStrictBranchPolicy(branchPolicy)) {
@@ -237,4 +320,11 @@ export async function applyManifestDirectives(agentNameOrPath, { branchPolicy } 
             }
         }
     }
+}
+
+export async function applyManifestDirectives(agentNameOrPath, { branchPolicy } = {}) {
+    return applyManifestDirectivesInternal(agentNameOrPath, {
+        branchPolicy,
+        visited: new Set(),
+    });
 }
