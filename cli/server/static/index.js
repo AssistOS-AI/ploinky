@@ -500,6 +500,50 @@ function serveWorkspaceFileRequest(req, res) {
     }
 }
 
+function serveWebLibRequest(req, res) {
+    try {
+        const parsed = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
+        const pathname = decodeURIComponent(parsed.pathname || '/');
+        if (!(pathname === '/web-libs' || pathname.startsWith('/web-libs/'))) {
+            return false;
+        }
+
+        const rel = pathname.replace(/^\/web-libs\/?/, '');
+        if (!rel) {
+            res.writeHead(404, { 'Content-Type': 'text/plain' });
+            res.end('Not Found');
+            return true;
+        }
+
+        const sanitized = sanitizeRelativeRequestPath(rel);
+        if (sanitized === null) {
+            res.writeHead(403, { 'Content-Type': 'text/plain' });
+            res.end('Forbidden');
+            return true;
+        }
+
+        const target = path.join(PROJECT_WEB_LIBS, sanitized);
+        if (!isPathWithinAllowedRoots([PROJECT_WEB_LIBS], target)) {
+            res.writeHead(403, { 'Content-Type': 'text/plain' });
+            res.end('Forbidden');
+            return true;
+        }
+
+        try {
+            const stat = fs.statSync(target);
+            if (stat.isFile() && sendFile(res, target)) return true;
+        } catch (_) { }
+
+        res.writeHead(404, { 'Content-Type': 'text/plain' });
+        res.end('Not Found');
+        return true;
+    } catch (_) {
+        res.writeHead(500, { 'Content-Type': 'text/plain' });
+        res.end('Internal Server Error');
+        return true;
+    }
+}
+
 export {
     getStaticHostPath,
     getStaticAgentName,
@@ -507,6 +551,7 @@ export {
     resolveFirstAvailable,
     sendFile,
     serveWorkspaceFileRequest,
+    serveWebLibRequest,
     serveStaticRequest,
 };
 

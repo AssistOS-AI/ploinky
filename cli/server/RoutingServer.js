@@ -167,8 +167,6 @@ function isRouterOwnedPath(pathname) {
         || pathname.startsWith('/api/router/')
         // Internal, non-policy-routable router-owned routes (DS014).
         || pathname === '/policy/command'
-        || pathname === '/whitelist'
-        || pathname.startsWith('/whitelist/')
         || pathname === '/metrics'
         || pathname === '/health/internal'
         || pathname === '/admin'
@@ -181,6 +179,7 @@ function isRouterOwnedPath(pathname) {
         || isRouteMount(pathname, '/status')
         || pathname === '/upload'
         || isRouteMount(pathname, '/blobs')
+        || isRouteMount(pathname, '/web-libs')
         || pathname === '/workspace-files'
         || pathname.startsWith('/workspace-files/');
 }
@@ -405,6 +404,10 @@ async function processRequest(req, res) {
         return;
     }
 
+    if (isRouteMount(pathname, '/web-libs')) {
+        return staticSrv.serveWebLibRequest(req, res);
+    }
+
     // DS014: any `__agent` segment is a router-owned agent control-plane path
     // (e.g. the share authorizer). The router reaches those itself over a direct
     // loopback call carrying a minted Router Request — the PUBLIC listener never
@@ -412,11 +415,6 @@ async function processRequest(req, res) {
     // passthrough handling can forward one to an agent. Generic 404 so the reply
     // does not confirm the internal route exists.
     if (hasInternalAgentSegment(pathname)) {
-        sendJsonResponse(res, 404, { error: 'not_found' });
-        return;
-    }
-
-    if (pathname === '/whitelist' || pathname.startsWith('/whitelist/')) {
         sendJsonResponse(res, 404, { error: 'not_found' });
         return;
     }
