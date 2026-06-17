@@ -16,7 +16,7 @@ import { getSecrets, createEnvWithSecrets, loadEnvFile } from './secretInjector.
 import { readSecretsFile } from './encryptedSecretsFile.js';
 import { buildEnvMap } from './secretVars.js';
 import { resolveAgentReadinessProtocol } from './startupReadiness.js';
-import { LOGS_DIR, PLOINKY_WORKSPACE_ROOT, ROUTING_FILE, RUNNING_DIR } from './config.js';
+import { LOGS_DIR, PLOINKY_CWD, PLOINKY_WORKSPACE_ROOT, ROUTING_FILE, RUNNING_DIR } from './config.js';
 import { classifyDependencyGraphWaitMode, resolveWorkspaceDependencyGraph, topologicallyGroupDependencyGraph } from './workspaceDependencyGraph.js';
 import { getAgentWorkDir } from './workspaceStructure.js';
 import { needsHostInstall } from './dependencyInstaller.js';
@@ -919,7 +919,7 @@ async function runCli(agentName, args) {
       }
     }
   }
-  const projPath = getConfiguredProjectPath(shortAgentName, repoName, registryRecord?.record?.alias);
+  const projPath = PLOINKY_CWD;
 
   // Determine actual runtime from registry (may differ from manifest if sandbox
   // failed and fell back to container during ensureAgentService)
