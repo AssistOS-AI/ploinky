@@ -2,6 +2,7 @@ import fs from 'fs';
 import path from 'path';
 import { PLOINKY_DIR } from './config.js';
 import * as repos from './repos.js';
+import { findAgent } from './utils.js';
 
 const DEFAULT_REPOS = [
     { name: 'basic', url: 'https://github.com/PloinkyRepos/Basic.git' },
@@ -64,6 +65,31 @@ export function bootstrap({ branchPolicy, staticAgent } = {}) {
             }
         }
     }
+
+    // The global --branch must also reach the static agent's OWN repo when the
+    // agent is named bare (e.g. `explorer`, not `AchillesIDE/explorer`).
+    // repoNameFromAgentRef() can't resolve a bare name, and findAgent() needs the
+    // repos on disk — so resolve it here, after the default repos are cloned, and
+    // switch that repo to the branch (default fallback keeps it on its current
+    // branch when the branch is absent). Repo-prefixed names are already handled
+    // in the loop above via policyForBootRepo.
+    if (branchPolicy?.branch && staticAgent && !repoNameFromAgentRef(staticAgent)) {
+        try {
+            const staticRepo = findAgent(String(staticAgent).trim())?.repo;
+            if (staticRepo && fs.existsSync(path.join(PLOINKY_DIR, 'repos', staticRepo))) {
+                repos.ensureRepoOnBranch(staticRepo, {
+                    branch: branchPolicy.branch,
+                    resetRepos: branchPolicy.resetRepos || false,
+                    fallback: branchPolicy.fallback || 'default',
+                    stdio: 'inherit',
+                });
+            }
+        } catch (error) {
+            if (isStrictBranchPolicy(branchPolicy)) throw error;
+            console.error(`Error switching static agent repo to branch: ${error.message}`);
+        }
+    }
+
     try {
         const list = repos.loadEnabledRepos();
         for (const { name } of getDefaultBootRepos()) {

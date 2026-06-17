@@ -277,9 +277,9 @@ function showDetailedHelp(topic, subtopic, subsubtopic) {
         },
         'start': {
             description: 'Start enabled agents and the local Router',
-            syntax: 'start [staticAgent] [port] ',
-            examples: [ 'start MyStaticAgent 8080', 'start' ],
-            notes: 'Reads manifest of static agent: applies repos{} (clone+enable) and enable[] (enable agents). First run needs agent and port.'
+            syntax: 'start [staticAgent] [port] [--branch <branch>] [--repo-branch <repo>=<branch>] [--branch-fallback default|fail] [--reset-repos]',
+            examples: [ 'start MyStaticAgent 8080', 'start', 'start explorer 8080 --branch soul-gateway-local-integration' ],
+            notes: 'Reads manifest of static agent: applies repos{} (clone+enable) and enable[] (enable agents). First run needs agent and port. --branch <branch> applies best-effort to the static agent\'s repo, every manifest dependency repo, AND the achillesAgentLib used by agent containers — each uses that branch where it exists, else its default/pinned branch. --repo-branch <repo>=<branch> (repeatable) overrides a single repo; --branch-fallback <default|fail> (fail aborts when a targeted branch is missing); --reset-repos force-checks-out dirty repos. (Advanced escape hatch: export PLOINKY_AGENTLIB_REF=<branch|git+/file: spec> to override just the achillesAgentLib source.)'
         },
         'status': {
             description: 'Show enabled agents and router configuration',

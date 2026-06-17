@@ -38,6 +38,7 @@ import {
     findAgentManifest,
 } from './repoAgentCommands.js';
 import { parseStartArgs } from '../services/repos.js';
+import { resolveAgentlibBranchRef } from '../services/dependencyInstaller.js';
 import {
     handleVarsCommand,
     handleVarCommand,
@@ -305,6 +306,15 @@ async function handleCommand(args) {
         // 'run' legacy commands removed; use 'start', 'cli', 'shell', 'console'.
         case 'start': {
             const startParsed = parseStartArgs(options);
+            // The global --branch also drives the achillesAgentLib used by agent
+            // containers (best-effort: the branch when the achillesAgentLib remote
+            // has it, else the pinned #master). Propagated via PLOINKY_AGENTLIB_REF,
+            // read host-side by readGlobalDepsPackage and inherited by the
+            // Watchdog/router via buildRouterEnv.
+            const agentlibRef = resolveAgentlibBranchRef(startParsed.branchPolicy);
+            if (agentlibRef) {
+                process.env.PLOINKY_AGENTLIB_REF = agentlibRef;
+            }
             await startWorkspace(startParsed.staticAgent, startParsed.port, {
                 refreshComponentToken,
                 ensureComponentToken,

@@ -69,6 +69,23 @@ export function hashMergedPackage(mergedPackage) {
     return sha256(JSON.stringify(ordered));
 }
 
+/**
+ * Resolve the global dependency manifest used to build the shared cache.
+ *
+ * Goes through readGlobalDepsPackage so a PLOINKY_AGENTLIB_REF override
+ * (`ploinky start --branch`) is reflected in both the installed package
+ * and the cache key. The hash is over the resolved (post-override) contents so
+ * switching the achillesAgentLib ref invalidates the shared cache instead of
+ * serving the pinned #master to every agent that seeds from it.
+ *
+ * @param {NodeJS.ProcessEnv} [env=process.env]
+ * @returns {{ pkg: object, hash: string }}
+ */
+export function resolveGlobalCacheManifest(env = process.env) {
+    const pkg = readGlobalDepsPackage(env);
+    return { pkg, hash: hashMergedPackage(pkg) };
+}
+
 function sortObject(obj) {
     return Object.keys(obj || {}).sort().reduce((acc, key) => {
         acc[key] = obj[key];
@@ -337,7 +354,11 @@ export function prepareGlobalCache(runtimeKey, { force = false, log = debugLog, 
     if (!fs.existsSync(globalPackageFile)) {
         throw new Error(`globalDeps/package.json missing at ${globalPackageFile}`);
     }
-    const globalPackageHash = hashFile(globalPackageFile);
+    // Resolve via readGlobalDepsPackage so a PLOINKY_AGENTLIB_REF override is
+    // reflected in BOTH the cache key and the installed package. Hashing/copying
+    // the raw file here would serve the pinned #master to every agent that seeds
+    // from this shared cache, regardless of the --branch override.
+    const { pkg: globalPkg, hash: globalPackageHash } = resolveGlobalCacheManifest();
     const cachePath = getGlobalCachePath(runtimeKey);
 
     if (!force) {
@@ -352,7 +373,10 @@ export function prepareGlobalCache(runtimeKey, { force = false, log = debugLog, 
     const lock = acquireLock(cachePath);
     try {
         ensureCacheDir(cachePath);
-        fs.copyFileSync(globalPackageFile, path.join(cachePath, 'package.json'));
+        fs.writeFileSync(
+            path.join(cachePath, 'package.json'),
+            JSON.stringify(globalPkg, null, 2),
+        );
         backend.install(cachePath);
         const stamp = writeStamp(cachePath, {
             runtimeKey,
@@ -405,7 +429,7 @@ export function prepareAgentCache({
     const mergedPkg = mergePackageJson(globalPkg, agentPkg);
     const mergedPackageHash = hashMergedPackage(mergedPkg);
     const agentPackageHash = agentPackagePath ? hashFile(agentPackagePath) : null;
-    const globalPackageHash = hashFile(getGlobalPackagePath());
+    const globalPackageHash = hashMergedPackage(globalPkg);
     const cachePath = getAgentCachePath(repoName, agentName, runtimeKey);
 
     if (!force) {

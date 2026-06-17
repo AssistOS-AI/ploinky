@@ -5,6 +5,7 @@ import { getRuntime } from './docker/common.js';
 import { GLOBAL_DEPS_PATH } from './config.js';
 import { getAgentWorkDir, getAgentCodePath, getRepoAgentCodePath } from './workspaceStructure.js';
 import { debugLog } from './utils.js';
+import { remoteBranchExists } from './repos.js';
 
 /**
  * Execute a command inside a running container.
@@ -654,7 +655,7 @@ function syncModuleSubdirectories(moduleName, sourcePath, targetPath, log = debu
  * @returns {object} The parsed global package.json
  * @throws {Error} if globalDeps/package.json cannot be read
  */
-function readGlobalDepsPackage() {
+function readGlobalDepsPackage(env = process.env) {
     const globalPackagePath = path.join(GLOBAL_DEPS_PATH, 'package.json');
     if (!fs.existsSync(globalPackagePath)) {
         throw new Error(
@@ -664,7 +665,101 @@ function readGlobalDepsPackage() {
             + `agent installs on setup.`
         );
     }
-    return JSON.parse(fs.readFileSync(globalPackagePath, 'utf8'));
+    const pkg = JSON.parse(fs.readFileSync(globalPackagePath, 'utf8'));
+    return overrideGlobalDeps(pkg, env);
+}
+
+/**
+ * Apply deploy-time overrides to the global dependency set.
+ *
+ * achillesAgentLib is normally pinned to a fixed git ref in
+ * globalDeps/package.json. `PLOINKY_AGENTLIB_REF` (set by `ploinky start` from
+ * the global --branch, or exported directly) points every agent's
+ * achillesAgentLib at a different branch or source for a single deploy without
+ * editing tracked files.
+ *
+ * A bare value (e.g. "soul-gateway-local-integration") is treated as a branch
+ * and swapped onto the existing dependency URL. A full npm spec (git+..., a
+ * URL, github:, npm: or file:) is used verbatim.
+ *
+ * @param {object} pkg - Parsed globalDeps package.json (mutated in place).
+ * @param {NodeJS.ProcessEnv} [env=process.env] - Environment to read the override from.
+ * @returns {object} The same pkg object.
+ */
+function overrideGlobalDeps(pkg, env = process.env) {
+    const ref = String(env.PLOINKY_AGENTLIB_REF || '').trim();
+    if (!ref) {
+        return pkg;
+    }
+    const deps = pkg.dependencies || (pkg.dependencies = {});
+    const isFullSpec = /:\/\//.test(ref) || /^(git\+|github:|npm:|file:|https?:)/.test(ref);
+    let value;
+    if (isFullSpec) {
+        value = ref;
+    } else {
+        const current = String(deps.achillesAgentLib || '');
+        const hashIdx = current.indexOf('#');
+        const base = hashIdx >= 0 ? current.slice(0, hashIdx) : current;
+        value = base ? `${base}#${ref}` : ref;
+    }
+    if (deps.achillesAgentLib !== value) {
+        debugLog(`[deps] achillesAgentLib override active: ${value}`);
+    }
+    deps.achillesAgentLib = value;
+    return pkg;
+}
+
+/**
+ * The pinned achillesAgentLib remote URL from globalDeps/package.json, stripped
+ * of the npm `git+` scheme prefix and any `#ref`, suitable for `git ls-remote`.
+ *
+ * @returns {string|null}
+ */
+function pinnedAgentlibUrl() {
+    try {
+        const raw = JSON.parse(fs.readFileSync(path.join(GLOBAL_DEPS_PATH, 'package.json'), 'utf8'));
+        const dep = String(raw?.dependencies?.achillesAgentLib || '');
+        let url = dep.replace(/^git\+/, '');
+        const hashIdx = url.indexOf('#');
+        if (hashIdx >= 0) {
+            url = url.slice(0, hashIdx);
+        }
+        return url || null;
+    } catch (_) {
+        return null;
+    }
+}
+
+/**
+ * Resolve the achillesAgentLib ref implied by a global --branch policy.
+ *
+ * Best-effort, mirroring per-repo branch resolution: if the branch exists on the
+ * achillesAgentLib remote, use it; otherwise honor the branch fallback
+ * (`default` → null so the pinned #master is kept, `fail` → throw). Called from
+ * `ploinky start` with the parsed --branch policy.
+ *
+ * @param {object} branchPolicy - parsed --branch policy ({ branch, fallback, ... }).
+ * @param {object} [opts]
+ * @param {(url: string, branch: string) => boolean} [opts.branchExists] - remote-branch probe (injectable for tests).
+ * @param {string} [opts.url] - achillesAgentLib remote URL (defaults to the pinned globalDeps URL).
+ * @returns {string|null} branch to use, or null to keep the pinned default.
+ */
+function resolveAgentlibBranchRef(branchPolicy, { branchExists = remoteBranchExists, url } = {}) {
+    const branch = branchPolicy?.branch;
+    if (!branch) {
+        return null;
+    }
+    const remoteUrl = url === undefined ? pinnedAgentlibUrl() : url;
+    if (remoteUrl && branchExists(remoteUrl, branch)) {
+        return branch;
+    }
+    if (branchPolicy.fallback === 'fail') {
+        throw new Error(
+            `Branch '${branch}' not found on the achillesAgentLib remote (${remoteUrl || 'unknown'}); `
+            + `aborting (--branch-fallback fail).`,
+        );
+    }
+    return null;
 }
 
 export {
@@ -672,6 +767,8 @@ export {
     fileExistsInContainer,
     dirExistsInContainer,
     readGlobalDepsPackage,
+    overrideGlobalDeps,
+    resolveAgentlibBranchRef,
     mergePackageJson,
     setupAgentWorkDir,
     needsReinstall,

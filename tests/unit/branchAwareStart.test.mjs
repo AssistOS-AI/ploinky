@@ -422,6 +422,38 @@ test('bootstrap: global branch policy only applies to the static repo among defa
     assert.equal(cliBranch, 'main');
 });
 
+test('bootstrap: a bare static agent name resolves its own repo for the global branch', () => {
+    // Isolate from the prior bootstrap test which reuses these default-repo names.
+    for (const r of ['basic', 'AchillesIDE', 'AchillesCLI']) {
+        fs.rmSync(path.join(tempDir, '.ploinky', 'repos', r), { recursive: true, force: true });
+    }
+    fs.rmSync(path.join(tempDir, '.ploinky', 'enabled_repos.json'), { force: true });
+
+    const idePath = initManagedRepo('AchillesIDE', { branches: ['feature-start'] });
+    const basicPath = initManagedRepo('basic');
+    initManagedRepo('AchillesCLI');
+
+    // findAgent('explorer') must resolve to AchillesIDE; commit the manifest so
+    // the repo is clean for the branch checkout.
+    const explorerDir = path.join(idePath, 'explorer');
+    fs.mkdirSync(explorerDir, { recursive: true });
+    fs.writeFileSync(path.join(explorerDir, 'manifest.json'), JSON.stringify({ container: 'node:20' }, null, 2));
+    execFileSync('git', ['-C', idePath, 'add', '.'], { stdio: 'ignore' });
+    execFileSync('git', ['-C', idePath, 'commit', '-m', 'add explorer manifest'], { stdio: 'ignore' });
+
+    bootstrap({
+        // BARE agent name (no repo prefix) — must still place AchillesIDE on the branch.
+        staticAgent: 'explorer',
+        branchPolicy: { branch: 'feature-start', repoBranches: {}, fallback: 'fail', resetRepos: false },
+    });
+
+    const ideBranch = String(execFileSync('git', ['-C', idePath, 'rev-parse', '--abbrev-ref', 'HEAD'])).trim();
+    const basicBranch = String(execFileSync('git', ['-C', basicPath, 'rev-parse', '--abbrev-ref', 'HEAD'])).trim();
+    assert.equal(ideBranch, 'feature-start');
+    // The static repo's branch must NOT bleed onto unrelated boot repos.
+    assert.equal(basicBranch, 'main');
+});
+
 test('applyManifestDirectives: strict branch policy aborts manifest repo fallback', async () => {
     const barePath = createBareRepo('manifest-strict-remote', { branches: [] });
     writeAgentManifest('staticStrict', 'app', {
