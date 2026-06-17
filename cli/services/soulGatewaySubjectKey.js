@@ -56,14 +56,8 @@ class SoulGatewayKeyError extends Error {
     }
 }
 
-// Resolve the store path against the live cwd (the workspace root) so the
-// keypair tracks the active workspace, matching encryptedPasswordStore.js.
 function resolveKeypairStoreFile() {
-    try {
-        return path.join(path.resolve(process.cwd()), '.ploinky', `${KEYPAIR_NAME}.enc`);
-    } catch (_) {
-        return KEYPAIR_STORE_FILE;
-    }
+    return KEYPAIR_STORE_FILE;
 }
 
 function getStorageKey() {

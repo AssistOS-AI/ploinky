@@ -36,7 +36,7 @@ import {
     ROUTING_FILE,
     SECRETS_FILE,
     SERVERS_CONFIG_FILE,
-    WORKSPACE_ROOT
+    PLOINKY_WORKSPACE_ROOT
 } from '../config.js';
 import {
     planRuntimeResources,
@@ -350,7 +350,7 @@ function buildFullEnvMap(agentName, manifest, profileConfig, agentWorkDir, repoN
     env.PLOINKY_MCP_CONFIG_PATH = CONTAINER_CONFIG_PATH;
     env.AGENT_NAME = agentName;
     env.WORKSPACE_PATH = agentWorkDir;
-    env.PLOINKY_WORKSPACE_ROOT = WORKSPACE_ROOT;
+    env.PLOINKY_WORKSPACE_ROOT = PLOINKY_WORKSPACE_ROOT;
     env.PLOINKY_RUNTIME = runtimeName;
 
     // Manifest-declared runtime.resources.env (post template expansion).

@@ -18,7 +18,7 @@ import {
     readManifestAgentCommand,
     readManifestStartCommand
 } from '../docker/agentCommands.js';
-import { LOGS_DIR, PLOINKY_DIR, WORKSPACE_ROOT } from '../config.js';
+import { LOGS_DIR, PLOINKY_DIR, PLOINKY_WORKSPACE_ROOT } from '../config.js';
 import { ensureSharedHostDir } from '../docker/agentHooks.js';
 import {
     runPreContainerLifecycle,
@@ -426,7 +426,7 @@ function startSeatbeltProcess(agentName, manifest, agentPath, options = {}) {
         codeReadOnly,
         skillsReadOnly,
         volumes: manifest.volumes,
-        workspaceRoot: WORKSPACE_ROOT,
+        workspaceRoot: PLOINKY_WORKSPACE_ROOT,
         extraReadPaths: getSeatbeltExtraReadPaths(),
         extraWritePaths: [
             LOGS_DIR,
@@ -731,7 +731,7 @@ function attachSeatbeltInteractive(agentName, manifest, agentPath, workdir, entr
         codeReadOnly,
         skillsReadOnly,
         volumes: manifest.volumes,
-        workspaceRoot: WORKSPACE_ROOT,
+        workspaceRoot: PLOINKY_WORKSPACE_ROOT,
         extraReadPaths: getSeatbeltExtraReadPaths(),
         extraWritePaths: [
             LOGS_DIR,

@@ -16,7 +16,7 @@ import { getSecrets, createEnvWithSecrets, loadEnvFile } from './secretInjector.
 import { readSecretsFile } from './encryptedSecretsFile.js';
 import { buildEnvMap } from './secretVars.js';
 import { resolveAgentReadinessProtocol } from './startupReadiness.js';
-import { LOGS_DIR, ROUTING_FILE, RUNNING_DIR } from './config.js';
+import { LOGS_DIR, PLOINKY_WORKSPACE_ROOT, ROUTING_FILE, RUNNING_DIR } from './config.js';
 import { classifyDependencyGraphWaitMode, resolveWorkspaceDependencyGraph, topologicallyGroupDependencyGraph } from './workspaceDependencyGraph.js';
 import { getAgentWorkDir } from './workspaceStructure.js';
 import { needsHostInstall } from './dependencyInstaller.js';
@@ -562,7 +562,7 @@ async function startWorkspace(staticAgentArg, portArg, { refreshComponentToken, 
             const secrets = profileConfig.secrets ? getSecrets(profileConfig.secrets) : {};
             const hookEnv = createEnvWithSecrets({ ...envVars, ...manifestEnv }, secrets);
             
-            const result = executeHostHook(hookValue, hookEnv, { cwd: process.cwd() });
+            const result = executeHostHook(hookValue, hookEnv, { cwd: PLOINKY_WORKSPACE_ROOT });
             if (!result.success) {
               console.error(`[start] Preinstall failed: ${result.message}`);
             } else {
@@ -834,16 +834,50 @@ async function startWorkspace(staticAgentArg, portArg, { refreshComponentToken, 
 async function runCli(agentName, args) {
   if (!agentName) { throw new Error('Usage: cli <agentName> [args...]'); }
   let registryRecord = null;
+  let manifestLookup = agentName;
   try {
     registryRecord = agentsSvc.resolveEnabledAgentRecord(agentName);
   } catch (err) {
     console.error(err?.message || err);
     return;
   }
-  const manifestLookup = registryRecord
+
+  if (!registryRecord) {
+    let autoEnableRef = null;
+    try {
+      const resolved = utils.findAgent(agentName);
+      autoEnableRef = `${resolved.repo}/${resolved.shortAgentName}`;
+      manifestLookup = autoEnableRef;
+    } catch (err) {
+      console.error(`Agent '${agentName}' is not found.`);
+      if (err?.message) {
+        console.error(err.message);
+      }
+      return;
+    }
+
+    try {
+      agentsSvc.enableAgent(autoEnableRef, 'global');
+    } catch (err) {
+      console.error(`Failed to enable '${agentName}' in global mode: ${err?.message || err}`);
+      return;
+    }
+
+    try {
+      registryRecord = agentsSvc.resolveEnabledAgentRecord(agentName);
+      if (!registryRecord) {
+        registryRecord = agentsSvc.resolveEnabledAgentRecord(autoEnableRef);
+      }
+    } catch (err) {
+      console.error(err?.message || err);
+      return;
+    }
+  }
+
+  const resolvedManifestRef = registryRecord
     ? `${registryRecord.record.repoName}/${registryRecord.record.agentName}`
-    : agentName;
-  const { manifestPath, shortAgentName } = utils.findAgent(manifestLookup);
+    : manifestLookup;
+  const { manifestPath, shortAgentName } = utils.findAgent(resolvedManifestRef);
   const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
   const cliBase = getCliCmd(manifest);
   if (!cliBase || !cliBase.trim()) { throw new Error(`Manifest for '${shortAgentName}' has no 'cli' command.`); }
@@ -869,6 +903,22 @@ async function runCli(agentName, args) {
   const containerName = (containerInfo && containerInfo.containerName)
     || registryRecord?.containerName
     || getAgentContainerName(shortAgentName, repoName);
+  const readinessProtocol = resolveAgentReadinessProtocol(manifest);
+  if (readinessProtocol !== 'none') {
+    const hostPort = containerInfo?.hostPort;
+    if (!hostPort) {
+      console.warn(`[cli] warning: cannot wait for '${shortAgentName}' readiness because no host port was resolved.`);
+    } else {
+      console.log(`[cli] Waiting for '${shortAgentName}' readiness (${readinessProtocol}) on port ${hostPort}...`);
+      const ready = await waitForAgentReady({ hostPort }, {
+        timeoutMs: 600000,
+        protocol: readinessProtocol,
+      });
+      if (!ready) {
+        throw new Error(`Agent '${shortAgentName}' did not become ready before CLI attach.`);
+      }
+    }
+  }
   const projPath = getConfiguredProjectPath(shortAgentName, repoName, registryRecord?.record?.alias);
 
   // Determine actual runtime from registry (may differ from manifest if sandbox

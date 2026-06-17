@@ -1,7 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 
-import { WORKSPACE_ROOT, PLOINKY_DIR } from './config.js';
+import { PLOINKY_DIR, PLOINKY_WORKSPACE_ROOT } from './config.js';
 import { ensurePersistentSecret, resolveVarValue } from './secretVars.js';
 import { deriveAgentSecret } from './masterKey.js';
 
@@ -19,7 +19,7 @@ import { deriveAgentSecret } from './masterKey.js';
  *     "PLOINKY_RESOURCE_<KEY>_HOST" (for compatibility with existing setups
  *     such as DPU_DATA_ROOT).
  *   - env: declarative environment variables supporting template placeholders:
- *       {{WORKSPACE_ROOT}}
+ *       {{PLOINKY_WORKSPACE_ROOT}}
  *       {{STORAGE_CONTAINER_PATH}}   (only when persistentStorage declared)
  *       {{STORAGE_HOST_PATH}}
  *       {{secret:<NAME>}}            (ensurePersistentSecret)
@@ -55,7 +55,7 @@ function expandTemplate(raw, { hostPath, containerPath, useHostStoragePath = fal
     return raw.replace(/\{\{([^}]+)\}\}/g, (match, exprRaw) => {
         const expr = String(exprRaw).trim();
         if (!expr) return '';
-        if (expr === 'WORKSPACE_ROOT') return WORKSPACE_ROOT || '';
+        if (expr === 'PLOINKY_WORKSPACE_ROOT') return PLOINKY_WORKSPACE_ROOT || '';
         if (expr === 'STORAGE_CONTAINER_PATH') return useHostStoragePath ? hostPath || '' : containerPath || '';
         if (expr === 'STORAGE_HOST_PATH') return hostPath || '';
         if (expr.startsWith('secret:')) {

@@ -6,7 +6,7 @@ import {
     GLOBAL_DEPS_CACHE_DIR,
     AGENTS_DEPS_CACHE_DIR,
     GLOBAL_DEPS_PATH,
-    WORKSPACE_ROOT,
+    PLOINKY_WORKSPACE_ROOT,
 } from './config.js';
 import { parseRuntimeKey, detectHostRuntimeKey } from './dependencyRuntimeKey.js';
 import { debugLog } from './utils.js';
@@ -224,7 +224,7 @@ function withGithubHttpsGitConfig(env = process.env, { cwd = '' } = {}) {
     return {
         ...env,
         GIT_CEILING_DIRECTORIES: mergePathList(env.GIT_CEILING_DIRECTORIES, [
-            WORKSPACE_ROOT,
+            PLOINKY_WORKSPACE_ROOT,
             cwd && path.resolve(cwd),
         ]),
         GIT_CONFIG_COUNT: String(baseCount + 2),

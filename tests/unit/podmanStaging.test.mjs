@@ -15,7 +15,7 @@ import {
     mergeNodeOptions,
     podmanMountSuffix,
 } from '../../cli/services/docker/agentServiceManager.js';
-import { PLOINKY_DIR, WORKSPACE_ROOT } from '../../cli/services/config.js';
+import { PLOINKY_DIR, PLOINKY_WORKSPACE_ROOT } from '../../cli/services/config.js';
 import {
     prepareFreshRuntimeRoot,
     pruneStaleRuntimeEntries,
@@ -236,7 +236,7 @@ test('manifest volume host paths must stay under workspace .ploinky', () => {
     });
     assert.throws(
         () => assertManifestVolumeHostPathUnderPloinky(
-            path.join(WORKSPACE_ROOT, 'demo', 'state'),
+            path.join(PLOINKY_WORKSPACE_ROOT, 'demo', 'state'),
             '/data',
         ),
         /Extra manifest volumes must live under/,

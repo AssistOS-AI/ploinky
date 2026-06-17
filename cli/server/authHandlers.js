@@ -5,7 +5,7 @@ import { appendLog } from './utils/logger.js';
 import { parseCookies, buildCookie, readJsonBody, appendSetCookie } from './handlers/common.js';
 import { resolveVarValue } from '../services/secretVars.js';
 import { resolveEnabledAgentRecord } from '../services/agents.js';
-import { ROUTING_FILE } from '../services/config.js';
+import { ROUTING_FILE, PLOINKY_WORKSPACE_ROOT } from '../services/config.js';
 import { findAgent } from '../services/utils.js';
 import { readRouterSettings, updateRouterSettings } from '../services/routerSettings.js';
 import { createAuthService } from './auth/service.js';
@@ -493,7 +493,7 @@ function renderSsoLoginHtml({ agentName, returnTo = '/', redirectUrl = '' } = {}
 
 function readRouting() {
     const dynamicRoutingFile = process.env.PLOINKY_ROUTING_FILE
-        || path.join(process.cwd(), '.ploinky', 'routing.json');
+        || path.join(PLOINKY_WORKSPACE_ROOT, '.ploinky', 'routing.json');
     const routingFile = fs.existsSync(dynamicRoutingFile) ? dynamicRoutingFile : ROUTING_FILE;
     try {
         return JSON.parse(fs.readFileSync(routingFile, 'utf8')) || {};

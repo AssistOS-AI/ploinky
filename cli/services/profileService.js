@@ -1,6 +1,6 @@
 import fs from 'fs';
 import path from 'path';
-import { PROFILE_FILE, PLOINKY_DIR, REPOS_DIR } from './config.js';
+import { PROFILE_FILE, PLOINKY_CWD, PLOINKY_DIR, PLOINKY_WORKSPACE_ROOT, REPOS_DIR } from './config.js';
 import { validateSecrets } from './secretInjector.js';
 import { validateManifestEnvProfileCompleteness } from './secretVars.js';
 import { debugLog, findAgent } from './utils.js';
@@ -421,7 +421,8 @@ export function getProfileEnvVars(agentName, repoName, profile, containerInfo = 
         PLOINKY_PROFILE_ENV: getProfileEnvironment(profile),
         PLOINKY_AGENT_NAME: agentName,
         PLOINKY_REPO_NAME: repoName,
-        PLOINKY_CWD: process.cwd(),
+        PLOINKY_WORKSPACE_ROOT,
+        PLOINKY_CWD,
         ...(containerInfo.containerName && { PLOINKY_CONTAINER_NAME: containerInfo.containerName }),
         ...(containerInfo.containerId && { PLOINKY_CONTAINER_ID: containerInfo.containerId })
     };

@@ -21,13 +21,17 @@ function tempDir(prefix = 'ploinky-runtime-test-') {
 }
 
 function runModuleSnippet(source, env = {}, options = {}) {
+    const childEnv = {
+        ...process.env,
+        ...env,
+        PLOINKY_DEBUG: '',
+    };
+    if (options.cwd && !Object.hasOwn(env, 'PLOINKY_WORKSPACE_ROOT')) {
+        childEnv.PLOINKY_WORKSPACE_ROOT = options.cwd;
+    }
     return spawnSync(process.execPath, ['--input-type=module', '-e', source], {
         cwd: options.cwd || repoRoot,
-        env: {
-            ...process.env,
-            ...env,
-            PLOINKY_DEBUG: '',
-        },
+        env: childEnv,
         encoding: 'utf8',
     });
 }

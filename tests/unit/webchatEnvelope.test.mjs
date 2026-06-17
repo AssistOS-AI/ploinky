@@ -14,7 +14,7 @@ import {
 import {
     extractManifestWebchatOptions
 } from '../../cli/server/webchat/commandResolver.js';
-import { WORKSPACE_ROOT } from '../../cli/services/config.js';
+import { PLOINKY_WORKSPACE_ROOT } from '../../cli/services/config.js';
 
 test('resolveWebchatLaunchOptions forwards agent-owned launch flags unchanged', () => {
     const parsedUrl = new URL(
@@ -22,7 +22,7 @@ test('resolveWebchatLaunchOptions forwards agent-owned launch flags unchanged', 
         'http://localhost'
     );
     const { cliArgs } = resolveWebchatLaunchOptions(parsedUrl);
-    assert.ok(cliArgs.includes(`--dir=${path.resolve(WORKSPACE_ROOT, 'projects/demo')}`));
+    assert.ok(cliArgs.includes(`--dir=${path.resolve(PLOINKY_WORKSPACE_ROOT, 'projects/demo')}`));
     assert.ok(cliArgs.includes('--feature-tags=1'));
     assert.ok(cliArgs.includes('--forward-envelope=1'));
     assert.equal(cliArgs.some((arg) => arg.startsWith('--workspace-dir=')), false);

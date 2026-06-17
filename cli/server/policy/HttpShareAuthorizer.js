@@ -3,6 +3,7 @@ import path from 'node:path';
 import http from 'node:http';
 
 import { deriveAgentPrincipalId } from '../../services/agentIdentity.js';
+import { PLOINKY_WORKSPACE_ROOT } from '../../services/config.js';
 import { buildRouterRequest } from '../mcp-proxy/invocationMinter.js';
 import { computeRch } from '../../../Agent/lib/requestHash.mjs';
 
@@ -33,7 +34,7 @@ export class ShareAuthorizer {
 
 function readRoutingRoutes() {
     try {
-        const file = path.join(process.env.PLOINKY_WORKSPACE_ROOT || process.cwd(), '.ploinky', 'routing.json');
+        const file = path.join(PLOINKY_WORKSPACE_ROOT, '.ploinky', 'routing.json');
         const parsed = JSON.parse(fs.readFileSync(file, 'utf8'));
         return parsed && typeof parsed.routes === 'object' ? parsed.routes : {};
     } catch {

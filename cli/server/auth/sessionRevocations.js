@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { PLOINKY_WORKSPACE_ROOT } from '../../services/config.js';
 
 /**
  * Persistent session revocation list (DS013/DS011).
@@ -19,7 +20,7 @@ import path from 'node:path';
 const SCHEMA = 'sessions-revocations';
 
 function workspaceRoot() {
-    return path.resolve(process.env.PLOINKY_WORKSPACE_ROOT || process.cwd());
+    return path.resolve(PLOINKY_WORKSPACE_ROOT);
 }
 
 function revocationsDir() {

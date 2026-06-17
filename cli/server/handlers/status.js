@@ -4,7 +4,7 @@ import { spawn } from 'child_process';
 import { fileURLToPath } from 'url';
 
 import * as staticSrv from '../static/index.js';
-import { ROUTING_FILE } from '../../services/config.js';
+import { ROUTING_FILE, PLOINKY_WORKSPACE_ROOT } from '../../services/config.js';
 import { getAllServerStatuses } from '../../services/serverManager.js';
 import { loadAgents } from '../../services/workspace.js';
 
@@ -33,7 +33,10 @@ function runStatusCommand() {
             resolve(payload);
         };
         try {
-            const proc = spawn('ploinky', ['status'], { cwd: process.cwd() });
+            const proc = spawn('ploinky', ['status'], {
+                cwd: PLOINKY_WORKSPACE_ROOT,
+                env: { ...process.env, PLOINKY_CWD: PLOINKY_WORKSPACE_ROOT },
+            });
             let out = '';
             let err = '';
             proc.stdout.on('data', chunk => out += chunk.toString('utf8'));

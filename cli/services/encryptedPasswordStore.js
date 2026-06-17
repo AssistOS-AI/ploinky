@@ -24,11 +24,7 @@ function defaultStore() {
 }
 
 function resolvePasswordStoreFile() {
-    try {
-        return path.join(path.resolve(process.cwd()), '.ploinky', 'passwords.enc');
-    } catch (_) {
-        return PASSWORD_STORE_FILE;
-    }
+    return PASSWORD_STORE_FILE;
 }
 
 function resolveMasterKey() {

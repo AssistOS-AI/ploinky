@@ -1,7 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 
-import { PLOINKY_DIR, WORKSPACE_ROOT } from './config.js';
+import { PLOINKY_DIR, PLOINKY_WORKSPACE_ROOT } from './config.js';
 
 function isPathInsideRoot(candidate, root) {
     const resolvedCandidate = path.resolve(candidate);
@@ -16,7 +16,7 @@ export function readManifestVolumeOptions(manifest) {
         : {};
 }
 
-export function resolveManifestVolumeHostPath(hostPath, workspaceRoot = WORKSPACE_ROOT) {
+export function resolveManifestVolumeHostPath(hostPath, workspaceRoot = PLOINKY_WORKSPACE_ROOT) {
     return path.isAbsolute(hostPath)
         ? path.resolve(hostPath)
         : path.resolve(workspaceRoot, hostPath);
@@ -94,7 +94,7 @@ export function ensureManifestVolumeHostPath(resolvedHostPath, _containerPath, o
 
 export function normalizeManifestVolumeHostPaths(volumes, options = {}) {
     if (!volumes || typeof volumes !== 'object') return [];
-    const workspaceRoot = options.workspaceRoot || WORKSPACE_ROOT;
+    const workspaceRoot = options.workspaceRoot || PLOINKY_WORKSPACE_ROOT;
     const ploinkyDir = options.ploinkyDir || path.join(workspaceRoot, '.ploinky');
     const paths = [];
     for (const [hostPath, containerPath] of Object.entries(volumes)) {

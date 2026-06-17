@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { PLOINKY_WORKSPACE_ROOT } from '../../services/config.js';
 
 import { PolicyAuditSink } from './PolicyAuditSink.js';
 
@@ -11,7 +12,7 @@ import { PolicyAuditSink } from './PolicyAuditSink.js';
  */
 function defaultDir() {
     return path.join(
-        process.env.PLOINKY_WORKSPACE_ROOT || process.cwd(),
+        PLOINKY_WORKSPACE_ROOT,
         '.ploinky', 'data', 'router-security',
     );
 }

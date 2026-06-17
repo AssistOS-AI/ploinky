@@ -4,7 +4,7 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
-import { PLOINKY_DIR, WORKSPACE_ROOT } from './config.js';
+import { PLOINKY_DIR, PLOINKY_WORKSPACE_ROOT } from './config.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -377,7 +377,7 @@ function resolveCatalogRootFromEnv(env, options = {}) {
     const cacheDir = String(env.PLOINKY_LLM_CATALOG_CACHE_DIR || '').trim() || DEFAULT_CACHE_DIR;
 
     if (explicitPath) {
-        const resolved = path.isAbsolute(explicitPath) ? explicitPath : path.resolve(WORKSPACE_ROOT, explicitPath);
+        const resolved = path.isAbsolute(explicitPath) ? explicitPath : path.resolve(PLOINKY_WORKSPACE_ROOT, explicitPath);
         return { rootPath: resolved, source: 'path', repoUrl: null, requestedRef: null, cacheDir };
     }
     if (repoUrl) {

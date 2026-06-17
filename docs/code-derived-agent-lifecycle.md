@@ -2,7 +2,7 @@
 
 This document is derived from implementation code only. Existing Ploinky docs and specs were not used as source material. The main code paths consulted are the CLI entrypoints in `bin/` and `cli/`, the runtime managers under `cli/services/`, the router under `cli/server/`, and the default in-container agent server under `Agent/server/`.
 
-All relative paths below are relative to the workspace directory where `ploinky` is run, because `cli/services/config.js` sets `WORKSPACE_ROOT` to `process.cwd()`.
+All relative paths below are relative to the workspace directory where `ploinky` is run, because `cli/services/config.js` sets `PLOINKY_WORKSPACE_ROOT` to the resolved workspace path.
 
 ## Source Map
 
@@ -173,7 +173,7 @@ Ploinky does not load a central manifest schema in the observed paths. Individua
 | `image` | No | Secondary image field. Fallback is `node:18-alpine`. Supports `${VAR}` interpolation during startup. |
 | `runtime` | No | Must be an object when used for resources. A string `runtime` selector is explicitly rejected as legacy/unsupported. |
 | `runtime.resources.persistentStorage` | No | If `key` and `containerPath` exist, creates/mounts host storage. Default host path is `.ploinky/data/<key>`, overridable by `PLOINKY_RESOURCE_<KEY>_HOST`; `dpu-data` also honors `DPU_DATA_ROOT`. |
-| `runtime.resources.env` | No | Adds env vars with templates such as `{{WORKSPACE_ROOT}}`, `{{STORAGE_CONTAINER_PATH}}`, `{{STORAGE_HOST_PATH}}`, `{{secret:NAME}}`, `{{generatedSecret:NAME}}`, and `{{var:NAME}}`. |
+| `runtime.resources.env` | No | Adds env vars with templates such as `{{PLOINKY_WORKSPACE_ROOT}}`, `{{STORAGE_CONTAINER_PATH}}`, `{{STORAGE_HOST_PATH}}`, `{{secret:NAME}}`, `{{generatedSecret:NAME}}`, and `{{var:NAME}}`. |
 | `lite-sandbox` | No | If true and host sandbox is enabled, selects bwrap on Linux or seatbelt on macOS. If host sandbox is disabled, it falls back to container runtime. |
 | `profiles` | No | If present, `profiles.default` is required. Active profile comes from record profile or `.ploinky/profile`; non-default profiles are merged over default. |
 | `profiles.<name>.ports` | No | The only ports read by `parseManifestPorts`. If absent at startup, Ploinky maps a random localhost host port to container port 7000 unless host networking is used. |

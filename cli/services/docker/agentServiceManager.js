@@ -36,7 +36,7 @@ import { clearLivenessState } from './healthProbes.js';
 import { stopAndRemove } from './containerFleet.js';
 import { buildContainerSecurityArgs, resolveContainerSecurity } from './containerSecurity.js';
 import { DEFAULT_AGENT_ENTRY, launchAgentSidecar, readManifestAgentCommand, readManifestStartCommand, splitCommandArgs } from './agentCommands.js';
-import { AGENTS_WORK_DIR, PLOINKY_DIR, ROUTING_FILE, WORKSPACE_ROOT } from '../config.js';
+import { AGENTS_WORK_DIR, PLOINKY_DIR, ROUTING_FILE, PLOINKY_WORKSPACE_ROOT } from '../config.js';
 import {
     planRuntimeResources,
     applyRuntimeResourceEnv,
@@ -89,7 +89,7 @@ import {
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const AGENT_LIB_PATH = path.resolve(__dirname, '../../../Agent');
-const LLM_RUNTIME_SHARED_PATH = path.join(WORKSPACE_ROOT, 'llm-runtime', 'shared');
+const LLM_RUNTIME_SHARED_PATH = path.join(PLOINKY_WORKSPACE_ROOT, 'llm-runtime', 'shared');
 function resolveLlmRuntimeSharedPath(agentPath) {
     // Prefer the shared runtime that ships inside the agent's own repo so
     // clone-based deploys (llm-runtime under .ploinky/repos) mount the real
@@ -830,7 +830,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     ];
     envStrings.push(formatEnvFlag('AGENT_NAME', agentName));
     envStrings.push(formatEnvFlag('WORKSPACE_PATH', agentWorkDir));
-    envStrings.push(formatEnvFlag('PLOINKY_WORKSPACE_ROOT', WORKSPACE_ROOT));
+    envStrings.push(formatEnvFlag('PLOINKY_WORKSPACE_ROOT', PLOINKY_WORKSPACE_ROOT));
     const explicitSoulGatewayEnv = captureExplicitSoulGatewayEnv(envStrings);
     // Apply env from manifest.runtime.resources.env (templates expanded).
     for (const [envKey, envValue] of Object.entries(applyRuntimeResourceEnv(resourcePlan))) {
@@ -969,6 +969,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         // Run preinstall + install in main container before default agent server
         if (combinedInstallCmd) {
             args.push('sh', '-c', `${combinedInstallCmd} && sh /Agent/server/AgentServer.sh`);
+            entrySummary = `sh -c "<install> && sh /Agent/server/AgentServer.sh"`;
         } else {
             args.push('sh', '/Agent/server/AgentServer.sh');
         }

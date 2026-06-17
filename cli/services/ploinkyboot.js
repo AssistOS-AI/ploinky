@@ -4,16 +4,6 @@ import { PLOINKY_DIR } from './config.js';
 import * as repos from './repos.js';
 import { findAgent } from './utils.js';
 
-const DEFAULT_REPOS = [
-    { name: 'basic', url: 'https://github.com/PloinkyRepos/Basic.git' },
-    { name: 'AchillesIDE', url: 'https://github.com/PloinkyRepos/AssistOSExplorer.git' },
-    { name: 'AchillesCLI', url: 'https://github.com/OutfinityResearch/AchillesCLI.git' },
-];
-
-export function getDefaultBootRepos() {
-    return DEFAULT_REPOS.map(repo => ({ ...repo }));
-}
-
 function repoNameFromAgentRef(agentRef) {
     const ref = String(agentRef || '').trim();
     const slashIdx = ref.indexOf('/');
@@ -36,7 +26,7 @@ function isStrictBranchPolicy(branchPolicy) {
 }
 
 export function bootstrap({ branchPolicy, staticAgent } = {}) {
-    for (const { name, url } of getDefaultBootRepos()) {
+    for (const { name, url } of repos.getDefaultBootRepos()) {
         const repoPath = path.join(PLOINKY_DIR, 'repos', name);
         const repoBranchPolicy = policyForBootRepo(name, branchPolicy, staticAgent);
         if (!fs.existsSync(repoPath)) {
@@ -92,7 +82,7 @@ export function bootstrap({ branchPolicy, staticAgent } = {}) {
 
     try {
         const list = repos.loadEnabledRepos();
-        for (const { name } of getDefaultBootRepos()) {
+        for (const { name } of repos.getDefaultBootRepos()) {
             const repoPath = path.join(PLOINKY_DIR, 'repos', name);
             if (fs.existsSync(repoPath) && !list.includes(name)) {
                 list.push(name);

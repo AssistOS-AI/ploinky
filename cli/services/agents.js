@@ -13,7 +13,7 @@ import {
     collectLiveAgentContainers
 } from './docker/index.js';
 import { findAgent } from './utils.js';
-import { REPOS_DIR, WORKSPACE_ROOT } from './config.js';
+import { REPOS_DIR, PLOINKY_WORKSPACE_ROOT } from './config.js';
 import {
     createAgentSymlinks,
     removeAgentSymlinks,
@@ -30,7 +30,7 @@ const AUTH_MODES = new Set(['none', 'local', 'pwd', 'sso', 'guest']);
 
 function isPathUnderRoot(candidate) {
     if (!candidate) return false;
-    const root = path.resolve(WORKSPACE_ROOT);
+    const root = path.resolve(PLOINKY_WORKSPACE_ROOT);
     const resolved = path.resolve(candidate);
     const relative = path.relative(root, resolved);
     return relative && !relative.startsWith('..') && !path.isAbsolute(relative);
@@ -257,13 +257,13 @@ export function enableAgent(agentName, mode, repoNameParam, aliasParam, authMode
         } catch (_) {}
         if (!projectPath) {
             runMode = 'isolated';
-            // Use workspace structure: $WORKSPACE_ROOT/.ploinky/agents/<agentName>/
+            // Use workspace structure: $PLOINKY_WORKSPACE_ROOT/.ploinky/agents/<agentName>/
             projectPath = getAgentWorkDir(shortAgentName);
             try { fs.mkdirSync(projectPath, { recursive: true }); } catch (_) {}
         }
     } else if (normalizedMode === 'global') {
         runMode = 'global';
-        projectPath = WORKSPACE_ROOT;
+        projectPath = PLOINKY_WORKSPACE_ROOT;
     } else if (normalizedMode === 'devel') {
         const repoCandidate = String(normalized.repoNameParam || '').trim();
         if (!repoCandidate) {
@@ -356,10 +356,10 @@ export function enableAgent(agentName, mode, repoNameParam, aliasParam, authMode
 
     // Create workspace structure for the agent
     try {
-        // Create agent working directory: $WORKSPACE_ROOT/.ploinky/agents/<agentName>/
+        // Create agent working directory: $PLOINKY_WORKSPACE_ROOT/.ploinky/agents/<agentName>/
         createAgentWorkDir(shortAgentName);
 
-        // Create symlinks: $WORKSPACE_ROOT/.ploinky/code/<agentName> and .ploinky/skills/<agentName>
+        // Create symlinks: $PLOINKY_WORKSPACE_ROOT/.ploinky/code/<agentName> and .ploinky/skills/<agentName>
         createAgentSymlinks(shortAgentName, repoName, agentPath);
     } catch (err) {
         console.error(`Warning: Failed to create workspace structure for ${shortAgentName}: ${err.message}`);

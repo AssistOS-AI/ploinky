@@ -1,7 +1,9 @@
 import fs from 'fs';
+import path from 'path';
+import { PLOINKY_DIR } from './config.js';
 
 function resolveWorkspaceRoot() {
-    return process.env.PLOINKY_WORKSPACE_ROOT || process.cwd();
+    return path.dirname(PLOINKY_DIR);
 }
 
 function resolvePloinkyDir() {
