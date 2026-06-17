@@ -51,11 +51,11 @@ export function detectHostRuntimeKey(runtimeFamily) {
     });
 }
 
-export function detectRuntimeKeyForAgent(manifest, repoName, agentName, profileConfig = null) {
+export function detectRuntimeKeyForAgent(manifest, repoName, agentName, profileConfig = null, image = '') {
     const runtime = getRuntimeForAgent(manifest);
     const family = normalizeRuntimeFamily(runtime);
     if (family === 'container') {
-        return detectContainerRuntimeKey({ manifest, profileConfig, repoName, agentName, runtime });
+        return detectContainerRuntimeKey({ manifest, profileConfig, repoName, agentName, runtime, image });
     }
     return detectHostRuntimeKey(family);
 }

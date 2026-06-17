@@ -90,6 +90,16 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const AGENT_LIB_PATH = path.resolve(__dirname, '../../../Agent');
 const LLM_RUNTIME_SHARED_PATH = path.join(WORKSPACE_ROOT, 'llm-runtime', 'shared');
+function resolveLlmRuntimeSharedPath(agentPath) {
+    // Prefer the shared runtime that ships inside the agent's own repo so
+    // clone-based deploys (llm-runtime under .ploinky/repos) mount the real
+    // runtime-agent; fall back to the workspace-root sibling (dev layout).
+    try {
+        const repoShared = path.join(path.dirname(agentPath), 'shared');
+        if (fs.existsSync(path.join(repoShared, 'runtime-agent'))) return repoShared;
+    } catch (_) { /* fall through to dev-layout default */ }
+    return LLM_RUNTIME_SHARED_PATH;
+}
 const AGENT_PRIVATE_KEY_CONTAINER_PATH = '/run/ploinky-agent.key';
 const PODMAN_STAGED_NODE_OPTIONS = ['--preserve-symlinks', '--preserve-symlinks-main'];
 const PODMAN_RUNTIME_ROOT = path.join(PLOINKY_DIR, 'container-runtime');
@@ -496,6 +506,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     const launchExplicitSidecar = Boolean(startCmd && explicitAgentCmd);
     const cwd = getConfiguredProjectPath(agentName, path.basename(path.dirname(agentPath)), options.alias);
     const sharedDir = ensureSharedHostDir();
+    const llmRuntimeSharedPath = resolveLlmRuntimeSharedPath(agentPath);
 
     // Get active profile and configuration
     const activeProfile = String(options.profileName || getActiveProfile()).trim() || getActiveProfile();
@@ -517,7 +528,15 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         throw new Error(`[profile] ${agentName}: pre-container lifecycle failed: ${preLifecycle.errors.join('; ')}`);
     }
 
-    const manifestImage = resolveManifestImage(manifest, profileConfig, { agentName, repoName });
+    // LLM-runtime agents receive their image from the hardware-aware catalog
+    // (resolved below), so a manifest `container` placeholder that cannot resolve
+    // here (e.g. ${PLOINKY_BASE_LOCAL_IMAGE} with no value) must not be fatal.
+    let manifestImage = null;
+    try {
+        manifestImage = resolveManifestImage(manifest, profileConfig, { agentName, repoName });
+    } catch (err) {
+        if (!isLlmRuntimeManifest(manifest, profileConfig)) throw err;
+    }
     let image = manifestImage;
     const useProfileLifecycle = Boolean(profileConfig);
     const runtimeRouterEnv = buildRuntimeRouterEnv(runtime, options);
@@ -549,6 +568,10 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         }
     }
 
+    if (!image) {
+        throw new Error(`[image] ${agentName}: no container image resolved (manifest container unresolved and no catalog image selected).`);
+    }
+
     // Get profile mount modes (profile overrides default if provided)
     const {
         codeMountMode,
@@ -578,7 +601,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     const needsCoreDeps = !useStartEntry || agentHasPackageJson || isLlmRuntimeManifest(manifest, profileConfig);
     let preparedNodeModulesDir = path.join(agentWorkDir, 'node_modules');
     if (needsCoreDeps) {
-        const runtimeKey = detectRuntimeKeyForAgent(manifest, repoName, agentName, profileConfig);
+        const runtimeKey = detectRuntimeKeyForAgent(manifest, repoName, agentName, profileConfig, image);
         const agentPackagePath = agentHasPackageJson ? path.join(agentCodePath, 'package.json') : null;
         const prepared = prepareAgentCache({
             repoName,
@@ -699,8 +722,8 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     if (llmStartup.enabled && llmStartup.stateDir) {
         args.push('-v', `${llmStartup.stateDir}:/runtime${runtime === 'podman' ? ':z' : ''}`);
     }
-    if (llmStartup.enabled && fs.existsSync(LLM_RUNTIME_SHARED_PATH)) {
-        args.push('-v', `${LLM_RUNTIME_SHARED_PATH}:/Agent/llm-runtime${runtime === 'podman' ? ':z,ro' : ':ro'}`);
+    if (llmStartup.enabled && fs.existsSync(llmRuntimeSharedPath)) {
+        args.push('-v', `${llmRuntimeSharedPath}:/Agent/llm-runtime${runtime === 'podman' ? ':z,ro' : ':ro'}`);
     }
 
     if (runtime === 'podman') {
@@ -979,7 +1002,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
                 { source: sharedDir, target: '/shared' },
                 ...(llmStartup.enabled && llmStartup.modelDir ? [{ source: llmStartup.modelDir, target: '/models' }] : []),
                 ...(llmStartup.enabled && llmStartup.stateDir ? [{ source: llmStartup.stateDir, target: '/runtime' }] : []),
-                ...(llmStartup.enabled && fs.existsSync(LLM_RUNTIME_SHARED_PATH) ? [{ source: LLM_RUNTIME_SHARED_PATH, target: '/Agent/llm-runtime', ro: true }] : []),
+                ...(llmStartup.enabled && fs.existsSync(llmRuntimeSharedPath) ? [{ source: llmRuntimeSharedPath, target: '/Agent/llm-runtime', ro: true }] : []),
                 ...(skillsPathExists && !skillsPathInsideCode && runtime !== 'podman' ? [{ source: agentSkillsPath, target: '/code/skills', ro: skillsReadOnly }] : []),
                 { source: cwd, target: cwd }
             ],
@@ -1140,7 +1163,15 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
         throw new Error(`[profile] ${agentName}: profile '${activeProfile}' not found. Available: ${availableProfiles.join(', ')}`);
     }
     assertManifestEnvProfileCompleteness(manifest, profileConfig, { agentName, repoName, profileName: activeProfile });
-    const image = resolveManifestImage(manifest, profileConfig, { agentName, repoName });
+    // LLM-runtime agents get their real image from the hardware-aware catalog in
+    // startAgentContainer; tolerate an unresolved manifest container placeholder
+    // here (this `image` is only a record fallback below).
+    let image = '';
+    try {
+        image = resolveManifestImage(manifest, profileConfig, { agentName, repoName });
+    } catch (err) {
+        if (!isLlmRuntimeManifest(manifest, profileConfig)) throw err;
+    }
     const runtimeRouterEnv = buildRuntimeRouterEnv(runtime, {
         routerPort: routerPortOverride,
         routerHost: routerHostOverride
