@@ -15,8 +15,6 @@ import { collectAgentsSummary } from '../services/status.js';
 import { findAgent } from '../services/utils.js';
 
 const REPOS_DIR = path.join(PLOINKY_DIR, 'repos');
-const SKILLS_REPO_NAME = 'AchillesCopilotBasicSkills';
-
 function getRepoNames() {
     if (!fs.existsSync(REPOS_DIR)) return [];
     return fs.readdirSync(REPOS_DIR).filter(file => fs.statSync(path.join(REPOS_DIR, file)).isDirectory());
@@ -184,6 +182,12 @@ async function updateAllRepos(folderPath, options = {}) {
     const ploinkyRoot = resolvePloinkyRoot();
     const workspaceRepos = reposSvc.findWorkspaceGitRepos(projectsRoot)
         .filter(repo => !pathsReferToSameLocation(repo.path, ploinkyRoot));
+    const workspaceManifestFolders = skillsSvc.findWorkspaceFoldersWithSkillsManifest(projectsRoot)
+        .filter(folderPath => !pathsReferToSameLocation(folderPath, ploinkyRoot))
+        .filter(folderPath => {
+            const hasManifest = skillsSvc.findSkillsManifestPath(folderPath);
+            return Boolean(hasManifest);
+        });
     const ploinkyRepos = getGitRepoNames();
     const failed = [];
     const skipped = [];
@@ -268,27 +272,38 @@ async function updateAllRepos(folderPath, options = {}) {
         }
     }
 
-    if (workspaceRepos.length) {
-        console.log('Installing default skills into workspace repositories...');
-        for (const repo of workspaceRepos) {
+    if (workspaceManifestFolders.length) {
+        console.log('Installing skills from folders containing ploinky-skills-manifest.json...');
+        for (const manifestFolder of workspaceManifestFolders) {
+            const manifestPath = skillsSvc.findSkillsManifestPath(manifestFolder);
             try {
-                const result = skillsSvc.installDefaultSkills(SKILLS_REPO_NAME, {
-                    targetRoot: repo.path,
+                const result = skillsSvc.installSkillsFromManifest(manifestPath, {
+                    targetRoot: manifestFolder,
                 });
+                const reposLabel = result.repoCount ? ` from ${result.repoCount} repos` : '';
                 const skillNames = result.skills.join(', ');
-                console.log(`  ✓ ${repo.name}: ${result.skills.length} skill(s) (${skillNames})`);
+                const folderLabel = path.relative(projectsRoot, manifestFolder) || path.basename(manifestFolder);
+                console.log(`  ✓ ${folderLabel}: ${result.skills.length} skill(s)${reposLabel} (${skillNames})`);
+                if (result.duplicateSkills?.length) {
+                    const duplicates = result.duplicateSkills
+                        .map((entry) => `  - ${entry.skill}: ${entry.previousSource} -> ${entry.chosenSource}`)
+                        .join('\n');
+                    console.log(`    duplicate skills resolved by manifest order:\n${duplicates}`);
+                }
                 if (result.gitignoreUpdated) {
                     console.log(`    .gitignore updated`);
                 }
+                updated += 1;
             } catch (err) {
                 const message = err?.message || String(err);
-                failed.push({ repoName: `${repo.name} skills`, message });
-                console.error(`  ✗ ${repo.name} skills: ${message}`);
+                const folderLabel = path.relative(projectsRoot, manifestFolder) || path.basename(manifestFolder);
+                failed.push({ repoName: `${folderLabel} skills`, message });
+                console.error(`  ✗ ${folderLabel} skills: ${message}`);
             }
         }
     }
 
-    const totalRepos = 1 + ploinkyRepos.length + workspaceRepos.length;
+    const totalRepos = 1 + ploinkyRepos.length + workspaceRepos.length + workspaceManifestFolders.length;
     console.log(`Update summary: ${updated}/${totalRepos} repositories updated.`);
     if (skipped.length) {
         const skippedNames = skipped.map(entry => entry.repoName).join(', ');

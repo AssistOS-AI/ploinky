@@ -1,5 +1,7 @@
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
+import { execFileSync } from 'child_process';
 import { REPOS_DIR } from './config.js';
 import * as reposSvc from './repos.js';
 
@@ -7,10 +9,12 @@ export const AGENT_SKILL_TARGETS = Object.freeze({
     'claude-code': '.claude/skills',
     'agents':      '.agents/skills',
 });
+export const SKILLS_MANIFEST_FILE = 'ploinky-skills-manifest.json';
 
 const CANONICAL_AGENT_DIR = '.agents';
 const CLAUDE_SYMLINK = '.claude';
 const CANONICAL_SKILLS_DIR = AGENT_SKILL_TARGETS['agents'];
+const SKILLS_DISCOVERY_IGNORED_DIRS = new Set(['.git', 'node_modules', 'globalDeps', '.ploinky']);
 
 const GITIGNORE_MARKER_START = '# >>> ploinky default-skills >>>';
 const GITIGNORE_MARKER_END = '# <<< ploinky default-skills <<<';
@@ -26,6 +30,62 @@ function listSkillDirectories(skillsRoot) {
     return fs.readdirSync(skillsRoot, { withFileTypes: true })
         .filter(entry => entry.isDirectory() && !entry.name.startsWith('.'))
         .map(entry => entry.name);
+}
+
+function parseSkillsManifest(rawPath) {
+    let rawManifest;
+    try {
+        rawManifest = fs.readFileSync(rawPath, 'utf8');
+    } catch (err) {
+        throw new Error(`Cannot read skills manifest '${rawPath}': ${err?.message || String(err)}`);
+    }
+
+    let parsed;
+    try {
+        parsed = JSON.parse(rawManifest || '');
+    } catch (err) {
+        throw new Error(`Invalid JSON in skills manifest '${rawPath}': ${err?.message || String(err)}`);
+    }
+
+    if (!Array.isArray(parsed)) {
+        throw new Error(`Invalid skills manifest '${rawPath}': expected an array of repository links.`);
+    }
+
+    return parsed.map((entry, index) => {
+        if (typeof entry !== 'string') {
+            throw new Error(`Invalid skills manifest '${rawPath}': entry at index ${index} must be a string.`);
+        }
+        const trimmed = entry.trim();
+        if (!trimmed) {
+            throw new Error(`Invalid skills manifest '${rawPath}': entry at index ${index} is empty.`);
+        }
+        return trimmed;
+    });
+}
+
+function resolveRepoFromManifestLink(link, manifestDir) {
+    const candidate = path.resolve(manifestDir, link);
+    if (fs.existsSync(candidate)) {
+        return {
+            repoPath: candidate,
+            cleanup: () => {},
+            source: link,
+        };
+    }
+
+    const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-skill-repo-'));
+    const clonedRepoPath = path.join(tmpRoot, 'repo');
+    try {
+        execFileSync('git', ['clone', '--quiet', '--depth', '1', link, clonedRepoPath], { stdio: 'ignore' });
+        return {
+            repoPath: clonedRepoPath,
+            cleanup: () => fs.rmSync(tmpRoot, { recursive: true, force: true }),
+            source: link,
+        };
+    } catch (err) {
+        fs.rmSync(tmpRoot, { recursive: true, force: true });
+        throw new Error(`Failed to clone skill repository '${link}': ${err?.message || String(err)}`);
+    }
 }
 
 export function copySkill(srcDir, destDir) {
@@ -82,6 +142,152 @@ export function ensureGitignoreEntries(workspaceRoot, relPaths) {
     const block = `${needsLeadingNewline ? '\n' : ''}${GITIGNORE_MARKER_START}\n${desired.join('\n')}\n${GITIGNORE_MARKER_END}\n`;
     fs.writeFileSync(gitignorePath, content + block);
     return true;
+}
+
+export function readSkillsManifest(manifestPath) {
+    return parseSkillsManifest(manifestPath);
+}
+
+export function installSkillsFromManifest(manifestPath, { targetRoot } = {}) {
+    if (!manifestPath || typeof manifestPath !== 'string') {
+        throw new Error('Missing skills manifest path.');
+    }
+
+    const links = parseSkillsManifest(manifestPath);
+    if (!links.length) {
+        throw new Error(`Skills manifest '${manifestPath}' has no repositories.`);
+    }
+
+    const destRoot = targetRoot || process.cwd();
+    const resolvedLinks = links.map(link => String(link).trim()).filter(Boolean);
+    const manifestDir = path.dirname(manifestPath);
+
+    const acquired = [];
+    const sourceRepos = [];
+    const skillConflicts = [];
+    const skillSource = new Map();
+    try {
+        for (const link of resolvedLinks) {
+            const source = resolveRepoFromManifestLink(link, manifestDir);
+            acquired.push(source);
+            const skillsRoot = path.join(source.repoPath, 'skills');
+            if (!fs.existsSync(skillsRoot) || !fs.statSync(skillsRoot).isDirectory()) {
+                throw new Error(`No skills/ folder in source repo '${link}' (expected ${skillsRoot}).`);
+            }
+            const skills = listSkillDirectories(skillsRoot);
+            if (!skills.length) {
+                throw new Error(`No skill subdirectories found under ${skillsRoot} for source '${link}'.`);
+            }
+            sourceRepos.push({
+                source: link,
+                repoPath: source.repoPath,
+                skills,
+                cleanup: source.cleanup,
+            });
+            for (const skill of skills) {
+                const previousSource = skillSource.get(skill);
+                if (previousSource) {
+                    skillConflicts.push({
+                        skill,
+                        previousSource,
+                        chosenSource: link,
+                    });
+                }
+                skillSource.set(skill, link);
+            }
+        }
+
+        const incomingSkills = Array.from(skillSource.keys());
+        const isGitRepoTarget = reposSvc.isGitRepository(destRoot);
+        const agentsSkillsDir = path.join(destRoot, CANONICAL_SKILLS_DIR);
+        fs.rmSync(agentsSkillsDir, { recursive: true, force: true });
+        fs.mkdirSync(agentsSkillsDir, { recursive: true });
+
+        for (const source of sourceRepos) {
+            const sourceSkillsRoot = path.join(source.repoPath, 'skills');
+            for (const skill of source.skills) {
+                copySkill(path.join(sourceSkillsRoot, skill), path.join(agentsSkillsDir, skill));
+            }
+        }
+
+        const claudeLink = ensureClaudeSymlink(destRoot);
+        let gitignoreUpdated = false;
+        if (isGitRepoTarget) {
+            const gitignoreEntries = [
+                ...incomingSkills.map(skill => `${CANONICAL_SKILLS_DIR}/${skill}`),
+                CANONICAL_AGENT_DIR,
+                CLAUDE_SYMLINK,
+            ];
+            gitignoreUpdated = ensureGitignoreEntries(destRoot, gitignoreEntries);
+        }
+
+        return {
+            manifestPath,
+            repoCount: links.length,
+            repos: sourceRepos.map((repo) => ({
+                source: repo.source,
+                skills: repo.skills,
+            })),
+            skills: incomingSkills,
+            targets: [{ agent: 'agents', relDir: CANONICAL_SKILLS_DIR, skills: incomingSkills }],
+            destRoot,
+            gitignoreUpdated,
+            symlinkCreated: claudeLink.changed,
+            claudeLink,
+            duplicateSkills: skillConflicts,
+            legacyMigration: { migratedSkills: [], skippedExistingSkills: [] },
+        };
+    } finally {
+        for (const source of acquired) {
+            try {
+                source.cleanup();
+            } catch (_) {}
+        }
+    }
+}
+
+export function findSkillsManifestPath(targetRoot) {
+    const manifestPath = path.join(targetRoot, SKILLS_MANIFEST_FILE);
+    if (!fs.existsSync(manifestPath)) return null;
+    return manifestPath;
+}
+
+export function findWorkspaceFoldersWithSkillsManifest(searchRoot) {
+    const root = String(searchRoot || '').trim();
+    if (!root) throw new Error('Search root must be a non-empty directory path.');
+
+    const resolvedRoot = path.resolve(root);
+    if (!fs.existsSync(resolvedRoot) || !fs.statSync(resolvedRoot).isDirectory()) {
+        throw new Error(`Search root '${resolvedRoot}' is not a directory.`);
+    }
+
+    const folders = [];
+
+    function visit(dir) {
+        const manifestPath = path.join(dir, SKILLS_MANIFEST_FILE);
+        if (fs.existsSync(manifestPath)) {
+            folders.push(dir);
+        }
+
+        let entries;
+        try {
+            entries = fs.readdirSync(dir, { withFileTypes: true });
+        } catch (err) {
+            if (err?.code === 'EACCES' || err?.code === 'EPERM') return;
+            throw err;
+        }
+
+        for (const entry of entries
+            .filter(entry => entry.isDirectory())
+            .filter(entry => !entry.name.startsWith('.'))
+            .filter(entry => !SKILLS_DISCOVERY_IGNORED_DIRS.has(entry.name))
+            .sort((a, b) => a.name.localeCompare(b.name))) {
+            visit(path.join(dir, entry.name));
+        }
+    }
+
+    visit(resolvedRoot);
+    return folders;
 }
 
 function migrateLegacyClaudeSkills(destRoot, incomingSkills, agentsSkillsDir) {
