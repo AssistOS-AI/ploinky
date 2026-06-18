@@ -65,10 +65,20 @@ function resolveSubjectId(repo, agent) {
     }
 }
 
-function resolveChatConfig(manifest) {
+const OPT_OUT_MODELS = new Set(['none', 'off']);
+
+function resolveResponderKind(manifest) {
     const endpoints = manifest && typeof manifest === 'object' ? manifest.endpoints : null;
     const chat = endpoints && typeof endpoints === 'object' ? endpoints.chatCompletions : null;
-    return chat && typeof chat === 'object' ? chat : null;
+    if (chat && typeof chat === 'object') {
+        if (typeof chat.command === 'string' && chat.command.trim()) {
+            return { kind: 'command', supportsStreaming: chat.supportsStream === true || chat.stream === true };
+        }
+        if (typeof chat.model === 'string' && OPT_OUT_MODELS.has(chat.model.trim().toLowerCase())) {
+            return { kind: 'inert', supportsStreaming: false };
+        }
+    }
+    return { kind: 'llm', supportsStreaming: true };
 }
 
 function buildAgentRow(routeKey, route, manifest) {
@@ -77,7 +87,7 @@ function buildAgentRow(routeKey, route, manifest) {
     const subjectId = resolveSubjectId(repoAgent.repo, repoAgent.agent);
     if (!subjectId) return null;
 
-    const chatConfig = resolveChatConfig(manifest);
+    const responder = resolveResponderKind(manifest);
     const name = String(manifest?.name || routeKey);
     return {
         subjectId,
@@ -87,13 +97,9 @@ function buildAgentRow(routeKey, route, manifest) {
         name,
         routerPath: `/${routeKey}`,
         chatCompletionsPath: CHAT_COMPLETIONS_PATH,
-        // Mirror the runtime's streaming detection in AgentServer.resolveOpenAiChatConfig
-        // (`supportsStream === true || stream === true`) so discovery advertises the
-        // same capability the agent actually serves.
-        supportsStreaming: chatConfig ? (chatConfig.supportsStream === true || chatConfig.stream === true) : false,
-        // Task 5 gives manifest-less-chat agents a default OpenAI responder, so they
-        // are still discoverable; the flag tells Soul Gateway which responder to use.
-        usesDefaultOpenAiResponder: !chatConfig,
+        supportsStreaming: responder.supportsStreaming,
+        usesDefaultOpenAiResponder: responder.kind !== 'command',
+        responderKind: responder.kind,
         manifest: {
             name,
             version: String(manifest?.version || ''),
