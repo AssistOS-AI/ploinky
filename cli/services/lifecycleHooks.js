@@ -135,6 +135,15 @@ export function executeHostHook(scriptPath, env = {}, options = {}) {
         PLOINKY_HOOK_TYPE: 'host'
     };
 
+    // Host hooks run on the HOST BEFORE the container exists, so the container-only
+    // PLOINKY_WORKSPACE_ROOT injection (see agentServiceManager/bwrapServiceManager)
+    // has not happened yet. Provide it here so host hooks can resolve the workspace
+    // root the same way containers do. An explicit value (caller-provided env or an
+    // operator-exported process env) always wins.
+    if (!hookEnv.PLOINKY_WORKSPACE_ROOT) {
+        hookEnv.PLOINKY_WORKSPACE_ROOT = cwd;
+    }
+
     // Check if this is an inline command
     if (isInlineCommand(scriptPath)) {
         try {
