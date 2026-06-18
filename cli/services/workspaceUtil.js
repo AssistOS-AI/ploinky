@@ -833,6 +833,7 @@ async function startWorkspace(staticAgentArg, portArg, { refreshComponentToken, 
 
 async function runCli(agentName, args) {
   if (!agentName) { throw new Error('Usage: cli <agentName> [args...]'); }
+  const suppressLauncherLogs = process.env.PLOINKY_NO_TTY === '1';
   let registryRecord = null;
   let manifestLookup = agentName;
   try {
@@ -907,9 +908,13 @@ async function runCli(agentName, args) {
   if (readinessProtocol !== 'none') {
     const hostPort = containerInfo?.hostPort;
     if (!hostPort) {
-      console.warn(`[cli] warning: cannot wait for '${shortAgentName}' readiness because no host port was resolved.`);
+      if (!suppressLauncherLogs) {
+        console.warn(`[cli] warning: cannot wait for '${shortAgentName}' readiness because no host port was resolved.`);
+      }
     } else {
-      console.log(`[cli] Waiting for '${shortAgentName}' readiness (${readinessProtocol}) on port ${hostPort}...`);
+      if (!suppressLauncherLogs) {
+        console.log(`[cli] Waiting for '${shortAgentName}' readiness (${readinessProtocol}) on port ${hostPort}...`);
+      }
       const ready = await waitForAgentReady({ hostPort }, {
         timeoutMs: 600000,
         protocol: readinessProtocol,
