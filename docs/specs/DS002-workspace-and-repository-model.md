@@ -36,7 +36,7 @@ Enabled repositories constrain discovery when `enabled_repos.json` is populated.
 
 Agent source and skill trees must be projected into `.ploinky/code/<agent>/` and `.ploinky/skills/<agent>/` through symlinks when an agent is enabled. If a real directory blocks a symlink target, the runtime may warn and skip that symlink rather than destroying the existing path.
 
-Manifest-declared extra host mounts must resolve under `.ploinky/`. Durable data belongs under `.ploinky/data/<agent-or-service>/...`; generated startup inputs belong under `.ploinky/agents/<agent>/...`. Agents must not create sibling top-level runtime directories such as `postgres/`, `webmeet/`, or `webmeetAgent/` in the user's workspace root.
+Manifest-declared extra host mounts are explicit operator-granted filesystem access. Relative manifest volume paths resolve against the workspace root, and absolute paths are honored as declared; they are not required to live under `.ploinky/`. Durable data should prefer `.ploinky/data/<agent-or-service>/...` and generated startup inputs should prefer `.ploinky/agents/<agent>/...` when no external host path is needed, but agents may mount workspace folders or host-managed directories when the manifest contract requires it.
 
 ## Decisions & Questions
 

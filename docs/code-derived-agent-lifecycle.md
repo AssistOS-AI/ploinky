@@ -206,7 +206,7 @@ Ploinky does not load a central manifest schema in the observed paths. Individua
 | `readiness.protocol` | No | Startup readiness protocol: `tcp`, `mcp`, or `none`. If absent, manifests with `start` default to `tcp`; otherwise default is `mcp`. |
 | `health.liveness` | No | Watchdog container monitor script probe. Script name must be local to agent root, with no slash or `..`. Failure can restart the container with backoff. |
 | `health.readiness` | No | Watchdog container monitor script probe. Failure logs a warning; it does not block startup in the same way as startup readiness. |
-| `volumes` | No | Extra host-to-container mounts. Host paths are resolved relative to workspace root when relative and must live under `.ploinky`. Missing paths are created unless marked generated+required. |
+| `volumes` | No | Extra host-to-container mounts. Relative host paths are resolved against the workspace root; absolute host paths are honored as declared. Missing paths are created unless marked generated+required. |
 | `volumeOptions` | No | Per-container-path options for `volumes`: `generated`, `required`, numeric `chmod`, and `makeWorldWritableSubdirs`. |
 | `network` | No | Supports host mode or named network with aliases. Default Docker adds `host.docker.internal`; default Podman uses `slirp4netns:allow_host_loopback=true`. |
 | `containerSecurity.privileged` | No | Adds `--privileged` for container runtime when true. |
@@ -462,7 +462,7 @@ Important bwrap mounts:
 | Agent private key when present | `/run/ploinky-agent.key`. |
 | Project path/current working directory | Same absolute path. |
 | Agent skills path | `/code/skills` when present. |
-| Manifest volumes | Configured target paths, after `.ploinky` host-path validation. |
+| Manifest volumes | Configured target paths, with relative host paths resolved against the workspace root and absolute host paths honored as declared. |
 | Runtime persistent storage | Configured container path. |
 
 The bwrap process does not unshare networking, so agent ports bind on the host. It does unshare PID. The runtime explicitly sets env vars with `--clearenv` plus `--setenv`, including `PORT`, router URL, manifest env, profile env/secrets, runtime resource env, `NODE_PATH=/code/node_modules`, `HOME=/tmp`, `PATH`, and identity variables.
@@ -488,7 +488,7 @@ The generated seatbelt profile grants reads/writes to required real paths, denie
 
 ## Manifest Volumes and Runtime Resources
 
-Manifest volumes are intentionally restricted. `resolveManifestVolumeHostPath` resolves relative paths against the workspace root. `assertManifestVolumeHostPathUnderPloinky` then requires the resolved host path to be inside `.ploinky`. This applies to containers, bwrap, and seatbelt profile generation.
+Manifest volumes are explicit trusted filesystem grants from the agent manifest. `resolveManifestVolumeHostPath` resolves relative paths against the workspace root and honors absolute paths as declared. Containers, bwrap, and seatbelt profile generation no longer require the resolved host path to live inside `.ploinky`.
 
 When a configured volume host path does not exist:
 

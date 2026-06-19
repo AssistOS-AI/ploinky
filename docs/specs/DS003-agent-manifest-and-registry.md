@@ -56,7 +56,7 @@ manifest value. Agents should use this only when the container is itself a
 sandbox host or similar runtime primitive that cannot function under the
 default OCI confinement.
 
-Manifest `volumes` declare additional host-to-container mounts beyond Ploinky's default `/Agent`, `/code`, dependency cache, `/shared`, and workspace/run-mode mounts. The host side of every manifest volume must resolve under the workspace `.ploinky/` directory. Relative host paths are resolved against the workspace root and are valid only when they point into `.ploinky/`, such as `.ploinky/data/postgres/data` or `.ploinky/agents/webmeetLivekitServer/livekit.yaml`. Container destinations should use stable semantic paths such as `/data` for agent-owned durable data and `/working-data/generated` for generated config when the agent controls the command line. Mounting into image-specific paths such as `/var/lib/postgresql/data`, `/opt/keycloak/data`, `/etc/letsencrypt`, or `/var/log/onlyoffice` is reserved for upstream images that require those locations.
+Manifest `volumes` declare additional host-to-container mounts beyond Ploinky's default `/Agent`, `/code`, dependency cache, `/shared`, and workspace/run-mode mounts. Relative host paths are resolved against the workspace root, and absolute host paths are mounted as declared. The host side is not required to live under `.ploinky/`; manifest volumes are explicit operator-granted filesystem access for the agent. Durable runtime state should still prefer `.ploinky/data/<agent-or-service>/...` and generated startup inputs should still prefer `.ploinky/agents/<agent>/...` when no external host path is required. Container destinations should use stable semantic paths such as `/data` for agent-owned durable data and `/working-data/generated` for generated config when the agent controls the command line. Mounting into image-specific paths such as `/var/lib/postgresql/data`, `/opt/keycloak/data`, `/etc/letsencrypt`, or `/var/log/onlyoffice` is reserved for upstream images that require those locations.
 
 The manifest `enable` directive may also appear inside a profile block (`manifest.profiles.<profile>.enable`). When the workspace dependency graph is built, profile-level `enable` entries are merged with the top-level `manifest.enable` list against the active profile only. This is the supported way to pin an optional dependency to specific profiles (for example "the production TLS terminator only ships in prod"). The leaf agent's manifest stays unaware of profile selection; the choice lives in the parent that knows when to chain it in.
 
@@ -108,10 +108,10 @@ policy is visible in the agent source and profile selection. Raw runtime flags
 would blur deployment policy with command construction and would make auditing
 container privilege harder.
 
-### Question #7: Why reject manifest volumes outside `.ploinky/`?
+### Question #7: Why are manifest volumes allowed outside `.ploinky/`?
 
 Response:
-Manifest volumes are broad writable filesystem grants. If each agent chooses arbitrary sibling folders in the workspace root, a normal project checkout accumulates service data, generated configs, databases, and recording trees that are hard to distinguish from user files. Requiring the host side to live under `.ploinky/` keeps runtime state disposable and auditable while still allowing the container side to match the service's expected filesystem contract.
+Manifest volumes are broad writable filesystem grants, but they are declared in the agent manifest and reviewed as part of the operator-enabled agent contract. Some agents need to bind existing workspace folders, external data directories, or host-managed paths that cannot be moved under `.ploinky/`. Ploinky therefore treats manifest volumes as explicit trusted grants: relative host paths resolve against the workspace root, absolute paths are honored, and `.ploinky/data` remains the recommended default for ordinary runtime state rather than a hard validation boundary.
 
 ### Question #8: Why require profile defaults for non-sensitive required env?
 
