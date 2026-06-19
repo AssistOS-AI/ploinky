@@ -76,7 +76,6 @@ import {
     runtimeSegment
 } from '../runtimeStaging.js';
 import {
-    assertManifestVolumeHostPathUnderPloinky,
     ensureManifestVolumeHostPath,
     readManifestVolumeOptions,
     resolveManifestVolumeHostPath
@@ -401,7 +400,6 @@ function ensureManifestVolumeHostPaths(manifest) {
     const volumeOptions = readManifestVolumeOptions(manifest);
     for (const [hostPath, containerPath] of Object.entries(manifest.volumes)) {
         const resolvedHostPath = resolveManifestVolumeHostPath(hostPath);
-        assertManifestVolumeHostPathUnderPloinky(resolvedHostPath, containerPath);
         const options = volumeOptions[containerPath]
             || volumeOptions[String(containerPath || '').replace(/\/+$/, '')]
             || {};
@@ -647,7 +645,6 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         const volumeOptions = readManifestVolumeOptions(manifest);
         for (const [hostPath, containerPath] of Object.entries(manifest.volumes)) {
             const resolvedHostPath = resolveManifestVolumeHostPath(hostPath);
-            assertManifestVolumeHostPathUnderPloinky(resolvedHostPath, containerPath);
             const options = volumeOptions[containerPath]
                 || volumeOptions[String(containerPath || '').replace(/\/+$/, '')]
                 || {};
@@ -1371,7 +1368,6 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
 }
 
 export {
-    assertManifestVolumeHostPathUnderPloinky,
     assertPodmanCodeMountAllowed,
     buildPodmanStagedTargetMounts,
     buildRuntimeRouterEnv,

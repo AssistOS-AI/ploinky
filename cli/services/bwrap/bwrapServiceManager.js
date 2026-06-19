@@ -76,7 +76,6 @@ import {
     getBwrapPid
 } from './bwrapFleet.js';
 import {
-    assertManifestVolumeHostPathUnderPloinky,
     ensureManifestVolumeHostPath,
     readManifestVolumeOptions,
     resolveManifestVolumeHostPath
@@ -291,7 +290,6 @@ function buildBwrapArgs(options) {
         const volumeOptions = options.volumeOptions || {};
         for (const [hostPath, containerPath] of Object.entries(volumes)) {
             const resolvedHostPath = resolveManifestVolumeHostPath(hostPath);
-            assertManifestVolumeHostPathUnderPloinky(resolvedHostPath, containerPath);
             const mountOptions = volumeOptions[containerPath]
                 || volumeOptions[String(containerPath || '').replace(/\/+$/, '')]
                 || {};

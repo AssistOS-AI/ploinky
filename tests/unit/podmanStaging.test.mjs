@@ -6,7 +6,6 @@ import os from 'node:os';
 import path from 'node:path';
 
 import {
-    assertManifestVolumeHostPathUnderPloinky,
     assertPodmanCodeMountAllowed,
     buildPodmanStagedTargetMounts,
     codeRelativeMountPath,
@@ -16,6 +15,7 @@ import {
     podmanMountSuffix,
 } from '../../cli/services/docker/agentServiceManager.js';
 import { PLOINKY_DIR, PLOINKY_WORKSPACE_ROOT } from '../../cli/services/config.js';
+import { resolveManifestVolumeHostPath } from '../../cli/services/manifestVolumePolicy.js';
 import {
     prepareFreshRuntimeRoot,
     pruneStaleRuntimeEntries,
@@ -227,19 +227,20 @@ test('podmanMountSuffix places z before ro for absolute self-mount targets', () 
     assert.equal(podmanMountSuffix(false), ':z');
 });
 
-test('manifest volume host paths must stay under workspace .ploinky', () => {
-    assert.doesNotThrow(() => {
-        assertManifestVolumeHostPathUnderPloinky(
-            path.join(PLOINKY_DIR, 'data', 'demo', 'state'),
-            '/data',
-        );
-    });
-    assert.throws(
-        () => assertManifestVolumeHostPathUnderPloinky(
-            path.join(PLOINKY_WORKSPACE_ROOT, 'demo', 'state'),
-            '/data',
-        ),
-        /Extra manifest volumes must live under/,
+test('manifest volume host paths may resolve outside workspace .ploinky', () => {
+    assert.equal(
+        resolveManifestVolumeHostPath('.ploinky/data/demo/state'),
+        path.join(PLOINKY_DIR, 'data', 'demo', 'state'),
+    );
+    assert.equal(
+        resolveManifestVolumeHostPath('demo/state'),
+        path.join(PLOINKY_WORKSPACE_ROOT, 'demo', 'state'),
+    );
+
+    const absoluteVolume = path.join(os.tmpdir(), 'ploinky-absolute-volume');
+    assert.equal(
+        resolveManifestVolumeHostPath(absoluteVolume),
+        path.resolve(absoluteVolume),
     );
 });
 

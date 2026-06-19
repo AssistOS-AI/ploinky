@@ -23,6 +23,15 @@ function hasRoBind(args, source, target = source) {
     return false;
 }
 
+function hasBind(args, source, target = source) {
+    for (let index = 0; index < args.length - 2; index += 1) {
+        if (args[index] === '--bind' && args[index + 1] === source && args[index + 2] === target) {
+            return true;
+        }
+    }
+    return false;
+}
+
 test('buildBwrapArgs overlays protected workspace paths read-only after cwd bind', () => {
     const root = tempDir();
     try {
@@ -52,6 +61,39 @@ test('buildBwrapArgs overlays protected workspace paths read-only after cwd bind
         assert.ok(hasRoBind(args, cacheRoot));
         assert.ok(hasRoBind(args, agentCodePath));
         assert.ok(args.indexOf('--bind') < args.lastIndexOf('--ro-bind'));
+    } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+    }
+});
+
+test('buildBwrapArgs allows manifest volumes outside .ploinky', () => {
+    const root = tempDir();
+    try {
+        const agentCodePath = path.join(root, '.ploinky', 'repos', 'repo', 'agent');
+        const nodeModulesDir = path.join(root, '.ploinky', 'deps', 'agents', 'repo', 'agent', 'bwrap-linux-x64-node25', 'node_modules');
+        const sharedDir = path.join(root, '.ploinky', 'shared');
+        const agentLibPath = path.join(root, 'Agent');
+        const dataDir = path.join(root, 'workspace-data', 'uploads');
+        for (const dir of [agentCodePath, nodeModulesDir, sharedDir, agentLibPath, dataDir]) {
+            fs.mkdirSync(dir, { recursive: true });
+        }
+
+        const args = buildBwrapArgs({
+            agentCodePath,
+            agentLibPath,
+            nodeModulesDir,
+            sharedDir,
+            cwd: root,
+            skillsPath: null,
+            envMap: {},
+            codeReadOnly: true,
+            skillsReadOnly: true,
+            volumes: {
+                [dataDir]: '/uploads',
+            },
+        });
+
+        assert.ok(hasBind(args, dataDir, '/uploads'));
     } finally {
         fs.rmSync(root, { recursive: true, force: true });
     }

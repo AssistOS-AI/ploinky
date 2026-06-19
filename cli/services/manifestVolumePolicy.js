@@ -1,14 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 
-import { PLOINKY_DIR, PLOINKY_WORKSPACE_ROOT } from './config.js';
-
-function isPathInsideRoot(candidate, root) {
-    const resolvedCandidate = path.resolve(candidate);
-    const resolvedRoot = path.resolve(root);
-    const relative = path.relative(resolvedRoot, resolvedCandidate);
-    return relative && !relative.startsWith('..') && !path.isAbsolute(relative);
-}
+import { PLOINKY_WORKSPACE_ROOT } from './config.js';
 
 export function readManifestVolumeOptions(manifest) {
     return manifest?.volumeOptions && typeof manifest.volumeOptions === 'object'
@@ -20,16 +13,6 @@ export function resolveManifestVolumeHostPath(hostPath, workspaceRoot = PLOINKY_
     return path.isAbsolute(hostPath)
         ? path.resolve(hostPath)
         : path.resolve(workspaceRoot, hostPath);
-}
-
-export function assertManifestVolumeHostPathUnderPloinky(resolvedHostPath, containerPath = '', ploinkyDir = PLOINKY_DIR) {
-    if (!isPathInsideRoot(resolvedHostPath, ploinkyDir)) {
-        throw new Error(
-            `[volume] Manifest volume '${containerPath || resolvedHostPath}' uses host path '${resolvedHostPath}'. `
-            + `Extra manifest volumes must live under '${ploinkyDir}'. `
-            + 'Use .ploinky/data/<agent>/... for durable data or .ploinky/agents/<agent>/... for generated runtime files.'
-        );
-    }
 }
 
 export function ensureManifestVolumeHostPath(resolvedHostPath, _containerPath, options = {}) {
@@ -95,11 +78,9 @@ export function ensureManifestVolumeHostPath(resolvedHostPath, _containerPath, o
 export function normalizeManifestVolumeHostPaths(volumes, options = {}) {
     if (!volumes || typeof volumes !== 'object') return [];
     const workspaceRoot = options.workspaceRoot || PLOINKY_WORKSPACE_ROOT;
-    const ploinkyDir = options.ploinkyDir || path.join(workspaceRoot, '.ploinky');
     const paths = [];
-    for (const [hostPath, containerPath] of Object.entries(volumes)) {
+    for (const hostPath of Object.keys(volumes)) {
         const resolvedHostPath = resolveManifestVolumeHostPath(hostPath, workspaceRoot);
-        assertManifestVolumeHostPathUnderPloinky(resolvedHostPath, containerPath, ploinkyDir);
         paths.push(resolvedHostPath);
     }
     return Array.from(new Set(paths));

@@ -49,7 +49,7 @@ function rejectHostMountFields(value, label) {
     if (!value || typeof value !== 'object') return;
     for (const banned of ['volumes', 'mounts', 'binds', 'hostMounts']) {
         if (Object.prototype.hasOwnProperty.call(value, banned)) {
-            throw new RuntimePolicyError(`${label}: '${banned}' is not permitted inside runtime policy; use manifest volumes under .ploinky/`);
+            throw new RuntimePolicyError(`${label}: '${banned}' is not permitted inside runtime policy; use manifest volumes`);
         }
     }
 }

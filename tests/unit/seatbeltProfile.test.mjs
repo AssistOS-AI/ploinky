@@ -40,6 +40,7 @@ test('buildSeatbeltProfile grants root and parent literals for scoped paths', ()
         skillsReadOnly: true,
         volumes: {
             '.ploinky/repos/webassist/data': '/data',
+            'workspace-data/uploads': '/uploads',
         },
         workspaceRoot: '/Users/alice/workspace',
         extraReadPaths: ['/opt/homebrew'],
@@ -55,6 +56,8 @@ test('buildSeatbeltProfile grants root and parent literals for scoped paths', ()
     assert.ok(profile.includes('(subpath "/Users/alice/workspace/.ploinky/logs")'));
     assert.ok(profile.includes('(allow file-write* (subpath "/Users/alice/workspace/.ploinky/logs"))'));
     assert.ok(profile.includes('(subpath "/Users/alice/workspace/.ploinky/repos/webassist/data")'));
+    assert.ok(profile.includes('(subpath "/Users/alice/workspace/workspace-data/uploads")'));
+    assert.ok(profile.includes('(allow file-write* (subpath "/Users/alice/workspace/workspace-data/uploads"))'));
 });
 
 test('buildSeatbeltProfile protects read-only paths even under writable workspace', () => {
