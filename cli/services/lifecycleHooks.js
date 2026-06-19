@@ -14,6 +14,7 @@ import {
     createAgentSymlinks,
     createAgentWorkDir
 } from './workspaceStructure.js';
+import { PLOINKY_WORKSPACE_ROOT } from './config.js';
 
 function normalizeProfileEnv(env) {
     if (!env || typeof env !== 'object' || Array.isArray(env)) {
@@ -509,8 +510,7 @@ export function runPreContainerLifecycle(agentName, repoName, agentPath, profile
                 });
                 
                 debugLog(`[lifecycle] Running preinstall [HOST]: ${hookValue}`);
-                // Run from workspace root so ploinky var commands can find .ploinky directory
-                const result = executeHostHook(hookValue, hookEnv, { cwd: process.cwd() });
+                const result = executeHostHook(hookValue, hookEnv, { cwd: PLOINKY_WORKSPACE_ROOT });
                 if (!result.success) {
                     errors.push(`preinstall hook failed: ${result.message}`);
                 } else {

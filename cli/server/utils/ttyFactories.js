@@ -5,7 +5,7 @@ import { configCache } from '../utils/configCache.js';
 import { logBootEvent } from '../utils/logger.js';
 import { getAppName } from '../authHandlers.js';
 import { resolveWebchatCommands, resolveWebchatCommandsForAgent } from '../webchat/commandResolver.js';
-import { WORKSPACE_ROOT } from '../../services/config.js';
+import { PLOINKY_WORKSPACE_ROOT } from '../../services/config.js';
 
 function tryGetCwd() {
     try {
@@ -174,7 +174,7 @@ function createWebchatFactoryConfig(pty, webchatTTYModule, resolvedWebchatComman
         // `.ploinky/` state (enabled repos, enabled agents). If it runs from
         // `agents/<name>/`, Ploinky bootstraps a new `.ploinky/` and then fails
         // with: "Agent '<name>' not found".
-        return resolveSafeHostWorkdir(WORKSPACE_ROOT);
+        return resolveSafeHostWorkdir(PLOINKY_WORKSPACE_ROOT);
     };
 
     const buildFactoryResult = (config) => {
@@ -324,5 +324,6 @@ function createServiceConfig(getWebttyFactory, getWebchatFactory) {
 
 export {
     initializeTTYFactories,
-    createServiceConfig
+    createServiceConfig,
+    resolveSafeHostWorkdir
 };

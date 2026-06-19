@@ -1,7 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 
-import { ROUTING_FILE } from '../services/config.js';
+import { ROUTING_FILE, PLOINKY_WORKSPACE_ROOT } from '../services/config.js';
 import { resolveEnabledAgentRecord } from '../services/agents.js';
 import { findAgent } from '../services/utils.js';
 import { resolveMaxTtlSeconds } from './mcp-proxy/userDelegationGrant.js';
@@ -12,7 +12,7 @@ const REMOVED_SERVICE_SPEC_FIELDS = ['auth', 'mode', ['force', 'Guest'].join('')
 
 export function loadRoutingConfig() {
     const dynamicRoutingFile = process.env.PLOINKY_ROUTING_FILE
-        || path.join(process.cwd(), '.ploinky', 'routing.json');
+        || path.join(PLOINKY_WORKSPACE_ROOT, '.ploinky', 'routing.json');
     const routingFile = fs.existsSync(dynamicRoutingFile) ? dynamicRoutingFile : ROUTING_FILE;
     try {
         return JSON.parse(fs.readFileSync(routingFile, 'utf8')) || {};

@@ -115,10 +115,23 @@ const PREDEFINED_REPOS = {
     extra: { url: 'https://github.com/PloinkyRepos/extra.git', description: 'Additional utility agents', kind: 'agents' },
     AchillesIDE: { url: 'https://github.com/PloinkyRepos/AssistOSExplorer.git', description: 'Workspace IDE with Explorer UI, SOPLang editing and Git workflows', kind: 'agents' },
     AchillesCLI: { url: 'https://github.com/OutfinityResearch/AchillesCLI.git', description: 'Workspace CLI for setup and management', kind: 'agents' },
+    'copilot-agents': { url: 'https://github.com/AssistOS-AI/copilot-agents.git', description: 'OpenCode copilot agents', kind: 'agents' },
     demo: { url: 'https://github.com/PloinkyRepos/demo.git', description: 'Demo agents and examples', kind: 'agents' },
     proxies: { url: 'https://github.com/PloinkyRepos/proxies.git', description: 'API proxy agents (Kiro Gateway)', kind: 'agents' },
     AchillesCopilotBasicSkills: { url: 'https://github.com/AssistOS-AI/AchillesCopilotBasicSkills.git', description: 'Default Anthropic-style skill catalog (SKILL.md folders)', kind: 'skills' }
 };
+
+const BOOT_REPO_NAMES = ['basic', 'AchillesIDE', 'AchillesCLI', 'copilot-agents'];
+
+export function getDefaultBootRepos() {
+    return BOOT_REPO_NAMES
+        .map((repoName) => {
+            const url = resolveRepoUrl(repoName);
+            if (!url) return null;
+            return { name: repoName, url };
+        })
+        .filter(Boolean);
+}
 
 export function getPredefinedRepos() {
     return PREDEFINED_REPOS;

@@ -6,6 +6,7 @@ import crypto from 'crypto';
 
 import { loadToken, parseCookies, buildCookie, readJsonBody, appendSetCookie } from './common.js';
 import * as staticSrv from '../static/index.js';
+import { PLOINKY_WORKSPACE_ROOT } from '../../services/config.js';
 import { resolveVarValue } from '../../services/secretVars.js';
 import { appendLog } from '../utils/logger.js';
 import { getConversation as getTranscriptConversation, listConversations as listTranscripts } from '../utils/transcriptStore.js';
@@ -366,7 +367,7 @@ function handleDashboard(req, res, appConfig, appState) {
             try {
                 const { cmd } = JSON.parse(body);
                 const args = (cmd || '').trim().split(/\s+/).filter(Boolean);
-                const proc = spawn('ploinky', args, { cwd: process.cwd() });
+                const proc = spawn('ploinky', args, { cwd: PLOINKY_WORKSPACE_ROOT, env: { ...process.env, PLOINKY_CWD: PLOINKY_WORKSPACE_ROOT } });
                 let out = ''; let err = '';
                 proc.stdout.on('data', d => out += d.toString('utf8'));
                 proc.stderr.on('data', d => err += d.toString('utf8'));

@@ -149,14 +149,21 @@ async function withAuthModules(t, options = {}) {
 
     const previousCwd = process.cwd();
     const previousMasterKey = process.env.PLOINKY_MASTER_KEY;
+    const previousWorkspaceRoot = process.env.PLOINKY_WORKSPACE_ROOT;
     process.chdir(workspace);
     process.env.PLOINKY_MASTER_KEY = MASTER_KEY;
+    process.env.PLOINKY_WORKSPACE_ROOT = workspace;
     t.after(() => {
         process.chdir(previousCwd);
         if (previousMasterKey === undefined) {
             delete process.env.PLOINKY_MASTER_KEY;
         } else {
             process.env.PLOINKY_MASTER_KEY = previousMasterKey;
+        }
+        if (previousWorkspaceRoot === undefined) {
+            delete process.env.PLOINKY_WORKSPACE_ROOT;
+        } else {
+            process.env.PLOINKY_WORKSPACE_ROOT = previousWorkspaceRoot;
         }
         rmSync(workspace, { recursive: true, force: true });
     });

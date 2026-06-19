@@ -5,7 +5,6 @@ import crypto from 'crypto';
 import { resolveWebchatCommandsForAgent } from '../webchat/commandResolver.js';
 import { parseCookies, buildCookie, appendSetCookie } from './common.js';
 import * as staticSrv from '../static/index.js';
-import { WORKSPACE_ROOT } from '../../services/config.js';
 import {
     getWorkspaceRoot,
     resolveWorkspacePath
@@ -293,7 +292,7 @@ function resolveWorkspaceScopedQueryPath(value) {
     if (!raw || raw.includes('\0') || path.isAbsolute(raw)) {
         return '';
     }
-    const root = path.resolve(process.env.PLOINKY_WORKSPACE_ROOT || WORKSPACE_ROOT || process.cwd());
+    const root = getWorkspaceRoot();
     const resolved = path.resolve(root, raw);
     const relative = path.relative(root, resolved);
     if (relative.startsWith('..') || path.isAbsolute(relative)) {
@@ -1104,6 +1103,7 @@ async function handleWebChat(req, res, appConfig, appState) {
     }
 
     if (pathname === '/' || pathname === '/index.html') {
+        const workspaceBase = resolveWebchatWorkspaceBase(parsedUrl);
         const html = renderTemplate(['chat.html', 'index.html'], {
             '__ASSET_BASE__': `/${appName}/assets`,
             '__AGENT_NAME__': effectiveConfig.agentName || '',
@@ -1111,7 +1111,8 @@ async function handleWebChat(req, res, appConfig, appState) {
             '__RUNTIME__': effectiveConfig.runtime || 'local',
             '__REQUIRES_AUTH__': 'true',
             '__BASE_PATH__': `/${appName}`,
-            '__AGENT_QUERY__': agentQuery
+            '__AGENT_QUERY__': agentQuery,
+            '__WORKDIR__': workspaceBase.base
         });
         if (html) {
             res.writeHead(200, {

@@ -1,13 +1,13 @@
 import fs from 'fs';
 import path from 'path';
-import { WORKSPACE_ROOT, PLOINKY_DIR, AGENTS_WORK_DIR, CODE_DIR, SKILLS_DIR, REPOS_DIR } from './config.js';
+import { PLOINKY_WORKSPACE_ROOT, PLOINKY_DIR, AGENTS_WORK_DIR, CODE_DIR, SKILLS_DIR, REPOS_DIR } from './config.js';
 
 /**
  * Initialize the workspace directory structure.
  * Creates: .ploinky/, .ploinky/agents/, .ploinky/code/, .ploinky/skills/, .ploinky/logs/, .ploinky/shared/
  * @param {string} [workspacePath] - Optional workspace path, defaults to CWD
  */
-export function initWorkspaceStructure(workspacePath = WORKSPACE_ROOT) {
+export function initWorkspaceStructure(workspacePath = PLOINKY_WORKSPACE_ROOT) {
     const runtimeRoot = path.join(workspacePath, '.ploinky');
     const dirs = [
         runtimeRoot,
@@ -27,8 +27,8 @@ export function initWorkspaceStructure(workspacePath = WORKSPACE_ROOT) {
 
 /**
  * Create symlinks for agent code and skills directories.
- * - $WORKSPACE_ROOT/.ploinky/code/<agentName> -> .ploinky/repos/<repo>/<agent>/code/
- * - $WORKSPACE_ROOT/.ploinky/skills/<agentName> -> .ploinky/repos/<repo>/<agent>/skills/
+ * - $PLOINKY_WORKSPACE_ROOT/.ploinky/code/<agentName> -> .ploinky/repos/<repo>/<agent>/code/
+ * - $PLOINKY_WORKSPACE_ROOT/.ploinky/skills/<agentName> -> .ploinky/repos/<repo>/<agent>/skills/
  * @param {string} agentName - The agent name
  * @param {string} repoName - The repository name
  * @param {string} agentPath - The full path to the agent directory in repos
@@ -45,7 +45,7 @@ export function createAgentSymlinks(agentName, repoName, agentPath) {
         fs.mkdirSync(skillsDir, { recursive: true });
     }
 
-    // Create symlink for code: $WORKSPACE_ROOT/.ploinky/code/<agentName> -> agent source
+    // Create symlink for code: $PLOINKY_WORKSPACE_ROOT/.ploinky/code/<agentName> -> agent source
     const codeSymlinkPath = path.join(codeDir, agentName);
     const codeTargetPath = path.join(agentPath, 'code');
 
@@ -77,7 +77,7 @@ export function createAgentSymlinks(agentName, repoName, agentPath) {
         }
     }
 
-    // Create symlink for skills: $WORKSPACE_ROOT/.ploinky/skills/<agentName> -> agent skills
+    // Create symlink for skills: $PLOINKY_WORKSPACE_ROOT/.ploinky/skills/<agentName> -> agent skills
     const skillsSymlinkPath = path.join(skillsDir, agentName);
     const skillsTargetPath = path.join(agentPath, 'skills');
 
@@ -135,7 +135,7 @@ export function removeAgentSymlinks(agentName) {
 /**
  * Get the agent working directory path.
  * @param {string} agentName - The agent name
- * @returns {string} The path to $WORKSPACE_ROOT/.ploinky/agents/<agentName>/
+ * @returns {string} The path to $PLOINKY_WORKSPACE_ROOT/.ploinky/agents/<agentName>/
  */
 export function getAgentWorkDir(agentName) {
     return path.join(AGENTS_WORK_DIR, agentName);
@@ -144,7 +144,7 @@ export function getAgentWorkDir(agentName) {
 /**
  * Get the agent code path (symlink location).
  * @param {string} agentName - The agent name
- * @returns {string} The path to $WORKSPACE_ROOT/.ploinky/code/<agentName>/
+ * @returns {string} The path to $PLOINKY_WORKSPACE_ROOT/.ploinky/code/<agentName>/
  */
 export function getAgentCodePath(agentName) {
     return path.join(CODE_DIR, agentName);
@@ -154,7 +154,7 @@ export function getAgentCodePath(agentName) {
  * Get the canonical repo-scoped agent root path.
  * @param {string} repoName - The repository name
  * @param {string} agentName - The agent name
- * @returns {string} The path to $WORKSPACE_ROOT/.ploinky/repos/<repo>/<agent>/
+ * @returns {string} The path to $PLOINKY_WORKSPACE_ROOT/.ploinky/repos/<repo>/<agent>/
  */
 export function getRepoAgentRootPath(repoName, agentName) {
     return path.join(REPOS_DIR, repoName, agentName);
@@ -178,7 +178,7 @@ export function getRepoAgentCodePath(repoName, agentName) {
 /**
  * Get the agent skills path (symlink location).
  * @param {string} agentName - The agent name
- * @returns {string} The path to $WORKSPACE_ROOT/.ploinky/skills/<agentName>/
+ * @returns {string} The path to $PLOINKY_WORKSPACE_ROOT/.ploinky/skills/<agentName>/
  */
 export function getAgentSkillsPath(agentName) {
     return path.join(SKILLS_DIR, agentName);
@@ -224,7 +224,7 @@ export function removeAgentWorkDir(agentName, force = false) {
  * @returns {{ valid: boolean, issues: string[] }}
  */
 export function verifyWorkspaceStructure() {
-    const cwd = WORKSPACE_ROOT;
+    const cwd = PLOINKY_WORKSPACE_ROOT;
     const issues = [];
     const runtimeRoot = path.join(cwd, '.ploinky');
 

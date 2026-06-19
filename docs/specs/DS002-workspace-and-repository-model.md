@@ -14,7 +14,7 @@ Ploinky’s runtime contract begins with workspace discovery and repository mana
 
 ## Core Content
 
-The workspace root must be the nearest ancestor directory that contains `.ploinky/`. If no such directory is found, the current working directory becomes the effective root and `initEnvironment()` will create `.ploinky/` there. The runtime must not silently spread state across multiple unrelated roots inside one command invocation.
+The workspace root must be the nearest ancestor directory that contains `.ploinky/`, discovered by scanning upward from the command launch directory. If no such directory is found, the current working directory becomes the effective root and `initEnvironment()` will create `.ploinky/` there. This resolution path applies to all CLI entry points, including `ploinky cli`, and the runtime must not silently spread state across multiple unrelated roots inside one command invocation.
 
 The repository must store workspace runtime state under `.ploinky/`, including at minimum:
 
@@ -26,7 +26,7 @@ The repository must store workspace runtime state under `.ploinky/`, including a
 - `data/` for manifest-declared durable service data and runtime-resource persistent storage.
 - `.secrets` and `profile` for workspace-local configuration.
 
-Repository installation must clone into `.ploinky/repos/<name>/`. Predefined repositories are resolved through the built-in catalog in `cli/services/repos.js`, while custom repositories may provide their own URL and optional branch. Custom repository URLs and branch selections discovered from manifest `repos` directives or explicit install arguments must be retained as workspace metadata so later update operations can repair or refresh that installed repository without switching branches. Skills-only repositories are not valid targets for `enable repo`; they must instead be consumed through `default-skills`.
+Repository installation must clone into `.ploinky/repos/<name>/`. Predefined repositories are resolved through the built-in catalog in `cli/services/repos.js` and the bootstrap defaults include `basic`, `AchillesIDE`, `AchillesCLI`, and `copilot-agents`. This bootstrap set is installed when needed to initialize fresh workspaces so default product agents are available. Custom repositories may provide their own URL and optional branch. Custom repository URLs and branch selections discovered from manifest `repos` directives or explicit install arguments must be retained as workspace metadata so later update operations can repair or refresh that installed repository without switching branches. Skills-only repositories are not valid targets for `enable repo`; they must instead be consumed through `default-skills`.
 
 Branch selection is repository-management state. `ploinky start --branch <branch>` sets a candidate branch for all managed repos involved in startup, while `--repo-branch <repo=branch>` overrides the candidate for a single repo. Resolution order is: explicit `--repo-branch`, manifest `repos` object branch, start-level `--branch`, stored branch in `.ploinky/repo_sources.json`, then repository default. `--branch-fallback default` (the default) keeps repos on their configured branch when the candidate is absent; `--branch-fallback fail` aborts startup. `--reset-repos` permits hard reset and clean of dirty managed `.ploinky/repos/` checkouts; without it, dirty repos refuse branch switches. Branch-aware start must not hardcode product-specific repos or agent behavior.
 

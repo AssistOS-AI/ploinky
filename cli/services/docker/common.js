@@ -3,7 +3,7 @@ import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
 import { fileURLToPath } from 'url';
-import { REPOS_DIR, PLOINKY_DIR, WORKSPACE_ROOT } from '../config.js';
+import { REPOS_DIR, PLOINKY_DIR, PLOINKY_WORKSPACE_ROOT } from '../config.js';
 import { getAgentWorkDir } from '../workspaceStructure.js';
 import { buildEnvFlags, buildEnvMap } from '../secretVars.js';
 import { loadAgents, saveAgents } from '../workspace.js';
@@ -15,7 +15,7 @@ const __dirname = path.dirname(__filename);
 
 function isPathUnderRoot(candidate) {
     if (!candidate) return false;
-    const root = path.resolve(WORKSPACE_ROOT);
+    const root = path.resolve(PLOINKY_WORKSPACE_ROOT);
     const resolved = path.resolve(candidate);
     const relative = path.relative(root, resolved);
     return relative && !relative.startsWith('..') && !path.isAbsolute(relative);
@@ -33,7 +33,7 @@ function normalizeProjectPath(candidate, runMode) {
 
 function getConfiguredProjectPath(agentName, repoName, alias) {
     if (!agentName || agentName === '.') {
-        return WORKSPACE_ROOT;
+        return PLOINKY_WORKSPACE_ROOT;
     }
     try {
         const map = loadAgentsMap();
@@ -41,7 +41,7 @@ function getConfiguredProjectPath(agentName, repoName, alias) {
             ? map._config.static.agent.trim()
             : '';
         if (staticAgent && staticAgent === agentName) {
-            return WORKSPACE_ROOT;
+            return PLOINKY_WORKSPACE_ROOT;
         }
         if (alias) {
             const aliasRec = Object.values(map || {}).find(r => r && r.type === 'agent' && r.alias === alias);
@@ -184,12 +184,12 @@ function getAgentContainerName(agentName, repoName) {
     const safeAgentName = String(agentName || '').replace(/[^a-zA-Z0-9_.-]/g, '_');
     const safeRepoName = String(repoName || '').replace(/[^a-zA-Z0-9_.-]/g, '_');
     const cwdHash = crypto.createHash('sha256')
-        .update(WORKSPACE_ROOT)
+        .update(PLOINKY_WORKSPACE_ROOT)
         .digest('hex')
         .substring(0, 8);
-    const projectDir = path.basename(WORKSPACE_ROOT).replace(/[^a-zA-Z0-9_.-]/g, '_');
+    const projectDir = path.basename(PLOINKY_WORKSPACE_ROOT).replace(/[^a-zA-Z0-9_.-]/g, '_');
     const containerName = `ploinky_${safeRepoName}_${safeAgentName}_${projectDir}_${cwdHash}`;
-    debugLog(`Calculated container name: ${containerName} (for path: ${WORKSPACE_ROOT})`);
+    debugLog(`Calculated container name: ${containerName} (for path: ${PLOINKY_WORKSPACE_ROOT})`);
     return containerName;
 }
 

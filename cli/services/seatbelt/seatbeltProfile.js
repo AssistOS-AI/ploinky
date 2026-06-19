@@ -9,7 +9,7 @@ import {
     ROUTING_FILE,
     SECRETS_FILE,
     SERVERS_CONFIG_FILE,
-    WORKSPACE_ROOT,
+    PLOINKY_WORKSPACE_ROOT,
 } from '../config.js';
 import { normalizeManifestVolumeHostPaths } from '../manifestVolumePolicy.js';
 
@@ -34,7 +34,7 @@ function buildSeatbeltProfile(options) {
         codeReadOnly,
         skillsReadOnly,
         volumes,
-        workspaceRoot = WORKSPACE_ROOT,
+        workspaceRoot = PLOINKY_WORKSPACE_ROOT,
         extraReadPaths = [],
         extraWritePaths = []
     } = options;

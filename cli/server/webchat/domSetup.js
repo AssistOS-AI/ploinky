@@ -75,6 +75,7 @@ export function initDom() {
     const displayName = (body.dataset.title || '').trim();
     const basePath = (body.dataset.base || '').replace(/\/$/, '') || '';
     const agentQuery = (body.dataset.agentQuery || '').trim();
+    const workdir = (body.dataset.workdir || '').trim();
 
     const launchConfig = {};
     try {
@@ -89,6 +90,10 @@ export function initDom() {
     const appTitle = displayName || agentName || 'WebChat';
     if (titleBar) {
         titleBar.textContent = appTitle;
+    }
+    const headerWorkdir = document.getElementById('headerWorkdir');
+    if (headerWorkdir && workdir) {
+        headerWorkdir.textContent = workdir;
     }
     document.title = `${appTitle} · WebChat`;
     if (avatarInitial) {

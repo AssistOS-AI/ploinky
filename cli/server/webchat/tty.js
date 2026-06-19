@@ -171,7 +171,7 @@ function createLocalTTYFactory({ ptyLib, workdir, command }) {
     const log = (...args) => { if (DEBUG) console.log('[webchat][tty-local]', ...args); };
     const factory = (ssoUser) => {
         const wd = workdir || process.cwd();
-        // PLOINKY_NO_TTY=1 ensures stdin EOF propagates when webchat connection closes
+        // PLOINKY_NO_TTY=1 ensures stdin EOF propagates when webchat connection closes.
         const env = { ...process.env, TERM: 'xterm-256color', PLOINKY_NO_TTY: '1' };
 
         // Build SSO CLI arguments (no env vars)

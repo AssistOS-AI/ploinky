@@ -1,10 +1,10 @@
 import fs from 'fs';
 import path from 'path';
 
-import { WORKSPACE_ROOT } from '../../services/config.js';
+import { PLOINKY_WORKSPACE_ROOT } from '../../services/config.js';
 
 export function getWorkspaceRoot() {
-    return path.resolve(process.env.PLOINKY_WORKSPACE_ROOT || WORKSPACE_ROOT || process.cwd());
+    return path.resolve(PLOINKY_WORKSPACE_ROOT);
 }
 
 export function sanitizeRelativeRequestPath(relPath) {

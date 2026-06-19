@@ -4,9 +4,12 @@ import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { pathToFileURL } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const moduleSuffix = `?t=${Date.now()}-${Math.random()}`;
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const REPO_ROOT = path.resolve(__dirname, '../..');
 const { HttpRouteAccessPolicy } = await import(`../../cli/server/policy/HttpRouteAccessPolicy.js${moduleSuffix}`);
 const {
     normalizeManifestHttpRouteAccess,
@@ -244,7 +247,7 @@ test('collects manifest route access through enabled-agent fallback when hostPat
             },
         }, null, 2));
 
-        const moduleUrl = pathToFileURL(path.resolve('cli/server/policy/HttpRouteProviders.js')).href;
+        const moduleUrl = pathToFileURL(path.join(REPO_ROOT, 'cli/server/policy/HttpRouteProviders.js')).href;
         const script = `
             const workspace = process.argv[1];
             const moduleUrl = process.argv[2];
@@ -267,6 +270,10 @@ test('collects manifest route access through enabled-agent fallback when hostPat
             moduleUrl,
         ], {
             encoding: 'utf8',
+            env: {
+                ...process.env,
+                PLOINKY_WORKSPACE_ROOT: tempDir,
+            },
         });
 
         assert.equal(child.status, 0, child.stderr);

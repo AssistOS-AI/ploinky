@@ -17,6 +17,10 @@ import { getPredefinedRepos, parseStartArgs } from './services/repos.js';
 
 const COMMANDS = getCommandRegistry();
 
+function getPredefinedRepoNames() {
+    return Object.keys(getPredefinedRepos() || {}).sort();
+}
+
 function completer(line) {
     const words = line.split(/\s+/).filter(Boolean);
     const lineFragment = line.endsWith(' ') ? '' : (words[words.length - 1] || '');
@@ -159,7 +163,7 @@ function completer(line) {
                 if (words.length >= 4) completions = getAgentNames();
             } else if (command === 'disable') {
                 if (subcommand === 'repo') {
-                    completions = ['basic', 'cloud', 'vibe', 'security', 'extra', 'demo'];
+                    completions = getPredefinedRepoNames();
                 } else if (subcommand === 'sandbox') {
                     completions = [];
                 } else {
@@ -168,12 +172,12 @@ function completer(line) {
             } else if (command === 'enable' && subcommand === 'sandbox') {
                 completions = [];
             } else if (command === 'enable' && subcommand === 'repo') {
-                completions = ['basic', 'cloud', 'vibe', 'security', 'extra', 'demo'];
+                completions = getPredefinedRepoNames();
             } else if (command === 'sandbox') {
                 completions = COMMANDS.sandbox;
             } else if (command === 'add' && subcommand === 'repo') {
                 // For add repo, show predefined repo names
-                completions = ['basic', 'cloud', 'vibe', 'security', 'extra', 'demo'];
+                completions = getPredefinedRepoNames();
             } else if (command === 'default-skills') {
                 const predefined = Object.keys(getPredefinedRepos() || {});
                 completions = Array.from(new Set([...getRepoNames(), ...predefined])).sort();
