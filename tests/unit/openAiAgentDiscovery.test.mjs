@@ -71,7 +71,7 @@ const MANIFESTS = {
     soplangAgent: {
         name: 'Soplang Agent',
         version: '0.9.0',
-        endpoints: { chatCompletions: { supportsStream: true } },
+        endpoints: { chatCompletions: { command: '/chat', supportsStream: true } },
     },
     disabledAgent: { name: 'Disabled Agent', version: '1.0.0' },
     manifestlessAgent: null,
@@ -85,7 +85,8 @@ test('builder includes a manifest-less-chat route and marks usesDefaultOpenAiRes
     const llm = agents.find((a) => a.routeKey === 'llmAssistant');
     assert.ok(llm, 'llmAssistant should be discovered');
     assert.equal(llm.usesDefaultOpenAiResponder, true);
-    assert.equal(llm.supportsStreaming, false);
+    assert.equal(llm.supportsStreaming, true);
+    assert.equal(llm.responderKind, 'llm');
     assert.equal(llm.subjectId, 'agent:AssistOSExplorer/llmAssistant');
     assert.equal(llm.repo, 'AssistOSExplorer');
     assert.equal(llm.agent, 'llmAssistant');
@@ -102,6 +103,36 @@ test('builder marks usesDefaultOpenAiResponder false (and streaming) when manife
     assert.ok(sop, 'soplangAgent should be discovered');
     assert.equal(sop.usesDefaultOpenAiResponder, false);
     assert.equal(sop.supportsStreaming, true);
+    assert.equal(sop.responderKind, 'command');
+});
+
+test('responderKind: command when manifest has a chat command', () => {
+    const { agents } = buildOpenAiAgentDiscovery({
+        routes: { demo: { hostPort: 5, repo: 'r', agent: 'demo' } },
+        readManifest: () => ({ name: 'demo', endpoints: { chatCompletions: { command: '/h' } } }),
+    });
+    assert.equal(agents[0].responderKind, 'command');
+    assert.equal(agents[0].usesDefaultOpenAiResponder, false);
+});
+
+test('responderKind: inert when model is none', () => {
+    const { agents } = buildOpenAiAgentDiscovery({
+        routes: { demo: { hostPort: 5, repo: 'r', agent: 'demo' } },
+        readManifest: () => ({ name: 'demo', endpoints: { chatCompletions: { model: 'none' } } }),
+    });
+    assert.equal(agents[0].responderKind, 'inert');
+    assert.equal(agents[0].usesDefaultOpenAiResponder, true);
+    assert.equal(agents[0].supportsStreaming, false);
+});
+
+test('responderKind: llm + streaming when no chatCompletions block', () => {
+    const { agents } = buildOpenAiAgentDiscovery({
+        routes: { demo: { hostPort: 5, repo: 'r', agent: 'demo' } },
+        readManifest: () => ({ name: 'demo' }),
+    });
+    assert.equal(agents[0].responderKind, 'llm');
+    assert.equal(agents[0].usesDefaultOpenAiResponder, true);
+    assert.equal(agents[0].supportsStreaming, true);
 });
 
 test('builder omits disabled, portless, and manifest-less routes', () => {

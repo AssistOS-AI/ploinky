@@ -3,10 +3,15 @@
  *
  * Spawns the real AgentServer process against temporary manifest/config
  * fixtures on an ephemeral port and exercises POST /v1/chat/completions:
- *   - Without endpoints.chatCompletions  -> default capability responder (200).
- *   - default response is OpenAI-compatible and lists MCP tool names.
- *   - stream:true on the default responder -> OpenAI-compatible 400 error.
- *   - With endpoints.chatCompletions      -> configured handler still runs.
+ *   - chatCompletions.model:"none" (opt-out) -> inert capability responder (200).
+ *   - that inert response is OpenAI-compatible and lists MCP tool names.
+ *   - stream:true on the inert responder -> OpenAI-compatible 400 error.
+ *   - With endpoints.chatCompletions.command -> configured handler still runs.
+ *
+ * NOTE: as of the agentic-default-responder change, an agent with NO
+ * endpoints.chatCompletions now routes to the LLM agentic responder (not the
+ * inert listing); the inert path is reached via model:"none"/"off". The agentic
+ * default path is covered at the unit level in tests/unit/openAiChatConfig.test.mjs.
  *
  * The server binds a real socket, so these tests use a child process rather
  * than importing the module (AgentServer.mjs runs main() at import time).
@@ -146,10 +151,12 @@ const TOOL_CONFIG = {
     ]
 };
 
-test('default responder: 200 + OpenAI-compatible body listing tool names', async () => {
+test('opt-out (model:none) responder: 200 + OpenAI-compatible body listing tool names', async () => {
     const agentId = 'agent:AssistOSExplorer/llmAssistant';
     const srv = await startServer({
-        manifest: { name: 'llmAssistant' },
+        // model:"none" opts out of the agentic LLM default and keeps the inert
+        // capability/listability responder.
+        manifest: { name: 'llmAssistant', endpoints: { chatCompletions: { model: 'none' } } },
         mcpConfig: TOOL_CONFIG,
         agentId
     });
@@ -175,9 +182,9 @@ test('default responder: 200 + OpenAI-compatible body listing tool names', async
     }
 });
 
-test('default responder: stream:true returns OpenAI-compatible 400 error', async () => {
+test('opt-out (model:none) responder: stream:true returns OpenAI-compatible 400 error', async () => {
     const srv = await startServer({
-        manifest: { name: 'llmAssistant' },
+        manifest: { name: 'llmAssistant', endpoints: { chatCompletions: { model: 'none' } } },
         mcpConfig: TOOL_CONFIG,
         agentId: 'agent:AssistOSExplorer/llmAssistant'
     });

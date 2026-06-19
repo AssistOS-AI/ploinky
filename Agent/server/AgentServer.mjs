@@ -2,7 +2,9 @@ import { randomUUID } from 'node:crypto';
 import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
+import { createRequire } from 'node:module';
 import { spawn } from 'node:child_process';
+import { pathToFileURL } from 'node:url';
 import { zod } from 'mcp-sdk';
 import { TaskQueue } from './TaskQueue.mjs';
 import {
@@ -19,7 +21,11 @@ import {
     buildDefaultOpenAiChatResponse,
     buildDefaultStreamRejection
 } from './openAiDefaultResponder.mjs';
+import { buildLoopToolsFromMcp } from './mcpToolBridge.mjs';
 const { z } = zod;
+const require = createRequire(import.meta.url);
+const achillesAgentLibRoot = path.dirname(require.resolve('achillesAgentLib/package.json'));
+const { isOptOutModel, runOpenAiAgenticResponse } = await import(pathToFileURL(path.join(achillesAgentLibRoot, 'LLMAgents/openAiAgenticResponder.mjs')).href);
 
 const DEFAULT_MAX_CONCURRENT_TASKS = 10;
 const DEFAULT_TASK_LOG_TAIL_BYTES = 128 * 1024;
@@ -354,18 +360,59 @@ function normalizeCapabilities(value) {
     return capabilities;
 }
 
-function resolveOpenAiChatConfig(manifest) {
-    if (!manifest || typeof manifest !== 'object') return null;
-    const endpoints = manifest.endpoints;
-    if (!endpoints || typeof endpoints !== 'object') return null;
-    const chatConfig = endpoints.chatCompletions;
-    if (!chatConfig || typeof chatConfig !== 'object') return null;
-    const commandSpec = buildCommandSpec(chatConfig, process.env.PLOINKY_CODE_DIR || '/code');
-    if (!commandSpec) return null;
-    return {
-        commandSpec,
-        supportsStream: chatConfig.supportsStream === true || chatConfig.stream === true
+function resolveOpenAiChatKind(manifest) {
+    const chat = manifest && typeof manifest === 'object' && manifest.endpoints && typeof manifest.endpoints === 'object'
+        ? manifest.endpoints.chatCompletions
+        : null;
+    if (chat && typeof chat === 'object' && typeof chat.command === 'string' && chat.command.trim()) {
+        const commandSpec = buildCommandSpec(chat, process.env.PLOINKY_CODE_DIR || '/code');
+        if (commandSpec) {
+            return { kind: 'command', commandSpec, supportsStream: chat.supportsStream === true || chat.stream === true };
+        }
+    }
+    const model = chat && typeof chat === 'object' && typeof chat.model === 'string' ? chat.model.trim() : null;
+    if (model && isOptOutModel(model)) {
+        return { kind: 'inert' };
+    }
+    return { kind: 'llm', model: model || null };
+}
+
+export { resolveOpenAiChatKind };
+
+// Testable core: build the OpenAI completion via the agentic loop. `runResponder`
+// is injectable for tests; production passes runOpenAiAgenticResponse.
+export async function __buildAgenticCompletion({ body, manifest, config, agentId, runResponder = runOpenAiAgenticResponse }) {
+    const toolsMap = buildLoopToolsFromMcp({
+        tools: config?.tools,
+        defaultCwd: process.env.PLOINKY_CODE_DIR || '/code',
+        buildCommandSpec,
+        runTool: executeShell,
+    });
+    return runResponder({
+        toolsMap,
+        messages: Array.isArray(body.messages) ? body.messages : [],
+        model: typeof body.model === 'string' && body.model.trim() ? body.model.trim() : (manifest?.endpoints?.chatCompletions?.model || null),
+        agentId,
+    });
+}
+
+export function sendEmulatedSseCompletion(res, completion) {
+    res.writeHead(200, {
+        'Content-Type': 'text/event-stream; charset=utf-8',
+        'Cache-Control': 'no-cache',
+        'Connection': 'keep-alive',
+    });
+    const choice = completion.choices?.[0] || {};
+    const chunk = {
+        id: completion.id,
+        object: 'chat.completion.chunk',
+        created: completion.created,
+        model: completion.model,
+        choices: [{ index: 0, delta: { role: 'assistant', content: choice.message?.content || '' }, finish_reason: 'stop' }],
     };
+    res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+    res.write('data: [DONE]\n\n');
+    res.end();
 }
 
 function collectMcpToolNames() {
@@ -666,11 +713,9 @@ async function handleOpenAiChatCompletions(req, res, body) {
     }
     const manifestResult = getManifestResult();
     const manifest = manifestResult ? manifestResult.manifest : null;
-    const openAiConfig = resolveOpenAiChatConfig(manifest);
-    if (!openAiConfig) {
-        // No manifest-specific chat handler: fall back to the inert default
-        // capability/listability responder so this agent stays discoverable and
-        // routable. Streaming is not supported by the default responder.
+    const chatKind = resolveOpenAiChatKind(manifest);
+
+    if (chatKind.kind === 'inert') {
         if (body.stream === true) {
             const rejection = buildDefaultStreamRejection();
             sendOpenAiError(res, rejection.statusCode, rejection.message, rejection.type);
@@ -687,6 +732,33 @@ async function handleOpenAiChatCompletions(req, res, body) {
         res.end(data);
         return;
     }
+
+    if (chatKind.kind === 'llm') {
+        const configResult = getConfigResult();
+        let completion;
+        try {
+            completion = await __buildAgenticCompletion({
+                body,
+                manifest,
+                config: configResult ? configResult.config : null,
+                agentId: process.env.PLOINKY_AGENT_ID,
+            });
+        } catch (error) {
+            sendOpenAiError(res, 502, `Default LLM responder failed: ${error.message}`, 'server_error');
+            return;
+        }
+        if (body.stream === true) {
+            sendEmulatedSseCompletion(res, completion);
+        } else {
+            const data = Buffer.from(JSON.stringify(completion));
+            res.writeHead(200, { 'Content-Type': 'application/json', 'Content-Length': data.length });
+            res.end(data);
+        }
+        return;
+    }
+
+    // kind === 'command' → existing custom-handler path
+    const openAiConfig = { commandSpec: chatKind.commandSpec, supportsStream: chatKind.supportsStream };
     const wantsStream = body.stream === true;
     if (wantsStream && !openAiConfig.supportsStream) {
         sendOpenAiError(res, 400, 'Streaming is not enabled for this agent', 'invalid_request_error');
@@ -1315,4 +1387,6 @@ async function main() {
     });
 }
 
-main().catch(err => { console.error('[AgentServer/MCP] fatal error:', err); process.exit(1); });
+if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {
+    main().catch(err => { console.error('[AgentServer/MCP] fatal error:', err); process.exit(1); });
+}

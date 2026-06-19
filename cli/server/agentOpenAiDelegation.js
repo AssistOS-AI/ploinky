@@ -37,6 +37,19 @@ import {
 // would make replay protection a no-op.
 const assertionReplayCache = createTokenReplayCache({ maxSize: 4096 });
 
+export const MAX_AGENTIC_DEPTH = 3;
+const AGENTIC_DEPTH_HEADER = 'x-ploinky-agentic-depth';
+
+export function readAgenticDepth(headers = {}) {
+    const raw = headers[AGENTIC_DEPTH_HEADER];
+    const n = Number.parseInt(Array.isArray(raw) ? raw[0] : raw, 10);
+    return Number.isFinite(n) && n > 0 ? n : 0;
+}
+
+export function nextAgenticDepthHeaders(headers = {}) {
+    return { ...headers, [AGENTIC_DEPTH_HEADER]: String(readAgenticDepth(headers) + 1) };
+}
+
 function readAuthorizationBearer(req) {
     const raw = req?.headers?.authorization ?? req?.headers?.Authorization;
     const value = Array.isArray(raw) ? raw[0] : raw;
@@ -219,6 +232,10 @@ export function handleDelegatedAgentOpenAiCall(req, res, route, routeKey, agentP
         sendJson(res, 404, { error: 'agent_not_found', agent: routeKey });
         return;
     }
+    if (readAgenticDepth(req.headers) >= MAX_AGENTIC_DEPTH) {
+        sendJson(res, 400, { error: { message: `agentic recursion depth exceeded (${MAX_AGENTIC_DEPTH})`, type: 'invalid_request_error' } });
+        return;
+    }
     const token = readAuthorizationBearer(req);
     readRequestBody(req, {
         maxBytes: resolveHttpServiceInvocationMaxBodyBytes(),
@@ -237,7 +254,10 @@ export function handleDelegatedAgentOpenAiCall(req, res, route, routeKey, agentP
             // proxyHttpBuffered strips any client x-ploinky-auth-info (via
             // stripRouterIdentityHeaders) and then applies the router-owned header,
             // forwarding the EXACT buffered bytes (content-length set, no re-encode).
-            proxyHttpBuffered(req, res, route.hostPort, agentProxyPath, body, result.authInfoHeader);
+            proxyHttpBuffered(req, res, route.hostPort, agentProxyPath, body, {
+                ...result.authInfoHeader,
+                [AGENTIC_DEPTH_HEADER]: String(readAgenticDepth(req.headers) + 1),
+            });
         },
         onTooLarge: ({ limitBytes }) => {
             sendJson(res, 413, { error: 'openai_body_too_large', limitBytes });
@@ -252,6 +272,9 @@ export function handleDelegatedAgentOpenAiCall(req, res, route, routeKey, agentP
 }
 
 export default {
+    MAX_AGENTIC_DEPTH,
+    readAgenticDepth,
+    nextAgenticDepthHeaders,
     isDelegatedAgentOpenAiCall,
     verifyAndMintAgentOpenAiCall,
     handleDelegatedAgentOpenAiCall,

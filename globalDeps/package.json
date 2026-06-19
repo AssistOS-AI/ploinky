@@ -6,7 +6,6 @@
   "dependencies": {
     "achillesAgentLib": "git+https://github.com/OutfinityResearch/achillesAgentLib.git#master",
     "mcp-sdk": "git+https://github.com/PloinkyRepos/MCPSDK.git#main",
-    "flexsearch": "git+https://github.com/PloinkyRepos/flexsearch.git#main",
     "node-pty": "^1.0.0"
   }
 }
