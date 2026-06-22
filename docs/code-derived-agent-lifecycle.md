@@ -586,7 +586,9 @@ sequenceDiagram
   Router->>Runtime: aggregate /mcp across agent routes
 ```
 
-Router-owned paths include `/health`, `/mcp`, `/agent-card`, `/auth/*`, `/api/agents/*`, `/webtty`, `/webchat`, `/dashboard`, `/status`, `/upload`, `/blobs`, `/workspace-files`, `/metrics`, `/admin`, and `/__agent`.
+Router-owned paths include `/health`, `/mcp`, `/agent-card`, `/auth/*`, `/api/agents/*`, `/api/marketplace`, `/webtty`, `/webchat`, `/dashboard`, `/status`, `/upload`, `/blobs`, `/workspace-files`, `/metrics`, `/admin`, and `/__agent`.
+
+`/api/marketplace` is a first-party JSON management API for the Marketplace plugin. GET requires an authenticated local or SSO user and returns repository, agent, enabled-registry, and live runtime-status data. POST requires a local admin session and supports repository addition, repository enable/disable, agent activation, and marketplace-specific agent deactivation. Repository enable/disable follows the CLI repository contract and only updates `enabled_repos.json`; it does not stop running agents or remove enabled-agent records. Marketplace deactivation removes the enabled-agent registry entry before removing the runtime container; the ordinary `disable agent` CLI command remains conservative and refuses to remove records while runtime state exists.
 
 Agent routes are stored under `routing.routes[routeKey]`. The route key is the alias when present, otherwise the short agent name. A plain `/` request redirects to the static route's `/index.html` when a static route exists.
 

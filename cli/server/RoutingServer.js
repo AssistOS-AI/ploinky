@@ -16,6 +16,7 @@ import {
     ensureAuthenticated,
     ensureHttpRouteAccess,
     handleAuthRoutes,
+    handleMarketplaceRoutes,
     handleUserAdminRoutes,
     resolveRouteDefaultHttpAccess,
 } from './authHandlers.js';
@@ -164,6 +165,8 @@ function isRouterOwnedPath(pathname) {
         || pathname === '/mcp/'
         || pathname.startsWith('/auth/')
         || pathname.startsWith('/api/agents/')
+        || pathname === '/api/marketplace'
+        || pathname.startsWith('/api/marketplace/')
         || pathname.startsWith('/api/router/')
         // Internal, non-policy-routable router-owned routes (DS014).
         || pathname === '/policy/command'
@@ -427,6 +430,11 @@ async function processRequest(req, res) {
 
     if (pathname.startsWith('/api/agents/')) {
         const handled = await handleUserAdminRoutes(req, res, parsedUrl);
+        if (handled) return;
+    }
+
+    if (pathname === '/api/marketplace' || pathname.startsWith('/api/marketplace/')) {
+        const handled = await handleMarketplaceRoutes(req, res, parsedUrl);
         if (handled) return;
     }
 

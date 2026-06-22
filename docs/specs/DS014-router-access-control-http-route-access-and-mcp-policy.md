@@ -98,6 +98,8 @@ There is one delegated-user path: a verified source agent may call an `authentic
 
 `http.route.list` is not the effective view because manifest, service, and route-default decisions are runtime inputs. `http.route.check` is the diagnostic path for the effective decision and includes the source that won.
 
+The router-owned Marketplace API under `/api/marketplace` is not administered through MCP policy and is not controlled by HTTP route access. `GET /api/marketplace` must require an authenticated local or SSO user. `POST /api/marketplace` is an administrative surface and must require an authenticated local admin user before mutating repository and agent marketplace state. The POST action body may add, enable, and disable repositories, enable agents through the standard registry path, and perform marketplace-specific agent deactivation as defined by DS005.
+
 ### Tag Bootstrap and Persistence
 
 `mcp-config.json` tool tags seed defaults only. Empty or absent tags seed `authenticated`; `internal` seeds `internal`; `admin` seeds `admin`; mixed or unknown access tags seed no entry, so enforcement denies until an admin sets policy. Persisted operator entries always win and are never overwritten by bootstrap.
@@ -108,7 +110,7 @@ Old state documents with missing or retired HTTP access vocabulary fail the whol
 
 ### Internal Paths
 
-Router-owned surfaces are never controlled by HTTP route access. This includes `/policy/command`, `/auth`, `/auth/*`, `/admin`, `/admin/*`, `/metrics`, `/health/internal`, the bare root, root wildcards, and any path containing an `__agent` segment in raw, encoded, or double-encoded form. The `RoutingServer` front-door guard and the routerHandlers synthesized-upstream guard both enforce the same segment rule as `HttpRouteAccessPath`.
+Router-owned surfaces are never controlled by HTTP route access. This includes `/policy/command`, `/api/marketplace`, `/auth`, `/auth/*`, `/admin`, `/admin/*`, `/metrics`, `/health/internal`, the bare root, root wildcards, and any path containing an `__agent` segment in raw, encoded, or double-encoded form. The `RoutingServer` front-door guard and the routerHandlers synthesized-upstream guard both enforce the same segment rule as `HttpRouteAccessPath`.
 
 Transparent agent proxying strips caller-supplied identity headers and regenerates router-owned headers only after the access decision has been satisfied.
 

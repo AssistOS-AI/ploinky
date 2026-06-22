@@ -41,6 +41,7 @@ Ploinky is a workspace-local runtime for repository-backed agents.
 - `/webmeet`: meeting and moderator UI.
 - `/dashboard`: management surface, including transcript and feedback views.
 - `/status`: read-only browser view that shells out to `ploinky status` and adds router-side server and agent summaries.
+- `/api/marketplace`: JSON endpoint for the first-party agent marketplace. `GET /api/marketplace` is available to authenticated local or SSO users and lists repositories, discoverable agents, enabled records, and runtime status. `POST /api/marketplace` is admin-only and supports `add_repository`, `enable_repository`, `disable_repository`, `activate_agent`, and `deactivate_agent`; repository toggles only update the enabled-repository list, while marketplace agent deactivation removes the enabled-agent registry record before removing the runtime container so the watchdog does not restart it during the operation.
 
 `/webtty`, `/webchat`, and `/webmeet` use the normal router login flow. `/dashboard` still supports `WEBDASHBOARD_TOKEN`, and `/status` reuses the dashboard token or dashboard invitation link for read-only access.
 
