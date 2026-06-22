@@ -5,7 +5,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { HISTORY_FILE, initEnvironment, setDebugMode } from './services/config.js';
+import { HISTORY_FILE, initEnvironment, logPloinkyDirectory, setDebugMode } from './services/config.js';
 import { handleCommand, getAgentNames, getRepoNames, cleanupSessionContainers as cleanupCliSessions } from './commands/cli.js';
 import { getCommandRegistry } from './services/commandRegistry.js';
 import { showHelp } from './services/help.js';
@@ -390,6 +390,7 @@ function main() {
     // should be synchronous to handle setup. Async logic is handled inside the REPL or
     // by letting the process run until the promise from handleCommand resolves.
     try {
+        logPloinkyDirectory();
         let args = process.argv.slice(2);
 
         const debugIndex = args.findIndex(arg => arg === '--debug' || arg === '-d');
