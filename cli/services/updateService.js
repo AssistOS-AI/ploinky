@@ -264,6 +264,87 @@ function cloneAchillesDependency(targetPath, {
     }
 }
 
+/**
+ * Parse an npm dependency spec into the git { url, ref } it points at, when the
+ * spec is a *moving* git source (a branch/tag, or the implicit default branch).
+ *
+ * Returns null for non-git specs (semver ranges, tarballs) and for git specs
+ * pinned to a 40-char commit SHA — those cannot advance, so they never need
+ * cache invalidation. The npm `git+` scheme prefix is stripped so the URL is
+ * usable directly with `git ls-remote`.
+ *
+ * @param {string} spec
+ * @returns {{ url: string, ref: string }|null}
+ */
+export function parseGitDependencyRef(spec) {
+    const raw = String(spec || '').trim();
+    if (!raw) return null;
+    const isGit = /^git\+/.test(raw)
+        || /^git:\/\//.test(raw)
+        || /^git@/.test(raw)
+        || /^https?:\/\/.+\.git(#|$)/.test(raw);
+    if (!isGit) return null;
+    let url = raw.replace(/^git\+/, '');
+    let ref = '';
+    const hashIdx = url.indexOf('#');
+    if (hashIdx >= 0) {
+        ref = url.slice(hashIdx + 1);
+        url = url.slice(0, hashIdx);
+    }
+    if (/^[0-9a-f]{40}$/i.test(ref)) return null; // pinned commit cannot move
+    return { url, ref: ref || 'HEAD' };
+}
+
+/**
+ * Resolve the commit a git url+ref currently points at via `git ls-remote`.
+ * Returns null on any failure (offline, unknown ref, malformed output) so
+ * callers fail open instead of acting on an unverified ref.
+ *
+ * @param {string} url
+ * @param {string} ref
+ * @param {object} [options]
+ * @param {Function} [options.execFile=execFileSync] - injectable for tests.
+ * @returns {string|null} 40-char hex sha, or null.
+ */
+export function resolveGitRefCommit(url, ref, { execFile = execFileSync } = {}) {
+    try {
+        const out = String(execFile('git', ['ls-remote', url, ref], {
+            stdio: ['ignore', 'pipe', 'pipe'],
+        }) || '').trim();
+        if (!out) return null;
+        const sha = out.split('\n')[0].trim().split(/\s+/)[0];
+        return /^[0-9a-f]{40}$/i.test(sha) ? sha : null;
+    } catch (_) {
+        return null;
+    }
+}
+
+/**
+ * Resolve the upstream commit of every *moving* git dependency in a package's
+ * dependency map (e.g. achillesAgentLib `#master`, mcp-sdk `#main`).
+ *
+ * `ploinky update` uses this to detect when a moving ref advanced even though
+ * its package.json spec string — and therefore the dependency-cache hash — is
+ * unchanged. It resolves the authoritative upstream tip (what a fresh cache
+ * `npm install` would fetch) via `git ls-remote`; `ploinky update` is already
+ * online. Deps that cannot be resolved are omitted (fail-open).
+ *
+ * @param {Record<string,string>} dependencies - dependency name -> spec map.
+ * @param {object} [options]
+ * @param {Function} [options.execFile=execFileSync] - injectable for tests.
+ * @returns {Record<string,string>} name -> resolved sha (only moving git deps that resolved).
+ */
+export function resolveMovingGitDepCommits(dependencies, { execFile = execFileSync } = {}) {
+    const commits = {};
+    for (const [name, spec] of Object.entries(dependencies || {})) {
+        const parsed = parseGitDependencyRef(spec);
+        if (!parsed) continue;
+        const sha = resolveGitRefCommit(parsed.url, parsed.ref, { execFile });
+        if (sha) commits[name] = sha;
+    }
+    return commits;
+}
+
 export function refreshPloinkyRuntimeAchillesDependency({
     ploinkyRoot = resolvePloinkyRoot(),
     sourceUrl = ACHILLES_REPO_URL,

@@ -6,9 +6,8 @@ import {
     readStamp,
     isAgentCacheValid,
     isGlobalCacheValid,
-    hashFile,
     hashMergedPackage,
-    getGlobalPackagePath,
+    resolveGlobalCacheManifest,
 } from '../services/dependencyCache.js';
 import { detectRuntimeKeyForAgent } from '../services/dependencyRuntimeKey.js';
 import {
@@ -181,11 +180,20 @@ function describeGlobal(runtimeKey) {
     const cachePath = path.join(GLOBAL_DEPS_CACHE_DIR, runtimeKey);
     const stamp = readStamp(cachePath);
     if (!stamp) return `  global ${runtimeKey}  [no stamp]`;
-    const check = isGlobalCacheValid(cachePath, {
-        runtimeKey,
-        globalPackageHash: hashFile(getGlobalPackagePath()),
-    });
-    return `  global ${runtimeKey}  prepared=${stamp.preparedAt}  ${check.valid ? 'valid' : 'stale (' + check.reason + ')'}`;
+    let status = '??';
+    try {
+        // Match prepareGlobalCache: the stamp stores hashMergedPackage(resolved
+        // global package), NOT a raw file hash. resolveGlobalCacheManifest() is
+        // the same helper prepareGlobalCache uses, so the hashes stay in sync.
+        const check = isGlobalCacheValid(cachePath, {
+            runtimeKey,
+            globalPackageHash: resolveGlobalCacheManifest().hash,
+        });
+        status = check.valid ? 'valid' : 'stale (' + check.reason + ')';
+    } catch (err) {
+        status = 'error: ' + err.message;
+    }
+    return `  global ${runtimeKey}  prepared=${stamp.preparedAt}  ${status}`;
 }
 
 function describeAgent(repoName, agentName, runtimeKey) {

@@ -7,8 +7,10 @@ import path from 'node:path';
 import {
     INTERACTIVE_PLOINKY_UPDATE_MESSAGE,
     findAchillesDependencyPackages,
+    parseGitDependencyRef,
     refreshAchillesDependenciesInRepos,
     refreshPloinkyRuntimeAchillesDependency,
+    resolveMovingGitDepCommits,
     updatePloinkySelf,
 } from '../../cli/services/updateService.js';
 
@@ -182,6 +184,97 @@ test('refreshPloinkyRuntimeAchillesDependency pulls the canonical runtime checko
     } finally {
         fs.rmSync(root, { recursive: true, force: true });
     }
+});
+
+test('parseGitDependencyRef extracts url + ref for moving git specs and strips git+', () => {
+    assert.deepEqual(
+        parseGitDependencyRef('git+https://github.com/OutfinityResearch/achillesAgentLib.git#master'),
+        { url: 'https://github.com/OutfinityResearch/achillesAgentLib.git', ref: 'master' },
+    );
+    assert.deepEqual(
+        parseGitDependencyRef('git+https://github.com/PloinkyRepos/MCPSDK.git#main'),
+        { url: 'https://github.com/PloinkyRepos/MCPSDK.git', ref: 'main' },
+    );
+    assert.deepEqual(
+        parseGitDependencyRef('git+ssh://git@github.com/o/r.git#dev'),
+        { url: 'ssh://git@github.com/o/r.git', ref: 'dev' },
+    );
+});
+
+test('parseGitDependencyRef treats a git url with no #ref as the moving default branch', () => {
+    assert.deepEqual(
+        parseGitDependencyRef('git+https://github.com/o/r.git'),
+        { url: 'https://github.com/o/r.git', ref: 'HEAD' },
+    );
+});
+
+test('parseGitDependencyRef returns null for non-git and pinned-commit specs', () => {
+    assert.equal(parseGitDependencyRef('^1.0.0'), null);
+    assert.equal(parseGitDependencyRef('1.2.3'), null);
+    assert.equal(parseGitDependencyRef(''), null);
+    assert.equal(parseGitDependencyRef(undefined), null);
+    // A 40-hex pinned commit cannot move, so it is not a "moving" ref.
+    assert.equal(
+        parseGitDependencyRef('git+https://github.com/o/r.git#0123456789abcdef0123456789abcdef01234567'),
+        null,
+    );
+});
+
+test('resolveMovingGitDepCommits resolves each moving git dep via ls-remote, skipping others', () => {
+    const calls = [];
+    const commits = resolveMovingGitDepCommits(
+        {
+            achillesAgentLib: 'git+https://github.com/OutfinityResearch/achillesAgentLib.git#master',
+            'mcp-sdk': 'git+https://github.com/PloinkyRepos/MCPSDK.git#main',
+            'node-pty': '^1.0.0',
+        },
+        {
+            execFile(command, args) {
+                calls.push({ command, args });
+                const url = args[args.length - 2];
+                const ref = args[args.length - 1];
+                const sha = url.includes('MCPSDK')
+                    ? 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
+                    : 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+                return `${sha}\trefs/heads/${ref}\n`;
+            },
+        },
+    );
+
+    assert.deepEqual(commits, {
+        achillesAgentLib: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+        'mcp-sdk': 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+    });
+    // node-pty (semver range) is not git, so it is never ls-remote'd.
+    assert.equal(calls.length, 2);
+    assert.ok(calls.every((c) => c.command === 'git' && c.args[0] === 'ls-remote'));
+});
+
+test('resolveMovingGitDepCommits omits deps whose ls-remote fails (fail-open)', () => {
+    const commits = resolveMovingGitDepCommits(
+        {
+            achillesAgentLib: 'git+https://github.com/OutfinityResearch/achillesAgentLib.git#master',
+            'mcp-sdk': 'git+https://github.com/PloinkyRepos/MCPSDK.git#main',
+        },
+        {
+            execFile(command, args) {
+                if (args[args.length - 2].includes('MCPSDK')) {
+                    throw new Error('offline');
+                }
+                return 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\trefs/heads/master\n';
+            },
+        },
+    );
+
+    assert.deepEqual(commits, { achillesAgentLib: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' });
+});
+
+test('resolveMovingGitDepCommits omits deps with empty/non-sha ls-remote output', () => {
+    const commits = resolveMovingGitDepCommits(
+        { achillesAgentLib: 'git+https://github.com/OutfinityResearch/achillesAgentLib.git#nope' },
+        { execFile() { return '\n'; } },
+    );
+    assert.deepEqual(commits, {});
 });
 
 test('refreshPloinkyRuntimeAchillesDependency reclones the canonical runtime checkout when missing', () => {

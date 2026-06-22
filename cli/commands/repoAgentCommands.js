@@ -8,9 +8,12 @@ import * as skillsSvc from '../services/skills.js';
 import {
     refreshAchillesDependenciesInRepos,
     refreshPloinkyRuntimeAchillesDependency,
+    resolveMovingGitDepCommits,
     resolvePloinkyRoot,
     updatePloinkySelf,
 } from '../services/updateService.js';
+import { invalidateDepsCacheForMovingGitDeps } from '../services/dependencyCache.js';
+import { readGlobalDepsPackage } from '../services/dependencyInstaller.js';
 import { collectAgentsSummary } from '../services/status.js';
 import { findAgent } from '../services/utils.js';
 
@@ -53,6 +56,17 @@ function refreshRuntimeAchillesForUpdate(failed, ploinkyRoot = resolvePloinkyRoo
     try {
         const result = refreshPloinkyRuntimeAchillesDependency({ ploinkyRoot });
         console.log(`  ✓ ${path.relative(ploinkyRoot, result.installedPath)} (${result.method})`);
+        // The prepared dependency caches under .ploinky/deps embed the global git
+        // dependencies (achillesAgentLib `#master`, mcp-sdk `#main`) but are keyed
+        // on the package.json spec string, so a moving ref that advanced upstream
+        // would otherwise serve a stale copy to containers. Resolve each moving git
+        // dep's upstream commit and invalidate the caches only when one changed.
+        const gitDepCommits = resolveMovingGitDepCommits(readGlobalDepsPackage().dependencies);
+        const invalidation = invalidateDepsCacheForMovingGitDeps(gitDepCommits);
+        if (invalidation.invalidated) {
+            const changedLabel = invalidation.changed.length ? invalidation.changed.join(', ') : 'initial';
+            console.log(`  ✓ Dependency caches invalidated (moving git deps changed: ${changedLabel}); agents reinstall on next start.`);
+        }
         return result;
     } catch (err) {
         const message = err?.message || String(err);

@@ -3,6 +3,7 @@ import path from 'path';
 import crypto from 'crypto';
 import { spawnSync } from 'child_process';
 import {
+    DEPS_DIR,
     GLOBAL_DEPS_CACHE_DIR,
     AGENTS_DEPS_CACHE_DIR,
     GLOBAL_DEPS_PATH,
@@ -18,6 +19,7 @@ export const STAMP_VERSION = 1;
 export const STAMP_FILENAME = 'stamp.json';
 export const LOCK_FILENAME = '.lock';
 export const CORE_MARKER_MODULE = 'mcp-sdk';
+export const GIT_DEPS_MARKER_FILENAME = 'git-deps.json';
 export const NPM_INSTALL_ARGS = ['install', '--no-package-lock', '--no-audit', '--no-fund'];
 const INSTALL_TIMEOUT_MS = 10 * 60 * 1000;
 
@@ -116,6 +118,104 @@ export function writeStamp(cachePath, stamp) {
     };
     fs.writeFileSync(stampPath(cachePath), JSON.stringify(payload, null, 2));
     return payload;
+}
+
+export function gitDepsMarkerPath(depsDir = DEPS_DIR) {
+    return path.join(depsDir, GIT_DEPS_MARKER_FILENAME);
+}
+
+/**
+ * Read the workspace-level moving-git-dependency marker. It records the commit
+ * each moving git dependency (e.g. achillesAgentLib `#master`, mcp-sdk `#main`)
+ * was last built against, so `ploinky update` can tell whether any of those
+ * refs actually advanced even though their package.json spec strings did not.
+ *
+ * @param {string} [depsDir=DEPS_DIR]
+ * @returns {{ commits: Record<string,string>, updatedAt?: string }|null}
+ */
+export function readGitDepsMarker(depsDir = DEPS_DIR) {
+    const file = gitDepsMarkerPath(depsDir);
+    if (!fs.existsSync(file)) return null;
+    try {
+        return JSON.parse(fs.readFileSync(file, 'utf8'));
+    } catch (_) {
+        return null;
+    }
+}
+
+export function writeGitDepsMarker(depsDir = DEPS_DIR, commits = {}) {
+    fs.mkdirSync(depsDir, { recursive: true });
+    const payload = {
+        commits: { ...commits },
+        updatedAt: new Date().toISOString(),
+    };
+    fs.writeFileSync(gitDepsMarkerPath(depsDir), JSON.stringify(payload, null, 2));
+    return payload;
+}
+
+/**
+ * Invalidate prepared dependency caches when any *moving* git dependency's
+ * resolved commit has advanced.
+ *
+ * The cache validity hash is computed from the package.json dependency *spec*
+ * strings, which are unchanged when a moving git ref (`#master`, `#main`)
+ * advances upstream — so a stale copy would otherwise be reused. Every global
+ * and agent cache embeds these dependencies, so when any resolved commit
+ * changes they are all genuinely stale: removing `global/` + `agents/` forces
+ * the next container start to rebuild (a fresh `npm install` re-fetches every
+ * dependency, including non-tracked semver ranges). When nothing changed this
+ * is a no-op, so `ploinky update` does not trigger an unnecessary reinstall.
+ *
+ * Commits are resolved by the caller during `ploinky update` (already online).
+ * Deps that could not be resolved are simply absent from `commits` and are
+ * ignored here (fail-open) — never treated as a change — and their prior marker
+ * entry is preserved.
+ *
+ * @param {Record<string,string|null>} commits - dependency name -> resolved sha (falsy/absent = unresolved).
+ * @param {object} [options]
+ * @param {string} [options.depsDir=DEPS_DIR]
+ * @param {Function} [options.log=debugLog]
+ * @returns {{ invalidated: boolean, reason: string, changed: string[], previous: Record<string,string>|null, current?: Record<string,string>, removed?: string[] }}
+ */
+export function invalidateDepsCacheForMovingGitDeps(commits, { depsDir = DEPS_DIR, log = debugLog } = {}) {
+    const resolved = {};
+    for (const [name, sha] of Object.entries(commits || {})) {
+        const value = String(sha || '').trim();
+        if (value) resolved[name] = value;
+    }
+    const names = Object.keys(resolved);
+    if (!names.length) {
+        return { invalidated: false, reason: 'no commits resolved', changed: [], previous: null };
+    }
+
+    const marker = readGitDepsMarker(depsDir);
+    const previous = (marker && marker.commits) || {};
+    const changed = names.filter((name) => previous[name] !== resolved[name]);
+    if (marker && changed.length === 0) {
+        return { invalidated: false, reason: 'unchanged', changed: [], previous };
+    }
+
+    const removed = [];
+    for (const sub of [path.join(depsDir, 'global'), path.join(depsDir, 'agents')]) {
+        if (fs.existsSync(sub)) {
+            fs.rmSync(sub, { recursive: true, force: true });
+            removed.push(sub);
+        }
+    }
+    const current = { ...previous, ...resolved };
+    writeGitDepsMarker(depsDir, current);
+    const description = changed.length
+        ? changed.map((name) => `${name} ${previous[name] || '(none)'} -> ${resolved[name]}`).join(', ')
+        : 'initial marker';
+    log(`[deps-cache] invalidated dependency caches: ${description}`);
+    return {
+        invalidated: true,
+        reason: marker ? 'commits changed' : 'no marker',
+        changed,
+        previous,
+        current,
+        removed,
+    };
 }
 
 function installerMismatchReason(stamp, expectedInstaller = null) {
