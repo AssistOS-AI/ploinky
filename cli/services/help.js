@@ -223,24 +223,28 @@ function showDetailedHelp(topic, subtopic, subsubtopic) {
                     notes: 'Equivalent to `sandbox enable`. Restart running agents to apply the change.'
                 },
                 'repo': {
-                    syntax: 'enable repo <name> [branch] | enable repo <name> --branch <branch>',
+                    syntax: 'enable [repo] <name> [branch] | enable [repo] <name> --branch <branch>',
                     description: 'Enable a repository for agent listings (see list repos). If not already installed, clones the repository.',
                     params: {
                         '<name>': 'Repository name (predefined or custom)',
                         '[branch]': 'Git branch to clone (optional, only used when cloning)'
                     },
                     examples: [
+                        'enable basic',
                         'enable repo cloud',
                         'enable repo basic',
+                        'enable basic profile_implementation  # Enable and clone at specific branch',
                         'enable repo basic profile_implementation  # Enable and clone at specific branch',
                         'enable repo demo --branch feature  # Enable with branch flag'
                     ],
                     notes: 'Branch is only used when the repository needs to be cloned. If the repo is already installed, the branch argument is ignored.'
                 },
                 'agent': {
-                    syntax: 'enable agent <name|repo/name> [isolated|global|devel [repoName]] [--auth none|pwd|sso] [--user <name> --password <value>] [as <alias>]',
+                    syntax: 'enable [agent] <name|repo/name> [isolated|global|devel [repoName]] [--auth none|pwd|sso] [--user <name> --password <value>] [as <alias>]',
                     description: 'Register and start an agent without changing the configured primary/static agent. Modes: isolated (omitted) creates a subfolder <agentName>; global uses current project; devel uses a repo under .ploinky/repos. Use "as <alias>" to create an additional instance with its own container name.',
                     examples: [
+                        'enable demo',
+                        'enable repoName/demo global',
                         'enable agent demo',
                         'enable agent demo --auth pwd',
                         'enable agent demo --auth pwd --user admin --password admin',
@@ -335,12 +339,12 @@ function showDetailedHelp(topic, subtopic, subsubtopic) {
                     notes: 'Equivalent to `sandbox disable`. Restart running agents to apply the change.'
                 },
                 'repo': {
-                    syntax: 'disable repo <name>',
+                    syntax: 'disable [repo] <name>',
                     description: 'Disable a repository from agent listings',
-                    examples: [ 'disable repo cloud' ]
+                    examples: [ 'disable cloud', 'disable repo cloud' ]
                 },
                 'agent': {
-                    syntax: 'disable <agentName>',
+                    syntax: 'disable [agent] <agentName>',
                     description: 'Remove an enabled agent from .ploinky/agents.json, then stop and remove its container',
                     examples: [ 'disable demo', 'disable agent repoName/demo' ]
                 },

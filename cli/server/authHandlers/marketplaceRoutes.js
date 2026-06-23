@@ -53,9 +53,9 @@ function normalizeMarketplaceAgentRef(value) {
 }
 
 function normalizeMarketplaceEnableMode(value) {
-    const mode = String(value || 'isolated').trim().toLowerCase();
-    if (!mode || mode === 'default') return 'isolated';
-    if (!['isolated', 'global', 'devel'].includes(mode)) {
+    const mode = String(value || agentsSvc.DEFAULT_ENABLE_AGENT_MODE).trim().toLowerCase();
+    if (!mode || mode === 'default') return agentsSvc.DEFAULT_ENABLE_AGENT_MODE;
+    if (!agentsSvc.isEnableAgentMode(mode)) {
         throw new Error('invalid_enable_mode');
     }
     return mode;
@@ -87,7 +87,7 @@ function buildMarketplaceState(user = null) {
             agentName: String(record.agentName || ''),
             containerName: String(containerName || ''),
             alias: String(record.alias || ''),
-            runMode: String(record.runMode || 'isolated')
+            runMode: String(record.runMode || agentsSvc.DEFAULT_ENABLE_AGENT_MODE)
         }));
     const activeAgentsByRepo = new Map();
     for (const record of enabledAgents) {
@@ -139,8 +139,8 @@ function buildMarketplaceState(user = null) {
                 name: agent.name,
                 about: agent.about === '-' ? '' : (agent.about || ''),
                 active,
-                enableMode: enabledRecord?.runMode || 'isolated',
-                enableModes: ['isolated', 'global', 'devel'],
+                enableMode: enabledRecord?.runMode || agentsSvc.DEFAULT_ENABLE_AGENT_MODE,
+                enableModes: agentsSvc.ENABLE_AGENT_MODES,
                 status: runtime?.status || (active ? 'stopped' : 'inactive'),
                 running: runtime?.status === 'running',
                 pid: runtime?.pid || null,

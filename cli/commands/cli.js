@@ -37,7 +37,7 @@ import {
     enableAgent,
     findAgentManifest,
 } from './repoAgentCommands.js';
-import { parseStartArgs } from '../services/repos.js';
+import { getPredefinedRepos, loadEnabledRepos, parseStartArgs } from '../services/repos.js';
 import { resolveAgentlibBranchRef } from '../services/dependencyInstaller.js';
 import {
     handleVarsCommand,
@@ -62,6 +62,13 @@ import { disableHostSandbox, enableHostSandbox, handleSandboxCommand } from './s
 import ClientCommands from './client.js';
 
 let llmAgentsLoadPromise = null;
+const ENABLE_AGENT_CLI_TOKENS = Object.freeze({
+    alias: 'as',
+    auth: '--auth',
+    user: '--user',
+    password: '--password',
+});
+const ENABLE_AGENT_CLI_TOKEN_SET = new Set(Object.values(ENABLE_AGENT_CLI_TOKENS));
 
 async function ensureLlmAgentsLoaded() {
     if (!llmAgentsLoadPromise) {
@@ -91,7 +98,7 @@ function parseEnableAgentArgs(rawOptions = []) {
     let aliasIndex = -1;
     for (let i = 0; i < tokens.length; i += 1) {
         const token = tokens[i];
-        if (typeof token === 'string' && token.toLowerCase() === 'as') {
+        if (typeof token === 'string' && token.toLowerCase() === ENABLE_AGENT_CLI_TOKENS.alias) {
             aliasIndex = i;
             break;
         }
@@ -107,7 +114,7 @@ function parseEnableAgentArgs(rawOptions = []) {
 
     for (let i = 0; i < tokens.length; i += 1) {
         const token = tokens[i];
-        if (typeof token === 'string' && token.toLowerCase() === '--auth') {
+        if (typeof token === 'string' && token.toLowerCase() === ENABLE_AGENT_CLI_TOKENS.auth) {
             const next = tokens[i + 1];
             if (!next || typeof next !== 'string') {
                 throw new Error("Usage: enable agent <name|repo/name> [isolated|global|devel [repoName]] [--auth none|pwd|sso] [--user <name> --password <value>] [as <alias>]");
@@ -117,7 +124,7 @@ function parseEnableAgentArgs(rawOptions = []) {
             i -= 1;
             continue;
         }
-        if (typeof token === 'string' && token.toLowerCase() === '--user') {
+        if (typeof token === 'string' && token.toLowerCase() === ENABLE_AGENT_CLI_TOKENS.user) {
             const next = tokens[i + 1];
             if (!next || typeof next !== 'string') {
                 throw new Error("Usage: enable agent <name|repo/name> [isolated|global|devel [repoName]] [--auth none|pwd|sso] [--user <name> --password <value>] [as <alias>]");
@@ -127,7 +134,7 @@ function parseEnableAgentArgs(rawOptions = []) {
             i -= 1;
             continue;
         }
-        if (typeof token === 'string' && token.toLowerCase() === '--password') {
+        if (typeof token === 'string' && token.toLowerCase() === ENABLE_AGENT_CLI_TOKENS.password) {
             const next = tokens[i + 1];
             if (!next || typeof next !== 'string') {
                 throw new Error("Usage: enable agent <name|repo/name> [isolated|global|devel [repoName]] [--auth none|pwd|sso] [--user <name> --password <value>] [as <alias>]");
@@ -147,6 +154,80 @@ function parseEnableAgentArgs(rawOptions = []) {
         username,
         password,
     };
+}
+
+function parseRepoBranchArgs(options = [], nameIndex = 1) {
+    const branchIdx = options.indexOf('--branch');
+    let branch = null;
+    if (branchIdx !== -1 && options[branchIdx + 1]) {
+        branch = options[branchIdx + 1];
+    } else if (options[nameIndex + 1] && !String(options[nameIndex + 1]).startsWith('--')) {
+        branch = options[nameIndex + 1];
+    }
+    return { name: options[nameIndex], branch };
+}
+
+function isKnownRepoName(name) {
+    const target = String(name || '').trim();
+    if (!target) return false;
+    const installed = getRepoNames();
+    if (installed.includes(target)) return true;
+    try {
+        if (loadEnabledRepos().includes(target)) return true;
+    } catch (_) {}
+    const predefined = getPredefinedRepos() || {};
+    return Object.prototype.hasOwnProperty.call(predefined, target);
+}
+
+function canResolveAgentName(name) {
+    const target = String(name || '').trim();
+    if (!target) return false;
+    try {
+        findAgent(target);
+        return true;
+    } catch (_) {
+        return false;
+    }
+}
+
+function hasAgentEnableSyntax(options = []) {
+    return options.slice(1).some((token) => {
+        const normalized = String(token || '').trim().toLowerCase();
+        return agentsSvc.isEnableAgentMode(normalized) || ENABLE_AGENT_CLI_TOKEN_SET.has(normalized);
+    });
+}
+
+function hasRepoBranchSyntax(options = []) {
+    if (options.includes('--branch')) return true;
+    const second = String(options[1] || '').trim().toLowerCase();
+    return Boolean(second) && !agentsSvc.isEnableAgentMode(second);
+}
+
+function resolveDirectEnableTarget(options = []) {
+    const target = String(options[0] || '').trim();
+    if (!target) return { type: 'missing' };
+    if (target.includes('/') || target.includes(':') || hasAgentEnableSyntax(options)) {
+        return { type: 'agent' };
+    }
+    if (hasRepoBranchSyntax(options)) {
+        return { type: 'repo' };
+    }
+    const repoMatch = isKnownRepoName(target);
+    const agentMatch = canResolveAgentName(target);
+    if (repoMatch && agentMatch) return { type: 'ambiguous', target };
+    if (repoMatch) return { type: 'repo' };
+    return { type: 'agent' };
+}
+
+function resolveDirectDisableTarget(options = []) {
+    const target = options.join(' ').trim();
+    if (!target) return { type: 'missing' };
+    if (target.includes('/') || target.includes(':')) return { type: 'agent', target };
+    const repoMatch = isKnownRepoName(target);
+    const agentMatch = canResolveAgentName(target);
+    if (repoMatch && agentMatch) return { type: 'ambiguous', target };
+    if (repoMatch) return { type: 'repo', target };
+    return { type: 'agent', target };
 }
 
 
@@ -218,14 +299,8 @@ async function handleCommand(args) {
         }
         case 'enable':
             if (options[0] === 'repo') {
-                const branchIdx = options.indexOf('--branch');
-                let branch = null;
-                if (branchIdx !== -1 && options[branchIdx + 1]) {
-                    branch = options[branchIdx + 1];
-                } else if (options[2] && !options[2].startsWith('--')) {
-                    branch = options[2];
-                }
-                enableRepo(options[1], branch);
+                const { name, branch } = parseRepoBranchArgs(options, 1);
+                enableRepo(name, branch);
             }
             else if (options[0] === 'agent') {
                 const parsed = parseEnableAgentArgs(options.slice(1));
@@ -234,7 +309,24 @@ async function handleCommand(args) {
             else if (['sandbox', 'host-sandbox', 'lite-sandbox'].includes(String(options[0] || '').toLowerCase())) {
                 enableHostSandbox();
             }
-            else showHelp();
+            else {
+                const resolved = resolveDirectEnableTarget(options);
+                if (resolved.type === 'missing') {
+                    showHelp();
+                    break;
+                }
+                if (resolved.type === 'ambiguous') {
+                    console.log(`Target '${resolved.target}' matches both an agent and a repository. Use 'enable agent ${resolved.target}' or 'enable repo ${resolved.target}'.`);
+                    break;
+                }
+                if (resolved.type === 'repo') {
+                    const { name, branch } = parseRepoBranchArgs(options, 0);
+                    enableRepo(name, branch);
+                    break;
+                }
+                const parsed = parseEnableAgentArgs(options);
+                await enableAgent(parsed.agentName, parsed.mode, parsed.repoName, parsed.alias, parsed.authMode, parsed.username, parsed.password);
+            }
             break;
         case 'expose':
             handleExposeCommand(options);
@@ -266,6 +358,21 @@ async function handleCommand(args) {
             let target = options.join(' ').trim();
             if (options[0] === 'agent') {
                 target = options.slice(1).join(' ').trim();
+            } else {
+                const resolved = resolveDirectDisableTarget(options);
+                if (resolved.type === 'missing') {
+                    showHelp();
+                    break;
+                }
+                if (resolved.type === 'ambiguous') {
+                    console.log(`Target '${resolved.target}' matches both an agent and a repository. Use 'disable agent ${resolved.target}' or 'disable repo ${resolved.target}'.`);
+                    break;
+                }
+                if (resolved.type === 'repo') {
+                    disableRepo(resolved.target);
+                    break;
+                }
+                target = resolved.target;
             }
 
             if (!target) {

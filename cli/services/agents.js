@@ -29,6 +29,17 @@ const __dirname = path.dirname(__filename);
 const RESERVED_AGENT_KEYS = new Set(['_config']);
 const ALIAS_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/;
 const AUTH_MODES = new Set(['none', 'local', 'pwd', 'sso', 'guest']);
+export const DEFAULT_ENABLE_AGENT_MODE = 'isolated';
+export const ENABLE_AGENT_MODES = Object.freeze(['isolated', 'global', 'devel']);
+const ENABLE_AGENT_MODE_SET = new Set(ENABLE_AGENT_MODES);
+
+export function isEnableAgentMode(value) {
+    return ENABLE_AGENT_MODE_SET.has(String(value || '').trim().toLowerCase());
+}
+
+function formatEnableAgentModes() {
+    return ENABLE_AGENT_MODES.join(' | ');
+}
 
 function isPathUnderRoot(candidate) {
     if (!candidate) return false;
@@ -171,7 +182,7 @@ function normalizeEnableArgs(agentName, mode, repoNameParam) {
     const spaceTokens = trimmed.split(/\s+/).filter(Boolean);
     if (spaceTokens.length > 1) {
         const candidateMode = spaceTokens[1].toLowerCase();
-        if (candidateMode === 'isolated' || candidateMode === 'global' || candidateMode === 'devel') {
+        if (isEnableAgentMode(candidateMode)) {
             parsedAgent = spaceTokens[0];
             parsedMode = candidateMode;
             if (candidateMode === 'devel' && parsedRepo === undefined) {
@@ -202,7 +213,7 @@ function normalizeEnableArgs(agentName, mode, repoNameParam) {
     }
 
     const inferredMode = tokens[0].toLowerCase();
-    if (inferredMode !== 'isolated' && inferredMode !== 'global' && inferredMode !== 'devel') {
+    if (!isEnableAgentMode(inferredMode)) {
         return { agentName: parsedAgent, mode: parsedMode, repoNameParam: parsedRepo };
     }
 
@@ -273,24 +284,24 @@ export function enableAgent(agentName, mode, repoNameParam, aliasParam, authMode
     }
 
     const normalizedMode = (normalized.mode || '').toLowerCase();
-    let runMode = 'isolated';
+    let runMode = DEFAULT_ENABLE_AGENT_MODE;
     let projectPath = '';
 
-    if (!normalizedMode || normalizedMode === 'default' || normalizedMode === 'isolated') {
+    if (!normalizedMode || normalizedMode === 'default' || normalizedMode === DEFAULT_ENABLE_AGENT_MODE) {
         try {
             const existing = Object.values(map || {}).find(
                 r => r && r.type === 'agent' && r.agentName === shortAgentName && r.repoName === repoName && !r.alias
             );
-            if (existing && (!existing.runMode || existing.runMode === 'isolated') && existing.projectPath) {
-                const normalizedPath = normalizeExistingProjectPath(existing.projectPath, existing.runMode || 'isolated');
+            if (existing && (!existing.runMode || existing.runMode === DEFAULT_ENABLE_AGENT_MODE) && existing.projectPath) {
+                const normalizedPath = normalizeExistingProjectPath(existing.projectPath, existing.runMode || DEFAULT_ENABLE_AGENT_MODE);
                 if (normalizedPath) {
                     projectPath = normalizedPath;
-                    runMode = 'isolated';
+                    runMode = DEFAULT_ENABLE_AGENT_MODE;
                 }
             }
         } catch (_) {}
         if (!projectPath) {
-            runMode = 'isolated';
+            runMode = DEFAULT_ENABLE_AGENT_MODE;
             // Use workspace structure: $PLOINKY_WORKSPACE_ROOT/.ploinky/agents/<agentName>/
             projectPath = getAgentWorkDir(shortAgentName);
             try { fs.mkdirSync(projectPath, { recursive: true }); } catch (_) {}
@@ -311,7 +322,7 @@ export function enableAgent(agentName, mode, repoNameParam, aliasParam, authMode
         projectPath = repoPath;
     } else {
         const errorMode = normalized.mode || mode || '';
-        throw new Error(`Unknown mode '${errorMode}'. Allowed: isolated | global | devel`);
+        throw new Error(`Unknown mode '${errorMode}'. Allowed: ${formatEnableAgentModes()}`);
     }
 
     // Parse port mappings from manifest
