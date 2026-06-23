@@ -101,7 +101,7 @@ function parseEnableAgentArgs(rawOptions = []) {
         alias = tokens.slice(aliasIndex + 1).join(' ').trim();
         tokens.splice(aliasIndex);
         if (!alias) {
-            throw new Error("Usage: enable agent <name|repo/name> [global|devel [repoName]] [as <alias>]");
+            throw new Error("Usage: enable agent <name|repo/name> [isolated|global|devel [repoName]] [as <alias>]");
         }
     }
 
@@ -110,7 +110,7 @@ function parseEnableAgentArgs(rawOptions = []) {
         if (typeof token === 'string' && token.toLowerCase() === '--auth') {
             const next = tokens[i + 1];
             if (!next || typeof next !== 'string') {
-                throw new Error("Usage: enable agent <name|repo/name> [global|devel [repoName]] [--auth none|pwd|sso] [--user <name> --password <value>] [as <alias>]");
+                throw new Error("Usage: enable agent <name|repo/name> [isolated|global|devel [repoName]] [--auth none|pwd|sso] [--user <name> --password <value>] [as <alias>]");
             }
             authMode = next.trim().toLowerCase();
             tokens.splice(i, 2);
@@ -120,7 +120,7 @@ function parseEnableAgentArgs(rawOptions = []) {
         if (typeof token === 'string' && token.toLowerCase() === '--user') {
             const next = tokens[i + 1];
             if (!next || typeof next !== 'string') {
-                throw new Error("Usage: enable agent <name|repo/name> [global|devel [repoName]] [--auth none|pwd|sso] [--user <name> --password <value>] [as <alias>]");
+                throw new Error("Usage: enable agent <name|repo/name> [isolated|global|devel [repoName]] [--auth none|pwd|sso] [--user <name> --password <value>] [as <alias>]");
             }
             username = next.trim();
             tokens.splice(i, 2);
@@ -130,7 +130,7 @@ function parseEnableAgentArgs(rawOptions = []) {
         if (typeof token === 'string' && token.toLowerCase() === '--password') {
             const next = tokens[i + 1];
             if (!next || typeof next !== 'string') {
-                throw new Error("Usage: enable agent <name|repo/name> [global|devel [repoName]] [--auth none|pwd|sso] [--user <name> --password <value>] [as <alias>]");
+                throw new Error("Usage: enable agent <name|repo/name> [isolated|global|devel [repoName]] [--auth none|pwd|sso] [--user <name> --password <value>] [as <alias>]");
             }
             password = next;
             tokens.splice(i, 2);

@@ -238,8 +238,8 @@ function showDetailedHelp(topic, subtopic, subsubtopic) {
                     notes: 'Branch is only used when the repository needs to be cloned. If the repo is already installed, the branch argument is ignored.'
                 },
                 'agent': {
-                    syntax: 'enable agent <name|repo/name> [global|devel [repoName]] [--auth none|pwd|sso] [--user <name> --password <value>] [as <alias>]',
-                    description: 'Register agent in .ploinky/agents.json (for start/stop/shutdown). Modes: isolated (omitted) creates a subfolder <agentName>; global uses current project; devel uses a repo under .ploinky/repos. Use "as <alias>" to create an additional instance with its own container name.',
+                    syntax: 'enable agent <name|repo/name> [isolated|global|devel [repoName]] [--auth none|pwd|sso] [--user <name> --password <value>] [as <alias>]',
+                    description: 'Register and start an agent without changing the configured primary/static agent. Modes: isolated (omitted) creates a subfolder <agentName>; global uses current project; devel uses a repo under .ploinky/repos. Use "as <alias>" to create an additional instance with its own container name.',
                     examples: [
                         'enable agent demo',
                         'enable agent demo --auth pwd',
@@ -249,7 +249,7 @@ function showDetailedHelp(topic, subtopic, subsubtopic) {
                         'enable agent demo devel simulator',
                         'enable agent demo as demo2'
                     ],
-                    notes: 'If --auth is omitted, no auth is applied unless the agent manifest declares a default auth mode. Pwd auth stores policy in .ploinky/agents.json and can also seed credentials via --user/--password or manifest defaults under `pwd.user` and `pwd.password`. Note: enable agent is optional. You can `enable repo` then `start <agent>`; it will use isolated mode (creates <agentName> subfolder). Aliases must be unique; commands like reinstall/disable should target the alias when multiple containers exist.'
+                    notes: 'If --auth is omitted, no auth is applied unless the agent manifest declares a default auth mode. Pwd auth stores policy in .ploinky/agents.json and can also seed credentials via --user/--password or manifest defaults under `pwd.user` and `pwd.password`. Enable starts the agent and updates its route, but does not replace the primary/static agent configured by start. Aliases must be unique; commands like reinstall/disable should target the alias when multiple containers exist.'
                 }
             }
         },

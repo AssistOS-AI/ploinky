@@ -52,6 +52,20 @@ function normalizeMarketplaceAgentRef(value) {
     return `${parts[0]}/${parts[1]}`;
 }
 
+function normalizeMarketplaceEnableMode(value) {
+    const mode = String(value || 'isolated').trim().toLowerCase();
+    if (!mode || mode === 'default') return 'isolated';
+    if (!['isolated', 'global', 'devel'].includes(mode)) {
+        throw new Error('invalid_enable_mode');
+    }
+    return mode;
+}
+
+function isSkillsOnlyRepoError(error) {
+    const message = String(error?.message || error || '');
+    return /skills-only repo|contains only skills/i.test(message);
+}
+
 function normalizeMarketplaceContainerSegment(value) {
     return String(value || '').replace(/[^a-zA-Z0-9_.-]/g, '_');
 }
@@ -72,7 +86,8 @@ function buildMarketplaceState(user = null) {
             repoName: String(record.repoName || ''),
             agentName: String(record.agentName || ''),
             containerName: String(containerName || ''),
-            alias: String(record.alias || '')
+            alias: String(record.alias || ''),
+            runMode: String(record.runMode || 'isolated')
         }));
     const activeAgentsByRepo = new Map();
     for (const record of enabledAgents) {
@@ -97,6 +112,7 @@ function buildMarketplaceState(user = null) {
     });
     const enabledKeys = new Set(enabledAgents.map(record => `${record.repoName}/${record.agentName}`));
     const enabledByContainer = new Map(enabledAgents.map(record => [record.containerName, record]));
+    const enabledByRef = new Map(enabledAgents.map(record => [`${record.repoName}/${record.agentName}`, record]));
     const liveEntries = collectLiveAgentContainers() || [];
     const summaries = collectAgentsSummary({ includeInactive: true });
     const agents = [];
@@ -116,12 +132,15 @@ function buildMarketplaceState(user = null) {
                 containerName: String(liveEntry?.containerName || '')
             } : null;
             const active = enabledKeys.has(ref);
+            const enabledRecord = enabledByRef.get(ref) || null;
             agents.push({
                 ref,
                 repo: agent.repo,
                 name: agent.name,
                 about: agent.about === '-' ? '' : (agent.about || ''),
                 active,
+                enableMode: enabledRecord?.runMode || 'isolated',
+                enableModes: ['isolated', 'global', 'devel'],
                 status: runtime?.status || (active ? 'stopped' : 'inactive'),
                 running: runtime?.status === 'running',
                 pid: runtime?.pid || null,
@@ -221,11 +240,25 @@ export async function handleMarketplaceRoutes(req, res, parsedUrl) {
                 const url = normalizeMarketplaceUrl(body?.url);
                 const branch = String(body?.branch || '').trim() || null;
                 const addResult = reposSvc.addRepo(name, url, branch, { stdio: 'pipe' });
-                reposSvc.enableRepo(name, branch, { stdio: 'pipe' });
+                let result = addResult;
+                try {
+                    reposSvc.enableRepo(name, branch, { stdio: 'pipe' });
+                    result = { ...addResult, enabled: true };
+                } catch (error) {
+                    if (!isSkillsOnlyRepoError(error)) {
+                        throw error;
+                    }
+                    result = {
+                        ...addResult,
+                        enabled: false,
+                        skillsOnly: true,
+                        message: error?.message || `Repo '${name}' contains only skills.`
+                    };
+                }
                 sendJson(res, 200, {
                     ok: true,
                     action,
-                    result: addResult,
+                    result,
                     marketplace: buildMarketplaceState(req.user)
                 });
                 return true;
@@ -256,9 +289,11 @@ export async function handleMarketplaceRoutes(req, res, parsedUrl) {
                 return true;
             }
 
-            if (action === 'activate_agent') {
+            if (action === 'enable_agent') {
                 const ref = normalizeMarketplaceAgentRef(body?.agentRef);
-                const result = agentsSvc.enableAgent(ref);
+                const mode = normalizeMarketplaceEnableMode(body?.mode || body?.enableMode);
+                const repoName = ref.split('/')[0];
+                const result = agentsSvc.enableAgent(ref, mode === 'isolated' ? undefined : mode, mode === 'devel' ? repoName : undefined);
                 sendJson(res, 200, {
                     ok: true,
                     action,
@@ -268,11 +303,11 @@ export async function handleMarketplaceRoutes(req, res, parsedUrl) {
                 return true;
             }
 
-            if (action === 'deactivate_agent') {
+            if (action === 'disable_agent') {
                 const ref = normalizeMarketplaceAgentRef(body?.agentRef);
                 const result = agentsSvc.disableAgent(ref);
                 if (result?.status && result.status !== 'removed' && result.status !== 'static-removed') {
-                    sendMarketplaceError(res, 409, 'agent_deactivation_blocked', result.status);
+                    sendMarketplaceError(res, 409, 'agent_disable_blocked', result.status);
                     return true;
                 }
                 sendJson(res, 200, {

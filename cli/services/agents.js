@@ -10,10 +10,11 @@ import {
     parseManifestPorts,
     containerExists,
     isContainerRunning,
-    stopAndRemove
+    stopAndRemove,
+    ensureAgentService
 } from './docker/index.js';
 import { findAgent } from './utils.js';
-import { REPOS_DIR, PLOINKY_WORKSPACE_ROOT } from './config.js';
+import { REPOS_DIR, PLOINKY_WORKSPACE_ROOT, ROUTING_FILE } from './config.js';
 import {
     createAgentSymlinks,
     removeAgentSymlinks,
@@ -154,7 +155,7 @@ function normalizeEnableArgs(agentName, mode, repoNameParam) {
     const spaceTokens = trimmed.split(/\s+/).filter(Boolean);
     if (spaceTokens.length > 1) {
         const candidateMode = spaceTokens[1].toLowerCase();
-        if (candidateMode === 'global' || candidateMode === 'devel') {
+        if (candidateMode === 'isolated' || candidateMode === 'global' || candidateMode === 'devel') {
             parsedAgent = spaceTokens[0];
             parsedMode = candidateMode;
             if (candidateMode === 'devel' && parsedRepo === undefined) {
@@ -185,7 +186,7 @@ function normalizeEnableArgs(agentName, mode, repoNameParam) {
     }
 
     const inferredMode = tokens[0].toLowerCase();
-    if (inferredMode !== 'global' && inferredMode !== 'devel') {
+    if (inferredMode !== 'isolated' && inferredMode !== 'global' && inferredMode !== 'devel') {
         return { agentName: parsedAgent, mode: parsedMode, repoNameParam: parsedRepo };
     }
 
@@ -197,6 +198,23 @@ function normalizeEnableArgs(agentName, mode, repoNameParam) {
             ? (repoNameParam !== undefined ? repoNameParam : repoFromDirective)
             : (repoNameParam !== undefined ? repoNameParam : undefined)
     };
+}
+
+function loadRoutingConfig() {
+    try {
+        if (!fs.existsSync(ROUTING_FILE)) return { routes: {} };
+        const data = JSON.parse(fs.readFileSync(ROUTING_FILE, 'utf8') || '{}');
+        return data && typeof data === 'object' ? data : { routes: {} };
+    } catch (_) {
+        return { routes: {} };
+    }
+}
+
+function saveRoutingConfig(config) {
+    try {
+        fs.mkdirSync(path.dirname(ROUTING_FILE), { recursive: true });
+        fs.writeFileSync(ROUTING_FILE, JSON.stringify(config || { routes: {} }, null, 2));
+    } catch (_) {}
 }
 
 export function enableAgent(agentName, mode, repoNameParam, aliasParam, authModeParam, authOptions = {}) {
@@ -242,7 +260,7 @@ export function enableAgent(agentName, mode, repoNameParam, aliasParam, authMode
     let runMode = 'isolated';
     let projectPath = '';
 
-    if (!normalizedMode || normalizedMode === 'default') {
+    if (!normalizedMode || normalizedMode === 'default' || normalizedMode === 'isolated') {
         try {
             const existing = Object.values(map || {}).find(
                 r => r && r.type === 'agent' && r.agentName === shortAgentName && r.repoName === repoName && !r.alias
@@ -277,7 +295,7 @@ export function enableAgent(agentName, mode, repoNameParam, aliasParam, authMode
         projectPath = repoPath;
     } else {
         const errorMode = normalized.mode || mode || '';
-        throw new Error(`Unknown mode '${errorMode}'. Allowed: global | devel`);
+        throw new Error(`Unknown mode '${errorMode}'. Allowed: isolated | global | devel`);
     }
 
     // Parse port mappings from manifest
@@ -339,6 +357,11 @@ export function enableAgent(agentName, mode, repoNameParam, aliasParam, authMode
         record.profile = profile;
     }
 
+    const routing = loadRoutingConfig();
+    routing.routes = routing.routes || {};
+    const existingRoute = routing.routes[routeKey] || {};
+    const preferredHostPort = Number(existingRoute.hostPort || 0) || undefined;
+
     for (const key of Object.keys(map)) {
         if (RESERVED_AGENT_KEYS.has(key)) continue;
         if (!map[key] || typeof map[key] !== 'object') continue;
@@ -365,7 +388,30 @@ export function enableAgent(agentName, mode, repoNameParam, aliasParam, authMode
         console.error(`Warning: Failed to create workspace structure for ${shortAgentName}: ${err.message}`);
     }
 
-    return { containerName, repoName, shortAgentName, alias: alias || undefined, auth: record.auth };
+    let started = null;
+    try {
+        started = ensureAgentService(shortAgentName, manifest, agentPath, {
+            containerName,
+            alias: alias || undefined,
+            preferredHostPort
+        });
+    } catch (error) {
+        throw new Error(`enable agent: failed to start '${shortAgentName}': ${error?.message || error}`);
+    }
+
+    const hostPort = started?.hostPort || preferredHostPort || existingRoute.hostPort;
+    routing.routes[routeKey] = {
+        ...existingRoute,
+        container: started?.containerName || containerName,
+        hostPath: agentPath,
+        repo: repoName,
+        agent: shortAgentName,
+        ...(alias ? { alias } : {}),
+        ...(hostPort ? { hostPort } : {})
+    };
+    saveRoutingConfig(routing);
+
+    return { containerName: started?.containerName || containerName, repoName, shortAgentName, alias: alias || undefined, auth: record.auth, runMode, hostPort };
 }
 
 export function disableAgent(agentRef) {

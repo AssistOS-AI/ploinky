@@ -363,11 +363,11 @@ function disableRepo(repoName) {
 }
 
 async function enableAgent(agentName, mode, repoNameParam, alias, authMode, username, password) {
-    if (!agentName) throw new Error('Usage: enable agent <name|repo/name> [global|devel [repoName]] [--auth none|pwd|sso] [--user <name> --password <value>] [as <alias>]');
+    if (!agentName) throw new Error('Usage: enable agent <name|repo/name> [isolated|global|devel [repoName]] [--auth none|pwd|sso] [--user <name> --password <value>] [as <alias>]');
     const { shortAgentName, repoName, alias: resolvedAlias, auth } = agentsSvc.enableAgent(agentName, mode, repoNameParam, alias, authMode, { username, password });
     const aliasNote = resolvedAlias ? ` as '${resolvedAlias}'` : '';
     const authLabel = auth?.mode === 'local' ? 'pwd' : (auth?.mode || 'none');
-    console.log(`✓ Agent '${shortAgentName}' from repo '${repoName}' enabled${aliasNote} with auth '${authLabel}'. Use 'start' to start all configured agents.`);
+    console.log(`✓ Agent '${shortAgentName}' from repo '${repoName}' enabled and started${aliasNote} with auth '${authLabel}'.`);
     if (auth?.mode === 'local' && auth.usersVar) {
         console.log(`  Local auth users var: ${auth.usersVar}`);
         if (username) {
