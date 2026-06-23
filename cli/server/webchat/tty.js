@@ -1,4 +1,5 @@
 import { buildExecArgs } from '../../services/docker/index.js';
+import { spawn } from 'child_process';
 
 import fs from 'fs';
 import os from 'os';
@@ -38,7 +39,7 @@ function shouldAppendIdentityArgs(command) {
     return !/^(?:\/bin\/)?(?:ba)?sh$/i.test(firstToken);
 }
 
-function createTTYFactory({ runtime, containerName, ptyLib, workdir, entry }) {
+function createTTYFactory({ runtime, containerName, workdir, entry }) {
     const DEBUG = process.env.WEBTTY_DEBUG === '1';
     const log = (...args) => { if (DEBUG) console.log('[webchat][tty]', ...args); };
     const factory = (ssoUser) => {
@@ -98,23 +99,29 @@ function createTTYFactory({ runtime, containerName, ptyLib, workdir, entry }) {
             }
         };
 
-        if (!ptyLib) throw new Error("'node-pty' is required for WebChat sessions.");
         try {
-            ptyProc = ptyLib.spawn(runtime, execArgs, {
-                name: 'xterm-color',
-                cols: 80,
-                rows: 24,
+            ptyProc = spawn(runtime, execArgs, {
                 cwd: safeProcessCwd(),
-                env
+                env,
+                detached: true,                 // own process group: global.processKill(-pid) reaps the tree
+                stdio: ['pipe', 'pipe', 'pipe'],
             });
-            log('spawned PTY', { runtime, containerName });
-            ptyProc.onData(emitOutput);
-            ptyProc.onExit(() => {
-                log('pty exit');
+            // Deliver strings (not Buffers) so the handler's JSON.stringify(data) stays byte-correct.
+            ptyProc.stdout.setEncoding('utf8');
+            ptyProc.stderr.setEncoding('utf8');
+            log('spawned child', { runtime, containerName, pid: ptyProc.pid });
+            ptyProc.stdout.on('data', emitOutput);
+            ptyProc.stderr.on('data', emitOutput);
+            ptyProc.on('error', (e) => {
+                log('child error', e?.message || e);
+                emitClose();
+            });
+            ptyProc.on('close', () => {
+                log('child close');
                 emitClose();
             });
         } catch (e) {
-            log('pty spawn failed', e?.message || e);
+            log('child spawn failed', e?.message || e);
             throw e;
         }
 
@@ -130,10 +137,7 @@ function createTTYFactory({ runtime, containerName, ptyLib, workdir, entry }) {
             },
             write(data) {
                 if (DEBUG) log('write', { bytes: Buffer.byteLength(data || '') });
-                try { ptyProc?.write?.(data); } catch (e) { log('write error', e?.message || e); }
-            },
-            resize(cols, rows) {
-                try { ptyProc?.resize?.(cols, rows); } catch (e) { log('resize error', e?.message || e); }
+                try { ptyProc?.stdin?.write?.(data); } catch (e) { log('write error', e?.message || e); }
             },
             kill() {
                 const pid = ptyProc?.pid;
@@ -166,7 +170,7 @@ function createTTYFactory({ runtime, containerName, ptyLib, workdir, entry }) {
 
 export { createTTYFactory, createLocalTTYFactory };
 
-function createLocalTTYFactory({ ptyLib, workdir, command }) {
+function createLocalTTYFactory({ workdir, command }) {
     const DEBUG = process.env.WEBTTY_DEBUG === '1';
     const log = (...args) => { if (DEBUG) console.log('[webchat][tty-local]', ...args); };
     const factory = (ssoUser) => {
@@ -244,18 +248,23 @@ function createLocalTTYFactory({ ptyLib, workdir, command }) {
             const shCmd = hasCustom
                 ? `cd '${wd}' && ${rawTtyPrefix} && exec ${useEntry}`
                 : `cd '${wd}' && ${rawTtyPrefix} && ${useEntry}`;
-            if (!ptyLib) throw new Error("'node-pty' is required for local WebChat sessions.");
             try {
-                ptyProc = ptyLib.spawn(parentShell, ['-lc', shCmd], {
-                    name: 'xterm-color',
-                    cols: 80,
-                    rows: 24,
+                ptyProc = spawn(parentShell, ['-lc', shCmd], {
                     cwd: wd,
-                    env
+                    env,
+                    detached: true,                 // own process group: global.processKill(-pid) reaps the tree
+                    stdio: ['pipe', 'pipe', 'pipe'],
                 });
-                ptyProc.onData(emitOutput);
-                ptyProc.onExit(() => {
-                    log('local pty exit', { isFallback: !!isFallback });
+                ptyProc.stdout.setEncoding('utf8');
+                ptyProc.stderr.setEncoding('utf8');
+                ptyProc.stdout.on('data', emitOutput);
+                ptyProc.stderr.on('data', emitOutput);
+                ptyProc.on('error', (e) => {
+                    log('local child error', e?.message || e);
+                    emitClose();
+                });
+                ptyProc.on('close', () => {
+                    log('local child close', { isFallback: !!isFallback });
                     if (disposed) {
                         emitClose();
                         return;
@@ -282,7 +291,7 @@ function createLocalTTYFactory({ ptyLib, workdir, command }) {
                     emitClose();
                 });
             } catch (e) {
-                log('local pty spawn failed', e?.message || e);
+                log('local child spawn failed', e?.message || e);
                 throw e;
             }
         }
@@ -294,8 +303,7 @@ function createLocalTTYFactory({ ptyLib, workdir, command }) {
             get pid() { return ptyProc?.pid; },
             onOutput(handler) { if (handler) outputHandlers.add(handler); return () => outputHandlers.delete(handler); },
             onClose(handler) { if (handler) closeHandlers.add(handler); return () => closeHandlers.delete(handler); },
-            write(data) { try { ptyProc?.write?.(data); } catch (e) { log('write error', e?.message || e); } },
-            resize(cols, rows) { try { ptyProc?.resize?.(cols, rows); } catch (e) { log('resize error', e?.message || e); } },
+            write(data) { try { ptyProc?.stdin?.write?.(data); } catch (e) { log('write error', e?.message || e); } },
             kill() {
                 disposed = true;
                 const pid = ptyProc?.pid;

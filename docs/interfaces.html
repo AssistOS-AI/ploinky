@@ -45,10 +45,6 @@
             </thead>
             <tbody>
               <tr>
-                <td><code>/webtty</code></td>
-                <td>Browser terminal backed by <code>node-pty</code>, guarded by a per-surface token or an authenticated user session, with global and per-session TTY limits.</td>
-              </tr>
-              <tr>
                 <td><code>/webchat</code></td>
                 <td>TTY-backed chat surface that persists encrypted transcripts, supports uploads, and forwards arbitrary URL query parameters to the selected agent CLI as long-form flags encoded as single <code>--key=value</code> tokens.</td>
               </tr>
@@ -74,7 +70,7 @@
 
         <section class="chapter-section">
           <h2>Authentication Modes</h2>
-          <p>Ploinky supports three practical access patterns. <code>/webtty</code>, <code>/webchat</code>, and <code>/webmeet</code> use the normal router login flow. <code>/dashboard</code> still supports <code>WEBDASHBOARD_TOKEN</code>, and the read-only <code>/status</code> surface reuses the dashboard token flow. Local auth stores hashed users inside a workspace-managed variable such as <code>PLOINKY_AUTH_&lt;ROUTE&gt;_USERS</code>. SSO stores a configured provider agent in workspace SSO config; provider agents mark their manifests with <code>"ssoProvider": true</code>.</p>
+          <p>Ploinky supports three practical access patterns. <code>/webchat</code> and <code>/webmeet</code> use the normal router login flow. <code>/dashboard</code> still supports <code>WEBDASHBOARD_TOKEN</code>, and the read-only <code>/status</code> surface reuses the dashboard token flow. Local auth stores hashed users inside a workspace-managed variable such as <code>PLOINKY_AUTH_&lt;ROUTE&gt;_USERS</code>. SSO stores a configured provider agent in workspace SSO config; provider agents mark their manifests with <code>"ssoProvider": true</code>.</p>
           <p>The auth bridge normalizes authenticated users onto <code>req.user</code> and tracks session cookies for both local and external sign-in paths. Local sessions are handled by the router’s session store, and SSO sessions inherit user identity and tokens from the provider flow.</p>
         </section>
 

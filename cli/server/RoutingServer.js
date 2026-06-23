@@ -3,8 +3,6 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
-// Handler imports
-import { handleWebTTY } from './handlers/webtty.js';
 import { handleWebChat } from './handlers/webchat.js';
 import { handleDashboard } from './handlers/dashboard.js';
 import { handleStatus } from './handlers/status.js';
@@ -62,10 +60,10 @@ const __dirname = path.dirname(__filename);
 const MCP_BROWSER_CLIENT_PATH = path.resolve(__dirname, '../../Agent/client/MCPBrowserClient.js');
 
 // Initialize TTY factories
-const { getWebttyFactory, getWebchatFactory } = await initializeTTYFactories();
+const { getWebchatFactory } = await initializeTTYFactories();
 
 // Create service configuration
-const config = createServiceConfig(getWebttyFactory, getWebchatFactory);
+const config = createServiceConfig(getWebchatFactory);
 
 // Safe console write that catches EPIPE/EIO errors
 function safeLog(...args) {
@@ -88,7 +86,6 @@ if (!global.processKill) {
 }
 // Global state for all services
 const globalState = {
-    webtty: { sessions: new Map() },
     webchat: { sessions: new Map() },
     dashboard: { sessions: new Map() },
     status: { sessions: new Map() }
@@ -176,7 +173,6 @@ function isRouterOwnedPath(pathname) {
         || pathname.startsWith('/admin/')
         || pathname === '/__agent'
         || pathname.startsWith('/__agent/')
-        || isRouteMount(pathname, '/webtty')
         || isRouteMount(pathname, '/webchat')
         || isRouteMount(pathname, '/dashboard')
         || isRouteMount(pathname, '/status')
@@ -389,7 +385,6 @@ async function processRequest(req, res) {
                 heapUsedMB: Math.round(memUsage.heapUsed / 1024 / 1024)
             },
             activeSessions: {
-                webtty: globalState.webtty.sessions.size,
                 webchat: globalState.webchat.sessions.size,
                 dashboard: globalState.dashboard.sessions.size,
                 status: globalState.status.sessions.size,
@@ -517,9 +512,7 @@ async function processRequest(req, res) {
     }
 
     // Route to appropriate handler
-    if (isRouteMount(pathname, '/webtty')) {
-        return handleWebTTY(req, res, config.webtty, globalState.webtty);
-    } else if (isRouteMount(pathname, '/webchat')) {
+    if (isRouteMount(pathname, '/webchat')) {
         return handleWebChat(req, res, config.webchat, globalState.webchat);
     } else if (isRouteMount(pathname, '/dashboard')) {
         return handleDashboard(req, res, config.dashboard, globalState.dashboard);
@@ -628,7 +621,6 @@ const port = process.env.PORT ? parseInt(process.env.PORT, 10) : 8080;
 server.listen(port, () => {
     console.log(`[RoutingServer] Ploinky server running on http://127.0.0.1:${port}`);
     console.log('  Dashboard:       /dashboard');
-    console.log('  WebTTY:          /webtty');
     console.log('  WebChat:         /webchat');
     console.log('  Status:          /status');
     console.log('  Health:          /health');

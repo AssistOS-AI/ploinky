@@ -21,12 +21,10 @@
   
   setTheme(getTheme());
 
-  // External links to Console/Chat servers (open in new tab)
+  // External link to the Chat surface (open in new tab)
   try {
     const loc = window.location;
-    const lnkConsole = document.getElementById('lnkConsole');
     const lnkChat = document.getElementById('lnkChat');
-    if (lnkConsole) lnkConsole.href = `${loc.origin}/webtty/`;
     if (lnkChat) lnkChat.href = `${loc.origin}/webchat/`;
   } catch(_) {}
 

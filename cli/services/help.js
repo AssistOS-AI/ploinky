@@ -20,8 +20,6 @@ export function showHelp(args = []) {
   start [staticAgent] [port]     Start agents from .ploinky/agents.json and launch Router
   shell <agentName>              Open interactive sh in container (attached TTY)
   cli <agentName> [args...]      Run manifest "cli" command (attached TTY)
-  webconsole [shell] [--rotate]  Prepare WebTTY (alias). Prints URL; login happens in router.
-  webtty [shell] [--rotate]      Prepare WebTTY and print access URL. Optional shell.
   webchat [--rotate]             Print the WebChat access URL and support agent URL params
   dashboard [--rotate]           Show or rotate Dashboard token and print access URL
   sso enable|disable|status  Bind or inspect SSO provider agents
@@ -88,7 +86,7 @@ function showDetailedHelp(topic, subtopic, subsubtopic) {
                 'var WEBDASHBOARD_TOKEN deadbeef  # Override dashboard token manually',
                 'var API_KEY sk-123456'
             ],
-            notes: "Use 'vars' to list variables. WebTTY/WebChat/WebMeet use the router login flow; only dashboard still uses a surface token."
+            notes: "Use 'vars' to list variables. WebChat/WebMeet use the router login flow; only dashboard still uses a surface token."
         },
         'vars': {
             description: 'List workspace variables (from encrypted .ploinky/.secrets)',
@@ -127,18 +125,6 @@ function showDetailedHelp(topic, subtopic, subsubtopic) {
                     notes: 'Attaches to a persistent container. REPLs stay attached until exit. Requires the agent manifest to define a "cli" entry. WebChat uses the same launch path and appends forwarded URL parameters as long-form CLI flags.'
                 }
             }
-        },
-        'webconsole': {
-            description: 'Alias of webtty. Optionally configure shell for console sessions and print the access URL.',
-            syntax: 'webconsole [shell] [--rotate]',
-            examples: [ 'webconsole', 'webconsole zsh', 'webconsole --rotate' ],
-            notes: 'Allowed shells: sh, zsh, dash, ksh, csh, tcsh, fish, or absolute path. If a shell is provided, the router restarts (if configured). WebTTY now uses the normal router login flow. `--rotate` no longer changes anything for this surface.'
-        },
-        'webtty': {
-            description: 'Prepare WebTTY. Optionally configure shell for console sessions and print the access URL.',
-            syntax: 'webtty [shell] [--rotate]',
-            examples: [ 'webtty', 'webtty sh', 'webtty --rotate' ],
-            notes: 'Allowed shells: sh, zsh, dash, ksh, csh, tcsh, fish, or absolute path. If a shell is provided, the router restarts (if configured). WebTTY now uses the normal router login flow. `--rotate` no longer changes anything for this surface.'
         },
         'webchat': {
             description: 'Print the WebChat URL served at /webchat.',

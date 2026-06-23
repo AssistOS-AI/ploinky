@@ -91,7 +91,6 @@
     if (!linksList) return;
     const entries = [
       { label: 'Dashboard', href: '/dashboard', note: 'through router' },
-      { label: 'Web Console', href: '/webtty', note: 'through router' },
       { label: 'WebChat', href: '/webchat', note: 'through router' }
     ];
     linksList.innerHTML = entries.map(entry => (

@@ -64,68 +64,6 @@ fast_test_dynamic_app_name() {
   return 0
 }
 
-fast_test_dynamic_webtty_shell() {
-  load_state
-  require_var "TEST_RUN_DIR" || return 1
-  require_var "TEST_ROUTER_PORT" || return 1
-  
-  local secrets_file="$TEST_RUN_DIR/.ploinky/.secrets"
-  local router_port="$TEST_ROUTER_PORT"
-  
-  # Save original WEBTTY_SHELL if exists
-  local original_shell=""
-  if grep -q "^WEBTTY_SHELL=" "$secrets_file" 2>/dev/null; then
-    original_shell=$(grep "^WEBTTY_SHELL=" "$secrets_file" | head -1 | cut -d= -f2-)
-  fi
-  
-  # Test 1: Server responds before config change
-  if ! curl -fsS "http://127.0.0.1:${router_port}/webtty/" >/dev/null 2>&1; then
-    echo "Server not responding before WEBTTY_SHELL change" >&2
-    return 1
-  fi
-  
-  # Test 2: Change WEBTTY_SHELL
-  echo "WEBTTY_SHELL=/bin/sh" >> "$secrets_file"
-  
-  sleep 0.5
-  
-  # Test 3: Server still responds after config change
-  if ! curl -fsS "http://127.0.0.1:${router_port}/webtty/" >/dev/null 2>&1; then
-    echo "Server not responding after WEBTTY_SHELL change" >&2
-    # Restore original
-    sed -i "/^WEBTTY_SHELL=/d" "$secrets_file"
-    if [[ -n "$original_shell" ]]; then
-      echo "WEBTTY_SHELL=${original_shell}" >> "$secrets_file"
-    fi
-    return 1
-  fi
-  
-  # Test 4: Change to different shell
-  sed -i "/^WEBTTY_SHELL=/d" "$secrets_file"
-  echo "WEBTTY_SHELL=/bin/bash" >> "$secrets_file"
-  
-  sleep 0.5
-  
-  # Test 5: Server still responds after second change
-  if ! curl -fsS "http://127.0.0.1:${router_port}/webtty/" >/dev/null 2>&1; then
-    echo "Server not responding after second WEBTTY_SHELL change" >&2
-    # Restore original
-    sed -i "/^WEBTTY_SHELL=/d" "$secrets_file"
-    if [[ -n "$original_shell" ]]; then
-      echo "WEBTTY_SHELL=${original_shell}" >> "$secrets_file"
-    fi
-    return 1
-  fi
-  
-  # Restore original WEBTTY_SHELL
-  sed -i "/^WEBTTY_SHELL=/d" "$secrets_file"
-  if [[ -n "$original_shell" ]]; then
-    echo "WEBTTY_SHELL=${original_shell}" >> "$secrets_file"
-  fi
-  
-  return 0
-}
-
 fast_test_sso_client_secret_propagation() {
   load_state
   require_var "TEST_RUN_DIR" || return 1

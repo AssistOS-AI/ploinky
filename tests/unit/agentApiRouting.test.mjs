@@ -54,7 +54,6 @@ test('extractAgentName ignores paths that are not routed agents', () => {
     assert.equal(extractAgentName(''), null);
     assert.equal(extractAgentName('/unknown/index.html'), null);
     assert.equal(extractAgentName('/mcp'), null);
-    assert.equal(extractAgentName('/webtty'), null);
     assert.equal(extractAgentName('/agent-card'), null);
 });
 

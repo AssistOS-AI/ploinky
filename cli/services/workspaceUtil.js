@@ -521,7 +521,6 @@ async function startWorkspace(staticAgentArg, portArg, { refreshComponentToken, 
     }
     if (typeof refreshComponentToken === 'function' || typeof ensureComponentToken === 'function') {
       try {
-        refreshComponentToken && refreshComponentToken('webtty', { quiet: true });
         const ensureToken = ensureComponentToken || refreshComponentToken;
         if (ensureComponentToken) {
           ensureComponentToken('webchat', { quiet: true });

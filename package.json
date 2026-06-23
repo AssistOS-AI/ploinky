@@ -31,7 +31,6 @@
         "url": "https://github.com/AssistOS-AI/ploinky.git"
     },
     "dependencies": {
-        "mcp-sdk": "github:AssistOS-AI/MCPSDK#main",
-        "node-pty": "^1.0.0"
+        "mcp-sdk": "github:AssistOS-AI/MCPSDK#main"
     }
 }

@@ -45,7 +45,6 @@ test_check "Agent data file retains initialization signature" assert_file_contai
 test_info "Testing dynamic env variable propagation (no restart)"
 
 test_check "Dynamic APP_NAME update without restart" fast_test_dynamic_app_name
-test_check "Dynamic WEBTTY_SHELL update without restart" fast_test_dynamic_webtty_shell
 test_check "Dynamic SSO_CLIENT_SECRET update without restart" fast_test_sso_client_secret_propagation
 
 stage_header "Manifest Environment"

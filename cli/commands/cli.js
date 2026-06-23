@@ -47,7 +47,6 @@ import {
 } from './envVarCommands.js';
 import { handleDefaultSkillsCommand } from './skillsCommands.js';
 import { runSettingsMenu } from '../services/settingsMenu.js';
-import { configureWebttyShell } from './webttyCommands.js';
 import { handleProfileCommand } from './profileCommands.js';
 import { ROUTING_FILE } from '../services/config.js';
 import {
@@ -429,28 +428,6 @@ async function handleCommand(args) {
             break;
         }
         // 'route' and 'probe' commands removed (replaced by start/status and client commands)
-        case 'webconsole': {
-            // Alias of webtty; supports optional shell and --rotate
-            const argsList = (options || []).filter(Boolean);
-            let shellCandidate = null;
-            let rotate = false;
-            for (const arg of argsList) {
-                if (String(arg).startsWith('--')) {
-                    if (arg === '--rotate') rotate = true;
-                } else if (!shellCandidate) {
-                    shellCandidate = arg;
-                }
-            }
-            if (shellCandidate) {
-                const ok = configureWebttyShell(shellCandidate);
-                if (!ok) break;
-                // Apply immediately if workspace start is configured
-                try { await handleCommand(['restart']); } catch (_) { }
-            }
-            if (rotate) await refreshComponentToken('webtty');
-            else ensureComponentToken('webtty');
-            break;
-        }
         case 'webchat': {
             const argsList = (options || []).filter(Boolean);
             let rotate = false;
@@ -480,27 +457,6 @@ async function handleCommand(args) {
         case 'deps':
             await handleDepsCommand(options);
             break;
-        case 'webtty': {
-            const argsList = (options || []).filter(Boolean);
-            let shellCandidate = null;
-            let rotate = false;
-            for (const arg of argsList) {
-                if (String(arg).startsWith('--')) {
-                    if (arg === '--rotate') rotate = true;
-                } else if (!shellCandidate) {
-                    shellCandidate = arg;
-                }
-            }
-            if (shellCandidate) {
-                const ok = configureWebttyShell(shellCandidate);
-                if (!ok) break;
-                // Apply immediately if workspace start is configured
-                try { await handleCommand(['restart']); } catch (_) { }
-            }
-            if (rotate) await refreshComponentToken('webtty');
-            else ensureComponentToken('webtty');
-            break;
-        }
         case 'dashboard': {
             const rotate = (options || []).includes('--rotate');
             if (rotate) await refreshComponentToken('dashboard');

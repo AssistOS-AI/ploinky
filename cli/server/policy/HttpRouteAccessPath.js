@@ -14,7 +14,6 @@ export const ROUTER_OWNED_FIRST_SEGMENTS = new Set([
     'mcp',
     'auth',
     'admin',
-    'webtty',
     'webchat',
     'dashboard',
     'status',

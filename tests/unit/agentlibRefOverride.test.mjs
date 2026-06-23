@@ -19,7 +19,6 @@ function freshPkg() {
         dependencies: {
             achillesAgentLib: BASE,
             'mcp-sdk': 'git+https://github.com/PloinkyRepos/MCPSDK.git#main',
-            'node-pty': '^1.0.0',
         },
     };
 }
@@ -56,5 +55,4 @@ test('overrideGlobalDeps: blank env leaves deps unchanged', () => {
 test('overrideGlobalDeps: does not touch sibling deps', () => {
     const out = overrideGlobalDeps(freshPkg(), { PLOINKY_AGENTLIB_REF: 'br' });
     assert.equal(out.dependencies['mcp-sdk'], 'git+https://github.com/PloinkyRepos/MCPSDK.git#main');
-    assert.equal(out.dependencies['node-pty'], '^1.0.0');
 });

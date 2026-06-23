@@ -226,7 +226,6 @@ test('resolveMovingGitDepCommits resolves each moving git dep via ls-remote, ski
         {
             achillesAgentLib: 'git+https://github.com/OutfinityResearch/achillesAgentLib.git#master',
             'mcp-sdk': 'git+https://github.com/PloinkyRepos/MCPSDK.git#main',
-            'node-pty': '^1.0.0',
         },
         {
             execFile(command, args) {
@@ -245,7 +244,7 @@ test('resolveMovingGitDepCommits resolves each moving git dep via ls-remote, ski
         achillesAgentLib: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
         'mcp-sdk': 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
     });
-    // node-pty (semver range) is not git, so it is never ls-remote'd.
+    // Only the two moving git dependencies are ls-remote'd.
     assert.equal(calls.length, 2);
     assert.ok(calls.every((c) => c.command === 'git' && c.args[0] === 'ls-remote'));
 });

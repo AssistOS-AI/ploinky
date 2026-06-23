@@ -71,7 +71,6 @@ source "$TESTS_DIR/test-functions/logs_commands.sh"
 source "$TESTS_DIR/test-functions/llm_cli_suggestions.sh"
 source "$TESTS_DIR/test-functions/webchat_tests.sh"
 source "$TESTS_DIR/test-functions/test_sso_params.sh"
-source "$TESTS_DIR/test-functions/webtty_command.sh"
 
 # Re-resolve dependency-test container names like testsAfterStart.sh does.
 SIMULATOR_CONTAINER=$(compute_container_name "simulator" "demo")

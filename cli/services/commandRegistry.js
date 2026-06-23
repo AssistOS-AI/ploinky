@@ -15,8 +15,6 @@ const rawCommands = {
     stop: [],
     destroy: [],
     list: ['agents', 'repos', 'routes'],
-    webconsole: [],
-    webtty: [],
     '/settings': [],
     settings: [],
     client: ['methods', 'status', 'list', 'task', 'task-status'],

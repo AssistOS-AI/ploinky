@@ -334,7 +334,7 @@ Dependency cache paths:
 
 Runtime keys include OS/libc/architecture/Node-major details. Containers are probed by running Node inside the target image. Host sandboxes use keys like `bwrap-<platform>-<arch>-node<major>` or `seatbelt-<platform>-<arch>-node<major>`.
 
-`globalDeps/package.json` supplies core dependencies: `achillesAgentLib`, `mcp-sdk`, `flexsearch`, and `node-pty`.
+`globalDeps/package.json` supplies core dependencies: `achillesAgentLib` and `mcp-sdk`.
 
 For container runtimes, cache installation is done in an ephemeral runtime command:
 

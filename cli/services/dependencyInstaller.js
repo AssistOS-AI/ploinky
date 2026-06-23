@@ -346,7 +346,7 @@ function runNpmInstallInContainer(containerName, workDir, log = debugLog) {
  * Uses CWD mount to write directly to host filesystem at $CWD/.ploinky/agents/<agent>/.
  *
  * This follows the spec:
- * 1. Copy core package.json (4 global deps) to $CWD/.ploinky/agents/<agent>/package.json
+ * 1. Copy core package.json (2 global deps) to $CWD/.ploinky/agents/<agent>/package.json
  * 2. Run npm install in $CWD/.ploinky/agents/<agent>/
  * 3. If agent has package.json in /code, merge and run npm install again
  *
@@ -377,7 +377,7 @@ function installDependencies(containerName, agentName, options = {}) {
         // Ensure agent work dir exists inside container (via CWD mount)
         dockerExec(containerName, `mkdir -p "${agentWorkDir}"`);
 
-        // Step 1: Copy core package.json and install (4 global deps)
+        // Step 1: Copy core package.json and install (2 global deps)
         if (!hasCoreModules || force) {
             log(`[deps] Installing core dependencies for ${agentName}...`);
             const corePackage = readGlobalDepsPackage();
@@ -643,8 +643,8 @@ function syncModuleSubdirectories(moduleName, sourcePath, targetPath, log = debu
  * Read the global dependencies package.json.
  *
  * `globalDeps/package.json` is the single source of truth for every
- * agent's core dependencies (achillesAgentLib, mcp-sdk, flexsearch,
- * node-pty). It is copied into each agent's workspace package.json
+ * agent's core dependencies (achillesAgentLib, mcp-sdk). It is copied
+ * into each agent's workspace package.json
  * at install time and then read from there on every container start.
  *
  * There is deliberately NO hardcoded fallback here — if this file is
@@ -661,7 +661,7 @@ function readGlobalDepsPackage(env = process.env) {
         throw new Error(
             `ploinky globalDeps package.json not found at ${globalPackagePath}. `
             + `This file is required — it defines the core dependencies `
-            + `(achillesAgentLib, mcp-sdk, flexsearch, node-pty) that every `
+            + `(achillesAgentLib, mcp-sdk) that every `
             + `agent installs on setup.`
         );
     }

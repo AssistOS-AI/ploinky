@@ -154,10 +154,10 @@ function completer(line) {
                     completions = repos;
                 }
             } else if (command === 'logs' && subcommand === 'tail') {
-                completions = ['router', 'webtty'];
+                completions = ['router'];
             } else if (command === 'logs' && subcommand === 'last') {
                 // may accept count then optional type; if third token, suggest type
-                if (words.length >= 4) completions = ['router', 'webtty'];
+                if (words.length >= 4) completions = ['router'];
             } else if (command === 'expose') {
                 // expose <EXPOSED> <$VAR|value> <agent>
                 if (words.length >= 4) completions = getAgentNames();

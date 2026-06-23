@@ -8,7 +8,6 @@ source "$TESTS_DIR/test-functions/mcp_tests.sh"
 source "$TESTS_DIR/test-functions/routingserver_aggregation_test.sh"
 source "$TESTS_DIR/test-functions/cli_variable_commands.sh"
 source "$TESTS_DIR/test-functions/router_static_assets.sh"
-source "$TESTS_DIR/test-functions/router_var_check.sh"
 source "$TESTS_DIR/test-functions/check_preinstall_run.sh"
 source "$TESTS_DIR/test-functions/install_command_verification.sh"
 source "$TESTS_DIR/test-functions/health_probes_negative.sh"
@@ -20,7 +19,6 @@ source "$TESTS_DIR/test-functions/devel_agent_verification.sh"
 source "$TESTS_DIR/test-functions/watchdog_restart_services.sh"
 source "$TESTS_DIR/test-functions/webchat_tests.sh"
 source "$TESTS_DIR/test-functions/test_sso_params.sh"
-source "$TESTS_DIR/test-functions/webtty_command.sh"
 source "$TESTS_DIR/test-functions/default_cli_tests.sh"
 source "$TESTS_DIR/test-functions/logs_commands.sh"
 source "$TESTS_DIR/test-functions/disable_repo_test.sh"
@@ -90,9 +88,6 @@ test_check "Watchdog restarts router and agent container" watchdog_restart_servi
 stage_header "Ploinky only var test"
 export FAST_PLOINKY_ONLY="host-env-value"
 test_check "Host-only env var not visible inside container" assert_container_env_absent "$TEST_AGENT_CONT_NAME" "FAST_PLOINKY_ONLY"
-
-stage_header "Router var change"
-test_check "Router rejects legacy WebTTY token auth" fast_router_verify_test_var_dynamic
 
 stage_header "Workspace status command"
 test_check "Status reports SSO disabled" fast_assert_status_contains "- SSO: disabled"
@@ -197,10 +192,6 @@ test_check "Manifest defined ports map correctly" fast_assert_manifest_ports
 stage_header "Devel Agent Verification"
 test_check "Devel agent cwd is the repo source and has RW permissions" fast_assert_devel_agent_workdir "TEST_DEVEL_AGENT_NAME"
 test_check "Manifest dependency devel agent uses repo root" fast_assert_devel_agent_workdir "TEST_AGENT_DEP_DEVEL_NAME"
-
-stage_header "WebTTY Command"
-test_action "Configure WebTTY shell to mock script" configure_mock_webtty_shell
-test_check "webtty command records mock shell configuration" test_webtty_shell
 
 stage_header "MCP Async Tool via CLI"
 test_check "cli tool demo_async_task completes successfully" fast_mcp_demo_async_task

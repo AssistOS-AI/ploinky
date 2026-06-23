@@ -1177,7 +1177,7 @@ async function handleWebChat(req, res, appConfig, appState) {
 
         if (!tab && !effectiveConfig.ttyFactory) {
             res.writeHead(503, { 'Content-Type': 'text/plain' });
-            res.end(effectiveConfig.unavailableReason || 'TTY support unavailable. Install node-pty to enable chat sessions.');
+            res.end(effectiveConfig.unavailableReason || 'WebChat is not available for this agent.');
             return;
         }
 
