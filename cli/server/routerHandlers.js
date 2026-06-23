@@ -2,7 +2,7 @@ import http from 'http';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 
-import { sendJson } from './authHandlers.js';
+import { sendJson } from './authHandlers/index.js';
 import { createAgentClient } from './AgentClient.js';
 import { buildInvocationContextForProviderCall } from './mcp-proxy/index.js';
 import { buildRouterRequest } from './mcp-proxy/invocationMinter.js';

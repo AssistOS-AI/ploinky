@@ -3,7 +3,7 @@ import fs from 'fs';
 import os from 'os';
 import { configCache } from '../utils/configCache.js';
 import { logBootEvent } from '../utils/logger.js';
-import { getAppName } from '../authHandlers.js';
+import { getAppName } from '../authHandlers/index.js';
 import { resolveWebchatCommands, resolveWebchatCommandsForAgent } from '../webchat/commandResolver.js';
 import { PLOINKY_WORKSPACE_ROOT } from '../../services/config.js';
 

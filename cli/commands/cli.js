@@ -291,9 +291,6 @@ async function handleCommand(args) {
                             console.log(`  - ${entry}`);
                         }
                         break;
-                    case 'container-exists':
-                        console.log(`Cannot disable agent '${result.shortAgentName}' because container '${result.containerName}' still exists. Please destroy the container before disabling the agent.`);
-                        break;
                     default:
                         console.log(`No changes made for agent '${target}'.`);
                         break;
@@ -619,6 +616,10 @@ async function handleCommand(args) {
             break;
         }
         case 'stop': {
+            if (options.length) {
+                showHelp(['stop']);
+                break;
+            }
             console.log('[stop] Stopping RoutingServer...');
             killRouterIfRunning();
             console.log('[stop] Stopping configured agent containers...');
@@ -754,7 +755,6 @@ function disableAllAgents() {
 
     const summary = {
         removed: 0,
-        containerExists: 0,
         notFound: 0,
         ambiguous: 0,
         staticRemoved: 0,
@@ -768,10 +768,6 @@ function disableAllAgents() {
             switch (result?.status) {
                 case 'removed':
                     summary.removed += 1;
-                    break;
-                case 'container-exists':
-                    summary.containerExists += 1;
-                    console.log(`- Skipped '${containerName}': container '${result.containerName}' still exists.`);
                     break;
                 case 'not-found':
                     summary.notFound += 1;
@@ -792,7 +788,7 @@ function disableAllAgents() {
         }
     }
 
-    console.log(`Disable agents-all summary: removed=${summary.removed}, container-exists=${summary.containerExists}, not-found=${summary.notFound}, ambiguous=${summary.ambiguous}, static-removed=${summary.staticRemoved}, unchanged=${summary.unchanged}, failed=${summary.failed}`);
+    console.log(`Disable agents-all summary: removed=${summary.removed}, not-found=${summary.notFound}, ambiguous=${summary.ambiguous}, static-removed=${summary.staticRemoved}, unchanged=${summary.unchanged}, failed=${summary.failed}`);
 }
 
 export {

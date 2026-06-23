@@ -107,7 +107,7 @@ test('user admin routes enforce admin access, CRUD, rev invalidation, and agent 
     });
 
     const nonce = Date.now();
-    const authHandlers = await import(`${pathToFileURL(path.join(REPO_ROOT, 'cli/server/authHandlers.js')).href}?test=${nonce}`);
+    const authHandlers = await import(`${pathToFileURL(path.join(REPO_ROOT, 'cli/server/authHandlers/index.js')).href}?test=${nonce}`);
     const localService = await import(`${pathToFileURL(path.join(REPO_ROOT, 'cli/server/auth/localService.js')).href}?test=${nonce}`);
     const passwordStore = await import(`${pathToFileURL(path.join(REPO_ROOT, 'cli/services/encryptedPasswordStore.js')).href}?test=${nonce}`);
     const passwords = await import(`${pathToFileURL(path.join(REPO_ROOT, 'cli/services/localAuthPasswords.js')).href}?test=${nonce}`);

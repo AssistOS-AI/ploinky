@@ -10,7 +10,7 @@ import {
     parseManifestPorts,
     containerExists,
     isContainerRunning,
-    collectLiveAgentContainers
+    stopAndRemove
 } from './docker/index.js';
 import { findAgent } from './utils.js';
 import { REPOS_DIR, PLOINKY_WORKSPACE_ROOT } from './config.js';
@@ -476,42 +476,6 @@ export function disableAgent(agentRef) {
 
     const [containerName, record] = matches[0];
 
-    let isActive = false;
-    try {
-        const liveSet = new Set((collectLiveAgentContainers() || []).map(item => item.containerName));
-        if (liveSet.size && liveSet.has(containerName)) {
-            isActive = true;
-        }
-    } catch (_) {}
-
-    if (!isActive) {
-        try {
-            if (isContainerRunning(containerName)) {
-                isActive = true;
-            }
-        } catch (_) {}
-    }
-
-    if (!isActive) {
-        try {
-            if (containerExists(containerName)) {
-                isActive = true;
-            }
-        } catch (error) {
-            // If we cannot determine container existence, err on the safe side
-            isActive = true;
-        }
-    }
-
-    if (isActive) {
-        return {
-            status: 'container-exists',
-            containerName,
-            shortAgentName: record.agentName,
-            repoName: record.repoName
-        };
-    }
-
     delete map[containerName];
 
     clearStaticConfig({
@@ -522,6 +486,12 @@ export function disableAgent(agentRef) {
     });
 
     saveAgents(map);
+
+    try {
+        stopAndRemove(containerName);
+    } catch (error) {
+        throw new Error(`disable agent: failed to stop and remove container '${containerName}': ${error?.message || error}`);
+    }
 
     // Remove workspace structure for the agent
     try {

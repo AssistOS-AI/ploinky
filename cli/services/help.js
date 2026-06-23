@@ -41,7 +41,7 @@ export function showHelp(args = []) {
   client status <agent>          One-line status (HTTP code, parsed)
 
   status | restart               Show state | restart enabled agents + Router
-  disable agents-all             Disable all enabled agents (non-destructive)
+  disable agents-all             Disable all enabled agents and remove their containers
   reinstall <agentName>          Re-create a running agent container (destructive)
   stop | shutdown | clean        Stop containers | remove containers
   logs tail [router]             Follow router logs
@@ -200,6 +200,12 @@ function showDetailedHelp(topic, subtopic, subsubtopic) {
             examples: ['shutdown'],
             notes: 'Removes containers for all enabled agents in this workspace.'
         },
+        'stop': {
+            description: 'Stop the router and all configured agent runtimes.',
+            syntax: 'stop',
+            examples: ['stop'],
+            notes: 'Stops the watchdog/router first, then stops configured agent runtimes without removing enabled-agent records.'
+        },
         'destroy': {
             description: 'Stop and remove all Ploinky containers created in this workspace',
             syntax: 'destroy',
@@ -335,14 +341,14 @@ function showDetailedHelp(topic, subtopic, subsubtopic) {
                 },
                 'agent': {
                     syntax: 'disable <agentName>',
-                    description: 'Remove an enabled agent from .ploinky/agents.json (container must be destroyed first)',
+                    description: 'Remove an enabled agent from .ploinky/agents.json, then stop and remove its container',
                     examples: [ 'disable demo', 'disable agent repoName/demo' ]
                 },
                 'agents-all': {
                     syntax: 'disable agents-all',
-                    description: 'Attempt to disable all enabled agents from .ploinky/agents.json without destroying containers',
+                    description: 'Disable all enabled agents from .ploinky/agents.json and remove their containers',
                     examples: [ 'disable agents-all' ],
-                    notes: 'Non-destructive: agents with existing containers are reported and skipped. Use stop/destroy first for full cleanup.'
+                    notes: 'Registry entries are removed before containers are stopped so the watchdog does not restart them.'
                 }
             }
         },

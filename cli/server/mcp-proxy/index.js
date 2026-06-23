@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { sendJson, ensureAuthenticated } from '../authHandlers.js';
+import { sendJson, ensureAuthenticated } from '../authHandlers/index.js';
 import { createAgentClient } from '../AgentClient.js';
 import { waitForAgentReady } from '../utils/agentReadiness.js';
 import {

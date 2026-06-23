@@ -19,7 +19,7 @@ import {
     handleMarketplaceRoutes,
     handleUserAdminRoutes,
     resolveRouteDefaultHttpAccess,
-} from './authHandlers.js';
+} from './authHandlers/index.js';
 import {
     loadApiRoutes,
     handleRouterMcp,

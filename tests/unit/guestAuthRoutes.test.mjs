@@ -169,7 +169,7 @@ async function withAuthModules(t, options = {}) {
     });
 
     const nonce = `${Date.now()}-${Math.random()}`;
-    const authHandlers = await import(`${pathToFileURL(path.join(REPO_ROOT, 'cli/server/authHandlers.js')).href}?test=${nonce}`);
+    const authHandlers = await import(`${pathToFileURL(path.join(REPO_ROOT, 'cli/server/authHandlers/index.js')).href}?test=${nonce}`);
     const localService = await import(`${pathToFileURL(path.join(REPO_ROOT, 'cli/server/auth/localService.js')).href}?test=${nonce}`);
     return { authHandlers, localService, authService: authHandlers.authService };
 }

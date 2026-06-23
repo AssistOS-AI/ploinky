@@ -1,4 +1,4 @@
-import { sendJson } from './authHandlers.js';
+import { sendJson } from './authHandlers/index.js';
 import { readJsonBody } from './handlers/common.js';
 import { Caller } from './policy/Caller.js';
 import { buildUserApiKeyResult } from '../services/soulGatewayUserKey.js';
