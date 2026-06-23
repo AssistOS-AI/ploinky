@@ -1258,10 +1258,18 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
             ensureManifestVolumeHostPaths(manifest);
             syncAgentMcpConfig(containerName, agentPath, agentName);
             try {
-                execSync(`${runtime} start ${containerName}`, { stdio: 'inherit' });
+                // Capture stderr so an expected reuse failure does not dump an
+                // alarming raw runtime error. The common case is a prepared
+                // dependency cache that `ploinky update` removed (a moving git dep
+                // advanced): the container's node_modules bind-mount source is gone,
+                // so `podman start` fails its getxattr check. We recreate from
+                // scratch below, which rebuilds the cache cleanly.
+                execSync(`${runtime} start ${containerName}`, { stdio: ['ignore', 'inherit', 'pipe'] });
             } catch (e) {
                 canReuseExisting = false;
-                console.warn(`[ensureAgentService] ${agentName}: existing container failed to start; recreating (${e.message})`);
+                const detail = String(e?.stderr || '').trim() || e?.message || 'unknown error';
+                console.log(`[start] ${agentName}: cannot reuse existing container; recreating.`);
+                debugLog(`[ensureAgentService] ${agentName}: reuse via '${runtime} start' failed (${detail}); recreating.`);
                 removeContainerForRecreate(runtime, containerName, `ensureAgentService:${agentName}:failedStart`);
             }
             if (canReuseExisting && withParallelAgent) {

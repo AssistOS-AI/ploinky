@@ -189,12 +189,28 @@ export function invalidateDepsCacheForMovingGitDeps(commits, { depsDir = DEPS_DI
     }
 
     const marker = readGitDepsMarker(depsDir);
-    const previous = (marker && marker.commits) || {};
+    // No marker yet — e.g. a fresh deploy that built caches (and created
+    // containers bind-mounting them) without ever recording commits. We have no
+    // evidence anything moved, so adopt the current commits as the baseline and
+    // do NOT wipe: deleting now would force an unnecessary rebuild and, worse,
+    // remove the node_modules dirs the existing containers bind-mount, breaking
+    // `podman start` on the next restart. Future real moves are caught once the
+    // baseline exists.
+    if (!marker) {
+        writeGitDepsMarker(depsDir, resolved);
+        return { invalidated: false, reason: 'baseline recorded', changed: [], previous: null, current: resolved };
+    }
+
+    const previous = marker.commits || {};
     const changed = names.filter((name) => previous[name] !== resolved[name]);
-    if (marker && changed.length === 0) {
+    if (changed.length === 0) {
         return { invalidated: false, reason: 'unchanged', changed: [], previous };
     }
 
+    // A tracked moving git dep actually advanced. Every cache embeds it, so all
+    // are stale: remove them so the next container (re)creation rebuilds from a
+    // clean `npm install` that fetches the new commit. (`ploinky update` is
+    // expected to be followed by `ploinky restart`, which recreates containers.)
     const removed = [];
     for (const sub of [path.join(depsDir, 'global'), path.join(depsDir, 'agents')]) {
         if (fs.existsSync(sub)) {
@@ -204,13 +220,13 @@ export function invalidateDepsCacheForMovingGitDeps(commits, { depsDir = DEPS_DI
     }
     const current = { ...previous, ...resolved };
     writeGitDepsMarker(depsDir, current);
-    const description = changed.length
-        ? changed.map((name) => `${name} ${previous[name] || '(none)'} -> ${resolved[name]}`).join(', ')
-        : 'initial marker';
+    const description = changed
+        .map((name) => `${name} ${previous[name] || '(none)'} -> ${resolved[name]}`)
+        .join(', ');
     log(`[deps-cache] invalidated dependency caches: ${description}`);
     return {
         invalidated: true,
-        reason: marker ? 'commits changed' : 'no marker',
+        reason: 'commits changed',
         changed,
         previous,
         current,
