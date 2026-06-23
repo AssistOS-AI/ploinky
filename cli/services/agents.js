@@ -10,6 +10,7 @@ import {
     parseManifestPorts,
     containerExists,
     isContainerRunning,
+    waitForContainerRunning,
     stopAndRemove,
     ensureAgentService
 } from './docker/index.js';
@@ -82,6 +83,21 @@ function buildDefaultLocalAuthVars(routeKey) {
     return {
         usersVar: `PLOINKY_AUTH_${suffix}_USERS`
     };
+}
+
+export function verifyEnabledAgentStarted(shortAgentName, containerName, {
+    isRunning = isContainerRunning,
+    waitRunning = waitForContainerRunning,
+    log = console.log
+} = {}) {
+    if (!containerName) {
+        throw new Error(`enable agent: failed to start '${shortAgentName}': no container was returned.`);
+    }
+    const running = isRunning(containerName) || waitRunning(containerName, 8, 250);
+    if (!running) {
+        throw new Error(`enable agent: failed to start '${shortAgentName}': container '${containerName}' exited during startup. Check container logs for details.`);
+    }
+    log(`Agent '${shortAgentName}' started successfully in container '${containerName}'.`);
 }
 
 function parsePloinkyDirectives(rawValue) {
@@ -390,6 +406,7 @@ export function enableAgent(agentName, mode, repoNameParam, aliasParam, authMode
 
     let started = null;
     try {
+        console.log(`Starting agent '${shortAgentName}' from repo '${repoName}'...`);
         started = ensureAgentService(shortAgentName, manifest, agentPath, {
             containerName,
             alias: alias || undefined,
@@ -398,6 +415,7 @@ export function enableAgent(agentName, mode, repoNameParam, aliasParam, authMode
     } catch (error) {
         throw new Error(`enable agent: failed to start '${shortAgentName}': ${error?.message || error}`);
     }
+    verifyEnabledAgentStarted(shortAgentName, started?.containerName || containerName);
 
     const hostPort = started?.hostPort || preferredHostPort || existingRoute.hostPort;
     routing.routes[routeKey] = {
