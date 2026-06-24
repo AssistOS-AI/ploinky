@@ -98,7 +98,7 @@ There is one delegated-user path: a verified source agent may call an `authentic
 
 `http.route.list` is not the effective view because manifest, service, and route-default decisions are runtime inputs. `http.route.check` is the diagnostic path for the effective decision and includes the source that won.
 
-The router-owned Marketplace API under `/api/marketplace` is not administered through MCP policy and is not controlled by HTTP route access. `GET /api/marketplace` must require an authenticated local or SSO user. `POST /api/marketplace` is an administrative surface and must require an authenticated local admin user before mutating repository and agent marketplace state. The POST action body may add, enable, and disable repositories, enable agents through the standard registry path, and perform marketplace-specific agent deactivation as defined by DS005.
+The router-owned Marketplace API under `/api/marketplace` is not administered through MCP policy and is not controlled by HTTP route access. `GET /api/marketplace` must require an authenticated local or SSO user. `POST /api/marketplace` is an administrative surface and must require an authenticated local admin user before mutating repository and agent marketplace state. The POST action body may install and uninstall repositories through `install_repo` and `uninstall_repo`, enable agents through the standard registry path, and perform marketplace-specific agent deactivation as defined by DS005.
 
 ### Tag Bootstrap and Persistence
 

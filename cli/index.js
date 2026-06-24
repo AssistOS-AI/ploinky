@@ -34,8 +34,10 @@ function completer(line) {
         const subcommands = COMMANDS[command];
 
         // Determine the context for completion
-        if (line.endsWith(' ')) {
-            if (words.length === 1 && subcommands.length > 0 && command !== 'reinstall' && command !== 'update') {
+            if (line.endsWith(' ')) {
+            if ((command === 'add' || command === 'install' || command === 'remove' || command === 'uninstall') && words.length === 1) {
+                context = 'args';
+            } else if (words.length === 1 && subcommands.length > 0 && command !== 'reinstall' && command !== 'update') {
                 context = 'subcommands';
             } else if (command === 'help' && words.length === 1) {
                 // For help command, show all available commands
@@ -81,7 +83,9 @@ function completer(line) {
             }
         } else {
             if (words.length === 1) context = 'commands';
-            else if (words.length === 2 && subcommands.length > 0) {
+            else if ((command === 'add' || command === 'install' || command === 'remove' || command === 'uninstall') && words.length === 2) {
+                context = 'args';
+            } else if (words.length === 2 && subcommands.length > 0) {
                 if ((command === 'disable' || command === 'reinstall' || command === 'update') && !subcommands.includes(words[1])) {
                     context = 'args';
                 } else {
@@ -162,22 +166,19 @@ function completer(line) {
                 // expose <EXPOSED> <$VAR|value> <agent>
                 if (words.length >= 4) completions = getAgentNames();
             } else if (command === 'disable') {
-                if (subcommand === 'repo') {
-                    completions = getPredefinedRepoNames();
-                } else if (subcommand === 'sandbox') {
+                if (subcommand === 'sandbox') {
                     completions = [];
                 } else {
                     completions = [...new Set(['sandbox', 'agents-all', ...getAgentNames()])];
                 }
             } else if (command === 'enable' && subcommand === 'sandbox') {
                 completions = [];
-            } else if (command === 'enable' && subcommand === 'repo') {
-                completions = getPredefinedRepoNames();
+            } else if (command === 'remove' || command === 'uninstall') {
+                completions = getRepoNames();
+            } else if (command === 'add' || command === 'install') {
+                completions = [];
             } else if (command === 'sandbox') {
                 completions = COMMANDS.sandbox;
-            } else if (command === 'add' && subcommand === 'repo') {
-                // For add repo, show predefined repo names
-                completions = getPredefinedRepoNames();
             } else if (command === 'default-skills') {
                 const predefined = Object.keys(getPredefinedRepos() || {});
                 completions = Array.from(new Set([...getRepoNames(), ...predefined])).sort();

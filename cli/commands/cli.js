@@ -28,16 +28,16 @@ import * as inputState from '../services/inputState.js';
 import {
     getRepoNames,
     getAgentNames,
+    installRepo,
     addRepo,
+    uninstallRepo,
     updateRepo,
     updatePloinkyRepos,
     updateAllRepos,
-    enableRepo,
-    disableRepo,
     enableAgent,
     findAgentManifest,
 } from './repoAgentCommands.js';
-import { getPredefinedRepos, loadEnabledRepos, parseStartArgs } from '../services/repos.js';
+import { parseStartArgs } from '../services/repos.js';
 import { resolveAgentlibBranchRef } from '../services/dependencyInstaller.js';
 import {
     handleVarsCommand,
@@ -155,38 +155,29 @@ function parseEnableAgentArgs(rawOptions = []) {
     };
 }
 
-function parseRepoBranchArgs(options = [], nameIndex = 1) {
-    const branchIdx = options.indexOf('--branch');
+function parseInstallRepoArgs(options = []) {
+    const tokens = [...options];
+    const branchIdx = tokens.indexOf('--branch');
     let branch = null;
-    if (branchIdx !== -1 && options[branchIdx + 1]) {
-        branch = options[branchIdx + 1];
-    } else if (options[nameIndex + 1] && !String(options[nameIndex + 1]).startsWith('--')) {
-        branch = options[nameIndex + 1];
+    if (branchIdx !== -1 && tokens[branchIdx + 1]) {
+        branch = tokens[branchIdx + 1];
+        tokens.splice(branchIdx, 2);
     }
-    return { name: options[nameIndex], branch };
+    if (String(tokens[0] || '').toLowerCase() === 'repo') {
+        tokens.shift();
+    }
+    const url = tokens[0];
+    const name = tokens[1] || null;
+    if (!branch && tokens[2]) branch = tokens[2];
+    return { url, name, branch };
 }
 
-function isKnownRepoName(name) {
-    const target = String(name || '').trim();
-    if (!target) return false;
-    const installed = getRepoNames();
-    if (installed.includes(target)) return true;
-    try {
-        if (loadEnabledRepos().includes(target)) return true;
-    } catch (_) {}
-    const predefined = getPredefinedRepos() || {};
-    return Object.prototype.hasOwnProperty.call(predefined, target);
-}
-
-function canResolveAgentName(name) {
-    const target = String(name || '').trim();
-    if (!target) return false;
-    try {
-        findAgent(target);
-        return true;
-    } catch (_) {
-        return false;
+function parseUninstallRepoTarget(options = []) {
+    const tokens = [...options];
+    if (String(tokens[0] || '').toLowerCase() === 'repo') {
+        tokens.shift();
     }
+    return tokens[0];
 }
 
 function hasAgentEnableSyntax(options = []) {
@@ -194,39 +185,6 @@ function hasAgentEnableSyntax(options = []) {
         const normalized = String(token || '').trim().toLowerCase();
         return agentsSvc.isEnableAgentMode(normalized) || ENABLE_AGENT_CLI_TOKEN_SET.has(normalized);
     });
-}
-
-function hasRepoBranchSyntax(options = []) {
-    if (options.includes('--branch')) return true;
-    const second = String(options[1] || '').trim().toLowerCase();
-    return Boolean(second) && !agentsSvc.isEnableAgentMode(second);
-}
-
-function resolveDirectEnableTarget(options = []) {
-    const target = String(options[0] || '').trim();
-    if (!target) return { type: 'missing' };
-    if (target.includes('/') || target.includes(':') || hasAgentEnableSyntax(options)) {
-        return { type: 'agent' };
-    }
-    if (hasRepoBranchSyntax(options)) {
-        return { type: 'repo' };
-    }
-    const repoMatch = isKnownRepoName(target);
-    const agentMatch = canResolveAgentName(target);
-    if (repoMatch && agentMatch) return { type: 'ambiguous', target };
-    if (repoMatch) return { type: 'repo' };
-    return { type: 'agent' };
-}
-
-function resolveDirectDisableTarget(options = []) {
-    const target = options.join(' ').trim();
-    if (!target) return { type: 'missing' };
-    if (target.includes('/') || target.includes(':')) return { type: 'agent', target };
-    const repoMatch = isKnownRepoName(target);
-    const agentMatch = canResolveAgentName(target);
-    if (repoMatch && agentMatch) return { type: 'ambiguous', target };
-    if (repoMatch) return { type: 'repo', target };
-    return { type: 'agent', target };
 }
 
 
@@ -245,17 +203,20 @@ async function handleCommand(args) {
             break;
         // 'agent' command removed; use 'enable agent <agentName>' then 'start'
         case 'add':
-            if (options[0] === 'repo') {
-                const branchIdx = options.indexOf('--branch');
-                let branch = null;
-                if (branchIdx !== -1 && options[branchIdx + 1]) {
-                    branch = options[branchIdx + 1];
-                } else if (options[3] && !options[3].startsWith('--')) {
-                    branch = options[3];
-                }
-                addRepo(options[1], options[2], branch);
+            {
+                const parsed = parseInstallRepoArgs(options);
+                addRepo(parsed.url, parsed.name, parsed.branch);
             }
-            else showHelp();
+            break;
+        case 'install':
+            {
+                const parsed = parseInstallRepoArgs(options);
+                installRepo(parsed.url, parsed.name, parsed.branch);
+            }
+            break;
+        case 'remove':
+        case 'uninstall':
+            uninstallRepo(parseUninstallRepoTarget(options));
             break;
         case 'vars':
             handleVarsCommand();
@@ -297,11 +258,7 @@ async function handleCommand(args) {
             break;
         }
         case 'enable':
-            if (options[0] === 'repo') {
-                const { name, branch } = parseRepoBranchArgs(options, 1);
-                enableRepo(name, branch);
-            }
-            else if (options[0] === 'agent') {
+            if (options[0] === 'agent') {
                 const parsed = parseEnableAgentArgs(options.slice(1));
                 await enableAgent(parsed.agentName, parsed.mode, parsed.repoName, parsed.alias, parsed.authMode, parsed.username, parsed.password);
             }
@@ -309,18 +266,8 @@ async function handleCommand(args) {
                 enableHostSandbox();
             }
             else {
-                const resolved = resolveDirectEnableTarget(options);
-                if (resolved.type === 'missing') {
+                if (!options.length) {
                     showHelp();
-                    break;
-                }
-                if (resolved.type === 'ambiguous') {
-                    console.log(`Target '${resolved.target}' matches both an agent and a repository. Use 'enable agent ${resolved.target}' or 'enable repo ${resolved.target}'.`);
-                    break;
-                }
-                if (resolved.type === 'repo') {
-                    const { name, branch } = parseRepoBranchArgs(options, 0);
-                    enableRepo(name, branch);
                     break;
                 }
                 const parsed = parseEnableAgentArgs(options);
@@ -344,11 +291,6 @@ async function handleCommand(args) {
                 break;
             }
 
-            if (options[0] === 'repo') {
-                disableRepo(options[1]);
-                break;
-            }
-
             if (['sandbox', 'host-sandbox', 'lite-sandbox'].includes(String(options[0] || '').toLowerCase())) {
                 disableHostSandbox();
                 break;
@@ -357,21 +299,6 @@ async function handleCommand(args) {
             let target = options.join(' ').trim();
             if (options[0] === 'agent') {
                 target = options.slice(1).join(' ').trim();
-            } else {
-                const resolved = resolveDirectDisableTarget(options);
-                if (resolved.type === 'missing') {
-                    showHelp();
-                    break;
-                }
-                if (resolved.type === 'ambiguous') {
-                    console.log(`Target '${resolved.target}' matches both an agent and a repository. Use 'disable agent ${resolved.target}' or 'disable repo ${resolved.target}'.`);
-                    break;
-                }
-                if (resolved.type === 'repo') {
-                    disableRepo(resolved.target);
-                    break;
-                }
-                target = resolved.target;
             }
 
             if (!target) {
@@ -859,9 +786,9 @@ export {
     getAgentNames,
     getRepoNames,
     findAgentManifest,
+    installRepo,
     addRepo,
-    enableRepo,
-    disableRepo,
+    uninstallRepo,
     listAgents,
     listRepos,
     listCurrentAgents,

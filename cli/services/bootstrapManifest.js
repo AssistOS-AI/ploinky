@@ -171,7 +171,6 @@ function ensurePrefixedRepoInstalled(spec, branchPolicy) {
             branch: source.branch,
             stdio: 'inherit',
         });
-        repos.enableRepo(repoName);
     } catch (err) {
         if (isStrictBranchPolicy(branchPolicy)) {
             throw new Error(`Auto-install repo '${repoName}' failed: ${errorMessage(err)}`);
@@ -280,14 +279,6 @@ async function applyManifestDirectivesInternal(agentNameOrPath, {
                     throw new Error(`[manifest repos] Failed to install repo '${name}': ${errorMessage(err)}`);
                 }
                 console.error(`[manifest repos] Failed to install repo '${name}': ${errorMessage(err)}`);
-            }
-            try {
-                repos.enableRepo(name);
-            } catch (err) {
-                if (isStrictBranchPolicy(branchPolicy)) {
-                    throw new Error(`[manifest repos] Failed to enable repo '${name}': ${errorMessage(err)}`);
-                }
-                console.error(`[manifest repos] Failed to enable repo '${name}': ${errorMessage(err)}`);
             }
         }
     }

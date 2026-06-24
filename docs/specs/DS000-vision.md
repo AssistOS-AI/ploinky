@@ -16,7 +16,7 @@ The repository also carries local maintenance skills under `.agents/skills/`, bu
 
 ## Core Content
 
-Ploinky must let an operator clone or enable repositories, discover agents from `manifest.json`, register enabled agents in `.ploinky/agents.json`, and start a workspace whose routing state is written to `.ploinky/routing.json`. The first-class user entry points are the `ploinky` and `p-cli` launchers, the `ploinky-shell` assistant shell, and the router-managed browser surfaces served on the configured static-agent port.
+Ploinky must let an operator install and uninstall repositories, discover agents from `manifest.json` in installed repositories, register enabled agents in `.ploinky/agents.json`, and start a workspace whose routing state is written to `.ploinky/routing.json`. The first-class user entry points are the `ploinky` and `p-cli` launchers, the `ploinky-shell` assistant shell, and the router-managed browser surfaces served on the configured static-agent port.
 
 The runtime must treat `.ploinky/` as the persistent boundary for workspace state. Agent working directories, cloned repositories, dependency caches, logs, keys, transcripts, and workspace configuration all live under that root. This repository must not describe alternate storage layouts as if they were equivalent unless they are implemented in code.
 

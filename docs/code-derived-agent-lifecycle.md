@@ -29,8 +29,7 @@ All relative paths below are relative to the workspace directory where `ploinky`
 | Path | Purpose |
 | --- | --- |
 | `.ploinky/agents.json` | Enabled-agent registry plus `_config` values such as static start config and sandbox setting. |
-| `.ploinky/enabled_repos.json` | Enabled repository names. If empty, installed repos are treated as active by repo listing/discovery code. |
-| `.ploinky/repo_sources.json` | Remembered repo URLs/branches for later update/reinstall. |
+| `.ploinky/repo_sources.json` | Remembered repo URLs, branches, and repository kind for later update/reinstall and Marketplace categorization. |
 | `.ploinky/repos/<repo>` | Cloned agent repositories. Agent manifests are found below this tree. |
 | `.ploinky/agents/<agent>` | Per-agent work directory for isolated mode and local runtime data. Disable preserves it. |
 | `.ploinky/code/<agent>` | Symlink to the agent's `code/` directory when present, otherwise to the agent root. |
@@ -64,15 +63,14 @@ The command surface is split between the registry in `cli/services/commandRegist
 | Command | Main behavior |
 | --- | --- |
 | `help` | Prints generated help from `cli/services/help.js`. |
-| `add repo <name> [url] [branch]` | Clones or records a repo under `.ploinky/repos/<name>` and stores source metadata. |
+| `install [repo] <url> [name] [branch]` / `add [repo] <url> [name] [branch]` | Clones a repo under `.ploinky/repos/<name>`, deriving the name from the URL when omitted, and stores source metadata. |
+| `uninstall [repo] <name-or-url>` / `remove [repo] <name-or-url>` | Disables enabled agents from that repo by container key, removes their runtime containers, removes `.ploinky/repos/<name>`, and preserves source metadata for reinstall. |
 | `update repo <name>` | Updates one installed repo with `git pull --rebase --autostash` or reclones a non-git repo when source metadata exists. |
 | `update repos` | Updates installed Ploinky repos and refreshes runtime Achilles dependencies. |
 | `update all [folder]` | Updates the Ploinky runtime, installed repos, discovered workspace git repos, and default skills for discovered repos. |
 | `reinstall [agent]` / `reinstall agent <agent>` | Removes the running service for an enabled agent, recreates it with `ensureAgentService`, updates routing, and starts the router if needed. |
-| `enable repo <name> [branch]` | Ensures a predefined or remembered repo is cloned, rejects skills-only repos, and adds it to `.ploinky/enabled_repos.json`. |
 | `enable agent <agent> [global|devel <repo>]` | Resolves an agent manifest, writes an enabled-agent record to `.ploinky/agents.json`, and creates work dirs/symlinks. |
 | `enable sandbox` | Allows host sandbox runtimes for manifests with `lite-sandbox: true`. |
-| `disable repo <name>` | Removes a repo from the enabled repo list. |
 | `disable agent <agent>` | Removes an enabled-agent record only if no live/stopped container or sandbox process exists for it. Symlinks are removed; the work dir is preserved. |
 | `disable agents-all` | Tries to disable all enabled agents and skips ones with live/stopped runtime state. |
 | `disable sandbox` | Disables host sandbox runtimes, causing `lite-sandbox` agents to fall back to containers. |
@@ -87,7 +85,7 @@ The command surface is split between the registry in `cli/services/commandRegist
 | `clean` | Destroys all workspace containers. It does not explicitly kill the router in the command implementation. |
 | `status` | Prints SSO status, router status, repo status, and enabled/running agent state. |
 | `list agents` | Lists manifest-bearing agent directories in active repos. |
-| `list repos` | Lists predefined, installed, and enabled repos. |
+| `list repos` | Lists predefined, installed, and remembered source repos. |
 | `list routes` | Prints `.ploinky/routing.json`. |
 | `shell <agent>` | Ensures the agent service is running, then attaches an interactive shell. |
 | `cli <agent> [args]` | Ensures the agent service is running, then attaches the manifest CLI command or default CLI script. |
@@ -588,7 +586,7 @@ sequenceDiagram
 
 Router-owned paths include `/health`, `/mcp`, `/agent-card`, `/auth/*`, `/api/agents/*`, `/api/marketplace`, `/webtty`, `/webchat`, `/dashboard`, `/status`, `/upload`, `/blobs`, `/workspace-files`, `/metrics`, `/admin`, and `/__agent`.
 
-`/api/marketplace` is a first-party JSON management API for the Marketplace plugin. GET requires an authenticated local or SSO user and returns repository, agent, enabled-registry, and live runtime-status data. POST requires a local admin session and supports repository addition, repository enable/disable, agent activation, and marketplace-specific agent deactivation. Repository enable/disable follows the CLI repository contract and only updates `enabled_repos.json`; it does not stop running agents or remove enabled-agent records. Marketplace deactivation removes the enabled-agent registry entry before removing the runtime container; the ordinary `disable agent` CLI command remains conservative and refuses to remove records while runtime state exists.
+`/api/marketplace` is a first-party JSON management API for the Marketplace plugin. GET requires an authenticated local or SSO user and returns repository, source metadata, repository kind, agent, enabled-registry, and live runtime-status data. POST requires a local admin session and supports `install_repo`, `uninstall_repo`, `enable_agent`, and marketplace-specific `disable_agent`. Repository install requires a URL, accepts an optional name and branch, clones the checkout, and records source metadata. Repository uninstall disables enabled agents from that repo by container key, removes their runtime containers, removes the checkout, and preserves `repo_sources.json` metadata so the repo can be installed again. Marketplace deactivation removes the enabled-agent registry entry before removing the runtime container; the ordinary direct `disable agent` CLI command remains conservative and refuses to remove records while runtime state exists.
 
 Agent routes are stored under `routing.routes[routeKey]`. The route key is the alias when present, otherwise the short agent name. A plain `/` request redirects to the static route's `/index.html` when a static route exists.
 

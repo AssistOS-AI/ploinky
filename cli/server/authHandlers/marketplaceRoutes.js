@@ -36,6 +36,11 @@ function normalizeMarketplaceRepoName(value) {
     return name;
 }
 
+function normalizeOptionalMarketplaceRepoName(value) {
+    const name = String(value || '').trim();
+    return name ? normalizeMarketplaceRepoName(name) : null;
+}
+
 function normalizeMarketplaceUrl(value) {
     const url = String(value || '').trim();
     if (!url) throw new Error('missing_repository_url');
@@ -61,9 +66,13 @@ function normalizeMarketplaceEnableMode(value) {
     return mode;
 }
 
-function isSkillsOnlyRepoError(error) {
-    const message = String(error?.message || error || '');
-    return /skills-only repo|contains only skills/i.test(message);
+function disableMarketplaceAgentsForRepo(repoName) {
+    const targetRepo = String(repoName || '').trim();
+    if (!targetRepo) return [];
+    const containerNames = Object.entries(workspaceSvc.loadAgents())
+        .filter(([, record]) => record && record.type === 'agent' && record.repoName === targetRepo && record.agentName)
+        .map(([containerName]) => containerName);
+    return agentsSvc.disableAgentContainers(containerNames);
 }
 
 function normalizeMarketplaceContainerSegment(value) {
@@ -78,8 +87,8 @@ function marketplaceContainerMatchesAgent(containerName, repoName, agentName) {
 function buildMarketplaceState(user = null) {
     const reposDir = path.join(PLOINKY_DIR, 'repos');
     const predefined = reposSvc.getPredefinedRepos();
+    const sources = reposSvc.getRepoSources();
     const installed = new Set(reposSvc.getInstalledRepos(reposDir));
-    const enabled = new Set(reposSvc.loadEnabledRepos());
     const enabledAgents = Object.entries(workspaceSvc.loadAgents())
         .filter(([, record]) => record && record.type === 'agent')
         .map(([containerName, record]) => ({
@@ -96,17 +105,18 @@ function buildMarketplaceState(user = null) {
         activeAgentsByRepo.set(repoName, (activeAgentsByRepo.get(repoName) || 0) + 1);
     }
     const bootRepos = new Set(reposSvc.getDefaultBootRepos().map(repo => repo.name));
-    const repoNames = new Set([...Object.keys(predefined), ...installed]);
+    const repoNames = new Set([...Object.keys(predefined), ...Object.keys(sources), ...installed]);
     const repositories = [...repoNames].sort((left, right) => left.localeCompare(right)).map((name) => {
         const predefinedEntry = predefined[name] || {};
+        const sourceEntry = sources[name] || {};
         return {
             name,
-            url: predefinedEntry.url || '',
+            url: predefinedEntry.url || sourceEntry.url || '',
             description: predefinedEntry.description || '',
-            kind: predefinedEntry.kind || reposSvc.classifyRepoKind(name),
+            kind: predefinedEntry.kind || sourceEntry.kind || reposSvc.classifyRepoKind(name),
             installed: installed.has(name),
-            enabled: enabled.has(name),
             default: bootRepos.has(name),
+            branch: sourceEntry.branch || '',
             activeAgentsCount: activeAgentsByRepo.get(name) || 0
         };
     });
@@ -235,26 +245,11 @@ export async function handleMarketplaceRoutes(req, res, parsedUrl) {
 
         const action = String(body?.action || '').trim();
         try {
-            if (action === 'add_repository') {
-                const name = normalizeMarketplaceRepoName(body?.name);
+            if (action === 'install_repo') {
                 const url = normalizeMarketplaceUrl(body?.url);
+                const name = normalizeOptionalMarketplaceRepoName(body?.name);
                 const branch = String(body?.branch || '').trim() || null;
-                const addResult = reposSvc.addRepo(name, url, branch, { stdio: 'pipe' });
-                let result = addResult;
-                try {
-                    reposSvc.enableRepo(name, branch, { stdio: 'pipe' });
-                    result = { ...addResult, enabled: true };
-                } catch (error) {
-                    if (!isSkillsOnlyRepoError(error)) {
-                        throw error;
-                    }
-                    result = {
-                        ...addResult,
-                        enabled: false,
-                        skillsOnly: true,
-                        message: error?.message || `Repo '${name}' contains only skills.`
-                    };
-                }
+                const result = reposSvc.installRepo(url, name, branch, { stdio: 'pipe' });
                 sendJson(res, 200, {
                     ok: true,
                     action,
@@ -264,22 +259,14 @@ export async function handleMarketplaceRoutes(req, res, parsedUrl) {
                 return true;
             }
 
-            if (action === 'enable_repository') {
-                const name = normalizeMarketplaceRepoName(body?.name);
-                const branch = String(body?.branch || '').trim() || null;
-                const result = reposSvc.enableRepo(name, branch, { stdio: 'pipe' });
-                sendJson(res, 200, {
-                    ok: true,
-                    action,
-                    result,
-                    marketplace: buildMarketplaceState(req.user)
-                });
-                return true;
-            }
-
-            if (action === 'disable_repository') {
-                const name = normalizeMarketplaceRepoName(body?.name);
-                const result = reposSvc.disableRepo(name);
+            if (action === 'uninstall_repo') {
+                const target = String(body?.target || body?.name || '').trim();
+                const repoName = reposSvc.resolveInstalledRepoTarget(target);
+                const disabledAgents = disableMarketplaceAgentsForRepo(repoName);
+                const result = {
+                    ...reposSvc.uninstallRepo(repoName, { stdio: 'pipe' }),
+                    disabledAgents
+                };
                 sendJson(res, 200, {
                     ok: true,
                     action,

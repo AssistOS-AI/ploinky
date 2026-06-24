@@ -15,7 +15,10 @@ export function showHelp(args = []) {
 ╔═══ PLOINKY ═══╗ Container Development & Cloud Platform
 
 ▶ LOCAL DEVELOPMENT
-  add repo <name> [url] [branch] Add repository (basic/cloud/vibe/security/extra/demo)
+  install <url|repoName> [name] [branch] Install repository
+  add <url|repoName> [name] [branch]     Alias for install
+  uninstall <name|url>           Uninstall repository and its enabled agents
+  remove <name|url>              Alias for uninstall
   update [folderPath]            Update Ploinky, .ploinky/repos, Achilles deps, projects, and default skills
   start [staticAgent] [port]     Start agents from .ploinky/agents.json and launch Router
   shell <agentName>              Open interactive sh in container (attached TTY)
@@ -59,25 +62,49 @@ function showDetailedHelp(topic, subtopic, subsubtopic) {
         // Local development commands
         'add': {
             description: 'Add repositories or environment variables',
-            subcommands: {
-                'repo': {
-                    syntax: 'add repo <name> [url] [branch] | add repo <name> [url] --branch <branch>',
-                    description: 'Add an agent repository to your local environment',
-                    params: {
-                        '<name>': 'Repository name (cloud/vibe/security/extra for predefined, or custom name)',
-                        '[url]': 'Git URL for custom repositories (optional for predefined repos)',
-                        '[branch]': 'Git branch to clone (optional, defaults to repository default branch)'
-                    },
-                    examples: [
-                        'add repo cloud           # Add predefined cloud repository',
-                        'add repo myrepo https://github.com/user/repo.git  # Add custom repo',
-                        'add repo basic profile_implementation  # Add basic repo at specific branch',
-                        'add repo myrepo https://github.com/user/repo.git --branch feature  # Add with branch flag'
-                    ],
-                    notes: 'Predefined repos: cloud (AWS/Azure/GCP), vibe (social), security (auth/crypto), extra (utilities). Branch can be specified as a positional argument or with --branch flag.'
-                },
-
-            }
+            syntax: 'add <url|repoName> [name] [branch] | add <url|repoName> [name] --branch <branch>',
+            params: {
+                '<url|repoName>': 'Git URL to clone, or a repository name already present in repo_sources.json or the predefined catalog.',
+                '[name]': 'Optional local repository name. Defaults to the repo name derived from the URL.',
+                '[branch]': 'Git branch to clone (optional, defaults to repository default branch)'
+            },
+            examples: [
+                'add copilot-agents',
+                'add https://github.com/user/repo.git',
+                'add https://github.com/user/repo.git myrepo',
+                'add repo https://github.com/user/repo.git myrepo --branch feature'
+            ],
+            notes: '`add` is an alias for `install`. The optional `repo` token is still accepted. Branch can be specified as a positional argument or with --branch.'
+        },
+        'install': {
+            description: 'Install repositories',
+            syntax: 'install <url|repoName> [name] [branch] | install <url|repoName> [name] --branch <branch>',
+            description: 'Clone and register a repository. Agent repos are made discoverable for agent listings.',
+            examples: [
+                'install copilot-agents',
+                'install https://github.com/user/repo.git',
+                'install https://github.com/user/repo.git myrepo --branch feature',
+                'install repo https://github.com/user/repo.git myrepo'
+            ],
+            notes: 'Repository-name install works only for repo_sources.json entries and predefined repositories. The optional `repo` token is accepted but not required.'
+        },
+        'uninstall': {
+            description: 'Uninstall repositories',
+            syntax: 'uninstall <name|url>',
+            description: 'Remove an installed repository after disabling agents from that repository.',
+            examples: [
+                'uninstall myrepo',
+                'uninstall https://github.com/user/repo.git',
+                'uninstall repo myrepo'
+            ],
+            notes: 'The optional `repo` token is accepted but not required.'
+        },
+        'remove': {
+            description: 'Remove repositories',
+            syntax: 'remove <name|url>',
+            description: 'Alias for uninstall.',
+            examples: [ 'remove myrepo', 'remove repo myrepo' ],
+            notes: 'The optional `repo` token is accepted but not required.'
         },
         'var': {
             description: 'Set a workspace variable (stored encrypted in .ploinky/.secrets)',
@@ -200,7 +227,7 @@ function showDetailedHelp(topic, subtopic, subsubtopic) {
         },
         
         'enable': {
-            description: 'Enable features for agents and repos',
+            description: 'Enable features for agents',
             subcommands: {
                 'sandbox': {
                     syntax: 'enable sandbox',
@@ -208,29 +235,12 @@ function showDetailedHelp(topic, subtopic, subsubtopic) {
                     examples: [ 'enable sandbox' ],
                     notes: 'Equivalent to `sandbox enable`. Restart running agents to apply the change.'
                 },
-                'repo': {
-                    syntax: 'enable [repo] <name> [branch] | enable [repo] <name> --branch <branch>',
-                    description: 'Enable a repository for agent listings (see list repos). If not already installed, clones the repository.',
-                    params: {
-                        '<name>': 'Repository name (predefined or custom)',
-                        '[branch]': 'Git branch to clone (optional, only used when cloning)'
-                    },
-                    examples: [
-                        'enable basic',
-                        'enable repo cloud',
-                        'enable repo basic',
-                        'enable basic profile_implementation  # Enable and clone at specific branch',
-                        'enable repo basic profile_implementation  # Enable and clone at specific branch',
-                        'enable repo demo --branch feature  # Enable with branch flag'
-                    ],
-                    notes: 'Branch is only used when the repository needs to be cloned. If the repo is already installed, the branch argument is ignored.'
-                },
                 'agent': {
                     syntax: 'enable [agent] <name|repo/name> [isolated|global|devel [repoName]] [--auth none|pwd|sso] [--user <name> --password <value>] [as <alias>]',
                     description: 'Register and start an agent without changing the configured primary/static agent. Modes: isolated (omitted) creates a subfolder <agentName>; global uses current project; devel uses a repo under .ploinky/repos. Use "as <alias>" to create an additional instance with its own container name.',
                     examples: [
                         'enable demo',
-                        'enable repoName/demo global',
+                        'enable agent repoName/demo global',
                         'enable agent demo',
                         'enable agent demo --auth pwd',
                         'enable agent demo --auth pwd --user admin --password admin',
@@ -324,11 +334,6 @@ function showDetailedHelp(topic, subtopic, subsubtopic) {
                     examples: [ 'disable sandbox' ],
                     notes: 'Equivalent to `sandbox disable`. Restart running agents to apply the change.'
                 },
-                'repo': {
-                    syntax: 'disable [repo] <name>',
-                    description: 'Disable a repository from agent listings',
-                    examples: [ 'disable cloud', 'disable repo cloud' ]
-                },
                 'agent': {
                     syntax: 'disable [agent] <agentName>',
                     description: 'Remove an enabled agent from .ploinky/agents.json, then stop and remove its container',
@@ -353,7 +358,7 @@ function showDetailedHelp(topic, subtopic, subsubtopic) {
                 },
                 'repos': {
                     syntax: 'list repos',
-                    description: 'List available repositories with URLs; mark installed and enabled. Use enable repo <name> to include in listings.',
+                    description: 'List available repositories with URLs and installed status.',
                     examples: ['list repos']
                 },
                 'routes': {

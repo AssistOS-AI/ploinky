@@ -11,14 +11,14 @@ Ploinky is a workspace-local runtime for repository-backed agents.
 
 ## Common CLI commands
 
-- `ploinky add repo <name> [url] [branch]`: clone a repository into `.ploinky/repos/`.
+- `ploinky install <url> [repoName] [branch]` and `ploinky add <url> [repoName] [branch]`: clone a repository into `.ploinky/repos/`. The optional `repo` token is also accepted, and the repository name is derived from the URL when omitted.
+- `ploinky uninstall <repoName|url>` and `ploinky remove <repoName|url>`: remove an installed repository checkout after disabling enabled agents from that repository. Source metadata remains in `.ploinky/repo_sources.json` so the repository can be installed again.
 - `ploinky update [folderPath]` and `ploinky update all [folderPath]`: update the Ploinky checkout, refresh `ploinky/node_modules/achillesAgentLib`, update `.ploinky/repos/`, repairing non-git installed repo directories by recloning on the recorded branch when a source URL is known, recursively update discovered git repositories, and refresh Achilles default skills in those project repositories. Discovered project repositories with missing or unreachable remotes are logged and skipped for the pull step while still receiving default skills. When no folder path is provided, discovery starts at the current working directory.
 - `ploinky update repos`: update installed `.ploinky/repos/` entries and refresh both the Ploinky runtime Achilles checkout and managed-repo Achilles dependencies.
 - `ploinky update repo <name>`: update one repository under `.ploinky/repos/`.
-- `ploinky enable repo <name> [branch]`: enable a repository for discovery and listings.
 - `ploinky enable agent <name|repo/name> [global|devel [repo]] [--auth none|pwd|sso] [as <alias>]`: register an agent in `.ploinky/agents.json`.
 - `ploinky start [staticAgent] [port] [--branch <branch>] [--repo-branch <repo=branch>]... [--branch-fallback default|fail] [--reset-repos]`: resolve dependency waves, start enabled agents, write `routing.json`, and launch the router under the watchdog. `--branch` sets a candidate branch for all repos involved in this start; `--repo-branch` overrides it per repo. `--branch-fallback default` (the default) keeps repos on their configured branch when the candidate is missing; `fail` aborts. `--reset-repos` permits hard reset of dirty managed repos.
-- `ploinky status`: show SSO state, router listening state, installed and enabled repositories, and running agent containers.
+- `ploinky status`: show SSO state, router listening state, installed and remembered repositories, and running agent containers.
 - `ploinky list routes`: inspect the current `.ploinky/routing.json` route table.
 - `ploinky restart`: restart enabled agents and the router.
 - `ploinky shell <agent>`: open `/bin/sh` inside the running agent backend.
@@ -41,7 +41,7 @@ Ploinky is a workspace-local runtime for repository-backed agents.
 - `/webmeet`: meeting and moderator UI.
 - `/dashboard`: management surface, including transcript and feedback views.
 - `/status`: read-only browser view that shells out to `ploinky status` and adds router-side server and agent summaries.
-- `/api/marketplace`: JSON endpoint for the first-party agent marketplace. `GET /api/marketplace` is available to authenticated local or SSO users and lists repositories, discoverable agents, enabled records, and runtime status. `POST /api/marketplace` is admin-only and supports `add_repository`, `enable_repository`, `disable_repository`, `enable_agent`, and `disable_agent`; repository toggles only update the enabled-repository list, while marketplace agent disablement removes the enabled-agent registry record before removing the runtime container so the watchdog does not restart it during the operation.
+- `/api/marketplace`: JSON endpoint for the first-party agent marketplace. `GET /api/marketplace` is available to authenticated local or SSO users and lists repositories, repository source metadata and kind, discoverable agents, enabled records, and runtime status. `POST /api/marketplace` is admin-only and supports `install_repo`, `uninstall_repo`, `enable_agent`, and `disable_agent`; repository uninstall disables agents from that repository and removes the checkout while preserving source metadata for reinstall. Marketplace agent disablement removes the enabled-agent registry record before removing the runtime container so the watchdog does not restart it during the operation.
 
 `/webtty`, `/webchat`, and `/webmeet` use the normal router login flow. `/dashboard` still supports `WEBDASHBOARD_TOKEN`, and `/status` reuses the dashboard token or dashboard invitation link for read-only access.
 

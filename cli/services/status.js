@@ -65,7 +65,6 @@ export function findAgentManifest(agentName) {
 }
 
 export function listRepos() {
-    const enabled = new Set(reposSvc.loadEnabledRepos());
     const installed = new Set(reposSvc.getInstalledRepos(REPOS_DIR));
     const allRepos = { ...PREDEFINED_REPOS };
 
@@ -78,15 +77,13 @@ export function listRepos() {
     console.log('Available repositories:');
     for (const [name, info] of Object.entries(allRepos)) {
         const isInstalled = installed.has(name);
-        const isEnabled = enabled.has(name);
         const kind = info.kind || reposSvc.classifyRepoKind(name);
         const badges = [kindBadge(kind)];
         if (isInstalled) badges.push('[installed]');
-        if (isEnabled) badges.push('[enabled]');
         const url = info.url === 'local' ? '(local)' : info.url;
         console.log(`- ${name}: ${url} ${badges.join(' ')}`);
     }
-    console.log("\nTip: enable repos with 'enable repo <name>'. If none are enabled, installed repos are used by default for agent listings.");
+    console.log("\nTip: install repos with 'install repo <url> [name]'. Agent repos are included in agent listings when installed.");
 }
 
 export function listCurrentAgents() {
@@ -221,9 +218,9 @@ export function listAgents() {
             .filter(r => reposSvc.classifyRepoKind(r) === 'skills');
         if (installedSkills.length) {
             console.log(`No agent repos installed. Skills-only repos installed: ${installedSkills.join(', ')}.`);
-            console.log("Use 'add repo <name>' to add an agents repo, or 'list repos' to see all available.");
+            console.log("Use 'install repo <url> [name]' to install an agents repo, or 'list repos' to see all available.");
         } else {
-            console.log('No repos installed. Use: add repo <name>');
+            console.log('No repos installed. Use: install repo <url> [name]');
         }
         return;
     }
@@ -231,7 +228,7 @@ export function listAgents() {
     for (const { repo, installed, agents } of summary) {
         console.log(`\n[Repo] ${repo}${installed ? '' : ' (not installed)'}:`);
         if (!installed) {
-            console.log(`  (install with: add repo ${repo})`);
+            console.log(`  (install with: install repo <url> ${repo})`);
             continue;
         }
         if (!agents.length) {
@@ -242,7 +239,7 @@ export function listAgents() {
             console.log(`  - ${agent.name}: ${agent.about || '-'}`);
         }
     }
-    console.log("\nTip: enable repos with 'enable repo <name>' to control listings. If none are enabled, installed repos are used by default.");
+    console.log("\nTip: install agent repositories with 'install repo <url> [name]' to include them in listings.");
 }
 
 export function listRoutes() {
@@ -309,15 +306,13 @@ function isPortListening(port, host = '127.0.0.1', timeoutMs = 500) {
 }
 
 function collectRepoStatusRows() {
-    const enabled = new Set(reposSvc.loadEnabledRepos());
     const installedList = reposSvc.getInstalledRepos(REPOS_DIR);
     const installed = new Set(installedList);
-    const allNames = new Set([ ...installedList, ...enabled ]);
+    const allNames = new Set(installedList);
     return Array.from(allNames)
         .sort((a, b) => a.localeCompare(b))
         .map((name) => ({
             name,
-            enabled: enabled.has(name),
             installed: installed.has(name),
             predefined: PREDEFINED_REPOS[name] !== undefined
         }));
@@ -332,7 +327,6 @@ function listReposForStatus() {
     console.log(`- ${styles.label('Repos')}:`);
     for (const row of rows) {
         const badges = [kindBadge(reposSvc.classifyRepoKind(row.name))];
-        if (row.enabled) badges.push(formatBadge('enabled', styles.success));
         if (!row.installed) badges.push(formatBadge('missing', styles.danger));
         else if (!row.predefined) badges.push(formatBadge('local', styles.info));
         console.log(`  ${bulletSymbol} ${styles.name(row.name)} ${badges.join(' ')}`);
