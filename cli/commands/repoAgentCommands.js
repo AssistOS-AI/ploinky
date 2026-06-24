@@ -234,15 +234,8 @@ async function updateAllRepos(folderPath, options = {}) {
             interactiveSession: options.interactiveSession === true,
         });
         if (selfUpdate.deferred) {
-            return {
-                total: 0,
-                updated: 0,
-                failed: [],
-                selfUpdate,
-                deferred: true,
-            };
-        }
-        if (selfUpdate.skipped) {
+            console.log('  - Ploinky self-update deferred; continuing repository and skills update.');
+        } else if (selfUpdate.skipped) {
             console.log(`  - skipped (${selfUpdate.reason || 'not available'})`);
         } else if (selfUpdate.updated) {
             console.log('  ✓ Ploinky updated.');
@@ -307,6 +300,7 @@ async function updateAllRepos(folderPath, options = {}) {
 
     if (workspaceManifestFolders.length) {
         console.log('Installing skills from folders containing ploinky-skills-manifest.json...');
+        console.log(`  Found ${workspaceManifestFolders.length} skills manifest folder(s) under ${projectsRoot}.`);
         for (const manifestFolder of workspaceManifestFolders) {
             const manifestPath = skillsSvc.findSkillsManifestPath(manifestFolder);
             try {
@@ -334,6 +328,8 @@ async function updateAllRepos(folderPath, options = {}) {
                 console.error(`  ✗ ${folderLabel} skills: ${message}`);
             }
         }
+    } else {
+        console.log(`No ploinky-skills-manifest.json files found under ${projectsRoot}.`);
     }
 
     const totalRepos = 1 + ploinkyRepos.length + workspaceRepos.length + workspaceManifestFolders.length;

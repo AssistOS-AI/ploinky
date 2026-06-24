@@ -77,7 +77,6 @@ function showDetailedHelp(topic, subtopic, subsubtopic) {
             notes: '`add` is an alias for `install`. The optional `repo` token is still accepted. Branch can be specified as a positional argument or with --branch.'
         },
         'install': {
-            description: 'Install repositories',
             syntax: 'install <url|repoName> [name] [branch] | install <url|repoName> [name] --branch <branch>',
             description: 'Clone and register a repository. Agent repos are made discoverable for agent listings.',
             examples: [
@@ -89,7 +88,6 @@ function showDetailedHelp(topic, subtopic, subsubtopic) {
             notes: 'Repository-name install works only for repo_sources.json entries and predefined repositories. The optional `repo` token is accepted but not required.'
         },
         'uninstall': {
-            description: 'Uninstall repositories',
             syntax: 'uninstall <name|url>',
             description: 'Remove an installed repository after disabling agents from that repository.',
             examples: [
@@ -100,7 +98,6 @@ function showDetailedHelp(topic, subtopic, subsubtopic) {
             notes: 'The optional `repo` token is accepted but not required.'
         },
         'remove': {
-            description: 'Remove repositories',
             syntax: 'remove <name|url>',
             description: 'Alias for uninstall.',
             examples: [ 'remove myrepo', 'remove repo myrepo' ],
@@ -125,7 +122,7 @@ function showDetailedHelp(topic, subtopic, subsubtopic) {
             description: 'Update Ploinky itself, its Achilles runtime checkout, workspace repositories, Achilles dependencies, and project repositories',
             syntax: 'update [folderPath] | update all [folderPath] | update repos | update repo <name>',
             examples: [ 'update', 'update /work/projects', 'update all /work/projects', 'update repo basic' ],
-            notes: '`update` is the same full workflow as `update all`: it runs git pull --rebase --autostash for the Ploinky checkout, refreshes ploinky/node_modules/achillesAgentLib, updates .ploinky/repos, and updates git repositories discovered recursively from folderPath. Without folderPath, discovery starts at the current working directory. Missing or unreachable remotes in discovered project repositories are logged and skipped instead of failing the full update; managed .ploinky/repos updates remain strict. `update repos` updates installed .ploinky/repos, the Ploinky runtime achillesAgentLib checkout, and managed-repo achillesAgentLib packages. Discovered workspace folders can define `ploinky-skills-manifest.json`; when present, that file selects the skill repositories to install into `.agents/skills` for that workspace folder (instead of using a hardcoded default). In an interactive Ploinky session, a detected Ploinky self-update is deferred: close the session, run `ploinky update`, then restart Ploinky so the new code is loaded.'
+            notes: '`update` is the same full workflow as `update all`: it runs git pull --rebase --autostash for the Ploinky checkout, refreshes ploinky/node_modules/achillesAgentLib, updates .ploinky/repos, and updates git repositories discovered recursively from folderPath. Without folderPath, discovery starts at the current working directory. Missing or unreachable remotes in discovered project repositories are logged and skipped instead of failing the full update; managed .ploinky/repos updates remain strict. `update repos` updates installed .ploinky/repos, the Ploinky runtime achillesAgentLib checkout, and managed-repo achillesAgentLib packages. Discovered workspace folders can define `ploinky-skills-manifest.json`; when present, that file must be an array of objects with url/name/branch/skills and selects the exact skills to install into `.agents/skills` for that workspace folder. In an interactive Ploinky session, a detected Ploinky self-update is deferred: close the session, run `ploinky update`, then restart Ploinky so the new code is loaded.'
         },
         
         
