@@ -12,6 +12,7 @@ import {
     isContainerRunning,
     waitForContainerRunning,
     stopAndRemove,
+    stopAndRemoveMany,
     ensureAgentService
 } from './docker/index.js';
 import { findAgent } from './utils.js';
@@ -585,6 +586,88 @@ export function disableAgent(agentRef) {
         shortAgentName: record.agentName,
         repoName: record.repoName
     };
+}
+
+export function disableAgentContainers(containerNames = []) {
+    const targets = Array.from(new Set((containerNames || [])
+        .map(name => String(name || '').trim())
+        .filter(Boolean)));
+    if (!targets.length) return [];
+
+    const map = loadAgents();
+    const config = (map && typeof map._config === 'object') ? map._config : null;
+    const disabled = [];
+
+    const clearStaticConfig = ({ repoName, shortName, containerName }) => {
+        if (!config || !config.static) return false;
+        const comparisons = new Set();
+        if (shortName) comparisons.add(String(shortName).trim().toLowerCase());
+        if (repoName && shortName) {
+            const repo = String(repoName).trim().toLowerCase();
+            const short = String(shortName).trim().toLowerCase();
+            comparisons.add(`${repo}/${short}`);
+            comparisons.add(`${repo}:${short}`);
+        }
+
+        const staticAgent = String(config.static.agent || '').trim().toLowerCase();
+        const staticContainer = String(config.static.container || '').trim();
+        const matchesAgent = staticAgent && comparisons.has(staticAgent);
+        const matchesContainer = containerName && staticContainer && staticContainer === containerName;
+
+        if (!matchesAgent && !matchesContainer) return false;
+
+        delete config.static;
+        if (Object.keys(config).length === 0) {
+            delete map._config;
+        } else {
+            map._config = config;
+        }
+        return true;
+    };
+
+    for (const containerName of targets) {
+        const record = map?.[containerName];
+        if (!record || record.type !== 'agent') {
+            disabled.push({
+                status: 'not-found',
+                containerName
+            });
+            continue;
+        }
+
+        delete map[containerName];
+        clearStaticConfig({
+            repoName: record.repoName,
+            shortName: record.agentName,
+            containerName
+        });
+
+        disabled.push({
+            status: 'removed',
+            containerName,
+            shortAgentName: record.agentName,
+            repoName: record.repoName
+        });
+    }
+
+    saveAgents(map);
+
+    try {
+        stopAndRemoveMany(targets);
+    } catch (error) {
+        throw new Error(`disable agents: failed to stop and remove containers: ${error?.message || error}`);
+    }
+
+    for (const item of disabled) {
+        if (item.status !== 'removed' || !item.shortAgentName) continue;
+        try {
+            removeAgentSymlinks(item.shortAgentName);
+        } catch (err) {
+            console.error(`Warning: Failed to remove workspace structure for ${item.shortAgentName}: ${err.message}`);
+        }
+    }
+
+    return disabled;
 }
 
 export function resolveEnabledAgentRecord(agentRef) {
