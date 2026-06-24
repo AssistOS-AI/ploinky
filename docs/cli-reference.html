@@ -65,21 +65,26 @@
                     <div class="doc-section" id="repository">
                         <h2>Repository Management</h2>
                         
-                        <h3>add repo</h3>
-                        <p>Add a repository to your local environment.</p>
-                        <pre><code>add repo &lt;name&gt; [url]</code></pre>
+                        <h3>install / add</h3>
+                        <p>Install a repository checkout into your local environment. The URL is required, the repository name is optional, and the optional <code>repo</code> token is accepted for compatibility.</p>
+                        <pre><code>install [repo] &lt;url&gt; [repoName] [branch]
+add [repo] &lt;url&gt; [repoName] [branch]</code></pre>
                         <table class="command-table">
                             <tr>
                                 <th>Parameter</th>
                                 <th>Description</th>
                             </tr>
                             <tr>
-                                <td><code>&lt;name&gt;</code></td>
-                                <td>Repository name (basic, cloud, vibe, security, extra, demo) or custom name</td>
+                                <td><code>&lt;url&gt;</code></td>
+                                <td>Git URL for the repository to install</td>
                             </tr>
                             <tr>
-                                <td><code>[url]</code></td>
-                                <td>Git URL for custom repositories (optional for predefined repos)</td>
+                                <td><code>[repoName]</code></td>
+                                <td>Optional repository name. If omitted, Ploinky derives it from the URL.</td>
+                            </tr>
+                            <tr>
+                                <td><code>[branch]</code></td>
+                                <td>Optional branch to record and use for the checkout.</td>
                             </tr>
                         </table>
                         <div class="alert alert-info">
@@ -94,18 +99,13 @@
                             </ul>
                         </div>
                         <pre><code># Examples
-add repo cloud                                    # Add predefined cloud repository
-add repo myrepo https://github.com/user/repo.git  # Add custom repository</code></pre>
+install https://github.com/PloinkyRepos/demo.git demo
+add repo https://github.com/user/repo.git myrepo main</code></pre>
 
-                        <h3>enable repo</h3>
-                        <p>Enable a repository for agent listings.</p>
-                        <pre><code>enable repo &lt;name&gt;</code></pre>
-                        <pre><code># Example
-enable repo cloud</code></pre>
-
-                        <h3>disable repo</h3>
-                        <p>Disable a repository from agent listings.</p>
-                        <pre><code>disable repo &lt;name&gt;</code></pre>
+                        <h3>uninstall / remove</h3>
+                        <p>Uninstall a repository checkout by name or URL. Ploinky disables enabled agents from that repository, removes their runtime containers, removes the repository checkout, and preserves source metadata for reinstall.</p>
+                        <pre><code>uninstall [repo] &lt;repoName|url&gt;
+remove [repo] &lt;repoName|url&gt;</code></pre>
 
                         <h3>list repos</h3>
                         <p>List all available repositories and their status.</p>
@@ -164,7 +164,7 @@ enable agent demo as demo2           # second container with alias "demo2"</code
                         </table>
 
                         <div class="alert alert-info">
-                            <strong>Note:</strong> Using <code>enable agent</code> is optional. You can <code>enable repo</code> then <code>start &lt;agent&gt;</code> directly; the agent will use the isolated mode and a subfolder <code>&lt;agentName&gt;</code> will be created. When supplying an alias, it becomes the container name for reinstall/disable/start operations and must be unique; reusing an alias returns <code>alias already exists</code>.
+                            <strong>Note:</strong> Using <code>enable agent</code> is optional. You can <code>install</code> a repository and then <code>start &lt;agent&gt;</code> directly; the agent will use the isolated mode and a subfolder <code>&lt;agentName&gt;</code> will be created. When supplying an alias, it becomes the container name for reinstall/disable/start operations and must be unique; reusing an alias returns <code>alias already exists</code>.
                         </div>
 
                         <h3>reinstall agent</h3>
@@ -174,7 +174,7 @@ enable agent demo as demo2           # second container with alias "demo2"</code
 reinstall demo  # stop, remove, and re-create the container for the 'demo' agent</code></pre>
 
                         <h3>list agents</h3>
-                        <p>List all available agents from enabled repositories.</p>
+                        <p>List all available agents from installed repositories.</p>
                         <pre><code>list agents</code></pre>
                         <h3>disable agent</h3>
                         <p>Remove an enabled agent from the workspace registry. The agent container must be destroyed first.</p>

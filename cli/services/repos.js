@@ -3,7 +3,6 @@ import path from 'path';
 import { execFileSync } from 'child_process';
 import { PLOINKY_DIR } from './config.js';
 
-export const ENABLED_REPOS_FILE = path.join(PLOINKY_DIR, 'enabled_repos.json');
 export const REPO_SOURCES_FILE = path.join(PLOINKY_DIR, 'repo_sources.json');
 const REPOS_DIR = path.join(PLOINKY_DIR, 'repos');
 
@@ -40,9 +39,11 @@ function normalizeRepoSourceValue(value) {
     }
     const url = String(value.url || '').trim();
     if (!url) return null;
+    const kind = String(value.kind || '').trim();
     return {
         url,
         branch: normalizeRepoBranch(value.branch),
+        kind: kind || null,
     };
 }
 
@@ -52,37 +53,48 @@ function readStoredRepoSource(name) {
     return normalizeRepoSourceValue(loadRepoSources()[repoName]);
 }
 
-function recordRepoSource(name, url, branch = null) {
+export function getRepoSources() {
+    const result = {};
+    const sources = loadRepoSources();
+    for (const [name, value] of Object.entries(sources)) {
+        const source = normalizeRepoSourceValue(value);
+        if (source?.url) result[name] = source;
+    }
+    return result;
+}
+
+function looksLikeRepoUrl(value) {
+    const candidate = String(value || '').trim();
+    if (!candidate) return false;
+    return /^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(candidate)
+        || /^git@[^:]+:.+/.test(candidate)
+        || candidate.startsWith('ssh://')
+        || candidate.startsWith('file://')
+        || candidate.startsWith('/')
+        || candidate.startsWith('./')
+        || candidate.startsWith('../')
+        || candidate.endsWith('.git');
+}
+
+function recordRepoSource(name, url, branch = null, kind = null) {
     const repoName = String(name || '').trim();
     const repoUrl = String(url || '').trim();
     if (!repoName || !repoUrl) return;
     const previous = readStoredRepoSource(repoName);
     const repoBranch = normalizeRepoBranch(branch)
         || (previous?.url === repoUrl ? previous.branch : null);
+    const repoKind = String(kind || '').trim()
+        || (previous?.url === repoUrl ? previous.kind : null);
     const next = { url: repoUrl };
     if (repoBranch) next.branch = repoBranch;
+    if (repoKind) next.kind = repoKind;
     const sources = loadRepoSources();
     const current = normalizeRepoSourceValue(sources[repoName]);
-    if (current?.url === next.url && current?.branch === (next.branch || null)) return;
+    if (current?.url === next.url
+        && current?.branch === (next.branch || null)
+        && current?.kind === (next.kind || null)) return;
     sources[repoName] = next;
     saveRepoSources(sources);
-}
-
-export function loadEnabledRepos() {
-    try {
-        const raw = fs.readFileSync(ENABLED_REPOS_FILE, 'utf8');
-        const data = JSON.parse(raw || '[]');
-        return Array.isArray(data) ? data : [];
-    } catch (_) {
-        return [];
-    }
-}
-
-export function saveEnabledRepos(list) {
-    try {
-        fs.mkdirSync(PLOINKY_DIR, { recursive: true });
-        fs.writeFileSync(ENABLED_REPOS_FILE, JSON.stringify(list || [], null, 2));
-    } catch (_) {}
 }
 
 export function getInstalledRepos(REPOS_DIR) {
@@ -102,8 +114,6 @@ export function getInstalledRepos(REPOS_DIR) {
 }
 
 export function getActiveRepos(REPOS_DIR) {
-    const enabled = loadEnabledRepos();
-    if (enabled && enabled.length) return enabled;
     return getInstalledRepos(REPOS_DIR);
 }
 
@@ -184,6 +194,24 @@ export function resolveRepoUrl(name, url) {
         || PREDEFINED_REPOS[rawName.toLowerCase()]
         || Object.entries(PREDEFINED_REPOS).find(([key]) => key.toLowerCase() === rawName.toLowerCase())?.[1];
     return preset ? preset.url : null;
+}
+
+export function deriveRepoNameFromUrl(url) {
+    const rawUrl = String(url || '').trim();
+    if (!rawUrl) return '';
+    const withoutHash = rawUrl.split('#')[0].split('?')[0];
+    const withoutSlash = withoutHash.replace(/\/+$/, '');
+    const lastSegment = withoutSlash.slice(withoutSlash.lastIndexOf('/') + 1);
+    const name = lastSegment.replace(/\.git$/i, '').replace(/[^a-zA-Z0-9_.-]+/g, '-');
+    return name.replace(/^-+|-+$/g, '');
+}
+
+export function normalizeRepoName(name) {
+    const repoName = String(name || '').trim();
+    if (!repoName || !/^[a-zA-Z0-9_.-]+$/.test(repoName)) {
+        throw new Error('Invalid repository name.');
+    }
+    return repoName;
 }
 
 function findManifestRepoSource(repoName) {
@@ -277,45 +305,70 @@ export function addRepo(name, url, branch = null, { stdio = 'inherit' } = {}) {
     return { status: 'cloned', path: repoPath, branch: actualBranch || 'default' };
 }
 
-export function enableRepo(name, branch = null, { stdio = 'inherit' } = {}) {
-    if (!name) throw new Error('Missing repository name.');
+export function installRepo(url, name = null, branch = null, { stdio = 'inherit' } = {}) {
+    const input = String(url || '').trim();
+    if (!input) throw new Error('Missing repository URL.');
 
-    if (PREDEFINED_REPOS[name]?.kind === 'skills') {
-        throw new Error(`Repo '${name}' is a skills-only repo (no agents). Use 'default-skills ${name}' to install its skills into the workspace.`);
+    let repoUrl = input;
+    let repoName = name ? normalizeRepoName(name) : null;
+    let resolvedBranch = normalizeRepoBranch(branch);
+
+    if (!looksLikeRepoUrl(input)) {
+        const sourceName = normalizeRepoName(input);
+        const source = resolveRepoSource(sourceName, null, resolvedBranch);
+        if (!source?.url) {
+            throw new Error(`Missing repository URL for '${sourceName}'. Install by name only works for repositories in repo_sources.json or predefined repositories.`);
+        }
+        repoName = sourceName;
+        repoUrl = source.url;
+        resolvedBranch = normalizeRepoBranch(branch) || source.branch || null;
+    } else if (!repoName) {
+        repoName = normalizeRepoName(deriveRepoNameFromUrl(repoUrl));
     }
 
-    const REPOS_DIR = ensureReposDir();
-    const repoPath = path.join(REPOS_DIR, name);
-    const source = resolveRepoSource(name, null, branch);
-    if (!fs.existsSync(repoPath)) {
-        const url = source?.url || null;
-        if (!url) throw new Error(`No URL configured for repo '${name}'.`);
-        const args = ['clone'];
-        if (source.branch) args.push('--branch', source.branch);
-        args.push(url, repoPath);
-        execFileSync('git', args, { stdio });
-        recordRepoSource(name, url, source.branch);
-    } else if (source?.url) {
-        recordRepoSource(name, source.url, source.branch);
-    }
-
-    if (classifyRepoKind(name) === 'skills') {
-        throw new Error(`Repo '${name}' contains only skills (no agents found). Use 'default-skills ${name}' to install its skills into the workspace.`);
-    }
-
-    const list = loadEnabledRepos();
-    if (!list.includes(name)) {
-        list.push(name);
-        saveEnabledRepos(list);
-    }
-    return true;
+    const result = addRepo(repoName, repoUrl, resolvedBranch, { stdio });
+    const kind = classifyRepoKind(repoName);
+    recordRepoSource(repoName, repoUrl, result.branch, kind);
+    return {
+        ...result,
+        name: repoName,
+        url: repoUrl,
+        kind,
+        installed: true
+    };
 }
 
-export function disableRepo(name) {
-    const list = loadEnabledRepos();
-    const filtered = list.filter(r => r !== name);
-    saveEnabledRepos(filtered);
-    return true;
+export function resolveInstalledRepoTarget(target) {
+    const rawTarget = String(target || '').trim();
+    if (!rawTarget) throw new Error('Missing repository target.');
+    const reposDir = ensureReposDir();
+    const installed = getInstalledRepos(reposDir);
+    if (installed.includes(rawTarget)) return rawTarget;
+
+    const sources = loadRepoSources();
+    for (const repoName of installed) {
+        const source = normalizeRepoSourceValue(sources[repoName]);
+        if (source?.url === rawTarget) return repoName;
+    }
+
+    for (const repoName of installed) {
+        const predefinedUrl = PREDEFINED_REPOS[repoName]?.url || '';
+        if (predefinedUrl && predefinedUrl === rawTarget) return repoName;
+    }
+
+    const derived = deriveRepoNameFromUrl(rawTarget);
+    if (derived && installed.includes(derived)) return derived;
+    throw new Error(`Repository '${rawTarget}' is not installed.`);
+}
+
+export function uninstallRepo(target, { stdio = 'inherit' } = {}) {
+    const repoName = resolveInstalledRepoTarget(target);
+    const repoPath = path.join(ensureReposDir(), repoName);
+    if (!fs.existsSync(repoPath)) {
+        return { status: 'missing', name: repoName, path: repoPath };
+    }
+    fs.rmSync(repoPath, { recursive: true, force: true });
+    return { status: 'removed', name: repoName, path: repoPath };
 }
 
 function recloneNonGitRepo(name, repoPath, url, { branch = null, stdio = 'inherit' } = {}) {

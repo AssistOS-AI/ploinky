@@ -5,6 +5,7 @@ import { showHelp } from '../services/help.js';
 import * as reposSvc from '../services/repos.js';
 import * as agentsSvc from '../services/agents.js';
 import * as skillsSvc from '../services/skills.js';
+import * as workspaceSvc from '../services/workspace.js';
 import {
     refreshAchillesDependenciesInRepos,
     refreshPloinkyRuntimeAchillesDependency,
@@ -115,14 +116,32 @@ function getAgentNames() {
     return Array.from(suggestions).sort();
 }
 
-function addRepo(repoName, repoUrl, branch = null) {
-    if (!repoName) { showHelp(); throw new Error('Missing repository name.'); }
-    const res = reposSvc.addRepo(repoName, repoUrl, branch);
-    if (res.status === 'exists') console.log(`✓ Repository '${repoName}' already exists.`);
+function installRepo(repoUrl, repoName = null, branch = null) {
+    if (!repoUrl) { showHelp(); throw new Error('Missing repository URL or known repository name.'); }
+    const res = reposSvc.installRepo(repoUrl, repoName, branch);
+    const name = res.name || repoName || reposSvc.deriveRepoNameFromUrl(repoUrl);
+    if (res.status === 'exists') console.log(`✓ Repository '${name}' already installed.`);
     else {
         const branchNote = branch ? ` (branch: ${branch})` : '';
-        console.log(`✓ Repository '${repoName}' added successfully${branchNote}.`);
+        console.log(`✓ Repository '${name}' installed successfully${branchNote}.`);
     }
+}
+
+function addRepo(repoUrl, repoName = null, branch = null) {
+    return installRepo(repoUrl, repoName, branch);
+}
+
+function uninstallRepo(target) {
+    if (!target) throw new Error('Usage: uninstall repo <name|url>');
+    const repoName = reposSvc.resolveInstalledRepoTarget(target);
+    const agents = workspaceSvc.loadAgents();
+    const containerNames = Object.entries(agents || {})
+        .filter(([, record]) => record && record.type === 'agent' && record.repoName === repoName && record.agentName)
+        .map(([containerName]) => containerName);
+    const disabledAgents = agentsSvc.disableAgentContainers(containerNames);
+    const result = reposSvc.uninstallRepo(repoName);
+    console.log(`✓ Repository '${repoName}' uninstalled.`);
+    return { ...result, disabledAgents };
 }
 
 async function updateRepo(repoName) {
@@ -215,15 +234,8 @@ async function updateAllRepos(folderPath, options = {}) {
             interactiveSession: options.interactiveSession === true,
         });
         if (selfUpdate.deferred) {
-            return {
-                total: 0,
-                updated: 0,
-                failed: [],
-                selfUpdate,
-                deferred: true,
-            };
-        }
-        if (selfUpdate.skipped) {
+            console.log('  - Ploinky self-update deferred; continuing repository and skills update.');
+        } else if (selfUpdate.skipped) {
             console.log(`  - skipped (${selfUpdate.reason || 'not available'})`);
         } else if (selfUpdate.updated) {
             console.log('  ✓ Ploinky updated.');
@@ -288,6 +300,7 @@ async function updateAllRepos(folderPath, options = {}) {
 
     if (workspaceManifestFolders.length) {
         console.log('Installing skills from folders containing ploinky-skills-manifest.json...');
+        console.log(`  Found ${workspaceManifestFolders.length} skills manifest folder(s) under ${projectsRoot}.`);
         for (const manifestFolder of workspaceManifestFolders) {
             const manifestPath = skillsSvc.findSkillsManifestPath(manifestFolder);
             try {
@@ -315,6 +328,8 @@ async function updateAllRepos(folderPath, options = {}) {
                 console.error(`  ✗ ${folderLabel} skills: ${message}`);
             }
         }
+    } else {
+        console.log(`No ploinky-skills-manifest.json files found under ${projectsRoot}.`);
     }
 
     const totalRepos = 1 + ploinkyRepos.length + workspaceRepos.length + workspaceManifestFolders.length;
@@ -349,19 +364,6 @@ function resolveUpdateProjectsRoot(folderPath) {
     return process.cwd();
 }
 
-function enableRepo(repoName, branch = null) {
-    if (!repoName) throw new Error('Usage: enable repo <name> [branch]');
-    reposSvc.enableRepo(repoName, branch);
-    const branchNote = branch ? ` (branch: ${branch})` : '';
-    console.log(`✓ Repo '${repoName}' enabled${branchNote}. Use 'list agents' to view agents.`);
-}
-
-function disableRepo(repoName) {
-    if (!repoName) throw new Error('Usage: disable repo <name>');
-    reposSvc.disableRepo(repoName);
-    console.log(`✓ Repo '${repoName}' disabled.`);
-}
-
 async function enableAgent(agentName, mode, repoNameParam, alias, authMode, username, password) {
     if (!agentName) throw new Error('Usage: enable agent <name|repo/name> [isolated|global|devel [repoName]] [--auth none|pwd|sso] [--user <name> --password <value>] [as <alias>]');
     const { shortAgentName, repoName, alias: resolvedAlias, auth } = agentsSvc.enableAgent(agentName, mode, repoNameParam, alias, authMode, { username, password });
@@ -384,13 +386,13 @@ function findAgentManifest(agentName) {
 export {
     getRepoNames,
     getAgentNames,
+    installRepo,
     addRepo,
+    uninstallRepo,
     updateRepo,
     updatePloinkyRepos,
     updateAllRepos,
     resolveUpdateProjectsRoot,
-    enableRepo,
-    disableRepo,
     enableAgent,
     findAgentManifest,
 };

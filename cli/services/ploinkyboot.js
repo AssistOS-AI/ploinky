@@ -80,14 +80,4 @@ export function bootstrap({ branchPolicy, staticAgent } = {}) {
         }
     }
 
-    try {
-        const list = repos.loadEnabledRepos();
-        for (const { name } of repos.getDefaultBootRepos()) {
-            const repoPath = path.join(PLOINKY_DIR, 'repos', name);
-            if (fs.existsSync(repoPath) && !list.includes(name)) {
-                list.push(name);
-                repos.saveEnabledRepos(list);
-            }
-        }
-    } catch (_) {}
 }

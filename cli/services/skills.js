@@ -1,7 +1,5 @@
 import fs from 'fs';
-import os from 'os';
 import path from 'path';
-import { execFileSync } from 'child_process';
 import { REPOS_DIR } from './config.js';
 import * as reposSvc from './repos.js';
 
@@ -29,7 +27,40 @@ function ensureRepoCloned(repoName) {
 function listSkillDirectories(skillsRoot) {
     return fs.readdirSync(skillsRoot, { withFileTypes: true })
         .filter(entry => entry.isDirectory() && !entry.name.startsWith('.'))
+        .filter(entry => fs.existsSync(path.join(skillsRoot, entry.name, 'SKILL.md')))
         .map(entry => entry.name);
+}
+
+function normalizeSkillName(value, context) {
+    const name = String(value || '').trim();
+    if (!name) {
+        throw new Error(`${context} is empty.`);
+    }
+    if (!/^[a-zA-Z0-9_.-]+$/.test(name)) {
+        throw new Error(`${context} '${name}' is invalid.`);
+    }
+    return name;
+}
+
+function normalizeManifestEntry(entry, index, manifestPath) {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+        throw new Error(`Invalid skills manifest '${manifestPath}': entry at index ${index} must be an object.`);
+    }
+    const url = String(entry.url || '').trim();
+    if (!url) {
+        throw new Error(`Invalid skills manifest '${manifestPath}': entry at index ${index} is missing url.`);
+    }
+    const name = normalizeSkillName(entry.name || reposSvc.deriveRepoNameFromUrl(url), `Invalid skills manifest '${manifestPath}': entry ${index} name`);
+    const branch = entry.branch === undefined || entry.branch === null || String(entry.branch).trim() === ''
+        ? null
+        : String(entry.branch).trim();
+    if (!Array.isArray(entry.skills)) {
+        throw new Error(`Invalid skills manifest '${manifestPath}': entry at index ${index} is missing skills array.`);
+    }
+    const skills = Array.from(new Set(entry.skills.map((skill, skillIndex) => (
+        normalizeSkillName(skill, `Invalid skills manifest '${manifestPath}': entry ${index} skill ${skillIndex}`)
+    ))));
+    return { url, name, branch, skills };
 }
 
 function parseSkillsManifest(rawPath) {
@@ -48,44 +79,19 @@ function parseSkillsManifest(rawPath) {
     }
 
     if (!Array.isArray(parsed)) {
-        throw new Error(`Invalid skills manifest '${rawPath}': expected an array of repository links.`);
+        throw new Error(`Invalid skills manifest '${rawPath}': expected an array of repository objects.`);
     }
 
-    return parsed.map((entry, index) => {
-        if (typeof entry !== 'string') {
-            throw new Error(`Invalid skills manifest '${rawPath}': entry at index ${index} must be a string.`);
-        }
-        const trimmed = entry.trim();
-        if (!trimmed) {
-            throw new Error(`Invalid skills manifest '${rawPath}': entry at index ${index} is empty.`);
-        }
-        return trimmed;
-    });
+    return parsed.map((entry, index) => normalizeManifestEntry(entry, index, rawPath));
 }
 
-function resolveRepoFromManifestLink(link, manifestDir) {
-    const candidate = path.resolve(manifestDir, link);
-    if (fs.existsSync(candidate)) {
-        return {
-            repoPath: candidate,
-            cleanup: () => {},
-            source: link,
-        };
+function ensureManifestRepoCached(entry) {
+    const repoPath = path.join(REPOS_DIR, entry.name);
+    if (fs.existsSync(repoPath)) {
+        reposSvc.updateRepo(entry.name, { stdio: 'inherit' });
+        return repoPath;
     }
-
-    const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-skill-repo-'));
-    const clonedRepoPath = path.join(tmpRoot, 'repo');
-    try {
-        execFileSync('git', ['clone', '--quiet', '--depth', '1', link, clonedRepoPath], { stdio: 'ignore' });
-        return {
-            repoPath: clonedRepoPath,
-            cleanup: () => fs.rmSync(tmpRoot, { recursive: true, force: true }),
-            source: link,
-        };
-    } catch (err) {
-        fs.rmSync(tmpRoot, { recursive: true, force: true });
-        throw new Error(`Failed to clone skill repository '${link}': ${err?.message || String(err)}`);
-    }
+    return reposSvc.installRepo(entry.url, entry.name, entry.branch, { stdio: 'inherit' }).path;
 }
 
 export function copySkill(srcDir, destDir) {
@@ -153,97 +159,89 @@ export function installSkillsFromManifest(manifestPath, { targetRoot } = {}) {
         throw new Error('Missing skills manifest path.');
     }
 
-    const links = parseSkillsManifest(manifestPath);
-    if (!links.length) {
-        throw new Error(`Skills manifest '${manifestPath}' has no repositories.`);
-    }
+    const entries = parseSkillsManifest(manifestPath);
 
     const destRoot = targetRoot || process.cwd();
-    const resolvedLinks = links.map(link => String(link).trim()).filter(Boolean);
-    const manifestDir = path.dirname(manifestPath);
-
-    const acquired = [];
     const sourceRepos = [];
     const skillConflicts = [];
     const skillSource = new Map();
-    try {
-        for (const link of resolvedLinks) {
-            const source = resolveRepoFromManifestLink(link, manifestDir);
-            acquired.push(source);
-            const skillsRoot = path.join(source.repoPath, 'skills');
-            if (!fs.existsSync(skillsRoot) || !fs.statSync(skillsRoot).isDirectory()) {
-                throw new Error(`No skills/ folder in source repo '${link}' (expected ${skillsRoot}).`);
+
+    for (const entry of entries) {
+        const repoPath = ensureManifestRepoCached(entry);
+        const skillsRoot = path.join(repoPath, 'skills');
+        if (!fs.existsSync(skillsRoot) || !fs.statSync(skillsRoot).isDirectory()) {
+            throw new Error(`No skills/ folder in source repo '${entry.name}' (expected ${skillsRoot}).`);
+        }
+        const availableSkills = listSkillDirectories(skillsRoot);
+        const available = new Set(availableSkills);
+        for (const skill of entry.skills) {
+            if (!available.has(skill)) {
+                throw new Error(`Skill '${skill}' is listed for repo '${entry.name}' but was not found under ${skillsRoot}.`);
             }
-            const skills = listSkillDirectories(skillsRoot);
-            if (!skills.length) {
-                throw new Error(`No skill subdirectories found under ${skillsRoot} for source '${link}'.`);
+            const previousSource = skillSource.get(skill);
+            if (previousSource) {
+                skillConflicts.push({
+                    skill,
+                    previousSource: previousSource.source,
+                    chosenSource: entry.name,
+                });
             }
-            sourceRepos.push({
-                source: link,
-                repoPath: source.repoPath,
-                skills,
-                cleanup: source.cleanup,
+            skillSource.set(skill, {
+                source: entry.name,
+                repoPath,
+                skill,
             });
-            for (const skill of skills) {
-                const previousSource = skillSource.get(skill);
-                if (previousSource) {
-                    skillConflicts.push({
-                        skill,
-                        previousSource,
-                        chosenSource: link,
-                    });
-                }
-                skillSource.set(skill, link);
-            }
         }
-
-        const incomingSkills = Array.from(skillSource.keys());
-        const isGitRepoTarget = reposSvc.isGitRepository(destRoot);
-        const agentsSkillsDir = path.join(destRoot, CANONICAL_SKILLS_DIR);
-        fs.rmSync(agentsSkillsDir, { recursive: true, force: true });
-        fs.mkdirSync(agentsSkillsDir, { recursive: true });
-
-        for (const source of sourceRepos) {
-            const sourceSkillsRoot = path.join(source.repoPath, 'skills');
-            for (const skill of source.skills) {
-                copySkill(path.join(sourceSkillsRoot, skill), path.join(agentsSkillsDir, skill));
-            }
-        }
-
-        const claudeLink = ensureClaudeSymlink(destRoot);
-        let gitignoreUpdated = false;
-        if (isGitRepoTarget) {
-            const gitignoreEntries = [
-                ...incomingSkills.map(skill => `${CANONICAL_SKILLS_DIR}/${skill}`),
-                CANONICAL_AGENT_DIR,
-                CLAUDE_SYMLINK,
-            ];
-            gitignoreUpdated = ensureGitignoreEntries(destRoot, gitignoreEntries);
-        }
-
-        return {
-            manifestPath,
-            repoCount: links.length,
-            repos: sourceRepos.map((repo) => ({
-                source: repo.source,
-                skills: repo.skills,
-            })),
-            skills: incomingSkills,
-            targets: [{ agent: 'agents', relDir: CANONICAL_SKILLS_DIR, skills: incomingSkills }],
-            destRoot,
-            gitignoreUpdated,
-            symlinkCreated: claudeLink.changed,
-            claudeLink,
-            duplicateSkills: skillConflicts,
-            legacyMigration: { migratedSkills: [], skippedExistingSkills: [] },
-        };
-    } finally {
-        for (const source of acquired) {
-            try {
-                source.cleanup();
-            } catch (_) {}
-        }
+        sourceRepos.push({
+            source: entry.url,
+            name: entry.name,
+            branch: entry.branch,
+            repoPath,
+            skills: entry.skills,
+            availableSkills,
+        });
     }
+
+    const incomingSkills = Array.from(skillSource.keys());
+    const isGitRepoTarget = reposSvc.isGitRepository(destRoot);
+    const agentsSkillsDir = path.join(destRoot, CANONICAL_SKILLS_DIR);
+    fs.rmSync(agentsSkillsDir, { recursive: true, force: true });
+    fs.mkdirSync(agentsSkillsDir, { recursive: true });
+
+    for (const [skill, source] of skillSource.entries()) {
+        copySkill(path.join(source.repoPath, 'skills', skill), path.join(agentsSkillsDir, skill));
+    }
+
+    const claudeLink = ensureClaudeSymlink(destRoot);
+    let gitignoreUpdated = false;
+    if (isGitRepoTarget) {
+        const gitignoreEntries = [
+            ...incomingSkills.map(skill => `${CANONICAL_SKILLS_DIR}/${skill}`),
+            CANONICAL_AGENT_DIR,
+            CLAUDE_SYMLINK,
+        ];
+        gitignoreUpdated = ensureGitignoreEntries(destRoot, gitignoreEntries);
+    }
+
+    return {
+        manifestPath,
+        repoCount: entries.length,
+        repos: sourceRepos.map((repo) => ({
+            source: repo.source,
+            name: repo.name,
+            branch: repo.branch,
+            skills: repo.skills,
+            availableSkills: repo.availableSkills,
+        })),
+        skills: incomingSkills,
+        targets: [{ agent: 'agents', relDir: CANONICAL_SKILLS_DIR, skills: incomingSkills }],
+        destRoot,
+        gitignoreUpdated,
+        symlinkCreated: claudeLink.changed,
+        claudeLink,
+        duplicateSkills: skillConflicts,
+        legacyMigration: { migratedSkills: [], skippedExistingSkills: [] },
+    };
 }
 
 export function findSkillsManifestPath(targetRoot) {

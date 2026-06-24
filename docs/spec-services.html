@@ -296,13 +296,18 @@ function addRepo(repoName, repoUrl) {
     return { status: 'added' };
 }
 
-// Enable/disable repositories
-function enableRepo(repoName) {
-    const enabled = loadEnabledRepos();
-    if (!enabled.includes(repoName)) {
-        enabled.push(repoName);
-        saveEnabledRepos(enabled);
-    }
+// Install/uninstall repositories
+function installRepo(url, name, branch) {
+    const repoName = name || deriveRepoNameFromUrl(url);
+    cloneOrRefresh(url, repoName, branch);
+    rememberRepoSource(repoName, { url, branch, kind: classifyRepoKind(repoName) });
+}
+
+function uninstallRepo(target) {
+    const repoName = resolveInstalledRepoTarget(target);
+    disableAgentsFromRepo(repoName);
+    removeRepoCheckout(repoName);
+    preserveRepoSource(repoName);
 }
 
 function getActiveRepos(reposDir) {
@@ -530,11 +535,11 @@ async function applyManifestDirectives(agentName) {
     const { manifestPath } = findAgent(agentName);
     const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
     
-    // Auto-add repositories
+    // Auto-install repositories
     if (manifest.repos) {
         for (const [name, url] of Object.entries(manifest.repos)) {
-            console.log(`Auto-adding repo: ${name}`);
-            addRepo(name, url);
+            console.log(`Auto-installing repo: ${name}`);
+            installRepo(url, name);
         }
     }
     
@@ -667,7 +672,7 @@ cli.js
 ├── docker/           // Container management (shared helpers + interactive + management)
 │   └── workspace.js  // Read agent registry
 ├── repos.js          // Repository management
-│   └── workspace.js  // Store enabled repos
+│   └── workspace.js  // Store source metadata and installed repos
 ├── agents.js         // Agent lifecycle
 │   ├── workspace.js  // Update registry
 │   ├── docker/       // Create containers
