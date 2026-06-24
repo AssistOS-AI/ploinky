@@ -74,17 +74,12 @@ Every agent container receives the following reserved environment variables from
 | `PLOINKY_AGENT_ID` | Canonical agent principal: `agent:<repo>/<agentName>` |
 | `PLOINKY_AGENT_PRINCIPAL` | Alias for `PLOINKY_AGENT_ID` |
 | `PLOINKY_AGENT_SECRET` | Per-agent HMAC signing secret (hex) derived from master via HKDF |
-| `PLOINKY_AGENT_API_KEY` | Signed-subject Soul Gateway API key: `<subjectId>|<base64url-ed25519-sig>` |
-| `SOUL_GATEWAY_API_KEY` | Canonical compatibility alias — same value as `PLOINKY_AGENT_API_KEY`, except during the temporary hosted Soul Gateway migration exception documented below |
-| `PLOINKY_SOUL_GATEWAY_API_PUBLIC_KEY` | Ed25519 public key for verifying signed-subject keys (Soul Gateway uses this) |
+| `PLOINKY_AGENT_API_KEY` | Signed-subject identity key: `<subjectId>|<base64url-ed25519-sig>` |
+| `PLOINKY_AGENT_API_PUBLIC_KEY` | Ed25519 public key for verifying signed-subject identity keys |
 | `PLOINKY_ENV_SOURCE_PLOINKY_AGENT_API_KEY` | Always `generated` (provenance marker) |
-| `PLOINKY_ENV_SOURCE_SOUL_GATEWAY_API_KEY` | Canonically `generated`; temporarily `explicit` only when the hosted Soul Gateway override is active |
+| `PLOINKY_ENV_SOURCE_PLOINKY_AGENT_API_PUBLIC_KEY` | Always `generated` (provenance marker) |
 
 `PLOINKY_MASTER_KEY` and `PLOINKY_DERIVED_MASTER_KEY` are never injected into an agent (asserted by `tests/unit/agentEnvInjection.test.mjs`). The agent verifier reads only `PLOINKY_AGENT_SECRET` with no fallback to the master or a shared key. Router and agent logs must not record secrets or whole JWTs.
-
-The `SOUL_GATEWAY_API_KEY` alias is injected by the launcher as a signed-subject value, NOT as a manifest `sharedGeneratedSecret`. Agents that already consume `SOUL_GATEWAY_API_KEY` for Soul Gateway calls continue to work without changes.
-
-Temporary hosted Soul Gateway compatibility narrows this rule only for agents that explicitly opt into the migration bridge through manifest env configuration. In that case, a real operator-supplied `SOUL_GATEWAY_API_KEY` may be re-appended after generated identity injection and marked `PLOINKY_ENV_SOURCE_SOUL_GATEWAY_API_KEY=explicit`. This exception is not canonical DS013 identity behavior and must not be treated as a general replacement for the generated local Soul Gateway credential path.
 
 This remains true even for delegated-user flows. Agents do not receive the router's session key or delegation-signing key and cannot mint User Delegation Grants themselves; they still receive only their own per-agent secret.
 
@@ -143,16 +138,8 @@ Response: Migration is a non-goal: the workspace is operator-controlled and rest
 ### Question #4: Why does an agent's own secret derive from the master while the agent never sees the master?
 Response: HKDF is one-way, so the router/launcher derive and inject only the per-agent result; an agent cannot recover the master or another agent's secret from its own. This keeps a single configured root key while giving every agent an isolated, non-repudiable signing identity.
 
-### Question #5: Why can `SOUL_GATEWAY_API_KEY` temporarily be explicit?
-Response: The hosted Soul Gateway bridge predates the local Soul Gateway-only end state. The launcher therefore preserves an explicit hosted key for agents that opt into the bridge, while keeping `PLOINKY_AGENT_API_KEY` generated and preserving all request-signing identity boundaries. This is a temporary compatibility exception, not canonical identity injection. The implementation must be removed when `soul.axiologic.dev` is no longer a supported runtime dependency.
-
-Temporary implementation offsets:
-
-```text
-cli/services/docker/agentServiceManager.js:L295-L310
-cli/services/docker/agentServiceManager.js:L804-L812
-cli/services/docker/agentServiceManager.js:L875-L890
-```
+### Question #5: Why was the service-specific credential alias removed?
+Response: Decision 2026-06-24: the signed-subject API credential is router-owned subject identity material, not a service-specific credential. Agents receive `PLOINKY_AGENT_API_KEY` and `PLOINKY_AGENT_API_PUBLIC_KEY` only; the temporary explicit-override bridge is removed. The identity signing keypair name changed with this hard cut, so first router start after the change creates a new identity signing keypair and a coordinated restart is required for consumers to receive the matching public key.
 
 ## Conclusion
 

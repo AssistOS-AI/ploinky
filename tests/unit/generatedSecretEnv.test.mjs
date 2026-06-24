@@ -8,8 +8,6 @@ const originalCwd = process.cwd();
 const originalMasterKey = process.env.PLOINKY_MASTER_KEY;
 const originalGeneratedTestSecret = process.env.GENERATED_SECRET_TEST_SECRET;
 const originalSharedSecret = process.env.SHARED_GENERATED_SECRET;
-const originalSoulGatewayApiKey = process.env.SOUL_GATEWAY_API_KEY;
-const originalSoulGatewayBaseUrl = process.env.SOUL_GATEWAY_BASE_URL;
 const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-generated-env-'));
 process.chdir(tempDir);
 process.env.PLOINKY_MASTER_KEY = '7'.repeat(64);
@@ -38,62 +36,7 @@ test.after(() => {
     } else {
         process.env.SHARED_GENERATED_SECRET = originalSharedSecret;
     }
-    if (originalSoulGatewayApiKey === undefined) {
-        delete process.env.SOUL_GATEWAY_API_KEY;
-    } else {
-        process.env.SOUL_GATEWAY_API_KEY = originalSoulGatewayApiKey;
-    }
-    if (originalSoulGatewayBaseUrl === undefined) {
-        delete process.env.SOUL_GATEWAY_BASE_URL;
-    } else {
-        process.env.SOUL_GATEWAY_BASE_URL = originalSoulGatewayBaseUrl;
-    }
 });
-
-function withSoulGatewayEnv(values, fn) {
-    const previousApiKey = process.env.SOUL_GATEWAY_API_KEY;
-    const previousBaseUrl = process.env.SOUL_GATEWAY_BASE_URL;
-    try {
-        if (Object.prototype.hasOwnProperty.call(values, 'SOUL_GATEWAY_API_KEY')) {
-            process.env.SOUL_GATEWAY_API_KEY = values.SOUL_GATEWAY_API_KEY;
-        } else {
-            delete process.env.SOUL_GATEWAY_API_KEY;
-        }
-        if (Object.prototype.hasOwnProperty.call(values, 'SOUL_GATEWAY_BASE_URL')) {
-            process.env.SOUL_GATEWAY_BASE_URL = values.SOUL_GATEWAY_BASE_URL;
-        } else {
-            delete process.env.SOUL_GATEWAY_BASE_URL;
-        }
-        return fn();
-    } finally {
-        if (previousApiKey === undefined) {
-            delete process.env.SOUL_GATEWAY_API_KEY;
-        } else {
-            process.env.SOUL_GATEWAY_API_KEY = previousApiKey;
-        }
-        if (previousBaseUrl === undefined) {
-            delete process.env.SOUL_GATEWAY_BASE_URL;
-        } else {
-            process.env.SOUL_GATEWAY_BASE_URL = previousBaseUrl;
-        }
-    }
-}
-
-function soulGatewayConsumerManifest() {
-    return {
-        env: [
-            {
-                name: 'SOUL_GATEWAY_API_KEY',
-                sharedGeneratedSecret: true,
-                explicitOverride: true,
-            },
-            {
-                name: 'SOUL_GATEWAY_BASE_URL',
-                value: '',
-            },
-        ],
-    };
-}
 
 test('buildEnvMap derives generatedSecret entries from the current agent identity', () => {
     const manifest = {
@@ -177,120 +120,6 @@ test('sharedGeneratedSecret entries can derive from varName', () => {
     assert.equal(env.JWT_SECRET, deriveWorkspaceSecret({
         name: 'ONLYOFFICE_JWT_SECRET',
     }));
-});
-
-test('sharedGeneratedSecret overrides can opt into explicit values when companions are present', () => {
-    withSoulGatewayEnv({
-        SOUL_GATEWAY_API_KEY: 'external-soul-key',
-        SOUL_GATEWAY_BASE_URL: 'https://soul.example.test/v1',
-    }, () => {
-        const env = buildEnvMap(soulGatewayConsumerManifest(), null, {
-            repoName: 'AssistOSExplorer',
-            agentName: 'llmAssistant',
-        });
-
-        assert.equal(env.SOUL_GATEWAY_API_KEY, 'external-soul-key');
-        assert.equal(env.PLOINKY_ENV_SOURCE_SOUL_GATEWAY_API_KEY, 'explicit');
-        assert.equal(env.SOUL_GATEWAY_BASE_URL, 'https://soul.example.test/v1');
-    });
-});
-
-test('sharedGeneratedSecret override can accept an explicit key without an explicit base URL', () => {
-    withSoulGatewayEnv({
-        SOUL_GATEWAY_API_KEY: 'external-soul-key',
-    }, () => {
-        const env = buildEnvMap(soulGatewayConsumerManifest(), null, {
-            repoName: 'AssistOSExplorer',
-            agentName: 'llmAssistant',
-        });
-
-        assert.equal(env.SOUL_GATEWAY_API_KEY, 'external-soul-key');
-        assert.equal(env.PLOINKY_ENV_SOURCE_SOUL_GATEWAY_API_KEY, 'explicit');
-        assert.equal(env.SOUL_GATEWAY_BASE_URL, '');
-    });
-});
-
-test('sharedGeneratedSecret companion requirements can still require a complete explicit pair', () => {
-    const manifest = {
-        env: [
-            {
-                name: 'SOUL_GATEWAY_API_KEY',
-                sharedGeneratedSecret: true,
-                explicitOverrideRequires: ['SOUL_GATEWAY_BASE_URL'],
-            },
-            {
-                name: 'SOUL_GATEWAY_BASE_URL',
-                value: '',
-            },
-        ],
-    };
-
-    withSoulGatewayEnv({
-        SOUL_GATEWAY_API_KEY: 'external-soul-key',
-    }, () => {
-        const env = buildEnvMap(manifest, null, {
-            repoName: 'AssistOSExplorer',
-            agentName: 'llmAssistant',
-        });
-
-        assert.equal(env.SOUL_GATEWAY_API_KEY, deriveWorkspaceSecret({
-            name: 'SOUL_GATEWAY_API_KEY',
-        }));
-        assert.equal(env.PLOINKY_ENV_SOURCE_SOUL_GATEWAY_API_KEY, 'generated');
-        assert.equal(env.SOUL_GATEWAY_BASE_URL, '');
-    });
-});
-
-test('generated local Soul Gateway key can coexist with remote provider key alias', () => {
-    const manifest = {
-        env: {
-            SOUL_GATEWAY_API_KEY: {
-                sharedGeneratedSecret: true,
-            },
-            SOUL_GATEWAY_PROVIDER_API_KEY: {
-                varName: 'SOUL_GATEWAY_API_KEY',
-                default: '',
-            },
-        },
-    };
-
-    withSoulGatewayEnv({
-        SOUL_GATEWAY_API_KEY: 'external-soul-key',
-    }, () => {
-        const env = buildEnvMap(manifest, null, {
-            repoName: 'proxies',
-            agentName: 'soul-gateway',
-        });
-
-        assert.equal(env.SOUL_GATEWAY_API_KEY, deriveWorkspaceSecret({
-            name: 'SOUL_GATEWAY_API_KEY',
-        }));
-        assert.equal(env.PLOINKY_ENV_SOURCE_SOUL_GATEWAY_API_KEY, 'generated');
-        assert.equal(env.SOUL_GATEWAY_PROVIDER_API_KEY, 'external-soul-key');
-    });
-});
-
-test('sharedGeneratedSecret override can resolve from workspace .env', () => {
-    withSoulGatewayEnv({}, () => {
-        const envFilePath = path.join(tempDir, '.env');
-        fs.writeFileSync(envFilePath, [
-            'SOUL_GATEWAY_API_KEY=env-file-soul-key',
-            'SOUL_GATEWAY_BASE_URL=https://env-file-soul.example.test/v1',
-            '',
-        ].join('\n'));
-        try {
-            const env = buildEnvMap(soulGatewayConsumerManifest(), null, {
-                repoName: 'AssistOSExplorer',
-                agentName: 'llmAssistant',
-            });
-
-            assert.equal(env.SOUL_GATEWAY_API_KEY, 'env-file-soul-key');
-            assert.equal(env.PLOINKY_ENV_SOURCE_SOUL_GATEWAY_API_KEY, 'explicit');
-            assert.equal(env.SOUL_GATEWAY_BASE_URL, 'https://env-file-soul.example.test/v1');
-        } finally {
-            fs.rmSync(envFilePath, { force: true });
-        }
-    });
 });
 
 test('generatedSecret works in object-form env declarations', () => {

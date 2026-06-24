@@ -39,12 +39,12 @@ function formatModelOption(entry) {
 }
 
 export async function loadSoulModelCatalog() {
-    const apiKey = String(getSecret('SOUL_GATEWAY_API_KEY') || '').trim();
+    const apiKey = String(getSecret('PLOINKY_AGENT_API_KEY') || '').trim();
     if (!apiKey) {
         return {
             models: [],
             tags: [],
-            warning: 'SOUL_GATEWAY_API_KEY is not set. Add it in .secrets or .env to load models.',
+            warning: 'PLOINKY_AGENT_API_KEY is not set. Add it in .secrets or .env to load models.',
         };
     }
 
@@ -106,7 +106,7 @@ export async function loadSoulModelCatalog() {
             tags: [...tagSet].sort((a, b) => a.localeCompare(b)),
             warning: uniqueModels.length
                 ? null
-                : 'Soul gateway returned 0 models for this API key.',
+                : 'Gateway returned 0 models for this API key.',
         };
     } catch (error) {
         return {

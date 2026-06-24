@@ -678,7 +678,7 @@ function readGlobalDepsPackage(env = process.env) {
  * achillesAgentLib at a different branch or source for a single deploy without
  * editing tracked files.
  *
- * A bare value (e.g. "soul-gateway-local-integration") is treated as a branch
+ * A bare value (e.g. "my-feature") is treated as a branch
  * and swapped onto the existing dependency URL. A full npm spec (git+..., a
  * URL, github:, npm: or file:) is used verbatim.
  *

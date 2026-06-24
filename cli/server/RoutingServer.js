@@ -43,9 +43,9 @@ import { policy } from './policy/index.js';
 import { createHttpServiceProvider, createManifestRouteProvider } from './policy/HttpRouteProviders.js';
 import { hasInternalAgentSegment } from './internalAgentPath.js';
 import {
-    SOUL_GATEWAY_USER_API_KEY_PATH,
-    handleSoulGatewayUserApiKeyRoute,
-} from './soulGatewayUserKeyRoute.js';
+    USER_IDENTITY_KEY_PATH,
+    handleUserIdentityKeyRoute,
+} from './userIdentityKeyRoute.js';
 import {
     OPENAI_AGENT_DISCOVERY_PATH,
     handleOpenAiAgentDiscoveryRoute,
@@ -441,9 +441,10 @@ async function processRequest(req, res) {
     }
 
     // Router-owned, agent-authenticated discovery of enabled OpenAI-style chat
-    // backends for Soul Gateway. Dispatched here (before the session-auth gate)
-    // because it authenticates an HTTP Agent Assertion itself, not a browser
-    // session: a session is neither sufficient nor required.
+    // backends for an OpenAI-compatible gateway consumer. Dispatched here
+    // (before the session-auth gate) because it authenticates an HTTP Agent
+    // Assertion itself, not a browser session: a session is neither sufficient
+    // nor required.
     if (pathname === OPENAI_AGENT_DISCOVERY_PATH) {
         const handled = handleOpenAiAgentDiscoveryRoute(req, res, parsedUrl);
         if (handled) return;
@@ -503,11 +504,11 @@ async function processRequest(req, res) {
         if (!authResult.ok) return;
     }
 
-    // Router-owned: mint a signed Soul Gateway user API key. Reached only after
+    // Router-owned: mint a router-signed user identity key. Reached only after
     // the auth gate above populated req.user (the handler enforces its own 401
     // for any unauthenticated caller and derives admin status internally).
-    if (pathname === SOUL_GATEWAY_USER_API_KEY_PATH) {
-        const handled = await handleSoulGatewayUserApiKeyRoute(req, res, parsedUrl);
+    if (pathname === USER_IDENTITY_KEY_PATH) {
+        const handled = await handleUserIdentityKeyRoute(req, res, parsedUrl);
         if (handled) return;
     }
 

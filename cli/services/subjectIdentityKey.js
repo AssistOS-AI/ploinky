@@ -5,15 +5,15 @@ import path from 'path';
 import { PLOINKY_DIR } from './config.js';
 import { deriveSubkey, resolveMasterKey as resolveConfiguredMasterKey } from './masterKey.js';
 
-// Soul Gateway signed-subject key primitive.
+// Signed-subject identity key primitive.
 //
 // Mints Ploinky-issued API keys of the exact shape `subjectId|sign(subjectId)`
 // where the signature is an Ed25519 signature over the *exact UTF-8 bytes of
 // subjectId and nothing else* (no timestamps, nonces, or scopes). The signing
 // (private) key is generated and stored locally by Ploinky and never leaves the
-// process: only `getOrCreateSoulGatewaySigningKeypair()` ever holds it, and no
-// function returns it to callers. The matching public key is what the Soul
-// Gateway verifies against.
+// process: only `getOrCreateIdentitySigningKeypair()` ever holds it, and no
+// function returns it to callers. The matching public key is what consumers
+// verify against.
 //
 // Storage mirrors the repo's existing encrypted-store idiom
 // (cli/services/encryptedPasswordStore.js): an AES-256-GCM envelope keyed by a
@@ -21,7 +21,7 @@ import { deriveSubkey, resolveMasterKey as resolveConfiguredMasterKey } from './
 // atomically with 0o600 permissions under .ploinky/. The private key is
 // therefore encrypted at rest and never persisted in plaintext.
 
-const KEYPAIR_NAME = 'soul_gateway_api_signing_ed25519_v1';
+const KEYPAIR_NAME = 'ploinky_subject_identity_ed25519_v1';
 const KEYPAIR_STORE_FILE = path.join(PLOINKY_DIR, `${KEYPAIR_NAME}.enc`);
 const STORE_VERSION = 1;
 const ALGORITHM = 'aes-256-gcm';
@@ -48,10 +48,10 @@ const USER_SUBJECT_RE = new RegExp(`^user:(${SEGMENT})$`);
 
 // Typed error so callers can distinguish validation, parse, and verification
 // failures by `code` rather than by string-matching messages.
-class SoulGatewayKeyError extends Error {
+class SubjectIdentityKeyError extends Error {
     constructor(code, message) {
         super(message);
-        this.name = 'SoulGatewayKeyError';
+        this.name = 'SubjectIdentityKeyError';
         this.code = code;
     }
 }
@@ -62,14 +62,14 @@ function resolveKeypairStoreFile() {
 
 function getStorageKey() {
     // Requires PLOINKY_MASTER_KEY; resolveMasterKey throws a clear error if absent.
-    resolveConfiguredMasterKey({ purpose: 'Soul Gateway API signing keypair storage' });
+    resolveConfiguredMasterKey({ purpose: 'subject identity signing keypair storage' });
     return deriveSubkey(SUBKEY_PURPOSE);
 }
 
 function decryptPacked(packedText) {
     const buf = Buffer.from(String(packedText || '').trim(), 'base64');
     if (buf.length < IV_BYTES + TAG_BYTES + 1) {
-        throw new Error('Encrypted Soul Gateway keypair envelope is incomplete.');
+        throw new Error('Encrypted subject identity keypair envelope is incomplete.');
     }
     const iv = buf.subarray(0, IV_BYTES);
     const tag = buf.subarray(IV_BYTES, IV_BYTES + TAG_BYTES);
@@ -97,7 +97,7 @@ function readStore() {
     try {
         raw = fs.readFileSync(storeFile, 'utf8').trim();
     } catch (error) {
-        throw new Error(`Unable to read Soul Gateway keypair store: ${error?.message || String(error)}`);
+        throw new Error(`Unable to read subject identity keypair store: ${error?.message || String(error)}`);
     }
     if (!raw) {
         return null;
@@ -106,11 +106,11 @@ function readStore() {
     try {
         plaintext = decryptPacked(raw);
     } catch (error) {
-        throw new Error(`Unable to decrypt Soul Gateway keypair store: ${error?.message || String(error)}`);
+        throw new Error(`Unable to decrypt subject identity keypair store: ${error?.message || String(error)}`);
     }
     const parsed = JSON.parse(plaintext.toString('utf8'));
     if (!parsed || typeof parsed !== 'object' || typeof parsed.privateKeyPem !== 'string' || typeof parsed.publicKeyPem !== 'string') {
-        throw new Error('Soul Gateway keypair store is malformed.');
+        throw new Error('Subject identity keypair store is malformed.');
     }
     return parsed;
 }
@@ -143,19 +143,19 @@ function encodePublicKey(publicKeyObject) {
 // a precise failure code.
 function decodePublicKey(publicKeyBase64url) {
     if (typeof publicKeyBase64url !== 'string' || publicKeyBase64url.length === 0) {
-        throw new SoulGatewayKeyError('INVALID_PUBLIC_KEY', 'Soul Gateway public key must be a non-empty base64url string.');
+        throw new SubjectIdentityKeyError('INVALID_PUBLIC_KEY', 'Subject identity public key must be a non-empty base64url string.');
     }
     // Buffer.from(..., 'base64url') never throws on malformed input; the
     // 32-byte length check below is the real guard against bad public keys.
     const raw = Buffer.from(publicKeyBase64url, 'base64url');
     if (raw.length !== ED25519_PUBLIC_KEY_BYTES) {
-        throw new SoulGatewayKeyError('INVALID_PUBLIC_KEY', 'Soul Gateway public key must decode to 32 raw Ed25519 bytes.');
+        throw new SubjectIdentityKeyError('INVALID_PUBLIC_KEY', 'Subject identity public key must decode to 32 raw Ed25519 bytes.');
     }
     const spki = Buffer.concat([ED25519_SPKI_PREFIX, raw]);
     try {
         return crypto.createPublicKey({ key: spki, format: 'der', type: 'spki' });
     } catch (_) {
-        throw new SoulGatewayKeyError('INVALID_PUBLIC_KEY', 'Soul Gateway public key could not be parsed as Ed25519.');
+        throw new SubjectIdentityKeyError('INVALID_PUBLIC_KEY', 'Subject identity public key could not be parsed as Ed25519.');
     }
 }
 
@@ -165,7 +165,7 @@ function decodePublicKey(publicKeyBase64url) {
 // a slash inside a user id, etc. — all rejected by the anchored validators).
 function classifySubject(subjectId) {
     if (typeof subjectId !== 'string') {
-        throw new SoulGatewayKeyError('INVALID_SUBJECT', 'Subject id must be a string.');
+        throw new SubjectIdentityKeyError('INVALID_SUBJECT', 'Subject id must be a string.');
     }
     if (AGENT_SUBJECT_RE.test(subjectId)) {
         return { subjectId, subjectType: 'agent' };
@@ -173,7 +173,7 @@ function classifySubject(subjectId) {
     if (USER_SUBJECT_RE.test(subjectId)) {
         return { subjectId, subjectType: 'user' };
     }
-    throw new SoulGatewayKeyError(
+    throw new SubjectIdentityKeyError(
         'INVALID_SUBJECT',
         'Subject id must match agent:<repo>/<agentName> or user:<userId> with no whitespace, empty segments, or extra delimiters.',
     );
@@ -183,7 +183,7 @@ function classifySubject(subjectId) {
 // create and persist one. The private key stays inside this function's local
 // scope and the returned KeyObjects; only the encoded public key string is ever
 // surfaced to other functions. NOTE: callers receive only the public key — see
-// getOrCreateSoulGatewaySigningKeypair() for the public-facing return shape.
+// getOrCreateIdentitySigningKeypair() for the public-facing return shape.
 function loadOrCreateKeyObjects() {
     let store = readStore();
     if (!store) {
@@ -205,7 +205,7 @@ function loadOrCreateKeyObjects() {
 // Ensure a signing keypair exists and return ONLY non-secret material. The
 // private key is never included in the return value (and never logged). Callers
 // that need to verify use the returned `publicKey` (base64url, raw 32 bytes).
-function getOrCreateSoulGatewaySigningKeypair() {
+function getOrCreateIdentitySigningKeypair() {
     const { publicKeyObject } = loadOrCreateKeyObjects();
     return Object.freeze({
         name: KEYPAIR_NAME,
@@ -215,7 +215,7 @@ function getOrCreateSoulGatewaySigningKeypair() {
 }
 
 // Return the public key as base64url without padding (raw 32-byte Ed25519 key).
-function getSoulGatewayPublicKey() {
+function getSubjectIdentityPublicKey() {
     const { publicKeyObject } = loadOrCreateKeyObjects();
     return encodePublicKey(publicKeyObject);
 }
@@ -223,7 +223,7 @@ function getSoulGatewayPublicKey() {
 // Validate `subjectId`, sign its exact UTF-8 bytes with the local private key,
 // and return `${subjectId}|${signatureBase64url}`. The private key is loaded,
 // used, and discarded entirely within this call.
-function buildSoulGatewayApiKey(subjectId) {
+function buildSubjectIdentityKey(subjectId) {
     const { subjectId: validSubjectId } = classifySubject(subjectId);
     const { privateKeyObject } = loadOrCreateKeyObjects();
     const signature = crypto.sign(null, Buffer.from(validSubjectId, 'utf8'), privateKeyObject);
@@ -232,20 +232,20 @@ function buildSoulGatewayApiKey(subjectId) {
 
 // Parse `<subjectId>|<signature>`, verify the signature over the exact subject
 // id bytes using the supplied base64url public key, and return
-// `{ subjectId, subjectType }`. Throws a typed SoulGatewayKeyError on any
+// `{ subjectId, subjectType }`. Throws a typed SubjectIdentityKeyError on any
 // malformed key, invalid public key, invalid subject, or failed verification.
-function verifySoulGatewayApiKey(apiKey, publicKey) {
+function verifySubjectIdentityKey(apiKey, publicKey) {
     if (typeof apiKey !== 'string') {
-        throw new SoulGatewayKeyError('MALFORMED_API_KEY', 'API key must be a string.');
+        throw new SubjectIdentityKeyError('MALFORMED_API_KEY', 'API key must be a string.');
     }
     // Exactly one delimiter: split into exactly two non-empty parts.
     const parts = apiKey.split('|');
     if (parts.length !== 2) {
-        throw new SoulGatewayKeyError('MALFORMED_API_KEY', 'API key must be exactly "<subjectId>|<signature>".');
+        throw new SubjectIdentityKeyError('MALFORMED_API_KEY', 'API key must be exactly "<subjectId>|<signature>".');
     }
     const [subjectId, signaturePart] = parts;
     if (!subjectId || !signaturePart) {
-        throw new SoulGatewayKeyError('MALFORMED_API_KEY', 'API key has an empty subject or signature segment.');
+        throw new SubjectIdentityKeyError('MALFORMED_API_KEY', 'API key has an empty subject or signature segment.');
     }
     // Validate/classify the subject BEFORE doing any signature math.
     const { subjectId: validSubjectId, subjectType } = classifySubject(subjectId);
@@ -255,7 +255,7 @@ function verifySoulGatewayApiKey(apiKey, publicKey) {
     // emptiness check below is the real guard against a bad signature segment.
     const signature = Buffer.from(signaturePart, 'base64url');
     if (signature.length === 0) {
-        throw new SoulGatewayKeyError('MALFORMED_API_KEY', 'API key signature is empty.');
+        throw new SubjectIdentityKeyError('MALFORMED_API_KEY', 'API key signature is empty.');
     }
 
     let ok = false;
@@ -265,16 +265,16 @@ function verifySoulGatewayApiKey(apiKey, publicKey) {
         ok = false;
     }
     if (!ok) {
-        throw new SoulGatewayKeyError('SIGNATURE_INVALID', 'Soul Gateway API key signature verification failed.');
+        throw new SubjectIdentityKeyError('SIGNATURE_INVALID', 'Subject identity key signature verification failed.');
     }
     return { subjectId: validSubjectId, subjectType };
 }
 
 export {
-    SoulGatewayKeyError,
+    SubjectIdentityKeyError,
     KEYPAIR_NAME,
-    getOrCreateSoulGatewaySigningKeypair,
-    getSoulGatewayPublicKey,
-    buildSoulGatewayApiKey,
-    verifySoulGatewayApiKey,
+    getOrCreateIdentitySigningKeypair,
+    getSubjectIdentityPublicKey,
+    buildSubjectIdentityKey,
+    verifySubjectIdentityKey,
 };

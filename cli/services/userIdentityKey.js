@@ -1,10 +1,10 @@
 import {
-    SoulGatewayKeyError,
-    buildSoulGatewayApiKey,
-    getSoulGatewayPublicKey,
-} from './soulGatewaySubjectKey.js';
+    SubjectIdentityKeyError,
+    buildSubjectIdentityKey,
+    getSubjectIdentityPublicKey,
+} from './subjectIdentityKey.js';
 
-// Soul Gateway user API-key builder.
+// Subject-identity user API-key builder.
 //
 // Pure orchestration over the Task 1 signing primitive: given the authenticated
 // session user, an (optional) requested target userId, and whether the caller is
@@ -18,7 +18,7 @@ import {
 //   - An admin may mint for another user by supplying `requestedUserId`. When an
 //     admin omits it, they get their own key.
 // The userId is fed through the primitive's `user:<userId>` validator, so an
-// invalid id (slash, pipe, whitespace, empty) raises a typed SoulGatewayKeyError
+// invalid id (slash, pipe, whitespace, empty) raises a typed SubjectIdentityKeyError
 // (code INVALID_SUBJECT) which the route maps to a 400 instead of a crash.
 
 // Derive a non-empty user identifier from a session-user object. The router
@@ -41,14 +41,14 @@ function resolveSessionUserId(sessionUser) {
 
 // Build the `{ subjectId, apiKey, publicKey }` result for a user-key request.
 // `requestedUserId` is only honored when `isAdmin` is true; otherwise the
-// session user's own id is always used. Throws SoulGatewayKeyError on any
+// session user's own id is always used. Throws SubjectIdentityKeyError on any
 // invalid/missing identifier so callers can map it to a 400.
 function buildUserApiKeyResult({ sessionUser, requestedUserId = null, isAdmin = false } = {}) {
     const ownUserId = resolveSessionUserId(sessionUser);
     if (!ownUserId) {
-        throw new SoulGatewayKeyError(
+        throw new SubjectIdentityKeyError(
             'INVALID_SUBJECT',
-            'Cannot mint a Soul Gateway user API key without an authenticated user id.',
+            'Cannot mint a user identity key without an authenticated user id.',
         );
     }
 
@@ -61,10 +61,10 @@ function buildUserApiKeyResult({ sessionUser, requestedUserId = null, isAdmin = 
     }
 
     const subjectId = `user:${targetUserId}`;
-    // classifySubject inside buildSoulGatewayApiKey throws INVALID_SUBJECT for a
+    // classifySubject inside buildSubjectIdentityKey throws INVALID_SUBJECT for a
     // userId that does not match the [A-Za-z0-9._:-]+ segment alphabet.
-    const apiKey = buildSoulGatewayApiKey(subjectId);
-    const publicKey = getSoulGatewayPublicKey();
+    const apiKey = buildSubjectIdentityKey(subjectId);
+    const publicKey = getSubjectIdentityPublicKey();
     return { subjectId, apiKey, publicKey };
 }
 

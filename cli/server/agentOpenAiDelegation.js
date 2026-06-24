@@ -16,7 +16,7 @@ import {
 /**
  * agentOpenAiDelegation.js — router-mediated agent-to-agent OpenAI calls.
  *
- * A Soul Gateway agent (or any agent) POSTs `/<routeKey>/v1/chat/completions`
+ * A gateway consumer agent (or any agent) POSTs `/<routeKey>/v1/chat/completions`
  * carrying an HTTP Agent Assertion (`Authorization: Bearer <jwt>`) whose `rch`
  * binds the EXACT request body bytes via computeRchHttp(). The router:
  *   1. buffers the raw body ONCE,

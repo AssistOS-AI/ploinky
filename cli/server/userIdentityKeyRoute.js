@@ -1,25 +1,25 @@
 import { sendJson } from './authHandlers/index.js';
 import { readJsonBody } from './handlers/common.js';
 import { Caller } from './policy/Caller.js';
-import { buildUserApiKeyResult } from '../services/soulGatewayUserKey.js';
-import { SoulGatewayKeyError } from '../services/soulGatewaySubjectKey.js';
+import { buildUserApiKeyResult } from '../services/userIdentityKey.js';
+import { SubjectIdentityKeyError } from '../services/subjectIdentityKey.js';
 
-// Router-owned endpoint: POST /api/router/soul-gateway/user-api-key
+// Router-owned endpoint: POST /api/router/identity/user-api-key
 //
-// Mints a Ploinky-signed Soul Gateway user API key (`user:<id>|<signature>`) for
+// Mints a router-signed user identity key (`user:<id>|<signature>`) for
 // the authenticated caller. Ploinky owns the private signing key, so this lives
-// here rather than in the Soul Gateway. The handler is a thin wrapper: it trusts
+// in the router. The handler is a thin wrapper: it trusts
 // `req.user` (populated upstream by ensureAuthenticated), parses the JSON body,
 // derives admin status from the canonical Caller convention, delegates the
 // privilege decision + signing to the pure buildUserApiKeyResult, and serializes
 // the result. All key logic — including the no-horizontal-escalation rule — lives
 // in the pure function so it stays unit-testable.
 
-export const SOUL_GATEWAY_USER_API_KEY_PATH = '/api/router/soul-gateway/user-api-key';
+export const USER_IDENTITY_KEY_PATH = '/api/router/identity/user-api-key';
 
-export async function handleSoulGatewayUserApiKeyRoute(req, res, parsedUrl) {
+export async function handleUserIdentityKeyRoute(req, res, parsedUrl) {
     const pathname = parsedUrl?.pathname || '';
-    if (pathname !== SOUL_GATEWAY_USER_API_KEY_PATH) {
+    if (pathname !== USER_IDENTITY_KEY_PATH) {
         return false;
     }
 
@@ -72,7 +72,7 @@ export async function handleSoulGatewayUserApiKeyRoute(req, res, parsedUrl) {
         // than only `instanceof`: that stays correct even if the key primitive is
         // resolved through a second module copy, where the class identity differs.
         const isInvalidSubject = error?.code === 'INVALID_SUBJECT'
-            || (error instanceof SoulGatewayKeyError && error.code === 'INVALID_SUBJECT');
+            || (error instanceof SubjectIdentityKeyError && error.code === 'INVALID_SUBJECT');
         if (isInvalidSubject) {
             sendJson(res, 400, {
                 ok: false,
@@ -86,4 +86,4 @@ export async function handleSoulGatewayUserApiKeyRoute(req, res, parsedUrl) {
     }
 }
 
-export default handleSoulGatewayUserApiKeyRoute;
+export default handleUserIdentityKeyRoute;

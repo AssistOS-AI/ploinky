@@ -179,6 +179,8 @@ The current branch uses `PLOINKY_MASTER_KEY` as the single configured workspace 
 Response:
 The shared-HMAC model injected one `derived-master` key into every agent, so any agent that read the shared secret could mint tokens for another principal — no non-repudiation between agents. That model is replaced (DS013): each agent receives only its own `PLOINKY_AGENT_SECRET`, derived from the master via HKDF with the agent id as domain separation. The router signs each Router Request with the target agent's secret, and agent-to-agent calls are authenticated by an Agent Assertion the source agent signs with its own secret and the router verifies by deriving that agent's secret. One agent reading its own environment can no longer forge tokens for another. This restores non-repudiation between enabled agents within the local trust domain; multi-tenant or mutually hostile hosting would still require additional issuer hardening (e.g. asymmetric signatures) but is outside the documented model.
 
+Decision 2026-06-24: router-issued signed-subject API credentials are generic identity material. Agents receive `PLOINKY_AGENT_API_KEY` and `PLOINKY_AGENT_API_PUBLIC_KEY` only; service-specific credential aliases are not part of the security contract.
+
 ### Question #3: Why are runtime sandboxes not described as complete containment?
 
 Response:

@@ -41,7 +41,7 @@ class MockResponse {
     }
 }
 
-function makeRequest({ method = 'POST', url = '/api/router/soul-gateway/user-api-key', body, user }) {
+function makeRequest({ method = 'POST', url = '/api/router/identity/user-api-key', body, user }) {
     const chunks = body === undefined ? [] : [Buffer.from(JSON.stringify(body), 'utf8')];
     const req = Readable.from(chunks);
     req.method = method;
@@ -63,7 +63,7 @@ function makeRequest({ method = 'POST', url = '/api/router/soul-gateway/user-api
 async function invoke(handler, options) {
     const req = makeRequest(options);
     const res = new MockResponse();
-    const parsedUrl = new URL(options.url || '/api/router/soul-gateway/user-api-key', 'http://localhost');
+    const parsedUrl = new URL(options.url || '/api/router/identity/user-api-key', 'http://localhost');
     const handled = await handler(req, res, parsedUrl);
     return {
         handled,
@@ -97,16 +97,16 @@ async function loadModules(t) {
     });
 
     const nonce = `${Date.now()}-${Math.random()}`;
-    const route = await import(`${pathToFileURL(path.join(REPO_ROOT, 'cli/server/soulGatewayUserKeyRoute.js')).href}?test=${nonce}`);
-    const pure = await import(`${pathToFileURL(path.join(REPO_ROOT, 'cli/services/soulGatewayUserKey.js')).href}?test=${nonce}`);
-    const primitive = await import(`${pathToFileURL(path.join(REPO_ROOT, 'cli/services/soulGatewaySubjectKey.js')).href}?test=${nonce}`);
+    const route = await import(`${pathToFileURL(path.join(REPO_ROOT, 'cli/server/userIdentityKeyRoute.js')).href}?test=${nonce}`);
+    const pure = await import(`${pathToFileURL(path.join(REPO_ROOT, 'cli/services/userIdentityKey.js')).href}?test=${nonce}`);
+    const primitive = await import(`${pathToFileURL(path.join(REPO_ROOT, 'cli/services/subjectIdentityKey.js')).href}?test=${nonce}`);
     return { route, pure, primitive };
 }
 
 test('authenticated user receives user:<id>|<signature> that verifies, with the public key', async (t) => {
     const { route, primitive } = await loadModules(t);
 
-    const result = await invoke(route.handleSoulGatewayUserApiKeyRoute, {
+    const result = await invoke(route.handleUserIdentityKeyRoute, {
         user: { id: '123', username: 'alice', roles: ['user'] },
     });
 
@@ -116,11 +116,11 @@ test('authenticated user receives user:<id>|<signature> that verifies, with the 
     assert.ok(result.body.apiKey.startsWith('user:123|'), `apiKey should start with user:123| (got ${result.body.apiKey})`);
     assert.equal(typeof result.body.publicKey, 'string');
     assert.ok(result.body.publicKey.length > 0);
-    assert.equal(result.body.publicKey, primitive.getSoulGatewayPublicKey());
+    assert.equal(result.body.publicKey, primitive.getSubjectIdentityPublicKey());
 
     // Real signature round-trip: the returned key verifies as the user subject.
     assert.deepEqual(
-        primitive.verifySoulGatewayApiKey(result.body.apiKey, result.body.publicKey),
+        primitive.verifySubjectIdentityKey(result.body.apiKey, result.body.publicKey),
         { subjectId: 'user:123', subjectType: 'user' },
     );
 });
@@ -129,7 +129,7 @@ test('a body userId is ignored for a non-admin (no horizontal privilege escalati
     const { route, primitive } = await loadModules(t);
 
     // Non-admin alice (id 123) attempts to mint a key for victim 999.
-    const result = await invoke(route.handleSoulGatewayUserApiKeyRoute, {
+    const result = await invoke(route.handleUserIdentityKeyRoute, {
         body: { userId: '999' },
         user: { id: '123', username: 'alice', roles: ['user'] },
     });
@@ -139,7 +139,7 @@ test('a body userId is ignored for a non-admin (no horizontal privilege escalati
     assert.equal(result.body.subjectId, 'user:123');
     assert.ok(result.body.apiKey.startsWith('user:123|'));
     assert.deepEqual(
-        primitive.verifySoulGatewayApiKey(result.body.apiKey, result.body.publicKey),
+        primitive.verifySubjectIdentityKey(result.body.apiKey, result.body.publicKey),
         { subjectId: 'user:123', subjectType: 'user' },
     );
 });
@@ -148,7 +148,7 @@ test('an admin CAN mint a key for another userId via the body', async (t) => {
     const { route, primitive } = await loadModules(t);
 
     // Admin (roles include admin) mints for another user 999.
-    const result = await invoke(route.handleSoulGatewayUserApiKeyRoute, {
+    const result = await invoke(route.handleUserIdentityKeyRoute, {
         body: { userId: '999' },
         user: { id: 'local:admin', username: 'admin', roles: ['user', 'admin'] },
     });
@@ -157,7 +157,7 @@ test('an admin CAN mint a key for another userId via the body', async (t) => {
     assert.equal(result.body.subjectId, 'user:999');
     assert.ok(result.body.apiKey.startsWith('user:999|'));
     assert.deepEqual(
-        primitive.verifySoulGatewayApiKey(result.body.apiKey, result.body.publicKey),
+        primitive.verifySubjectIdentityKey(result.body.apiKey, result.body.publicKey),
         { subjectId: 'user:999', subjectType: 'user' },
     );
 });
@@ -165,7 +165,7 @@ test('an admin CAN mint a key for another userId via the body', async (t) => {
 test('an admin with no body userId mints their own key', async (t) => {
     const { route } = await loadModules(t);
 
-    const result = await invoke(route.handleSoulGatewayUserApiKeyRoute, {
+    const result = await invoke(route.handleUserIdentityKeyRoute, {
         user: { id: 'local:admin', username: 'admin', roles: ['admin'] },
     });
 
@@ -177,7 +177,7 @@ test('an admin with no body userId mints their own key', async (t) => {
 test('an anonymous request is rejected with 401 and no key is minted', async (t) => {
     const { route } = await loadModules(t);
 
-    const result = await invoke(route.handleSoulGatewayUserApiKeyRoute, {
+    const result = await invoke(route.handleUserIdentityKeyRoute, {
         // no user => unauthenticated
     });
 
@@ -195,7 +195,7 @@ test('a guest session is rejected — guests do not satisfy authenticated access
     // which is NOT an authenticated user. The route must refuse to mint a signed
     // key for it even though req.user is a populated object, otherwise an
     // unauthenticated guest could self-issue a usable Soul Gateway credential.
-    const result = await invoke(route.handleSoulGatewayUserApiKeyRoute, {
+    const result = await invoke(route.handleUserIdentityKeyRoute, {
         body: { userId: '999' },
         user: { id: 'guest:abc', username: 'visitor', roles: ['guest'] },
     });
@@ -215,7 +215,7 @@ test('an invalid userId returns 400, not a crash', async (t) => {
     // this set: it means "no userId supplied" and correctly falls back to self
     // (covered by the next test), so it must not 400.
     for (const badId of ['a/b', 'a|b', 'has space', 'a\tb']) {
-        const result = await invoke(route.handleSoulGatewayUserApiKeyRoute, {
+        const result = await invoke(route.handleUserIdentityKeyRoute, {
             body: { userId: badId },
             user: { id: 'local:admin', username: 'admin', roles: ['admin'] },
         });
@@ -228,7 +228,7 @@ test('an invalid userId returns 400, not a crash', async (t) => {
 test('an admin supplying an empty-string userId falls back to their own key (not a 400)', async (t) => {
     const { route } = await loadModules(t);
 
-    const result = await invoke(route.handleSoulGatewayUserApiKeyRoute, {
+    const result = await invoke(route.handleUserIdentityKeyRoute, {
         body: { userId: '' },
         user: { id: 'local:admin', username: 'admin', roles: ['admin'] },
     });
@@ -243,7 +243,7 @@ test('a session user with no usable identifier fails closed with 400', async (t)
 
     // req.user is an object (so it passes the 401 gate) but carries no id /
     // username / email — there is nothing safe to sign, so it is a 400.
-    const result = await invoke(route.handleSoulGatewayUserApiKeyRoute, {
+    const result = await invoke(route.handleUserIdentityKeyRoute, {
         user: { roles: ['user'] },
     });
 
@@ -254,7 +254,7 @@ test('a session user with no usable identifier fails closed with 400', async (t)
 test('a non-POST method is rejected with 405', async (t) => {
     const { route } = await loadModules(t);
 
-    const result = await invoke(route.handleSoulGatewayUserApiKeyRoute, {
+    const result = await invoke(route.handleUserIdentityKeyRoute, {
         method: 'GET',
         user: { id: '123', username: 'alice', roles: ['user'] },
     });
@@ -268,7 +268,7 @@ test('the route handler returns false (does not handle) for a non-matching path'
 
     const req = makeRequest({ url: '/api/router/something-else', user: { id: '1', roles: ['user'] } });
     const res = new MockResponse();
-    const handled = await route.handleSoulGatewayUserApiKeyRoute(req, res, new URL('/api/router/something-else', 'http://localhost'));
+    const handled = await route.handleUserIdentityKeyRoute(req, res, new URL('/api/router/something-else', 'http://localhost'));
     assert.equal(handled, false);
     assert.equal(res.statusCode, 200); // untouched default
 });
@@ -294,11 +294,11 @@ test('the pure buildUserApiKeyResult enforces the privilege model directly', asy
 
     // Both keys verify under the shared public key.
     assert.deepEqual(
-        primitive.verifySoulGatewayApiKey(nonAdmin.apiKey, nonAdmin.publicKey),
+        primitive.verifySubjectIdentityKey(nonAdmin.apiKey, nonAdmin.publicKey),
         { subjectId: 'user:123', subjectType: 'user' },
     );
     assert.deepEqual(
-        primitive.verifySoulGatewayApiKey(admin.apiKey, admin.publicKey),
+        primitive.verifySubjectIdentityKey(admin.apiKey, admin.publicKey),
         { subjectId: 'user:999', subjectType: 'user' },
     );
 
@@ -309,6 +309,6 @@ test('the pure buildUserApiKeyResult enforces the privilege model directly', asy
             requestedUserId: 'a/b',
             isAdmin: true,
         }),
-        (err) => err?.name === 'SoulGatewayKeyError' && err.code === 'INVALID_SUBJECT',
+        (err) => err?.name === 'SubjectIdentityKeyError' && err.code === 'INVALID_SUBJECT',
     );
 });

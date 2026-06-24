@@ -301,23 +301,6 @@ function getLastFormattedEnvValue(envStrings, name) {
     return '';
 }
 
-function captureExplicitSoulGatewayEnv(envStrings) {
-    const apiKey = getLastFormattedEnvValue(envStrings, 'SOUL_GATEWAY_API_KEY');
-    const source = getLastFormattedEnvValue(envStrings, 'PLOINKY_ENV_SOURCE_SOUL_GATEWAY_API_KEY');
-    if (!apiKey || source !== 'explicit') {
-        return null;
-    }
-    return { apiKey, source };
-}
-
-function appendExplicitSoulGatewayEnv(envStrings, captured) {
-    if (!captured?.apiKey) {
-        return;
-    }
-    envStrings.push(formatEnvFlag('SOUL_GATEWAY_API_KEY', captured.apiKey));
-    envStrings.push(formatEnvFlag('PLOINKY_ENV_SOURCE_SOUL_GATEWAY_API_KEY', 'explicit'));
-}
-
 function mergeNodeOptions(existingValue, requiredOptions = []) {
     const parts = String(existingValue || '').split(/\s+/).filter(Boolean);
     const seen = new Set(parts);
@@ -828,7 +811,6 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     envStrings.push(formatEnvFlag('AGENT_NAME', agentName));
     envStrings.push(formatEnvFlag('WORKSPACE_PATH', agentWorkDir));
     envStrings.push(formatEnvFlag('PLOINKY_WORKSPACE_ROOT', PLOINKY_WORKSPACE_ROOT));
-    const explicitSoulGatewayEnv = captureExplicitSoulGatewayEnv(envStrings);
     // Apply env from manifest.runtime.resources.env (templates expanded).
     for (const [envKey, envValue] of Object.entries(applyRuntimeResourceEnv(resourcePlan))) {
         envStrings.push(formatEnvFlag(envKey, envValue));
@@ -849,7 +831,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     const profileEnv = normalizeProfileEnv(profileConfig?.env);
     // Primitive profile env values are already resolved by buildEnvFlags above.
     // Appending them again here would let defaults override operator-provided
-    // vars, for example clearing an explicit SOUL_GATEWAY_BASE_URL with "".
+    // vars, for example clearing an explicit gateway base URL override with "".
 
     const profileEnvVars = getProfileEnvVars(agentName, repoName, activeProfile, {
         containerName,
@@ -906,7 +888,6 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         for (const [key, value] of Object.entries(buildAgentIdentityEnv(deriveAgentPrincipalId(path.basename(path.dirname(agentPath)), agentName)))) {
             envStrings.push(formatEnvFlag(key, value));
         }
-        appendExplicitSoulGatewayEnv(envStrings, explicitSoulGatewayEnv);
     } catch (err) {
         debugLog(`[invocationAuth] could not set agent identity for ${agentName}: ${err?.message || err}`);
     }

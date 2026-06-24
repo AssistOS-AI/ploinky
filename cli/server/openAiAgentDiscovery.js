@@ -7,14 +7,14 @@ import { computeRchHttp, sha256RawBodyHash } from '../../Agent/lib/requestHash.m
 
 /**
  * openAiAgentDiscovery.js — router-owned, agent-authenticated discovery of the
- * enabled agents Soul Gateway may address as OpenAI-compatible chat backends.
+ * enabled agents an OpenAI-compatible gateway consumer may address as chat backends.
  *
  * GET /api/router/openai-agent-discovery returns one row per enabled route that
  * resolves to a manifest AND has an active host port. The response is built from
  * `route.hostPath` (via the exported readEnabledAgentManifest) plus the
  * enabled-agent fallback — never a `route.manifestPath`. It deliberately emits NO
- * `http://127.0.0.1:<routerPort>` base URLs: Soul Gateway composes the actual call
- * URL from its own PLOINKY_ROUTER_URL, the returned `routerPath`, and
+ * `http://127.0.0.1:<routerPort>` base URLs: the consumer composes the actual
+ * call URL from its own PLOINKY_ROUTER_URL, the returned `routerPath`, and
  * `chatCompletionsPath`. The container-internal port stays inside the router.
  *
  * The endpoint is for agents, not browsers: it requires an HTTP Agent Assertion
@@ -166,8 +166,8 @@ function sendJson(res, statusCode, body) {
  * Authentication is an HTTP Agent Assertion bound to the GET surface with `rch`
  * computed via computeRchHttp(); any missing/invalid/replayed/mismatched assertion
  * is a 401. On a verified caller it serves the discovery inventory (200). A non-2xx
- * response (here, 401) carries `complete:false` so Soul Gateway treats discovery as
- * failed and preserves its existing rows.
+ * response (here, 401) carries `complete:false` so the consumer treats discovery
+ * as failed and preserves its existing rows.
  */
 export function handleOpenAiAgentDiscoveryRoute(req, res, parsedUrl, {
     routing = loadRoutingConfig(),

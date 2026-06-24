@@ -1,5 +1,5 @@
 import { deriveAgentRequestSecret } from './masterKey.js';
-import { buildSoulGatewayApiKey, getSoulGatewayPublicKey } from './soulGatewaySubjectKey.js';
+import { buildSubjectIdentityKey, getSubjectIdentityPublicKey } from './subjectIdentityKey.js';
 
 /**
  * The per-agent identity injected into EVERY agent runtime (docker, bwrap, and
@@ -11,56 +11,50 @@ import { buildSoulGatewayApiKey, getSoulGatewayPublicKey } from './soulGatewaySu
  * The injected material is:
  *  - PLOINKY_AGENT_ID / PLOINKY_AGENT_PRINCIPAL — the canonical subject id.
  *  - PLOINKY_AGENT_SECRET — the per-agent request-signing secret derived from id.
- *  - PLOINKY_AGENT_API_KEY — the Soul Gateway signed-subject key for this id,
+ *  - PLOINKY_AGENT_API_KEY — the signed identity key for this id,
  *    of shape `<id>|<signature>`, minted at build time from the canonical subject.
- *  - SOUL_GATEWAY_API_KEY — the SAME signed-subject key, kept only as a
- *    provider-env compatibility alias for Achilles config loading. It carries the
- *    signed subject key, never a workspace key.
- *  - PLOINKY_SOUL_GATEWAY_API_PUBLIC_KEY — the public verification key (base64url)
- *    the Soul Gateway uses to verify the signed key. Only public material.
+ *  - PLOINKY_AGENT_API_PUBLIC_KEY — the public verification key (base64url)
+ *    consumers use to verify the signed key. Only public material.
  *  - PLOINKY_ENV_SOURCE_* — provenance markers (`generated`) flagging that the
  *    above identity values were minted here, not supplied by config.
  *
  * Centralized here so all three runtime managers inject one identical, audited
  * key set instead of duplicating the construction. Only public/derived material
- * is returned; the private signing key never leaves soulGatewaySubjectKey.js.
+ * is returned; the private signing key never leaves subjectIdentityKey.js.
  */
 export function buildAgentIdentityEnv(principalId) {
     const id = String(principalId || '').trim();
     if (!id) {
         throw new Error('agentIdentityEnv: principalId is required');
     }
-    // `id` is the canonical `agent:<repo>/<agentName>` subject, which is a valid
-    // Soul Gateway subject, so we can sign it directly. Mint once and reuse the
-    // same signed key for both the canonical name and the compatibility alias.
-    // NOTE: `buildSoulGatewayApiKey`/`getSoulGatewayPublicKey` widen the throw
+    // `id` is the canonical `agent:<repo>/<agentName>` subject, so we can sign it
+    // directly.
+    // NOTE: `buildSubjectIdentityKey`/`getSubjectIdentityPublicKey` widen the throw
     // surface beyond the prior master-key-absence path — they also touch the
     // encrypted keypair store (.ploinky/), so corrupt/unwritable key material now
     // throws here too. The docker/bwrap/lifecycle callers swallow this throw and
     // continue, which means a key-store fault degrades an agent to no-identity
     // rather than failing startup; fail-closing that path is a separate change.
-    const apiKey = buildSoulGatewayApiKey(id);
-    const publicKey = getSoulGatewayPublicKey();
+    const apiKey = buildSubjectIdentityKey(id);
+    const publicKey = getSubjectIdentityPublicKey();
     return {
         PLOINKY_AGENT_ID: id,
         PLOINKY_AGENT_PRINCIPAL: id,
         PLOINKY_AGENT_SECRET: deriveAgentRequestSecret(id),
         PLOINKY_AGENT_API_KEY: apiKey,
-        SOUL_GATEWAY_API_KEY: apiKey,
-        PLOINKY_SOUL_GATEWAY_API_PUBLIC_KEY: publicKey,
+        PLOINKY_AGENT_API_PUBLIC_KEY: publicKey,
         PLOINKY_ENV_SOURCE_PLOINKY_AGENT_API_KEY: 'generated',
-        PLOINKY_ENV_SOURCE_SOUL_GATEWAY_API_KEY: 'generated',
-        PLOINKY_ENV_SOURCE_PLOINKY_SOUL_GATEWAY_API_PUBLIC_KEY: 'generated',
+        PLOINKY_ENV_SOURCE_PLOINKY_AGENT_API_PUBLIC_KEY: 'generated',
     };
 }
 
 // Env names that are router-managed and must NEVER be settable by agent-supplied
 // configuration (manifest env, profile env, profile secrets, runtime resources):
 // the workspace master keys (must never enter an agent at all), the per-agent
-// identity, and the generated Soul Gateway signed key / public verification key /
+// identity, and the generated signed identity key / public verification key /
 // provenance markers. All of these must come only from `buildAgentIdentityEnv`,
 // never an override — a manifest must not be able to substitute its own signed
-// key, alias, public key, or forge a `generated` provenance claim.
+// key, public key, or forge a `generated` provenance claim.
 export const RESERVED_AGENT_ENV_NAMES = Object.freeze([
     'PLOINKY_MASTER_KEY',
     'PLOINKY_DERIVED_MASTER_KEY',
@@ -68,11 +62,9 @@ export const RESERVED_AGENT_ENV_NAMES = Object.freeze([
     'PLOINKY_AGENT_PRINCIPAL',
     'PLOINKY_AGENT_SECRET',
     'PLOINKY_AGENT_API_KEY',
-    'SOUL_GATEWAY_API_KEY',
-    'PLOINKY_SOUL_GATEWAY_API_PUBLIC_KEY',
+    'PLOINKY_AGENT_API_PUBLIC_KEY',
     'PLOINKY_ENV_SOURCE_PLOINKY_AGENT_API_KEY',
-    'PLOINKY_ENV_SOURCE_SOUL_GATEWAY_API_KEY',
-    'PLOINKY_ENV_SOURCE_PLOINKY_SOUL_GATEWAY_API_PUBLIC_KEY',
+    'PLOINKY_ENV_SOURCE_PLOINKY_AGENT_API_PUBLIC_KEY',
 ]);
 
 const RESERVED = new Set(RESERVED_AGENT_ENV_NAMES);
