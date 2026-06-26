@@ -4,6 +4,12 @@
 SCRIPT_DIR=$(dirname "$(readlink -f "$0")")
 export PLOINKY_ROOT=$(realpath "$SCRIPT_DIR/..")
 
+if [[ ! -d "$PLOINKY_ROOT/node_modules/achillesAgentLib" ]]; then
+    echo "Ploinky dependency missing: $PLOINKY_ROOT/node_modules/achillesAgentLib" >&2
+    echo "Run 'npm install' from $PLOINKY_ROOT before running ploinky." >&2
+    exit 1
+fi
+
 # Route shell (formerly light) mode explicitly to the dedicated launcher
 if [[ "$1" == "-shell" || "$1" == "sh" || "$1" == "--shell" ]]; then
     shift

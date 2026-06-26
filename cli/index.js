@@ -16,6 +16,17 @@ import { enableMultilineNavigation } from './services/multilineNavigation.js';
 import { getPredefinedRepos, parseStartArgs } from './services/repos.js';
 
 const COMMANDS = getCommandRegistry();
+const PLOINKY_ROOT = process.env.PLOINKY_ROOT || path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+
+function assertRuntimeDependencies() {
+    const agentLibPath = path.join(PLOINKY_ROOT, 'node_modules', 'achillesAgentLib');
+    try {
+        if (fs.statSync(agentLibPath).isDirectory()) return;
+    } catch (_) {}
+    console.error(`Ploinky dependency missing: ${agentLibPath}`);
+    console.error(`Run 'npm install' from ${PLOINKY_ROOT} before running ploinky.`);
+    process.exit(1);
+}
 
 function getPredefinedRepoNames() {
     return Object.keys(getPredefinedRepos() || {}).sort();
@@ -391,6 +402,7 @@ function main() {
     // should be synchronous to handle setup. Async logic is handled inside the REPL or
     // by letting the process run until the promise from handleCommand resolves.
     try {
+        assertRuntimeDependencies();
         logPloinkyDirectory();
         let args = process.argv.slice(2);
 
