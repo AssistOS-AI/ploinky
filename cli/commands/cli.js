@@ -13,6 +13,7 @@ import { refreshComponentToken, ensureComponentToken } from '../server/utils/rou
 import {
     getAgentContainerName,
     getRuntime,
+    containerExists,
     isContainerRunning,
     parseManifestPorts,
     resolveHostPortFromRuntime,
@@ -455,8 +456,21 @@ async function handleCommand(args) {
                     // Sandbox restart: stop process, then re-create via ensureAgentService
                     const bwrapRunning = isBwrapProcessRunning(resolved.shortAgentName);
                     const containerAlsoRunning = isContainerRunning(containerName);
-                    if (!bwrapRunning && !containerAlsoRunning) {
-                        console.error(`Agent '${agentName}' is not running.`);
+                    const containerPresent = containerAlsoRunning || containerExists(containerName) || Boolean(registryRecord?.containerName);
+                    if (!bwrapRunning && !containerPresent) {
+                        console.error(`Agent '${agentName}' has no existing container. Run 'ploinky reinstall ${agentName}'.`);
+                        return;
+                    }
+
+                    if (!bwrapRunning && !containerAlsoRunning && containerPresent) {
+                        const runtime = getRuntime();
+                        console.log(`Starting (${runtime}) agent '${agentName}'...`);
+                        try {
+                            execSync(`${runtime} start ${containerName}`, { stdio: 'inherit' });
+                            console.log('✓ Agent started.');
+                        } catch (e) {
+                            console.error(`Failed to start container ${containerName}: ${e.message}`);
+                        }
                         return;
                     }
 
@@ -522,15 +536,18 @@ async function handleCommand(args) {
                     }
                 } else {
                     // Container restart: keep the watchdog from racing a split stop/start.
-                    if (!isContainerRunning(containerName)) {
-                        console.error(`Agent '${agentName}' is not running.`);
+                    const runtime = getRuntime();
+                    const containerRunning = isContainerRunning(containerName);
+                    const containerPresent = containerRunning || containerExists(containerName) || Boolean(registryRecord?.containerName);
+                    if (!containerPresent) {
+                        console.error(`Agent '${agentName}' has no existing container. Run 'ploinky reinstall ${agentName}'.`);
                         return;
                     }
 
-                    const runtime = getRuntime();
-                    console.log(`Restarting (${runtime}) agent '${agentName}'...`);
+                    const runtimeAction = containerRunning ? 'restart' : 'start';
+                    console.log(`${containerRunning ? 'Restarting' : 'Starting'} (${runtime}) agent '${agentName}'...`);
                     try {
-                        execSync(`${runtime} restart ${containerName}`, { stdio: 'inherit' });
+                        execSync(`${runtime} ${runtimeAction} ${containerName}`, { stdio: 'inherit' });
                         try {
                             const { portMappings } = parseManifestPorts(manifest);
                             const containerPortCandidates = portMappings
@@ -570,9 +587,9 @@ async function handleCommand(args) {
                         } catch (routeError) {
                             console.warn(`[restart] Agent '${agentName}' restarted, but routing update failed: ${routeError?.message || routeError}`);
                         }
-                        console.log('✓ Agent restarted.');
+                        console.log(`✓ Agent ${containerRunning ? 'restarted' : 'started'}.`);
                     } catch (e) {
-                        console.error(`Failed to restart container ${containerName}: ${e.message}`);
+                        console.error(`Failed to ${runtimeAction} container ${containerName}: ${e.message}`);
                     }
                 }
             } else {
