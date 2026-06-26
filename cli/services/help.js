@@ -32,7 +32,9 @@ export function showHelp(args = []) {
   echo <VAR|$VAR>                Print the resolved value of a variable
   expose <ENV_NAME> [<$VAR|value>] [agent]  Expose to agent environment
   default-skills <repoName>      Refresh repo skills into .agents/skills while preserving other skills
-  list agents | repos            List agents (manifests) or predefined repos
+  list agents | repos | routes   List agents, predefined repos, or router routes
+  /settings | settings           Open the interactive model/settings menu
+  profile [name|list|show]       Inspect or change the active profile
 
 
 ▶ CLIENT OPERATIONS
@@ -45,6 +47,7 @@ export function showHelp(args = []) {
   disable agents-all             Disable all enabled agents and remove their containers
   reinstall <agentName>          Re-create a running agent container (destructive)
   stop | shutdown | clean        Stop containers | remove containers
+  destroy                        Stop router and remove workspace containers
   logs tail [router]             Follow router logs
   logs last <N>                  Show last N router log lines
 
@@ -110,7 +113,7 @@ function showDetailedHelp(topic, subtopic, subsubtopic) {
                 'var WEBDASHBOARD_TOKEN deadbeef  # Override dashboard token manually',
                 'var API_KEY sk-123456'
             ],
-            notes: "Use 'vars' to list variables. WebChat/WebMeet use the router login flow; only dashboard still uses a surface token."
+            notes: "Use 'vars' to list variables. WebChat uses the router login flow; only dashboard still uses a surface token."
         },
         'vars': {
             description: 'List workspace variables (from encrypted .ploinky/.secrets)',
@@ -222,6 +225,12 @@ function showDetailedHelp(topic, subtopic, subsubtopic) {
             examples: ['destroy'],
             notes: 'Irreversible for running containers; also clears .ploinky/agents so dependencies are rebuilt on next start.'
         },
+        'clean': {
+            description: 'Remove all workspace containers created by Ploinky.',
+            syntax: 'clean',
+            examples: ['clean'],
+            notes: 'Runs the workspace container removal workflow. Unlike destroy, it does not explicitly stop the router first.'
+        },
         
         'enable': {
             description: 'Enable features for agents',
@@ -321,6 +330,30 @@ function showDetailedHelp(topic, subtopic, subsubtopic) {
                     examples: [ 'logs last 200', 'logs last 50' ]
                 }
             }
+        },
+        '/settings': {
+            description: 'Open the interactive model/settings menu.',
+            syntax: '/settings',
+            examples: [ '/settings', 'settings' ],
+            notes: 'Requires an interactive TTY. The `settings` command is accepted as an alias.'
+        },
+        'settings': {
+            description: 'Alias for /settings.',
+            syntax: 'settings',
+            examples: [ 'settings' ],
+            notes: 'Requires an interactive TTY.'
+        },
+        'profile': {
+            description: 'Inspect or change the active runtime profile.',
+            syntax: 'profile [<profileName>|list|validate|show]',
+            examples: [
+                'profile',
+                'profile show',
+                'profile list',
+                'profile validate default',
+                'profile default'
+            ],
+            notes: 'Valid profile names are accepted directly and become the active profile.'
         },
         'disable': {
             description: 'Disable features',
@@ -636,14 +669,15 @@ function showDetailedHelp(topic, subtopic, subsubtopic) {
                 },
                 'task-status': {
                     syntax: 'client task-status <agent> <task-id>',
-                    description: 'Check the status of a submitted task',
+                    description: 'Compatibility helper for older task-status flows.',
                     params: {
                         '<agent>': 'Agent name',
-                        '<task-id>': 'Task ID returned when task was submitted'
+                        '<task-id>': 'Task ID returned by an older agent-specific async task flow'
                     },
                     examples: [
                         'client task-status MyAPI task-123'
-                    ]
+                    ],
+                    notes: 'This is not standardized for MCP tools. Prefer `client tool <toolName>` for current agent operations.'
                 }
             }
         }

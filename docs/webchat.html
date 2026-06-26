@@ -25,7 +25,6 @@
                         <li><a href="architecture.html">Architecture</a></li>
                         <li><a href="specs.html">Specs</a></li>
                         <li><a href="webchat.html" class="active">WebChat</a></li>
-                        <li><a href="spec-webmeet.html">WebMeet</a></li>
                         <li><button class="theme-toggle" id="themeToggle">🌙</button></li>
                     </ul>
                 </nav>
@@ -51,8 +50,8 @@
                         </div>
                         <div class="feature-card">
                             <div class="feature-icon">🔐</div>
-                            <h3>Token Security</h3>
-                            <p>Each session is gated by an access token that lives in <code>.ploinky/.secrets</code>. Share the URL to grant access.</p>
+                            <h3>Router Login</h3>
+                            <p>WebChat uses the router login flow, so access follows the same local or SSO session model as other authenticated router surfaces.</p>
                         </div>
                         <div class="feature-card">
                             <div class="feature-icon">🛠️</div>
@@ -63,14 +62,13 @@
                 </div>
 
                 <div class="doc-section">
-                    <h2>Access & Tokens</h2>
-                    <p>Use <code>ploinky webchat</code> to print the current access URL or pass <code>--rotate</code> to mint a fresh token when needed.</p>
-                    <pre><code>ploinky webchat          # ensure token and show access URL
-ploinky webchat --rotate # regenerate the token</code></pre>
+                    <h2>Access</h2>
+                    <p>Use <code>ploinky webchat</code> to print the current access URL. The command reports the router login URL; <code>--rotate</code> is accepted for compatibility but WebChat does not use a surface-specific token.</p>
+                    <pre><code>ploinky webchat          # show the router login URL
+ploinky webchat --rotate # show the same login URL</code></pre>
                     <div class="alert alert-info">
-                        Access URL format: <code>http://127.0.0.1:8080/webchat?token=&lt;WEBCHAT_TOKEN&gt;</code>
+                        Access URL format: <code>http://127.0.0.1:8080/webchat</code>
                     </div>
-                    <p>The token is stored as <code>WEBCHAT_TOKEN</code> in <code>.ploinky/.secrets</code>. Removing the entry or using <code>--rotate</code> forces a regeneration.</p>
                 </div>
 
                 <div class="doc-section">
@@ -128,9 +126,8 @@ ploinky cli achilles-cli --path=/absolute/path</code></pre>
                 <div class="doc-section">
                     <h2>Security Practices</h2>
                     <ul style="margin-left: 2rem;">
-                        <li>Rotate tokens regularly with <code>ploinky webchat --rotate</code>.</li>
-                        <li>Prefer sharing short-lived tokens and revoke access by rotating after a session concludes.</li>
-                        <li>Remember that tokens live in <code>.ploinky/.secrets</code>; secure that directory if you back it up or sync it.</li>
+                        <li>Use HTTPS or SSH tunnels when exposing the WebChat URL beyond localhost.</li>
+                        <li>Protect router session cookies and the encrypted <code>.ploinky/.secrets</code> store used by local auth, dashboard tokens, and manifest env.</li>
                     </ul>
                 </div>
 

@@ -24,8 +24,8 @@ p-cli
 enable agent my-agent
 start my-agent 8088
 
-# Web console (TTY + Chat)
-console my-agent myPassword
+# Browser chat surface
+webchat
 ```
 
 ## Usage
@@ -57,11 +57,12 @@ You can use Ploinky in two ways:
 - `start <staticAgent> <port>`: first run requires a static agent and port; subsequent runs can just use `start`.
   - Ensures all enabled agents are running and launches the Router on `<port>`.
   - Serves static files from the repository of `<staticAgent>`; non `/<agent>/...` paths are static.
-- `console <name> <password> [port]`: start the WebConsole (TTY + Chat) for an agent.
 - `cli <name> [args...]`: run the agent’s CLI command interactively.
 - `shell <name>`: open interactive `/bin/sh` in the agent container.
-- `client task <agent> [--parameters <params>] [-key value...]`: send a task to an agent.
-- `client methods <agent>`: list available methods for an agent.
+- `webchat [--rotate]`: print the WebChat access URL for the router login flow.
+- `dashboard [--rotate]`: prepare or rotate the dashboard token and print its access URL.
+- `client tool <toolName> [--agent <agent>] [--parameters <params>] [-key value...]`: call an MCP tool exposed by an enabled agent.
+- `client list tools|resources`: list MCP tools or resources exposed by enabled agents.
 - `client status <agent>`: check agent health status.
 - `stop`: stop containers recorded in `.ploinky/agents.json` (do not remove).
 - `shutdown`: stop and remove containers recorded in `.ploinky/agents.json`.
@@ -127,5 +128,4 @@ The cloud component will allow hosting multiple custom apps built on Ploinky, ea
 
 ## License
 
-MIT License - see [LICENSE](LICENSE).
-# gitAgent
+MIT License - see [LICENSE](LICENSE)

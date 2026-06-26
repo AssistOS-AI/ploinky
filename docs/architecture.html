@@ -30,7 +30,6 @@
                         <li><a href="architecture.html" class="active">Architecture</a></li>
                         <li><a href="specs.html">Specs</a></li>
                         <li><a href="webchat.html">WebChat</a></li>
-                        <li><a href="spec-webmeet.html">WebMeet</a></li>
                         <li><button class="theme-toggle" id="themeToggle">🌙</button></li>
                     </ul>
                 </nav>
@@ -69,13 +68,13 @@
                         <pre class="mermaid">
 graph TD
     UI["User Interface
-    CLI Commands / Web Console / Chat / Dashboard"]
+    CLI Commands / WebChat / Dashboard / Status"]
     CLI["Ploinky CLI Core
     Command Handler / Service Manager / Config"]
     RS["Routing Server
     + Watchdog"]
     WS["Web Services
-    WebTTY / Chat"]
+    WebChat / Dashboard / Status"]
     RT["Runtime Mgmt
     Container / Bwrap / Seatbelt"]
     AS["Agent Sandboxes
@@ -374,15 +373,7 @@ DATABASE_URL=postgres://localhost/db</code></pre>
                     <div class="doc-section" id="web-services">
                         <h2>Web Services Architecture</h2>
                         
-                        <h3>WebTTY/Console (cli/webtty/)</h3>
-                        <p>Provides terminal access through web browser:</p>
-                        <pre><code>// Component structure
-server.js       // HTTP/WebSocket server
-tty.js          // PTY management
-console.js      // Client-side terminal UI
-clientloader.js // Dynamic UI loader</code></pre>
-
-                        <h3>WebChat (cli/webtty/chat.js)</h3>
+                        <h3>WebChat (cli/server/handlers/webchat.js)</h3>
                         <p>Chat interface for CLI programs:</p>
                         <ul style="margin-left: 2rem;">
                             <li>Captures stdout/stdin through PTY</li>
@@ -447,14 +438,13 @@ observability.js    // Monitoring views</code></pre>
                         <h3>WebChat Session</h3>
                         <pre><code>1. User: webchat secret python bot.py
    
-2. WebTTY Server:
-   → Start PTY with command: python bot.py
-   → Create HTTP server on port 8080
-   → Serve chat.html interface
+2. Router WebChat handler:
+   → Start PTY for the selected agent CLI
+   → Serve chat.html through the router
    
 3. Browser connects:
    → WebSocket handshake
-   → Authenticate with password
+   → Authenticate through the router login flow
    → Establish bidirectional channel
    
 4. Message flow:

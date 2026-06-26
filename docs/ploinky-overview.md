@@ -28,22 +28,18 @@ Ploinky is a workspace-local runtime for repository-backed agents.
 - `ploinky destroy`: stop the router, remove all Ploinky runtimes for the workspace, and clear `.ploinky/agents/`.
 - `ploinky clean`: alias for `destroy`.
 - `ploinky logs tail [router]` and `ploinky logs last <N> [router]`: inspect router logs. Router logs are the only logs exposed through the CLI.
-- `ploinky webtty [shell] [--rotate]` and `ploinky webconsole [shell] [--rotate]`: show or rotate the WebTTY token and optionally set the interactive shell.
-- `ploinky webchat [--rotate]`: show or rotate the WebChat token.
-- `ploinky webmeet [moderatorAgent] [--rotate]`: show or rotate the WebMeet token and optionally persist the moderator agent.
+- `ploinky webchat [--rotate]`: print the WebChat access URL. WebChat uses the router login flow; `--rotate` is accepted for compatibility but does not mint a WebChat-specific token.
 - `ploinky dashboard [--rotate]`: show or rotate the dashboard token used for `/dashboard` and invitation-style `/status` access.
 - `ploinky client list tools|resources`, `ploinky client status <agent>`, and `ploinky client tool <name>`: inspect or call MCP surfaces through the router.
 
 ## Web surfaces
 
-- `/webtty`: browser terminal.
 - `/webchat`: chat surface over the same TTY stream, with encrypted transcript storage. When opened as `/webchat?agent=<name>&...`, the router forwards every additional query parameter except `tabId` to `ploinky cli <name>` as long-form CLI flags encoded as `--key=value`.
-- `/webmeet`: meeting and moderator UI.
 - `/dashboard`: management surface, including transcript and feedback views.
 - `/status`: read-only browser view that shells out to `ploinky status` and adds router-side server and agent summaries.
 - `/api/marketplace`: JSON endpoint for the first-party agent marketplace. `GET /api/marketplace` is available to authenticated local or SSO users and lists repositories, repository source metadata and kind, discoverable agents, enabled records, and runtime status. `POST /api/marketplace` is admin-only and supports `install_repo`, `uninstall_repo`, `enable_agent`, and `disable_agent`; repository uninstall disables agents from that repository and removes the checkout while preserving source metadata for reinstall. Marketplace agent disablement removes the enabled-agent registry record before removing the runtime container so the watchdog does not restart it during the operation.
 
-`/webtty`, `/webchat`, and `/webmeet` use the normal router login flow. `/dashboard` still supports `WEBDASHBOARD_TOKEN`, and `/status` reuses the dashboard token or dashboard invitation link for read-only access.
+`/webchat` uses the normal router login flow. `/dashboard` still supports `WEBDASHBOARD_TOKEN`, and `/status` reuses the dashboard token or dashboard invitation link for read-only access.
 
 ## Auth and agent cards
 

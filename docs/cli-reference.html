@@ -25,7 +25,6 @@
                         <li><a href="architecture.html">Architecture</a></li>
                         <li><a href="specs.html">Specs</a></li>
                         <li><a href="webchat.html">WebChat</a></li>
-                        <li><a href="spec-webmeet.html">WebMeet</a></li>
                         <li><button class="theme-toggle" id="themeToggle">🌙</button></li>
                     </ul>
                 </nav>
@@ -240,7 +239,7 @@ start
 start AchillesIDE/explorer 8080 --branch feature-branch
 
 # Per-repo branch override
-start AchillesIDE/explorer 8080 --branch feature-branch --repo-branch webmeetInfra=main
+start AchillesIDE/explorer 8080 --branch feature-branch --repo-branch proxies=main
 
 # Strict CI/deploy mode
 start AchillesIDE/explorer 8097 --branch feature-branch --branch-fallback fail --reset-repos</code></pre>
@@ -261,18 +260,6 @@ cli PyBot --version</code></pre>
                         <div class="alert alert-info">
                             Any extra arguments after <code>cli &lt;agentName&gt;</code> are appended directly to the manifest CLI command. This is also how routed WebChat launches pass query parameters through to an agent CLI.
                         </div>
-
-                        <h3>WebTTY Agent Shortcuts</h3>
-                        <p>Inside the Web Console/WebTTY, you can prefix a command with an agent name to run it inside that agent’s container via its CLI.</p>
-                        <pre><code># In WebTTY shell
-demo whoami     # opens 'cli demo', runs 'whoami', exits; shows only the command output
-demo ls /       # same: runs 'ls /' inside the demo container and prints only its output
-
-# Notes
-- Output is trimmed to the subcommand’s result (not the intermediate 'cli demo'/'exit' steps).
-- Requires the agent to define a <code>cli</code> command in its manifest; otherwise an error is shown.
-- Works in WebTTY/WebConsole sessions that use bash (default). If bash is unavailable, the fallback shell may not support this shortcut.
-- Equivalent to: open <code>cli &lt;agent&gt;</code>, run the subcommand, then exit.</code></pre>
 
                         <h3>status</h3>
                         <p>Show workspace status including agents, router, and web services.</p>
@@ -309,30 +296,14 @@ restart MyAPI    # Stop and then start the existing container for MyAPI</code></
                                 <th>Default</th>
                             </tr>
                             <tr>
-                                <td><code>WEBTTY_TOKEN</code></td>
-                                <td>WebConsole authentication token</td>
-                                <td>(randomly generated)</td>
-                            </tr>
-                            <tr>
-                                <td><code>WEBCHAT_TOKEN</code></td>
-                                <td>WebChat authentication token</td>
-                                <td>(randomly generated)</td>
-                            </tr>
-                            <tr>
                                 <td><code>WEBDASHBOARD_TOKEN</code></td>
                                 <td>Dashboard authentication token</td>
-                                <td>(randomly generated)</td>
-                            </tr>
-                            <tr>
-                                <td><code>WEBMEET_TOKEN</code></td>
-                                <td>WebMeet authentication token</td>
                                 <td>(randomly generated)</td>
                             </tr>
                         </table>
                         <pre><code># Examples
 var API_KEY sk-123456789
-var WEBTTY_TOKEN deadbeef
-var WEBTTY_PORT 9000</code></pre>
+var WEBDASHBOARD_TOKEN deadbeef</code></pre>
 
                         <h3>vars</h3>
                         <p>List all workspace variables.</p>
@@ -373,30 +344,14 @@ default-skills AchillesCopilotBasicSkills</code></pre>
                     <div class="doc-section" id="web">
                         <h2>Web Interfaces</h2>
                         
-                        <h3>webconsole / webtty</h3>
-                        <p>Prepare access for the Web Console (synonyms). Prints URL with token. Use --rotate to mint a new token.</p>
-                        <pre><code>webconsole [shell] [--rotate]
-webtty [shell] [--rotate]</code></pre>
-                        <pre><code># Examples
-webconsole
-webconsole --rotate
-webtty sh
-webtty /bin/zsh</code></pre>
-                        <div class="alert alert-info">
-                            Access at: http://127.0.0.1:8080/webtty?token=&lt;WEBTTY_TOKEN&gt;
-                        </div>
-                        <div class="alert alert-warning">
-                            Shell options: sh, zsh, dash, ksh, csh, tcsh, fish, or absolute path. When a shell is provided, the router is restarted (if previously configured) so changes apply immediately; otherwise changes take effect on next start.
-                        </div>
-
                         <h3>webchat</h3>
-                        <p>Prepare access for the WebChat interface. The command now only manages the access token and prints the router URL.</p>
+                        <p>Print the WebChat router login URL. WebChat does not use a surface-specific token.</p>
                         <pre><code>webchat [--rotate]</code></pre>
                         <pre><code># Examples
-webchat              # ensure token and show URL
-webchat --rotate     # mint a new token</code></pre>
+webchat              # show the router login URL
+webchat --rotate     # accepted for compatibility; still uses router login</code></pre>
                         <div class="alert alert-info">
-                            Access at: http://127.0.0.1:8080/webchat?token=&lt;WEBCHAT_TOKEN&gt;
+                            Access at: http://127.0.0.1:8080/webchat
                         </div>
                         <p>When opening WebChat with an explicit agent selection such as <code>/webchat?agent=achilles-cli&amp;path=/absolute/path</code>, the router forwards every additional query parameter except its internal session parameters to <code>ploinky cli achilles-cli</code> as single-token long-form CLI arguments such as <code>--path=/absolute/path</code>.</p>
 
@@ -413,26 +368,6 @@ webchat --rotate     # mint a new token</code></pre>
                             Access at: http://127.0.0.1:8080/dashboard?token=&lt;WEBDASHBOARD_TOKEN&gt;
                         </div>
 
-                        <h3>webmeet</h3>
-                        <p>Prepare access for WebMeet and optionally set a moderator agent. Prints URL with token.</p>
-                        <pre><code>webmeet [moderatorAgent] [--rotate]</code></pre>
-                        <table class="command-table">
-                            <tbody><tr>
-                                <th>Parameter</th>
-                                <th>Description</th>
-                            </tr>
-                            <tr>
-                                <td><code>[moderatorAgent]</code></td>
-                                <td>Agent to use as moderator</td>
-                            </tr>
-                            <tr>
-                                <td><code>--rotate</code></td>
-                                <td>Generate a new token</td>
-                            </tr>
-                        </tbody></table>
-                        <div class="alert alert-info">
-                            Access at: http://localhost:8080/webmeet (proxied by the router)
-                        </div>
                     </div>
 
                     <div class="doc-section" id="auth">

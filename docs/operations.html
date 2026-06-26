@@ -53,8 +53,8 @@
 
         <section class="chapter-section">
           <h2>Access Tokens and Invitations</h2>
-          <p><code>webtty</code>, <code>webconsole</code>, <code>webchat</code>, and <code>webmeet</code> now print access URLs for surfaces that use the normal router login flow. Only <code>dashboard</code> continues to mint or reuse a workspace token through <code>WEBDASHBOARD_TOKEN</code>.</p>
-          <p><code>webtty</code> and <code>webconsole</code> may still store <code>WEBTTY_SHELL</code> and <code>WEBTTY_COMMAND</code>, restarting the router when a shell override is applied. The read-only <code>/status</code> surface does not have a separate token namespace; it accepts a dashboard invitation link or the dashboard token instead.</p>
+          <p><code>webchat</code> prints the router login URL for the chat surface. Only <code>dashboard</code> mints or reuses a workspace token through <code>WEBDASHBOARD_TOKEN</code>.</p>
+          <p>The read-only <code>/status</code> surface does not have a separate token namespace; it accepts a dashboard invitation link or the dashboard token instead.</p>
         </section>
 
         <section class="chapter-section">

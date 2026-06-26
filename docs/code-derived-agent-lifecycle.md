@@ -40,7 +40,7 @@ All relative paths below are relative to the workspace directory where `ploinky`
 | `.ploinky/logs` | Router, watchdog, no-wait worker, and other logs. |
 | `.ploinky/running` | PID/status files, including router PID and no-wait worker status. |
 | `.ploinky/routing.json` | Router route table written during start/restart. |
-| `.ploinky/.secrets` | Encrypted secret store used by `var`, auth, dashboard/webtty tokens, and manifest env. |
+| `.ploinky/.secrets` | Encrypted secret store used by `var`, auth, dashboard tokens, and manifest env. |
 | `.ploinky/profile` | Active profile name, defaulting to `default`. |
 | `.ploinky/data/<key>` | Default host location for `runtime.resources.persistentStorage`. |
 | `.ploinky/container-runtime/<container>` | Podman staging directory used when symlink-heavy code needs a real mounted tree. |
@@ -89,10 +89,9 @@ The command surface is split between the registry in `cli/services/commandRegist
 | `list routes` | Prints `.ploinky/routing.json`. |
 | `shell <agent>` | Ensures the agent service is running, then attaches an interactive shell. |
 | `cli <agent> [args]` | Ensures the agent service is running, then attaches the manifest CLI command or default CLI script. |
-| `webconsole` / `webtty` | Optionally configures a router shell command, restarts router when needed, and prints a tokenized URL. |
-| `webchat` | Prints a tokenized webchat URL. Positional config arguments are rejected as removed. |
+| `webchat` | Prints the `/webchat` URL for the router login flow. Positional config arguments are rejected as removed. |
 | `dashboard` | Prints a tokenized dashboard URL. |
-| `client methods|status|list|tool|task|task-status` | Talks to the local router MCP endpoint. `call` is treated as an old/removed form. |
+| `client status|list|tool` | Talks to the local router MCP endpoint. `call`, `methods`, `task`, and `task-status` are old forms that print migration guidance. |
 | `/settings` / `settings` | Opens the settings menu and refreshes the LLM suggestion cache when env changes. |
 | `set` | Legacy spelling; prints that the command was renamed to `/settings`. |
 | `logs tail [router]` | Tails router log output. Router is the only supported target. |
@@ -245,7 +244,7 @@ flowchart TD
   D --> E{"static agent supplied?"}
   E -- yes --> F["enable static agent if needed and save _config.static"]
   E -- no --> G["load saved _config.static"]
-  F --> H["refresh webtty/webchat/dashboard tokens"]
+  F --> H["refresh dashboard token and print WebChat login URL"]
   G --> H
   H --> I["run static preinstall hook early when profile has preinstall"]
   I --> J["apply manifest repos and enable directives"]
@@ -584,7 +583,7 @@ sequenceDiagram
   Router->>Runtime: aggregate /mcp across agent routes
 ```
 
-Router-owned paths include `/health`, `/mcp`, `/agent-card`, `/auth/*`, `/api/agents/*`, `/api/marketplace`, `/webtty`, `/webchat`, `/dashboard`, `/status`, `/upload`, `/blobs`, `/workspace-files`, `/metrics`, `/admin`, and `/__agent`.
+Router-owned paths include `/health`, `/mcp`, `/agent-card`, `/auth/*`, `/api/agents/*`, `/api/marketplace`, `/webchat`, `/dashboard`, `/status`, `/upload`, `/blobs`, `/workspace-files`, `/metrics`, `/admin`, and `/__agent`.
 
 `/api/marketplace` is a first-party JSON management API for the Marketplace plugin. GET requires an authenticated local or SSO user and returns repository, source metadata, repository kind, agent, enabled-registry, and live runtime-status data. POST requires a local admin session and supports `install_repo`, `uninstall_repo`, `enable_agent`, and marketplace-specific `disable_agent`. Repository install requires a URL, accepts an optional name and branch, clones the checkout, and records source metadata. Repository uninstall disables enabled agents from that repo by container key, removes their runtime containers, removes the checkout, and preserves `repo_sources.json` metadata so the repo can be installed again. Marketplace deactivation removes the enabled-agent registry entry before removing the runtime container; the ordinary direct `disable agent` CLI command remains conservative and refuses to remove records while runtime state exists.
 

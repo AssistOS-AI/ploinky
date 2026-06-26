@@ -421,7 +421,7 @@ function main() {
             startInteractiveMode();
         } else {
             if (args[0] === 'help') {
-                showHelp();
+                showHelp(args.slice(1));
                 return;
             }
             // Let the promise resolve on its own. Node will wait.

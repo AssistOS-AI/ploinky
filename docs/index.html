@@ -104,7 +104,6 @@
                         <li><a href="architecture.html">Architecture</a></li>
                         <li><a href="spec-agent.html">Agent Spec</a></li>
                         <li><a href="webchat.html">WebChat</a></li>
-                        <li><a href="spec-webmeet.html">WebMeet</a></li>
                         <li><button class="theme-toggle" id="themeToggle">🌙</button></li>
                     </ul>
                 </nav>
@@ -158,7 +157,7 @@
                 <div class="feature-card">
                     <div class="feature-icon">🌐</div>
                     <h3>Web Interfaces</h3>
-                    <p>Transform any CLI tool into a modern web interface with WebConsole, WebChat, and Dashboard.</p>
+                    <p>Transform any CLI tool into a modern web interface with WebChat and Dashboard.</p>
                 </div>
                 <div class="feature-card">
                     <div class="feature-icon">🔧</div>
@@ -344,12 +343,6 @@ ploinky -shell &lt;text&gt;     # single-shot suggestion and exit</code></pre>
                 { type: 'output', text: 'remote: Compressing objects: 100% (11/11), done.' },
                 { type: 'output', text: 'remote: Total 19 (delta 0), reused 16 (delta 0), pack-reused 0 (from 0)' },
                 { type: 'output', text: 'Receiving objects: 100% (19/19), done.' },
-                { type: 'output', text: 'Cloning into \'.ploinky/repos/webmeet\'...' },
-                { type: 'output', text: 'remote: Enumerating objects: 8, done.' },
-                { type: 'output', text: 'remote: Counting objects: 100% (8/8), done.' },
-                { type: 'output', text: 'remote: Compressing objects: 100% (7/7), done.' },
-                { type: 'output', text: 'remote: Total 8 (delta 0), reused 5 (delta 0), pack-reused 0 (from 0)' },
-                { type: 'output', text: 'Receiving objects: 100% (8/8), done.' },
                 { type: 'info', text: 'Static: agent=demo port=8080' },
                 { type: 'output', text: 'f50f3026bfac2a027ad86fc51627318b994604796faa6dcece502afcd3b0f9d2' },
                 { type: 'output', text: '[install] running for \'demo\'...' },
@@ -361,9 +354,7 @@ ploinky -shell &lt;text&gt;     # single-shot suggestion and exit</code></pre>
                 { type: 'info', text: '[start] Dashboard: http://127.0.0.1:8080/dashboard' },
                 { type: 'output', text: '[RoutingServer] Ploinky server running on http://127.0.0.1:8080' },
                 { type: 'output', text: '  Dashboard: /dashboard' },
-                { type: 'output', text: '  WebTTY:    /webtty' },
                 { type: 'output', text: '  WebChat:   /webchat' },
-                { type: 'output', text: '  WebMeet:   /webmeet' },
                 { type: 'output', text: '  Status:    /status' },
                 { type: 'prompt', text: 'ploinky ~/Desktop/work> ' }
             ],
@@ -375,9 +366,7 @@ ploinky -shell &lt;text&gt;     # single-shot suggestion and exit</code></pre>
                 { type: 'output', text: '- Static: agent=demo port=8080' },
                 { type: 'output', text: '- Interfaces:' },
                 { type: 'output', text: '  • Dashboard: served via router (configured)' },
-                { type: 'output', text: '  • Web Console: served via router (configured)' },
                 { type: 'output', text: '  • WebChat: served via router (configured)' },
-                { type: 'output', text: '  • WebMeet: served via router (run "webmeet <agent>" to set moderator)' },
                 { type: 'output', text: '- Router: running (pid xxxxx)' },
                 { type: 'output', text: '- Agents:' },
                 { type: 'success', text: '  • demo [static]  [container: ploinky_agent_demo_work_xxxxxx] (running)' },
@@ -385,7 +374,6 @@ ploinky -shell &lt;text&gt;     # single-shot suggestion and exit</code></pre>
                 { type: 'success', text: '  • simulator  [container: ploinky_agent_simulator_work_xxxxxx] (running)' },
                 { type: 'output', text: '    image: node:18-alpine  repo: demo  cwd: ~/Desktop/work' },
                 { type: 'success', text: '  • moderator  [container: ploinky_agent_moderator_work_xxxxxx] (running)' },
-                { type: 'output', text: '    image: node:18-alpine  repo: webmeet  cwd: ~/Desktop/work' },
                 { type: 'prompt', text: 'ploinky ~/Desktop/work> ' }
             ]
         };
