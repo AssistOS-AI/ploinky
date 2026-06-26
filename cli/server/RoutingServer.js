@@ -25,6 +25,7 @@ import {
     proxyHttpPassthrough
 } from './routerHandlers.js';
 import { collectHttpServiceRoutes, resolveHttpServiceRoute } from './httpServiceRoutes.js';
+import { handleHttpServiceUpgrade } from './wsServiceProxy.js';
 
 // Logging
 import { appendLog, logBootEvent, logMemoryUsage } from './utils/logger.js';
@@ -583,6 +584,16 @@ const server = http.createServer((req, res) => {
             try { res.end(); } catch (_) { }
         }
     });
+});
+
+server.on('upgrade', async (req, socket, head) => {
+    try {
+        const parsedUrl = new URL(req.url, 'http://router.local');
+        const handled = await handleHttpServiceUpgrade({ req, socket, head, parsedUrl, policy });
+        if (!handled) { socket.write('HTTP/1.1 404 Not Found\r\n\r\n'); socket.destroy(); }
+    } catch (_) {
+        try { socket.destroy(); } catch (_) {}
+    }
 });
 
 // Setup process lifecycle management

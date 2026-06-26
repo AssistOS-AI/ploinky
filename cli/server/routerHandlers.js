@@ -226,7 +226,7 @@ const ROUTER_IDENTITY_HEADERS = new Set([
     'x-ploinky-session-id'
 ]);
 
-function stripRouterIdentityHeaders(headers = {}) {
+export function stripRouterIdentityHeaders(headers = {}) {
     const sanitized = {};
     for (const [name, value] of Object.entries(headers || {})) {
         if (ROUTER_IDENTITY_HEADERS.has(String(name || '').toLowerCase())) continue;
