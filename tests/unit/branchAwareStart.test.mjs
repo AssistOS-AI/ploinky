@@ -266,8 +266,8 @@ test('remoteBranchExists: detects existing branch', () => {
 
 test('ensureRepoInstalled: clones at requested branch', () => {
     const barePath = createBareRepo('test-install-branch', { branches: ['dev'] });
-    const ploinkyRepos = path.join(tempDir, '.ploinky', 'repos');
-    fs.mkdirSync(ploinkyRepos, { recursive: true });
+    const reposDir = path.join(tempDir, '.ploinky', 'repos');
+    fs.mkdirSync(reposDir, { recursive: true });
 
     const result = ensureRepoInstalled('test-install-branch', barePath, {
         branchPolicy: { branch: 'dev', repoBranches: {}, fallback: 'default', resetRepos: false },
@@ -277,7 +277,7 @@ test('ensureRepoInstalled: clones at requested branch', () => {
     assert.equal(result.branch, 'dev');
 
     const clonedBranch = String(execFileSync('git', [
-        '-C', path.join(ploinkyRepos, 'test-install-branch'),
+        '-C', path.join(reposDir, 'test-install-branch'),
         'rev-parse', '--abbrev-ref', 'HEAD',
     ])).trim();
     assert.equal(clonedBranch, 'dev');
@@ -285,8 +285,8 @@ test('ensureRepoInstalled: clones at requested branch', () => {
 
 test('ensureRepoInstalled: missing branch with fallback=default clones default', () => {
     const barePath = createBareRepo('test-install-fallback', { branches: [] });
-    const ploinkyRepos = path.join(tempDir, '.ploinky', 'repos');
-    fs.mkdirSync(ploinkyRepos, { recursive: true });
+    const reposDir = path.join(tempDir, '.ploinky', 'repos');
+    fs.mkdirSync(reposDir, { recursive: true });
 
     const result = ensureRepoInstalled('test-install-fallback', barePath, {
         branchPolicy: { branch: 'no-such', repoBranches: {}, fallback: 'default', resetRepos: false },
@@ -297,8 +297,8 @@ test('ensureRepoInstalled: missing branch with fallback=default clones default',
 
 test('ensureRepoInstalled: missing branch with fallback=fail throws', () => {
     const barePath = createBareRepo('test-install-fail', { branches: [] });
-    const ploinkyRepos = path.join(tempDir, '.ploinky', 'repos');
-    fs.mkdirSync(ploinkyRepos, { recursive: true });
+    const reposDir = path.join(tempDir, '.ploinky', 'repos');
+    fs.mkdirSync(reposDir, { recursive: true });
 
     assert.throws(
         () => ensureRepoInstalled('test-install-fail', barePath, {

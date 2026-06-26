@@ -13,7 +13,7 @@ Beyond a single agent, Ploinky supports a multi‑agent workspace. Each agent ru
 
 ```bash
 # Clone and setup
-git clone https://github.com/PlonkyRepos/ploinky.git
+git clone https://github.com/AssistOS-AI/ploinky.git
 cd ploinky
 export PATH="$PATH:$(pwd)/bin"
 
