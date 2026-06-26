@@ -5,7 +5,7 @@ import { fileURLToPath } from 'url';
 import { PLOINKY_DIR } from './config.js';
 
 const ACHILLES_PACKAGE_NAME = 'achillesAgentLib';
-const ACHILLES_REPO_URL = 'https://github.com/OutfinityResearch/achillesAgentLib.git';
+const ACHILLES_REPO_URL = 'https://github.com/AssistOS-AI/achillesAgentLib.git';
 const DEPENDENCY_SECTIONS = [
     'dependencies',
     'devDependencies',

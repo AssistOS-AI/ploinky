@@ -118,16 +118,16 @@ export function getActiveRepos(REPOS_DIR) {
 }
 
 const PREDEFINED_REPOS = {
-    basic: { url: 'https://github.com/PloinkyRepos/Basic.git', description: 'Default base agents', kind: 'agents' },
-    cloud: { url: 'https://github.com/PloinkyRepos/cloud.git', description: 'Cloud infrastructure agents', kind: 'agents' },
-    vibe: { url: 'https://github.com/PloinkyRepos/vibe.git', description: 'Vibe coding agents', kind: 'agents' },
-    security: { url: 'https://github.com/PloinkyRepos/security.git', description: 'Security and scanning tools', kind: 'agents' },
-    extra: { url: 'https://github.com/PloinkyRepos/extra.git', description: 'Additional utility agents', kind: 'agents' },
-    AchillesIDE: { url: 'https://github.com/PloinkyRepos/AssistOSExplorer.git', description: 'Workspace IDE with Explorer UI, SOPLang editing and Git workflows', kind: 'agents' },
-    AchillesCLI: { url: 'https://github.com/OutfinityResearch/AchillesCLI.git', description: 'Workspace CLI for setup and management', kind: 'agents' },
+    basic: { url: 'https://github.com/AssistOS-AI/Basic.git', description: 'Default base agents', kind: 'agents' },
+    cloud: { url: 'https://github.com/AssistOS-AI/cloud.git', description: 'Cloud infrastructure agents', kind: 'agents' },
+    vibe: { url: 'https://github.com/AssistOS-AI/vibe.git', description: 'Vibe coding agents', kind: 'agents' },
+    security: { url: 'https://github.com/AssistOS-AI/security.git', description: 'Security and scanning tools', kind: 'agents' },
+    extra: { url: 'https://github.com/AssistOS-AI/extra.git', description: 'Additional utility agents', kind: 'agents' },
+    AchillesIDE: { url: 'https://github.com/AssistOS-AI/AssistOSExplorer.git', description: 'Workspace IDE with Explorer UI, SOPLang editing and Git workflows', kind: 'agents' },
+    AchillesCLI: { url: 'https://github.com/AssistOS-AI/AchillesCLI.git', description: 'Workspace CLI for setup and management', kind: 'agents' },
     'copilot-agents': { url: 'https://github.com/AssistOS-AI/copilot-agents.git', description: 'OpenCode copilot agents', kind: 'agents' },
-    demo: { url: 'https://github.com/PloinkyRepos/demo.git', description: 'Demo agents and examples', kind: 'agents' },
-    proxies: { url: 'https://github.com/PloinkyRepos/proxies.git', description: 'API proxy agents (Kiro Gateway)', kind: 'agents' },
+    demo: { url: 'https://github.com/AssistOS-AI/demo.git', description: 'Demo agents and examples', kind: 'agents' },
+    proxies: { url: 'https://github.com/AssistOS-AI/proxies.git', description: 'API proxy agents (Kiro Gateway)', kind: 'agents' },
     AchillesCopilotBasicSkills: { url: 'https://github.com/AssistOS-AI/AchillesCopilotBasicSkills.git', description: 'Default Anthropic-style skill catalog (SKILL.md folders)', kind: 'skills' }
 };
 

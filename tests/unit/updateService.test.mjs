@@ -188,12 +188,12 @@ test('refreshPloinkyRuntimeAchillesDependency pulls the canonical runtime checko
 
 test('parseGitDependencyRef extracts url + ref for moving git specs and strips git+', () => {
     assert.deepEqual(
-        parseGitDependencyRef('git+https://github.com/OutfinityResearch/achillesAgentLib.git#master'),
-        { url: 'https://github.com/OutfinityResearch/achillesAgentLib.git', ref: 'master' },
+        parseGitDependencyRef('git+https://github.com/AssistOS-AI/achillesAgentLib.git#master'),
+        { url: 'https://github.com/AssistOS-AI/achillesAgentLib.git', ref: 'master' },
     );
     assert.deepEqual(
-        parseGitDependencyRef('git+https://github.com/PloinkyRepos/MCPSDK.git#main'),
-        { url: 'https://github.com/PloinkyRepos/MCPSDK.git', ref: 'main' },
+        parseGitDependencyRef('git+https://github.com/AssistOS-AI/MCPSDK.git#main'),
+        { url: 'https://github.com/AssistOS-AI/MCPSDK.git', ref: 'main' },
     );
     assert.deepEqual(
         parseGitDependencyRef('git+ssh://git@github.com/o/r.git#dev'),
@@ -224,8 +224,8 @@ test('resolveMovingGitDepCommits resolves each moving git dep via ls-remote, ski
     const calls = [];
     const commits = resolveMovingGitDepCommits(
         {
-            achillesAgentLib: 'git+https://github.com/OutfinityResearch/achillesAgentLib.git#master',
-            'mcp-sdk': 'git+https://github.com/PloinkyRepos/MCPSDK.git#main',
+            achillesAgentLib: 'git+https://github.com/AssistOS-AI/achillesAgentLib.git#master',
+            'mcp-sdk': 'git+https://github.com/AssistOS-AI/MCPSDK.git#main',
         },
         {
             execFile(command, args) {
@@ -252,8 +252,8 @@ test('resolveMovingGitDepCommits resolves each moving git dep via ls-remote, ski
 test('resolveMovingGitDepCommits omits deps whose ls-remote fails (fail-open)', () => {
     const commits = resolveMovingGitDepCommits(
         {
-            achillesAgentLib: 'git+https://github.com/OutfinityResearch/achillesAgentLib.git#master',
-            'mcp-sdk': 'git+https://github.com/PloinkyRepos/MCPSDK.git#main',
+            achillesAgentLib: 'git+https://github.com/AssistOS-AI/achillesAgentLib.git#master',
+            'mcp-sdk': 'git+https://github.com/AssistOS-AI/MCPSDK.git#main',
         },
         {
             execFile(command, args) {
@@ -270,7 +270,7 @@ test('resolveMovingGitDepCommits omits deps whose ls-remote fails (fail-open)', 
 
 test('resolveMovingGitDepCommits omits deps with empty/non-sha ls-remote output', () => {
     const commits = resolveMovingGitDepCommits(
-        { achillesAgentLib: 'git+https://github.com/OutfinityResearch/achillesAgentLib.git#nope' },
+        { achillesAgentLib: 'git+https://github.com/AssistOS-AI/achillesAgentLib.git#nope' },
         { execFile() { return '\n'; } },
     );
     assert.deepEqual(commits, {});

@@ -271,9 +271,9 @@ enable_repo_with_branch "demo"
 # These repos are referenced in demo's manifest.repos and need branch support for testing.
 # webmeet is also pre-cloned so we can slim moderator's enable list before
 # `ploinky start demo` triggers the recursive dependency-graph walk.
-preclone_manifest_repo "fileExplorer" "https://github.com/PloinkyRepos/AssistOSExplorer.git"
-preclone_manifest_repo "soplangBuilder" "https://github.com/PloinkyRepos/SOPLangBuilder.git"
-preclone_manifest_repo "webmeet" "https://github.com/PloinkyRepos/webmeet.git"
+preclone_manifest_repo "fileExplorer" "https://github.com/AssistOS-AI/AssistOSExplorer.git"
+preclone_manifest_repo "soplangBuilder" "https://github.com/AssistOS-AI/SOPLangBuilder.git"
+preclone_manifest_repo "webmeet" "https://github.com/AssistOS-AI/webmeet.git"
 
 # Trim cloned manifests to the minimum dependency surface required by
 # testsAfterStart.sh. Without this, dependency-gated startup (see

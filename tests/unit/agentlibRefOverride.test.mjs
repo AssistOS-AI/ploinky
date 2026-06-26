@@ -13,12 +13,12 @@ const { overrideGlobalDeps } = await import(`${depInstallerUrl.href}${moduleSuff
 // overrideGlobalDeps: rewrite the achillesAgentLib dependency from env
 // ---------------------------------------------------------------------------
 
-const BASE = 'git+https://github.com/OutfinityResearch/achillesAgentLib.git#master';
+const BASE = 'git+https://github.com/AssistOS-AI/achillesAgentLib.git#master';
 function freshPkg() {
     return {
         dependencies: {
             achillesAgentLib: BASE,
-            'mcp-sdk': 'git+https://github.com/PloinkyRepos/MCPSDK.git#main',
+            'mcp-sdk': 'git+https://github.com/AssistOS-AI/MCPSDK.git#main',
         },
     };
 }
@@ -27,7 +27,7 @@ test('overrideGlobalDeps: bare branch swaps the ref, preserves URL', () => {
     const out = overrideGlobalDeps(freshPkg(), { PLOINKY_AGENTLIB_REF: 'soul-gateway-local-integration' });
     assert.equal(
         out.dependencies.achillesAgentLib,
-        'git+https://github.com/OutfinityResearch/achillesAgentLib.git#soul-gateway-local-integration',
+        'git+https://github.com/AssistOS-AI/achillesAgentLib.git#soul-gateway-local-integration',
     );
 });
 
@@ -54,5 +54,5 @@ test('overrideGlobalDeps: blank env leaves deps unchanged', () => {
 
 test('overrideGlobalDeps: does not touch sibling deps', () => {
     const out = overrideGlobalDeps(freshPkg(), { PLOINKY_AGENTLIB_REF: 'br' });
-    assert.equal(out.dependencies['mcp-sdk'], 'git+https://github.com/PloinkyRepos/MCPSDK.git#main');
+    assert.equal(out.dependencies['mcp-sdk'], 'git+https://github.com/AssistOS-AI/MCPSDK.git#main');
 });
