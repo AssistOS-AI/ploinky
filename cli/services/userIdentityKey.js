@@ -4,6 +4,12 @@ import {
     getSubjectIdentityPublicKey,
 } from './subjectIdentityKey.js';
 
+const PUBLIC_USER_API_KEY_PREFIX = 'sk-soul-';
+
+function encodePublicUserApiKey(rawApiKey) {
+    return `${PUBLIC_USER_API_KEY_PREFIX}${Buffer.from(rawApiKey, 'utf8').toString('base64url')}`;
+}
+
 // Subject-identity user API-key builder.
 //
 // Pure orchestration over the Task 1 signing primitive: given the authenticated
@@ -63,7 +69,8 @@ function buildUserApiKeyResult({ sessionUser, requestedUserId = null, isAdmin = 
     const subjectId = `user:${targetUserId}`;
     // classifySubject inside buildSubjectIdentityKey throws INVALID_SUBJECT for a
     // userId that does not match the [A-Za-z0-9._:-]+ segment alphabet.
-    const apiKey = buildSubjectIdentityKey(subjectId);
+    const rawApiKey = buildSubjectIdentityKey(subjectId);
+    const apiKey = encodePublicUserApiKey(rawApiKey);
     const publicKey = getSubjectIdentityPublicKey();
     return { subjectId, apiKey, publicKey };
 }

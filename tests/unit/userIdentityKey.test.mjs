@@ -73,6 +73,16 @@ async function invoke(handler, options) {
     };
 }
 
+function decodePublicUserApiKey(apiKey) {
+    assert.equal(typeof apiKey, 'string');
+    assert.ok(apiKey.startsWith('sk-soul-'), `expected public key prefix, got ${apiKey}`);
+    assert.equal(apiKey.includes('user:'), false, 'public key must not expose a user subject');
+    assert.equal(apiKey.startsWith('sk-soul-v1'), false, 'public key prefix must not expose a version marker');
+    const payload = apiKey.slice('sk-soul-'.length);
+    assert.match(payload, /^[A-Za-z0-9_-]+$/);
+    return Buffer.from(payload, 'base64url').toString('utf8');
+}
+
 // Load the route handler, the pure builder, and the verify primitive in a
 // throwaway cwd with an explicit master key, exactly like agentEnvInjection +
 // userAdminRoutes do, so the keypair file lands under <temp>/.ploinky and no
@@ -103,7 +113,7 @@ async function loadModules(t) {
     return { route, pure, primitive };
 }
 
-test('authenticated user receives user:<id>|<signature> that verifies, with the public key', async (t) => {
+test('authenticated user receives sk-soul encoded key that verifies after decoding', async (t) => {
     const { route, primitive } = await loadModules(t);
 
     const result = await invoke(route.handleUserIdentityKeyRoute, {
@@ -113,14 +123,14 @@ test('authenticated user receives user:<id>|<signature> that verifies, with the 
     assert.equal(result.handled, true);
     assert.equal(result.statusCode, 200);
     assert.equal(result.body.subjectId, 'user:123');
-    assert.ok(result.body.apiKey.startsWith('user:123|'), `apiKey should start with user:123| (got ${result.body.apiKey})`);
     assert.equal(typeof result.body.publicKey, 'string');
     assert.ok(result.body.publicKey.length > 0);
     assert.equal(result.body.publicKey, primitive.getSubjectIdentityPublicKey());
 
-    // Real signature round-trip: the returned key verifies as the user subject.
+    const rawApiKey = decodePublicUserApiKey(result.body.apiKey);
+    assert.ok(rawApiKey.startsWith('user:123|'), `decoded key should start with user:123| (got ${rawApiKey})`);
     assert.deepEqual(
-        primitive.verifySubjectIdentityKey(result.body.apiKey, result.body.publicKey),
+        primitive.verifySubjectIdentityKey(rawApiKey, result.body.publicKey),
         { subjectId: 'user:123', subjectType: 'user' },
     );
 });
@@ -137,9 +147,10 @@ test('a body userId is ignored for a non-admin (no horizontal privilege escalati
     assert.equal(result.statusCode, 200);
     // The key is for alice's OWN id, NOT the requested 999.
     assert.equal(result.body.subjectId, 'user:123');
-    assert.ok(result.body.apiKey.startsWith('user:123|'));
+    const rawApiKey = decodePublicUserApiKey(result.body.apiKey);
+    assert.ok(rawApiKey.startsWith('user:123|'));
     assert.deepEqual(
-        primitive.verifySubjectIdentityKey(result.body.apiKey, result.body.publicKey),
+        primitive.verifySubjectIdentityKey(rawApiKey, result.body.publicKey),
         { subjectId: 'user:123', subjectType: 'user' },
     );
 });
@@ -155,9 +166,10 @@ test('an admin CAN mint a key for another userId via the body', async (t) => {
 
     assert.equal(result.statusCode, 200);
     assert.equal(result.body.subjectId, 'user:999');
-    assert.ok(result.body.apiKey.startsWith('user:999|'));
+    const rawApiKey = decodePublicUserApiKey(result.body.apiKey);
+    assert.ok(rawApiKey.startsWith('user:999|'));
     assert.deepEqual(
-        primitive.verifySubjectIdentityKey(result.body.apiKey, result.body.publicKey),
+        primitive.verifySubjectIdentityKey(rawApiKey, result.body.publicKey),
         { subjectId: 'user:999', subjectType: 'user' },
     );
 });
@@ -171,7 +183,8 @@ test('an admin with no body userId mints their own key', async (t) => {
 
     assert.equal(result.statusCode, 200);
     assert.equal(result.body.subjectId, 'user:local:admin');
-    assert.ok(result.body.apiKey.startsWith('user:local:admin|'));
+    const rawApiKey = decodePublicUserApiKey(result.body.apiKey);
+    assert.ok(rawApiKey.startsWith('user:local:admin|'));
 });
 
 test('an anonymous request is rejected with 401 and no key is minted', async (t) => {
@@ -235,7 +248,8 @@ test('an admin supplying an empty-string userId falls back to their own key (not
 
     assert.equal(result.statusCode, 200);
     assert.equal(result.body.subjectId, 'user:local:admin');
-    assert.ok(result.body.apiKey.startsWith('user:local:admin|'));
+    const rawApiKey = decodePublicUserApiKey(result.body.apiKey);
+    assert.ok(rawApiKey.startsWith('user:local:admin|'));
 });
 
 test('a session user with no usable identifier fails closed with 400', async (t) => {
@@ -294,11 +308,11 @@ test('the pure buildUserApiKeyResult enforces the privilege model directly', asy
 
     // Both keys verify under the shared public key.
     assert.deepEqual(
-        primitive.verifySubjectIdentityKey(nonAdmin.apiKey, nonAdmin.publicKey),
+        primitive.verifySubjectIdentityKey(decodePublicUserApiKey(nonAdmin.apiKey), nonAdmin.publicKey),
         { subjectId: 'user:123', subjectType: 'user' },
     );
     assert.deepEqual(
-        primitive.verifySubjectIdentityKey(admin.apiKey, admin.publicKey),
+        primitive.verifySubjectIdentityKey(decodePublicUserApiKey(admin.apiKey), admin.publicKey),
         { subjectId: 'user:999', subjectType: 'user' },
     );
 
