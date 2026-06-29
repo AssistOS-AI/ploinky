@@ -60,6 +60,8 @@ import { handleSsoCommand } from './ssoCommands.js';
 import { handleDepsCommand } from './depsCommands.js';
 import { disableHostSandbox, enableHostSandbox, handleSandboxCommand } from './sandboxCommands.js';
 import ClientCommands from './client.js';
+import { getActiveProfile, getProfileConfig } from '../services/profileService.js';
+import { resolveProfileServer } from '../services/profileServer.js';
 
 let llmAgentsLoadPromise = null;
 const ENABLE_AGENT_CLI_TOKENS = Object.freeze({
@@ -489,7 +491,7 @@ async function handleCommand(args) {
 
                     try {
                         const agentPath = path.dirname(resolved.manifestPath);
-                        const { containerName: newContainerName, hostPort } = ensureAgentService(resolved.shortAgentName, manifest, agentPath, {
+                        const { containerName: newContainerName, hostPort, server } = ensureAgentService(resolved.shortAgentName, manifest, agentPath, {
                             containerName,
                             alias: registryRecord?.record?.alias,
                             forceRecreate: true
@@ -513,6 +515,11 @@ async function handleCommand(args) {
                             cfg.routes[routeKey].agent = resolved.shortAgentName;
                             if (registryRecord?.record?.alias) cfg.routes[routeKey].alias = registryRecord.record.alias;
                             cfg.routes[routeKey].hostPort = hostPort;
+                            if (server) {
+                                cfg.routes[routeKey].server = server;
+                            } else {
+                                delete cfg.routes[routeKey].server;
+                            }
 
                             const staticAgent = String(cfg.static?.agent || '').trim();
                             if (staticAgent) {
@@ -570,6 +577,14 @@ async function handleCommand(args) {
                                 cfg.routes[routeKey].agent = resolved.shortAgentName;
                                 if (registryRecord?.record?.alias) cfg.routes[routeKey].alias = registryRecord.record.alias;
                                 cfg.routes[routeKey].hostPort = hostPort;
+                                const activeProfile = getActiveProfile();
+                                const profileConfig = getProfileConfig(`${repoName}/${resolved.shortAgentName}`, activeProfile);
+                                const server = resolveProfileServer(manifest, profileConfig, { runtimeMode: 'container' });
+                                if (server) {
+                                    cfg.routes[routeKey].server = server;
+                                } else {
+                                    delete cfg.routes[routeKey].server;
+                                }
 
                                 const staticAgent = String(cfg.static?.agent || '').trim();
                                 if (staticAgent) {

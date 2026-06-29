@@ -675,24 +675,27 @@ async function startWorkspace(staticAgentArg, portArg, { refreshComponentToken, 
           const agentPath = path.dirname(manifestPath0);
           const repoName = rec.repoName || path.basename(path.dirname(agentPath));
           const routeKey = rec.alias || shortAgentName;
-          const { containerName, hostPort } = ensureAgentService(shortAgentName, manifest, agentPath, {
+          const { containerName, hostPort, server } = ensureAgentService(shortAgentName, manifest, agentPath, {
             containerName: name,
             alias: rec.alias,
             routerPort: staticPort
           });
+          const nextRoute = {
+            ...(cfg.routes[routeKey] || {}),
+            container: containerName,
+            hostPath: agentPath,
+            repo: repoName,
+            agent: shortAgentName,
+            ...(rec.alias ? { alias: rec.alias } : {}),
+            hostPort: hostPort || cfg.routes[routeKey]?.hostPort,
+            ...(server ? { server } : {})
+          };
+          if (!server) delete nextRoute.server;
           return {
             ok: true,
             shortAgentName,
             routeKey,
-            route: {
-              ...(cfg.routes[routeKey] || {}),
-              container: containerName,
-              hostPath: agentPath,
-              repo: repoName,
-              agent: shortAgentName,
-              ...(rec.alias ? { alias: rec.alias } : {}),
-              hostPort: hostPort || cfg.routes[routeKey]?.hostPort
-            }
+            route: nextRoute
           };
         } catch (agentErr) {
           console.error(`[start] Failed to start agent '${shortAgentName}': ${agentErr.message}`);
@@ -1056,7 +1059,7 @@ async function reinstallAgent(agentName) {
         }
         stopAndRemove(containerName);
         
-        const { containerName: newContainerName, hostPort } = await ensureAgentService(short, manifest, agentPath, {
+        const { containerName: newContainerName, hostPort, server } = await ensureAgentService(short, manifest, agentPath, {
             containerName,
             alias: registryRecord?.record?.alias,
             forceRecreate: true
@@ -1086,6 +1089,11 @@ async function reinstallAgent(agentName) {
                 cfg.routes[routeKey].hostPort = hostPort;
             } else {
                 delete cfg.routes[routeKey].hostPort;
+            }
+            if (server) {
+                cfg.routes[routeKey].server = server;
+            } else {
+                delete cfg.routes[routeKey].server;
             }
 
             const savedCfg = workspaceSvc.getConfig();

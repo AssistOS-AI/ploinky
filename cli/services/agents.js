@@ -430,6 +430,7 @@ export function enableAgent(agentName, mode, repoNameParam, aliasParam, authMode
     verifyEnabledAgentStarted(shortAgentName, started?.containerName || containerName);
 
     const hostPort = started?.hostPort || preferredHostPort || existingRoute.hostPort;
+    const profileServer = started?.server || null;
     routing.routes[routeKey] = {
         ...existingRoute,
         container: started?.containerName || containerName,
@@ -437,8 +438,12 @@ export function enableAgent(agentName, mode, repoNameParam, aliasParam, authMode
         repo: repoName,
         agent: shortAgentName,
         ...(alias ? { alias } : {}),
-        ...(hostPort ? { hostPort } : {})
+        ...(hostPort ? { hostPort } : {}),
+        ...(profileServer ? { server: profileServer } : {})
     };
+    if (!profileServer) {
+        delete routing.routes[routeKey].server;
+    }
     saveRoutingConfig(routing);
 
     return { containerName: started?.containerName || containerName, repoName, shortAgentName, alias: alias || undefined, auth: record.auth, runMode, hostPort };

@@ -36,6 +36,7 @@ import {
     getProfileEnvVars,
     mergeProfiles
 } from '../profileService.js';
+import { resolveProfileServer } from '../profileServer.js';
 import {
     getAgentWorkDir,
     getAgentCodePath,
@@ -377,6 +378,7 @@ function startSeatbeltProcess(agentName, manifest, agentPath, options = {}) {
 
     // Port resolution — with shared host network, hostPort === containerPort
     const { portMappings } = parseManifestPorts(manifest, profileConfig);
+    const profileServer = resolveProfileServer(manifest, profileConfig, { runtimeMode: 'host' });
     let allPortMappings = [...portMappings];
     if (!allPortMappings.length) {
         const containerName = options.containerName || getAgentContainerName(agentName, repoName);
@@ -532,7 +534,8 @@ function startSeatbeltProcess(agentName, manifest, agentPath, options = {}) {
                 { source: cwd, target: cwd }
             ],
             env: Array.from(new Set(declaredEnvNames)).map((name) => ({ name })),
-            ports: allPortMappings
+            ports: allPortMappings,
+            ...(profileServer ? { server: profileServer } : {})
         }
     };
     if (existingRecord.auth) {
@@ -566,7 +569,7 @@ function startSeatbeltProcess(agentName, manifest, agentPath, options = {}) {
     syncAgentMcpConfig(containerName, path.resolve(agentPath), agentName);
 
     const returnPort = allPortMappings.find((p) => p.containerPort === 7000)?.hostPort || allPortMappings[0]?.hostPort || 0;
-    return { containerName, hostPort: returnPort };
+    return { containerName, hostPort: returnPort, server: profileServer };
 }
 
 /**
@@ -605,6 +608,7 @@ function ensureSeatbeltService(agentName, manifest, agentPath, options = {}) {
 
     assertManifestEnvProfileCompleteness(manifest, profileConfig, { agentName, repoName, profileName: activeProfile });
     const { portMappings } = parseManifestPorts(manifest, profileConfig);
+    const profileServer = resolveProfileServer(manifest, profileConfig, { runtimeMode: 'host' });
     let allPortMappings = [...portMappings];
     if (!allPortMappings.length) {
         const hostPort = preferredHostPort || existingRecord?.config?.ports?.[0]?.hostPort || (10000 + Math.floor(Math.random() * 50000));
@@ -628,7 +632,7 @@ function ensureSeatbeltService(agentName, manifest, agentPath, options = {}) {
             debugLog(`[seatbelt] ${agentName}: already running (PID ${getBwrapPid(agentName)})`);
             const hostPort = allPortMappings[0]?.hostPort || 0;
             syncAgentMcpConfig(containerName, agentPath, agentName);
-            return { containerName, hostPort };
+            return { containerName, hostPort, server: profileServer };
         }
     }
 

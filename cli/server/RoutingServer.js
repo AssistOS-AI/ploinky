@@ -25,7 +25,7 @@ import {
     proxyHttpPassthrough
 } from './routerHandlers.js';
 import { collectHttpServiceRoutes, resolveHttpServiceRoute } from './httpServiceRoutes.js';
-import { handleHttpServiceUpgrade } from './wsServiceProxy.js';
+import { proxyProfileServer } from './profileServerProxy.js';
 
 // Logging
 import { appendLog, logBootEvent, logMemoryUsage } from './utils/logger.js';
@@ -156,6 +156,19 @@ function extractAgentName(pathname, routes = loadApiRoutes()) {
     return agentName;
 }
 
+function extractProfileServerHostAgentName(hostHeader, routes = loadApiRoutes()) {
+    const host = String(hostHeader || '').split(':')[0].trim().toLowerCase();
+    if (!host.endsWith('.localhost')) return null;
+    const label = host.slice(0, -'.localhost'.length);
+    if (!label) return null;
+    for (const routeKey of Object.keys(routes || {})) {
+        if (String(routeKey || '').toLowerCase() === label && routes[routeKey]?.server) {
+            return routeKey;
+        }
+    }
+    return null;
+}
+
 function isRouterOwnedPath(pathname) {
     return pathname === '/agent-card'
         || pathname === '/agent-card/'
@@ -196,6 +209,10 @@ function buildAgentProxyPath(agentName, parsedUrl) {
         upstreamPath = pathname.slice(prefix.length) || '/';
     }
     return `${upstreamPath || '/'}${parsedUrl?.search || ''}`;
+}
+
+function buildRootProxyPath(parsedUrl) {
+    return `${parsedUrl?.pathname || '/'}${parsedUrl?.search || ''}`;
 }
 
 function hasDelegatedAgentAssertion(req) {
@@ -336,9 +353,12 @@ async function processRequest(req, res) {
     const pathname = parsedUrl.pathname || '/';
     const routedAggregateAgentCard = pathname === '/agent-card' || pathname === '/agent-card/';
     const apiRoutes = loadApiRoutes();
-    const agentName = isRouterOwnedPath(pathname) ? null : extractAgentName(pathname, apiRoutes);
+    const profileServerHostAgentName = extractProfileServerHostAgentName(req.headers.host, apiRoutes);
+    const agentName = profileServerHostAgentName || (isRouterOwnedPath(pathname) ? null : extractAgentName(pathname, apiRoutes));
     const route = agentName ? apiRoutes[agentName] : null;
-    const agentProxyPath = agentName ? buildAgentProxyPath(agentName, parsedUrl) : '';
+    const agentProxyPath = profileServerHostAgentName
+        ? buildRootProxyPath(parsedUrl)
+        : (agentName ? buildAgentProxyPath(agentName, parsedUrl) : '');
     const isAgentMcpRoute = Boolean(agentName && (agentProxyPath === '/mcp' || agentProxyPath.startsWith('/mcp?') || agentProxyPath.startsWith('/mcp/')));
     // Path-exact delegated agent OpenAI bypass: ONLY POST /<routeKey>/v1/chat/completions
     // with an Agent Assertion. No other agent-prefixed HTTP path uses this bypass.
@@ -348,13 +368,13 @@ async function processRequest(req, res) {
         agentProxyPath,
         req,
     });
-    const serviceDefinition = !agentName && !isRouterOwnedPath(pathname)
+    const serviceDefinition = !agentName && !profileServerHostAgentName && !isRouterOwnedPath(pathname)
         ? resolveHttpServiceRoute(pathname)
         : null;
     const policyGatedRouteKey = agentName && !isAgentMcpRoute
         ? agentName
         : serviceDefinition?.routeKey || '';
-    const httpRouteAccess = (agentName && !isAgentMcpRoute) || serviceDefinition
+    const httpRouteAccess = (!profileServerHostAgentName && agentName && !isAgentMcpRoute) || serviceDefinition
         ? policy.httpRouteAccessPolicy.evaluate({
             pathname,
             method: req.method || 'GET',
@@ -530,8 +550,14 @@ async function processRequest(req, res) {
         return;
     } else if (routedAggregateAgentCard) {
         return handleRoutedAggregateAgentCard(req, res);
+    } else if (profileServerHostAgentName) {
+        return proxyProfileServer(req, res, route, agentProxyPath, agentProxyExtraHeaders);
     } else if (agentName) {
-        if (!route || !route.hostPort) {
+        if (!route) {
+            sendJsonResponse(res, 404, { error: 'agent_not_found', agent: agentName });
+            return;
+        }
+        if (!route.hostPort) {
             sendJsonResponse(res, 404, { error: 'agent_not_found', agent: agentName });
             return;
         }
@@ -637,6 +663,7 @@ server.listen(port, () => {
     console.log('  Status:          /status');
     console.log('  Health:          /health');
     console.log('  Agent routes:    /<agent>/{mcp,task,agent-card,v1/chat/completions}');
+    console.log('  Agent servers:   http://<agent>.localhost:<port>/');
     console.log('  Aggregate cards: /agent-card');
     appendLog('server_start', { port });
     logBootEvent('server_listening', { port });

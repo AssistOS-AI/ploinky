@@ -49,6 +49,7 @@ Ploinky is a workspace-local runtime for repository-backed agents.
 - `GET /agent-card` on the router lists successful capability responses from active agents without enforcing a fixed payload shape; `GET /<agent>/agent-card` proxies one agent's metadata.
 - `POST /<agent>/v1/chat/completions` routes OpenAI-compatible requests to one agent, with `stream: true` selecting SSE streaming and normal JSON returned otherwise.
 - `/<agent>/...` routes are transparent per-agent proxy routes after router-owned paths are handled. The router strips the `/<agent>` prefix; the target agent owns paths such as `/index.html`, `/agent-card`, `/v1/chat/completions`, and custom HTTP endpoints. `/<agent>/mcp` remains special so the router can preserve MCP session mediation and secure-wire token minting.
+- `http://<agent>.localhost:<routerPort>/` proxies the active profile's `server` URL when declared, allowing an agent-owned browser service to stay on an internal container port instead of occupying a stable host port.
 - Delegated MCP calls use router-minted invocation JWTs. The router verifies the caller's session and forwards a fresh target invocation token.
 
 ## Dependency and profile commands

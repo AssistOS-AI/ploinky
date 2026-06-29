@@ -175,6 +175,11 @@ export function mergeProfiles(defaultProfile, activeProfile) {
         merged.network = activeProfile.network;
     }
 
+    // Merge profile server - active replaces default because it selects one upstream.
+    if (activeProfile.server !== undefined) {
+        merged.server = activeProfile.server;
+    }
+
     return merged;
 }
 

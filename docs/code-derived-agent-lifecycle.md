@@ -174,6 +174,7 @@ Ploinky does not load a central manifest schema in the observed paths. Individua
 | `lite-sandbox` | No | If true and host sandbox is enabled, selects bwrap on Linux or seatbelt on macOS. If host sandbox is disabled, it falls back to container runtime. |
 | `profiles` | No | If present, `profiles.default` is required. Active profile comes from record profile or `.ploinky/profile`; non-default profiles are merged over default. |
 | `profiles.<name>.ports` | No | The only ports read by `parseManifestPorts`. If absent at startup, Ploinky maps a random localhost host port to container port 7000 unless host networking is used. |
+| `profiles.<name>.server` | No | Internal HTTP URL for an agent-owned browser service. The router exposes it at `http://<agent>.localhost:<routerPort>/` without requiring a stable host port for that service. |
 | `profiles.<name>.env` | No | Overrides top-level `env` for the active profile. |
 | `profiles.<name>.secrets` | No | Profile secrets are validated and injected at runtime. |
 | `profiles.<name>.mounts` | No | Controls code/skills mount mode. Default and dev profiles are read-write by default; other profiles are read-only by default. |
@@ -436,6 +437,8 @@ Ports come from active profile `ports`. Accepted forms include:
 
 If no ports are defined and networking is not host mode, Ploinky chooses a random host port between 10000 and 59999 and maps it to container port 7000 on localhost.
 
+Profile `server` is separate from `ports`. It accepts an HTTP URL such as `http://127.0.0.1:3000` for a service running inside the agent runtime. At startup and restart, Ploinky publishes that server port on `127.0.0.1` with an ephemeral host port for container runtimes, records the resolved host URL in `.ploinky/routing.json`, and exposes it through the router at `http://<agent>.localhost:<routerPort>/`. The AgentServer/MCP port remains the normal port-7000 route.
+
 ## Host Sandbox Runtimes
 
 Host sandboxes are selected only for `lite-sandbox: true` agents when sandbox support is enabled.
@@ -635,11 +638,12 @@ MCP tool and resource commands require router-minted invocation headers before c
 
 1. Enable-time port records are mostly descriptive. `enableAgent` calls `parseManifestPorts` without profile config, and that function only reads profile ports, so enable-time records normally fall back to container port 7000.
 2. Top-level `manifest.ports` is not read by the observed `parseManifestPorts` implementation.
-3. Manifest `repos` and `enable` are applied at `start`, not at `enable agent`.
-4. Container runtime dependency installs happen in caches, not in the long-running containers.
-5. Podman and seatbelt copy/stage runtime files; Docker mostly mounts them directly.
-6. `clean` destroys containers but does not explicitly kill the router in the dispatcher path.
-7. `cli/services/help.js` contains cloud help, but `cli/commands/cli.js` treats cloud commands as unavailable in this build.
-8. `client tool --agent` resolves ambiguity, but the observed call path invokes `client.callTool(toolName, payloadObj)` without passing target-agent metadata.
-9. Seatbelt links prepared dependencies into the real agent code path as `node_modules`; it errors if that path exists and is not a symlink.
-10. Manifest health probes are watchdog/container-monitor probes and are separate from startup readiness.
+3. Profile `server` does not require a stable manifest host port; container runtimes publish it automatically on a localhost ephemeral port used only by the router proxy.
+4. Manifest `repos` and `enable` are applied at `start`, not at `enable agent`.
+5. Container runtime dependency installs happen in caches, not in the long-running containers.
+6. Podman and seatbelt copy/stage runtime files; Docker mostly mounts them directly.
+7. `clean` destroys containers but does not explicitly kill the router in the dispatcher path.
+8. `cli/services/help.js` contains cloud help, but `cli/commands/cli.js` treats cloud commands as unavailable in this build.
+9. `client tool --agent` resolves ambiguity, but the observed call path invokes `client.callTool(toolName, payloadObj)` without passing target-agent metadata.
+10. Seatbelt links prepared dependencies into the real agent code path as `node_modules`; it errors if that path exists and is not a symlink.
+11. Manifest health probes are watchdog/container-monitor probes and are separate from startup readiness.

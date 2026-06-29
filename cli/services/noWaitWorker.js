@@ -50,6 +50,9 @@ async function upsertRoute(routeKey, route) {
     await mergeRoutingConfig((cfg) => {
         cfg.routes = cfg.routes || {};
         cfg.routes[routeKey] = { ...(cfg.routes[routeKey] || {}), ...route };
+        if (route.server === null) {
+            delete cfg.routes[routeKey].server;
+        }
         return cfg;
     });
 }
@@ -100,6 +103,7 @@ async function main() {
         const result = await dockerSvc.ensureAgentService(shortAgent, manifest, agentPath, ensureOptions);
         const resolvedContainerName = (result && result.containerName) || containerName;
         const hostPort = result && result.hostPort;
+        const server = result && result.server;
 
         await upsertRoute(routeKey, {
             container: resolvedContainerName,
@@ -107,7 +111,8 @@ async function main() {
             repo: repoName,
             agent: shortAgent,
             ...(alias ? { alias } : {}),
-            ...(hostPort ? { hostPort } : {})
+            ...(hostPort ? { hostPort } : {}),
+            server: server || null
         });
 
         const finishedAt = new Date().toISOString();

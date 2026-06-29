@@ -66,6 +66,11 @@ import {
     mergeProfiles
 } from '../profileService.js';
 import {
+    createProfileServerPublish,
+    resolvePublishedProfileServer,
+    resolveProfileServer
+} from '../profileServer.js';
+import {
     getAgentWorkDir,
     getAgentCodePath,
     getAgentSkillsPath,
@@ -744,6 +749,9 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         ? manifestNetwork.aliases.map((entry) => String(entry || '').trim()).filter(Boolean)
         : [];
     const useHostNetwork = manifestNetworkMode === 'host';
+    const profileServer = resolveProfileServer(manifest, profileConfig, {
+        runtimeMode: useHostNetwork ? 'host' : 'container'
+    });
     const containerSecurityArgs = buildContainerSecurityArgs(resolveContainerSecurity(manifest, profileConfig));
     if (containerSecurityArgs.length) {
         args.splice(1, 0, ...containerSecurityArgs);
@@ -790,7 +798,14 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
 
     const { publishArgs: manifestPorts, portMappings } = parseManifestPorts(manifest, profileConfig);
     const runtimePorts = (options && Array.isArray(options.publish)) ? options.publish : [];
-    const pubs = useHostNetwork ? [] : [...manifestPorts, ...runtimePorts];
+    const runtimePortMappings = (options && Array.isArray(options.publishMappings)) ? options.publishMappings : [];
+    const basePortMappings = [...portMappings, ...runtimePortMappings];
+    const profileServerPublish = useHostNetwork ? null : createProfileServerPublish(profileServer, basePortMappings);
+    const profileServerPublishArgs = profileServerPublish ? [profileServerPublish.publishArg] : [];
+    const effectivePortMappings = profileServerPublish
+        ? [...basePortMappings, profileServerPublish.mapping]
+        : basePortMappings;
+    const pubs = useHostNetwork ? [] : [...manifestPorts, ...runtimePorts, ...profileServerPublishArgs];
     for (const p of pubs) {
         if (!p) continue;
         args.splice(1, 0, '-p', String(p));
@@ -1005,7 +1020,8 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
                 { source: cwd, target: cwd }
             ],
             env: Array.from(new Set([...declaredEnvNames2, ...llmRuntimeEnvNames])).map((name) => ({ name })),
-            ports: portMappings
+            ports: effectivePortMappings,
+            ...(profileServer ? { server: profileServer } : {})
         }
     };
     if (existingRecord.auth) {
@@ -1176,6 +1192,7 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
     });
 
     const { publishArgs: manifestPorts, portMappings } = parseManifestPorts(manifest, profileConfig);
+    const profileServer = resolveProfileServer(manifest, profileConfig, { runtimeMode: 'container' });
     const containerPortCandidates = portMappings
         .map((mapping) => mapping?.containerPort)
         .filter((port) => typeof port === 'number' && port > 0);
@@ -1232,6 +1249,16 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
             debugLog(`[ensureAgentService] ${agentName}: LLM reuse-hash check skipped: ${err?.message || err}`);
         }
     }
+
+    if (containerExists(containerName) && profileServer) {
+        const existingPortMappings = resolvePublishedPortMappings(containerName, existingRecord.config?.ports || []);
+        const existingProfileServer = resolvePublishedProfileServer(profileServer, existingPortMappings);
+        if (!existingProfileServer) {
+            debugLog(`[ensureAgentService] ${agentName}: profile server port is not published; recreating container`);
+            removeContainerForRecreate(runtime, containerName, `ensureAgentService:${agentName}:profileServerPublishChanged`);
+        }
+    }
+
     if (containerExists(containerName)) {
         debugLog(`[ensureAgentService] ${agentName}: container exists, checking if running...`);
         let canReuseExisting = true;
@@ -1265,22 +1292,35 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
         if (canReuseExisting) {
             debugLog(`[ensureAgentService] ${agentName}: returning early (container exists)`);
             const hostPort = resolveHostPort(containerName, existingRecord, containerPortCandidates);
+            const existingPortMappings = resolvePublishedPortMappings(containerName, existingRecord.config?.ports || []);
+            const resolvedProfileServer = resolvePublishedProfileServer(profileServer, existingPortMappings) || profileServer;
             syncAgentMcpConfig(containerName, agentPath, agentName);
-            return { containerName, hostPort };
+            return { containerName, hostPort, server: resolvedProfileServer };
         }
     }
 
     let additionalPorts = [];
+    let additionalPortMappings = [];
     let allPortMappings = [...portMappings];
 
     if (manifestPorts.length === 0) {
         const hostPort = preferredHostPort || (10000 + Math.floor(Math.random() * 50000));
+        const agentServerMapping = { containerPort: 7000, hostPort, hostIp: '127.0.0.1', protocol: 'tcp' };
         additionalPorts = [`127.0.0.1:${hostPort}:7000`];
-        allPortMappings = [{ containerPort: 7000, hostPort, hostIp: '127.0.0.1' }];
+        additionalPortMappings.push(agentServerMapping);
+        allPortMappings = [agentServerMapping];
+    }
+
+    const profileServerPublish = createProfileServerPublish(profileServer, allPortMappings);
+    if (profileServerPublish) {
+        additionalPorts.push(profileServerPublish.publishArg);
+        additionalPortMappings.push(profileServerPublish.mapping);
+        allPortMappings.push(profileServerPublish.mapping);
     }
 
     startAgentContainer(agentName, manifest, agentPath, {
         publish: additionalPorts,
+        publishMappings: additionalPortMappings,
         containerName,
         alias: aliasOverride,
         profileName: activeProfile,
@@ -1288,6 +1328,7 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
         routerHost: runtimeRouterEnv.PLOINKY_ROUTER_HOST
     });
     allPortMappings = resolvePublishedPortMappings(containerName, allPortMappings);
+    const resolvedProfileServer = resolvePublishedProfileServer(profileServer, allPortMappings) || profileServer;
 
     // Get paths for the new workspace structure
     const agentWorkDir = getAgentWorkDir(agentName);
@@ -1340,7 +1381,8 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
                 { source: projPath, target: projPath }
             ],
             env: Array.from(new Set([...declaredEnvNames3, ...startedEnvNames])).map((name) => ({ name })),
-            ports: allPortMappings
+            ports: allPortMappings,
+            ...(resolvedProfileServer ? { server: resolvedProfileServer } : {})
         }
     };
     if (existingRecord.auth) {
@@ -1353,7 +1395,7 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
 
     syncAgentMcpConfig(containerName, agentPath, agentName);
     const returnPort = allPortMappings.find((p) => p.containerPort === 7000)?.hostPort || allPortMappings[0]?.hostPort || 0;
-    return { containerName, hostPort: returnPort };
+    return { containerName, hostPort: returnPort, server: resolvedProfileServer };
 }
 
 export {
