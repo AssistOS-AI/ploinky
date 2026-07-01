@@ -201,9 +201,13 @@
 $ cd ploinky
 $ echo 'PLOINKY_MASTER_KEY=change-me-to-a-random-secret' &gt; .env
 $ npm install
+$ echo 'export PATH="$PATH:$HOME/Desktop/work/ploinky/bin"' &gt;&gt; ~/.bashrc
+$ source ~/.bashrc
+$ cd ~/Desktop/work
+$ ploinky start explorer
 </code></pre>
                     <p><code>PLOINKY_MASTER_KEY</code> is required before Ploinky can start because it derives workspace secrets from that value. Any non-empty value works for local testing, but a long random value is recommended. You can keep it in the project <code>.env</code> file as shown above or export it in your shell.</p>
-                    <p>To run <code>ploinky start explorer</code> from any directory, add Ploinky's <code>bin</code> directory to your <code>PATH</code>, for example: <code>export PATH="$PATH:~/path/to/ploinky/bin"</code>.</p>
+                    <p>The <code>PATH</code> line above points to the cloned Ploinky <code>bin</code> directory and makes <code>ploinky</code> available in new Bash sessions. If your clone lives somewhere else, replace <code>$HOME/Desktop/work/ploinky/bin</code> with that path. For Zsh, add the same line to <code>~/.zshrc</code>.</p>
 
                     <div style="text-align: center; margin-top: 3rem;">
                         <a href="cli-reference.html" class="btn btn-primary">View CLI Reference</a>
