@@ -1,40 +1,37 @@
-function normalizeProfileServer(server, { mode = 'container' } = {}) {
-    if (server === undefined || server === null || server === false || server === '') {
+function normalizeProfileServer(additionalServerPort, { mode = 'container' } = {}) {
+    if (additionalServerPort === undefined || additionalServerPort === null || additionalServerPort === false || additionalServerPort === '') {
         return null;
     }
-    if (typeof server === 'string') {
-        return normalizeServerUrl(server, { mode });
+    if (typeof additionalServerPort === 'string' || typeof additionalServerPort === 'number') {
+        return normalizeAdditionalServerPort(additionalServerPort, { mode });
     }
-    if (server && typeof server === 'object' && !Array.isArray(server)) {
-        const url = server.url || server.address || server.href;
-        return normalizeServerUrl(url, {
-            mode: server.mode || mode
-        });
-    }
-    throw new Error('profile server must be a URL string or an object with url');
+    throw new Error('additionalServerPort must be a port or host:port string');
 }
 
-function normalizeServerUrl(rawUrl, { mode = 'container' } = {}) {
-    const value = String(rawUrl || '').trim();
+function normalizeAdditionalServerPort(rawValue, { mode = 'container' } = {}) {
+    const value = String(rawValue || '').trim();
     if (!value) return null;
+    if (value.includes('://')) {
+        throw new Error(`invalid additionalServerPort '${value}': expected port or host:port`);
+    }
+
+    const target = value.includes(':') ? value : `127.0.0.1:${value}`;
     let parsed;
     try {
-        parsed = new URL(value);
+        parsed = new URL(`http://${target}`);
     } catch (_) {
-        throw new Error(`invalid profile server URL '${value}'`);
+        throw new Error(`invalid additionalServerPort '${value}': expected port or host:port`);
     }
-    if (parsed.protocol !== 'http:') {
-        throw new Error(`profile server URL must use http: got '${parsed.protocol}'`);
-    }
-    if (!parsed.hostname || !parsed.port) {
-        throw new Error('profile server URL must include host and port');
+    const port = Number.parseInt(parsed.port, 10);
+    if (!parsed.hostname || !Number.isInteger(port) || port <= 0 || port > 65535) {
+        throw new Error(`invalid additionalServerPort '${value}': expected port or host:port`);
     }
     const normalizedMode = String(mode || 'container').trim().toLowerCase();
     if (!['container', 'host'].includes(normalizedMode)) {
-        throw new Error(`profile server mode must be 'container' or 'host', got '${mode}'`);
+        throw new Error(`additionalServerPort mode must be 'container' or 'host', got '${mode}'`);
     }
     return {
-        url: parsed.toString().replace(/\/$/, ''),
+        url: `http://${parsed.hostname}:${parsed.port}`,
         mode: normalizedMode
     };
 }
@@ -47,7 +44,10 @@ function isHostNetworkProfile(manifest, profileConfig) {
 }
 
 function resolveProfileServer(manifest, profileConfig, { runtimeMode = 'container' } = {}) {
-    const raw = profileConfig?.server;
+    if (profileConfig && Object.prototype.hasOwnProperty.call(profileConfig, 'server')) {
+        throw new Error("profile field 'server' has been renamed to 'additionalServerPort'");
+    }
+    const raw = profileConfig?.additionalServerPort;
     if (raw === undefined || raw === null || raw === false || raw === '') return null;
     const mode = runtimeMode === 'host' || isHostNetworkProfile(manifest, profileConfig)
         ? 'host'

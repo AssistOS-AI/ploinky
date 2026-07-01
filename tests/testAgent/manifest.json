@@ -21,7 +21,7 @@
         "FAST_TEST_MARKER": "fast-suite",
         "MY_TEST_VAR": "hello-manifest"
       },
-      "ports": [
+      "openPorts": [
         "127.0.0.1:__HOST_PORT__:7000"
       ],
       "install": "echo 'install_ok' > \"$WORKSPACE_PATH/install_marker.txt\""

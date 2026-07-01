@@ -162,7 +162,7 @@ function extractProfileServerHostAgentName(hostHeader, routes = loadApiRoutes())
     const label = host.slice(0, -'.localhost'.length);
     if (!label) return null;
     for (const routeKey of Object.keys(routes || {})) {
-        if (String(routeKey || '').toLowerCase() === label && routes[routeKey]?.server) {
+        if (String(routeKey || '').toLowerCase() === label && routes[routeKey]?.additionalServerPort) {
             return routeKey;
         }
     }

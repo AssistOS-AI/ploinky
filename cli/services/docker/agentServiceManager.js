@@ -749,7 +749,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         ? manifestNetwork.aliases.map((entry) => String(entry || '').trim()).filter(Boolean)
         : [];
     const useHostNetwork = manifestNetworkMode === 'host';
-    const profileServer = resolveProfileServer(manifest, profileConfig, {
+    const additionalServerPort = resolveProfileServer(manifest, profileConfig, {
         runtimeMode: useHostNetwork ? 'host' : 'container'
     });
     const containerSecurityArgs = buildContainerSecurityArgs(resolveContainerSecurity(manifest, profileConfig));
@@ -800,7 +800,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     const runtimePorts = (options && Array.isArray(options.publish)) ? options.publish : [];
     const runtimePortMappings = (options && Array.isArray(options.publishMappings)) ? options.publishMappings : [];
     const basePortMappings = [...portMappings, ...runtimePortMappings];
-    const profileServerPublish = useHostNetwork ? null : createProfileServerPublish(profileServer, basePortMappings);
+    const profileServerPublish = useHostNetwork ? null : createProfileServerPublish(additionalServerPort, basePortMappings);
     const profileServerPublishArgs = profileServerPublish ? [profileServerPublish.publishArg] : [];
     const effectivePortMappings = profileServerPublish
         ? [...basePortMappings, profileServerPublish.mapping]
@@ -1021,7 +1021,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
             ],
             env: Array.from(new Set([...declaredEnvNames2, ...llmRuntimeEnvNames])).map((name) => ({ name })),
             ports: effectivePortMappings,
-            ...(profileServer ? { server: profileServer } : {})
+            ...(additionalServerPort ? { additionalServerPort } : {})
         }
     };
     if (existingRecord.auth) {
@@ -1192,7 +1192,7 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
     });
 
     const { publishArgs: manifestPorts, portMappings } = parseManifestPorts(manifest, profileConfig);
-    const profileServer = resolveProfileServer(manifest, profileConfig, { runtimeMode: 'container' });
+    const additionalServerPort = resolveProfileServer(manifest, profileConfig, { runtimeMode: 'container' });
     const containerPortCandidates = portMappings
         .map((mapping) => mapping?.containerPort)
         .filter((port) => typeof port === 'number' && port > 0);
@@ -1250,11 +1250,11 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
         }
     }
 
-    if (containerExists(containerName) && profileServer) {
+    if (containerExists(containerName) && additionalServerPort) {
         const existingPortMappings = resolvePublishedPortMappings(containerName, existingRecord.config?.ports || []);
-        const existingProfileServer = resolvePublishedProfileServer(profileServer, existingPortMappings);
+        const existingProfileServer = resolvePublishedProfileServer(additionalServerPort, existingPortMappings);
         if (!existingProfileServer) {
-            debugLog(`[ensureAgentService] ${agentName}: profile server port is not published; recreating container`);
+            debugLog(`[ensureAgentService] ${agentName}: additional server port is not published; recreating container`);
             removeContainerForRecreate(runtime, containerName, `ensureAgentService:${agentName}:profileServerPublishChanged`);
         }
     }
@@ -1293,9 +1293,9 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
             debugLog(`[ensureAgentService] ${agentName}: returning early (container exists)`);
             const hostPort = resolveHostPort(containerName, existingRecord, containerPortCandidates);
             const existingPortMappings = resolvePublishedPortMappings(containerName, existingRecord.config?.ports || []);
-            const resolvedProfileServer = resolvePublishedProfileServer(profileServer, existingPortMappings) || profileServer;
+            const resolvedProfileServer = resolvePublishedProfileServer(additionalServerPort, existingPortMappings) || additionalServerPort;
             syncAgentMcpConfig(containerName, agentPath, agentName);
-            return { containerName, hostPort, server: resolvedProfileServer };
+            return { containerName, hostPort, additionalServerPort: resolvedProfileServer };
         }
     }
 
@@ -1311,7 +1311,7 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
         allPortMappings = [agentServerMapping];
     }
 
-    const profileServerPublish = createProfileServerPublish(profileServer, allPortMappings);
+    const profileServerPublish = createProfileServerPublish(additionalServerPort, allPortMappings);
     if (profileServerPublish) {
         additionalPorts.push(profileServerPublish.publishArg);
         additionalPortMappings.push(profileServerPublish.mapping);
@@ -1328,7 +1328,7 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
         routerHost: runtimeRouterEnv.PLOINKY_ROUTER_HOST
     });
     allPortMappings = resolvePublishedPortMappings(containerName, allPortMappings);
-    const resolvedProfileServer = resolvePublishedProfileServer(profileServer, allPortMappings) || profileServer;
+    const resolvedProfileServer = resolvePublishedProfileServer(additionalServerPort, allPortMappings) || additionalServerPort;
 
     // Get paths for the new workspace structure
     const agentWorkDir = getAgentWorkDir(agentName);
@@ -1382,7 +1382,7 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
             ],
             env: Array.from(new Set([...declaredEnvNames3, ...startedEnvNames])).map((name) => ({ name })),
             ports: allPortMappings,
-            ...(resolvedProfileServer ? { server: resolvedProfileServer } : {})
+            ...(resolvedProfileServer ? { additionalServerPort: resolvedProfileServer } : {})
         }
     };
     if (existingRecord.auth) {
@@ -1395,7 +1395,7 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
 
     syncAgentMcpConfig(containerName, agentPath, agentName);
     const returnPort = allPortMappings.find((p) => p.containerPort === 7000)?.hostPort || allPortMappings[0]?.hostPort || 0;
-    return { containerName, hostPort: returnPort, server: resolvedProfileServer };
+    return { containerName, hostPort: returnPort, additionalServerPort: resolvedProfileServer };
 }
 
 export {

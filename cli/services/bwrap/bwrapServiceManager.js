@@ -564,7 +564,7 @@ function startBwrapProcess(agentName, manifest, agentPath, options = {}) {
     // Port resolution — with shared host network, hostPort === containerPort
     // Must happen before env map so PORT is set correctly
     const { portMappings } = parseManifestPorts(manifest, profileConfig);
-    const profileServer = resolveProfileServer(manifest, profileConfig, { runtimeMode: 'host' });
+    const additionalServerPort = resolveProfileServer(manifest, profileConfig, { runtimeMode: 'host' });
     let allPortMappings = [...portMappings];
     if (!allPortMappings.length) {
         const containerName = options.containerName || getAgentContainerName(agentName, repoName);
@@ -693,7 +693,7 @@ function startBwrapProcess(agentName, manifest, agentPath, options = {}) {
             ],
             env: Array.from(new Set(declaredEnvNames)).map((name) => ({ name })),
             ports: allPortMappings,
-            ...(profileServer ? { server: profileServer } : {})
+            ...(additionalServerPort ? { additionalServerPort } : {})
         }
     };
     if (existingRecord.auth) {
@@ -728,7 +728,7 @@ function startBwrapProcess(agentName, manifest, agentPath, options = {}) {
     syncAgentMcpConfig(containerName, path.resolve(agentPath), agentName);
 
     const returnPort = allPortMappings.find((p) => p.containerPort === 7000)?.hostPort || allPortMappings[0]?.hostPort || 0;
-    return { containerName, hostPort: returnPort, server: profileServer };
+    return { containerName, hostPort: returnPort, additionalServerPort };
 }
 
 /**
@@ -768,7 +768,7 @@ function ensureBwrapService(agentName, manifest, agentPath, options = {}) {
 
     assertManifestEnvProfileCompleteness(manifest, profileConfig, { agentName, repoName, profileName: activeProfile });
     const { portMappings } = parseManifestPorts(manifest, profileConfig);
-    const profileServer = resolveProfileServer(manifest, profileConfig, { runtimeMode: 'host' });
+    const additionalServerPort = resolveProfileServer(manifest, profileConfig, { runtimeMode: 'host' });
     let allPortMappings = [...portMappings];
     if (!allPortMappings.length) {
         const hostPort = preferredHostPort || existingRecord?.config?.ports?.[0]?.hostPort || (10000 + Math.floor(Math.random() * 50000));
@@ -793,7 +793,7 @@ function ensureBwrapService(agentName, manifest, agentPath, options = {}) {
             debugLog(`[bwrap] ${agentName}: already running (PID ${getBwrapPid(agentName)})`);
             const hostPort = allPortMappings[0]?.hostPort || 0;
             syncAgentMcpConfig(containerName, agentPath, agentName);
-            return { containerName, hostPort, server: profileServer };
+            return { containerName, hostPort, additionalServerPort };
         }
     }
 

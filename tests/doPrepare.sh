@@ -334,7 +334,7 @@ cat >"${global_agent_root}/manifest.json" <<EOF
       "env": {
         "PORT": "${global_agent_internal_port}"
       },
-      "ports": [
+      "openPorts": [
         "127.0.0.1:${global_agent_host_port}:${global_agent_internal_port}"
       ]
     }

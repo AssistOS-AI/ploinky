@@ -675,7 +675,7 @@ async function startWorkspace(staticAgentArg, portArg, { refreshComponentToken, 
           const agentPath = path.dirname(manifestPath0);
           const repoName = rec.repoName || path.basename(path.dirname(agentPath));
           const routeKey = rec.alias || shortAgentName;
-          const { containerName, hostPort, server } = ensureAgentService(shortAgentName, manifest, agentPath, {
+          const { containerName, hostPort, additionalServerPort } = ensureAgentService(shortAgentName, manifest, agentPath, {
             containerName: name,
             alias: rec.alias,
             routerPort: staticPort
@@ -688,9 +688,9 @@ async function startWorkspace(staticAgentArg, portArg, { refreshComponentToken, 
             agent: shortAgentName,
             ...(rec.alias ? { alias: rec.alias } : {}),
             hostPort: hostPort || cfg.routes[routeKey]?.hostPort,
-            ...(server ? { server } : {})
+            ...(additionalServerPort ? { additionalServerPort } : {})
           };
-          if (!server) delete nextRoute.server;
+          if (!additionalServerPort) delete nextRoute.additionalServerPort;
           return {
             ok: true,
             shortAgentName,
@@ -1059,7 +1059,7 @@ async function reinstallAgent(agentName) {
         }
         stopAndRemove(containerName);
         
-        const { containerName: newContainerName, hostPort, server } = await ensureAgentService(short, manifest, agentPath, {
+        const { containerName: newContainerName, hostPort, additionalServerPort } = await ensureAgentService(short, manifest, agentPath, {
             containerName,
             alias: registryRecord?.record?.alias,
             forceRecreate: true
@@ -1090,10 +1090,10 @@ async function reinstallAgent(agentName) {
             } else {
                 delete cfg.routes[routeKey].hostPort;
             }
-            if (server) {
-                cfg.routes[routeKey].server = server;
+            if (additionalServerPort) {
+                cfg.routes[routeKey].additionalServerPort = additionalServerPort;
             } else {
-                delete cfg.routes[routeKey].server;
+                delete cfg.routes[routeKey].additionalServerPort;
             }
 
             const savedCfg = workspaceSvc.getConfig();

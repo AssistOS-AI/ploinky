@@ -317,8 +317,8 @@ function sleepMs(ms) {
 }
 
 function parseManifestPorts(manifest, profileConfig = null) {
-    // Ports must be defined in profile configuration
-    const ports = profileConfig?.ports;
+    // Open ports must be defined in profile configuration.
+    const ports = profileConfig?.openPorts;
     if (!ports) return { publishArgs: [], portMappings: [] };
 
     const portArray = Array.isArray(ports) ? ports : [ports];

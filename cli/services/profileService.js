@@ -165,9 +165,9 @@ export function mergeProfiles(defaultProfile, activeProfile) {
         merged.mounts = { ...defaultProfile.mounts, ...activeProfile.mounts };
     }
 
-    // Merge ports - active replaces default (like hooks)
-    if (activeProfile.ports !== undefined) {
-        merged.ports = activeProfile.ports;
+    // Merge open ports - active replaces default (like hooks)
+    if (activeProfile.openPorts !== undefined) {
+        merged.openPorts = activeProfile.openPorts;
     }
 
     // Merge network - active replaces default because the namespace is selected as a unit.
@@ -175,9 +175,9 @@ export function mergeProfiles(defaultProfile, activeProfile) {
         merged.network = activeProfile.network;
     }
 
-    // Merge profile server - active replaces default because it selects one upstream.
-    if (activeProfile.server !== undefined) {
-        merged.server = activeProfile.server;
+    // Merge additional server port - active replaces default because it selects one upstream.
+    if (activeProfile.additionalServerPort !== undefined) {
+        merged.additionalServerPort = activeProfile.additionalServerPort;
     }
 
     return merged;

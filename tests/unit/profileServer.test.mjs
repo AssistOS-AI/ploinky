@@ -12,26 +12,40 @@ import {
     resolveProfileServerTarget
 } from '../../cli/server/profileServerProxy.js';
 
-test('normalizeProfileServer accepts http URL strings', () => {
+test('normalizeProfileServer accepts port strings', () => {
     assert.deepEqual(
-        normalizeProfileServer('http://127.0.0.1:3000', { mode: 'container' }),
+        normalizeProfileServer('3000', { mode: 'container' }),
         { url: 'http://127.0.0.1:3000', mode: 'container' }
     );
 });
 
-test('normalizeProfileServer rejects non-http URLs', () => {
+test('normalizeProfileServer accepts host:port strings', () => {
+    assert.deepEqual(
+        normalizeProfileServer('127.0.0.1:3000', { mode: 'container' }),
+        { url: 'http://127.0.0.1:3000', mode: 'container' }
+    );
+});
+
+test('normalizeProfileServer rejects URL strings', () => {
     assert.throws(
         () => normalizeProfileServer('https://127.0.0.1:3000'),
-        /must use http/
+        /expected port or host:port/
     );
 });
 
 test('resolveProfileServer switches to host mode for host-network profiles', () => {
     const manifest = { network: { mode: 'host' } };
-    const profile = { server: 'http://127.0.0.1:3000' };
+    const profile = { additionalServerPort: '3000' };
     assert.deepEqual(
         resolveProfileServer(manifest, profile, { runtimeMode: 'container' }),
         { url: 'http://127.0.0.1:3000', mode: 'host' }
+    );
+});
+
+test('resolveProfileServer rejects legacy profile server field', () => {
+    assert.throws(
+        () => resolveProfileServer({}, { server: 'http://127.0.0.1:3000' }),
+        /renamed to 'additionalServerPort'/
     );
 });
 
@@ -92,7 +106,7 @@ test('buildProfileServerPath forwards root-mounted host paths and preserves quer
 
 test('resolveProfileServerTarget leaves host-mode loopback unchanged', () => {
     const resolved = resolveProfileServerTarget({
-        server: { url: 'http://127.0.0.1:3000/', mode: 'host' }
+        additionalServerPort: { url: 'http://127.0.0.1:3000/', mode: 'host' }
     });
     assert.equal(resolved.target.hostname, '127.0.0.1');
     assert.equal(resolved.target.port, '3000');

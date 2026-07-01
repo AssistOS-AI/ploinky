@@ -52,7 +52,7 @@ function resolveContainerIp(containerName) {
 }
 
 function resolveProfileServerTarget(route) {
-    const server = route?.server || route?.config?.server || null;
+    const server = route?.additionalServerPort || route?.config?.additionalServerPort || null;
     const rawUrl = String(server?.url || server || '').trim();
     if (!rawUrl) return null;
     const target = new URL(rawUrl);

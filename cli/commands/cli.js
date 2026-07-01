@@ -491,7 +491,7 @@ async function handleCommand(args) {
 
                     try {
                         const agentPath = path.dirname(resolved.manifestPath);
-                        const { containerName: newContainerName, hostPort, server } = ensureAgentService(resolved.shortAgentName, manifest, agentPath, {
+                        const { containerName: newContainerName, hostPort, additionalServerPort } = ensureAgentService(resolved.shortAgentName, manifest, agentPath, {
                             containerName,
                             alias: registryRecord?.record?.alias,
                             forceRecreate: true
@@ -515,10 +515,10 @@ async function handleCommand(args) {
                             cfg.routes[routeKey].agent = resolved.shortAgentName;
                             if (registryRecord?.record?.alias) cfg.routes[routeKey].alias = registryRecord.record.alias;
                             cfg.routes[routeKey].hostPort = hostPort;
-                            if (server) {
-                                cfg.routes[routeKey].server = server;
+                            if (additionalServerPort) {
+                                cfg.routes[routeKey].additionalServerPort = additionalServerPort;
                             } else {
-                                delete cfg.routes[routeKey].server;
+                                delete cfg.routes[routeKey].additionalServerPort;
                             }
 
                             const staticAgent = String(cfg.static?.agent || '').trim();
@@ -579,11 +579,11 @@ async function handleCommand(args) {
                                 cfg.routes[routeKey].hostPort = hostPort;
                                 const activeProfile = getActiveProfile();
                                 const profileConfig = getProfileConfig(`${repoName}/${resolved.shortAgentName}`, activeProfile);
-                                const server = resolveProfileServer(manifest, profileConfig, { runtimeMode: 'container' });
-                                if (server) {
-                                    cfg.routes[routeKey].server = server;
+                                const additionalServerPort = resolveProfileServer(manifest, profileConfig, { runtimeMode: 'container' });
+                                if (additionalServerPort) {
+                                    cfg.routes[routeKey].additionalServerPort = additionalServerPort;
                                 } else {
-                                    delete cfg.routes[routeKey].server;
+                                    delete cfg.routes[routeKey].additionalServerPort;
                                 }
 
                                 const staticAgent = String(cfg.static?.agent || '').trim();

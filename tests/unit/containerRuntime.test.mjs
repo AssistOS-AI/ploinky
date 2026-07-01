@@ -135,13 +135,13 @@ process.stdout.write(JSON.stringify({
     }
 });
 
-test('parseManifestPorts emits runtime-chosen localhost ports for host port 0', () => {
+test('parseManifestPorts emits runtime-chosen localhost openPorts for host port 0', () => {
     const workspaceDir = tempDir();
     try {
         const result = runModuleSnippet(
             `const { parseManifestPorts } = await import(${JSON.stringify(dockerCommonUrl)});
 const manifest = {};
-const profile = { ports: ['127.0.0.1:0:9000', '127.0.0.1:18080:8080'] };
+const profile = { openPorts: ['127.0.0.1:0:9000', '127.0.0.1:18080:8080'] };
 process.stdout.write(JSON.stringify(parseManifestPorts(manifest, profile)));`,
             {},
             { cwd: workspaceDir },
@@ -155,6 +155,48 @@ process.stdout.write(JSON.stringify(parseManifestPorts(manifest, profile)));`,
                 { hostPort: 18080, containerPort: 8080, hostIp: '127.0.0.1', protocol: 'tcp' },
             ],
         });
+    } finally {
+        fs.rmSync(workspaceDir, { recursive: true, force: true });
+    }
+});
+
+test('parseManifestPorts rejects legacy profile ports field', () => {
+    const workspaceDir = tempDir();
+    try {
+        const result = runModuleSnippet(
+            `const { parseManifestPorts } = await import(${JSON.stringify(dockerCommonUrl)});
+try {
+  parseManifestPorts({}, { ports: ['127.0.0.1:0:9000'] });
+} catch (err) {
+  process.stdout.write(err.message);
+}`,
+            {},
+            { cwd: workspaceDir },
+        );
+
+        assert.equal(result.status, 0, result.stderr);
+        assert.match(result.stdout, /renamed to 'openPorts'/);
+    } finally {
+        fs.rmSync(workspaceDir, { recursive: true, force: true });
+    }
+});
+
+test('parseManifestPorts rejects legacy manifest ports field', () => {
+    const workspaceDir = tempDir();
+    try {
+        const result = runModuleSnippet(
+            `const { parseManifestPorts } = await import(${JSON.stringify(dockerCommonUrl)});
+try {
+  parseManifestPorts({ ports: ['7000'] }, {});
+} catch (err) {
+  process.stdout.write(err.message);
+}`,
+            {},
+            { cwd: workspaceDir },
+        );
+
+        assert.equal(result.status, 0, result.stderr);
+        assert.match(result.stdout, /renamed to profile field 'openPorts'/);
     } finally {
         fs.rmSync(workspaceDir, { recursive: true, force: true });
     }

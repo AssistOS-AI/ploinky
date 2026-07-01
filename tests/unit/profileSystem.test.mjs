@@ -145,20 +145,20 @@ test('getProfileConfig lets active profile network replace default network', () 
     assert.deepStrictEqual(config.network, { mode: 'host' });
 });
 
-test('getProfileConfig lets active profile server replace default server', () => {
+test('getProfileConfig lets active profile additionalServerPort replace default additionalServerPort', () => {
     writeManifest('repo-server', 'agent-server', {
         profiles: {
             default: {
-                server: 'http://127.0.0.1:3000',
+                additionalServerPort: '3000',
             },
             prod: {
-                server: 'http://127.0.0.1:8080',
+                additionalServerPort: '8080',
             },
         },
     });
 
     const config = getProfileConfig('repo-server/agent-server', 'prod');
-    assert.equal(config.server, 'http://127.0.0.1:8080');
+    assert.equal(config.additionalServerPort, '8080');
 });
 
 test('validateProfile reports missing secrets', () => {

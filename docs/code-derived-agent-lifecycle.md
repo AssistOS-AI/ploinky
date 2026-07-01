@@ -144,7 +144,7 @@ The enabled record includes:
 | `runMode` | `isolated`, `global`, or `devel`. |
 | `type` | Always `agent` for agent records. |
 | `config.binds` | Initial descriptive binds: project path to itself, repo `Agent/` to `/Agent`, agent source to `/code`. Runtime startup recomputes actual binds. |
-| `config.ports` | Result of `parseManifestPorts(manifest)` or fallback `{containerPort: 7000}`. Because `parseManifestPorts` only reads profile config, enable-time records normally get the fallback. |
+| `config.ports` | Runtime port mapping metadata from `parseManifestPorts(manifest)` or fallback `{containerPort: 7000}`. Because `parseManifestPorts` only reads profile config, enable-time records normally get the fallback. |
 | `auth` | `{mode}` plus local auth metadata when local password auth is enabled. |
 | `alias` | Optional route/record alias. |
 | `profile` | Optional profile requested by dependency directive or CLI auth options. |
@@ -173,8 +173,8 @@ Ploinky does not load a central manifest schema in the observed paths. Individua
 | `runtime.resources.env` | No | Adds env vars with templates such as `{{PLOINKY_WORKSPACE_ROOT}}`, `{{STORAGE_CONTAINER_PATH}}`, `{{STORAGE_HOST_PATH}}`, `{{secret:NAME}}`, `{{generatedSecret:NAME}}`, and `{{var:NAME}}`. |
 | `lite-sandbox` | No | If true and host sandbox is enabled, selects bwrap on Linux or seatbelt on macOS. If host sandbox is disabled, it falls back to container runtime. |
 | `profiles` | No | If present, `profiles.default` is required. Active profile comes from record profile or `.ploinky/profile`; non-default profiles are merged over default. |
-| `profiles.<name>.ports` | No | The only ports read by `parseManifestPorts`. If absent at startup, Ploinky maps a random localhost host port to container port 7000 unless host networking is used. |
-| `profiles.<name>.server` | No | Internal HTTP URL for an agent-owned browser service. The router exposes it at `http://<agent>.localhost:<routerPort>/` without requiring a stable host port for that service. |
+| `profiles.<name>.openPorts` | No | The only manifest port declarations read by `parseManifestPorts`. If absent at startup, Ploinky maps a random localhost host port to container port 7000 unless host networking is used. |
+| `profiles.<name>.additionalServerPort` | No | Internal port for an agent-owned browser service, usually a bare port such as `"3000"` and optionally `host:port`. The router exposes it at `http://<agent>.localhost:<routerPort>/` without requiring a stable host port for that service. |
 | `profiles.<name>.env` | No | Overrides top-level `env` for the active profile. |
 | `profiles.<name>.secrets` | No | Profile secrets are validated and injected at runtime. |
 | `profiles.<name>.mounts` | No | Controls code/skills mount mode. Default and dev profiles are read-write by default; other profiles are read-only by default. |
@@ -185,7 +185,7 @@ Ploinky does not load a central manifest schema in the observed paths. Individua
 | `profiles.<name>.install` | No | Inserted into the runtime entry command before the start/agent/default server command. |
 | `profiles.<name>.postinstall` | No | Container/sandbox command run after creation. Without profile handling, legacy `manifest.profiles.default.postinstall` is also checked. |
 | `profiles.<name>.hosthook_postinstall` | No | Host hook run after postinstall. |
-| `ports` at top level | Effectively no | The observed `parseManifestPorts` implementation reads only profile config, not top-level `manifest.ports`. |
+| `openPorts` at top level | Effectively no | The observed `parseManifestPorts` implementation reads only profile config, not top-level `manifest.openPorts`. |
 | `env` | No | Manifest env specs. Resolution order in `secretVars.js` is encrypted secrets, `process.env`, `.env`, then default. Profile `env` replaces top-level `env`. |
 | `expose` | No | Adds explicit env values or refs. The `expose` CLI command edits this field in the source manifest. |
 | `repos` | No | Object processed by `applyManifestDirectives` during `start`. Values may be URL strings or objects with `url` and `branch`. Repos are ensured and enabled before dependency enable processing. |
@@ -424,7 +424,7 @@ Default Podman networking uses `slirp4netns:allow_host_loopback=true` and `--rep
 
 ### Ports
 
-Ports come from active profile `ports`. Accepted forms include:
+Open ports come from active profile `openPorts`. Accepted forms include:
 
 | Form | Meaning |
 | --- | --- |
@@ -435,9 +435,9 @@ Ports come from active profile `ports`. Accepted forms include:
 | `8000-8002:7000-7002` | Port range, same length on both sides. |
 | `8080:7000/udp` | UDP mapping. |
 
-If no ports are defined and networking is not host mode, Ploinky chooses a random host port between 10000 and 59999 and maps it to container port 7000 on localhost.
+If no open ports are defined and networking is not host mode, Ploinky chooses a random host port between 10000 and 59999 and maps it to container port 7000 on localhost.
 
-Profile `server` is separate from `ports`. It accepts an HTTP URL such as `http://127.0.0.1:3000` for a service running inside the agent runtime. At startup and restart, Ploinky publishes that server port on `127.0.0.1` with an ephemeral host port for container runtimes, records the resolved host URL in `.ploinky/routing.json`, and exposes it through the router at `http://<agent>.localhost:<routerPort>/`. The AgentServer/MCP port remains the normal port-7000 route.
+Profile `additionalServerPort` is separate from `openPorts`. It accepts a bare port such as `3000` for a service running inside the agent runtime; `127.0.0.1:3000` is also accepted. At startup and restart, Ploinky publishes that server port on `127.0.0.1` with an ephemeral host port for container runtimes, records the resolved upstream in `.ploinky/routing.json`, and exposes it through the router at `http://<agent>.localhost:<routerPort>/`. The AgentServer/MCP port remains the normal port-7000 route.
 
 ## Host Sandbox Runtimes
 
@@ -636,9 +636,9 @@ MCP tool and resource commands require router-minted invocation headers before c
 
 ## Code-Observed Caveats
 
-1. Enable-time port records are mostly descriptive. `enableAgent` calls `parseManifestPorts` without profile config, and that function only reads profile ports, so enable-time records normally fall back to container port 7000.
-2. Top-level `manifest.ports` is not read by the observed `parseManifestPorts` implementation.
-3. Profile `server` does not require a stable manifest host port; container runtimes publish it automatically on a localhost ephemeral port used only by the router proxy.
+1. Enable-time port records are mostly descriptive. `enableAgent` calls `parseManifestPorts` without profile config, and that function only reads profile `openPorts`, so enable-time records normally fall back to container port 7000.
+2. Top-level `manifest.openPorts` is not read by the observed `parseManifestPorts` implementation.
+3. Profile `additionalServerPort` does not require a stable manifest host port; container runtimes publish it automatically on a localhost ephemeral port used only by the router proxy.
 4. Manifest `repos` and `enable` are applied at `start`, not at `enable agent`.
 5. Container runtime dependency installs happen in caches, not in the long-running containers.
 6. Podman and seatbelt copy/stage runtime files; Docker mostly mounts them directly.
