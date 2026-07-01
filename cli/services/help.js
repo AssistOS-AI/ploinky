@@ -21,7 +21,7 @@ export function showHelp(args = []) {
   remove <name|url>              Alias for uninstall
   update [folderPath]            Update Ploinky, .ploinky/repos, Achilles deps, projects, and default skills
   start [staticAgent] [port]     Start agents from .ploinky/agents.json and launch Router
-  shell <agentName>              Open interactive sh in container (attached TTY)
+  shell <agentName>              Open interactive shell in container (attached TTY)
   cli <agentName> [args...]      Run manifest "cli" command (attached TTY)
   webchat [--rotate]             Print the WebChat access URL and support agent URL params
   dashboard [--rotate]           Show or rotate Dashboard token and print access URL
@@ -134,7 +134,7 @@ function showDetailedHelp(topic, subtopic, subsubtopic) {
             subcommands: {
                 'default': {
                     syntax: 'shell <agentName>',
-                    description: 'Open interactive POSIX sh (attached TTY) in the agent container',
+                    description: 'Open an interactive shell (attached TTY) in the agent container',
                     params: { '<agentName>': 'Agent name' },
                     examples: [ 'shell MyAPI' ],
                     notes: 'Attaches to a persistent container; exit shell to return.'

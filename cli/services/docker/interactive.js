@@ -328,18 +328,51 @@ function ensureAgentContainer(agentName, repoName, manifest) {
     return containerName;
 }
 
-function buildExecArgs(containerName, workdir, entryCommand, interactive = true, allocateTty = true) {
-    const wd = workdir || process.cwd();
-    const cmd = entryCommand && String(entryCommand).trim()
-        ? entryCommand
+function shellQuote(value) {
+    return `'${String(value).replace(/'/g, `'\\''`)}'`;
+}
+
+function sanitizeHistoryName(value) {
+    return String(value || 'agent').replace(/[^A-Za-z0-9_.-]/g, '_');
+}
+
+function buildInteractiveShellCommand(entryCommand, allocateTty) {
+    const rawCommand = entryCommand && String(entryCommand).trim()
+        ? String(entryCommand).trim()
         : 'exec /bin/bash || exec /bin/sh';
+    if (allocateTty && rawCommand === '/bin/sh') {
+        return "export PS1='# '; if command -v /bin/bash >/dev/null 2>&1; then exec /bin/bash --noprofile --norc -i; else exec /bin/sh -i; fi";
+    }
+    return rawCommand;
+}
+
+function buildTerminalEnvArgs(env = process.env, historyName = '') {
+    const args = [];
+    for (const key of ['TERM', 'COLORTERM', 'LINES', 'COLUMNS']) {
+        if (env[key]) args.push('-e', `${key}=${env[key]}`);
+    }
+    if (historyName) {
+        args.push(
+            '-e', `HISTFILE=/shared/.ploinky-${sanitizeHistoryName(historyName)}-shell-history`,
+            '-e', 'HISTSIZE=5000',
+            '-e', 'HISTFILESIZE=10000'
+        );
+    }
+    return args;
+}
+
+function buildExecArgs(containerName, workdir, entryCommand, interactive = true, allocateTty = true, options = {}) {
+    const wd = workdir || process.cwd();
+    const cmd = buildInteractiveShellCommand(entryCommand, allocateTty);
     const args = ['exec'];
     if (interactive && allocateTty) {
         args.push('-it');  // Full interactive with TTY (for direct terminal use)
+        const historyName = Object.prototype.hasOwnProperty.call(options, 'historyName') ? options.historyName : containerName;
+        args.push(...buildTerminalEnvArgs(options.env || process.env, historyName));
     } else if (interactive) {
         args.push('-i');   // Interactive stdin only, no TTY (for webchat - ensures stdin EOF propagates)
     }
-    args.push(containerName, 'sh', '-lc', `cd '${wd}' && ${cmd}`);
+    args.push(containerName, 'sh', '-lc', `cd ${shellQuote(wd)} && ${cmd}`);
     return args;
 }
 
@@ -347,7 +380,7 @@ function attachInteractive(containerName, workdir, entryCommand) {
     const runtime = getRuntime();
     // PLOINKY_NO_TTY=1 disables TTY allocation (used by webchat to ensure stdin EOF propagates)
     const allocateTty = process.env.PLOINKY_NO_TTY !== '1';
-    const execArgs = buildExecArgs(containerName, workdir, entryCommand, true, allocateTty);
+    const execArgs = buildExecArgs(containerName, workdir, entryCommand, true, allocateTty, { historyName: containerName });
     const result = spawnSync(runtime, execArgs, { stdio: 'inherit' });
     return result.status ?? 0;
 }

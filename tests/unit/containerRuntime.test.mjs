@@ -11,6 +11,7 @@ import {
     markPreinstallRunInProcess,
     resetPreinstallRunInProcess,
 } from '../../cli/services/lifecycleHooks.js';
+import { buildExecArgs } from '../../cli/services/docker/interactive.js';
 
 const repoRoot = path.resolve(fileURLToPath(new URL('../..', import.meta.url)));
 const agentServiceManagerUrl = pathToFileURL(path.join(repoRoot, 'cli/services/docker/agentServiceManager.js')).href;
@@ -179,6 +180,68 @@ try {
     } finally {
         fs.rmSync(workspaceDir, { recursive: true, force: true });
     }
+});
+
+test('buildExecArgs prefers interactive bash for direct shell TTY sessions', () => {
+    const args = buildExecArgs('agent-container', '/work', '/bin/sh', true, true, {
+        env: {
+            TERM: 'xterm-256color',
+            COLORTERM: 'truecolor',
+            LINES: '42',
+            COLUMNS: '120',
+        },
+        historyName: 'repo/agent',
+    });
+
+    assert.deepEqual(args, [
+        'exec',
+        '-it',
+        '-e', 'TERM=xterm-256color',
+        '-e', 'COLORTERM=truecolor',
+        '-e', 'LINES=42',
+        '-e', 'COLUMNS=120',
+        '-e', 'HISTFILE=/shared/.ploinky-repo_agent-shell-history',
+        '-e', 'HISTSIZE=5000',
+        '-e', 'HISTFILESIZE=10000',
+        'agent-container',
+        'sh',
+        '-lc',
+        "cd '/work' && export PS1='# '; if command -v /bin/bash >/dev/null 2>&1; then exec /bin/bash --noprofile --norc -i; else exec /bin/sh -i; fi",
+    ]);
+});
+
+test('buildExecArgs preserves non-tty shell sessions for webchat stdin EOF handling', () => {
+    assert.deepEqual(
+        buildExecArgs('agent-container', '/work', '/bin/sh', true, false, {
+            env: { TERM: 'xterm-256color' },
+            historyName: 'repo/agent',
+        }),
+        [
+            'exec',
+            '-i',
+            'agent-container',
+            'sh',
+            '-lc',
+            "cd '/work' && /bin/sh",
+        ],
+    );
+});
+
+test('buildExecArgs does not rewrite non-shell commands and quotes workdir', () => {
+    assert.deepEqual(
+        buildExecArgs('agent-container', "/tmp/it's-here", 'node /code/src/index.mjs', true, true, {
+            env: {},
+            historyName: '',
+        }),
+        [
+            'exec',
+            '-it',
+            'agent-container',
+            'sh',
+            '-lc',
+            "cd '/tmp/it'\\''s-here' && node /code/src/index.mjs",
+        ],
+    );
 });
 
 test('parseManifestPorts rejects legacy manifest ports field', () => {
