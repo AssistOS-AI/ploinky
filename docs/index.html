@@ -212,8 +212,10 @@
                     <h3>Installation</h3>
                     <pre><code>$ git clone https://github.com/AssistOS-AI/ploinky.git
 $ cd ploinky
+$ echo 'PLOINKY_MASTER_KEY=change-me-to-a-random-secret' &gt; .env
 $ npm install
 </code></pre>
+                    <p><code>PLOINKY_MASTER_KEY</code> is required before Ploinky can start because it derives workspace secrets from that value. Any non-empty value works for local testing, but a long random value is recommended. You can keep it in the project <code>.env</code> file as shown above or export it in your shell.</p>
 
                     <div style="text-align: center; margin-top: 3rem;">
                         <a href="cli-reference.html" class="btn btn-primary">View CLI Reference</a>
