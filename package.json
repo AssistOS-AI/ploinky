@@ -11,7 +11,7 @@
         "start": "cd test_run_dir node bin/p-cloud",
         "clean": "rm -rf test_run_dir",
         "test": "./tests/run-all.sh",
-        "postinstall": "cd node_modules; git clone https://github.com/AssistOS-AI/AchillesAgentLib.git"
+        "postinstall": "cd node_modules; git clone https://github.com/AssistOS-AI/AchillesAgentLib.git achillesAgentLib"
     },
     "keywords": [
         "ploinky",
