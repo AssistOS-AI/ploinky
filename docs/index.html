@@ -178,19 +178,6 @@
 
             <div class="content-wrapper">
                 <div class="doc-section">
-                    <h2>Introduction to Agents</h2>
-                    <p>In Ploinky, an "agent" is a tool that you can use and modify. It's an abstract concept and doesn't necessarily refer to a Large Language Model (LLM). Agents can be anything from a simple script to a complex application.</p>
-                    <p>Agents are organized in repositories, which can contain multiple agents. You can easily add new repositories, and modify existing agents to fit your needs.</p>
-
-                    <h3>Using Agents</h3>
-                    <p>You can interact with agents in two main ways:</p>
-                    <ol style="margin-left: 2rem; line-height: 2;">
-                        <li><strong>Individually:</strong> You can run an agent's command-line interface directly using the <code>cli</code> command. For example: <code>cli my-agent --input "some data"</code>. Agents can be designed to accept various input formats, such as JSON, natural language, or any other convention.</li>
-                        <li><strong>Integrated with Ploinky:</strong> By enabling an agent, it becomes part of the Ploinky workspace. The Ploinky server will expose the agent on a local port, which allows you to build applications that interact with your agents through a simple API on localhost. When you open the web interface, you will need to provide a token, which can be found in <code>.ploinky/.secrets</code>.</li>
-                    </ol>
-                </div>
-
-                <div class="doc-section">
                     <h2>Getting Started</h2>
 
                     <h3>Prerequisites</h3>
@@ -216,11 +203,25 @@ $ echo 'PLOINKY_MASTER_KEY=change-me-to-a-random-secret' &gt; .env
 $ npm install
 </code></pre>
                     <p><code>PLOINKY_MASTER_KEY</code> is required before Ploinky can start because it derives workspace secrets from that value. Any non-empty value works for local testing, but a long random value is recommended. You can keep it in the project <code>.env</code> file as shown above or export it in your shell.</p>
+                    <p>To run <code>ploinky start explorer</code> from any directory, add Ploinky's <code>bin</code> directory to your <code>PATH</code>, for example: <code>export PATH="$PATH:~/path/to/ploinky/bin"</code>.</p>
 
                     <div style="text-align: center; margin-top: 3rem;">
                         <a href="cli-reference.html" class="btn btn-primary">View CLI Reference</a>
                         <a href="architecture.html" class="btn btn-secondary">Learn Architecture</a>
                     </div>
+                </div>
+
+                <div class="doc-section">
+                    <h2>Introduction to Agents</h2>
+                    <p>In Ploinky, an "agent" is a tool that you can use and modify. It's an abstract concept and doesn't necessarily refer to a Large Language Model (LLM). Agents can be anything from a simple script to a complex application.</p>
+                    <p>Agents are organized in repositories, which can contain multiple agents. You can easily add new repositories, and modify existing agents to fit your needs.</p>
+
+                    <h3>Using Agents</h3>
+                    <p>You can interact with agents in two main ways:</p>
+                    <ol style="margin-left: 2rem; line-height: 2;">
+                        <li><strong>Individually:</strong> You can run an agent's command-line interface directly using the <code>cli</code> command. For example: <code>cli my-agent --input "some data"</code>. Agents can be designed to accept various input formats, such as JSON, natural language, or any other convention.</li>
+                        <li><strong>Integrated with Ploinky:</strong> By enabling an agent, it becomes part of the Ploinky workspace. The Ploinky server will expose the agent on a local port, which allows you to build applications that interact with your agents through a simple API on localhost. When you open the web interface, you will need to provide a token, which can be found in <code>.ploinky/.secrets</code>.</li>
+                    </ol>
                 </div>
 
                 <div class="doc-section">
@@ -291,7 +292,7 @@ ploinky -shell &lt;text&gt;     # single-shot suggestion and exit</code></pre>
         // Demo content for each tab
         const demos = {
             init: [
-                { type: 'command', text: 'user@host:~/Desktop/work$ ploinky' },
+                { type: 'command', text: 'user@host:~/Desktop/work$ ploinky start explorer' },
                 { type: 'output', text: 'Initializing Ploinky environment in ~/Desktop/work/.ploinky...' },
                 { type: 'output', text: 'Default \'basic\' repository not found. Cloning...' },
                 { type: 'output', text: 'Cloning into \'.ploinky/repos/basic\'...' },
@@ -302,9 +303,14 @@ ploinky -shell &lt;text&gt;     # single-shot suggestion and exit</code></pre>
                 { type: 'output', text: 'Receiving objects: 100% (102/102), 15.88 KiB | 15.88 MiB/s, done.' },
                 { type: 'output', text: 'Resolving deltas: 100% (25/25), done.' },
                 { type: 'output', text: 'Default repository cloned successfully.' },
-                { type: 'output', text: 'Welcome to Ploinky interactive mode.' },
-                { type: 'output', text: 'Type \'help\' for a list of commands. Use \'exit\' to leave, \'shutdown\' to close session containers, or \'destroy\' to remove all Ploinky containers.' },
-                { type: 'prompt', text: 'ploinky ~/Desktop/work> ' }
+                { type: 'success', text: '✓ Agent \'explorer\' from repo \'AchillesIDE\' enabled.' },
+                { type: 'output', text: '[install] running for \'explorer\'...' },
+                { type: 'output', text: 'Installing agent dependencies...' },
+                { type: 'output', text: 'ploinky_agent_explorer_work_xxxxxx' },
+                { type: 'info', text: '[start] RoutingServer launched in background (pid xxxxx).' },
+                { type: 'info', text: '[start] Dashboard: http://127.0.0.1:8080/dashboard' },
+                { type: 'info', text: '[start] WebChat: http://127.0.0.1:8080/webchat' },
+                { type: 'output', text: '[RoutingServer] Ploinky server running on http://127.0.0.1:8080' }
             ],
             repos: [
                 { type: 'prompt', text: 'ploinky ~/Desktop/work> ' },
@@ -383,6 +389,7 @@ ploinky -shell &lt;text&gt;     # single-shot suggestion and exit</code></pre>
         // Tab switching
         const tabs = document.querySelectorAll('.demo-tab');
         const terminalContent = document.getElementById('terminal-content');
+        let activeDemoTimers = [];
         
         tabs.forEach(tab => {
             tab.addEventListener('click', () => {
@@ -398,10 +405,12 @@ ploinky -shell &lt;text&gt;     # single-shot suggestion and exit</code></pre>
 
         function showDemo(name) {
             const lines = demos[name];
+            activeDemoTimers.forEach(timer => clearTimeout(timer));
+            activeDemoTimers = [];
             terminalContent.innerHTML = '';
             
             lines.forEach((line, index) => {
-                setTimeout(() => {
+                const timer = setTimeout(() => {
                     const div = document.createElement('div');
                     div.className = `terminal-line ${line.type}`;
                     div.textContent = line.text;
@@ -409,11 +418,13 @@ ploinky -shell &lt;text&gt;     # single-shot suggestion and exit</code></pre>
                     terminalContent.appendChild(div);
                     
                     // Animate appearance
-                    setTimeout(() => {
+                    const fadeTimer = setTimeout(() => {
                         div.style.opacity = '1';
                         terminalContent.scrollTop = terminalContent.scrollHeight;
                     }, 50);
+                    activeDemoTimers.push(fadeTimer);
                 }, index * 100); // Stagger the appearance
+                activeDemoTimers.push(timer);
             });
         }
 

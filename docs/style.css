@@ -459,6 +459,10 @@ pre code {
   color: white;
 }
 
+.doc-section a.btn-primary {
+  color: white;
+}
+
 .btn-primary:hover {
   transform: translateY(-2px);
   box-shadow: var(--shadow-md);
