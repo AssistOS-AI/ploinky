@@ -4,6 +4,7 @@ import { execFileSync } from 'child_process';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+import { fileURLToPath, pathToFileURL } from 'url';
 
 import { PLOINKY_DIR, REPOS_DIR } from '../../cli/services/config.js';
 import {
@@ -43,6 +44,11 @@ function initGitRepo(repoPath) {
 
 function removeRepo(repoName) {
     fs.rmSync(path.join(REPOS_DIR, repoName), { recursive: true, force: true });
+}
+
+function projectFileUrl(relPath) {
+    const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
+    return pathToFileURL(path.join(projectRoot, relPath)).href;
 }
 
 test('copySkill replaces destination so removed source files do not linger', () => {
@@ -318,6 +324,91 @@ test('refreshDefaultSkillsInPloinkyRepos reports default skill install failures'
     } finally {
         removeRepo(sourceRepo);
         removeRepo(managedRepo);
+    }
+});
+
+test('updateRepo reports default skill refresh failures after updating a managed repo', () => {
+    const workspaceRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-update-default-skills-'));
+    const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
+    const configUrl = projectFileUrl('cli/services/config.js');
+    const commandsUrl = projectFileUrl('cli/commands/repoAgentCommands.js');
+
+    try {
+        execFileSync(process.execPath, ['--input-type=module', '-e', `
+            import assert from 'node:assert/strict';
+            import fs from 'node:fs';
+            import path from 'node:path';
+            import { execFileSync } from 'node:child_process';
+
+            const workspaceRoot = ${JSON.stringify(workspaceRoot)};
+            process.env.PLOINKY_WORKSPACE_ROOT = workspaceRoot;
+
+            const { REPOS_DIR } = await import(${JSON.stringify(configUrl)});
+            const { updateRepo } = await import(${JSON.stringify(commandsUrl)});
+
+            function mkdir(dir) {
+                fs.mkdirSync(dir, { recursive: true });
+            }
+
+            function initGitRepo(repoPath) {
+                mkdir(repoPath);
+                execFileSync('git', ['init', '-q'], { cwd: repoPath, stdio: 'ignore' });
+                execFileSync('git', ['config', 'user.email', 'test@example.invalid'], { cwd: repoPath, stdio: 'ignore' });
+                execFileSync('git', ['config', 'user.name', 'Test User'], { cwd: repoPath, stdio: 'ignore' });
+                fs.writeFileSync(path.join(repoPath, 'README.md'), '# repo\\n');
+                execFileSync('git', ['add', '.'], { cwd: repoPath, stdio: 'ignore' });
+                execFileSync('git', ['commit', '-m', 'initial'], { cwd: repoPath, stdio: 'ignore' });
+            }
+
+            const repoName = 'UnitCommandRepo-${process.pid}-${Date.now()}';
+            const providerName = 'UnitCommandProvider-${process.pid}-${Date.now()}';
+            const sourceRepoPath = path.join(workspaceRoot, 'source-repo');
+            const installedRepoPath = path.join(REPOS_DIR, repoName);
+            const defaultSkillsRepoPath = path.join(REPOS_DIR, 'AchillesCopilotBasicSkills');
+
+            mkdir(REPOS_DIR);
+            initGitRepo(sourceRepoPath);
+            mkdir(path.join(REPOS_DIR, providerName, 'agent'));
+            fs.writeFileSync(path.join(REPOS_DIR, providerName, 'agent', 'manifest.json'), JSON.stringify({
+                repos: { [repoName]: sourceRepoPath },
+            }, null, 2));
+            mkdir(installedRepoPath);
+            fs.writeFileSync(path.join(installedRepoPath, 'stale.txt'), 'stale\\n');
+            mkdir(defaultSkillsRepoPath);
+
+            const logs = [];
+            const originalLog = console.log;
+            console.log = (message = '') => {
+                logs.push(String(message));
+            };
+            try {
+                await assert.rejects(
+                    () => updateRepo(repoName),
+                    (err) => {
+                        assert.match(
+                            err.message,
+                            new RegExp('update repo failed: Failed to refresh default skills in ' + repoName),
+                        );
+                        return true;
+                    },
+                );
+            } finally {
+                console.log = originalLog;
+            }
+
+            assert.equal(fs.existsSync(path.join(installedRepoPath, 'README.md')), true);
+            assert.equal(fs.existsSync(path.join(installedRepoPath, 'stale.txt')), false);
+            assert.ok(logs.includes('  Default skills summary: 0/1 repo(s) refreshed.'));
+        `], {
+            cwd: projectRoot,
+            env: {
+                ...process.env,
+                PLOINKY_WORKSPACE_ROOT: workspaceRoot,
+            },
+            stdio: ['ignore', 'pipe', 'pipe'],
+        });
+    } finally {
+        fs.rmSync(workspaceRoot, { recursive: true, force: true });
     }
 });
 

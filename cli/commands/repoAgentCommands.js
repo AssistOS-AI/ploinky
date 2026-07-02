@@ -165,6 +165,31 @@ function refreshRuntimeAchillesForUpdate(failed, ploinkyRoot = resolvePloinkyRoo
     }
 }
 
+function appendDefaultSkillFailures(failed, summary) {
+    if (!summary?.failed?.length) return;
+    for (const entry of summary.failed) {
+        failed.push({
+            repoName: `default skills ${entry.repoName}`,
+            message: entry.message,
+        });
+    }
+}
+
+function logDefaultSkillSummary(summary, indent = '') {
+    const refreshedCount = summary?.refreshed?.length || 0;
+    const skippedCount = summary?.skipped?.length || 0;
+    const failedCount = summary?.failed?.length || 0;
+    if (!refreshedCount && !failedCount) return;
+
+    console.log(`${indent}Default skills summary: ${refreshedCount}/${summary.total} repo(s) refreshed.`);
+    if (skippedCount) {
+        console.log(`${indent}Default skills skipped: ${skippedCount} repo(s).`);
+    }
+    if (failedCount) {
+        console.log(`${indent}Default skills failed: ${failedCount} repo(s).`);
+    }
+}
+
 function getAgentNames() {
     const summary = collectAgentsSummary();
     if (!summary.length) return [];
@@ -244,6 +269,12 @@ async function updateRepo(repoName) {
             const failedPackages = achilles.failed.map(entry => path.relative(repoPath, entry.packageDir) || '.').join(', ');
             throw new Error(`Failed to refresh achillesAgentLib in ${failedPackages}`);
         }
+        const defaultSkills = refreshDefaultSkillsInPloinkyRepos([repoName]);
+        logDefaultSkillSummary(defaultSkills, '  ');
+        if (defaultSkills.failed.length) {
+            const failedRepos = defaultSkills.failed.map(entry => entry.repoName).join(', ');
+            throw new Error(`Failed to refresh default skills in ${failedRepos}`);
+        }
     } catch (err) {
         throw new Error(`update repo failed: ${err?.message || err}`);
     }
@@ -282,6 +313,10 @@ async function updatePloinkyRepos() {
         }
     }
 
+    const defaultSkills = refreshDefaultSkillsInPloinkyRepos(ploinkyRepos);
+    logDefaultSkillSummary(defaultSkills);
+    appendDefaultSkillFailures(failed, defaultSkills);
+
     console.log(`Ploinky repository update summary: ${updated}/${ploinkyRepos.length} repositories updated.`);
     if (achilles.total) {
         console.log(`Achilles dependency summary: ${achilles.refreshed.length}/${achilles.total} package(s) refreshed.`);
@@ -292,7 +327,7 @@ async function updatePloinkyRepos() {
         throw new Error(`Failed to update ${failed.length} repository(s): ${failedNames}`);
     }
 
-    return { total: ploinkyRepos.length, updated, failed, runtimeAchilles, achilles };
+    return { total: ploinkyRepos.length, updated, failed, runtimeAchilles, achilles, defaultSkills };
 }
 
 async function updateAllRepos(folderPath, options = {}) {
@@ -383,6 +418,10 @@ async function updateAllRepos(folderPath, options = {}) {
         }
     }
 
+    const defaultSkills = refreshDefaultSkillsInPloinkyRepos(ploinkyRepos);
+    logDefaultSkillSummary(defaultSkills);
+    appendDefaultSkillFailures(failed, defaultSkills);
+
     if (workspaceManifestFolders.length) {
         console.log('Installing skills from folders containing ploinky-skills-manifest.json...');
         console.log(`  Found ${workspaceManifestFolders.length} skills manifest folder(s) under ${projectsRoot}.`);
@@ -432,7 +471,7 @@ async function updateAllRepos(folderPath, options = {}) {
         throw new Error(`Failed to update ${failed.length} repository(s): ${failedNames}`);
     }
 
-    return { total: totalRepos, updated, failed, skipped, selfUpdate, runtimeAchilles, achilles };
+    return { total: totalRepos, updated, failed, skipped, selfUpdate, runtimeAchilles, achilles, defaultSkills };
 }
 
 function pathsReferToSameLocation(first, second) {
