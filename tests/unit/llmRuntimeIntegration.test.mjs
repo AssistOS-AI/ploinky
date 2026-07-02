@@ -1,9 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { pathToFileURL } from 'node:url';
 
 import {
     isLlmRuntimeManifest,
@@ -58,6 +60,68 @@ function withTempDirs(fn) {
     } finally {
         fs.rmSync(workspace, { recursive: true, force: true });
     }
+}
+
+const TEST_GIT_CONFIG = [
+    ['commit.gpgsign', 'false'],
+    ['protocol.file.allow', 'always'],
+];
+
+function withIsolatedGitEnv(workspace, fn) {
+    const emptyGlobalConfig = path.join(workspace, 'empty-gitconfig');
+    fs.writeFileSync(emptyGlobalConfig, '');
+
+    const originalGitEnv = new Map();
+    for (const name of Object.keys(process.env)) {
+        if (!name.startsWith('GIT_CONFIG')) continue;
+        originalGitEnv.set(name, process.env[name]);
+        delete process.env[name];
+    }
+
+    const controlledGitEnv = {
+        GIT_CONFIG_NOSYSTEM: '1',
+        GIT_CONFIG_GLOBAL: emptyGlobalConfig,
+        GIT_CONFIG_COUNT: String(TEST_GIT_CONFIG.length),
+    };
+    for (const [index, [key, value]] of TEST_GIT_CONFIG.entries()) {
+        controlledGitEnv[`GIT_CONFIG_KEY_${index}`] = key;
+        controlledGitEnv[`GIT_CONFIG_VALUE_${index}`] = value;
+    }
+    for (const [name, value] of Object.entries(controlledGitEnv)) {
+        process.env[name] = value;
+    }
+
+    try {
+        return fn();
+    } finally {
+        for (const name of Object.keys(controlledGitEnv)) {
+            delete process.env[name];
+        }
+        for (const [name, value] of originalGitEnv.entries()) {
+            process.env[name] = value;
+        }
+    }
+}
+
+function git(args, cwd) {
+    return execFileSync('git', args, {
+        cwd,
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'pipe'],
+    }).trim();
+}
+
+function fileUrl(filePath) {
+    return pathToFileURL(filePath).href;
+}
+
+function initCatalogGitRepo(catalogRoot) {
+    git(['init', '--quiet', '-b', 'main'], catalogRoot);
+    git(['config', 'user.email', 'runtime-integration@example.invalid'], catalogRoot);
+    git(['config', 'user.name', 'Runtime Integration Tests'], catalogRoot);
+    git(['add', '.'], catalogRoot);
+    git(['commit', '--quiet', '-m', 'catalog'], catalogRoot);
+    return git(['rev-parse', 'HEAD'], catalogRoot);
 }
 
 function computeReuseHashForTest(parts) {
@@ -216,6 +280,51 @@ test('prepareLlmStartup selects catalog architecture and writes state file', () 
         const serializedState = JSON.stringify({ stateJson, lockJson });
         assert.equal(serializedState.includes('HF_TOKEN'), false);
         assert.equal(serializedState.includes('super-secret-token'), false);
+    });
+});
+
+test('prepareLlmStartup records remote catalog provenance from configured repo', () => {
+    withTempDirs(({ agentsRoot, catalogRoot, workspace }) => {
+        withIsolatedGitEnv(workspace, () => {
+            const commit = initCatalogGitRepo(catalogRoot);
+            const cacheDir = path.join(workspace, '.ploinky', 'llm-catalog-cache');
+            const repoUrl = fileUrl(catalogRoot);
+
+            const result = prepareLlmStartup({
+                runtime: 'docker',
+                manifest: { llmRuntime: { enabled: true } },
+                profileConfig: null,
+                agentName: 'baseLocal',
+                env: {
+                    PLOINKY_LLM_ARCHITECTURES_REPO: repoUrl,
+                    PLOINKY_LLM_ARCHITECTURES_REF: 'main',
+                    PLOINKY_LLM_CATALOG_CACHE_DIR: cacheDir,
+                    PLOINKY_LLM_FORCE_PLATFORM: 'linux/amd64',
+                },
+                agentWorkDirRoot: agentsRoot,
+                envHash: 'envhash-remote',
+                effectiveNetwork: null,
+            });
+
+            assert.equal(result.selection.catalogSource, 'git');
+            assert.equal(result.selection.catalogRepoUrl, repoUrl);
+            assert.equal(result.selection.catalogRequestedRef, 'main');
+            assert.equal(result.selection.catalogRef, commit);
+            assert.equal(result.reuseKey.catalogSource, 'git');
+            assert.equal(result.reuseKey.catalogRepoUrl, repoUrl);
+            assert.equal(result.reuseKey.catalogRequestedRef, 'main');
+            assert.equal(result.reuseKey.catalogRef, commit);
+
+            const stateFile = path.join(agentsRoot, 'baseLocal', 'runtime', 'selected-architecture.json');
+            const stateJson = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
+            assert.deepEqual(stateJson.catalog, {
+                id: 'test/catalog',
+                ref: commit,
+                source: 'git',
+                repoUrl,
+                requestedRef: 'main',
+            });
+        });
     });
 });
 
