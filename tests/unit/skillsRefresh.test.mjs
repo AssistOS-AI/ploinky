@@ -212,6 +212,39 @@ test('refreshDefaultSkillsInPloinkyRepos skips skills-only repos', () => {
     }
 });
 
+test('refreshDefaultSkillsInPloinkyRepos rejects path-like repo names', () => {
+    const sourceRepo = `UnitDefaultSkillsSafeSource-${process.pid}-${Date.now()}`;
+    const outsideName = `UnitDefaultSkillsOutside-${process.pid}-${Date.now()}`;
+    const pathLikeRepo = `../${outsideName}`;
+    const outsidePath = path.join(REPOS_DIR, '..', outsideName);
+
+    try {
+        removeRepo(sourceRepo);
+        fs.rmSync(outsidePath, { recursive: true, force: true });
+        createRepo(sourceRepo, {
+            defaultSkill: {
+                'SKILL.md': '# Default skill\n',
+            },
+        });
+        fs.mkdirSync(outsidePath, { recursive: true });
+
+        const result = refreshDefaultSkillsInPloinkyRepos([pathLikeRepo], {
+            defaultSkillsRepoName: sourceRepo,
+        });
+
+        assert.equal(result.refreshed.length, 0);
+        assert.equal(result.skipped.length, 0);
+        assert.equal(result.failed.length, 1);
+        assert.equal(result.failed[0].repoName, pathLikeRepo);
+        assert.match(result.failed[0].message, /Invalid repository name/);
+        assert.equal(fs.existsSync(path.join(outsidePath, '.agents')), false);
+        assert.equal(fs.existsSync(path.join(outsidePath, '.claude')), false);
+    } finally {
+        removeRepo(sourceRepo);
+        fs.rmSync(outsidePath, { recursive: true, force: true });
+    }
+});
+
 test('refreshDefaultSkillsInPloinkyRepos reports default skill install failures', () => {
     const sourceRepo = `UnitDefaultSkillsRepoFailure-${process.pid}-${Date.now()}`;
     const managedRepo = `UnitManagedRepoFailure-${process.pid}-${Date.now()}`;
