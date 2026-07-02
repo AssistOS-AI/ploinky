@@ -39,6 +39,20 @@ function getGitRepoNames() {
     return gitRepoNames;
 }
 
+function normalizeManagedRepoName(repoName) {
+    const normalizedRepoName = reposSvc.normalizeRepoName(repoName);
+    const reposRoot = path.resolve(REPOS_DIR);
+    const repoPath = path.resolve(reposRoot, normalizedRepoName);
+    const relativeRepoPath = path.relative(reposRoot, repoPath);
+    if (!relativeRepoPath
+        || relativeRepoPath === '..'
+        || relativeRepoPath.startsWith(`..${path.sep}`)
+        || path.isAbsolute(relativeRepoPath)) {
+        throw new Error('Invalid repository name.');
+    }
+    return { repoName: normalizedRepoName, repoPath };
+}
+
 function refreshDefaultSkillsInPloinkyRepo(repoName, {
     defaultSkillsRepoName = DEFAULT_SKILLS_REPO_NAME,
 } = {}) {
@@ -46,13 +60,12 @@ function refreshDefaultSkillsInPloinkyRepo(repoName, {
     if (!repoNameLabel) {
         return { repoName: repoNameLabel, skipped: true, reason: 'missing repo name' };
     }
-    const normalizedRepoName = reposSvc.normalizeRepoName(repoNameLabel);
-    const normalizedDefaultSkillsRepoName = reposSvc.normalizeRepoName(defaultSkillsRepoName);
+    const { repoName: normalizedRepoName, repoPath } = normalizeManagedRepoName(repoNameLabel);
+    const { repoName: normalizedDefaultSkillsRepoName } = normalizeManagedRepoName(defaultSkillsRepoName);
     if (normalizedRepoName === normalizedDefaultSkillsRepoName) {
         return { repoName: normalizedRepoName, skipped: true, reason: 'default skills source repo' };
     }
 
-    const repoPath = path.join(REPOS_DIR, normalizedRepoName);
     if (!fs.existsSync(repoPath) || !fs.statSync(repoPath).isDirectory()) {
         return { repoName: normalizedRepoName, skipped: true, reason: 'repo path missing' };
     }

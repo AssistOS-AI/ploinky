@@ -5,7 +5,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 
-import { REPOS_DIR } from '../../cli/services/config.js';
+import { PLOINKY_DIR, REPOS_DIR } from '../../cli/services/config.js';
 import {
     refreshDefaultSkillsInPloinkyRepos,
 } from '../../cli/commands/repoAgentCommands.js';
@@ -242,6 +242,56 @@ test('refreshDefaultSkillsInPloinkyRepos rejects path-like repo names', () => {
     } finally {
         removeRepo(sourceRepo);
         fs.rmSync(outsidePath, { recursive: true, force: true });
+    }
+});
+
+test('refreshDefaultSkillsInPloinkyRepos rejects dot repo names without root pollution', () => {
+    const sourceRepo = `UnitDefaultSkillsDotSource-${process.pid}-${Date.now()}`;
+    const skillName = `defaultSkillDot-${process.pid}-${Date.now()}`;
+    const pollutionPaths = [
+        path.join(REPOS_DIR, '.agents'),
+        path.join(REPOS_DIR, '.claude'),
+        path.join(PLOINKY_DIR, '.agents'),
+        path.join(PLOINKY_DIR, '.claude'),
+    ];
+    const existedBefore = new Map(pollutionPaths.map(targetPath => [targetPath, fs.existsSync(targetPath)]));
+
+    try {
+        removeRepo(sourceRepo);
+        createRepo(sourceRepo, {
+            [skillName]: {
+                'SKILL.md': '# Default skill\n',
+            },
+        });
+
+        const result = refreshDefaultSkillsInPloinkyRepos(['.', '..'], {
+            defaultSkillsRepoName: sourceRepo,
+        });
+
+        assert.equal(result.refreshed.length, 0);
+        assert.equal(result.skipped.length, 0);
+        assert.equal(result.failed.length, 2);
+        assert.deepEqual(result.failed.map(entry => entry.repoName), ['.', '..']);
+        assert.match(result.failed[0].message, /Invalid repository name/);
+        assert.match(result.failed[1].message, /Invalid repository name/);
+        for (const targetPath of pollutionPaths) {
+            if (!existedBefore.get(targetPath)) {
+                assert.equal(fs.existsSync(targetPath), false);
+            }
+        }
+        assert.equal(fs.existsSync(path.join(REPOS_DIR, '.agents', 'skills', skillName)), false);
+        assert.equal(fs.existsSync(path.join(PLOINKY_DIR, '.agents', 'skills', skillName)), false);
+    } finally {
+        removeRepo(sourceRepo);
+        for (const root of [REPOS_DIR, PLOINKY_DIR]) {
+            fs.rmSync(path.join(root, '.agents', 'skills', skillName), { recursive: true, force: true });
+            fs.rmSync(path.join(root, '.claude', 'skills', skillName), { recursive: true, force: true });
+        }
+        for (const targetPath of pollutionPaths) {
+            if (!existedBefore.get(targetPath)) {
+                fs.rmSync(targetPath, { recursive: true, force: true });
+            }
+        }
     }
 });
 
