@@ -67,6 +67,7 @@ function runAggregateUpdateChild(workspaceRoot, body) {
         const runtimeRoot = ${JSON.stringify(runtimeRoot)};
         process.env.PLOINKY_WORKSPACE_ROOT = workspaceRoot;
         process.env.PLOINKY_ROOT = runtimeRoot;
+        delete process.env.PLOINKY_AGENTLIB_REF;
 
         function mkdir(dir) {
             fs.mkdirSync(dir, { recursive: true });
@@ -100,16 +101,28 @@ function runAggregateUpdateChild(workspaceRoot, body) {
             const wrapperPath = path.join(binDir, 'git');
             fs.writeFileSync(wrapperPath, [
                 '#!/bin/sh',
-                'case " $* " in',
-                '  *github.com/AssistOS-AI/achillesAgentLib.git*|*github.com/AssistOS-AI/MCPSDK.git*)',
-                '    for arg in "$@"; do',
-                '      if [ "$arg" = "ls-remote" ]; then',
-                '        echo "0123456789abcdef0123456789abcdef01234567\\trefs/heads/main"',
-                '        exit 0',
-                '      fi',
-                '    done',
-                '    ;;',
-                'esac',
+                'is_ls_remote=0',
+                'for arg in "$@"; do',
+                '  if [ "$arg" = "ls-remote" ]; then',
+                '    is_ls_remote=1',
+                '  fi',
+                'done',
+                'if [ "$is_ls_remote" = "1" ]; then',
+                '  case " $* " in',
+                '    *github.com/AssistOS-AI/achillesAgentLib.git*|*github.com/AssistOS-AI/MCPSDK.git*)',
+                '      echo "0123456789abcdef0123456789abcdef01234567\\trefs/heads/main"',
+                '      exit 0',
+                '      ;;',
+                '  esac',
+                '  for arg in "$@"; do',
+                '    case "$arg" in',
+                '      http://*|https://*|ssh://*|git@*)',
+                '        echo "unexpected external git ls-remote in aggregate update test: $arg" >&2',
+                '        exit 99',
+                '        ;;',
+                '    esac',
+                '  done',
+                'fi',
                 'exec ' + shellQuotePath(realGit) + ' "$@"',
                 '',
             ].join('\\n'));
@@ -178,6 +191,7 @@ function runAggregateUpdateChild(workspaceRoot, body) {
             ...process.env,
             PLOINKY_WORKSPACE_ROOT: workspaceRoot,
             PLOINKY_ROOT: runtimeRoot,
+            PLOINKY_AGENTLIB_REF: '',
         },
         stdio: ['ignore', 'pipe', 'pipe'],
     });
@@ -566,11 +580,16 @@ test('aggregate update commands return default skill summaries after refreshing 
             assert.equal(fs.existsSync(path.join(fixture.installedRepoPath, 'stale.txt')), false);
             assert.equal(fs.existsSync(installedSkillPath), true);
 
+            fs.rmSync(path.join(fixture.installedRepoPath, '.agents'), { recursive: true, force: true });
+            fs.rmSync(path.join(fixture.installedRepoPath, '.claude'), { recursive: true, force: true });
+            assert.equal(fs.existsSync(installedSkillPath), false);
+
             const allResult = await updateAllRepos(workspaceRoot, { interactiveSession: true });
 
             assert.equal(allResult.failed.length, 0);
             assertDefaultSkillsSummary(allResult.defaultSkills, fixture.repoName);
             assert.equal(fs.existsSync(installedSkillPath), true);
+            assert.equal(fs.lstatSync(path.join(fixture.installedRepoPath, '.claude')).isSymbolicLink(), true);
         `);
     } finally {
         fs.rmSync(workspaceRoot, { recursive: true, force: true });
