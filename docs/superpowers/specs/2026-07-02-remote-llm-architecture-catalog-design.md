@@ -38,7 +38,7 @@ The sibling checkout fallback is removed. Local development checkouts remain sup
 | 2 | `PLOINKY_LLM_ARCHITECTURES_REPO` and optional `PLOINKY_LLM_ARCHITECTURES_REF` | Clone/fetch the configured repo/ref into `.ploinky/llm-catalog-cache`. |
 | 3 | Built-in default remote repo and default ref | Clone/fetch `https://github.com/AssistOS-AI/local-llm-architectures.git` at `main` into `.ploinky/llm-catalog-cache`. |
 
-There is no implicit lookup of `../local-llm-architectures`.
+There is no implicit sibling lookup of `../local-llm-architectures`.
 
 ## Cache Behavior
 
