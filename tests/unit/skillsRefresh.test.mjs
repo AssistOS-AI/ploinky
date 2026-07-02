@@ -1,10 +1,14 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { execFileSync } from 'child_process';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
 
 import { REPOS_DIR } from '../../cli/services/config.js';
+import {
+    refreshDefaultSkillsInPloinkyRepos,
+} from '../../cli/commands/repoAgentCommands.js';
 import { copySkill, installDefaultSkills } from '../../cli/services/skills.js';
 
 function writeSkill(root, name, files) {
@@ -25,6 +29,20 @@ function createRepo(repoName, skills) {
         writeSkill(skillsRoot, name, files);
     }
     return repoRoot;
+}
+
+function initGitRepo(repoPath) {
+    fs.mkdirSync(repoPath, { recursive: true });
+    execFileSync('git', ['init', '-q'], { cwd: repoPath, stdio: 'ignore' });
+    execFileSync('git', ['config', 'user.email', 'test@example.invalid'], { cwd: repoPath, stdio: 'ignore' });
+    execFileSync('git', ['config', 'user.name', 'Test User'], { cwd: repoPath, stdio: 'ignore' });
+    fs.writeFileSync(path.join(repoPath, 'README.md'), '# repo\n');
+    execFileSync('git', ['add', '.'], { cwd: repoPath, stdio: 'ignore' });
+    execFileSync('git', ['commit', '-m', 'initial'], { cwd: repoPath, stdio: 'ignore' });
+}
+
+function removeRepo(repoName) {
+    fs.rmSync(path.join(REPOS_DIR, repoName), { recursive: true, force: true });
 }
 
 test('copySkill replaces destination so removed source files do not linger', () => {
@@ -94,6 +112,70 @@ test('installDefaultSkills refreshes incoming skills and preserves other .agents
     } finally {
         fs.rmSync(root, { recursive: true, force: true });
         fs.rmSync(repoRoot, { recursive: true, force: true });
+    }
+});
+
+test('refreshDefaultSkillsInPloinkyRepos installs AchillesCopilotBasicSkills into managed repos', () => {
+    const sourceRepo = 'AchillesCopilotBasicSkills';
+    const managedRepo = `UnitManagedRepo-${process.pid}-${Date.now()}`;
+    const managedPath = path.join(REPOS_DIR, managedRepo);
+
+    removeRepo(sourceRepo);
+    removeRepo(managedRepo);
+    createRepo(sourceRepo, {
+        defaultSkill: {
+            'SKILL.md': '# Default skill\n',
+            'tool.js': 'export default 1;\n',
+        },
+    });
+    initGitRepo(managedPath);
+
+    try {
+        const result = refreshDefaultSkillsInPloinkyRepos([managedRepo, sourceRepo]);
+
+        assert.equal(result.defaultSkillsRepoName, sourceRepo);
+        assert.equal(result.refreshed.length, 1);
+        assert.equal(result.refreshed[0].repoName, managedRepo);
+        assert.equal(result.skipped.length, 1);
+        assert.equal(result.skipped[0].repoName, sourceRepo);
+        assert.equal(result.failed.length, 0);
+        assert.equal(
+            fs.existsSync(path.join(managedPath, '.agents', 'skills', 'defaultSkill', 'SKILL.md')),
+            true,
+        );
+        assert.equal(fs.lstatSync(path.join(managedPath, '.claude')).isSymbolicLink(), true);
+
+        const gitignore = fs.readFileSync(path.join(managedPath, '.gitignore'), 'utf8');
+        assert.match(gitignore, /^\.claude$/m);
+        assert.match(gitignore, /^\.agents\/skills\/defaultSkill\/$/m);
+        assert.doesNotMatch(gitignore, /^\.agents$/m);
+    } finally {
+        removeRepo(sourceRepo);
+        removeRepo(managedRepo);
+    }
+});
+
+test('refreshDefaultSkillsInPloinkyRepos reports default skill install failures', () => {
+    const sourceRepo = 'AchillesCopilotBasicSkills';
+    const managedRepo = `UnitManagedRepoFailure-${process.pid}-${Date.now()}`;
+    const managedPath = path.join(REPOS_DIR, managedRepo);
+    const sourcePath = path.join(REPOS_DIR, sourceRepo);
+
+    removeRepo(sourceRepo);
+    removeRepo(managedRepo);
+    fs.mkdirSync(sourcePath, { recursive: true });
+    initGitRepo(managedPath);
+
+    try {
+        const result = refreshDefaultSkillsInPloinkyRepos([managedRepo]);
+
+        assert.equal(result.refreshed.length, 0);
+        assert.equal(result.failed.length, 1);
+        assert.equal(result.failed[0].repoName, managedRepo);
+        assert.match(result.failed[0].message, /No skills\/ folder in repo 'AchillesCopilotBasicSkills'/);
+    } finally {
+        removeRepo(sourceRepo);
+        removeRepo(managedRepo);
     }
 });
 
