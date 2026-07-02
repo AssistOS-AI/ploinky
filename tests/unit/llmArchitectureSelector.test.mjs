@@ -125,7 +125,12 @@ function makeLocalIntelVulkanCatalog() {
 }
 
 test('selectArchitecture prefers nvidia when probes pass', () => {
-    const catalog = makeCatalog();
+    const catalog = makeCatalog({
+        catalogRef: 'abc123catalogref',
+        source: 'git',
+        repoUrl: 'https://example.invalid/local-llm-architectures.git',
+        requestedRef: 'main',
+    });
     const hardware = {
         runtime: 'docker',
         ociPlatform: 'linux/amd64',
@@ -139,6 +144,9 @@ test('selectArchitecture prefers nvidia when probes pass', () => {
     assert.equal(selected.imageRef, 'docker.io/assistos/llm-runtime:nvidia-amd64');
     assert.equal(selected.imageDigest, 'sha256:' + 'a'.repeat(64));
     assert.equal(selected.imageSource, 'catalog');
+    assert.equal(selected.catalogSource, 'git');
+    assert.equal(selected.catalogRepoUrl, 'https://example.invalid/local-llm-architectures.git');
+    assert.equal(selected.catalogRequestedRef, 'main');
 });
 
 test('selectArchitecture treats catalog image refs as literals and rejects templates', () => {

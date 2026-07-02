@@ -154,6 +154,9 @@ test('prepareLlmStartup selects catalog architecture and writes state file', () 
         assert.equal(result.labels['ploinky.llm.architecture'], 'cpu-amd64');
         assert.equal(result.labels['ploinky.reusehash'], result.reuseHash);
         assert.equal(result.reuseHash, computeReuseHashForTest(result.reuseKey));
+        assert.equal(result.reuseKey.catalogSource, 'path');
+        assert.equal(result.reuseKey.catalogRepoUrl, null);
+        assert.equal(result.reuseKey.catalogRequestedRef, null);
         const invocationAuthChanged = cloneJson(result.reuseKey);
         invocationAuthChanged.startupContract.env.PLOINKY_INVOCATION_AUTH_MODULE = '/Agent/lib/customInvocationAuth.mjs';
         assert.notEqual(
@@ -181,6 +184,9 @@ test('prepareLlmStartup selects catalog architecture and writes state file', () 
         const stateJson = JSON.parse(stateBytes);
         assert.equal(stateJson.architecture.id, 'cpu-amd64');
         assert.equal(stateJson.catalog.id, 'test/catalog');
+        assert.equal(stateJson.catalog.source, 'path');
+        assert.equal(stateJson.catalog.repoUrl, null);
+        assert.equal(stateJson.catalog.requestedRef, null);
         assert.equal(stateJson.architecture.imageRef, 'reg.example.com/llm-cpu-amd64:dev');
         assert.equal(stateJson.architecture.imageDigest, 'sha256:' + 'b'.repeat(64));
         assert.equal(stateJson.architecture.platform, 'linux/amd64');
