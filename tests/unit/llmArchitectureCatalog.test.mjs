@@ -634,13 +634,14 @@ test('validateArchitectureRecord rejects unknown top-level fields', () => {
     );
 });
 
-test('loadCatalog default workspace catalog passes validation', () => {
+test('local workspace catalog passes validation when explicitly configured by path', () => {
     const repoRoot = path.resolve(import.meta.dirname, '..', '..', '..');
     const defaultCatalogPath = path.join(repoRoot, 'local-llm-architectures');
     if (!fs.existsSync(defaultCatalogPath)) {
         assert.fail(`expected workspace catalog at ${defaultCatalogPath}`);
     }
     const result = loadCatalog({ env: { PLOINKY_LLM_ARCHITECTURES_PATH: defaultCatalogPath } });
+    assert.equal(result.source, 'path');
     assert.equal(result.catalogId, 'local-llm-architectures/default');
     assert.ok(result.architectures.has('cpu-amd64'));
     assert.ok(result.architectures.has('cpu-arm64'));
