@@ -19,6 +19,7 @@ import { collectAgentsSummary } from '../services/status.js';
 import { findAgent } from '../services/utils.js';
 
 const REPOS_DIR = path.join(PLOINKY_DIR, 'repos');
+const DEFAULT_SKILLS_REPO_NAME = 'AchillesCopilotBasicSkills';
 function getRepoNames() {
     if (!fs.existsSync(REPOS_DIR)) return [];
     return fs.readdirSync(REPOS_DIR).filter(file => fs.statSync(path.join(REPOS_DIR, file)).isDirectory());
@@ -36,6 +37,68 @@ function getGitRepoNames() {
         }
     }
     return gitRepoNames;
+}
+
+function refreshDefaultSkillsInPloinkyRepo(repoName, {
+    defaultSkillsRepoName = DEFAULT_SKILLS_REPO_NAME,
+} = {}) {
+    const normalizedRepoName = String(repoName || '').trim();
+    if (!normalizedRepoName) {
+        return { repoName: normalizedRepoName, skipped: true, reason: 'missing repo name' };
+    }
+    if (normalizedRepoName === defaultSkillsRepoName) {
+        return { repoName: normalizedRepoName, skipped: true, reason: 'default skills source repo' };
+    }
+
+    const repoPath = path.join(REPOS_DIR, normalizedRepoName);
+    if (!fs.existsSync(repoPath) || !fs.statSync(repoPath).isDirectory()) {
+        return { repoName: normalizedRepoName, skipped: true, reason: 'repo path missing' };
+    }
+
+    const result = skillsSvc.installDefaultSkills(defaultSkillsRepoName, {
+        targetRoot: repoPath,
+    });
+
+    return {
+        repoName: normalizedRepoName,
+        repoPath,
+        skills: result.skills,
+        gitignoreUpdated: result.gitignoreUpdated,
+        claudeLink: result.claudeLink,
+        refreshed: true,
+    };
+}
+
+function refreshDefaultSkillsInPloinkyRepos(repoNames = getGitRepoNames(), {
+    defaultSkillsRepoName = DEFAULT_SKILLS_REPO_NAME,
+} = {}) {
+    const refreshed = [];
+    const skipped = [];
+    const failed = [];
+
+    for (const repoName of repoNames) {
+        try {
+            const result = refreshDefaultSkillsInPloinkyRepo(repoName, { defaultSkillsRepoName });
+            if (result.refreshed) {
+                refreshed.push(result);
+            } else {
+                skipped.push(result);
+            }
+        } catch (err) {
+            failed.push({
+                repoName,
+                message: err?.message || String(err),
+            });
+        }
+    }
+
+    return {
+        defaultSkillsRepoName,
+        total: repoNames.length,
+        refreshed,
+        skipped,
+        failed,
+    };
 }
 
 function logRepoUpdateSuccess(repoName, result, indent = '') {
@@ -392,6 +455,7 @@ export {
     updateRepo,
     updatePloinkyRepos,
     updateAllRepos,
+    refreshDefaultSkillsInPloinkyRepos,
     resolveUpdateProjectsRoot,
     enableAgent,
     findAgentManifest,
