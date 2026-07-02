@@ -3,20 +3,20 @@ id: DS006
 title: Auth, SSO Provider Selection, and Secure Wire
 status: implemented (wire protocol superseded by DS011 and DS013)
 owner: ploinky-team
-summary: Defines local auth, SSO provider selection, and the signed secure-wire path for delegated agent calls.
+summary: Defines SSO provider selection, guest/session handling, and the signed secure-wire path for delegated agent calls.
 ---
 
 # DS006 Auth, SSO Provider Selection, and Secure Wire
 
 ## Introduction
 
-Authentication and inter-agent trust in Ploinky are manifest-driven and workspace-scoped. This document defines the current model for local auth, SSO provider selection, and signed delegated invocations.
+Authentication and inter-agent trust in Ploinky are manifest-driven and workspace-scoped. This document defines the current model for SSO provider selection, guest/session handling, and signed delegated invocations.
 
 ## Core Content
 
-The router authentication layer must normalize successful authentication onto request context so that protected handlers can rely on `req.user`, `req.session`, and `req.authMode` rather than on transport-specific details. Token-based surface login remains valid for first-party browser surfaces when SSO is not active. Local auth must validate hashed credentials stored in a workspace-managed variable, while SSO must use the provider agent stored in workspace SSO config. Installed SSO providers advertise themselves with a top-level manifest marker: `ssoProvider: true`.
+The router authentication layer must normalize successful authentication onto request context so that protected handlers can rely on `req.user`, `req.session`, and `req.authMode` rather than on transport-specific details. Token-based surface login remains valid for first-party browser surfaces where still supported by the surface. Built-in local password login has been removed; SSO must use the provider agent stored in workspace SSO config. Installed SSO providers advertise themselves with a top-level manifest marker: `ssoProvider: true`.
 
-Local auth users must be stored as hashed user records rather than plain-text credentials. Session state must be retained in the router-side session store, and local-auth credential rotation must revoke sessions tied to the affected policy variable.
+User records and password policy now belong to the configured SSO provider agent. Router-owned guest sessions remain scoped, signed, and revocable by the router.
 
 Agent discovery must be built from installed manifests. The agent index records installed agent references, deterministic principals, runtime resources, and SSO-provider markers. Provider-specific permissions are enforced by the target agent rather than by workspace-level provider negotiation.
 
@@ -38,4 +38,4 @@ The router proxy and agent runtime already implement invocation-token verificati
 
 ## Conclusion
 
-Ploinky’s auth and trust model is workspace-scoped and invocation-token-backed. The repository must continue to document and implement local auth, direct SSO provider selection, and secure delegated invocations as connected parts of one system.
+Ploinky’s auth and trust model is workspace-scoped and invocation-token-backed. The repository must continue to document and implement direct SSO provider selection, guest/session handling, and secure delegated invocations as connected parts of one system.

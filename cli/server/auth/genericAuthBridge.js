@@ -14,7 +14,7 @@ import { findAgent } from '../../services/utils.js';
  *
  * Provider-neutral SSO bridge. Core:
  *   - keeps cookie issuance, workspace session store, dev-only web-token
- *     auth, local auth fallback, and browser pending-auth state;
+ *     auth, and browser pending-auth state;
  *   - delegates OIDC-specific work (auth URL, callback exchange, JWT verify,
  *     refresh, logout, claim extraction) to the configured SSO provider agent.
  *

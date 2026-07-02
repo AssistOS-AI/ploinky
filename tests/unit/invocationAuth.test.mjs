@@ -33,8 +33,8 @@ function mintRouterRequest(overrides = {}) {
         typ: 'router-request',
         iss: 'ploinky-router',
         aud: AGENT_ID,
-        sub: 'user:local:admin',
-        actor: { kind: 'user', id: 'user:local:admin', roles: ['user'] },
+        sub: 'user:sso:admin',
+        actor: { kind: 'user', id: 'user:sso:admin', roles: ['user'] },
         method: METHOD,
         path: PATH,
         tool: TOOL,
@@ -62,8 +62,8 @@ function mintHttpServiceRequest({ method = HTTP_METHOD, path = HTTP_PATH, query 
         typ: 'router-request',
         iss: 'ploinky-router',
         aud: AGENT_ID,
-        sub: 'user:local:admin',
-        actor: { kind: 'user', id: 'user:local:admin', roles: ['user'] },
+        sub: 'user:sso:admin',
+        actor: { kind: 'user', id: 'user:sso:admin', roles: ['user'] },
         method,
         path,
         tool: '__http_service__',
@@ -78,7 +78,7 @@ function mintHttpServiceRequest({ method = HTTP_METHOD, path = HTTP_PATH, query 
 
 function makeHttpServiceAuthInfoHeader(token, bodyHash) {
     return JSON.stringify({
-        user: { id: 'local:admin', username: 'admin', roles: ['user'] },
+        user: { id: 'sso:admin', username: 'admin', roles: ['user'] },
         invocationToken: token,
         invocationBody: {
             method: HTTP_METHOD,
@@ -115,7 +115,7 @@ test('verifyRouterRequestFromHeaders accepts a valid router-request', () => {
     assert.equal(result.ok, true, result.reason);
     assert.equal(result.payload.actor.kind, 'user');
     assert.equal(result.payload.tool, TOOL);
-    assert.equal(result.payload.sub, 'user:local:admin');
+    assert.equal(result.payload.sub, 'user:sso:admin');
 });
 
 test('rejects a missing bearer token', () => {

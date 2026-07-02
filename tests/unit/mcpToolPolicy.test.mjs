@@ -39,7 +39,7 @@ const AGENT = new Caller({ kind: 'agent', id: 'agent:a/b' });
 const DELEGATED_AGENT = new Caller({
     kind: 'agent',
     id: 'agent:AssistOSExplorer/onlyOffice',
-    delegatedUser: { id: 'local:alice', username: 'alice', roles: ['user'] },
+    delegatedUser: { id: 'sso:alice', username: 'alice', roles: ['user'] },
     delegatedTool: 'authed',
     sourceAgentId: 'agent:AssistOSExplorer/onlyOffice',
 });
@@ -150,12 +150,12 @@ test('Caller.fromRequest classifies users, admins, guests, and agents', () => {
         delegatedAgentVerified: {
             callerPrincipal: 'agent:x/y',
             userDelegation: {
-                user: { id: 'local:alice', username: 'alice', roles: ['user'] },
+                user: { id: 'sso:alice', username: 'alice', roles: ['user'] },
                 delegation: { tool: 'docs_search', sourceAgentId: 'agent:x/y' },
             },
         },
     });
-    assert.equal(delegated.delegatedUser.id, 'local:alice');
+    assert.equal(delegated.delegatedUser.id, 'sso:alice');
     assert.equal(delegated.delegatedTool, 'docs_search');
     assert.equal(Caller.fromRequest({}).kind, 'none');
 });

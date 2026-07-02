@@ -8,7 +8,7 @@ remain the DS specs:
 | Spec | Scope |
 | --- | --- |
 | `docs/specs/DS005-routing-and-web-surfaces.md` | Router surfaces, route table behavior, transparent agent proxying, HTTP services, and browser endpoints. |
-| `docs/specs/DS011-security-model.md` | Workspace trust model, sessions, storage keys, local/SSO/guest auth, runtime isolation, and deployment limits. |
+| `docs/specs/DS011-security-model.md` | Workspace trust model, sessions, storage keys, SSO/guest auth, runtime isolation, and deployment limits. |
 | `docs/specs/DS013-per-agent-identity-and-request-signed-jwts.md` | Per-agent identity, Agent Assertions, Router Requests, User Sessions, request-content hashes, and delegation grants. |
 | `docs/specs/DS014-router-access-control-http-route-access-and-mcp-policy.md` | HTTP route access, MCP policy, administrative policy commands, fail-closed state handling, and removed vocabulary. |
 
@@ -20,8 +20,8 @@ declared HTTP services. That model recognizes exactly three access values:
 | Value | Meaning | Anonymous? | Session Outcome |
 | --- | --- | --- | --- |
 | `public` | Read-only anonymous HTTP access. | Yes, for `GET` and `HEAD` only. | No session is minted or required. |
-| `guest` | Browser access with a router-issued anonymous guest identity unless the caller is already a user. | Yes, but with an expiring guest session. | Existing local/SSO user wins; otherwise `ploinky_guest` is minted or reused. |
-| `authenticated` | Browser access requiring a real local or SSO user session. | No. | `ploinky_jwt` must resolve to a user session; guest sessions never satisfy it. |
+| `guest` | Browser access with a router-issued anonymous guest identity unless the caller is already a user. | Yes, but with an expiring guest session. | Existing SSO user wins; otherwise `ploinky_guest` is minted or reused. |
+| `authenticated` | Browser access requiring a real SSO user session. | No. | `ploinky_sso` must resolve to a user session; guest sessions never satisfy it. |
 
 Every other value is invalid. Manifest `routerAccess.httpRoutes` entries that
 omit `access` default to `authenticated`. Persisted policy routes and
@@ -48,7 +48,7 @@ mutually hostile tenants.
 | Workspace master key | Session signing, encrypted stores, per-agent request secrets, generated secrets. | `PLOINKY_MASTER_KEY` is high trust; all purpose keys are HKDF-derived from it. |
 | Agent environment | Agent identity and per-agent signing. | Agents receive only `PLOINKY_AGENT_ID`, `PLOINKY_AGENT_PRINCIPAL`, and their own `PLOINKY_AGENT_SECRET`; they never receive the master or shared derived-master request key. |
 | Policy state | Operator/admin HTTP and MCP policy. | Corrupt or old schema state fails the whole document closed. |
-| Manifest declarations | Agent-owned routing/service intent. | Manifests may declare route access and HTTP services in the new vocabulary. Manifest route entries may omit `access` to default to `authenticated`; services must be explicit. Invalid local specs are skipped or unmounted locally. |
+| Manifest declarations | Agent-owned routing/service intent. | Manifests may declare route access and HTTP services in the new vocabulary. Manifest route entries may omit `access` to default to `authenticated`; services must be explicit. Invalid specs are skipped or unmounted locally. |
 
 The router is the trust broker. Browser cookies stop at the router. Agents do
 not receive user session JWTs, guest session JWTs, or router policy state.
@@ -106,7 +106,7 @@ before synthesized upstream service dispatch.
 | --- | --- |
 | Methods | Only `GET` and `HEAD` pass. |
 | Write methods | `POST`, `PUT`, `PATCH`, `DELETE`, and other writes return `403 PUBLIC_ROUTE_WRITE_DENIED`. |
-| Cookies | The router does not mint `ploinky_guest` and does not require `ploinky_jwt`. |
+| Cookies | The router does not mint `ploinky_guest` and does not require `ploinky_sso`. |
 | Defaults | Route defaults never produce `public`. |
 | Overlap | If a more restrictive declaration overlaps a public one, the more restrictive declaration wins. |
 
@@ -122,7 +122,7 @@ real users.
 
 | Rule | Detail |
 | --- | --- |
-| Existing user precedence | A valid local or SSO user session takes precedence over guest minting. |
+| Existing user precedence | A valid SSO user session takes precedence over guest minting. |
 | Guest cookie | If no user session exists, the router mints or reuses `ploinky_guest`. |
 | JWT type | Guest sessions are `typ: "guest-session"`. |
 | Scope | Guest sessions may carry a `gscope` that limits reuse to the route or service that minted them. |
@@ -134,12 +134,11 @@ It is a router-issued, expiring identity with limited authority.
 
 ### Authenticated
 
-`authenticated` requires a real user session. It excludes guest sessions even
-if a guest JWT is presented in the `ploinky_jwt` cookie.
+`authenticated` requires a real user session. It excludes guest sessions.
 
 | Rule | Detail |
 | --- | --- |
-| Accepted sessions | Local user sessions and SSO user sessions. |
+| Accepted sessions | SSO user sessions. |
 | Rejected sessions | Guest sessions, missing cookies, wrong `typ`, revoked sessions, wrong route binding, expired sessions. |
 | Route auth source | Prefer the owning route's user-auth policy; fall back to the static route's user-auth policy when allowed by the route-default rules. |
 | Failure mode | If no user-auth policy can authenticate the route, fail closed with an auth-required response. |
@@ -338,14 +337,10 @@ API.
 
 | Session | Cookie | `typ` | Audience | Satisfies HTTP `authenticated`? |
 | --- | --- | --- | --- | --- |
-| User Session | `ploinky_jwt` | `user-session` | `ploinky-router` | Yes, if valid for the route. |
+| User Session | `ploinky_sso` | provider-backed server session | provider/router session | Yes, if valid for the route. |
 | Guest Session | `ploinky_guest` | `guest-session` | `ploinky-router` | No. |
 
-The token verifier may parse both user and guest session JWTs, but
-`SessionTokenService.getUserSession()` returns only `user-session`, and
-`getGuestSession()` returns only `guest-session`. This structural separation is
-what prevents a guest JWT placed in `ploinky_jwt` from satisfying an
-authenticated route.
+The token verifier may parse legacy user JWTs and guest session JWTs, but the active authenticated browser path uses the SSO session store. `getGuestSession()` returns only `guest-session`, and guest JWTs never satisfy an authenticated route.
 
 ### Agent Assertion
 
@@ -555,8 +550,8 @@ sessions, MCP policy, or token services.
 | HTTP vocabulary | Only `public`, `guest`, and `authenticated` are accepted. |
 | Fail closed | Missing, `none`, `deny`, unknown, corrupt, and unbound-provider decisions deny. |
 | Public writes | Non-`GET`/`HEAD` public requests return `PUBLIC_ROUTE_WRITE_DENIED`. |
-| Guest precedence | Local and SSO user sessions take precedence over guest minting. |
-| Guest separation | `guest-session` JWT in `ploinky_jwt` never satisfies authenticated route access. |
+| Guest precedence | SSO user sessions take precedence over guest minting. |
+| Guest separation | `guest-session` JWT never satisfies authenticated route access. |
 | Route defaults | Static user-auth deference yields `authenticated`; otherwise no-auth routes default to `guest`, never public. |
 | Internal paths | Literal and encoded `__agent` are blocked in path normalization, front-door dispatch, and synthesized upstream handling. |
 | HTTP services | Services use the same evaluator and executor path; invalid service specs unmount locally. |
@@ -575,8 +570,8 @@ A started workspace on port 8080 should satisfy the following probes:
 | `GET /<agent>/public/readme` where route is `public` | `200`, no `Set-Cookie`. |
 | `POST /<agent>/public/readme` where route is `public` | `403 PUBLIC_ROUTE_WRITE_DENIED`. |
 | `GET /<agent>/guest/page` where route is `guest` and no cookies | `200`, `Set-Cookie: ploinky_guest=...`. |
-| `GET /<agent>/index.html` where route auth is `none` behind a local-auth static agent | Login redirect or `401`; never anonymous pass-through. |
-| `GET /<agent>/auth/x` with `Cookie: ploinky_jwt=<guest-session>` | Login redirect or `401`; never `200`. |
+| `GET /<agent>/index.html` where route auth is `none` behind an SSO-auth static agent | Login redirect or `401`; never anonymous pass-through. |
+| `GET /<agent>/auth/x` with only `Cookie: ploinky_guest=<guest-session>` | Login redirect or `401`; never `200`. |
 | `GET /<agent>/a//b` | `404 UNROUTABLE_PATH`. |
 | `GET /<agent>/a%2Fb` | `404 UNROUTABLE_PATH`. |
 | `GET /<agent>/__agent/x` | `404 not_found`. |

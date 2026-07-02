@@ -25,6 +25,7 @@ import {
     proxyHttpPassthrough
 } from './routerHandlers.js';
 import { collectHttpServiceRoutes, resolveHttpServiceRoute } from './httpServiceRoutes.js';
+import { handleHttpServiceUpgrade } from './wsServiceProxy.js';
 import { proxyProfileServer } from './profileServerProxy.js';
 
 // Logging
@@ -617,7 +618,8 @@ server.on('upgrade', async (req, socket, head) => {
         const parsedUrl = new URL(req.url, 'http://router.local');
         const handled = await handleHttpServiceUpgrade({ req, socket, head, parsedUrl, policy });
         if (!handled) { socket.write('HTTP/1.1 404 Not Found\r\n\r\n'); socket.destroy(); }
-    } catch (_) {
+    } catch (err) {
+        appendLog('upgrade_error', { error: err?.message || String(err), path: req?.url || '' });
         try { socket.destroy(); } catch (_) {}
     }
 });

@@ -7,8 +7,8 @@ import { getActiveProfile } from './profileService.js';
 
 function normalizeAuthMode(value) {
     const normalized = String(value || '').trim().toLowerCase();
-    if (normalized === 'local' || normalized === 'pwd') return 'local';
     if (normalized === 'sso') return 'sso';
+    if (normalized === 'guest') return 'guest';
     return 'none';
 }
 
@@ -33,7 +33,7 @@ function resolveManifestAuthMode(manifest, registryRecord = null) {
 
     const ploinkyDirectives = parsePloinkyDirectives(manifest?.ploinky);
     if (ploinkyDirectives.includes('pwd enable')) {
-        return 'local';
+        return 'none';
     }
     if (ploinkyDirectives.includes('sso enable')) {
         return 'sso';

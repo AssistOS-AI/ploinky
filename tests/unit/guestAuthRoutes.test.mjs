@@ -10,6 +10,11 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const REPO_ROOT = path.resolve(__dirname, '../..');
 const MASTER_KEY = '4'.repeat(64);
+const SHARED_WORKSPACE = mkdtempSync(path.join(os.tmpdir(), 'ploinky-guest-auth-'));
+
+test.after(() => {
+    rmSync(SHARED_WORKSPACE, { recursive: true, force: true });
+});
 
 class MockResponse {
     constructor() {
@@ -53,7 +58,7 @@ function makeRequest({ method = 'GET', url, body, cookie = '', accept = 'applica
     return req;
 }
 
-function writeWorkspaceConfig(ploinkyDir, { staticAuthMode = 'local' } = {}) {
+function writeWorkspaceConfig(ploinkyDir, { staticAuthMode = 'sso' } = {}) {
     writeFileSync(path.join(ploinkyDir, '.secrets'), '# test secrets\n');
     const webAdminManifestDir = path.join(ploinkyDir, 'repos', 'webassist', 'webAdmin');
     const serviceManifestDir = path.join(ploinkyDir, 'repos', 'services', 'guestAgent');
@@ -99,8 +104,8 @@ function writeWorkspaceConfig(ploinkyDir, { staticAuthMode = 'local' } = {}) {
             type: 'agent',
             agentName: 'explorer',
             repoName: 'AchillesIDE',
-            auth: staticAuthMode === 'local'
-                ? { mode: 'local', usersVar: 'PLOINKY_AUTH_EXPLORER_USERS' }
+            auth: staticAuthMode === 'sso'
+                ? { mode: 'sso' }
                 : { mode: 'none' },
         },
         webAssist: {
@@ -142,7 +147,7 @@ function writeWorkspaceConfig(ploinkyDir, { staticAuthMode = 'local' } = {}) {
 }
 
 async function withAuthModules(t, options = {}) {
-    const workspace = mkdtempSync(path.join(os.tmpdir(), 'ploinky-guest-auth-'));
+    const workspace = SHARED_WORKSPACE;
     const ploinkyDir = path.join(workspace, '.ploinky');
     mkdirSync(ploinkyDir, { recursive: true });
     writeWorkspaceConfig(ploinkyDir, options);
@@ -165,12 +170,19 @@ async function withAuthModules(t, options = {}) {
         } else {
             process.env.PLOINKY_WORKSPACE_ROOT = previousWorkspaceRoot;
         }
-        rmSync(workspace, { recursive: true, force: true });
     });
 
     const nonce = `${Date.now()}-${Math.random()}`;
     const authHandlers = await import(`${pathToFileURL(path.join(REPO_ROOT, 'cli/server/authHandlers/index.js')).href}?test=${nonce}`);
     const localService = await import(`${pathToFileURL(path.join(REPO_ROOT, 'cli/server/auth/localService.js')).href}?test=${nonce}`);
+    const originalIsConfigured = authHandlers.authService.isConfigured;
+    const originalGetSession = authHandlers.authService.getSession;
+    authHandlers.authService.isConfigured = () => true;
+    authHandlers.authService.getSession = () => null;
+    t.after(() => {
+        authHandlers.authService.isConfigured = originalIsConfigured;
+        authHandlers.authService.getSession = originalGetSession;
+    });
     return { authHandlers, localService, authService: authHandlers.authService };
 }
 
@@ -190,7 +202,7 @@ test('guest routes use the guest agent policy instead of the static Explorer pol
     assert.equal(mcpReq.user?.username, 'visitor');
     assert.deepEqual(mcpReq.user?.roles, ['guest']);
     assert.match(String(mcpRes.getHeader('set-cookie') || ''), /^ploinky_guest=/);
-    assert.doesNotMatch(String(mcpRes.getHeader('set-cookie') || ''), /^ploinky_jwt=/);
+    assert.doesNotMatch(String(mcpRes.getHeader('set-cookie') || ''), /^ploinky_sso=/);
 
     const guestJwt = String(mcpReq.sessionId || '');
     const tokenReq = makeRequest({
@@ -302,13 +314,13 @@ test('ensureHttpRouteAccess denies none, deny, missing, and unknown decisions', 
     }
 });
 
-test('a guest-session JWT in the ploinky_jwt cookie never satisfies an authenticated route', async (t) => {
+test('a guest-session JWT in the guest cookie never satisfies an authenticated route', async (t) => {
     const { authHandlers, localService } = await withAuthModules(t);
     const guestJwt = localService.mintGuestSessionJwt({});
     const req = makeRequest({
         method: 'GET',
         url: '/explorer/settings',
-        cookie: `ploinky_jwt=${guestJwt}`,
+        cookie: `ploinky_guest=${guestJwt}`,
     });
     const res = new MockResponse();
     const parsedUrl = new URL(req.url, 'http://localhost');
@@ -326,14 +338,11 @@ test('a guest-session JWT in the ploinky_jwt cookie never satisfies an authentic
 
 test('an SSO user session takes precedence over guest minting on guest routes', async (t) => {
     const { authHandlers, authService } = await withAuthModules(t);
-    const originalIsConfigured = authService.isConfigured;
     const originalGetSession = authService.getSession;
-    authService.isConfigured = () => true;
     authService.getSession = (id) => id === 'sso-cookie-1'
         ? { user: { id: 'sso:alice', username: 'alice', roles: ['user'] }, expiresAt: Date.now() + 60_000 }
         : null;
     t.after(() => {
-        authService.isConfigured = originalIsConfigured;
         authService.getSession = originalGetSession;
     });
 

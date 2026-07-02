@@ -1,6 +1,5 @@
-import { createLocalAuthUser, deleteLocalAuthUser, getSession as getLocalSession, getSessionCookieMaxAge as getLocalSessionCookieMaxAge, isLocalAdminUser, listLocalAuthUsers, updateLocalAuthUser } from '../auth/localService.js';
 import { readRouterSettings, updateRouterSettings } from '../../services/routerSettings.js';
-import { buildCookie, LOCAL_AUTH_COOKIE_NAME, parseCookies, readJsonBody, sendJson } from './shared.js';
+import { readJsonBody, sendJson } from './shared.js';
 import { resolveAuthContextForRouteKey } from './authContext.js';
 
 function getUserAdminErrorStatus(code = '') {
@@ -10,6 +9,8 @@ function getUserAdminErrorStatus(code = '') {
             return 401;
         case 'admin_required':
             return 403;
+        case 'local_auth_removed':
+            return 410;
         case 'local_auth_disabled':
         case 'user_not_found':
         case 'not_found':
@@ -34,6 +35,8 @@ function getUserAdminErrorMessage(code = '') {
             return 'Authentication required.';
         case 'admin_required':
             return 'Admin access is required.';
+        case 'local_auth_removed':
+            return 'Built-in local password user management was removed. Manage users in the configured SSO provider agent.';
         case 'local_auth_disabled':
             return 'Local auth is not enabled for this agent.';
         case 'user_not_found':
@@ -104,30 +107,8 @@ export async function handleUserAdminRoutes(req, res, parsedUrl) {
 
     const method = (req.method || 'GET').toUpperCase();
     const authContext = resolveAuthContextForRouteKey(route.agent);
-    if (authContext.mode !== 'local' || !authContext.policy?.usersVar) {
-        sendUserAdminError(res, 'local_auth_disabled');
-        return true;
-    }
-
-    const cookies = parseCookies(req);
-    const sessionId = cookies.get(LOCAL_AUTH_COOKIE_NAME) || '';
-    const session = getLocalSession(sessionId, { policy: authContext.policy });
-    if (!session) {
-        sendUserAdminError(res, 'authentication_required');
-        return true;
-    }
-    if (!isLocalAdminUser(session.user)) {
-        sendUserAdminError(res, 'admin_required');
-        return true;
-    }
 
     try {
-        const cookie = buildCookie(LOCAL_AUTH_COOKIE_NAME, sessionId, req, '/', {
-            maxAge: getLocalSessionCookieMaxAge(),
-            sameSite: 'Lax'
-        });
-        res.setHeader('Set-Cookie', cookie);
-
         if (route.resource === 'settings') {
             if (route.userId) {
                 sendUserAdminError(res, 'not_found');
@@ -158,70 +139,7 @@ export async function handleUserAdminRoutes(req, res, parsedUrl) {
             return true;
         }
 
-        if (method === 'GET' && !route.userId) {
-            const users = listLocalAuthUsers(authContext.policy)
-                .sort((left, right) => String(left.username || '').localeCompare(String(right.username || '')));
-            sendJson(res, 200, {
-                ok: true,
-                agent: authContext.routeKey,
-                users
-            });
-            return true;
-        }
-
-        if (method === 'POST' && !route.userId) {
-            const body = await readUserAdminBody(req);
-            const user = createLocalAuthUser({
-                policy: authContext.policy,
-                username: body?.username,
-                password: body?.password,
-                name: body?.name,
-                email: body?.email,
-                roles: Object.prototype.hasOwnProperty.call(body || {}, 'roles') ? body.roles : undefined
-            });
-            sendJson(res, 201, {
-                ok: true,
-                agent: authContext.routeKey,
-                user
-            });
-            return true;
-        }
-
-        if (method === 'PATCH' && route.userId) {
-            const body = await readUserAdminBody(req);
-            const user = updateLocalAuthUser({
-                policy: authContext.policy,
-                id: route.userId,
-                username: Object.prototype.hasOwnProperty.call(body || {}, 'username') ? body.username : undefined,
-                password: Object.prototype.hasOwnProperty.call(body || {}, 'password') ? body.password : undefined,
-                name: Object.prototype.hasOwnProperty.call(body || {}, 'name') ? body.name : undefined,
-                email: Object.prototype.hasOwnProperty.call(body || {}, 'email') ? body.email : undefined,
-                roles: Object.prototype.hasOwnProperty.call(body || {}, 'roles') ? body.roles : undefined
-            });
-            sendJson(res, 200, {
-                ok: true,
-                agent: authContext.routeKey,
-                user
-            });
-            return true;
-        }
-
-        if (method === 'DELETE' && route.userId) {
-            const user = deleteLocalAuthUser({
-                policy: authContext.policy,
-                id: route.userId
-            });
-            sendJson(res, 200, {
-                ok: true,
-                agent: authContext.routeKey,
-                deleted: true,
-                user
-            });
-            return true;
-        }
-
-        res.writeHead(405, { 'Content-Type': 'application/json', Allow: route.userId ? 'PATCH, DELETE' : 'GET, POST' });
-        res.end(JSON.stringify({ ok: false, error: 'method_not_allowed' }));
+        sendUserAdminError(res, 'local_auth_removed');
         return true;
     } catch (error) {
         const code = error?.message === 'invalid_json' ? 'invalid_json' : (error?.message || 'user_admin_failed');

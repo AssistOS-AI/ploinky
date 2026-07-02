@@ -46,7 +46,7 @@ An HTTP route decision may come from four sources:
 | Manifest `httpServices` | Agent service declaration | Converted to route access for the external service prefix. |
 | Route default | Router fallback for ordinary transparent routes | Preserves static-agent deference: `auth.mode: "none"` behind a user-authenticated static agent becomes `authenticated`; otherwise it becomes `guest`. Defaults never produce `public`. |
 
-When entries overlap, the router chooses the most restrictive access: `authenticated` over `guest` over `public`. `public` allows only `GET` and `HEAD`; write methods receive `403 PUBLIC_ROUTE_WRITE_DENIED` before proxying. `guest` accepts an existing local or SSO user session first; only requests without a user session mint or reuse `ploinky_guest`. `authenticated` requires a real user session and rejects guest-session JWTs even if they arrive in the `ploinky_jwt` cookie.
+When entries overlap, the router chooses the most restrictive access: `authenticated` over `guest` over `public`. `public` allows only `GET` and `HEAD`; write methods receive `403 PUBLIC_ROUTE_WRITE_DENIED` before proxying. `guest` accepts an existing SSO user session first; only requests without a user session mint or reuse `ploinky_guest`. `authenticated` requires a real user session and rejects guest-session JWTs.
 
 `HttpRouteAccessPath` normalizes route paths. It requires a leading slash; strips query and fragment data; rejects NUL bytes, URL schemes, backslashes, double slashes, encoded slash or backslash bytes, dot segments, root-only paths, non-trailing wildcards, and router-owned internal paths. A trailing `/*` is a prefix match; other `*` usage is invalid. Literal and percent-encoded `__agent` segments are internal and denied at write time, policy evaluation time, the `RoutingServer` request front door, and the synthesized-upstream guard for HTTP services.
 
@@ -66,7 +66,7 @@ Declared HTTP services use the same evaluator as ordinary routes. A valid servic
 
 The manifest-route omitted-access default does not apply to HTTP services. A service without explicit `access` is invalid and is not mounted.
 
-`public` services run without router identity. `guest` services use an existing local or SSO user session when present, otherwise they mint or reuse a scoped guest session. `authenticated` services require user authentication using the owning route policy first and the static route policy as fallback. Only authenticated services may receive user delegation grants. Authenticated and guest services receive scoped `__http_service__` invocation metadata unless the manifest disables invocation minting.
+`public` services run without router identity. `guest` services use an existing SSO user session when present, otherwise they mint or reuse a scoped guest session. `authenticated` services require user authentication using the owning route policy first and the static route policy as fallback. Only authenticated services may receive user delegation grants. Authenticated and guest services receive scoped `__http_service__` invocation metadata unless the manifest disables invocation minting.
 
 ### MCP Tool Policy
 
@@ -98,7 +98,7 @@ There is one delegated-user path: a verified source agent may call an `authentic
 
 `http.route.list` is not the effective view because manifest, service, and route-default decisions are runtime inputs. `http.route.check` is the diagnostic path for the effective decision and includes the source that won.
 
-The router-owned Marketplace API under `/api/marketplace` is not administered through MCP policy and is not controlled by HTTP route access. `GET /api/marketplace` must require an authenticated local or SSO user. `POST /api/marketplace` is an administrative surface and must require an authenticated local admin user before mutating repository and agent marketplace state. The POST action body may install and uninstall repositories through `install_repo` and `uninstall_repo`, enable agents through the standard registry path, and perform marketplace-specific agent deactivation as defined by DS005.
+The router-owned Marketplace API under `/api/marketplace` is not administered through MCP policy and is not controlled by HTTP route access. `GET /api/marketplace` must require an authenticated SSO user. `POST /api/marketplace` is an administrative surface and must require an authenticated admin user before mutating repository and agent marketplace state. The POST action body may install and uninstall repositories through `install_repo` and `uninstall_repo`, enable agents through the standard registry path, and perform marketplace-specific agent deactivation as defined by DS005.
 
 ### Tag Bootstrap and Persistence
 

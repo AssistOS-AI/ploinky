@@ -14,7 +14,7 @@ const SOURCE_AGENT = 'agent:AssistOSExplorer/onlyOffice';
 const TARGET_AGENT = 'agent:AssistOSExplorer/dpuAgent';
 const TOOL = 'dpu_confidential_get';
 const USER = {
-    id: 'local:alice',
+    id: 'sso:alice',
     username: 'alice',
     roles: ['user'],
 };
@@ -51,9 +51,9 @@ test('mintUserDelegationGrant signs a source-bound router-audience grant', () =>
     assert.equal(payload.sourceAgentId, SOURCE_AGENT);
     assert.deepEqual(payload.allowedTargets, [TARGET_AGENT]);
     assert.deepEqual(payload.allowedTools, [TOOL, 'dpu_confidential_update']);
-    assert.equal(payload.sub, 'user:local:alice');
+    assert.equal(payload.sub, 'user:sso:alice');
     assert.deepEqual(payload.usr, {
-        id: 'local:alice',
+        id: 'sso:alice',
         username: 'alice',
         email: '',
         roles: ['user'],
@@ -204,7 +204,7 @@ test('verifyUserDelegationGrant returns normalized claims and delegation metadat
         replayCache: createMemoryReplayCache(),
     });
 
-    assert.equal(verified.user.id, 'local:alice');
+    assert.equal(verified.user.id, 'sso:alice');
     assert.equal(verified.delegation.sourceAgentId, SOURCE_AGENT);
     assert.equal(verified.delegation.targetAgentId, TARGET_AGENT);
     assert.equal(verified.delegation.tool, TOOL);
@@ -220,7 +220,7 @@ test('mint+verify honor PLOINKY_USER_DELEGATION_MAX_TTL_SECONDS over the default
             signingSecret,
             ttlSeconds: 7200,
             sourceAgentId: 'agent:AchillesIDE/onlyOffice',
-            user: { id: 'local:alice', username: 'alice', roles: ['user'] },
+            user: { id: 'sso:alice', username: 'alice', roles: ['user'] },
             targetAgentId: 'agent:AchillesIDE/dpuAgent',
             tools: ['dpu_confidential_get'],
             scopes: ['dpu:confidential:read'],
@@ -233,7 +233,7 @@ test('mint+verify honor PLOINKY_USER_DELEGATION_MAX_TTL_SECONDS over the default
             expectedTargetAgentId: 'agent:AchillesIDE/dpuAgent',
             expectedTool: 'dpu_confidential_get',
         });
-        assert.equal(verified.user.id, 'local:alice');
+        assert.equal(verified.user.id, 'sso:alice');
     } finally {
         if (prev === undefined) delete process.env.PLOINKY_USER_DELEGATION_MAX_TTL_SECONDS;
         else process.env.PLOINKY_USER_DELEGATION_MAX_TTL_SECONDS = prev;
@@ -248,7 +248,7 @@ test('mint still clamps to the default 28800 ceiling when env is unset', () => {
             signingSecret: Buffer.from('test-delegation-secret-please-rotate'),
             ttlSeconds: 86400,
             sourceAgentId: 'agent:AchillesIDE/onlyOffice',
-            user: { id: 'local:alice', roles: ['user'] },
+            user: { id: 'sso:alice', roles: ['user'] },
             targetAgentId: 'agent:AchillesIDE/dpuAgent',
             tools: ['dpu_confidential_get'],
             scopes: ['dpu:confidential:read'],

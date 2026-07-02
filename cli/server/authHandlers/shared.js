@@ -1,14 +1,13 @@
 import { appendLog } from '../utils/logger.js';
 import { parseCookies, buildCookie, readJsonBody, appendSetCookie } from '../handlers/common.js';
 import { createAuthService } from '../auth/service.js';
-import { GUEST_SESSION_TTL_SECONDS, getSessionCookieMaxAge as getLocalSessionCookieMaxAge, mintGuestSessionJwt, mintSessionJwt, resolveUserRev, revokeSession as revokeLocalSession, verifySessionJwt } from '../auth/localService.js';
+import { GUEST_SESSION_TTL_SECONDS, mintGuestSessionJwt, mintSessionJwt, resolveUserRev, revokeSession as revokeLocalSession, verifySessionJwt } from '../auth/localService.js';
 import { isSessionRevoked } from '../auth/sessionRevocations.js';
 import { SessionTokenService } from '../security/tokens/SessionTokenService.js';
 
-export { appendLog, parseCookies, buildCookie, readJsonBody, appendSetCookie, GUEST_SESSION_TTL_SECONDS, getLocalSessionCookieMaxAge, verifySessionJwt };
+export { appendLog, parseCookies, buildCookie, readJsonBody, appendSetCookie, GUEST_SESSION_TTL_SECONDS, verifySessionJwt };
 
 export const SSO_AUTH_COOKIE_NAME = 'ploinky_sso';
-export const LOCAL_AUTH_COOKIE_NAME = 'ploinky_jwt';
 export const GUEST_AUTH_COOKIE_NAME = 'ploinky_guest';
 export const AUTH_COOKIE_NAME = SSO_AUTH_COOKIE_NAME;
 export const authService = createAuthService();
@@ -90,7 +89,6 @@ async function readLoginBody(req) {
 }
 
 function getCookieNameForMode(mode) {
-    if (mode === 'local') return LOCAL_AUTH_COOKIE_NAME;
     if (mode === 'guest') return GUEST_AUTH_COOKIE_NAME;
     return SSO_AUTH_COOKIE_NAME;
 }

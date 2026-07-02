@@ -6,8 +6,8 @@ import * as agentsSvc from '../../services/agents.js';
 import * as workspaceSvc from '../../services/workspace.js';
 import { collectLiveAgentContainers } from '../../services/docker/index.js';
 import { collectAgentsSummary } from '../../services/status.js';
-import { isLocalAdminUser } from '../auth/localService.js';
-import { authService, LOCAL_AUTH_COOKIE_NAME, parseCookies, readJsonBody, sendJson, sessionTokenService, SSO_AUTH_COOKIE_NAME } from './shared.js';
+import { isAdminUser } from '../auth/localService.js';
+import { authService, parseCookies, readJsonBody, sendJson, SSO_AUTH_COOKIE_NAME } from './shared.js';
 
 function parseMarketplacePath(pathname = '') {
     const parts = String(pathname || '').split('/').filter(Boolean);
@@ -167,7 +167,7 @@ function buildMarketplaceState(user = null) {
             roles: Array.isArray(user.roles) ? [...user.roles] : []
         } : null,
         permissions: {
-            canManage: isLocalAdminUser(user)
+            canManage: isAdminUser(user)
         },
         repositories,
         agents: agents.sort((left, right) => left.ref.localeCompare(right.ref)),
@@ -178,7 +178,7 @@ function buildMarketplaceState(user = null) {
 async function ensureMarketplaceAdmin(req, res, parsedUrl) {
     const authResult = await ensureMarketplaceUser(req, res);
     if (!authResult.ok) return false;
-    if (!isLocalAdminUser(req.user)) {
+    if (!isAdminUser(req.user)) {
         sendMarketplaceError(res, 403, 'admin_required', 'Administrator access is required.');
         return false;
     }
@@ -187,18 +187,6 @@ async function ensureMarketplaceAdmin(req, res, parsedUrl) {
 
 async function ensureMarketplaceUser(req, res) {
     const cookies = parseCookies(req);
-    const localSessionId = cookies.get(LOCAL_AUTH_COOKIE_NAME);
-    if (localSessionId) {
-        const session = await sessionTokenService.getUserSession(localSessionId);
-        if (session?.user) {
-            req.user = session.user;
-            req.session = session;
-            req.sessionId = localSessionId;
-            req.authMode = 'local';
-            return { ok: true, session };
-        }
-    }
-
     const ssoSessionId = cookies.get(SSO_AUTH_COOKIE_NAME);
     if (ssoSessionId && authService.isConfigured()) {
         const session = authService.getSession(ssoSessionId);

@@ -85,7 +85,7 @@ function mintDelegation(overrides = {}) {
             internalPrefix: '/control/',
             internalPath: '/control/office/session',
         },
-        user: overrides.user || { id: 'local:alice', username: 'alice', roles: ['user'] },
+        user: overrides.user || { id: 'sso:alice', username: 'alice', roles: ['user'] },
         targetAgentId: overrides.targetAgentId || TARGET_AGENT,
         tools: overrides.tools || [TOOL, 'dpu_confidential_update'],
         scopes: ['dpu:confidential:read', 'dpu:confidential:write'],
@@ -143,7 +143,7 @@ test('mcp proxy mints router request with caller agent and usr user claims', () 
     assert.equal(ctx.payload.sub, SOURCE_AGENT);
     assert.equal(ctx.payload.actor.kind, 'agent');
     assert.equal(ctx.payload.caller.id, SOURCE_AGENT);
-    assert.equal(ctx.payload.usr.id, 'local:alice');
+    assert.equal(ctx.payload.usr.id, 'sso:alice');
     assert.equal(ctx.payload.delegation.sourceAgentId, SOURCE_AGENT);
     assert.equal(ctx.payload.delegations, undefined);
     assert.equal(ctx.payload.delegation.sourceAgentId, SOURCE_AGENT);
@@ -259,7 +259,7 @@ test('mcp proxy reuses one delegation grant across multiple scoped tool calls un
         assertionCache: createMemoryReplayCache(),
         userDelegationCache: delegationCache,
     });
-    assert.equal(first.userDelegation.user.id, 'local:alice');
+    assert.equal(first.userDelegation.user.id, 'sso:alice');
     const second = verifyDelegatedAgentToolCall({
         req: makeReq({ assertion: secondAssertion, delegationToken }),
         agentName: TARGET_ROUTE,
@@ -268,7 +268,7 @@ test('mcp proxy reuses one delegation grant across multiple scoped tool calls un
         assertionCache: createMemoryReplayCache(),
         userDelegationCache: delegationCache,
     });
-    assert.equal(second.userDelegation.user.id, 'local:alice');
+    assert.equal(second.userDelegation.user.id, 'sso:alice');
 });
 
 test('mcp proxy rejects expired delegation grants', () => {
@@ -291,7 +291,7 @@ test('mcp proxy rejects expired delegation grants', () => {
 
 test('user-originated configured tool call mints delegations on the shared mint path', () => {
     const ctx = buildInvocationContextForProviderCall({
-        req: { user: { id: 'local:admin', username: 'admin', email: '', roles: ['admin'] } },
+        req: { user: { id: 'sso:admin', username: 'admin', email: '', roles: ['admin'] } },
         agentName: 'gitAgent',
         toolName: 'git_auth_store_token',
         toolArgs: { token: 'redacted-by-test' },
@@ -308,12 +308,12 @@ test('user-originated configured tool call mints delegations on the shared mint 
         expectedTargetAgentId: 'agent:AssistOSExplorer/dpuAgent',
         expectedTool: 'dpu_secret_put',
     });
-    assert.equal(verified.user.id, 'local:admin');
+    assert.equal(verified.user.id, 'sso:admin');
 });
 
 test('user call to an unconfigured tool mints no delegations', () => {
     const ctx = buildInvocationContextForProviderCall({
-        req: { user: { id: 'local:admin', username: 'admin', roles: ['admin'] } },
+        req: { user: { id: 'sso:admin', username: 'admin', roles: ['admin'] } },
         agentName: 'gitAgent',
         toolName: 'git_status',
         toolArgs: { path: '/tmp/x' },

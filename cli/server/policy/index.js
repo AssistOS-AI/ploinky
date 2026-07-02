@@ -1,4 +1,5 @@
-import { getSession, isLocalAdminUser } from '../auth/localService.js';
+import { isAdminUser } from '../auth/localService.js';
+import { authService, SSO_AUTH_COOKIE_NAME } from '../authHandlers/shared.js';
 
 import { PolicyStateRepository } from './PolicyStateRepository.js';
 import { FileSystemPolicyStateStore } from './FileSystemPolicyStateStore.js';
@@ -47,7 +48,13 @@ const registry = new PolicyCommandRegistry()
     .register(new McpPolicyGetCommand({ repository }))
     .register(new McpPolicyListCommand({ repository }));
 
-const commandInvoker = new PolicyCommandInvoker({ registry, auditLog, getSession, isAdminUser: isLocalAdminUser });
+const commandInvoker = new PolicyCommandInvoker({
+    registry,
+    auditLog,
+    getSession: (sessionId) => authService.getSession(sessionId),
+    cookieName: SSO_AUTH_COOKIE_NAME,
+    isAdminUser,
+});
 
 export const policy = {
     repository,

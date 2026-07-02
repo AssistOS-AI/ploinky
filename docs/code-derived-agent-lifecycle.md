@@ -145,7 +145,7 @@ The enabled record includes:
 | `type` | Always `agent` for agent records. |
 | `config.binds` | Initial descriptive binds: per-instance home to `/root`, non-isolated project path to itself, repo `Agent/` to `/Agent`, agent source to `/code`. Runtime startup recomputes actual binds. |
 | `config.ports` | Runtime port mapping metadata from `parseManifestPorts(manifest)` or fallback `{containerPort: 7000}`. Because `parseManifestPorts` only reads profile config, enable-time records normally get the fallback. |
-| `auth` | `{mode}` plus local auth metadata when local password auth is enabled. |
+| `auth` | `{mode}` for `none`, `sso`, or `guest`. Built-in `pwd`/local password auth is retired. |
 | `alias` | Optional route/record alias. |
 | `profile` | Optional profile requested by dependency directive or CLI auth options. |
 
@@ -191,8 +191,8 @@ Ploinky does not load a central manifest schema in the observed paths. Individua
 | `repos` | No | Object processed by `applyManifestDirectives` during `start`. Values may be URL strings or objects with `url` and `branch`. Repos are ensured and enabled before dependency enable processing. |
 | `enable` | No | Top-level and active-profile enable arrays are processed during `start` and dependency graph building. String specs can include `as <alias>` and `no-wait`; object specs can include `agent/ref/spec/name`, `alias/as`, `profile`, and `noWait`/`no-wait`. |
 | `guest` | No | `guest: true` makes manifest-derived auth mode `guest`. |
-| `ploinky` | No | String/list directives. `pwd enable` maps to local auth; `sso enable` maps to SSO auth. |
-| `pwd.users` | No | Seeds local password users when local auth is active and CLI user/password were not provided. Each entry needs username/user and password. |
+| `ploinky` | No | String/list directives. `sso enable` maps to SSO auth; `pwd enable` is rejected with migration guidance. |
+| `pwd.users` | No | Retired with built-in local password auth. User records now belong to the configured SSO provider agent. |
 | `start` | No | Main runtime command when present. If both `start` and `agent`/`commands.run` exist, `start` runs as the container entry and the agent command is launched as a detached sidecar. |
 | `agent` | No | Agent command. Used before `commands.run`. |
 | `commands.run` | No | Agent command fallback after `agent`. |
@@ -223,15 +223,15 @@ Auth mode can be supplied by the CLI or inferred from the manifest:
 | Source | Result |
 | --- | --- |
 | CLI `--auth none` | `none` |
-| CLI `--auth pwd` or `--auth local` | `local` |
+| CLI `--auth pwd` or `--auth local` | rejected; enable an SSO provider agent with `ploinky sso enable <providerAgent>` |
 | CLI `--auth sso` | `sso` |
 | CLI `--auth guest` | `guest` |
 | `guest: true` | `guest` |
-| `ploinky` contains `pwd enable` | `local` |
+| `ploinky` contains `pwd enable` | rejected; enable an SSO provider agent with `ploinky sso enable <providerAgent>` |
 | `ploinky` contains `sso enable` | `sso` |
 | None of the above | `none` |
 
-For local auth, the record gets a generated users variable name such as `PLOINKY_AUTH_<ROUTE>_USERS`. If `--user` and `--password` are provided, Ploinky writes one admin local user into the encrypted password store. Otherwise, if `pwd.users` exists, those users are hashed and written. Local auth can therefore be enabled without users if neither source provides credentials; the code records local mode but does not seed a users payload.
+Built-in local password login, CLI `--user`/`--password`, `pwd.users`, and generated `PLOINKY_AUTH_<ROUTE>_USERS` credentials are no longer active. Existing `.ploinky/passwords.enc` files are stale migration artifacts and are not used by the router after this removal.
 
 ## Start Flow
 
@@ -588,7 +588,7 @@ sequenceDiagram
 
 Router-owned paths include `/health`, `/mcp`, `/agent-card`, `/auth/*`, `/api/agents/*`, `/api/marketplace`, `/webchat`, `/dashboard`, `/status`, `/upload`, `/blobs`, `/workspace-files`, `/metrics`, `/admin`, and `/__agent`.
 
-`/api/marketplace` is a first-party JSON management API for the Marketplace plugin. GET requires an authenticated local or SSO user and returns repository, source metadata, repository kind, agent, enabled-registry, and live runtime-status data. POST requires a local admin session and supports `install_repo`, `uninstall_repo`, `enable_agent`, and marketplace-specific `disable_agent`. Repository install requires a URL, accepts an optional name and branch, clones the checkout, and records source metadata. Repository uninstall disables enabled agents from that repo by container key, removes their runtime containers, removes the checkout, and preserves `repo_sources.json` metadata so the repo can be installed again. Marketplace deactivation removes the enabled-agent registry entry before removing the runtime container; the ordinary direct `disable agent` CLI command remains conservative and refuses to remove records while runtime state exists.
+`/api/marketplace` is a first-party JSON management API for the Marketplace plugin. GET requires an authenticated SSO user and returns repository, source metadata, repository kind, agent, enabled-registry, and live runtime-status data. POST requires an authenticated admin user from the SSO session and supports `install_repo`, `uninstall_repo`, `enable_agent`, and marketplace-specific `disable_agent`. Repository install requires a URL, accepts an optional name and branch, clones the checkout, and records source metadata. Repository uninstall disables enabled agents from that repo by container key, removes their runtime containers, removes the checkout, and preserves `repo_sources.json` metadata so the repo can be installed again. Marketplace deactivation removes the enabled-agent registry entry before removing the runtime container; the ordinary direct `disable agent` CLI command remains conservative and refuses to remove records while runtime state exists.
 
 Agent routes are stored under `routing.routes[routeKey]`. The route key is the alias when present, otherwise the short agent name. A plain `/` request redirects to the static route's `/index.html` when a static route exists.
 

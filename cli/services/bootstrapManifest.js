@@ -78,7 +78,7 @@ function parsePloinkyDirectives(rawValue) {
 function resolveManifestAuthMode(manifest) {
     const ploinkyDirectives = parsePloinkyDirectives(manifest?.ploinky);
     if (ploinkyDirectives.includes('pwd enable')) {
-        return 'local';
+        throw new Error("Manifest directive 'pwd enable' was removed. Enable an SSO provider agent and use 'sso enable' instead.");
     }
     if (ploinkyDirectives.includes('sso enable')) {
         return 'sso';

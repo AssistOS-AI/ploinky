@@ -154,13 +154,12 @@ enable agent demo global             # run in current directory
 enable agent demo devel simulator    # run inside .ploinky/repos/simulator
 enable agent demo as demo2           # second container with alias "demo2"</code></pre>
                         <h4>Authentication Options</h4>
-                        <pre><code>enable agent &lt;name&gt; [mode] [--auth none|pwd|sso] [--user &lt;name&gt; --password &lt;value&gt;] [as &lt;alias&gt;]</code></pre>
+                        <pre><code>enable agent &lt;name&gt; [mode] [--auth none|sso|guest] [as &lt;alias&gt;]</code></pre>
                         <table class="command-table">
                             <tr><th>Flag</th><th>Description</th></tr>
                             <tr><td><code>--auth none</code></td><td>No authentication (default)</td></tr>
-                            <tr><td><code>--auth pwd</code></td><td>Local password auth with HMAC-JWT sessions</td></tr>
                             <tr><td><code>--auth sso</code></td><td>OIDC via the configured SSO provider agent</td></tr>
-                            <tr><td><code>--user / --password</code></td><td>Set credentials for pwd mode</td></tr>
+                            <tr><td><code>--auth guest</code></td><td>Guest-session access for explicitly guest-capable surfaces</td></tr>
                         </table>
 
                         <div class="alert alert-info">

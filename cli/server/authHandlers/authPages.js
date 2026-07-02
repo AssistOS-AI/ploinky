@@ -1,4 +1,3 @@
-import { readRouterSettings } from '../../services/routerSettings.js';
 import { escapeHtml, normalizeRelativePath } from './shared.js';
 
 function renderLoggedOutHtml(nextPath) {
@@ -20,43 +19,6 @@ function renderLoggedOutHtml(nextPath) {
       <h1>Signed out</h1>
       <p>Your session was closed. Sign in again to return to the workspace.</p>
       <a class="auth-btn" href="${escapeHtml(loginUrl)}">Sign in</a>
-    </section>
-  </main>
-</body>
-</html>`;
-}
-
-
-function renderExternalAccountHtml({
-    providerLabel = 'GitHub',
-    returnTo = '/',
-    username = ''
-} = {}) {
-    const safeReturnTo = escapeHtml(normalizeRelativePath(returnTo, '/'));
-    const safeUsername = escapeHtml(username || '');
-    const safeProvider = escapeHtml(providerLabel || 'GitHub');
-    const safeLogoutUrl = escapeHtml(`/auth/logout?returnTo=${encodeURIComponent(normalizeRelativePath(returnTo, '/'))}`);
-    return `<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Account</title>
-  <style>
-    ${getAuthPageStyles()}
-  </style>
-</head>
-<body>
-  <main class="auth-shell">
-    <section class="auth-card">
-      <div class="auth-kicker">Workspace Access</div>
-      <h1>${safeProvider}</h1>
-      <p>${safeUsername ? `${safeUsername} is signed in with ${safeProvider}.` : `This workspace session uses ${safeProvider} sign-in.`}</p>
-      <p>Local account settings are not available for this sign-in method.</p>
-      <div class="auth-actions">
-        <a class="auth-btn secondary" href="${safeReturnTo}">Back</a>
-        <a class="auth-btn" href="${safeLogoutUrl}">Sign out</a>
-      </div>
     </section>
   </main>
 </body>
@@ -255,126 +217,6 @@ function getAuthPageStyles() {
     }`;
 }
 
-function renderLocalLoginHtml({ agentName, returnTo = '/', error = '', notice = '', usersVar = '' } = {}) {
-    const safeAgent = escapeHtml(agentName || 'application');
-    const safeReturnTo = escapeHtml(normalizeRelativePath(returnTo, '/'));
-    const safeError = escapeHtml(error || '');
-    const safeNotice = escapeHtml(notice || '');
-    const safeBrandingName = escapeHtml(readRouterSettings().loginBrandingName);
-    return `<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>${safeBrandingName}</title>
-  <style>
-    ${getAuthPageStyles()}
-  </style>
-</head>
-<body>
-  <main class="auth-shell">
-    <section class="auth-card">
-      <h1>${safeBrandingName}</h1>
-      ${safeNotice ? `<div class="auth-notice">${safeNotice}</div>` : ''}
-      ${safeError ? `<div class="auth-error">${safeError}</div>` : ''}
-      <form method="post" action="/auth/login">
-        <input type="hidden" name="agent" value="${safeAgent}" />
-        <input type="hidden" name="returnTo" value="${safeReturnTo}" />
-        <label for="username">Username</label>
-        <input id="username" name="username" type="text" autocomplete="username" required />
-        <label for="password">Password</label>
-        <input id="password" name="password" type="password" autocomplete="current-password" required />
-        <button class="auth-btn" type="submit">Sign in</button>
-      </form>
-    </section>
-  </main>
-  <script>
-    (() => {
-      const form = document.querySelector('form[action="/auth/login"]');
-      const button = form?.querySelector('button[type="submit"]');
-      if (!form || !button) return;
-      form.addEventListener('submit', () => {
-        if (button.classList.contains('is-loading')) return;
-        button.classList.add('is-loading');
-        button.disabled = true;
-        button.innerHTML = '<span class="auth-btn-spinner" aria-hidden="true"></span><span>Signing in...</span>';
-      });
-    })();
-  </script>
-</body>
-</html>`;
-}
-
-function renderLocalAccountHtml({
-    agentName,
-    returnTo = '/',
-    error = '',
-    notice = '',
-    username = '',
-    usersVar = ''
-} = {}) {
-    const safeAgent = escapeHtml(agentName || 'application');
-    const safeReturnTo = escapeHtml(normalizeRelativePath(returnTo, '/'));
-    const safeError = escapeHtml(error || '');
-    const safeNotice = escapeHtml(notice || '');
-    const safeUsername = escapeHtml(username || '');
-    const safeUsersVar = escapeHtml(usersVar || '');
-    const safeLogoutUrl = escapeHtml(`/auth/logout?returnTo=${encodeURIComponent(normalizeRelativePath(returnTo, '/'))}`);
-    return `<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Account settings</title>
-  <style>
-    ${getAuthPageStyles()}
-  </style>
-</head>
-<body>
-  <main class="auth-shell">
-    <section class="auth-card">
-      <div class="auth-kicker">Workspace Access</div>
-      <h1>Account settings</h1>
-      <p>Update the local credentials for ${safeAgent}. Confirm the current password before saving any change.</p>
-      ${safeNotice ? `<div class="auth-notice">${safeNotice}</div>` : ''}
-      ${safeError ? `<div class="auth-error">${safeError}</div>` : ''}
-      <form method="post" action="/auth/account">
-        <input type="hidden" name="returnTo" value="${safeReturnTo}" />
-        <label for="newUsername">Username</label>
-        <input id="newUsername" name="newUsername" type="text" autocomplete="username" value="${safeUsername}" required />
-        <label for="newPassword">New password</label>
-        <input id="newPassword" name="newPassword" type="password" autocomplete="new-password" />
-        <label for="confirmPassword">Confirm new password</label>
-        <input id="confirmPassword" name="confirmPassword" type="password" autocomplete="new-password" />
-        <label for="currentPassword">Current password</label>
-        <input id="currentPassword" name="currentPassword" type="password" autocomplete="current-password" required />
-        <button class="auth-btn" type="submit">Save changes</button>
-      </form>
-      <div class="auth-actions">
-        <a class="auth-btn secondary" href="${safeReturnTo}">Back</a>
-        <a class="auth-btn secondary" href="${safeLogoutUrl}">Sign out</a>
-      </div>
-      <div class="auth-meta">Leave the new password fields empty if you only want to change the username.</div>
-      ${safeUsersVar ? `<div class="auth-meta">Workspace variable: ${safeUsersVar}</div>` : ''}
-    </section>
-  </main>
-  <script>
-    (() => {
-      const form = document.querySelector('form[action="/auth/account"]');
-      const button = form?.querySelector('button[type="submit"]');
-      if (!form || !button) return;
-      form.addEventListener('submit', () => {
-        if (button.classList.contains('is-loading')) return;
-        button.classList.add('is-loading');
-        button.disabled = true;
-        button.innerHTML = '<span class="auth-btn-spinner" aria-hidden="true"></span><span>Saving...</span>';
-      });
-    })();
-  </script>
-</body>
-</html>`;
-}
-
 function renderSsoLoginHtml({ agentName, returnTo = '/', redirectUrl = '' } = {}) {
     const safeAgent = escapeHtml(agentName || 'application');
     const safeReturnTo = escapeHtml(normalizeRelativePath(returnTo, '/'));
@@ -418,8 +260,5 @@ function renderSsoLoginHtml({ agentName, returnTo = '/', redirectUrl = '' } = {}
 
 export {
     renderLoggedOutHtml,
-    renderExternalAccountHtml,
-    renderLocalLoginHtml,
-    renderLocalAccountHtml,
     renderSsoLoginHtml,
 };

@@ -4,7 +4,7 @@ import path from 'path';
 import { PLOINKY_WORKSPACE_ROOT, ROUTING_FILE } from '../../services/config.js';
 import { resolveEnabledAgentRecord } from '../../services/agents.js';
 import { findAgent } from '../../services/utils.js';
-import { GUEST_SESSION_TTL_SECONDS, getSessionCookieMaxAge as getLocalSessionCookieMaxAge, mintGuestSessionJwt, mintSessionJwt } from '../auth/localService.js';
+import { GUEST_SESSION_TTL_SECONDS, mintGuestSessionJwt } from '../auth/localService.js';
 import { waitForAgentReady } from '../utils/agentReadiness.js';
 import { evaluateRequiredCapability } from './requiredCapability.mjs';
 import {
@@ -14,7 +14,6 @@ import {
     buildCookie,
     getCookieNameForMode,
     GUEST_AUTH_COOKIE_NAME,
-    LOCAL_AUTH_COOKIE_NAME,
     parseCookies,
     sendJson,
     sessionTokenService,
@@ -249,33 +248,9 @@ export function resolveRouteDefaultHttpAccess(routeKey) {
     return { access: 'guest', routeKey: normalizedRouteKey, source: 'routeDefault' };
 }
 
-function getLocalRouteKey(parsedUrl, session = null, fallback = '') {
-    const fromSession = String(session?.localAuth?.routeKey || session?.externalAuth?.routeKey || '').trim();
-    if (fromSession) return fromSession;
-    const fromQuery = String(parsedUrl.searchParams.get('agent') || '').trim();
-    if (fromQuery) return fromQuery;
-    return String(fallback || '').trim();
-}
-
-function getLocalAuthPolicyFromSession(session = null, fallbackPolicy = null) {
-    const localAuth = session?.localAuth || {};
-    if (localAuth.usersVar) {
-        return {
-            mode: 'local',
-            usersVar: localAuth.usersVar
-        };
-    }
-    if (session?.externalAuth?.provider) {
-        return null;
-    }
-    return fallbackPolicy;
-}
-
 async function resolveSessionForAuthContext(authContext, sessionId) {
     if (!sessionId) return null;
-    let session = authContext.mode === 'local'
-        ? await sessionTokenService.getUserSession(sessionId, { policy: authContext.policy })
-        : authService.getSession(sessionId);
+    let session = authService.getSession(sessionId);
     if (authContext.mode === 'sso' && (!session || (session.expiresAt && Date.now() > session.expiresAt))) {
         try {
             await authService.refreshSession(sessionId);
@@ -351,6 +326,14 @@ async function ensureAuthenticatedWithContext(req, res, parsedUrl, authContext) 
     if (authContext.mode === 'none') {
         return { ok: true };
     }
+    if (authContext.mode === 'local' || authContext.mode === 'pwd') {
+        sendJson(res, 410, {
+            ok: false,
+            error: 'local_auth_removed',
+            message: 'Local password auth was removed. Enable an SSO provider agent.'
+        });
+        return { ok: false, error: 'local_auth_removed' };
+    }
     if (authContext.mode === 'sso' && !authService.isConfigured()) {
         sendJson(res, 503, { ok: false, error: 'sso_not_configured' });
         return { ok: false, error: 'sso_not_configured' };
@@ -358,17 +341,6 @@ async function ensureAuthenticatedWithContext(req, res, parsedUrl, authContext) 
     const cookies = parseCookies(req);
 
     if (authContext.mode === 'guest') {
-        const existingAuth = cookies.get(LOCAL_AUTH_COOKIE_NAME);
-        if (existingAuth) {
-            const authSession = await sessionTokenService.getUserSession(existingAuth, { policy: authContext.policy });
-            if (authSession) {
-                req.user = authSession.user;
-                req.session = authSession;
-                req.sessionId = existingAuth;
-                req.authMode = 'local';
-                return { ok: true, session: authSession };
-            }
-        }
         const ssoCookie = cookies.get(SSO_AUTH_COOKIE_NAME);
         if (ssoCookie && authService.isConfigured()) {
             const ssoSession = authService.getSession(ssoCookie);
@@ -412,9 +384,7 @@ async function ensureAuthenticatedWithContext(req, res, parsedUrl, authContext) 
         appendLog('auth_missing_cookie', { path: parsedUrl.pathname });
         return respondUnauthenticated(req, res, parsedUrl, authContext);
     }
-    let session = authContext.mode === 'local'
-        ? await sessionTokenService.getUserSession(sessionId, { policy: authContext.policy })
-        : authService.getSession(sessionId);
+    let session = authService.getSession(sessionId);
     if (authContext.mode === 'sso' && (!session || (session.expiresAt && Date.now() > session.expiresAt))) {
         try {
             await authService.refreshSession(sessionId);
@@ -437,23 +407,11 @@ async function ensureAuthenticatedWithContext(req, res, parsedUrl, authContext) 
         return { ok: false, error: capability.code || 'CAPABILITY_REQUIRED', required: capability.required };
     }
     try {
-        if (authContext.mode === 'local' && session.user) {
-            const refreshedJwt = mintSessionJwt(session.user, session._jwtPayload?.rev || 1, {
-                usersVar: session.localAuth?.usersVar || authContext.policy?.usersVar || '',
-                sid: session._jwtPayload?.sid || ''
-            });
-            const cookie = buildCookie(cookieName, refreshedJwt, req, '/', {
-                maxAge: getLocalSessionCookieMaxAge(),
-                sameSite: 'Lax'
-            });
-            appendSetCookie(res, cookie);
-        } else {
-            const cookie = buildCookie(cookieName, sessionId, req, '/', {
-                maxAge: authService.getSessionCookieMaxAge(),
-                sameSite: 'Lax'
-            });
-            appendSetCookie(res, cookie);
-        }
+        const cookie = buildCookie(cookieName, sessionId, req, '/', {
+            maxAge: authService.getSessionCookieMaxAge(),
+            sameSite: 'Lax'
+        });
+        appendSetCookie(res, cookie);
     } catch (_) { }
     return { ok: true, session };
 }
@@ -488,8 +446,6 @@ export async function ensureHttpRouteAccess(req, res, parsedUrl, decision) {
 }
 
 export {
-    getLocalAuthPolicyFromSession,
-    getLocalRouteKey,
     resolveAuthContext,
     resolveAuthContextForRouteKey,
     waitForAgentRedirectReady,

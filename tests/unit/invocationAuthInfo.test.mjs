@@ -6,19 +6,19 @@ import { authInfoFromInvocation } from '../../Agent/lib/invocation-auth.mjs';
 test('authInfoFromInvocation promotes router user actor into authInfo.user', () => {
     const authInfo = authInfoFromInvocation({
         iss: 'ploinky-router',
-        sub: 'user:local:admin',
-        actor: { kind: 'user', id: 'user:local:admin', roles: ['admin'] },
+        sub: 'user:sso:admin',
+        actor: { kind: 'user', id: 'user:sso:admin', roles: ['admin'] },
         tool: 'webmeet_room_list'
     });
 
-    assert.equal(authInfo.principalId, 'user:local:admin');
+    assert.equal(authInfo.principalId, 'user:sso:admin');
     assert.deepEqual(authInfo.user, {
-        id: 'local:admin',
-        username: 'admin',
+        id: 'sso:admin',
+        username: 'sso:admin',
         email: '',
         roles: ['admin']
     });
-    assert.equal(authInfo.invocation.actor.id, 'user:local:admin');
+    assert.equal(authInfo.invocation.actor.id, 'user:sso:admin');
 });
 
 test('authInfoFromInvocation derives user identity from user subject when actor is absent', () => {
@@ -70,7 +70,7 @@ test('authInfoFromInvocation does not promote a guest actor even when sub is use
     // authenticated user via the `sub` fallback.
     const authInfo = authInfoFromInvocation({
         iss: 'ploinky-router',
-        sub: 'user:local:admin',
+        sub: 'user:sso:admin',
         actor: { kind: 'guest', id: 'guest:room_x', roles: ['guest'] },
         tool: 'webmeet_room_list'
     });
@@ -82,18 +82,18 @@ test('authInfoFromInvocation does not promote a guest actor even when sub is use
 test('authInfoFromInvocation keeps legacy usr claims authoritative and normalizes the id', () => {
     const authInfo = authInfoFromInvocation({
         iss: 'ploinky-router',
-        sub: 'user:local:admin',
-        actor: { kind: 'user', id: 'user:local:admin', roles: ['admin'] },
-        usr: { id: 'user:local:admin', username: 'admin', email: 'a@b.c', roles: ['operator'] }
+        sub: 'user:sso:admin',
+        actor: { kind: 'user', id: 'user:sso:admin', roles: ['admin'] },
+        usr: { id: 'user:sso:admin', username: 'admin', email: 'a@b.c', roles: ['operator'] }
     });
 
     // Legacy claims win for identity + roles; the `user:` prefix is stripped so
     // the id matches the `user:${id}` principal convention used by DPU/Git.
-    assert.equal(authInfo.user.id, 'local:admin');
+    assert.equal(authInfo.user.id, 'sso:admin');
     assert.equal(authInfo.user.username, 'admin');
     assert.equal(authInfo.user.email, 'a@b.c');
     assert.deepEqual(authInfo.user.roles, ['operator']);
-    assert.equal(authInfo.principalId, 'user:local:admin');
+    assert.equal(authInfo.principalId, 'user:sso:admin');
 });
 
 test('authInfoFromInvocation does not merge actor.roles into present usr claims', () => {
@@ -128,7 +128,7 @@ test('authInfoFromInvocation exposes caller and delegation metadata while keepin
         sub: 'agent:AssistOSExplorer/onlyOffice',
         actor: { kind: 'agent', id: 'agent:AssistOSExplorer/onlyOffice', roles: ['agent'] },
         caller: { kind: 'agent', id: 'agent:AssistOSExplorer/onlyOffice', roles: ['agent'] },
-        usr: { id: 'local:alice', username: 'alice', roles: ['user'] },
+        usr: { id: 'sso:alice', username: 'alice', roles: ['user'] },
         delegation: {
             jti: 'delegation-1',
             scope: ['dpu:confidential:read'],
@@ -137,7 +137,7 @@ test('authInfoFromInvocation exposes caller and delegation metadata while keepin
         tool: 'dpu_confidential_get'
     });
 
-    assert.equal(authInfo.user.id, 'local:alice');
+    assert.equal(authInfo.user.id, 'sso:alice');
     assert.equal(authInfo.agent.principalId, 'agent:AssistOSExplorer/onlyOffice');
     assert.equal(authInfo.invocation.caller.id, 'agent:AssistOSExplorer/onlyOffice');
     assert.equal(authInfo.invocation.delegation.jti, 'delegation-1');
@@ -146,8 +146,8 @@ test('authInfoFromInvocation exposes caller and delegation metadata while keepin
 test('authInfoFromInvocation exposes router-minted delegations for a user actor', () => {
     const authInfo = authInfoFromInvocation({
         iss: 'ploinky-router',
-        sub: 'user:local:admin',
-        actor: { kind: 'user', id: 'user:local:admin', roles: ['admin'] },
+        sub: 'user:sso:admin',
+        actor: { kind: 'user', id: 'user:sso:admin', roles: ['admin'] },
         tool: 'git_auth_store_token',
         delegations: {
             dpuGitSecrets: {
@@ -162,7 +162,7 @@ test('authInfoFromInvocation exposes router-minted delegations for a user actor'
 
     assert.equal(authInfo.delegations.dpuGitSecrets.token, 'delegation.jwt.value');
     assert.equal(authInfo.delegations.dpuGitSecrets.targetAgentId, 'agent:AchillesIDE/dpuAgent');
-    assert.equal(authInfo.user.id, 'local:admin');
+    assert.equal(authInfo.user.id, 'sso:admin');
     assert.equal(authInfo.agent, undefined);
 });
 
@@ -172,7 +172,7 @@ test('authInfoFromInvocation keeps the singular delegation and plural delegation
         sub: 'agent:AchillesIDE/gitAgent',
         actor: { kind: 'agent', id: 'agent:AchillesIDE/gitAgent', roles: [] },
         caller: { kind: 'agent', id: 'agent:AchillesIDE/gitAgent', roles: ['agent'] },
-        usr: { id: 'local:admin', username: 'admin', roles: ['admin'] },
+        usr: { id: 'sso:admin', username: 'admin', roles: ['admin'] },
         delegation: { jti: 'grant-jti', scope: ['secret:write'], sourceAgentId: 'agent:AchillesIDE/gitAgent' },
         tool: 'dpu_secret_put',
     });
@@ -180,6 +180,6 @@ test('authInfoFromInvocation keeps the singular delegation and plural delegation
     assert.equal(authInfo.invocation.delegation.jti, 'grant-jti');
     assert.deepEqual(authInfo.invocation.delegation.scope, ['secret:write']);
     assert.equal(authInfo.delegations, undefined);
-    assert.equal(authInfo.user.id, 'local:admin');
+    assert.equal(authInfo.user.id, 'sso:admin');
     assert.equal(authInfo.agent.principalId, 'agent:AchillesIDE/gitAgent');
 });

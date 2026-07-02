@@ -51,7 +51,7 @@
                         <div class="feature-card">
                             <div class="feature-icon">🔐</div>
                             <h3>Router Login</h3>
-                            <p>WebChat uses the router login flow, so access follows the same local or SSO session model as other authenticated router surfaces.</p>
+                            <p>WebChat uses the router login flow, so access follows the configured SSO session model for authenticated router surfaces.</p>
                         </div>
                         <div class="feature-card">
                             <div class="feature-icon">🛠️</div>
@@ -127,7 +127,7 @@ ploinky cli achilles-cli --path=/absolute/path</code></pre>
                     <h2>Security Practices</h2>
                     <ul style="margin-left: 2rem;">
                         <li>Use HTTPS or SSH tunnels when exposing the WebChat URL beyond localhost.</li>
-                        <li>Protect router session cookies and the encrypted <code>.ploinky/.secrets</code> store used by local auth, dashboard tokens, and manifest env.</li>
+                        <li>Protect router session cookies and the encrypted <code>.ploinky/.secrets</code> store used by dashboard tokens and manifest env.</li>
                     </ul>
                 </div>
 

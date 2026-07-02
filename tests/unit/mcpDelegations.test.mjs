@@ -83,7 +83,7 @@ test('deriveDelegationKey prefers explicit key, then scope, then target agent na
 });
 
 test('buildMcpDelegationsForUserCall mints verifiable grants for non-guest users only', () => {
-    const req = { user: { id: 'local:admin', username: 'admin', email: '', roles: ['admin'] } };
+    const req = { user: { id: 'sso:admin', username: 'admin', email: '', roles: ['admin'] } };
     const out = buildMcpDelegationsForUserCall({ req, routeKey: 'gitAgent', toolName: 'git_auth_store_token', routes: ROUTES });
     assert.ok(out.dpuGitSecrets.token);
     assert.equal(out.dpuGitSecrets.targetAgentId, 'agent:AchillesIDE/dpuAgent');
@@ -95,7 +95,7 @@ test('buildMcpDelegationsForUserCall mints verifiable grants for non-guest users
         expectedTargetAgentId: 'agent:AchillesIDE/dpuAgent',
         expectedTool: 'dpu_secret_put',
     });
-    assert.equal(verified.user.id, 'local:admin');
+    assert.equal(verified.user.id, 'sso:admin');
     assert.deepEqual(verified.delegation.scope, ['secret:write', 'secret:grant']);
 
     const guestReq = { user: { id: 'guest-1', username: 'guest', roles: ['guest'] } };

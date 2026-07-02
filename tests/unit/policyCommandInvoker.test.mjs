@@ -55,8 +55,8 @@ function makeInvoker(authorizer = shareAllow) {
         registry,
         auditLog: new PolicyAuditLog(),
         getSession: (cookie) => (
-            cookie === 'admin' ? { user: { id: 'local:admin', username: 'admin', roles: ['user', 'admin'] } }
-                : cookie === 'user' ? { user: { id: 'local:bob', username: 'bob', roles: ['user'] } }
+            cookie === 'admin' ? { user: { id: 'sso:admin', username: 'admin', roles: ['user', 'admin'] } }
+                : cookie === 'user' ? { user: { id: 'sso:bob', username: 'bob', roles: ['user'] } }
                     : null
         ),
         isAdminUser: (u) => Array.isArray(u?.roles) && u.roles.includes('admin'),
@@ -92,7 +92,7 @@ function makeRequest({ method = 'POST', cookie = '', body } = {}) {
     const req = Readable.from(chunks);
     req.method = method;
     req.url = '/policy/command';
-    req.headers = { host: 'localhost', ...(cookie ? { cookie: `ploinky_jwt=${cookie}` } : {}), ...(body === undefined ? {} : { 'content-type': 'application/json' }) };
+    req.headers = { host: 'localhost', ...(cookie ? { cookie: `ploinky_sso=${cookie}` } : {}), ...(body === undefined ? {} : { 'content-type': 'application/json' }) };
     req.socket = { encrypted: false };
     return req;
 }

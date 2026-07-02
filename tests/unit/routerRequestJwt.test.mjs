@@ -166,8 +166,8 @@ test('buildRouterRequest carries router-minted delegation grants without touchin
     const rch = computeRchTool({ method: 'POST', path: '/mcp', tool: 'git_auth_store_token', arguments: { token: 'redacted-by-test' } });
     const { token, payload } = buildRouterRequest({
         targetAgentId: 'agent:AchillesIDE/gitAgent',
-        sub: 'user:local:admin',
-        actor: { kind: 'user', id: 'user:local:admin', roles: ['admin'] },
+        sub: 'user:sso:admin',
+        actor: { kind: 'user', id: 'user:sso:admin', roles: ['admin'] },
         method: 'POST',
         path: '/mcp',
         tool: 'git_auth_store_token',
@@ -197,8 +197,8 @@ test('buildRouterRequest omits delegations when none are valid', () => {
     const rch = computeRchTool({ method: 'POST', path: '/mcp', tool: 'git_status', arguments: {} });
     const { payload } = buildRouterRequest({
         targetAgentId: 'agent:AchillesIDE/gitAgent',
-        sub: 'user:local:admin',
-        actor: { kind: 'user', id: 'user:local:admin', roles: [] },
+        sub: 'user:sso:admin',
+        actor: { kind: 'user', id: 'user:sso:admin', roles: [] },
         method: 'POST',
         path: '/mcp',
         tool: 'git_status',

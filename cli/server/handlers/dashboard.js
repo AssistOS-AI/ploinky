@@ -108,9 +108,6 @@ function getAuditViewerHash(req, appState) {
 function hasTranscriptViewerAccess(req, appState) {
     const localViewerAllowed = readBoolConfig('PLOINKY_TRANSCRIPT_VIEWER_ALLOW_LOCAL', false);
     if (req?.user) {
-        if (req.authMode === 'local') {
-            return localViewerAllowed;
-        }
         const allowedRoles = getTranscriptViewerRoles();
         if (allowedRoles.includes('*')) {
             return true;

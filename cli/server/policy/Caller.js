@@ -31,9 +31,8 @@ export class Caller {
                 ? req.user.roles.map((role) => String(role || '').trim().toLowerCase()).filter(Boolean)
                 : [];
             const username = String(req.user.username || '').trim().toLowerCase();
-            const id = String(req.user.id || '').trim().toLowerCase();
             const isGuest = roles.includes('guest');
-            const isAdmin = !isGuest && (roles.includes('admin') || username === 'admin' || id === 'local:admin');
+            const isAdmin = !isGuest && (roles.includes('admin') || username === 'admin');
             return new Caller({ kind: isGuest ? 'guest' : 'user', id: String(req.user.id || ''), roles, isAdmin });
         }
         return new Caller({ kind: 'none' });

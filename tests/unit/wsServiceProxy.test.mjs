@@ -16,7 +16,6 @@ const previousEnv = {
     PLOINKY_WORKSPACE_ROOT: process.env.PLOINKY_WORKSPACE_ROOT,
     PLOINKY_ROUTING_FILE: process.env.PLOINKY_ROUTING_FILE,
     PLOINKY_MASTER_KEY: process.env.PLOINKY_MASTER_KEY,
-    PLOINKY_AUTH_EXPLORER_USERS: process.env.PLOINKY_AUTH_EXPLORER_USERS,
 };
 
 process.env.PLOINKY_WORKSPACE_ROOT = fixture.workspace;
@@ -39,23 +38,17 @@ test('resolveUpgradeTarget returns matched:false for a non-service path', async 
 
 test('resolveUpgradeTarget rewrites authenticated service upgrades and signs router auth info', async () => {
     const { resolveUpgradeTarget } = await import('../../cli/server/wsServiceProxy.js');
-    const localService = await import('../../cli/server/auth/localService.js');
-    const authPolicy = { mode: 'local', usersVar: 'PLOINKY_AUTH_EXPLORER_USERS' };
-    localService.createLocalAuthUser({
-        policy: authPolicy,
-        username: 'admin',
-        password: 'correct horse battery staple',
-        roles: ['admin'],
-    });
-    const login = localService.authenticateLocalUser({
-        policy: authPolicy,
-        username: 'admin',
-        password: 'correct horse battery staple',
-    });
+    const authHandlers = await import('../../cli/server/authHandlers/index.js');
+    const originalIsConfigured = authHandlers.authService.isConfigured;
+    const originalGetSession = authHandlers.authService.getSession;
+    authHandlers.authService.isConfigured = () => true;
+    authHandlers.authService.getSession = (id) => id === 'sso-admin'
+        ? { user: { id: 'sso:admin', username: 'admin', roles: ['user', 'admin'] }, expiresAt: Date.now() + 60_000 }
+        : null;
 
     const req = makeRequest({
         url: '/services/demo/management/ws/logs?tail=1',
-        cookie: `ploinky_jwt=${login.sessionId}`,
+        cookie: 'ploinky_sso=sso-admin',
         headers: {
             'x-ploinky-auth-info': '{"user":{"id":"spoofed"}}',
             'sec-websocket-key': 'fixture-key',
@@ -70,6 +63,8 @@ test('resolveUpgradeTarget rewrites authenticated service upgrades and signs rou
     };
 
     const out = await resolveUpgradeTarget({ req, parsedUrl, policy });
+    authHandlers.authService.isConfigured = originalIsConfigured;
+    authHandlers.authService.getSession = originalGetSession;
 
     assert.equal(out.matched, true);
     assert.equal(out.ok, true);
@@ -79,7 +74,7 @@ test('resolveUpgradeTarget rewrites authenticated service upgrades and signs rou
     assert.equal(typeof out.responseHeaders['set-cookie'], 'string');
 
     const authInfo = JSON.parse(out.identityHeaders['x-ploinky-auth-info']);
-    assert.equal(authInfo.user.id, 'local:admin');
+    assert.equal(authInfo.user.id, 'sso:admin');
     assert.equal(authInfo.user.username, 'admin');
     assert.deepEqual(authInfo.user.roles, ['user', 'admin']);
     assert.equal(typeof authInfo.invocationToken, 'string');
@@ -107,7 +102,7 @@ test('resolveUpgradeTarget rewrites authenticated service upgrades and signs rou
         replayCache: createMemoryReplayCache(),
     });
     assert.equal(verified.payload.typ, 'router-request');
-    assert.equal(verified.payload.sub, 'user:local:admin');
+    assert.equal(verified.payload.sub, 'user:sso:admin');
 });
 
 function createRoutingFixture() {
@@ -134,7 +129,7 @@ function createRoutingFixture() {
             type: 'agent',
             agentName: 'explorer',
             repoName: 'fixtures',
-            auth: { mode: 'local', usersVar: 'PLOINKY_AUTH_EXPLORER_USERS' },
+            auth: { mode: 'sso' },
         },
         demoService: {
             type: 'agent',

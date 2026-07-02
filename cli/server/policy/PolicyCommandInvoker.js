@@ -11,7 +11,7 @@ function sendJson(res, statusCode, body) {
 
 /**
  * PolicyCommandInvoker — the Command-pattern invoker and HTTP adapter for
- * `POST /policy/command` (DS014). Authenticated via the local User Session
+ * `POST /policy/command` (DS014). Authenticated via the router SSO session
  * cookie; agents (which cannot present a session cookie) are rejected. It builds
  * the CommandContext, looks the command up in the registry, runs authorize then
  * execute, maps the CommandResult to the HTTP response, and writes one audit line.
@@ -20,13 +20,12 @@ function sendJson(res, statusCode, body) {
  * is testable without real session minting.
  */
 
-const LOCAL_AUTH_COOKIE_NAME = 'ploinky_jwt';
-
 export class PolicyCommandInvoker {
-    constructor({ registry, auditLog, getSession, isAdminUser }) {
+    constructor({ registry, auditLog, getSession, cookieName = 'ploinky_sso', isAdminUser }) {
         this._registry = registry;
         this._audit = auditLog;
         this._getSession = getSession;
+        this._cookieName = cookieName;
         this._isAdminUser = isAdminUser;
     }
 
@@ -36,7 +35,7 @@ export class PolicyCommandInvoker {
             return true;
         }
         const cookies = parseCookies(req);
-        const cookie = cookies.get(LOCAL_AUTH_COOKIE_NAME) || '';
+        const cookie = cookies.get(this._cookieName) || '';
         const session = cookie ? this._getSession(cookie) : null;
         if (!session || !session.user) {
             sendJson(res, 401, { ok: false, error: { code: 'AUTH_REQUIRED', message: 'Authentication is required.' } });

@@ -67,8 +67,6 @@ let llmAgentsLoadPromise = null;
 const ENABLE_AGENT_CLI_TOKENS = Object.freeze({
     alias: 'as',
     auth: '--auth',
-    user: '--user',
-    password: '--password',
 });
 const ENABLE_AGENT_CLI_TOKEN_SET = new Set(Object.values(ENABLE_AGENT_CLI_TOKENS));
 
@@ -95,8 +93,6 @@ function parseEnableAgentArgs(rawOptions = []) {
 
     let alias;
     let authMode;
-    let username;
-    let password;
     let aliasIndex = -1;
     for (let i = 0; i < tokens.length; i += 1) {
         const token = tokens[i];
@@ -119,31 +115,12 @@ function parseEnableAgentArgs(rawOptions = []) {
         if (typeof token === 'string' && token.toLowerCase() === ENABLE_AGENT_CLI_TOKENS.auth) {
             const next = tokens[i + 1];
             if (!next || typeof next !== 'string') {
-                throw new Error("Usage: enable agent <name|repo/name> [isolated|global|devel [repoName]] [--auth none|pwd|sso] [--user <name> --password <value>] [as <alias>]");
+                throw new Error("Usage: enable agent <name|repo/name> [isolated|global|devel [repoName]] [--auth none|sso|guest] [as <alias>]");
             }
             authMode = next.trim().toLowerCase();
             tokens.splice(i, 2);
             i -= 1;
             continue;
-        }
-        if (typeof token === 'string' && token.toLowerCase() === ENABLE_AGENT_CLI_TOKENS.user) {
-            const next = tokens[i + 1];
-            if (!next || typeof next !== 'string') {
-                throw new Error("Usage: enable agent <name|repo/name> [isolated|global|devel [repoName]] [--auth none|pwd|sso] [--user <name> --password <value>] [as <alias>]");
-            }
-            username = next.trim();
-            tokens.splice(i, 2);
-            i -= 1;
-            continue;
-        }
-        if (typeof token === 'string' && token.toLowerCase() === ENABLE_AGENT_CLI_TOKENS.password) {
-            const next = tokens[i + 1];
-            if (!next || typeof next !== 'string') {
-                throw new Error("Usage: enable agent <name|repo/name> [isolated|global|devel [repoName]] [--auth none|pwd|sso] [--user <name> --password <value>] [as <alias>]");
-            }
-            password = next;
-            tokens.splice(i, 2);
-            i -= 1;
         }
     }
 
@@ -153,8 +130,6 @@ function parseEnableAgentArgs(rawOptions = []) {
         repoName: tokens[2],
         alias,
         authMode,
-        username,
-        password,
     };
 }
 
@@ -263,7 +238,7 @@ async function handleCommand(args) {
         case 'enable':
             if (options[0] === 'agent') {
                 const parsed = parseEnableAgentArgs(options.slice(1));
-                await enableAgent(parsed.agentName, parsed.mode, parsed.repoName, parsed.alias, parsed.authMode, parsed.username, parsed.password);
+                await enableAgent(parsed.agentName, parsed.mode, parsed.repoName, parsed.alias, parsed.authMode);
             }
             else if (['sandbox', 'host-sandbox', 'lite-sandbox'].includes(String(options[0] || '').toLowerCase())) {
                 enableHostSandbox();
@@ -274,7 +249,7 @@ async function handleCommand(args) {
                     break;
                 }
                 const parsed = parseEnableAgentArgs(options);
-                await enableAgent(parsed.agentName, parsed.mode, parsed.repoName, parsed.alias, parsed.authMode, parsed.username, parsed.password);
+                await enableAgent(parsed.agentName, parsed.mode, parsed.repoName, parsed.alias, parsed.authMode);
             }
             break;
         case 'expose':

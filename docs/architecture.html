@@ -359,11 +359,11 @@ PROD_KEY=$API_KEY        # Alias reference
 DATABASE_URL=postgres://localhost/db</code></pre>
 
                         <h3>Authentication Modes</h3>
-                        <p>Each agent can be independently configured with one of three auth modes via <code>enable agent --auth none|pwd|sso</code>:</p>
+                        <p>Each agent can be independently configured with auth modes via <code>enable agent --auth none|sso|guest</code>:</p>
                         <ul style="margin-left: 2rem;">
                             <li><strong>none:</strong> No authentication (default).</li>
-                            <li><strong>pwd (local):</strong> Username/password auth with HMAC-signed JWT sessions. Cookie: <code>ploinky_jwt</code>. Session TTL: 4 hours.</li>
                             <li><strong>sso (OIDC):</strong> Delegates to the configured SSO provider agent marked with <code>"ssoProvider": true</code>. Supports PKCE flow. Cookie: <code>ploinky_sso</code>.</li>
+                            <li><strong>guest:</strong> Router-minted scoped guest sessions for guest-capable routes. Cookie: <code>ploinky_guest</code>.</li>
                         </ul>
 
                         <h3>Secure Wire Protocol</h3>

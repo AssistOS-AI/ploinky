@@ -51,7 +51,7 @@ export async function handleUserIdentityKeyRoute(req, res, parsedUrl) {
     }
 
     // Admin status comes from the same canonical Caller convention used by
-    // MCP/policy routing (roles include admin, or the local admin id/username;
+    // MCP/policy routing (roles include admin, or the admin username fallback;
     // never a guest). A non-admin's body userId is ignored by buildUserApiKeyResult.
     const requestedUserId = body && typeof body === 'object' ? body.userId : undefined;
 

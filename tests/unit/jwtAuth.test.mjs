@@ -26,9 +26,9 @@ function mintJws(overrides = {}) {
     const now = Math.floor(Date.now() / 1000);
     const payload = {
         aud: 'agent:AssistOSExplorer/dpuAgent',
-        sub: 'user:local:admin',
+        sub: 'user:sso:admin',
         bh: bodyHashForRequest(EXAMPLE_BODY),
-        usr: { id: 'local:admin', username: 'admin', roles: ['local'] },
+        usr: { id: 'sso:admin', username: 'admin', roles: ['user'] },
         jti: crypto.randomBytes(12).toString('base64url'),
         iat: now,
         exp: now + 60,
@@ -45,7 +45,7 @@ test('signHmacJwt / verifyJws round-trip preserves claims and uses HS256', () =>
         bodyObject: EXAMPLE_BODY,
         replayCache: createMemoryReplayCache()
     });
-    assert.equal(result.payload.sub, 'user:local:admin');
+    assert.equal(result.payload.sub, 'user:sso:admin');
     assert.equal(result.payload.usr.username, 'admin');
     assert.equal(result.header.alg, 'HS256');
 });

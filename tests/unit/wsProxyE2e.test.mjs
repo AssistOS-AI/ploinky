@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import crypto from 'node:crypto';
 import { once } from 'node:events';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import http from 'node:http';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -24,6 +24,7 @@ test('router proxies authenticated WebSocket upgrades to HTTP-service agents', a
     let captured = null;
     let router = null;
     let ws = null;
+    let explorer = null;
     const upstream = http.createServer();
     upstream.on('upgrade', (req, socket, head) => {
         captured = {
@@ -36,29 +37,18 @@ test('router proxies authenticated WebSocket upgrades to HTTP-service agents', a
         });
     });
     const upstreamPort = await listen(upstream);
+    explorer = createReadyMcpServer();
+    const explorerPort = await listen(explorer);
 
-    const fixture = createRoutingFixture(upstreamPort);
+    const fixture = createRoutingFixture(upstreamPort, explorerPort);
     const previousEnv = setFixtureEnv(fixture);
     t.after(async () => {
         if (ws) await closeWebSocket(ws);
         if (router) await stopChild(router);
+        if (explorer) await close(explorer);
         await close(upstream);
         restoreEnv(previousEnv);
         rmSync(fixture.workspace, { recursive: true, force: true });
-    });
-
-    const localService = await import(`../../cli/server/auth/localService.js?e2e=${Date.now()}`);
-    const authPolicy = { mode: 'local', usersVar: 'PLOINKY_AUTH_EXPLORER_USERS' };
-    localService.createLocalAuthUser({
-        policy: authPolicy,
-        username: 'admin',
-        password: 'correct horse battery staple',
-        roles: ['admin'],
-    });
-    const login = localService.authenticateLocalUser({
-        policy: authPolicy,
-        username: 'admin',
-        password: 'correct horse battery staple',
     });
 
     const routerPort = await getFreePort();
@@ -75,13 +65,19 @@ test('router proxies authenticated WebSocket upgrades to HTTP-service agents', a
     });
     const output = captureChildOutput(router);
     await waitForRouter(router, output, routerPort);
+    const ssoCookie = await loginWithFakeSso(routerPort);
 
-    const connected = await connectWebSocketWithStatus({
-        url: `ws://127.0.0.1:${routerPort}/services/demo/management/ws/logs?tail=1`,
-        headers: {
-            cookie: `ploinky_jwt=${login.sessionId}`,
-        },
-    });
+    let connected;
+    try {
+        connected = await connectWebSocketWithStatus({
+            url: `ws://127.0.0.1:${routerPort}/services/demo/management/ws/logs?tail=1`,
+            headers: {
+                cookie: ssoCookie,
+            },
+        });
+    } catch (err) {
+        throw new Error(`${err?.message || err}\nrouter stdout:\n${output.stdout}\nrouter stderr:\n${output.stderr}\nrouter log:\n${readRouterLog(fixture)}`);
+    }
     const { statusCode } = connected;
     ws = connected.ws;
 
@@ -94,7 +90,7 @@ test('router proxies authenticated WebSocket upgrades to HTTP-service agents', a
     assert.equal(typeof captured?.authInfo, 'string');
 
     const authInfo = JSON.parse(captured.authInfo);
-    assert.equal(authInfo.user.id, 'local:admin');
+    assert.equal(authInfo.user.id, 'sso:admin');
     assert.equal(typeof authInfo.invocationToken, 'string');
     assert.deepEqual(authInfo.invocationBody, {
         method: 'GET',
@@ -120,7 +116,7 @@ test('router proxies authenticated WebSocket upgrades to HTTP-service agents', a
         replayCache: createMemoryReplayCache(),
     });
     assert.equal(verified.payload.typ, 'router-request');
-    assert.equal(verified.payload.sub, 'user:local:admin');
+    assert.equal(verified.payload.sub, 'user:sso:admin');
 
     await closeWebSocket(ws);
     ws = null;
@@ -128,15 +124,17 @@ test('router proxies authenticated WebSocket upgrades to HTTP-service agents', a
     router = null;
 });
 
-function createRoutingFixture(servicePort) {
+function createRoutingFixture(servicePort, explorerPort) {
     const workspace = mkdtempSync(path.join(tmpdir(), 'ploinky-ws-e2e-'));
     const ploinkyDir = path.join(workspace, '.ploinky');
     const explorerManifestDir = path.join(ploinkyDir, 'repos', 'fixtures', 'explorer');
     const serviceManifestDir = path.join(ploinkyDir, 'repos', 'fixtures', 'demoService');
+    const providerDir = path.join(ploinkyDir, 'repos', 'fixtures', 'fakeProvider');
     const routingFile = path.join(ploinkyDir, 'routing.json');
 
     mkdirSync(explorerManifestDir, { recursive: true });
     mkdirSync(serviceManifestDir, { recursive: true });
+    mkdirSync(path.join(providerDir, 'runtime'), { recursive: true });
     writeFileSync(path.join(explorerManifestDir, 'manifest.json'), JSON.stringify({ about: 'Explorer' }, null, 2));
     writeFileSync(path.join(serviceManifestDir, 'manifest.json'), JSON.stringify({
         httpServices: [{
@@ -146,12 +144,57 @@ function createRoutingFixture(servicePort) {
             access: 'authenticated',
         }],
     }, null, 2));
+    writeFileSync(path.join(providerDir, 'manifest.json'), JSON.stringify({
+        ssoProvider: true,
+    }, null, 2));
+    writeFileSync(path.join(providerDir, 'runtime', 'index.mjs'), `
+export function resolveProviderConfig({ providerConfig = {} } = {}) {
+    return {
+        issuerBaseUrl: providerConfig.issuerBaseUrl || 'https://fake.test',
+        clientId: providerConfig.clientId || 'fake-client'
+    };
+}
+
+export function createProvider() {
+    return {
+        async sso_begin_login() {
+            return {
+                authorizationUrl: 'https://fake.test/auth?state=PROVIDER_STATE',
+                providerState: 'PROVIDER_STATE',
+                expiresAt: Date.now() + 60_000
+            };
+        },
+        async sso_handle_callback() {
+            return {
+                user: {
+                    id: 'sso:admin',
+                    username: 'admin',
+                    email: 'admin@example.test',
+                    roles: ['user', 'admin'],
+                    capabilities: ['explorer.access']
+                },
+                providerSession: {
+                    provider: 'fixtures/fakeProvider',
+                    tokens: { accessToken: 'AT', tokenType: 'Bearer' },
+                    expiresAt: Date.now() + 60_000
+                }
+            };
+        },
+        async sso_refresh_session({ providerSession }) {
+            return { user: null, providerSession };
+        },
+        async sso_logout() {
+            return { redirectUrl: '/' };
+        }
+    };
+}
+`);
     writeFileSync(path.join(ploinkyDir, 'agents.json'), JSON.stringify({
         explorer: {
             type: 'agent',
             agentName: 'explorer',
             repoName: 'fixtures',
-            auth: { mode: 'local', usersVar: 'PLOINKY_AUTH_EXPLORER_USERS' },
+            auth: { mode: 'sso' },
         },
         demoService: {
             type: 'agent',
@@ -159,13 +202,23 @@ function createRoutingFixture(servicePort) {
             repoName: 'fixtures',
             auth: { mode: 'none' },
         },
+        _config: {
+            sso: {
+                enabled: true,
+                providerAgent: 'fixtures/fakeProvider',
+                providerConfig: {
+                    issuerBaseUrl: 'https://fake.test',
+                    clientId: 'fake-client',
+                },
+            },
+        },
     }, null, 2));
     writeFileSync(routingFile, JSON.stringify({
         routes: {
             explorer: {
                 agent: 'explorer',
                 repo: 'fixtures',
-                hostPort: 55289,
+                hostPort: explorerPort,
                 hostPath: explorerManifestDir,
             },
             demoService: {
@@ -184,17 +237,96 @@ function createRoutingFixture(servicePort) {
     return { workspace, routingFile };
 }
 
+function createReadyMcpServer() {
+    return http.createServer((req, res) => {
+        if (req.method !== 'POST' || req.url !== '/mcp') {
+            res.writeHead(404);
+            res.end();
+            return;
+        }
+        const chunks = [];
+        req.on('data', (chunk) => chunks.push(chunk));
+        req.on('end', () => {
+            let body = {};
+            try {
+                body = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}');
+            } catch (_) { }
+            if (body.method === 'initialize') {
+                res.writeHead(200, {
+                    'Content-Type': 'application/json',
+                    'mcp-session-id': 'ready-session',
+                });
+                res.end(JSON.stringify({
+                    jsonrpc: '2.0',
+                    id: body.id,
+                    result: { protocolVersion: '2025-06-18', capabilities: {}, serverInfo: { name: 'ready', version: '1.0.0' } },
+                }));
+                return;
+            }
+            if (body.method === 'notifications/initialized') {
+                res.writeHead(204);
+                res.end();
+                return;
+            }
+            if (body.method === 'tools/list') {
+                res.writeHead(200, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ jsonrpc: '2.0', id: body.id, result: { tools: [] } }));
+                return;
+            }
+            res.writeHead(404);
+            res.end();
+        });
+    });
+}
+
 function setFixtureEnv(fixture) {
     const previous = {
         PLOINKY_WORKSPACE_ROOT: process.env.PLOINKY_WORKSPACE_ROOT,
         PLOINKY_ROUTING_FILE: process.env.PLOINKY_ROUTING_FILE,
         PLOINKY_MASTER_KEY: process.env.PLOINKY_MASTER_KEY,
-        PLOINKY_AUTH_EXPLORER_USERS: process.env.PLOINKY_AUTH_EXPLORER_USERS,
     };
     process.env.PLOINKY_WORKSPACE_ROOT = fixture.workspace;
     process.env.PLOINKY_ROUTING_FILE = fixture.routingFile;
     process.env.PLOINKY_MASTER_KEY = MASTER_KEY;
     return previous;
+}
+
+async function loginWithFakeSso(routerPort) {
+    const login = await httpRequest({
+        port: routerPort,
+        path: '/auth/login?agent=explorer&returnTo=/services/demo/management/ws/logs%3Ftail%3D1',
+    });
+    assert.equal(login.statusCode, 200);
+    const stateMatch = login.body.match(/state=([^"&]+)/);
+    assert.ok(stateMatch, login.body);
+    const callback = await httpRequest({
+        port: routerPort,
+        path: `/auth/callback?agent=explorer&code=auth-code&state=${stateMatch[1]}`,
+    });
+    assert.equal(callback.statusCode, 302);
+    const setCookie = String(callback.headers['set-cookie']?.[0] || callback.headers['set-cookie'] || '');
+    assert.match(setCookie, /^ploinky_sso=/);
+    return setCookie.split(';')[0];
+}
+
+function httpRequest({ port, path: requestPath }) {
+    return new Promise((resolve, reject) => {
+        const req = http.request({
+            hostname: '127.0.0.1',
+            port,
+            path: requestPath,
+            method: 'GET',
+            headers: { accept: 'text/html,application/json' },
+        }, (res) => {
+            let body = '';
+            res.setEncoding('utf8');
+            res.on('data', (chunk) => { body += chunk; });
+            res.on('end', () => resolve({ statusCode: res.statusCode, headers: res.headers, body }));
+        });
+        req.setTimeout(3000, () => req.destroy(new Error('HTTP request timed out')));
+        req.on('error', reject);
+        req.end();
+    });
 }
 
 function restoreEnv(snapshot) {
@@ -204,6 +336,14 @@ function restoreEnv(snapshot) {
         } else {
             process.env[name] = value;
         }
+    }
+}
+
+function readRouterLog(fixture) {
+    try {
+        return readFileSync(path.join(fixture.workspace, '.ploinky', 'logs', 'router.log'), 'utf8');
+    } catch (_) {
+        return '';
     }
 }
 

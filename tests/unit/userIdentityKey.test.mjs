@@ -161,7 +161,7 @@ test('an admin CAN mint a key for another userId via the body', async (t) => {
     // Admin (roles include admin) mints for another user 999.
     const result = await invoke(route.handleUserIdentityKeyRoute, {
         body: { userId: '999' },
-        user: { id: 'local:admin', username: 'admin', roles: ['user', 'admin'] },
+        user: { id: 'sso:admin', username: 'admin', roles: ['user', 'admin'] },
     });
 
     assert.equal(result.statusCode, 200);
@@ -178,13 +178,13 @@ test('an admin with no body userId mints their own key', async (t) => {
     const { route } = await loadModules(t);
 
     const result = await invoke(route.handleUserIdentityKeyRoute, {
-        user: { id: 'local:admin', username: 'admin', roles: ['admin'] },
+        user: { id: 'sso:admin', username: 'admin', roles: ['admin'] },
     });
 
     assert.equal(result.statusCode, 200);
-    assert.equal(result.body.subjectId, 'user:local:admin');
+    assert.equal(result.body.subjectId, 'user:sso:admin');
     const rawApiKey = decodePublicUserApiKey(result.body.apiKey);
-    assert.ok(rawApiKey.startsWith('user:local:admin|'));
+    assert.ok(rawApiKey.startsWith('user:sso:admin|'));
 });
 
 test('an anonymous request is rejected with 401 and no key is minted', async (t) => {
@@ -230,7 +230,7 @@ test('an invalid userId returns 400, not a crash', async (t) => {
     for (const badId of ['a/b', 'a|b', 'has space', 'a\tb']) {
         const result = await invoke(route.handleUserIdentityKeyRoute, {
             body: { userId: badId },
-            user: { id: 'local:admin', username: 'admin', roles: ['admin'] },
+            user: { id: 'sso:admin', username: 'admin', roles: ['admin'] },
         });
         assert.equal(result.statusCode, 400, `userId=${JSON.stringify(badId)} should be 400`);
         assert.equal(result.body.error, 'invalid_user_id');
@@ -243,13 +243,13 @@ test('an admin supplying an empty-string userId falls back to their own key (not
 
     const result = await invoke(route.handleUserIdentityKeyRoute, {
         body: { userId: '' },
-        user: { id: 'local:admin', username: 'admin', roles: ['admin'] },
+        user: { id: 'sso:admin', username: 'admin', roles: ['admin'] },
     });
 
     assert.equal(result.statusCode, 200);
-    assert.equal(result.body.subjectId, 'user:local:admin');
+    assert.equal(result.body.subjectId, 'user:sso:admin');
     const rawApiKey = decodePublicUserApiKey(result.body.apiKey);
-    assert.ok(rawApiKey.startsWith('user:local:admin|'));
+    assert.ok(rawApiKey.startsWith('user:sso:admin|'));
 });
 
 test('a session user with no usable identifier fails closed with 400', async (t) => {
@@ -300,7 +300,7 @@ test('the pure buildUserApiKeyResult enforces the privilege model directly', asy
 
     // Admin: requestedUserId honored.
     const admin = pure.buildUserApiKeyResult({
-        sessionUser: { id: 'local:admin', username: 'admin' },
+        sessionUser: { id: 'sso:admin', username: 'admin' },
         requestedUserId: '999',
         isAdmin: true,
     });
@@ -319,7 +319,7 @@ test('the pure buildUserApiKeyResult enforces the privilege model directly', asy
     // Invalid id throws the typed error (mapped to 400 by the route).
     assert.throws(
         () => pure.buildUserApiKeyResult({
-            sessionUser: { id: 'local:admin' },
+            sessionUser: { id: 'sso:admin' },
             requestedUserId: 'a/b',
             isAdmin: true,
         }),

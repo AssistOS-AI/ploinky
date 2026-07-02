@@ -20,6 +20,14 @@ const __dirname = path.dirname(__filename);
 const REPO_ROOT = path.resolve(__dirname, '../..');
 const MASTER_KEY = '5'.repeat(64);
 
+function ssoUser(username = 'admin', roles = ['user', 'admin']) {
+    return {
+        id: `sso:${username}`,
+        username,
+        roles,
+    };
+}
+
 const VALID_DELEGATION_SPEC = {
     externalPrefix: '/services/onlyoffice/',
     internalPrefix: '/control/',
@@ -203,7 +211,7 @@ test('authenticated http service auth info includes configured user delegation g
         url: '/services/onlyoffice/office/session?path=%2FConfidential%2FReport.docx',
     });
     req.user = {
-        id: 'local:alice',
+        id: 'sso:alice',
         username: 'alice',
         roles: ['user'],
     };
@@ -215,7 +223,7 @@ test('authenticated http service auth info includes configured user delegation g
     await res.done;
 
     const authInfo = JSON.parse(captured?.headers['x-ploinky-auth-info'] || '{}');
-    assert.equal(authInfo.user.id, 'local:alice');
+    assert.equal(authInfo.user.id, 'sso:alice');
     assert.equal(authInfo.delegations?.dpuConfidential?.targetAgentId, 'agent:AssistOSExplorer/dpuAgent');
     const verified = verifyUserDelegationGrant({
         signingSecret: deriveSubkey('router-user-delegation', 32),
@@ -225,7 +233,7 @@ test('authenticated http service auth info includes configured user delegation g
         expectedTool: 'dpu_confidential_get',
         replayCache: createMemoryReplayCache(),
     });
-    assert.equal(verified.user.id, 'local:alice');
+    assert.equal(verified.user.id, 'sso:alice');
 });
 
 test('authenticated http service grant is omitted when the configured request path root does not match', async (t) => {
@@ -250,7 +258,7 @@ test('authenticated http service grant is omitted when the configured request pa
             url: `/services/onlyoffice/office/session?path=${encodeURIComponent(requestPath)}`,
         });
         req.user = {
-            id: 'local:alice',
+            id: 'sso:alice',
             username: 'alice',
             roles: ['user'],
         };
@@ -336,7 +344,7 @@ test('router strips caller-supplied x-ploinky-user-delegation before proxying', 
         },
     });
     req.user = {
-        id: 'local:alice',
+        id: 'sso:alice',
         username: 'alice',
         roles: ['user'],
     };
@@ -370,7 +378,7 @@ test('http service grant expiry is capped by the service delegation ttl', async 
         url: '/services/onlyoffice/office/session?path=%2FConfidential%2FReport.docx',
     });
     req.user = {
-        id: 'local:alice',
+        id: 'sso:alice',
         username: 'alice',
         roles: ['user'],
     };
@@ -503,7 +511,7 @@ function writeWorkspaceConfig(ploinkyDir, servicePort) {
             type: 'agent',
             agentName: 'explorer',
             repoName: 'AchillesIDE',
-            auth: { mode: 'local', usersVar: 'PLOINKY_AUTH_EXPLORER_USERS' }
+            auth: { mode: 'sso' }
         },
         browserUseAgent: {
             type: 'agent',
@@ -633,9 +641,27 @@ async function withRouterModules(t, servicePort, writeConfig = writeWorkspaceCon
 
     const nonce = `${Date.now()}-${Math.random()}`;
     const authHandlers = await import(`${pathToFileURL(path.join(REPO_ROOT, 'cli/server/authHandlers/index.js')).href}?test=${nonce}`);
-    const localService = await import(`${pathToFileURL(path.join(REPO_ROOT, 'cli/server/auth/localService.js')).href}?test=${nonce}`);
     const routerHandlers = await import(`${pathToFileURL(path.join(REPO_ROOT, 'cli/server/routerHandlers.js')).href}?test=${nonce}`);
-    return { authHandlers, localService, routerHandlers };
+    const originalIsConfigured = authHandlers.authService.isConfigured;
+    const originalGetSession = authHandlers.authService.getSession;
+    const originalRefreshSession = authHandlers.authService.refreshSession;
+    authHandlers.authService.isConfigured = () => true;
+    authHandlers.authService.getSession = (sessionId) => {
+        if (sessionId !== 'sso-admin') return null;
+        return {
+            id: 'sso-admin',
+            user: ssoUser('admin'),
+            tokens: { accessToken: 'sso-access-token' },
+            expiresAt: Date.now() + 60_000,
+        };
+    };
+    authHandlers.authService.refreshSession = async () => null;
+    t.after(() => {
+        authHandlers.authService.isConfigured = originalIsConfigured;
+        authHandlers.authService.getSession = originalGetSession;
+        authHandlers.authService.refreshSession = originalRefreshSession;
+    });
+    return { authHandlers, routerHandlers };
 }
 
 test('authenticated HTTP service falls back to static auth and injects router auth info', async (t) => {
@@ -653,7 +679,7 @@ test('authenticated HTTP service falls back to static auth and injects router au
         await close(upstream);
     });
 
-    const { authHandlers, localService, routerHandlers } = await withRouterModules(t, servicePort);
+    const { authHandlers, routerHandlers } = await withRouterModules(t, servicePort);
     const unauthReq = makeRequest({
         url: '/services/browser-use/sessions/sess_fake'
     });
@@ -667,21 +693,9 @@ test('authenticated HTTP service falls back to static auth and injects router au
     assert.equal(JSON.parse(unauthRes.body).error, 'not_authenticated');
     assert.equal(captured, null);
 
-    const policy = { mode: 'local', usersVar: 'PLOINKY_AUTH_EXPLORER_USERS' };
-    localService.createLocalAuthUser({
-        policy,
-        username: 'admin',
-        password: 'correct horse battery staple',
-        roles: ['admin']
-    });
-    const login = localService.authenticateLocalUser({
-        username: 'admin',
-        password: 'correct horse battery staple',
-        policy
-    });
     const req = makeRequest({
         url: '/services/browser-use/sessions/sess_1?view=1',
-        cookie: `ploinky_jwt=${login.sessionId}`,
+        cookie: 'ploinky_sso=sso-admin',
         headers: {
             'x-ploinky-auth-info': '{"user":{"id":"spoofed"}}'
         }
@@ -691,8 +705,8 @@ test('authenticated HTTP service falls back to static auth and injects router au
 
     const authResult = await authHandlers.ensureAuthenticated(req, res, parsedUrl);
     assert.equal(authResult.ok, true, res.body);
-    assert.equal(req.authMode, 'local');
-    assert.equal(req.user?.id, 'local:admin');
+    assert.equal(req.authMode, 'sso');
+    assert.equal(req.user?.id, 'sso:admin');
 
     const handled = routerHandlers.handleHttpServiceRoute(req, res, parsedUrl);
     assert.equal(handled, true);
@@ -703,7 +717,7 @@ test('authenticated HTTP service falls back to static auth and injects router au
     assert.equal(captured?.url, '/browser-use/sessions/sess_1?view=1');
 
     const authInfo = JSON.parse(captured?.headers['x-ploinky-auth-info'] || '{}');
-    assert.equal(authInfo.user?.id, 'local:admin');
+    assert.equal(authInfo.user?.id, 'sso:admin');
     assert.equal(authInfo.user?.username, 'admin');
     assert.deepEqual(authInfo.user?.roles, ['user', 'admin']);
     assert.ok(authInfo.sessionId);
@@ -733,12 +747,12 @@ test('authenticated HTTP service falls back to static auth and injects router au
     });
     assert.equal(verified.payload.typ, 'router-request');
     assert.equal(verified.payload.actor?.kind, 'user');
-    assert.equal(verified.payload.sub, 'user:local:admin');
+    assert.equal(verified.payload.sub, 'user:sso:admin');
 
     captured = null;
     const rootReq = makeRequest({
         url: '/services/browser-use',
-        cookie: `ploinky_jwt=${login.sessionId}`,
+        cookie: 'ploinky_sso=sso-admin',
     });
     const rootRes = new MockWritableResponse();
     const rootParsedUrl = new URL(rootReq.url, 'http://localhost');
@@ -786,7 +800,7 @@ test('authenticated HTTP service invocation rch binds the forwarded request body
         body: requestBody,
     });
     req.user = {
-        id: 'local:admin',
+        id: 'sso:admin',
         username: 'admin',
         roles: ['user', 'admin'],
     };
@@ -873,7 +887,7 @@ test('HTTP service invocation signs the internal path observed by the service', 
         body: requestBody,
     });
     req.user = {
-        id: 'local:admin',
+        id: 'sso:admin',
         username: 'admin',
         roles: ['user', 'admin'],
     };
@@ -949,7 +963,7 @@ test('HTTP service invocation rejects oversized buffered bodies before proxying'
         body: '0123456789',
     });
     req.user = {
-        id: 'local:admin',
+        id: 'sso:admin',
         username: 'admin',
         roles: ['user', 'admin'],
     };
@@ -992,7 +1006,7 @@ test('HTTP service oversized body returns 413 on a real socket', async (t) => {
     const { routerHandlers } = await withRouterModules(t, servicePort);
     const router = http.createServer((req, res) => {
         req.user = {
-            id: 'local:admin',
+            id: 'sso:admin',
             username: 'admin',
             roles: ['user', 'admin'],
         };
@@ -1092,9 +1106,9 @@ test('authenticated HTTP service fails closed when invocation principal cannot b
         url: '/services/broken/session',
     });
     req.user = {
-        id: 'local:admin',
+        id: 'sso:admin',
         username: 'admin',
-        roles: ['local', 'admin'],
+        roles: ['user', 'admin'],
     };
     req.sessionId = 'session-1';
     const res = new MockWritableResponse();
@@ -1115,7 +1129,7 @@ test('authenticated HTTP service auth info carries user identity', async () => {
     const { buildPlainAuthInfoHeader } = await import(`${pathToFileURL(path.join(REPO_ROOT, 'cli/server/routerHandlers.js')).href}?plain=${Date.now()}`);
     const headers = buildPlainAuthInfoHeader({
         user: {
-            id: 'local:admin',
+            id: 'sso:admin',
             username: 'admin',
             email: 'admin@example.com',
             roles: ['admin']
@@ -1126,7 +1140,7 @@ test('authenticated HTTP service auth info carries user identity', async () => {
     const authInfo = JSON.parse(headers['x-ploinky-auth-info']);
 
     assert.deepEqual(authInfo.user, {
-        id: 'local:admin',
+        id: 'sso:admin',
         username: 'admin',
         email: 'admin@example.com',
         roles: ['admin']

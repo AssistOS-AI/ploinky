@@ -16,7 +16,7 @@ const { deriveSubkey } = await import(`../../cli/services/masterKey.js${moduleSu
 const { signHmacJwt } = await import(`../../Agent/lib/jwtSign.mjs${moduleSuffix}`);
 const { revokeSessionId } = await import(`../../cli/server/auth/sessionRevocations.js${moduleSuffix}`);
 
-const USER = { id: 'local:daniel', username: 'daniel', name: 'Daniel', email: '', roles: ['user'] };
+const USER = { id: 'sso:daniel', username: 'daniel', name: 'Daniel', email: '', roles: ['user'] };
 
 test.after(() => {
     process.chdir(originalCwd);
@@ -29,9 +29,9 @@ function signSession(payloadOverrides = {}) {
         typ: 'user-session',
         iss: 'ploinky-router',
         aud: 'ploinky-router',
-        sub: 'local:daniel',
+        sub: 'sso:daniel',
         sid: 'sess_manual',
-        usr: { id: 'local:daniel', username: 'daniel', roles: ['user'] },
+        usr: { id: 'sso:daniel', username: 'daniel', roles: ['user'] },
         rev: 1,
         iat: now,
         exp: now + 3600,

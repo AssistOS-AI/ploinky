@@ -1,7 +1,6 @@
 export {
     AUTH_COOKIE_NAME,
     SSO_AUTH_COOKIE_NAME,
-    LOCAL_AUTH_COOKIE_NAME,
     authService,
     sendJson,
 } from './shared.js';
