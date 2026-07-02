@@ -117,6 +117,9 @@ function buildSelectedArchitectureState({ selection, hardware, policy, policyHas
         catalog: {
             id: selection.catalogId,
             ref: selection.catalogRef,
+            source: selection.catalogSource || null,
+            repoUrl: selection.catalogRepoUrl || null,
+            requestedRef: selection.catalogRequestedRef || null,
         },
         architecture: {
             id: selection.architectureId,
@@ -278,6 +281,9 @@ function prepareLlmStartup(input) {
         policyHash,
         catalogId: selection.catalogId,
         catalogRef: selection.catalogRef,
+        catalogSource: selection.catalogSource || null,
+        catalogRepoUrl: selection.catalogRepoUrl || null,
+        catalogRequestedRef: selection.catalogRequestedRef || null,
     };
     const reuseHash = computeReuseHash(reuseKey);
 
