@@ -115,23 +115,26 @@ test('installDefaultSkills refreshes incoming skills and preserves other .agents
     }
 });
 
-test('refreshDefaultSkillsInPloinkyRepos installs AchillesCopilotBasicSkills into managed repos', () => {
-    const sourceRepo = 'AchillesCopilotBasicSkills';
+test('refreshDefaultSkillsInPloinkyRepos installs default skills into managed repos', () => {
+    const sourceRepo = `UnitDefaultSkillsRepo-${process.pid}-${Date.now()}`;
     const managedRepo = `UnitManagedRepo-${process.pid}-${Date.now()}`;
     const managedPath = path.join(REPOS_DIR, managedRepo);
-
-    removeRepo(sourceRepo);
-    removeRepo(managedRepo);
-    createRepo(sourceRepo, {
-        defaultSkill: {
-            'SKILL.md': '# Default skill\n',
-            'tool.js': 'export default 1;\n',
-        },
-    });
-    initGitRepo(managedPath);
+    const sourcePath = path.join(REPOS_DIR, sourceRepo);
 
     try {
-        const result = refreshDefaultSkillsInPloinkyRepos([managedRepo, sourceRepo]);
+        removeRepo(sourceRepo);
+        removeRepo(managedRepo);
+        createRepo(sourceRepo, {
+            defaultSkill: {
+                'SKILL.md': '# Default skill\n',
+                'tool.js': 'export default 1;\n',
+            },
+        });
+        initGitRepo(managedPath);
+
+        const result = refreshDefaultSkillsInPloinkyRepos([managedRepo, sourceRepo], {
+            defaultSkillsRepoName: sourceRepo,
+        });
 
         assert.equal(result.defaultSkillsRepoName, sourceRepo);
         assert.equal(result.refreshed.length, 1);
@@ -144,6 +147,8 @@ test('refreshDefaultSkillsInPloinkyRepos installs AchillesCopilotBasicSkills int
             true,
         );
         assert.equal(fs.lstatSync(path.join(managedPath, '.claude')).isSymbolicLink(), true);
+        assert.equal(fs.readlinkSync(path.join(managedPath, '.claude')), '.agents');
+        assert.equal(fs.existsSync(path.join(sourcePath, '.agents')), false);
 
         const gitignore = fs.readFileSync(path.join(managedPath, '.gitignore'), 'utf8');
         assert.match(gitignore, /^\.claude$/m);
@@ -156,23 +161,25 @@ test('refreshDefaultSkillsInPloinkyRepos installs AchillesCopilotBasicSkills int
 });
 
 test('refreshDefaultSkillsInPloinkyRepos reports default skill install failures', () => {
-    const sourceRepo = 'AchillesCopilotBasicSkills';
+    const sourceRepo = `UnitDefaultSkillsRepoFailure-${process.pid}-${Date.now()}`;
     const managedRepo = `UnitManagedRepoFailure-${process.pid}-${Date.now()}`;
     const managedPath = path.join(REPOS_DIR, managedRepo);
     const sourcePath = path.join(REPOS_DIR, sourceRepo);
 
-    removeRepo(sourceRepo);
-    removeRepo(managedRepo);
-    fs.mkdirSync(sourcePath, { recursive: true });
-    initGitRepo(managedPath);
-
     try {
-        const result = refreshDefaultSkillsInPloinkyRepos([managedRepo]);
+        removeRepo(sourceRepo);
+        removeRepo(managedRepo);
+        fs.mkdirSync(sourcePath, { recursive: true });
+        initGitRepo(managedPath);
+
+        const result = refreshDefaultSkillsInPloinkyRepos([managedRepo], {
+            defaultSkillsRepoName: sourceRepo,
+        });
 
         assert.equal(result.refreshed.length, 0);
         assert.equal(result.failed.length, 1);
         assert.equal(result.failed[0].repoName, managedRepo);
-        assert.match(result.failed[0].message, /No skills\/ folder in repo 'AchillesCopilotBasicSkills'/);
+        assert.match(result.failed[0].message, new RegExp(`No skills/ folder in repo '${sourceRepo}'`));
     } finally {
         removeRepo(sourceRepo);
         removeRepo(managedRepo);
