@@ -51,6 +51,138 @@ function projectFileUrl(relPath) {
     return pathToFileURL(path.join(projectRoot, relPath)).href;
 }
 
+function runAggregateUpdateChild(workspaceRoot, body) {
+    const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
+    const configUrl = projectFileUrl('cli/services/config.js');
+    const commandsUrl = projectFileUrl('cli/commands/repoAgentCommands.js');
+    const runtimeRoot = path.join(workspaceRoot, '.fixtures', 'runtime-root');
+
+    execFileSync(process.execPath, ['--input-type=module', '-e', `
+        import assert from 'node:assert/strict';
+        import fs from 'node:fs';
+        import path from 'node:path';
+        import { execFileSync } from 'node:child_process';
+
+        const workspaceRoot = ${JSON.stringify(workspaceRoot)};
+        const runtimeRoot = ${JSON.stringify(runtimeRoot)};
+        process.env.PLOINKY_WORKSPACE_ROOT = workspaceRoot;
+        process.env.PLOINKY_ROOT = runtimeRoot;
+
+        function mkdir(dir) {
+            fs.mkdirSync(dir, { recursive: true });
+        }
+
+        function writeFile(filePath, content) {
+            mkdir(path.dirname(filePath));
+            fs.writeFileSync(filePath, content);
+        }
+
+        function initGitRepo(repoPath, files = { 'README.md': '# repo\\n' }) {
+            mkdir(repoPath);
+            execFileSync('git', ['init', '-q'], { cwd: repoPath, stdio: 'ignore' });
+            execFileSync('git', ['config', 'user.email', 'test@example.invalid'], { cwd: repoPath, stdio: 'ignore' });
+            execFileSync('git', ['config', 'user.name', 'Test User'], { cwd: repoPath, stdio: 'ignore' });
+            for (const [relPath, content] of Object.entries(files)) {
+                writeFile(path.join(repoPath, relPath), content);
+            }
+            execFileSync('git', ['add', '.'], { cwd: repoPath, stdio: 'ignore' });
+            execFileSync('git', ['commit', '-m', 'initial'], { cwd: repoPath, stdio: 'ignore' });
+        }
+
+        function shellQuotePath(filePath) {
+            return '"' + filePath.replace(/["\\\\$]/g, '\\\\$&') + '"';
+        }
+
+        function installGitWrapper() {
+            const realGit = String(execFileSync('which', ['git'], { encoding: 'utf8' })).trim();
+            const binDir = path.join(workspaceRoot, '.fixtures', 'bin');
+            mkdir(binDir);
+            const wrapperPath = path.join(binDir, 'git');
+            fs.writeFileSync(wrapperPath, [
+                '#!/bin/sh',
+                'case " $* " in',
+                '  *github.com/AssistOS-AI/achillesAgentLib.git*|*github.com/AssistOS-AI/MCPSDK.git*)',
+                '    for arg in "$@"; do',
+                '      if [ "$arg" = "ls-remote" ]; then',
+                '        echo "0123456789abcdef0123456789abcdef01234567\\trefs/heads/main"',
+                '        exit 0',
+                '      fi',
+                '    done',
+                '    ;;',
+                'esac',
+                'exec ' + shellQuotePath(realGit) + ' "$@"',
+                '',
+            ].join('\\n'));
+            fs.chmodSync(wrapperPath, 0o755);
+            process.env.PATH = binDir + path.delimiter + process.env.PATH;
+        }
+
+        function setupRuntimeAchilles() {
+            const sourcePath = path.join(workspaceRoot, '.fixtures', 'achilles-source');
+            const installedPath = path.join(runtimeRoot, 'node_modules', 'achillesAgentLib');
+            initGitRepo(sourcePath, { 'README.md': '# achilles\\n' });
+            mkdir(path.dirname(installedPath));
+            execFileSync('git', ['clone', '--quiet', sourcePath, installedPath], { stdio: 'ignore' });
+        }
+
+        function setupAggregateRepoFixture({ defaultSkillsHasSkills = true } = {}) {
+            const unique = process.pid + '-' + Date.now();
+            const repoName = 'UnitAggregateRepo-' + unique;
+            const providerName = 'UnitAggregateProvider-' + unique;
+            const sourceRepoPath = path.join(workspaceRoot, '.fixtures', 'source-repo');
+            const defaultSkillsSourcePath = path.join(workspaceRoot, '.fixtures', 'default-skills-source');
+            const installedRepoPath = path.join(REPOS_DIR, repoName);
+            const defaultSkillsRepoPath = path.join(REPOS_DIR, 'AchillesCopilotBasicSkills');
+
+            mkdir(REPOS_DIR);
+            initGitRepo(sourceRepoPath, { 'README.md': '# managed\\n' });
+            initGitRepo(
+                defaultSkillsSourcePath,
+                defaultSkillsHasSkills
+                    ? { 'skills/defaultSkill/SKILL.md': '# Default skill\\n' }
+                    : { 'README.md': '# default skills\\n' },
+            );
+            mkdir(path.join(REPOS_DIR, providerName, 'agent'));
+            writeFile(path.join(REPOS_DIR, providerName, 'agent', 'manifest.json'), JSON.stringify({
+                repos: { [repoName]: sourceRepoPath },
+            }, null, 2));
+            mkdir(installedRepoPath);
+            writeFile(path.join(installedRepoPath, 'stale.txt'), 'stale\\n');
+            execFileSync('git', ['clone', '--quiet', defaultSkillsSourcePath, defaultSkillsRepoPath], { stdio: 'ignore' });
+
+            return { repoName, installedRepoPath, defaultSkillsRepoPath };
+        }
+
+        function assertDefaultSkillsSummary(summary, repoName) {
+            assert.ok(summary, 'aggregate result includes defaultSkills');
+            assert.equal(summary.defaultSkillsRepoName, 'AchillesCopilotBasicSkills');
+            assert.equal(summary.total, 2);
+            assert.deepEqual(summary.refreshed.map(entry => entry.repoName), [repoName]);
+            assert.deepEqual(
+                summary.skipped.map(entry => ({ repoName: entry.repoName, reason: entry.reason })),
+                [{ repoName: 'AchillesCopilotBasicSkills', reason: 'default skills source repo' }],
+            );
+            assert.equal(summary.failed.length, 0);
+        }
+
+        installGitWrapper();
+        setupRuntimeAchilles();
+
+        const { REPOS_DIR } = await import(${JSON.stringify(configUrl)});
+        const { updatePloinkyRepos, updateAllRepos } = await import(${JSON.stringify(commandsUrl)});
+
+        ${body}
+    `], {
+        cwd: projectRoot,
+        env: {
+            ...process.env,
+            PLOINKY_WORKSPACE_ROOT: workspaceRoot,
+            PLOINKY_ROOT: runtimeRoot,
+        },
+        stdio: ['ignore', 'pipe', 'pipe'],
+    });
+}
+
 test('copySkill replaces destination so removed source files do not linger', () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-skills-'));
     try {
@@ -407,6 +539,67 @@ test('updateRepo reports default skill refresh failures after updating a managed
             },
             stdio: ['ignore', 'pipe', 'pipe'],
         });
+    } finally {
+        fs.rmSync(workspaceRoot, { recursive: true, force: true });
+    }
+});
+
+test('aggregate update commands return default skill summaries after refreshing managed repos', () => {
+    const workspaceRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-aggregate-default-skills-'));
+
+    try {
+        runAggregateUpdateChild(workspaceRoot, `
+            const fixture = setupAggregateRepoFixture();
+            const installedSkillPath = path.join(
+                fixture.installedRepoPath,
+                '.agents',
+                'skills',
+                'defaultSkill',
+                'SKILL.md',
+            );
+
+            const ploinkyResult = await updatePloinkyRepos();
+
+            assert.equal(ploinkyResult.failed.length, 0);
+            assertDefaultSkillsSummary(ploinkyResult.defaultSkills, fixture.repoName);
+            assert.equal(fs.existsSync(path.join(fixture.installedRepoPath, 'README.md')), true);
+            assert.equal(fs.existsSync(path.join(fixture.installedRepoPath, 'stale.txt')), false);
+            assert.equal(fs.existsSync(installedSkillPath), true);
+
+            const allResult = await updateAllRepos(workspaceRoot, { interactiveSession: true });
+
+            assert.equal(allResult.failed.length, 0);
+            assertDefaultSkillsSummary(allResult.defaultSkills, fixture.repoName);
+            assert.equal(fs.existsSync(installedSkillPath), true);
+        `);
+    } finally {
+        fs.rmSync(workspaceRoot, { recursive: true, force: true });
+    }
+});
+
+test('updatePloinkyRepos surfaces default skill failures in aggregate errors', () => {
+    const workspaceRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-aggregate-default-skills-failure-'));
+
+    try {
+        runAggregateUpdateChild(workspaceRoot, `
+            const fixture = setupAggregateRepoFixture({ defaultSkillsHasSkills: false });
+
+            await assert.rejects(
+                () => updatePloinkyRepos(),
+                (err) => {
+                    assert.match(
+                        err.message,
+                        new RegExp('Failed to update 1 repository\\\\(s\\\\): default skills ' + fixture.repoName),
+                    );
+                    return true;
+                },
+            );
+            assert.equal(fs.existsSync(path.join(fixture.installedRepoPath, 'README.md')), true);
+            assert.equal(
+                fs.existsSync(path.join(fixture.installedRepoPath, '.agents', 'skills', 'defaultSkill', 'SKILL.md')),
+                false,
+            );
+        `);
     } finally {
         fs.rmSync(workspaceRoot, { recursive: true, force: true });
     }
