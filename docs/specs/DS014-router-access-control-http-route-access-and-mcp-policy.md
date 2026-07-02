@@ -48,6 +48,8 @@ An HTTP route decision may come from four sources:
 
 When entries overlap, the router chooses the most restrictive access: `authenticated` over `guest` over `public`. `public` allows only `GET` and `HEAD`; write methods receive `403 PUBLIC_ROUTE_WRITE_DENIED` before proxying. `guest` accepts an existing SSO user session first; only requests without a user session mint or reuse `ploinky_guest`. `authenticated` requires a real user session and rejects guest-session JWTs.
 
+Independent of the three access classes, an enabled agent manifest may declare `routerAccess.requiredCapability` (DS003). The requirement applies after authentication succeeds, to every authenticated user session reaching that agent's routes: the session user's `capabilities` array — resolved by the SSO provider at login/refresh (DS006) — must contain the declared capability, or the router denies with `403 CAPABILITY_REQUIRED` before proxying. Agents without the field are unaffected, roles never satisfy a capability requirement, and guest/public access paths are not evaluated against it.
+
 `HttpRouteAccessPath` normalizes route paths. It requires a leading slash; strips query and fragment data; rejects NUL bytes, URL schemes, backslashes, double slashes, encoded slash or backslash bytes, dot segments, root-only paths, non-trailing wildcards, and router-owned internal paths. A trailing `/*` is a prefix match; other `*` usage is invalid. Literal and percent-encoded `__agent` segments are internal and denied at write time, policy evaluation time, the `RoutingServer` request front door, and the synthesized-upstream guard for HTTP services.
 
 ### Why Manifest Routes Are Never Persisted
@@ -120,6 +122,7 @@ Transparent agent proxying strips caller-supplied identity headers and regenerat
 | --- | --- | --- |
 | Missing session, guest on an authenticated route, or no route identity available | 401 | `AUTH_REQUIRED` |
 | Public write method | 403 | `PUBLIC_ROUTE_WRITE_DENIED` |
+| Authenticated user lacks the manifest-required capability | 403 | `CAPABILITY_REQUIRED` |
 | Unroutable request path | 404 | `UNROUTABLE_PATH` |
 | Internal route entry | 400 | `INTERNAL_ROUTE_NOT_ALLOWED` |
 | Invalid path or wildcard | 400 | `INVALID_PATH` / `INVALID_WILDCARD` |
@@ -147,6 +150,11 @@ Response: Agent manifests are the agent's source of truth and may change indepen
 
 ### Question #5: Why does an old policy-state file fail the whole document closed?
 Response: HTTP and MCP policy share one persisted security document. If validation cannot prove every entry uses the current schema, the router refuses to reason from partial data. Operators recover by deleting the file, restarting, and re-adding the intended route entries.
+
+### Question #6: Why is `requiredCapability` a single string instead of a list or expression?
+
+Response:
+Decision 2026-07-02: the first consumer (Explorer, requiring `explorer.access`) needs exactly one surface-level capability per agent, so the contract ships as one string evaluated with simple membership against the session user's capabilities. A list or boolean expression would need combination semantics (all-of vs any-of) that no current agent requires; if a future agent needs richer conditions, the field can grow without breaking single-string manifests. The gate is deliberately coarse — per-tool and per-resource authorization stays inside the agent (DS006, agent domain authorization).
 
 ## Conclusion
 
