@@ -2,14 +2,11 @@ import { execFileSync } from 'child_process';
 import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
-import { fileURLToPath } from 'url';
 
 import { PLOINKY_DIR, PLOINKY_WORKSPACE_ROOT } from './config.js';
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-const REPO_ROOT = path.resolve(__dirname, '..', '..', '..');
-const DEFAULT_CATALOG_PATH = path.join(REPO_ROOT, 'local-llm-architectures');
+const DEFAULT_CATALOG_REPO_URL = 'https://github.com/AssistOS-AI/local-llm-architectures.git';
+const DEFAULT_CATALOG_REF = 'main';
 const DEFAULT_CACHE_DIR = path.join(PLOINKY_DIR, 'llm-catalog-cache');
 const ARCH_ID_RE = /^[a-z0-9][a-z0-9._-]{0,63}$/;
 const SHA_DIGEST_RE = /^sha256:[a-f0-9]{64}$/;
@@ -393,63 +390,151 @@ function readGitRef(catalogPath) {
     return null;
 }
 
-function ensureRemoteClone(repoUrl, ref, cacheDir) {
-    if (!fs.existsSync(cacheDir)) {
-        fs.mkdirSync(cacheDir, { recursive: true });
+function validateCatalogRepoUrl(repoUrl, label = 'PLOINKY_LLM_ARCHITECTURES_REPO') {
+    if (!/^(https?:\/\/|git@|ssh:\/\/|file:\/\/)/.test(repoUrl)) {
+        throw new CatalogValidationError(`${label}: unsupported URL scheme`);
     }
-    const target = path.join(cacheDir, crypto.createHash('sha256').update(`${repoUrl}#${ref || 'default'}`).digest('hex').slice(0, 16));
-    if (!fs.existsSync(path.join(target, '.git'))) {
-        execFileSync('git', ['clone', '--quiet', '--depth', '1', repoUrl, target], { stdio: 'pipe' });
-    } else {
-        try {
-            execFileSync('git', ['-C', target, 'fetch', '--quiet', '--depth', '1', 'origin', ref || 'HEAD'], { stdio: 'pipe' });
-        } catch (_) {}
+}
+
+function catalogCacheKey(repoUrl, ref) {
+    return crypto.createHash('sha256')
+        .update(`${repoUrl}#${ref || DEFAULT_CATALOG_REF}`)
+        .digest('hex')
+        .slice(0, 16);
+}
+
+function runGit(args, label) {
+    try {
+        return execFileSync('git', args, {
+            encoding: 'utf8',
+            stdio: ['ignore', 'pipe', 'pipe'],
+        }).trim();
+    } catch (err) {
+        const stderr = err?.stderr ? String(err.stderr).trim() : '';
+        const message = stderr || err.message || 'git command failed';
+        throw new CatalogValidationError(`${label}: ${message}`, { cause: err });
     }
-    if (ref) {
-        try {
-            execFileSync('git', ['-C', target, 'checkout', '--quiet', ref], { stdio: 'pipe' });
-        } catch (err) {
-            throw new CatalogValidationError(`unable to checkout ref '${ref}' from ${repoUrl}: ${err.message}`);
+}
+
+function hasGitCheckout(target) {
+    return fs.existsSync(path.join(target, '.git'));
+}
+
+function remoteFetchFailureMessage(repoUrl, ref, cacheDir) {
+    return [
+        `Unable to fetch LLM architecture catalog from ${repoUrl}#${ref}.`,
+        `Set PLOINKY_LLM_ARCHITECTURES_PATH to use a local catalog checkout,`,
+        `or set PLOINKY_LLM_ARCHITECTURES_REPO/PLOINKY_LLM_ARCHITECTURES_REF to a reachable remote.`,
+        `Cache directory: ${cacheDir}`,
+    ].join(' ');
+}
+
+function initializeRemoteCheckout(target, repoUrl, ref) {
+    fs.mkdirSync(target, { recursive: true });
+    runGit(['-C', target, 'init', '--quiet'], `git init catalog cache`);
+    runGit(['-C', target, 'remote', 'add', 'origin', repoUrl], `git remote add catalog origin`);
+    runGit(['-C', target, 'fetch', '--quiet', '--depth', '1', 'origin', ref], `git fetch catalog ${ref}`);
+    runGit(['-C', target, 'checkout', '--quiet', 'FETCH_HEAD'], `git checkout catalog ${ref}`);
+}
+
+function updateRemoteCheckout(target, repoUrl, ref) {
+    runGit(['-C', target, 'remote', 'set-url', 'origin', repoUrl], `git remote set-url catalog origin`);
+    runGit(['-C', target, 'fetch', '--quiet', '--depth', '1', 'origin', ref], `git fetch catalog ${ref}`);
+    runGit(['-C', target, 'checkout', '--quiet', 'FETCH_HEAD'], `git checkout catalog ${ref}`);
+}
+
+function ensureRemoteCatalog({ repoUrl, ref, cacheDir, source }) {
+    validateCatalogRepoUrl(repoUrl);
+    const requestedRef = String(ref || DEFAULT_CATALOG_REF).trim() || DEFAULT_CATALOG_REF;
+    fs.mkdirSync(cacheDir, { recursive: true });
+    const target = path.join(cacheDir, catalogCacheKey(repoUrl, requestedRef));
+    const hadCache = hasGitCheckout(target);
+    const tmpTarget = `${target}.tmp-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+
+    try {
+        if (hadCache) {
+            updateRemoteCheckout(target, repoUrl, requestedRef);
+        } else {
+            fs.rmSync(tmpTarget, { recursive: true, force: true });
+            initializeRemoteCheckout(tmpTarget, repoUrl, requestedRef);
+            fs.rmSync(target, { recursive: true, force: true });
+            fs.renameSync(tmpTarget, target);
         }
+    } catch (err) {
+        fs.rmSync(tmpTarget, { recursive: true, force: true });
+        if (hadCache && hasGitCheckout(target)) {
+            return {
+                rootPath: target,
+                source,
+                repoUrl,
+                requestedRef,
+                cacheDir,
+                fetchStatus: 'cached-after-fetch-failure',
+            };
+        }
+        throw new CatalogValidationError(
+            remoteFetchFailureMessage(repoUrl, requestedRef, cacheDir),
+            { repoUrl, requestedRef, cacheDir, cause: err }
+        );
     }
-    return target;
+
+    return {
+        rootPath: target,
+        source,
+        repoUrl,
+        requestedRef,
+        cacheDir,
+        fetchStatus: 'updated',
+    };
 }
 
 function resolveCatalogRootFromEnv(env, options = {}) {
     const explicitPath = String(env.PLOINKY_LLM_ARCHITECTURES_PATH || '').trim();
     const repoUrl = String(env.PLOINKY_LLM_ARCHITECTURES_REPO || '').trim();
-    const ref = String(env.PLOINKY_LLM_ARCHITECTURES_REF || '').trim();
+    const requestedRef = String(env.PLOINKY_LLM_ARCHITECTURES_REF || '').trim()
+        || String(options.defaultRef || DEFAULT_CATALOG_REF).trim()
+        || DEFAULT_CATALOG_REF;
     const cacheDir = String(env.PLOINKY_LLM_CATALOG_CACHE_DIR || '').trim() || DEFAULT_CACHE_DIR;
 
     if (explicitPath) {
-        const resolved = path.isAbsolute(explicitPath) ? explicitPath : path.resolve(PLOINKY_WORKSPACE_ROOT, explicitPath);
-        return { rootPath: resolved, source: 'path', repoUrl: null, requestedRef: null, cacheDir };
+        const resolved = path.isAbsolute(explicitPath)
+            ? explicitPath
+            : path.resolve(PLOINKY_WORKSPACE_ROOT, explicitPath);
+        return {
+            rootPath: resolved,
+            source: 'path',
+            repoUrl: null,
+            requestedRef: null,
+            cacheDir,
+            fetchStatus: 'not-needed',
+        };
     }
+
     if (repoUrl) {
-        if (!/^(https?:\/\/|git@|ssh:\/\/|file:\/\/)/.test(repoUrl)) {
-            throw new CatalogValidationError(`PLOINKY_LLM_ARCHITECTURES_REPO: unsupported URL scheme`);
-        }
-        const localClone = ensureRemoteClone(repoUrl, ref || null, cacheDir);
-        return { rootPath: localClone, source: 'git', repoUrl, requestedRef: ref || null, cacheDir };
+        return ensureRemoteCatalog({
+            repoUrl,
+            ref: requestedRef,
+            cacheDir,
+            source: 'git',
+        });
     }
-    if (options.defaultPath && fs.existsSync(options.defaultPath)) {
-        return { rootPath: options.defaultPath, source: 'default', repoUrl: null, requestedRef: null, cacheDir };
-    }
-    return null;
+
+    const defaultRepoUrl = String(options.defaultRepoUrl || DEFAULT_CATALOG_REPO_URL).trim();
+    return ensureRemoteCatalog({
+        repoUrl: defaultRepoUrl,
+        ref: requestedRef,
+        cacheDir,
+        source: 'default-remote',
+    });
 }
 
 function loadCatalog(options = {}) {
     const env = options.env || process.env;
     const resolved = resolveCatalogRootFromEnv(env, {
-        defaultPath: options.defaultPath || DEFAULT_CATALOG_PATH,
+        defaultRepoUrl: options.defaultRepoUrl || DEFAULT_CATALOG_REPO_URL,
+        defaultRef: options.defaultRef || DEFAULT_CATALOG_REF,
     });
-    if (!resolved) {
-        throw new CatalogValidationError(
-            'No local-llm-architectures catalog found. Set PLOINKY_LLM_ARCHITECTURES_PATH, PLOINKY_LLM_ARCHITECTURES_REPO, '
-            + 'or place a catalog at the workspace default path.'
-        );
-    }
-    const { rootPath, source, repoUrl, requestedRef, cacheDir } = resolved;
+    const { rootPath, source, repoUrl, requestedRef, cacheDir, fetchStatus } = resolved;
     const resolvedRoot = path.resolve(rootPath);
     if (!fs.existsSync(resolvedRoot)) {
         throw new CatalogValidationError(`catalog path does not exist: ${resolvedRoot}`);
@@ -524,6 +609,7 @@ function loadCatalog(options = {}) {
         repoUrl,
         requestedRef,
         cacheDir,
+        fetchStatus,
         defaultFallback: catalog.defaultFallback || null,
         updatedAt: catalog.updatedAt || null,
         architectures,
@@ -534,7 +620,8 @@ function loadCatalog(options = {}) {
 export {
     CATALOG_VALIDATION_CONTRACT,
     CatalogValidationError,
-    DEFAULT_CATALOG_PATH,
+    DEFAULT_CATALOG_REF,
+    DEFAULT_CATALOG_REPO_URL,
     loadCatalog,
     resolveCatalogRootFromEnv,
     validateArchitectureRecord,

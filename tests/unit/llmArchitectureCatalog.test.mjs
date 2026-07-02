@@ -164,6 +164,40 @@ test('loadCatalog clones default remote catalog when no path or repo env is set'
     }
 });
 
+test('loadCatalog honors env ref for default remote catalog', () => {
+    const sourceRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-catalog-default-ref-src-'));
+    const cacheDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-catalog-default-ref-cache-'));
+    try {
+        initGitCatalog(sourceRoot, 'main');
+        git(['checkout', '--quiet', '-b', 'dev'], sourceRoot);
+        const catalogPath = path.join(sourceRoot, 'catalog.json');
+        const catalog = JSON.parse(fs.readFileSync(catalogPath, 'utf8'));
+        catalog.catalogId = 'test/dev-catalog';
+        fs.writeFileSync(catalogPath, JSON.stringify(catalog));
+        git(['add', 'catalog.json'], sourceRoot);
+        git(['commit', '--quiet', '-m', 'dev catalog'], sourceRoot);
+        const devCommit = git(['rev-parse', 'HEAD'], sourceRoot);
+
+        const repoUrl = fileUrl(sourceRoot);
+        const result = loadCatalog({
+            env: {
+                PLOINKY_LLM_ARCHITECTURES_REF: 'dev',
+                PLOINKY_LLM_CATALOG_CACHE_DIR: cacheDir,
+            },
+            defaultRepoUrl: repoUrl,
+            defaultRef: 'main',
+        });
+
+        assert.equal(result.source, 'default-remote');
+        assert.equal(result.requestedRef, 'dev');
+        assert.equal(result.catalogId, 'test/dev-catalog');
+        assert.equal(result.catalogRef, devCommit);
+    } finally {
+        fs.rmSync(sourceRoot, { recursive: true, force: true });
+        fs.rmSync(cacheDir, { recursive: true, force: true });
+    }
+});
+
 test('loadCatalog uses existing cached checkout when remote update fails', () => {
     const sourceRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-catalog-cache-src-'));
     const removedRoot = `${sourceRoot}.removed`;
