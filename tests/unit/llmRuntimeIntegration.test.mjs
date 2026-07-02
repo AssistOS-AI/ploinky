@@ -115,6 +115,10 @@ function fileUrl(filePath) {
     return pathToFileURL(filePath).href;
 }
 
+function credentialedFileUrl(filePath) {
+    return fileUrl(filePath).replace(/^file:\/\//, 'file://user:super-secret@');
+}
+
 function initCatalogGitRepo(catalogRoot) {
     git(['init', '--quiet', '-b', 'main'], catalogRoot);
     git(['config', 'user.email', 'runtime-integration@example.invalid'], catalogRoot);
@@ -289,6 +293,7 @@ test('prepareLlmStartup records remote catalog provenance from configured repo',
             const commit = initCatalogGitRepo(catalogRoot);
             const cacheDir = path.join(workspace, '.ploinky', 'llm-catalog-cache');
             const repoUrl = fileUrl(catalogRoot);
+            const rawRepoUrl = credentialedFileUrl(catalogRoot);
 
             const result = prepareLlmStartup({
                 runtime: 'docker',
@@ -296,7 +301,7 @@ test('prepareLlmStartup records remote catalog provenance from configured repo',
                 profileConfig: null,
                 agentName: 'baseLocal',
                 env: {
-                    PLOINKY_LLM_ARCHITECTURES_REPO: repoUrl,
+                    PLOINKY_LLM_ARCHITECTURES_REPO: rawRepoUrl,
                     PLOINKY_LLM_ARCHITECTURES_REF: 'main',
                     PLOINKY_LLM_CATALOG_CACHE_DIR: cacheDir,
                     PLOINKY_LLM_FORCE_PLATFORM: 'linux/amd64',
@@ -306,6 +311,7 @@ test('prepareLlmStartup records remote catalog provenance from configured repo',
                 effectiveNetwork: null,
             });
 
+            assert.equal(JSON.stringify(result).includes('super-secret'), false);
             assert.equal(result.selection.catalogSource, 'git');
             assert.equal(result.selection.catalogRepoUrl, repoUrl);
             assert.equal(result.selection.catalogRequestedRef, 'main');

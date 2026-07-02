@@ -1,6 +1,6 @@
 import { validatePolicyShape } from './containerRuntimePolicy.js';
 import { detectHardware } from './hardwareDetection.js';
-import { loadCatalog } from './llmArchitectureCatalog.js';
+import { loadCatalog, redactCatalogRepoUrl } from './llmArchitectureCatalog.js';
 
 const ARCH_ID_RE = /^[a-z0-9][a-z0-9._-]{0,63}$/;
 const ACCELERATOR_FAMILIES = new Set(['cpu', 'nvidia-cuda', 'amd-rocm', 'vulkan', 'intel-openvino']);
@@ -298,7 +298,7 @@ function selectArchitecture(catalog, hardware, options = {}) {
         catalogId: catalog.catalogId,
         catalogRef: catalog.catalogRef,
         catalogSource: catalog.source || null,
-        catalogRepoUrl: catalog.repoUrl || null,
+        catalogRepoUrl: redactCatalogRepoUrl(catalog.repoUrl),
         catalogRequestedRef: catalog.requestedRef || null,
         platform: chosen.platform,
         acceleratorFamily: chosen.accelerator.family,

@@ -12,6 +12,7 @@ import {
     DEFAULT_CATALOG_REF,
     DEFAULT_CATALOG_REPO_URL,
     loadCatalog,
+    redactCatalogRepoUrl,
     resolveCatalogRootFromEnv,
     validateRuntimePolicy,
     validateArchitectureRecord,
@@ -62,16 +63,50 @@ function makeValidCatalog(rootPath) {
     }));
 }
 
+function gitTestEnv() {
+    const env = { ...process.env };
+    for (const key of Object.keys(env)) {
+        if (key.startsWith('GIT_CONFIG')) {
+            delete env[key];
+        }
+    }
+    return env;
+}
+
 function git(args, cwd) {
     return execFileSync('git', args, {
         cwd,
         encoding: 'utf8',
+        env: gitTestEnv(),
         stdio: ['ignore', 'pipe', 'pipe'],
     }).trim();
 }
 
 function fileUrl(filePath) {
     return pathToFileURL(filePath).href;
+}
+
+function credentialedFileUrl(filePath) {
+    return fileUrl(filePath).replace(/^file:\/\//, 'file://user:super-secret@');
+}
+
+function withProcessEnv(overrides, fn) {
+    const previous = new Map();
+    for (const key of Object.keys(overrides)) {
+        previous.set(key, Object.hasOwn(process.env, key) ? process.env[key] : undefined);
+        process.env[key] = overrides[key];
+    }
+    try {
+        return fn();
+    } finally {
+        for (const [key, value] of previous.entries()) {
+            if (value === undefined) {
+                delete process.env[key];
+            } else {
+                process.env[key] = value;
+            }
+        }
+    }
 }
 
 function initGitCatalog(rootPath, branch = 'main') {
@@ -109,6 +144,25 @@ test('loadCatalog uses explicit path before any remote source', () => {
     }
 });
 
+test('redactCatalogRepoUrl removes URL userinfo from provenance values', () => {
+    assert.equal(
+        redactCatalogRepoUrl('https://user:super-secret@example.invalid/org/repo.git'),
+        'https://example.invalid/org/repo.git',
+    );
+    assert.equal(
+        redactCatalogRepoUrl('file://user:super-secret@/tmp/local-llm-architectures'),
+        'file:///tmp/local-llm-architectures',
+    );
+    assert.equal(
+        redactCatalogRepoUrl('ssh://git:super-secret@example.invalid/org/repo.git'),
+        'ssh://example.invalid/org/repo.git',
+    );
+    assert.equal(
+        redactCatalogRepoUrl('git@example.invalid:org/repo.git'),
+        'git@example.invalid:org/repo.git',
+    );
+});
+
 test('loadCatalog clones configured remote catalog into cache', () => {
     const sourceRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-catalog-remote-src-'));
     const cacheDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-catalog-remote-cache-'));
@@ -130,6 +184,79 @@ test('loadCatalog clones configured remote catalog into cache', () => {
         assert.equal(result.catalogId, 'test/catalog');
         assert.ok(result.catalogRoot.startsWith(path.resolve(cacheDir)));
         assert.ok(fs.existsSync(path.join(result.catalogRoot, '.git')));
+    } finally {
+        fs.rmSync(sourceRoot, { recursive: true, force: true });
+        fs.rmSync(cacheDir, { recursive: true, force: true });
+    }
+});
+
+test('loadCatalog redacts credentialed remote catalog URLs from metadata', () => {
+    const sourceRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-catalog-remote-secret-src-'));
+    const cacheDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-catalog-remote-secret-cache-'));
+    try {
+        initGitCatalog(sourceRoot, 'main');
+        const rawRepoUrl = credentialedFileUrl(sourceRoot);
+        const safeRepoUrl = fileUrl(sourceRoot);
+        const result = loadCatalog({
+            env: {
+                PLOINKY_LLM_ARCHITECTURES_REPO: rawRepoUrl,
+                PLOINKY_LLM_ARCHITECTURES_REF: 'main',
+                PLOINKY_LLM_CATALOG_CACHE_DIR: cacheDir,
+            },
+        });
+
+        assert.equal(result.source, 'git');
+        assert.equal(result.repoUrl, safeRepoUrl);
+        assert.equal(result.repoUrl.includes('super-secret'), false);
+    } finally {
+        fs.rmSync(sourceRoot, { recursive: true, force: true });
+        fs.rmSync(cacheDir, { recursive: true, force: true });
+    }
+});
+
+test('loadCatalog redacts credentialed remote catalog URLs from fetch errors', () => {
+    const cacheDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-catalog-secret-fail-cache-'));
+    try {
+        assert.throws(
+            () => loadCatalog({
+                env: {
+                    PLOINKY_LLM_ARCHITECTURES_REPO: 'file://user:super-secret@/path/that/does/not/exist',
+                    PLOINKY_LLM_ARCHITECTURES_REF: 'main',
+                    PLOINKY_LLM_CATALOG_CACHE_DIR: cacheDir,
+                },
+            }),
+            (err) => err instanceof CatalogValidationError
+                && /Unable to fetch LLM architecture catalog/.test(err.message)
+                && !err.message.includes('super-secret')
+                && !String(err.repoUrl).includes('super-secret')
+                && !String(err.fetchError).includes('super-secret'),
+        );
+    } finally {
+        fs.rmSync(cacheDir, { recursive: true, force: true });
+    }
+});
+
+test('loadCatalog file remotes ignore hostile ambient Git protocol config', () => {
+    const sourceRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-catalog-hostile-git-src-'));
+    const cacheDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-catalog-hostile-git-cache-'));
+    try {
+        const commit = initGitCatalog(sourceRoot, 'main');
+        const repoUrl = fileUrl(sourceRoot);
+        const result = withProcessEnv({
+            GIT_CONFIG_COUNT: '1',
+            GIT_CONFIG_KEY_0: 'protocol.file.allow',
+            GIT_CONFIG_VALUE_0: 'never',
+        }, () => loadCatalog({
+            env: {
+                PLOINKY_LLM_ARCHITECTURES_REPO: repoUrl,
+                PLOINKY_LLM_ARCHITECTURES_REF: 'main',
+                PLOINKY_LLM_CATALOG_CACHE_DIR: cacheDir,
+            },
+        }));
+
+        assert.equal(result.repoUrl, repoUrl);
+        assert.equal(result.catalogRef, commit);
+        assert.equal(result.catalogId, 'test/catalog');
     } finally {
         fs.rmSync(sourceRoot, { recursive: true, force: true });
         fs.rmSync(cacheDir, { recursive: true, force: true });

@@ -396,6 +396,29 @@ function validateCatalogRepoUrl(repoUrl, label = 'PLOINKY_LLM_ARCHITECTURES_REPO
     }
 }
 
+function redactCatalogRepoUrl(repoUrl) {
+    if (repoUrl === null || repoUrl === undefined) return null;
+    const value = String(repoUrl);
+    try {
+        const parsed = new URL(value);
+        if (parsed.username || parsed.password) {
+            parsed.username = '';
+            parsed.password = '';
+            return parsed.toString();
+        }
+        return value;
+    } catch (_) {
+        return value
+            .replace(/\b(https?:\/\/)[^\s/@]+(?::[^\s/@]*)?@/gi, '$1')
+            .replace(/\b(ssh:\/\/)[^\s/@]+(?::[^\s/@]*)?@/gi, '$1')
+            .replace(/\b(file:\/\/)[^\s/@]+(?::[^\s/@]*)?@/gi, '$1');
+    }
+}
+
+function redactCatalogErrorText(text) {
+    return redactCatalogRepoUrl(String(text || ''));
+}
+
 function catalogCacheKey(repoUrl, ref) {
     return crypto.createHash('sha256')
         .update(`${repoUrl}#${ref || DEFAULT_CATALOG_REF}`)
@@ -403,16 +426,27 @@ function catalogCacheKey(repoUrl, ref) {
         .slice(0, 16);
 }
 
+function gitExecutionEnv() {
+    const env = { ...process.env };
+    for (const key of Object.keys(env)) {
+        if (key.startsWith('GIT_CONFIG')) {
+            delete env[key];
+        }
+    }
+    return env;
+}
+
 function runGit(args, label) {
     try {
-        return execFileSync('git', args, {
+        return execFileSync('git', ['-c', 'protocol.file.allow=always', ...args], {
             encoding: 'utf8',
+            env: gitExecutionEnv(),
             stdio: ['ignore', 'pipe', 'pipe'],
         }).trim();
     } catch (err) {
         const stderr = err?.stderr ? String(err.stderr).trim() : '';
-        const message = stderr || err.message || 'git command failed';
-        throw new CatalogValidationError(`${label}: ${message}`, { cause: err });
+        const message = redactCatalogErrorText(stderr || err.message || 'git command failed');
+        throw new CatalogValidationError(`${label}: ${message}`);
     }
 }
 
@@ -446,6 +480,7 @@ function updateRemoteCheckout(target, repoUrl, ref) {
 function ensureRemoteCatalog({ repoUrl, ref, cacheDir, source }) {
     validateCatalogRepoUrl(repoUrl);
     const requestedRef = String(ref || DEFAULT_CATALOG_REF).trim() || DEFAULT_CATALOG_REF;
+    const safeRepoUrl = redactCatalogRepoUrl(repoUrl);
     fs.mkdirSync(cacheDir, { recursive: true });
     const target = path.join(cacheDir, catalogCacheKey(repoUrl, requestedRef));
     const hadCache = hasGitCheckout(target);
@@ -466,22 +501,27 @@ function ensureRemoteCatalog({ repoUrl, ref, cacheDir, source }) {
             return {
                 rootPath: target,
                 source,
-                repoUrl,
+                repoUrl: safeRepoUrl,
                 requestedRef,
                 cacheDir,
                 fetchStatus: 'cached-after-fetch-failure',
             };
         }
         throw new CatalogValidationError(
-            remoteFetchFailureMessage(repoUrl, requestedRef, cacheDir),
-            { repoUrl, requestedRef, cacheDir, cause: err }
+            remoteFetchFailureMessage(safeRepoUrl, requestedRef, cacheDir),
+            {
+                repoUrl: safeRepoUrl,
+                requestedRef,
+                cacheDir,
+                fetchError: redactCatalogErrorText(err.message),
+            }
         );
     }
 
     return {
         rootPath: target,
         source,
-        repoUrl,
+        repoUrl: safeRepoUrl,
         requestedRef,
         cacheDir,
         fetchStatus: 'updated',
@@ -623,6 +663,7 @@ export {
     DEFAULT_CATALOG_REF,
     DEFAULT_CATALOG_REPO_URL,
     loadCatalog,
+    redactCatalogRepoUrl,
     resolveCatalogRootFromEnv,
     validateArchitectureRecord,
     validateCatalogRoot,

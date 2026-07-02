@@ -128,7 +128,7 @@ test('selectArchitecture prefers nvidia when probes pass', () => {
     const catalog = makeCatalog({
         catalogRef: 'abc123catalogref',
         source: 'git',
-        repoUrl: 'https://example.invalid/local-llm-architectures.git',
+        repoUrl: 'https://user:super-secret@example.invalid/local-llm-architectures.git',
         requestedRef: 'main',
     });
     const hardware = {
@@ -146,6 +146,7 @@ test('selectArchitecture prefers nvidia when probes pass', () => {
     assert.equal(selected.imageSource, 'catalog');
     assert.equal(selected.catalogSource, 'git');
     assert.equal(selected.catalogRepoUrl, 'https://example.invalid/local-llm-architectures.git');
+    assert.equal(JSON.stringify(selected).includes('super-secret'), false);
     assert.equal(selected.catalogRequestedRef, 'main');
 });
 
