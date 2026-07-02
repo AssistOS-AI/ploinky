@@ -1,5 +1,7 @@
 import http from 'http';
 import { execFileSync } from 'child_process';
+import { ensureAuthenticated } from './authHandlers/authContext.js';
+import { closeSocket, createCapturingRes, proxyWsUpgrade } from './wsServiceProxy.js';
 
 const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost', '::1']);
 const ROUTER_IDENTITY_HEADERS = new Set([
@@ -116,6 +118,55 @@ function proxyProfileServer(req, res, route, agentProxyPath, extraHeaders = {}) 
     return true;
 }
 
+async function handleProfileServerUpgrade({ req, socket, head, route, agentProxyPath, parsedUrl }) {
+    if (!route?.additionalServerPort) {
+        closeSocket(socket, 404, 'Not Found');
+        return true;
+    }
+
+    const capRes = createCapturingRes();
+    const authResult = await ensureAuthenticated(req, capRes, parsedUrl);
+    if (!authResult?.ok) {
+        const setCookie = capRes.getHeader('set-cookie');
+        closeSocket(
+            socket,
+            capRes.statusCode || 401,
+            'Unauthorized',
+            setCookie ? { 'set-cookie': setCookie } : {}
+        );
+        return true;
+    }
+
+    const resolved = resolveProfileServerTarget(route);
+    if (!resolved) {
+        closeSocket(socket, 404, 'Not Found');
+        return true;
+    }
+    if (resolved.error) {
+        closeSocket(socket, 502, 'Bad Gateway');
+        return true;
+    }
+
+    const target = resolved.target;
+    const upstreamPath = buildProfileServerPath(agentProxyPath, target.toString());
+    const setCookie = capRes.getHeader('set-cookie');
+    proxyWsUpgrade({
+        socket,
+        head,
+        hostPort: target.port,
+        upstreamPath,
+        upstreamHostname: target.hostname,
+        forwardHeaders: {
+            ...stripRouterIdentityHeaders(req.headers),
+            host: target.host,
+            'x-forwarded-host': req.headers.host || '',
+            'x-forwarded-prefix': ''
+        },
+        extraResponseHeaders: setCookie ? { 'set-cookie': setCookie } : {}
+    });
+    return true;
+}
+
 function stripRouterIdentityHeaders(headers = {}) {
     const sanitized = {};
     for (const [name, value] of Object.entries(headers || {})) {
@@ -127,6 +178,7 @@ function stripRouterIdentityHeaders(headers = {}) {
 
 export {
     buildProfileServerPath,
+    handleProfileServerUpgrade,
     proxyProfileServer,
     resolveProfileServerTarget
 };

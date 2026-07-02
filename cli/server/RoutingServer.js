@@ -25,7 +25,7 @@ import {
     proxyHttpPassthrough
 } from './routerHandlers.js';
 import { collectHttpServiceRoutes, resolveHttpServiceRoute } from './httpServiceRoutes.js';
-import { proxyProfileServer } from './profileServerProxy.js';
+import { handleProfileServerUpgrade, proxyProfileServer } from './profileServerProxy.js';
 
 // Logging
 import { appendLog, logBootEvent, logMemoryUsage } from './utils/logger.js';
@@ -614,7 +614,20 @@ const server = http.createServer((req, res) => {
 
 server.on('upgrade', async (req, socket, head) => {
     try {
-        const parsedUrl = new URL(req.url, 'http://router.local');
+        const parsedUrl = new URL(req.url, `http://${req.headers.host || 'router.local'}`);
+        const apiRoutes = loadApiRoutes();
+        const profileServerHostAgentName = extractProfileServerHostAgentName(req.headers.host, apiRoutes);
+        if (profileServerHostAgentName) {
+            const handled = await handleProfileServerUpgrade({
+                req,
+                socket,
+                head,
+                route: apiRoutes[profileServerHostAgentName],
+                agentProxyPath: buildRootProxyPath(parsedUrl),
+                parsedUrl
+            });
+            if (handled) return;
+        }
         const handled = await handleHttpServiceUpgrade({ req, socket, head, parsedUrl, policy });
         if (!handled) { socket.write('HTTP/1.1 404 Not Found\r\n\r\n'); socket.destroy(); }
     } catch (_) {

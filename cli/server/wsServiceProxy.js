@@ -86,7 +86,7 @@ export async function resolveUpgradeTarget({ req, parsedUrl, policy }) {
     };
 }
 
-function buildStatusLine(statusCode, statusMessage, headers = {}) {
+export function buildStatusLine(statusCode, statusMessage, headers = {}) {
     const lines = [`HTTP/1.1 ${statusCode} ${statusMessage || ''}`.trim()];
     for (const [k, v] of Object.entries(headers)) {
         if (Array.isArray(v)) v.forEach((val) => lines.push(`${k}: ${val}`));
@@ -95,15 +95,15 @@ function buildStatusLine(statusCode, statusMessage, headers = {}) {
     return lines.join('\r\n') + '\r\n\r\n';
 }
 
-function closeSocket(socket, status, message) {
-    try { socket.write(buildStatusLine(status, message)); } catch (_) {}
+export function closeSocket(socket, status, message, headers = {}) {
+    try { socket.write(buildStatusLine(status, message, headers)); } catch (_) {}
     try { socket.destroy(); } catch (_) {}
 }
 
-function proxyWsUpgrade({ socket, head, hostPort, upstreamPath, forwardHeaders, extraResponseHeaders }) {
+export function proxyWsUpgrade({ socket, head, hostPort, upstreamPath, forwardHeaders, extraResponseHeaders, upstreamHostname = '127.0.0.1' }) {
     const proxyReq = http.request({
-        hostname: '127.0.0.1', port: hostPort, method: 'GET', path: upstreamPath,
-        headers: { ...forwardHeaders, host: `127.0.0.1:${hostPort}` },
+        hostname: upstreamHostname, port: hostPort, method: 'GET', path: upstreamPath,
+        headers: { ...forwardHeaders, host: `${upstreamHostname}:${hostPort}` },
     });
     let settled = false;
     const timer = setTimeout(() => {
