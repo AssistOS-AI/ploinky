@@ -1,13 +1,18 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { pathToFileURL } from 'node:url';
 
 import {
     CATALOG_VALIDATION_CONTRACT,
     CatalogValidationError,
+    DEFAULT_CATALOG_REF,
+    DEFAULT_CATALOG_REPO_URL,
     loadCatalog,
+    resolveCatalogRootFromEnv,
     validateRuntimePolicy,
     validateArchitectureRecord,
     validateImageRecord,
@@ -56,6 +61,190 @@ function makeValidCatalog(rootPath) {
         },
     }));
 }
+
+function git(args, cwd) {
+    return execFileSync('git', args, {
+        cwd,
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'pipe'],
+    }).trim();
+}
+
+function fileUrl(filePath) {
+    return pathToFileURL(filePath).href;
+}
+
+function initGitCatalog(rootPath, branch = 'main') {
+    makeValidCatalog(rootPath);
+    git(['init', '--quiet', '-b', branch], rootPath);
+    git(['config', 'user.email', 'catalog-tests@example.invalid'], rootPath);
+    git(['config', 'user.name', 'Catalog Tests'], rootPath);
+    git(['add', '.'], rootPath);
+    git(['commit', '--quiet', '-m', 'catalog'], rootPath);
+    return git(['rev-parse', 'HEAD'], rootPath);
+}
+
+test('loadCatalog uses explicit path before any remote source', () => {
+    const catalogRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-catalog-path-first-'));
+    const cacheDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-catalog-cache-'));
+    try {
+        makeValidCatalog(catalogRoot);
+        const result = loadCatalog({
+            env: {
+                PLOINKY_LLM_ARCHITECTURES_PATH: catalogRoot,
+                PLOINKY_LLM_ARCHITECTURES_REPO: 'file:///does/not/exist',
+                PLOINKY_LLM_ARCHITECTURES_REF: 'main',
+                PLOINKY_LLM_CATALOG_CACHE_DIR: cacheDir,
+            },
+        });
+
+        assert.equal(result.source, 'path');
+        assert.equal(result.repoUrl, null);
+        assert.equal(result.requestedRef, null);
+        assert.equal(result.catalogRoot, path.resolve(catalogRoot));
+        assert.equal(result.catalogId, 'test/catalog');
+    } finally {
+        fs.rmSync(catalogRoot, { recursive: true, force: true });
+        fs.rmSync(cacheDir, { recursive: true, force: true });
+    }
+});
+
+test('loadCatalog clones configured remote catalog into cache', () => {
+    const sourceRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-catalog-remote-src-'));
+    const cacheDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-catalog-remote-cache-'));
+    try {
+        const commit = initGitCatalog(sourceRoot, 'main');
+        const repoUrl = fileUrl(sourceRoot);
+        const result = loadCatalog({
+            env: {
+                PLOINKY_LLM_ARCHITECTURES_REPO: repoUrl,
+                PLOINKY_LLM_ARCHITECTURES_REF: 'main',
+                PLOINKY_LLM_CATALOG_CACHE_DIR: cacheDir,
+            },
+        });
+
+        assert.equal(result.source, 'git');
+        assert.equal(result.repoUrl, repoUrl);
+        assert.equal(result.requestedRef, 'main');
+        assert.equal(result.catalogRef, commit);
+        assert.equal(result.catalogId, 'test/catalog');
+        assert.ok(result.catalogRoot.startsWith(path.resolve(cacheDir)));
+        assert.ok(fs.existsSync(path.join(result.catalogRoot, '.git')));
+    } finally {
+        fs.rmSync(sourceRoot, { recursive: true, force: true });
+        fs.rmSync(cacheDir, { recursive: true, force: true });
+    }
+});
+
+test('loadCatalog clones default remote catalog when no path or repo env is set', () => {
+    const sourceRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-catalog-default-src-'));
+    const cacheDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-catalog-default-cache-'));
+    try {
+        const commit = initGitCatalog(sourceRoot, DEFAULT_CATALOG_REF);
+        const repoUrl = fileUrl(sourceRoot);
+        const result = loadCatalog({
+            env: {
+                PLOINKY_LLM_CATALOG_CACHE_DIR: cacheDir,
+            },
+            defaultRepoUrl: repoUrl,
+            defaultRef: DEFAULT_CATALOG_REF,
+        });
+
+        assert.equal(DEFAULT_CATALOG_REPO_URL, 'https://github.com/AssistOS-AI/local-llm-architectures.git');
+        assert.equal(DEFAULT_CATALOG_REF, 'main');
+        assert.equal(result.source, 'default-remote');
+        assert.equal(result.repoUrl, repoUrl);
+        assert.equal(result.requestedRef, 'main');
+        assert.equal(result.catalogRef, commit);
+        assert.equal(result.catalogId, 'test/catalog');
+        assert.ok(result.catalogRoot.startsWith(path.resolve(cacheDir)));
+    } finally {
+        fs.rmSync(sourceRoot, { recursive: true, force: true });
+        fs.rmSync(cacheDir, { recursive: true, force: true });
+    }
+});
+
+test('loadCatalog uses existing cached checkout when remote update fails', () => {
+    const sourceRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-catalog-cache-src-'));
+    const removedRoot = `${sourceRoot}.removed`;
+    const cacheDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-catalog-cache-dir-'));
+    try {
+        const commit = initGitCatalog(sourceRoot, 'main');
+        const repoUrl = fileUrl(sourceRoot);
+        const first = loadCatalog({
+            env: {
+                PLOINKY_LLM_ARCHITECTURES_REPO: repoUrl,
+                PLOINKY_LLM_ARCHITECTURES_REF: 'main',
+                PLOINKY_LLM_CATALOG_CACHE_DIR: cacheDir,
+            },
+        });
+        assert.equal(first.catalogRef, commit);
+
+        fs.renameSync(sourceRoot, removedRoot);
+
+        const second = loadCatalog({
+            env: {
+                PLOINKY_LLM_ARCHITECTURES_REPO: repoUrl,
+                PLOINKY_LLM_ARCHITECTURES_REF: 'main',
+                PLOINKY_LLM_CATALOG_CACHE_DIR: cacheDir,
+            },
+        });
+        assert.equal(second.source, 'git');
+        assert.equal(second.repoUrl, repoUrl);
+        assert.equal(second.requestedRef, 'main');
+        assert.equal(second.catalogRef, commit);
+        assert.equal(second.catalogRoot, first.catalogRoot);
+        assert.equal(second.catalogId, 'test/catalog');
+    } finally {
+        fs.rmSync(sourceRoot, { recursive: true, force: true });
+        fs.rmSync(removedRoot, { recursive: true, force: true });
+        fs.rmSync(cacheDir, { recursive: true, force: true });
+    }
+});
+
+test('loadCatalog fails clearly when remote catalog cannot be fetched and no cache exists', () => {
+    const cacheDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-catalog-empty-cache-'));
+    try {
+        assert.throws(
+            () => loadCatalog({
+                env: {
+                    PLOINKY_LLM_ARCHITECTURES_REPO: 'file:///path/that/does/not/exist',
+                    PLOINKY_LLM_ARCHITECTURES_REF: 'main',
+                    PLOINKY_LLM_CATALOG_CACHE_DIR: cacheDir,
+                },
+            }),
+            (err) => err instanceof CatalogValidationError
+                && /Unable to fetch LLM architecture catalog/.test(err.message)
+                && /PLOINKY_LLM_ARCHITECTURES_PATH/.test(err.message)
+                && /PLOINKY_LLM_ARCHITECTURES_REPO/.test(err.message),
+        );
+    } finally {
+        fs.rmSync(cacheDir, { recursive: true, force: true });
+    }
+});
+
+test('resolveCatalogRootFromEnv returns default-remote metadata for the built-in source', () => {
+    const sourceRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-catalog-resolve-src-'));
+    const cacheDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-catalog-resolve-cache-'));
+    try {
+        initGitCatalog(sourceRoot, 'main');
+        const repoUrl = fileUrl(sourceRoot);
+        const resolved = resolveCatalogRootFromEnv({
+            PLOINKY_LLM_CATALOG_CACHE_DIR: cacheDir,
+        }, {
+            defaultRepoUrl: repoUrl,
+            defaultRef: 'main',
+        });
+
+        assert.equal(resolved.source, 'default-remote');
+        assert.equal(resolved.repoUrl, repoUrl);
+        assert.equal(resolved.requestedRef, 'main');
+        assert.ok(resolved.rootPath.startsWith(path.resolve(cacheDir)));
+    } finally {
+        fs.rmSync(sourceRoot, { recursive: true, force: true });
+        fs.rmSync(cacheDir, { recursive: true, force: true });
+    }
+});
 
 test('loadCatalog accepts a valid catalog with required relationships', () => {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-catalog-valid-'));
