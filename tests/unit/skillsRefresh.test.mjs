@@ -160,6 +160,58 @@ test('refreshDefaultSkillsInPloinkyRepos installs default skills into managed re
     }
 });
 
+test('refreshDefaultSkillsInPloinkyRepos skips skills-only repos', () => {
+    const sourceRepo = `UnitDefaultSkillsSourceRepo-${process.pid}-${Date.now()}`;
+    const managedRepo = `UnitManagedRepoWithSkillsSkip-${process.pid}-${Date.now()}`;
+    const skillsRepo = `UnitSkillsOnlyRepo-${process.pid}-${Date.now()}`;
+    const managedPath = path.join(REPOS_DIR, managedRepo);
+    const skillsPath = path.join(REPOS_DIR, skillsRepo);
+    const sourcePath = path.join(REPOS_DIR, sourceRepo);
+
+    try {
+        removeRepo(sourceRepo);
+        removeRepo(managedRepo);
+        removeRepo(skillsRepo);
+        createRepo(sourceRepo, {
+            defaultSkill: {
+                'SKILL.md': '# Default skill\n',
+            },
+        });
+        createRepo(skillsRepo, {
+            catalogSkill: {
+                'SKILL.md': '# Catalog skill\n',
+            },
+        });
+        initGitRepo(managedPath);
+
+        const result = refreshDefaultSkillsInPloinkyRepos([managedRepo, skillsRepo, sourceRepo], {
+            defaultSkillsRepoName: sourceRepo,
+        });
+
+        assert.equal(result.refreshed.length, 1);
+        assert.equal(result.refreshed[0].repoName, managedRepo);
+        assert.equal(result.skipped.length, 2);
+        assert.deepEqual(
+            result.skipped.map(entry => ({ repoName: entry.repoName, reason: entry.reason })),
+            [
+                { repoName: skillsRepo, reason: 'skills-only repo' },
+                { repoName: sourceRepo, reason: 'default skills source repo' },
+            ],
+        );
+        assert.equal(result.failed.length, 0);
+        assert.equal(
+            fs.existsSync(path.join(managedPath, '.agents', 'skills', 'defaultSkill', 'SKILL.md')),
+            true,
+        );
+        assert.equal(fs.existsSync(path.join(skillsPath, '.agents')), false);
+        assert.equal(fs.existsSync(path.join(sourcePath, '.agents')), false);
+    } finally {
+        removeRepo(sourceRepo);
+        removeRepo(managedRepo);
+        removeRepo(skillsRepo);
+    }
+});
+
 test('refreshDefaultSkillsInPloinkyRepos reports default skill install failures', () => {
     const sourceRepo = `UnitDefaultSkillsRepoFailure-${process.pid}-${Date.now()}`;
     const managedRepo = `UnitManagedRepoFailure-${process.pid}-${Date.now()}`;
@@ -172,7 +224,7 @@ test('refreshDefaultSkillsInPloinkyRepos reports default skill install failures'
         fs.mkdirSync(sourcePath, { recursive: true });
         initGitRepo(managedPath);
 
-        const result = refreshDefaultSkillsInPloinkyRepos([managedRepo], {
+        const result = refreshDefaultSkillsInPloinkyRepos([` ${managedRepo} `], {
             defaultSkillsRepoName: sourceRepo,
         });
 

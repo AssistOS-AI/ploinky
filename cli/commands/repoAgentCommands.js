@@ -43,10 +43,11 @@ function refreshDefaultSkillsInPloinkyRepo(repoName, {
     defaultSkillsRepoName = DEFAULT_SKILLS_REPO_NAME,
 } = {}) {
     const normalizedRepoName = String(repoName || '').trim();
+    const normalizedDefaultSkillsRepoName = String(defaultSkillsRepoName || '').trim();
     if (!normalizedRepoName) {
         return { repoName: normalizedRepoName, skipped: true, reason: 'missing repo name' };
     }
-    if (normalizedRepoName === defaultSkillsRepoName) {
+    if (normalizedRepoName === normalizedDefaultSkillsRepoName) {
         return { repoName: normalizedRepoName, skipped: true, reason: 'default skills source repo' };
     }
 
@@ -54,8 +55,11 @@ function refreshDefaultSkillsInPloinkyRepo(repoName, {
     if (!fs.existsSync(repoPath) || !fs.statSync(repoPath).isDirectory()) {
         return { repoName: normalizedRepoName, skipped: true, reason: 'repo path missing' };
     }
+    if (reposSvc.classifyRepoKind(normalizedRepoName) === 'skills') {
+        return { repoName: normalizedRepoName, skipped: true, reason: 'skills-only repo' };
+    }
 
-    const result = skillsSvc.installDefaultSkills(defaultSkillsRepoName, {
+    const result = skillsSvc.installDefaultSkills(normalizedDefaultSkillsRepoName, {
         targetRoot: repoPath,
     });
 
@@ -72,13 +76,17 @@ function refreshDefaultSkillsInPloinkyRepo(repoName, {
 function refreshDefaultSkillsInPloinkyRepos(repoNames = getGitRepoNames(), {
     defaultSkillsRepoName = DEFAULT_SKILLS_REPO_NAME,
 } = {}) {
+    const normalizedDefaultSkillsRepoName = String(defaultSkillsRepoName || '').trim();
     const refreshed = [];
     const skipped = [];
     const failed = [];
 
     for (const repoName of repoNames) {
+        const normalizedRepoName = String(repoName || '').trim();
         try {
-            const result = refreshDefaultSkillsInPloinkyRepo(repoName, { defaultSkillsRepoName });
+            const result = refreshDefaultSkillsInPloinkyRepo(normalizedRepoName, {
+                defaultSkillsRepoName: normalizedDefaultSkillsRepoName,
+            });
             if (result.refreshed) {
                 refreshed.push(result);
             } else {
@@ -86,14 +94,14 @@ function refreshDefaultSkillsInPloinkyRepos(repoNames = getGitRepoNames(), {
             }
         } catch (err) {
             failed.push({
-                repoName,
+                repoName: normalizedRepoName,
                 message: err?.message || String(err),
             });
         }
     }
 
     return {
-        defaultSkillsRepoName,
+        defaultSkillsRepoName: normalizedDefaultSkillsRepoName,
         total: repoNames.length,
         refreshed,
         skipped,
