@@ -53,7 +53,7 @@ You can use Ploinky in two ways:
 ## Core commands (in p-cli)
 
 - `enable agent <name> [as <alias>]`: register an agent in `.ploinky/agents.json` (creates a minimal manifest if missing). Use `as <alias>` to spin up additional instances with unique container names.
-- `update [folderPath]`: update the Ploinky checkout, refresh `node_modules/achillesAgentLib`, update managed repos, and refresh discovered project repositories and default skills.
+- `update [folderPath]`: update the Ploinky checkout, refresh `node_modules/achillesAgentLib`, update managed repos, refresh `AchillesCopilotBasicSkills` in eligible managed repos, and refresh discovered project repositories and default skills.
 - `start <staticAgent> <port>`: first run requires a static agent and port; subsequent runs can just use `start`.
   - Ensures all enabled agents are running and launches the Router on `<port>`.
   - Serves static files from the repository of `<staticAgent>`; non `/<agent>/...` paths are static.

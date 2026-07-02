@@ -65,9 +65,9 @@ The command surface is split between the registry in `cli/services/commandRegist
 | `help` | Prints generated help from `cli/services/help.js`. |
 | `install [repo] <url> [name] [branch]` / `add [repo] <url> [name] [branch]` | Clones a repo under `.ploinky/repos/<name>`, deriving the name from the URL when omitted, and stores source metadata. |
 | `uninstall [repo] <name-or-url>` / `remove [repo] <name-or-url>` | Disables enabled agents from that repo by container key, removes their runtime containers, removes `.ploinky/repos/<name>`, and preserves source metadata for reinstall. |
-| `update repo <name>` | Updates one installed repo with `git pull --rebase --autostash` or reclones a non-git repo when source metadata exists. |
-| `update repos` | Updates installed Ploinky repos and refreshes runtime Achilles dependencies. |
-| `update all [folder]` | Updates the Ploinky runtime, installed repos, discovered workspace git repos, and default skills for discovered repos. |
+| `update repo <name>` | Updates one installed repo with `git pull --rebase --autostash` or reclones a non-git repo when source metadata exists, then refreshes `AchillesCopilotBasicSkills` there when eligible. |
+| `update repos` | Updates installed Ploinky repos, refreshes runtime Achilles dependencies, and refreshes `AchillesCopilotBasicSkills` in eligible managed repos. |
+| `update all [folder]` | Updates the Ploinky runtime, installed repos, managed-repo default skills, discovered workspace git repos, and default skills for discovered repos. |
 | `reinstall [agent]` / `reinstall agent <agent>` | Removes the running service for an enabled agent, recreates it with `ensureAgentService`, updates routing, and starts the router if needed. |
 | `enable agent <agent> [global|devel <repo>]` | Resolves an agent manifest, writes an enabled-agent record to `.ploinky/agents.json`, and creates work dirs/symlinks. |
 | `enable sandbox` | Allows host sandbox runtimes for manifests with `lite-sandbox: true`. |
