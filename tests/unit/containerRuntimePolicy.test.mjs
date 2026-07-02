@@ -38,6 +38,14 @@ test('validatePolicyShape rejects manifest volume fields inside runtime policy',
 });
 
 test('validatePolicyShape rejects arbitrary host devices', () => {
+    for (const hostPath of ['/dev/kfd', '/dev/dri', '/dev/dri/renderD128', '/dev/accel', '/dev/accel/accel0']) {
+        assert.doesNotThrow(
+            () => validatePolicyShape({
+                devices: [{ type: 'hostDevice', hostPath }],
+            }, 'policy'),
+            `${hostPath} should be accepted`,
+        );
+    }
     assert.throws(
         () => validatePolicyShape({
             devices: [{ type: 'hostDevice', hostPath: '/etc/passwd' }],
@@ -50,6 +58,15 @@ test('validatePolicyShape rejects arbitrary host devices', () => {
         }, 'policy'),
         /not in the allowlist/,
     );
+    for (const hostPath of ['/dev/dri/../sda', '/dev/accel/../../sda', '/dev/dri/./renderD128', '/dev/kfd/child']) {
+        assert.throws(
+            () => validatePolicyShape({
+                devices: [{ type: 'hostDevice', hostPath }],
+            }, 'policy'),
+            /not in the allowlist|invalid host device path|traversal/,
+            `${hostPath} should be rejected`,
+        );
+    }
 });
 
 test('validatePolicyShape accepts allowlisted CDI devices', () => {
@@ -104,6 +121,19 @@ test('emitRunArgs emits --device entries for ROCm host devices and label=disable
     assert.ok(args.includes('/dev/dri'));
     assert.ok(args.includes('label=disable'));
     assert.ok(args.includes('host'));
+});
+
+test('emitRunArgs emits seccomp=unconfined for ROCm policies', () => {
+    const policy = validatePolicyShape({
+        devices: [
+            { type: 'hostDevice', hostPath: '/dev/kfd' },
+            { type: 'hostDevice', hostPath: '/dev/dri' },
+        ],
+        securityOpt: ['seccomp=unconfined'],
+    }, 'policy', { runtime: 'podman' });
+    const args = emitRunArgs(policy, { runtime: 'podman' });
+    assert.ok(args.includes('--security-opt'));
+    assert.ok(args.includes('seccomp=unconfined'));
 });
 
 test('emitRunArgs emits memlock ulimit and shm-size for GPU policies', () => {

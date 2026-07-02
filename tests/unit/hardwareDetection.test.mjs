@@ -1,12 +1,14 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import {
+import * as hardwareDetection from '../../cli/services/hardwareDetection.js';
+
+const {
     detectHardware,
     normalizeArch,
     normalizePlatform,
     summarizeAcceleratorFamilies,
-} from '../../cli/services/hardwareDetection.js';
+} = hardwareDetection;
 
 test('normalizeArch maps Node and uname variants to amd64/arm64', () => {
     assert.equal(normalizeArch('x64'), 'amd64');
@@ -45,6 +47,45 @@ test('summarizeAcceleratorFamilies always includes cpu and adds confirmed gpu fa
         intelPci: { ok: true, stdoutSnippet: '00:02.0 VGA compatible controller [0300]: Intel Corporation [8086:1234]' },
     });
     assert.deepEqual(both.sort(), ['amd-rocm', 'cpu', 'intel-openvino', 'vulkan'].sort());
+});
+
+test('parseNvidiaComputeCapability returns the highest valid compute capability', () => {
+    assert.equal(typeof hardwareDetection.parseNvidiaComputeCapability, 'function');
+    assert.equal(hardwareDetection.parseNvidiaComputeCapability('12.1\n8.9\n'), '12.1');
+    assert.equal(hardwareDetection.parseNvidiaComputeCapability('8.9\n12.2\n12.1\n'), '12.2');
+    assert.equal(hardwareDetection.parseNvidiaComputeCapability('not available\n'), null);
+});
+
+test('detectHardware populates NVIDIA compute capability when query probe succeeds', () => {
+    const hardware = detectHardware({
+        runtime: 'docker',
+        arch: 'arm64',
+        probes: {
+            nvidiaSmi: { kind: 'command', command: 'true' },
+            nvidiaComputeCapability: { kind: 'command', command: 'printf', args: ['12.1\n8.9\n'] },
+        },
+        dockerInspect: () => ({ platform: 'linux/arm64', arch: 'arm64', rawArch: 'aarch64', rawOsType: 'linux' }),
+    });
+    assert.deepEqual(hardware.acceleratorFamilies, ['cpu', 'nvidia-cuda']);
+    assert.deepEqual(hardware.acceleratorDetails, {
+        'nvidia-cuda': { computeCapability: '12.1' },
+    });
+});
+
+test('detectHardware parses NVIDIA compute capability from full probe output', () => {
+    const hardware = detectHardware({
+        runtime: 'docker',
+        arch: 'arm64',
+        probes: {
+            nvidiaSmi: { kind: 'command', command: 'true' },
+            nvidiaComputeCapability: { kind: 'command', command: 'printf', args: ['8.0\n8.0\n8.0\n12.1\n'] },
+        },
+        dockerInspect: () => ({ platform: 'linux/arm64', arch: 'arm64', rawArch: 'aarch64', rawOsType: 'linux' }),
+    });
+    assert.equal(hardware.probes.nvidiaComputeCapability.stdoutSnippet, '8.0\n8.0\n8.0');
+    assert.deepEqual(hardware.acceleratorDetails, {
+        'nvidia-cuda': { computeCapability: '12.1' },
+    });
 });
 
 test('detectHardware uses injected daemon inspector for docker', () => {

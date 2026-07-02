@@ -328,6 +328,19 @@ function sleepMs(ms) {
 
 function parseManifestPorts(manifest, profileConfig = null) {
     // Open ports must be defined in profile configuration.
+    if (manifest?.profiles && typeof manifest.profiles === 'object' && !Array.isArray(manifest.profiles)) {
+        for (const [profileName, profile] of Object.entries(manifest.profiles)) {
+            if (profile && typeof profile === 'object' && Object.prototype.hasOwnProperty.call(profile, 'ports')) {
+                throw new Error(`manifest.profiles.${profileName}.ports has been renamed to 'openPorts'`);
+            }
+        }
+    }
+    if (profileConfig && Object.prototype.hasOwnProperty.call(profileConfig, 'ports')) {
+        throw new Error("profile.ports has been renamed to 'openPorts'");
+    }
+    if (manifest && Object.prototype.hasOwnProperty.call(manifest, 'ports')) {
+        throw new Error("manifest.ports has been renamed to profile field 'openPorts'");
+    }
     const ports = profileConfig?.openPorts;
     if (!ports) return { publishArgs: [], portMappings: [] };
 

@@ -1,5 +1,7 @@
 import { execSync, spawnSync } from 'child_process';
+import crypto from 'crypto';
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import {
@@ -7,6 +9,7 @@ import {
     buildEnvFlags,
     formatEnvFlag,
     getExposedNames,
+    getManifestEnvSpecs,
     getManifestEnvNames,
     resolveManifestImage,
     resolveVarValue
@@ -47,7 +50,10 @@ import { ensureSharedHostDir, runPostinstallHook } from './agentHooks.js';
 import { ensureBwrapService } from '../bwrap/bwrapServiceManager.js';
 import { ensureSeatbeltService } from '../seatbelt/seatbeltServiceManager.js';
 import { detectShellForImage, SHELL_FALLBACK_DIRECT } from './shellDetection.js';
-import { detectRuntimeKeyForAgent } from '../dependencyRuntimeKey.js';
+import {
+    detectContainerRuntimeKey,
+    detectRuntimeKeyForAgent,
+} from '../dependencyRuntimeKey.js';
 import { nodeModulesDir, prepareAgentCache } from '../dependencyCache.js';
 import {
     runPreContainerLifecycle,
@@ -92,20 +98,54 @@ import {
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const AGENT_LIB_PATH = path.resolve(__dirname, '../../../Agent');
-const LLM_RUNTIME_SHARED_PATH = path.join(PLOINKY_WORKSPACE_ROOT, 'llm-runtime', 'shared');
-function resolveLlmRuntimeSharedPath(agentPath) {
-    // Prefer the shared runtime that ships inside the agent's own repo so
-    // clone-based deploys (llm-runtime under .ploinky/repos) mount the real
-    // runtime-agent; fall back to the workspace-root sibling (dev layout).
-    try {
-        const repoShared = path.join(path.dirname(agentPath), 'shared');
-        if (fs.existsSync(path.join(repoShared, 'runtime-agent'))) return repoShared;
-    } catch (_) { /* fall through to dev-layout default */ }
-    return LLM_RUNTIME_SHARED_PATH;
-}
 const AGENT_PRIVATE_KEY_CONTAINER_PATH = '/run/ploinky-agent.key';
 const PODMAN_STAGED_NODE_OPTIONS = ['--preserve-symlinks', '--preserve-symlinks-main'];
 const PODMAN_RUNTIME_ROOT = path.join(PLOINKY_DIR, 'container-runtime');
+const LLM_RUNTIME_MCP_PORT = 9000;
+const LLM_RUNTIME_INFERENCE_PORT = 8080;
+const LLM_MODEL_SECRET_FILE_ENV = 'PLOINKY_MODEL_SECRET_FILE';
+const LLM_MODEL_SECRET_CONTAINER_PATH = '/run/secrets/hf_token';
+const LLM_RUNTIME_BASE_ENV_NAMES = Object.freeze([
+    'HF_HOME',
+    'PLOINKY_MODELS_DIR',
+    'PLOINKY_DERIVED_DIR',
+    'PLOINKY_RUNTIME_DIR',
+    'PLOINKY_LAUNCHERS_DIR',
+    'PLOINKY_MCP_PORT',
+    'PLOINKY_INFERENCE_PORT',
+]);
+const LLM_RUNTIME_AUTH_ENV_NAMES = Object.freeze([
+    'PLOINKY_INVOCATION_AUTH_MODULE',
+    'PLOINKY_REQUEST_HASH_MODULE',
+]);
+const LLM_RUNTIME_MANAGED_ENV_NAMES = Object.freeze([
+    ...LLM_RUNTIME_BASE_ENV_NAMES,
+    ...LLM_RUNTIME_AUTH_ENV_NAMES,
+    LLM_MODEL_SECRET_FILE_ENV,
+]);
+const RETIRED_LLM_RUNTIME_ENV_NAMES = new Set([
+    'PLOINKY_LLM_PUBLIC_PORT',
+    'PLOINKY_LLM_MCP_PORT',
+    'PLOINKY_LLM_CONTROL_PORT',
+    'PLOINKY_LLM_LAUNCHERS_DIR',
+]);
+const LLM_SECRET_ONLY_ENV_NAMES = new Set(['HF_TOKEN']);
+const LLM_RESERVED_MOUNT_TARGETS = ['/workspace', '/models', '/runtime'];
+
+function formattedEnvFlagName(flag) {
+    const match = /^-e ([A-Za-z_][A-Za-z0-9_]*)=/.exec(String(flag || ''));
+    return match ? match[1] : '';
+}
+
+function stripManagedEnvFlags(envStrings, envNames) {
+    const blocked = new Set(envNames.filter(Boolean));
+    for (let i = envStrings.length - 1; i >= 0; i -= 1) {
+        const name = formattedEnvFlagName(envStrings[i]);
+        if (name && blocked.has(name)) {
+            envStrings.splice(i, 1);
+        }
+    }
+}
 
 function pathTypeForSymlink(sourcePath) {
     try {
@@ -224,6 +264,66 @@ function podmanMountSuffix(readOnly) {
     // Podman remote on macOS has parsed absolute self-mounts incorrectly with
     // ':ro,z', creating paths that end in 'o,z'. ':z,ro' preserves the target.
     return readOnly ? ':z,ro' : ':z';
+}
+
+function privateTempFilePath(filePath) {
+    const dir = path.dirname(filePath);
+    const base = path.basename(filePath);
+    const nonce = `${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    return path.join(dir, `.${base}.tmp-${nonce}`);
+}
+
+function ensurePrivateDirectory(dir) {
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    try { fs.chmodSync(dir, 0o700); } catch (_) {}
+    return dir;
+}
+
+function writePrivateFile(filePath, value) {
+    ensurePrivateDirectory(path.dirname(filePath));
+    const tmpPath = privateTempFilePath(filePath);
+    let fd = null;
+    let cleanupTmp = false;
+    try {
+        fd = fs.openSync(tmpPath, 'wx', 0o600);
+        cleanupTmp = true;
+        fs.writeFileSync(fd, value, { encoding: 'utf8' });
+        fs.closeSync(fd);
+        fd = null;
+        fs.renameSync(tmpPath, filePath);
+        cleanupTmp = false;
+        try { fs.chmodSync(filePath, 0o600); } catch (_) {}
+    } finally {
+        if (fd !== null) {
+            try { fs.closeSync(fd); } catch (_) {}
+        }
+        if (cleanupTmp) {
+            try { fs.unlinkSync(tmpPath); } catch (_) {}
+        }
+    }
+    return filePath;
+}
+
+function llmModelSecretHostPath(identity) {
+    const workspaceHash = crypto
+        .createHash('sha256')
+        .update(PLOINKY_WORKSPACE_ROOT)
+        .digest('hex')
+        .slice(0, 16);
+    const safeIdentity = String(identity || 'agent').replace(/[^A-Za-z0-9._-]/g, '_') || 'agent';
+    return path.join(os.tmpdir(), 'ploinky-llm-runtime-secrets', workspaceHash, safeIdentity, 'hf_token');
+}
+
+function prepareLlmModelSecretMount(llmStartup, profileSecrets) {
+    if (!llmStartup?.enabled || !llmStartup.stateDir) return null;
+    if (!Object.prototype.hasOwnProperty.call(profileSecrets || {}, 'HF_TOKEN')) return null;
+    const hostPath = llmModelSecretHostPath(llmStartup.identity);
+    writePrivateFile(hostPath, String(profileSecrets.HF_TOKEN ?? ''));
+    return {
+        source: hostPath,
+        target: LLM_MODEL_SECRET_CONTAINER_PATH,
+        ro: true,
+    };
 }
 
 function ensurePodmanStagedAgentLibDir(agentName, nodeModulesDir, options = {}) {
@@ -434,6 +534,193 @@ function ensureNamedRuntimeNetwork(runtime, networkName) {
     }
 }
 
+function resolveEffectiveManifestNetwork(manifest, profileConfig) {
+    const profileNetwork = profileConfig?.network && typeof profileConfig.network === 'object' ? profileConfig.network : null;
+    const rootNetwork = manifest?.network && typeof manifest.network === 'object' ? manifest.network : null;
+    return profileNetwork || rootNetwork;
+}
+
+function assertLlmRuntimeNetworkAllowed(agentName, manifestNetwork) {
+    const mode = String(manifestNetwork?.mode || '').trim().toLowerCase();
+    const name = String(manifestNetwork?.name || '').trim().toLowerCase();
+    if (mode === 'host' || mode === 'container' || mode.startsWith('container:') || mode.startsWith('service:')) {
+        throw new Error(
+            `[llm-runtime] ${agentName}: network.mode '${mode}' is not supported for LLM runtime containers; `
+            + 'runtime ports must be published as 127.0.0.1:<host>:9000 and 127.0.0.1:<host>:8080.'
+        );
+    }
+    if (name === 'host' || name.startsWith('container:') || name.startsWith('service:')) {
+        throw new Error(
+            `[llm-runtime] ${agentName}: network.name '${name}' is not supported for LLM runtime containers; `
+            + 'runtime ports must be published as 127.0.0.1:<host>:9000 and 127.0.0.1:<host>:8080.'
+        );
+    }
+}
+
+function hasManifestEntrypoint(manifest) {
+    if (!manifest || !Object.prototype.hasOwnProperty.call(manifest, 'entrypoint')) return false;
+    const value = manifest.entrypoint;
+    if (value === undefined || value === null) return false;
+    if (typeof value === 'string') return value.trim() !== '';
+    if (Array.isArray(value)) return value.length > 0;
+    return true;
+}
+
+function assertLlmRuntimeEntrypointAllowed(agentName, { startCmd, explicitAgentCmd, manifestEntrypoint } = {}) {
+    if (startCmd || explicitAgentCmd || manifestEntrypoint) {
+        const fields = [];
+        if (startCmd) fields.push('start');
+        if (explicitAgentCmd) fields.push('agent/commands.run');
+        if (manifestEntrypoint) fields.push('entrypoint');
+        throw new Error(
+            `[llm-runtime] ${agentName}: explicit startup command fields are not supported for LLM runtime manifests`
+            + `${fields.length ? ` (${fields.join(', ')})` : ''}; `
+            + 'remove manifest start, agent, commands.run, and entrypoint so the image ENTRYPOINT runs.'
+        );
+    }
+}
+
+function collectProfileEnvNames(profileConfig) {
+    if (!profileConfig?.env || typeof profileConfig.env !== 'object' || Array.isArray(profileConfig.env)) {
+        return [];
+    }
+    return Object.keys(profileConfig.env);
+}
+
+function collectProfileSecretNames(profileConfig) {
+    if (!Array.isArray(profileConfig?.secrets)) {
+        return [];
+    }
+    return profileConfig.secrets.map((name) => String(name || '').trim()).filter(Boolean);
+}
+
+function collectRuntimeResourceEnvNames(manifest) {
+    const env = manifest?.runtime?.resources?.env;
+    if (!env || typeof env !== 'object' || Array.isArray(env)) {
+        return [];
+    }
+    return Object.keys(env);
+}
+
+function collectRuntimeResourceEnvTemplateRefs(manifest) {
+    const env = manifest?.runtime?.resources?.env;
+    if (!env || typeof env !== 'object' || Array.isArray(env)) {
+        return [];
+    }
+    const refs = [];
+    for (const rawValue of Object.values(env)) {
+        if (typeof rawValue !== 'string') continue;
+        rawValue.replace(/\{\{([^}]+)\}\}/g, (_match, exprRaw) => {
+            const expr = String(exprRaw || '').trim();
+            const separatorIndex = expr.indexOf(':');
+            if (separatorIndex < 0) return '';
+            const referencedName = expr.slice(separatorIndex + 1).trim();
+            if (referencedName) refs.push(referencedName);
+            return '';
+        });
+    }
+    return refs;
+}
+
+function collectDollarEnvRef(value) {
+    if (typeof value !== 'string') return '';
+    const trimmed = value.trim();
+    if (!trimmed.startsWith('$')) return '';
+    return trimmed.slice(1).trim();
+}
+
+function collectManifestExposeSourceRefs(manifest) {
+    const exp = manifest?.expose;
+    const refs = [];
+    if (Array.isArray(exp)) {
+        for (const spec of exp) {
+            if (!spec || typeof spec !== 'object') continue;
+            if (spec.ref) refs.push(String(spec.ref).trim());
+            const valueRef = collectDollarEnvRef(spec.value);
+            if (valueRef) refs.push(valueRef);
+        }
+    } else if (exp && typeof exp === 'object') {
+        for (const value of Object.values(exp)) {
+            const valueRef = collectDollarEnvRef(value);
+            if (valueRef) refs.push(valueRef);
+        }
+    }
+    return refs.filter(Boolean);
+}
+
+function collectPlainLlmEnvRefs(manifest, profileConfig) {
+    const refs = new Set([
+        ...getExposedNames(manifest, profileConfig),
+        ...collectManifestExposeSourceRefs(manifest),
+        ...collectProfileEnvNames(profileConfig),
+        ...collectRuntimeResourceEnvNames(manifest),
+        ...collectRuntimeResourceEnvTemplateRefs(manifest),
+    ]);
+    for (const spec of getManifestEnvSpecs(manifest, profileConfig)) {
+        if (spec?.insideName) refs.add(spec.insideName);
+        if (spec?.sourceName) refs.add(spec.sourceName);
+    }
+    return refs;
+}
+
+function assertNoRetiredLlmRuntimeEnv(agentName, manifest, profileConfig) {
+    const envNames = new Set([
+        ...collectPlainLlmEnvRefs(manifest, profileConfig),
+        ...collectProfileSecretNames(profileConfig),
+    ]);
+    const retiredNames = Array.from(envNames)
+        .map((name) => String(name || '').trim())
+        .filter((name) => RETIRED_LLM_RUNTIME_ENV_NAMES.has(name))
+        .sort();
+    if (!retiredNames.length) return;
+    throw new Error(
+        `[llm-runtime] ${agentName}: retired LLM runtime env names are not supported: ${retiredNames.join(', ')}. `
+        + 'Use the clean runtime contract env names owned by Ploinky.'
+    );
+}
+
+function assertNoPlainLlmSecretEnv(agentName, manifest, profileConfig) {
+    const secretOnlyNames = Array.from(collectPlainLlmEnvRefs(manifest, profileConfig))
+        .map((name) => String(name || '').trim())
+        .filter((name) => LLM_SECRET_ONLY_ENV_NAMES.has(name))
+        .sort();
+    if (!secretOnlyNames.length) return;
+    throw new Error(
+        `[llm-runtime] ${agentName}: ${secretOnlyNames.join(', ')} must be supplied as secret env `
+        + 'through profile secrets, not manifest/profile/runtime resource env or env source templates.'
+    );
+}
+
+function normalizeContainerMountTarget(containerPath) {
+    const normalized = String(containerPath || '')
+        .trim()
+        .replace(/\\/g, '/')
+        .replace(/\/+/g, '/');
+    if (!normalized || normalized === '/') return normalized;
+    return normalized.replace(/\/+$/, '');
+}
+
+function reservedLlmMountForTarget(containerPath) {
+    const target = normalizeContainerMountTarget(containerPath);
+    return LLM_RESERVED_MOUNT_TARGETS.find((reservedTarget) => (
+        target === reservedTarget || target.startsWith(`${reservedTarget}/`)
+    )) || '';
+}
+
+function assertNoLlmReservedVolumeTargets(agentName, manifest) {
+    if (!manifest?.volumes || typeof manifest.volumes !== 'object' || Array.isArray(manifest.volumes)) {
+        return;
+    }
+    for (const containerPath of Object.values(manifest.volumes)) {
+        const reservedTarget = reservedLlmMountForTarget(containerPath);
+        if (!reservedTarget) continue;
+        throw new Error(
+            `[llm-runtime] ${agentName}: manifest volume target '${containerPath}' conflicts with reserved `
+            + `LLM runtime mount '${reservedTarget}'.`
+        );
+    }
+}
+
 function normalizeProfileEnv(env) {
     if (!env || typeof env !== 'object' || Array.isArray(env)) {
         return {};
@@ -451,14 +738,108 @@ function normalizeProfileEnv(env) {
     return normalized;
 }
 
-function appendEnvFlagsFromMap(envFlags, envMap) {
+function appendEnvFlagsFromMap(envFlags, envMap, options = {}) {
     if (!envMap || typeof envMap !== 'object' || Array.isArray(envMap)) {
         return;
     }
+    const skipNames = options.skipNames instanceof Set ? options.skipNames : new Set();
     for (const [name, value] of Object.entries(envMap)) {
         if (!name) continue;
+        if (skipNames.has(String(name))) continue;
         envFlags.push(formatEnvFlag(String(name), value ?? ''));
     }
+}
+
+function assertNoLlmReservedRuntimeResourceTargets(agentName, manifest) {
+    const persistentStorage = manifest?.runtime?.resources?.persistentStorage;
+    if (!persistentStorage || typeof persistentStorage !== 'object' || Array.isArray(persistentStorage)) {
+        return;
+    }
+    const containerPath = persistentStorage.containerPath;
+    const reservedTarget = reservedLlmMountForTarget(containerPath);
+    if (!reservedTarget) return;
+    throw new Error(
+        `[llm-runtime] ${agentName}: runtime resource persistent storage containerPath '${containerPath}' conflicts `
+        + `with reserved LLM runtime mount '${reservedTarget}'.`
+    );
+}
+
+function hasContainerPortMapping(mappings, containerPort) {
+    return Array.isArray(mappings)
+        && mappings.some((mapping) => Number(mapping?.containerPort) === Number(containerPort));
+}
+
+function isLlmRuntimeContainerPort(containerPort) {
+    const parsed = Number(containerPort);
+    return parsed === LLM_RUNTIME_MCP_PORT || parsed === LLM_RUNTIME_INFERENCE_PORT;
+}
+
+function publishArgContainerPortSpec(publishArg) {
+    const parts = String(publishArg || '').trim().split(':');
+    return parts[parts.length - 1] || '';
+}
+
+function portSpecIncludesContainerPort(portSpec, containerPort) {
+    const raw = String(portSpec || '').split('/')[0].trim();
+    const match = raw.match(/^(\d+)(?:-(\d+))?$/);
+    if (!match) return false;
+    const start = Number.parseInt(match[1], 10);
+    const end = match[2] ? Number.parseInt(match[2], 10) : start;
+    return Number.isInteger(start)
+        && Number.isInteger(end)
+        && start > 0
+        && end >= start
+        && Number(containerPort) >= start
+        && Number(containerPort) <= end;
+}
+
+function publishArgTargetsLlmRuntimePort(publishArg) {
+    const containerSpec = publishArgContainerPortSpec(publishArg);
+    return portSpecIncludesContainerPort(containerSpec, LLM_RUNTIME_MCP_PORT)
+        || portSpecIncludesContainerPort(containerSpec, LLM_RUNTIME_INFERENCE_PORT);
+}
+
+function formatPublishArgFromMapping(mapping) {
+    const hostPort = Number(mapping?.hostPort);
+    const hostPortSpec = Number.isFinite(hostPort) && hostPort > 0 ? String(hostPort) : '';
+    const containerPort = Number(mapping?.containerPort);
+    const protocol = String(mapping?.protocol || 'tcp').toLowerCase();
+    const protocolSuffix = protocol && protocol !== 'tcp' ? `/${protocol}` : '';
+    return `127.0.0.1:${hostPortSpec}:${containerPort}${protocolSuffix}`;
+}
+
+function ensureLlmRuntimeLoopbackPublish(publishArgs, portMappings) {
+    const nextPublishArgs = Array.isArray(publishArgs)
+        ? publishArgs.filter((arg) => !publishArgTargetsLlmRuntimePort(arg))
+        : [];
+    const nextPortMappings = [];
+    const llmMappings = new Map();
+    for (const mapping of Array.isArray(portMappings) ? portMappings : []) {
+        const containerPort = Number(mapping?.containerPort);
+        if (!isLlmRuntimeContainerPort(containerPort)) {
+            nextPortMappings.push(mapping);
+            continue;
+        }
+        llmMappings.set(containerPort, {
+            ...mapping,
+            hostIp: '127.0.0.1',
+            protocol: 'tcp',
+        });
+    }
+    for (const containerPort of [LLM_RUNTIME_MCP_PORT, LLM_RUNTIME_INFERENCE_PORT]) {
+        if (!hasContainerPortMapping(Array.from(llmMappings.values()), containerPort)) {
+            llmMappings.set(containerPort, {
+                hostIp: '127.0.0.1',
+                hostPort: 0,
+                containerPort,
+                protocol: 'tcp',
+            });
+        }
+        const mapping = llmMappings.get(containerPort);
+        nextPublishArgs.push(formatPublishArgFromMapping(mapping));
+        nextPortMappings.push(mapping);
+    }
+    return { publishArgs: nextPublishArgs, portMappings: nextPortMappings };
 }
 
 function isMissingContainerRemoval(stderr) {
@@ -507,6 +888,8 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
 
     const { raw: explicitAgentCmd } = readManifestAgentCommand(manifest);
     const startCmd = readManifestStartCommand(manifest);
+    const manifestEntrypoint = typeof manifest?.entrypoint === 'string' ? manifest.entrypoint.trim() : '';
+    const manifestEntrypointOverride = hasManifestEntrypoint(manifest);
     const useStartEntry = Boolean(startCmd);
     const launchExplicitSidecar = Boolean(startCmd && explicitAgentCmd);
     const cwd = getConfiguredProjectPath(agentName, path.basename(path.dirname(agentPath)), options.alias);
@@ -515,7 +898,6 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     const containerCwd = isolatedHome ? '/root' : cwd;
     const cwdMountTarget = isolatedHome ? '/root' : cwd;
     const sharedDir = ensureSharedHostDir();
-    const llmRuntimeSharedPath = resolveLlmRuntimeSharedPath(agentPath);
 
     // Get active profile and configuration
     const activeProfile = String(options.profileName || getActiveProfile()).trim() || getActiveProfile();
@@ -528,6 +910,20 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         throw new Error(`[profile] ${agentName}: profile '${activeProfile}' not found. Available: ${availableProfiles.join(', ')}`);
     }
     assertManifestEnvProfileCompleteness(manifest, profileConfig, { agentName, repoName, profileName: activeProfile });
+    const llmRuntimeEnabled = isLlmRuntimeManifest(manifest, profileConfig);
+    const effectiveManifestNetwork = resolveEffectiveManifestNetwork(manifest, profileConfig);
+    if (llmRuntimeEnabled) {
+        assertLlmRuntimeNetworkAllowed(agentName, effectiveManifestNetwork);
+        assertLlmRuntimeEntrypointAllowed(agentName, {
+            startCmd,
+            explicitAgentCmd,
+            manifestEntrypoint: manifestEntrypointOverride,
+        });
+        assertNoRetiredLlmRuntimeEnv(agentName, manifest, profileConfig);
+        assertNoPlainLlmSecretEnv(agentName, manifest, profileConfig);
+        assertNoLlmReservedVolumeTargets(agentName, manifest);
+        assertNoLlmReservedRuntimeResourceTargets(agentName, manifest);
+    }
 
     // Ensure workspace structure exists and run preinstall [HOST] before any
     // image-dependent work. Hooks may build local images or seed vars that image
@@ -554,8 +950,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     // LLM runtime opt-in: catalog-driven image, hardware-aware policy, reuse hash.
     // Resolved BEFORE dependency cache prep so the cache uses the selected image.
     let llmStartup = { enabled: false };
-    if (isLlmRuntimeManifest(manifest, profileConfig)) {
-        const effectiveNetworkForLlm = profileConfig?.network ?? manifest?.network ?? null;
+    if (llmRuntimeEnabled) {
         llmStartup = prepareLlmStartup({
             runtime,
             manifest,
@@ -569,11 +964,11 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
                 ...getExposedNames(manifest, profileConfig),
             ],
             envHash,
-            effectiveNetwork: effectiveNetworkForLlm,
+            effectiveNetwork: effectiveManifestNetwork,
         });
-        if (llmStartup.enabled && llmStartup.imageRef) {
-            image = llmStartup.imageRef;
-            debugLog(`[llm-runtime] ${agentName}: catalog-selected image ${image} (arch ${llmStartup.selection.architectureId})`);
+        if (llmStartup.enabled && llmStartup.imageRunRef) {
+            image = llmStartup.imageRunRef;
+            debugLog(`[llm-runtime] ${agentName}: catalog-selected image ${llmStartup.imageRef} (arch ${llmStartup.selection.architectureId})`);
         }
     }
 
@@ -610,7 +1005,9 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     const needsCoreDeps = !useStartEntry || agentHasPackageJson || isLlmRuntimeManifest(manifest, profileConfig);
     let preparedNodeModulesDir = path.join(agentWorkDir, 'node_modules');
     if (needsCoreDeps) {
-        const runtimeKey = detectRuntimeKeyForAgent(manifest, repoName, agentName, profileConfig, image);
+        const runtimeKey = llmStartup.enabled
+            ? detectContainerRuntimeKey({ manifest, profileConfig, repoName, agentName, runtime, image })
+            : detectRuntimeKeyForAgent(manifest, repoName, agentName, profileConfig, image);
         const agentPackagePath = agentHasPackageJson ? path.join(agentCodePath, 'package.json') : null;
         const prepared = prepareAgentCache({
             repoName,
@@ -692,12 +1089,16 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     // Build volume mount arguments using new workspace structure
     // Prepared node_modules are mounted read-only; runtime containers never mutate deps.
     const nodeModulesMount = runtime === 'podman' ? ':z,ro' : ':ro';
-    const containerWorkdir = isolatedHome ? '/root' : (String(manifest?.workdir || '/code').trim() || '/code');
+    const defaultContainerWorkdir = llmStartup.enabled ? '/workspace' : (isolatedHome ? '/root' : '/code');
+    const containerWorkdir = String(manifest?.workdir || defaultContainerWorkdir).trim() || defaultContainerWorkdir;
     const args = ['run', '-d', '--name', containerName, '--label', `ploinky.envhash=${envHash}`, '-w', containerWorkdir,
         // Agent library (always ro)
         '-v', `${agentLibMountPath}:/Agent${runtime === 'podman' ? ':z,ro' : ':ro'}`,
         // Code directory - profile dependent (rw in dev, ro in qa/prod)
         '-v', `${codeMountPath}:/code${codeMountMode}`,
+        ...(llmStartup.enabled ? [
+            '-v', `${codeMountPath}:/workspace${codeMountMode}`,
+        ] : []),
         ...(useNestedDependencyMounts ? [
             // node_modules mounts - ESM resolution walks up from script location
             // Mount at both /code/node_modules (for agent code) and /Agent/node_modules (for AgentServer.mjs)
@@ -723,9 +1124,6 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     if (llmStartup.enabled && llmStartup.stateDir) {
         args.push('-v', `${llmStartup.stateDir}:/runtime${runtime === 'podman' ? ':z' : ''}`);
     }
-    if (llmStartup.enabled && fs.existsSync(llmRuntimeSharedPath)) {
-        args.push('-v', `${llmRuntimeSharedPath}:/Agent/llm-runtime${runtime === 'podman' ? ':z,ro' : ':ro'}`);
-    }
 
     if (runtime === 'podman') {
         for (const mount of podmanStagedTargetMounts) {
@@ -739,9 +1137,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     }
     // Profile-level network overrides root manifest.network (mirrors how ports/env behave).
     // Lets one manifest declare e.g. host networking for prod and bridge networking for dev.
-    const profileNetwork = profileConfig?.network && typeof profileConfig.network === 'object' ? profileConfig.network : null;
-    const rootNetwork = manifest?.network && typeof manifest.network === 'object' ? manifest.network : null;
-    const manifestNetwork = profileNetwork || rootNetwork;
+    const manifestNetwork = effectiveManifestNetwork;
     const manifestNetworkMode = String(manifestNetwork?.mode || '').trim().toLowerCase();
     const manifestNetworkName = String(manifestNetwork?.name || '').trim();
     const manifestNetworkAliases = Array.isArray(manifestNetwork?.aliases)
@@ -798,13 +1194,16 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     const { publishArgs: manifestPorts, portMappings } = parseManifestPorts(manifest, profileConfig);
     const runtimePorts = (options && Array.isArray(options.publish)) ? options.publish : [];
     const runtimePortMappings = (options && Array.isArray(options.publishMappings)) ? options.publishMappings : [];
-    const basePortMappings = [...portMappings, ...runtimePortMappings];
+    const llmPublishPlan = llmStartup.enabled
+        ? ensureLlmRuntimeLoopbackPublish([...manifestPorts, ...runtimePorts], [...portMappings, ...runtimePortMappings])
+        : { publishArgs: [...manifestPorts, ...runtimePorts], portMappings: [...portMappings, ...runtimePortMappings] };
+    const basePortMappings = llmPublishPlan.portMappings;
     const profileServerPublish = useHostNetwork ? null : createProfileServerPublish(additionalServerPort, basePortMappings);
     const profileServerPublishArgs = profileServerPublish ? [profileServerPublish.publishArg] : [];
     const effectivePortMappings = profileServerPublish
         ? [...basePortMappings, profileServerPublish.mapping]
         : basePortMappings;
-    const pubs = useHostNetwork ? [] : [...manifestPorts, ...runtimePorts, ...profileServerPublishArgs];
+    const pubs = useHostNetwork ? [] : [...llmPublishPlan.publishArgs, ...profileServerPublishArgs];
     for (const p of pubs) {
         if (!p) continue;
         args.splice(1, 0, '-p', String(p));
@@ -866,39 +1265,36 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         envStrings.push(formatEnvFlag('PLOINKY_AGENT_CLIENT_SECRET', agentClientSecret));
     }
 
+    let llmModelSecretMount = null;
     if (profileConfig?.secrets && profileConfig.secrets.length > 0) {
         const secretValidation = validateSecrets(profileConfig.secrets);
         if (!secretValidation.valid) {
             throw new Error(formatMissingSecretsError(secretValidation.missing, activeProfile));
         }
         const profileSecrets = getSecrets(profileConfig.secrets);
-        appendEnvFlagsFromMap(envStrings, profileSecrets);
+        if (llmStartup.enabled) {
+            llmModelSecretMount = prepareLlmModelSecretMount(llmStartup, profileSecrets);
+        }
+        appendEnvFlagsFromMap(envStrings, profileSecrets, {
+            skipNames: llmStartup.enabled ? LLM_SECRET_ONLY_ENV_NAMES : new Set(),
+        });
     }
 
     appendRuntimeRouterEnvFlags(envStrings, runtimeRouterEnv);
-    if (llmStartup.enabled) {
-        envStrings.push(formatEnvFlag('HF_HOME', '/models/hf-cache'));
-        envStrings.push(formatEnvFlag('PLOINKY_MODELS_DIR', '/models/artifacts'));
-        envStrings.push(formatEnvFlag('PLOINKY_DERIVED_DIR', '/models/derived'));
-        envStrings.push(formatEnvFlag('PLOINKY_RUNTIME_DIR', '/runtime'));
-        envStrings.push(formatEnvFlag('PLOINKY_LAUNCHERS_DIR', '/opt/ploinky/launchers'));
-        envStrings.push(formatEnvFlag('PLOINKY_MCP_PORT', '9000'));
-        envStrings.push(formatEnvFlag('PLOINKY_LLM_PUBLIC_PORT', '9000'));
-        envStrings.push(formatEnvFlag('PLOINKY_LLM_MCP_PORT', '9001'));
-        envStrings.push(formatEnvFlag('PLOINKY_LLM_CONTROL_PORT', '9002'));
-        envStrings.push(formatEnvFlag('PLOINKY_INFERENCE_PORT', '8080'));
-    }
 
-    // DS013/DS011: strip any reserved identity/master env FLAG a config layer
-    // emitted (manifest env, runtime resources, profile env/secrets), then
-    // re-assert the authoritative agent identity LAST so no config can inject a
-    // master key or override the agent's derived secret.
-    const reservedEnvPrefixes = RESERVED_AGENT_ENV_NAMES.map((name) => `-e ${name}=`);
-    for (let i = envStrings.length - 1; i >= 0; i -= 1) {
-        if (reservedEnvPrefixes.some((prefix) => String(envStrings[i] || '').startsWith(prefix))) {
-            envStrings.splice(i, 1);
-        }
-    }
+    // Config may not supply router-managed identity envs, and non-LLM config may
+    // not smuggle the LLM runtime auth module pointers into a normal agent. For
+    // LLM agents, strip every clean runtime-managed env before appending the
+    // authoritative values below so config cannot override or duplicate them.
+    stripManagedEnvFlags(envStrings, [
+        ...RESERVED_AGENT_ENV_NAMES,
+        ...LLM_RUNTIME_AUTH_ENV_NAMES,
+        ...(llmStartup.enabled ? LLM_RUNTIME_MANAGED_ENV_NAMES : []),
+    ]);
+
+    // DS013/DS011: re-assert the authoritative agent identity after config layers
+    // have been stripped, so no config can inject a master key or override the
+    // agent's derived secret.
     try {
         for (const [key, value] of Object.entries(buildAgentIdentityEnv(deriveAgentPrincipalId(path.basename(path.dirname(agentPath)), agentName)))) {
             envStrings.push(formatEnvFlag(key, value));
@@ -907,6 +1303,22 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         debugLog(`[invocationAuth] could not set agent identity for ${agentName}: ${err?.message || err}`);
     }
     envStrings.push(formatEnvFlag('HOME', '/root'));
+
+    if (llmStartup.enabled) {
+        envStrings.push(formatEnvFlag('HF_HOME', '/models/hf-cache'));
+        envStrings.push(formatEnvFlag('PLOINKY_MODELS_DIR', '/models/artifacts'));
+        envStrings.push(formatEnvFlag('PLOINKY_DERIVED_DIR', '/models/derived'));
+        envStrings.push(formatEnvFlag('PLOINKY_RUNTIME_DIR', '/runtime'));
+        envStrings.push(formatEnvFlag('PLOINKY_LAUNCHERS_DIR', '/workspace/modelLaunchers'));
+        envStrings.push(formatEnvFlag('PLOINKY_MCP_PORT', String(LLM_RUNTIME_MCP_PORT)));
+        envStrings.push(formatEnvFlag('PLOINKY_INFERENCE_PORT', String(LLM_RUNTIME_INFERENCE_PORT)));
+        envStrings.push(formatEnvFlag('PLOINKY_INVOCATION_AUTH_MODULE', '/Agent/lib/invocationAuth.mjs'));
+        envStrings.push(formatEnvFlag('PLOINKY_REQUEST_HASH_MODULE', '/Agent/lib/requestHash.mjs'));
+        if (llmModelSecretMount) {
+            args.push('-v', `${llmModelSecretMount.source}:${llmModelSecretMount.target}${runtime === 'podman' ? ':z,ro' : ':ro'}`);
+            envStrings.push(formatEnvFlag(LLM_MODEL_SECRET_FILE_ENV, llmModelSecretMount.target));
+        }
+    }
 
     const envFlags = flagsToArgs(envStrings);
     if (envFlags.length) args.push(...envFlags);
@@ -921,7 +1333,6 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     // Node.js module resolution walks up from script location, so it won't find /code/node_modules
     args.push('-e', `NODE_PATH=/code/node_modules`);
 
-    const manifestEntrypoint = typeof manifest?.entrypoint === 'string' ? manifest.entrypoint.trim() : '';
     if (manifestEntrypoint) {
         args.push('--entrypoint', manifestEntrypoint);
     }
@@ -959,6 +1370,8 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         entrySummary = combinedInstallCmd
             ? `${shellPath} -lc "cd ${containerCwd} && <install> && ${explicitAgentCmd}"`
             : `${shellPath} -lc "cd ${containerCwd} && ${explicitAgentCmd}"`;
+    } else if (llmStartup.enabled) {
+        entrySummary = 'image ENTRYPOINT';
     } else {
         // Run preinstall + install in main container before default agent server
         if (combinedInstallCmd) {
@@ -973,13 +1386,22 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     const res = spawnSync(runtime, args, { stdio: 'inherit' });
     if (res.status !== 0) { throw new Error(`${runtime} run failed with code ${res.status}`); }
     const agents = loadAgentsMap();
+    const stateManagedEnvNames = new Set([
+        ...RESERVED_AGENT_ENV_NAMES,
+        ...LLM_RUNTIME_AUTH_ENV_NAMES,
+        ...(llmStartup.enabled ? LLM_RUNTIME_MANAGED_ENV_NAMES : []),
+    ]);
     const declaredEnvNames2 = [
         ...getManifestEnvNames(manifest, profileConfig),
         ...getExposedNames(manifest, profileConfig),
         ...Object.keys(profileEnv)
-    ];
+    ].filter((name) => !stateManagedEnvNames.has(name));
     const llmRuntimeEnvNames = llmStartup.enabled
-        ? ['HF_HOME', 'PLOINKY_MODELS_DIR', 'PLOINKY_DERIVED_DIR', 'PLOINKY_RUNTIME_DIR', 'PLOINKY_LAUNCHERS_DIR', 'PLOINKY_MCP_PORT', 'PLOINKY_LLM_PUBLIC_PORT', 'PLOINKY_LLM_MCP_PORT', 'PLOINKY_LLM_CONTROL_PORT', 'PLOINKY_INFERENCE_PORT']
+        ? [
+            ...LLM_RUNTIME_BASE_ENV_NAMES,
+            ...LLM_RUNTIME_AUTH_ENV_NAMES,
+            ...(llmModelSecretMount ? [LLM_MODEL_SECRET_FILE_ENV] : []),
+        ]
         : [];
     const persistedRecord = agents[containerName] || existingRecord;
     agents[containerName] = {
@@ -993,7 +1415,9 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
                 catalogId: llmStartup.selection.catalogId,
                 catalogRef: llmStartup.selection.catalogRef,
                 platform: llmStartup.selection.platform,
+                imageRef: llmStartup.imageRef,
                 imageDigest: llmStartup.imageDigest,
+                imageRunRef: llmStartup.imageRunRef,
                 policyHash: llmStartup.policyHash,
                 reuseHash: llmStartup.reuseHash,
             },
@@ -1008,6 +1432,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
             binds: [
                 { source: agentLibMountPath, target: '/Agent', ro: true },
                 { source: codeMountPath, target: '/code', ro: codeReadOnly },
+                ...(llmStartup.enabled ? [{ source: codeMountPath, target: '/workspace', ro: codeReadOnly }] : []),
                 ...(useNestedDependencyMounts ? [
                     { source: preparedNodeModulesDir, target: '/code/node_modules', ro: true },
                     { source: preparedNodeModulesDir, target: '/Agent/node_modules', ro: true },
@@ -1017,7 +1442,6 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
                 ...(!isolatedHome ? [{ source: agentHomeDir, target: '/root' }] : []),
                 ...(llmStartup.enabled && llmStartup.modelDir ? [{ source: llmStartup.modelDir, target: '/models' }] : []),
                 ...(llmStartup.enabled && llmStartup.stateDir ? [{ source: llmStartup.stateDir, target: '/runtime' }] : []),
-                ...(llmStartup.enabled && fs.existsSync(llmRuntimeSharedPath) ? [{ source: llmRuntimeSharedPath, target: '/Agent/llm-runtime', ro: true }] : []),
                 ...(skillsPathExists && !skillsPathInsideCode && runtime !== 'podman' ? [{ source: agentSkillsPath, target: '/code/skills', ro: skillsReadOnly }] : []),
                 { source: cwd, target: cwdMountTarget }
             ],
@@ -1123,24 +1547,6 @@ function resolvePublishedPortMappings(containerName, portMappings) {
 }
 
 function ensureAgentService(agentName, manifest, agentPath, options = {}) {
-    // Check if this agent should use a sandbox runtime instead of containers
-    const agentRuntime = getRuntimeForAgent(manifest);
-    if (agentRuntime === 'bwrap') {
-        try {
-            return ensureBwrapService(agentName, manifest, agentPath, options);
-        } catch (err) {
-            throw createHostSandboxStartupError(agentName, 'bwrap', err);
-        }
-    }
-    if (agentRuntime === 'seatbelt') {
-        try {
-            return ensureSeatbeltService(agentName, manifest, agentPath, options);
-        } catch (err) {
-            throw createHostSandboxStartupError(agentName, 'seatbelt', err);
-        }
-    }
-    const runtime = getRuntime();
-
     let preferredHostPort;
     let containerOverride;
     let aliasOverride;
@@ -1179,6 +1585,23 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
         throw new Error(`[profile] ${agentName}: profile '${activeProfile}' not found. Available: ${availableProfiles.join(', ')}`);
     }
     assertManifestEnvProfileCompleteness(manifest, profileConfig, { agentName, repoName, profileName: activeProfile });
+    const llmRuntimeEnabled = isLlmRuntimeManifest(manifest, profileConfig);
+    const agentRuntime = llmRuntimeEnabled ? getRuntime() : getRuntimeForAgent(manifest);
+    if (agentRuntime === 'bwrap') {
+        try {
+            return ensureBwrapService(agentName, manifest, agentPath, options);
+        } catch (err) {
+            throw createHostSandboxStartupError(agentName, 'bwrap', err);
+        }
+    }
+    if (agentRuntime === 'seatbelt') {
+        try {
+            return ensureSeatbeltService(agentName, manifest, agentPath, options);
+        } catch (err) {
+            throw createHostSandboxStartupError(agentName, 'seatbelt', err);
+        }
+    }
+    const runtime = agentRuntime;
     // LLM-runtime agents get their real image from the hardware-aware catalog in
     // startAgentContainer; tolerate an unresolved manifest container placeholder
     // here (this `image` is only a record fallback below).
@@ -1193,18 +1616,38 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
         routerHost: routerHostOverride
     });
 
+    const effectiveManifestNetwork = resolveEffectiveManifestNetwork(manifest, profileConfig);
+    if (llmRuntimeEnabled) {
+        assertLlmRuntimeNetworkAllowed(agentName, effectiveManifestNetwork);
+        assertNoRetiredLlmRuntimeEnv(agentName, manifest, profileConfig);
+        assertNoPlainLlmSecretEnv(agentName, manifest, profileConfig);
+        assertNoLlmReservedVolumeTargets(agentName, manifest);
+        assertNoLlmReservedRuntimeResourceTargets(agentName, manifest);
+    }
     const { publishArgs: manifestPorts, portMappings } = parseManifestPorts(manifest, profileConfig);
     const additionalServerPort = resolveProfileServer(manifest, profileConfig, { runtimeMode: 'container' });
     const containerPortCandidates = portMappings
         .map((mapping) => mapping?.containerPort)
         .filter((port) => typeof port === 'number' && port > 0);
     if (!containerPortCandidates.length) {
-        containerPortCandidates.push(7000);
+        if (llmRuntimeEnabled) {
+            containerPortCandidates.push(LLM_RUNTIME_MCP_PORT, LLM_RUNTIME_INFERENCE_PORT);
+        } else {
+            containerPortCandidates.push(7000);
+        }
     }
 
     const { raw: explicitAgentCmd } = readManifestAgentCommand(manifest);
     const startCmd = readManifestStartCommand(manifest);
+    const manifestEntrypointOverride = hasManifestEntrypoint(manifest);
     const withParallelAgent = Boolean(startCmd && explicitAgentCmd);
+    if (llmRuntimeEnabled) {
+        assertLlmRuntimeEntrypointAllowed(agentName, {
+            startCmd,
+            explicitAgentCmd,
+            manifestEntrypoint: manifestEntrypointOverride,
+        });
+    }
 
     if (forceRecreate && containerExists(containerName)) {
         removeContainerForRecreate(runtime, containerName, `ensureAgentService:${agentName}:forceRecreate`);
@@ -1220,10 +1663,9 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
     }
 
     // LLM runtime: include architecture/catalog/digest/policy in reuse comparison.
-    if (containerExists(containerName) && isLlmRuntimeManifest(manifest, profileConfig)) {
+    if (containerExists(containerName) && llmRuntimeEnabled) {
         try {
             const desiredEnvHash = computeEnvHash(manifest, profileConfig, runtimeRouterEnv, { agentName, repoName });
-            const effectiveNetworkForLlm = profileConfig?.network ?? manifest?.network ?? null;
             const probe = prepareLlmStartup({
                 runtime,
                 manifest,
@@ -1237,7 +1679,7 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
                     ...getExposedNames(manifest, profileConfig),
                 ],
                 envHash: desiredEnvHash,
-                effectiveNetwork: effectiveNetworkForLlm,
+                effectiveNetwork: effectiveManifestNetwork,
                 writeState: false,
             });
             if (probe.enabled) {
@@ -1248,7 +1690,9 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
                 }
             }
         } catch (err) {
-            debugLog(`[ensureAgentService] ${agentName}: LLM reuse-hash check skipped: ${err?.message || err}`);
+            debugLog(`[ensureAgentService] ${agentName}: LLM reuse-hash check failed: ${err?.message || err}; removing existing container.`);
+            removeContainerForRecreate(runtime, containerName, `ensureAgentService:${agentName}:llmReuseHashUnavailable`);
+            throw err;
         }
     }
 
@@ -1307,10 +1751,32 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
 
     if (manifestPorts.length === 0) {
         const hostPort = preferredHostPort || (10000 + Math.floor(Math.random() * 50000));
-        const agentServerMapping = { containerPort: 7000, hostPort, hostIp: '127.0.0.1', protocol: 'tcp' };
-        additionalPorts = [`127.0.0.1:${hostPort}:7000`];
-        additionalPortMappings.push(agentServerMapping);
-        allPortMappings = [agentServerMapping];
+        if (llmRuntimeEnabled) {
+            const engineHostPort = 10000 + Math.floor(Math.random() * 50000);
+            const mcpMapping = {
+                containerPort: LLM_RUNTIME_MCP_PORT,
+                hostPort,
+                hostIp: '127.0.0.1',
+                protocol: 'tcp',
+            };
+            const inferenceMapping = {
+                containerPort: LLM_RUNTIME_INFERENCE_PORT,
+                hostPort: engineHostPort,
+                hostIp: '127.0.0.1',
+                protocol: 'tcp',
+            };
+            additionalPorts = [
+                `127.0.0.1:${hostPort}:${LLM_RUNTIME_MCP_PORT}`,
+                `127.0.0.1:${engineHostPort}:${LLM_RUNTIME_INFERENCE_PORT}`,
+            ];
+            additionalPortMappings.push(mcpMapping, inferenceMapping);
+            allPortMappings = [mcpMapping, inferenceMapping];
+        } else {
+            const agentServerMapping = { containerPort: 7000, hostPort, hostIp: '127.0.0.1', protocol: 'tcp' };
+            additionalPorts = [`127.0.0.1:${hostPort}:7000`];
+            additionalPortMappings.push(agentServerMapping);
+            allPortMappings = [agentServerMapping];
+        }
     }
 
     const profileServerPublish = createProfileServerPublish(additionalServerPort, allPortMappings);
@@ -1399,7 +1865,9 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
     saveAgentsMap(agents);
 
     syncAgentMcpConfig(containerName, agentPath, finalInstanceName, { workDir: finalAgentWorkDir });
-    const returnPort = allPortMappings.find((p) => p.containerPort === 7000)?.hostPort || allPortMappings[0]?.hostPort || 0;
+    const returnPort = allPortMappings.find((p) => p.containerPort === (llmRuntimeEnabled ? LLM_RUNTIME_MCP_PORT : 7000))?.hostPort
+        || allPortMappings[0]?.hostPort
+        || 0;
     return { containerName, hostPort: returnPort, additionalServerPort: resolvedProfileServer };
 }
 

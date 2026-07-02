@@ -10,9 +10,27 @@ import {
     emitRunArgs,
 } from './containerRuntimePolicy.js';
 import { detectHardware } from './hardwareDetection.js';
-import { isSensitiveEnvVariableName } from './secretVars.js';
 
 const SAFE_AGENT_KEY_RE = /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$/;
+const LLM_STARTUP_CONTRACT = Object.freeze({
+    version: 2,
+    mounts: Object.freeze(['/workspace', '/models', '/runtime']),
+    env: Object.freeze({
+        HF_HOME: '/models/hf-cache',
+        PLOINKY_MODELS_DIR: '/models/artifacts',
+        PLOINKY_DERIVED_DIR: '/models/derived',
+        PLOINKY_RUNTIME_DIR: '/runtime',
+        PLOINKY_LAUNCHERS_DIR: '/workspace/modelLaunchers',
+        PLOINKY_MCP_PORT: '9000',
+        PLOINKY_INFERENCE_PORT: '8080',
+        PLOINKY_INVOCATION_AUTH_MODULE: '/Agent/lib/invocationAuth.mjs',
+        PLOINKY_REQUEST_HASH_MODULE: '/Agent/lib/requestHash.mjs',
+    }),
+    publish: Object.freeze([
+        Object.freeze({ hostIp: '127.0.0.1', containerPort: 9000, protocol: 'tcp' }),
+        Object.freeze({ hostIp: '127.0.0.1', containerPort: 8080, protocol: 'tcp' }),
+    ]),
+});
 
 function isLlmRuntimeManifest(manifest, profileConfig) {
     const profileFlag = profileConfig?.llmRuntime?.enabled === true;
@@ -32,11 +50,64 @@ function safeIdentity({ agentName, alias }) {
     return candidate;
 }
 
-function buildSelectedArchitectureState({ selection, hardware, policy, policyHash, manifestEnvNames, identity }) {
+function ensureDirectoryMode(dir, mode) {
+    fs.mkdirSync(dir, { recursive: true, mode });
+    try { fs.chmodSync(dir, mode); } catch (_) {}
+    return dir;
+}
+
+function tempFilePath(filePath) {
+    const dir = path.dirname(filePath);
+    const base = path.basename(filePath);
+    const nonce = `${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    return path.join(dir, `.${base}.tmp-${nonce}`);
+}
+
+function safeFileWrite(filePath, bytes, mode = 0o600) {
+    ensureDirectoryMode(path.dirname(filePath), 0o700);
+    const tmpPath = tempFilePath(filePath);
+    let fd = null;
+    let cleanupTmp = false;
+    try {
+        fd = fs.openSync(tmpPath, 'wx', mode);
+        cleanupTmp = true;
+        fs.writeFileSync(fd, bytes, { encoding: 'utf8' });
+        fs.closeSync(fd);
+        fd = null;
+        fs.renameSync(tmpPath, filePath);
+        cleanupTmp = false;
+        try { fs.chmodSync(filePath, mode); } catch (_) {}
+    } finally {
+        if (fd !== null) {
+            try { fs.closeSync(fd); } catch (_) {}
+        }
+        if (cleanupTmp) {
+            try { fs.unlinkSync(tmpPath); } catch (_) {}
+        }
+    }
+}
+
+function safeJsonWrite(filePath, payload) {
+    safeFileWrite(filePath, `${JSON.stringify(payload, null, 2)}\n`, 0o600);
+}
+
+function buildEngineInventory(selection, imageRecord = null) {
+    const defaults = selection?.engineDefaults || {};
+    const runtimePort = Number(defaults.runtimePort) || 9000;
+    const enginePort = Number(defaults.enginePort) || 8080;
+    return {
+        engines: Array.isArray(imageRecord?.engines) ? imageRecord.engines.slice() : [],
+        mcp: { containerPort: runtimePort },
+        inference: { containerPort: enginePort },
+    };
+}
+
+function buildSelectedArchitectureState({ selection, hardware, policy, policyHash, identity, imageRecord }) {
     const safeProbes = {};
     for (const [name, probe] of Object.entries(hardware?.probes || {})) {
         safeProbes[name] = { ok: Boolean(probe?.ok), timedOut: Boolean(probe?.timedOut) };
     }
+    const engineInventory = buildEngineInventory(selection, imageRecord);
     return {
         schemaVersion: 1,
         writtenAt: new Date().toISOString(),
@@ -58,6 +129,8 @@ function buildSelectedArchitectureState({ selection, hardware, policy, policyHas
         },
         runtimePolicy: policy,
         runtimePolicyHash: policyHash,
+        resourcePolicy: policy?.resources || {},
+        engineInventory,
         hardware: {
             runtime: hardware?.runtime || null,
             nodeArch: hardware?.nodeArch || null,
@@ -67,28 +140,46 @@ function buildSelectedArchitectureState({ selection, hardware, policy, policyHas
             probes: safeProbes,
         },
         explanation: selection.explanation || {},
-        envExposed: Array.isArray(manifestEnvNames)
-            ? manifestEnvNames.filter((name) => !isSensitiveEnvVariableName(name))
-            : [],
     };
 }
 
 function ensureRuntimeStateDir(rootDir, identity) {
     const stateDir = path.join(rootDir, identity, 'runtime');
-    fs.mkdirSync(stateDir, { recursive: true });
-    return stateDir;
+    return ensureDirectoryMode(stateDir, 0o700);
 }
 
 function ensureModelsDir(rootDir, identity) {
     const modelsDir = path.join(rootDir, identity, 'models');
-    fs.mkdirSync(modelsDir, { recursive: true });
-    return modelsDir;
+    return ensureDirectoryMode(modelsDir, 0o700);
 }
 
 function writeSelectedArchitectureFile(stateDir, payload) {
     const filePath = path.join(stateDir, 'selected-architecture.json');
-    fs.writeFileSync(filePath, `${JSON.stringify(payload, null, 2)}\n`);
-    try { fs.chmodSync(filePath, 0o600); } catch (_) {}
+    safeJsonWrite(filePath, payload);
+    return filePath;
+}
+
+function buildRuntimeLockfilePayload(statePayload) {
+    return {
+        schemaVersion: 1,
+        writtenAt: statePayload.writtenAt,
+        architecture: {
+            id: statePayload.architecture.id,
+            platform: statePayload.architecture.platform,
+        },
+        image: {
+            ref: statePayload.architecture.imageRef,
+            digest: statePayload.architecture.imageDigest || null,
+        },
+        runtimePolicyHash: statePayload.runtimePolicyHash,
+        resourcePolicy: statePayload.resourcePolicy || {},
+        engineInventory: statePayload.engineInventory || {},
+    };
+}
+
+function writeRuntimeLockfile(stateDir, payload) {
+    const filePath = path.join(stateDir, 'llm-runtime-lock.json');
+    safeJsonWrite(filePath, payload);
     return filePath;
 }
 
@@ -98,6 +189,20 @@ function computeReuseHash(parts) {
         return acc;
     }, {});
     return crypto.createHash('sha256').update(JSON.stringify(sorted)).digest('hex');
+}
+
+function cloneStartupContract() {
+    return {
+        version: LLM_STARTUP_CONTRACT.version,
+        mounts: LLM_STARTUP_CONTRACT.mounts.slice(),
+        env: { ...LLM_STARTUP_CONTRACT.env },
+        publish: LLM_STARTUP_CONTRACT.publish.map((mapping) => ({ ...mapping })),
+    };
+}
+
+function buildImageRunRef(selection) {
+    if (!selection?.imageRef) return '';
+    return selection.imageDigest ? `${selection.imageRef}@${selection.imageDigest}` : selection.imageRef;
 }
 
 function prepareLlmStartup(input) {
@@ -132,6 +237,7 @@ function prepareLlmStartup(input) {
         env,
         allowExperimental: Boolean(profileConfig?.llmRuntime?.allowExperimental || manifest?.llmRuntime?.allowExperimental),
     });
+    const imageRunRef = buildImageRunRef(selection);
 
     const policy = buildEffectivePolicy({
         manifestPolicy: extractManifestPolicy(manifest, profileConfig),
@@ -142,23 +248,27 @@ function prepareLlmStartup(input) {
 
     const policyHash = computeRuntimePolicyHash(policy);
     const runArgs = emitRunArgs(policy, { runtime });
+    const selectedImageRecord = catalog.images?.get?.(selection.imageId) || null;
 
     const statePayload = buildSelectedArchitectureState({
         selection,
         hardware,
         policy,
         policyHash,
-        manifestEnvNames,
         identity,
+        imageRecord: selectedImageRecord,
     });
     let stateDir = null;
     if (writeState) {
         stateDir = ensureRuntimeStateDir(agentWorkDirRoot, identity);
         writeSelectedArchitectureFile(stateDir, statePayload);
+        writeRuntimeLockfile(stateDir, buildRuntimeLockfilePayload(statePayload));
     }
     const modelDir = ensureModelsDir(agentWorkDirRoot, identity);
 
     const reuseKey = {
+        startupContractVersion: LLM_STARTUP_CONTRACT.version,
+        startupContract: cloneStartupContract(),
         envHash: envHash || '',
         network: effectiveNetwork || null,
         architectureId: selection.architectureId,
@@ -194,6 +304,7 @@ function prepareLlmStartup(input) {
         modelDir,
         imageRef: selection.imageRef,
         imageDigest: selection.imageDigest || null,
+        imageRunRef,
         platform: selection.platform,
         // Useful for tests:
         statePayload,
@@ -202,6 +313,7 @@ function prepareLlmStartup(input) {
 }
 
 export {
+    LLM_STARTUP_CONTRACT,
     isLlmRuntimeManifest,
     prepareLlmStartup,
 };

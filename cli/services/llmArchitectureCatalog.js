@@ -15,16 +15,21 @@ const ARCH_ID_RE = /^[a-z0-9][a-z0-9._-]{0,63}$/;
 const SHA_DIGEST_RE = /^sha256:[a-f0-9]{64}$/;
 const ALLOWED_PLATFORMS = ['linux/amd64', 'linux/arm64'];
 const ALLOWED_ACCELERATORS = ['cpu', 'nvidia-cuda', 'amd-rocm', 'vulkan', 'intel-openvino'];
+const ALLOWED_ENGINES = ['llamacpp', 'vllm', 'sglang', 'trtllm', 'openvino'];
 const ALLOWED_CONTAINER_RUNTIMES = ['docker', 'podman'];
 const ALLOWED_DEVICE_TYPES = ['cdi', 'hostDevice'];
-const ALLOWED_SECURITY_OPT = new Set(['label=disable']);
+const ALLOWED_HOST_DEVICE_PREFIXES = ['/dev/kfd', '/dev/dri', '/dev/accel'];
+const ALLOWED_SECURITY_OPT = new Set(['label=disable', 'seccomp=unconfined']);
 const ALLOWED_IPC = new Set(['default', 'host']);
-const HOST_DEVICE_PATH_RE = /^\/dev\/[A-Za-z0-9._/-]+$/;
+const HOST_DEVICE_PATH_PATTERN = '^/dev/(?:kfd|dri(?:/(?!\\.{1,2}(?:/|$))[A-Za-z0-9._-]+)*|accel(?:/(?!\\.{1,2}(?:/|$))[A-Za-z0-9._-]+)*)$';
+const HOST_DEVICE_PATH_RE = new RegExp(HOST_DEVICE_PATH_PATTERN);
 const ARCHITECTURE_PATH_RE = /^architectures\/[A-Za-z0-9._-]+\.json$/;
 const IMAGE_PATH_RE = /^images\/[A-Za-z0-9._-]+\.json$/;
+const SAFE_RELATIVE_PATH_RE = /^[A-Za-z0-9._/-]+$/;
 const SIZE_RE = /^[0-9]+[bkmgtBKMGT]?$/;
 const CPU_RE = /^[0-9]+(\.[0-9]+)?$/;
 const GPUS_RE = /^all$|^device=[A-Za-z0-9._,-]+$/;
+const CDI_DEVICE_RE = /^[A-Za-z0-9._/-]+=([A-Za-z0-9._,-]+|all)$/;
 const MAX_PIDS_LIMIT = 1048576;
 const CATALOG_VALIDATION_CONTRACT = Object.freeze({
     catalogKeys: Object.freeze(['schemaVersion', 'catalogId', 'updatedAt', 'defaultFallback', 'architectures', 'images']),
@@ -42,10 +47,15 @@ const CATALOG_VALIDATION_CONTRACT = Object.freeze({
     memlockKeys: Object.freeze(['soft', 'hard']),
     deviceKeys: Object.freeze(['type', 'value', 'hostPath']),
     deviceTypes: Object.freeze(ALLOWED_DEVICE_TYPES.slice()),
+    hostDevicePrefixes: Object.freeze(ALLOWED_HOST_DEVICE_PREFIXES.slice()),
+    hostDevicePathPattern: HOST_DEVICE_PATH_PATTERN,
     securityOpt: Object.freeze(Array.from(ALLOWED_SECURITY_OPT)),
     ipc: Object.freeze(Array.from(ALLOWED_IPC)),
-    imageKeys: Object.freeze(['id', 'ref', 'digest', 'platform', 'build']),
-    imageBuildKeys: Object.freeze(['context', 'dockerfile']),
+    imageKeys: Object.freeze(['id', 'ref', 'digest', 'platform', 'engines', 'build']),
+    imageRequiredKeys: Object.freeze(['id', 'ref', 'platform', 'engines', 'build']),
+    imageEngines: Object.freeze(ALLOWED_ENGINES.slice()),
+    imageBuildKeys: Object.freeze(['context', 'dockerfile', 'workflow', 'engineVersionsLock']),
+    imageBuildRequiredKeys: Object.freeze(['context', 'dockerfile', 'workflow', 'engineVersionsLock']),
     engineDefaultKeys: Object.freeze(['enginePort', 'runtimePort']),
 });
 
@@ -84,6 +94,30 @@ function rejectUnknownKeys(value, allowed, label) {
 function ensureStringPattern(value, regex, label) {
     if (typeof value !== 'string' || !regex.test(value)) {
         throw new CatalogValidationError(`${label}: invalid value`);
+    }
+}
+
+function ensureSafeRelativePath(value, label) {
+    if (
+        typeof value !== 'string'
+        || value.length < 1
+        || value.length > 256
+        || path.isAbsolute(value)
+        || value.includes('${')
+        || value.split('/').some((segment) => segment.length === 0 || segment === '..')
+        || !SAFE_RELATIVE_PATH_RE.test(value)
+    ) {
+        throw new CatalogValidationError(`${label}: invalid`);
+    }
+}
+
+function ensureHostDevicePath(value, label) {
+    if (typeof value !== 'string' || !value.startsWith('/dev/')) {
+        throw new CatalogValidationError(`${label}: invalid host device path`);
+    }
+    const normalized = path.posix.normalize(value);
+    if (normalized !== value || !HOST_DEVICE_PATH_RE.test(normalized)) {
+        throw new CatalogValidationError(`${label}: invalid host device path`);
     }
 }
 
@@ -156,14 +190,12 @@ function validateRuntimePolicy(policy, label) {
                 throw new CatalogValidationError(`${devLabel}.type: unsupported`);
             }
             if (dev.type === 'cdi') {
-                if (typeof dev.value !== 'string' || dev.value.length < 1 || dev.value.length > 200) {
+                if (typeof dev.value !== 'string' || dev.value.length < 1 || dev.value.length > 200 || !CDI_DEVICE_RE.test(dev.value)) {
                     throw new CatalogValidationError(`${devLabel}.value: invalid CDI device`);
                 }
             }
             if (dev.type === 'hostDevice') {
-                if (!HOST_DEVICE_PATH_RE.test(String(dev.hostPath || ''))) {
-                    throw new CatalogValidationError(`${devLabel}.hostPath: invalid host device path`);
-                }
+                ensureHostDevicePath(dev.hostPath, `${devLabel}.hostPath`);
             }
         }
     }
@@ -253,7 +285,12 @@ function validateImageRecord(record, label) {
     ensureObject(record, label);
     rejectUnknownKeys(record, new Set(CATALOG_VALIDATION_CONTRACT.imageKeys), label);
     ensureStringPattern(record.id, ARCH_ID_RE, `${label}.id`);
-    if (typeof record.ref !== 'string' || record.ref.length < 1 || record.ref.length > 512) {
+    if (
+        typeof record.ref !== 'string'
+        || record.ref.length < 1
+        || record.ref.length > 512
+        || record.ref.includes('${')
+    ) {
         throw new CatalogValidationError(`${label}.ref: invalid`);
     }
     if (record.digest !== undefined) {
@@ -261,19 +298,27 @@ function validateImageRecord(record, label) {
             throw new CatalogValidationError(`${label}.digest: must be sha256:<64 hex>`);
         }
     }
-    if (record.platform !== undefined && !ALLOWED_PLATFORMS.includes(record.platform)) {
+    if (!ALLOWED_PLATFORMS.includes(record.platform)) {
         throw new CatalogValidationError(`${label}.platform: unsupported`);
     }
-    if (record.build !== undefined) {
-        ensureObject(record.build, `${label}.build`);
-        rejectUnknownKeys(record.build, new Set(CATALOG_VALIDATION_CONTRACT.imageBuildKeys), `${label}.build`);
-        for (const field of CATALOG_VALIDATION_CONTRACT.imageBuildKeys) {
-            if (record.build[field] !== undefined) {
-                if (typeof record.build[field] !== 'string' || record.build[field].length > 256) {
-                    throw new CatalogValidationError(`${label}.build.${field}: invalid`);
-                }
-            }
+    ensureArray(record.engines, `${label}.engines`, { minItems: 1 });
+    const seenEngines = new Set();
+    for (const engine of record.engines) {
+        if (!ALLOWED_ENGINES.includes(engine)) {
+            throw new CatalogValidationError(`${label}.engines: unsupported engine '${engine}'`);
         }
+        if (seenEngines.has(engine)) {
+            throw new CatalogValidationError(`${label}.engines: duplicate engine '${engine}'`);
+        }
+        seenEngines.add(engine);
+    }
+    ensureObject(record.build, `${label}.build`);
+    rejectUnknownKeys(record.build, new Set(CATALOG_VALIDATION_CONTRACT.imageBuildKeys), `${label}.build`);
+    for (const field of CATALOG_VALIDATION_CONTRACT.imageBuildKeys) {
+        if (record.build[field] === undefined) {
+            throw new CatalogValidationError(`${label}.build.${field}: required`);
+        }
+        ensureSafeRelativePath(record.build[field], `${label}.build.${field}`);
     }
     return record;
 }

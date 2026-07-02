@@ -1,12 +1,19 @@
 import crypto from 'crypto';
+import path from 'path';
 
 const ALLOWED_PLATFORMS = new Set(['linux/amd64', 'linux/arm64']);
 const ALLOWED_DEVICE_TYPES = new Set(['cdi', 'hostDevice']);
-const ALLOWED_HOST_DEVICE_PREFIXES = ['/dev/kfd', '/dev/dri', '/dev/accel'];
-const ALLOWED_SECURITY_OPT = new Set(['label=disable']);
+const ALLOWED_HOST_DEVICE_ROOTS = Object.freeze([
+    { root: '/dev/kfd', allowChildren: false },
+    { root: '/dev/dri', allowChildren: true },
+    { root: '/dev/accel', allowChildren: true },
+]);
+const ALLOWED_HOST_DEVICE_PREFIXES = ALLOWED_HOST_DEVICE_ROOTS.map((entry) => entry.root);
+const ALLOWED_SECURITY_OPT = new Set(['label=disable', 'seccomp=unconfined']);
 const ALLOWED_IPC = new Set(['default', 'host']);
 const ALLOWED_GPUS_RE = /^all$|^device=[A-Za-z0-9._,-]+$/;
 const ALLOWED_CDI_RE = /^[A-Za-z0-9._/-]+=([A-Za-z0-9._,-]+|all)$/;
+const SAFE_HOST_DEVICE_PATH_RE = /^\/dev(?:\/[A-Za-z0-9._-]+)+$/;
 const SIZE_RE = /^[0-9]+[bkmgtBKMGT]?$/;
 const CPU_RE = /^[0-9]+(\.[0-9]+)?$/;
 const MAX_PIDS_LIMIT = 1048576;
@@ -92,6 +99,30 @@ function validateResources(resources, label) {
     return resources;
 }
 
+function validateHostDevicePath(hostPath, label) {
+    if (typeof hostPath !== 'string' || !hostPath.startsWith('/dev/')) {
+        throw new RuntimePolicyError(`${label}: must start with /dev/`);
+    }
+    if (!SAFE_HOST_DEVICE_PATH_RE.test(hostPath)) {
+        throw new RuntimePolicyError(`${label}: invalid host device path`);
+    }
+    const segments = hostPath.split('/').slice(1);
+    if (segments.some((segment) => segment === '.' || segment === '..')) {
+        throw new RuntimePolicyError(`${label}: invalid host device path traversal`);
+    }
+    const normalized = path.posix.normalize(hostPath);
+    if (normalized !== hostPath) {
+        throw new RuntimePolicyError(`${label}: invalid host device path traversal`);
+    }
+    const ok = ALLOWED_HOST_DEVICE_ROOTS.some(({ root, allowChildren }) => (
+        normalized === root || (allowChildren && normalized.startsWith(`${root}/`))
+    ));
+    if (!ok) {
+        throw new RuntimePolicyError(`${label}: host device '${hostPath}' is not in the allowlist (${ALLOWED_HOST_DEVICE_PREFIXES.join(', ')})`);
+    }
+    return normalized;
+}
+
 function validateDevices(devices, label, options = {}) {
     if (devices === undefined) return [];
     if (!Array.isArray(devices)) {
@@ -114,14 +145,7 @@ function validateDevices(devices, label, options = {}) {
             }
         }
         if (device.type === 'hostDevice') {
-            const hostPath = String(device.hostPath || '');
-            if (!hostPath.startsWith('/dev/')) {
-                throw new RuntimePolicyError(`${itemLabel}.hostPath: must start with /dev/`);
-            }
-            const ok = ALLOWED_HOST_DEVICE_PREFIXES.some((prefix) => hostPath === prefix || hostPath.startsWith(`${prefix}/`));
-            if (!ok) {
-                throw new RuntimePolicyError(`${itemLabel}.hostPath: host device '${hostPath}' is not in the allowlist (${ALLOWED_HOST_DEVICE_PREFIXES.join(', ')})`);
-            }
+            validateHostDevicePath(device.hostPath, `${itemLabel}.hostPath`);
         }
         validated.push(device);
     }

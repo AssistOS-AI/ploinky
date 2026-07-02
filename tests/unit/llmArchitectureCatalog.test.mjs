@@ -5,10 +5,12 @@ import os from 'node:os';
 import path from 'node:path';
 
 import {
+    CATALOG_VALIDATION_CONTRACT,
     CatalogValidationError,
     loadCatalog,
     validateRuntimePolicy,
     validateArchitectureRecord,
+    validateImageRecord,
 } from '../../cli/services/llmArchitectureCatalog.js';
 
 function makeValidCatalog(rootPath) {
@@ -43,8 +45,15 @@ function makeValidCatalog(rootPath) {
     }));
     fs.writeFileSync(path.join(rootPath, 'images/cpu-amd64.json'), JSON.stringify({
         id: 'cpu-amd64',
-        ref: 'example.com/llm-cpu-amd64:dev',
+        ref: 'docker.io/assistos/llm-runtime:cpu-amd64',
         platform: 'linux/amd64',
+        engines: ['llamacpp'],
+        build: {
+            context: 'container-image-builds',
+            dockerfile: 'container-image-builds/images/llm-runtime-cpu/Dockerfile',
+            workflow: 'container-image-builds/.github/workflows/publish-llm-runtime-images.yml',
+            engineVersionsLock: 'container-image-builds/images/llm-runtime-cpu/engineVersions.lock.json',
+        },
     }));
 }
 
@@ -147,10 +156,242 @@ test('loadCatalog rejects architecture and runtime policy platform mismatch', ()
     }
 });
 
+test('validateImageRecord accepts engine inventory, build workflow metadata, and optional digest', () => {
+    assert.doesNotThrow(() => validateImageRecord({
+        id: 'nvidia-amd64',
+        ref: 'docker.io/assistos/llm-runtime:nvidia-amd64',
+        digest: 'sha256:' + 'a'.repeat(64),
+        platform: 'linux/amd64',
+        engines: ['llamacpp', 'vllm', 'sglang', 'trtllm'],
+        build: {
+            context: 'container-image-builds',
+            dockerfile: 'container-image-builds/images/llm-runtime-nvidia-amd64/Dockerfile',
+            workflow: 'container-image-builds/.github/workflows/publish-llm-runtime-images.yml',
+            engineVersionsLock: 'container-image-builds/images/llm-runtime-nvidia-amd64/engineVersions.lock.json',
+        },
+    }, 'image'));
+});
+
+test('validateImageRecord accepts safe external catalog build topology', () => {
+    assert.doesNotThrow(() => validateImageRecord({
+        id: 'cpu-amd64',
+        ref: 'ghcr.io/acme/llm-runtime:cpu-amd64',
+        platform: 'linux/amd64',
+        engines: ['llamacpp'],
+        build: {
+            context: 'runtime-images',
+            dockerfile: 'runtime-images/acme/Dockerfile',
+            workflow: '.github/workflows/publish.yml',
+            engineVersionsLock: 'runtime-images/acme/engineVersions.lock.json',
+        },
+    }, 'image'));
+});
+
+test('validateImageRecord rejects unsafe image metadata shapes', () => {
+    const base = {
+        id: 'cpu-amd64',
+        ref: 'docker.io/assistos/llm-runtime:cpu-amd64',
+        platform: 'linux/amd64',
+        engines: ['llamacpp'],
+        build: {
+            context: 'container-image-builds',
+            dockerfile: 'container-image-builds/images/llm-runtime-cpu/Dockerfile',
+            workflow: 'container-image-builds/.github/workflows/publish-llm-runtime-images.yml',
+            engineVersionsLock: 'container-image-builds/images/llm-runtime-cpu/engineVersions.lock.json',
+        },
+    };
+    assert.throws(
+        () => validateImageRecord({ ...base, modelIds: ['org/model'] }, 'image'),
+        /unknown field 'modelIds'/,
+    );
+    assert.throws(
+        () => validateImageRecord({ ...base, ref: 'docker.io/assistos/${AGENT_IMAGE_NAME}:cpu-amd64' }, 'image'),
+        /ref: invalid/,
+    );
+    assert.throws(
+        () => validateImageRecord({ ...base, digest: 'sha256:nothex' }, 'image'),
+        /digest: must be sha256:<64 hex>/,
+    );
+    assert.throws(
+        () => validateImageRecord({ ...base, engines: ['llamacpp', 'bash'] }, 'image'),
+        /engines: unsupported engine 'bash'/,
+    );
+    assert.throws(
+        () => validateImageRecord({
+            ...base,
+            build: { ...base.build, context: '../container-image-builds' },
+        }, 'image'),
+        /build\.context: invalid/,
+    );
+    assert.throws(
+        () => validateImageRecord({
+            ...base,
+            build: { ...base.build, args: ['--privileged'] },
+        }, 'image'),
+        /unknown field 'args'/,
+    );
+});
+
+test('validateImageRecord accepts safe build paths and rejects unsafe build paths', () => {
+    const base = {
+        id: 'cpu-amd64',
+        ref: 'docker.io/assistos/llm-runtime:cpu-amd64',
+        platform: 'linux/amd64',
+        engines: ['llamacpp'],
+        build: {
+            context: 'container-image-builds',
+            dockerfile: 'container-image-builds/images/llm-runtime-cpu/Dockerfile',
+            workflow: 'container-image-builds/.github/workflows/publish-llm-runtime-images.yml',
+            engineVersionsLock: 'container-image-builds/images/llm-runtime-cpu/engineVersions.lock.json',
+        },
+    };
+    const examplesByField = {
+        context: {
+            accepted: ['container-image-builds', 'runtime-images', 'build/families/cpu'],
+            rejected: ['container-image-builds/', '/container-image-builds', '../container-image-builds', 'container-${REPO}'],
+        },
+        dockerfile: {
+            accepted: [
+                'container-image-builds/images/llm-runtime-cpu/Dockerfile',
+                'container-image-builds/images/llm-runtime-nvidia-spark-arm64-sm121/Dockerfile',
+                'Dockerfile.amd64',
+                'images/llm-runtime-cpu/Dockerfile',
+                'runtime-images/acme/Dockerfile',
+            ],
+            rejected: ['/runtime-images/acme/Dockerfile', '../container-image-builds/images/llm-runtime-cpu/Dockerfile', 'runtime-images//Dockerfile', 'runtime-images/${IMAGE}/Dockerfile'],
+        },
+        workflow: {
+            accepted: [
+                'container-image-builds/.github/workflows/publish-llm-runtime-images.yml',
+                '.github/workflows/build-llm-runtime.yml',
+                'container-image-builds/.github/workflows/build-llm-runtime.yml',
+                'container-image-builds/.github/workflows/publish-llm-runtime-images.yaml',
+                '.github/workflows/publish.yml',
+            ],
+            rejected: ['/workflows/publish.yml', '../container-image-builds/.github/workflows/publish-llm-runtime-images.yml', '.github//workflows/publish.yml', '.github/workflows/${WORKFLOW}.yml'],
+        },
+        engineVersionsLock: {
+            accepted: [
+                'container-image-builds/images/llm-runtime-cpu/engineVersions.lock.json',
+                'container-image-builds/images/llm-runtime-nvidia-amd64/engineVersions.lock.json',
+                'llm-runtime/engine-versions.lock',
+                'container-image-builds/images/llm-runtime-cpu/engine-versions.lock',
+                'container-image-builds/images/llm-runtime-cpu/engineVersions.lock',
+                'runtime-images/acme/engineVersions.lock.json',
+            ],
+            rejected: ['/runtime-images/acme/engineVersions.lock.json', '../container-image-builds/images/llm-runtime-cpu/engineVersions.lock.json', 'runtime-images//engineVersions.lock.json', 'runtime-images/${IMAGE}/engineVersions.lock.json'],
+        },
+    };
+    for (const [field, examples] of Object.entries(examplesByField)) {
+        for (const accepted of examples.accepted) {
+            assert.doesNotThrow(
+                () => validateImageRecord({ ...base, build: { ...base.build, [field]: accepted } }, 'image'),
+                `${field} ${accepted} should be accepted`,
+            );
+        }
+        for (const rejected of examples.rejected) {
+            assert.throws(
+                () => validateImageRecord({ ...base, build: { ...base.build, [field]: rejected } }, 'image'),
+                new RegExp(`build\\.${field}: invalid`),
+                `${field} ${rejected} should be rejected`,
+            );
+        }
+    }
+});
+
+test('validateRuntimePolicy validates CDI device assignment syntax', () => {
+    for (const value of ['nvidia.com/gpu=all', 'nvidia.com/gpu=0']) {
+        assert.doesNotThrow(
+            () => validateRuntimePolicy({
+                devices: [{ type: 'cdi', value }],
+            }, 'test'),
+            `${value} should be accepted`,
+        );
+    }
+    assert.throws(
+        () => validateRuntimePolicy({
+            devices: [{ type: 'cdi', value: 'nvidia.com/gpu' }],
+        }, 'test'),
+        /invalid CDI device/,
+    );
+});
+
+test('catalog validation contract exposes supported security options', () => {
+    assert.deepEqual(
+        Array.from(CATALOG_VALIDATION_CONTRACT.securityOpt).sort(),
+        ['label=disable', 'seccomp=unconfined'].sort(),
+    );
+});
+
+test('validateRuntimePolicy accepts supported security options', () => {
+    for (const opt of ['label=disable', 'seccomp=unconfined']) {
+        assert.doesNotThrow(
+            () => validateRuntimePolicy({ securityOpt: [opt] }, 'test'),
+            `${opt} should be accepted`,
+        );
+    }
+});
+
 test('validateRuntimePolicy rejects arbitrary host devices', () => {
+    for (const hostPath of ['/dev/kfd', '/dev/dri', '/dev/dri/renderD128', '/dev/accel', '/dev/accel/accel0']) {
+        assert.doesNotThrow(
+            () => validateRuntimePolicy({
+                devices: [{ type: 'hostDevice', hostPath }],
+            }, 'test'),
+            `${hostPath} should be accepted`,
+        );
+    }
+    assert.throws(
+        () => validateRuntimePolicy({
+            devices: [{ type: 'hostDevice', hostPath: '/dev/sda' }],
+        }, 'test'),
+        /host device path/,
+    );
+    assert.throws(
+        () => validateRuntimePolicy({
+            devices: [{ type: 'hostDevice', hostPath: '/dev/nvidia0' }],
+        }, 'test'),
+        /host device path/,
+    );
+    for (const hostPath of ['/dev/dri/../sda', '/dev/accel/../../sda', '/dev/dri/./renderD128', '/dev/kfd/child']) {
+        assert.throws(
+            () => validateRuntimePolicy({
+                devices: [{ type: 'hostDevice', hostPath }],
+            }, 'test'),
+            /host device path/,
+            `${hostPath} should be rejected`,
+        );
+    }
     assert.throws(
         () => validateRuntimePolicy({
             devices: [{ type: 'hostDevice', hostPath: '/etc/shadow' }],
+        }, 'test'),
+        /invalid host device path/,
+    );
+    assert.throws(
+        () => validateRuntimePolicy({
+            devices: [{ type: 'hostDevice', hostPath: '/dev/${GPU}' }],
+        }, 'test'),
+        /invalid host device path/,
+    );
+    assert.throws(
+        () => validateRuntimePolicy({
+            env: { LD_PRELOAD: '/tmp/hook.so' },
+        }, 'test'),
+        /unknown field 'env'/,
+    );
+});
+
+test('validateRuntimePolicy rejects incomplete typed devices', () => {
+    assert.throws(
+        () => validateRuntimePolicy({
+            devices: [{ type: 'cdi' }],
+        }, 'test'),
+        /invalid CDI device/,
+    );
+    assert.throws(
+        () => validateRuntimePolicy({
+            devices: [{ type: 'hostDevice' }],
         }, 'test'),
         /invalid host device path/,
     );
@@ -180,5 +421,7 @@ test('loadCatalog default workspace catalog passes validation', () => {
     assert.equal(result.catalogId, 'local-llm-architectures/default');
     assert.ok(result.architectures.has('cpu-amd64'));
     assert.ok(result.architectures.has('cpu-arm64'));
-    assert.ok(result.architectures.has('nvidia-cuda-amd64'));
+    assert.ok(result.architectures.has('nvidia-amd64'));
+    assert.ok(result.architectures.has('nvidia-spark-arm64-sm121'));
+    assert.ok(result.images.has('intel-amd64'));
 });

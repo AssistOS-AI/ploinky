@@ -34,6 +34,7 @@ function runCommandProbe(probe, options = {}) {
         ok: !result.error && result.status === 0,
         status: result.status ?? null,
         timedOut: Boolean(result.error && result.error.code === 'ETIMEDOUT'),
+        stdout: typeof result.stdout === 'string' ? result.stdout : '',
         stdoutSnippet: snippet(result.stdout, 3, 256),
         stderrSnippet: snippet(result.stderr, 1, 200),
         error: result.error ? result.error.message : null,
@@ -87,6 +88,7 @@ function inspectPodmanDaemon(runtime, options = {}) {
 function defaultProbes() {
     return {
         nvidiaSmi: { kind: 'command', command: 'nvidia-smi', args: ['-L'] },
+        nvidiaComputeCapability: { kind: 'command', command: 'nvidia-smi', args: ['--query-gpu=compute_cap', '--format=csv,noheader'] },
         nvidiaCdi: { kind: 'command', command: 'nvidia-ctk', args: ['cdi', 'list'] },
         kfdDevice: { kind: 'file', path: '/dev/kfd' },
         driDevice: { kind: 'file', path: '/dev/dri' },
@@ -111,6 +113,43 @@ function runProbes(probeSet, options = {}) {
         }
     }
     return results;
+}
+
+function compareComputeCapability(left, right) {
+    const parse = (value) => {
+        const match = String(value || '').trim().match(/^([0-9]+)(?:\.([0-9]+))?$/);
+        if (!match) return null;
+        return [Number(match[1]), Number(match[2] || 0)];
+    };
+    const leftParts = parse(left);
+    const rightParts = parse(right);
+    if (!leftParts || !rightParts) return null;
+    if (leftParts[0] !== rightParts[0]) return leftParts[0] - rightParts[0];
+    return leftParts[1] - rightParts[1];
+}
+
+function parseNvidiaComputeCapability(rawOutput) {
+    let best = null;
+    for (const line of String(rawOutput || '').split(/\r?\n/)) {
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+        if (!/^([0-9]+)(?:\.([0-9]+))?$/.test(trimmed)) continue;
+        if (!best || compareComputeCapability(trimmed, best) > 0) {
+            best = trimmed.includes('.') ? trimmed : `${trimmed}.0`;
+        }
+    }
+    return best;
+}
+
+function summarizeAcceleratorDetails(probes) {
+    const details = {};
+    const nvidiaCapability = probes?.nvidiaComputeCapability?.ok
+        ? parseNvidiaComputeCapability(probes.nvidiaComputeCapability.stdout || probes.nvidiaComputeCapability.stdoutSnippet)
+        : null;
+    if (nvidiaCapability) {
+        details['nvidia-cuda'] = { computeCapability: nvidiaCapability };
+    }
+    return details;
 }
 
 function summarizeAcceleratorFamilies(probes) {
@@ -154,6 +193,7 @@ function detectHardware(options = {}) {
         : null;
     const ociPlatform = daemonInspection?.platform || hostPlatform || null;
     const acceleratorFamilies = summarizeAcceleratorFamilies(probes);
+    const acceleratorDetails = summarizeAcceleratorDetails(probes);
 
     return {
         runtime,
@@ -162,6 +202,7 @@ function detectHardware(options = {}) {
         ociPlatform,
         daemon: daemonInspection,
         acceleratorFamilies,
+        acceleratorDetails,
         probes,
     };
 }
@@ -174,6 +215,8 @@ export {
     inspectPodmanDaemon,
     normalizeArch,
     normalizePlatform,
+    parseNvidiaComputeCapability,
     runProbes,
+    summarizeAcceleratorDetails,
     summarizeAcceleratorFamilies,
 };

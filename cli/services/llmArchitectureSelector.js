@@ -1,6 +1,7 @@
 import { validatePolicyShape } from './containerRuntimePolicy.js';
+import { detectHardware } from './hardwareDetection.js';
+import { loadCatalog } from './llmArchitectureCatalog.js';
 
-const AGENT_ID_RE = /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$/;
 const ARCH_ID_RE = /^[a-z0-9][a-z0-9._-]{0,63}$/;
 const ACCELERATOR_FAMILIES = new Set(['cpu', 'nvidia-cuda', 'amd-rocm', 'vulkan', 'intel-openvino']);
 const ALLOWED_PLATFORMS = new Set(['linux/amd64', 'linux/arm64']);
@@ -14,30 +15,34 @@ class ArchitectureSelectionError extends Error {
     }
 }
 
-function safeAgentIdentity({ agentName, alias }) {
-    const candidate = String(alias || agentName || '').trim();
-    if (!AGENT_ID_RE.test(candidate)) return null;
-    return candidate;
-}
-
-function resolveImageRef(image, identity) {
-    if (!image) return null;
-    const ref = String(image.ref || '');
-    if (!ref.includes('${')) return ref;
-    if (!identity) {
-        throw new ArchitectureSelectionError(
-            `image '${image.id}' template uses ${'${AGENT_IMAGE_NAME}'} but agent identity is not validated`
-        );
-    }
-    return ref.replace(/\$\{AGENT_IMAGE_NAME\}/g, identity);
-}
-
 function envOverride(env, name) {
     if (!env || typeof env !== 'object') return null;
     const value = env[name];
     if (value === undefined || value === null) return null;
     const trimmed = String(value).trim();
     return trimmed.length > 0 ? trimmed : null;
+}
+
+function perAgentImageOverrideName(agentName) {
+    const normalized = String(agentName || '').toUpperCase().replace(/[^A-Z0-9]/g, '_');
+    return normalized ? `PLOINKY_${normalized}_IMAGE` : null;
+}
+
+function findUnsupportedImageOverride(env, agentName) {
+    const globalValue = envOverride(env, 'PLOINKY_LLM_AGENT_IMAGE');
+    if (globalValue) return { name: 'PLOINKY_LLM_AGENT_IMAGE', value: globalValue };
+    const perAgentName = perAgentImageOverrideName(agentName);
+    if (!perAgentName) return null;
+    const perAgentValue = envOverride(env, perAgentName);
+    return perAgentValue ? { name: perAgentName, value: perAgentValue } : null;
+}
+
+function rejectUnsupportedImageOverride(env, agentName) {
+    const override = findUnsupportedImageOverride(env, agentName);
+    if (!override) return;
+    throw new ArchitectureSelectionError(
+        `${override.name}: raw image override is unsupported for LLM runtime selection; use catalog architecture policy`
+    );
 }
 
 function probesSatisfied(requiredProbes, probes) {
@@ -61,6 +66,27 @@ function platformMatches(architecturePlatform, hardware, forcePlatform) {
     return targets.has(architecturePlatform);
 }
 
+function parseComputeCapability(value) {
+    const match = String(value || '').trim().match(/^([0-9]+)(?:\.([0-9]+))?$/);
+    if (!match) return null;
+    return [Number(match[1]), Number(match[2] || 0)];
+}
+
+function compareComputeCapability(actual, minimum) {
+    const actualParts = parseComputeCapability(actual);
+    const minimumParts = parseComputeCapability(minimum);
+    if (!actualParts || !minimumParts) return null;
+    if (actualParts[0] !== minimumParts[0]) return actualParts[0] - minimumParts[0];
+    return actualParts[1] - minimumParts[1];
+}
+
+function hardwareComputeCapability(hardware, family) {
+    const details = hardware?.acceleratorDetails?.[family];
+    if (typeof details?.computeCapability === 'string') return details.computeCapability;
+    if (typeof hardware?.computeCapabilities?.[family] === 'string') return hardware.computeCapabilities[family];
+    return null;
+}
+
 function candidateCompatibilityReasons(arch, catalog, hardware, options = {}) {
     const reasons = [];
     if (options.forcePlatform && arch.platform !== options.forcePlatform) {
@@ -77,6 +103,15 @@ function candidateCompatibilityReasons(arch, catalog, hardware, options = {}) {
     }
     if (arch.accelerator.family !== 'cpu' && !hardware?.acceleratorFamilies?.includes(arch.accelerator.family)) {
         reasons.push('accelerator-family-unavailable');
+    }
+    if (arch.accelerator.minimumComputeCapability !== undefined) {
+        const actualCapability = hardwareComputeCapability(hardware, arch.accelerator.family);
+        const comparison = compareComputeCapability(actualCapability, arch.accelerator.minimumComputeCapability);
+        if (!actualCapability || comparison === null) {
+            reasons.push('compute-capability-unknown');
+        } else if (comparison < 0) {
+            reasons.push('minimum-compute-capability-unmet');
+        }
     }
     if (!runtimeMatches(arch, hardware)) {
         reasons.push('container-runtime-mismatch');
@@ -184,7 +219,7 @@ function selectArchitecture(catalog, hardware, options = {}) {
         throw new ArchitectureSelectionError('catalog: missing architectures');
     }
     const env = options.env || {};
-    const identity = safeAgentIdentity({ agentName: options.agentName, alias: options.alias });
+    rejectUnsupportedImageOverride(env, options.agentName);
 
     const archOverride = envOverride(env, 'PLOINKY_LLM_ARCHITECTURE_ID');
     if (archOverride && !ARCH_ID_RE.test(archOverride)) {
@@ -245,30 +280,17 @@ function selectArchitecture(catalog, hardware, options = {}) {
         }
     }
 
-    let image = catalog.images.get(chosen.image);
+    const image = catalog.images.get(chosen.image);
     if (!image) {
         throw new ArchitectureSelectionError(`architecture '${chosen.id}' references unknown image '${chosen.image}'`);
     }
-    const imageOverride = envOverride(env, 'PLOINKY_LLM_AGENT_IMAGE')
-        || envOverride(env, `PLOINKY_${String(options.agentName || '').toUpperCase().replace(/[^A-Z0-9]/g, '_')}_IMAGE`);
-    let imageRef;
-    let imageDigest = image.digest || null;
-    let imageSource = 'catalog';
-    if (imageOverride) {
-        if (imageOverride.length > 512) {
-            throw new ArchitectureSelectionError('PLOINKY_LLM_AGENT_IMAGE: value too long');
-        }
-        imageRef = imageOverride;
-        imageDigest = null;
-        imageSource = 'env-override';
-        explanation.overrides.imageRef = imageRef;
-    } else {
-        imageRef = resolveImageRef(image, identity);
-        if (!imageRef || imageRef.includes('${')) {
-            throw new ArchitectureSelectionError(
-                `image '${image.id}' could not be resolved (agent identity '${identity || ''}' invalid or missing)`
-            );
-        }
+    const imageRef = String(image.ref || '').trim();
+    const imageDigest = image.digest || null;
+    const imageSource = 'catalog';
+    if (!imageRef || imageRef.includes('${')) {
+        throw new ArchitectureSelectionError(
+            `image '${image.id}' ref must be a literal image reference`
+        );
     }
 
     return {
@@ -284,8 +306,21 @@ function selectArchitecture(catalog, hardware, options = {}) {
         runtimePolicy: chosen.runtimePolicy || null,
         engineDefaults: chosen.engineDefaults || null,
         explanation,
-        agentIdentity: identity,
     };
+}
+
+async function selectLlmArchitecture(options = {}) {
+    const env = options.env || process.env;
+    rejectUnsupportedImageOverride(env, options.agentName);
+    const catalog = options.catalog || loadCatalog({ env });
+    const hardware = options.hardware || detectHardware({ runtime: options.runtime, env });
+    const selectorEnv = options.requestedArchitectureId
+        ? { ...env, PLOINKY_LLM_ARCHITECTURE_ID: options.requestedArchitectureId }
+        : env;
+    return selectArchitecture(catalog, hardware, {
+        ...options,
+        env: selectorEnv,
+    });
 }
 
 export {
@@ -295,4 +330,5 @@ export {
     findCpuFallback,
     pickPreferredCandidate,
     selectArchitecture,
+    selectLlmArchitecture,
 };
