@@ -6,6 +6,7 @@ import { resolveEnabledAgentRecord } from '../../services/agents.js';
 import { findAgent } from '../../services/utils.js';
 import { GUEST_SESSION_TTL_SECONDS, getSessionCookieMaxAge as getLocalSessionCookieMaxAge, mintGuestSessionJwt, mintSessionJwt } from '../auth/localService.js';
 import { waitForAgentReady } from '../utils/agentReadiness.js';
+import { evaluateRequiredCapability } from './requiredCapability.mjs';
 import {
     appendLog,
     appendSetCookie,
@@ -155,6 +156,32 @@ function resolveAuthContextForRouteKey(routeKey) {
     const policy = record?.auth || { mode: 'none' };
     const mode = String(policy.mode || 'none').trim().toLowerCase() || 'none';
     return { routeKey: normalizedRouteKey, mode, policy, record };
+}
+
+function resolveRequiredCapabilityRecord(routeKey, fallbackRecord = null) {
+    const normalizedRouteKey = String(routeKey || '').trim();
+    if (!normalizedRouteKey) return fallbackRecord || {};
+
+    let record = null;
+    try {
+        record = resolveEnabledAgentRecord(normalizedRouteKey)?.record || null;
+    } catch (_) {
+        record = null;
+    }
+    if (!record && fallbackRecord) record = fallbackRecord;
+
+    const routing = readRouting();
+    const manifest = readEnabledAgentManifest(normalizedRouteKey, routing.routes || {});
+    const routerAccess = manifest?.routerAccess || record?.routerAccess || null;
+    if (!routerAccess) return record || {};
+    return { ...(record || {}), routerAccess };
+}
+
+function evaluateAuthenticatedRouteCapability(authContext, user) {
+    const routeKey = String(authContext?.serviceRouteKey || authContext?.routeKey || '').trim();
+    const fallbackRecord = authContext?.serviceRouteKey ? null : authContext?.record;
+    const record = resolveRequiredCapabilityRecord(routeKey, fallbackRecord);
+    return evaluateRequiredCapability(record, user);
 }
 
 function isUserAuthenticatedAuthMode(mode) {
@@ -404,6 +431,11 @@ async function ensureAuthenticatedWithContext(req, res, parsedUrl, authContext) 
     req.session = session;
     req.sessionId = sessionId;
     req.authMode = authContext.mode;
+    const capability = evaluateAuthenticatedRouteCapability(authContext, req.user);
+    if (!capability.ok) {
+        sendJson(res, 403, { ok: false, error: capability.code || 'CAPABILITY_REQUIRED' });
+        return { ok: false, error: capability.code || 'CAPABILITY_REQUIRED', required: capability.required };
+    }
     try {
         if (authContext.mode === 'local' && session.user) {
             const refreshedJwt = mintSessionJwt(session.user, session._jwtPayload?.rev || 1, {

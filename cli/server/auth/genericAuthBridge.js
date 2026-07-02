@@ -261,6 +261,7 @@ export function createGenericAuthBridge(options = {}) {
         const expiresAt = providerSession?.expiresAt || (now + sessionStore.sessionTtlMs);
         const refreshExpiresAt = providerSession?.refreshExpiresAt || session.refreshExpiresAt || null;
         sessionStore.updateSession(sessionId, {
+            ...(user ? { user } : {}),
             tokens: providerSession?.tokens || session.tokens,
             providerSession,
             expiresAt,

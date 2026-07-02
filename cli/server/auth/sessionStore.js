@@ -76,6 +76,9 @@ function createSessionStore({ sessionTtlMs = DEFAULT_SESSION_TTL_MS, pendingTtlM
     function updateSession(sessionId, updates) {
         const session = getSession(sessionId);
         if (!session) return null;
+        if (Object.prototype.hasOwnProperty.call(updates, 'user')) {
+            session.user = updates.user;
+        }
         if (updates.tokens) {
             session.tokens = { ...session.tokens, ...updates.tokens };
         }
