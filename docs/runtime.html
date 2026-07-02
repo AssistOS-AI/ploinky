@@ -29,7 +29,7 @@
         </header>
 
         <section class="chapter-section">
-          <h2>Workspace State Under <code>.ploinky/</code></h2>
+          <h2>Workspace State</h2>
           <table class="data-table">
             <thead>
               <tr>
@@ -47,8 +47,8 @@
                 <td>Cloned agent and skills repositories managed by <code>install</code>/<code>add</code> and <code>uninstall</code>/<code>remove</code>.</td>
               </tr>
               <tr>
-                <td><code>.ploinky/agents/</code></td>
-                <td>Isolated per-agent working directories used by the default run mode.</td>
+                <td><code>.data/&lt;agent-or-alias&gt;/</code></td>
+                <td>Persistent host-side agent home mounted at <code>/root</code> for enabled-agent instances. Destroy preserves this directory.</td>
               </tr>
               <tr>
                 <td><code>.ploinky/code/</code> and <code>.ploinky/skills/</code></td>
@@ -56,7 +56,7 @@
               </tr>
               <tr>
                 <td><code>.ploinky/deps/</code></td>
-                <td>Runtime-keyed global and per-agent Node dependency caches.</td>
+                <td>Runtime-keyed global and per-agent Node dependency caches. Destroy clears this regenerated cache.</td>
               </tr>
               <tr>
                 <td><code>.ploinky/keys/</code></td>
@@ -80,11 +80,11 @@
           <div class="grid-two">
             <div class="mini-panel">
               <h3><code>isolated</code></h3>
-              <p>The default mode creates a working directory under <code>.ploinky/agents/&lt;agent&gt;/</code>. The path must stay inside the workspace root.</p>
+              <p>The default mode uses <code>.data/&lt;agent-or-alias&gt;/</code> as both the per-instance working directory and the persistent home mounted at <code>/root</code>.</p>
             </div>
             <div class="mini-panel">
               <h3><code>global</code> and <code>devel</code></h3>
-              <p><code>global</code> points the agent at the workspace root. <code>devel</code> points the agent at a repository checkout under <code>.ploinky/repos/&lt;repo&gt;/</code>, enabling live development against a cloned repository.</p>
+              <p><code>global</code> points the agent at the workspace root. <code>devel</code> points the agent at a repository checkout under <code>.ploinky/repos/&lt;repo&gt;/</code>. Both modes still mount <code>.data/&lt;agent-or-alias&gt;/</code> at <code>/root</code> for CLI and tool configuration.</p>
             </div>
           </div>
           <p>Aliases become route keys and container names. This is how Ploinky supports multiple instances of the same agent in one workspace without overwriting the registry entry for the canonical instance.</p>
@@ -103,7 +103,7 @@
           </div>
           <p>Required non-sensitive environment entries must be complete in the active profile through a manifest <code>default</code> or <code>value</code>. URLs, hostnames, public IPs, realms, and ports belong in profiles so <code>ploinky profile prod</code> followed by <code>ploinky start &lt;agent&gt;</code> can boot a fresh workspace. Manually configured secrets, tokens, API keys, passwords, and master keys remain secret-owned and can be supplied by encrypted vars or deployment environment; <code>generatedSecret</code> entries are derived by Ploinky instead.</p>
           <div class="callout callout--warm">
-            <p>Manifest volumes resolve relative host paths against the workspace root and honor absolute host paths as declared. Durable service data should prefer <code>.ploinky/data/</code>, generated startup inputs should prefer <code>.ploinky/agents/</code>, and container destinations should use semantic paths such as <code>/data</code> or <code>/working-data/generated</code> unless an upstream image requires a specific path. Runtime resource planning can also create persistent storage directories under <code>.ploinky/data/</code> and template environment values from workspace roots, storage paths, secrets, and variables.</p>
+            <p>Manifest volumes resolve relative host paths against the workspace root and honor absolute host paths as declared. Runtime-resource persistent storage should prefer <code>.ploinky/data/</code>, while agent-owned home files and generated startup inputs should prefer <code>.data/&lt;agent-or-alias&gt;/</code>. Container destinations should use semantic paths such as <code>/data</code>, <code>/root</code>, or <code>/working-data/generated</code> unless an upstream image requires a specific path. Runtime resource planning can also create persistent storage directories under <code>.ploinky/data/</code> and template environment values from workspace roots, storage paths, secrets, and variables.</p>
           </div>
         </section>
 

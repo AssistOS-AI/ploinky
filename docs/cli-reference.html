@@ -43,6 +43,7 @@
                         <li><a href="#workspace">Workspace Commands</a></li>
                         <li><a href="#variables">Variables & Environment</a></li>
                         <li><a href="#web">Web Interfaces</a></li>
+                        <li><a href="#ploinky-shell">Ploinky Shell</a></li>
                         <li><a href="#auth">Authentication</a></li>
                         <li><a href="#client">Client Operations</a></li>
                         <li><a href="#system">System Management</a></li>
@@ -136,11 +137,11 @@ update repo basic         # Update one .ploinky/repos entry</code></pre>
                             </tr>
                             <tr>
                                 <td>isolated (omitted)</td>
-                                <td>Agent runs inside a new subfolder named <code>&lt;agentName&gt;</code> in the current project directory.</td>
+                                <td>Agent uses <code>.data/&lt;agentName&gt;</code> or <code>.data/&lt;alias&gt;</code> as its host data directory and workspace; containers mount it at <code>/root</code>.</td>
                             </tr>
                             <tr>
                                 <td>global</td>
-                                <td>Agent runs in the current project directory.</td>
+                                <td>Agent runs in the current project directory and still uses <code>.data/&lt;agent-or-alias&gt;</code> as the persistent <code>/root</code> home.</td>
                             </tr>
                             <tr>
                                 <td>devel &lt;repoName&gt;</td>
@@ -148,7 +149,7 @@ update repo basic         # Update one .ploinky/repos entry</code></pre>
                             </tr>
                         </table>
                         <pre><code># Examples
-enable agent demo                    # isolated (creates ./demo)
+enable agent demo                    # isolated (creates .data/demo)
 enable agent demo global             # run in current directory
 enable agent demo devel simulator    # run inside .ploinky/repos/simulator
 enable agent demo as demo2           # second container with alias "demo2"</code></pre>
@@ -163,7 +164,7 @@ enable agent demo as demo2           # second container with alias "demo2"</code
                         </table>
 
                         <div class="alert alert-info">
-                            <strong>Note:</strong> Using <code>enable agent</code> is optional. You can <code>install</code> a repository and then <code>start &lt;agent&gt;</code> directly; the agent will use the isolated mode and a subfolder <code>&lt;agentName&gt;</code> will be created. When supplying an alias, it becomes the container name for reinstall/disable/start operations and must be unique; reusing an alias returns <code>alias already exists</code>.
+                            <strong>Note:</strong> Using <code>enable agent</code> is optional. You can <code>install</code> a repository and then <code>start &lt;agent&gt;</code> directly; the agent will use isolated mode and create <code>.data/&lt;agentName&gt;</code>. When supplying an alias, it becomes the route/container identity and creates <code>.data/&lt;alias&gt;</code>; aliases must be unique and reusing one returns <code>alias already exists</code>.
                         </div>
 
                         <h3>reinstall agent</h3>
@@ -245,10 +246,13 @@ start AchillesIDE/explorer 8080 --branch feature-branch --repo-branch proxies=ma
 start AchillesIDE/explorer 8097 --branch feature-branch --branch-fallback fail --reset-repos</code></pre>
 
                         <h3>shell</h3>
-                        <p>Open interactive shell session in agent container.</p>
+                        <p>Open an interactive shell session inside an agent runtime. For containerized agents this enters the agent container with full TTY support and the same mounted home directory the agent uses.</p>
                         <pre><code>shell &lt;agentName&gt;</code></pre>
+                        <pre><code># Examples
+shell codexAgent
+ploinky shell codexAgent</code></pre>
                         <div class="alert alert-warning">
-                            Attaches to a persistent container with full TTY support. Exit shell by typing "exit" to return to host.
+                            Exit the shell by typing <code>exit</code> to return to the host.
                         </div>
 
                         <h3>cli</h3>
@@ -256,9 +260,10 @@ start AchillesIDE/explorer 8097 --branch feature-branch --branch-fallback fail -
                         <pre><code>cli &lt;agentName&gt; [args...]</code></pre>
                         <pre><code># Examples
 cli MyAPI --help
-cli PyBot --version</code></pre>
+cli PyBot --version
+ploinky cli codexAgent</code></pre>
                         <div class="alert alert-info">
-                            Any extra arguments after <code>cli &lt;agentName&gt;</code> are appended directly to the manifest CLI command. This is also how routed WebChat launches pass query parameters through to an agent CLI.
+                            Any extra arguments after <code>cli &lt;agentName&gt;</code> are appended directly to the manifest CLI command. For coding agents such as <code>codexAgent</code>, this lets you use the coding CLI inside the agent's containerized runtime instead of running it directly on the host.
                         </div>
 
                         <h3>status</h3>
@@ -370,6 +375,25 @@ webchat --rotate     # accepted for compatibility; still uses router login</code
 
                     </div>
 
+                    <div class="doc-section" id="ploinky-shell">
+                        <h2>Ploinky Shell</h2>
+                        <p>Ploinky Shell is an LLM-only helper mode for quick command recommendations without initializing the full workspace. It does not create a <code>.ploinky</code> folder, clone repositories, or start agents, and regular Ploinky workspace commands are rejected in this mode.</p>
+                        <pre><code>ploinky -shell            # interactive shell
+ploinky --shell           # same as -shell
+ploinky sh                # alias for Ploinky Shell
+psh                       # alias for Ploinky Shell
+ploinky -shell &lt;text&gt;     # single-shot suggestion and exit</code></pre>
+                        <ul>
+                            <li>Single-command suggestions ask <code>Execute? (y/n)</code> before running.</li>
+                            <li>API keys are read from <code>.env</code> found upward from the current directory and from your environment variables.</li>
+                            <li>Startup logs show the <code>.env</code> path used and available LLM model names.</li>
+                            <li>Use <code>/settings</code> inside the shell to configure LLM model and provider preferences interactively.</li>
+                        </ul>
+                        <div class="alert alert-info">
+                            <strong>Different from <code>ploinky shell &lt;agentName&gt;</code>:</strong> Ploinky Shell is a host-side LLM command helper. The <code>shell &lt;agentName&gt;</code> command enters an enabled agent runtime, such as a containerized <code>codexAgent</code>.
+                        </div>
+                    </div>
+
                     <div class="doc-section" id="auth">
                         <h2>Authentication</h2>
 
@@ -469,7 +493,7 @@ MCP ping succeeded.</code></pre>
                         <pre><code>shutdown</code></pre>
 
                         <h3>destroy</h3>
-                        <p>Stop the router and remove ALL Ploinky runtimes in the workspace. <code>clean</code> is an alias for <code>destroy</code>. Host-sandboxed agents receive the graceful signal together, then any remaining process groups are force-killed after the shared timeout.</p>
+                        <p>Stop the router, remove ALL Ploinky runtimes in the workspace, and clear the regenerated dependency cache under <code>.ploinky/deps/</code>. <code>clean</code> is an alias for <code>destroy</code>. Persistent agent home data under <code>.data/&lt;agent-or-alias&gt;/</code> is preserved and mounted again on the next start. Host-sandboxed agents receive the graceful signal together, then any remaining process groups are force-killed after the shared timeout.</p>
                         <pre><code>destroy
 clean</code></pre>
                     </div>
@@ -550,13 +574,12 @@ help cli       # Help for cli command</code></pre>
                         <h2>Configuration Files</h2>
                         
                         <h3>Workspace Directory Structure</h3>
-                        <pre><code>.ploinky/
+<pre><code>.ploinky/
 ├── agents.json       # Enabled agents registry
 ├── .secrets          # Environment variables
 ├── profile           # Active profile name
 ├── ploinky_history   # CLI command history
 ├── repos/            # Cloned repositories
-├── agents/           # Per-agent work directories
 ├── code/             # Symlinks to agent code
 ├── skills/           # Symlinks to agent skills
 ├── logs/             # Router and watchdog logs
@@ -567,7 +590,10 @@ help cli       # Help for cli command</code></pre>
 ├── transcripts/      # Conversation transcripts
 └── deps/             # Dependency caches
     ├── global/
-    └── agents/</code></pre>
+    └── agents/
+
+.data/
+└── &lt;agent-or-alias&gt;/ # Persistent agent home mounted at /root</code></pre>
 
                         <h3>Agent Manifest (manifest.json)</h3>
                         <pre><code>{

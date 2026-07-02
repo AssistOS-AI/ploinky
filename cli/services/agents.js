@@ -22,7 +22,7 @@ import {
     removeAgentSymlinks,
     createAgentWorkDir,
     removeAgentWorkDir,
-    getAgentWorkDir
+    getAgentDataDir
 } from './workspaceStructure.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -40,24 +40,6 @@ export function isEnableAgentMode(value) {
 
 function formatEnableAgentModes() {
     return ENABLE_AGENT_MODES.join(' | ');
-}
-
-function isPathUnderRoot(candidate) {
-    if (!candidate) return false;
-    const root = path.resolve(PLOINKY_WORKSPACE_ROOT);
-    const resolved = path.resolve(candidate);
-    const relative = path.relative(root, resolved);
-    return relative && !relative.startsWith('..') && !path.isAbsolute(relative);
-}
-
-function normalizeExistingProjectPath(candidate, runMode) {
-    if (!candidate || typeof candidate !== 'string') return '';
-    const resolved = path.resolve(candidate);
-    if (!fs.existsSync(resolved)) return '';
-    if ((runMode || 'isolated') === 'isolated' && !isPathUnderRoot(resolved)) {
-        return '';
-    }
-    return resolved;
 }
 
 function normalizeAlias(aliasInput) {
@@ -264,6 +246,7 @@ export function enableAgent(agentName, mode, repoNameParam, aliasParam, authMode
     const containerBaseName = alias || shortAgentName;
     const containerName = getAgentContainerName(containerBaseName, repoName);
     const routeKey = alias || shortAgentName;
+    const instanceName = alias || shortAgentName;
     const authMode = authModeParam === undefined || authModeParam === null || String(authModeParam).trim() === ''
         ? resolveManifestAuthMode(manifest)
         : normalizeAuthMode(authModeParam);
@@ -289,24 +272,9 @@ export function enableAgent(agentName, mode, repoNameParam, aliasParam, authMode
     let projectPath = '';
 
     if (!normalizedMode || normalizedMode === 'default' || normalizedMode === DEFAULT_ENABLE_AGENT_MODE) {
-        try {
-            const existing = Object.values(map || {}).find(
-                r => r && r.type === 'agent' && r.agentName === shortAgentName && r.repoName === repoName && !r.alias
-            );
-            if (existing && (!existing.runMode || existing.runMode === DEFAULT_ENABLE_AGENT_MODE) && existing.projectPath) {
-                const normalizedPath = normalizeExistingProjectPath(existing.projectPath, existing.runMode || DEFAULT_ENABLE_AGENT_MODE);
-                if (normalizedPath) {
-                    projectPath = normalizedPath;
-                    runMode = DEFAULT_ENABLE_AGENT_MODE;
-                }
-            }
-        } catch (_) {}
-        if (!projectPath) {
-            runMode = DEFAULT_ENABLE_AGENT_MODE;
-            // Use workspace structure: $PLOINKY_WORKSPACE_ROOT/.ploinky/agents/<agentName>/
-            projectPath = getAgentWorkDir(shortAgentName);
-            try { fs.mkdirSync(projectPath, { recursive: true }); } catch (_) {}
-        }
+        runMode = DEFAULT_ENABLE_AGENT_MODE;
+        projectPath = getAgentDataDir(instanceName);
+        try { fs.mkdirSync(projectPath, { recursive: true }); } catch (_) {}
     } else if (normalizedMode === 'global') {
         runMode = 'global';
         projectPath = PLOINKY_WORKSPACE_ROOT;
@@ -330,6 +298,9 @@ export function enableAgent(agentName, mode, repoNameParam, aliasParam, authMode
     const { portMappings } = parseManifestPorts(manifest);
     // If no ports specified, use default 7000
     const ports = portMappings.length > 0 ? portMappings : [{ containerPort: 7000 }];
+    const projectMountTarget = runMode === DEFAULT_ENABLE_AGENT_MODE ? '/root' : projectPath;
+    const homePath = getAgentDataDir(instanceName);
+    try { fs.mkdirSync(homePath, { recursive: true }); } catch (_) {}
     
     const record = {
         agentName: shortAgentName,
@@ -342,7 +313,8 @@ export function enableAgent(agentName, mode, repoNameParam, aliasParam, authMode
         type: 'agent',
         config: {
             binds: [
-                { source: projectPath, target: projectPath },
+                { source: projectPath, target: projectMountTarget },
+                ...(runMode === DEFAULT_ENABLE_AGENT_MODE ? [] : [{ source: homePath, target: '/root' }]),
                 { source: path.resolve(__dirname, '../../../Agent'), target: '/Agent' },
                 { source: agentPath, target: '/code' }
             ],
@@ -407,8 +379,8 @@ export function enableAgent(agentName, mode, repoNameParam, aliasParam, authMode
 
     // Create workspace structure for the agent
     try {
-        // Create agent working directory: $PLOINKY_WORKSPACE_ROOT/.ploinky/agents/<agentName>/
-        createAgentWorkDir(shortAgentName);
+        // Create per-instance data directory: $PLOINKY_WORKSPACE_ROOT/.data/<alias|agentName>/
+        createAgentWorkDir(instanceName);
 
         // Create symlinks: $PLOINKY_WORKSPACE_ROOT/.ploinky/code/<agentName> and .ploinky/skills/<agentName>
         createAgentSymlinks(shortAgentName, repoName, agentPath);

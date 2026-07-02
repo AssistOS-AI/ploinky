@@ -217,13 +217,16 @@ $ ploinky start explorer
 
                 <div class="doc-section">
                     <h2>Introduction to Agents</h2>
-                    <p>In Ploinky, an "agent" is a tool that you can use and modify. It's an abstract concept and doesn't necessarily refer to a Large Language Model (LLM). Agents can be anything from a simple script to a complex application.</p>
-                    <p>Agents are organized in repositories, which can contain multiple agents. You can easily add new repositories, and modify existing agents to fit your needs.</p>
+                    <p>In Ploinky, an "agent" is a tool that you can use and modify. It can be a simple script, a long-running service, a web application, or an LLM-powered coding tool.</p>
+                    <p>Agents are organized in repositories, which can contain multiple agents. You can add repositories, enable the agents you need, and keep their runtime files separated from your project files.</p>
+                    <p>Coding assistants can also be installed as Ploinky agents. For example, a <code>codexAgent</code> can run Codex inside a containerized environment, so its shell, package installs, and CLI configuration stay inside the agent home instead of directly mutating your host machine.</p>
+                    <p>This is useful when a coding agent needs to inspect an unfamiliar project or install dependencies you do not fully trust. Running the agent in a container lets you keep the host workspace safer while still giving the agent a controlled place to work.</p>
 
                     <h3>Using Agents</h3>
-                    <p>You can interact with agents in two main ways:</p>
+                    <p>You can interact with agents in three main ways:</p>
                     <ol style="margin-left: 2rem; line-height: 2;">
-                        <li><strong>Individually:</strong> You can run an agent's command-line interface directly using the <code>cli</code> command. For example: <code>cli my-agent --input "some data"</code>. Agents can be designed to accept various input formats, such as JSON, natural language, or any other convention.</li>
+                        <li><strong>Individually:</strong> You can run an agent's command-line interface directly using the <code>cli</code> command. For example, <code>ploinky cli codexAgent</code> opens the Codex agent CLI inside its containerized environment. Agents can accept JSON, natural language, files, or any other convention defined by their manifest.</li>
+                        <li><strong>As a shell environment:</strong> You can enter an agent's container with <code>ploinky shell &lt;agentName&gt;</code>. This is useful when you want to inspect the runtime, run package managers, debug tool installation, or see the same filesystem and home directory the agent sees.</li>
                         <li><strong>Integrated with Ploinky:</strong> By enabling an agent, it becomes part of the Ploinky workspace. The Ploinky server will expose the agent on a local port, which allows you to build applications that interact with your agents through a simple API on localhost. When you open the web interface, you will need to provide a token, which can be found in <code>.ploinky/.secrets</code>.</li>
                     </ol>
                 </div>
@@ -235,8 +238,7 @@ $ ploinky start explorer
                     <p>When you are in the project directory, you can use the <code>ploinky</code> command directly. Here are the first steps to get you started:</p>
                     <ol style="margin-left: 2rem; line-height: 2;">
                         <li>Run <code>ploinky</code> to initialize your workspace</li>
-                        <li>Install the demo repository: <code>install https://github.com/AssistOS-AI/demo.git demo</code></li>
-                        <li>Start demo agent: <code>start demo</code></li>
+                        <li>Start explorer agent: <code>start explorer</code></li>
                     </ol>
 
                     <h3>Globally from any directory</h3>
@@ -247,20 +249,6 @@ $ ploinky start explorer
                     <pre><code>ploinky list agents</code></pre>
                 </div>
 
-                <div class="doc-section">
-                    <h2>Ploinky Shell (LLM-only)</h2>
-                    <p>Use Ploinky Shell for quick LLM command recommendations without initializing the full workspace. No <code>.ploinky</code> folder is created, no repos are cloned, and Ploinky commands are rejected in this mode.</p>
-                    <pre><code>ploinky -shell       # interactive shell (also: ploinky sh, ploinky --shell, psh)
-ploinky sh           # alias for Ploinky Shell
-psh                  # alias for Ploinky Shell
-ploinky -shell &lt;text&gt;     # single-shot suggestion and exit</code></pre>
-                    <ul style="line-height: 1.6;">
-                        <li>Single-command suggestions ask <code>Execute? (y/n)</code> before running.</li>
-                        <li>API keys are read from <code>.env</code> found upward from the current directory and from your environment variables.</li>
-                        <li>Startup logs show the <code>.env</code> path used and available LLM model names.</li>
-                        <li>Use <code>/settings</code> inside the shell to configure LLM model and provider preferences interactively.</li>
-                    </ul>
-                </div>
             </div>
         </div>
     </main>

@@ -68,9 +68,8 @@ export const REPOS_DIR = path.join(PLOINKY_DIR, 'repos');
 export const AGENTS_FILE = path.join(PLOINKY_DIR, 'agents.json');
 export const SECRETS_FILE = path.join(PLOINKY_DIR, '.secrets');
 export const PROFILE_FILE = path.join(PLOINKY_DIR, 'profile');
+export const AGENTS_DATA_DIR = path.join(PLOINKY_WORKSPACE_ROOT, '.data');
 
-// Workspace runtime structure lives under .ploinky/
-export const AGENTS_WORK_DIR = path.join(PLOINKY_DIR, 'agents');
 export const CODE_DIR = path.join(PLOINKY_DIR, 'code');
 export const SKILLS_DIR = path.join(PLOINKY_DIR, 'skills');
 export const LOGS_DIR = path.join(PLOINKY_DIR, 'logs');
@@ -108,13 +107,13 @@ export function initEnvironment() {
 
     const requiredDirs = [
         REPOS_DIR,
-        AGENTS_WORK_DIR,
         CODE_DIR,
         SKILLS_DIR,
         LOGS_DIR,
         SHARED_DIR,
         RUNNING_DIR,
         TRANSCRIPTS_DIR,
+        AGENTS_DATA_DIR,
     ];
     for (const dir of requiredDirs) {
         if (!fs.existsSync(dir)) {

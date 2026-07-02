@@ -31,7 +31,7 @@ All relative paths below are relative to the workspace directory where `ploinky`
 | `.ploinky/agents.json` | Enabled-agent registry plus `_config` values such as static start config and sandbox setting. |
 | `.ploinky/repo_sources.json` | Remembered repo URLs, branches, and repository kind for later update/reinstall and Marketplace categorization. |
 | `.ploinky/repos/<repo>` | Cloned agent repositories. Agent manifests are found below this tree. |
-| `.ploinky/agents/<agent>` | Per-agent work directory for isolated mode and local runtime data. Disable preserves it. |
+| `.data/<agent-or-alias>` | Per-instance persistent agent home. Containers mount it at `/root` in every run mode. Disable preserves it. |
 | `.ploinky/code/<agent>` | Symlink to the agent's `code/` directory when present, otherwise to the agent root. |
 | `.ploinky/skills/<agent>` | Symlink to the agent's `skills/` directory when present. |
 | `.ploinky/shared` | Shared writable host directory mounted as `/shared` in containers and host sandboxes. |
@@ -81,7 +81,7 @@ The command surface is split between the registry in `cli/services/commandRegist
 | `restart <agent>` | Recreates or restarts one enabled agent and refreshes its route. |
 | `stop` | Kills router and stops configured agents without removing containers. |
 | `shutdown` | Kills router and destroys workspace containers for enabled agents. |
-| `destroy` | Kills router and destroys all workspace containers. |
+| `destroy` | Kills router, destroys all workspace containers, removes `.ploinky/deps`, and preserves `.data/<agent-or-alias>`. |
 | `clean` | Destroys all workspace containers. It does not explicitly kill the router in the command implementation. |
 | `status` | Prints SSO status, router status, repo status, and enabled/running agent state. |
 | `list agents` | Lists manifest-bearing agent directories in active repos. |
@@ -126,7 +126,7 @@ flowchart TD
   C --> D["normalize alias and auth mode"]
   D --> E["choose run mode"]
   E --> F["write .ploinky/agents.json record"]
-  F --> G["create .ploinky/agents/<agent>"]
+  F --> G["create .data/<agent-or-alias>"]
   G --> H["create .ploinky/code/<agent> symlink"]
   H --> I["create .ploinky/skills/<agent> symlink when skills/ exists"]
 ```
@@ -143,7 +143,7 @@ The enabled record includes:
 | `projectPath` | Depends on run mode. |
 | `runMode` | `isolated`, `global`, or `devel`. |
 | `type` | Always `agent` for agent records. |
-| `config.binds` | Initial descriptive binds: project path to itself, repo `Agent/` to `/Agent`, agent source to `/code`. Runtime startup recomputes actual binds. |
+| `config.binds` | Initial descriptive binds: per-instance home to `/root`, non-isolated project path to itself, repo `Agent/` to `/Agent`, agent source to `/code`. Runtime startup recomputes actual binds. |
 | `config.ports` | Runtime port mapping metadata from `parseManifestPorts(manifest)` or fallback `{containerPort: 7000}`. Because `parseManifestPorts` only reads profile config, enable-time records normally get the fallback. |
 | `auth` | `{mode}` plus local auth metadata when local password auth is enabled. |
 | `alias` | Optional route/record alias. |
@@ -153,11 +153,11 @@ Run modes:
 
 | Mode | Project path |
 | --- | --- |
-| default / isolated | `.ploinky/agents/<agent>`. Existing isolated paths are reused when valid. |
+| default / isolated | `.data/<agent-or-alias>`. Legacy isolated `projectPath` values are ignored and recomputed from the current data layout. |
 | `global` | Workspace root. |
 | `devel <repo>` | `.ploinky/repos/<repo>`, which must already exist. |
 
-Disable behavior is conservative. `disable agent` refuses to remove the record when a live container, stopped container, or sandbox process appears to exist. If it can disable, it clears matching static config, removes symlinks, and leaves `.ploinky/agents/<agent>` intact.
+Disable behavior is conservative. `disable agent` refuses to remove the record when a live container, stopped container, or sandbox process appears to exist. If it can disable, it clears matching static config, removes symlinks, and leaves `.data/<agent-or-alias>` intact.
 
 ## Manifest Fields
 
@@ -208,7 +208,7 @@ Ploinky does not load a central manifest schema in the observed paths. Individua
 | `volumeOptions` | No | Per-container-path options for `volumes`: `generated`, `required`, numeric `chmod`, and `makeWorldWritableSubdirs`. |
 | `network` | No | Supports host mode or named network with aliases. Default Docker adds `host.docker.internal`; default Podman uses `slirp4netns:allow_host_loopback=true`. |
 | `containerSecurity.privileged` | No | Adds `--privileged` for container runtime when true. |
-| `mcp-config.json` beside manifest/code | No | Copied/synchronized into `.ploinky/agents/<agent>/mcp-config.json` for container runtime. Seatbelt writes a rewritten `.seatbelt` config. Default AgentServer also searches `/code/mcp-config.json`. |
+| `mcp-config.json` beside manifest/code | No | Copied/synchronized into the persistent agent home, `.data/<agent-or-alias>/mcp-config.json`. Seatbelt writes a rewritten `.seatbelt` config in the same work directory. Default AgentServer also searches `/code/mcp-config.json`. |
 | `httpServices` | No | Router exposes service prefixes that proxy to the agent route using explicit `access: public`, `access: guest`, or `access: authenticated`. |
 | `routerAccess.httpRoutes` | No | Declares agent-relative HTTP route access using `access` only. Valid values are `public`, `guest`, and `authenticated`; public entries expose anonymous `GET`/`HEAD`, guest entries use or mint a guest session, and authenticated entries require a user session before transparent proxying. |
 | `endpoints.chatCompletions` | No | Default AgentServer exposes an OpenAI-style chat completions endpoint backed by a command spec. |
@@ -397,8 +397,8 @@ For Docker-style runtime, the main mounts are:
 | Prepared agent dependency cache | `/code/node_modules` | read-only |
 | Prepared agent dependency cache | `/Agent/node_modules` | read-only |
 | `.ploinky/shared` | `/shared` | read-write |
-| `projectPath` / current working directory | Same absolute path inside container | read-write |
-| `.ploinky/agents/<agent>` | Same absolute path, when outside the current working directory | read-write |
+| Agent home (`.data/<agent-or-alias>`) | `/root` | read-write |
+| Global or devel `projectPath` / current working directory | Same absolute path inside container | read-write |
 | Agent `skills/`, when it exists outside code | `/code/skills` | profile-controlled read-write/read-only |
 | `runtime.resources.persistentStorage.hostPath` | `runtime.resources.persistentStorage.containerPath` | read-write |
 | `manifest.volumes` host path | configured container path | read-write by default |
@@ -465,7 +465,7 @@ Important bwrap mounts:
 | Manifest volumes | Configured target paths, with relative host paths resolved against the workspace root and absolute host paths honored as declared. |
 | Runtime persistent storage | Configured container path. |
 
-The bwrap process does not unshare networking, so agent ports bind on the host. It does unshare PID. The runtime explicitly sets env vars with `--clearenv` plus `--setenv`, including `PORT`, router URL, manifest env, profile env/secrets, runtime resource env, `NODE_PATH=/code/node_modules`, `HOME=/tmp`, `PATH`, and identity variables.
+The bwrap process does not unshare networking, so agent ports bind on the host. It does unshare PID. The runtime explicitly sets env vars with `--clearenv` plus `--setenv`, including `PORT`, router URL, manifest env, profile env/secrets, runtime resource env, `NODE_PATH=/code/node_modules`, `HOME=<resolved projectPath>`, `PATH`, and identity variables.
 
 The bwrap entry command follows the same broad selection as containers. When both `start` and agent command exist, it runs start in the background and execs the agent command.
 
@@ -480,7 +480,7 @@ Important seatbelt copy/link operations:
 | Copy Ploinky Agent runtime | repo `Agent/` excluding `Agent/node_modules` | `.ploinky/seatbelt-runtime/<agent>/Agent-<pid>-<timestamp>` |
 | Link Agent dependencies | prepared dependency cache | staged `Agent/node_modules` |
 | Link code dependencies | prepared dependency cache | real agent code path `node_modules`; errors if a non-symlink already exists |
-| Rewrite MCP config | source `mcp-config.json` | `.ploinky/agents/<agent>/mcp-config.seatbelt.json` with `/code` and `/Agent` replaced by real paths |
+| Rewrite MCP config | source `mcp-config.json` | resolved work directory `mcp-config.seatbelt.json` with `/code` and `/Agent` replaced by real paths |
 
 Seatbelt env includes `PLOINKY_AGENT_LIB_DIR`, `PLOINKY_INVOCATION_AUTH_MODULE`, `PLOINKY_CODE_DIR`, `NODE_PATH`, router env, runtime resources, profile vars, profile secrets, and identity vars.
 
@@ -528,14 +528,14 @@ Required non-sensitive env entries must have defaults in profile definitions unl
 | --- | --- | --- | --- |
 | `enable agent` | Agent source path | `.ploinky/code/<agent>` symlink | All |
 | `enable agent` | Agent `skills/` path | `.ploinky/skills/<agent>` symlink | All, when present |
-| `ensureAgentService` | Agent `mcp-config.json` | `.ploinky/agents/<agent>/mcp-config.json` | Containers |
+| `ensureAgentService` | Agent `mcp-config.json` | resolved work directory `mcp-config.json` | Containers |
 | Container dependency prep | `globalDeps/package.json` | `.ploinky/deps/global/<runtimeKey>/package.json` | Containers and host sandboxes |
 | Container dependency prep | Global/agent package metadata | `.ploinky/deps/agents/<repo>/<agent>/<runtimeKey>/package.json` | Containers and host sandboxes |
 | Podman startup | repo `Agent/` | `.ploinky/container-runtime/<container>/Agent` | Podman |
 | Podman startup | Agent code entries | `.ploinky/container-runtime/<container>/code` symlink tree | Podman |
 | Podman startup | Prepared deps | staged `Agent/node_modules` and `code/node_modules` | Podman |
 | Seatbelt startup | repo `Agent/` | `.ploinky/seatbelt-runtime/<agent>/Agent-...` | Seatbelt |
-| Seatbelt startup | Source MCP config | `.ploinky/agents/<agent>/mcp-config.seatbelt.json` | Seatbelt |
+| Seatbelt startup | Source MCP config | resolved work directory `mcp-config.seatbelt.json` | Seatbelt |
 | Router start | Runtime route data | `.ploinky/routing.json` | Router |
 | No-wait start | Worker state | `.ploinky/running/no-wait/<container>.json` | No-wait dependencies |
 | Watchdog start | Router PID/logs | `.ploinky/running/router.pid`, `.ploinky/logs/router.log`, `.ploinky/logs/watchdog.log` | Router |
@@ -630,8 +630,8 @@ MCP tool and resource commands require router-minted invocation headers before c
 | `restart <agent>` | Updates route after restart. | For containers: `runtime restart` when existing, or forced recreate for sandbox paths. |
 | `stop` | Kills router. | Stops configured agents but does not remove containers. |
 | `shutdown` | Kills router. | Destroys workspace containers for enabled agents. |
-| `destroy` | Kills router. | Destroys all workspace containers. |
-| `clean` | Does not explicitly kill router in command code. | Destroys all workspace containers. |
+| `destroy` | Kills router. | Destroys all workspace containers, clears `.ploinky/deps`, and preserves `.data/<agent-or-alias>`. |
+| `clean` | Does not explicitly kill router in command code. | Destroys all workspace containers, clears `.ploinky/deps`, and preserves `.data/<agent-or-alias>`. |
 | `disable agent` | Clears matching static config if disabling succeeds. | Refuses if runtime state exists. |
 
 ## Code-Observed Caveats

@@ -418,7 +418,7 @@ app.listen(7000);</code></pre>
                         <p>Agents run with these environment variables:</p>
                         <pre><code>AGENT_NAME=MyAgent           # Agent name
 AGENT_REPO=myrepo           # Repository name
-WORKSPACE_PATH=$CWD/.ploinky/agents/&lt;agent&gt;  # Agent work directory (via CWD passthrough)
+WORKSPACE_PATH=/root          # Isolated container home backed by .data/&lt;agent-or-alias&gt;
 CODE_PATH=/code             # Agent code directory
 PORT=7000                   # Default service port</code></pre>
 

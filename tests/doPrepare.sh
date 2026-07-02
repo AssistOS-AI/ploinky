@@ -397,7 +397,7 @@ health_agent_container_name=$(compute_container_name "$HEALTH_AGENT_NAME" "$TEST
 write_state_var "TEST_HEALTH_AGENT_CONT_NAME" "$health_agent_container_name"
 test_info "Health probe container will be named: $health_agent_container_name"
 
-workspace_project="$TEST_RUN_DIR/.ploinky/agents/$TEST_AGENT_NAME"
+workspace_project="$TEST_RUN_DIR/.data/$TEST_AGENT_NAME"
 write_state_var "TEST_AGENT_WORKSPACE" "$workspace_project"
 write_state_var "TEST_PERSIST_FILE" "$workspace_project/data/fast-persist.txt"
 write_state_var "TEST_AGENT_LOG" "$workspace_project/fast-start.log"

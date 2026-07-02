@@ -440,7 +440,19 @@ test('createAgentWorkDir creates agent workspace folder', () => {
     const workDir = createAgentWorkDir(agentName);
 
     assert.strictEqual(workDir, getAgentWorkDir(agentName));
+    assert.strictEqual(workDir, path.join(tempDir, '.data', agentName));
     assert.ok(fs.statSync(workDir).isDirectory());
+});
+
+test('initWorkspaceStructure does not create legacy .ploinky agents directory', () => {
+    const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-structure-'));
+    try {
+        workspaceStructure.initWorkspaceStructure(workspace);
+        assert.ok(fs.statSync(path.join(workspace, '.data')).isDirectory());
+        assert.ok(!fs.existsSync(path.join(workspace, '.ploinky', 'agents')));
+    } finally {
+        fs.rmSync(workspace, { recursive: true, force: true });
+    }
 });
 
 // --- Semantic (manifest-declared) profile tests ---

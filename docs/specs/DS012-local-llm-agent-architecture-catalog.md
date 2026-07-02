@@ -109,9 +109,9 @@ Selection produces a canonical `runtimePolicyHash` (SHA-256 over the canonical m
 
 ### Container Layout And Selected Architecture State
 
-Before container start, Ploinky writes `.ploinky/agents/<agent-or-alias>/runtime/selected-architecture.json` with the catalog id and ref, architecture id, accelerator family, image id/ref/digest, runtime policy and policy hash, hardware summary (runtime, node arch, OCI platform, accelerator families, redacted probe results), the selection explanation, and the names of env variables exposed to the container (with secret names redacted). The file is mounted into the container at `/runtime/selected-architecture.json` and is readable by the in-container runtime control service. The file must not contain `HF_TOKEN` or any secret value. Mode `0600` is requested when supported.
+Before container start, Ploinky writes `.data/<agent-or-alias>/runtime/selected-architecture.json` with the catalog id and ref, architecture id, accelerator family, image id/ref/digest, runtime policy and policy hash, hardware summary (runtime, node arch, OCI platform, accelerator families, redacted probe results), the selection explanation, and the names of env variables exposed to the container (with secret names redacted). The file is mounted into the container at `/runtime/selected-architecture.json` and is readable by the in-container runtime control service. The file must not contain `HF_TOKEN` or any secret value. Mode `0600` is requested when supported.
 
-Ploinky also creates `.ploinky/agents/<agent-or-alias>/models` and mounts it at `/models`. Long-lived model data belongs under `/models/hf-cache`, `/models/artifacts`, and `/models/derived`. `/runtime` is reserved for state files, launch configs, PIDs, logs, selected architecture metadata, and temporary priority overrides.
+Ploinky also creates `.data/<agent-or-alias>/models` and mounts it at `/models`. Long-lived model data belongs under `/models/hf-cache`, `/models/artifacts`, and `/models/derived`. `/runtime` is reserved for state files, launch configs, PIDs, logs, selected architecture metadata, and temporary priority overrides.
 
 ### Labels
 

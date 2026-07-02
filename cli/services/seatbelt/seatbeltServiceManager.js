@@ -40,8 +40,7 @@ import { resolveProfileServer } from '../profileServer.js';
 import {
     getAgentWorkDir,
     getAgentCodePath,
-    getAgentSkillsPath,
-    createAgentWorkDir
+    getAgentSkillsPath
 } from '../workspaceStructure.js';
 import { ensureAgentCacheForFamily } from '../dependencyCache.js';
 import {
@@ -350,7 +349,7 @@ function startSeatbeltProcess(agentName, manifest, agentPath, options = {}) {
     // Resolve paths (real host paths — no mount namespaces)
     const agentCodePath = resolveSymlinkPath(getAgentCodePath(agentName));
     const agentSkillsPath = resolveSymlinkPath(getAgentSkillsPath(agentName));
-    const agentWorkDir = getAgentWorkDir(agentName);
+    const agentWorkDir = cwd;
 
     // Pre-container lifecycle
     const preLifecycle = runPreContainerLifecycle(agentName, repoName, agentPath, activeProfile);
@@ -359,8 +358,8 @@ function startSeatbeltProcess(agentName, manifest, agentPath, options = {}) {
     }
 
     // Ensure work directory and MCP config
-    createAgentWorkDir(agentName);
-    syncAgentMcpConfig(`seatbelt_${agentName}`, path.resolve(agentPath), agentName);
+    fs.mkdirSync(agentWorkDir, { recursive: true });
+    syncAgentMcpConfig(`seatbelt_${agentName}`, path.resolve(agentPath), alias || agentName, { workDir: agentWorkDir });
 
     // Prepare or reuse the host dependency cache (see dependencyCache.js).
     const agentHasPackageJson = fs.existsSync(path.join(agentCodePath, 'package.json'));
@@ -407,7 +406,7 @@ function startSeatbeltProcess(agentName, manifest, agentPath, options = {}) {
 
     // NODE_PATH for module resolution
     envMap.NODE_PATH = nodeModulesDir;
-    envMap.HOME = '/tmp';
+    envMap.HOME = agentWorkDir;
     envMap.PATH = buildSeatbeltPathEnv();
 
     // Rewrite mcp-config.json for real paths
@@ -674,7 +673,7 @@ function attachSeatbeltInteractive(agentName, manifest, agentPath, workdir, entr
     // Resolve paths
     const agentCodePath = resolveSymlinkPath(getAgentCodePath(agentName));
     const agentSkillsPath = resolveSymlinkPath(getAgentSkillsPath(agentName));
-    const agentWorkDir = getAgentWorkDir(agentName);
+    const agentWorkDir = record.projectPath || getAgentWorkDir(agentName);
     const sharedDir = ensureSharedHostDir();
     const agentHasPackageJson = fs.existsSync(path.join(agentCodePath, 'package.json'));
     const startCmd = readManifestStartCommand(manifest);
@@ -714,7 +713,7 @@ function attachSeatbeltInteractive(agentName, manifest, agentPath, workdir, entr
     envMap.PLOINKY_INVOCATION_AUTH_MODULE = path.join(seatbeltAgentLibPath, 'lib/invocation-auth.mjs');
     envMap.PLOINKY_CODE_DIR = agentCodePath;
     envMap.NODE_PATH = nodeModulesDir;
-    envMap.HOME = '/tmp';
+    envMap.HOME = agentWorkDir;
     envMap.PATH = buildSeatbeltPathEnv();
 
     // Rewrite mcp-config

@@ -18,8 +18,6 @@ import { buildEnvMap } from './secretVars.js';
 import { resolveAgentReadinessProtocol } from './startupReadiness.js';
 import { LOGS_DIR, PLOINKY_CWD, PLOINKY_WORKSPACE_ROOT, ROUTING_FILE, RUNNING_DIR } from './config.js';
 import { classifyDependencyGraphWaitMode, resolveWorkspaceDependencyGraph, topologicallyGroupDependencyGraph } from './workspaceDependencyGraph.js';
-import { getAgentWorkDir } from './workspaceStructure.js';
-import { needsHostInstall } from './dependencyInstaller.js';
 import { mergeRoutingConfig, readRoutingConfig } from './routingFile.js';
 import { waitForAgentReady } from '../server/utils/agentReadiness.js';
 
@@ -281,13 +279,9 @@ function formatGraphNodeLabel(node, staticLabel) {
 }
 
 function buildReadinessEntryFromNode(node, route, staticLabel) {
-  const installState = needsHostInstall(node.shortAgentName, {
-    agentPath: route?.hostPath || node.agentPath,
-    packagePath: path.join(getAgentWorkDir(node.shortAgentName), 'package.json')
-  });
   const timeoutMs = Number.parseInt(
     process.env[node.isStatic ? 'PLOINKY_STATIC_AGENT_READY_TIMEOUT_MS' : 'PLOINKY_DEPENDENCY_AGENT_READY_TIMEOUT_MS']
-      || String(installState.needsInstall ? 600000 : 120000),
+      || '120000',
     10
   );
   const intervalMs = Number.parseInt(
@@ -309,8 +303,7 @@ function buildReadinessEntryFromNode(node, route, staticLabel) {
     protocol: resolveAgentReadinessProtocol(node.manifest),
     timeoutMs,
     intervalMs,
-    probeTimeoutMs,
-    installState
+    probeTimeoutMs
   };
 }
 
@@ -378,9 +371,6 @@ async function waitForReadinessEntries(readinessEntries) {
       console.log(`[start] Marking ${waitLabel} '${entry.label}' ready (no port-bound readiness probe).`);
     } else {
       console.log(`[start] Waiting for ${waitLabel} '${entry.label}' to become ready on port ${entry.route.hostPort}...`);
-    }
-    if (entry.installState?.needsInstall) {
-      console.log(`[start] ${entry.label}: startup cache cold or invalid (${entry.installState.reason}); using extended readiness timeout ${entry.timeoutMs}ms.`);
     }
     readinessProgress.set(entry.key, {
       ready: false,

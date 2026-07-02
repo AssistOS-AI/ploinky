@@ -22,6 +22,8 @@ import {
     REPOS_DIR,
     waitForContainerRunning
 } from './common.js';
+import { loadAgents } from '../workspace.js';
+import { getAgentWorkDir } from '../workspaceStructure.js';
 import { SHARED_DIR } from '../config.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -38,8 +40,10 @@ function runCommandInContainer(agentName, repoName, manifest, command, interacti
     const containerName = getAgentContainerName(agentName, repoName);
     let agents = loadAgentsMap();
     const projectDir = getConfiguredProjectPath(agentName, repoName);
+    const homeDir = getAgentWorkDir(agentName);
 
     const sharedDir = ensureSharedHostDir();
+    try { fs.mkdirSync(homeDir, { recursive: true }); } catch (_) {}
 
     let firstRun = false;
     debugLog(`Checking if container '${containerName}' exists...`);
@@ -48,6 +52,7 @@ function runCommandInContainer(agentName, repoName, manifest, command, interacti
         const envVarParts = [
             ...getSecretsForAgent(manifest, { agentName, repoName }),
             formatEnvFlag('PLOINKY_MCP_CONFIG_PATH', CONTAINER_CONFIG_PATH),
+            formatEnvFlag('HOME', '/root'),
             // Set NODE_PATH to project directory node_modules (in the passthrough mount)
             formatEnvFlag('NODE_PATH', `${projectDir}/node_modules`)
         ];
@@ -55,10 +60,16 @@ function runCommandInContainer(agentName, repoName, manifest, command, interacti
         const mountOptions = runtime === 'podman'
             ? [
                 `--mount type=bind,source="${projectDir}",destination="${projectDir}",relabel=shared`,
+                ...(path.resolve(projectDir) === path.resolve(homeDir) ? [] : [
+                    `--mount type=bind,source="${homeDir}",destination="/root",relabel=shared`
+                ]),
                 `--mount type=bind,source="${sharedDir}",destination="/shared",relabel=shared`
             ]
             : [
                 `-v "${projectDir}:${projectDir}"`,
+                ...(path.resolve(projectDir) === path.resolve(homeDir) ? [] : [
+                    `-v "${homeDir}:/root"`
+                ]),
                 `-v "${sharedDir}:/shared"`
             ];
         const mountOption = mountOptions.join(' ');
@@ -114,6 +125,7 @@ function runCommandInContainer(agentName, repoName, manifest, command, interacti
             config: {
                 binds: [
                     { source: projectDir, target: projectDir },
+                    ...(path.resolve(projectDir) === path.resolve(homeDir) ? [] : [{ source: homeDir, target: '/root' }]),
                     { source: sharedDir, target: '/shared' }
                 ],
                 env: Array.from(new Set(declaredEnvNames)).map(name => ({ name })),
@@ -217,10 +229,12 @@ function ensureAgentContainer(agentName, repoName, manifest) {
     const runtime = getRuntime();
     const containerName = getAgentContainerName(agentName, repoName);
     const projectDir = getConfiguredProjectPath(agentName, repoName);
+    const homeDir = getAgentWorkDir(agentName);
     const agentLibPath = path.resolve(__dirname, '../../../Agent');
     const agentPath = path.join(REPOS_DIR, repoName, agentName);
     const absAgentPath = path.resolve(agentPath);
     const sharedDir = ensureSharedHostDir();
+    try { fs.mkdirSync(homeDir, { recursive: true }); } catch (_) {}
     let agents = loadAgentsMap();
 
     // Resolve profile config for env hash computation
@@ -242,6 +256,7 @@ function ensureAgentContainer(agentName, repoName, manifest) {
         console.log(`Creating container '${containerName}' for agent '${agentName}'...`);
         const envVarParts = [
             ...getSecretsForAgent(manifest, { agentName, repoName }),
+            formatEnvFlag('HOME', '/root'),
             // Set NODE_PATH to project directory node_modules (in the passthrough mount)
             formatEnvFlag('NODE_PATH', `${projectDir}/node_modules`)
         ];
@@ -255,6 +270,7 @@ function ensureAgentContainer(agentName, repoName, manifest) {
         try {
             const createCommand = `${runtime} create -it --name ${containerName} --label ploinky.envhash=${envHash} \
               -v "${projectDir}:${projectDir}${volZ}" \
+              ${path.resolve(projectDir) === path.resolve(homeDir) ? '' : `-v "${homeDir}:/root${volZ}" \\`}
               -v "${agentLibPath}:/Agent${roOpt}" \
               -v "${absAgentPath}:/code${roOpt}" \
               -v "${sharedDir}:/shared${volZ}" \
@@ -269,6 +285,7 @@ function ensureAgentContainer(agentName, repoName, manifest) {
                 console.log(`Retrying with full registry name: ${containerImage}`);
                 const retryCommand = `${runtime} create -it --name ${containerName} --label ploinky.envhash=${envHash} \
                   -v "${projectDir}:${projectDir}${volZ}" \
+                  ${path.resolve(projectDir) === path.resolve(homeDir) ? '' : `-v "${homeDir}:/root${volZ}" \\`}
                   -v "${agentLibPath}:/Agent${roOpt}" \
                   -v "${absAgentPath}:/code${roOpt}" \
                   -v "${sharedDir}:/shared${volZ}" \
@@ -293,6 +310,7 @@ function ensureAgentContainer(agentName, repoName, manifest) {
             config: {
                 binds: [
                     { source: projectDir, target: projectDir },
+                    ...(path.resolve(projectDir) === path.resolve(homeDir) ? [] : [{ source: homeDir, target: '/root' }]),
                     { source: agentLibPath, target: '/Agent', ro: true },
                     { source: absAgentPath, target: '/code', ro: true },
                     { source: sharedDir, target: '/shared' }
@@ -376,11 +394,22 @@ function buildExecArgs(containerName, workdir, entryCommand, interactive = true,
     return args;
 }
 
+function resolveContainerWorkdir(containerName, workdir) {
+    try {
+        const record = loadAgents()?.[containerName];
+        if (record?.runMode === 'isolated' && record.projectPath && path.resolve(record.projectPath) === path.resolve(workdir)) {
+            return '/root';
+        }
+    } catch (_) {}
+    return workdir;
+}
+
 function attachInteractive(containerName, workdir, entryCommand) {
     const runtime = getRuntime();
     // PLOINKY_NO_TTY=1 disables TTY allocation (used by webchat to ensure stdin EOF propagates)
     const allocateTty = process.env.PLOINKY_NO_TTY !== '1';
-    const execArgs = buildExecArgs(containerName, workdir, entryCommand, true, allocateTty, { historyName: containerName });
+    const containerWorkdir = resolveContainerWorkdir(containerName, workdir);
+    const execArgs = buildExecArgs(containerName, containerWorkdir, entryCommand, true, allocateTty, { historyName: containerName });
     const result = spawnSync(runtime, execArgs, { stdio: 'inherit' });
     return result.status ?? 0;
 }

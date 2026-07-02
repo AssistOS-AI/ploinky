@@ -36,7 +36,7 @@ import { clearLivenessState } from './healthProbes.js';
 import { stopAndRemove } from './containerFleet.js';
 import { buildContainerSecurityArgs, resolveContainerSecurity } from './containerSecurity.js';
 import { DEFAULT_AGENT_ENTRY, launchAgentSidecar, readManifestAgentCommand, readManifestStartCommand, splitCommandArgs } from './agentCommands.js';
-import { AGENTS_WORK_DIR, PLOINKY_DIR, ROUTING_FILE, PLOINKY_WORKSPACE_ROOT } from '../config.js';
+import { AGENTS_DATA_DIR, PLOINKY_DIR, ROUTING_FILE, PLOINKY_WORKSPACE_ROOT } from '../config.js';
 import {
     planRuntimeResources,
     applyRuntimeResourceEnv,
@@ -73,8 +73,7 @@ import {
 import {
     getAgentWorkDir,
     getAgentCodePath,
-    getAgentSkillsPath,
-    createAgentWorkDir
+    getAgentSkillsPath
 } from '../workspaceStructure.js';
 import {
     prepareFreshRuntimeRoot,
@@ -501,6 +500,9 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     const runtime = getRuntime();
     const repoName = path.basename(path.dirname(agentPath));
     const containerName = options.containerName || getAgentContainerName(agentName, repoName);
+    const agentSnapshot = loadAgentsMap();
+    const existingRecord = agentSnapshot[containerName] || {};
+    const instanceName = options.alias || existingRecord.alias || agentName;
     removeContainerForRecreate(runtime, containerName, `startAgentContainer:${agentName}`);
 
     const { raw: explicitAgentCmd } = readManifestAgentCommand(manifest);
@@ -508,6 +510,10 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     const useStartEntry = Boolean(startCmd);
     const launchExplicitSidecar = Boolean(startCmd && explicitAgentCmd);
     const cwd = getConfiguredProjectPath(agentName, path.basename(path.dirname(agentPath)), options.alias);
+    const isolatedHome = (existingRecord.runMode || 'isolated') === 'isolated';
+    const agentHomeDir = getAgentWorkDir(instanceName);
+    const containerCwd = isolatedHome ? '/root' : cwd;
+    const cwdMountTarget = isolatedHome ? '/root' : cwd;
     const sharedDir = ensureSharedHostDir();
     const llmRuntimeSharedPath = resolveLlmRuntimeSharedPath(agentPath);
 
@@ -557,7 +563,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
             agentName,
             alias: options.alias,
             env: process.env,
-            agentWorkDirRoot: AGENTS_WORK_DIR,
+            agentWorkDirRoot: AGENTS_DATA_DIR,
             manifestEnvNames: [
                 ...getManifestEnvNames(manifest, profileConfig),
                 ...getExposedNames(manifest, profileConfig),
@@ -584,7 +590,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     } = getProfileMountModes(activeProfile, runtime, profileConfig || {});
 
     // New workspace structure paths
-    const agentWorkDir = getAgentWorkDir(agentName);
+    const agentWorkDir = agentHomeDir;
     const agentCodePathSymlink = getAgentCodePath(agentName);
     const agentSkillsPathSymlink = getAgentSkillsPath(agentName);
 
@@ -593,10 +599,10 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     const agentCodePath = resolveSymlinkPath(agentCodePathSymlink);
     const agentSkillsPath = resolveSymlinkPath(agentSkillsPathSymlink);
 
-    // Ensure agent work directory exists
-    createAgentWorkDir(agentName);
-    // Ensure MCP config is staged in the agent work dir before container start
-    syncAgentMcpConfig(containerName, path.resolve(agentPath), agentName);
+    // Ensure persistent agent home exists before container start.
+    fs.mkdirSync(agentHomeDir, { recursive: true });
+    // Ensure MCP config is staged in the persistent agent home before container start.
+    syncAgentMcpConfig(containerName, path.resolve(agentPath), instanceName, { workDir: agentWorkDir });
 
     // INSTALL PHASE — runtime containers never run npm install. Dependency
     // preparation happens here, before runtime boot, via a dedicated cache.
@@ -680,13 +686,13 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         });
     }
 
-    // Ensure the agent work directory exists on host
-    createAgentWorkDir(agentName);
+    // Ensure the agent home directory exists on host.
+    fs.mkdirSync(agentHomeDir, { recursive: true });
 
     // Build volume mount arguments using new workspace structure
     // Prepared node_modules are mounted read-only; runtime containers never mutate deps.
     const nodeModulesMount = runtime === 'podman' ? ':z,ro' : ':ro';
-    const containerWorkdir = String(manifest?.workdir || '/code').trim() || '/code';
+    const containerWorkdir = isolatedHome ? '/root' : (String(manifest?.workdir || '/code').trim() || '/code');
     const args = ['run', '-d', '--name', containerName, '--label', `ploinky.envhash=${envHash}`, '-w', containerWorkdir,
         // Agent library (always ro)
         '-v', `${agentLibMountPath}:/Agent${runtime === 'podman' ? ':z,ro' : ':ro'}`,
@@ -700,19 +706,12 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         ] : []),
         // Shared directory
         '-v', `${sharedDir}:/shared${runtime === 'podman' ? ':z' : ''}`,
-        // CWD passthrough - provides access to agents/<name>/ for runtime data
-        '-v', `${cwd}:${cwd}${runtime === 'podman' ? ':z' : ''}`
+        // CWD passthrough. Isolated agents receive their host data dir as /root.
+        '-v', `${cwd}:${cwdMountTarget}${runtime === 'podman' ? ':z' : ''}`
     ];
 
-    // Some modes (for example devel) run with cwd outside the isolated
-    // agent workspace. Mount WORKSPACE_PATH explicitly when it is not covered
-    // by the cwd passthrough so install/start hooks can always read and write
-    // the generated package.json, node_modules, and runtime artifacts.
-    const relativeAgentWorkDir = path.relative(cwd, agentWorkDir);
-    const workDirCoveredByCwdMount = relativeAgentWorkDir === ''
-        || (!relativeAgentWorkDir.startsWith('..') && !path.isAbsolute(relativeAgentWorkDir));
-    if (!workDirCoveredByCwdMount) {
-        args.push('-v', `${agentWorkDir}:${agentWorkDir}${runtime === 'podman' ? ':z' : ''}`);
+    if (!isolatedHome) {
+        args.push('-v', `${agentHomeDir}:/root${runtime === 'podman' ? ':z' : ''}`);
     }
 
     // LLM runtime: expose persistent model storage at /models and selected
@@ -824,8 +823,9 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         formatEnvFlag('PLOINKY_MCP_CONFIG_PATH', CONTAINER_CONFIG_PATH)
     ];
     envStrings.push(formatEnvFlag('AGENT_NAME', agentName));
-    envStrings.push(formatEnvFlag('WORKSPACE_PATH', agentWorkDir));
+    envStrings.push(formatEnvFlag('WORKSPACE_PATH', isolatedHome ? '/root' : cwd));
     envStrings.push(formatEnvFlag('PLOINKY_WORKSPACE_ROOT', PLOINKY_WORKSPACE_ROOT));
+    envStrings.push(formatEnvFlag('HOME', '/root'));
     // Apply env from manifest.runtime.resources.env (templates expanded).
     for (const [envKey, envValue] of Object.entries(applyRuntimeResourceEnv(resourcePlan))) {
         envStrings.push(formatEnvFlag(envKey, envValue));
@@ -906,6 +906,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     } catch (err) {
         debugLog(`[invocationAuth] could not set agent identity for ${agentName}: ${err?.message || err}`);
     }
+    envStrings.push(formatEnvFlag('HOME', '/root'));
 
     const envFlags = flagsToArgs(envStrings);
     if (envFlags.length) args.push(...envFlags);
@@ -934,9 +935,9 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         // Run install command before start script if defined
         if (combinedInstallCmd) {
             console.log(`[install] ${agentName}: entrypoint deps + manifest hooks`);
-            const fullCmd = `cd /code && ${combinedInstallCmd} && ${startArgs.join(' ')}`;
+            const fullCmd = `cd ${containerCwd} && ${combinedInstallCmd} && ${startArgs.join(' ')}`;
             args.push('sh', '-c', fullCmd);
-            entrySummary = `sh -c "cd /code && <install> && ${startArgs.join(' ')}"`;
+            entrySummary = `sh -c "cd ${containerCwd} && <install> && ${startArgs.join(' ')}"`;
 
         } else {
             args.push(...startArgs);
@@ -952,12 +953,12 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
             console.log(`[install] ${agentName}: entrypoint deps + manifest hooks`);
         }
         const fullCmd = combinedInstallCmd
-            ? `cd /code && ${combinedInstallCmd} && ${explicitAgentCmd}`
-            : `cd /code && ${explicitAgentCmd}`;
+            ? `cd ${containerCwd} && ${combinedInstallCmd} && ${explicitAgentCmd}`
+            : `cd ${containerCwd} && ${explicitAgentCmd}`;
         args.push(shellPath, '-lc', fullCmd);
         entrySummary = combinedInstallCmd
-            ? `${shellPath} -lc "cd /code && <install> && ${explicitAgentCmd}"`
-            : `${shellPath} -lc "cd /code && ${explicitAgentCmd}"`;
+            ? `${shellPath} -lc "cd ${containerCwd} && <install> && ${explicitAgentCmd}"`
+            : `${shellPath} -lc "cd ${containerCwd} && ${explicitAgentCmd}"`;
     } else {
         // Run preinstall + install in main container before default agent server
         if (combinedInstallCmd) {
@@ -980,7 +981,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     const llmRuntimeEnvNames = llmStartup.enabled
         ? ['HF_HOME', 'PLOINKY_MODELS_DIR', 'PLOINKY_DERIVED_DIR', 'PLOINKY_RUNTIME_DIR', 'PLOINKY_LAUNCHERS_DIR', 'PLOINKY_MCP_PORT', 'PLOINKY_LLM_PUBLIC_PORT', 'PLOINKY_LLM_MCP_PORT', 'PLOINKY_LLM_CONTROL_PORT', 'PLOINKY_INFERENCE_PORT']
         : [];
-    const existingRecord = agents[containerName] || {};
+    const persistedRecord = agents[containerName] || existingRecord;
     agents[containerName] = {
         agentName,
         repoName,
@@ -997,10 +998,10 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
                 reuseHash: llmStartup.reuseHash,
             },
         } : {}),
-        createdAt: existingRecord.createdAt || new Date().toISOString(),
+        createdAt: persistedRecord.createdAt || new Date().toISOString(),
         projectPath: cwd,
-        runMode: existingRecord.runMode,
-        develRepo: existingRecord.develRepo,
+        runMode: persistedRecord.runMode,
+        develRepo: persistedRecord.develRepo,
         profile: activeProfile,
         type: 'agent',
         config: {
@@ -1013,23 +1014,24 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
                 ] : []),
                 ...(runtime === 'podman' ? podmanStagedTargetMounts : []),
                 { source: sharedDir, target: '/shared' },
+                ...(!isolatedHome ? [{ source: agentHomeDir, target: '/root' }] : []),
                 ...(llmStartup.enabled && llmStartup.modelDir ? [{ source: llmStartup.modelDir, target: '/models' }] : []),
                 ...(llmStartup.enabled && llmStartup.stateDir ? [{ source: llmStartup.stateDir, target: '/runtime' }] : []),
                 ...(llmStartup.enabled && fs.existsSync(llmRuntimeSharedPath) ? [{ source: llmRuntimeSharedPath, target: '/Agent/llm-runtime', ro: true }] : []),
                 ...(skillsPathExists && !skillsPathInsideCode && runtime !== 'podman' ? [{ source: agentSkillsPath, target: '/code/skills', ro: skillsReadOnly }] : []),
-                { source: cwd, target: cwd }
+                { source: cwd, target: cwdMountTarget }
             ],
             env: Array.from(new Set([...declaredEnvNames2, ...llmRuntimeEnvNames])).map((name) => ({ name })),
             ports: effectivePortMappings,
             ...(additionalServerPort ? { additionalServerPort } : {})
         }
     };
-    if (existingRecord.auth) {
-        agents[containerName].auth = existingRecord.auth;
+    if (persistedRecord.auth) {
+        agents[containerName].auth = persistedRecord.auth;
     }
 
-    if (existingRecord.alias) {
-        agents[containerName].alias = existingRecord.alias;
+    if (persistedRecord.alias) {
+        agents[containerName].alias = persistedRecord.alias;
     }
     saveAgentsMap(agents);
     try {
@@ -1229,7 +1231,7 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
                 agentName,
                 alias: aliasOverride,
                 env: process.env,
-                agentWorkDirRoot: AGENTS_WORK_DIR,
+                agentWorkDirRoot: AGENTS_DATA_DIR,
                 manifestEnvNames: [
                     ...getManifestEnvNames(manifest, profileConfig),
                     ...getExposedNames(manifest, profileConfig),
@@ -1330,8 +1332,6 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
     allPortMappings = resolvePublishedPortMappings(containerName, allPortMappings);
     const resolvedProfileServer = resolvePublishedProfileServer(additionalServerPort, allPortMappings) || additionalServerPort;
 
-    // Get paths for the new workspace structure
-    const agentWorkDir = getAgentWorkDir(agentName);
     const agentCodePath = getAgentCodePath(agentName);
     const agentSkillsPath = getAgentSkillsPath(agentName);
     const profileEnv = normalizeProfileEnv(profileConfig?.env);
@@ -1348,6 +1348,10 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
     if (!projPath) {
         projPath = existingRecord.projectPath;
     }
+    const finalInstanceName = aliasOverride || existingRecord.alias || agentName;
+    const finalIsolatedHome = (existingRecord.runMode || 'isolated') === 'isolated';
+    const finalAgentWorkDir = getAgentWorkDir(finalInstanceName);
+    const finalWorkTarget = finalIsolatedHome ? '/root' : projPath;
     const hasStartedBinds = Array.isArray(startedRecord.config?.binds) && startedRecord.config.binds.length > 0;
     const startedEnvNames = Array.isArray(startedRecord.config?.env)
         ? startedRecord.config.env.map((entry) => String(entry?.name || '').trim()).filter(Boolean)
@@ -1378,7 +1382,8 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
                 { source: AGENT_LIB_PATH, target: '/Agent', ro: true },
                 { source: agentCodePath, target: '/code', ro: codeReadOnly },
                 ...(fs.existsSync(agentSkillsPath) ? [{ source: agentSkillsPath, target: '/code/skills', ro: skillsReadOnly }] : []),
-                { source: projPath, target: projPath }
+                { source: projPath, target: finalWorkTarget },
+                ...(!finalIsolatedHome ? [{ source: finalAgentWorkDir, target: '/root' }] : [])
             ],
             env: Array.from(new Set([...declaredEnvNames3, ...startedEnvNames])).map((name) => ({ name })),
             ports: allPortMappings,
@@ -1393,7 +1398,7 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
     }
     saveAgentsMap(agents);
 
-    syncAgentMcpConfig(containerName, agentPath, agentName);
+    syncAgentMcpConfig(containerName, agentPath, finalInstanceName, { workDir: finalAgentWorkDir });
     const returnPort = allPortMappings.find((p) => p.containerPort === 7000)?.hostPort || allPortMappings[0]?.hostPort || 0;
     return { containerName, hostPort: returnPort, additionalServerPort: resolvedProfileServer };
 }

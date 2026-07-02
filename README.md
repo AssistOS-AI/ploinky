@@ -66,6 +66,7 @@ You can use Ploinky in two ways:
 - `client status <agent>`: check agent health status.
 - `stop`: stop containers recorded in `.ploinky/agents.json` (do not remove).
 - `shutdown`: stop and remove containers recorded in `.ploinky/agents.json`.
+- `destroy`: stop the router, remove workspace containers, and clear `.ploinky/deps` while preserving isolated agent data in `.data/<agent-or-alias>`.
 - `deps prepare [<repo>/<agent>]`: build the prepared node_modules cache for the current runtime.
 - `deps status`: list prepared global and per-agent caches with their runtime keys and validity.
 - `deps clean <repo>/<agent>|--global|--all`: remove a cache directory.

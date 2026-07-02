@@ -45,12 +45,22 @@ function getConfiguredProjectPath(agentName, repoName, alias) {
         }
         if (alias) {
             const aliasRec = Object.values(map || {}).find(r => r && r.type === 'agent' && r.alias === alias);
+            if (aliasRec && (aliasRec.runMode || 'isolated') === 'isolated') {
+                const isolatedPath = getAgentWorkDir(alias);
+                try { fs.mkdirSync(isolatedPath, { recursive: true }); } catch (_) {}
+                return isolatedPath;
+            }
             if (aliasRec && aliasRec.projectPath && typeof aliasRec.projectPath === 'string') {
                 const normalized = normalizeProjectPath(aliasRec.projectPath, aliasRec.runMode);
                 if (normalized) return normalized;
             }
         }
         const rec = Object.values(map || {}).find(r => r && r.type === 'agent' && r.agentName === agentName && r.repoName === repoName);
+        if (rec && (rec.runMode || 'isolated') === 'isolated') {
+            const isolatedPath = getAgentWorkDir(rec.alias || agentName);
+            try { fs.mkdirSync(isolatedPath, { recursive: true }); } catch (_) {}
+            return isolatedPath;
+        }
         if (rec && rec.projectPath && typeof rec.projectPath === 'string') {
             const normalized = normalizeProjectPath(rec.projectPath, rec.runMode);
             if (normalized) return normalized;
@@ -244,13 +254,13 @@ function getAgentMcpConfigPath(agentPath) {
     return null;
 }
 
-function syncAgentMcpConfig(_containerName, agentPath, agentName) {
+function syncAgentMcpConfig(_containerName, agentPath, agentName, options = {}) {
     try {
         const source = getAgentMcpConfigPath(agentPath);
         if (!source) return false;
         const resolvedAgentName = agentName || path.basename(agentPath || '');
         if (!resolvedAgentName) return false;
-        const workDir = getAgentWorkDir(resolvedAgentName);
+        const workDir = options.workDir || getAgentWorkDir(resolvedAgentName);
         if (!fs.existsSync(workDir)) {
             fs.mkdirSync(workDir, { recursive: true });
         }

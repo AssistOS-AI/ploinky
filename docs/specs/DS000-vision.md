@@ -18,7 +18,7 @@ The repository also carries local maintenance skills under `.agents/skills/`, bu
 
 Ploinky must let an operator install and uninstall repositories, discover agents from `manifest.json` in installed repositories, register enabled agents in `.ploinky/agents.json`, and start a workspace whose routing state is written to `.ploinky/routing.json`. The first-class user entry points are the `ploinky` and `p-cli` launchers, the `ploinky-shell` assistant shell, and the router-managed browser surfaces served on the configured static-agent port.
 
-The runtime must treat `.ploinky/` as the persistent boundary for workspace state. Agent working directories, cloned repositories, dependency caches, logs, keys, transcripts, and workspace configuration all live under that root. This repository must not describe alternate storage layouts as if they were equivalent unless they are implemented in code.
+The runtime must treat `.ploinky/` as the boundary for internal workspace state such as the enabled-agent registry, cloned repositories, regenerated dependency caches, logs, keys, transcripts, routing, and workspace configuration. Persistent agent homes live beside that internal state under `.data/<agent-or-alias>/` and are mounted at `/root` for container agents in every run mode; `destroy` must preserve `.data/` while it removes containers and regenerated dependency caches.
 
 Documentation must remain synchronized with the current branch. The HTML pages under `docs/` explain the system to human readers. The DS files under `docs/specs/` define the stable contract. When wording differs, the DS specifications are authoritative. The repository must keep the DS numbering contiguous and must preserve `DS001-coding-style.md` as the coding-style authority.
 

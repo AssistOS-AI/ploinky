@@ -16,7 +16,7 @@ Ploinky is a workspace-local runtime for repository-backed agents.
 - `ploinky update [folderPath]` and `ploinky update all [folderPath]`: update the Ploinky checkout, refresh `ploinky/node_modules/achillesAgentLib`, update `.ploinky/repos/`, repairing non-git installed repo directories by recloning on the recorded branch when a source URL is known, recursively update discovered git repositories, and refresh Achilles default skills in those project repositories. Discovered project repositories with missing or unreachable remotes are logged and skipped for the pull step while still receiving default skills. When no folder path is provided, discovery starts at the current working directory.
 - `ploinky update repos`: update installed `.ploinky/repos/` entries and refresh both the Ploinky runtime Achilles checkout and managed-repo Achilles dependencies.
 - `ploinky update repo <name>`: update one repository under `.ploinky/repos/`.
-- `ploinky enable agent <name|repo/name> [global|devel [repo]] [--auth none|pwd|sso] [as <alias>]`: register an agent in `.ploinky/agents.json`.
+- `ploinky enable agent <name|repo/name> [global|devel [repo]] [--auth none|pwd|sso] [as <alias>]`: register an agent in `.ploinky/agents.json`. Isolated agents use `.data/<agent-or-alias>/` as their host-side home and work directory.
 - `ploinky start [staticAgent] [port] [--branch <branch>] [--repo-branch <repo=branch>]... [--branch-fallback default|fail] [--reset-repos]`: resolve dependency waves, start enabled agents, write `routing.json`, and launch the router under the watchdog. `--branch` sets a candidate branch for all repos involved in this start; `--repo-branch` overrides it per repo. `--branch-fallback default` (the default) keeps repos on their configured branch when the candidate is missing; `fail` aborts. `--reset-repos` permits hard reset of dirty managed repos.
 - `ploinky status`: show SSO state, router listening state, installed and remembered repositories, and running agent containers.
 - `ploinky list routes`: inspect the current `.ploinky/routing.json` route table.
@@ -25,7 +25,7 @@ Ploinky is a workspace-local runtime for repository-backed agents.
 - `ploinky cli <agent> [args...]`: run the manifest CLI command interactively.
 - `ploinky stop`: stop enabled agents and the router without removing runtime state. Host-sandboxed agents are signaled in a batch before Ploinky waits.
 - `ploinky shutdown`: stop the router and remove runtimes recorded for this workspace in `.ploinky/agents.json`.
-- `ploinky destroy`: stop the router, remove all Ploinky runtimes for the workspace, and clear `.ploinky/agents/`.
+- `ploinky destroy`: stop the router, remove all Ploinky runtimes for the workspace, and clear the regenerated dependency cache under `.ploinky/deps/` without deleting `.data/<agent-or-alias>/`.
 - `ploinky clean`: alias for `destroy`.
 - `ploinky logs tail [router]` and `ploinky logs last <N> [router]`: inspect router logs. Router logs are the only logs exposed through the CLI.
 - `ploinky webchat [--rotate]`: print the WebChat access URL. WebChat uses the router login flow; `--rotate` is accepted for compatibility but does not mint a WebChat-specific token.

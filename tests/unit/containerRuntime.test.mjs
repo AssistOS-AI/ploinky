@@ -182,6 +182,140 @@ try {
     }
 });
 
+test('getConfiguredProjectPath uses .data agent folder for isolated records', () => {
+    const workspaceDir = tempDir();
+    try {
+        fs.mkdirSync(path.join(workspaceDir, '.ploinky'), { recursive: true });
+        fs.writeFileSync(path.join(workspaceDir, '.ploinky/agents.json'), JSON.stringify({
+            demoContainer: {
+                type: 'agent',
+                agentName: 'demo',
+                repoName: 'repo',
+                runMode: 'isolated',
+            },
+        }));
+
+        const result = runModuleSnippet(
+            `const { getConfiguredProjectPath } = await import(${JSON.stringify(dockerCommonUrl)});
+process.stdout.write(getConfiguredProjectPath('demo', 'repo'));`,
+            {},
+            { cwd: workspaceDir },
+        );
+
+        assert.equal(result.status, 0, result.stderr);
+        assert.equal(result.stdout, path.join(workspaceDir, '.data', 'demo'));
+    } finally {
+        fs.rmSync(workspaceDir, { recursive: true, force: true });
+    }
+});
+
+test('getConfiguredProjectPath uses alias as isolated .data folder name', () => {
+    const workspaceDir = tempDir();
+    try {
+        fs.mkdirSync(path.join(workspaceDir, '.ploinky'), { recursive: true });
+        fs.writeFileSync(path.join(workspaceDir, '.ploinky/agents.json'), JSON.stringify({
+            demoAliasContainer: {
+                type: 'agent',
+                agentName: 'demo',
+                repoName: 'repo',
+                alias: 'demoAlias',
+                runMode: 'isolated',
+            },
+        }));
+
+        const result = runModuleSnippet(
+            `const { getConfiguredProjectPath } = await import(${JSON.stringify(dockerCommonUrl)});
+process.stdout.write(getConfiguredProjectPath('demo', 'repo', 'demoAlias'));`,
+            {},
+            { cwd: workspaceDir },
+        );
+
+        assert.equal(result.status, 0, result.stderr);
+        assert.equal(result.stdout, path.join(workspaceDir, '.data', 'demoAlias'));
+    } finally {
+        fs.rmSync(workspaceDir, { recursive: true, force: true });
+    }
+});
+
+test('global enabled agents keep workspace projectPath and declare persistent /root home', () => {
+    const workspaceDir = tempDir();
+    const binDir = tempDir('ploinky-fake-runtime-');
+    try {
+        const stateFile = path.join(binDir, 'container-name.txt');
+        const argsFile = path.join(binDir, 'run-args.txt');
+        const podmanPath = path.join(binDir, 'podman');
+        fs.writeFileSync(
+            podmanPath,
+            `#!/bin/sh
+case "$1" in
+  image)
+    exit 0
+    ;;
+  inspect)
+    exit 1
+    ;;
+  run)
+    printf '%s\\n' "$*" > ${JSON.stringify(argsFile)}
+    name=""
+    prev=""
+    for arg in "$@"; do
+      if [ "$prev" = "--name" ]; then name="$arg"; break; fi
+      prev="$arg"
+    done
+    printf '%s\\n' "$name" > ${JSON.stringify(stateFile)}
+    exit 0
+    ;;
+  ps)
+    cat ${JSON.stringify(stateFile)} 2>/dev/null || true
+    exit 0
+    ;;
+  port)
+    exit 1
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+`,
+        );
+        fs.chmodSync(podmanPath, 0o755);
+
+        const agentDir = path.join(workspaceDir, '.ploinky', 'repos', 'repo', 'demo');
+        fs.mkdirSync(agentDir, { recursive: true });
+        fs.writeFileSync(path.join(agentDir, 'manifest.json'), JSON.stringify({
+            container: 'example/demo:latest',
+            start: 'sleep 3600',
+            readiness: { protocol: 'none' },
+        }));
+
+        const result = runModuleSnippet(
+            `const { enableAgent } = await import(${JSON.stringify(pathToFileURL(path.join(repoRoot, 'cli/services/agents.js')).href)});
+enableAgent('repo/demo', 'global');
+const fs = await import('node:fs');
+const path = await import('node:path');
+const agents = JSON.parse(fs.readFileSync(path.join(process.cwd(), '.ploinky', 'agents.json'), 'utf8'));
+const record = Object.values(agents).find((entry) => entry && entry.agentName === 'demo');
+console.log(JSON.stringify(record));`,
+            { PATH: `${binDir}${path.delimiter}${process.env.PATH || ''}` },
+            { cwd: workspaceDir },
+        );
+
+        assert.equal(result.status, 0, result.stderr);
+        const record = JSON.parse(result.stdout.trim().split('\n').at(-1));
+        assert.equal(record.runMode, 'global');
+        assert.equal(record.projectPath, workspaceDir);
+        assert.ok(record.config.binds.some((bind) => (
+            bind.source === workspaceDir && bind.target === workspaceDir
+        )));
+        assert.ok(record.config.binds.some((bind) => (
+            bind.source === path.join(workspaceDir, '.data', 'demo') && bind.target === '/root'
+        )));
+    } finally {
+        fs.rmSync(workspaceDir, { recursive: true, force: true });
+        fs.rmSync(binDir, { recursive: true, force: true });
+    }
+});
+
 test('buildExecArgs prefers interactive bash for direct shell TTY sessions', () => {
     const args = buildExecArgs('agent-container', '/work', '/bin/sh', true, true, {
         env: {

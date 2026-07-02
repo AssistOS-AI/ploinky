@@ -8,7 +8,6 @@ import { validateSecrets, getSecrets, createEnvWithSecrets, formatMissingSecrets
 import { buildEnvMap } from './secretVars.js';
 import { buildAgentIdentityEnv, stripReservedAgentEnv } from './agentIdentityEnv.js';
 import { deriveAgentPrincipalId } from './agentIdentity.js';
-import { installDependencies } from './dependencyInstaller.js';
 import {
     initWorkspaceStructure,
     createAgentSymlinks,
@@ -377,15 +376,12 @@ export function runProfileLifecycle(agentName, profileName, options = {}) {
 
     // Steps 7-10: Install hooks (skip if already ran in temp container before main container start)
     if (!skipInstallHooks) {
-        // Step 7 & 8: Dependencies Installation [CONTAINER] (conditional)
-        if (containerName) {
-            log('[lifecycle] Steps 7-8: Installing dependencies...');
-            const depResult = installDependencies(containerName, agentName, { verbose });
-            steps.push({ step: 7, name: 'dependencies', success: depResult.success, message: depResult.message });
-            if (!depResult.success) {
-                errors.push(`Dependency installation failed: ${depResult.message}`);
-            }
-        }
+        steps.push({
+            step: 7,
+            name: 'dependencies',
+            success: true,
+            message: 'Prepared dependency cache is managed before runtime start'
+        });
 
         // Step 9: install [CONTAINER]
         if (profileConfig.install && containerName) {
@@ -566,12 +562,7 @@ export function runPostStartLifecycle(containerName, agentName, profileName, opt
         containerInfo: { containerName },
     });
 
-    // Dependencies
-    log('[lifecycle] Installing dependencies...');
-    const depResult = installDependencies(containerName, agentName, { verbose });
-    if (!depResult.success) {
-        errors.push(`Dependencies: ${depResult.message}`);
-    }
+    log('[lifecycle] Dependency installation is handled by the prepared cache before runtime start.');
 
     // Container hooks (preinstall is a HOST hook, not a container hook)
     const hooks = ['install', 'postinstall'];

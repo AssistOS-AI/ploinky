@@ -65,8 +65,7 @@ import { resolveProfileServer } from '../profileServer.js';
 import {
     getAgentWorkDir,
     getAgentCodePath,
-    getAgentSkillsPath,
-    createAgentWorkDir
+    getAgentSkillsPath
 } from '../workspaceStructure.js';
 import { ensureAgentCacheForFamily } from '../dependencyCache.js';
 import {
@@ -422,7 +421,7 @@ function buildFullEnvMap(agentName, manifest, profileConfig, agentWorkDir, repoN
 
     // Essential system vars
     env.NODE_PATH = '/code/node_modules';
-    env.HOME = '/tmp';
+    env.HOME = agentWorkDir;
     env.PATH = '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin';
 
     // Final, authoritative agent identity (DS013): strip any reserved name a
@@ -534,7 +533,7 @@ function startBwrapProcess(agentName, manifest, agentPath, options = {}) {
     // Resolve paths
     const agentCodePath = resolveSymlinkPath(getAgentCodePath(agentName));
     const agentSkillsPath = resolveSymlinkPath(getAgentSkillsPath(agentName));
-    const agentWorkDir = getAgentWorkDir(agentName);
+    const agentWorkDir = cwd;
     const runtimeResourcePlan = planRuntimeResources(manifest, { agentName, repoName });
 
     // Pre-container lifecycle (workspace init, symlinks, preinstall HOST hook)
@@ -544,8 +543,8 @@ function startBwrapProcess(agentName, manifest, agentPath, options = {}) {
     }
 
     // Ensure work directory and MCP config
-    createAgentWorkDir(agentName);
-    syncAgentMcpConfig(`bwrap_${agentName}`, path.resolve(agentPath), agentName);
+    fs.mkdirSync(agentWorkDir, { recursive: true });
+    syncAgentMcpConfig(`bwrap_${agentName}`, path.resolve(agentPath), alias || agentName, { workDir: agentWorkDir });
 
     // Prepare node dependencies via prepared cache (see dependencyCache.js).
     // Non-Node agents (start-only, no package.json) still get an empty
@@ -831,7 +830,7 @@ function attachBwrapInteractive(agentName, manifest, agentPath, workdir, entryCo
     // Resolve paths
     const agentCodePath = resolveSymlinkPath(getAgentCodePath(agentName));
     const agentSkillsPath = resolveSymlinkPath(getAgentSkillsPath(agentName));
-    const agentWorkDir = getAgentWorkDir(agentName);
+    const agentWorkDir = record.projectPath || getAgentWorkDir(agentName);
     const sharedDir = ensureSharedHostDir();
     const agentHasPackageJson = fs.existsSync(path.join(agentCodePath, 'package.json'));
     const startCmd = readManifestStartCommand(manifest);
