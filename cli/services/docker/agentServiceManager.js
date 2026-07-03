@@ -47,7 +47,7 @@ import { ensureSharedHostDir, runPostinstallHook } from './agentHooks.js';
 import { ensureBwrapService } from '../bwrap/bwrapServiceManager.js';
 import { ensureSeatbeltService } from '../seatbelt/seatbeltServiceManager.js';
 import { detectShellForImage, SHELL_FALLBACK_DIRECT } from './shellDetection.js';
-import { detectRuntimeKeyForAgent } from '../dependencyRuntimeKey.js';
+import { detectRuntimeKeyForAgent, isNoNodeRuntimeKey } from '../dependencyRuntimeKey.js';
 import { nodeModulesDir, prepareAgentCache } from '../dependencyCache.js';
 import {
     runPreContainerLifecycle,
@@ -316,6 +316,37 @@ function mergeNodeOptions(existingValue, requiredOptions = []) {
     return parts.join(' ');
 }
 
+function resolveDependencyCachePreparation({
+    needsCoreDeps = false,
+    agentHasPackageJson = false,
+    isLlmRuntime = false,
+    runtimeKey = '',
+} = {}) {
+    if (!needsCoreDeps) {
+        return { prepare: false, fatal: false, reason: 'no-core-deps' };
+    }
+    if (!isNoNodeRuntimeKey(runtimeKey)) {
+        return { prepare: true, fatal: false, reason: 'node-runtime' };
+    }
+    if (agentHasPackageJson) {
+        return {
+            prepare: false,
+            fatal: true,
+            reason: 'no-node-image',
+            message: 'container image has no Node binary but the agent has package.json dependencies',
+        };
+    }
+    if (isLlmRuntime) {
+        return {
+            prepare: false,
+            fatal: true,
+            reason: 'no-node-image',
+            message: 'container image has no Node binary but the LLM runtime requires Node dependency preparation',
+        };
+    }
+    return { prepare: false, fatal: false, reason: 'no-node-image' };
+}
+
 /**
  * Resolve a symlink path to its actual target.
  * If the path is not a symlink or doesn't exist, returns the original path.
@@ -553,8 +584,9 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
 
     // LLM runtime opt-in: catalog-driven image, hardware-aware policy, reuse hash.
     // Resolved BEFORE dependency cache prep so the cache uses the selected image.
+    const llmRuntimeManifest = isLlmRuntimeManifest(manifest, profileConfig);
     let llmStartup = { enabled: false };
-    if (isLlmRuntimeManifest(manifest, profileConfig)) {
+    if (llmRuntimeManifest) {
         const effectiveNetworkForLlm = profileConfig?.network ?? manifest?.network ?? null;
         llmStartup = prepareLlmStartup({
             runtime,
@@ -607,21 +639,37 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     // INSTALL PHASE — runtime containers never run npm install. Dependency
     // preparation happens here, before runtime boot, via a dedicated cache.
     const agentHasPackageJson = fs.existsSync(path.join(agentCodePath, 'package.json'));
-    const needsCoreDeps = !useStartEntry || agentHasPackageJson || isLlmRuntimeManifest(manifest, profileConfig);
+    const needsCoreDeps = !useStartEntry || agentHasPackageJson || llmRuntimeManifest;
     let preparedNodeModulesDir = path.join(agentWorkDir, 'node_modules');
     if (needsCoreDeps) {
         const runtimeKey = detectRuntimeKeyForAgent(manifest, repoName, agentName, profileConfig, image);
-        const agentPackagePath = agentHasPackageJson ? path.join(agentCodePath, 'package.json') : null;
-        const prepared = prepareAgentCache({
-            repoName,
-            agentName,
+        const dependencyPlan = resolveDependencyCachePreparation({
+            needsCoreDeps,
+            agentHasPackageJson,
+            isLlmRuntime: llmRuntimeManifest,
             runtimeKey,
-            agentPackagePath,
-            image,
-            runtime,
         });
-        preparedNodeModulesDir = nodeModulesDir(prepared.cachePath);
-        debugLog(`[deps] ${agentName}: prepared dependency cache ready at ${preparedNodeModulesDir}`);
+        if (dependencyPlan.fatal) {
+            throw new Error(`[deps] ${agentName}: ${dependencyPlan.message}.`);
+        }
+        if (dependencyPlan.prepare) {
+            const agentPackagePath = agentHasPackageJson ? path.join(agentCodePath, 'package.json') : null;
+            const prepared = prepareAgentCache({
+                repoName,
+                agentName,
+                runtimeKey,
+                agentPackagePath,
+                image,
+                runtime,
+            });
+            preparedNodeModulesDir = nodeModulesDir(prepared.cachePath);
+            debugLog(`[deps] ${agentName}: prepared dependency cache ready at ${preparedNodeModulesDir}`);
+        } else {
+            debugLog(`[deps] ${agentName}: Skipping dependency cache prep (${dependencyPlan.reason})`);
+            if (!fs.existsSync(preparedNodeModulesDir)) {
+                fs.mkdirSync(preparedNodeModulesDir, { recursive: true });
+            }
+        }
     } else {
         debugLog(`[deps] ${agentName}: Skipping dependency cache prep (uses start command, no package.json)`);
         if (!fs.existsSync(preparedNodeModulesDir)) {
@@ -1413,6 +1461,7 @@ export {
     ensurePodmanStagedCodeDir,
     mergeNodeOptions,
     podmanMountSuffix,
+    resolveDependencyCachePreparation,
     resolveHostPort,
     resolveHostPortFromRecord,
     resolveHostPortFromRuntime,

@@ -480,8 +480,7 @@ async function startWorkspace(staticAgentArg, portArg, { refreshComponentToken, 
               console.log(`✓ Agent '${info.shortAgentName}' from repo '${info.repoName}' enabled. Use 'start' to start all configured agents.`);
             }
           } catch (e) {
-            console.error(`start: failed to enable agent '${staticAgentArg}': ${e?.message || e}`);
-            return;
+            throw new Error(`start: failed to enable agent '${staticAgentArg}': ${e?.message || e}`);
           }
         }
       } else {
@@ -506,8 +505,7 @@ async function startWorkspace(staticAgentArg, portArg, { refreshComponentToken, 
       }
     }
     if (!cfg0.static || !cfg0.static.agent || !cfg0.static.port) {
-      console.error('start: missing static agent or port. Usage: start <staticAgent> <port> (first time).');
-      return;
+      throw new Error('start: missing static agent or port. Usage: start <staticAgent> <port> (first time).');
     }
     if (typeof refreshComponentToken === 'function' || typeof ensureComponentToken === 'function') {
       try {
@@ -586,8 +584,7 @@ async function startWorkspace(staticAgentArg, portArg, { refreshComponentToken, 
       staticRepoName = resolvedStaticAgent.repo;
       staticShortAgent = resolvedStaticAgent.shortAgentName;
     } catch (e) {
-      console.error(`start: static agent '${staticAgent}' not found in any repo. Use 'enable agent <repo/name>' or check repos.`);
-      return;
+      throw new Error(`start: static agent '${staticAgent}' not found in any repo. Use 'enable agent <repo/name>' or check repos.`);
     }
 
     let dependencyGraph;
@@ -819,7 +816,11 @@ async function startWorkspace(staticAgentArg, portArg, { refreshComponentToken, 
     console.log(`[start] Watchdog logs: ${path.join(LOGS_DIR, 'watchdog.log')}`);
     console.log(`[start] Dashboard: http://127.0.0.1:${staticPort}/dashboard`);
   } catch (e) {
-    console.error('start (workspace) failed:', e.message);
+    const message = e?.message || String(e);
+    if (message.startsWith('start:') || message.startsWith('start (workspace) failed:')) {
+      throw e;
+    }
+    throw new Error(`start (workspace) failed: ${message}`);
   }
 }
 

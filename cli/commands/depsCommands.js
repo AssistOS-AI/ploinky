@@ -9,7 +9,7 @@ import {
     hashMergedPackage,
     resolveGlobalCacheManifest,
 } from '../services/dependencyCache.js';
-import { detectRuntimeKeyForAgent } from '../services/dependencyRuntimeKey.js';
+import { detectRuntimeKeyForAgent, isNoNodeRuntimeKey } from '../services/dependencyRuntimeKey.js';
 import {
     DEPS_DIR,
     GLOBAL_DEPS_CACHE_DIR,
@@ -112,6 +112,13 @@ function depsPrepare(args) {
             return;
         }
         const runtimeKey = runtimeKeyForAgent(repoName, agentName);
+        if (isNoNodeRuntimeKey(runtimeKey)) {
+            if (resolveAgentPackagePath(repoName, agentName)) {
+                throw new Error(`[deps] ${repoName}/${agentName}: container image has no Node binary but package.json dependencies are present.`);
+            }
+            log(`[deps] ${repoName}/${agentName} does not require prepared Node dependencies (image has no Node binary).`);
+            return;
+        }
         log(`[deps] preparing ${repoName}/${agentName} (${runtimeKey})`);
         const result = prepareOne({
             repoName,
@@ -138,6 +145,12 @@ function depsPrepare(args) {
                 continue;
             }
             const runtimeKey = runtimeKeyForAgent(repoName, agentName);
+            if (isNoNodeRuntimeKey(runtimeKey)) {
+                if (resolveAgentPackagePath(repoName, agentName)) {
+                    console.warn(`[deps] skipping ${repoName}/${agentName}: image has no Node binary but package.json dependencies are present`);
+                }
+                continue;
+            }
             if (!runtimeKeys.has(runtimeKey)) {
                 runtimeKeys.set(runtimeKey, {
                     runtime: manifest ? getRuntimeForAgent(manifest) : 'bwrap',
@@ -161,6 +174,14 @@ function depsPrepare(args) {
                 continue;
             }
             const runtimeKey = runtimeKeyForAgent(repoName, agentName);
+            if (isNoNodeRuntimeKey(runtimeKey)) {
+                if (resolveAgentPackagePath(repoName, agentName)) {
+                    console.warn(`[deps] skipping ${repoName}/${agentName}: image has no Node binary but package.json dependencies are present`);
+                } else {
+                    log(`[deps] skipping ${repoName}/${agentName}: no Node dependency cache required`);
+                }
+                continue;
+            }
             log(`[deps] preparing ${repoName}/${agentName} (${runtimeKey})`);
             prepareOne({
                 repoName,
