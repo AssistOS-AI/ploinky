@@ -307,6 +307,30 @@ function buildReadinessEntryFromNode(node, route, staticLabel) {
   };
 }
 
+function resolveManifestReadinessWaitOptions(manifest, fallbackTimeoutMs = 120000) {
+  const probe = manifest?.health?.readiness && typeof manifest.health.readiness === 'object'
+    ? manifest.health.readiness
+    : null;
+  if (!probe) {
+    return {
+      timeoutMs: fallbackTimeoutMs,
+      intervalMs: 250,
+      probeTimeoutMs: 1000
+    };
+  }
+  const intervalSeconds = Number.parseInt(probe.interval ?? '1', 10);
+  const timeoutSeconds = Number.parseInt(probe.timeout ?? '1', 10);
+  const failureThreshold = Number.parseInt(probe.failureThreshold ?? '120', 10);
+  const intervalMs = Math.max(1, Number.isFinite(intervalSeconds) ? intervalSeconds : 1) * 1000;
+  const probeTimeoutMs = Math.max(1, Number.isFinite(timeoutSeconds) ? timeoutSeconds : 1) * 1000;
+  const attempts = Math.max(1, Number.isFinite(failureThreshold) ? failureThreshold : 120);
+  return {
+    timeoutMs: Math.max(fallbackTimeoutMs, attempts * (intervalMs + probeTimeoutMs)),
+    intervalMs,
+    probeTimeoutMs
+  };
+}
+
 function buildBlockingReadinessEntryFromNode(node, route, staticLabel) {
   const entry = buildReadinessEntryFromNode(node, route, staticLabel);
   if (!route?.hostPort && entry.protocol !== 'none') {
@@ -955,13 +979,16 @@ async function runShell(agentName) {
     : agentName;
   const { manifestPath, shortAgentName } = utils.findAgent(manifestLookup);
   const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
-  const { ensureAgentService, attachInteractive, getConfiguredProjectPath, getAgentContainerName } = dockerSvc;
+  const { ensureAgentService, attachInteractive, getConfiguredProjectPath, getAgentContainerName, isContainerRunning } = dockerSvc;
   const agentDir = path.dirname(manifestPath);
   const repoName = path.basename(path.dirname(agentDir));
-  const containerInfo = ensureAgentService(shortAgentName, manifest, agentDir, { containerName: registryRecord?.containerName, alias: registryRecord?.record?.alias });
-  const containerName = (containerInfo && containerInfo.containerName)
-    || registryRecord?.containerName
-    || getAgentContainerName(shortAgentName, repoName);
+  const registeredContainerName = registryRecord?.containerName || getAgentContainerName(shortAgentName, repoName);
+  let containerName = registeredContainerName;
+  if (!isContainerRunning(registeredContainerName)) {
+    const containerInfo = ensureAgentService(shortAgentName, manifest, agentDir, { containerName: registeredContainerName, alias: registryRecord?.record?.alias });
+    containerName = (containerInfo && containerInfo.containerName)
+      || registeredContainerName;
+  }
   const cmd = '/bin/sh';
   const projPath = getConfiguredProjectPath(shortAgentName, repoName, registryRecord?.record?.alias);
 
@@ -1114,8 +1141,11 @@ async function reinstallAgent(agentName) {
             fs.writeFileSync(routingFile, JSON.stringify(cfg, null, 2));
 
             if (readinessProtocol !== 'none') {
+                const readinessWait = resolveManifestReadinessWaitOptions(manifest, 15000);
                 const ready = await waitForAgentReady({ hostPort }, {
-                    timeoutMs: 15000,
+                    timeoutMs: readinessWait.timeoutMs,
+                    intervalMs: readinessWait.intervalMs,
+                    probeTimeoutMs: readinessWait.probeTimeoutMs,
                     protocol: readinessProtocol,
                 });
                 if (!ready) {
