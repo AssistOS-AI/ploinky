@@ -2,7 +2,7 @@
 # ploinky-box: run the Ploinky runtime isolated inside a rootless-podman container.
 # Host requirements: podman (preferred) or docker. Nothing else.
 # Isolation contract: never --privileged; explicit crossings only (published
-# router port, `cp`, opt-in --mount).
+# ports, `cp`, opt-in --mount).
 set -euo pipefail
 
 DEFAULT_IMAGE="docker.io/assistos/ploinky-box:podman-node24"
@@ -15,6 +15,9 @@ IMAGE="$DEFAULT_IMAGE"
 MOUNT_DIR=""
 LISTEN_LAN=0
 DRY_RUN=0
+PUBLISH_ARGS=()
+PUBLISH_COUNT=0
+WEBMEET_PORTS=0
 
 usage() {
     cat <<'EOF'
@@ -39,6 +42,9 @@ Flags:
   --name X       Extra isolated instance (container ploinky-box-X)
   --port N       Host port for the router (default 8080).
                  Inside the box, always start the router on port 8080.
+  --publish SPEC Extra host-to-box port publish; repeatable, same form as -p.
+  --webmeet-ports
+                 Publish local LiveKit/TURN ports used by WebMeet rooms/media.
   --image I      Image override (default docker.io/assistos/ploinky-box:podman-node24)
   --mount DIR    Bind DIR read-write at /workspace/mounted (pierces isolation)
   --listen-lan   Publish the router on 0.0.0.0 instead of 127.0.0.1
@@ -56,6 +62,12 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --name)   NAME="${2:?--name needs a value}"; shift 2 ;;
         --port)   PORT="${2:?--port needs a value}"; shift 2 ;;
+        --publish)
+            PUBLISH_ARGS+=("${2:?--publish needs a value}")
+            PUBLISH_COUNT=$((PUBLISH_COUNT + 1))
+            shift 2
+            ;;
+        --webmeet-ports) WEBMEET_PORTS=1; shift ;;
         --image)  IMAGE="${2:?--image needs a value}"; shift 2 ;;
         --mount)  MOUNT_DIR="${2:?--mount needs a value}"; shift 2 ;;
         --engine) ENGINE="${2:?--engine needs a value}"; shift 2 ;;
@@ -134,6 +146,7 @@ host_port() {
 
 build_run_args() {
     local bind_ip="127.0.0.1"
+    local publish_spec
     [ "$LISTEN_LAN" -eq 1 ] && bind_ip="0.0.0.0"
     RUN_ARGS=(run -d --init --name "$INSTANCE"
         --user podman
@@ -141,8 +154,26 @@ build_run_args() {
         --device /dev/net/tun
         --security-opt seccomp=unconfined
         -p "${bind_ip}:${PORT}:8080"
+    )
+    if [ "$PUBLISH_COUNT" -gt 0 ]; then
+        for publish_spec in "${PUBLISH_ARGS[@]}"; do
+            RUN_ARGS+=(-p "$publish_spec")
+        done
+    fi
+    if [ "$WEBMEET_PORTS" -eq 1 ]; then
+        RUN_ARGS+=(
+            -p "${bind_ip}:7880:7880"
+            -p "${bind_ip}:7881:7881"
+            -p "${bind_ip}:7882-7892:7882-7892/udp"
+            -p "${bind_ip}:3478:3478/tcp"
+            -p "${bind_ip}:3478:3478/udp"
+            -p "${bind_ip}:20000-20010:20000-20010/udp"
+        )
+    fi
+    RUN_ARGS+=(
         -v "${VOL_WS}:/workspace"
         -v "${VOL_CT}:/home/podman/.local/share/containers"
+        -e PLOINKY_BOX=1
         -e PLOINKY_WORKSPACE_ROOT=/workspace
     )
     if [ "$DRY_RUN" -eq 0 ] && engine_selinux_enabled; then

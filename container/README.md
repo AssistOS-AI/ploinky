@@ -25,7 +25,14 @@ inside the agent image and node-less images (e.g. plain alpine) fail to start.
 
 The wrapper publishes host port `--port N` (default 8080) to **container port
 8080**. Inside the box, always start the router on 8080:
-`start <agent> 8080`. Any other in-box port is unreachable from the host.
+`start <agent> 8080`.
+
+Other in-box ports are unreachable from the host unless you publish them when
+creating the box. Use `--publish HOST:BOX` for a specific port, repeat it for
+more ports, or use `--webmeet-ports` to publish the local LiveKit/TURN ports
+needed by WebMeet rooms/media. Existing boxes keep their original port mappings;
+run `ploinky-box update` with the same flags, or recreate the box, when you add
+new published ports.
 
 ## Commands
 
@@ -41,8 +48,9 @@ The wrapper publishes host port `--port N` (default 8080) to **container port
 | `update` | Pull newer image, recreate the box (pass the same flags as `up`) |
 | `destroy` | Remove the box AND its volumes (asks first) |
 
-Flags: `--name X` (extra isolated instance), `--port N`, `--image I`,
-`--mount DIR`, `--listen-lan`, `--engine podman|docker`, `--dry-run`.
+Flags: `--name X` (extra isolated instance), `--port N`, `--publish SPEC`,
+`--webmeet-ports`, `--image I`, `--mount DIR`, `--listen-lan`,
+`--engine podman|docker`, `--dry-run`.
 `PLOINKY_BOX_ENGINE` overrides engine detection.
 
 ## Isolation contract
@@ -50,7 +58,7 @@ Flags: `--name X` (extra isolated instance), `--port N`, `--image I`,
 The box runs **without `--privileged`**: `--user podman --device /dev/fuse
 --device /dev/net/tun --security-opt seccomp=unconfined` (plus `label=disable` whenever the engine
 reports SELinux enabled — e.g. the podman-machine VM on macOS, even though the
-Mac itself has no SELinux). The only crossings of the boundary are: the published router port
+Mac itself has no SELinux). The only crossings of the boundary are: published ports
 (loopback-only unless `--listen-lan`), explicit `cp`, and the opt-in `--mount DIR`
 (bind-mounted read-write at `/workspace/mounted` — you are piercing the sandbox).
 State lives in two named volumes per instance: `<instance>-workspace`

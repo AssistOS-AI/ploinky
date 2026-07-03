@@ -85,6 +85,33 @@ process.stdout.write(JSON.stringify(buildRuntimeRouterEnv('docker')));`,
     }
 });
 
+test('buildRuntimeNetworkPlan downgrades named podman networks inside ploinky-box', () => {
+    const workspaceDir = tempDir();
+    try {
+        const result = runModuleSnippet(
+            `const { buildRuntimeNetworkPlan } = await import(${JSON.stringify(agentServiceManagerUrl)});
+const plan = buildRuntimeNetworkPlan('podman', {
+  name: 'webmeet',
+  aliases: ['liveKitServerAgent', 'webmeetAgent'],
+}, { env: { PLOINKY_BOX: '1' } });
+process.stdout.write(JSON.stringify(plan));`,
+            {},
+            { cwd: workspaceDir },
+        );
+
+        assert.equal(result.status, 0, result.stderr);
+        assert.deepEqual(JSON.parse(result.stdout), {
+            args: ['--replace', '--network', 'slirp4netns:allow_host_loopback=true'],
+            ensureNetworkName: '',
+            useHostNetwork: false,
+            boxNetworkCompat: true,
+            hashEnv: { PLOINKY_BOX_NETWORK_COMPAT: 'slirp4netns-named-network' },
+        });
+    } finally {
+        fs.rmSync(workspaceDir, { recursive: true, force: true });
+    }
+});
+
 test('computeEnvHash preserves legacy shape when no network is declared', () => {
     const workspaceDir = tempDir();
     try {
