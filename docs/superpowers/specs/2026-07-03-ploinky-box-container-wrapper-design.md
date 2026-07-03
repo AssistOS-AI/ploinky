@@ -120,7 +120,7 @@ must succeed. Failures print the exact start command.
   --user podman \
   --device /dev/fuse \
   --security-opt seccomp=unconfined \
-  [--security-opt label=disable]           # only when getenforce exists and prints Enforcing
+  [--security-opt label=disable]           # only when the ENGINE reports SELinux enabled (engine info query, never client getenforce)
   -p 127.0.0.1:<PORT>:8080 \               # 0.0.0.0 only with --listen-lan
   -v <instance>-workspace:/workspace \
   -v <instance>-containers:/home/podman/.local/share/containers \

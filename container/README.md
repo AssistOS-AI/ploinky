@@ -42,8 +42,9 @@ Flags: `--name X` (extra isolated instance), `--port N`, `--image I`,
 ## Isolation contract
 
 The box runs **without `--privileged`**: `--user podman --device /dev/fuse
---security-opt seccomp=unconfined` (plus `label=disable` on SELinux-enforcing
-hosts). The only crossings of the boundary are: the published router port
+--security-opt seccomp=unconfined` (plus `label=disable` whenever the engine
+reports SELinux enabled — e.g. the podman-machine VM on macOS, even though the
+Mac itself has no SELinux). The only crossings of the boundary are: the published router port
 (loopback-only unless `--listen-lan`), explicit `cp`, and the opt-in `--mount DIR`
 (bind-mounted read-write at `/workspace/mounted` — you are piercing the sandbox).
 State lives in two named volumes per instance: `<instance>-workspace`

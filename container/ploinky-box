@@ -115,8 +115,14 @@ engine() {
     fi
 }
 
-selinux_enforcing() {
-    command -v getenforce >/dev/null 2>&1 && [ "$(getenforce 2>/dev/null)" = "Enforcing" ]
+engine_selinux_enabled() {
+    # SELinux lives on the engine host (e.g. the podman-machine VM), not the
+    # client OS - query the engine, never the local getenforce.
+    if [ "$ENGINE" = "podman" ]; then
+        [ "$("$ENGINE" info --format '{{.Host.Security.SELinuxEnabled}}' 2>/dev/null)" = "true" ]
+    else
+        "$ENGINE" info --format '{{json .SecurityOptions}}' 2>/dev/null | grep -q selinux
+    fi
 }
 
 box_exists()  { "$ENGINE" container inspect "$INSTANCE" >/dev/null 2>&1; }
@@ -138,7 +144,7 @@ build_run_args() {
         -v "${VOL_CT}:/home/podman/.local/share/containers"
         -e PLOINKY_WORKSPACE_ROOT=/workspace
     )
-    if selinux_enforcing; then
+    if [ "$DRY_RUN" -eq 0 ] && engine_selinux_enabled; then
         RUN_ARGS+=(--security-opt label=disable)
     fi
     if [ -n "$MOUNT_DIR" ]; then
