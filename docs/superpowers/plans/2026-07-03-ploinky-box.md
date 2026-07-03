@@ -17,7 +17,7 @@
 - Each commit stays scoped to its own repo. In the ploinky repo NEVER stage `node_modules/achillesAgentLib` (a pre-existing submodule pointer change is present; leave it).
 - Image identity: `assistos/ploinky-box`, default tag `podman-node24`, platforms `linux/amd64,linux/arm64`, `provenance: false`.
 - Ploinky's GitHub default branch is **`master`** (verified via `git ls-remote --symref`); all `source_ref` defaults must be `master`.
-- `node --test tests/` in container-image-builds must pass after every commit to that repo.
+- `node --test` (bare, from the container-image-builds root; Node 25 rejects the `tests/` directory-arg form) must pass after every commit to that repo.
 - All bash must run under macOS system bash 3.2: no `declare -n`, no associative arrays, guard possibly-empty array expansion as `${ARR[@]+"${ARR[@]}"}` under `set -u`.
 - The in-box router port is fixed at 8080 (the wrapper publishes `<host-port>:8080`); in-box `start` commands must use port 8080.
 - Absolute repo paths: repo A = `/Users/danielsava/work/file-parser/container-image-builds`, repo B = `/Users/danielsava/work/file-parser/ploinky`.
@@ -78,8 +78,8 @@ test('ploinky-box workflow builds pinned ploinky checkout with nested-podman bas
 
 - [ ] **Step 2: Run the test to verify it fails**
 
-Run: `cd /Users/danielsava/work/file-parser/container-image-builds && node --test tests/`
-Expected: FAIL — the new test throws `ENOENT ... publish-ploinky-box-image.yml` (the 8 existing tests still pass).
+Run: `cd /Users/danielsava/work/file-parser/container-image-builds && node --test`
+Expected: FAIL — the new test throws `ENOENT ... publish-ploinky-box-image.yml` (the 9 existing tests still pass).
 
 - [ ] **Step 3: Write the Dockerfile**
 
@@ -322,8 +322,8 @@ sources/
 
 - [ ] **Step 7: Run the tests to verify they pass**
 
-Run: `cd /Users/danielsava/work/file-parser/container-image-builds && node --test tests/`
-Expected: PASS — `# pass 9`, `# fail 0`.
+Run: `cd /Users/danielsava/work/file-parser/container-image-builds && node --test`
+Expected: PASS — `# pass 10`, `# fail 0`.
 
 - [ ] **Step 8: Commit (repo A)**
 
@@ -393,7 +393,7 @@ Expected output contains `[ploinky-box] self-check OK` then `nested-ok`. This is
 
 - [ ] **Step 5: Commit any fixes**
 
-If Steps 2-4 forced changes to Task 1 files, re-run `node --test tests/` (must stay green, updating assertions if load-bearing lines changed), then:
+If Steps 2-4 forced changes to Task 1 files, re-run `node --test` (must stay green, updating assertions if load-bearing lines changed), then:
 
 ```bash
 cd /Users/danielsava/work/file-parser/container-image-builds
@@ -1072,13 +1072,13 @@ If no Linux host is available in this session, add to `container/README.md` Limi
 - [ ] **Step 2: Final verification sweep**
 
 ```bash
-cd /Users/danielsava/work/file-parser/container-image-builds && node --test tests/
+cd /Users/danielsava/work/file-parser/container-image-builds && node --test
 bash /Users/danielsava/work/file-parser/ploinky/container/wrapper-tests.sh
 git -C /Users/danielsava/work/file-parser/container-image-builds status --short
 git -C /Users/danielsava/work/file-parser/ploinky status --short
 ```
 
-Expected: 9/9 definition tests pass; 19/19 wrapper tests pass; both repos clean except ploinky's pre-existing `M node_modules/achillesAgentLib` line, which must remain unstaged.
+Expected: 10/10 definition tests pass (a tenth `default-local-llm` test landed upstream on 2026-07-03); 19/19 wrapper tests pass; both repos clean except ploinky's pre-existing `M node_modules/achillesAgentLib` line, which must remain unstaged.
 
 ---
 
