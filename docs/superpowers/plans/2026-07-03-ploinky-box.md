@@ -99,8 +99,10 @@ COPY --from=node-runtime /usr/local/bin/node /usr/local/bin/node
 COPY --from=node-runtime /usr/local/lib/node_modules /usr/local/lib/node_modules
 RUN ln -s /usr/local/lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
     && ln -s /usr/local/lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx \
-    && dnf install -y git \
+    && dnf install -y git slirp4netns \
     && dnf clean all
+# slirp4netns: ploinky pins agent networking to slirp4netns:allow_host_loopback,
+# but podman/stable ships only pasta by default.
 
 # Ploinky baked from the workflow checkout (submodules: true pins achillesAgentLib).
 # --ignore-scripts skips the postinstall that would clone achillesAgentLib master
@@ -260,7 +262,8 @@ jobs:
           docker run --rm --user podman \
             --device /dev/fuse --security-opt seccomp=unconfined \
             ploinky-box:verify \
-            podman run --rm docker.io/library/alpine echo nested-ok
+            podman run --network slirp4netns:allow_host_loopback=true \
+              --rm docker.io/library/alpine echo nested-ok
 
       - name: Build metadata
         id: meta
@@ -391,12 +394,16 @@ Expected output ends with: `IMAGE-OK`
 podman run --rm --user podman \
   --device /dev/fuse --security-opt seccomp=unconfined \
   --security-opt label=disable \
-  ploinky-box:dev podman run --rm docker.io/library/alpine echo nested-ok
+  ploinky-box:dev podman run --network slirp4netns:allow_host_loopback=true \
+  --rm docker.io/library/alpine echo nested-ok
 ```
 
 (`label=disable` is required whenever the engine host enforces SELinux — the
 podman-machine VM does, and without it the inner crun fails with
-`mount devpts to dev/pts: Permission denied`.)
+`mount devpts to dev/pts: Permission denied`. The nested check must use
+ploinky's exact network mode — `slirp4netns:allow_host_loopback=true` — because
+podman's default pasta network can succeed while the slirp4netns binary is
+missing from the image.)
 
 Expected output contains `[ploinky-box] self-check OK` then `nested-ok`. This is the go/no-go check for rootless-in-rootless on this machine (spec §8). If it fails, capture the exact error; the spec's fallback is switching inner storage to `vfs` via a mounted `storage.conf` — investigate before proceeding, do NOT work around with `--privileged`.
 
@@ -873,9 +880,15 @@ they do touches the host filesystem.
     chmod +x ploinky-box
     ./ploinky-box up
     ./ploinky-box cli          # interactive Ploinky console
-    # inside: enable agent demo
-    # inside: start demo 8080
+    # inside: enable agent webtty
+    # inside: start webtty 8080
     open http://127.0.0.1:8080/status
+
+The agent must exist in an enabled repo — ploinky auto-clones its default
+repos (basic, AchillesIDE, AchillesCLI, copilot-agents) on first use, so the
+box needs outbound network on first `up`. `webtty` ships in `basic`. Pick
+agents whose image contains node: ploinky's runtime-key probe execs `node`
+inside the agent image and node-less images (e.g. plain alpine) fail to start.
 
 ## The one rule about ports
 
@@ -889,7 +902,7 @@ The wrapper publishes host port `--port N` (default 8080) to **container port
 | --- | --- |
 | `up` | Create/start the box; pulls the image on first use |
 | `cli` | Interactive `p-cli` console inside the box |
-| `run <args>` | One-shot ploinky command (`run start demo 8080`, `run list agents`) |
+| `run <args>` | One-shot ploinky command (`run start webtty 8080`, `run list agents`) |
 | `cp A B` | Copy in/out; container side uses the `box:` prefix |
 | `status` | Container state + router probe |
 | `logs` | Recent `.ploinky` logs |
@@ -972,7 +985,7 @@ BOX="$(cd "$(dirname "$0")" && pwd)/ploinky-box"
 NAME="smoke$$"
 PORT="${SMOKE_PORT:-8090}"
 IMAGE="${SMOKE_IMAGE:-docker.io/assistos/ploinky-box:podman-node24}"
-AGENT="${SMOKE_AGENT:-demo}"
+AGENT="${SMOKE_AGENT:-webtty}"
 FAILED=0
 TMP_IN="$(mktemp)"
 TMP_OUT="$(mktemp)"
