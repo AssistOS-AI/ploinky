@@ -68,12 +68,16 @@ first attempt a graceful in-box `ploinky stop`.
   `.git` stripped); update the box itself with `ploinky-box update`.
 - `additionalServerPort` in `container` mode relies on inspect-derived
   container IPs, which rootless podman does not expose; use `host` mode for
-  such agents. (Smoke-test outcome recorded below.)
+  such agents. Smoke result 2026-07-03 (macOS 26.5.2, podman machine 5.8.2):
+  WebSocket/additional-port check skipped because `SMOKE_WS_AGENT` was not set.
 - Agents with `lite-sandbox: true` (bwrap/seatbelt) are unsupported inside
   the box in v1.
 - On macOS, `--mount` directories must live under the podman-machine /
   Docker Desktop file share (default: your home directory).
+- Linux-host smoke not yet executed (verified on macOS only as of 2026-07-03).
 - Windows hosts are unsupported.
+
+Smoke verified on macOS 26.5.2 / podman machine (podman 5.8.2) on 2026-07-03.
 
 ## Image provenance
 
