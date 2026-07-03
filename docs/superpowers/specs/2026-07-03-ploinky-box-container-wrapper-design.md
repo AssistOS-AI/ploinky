@@ -171,9 +171,19 @@ its own `--port`.
 
 ## 6. Error-handling policy
 
-Fail loud with remediation; never degrade isolation silently (§4.2). Specific
-cases and messages are enumerated in §4.1/§4.3; the entrypoint self-check is the
-single source of in-box diagnostics so `up` can surface root causes verbatim.
+Fail loud with remediation; never degrade isolation silently (§4.2). The
+entrypoint self-check is the single source of in-box diagnostics so `up` can
+surface root causes verbatim. Specific cases:
+
+| Failure | Handling |
+| --- | --- |
+| No engine on host | Exit with install pointers; `--engine`/`PLOINKY_BOX_ENGINE` respected |
+| macOS engine VM not running | Print the exact start command (`podman machine start` / start Docker Desktop) |
+| Image pull fails | Name the fix: `gh workflow run publish-ploinky-box-image.yml --repo AssistOS-AI/container-image-builds`, or `--image` override; no local-build fallback in v1 |
+| Nested podman broken inside box | Entrypoint self-check exits nonzero naming the missing piece (`/dev/fuse`, seccomp, subuid); `up` health-wait surfaces it verbatim |
+| Container name collision | Detect existing container; offer restart instead of erroring blindly |
+| Host port busy | Detect and suggest `--port` |
+| Engine rejects rootless flags | Report engine/version requirement and exit — never fall back to `--privileged` |
 
 ## 7. Testing and acceptance criteria (runnable)
 
