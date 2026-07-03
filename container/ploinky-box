@@ -254,9 +254,18 @@ cmd_logs() {
     engine exec "$INSTANCE" sh -lc 'tail -n 100 /workspace/.ploinky/logs/*.log 2>/dev/null || echo "no .ploinky logs yet"'
 }
 
+graceful_ploinky_stop() {
+    # Best-effort: stop agents + router via ploinky so agent containers and
+    # .ploinky state shut down cleanly before the box itself is stopped.
+    if [ "$DRY_RUN" -eq 0 ] && box_running; then
+        "$ENGINE" exec -w /workspace "$INSTANCE" timeout 30 ploinky stop >/dev/null 2>&1 || true
+    fi
+}
+
 cmd_stop() {
     preflight
     box_exists || { echo "ploinky-box: '$INSTANCE' does not exist."; return 0; }
+    graceful_ploinky_stop
     engine stop "$INSTANCE" >/dev/null && echo "ploinky-box: '$INSTANCE' stopped (volumes kept)."
 }
 
@@ -264,6 +273,7 @@ cmd_update() {
     preflight
     engine pull "$IMAGE"
     if box_exists; then
+        graceful_ploinky_stop
         engine stop "$INSTANCE" >/dev/null 2>&1 || true
         engine rm "$INSTANCE" >/dev/null
     fi

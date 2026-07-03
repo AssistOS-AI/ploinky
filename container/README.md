@@ -57,6 +57,11 @@ State lives in two named volumes per instance: `<instance>-workspace`
 (the Ploinky workspace) and `<instance>-containers` (nested agent images).
 `stop`/`update` keep them; only `destroy` deletes them.
 
+Agent containers inside the box are disposable: every box start wipes stale
+inner containers (an unclean stop leaves inner podman with false "running"
+state) and `run start` recreates them from `.ploinky` state. `stop`/`update`
+first attempt a graceful in-box `ploinky stop`.
+
 ## Limitations
 
 - In-box `ploinky update` cannot update the baked runtime (read-only,

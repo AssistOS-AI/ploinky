@@ -66,8 +66,10 @@ Follows the repo's external-source pattern (`bwrap-runner`, `livekit-server-agen
 - `COPY images/ploinky-box/entrypoint.sh /usr/local/bin/ploinky-box-entrypoint`;
   entrypoint runs a self-check (`podman info`, node/git present, `/workspace`
   writable) — on failure prints a named diagnostic (missing `/dev/fuse`, seccomp,
-  subuid) and exits nonzero; on success idles (`exec sleep infinity`). Ploinky
-  commands arrive via `exec`.
+  subuid) and exits nonzero; on success wipes stale inner containers
+  (`podman rm -af --time 0` — agent containers are disposable; an unclean box stop
+  leaves false "running" state) and idles (`exec sleep infinity`). Ploinky commands
+  arrive via `exec`.
 
 ### 3.2 `.github/workflows/publish-ploinky-box-image.yml`
 
@@ -165,7 +167,9 @@ its own `--port`.
   agent start is slow, later starts warm; survives `stop`/`update`/reboot.
 - Resume semantics: identical to native ploinky. Workspace state (absolute paths
   under `/workspace`) is stable across container recreation, so
-  `ploinky-box run start` restarts previously enabled agents.
+  `ploinky-box run start` restarts previously enabled agents. Every box start
+  begins with a fresh inner-container slate; `run start` recreates agents.
+  `stop`/`update` first attempt a graceful in-box `ploinky stop`.
 - Isolation crossings are explicit only: published router port (loopback by default),
   `cp`, and opt-in `--mount` (documented as isolation-piercing; on macOS the host
   dir must be inside the podman-machine/Docker Desktop share).

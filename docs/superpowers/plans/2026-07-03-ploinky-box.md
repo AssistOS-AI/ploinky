@@ -161,6 +161,12 @@ command -v podman >/dev/null 2>&1 || fail "podman not on PATH"
 podman info >/dev/null 2>&1 \
     || fail "inner podman not functional - check --security-opt seccomp=unconfined, --device /dev/fuse, and subuid mapping"
 
+# Fresh slate: an unclean box stop leaves inner podman with stale "running"
+# containers (dead conmon/rootlessport, PID reuse fools liveness), which stops
+# ploinky from recreating agents on resume. Agent containers are disposable -
+# `ploinky start` recreates them from /workspace/.ploinky state.
+podman rm -af --time 0 >/dev/null 2>&1 || true
+
 echo "[ploinky-box] self-check OK"
 
 if [ "$#" -gt 0 ]; then
@@ -358,11 +364,14 @@ git commit -m "Add ploinky-box nested-podman image definition"
 
 ```bash
 SCRATCH=$(mktemp -d)
-git clone --recurse-submodules /Users/danielsava/work/file-parser/ploinky "$SCRATCH/sources/ploinky"
+git clone --no-hardlinks --recurse-submodules file:///Users/danielsava/work/file-parser/ploinky "$SCRATCH/sources/ploinky"
 cp -R /Users/danielsava/work/file-parser/container-image-builds/images "$SCRATCH/images"
 ```
 
-(The submodule fetch goes to GitHub per `.gitmodules`; network required.)
+(The submodule fetch goes to GitHub per `.gitmodules`; network required.
+`--no-hardlinks`/`file://` matters: a plain local-path clone hardlinks git
+objects into the scratch context, and later commits/gc in the origin repo can
+leave the build context with unreadable object files mid-`COPY`.)
 
 - [ ] **Step 2: Build the image**
 
@@ -813,9 +822,18 @@ cmd_logs() {
     engine exec "$INSTANCE" sh -lc 'tail -n 100 /workspace/.ploinky/logs/*.log 2>/dev/null || echo "no .ploinky logs yet"'
 }
 
+graceful_ploinky_stop() {
+    # Best-effort: stop agents + router via ploinky so agent containers and
+    # .ploinky state shut down cleanly before the box itself is stopped.
+    if [ "$DRY_RUN" -eq 0 ] && box_running; then
+        "$ENGINE" exec -w /workspace "$INSTANCE" timeout 30 ploinky stop >/dev/null 2>&1 || true
+    fi
+}
+
 cmd_stop() {
     preflight
     box_exists || { echo "ploinky-box: '$INSTANCE' does not exist."; return 0; }
+    graceful_ploinky_stop
     engine stop "$INSTANCE" >/dev/null && echo "ploinky-box: '$INSTANCE' stopped (volumes kept)."
 }
 
@@ -823,6 +841,7 @@ cmd_update() {
     preflight
     engine pull "$IMAGE"
     if box_exists; then
+        graceful_ploinky_stop
         engine stop "$INSTANCE" >/dev/null 2>&1 || true
         engine rm "$INSTANCE" >/dev/null
     fi
