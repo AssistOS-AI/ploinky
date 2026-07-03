@@ -119,6 +119,7 @@ must succeed. Failures print the exact start command.
 <engine> run -d --init --name ploinky-box[-NAME] \   # --init: reap zombies from detached in-box processes
   --user podman \
   --device /dev/fuse \
+  --device /dev/net/tun \                    # slirp4netns (ploinky's agent network mode) needs the TUN device
   --security-opt seccomp=unconfined \
   [--security-opt label=disable]           # only when the ENGINE reports SELinux enabled (engine info query, never client getenforce)
   -p 127.0.0.1:<PORT>:8080 \               # 0.0.0.0 only with --listen-lan

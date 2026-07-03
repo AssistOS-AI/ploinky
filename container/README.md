@@ -11,9 +11,15 @@ they do touches the host filesystem.
     chmod +x ploinky-box
     ./ploinky-box up
     ./ploinky-box cli          # interactive Ploinky console
-    # inside: enable agent demo
-    # inside: start demo 8080
+    # inside: enable agent webtty
+    # inside: start webtty 8080
     open http://127.0.0.1:8080/status
+
+The agent must exist in an enabled repo — ploinky auto-clones its default
+repos (basic, AchillesIDE, AchillesCLI, copilot-agents) on first use, so the
+box needs outbound network on first `up`. `webtty` ships in `basic`. Pick
+agents whose image contains node: ploinky's runtime-key probe execs `node`
+inside the agent image and node-less images (e.g. plain alpine) fail to start.
 
 ## The one rule about ports
 
@@ -27,7 +33,7 @@ The wrapper publishes host port `--port N` (default 8080) to **container port
 | --- | --- |
 | `up` | Create/start the box; pulls the image on first use |
 | `cli` | Interactive `p-cli` console inside the box |
-| `run <args>` | One-shot ploinky command (`run start demo 8080`, `run list agents`) |
+| `run <args>` | One-shot ploinky command (`run start webtty 8080`, `run list agents`) |
 | `cp A B` | Copy in/out; container side uses the `box:` prefix |
 | `status` | Container state + router probe |
 | `logs` | Recent `.ploinky` logs |
@@ -42,7 +48,7 @@ Flags: `--name X` (extra isolated instance), `--port N`, `--image I`,
 ## Isolation contract
 
 The box runs **without `--privileged`**: `--user podman --device /dev/fuse
---security-opt seccomp=unconfined` (plus `label=disable` whenever the engine
+--device /dev/net/tun --security-opt seccomp=unconfined` (plus `label=disable` whenever the engine
 reports SELinux enabled — e.g. the podman-machine VM on macOS, even though the
 Mac itself has no SELinux). The only crossings of the boundary are: the published router port
 (loopback-only unless `--listen-lan`), explicit `cp`, and the opt-in `--mount DIR`

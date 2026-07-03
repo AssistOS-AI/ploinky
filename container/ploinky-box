@@ -25,7 +25,7 @@ Usage: ploinky-box [flags] <command> [args]
 Commands:
   up         Create/start the box (pulls the image on first use)
   cli        Interactive Ploinky console (p-cli) inside the box
-  run <...>  One-shot ploinky command, e.g.: ploinky-box run start demo 8080
+  run <...>  One-shot ploinky command, e.g.: ploinky-box run start webtty 8080
   cp A B     Copy in/out; prefix the container side with box:
              e.g. ploinky-box cp ./file box:/workspace/file
   status     Container state + router probe
@@ -138,6 +138,7 @@ build_run_args() {
     RUN_ARGS=(run -d --init --name "$INSTANCE"
         --user podman
         --device /dev/fuse
+        --device /dev/net/tun
         --security-opt seccomp=unconfined
         -p "${bind_ip}:${PORT}:8080"
         -v "${VOL_WS}:/workspace"
