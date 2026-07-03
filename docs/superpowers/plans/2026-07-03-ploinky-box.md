@@ -617,7 +617,11 @@ VOL_CT="${INSTANCE}-containers"
 
 detect_engine() {
     if [ -n "$ENGINE" ]; then
-        command -v "$ENGINE" >/dev/null 2>&1 || die "requested engine '$ENGINE' not found in PATH"
+        # In --dry-run the binary need not exist: tests force both engine names
+        # on machines that may have only one (or neither) installed.
+        if [ "$DRY_RUN" -eq 0 ]; then
+            command -v "$ENGINE" >/dev/null 2>&1 || die "requested engine '$ENGINE' not found in PATH"
+        fi
         return 0
     fi
     local c
