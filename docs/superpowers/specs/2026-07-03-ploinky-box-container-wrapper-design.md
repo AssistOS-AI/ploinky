@@ -73,8 +73,8 @@ Follows the repo's external-source pattern (`bwrap-runner`, `livekit-server-agen
 
 Mirrors `publish-bwrap-runner.yml` with these specifics:
 
-- `workflow_dispatch` inputs: `source_ref` (default `main` — ploinky ref to build),
-  `image_tag` (default `podman-node24`).
+- `workflow_dispatch` inputs: `source_ref` (default `master` — ploinky's verified
+  GitHub default branch), `image_tag` (default `podman-node24`).
 - Checkout `AssistOS-AI/ploinky` under `sources/ploinky` with **`submodules: true`**
   (pins achillesAgentLib at the recorded gitlink) and
   `token: ${{ secrets.SOURCE_REPO_TOKEN || github.token }}`.
@@ -116,16 +116,16 @@ must succeed. Failures print the exact start command.
 ### 4.2 Container run profile (isolation contract)
 
 ```
-<engine> run -d --name ploinky-box[-NAME] \
+<engine> run -d --init --name ploinky-box[-NAME] \   # --init: reap zombies from detached in-box processes
   --user podman \
   --device /dev/fuse \
   --security-opt seccomp=unconfined \
   [--security-opt label=disable]           # only when getenforce exists and prints Enforcing
   -p 127.0.0.1:<PORT>:8080 \               # 0.0.0.0 only with --listen-lan
-  -v <name>-workspace:/workspace \
-  -v <name>-containers:/home/podman/.local/share/containers \
-  [-v HOSTDIR:/workspace/mounted:...]      # only with explicit --mount HOSTDIR
-  -e PORT=8080 \
+  -v <instance>-workspace:/workspace \
+  -v <instance>-containers:/home/podman/.local/share/containers \
+  [-v HOSTDIR:/workspace/mounted]          # only with explicit --mount HOSTDIR
+  -e PLOINKY_WORKSPACE_ROOT=/workspace \   # pins state location regardless of exec cwd
   assistos/ploinky-box:podman-node24
 ```
 
