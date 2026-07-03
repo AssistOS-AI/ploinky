@@ -105,9 +105,13 @@ RUN ln -s /usr/local/lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
 # Ploinky baked from the workflow checkout (submodules: true pins achillesAgentLib).
 # --ignore-scripts skips the postinstall that would clone achillesAgentLib master
 # over the pinned checkout (and would fail: git clone into a non-empty dir errors).
+# npm >= 11 prunes packages not listed in package.json, so the pinned submodule
+# is parked aside during install and restored afterwards.
 COPY sources/ploinky /opt/ploinky
 RUN cd /opt/ploinky \
+    && mv node_modules/achillesAgentLib /tmp/achillesAgentLib-pinned \
     && npm install --ignore-scripts \
+    && mv /tmp/achillesAgentLib-pinned node_modules/achillesAgentLib \
     && test -d node_modules/achillesAgentLib \
     && test -d node_modules/mcp-sdk \
     && rm -rf .git node_modules/achillesAgentLib/.git \
