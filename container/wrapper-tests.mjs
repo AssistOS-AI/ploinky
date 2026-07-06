@@ -14,6 +14,50 @@ import { fileURLToPath } from 'node:url';
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const BOX = path.join(HERE, 'ploinky-box');
 const MJS = path.join(HERE, 'ploinky-box.mjs');
+const PLOINKY = path.join(HERE, '..', 'bin', 'ploinky');
+const PCLI = path.join(HERE, '..', 'bin', 'p-cli');
+const PSH = path.join(HERE, '..', 'bin', 'psh');
+
+function makeFakeNodeCapture() {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-node-'));
+    const capture = path.join(dir, 'capture.json');
+    const node = path.join(dir, 'node');
+    const realNode = process.execPath;
+    fs.writeFileSync(node, `#!/usr/bin/env bash
+printf '{"argv":[' > ${JSON.stringify(capture)}
+first=1
+for arg in "$@"; do
+  if [ "$first" -eq 0 ]; then printf ',' >> ${JSON.stringify(capture)}; fi
+  first=0
+  ${JSON.stringify(realNode)} -e 'process.stdout.write(JSON.stringify(process.argv[1]))' -- "$arg" >> ${JSON.stringify(capture)}
+done
+printf '],"PLOINKY_PUBLIC_ENTRYPOINT":' >> ${JSON.stringify(capture)}
+${JSON.stringify(realNode)} -e 'process.stdout.write(JSON.stringify(process.env.PLOINKY_PUBLIC_ENTRYPOINT || ""))' >> ${JSON.stringify(capture)}
+printf ',"PLOINKY_BOX":' >> ${JSON.stringify(capture)}
+${JSON.stringify(realNode)} -e 'process.stdout.write(JSON.stringify(process.env.PLOINKY_BOX || ""))' >> ${JSON.stringify(capture)}
+printf ',"PLOINKY_DIRECT":' >> ${JSON.stringify(capture)}
+${JSON.stringify(realNode)} -e 'process.stdout.write(JSON.stringify(process.env.PLOINKY_DIRECT || ""))' >> ${JSON.stringify(capture)}
+printf '}' >> ${JSON.stringify(capture)}
+exit 0
+`);
+    fs.chmodSync(node, 0o755);
+    return { dir, capture };
+}
+
+function addReadlinkWithoutDashF(dir) {
+    const readlink = path.join(dir, 'readlink');
+    fs.writeFileSync(readlink, `#!/usr/bin/env bash
+if [ "\${1-}" = "-f" ]; then
+  exit 1
+fi
+/usr/bin/readlink "$@"
+`);
+    fs.chmodSync(readlink, 0o755);
+}
+
+function readCapture(capture) {
+    return JSON.parse(fs.readFileSync(capture, 'utf8'));
+}
 
 // Combined stdout+stderr, like the `2>&1` captures in the old wrapper-tests.sh.
 function boxRun(engine, ...args) {
@@ -30,6 +74,23 @@ function boxRunIn(cwd, engine, ...args) {
         cwd,
         encoding: 'utf8',
         env: { ...process.env, PLOINKY_BOX_ENGINE: engine },
+    });
+    return { out: `${r.stdout ?? ''}${r.stderr ?? ''}`, status: r.status };
+}
+
+function publicRun(engine, ...args) {
+    const r = spawnSync(MJS, args, {
+        encoding: 'utf8',
+        env: { ...process.env, PLOINKY_BOX_ENGINE: engine, PLOINKY_PUBLIC_ENTRYPOINT: '1' },
+    });
+    return { out: `${r.stdout ?? ''}${r.stderr ?? ''}`, status: r.status };
+}
+
+function publicRunIn(cwd, engine, ...args) {
+    const r = spawnSync(MJS, args, {
+        cwd,
+        encoding: 'utf8',
+        env: { ...process.env, PLOINKY_BOX_ENGINE: engine, PLOINKY_PUBLIC_ENTRYPOINT: '1' },
     });
     return { out: `${r.stdout ?? ''}${r.stderr ?? ''}`, status: r.status };
 }
@@ -54,6 +115,189 @@ function checkAbsent(out, needle, description) {
 test('entrypoint bash syntax check (bash -n)', () => {
     const r = spawnSync('bash', ['-n', BOX], { encoding: 'utf8' });
     assert.equal(r.status, 0, r.stderr);
+});
+
+test('public bin/ploinky delegates to the box wrapper on the host', () => {
+    const fake = makeFakeNodeCapture();
+    try {
+        const env = {
+            ...process.env,
+            PATH: `${fake.dir}:${process.env.PATH || ''}`,
+            PLOINKY_BOX_ENGINE: 'podman',
+        };
+        delete env.PLOINKY_BOX;
+        delete env.PLOINKY_DIRECT;
+        const r = spawnSync(PLOINKY, ['status', '--dry-run'], { encoding: 'utf8', env });
+        assert.equal(r.status, 0, `${r.stdout}${r.stderr}`);
+        const captured = readCapture(fake.capture);
+        assert.ok(captured.argv[0].endsWith('/container/ploinky-box.mjs'), captured.argv);
+        assert.deepEqual(captured.argv.slice(1), ['status', '--dry-run']);
+        assert.equal(captured.PLOINKY_PUBLIC_ENTRYPOINT, '1');
+    } finally {
+        fs.rmSync(fake.dir, { recursive: true, force: true });
+    }
+});
+
+test('bin/ploinky runs direct CLI inside the box', () => {
+    const fake = makeFakeNodeCapture();
+    try {
+        const env = {
+            ...process.env,
+            PATH: `${fake.dir}:${process.env.PATH || ''}`,
+            PLOINKY_BOX: '1',
+        };
+        delete env.PLOINKY_DIRECT;
+        const r = spawnSync(PLOINKY, ['status'], { encoding: 'utf8', env });
+        assert.equal(r.status, 0, `${r.stdout}${r.stderr}`);
+        const captured = readCapture(fake.capture);
+        assert.ok(captured.argv[0].endsWith('/cli/index.js'), captured.argv);
+        assert.deepEqual(captured.argv.slice(1), ['status']);
+        assert.equal(captured.PLOINKY_BOX, '1');
+        assert.equal(captured.PLOINKY_PUBLIC_ENTRYPOINT, '');
+    } finally {
+        fs.rmSync(fake.dir, { recursive: true, force: true });
+    }
+});
+
+test('bin/ploinky supports explicit PLOINKY_DIRECT escape on the host', () => {
+    const fake = makeFakeNodeCapture();
+    try {
+        const env = {
+            ...process.env,
+            PATH: `${fake.dir}:${process.env.PATH || ''}`,
+            PLOINKY_DIRECT: '1',
+        };
+        delete env.PLOINKY_BOX;
+        const r = spawnSync(PLOINKY, ['list', 'agents'], { encoding: 'utf8', env });
+        assert.equal(r.status, 0, `${r.stdout}${r.stderr}`);
+        const captured = readCapture(fake.capture);
+        assert.ok(captured.argv[0].endsWith('/cli/index.js'), captured.argv);
+        assert.deepEqual(captured.argv.slice(1), ['list', 'agents']);
+        assert.equal(captured.PLOINKY_DIRECT, '1');
+    } finally {
+        fs.rmSync(fake.dir, { recursive: true, force: true });
+    }
+});
+
+test('bin/ploinky resolves its repo root when invoked through a symlink', () => {
+    const fake = makeFakeNodeCapture();
+    const linkDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-link-'));
+    const link = path.join(linkDir, 'ploinky');
+    try {
+        fs.symlinkSync(PLOINKY, link);
+        const env = {
+            ...process.env,
+            PATH: `${fake.dir}:${process.env.PATH || ''}`,
+            PLOINKY_BOX_ENGINE: 'podman',
+        };
+        delete env.PLOINKY_BOX;
+        delete env.PLOINKY_DIRECT;
+        const r = spawnSync(link, ['status', '--dry-run'], { encoding: 'utf8', env });
+        assert.equal(r.status, 0, `${r.stdout}${r.stderr}`);
+        const captured = readCapture(fake.capture);
+        assert.equal(captured.argv[0], MJS);
+        assert.deepEqual(captured.argv.slice(1), ['status', '--dry-run']);
+    } finally {
+        fs.rmSync(fake.dir, { recursive: true, force: true });
+        fs.rmSync(linkDir, { recursive: true, force: true });
+    }
+});
+
+test('bin/ploinky direct mode resolves through a symlink', () => {
+    const fake = makeFakeNodeCapture();
+    const linkDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-link-'));
+    const link = path.join(linkDir, 'ploinky');
+    try {
+        fs.symlinkSync(PLOINKY, link);
+        const env = {
+            ...process.env,
+            PATH: `${fake.dir}:${process.env.PATH || ''}`,
+            PLOINKY_DIRECT: '1',
+        };
+        delete env.PLOINKY_BOX;
+        const r = spawnSync(link, ['status'], { encoding: 'utf8', env });
+        assert.equal(r.status, 0, `${r.stdout}${r.stderr}`);
+        const captured = readCapture(fake.capture);
+        assert.equal(captured.argv[0], path.join(HERE, '..', 'cli', 'index.js'));
+        assert.deepEqual(captured.argv.slice(1), ['status']);
+    } finally {
+        fs.rmSync(fake.dir, { recursive: true, force: true });
+        fs.rmSync(linkDir, { recursive: true, force: true });
+    }
+});
+
+test('p-cli still delegates through bin/ploinky', () => {
+    const fake = makeFakeNodeCapture();
+    try {
+        addReadlinkWithoutDashF(fake.dir);
+        const env = {
+            ...process.env,
+            PATH: `${fake.dir}:${process.env.PATH || ''}`,
+            PLOINKY_BOX_ENGINE: 'podman',
+        };
+        delete env.PLOINKY_BOX;
+        delete env.PLOINKY_DIRECT;
+        const r = spawnSync(PCLI, ['status', '--dry-run'], { encoding: 'utf8', env });
+        assert.equal(r.status, 0, `${r.stdout}${r.stderr}`);
+        const captured = readCapture(fake.capture);
+        assert.ok(captured.argv[0].endsWith('/container/ploinky-box.mjs'), captured.argv);
+        assert.deepEqual(captured.argv.slice(1), ['status', '--dry-run']);
+        assert.equal(captured.PLOINKY_PUBLIC_ENTRYPOINT, '1');
+    } finally {
+        fs.rmSync(fake.dir, { recursive: true, force: true });
+    }
+});
+
+test('p-cli resolves its repo root when invoked through a symlink', () => {
+    const fake = makeFakeNodeCapture();
+    const linkDir = fs.mkdtempSync(path.join(os.tmpdir(), 'p-cli-link-'));
+    const link = path.join(linkDir, 'p-cli');
+    try {
+        addReadlinkWithoutDashF(fake.dir);
+        fs.symlinkSync(PCLI, link);
+        const env = {
+            ...process.env,
+            PATH: `${fake.dir}:${process.env.PATH || ''}`,
+            PLOINKY_BOX_ENGINE: 'podman',
+        };
+        delete env.PLOINKY_BOX;
+        delete env.PLOINKY_DIRECT;
+        const r = spawnSync(link, ['status'], { encoding: 'utf8', env });
+        assert.equal(r.status, 0, `${r.stdout}${r.stderr}`);
+        const captured = readCapture(fake.capture);
+        assert.equal(captured.argv[0], MJS);
+        assert.deepEqual(captured.argv.slice(1), ['status']);
+        assert.equal(captured.PLOINKY_PUBLIC_ENTRYPOINT, '1');
+    } finally {
+        fs.rmSync(fake.dir, { recursive: true, force: true });
+        fs.rmSync(linkDir, { recursive: true, force: true });
+    }
+});
+
+test('psh delegates to ploinky sh through a symlink', () => {
+    const fake = makeFakeNodeCapture();
+    const linkDir = fs.mkdtempSync(path.join(os.tmpdir(), 'psh-link-'));
+    const link = path.join(linkDir, 'psh');
+    try {
+        addReadlinkWithoutDashF(fake.dir);
+        fs.symlinkSync(PSH, link);
+        const env = {
+            ...process.env,
+            PATH: `${fake.dir}:${process.env.PATH || ''}`,
+            PLOINKY_BOX_ENGINE: 'podman',
+        };
+        delete env.PLOINKY_BOX;
+        delete env.PLOINKY_DIRECT;
+        const r = spawnSync(link, ['--dry-run'], { encoding: 'utf8', env });
+        assert.equal(r.status, 0, `${r.stdout}${r.stderr}`);
+        const captured = readCapture(fake.capture);
+        assert.equal(captured.argv[0], MJS);
+        assert.deepEqual(captured.argv.slice(1), ['sh', '--dry-run']);
+        assert.equal(captured.PLOINKY_PUBLIC_ENTRYPOINT, '1');
+    } finally {
+        fs.rmSync(fake.dir, { recursive: true, force: true });
+        fs.rmSync(linkDir, { recursive: true, force: true });
+    }
 });
 
 test('inferred up: cwd basename drives names; isolation contract holds', () => {
@@ -127,6 +371,7 @@ import {
     usageText,
     sanitizeBoxSuffix,
     resolveInstanceIdentity,
+    isPublicEntrypoint,
 } from './ploinky-box.mjs';
 
 test('ploinky-box.mjs syntax check (node --check)', () => {
@@ -204,6 +449,174 @@ test('usage text still documents every command and flag', () => {
         '--listen-lan', '--engine', '--dry-run']) {
         assert.ok(u.includes(word), `usage() lost mention of ${word}`);
     }
+});
+
+test('public usage describes ploinky and box namespace', () => {
+    const r = spawnSync(process.execPath, [MJS, '--help'], {
+        encoding: 'utf8',
+        env: { ...process.env, PLOINKY_PUBLIC_ENTRYPOINT: '1' },
+    });
+    assert.equal(r.status, 0, r.stderr);
+    assert.ok(r.stdout.includes('Usage: ploinky [flags] [command] [args]'), r.stdout);
+    assert.ok(r.stdout.includes('ploinky box status'), r.stdout);
+    assert.ok(r.stdout.includes('PLOINKY_DIRECT=1'), r.stdout);
+});
+
+test('isPublicEntrypoint reads the public mode environment marker', () => {
+    assert.equal(isPublicEntrypoint({ PLOINKY_PUBLIC_ENTRYPOINT: '1' }), true);
+    assert.equal(isPublicEntrypoint({ PLOINKY_PUBLIC_ENTRYPOINT: '' }), false);
+});
+
+test('public status routes to in-box ploinky status, not outer box status', () => {
+    const { parent, dir } = makeCwd('testExplorerFresh');
+    try {
+        const { out, status } = publicRunIn(dir, 'podman', '--dry-run', 'status');
+        assert.equal(status, 0, out);
+        checkIncludes(out, 'DRY-RUN: podman run -d', 'public status creates/starts the box first');
+        checkIncludes(out, 'exec -w /workspace ploinky-box-testExplorerFresh ploinky status', 'public status runs in-box status');
+        checkAbsent(out, "'ploinky-box-testExplorerFresh' does not exist.", 'public status is not outer status');
+    } finally {
+        fs.rmSync(parent, { recursive: true, force: true });
+    }
+});
+
+test('public destroy routes to in-box ploinky destroy, not outer volume removal', () => {
+    const { out, status } = publicRun('podman', '--name', 'qa', '--dry-run', 'destroy');
+    assert.equal(status, 0, out);
+    checkIncludes(out, 'exec -w /workspace ploinky-box-qa ploinky destroy', 'public destroy runs in-box destroy');
+    checkAbsent(out, 'volume rm ploinky-box-qa-workspace', 'public destroy does not remove outer volumes');
+});
+
+test('public destroy honors --name after the command without forwarding it in-box', () => {
+    const { out, status } = publicRun('podman', '--dry-run', 'destroy', '--name', 'qa');
+    assert.equal(status, 0, out);
+    checkIncludes(out, '--name ploinky-box-qa', 'post-command --name selects the outer box instance');
+    checkIncludes(out, 'exec -w /workspace ploinky-box-qa ploinky destroy', 'post-command --name still runs in-box destroy');
+    checkAbsent(out, 'ploinky destroy --name qa', 'post-command --name is not forwarded as a misleading in-box arg');
+    checkAbsent(out, 'volume rm ploinky-box-qa-workspace', 'public destroy does not remove outer volumes');
+});
+
+test('public box status targets the outer box status command', () => {
+    const { out, status } = publicRun('podman', '--name', 'qa', '--dry-run', 'box', 'status');
+    assert.equal(status, 1, out);
+    checkIncludes(out, "'ploinky-box-qa' does not exist.", 'box status uses outer status behavior');
+    checkAbsent(out, 'ploinky status', 'box status does not forward to in-box status');
+});
+
+test('public box destroy targets the outer volume destroy command', () => {
+    const { out, status } = publicRun('podman', '--name', 'qa', '--dry-run', 'box', 'destroy');
+    assert.equal(status, 0, out);
+    checkIncludes(out, "'ploinky-box-qa' and its volumes removed.", 'box destroy uses outer destroy behavior');
+    checkAbsent(out, 'ploinky destroy', 'box destroy does not run in-box destroy');
+});
+
+test('public no-arg command opens in-box p-cli', () => {
+    const { out, status } = publicRun('podman', '--name', 'qa', '--dry-run');
+    assert.equal(status, 0, out);
+    checkIncludes(out, 'DRY-RUN: podman run -d', 'no-arg public command ensures box');
+    checkIncludes(out, 'exec -it -w /workspace ploinky-box-qa p-cli', 'no-arg public command opens p-cli');
+});
+
+test('public start preserves branch flags while forcing in-box router to 8080', () => {
+    const { out, status } = publicRun(
+        'podman',
+        '--name', 'qa',
+        '--dry-run',
+        'start', 'explorer',
+        '--branch', 'feature-x',
+        '9191',
+        '--repo-branch', 'AssistOSExplorer=peristo-user',
+        '--branch-fallback', 'fail',
+    );
+    assert.equal(status, 0, out);
+    checkIncludes(out, '127.0.0.1:9191:8080', 'public start positional port is host port');
+    checkIncludes(
+        out,
+        'exec -w /workspace ploinky-box-qa ploinky start explorer 8080 --branch feature-x --repo-branch AssistOSExplorer=peristo-user --branch-fallback fail',
+        'public start forwards branch flags after in-box port',
+    );
+    checkAbsent(out, 'ploinky start explorer 9191', 'public start never uses host port inside');
+});
+
+test('public start accepts --port before the agent without forwarding it in-box', () => {
+    const { out, status } = publicRun('podman', '--name', 'qa', '--dry-run', 'start', '--port', '9191', 'explorer');
+    assert.equal(status, 0, out);
+    checkIncludes(out, '127.0.0.1:9191:8080', 'post-command --port before agent is the host port');
+    checkIncludes(out, 'exec -w /workspace ploinky-box-qa ploinky start explorer 8080', 'agent remains explorer');
+    checkAbsent(out, 'ploinky start 9191 8080 --port explorer', 'post-command --port does not reorder into in-box args');
+});
+
+test('public start accepts --port after the agent without forwarding it in-box', () => {
+    const { out, status } = publicRun('podman', '--name', 'qa', '--dry-run', 'start', 'explorer', '--port', '9192');
+    assert.equal(status, 0, out);
+    checkIncludes(out, '127.0.0.1:9192:8080', 'post-command --port after agent is the host port');
+    checkIncludes(out, 'exec -w /workspace ploinky-box-qa ploinky start explorer 8080', 'agent remains explorer');
+    checkAbsent(out, 'ploinky start explorer 8080 --port 9192', 'post-command --port is not forwarded in-box');
+});
+
+test('public start without an agent forwards in-box start instead of wrapper failing', () => {
+    const { out, status } = publicRun('podman', '--name', 'qa', '--dry-run', 'start');
+    assert.equal(status, 0, out);
+    checkIncludes(out, 'exec -w /workspace ploinky-box-qa ploinky start', 'start with no args is forwarded');
+    checkAbsent(out, 'usage:', 'public start without args is not rejected by the wrapper');
+});
+
+test('public parser preserves normal command flags after the command', () => {
+    const cfg = parseCli(['client', 'tool', 'process', '--dry-run'], {}, { publicEntrypoint: true });
+    assert.equal(cfg.command, 'client');
+    assert.deepEqual(cfg.args, ['tool', 'process', '--dry-run']);
+    assert.equal(cfg.dryRun, false);
+});
+
+test('public parser hoists box selector flags after the command', () => {
+    const cfg = parseCli(['destroy', '--name', 'qa'], {}, { publicEntrypoint: true });
+    assert.equal(cfg.command, 'destroy');
+    assert.equal(cfg.name, 'qa');
+    assert.deepEqual(cfg.args, []);
+});
+
+test('public cli forwards with interactive exec', () => {
+    const { out, status } = publicRun('podman', '--name', 'qa', '--dry-run', 'cli');
+    assert.equal(status, 0, out);
+    checkIncludes(out, 'exec -it -w /workspace ploinky-box-qa ploinky cli', 'public cli keeps a TTY');
+});
+
+test('public sh forwards with interactive exec', () => {
+    const { out, status } = publicRun('podman', '--name', 'qa', '--dry-run', 'sh');
+    assert.equal(status, 0, out);
+    checkIncludes(out, 'exec -it -w /workspace ploinky-box-qa ploinky sh', 'public sh keeps a TTY');
+});
+
+test('public box help shows wrapper help', () => {
+    const { out, status } = publicRun('podman', 'box', '--help');
+    assert.equal(status, 0, out);
+    checkIncludes(out, 'Usage: ploinky-box [flags] <command> [args]', 'box --help shows wrapper help');
+});
+
+test('ploinky-box unknown command keeps compatibility help guidance', () => {
+    const { out, status } = boxRun('podman', 'nosuch');
+    assert.equal(status, 1, out);
+    checkIncludes(out, "unknown command 'nosuch' (see: ploinky-box --help)", 'compat unknown command points at ploinky-box help');
+});
+
+test('smoke script documents optional public ploinky path', () => {
+    const smokeText = fs.readFileSync(path.join(HERE, 'smoke-box.mjs'), 'utf8');
+    assert.ok(smokeText.includes('SMOKE_PUBLIC_PLOINKY'), smokeText);
+    assert.ok(smokeText.includes('bin/ploinky'), smokeText);
+});
+
+test('docs describe boxed-by-default ploinky and direct escape', () => {
+    const rootReadme = fs.readFileSync(path.join(HERE, '..', 'README.md'), 'utf8');
+    const boxReadme = fs.readFileSync(path.join(HERE, 'README.md'), 'utf8');
+    assert.ok(rootReadme.includes('PLOINKY_DIRECT=1'), rootReadme);
+    assert.ok(rootReadme.includes('ploinky box status'), rootReadme);
+    assert.ok(boxReadme.includes('ploinky box destroy'), boxReadme);
+    assert.ok(boxReadme.includes('ploinky-box compatibility'), boxReadme);
+});
+
+test('package metadata advertises the Node 20 runtime floor', () => {
+    const packageJson = JSON.parse(fs.readFileSync(path.join(HERE, '..', 'package.json'), 'utf8'));
+    assert.equal(packageJson.engines.node, '>=20.0.0');
 });
 
 test('sanitizeBoxSuffix: engine-safe suffixes', () => {

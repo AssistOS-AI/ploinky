@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_PATH="${BASH_SOURCE[0]}"
+while [[ -L "$SCRIPT_PATH" ]]; do
+    SCRIPT_DIR="$(cd -P "$(dirname "$SCRIPT_PATH")" >/dev/null 2>&1 && pwd)"
+    SCRIPT_PATH="$(readlink "$SCRIPT_PATH")"
+    [[ "$SCRIPT_PATH" != /* ]] && SCRIPT_PATH="$SCRIPT_DIR/$SCRIPT_PATH"
+done
+SCRIPT_DIR="$(cd -P "$(dirname "$SCRIPT_PATH")" >/dev/null 2>&1 && pwd)"
+export PLOINKY_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+if [[ ! -d "$PLOINKY_ROOT/node_modules/achillesAgentLib" ]]; then
+    echo "Ploinky dependency missing: $PLOINKY_ROOT/node_modules/achillesAgentLib" >&2
+    echo "Run 'npm install' from $PLOINKY_ROOT before running ploinky." >&2
+    exit 1
+fi
+
+if [[ "${1:-}" == "-shell" || "${1:-}" == "sh" || "${1:-}" == "--shell" ]]; then
+    shift
+    exec "$SCRIPT_DIR/ploinky-shell" "$@"
+fi
+
+exec node "$PLOINKY_ROOT/cli/index.js" "$@"

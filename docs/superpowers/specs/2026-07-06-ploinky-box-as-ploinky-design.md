@@ -96,15 +96,19 @@ Those commands target different outer boxes because their current directory
 basenames differ.
 
 Users can still pass `--name X` to target another instance explicitly. In public
-`ploinky` mode, wrapper flags are parsed only before the first non-flag command
-token, or after the explicit `box` namespace for box lifecycle operations. Once
-normal Ploinky command parsing begins, flags belong to the in-box Ploinky
+`ploinky` mode, box selector flags may appear before the first non-flag command
+token, after the explicit `box` namespace for box lifecycle operations, or after
+the public command when the flag is unambiguous (`--name`, `--port`, `--image`,
+`--publish`, `--webmeet-ports`, `--mount`, `--listen-lan`, `--engine`). Once
+normal Ploinky command parsing begins, other flags belong to the in-box Ploinky
 command and must be forwarded unchanged. This preserves commands such as
-`ploinky client tool process --dry-run`.
+`ploinky client tool process --dry-run`; wrapper dry-run is `ploinky --dry-run
+<command>`.
 
 The public entrypoint accepts the same box flags that are needed before the
 in-box command is executed, such as `--name`, `--port`, `--image`, `--publish`,
-`--webmeet-ports`, `--mount`, `--listen-lan`, `--engine`, and `--dry-run`.
+`--webmeet-ports`, `--mount`, `--listen-lan`, `--engine`, and pre-command
+`--dry-run`.
 
 ## Runtime Architecture
 

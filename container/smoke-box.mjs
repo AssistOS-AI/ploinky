@@ -11,14 +11,20 @@ import { setTimeout as sleep } from 'node:timers/promises';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const BOX = path.join(HERE, 'ploinky-box');
+const PUBLIC_PLOINKY = path.resolve(HERE, '../bin/ploinky');
 const NAME = `smoke${process.pid}`;
 const PORT = process.env.SMOKE_PORT || '8090';
 const IMAGE = process.env.SMOKE_IMAGE || 'docker.io/assistos/ploinky-box:podman-node24';
 const AGENT = process.env.SMOKE_AGENT || 'webtty';
+const USE_PUBLIC_PLOINKY = process.env.SMOKE_PUBLIC_PLOINKY === '1';
 let failed = 0;
 
 function box(...args) {
     return spawnSync(BOX, args, { stdio: 'inherit' }).status === 0;
+}
+
+function publicPloinky(...args) {
+    return spawnSync(PUBLIC_PLOINKY, args, { stdio: 'inherit' }).status === 0;
 }
 
 function step(desc, ok) {
@@ -44,6 +50,7 @@ async function probeRouter() {
 }
 
 console.log(`== ploinky-box smoke: instance=${NAME} port=${PORT} image=${IMAGE} agent=${AGENT} ==`);
+console.log(`publicPloinky=${USE_PUBLIC_PLOINKY ? 'enabled' : 'disabled'}`);
 
 const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-box-smoke-'));
 const tmpIn = path.join(tmpDir, 'in.txt');
@@ -64,7 +71,16 @@ step('stop', box('--name', NAME, 'stop'));
 step('re-up (state kept)', box('--name', NAME, '--port', PORT, '--image', IMAGE, 'up'));
 step('resume agents', box('--name', NAME, 'run', 'start'));
 step('router responds again', await probeRouter());
-step('start command (idempotent on a running box)', box('--name', NAME, 'start', AGENT));
+if (USE_PUBLIC_PLOINKY) {
+    step(
+        'public ploinky start command (idempotent on a running box)',
+        publicPloinky('--name', NAME, '--port', PORT, 'start', AGENT),
+    );
+    step('public ploinky status command', publicPloinky('--name', NAME, 'status'));
+    step('public ploinky box status command', publicPloinky('--name', NAME, 'box', 'status'));
+} else {
+    step('start command (idempotent on a running box)', box('--name', NAME, 'start', AGENT));
+}
 
 if (process.env.SMOKE_WS_AGENT) {
     step('ws agent enable', box('--name', NAME, 'run', 'enable', 'agent', process.env.SMOKE_WS_AGENT));

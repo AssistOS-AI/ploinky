@@ -1,9 +1,13 @@
-# ploinky-box
+# Boxed Ploinky Runtime
 
 Run the entire Ploinky runtime isolated inside one rootless-podman container.
 The host needs podman (preferred) or docker, plus Node >= 20 to run the
 wrapper — no git, no ploinky checkout. Agents run as nested containers
 *inside* the box; nothing they do touches the host filesystem.
+
+`ploinky` is the preferred public entrypoint when using this checkout. It runs
+normal Ploinky commands through the boxed runtime by default. `ploinky-box`
+remains as a compatibility and diagnostic command for the wrapper itself.
 
 ## Quick start
 
@@ -63,7 +67,43 @@ needed by WebMeet rooms/media. Existing boxes keep their original port mappings;
 run `ploinky-box update` with the same flags, or recreate the box, when you add
 new published ports.
 
-## Commands
+## Public `ploinky` Command
+
+Bare `ploinky ...` commands keep their existing Ploinky meaning and execute
+inside the box:
+
+```bash
+ploinky start explorer
+ploinky status
+ploinky stop
+ploinky destroy
+ploinky logs
+ploinky install ...
+```
+
+Outer box lifecycle commands use the explicit `box` namespace:
+
+```bash
+ploinky box status
+ploinky box stop
+ploinky box update
+ploinky box destroy
+```
+
+`ploinky destroy` runs the normal in-box Ploinky destroy command. `ploinky box
+destroy` removes the outer container and the two named volumes for the selected
+instance.
+
+Box selector flags such as `--name` and `--port` can appear before or after a
+public command. Put `--dry-run` before the command for wrapper dry-run; after
+the command it is forwarded to the in-box Ploinky CLI.
+
+## `ploinky-box` Compatibility Commands
+
+These commands remain available for direct wrapper diagnostics and standalone
+downloads; public users should prefer `ploinky ...` and `ploinky box ...`.
+This is the ploinky-box compatibility reference for scripts that still call the
+wrapper directly.
 
 | Command | Effect |
 | --- | --- |

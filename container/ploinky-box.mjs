@@ -15,8 +15,61 @@ import { setTimeout as sleep } from 'node:timers/promises';
 
 const DEFAULT_IMAGE = 'docker.io/assistos/ploinky-box:podman-node24';
 const BOX_PREFIX = 'ploinky-box';
+const PUBLIC_ENTRYPOINT_ENV = 'PLOINKY_PUBLIC_ENTRYPOINT';
+const PUBLIC_PROGRAM = 'ploinky';
+const BOX_PROGRAM = 'ploinky-box';
+const BOX_COMMANDS = new Set(['up', 'start', 'cli', 'run', 'cp', 'status', 'logs', 'stop', 'update', 'destroy', 'help']);
+let activeProgramName = BOX_PROGRAM;
 
-export function usageText() {
+export function usageText(options = {}) {
+    const publicEntrypoint = Boolean(options.publicEntrypoint);
+    if (publicEntrypoint) {
+        return `ploinky - run Ploinky through the boxed runtime
+
+Usage: ploinky [flags] [command] [args]
+
+Normal commands keep their existing Ploinky syntax and execute inside the box:
+  ploinky start <agent> [port]
+  ploinky status
+  ploinky stop
+  ploinky destroy
+  ploinky logs
+  ploinky install ...
+  ploinky list agents
+  ploinky
+
+Outer box lifecycle is explicit:
+  ploinky box up
+  ploinky box status
+  ploinky box logs
+  ploinky box stop
+  ploinky box update
+  ploinky box destroy
+  ploinky box cp A B
+
+Flags:
+  --name X       Instance name (container ploinky-box-X). Default: inferred
+                 from the current directory basename.
+  --port N       Host port for the router (default 8080).
+                 Inside the box, always start the router on port 8080.
+  --publish SPEC Extra host-to-box port publish; repeatable, same form as -p.
+  --webmeet-ports
+                 Publish local LiveKit/TURN ports used by WebMeet rooms/media.
+  --image I      Image override (default docker.io/assistos/ploinky-box:podman-node24)
+  --mount DIR    Bind DIR read-write at /workspace/mounted (pierces isolation)
+  --listen-lan   Publish the router on 0.0.0.0 instead of 127.0.0.1
+  --engine E     podman|docker (default: auto-detect, podman first)
+  --dry-run      Print engine commands instead of executing
+  -h, --help     This help
+
+Box selector flags such as --name and --port may appear before or after a
+public command. Put --dry-run before the command for wrapper dry-run; after the
+command it is forwarded to Ploinky.
+
+Direct development escape:
+  PLOINKY_DIRECT=1 ploinky <args>
+`;
+    }
     return `ploinky-box - run Ploinky isolated in a rootless-podman container
 
 Usage: ploinky-box [flags] <command> [args]
@@ -55,11 +108,12 @@ Flags:
 }
 
 function die(msg) {
-    process.stderr.write(`ploinky-box: ${msg}\n`);
+    process.stderr.write(`${activeProgramName}: ${msg}\n`);
     process.exit(1);
 }
 
-export function parseCli(argv, env = process.env) {
+export function parseCli(argv, env = process.env, options = {}) {
+    const publicEntrypoint = Boolean(options.publicEntrypoint);
     const cfg = {
         engine: env.PLOINKY_BOX_ENGINE || '',
         name: '',
@@ -86,6 +140,25 @@ export function parseCli(argv, env = process.env) {
     };
     while (i < argv.length) {
         const tok = argv[i];
+        if (publicEntrypoint && cfg.command) {
+            switch (tok) {
+                case '--name': cfg.name = need('--name'); break;
+                case '--port':
+                    cfg.port = need('--port');
+                    cfg.portExplicit = true;
+                    break;
+                case '--publish': cfg.publish.push(need('--publish')); break;
+                case '--webmeet-ports': cfg.webmeetPorts = true; i += 1; break;
+                case '--image': cfg.image = need('--image'); break;
+                case '--mount': cfg.mountDir = need('--mount'); break;
+                case '--engine': cfg.engine = need('--engine'); break;
+                case '--listen-lan': cfg.listenLan = true; i += 1; break;
+                default:
+                    cfg.args.push(tok);
+                    i += 1;
+            }
+            continue;
+        }
         switch (tok) {
             case '--name': cfg.name = need('--name'); break;
             case '--port':
@@ -107,6 +180,10 @@ export function parseCli(argv, env = process.env) {
         }
     }
     return cfg;
+}
+
+export function isPublicEntrypoint(env = process.env) {
+    return String(env?.[PUBLIC_ENTRYPOINT_ENV] || '') === '1';
 }
 
 export function instanceName(cfg) {
@@ -393,7 +470,7 @@ async function waitHealthy(cfg) {
 function requireRunning(cfg) {
     if (cfg.dryRun) return;
     if (!boxRunning(cfg)) {
-        die(`'${instanceName(cfg)}' is not running. Start it with: ploinky-box --name ${cfg.name} up`);
+        die(`'${instanceName(cfg)}' is not running. Start it with: ${activeProgramName} --name ${cfg.name} ${activeProgramName === PUBLIC_PROGRAM ? 'box up' : 'up'}`);
     }
 }
 
@@ -455,31 +532,87 @@ async function probeRouter(port, attempts = 30) {
     return null;
 }
 
+function splitPublicStartArgs(args) {
+    const raw = args.map((entry) => String(entry));
+    if (raw.length === 0) {
+        return { hasAgent: false, hostPort: '', inBoxArgs: ['start'] };
+    }
+    let agent = '';
+    let hostPort = '';
+    const passthrough = [];
+    for (let i = 0; i < raw.length; i += 1) {
+        const arg = raw[i];
+        if (arg === '--branch' || arg === '--repo-branch' || arg === '--branch-fallback') {
+            passthrough.push(arg);
+            if (i + 1 < raw.length) passthrough.push(raw[++i]);
+            continue;
+        }
+        if (arg.startsWith('--branch=') || arg.startsWith('--repo-branch=') || arg.startsWith('--branch-fallback=')) {
+            passthrough.push(arg);
+            continue;
+        }
+        if (arg === '--reset-repos') {
+            passthrough.push(arg);
+            continue;
+        }
+        if (arg.startsWith('--')) {
+            passthrough.push(arg);
+            continue;
+        }
+        if (!agent) {
+            agent = arg;
+            continue;
+        }
+        if (!hostPort && /^\d+$/.test(arg)) {
+            hostPort = arg;
+            continue;
+        }
+        passthrough.push(arg);
+    }
+    if (!agent) {
+        return { hasAgent: false, hostPort: '', inBoxArgs: ['start', ...raw] };
+    }
+    return { hasAgent: true, hostPort, inBoxArgs: ['start', agent, '8080', ...passthrough] };
+}
+
 // start <agent> [port]: up + in-box `ploinky start <agent> 8080` + router
 // probe. [port]/--port choose the HOST side only; the in-box router port is
 // always 8080 (the one rule about ports).
-async function cmdStart(cfg) {
-    const [agent, portArg, ...extra] = cfg.args;
-    if (!agent || extra.length > 0) die('usage: ploinky-box start <agent> [port]');
-    if (portArg !== undefined) {
-        if (cfg.portExplicit && cfg.port !== portArg) {
-            die(`start: conflicting host ports (--port ${cfg.port} vs argument ${portArg}); give the port once`);
+async function cmdStart(cfg, options = {}) {
+    const publicEntrypoint = Boolean(options.publicEntrypoint);
+    let startPlan;
+    if (publicEntrypoint) {
+        startPlan = splitPublicStartArgs(cfg.args);
+    } else {
+        const [agent, portArg, ...extra] = cfg.args;
+        if (!agent || extra.length > 0) die(`usage: ${activeProgramName} start <agent> [port]`);
+        startPlan = { hasAgent: true, hostPort: portArg || '', inBoxArgs: ['start', agent, '8080'] };
+    }
+    if (!startPlan.hasAgent) {
+        if (!publicEntrypoint) die(`usage: ${activeProgramName} start <agent> [port]`);
+        await cmdUp(cfg);
+        runEngine(cfg, ['exec', '-w', '/workspace', instanceName(cfg), 'ploinky', ...startPlan.inBoxArgs]);
+        return;
+    }
+    if (startPlan.hostPort) {
+        if (cfg.portExplicit && cfg.port !== startPlan.hostPort) {
+            die(`start: conflicting host ports (--port ${cfg.port} vs argument ${startPlan.hostPort}); give the port once`);
         }
-        cfg.port = portArg;
+        cfg.port = startPlan.hostPort;
     }
     if (!/^\d+$/.test(cfg.port)) die(`start: host port must be a number, got '${cfg.port}'`);
     await cmdUp(cfg);
     const published = cfg.dryRun ? cfg.port : (hostPort(cfg) || cfg.port);
     if (!cfg.dryRun && published !== cfg.port) {
-        process.stderr.write(`ploinky-box: note: existing box publishes host port ${published}; the requested port applies only when the box is created. To change it, run update/recreate with the same flags you used for up plus --port ${cfg.port}.\n`);
+        process.stderr.write(`${activeProgramName}: note: existing box publishes host port ${published}; the requested port applies only when the box is created. To change it, run ${activeProgramName} ${activeProgramName === PUBLIC_PROGRAM ? 'box update/recreate' : 'update/recreate'} with the same flags you used for up plus --port ${cfg.port}.\n`);
     }
-    runEngine(cfg, ['exec', '-w', '/workspace', instanceName(cfg), 'ploinky', 'start', agent, '8080']);
+    runEngine(cfg, ['exec', '-w', '/workspace', instanceName(cfg), 'ploinky', ...startPlan.inBoxArgs]);
     if (cfg.dryRun) return;
     const probePath = await probeRouter(published);
     if (probePath) {
-        process.stdout.write(`ploinky-box: router responding on http://127.0.0.1:${published}/${probePath}\n`);
+        process.stdout.write(`${activeProgramName}: router responding on http://127.0.0.1:${published}/${probePath}\n`);
     } else {
-        process.stderr.write(`ploinky-box: router did not respond on http://127.0.0.1:${published} within 30s; check: ploinky-box --name ${cfg.name} status\n`);
+        process.stderr.write(`${activeProgramName}: router did not respond on http://127.0.0.1:${published} within 30s; check: ${activeProgramName} --name ${cfg.name} ${activeProgramName === PUBLIC_PROGRAM ? 'box status' : 'status'}\n`);
         process.exitCode = 1;
     }
 }
@@ -589,14 +722,15 @@ async function cmdDestroy(cfg) {
     process.stdout.write(`ploinky-box: '${instance}' and its volumes removed.\n`);
 }
 
-async function main() {
-    const major = Number(process.versions.node.split('.')[0]);
-    if (major < 20) die(`Node >= 20 is required (found ${process.versions.node})`);
-    const cfg = parseCli(process.argv.slice(2));
-    if (cfg.help) { process.stdout.write(usageText()); process.exit(0); }
-    if (!cfg.command) { process.stdout.write(usageText()); process.exit(1); }
-    const known = new Set(['up', 'start', 'cli', 'run', 'cp', 'status', 'logs', 'stop', 'update', 'destroy', 'help']);
-    if (!known.has(cfg.command)) die(`unknown command '${cfg.command}' (see: ploinky-box --help)`);
+function assertBoxCommand(cfg, { nested = false } = {}) {
+    if (!BOX_COMMANDS.has(cfg.command)) {
+        const helpTarget = activeProgramName === PUBLIC_PROGRAM && nested ? 'ploinky box --help' : `${activeProgramName} --help`;
+        die(`unknown command '${cfg.command}' (see: ${helpTarget})`);
+    }
+}
+
+async function runBoxCommand(cfg, options = {}) {
+    assertBoxCommand(cfg, options);
     if (!(cfg.command === 'status' && cfg.dryRun)) detectEngine(cfg);
     if (cfg.command !== 'help') resolveInstanceIdentity(cfg);
     switch (cfg.command) {
@@ -610,8 +744,85 @@ async function main() {
         case 'stop': cmdStop(cfg); break;
         case 'update': await cmdUpdate(cfg); break;
         case 'destroy': await cmdDestroy(cfg); break;
-        case 'help': process.stdout.write(usageText()); break;
+        case 'help': process.stdout.write(usageText({ publicEntrypoint: false })); break;
     }
+}
+
+function cmdForwardToPloinky(cfg, forwardedArgs, { interactive = false } = {}) {
+    preflight(cfg);
+    requireRunning(cfg);
+    const execArgs = ['exec'];
+    if (interactive) execArgs.push('-it');
+    execArgs.push('-w', '/workspace', instanceName(cfg), 'ploinky', ...forwardedArgs);
+    runEngine(cfg, execArgs);
+}
+
+function isInteractivePloinkyCommand(command) {
+    return command === 'cli' || command === 'shell' || command === 'sh' || command === '--shell' || command === '-shell';
+}
+
+function mergeBoxCfg(outer, inner) {
+    return {
+        ...outer,
+        ...inner,
+        engine: inner.engine || outer.engine,
+        name: inner.name || outer.name,
+        nameSource: inner.name ? inner.nameSource : outer.nameSource,
+        port: inner.portExplicit ? inner.port : outer.port,
+        portExplicit: inner.portExplicit || outer.portExplicit,
+        image: inner.image !== DEFAULT_IMAGE ? inner.image : outer.image,
+        mountDir: inner.mountDir || outer.mountDir,
+        mountDirResolved: inner.mountDirResolved || outer.mountDirResolved,
+        listenLan: inner.listenLan || outer.listenLan,
+        dryRun: inner.dryRun || outer.dryRun,
+        publish: [...outer.publish, ...inner.publish],
+        webmeetPorts: inner.webmeetPorts || outer.webmeetPorts,
+    };
+}
+
+async function runPublicCommand(cfg) {
+    if (cfg.command === 'box') {
+        const inner = parseCli(cfg.args, process.env, { publicEntrypoint: false });
+        const boxCfg = mergeBoxCfg(cfg, inner);
+        boxCfg.command = boxCfg.command || 'help';
+        if (boxCfg.help && !boxCfg.command) boxCfg.command = 'help';
+        await runBoxCommand(boxCfg, { nested: true });
+        return;
+    }
+    detectEngine(cfg);
+    resolveInstanceIdentity(cfg);
+    if (!cfg.command) {
+        await cmdUp(cfg);
+        cmdCli(cfg);
+        return;
+    }
+    if (cfg.command === 'start') {
+        await cmdStart(cfg, { publicEntrypoint: true });
+        return;
+    }
+    await cmdUp(cfg);
+    cmdForwardToPloinky(cfg, [cfg.command, ...cfg.args], { interactive: isInteractivePloinkyCommand(cfg.command) });
+}
+
+async function main() {
+    const major = Number(process.versions.node.split('.')[0]);
+    if (major < 20) die(`Node >= 20 is required (found ${process.versions.node})`);
+    const publicEntrypoint = isPublicEntrypoint();
+    activeProgramName = publicEntrypoint ? PUBLIC_PROGRAM : BOX_PROGRAM;
+    const cfg = parseCli(process.argv.slice(2), process.env, { publicEntrypoint });
+    if (cfg.help) {
+        process.stdout.write(usageText({ publicEntrypoint }));
+        process.exit(0);
+    }
+    if (publicEntrypoint) {
+        await runPublicCommand(cfg);
+        return;
+    }
+    if (!cfg.command) {
+        process.stdout.write(usageText({ publicEntrypoint: false }));
+        process.exit(1);
+    }
+    await runBoxCommand(cfg);
 }
 
 function isMainModule() {
