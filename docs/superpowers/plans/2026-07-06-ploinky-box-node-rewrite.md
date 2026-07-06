@@ -36,7 +36,7 @@
 - Consumes: the existing bash `container/ploinky-box` (spawned as a child process with `PLOINKY_BOX_ENGINE` + `--dry-run` — engine-free).
 - Produces: `container/wrapper-tests.mjs` — runnable standalone (`node container/wrapper-tests.mjs`, exit 0 on pass) and importable (registers `node:test` tests on import). Task 2 appends import-level tests to this file and relies on the process-level tests as its migration gate. The spawn target is the path `container/ploinky-box` (the entrypoint), NEVER `ploinky-box.mjs` directly — that is what keeps the tests implementation-agnostic.
 
-- [ ] **Step 1: Write `container/wrapper-tests.mjs`** (process-level port of every check in `wrapper-tests.sh`, same expected strings)
+- [x] **Step 1: Write `container/wrapper-tests.mjs`** (process-level port of every check in `wrapper-tests.sh`, same expected strings)
 
 ```js
 #!/usr/bin/env node
@@ -131,12 +131,12 @@ test('cp maps box: prefix to instance', () => {
 });
 ```
 
-- [ ] **Step 2: Run the ported tests against the CURRENT bash implementation**
+- [x] **Step 2: Run the ported tests against the CURRENT bash implementation**
 
 Run: `cd /Users/danielsava/work/file-parser/ploinky && node container/wrapper-tests.mjs`
 Expected: `pass 8`, `fail 0`, exit code 0. These are the same assertions `wrapper-tests.sh` makes today, so they must be green before any implementation change. If anything fails, the port is wrong — fix the test, not the script.
 
-- [ ] **Step 3: Write the unit-suite shim `tests/unit/ploinkyBoxWrapper.test.mjs`**
+- [x] **Step 3: Write the unit-suite shim `tests/unit/ploinkyBoxWrapper.test.mjs`**
 
 ```js
 // Auto-discovery shim: tests/test_all.sh runs every tests/unit/*.test.mjs with
@@ -145,16 +145,16 @@ Expected: `pass 8`, `fail 0`, exit code 0. These are the same assertions `wrappe
 import '../../container/wrapper-tests.mjs';
 ```
 
-- [ ] **Step 4: Run the suite entry**
+- [x] **Step 4: Run the suite entry**
 
 Run: `cd /Users/danielsava/work/file-parser/ploinky && node --test tests/unit/ploinkyBoxWrapper.test.mjs`
 Expected: `pass 8`, exit 0.
 
-- [ ] **Step 5: Delete the bash test script**
+- [x] **Step 5: Delete the bash test script**
 
 Run: `git rm container/wrapper-tests.sh`
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add container/wrapper-tests.mjs tests/unit/ploinkyBoxWrapper.test.mjs
@@ -174,7 +174,7 @@ git commit -m "Port ploinky-box wrapper tests to node:test"
 - Consumes: Task 1's `container/wrapper-tests.mjs` (the migration gate — spawns `container/ploinky-box`).
 - Produces: `container/ploinky-box.mjs` exporting `parseCli(argv, env)`, `buildRunArgs(cfg, {selinux})`, `instanceName(cfg)`, `volumeNames(cfg)`, `mapCpPath(side, instance)`, `usageText()` — signatures below are relied on by the appended import-level tests. Command dispatch runs only under the main-module guard, so importing is side-effect free.
 
-- [ ] **Step 1: Capture the golden dry-run matrix from the CURRENT bash implementation (before touching anything)**
+- [x] **Step 1: Capture the golden dry-run matrix from the CURRENT bash implementation (before touching anything)**
 
 ```bash
 cd /Users/danielsava/work/file-parser/ploinky
@@ -202,7 +202,7 @@ echo "golden captured at $GOLD"
 
 Keep `$GOLD` for Step 6. Deliberately excluded from the matrix: `stop`, `status`, `logs`, `update`, `cli` — even in dry-run those probe the real engine for container state (`box_exists`/`box_running` use direct engine queries, matching bash), so their output depends on machine state. They are covered by the smoke test instead.
 
-- [ ] **Step 2: Write `container/ploinky-box.mjs`**
+- [x] **Step 2: Write `container/ploinky-box.mjs`**
 
 The complete program. Every string and flag ordering below is copied from the bash version — do not "improve" anything.
 
@@ -705,7 +705,7 @@ if (import.meta.url === pathToFileURL(process.argv[1]).href) {
 Parity notes for the reviewer (each maps to a bash line in `git show HEAD:container/ploinky-box`):
 `silence: 'stdout'` = bash `>/dev/null`; `silence: 'all'` + `allowFail` = bash `>/dev/null 2>&1 || true`; `query()` = the direct `"$ENGINE" ...` call sites that bypass dry-run (bash lines 140-145, 192, 202-203, 270-272); `detectEngine` keeps `help`/unknown commands requiring an engine, exactly like bash line 330; the port-in-use probe replaces the `/dev/tcp` bash-ism (line 226); `cmdStatus` returning 1 = bash `return 1` (line 269).
 
-- [ ] **Step 3: Make it executable and syntax-check**
+- [x] **Step 3: Make it executable and syntax-check**
 
 ```bash
 chmod +x container/ploinky-box.mjs
@@ -713,7 +713,7 @@ node --check container/ploinky-box.mjs
 ```
 Expected: no output, exit 0.
 
-- [ ] **Step 4: Rewrite `container/ploinky-box` as the shim**
+- [x] **Step 4: Rewrite `container/ploinky-box` as the shim**
 
 Replace the entire file content with:
 
@@ -737,12 +737,12 @@ fi
 exec node "$SCRIPT_DIR/ploinky-box.mjs" "$@"
 ```
 
-- [ ] **Step 5: Run the migration gate (Task 1 tests, unchanged, now exercising shim → node)**
+- [x] **Step 5: Run the migration gate (Task 1 tests, unchanged, now exercising shim → node)**
 
 Run: `node container/wrapper-tests.mjs`
 Expected: `pass 8`, exit 0 — the same tests that passed against bash in Task 1.
 
-- [ ] **Step 6: Golden byte-diff old vs new**
+- [x] **Step 6: Golden byte-diff old vs new**
 
 ```bash
 matrix container/ploinky-box > "$GOLD/new.txt" 2>&1   # same matrix() + $GOLD from Step 1
@@ -750,7 +750,7 @@ diff "$GOLD/old.txt" "$GOLD/new.txt" && echo GOLDEN-OK
 ```
 Expected: `GOLDEN-OK` (zero differences). Two allowed exceptions ONLY, both pre-decided in spec §5: (1) a `--X needs a value` error is formatted `ploinky-box: --X needs a value` instead of bash's `line N: 2: --X needs a value` interpolation (not in the matrix anyway); (2) `--mount` of a symlinked dir may print the physical path where bash printed the logical one. Any OTHER diff is a parity bug — fix `ploinky-box.mjs`, never the golden file. If a diff appears in an `exit=` line, the exit-code parity is broken — same rule.
 
-- [ ] **Step 7: Append syntax + import-level tests to `container/wrapper-tests.mjs`**
+- [x] **Step 7: Append syntax + import-level tests to `container/wrapper-tests.mjs`**
 
 Append at the end of the file:
 
@@ -824,7 +824,7 @@ test('usage text still documents every command and flag', () => {
 });
 ```
 
-- [ ] **Step 8: Run the full test file + the suite entry**
+- [x] **Step 8: Run the full test file + the suite entry**
 
 ```bash
 node container/wrapper-tests.mjs
@@ -832,7 +832,7 @@ node --test tests/unit/ploinkyBoxWrapper.test.mjs
 ```
 Expected: `pass 17` (8 process-level + 9 appended), `fail 0`, exit 0 for both.
 
-- [ ] **Step 9: Sanity-check the shim under bash**
+- [x] **Step 9: Sanity-check the shim under bash**
 
 ```bash
 bash -n container/ploinky-box && wc -l < container/ploinky-box
@@ -840,7 +840,7 @@ grep -rl '^#!/usr/bin/env bash' container/
 ```
 Expected: `bash -n` silent, line count ≤ 20; grep prints `container/ploinky-box` AND `container/smoke-box.sh` (the smoke script is still bash until Task 3; the "exactly one bash file" acceptance check runs in Task 4).
 
-- [ ] **Step 10: Commit**
+- [x] **Step 10: Commit**
 
 ```bash
 git add container/ploinky-box container/ploinky-box.mjs container/wrapper-tests.mjs
@@ -859,7 +859,7 @@ git commit -m "Rewrite ploinky-box wrapper in Node behind a thin bash shim"
 - Consumes: the `container/ploinky-box` shim (spawned per step — exercises the full shim → node stack) and env overrides `SMOKE_IMAGE`, `SMOKE_PORT`, `SMOKE_AGENT`, `SMOKE_WS_AGENT`.
 - Produces: `node container/smoke-box.mjs` with the exact PASS/FAIL step lines, `== SMOKE PASSED/FAILED ==` trailer, and exit code of `smoke-box.sh`.
 
-- [ ] **Step 1: Write `container/smoke-box.mjs`**
+- [x] **Step 1: Write `container/smoke-box.mjs`**
 
 ```js
 #!/usr/bin/env node
@@ -945,7 +945,7 @@ console.log(failed === 0 ? '== SMOKE PASSED ==' : '== SMOKE FAILED ==');
 process.exit(failed);
 ```
 
-- [ ] **Step 2: Syntax-check and delete the bash version**
+- [x] **Step 2: Syntax-check and delete the bash version**
 
 ```bash
 node --check container/smoke-box.mjs
@@ -953,17 +953,17 @@ git rm container/smoke-box.sh
 ```
 Expected: `node --check` exits 0.
 
-- [ ] **Step 3: Run the smoke IF an engine is available; otherwise record it as pending**
+- [x] **Step 3: Run the smoke IF an engine is available; otherwise record it as pending**
 
 Run: `podman machine inspect --format '{{.State}}' 2>/dev/null | grep -q running && node container/smoke-box.mjs || echo "SMOKE SKIPPED: no running engine — must be run manually before release"`
 Expected when the engine is up: every step `PASS`, `== SMOKE PASSED ==`, exit 0 (first `up` pulls the image; allow several minutes). If skipped, the task is still committable — the smoke is the same engine-gated manual gate it was in bash — but the skip MUST be reported to the user in the task summary.
 
-- [ ] **Step 4: Re-run the engine-free gates**
+- [x] **Step 4: Re-run the engine-free gates**
 
 Run: `node container/wrapper-tests.mjs`
 Expected: `pass 17`, exit 0.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add container/smoke-box.mjs
@@ -981,7 +981,7 @@ git commit -m "Port ploinky-box smoke test to Node"
 - Consumes: everything above.
 - Produces: user-facing docs that state the new Node ≥ 20 host requirement and two-file install.
 
-- [ ] **Step 1: Update the README quick start and host requirements**
+- [x] **Step 1: Update the README quick start and host requirements**
 
 In `container/README.md`, replace the intro paragraph (lines 3-6) with:
 
@@ -1008,7 +1008,7 @@ Append to the Limitations section:
   and the agents inside it still need nothing but the container engine.
 ```
 
-- [ ] **Step 2: Final acceptance sweep (spec §8)**
+- [x] **Step 2: Final acceptance sweep (spec §8)**
 
 ```bash
 node container/wrapper-tests.mjs                       # §8.1 — expect pass 17, exit 0
@@ -1020,7 +1020,7 @@ ls container/                                          # README.md ploinky-box p
 ```
 Expected: all as annotated. (§8.3 golden diff was proven in Task 2 Step 6; §8.6 smoke in Task 3 Step 3.)
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add container/README.md
