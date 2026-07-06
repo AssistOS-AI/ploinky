@@ -198,7 +198,7 @@ test('mapCpPath: leading box: prefix only', () => {
 
 test('usage text still documents every command and flag', () => {
     const u = usageText();
-    for (const word of ['up', 'cli', 'run', 'cp', 'status', 'logs', 'stop', 'update', 'destroy',
+    for (const word of ['up', 'start', 'cli', 'run', 'cp', 'status', 'logs', 'stop', 'update', 'destroy',
         '--name', '--port', '--publish', '--webmeet-ports', '--image', '--mount',
         '--listen-lan', '--engine', '--dry-run']) {
         assert.ok(u.includes(word), `usage() lost mention of ${word}`);
@@ -280,6 +280,71 @@ test('destroy targets the inferred instance and says so', () => {
         const { out } = boxRunIn(dir, 'podman', '--dry-run', 'destroy');
         checkIncludes(out, "targeting 'ploinky-box-testExplorerFresh' (name inferred from the current directory)", 'destroy announces the inferred target');
         checkIncludes(out, "'ploinky-box-testExplorerFresh' and its volumes removed.", 'destroy resolves the inferred name');
+    } finally {
+        fs.rmSync(parent, { recursive: true, force: true });
+    }
+});
+
+// --- start command: up + in-box `ploinky start <agent> 8080` ---
+
+test('start: up then in-box ploinky start on 8080', () => {
+    const { out } = boxRun('podman', '--name', 'qa', '--dry-run', 'start', 'explorer');
+    checkIncludes(out, 'DRY-RUN: podman run -d', 'start creates the box first');
+    checkIncludes(out, '127.0.0.1:8080:8080', 'default host port is 8080');
+    checkIncludes(out, 'exec -w /workspace ploinky-box-qa ploinky start explorer 8080', 'start runs ploinky start on 8080 inside');
+});
+
+test('start: --port publishes N:8080, router stays on 8080', () => {
+    const { out } = boxRun('podman', '--name', 'qa', '--port', '8081', '--dry-run', 'start', 'explorer');
+    checkIncludes(out, '127.0.0.1:8081:8080', 'host 8081 maps to box 8080');
+    checkIncludes(out, 'ploinky start explorer 8080', 'in-box router still on 8080');
+    checkAbsent(out, '8081:8081', 'the box side never follows the host port');
+    checkAbsent(out, 'ploinky start explorer 8081', 'the in-box port never follows the host port');
+});
+
+test('start: positional port sets the host port', () => {
+    const { out } = boxRun('podman', '--name', 'qa', '--dry-run', 'start', 'explorer', '9191');
+    checkIncludes(out, '127.0.0.1:9191:8080', 'positional port is the host port');
+    checkIncludes(out, 'ploinky start explorer 8080', 'in-box router still on 8080');
+});
+
+test('start: matching --port and positional port are accepted', () => {
+    const { out, status } = boxRun('podman', '--name', 'qa', '--port', '9191', '--dry-run', 'start', 'explorer', '9191');
+    assert.equal(status, 0, out);
+    checkIncludes(out, '127.0.0.1:9191:8080', 'agreeing ports are fine');
+});
+
+test('start: conflicting --port and positional port die', () => {
+    const { out, status } = boxRun('podman', '--name', 'qa', '--port', '8081', '--dry-run', 'start', 'explorer', '9191');
+    assert.equal(status, 1, out);
+    checkIncludes(out, 'conflicting host ports', 'double-specified port is rejected');
+});
+
+test('start: requires an agent', () => {
+    const { out, status } = boxRun('podman', '--name', 'qa', '--dry-run', 'start');
+    assert.equal(status, 1, out);
+    checkIncludes(out, 'usage: ploinky-box start <agent> [port]', 'missing agent shows usage');
+});
+
+test('start: non-numeric port dies', () => {
+    const { out, status } = boxRun('podman', '--name', 'qa', '--dry-run', 'start', 'explorer', '80a8');
+    assert.equal(status, 1, out);
+    checkIncludes(out, 'host port must be a number', 'junk port is rejected');
+});
+
+test('start: non-numeric --port dies', () => {
+    const { out, status } = boxRun('podman', '--name', 'qa', '--port', 'nope', '--dry-run', 'start', 'explorer');
+    assert.equal(status, 1, out);
+    checkIncludes(out, 'host port must be a number', 'junk --port is rejected');
+});
+
+test('start: infers the instance from the cwd', () => {
+    const { parent, dir } = makeCwd('testExplorer2');
+    try {
+        const { out } = boxRunIn(dir, 'podman', '--port', '8081', '--dry-run', 'start', 'explorer');
+        checkIncludes(out, '--name ploinky-box-testExplorer2', 'instance inferred from cwd');
+        checkIncludes(out, '127.0.0.1:8081:8080', 'host 8081 maps to box 8080');
+        checkIncludes(out, 'exec -w /workspace ploinky-box-testExplorer2 ploinky start explorer 8080', 'in-box start against the inferred instance');
     } finally {
         fs.rmSync(parent, { recursive: true, force: true });
     }

@@ -64,6 +64,7 @@ step('stop', box('--name', NAME, 'stop'));
 step('re-up (state kept)', box('--name', NAME, '--port', PORT, '--image', IMAGE, 'up'));
 step('resume agents', box('--name', NAME, 'run', 'start'));
 step('router responds again', await probeRouter());
+step('start command (idempotent on a running box)', box('--name', NAME, 'start', AGENT));
 
 if (process.env.SMOKE_WS_AGENT) {
     step('ws agent enable', box('--name', NAME, 'run', 'enable', 'agent', process.env.SMOKE_WS_AGENT));

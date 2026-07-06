@@ -23,6 +23,9 @@ Usage: ploinky-box [flags] <command> [args]
 
 Commands:
   up         Create/start the box (pulls the image on first use)
+  start <agent> [port]
+             Create/start the box, then run 'ploinky start <agent> 8080'
+             inside and wait for the router; [port] = host port (default 8080)
   cli        Interactive Ploinky console (p-cli) inside the box
   run <...>  One-shot ploinky command, e.g.: ploinky-box run start webtty 8080
   cp A B     Copy in/out; prefix the container side with box:
@@ -442,6 +445,45 @@ async function cmdUp(cfg) {
     await waitHealthy(cfg);
 }
 
+async function probeRouter(port, attempts = 30) {
+    for (let i = 0; i < attempts; i += 1) {
+        for (const p of ['status', 'health']) {
+            if (await urlOk(`http://127.0.0.1:${port}/${p}`)) return p;
+        }
+        await sleep(1000);
+    }
+    return null;
+}
+
+// start <agent> [port]: up + in-box `ploinky start <agent> 8080` + router
+// probe. [port]/--port choose the HOST side only; the in-box router port is
+// always 8080 (the one rule about ports).
+async function cmdStart(cfg) {
+    const [agent, portArg, ...extra] = cfg.args;
+    if (!agent || extra.length > 0) die('usage: ploinky-box start <agent> [port]');
+    if (portArg !== undefined) {
+        if (cfg.portExplicit && cfg.port !== portArg) {
+            die(`start: conflicting host ports (--port ${cfg.port} vs argument ${portArg}); give the port once`);
+        }
+        cfg.port = portArg;
+    }
+    if (!/^\d+$/.test(cfg.port)) die(`start: host port must be a number, got '${cfg.port}'`);
+    await cmdUp(cfg);
+    const published = cfg.dryRun ? cfg.port : (hostPort(cfg) || cfg.port);
+    if (!cfg.dryRun && published !== cfg.port) {
+        process.stderr.write(`ploinky-box: note: existing box publishes host port ${published}; the requested port applies only when the box is created. To change it, run update/recreate with the same flags you used for up plus --port ${cfg.port}.\n`);
+    }
+    runEngine(cfg, ['exec', '-w', '/workspace', instanceName(cfg), 'ploinky', 'start', agent, '8080']);
+    if (cfg.dryRun) return;
+    const probePath = await probeRouter(published);
+    if (probePath) {
+        process.stdout.write(`ploinky-box: router responding on http://127.0.0.1:${published}/${probePath}\n`);
+    } else {
+        process.stderr.write(`ploinky-box: router did not respond on http://127.0.0.1:${published} within 30s; check: ploinky-box --name ${cfg.name} status\n`);
+        process.exitCode = 1;
+    }
+}
+
 function cmdCli(cfg) {
     preflight(cfg);
     requireRunning(cfg);
@@ -553,12 +595,13 @@ async function main() {
     const cfg = parseCli(process.argv.slice(2));
     if (cfg.help) { process.stdout.write(usageText()); process.exit(0); }
     if (!cfg.command) { process.stdout.write(usageText()); process.exit(1); }
-    const known = new Set(['up', 'cli', 'run', 'cp', 'status', 'logs', 'stop', 'update', 'destroy', 'help']);
+    const known = new Set(['up', 'start', 'cli', 'run', 'cp', 'status', 'logs', 'stop', 'update', 'destroy', 'help']);
     if (!known.has(cfg.command)) die(`unknown command '${cfg.command}' (see: ploinky-box --help)`);
     detectEngine(cfg);
     if (cfg.command !== 'help') resolveInstanceIdentity(cfg);
     switch (cfg.command) {
         case 'up': await cmdUp(cfg); break;
+        case 'start': await cmdStart(cfg); break;
         case 'cli': cmdCli(cfg); break;
         case 'run': cmdRun(cfg); break;
         case 'cp': cmdCp(cfg); break;
