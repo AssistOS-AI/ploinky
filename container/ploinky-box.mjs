@@ -527,6 +527,16 @@ async function main() {
     }
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+function isMainModule() {
+    if (!process.argv[1]) return false;
+    if (import.meta.url === pathToFileURL(process.argv[1]).href) return true;
+    try {
+        return import.meta.url === pathToFileURL(fs.realpathSync(process.argv[1])).href;
+    } catch {
+        return false;
+    }
+}
+
+if (isMainModule()) {
     await main();
 }

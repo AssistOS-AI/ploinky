@@ -552,8 +552,14 @@ function askLine(promptText) {
     return new Promise((resolve) => {
         process.stdout.write(promptText);
         const rl = readline.createInterface({ input: process.stdin, terminal: false });
-        rl.once('line', (line) => { rl.close(); resolve(line); });
-        rl.once('close', () => resolve(null));
+        let settled = false;
+        const finish = (value) => {
+            if (settled) return;
+            settled = true;
+            resolve(value);
+        };
+        rl.once('line', (line) => { finish(line); rl.close(); });
+        rl.once('close', () => finish(null));
     });
 }
 
@@ -830,7 +836,8 @@ test('usage text still documents every command and flag', () => {
 node container/wrapper-tests.mjs
 node --test tests/unit/ploinkyBoxWrapper.test.mjs
 ```
-Expected: `pass 17` (8 process-level + 9 appended), `fail 0`, exit 0 for both.
+Expected after the post-review symlink main-guard regression test: `pass 18`
+(8 process-level + 10 appended), `fail 0`, exit 0 for both.
 
 - [x] **Step 9: Sanity-check the shim under bash**
 
@@ -961,7 +968,7 @@ Expected when the engine is up: every step `PASS`, `== SMOKE PASSED ==`, exit 0 
 - [x] **Step 4: Re-run the engine-free gates**
 
 Run: `node container/wrapper-tests.mjs`
-Expected: `pass 17`, exit 0.
+Expected after the post-review symlink main-guard regression test: `pass 18`, exit 0.
 
 - [x] **Step 5: Commit**
 
@@ -1011,8 +1018,8 @@ Append to the Limitations section:
 - [x] **Step 2: Final acceptance sweep (spec §8)**
 
 ```bash
-node container/wrapper-tests.mjs                       # §8.1 — expect pass 17, exit 0
-node --test tests/unit/ploinkyBoxWrapper.test.mjs      # §8.2 — expect pass 17, exit 0
+node container/wrapper-tests.mjs                       # §8.1 — expect pass 18, exit 0
+node --test tests/unit/ploinkyBoxWrapper.test.mjs      # §8.2 — expect pass 18, exit 0
 grep -rl '^#!/usr/bin/env bash' container/             # §8.4 — exactly: container/ploinky-box
 wc -l < container/ploinky-box                          # §8.4 — <= 20
 grep -n "Node >= 20" container/README.md               # §8.5 — at least one hit

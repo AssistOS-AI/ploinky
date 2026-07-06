@@ -55,7 +55,7 @@ quick start). Compensating win: `status` and the smoke probe use Node's global
 | Dry-run output | Byte-identical `DRY-RUN: <engine> <args space-joined>` | Existing tests grep it with `-F`; it is the parity seam |
 | Test home | Source of truth `container/wrapper-tests.mjs` (works standalone: `node container/wrapper-tests.mjs`); thin `tests/unit/ploinkyBoxWrapper.test.mjs` doing `import '../../container/wrapper-tests.mjs'` | Keeps container/ self-contained *and* wires the tests into the repo suite — fixing the current "wired into nothing" gap |
 | Testability upgrade | `ploinky-box.mjs` exports its pure functions (`parseCli`, `buildRunArgs`, `mapCpPath`, …) behind a main-module guard | The bash version could only be tested by spawning; imports enable direct unit tests |
-| Behavior changes | **None**, except: error message when node is missing (new, shim) and node-too-old (new, .mjs) | Rewrite discipline; improvements are follow-ups |
+| Behavior changes | **None** for supported command behavior, except: node-missing (new, shim), node-too-old (new, .mjs), cleaner missing-value flag diagnostics, and the documented `--mount` symlink path micro-divergence in §5 | Rewrite discipline; accepted divergences are documented so parity reviews do not treat them as accidents |
 
 ## 3. Approaches considered
 
@@ -90,14 +90,15 @@ builtins: `node:child_process`, `node:net`, `node:fs`, `node:path`,
 | Model | `instanceName(cfg)`, `volumeNames(cfg)`, `buildRunArgs(cfg, {selinux})` (pure, returns the argv array), `mapCpPath(side, instance)` | lines 88-90, `build_run_args`, `cmd_cp` prefix logic |
 | Commands | `cmdUp/cmdCli/cmdRun/cmdCp/cmdStatus/cmdLogs/cmdStop/cmdUpdate/cmdDestroy` + helpers `boxExists`, `boxRunning`, `hostPort`, `waitHealthy`, `gracefulPloinkyStop`, `portInUse`, `confirm` | `cmd_*` + helpers |
 
-Main-module guard: `if (import.meta.url === pathToFileURL(process.argv[1]).href) await main();`
-so importing for tests has zero side effects.
+Main-module guard compares `import.meta.url` to `process.argv[1]` and its
+`fs.realpathSync()` target, so imports have zero side effects while direct
+execution through a symlink still runs the CLI.
 
 ### Parity contract (the load-bearing details)
 
 | Bash behavior | Node port |
 | --- | --- |
-| Greedy flag scan: flags recognized anywhere in argv, first non-flag = command, rest = args (so wrapper flags after `run` are still eaten — existing quirk, preserved) | same loop, same order, same `--X needs a value` errors |
+| Greedy flag scan: flags recognized anywhere in argv, first non-flag = command, rest = args (so wrapper flags after `run` are still eaten — existing quirk, preserved) | same loop, same order, same missing/empty value semantics; accepted diagnostic cleanup: Node prints `ploinky-box: --X needs a value` instead of bash's `${2:?}` shell diagnostic |
 | `die()` → `ploinky-box: <msg>` on stderr, exit 1 | identical |
 | `set -e` propagation: engine/child failures exit with the child's status (`run`, `cli`, `cp`, `pull`, …); signal death → 128+n | check `status`/`signal` from `spawnSync`/awaited spawn; `process.exit(status)`; 128+signum on signal |
 | Dry-run short-circuits: `preflight`, `require_running`, `box_running`/`box_exists` in `cmd_up`, SELinux query, `ensure_image`, `wait_healthy`, destroy confirmation, port-in-use probe | replicated per call site — this is what makes the dry-run matrix deterministic on engine-less machines |

@@ -6,6 +6,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
+import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -95,6 +97,19 @@ import { parseCli, buildRunArgs, instanceName, volumeNames, mapCpPath, usageText
 test('ploinky-box.mjs syntax check (node --check)', () => {
     const r = spawnSync(process.execPath, ['--check', path.join(HERE, 'ploinky-box.mjs')], { encoding: 'utf8' });
     assert.equal(r.status, 0, r.stderr);
+});
+
+test('ploinky-box.mjs main guard works through a symlink', () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-box-test-'));
+    const link = path.join(tmp, 'box-link.mjs');
+    try {
+        fs.symlinkSync(path.join(HERE, 'ploinky-box.mjs'), link);
+        const r = spawnSync(process.execPath, [link, '-h'], { encoding: 'utf8' });
+        assert.equal(r.status, 0, r.stderr);
+        assert.ok(r.stdout.includes('Usage: ploinky-box [flags] <command> [args]'), r.stdout);
+    } finally {
+        fs.rmSync(tmp, { recursive: true, force: true });
+    }
 });
 
 test('parseCli: flags anywhere, first non-flag is the command', () => {
