@@ -40,7 +40,6 @@ build/Release
 
 # Dependency directories
 node_modules/*
-!node_modules/achillesAgentLib/
 jspm_packages/
 workingFolder/*
 
@@ -161,3 +160,5 @@ CLAUDE.md
 .agents/skills/oskill-build/
 .agents/skills/review-specs/
 # <<< ploinky default-skills <<<
+
+.DS_Store
