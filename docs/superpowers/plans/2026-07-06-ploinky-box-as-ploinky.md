@@ -29,7 +29,7 @@
 - Create: `bin/ploinky-direct`
 - Modify: `container/wrapper-tests.mjs`
 
-- [ ] **Step 1: Write failing shell-entrypoint tests**
+- [x] **Step 1: Write failing shell-entrypoint tests**
 
 Add these helpers near the top of `container/wrapper-tests.mjs`, after the existing `const MJS = ...` declarations:
 
@@ -161,7 +161,7 @@ test('psh still delegates to ploinky sh', () => {
 });
 ```
 
-- [ ] **Step 2: Run the focused tests and confirm failure**
+- [x] **Step 2: Run the focused tests and confirm failure**
 
 Run:
 
@@ -171,7 +171,7 @@ node container/wrapper-tests.mjs
 
 Expected: FAIL. The new tests should fail because `bin/ploinky` still runs the direct CLI on the host and `bin/ploinky-direct` does not exist yet.
 
-- [ ] **Step 3: Create `bin/ploinky-direct` with the old direct behavior**
+- [x] **Step 3: Create `bin/ploinky-direct` with the old direct behavior**
 
 Create `bin/ploinky-direct`:
 
@@ -206,7 +206,7 @@ Then make it executable:
 chmod +x bin/ploinky-direct
 ```
 
-- [ ] **Step 4: Replace `bin/ploinky` with the boxed-by-default dispatcher**
+- [x] **Step 4: Replace `bin/ploinky` with the boxed-by-default dispatcher**
 
 Replace `bin/ploinky` with:
 
@@ -235,7 +235,7 @@ export PLOINKY_PUBLIC_ENTRYPOINT=1
 exec node "$ROOT_DIR/container/ploinky-box.mjs" "$@"
 ```
 
-- [ ] **Step 5: Run syntax and focused tests**
+- [x] **Step 5: Run syntax and focused tests**
 
 Run:
 
@@ -247,7 +247,7 @@ node container/wrapper-tests.mjs
 
 Expected: the shell syntax checks pass. Some public-mode wrapper tests may still fail until Task 2, but the entrypoint guard tests from this task should pass.
 
-- [ ] **Step 6: Commit Task 1**
+- [x] **Step 6: Commit Task 1**
 
 Run:
 
@@ -264,7 +264,7 @@ git commit -m "Make ploinky dispatch through the boxed wrapper"
 - Modify: `container/ploinky-box.mjs`
 - Modify: `container/wrapper-tests.mjs`
 
-- [ ] **Step 1: Add failing public-mode wrapper tests**
+- [x] **Step 1: Add failing public-mode wrapper tests**
 
 Add these helpers near `boxRunIn` in `container/wrapper-tests.mjs`:
 
@@ -403,7 +403,7 @@ test('ploinky-box compatibility status remains outer status', () => {
 });
 ```
 
-- [ ] **Step 2: Run focused tests and confirm failure**
+- [x] **Step 2: Run focused tests and confirm failure**
 
 Run:
 
@@ -413,7 +413,7 @@ node container/wrapper-tests.mjs
 
 Expected: FAIL. Public-mode tests should fail because `PLOINKY_PUBLIC_ENTRYPOINT=1` is not handled yet and `cmdStart` rejects extra branch arguments.
 
-- [ ] **Step 3: Add mode-aware help and program naming**
+- [x] **Step 3: Add mode-aware help and program naming**
 
 In `container/ploinky-box.mjs`, add these constants after `BOX_PREFIX`:
 
@@ -425,8 +425,12 @@ const BOX_COMMANDS = new Set(['up', 'start', 'cli', 'run', 'cp', 'status', 'logs
 let activeProgramName = BOX_PROGRAM;
 ```
 
-Change the `parseCli` signature and flag loop so public mode stops parsing
-wrapper flags after the first command token:
+Change the `parseCli` signature and flag loop so public mode preserves normal
+command flags after the first command token, while still hoisting unambiguous
+box selector flags (`--name`, `--port`, `--publish`, `--webmeet-ports`,
+`--image`, `--mount`, `--engine`, `--listen-lan`) when they appear after the
+command. Keep after-command `--dry-run` as an in-box command argument; wrapper
+dry-run is pre-command `--dry-run`.
 
 ```js
 export function parseCli(argv, env = process.env, options = {}) {
@@ -589,7 +593,7 @@ export function isPublicEntrypoint(env = process.env) {
 }
 ```
 
-- [ ] **Step 4: Make public start preserve existing start syntax**
+- [x] **Step 4: Make public start preserve existing start syntax**
 
 Add these helpers before `cmdStart`:
 
@@ -670,7 +674,7 @@ async function cmdStart(cfg, options = {}) {
 
 Keep the existing router probe block after this line unchanged except for any `ploinky-box:` wording that should use `activeProgramName`.
 
-- [ ] **Step 5: Add public-mode command execution**
+- [x] **Step 5: Add public-mode command execution**
 
 Add these helpers before `main()`:
 
@@ -783,7 +787,7 @@ async function main() {
 }
 ```
 
-- [ ] **Step 6: Run focused tests**
+- [x] **Step 6: Run focused tests**
 
 Run:
 
@@ -793,7 +797,7 @@ node container/wrapper-tests.mjs
 
 Expected: PASS for public routing, compatibility routing, and shell-entrypoint tests.
 
-- [ ] **Step 7: Commit Task 2**
+- [x] **Step 7: Commit Task 2**
 
 Run:
 
@@ -810,7 +814,7 @@ git commit -m "Route ploinky commands through the box"
 - Modify: `container/smoke-box.mjs`
 - Modify: `container/wrapper-tests.mjs`
 
-- [ ] **Step 1: Add failing smoke public-path support test**
+- [x] **Step 1: Add failing smoke public-path support test**
 
 Add this test to `container/wrapper-tests.mjs`:
 
@@ -822,7 +826,7 @@ test('smoke script documents optional public ploinky path', () => {
 });
 ```
 
-- [ ] **Step 2: Run focused tests and confirm failure**
+- [x] **Step 2: Run focused tests and confirm failure**
 
 Run:
 
@@ -832,7 +836,7 @@ node container/wrapper-tests.mjs
 
 Expected: FAIL because `container/smoke-box.mjs` does not mention `SMOKE_PUBLIC_PLOINKY` yet.
 
-- [ ] **Step 3: Modify `container/smoke-box.mjs` to support public path**
+- [x] **Step 3: Modify `container/smoke-box.mjs` to support public path**
 
 Change the constants at the top:
 
@@ -877,7 +881,7 @@ if (USE_PUBLIC_PLOINKY) {
 }
 ```
 
-- [ ] **Step 4: Run smoke script syntax and focused tests**
+- [x] **Step 4: Run smoke script syntax and focused tests**
 
 Run:
 
@@ -888,7 +892,7 @@ node container/wrapper-tests.mjs
 
 Expected: both pass.
 
-- [ ] **Step 5: Commit Task 3**
+- [x] **Step 5: Commit Task 3**
 
 Run:
 
@@ -905,7 +909,7 @@ git commit -m "Exercise public ploinky path in box smoke"
 - Modify: `container/README.md`
 - Modify: `README.md`
 
-- [ ] **Step 1: Add failing documentation assertions**
+- [x] **Step 1: Add failing documentation assertions**
 
 Add this test to `container/wrapper-tests.mjs`:
 
@@ -920,7 +924,7 @@ test('docs describe boxed-by-default ploinky and direct escape', () => {
 });
 ```
 
-- [ ] **Step 2: Run focused tests and confirm failure**
+- [x] **Step 2: Run focused tests and confirm failure**
 
 Run:
 
@@ -930,7 +934,7 @@ node container/wrapper-tests.mjs
 
 Expected: FAIL because the docs do not yet describe boxed-by-default `ploinky`.
 
-- [ ] **Step 3: Update `container/README.md`**
+- [x] **Step 3: Update `container/README.md`**
 
 Make these content changes:
 
@@ -992,7 +996,7 @@ These commands remain available for direct wrapper diagnostics and standalone
 downloads; public users should prefer `ploinky ...` and `ploinky box ...`.
 ```
 
-- [ ] **Step 4: Update `README.md`**
+- [x] **Step 4: Update `README.md`**
 
 In the usage/PATH section, add:
 
@@ -1012,7 +1016,7 @@ PLOINKY_DIRECT=1 ploinky <args>
 ```
 ```
 
-- [ ] **Step 5: Run docs tests**
+- [x] **Step 5: Run docs tests**
 
 Run:
 
@@ -1022,7 +1026,7 @@ node container/wrapper-tests.mjs
 
 Expected: PASS.
 
-- [ ] **Step 6: Commit Task 4**
+- [x] **Step 6: Commit Task 4**
 
 Run:
 
@@ -1038,7 +1042,7 @@ git commit -m "Document boxed ploinky entrypoint"
 **Files:**
 - Modify: `docs/superpowers/plans/2026-07-06-ploinky-box-as-ploinky.md`
 
-- [ ] **Step 1: Run full engine-free verification**
+- [x] **Step 1: Run full engine-free verification**
 
 Run:
 
@@ -1058,7 +1062,7 @@ Expected:
 - Node syntax checks pass.
 - Bash syntax checks pass.
 
-- [ ] **Step 2: Run smoke only if Podman is already running**
+- [x] **Step 2: Run smoke only if Podman is already running**
 
 Check:
 
@@ -1077,7 +1081,7 @@ Expected: `== SMOKE PASSED ==`.
 If Podman is not already running, do not start it. Record the smoke as SKIPPED
 with the observed reason.
 
-- [ ] **Step 3: Review final diff**
+- [x] **Step 3: Review final diff**
 
 Run:
 
@@ -1089,13 +1093,13 @@ git diff -- bin/ploinky bin/ploinky-direct container/ploinky-box.mjs container/w
 
 Expected: only intended files are modified, plus this plan ledger.
 
-- [ ] **Step 4: Tick completed checkboxes in this plan**
+- [x] **Step 4: Tick completed checkboxes in this plan**
 
 After all tasks and verification pass, change every completed `- [ ]` checkbox
 in this plan to `- [x]`. Do not tick a skipped smoke run as passed; leave the
 step ticked only if the skip was intentional and recorded.
 
-- [ ] **Step 5: Commit the checked plan**
+- [x] **Step 5: Commit the checked plan**
 
 Run:
 
