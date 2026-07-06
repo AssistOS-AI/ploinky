@@ -88,3 +88,71 @@ test('cp maps box: prefix to instance', () => {
     const { out } = boxRun('podman', '--dry-run', 'cp', '/tmp/f', 'box:/workspace/f');
     checkIncludes(out, 'cp /tmp/f ploinky-box:/workspace/f', 'cp maps box: prefix to instance');
 });
+
+// --- Added with the Node implementation: syntax + import-level unit tests ---
+import { parseCli, buildRunArgs, instanceName, volumeNames, mapCpPath, usageText } from './ploinky-box.mjs';
+
+test('ploinky-box.mjs syntax check (node --check)', () => {
+    const r = spawnSync(process.execPath, ['--check', path.join(HERE, 'ploinky-box.mjs')], { encoding: 'utf8' });
+    assert.equal(r.status, 0, r.stderr);
+});
+
+test('parseCli: flags anywhere, first non-flag is the command', () => {
+    const cfg = parseCli(['--name', 'qa', 'run', 'start', 'demo', '8080', '--dry-run'], {});
+    assert.equal(cfg.command, 'run');
+    assert.deepEqual(cfg.args, ['start', 'demo', '8080']);
+    assert.equal(cfg.name, 'qa');
+    assert.equal(cfg.dryRun, true);
+});
+
+test('parseCli: PLOINKY_BOX_ENGINE env seeds the engine, --engine overrides', () => {
+    assert.equal(parseCli(['up'], { PLOINKY_BOX_ENGINE: 'docker' }).engine, 'docker');
+    assert.equal(parseCli(['--engine', 'podman', 'up'], { PLOINKY_BOX_ENGINE: 'docker' }).engine, 'podman');
+});
+
+test('parseCli: repeatable --publish accumulates in order', () => {
+    const cfg = parseCli(['--publish', 'a:1:1', '--publish', 'b:2:2', 'up'], {});
+    assert.deepEqual(cfg.publish, ['a:1:1', 'b:2:2']);
+});
+
+test('instance and volume naming', () => {
+    assert.equal(instanceName(parseCli(['up'], {})), 'ploinky-box');
+    const named = parseCli(['--name', 'qa', 'up'], {});
+    assert.equal(instanceName(named), 'ploinky-box-qa');
+    assert.deepEqual(volumeNames(named), {
+        workspace: 'ploinky-box-qa-workspace',
+        containers: 'ploinky-box-qa-containers',
+    });
+});
+
+test('buildRunArgs: selinux label only when the engine reports it; image is last', () => {
+    const cfg = parseCli(['up'], {});
+    const plain = buildRunArgs(cfg, { selinux: false });
+    const labeled = buildRunArgs(cfg, { selinux: true });
+    assert.ok(!plain.join(' ').includes('label=disable'));
+    assert.ok(labeled.join(' ').includes('--security-opt label=disable'));
+    assert.equal(plain[plain.length - 1], 'docker.io/assistos/ploinky-box:podman-node24');
+    assert.ok(!plain.includes('--privileged'));
+});
+
+test('buildRunArgs: mount is appended only when set, before the image', () => {
+    const cfg = parseCli(['--mount', '/tmp', 'up'], {});
+    cfg.mountDirResolved = '/tmp';
+    const args = buildRunArgs(cfg, { selinux: false });
+    assert.equal(args[args.length - 3], '-v');
+    assert.equal(args[args.length - 2], '/tmp:/workspace/mounted');
+});
+
+test('mapCpPath: leading box: prefix only', () => {
+    assert.equal(mapCpPath('box:/workspace/f', 'ploinky-box'), 'ploinky-box:/workspace/f');
+    assert.equal(mapCpPath('/tmp/box:file', 'ploinky-box'), '/tmp/box:file');
+});
+
+test('usage text still documents every command and flag', () => {
+    const u = usageText();
+    for (const word of ['up', 'cli', 'run', 'cp', 'status', 'logs', 'stop', 'update', 'destroy',
+        '--name', '--port', '--publish', '--webmeet-ports', '--image', '--mount',
+        '--listen-lan', '--engine', '--dry-run']) {
+        assert.ok(u.includes(word), `usage() lost mention of ${word}`);
+    }
+});
