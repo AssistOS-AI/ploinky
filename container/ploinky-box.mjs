@@ -597,7 +597,7 @@ async function main() {
     if (!cfg.command) { process.stdout.write(usageText()); process.exit(1); }
     const known = new Set(['up', 'start', 'cli', 'run', 'cp', 'status', 'logs', 'stop', 'update', 'destroy', 'help']);
     if (!known.has(cfg.command)) die(`unknown command '${cfg.command}' (see: ploinky-box --help)`);
-    detectEngine(cfg);
+    if (!(cfg.command === 'status' && cfg.dryRun)) detectEngine(cfg);
     if (cfg.command !== 'help') resolveInstanceIdentity(cfg);
     switch (cfg.command) {
         case 'up': await cmdUp(cfg); break;

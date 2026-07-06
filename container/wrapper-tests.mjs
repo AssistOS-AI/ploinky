@@ -13,6 +13,7 @@ import { fileURLToPath } from 'node:url';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const BOX = path.join(HERE, 'ploinky-box');
+const MJS = path.join(HERE, 'ploinky-box.mjs');
 
 // Combined stdout+stderr, like the `2>&1` captures in the old wrapper-tests.sh.
 function boxRun(engine, ...args) {
@@ -269,6 +270,26 @@ test('status targets the inferred instance', () => {
         assert.equal(status, 1, out);
         checkIncludes(out, "'ploinky-box-testExplorerFresh' does not exist.", 'status resolves the inferred name');
         checkIncludes(out, 'name inferred from the current directory', 'status explains where the name came from');
+    } finally {
+        fs.rmSync(parent, { recursive: true, force: true });
+    }
+});
+
+test('dry-run status is engine-free when inferring the instance', () => {
+    const { parent, dir } = makeCwd('testExplorerFresh');
+    const env = { ...process.env, PATH: '/usr/bin:/bin' };
+    delete env.PLOINKY_BOX_ENGINE;
+    try {
+        const r = spawnSync(process.execPath, [MJS, '--dry-run', 'status'], {
+            cwd: dir,
+            encoding: 'utf8',
+            env,
+        });
+        const out = `${r.stdout ?? ''}${r.stderr ?? ''}`;
+        assert.equal(r.status, 1, out);
+        checkIncludes(out, "'ploinky-box-testExplorerFresh' does not exist.", 'dry-run status resolves the inferred name');
+        checkIncludes(out, 'name inferred from the current directory', 'dry-run status explains where the name came from');
+        checkAbsent(out, 'neither podman nor docker found', 'dry-run status does not detect container engines');
     } finally {
         fs.rmSync(parent, { recursive: true, force: true });
     }
