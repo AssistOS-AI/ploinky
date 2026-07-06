@@ -1,13 +1,14 @@
 # ploinky-box
 
 Run the entire Ploinky runtime isolated inside one rootless-podman container.
-The host needs nothing but podman (preferred) or docker — no node, no git, no
-ploinky checkout. Agents run as nested containers *inside* the box; nothing
-they do touches the host filesystem.
+The host needs podman (preferred) or docker, plus Node >= 20 to run the
+wrapper — no git, no ploinky checkout. Agents run as nested containers
+*inside* the box; nothing they do touches the host filesystem.
 
 ## Quick start
 
     curl -fsSL https://raw.githubusercontent.com/AssistOS-AI/ploinky/master/container/ploinky-box -o ploinky-box
+    curl -fsSL https://raw.githubusercontent.com/AssistOS-AI/ploinky/master/container/ploinky-box.mjs -o ploinky-box.mjs
     chmod +x ploinky-box
     ./ploinky-box up
     ./ploinky-box cli          # interactive Ploinky console
@@ -84,6 +85,9 @@ first attempt a graceful in-box `ploinky stop`.
   Docker Desktop file share (default: your home directory).
 - Linux-host smoke not yet executed (verified on macOS only as of 2026-07-03).
 - Windows hosts are unsupported.
+- The wrapper itself needs Node >= 20 on the host (`ploinky-box` is a thin
+  shim around `ploinky-box.mjs`; keep the two files side by side). The box
+  and the agents inside it still need nothing but the container engine.
 
 Smoke verified on macOS 26.5.2 / podman machine (podman 5.8.2) on 2026-07-03.
 
