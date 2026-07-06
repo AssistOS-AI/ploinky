@@ -425,6 +425,22 @@ function listLocalAuthUsers(policy = {}) {
     return config.users.map((entry) => serializeUserSummary(entry));
 }
 
+function listLocalAuthRoles(policy = {}) {
+    const config = resolveLocalAuthConfig(policy);
+    if (!config.usersVar || !config.users.length) {
+        return [];
+    }
+    const roles = [];
+    for (const user of config.users) {
+        for (const role of normalizeRoles(user.roles)) {
+            if (!roles.includes(role)) {
+                roles.push(role);
+            }
+        }
+    }
+    return roles;
+}
+
 function countAdmins(users = []) {
     return users.filter((entry) => isLocalAdminUser(entry)).length;
 }
@@ -597,6 +613,7 @@ export {
     getSession,
     getSessionCookieMaxAge,
     isLocalAdminUser,
+    listLocalAuthRoles,
     listLocalAuthUsers,
     mintGuestSessionJwt,
     mintSessionJwt,

@@ -63,7 +63,9 @@ function writeWorkspaceConfig(ploinkyDir, { staticAuthMode = 'local' } = {}) {
         webchat: { auth: 'static' },
     }, null, 2));
     const webAssistManifestDir = path.join(ploinkyDir, 'repos', 'webassist', 'webAssist');
+    const staleManifestGuestDir = path.join(ploinkyDir, 'repos', 'webassist', 'manifestGuest');
     mkdirSync(webAssistManifestDir, { recursive: true });
+    mkdirSync(staleManifestGuestDir, { recursive: true });
     writeFileSync(path.join(webAssistManifestDir, 'manifest.json'), JSON.stringify({
         httpServices: [
             {
@@ -72,6 +74,9 @@ function writeWorkspaceConfig(ploinkyDir, { staticAuthMode = 'local' } = {}) {
                 access: 'authenticated',
             },
         ],
+    }, null, 2));
+    writeFileSync(path.join(staleManifestGuestDir, 'manifest.json'), JSON.stringify({
+        guest: true,
     }, null, 2));
     writeFileSync(path.join(serviceManifestDir, 'manifest.json'), JSON.stringify({
         httpServices: [
@@ -109,6 +114,12 @@ function writeWorkspaceConfig(ploinkyDir, { staticAuthMode = 'local' } = {}) {
             repoName: 'webassist',
             auth: { mode: 'guest' },
         },
+        manifestGuest: {
+            type: 'agent',
+            agentName: 'manifestGuest',
+            repoName: 'webassist',
+            auth: { mode: 'none' },
+        },
         webAdmin: {
             type: 'agent',
             agentName: 'webAdmin',
@@ -126,6 +137,7 @@ function writeWorkspaceConfig(ploinkyDir, { staticAuthMode = 'local' } = {}) {
         routes: {
             explorer: { agent: 'explorer', repo: 'AchillesIDE', hostPort: 55289 },
             webAssist: { agent: 'webAssist', repo: 'webassist', hostPort: 53659, hostPath: webAssistManifestDir },
+            manifestGuest: { agent: 'manifestGuest', repo: 'webassist', hostPort: 53660, hostPath: staleManifestGuestDir },
             webAdmin: { agent: 'webAdmin', repo: 'webassist', hostPort: 41155 },
             guestAgent: {
                 agent: 'guestAgent',
@@ -212,6 +224,19 @@ test('guest routes use the guest agent policy instead of the static Explorer pol
     assert.deepEqual(body.user.roles, ['guest']);
     assert.match(String(tokenRes.getHeader('set-cookie') || ''), /^ploinky_guest=/);
     assert.match(String(tokenRes.getHeader('set-cookie') || ''), /Max-Age=3600/);
+
+    const manifestGuestReq = makeRequest({
+        method: 'POST',
+        url: '/manifestGuest/mcp',
+    });
+    const manifestGuestRes = new MockResponse();
+    const manifestGuestParsedUrl = new URL(manifestGuestReq.url, 'http://localhost');
+    const manifestGuestResult = await authHandlers.ensureAuthenticated(manifestGuestReq, manifestGuestRes, manifestGuestParsedUrl);
+
+    assert.equal(manifestGuestResult.ok, true);
+    assert.equal(manifestGuestReq.authMode, 'guest');
+    assert.equal(manifestGuestReq.user?.username, 'visitor');
+    assert.match(String(manifestGuestRes.getHeader('set-cookie') || ''), /^ploinky_guest=/);
 
     const noAuthMcpReq = makeRequest({
         method: 'POST',

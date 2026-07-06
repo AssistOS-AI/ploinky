@@ -1,4 +1,4 @@
-import { createLocalAuthUser, deleteLocalAuthUser, getSession as getLocalSession, getSessionCookieMaxAge as getLocalSessionCookieMaxAge, isLocalAdminUser, listLocalAuthUsers, updateLocalAuthUser } from '../auth/localService.js';
+import { createLocalAuthUser, deleteLocalAuthUser, getSession as getLocalSession, getSessionCookieMaxAge as getLocalSessionCookieMaxAge, isLocalAdminUser, listLocalAuthRoles, listLocalAuthUsers, updateLocalAuthUser } from '../auth/localService.js';
 import { readRouterSettings, updateRouterSettings } from '../../services/routerSettings.js';
 import { buildCookie, LOCAL_AUTH_COOKIE_NAME, parseCookies, readJsonBody, sendJson } from './shared.js';
 import { resolveAuthContextForRouteKey } from './authContext.js';
@@ -164,6 +164,7 @@ export async function handleUserAdminRoutes(req, res, parsedUrl) {
             sendJson(res, 200, {
                 ok: true,
                 agent: authContext.routeKey,
+                availableRoles: listLocalAuthRoles(authContext.policy),
                 users
             });
             return true;
