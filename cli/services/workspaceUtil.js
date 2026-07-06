@@ -16,6 +16,7 @@ import { getSecrets, createEnvWithSecrets, loadEnvFile } from './secretInjector.
 import { readSecretsFile } from './encryptedSecretsFile.js';
 import { buildEnvMap } from './secretVars.js';
 import { resolveAgentReadinessProtocol } from './startupReadiness.js';
+import { withMaintenanceLock } from './maintenanceLocks.js';
 import { LOGS_DIR, PLOINKY_CWD, PLOINKY_WORKSPACE_ROOT, ROUTING_FILE, RUNNING_DIR } from './config.js';
 import { classifyDependencyGraphWaitMode, resolveWorkspaceDependencyGraph, topologicallyGroupDependencyGraph } from './workspaceDependencyGraph.js';
 import { mergeRoutingConfig, readRoutingConfig } from './routingFile.js';
@@ -1067,29 +1068,36 @@ async function reinstallAgent(agentName) {
     console.log(`Reinstalling (re-creating) agent '${agentName}'...`);
 
     try {
-        const short = resolved.shortAgentName;
-        const agentPath = path.dirname(resolved.manifestPath);
+        await withMaintenanceLock(containerName, {
+            operation: 'reinstall',
+            metadata: {
+                agent: resolved.shortAgentName,
+                repo: resolved.repo,
+            },
+        }, async () => {
+            const short = resolved.shortAgentName;
+            const agentPath = path.dirname(resolved.manifestPath);
 
-        // Stop existing process (bwrap or container)
-        if (bwrapRunning) {
-            stopBwrapProcess(short);
-        }
-        stopAndRemove(containerName);
-        
-        const { containerName: newContainerName, hostPort, additionalServerPort } = await ensureAgentService(short, manifest, agentPath, {
-            containerName,
-            alias: registryRecord?.record?.alias,
-            forceRecreate: true
-        });
+            // Stop existing process (bwrap or container)
+            if (bwrapRunning) {
+                stopBwrapProcess(short);
+            }
+            stopAndRemove(containerName);
+            
+            const { containerName: newContainerName, hostPort, additionalServerPort } = await ensureAgentService(short, manifest, agentPath, {
+                containerName,
+                alias: registryRecord?.record?.alias,
+                forceRecreate: true
+            });
 
-        const readinessProtocol = resolveAgentReadinessProtocol(manifest);
-        if (!hostPort && readinessProtocol !== 'none') {
-            throw new Error(`Failed to resolve host port for restarted agent '${short}'.`);
-        }
-        console.log(`[reinstall] reinstalled '${short}' [container: ${newContainerName}]`);
+            const readinessProtocol = resolveAgentReadinessProtocol(manifest);
+            if (!hostPort && readinessProtocol !== 'none') {
+                throw new Error(`Failed to resolve host port for restarted agent '${short}'.`);
+            }
+            console.log(`[reinstall] reinstalled '${short}' [container: ${newContainerName}]`);
 
-        // Routing update logic from original restart command
-        try {
+            // Routing update logic from original restart command
+            try {
             const routingFile = ROUTING_FILE;
             let cfg = { routes: {} };
             try { cfg = JSON.parse(fs.readFileSync(routingFile, 'utf8')) || { routes: {} }; } catch(_) {}
@@ -1177,6 +1185,7 @@ async function reinstallAgent(agentName) {
         } catch (e) {
             console.error('[reinstall] routing update/router start failed:', e?.message||e);
         }
+        });
     } catch (e) {
         console.error(`[reinstall] ${agentName}: ${e?.message||e}`);
     }
