@@ -7,26 +7,54 @@ wrapper — no git, no ploinky checkout. Agents run as nested containers
 
 ## Quick start
 
+    cd ~/work/myProject
     curl -fsSL https://raw.githubusercontent.com/AssistOS-AI/ploinky/master/container/ploinky-box -o ploinky-box
     curl -fsSL https://raw.githubusercontent.com/AssistOS-AI/ploinky/master/container/ploinky-box.mjs -o ploinky-box.mjs
     chmod +x ploinky-box
-    ./ploinky-box up
-    ./ploinky-box cli          # interactive Ploinky console
-    # inside: enable agent webtty
-    # inside: start webtty 8080
+    ./ploinky-box start webtty    # box 'ploinky-box-myProject': up + start webtty + router probe
     open http://127.0.0.1:8080/status
 
-The agent must exist in an enabled repo — ploinky auto-clones its default
+The agent must exist in a repo known to the box. Ploinky auto-clones its default
 repos (basic, AchillesIDE, AchillesCLI, copilot-agents) on first use, so the
-box needs outbound network on first `up`. `webtty` ships in `basic`. Pick
-agents whose image contains node: ploinky's runtime-key probe execs `node`
+box needs outbound network on first `up`; `webtty` ships in `basic`.
+`start <agent>` enables the agent automatically when its repo is known to the
+box. Agents from non-default repos still need the repo added first (via `cli`).
+Pick agents whose image contains node: ploinky's runtime-key probe execs `node`
 inside the agent image and node-less images (e.g. plain alpine) fail to start.
+
+## Instances
+
+Every command targets one instance:
+
+| Selector | Instance (container / volume prefix) |
+| --- | --- |
+| *(nothing)* | Inferred from the current directory basename: `ploinky-box-<basename>` |
+| `--name X` | `ploinky-box-X` (explicit, wins over inference) |
+
+Inferred names are sanitized (`[^a-zA-Z0-9_.-]` becomes `_`, capped at 63
+chars, case preserved): `~/work/testExplorerFresh` →
+`ploinky-box-testExplorerFresh` with volumes
+`ploinky-box-testExplorerFresh-workspace` / `-containers`. Directories whose
+basename has no ASCII letters or digits at all cannot be inferred — pass
+`--name`. Two directories with the same basename map to the SAME instance
+(inference reads only the basename); disambiguate with `--name`. Explicit
+`--name` values are passed to the engine unsanitized. Every command resolves
+the instance the same way, including `destroy` — the confirmation prompt names
+the exact container and volumes it is about to remove, so read it.
+
+Older wrapper versions created a bare instance named `ploinky-box`. The new
+wrapper no longer addresses it. If you intentionally want to delete that old
+box and its workspace/image volumes, first copy out anything you need, then run
+the matching engine command, for example:
+`<engine> rm -f ploinky-box && <engine> volume rm ploinky-box-workspace ploinky-box-containers`.
 
 ## The one rule about ports
 
 The wrapper publishes host port `--port N` (default 8080) to **container port
 8080**. Inside the box, always start the router on 8080:
-`start <agent> 8080`.
+`start <agent> 8080`. `ploinky-box start <agent> [port]` obeys the rule for you:
+`[port]` (or `--port`) picks the HOST side, the router inside is always started
+on 8080.
 
 Other in-box ports are unreachable from the host unless you publish them when
 creating the box. Use `--publish HOST:BOX` for a specific port, repeat it for
@@ -40,6 +68,7 @@ new published ports.
 | Command | Effect |
 | --- | --- |
 | `up` | Create/start the box; pulls the image on first use |
+| `start <agent> [port]` | `up` + in-box `ploinky start <agent> 8080` + router probe; `[port]` = host port (default 8080). On an existing box the original port mapping wins (recreate via `update` to change it) |
 | `cli` | Interactive `p-cli` console inside the box |
 | `run <args>` | One-shot ploinky command (`run start webtty 8080`, `run list agents`) |
 | `cp A B` | Copy in/out; container side uses the `box:` prefix |
@@ -49,8 +78,9 @@ new published ports.
 | `update` | Pull newer image, recreate the box (pass the same flags as `up`) |
 | `destroy` | Remove the box AND its volumes (asks first) |
 
-Flags: `--name X` (extra isolated instance), `--port N`, `--publish SPEC`,
-`--webmeet-ports`, `--image I`, `--mount DIR`, `--listen-lan`,
+Flags: `--name X` (explicit instance; default: inferred from the current
+directory basename), `--port N`, `--publish SPEC`, `--webmeet-ports`,
+`--image I`, `--mount DIR`, `--listen-lan`,
 `--engine podman|docker`, `--dry-run`.
 `PLOINKY_BOX_ENGINE` overrides engine detection.
 
