@@ -35,7 +35,8 @@ Commands:
   destroy    Remove the box AND its volumes (asks for confirmation)
 
 Flags:
-  --name X       Extra isolated instance (container ploinky-box-X)
+  --name X       Instance name (container ploinky-box-X). Default: inferred
+                 from the current directory basename.
   --port N       Host port for the router (default 8080).
                  Inside the box, always start the router on port 8080.
   --publish SPEC Extra host-to-box port publish; repeatable, same form as -p.
@@ -59,7 +60,9 @@ export function parseCli(argv, env = process.env) {
     const cfg = {
         engine: env.PLOINKY_BOX_ENGINE || '',
         name: '',
+        nameSource: '',
         port: '8080',
+        portExplicit: false,
         image: DEFAULT_IMAGE,
         mountDir: '',
         mountDirResolved: '',
@@ -82,7 +85,10 @@ export function parseCli(argv, env = process.env) {
         const tok = argv[i];
         switch (tok) {
             case '--name': cfg.name = need('--name'); break;
-            case '--port': cfg.port = need('--port'); break;
+            case '--port':
+                cfg.port = need('--port');
+                cfg.portExplicit = true;
+                break;
             case '--publish': cfg.publish.push(need('--publish')); break;
             case '--webmeet-ports': cfg.webmeetPorts = true; i += 1; break;
             case '--image': cfg.image = need('--image'); break;
@@ -101,12 +107,36 @@ export function parseCli(argv, env = process.env) {
 }
 
 export function instanceName(cfg) {
-    return cfg.name ? `${BOX_PREFIX}-${cfg.name}` : BOX_PREFIX;
+    return `${BOX_PREFIX}-${cfg.name}`;
 }
 
 export function volumeNames(cfg) {
     const instance = instanceName(cfg);
     return { workspace: `${instance}-workspace`, containers: `${instance}-containers` };
+}
+
+export function sanitizeBoxSuffix(raw) {
+    return raw.replace(/[^a-zA-Z0-9_.-]/g, '_').slice(0, 63);
+}
+
+export function resolveInstanceIdentity(cfg, cwd = process.cwd()) {
+    if (cfg.name) {
+        cfg.nameSource = 'flag';
+        return cfg;
+    }
+    const inferred = sanitizeBoxSuffix(path.basename(cwd));
+    if (!/[a-zA-Z0-9]/.test(inferred)) {
+        die(`cannot infer an instance name from the current directory (${cwd}); pass --name X`);
+    }
+    cfg.name = inferred;
+    cfg.nameSource = 'cwd';
+    return cfg;
+}
+
+function inferredNote(cfg) {
+    return cfg.nameSource === 'cwd'
+        ? ' (name inferred from the current directory; pass --name X to target another instance)'
+        : '';
 }
 
 export function mapCpPath(side, instance) {
@@ -360,7 +390,7 @@ async function waitHealthy(cfg) {
 function requireRunning(cfg) {
     if (cfg.dryRun) return;
     if (!boxRunning(cfg)) {
-        die(`'${instanceName(cfg)}' is not running. Start it with: ploinky-box${cfg.name ? ` --name ${cfg.name}` : ''} up`);
+        die(`'${instanceName(cfg)}' is not running. Start it with: ploinky-box --name ${cfg.name} up`);
     }
 }
 
@@ -441,8 +471,12 @@ function cmdCp(cfg) {
 async function cmdStatus(cfg) {
     preflight(cfg);
     const instance = instanceName(cfg);
+    if (cfg.dryRun) {
+        process.stdout.write(`ploinky-box: '${instance}' does not exist.${inferredNote(cfg)}\n`);
+        return 1;
+    }
     if (!boxExists(cfg)) {
-        process.stdout.write(`ploinky-box: '${instance}' does not exist.\n`);
+        process.stdout.write(`ploinky-box: '${instance}' does not exist.${inferredNote(cfg)}\n`);
         return 1;
     }
     const state = query(cfg, ['container', 'inspect', '--format', '{{.State.Status}}', instance]).stdout.trim();
@@ -453,7 +487,7 @@ async function cmdStatus(cfg) {
     } else if (hp && await urlOk(`http://127.0.0.1:${hp}/health`)) {
         process.stdout.write(`router:    responding on http://127.0.0.1:${hp}/health\n`);
     } else {
-        process.stdout.write(`router:    not responding (start it inside: ploinky-box${cfg.name ? ` --name ${cfg.name}` : ''} run start <agent> 8080)\n`);
+        process.stdout.write(`router:    not responding (start it inside: ploinky-box --name ${cfg.name} run start <agent> 8080)\n`);
     }
     return 0;
 }
@@ -468,7 +502,7 @@ function cmdLogs(cfg) {
 function cmdStop(cfg) {
     preflight(cfg);
     if (!boxExists(cfg)) {
-        process.stdout.write(`ploinky-box: '${instanceName(cfg)}' does not exist.\n`);
+        process.stdout.write(`ploinky-box: '${instanceName(cfg)}' does not exist.${inferredNote(cfg)}\n`);
         return;
     }
     gracefulPloinkyStop(cfg);
@@ -488,14 +522,22 @@ async function cmdUpdate(cfg) {
     const selinux = cfg.dryRun ? false : engineSelinuxEnabled(cfg);
     runEngine(cfg, buildRunArgs(cfg, { selinux }));
     await waitHealthy(cfg);
-    process.stdout.write(`ploinky-box: updated. Resume agents with: ploinky-box${cfg.name ? ` --name ${cfg.name}` : ''} run start\n`);
+    process.stdout.write(`ploinky-box: updated. Resume agents with: ploinky-box --name ${cfg.name} run start\n`);
 }
 
 async function cmdDestroy(cfg) {
     preflight(cfg);
     const instance = instanceName(cfg);
     const { workspace, containers } = volumeNames(cfg);
+    if (cfg.nameSource === 'cwd') {
+        process.stderr.write(`ploinky-box: targeting '${instance}' (name inferred from the current directory)\n`);
+    }
     if (!cfg.dryRun) {
+        const anyVolume = query(cfg, ['volume', 'inspect', workspace]).ok
+            || query(cfg, ['volume', 'inspect', containers]).ok;
+        if (!boxExists(cfg) && !anyVolume) {
+            die(`nothing to destroy: no container or volumes for '${instance}'${inferredNote(cfg)}`);
+        }
         const reply = await askLine(`Remove container '${instance}' and volumes '${workspace}' + '${containers}'? [y/N] `);
         if (!/^[yY]$/.test(reply ?? '')) die('aborted');
     }
@@ -511,7 +553,10 @@ async function main() {
     const cfg = parseCli(process.argv.slice(2));
     if (cfg.help) { process.stdout.write(usageText()); process.exit(0); }
     if (!cfg.command) { process.stdout.write(usageText()); process.exit(1); }
+    const known = new Set(['up', 'cli', 'run', 'cp', 'status', 'logs', 'stop', 'update', 'destroy', 'help']);
+    if (!known.has(cfg.command)) die(`unknown command '${cfg.command}' (see: ploinky-box --help)`);
     detectEngine(cfg);
+    if (cfg.command !== 'help') resolveInstanceIdentity(cfg);
     switch (cfg.command) {
         case 'up': await cmdUp(cfg); break;
         case 'cli': cmdCli(cfg); break;
@@ -523,7 +568,6 @@ async function main() {
         case 'update': await cmdUpdate(cfg); break;
         case 'destroy': await cmdDestroy(cfg); break;
         case 'help': process.stdout.write(usageText()); break;
-        default: die(`unknown command '${cfg.command}' (see: ploinky-box --help)`);
     }
 }
 

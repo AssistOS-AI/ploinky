@@ -23,6 +23,25 @@ function boxRun(engine, ...args) {
     return { out: `${r.stdout ?? ''}${r.stderr ?? ''}`, status: r.status };
 }
 
+// Like boxRun, but with a controlled working directory — cwd inference tests.
+function boxRunIn(cwd, engine, ...args) {
+    const r = spawnSync(BOX, args, {
+        cwd,
+        encoding: 'utf8',
+        env: { ...process.env, PLOINKY_BOX_ENGINE: engine },
+    });
+    return { out: `${r.stdout ?? ''}${r.stderr ?? ''}`, status: r.status };
+}
+
+// Fixed-basename child inside a random temp parent: deterministic inference,
+// no collision with real containers. Callers clean up the returned parent.
+function makeCwd(basename) {
+    const parent = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-box-cwd-'));
+    const dir = path.join(parent, basename);
+    fs.mkdirSync(dir);
+    return { parent, dir };
+}
+
 function checkIncludes(out, needle, description) {
     assert.ok(out.includes(needle), `${description}\n  wanted: ${needle}\n  in: ${out}`);
 }
@@ -36,20 +55,26 @@ test('entrypoint bash syntax check (bash -n)', () => {
     assert.equal(r.status, 0, r.stderr);
 });
 
-test('default up: isolation contract and defaults', () => {
-    const { out } = boxRun('podman', '--dry-run', 'up');
-    checkIncludes(out, 'DRY-RUN: podman', 'default up uses podman');
-    checkIncludes(out, '--user podman', 'default up runs rootless user');
-    checkIncludes(out, '--device /dev/fuse', 'default up passes /dev/fuse');
-    checkIncludes(out, '--device /dev/net/tun', 'default up passes /dev/net/tun');
-    checkIncludes(out, 'seccomp=unconfined', 'default up unconfines seccomp');
-    checkIncludes(out, '127.0.0.1:8080:8080', 'default up publishes loopback 8080');
-    checkIncludes(out, 'ploinky-box-workspace:/workspace', 'default up mounts workspace volume');
-    checkIncludes(out, 'ploinky-box-containers:/home/podman/.local/share/containers', 'default up mounts containers volume');
-    checkIncludes(out, '-e PLOINKY_BOX=1', 'default up marks box runtime');
-    checkIncludes(out, 'docker.io/assistos/ploinky-box:podman-node24', 'default up uses default image');
-    checkIncludes(out, '--init', 'default up reaps zombies');
-    checkAbsent(out, '--privileged', 'no --privileged, ever');
+test('inferred up: cwd basename drives names; isolation contract holds', () => {
+    const { parent, dir } = makeCwd('testExplorerFresh');
+    try {
+        const { out } = boxRunIn(dir, 'podman', '--dry-run', 'up');
+        checkIncludes(out, 'DRY-RUN: podman', 'inferred up uses podman');
+        checkIncludes(out, '--name ploinky-box-testExplorerFresh', 'cwd basename names the instance');
+        checkIncludes(out, '--user podman', 'inferred up runs rootless user');
+        checkIncludes(out, '--device /dev/fuse', 'inferred up passes /dev/fuse');
+        checkIncludes(out, '--device /dev/net/tun', 'inferred up passes /dev/net/tun');
+        checkIncludes(out, 'seccomp=unconfined', 'inferred up unconfines seccomp');
+        checkIncludes(out, '127.0.0.1:8080:8080', 'inferred up publishes loopback 8080');
+        checkIncludes(out, 'ploinky-box-testExplorerFresh-workspace:/workspace', 'inferred up mounts workspace volume');
+        checkIncludes(out, 'ploinky-box-testExplorerFresh-containers:/home/podman/.local/share/containers', 'inferred up mounts containers volume');
+        checkIncludes(out, '-e PLOINKY_BOX=1', 'inferred up marks box runtime');
+        checkIncludes(out, 'docker.io/assistos/ploinky-box:podman-node24', 'inferred up uses default image');
+        checkIncludes(out, '--init', 'inferred up reaps zombies');
+        checkAbsent(out, '--privileged', 'no --privileged, ever');
+    } finally {
+        fs.rmSync(parent, { recursive: true, force: true });
+    }
 });
 
 test('named up: docker engine, instance prefixes, LAN bind', () => {
@@ -82,17 +107,26 @@ test('webmeet ports publish the LiveKit/TURN set', () => {
 });
 
 test('run passes through to ploinky', () => {
-    const { out } = boxRun('podman', '--dry-run', 'run', 'start', 'demo', '8080');
-    checkIncludes(out, 'exec -w /workspace ploinky-box ploinky start demo 8080', 'run passes through to ploinky');
+    const { out } = boxRun('podman', '--name', 'qa', '--dry-run', 'run', 'start', 'demo', '8080');
+    checkIncludes(out, 'exec -w /workspace ploinky-box-qa ploinky start demo 8080', 'run passes through to ploinky');
 });
 
 test('cp maps box: prefix to instance', () => {
-    const { out } = boxRun('podman', '--dry-run', 'cp', '/tmp/f', 'box:/workspace/f');
-    checkIncludes(out, 'cp /tmp/f ploinky-box:/workspace/f', 'cp maps box: prefix to instance');
+    const { out } = boxRun('podman', '--name', 'qa', '--dry-run', 'cp', '/tmp/f', 'box:/workspace/f');
+    checkIncludes(out, 'cp /tmp/f ploinky-box-qa:/workspace/f', 'cp maps box: prefix to instance');
 });
 
 // --- Added with the Node implementation: syntax + import-level unit tests ---
-import { parseCli, buildRunArgs, instanceName, volumeNames, mapCpPath, usageText } from './ploinky-box.mjs';
+import {
+    parseCli,
+    buildRunArgs,
+    instanceName,
+    volumeNames,
+    mapCpPath,
+    usageText,
+    sanitizeBoxSuffix,
+    resolveInstanceIdentity,
+} from './ploinky-box.mjs';
 
 test('ploinky-box.mjs syntax check (node --check)', () => {
     const r = spawnSync(process.execPath, ['--check', path.join(HERE, 'ploinky-box.mjs')], { encoding: 'utf8' });
@@ -131,7 +165,6 @@ test('parseCli: repeatable --publish accumulates in order', () => {
 });
 
 test('instance and volume naming', () => {
-    assert.equal(instanceName(parseCli(['up'], {})), 'ploinky-box');
     const named = parseCli(['--name', 'qa', 'up'], {});
     assert.equal(instanceName(named), 'ploinky-box-qa');
     assert.deepEqual(volumeNames(named), {
@@ -169,5 +202,85 @@ test('usage text still documents every command and flag', () => {
         '--name', '--port', '--publish', '--webmeet-ports', '--image', '--mount',
         '--listen-lan', '--engine', '--dry-run']) {
         assert.ok(u.includes(word), `usage() lost mention of ${word}`);
+    }
+});
+
+test('sanitizeBoxSuffix: engine-safe suffixes', () => {
+    assert.equal(sanitizeBoxSuffix('testExplorerFresh'), 'testExplorerFresh');
+    assert.equal(sanitizeBoxSuffix('my repo!'), 'my_repo_');
+    assert.equal(sanitizeBoxSuffix('a.b-c_d'), 'a.b-c_d');
+    assert.equal(sanitizeBoxSuffix('x'.repeat(80)), 'x'.repeat(63));
+    assert.equal(sanitizeBoxSuffix(''), '');
+});
+
+test('resolveInstanceIdentity: cwd inference and --name override', () => {
+    const inferred = resolveInstanceIdentity(parseCli(['up'], {}), '/home/u/testExplorer2');
+    assert.equal(inferred.name, 'testExplorer2');
+    assert.equal(inferred.nameSource, 'cwd');
+    assert.equal(instanceName(inferred), 'ploinky-box-testExplorer2');
+
+    const flagged = resolveInstanceIdentity(parseCli(['--name', 'qa', 'up'], {}), '/home/u/testExplorer2');
+    assert.equal(flagged.name, 'qa');
+    assert.equal(flagged.nameSource, 'flag');
+});
+
+test('parseCli: explicit-port tracking for start', () => {
+    assert.equal(parseCli(['--port', '9090', 'up'], {}).portExplicit, true);
+    assert.equal(parseCli(['up'], {}).portExplicit, false);
+});
+
+test('inferred up: cwd basename is sanitized', () => {
+    const { parent, dir } = makeCwd('my repo!');
+    try {
+        const { out } = boxRunIn(dir, 'podman', '--dry-run', 'up');
+        checkIncludes(out, '--name ploinky-box-my_repo_', 'unsafe chars become underscores');
+    } finally {
+        fs.rmSync(parent, { recursive: true, force: true });
+    }
+});
+
+test('--name overrides the cwd basename', () => {
+    const { parent, dir } = makeCwd('testExplorerFresh');
+    try {
+        const { out } = boxRunIn(dir, 'podman', '--name', 'qa', '--dry-run', 'up');
+        checkIncludes(out, '--name ploinky-box-qa', 'explicit --name wins');
+        checkAbsent(out, 'testExplorerFresh', 'cwd basename ignored when --name is given');
+    } finally {
+        fs.rmSync(parent, { recursive: true, force: true });
+    }
+});
+
+test('un-inferable cwd dies with guidance', () => {
+    const { parent, dir } = makeCwd('___');
+    try {
+        const { out, status } = boxRunIn(dir, 'podman', '--dry-run', 'up');
+        assert.equal(status, 1, out);
+        checkIncludes(out, 'cannot infer an instance name', 'un-inferable cwd is an error');
+        checkIncludes(out, 'pass --name X', 'error points at the escape hatch');
+    } finally {
+        fs.rmSync(parent, { recursive: true, force: true });
+    }
+});
+
+test('status targets the inferred instance', () => {
+    const { parent, dir } = makeCwd('testExplorerFresh');
+    try {
+        const { out, status } = boxRunIn(dir, 'podman', '--dry-run', 'status');
+        assert.equal(status, 1, out);
+        checkIncludes(out, "'ploinky-box-testExplorerFresh' does not exist.", 'status resolves the inferred name');
+        checkIncludes(out, 'name inferred from the current directory', 'status explains where the name came from');
+    } finally {
+        fs.rmSync(parent, { recursive: true, force: true });
+    }
+});
+
+test('destroy targets the inferred instance and says so', () => {
+    const { parent, dir } = makeCwd('testExplorerFresh');
+    try {
+        const { out } = boxRunIn(dir, 'podman', '--dry-run', 'destroy');
+        checkIncludes(out, "targeting 'ploinky-box-testExplorerFresh' (name inferred from the current directory)", 'destroy announces the inferred target');
+        checkIncludes(out, "'ploinky-box-testExplorerFresh' and its volumes removed.", 'destroy resolves the inferred name');
+    } finally {
+        fs.rmSync(parent, { recursive: true, force: true });
     }
 });
