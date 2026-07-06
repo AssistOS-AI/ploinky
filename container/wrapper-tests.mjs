@@ -619,6 +619,11 @@ test('package metadata advertises the Node 20 runtime floor', () => {
     assert.equal(packageJson.engines.node, '>=20.0.0');
 });
 
+test('package metadata exposes ploinky as the public binary', () => {
+    const packageJson = JSON.parse(fs.readFileSync(path.join(HERE, '..', 'package.json'), 'utf8'));
+    assert.equal(packageJson.bin.ploinky, './bin/ploinky');
+});
+
 test('sanitizeBoxSuffix: engine-safe suffixes', () => {
     assert.equal(sanitizeBoxSuffix('testExplorerFresh'), 'testExplorerFresh');
     assert.equal(sanitizeBoxSuffix('my repo!'), 'my_repo_');
