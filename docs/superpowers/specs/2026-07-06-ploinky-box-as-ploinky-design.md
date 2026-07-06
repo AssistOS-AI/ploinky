@@ -95,11 +95,16 @@ ploinky start explorer
 Those commands target different outer boxes because their current directory
 basenames differ.
 
-Users can still pass `--name X` to target another instance explicitly. The
-public `ploinky` entrypoint should accept the same box flags that are needed
-before the in-box command is executed, such as `--name`, `--port`, `--image`,
-`--publish`, `--webmeet-ports`, `--mount`, `--listen-lan`, `--engine`, and
-`--dry-run`.
+Users can still pass `--name X` to target another instance explicitly. In public
+`ploinky` mode, wrapper flags are parsed only before the first non-flag command
+token, or after the explicit `box` namespace for box lifecycle operations. Once
+normal Ploinky command parsing begins, flags belong to the in-box Ploinky
+command and must be forwarded unchanged. This preserves commands such as
+`ploinky client tool process --dry-run`.
+
+The public entrypoint accepts the same box flags that are needed before the
+in-box command is executed, such as `--name`, `--port`, `--image`, `--publish`,
+`--webmeet-ports`, `--mount`, `--listen-lan`, `--engine`, and `--dry-run`.
 
 ## Runtime Architecture
 
@@ -137,6 +142,8 @@ In public `ploinky` mode:
 - `ploinky box <box-command> ...` maps to existing outer box lifecycle logic.
 - `ploinky start <agent> [hostPort]` ensures the box exists and then runs
   `ploinky start <agent> 8080` inside `/workspace`.
+- `ploinky start` with no static agent remains valid existing syntax and is
+  forwarded as `ploinky start` inside `/workspace`.
 - `ploinky <anything-else>` ensures the box exists and then runs the same
   command inside `/workspace`.
 - `ploinky` with no arguments ensures the box exists and runs the in-box
@@ -144,7 +151,9 @@ In public `ploinky` mode:
 
 For `start`, the optional user-provided port remains the host-facing router port.
 Inside the box, the router is always started on port `8080`, matching the
-existing box contract.
+existing box contract. Start flags such as `--branch`, `--repo-branch`,
+`--branch-fallback`, and `--reset-repos` may appear before or after the port and
+must be forwarded to the in-box command unchanged.
 
 ## Shell and Aliases
 
@@ -157,6 +166,10 @@ normal Ploinky command. Inside the box, `PLOINKY_BOX=1` makes `bin/ploinky`
 execute the direct path, where the existing `sh`, `--shell`, and `-shell`
 shortcut routes to `bin/ploinky-shell`. This preserves shell behavior without
 starting host-mode agents.
+
+Interactive commands that naturally need a terminal, including `ploinky`,
+`ploinky cli`, `ploinky shell`, and `ploinky sh`, should use interactive engine
+exec (`-it`) when forwarding into the box.
 
 ## State and Storage Semantics
 
@@ -200,9 +213,20 @@ behavior:
 - Direct/development escape runs direct CLI without creating a box.
 - Host `ploinky start explorer 9090 --dry-run` translates to outer box startup
   on host port `9090` and in-box `ploinky start explorer 8080`.
-- Host `ploinky status --dry-run` is routed as an in-box `ploinky status`, not
-  as outer box status.
+- Host `ploinky --dry-run start explorer 9090 --branch feature-x` translates to
+  outer box startup on host port `9090` and in-box
+  `ploinky start explorer 8080 --branch feature-x`.
+- Host `ploinky start` is forwarded as an in-box `ploinky start` command instead
+  of failing in the wrapper.
+- Host `ploinky client tool process --dry-run` preserves `--dry-run` as an
+  in-box command argument instead of consuming it as a wrapper flag.
+- Host `ploinky --dry-run status` is routed as an in-box `ploinky status` in
+  wrapper dry-run mode, not as outer box status.
+- Host `ploinky status --dry-run` preserves `--dry-run` as an in-box command
+  argument instead of consuming it as a wrapper flag.
 - `ploinky box status --dry-run` targets outer box status.
+- `ploinky box --help`, `ploinky box help`, and unknown `ploinky-box` commands
+  show mode-appropriate help/guidance.
 - `ploinky` with no arguments maps to in-box interactive CLI.
 - `p-cli` and `psh` keep working through the new entrypoint.
 - `ploinky-box` compatibility commands remain available.
