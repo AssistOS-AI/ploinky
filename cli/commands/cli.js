@@ -9,6 +9,7 @@ import * as agentsSvc from '../services/agents.js';
 import { listRepos, listAgents, listCurrentAgents, listRoutes, statusWorkspace } from '../services/status.js';
 import { logsTail, showLast } from '../services/logUtils.js';
 import { startWorkspace, runCli, runShell, reinstallAgent } from '../services/workspaceUtil.js';
+import { withMaintenanceLock } from '../services/maintenanceLocks.js';
 import { refreshComponentToken, ensureComponentToken } from '../server/utils/routerEnv.js';
 import {
     getAgentContainerName,
@@ -468,7 +469,15 @@ async function handleCommand(args) {
                         const runtime = getRuntime();
                         console.log(`Starting (${runtime}) agent '${agentName}'...`);
                         try {
-                            execSync(`${runtime} start ${containerName}`, { stdio: 'inherit' });
+                            await withMaintenanceLock(containerName, {
+                                operation: 'start',
+                                metadata: {
+                                    agent: resolved.shortAgentName,
+                                    repo: resolved.repo,
+                                },
+                            }, async () => {
+                                execSync(`${runtime} start ${containerName}`, { stdio: 'inherit' });
+                            });
                             console.log('✓ Agent started.');
                         } catch (e) {
                             console.error(`Failed to start container ${containerName}: ${e.message}`);
@@ -478,64 +487,72 @@ async function handleCommand(args) {
 
                     console.log(`Restarting (${agentRuntime}) agent '${agentName}'...`);
 
-                    // Stop existing process (bwrap or container if transitioning)
-                    if (bwrapRunning) {
-                        stopBwrapProcess(resolved.shortAgentName);
-                    }
-                    if (containerAlsoRunning) {
-                        try {
-                            const { stopAndRemove } = await import('../services/docker/containerFleet.js');
-                            stopAndRemove(containerName);
-                        } catch (_) {}
-                    }
-
                     try {
-                        const agentPath = path.dirname(resolved.manifestPath);
-                        const { containerName: newContainerName, hostPort, additionalServerPort } = ensureAgentService(resolved.shortAgentName, manifest, agentPath, {
-                            containerName,
-                            alias: registryRecord?.record?.alias,
-                            forceRecreate: true
+                        await withMaintenanceLock(containerName, {
+                            operation: 'restart',
+                            metadata: {
+                                agent: resolved.shortAgentName,
+                                repo: resolved.repo,
+                            },
+                        }, async () => {
+                            // Stop existing process (bwrap or container if transitioning)
+                            if (bwrapRunning) {
+                                stopBwrapProcess(resolved.shortAgentName);
+                            }
+                            if (containerAlsoRunning) {
+                                try {
+                                    const { stopAndRemove } = await import('../services/docker/containerFleet.js');
+                                    stopAndRemove(containerName);
+                                } catch (_) {}
+                            }
+
+                            const agentPath = path.dirname(resolved.manifestPath);
+                            const { containerName: newContainerName, hostPort, additionalServerPort } = ensureAgentService(resolved.shortAgentName, manifest, agentPath, {
+                                containerName,
+                                alias: registryRecord?.record?.alias,
+                                forceRecreate: true
+                            });
+
+                            if (!hostPort) {
+                                throw new Error(`Failed to resolve host port for restarted agent '${resolved.shortAgentName}'.`);
+                            }
+
+                            try {
+                                const routingFile = ROUTING_FILE;
+                                let cfg = { routes: {} };
+                                try { cfg = JSON.parse(fs.readFileSync(routingFile, 'utf8')) || { routes: {} }; } catch (_) {}
+                                cfg.routes = cfg.routes || {};
+                                const repoName = registryRecord?.record?.repoName || resolved.repo;
+                                const routeKey = registryRecord?.record?.alias || resolved.shortAgentName;
+                                cfg.routes[routeKey] = cfg.routes[routeKey] || {};
+                                cfg.routes[routeKey].container = newContainerName;
+                                cfg.routes[routeKey].hostPath = agentPath;
+                                cfg.routes[routeKey].repo = repoName;
+                                cfg.routes[routeKey].agent = resolved.shortAgentName;
+                                if (registryRecord?.record?.alias) cfg.routes[routeKey].alias = registryRecord.record.alias;
+                                cfg.routes[routeKey].hostPort = hostPort;
+                                if (additionalServerPort) {
+                                    cfg.routes[routeKey].additionalServerPort = additionalServerPort;
+                                } else {
+                                    delete cfg.routes[routeKey].additionalServerPort;
+                                }
+
+                                const staticAgent = String(cfg.static?.agent || '').trim();
+                                if (staticAgent) {
+                                    const matches = new Set([resolved.shortAgentName, `${repoName}/${resolved.shortAgentName}`, `${repoName}:${resolved.shortAgentName}`]);
+                                    if (registryRecord?.record?.alias) {
+                                        matches.add(registryRecord.record.alias);
+                                    }
+                                    if (matches.has(staticAgent)) {
+                                        cfg.static.container = newContainerName;
+                                    }
+                                }
+
+                                fs.writeFileSync(routingFile, JSON.stringify(cfg, null, 2));
+                            } catch (routingError) {
+                                throw new Error(`routing update failed: ${routingError?.message || routingError}`);
+                            }
                         });
-
-                        if (!hostPort) {
-                            throw new Error(`Failed to resolve host port for restarted agent '${resolved.shortAgentName}'.`);
-                        }
-
-                        try {
-                            const routingFile = ROUTING_FILE;
-                            let cfg = { routes: {} };
-                            try { cfg = JSON.parse(fs.readFileSync(routingFile, 'utf8')) || { routes: {} }; } catch (_) {}
-                            cfg.routes = cfg.routes || {};
-                            const repoName = registryRecord?.record?.repoName || resolved.repo;
-                            const routeKey = registryRecord?.record?.alias || resolved.shortAgentName;
-                            cfg.routes[routeKey] = cfg.routes[routeKey] || {};
-                            cfg.routes[routeKey].container = newContainerName;
-                            cfg.routes[routeKey].hostPath = agentPath;
-                            cfg.routes[routeKey].repo = repoName;
-                            cfg.routes[routeKey].agent = resolved.shortAgentName;
-                            if (registryRecord?.record?.alias) cfg.routes[routeKey].alias = registryRecord.record.alias;
-                            cfg.routes[routeKey].hostPort = hostPort;
-                            if (additionalServerPort) {
-                                cfg.routes[routeKey].additionalServerPort = additionalServerPort;
-                            } else {
-                                delete cfg.routes[routeKey].additionalServerPort;
-                            }
-
-                            const staticAgent = String(cfg.static?.agent || '').trim();
-                            if (staticAgent) {
-                                const matches = new Set([resolved.shortAgentName, `${repoName}/${resolved.shortAgentName}`, `${repoName}:${resolved.shortAgentName}`]);
-                                if (registryRecord?.record?.alias) {
-                                    matches.add(registryRecord.record.alias);
-                                }
-                                if (matches.has(staticAgent)) {
-                                    cfg.static.container = newContainerName;
-                                }
-                            }
-
-                            fs.writeFileSync(routingFile, JSON.stringify(cfg, null, 2));
-                        } catch (routingError) {
-                            throw new Error(`routing update failed: ${routingError?.message || routingError}`);
-                        }
 
                         console.log(`✓ Agent restarted (${agentRuntime}).`);
                     } catch (e) {
@@ -554,54 +571,62 @@ async function handleCommand(args) {
                     const runtimeAction = containerRunning ? 'restart' : 'start';
                     console.log(`${containerRunning ? 'Restarting' : 'Starting'} (${runtime}) agent '${agentName}'...`);
                     try {
-                        execSync(`${runtime} ${runtimeAction} ${containerName}`, { stdio: 'inherit' });
-                        try {
-                            const { portMappings } = parseManifestPorts(manifest);
-                            const containerPortCandidates = portMappings
-                                .map((mapping) => mapping?.containerPort)
-                                .filter((port) => typeof port === 'number' && port > 0);
-                            if (!containerPortCandidates.includes(7000)) {
-                                containerPortCandidates.push(7000);
-                            }
-                            const hostPort = resolveHostPortFromRuntime(containerName, containerPortCandidates);
-                            if (hostPort) {
-                                let cfg = { routes: {} };
-                                try { cfg = JSON.parse(fs.readFileSync(ROUTING_FILE, 'utf8')) || { routes: {} }; } catch (_) {}
-                                cfg.routes = cfg.routes || {};
-                                const repoName = registryRecord?.record?.repoName || resolved.repo;
-                                const routeKey = registryRecord?.record?.alias || resolved.shortAgentName;
-                                cfg.routes[routeKey] = cfg.routes[routeKey] || {};
-                                cfg.routes[routeKey].container = containerName;
-                                cfg.routes[routeKey].hostPath = path.dirname(resolved.manifestPath);
-                                cfg.routes[routeKey].repo = repoName;
-                                cfg.routes[routeKey].agent = resolved.shortAgentName;
-                                if (registryRecord?.record?.alias) cfg.routes[routeKey].alias = registryRecord.record.alias;
-                                cfg.routes[routeKey].hostPort = hostPort;
-                                const activeProfile = getActiveProfile();
-                                const profileConfig = getProfileConfig(`${repoName}/${resolved.shortAgentName}`, activeProfile);
-                                const additionalServerPort = resolveProfileServer(manifest, profileConfig, { runtimeMode: 'container' });
-                                if (additionalServerPort) {
-                                    cfg.routes[routeKey].additionalServerPort = additionalServerPort;
-                                } else {
-                                    delete cfg.routes[routeKey].additionalServerPort;
+                        await withMaintenanceLock(containerName, {
+                            operation: runtimeAction,
+                            metadata: {
+                                agent: resolved.shortAgentName,
+                                repo: resolved.repo,
+                            },
+                        }, async () => {
+                            execSync(`${runtime} ${runtimeAction} ${containerName}`, { stdio: 'inherit' });
+                            try {
+                                const { portMappings } = parseManifestPorts(manifest);
+                                const containerPortCandidates = portMappings
+                                    .map((mapping) => mapping?.containerPort)
+                                    .filter((port) => typeof port === 'number' && port > 0);
+                                if (!containerPortCandidates.includes(7000)) {
+                                    containerPortCandidates.push(7000);
                                 }
+                                const hostPort = resolveHostPortFromRuntime(containerName, containerPortCandidates);
+                                if (hostPort) {
+                                    let cfg = { routes: {} };
+                                    try { cfg = JSON.parse(fs.readFileSync(ROUTING_FILE, 'utf8')) || { routes: {} }; } catch (_) {}
+                                    cfg.routes = cfg.routes || {};
+                                    const repoName = registryRecord?.record?.repoName || resolved.repo;
+                                    const routeKey = registryRecord?.record?.alias || resolved.shortAgentName;
+                                    cfg.routes[routeKey] = cfg.routes[routeKey] || {};
+                                    cfg.routes[routeKey].container = containerName;
+                                    cfg.routes[routeKey].hostPath = path.dirname(resolved.manifestPath);
+                                    cfg.routes[routeKey].repo = repoName;
+                                    cfg.routes[routeKey].agent = resolved.shortAgentName;
+                                    if (registryRecord?.record?.alias) cfg.routes[routeKey].alias = registryRecord.record.alias;
+                                    cfg.routes[routeKey].hostPort = hostPort;
+                                    const activeProfile = getActiveProfile();
+                                    const profileConfig = getProfileConfig(`${repoName}/${resolved.shortAgentName}`, activeProfile);
+                                    const additionalServerPort = resolveProfileServer(manifest, profileConfig, { runtimeMode: 'container' });
+                                    if (additionalServerPort) {
+                                        cfg.routes[routeKey].additionalServerPort = additionalServerPort;
+                                    } else {
+                                        delete cfg.routes[routeKey].additionalServerPort;
+                                    }
 
-                                const staticAgent = String(cfg.static?.agent || '').trim();
-                                if (staticAgent) {
-                                    const matches = new Set([resolved.shortAgentName, `${repoName}/${resolved.shortAgentName}`, `${repoName}:${resolved.shortAgentName}`]);
-                                    if (registryRecord?.record?.alias) {
-                                        matches.add(registryRecord.record.alias);
+                                    const staticAgent = String(cfg.static?.agent || '').trim();
+                                    if (staticAgent) {
+                                        const matches = new Set([resolved.shortAgentName, `${repoName}/${resolved.shortAgentName}`, `${repoName}:${resolved.shortAgentName}`]);
+                                        if (registryRecord?.record?.alias) {
+                                            matches.add(registryRecord.record.alias);
+                                        }
+                                        if (matches.has(staticAgent)) {
+                                            cfg.static.container = containerName;
+                                        }
                                     }
-                                    if (matches.has(staticAgent)) {
-                                        cfg.static.container = containerName;
-                                    }
+
+                                    fs.writeFileSync(ROUTING_FILE, JSON.stringify(cfg, null, 2));
                                 }
-
-                                fs.writeFileSync(ROUTING_FILE, JSON.stringify(cfg, null, 2));
+                            } catch (routeError) {
+                                console.warn(`[restart] Agent '${agentName}' restarted, but routing update failed: ${routeError?.message || routeError}`);
                             }
-                        } catch (routeError) {
-                            console.warn(`[restart] Agent '${agentName}' restarted, but routing update failed: ${routeError?.message || routeError}`);
-                        }
+                        });
                         console.log(`✓ Agent ${containerRunning ? 'restarted' : 'started'}.`);
                     } catch (e) {
                         console.error(`Failed to ${runtimeAction} container ${containerName}: ${e.message}`);

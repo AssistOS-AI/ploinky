@@ -5,6 +5,8 @@ import { fileURLToPath } from 'url';
 
 import * as workspaceSvc from '../services/workspace.js';
 import { REPOS_DIR, RUNNING_DIR } from '../services/config.js';
+import { mergeRoutingConfig } from '../services/routingFile.js';
+import { inspectMaintenanceLock } from '../services/maintenanceLocks.js';
 import { ensureAgentService, isContainerRunning } from '../services/docker/index.js';
 import { isSandboxRuntime } from '../services/docker/common.js';
 import { isBwrapProcessRunning } from '../services/bwrap/bwrapFleet.js';
@@ -46,6 +48,7 @@ function createContainerTarget(info, monitor) {
         containerName: info.containerName,
         agentName: info.agentName,
         repoName: info.repoName,
+        alias: info.alias || null,
         type: info.type,
         manifestPath: info.manifestPath,
         restartHistory: [],
@@ -213,6 +216,36 @@ function shouldDeferNoWaitRestart(monitor, target) {
     return true;
 }
 
+function shouldDeferMaintenanceRestart(monitor, target) {
+    const result = inspectMaintenanceLock(target?.containerName || '');
+    if (result.stale) {
+        logEvent(monitor, 'info', 'container_maintenance_lock_removed', {
+            container: target.containerName,
+            agent: target.agentName,
+            repo: target.repoName,
+            operation: result.lock?.operation || null,
+            ownerPid: result.lock?.ownerPid || null,
+            expiresAt: result.lock?.expiresAt || null
+        });
+    }
+    if (!result.active) {
+        target.maintenanceDeferred = false;
+        return false;
+    }
+    if (!target.maintenanceDeferred) {
+        target.maintenanceDeferred = true;
+        logEvent(monitor, 'info', 'container_restart_deferred_maintenance', {
+            container: target.containerName,
+            agent: target.agentName,
+            repo: target.repoName,
+            operation: result.lock?.operation || null,
+            ownerPid: result.lock?.ownerPid || null,
+            expiresAt: result.lock?.expiresAt || null
+        });
+    }
+    return true;
+}
+
 function syncManagedContainers(monitor) {
     const monitorRef = monitor;
     if (!monitorRef) return;
@@ -236,6 +269,7 @@ function syncManagedContainers(monitor) {
 
         const agentName = record.agentName || record.shortAgentName || null;
         const repoName = record.repoName || record.repo || null;
+        const alias = record.alias || null;
         if (!agentName || !repoName) continue;
 
         const manifestPath = path.join(REPOS_DIR, repoName, agentName, 'manifest.json');
@@ -250,7 +284,7 @@ function syncManagedContainers(monitor) {
         }
 
         const runtime = record.runtime || 'container';
-        const info = { containerName, type, agentName, repoName, manifestPath, runtime };
+        const info = { containerName, type, agentName, repoName, alias, manifestPath, runtime };
         desired.set(containerName, info);
 
         let target = monitorRef.targets.get(containerName);
@@ -267,6 +301,7 @@ function syncManagedContainers(monitor) {
         } else {
             target.agentName = agentName;
             target.repoName = repoName;
+            target.alias = alias;
             target.type = type;
             target.manifestPath = manifestPath;
             target.runtime = runtime;
@@ -322,11 +357,44 @@ function scheduleContainerRestart(monitor, target, reason) {
     target.isRestarting = true;
     target.pendingRestartTimer = setTimeout(() => {
         target.pendingRestartTimer = null;
-        performContainerRestart(monitor, target, reason);
+        performContainerRestart(monitor, target, reason).catch((error) => {
+            target.lastError = error?.message || error;
+            logEvent(monitor, 'error', 'container_restart_failed', {
+                container: target.containerName,
+                agent: target.agentName,
+                repo: target.repoName,
+                reason,
+                error: target.lastError
+            });
+            target.isRestarting = false;
+            scheduleContainerRestart(monitor, target, 'restart_failed');
+        });
     }, backoff);
 }
 
-function performContainerRestart(monitor, target, reason) {
+async function upsertRestartedContainerRoute(target, agentDir, result = {}) {
+    const routeKey = target.alias || target.agentName;
+    const route = {
+        container: result.containerName || target.containerName,
+        hostPath: agentDir,
+        repo: target.repoName,
+        agent: target.agentName,
+        ...(target.alias ? { alias: target.alias } : {}),
+        ...(result.hostPort ? { hostPort: result.hostPort } : {}),
+        additionalServerPort: result.additionalServerPort || null
+    };
+
+    await mergeRoutingConfig((cfg) => {
+        cfg.routes = cfg.routes || {};
+        cfg.routes[routeKey] = { ...(cfg.routes[routeKey] || {}), ...route };
+        if (route.additionalServerPort === null) {
+            delete cfg.routes[routeKey].additionalServerPort;
+        }
+        return cfg;
+    });
+}
+
+async function performContainerRestart(monitor, target, reason) {
     if (!monitor || !target) return;
     if (monitor.isShuttingDown()) {
         target.isRestarting = false;
@@ -379,6 +447,7 @@ function performContainerRestart(monitor, target, reason) {
             target.containerName = result.containerName;
             monitor.targets.set(target.containerName, target);
         }
+        await upsertRestartedContainerRoute(target, agentDir, result);
 
         stopProbeWorker(target);
         target.probeState = 'pending';
@@ -459,6 +528,10 @@ function monitorTick(monitor) {
         }
 
         if (target.probeState === 'running') {
+            continue;
+        }
+
+        if (shouldDeferMaintenanceRestart(monitor, target)) {
             continue;
         }
 

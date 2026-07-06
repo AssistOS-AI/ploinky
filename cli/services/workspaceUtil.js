@@ -16,6 +16,7 @@ import { getSecrets, createEnvWithSecrets, loadEnvFile } from './secretInjector.
 import { readSecretsFile } from './encryptedSecretsFile.js';
 import { buildEnvMap } from './secretVars.js';
 import { resolveAgentReadinessProtocol } from './startupReadiness.js';
+import { withMaintenanceLock } from './maintenanceLocks.js';
 import { LOGS_DIR, PLOINKY_CWD, PLOINKY_WORKSPACE_ROOT, ROUTING_FILE, RUNNING_DIR } from './config.js';
 import { classifyDependencyGraphWaitMode, resolveWorkspaceDependencyGraph, topologicallyGroupDependencyGraph } from './workspaceDependencyGraph.js';
 import { mergeRoutingConfig, readRoutingConfig } from './routingFile.js';
@@ -302,6 +303,30 @@ function buildReadinessEntryFromNode(node, route, staticLabel) {
     route,
     protocol: resolveAgentReadinessProtocol(node.manifest),
     timeoutMs,
+    intervalMs,
+    probeTimeoutMs
+  };
+}
+
+function resolveManifestReadinessWaitOptions(manifest, fallbackTimeoutMs = 120000) {
+  const probe = manifest?.health?.readiness && typeof manifest.health.readiness === 'object'
+    ? manifest.health.readiness
+    : null;
+  if (!probe) {
+    return {
+      timeoutMs: fallbackTimeoutMs,
+      intervalMs: 250,
+      probeTimeoutMs: 1000
+    };
+  }
+  const intervalSeconds = Number.parseInt(probe.interval ?? '1', 10);
+  const timeoutSeconds = Number.parseInt(probe.timeout ?? '1', 10);
+  const failureThreshold = Number.parseInt(probe.failureThreshold ?? '120', 10);
+  const intervalMs = Math.max(1, Number.isFinite(intervalSeconds) ? intervalSeconds : 1) * 1000;
+  const probeTimeoutMs = Math.max(1, Number.isFinite(timeoutSeconds) ? timeoutSeconds : 1) * 1000;
+  const attempts = Math.max(1, Number.isFinite(failureThreshold) ? failureThreshold : 120);
+  return {
+    timeoutMs: Math.max(fallbackTimeoutMs, attempts * (intervalMs + probeTimeoutMs)),
     intervalMs,
     probeTimeoutMs
   };
@@ -956,13 +981,16 @@ async function runShell(agentName) {
     : agentName;
   const { manifestPath, shortAgentName } = utils.findAgent(manifestLookup);
   const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
-  const { ensureAgentService, attachInteractive, getConfiguredProjectPath, getAgentContainerName } = dockerSvc;
+  const { ensureAgentService, attachInteractive, getConfiguredProjectPath, getAgentContainerName, isContainerRunning } = dockerSvc;
   const agentDir = path.dirname(manifestPath);
   const repoName = path.basename(path.dirname(agentDir));
-  const containerInfo = ensureAgentService(shortAgentName, manifest, agentDir, { containerName: registryRecord?.containerName, alias: registryRecord?.record?.alias });
-  const containerName = (containerInfo && containerInfo.containerName)
-    || registryRecord?.containerName
-    || getAgentContainerName(shortAgentName, repoName);
+  const registeredContainerName = registryRecord?.containerName || getAgentContainerName(shortAgentName, repoName);
+  let containerName = registeredContainerName;
+  if (!isContainerRunning(registeredContainerName)) {
+    const containerInfo = ensureAgentService(shortAgentName, manifest, agentDir, { containerName: registeredContainerName, alias: registryRecord?.record?.alias });
+    containerName = (containerInfo && containerInfo.containerName)
+      || registeredContainerName;
+  }
   const cmd = '/bin/sh';
   const projPath = getConfiguredProjectPath(shortAgentName, repoName, registryRecord?.record?.alias);
 
@@ -1041,29 +1069,36 @@ async function reinstallAgent(agentName) {
     console.log(`Reinstalling (re-creating) agent '${agentName}'...`);
 
     try {
-        const short = resolved.shortAgentName;
-        const agentPath = path.dirname(resolved.manifestPath);
+        await withMaintenanceLock(containerName, {
+            operation: 'reinstall',
+            metadata: {
+                agent: resolved.shortAgentName,
+                repo: resolved.repo,
+            },
+        }, async () => {
+            const short = resolved.shortAgentName;
+            const agentPath = path.dirname(resolved.manifestPath);
 
-        // Stop existing process (bwrap or container)
-        if (bwrapRunning) {
-            stopBwrapProcess(short);
-        }
-        stopAndRemove(containerName);
-        
-        const { containerName: newContainerName, hostPort, additionalServerPort } = await ensureAgentService(short, manifest, agentPath, {
-            containerName,
-            alias: registryRecord?.record?.alias,
-            forceRecreate: true
-        });
+            // Stop existing process (bwrap or container)
+            if (bwrapRunning) {
+                stopBwrapProcess(short);
+            }
+            stopAndRemove(containerName);
+            
+            const { containerName: newContainerName, hostPort, additionalServerPort } = await ensureAgentService(short, manifest, agentPath, {
+                containerName,
+                alias: registryRecord?.record?.alias,
+                forceRecreate: true
+            });
 
-        const readinessProtocol = resolveAgentReadinessProtocol(manifest);
-        if (!hostPort && readinessProtocol !== 'none') {
-            throw new Error(`Failed to resolve host port for restarted agent '${short}'.`);
-        }
-        console.log(`[reinstall] reinstalled '${short}' [container: ${newContainerName}]`);
+            const readinessProtocol = resolveAgentReadinessProtocol(manifest);
+            if (!hostPort && readinessProtocol !== 'none') {
+                throw new Error(`Failed to resolve host port for restarted agent '${short}'.`);
+            }
+            console.log(`[reinstall] reinstalled '${short}' [container: ${newContainerName}]`);
 
-        // Routing update logic from original restart command
-        try {
+            // Routing update logic from original restart command
+            try {
             const routingFile = ROUTING_FILE;
             let cfg = { routes: {} };
             try { cfg = JSON.parse(fs.readFileSync(routingFile, 'utf8')) || { routes: {} }; } catch(_) {}
@@ -1115,8 +1150,11 @@ async function reinstallAgent(agentName) {
             fs.writeFileSync(routingFile, JSON.stringify(cfg, null, 2));
 
             if (readinessProtocol !== 'none') {
+                const readinessWait = resolveManifestReadinessWaitOptions(manifest, 15000);
                 const ready = await waitForAgentReady({ hostPort }, {
-                    timeoutMs: 15000,
+                    timeoutMs: readinessWait.timeoutMs,
+                    intervalMs: readinessWait.intervalMs,
+                    probeTimeoutMs: readinessWait.probeTimeoutMs,
                     protocol: readinessProtocol,
                 });
                 if (!ready) {
@@ -1148,6 +1186,7 @@ async function reinstallAgent(agentName) {
         } catch (e) {
             console.error('[reinstall] routing update/router start failed:', e?.message||e);
         }
+        });
     } catch (e) {
         console.error(`[reinstall] ${agentName}: ${e?.message||e}`);
     }
