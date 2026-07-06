@@ -381,8 +381,14 @@ function askLine(promptText) {
     return new Promise((resolve) => {
         process.stdout.write(promptText);
         const rl = readline.createInterface({ input: process.stdin, terminal: false });
-        rl.once('line', (line) => { rl.close(); resolve(line); });
-        rl.once('close', () => resolve(null));
+        let settled = false;
+        const finish = (value) => {
+            if (settled) return;
+            settled = true;
+            resolve(value);
+        };
+        rl.once('line', (line) => { finish(line); rl.close(); });
+        rl.once('close', () => finish(null));
     });
 }
 
