@@ -10,6 +10,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { getCommandRegistry } from '../cli/services/commandRegistry.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const BOX = path.join(HERE, 'ploinky-box');
@@ -559,6 +560,24 @@ test('public start without an agent forwards in-box start instead of wrapper fai
     assert.equal(status, 0, out);
     checkIncludes(out, 'exec -w /workspace ploinky-box-qa ploinky start', 'start with no args is forwarded');
     checkAbsent(out, 'usage:', 'public start without args is not rejected by the wrapper');
+});
+
+test('public ploinky forwards every registered top-level CLI command into the box', () => {
+    const registry = getCommandRegistry();
+    assert.equal(registry.box, undefined, 'box is reserved for outer lifecycle commands');
+
+    for (const command of Object.keys(registry)) {
+        const { out, status } = publicRun('podman', '--name', 'qa', '--dry-run', command);
+        assert.equal(status, 0, `${command}\n${out}`);
+        checkIncludes(out, 'DRY-RUN: podman run -d', `${command}: public command ensures the box`);
+
+        const ttyFlag = (command === 'cli' || command === 'shell') ? '-it ' : '';
+        checkIncludes(
+            out,
+            `exec ${ttyFlag}-w /workspace ploinky-box-qa ploinky ${command}`,
+            `${command}: public command forwards to in-box ploinky`,
+        );
+    }
 });
 
 test('public parser preserves normal command flags after the command', () => {
