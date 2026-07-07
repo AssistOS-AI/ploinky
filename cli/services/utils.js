@@ -1,6 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import { REPOS_DIR, isDebugMode } from './config.js';
+import * as reposSvc from './repos.js';
 
 // Simple ANSI color helpers
 const ANSI = {
@@ -43,7 +44,11 @@ function findAgent(agentName) {
     if (!fs.existsSync(REPOS_DIR)) {
         throw new Error("Ploinky environment not initialized. No repos found.");
     }
-    const repos = fs.readdirSync(REPOS_DIR);
+    const installedRepos = fs.readdirSync(REPOS_DIR);
+    const enabledRepos = reposSvc.loadEnabledRepos();
+    const repos = enabledRepos.length
+        ? enabledRepos.filter(repo => installedRepos.includes(repo))
+        : installedRepos;
     debugLog(`Searching in repos: ${repos.join(', ')}`);
     for (const repo of repos) {
         const repoPath = path.join(REPOS_DIR, repo);

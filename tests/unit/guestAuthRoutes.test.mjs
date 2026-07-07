@@ -285,6 +285,33 @@ test('route default falls back to guest when no user-authenticated static agent 
     assert.deepEqual(decision, { access: 'guest', routeKey: 'webAdmin', source: 'routeDefault' });
 });
 
+test('auth mode none preserves valid local sessions for router policy', async (t) => {
+    const { authHandlers, localService } = await withAuthModules(t, { staticAuthMode: 'none' });
+    const token = localService.mintSessionJwt({
+        id: 'local:admin',
+        username: 'admin',
+        name: 'Local CLI',
+        email: '',
+        roles: ['user', 'admin'],
+    }, 1);
+    const req = makeRequest({
+        method: 'POST',
+        url: '/mcp',
+        cookie: `ploinky_jwt=${token}`,
+    });
+    const res = new MockResponse();
+    const parsedUrl = new URL(req.url, 'http://localhost');
+
+    const result = await authHandlers.ensureAuthenticated(req, res, parsedUrl);
+
+    assert.equal(result.ok, true);
+    assert.equal(req.authMode, 'local');
+    assert.equal(req.user?.username, 'admin');
+    assert.deepEqual(req.user?.roles, ['user', 'admin']);
+    assert.equal(res.statusCode, 200);
+    assert.equal(res.body, '');
+});
+
 test('ensureHttpRouteAccess denies none, deny, missing, and unknown decisions', async (t) => {
     const { authHandlers } = await withAuthModules(t);
     for (const decision of [

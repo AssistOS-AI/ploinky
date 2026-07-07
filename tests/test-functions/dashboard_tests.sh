@@ -6,16 +6,17 @@ assert_dashboard_status() {
     return 1
   fi
 
-  local secrets_file=".ploinky/.secrets"
-  if [[ ! -f "$secrets_file" ]]; then
-    echo "Secrets file ${secrets_file} is missing." >&2
+  local token token_line
+  if ! token_line=$(ploinky echo WEBDASHBOARD_TOKEN 2>/dev/null); then
+    echo "Failed to read WEBDASHBOARD_TOKEN via 'ploinky echo'." >&2
     return 1
   fi
-
-  local token
-  token=$(awk -F'=' '/^WEBDASHBOARD_TOKEN=/{print $2}' "$secrets_file" | tail -n1 | tr -d '\r')
+  token=$(printf '%s\n' "$token_line" \
+    | awk -F'=' '/^WEBDASHBOARD_TOKEN=/{print $2}' \
+    | tail -n1 \
+    | tr -d '\r')
   if [[ -z "$token" ]]; then
-    echo "Dashboard token not found in ${secrets_file}." >&2
+    echo "Dashboard token not found in 'ploinky echo WEBDASHBOARD_TOKEN' output." >&2
     return 1
   fi
 

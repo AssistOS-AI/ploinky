@@ -241,6 +241,25 @@ function addRepo(repoUrl, repoName = null, branch = null) {
     return installRepo(repoUrl, repoName, branch);
 }
 
+function enableRepo(repoName, branch = null) {
+    if (!repoName) throw new Error('Usage: enable repo <name> [--branch <branch>]');
+    const result = reposSvc.enableRepo(repoName, { branch });
+    const branchNote = result.branch && result.branch !== 'default' ? ` (branch: ${result.branch})` : '';
+    console.log(`✓ Repository '${result.name}' enabled${branchNote}.`);
+    return result;
+}
+
+function disableRepo(repoName) {
+    if (!repoName) throw new Error('Usage: disable repo <name>');
+    const result = reposSvc.disableRepo(repoName);
+    if (result.status === 'disabled') {
+        console.log(`✓ Repository '${result.name}' disabled.`);
+    } else {
+        console.log(`Repository '${result.name}' is not enabled in this workspace.`);
+    }
+    return result;
+}
+
 function uninstallRepo(target) {
     if (!target) throw new Error('Usage: uninstall repo <name|url>');
     const repoName = reposSvc.resolveInstalledRepoTarget(target);
@@ -512,6 +531,8 @@ export {
     getAgentNames,
     installRepo,
     addRepo,
+    enableRepo,
+    disableRepo,
     uninstallRepo,
     updateRepo,
     updatePloinkyRepos,

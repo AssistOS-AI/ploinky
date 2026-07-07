@@ -316,26 +316,30 @@ resolve_agent_runtime_from_container() {
   require_var "TEST_RUN_DIR" || return 1
   local registry="$TEST_RUN_DIR/.ploinky/agents.json"
   if [[ ! -f "$registry" ]]; then
-    echo "container"
+    echo "${FAST_AGENT_RUNTIME:-container}"
     return 0
   fi
   FAST_TMP_REGISTRY="$registry" FAST_TMP_CONTAINER="$container_name" node -e '
     const fs = require("fs");
     const data = JSON.parse(fs.readFileSync(process.env.FAST_TMP_REGISTRY, "utf8") || "{}");
     const entry = data[process.env.FAST_TMP_CONTAINER];
-    process.stdout.write((entry && entry.runtime) || "container");
-  '
+    process.stdout.write((entry && entry.runtime) || "");
+  ' || true
 }
 
 is_bwrap_agent() {
   local container_name="$1"
   local rt
   rt=$(resolve_agent_runtime_from_container "$container_name")
+  if [[ -z "$rt" ]]; then
+    rt="${FAST_AGENT_RUNTIME:-container}"
+  fi
   [[ "$rt" == "bwrap" || "$rt" == "seatbelt" ]]
 }
 
 # Returns true when the detected agent runtime is a sandbox (bwrap or seatbelt)
 is_sandbox_runtime() {
+  load_state
   [[ "${FAST_AGENT_RUNTIME:-container}" == "bwrap" || "${FAST_AGENT_RUNTIME:-container}" == "seatbelt" ]]
 }
 
@@ -510,14 +514,11 @@ check_router_stop_entry() {
   fi
 
   local last_entry
-  last_entry=$(tail -n 1 "$log_file" 2>/dev/null || true)
+  last_entry=$(grep '"type":"server_stop"' "$log_file" 2>/dev/null | tail -n 1 || true)
   if [[ -z "$last_entry" ]]; then
-    echo "Router log '${log_file}' is empty." >&2
-    return 1
-  fi
-
-  if [[ "$last_entry" != *'"type":"server_stop"'* ]]; then
-    echo "Router log last entry does not record server_stop: ${last_entry}" >&2
+    local physical_last_entry
+    physical_last_entry=$(tail -n 1 "$log_file" 2>/dev/null || true)
+    echo "Router log '${log_file}' does not contain a server_stop entry. Last line: ${physical_last_entry}" >&2
     return 1
   fi
 

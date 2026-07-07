@@ -268,8 +268,17 @@ async function applyManifestDirectivesInternal(agentNameOrPath, {
                         branch: resolvedBranch,
                         stdio: 'inherit',
                     });
+                    repos.enableRepo(name, {
+                        branch: resolvedBranch,
+                        branchPolicy,
+                        stdio: 'inherit',
+                    });
                 } else {
                     repos.ensureRepoInstalled(name, value, {
+                        branchPolicy,
+                        stdio: 'inherit',
+                    });
+                    repos.enableRepo(name, {
                         branchPolicy,
                         stdio: 'inherit',
                     });

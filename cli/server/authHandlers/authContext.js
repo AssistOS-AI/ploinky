@@ -321,14 +321,25 @@ async function ensureAuthenticatedWithContext(req, res, parsedUrl, authContext) 
         });
         return { ok: false, error: authContext.error };
     }
+    const cookies = parseCookies(req);
     if (authContext.mode === 'none') {
+        const localCookie = cookies.get(LOCAL_AUTH_COOKIE_NAME);
+        if (localCookie) {
+            const localSession = await sessionTokenService.getUserSession(localCookie, { policy: {} });
+            if (localSession) {
+                req.user = localSession.user;
+                req.session = localSession;
+                req.sessionId = localCookie;
+                req.authMode = 'local';
+                return { ok: true, session: localSession };
+            }
+        }
         return { ok: true };
     }
     if (authContext.mode === 'sso' && !authService.isConfigured()) {
         sendJson(res, 503, { ok: false, error: 'sso_not_configured' });
         return { ok: false, error: 'sso_not_configured' };
     }
-    const cookies = parseCookies(req);
 
     if (authContext.mode === 'guest') {
         const existingAuth = cookies.get(LOCAL_AUTH_COOKIE_NAME);

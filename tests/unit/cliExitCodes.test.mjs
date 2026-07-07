@@ -29,6 +29,7 @@ function runPloinky(t, args) {
         encoding: 'utf8',
         env: {
             ...process.env,
+            PLOINKY_DIRECT: '1',
             PLOINKY_WORKSPACE_ROOT: workspace,
             PLOINKY_MASTER_KEY: '5'.repeat(64),
         },
@@ -54,4 +55,25 @@ test('one-shot start without initial configuration exits nonzero', (t) => {
 
     assert.notEqual(result.status, 0);
     assert.match(`${result.stdout}\n${result.stderr}`, /missing static agent or port/);
+});
+
+test('enable repo marks an installed repository as enabled', (t) => {
+    const workspace = createWorkspace(t);
+    const repoName = 'testRepo';
+    fs.mkdirSync(path.join(workspace, '.ploinky', 'repos', repoName), { recursive: true });
+
+    const result = spawnSync(ploinkyBin, ['enable', 'repo', repoName], {
+        cwd: workspace,
+        encoding: 'utf8',
+        env: {
+            ...process.env,
+            PLOINKY_DIRECT: '1',
+            PLOINKY_WORKSPACE_ROOT: workspace,
+            PLOINKY_MASTER_KEY: '5'.repeat(64),
+        },
+    });
+
+    assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
+    const enabledPath = path.join(workspace, '.ploinky', 'enabled_repos.json');
+    assert.deepEqual(JSON.parse(fs.readFileSync(enabledPath, 'utf8')), [repoName]);
 });

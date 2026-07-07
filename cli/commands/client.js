@@ -3,6 +3,24 @@ import path from 'path';
 import { PLOINKY_DIR, ROUTING_FILE } from '../services/config.js';
 import { debugLog, parseParametersString } from '../services/utils.js';
 import { createAgentClient as createBrowserClient } from '../../Agent/client/MCPBrowserClient.js';
+import { mintSessionJwt } from '../server/auth/localService.js';
+
+const LOCAL_AUTH_COOKIE_NAME = 'ploinky_jwt';
+
+export function buildLocalCliSessionHeaders() {
+    try {
+        const token = mintSessionJwt({
+            id: 'local:admin',
+            username: 'admin',
+            name: 'Local CLI',
+            email: '',
+            roles: ['user', 'admin'],
+        }, 1);
+        return { cookie: `${LOCAL_AUTH_COOKIE_NAME}=${token}` };
+    } catch (_) {
+        return {};
+    }
+}
 
 class ClientCommands {
     constructor() {
@@ -57,7 +75,9 @@ class ClientCommands {
 
     async withRouterClient(fn) {
         const baseUrl = `http://127.0.0.1:${this.getRouterPort()}/mcp`;
-        const client = createBrowserClient(baseUrl);
+        const client = createBrowserClient(baseUrl, {
+            requestHeaders: buildLocalCliSessionHeaders(),
+        });
         try {
             return await fn(client);
         } finally {

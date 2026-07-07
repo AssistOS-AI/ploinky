@@ -3,6 +3,10 @@ import path from 'path';
 import { PLOINKY_DIR } from './config.js';
 
 function resolveWorkspaceRoot() {
+    const explicitRoot = String(process.env.PLOINKY_WORKSPACE_ROOT || '').trim();
+    if (explicitRoot) {
+        return path.resolve(explicitRoot);
+    }
     return path.dirname(PLOINKY_DIR);
 }
 

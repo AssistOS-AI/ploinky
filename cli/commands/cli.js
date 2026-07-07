@@ -32,6 +32,8 @@ import {
     getAgentNames,
     installRepo,
     addRepo,
+    enableRepo,
+    disableRepo,
     uninstallRepo,
     updateRepo,
     updatePloinkyRepos,
@@ -167,13 +169,18 @@ function parseInstallRepoArgs(options = []) {
         branch = tokens[branchIdx + 1];
         tokens.splice(branchIdx, 2);
     }
-    if (String(tokens[0] || '').toLowerCase() === 'repo') {
+    if (['repo', 'repository'].includes(String(tokens[0] || '').toLowerCase())) {
         tokens.shift();
     }
     const url = tokens[0];
     const name = tokens[1] || null;
     if (!branch && tokens[2]) branch = tokens[2];
     return { url, name, branch };
+}
+
+function parseRepoToggleArgs(options = []) {
+    const parsed = parseInstallRepoArgs(options);
+    return { repoName: parsed.url, branch: parsed.branch };
 }
 
 function parseUninstallRepoTarget(options = []) {
@@ -262,7 +269,11 @@ async function handleCommand(args) {
             break;
         }
         case 'enable':
-            if (options[0] === 'agent') {
+            if (String(options[0] || '').toLowerCase() === 'repo' || String(options[0] || '').toLowerCase() === 'repository') {
+                const parsed = parseRepoToggleArgs(options);
+                enableRepo(parsed.repoName, parsed.branch);
+            }
+            else if (options[0] === 'agent') {
                 const parsed = parseEnableAgentArgs(options.slice(1));
                 await enableAgent(parsed.agentName, parsed.mode, parsed.repoName, parsed.alias, parsed.authMode, parsed.username, parsed.password);
             }
@@ -292,6 +303,12 @@ async function handleCommand(args) {
 
             if (String(options[0] || '').toLowerCase() === 'agents-all') {
                 disableAllAgents();
+                break;
+            }
+
+            if (String(options[0] || '').toLowerCase() === 'repo' || String(options[0] || '').toLowerCase() === 'repository') {
+                const parsed = parseRepoToggleArgs(options);
+                disableRepo(parsed.repoName);
                 break;
             }
 
