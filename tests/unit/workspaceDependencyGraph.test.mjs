@@ -120,6 +120,24 @@ test('resolveWorkspaceDependencyGraph resolves same-repo bare dependencies when 
     assert.ok(graph.nodes.get('AchillesIDE/explorer').dependencies.has('AchillesIDE/gitAgent'));
 });
 
+test('resolveWorkspaceDependencyGraph leaves cross-repo bare dependencies available for global lookup', (t) => {
+    writeEnabledRepos(['appRepo']);
+    t.after(clearEnabledRepos);
+
+    writeManifest('toolsRepo', 'sharedTool', { container: 'node:20-alpine' });
+    writeManifest('appRepo', 'app', {
+        container: 'node:20-alpine',
+        enable: ['sharedTool global no-wait'],
+    });
+
+    const graph = resolveWorkspaceDependencyGraph({ staticAgentRef: 'appRepo/app' });
+
+    assert.ok(graph.nodes.has('toolsRepo/sharedTool'));
+    assert.equal(graph.nodes.get('toolsRepo/sharedTool').enableSpec, 'sharedTool global');
+    assert.ok(graph.nodes.get('appRepo/app').dependencies.has('toolsRepo/sharedTool'));
+    assert.equal(graph.nodes.get('appRepo/app').dependencyEdges.get('toolsRepo/sharedTool')?.noWait, true);
+});
+
 test('applyManifestDirectives resolves same-repo bare entries when enabled repos are filtered', async (t) => {
     writeEnabledRepos(['basic']);
     t.after(() => {
@@ -157,6 +175,45 @@ test('applyManifestDirectives resolves same-repo bare entries when enabled repos
     assert.equal(records[0].repoName, 'AchillesIDE');
     assert.equal(records[0].agentName, 'gitAgent');
     assert.equal(records[0].profile, 'embedded');
+});
+
+test('applyManifestDirectives leaves cross-repo bare entries available for global lookup', async (t) => {
+    writeEnabledRepos(['appRepo']);
+    t.after(() => {
+        clearEnabledRepos();
+        fs.rmSync(path.join(tempDir, '.ploinky', 'agents.json'), { force: true });
+    });
+
+    writeManifest('toolsRepo', 'sharedTool', { container: 'node:20-alpine' });
+    writeManifest('appRepo', 'app-bootstrap', {
+        container: 'node:20-alpine',
+        enable: [
+            {
+                agent: 'sharedTool global',
+                profile: 'utility',
+            },
+        ],
+    });
+    fs.writeFileSync(
+        path.join(tempDir, '.ploinky', 'agents.json'),
+        JSON.stringify({
+            existing_sharedTool: {
+                type: 'agent',
+                repoName: 'toolsRepo',
+                agentName: 'sharedTool',
+                config: {},
+            },
+        }, null, 2)
+    );
+
+    await applyManifestDirectives('appRepo/app-bootstrap');
+    const agents = JSON.parse(fs.readFileSync(path.join(tempDir, '.ploinky', 'agents.json'), 'utf8'));
+    const records = Object.values(agents).filter((record) => record?.type === 'agent');
+
+    assert.equal(records.length, 1);
+    assert.equal(records[0].repoName, 'toolsRepo');
+    assert.equal(records[0].agentName, 'sharedTool');
+    assert.equal(records[0].profile, 'utility');
 });
 
 test('resolveWorkspaceDependencyGraph respects SSO gating for provider dependencies', () => {

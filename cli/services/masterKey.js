@@ -75,7 +75,12 @@ function loadEnvFile(startDir = process.cwd()) {
 function resolveGeneratedMasterKeyRoot(startDir = process.cwd()) {
     const explicitRoot = String(process.env.PLOINKY_WORKSPACE_ROOT || '').trim();
     if (explicitRoot) {
-        return path.resolve(explicitRoot);
+        const normalizedExplicit = path.resolve(explicitRoot);
+        try {
+            if (fs.statSync(normalizedExplicit).isDirectory()) {
+                return normalizedExplicit;
+            }
+        } catch (_) { }
     }
 
     let current = path.resolve(startDir);
@@ -116,13 +121,15 @@ function writeGeneratedMasterKeySeed(filePath) {
         return generated;
     } catch (error) {
         if (error?.code === 'EEXIST') {
-            const existing = readGeneratedMasterKeySeed(filePath);
-            if (existing) {
-                return existing;
+            for (let attempt = 0; attempt < 50; attempt += 1) {
+                const existing = readGeneratedMasterKeySeed(filePath);
+                if (existing) {
+                    return existing;
+                }
+                const waitBuffer = new SharedArrayBuffer(4);
+                Atomics.wait(new Int32Array(waitBuffer), 0, 0, 10);
             }
-            fs.writeFileSync(filePath, `${generated}\n`, { encoding: 'utf8', mode: 0o600 });
-            try { fs.chmodSync(filePath, 0o600); } catch (_) { }
-            return generated;
+            throw new Error(`Generated master key file exists but is empty: ${filePath}`);
         }
         throw error;
     }
@@ -155,11 +162,12 @@ function warnGeneratedFallback({ purpose, source, filePath, error }) {
         return;
     }
     generatedFallbackWarningEmitted = true;
-    const detail = error
-        ? ` Could not persist ${filePath}: ${error?.message || String(error)}.`
-        : '';
+    const using = source === 'built-in fallback'
+        ? `using insecure built-in fallback seed because generated fallback could not be persisted at ${filePath}.`
+        : `using ${source} at ${filePath}.`;
+    const detail = error ? ` Could not persist ${filePath}: ${error?.message || String(error)}.` : '';
     console.error(
-        `[ploinky] ${MASTER_KEY_VAR} is not set for ${purpose}; using ${source} at ${filePath}.`
+        `[ploinky] ${MASTER_KEY_VAR} is not set for ${purpose}; ${using}`
         + `${detail} Set ${MASTER_KEY_VAR} in the process environment or a walked-up .env for an operator-managed key.`
     );
 }

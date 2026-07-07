@@ -740,16 +740,7 @@ export function resolveManifestImage(manifest, profileConfig, options = {}) {
     const raw = String(manifest?.container || manifest?.image || 'node:18-alpine');
     if (!raw.includes('${')) return raw;
 
-    let envMap = {};
-    try {
-        envMap = buildEnvMap(manifest, profileConfig, options);
-    } catch (error) {
-        const message = error?.message || String(error);
-        const secretsUnavailable = message.startsWith('PLOINKY_MASTER_KEY is required');
-        if (!secretsUnavailable) {
-            throw error;
-        }
-    }
+    const envMap = buildEnvMap(manifest, profileConfig, options);
 
     // Manifest env declarations carry their own defaults and do not require
     // secrets decryption. Read them directly so a non-templated default still

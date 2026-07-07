@@ -15,6 +15,7 @@ const ALGORITHM = 'aes-256-gcm';
 const IV_BYTES = 12;
 const TAG_BYTES = 16;
 const SUBKEY_PURPOSE = 'storage/passwords';
+const KEY_MISMATCH_HINT = 'Check PLOINKY_MASTER_KEY, any walked-up .env, and .ploinky/master-key; this store may have been written with a different master seed.';
 
 function defaultStore() {
     return {
@@ -93,7 +94,7 @@ function readPasswordStore() {
     try {
         plaintext = decryptPacked(raw);
     } catch (error) {
-        throw new Error(`Unable to decrypt encrypted password store: ${error?.message || String(error)}`);
+        throw new Error(`Unable to decrypt encrypted password store: ${error?.message || String(error)}. ${KEY_MISMATCH_HINT}`);
     }
     return normalizeStore(JSON.parse(plaintext.toString('utf8')));
 }

@@ -60,7 +60,7 @@ test('encrypted password store round-trips and enforces the master key', async (
     delete process.env.PLOINKY_MASTER_KEY;
     assert.throws(
         () => store.getUsersPayload('PLOINKY_AUTH_ALPHA_USERS'),
-        /Unable to decrypt encrypted password store/,
+        /Unable to decrypt encrypted password store: .*Check PLOINKY_MASTER_KEY.*\.env.*\.ploinky\/master-key/s,
         '.env uses a different key, so process env must have taken precedence while writing',
     );
 
@@ -72,7 +72,7 @@ test('encrypted password store round-trips and enforces the master key', async (
     writeFileSync(path.join(workspace, '.env'), '');
     assert.throws(
         () => store.getUsersPayload('PLOINKY_AUTH_ALPHA_USERS'),
-        /Unable to decrypt encrypted password store/,
+        /Unable to decrypt encrypted password store: .*Check PLOINKY_MASTER_KEY.*\.env.*\.ploinky\/master-key/s,
     );
 
     // Arbitrary strings are now accepted as seeds, so the wrong seed produces
@@ -80,6 +80,6 @@ test('encrypted password store round-trips and enforces the master key', async (
     process.env.PLOINKY_MASTER_KEY = 'abc';
     assert.throws(
         () => store.getUsersPayload('PLOINKY_AUTH_ALPHA_USERS'),
-        /Unable to decrypt encrypted password store/,
+        /Unable to decrypt encrypted password store: .*Check PLOINKY_MASTER_KEY.*\.env.*\.ploinky\/master-key/s,
     );
 });

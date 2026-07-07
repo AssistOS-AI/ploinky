@@ -81,7 +81,7 @@ test('resolveMasterKey warns when using the built-in fallback seed', async () =>
             errors.some((m) => (
                 m.includes('[ploinky]')
                 && m.includes(MASTER_KEY_VAR)
-                && m.includes('built-in fallback')
+                && m.includes('insecure built-in fallback seed')
                 && m.includes('Could not persist')
                 && m.includes('Set PLOINKY_MASTER_KEY')
             )),
@@ -89,6 +89,62 @@ test('resolveMasterKey warns when using the built-in fallback seed', async () =>
         );
     } finally {
         console.error = originalError;
+        process.chdir(previousCwd);
+        if (previousRoot === undefined) {
+            delete process.env.PLOINKY_WORKSPACE_ROOT;
+        } else {
+            process.env.PLOINKY_WORKSPACE_ROOT = previousRoot;
+        }
+        fs.rmSync(workspace, { recursive: true, force: true });
+    }
+});
+
+test('resolveMasterKey ignores stale explicit workspace roots that are not directories', async () => {
+    const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-mkey-root-'));
+    const previousCwd = process.cwd();
+    const previousRoot = process.env.PLOINKY_WORKSPACE_ROOT;
+    try {
+        fs.mkdirSync(path.join(workspace, '.ploinky'), { recursive: true });
+        process.chdir(workspace);
+        process.env.PLOINKY_WORKSPACE_ROOT = path.join(workspace, 'missing-root');
+
+        const freshModule = await importFreshMasterKeyModule('stale-workspace-root');
+        freshModule.resolveMasterKey();
+
+        assert.equal(fs.existsSync(path.join(workspace, '.ploinky', 'master-key')), true);
+        assert.equal(fs.existsSync(path.join(workspace, 'missing-root')), false);
+    } finally {
+        process.chdir(previousCwd);
+        if (previousRoot === undefined) {
+            delete process.env.PLOINKY_WORKSPACE_ROOT;
+        } else {
+            process.env.PLOINKY_WORKSPACE_ROOT = previousRoot;
+        }
+        fs.rmSync(workspace, { recursive: true, force: true });
+    }
+});
+
+test('resolveMasterKey does not overwrite an empty generated key file', async () => {
+    const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-mkey-empty-'));
+    const previousCwd = process.cwd();
+    const previousRoot = process.env.PLOINKY_WORKSPACE_ROOT;
+    try {
+        const keyPath = path.join(workspace, '.ploinky', 'master-key');
+        fs.mkdirSync(path.dirname(keyPath), { recursive: true });
+        fs.writeFileSync(keyPath, '');
+        process.chdir(workspace);
+        process.env.PLOINKY_WORKSPACE_ROOT = workspace;
+
+        const freshModule = await importFreshMasterKeyModule('empty-generated-key');
+        const key = freshModule.resolveMasterKey();
+        const expected = crypto
+            .createHash('sha256')
+            .update('ploinky-default-master-key-v1', 'utf8')
+            .digest();
+
+        assert.deepEqual(key, expected);
+        assert.equal(fs.readFileSync(keyPath, 'utf8'), '');
+    } finally {
         process.chdir(previousCwd);
         if (previousRoot === undefined) {
             delete process.env.PLOINKY_WORKSPACE_ROOT;

@@ -70,6 +70,13 @@ function isPrefixedAgentToken(token) {
     return String(token || '').includes('/') || String(token || '').includes(':');
 }
 
+function hasSameRepoBareAgent(repoName, agentName) {
+    const repo = String(repoName || '').trim();
+    const agent = String(agentName || '').trim();
+    if (!repo || !agent) return false;
+    return fs.existsSync(path.join(PLOINKY_DIR, 'repos', repo, agent, 'manifest.json'));
+}
+
 export function qualifyEnableSpecForRepo(spec, repoName) {
     const raw = String(spec || '').trim();
     const repo = String(repoName || '').trim();
@@ -77,6 +84,9 @@ export function qualifyEnableSpecForRepo(spec, repoName) {
 
     const tokens = raw.split(/\s+/).filter(Boolean);
     if (!tokens.length || isPrefixedAgentToken(tokens[0])) {
+        return raw;
+    }
+    if (!hasSameRepoBareAgent(repo, tokens[0])) {
         return raw;
     }
     return [`${repo}/${tokens[0]}`, ...tokens.slice(1)].join(' ');
