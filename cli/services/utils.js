@@ -46,20 +46,29 @@ function findAgent(agentName) {
     }
     const installedRepos = fs.readdirSync(REPOS_DIR);
     const enabledRepos = reposSvc.loadEnabledRepos();
-    const repos = enabledRepos.length
+    const primaryRepos = enabledRepos.length
         ? enabledRepos.filter(repo => installedRepos.includes(repo))
         : installedRepos;
-    debugLog(`Searching in repos: ${repos.join(', ')}`);
-    for (const repo of repos) {
-        const repoPath = path.join(REPOS_DIR, repo);
-        if (fs.statSync(repoPath).isDirectory()) {
-            const agentPath = path.join(repoPath, agentName);
-            const manifestPath = path.join(agentPath, 'manifest.json');
-            if (fs.existsSync(manifestPath)) {
-                debugLog(`Found potential match in repo '${repo}': ${manifestPath}`);
-                foundAgents.push({ manifestPath, repo: repo, shortAgentName: agentName });
+    const searchRepos = (repos, label) => {
+        debugLog(`Searching ${label} repos: ${repos.join(', ')}`);
+        for (const repo of repos) {
+            const repoPath = path.join(REPOS_DIR, repo);
+            if (fs.statSync(repoPath).isDirectory()) {
+                const agentPath = path.join(repoPath, agentName);
+                const manifestPath = path.join(agentPath, 'manifest.json');
+                if (fs.existsSync(manifestPath)) {
+                    debugLog(`Found potential match in repo '${repo}': ${manifestPath}`);
+                    foundAgents.push({ manifestPath, repo: repo, shortAgentName: agentName });
+                }
             }
         }
+    };
+
+    searchRepos(primaryRepos, enabledRepos.length ? 'enabled' : 'installed');
+    if (foundAgents.length === 0 && enabledRepos.length) {
+        const primaryRepoSet = new Set(primaryRepos);
+        const fallbackRepos = installedRepos.filter(repo => !primaryRepoSet.has(repo));
+        searchRepos(fallbackRepos, 'inactive installed');
     }
 
     if (foundAgents.length === 0) {

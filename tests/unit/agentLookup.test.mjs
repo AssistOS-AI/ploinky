@@ -47,6 +47,36 @@ process.stdout.write(JSON.stringify(found));
     }
 });
 
+test('bare agent lookup falls back to inactive installed repos when enabled repos have no match', () => {
+    const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-agent-lookup-'));
+    try {
+        writeManifest(workspace, 'AchillesIDE', 'explorer');
+        writeManifest(workspace, 'basic', 'webtty');
+        fs.writeFileSync(
+            path.join(workspace, '.ploinky', 'enabled_repos.json'),
+            JSON.stringify(['basic'], null, 2),
+        );
+
+        const result = spawnSync(process.execPath, ['--input-type=module', '-e', `
+const { findAgent } = await import(${JSON.stringify(utilsUrl)});
+const found = findAgent('explorer');
+process.stdout.write(JSON.stringify(found));
+`], {
+            cwd: workspace,
+            encoding: 'utf8',
+            env: {
+                ...process.env,
+                PLOINKY_WORKSPACE_ROOT: workspace,
+            },
+        });
+
+        assert.equal(result.status, 0, result.stderr);
+        assert.equal(JSON.parse(result.stdout).repo, 'AchillesIDE');
+    } finally {
+        fs.rmSync(workspace, { recursive: true, force: true });
+    }
+});
+
 test('manifest repos are enabled even when their checkouts already exist', () => {
     const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-manifest-repos-'));
     try {
