@@ -72,7 +72,7 @@ test('encrypted password store round-trips and enforces the master key', async (
     writeFileSync(path.join(workspace, '.env'), '');
     assert.throws(
         () => store.getUsersPayload('PLOINKY_AUTH_ALPHA_USERS'),
-        /PLOINKY_MASTER_KEY is required/,
+        /Unable to decrypt encrypted password store/,
     );
 
     // Arbitrary strings are now accepted as seeds, so the wrong seed produces

@@ -3,6 +3,10 @@ import fs from 'fs';
 import path from 'path';
 
 const MASTER_KEY_VAR = 'PLOINKY_MASTER_KEY';
+const GENERATED_MASTER_KEY_FILE = 'master-key';
+const BUILT_IN_FALLBACK_MASTER_KEY_SEED = 'ploinky-default-master-key-v1';
+
+let generatedFallbackWarningEmitted = false;
 
 function parseKeyValueText(raw = '') {
     const result = {};
@@ -68,6 +72,98 @@ function loadEnvFile(startDir = process.cwd()) {
     return envPath ? parseKeyValueFile(envPath) : {};
 }
 
+function resolveGeneratedMasterKeyRoot(startDir = process.cwd()) {
+    const explicitRoot = String(process.env.PLOINKY_WORKSPACE_ROOT || '').trim();
+    if (explicitRoot) {
+        return path.resolve(explicitRoot);
+    }
+
+    let current = path.resolve(startDir);
+    while (true) {
+        try {
+            if (fs.statSync(path.join(current, '.ploinky')).isDirectory()) {
+                return current;
+            }
+        } catch (_) { }
+
+        const parent = path.dirname(current);
+        if (parent === current) {
+            return path.resolve(startDir);
+        }
+        current = parent;
+    }
+}
+
+function resolveGeneratedMasterKeyPath(startDir = process.cwd()) {
+    return path.join(resolveGeneratedMasterKeyRoot(startDir), '.ploinky', GENERATED_MASTER_KEY_FILE);
+}
+
+function readGeneratedMasterKeySeed(filePath) {
+    try {
+        const raw = String(fs.readFileSync(filePath, 'utf8') || '').trim();
+        return raw || '';
+    } catch (_) {
+        return '';
+    }
+}
+
+function writeGeneratedMasterKeySeed(filePath) {
+    const generated = crypto.randomBytes(32).toString('hex');
+    fs.mkdirSync(path.dirname(filePath), { recursive: true });
+    try {
+        fs.writeFileSync(filePath, `${generated}\n`, { encoding: 'utf8', mode: 0o600, flag: 'wx' });
+        try { fs.chmodSync(filePath, 0o600); } catch (_) { }
+        return generated;
+    } catch (error) {
+        if (error?.code === 'EEXIST') {
+            const existing = readGeneratedMasterKeySeed(filePath);
+            if (existing) {
+                return existing;
+            }
+            fs.writeFileSync(filePath, `${generated}\n`, { encoding: 'utf8', mode: 0o600 });
+            try { fs.chmodSync(filePath, 0o600); } catch (_) { }
+            return generated;
+        }
+        throw error;
+    }
+}
+
+function resolveGeneratedMasterKeySeed(startDir = process.cwd()) {
+    const filePath = resolveGeneratedMasterKeyPath(startDir);
+    const existing = readGeneratedMasterKeySeed(filePath);
+    if (existing) {
+        return { seed: existing, filePath, source: 'existing generated fallback' };
+    }
+    try {
+        return {
+            seed: writeGeneratedMasterKeySeed(filePath),
+            filePath,
+            source: 'generated fallback',
+        };
+    } catch (error) {
+        return {
+            seed: BUILT_IN_FALLBACK_MASTER_KEY_SEED,
+            filePath,
+            source: 'built-in fallback',
+            error,
+        };
+    }
+}
+
+function warnGeneratedFallback({ purpose, source, filePath, error }) {
+    if (generatedFallbackWarningEmitted) {
+        return;
+    }
+    generatedFallbackWarningEmitted = true;
+    const detail = error
+        ? ` Could not persist ${filePath}: ${error?.message || String(error)}.`
+        : '';
+    console.error(
+        `[ploinky] ${MASTER_KEY_VAR} is not set for ${purpose}; using ${source} at ${filePath}.`
+        + `${detail} Set ${MASTER_KEY_VAR} in the process environment or a walked-up .env for an operator-managed key.`
+    );
+}
+
 function resolveMasterKey({ purpose = 'Ploinky encrypted storage' } = {}) {
     let raw = String(process.env[MASTER_KEY_VAR] || '').trim();
     if (!raw) {
@@ -77,9 +173,9 @@ function resolveMasterKey({ purpose = 'Ploinky encrypted storage' } = {}) {
         raw = String(loadEnvFile()[MASTER_KEY_VAR] || '').trim();
     }
     if (!raw) {
-        const message = `${MASTER_KEY_VAR} is required for ${purpose}. Set it in the process environment or define it in a .env walked upward from the current directory.`;
-        console.error(`[ploinky] ${message}`);
-        throw new Error(message);
+        const fallback = resolveGeneratedMasterKeySeed();
+        raw = fallback.seed;
+        warnGeneratedFallback({ purpose, ...fallback });
     }
     return crypto.createHash('sha256').update(raw, 'utf8').digest();
 }
@@ -89,7 +185,7 @@ function resolveMasterKey({ purpose = 'Ploinky encrypted storage' } = {}) {
 // directly. Domain separation is carried in the `info` parameter so that
 // rotating one purpose (by bumping its version segment) cannot collide with
 // another. Empty salt is fine because the master key is already a
-// SHA-256 digest of the operator-supplied seed.
+// SHA-256 digest of the resolved workspace seed.
 function deriveSubkey(purpose, length = 32) {
     const trimmedPurpose = String(purpose || '').trim();
     if (!trimmedPurpose) {

@@ -27,18 +27,22 @@ test.beforeEach(() => {
     delete process.env[MASTER_KEY_VAR];
 });
 
-test('resolveMasterKey throws and logs when neither process.env nor .env defines the key', () => {
+test('resolveMasterKey creates a persistent fallback when neither process.env nor .env defines the key', () => {
     const errors = [];
     const originalError = console.error;
     console.error = (msg) => { errors.push(String(msg)); };
     try {
-        assert.throws(
-            () => resolveMasterKey(),
-            /PLOINKY_MASTER_KEY is required.*\.env walked upward/
-        );
+        const key = resolveMasterKey();
+        const fallbackSeedPath = path.join(tempDir, '.ploinky', 'master-key');
+        const fallbackSeed = fs.readFileSync(fallbackSeedPath, 'utf8').trim();
+        const expected = crypto.createHash('sha256').update(fallbackSeed, 'utf8').digest();
+        assert.equal(key.length, 32);
+        assert.match(fallbackSeed, /^[0-9a-f]{64}$/);
+        assert.deepEqual(key, expected);
+        assert.deepEqual(resolveMasterKey(), expected);
         assert.ok(
-            errors.some((m) => m.includes('[ploinky]') && m.includes(MASTER_KEY_VAR)),
-            'expected an error to be logged via console.error'
+            errors.some((m) => m.includes('[ploinky]') && m.includes(MASTER_KEY_VAR) && m.includes('generated fallback')),
+            'expected a generated fallback warning to be logged via console.error'
         );
     } finally {
         console.error = originalError;

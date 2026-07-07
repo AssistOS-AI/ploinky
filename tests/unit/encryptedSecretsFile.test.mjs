@@ -74,7 +74,7 @@ test('encrypted .secrets round-trips and enforces the master key', async (t) => 
     writeFileSync(path.join(workspace, '.env'), '');
     assert.throws(
         () => store.readSecretsFile(),
-        /PLOINKY_MASTER_KEY is required/,
+        /Unable to decrypt \.ploinky\/\.secrets/,
     );
 
     // Arbitrary strings are now accepted as seeds, so the wrong seed produces
@@ -85,4 +85,3 @@ test('encrypted .secrets round-trips and enforces the master key', async (t) => 
         /Unable to decrypt .ploinky\/.secrets/,
     );
 });
-

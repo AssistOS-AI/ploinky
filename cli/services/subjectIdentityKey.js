@@ -61,7 +61,8 @@ function resolveKeypairStoreFile() {
 }
 
 function getStorageKey() {
-    // Requires PLOINKY_MASTER_KEY; resolveMasterKey throws a clear error if absent.
+    // Explicit PLOINKY_MASTER_KEY / .env values win; otherwise masterKey.js
+    // provides the workspace fallback seed used by the rest of Ploinky.
     resolveConfiguredMasterKey({ purpose: 'subject identity signing keypair storage' });
     return deriveSubkey(SUBKEY_PURPOSE);
 }

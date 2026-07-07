@@ -29,10 +29,9 @@ export function buildAgentIdentityEnv(principalId) {
     }
     // `id` is the canonical `agent:<repo>/<agentName>` subject, so we can sign it
     // directly.
-    // NOTE: `buildSubjectIdentityKey`/`getSubjectIdentityPublicKey` widen the throw
-    // surface beyond the prior master-key-absence path — they also touch the
-    // encrypted keypair store (.ploinky/), so corrupt/unwritable key material now
-    // throws here too. The docker/bwrap/lifecycle callers swallow this throw and
+    // NOTE: `buildSubjectIdentityKey`/`getSubjectIdentityPublicKey` touch the
+    // encrypted keypair store (.ploinky/), so corrupt/unwritable key material can
+    // still throw here. The docker/bwrap/lifecycle callers swallow this throw and
     // continue, which means a key-store fault degrades an agent to no-identity
     // rather than failing startup; fail-closing that path is a separate change.
     const apiKey = buildSubjectIdentityKey(id);
