@@ -8,7 +8,7 @@ import { fileURLToPath } from 'node:url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(__dirname, '../..');
-const ploinkyBin = path.join(repoRoot, 'bin', 'ploinky');
+const cliEntry = path.join(repoRoot, 'cli', 'index.js');
 const bootRepos = ['basic', 'AchillesIDE', 'AchillesCLI', 'copilot-agents'];
 
 function createWorkspace(t) {
@@ -24,12 +24,11 @@ function createWorkspace(t) {
 
 function runPloinky(t, args) {
     const workspace = createWorkspace(t);
-    return spawnSync(ploinkyBin, args, {
+    return spawnSync(process.execPath, [cliEntry, ...args], {
         cwd: workspace,
         encoding: 'utf8',
         env: {
             ...process.env,
-            PLOINKY_DIRECT: '1',
             PLOINKY_WORKSPACE_ROOT: workspace,
             PLOINKY_MASTER_KEY: '5'.repeat(64),
         },
@@ -62,12 +61,11 @@ test('enable repo marks an installed repository as enabled', (t) => {
     const repoName = 'testRepo';
     fs.mkdirSync(path.join(workspace, '.ploinky', 'repos', repoName), { recursive: true });
 
-    const result = spawnSync(ploinkyBin, ['enable', 'repo', repoName], {
+    const result = spawnSync(process.execPath, [cliEntry, 'enable', 'repo', repoName], {
         cwd: workspace,
         encoding: 'utf8',
         env: {
             ...process.env,
-            PLOINKY_DIRECT: '1',
             PLOINKY_WORKSPACE_ROOT: workspace,
             PLOINKY_MASTER_KEY: '5'.repeat(64),
         },

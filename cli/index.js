@@ -19,12 +19,17 @@ const COMMANDS = getCommandRegistry();
 const PLOINKY_ROOT = process.env.PLOINKY_ROOT || path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
 function assertRuntimeDependencies() {
-    const agentLibPath = path.join(PLOINKY_ROOT, 'node_modules', 'achillesAgentLib');
-    try {
-        if (fs.statSync(agentLibPath).isDirectory()) return;
-    } catch (_) {}
-    console.error(`Ploinky dependency missing: ${agentLibPath}`);
-    console.error(`Run 'npm install' from ${PLOINKY_ROOT} before running ploinky.`);
+    const missing = ['achillesAgentLib', 'mcp-sdk'].filter((dep) => {
+        try {
+            return !fs.statSync(path.join(PLOINKY_ROOT, 'node_modules', dep)).isDirectory();
+        } catch (_) {
+            return true;
+        }
+    });
+    if (missing.length === 0) return;
+    console.error(`Ploinky dependencies missing: ${missing.map((dep) => path.join(PLOINKY_ROOT, 'node_modules', dep)).join(', ')}`);
+    console.error('WARNING: Ploinky cannot run until dependencies are installed.');
+    console.error(`Install them with: ${path.join(PLOINKY_ROOT, 'bin', 'ploinky-install-deps')}`);
     process.exit(1);
 }
 

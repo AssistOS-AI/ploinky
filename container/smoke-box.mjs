@@ -19,12 +19,16 @@ const AGENT = process.env.SMOKE_AGENT || 'webtty';
 const USE_PUBLIC_PLOINKY = process.env.SMOKE_PUBLIC_PLOINKY === '1';
 let failed = 0;
 
+// Smoke runs non-interactively; PLOINKY_BOX_INSTALL_DEPS=1 is the explicit
+// opt-in that lets the wrapper install ploinky deps on first up without a TTY.
+const SMOKE_ENV = { ...process.env, PLOINKY_BOX_INSTALL_DEPS: '1' };
+
 function box(...args) {
-    return spawnSync(BOX, args, { stdio: 'inherit' }).status === 0;
+    return spawnSync(BOX, args, { stdio: 'inherit', env: SMOKE_ENV }).status === 0;
 }
 
 function publicPloinky(...args) {
-    return spawnSync(PUBLIC_PLOINKY, args, { stdio: 'inherit' }).status === 0;
+    return spawnSync(PUBLIC_PLOINKY, args, { stdio: 'inherit', env: SMOKE_ENV }).status === 0;
 }
 
 function step(desc, ok) {

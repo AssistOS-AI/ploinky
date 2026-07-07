@@ -10,14 +10,41 @@ done
 SCRIPT_DIR="$(cd -P "$(dirname "$SCRIPT_PATH")" >/dev/null 2>&1 && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-if [[ "${PLOINKY_BOX:-}" == "1" || "${PLOINKY_DIRECT:-}" == "1" ]]; then
-    exec "$SCRIPT_DIR/ploinky-direct" "$@"
+if ! command -v node >/dev/null 2>&1; then
+    echo "ploinky: node >= 20 is required (https://nodejs.org)." >&2
+    exit 1
 fi
 
-if ! command -v node >/dev/null 2>&1; then
-    echo "ploinky: node >= 20 is required for the boxed wrapper (https://nodejs.org)." >&2
-    echo "Inside the box, or with PLOINKY_DIRECT=1, ploinky runs the direct Node CLI." >&2
-    exit 1
+# Single entry: inside the ploinky-box image (marker baked by its Dockerfile)
+# ploinky IS the direct CLI; everywhere else it drives the boxed runtime.
+if [[ -f /etc/ploinky-box ]]; then
+    export PLOINKY_ROOT="$ROOT_DIR"
+
+    deps_missing=0
+    [[ -d "$PLOINKY_ROOT/node_modules/achillesAgentLib" ]] || deps_missing=1
+    [[ -d "$PLOINKY_ROOT/node_modules/mcp-sdk" ]] || deps_missing=1
+    if [[ "$deps_missing" == "1" ]]; then
+        # First-run flow: ask on a TTY, never install silently. Non-interactive
+        # contexts (podman exec without -t, scripts, CI) default to "no".
+        answer="n"
+        if [[ -t 0 ]]; then
+            printf 'Ploinky dependencies are not installed. Install them now? [y/N] ' >&2
+            read -r answer || answer="n"
+        fi
+        if [[ "$answer" =~ ^[yY]$ ]]; then
+            "$SCRIPT_DIR/ploinky-install-deps"
+        else
+            echo "WARNING: Ploinky cannot run until dependencies are installed." >&2
+            echo "Install them with: $SCRIPT_DIR/ploinky-install-deps" >&2
+            exit 1
+        fi
+    fi
+
+    if [[ "${1:-}" == "-shell" || "${1:-}" == "sh" || "${1:-}" == "--shell" ]]; then
+        shift
+        exec "$SCRIPT_DIR/ploinky-shell" "$@"
+    fi
+    exec node "$PLOINKY_ROOT/cli/index.js" "$@"
 fi
 
 export PLOINKY_PUBLIC_ENTRYPOINT=1

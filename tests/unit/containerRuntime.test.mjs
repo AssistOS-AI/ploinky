@@ -88,12 +88,14 @@ process.stdout.write(JSON.stringify(buildRuntimeRouterEnv('docker')));`,
 test('buildRuntimeNetworkPlan downgrades named podman networks inside ploinky-box', () => {
     const workspaceDir = tempDir();
     try {
+        const markerPath = `${workspaceDir}/ploinky-box-marker`;
+        fs.writeFileSync(markerPath, 'assistos/ploinky-box\n');
         const result = runModuleSnippet(
             `const { buildRuntimeNetworkPlan } = await import(${JSON.stringify(agentServiceManagerUrl)});
 const plan = buildRuntimeNetworkPlan('podman', {
   name: 'webmeet',
   aliases: ['liveKitServerAgent', 'webmeetAgent'],
-}, { env: { PLOINKY_BOX: '1' } });
+}, { boxMarkerPath: ${JSON.stringify(markerPath)} });
 process.stdout.write(JSON.stringify(plan));`,
             {},
             { cwd: workspaceDir },
@@ -188,22 +190,23 @@ process.stdout.write(JSON.stringify(parseManifestPorts(manifest, profile)));`,
     }
 });
 
-test('parseManifestPorts rejects legacy profile ports field', () => {
+test('parseManifestPorts accepts legacy profile ports field for existing agents', () => {
     const workspaceDir = tempDir();
     try {
         const result = runModuleSnippet(
             `const { parseManifestPorts } = await import(${JSON.stringify(dockerCommonUrl)});
-try {
-  parseManifestPorts({}, { ports: ['127.0.0.1:0:9000'] });
-} catch (err) {
-  process.stdout.write(err.message);
-}`,
+process.stdout.write(JSON.stringify(parseManifestPorts({}, { ports: ['127.0.0.1:0:9000'] })));`,
             {},
             { cwd: workspaceDir },
         );
 
         assert.equal(result.status, 0, result.stderr);
-        assert.match(result.stdout, /renamed to 'openPorts'/);
+        assert.deepEqual(JSON.parse(result.stdout), {
+            publishArgs: ['127.0.0.1::9000'],
+            portMappings: [
+                { hostPort: 0, containerPort: 9000, hostIp: '127.0.0.1', protocol: 'tcp' },
+            ],
+        });
     } finally {
         fs.rmSync(workspaceDir, { recursive: true, force: true });
     }

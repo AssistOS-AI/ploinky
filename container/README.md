@@ -1,9 +1,11 @@
 # Boxed Ploinky Runtime
 
 Run the entire Ploinky runtime isolated inside one rootless-podman container.
-The host needs podman (preferred) or docker, plus Node >= 20 to run the
-wrapper — no git, no ploinky checkout. Agents run as nested containers
-*inside* the box; nothing they do touches the host filesystem.
+The host needs podman (preferred) or docker, Node >= 20 to run the wrapper,
+and a local ploinky checkout: the box does not bake Ploinky core -- the wrapper
+bind-mounts your checkout read-only at `/opt/ploinky` inside the box. Agents
+run as nested containers *inside* the box; nothing they do touches the host
+filesystem.
 
 `ploinky` is the preferred public entrypoint when using this checkout. It runs
 normal Ploinky commands through the boxed runtime by default. `ploinky-box`
@@ -11,20 +13,18 @@ remains as a compatibility and diagnostic command for the wrapper itself.
 
 ## Quick start
 
+    git clone https://github.com/AssistOS-AI/ploinky ~/work/ploinky
     cd ~/work/myProject
-    curl -fsSL https://raw.githubusercontent.com/AssistOS-AI/ploinky/master/container/ploinky-box -o ploinky-box
-    curl -fsSL https://raw.githubusercontent.com/AssistOS-AI/ploinky/master/container/ploinky-box.mjs -o ploinky-box.mjs
-    chmod +x ploinky-box
-    ./ploinky-box start webtty    # box 'ploinky-box-myProject': up + start webtty + router probe
+    ~/work/ploinky/bin/ploinky start webtty   # box 'ploinky-box-myProject': up + start webtty + router probe
     open http://127.0.0.1:8080/status
 
-The agent must exist in a repo known to the box. Ploinky auto-clones its default
-repos (basic, AchillesIDE, AchillesCLI, copilot-agents) on first use, so the
-box needs outbound network on first `up`; `webtty` ships in `basic`.
-`start <agent>` enables the agent automatically when its repo is known to the
-box. Agents from non-default repos still need the repo added first (via `cli`).
-Pick agents whose image contains node: ploinky's runtime-key probe execs `node`
-inside the agent image and node-less images (e.g. plain alpine) fail to start.
+On the first run the box has no Ploinky dependencies yet; the wrapper asks
+`Ploinky dependencies are not installed. Install them now? [y/N]` and installs
+them into the box's dependency volume when you confirm. Decline (or run
+without a terminal) and ploinky exits non-zero with a warning until you
+install. Set `PLOINKY_BOX_INSTALL_DEPS=1` to opt into automatic install in
+scripts, or run the installer yourself:
+`<engine> exec -it <instance> /opt/ploinky/bin/ploinky-install-deps`.
 
 ## Instances
 
@@ -38,7 +38,8 @@ Every command targets one instance:
 Inferred names are sanitized (`[^a-zA-Z0-9_.-]` becomes `_`, capped at 63
 chars, case preserved): `~/work/testExplorerFresh` →
 `ploinky-box-testExplorerFresh` with volumes
-`ploinky-box-testExplorerFresh-workspace` / `-containers`. Directories whose
+`ploinky-box-testExplorerFresh-workspace` / `-containers` / `-ploinky-deps`.
+Directories whose
 basename has no ASCII letters or digits at all cannot be inferred — pass
 `--name`. Two directories with the same basename map to the SAME instance
 (inference reads only the basename); disambiguate with `--name`. Explicit
@@ -67,6 +68,22 @@ needed by WebMeet rooms/media. Existing boxes keep their original port mappings;
 run `ploinky-box update` with the same flags, or recreate the box, when you add
 new published ports.
 
+## Host-mounted core and the dependency volume
+
+The box mounts your ploinky checkout read-only at `/opt/ploinky` (resolved
+from the wrapper's own location; override with `PLOINKY_BOX_SOURCE=/path`).
+Core code edits on the host are visible inside the running box immediately --
+no image rebuild. Because the source is read-only, npm dependencies live in a
+writable named volume `<instance>-ploinky-deps` mounted at
+`/opt/ploinky/node_modules`; host-side `node_modules` content is shadowed and
+never used in-box. `stop`/`update` keep the volume; `destroy` removes it.
+
+There is no direct-mode escape and no legacy env-var routing: on hosts
+`ploinky` always drives the box, and inside the box image (marker file
+`/etc/ploinky-box`, baked by the Dockerfile) the same `ploinky` script is the
+direct CLI. For CLI development on the host without the box, run
+`node cli/index.js` from the checkout.
+
 ## Public `ploinky` Command
 
 Bare `ploinky ...` commands keep their existing Ploinky meaning and execute
@@ -91,7 +108,7 @@ ploinky box destroy
 ```
 
 `ploinky destroy` runs the normal in-box Ploinky destroy command. `ploinky box
-destroy` removes the outer container and the two named volumes for the selected
+destroy` removes the outer container and the three named volumes for the selected
 instance.
 
 Box selector flags such as `--name` and `--port` can appear before or after a
@@ -132,8 +149,10 @@ reports SELinux enabled — e.g. the podman-machine VM on macOS, even though the
 Mac itself has no SELinux). The only crossings of the boundary are: published ports
 (loopback-only unless `--listen-lan`), explicit `cp`, and the opt-in `--mount DIR`
 (bind-mounted read-write at `/workspace/mounted` — you are piercing the sandbox).
-State lives in two named volumes per instance: `<instance>-workspace`
-(the Ploinky workspace) and `<instance>-containers` (nested agent images).
+The ploinky source mount is read-only and is not a crossing: nothing in the box
+can write through it. State lives in three named volumes per instance:
+`<instance>-workspace` (the Ploinky workspace), `<instance>-containers` (nested
+agent images), and `<instance>-ploinky-deps` (Ploinky's npm dependencies).
 `stop`/`update` keep them; only `destroy` deletes them.
 
 Agent containers inside the box are disposable: every box start wipes stale
@@ -143,16 +162,19 @@ first attempt a graceful in-box `ploinky stop`.
 
 ## Limitations
 
-- In-box `ploinky update` cannot update the baked runtime (read-only,
-  `.git` stripped); update the box itself with `ploinky-box update`.
+- Ploinky core is supplied by the host checkout (mounted read-only), so
+  in-box `ploinky update` cannot modify core code either -- update the
+  checkout on the host with git; running boxes see edits immediately.
+  `ploinky box update` still refreshes the runtime image itself.
+- On macOS, the ploinky checkout (like `--mount` directories) must live under
+  the podman-machine / Docker Desktop file share (default: your home
+  directory).
 - `additionalServerPort` in `container` mode relies on inspect-derived
   container IPs, which rootless podman does not expose; use `host` mode for
   such agents. Smoke result 2026-07-03 (macOS 26.5.2, podman machine 5.8.2):
   WebSocket/additional-port check skipped because `SMOKE_WS_AGENT` was not set.
 - Agents with `lite-sandbox: true` (bwrap/seatbelt) are unsupported inside
   the box in v1.
-- On macOS, `--mount` directories must live under the podman-machine /
-  Docker Desktop file share (default: your home directory).
 - Linux-host smoke not yet executed (verified on macOS only as of 2026-07-03).
 - Windows hosts are unsupported.
 - The wrapper itself needs Node >= 20 on the host (`ploinky-box` is a thin
@@ -164,9 +186,11 @@ Smoke verified on macOS 26.5.2 / podman machine (podman 5.8.2) on 2026-07-03.
 ## Image provenance
 
 `docker.io/assistos/ploinky-box:podman-node24`, built by
-`publish-ploinky-box-image.yml` in `AssistOS-AI/container-image-builds` from a
-submodule-pinned ploinky checkout. Rebuild/publish:
+`publish-ploinky-box-image.yml` in `AssistOS-AI/container-image-builds`. The
+image is runtime-only (Node 24, npm, git, nested podman, slirp4netns, plus
+the `/etc/ploinky-box` marker file): it contains no Ploinky source; the
+wrapper supplies core code via the read-only host mount. Rebuild/publish:
 
     gh workflow run publish-ploinky-box-image.yml \
       --repo AssistOS-AI/container-image-builds \
-      -f source_ref=master -f image_tag=podman-node24
+      -f image_tag=podman-node24

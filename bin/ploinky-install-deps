@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+# Install Ploinky's runtime dependencies (node_modules/achillesAgentLib and
+# node_modules/mcp-sdk). Safe for the ploinky-box layout where the checkout is
+# mounted read-only and node_modules is a writable volume: nothing outside
+# node_modules is written (npm runs with --no-package-lock).
+set -euo pipefail
+
+SCRIPT_PATH="${BASH_SOURCE[0]}"
+while [[ -L "$SCRIPT_PATH" ]]; do
+    SCRIPT_DIR="$(cd -P "$(dirname "$SCRIPT_PATH")" >/dev/null 2>&1 && pwd)"
+    SCRIPT_PATH="$(readlink "$SCRIPT_PATH")"
+    [[ "$SCRIPT_PATH" != /* ]] && SCRIPT_PATH="$SCRIPT_DIR/$SCRIPT_PATH"
+done
+SCRIPT_DIR="$(cd -P "$(dirname "$SCRIPT_PATH")" >/dev/null 2>&1 && pwd)"
+PLOINKY_ROOT="${PLOINKY_ROOT:-$(cd "$SCRIPT_DIR/.." && pwd)}"
+DEPS_DIR="$PLOINKY_ROOT/node_modules"
+
+if [[ -d "$DEPS_DIR/achillesAgentLib" && -d "$DEPS_DIR/mcp-sdk" ]]; then
+    echo "ploinky-install-deps: dependencies already present under $DEPS_DIR"
+    exit 0
+fi
+
+mkdir -p "$DEPS_DIR" 2>/dev/null || true
+if [[ ! -d "$DEPS_DIR" || ! -w "$DEPS_DIR" ]]; then
+    echo "ploinky-install-deps: $DEPS_DIR is not writable." >&2
+    echo "Inside ploinky-box this is the '<instance>-ploinky-deps' volume; recreate the box if its ownership is wrong." >&2
+    exit 1
+fi
+
+install_args=(install --no-package-lock --no-audit --no-fund)
+
+allow_achilles_reset=0
+if [[ "${PLOINKY_INSTALL_DEPS_ALLOW_RESET:-}" == "1" || -f /etc/ploinky-box ]]; then
+    allow_achilles_reset=1
+fi
+
+if [[ -d "$DEPS_DIR/achillesAgentLib" && ! -d "$DEPS_DIR/mcp-sdk" && "$allow_achilles_reset" == "1" ]]; then
+    # Inside ploinky-box this path is a disposable dependency volume. A leftover
+    # partial directory makes postinstall's clone fail, so reset it.
+    rm -rf "$DEPS_DIR/achillesAgentLib"
+elif [[ -d "$DEPS_DIR/achillesAgentLib" && ! -d "$DEPS_DIR/mcp-sdk" ]]; then
+    # On a host checkout, achillesAgentLib may be a load-bearing source tree
+    # with local changes. Preserve it and install the missing package without
+    # running package.json postinstall, which would try to clone over it.
+    install_args=(install --ignore-scripts --no-package-lock --no-audit --no-fund)
+elif [[ -d "$DEPS_DIR/achillesAgentLib" ]]; then
+    if [[ "$allow_achilles_reset" == "1" ]]; then
+        # Inside ploinky-box this path is a disposable dependency volume. A
+        # leftover partial directory makes postinstall's clone fail, so reset it.
+        rm -rf "$DEPS_DIR/achillesAgentLib"
+    else
+        echo "ploinky-install-deps: refusing to remove existing $DEPS_DIR/achillesAgentLib outside ploinky-box." >&2
+        echo "Run npm install --ignore-scripts --no-package-lock --no-audit --no-fund to preserve that checkout." >&2
+        exit 1
+    fi
+fi
+
+(cd "$PLOINKY_ROOT" && npm "${install_args[@]}")
+
+for dep in achillesAgentLib mcp-sdk; do
+    if [[ ! -d "$DEPS_DIR/$dep" ]]; then
+        echo "ploinky-install-deps: $DEPS_DIR/$dep still missing after npm install." >&2
+        exit 1
+    fi
+done
+echo "ploinky-install-deps: dependencies installed under $DEPS_DIR"

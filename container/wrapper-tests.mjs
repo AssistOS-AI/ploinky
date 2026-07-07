@@ -13,11 +13,13 @@ import { fileURLToPath } from 'node:url';
 import { getCommandRegistry } from '../cli/services/commandRegistry.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
+const REPO_ROOT = path.resolve(HERE, '..');
 const BOX = path.join(HERE, 'ploinky-box');
 const MJS = path.join(HERE, 'ploinky-box.mjs');
 const PLOINKY = path.join(HERE, '..', 'bin', 'ploinky');
 const PCLI = path.join(HERE, '..', 'bin', 'p-cli');
 const PSH = path.join(HERE, '..', 'bin', 'psh');
+const INSTALL_DEPS = path.join(HERE, '..', 'bin', 'ploinky-install-deps');
 
 function makeFakeNodeCapture() {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-node-'));
@@ -34,10 +36,6 @@ for arg in "$@"; do
 done
 printf '],"PLOINKY_PUBLIC_ENTRYPOINT":' >> ${JSON.stringify(capture)}
 ${JSON.stringify(realNode)} -e 'process.stdout.write(JSON.stringify(process.env.PLOINKY_PUBLIC_ENTRYPOINT || ""))' >> ${JSON.stringify(capture)}
-printf ',"PLOINKY_BOX":' >> ${JSON.stringify(capture)}
-${JSON.stringify(realNode)} -e 'process.stdout.write(JSON.stringify(process.env.PLOINKY_BOX || ""))' >> ${JSON.stringify(capture)}
-printf ',"PLOINKY_DIRECT":' >> ${JSON.stringify(capture)}
-${JSON.stringify(realNode)} -e 'process.stdout.write(JSON.stringify(process.env.PLOINKY_DIRECT || ""))' >> ${JSON.stringify(capture)}
 printf '}' >> ${JSON.stringify(capture)}
 exit 0
 `);
@@ -113,8 +111,79 @@ function checkAbsent(out, needle, description) {
     assert.ok(!out.includes(needle), `${description} (found forbidden '${needle}')\n  in: ${out}`);
 }
 
+// Fake checkout + fake npm: asserts the exact install flags and that the
+// script verifies both dependency dirs afterwards.
+function makeFakeCheckout({ npmCreatesDeps, npmBody = '' }) {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-fake-root-'));
+    fs.mkdirSync(path.join(root, 'bin'));
+    fs.copyFileSync(INSTALL_DEPS, path.join(root, 'bin', 'ploinky-install-deps'));
+    fs.chmodSync(path.join(root, 'bin', 'ploinky-install-deps'), 0o755);
+    fs.writeFileSync(path.join(root, 'package.json'), '{"name":"fake"}\n');
+    const binDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-fake-npm-'));
+    const argsFile = path.join(binDir, 'npm-args.txt');
+    fs.writeFileSync(path.join(binDir, 'npm'), `#!/usr/bin/env bash
+echo "$@" >> ${JSON.stringify(argsFile)}
+${npmBody || (npmCreatesDeps ? `mkdir -p "$PWD/node_modules/achillesAgentLib" "$PWD/node_modules/mcp-sdk"` : 'true')}
+`);
+    fs.chmodSync(path.join(binDir, 'npm'), 0o755);
+    return { root, binDir, argsFile };
+}
+
+function makeFakePodmanForMissingDeps() {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-fake-podman-'));
+    const calls = path.join(dir, 'calls.log');
+    const state = path.join(dir, 'state');
+    const podman = path.join(dir, 'podman');
+    fs.writeFileSync(podman, `#!/usr/bin/env bash
+printf '%s\\n' "$*" >> ${JSON.stringify(calls)}
+state_file=${JSON.stringify(state)}
+case "$1 $2" in
+  "machine inspect")
+    echo running
+    exit 0
+    ;;
+  "container inspect")
+    if [ -f "$state_file" ]; then
+      if [ "$3" = "--format" ]; then echo running; fi
+      exit 0
+    fi
+    exit 1
+    ;;
+  "image inspect")
+    exit 0
+    ;;
+  "info --format")
+    echo false
+    exit 0
+    ;;
+  "run -d")
+    echo running > "$state_file"
+    echo fake-container-id
+    exit 0
+    ;;
+  "logs ploinky-box-qa")
+    echo "self-check OK"
+    exit 0
+    ;;
+  "exec ploinky-box-qa")
+    exit 1
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+`);
+    fs.chmodSync(podman, 0o755);
+    return { dir, calls };
+}
+
 test('entrypoint bash syntax check (bash -n)', () => {
     const r = spawnSync('bash', ['-n', BOX], { encoding: 'utf8' });
+    assert.equal(r.status, 0, r.stderr);
+});
+
+test('ploinky-install-deps bash syntax check (bash -n)', () => {
+    const r = spawnSync('bash', ['-n', INSTALL_DEPS], { encoding: 'utf8' });
     assert.equal(r.status, 0, r.stderr);
 });
 
@@ -126,55 +195,12 @@ test('public bin/ploinky delegates to the box wrapper on the host', () => {
             PATH: `${fake.dir}:${process.env.PATH || ''}`,
             PLOINKY_BOX_ENGINE: 'podman',
         };
-        delete env.PLOINKY_BOX;
-        delete env.PLOINKY_DIRECT;
         const r = spawnSync(PLOINKY, ['status', '--dry-run'], { encoding: 'utf8', env });
         assert.equal(r.status, 0, `${r.stdout}${r.stderr}`);
         const captured = readCapture(fake.capture);
         assert.ok(captured.argv[0].endsWith('/container/ploinky-box.mjs'), captured.argv);
         assert.deepEqual(captured.argv.slice(1), ['status', '--dry-run']);
         assert.equal(captured.PLOINKY_PUBLIC_ENTRYPOINT, '1');
-    } finally {
-        fs.rmSync(fake.dir, { recursive: true, force: true });
-    }
-});
-
-test('bin/ploinky runs direct CLI inside the box', () => {
-    const fake = makeFakeNodeCapture();
-    try {
-        const env = {
-            ...process.env,
-            PATH: `${fake.dir}:${process.env.PATH || ''}`,
-            PLOINKY_BOX: '1',
-        };
-        delete env.PLOINKY_DIRECT;
-        const r = spawnSync(PLOINKY, ['status'], { encoding: 'utf8', env });
-        assert.equal(r.status, 0, `${r.stdout}${r.stderr}`);
-        const captured = readCapture(fake.capture);
-        assert.ok(captured.argv[0].endsWith('/cli/index.js'), captured.argv);
-        assert.deepEqual(captured.argv.slice(1), ['status']);
-        assert.equal(captured.PLOINKY_BOX, '1');
-        assert.equal(captured.PLOINKY_PUBLIC_ENTRYPOINT, '');
-    } finally {
-        fs.rmSync(fake.dir, { recursive: true, force: true });
-    }
-});
-
-test('bin/ploinky supports explicit PLOINKY_DIRECT escape on the host', () => {
-    const fake = makeFakeNodeCapture();
-    try {
-        const env = {
-            ...process.env,
-            PATH: `${fake.dir}:${process.env.PATH || ''}`,
-            PLOINKY_DIRECT: '1',
-        };
-        delete env.PLOINKY_BOX;
-        const r = spawnSync(PLOINKY, ['list', 'agents'], { encoding: 'utf8', env });
-        assert.equal(r.status, 0, `${r.stdout}${r.stderr}`);
-        const captured = readCapture(fake.capture);
-        assert.ok(captured.argv[0].endsWith('/cli/index.js'), captured.argv);
-        assert.deepEqual(captured.argv.slice(1), ['list', 'agents']);
-        assert.equal(captured.PLOINKY_DIRECT, '1');
     } finally {
         fs.rmSync(fake.dir, { recursive: true, force: true });
     }
@@ -191,36 +217,11 @@ test('bin/ploinky resolves its repo root when invoked through a symlink', () => 
             PATH: `${fake.dir}:${process.env.PATH || ''}`,
             PLOINKY_BOX_ENGINE: 'podman',
         };
-        delete env.PLOINKY_BOX;
-        delete env.PLOINKY_DIRECT;
         const r = spawnSync(link, ['status', '--dry-run'], { encoding: 'utf8', env });
         assert.equal(r.status, 0, `${r.stdout}${r.stderr}`);
         const captured = readCapture(fake.capture);
         assert.equal(captured.argv[0], MJS);
         assert.deepEqual(captured.argv.slice(1), ['status', '--dry-run']);
-    } finally {
-        fs.rmSync(fake.dir, { recursive: true, force: true });
-        fs.rmSync(linkDir, { recursive: true, force: true });
-    }
-});
-
-test('bin/ploinky direct mode resolves through a symlink', () => {
-    const fake = makeFakeNodeCapture();
-    const linkDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-link-'));
-    const link = path.join(linkDir, 'ploinky');
-    try {
-        fs.symlinkSync(PLOINKY, link);
-        const env = {
-            ...process.env,
-            PATH: `${fake.dir}:${process.env.PATH || ''}`,
-            PLOINKY_DIRECT: '1',
-        };
-        delete env.PLOINKY_BOX;
-        const r = spawnSync(link, ['status'], { encoding: 'utf8', env });
-        assert.equal(r.status, 0, `${r.stdout}${r.stderr}`);
-        const captured = readCapture(fake.capture);
-        assert.equal(captured.argv[0], path.join(HERE, '..', 'cli', 'index.js'));
-        assert.deepEqual(captured.argv.slice(1), ['status']);
     } finally {
         fs.rmSync(fake.dir, { recursive: true, force: true });
         fs.rmSync(linkDir, { recursive: true, force: true });
@@ -236,8 +237,6 @@ test('p-cli still delegates through bin/ploinky', () => {
             PATH: `${fake.dir}:${process.env.PATH || ''}`,
             PLOINKY_BOX_ENGINE: 'podman',
         };
-        delete env.PLOINKY_BOX;
-        delete env.PLOINKY_DIRECT;
         const r = spawnSync(PCLI, ['status', '--dry-run'], { encoding: 'utf8', env });
         assert.equal(r.status, 0, `${r.stdout}${r.stderr}`);
         const captured = readCapture(fake.capture);
@@ -261,8 +260,6 @@ test('p-cli resolves its repo root when invoked through a symlink', () => {
             PATH: `${fake.dir}:${process.env.PATH || ''}`,
             PLOINKY_BOX_ENGINE: 'podman',
         };
-        delete env.PLOINKY_BOX;
-        delete env.PLOINKY_DIRECT;
         const r = spawnSync(link, ['status'], { encoding: 'utf8', env });
         assert.equal(r.status, 0, `${r.stdout}${r.stderr}`);
         const captured = readCapture(fake.capture);
@@ -287,8 +284,6 @@ test('psh delegates to ploinky sh through a symlink', () => {
             PATH: `${fake.dir}:${process.env.PATH || ''}`,
             PLOINKY_BOX_ENGINE: 'podman',
         };
-        delete env.PLOINKY_BOX;
-        delete env.PLOINKY_DIRECT;
         const r = spawnSync(link, ['--dry-run'], { encoding: 'utf8', env });
         assert.equal(r.status, 0, `${r.stdout}${r.stderr}`);
         const captured = readCapture(fake.capture);
@@ -314,7 +309,9 @@ test('inferred up: cwd basename drives names; isolation contract holds', () => {
         checkIncludes(out, '127.0.0.1:8080:8080', 'inferred up publishes loopback 8080');
         checkIncludes(out, 'ploinky-box-testExplorerFresh-workspace:/workspace', 'inferred up mounts workspace volume');
         checkIncludes(out, 'ploinky-box-testExplorerFresh-containers:/home/podman/.local/share/containers', 'inferred up mounts containers volume');
-        checkIncludes(out, '-e PLOINKY_BOX=1', 'inferred up marks box runtime');
+        checkIncludes(out, `-v ${path.resolve(HERE, '..')}:/opt/ploinky:ro`, 'inferred up mounts the host checkout read-only');
+        checkIncludes(out, 'ploinky-box-testExplorerFresh-ploinky-deps:/opt/ploinky/node_modules:U', 'inferred up mounts the writable deps volume');
+        checkAbsent(out, 'PLOINKY_BOX=', 'in-box routing uses the image marker file, not an env var');
         checkIncludes(out, 'docker.io/assistos/ploinky-box:podman-node24', 'inferred up uses default image');
         checkIncludes(out, '--init', 'inferred up reaps zombies');
         checkAbsent(out, '--privileged', 'no --privileged, ever');
@@ -328,6 +325,7 @@ test('named up: docker engine, instance prefixes, LAN bind', () => {
     checkIncludes(out, 'DRY-RUN: docker', 'named up uses docker when forced');
     checkIncludes(out, '--name ploinky-box-qa', 'named up names the instance');
     checkIncludes(out, 'ploinky-box-qa-workspace:/workspace', 'named up prefixes volumes');
+    checkIncludes(out, 'ploinky-box-qa-ploinky-deps:/opt/ploinky/node_modules', 'named up mounts deps volume');
     checkIncludes(out, '0.0.0.0:9090:8080', 'lan flag binds all interfaces');
     checkAbsent(out, '--privileged', 'named up still not privileged');
 });
@@ -362,6 +360,76 @@ test('cp maps box: prefix to instance', () => {
     checkIncludes(out, 'cp /tmp/f ploinky-box-qa:/workspace/f', 'cp maps box: prefix to instance');
 });
 
+test('ploinky-install-deps installs with read-only-safe npm flags and verifies deps', () => {
+    const { root, binDir, argsFile } = makeFakeCheckout({ npmCreatesDeps: true });
+    try {
+        const env = { ...process.env, PATH: `${binDir}:${process.env.PATH || ''}` };
+        const r = spawnSync(path.join(root, 'bin', 'ploinky-install-deps'), [], { encoding: 'utf8', env });
+        assert.equal(r.status, 0, `${r.stdout}${r.stderr}`);
+        const npmArgs = fs.readFileSync(argsFile, 'utf8');
+        assert.ok(npmArgs.includes('install --no-package-lock --no-audit --no-fund'), npmArgs);
+        assert.ok(fs.statSync(path.join(root, 'node_modules', 'achillesAgentLib')).isDirectory());
+        assert.ok(fs.statSync(path.join(root, 'node_modules', 'mcp-sdk')).isDirectory());
+        // second run: already installed, npm must not run again
+        const r2 = spawnSync(path.join(root, 'bin', 'ploinky-install-deps'), [], { encoding: 'utf8', env });
+        assert.equal(r2.status, 0, `${r2.stdout}${r2.stderr}`);
+        assert.ok(r2.stdout.includes('already present'), r2.stdout);
+        assert.equal(fs.readFileSync(argsFile, 'utf8'), npmArgs, 'npm not re-invoked when deps exist');
+    } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+        fs.rmSync(binDir, { recursive: true, force: true });
+    }
+});
+
+test('ploinky-install-deps fails loudly when npm leaves deps missing', () => {
+    const { root, binDir } = makeFakeCheckout({ npmCreatesDeps: false });
+    try {
+        const env = { ...process.env, PATH: `${binDir}:${process.env.PATH || ''}` };
+        const r = spawnSync(path.join(root, 'bin', 'ploinky-install-deps'), [], { encoding: 'utf8', env });
+        assert.equal(r.status, 1, `${r.stdout}${r.stderr}`);
+        assert.ok(`${r.stdout}${r.stderr}`.includes('still missing after npm install'), `${r.stdout}${r.stderr}`);
+    } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+        fs.rmSync(binDir, { recursive: true, force: true });
+    }
+});
+
+test('ploinky-install-deps preserves an existing AchillesAgentLib checkout while installing missing mcp-sdk', () => {
+    const { root, binDir, argsFile } = makeFakeCheckout({
+        npmCreatesDeps: false,
+        npmBody: 'mkdir -p "$PWD/node_modules/mcp-sdk"',
+    });
+    try {
+        const localChange = path.join(root, 'node_modules', 'achillesAgentLib', 'local-change.txt');
+        fs.mkdirSync(path.dirname(localChange), { recursive: true });
+        fs.writeFileSync(localChange, 'do not delete\n');
+        const env = { ...process.env, PATH: `${binDir}:${process.env.PATH || ''}` };
+        const r = spawnSync(path.join(root, 'bin', 'ploinky-install-deps'), [], { encoding: 'utf8', env });
+        assert.equal(r.status, 0, `${r.stdout}${r.stderr}`);
+        assert.equal(fs.readFileSync(localChange, 'utf8'), 'do not delete\n');
+        const npmArgs = fs.readFileSync(argsFile, 'utf8');
+        assert.ok(npmArgs.includes('install --ignore-scripts --no-package-lock --no-audit --no-fund'), npmArgs);
+    } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+        fs.rmSync(binDir, { recursive: true, force: true });
+    }
+});
+
+test('ploinky-install-deps resets a partial achillesAgentLib before installing when reset is explicitly allowed', () => {
+    const { root, binDir } = makeFakeCheckout({ npmCreatesDeps: true });
+    try {
+        // partial state: achillesAgentLib exists (would break postinstall's git clone), mcp-sdk missing
+        fs.mkdirSync(path.join(root, 'node_modules', 'achillesAgentLib', '.git'), { recursive: true });
+        const env = { ...process.env, PATH: `${binDir}:${process.env.PATH || ''}`, PLOINKY_INSTALL_DEPS_ALLOW_RESET: '1' };
+        const r = spawnSync(path.join(root, 'bin', 'ploinky-install-deps'), [], { encoding: 'utf8', env });
+        assert.equal(r.status, 0, `${r.stdout}${r.stderr}`);
+        assert.ok(!fs.existsSync(path.join(root, 'node_modules', 'achillesAgentLib', '.git')), 'partial dir was reset');
+    } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+        fs.rmSync(binDir, { recursive: true, force: true });
+    }
+});
+
 // --- Added with the Node implementation: syntax + import-level unit tests ---
 import {
     parseCli,
@@ -373,6 +441,8 @@ import {
     sanitizeBoxSuffix,
     resolveInstanceIdentity,
     isPublicEntrypoint,
+    resolveHostPloinkySource,
+    shouldInstallDeps,
 } from './ploinky-box.mjs';
 
 test('ploinky-box.mjs syntax check (node --check)', () => {
@@ -406,6 +476,36 @@ test('parseCli: PLOINKY_BOX_ENGINE env seeds the engine, --engine overrides', ()
     assert.equal(parseCli(['--engine', 'podman', 'up'], { PLOINKY_BOX_ENGINE: 'docker' }).engine, 'podman');
 });
 
+test('resolveHostPloinkySource: PLOINKY_BOX_SOURCE override wins, defaults to the checkout', () => {
+    assert.equal(resolveHostPloinkySource({}), REPO_ROOT);
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-src-'));
+    try {
+        for (const marker of ['bin', 'cli', 'globalDeps']) fs.mkdirSync(path.join(tmp, marker));
+        fs.writeFileSync(path.join(tmp, 'bin', 'ploinky'), '#!/usr/bin/env bash\n');
+        fs.writeFileSync(path.join(tmp, 'cli', 'index.js'), '// stub\n');
+        fs.writeFileSync(path.join(tmp, 'globalDeps', 'package.json'), '{}\n');
+        assert.equal(resolveHostPloinkySource({ PLOINKY_BOX_SOURCE: tmp }), path.resolve(tmp));
+    } finally {
+        fs.rmSync(tmp, { recursive: true, force: true });
+    }
+});
+
+test('up dies with guidance when PLOINKY_BOX_SOURCE is not a ploinky checkout', () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-notsrc-'));
+    try {
+        const r = spawnSync(BOX, ['--name', 'qa', '--dry-run', 'up'], {
+            encoding: 'utf8',
+            env: { ...process.env, PLOINKY_BOX_ENGINE: 'podman', PLOINKY_BOX_SOURCE: tmp },
+        });
+        const out = `${r.stdout ?? ''}${r.stderr ?? ''}`;
+        assert.equal(r.status, 1, out);
+        checkIncludes(out, 'ploinky source not found', 'invalid source dies');
+        checkIncludes(out, 'PLOINKY_BOX_SOURCE', 'error names the escape hatch');
+    } finally {
+        fs.rmSync(tmp, { recursive: true, force: true });
+    }
+});
+
 test('parseCli: repeatable --publish accumulates in order', () => {
     const cfg = parseCli(['--publish', 'a:1:1', '--publish', 'b:2:2', 'up'], {});
     assert.deepEqual(cfg.publish, ['a:1:1', 'b:2:2']);
@@ -417,6 +517,16 @@ test('instance and volume naming', () => {
     assert.deepEqual(volumeNames(named), {
         workspace: 'ploinky-box-qa-workspace',
         containers: 'ploinky-box-qa-containers',
+        deps: 'ploinky-box-qa-ploinky-deps',
+    });
+});
+
+test('volume naming includes the deps volume', () => {
+    const named = parseCli(['--name', 'qa', 'up'], {});
+    assert.deepEqual(volumeNames(named), {
+        workspace: 'ploinky-box-qa-workspace',
+        containers: 'ploinky-box-qa-containers',
+        deps: 'ploinky-box-qa-ploinky-deps',
     });
 });
 
@@ -428,6 +538,75 @@ test('buildRunArgs: selinux label only when the engine reports it; image is last
     assert.ok(labeled.join(' ').includes('--security-opt label=disable'));
     assert.equal(plain[plain.length - 1], 'docker.io/assistos/ploinky-box:podman-node24');
     assert.ok(!plain.includes('--privileged'));
+});
+
+test('buildRunArgs: read-only source mount plus writable deps volume', () => {
+    const podmanCfg = parseCli(['--engine', 'podman', 'up'], {});
+    const podmanArgs = buildRunArgs(podmanCfg, { selinux: false }).join(' ');
+    assert.ok(podmanArgs.includes(`-v ${REPO_ROOT}:/opt/ploinky:ro`), podmanArgs);
+    assert.ok(podmanArgs.includes('-ploinky-deps:/opt/ploinky/node_modules:U'), podmanArgs);
+    assert.ok(!podmanArgs.includes('/workspace:ro'), 'workspace stays writable');
+    assert.ok(!podmanArgs.includes('PLOINKY_BOX='), 'no PLOINKY_BOX env injection');
+
+    const dockerCfg = parseCli(['--engine', 'docker', 'up'], {});
+    const dockerArgs = buildRunArgs(dockerCfg, { selinux: false }).join(' ');
+    assert.ok(dockerArgs.includes('-ploinky-deps:/opt/ploinky/node_modules '), dockerArgs);
+    assert.ok(!dockerArgs.includes(':U'), 'docker gets no :U volume option');
+});
+
+test('docker up fixes deps-volume ownership; podman relies on :U', () => {
+    const docker = boxRun('docker', '--dry-run', '--name', 'qa', 'up');
+    checkIncludes(docker.out, 'exec --user root ploinky-box-qa chown podman:podman /opt/ploinky/node_modules',
+        'docker up chowns the fresh deps volume');
+    const podman = boxRun('podman', '--dry-run', '--name', 'qa', 'up');
+    checkAbsent(podman.out, 'chown podman:podman /opt/ploinky/node_modules', 'podman up needs no chown (:U)');
+});
+
+test('shouldInstallDeps: explicit env opt-in, TTY confirm, default no', () => {
+    assert.equal(shouldInstallDeps({ PLOINKY_BOX_INSTALL_DEPS: '1' }, false, null), true);
+    assert.equal(shouldInstallDeps({}, true, 'y'), true);
+    assert.equal(shouldInstallDeps({}, true, 'Y'), true);
+    assert.equal(shouldInstallDeps({}, true, 'n'), false);
+    assert.equal(shouldInstallDeps({}, true, ''), false);
+    assert.equal(shouldInstallDeps({}, true, null), false);
+    assert.equal(shouldInstallDeps({}, false, 'y'), false); // non-TTY never installs from a piped reply
+});
+
+test('dependency flow source contract: fatal public decline, docker chown is mandatory', () => {
+    const source = fs.readFileSync(MJS, 'utf8');
+    checkIncludes(source, 'async function cmdUp(cfg, { fatalOnDepsDecline = false } = {})',
+        'cmdUp accepts fatal dependency-decline option');
+    checkIncludes(source, 'if (fatalOnDecline) process.exit(1);',
+        'declined public ploinky command exits before forwarding');
+    checkIncludes(source, 'await cmdUp(cfg, { fatalOnDepsDecline: true });',
+        'public ploinky startup passes fatal dependency-decline option');
+    checkIncludes(source, 'fixDepsOwnership(cfg);\n        if (!await ensureDepsInstalled(cfg, { fatalOnDecline: fatalOnDepsDecline })) process.exit(1);',
+        'already-running boxes repair docker deps ownership before prompting and exit on decline');
+    checkAbsent(source, "chown', 'podman:podman', '/opt/ploinky/node_modules'], { allowFail: true",
+        'docker deps chown failures are not ignored');
+});
+
+test('box up exits nonzero when dependency install is declined noninteractively', () => {
+    const fake = makeFakePodmanForMissingDeps();
+    try {
+        const r = spawnSync(BOX, ['--name', 'qa', '--port', '18349', 'up'], {
+            encoding: 'utf8',
+            env: {
+                ...process.env,
+                PATH: `${fake.dir}:${process.env.PATH || ''}`,
+                PLOINKY_BOX_ENGINE: 'podman',
+                PLOINKY_BOX_INSTALL_DEPS: '',
+            },
+            input: '',
+        });
+        const out = `${r.stdout ?? ''}${r.stderr ?? ''}`;
+        assert.equal(r.status, 1, out);
+        checkIncludes(out, 'WARNING: Ploinky cannot run until dependencies are installed.', 'declined deps warning is emitted');
+        const calls = fs.readFileSync(fake.calls, 'utf8');
+        checkAbsent(calls, '/opt/ploinky/bin/ploinky-install-deps', 'decline must not run the installer');
+    } finally {
+        fs.rmSync(fake.dir, { recursive: true, force: true });
+    }
 });
 
 test('buildRunArgs: mount is appended only when set, before the image', () => {
@@ -460,7 +639,25 @@ test('public usage describes ploinky and box namespace', () => {
     assert.equal(r.status, 0, r.stderr);
     assert.ok(r.stdout.includes('Usage: ploinky [flags] [command] [args]'), r.stdout);
     assert.ok(r.stdout.includes('ploinky box status'), r.stdout);
-    assert.ok(r.stdout.includes('PLOINKY_DIRECT=1'), r.stdout);
+    assert.ok(!r.stdout.includes('PLOINKY_DIRECT'), r.stdout);
+});
+
+test('bin/ploinky bash syntax and single-entry contract', () => {
+    const r = spawnSync('bash', ['-n', PLOINKY], { encoding: 'utf8' });
+    assert.equal(r.status, 0, r.stderr);
+    const entry = fs.readFileSync(PLOINKY, 'utf8');
+    assert.ok(entry.includes('/etc/ploinky-box'), 'entry routes on the image marker file');
+    assert.ok(entry.includes('Ploinky dependencies are not installed. Install them now? [y/N]'), 'entry carries the confirm prompt');
+    assert.ok(entry.includes('Ploinky cannot run until dependencies are installed.'), 'entry carries the decline warning');
+    assert.ok(entry.includes('ploinky-install-deps'), 'entry points at the installer');
+    assert.ok(entry.includes('cli/index.js'), 'in-box branch execs the CLI');
+    assert.ok(!entry.includes('PLOINKY_DIRECT'), 'PLOINKY_DIRECT is gone');
+    assert.ok(!entry.includes('PLOINKY_BOX'), 'PLOINKY_BOX routing is gone');
+    assert.ok(!entry.includes('ploinky-direct'), 'ploinky-direct is gone');
+});
+
+test('bin/ploinky-direct is deleted', () => {
+    assert.ok(!fs.existsSync(path.join(HERE, '..', 'bin', 'ploinky-direct')), 'ploinky-direct must not exist');
 });
 
 test('isPublicEntrypoint reads the public mode environment marker', () => {
@@ -624,13 +821,23 @@ test('smoke script documents optional public ploinky path', () => {
     assert.ok(smokeText.includes('bin/ploinky'), smokeText);
 });
 
-test('docs describe boxed-by-default ploinky and direct escape', () => {
+test('docs describe boxed-by-default ploinky and the host-mounted core', () => {
     const rootReadme = fs.readFileSync(path.join(HERE, '..', 'README.md'), 'utf8');
     const boxReadme = fs.readFileSync(path.join(HERE, 'README.md'), 'utf8');
-    assert.ok(rootReadme.includes('PLOINKY_DIRECT=1'), rootReadme);
     assert.ok(rootReadme.includes('ploinky box status'), rootReadme);
+    assert.ok(rootReadme.includes('mounted read-only'), rootReadme);
+    assert.ok(rootReadme.includes('node cli/index.js'), rootReadme);
+    assert.ok(!rootReadme.includes('PLOINKY_DIRECT'), 'the direct-mode escape is gone');
     assert.ok(boxReadme.includes('ploinky box destroy'), boxReadme);
     assert.ok(boxReadme.includes('ploinky-box compatibility'), boxReadme);
+    assert.ok(boxReadme.includes('/opt/ploinky'), boxReadme);
+    assert.ok(boxReadme.includes('read-only'), boxReadme);
+    assert.ok(boxReadme.includes('ploinky-deps'), boxReadme);
+    assert.ok(boxReadme.includes('PLOINKY_BOX_SOURCE'), boxReadme);
+    assert.ok(boxReadme.includes('PLOINKY_BOX_INSTALL_DEPS'), boxReadme);
+    assert.ok(boxReadme.includes('Install them now?'), boxReadme);
+    assert.ok(boxReadme.includes('/etc/ploinky-box'), boxReadme);
+    assert.ok(!boxReadme.includes('PLOINKY_DIRECT'), 'the direct-mode escape is gone');
 });
 
 test('package metadata advertises the Node 20 runtime floor', () => {
@@ -737,6 +944,7 @@ test('destroy targets the inferred instance and says so', () => {
     try {
         const { out } = boxRunIn(dir, 'podman', '--dry-run', 'destroy');
         checkIncludes(out, "targeting 'ploinky-box-testExplorerFresh' (name inferred from the current directory)", 'destroy announces the inferred target');
+        checkIncludes(out, 'volume rm ploinky-box-testExplorerFresh-workspace ploinky-box-testExplorerFresh-containers ploinky-box-testExplorerFresh-ploinky-deps', 'destroy removes all three volumes');
         checkIncludes(out, "'ploinky-box-testExplorerFresh' and its volumes removed.", 'destroy resolves the inferred name');
     } finally {
         fs.rmSync(parent, { recursive: true, force: true });

@@ -10,9 +10,10 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import readline from 'node:readline';
-import { pathToFileURL } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { setTimeout as sleep } from 'node:timers/promises';
 
+const HERE = path.dirname(fileURLToPath(import.meta.url));
 const DEFAULT_IMAGE = 'docker.io/assistos/ploinky-box:podman-node24';
 const BOX_PREFIX = 'ploinky-box';
 const PUBLIC_ENTRYPOINT_ENV = 'PLOINKY_PUBLIC_ENTRYPOINT';
@@ -65,9 +66,6 @@ Flags:
 Box selector flags such as --name and --port may appear before or after a
 public command. Put --dry-run before the command for wrapper dry-run; after the
 command it is forwarded to Ploinky.
-
-Direct development escape:
-  PLOINKY_DIRECT=1 ploinky <args>
 `;
     }
     return `ploinky-box - run Ploinky isolated in a rootless-podman container
@@ -123,6 +121,7 @@ export function parseCli(argv, env = process.env, options = {}) {
         image: DEFAULT_IMAGE,
         mountDir: '',
         mountDirResolved: '',
+        sourceDirResolved: '',
         listenLan: false,
         dryRun: false,
         publish: [],
@@ -192,7 +191,11 @@ export function instanceName(cfg) {
 
 export function volumeNames(cfg) {
     const instance = instanceName(cfg);
-    return { workspace: `${instance}-workspace`, containers: `${instance}-containers` };
+    return {
+        workspace: `${instance}-workspace`,
+        containers: `${instance}-containers`,
+        deps: `${instance}-ploinky-deps`,
+    };
 }
 
 export function sanitizeBoxSuffix(raw) {
@@ -385,10 +388,38 @@ function prepareMount(cfg) {
     process.stderr.write(`ploinky-box: WARNING: --mount pierces the isolation boundary for ${cfg.mountDir}\n`);
 }
 
+const SOURCE_MARKERS = ['bin/ploinky', 'cli/index.js', 'globalDeps/package.json'];
+
+// The box mounts the local ploinky checkout read-only at /opt/ploinky. The
+// checkout is found from this script's own location (container/ -> repo root)
+// so it works from any cwd; PLOINKY_BOX_SOURCE overrides for detached copies.
+export function resolveHostPloinkySource(env = process.env, scriptDir = HERE) {
+    const override = String(env.PLOINKY_BOX_SOURCE || '').trim();
+    const candidate = path.resolve(override || path.resolve(scriptDir, '..'));
+    const missing = SOURCE_MARKERS.filter((marker) => !fs.existsSync(path.join(candidate, marker)));
+    if (missing.length > 0) {
+        die(`ploinky source not found at ${candidate} (missing: ${missing.join(', ')}).
+  The box mounts a local ploinky checkout read-only at /opt/ploinky.
+  Run the wrapper from inside a ploinky checkout, or set PLOINKY_BOX_SOURCE=/path/to/ploinky.`);
+    }
+    return candidate;
+}
+
+function prepareSource(cfg) {
+    cfg.sourceDirResolved = resolveHostPloinkySource();
+    // node_modules must exist on the host: it is the mountpoint for the deps
+    // volume, and the engine cannot create it inside a read-only bind mount.
+    if (!cfg.dryRun) {
+        fs.mkdirSync(path.join(cfg.sourceDirResolved, 'node_modules'), { recursive: true });
+    }
+}
+
 export function buildRunArgs(cfg, { selinux = false } = {}) {
     const bindIp = cfg.listenLan ? '0.0.0.0' : '127.0.0.1';
     const instance = instanceName(cfg);
-    const { workspace, containers } = volumeNames(cfg);
+    const { workspace, containers, deps } = volumeNames(cfg);
+    const source = cfg.sourceDirResolved || resolveHostPloinkySource();
+    const depsMountSuffix = cfg.engine === 'podman' ? ':U' : '';
     const args = ['run', '-d', '--init', '--name', instance,
         '--user', 'podman',
         '--device', '/dev/fuse',
@@ -410,7 +441,8 @@ export function buildRunArgs(cfg, { selinux = false } = {}) {
     args.push(
         '-v', `${workspace}:/workspace`,
         '-v', `${containers}:/home/podman/.local/share/containers`,
-        '-e', 'PLOINKY_BOX=1',
+        '-v', `${source}:/opt/ploinky:ro`,
+        '-v', `${deps}:/opt/ploinky/node_modules${depsMountSuffix}`,
         '-e', 'PLOINKY_WORKSPACE_ROOT=/workspace',
     );
     if (selinux) args.push('--security-opt', 'label=disable');
@@ -467,6 +499,47 @@ async function waitHealthy(cfg) {
     die(`'${instance}' did not become healthy within 30s; inspect with: ${cfg.engine} logs ${instanceName(cfg)}`);
 }
 
+// Docker cannot chown a fresh named volume via a mount option (podman's :U),
+// so fix ownership with one root exec right after the container starts. The
+// volume top-level is enough for npm to create its subtree.
+function fixDepsOwnership(cfg) {
+    if (cfg.engine !== 'docker') return;
+    runEngine(cfg, ['exec', '--user', 'root', instanceName(cfg),
+        'chown', 'podman:podman', '/opt/ploinky/node_modules']);
+}
+
+function depsInstalled(cfg) {
+    return query(cfg, ['exec', instanceName(cfg), 'sh', '-lc',
+        'test -d /opt/ploinky/node_modules/achillesAgentLib && test -d /opt/ploinky/node_modules/mcp-sdk']).ok;
+}
+
+export function shouldInstallDeps(env, isTTY, reply) {
+    if (String(env?.PLOINKY_BOX_INSTALL_DEPS || '') === '1') return true;
+    if (!isTTY) return false;
+    return /^[yY]$/.test(reply ?? '');
+}
+
+// First-run dependency flow, host side: never install silently. Explicit env
+// opt-in installs; a TTY asks; everything else leaves the box up and warns.
+// Public ploinky commands pass fatalOnDecline so a declined prompt exits once,
+// before forwarding into a second in-box prompt.
+async function ensureDepsInstalled(cfg, { fatalOnDecline = false } = {}) {
+    if (cfg.dryRun || depsInstalled(cfg)) return true;
+    let reply = null;
+    const envOptIn = String(process.env.PLOINKY_BOX_INSTALL_DEPS || '') === '1';
+    if (!envOptIn && process.stdin.isTTY) {
+        reply = await askLine('Ploinky dependencies are not installed. Install them now? [y/N] ');
+    }
+    if (!shouldInstallDeps(process.env, process.stdin.isTTY, reply)) {
+        process.stderr.write(`${activeProgramName}: WARNING: Ploinky cannot run until dependencies are installed.\n`
+            + `${activeProgramName}: install them with: ${cfg.engine} exec -it ${instanceName(cfg)} /opt/ploinky/bin/ploinky-install-deps\n`);
+        if (fatalOnDecline) process.exit(1);
+        return false;
+    }
+    runEngine(cfg, ['exec', '-i', instanceName(cfg), '/opt/ploinky/bin/ploinky-install-deps']);
+    return true;
+}
+
 function requireRunning(cfg) {
     if (cfg.dryRun) return;
     if (!boxRunning(cfg)) {
@@ -502,10 +575,12 @@ function askLine(promptText) {
     });
 }
 
-async function cmdUp(cfg) {
+async function cmdUp(cfg, { fatalOnDepsDecline = false } = {}) {
     preflight(cfg);
     if (!cfg.dryRun && boxRunning(cfg)) {
         process.stdout.write(`ploinky-box: '${instanceName(cfg)}' already running.\n`);
+        fixDepsOwnership(cfg);
+        if (!await ensureDepsInstalled(cfg, { fatalOnDecline: fatalOnDepsDecline })) process.exit(1);
         return;
     }
     if (!cfg.dryRun && boxExists(cfg)) {
@@ -516,10 +591,13 @@ async function cmdUp(cfg) {
         }
         ensureImage(cfg);
         prepareMount(cfg);
+        prepareSource(cfg);
         const selinux = cfg.dryRun ? false : engineSelinuxEnabled(cfg);
         runEngine(cfg, buildRunArgs(cfg, { selinux }));
     }
     await waitHealthy(cfg);
+    fixDepsOwnership(cfg);
+    if (!await ensureDepsInstalled(cfg, { fatalOnDecline: fatalOnDepsDecline })) process.exit(1);
 }
 
 async function probeRouter(port, attempts = 30) {
@@ -590,7 +668,7 @@ async function cmdStart(cfg, options = {}) {
     }
     if (!startPlan.hasAgent) {
         if (!publicEntrypoint) die(`usage: ${activeProgramName} start <agent> [port]`);
-        await cmdUp(cfg);
+        await cmdUp(cfg, { fatalOnDepsDecline: publicEntrypoint });
         runEngine(cfg, ['exec', '-w', '/workspace', instanceName(cfg), 'ploinky', ...startPlan.inBoxArgs]);
         return;
     }
@@ -601,7 +679,7 @@ async function cmdStart(cfg, options = {}) {
         cfg.port = startPlan.hostPort;
     }
     if (!/^\d+$/.test(cfg.port)) die(`start: host port must be a number, got '${cfg.port}'`);
-    await cmdUp(cfg);
+    await cmdUp(cfg, { fatalOnDepsDecline: publicEntrypoint });
     const published = cfg.dryRun ? cfg.port : (hostPort(cfg) || cfg.port);
     if (!cfg.dryRun && published !== cfg.port) {
         process.stderr.write(`${activeProgramName}: note: existing box publishes host port ${published}; the requested port applies only when the box is created. To change it, run ${activeProgramName} ${activeProgramName === PUBLIC_PROGRAM ? 'box update/recreate' : 'update/recreate'} with the same flags you used for up plus --port ${cfg.port}.\n`);
@@ -694,31 +772,35 @@ async function cmdUpdate(cfg) {
         runEngine(cfg, ['rm', instanceName(cfg)], { silence: 'stdout' });
     }
     prepareMount(cfg);
+    prepareSource(cfg);
     const selinux = cfg.dryRun ? false : engineSelinuxEnabled(cfg);
     runEngine(cfg, buildRunArgs(cfg, { selinux }));
     await waitHealthy(cfg);
+    fixDepsOwnership(cfg);
+    await ensureDepsInstalled(cfg);
     process.stdout.write(`ploinky-box: updated. Resume agents with: ploinky-box --name ${cfg.name} run start\n`);
 }
 
 async function cmdDestroy(cfg) {
     preflight(cfg);
     const instance = instanceName(cfg);
-    const { workspace, containers } = volumeNames(cfg);
+    const { workspace, containers, deps } = volumeNames(cfg);
     if (cfg.nameSource === 'cwd') {
         process.stderr.write(`ploinky-box: targeting '${instance}' (name inferred from the current directory)\n`);
     }
     if (!cfg.dryRun) {
         const anyVolume = query(cfg, ['volume', 'inspect', workspace]).ok
-            || query(cfg, ['volume', 'inspect', containers]).ok;
+            || query(cfg, ['volume', 'inspect', containers]).ok
+            || query(cfg, ['volume', 'inspect', deps]).ok;
         if (!boxExists(cfg) && !anyVolume) {
             die(`nothing to destroy: no container or volumes for '${instance}'${inferredNote(cfg)}`);
         }
-        const reply = await askLine(`Remove container '${instance}' and volumes '${workspace}' + '${containers}'? [y/N] `);
+        const reply = await askLine(`Remove container '${instance}' and volumes '${workspace}' + '${containers}' + '${deps}'? [y/N] `);
         if (!/^[yY]$/.test(reply ?? '')) die('aborted');
     }
     runEngine(cfg, ['stop', instance], { silence: 'all', allowFail: true });
     runEngine(cfg, ['rm', instance], { silence: 'all', allowFail: true });
-    runEngine(cfg, ['volume', 'rm', workspace, containers], { silence: 'all', allowFail: true });
+    runEngine(cfg, ['volume', 'rm', workspace, containers, deps], { silence: cfg.dryRun ? 'none' : 'all', allowFail: true });
     process.stdout.write(`ploinky-box: '${instance}' and its volumes removed.\n`);
 }
 
@@ -773,6 +855,7 @@ function mergeBoxCfg(outer, inner) {
         image: inner.image !== DEFAULT_IMAGE ? inner.image : outer.image,
         mountDir: inner.mountDir || outer.mountDir,
         mountDirResolved: inner.mountDirResolved || outer.mountDirResolved,
+        sourceDirResolved: inner.sourceDirResolved || outer.sourceDirResolved,
         listenLan: inner.listenLan || outer.listenLan,
         dryRun: inner.dryRun || outer.dryRun,
         publish: [...outer.publish, ...inner.publish],
@@ -792,7 +875,7 @@ async function runPublicCommand(cfg) {
     detectEngine(cfg);
     resolveInstanceIdentity(cfg);
     if (!cfg.command) {
-        await cmdUp(cfg);
+        await cmdUp(cfg, { fatalOnDepsDecline: true });
         cmdCli(cfg);
         return;
     }
@@ -800,7 +883,7 @@ async function runPublicCommand(cfg) {
         await cmdStart(cfg, { publicEntrypoint: true });
         return;
     }
-    await cmdUp(cfg);
+    await cmdUp(cfg, { fatalOnDepsDecline: true });
     cmdForwardToPloinky(cfg, [cfg.command, ...cfg.args], { interactive: isInteractivePloinkyCommand(cfg.command) });
 }
 

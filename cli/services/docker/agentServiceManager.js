@@ -108,6 +108,7 @@ const PODMAN_STAGED_NODE_OPTIONS = ['--preserve-symlinks', '--preserve-symlinks-
 const PODMAN_RUNTIME_ROOT = path.join(PLOINKY_DIR, 'container-runtime');
 const PODMAN_ROOTLESS_NETWORK = 'slirp4netns:allow_host_loopback=true';
 const PLOINKY_BOX_NETWORK_COMPAT_HASH = 'slirp4netns-named-network';
+const PLOINKY_BOX_MARKER_PATH = '/etc/ploinky-box';
 
 function pathTypeForSymlink(sourcePath) {
     try {
@@ -467,9 +468,15 @@ function ensureNamedRuntimeNetwork(runtime, networkName) {
     }
 }
 
-function isPloinkyBoxRuntime(env = process.env) {
-    const value = String(env?.PLOINKY_BOX || '').trim().toLowerCase();
-    return value === '1' || value === 'true' || value === 'yes' || value === 'on';
+// The ploinky-box image bakes /etc/ploinky-box (container-image-builds,
+// images/ploinky-box/Dockerfile). Its presence -- not an env var -- signals
+// that ploinky runs inside the box.
+function isPloinkyBoxRuntime(markerPath = PLOINKY_BOX_MARKER_PATH) {
+    try {
+        return fs.statSync(markerPath).isFile();
+    } catch (_) {
+        return false;
+    }
 }
 
 function resolveEffectiveManifestNetwork(manifest, profileConfig) {
@@ -500,7 +507,7 @@ function normalizeRuntimeNetwork(network) {
 }
 
 function buildRuntimeNetworkPlan(runtime, manifestNetwork, options = {}) {
-    const env = options.env || process.env;
+    const boxMarkerPath = options.boxMarkerPath || PLOINKY_BOX_MARKER_PATH;
     const network = normalizeRuntimeNetwork(manifestNetwork);
     const isPodman = runtime === 'podman';
 
@@ -515,7 +522,7 @@ function buildRuntimeNetworkPlan(runtime, manifestNetwork, options = {}) {
     }
 
     if (network.name) {
-        if (isPodman && isPloinkyBoxRuntime(env)) {
+        if (isPodman && isPloinkyBoxRuntime(boxMarkerPath)) {
             return {
                 args: ['--replace', '--network', PODMAN_ROOTLESS_NETWORK],
                 ensureNetworkName: '',
