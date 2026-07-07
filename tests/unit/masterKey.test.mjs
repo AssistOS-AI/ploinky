@@ -18,6 +18,12 @@ const {
     MASTER_KEY_VAR,
 } = await import(`../../cli/services/masterKey.js${moduleSuffix}`);
 
+let freshImportCounter = 0;
+async function importFreshMasterKeyModule(label) {
+    freshImportCounter += 1;
+    return import(`../../cli/services/masterKey.js?test=${Date.now()}-${freshImportCounter}-${label}`);
+}
+
 test.after(() => {
     process.chdir(originalCwd);
     fs.rmSync(tempDir, { recursive: true, force: true });
@@ -25,6 +31,7 @@ test.after(() => {
 
 test.beforeEach(() => {
     delete process.env[MASTER_KEY_VAR];
+    delete process.env.PLOINKY_WORKSPACE_ROOT;
 });
 
 test('resolveMasterKey creates a persistent fallback when neither process.env nor .env defines the key', () => {
@@ -46,6 +53,49 @@ test('resolveMasterKey creates a persistent fallback when neither process.env no
         );
     } finally {
         console.error = originalError;
+    }
+});
+
+test('resolveMasterKey warns when using the built-in fallback seed', async () => {
+    const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-mkey-builtin-'));
+    const previousCwd = process.cwd();
+    const previousRoot = process.env.PLOINKY_WORKSPACE_ROOT;
+    const errors = [];
+    const originalError = console.error;
+    console.error = (msg) => { errors.push(String(msg)); };
+    try {
+        const blockedPath = path.join(workspace, '.ploinky', 'master-key');
+        fs.mkdirSync(blockedPath, { recursive: true });
+        process.chdir(workspace);
+        process.env.PLOINKY_WORKSPACE_ROOT = workspace;
+
+        const freshModule = await importFreshMasterKeyModule('built-in-fallback-warning');
+        const key = freshModule.resolveMasterKey({ purpose: 'test encrypted storage' });
+        const expected = crypto
+            .createHash('sha256')
+            .update('ploinky-default-master-key-v1', 'utf8')
+            .digest();
+
+        assert.deepEqual(key, expected);
+        assert.ok(
+            errors.some((m) => (
+                m.includes('[ploinky]')
+                && m.includes(MASTER_KEY_VAR)
+                && m.includes('built-in fallback')
+                && m.includes('Could not persist')
+                && m.includes('Set PLOINKY_MASTER_KEY')
+            )),
+            'expected a built-in fallback warning to be logged via console.error'
+        );
+    } finally {
+        console.error = originalError;
+        process.chdir(previousCwd);
+        if (previousRoot === undefined) {
+            delete process.env.PLOINKY_WORKSPACE_ROOT;
+        } else {
+            process.env.PLOINKY_WORKSPACE_ROOT = previousRoot;
+        }
+        fs.rmSync(workspace, { recursive: true, force: true });
     }
 });
 
