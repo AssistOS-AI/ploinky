@@ -20,6 +20,8 @@ const PUBLIC_ENTRYPOINT_ENV = 'PLOINKY_PUBLIC_ENTRYPOINT';
 const PUBLIC_PROGRAM = 'ploinky';
 const BOX_PROGRAM = 'ploinky-box';
 const BOX_COMMANDS = new Set(['up', 'start', 'cli', 'run', 'cp', 'status', 'logs', 'stop', 'update', 'destroy', 'help']);
+const BOX_COMMANDS_REJECT_REMOVED_FLAGS = new Set(['up', 'start', 'cli', 'status', 'logs', 'stop', 'update', 'destroy', 'help']);
+const REMOVED_BOX_FLAGS = new Set(['--webmeet-ports']);
 let activeProgramName = BOX_PROGRAM;
 
 export function usageText(options = {}) {
@@ -54,8 +56,7 @@ Flags:
   --port N       Host port for the router (default 8080).
                  Inside the box, always start the router on port 8080.
   --publish SPEC Extra host-to-box port publish; repeatable, same form as -p.
-  --webmeet-ports
-                 Publish local LiveKit/TURN ports used by WebMeet rooms/media.
+  --expose SPEC  Alias for --publish; repeatable.
   --image I      Image override (default docker.io/assistos/ploinky-box:podman-node24)
   --mount DIR    Bind DIR read-write at /workspace/mounted (pierces isolation)
   --listen-lan   Publish the router on 0.0.0.0 instead of 127.0.0.1
@@ -94,8 +95,7 @@ Flags:
   --port N       Host port for the router (default 8080).
                  Inside the box, always start the router on port 8080.
   --publish SPEC Extra host-to-box port publish; repeatable, same form as -p.
-  --webmeet-ports
-                 Publish local LiveKit/TURN ports used by WebMeet rooms/media.
+  --expose SPEC  Alias for --publish; repeatable.
   --image I      Image override (default docker.io/assistos/ploinky-box:podman-node24)
   --mount DIR    Bind DIR read-write at /workspace/mounted (pierces isolation)
   --listen-lan   Publish the router on 0.0.0.0 instead of 127.0.0.1
@@ -125,7 +125,6 @@ export function parseCli(argv, env = process.env, options = {}) {
         listenLan: false,
         dryRun: false,
         publish: [],
-        webmeetPorts: false,
         help: false,
         command: '',
         args: [],
@@ -146,8 +145,10 @@ export function parseCli(argv, env = process.env, options = {}) {
                     cfg.port = need('--port');
                     cfg.portExplicit = true;
                     break;
-                case '--publish': cfg.publish.push(need('--publish')); break;
-                case '--webmeet-ports': cfg.webmeetPorts = true; i += 1; break;
+                case '--publish':
+                case '--expose':
+                    cfg.publish.push(need(tok));
+                    break;
                 case '--image': cfg.image = need('--image'); break;
                 case '--mount': cfg.mountDir = need('--mount'); break;
                 case '--engine': cfg.engine = need('--engine'); break;
@@ -164,8 +165,10 @@ export function parseCli(argv, env = process.env, options = {}) {
                 cfg.port = need('--port');
                 cfg.portExplicit = true;
                 break;
-            case '--publish': cfg.publish.push(need('--publish')); break;
-            case '--webmeet-ports': cfg.webmeetPorts = true; i += 1; break;
+            case '--publish':
+            case '--expose':
+                cfg.publish.push(need(tok));
+                break;
             case '--image': cfg.image = need('--image'); break;
             case '--mount': cfg.mountDir = need('--mount'); break;
             case '--engine': cfg.engine = need('--engine'); break;
@@ -428,16 +431,6 @@ export function buildRunArgs(cfg, { selinux = false } = {}) {
         '-p', `${bindIp}:${cfg.port}:8080`,
     ];
     for (const spec of cfg.publish) args.push('-p', spec);
-    if (cfg.webmeetPorts) {
-        args.push(
-            '-p', `${bindIp}:7880:7880`,
-            '-p', `${bindIp}:7881:7881`,
-            '-p', `${bindIp}:7882-7892:7882-7892/udp`,
-            '-p', `${bindIp}:3478:3478/tcp`,
-            '-p', `${bindIp}:3478:3478/udp`,
-            '-p', `${bindIp}:20000-20010:20000-20010/udp`,
-        );
-    }
     args.push(
         '-v', `${workspace}:/workspace`,
         '-v', `${containers}:/home/podman/.local/share/containers`,
@@ -804,15 +797,29 @@ async function cmdDestroy(cfg) {
     process.stdout.write(`ploinky-box: '${instance}' and its volumes removed.\n`);
 }
 
-function assertBoxCommand(cfg, { nested = false } = {}) {
+function boxHelpTarget({ nested = false } = {}) {
+    return activeProgramName === PUBLIC_PROGRAM && nested ? 'ploinky box --help' : `${activeProgramName} --help`;
+}
+
+function assertBoxCommand(cfg, options = {}) {
     if (!BOX_COMMANDS.has(cfg.command)) {
-        const helpTarget = activeProgramName === PUBLIC_PROGRAM && nested ? 'ploinky box --help' : `${activeProgramName} --help`;
-        die(`unknown command '${cfg.command}' (see: ${helpTarget})`);
+        die(`unknown command '${cfg.command}' (see: ${boxHelpTarget(options)})`);
     }
+}
+
+function findRemovedBoxFlag(args) {
+    return args.find((arg) => REMOVED_BOX_FLAGS.has(arg));
+}
+
+function rejectRemovedBoxFlags(cfg, options = {}) {
+    if (!BOX_COMMANDS_REJECT_REMOVED_FLAGS.has(cfg.command)) return;
+    const removed = findRemovedBoxFlag(cfg.args);
+    if (removed) die(`unknown command '${removed}' (see: ${boxHelpTarget(options)})`);
 }
 
 async function runBoxCommand(cfg, options = {}) {
     assertBoxCommand(cfg, options);
+    rejectRemovedBoxFlags(cfg, options);
     if (!(cfg.command === 'status' && cfg.dryRun)) detectEngine(cfg);
     if (cfg.command !== 'help') resolveInstanceIdentity(cfg);
     switch (cfg.command) {
@@ -859,7 +866,6 @@ function mergeBoxCfg(outer, inner) {
         listenLan: inner.listenLan || outer.listenLan,
         dryRun: inner.dryRun || outer.dryRun,
         publish: [...outer.publish, ...inner.publish],
-        webmeetPorts: inner.webmeetPorts || outer.webmeetPorts,
     };
 }
 
@@ -872,6 +878,8 @@ async function runPublicCommand(cfg) {
         await runBoxCommand(boxCfg, { nested: true });
         return;
     }
+    const removed = findRemovedBoxFlag([cfg.command, ...cfg.args]);
+    if (removed) die(`unknown command '${removed}' (see: ${boxHelpTarget()})`);
     detectEngine(cfg);
     resolveInstanceIdentity(cfg);
     if (!cfg.command) {

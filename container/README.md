@@ -62,11 +62,10 @@ The wrapper publishes host port `--port N` (default 8080) to **container port
 on 8080.
 
 Other in-box ports are unreachable from the host unless you publish them when
-creating the box. Use `--publish HOST:BOX` for a specific port, repeat it for
-more ports, or use `--webmeet-ports` to publish the local LiveKit/TURN ports
-needed by WebMeet rooms/media. Existing boxes keep their original port mappings;
-run `ploinky-box update` with the same flags, or recreate the box, when you add
-new published ports.
+creating the box. Use `--publish HOST:BOX` for a specific port, or use its alias
+`--expose HOST:BOX`; repeat either flag for more ports. Existing boxes keep their
+original port mappings; run `ploinky-box update` with the same flags, or recreate
+the box, when you add new published ports.
 
 ## Host-mounted core and the dependency volume
 
@@ -136,7 +135,7 @@ wrapper directly.
 | `destroy` | Remove the box AND its volumes (asks first) |
 
 Flags: `--name X` (explicit instance; default: inferred from the current
-directory basename), `--port N`, `--publish SPEC`, `--webmeet-ports`,
+directory basename), `--port N`, `--publish SPEC`, `--expose SPEC`,
 `--image I`, `--mount DIR`, `--listen-lan`,
 `--engine podman|docker`, `--dry-run`.
 `PLOINKY_BOX_ENGINE` overrides engine detection.

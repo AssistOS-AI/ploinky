@@ -335,19 +335,38 @@ test('image override respected', () => {
     checkIncludes(out, 'example.org/x/y:z', 'image override respected');
 });
 
-test('publish flag adds extra port', () => {
-    const { out } = boxRun('podman', '--dry-run', '--publish', '127.0.0.1:7880:7880', 'up');
+test('publish and expose flags add extra ports in order', () => {
+    const { out } = boxRun(
+        'podman',
+        '--dry-run',
+        '--publish', '127.0.0.1:7880:7880',
+        '--expose', '127.0.0.1:7881:7881',
+        'up',
+    );
     checkIncludes(out, '-p 127.0.0.1:7880:7880', 'publish flag adds extra port');
+    checkIncludes(out, '-p 127.0.0.1:7881:7881', 'expose flag aliases publish');
+    assert.ok(
+        out.indexOf('-p 127.0.0.1:7880:7880') < out.indexOf('-p 127.0.0.1:7881:7881'),
+        'publish/expose port order is preserved',
+    );
 });
 
-test('webmeet ports publish the LiveKit/TURN set', () => {
-    const { out } = boxRun('podman', '--dry-run', '--webmeet-ports', 'up');
-    checkIncludes(out, '-p 127.0.0.1:7880:7880', 'webmeet ports publish livekit websocket');
-    checkIncludes(out, '-p 127.0.0.1:7881:7881', 'webmeet ports publish livekit tcp');
-    checkIncludes(out, '-p 127.0.0.1:7882-7892:7882-7892/udp', 'webmeet ports publish livekit udp');
-    checkIncludes(out, '-p 127.0.0.1:3478:3478/tcp', 'webmeet ports publish turn tcp');
-    checkIncludes(out, '-p 127.0.0.1:3478:3478/udp', 'webmeet ports publish turn udp');
-    checkIncludes(out, '-p 127.0.0.1:20000-20010:20000-20010/udp', 'webmeet ports publish turn relay');
+test('--webmeet-ports is no longer a wrapper flag', () => {
+    const { out, status } = boxRun('podman', '--dry-run', '--webmeet-ports', 'up');
+    assert.equal(status, 1, out);
+    checkIncludes(
+        out,
+        "unknown command '--webmeet-ports' (see: ploinky-box --help)",
+        'removed webmeet shortcut is not accepted as a wrapper flag',
+    );
+
+    const trailing = boxRun('podman', '--dry-run', 'up', '--webmeet-ports');
+    assert.equal(trailing.status, 1, trailing.out);
+    checkIncludes(
+        trailing.out,
+        "unknown command '--webmeet-ports' (see: ploinky-box --help)",
+        'removed webmeet shortcut is not accepted after a wrapper command',
+    );
 });
 
 test('run passes through to ploinky', () => {
@@ -506,9 +525,10 @@ test('up dies with guidance when PLOINKY_BOX_SOURCE is not a ploinky checkout', 
     }
 });
 
-test('parseCli: repeatable --publish accumulates in order', () => {
-    const cfg = parseCli(['--publish', 'a:1:1', '--publish', 'b:2:2', 'up'], {});
-    assert.deepEqual(cfg.publish, ['a:1:1', 'b:2:2']);
+test('parseCli: repeatable --publish and --expose accumulate in order', () => {
+    const cfg = parseCli(['--publish', 'a:1:1', '--expose', 'b:2:2', '--publish', 'c:3:3', 'up'], {});
+    assert.deepEqual(cfg.publish, ['a:1:1', 'b:2:2', 'c:3:3']);
+    assert.equal(Object.hasOwn(cfg, 'webmeetPorts'), false);
 });
 
 test('instance and volume naming', () => {
@@ -625,10 +645,11 @@ test('mapCpPath: leading box: prefix only', () => {
 test('usage text still documents every command and flag', () => {
     const u = usageText();
     for (const word of ['up', 'start', 'cli', 'run', 'cp', 'status', 'logs', 'stop', 'update', 'destroy',
-        '--name', '--port', '--publish', '--webmeet-ports', '--image', '--mount',
+        '--name', '--port', '--publish', '--expose', '--image', '--mount',
         '--listen-lan', '--engine', '--dry-run']) {
         assert.ok(u.includes(word), `usage() lost mention of ${word}`);
     }
+    assert.ok(!u.includes('--webmeet-ports'), 'usage() still documents removed --webmeet-ports flag');
 });
 
 test('public usage describes ploinky and box namespace', () => {
@@ -639,6 +660,8 @@ test('public usage describes ploinky and box namespace', () => {
     assert.equal(r.status, 0, r.stderr);
     assert.ok(r.stdout.includes('Usage: ploinky [flags] [command] [args]'), r.stdout);
     assert.ok(r.stdout.includes('ploinky box status'), r.stdout);
+    assert.ok(r.stdout.includes('--expose SPEC'), r.stdout);
+    assert.ok(!r.stdout.includes('--webmeet-ports'), r.stdout);
     assert.ok(!r.stdout.includes('PLOINKY_DIRECT'), r.stdout);
 });
 
@@ -708,6 +731,16 @@ test('public box destroy targets the outer volume destroy command', () => {
     checkAbsent(out, 'ploinky destroy', 'box destroy does not run in-box destroy');
 });
 
+test('public box rejects removed --webmeet-ports after lifecycle command', () => {
+    const { out, status } = publicRun('podman', '--name', 'qa', '--dry-run', 'box', 'up', '--webmeet-ports');
+    assert.equal(status, 1, out);
+    checkIncludes(
+        out,
+        "unknown command '--webmeet-ports' (see: ploinky box --help)",
+        'public box rejects removed webmeet shortcut after lifecycle command',
+    );
+});
+
 test('public no-arg command opens in-box p-cli', () => {
     const { out, status } = publicRun('podman', '--name', 'qa', '--dry-run');
     assert.equal(status, 0, out);
@@ -759,6 +792,33 @@ test('public start without an agent forwards in-box start instead of wrapper fai
     checkAbsent(out, 'usage:', 'public start without args is not rejected by the wrapper');
 });
 
+test('public command hoists --expose after the command without forwarding it in-box', () => {
+    const { out, status } = publicRun('podman', '--name', 'qa', '--dry-run', 'status', '--expose', '127.0.0.1:9090:9090');
+    assert.equal(status, 0, out);
+    checkIncludes(out, '-p 127.0.0.1:9090:9090', 'public post-command --expose publishes an outer box port');
+    checkIncludes(out, 'exec -w /workspace ploinky-box-qa ploinky status', 'public status still runs in-box status');
+    checkAbsent(out, 'ploinky status --expose 127.0.0.1:9090:9090', 'post-command --expose is not forwarded in-box');
+});
+
+test('public command rejects removed --webmeet-ports instead of forwarding it in-box', () => {
+    const trailing = publicRun('podman', '--name', 'qa', '--dry-run', 'status', '--webmeet-ports');
+    assert.equal(trailing.status, 1, trailing.out);
+    checkIncludes(
+        trailing.out,
+        "unknown command '--webmeet-ports' (see: ploinky --help)",
+        'public post-command webmeet shortcut is rejected',
+    );
+    checkAbsent(trailing.out, 'ploinky status --webmeet-ports', 'removed wrapper flag is not forwarded in-box');
+
+    const leading = publicRun('podman', '--name', 'qa', '--dry-run', '--webmeet-ports', 'status');
+    assert.equal(leading.status, 1, leading.out);
+    checkIncludes(
+        leading.out,
+        "unknown command '--webmeet-ports' (see: ploinky --help)",
+        'public leading webmeet shortcut is rejected',
+    );
+});
+
 test('public ploinky forwards every registered top-level CLI command into the box', () => {
     const registry = getCommandRegistry();
     assert.equal(registry.box, undefined, 'box is reserved for outer lifecycle commands');
@@ -785,9 +845,10 @@ test('public parser preserves normal command flags after the command', () => {
 });
 
 test('public parser hoists box selector flags after the command', () => {
-    const cfg = parseCli(['destroy', '--name', 'qa'], {}, { publicEntrypoint: true });
+    const cfg = parseCli(['destroy', '--name', 'qa', '--expose', '127.0.0.1:9090:9090'], {}, { publicEntrypoint: true });
     assert.equal(cfg.command, 'destroy');
     assert.equal(cfg.name, 'qa');
+    assert.deepEqual(cfg.publish, ['127.0.0.1:9090:9090']);
     assert.deepEqual(cfg.args, []);
 });
 
