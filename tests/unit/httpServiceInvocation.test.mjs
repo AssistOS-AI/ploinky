@@ -444,7 +444,27 @@ function listen(server) {
 }
 
 function close(server) {
-    return new Promise((resolve) => server.close(() => resolve()));
+    try {
+        server.closeIdleConnections?.();
+        server.closeAllConnections?.();
+    } catch (_) {
+        // best effort teardown for test sockets
+    }
+    return new Promise((resolve) => {
+        const timer = setTimeout(() => {
+            try {
+                server.closeAllConnections?.();
+            } catch (_) {
+                // best effort teardown for test sockets
+            }
+            resolve();
+        }, 1000);
+        timer.unref?.();
+        server.close(() => {
+            clearTimeout(timer);
+            resolve();
+        });
+    });
 }
 
 function requestBody({ port, path: requestPath, method = 'GET', body = '', headers = {} }) {
@@ -619,14 +639,21 @@ async function withRouterModules(t, servicePort, writeConfig = writeWorkspaceCon
 
     const previousCwd = process.cwd();
     const previousMasterKey = process.env.PLOINKY_MASTER_KEY;
+    const previousWorkspaceRoot = process.env.PLOINKY_WORKSPACE_ROOT;
     process.chdir(workspace);
     process.env.PLOINKY_MASTER_KEY = MASTER_KEY;
+    process.env.PLOINKY_WORKSPACE_ROOT = workspace;
     t.after(() => {
         process.chdir(previousCwd);
         if (previousMasterKey === undefined) {
             delete process.env.PLOINKY_MASTER_KEY;
         } else {
             process.env.PLOINKY_MASTER_KEY = previousMasterKey;
+        }
+        if (previousWorkspaceRoot === undefined) {
+            delete process.env.PLOINKY_WORKSPACE_ROOT;
+        } else {
+            process.env.PLOINKY_WORKSPACE_ROOT = previousWorkspaceRoot;
         }
         rmSync(workspace, { recursive: true, force: true });
     });
@@ -668,14 +695,16 @@ test('authenticated HTTP service falls back to static auth and injects router au
     assert.equal(captured, null);
 
     const policy = { mode: 'local', usersVar: 'PLOINKY_AUTH_EXPLORER_USERS' };
+    const username = `admin-${crypto.randomBytes(4).toString('hex')}`;
+    const userId = `local:${username}`;
     localService.createLocalAuthUser({
         policy,
-        username: 'admin',
+        username,
         password: 'correct horse battery staple',
         roles: ['admin']
     });
     const login = localService.authenticateLocalUser({
-        username: 'admin',
+        username,
         password: 'correct horse battery staple',
         policy
     });
@@ -692,7 +721,7 @@ test('authenticated HTTP service falls back to static auth and injects router au
     const authResult = await authHandlers.ensureAuthenticated(req, res, parsedUrl);
     assert.equal(authResult.ok, true, res.body);
     assert.equal(req.authMode, 'local');
-    assert.equal(req.user?.id, 'local:admin');
+    assert.equal(req.user?.id, userId);
 
     const handled = routerHandlers.handleHttpServiceRoute(req, res, parsedUrl);
     assert.equal(handled, true);
@@ -703,8 +732,8 @@ test('authenticated HTTP service falls back to static auth and injects router au
     assert.equal(captured?.url, '/browser-use/sessions/sess_1?view=1');
 
     const authInfo = JSON.parse(captured?.headers['x-ploinky-auth-info'] || '{}');
-    assert.equal(authInfo.user?.id, 'local:admin');
-    assert.equal(authInfo.user?.username, 'admin');
+    assert.equal(authInfo.user?.id, userId);
+    assert.equal(authInfo.user?.username, username);
     assert.deepEqual(authInfo.user?.roles, ['user', 'admin']);
     assert.ok(authInfo.sessionId);
     assert.equal(typeof authInfo.invocationToken, 'string');
@@ -733,7 +762,7 @@ test('authenticated HTTP service falls back to static auth and injects router au
     });
     assert.equal(verified.payload.typ, 'router-request');
     assert.equal(verified.payload.actor?.kind, 'user');
-    assert.equal(verified.payload.sub, 'user:local:admin');
+    assert.equal(verified.payload.sub, `user:${userId}`);
 
     captured = null;
     const rootReq = makeRequest({

@@ -62,6 +62,36 @@ export function parseEnableDirective(entry) {
     return { spec, alias, noWait };
 }
 
+function firstEnableSpecToken(spec) {
+    return String(spec || '').trim().split(/\s+/).filter(Boolean)[0] || '';
+}
+
+function isPrefixedAgentToken(token) {
+    return String(token || '').includes('/') || String(token || '').includes(':');
+}
+
+function hasSameRepoBareAgent(repoName, agentName) {
+    const repo = String(repoName || '').trim();
+    const agent = String(agentName || '').trim();
+    if (!repo || !agent) return false;
+    return fs.existsSync(path.join(PLOINKY_DIR, 'repos', repo, agent, 'manifest.json'));
+}
+
+export function qualifyEnableSpecForRepo(spec, repoName) {
+    const raw = String(spec || '').trim();
+    const repo = String(repoName || '').trim();
+    if (!raw || !repo) return raw;
+
+    const tokens = raw.split(/\s+/).filter(Boolean);
+    if (!tokens.length || isPrefixedAgentToken(tokens[0])) {
+        return raw;
+    }
+    if (!hasSameRepoBareAgent(repo, tokens[0])) {
+        return raw;
+    }
+    return [`${repo}/${tokens[0]}`, ...tokens.slice(1)].join(' ');
+}
+
 function parsePloinkyDirectives(rawValue) {
     if (Array.isArray(rawValue)) {
         return rawValue.flatMap((item) => parsePloinkyDirectives(item)).filter(Boolean);
@@ -89,7 +119,7 @@ function resolveManifestAuthMode(manifest) {
 function agentRefFromEnableSpec(spec) {
     const raw = String(spec || '').trim();
     if (!raw) return '';
-    const token = raw.split(/\s+/).filter(Boolean)[0] || '';
+    const token = firstEnableSpecToken(raw);
     const slashIndex = token.indexOf('/');
     const colonIndex = token.indexOf(':');
     if (slashIndex !== -1 && colonIndex > slashIndex) {
@@ -179,18 +209,31 @@ function ensurePrefixedRepoInstalled(spec, branchPolicy) {
     }
 }
 
+function repoNameFromManifestPath(manifestPath) {
+    const reposRoot = path.join(PLOINKY_DIR, 'repos');
+    const repoPath = path.dirname(path.dirname(path.resolve(manifestPath)));
+    const relative = path.relative(reposRoot, repoPath);
+    if (!relative || relative.startsWith('..') || path.isAbsolute(relative)) {
+        return '';
+    }
+    return relative.split(path.sep).filter(Boolean)[0] || '';
+}
+
 function readManifestTarget(agentNameOrPath) {
     let manifest;
     let manifestPath;
+    let repoName = '';
     if (agentNameOrPath.endsWith('.json')) {
         manifestPath = agentNameOrPath;
         manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+        repoName = repoNameFromManifestPath(manifestPath);
     } else {
         const resolved = findAgent(agentRefFromEnableSpec(agentNameOrPath) || agentNameOrPath);
         manifestPath = resolved.manifestPath;
         manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+        repoName = resolved.repo || repoNameFromManifestPath(manifestPath);
     }
-    return { manifest, manifestPath };
+    return { manifest, manifestPath, repoName };
 }
 
 function findEnabledDirectiveRecord(parsedDirective) {
@@ -245,7 +288,7 @@ async function applyManifestDirectivesInternal(agentNameOrPath, {
     profile = '',
     visited,
 } = {}) {
-    const { manifest, manifestPath } = readManifestTarget(agentNameOrPath);
+    const { manifest, manifestPath, repoName } = readManifestTarget(agentNameOrPath);
     const visitKey = `${path.resolve(manifestPath)}::${profile || ''}`;
     if (visited.has(visitKey)) {
         return;
@@ -268,8 +311,17 @@ async function applyManifestDirectivesInternal(agentNameOrPath, {
                         branch: resolvedBranch,
                         stdio: 'inherit',
                     });
+                    repos.enableRepo(name, {
+                        branch: resolvedBranch,
+                        branchPolicy,
+                        stdio: 'inherit',
+                    });
                 } else {
                     repos.ensureRepoInstalled(name, value, {
+                        branchPolicy,
+                        stdio: 'inherit',
+                    });
+                    repos.enableRepo(name, {
                         branchPolicy,
                         stdio: 'inherit',
                     });
@@ -289,16 +341,20 @@ async function applyManifestDirectivesInternal(agentNameOrPath, {
             try {
                 const parsed = parseEnableDirective(rawEntry);
                 if (!parsed) continue;
-                ensurePrefixedRepoInstalled(parsed.spec, branchPolicy);
-                if (!shouldEnableDirectiveForManifest(parsed, manifest)) {
+                const qualified = {
+                    ...parsed,
+                    spec: qualifyEnableSpecForRepo(parsed.spec, repoName),
+                };
+                ensurePrefixedRepoInstalled(qualified.spec, branchPolicy);
+                if (!shouldEnableDirectiveForManifest(qualified, manifest)) {
                     continue;
                 }
-                ensureDirectiveEnabled(parsed);
-                const childRef = agentRefFromEnableSpec(parsed.spec);
+                ensureDirectiveEnabled(qualified);
+                const childRef = agentRefFromEnableSpec(qualified.spec);
                 if (childRef) {
                     await applyManifestDirectivesInternal(childRef, {
                         branchPolicy,
-                        profile: parsed.profile || '',
+                        profile: qualified.profile || '',
                         visited,
                     });
                 }

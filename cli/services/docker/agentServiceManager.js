@@ -47,7 +47,7 @@ import { ensureSharedHostDir, runPostinstallHook } from './agentHooks.js';
 import { ensureBwrapService } from '../bwrap/bwrapServiceManager.js';
 import { ensureSeatbeltService } from '../seatbelt/seatbeltServiceManager.js';
 import { detectShellForImage, SHELL_FALLBACK_DIRECT } from './shellDetection.js';
-import { detectRuntimeKeyForAgent } from '../dependencyRuntimeKey.js';
+import { detectRuntimeKeyForAgent, isNoNodeRuntimeKey } from '../dependencyRuntimeKey.js';
 import { nodeModulesDir, prepareAgentCache } from '../dependencyCache.js';
 import {
     runPreContainerLifecycle,
@@ -106,6 +106,9 @@ function resolveLlmRuntimeSharedPath(agentPath) {
 const AGENT_PRIVATE_KEY_CONTAINER_PATH = '/run/ploinky-agent.key';
 const PODMAN_STAGED_NODE_OPTIONS = ['--preserve-symlinks', '--preserve-symlinks-main'];
 const PODMAN_RUNTIME_ROOT = path.join(PLOINKY_DIR, 'container-runtime');
+const PODMAN_ROOTLESS_NETWORK = 'slirp4netns:allow_host_loopback=true';
+const PLOINKY_BOX_NETWORK_COMPAT_HASH = 'slirp4netns-named-network';
+const PLOINKY_BOX_MARKER_PATH = '/etc/ploinky-box';
 
 function pathTypeForSymlink(sourcePath) {
     try {
@@ -316,6 +319,37 @@ function mergeNodeOptions(existingValue, requiredOptions = []) {
     return parts.join(' ');
 }
 
+function resolveDependencyCachePreparation({
+    needsCoreDeps = false,
+    agentHasPackageJson = false,
+    isLlmRuntime = false,
+    runtimeKey = '',
+} = {}) {
+    if (!needsCoreDeps) {
+        return { prepare: false, fatal: false, reason: 'no-core-deps' };
+    }
+    if (!isNoNodeRuntimeKey(runtimeKey)) {
+        return { prepare: true, fatal: false, reason: 'node-runtime' };
+    }
+    if (agentHasPackageJson) {
+        return {
+            prepare: false,
+            fatal: true,
+            reason: 'no-node-image',
+            message: 'container image has no Node binary but the agent has package.json dependencies',
+        };
+    }
+    if (isLlmRuntime) {
+        return {
+            prepare: false,
+            fatal: true,
+            reason: 'no-node-image',
+            message: 'container image has no Node binary but the LLM runtime requires Node dependency preparation',
+        };
+    }
+    return { prepare: false, fatal: false, reason: 'no-node-image' };
+}
+
 /**
  * Resolve a symlink path to its actual target.
  * If the path is not a symlink or doesn't exist, returns the original path.
@@ -434,6 +468,115 @@ function ensureNamedRuntimeNetwork(runtime, networkName) {
     }
 }
 
+// The ploinky-box image bakes /etc/ploinky-box (container-image-builds,
+// images/ploinky-box/Dockerfile). Its presence -- not an env var -- signals
+// that ploinky runs inside the box.
+function isPloinkyBoxRuntime(markerPath = PLOINKY_BOX_MARKER_PATH) {
+    try {
+        return fs.statSync(markerPath).isFile();
+    } catch (_) {
+        return false;
+    }
+}
+
+function resolveEffectiveManifestNetwork(manifest, profileConfig) {
+    if (profileConfig?.network && typeof profileConfig.network === 'object') {
+        return profileConfig.network;
+    }
+    if (manifest?.network && typeof manifest.network === 'object') {
+        return manifest.network;
+    }
+    return null;
+}
+
+function normalizeRuntimeNetwork(network) {
+    const normalized = {
+        mode: '',
+        name: '',
+        aliases: []
+    };
+    if (!network || typeof network !== 'object') {
+        return normalized;
+    }
+    normalized.mode = String(network.mode || '').trim().toLowerCase();
+    normalized.name = String(network.name || '').trim();
+    normalized.aliases = Array.isArray(network.aliases)
+        ? network.aliases.map((entry) => String(entry || '').trim()).filter(Boolean)
+        : [];
+    return normalized;
+}
+
+function buildRuntimeNetworkPlan(runtime, manifestNetwork, options = {}) {
+    const boxMarkerPath = options.boxMarkerPath || PLOINKY_BOX_MARKER_PATH;
+    const network = normalizeRuntimeNetwork(manifestNetwork);
+    const isPodman = runtime === 'podman';
+
+    if (network.mode === 'host') {
+        return {
+            args: isPodman ? ['--replace', '--network', 'host'] : ['--network', 'host'],
+            ensureNetworkName: '',
+            useHostNetwork: true,
+            boxNetworkCompat: false,
+            hashEnv: {}
+        };
+    }
+
+    if (network.name) {
+        if (isPodman && isPloinkyBoxRuntime(boxMarkerPath)) {
+            return {
+                args: ['--replace', '--network', PODMAN_ROOTLESS_NETWORK],
+                ensureNetworkName: '',
+                useHostNetwork: false,
+                boxNetworkCompat: true,
+                hashEnv: { PLOINKY_BOX_NETWORK_COMPAT: PLOINKY_BOX_NETWORK_COMPAT_HASH }
+            };
+        }
+
+        const args = ['--network', network.name];
+        for (const alias of network.aliases) {
+            args.push('--network-alias', alias);
+        }
+        if (isPodman) {
+            args.unshift('--replace');
+        }
+        return {
+            args,
+            ensureNetworkName: network.name,
+            useHostNetwork: false,
+            boxNetworkCompat: false,
+            hashEnv: {}
+        };
+    }
+
+    if (isPodman) {
+        return {
+            args: ['--replace', '--network', PODMAN_ROOTLESS_NETWORK],
+            ensureNetworkName: '',
+            useHostNetwork: false,
+            boxNetworkCompat: false,
+            hashEnv: {}
+        };
+    }
+
+    if (runtime === 'docker') {
+        return {
+            args: ['--add-host', 'host.docker.internal:host-gateway'],
+            ensureNetworkName: '',
+            useHostNetwork: false,
+            boxNetworkCompat: false,
+            hashEnv: {}
+        };
+    }
+
+    return {
+        args: [],
+        ensureNetworkName: '',
+        useHostNetwork: false,
+        boxNetworkCompat: false,
+        hashEnv: {}
+    };
+}
+
 function normalizeProfileEnv(env) {
     if (!env || typeof env !== 'object' || Array.isArray(env)) {
         return {};
@@ -548,13 +691,19 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     }
     let image = manifestImage;
     const useProfileLifecycle = Boolean(profileConfig);
+    const manifestNetwork = resolveEffectiveManifestNetwork(manifest, profileConfig);
+    const runtimeNetworkPlan = buildRuntimeNetworkPlan(runtime, manifestNetwork);
     const runtimeRouterEnv = buildRuntimeRouterEnv(runtime, options);
-    const envHash = computeEnvHash(manifest, profileConfig, runtimeRouterEnv, { agentName, repoName });
+    const envHash = computeEnvHash(manifest, profileConfig, {
+        ...runtimeRouterEnv,
+        ...runtimeNetworkPlan.hashEnv
+    }, { agentName, repoName });
 
     // LLM runtime opt-in: catalog-driven image, hardware-aware policy, reuse hash.
     // Resolved BEFORE dependency cache prep so the cache uses the selected image.
+    const llmRuntimeManifest = isLlmRuntimeManifest(manifest, profileConfig);
     let llmStartup = { enabled: false };
-    if (isLlmRuntimeManifest(manifest, profileConfig)) {
+    if (llmRuntimeManifest) {
         const effectiveNetworkForLlm = profileConfig?.network ?? manifest?.network ?? null;
         llmStartup = prepareLlmStartup({
             runtime,
@@ -607,21 +756,37 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     // INSTALL PHASE — runtime containers never run npm install. Dependency
     // preparation happens here, before runtime boot, via a dedicated cache.
     const agentHasPackageJson = fs.existsSync(path.join(agentCodePath, 'package.json'));
-    const needsCoreDeps = !useStartEntry || agentHasPackageJson || isLlmRuntimeManifest(manifest, profileConfig);
+    const needsCoreDeps = !useStartEntry || agentHasPackageJson || llmRuntimeManifest;
     let preparedNodeModulesDir = path.join(agentWorkDir, 'node_modules');
     if (needsCoreDeps) {
         const runtimeKey = detectRuntimeKeyForAgent(manifest, repoName, agentName, profileConfig, image);
-        const agentPackagePath = agentHasPackageJson ? path.join(agentCodePath, 'package.json') : null;
-        const prepared = prepareAgentCache({
-            repoName,
-            agentName,
+        const dependencyPlan = resolveDependencyCachePreparation({
+            needsCoreDeps,
+            agentHasPackageJson,
+            isLlmRuntime: llmRuntimeManifest,
             runtimeKey,
-            agentPackagePath,
-            image,
-            runtime,
         });
-        preparedNodeModulesDir = nodeModulesDir(prepared.cachePath);
-        debugLog(`[deps] ${agentName}: prepared dependency cache ready at ${preparedNodeModulesDir}`);
+        if (dependencyPlan.fatal) {
+            throw new Error(`[deps] ${agentName}: ${dependencyPlan.message}.`);
+        }
+        if (dependencyPlan.prepare) {
+            const agentPackagePath = agentHasPackageJson ? path.join(agentCodePath, 'package.json') : null;
+            const prepared = prepareAgentCache({
+                repoName,
+                agentName,
+                runtimeKey,
+                agentPackagePath,
+                image,
+                runtime,
+            });
+            preparedNodeModulesDir = nodeModulesDir(prepared.cachePath);
+            debugLog(`[deps] ${agentName}: prepared dependency cache ready at ${preparedNodeModulesDir}`);
+        } else {
+            debugLog(`[deps] ${agentName}: Skipping dependency cache prep (${dependencyPlan.reason})`);
+            if (!fs.existsSync(preparedNodeModulesDir)) {
+                fs.mkdirSync(preparedNodeModulesDir, { recursive: true });
+            }
+        }
     } else {
         debugLog(`[deps] ${agentName}: Skipping dependency cache prep (uses start command, no package.json)`);
         if (!fs.existsSync(preparedNodeModulesDir)) {
@@ -737,17 +902,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     if (skillsPathExists && !skillsPathInsideCode && runtime !== 'podman') {
         args.push('-v', `${agentSkillsPath}:/code/skills${skillsMountMode}`);
     }
-    // Profile-level network overrides root manifest.network (mirrors how ports/env behave).
-    // Lets one manifest declare e.g. host networking for prod and bridge networking for dev.
-    const profileNetwork = profileConfig?.network && typeof profileConfig.network === 'object' ? profileConfig.network : null;
-    const rootNetwork = manifest?.network && typeof manifest.network === 'object' ? manifest.network : null;
-    const manifestNetwork = profileNetwork || rootNetwork;
-    const manifestNetworkMode = String(manifestNetwork?.mode || '').trim().toLowerCase();
-    const manifestNetworkName = String(manifestNetwork?.name || '').trim();
-    const manifestNetworkAliases = Array.isArray(manifestNetwork?.aliases)
-        ? manifestNetwork.aliases.map((entry) => String(entry || '').trim()).filter(Boolean)
-        : [];
-    const useHostNetwork = manifestNetworkMode === 'host';
+    const useHostNetwork = runtimeNetworkPlan.useHostNetwork;
     const additionalServerPort = resolveProfileServer(manifest, profileConfig, {
         runtimeMode: useHostNetwork ? 'host' : 'container'
     });
@@ -770,25 +925,11 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         }
     }
 
-    if (useHostNetwork) {
-        args.splice(1, 0, '--network', 'host');
-        if (runtime === 'podman') {
-            args.splice(1, 0, '--replace');
-        }
-    } else if (manifestNetworkName) {
-        ensureNamedRuntimeNetwork(runtime, manifestNetworkName);
-        args.splice(1, 0, '--network', manifestNetworkName);
-        for (const alias of manifestNetworkAliases) {
-            args.splice(1, 0, '--network-alias', alias);
-        }
-        if (runtime === 'podman') {
-            args.splice(1, 0, '--replace');
-        }
-    } else if (runtime === 'podman') {
-        args.splice(1, 0, '--network', 'slirp4netns:allow_host_loopback=true');
-        args.splice(1, 0, '--replace');
-    } else if (runtime === 'docker') {
-        args.splice(1, 0, '--add-host', 'host.docker.internal:host-gateway');
+    if (runtimeNetworkPlan.ensureNetworkName) {
+        ensureNamedRuntimeNetwork(runtime, runtimeNetworkPlan.ensureNetworkName);
+    }
+    if (runtimeNetworkPlan.args.length) {
+        args.splice(1, 0, ...runtimeNetworkPlan.args);
     }
 
     for (const { resolvedHostPath, containerPath } of manifestVolumeMounts) {
@@ -1192,9 +1333,19 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
         routerPort: routerPortOverride,
         routerHost: routerHostOverride
     });
+    const runtimeNetworkPlan = buildRuntimeNetworkPlan(
+        runtime,
+        resolveEffectiveManifestNetwork(manifest, profileConfig)
+    );
+    const envHashExtra = {
+        ...runtimeRouterEnv,
+        ...runtimeNetworkPlan.hashEnv
+    };
 
     const { publishArgs: manifestPorts, portMappings } = parseManifestPorts(manifest, profileConfig);
-    const additionalServerPort = resolveProfileServer(manifest, profileConfig, { runtimeMode: 'container' });
+    const additionalServerPort = resolveProfileServer(manifest, profileConfig, {
+        runtimeMode: runtimeNetworkPlan.useHostNetwork ? 'host' : 'container'
+    });
     const containerPortCandidates = portMappings
         .map((mapping) => mapping?.containerPort)
         .filter((port) => typeof port === 'number' && port > 0);
@@ -1211,7 +1362,7 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
     }
 
     if (containerExists(containerName)) {
-        const desired = computeEnvHash(manifest, profileConfig, runtimeRouterEnv, { agentName, repoName });
+        const desired = computeEnvHash(manifest, profileConfig, envHashExtra, { agentName, repoName });
         const current = getContainerLabel(containerName, 'ploinky.envhash');
         if (desired && desired !== current) {
             debugLog(`[ensureAgentService] ${agentName}: env hash changed (current=${current || '<none>'}, desired=${desired.slice(0, 12)}…), recreating container`);
@@ -1222,7 +1373,7 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
     // LLM runtime: include architecture/catalog/digest/policy in reuse comparison.
     if (containerExists(containerName) && isLlmRuntimeManifest(manifest, profileConfig)) {
         try {
-            const desiredEnvHash = computeEnvHash(manifest, profileConfig, runtimeRouterEnv, { agentName, repoName });
+            const desiredEnvHash = computeEnvHash(manifest, profileConfig, envHashExtra, { agentName, repoName });
             const effectiveNetworkForLlm = profileConfig?.network ?? manifest?.network ?? null;
             const probe = prepareLlmStartup({
                 runtime,
@@ -1406,6 +1557,7 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
 export {
     assertPodmanCodeMountAllowed,
     buildPodmanStagedTargetMounts,
+    buildRuntimeNetworkPlan,
     buildRuntimeRouterEnv,
     codeRelativeMountPath,
     ensureAgentService,
@@ -1413,6 +1565,7 @@ export {
     ensurePodmanStagedCodeDir,
     mergeNodeOptions,
     podmanMountSuffix,
+    resolveDependencyCachePreparation,
     resolveHostPort,
     resolveHostPortFromRecord,
     resolveHostPortFromRuntime,

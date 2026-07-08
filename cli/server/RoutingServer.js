@@ -140,6 +140,12 @@ function sendJsonResponse(res, statusCode, body, extraHeaders = {}) {
     res.end(data);
 }
 
+function isRemovedLegacySurfaceAuthRoute(pathname, method) {
+    const normalizedPath = String(pathname || '').replace(/\/+$/, '') || '/';
+    return method === 'POST'
+        && (normalizedPath === '/webmeet/auth' || normalizedPath === '/webtty/auth');
+}
+
 function decodePathSegment(value) {
     try {
         return decodeURIComponent(value || '');
@@ -435,6 +441,15 @@ async function processRequest(req, res) {
     // does not confirm the internal route exists.
     if (hasInternalAgentSegment(pathname)) {
         sendJsonResponse(res, 404, { error: 'not_found' });
+        return;
+    }
+
+    if (isRemovedLegacySurfaceAuthRoute(pathname, req.method)) {
+        sendJsonResponse(res, 410, {
+            ok: false,
+            error: 'surface_token_auth_removed',
+            detail: 'Use the router login page; per-surface token auth endpoints are no longer supported.',
+        }, { 'Cache-Control': 'no-store' });
         return;
     }
 

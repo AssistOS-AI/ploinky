@@ -19,17 +19,23 @@ test('verifyEnabledAgentStarted logs when the enabled agent container is running
 
 test('verifyEnabledAgentStarted waits briefly before failing a non-running container', () => {
     let waitCalls = 0;
+    let waitAttempts = 0;
+    let waitDelayMs = 0;
 
     assert.throws(() => verifyEnabledAgentStarted('codexAgent', 'ploinky_codexAgent_test', {
         isRunning: () => false,
-        waitRunning: () => {
+        waitRunning: (_containerName, attempts, delayMs) => {
             waitCalls += 1;
+            waitAttempts = attempts;
+            waitDelayMs = delayMs;
             return false;
         },
         log: () => {}
     }), /enable agent: failed to start 'codexAgent': container 'ploinky_codexAgent_test' exited during startup/);
 
     assert.equal(waitCalls, 1);
+    assert.equal(waitAttempts, 40);
+    assert.equal(waitDelayMs, 250);
 });
 
 test('verifyEnabledAgentStarted fails clearly when startup returns no container', () => {

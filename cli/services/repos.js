@@ -4,6 +4,7 @@ import { execFileSync } from 'child_process';
 import { PLOINKY_DIR } from './config.js';
 
 export const REPO_SOURCES_FILE = path.join(PLOINKY_DIR, 'repo_sources.json');
+export const ENABLED_REPOS_FILE = path.join(PLOINKY_DIR, 'enabled_repos.json');
 const REPOS_DIR = path.join(PLOINKY_DIR, 'repos');
 
 function loadRepoSources() {
@@ -114,7 +115,12 @@ export function getInstalledRepos(REPOS_DIR) {
 }
 
 export function getActiveRepos(REPOS_DIR) {
-    return getInstalledRepos(REPOS_DIR);
+    const enabled = loadEnabledRepos();
+    if (!enabled.length) {
+        return getInstalledRepos(REPOS_DIR);
+    }
+    const installed = new Set(getInstalledRepos(REPOS_DIR));
+    return enabled.filter(repoName => installed.has(repoName));
 }
 
 const PREDEFINED_REPOS = {
@@ -303,6 +309,71 @@ export function addRepo(name, url, branch = null, { stdio = 'inherit' } = {}) {
     execFileSync('git', args, { stdio });
     recordRepoSource(name, actualUrl, actualBranch);
     return { status: 'cloned', path: repoPath, branch: actualBranch || 'default' };
+}
+
+export function loadEnabledRepos() {
+    try {
+        const raw = fs.readFileSync(ENABLED_REPOS_FILE, 'utf8');
+        const parsed = JSON.parse(raw || '[]');
+        if (!Array.isArray(parsed)) return [];
+        const seen = new Set();
+        const repos = [];
+        for (const entry of parsed) {
+            const repoName = String(entry || '').trim();
+            if (!repoName || seen.has(repoName)) continue;
+            seen.add(repoName);
+            repos.push(repoName);
+        }
+        return repos;
+    } catch (_) {
+        return [];
+    }
+}
+
+function saveEnabledRepos(repoNames) {
+    const seen = new Set();
+    const repos = [];
+    for (const entry of repoNames || []) {
+        const repoName = String(entry || '').trim();
+        if (!repoName || seen.has(repoName)) continue;
+        seen.add(repoName);
+        repos.push(repoName);
+    }
+    fs.mkdirSync(PLOINKY_DIR, { recursive: true });
+    fs.writeFileSync(ENABLED_REPOS_FILE, JSON.stringify(repos, null, 2));
+    return repos;
+}
+
+export function enableRepo(name, { branch = null, branchPolicy = null, stdio = 'inherit' } = {}) {
+    const repoName = normalizeRepoName(name);
+    const source = resolveRepoSource(repoName, null, branch);
+    const result = ensureRepoInstalled(repoName, source?.url || null, {
+        branchPolicy,
+        branch,
+        stdio,
+    });
+    const enabled = loadEnabledRepos();
+    if (!enabled.includes(repoName)) {
+        enabled.push(repoName);
+        saveEnabledRepos(enabled);
+    }
+    return {
+        status: enabled.includes(repoName) ? 'enabled' : 'unchanged',
+        name: repoName,
+        path: result.path,
+        branch: result.branch || null,
+    };
+}
+
+export function disableRepo(name) {
+    const repoName = normalizeRepoName(name);
+    const enabled = loadEnabledRepos();
+    const next = enabled.filter(entry => entry !== repoName);
+    saveEnabledRepos(next);
+    return {
+        status: next.length === enabled.length ? 'not-enabled' : 'disabled',
+        name: repoName,
+    };
 }
 
 export function installRepo(url, name = null, branch = null, { stdio = 'inherit' } = {}) {

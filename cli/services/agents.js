@@ -87,7 +87,7 @@ export function verifyEnabledAgentStarted(shortAgentName, containerName, {
     if (!containerName) {
         throw new Error(`enable agent: failed to start '${shortAgentName}': no container was returned.`);
     }
-    const running = isRunning(containerName) || waitRunning(containerName, 8, 250);
+    const running = isRunning(containerName) || waitRunning(containerName, 40, 250);
     if (!running) {
         throw new Error(`enable agent: failed to start '${shortAgentName}': container '${containerName}' exited during startup. Check container logs for details.`);
     }

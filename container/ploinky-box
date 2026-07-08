@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# ploinky-box: thin launcher — all logic lives in ploinky-box.mjs next to it.
+# Host requirements: podman (preferred) or docker, plus Node >= 20.
+set -euo pipefail
+
+SCRIPT_PATH="$(readlink -f "$0" 2>/dev/null || true)"
+if [ -z "$SCRIPT_PATH" ]; then
+    SCRIPT_PATH="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+fi
+SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
+
+if ! command -v node >/dev/null 2>&1; then
+    echo "ploinky-box: node >= 20 is required (https://nodejs.org) — the box itself still only needs podman/docker." >&2
+    exit 1
+fi
+
+exec node "$SCRIPT_DIR/ploinky-box.mjs" "$@"

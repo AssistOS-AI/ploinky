@@ -327,8 +327,11 @@ function sleepMs(ms) {
 }
 
 function parseManifestPorts(manifest, profileConfig = null) {
+    if (manifest && Object.prototype.hasOwnProperty.call(manifest, 'ports')) {
+        throw new Error("manifest field 'ports' was renamed to profile field 'openPorts'");
+    }
     // Open ports must be defined in profile configuration.
-    const ports = profileConfig?.openPorts;
+    const ports = profileConfig?.openPorts ?? profileConfig?.ports;
     if (!ports) return { publishArgs: [], portMappings: [] };
 
     const portArray = Array.isArray(ports) ? ports : [ports];

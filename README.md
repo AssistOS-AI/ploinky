@@ -5,7 +5,7 @@ Ploinky is a lightweight runtime for AI agents. It is technology‑agnostic: an 
 Beyond a single agent, Ploinky supports a multi‑agent workspace. Each agent runs in its own container. A local web router serves a simple web app and proxies API calls to the containers, so you can build applications that orchestrate multiple agents. A companion cloud component (in progress) will host multiple such custom apps, each with its own agents and routes.
 
 ## Prerequisites
-- Node.js 18+
+- Node.js 20+
 - Docker or Podman
 - Git
 
@@ -49,6 +49,30 @@ You can use Ploinky in two ways:
     ```bash
     ploinky list agents
     ```
+
+By default, `ploinky` now runs through the boxed runtime. Existing commands keep
+their syntax, but agents run as nested containers inside one outer box
+container.
+The box does not bake Ploinky core: your local checkout is mounted read-only
+into the box, so core edits on the host apply to a running box without an
+image rebuild. On first use, ploinky asks before installing its npm
+dependencies into the box's dependency volume.
+
+Use `ploinky box status`, `ploinky box stop`, `ploinky box update`, and
+`ploinky box destroy` for the outer container lifecycle. Bare commands such as
+`ploinky status`, `ploinky stop`, and `ploinky destroy` are forwarded to the
+normal Ploinky CLI inside the box.
+
+Box selector flags such as `--name` and `--port` can appear before or after a
+public command. Put `--dry-run` before the command for wrapper dry-run; after
+the command it is forwarded to the in-box Ploinky CLI.
+
+For local CLI development without the box, run the CLI entry directly from
+your checkout:
+
+```bash
+node cli/index.js <args>
+```
 
 ## Core commands (in p-cli)
 

@@ -3,6 +3,7 @@ import { getRuntime, getRuntimeForAgent, ensureImagePresent } from './docker/com
 import { resolveManifestImage } from './secretVars.js';
 
 const SUPPORTED_FAMILIES = new Set(['bwrap', 'seatbelt', 'container']);
+const NO_NODE_RUNTIME_KEY = 'container-no-node';
 
 // The probe only starts a container and runs a tiny `node -e` script, so it
 // should finish in seconds. Keep the timeout short (env-overridable) so it
@@ -38,6 +39,10 @@ function buildRuntimeKey({ family, platform, arch, nodeMajor, variant = '' }) {
     return `${family}-${platform}-${arch}${variantSuffix}-node${nodeMajor}`;
 }
 
+function isNoNodeRuntimeKey(runtimeKey) {
+    return String(runtimeKey || '') === NO_NODE_RUNTIME_KEY;
+}
+
 export function detectHostRuntimeKey(runtimeFamily) {
     const family = normalizeRuntimeFamily(runtimeFamily);
     if (family === 'container') {
@@ -71,6 +76,9 @@ export function parseContainerProbeOutput(raw) {
     } catch (err) {
         throw new Error(`Container runtime-key probe returned invalid JSON: ${err.message}`);
     }
+    if (parsed?.noNode === true) {
+        return { noNode: true };
+    }
     const platform = String(parsed?.platform || '').trim();
     const arch = String(parsed?.arch || '').trim();
     const nodeMajor = Number.parseInt(parsed?.nodeMajor, 10);
@@ -82,6 +90,13 @@ export function parseContainerProbeOutput(raw) {
         ? libc
         : '';
     return { platform, arch, nodeMajor, variant };
+}
+
+function isNodeMissingProbeFailure(status, stderr) {
+    if (status !== 127) return false;
+    const text = String(stderr || '').toLowerCase();
+    if (!text.includes('node')) return false;
+    return /not found|no such file|not in \$?path|executable file/.test(text);
 }
 
 function defaultContainerProbe({ image, runtime }) {
@@ -116,6 +131,9 @@ function defaultContainerProbe({ image, runtime }) {
             throw new Error(`Container image '${image}' is not present locally (probe uses --pull=never). `
                 + `Pull it first: '${runtime} pull ${image}'.`);
         }
+        if (isNodeMissingProbeFailure(res.status, stderr)) {
+            return JSON.stringify({ noNode: true });
+        }
         throw new Error(`Container runtime-key probe exited with code ${res.status}${stderr ? `: ${stderr}` : ''}`);
     }
     return String(res.stdout || '').trim();
@@ -145,6 +163,9 @@ export function detectContainerRuntimeKey({
     ensureImage({ image: resolvedImage, runtime: resolvedRuntime, manifest, repoName, agentName });
     const output = execProbe({ image: resolvedImage, runtime: resolvedRuntime, manifest, repoName, agentName });
     const probe = parseContainerProbeOutput(output);
+    if (probe.noNode === true) {
+        return NO_NODE_RUNTIME_KEY;
+    }
     return buildRuntimeKey({
         family: 'container',
         platform: probe.platform,
@@ -166,4 +187,4 @@ export function parseRuntimeKey(runtimeKey) {
     };
 }
 
-export { normalizeRuntimeFamily, buildRuntimeKey, SUPPORTED_FAMILIES };
+export { normalizeRuntimeFamily, buildRuntimeKey, isNoNodeRuntimeKey, NO_NODE_RUNTIME_KEY, SUPPORTED_FAMILIES };

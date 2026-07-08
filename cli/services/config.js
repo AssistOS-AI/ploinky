@@ -88,7 +88,7 @@ export const GLOBAL_DEPS_PATH = path.join(path.dirname(new URL(import.meta.url).
 let DEBUG_MODE = process.env.PLOINKY_DEBUG === '1';
 
 export function logPloinkyDirectory() {
-    console.log(`[ploinky] using .ploinky: ${path.resolve(PLOINKY_DIR)}`);
+    console.error(`[ploinky] using .ploinky: ${path.resolve(PLOINKY_DIR)}`);
 }
 
 export function setDebugMode(enabled) {

@@ -1,6 +1,6 @@
 import fs from 'fs';
 import path from 'path';
-import { parseEnableDirective } from './bootstrapManifest.js';
+import { parseEnableDirective, qualifyEnableSpecForRepo } from './bootstrapManifest.js';
 import { findAgent } from './utils.js';
 import { isSsoProviderManifest } from './agentRegistry.js';
 import { getActiveProfile } from './profileService.js';
@@ -200,19 +200,23 @@ function resolveWorkspaceDependencyGraph({ staticAgentRef, registry = {} } = {})
                 const parsedDependency = parseEnableDirective(rawDependency);
                 if (!parsedDependency) continue;
 
-                const dependencyRef = parseManifestDependencyRef(parsedDependency.spec);
+                const qualifiedDependency = {
+                    ...parsedDependency,
+                    spec: qualifyEnableSpecForRepo(parsedDependency.spec, node.repoName),
+                };
+                const dependencyRef = parseManifestDependencyRef(qualifiedDependency.spec);
                 if (!shouldEnableManifestDependency(dependencyRef, node.authMode)) {
                     continue;
                 }
 
                 const childId = visit(dependencyRef, {
-                    alias: parsedDependency.alias || '',
-                    enableSpec: parsedDependency.spec || dependencyRef,
-                    profile: parsedDependency.profile || '',
+                    alias: qualifiedDependency.alias || '',
+                    enableSpec: qualifiedDependency.spec || dependencyRef,
+                    profile: qualifiedDependency.profile || '',
                     stack: nextStack
                 });
                 node.dependencies.add(childId);
-                const noWait = Boolean(parsedDependency.noWait);
+                const noWait = Boolean(qualifiedDependency.noWait);
                 const existingEdge = node.dependencyEdges.get(childId);
                 // When the same parent declares the same child twice (typical when
                 // a top-level enable[] entry overlaps a profile enable[] entry),

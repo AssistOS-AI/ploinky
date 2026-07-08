@@ -5,7 +5,8 @@
     "type": "module",
     "main": "cloud/core/server.js",
     "bin": {
-        "p-cloud": "./bin/p-cloud"
+        "p-cloud": "./bin/p-cloud",
+        "ploinky": "./bin/ploinky"
     },
     "scripts": {
         "start": "cd test_run_dir node bin/p-cloud",
@@ -24,13 +25,13 @@
     "author": "Ploinky Team",
     "license": "MIT",
     "engines": {
-        "node": ">=14.0.0"
+        "node": ">=20.0.0"
     },
     "repository": {
         "type": "git",
         "url": "https://github.com/AssistOS-AI/ploinky.git"
     },
     "dependencies": {
-        "mcp-sdk": "github:AssistOS-AI/MCPSDK#main"
+        "mcp-sdk": "git+https://github.com/AssistOS-AI/MCPSDK.git#main"
     }
 }

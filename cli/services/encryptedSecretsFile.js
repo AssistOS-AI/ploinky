@@ -10,6 +10,7 @@ const ALGORITHM = 'aes-256-gcm';
 const IV_BYTES = 12;
 const TAG_BYTES = 16;
 const SUBKEY_PURPOSE = 'storage/secrets';
+const KEY_MISMATCH_HINT = 'Check PLOINKY_MASTER_KEY, any walked-up .env, and .ploinky/master-key; .ploinky/.secrets may have been written with a different master seed.';
 
 function getStorageKey() {
     return deriveSubkey(SUBKEY_PURPOSE);
@@ -75,7 +76,7 @@ function readSecretsFile() {
     try {
         payload = JSON.parse(decryptPacked(raw));
     } catch (error) {
-        throw new Error(`Unable to decrypt .ploinky/.secrets: ${error?.message || String(error)}`);
+        throw new Error(`Unable to decrypt .ploinky/.secrets: ${error?.message || String(error)}. ${KEY_MISMATCH_HINT}`);
     }
     return normalizeSecretsMap(payload?.secrets);
 }

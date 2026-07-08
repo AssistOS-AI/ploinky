@@ -718,11 +718,19 @@ function createAgentClient(baseUrl, options = {}) {
                 for (const [key, value] of requestHeaders) {
                     headers.set(key, value);
                 }
-                await fetch(endpoint, {
-                    method: 'DELETE',
-                    headers,
-                    credentials: 'include'
-                });
+                const closeController = new AbortController();
+                const closeTimer = setTimeout(() => closeController.abort(), 1000);
+                closeTimer.unref?.();
+                try {
+                    await fetch(endpoint, {
+                        method: 'DELETE',
+                        headers,
+                        credentials: 'include',
+                        signal: closeController.signal,
+                    });
+                } finally {
+                    clearTimeout(closeTimer);
+                }
             }
         } catch {
             // Ignore close errors

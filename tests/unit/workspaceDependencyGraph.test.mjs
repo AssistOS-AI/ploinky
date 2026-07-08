@@ -16,6 +16,16 @@ function writeManifest(repoName, agentName, manifest) {
     );
 }
 
+function writeEnabledRepos(repoNames = []) {
+    const file = path.join(tempDir, '.ploinky', 'enabled_repos.json');
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, JSON.stringify(repoNames, null, 2));
+}
+
+function clearEnabledRepos() {
+    fs.rmSync(path.join(tempDir, '.ploinky', 'enabled_repos.json'), { force: true });
+}
+
 process.chdir(tempDir);
 
 const moduleSuffix = `?test=${Date.now()}`;
@@ -30,7 +40,7 @@ const {
     resolveWorkspaceDependencyGraph,
     topologicallyGroupDependencyGraph
 } = graphModule;
-const { parseEnableDirective } = bootstrapModule;
+const { applyManifestDirectives, parseEnableDirective } = bootstrapModule;
 
 test.after(() => {
     process.chdir(originalCwd);
@@ -73,7 +83,7 @@ test('resolveWorkspaceDependencyGraph collects recursive dependencies and preser
     );
 });
 
-test('resolveWorkspaceDependencyGraph preserves the original enable spec for dependency modes', () => {
+test('resolveWorkspaceDependencyGraph preserves dependency modes while qualifying relative refs', () => {
     writeManifest('demo', 'mode-target', { container: 'node:20-alpine' });
     writeManifest('demo', 'mode-app', {
         container: 'node:20-alpine',
@@ -81,7 +91,129 @@ test('resolveWorkspaceDependencyGraph preserves the original enable spec for dep
     });
 
     const graph = resolveWorkspaceDependencyGraph({ staticAgentRef: 'demo/mode-app' });
-    assert.equal(graph.nodes.get('demo/mode-target').enableSpec, 'mode-target global');
+    assert.equal(graph.nodes.get('demo/mode-target').enableSpec, 'demo/mode-target global');
+});
+
+test('resolveWorkspaceDependencyGraph resolves same-repo bare dependencies when enabled repos are filtered', (t) => {
+    writeEnabledRepos(['basic']);
+    t.after(clearEnabledRepos);
+
+    writeManifest('basic', 'webtty', { container: 'node:20-alpine' });
+    writeManifest('AchillesIDE', 'gitAgent', { container: 'node:20-alpine' });
+    writeManifest('AchillesIDE', 'explorer', {
+        container: 'node:20-alpine',
+        enable: [
+            {
+                agent: 'gitAgent global',
+                profile: 'embedded',
+            },
+            'basic/webtty',
+        ],
+    });
+
+    const graph = resolveWorkspaceDependencyGraph({ staticAgentRef: 'AchillesIDE/explorer' });
+
+    assert.ok(graph.nodes.has('AchillesIDE/gitAgent'));
+    assert.ok(graph.nodes.has('basic/webtty'));
+    assert.equal(graph.nodes.get('AchillesIDE/gitAgent').enableSpec, 'AchillesIDE/gitAgent global');
+    assert.equal(graph.nodes.get('AchillesIDE/gitAgent').profile, 'embedded');
+    assert.ok(graph.nodes.get('AchillesIDE/explorer').dependencies.has('AchillesIDE/gitAgent'));
+});
+
+test('resolveWorkspaceDependencyGraph leaves cross-repo bare dependencies available for global lookup', (t) => {
+    writeEnabledRepos(['appRepo']);
+    t.after(clearEnabledRepos);
+
+    writeManifest('toolsRepo', 'sharedTool', { container: 'node:20-alpine' });
+    writeManifest('appRepo', 'app', {
+        container: 'node:20-alpine',
+        enable: ['sharedTool global no-wait'],
+    });
+
+    const graph = resolveWorkspaceDependencyGraph({ staticAgentRef: 'appRepo/app' });
+
+    assert.ok(graph.nodes.has('toolsRepo/sharedTool'));
+    assert.equal(graph.nodes.get('toolsRepo/sharedTool').enableSpec, 'sharedTool global');
+    assert.ok(graph.nodes.get('appRepo/app').dependencies.has('toolsRepo/sharedTool'));
+    assert.equal(graph.nodes.get('appRepo/app').dependencyEdges.get('toolsRepo/sharedTool')?.noWait, true);
+});
+
+test('applyManifestDirectives resolves same-repo bare entries when enabled repos are filtered', async (t) => {
+    writeEnabledRepos(['basic']);
+    t.after(() => {
+        clearEnabledRepos();
+        fs.rmSync(path.join(tempDir, '.ploinky', 'agents.json'), { force: true });
+    });
+
+    writeManifest('AchillesIDE', 'gitAgent', { container: 'node:20-alpine' });
+    writeManifest('AchillesIDE', 'explorer-bootstrap', {
+        container: 'node:20-alpine',
+        enable: [
+            {
+                agent: 'gitAgent global',
+                profile: 'embedded',
+            },
+        ],
+    });
+    fs.writeFileSync(
+        path.join(tempDir, '.ploinky', 'agents.json'),
+        JSON.stringify({
+            existing_gitAgent: {
+                type: 'agent',
+                repoName: 'AchillesIDE',
+                agentName: 'gitAgent',
+                config: {},
+            },
+        }, null, 2)
+    );
+
+    await applyManifestDirectives('AchillesIDE/explorer-bootstrap');
+    const agents = JSON.parse(fs.readFileSync(path.join(tempDir, '.ploinky', 'agents.json'), 'utf8'));
+    const records = Object.values(agents).filter((record) => record?.type === 'agent');
+
+    assert.equal(records.length, 1);
+    assert.equal(records[0].repoName, 'AchillesIDE');
+    assert.equal(records[0].agentName, 'gitAgent');
+    assert.equal(records[0].profile, 'embedded');
+});
+
+test('applyManifestDirectives leaves cross-repo bare entries available for global lookup', async (t) => {
+    writeEnabledRepos(['appRepo']);
+    t.after(() => {
+        clearEnabledRepos();
+        fs.rmSync(path.join(tempDir, '.ploinky', 'agents.json'), { force: true });
+    });
+
+    writeManifest('toolsRepo', 'sharedTool', { container: 'node:20-alpine' });
+    writeManifest('appRepo', 'app-bootstrap', {
+        container: 'node:20-alpine',
+        enable: [
+            {
+                agent: 'sharedTool global',
+                profile: 'utility',
+            },
+        ],
+    });
+    fs.writeFileSync(
+        path.join(tempDir, '.ploinky', 'agents.json'),
+        JSON.stringify({
+            existing_sharedTool: {
+                type: 'agent',
+                repoName: 'toolsRepo',
+                agentName: 'sharedTool',
+                config: {},
+            },
+        }, null, 2)
+    );
+
+    await applyManifestDirectives('appRepo/app-bootstrap');
+    const agents = JSON.parse(fs.readFileSync(path.join(tempDir, '.ploinky', 'agents.json'), 'utf8'));
+    const records = Object.values(agents).filter((record) => record?.type === 'agent');
+
+    assert.equal(records.length, 1);
+    assert.equal(records[0].repoName, 'toolsRepo');
+    assert.equal(records[0].agentName, 'sharedTool');
+    assert.equal(records[0].profile, 'utility');
 });
 
 test('resolveWorkspaceDependencyGraph respects SSO gating for provider dependencies', () => {

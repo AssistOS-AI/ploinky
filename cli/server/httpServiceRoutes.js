@@ -10,9 +10,13 @@ import { normalizeHttpRouteAccess } from './policy/HttpRouteAccessDecision.js';
 const DEFAULT_DELEGATION_TTL_SECONDS = 1800;
 const REMOVED_SERVICE_SPEC_FIELDS = ['auth', 'mode', ['force', 'Guest'].join('')];
 
+function resolveCurrentWorkspaceRoot() {
+    return String(process.env.PLOINKY_WORKSPACE_ROOT || '').trim() || PLOINKY_WORKSPACE_ROOT;
+}
+
 export function loadRoutingConfig() {
     const dynamicRoutingFile = process.env.PLOINKY_ROUTING_FILE
-        || path.join(PLOINKY_WORKSPACE_ROOT, '.ploinky', 'routing.json');
+        || path.join(resolveCurrentWorkspaceRoot(), '.ploinky', 'routing.json');
     const routingFile = fs.existsSync(dynamicRoutingFile) ? dynamicRoutingFile : ROUTING_FILE;
     try {
         return JSON.parse(fs.readFileSync(routingFile, 'utf8')) || {};

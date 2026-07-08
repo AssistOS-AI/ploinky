@@ -256,11 +256,15 @@ function getAuthPageStyles() {
 }
 
 function renderLocalLoginHtml({ agentName, returnTo = '/', error = '', notice = '', usersVar = '' } = {}) {
-    const safeAgent = escapeHtml(agentName || 'application');
+    const rawAgent = String(agentName || '').trim();
+    const safeAgent = escapeHtml(rawAgent || 'application');
     const safeReturnTo = escapeHtml(normalizeRelativePath(returnTo, '/'));
     const safeError = escapeHtml(error || '');
     const safeNotice = escapeHtml(notice || '');
     const safeBrandingName = escapeHtml(readRouterSettings().loginBrandingName);
+    const safeLoginAction = escapeHtml(rawAgent
+        ? `/auth/login?agent=${encodeURIComponent(rawAgent)}`
+        : '/auth/login');
     return `<!doctype html>
 <html lang="en">
 <head>
@@ -277,7 +281,7 @@ function renderLocalLoginHtml({ agentName, returnTo = '/', error = '', notice = 
       <h1>${safeBrandingName}</h1>
       ${safeNotice ? `<div class="auth-notice">${safeNotice}</div>` : ''}
       ${safeError ? `<div class="auth-error">${safeError}</div>` : ''}
-      <form method="post" action="/auth/login">
+      <form method="post" action="${safeLoginAction}" data-auth-login-form>
         <input type="hidden" name="agent" value="${safeAgent}" />
         <input type="hidden" name="returnTo" value="${safeReturnTo}" />
         <label for="username">Username</label>
@@ -290,7 +294,7 @@ function renderLocalLoginHtml({ agentName, returnTo = '/', error = '', notice = 
   </main>
   <script>
     (() => {
-      const form = document.querySelector('form[action="/auth/login"]');
+      const form = document.querySelector('form[data-auth-login-form]');
       const button = form?.querySelector('button[type="submit"]');
       if (!form || !button) return;
       form.addEventListener('submit', () => {

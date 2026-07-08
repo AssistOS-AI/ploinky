@@ -1,6 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import { REPOS_DIR, isDebugMode } from './config.js';
+import * as reposSvc from './repos.js';
 
 // Simple ANSI color helpers
 const ANSI = {
@@ -43,18 +44,31 @@ function findAgent(agentName) {
     if (!fs.existsSync(REPOS_DIR)) {
         throw new Error("Ploinky environment not initialized. No repos found.");
     }
-    const repos = fs.readdirSync(REPOS_DIR);
-    debugLog(`Searching in repos: ${repos.join(', ')}`);
-    for (const repo of repos) {
-        const repoPath = path.join(REPOS_DIR, repo);
-        if (fs.statSync(repoPath).isDirectory()) {
-            const agentPath = path.join(repoPath, agentName);
-            const manifestPath = path.join(agentPath, 'manifest.json');
-            if (fs.existsSync(manifestPath)) {
-                debugLog(`Found potential match in repo '${repo}': ${manifestPath}`);
-                foundAgents.push({ manifestPath, repo: repo, shortAgentName: agentName });
+    const installedRepos = fs.readdirSync(REPOS_DIR);
+    const enabledRepos = reposSvc.loadEnabledRepos();
+    const primaryRepos = enabledRepos.length
+        ? enabledRepos.filter(repo => installedRepos.includes(repo))
+        : installedRepos;
+    const searchRepos = (repos, label) => {
+        debugLog(`Searching ${label} repos: ${repos.join(', ')}`);
+        for (const repo of repos) {
+            const repoPath = path.join(REPOS_DIR, repo);
+            if (fs.statSync(repoPath).isDirectory()) {
+                const agentPath = path.join(repoPath, agentName);
+                const manifestPath = path.join(agentPath, 'manifest.json');
+                if (fs.existsSync(manifestPath)) {
+                    debugLog(`Found potential match in repo '${repo}': ${manifestPath}`);
+                    foundAgents.push({ manifestPath, repo: repo, shortAgentName: agentName });
+                }
             }
         }
+    };
+
+    searchRepos(primaryRepos, enabledRepos.length ? 'enabled' : 'installed');
+    if (foundAgents.length === 0 && enabledRepos.length) {
+        const primaryRepoSet = new Set(primaryRepos);
+        const fallbackRepos = installedRepos.filter(repo => !primaryRepoSet.has(repo));
+        searchRepos(fallbackRepos, 'inactive installed');
     }
 
     if (foundAgents.length === 0) {

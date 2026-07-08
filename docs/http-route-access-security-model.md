@@ -38,14 +38,14 @@ through one executor before proxying.
 ## Trust Boundaries
 
 Ploinky is still a local workspace runtime. The trusted assets are the operator
-account, the host filesystem, `PLOINKY_MASTER_KEY`, the `.ploinky/` workspace
-state directory, and the router process. Agents are operator-enabled code, not
+account, the host filesystem, `PLOINKY_MASTER_KEY` or `.ploinky/master-key`, the
+`.ploinky/` workspace state directory, and the router process. Agents are operator-enabled code, not
 mutually hostile tenants.
 
 | Boundary | What It Protects | Current Rule |
 | --- | --- | --- |
 | Router public HTTP listener | Browser routes, HTTP services, first-party surfaces, policy commands, MCP entry points. | The router owns authentication, route access, internal path rejection, and proxy dispatch. |
-| Workspace master key | Session signing, encrypted stores, per-agent request secrets, generated secrets. | `PLOINKY_MASTER_KEY` is high trust; all purpose keys are HKDF-derived from it. |
+| Workspace master key | Session signing, encrypted stores, per-agent request secrets, generated secrets. | The resolved master seed is high trust; explicit `PLOINKY_MASTER_KEY` / `.env` values and the generated `.ploinky/master-key` fallback all root the same HKDF tree. |
 | Agent environment | Agent identity and per-agent signing. | Agents receive only `PLOINKY_AGENT_ID`, `PLOINKY_AGENT_PRINCIPAL`, and their own `PLOINKY_AGENT_SECRET`; they never receive the master or shared derived-master request key. |
 | Policy state | Operator/admin HTTP and MCP policy. | Corrupt or old schema state fails the whole document closed. |
 | Manifest declarations | Agent-owned routing/service intent. | Manifests may declare route access and HTTP services in the new vocabulary. Manifest route entries may omit `access` to default to `authenticated`; services must be explicit. Invalid local specs are skipped or unmounted locally. |
