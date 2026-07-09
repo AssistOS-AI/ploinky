@@ -8,6 +8,7 @@ import { validateSecrets, getSecrets, createEnvWithSecrets, formatMissingSecrets
 import { buildEnvMap } from './secretVars.js';
 import { buildAgentIdentityEnv, stripReservedAgentEnv } from './agentIdentityEnv.js';
 import { deriveAgentPrincipalId } from './agentIdentity.js';
+import { resolveMasterKeySeed } from './masterKey.js';
 import {
     initWorkspaceStructure,
     createAgentSymlinks,
@@ -142,6 +143,12 @@ export function executeHostHook(scriptPath, env = {}, options = {}) {
     // operator-exported process env) always wins.
     if (!hookEnv.PLOINKY_WORKSPACE_ROOT) {
         hookEnv.PLOINKY_WORKSPACE_ROOT = cwd;
+    }
+    if (!String(hookEnv.PLOINKY_MASTER_KEY || '').trim()) {
+        hookEnv.PLOINKY_MASTER_KEY = resolveMasterKeySeed({
+            purpose: 'host lifecycle hooks',
+            startDir: hookEnv.PLOINKY_WORKSPACE_ROOT || cwd,
+        });
     }
 
     // Check if this is an inline command

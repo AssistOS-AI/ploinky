@@ -104,10 +104,22 @@ function requireContainerRuntime() {
 }
 
 const DEFAULT_IMAGE_PULL_TIMEOUT_MS = 30 * 60 * 1000;
+const DEFAULT_IMAGE_BUILD_TIMEOUT_MS = 30 * 60 * 1000;
+const LOCAL_IMAGE_BUILD_DEFINITIONS = {
+    'docker.io/assistos/web-publishing-agent:node24-nginx-cloudflared': {
+        repoName: 'container-image-builds',
+        context: 'images/web-publishing-agent',
+    },
+};
 
 function imagePullTimeoutMs() {
     const raw = Number(process.env.PLOINKY_IMAGE_PULL_TIMEOUT_MS);
     return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_IMAGE_PULL_TIMEOUT_MS;
+}
+
+function imageBuildTimeoutMs() {
+    const raw = Number(process.env.PLOINKY_IMAGE_BUILD_TIMEOUT_MS);
+    return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_IMAGE_BUILD_TIMEOUT_MS;
 }
 
 function imageExists(image, runtime) {
@@ -165,6 +177,53 @@ function pullImage(image, options = {}) {
     }
 }
 
+function resolveLocalImageBuildSource(image, options = {}) {
+    const img = String(image || '').trim();
+    const definition = LOCAL_IMAGE_BUILD_DEFINITIONS[img];
+    if (!definition) return null;
+    const reposDir = options.reposDir || REPOS_DIR;
+    const contextPath = path.join(reposDir, definition.repoName, definition.context);
+    const dockerfilePath = path.join(contextPath, definition.dockerfile || 'Dockerfile');
+    if (!fs.existsSync(dockerfilePath)) return null;
+    return {
+        ...definition,
+        image: img,
+        contextPath,
+        dockerfilePath,
+    };
+}
+
+function buildLocalImage(image, options = {}) {
+    const rt = options.runtime || getRuntime();
+    const img = String(image || '').trim();
+    if (!img) throw new Error('buildLocalImage: image is required');
+    const source = options.source || resolveLocalImageBuildSource(img, options);
+    if (!source) return false;
+    const log = typeof options.log === 'function' ? options.log : ((msg) => console.log(msg));
+    const timeoutMs = Number.isFinite(options.timeoutMs) && options.timeoutMs > 0
+        ? options.timeoutMs
+        : imageBuildTimeoutMs();
+    log(`[build] ${rt} build -t ${img} ${source.contextPath} (timeout ${Math.round(timeoutMs / 1000)}s)`);
+    const startedAt = Date.now();
+    const res = spawnSync(rt, ['build', '-t', img, source.contextPath], {
+        stdio: ['ignore', 'inherit', 'inherit'],
+        timeout: timeoutMs,
+    });
+    const elapsedSec = Math.max(1, Math.round((Date.now() - startedAt) / 1000));
+    if (res.error) {
+        if (res.error.code === 'ETIMEDOUT') {
+            throw new Error(`Image build for '${img}' timed out after ${Math.round(timeoutMs / 1000)}s. `
+                + 'Increase PLOINKY_IMAGE_BUILD_TIMEOUT_MS or pre-build it.');
+        }
+        throw new Error(`Image build for '${img}' failed: ${res.error.message}`);
+    }
+    if (res.status !== 0) {
+        throw new Error(`Image build for '${img}' exited with code ${res.status}.`);
+    }
+    log(`[build] ${img} ready from ${source.repoName}/${source.context} in ${elapsedSec}s`);
+    return true;
+}
+
 // Ensure an image is present locally, pulling it (with streamed progress) only
 // when missing. Returns true if a pull happened, false if it was already cached.
 function ensureImagePresent(image, options = {}) {
@@ -174,7 +233,27 @@ function ensureImagePresent(image, options = {}) {
     if (imageExists(img, rt)) return false;
     const log = typeof options.log === 'function' ? options.log : ((msg) => console.log(msg));
     log(`[pull] image '${img}' not present locally — pulling before runtime probe...`);
-    pullImage(img, { runtime: rt, log, timeoutMs: options.pullTimeoutMs });
+    try {
+        pullImage(img, { runtime: rt, log, timeoutMs: options.pullTimeoutMs });
+    } catch (pullError) {
+        const source = resolveLocalImageBuildSource(img, options);
+        if (!source) throw pullError;
+        log(`[pull] ${img} could not be pulled (${pullError.message}); building from ${source.repoName}/${source.context}...`);
+        try {
+            buildLocalImage(img, {
+                ...options,
+                runtime: rt,
+                log,
+                source,
+                timeoutMs: options.buildTimeoutMs,
+            });
+        } catch (buildError) {
+            throw new Error(
+                `Image pull for '${img}' failed and local build fallback failed: ${buildError.message} `
+                + `Original pull error: ${pullError.message}`
+            );
+        }
+    }
     return true;
 }
 
@@ -552,9 +631,11 @@ export {
     REPOS_DIR,
     containerRuntime,
     containerExists,
+    buildLocalImage,
     ensureImagePresent,
     imageExists,
     pullImage,
+    resolveLocalImageBuildSource,
     computeEnvHash,
     getAgentContainerName,
     getAgentMcpConfigPath,

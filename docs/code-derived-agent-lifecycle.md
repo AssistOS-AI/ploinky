@@ -407,7 +407,7 @@ For Docker-style runtime, the main mounts are:
 | Global or devel `projectPath` / current working directory | Same absolute path inside container | read-write |
 | Agent `skills/`, when it exists outside code | `/code/skills` | profile-controlled read-write/read-only |
 | `runtime.resources.persistentStorage.hostPath` | `runtime.resources.persistentStorage.containerPath` | read-write |
-| `manifest.volumes` host path | configured container path | read-write by default |
+| Root or active profile `volumes` host path | configured container path | read-write by default |
 | LLM model/state/shared paths | `/models`, `/runtime`, `/Agent/llm-runtime` | runtime-specific |
 
 Profile mount defaults come from `profileService.js`: `default` and `dev` are read-write for code/skills; other profiles default to read-only unless overridden.
@@ -424,7 +424,7 @@ Podman uses a staging directory under `.ploinky/container-runtime/<container>`:
 | Override code dependencies | prepared dependency cache | staged `code/node_modules` |
 | Apply `/code/...` manifest volume links | `.ploinky` volume host paths | staged code entries |
 
-Podman receives `NODE_OPTIONS=--preserve-symlinks --preserve-symlinks-main`. It also receives extra self-mounts for real symlink targets. Manifest volumes that target `/code/node_modules` are rejected.
+Podman receives `NODE_OPTIONS=--preserve-symlinks --preserve-symlinks-main`. It also receives extra self-mounts for real symlink targets. Manifest volumes that target `/code/node_modules` are rejected. Writable Podman manifest volumes under `.ploinky/data/` are mounted with `:U` so non-root images can own their private runtime state; arbitrary external manifest volumes keep the normal `:z` suffix unless `volumeOptions.<containerPath>.podmanChown` opts in.
 
 Default Podman networking uses `slirp4netns:allow_host_loopback=true` and `--replace`. Default Docker networking adds `host.docker.internal:host-gateway`.
 
@@ -468,7 +468,7 @@ Important bwrap mounts:
 | Agent private key when present | `/run/ploinky-agent.key`. |
 | Project path/current working directory | Same absolute path. |
 | Agent skills path | `/code/skills` when present. |
-| Manifest volumes | Configured target paths, with relative host paths resolved against the workspace root and absolute host paths honored as declared. |
+| Manifest volumes | Configured target paths from the root manifest and active profile, with relative host paths resolved against the workspace root and absolute host paths honored as declared. |
 | Runtime persistent storage | Configured container path. |
 
 The bwrap process does not unshare networking, so agent ports bind on the host. It does unshare PID. The runtime explicitly sets env vars with `--clearenv` plus `--setenv`, including `PORT`, router URL, manifest env, profile env/secrets, runtime resource env, `NODE_PATH=/code/node_modules`, `HOME=<resolved projectPath>`, `PATH`, and identity variables.
@@ -494,7 +494,7 @@ The generated seatbelt profile grants reads/writes to required real paths, denie
 
 ## Manifest Volumes and Runtime Resources
 
-Manifest volumes are explicit trusted filesystem grants from the agent manifest. `resolveManifestVolumeHostPath` resolves relative paths against the workspace root and honors absolute paths as declared. Containers, bwrap, and seatbelt profile generation no longer require the resolved host path to live inside `.ploinky`.
+Manifest volumes are explicit trusted filesystem grants from the agent manifest. Root manifest volumes and active profile volumes are merged, with profile entries overriding matching host-path keys. `resolveManifestVolumeHostPath` resolves relative paths against the workspace root and honors absolute paths as declared. Containers, bwrap, and seatbelt profile generation no longer require the resolved host path to live inside `.ploinky`.
 
 When a configured volume host path does not exist:
 

@@ -111,6 +111,10 @@ function checkAbsent(out, needle, description) {
     assert.ok(!out.includes(needle), `${description} (found forbidden '${needle}')\n  in: ${out}`);
 }
 
+function countOccurrences(out, needle) {
+    return out.split(needle).length - 1;
+}
+
 // Fake checkout + fake npm: asserts the exact install flags and that the
 // script verifies both dependency dirs afterwards.
 function makeFakeCheckout({ npmCreatesDeps, npmBody = '' }) {
@@ -462,6 +466,7 @@ import {
     isPublicEntrypoint,
     resolveHostPloinkySource,
     shouldInstallDeps,
+    inferPublicStartBranchArgs,
 } from './ploinky-box.mjs';
 
 test('ploinky-box.mjs syntax check (node --check)', () => {
@@ -493,6 +498,25 @@ test('parseCli: flags anywhere, first non-flag is the command', () => {
 test('parseCli: PLOINKY_BOX_ENGINE env seeds the engine, --engine overrides', () => {
     assert.equal(parseCli(['up'], { PLOINKY_BOX_ENGINE: 'docker' }).engine, 'docker');
     assert.equal(parseCli(['--engine', 'podman', 'up'], { PLOINKY_BOX_ENGINE: 'docker' }).engine, 'podman');
+});
+
+test('public start infers non-default source branch unless branch flags are explicit', () => {
+    assert.deepEqual(
+        inferPublicStartBranchArgs(['explorer'], { PLOINKY_BOX_BRANCH: 'feature-x' }, REPO_ROOT),
+        ['--branch', 'feature-x'],
+    );
+    assert.deepEqual(
+        inferPublicStartBranchArgs(['explorer'], { PLOINKY_BOX_BRANCH: 'main' }, REPO_ROOT),
+        [],
+    );
+    assert.deepEqual(
+        inferPublicStartBranchArgs(['explorer', '--branch', 'manual'], { PLOINKY_BOX_BRANCH: 'feature-x' }, REPO_ROOT),
+        [],
+    );
+    assert.deepEqual(
+        inferPublicStartBranchArgs(['explorer'], { PLOINKY_BOX_BRANCH: 'feature-x', PLOINKY_BOX_AUTO_BRANCH: '0' }, REPO_ROOT),
+        [],
+    );
 });
 
 test('resolveHostPloinkySource: PLOINKY_BOX_SOURCE override wins, defaults to the checkout', () => {
@@ -670,6 +694,8 @@ test('bin/ploinky bash syntax and single-entry contract', () => {
     assert.equal(r.status, 0, r.stderr);
     const entry = fs.readFileSync(PLOINKY, 'utf8');
     assert.ok(entry.includes('/etc/ploinky-box'), 'entry routes on the image marker file');
+    assert.ok(entry.includes('PLOINKY_WORKSPACE_ROOT'), 'entry supports older images that lack the marker file');
+    assert.ok(entry.includes('/opt/ploinky'), 'entry limits marker fallback to the mounted box source path');
     assert.ok(entry.includes('Ploinky dependencies are not installed. Install them now? [y/N]'), 'entry carries the confirm prompt');
     assert.ok(entry.includes('Ploinky cannot run until dependencies are installed.'), 'entry carries the decline warning');
     assert.ok(entry.includes('ploinky-install-deps'), 'entry points at the installer');
@@ -677,6 +703,14 @@ test('bin/ploinky bash syntax and single-entry contract', () => {
     assert.ok(!entry.includes('PLOINKY_DIRECT'), 'PLOINKY_DIRECT is gone');
     assert.ok(!entry.includes('PLOINKY_BOX'), 'PLOINKY_BOX routing is gone');
     assert.ok(!entry.includes('ploinky-direct'), 'ploinky-direct is gone');
+});
+
+test('bin/ploinky-install-deps recognizes the same in-box context', () => {
+    const installer = fs.readFileSync(path.join(HERE, '..', 'bin', 'ploinky-install-deps'), 'utf8');
+    assert.ok(installer.includes('/etc/ploinky-box'), 'installer honors the image marker file');
+    assert.ok(installer.includes('PLOINKY_WORKSPACE_ROOT'), 'installer supports older images that lack the marker file');
+    assert.ok(installer.includes('/opt/ploinky'), 'installer limits marker fallback to the mounted box source path');
+    assert.ok(installer.includes('PLOINKY_INSTALL_DEPS_ALLOW_RESET'), 'installer keeps the explicit reset override');
 });
 
 test('bin/ploinky-direct is deleted', () => {
@@ -767,6 +801,74 @@ test('public start preserves branch flags while forcing in-box router to 8080', 
         'public start forwards branch flags after in-box port',
     );
     checkAbsent(out, 'ploinky start explorer 9191', 'public start never uses host port inside');
+});
+
+test('public start forwards inferred source branch when no branch flag is supplied', () => {
+    const r = spawnSync(MJS, ['--name', 'qa', '--dry-run', 'start', 'explorer'], {
+        encoding: 'utf8',
+        env: {
+            ...process.env,
+            PLOINKY_BOX_ENGINE: 'podman',
+            PLOINKY_PUBLIC_ENTRYPOINT: '1',
+            PLOINKY_BOX_BRANCH: 'feature-default',
+        },
+    });
+    const out = `${r.stdout ?? ''}${r.stderr ?? ''}`;
+    assert.equal(r.status, 0, out);
+    checkIncludes(
+        out,
+        'exec -w /workspace ploinky-box-qa ploinky start explorer 8080 --branch feature-default',
+        'public start appends the inferred branch after the fixed in-box port',
+    );
+});
+
+test('public start explorer publishes the default Explorer local data-plane ports', () => {
+    const { out, status } = publicRun('podman', '--name', 'qa', '--dry-run', 'start', 'explorer');
+    assert.equal(status, 0, out);
+    checkIncludes(out, '-p 127.0.0.1:8081:8081', 'Explorer start publishes Web Publishing nginx');
+    checkIncludes(out, '-p 127.0.0.1:8082:8082', 'Explorer start publishes OnlyOffice editor');
+    checkIncludes(out, '-p 127.0.0.1:7681:7681', 'Explorer start publishes webtty');
+    checkIncludes(out, '-p 127.0.0.1:17000:17000', 'Explorer start publishes LiveKit health');
+    checkIncludes(out, '-p 127.0.0.1:7880:7880', 'Explorer start publishes LiveKit signaling');
+    checkIncludes(out, '-p 127.0.0.1:3478:3478/tcp', 'Explorer start publishes TURN TCP');
+    checkIncludes(out, '-p 127.0.0.1:3478:3478/udp', 'Explorer start publishes TURN UDP');
+    checkIncludes(out, '-p 127.0.0.1:7882-7892:7882-7892/udp', 'Explorer start publishes LiveKit UDP media range');
+    checkIncludes(out, '-p 127.0.0.1:20000-20010:20000-20010/udp', 'Explorer start publishes TURN relay range');
+    checkAbsent(out, '-p 127.0.0.1:6379:6379', 'Explorer start does not publish Redis by default');
+});
+
+test('public start only adds Explorer default publishes for the explorer agent', () => {
+    const { out, status } = publicRun('podman', '--name', 'qa', '--dry-run', 'start', 'demo');
+    assert.equal(status, 0, out);
+    checkIncludes(out, 'exec -w /workspace ploinky-box-qa ploinky start demo 8080', 'non-Explorer start still runs inside');
+    checkAbsent(out, '-p 127.0.0.1:7880:7880', 'non-Explorer start does not get Explorer LiveKit publish');
+    checkAbsent(out, '-p 127.0.0.1:8081:8081', 'non-Explorer start does not get Explorer Web Publishing publish');
+});
+
+test('public start explorer preserves explicit publishes and skips conflicting defaults', () => {
+    const { out, status } = publicRun(
+        'podman',
+        '--name', 'qa',
+        '--dry-run',
+        '--publish', '0.0.0.0:7880:7880',
+        'start', 'explorer',
+    );
+    assert.equal(status, 0, out);
+    checkIncludes(out, '-p 0.0.0.0:7880:7880', 'explicit LiveKit publish is preserved');
+    checkAbsent(out, '-p 127.0.0.1:7880:7880', 'default LiveKit publish is skipped for the same target');
+    checkIncludes(out, '-p 127.0.0.1:7881:7881', 'other Explorer defaults are still added');
+});
+
+test('public start explorer does not duplicate an exact explicit default publish', () => {
+    const { out, status } = publicRun(
+        'podman',
+        '--name', 'qa',
+        '--dry-run',
+        '--publish', '127.0.0.1:7880:7880',
+        'start', 'explorer',
+    );
+    assert.equal(status, 0, out);
+    assert.equal(countOccurrences(out, '-p 127.0.0.1:7880:7880'), 1, out);
 });
 
 test('public start accepts --port before the agent without forwarding it in-box', () => {

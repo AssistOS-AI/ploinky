@@ -10,6 +10,7 @@ import {
     CORE_MARKER_MODULE,
     NPM_INSTALL_ARGS,
     buildContainerInstallScript,
+    buildContainerInstallRunArgs,
     sha256,
     hashFile,
     hashMergedPackage,
@@ -73,6 +74,24 @@ test('container dependency installer disables audit/fund and emits a heartbeat',
     assert.match(script, /still running/);
     assert.match(script, /sleep 7/);
     assert.deepEqual(NPM_INSTALL_ARGS, ['install', '--no-package-lock', '--no-audit', '--no-fund']);
+});
+
+test('container dependency install runs as root for non-root runtime images', () => {
+    const args = buildContainerInstallRunArgs({
+        cwd: '/tmp/cache',
+        image: 'example/image:tag',
+        runtime: 'podman',
+        shellPath: '/bin/sh',
+        installScript: 'echo ok',
+    });
+
+    const userIndex = args.indexOf('--user');
+    const volumeIndex = args.indexOf('-v');
+    assert.notEqual(userIndex, -1);
+    assert.equal(args[userIndex + 1], '0:0');
+    assert.ok(userIndex < volumeIndex, 'user override should apply to the container run');
+    assert.deepEqual(args.slice(-3), ['example/image:tag', '-lc', 'echo ok']);
+    assert.ok(args.includes('slirp4netns:allow_host_loopback=true'));
 });
 
 test('writeStamp + readStamp round-trip', () => {

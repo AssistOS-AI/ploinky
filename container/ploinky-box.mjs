@@ -22,6 +22,19 @@ const BOX_PROGRAM = 'ploinky-box';
 const BOX_COMMANDS = new Set(['up', 'start', 'cli', 'run', 'cp', 'status', 'logs', 'stop', 'update', 'destroy', 'help']);
 const BOX_COMMANDS_REJECT_REMOVED_FLAGS = new Set(['up', 'start', 'cli', 'status', 'logs', 'stop', 'update', 'destroy', 'help']);
 const REMOVED_BOX_FLAGS = new Set(['--webmeet-ports']);
+const EXPLORER_AGENT_NAME = 'explorer';
+const EXPLORER_START_PUBLISH_SPECS = Object.freeze([
+    '127.0.0.1:8081:8081',
+    '127.0.0.1:8082:8082',
+    '127.0.0.1:7681:7681',
+    '127.0.0.1:17000:17000',
+    '127.0.0.1:7880:7880',
+    '127.0.0.1:7881:7881',
+    '127.0.0.1:3478:3478/tcp',
+    '127.0.0.1:3478:3478/udp',
+    '127.0.0.1:7882-7892:7882-7892/udp',
+    '127.0.0.1:20000-20010:20000-20010/udp',
+]);
 let activeProgramName = BOX_PROGRAM;
 
 export function usageText(options = {}) {
@@ -67,6 +80,14 @@ Flags:
 Box selector flags such as --name and --port may appear before or after a
 public command. Put --dry-run before the command for wrapper dry-run; after the
 command it is forwarded to Ploinky.
+
+When the local Ploinky checkout is on a non-main branch, public
+\`ploinky start ...\` forwards that branch automatically unless explicit branch
+flags are supplied. Set PLOINKY_BOX_AUTO_BRANCH=0 to disable this.
+
+\`ploinky start explorer\` also publishes Explorer's local browser/data-plane
+ports on 127.0.0.1 by default, including Web Publishing, OnlyOffice, webtty, and
+LiveKit signaling/media/TURN ports.
 `;
     }
     return `ploinky-box - run Ploinky isolated in a rootless-podman container
@@ -417,6 +438,40 @@ function prepareSource(cfg) {
     }
 }
 
+const DEFAULT_SOURCE_BRANCHES = new Set(['main', 'master', 'HEAD']);
+const BRANCH_POLICY_FLAGS = new Set(['--branch', '--repo-branch', '--branch-fallback', '--reset-repos']);
+
+function hasBranchPolicyArg(args) {
+    return (args || []).some((arg) => {
+        const value = String(arg || '');
+        return BRANCH_POLICY_FLAGS.has(value)
+            || value.startsWith('--branch=')
+            || value.startsWith('--repo-branch=')
+            || value.startsWith('--branch-fallback=');
+    });
+}
+
+function currentGitBranch(sourceDir) {
+    const dir = String(sourceDir || '').trim();
+    if (!dir) return '';
+    const result = spawnSync('git', ['-C', dir, 'rev-parse', '--abbrev-ref', 'HEAD'], {
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'ignore'],
+    });
+    if (result.status !== 0 || result.error) return '';
+    return String(result.stdout || '').trim();
+}
+
+export function inferPublicStartBranchArgs(args, env = process.env, sourceDir = '') {
+    const autoBranch = String(env?.PLOINKY_BOX_AUTO_BRANCH || '').trim().toLowerCase();
+    if (autoBranch === '0' || autoBranch === 'false' || autoBranch === 'no') return [];
+    if (hasBranchPolicyArg(args)) return [];
+
+    const branch = String(env?.PLOINKY_BOX_BRANCH || currentGitBranch(sourceDir || resolveHostPloinkySource(env)) || '').trim();
+    if (!branch || DEFAULT_SOURCE_BRANCHES.has(branch)) return [];
+    return ['--branch', branch];
+}
+
 export function buildRunArgs(cfg, { selinux = false } = {}) {
     const bindIp = cfg.listenLan ? '0.0.0.0' : '127.0.0.1';
     const instance = instanceName(cfg);
@@ -442,6 +497,34 @@ export function buildRunArgs(cfg, { selinux = false } = {}) {
     if (cfg.mountDir) args.push('-v', `${cfg.mountDirResolved}:/workspace/mounted`);
     args.push(cfg.image);
     return args;
+}
+
+function publishTarget(spec) {
+    const raw = String(spec || '').trim();
+    const slash = raw.indexOf('/');
+    const protocol = slash === -1 ? 'tcp' : raw.slice(slash + 1).toLowerCase();
+    const withoutProtocol = slash === -1 ? raw : raw.slice(0, slash);
+    const containerPort = withoutProtocol.split(':').at(-1) || '';
+    return `${containerPort}/${protocol || 'tcp'}`;
+}
+
+function appendDefaultPublishes(cfg, specs) {
+    const exact = new Set(cfg.publish);
+    const targets = new Set(cfg.publish.map((spec) => publishTarget(spec)));
+    for (const spec of specs) {
+        const target = publishTarget(spec);
+        if (exact.has(spec) || targets.has(target)) continue;
+        cfg.publish.push(spec);
+        exact.add(spec);
+        targets.add(target);
+    }
+}
+
+function appendExplorerStartPublishes(cfg, startPlan, env = process.env) {
+    const disabled = String(env?.PLOINKY_BOX_EXPLORER_PORTS || '').trim().toLowerCase();
+    if (disabled === '0' || disabled === 'false' || disabled === 'no') return;
+    if (startPlan?.agent !== EXPLORER_AGENT_NAME) return;
+    appendDefaultPublishes(cfg, EXPLORER_START_PUBLISH_SPECS);
 }
 
 function ensureImage(cfg) {
@@ -603,10 +686,10 @@ async function probeRouter(port, attempts = 30) {
     return null;
 }
 
-function splitPublicStartArgs(args) {
+function splitPublicStartArgs(args, options = {}) {
     const raw = args.map((entry) => String(entry));
     if (raw.length === 0) {
-        return { hasAgent: false, hostPort: '', inBoxArgs: ['start'] };
+        return { hasAgent: false, agent: '', hostPort: '', inBoxArgs: ['start'] };
     }
     let agent = '';
     let hostPort = '';
@@ -641,9 +724,10 @@ function splitPublicStartArgs(args) {
         passthrough.push(arg);
     }
     if (!agent) {
-        return { hasAgent: false, hostPort: '', inBoxArgs: ['start', ...raw] };
+        return { hasAgent: false, agent: '', hostPort: '', inBoxArgs: ['start', ...raw] };
     }
-    return { hasAgent: true, hostPort, inBoxArgs: ['start', agent, '8080', ...passthrough] };
+    const implicitBranchArgs = inferPublicStartBranchArgs(raw, options.env || process.env, options.sourceDir || '');
+    return { hasAgent: true, agent, hostPort, inBoxArgs: ['start', agent, '8080', ...passthrough, ...implicitBranchArgs] };
 }
 
 // start <agent> [port]: up + in-box `ploinky start <agent> 8080` + router
@@ -653,11 +737,14 @@ async function cmdStart(cfg, options = {}) {
     const publicEntrypoint = Boolean(options.publicEntrypoint);
     let startPlan;
     if (publicEntrypoint) {
-        startPlan = splitPublicStartArgs(cfg.args);
+        startPlan = splitPublicStartArgs(cfg.args, {
+            env: process.env,
+            sourceDir: cfg.sourceDirResolved || '',
+        });
     } else {
         const [agent, portArg, ...extra] = cfg.args;
         if (!agent || extra.length > 0) die(`usage: ${activeProgramName} start <agent> [port]`);
-        startPlan = { hasAgent: true, hostPort: portArg || '', inBoxArgs: ['start', agent, '8080'] };
+        startPlan = { hasAgent: true, agent, hostPort: portArg || '', inBoxArgs: ['start', agent, '8080'] };
     }
     if (!startPlan.hasAgent) {
         if (!publicEntrypoint) die(`usage: ${activeProgramName} start <agent> [port]`);
@@ -672,6 +759,7 @@ async function cmdStart(cfg, options = {}) {
         cfg.port = startPlan.hostPort;
     }
     if (!/^\d+$/.test(cfg.port)) die(`start: host port must be a number, got '${cfg.port}'`);
+    if (publicEntrypoint) appendExplorerStartPublishes(cfg, startPlan);
     await cmdUp(cfg, { fatalOnDepsDecline: publicEntrypoint });
     const published = cfg.dryRun ? cfg.port : (hostPort(cfg) || cfg.port);
     if (!cfg.dryRun && published !== cfg.port) {

@@ -172,19 +172,24 @@ function warnGeneratedFallback({ purpose, source, filePath, error }) {
     );
 }
 
-function resolveMasterKey({ purpose = 'Ploinky encrypted storage' } = {}) {
+function resolveMasterKeySeed({ purpose = 'Ploinky encrypted storage', startDir = process.cwd() } = {}) {
     let raw = String(process.env[MASTER_KEY_VAR] || '').trim();
     if (!raw) {
         // Walk up from cwd looking for a .env that defines the master key.
         // Operators frequently keep a single .env in a parent directory that
         // shadows multiple workspaces, so this matches that workflow.
-        raw = String(loadEnvFile()[MASTER_KEY_VAR] || '').trim();
+        raw = String(loadEnvFile(startDir)[MASTER_KEY_VAR] || '').trim();
     }
     if (!raw) {
-        const fallback = resolveGeneratedMasterKeySeed();
+        const fallback = resolveGeneratedMasterKeySeed(startDir);
         raw = fallback.seed;
         warnGeneratedFallback({ purpose, ...fallback });
     }
+    return raw;
+}
+
+function resolveMasterKey({ purpose = 'Ploinky encrypted storage', startDir = process.cwd() } = {}) {
+    const raw = resolveMasterKeySeed({ purpose, startDir });
     return crypto.createHash('sha256').update(raw, 'utf8').digest();
 }
 
@@ -315,4 +320,5 @@ export {
     parseKeyValueFile,
     parseKeyValueText,
     resolveMasterKey,
+    resolveMasterKeySeed,
 };

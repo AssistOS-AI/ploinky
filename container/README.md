@@ -61,6 +61,14 @@ The wrapper publishes host port `--port N` (default 8080) to **container port
 `[port]` (or `--port`) picks the HOST side, the router inside is always started
 on 8080.
 
+`ploinky start explorer` also publishes Explorer's default local
+browser/data-plane surfaces on host loopback: Web Publishing nginx `8081`,
+OnlyOffice `8082`, webtty `7681`, LiveKit signaling `7880`, LiveKit TCP `7881`,
+TURN `3478/tcp` and `3478/udp`, LiveKit UDP media `7882-7892/udp`, and TURN
+relay `20000-20010/udp`. These are loopback-only outer box publishes; use
+explicit `--publish` entries when you intentionally want different host
+addresses or ports.
+
 Other in-box ports are unreachable from the host unless you publish them when
 creating the box. Use `--publish HOST:BOX` for a specific port, or use its alias
 `--expose HOST:BOX`; repeat either flag for more ports. Existing boxes keep their
@@ -78,9 +86,11 @@ writable named volume `<instance>-ploinky-deps` mounted at
 never used in-box. `stop`/`update` keep the volume; `destroy` removes it.
 
 There is no direct-mode escape and no legacy env-var routing: on hosts
-`ploinky` always drives the box, and inside the box image (marker file
-`/etc/ploinky-box`, baked by the Dockerfile) the same `ploinky` script is the
-direct CLI. For CLI development on the host without the box, run
+`ploinky` always drives the box, and inside the box image the same `ploinky`
+script is the direct CLI. The preferred signal is the marker file
+`/etc/ploinky-box`, baked by the Dockerfile; older images that lack it are also
+recognized when the source is mounted at `/opt/ploinky` and the workspace is
+`/workspace`. For CLI development on the host without the box, run
 `node cli/index.js` from the checkout.
 
 ## Public `ploinky` Command
@@ -96,6 +106,14 @@ ploinky destroy
 ploinky logs
 ploinky install ...
 ```
+
+When the host Ploinky checkout is on a non-main branch, `ploinky start ...`
+forwards that branch to the in-box CLI unless you pass explicit branch flags.
+This keeps branch-scoped stacks reproducible from the ordinary command:
+`ploinky start explorer` on branch `ploinky-box` behaves like an explicit
+`--branch ploinky-box`. Set `PLOINKY_BOX_AUTO_BRANCH=0` to disable inference, or
+`PLOINKY_BOX_BRANCH=<branch>` to force a branch for wrapper tests and scripted
+runs.
 
 Outer box lifecycle commands use the explicit `box` namespace:
 

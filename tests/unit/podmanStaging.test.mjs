@@ -9,9 +9,11 @@ import {
     assertPodmanCodeMountAllowed,
     buildPodmanStagedTargetMounts,
     codeRelativeMountPath,
+    collectManifestVolumeEntries,
     ensurePodmanStagedCodeDir,
     ensureManifestVolumeHostPath,
     mergeNodeOptions,
+    podmanManifestVolumeMountSuffix,
     podmanMountSuffix,
 } from '../../cli/services/docker/agentServiceManager.js';
 import { PLOINKY_DIR, PLOINKY_WORKSPACE_ROOT } from '../../cli/services/config.js';
@@ -225,6 +227,63 @@ test('mergeNodeOptions appends podman symlink flags without duplicating existing
 test('podmanMountSuffix places z before ro for absolute self-mount targets', () => {
     assert.equal(podmanMountSuffix(true), ':z,ro');
     assert.equal(podmanMountSuffix(false), ':z');
+});
+
+test('profile manifest volumes are collected with profile volume options', () => {
+    const entries = collectManifestVolumeEntries({
+        volumes: {
+            '.ploinky/data/root-state': '/root-state',
+        },
+        volumeOptions: {
+            '/root-state': { readOnly: true },
+            '/data': { podmanChown: false },
+        },
+    }, {
+        volumes: {
+            '.ploinky/data/web-publishing': '/data',
+        },
+        volumeOptions: {
+            '/data': { podmanChown: true },
+        },
+    });
+
+    assert.deepEqual(entries, [
+        {
+            hostPath: '.ploinky/data/root-state',
+            containerPath: '/root-state',
+            resolvedHostPath: path.join(PLOINKY_DIR, 'data', 'root-state'),
+            options: { readOnly: true },
+        },
+        {
+            hostPath: '.ploinky/data/web-publishing',
+            containerPath: '/data',
+            resolvedHostPath: path.join(PLOINKY_DIR, 'data', 'web-publishing'),
+            options: { podmanChown: true },
+        },
+    ]);
+});
+
+test('podman manifest data volumes chown only managed writable data mounts by default', () => {
+    assert.equal(
+        podmanManifestVolumeMountSuffix(path.join(PLOINKY_DIR, 'data', 'web-publishing'), {}),
+        ':z,U',
+    );
+    assert.equal(
+        podmanManifestVolumeMountSuffix(path.join(PLOINKY_WORKSPACE_ROOT, 'workspace-data'), {}),
+        ':z',
+    );
+    assert.equal(
+        podmanManifestVolumeMountSuffix(path.join(PLOINKY_DIR, 'data', 'readonly'), { readOnly: true }),
+        ':z,ro',
+    );
+    assert.equal(
+        podmanManifestVolumeMountSuffix(path.join(PLOINKY_DIR, 'data', 'optout'), { podmanChown: false }),
+        ':z',
+    );
+    assert.equal(
+        podmanManifestVolumeMountSuffix(path.join(os.tmpdir(), 'explicit-podman-volume'), { podmanChown: true }),
+        ':z,U',
+    );
 });
 
 test('manifest volume host paths may resolve outside workspace .ploinky', () => {

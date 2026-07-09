@@ -31,6 +31,16 @@ function writeProbeHook(dir) {
     return { hookPath, outPath };
 }
 
+function writeMasterProbeHook(dir) {
+    const hookPath = path.join(dir, 'master-probe.sh');
+    const outPath = path.join(dir, 'master-seen.txt');
+    fs.writeFileSync(
+        hookPath,
+        '#!/usr/bin/env bash\nprintf "%s" "${PLOINKY_MASTER_KEY:-UNSET}" > "$HOOK_OUT"\n'
+    );
+    return { hookPath, outPath };
+}
+
 function withoutExportedRoot(fn) {
     const previous = process.env.PLOINKY_WORKSPACE_ROOT;
     delete process.env.PLOINKY_WORKSPACE_ROOT; // mirror a normal `ploinky start`
@@ -39,6 +49,21 @@ function withoutExportedRoot(fn) {
     } finally {
         if (previous === undefined) delete process.env.PLOINKY_WORKSPACE_ROOT;
         else process.env.PLOINKY_WORKSPACE_ROOT = previous;
+    }
+}
+
+function withoutExportedRootOrMaster(fn) {
+    const previousRoot = process.env.PLOINKY_WORKSPACE_ROOT;
+    const previousMaster = process.env.PLOINKY_MASTER_KEY;
+    delete process.env.PLOINKY_WORKSPACE_ROOT;
+    delete process.env.PLOINKY_MASTER_KEY;
+    try {
+        return fn();
+    } finally {
+        if (previousRoot === undefined) delete process.env.PLOINKY_WORKSPACE_ROOT;
+        else process.env.PLOINKY_WORKSPACE_ROOT = previousRoot;
+        if (previousMaster === undefined) delete process.env.PLOINKY_MASTER_KEY;
+        else process.env.PLOINKY_MASTER_KEY = previousMaster;
     }
 }
 
@@ -63,5 +88,31 @@ test('host hook does not override an explicitly provided PLOINKY_WORKSPACE_ROOT'
         );
         assert.equal(result.success, true, result.message);
         assert.equal(fs.readFileSync(outPath, 'utf8'), explicit);
+    }));
+});
+
+test('host hook receives the generated fallback PLOINKY_MASTER_KEY seed', () => {
+    withoutExportedRootOrMaster(() => withTmpWorkspace((dir) => {
+        const { hookPath, outPath } = writeMasterProbeHook(dir);
+        const result = executeHostHook(hookPath, { HOOK_OUT: outPath }, { cwd: dir });
+        assert.equal(result.success, true, result.message);
+
+        const generatedSeed = fs.readFileSync(path.join(dir, '.ploinky', 'master-key'), 'utf8').trim();
+        assert.ok(generatedSeed.length > 0);
+        assert.equal(fs.readFileSync(outPath, 'utf8'), generatedSeed);
+    }));
+});
+
+test('host hook preserves an explicitly provided PLOINKY_MASTER_KEY', () => {
+    withoutExportedRootOrMaster(() => withTmpWorkspace((dir) => {
+        const { hookPath, outPath } = writeMasterProbeHook(dir);
+        const result = executeHostHook(
+            hookPath,
+            { HOOK_OUT: outPath, PLOINKY_MASTER_KEY: 'explicit-master' },
+            { cwd: dir }
+        );
+        assert.equal(result.success, true, result.message);
+        assert.equal(fs.readFileSync(outPath, 'utf8'), 'explicit-master');
+        assert.equal(fs.existsSync(path.join(dir, '.ploinky', 'master-key')), false);
     }));
 });

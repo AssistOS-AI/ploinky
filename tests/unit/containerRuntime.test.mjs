@@ -37,6 +37,11 @@ function runModuleSnippet(source, env = {}, options = {}) {
     });
 }
 
+function writeExecutable(filePath, contents) {
+    fs.writeFileSync(filePath, contents);
+    fs.chmodSync(filePath, 0o755);
+}
+
 test('buildRuntimeRouterEnv prefers the startup port over stale routing state', () => {
     const workspaceDir = tempDir();
     try {
@@ -109,6 +114,103 @@ process.stdout.write(JSON.stringify(plan));`,
             boxNetworkCompat: true,
             hashEnv: { PLOINKY_BOX_NETWORK_COMPAT: 'slirp4netns-named-network' },
         });
+    } finally {
+        fs.rmSync(workspaceDir, { recursive: true, force: true });
+    }
+});
+
+test('buildRuntimeNetworkPlan detects older ploinky-box images without the marker file', () => {
+    const workspaceDir = tempDir();
+    const fakeWorkspace = path.join(workspaceDir, 'workspace');
+    fs.mkdirSync(fakeWorkspace, { recursive: true });
+    try {
+        const result = runModuleSnippet(
+            `const { buildRuntimeNetworkPlan } = await import(${JSON.stringify(agentServiceManagerUrl)});
+const plan = buildRuntimeNetworkPlan('podman', { name: 'webmeet' }, {
+  boxMarkerPath: ${JSON.stringify(path.join(workspaceDir, 'missing-marker'))},
+  sourceRoot: '/opt/ploinky',
+  workspacePath: ${JSON.stringify(fakeWorkspace)},
+});
+process.stdout.write(JSON.stringify(plan));`,
+            { PLOINKY_WORKSPACE_ROOT: '/workspace' },
+            { cwd: workspaceDir },
+        );
+
+        assert.equal(result.status, 0, result.stderr);
+        assert.deepEqual(JSON.parse(result.stdout), {
+            args: ['--replace', '--network', 'slirp4netns:allow_host_loopback=true'],
+            ensureNetworkName: '',
+            useHostNetwork: false,
+            boxNetworkCompat: true,
+            hashEnv: { PLOINKY_BOX_NETWORK_COMPAT: 'slirp4netns-named-network' },
+        });
+    } finally {
+        fs.rmSync(workspaceDir, { recursive: true, force: true });
+    }
+});
+
+test('ensureImagePresent builds the managed web-publishing image when registry pull fails', () => {
+    const workspaceDir = tempDir();
+    const image = 'docker.io/assistos/web-publishing-agent:node24-nginx-cloudflared';
+    const contextPath = path.join(
+        workspaceDir,
+        '.ploinky',
+        'repos',
+        'container-image-builds',
+        'images',
+        'web-publishing-agent',
+    );
+    const fakeRuntime = path.join(workspaceDir, 'fake-runtime.sh');
+    const callsFile = path.join(workspaceDir, 'runtime-calls.txt');
+
+    try {
+        fs.mkdirSync(contextPath, { recursive: true });
+        fs.writeFileSync(path.join(contextPath, 'Dockerfile'), 'FROM scratch\n');
+        writeExecutable(fakeRuntime, `#!/bin/sh
+printf '%s\\n' "$*" >> "$CALLS_FILE"
+if [ "$1" = "image" ] && [ "$2" = "inspect" ]; then
+  exit 1
+fi
+if [ "$1" = "pull" ]; then
+  exit 125
+fi
+if [ "$1" = "build" ]; then
+  exit 0
+fi
+exit 99
+`);
+
+        const result = runModuleSnippet(
+            `import fs from 'node:fs';
+const { ensureImagePresent } = await import(${JSON.stringify(dockerCommonUrl)});
+const logs = [];
+const changed = ensureImagePresent(${JSON.stringify(image)}, {
+  runtime: ${JSON.stringify(fakeRuntime)},
+  log(message) { logs.push(message); },
+  pullTimeoutMs: 1000,
+  buildTimeoutMs: 1000,
+});
+process.stdout.write(JSON.stringify({
+  changed,
+  logs,
+  calls: fs.readFileSync(${JSON.stringify(callsFile)}, 'utf8').trim().split(/\\n+/),
+}));`,
+            { CALLS_FILE: callsFile },
+            { cwd: workspaceDir },
+        );
+
+        assert.equal(result.status, 0, result.stderr);
+        const output = JSON.parse(result.stdout);
+        assert.equal(output.changed, true);
+        assert.deepEqual(output.calls, [
+            `image inspect ${image}`,
+            `pull ${image}`,
+            `build -t ${image} ${contextPath}`,
+        ]);
+        assert.equal(
+            output.logs.some((entry) => entry.includes('building from container-image-builds/images/web-publishing-agent')),
+            true,
+        );
     } finally {
         fs.rmSync(workspaceDir, { recursive: true, force: true });
     }

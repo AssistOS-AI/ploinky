@@ -428,6 +428,34 @@ function resolveInstallBackend(runtimeKey, { image = '', runtime = null, log = d
     throw new Error(`Unsupported install backend for runtime family ${parsed.family}`);
 }
 
+export function buildContainerInstallRunArgs({
+    cwd,
+    image,
+    runtime,
+    shellPath,
+    installScript = buildContainerInstallScript(),
+} = {}) {
+    const resolvedRuntime = runtime || getRuntime();
+    const volumeSuffix = resolvedRuntime === 'podman' ? ':z' : '';
+    const roArgs = resolvedRuntime === 'podman'
+        ? ['--network', 'slirp4netns:allow_host_loopback=true']
+        : [];
+    return [
+        'run', '--rm',
+        ...roArgs,
+        // Dependency-cache installation is a maintenance step against a writable
+        // host cache, so it must not inherit non-root USER defaults from runtime
+        // images such as web-publishing.
+        '--user', '0:0',
+        '-v', `${cwd}:/install${volumeSuffix}`,
+        '-w', '/install',
+        '--entrypoint', shellPath,
+        image,
+        '-lc',
+        installScript,
+    ];
+}
+
 function runNpmInstallInContainer(cwd, { image, runtime = null, log = debugLog } = {}) {
     if (!image) {
         throw new Error('Container dependency install requires an image.');
@@ -437,21 +465,12 @@ function runNpmInstallInContainer(cwd, { image, runtime = null, log = debugLog }
     if (!shellPath || shellPath === SHELL_FALLBACK_DIRECT) {
         throw new Error(`Could not determine a shell for image ${image}.`);
     }
-    const volumeSuffix = resolvedRuntime === 'podman' ? ':z' : '';
-    const roArgs = resolvedRuntime === 'podman'
-        ? ['--network', 'slirp4netns:allow_host_loopback=true']
-        : [];
-    const installScript = buildContainerInstallScript();
-    const args = [
-        'run', '--rm',
-        ...roArgs,
-        '-v', `${cwd}:/install${volumeSuffix}`,
-        '-w', '/install',
-        '--entrypoint', shellPath,
+    const args = buildContainerInstallRunArgs({
+        cwd,
         image,
-        '-lc',
-        installScript,
-    ];
+        runtime: resolvedRuntime,
+        shellPath,
+    });
     log(`[deps-cache] npm install in container ${image} at ${cwd}`);
     const result = spawnSync(resolvedRuntime, args, { stdio: 'inherit', timeout: INSTALL_TIMEOUT_MS });
     if (result.error) {

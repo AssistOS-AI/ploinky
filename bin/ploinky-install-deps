@@ -30,7 +30,14 @@ fi
 install_args=(install --no-package-lock --no-audit --no-fund)
 
 allow_achilles_reset=0
-if [[ "${PLOINKY_INSTALL_DEPS_ALLOW_RESET:-}" == "1" || -f /etc/ploinky-box ]]; then
+in_ploinky_box=0
+if [[ -f /etc/ploinky-box ]]; then
+    in_ploinky_box=1
+elif [[ "${PLOINKY_WORKSPACE_ROOT:-}" == "/workspace" && "$PLOINKY_ROOT" == "/opt/ploinky" && -d /workspace ]]; then
+    in_ploinky_box=1
+fi
+
+if [[ "${PLOINKY_INSTALL_DEPS_ALLOW_RESET:-}" == "1" || "$in_ploinky_box" == "1" ]]; then
     allow_achilles_reset=1
 fi
 

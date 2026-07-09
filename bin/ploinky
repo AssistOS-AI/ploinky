@@ -16,8 +16,16 @@ if ! command -v node >/dev/null 2>&1; then
 fi
 
 # Single entry: inside the ploinky-box image (marker baked by its Dockerfile)
-# ploinky IS the direct CLI; everywhere else it drives the boxed runtime.
+# ploinky IS the direct CLI; everywhere else it drives the boxed runtime. The
+# workspace/source check keeps older images usable when the marker is missing.
+in_ploinky_box=0
 if [[ -f /etc/ploinky-box ]]; then
+    in_ploinky_box=1
+elif [[ "${PLOINKY_WORKSPACE_ROOT:-}" == "/workspace" && "$ROOT_DIR" == "/opt/ploinky" && -d /workspace ]]; then
+    in_ploinky_box=1
+fi
+
+if [[ "$in_ploinky_box" == "1" ]]; then
     export PLOINKY_ROOT="$ROOT_DIR"
 
     deps_missing=0

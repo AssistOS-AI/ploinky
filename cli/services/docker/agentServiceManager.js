@@ -81,7 +81,6 @@ import {
 } from '../runtimeStaging.js';
 import {
     ensureManifestVolumeHostPath,
-    readManifestVolumeOptions,
     resolveManifestVolumeHostPath
 } from '../manifestVolumePolicy.js';
 import {
@@ -227,6 +226,58 @@ function podmanMountSuffix(readOnly) {
     // Podman remote on macOS has parsed absolute self-mounts incorrectly with
     // ':ro,z', creating paths that end in 'o,z'. ':z,ro' preserves the target.
     return readOnly ? ':z,ro' : ':z';
+}
+
+function shouldPodmanChownManifestVolume(resolvedHostPath, options = {}) {
+    if (options?.readOnly === true) return false;
+    if (options?.podmanChown === true) return true;
+    if (options?.podmanChown === false) return false;
+
+    const dataRoot = path.resolve(PLOINKY_DIR, 'data');
+    const resolved = path.resolve(resolvedHostPath);
+    return isPathWithin(resolved, dataRoot);
+}
+
+function podmanManifestVolumeMountSuffix(resolvedHostPath, options = {}) {
+    if (options?.readOnly === true) return ':z,ro';
+    return shouldPodmanChownManifestVolume(resolvedHostPath, options) ? ':z,U' : ':z';
+}
+
+function readVolumeOptions(source) {
+    return source?.volumeOptions && typeof source.volumeOptions === 'object'
+        ? source.volumeOptions
+        : {};
+}
+
+function mergeManifestVolumes(manifest, profileConfig = null) {
+    return {
+        ...(manifest?.volumes && typeof manifest.volumes === 'object' ? manifest.volumes : {}),
+        ...(profileConfig?.volumes && typeof profileConfig.volumes === 'object' ? profileConfig.volumes : {}),
+    };
+}
+
+function mergeManifestVolumeOptions(manifest, profileConfig = null) {
+    return {
+        ...readVolumeOptions(manifest),
+        ...readVolumeOptions(profileConfig),
+    };
+}
+
+function getVolumeOptionsForContainerPath(volumeOptions, containerPath) {
+    return volumeOptions[containerPath]
+        || volumeOptions[String(containerPath || '').replace(/\/+$/, '')]
+        || {};
+}
+
+function collectManifestVolumeEntries(manifest, profileConfig = null) {
+    const volumes = mergeManifestVolumes(manifest, profileConfig);
+    const volumeOptions = mergeManifestVolumeOptions(manifest, profileConfig);
+    return Object.entries(volumes).map(([hostPath, containerPath]) => ({
+        hostPath,
+        containerPath,
+        resolvedHostPath: resolveManifestVolumeHostPath(hostPath),
+        options: getVolumeOptionsForContainerPath(volumeOptions, containerPath),
+    }));
 }
 
 function ensurePodmanStagedAgentLibDir(agentName, nodeModulesDir, options = {}) {
@@ -416,14 +467,8 @@ function appendRuntimeRouterEnvFlags(envStrings, routerEnv) {
     }
 }
 
-function ensureManifestVolumeHostPaths(manifest) {
-    if (!manifest?.volumes || typeof manifest.volumes !== 'object') return;
-    const volumeOptions = readManifestVolumeOptions(manifest);
-    for (const [hostPath, containerPath] of Object.entries(manifest.volumes)) {
-        const resolvedHostPath = resolveManifestVolumeHostPath(hostPath);
-        const options = volumeOptions[containerPath]
-            || volumeOptions[String(containerPath || '').replace(/\/+$/, '')]
-            || {};
+function ensureManifestVolumeHostPaths(manifest, profileConfig = null) {
+    for (const { resolvedHostPath, containerPath, options } of collectManifestVolumeEntries(manifest, profileConfig)) {
         ensureManifestVolumeHostPath(resolvedHostPath, containerPath, options);
     }
 }
@@ -469,14 +514,19 @@ function ensureNamedRuntimeNetwork(runtime, networkName) {
 }
 
 // The ploinky-box image bakes /etc/ploinky-box (container-image-builds,
-// images/ploinky-box/Dockerfile). Its presence -- not an env var -- signals
-// that ploinky runs inside the box.
-function isPloinkyBoxRuntime(markerPath = PLOINKY_BOX_MARKER_PATH) {
+// images/ploinky-box/Dockerfile). Older published images may lack it, so keep a
+// narrow fallback for the mounted-box layout.
+function isPloinkyBoxRuntime(markerPath = PLOINKY_BOX_MARKER_PATH, options = {}) {
     try {
-        return fs.statSync(markerPath).isFile();
+        if (fs.statSync(markerPath).isFile()) return true;
     } catch (_) {
-        return false;
+        // fall through to mounted-box layout detection
     }
+    const sourceRoot = options.sourceRoot || path.resolve(__dirname, '../../..');
+    const workspacePath = options.workspacePath || '/workspace';
+    return String(process.env.PLOINKY_WORKSPACE_ROOT || '').trim() === '/workspace'
+        && sourceRoot === '/opt/ploinky'
+        && fs.existsSync(workspacePath);
 }
 
 function resolveEffectiveManifestNetwork(manifest, profileConfig) {
@@ -522,7 +572,7 @@ function buildRuntimeNetworkPlan(runtime, manifestNetwork, options = {}) {
     }
 
     if (network.name) {
-        if (isPodman && isPloinkyBoxRuntime(boxMarkerPath)) {
+        if (isPodman && isPloinkyBoxRuntime(boxMarkerPath, options)) {
             return {
                 args: ['--replace', '--network', PODMAN_ROOTLESS_NETWORK],
                 ensureNetworkName: '',
@@ -800,21 +850,17 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
 
     const podmanCodeLinks = new Map();
     const manifestVolumeMounts = [];
-    if (manifest.volumes && typeof manifest.volumes === 'object') {
-        const volumeOptions = readManifestVolumeOptions(manifest);
-        for (const [hostPath, containerPath] of Object.entries(manifest.volumes)) {
-            const resolvedHostPath = resolveManifestVolumeHostPath(hostPath);
-            const options = volumeOptions[containerPath]
-                || volumeOptions[String(containerPath || '').replace(/\/+$/, '')]
-                || {};
-            ensureManifestVolumeHostPath(resolvedHostPath, containerPath, options);
-            const codeRelPath = runtime === 'podman' ? codeRelativeMountPath(containerPath) : null;
-            if (codeRelPath) {
-                assertPodmanCodeMountAllowed(codeRelPath, containerPath);
-                podmanCodeLinks.set(codeRelPath, { hostPath: resolvedHostPath, readOnly: false });
-            } else {
-                manifestVolumeMounts.push({ resolvedHostPath, containerPath });
-            }
+    for (const { resolvedHostPath, containerPath, options } of collectManifestVolumeEntries(manifest, profileConfig)) {
+        ensureManifestVolumeHostPath(resolvedHostPath, containerPath, options);
+        const codeRelPath = runtime === 'podman' ? codeRelativeMountPath(containerPath) : null;
+        if (codeRelPath) {
+            assertPodmanCodeMountAllowed(codeRelPath, containerPath);
+            podmanCodeLinks.set(codeRelPath, {
+                hostPath: resolvedHostPath,
+                readOnly: options?.readOnly === true,
+            });
+        } else {
+            manifestVolumeMounts.push({ resolvedHostPath, containerPath, options });
         }
     }
 
@@ -932,8 +978,9 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         args.splice(1, 0, ...runtimeNetworkPlan.args);
     }
 
-    for (const { resolvedHostPath, containerPath } of manifestVolumeMounts) {
-        args.push('-v', `${resolvedHostPath}:${containerPath}${runtime === 'podman' ? ':z' : ''}`);
+    for (const { resolvedHostPath, containerPath, options } of manifestVolumeMounts) {
+        const mountSuffix = runtime === 'podman' ? podmanManifestVolumeMountSuffix(resolvedHostPath, options) : '';
+        args.push('-v', `${resolvedHostPath}:${containerPath}${mountSuffix}`);
     }
 
     const { publishArgs: manifestPorts, portMappings } = parseManifestPorts(manifest, profileConfig);
@@ -1416,7 +1463,7 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
         debugLog(`[ensureAgentService] ${agentName}: container exists, checking if running...`);
         let canReuseExisting = true;
         if (!isContainerRunning(containerName)) {
-            ensureManifestVolumeHostPaths(manifest);
+            ensureManifestVolumeHostPaths(manifest, profileConfig);
             syncAgentMcpConfig(containerName, agentPath, agentName);
             try {
                 // Capture stderr so an expected reuse failure does not dump an
@@ -1560,10 +1607,12 @@ export {
     buildRuntimeNetworkPlan,
     buildRuntimeRouterEnv,
     codeRelativeMountPath,
+    collectManifestVolumeEntries,
     ensureAgentService,
     ensureManifestVolumeHostPath,
     ensurePodmanStagedCodeDir,
     mergeNodeOptions,
+    podmanManifestVolumeMountSuffix,
     podmanMountSuffix,
     resolveDependencyCachePreparation,
     resolveHostPort,
