@@ -28,7 +28,7 @@ const {
     ensureRepoOnBranch,
     loadEnabledRepos,
 } = reposMod;
-const { applyManifestDirectives } = bootstrapManifestMod;
+const { applyManifestDirectives, manifestEnableEntries } = bootstrapManifestMod;
 const { bootstrap } = ploinkybootMod;
 
 // ---------------------------------------------------------------------------
@@ -508,6 +508,24 @@ test('applyManifestDirectives: profile enable auto-installs missing prefixed rep
     assert.equal(current, 'feature-profile');
     assert.equal(loadEnabledRepos().includes('profileAutoRepo'), true);
     fs.writeFileSync(path.join(tempDir, '.ploinky', 'profile'), 'default');
+});
+
+test('manifestEnableEntries: default profile enable is used when active profile is absent', (t) => {
+    const profilePath = path.join(tempDir, '.ploinky', 'profile');
+    fs.mkdirSync(path.dirname(profilePath), { recursive: true });
+    fs.writeFileSync(profilePath, 'embedded');
+    t.after(() => fs.writeFileSync(profilePath, 'default'));
+
+    const entries = manifestEnableEntries({
+        enable: ['base-agent'],
+        profiles: {
+            default: {
+                enable: ['default-profile-agent'],
+            },
+        },
+    });
+
+    assert.deepEqual(entries, ['base-agent', 'default-profile-agent']);
 });
 
 test('applyManifestDirectives: child manifest repos are applied before recursive enables resolve', async () => {

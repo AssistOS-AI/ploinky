@@ -161,14 +161,17 @@ function errorMessage(err) {
     return err && err.message ? err.message : String(err);
 }
 
-function manifestEnableEntries(manifest, profileOverride = '') {
+export function manifestEnableEntries(manifest, profileOverride = '') {
     const entries = [];
     if (Array.isArray(manifest?.enable)) {
         entries.push(...manifest.enable);
     }
     try {
         const activeProfile = profileOverride || getActiveProfile();
-        const profileBlock = manifest?.profiles?.[activeProfile];
+        const profiles = manifest?.profiles || {};
+        // Agents that do not declare the active semantic profile still use their
+        // default profile dependency contract.
+        const profileBlock = profiles[activeProfile] || profiles.default;
         if (profileBlock && Array.isArray(profileBlock.enable)) {
             entries.push(...profileBlock.enable);
         }

@@ -526,6 +526,38 @@ test('resolveWorkspaceDependencyGraph resolves profile-specific enable[] for sem
     fs.writeFileSync(profilePath, 'dev');
 });
 
+test('resolveWorkspaceDependencyGraph uses default profile enable[] when active profile is absent', (t) => {
+    const profilePath = path.join(tempDir, '.ploinky', 'profile');
+    fs.mkdirSync(path.dirname(profilePath), { recursive: true });
+    fs.writeFileSync(profilePath, 'embedded');
+    t.after(() => fs.writeFileSync(profilePath, 'default'));
+
+    writeManifest('basic', 'default-profile-provider', {
+        container: 'node:20-slim',
+        profiles: {
+            default: {},
+        },
+    });
+    writeManifest('AchillesIDE', 'explorer-default-profile-enable', {
+        container: 'node:20',
+        profiles: {
+            default: {
+                enable: ['basic/default-profile-provider global'],
+            },
+        },
+    });
+
+    const graph = resolveWorkspaceDependencyGraph({ staticAgentRef: 'AchillesIDE/explorer-default-profile-enable' });
+
+    assert.ok(graph.nodes.has('basic/default-profile-provider'));
+    assert.ok(
+        graph.nodes
+            .get('AchillesIDE/explorer-default-profile-enable')
+            .dependencies
+            .has('basic/default-profile-provider')
+    );
+});
+
 test('resolveWorkspaceDependencyGraph records dependency-local profile overrides', () => {
     writeManifest('profileEdge', 'worker', {
         container: 'node:20',
