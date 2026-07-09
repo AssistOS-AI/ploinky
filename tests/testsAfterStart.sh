@@ -160,6 +160,7 @@ test_check "Recursive dependency graph waits wave-by-wave before starting depend
 test_check "Dependency readiness.protocol override applies to dependency startup gating" fast_test_dependency_readiness_protocol_override
 test_check "Static start-only TCP service becomes ready without MCP probing" fast_test_static_start_only_tcp_readiness
 test_check "Broken dependency prevents router launch and static agent startup" fast_test_dependency_failure_blocks_router_startup
+test_check "Startup config provider preflight persists values before static start" fast_test_startup_config_provider_preflight
 
 stage_header "Start Command Result"
 test_start_result_file="$TEST_AGENT_WORKSPACE/start-result"

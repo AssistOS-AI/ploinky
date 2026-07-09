@@ -45,6 +45,8 @@ Adding a new persistent secret requires picking a fresh purpose label rather tha
 
 Agent-owned generated secrets must derive from `PLOINKY_DERIVED_MASTER_KEY`, not from `PLOINKY_MASTER_KEY` and not from random persistent storage. Manifests declare ordinary per-agent generated secrets with `generatedSecret: true`; this derives from a domain-separated label containing the current repo name, current agent name, and env name. Runtime resources use `{{generatedSecret:NAME}}` for the same per-agent behavior. Cross-agent service credentials that must be identical, such as a shared media-service API key, must use `sharedGeneratedSecret: true` so the value derives from the source env name rather than a custom logical repo/agent/name tuple. Shared generated credentials are still explicit manifest choices and should be reserved for credentials that truly must be shared. A generated env entry may set `explicitOverride: true` when an operator-provided external credential is allowed to replace the generated value, or `explicitOverrideRequires` when that external credential must travel together with companion topology. Runtime managers expose only the source class, `PLOINKY_ENV_SOURCE_<ENV_NAME>=generated|explicit`, not the secret material itself. External provider credentials and operator-supplied API keys remain explicitly configured because their values originate outside the workspace.
 
+Startup config-provider subprocesses are host-side helper commands, not trusted runtime key holders. Ploinky builds a sanitized provider environment, strips `PLOINKY_MASTER_KEY`, `PLOINKY_DERIVED_MASTER_KEY`, `PLOINKY_AGENT_SECRET`, `PLOINKY_AGENT_ID`, `PLOINKY_AGENT_API_KEY`, and `PLOINKY_AGENT_API_PUBLIC_KEY`, then validates provider stdout before writing accepted values itself. Providers therefore cannot decrypt workspace stores or mint router credentials through environment inheritance. Provider output is also rejected when it targets reserved Ploinky names or generated/shared-generated secret names owned by the dependency graph.
+
 `.ploinky/.secrets` must be stored as an AES-256-GCM JSON envelope through `cli/services/encryptedSecretsFile.js`, encrypted with the `storage/secrets` subkey. Legacy plaintext key-value files are migrated into the encrypted envelope on first read. The envelope encrypts both variable names and values inside the ciphertext payload. Writes use a temporary file and rename, and the implementation attempts to set mode `0600`.
 
 Local authentication users must be stored in `.ploinky/passwords.enc` through `cli/services/encryptedPasswordStore.js`, not in `.ploinky/.secrets`. The password store is an AES-256-GCM envelope encrypted with the `storage/passwords` subkey; it groups user payloads by the route-specific users variable name, such as `PLOINKY_AUTH_EXPLORER_USERS`. User password material inside that store must be password hashes, not plaintext.
@@ -200,6 +202,11 @@ Per-agent credential isolation is now implemented (DS013) and the router enforce
 
 Response:
 A manifest already controls runtime commands, env defaults, mounts, profiles, and service declarations for an enabled agent. Letting the same manifest declare public read-only or protected transparent proxy paths keeps that routing intent with the agent source, but it must be documented as trusted power because `public` changes anonymous reachability. The security boundary is preserved by limiting public to `GET`/`HEAD`, by making protected win over public on overlaps, and by reusing the router's internal-path rejection before any declaration can affect request handling.
+
+### Question #7: Why are provider subprocesses denied master and identity secrets even though they run on the host?
+
+Response:
+Provider commands are configuration helpers that may wrap third-party APIs or route-generation logic. They need selected manifest inputs and workspace context, not the workspace master seed or router-issued agent identity. Keeping the persistence step inside Ploinky preserves the encrypted-store boundary and keeps provider authors from depending on secrets that would make later sandboxing or policy hardening impossible.
 
 ## Conclusion
 

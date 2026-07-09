@@ -3,18 +3,24 @@
 Date: 2026-07-09. Branch target: `ploinky-box` across all affected repos.
 Status: proposed (planning session; no implementation yet).
 
+> Superseded implementation note (2026-07-09): this archival design was updated
+> for terminology only. The implemented runtime contract is Ploinky startup
+> config providers (`providesConfig` plus profile `configProviders`), documented
+> in `../../specs/DS015-startup-config-providers.md`; the rejected router
+> variable-publish architecture below is not the active implementation path.
+
 ## Problem
 
 Deployments of AssistOSExplorer (especially inside ploinky-box) currently require
 operators to inject public-exposure env vars into the runtime before start:
-`ONLYOFFICE_PUBLIC_URL`, `CLOUDFLARED_TUNNEL_TOKEN`, `WEBMEET_PUBLIC_LIVEKIT_URL`,
+`ONLYOFFICE_PUBLIC_URL`, `WEB_PUBLISHING_CLOUDFLARED_TUNNEL_TOKEN`, `WEBMEET_PUBLIC_LIVEKIT_URL`,
 `WEBMEET_TLS_HOSTNAME`, `WEBMEET_TURN_HOST`, `WEBMEET_TURN_EXTERNAL_IP`,
 `WEBMEET_CERT_EMAIL`. The ploinky-box wrapper forwards **no** host env into the box
 (`container/ploinky-box.mjs` `buildRunArgs()` passes only
 `PLOINKY_WORKSPACE_ROOT`), so today these values must be seeded by running
 `ploinky var` inside the box or by CI (`deploy-explorer-qa.yml` `set_var` calls).
 `AssistOSExplorer/docs/explorer-qa-env-injection.md` additionally records that
-`CLOUDFLARED_TUNNEL_TOKEN` injection is missing from the QA workflow entirely.
+`WEB_PUBLISHING_CLOUDFLARED_TUNNEL_TOKEN` injection is missing from the QA workflow entirely.
 
 Goal: a new **Web Publishing** agent in the `basic` repo that owns public exposure
 (nginx reverse proxy and/or Cloudflare Tunnel), is configured through an
@@ -64,10 +70,10 @@ Three layers:
    dashboard-entered configuration (mode, base domain, exposures, Cloudflare
    credentials reference). Follows cloudflared's `routes.json`/`status.json`
    pattern.
-2. **Published workspace vars** — the new Ploinky runtime feature (§3): the
+2. **Startup config provider outputs** — the new Ploinky runtime feature (§3): the
    agent pushes the *derived consumer-facing values* (`ONLYOFFICE_PUBLIC_URL`,
-   `WEBMEET_*`, `CLOUDFLARED_TUNNEL_TOKEN`) to a router-owned, encrypted
-   published-vars store that manifest env resolution consults.
+   `WEBMEET_*`, `WEB_PUBLISHING_CLOUDFLARED_TUNNEL_TOKEN`) to a router-owned, encrypted
+   startup-config-providers store that manifest env resolution consults.
 3. **Existing generated secrets stay untouched**: `WEBMEET_LIVEKIT_API_KEY/SECRET`,
    `WEBMEET_TURN_PASSWORD`, `PLOINKY_WEBMEET_MASTER_KEY`, `ONLYOFFICE_JWT_SECRET`
    remain `generatedSecret`/`sharedGeneratedSecret` — Web Publishing does not own
@@ -84,14 +90,14 @@ via Cloudflare API, dashboard reconfiguration). The feature has four parts:
 1. **Manifest allowlist**: a new manifest field `publishesVars: ["NAME", ...]`
    (agent self-declaration, same trust class as `routerAccess.httpRoutes` —
    trusted manifest power, reviewed at enable time).
-2. **Router endpoint**: `POST /api/router/published-vars` under the existing
+2. **Router endpoint**: `POST /api/router/startup-config-providers` under the existing
    router-owned `/api/router/` prefix, authenticated by an HTTP Agent Assertion
    (`tool: "__published_vars__"`, `computeRchHttp` over the exact body — the
    `openAiAgentDiscovery.js` pattern). The router verifies the source agent,
    loads its manifest, and accepts only names in that agent's `publishesVars`,
    rejecting reserved names (`PLOINKY_*`, `WEBDASHBOARD_TOKEN`) atomically.
-3. **Encrypted store**: `.ploinky/data/published-vars.enc`, AES-256-GCM under a
-   **new HKDF purpose label `storage/published-vars`** (per DS011's "new
+3. **Encrypted store**: `.ploinky/data/startup-config-providers.enc`, AES-256-GCM under a
+   **new HKDF purpose label `storage/startup-config-providers`** (per DS011's "new
    persistent secret ⇒ fresh purpose label" rule). Entries record
    `{value, publisher, updatedAt}`.
 4. **Resolution integration**: `cli/services/secretVars.js` consults the
@@ -110,7 +116,7 @@ the dashboard can warn). Published values only beat manifest defaults.
 Nothing new crosses the box boundary. User-owned inputs (Cloudflare API token or
 tunnel token, base domain, hostnames, cert email) are entered once in the
 admin dashboard → travel browser → router (session terminates at router) →
-admin MCP tool (Router Request) → agent → published-vars endpoint (Agent
+admin MCP tool (Router Request) → agent → startup-config-providers endpoint (Agent
 Assertion) → encrypted store inside the workspace volume. `PLOINKY_MASTER_KEY`
 remains router/launcher-only (in-box it resolves to the generated
 `.ploinky/master-key` fallback); the publish endpoint denylists `PLOINKY_*` so
@@ -121,8 +127,8 @@ never reach the agent (DS013 flow unchanged).
 
 | Class | Values | Source |
 | --- | --- | --- |
-| User-owned (dashboard inputs) | `CLOUDFLARE_API_TOKEN` + `CLOUDFLARE_ACCOUNT_ID` + `CLOUDFLARE_ZONE_ID` (API mode), or `CLOUDFLARED_TUNNEL_TOKEN` (token mode), base domain, per-service hostname overrides, `WEBMEET_CERT_EMAIL`, LAN host/IP override | Entered in dashboard, persisted in agent config store; secrets kept out of status output |
-| Generated/derived and published by Web Publishing | `ONLYOFFICE_PUBLIC_URL`, `WEBMEET_PUBLIC_LIVEKIT_URL`, `WEBMEET_TLS_HOSTNAME`, `WEBMEET_TURN_HOST`, `WEBMEET_TURN_EXTERNAL_IP`, `WEBMEET_CERT_EMAIL`, `CLOUDFLARED_TUNNEL_TOKEN` (API mode mints it) | Derived from base domain + exposure map + detected/entered host IP; written via published-vars |
+| User-owned (dashboard inputs) | `WEB_PUBLISHING_CLOUDFLARE_API_TOKEN` + `WEB_PUBLISHING_CLOUDFLARE_ACCOUNT_ID` + `WEB_PUBLISHING_CLOUDFLARE_ZONE_ID` (API mode), or `WEB_PUBLISHING_CLOUDFLARED_TUNNEL_TOKEN` (token mode), base domain, per-service hostname overrides, `WEBMEET_CERT_EMAIL`, LAN host/IP override | Entered in dashboard, persisted in agent config store; secrets kept out of status output |
+| Generated/derived and published by Web Publishing | `ONLYOFFICE_PUBLIC_URL`, `WEBMEET_PUBLIC_LIVEKIT_URL`, `WEBMEET_TLS_HOSTNAME`, `WEBMEET_TURN_HOST`, `WEBMEET_TURN_EXTERNAL_IP`, `WEBMEET_CERT_EMAIL`, `WEB_PUBLISHING_CLOUDFLARED_TUNNEL_TOKEN` (API mode mints it) | Derived from base domain + exposure map + detected/entered host IP; written via startup-config-providers |
 | Untouched (Ploinky-generated) | `WEBMEET_LIVEKIT_API_KEY`, `WEBMEET_LIVEKIT_API_SECRET`, `WEBMEET_TURN_PASSWORD`, `PLOINKY_WEBMEET_MASTER_KEY`, `ONLYOFFICE_JWT_SECRET`/`JWT_SECRET`, `DPU_MASTER_KEY`, agent identity vars | Existing `generatedSecret`/`sharedGeneratedSecret`/DS013 injection |
 | Optional/defaulted (not published in v1) | `WEBMEET_LIVEKIT_URL`, `ONLYOFFICE_INTERNAL_URL`, `ONLYOFFICE_CALLBACK_BASE_URL`, TURN ports/realm/user | Manifest profile defaults + existing preinstall seeding |
 | Forbidden | `PLOINKY_MASTER_KEY` (never in any agent), `PLOINKY_*` names via publish API | Endpoint denylist + existing DS013 guarantees |
@@ -143,7 +149,7 @@ Dashboard collects API token + account id (+ zone id + base domain). The
 allowlisted local origin), and CNAME upsert `{hostname} → {tunnelId}.cfargotunnel.com`
 (reusing `basic/cloudflared/lib/cloudflare-api.mjs` logic, extended with
 create/token endpoints). The fetched token is stored in the agent config store
-and published as `CLOUDFLARED_TUNNEL_TOKEN`; the supervisor (re)starts
+and published as `WEB_PUBLISHING_CLOUDFLARED_TUNNEL_TOKEN`; the supervisor (re)starts
 cloudflared with it.
 
 ### 7. Tunnel-token mode (no API credentials)
@@ -206,7 +212,7 @@ v1 (trivially satisfying "public = GET/HEAD readonly": there are none).
 
 See the implementation plan
 (`docs/superpowers/plans/2026-07-09-web-publishing-agent.md`) for exact files,
-code, tests, and commands. Summary: ploinky (published-vars store + endpoint +
+code, tests, and commands. Summary: ploinky (startup-config-providers store + endpoint +
 resolution + CLI display + Agent client + tests + DS spec updates),
 container-image-builds (Dockerfile + workflow + tests + README row), basic
 (manifest, mcp-config with 4 admin tools, supervisor, nginx/cloudflare/publish
@@ -229,10 +235,10 @@ Browser (admin user)
                                                    └─ lib: config store · nginx conf gen · Cloudflare API · publisher
                                                             │ Agent Assertion (`__published_vars__`)
                                                             ▼
-                                              Router  POST /api/router/published-vars
+                                              Router  POST /api/router/startup-config-providers
                                                             │ allowlist: manifest publishesVars
                                                             ▼
-                                            .ploinky/data/published-vars.enc  (AES-GCM, storage/published-vars)
+                                            .ploinky/data/startup-config-providers.enc  (AES-GCM, storage/startup-config-providers)
                                                             │ consulted by secretVars resolution
                                                             ▼
                             consumer agents (onlyOffice, webmeetAgent, liveKitServerAgent, explorer)
@@ -282,7 +288,7 @@ consumers with the new values.
    workspaces: store absent ⇒ resolution unchanged).
 2. Explorer `qa`/`prod` switch cloudflared → web-publishing. Existing
    deployments keep working because operator-set vars (including
-   `CLOUDFLARED_TUNNEL_TOKEN`) win over published values; the agent consumes the
+   `WEB_PUBLISHING_CLOUDFLARED_TUNNEL_TOKEN`) win over published values; the agent consumes the
    same var name for its own cloudflared child.
 3. `deploy-explorer-qa.yml` is left unchanged in v1 (operator vars still
    authoritative for CI); making `EXPLORER_QA_ONLYOFFICE_PUBLIC_URL` optional is
@@ -293,7 +299,7 @@ consumers with the new values.
 
 - Revert Explorer manifest profiles to `basic/cloudflared global no-wait`.
 - `ploinky disable agent web-publishing` (or remove from enable list).
-- `rm .ploinky/data/published-vars.enc` — resolution falls back to operator
+- `rm .ploinky/data/startup-config-providers.enc` — resolution falls back to operator
   vars/defaults; consumers revert on next restart.
 - The ploinky feature is additive (new files + one guarded resolution branch);
   reverting the ploinky commits restores prior behavior byte-for-byte.

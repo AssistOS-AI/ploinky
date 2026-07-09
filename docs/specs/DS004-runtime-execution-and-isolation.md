@@ -36,6 +36,8 @@ Manifest volume declarations must create missing host directories before startup
 
 The static agent’s preinstall host hook must be allowed to run before dependency startup begins. This is part of the current startup contract because dependent services may require variables or files that the static agent’s preinstall hook creates before the dependency graph is expanded into startup waves.
 
+After static preinstall and manifest directive application, startup config providers run as a host-side preflight over the discovered dependency graph. This provider phase runs before dependent env maps are built, before missing graph nodes are enabled, and before blocking/no-wait dependency waves start. It may persist validated output into the encrypted workspace var store, so the ordinary runtime env resolution path sees provider-written values during the same `ploinky start`.
+
 Hardware-aware LLM agents opt in through `manifest.llmRuntime.enabled = true`. When opted in, Ploinky resolves the architecture catalog, runs allowlisted accelerator probes with short timeouts (`nvidia-smi -L`, `nvidia-ctk cdi list`, `/dev/kfd`, `/dev/dri`, `/dev/accel`, `rocminfo`, `amd-smi`, `lspci -nn`, `vulkaninfo --summary`), inspects the container daemon's OCI platform via `docker info`/`docker version`/`podman info --format json`, and selects a compatible architecture record before dependency-cache preparation. Accelerator families require confirmation signals, not just device-file presence: ROCm requires a ROCm tool, Vulkan requires a renderer from `vulkaninfo`, and Intel/OpenVINO requires an Intel device confirmation.
 
 Architecture selection produces a typed runtime policy (platform, memory, cpus, pids-limit, shm-size, ulimit memlock, allowlisted CDI/host devices, allowlisted `securityOpt`, `ipc`, `--gpus`). Ploinky emits those arguments into the `docker run` / `podman run` command and labels the container with `ploinky.llm.architecture`, `ploinky.llm.catalog`, `ploinky.llm.catalogref`, `ploinky.llm.policyhash`, `ploinky.llm.imagedigest`, and `ploinky.reusehash`. Container reuse for LLM agents compares both `ploinky.envhash` and `ploinky.reusehash` against the desired values; the reuse hash includes architecture id, image ref, image digest, OCI platform, runtime policy hash, catalog id, and catalog ref. The single architecture override (`PLOINKY_LLM_ARCHITECTURE_ID`), forced platform (`PLOINKY_LLM_FORCE_PLATFORM`), forced accelerator family (`PLOINKY_LLM_ACCELERATOR`), and explicit image override (`PLOINKY_LLM_AGENT_IMAGE` / `PLOINKY_<AGENT>_IMAGE`) are validated against the same typed contract — runtime policy validation is never bypassed. There is no per-agent architecture override because architecture selection is host/runtime policy, not agent-owned model policy. Non-LLM agents are untouched.
@@ -49,17 +51,22 @@ For LLM runtime agents, Ploinky mounts alias-specific runtime state at `/runtime
 Response:
 The implementation explicitly runs the static agent’s preinstall hook before manifest directives and dependency waves are applied. This ordering allows the static agent to seed workspace variables or files that dependent agents consume during their own startup and matches the current behavior in `startWorkspace()`.
 
-### Question #2: Why are mount permissions profile-driven instead of being hardcoded per runtime?
+### Question #2: Why do startup config providers run after graph discovery but before dependency startup?
+
+Response:
+Provider declarations belong to the static/profile manifest, but provider agents can be installed or enabled by the same recursive manifest directive pass as other dependencies. Running after graph discovery lets Ploinky resolve those provider agents and protect generated-secret names across the full graph; running before dependency startup lets provider output participate in normal manifest env resolution for consumers.
+
+### Question #3: Why are mount permissions profile-driven instead of being hardcoded per runtime?
 
 Response:
 The repository already supports multiple deployment stances through `dev`, `qa`, and `prod`. Mount policy is therefore an operational concern, not a property of one backend. Keeping it profile-driven allows the same agent manifest to run with writable development mounts and read-only higher-assurance mounts without forking the runtime implementation.
 
-### Question #3: Why is host networking handled at the manifest layer rather than as a runtime flag?
+### Question #4: Why is host networking handled at the manifest layer rather than as a runtime flag?
 
 Response:
 Host networking changes the agent's port surface, its DNS resolution, and the way siblings address it; that affects manifest content (no `-p` flags, no bridge aliases, sibling URL configuration) more than it affects the implementation. Modeling it as `network.mode: "host"` in the manifest keeps the choice declarative, visible to operators, reflected in the manifest registry, and reproducible across `podman` and `docker` runtimes without bespoke flags at the call site.
 
-### Question #4: Why does host sandbox teardown signal every process before waiting?
+### Question #5: Why does host sandbox teardown signal every process before waiting?
 
 Response:
 `stop`, `shutdown`, and `destroy` are workspace-level lifecycle operations. If Ploinky waited for each `bwrap` or Seatbelt process before signaling the next one, one stuck agent could keep the rest of the workspace running for the full timeout. Batch signaling gives every selected sandbox the same shutdown window and keeps the total wait bounded by one shared deadline.

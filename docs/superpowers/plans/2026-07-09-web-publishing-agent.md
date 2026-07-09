@@ -1,10 +1,16 @@
 # Web Publishing Agent Implementation Plan
 
+> Superseded implementation note (2026-07-09): this archival plan was updated
+> for terminology only. The implemented runtime contract is Ploinky startup
+> config providers (`providesConfig` plus profile `configProviders`), documented
+> in `docs/specs/DS015-startup-config-providers.md`; the rejected router
+> variable-publish architecture below is not the active implementation path.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Add a `basic/web-publishing` Ploinky agent (custom nginx+cloudflared image, admin dashboard) plus a new ploinky "agent-published workspace vars" runtime feature, so public-exposure env vars (`ONLYOFFICE_PUBLIC_URL`, `CLOUDFLARED_TUNNEL_TOKEN`, `WEBMEET_*`) are generated/persisted/published by the agent instead of being passed into the Ploinky box container.
+**Goal:** Add a `basic/web-publishing` Ploinky agent (custom nginx+cloudflared image, admin dashboard) plus a new ploinky "agent-published workspace vars" runtime feature, so public-exposure env vars (`ONLYOFFICE_PUBLIC_URL`, `WEB_PUBLISHING_CLOUDFLARED_TUNNEL_TOKEN`, `WEBMEET_*`) are generated/persisted/published by the agent instead of being passed into the Ploinky box container.
 
-**Architecture:** One agent container runs nginx + cloudflared + the standard AgentServer under a supervisor (the `basic/cloudflared` dual-command pattern). Its admin-tagged MCP tools (driven by an Explorer settings plugin) write an agent-local config store, regenerate nginx/cloudflared state, and push derived consumer values through a new router-owned, Agent-Assertion-authenticated endpoint `POST /api/router/published-vars` into an encrypted store `.ploinky/data/published-vars.enc`. Manifest env resolution consults that store after operator sources and before manifest defaults, so consumers pick published values up via the existing envhash-driven container recreate on the next start/restart.
+**Architecture:** One agent container runs nginx + cloudflared + the standard AgentServer under a supervisor (the `basic/cloudflared` dual-command pattern). Its admin-tagged MCP tools (driven by an Explorer settings plugin) write an agent-local config store, regenerate nginx/cloudflared state, and push derived consumer values through a new router-owned, Agent-Assertion-authenticated endpoint `POST /api/router/startup-config-providers` into an encrypted store `.ploinky/data/startup-config-providers.enc`. Manifest env resolution consults that store after operator sources and before manifest defaults, so consumers pick published values up via the existing envhash-driven container recreate on the next start/restart.
 
 **Tech Stack:** Node.js ESM (Node 20+), `node:test` + `node:assert/strict`, bash lifecycle hooks, nginx, cloudflared, Cloudflare REST API v4, Docker/Podman multi-stage images, GitHub Actions image publishing.
 
@@ -41,13 +47,13 @@
 
 | Repo | Path | Role |
 | --- | --- | --- |
-| ploinky | `cli/services/publishedVars.js` | New: encrypted published-vars store (read/write/delete, provenance) |
+| ploinky | `cli/services/startupConfigProviders.js` | New: encrypted startup-config-providers store (read/write/delete, provenance) |
 | ploinky | `cli/services/secretVars.js` | Modify: consult published store in resolution + `published` provenance |
-| ploinky | `cli/server/publishedVarsRoute.js` | New: `POST /api/router/published-vars` handler |
+| ploinky | `cli/server/startupConfigProvidersRoute.js` | New: `POST /api/router/startup-config-providers` handler |
 | ploinky | `cli/server/RoutingServer.js` | Modify: dispatch new route beside the discovery route |
 | ploinky | `cli/commands/envVarCommands.js` | Modify: `ploinky vars`/`echo` show/resolve published values |
-| ploinky | `Agent/lib/publishedVarsClient.mjs` | New: agent-side publish client (Agent Assertion) |
-| ploinky | `tests/unit/publishedVarsStore.test.mjs`, `publishedVarsResolution.test.mjs`, `publishedVarsRoute.test.mjs` | New tests |
+| ploinky | `Agent/lib/startupConfigProvidersClient.mjs` | New: agent-side publish client (Agent Assertion) |
+| ploinky | `tests/unit/startupConfigProvidersStore.test.mjs`, `startupConfigProvidersResolution.test.mjs`, `startupConfigProvidersRoute.test.mjs` | New tests |
 | ploinky | `docs/specs/DS003,DS005,DS011,DS013` | Modify: document the feature |
 | container-image-builds | `images/web-publishing-agent/Dockerfile`, `.github/workflows/publish-web-publishing-agent-image.yml`, `tests/image-definitions.test.mjs`, `README.md` | New image + workflow + test + index row |
 | basic | `web-publishing/manifest.json`, `mcp-config.json`, `runtime/web-publishing-supervisor.mjs`, `lib/{configStore.mjs,publishTargets.mjs,nginxConfig.mjs,cloudflare-api.mjs,publisher.mjs}`, `tools/web-publishing-tool.mjs`, `IDE-plugins/web-publishing-settings/*`, `README.md`, `scripts/hooks/preinstall.sh` | New agent |
@@ -78,11 +84,11 @@ Expected: each repo on `ploinky-box`, clean tree (ploinky already has the branch
 
 ---
 
-### Task 1: ploinky — published-vars store
+### Task 1: ploinky — startup-config-providers store
 
 **Files:**
-- Create: `ploinky/cli/services/publishedVars.js`
-- Test: `ploinky/tests/unit/publishedVarsStore.test.mjs`
+- Create: `ploinky/cli/services/startupConfigProviders.js`
+- Test: `ploinky/tests/unit/startupConfigProvidersStore.test.mjs`
 
 **Interfaces:**
 - Produces: `readPublishedVars() -> {name: {value, publisher, updatedAt}}`, `getPublishedValue(name) -> string|undefined`, `setPublishedVars(entries, publisher) -> {written, deleted}`, `PUBLISHED_VARS_FILE`, `isReservedPublishedName(name) -> boolean`, `isValidPublishedName(name) -> boolean`.
@@ -94,7 +100,7 @@ If `deriveSubkey` is not exported, export it (it is the documented derivation ro
 
 - [ ] **Step 2: Write the failing test**
 
-`ploinky/tests/unit/publishedVarsStore.test.mjs`:
+`ploinky/tests/unit/startupConfigProvidersStore.test.mjs`:
 
 ```js
 import test from 'node:test';
@@ -108,9 +114,9 @@ process.env.PLOINKY_WORKSPACE_ROOT = tmp;
 process.env.PLOINKY_CWD = tmp;
 process.chdir(tmp);
 
-const store = await import('../../cli/services/publishedVars.js');
+const store = await import('../../cli/services/startupConfigProviders.js');
 
-test('round-trips published vars through the encrypted store', () => {
+test('round-trips startup config provider outputs through the encrypted store', () => {
     const res = store.setPublishedVars(
         { ONLYOFFICE_PUBLIC_URL: 'https://onlyoffice.example.test' },
         'agent:basic/web-publishing',
@@ -150,12 +156,12 @@ test('corrupt store reads as empty, does not throw', () => {
 
 - [ ] **Step 3: Run to verify failure**
 
-Run: `cd /Users/danielsava/work/file-parser/ploinky && node --test tests/unit/publishedVarsStore.test.mjs`
+Run: `cd /Users/danielsava/work/file-parser/ploinky && node --test tests/unit/startupConfigProvidersStore.test.mjs`
 Expected: FAIL (module not found).
 
 - [ ] **Step 4: Implement the store**
 
-`ploinky/cli/services/publishedVars.js` (match masterKey.js's module system; shown as ESM — convert to CJS `require/module.exports` if masterKey.js is CJS, mirroring its own imports):
+`ploinky/cli/services/startupConfigProviders.js` (match masterKey.js's module system; shown as ESM — convert to CJS `require/module.exports` if masterKey.js is CJS, mirroring its own imports):
 
 ```js
 import crypto from 'node:crypto';
@@ -166,7 +172,7 @@ import { deriveSubkey } from './masterKey.js';
 // Agent-published workspace variables (design 2026-07-09-web-publishing-agent-design.md).
 // Encrypted with a dedicated HKDF purpose so a leak of this store's key cannot
 // decrypt .secrets or passwords (DS011: new persistent secret => new purpose label).
-const PURPOSE = 'storage/published-vars';
+const PURPOSE = 'storage/startup-config-providers';
 const ALGORITHM = 'aes-256-gcm';
 const IV_BYTES = 12;
 const TAG_BYTES = 16;
@@ -177,11 +183,11 @@ function workspaceRoot() {
     return process.env.PLOINKY_WORKSPACE_ROOT || process.cwd();
 }
 
-export const PUBLISHED_VARS_FILE = path.join(workspaceRoot(), '.ploinky', 'data', 'published-vars.enc');
+export const PUBLISHED_VARS_FILE = path.join(workspaceRoot(), '.ploinky', 'data', 'startup-config-providers.enc');
 
 function storeFile() {
     // Recomputed per call so tests can point PLOINKY_WORKSPACE_ROOT at a temp dir.
-    return path.join(workspaceRoot(), '.ploinky', 'data', 'published-vars.enc');
+    return path.join(workspaceRoot(), '.ploinky', 'data', 'startup-config-providers.enc');
 }
 
 export function isValidPublishedName(name) {
@@ -270,22 +276,22 @@ Note: if `PUBLISHED_VARS_FILE` as a static export conflicts with the per-call `s
 
 - [ ] **Step 5: Run the test — expect PASS**
 
-Run: `node --test tests/unit/publishedVarsStore.test.mjs`
+Run: `node --test tests/unit/startupConfigProvidersStore.test.mjs`
 
 - [ ] **Step 6: Commit (ploinky)**
 
 ```bash
-git -C /Users/danielsava/work/file-parser/ploinky add cli/services/publishedVars.js tests/unit/publishedVarsStore.test.mjs
+git -C /Users/danielsava/work/file-parser/ploinky add cli/services/startupConfigProviders.js tests/unit/startupConfigProvidersStore.test.mjs
 git -C /Users/danielsava/work/file-parser/ploinky commit -m "Add encrypted published workspace vars store"
 ```
 
 ---
 
-### Task 2: ploinky — env resolution consults published vars
+### Task 2: ploinky — env resolution consults startup config provider outputs
 
 **Files:**
 - Modify: `ploinky/cli/services/secretVars.js` (read via glob-copy per Global Constraints)
-- Test: `ploinky/tests/unit/publishedVarsResolution.test.mjs`
+- Test: `ploinky/tests/unit/startupConfigProvidersResolution.test.mjs`
 
 **Interfaces:**
 - Consumes: `getPublishedValue(name)` from Task 1.
@@ -312,7 +318,7 @@ Also locate where `valueSource` is assigned for explicit values and where `PLOIN
 
 - [ ] **Step 2: Write the failing test**
 
-`ploinky/tests/unit/publishedVarsResolution.test.mjs`:
+`ploinky/tests/unit/startupConfigProvidersResolution.test.mjs`:
 
 ```js
 import test from 'node:test';
@@ -326,7 +332,7 @@ process.env.PLOINKY_WORKSPACE_ROOT = tmp;
 process.env.PLOINKY_CWD = tmp;
 process.chdir(tmp);
 
-const store = await import('../../cli/services/publishedVars.js');
+const store = await import('../../cli/services/startupConfigProviders.js');
 // secretVars.js may be CJS; import interop below mirrors other unit tests —
 // check tests/unit/agentEnvInjection.test.mjs and copy its import style.
 const secretVars = await import('../../cli/services/secretVars.js');
@@ -363,7 +369,7 @@ Adjust `buildEnvMap` naming/export style to what `/tmp/inspect/secretVars.js` ac
 
 - [ ] **Step 3: Run to verify failure**
 
-Run: `node --test tests/unit/publishedVarsResolution.test.mjs`
+Run: `node --test tests/unit/startupConfigProvidersResolution.test.mjs`
 Expected: FAIL — published value not resolved (falls to default/undefined).
 
 - [ ] **Step 4: Implement the resolution branch**
@@ -371,7 +377,7 @@ Expected: FAIL — published value not resolved (falls to default/undefined).
 In `cli/services/secretVars.js` (Edit on the real file, anchored by the copy):
 
 1. Import the store at the top, matching the file's module system:
-   `import { getPublishedValue } from './publishedVars.js';` (or the CJS `require`).
+   `import { getPublishedValue } from './startupConfigProviders.js';` (or the CJS `require`).
 2. Insert a `published` branch between the `.env` check and the `defaultValue` check:
 
 ```js
@@ -388,29 +394,29 @@ In `cli/services/secretVars.js` (Edit on the real file, anchored by the copy):
 - [ ] **Step 5: Run the new test and the existing env-injection guard**
 
 ```bash
-node --test tests/unit/publishedVarsResolution.test.mjs tests/unit/agentEnvInjection.test.mjs
+node --test tests/unit/startupConfigProvidersResolution.test.mjs tests/unit/agentEnvInjection.test.mjs
 ```
 Expected: PASS both (the second proves no reserved-injection regression).
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git -C /Users/danielsava/work/file-parser/ploinky add -A cli/services tests/unit/publishedVarsResolution.test.mjs
-git -C /Users/danielsava/work/file-parser/ploinky commit -m "Resolve agent-published vars after operator sources"
+git -C /Users/danielsava/work/file-parser/ploinky add -A cli/services tests/unit/startupConfigProvidersResolution.test.mjs
+git -C /Users/danielsava/work/file-parser/ploinky commit -m "Resolve agent-startup config provider outputs after operator sources"
 ```
 
 ---
 
-### Task 3: ploinky — router endpoint `POST /api/router/published-vars`
+### Task 3: ploinky — router endpoint `POST /api/router/startup-config-providers`
 
 **Files:**
-- Create: `ploinky/cli/server/publishedVarsRoute.js`
+- Create: `ploinky/cli/server/startupConfigProvidersRoute.js`
 - Modify: `ploinky/cli/server/RoutingServer.js` (dispatch)
-- Test: `ploinky/tests/unit/publishedVarsRoute.test.mjs`
+- Test: `ploinky/tests/unit/startupConfigProvidersRoute.test.mjs`
 
 **Interfaces:**
 - Consumes: `setPublishedVars`, `isValidPublishedName`, `isReservedPublishedName` (Task 1); `verifyAgentAssertion` (`cli/server/mcp-proxy/invocationMinter.js:87`); `computeRchHttp`, `sha256RawBodyHash` (`Agent/lib/requestHash.mjs`); `readEnabledAgentManifest`, `loadRoutingConfig` (`cli/server/httpServiceRoutes.js`); `deriveAgentPrincipalId` (`cli/services/agentIdentity.js`).
-- Produces: `PUBLISHED_VARS_PATH = '/api/router/published-vars'`, `PUBLISHED_VARS_TOOL = '__published_vars__'`, `handlePublishedVarsRoute(req, res, parsedUrl, deps) -> boolean`. Request body `{ "vars": { "NAME": "value" | null } }`; response `{ ok, written, deleted, shadowed }`; failures: 401 `agent_assertion_required`, 403 `var_not_publishable`, 400 `invalid_payload`, 405, 413.
+- Produces: `PUBLISHED_VARS_PATH = '/api/router/startup-config-providers'`, `PUBLISHED_VARS_TOOL = '__published_vars__'`, `handlePublishedVarsRoute(req, res, parsedUrl, deps) -> boolean`. Request body `{ "vars": { "NAME": "value" | null } }`; response `{ ok, written, deleted, shadowed }`; failures: 401 `agent_assertion_required`, 403 `var_not_publishable`, 400 `invalid_payload`, 405, 413.
 
 - [ ] **Step 1: Confirm `verifyAgentAssertion` return shape**
 
@@ -419,7 +425,7 @@ Also see the usage at `cli/server/agentOpenAiDelegation.js:147`. Expected: it re
 
 - [ ] **Step 2: Write the failing test**
 
-`ploinky/tests/unit/publishedVarsRoute.test.mjs` (pure-handler test with injected deps; assertion signed with the same derived secret the router derives):
+`ploinky/tests/unit/startupConfigProvidersRoute.test.mjs` (pure-handler test with injected deps; assertion signed with the same derived secret the router derives):
 
 ```js
 import test from 'node:test';
@@ -435,9 +441,9 @@ process.env.PLOINKY_CWD = tmp;
 process.chdir(tmp);
 
 const { handlePublishedVarsRoute, PUBLISHED_VARS_PATH, PUBLISHED_VARS_TOOL } =
-    await import('../../cli/server/publishedVarsRoute.js');
+    await import('../../cli/server/startupConfigProvidersRoute.js');
 const { deriveAgentRequestSecret } = await import('../../cli/services/masterKey.js');
-const { readPublishedVars } = await import('../../cli/services/publishedVars.js');
+const { readPublishedVars } = await import('../../cli/services/startupConfigProviders.js');
 const { signAgentHttpAssertion } = await import('../../Agent/lib/agentAssertion.mjs');
 
 const AGENT_ID = 'agent:basic/web-publishing';
@@ -515,11 +521,11 @@ test('reports shadowed names when an operator value exists', async () => {
 
 - [ ] **Step 3: Run to verify failure**
 
-Run: `node --test tests/unit/publishedVarsRoute.test.mjs` — Expected: FAIL (module not found).
+Run: `node --test tests/unit/startupConfigProvidersRoute.test.mjs` — Expected: FAIL (module not found).
 
 - [ ] **Step 4: Implement the handler**
 
-`ploinky/cli/server/publishedVarsRoute.js`:
+`ploinky/cli/server/startupConfigProvidersRoute.js`:
 
 ```js
 import { readEnabledAgentManifest, loadRoutingConfig } from './httpServiceRoutes.js';
@@ -527,13 +533,13 @@ import { deriveAgentPrincipalId } from '../services/agentIdentity.js';
 import { verifyAgentAssertion } from './mcp-proxy/invocationMinter.js';
 import { createTokenReplayCache } from './security/tokens/JwsCodec.js';
 import { computeRchHttp, sha256RawBodyHash } from '../../Agent/lib/requestHash.mjs';
-import { setPublishedVars, isValidPublishedName, isReservedPublishedName } from '../services/publishedVars.js';
+import { setPublishedVars, isValidPublishedName, isReservedPublishedName } from '../services/startupConfigProviders.js';
 
 /**
- * publishedVarsRoute.js — router-owned, agent-authenticated write surface for
+ * startupConfigProvidersRoute.js — router-owned, agent-authenticated write surface for
  * agent-published workspace variables (design 2026-07-09).
  *
- * POST /api/router/published-vars with an HTTP Agent Assertion
+ * POST /api/router/startup-config-providers with an HTTP Agent Assertion
  * (tool `__published_vars__`, rch over the exact body bytes). The router derives
  * the caller identity from the verified assertion, loads THAT agent's enabled
  * manifest, and accepts only names listed in its `publishesVars` allowlist.
@@ -542,7 +548,7 @@ import { setPublishedVars, isValidPublishedName, isReservedPublishedName } from 
  * Dispatched BEFORE the session-auth gate, like /api/router/openai-agent-discovery.
  */
 
-export const PUBLISHED_VARS_PATH = '/api/router/published-vars';
+export const PUBLISHED_VARS_PATH = '/api/router/startup-config-providers';
 export const PUBLISHED_VARS_TOOL = '__published_vars__';
 const MAX_BODY_BYTES = 64 * 1024;
 const MAX_VARS_PER_CALL = 64;
@@ -649,7 +655,7 @@ export function handlePublishedVarsRoute(req, res, parsedUrl, {
         const allow = new Set(Array.isArray(manifest?.publishesVars) ? manifest.publishesVars.map(String) : []);
         const refused = names.filter((n) => !isValidPublishedName(n) || isReservedPublishedName(n) || !allow.has(n));
         if (refused.length) {
-            console.log(`[published-vars] refused ${sourceAgentId}: ${refused.join(', ')}`);
+            console.log(`[startup-config-providers] refused ${sourceAgentId}: ${refused.join(', ')}`);
             sendJson(res, 403, { ok: false, error: 'var_not_publishable', names: refused });
             return;
         }
@@ -662,7 +668,7 @@ export function handlePublishedVarsRoute(req, res, parsedUrl, {
             return;
         }
         const shadowed = names.filter((n) => { try { return hasOperatorValue(n); } catch { return false; } });
-        console.log(`[published-vars] ${sourceAgentId} wrote [${result.written.join(', ')}] deleted [${result.deleted.join(', ')}]`);
+        console.log(`[startup-config-providers] ${sourceAgentId} wrote [${result.written.join(', ')}] deleted [${result.deleted.join(', ')}]`);
         sendJson(res, 200, { ok: true, written: result.written, deleted: result.deleted, shadowed });
     })();
 
@@ -717,14 +723,14 @@ with the matching import. `/api/router/` is already in `isRouterOwnedPath` (line
 - [ ] **Step 6: Run tests — expect PASS**
 
 ```bash
-node --test tests/unit/publishedVarsRoute.test.mjs tests/unit/publishedVarsStore.test.mjs tests/unit/publishedVarsResolution.test.mjs
+node --test tests/unit/startupConfigProvidersRoute.test.mjs tests/unit/startupConfigProvidersStore.test.mjs tests/unit/startupConfigProvidersResolution.test.mjs
 ```
 
 - [ ] **Step 7: Commit**
 
 ```bash
-git -C /Users/danielsava/work/file-parser/ploinky add cli/server/publishedVarsRoute.js cli/server/RoutingServer.js tests/unit/publishedVarsRoute.test.mjs
-git -C /Users/danielsava/work/file-parser/ploinky commit -m "Add agent-authenticated published-vars router endpoint"
+git -C /Users/danielsava/work/file-parser/ploinky add cli/server/startupConfigProvidersRoute.js cli/server/RoutingServer.js tests/unit/startupConfigProvidersRoute.test.mjs
+git -C /Users/danielsava/work/file-parser/ploinky commit -m "Add agent-authenticated startup-config-providers router endpoint"
 ```
 
 ---
@@ -732,9 +738,9 @@ git -C /Users/danielsava/work/file-parser/ploinky commit -m "Add agent-authentic
 ### Task 4: ploinky — agent-side publish client + CLI visibility
 
 **Files:**
-- Create: `ploinky/Agent/lib/publishedVarsClient.mjs`
+- Create: `ploinky/Agent/lib/startupConfigProvidersClient.mjs`
 - Modify: `ploinky/cli/commands/envVarCommands.js`
-- Test: extend `ploinky/tests/unit/publishedVarsStore.test.mjs` (CLI part is exercised via service call)
+- Test: extend `ploinky/tests/unit/startupConfigProvidersStore.test.mjs` (CLI part is exercised via service call)
 
 **Interfaces:**
 - Produces: `publishWorkspaceVars(vars, {routerUrl, env, fetchImpl}) -> {ok, written, deleted, shadowed}` for agent code; `ploinky vars` lists published entries (values masked); `ploinky echo NAME` resolves published values after operator sources.
@@ -746,19 +752,19 @@ Expected: the injected value (likely `http://host.containers.internal:<routerPor
 
 - [ ] **Step 2: Implement the client**
 
-`ploinky/Agent/lib/publishedVarsClient.mjs`:
+`ploinky/Agent/lib/startupConfigProvidersClient.mjs`:
 
 ```js
 import { signAgentHttpAssertion } from './agentAssertion.mjs';
 
 /**
- * publishedVarsClient.mjs — agent-side helper for the router's
- * POST /api/router/published-vars surface (agent-published workspace vars).
+ * startupConfigProvidersClient.mjs — agent-side helper for the router's
+ * POST /api/router/startup-config-providers surface (agent-published workspace vars).
  * The caller must be an enabled agent whose manifest declares the names in
  * `publishesVars`. Values are strings; null deletes. Never log values.
  */
 
-export const PUBLISHED_VARS_PATH = '/api/router/published-vars';
+export const PUBLISHED_VARS_PATH = '/api/router/startup-config-providers';
 export const PUBLISHED_VARS_TOOL = '__published_vars__';
 
 export async function publishWorkspaceVars(vars, {
@@ -793,7 +799,7 @@ export default { publishWorkspaceVars, PUBLISHED_VARS_PATH, PUBLISHED_VARS_TOOL 
 Read `ploinky/cli/commands/envVarCommands.js`. In `handleVarsCommand` output, append a published section; in the `echo` resolution, fall back to `getPublishedValue(name)` when no operator source has the name. Addition (adapt variable names to the file):
 
 ```js
-const { readPublishedVars, getPublishedValue } = await import('../services/publishedVars.js');
+const { readPublishedVars, getPublishedValue } = await import('../services/startupConfigProviders.js');
 // ... after printing operator vars:
 const published = readPublishedVars();
 const names = Object.keys(published).sort();
@@ -817,8 +823,8 @@ Expected: runs without error; no published section in an empty workspace.
 - [ ] **Step 5: Commit**
 
 ```bash
-git -C /Users/danielsava/work/file-parser/ploinky add Agent/lib/publishedVarsClient.mjs cli/commands/envVarCommands.js
-git -C /Users/danielsava/work/file-parser/ploinky commit -m "Add publish client and CLI visibility for published vars"
+git -C /Users/danielsava/work/file-parser/ploinky add Agent/lib/startupConfigProvidersClient.mjs cli/commands/envVarCommands.js
+git -C /Users/danielsava/work/file-parser/ploinky commit -m "Add publish client and CLI visibility for startup config provider outputs"
 ```
 
 ---
@@ -826,7 +832,7 @@ git -C /Users/danielsava/work/file-parser/ploinky commit -m "Add publish client 
 ### Task 5: ploinky — spec/doc sync + full test gate
 
 **Files:**
-- Modify: `docs/specs/DS003-agent-manifest-and-registry.md` (new `publishesVars` manifest field), `docs/specs/DS005-routing-and-web-surfaces.md` (new router-owned path), `docs/specs/DS011-security-model.md` (new purpose label `storage/published-vars`, provenance class `published`, trust discussion), `docs/specs/DS013-per-agent-identity-and-request-signed-jwts.md` (second agent-only router endpoint)
+- Modify: `docs/specs/DS003-agent-manifest-and-registry.md` (new `publishesVars` manifest field), `docs/specs/DS005-routing-and-web-surfaces.md` (new router-owned path), `docs/specs/DS011-security-model.md` (new purpose label `storage/startup-config-providers`, provenance class `published`, trust discussion), `docs/specs/DS013-per-agent-identity-and-request-signed-jwts.md` (second agent-only router endpoint)
 
 - [ ] **Step 1: Update the four DS specs** — add the feature in each spec's Core Content plus a Decisions & Questions entry ("Why do operator sources always win over published values?" — answer: published values are trusted-manifest power from an enabled agent, but the operator owns the workspace; precedence keeps a compromised/buggy publisher from overriding deliberate operator configuration). Use the `file-parser-workspace:review_specs` skill against `/Users/danielsava/work/file-parser/ploinky` for the mechanics.
 
@@ -914,7 +920,7 @@ git -C /Users/danielsava/work/file-parser/container-image-builds commit -m "Add 
 - Test: `basic/tests/unit/webPublishingManifest.test.mjs`
 
 **Interfaces:**
-- Produces: agent id `agent:basic/web-publishing`, route key `web-publishing`; `publishesVars` exact list `["ONLYOFFICE_PUBLIC_URL","WEBMEET_PUBLIC_LIVEKIT_URL","WEBMEET_TLS_HOSTNAME","WEBMEET_TURN_HOST","WEBMEET_TURN_EXTERNAL_IP","WEBMEET_CERT_EMAIL","CLOUDFLARED_TUNNEL_TOKEN"]`; env names used by later tasks: `WEB_PUBLISHING_STATE_FILE`, `WEB_PUBLISHING_STATUS_FILE`, `WEB_PUBLISHING_ALLOWED_ORIGINS_JSON`, `WEB_PUBLISHING_HTTP_PORT`, `TUNNEL_TOKEN`, `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_ZONE_ID`, `CLOUDFLARE_BASE_DOMAIN`.
+- Produces: agent id `agent:basic/web-publishing`, route key `web-publishing`; `publishesVars` exact list `["ONLYOFFICE_PUBLIC_URL","WEBMEET_PUBLIC_LIVEKIT_URL","WEBMEET_TLS_HOSTNAME","WEBMEET_TURN_HOST","WEBMEET_TURN_EXTERNAL_IP","WEBMEET_CERT_EMAIL","WEB_PUBLISHING_CLOUDFLARED_TUNNEL_TOKEN"]`; env names used by later tasks: `WEB_PUBLISHING_STATE_FILE`, `WEB_PUBLISHING_STATUS_FILE`, `WEB_PUBLISHING_ALLOWED_ORIGINS_JSON`, `WEB_PUBLISHING_HTTP_PORT`, `TUNNEL_TOKEN`, `WEB_PUBLISHING_CLOUDFLARE_API_TOKEN`, `WEB_PUBLISHING_CLOUDFLARE_ACCOUNT_ID`, `WEB_PUBLISHING_CLOUDFLARE_ZONE_ID`, `WEB_PUBLISHING_BASE_DOMAIN`.
 
 - [ ] **Step 1: Write the manifest**
 
@@ -936,7 +942,7 @@ git -C /Users/danielsava/work/file-parser/container-image-builds commit -m "Add 
     "WEBMEET_TURN_HOST",
     "WEBMEET_TURN_EXTERNAL_IP",
     "WEBMEET_CERT_EMAIL",
-    "CLOUDFLARED_TUNNEL_TOKEN"
+    "WEB_PUBLISHING_CLOUDFLARED_TUNNEL_TOKEN"
   ],
   "endpoints": {
     "agent-card": {
@@ -965,11 +971,11 @@ git -C /Users/danielsava/work/file-parser/container-image-builds commit -m "Add 
         "WEB_PUBLISHING_STATUS_FILE": { "default": "/root/web-publishing/status.json" },
         "WEB_PUBLISHING_HTTP_PORT": { "default": "8081" },
         "WEB_PUBLISHING_ALLOWED_ORIGINS_JSON": { "required": false },
-        "TUNNEL_TOKEN": { "varName": "CLOUDFLARED_TUNNEL_TOKEN", "required": false },
-        "CLOUDFLARE_API_TOKEN": { "required": false },
-        "CLOUDFLARE_ACCOUNT_ID": { "required": false },
-        "CLOUDFLARE_ZONE_ID": { "required": false },
-        "CLOUDFLARE_BASE_DOMAIN": { "required": false }
+        "TUNNEL_TOKEN": { "varName": "WEB_PUBLISHING_CLOUDFLARED_TUNNEL_TOKEN", "required": false },
+        "WEB_PUBLISHING_CLOUDFLARE_API_TOKEN": { "required": false },
+        "WEB_PUBLISHING_CLOUDFLARE_ACCOUNT_ID": { "required": false },
+        "WEB_PUBLISHING_CLOUDFLARE_ZONE_ID": { "required": false },
+        "WEB_PUBLISHING_BASE_DOMAIN": { "required": false }
       }
     },
     "lan": {
@@ -981,11 +987,11 @@ git -C /Users/danielsava/work/file-parser/container-image-builds commit -m "Add 
         "WEB_PUBLISHING_STATUS_FILE": { "default": "/root/web-publishing/status.json" },
         "WEB_PUBLISHING_HTTP_PORT": { "default": "8081" },
         "WEB_PUBLISHING_ALLOWED_ORIGINS_JSON": { "required": false },
-        "TUNNEL_TOKEN": { "varName": "CLOUDFLARED_TUNNEL_TOKEN", "required": false },
-        "CLOUDFLARE_API_TOKEN": { "required": false },
-        "CLOUDFLARE_ACCOUNT_ID": { "required": false },
-        "CLOUDFLARE_ZONE_ID": { "required": false },
-        "CLOUDFLARE_BASE_DOMAIN": { "required": false }
+        "TUNNEL_TOKEN": { "varName": "WEB_PUBLISHING_CLOUDFLARED_TUNNEL_TOKEN", "required": false },
+        "WEB_PUBLISHING_CLOUDFLARE_API_TOKEN": { "required": false },
+        "WEB_PUBLISHING_CLOUDFLARE_ACCOUNT_ID": { "required": false },
+        "WEB_PUBLISHING_CLOUDFLARE_ZONE_ID": { "required": false },
+        "WEB_PUBLISHING_BASE_DOMAIN": { "required": false }
       }
     },
     "local-test": {
@@ -1001,7 +1007,7 @@ git -C /Users/danielsava/work/file-parser/container-image-builds commit -m "Add 
 }
 ```
 
-Note: `TUNNEL_TOKEN` maps from `CLOUDFLARED_TUNNEL_TOKEN`, which resolves operator var → published var (the agent's own previously-published token) → empty. The supervisor also re-reads the config store directly so a token minted mid-session works without self-restart.
+Note: `TUNNEL_TOKEN` maps from `WEB_PUBLISHING_CLOUDFLARED_TUNNEL_TOKEN`, which resolves operator var → published var (the agent's own previously-published token) → empty. The supervisor also re-reads the config store directly so a token minted mid-session works without self-restart.
 
 - [ ] **Step 2: Failing invariant test**
 
@@ -1034,7 +1040,7 @@ git -C /Users/danielsava/work/file-parser/basic commit -m "Add web-publishing ag
 - Produces: `normalizeExposures(drafts, {env}) -> [{id, hostname, origin, websocket, publish: {var, url}}]` (throws on invalid); `loadOriginPresets(env)`; `buildNginxConf({httpPort, exposures}) -> string`.
 - Origin rules (copied from `basic/cloudflared/lib/routes.mjs:56-81` semantics): http/https URL, host must be `host.containers.internal` (or `127.0.0.1`/`localhost` for in-container nginx upstream), explicit port required, no path/query/fragment, port `7000` refused.
 
-- [ ] **Step 1: Failing tests** — `webPublishingTargets.test.mjs`: valid exposure normalizes; missing hostname throws; origin with port 7000 throws (message contains `7000`); origin with foreign host throws; `CLOUDFLARE_BASE_DOMAIN` set ⇒ hostname outside the base domain throws; wildcard hostname throws. `webPublishingNginxConfig.test.mjs`: generated conf contains `listen 8081`, one `server_name onlyoffice.example.test;` block per exposure, `proxy_pass http://host.containers.internal:8082;`, `proxy_set_header Upgrade $http_upgrade;` when `websocket: true`, a default server returning 444, and no plaintext secrets.
+- [ ] **Step 1: Failing tests** — `webPublishingTargets.test.mjs`: valid exposure normalizes; missing hostname throws; origin with port 7000 throws (message contains `7000`); origin with foreign host throws; `WEB_PUBLISHING_BASE_DOMAIN` set ⇒ hostname outside the base domain throws; wildcard hostname throws. `webPublishingNginxConfig.test.mjs`: generated conf contains `listen 8081`, one `server_name onlyoffice.example.test;` block per exposure, `proxy_pass http://host.containers.internal:8082;`, `proxy_set_header Upgrade $http_upgrade;` when `websocket: true`, a default server returning 444, and no plaintext secrets.
 
 - [ ] **Step 2: Implement `publishTargets.mjs`** — port the validation logic from `basic/cloudflared/lib/routes.mjs` (`normalizeString`, hostname validation with optional base-domain restriction, `normalizeService` with the 7000 refusal), renaming `service` → `origin`, adding per-exposure `websocket` (default true) and `publish` (`{var, url}`, both optional strings; `var` must match `/^[A-Z][A-Z0-9_]*$/`).
 
@@ -1161,7 +1167,7 @@ git -C /Users/danielsava/work/file-parser/basic commit -m "Add web-publishing Cl
 
 **Interfaces:**
 - `configStore.mjs`: `readConfig({env})`, `writeConfig(config, {env})`, `writeStatus(patch, {env})` — config shape `{version: 1, mode: "nginx"|"tunnel"|"both", baseDomain, lanHost, certEmail, tunnel: {source: "token"|"api", tokenSet: boolean, tunnelId}, exposures: [...]}`. The raw tunnel token is stored under `tunnel.token` in the config file (0600 inside `/root`, i.e. host `.data/web-publishing/`) and NEVER included in status output.
-- `publisher.mjs`: `deriveVarMap(config) -> {NAME: value|null}` (pure) and `publishFromConfig(config, {publish})` calling `/Agent/lib/publishedVarsClient.mjs` `publishWorkspaceVars`.
+- `publisher.mjs`: `deriveVarMap(config) -> {NAME: value|null}` (pure) and `publishFromConfig(config, {publish})` calling `/Agent/lib/startupConfigProvidersClient.mjs` `publishWorkspaceVars`.
 - Supervisor: env `WEB_PUBLISHING_STATE_FILE`/`STATUS_FILE`/`HTTP_PORT`, `TUNNEL_TOKEN`; children nginx (`nginx -c <generated> -g 'daemon off;'`) and cloudflared (`cloudflared tunnel --no-autoupdate run` with `TUNNEL_TOKEN` in child env); watches the state file and a `reload` marker; `nginx -t` gate before reload; status states `starting|running|degraded|missing-config|exited`.
 
 - [ ] **Step 1: Failing publisher test** — `webPublishingPublisher.test.mjs` asserts `deriveVarMap`:
@@ -1187,7 +1193,7 @@ test('derives consumer vars from a tunnel config', () => {
     assert.equal(map.WEBMEET_TURN_HOST, 'livekit.skills.example.test');
     assert.equal(map.WEBMEET_TURN_EXTERNAL_IP, '203.0.113.7');
     assert.equal(map.WEBMEET_CERT_EMAIL, 'ops@example.test');
-    assert.equal(map.CLOUDFLARED_TUNNEL_TOKEN, 'fake-token-value');
+    assert.equal(map.WEB_PUBLISHING_CLOUDFLARED_TUNNEL_TOKEN, 'fake-token-value');
 });
 
 test('omits unset values and never invents them', () => {
@@ -1196,7 +1202,7 @@ test('omits unset values and never invents them', () => {
 });
 ```
 
-- [ ] **Step 2: Implement `configStore.mjs` and `publisher.mjs`** — configStore mirrors cloudflared's `writeRouteState` (mkdir -p, pretty JSON + trailing newline, 0600 for the config file since it can hold the token); `writeStatus` strips `tunnel.token` always. `deriveVarMap` maps: each exposure with `publish.var` → `publish.url`; `webmeet.tlsHostname|turnHost|turnExternalIp` → the three WEBMEET vars; `certEmail` → `WEBMEET_CERT_EMAIL`; `tunnel.token` → `CLOUDFLARED_TUNNEL_TOKEN`; skip empty/absent. `publishFromConfig(config, {publish = publishWorkspaceVars})` calls the client and returns its response.
+- [ ] **Step 2: Implement `configStore.mjs` and `publisher.mjs`** — configStore mirrors cloudflared's `writeRouteState` (mkdir -p, pretty JSON + trailing newline, 0600 for the config file since it can hold the token); `writeStatus` strips `tunnel.token` always. `deriveVarMap` maps: each exposure with `publish.var` → `publish.url`; `webmeet.tlsHostname|turnHost|turnExternalIp` → the three WEBMEET vars; `certEmail` → `WEBMEET_CERT_EMAIL`; `tunnel.token` → `WEB_PUBLISHING_CLOUDFLARED_TUNNEL_TOKEN`; skip empty/absent. `publishFromConfig(config, {publish = publishWorkspaceVars})` calls the client and returns its response.
 
 - [ ] **Step 3: Implement the supervisor** — model on `basic/cloudflared/runtime/cloudflared-supervisor.mjs` (read it fully; keep `redactArgs`). Structure:
 
@@ -1239,13 +1245,13 @@ git -C /Users/danielsava/work/file-parser/basic commit -m "Add web-publishing su
 **Interfaces:**
 - Produces four tools, ALL tagged `["admin"]`, dispatched by `TOOL_NAME` env (cloudflared pattern):
   - `web_publishing_status` `{}` → redacted config + child status + published-var names (never values/tokens).
-  - `web_publishing_config_validate` `{config: {...}}` → normalized exposures + generated-conf preview + derived var map (values included ONLY for non-secret names; `CLOUDFLARED_TUNNEL_TOKEN` masked).
+  - `web_publishing_config_validate` `{config: {...}}` → normalized exposures + generated-conf preview + derived var map (values included ONLY for non-secret names; `WEB_PUBLISHING_CLOUDFLARED_TUNNEL_TOKEN` masked).
   - `web_publishing_config_apply` `{config: {...}}` → write config store, touch reload marker, `publishFromConfig`, return `{ok, published: names, shadowed, restartRequired: names}`.
-  - `web_publishing_tunnel_provision` `{name, hostnames: [..], createDnsRecords?: bool}` → createTunnel + getTunnelToken + putTunnelIngress + optional DNS upsert; merges token/tunnelId into config store; publishes `CLOUDFLARED_TUNNEL_TOKEN`; response masks the token.
+  - `web_publishing_tunnel_provision` `{name, hostnames: [..], createDnsRecords?: bool}` → createTunnel + getTunnelToken + putTunnelIngress + optional DNS upsert; merges token/tunnelId into config store; publishes `WEB_PUBLISHING_CLOUDFLARED_TUNNEL_TOKEN`; response masks the token.
 
 - [ ] **Step 1: mcp-config.json** — copy `basic/cloudflared/mcp-config.json` structure exactly (command `node`, `args: ["tools/web-publishing-tool.mjs"]`, `cwd: "/code"`, `timeoutMs: 30000` — 60000 for provision, `env: {"TOOL_NAME": ...}`, `tags: ["admin"]`, strict `inputSchema` per tool).
 
-- [ ] **Step 2: Dispatcher** — `tools/web-publishing-tool.mjs` mirroring `basic/cloudflared/tools/cloudflared-tool.mjs:99-107` (read stdin JSON `{tool, input}` — confirm the exact envelope from that file), routing to four handler functions that call the Task 8-10 libs. The publish call imports `publishWorkspaceVars` from `/Agent/lib/publishedVarsClient.mjs` (absolute container path).
+- [ ] **Step 2: Dispatcher** — `tools/web-publishing-tool.mjs` mirroring `basic/cloudflared/tools/cloudflared-tool.mjs:99-107` (read stdin JSON `{tool, input}` — confirm the exact envelope from that file), routing to four handler functions that call the Task 8-10 libs. The publish call imports `publishWorkspaceVars` from `/Agent/lib/startupConfigProvidersClient.mjs` (absolute container path).
 
 - [ ] **Step 3: Extend the manifest test** — assert `mcp-config.json` parses; every tool name in the set above; every `tags` deep-equals `["admin"]`; every tool has `inputSchema` and `TOOL_NAME` env; no tool combines `internal`+`admin`.
 
@@ -1308,7 +1314,7 @@ git -C /Users/danielsava/work/file-parser/basic commit -m "Add web-publishing Ex
 - Create: `basic/web-publishing/README.md`
 - Modify: `basic/docs/**` (via gamp_specs), run skill validator
 
-- [ ] **Step 1: README** — document: what the agent does, the three modes, the dashboard flow, the published vars table (name → meaning → consumer), operator-precedence note, restart-to-apply contract, rollback (`disable` + delete `.ploinky/data/published-vars.enc`), and a security section (admin-only tools, no public routes, token redaction). Placeholders only for secrets (e.g. `CLOUDFLARE_API_TOKEN=<your-token>`).
+- [ ] **Step 1: README** — document: what the agent does, the three modes, the dashboard flow, the startup config provider outputs table (name → meaning → consumer), operator-precedence note, restart-to-apply contract, rollback (`disable` + delete `.ploinky/data/startup-config-providers.enc`), and a security section (admin-only tools, no public routes, token redaction). Placeholders only for secrets (e.g. `WEB_PUBLISHING_CLOUDFLARE_API_TOKEN=<your-token>`).
 
 - [ ] **Step 2: Skill validator**
 
@@ -1318,7 +1324,7 @@ node /Users/danielsava/work/file-parser/basic/.agents/skills/manage-ploinky-agen
 ```
 Expected: pass (fix findings; `publishesVars` may be flagged unknown — acceptable if the validator whitelists unknown fields; if it hard-fails, record the finding and update the skill's reference in a follow-up, do not remove the field).
 
-- [ ] **Step 3: Spec resync** — invoke the `gamp_specs` skill against `/Users/danielsava/work/file-parser/basic`: new `docs/specs/DS00X-web-publishing-agent.md` (identity, runtime mode, tools + tags, forbidden-exposure doctrine copied from the cloudflared DS, published-vars contract), regenerate `docs/specs/matrix.md`, add `docs/web-publishing.html` + `docs/index.html` nav row.
+- [ ] **Step 3: Spec resync** — invoke the `gamp_specs` skill against `/Users/danielsava/work/file-parser/basic`: new `docs/specs/DS00X-web-publishing-agent.md` (identity, runtime mode, tools + tags, forbidden-exposure doctrine copied from the cloudflared DS, startup-config-providers contract), regenerate `docs/specs/matrix.md`, add `docs/web-publishing.html` + `docs/index.html` nav row.
 
 - [ ] **Step 4: Full basic test gate** — `cd /Users/danielsava/work/file-parser/basic && node --test tests/unit/*.mjs` — all pass.
 
@@ -1357,7 +1363,7 @@ with:
 
 (isolated run mode — no `global`; least privilege, the agent needs no workspace-root mount. If the smoke test in Task 16 shows the plugin scanner or code mount requires `global`, revert to `global` and record why in DS02.)
 
-- [ ] **Step 2: DS sync** — update DS06 (dependency example: qa/prod public exposure now via `basic/web-publishing`; published-vars precedence note under env invariants) and DS02 (plugin discovery example row for `web-publishing-settings`). Use `review_specs` against the repo.
+- [ ] **Step 2: DS sync** — update DS06 (dependency example: qa/prod public exposure now via `basic/web-publishing`; startup-config-providers precedence note under env invariants) and DS02 (plugin discovery example row for `web-publishing-settings`). Use `review_specs` against the repo.
 
 - [ ] **Step 3: Validate JSON** — `node -e "JSON.parse(require('fs').readFileSync('/Users/danielsava/work/file-parser/AssistOSExplorer/explorer/manifest.json','utf8')); console.log('ok')"` — prints `ok`.
 
@@ -1375,7 +1381,7 @@ git -C /Users/danielsava/work/file-parser/AssistOSExplorer commit -m "Adopt web-
 **Files:**
 - Modify: `AssistOSExplorer/docs/explorer-agent-env-requirements.md`, `AssistOSExplorer/docs/explorer-qa-env-injection.md`
 
-- [ ] **Step 1: explorer-agent-env-requirements.md** — bump `Last updated`; add a classification row: `Published by Web Publishing agent | ONLYOFFICE_PUBLIC_URL, WEBMEET_PUBLIC_LIVEKIT_URL, WEBMEET_TLS_HOSTNAME, WEBMEET_TURN_HOST, WEBMEET_TURN_EXTERNAL_IP, WEBMEET_CERT_EMAIL, CLOUDFLARED_TUNNEL_TOKEN | consumers unchanged | No (dashboard-configured) | Operator-set workspace vars still override published values; changes take effect on the next restart`; amend the `CLOUDFLARED_TUNNEL_TOKEN` mandatory row: mandatory only when running `basic/cloudflared` standalone or when Web Publishing runs in token mode without dashboard configuration; update the Summary table answer for qa/prod accordingly.
+- [ ] **Step 1: explorer-agent-env-requirements.md** — bump `Last updated`; add a classification row: `Published by Web Publishing agent | ONLYOFFICE_PUBLIC_URL, WEBMEET_PUBLIC_LIVEKIT_URL, WEBMEET_TLS_HOSTNAME, WEBMEET_TURN_HOST, WEBMEET_TURN_EXTERNAL_IP, WEBMEET_CERT_EMAIL, WEB_PUBLISHING_CLOUDFLARED_TUNNEL_TOKEN | consumers unchanged | No (dashboard-configured) | Operator-set workspace vars still override published values; changes take effect on the next restart`; amend the `WEB_PUBLISHING_CLOUDFLARED_TUNNEL_TOKEN` mandatory row: mandatory only when running `basic/cloudflared` standalone or when Web Publishing runs in token mode without dashboard configuration; update the Summary table answer for qa/prod accordingly.
 
 - [ ] **Step 2: explorer-qa-env-injection.md** — bump `Last updated`; in "Missing Cloudflared Injection" record that qa/prod now enable `basic/web-publishing` and the token is dashboard-provisioned or dashboard-pasted (published var), with the GitHub-secret path remaining a supported operator override; add priority level between 3 and 5: `Published workspace var (agent-published, encrypted store) — wins over manifest defaults, loses to operator var`; note the restart-to-apply contract.
 
@@ -1445,7 +1451,7 @@ Only after the checklist passes and the operator confirms.
 ## Migration & Rollback (operator-facing)
 
 - **Migration:** ship order = ploinky feature → image → agent → Explorer switch. Existing deployments are unaffected until the Explorer manifest switch; operator-set vars always keep winning. QA workflow unchanged in v1 (its `set_var` values shadow published ones by design).
-- **Rollback:** revert the Explorer manifest commit (restores `basic/cloudflared`); `ploinky disable agent web-publishing`; delete `.ploinky/data/published-vars.enc`; restart. The ploinky feature is additive — reverting its commits restores prior resolution behavior.
+- **Rollback:** revert the Explorer manifest commit (restores `basic/cloudflared`); `ploinky disable agent web-publishing`; delete `.ploinky/data/startup-config-providers.enc`; restart. The ploinky feature is additive — reverting its commits restores prior resolution behavior.
 
 ## Self-Review
 

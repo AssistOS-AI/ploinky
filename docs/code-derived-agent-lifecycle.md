@@ -13,7 +13,7 @@ All relative paths below are relative to the workspace directory where `ploinky`
 | Workspace paths | `cli/services/config.js`, `cli/services/workspace.js`, `cli/services/workspaceStructure.js` |
 | Repo discovery and install | `cli/services/repos.js`, `cli/commands/repoAgentCommands.js`, `cli/services/utils.js`, `cli/services/status.js` |
 | Agent enable/disable state | `cli/services/agents.js` |
-| Start/restart/runtime orchestration | `cli/services/workspaceUtil.js`, `cli/services/workspaceDependencyGraph.js`, `cli/services/bootstrapManifest.js`, `cli/services/noWaitWorker.js` |
+| Start/restart/runtime orchestration | `cli/services/workspaceUtil.js`, `cli/services/workspaceDependencyGraph.js`, `cli/services/bootstrapManifest.js`, `cli/services/startupConfigProviders.js`, `cli/services/noWaitWorker.js` |
 | Container runtime | `cli/services/docker/common.js`, `cli/services/docker/agentServiceManager.js`, `cli/services/docker/containerFleet.js` |
 | Host sandbox runtime | `cli/services/sandboxRuntime.js`, `cli/services/bwrap/bwrapServiceManager.js`, `cli/services/seatbelt/seatbeltServiceManager.js`, `cli/services/seatbelt/seatbeltProfile.js` |
 | Dependency cache | `cli/services/dependencyCache.js`, `cli/services/dependencyRuntimeKey.js`, `cli/services/dependencyInstaller.js`, `globalDeps/package.json`, `cli/commands/depsCommands.js` |
@@ -180,6 +180,7 @@ Ploinky does not load a central manifest schema in the observed paths. Individua
 | `profiles.<name>.mounts` | No | Controls code/skills mount mode. Default and dev profiles are read-write by default; other profiles are read-only by default. |
 | `profiles.<name>.network` | No | Overrides top-level `network`. |
 | `profiles.<name>.containerSecurity` | No | Overrides top-level `containerSecurity`. Currently only `privileged: true` is implemented. |
+| `profiles.<name>.configProviders` | No | Replaces default-profile startup config providers for the active profile. Entries name provider agents and may select the provider profile. |
 | `profiles.<name>.preinstall` | No | Host hook run before container/sandbox creation. For the static agent, `startWorkspace` can run it before manifest directives and dependency graph setup. |
 | `profiles.<name>.hosthook_aftercreation` | No | Host hook run after runtime creation. |
 | `profiles.<name>.install` | No | Inserted into the runtime entry command before the start/agent/default server command. |
@@ -190,6 +191,8 @@ Ploinky does not load a central manifest schema in the observed paths. Individua
 | `expose` | No | Adds explicit env values or refs. The `expose` CLI command edits this field in the source manifest. |
 | `repos` | No | Object processed by `applyManifestDirectives` during `start`. Values may be URL strings or objects with `url` and `branch`. Repos are ensured and enabled before dependency enable processing. |
 | `enable` | No | Top-level and active-profile enable arrays are processed during `start` and dependency graph building. String specs can include `as <alias>` and `no-wait`; object specs can include `agent/ref/spec/name`, `alias/as`, `profile`, and `noWait`/`no-wait`. |
+| `configProviders` | No | Top-level startup provider entries processed for the static agent after dependency graph discovery and before dependency env resolution. Profile entries replace the default profile list. |
+| `providesConfig` | No | Declares a startup provider command and output allowlist. Provider stdout must be schema version 1 JSON and is persisted by Ploinky only after allowlist, reserved-name, sensitive-flag, and generated-secret checks pass. |
 | `guest` | No | `guest: true` makes manifest-derived auth mode `guest`. |
 | `ploinky` | No | String/list directives. `pwd enable` maps to local auth; `sso enable` maps to SSO auth. |
 | `pwd.users` | No | Seeds local password users when local auth is active and CLI user/password were not provided. Each entry needs username/user and password. |
@@ -250,7 +253,8 @@ flowchart TD
   H --> I["run static preinstall hook early when profile has preinstall"]
   I --> J["apply manifest repos and enable directives"]
   J --> K["build recursive dependency graph"]
-  K --> L["enable missing graph nodes"]
+  K --> KP["run startup config-provider preflight"]
+  KP --> L["enable missing graph nodes"]
   L --> M["merge .ploinky/routing.json base config"]
   M --> N["start dependency waves"]
   N --> O{"node wait mode"}
@@ -262,6 +266,8 @@ flowchart TD
 ```
 
 Manifest `repos` and `enable` directives are not applied during `enable agent`; they are applied during `startWorkspace`. Dependency graph construction also reads `enable` arrays recursively.
+
+Startup config providers are applied after dependency graph construction and before dependency startup. The static/profile manifest supplies `configProviders`; provider manifests supply `providesConfig`. Ploinky resolves provider agents from the graph or installed repositories, runs their provider command with a sanitized host-side environment, validates stdout against the provider manifest allowlist, rejects generated-secret and reserved names, and writes accepted values into `.ploinky/.secrets` before consumer env maps are built.
 
 `enable` dependency refs can be blocking or no-wait. The graph classifier treats the static node as blocking. A child is blocking when it is reachable through a path with only blocking edges; it is no-wait only when every path to it includes a no-wait edge. Blocking waves are started and then checked for readiness before Ploinky continues.
 
@@ -521,6 +527,8 @@ Ploinky builds runtime env from several sources:
 Manifest env resolution order is encrypted `.ploinky/.secrets`, then `process.env`, then `.env`, then manifest default. Wildcards are supported, with API-key-like names excluded from broad wildcard expansion.
 
 Required non-sensitive env entries must have defaults in profile definitions unless they are generated or sensitive.
+
+Startup config providers can write values into encrypted `.ploinky/.secrets` before dependency env maps are built. Provider subprocesses do not receive `PLOINKY_MASTER_KEY`, `PLOINKY_DERIVED_MASTER_KEY`, router-issued agent identity secrets, or caller-supplied identity values. Provider metadata is written under `.ploinky/config-providers/` with values redacted.
 
 ## Files Copied or Generated
 

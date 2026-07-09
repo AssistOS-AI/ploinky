@@ -18,6 +18,8 @@ Secret resolution must prefer process environment variables, then `.ploinky/.sec
 
 Manifest profile defaults are the required baseline for non-sensitive required env entries. A required URL, hostname, public IP, realm, port, or similar topology value must be present in the active profile as a `default` or `value`, while required secrets may remain unset in the profile and resolve from secure sources or `generatedSecret: true`. This keeps profile startup reproducible without weakening operator overrides: `ploinky var`, process env, and `.env` values still take precedence over the manifest default.
 
+Startup config providers (DS015) are another writer for the encrypted workspace var store, but not another secret-ownership model. Provider subprocesses return an allowlisted JSON patch, and Ploinky validates and persists accepted values through the same encrypted `.ploinky/.secrets` store used by `ploinky var`. Provider output may include provider-owned external credentials when declared sensitive, but it must not overwrite `generatedSecret` or `sharedGeneratedSecret` names owned by any enabled graph node. Provider metadata under `.ploinky/config-providers/` is redacted and must not contain raw values.
+
 Workspace variable commands must preserve explicit operator control. `var` writes workspace-local values, `vars` lists known names, `echo` resolves aliases, and `expose` maps values into agent environments. Wildcard expansion is allowed, but the all-match `*` pattern must exclude variable names containing `API_KEY` or `APIKEY`. Sensitive values therefore require explicit manifest or operator intent rather than accidental blanket inclusion.
 
 `default-skills` copies skill directories from a skills repository into `.agents/skills/`. Existing directories with names supplied by that source repository must be removed and copied again so deleted upstream files do not remain locally, while unrelated skill directories already present under `.agents/skills/` or legacy `.claude/skills/` may be preserved. Legacy `.claude/skills/` skills that are not owned by the source repository may be migrated into `.agents/skills/` before Claude compatibility symlinks are created. New workspaces should get `.claude` as a symlink to `.agents`; when a non-empty existing `.claude` directory must be preserved, `.claude/skills` must instead point to `../.agents/skills`. The `.claude` compatibility path and each source-owned skill directory under `.agents/skills/` must be added to `.gitignore` through the managed marker block; `.agents/` itself must not be gitignored. The copied skills are a workspace convenience and must not be documented as runtime product pages or runtime DS files for the host project.
@@ -46,6 +48,11 @@ The LLM helper in `cli/commands/llmSystemCommands.js` reads that file directly t
 
 Response:
 `default-skills` treats skill names from the selected source repository as owned, so it removes and replaces only those directories to preserve other operator-managed skill folders. `update`, by design, treats `ploinky-skills-manifest.json` as the explicit skill set for that workspace and therefore reconstructs `.agents/skills/` from scratch each run.
+
+### Question #4: Why do startup config providers persist through `.ploinky/.secrets` even for non-sensitive public values?
+
+Response:
+The existing manifest env resolver already consumes workspace vars from the encrypted store before applying profile defaults. Using the same store gives provider output one consistent precedence path and avoids a second public-topology state file that every runtime manager would need to understand. Redacted metadata gives operators provenance without turning public URLs or mixed config payloads into an unencrypted diagnostic channel.
 
 ## Conclusion
 

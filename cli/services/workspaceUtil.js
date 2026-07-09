@@ -16,6 +16,7 @@ import { getSecrets, createEnvWithSecrets, loadEnvFile } from './secretInjector.
 import { readSecretsFile } from './encryptedSecretsFile.js';
 import { buildEnvMap } from './secretVars.js';
 import { resolveAgentReadinessProtocol } from './startupReadiness.js';
+import { applyStartupConfigProvidersForGraph } from './startupConfigProviders.js';
 import { withMaintenanceLock } from './maintenanceLocks.js';
 import { LOGS_DIR, PLOINKY_CWD, PLOINKY_WORKSPACE_ROOT, ROUTING_FILE, RUNNING_DIR } from './config.js';
 import { classifyDependencyGraphWaitMode, resolveWorkspaceDependencyGraph, topologicallyGroupDependencyGraph } from './workspaceDependencyGraph.js';
@@ -620,6 +621,24 @@ async function startWorkspace(staticAgentArg, portArg, { refreshComponentToken, 
       });
     } catch (graphErr) {
       throw new Error(`Failed to resolve dependency graph for '${staticAgent}': ${graphErr.message}`);
+    }
+
+    try {
+      const providerResult = await applyStartupConfigProvidersForGraph({
+        dependencyGraph,
+        profileName: getActiveProfile(),
+        workspaceRoot: PLOINKY_WORKSPACE_ROOT
+      });
+      if (providerResult.providers.length) {
+        const appliedNames = providerResult.applied.map((entry) => entry.name);
+        const appliedSummary = appliedNames.length ? appliedNames.join(', ') : 'no changed values';
+        console.log(`[start] Startup config providers applied: ${appliedSummary}`);
+        for (const warning of providerResult.warnings) {
+          console.warn(`[start] Config provider warning: ${warning}`);
+        }
+      }
+    } catch (providerErr) {
+      throw new Error(`Startup config provider preflight failed: ${providerErr?.message || providerErr}`);
     }
 
     ensureGraphNodesEnabled(dependencyGraph, reg);

@@ -180,6 +180,13 @@ export function mergeProfiles(defaultProfile, activeProfile) {
         merged.additionalServerPort = activeProfile.additionalServerPort;
     }
 
+    // Startup config providers are profile-selected lifecycle inputs. The
+    // active profile replaces the default list so deployment profiles can opt
+    // into providers without changing development startup.
+    if (activeProfile.configProviders !== undefined) {
+        merged.configProviders = activeProfile.configProviders;
+    }
+
     return merged;
 }
 
