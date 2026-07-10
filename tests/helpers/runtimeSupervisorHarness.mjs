@@ -161,6 +161,8 @@ export function createFakeEngine({
     pullImages = {},
     volumes = [],
     failures = {},
+    replacementFailureCreatesContainer = false,
+    replacementCleanupFailureRemovesContainer = false,
     stdout = { write() { return true; } },
     stderr = { write() { return true; } },
 } = {}) {
@@ -190,6 +192,18 @@ export function createFakeEngine({
         if (options.allowFail) return code;
         throw new Error(`${engine} ${signature} exited ${code}`);
     };
+    const containerFromRunArgs = (args) => ({
+        inspect: inspectFromRunArgs(
+            engine,
+            args,
+            state.images,
+            state.volumes,
+        ),
+        logs: '[ploinky-box] self-check OK\n',
+        coreStatus: 0,
+        coreStdout: 'core: running\n',
+        depsInstalled: true,
+    });
 
     const engineClient = {
         name: engine,
@@ -207,10 +221,15 @@ export function createFakeEngine({
                 return { ok: true, status: 0, stdout: stdoutValue, stderr: '' };
             }
             if (args[0] === 'container' && args[1] === 'inspect') {
+                const fullInspect = !args.includes('--format');
                 if (!state.container) {
+                    if (fullInspect) {
+                        reconciliationRunState = 'idle';
+                        inspectedOld = false;
+                    }
                     return { ok: false, status: 1, stdout: '', stderr: 'missing' };
                 }
-                if (args.includes('--format')) {
+                if (!fullInspect) {
                     return {
                         ok: true,
                         status: 0,
@@ -218,9 +237,7 @@ export function createFakeEngine({
                         stderr: '',
                     };
                 }
-                if (reconciliationRunState === 'replacement-created') {
-                    reconciliationRunState = 'idle';
-                }
+                reconciliationRunState = 'idle';
                 inspectedOld = true;
                 return {
                     ok: true,
@@ -291,26 +308,26 @@ export function createFakeEngine({
                     : (reconciliationRunState === 'replacement-ready'
                         ? 'run replacement'
                         : 'run create');
+                if (state.container) {
+                    if (options.allowFail) return 1;
+                    throw new Error(
+                        `${engine} ${signature} failed: container name already in use`,
+                    );
+                }
                 const code = failureCode(failures, signature);
                 if (code !== 0) {
                     if (signature === 'run replacement') {
+                        if (replacementFailureCreatesContainer) {
+                            state.container = containerFromRunArgs(args);
+                            state.container.inspect.State.Status = 'exited';
+                            state.container.inspect.State.Running = false;
+                        }
                         reconciliationRunState = 'rollback-ready';
                     }
                     if (options.allowFail) return code;
                     throw new Error(`${engine} ${signature} exited ${code}`);
                 }
-                state.container = {
-                    inspect: inspectFromRunArgs(
-                        engine,
-                        args,
-                        state.images,
-                        state.volumes,
-                    ),
-                    logs: '[ploinky-box] self-check OK\n',
-                    coreStatus: 0,
-                    coreStdout: 'core: running\n',
-                    depsInstalled: true,
-                };
+                state.container = containerFromRunArgs(args);
                 if (signature === 'run replacement') {
                     reconciliationRunState = 'replacement-created';
                 } else if (signature === 'run rollback') {
@@ -337,8 +354,26 @@ export function createFakeEngine({
                 return 0;
             }
             if (args[0] === 'rm') {
-                const failed = fail('rm container', options);
-                if (failed) return failed;
+                const phaseSignature = [
+                    'replacement-created',
+                    'rollback-ready',
+                ].includes(reconciliationRunState)
+                    ? 'rm replacement cleanup'
+                    : 'rm container';
+                let failed = fail(phaseSignature, options);
+                if (!failed && phaseSignature !== 'rm container') {
+                    failed = fail('rm container', options);
+                }
+                if (failed) {
+                    if (
+                        phaseSignature === 'rm replacement cleanup'
+                        && replacementCleanupFailureRemovesContainer
+                    ) {
+                        state.container = null;
+                        inspectedOld = false;
+                    }
+                    return failed;
+                }
                 if (state.container) {
                     if (reconciliationRunState === 'replacement-created') {
                         reconciliationRunState = 'rollback-ready';

@@ -345,6 +345,13 @@ function runtimeExists(cfg) {
     return query(cfg, ['container', 'inspect', instanceName(cfg)]).ok;
 }
 
+function namedRuntimeExists(cfg, instance) {
+    return query(
+        cfg,
+        ['container', 'inspect', '--format', '{{.Id}}', instance],
+    ).ok;
+}
+
 function runtimeRunning(cfg) {
     return query(cfg, ['container', 'inspect', '--format', '{{.State.Status}}', instanceName(cfg)])
         .stdout.trim() === 'running';
@@ -757,7 +764,6 @@ export async function replaceRuntimeTransaction(context) {
             throw new SupervisorError(
                 'runtime replacement aborted: graceful core shutdown exited '
                 + coreCode,
-                coreCode,
             );
         }
         runEngine(cfg, ['stop', existing.instance], { silence: 'all' });
@@ -780,17 +786,50 @@ export async function replaceRuntimeTransaction(context) {
             state: 'running',
             running: true,
         };
-    } catch (error) {
-        runEngine(cfg, ['rm', '-f', desired.instance], {
-            allowFail: true,
-            silence: 'all',
-        });
-        const rollback = { ...previous, image: previousImage };
-        runEngine(cfg, buildRuntimeRunArgs(rollback, engineOptions));
-        await waitHealthy(cfg, 'rollback');
+    } catch (replacementError) {
+        const aggregateFailure = (rollbackError) => new AggregateError(
+            [replacementError, rollbackError],
+            'runtime replacement failed and rollback failed; '
+            + 'replacement phase: '
+            + (replacementError.message || replacementError)
+            + '; rollback phase: '
+            + (rollbackError.message || rollbackError),
+        );
+        if (namedRuntimeExists(cfg, desired.instance)) {
+            let cleanupError = null;
+            try {
+                const cleanupCode = runEngine(
+                    cfg,
+                    ['rm', '-f', desired.instance],
+                    { allowFail: true, silence: 'all' },
+                );
+                if (cleanupCode !== 0) {
+                    cleanupError = new SupervisorError(
+                        `${cfg.engine} rm replacement cleanup exited ${cleanupCode}`,
+                        cleanupCode,
+                    );
+                }
+            } catch (error) {
+                cleanupError = error;
+            }
+            if (namedRuntimeExists(cfg, desired.instance)) {
+                cleanupError ||= new SupervisorError(
+                    `${cfg.engine} rm replacement cleanup left container '${desired.instance}' present`,
+                );
+                throw aggregateFailure(cleanupError);
+            }
+        }
+
+        try {
+            const rollback = { ...previous, image: previousImage };
+            runEngine(cfg, buildRuntimeRunArgs(rollback, engineOptions));
+            await waitHealthy(cfg, 'rollback');
+        } catch (rollbackError) {
+            throw aggregateFailure(rollbackError);
+        }
         throw new SupervisorError(
             'runtime replacement failed; previous runtime restored: '
-            + (error.message || error),
+            + (replacementError.message || replacementError),
         );
     }
 }

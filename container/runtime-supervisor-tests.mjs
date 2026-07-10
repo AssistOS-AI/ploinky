@@ -163,6 +163,34 @@ function legacyRunningContainerWithCustomConfig() {
     return value;
 }
 
+function assertLegacyCreationConfig(args, expectedImage) {
+    for (const value of [
+        '0.0.0.0:18080:8080',
+        '127.0.0.1:17880:7880/udp',
+        '/src/ploinky:/opt/ploinky:ro',
+        '/host/data:/workspace/mounted',
+        'ploinky-box-demo-workspace:/workspace',
+        'ploinky-box-demo-containers:/home/podman/.local/share/containers',
+        '/dev/fuse:/dev/fuse:rwm',
+        '/dev/net/tun:/dev/net/tun:rwm',
+        'seccomp=unconfined',
+        'PLOINKY_WORKSPACE_ROOT=/workspace',
+        'PLOINKY_RUNTIME_NAME=ploinky-box-demo',
+        'CUSTOM_RUNTIME_SETTING=kept',
+    ]) {
+        assert.ok(args.includes(value), value);
+    }
+    const deps =
+        'ploinky-box-demo-ploinky-deps:/opt/ploinky/node_modules';
+    assert.ok(
+        args.includes(deps) || args.includes(deps + ':U'),
+        deps,
+    );
+    assert.ok(args.includes('--privileged'));
+    assert.equal(args[args.indexOf('--user') + 1], 'podman');
+    assert.equal(args.at(-1), expectedImage);
+}
+
 function statusScenarios() {
     return [
         { name: 'missing', input: { container: null }, code: 1, core: false },
@@ -857,6 +885,7 @@ test('review regression: fake engine models replacement rollback and health phas
         container: compatibleRunningContainer(),
         images: contractV1Images(),
         failures: { 'run replacement': 8, 'run rollback': 9 },
+        replacementFailureCreatesContainer: true,
     });
     afterCreationFailure.engineClient.query([
         'container', 'inspect', 'ploinky-box-demo',
@@ -866,6 +895,13 @@ test('review regression: fake engine models replacement rollback and health phas
         () => afterCreationFailure.engineClient.run(replacementArgs),
         /run replacement exited 8/,
     );
+    assert.throws(
+        () => afterCreationFailure.engineClient.run(replacementArgs),
+        /run rollback failed: container name already in use/,
+    );
+    afterCreationFailure.engineClient.run([
+        'rm', '-f', 'ploinky-box-demo',
+    ]);
     assert.throws(
         () => afterCreationFailure.engineClient.run(replacementArgs),
         /run rollback exited 9/,
@@ -2070,7 +2106,299 @@ for (const engine of ['podman', 'docker']) {
             false,
         );
     });
+
+    test(engine + ' replacement validates before graceful shutdown and preserves volumes', async () => {
+        const harness = createSupervisorHarness({
+            engine,
+            container: legacyRunningContainerWithCustomConfig(),
+            images: {
+                'sha256:legacy': legacyImage(),
+                [REQUIRED_IMAGE]: contractV1Image(),
+            },
+        });
+        assert.equal(await harness.supervisor.run(['list', 'agents']), 0);
+        const phases = harness.calls
+            .filter(call => [
+                'pull',
+                'image',
+                'exec',
+                'stop',
+                'rm',
+                'run',
+            ].includes(call.args[0]))
+            .map(call => call.args[0]);
+        assert.deepEqual(
+            phases.slice(0, 7),
+            ['image', 'pull', 'image', 'exec', 'stop', 'rm', 'run'],
+        );
+        assert.equal(
+            harness.calls.some(call => call.args[0] === 'volume'),
+            false,
+        );
+
+        const replacementRun = harness.calls
+            .filter(call => call.args[0] === 'run')
+            .at(-1).args;
+        assertLegacyCreationConfig(replacementRun, REQUIRED_IMAGE);
+    });
+
+    test(engine + ' graceful core shutdown failure leaves the old runtime running', async () => {
+        const harness = createSupervisorHarness({
+            engine,
+            container: legacyRunningContainerWithCustomConfig(),
+            images: {
+                'sha256:legacy': legacyImage(),
+                [REQUIRED_IMAGE]: contractV1Image(),
+            },
+            failures: { 'exec ploinky stop': 9 },
+        });
+        assert.equal(await harness.supervisor.run(['list', 'agents']), 1);
+        assert.equal(
+            harness.calls.some(call =>
+                ['stop', 'rm', 'run'].includes(call.args[0])
+            ),
+            false,
+        );
+        assert.equal(
+            harness.state.container.inspect.State.Status,
+            'running',
+        );
+    });
+
+    for (const [name, failures] of [
+        ['replacement run', { 'run replacement': 7 }],
+        ['replacement health', { 'health replacement': 7 }],
+    ]) {
+        test(engine + ' ' + name + ' failure restores the prior image and full config', async () => {
+            const harness = createSupervisorHarness({
+                engine,
+                container: legacyRunningContainerWithCustomConfig(),
+                images: {
+                    'sha256:legacy': legacyImage(),
+                    [REQUIRED_IMAGE]: contractV1Image(),
+                },
+                failures,
+            });
+            assert.equal(await harness.supervisor.run(['list', 'agents']), 1);
+            const runs = harness.calls.filter(call => call.args[0] === 'run');
+            const rollback = runs.at(-1).args;
+            assertLegacyCreationConfig(rollback, 'sha256:legacy');
+            assert.ok(harness.calls.some(call =>
+                call.kind === 'health' && call.phase === 'rollback'
+            ));
+            assert.equal(
+                harness.calls.some(call => call.args[0] === 'volume'),
+                false,
+            );
+        });
+    }
+
+    test(engine + ' replacement run failure before container creation rolls back directly', async () => {
+        const harness = createSupervisorHarness({
+            engine,
+            container: legacyRunningContainerWithCustomConfig(),
+            images: {
+                'sha256:legacy': legacyImage(),
+                [REQUIRED_IMAGE]: contractV1Image(),
+            },
+            failures: { 'run replacement': 7 },
+            replacementFailureCreatesContainer: false,
+        });
+        const volumesBefore = [...harness.state.volumes].sort();
+
+        assert.equal(await harness.supervisor.run(['list', 'agents']), 1);
+        assert.match(
+            harness.stderr,
+            /runtime replacement failed; previous runtime restored: .*exited 7/,
+        );
+        assert.doesNotMatch(harness.stderr, /rollback phase:/);
+        const rollback = harness.calls
+            .filter(call => call.args[0] === 'run')
+            .at(-1).args;
+        assertLegacyCreationConfig(rollback, 'sha256:legacy');
+        assert.ok(harness.calls.some(call =>
+            call.kind === 'health' && call.phase === 'rollback'
+        ));
+        assert.equal(
+            harness.calls.some(call =>
+                call.args[0] === 'rm' && call.args.includes('-f')
+            ),
+            false,
+        );
+        assert.equal(
+            harness.calls.some(call => call.args[0] === 'volume'),
+            false,
+        );
+        assert.deepEqual([...harness.state.volumes].sort(), volumesBefore);
+    });
+
+    for (const [name, rollbackFailure] of [
+        ['rollback run', { 'run rollback': 8 }],
+        ['rollback health', { 'health rollback': 8 }],
+    ]) {
+        test(engine + ' ' + name + ' failure reports both phases without removing volumes', async () => {
+            const harness = createSupervisorHarness({
+                engine,
+                container: legacyRunningContainerWithCustomConfig(),
+                images: {
+                    'sha256:legacy': legacyImage(),
+                    [REQUIRED_IMAGE]: contractV1Image(),
+                },
+                failures: {
+                    'run replacement': 7,
+                    ...rollbackFailure,
+                },
+            });
+            assert.equal(await harness.supervisor.run(['list', 'agents']), 1);
+            assert.match(harness.stderr, /replacement phase: .*exited 7/);
+            assert.match(harness.stderr, /rollback phase: .*exited 8/);
+            assert.equal(
+                harness.calls.some(call => call.args[0] === 'volume'),
+                false,
+            );
+        });
+    }
+
+    test(engine + ' failed replacement cleanup reports both phases without attempting rollback', async () => {
+        const harness = createSupervisorHarness({
+            engine,
+            container: legacyRunningContainerWithCustomConfig(),
+            images: {
+                'sha256:legacy': legacyImage(),
+                [REQUIRED_IMAGE]: contractV1Image(),
+            },
+            failures: {
+                'run replacement': 7,
+                'rm replacement cleanup': 8,
+            },
+            replacementFailureCreatesContainer: true,
+        });
+        const volumesBefore = [...harness.state.volumes].sort();
+
+        assert.equal(await harness.supervisor.run(['list', 'agents']), 1);
+        assert.match(harness.stderr, /replacement phase: .*exited 7/);
+        assert.match(harness.stderr, /rollback phase: .*exited 8/);
+        assert.equal(
+            harness.calls.some(call =>
+                call.args[0] === 'run'
+                && call.args.at(-1) === 'sha256:legacy'
+            ),
+            false,
+        );
+        assert.equal(
+            harness.calls.some(call => call.args[0] === 'volume'),
+            false,
+        );
+        assert.deepEqual([...harness.state.volumes].sort(), volumesBefore);
+    });
+
+    test(engine + ' failed cleanup that leaves no replacement still rolls back', async () => {
+        const harness = createSupervisorHarness({
+            engine,
+            container: legacyRunningContainerWithCustomConfig(),
+            images: {
+                'sha256:legacy': legacyImage(),
+                [REQUIRED_IMAGE]: contractV1Image(),
+            },
+            failures: {
+                'run replacement': 7,
+                'rm replacement cleanup': 8,
+            },
+            replacementFailureCreatesContainer: true,
+            replacementCleanupFailureRemovesContainer: true,
+        });
+        const volumesBefore = [...harness.state.volumes].sort();
+
+        assert.equal(await harness.supervisor.run(['list', 'agents']), 1);
+        assert.match(
+            harness.stderr,
+            /runtime replacement failed; previous runtime restored: .*exited 7/,
+        );
+        assert.doesNotMatch(harness.stderr, /rollback phase:/);
+        const rollback = harness.calls
+            .filter(call => call.args[0] === 'run')
+            .at(-1).args;
+        assertLegacyCreationConfig(rollback, 'sha256:legacy');
+        assert.ok(harness.calls.some(call =>
+            call.kind === 'health' && call.phase === 'rollback'
+        ));
+        assert.equal(
+            harness.calls.some(call => call.args[0] === 'volume'),
+            false,
+        );
+        assert.deepEqual([...harness.state.volumes].sort(), volumesBefore);
+    });
+
+    test(engine + ' retry after terminal replacement and rollback failure starts a fresh create', async () => {
+        const harness = createSupervisorHarness({
+            engine,
+            container: legacyRunningContainerWithCustomConfig(),
+            images: {
+                'sha256:legacy': legacyImage(),
+                [REQUIRED_IMAGE]: contractV1Image(),
+            },
+            failures: {
+                'run replacement': 7,
+                'run rollback': 8,
+            },
+        });
+
+        assert.equal(await harness.supervisor.run(['list', 'agents']), 1);
+        assert.match(harness.stderr, /replacement phase: .*exited 7/);
+        assert.match(harness.stderr, /rollback phase: .*exited 8/);
+
+        assert.equal(await harness.supervisor.run(['list', 'agents']), 0);
+        assert.equal(
+            harness.calls.filter(call =>
+                call.kind === 'health' && call.phase === 'create'
+            ).length,
+            1,
+        );
+        assert.equal(
+            harness.calls.filter(call =>
+                call.args[0] === 'run'
+                && call.args.at(-1) === REQUIRED_IMAGE
+            ).length,
+            2,
+        );
+    });
 }
+
+test('explicit port and publish replace only their inspected fields', () => {
+    const existing = {
+        ...normalizeContainerInspect('docker', dockerInspect),
+        contract: '1',
+    };
+    const portChanged = mergeDesiredRuntimeConfig(
+        parseHostInvocation(['--port', '19191', 'list', 'agents']),
+        existing,
+        [],
+    );
+    assert.equal(portChanged.routerPublish.hostPort, '19191');
+    assert.deepEqual(
+        { ...portChanged, routerPublish: existing.routerPublish },
+        existing,
+    );
+
+    const publishChanged = mergeDesiredRuntimeConfig(
+        parseHostInvocation([
+            '--publish', '127.0.0.1:9000:9000/tcp',
+            'list', 'agents',
+        ]),
+        existing,
+        [],
+    );
+    assert.deepEqual(publishChanged.extraPublishes, [{
+        hostIp: '127.0.0.1',
+        hostPort: '9000',
+        containerPort: '9000',
+        protocol: 'tcp',
+    }]);
+    assert.deepEqual(
+        { ...publishChanged, extraPublishes: existing.extraPublishes },
+        existing,
+    );
+});
 
 test('source-owned runtime marker is absent', () => {
     assert.equal(fs.existsSync(path.join(HERE, 'ploinky-box-marker')), false);
