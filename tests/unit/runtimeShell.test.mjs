@@ -1,6 +1,32 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { handleCliCommand } from '../../cli/commands/cli.js';
+import {
+    isSuspended,
+    registerInterface,
+} from '../../cli/services/inputState.js';
+import { runReplCommand } from '../../cli/services/replCommandRunner.js';
 import { runOuterRuntimeShell } from '../../cli/services/runtimeShell.js';
+
+test('cli dispatches solely by argument arity', async () => {
+    const calls = [];
+    const shellCode = await handleCliCommand([], {
+        runOuterRuntimeShellImpl: () => {
+            calls.push(['outer']);
+            return 7;
+        },
+        runAgentCliImpl: async (...args) => calls.push(['agent', ...args]),
+    });
+    await handleCliCommand(['explorer', '--help'], {
+        runOuterRuntimeShellImpl: () => calls.push(['wrong']),
+        runAgentCliImpl: async (...args) => calls.push(['agent', ...args]),
+    });
+    assert.equal(shellCode, 7);
+    assert.deepEqual(calls, [
+        ['outer'],
+        ['agent', 'explorer', ['--help']],
+    ]);
+});
 
 test('outer shell validates marker before tty and restores around bash', () => {
     const events = [];
@@ -84,4 +110,58 @@ test('outer shell maps SIGTERM termination to shell exit status 143', () => {
     });
 
     assert.equal(code, 143);
+});
+
+test('repl cli gives bash the tty then restores history and exactly one prompt', async () => {
+    const events = [];
+    const input = {
+        isTTY: true,
+        isRaw: true,
+        setRawMode(value) {
+            events.push(['raw', value]);
+            this.isRaw = value;
+        },
+    };
+    const rl = {
+        input,
+        history: ['status', 'list agents'],
+        pause: () => events.push('pause'),
+        resume: () => events.push('resume'),
+        setPrompt: value => events.push(['setPrompt', value]),
+        prompt: () => events.push('prompt'),
+    };
+    const historyBefore = [...rl.history];
+    registerInterface(rl);
+    await runReplCommand({
+        args: ['cli'],
+        rl,
+        stdin: input,
+        getPromptImpl: () => 'ploinky> ',
+        handleCommandImpl: args => handleCliCommand(args.slice(1), {
+            runOuterRuntimeShellImpl: () => runOuterRuntimeShell({
+                stdin: input,
+                stdout: { isTTY: true },
+                isManagedRuntimeImpl: () => true,
+                runtimeName: 'ploinky-box-demo',
+                user: 'podman',
+                log: () => {},
+                spawnSyncImpl: (file, argv, options) => {
+                    assert.equal(isSuspended(), true);
+                    events.push(['spawn', file, argv, options.stdio]);
+                    return { status: 0 };
+                },
+            }),
+        }),
+    });
+    assert.deepEqual(rl.history, historyBefore);
+    assert.deepEqual(events, [
+        'pause',
+        ['raw', false],
+        ['spawn', '/bin/bash', [], 'inherit'],
+        ['raw', true],
+        'resume',
+        ['setPrompt', 'ploinky> '],
+        'prompt',
+    ]);
+    registerInterface(null);
 });

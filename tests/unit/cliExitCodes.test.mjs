@@ -9,6 +9,12 @@ import { fileURLToPath } from 'node:url';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(__dirname, '../..');
 const cliEntry = path.join(repoRoot, 'cli', 'index.js');
+const lightweightBoundaryLoader = path.join(
+    repoRoot,
+    'tests',
+    'fixtures',
+    'lightweightCliBoundaryLoader.mjs',
+);
 const bootRepos = ['basic', 'AchillesIDE', 'AchillesCLI', 'copilot-agents'];
 
 function createWorkspace(t) {
@@ -74,4 +80,105 @@ test('enable repo marks an installed repository as enabled', (t) => {
     assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
     const enabledPath = path.join(workspace, '.ploinky', 'enabled_repos.json');
     assert.deepEqual(JSON.parse(fs.readFileSync(enabledPath, 'utf8')), [repoName]);
+});
+
+test('direct-core bare cli fails before dependency initialization', () => {
+    const emptyRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-empty-root-'));
+    try {
+        const result = spawnSync(
+            process.execPath,
+            [
+                '--experimental-loader', lightweightBoundaryLoader,
+                'cli/index.js', 'cli',
+            ],
+            {
+                cwd: repoRoot,
+                env: { ...process.env, PLOINKY_ROOT: emptyRoot },
+                encoding: 'utf8',
+            },
+        );
+        const output = (result.stdout || '') + (result.stderr || '');
+        assert.equal(result.status, 1);
+        assert.match(output, /requires the managed Ploinky runtime/);
+        assert.doesNotMatch(output, /Ploinky dependencies missing/);
+        assert.doesNotMatch(output, /FORBIDDEN_CORE_MODULE/);
+    } finally {
+        fs.rmSync(emptyRoot, { recursive: true, force: true });
+    }
+});
+
+test('help and direct-core bare cli do not load the core command graph', () => {
+    const emptyRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-empty-root-'));
+    try {
+        for (const args of [['help'], ['--help'], ['-h']]) {
+            const result = spawnSync(
+                process.execPath,
+                [
+                    '--experimental-loader', lightweightBoundaryLoader,
+                    'cli/index.js', ...args,
+                ],
+                {
+                    cwd: repoRoot,
+                    env: { ...process.env, PLOINKY_ROOT: emptyRoot },
+                    encoding: 'utf8',
+                },
+            );
+            assert.equal(result.status, 0, (result.stdout || '') + (result.stderr || ''));
+        }
+
+        const shell = spawnSync(
+            process.execPath,
+            [
+                '--experimental-loader', lightweightBoundaryLoader,
+                'cli/index.js', 'cli',
+            ],
+            {
+                cwd: repoRoot,
+                env: { ...process.env, PLOINKY_ROOT: emptyRoot },
+                encoding: 'utf8',
+            },
+        );
+        const output = (shell.stdout || '') + (shell.stderr || '');
+        assert.equal(shell.status, 1);
+        assert.match(output, /requires the managed Ploinky runtime/);
+        assert.doesNotMatch(output, /FORBIDDEN_CORE_MODULE/);
+    } finally {
+        fs.rmSync(emptyRoot, { recursive: true, force: true });
+    }
+});
+
+test('managed launcher bypasses its dependency gate only for help and bare cli', () => {
+    const launcher = fs.readFileSync(path.join(repoRoot, 'bin', 'ploinky'), 'utf8');
+    assert.match(
+        launcher,
+        /case "\$\{1:-\}" in[\s\S]*help\|--help\|-h[\s\S]*cli[\s\S]*skip_dependency_gate=1/,
+    );
+    assert.ok(
+        launcher.indexOf('skip_dependency_gate=1')
+        < launcher.indexOf('deps_missing=0'),
+    );
+    assert.match(
+        launcher,
+        /cli\)[\s\S]{0,160}\[\[ "\$#" -eq 1 \]\] && skip_dependency_gate=1/,
+    );
+});
+
+test('one-shot bare cli propagates the exact shell exit code', () => {
+    const result = spawnSync(
+        process.execPath,
+        [
+            '--experimental-loader', lightweightBoundaryLoader,
+            'cli/index.js', 'cli',
+        ],
+        {
+            cwd: repoRoot,
+            env: {
+                ...process.env,
+                PLOINKY_TEST_RUNTIME_SHELL_STATUS: '7',
+            },
+            encoding: 'utf8',
+        },
+    );
+
+    assert.equal(result.status, 7, (result.stdout || '') + (result.stderr || ''));
 });

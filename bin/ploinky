@@ -28,23 +28,35 @@ fi
 if [[ "$in_ploinky_box" == "1" ]]; then
     export PLOINKY_ROOT="$ROOT_DIR"
 
-    deps_missing=0
-    [[ -d "$PLOINKY_ROOT/node_modules/achillesAgentLib" ]] || deps_missing=1
-    [[ -d "$PLOINKY_ROOT/node_modules/mcp-sdk" ]] || deps_missing=1
-    if [[ "$deps_missing" == "1" ]]; then
-        # First-run flow: ask on a TTY, never install silently. Non-interactive
-        # contexts (podman exec without -t, scripts, CI) default to "no".
-        answer="n"
-        if [[ -t 0 ]]; then
-            printf 'Ploinky dependencies are not installed. Install them now? [y/N] ' >&2
-            read -r answer || answer="n"
-        fi
-        if [[ "$answer" =~ ^[yY]$ ]]; then
-            "$SCRIPT_DIR/ploinky-install-deps"
-        else
-            echo "WARNING: Ploinky cannot run until dependencies are installed." >&2
-            echo "Install them with: $SCRIPT_DIR/ploinky-install-deps" >&2
-            exit 1
+    skip_dependency_gate=0
+    case "${1:-}" in
+        help|--help|-h)
+            skip_dependency_gate=1
+            ;;
+        cli)
+            [[ "$#" -eq 1 ]] && skip_dependency_gate=1
+            ;;
+    esac
+
+    if [[ "$skip_dependency_gate" == "0" ]]; then
+        deps_missing=0
+        [[ -d "$PLOINKY_ROOT/node_modules/achillesAgentLib" ]] || deps_missing=1
+        [[ -d "$PLOINKY_ROOT/node_modules/mcp-sdk" ]] || deps_missing=1
+        if [[ "$deps_missing" == "1" ]]; then
+            # First-run flow: ask on a TTY, never install silently. Non-interactive
+            # contexts (podman exec without -t, scripts, CI) default to "no".
+            answer="n"
+            if [[ -t 0 ]]; then
+                printf 'Ploinky dependencies are not installed. Install them now? [y/N] ' >&2
+                read -r answer || answer="n"
+            fi
+            if [[ "$answer" =~ ^[yY]$ ]]; then
+                "$SCRIPT_DIR/ploinky-install-deps"
+            else
+                echo "WARNING: Ploinky cannot run until dependencies are installed." >&2
+                echo "Install them with: $SCRIPT_DIR/ploinky-install-deps" >&2
+                exit 1
+            fi
         fi
     fi
 

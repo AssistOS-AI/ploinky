@@ -65,6 +65,7 @@ import { disableHostSandbox, enableHostSandbox, handleSandboxCommand } from './s
 import ClientCommands from './client.js';
 import { getActiveProfile, getProfileConfig, setActiveProfile } from '../services/profileService.js';
 import { resolveProfileServer } from '../services/profileServer.js';
+import { runOuterRuntimeShell } from '../services/runtimeShell.js';
 
 let llmAgentsLoadPromise = null;
 const ENABLE_AGENT_CLI_TOKENS = Object.freeze({
@@ -201,6 +202,14 @@ function hasAgentEnableSyntax(options = []) {
 
 
 
+export async function handleCliCommand(options = [], {
+    runOuterRuntimeShellImpl = runOuterRuntimeShell,
+    runAgentCliImpl = runCli,
+} = {}) {
+    if (options.length === 0) return runOuterRuntimeShellImpl();
+    return runAgentCliImpl(options[0], options.slice(1));
+}
+
 async function handleCommand(args) {
     const [command, ...options] = args;
     switch (command) {
@@ -209,9 +218,7 @@ async function handleCommand(args) {
             await runShell(options[0]);
             break;
         case 'cli':
-            if (!options[0]) { showHelp(); break; }
-            await runCli(options[0], options.slice(1));
-            break;
+            return handleCliCommand(options);
         // 'agent' command removed; use 'enable agent <agentName>' then 'start'
         case 'add':
             {
