@@ -36,6 +36,8 @@ const SERVER_PATH = path.resolve(__dirname, '../../Agent/server/AgentServer.mjs'
 
 const OPENAI_PATH = '/v1/chat/completions';
 const OPENAI_TOOL = '__openai_chat_completions__';
+const MODELS_PATH = '/v1/models';
+const MODELS_TOOL = '__openai_models__';
 
 // Master key shared by the parent (token signer) and the spawned AgentServer
 // child (token verifier). Set in the parent BEFORE deriveAgentRequestSecret is
@@ -48,20 +50,20 @@ process.env.PLOINKY_MASTER_KEY = process.env.PLOINKY_MASTER_KEY || ROUTER_OPENAI
 // (httpServiceInvocation) import this router service the same way.
 const { deriveAgentRequestSecret } = await import('../../cli/services/masterKey.js');
 
-function buildRouterRequestAuthInfo({ agentId, body, overrides = {} }) {
+function buildRouterRequestAuthInfo({ agentId, body = '', method = 'POST', path = OPENAI_PATH, tool = OPENAI_TOOL, overrides = {} }) {
     const secret = deriveAgentRequestSecret(agentId, { encoding: 'buffer' });
     const now = Math.floor(Date.now() / 1000);
     const bodyHash = sha256RawBodyHash(body);
-    const rch = computeRchHttp({ method: 'POST', path: OPENAI_PATH, query: '', bodyHash });
+    const rch = computeRchHttp({ method, path, query: '', bodyHash });
     const payload = {
         typ: 'router-request',
         iss: 'ploinky-router',
         aud: agentId,
         sub: 'agent:AssistOSExplorer/soulGateway',
         actor: { kind: 'agent', id: 'agent:AssistOSExplorer/soulGateway', roles: [] },
-        method: 'POST',
-        path: OPENAI_PATH,
-        tool: OPENAI_TOOL,
+        method,
+        path,
+        tool,
         rch,
         jti: crypto.randomBytes(12).toString('base64url'),
         iat: now,
@@ -71,7 +73,7 @@ function buildRouterRequestAuthInfo({ agentId, body, overrides = {} }) {
     const token = signHmacJwt({ payload, secret });
     return JSON.stringify({
         invocationToken: token,
-        invocationBody: { method: 'POST', path: OPENAI_PATH, search: '', routeKey: 'llmAssistant', bodyHash },
+        invocationBody: { method, path, search: '', routeKey: 'llmAssistant', bodyHash },
     });
 }
 
@@ -237,6 +239,73 @@ test('configured endpoints.chatCompletions handler still executes', async () => 
         const body = await res.json();
         assert.equal(body.id, 'chatcmpl-configured', 'configured handler response is returned');
         assert.equal(body.choices[0].message.content, 'CONFIGURED_HANDLER_RAN');
+    } finally {
+        await srv.stop();
+    }
+});
+
+test('GET /v1/models returns a default model when endpoints.models is absent', async () => {
+    const srv = await startServer({
+        manifest: { name: 'llmAssistant', endpoints: { chatCompletions: { model: 'none' } } },
+        mcpConfig: TOOL_CONFIG,
+        agentId: 'agent:AssistOSExplorer/llmAssistant',
+    });
+    try {
+        const res = await fetch(`http://127.0.0.1:${srv.port}${MODELS_PATH}`);
+        assert.equal(res.status, 200);
+        const body = await res.json();
+        assert.equal(body.object, 'list');
+        assert.equal(body.data[0].modelId, 'default');
+        assert.equal(body.data[0].displayName, 'llmAssistant');
+        assert.equal(body.data[0].metadata.fallback, true);
+    } finally {
+        await srv.stop();
+    }
+});
+
+test('configured endpoints.models handler executes', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agentsrv-models-handler-'));
+    const handlerPath = path.join(dir, 'models-handler.mjs');
+    fs.writeFileSync(handlerPath,
+        'let raw = "";\n'
+        + 'process.stdin.on("data", c => { raw += c; });\n'
+        + 'process.stdin.on("end", () => {\n'
+        + '    const payload = JSON.parse(raw || "{}");\n'
+        + '    process.stdout.write(JSON.stringify({ object: "list", data: [{ modelId: "fast", displayName: payload.endpoint, tags: ["fast"] }] }));\n'
+        + '});\n'
+    );
+    const agentId = 'agent:Workspace/configuredAgent';
+    const srv = await startServer({
+        manifest: {
+            name: 'configuredAgent',
+            endpoints: {
+                models: { command: process.execPath, args: [handlerPath] },
+            },
+        },
+        agentId,
+        extraEnv: {
+            PLOINKY_MASTER_KEY: process.env.PLOINKY_MASTER_KEY,
+            PLOINKY_AGENT_SECRET: deriveAgentRequestSecret(agentId),
+        },
+    });
+    try {
+        const res = await fetch(`http://127.0.0.1:${srv.port}${MODELS_PATH}`, {
+            method: 'GET',
+            headers: {
+                'x-ploinky-auth-info': buildRouterRequestAuthInfo({
+                    agentId,
+                    method: 'GET',
+                    path: MODELS_PATH,
+                    tool: MODELS_TOOL,
+                    body: '',
+                }),
+            },
+        });
+        const text = await res.text();
+        assert.equal(res.status, 200, text);
+        const body = JSON.parse(text);
+        assert.equal(body.data[0].modelId, 'fast');
+        assert.equal(body.data[0].displayName, 'openai.models');
     } finally {
         await srv.stop();
     }

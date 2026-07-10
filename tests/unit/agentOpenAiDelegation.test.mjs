@@ -12,10 +12,13 @@ import { signAgentAssertion, signAgentHttpAssertion } from '../../Agent/lib/agen
 import {
     verifyRouterRequestFromHeaders,
     verifyOpenAiServiceAuthInfoFromHeaders,
+    verifyOpenAiModelsAuthInfoFromHeaders,
 } from '../../Agent/lib/invocationAuth.mjs';
 
 const OPENAI_PATH = '/v1/chat/completions';
 const OPENAI_TOOL = '__openai_chat_completions__';
+const MODELS_PATH = '/v1/models';
+const MODELS_TOOL = '__openai_models__';
 
 const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-openai-deleg-'));
 const originalCwd = process.cwd();
@@ -161,6 +164,15 @@ test('isDelegatedAgentOpenAiCall is path-exact and method-exact', () => {
     assert.equal(isDelegatedAgentOpenAiCall({ agentName: TARGET_ROUTE, method: 'POST', agentProxyPath: OPENAI_PATH, req: makeReq({}) }), false);
 });
 
+test('isDelegatedAgentOpenAiCall accepts only exact delegated GET /v1/models', () => {
+    const bearer = signAgentHttpAssertion({ method: 'GET', path: MODELS_PATH, body: Buffer.alloc(0), targetAgent: TARGET_ROUTE, tool: MODELS_TOOL, env: envFor(SOURCE_AGENT) });
+    const baseReq = makeReq({ method: 'GET', bearer });
+    assert.equal(isDelegatedAgentOpenAiCall({ agentName: TARGET_ROUTE, method: 'GET', agentProxyPath: MODELS_PATH, req: baseReq }), true);
+    assert.equal(isDelegatedAgentOpenAiCall({ agentName: TARGET_ROUTE, method: 'GET', agentProxyPath: '/v1/models/x', req: baseReq }), false);
+    assert.equal(isDelegatedAgentOpenAiCall({ agentName: TARGET_ROUTE, method: 'GET', agentProxyPath: '/v1/models?x=1', req: baseReq }), false);
+    assert.equal(isDelegatedAgentOpenAiCall({ agentName: TARGET_ROUTE, method: 'POST', agentProxyPath: MODELS_PATH, req: baseReq }), false);
+});
+
 // ---------------------------------------------------------------------------
 // 3. verifyAndMintAgentOpenAiCall accept + mint, and the full reject matrix.
 // ---------------------------------------------------------------------------
@@ -196,6 +208,34 @@ test('verifyAndMintAgentOpenAiCall accepts a valid assertion and mints a body-bo
     assert.equal(verified.payload.rch, expectedRch);
     assert.equal(verified.payload.actor.kind, 'agent');
     assert.equal(verified.payload.sub, SOURCE_AGENT);
+});
+
+test('verifyAndMintAgentOpenAiCall accepts GET /v1/models and mints a models-bound router token', () => {
+    const empty = Buffer.alloc(0);
+    const bearer = signAgentHttpAssertion({ method: 'GET', path: MODELS_PATH, body: empty, targetAgent: TARGET_ROUTE, tool: MODELS_TOOL, env: envFor(SOURCE_AGENT) });
+    const result = verifyAndMintAgentOpenAiCall({
+        token: bearer,
+        routeKey: TARGET_ROUTE,
+        route: ROUTE,
+        body: empty,
+        method: 'GET',
+        path: MODELS_PATH,
+        replayCache: createMemoryReplayCache(),
+    });
+    assert.equal(result.ok, true, result.error);
+    const authInfo = JSON.parse(result.authInfoHeader['x-ploinky-auth-info']);
+    assert.equal(authInfo.invocationBody.bodyHash, sha256RawBodyHash(empty));
+
+    const verified = verifyOpenAiModelsAuthInfoFromHeaders(result.authInfoHeader, {
+        env: targetEnv(),
+        replayCache: createMemoryReplayCache(),
+    });
+    assert.equal(verified.ok, true, verified.reason);
+    assert.equal(verified.payload.typ, 'router-request');
+    assert.equal(verified.payload.tool, MODELS_TOOL);
+    assert.equal(verified.payload.method, 'GET');
+    assert.equal(verified.payload.path, MODELS_PATH);
+    assert.equal(verified.payload.aud, TARGET_AGENT);
 });
 
 test('verifyAndMintAgentOpenAiCall rejects a missing assertion', () => {

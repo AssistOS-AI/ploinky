@@ -4,6 +4,7 @@ import { computeRchHttp, sha256RawBodyHash } from './requestHash.mjs';
 
 const httpServiceReplayCache = createMemoryReplayCache({ maxSize: 4096 });
 const openAiServiceReplayCache = createMemoryReplayCache({ maxSize: 4096 });
+const openAiModelsReplayCache = createMemoryReplayCache({ maxSize: 4096 });
 
 // Tool name the router binds into the Router Request token it mints for a
 // verified agent-to-agent OpenAI call. Kept here so router (minter) and agent
@@ -11,6 +12,8 @@ const openAiServiceReplayCache = createMemoryReplayCache({ maxSize: 4096 });
 // completion is always the agent-internal `/v1/chat/completions`.
 export const OPENAI_CHAT_COMPLETIONS_TOOL = '__openai_chat_completions__';
 export const OPENAI_CHAT_COMPLETIONS_PATH = '/v1/chat/completions';
+export const OPENAI_MODELS_TOOL = '__openai_models__';
+export const OPENAI_MODELS_PATH = '/v1/models';
 
 export function readHeaderValue(headers = {}, headerName) {
     const unwrap = (value) => {
@@ -252,6 +255,55 @@ export function verifyOpenAiServiceAuthInfoFromHeaders(headers = {}, {
     };
 }
 
+// Verify the router-minted Router Request token for an agent-to-agent OpenAI
+// models-list call. This mirrors the chat-completions verifier but binds the
+// token to the GET /v1/models surface with an empty body and query.
+export function verifyOpenAiModelsAuthInfoFromHeaders(headers = {}, {
+    env = process.env,
+    replayCache,
+} = {}) {
+    const parsed = parseHttpServiceAuthInfo(headers);
+    if (!parsed.ok) {
+        return parsed;
+    }
+
+    const authInfo = parsed.authInfo;
+    const rawToken = typeof authInfo.invocationToken === 'string' ? authInfo.invocationToken.trim() : '';
+    if (!rawToken) {
+        return { ok: false, reason: 'missing OpenAI models invocation token' };
+    }
+
+    const expectedMethod = 'GET';
+    const expectedPath = OPENAI_MODELS_PATH;
+    const expectedQuery = '';
+    const expectedBodyHash = sha256RawBodyHash('');
+
+    const verified = verifyRouterRequestFromHeaders(
+        { authorization: `Bearer ${rawToken}` },
+        {
+            env,
+            replayCache: replayCache || openAiModelsReplayCache,
+            method: expectedMethod,
+            path: expectedPath,
+            tool: OPENAI_MODELS_TOOL,
+            rch: computeRchHttp({
+                method: expectedMethod,
+                path: expectedPath,
+                query: expectedQuery,
+                bodyHash: expectedBodyHash,
+            }),
+        },
+    );
+    if (!verified.ok) {
+        return verified;
+    }
+    return {
+        ...verified,
+        authInfo,
+        bodyHash: expectedBodyHash,
+    };
+}
+
 export default {
     readHeaderValue,
     hasInvocationTokenHeader,
@@ -262,7 +314,10 @@ export default {
     parseHttpServiceAuthInfo,
     verifyHttpServiceAuthInfoFromHeaders,
     verifyOpenAiServiceAuthInfoFromHeaders,
+    verifyOpenAiModelsAuthInfoFromHeaders,
     verifyRouterRequestFromHeaders,
     OPENAI_CHAT_COMPLETIONS_TOOL,
     OPENAI_CHAT_COMPLETIONS_PATH,
+    OPENAI_MODELS_TOOL,
+    OPENAI_MODELS_PATH,
 };

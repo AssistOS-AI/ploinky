@@ -6,6 +6,8 @@ import { computeRchHttp, sha256RawBodyHash } from '../../Agent/lib/requestHash.m
 import {
     OPENAI_CHAT_COMPLETIONS_TOOL,
     OPENAI_CHAT_COMPLETIONS_PATH,
+    OPENAI_MODELS_TOOL,
+    OPENAI_MODELS_PATH,
 } from '../../Agent/lib/invocationAuth.mjs';
 import {
     proxyHttpBuffered,
@@ -39,6 +41,20 @@ const assertionReplayCache = createTokenReplayCache({ maxSize: 4096 });
 
 export const MAX_AGENTIC_DEPTH = 3;
 const AGENTIC_DEPTH_HEADER = 'x-ploinky-agentic-depth';
+const OPENAI_SURFACES = Object.freeze({
+    chat: {
+        method: 'POST',
+        path: OPENAI_CHAT_COMPLETIONS_PATH,
+        tool: OPENAI_CHAT_COMPLETIONS_TOOL,
+        bodyTooLargeError: 'openai_body_too_large',
+    },
+    models: {
+        method: 'GET',
+        path: OPENAI_MODELS_PATH,
+        tool: OPENAI_MODELS_TOOL,
+        bodyTooLargeError: 'openai_models_body_too_large',
+    },
+});
 
 export function readAgenticDepth(headers = {}) {
     const raw = headers[AGENTIC_DEPTH_HEADER];
@@ -71,9 +87,20 @@ function hasDelegatedAgentAssertion(req) {
  */
 export function isDelegatedAgentOpenAiCall({ agentName, method, agentProxyPath, req } = {}) {
     if (!agentName) return false;
-    if (String(method || '').toUpperCase() !== 'POST') return false;
-    if (String(agentProxyPath || '') !== OPENAI_CHAT_COMPLETIONS_PATH) return false;
+    const surface = resolveOpenAiSurface(method, agentProxyPath);
+    if (!surface) return false;
     return hasDelegatedAgentAssertion(req);
+}
+
+function resolveOpenAiSurface(method, agentProxyPath) {
+    const normalizedMethod = String(method || '').toUpperCase();
+    const normalizedPath = String(agentProxyPath || '');
+    for (const surface of Object.values(OPENAI_SURFACES)) {
+        if (normalizedMethod === surface.method && normalizedPath === surface.path) {
+            return surface;
+        }
+    }
+    return null;
 }
 
 function resolveRepoAgent(routeKey, route) {
@@ -120,6 +147,8 @@ export function verifyAndMintAgentOpenAiCall({
     routeKey,
     route,
     body = Buffer.alloc(0),
+    method = 'POST',
+    path = OPENAI_CHAT_COMPLETIONS_PATH,
     replayCache = assertionReplayCache,
 } = {}) {
     // The source agent addresses the router by ROUTE KEY (it does not know the
@@ -135,9 +164,10 @@ export function verifyAndMintAgentOpenAiCall({
     }
 
     const bodyHash = sha256RawBodyHash(body);
+    const surface = resolveOpenAiSurface(method, path) || OPENAI_SURFACES.chat;
     const rch = computeRchHttp({
-        method: 'POST',
-        path: OPENAI_CHAT_COMPLETIONS_PATH,
+        method: surface.method,
+        path: surface.path,
         query: '',
         bodyHash,
     });
@@ -146,9 +176,9 @@ export function verifyAndMintAgentOpenAiCall({
     try {
         const verified = verifyAgentAssertion({
             token,
-            method: 'POST',
-            path: OPENAI_CHAT_COMPLETIONS_PATH,
-            tool: OPENAI_CHAT_COMPLETIONS_TOOL,
+            method: surface.method,
+            path: surface.path,
+            tool: surface.tool,
             rch,
             targetAgentId: String(routeKey || ''),
             replayCache,
@@ -173,9 +203,9 @@ export function verifyAndMintAgentOpenAiCall({
             sub,
             actor,
             caller,
-            method: 'POST',
-            path: OPENAI_CHAT_COMPLETIONS_PATH,
-            tool: OPENAI_CHAT_COMPLETIONS_TOOL,
+            method: surface.method,
+            path: surface.path,
+            tool: surface.tool,
             rch,
         });
         token2 = minted.token;
@@ -184,8 +214,8 @@ export function verifyAndMintAgentOpenAiCall({
     }
 
     const invocationBody = {
-        method: 'POST',
-        path: OPENAI_CHAT_COMPLETIONS_PATH,
+        method: surface.method,
+        path: surface.path,
         search: '',
         routeKey: String(routeKey || ''),
         bodyHash,
@@ -240,11 +270,18 @@ export function handleDelegatedAgentOpenAiCall(req, res, route, routeKey, agentP
     readRequestBody(req, {
         maxBytes: resolveHttpServiceInvocationMaxBodyBytes(),
         onSuccess: (body) => {
+            const surface = resolveOpenAiSurface(req.method, agentProxyPath);
+            if (!surface) {
+                sendJson(res, 404, { error: 'not_found' });
+                return;
+            }
             const result = verifyAndMintAgentOpenAiCall({
                 token,
                 routeKey,
                 route,
                 body,
+                method: surface.method,
+                path: surface.path,
                 replayCache,
             });
             if (!result.ok) {
@@ -260,7 +297,8 @@ export function handleDelegatedAgentOpenAiCall(req, res, route, routeKey, agentP
             });
         },
         onTooLarge: ({ limitBytes }) => {
-            sendJson(res, 413, { error: 'openai_body_too_large', limitBytes });
+            const surface = resolveOpenAiSurface(req.method, agentProxyPath) || OPENAI_SURFACES.chat;
+            sendJson(res, 413, { error: surface.bodyTooLargeError, limitBytes });
         },
         onError: (err) => {
             if (!res.headersSent) {
@@ -280,4 +318,6 @@ export default {
     handleDelegatedAgentOpenAiCall,
     OPENAI_CHAT_COMPLETIONS_TOOL,
     OPENAI_CHAT_COMPLETIONS_PATH,
+    OPENAI_MODELS_TOOL,
+    OPENAI_MODELS_PATH,
 };

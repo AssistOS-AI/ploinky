@@ -675,7 +675,7 @@ server.listen(port, () => {
     console.log('  WebChat:         /webchat');
     console.log('  Status:          /status');
     console.log('  Health:          /health');
-    console.log('  Agent routes:    /<agent>/{mcp,task,agent-card,v1/chat/completions}');
+    console.log('  Agent routes:    /<agent>/{mcp,task,agent-card,v1/models,v1/chat/completions}');
     console.log('  Agent servers:   http://<agent>.localhost:<port>/');
     console.log('  Aggregate cards: /agent-card');
     appendLog('server_start', { port });
