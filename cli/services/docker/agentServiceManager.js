@@ -67,9 +67,11 @@ import {
 } from '../profileService.js';
 import {
     createProfileServerPublish,
+    profileServerContainerPort,
     resolvePublishedProfileServer,
     resolveProfileServer
 } from '../profileServer.js';
+import { resolveAgentExecutionMode } from '../startupReadiness.js';
 import {
     getAgentWorkDir,
     getAgentCodePath,
@@ -106,8 +108,6 @@ const AGENT_PRIVATE_KEY_CONTAINER_PATH = '/run/ploinky-agent.key';
 const PODMAN_STAGED_NODE_OPTIONS = ['--preserve-symlinks', '--preserve-symlinks-main'];
 const PODMAN_RUNTIME_ROOT = path.join(PLOINKY_DIR, 'container-runtime');
 const PODMAN_ROOTLESS_NETWORK = 'slirp4netns:allow_host_loopback=true';
-const PLOINKY_BOX_NETWORK_COMPAT_HASH = 'slirp4netns-named-network';
-const PLOINKY_BOX_MARKER_PATH = '/etc/ploinky-box';
 
 function pathTypeForSymlink(sourcePath) {
     try {
@@ -513,22 +513,6 @@ function ensureNamedRuntimeNetwork(runtime, networkName) {
     }
 }
 
-// The ploinky-box image bakes /etc/ploinky-box (container-image-builds,
-// images/ploinky-box/Dockerfile). Older published images may lack it, so keep a
-// narrow fallback for the mounted-box layout.
-function isPloinkyBoxRuntime(markerPath = PLOINKY_BOX_MARKER_PATH, options = {}) {
-    try {
-        if (fs.statSync(markerPath).isFile()) return true;
-    } catch (_) {
-        // fall through to mounted-box layout detection
-    }
-    const sourceRoot = options.sourceRoot || path.resolve(__dirname, '../../..');
-    const workspacePath = options.workspacePath || '/workspace';
-    return String(process.env.PLOINKY_WORKSPACE_ROOT || '').trim() === '/workspace'
-        && sourceRoot === '/opt/ploinky'
-        && fs.existsSync(workspacePath);
-}
-
 function resolveEffectiveManifestNetwork(manifest, profileConfig) {
     if (profileConfig?.network && typeof profileConfig.network === 'object') {
         return profileConfig.network;
@@ -557,7 +541,6 @@ function normalizeRuntimeNetwork(network) {
 }
 
 function buildRuntimeNetworkPlan(runtime, manifestNetwork, options = {}) {
-    const boxMarkerPath = options.boxMarkerPath || PLOINKY_BOX_MARKER_PATH;
     const network = normalizeRuntimeNetwork(manifestNetwork);
     const isPodman = runtime === 'podman';
 
@@ -572,16 +555,6 @@ function buildRuntimeNetworkPlan(runtime, manifestNetwork, options = {}) {
     }
 
     if (network.name) {
-        if (isPodman && isPloinkyBoxRuntime(boxMarkerPath, options)) {
-            return {
-                args: ['--replace', '--network', PODMAN_ROOTLESS_NETWORK],
-                ensureNetworkName: '',
-                useHostNetwork: false,
-                boxNetworkCompat: true,
-                hashEnv: { PLOINKY_BOX_NETWORK_COMPAT: PLOINKY_BOX_NETWORK_COMPAT_HASH }
-            };
-        }
-
         const args = ['--network', network.name];
         for (const alias of network.aliases) {
             args.push('--network-alias', alias);
@@ -1310,6 +1283,23 @@ function resolvePublishedPortMappings(containerName, portMappings) {
     });
 }
 
+function shouldCreateImplicitAgentServerPublish(manifest, manifestPorts = []) {
+    if (Array.isArray(manifestPorts) && manifestPorts.length > 0) {
+        return false;
+    }
+    return resolveAgentExecutionMode(manifest).type !== 'start_only';
+}
+
+function resolveDirectProfileServerHostPort(profileServer) {
+    if (String(profileServer?.mode || '').trim().toLowerCase() !== 'host') return 0;
+    try {
+        const port = Number.parseInt(new URL(profileServer.url).port, 10);
+        return Number.isInteger(port) && port > 0 ? port : 0;
+    } catch (_) {
+        return 0;
+    }
+}
+
 function ensureAgentService(agentName, manifest, agentPath, options = {}) {
     // Check if this agent should use a sandbox runtime instead of containers
     const agentRuntime = getRuntimeForAgent(manifest);
@@ -1396,8 +1386,12 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
     const containerPortCandidates = portMappings
         .map((mapping) => mapping?.containerPort)
         .filter((port) => typeof port === 'number' && port > 0);
-    if (!containerPortCandidates.length) {
-        containerPortCandidates.push(7000);
+    const additionalServerContainerPort = profileServerContainerPort(additionalServerPort);
+    if (additionalServerContainerPort && !containerPortCandidates.includes(additionalServerContainerPort)) {
+        containerPortCandidates.push(additionalServerContainerPort);
+    }
+    if (shouldCreateImplicitAgentServerPublish(manifest, manifestPorts)) {
+        containerPortCandidates.unshift(7000);
     }
 
     const { raw: explicitAgentCmd } = readManifestAgentCommand(manifest);
@@ -1491,7 +1485,9 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
         }
         if (canReuseExisting) {
             debugLog(`[ensureAgentService] ${agentName}: returning early (container exists)`);
-            const hostPort = resolveHostPort(containerName, existingRecord, containerPortCandidates);
+            const hostPort = containerPortCandidates.length
+                ? resolveHostPort(containerName, existingRecord, containerPortCandidates)
+                : resolveDirectProfileServerHostPort(additionalServerPort);
             const existingPortMappings = resolvePublishedPortMappings(containerName, existingRecord.config?.ports || []);
             const resolvedProfileServer = resolvePublishedProfileServer(additionalServerPort, existingPortMappings) || additionalServerPort;
             syncAgentMcpConfig(containerName, agentPath, agentName);
@@ -1503,7 +1499,7 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
     let additionalPortMappings = [];
     let allPortMappings = [...portMappings];
 
-    if (manifestPorts.length === 0) {
+    if (shouldCreateImplicitAgentServerPublish(manifest, manifestPorts)) {
         const hostPort = preferredHostPort || (10000 + Math.floor(Math.random() * 50000));
         const agentServerMapping = { containerPort: 7000, hostPort, hostIp: '127.0.0.1', protocol: 'tcp' };
         additionalPorts = [`127.0.0.1:${hostPort}:7000`];
@@ -1597,7 +1593,10 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
     saveAgentsMap(agents);
 
     syncAgentMcpConfig(containerName, agentPath, finalInstanceName, { workDir: finalAgentWorkDir });
-    const returnPort = allPortMappings.find((p) => p.containerPort === 7000)?.hostPort || allPortMappings[0]?.hostPort || 0;
+    const returnPort = allPortMappings.find((p) => p.containerPort === 7000)?.hostPort
+        || allPortMappings[0]?.hostPort
+        || resolveDirectProfileServerHostPort(additionalServerPort)
+        || 0;
     return { containerName, hostPort: returnPort, additionalServerPort: resolvedProfileServer };
 }
 
@@ -1619,5 +1618,6 @@ export {
     resolveHostPortFromRecord,
     resolveHostPortFromRuntime,
     resolvePublishedPortMappings,
+    shouldCreateImplicitAgentServerPublish,
     startAgentContainer
 };

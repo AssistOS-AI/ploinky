@@ -63,7 +63,7 @@ import { handleSsoCommand } from './ssoCommands.js';
 import { handleDepsCommand } from './depsCommands.js';
 import { disableHostSandbox, enableHostSandbox, handleSandboxCommand } from './sandboxCommands.js';
 import ClientCommands from './client.js';
-import { getActiveProfile, getProfileConfig } from '../services/profileService.js';
+import { getActiveProfile, getProfileConfig, setActiveProfile } from '../services/profileService.js';
 import { resolveProfileServer } from '../services/profileServer.js';
 
 let llmAgentsLoadPromise = null;
@@ -357,6 +357,12 @@ async function handleCommand(args) {
         // 'run' legacy commands removed; use 'start', 'cli', 'shell', 'console'.
         case 'start': {
             const startParsed = parseStartArgs(options);
+            if (startParsed.profile) {
+                const profileResult = setActiveProfile(startParsed.profile);
+                if (!profileResult.success) {
+                    throw new Error(profileResult.message);
+                }
+            }
             // The global --branch also drives the achillesAgentLib used by agent
             // containers (best-effort: the branch when the achillesAgentLib remote
             // has it, else the pinned #master). Propagated via PLOINKY_AGENTLIB_REF,

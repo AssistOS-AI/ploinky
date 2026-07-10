@@ -15,7 +15,8 @@ import { getActiveProfile, getProfileConfig, getProfileEnvVars } from './profile
 import { getSecrets, createEnvWithSecrets, loadEnvFile } from './secretInjector.js';
 import { readSecretsFile } from './encryptedSecretsFile.js';
 import { buildEnvMap } from './secretVars.js';
-import { resolveAgentReadinessProtocol } from './startupReadiness.js';
+import { resolveAgentExecutionMode, resolveAgentReadinessProtocol } from './startupReadiness.js';
+import { normalizeProbeConfig, runContainerScriptReadiness } from './docker/healthProbes.js';
 import { applyStartupConfigProvidersForGraph } from './startupConfigProviders.js';
 import { withMaintenanceLock } from './maintenanceLocks.js';
 import { LOGS_DIR, PLOINKY_CWD, PLOINKY_WORKSPACE_ROOT, ROUTING_FILE, RUNNING_DIR } from './config.js';
@@ -297,16 +298,23 @@ function buildReadinessEntryFromNode(node, route, staticLabel) {
     10
   );
 
-  return {
+  const protocol = resolveAgentReadinessProtocol(node.manifest, {
+    additionalServerPort: route?.additionalServerPort
+  });
+  const entry = {
     key: node.id,
     label: formatGraphNodeLabel(node, staticLabel),
     kind: node.isStatic ? 'static' : 'dependency',
     route,
-    protocol: resolveAgentReadinessProtocol(node.manifest),
+    protocol,
     timeoutMs,
     intervalMs,
     probeTimeoutMs
   };
+  if (protocol === 'script') {
+    entry.scriptProbe = normalizeProbeConfig('readiness', node.manifest?.health?.readiness);
+  }
+  return entry;
 }
 
 function resolveManifestReadinessWaitOptions(manifest, fallbackTimeoutMs = 120000) {
@@ -335,10 +343,28 @@ function resolveManifestReadinessWaitOptions(manifest, fallbackTimeoutMs = 12000
 
 function buildBlockingReadinessEntryFromNode(node, route, staticLabel) {
   const entry = buildReadinessEntryFromNode(node, route, staticLabel);
+  if (entry.protocol === 'script' && !route?.container) {
+    throw new Error(`${node.isStatic ? 'Static agent' : 'Dependent agent'} '${formatGraphNodeLabel(node, staticLabel)}' did not resolve its service container for script readiness.`);
+  }
   if (!route?.hostPort && entry.protocol !== 'none') {
+    if (entry.protocol === 'script') {
+      return entry;
+    }
+    if (resolveAgentExecutionMode(node.manifest).type === 'start_only') {
+      throw new Error(
+        `${node.isStatic ? 'Static agent' : 'Dependent agent'} '${formatGraphNodeLabel(node, staticLabel)}' is start-only but has no reachable readiness contract. `
+        + 'Declare health.readiness.script, a private additionalServerPort/openPorts route, or readiness.protocol none.'
+      );
+    }
     throw new Error(`${node.isStatic ? 'Static agent' : 'Dependent agent'} '${formatGraphNodeLabel(node, staticLabel)}' did not expose a host port.`);
   }
   return entry;
+}
+
+function readinessKindLabel(entry) {
+  if (entry.kind === 'static') return 'Static agent';
+  if (entry.kind === 'reinstall') return 'Reinstalled agent';
+  return 'Dependent agent';
 }
 
 function formatReadyProgress({ elapsedMs, timeoutMs, portOpen, protocol, stage, lastError }) {
@@ -356,7 +382,9 @@ function formatReadyProgress({ elapsedMs, timeoutMs, portOpen, protocol, stage, 
   return `still waiting (${elapsedSec}s/${timeoutSec}s)`;
 }
 
-async function waitForReadinessEntries(readinessEntries) {
+async function waitForReadinessEntries(readinessEntries, options = {}) {
+  const waitForAgentReadyImpl = options.waitForAgentReadyImpl || waitForAgentReady;
+  const runContainerScriptReadinessImpl = options.runContainerScriptReadinessImpl || runContainerScriptReadiness;
   const readinessProgress = new Map();
   const readinessStartAt = Date.now();
   let lastSummaryBucket = -1;
@@ -392,9 +420,11 @@ async function waitForReadinessEntries(readinessEntries) {
   };
 
   for (const entry of readinessEntries) {
-    const waitLabel = entry.kind === 'static' ? 'static agent' : 'dependent agent';
+    const waitLabel = entry.kind === 'static' ? 'static agent' : (entry.kind === 'reinstall' ? 'reinstalled agent' : 'dependent agent');
     if (entry.protocol === 'none') {
       console.log(`[start] Marking ${waitLabel} '${entry.label}' ready (no port-bound readiness probe).`);
+    } else if (entry.protocol === 'script') {
+      console.log(`[start] Waiting for ${waitLabel} '${entry.label}' to pass container script './${entry.scriptProbe.script}'...`);
     } else {
       console.log(`[start] Waiting for ${waitLabel} '${entry.label}' to become ready on port ${entry.route.hostPort}...`);
     }
@@ -422,7 +452,29 @@ async function waitForReadinessEntries(readinessEntries) {
       summarizeReadiness();
       return;
     }
-    const ready = await waitForAgentReady(entry.route, {
+    if (entry.protocol === 'script') {
+      const result = await Promise.resolve(runContainerScriptReadinessImpl(
+        entry.label,
+        entry.route.container,
+        entry.scriptProbe
+      ));
+      if (result?.status !== 'success') {
+        const reason = result?.reason || 'unknown failure';
+        const detail = result?.detail ? `, output='${result.detail}'` : '';
+        throw new Error(`${readinessKindLabel(entry)} '${entry.label}' failed readiness script './${entry.scriptProbe.script}' (${reason}${detail}).`);
+      }
+      readinessProgress.set(entry.key, {
+        elapsedMs: Date.now() - readinessStartAt,
+        ready: true,
+        stage: 'ready',
+        portOpen: false,
+        lastError: null
+      });
+      console.log(`[start] ${entry.label}: container script readiness passed.`);
+      summarizeReadiness({ force: true });
+      return;
+    }
+    const ready = await waitForAgentReadyImpl(entry.route, {
       timeoutMs: entry.timeoutMs,
       intervalMs: entry.intervalMs,
       probeTimeoutMs: entry.probeTimeoutMs,
@@ -439,7 +491,7 @@ async function waitForReadinessEntries(readinessEntries) {
       }
     });
     if (!ready) {
-      throw new Error(`${entry.kind === 'static' ? 'Static agent' : 'Dependent agent'} '${entry.label}' did not become ready within ${entry.timeoutMs}ms.`);
+      throw new Error(`${readinessKindLabel(entry)} '${entry.label}' did not become ready within ${entry.timeoutMs}ms.`);
     }
     const elapsedMs = Number(readinessProgress.get(entry.key)?.elapsedMs || 0);
     const elapsedSec = Math.floor(elapsedMs / 1000);
@@ -453,6 +505,28 @@ async function waitForReadinessEntries(readinessEntries) {
     console.log(`[start] ${entry.label}: ready after ${elapsedSec}s.`);
     summarizeReadiness({ force: true });
   }));
+}
+
+async function waitForManifestReadiness({ key, label, kind = 'dependency', manifest, route }, options = {}) {
+  try {
+    const node = {
+      id: key || label,
+      shortAgentName: label,
+      isStatic: kind === 'static',
+      manifest
+    };
+    const entry = buildBlockingReadinessEntryFromNode(node, route, label);
+    entry.kind = kind;
+    entry.label = label;
+    if (kind === 'reinstall' && entry.protocol !== 'script') {
+      Object.assign(entry, resolveManifestReadinessWaitOptions(manifest, 15000));
+    }
+    await waitForReadinessEntries([entry], options);
+  } catch (error) {
+    const readinessError = new Error(error?.message || String(error), { cause: error });
+    readinessError.code = 'PLOINKY_READINESS_FAILED';
+    throw readinessError;
+  }
 }
 
 async function startWorkspace(staticAgentArg, portArg, { refreshComponentToken, ensureComponentToken, enableAgent, killRouterIfRunning, branchPolicy } = {}) {
@@ -711,6 +785,10 @@ async function startWorkspace(staticAgentArg, portArg, { refreshComponentToken, 
             alias: rec.alias,
             routerPort: staticPort
           });
+          const executionMode = resolveAgentExecutionMode(manifest);
+          const resolvedHostPort = hostPort || (
+            executionMode.type === 'start_only' ? 0 : cfg.routes[routeKey]?.hostPort
+          );
           const nextRoute = {
             ...(cfg.routes[routeKey] || {}),
             container: containerName,
@@ -718,9 +796,10 @@ async function startWorkspace(staticAgentArg, portArg, { refreshComponentToken, 
             repo: repoName,
             agent: shortAgentName,
             ...(rec.alias ? { alias: rec.alias } : {}),
-            hostPort: hostPort || cfg.routes[routeKey]?.hostPort,
+            ...(resolvedHostPort ? { hostPort: resolvedHostPort } : {}),
             ...(additionalServerPort ? { additionalServerPort } : {})
           };
+          if (!resolvedHostPort) delete nextRoute.hostPort;
           if (!additionalServerPort) delete nextRoute.additionalServerPort;
           return {
             ok: true,
@@ -942,7 +1021,18 @@ async function runCli(agentName, args) {
     || registryRecord?.containerName
     || getAgentContainerName(shortAgentName, repoName);
   const readinessProtocol = resolveAgentReadinessProtocol(manifest);
-  if (readinessProtocol !== 'none') {
+  if (readinessProtocol === 'script') {
+    await waitForManifestReadiness({
+      key: `cli:${shortAgentName}`,
+      label: shortAgentName,
+      manifest,
+      route: {
+        container: containerName,
+        hostPort: containerInfo?.hostPort || 0,
+        ...(containerInfo?.additionalServerPort ? { additionalServerPort: containerInfo.additionalServerPort } : {})
+      }
+    });
+  } else if (readinessProtocol !== 'none') {
     const hostPort = containerInfo?.hostPort;
     if (!hostPort) {
       if (!suppressLauncherLogs) {
@@ -1110,11 +1200,21 @@ async function reinstallAgent(agentName) {
                 forceRecreate: true
             });
 
-            const readinessProtocol = resolveAgentReadinessProtocol(manifest);
-            if (!hostPort && readinessProtocol !== 'none') {
-                throw new Error(`Failed to resolve host port for restarted agent '${short}'.`);
-            }
             console.log(`[reinstall] reinstalled '${short}' [container: ${newContainerName}]`);
+            const repoName = path.basename(path.dirname(agentPath));
+            const routeKey = registryRecord?.record.alias || short;
+
+            await waitForManifestReadiness({
+                key: `reinstall:${routeKey}`,
+                label: short,
+                kind: 'reinstall',
+                manifest,
+                route: {
+                    container: newContainerName,
+                    hostPort: hostPort || 0,
+                    ...(additionalServerPort ? { additionalServerPort } : {})
+                }
+            });
 
             // Routing update logic from original restart command
             try {
@@ -1122,8 +1222,6 @@ async function reinstallAgent(agentName) {
             let cfg = { routes: {} };
             try { cfg = JSON.parse(fs.readFileSync(routingFile, 'utf8')) || { routes: {} }; } catch(_) {}
             cfg.routes = cfg.routes || {};
-            const repoName = path.basename(path.dirname(agentPath));
-            const routeKey = registryRecord?.record.alias || short;
             cfg.routes[routeKey] = cfg.routes[routeKey] || {};
             cfg.routes[routeKey].container = newContainerName;
             cfg.routes[routeKey].hostPath = agentPath;
@@ -1168,19 +1266,6 @@ async function reinstallAgent(agentName) {
             fs.mkdirSync(path.dirname(routingFile), { recursive: true });
             fs.writeFileSync(routingFile, JSON.stringify(cfg, null, 2));
 
-            if (readinessProtocol !== 'none') {
-                const readinessWait = resolveManifestReadinessWaitOptions(manifest, 15000);
-                const ready = await waitForAgentReady({ hostPort }, {
-                    timeoutMs: readinessWait.timeoutMs,
-                    intervalMs: readinessWait.intervalMs,
-                    probeTimeoutMs: readinessWait.probeTimeoutMs,
-                    protocol: readinessProtocol,
-                });
-                if (!ready) {
-                    console.error(`[reinstall] warning: agent '${short}' (host port ${hostPort}) is not ready yet; if requests 502, run 'ploinky restart'.`);
-                }
-            }
-
             const isRouterUp = (p) => {
                 try {
                     const out = execSync(`lsof -t -i :${p} -sTCP:LISTEN`, { stdio: 'pipe' }).toString().trim();
@@ -1208,11 +1293,14 @@ async function reinstallAgent(agentName) {
         });
     } catch (e) {
         console.error(`[reinstall] ${agentName}: ${e?.message||e}`);
+        if (e?.code === 'PLOINKY_READINESS_FAILED') throw e;
     }
 }
 
 export {
   buildBlockingReadinessEntryFromNode,
+  waitForManifestReadiness,
+  waitForReadinessEntries,
   startWorkspace,
   runCli,
   runShell,

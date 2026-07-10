@@ -667,11 +667,36 @@ export function parseStartArgs(rawArgs) {
     const args = (rawArgs || []).map(a => String(a));
     let staticAgent = null;
     let port = null;
+    let profile = null;
     const policyArgs = [];
     const positional = [];
 
+    const selectProfile = (value) => {
+        const normalized = String(value || '').trim().toLowerCase();
+        if (!normalized) {
+            throw new Error('--profile needs a value.');
+        }
+        if (profile && profile !== normalized) {
+            throw new Error(`Conflicting --profile values '${profile}' and '${normalized}'.`);
+        }
+        profile = normalized;
+    };
+
     for (let i = 0; i < args.length; i += 1) {
         const arg = args[i];
+        if (arg === '--profile') {
+            const value = args[i + 1];
+            if (value === undefined || value === '' || value.startsWith('--')) {
+                throw new Error('--profile needs a value.');
+            }
+            selectProfile(value);
+            i += 1;
+            continue;
+        }
+        if (arg.startsWith('--profile=')) {
+            selectProfile(arg.slice('--profile='.length));
+            continue;
+        }
         if (arg === '--branch' || arg === '--repo-branch' || arg === '--branch-fallback') {
             policyArgs.push(arg);
             if (i + 1 < args.length) policyArgs.push(args[++i]);
@@ -700,6 +725,7 @@ export function parseStartArgs(rawArgs) {
     return {
         staticAgent,
         port,
+        profile,
         branchPolicy: parseBranchPolicy(policyArgs),
     };
 }

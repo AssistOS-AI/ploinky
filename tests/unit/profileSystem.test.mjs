@@ -3,6 +3,8 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 
 const originalCwd = process.cwd();
 const originalMasterKey = process.env.PLOINKY_MASTER_KEY;
@@ -579,4 +581,40 @@ test('getProfileConfig falls back to default when agent has no matching semantic
 
     const config = getProfileConfig('semantic-fallback/agent-fallback', 'embedded');
     assert.deepStrictEqual(config.env, { PORT: '8042' });
+});
+
+test('start command rejects an invalid explicit profile before creating workspace start state', () => {
+    const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-start-profile-'));
+    const cliCommandsPath = fileURLToPath(new URL('../../cli/commands/cli.js', import.meta.url));
+    try {
+        const script = `
+            const { handleCommand } = await import(${JSON.stringify(new URL(`file://${cliCommandsPath}`).href)});
+            try {
+                await handleCommand(['start', 'explorer', '--profile', 'does-not-exist']);
+                console.log(JSON.stringify({ ok: true }));
+            } catch (error) {
+                console.log(JSON.stringify({ ok: false, message: error.message }));
+            }
+        `;
+        const result = spawnSync(process.execPath, ['--input-type=module', '-e', script], {
+            cwd: workspace,
+            encoding: 'utf8',
+            env: { ...process.env, PLOINKY_MASTER_KEY: '5'.repeat(64) },
+        });
+        assert.equal(result.status, 0, result.stderr || result.stdout);
+        const output = JSON.parse(result.stdout.trim().split('\n').at(-1));
+        assert.equal(output.ok, false);
+        assert.match(output.message, /Invalid profile 'does-not-exist'/);
+        assert.equal(fs.existsSync(path.join(workspace, '.ploinky', 'workspace.json')), false);
+    } finally {
+        fs.rmSync(workspace, { recursive: true, force: true });
+    }
+});
+
+test('public and in-box help use the canonical start profile form', () => {
+    const helpSource = fs.readFileSync(
+        fileURLToPath(new URL('../../cli/services/help.js', import.meta.url)),
+        'utf8',
+    );
+    assert.match(helpSource, /start <agent> \[port\] \[--profile <name>\]/);
 });

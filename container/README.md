@@ -8,8 +8,9 @@ run as nested containers *inside* the box; nothing they do touches the host
 filesystem.
 
 `ploinky` is the preferred public entrypoint when using this checkout. It runs
-normal Ploinky commands through the boxed runtime by default. `ploinky-box`
-remains as a compatibility and diagnostic command for the wrapper itself.
+normal Ploinky commands through the boxed runtime by default, with `ploinky
+destroy` reserved for host-side box teardown. `ploinky-box` remains as a
+diagnostic command for the wrapper itself.
 
 ## Quick start
 
@@ -61,19 +62,59 @@ The wrapper publishes host port `--port N` (default 8080) to **container port
 `[port]` (or `--port`) picks the HOST side, the router inside is always started
 on 8080.
 
-`ploinky start explorer` also publishes Explorer's default local
-browser/data-plane surfaces on host loopback: Web Publishing nginx `8081`,
-OnlyOffice `8082`, webtty `7681`, LiveKit signaling `7880`, LiveKit TCP `7881`,
-TURN `3478/tcp` and `3478/udp`, LiveKit UDP media `7882-7892/udp`, and TURN
-relay `20000-20010/udp`. These are loopback-only outer box publishes; use
-explicit `--publish` entries when you intentionally want different host
-addresses or ports.
+### Graph-driven Explorer publishes
+
+When the public wrapper starts Explorer, the outer box derives additional `-p`
+flags from the enabled Explorer graph instead of carrying an Explorer-specific
+port list. `explorer`, `AchillesIDE/explorer`, and
+`AssistOSExplorer/explorer` select the same graph.
+
+Each enabled agent's effective profile `openPorts` entries have two roles: they
+declare what that agent exposes into the box, and they make the corresponding
+box-side sockets eligible for publication through the outer box. A workspace
+profile applies across the graph; when a manifest does not define that profile,
+the planner uses that manifest's `default` profile. An explicit profile on an
+individual `enable` edge must exist on the child manifest or planning fails.
+
+`openPorts` is intentionally the only manifest field for default outer box
+publishes. Internal-only services, Redis, databases, MCP/control and application
+surfaces, private health and signaling listeners, identity providers, LLM APIs,
+document-server ports, and router-mediated HTTP services must not be listed in
+default `openPorts`.
+
+Generated graph claims are checked before box creation. Two claims may not
+overlap on the same box-side port or range and protocol, even when they declare
+different bind addresses; a failure identifies both owning agents, profiles,
+aliases, binds, and original declarations. An exact duplicate within the same
+effective graph node is emitted once.
+
+User-supplied `--publish` and `--expose` values remain authoritative engine
+syntax: the wrapper preserves each value byte-for-byte and in order. It parses
+only the terminal container port or range plus protocol into a canonical target
+for generated-claim suppression. When an explicit target overlaps a generated
+target for the same protocol, the whole generated claim is omitted; the
+explicit value is neither rewritten nor split.
+
+Web Publishing owns the default HTTP/WebSocket entrypoint through nginx on
+`127.0.0.1:8081:8081`. HTTP and WebSocket application surfaces such as router
+paths, OnlyOffice, WebTTY, and LiveKit signaling should flow through that
+consolidation layer. Nginx always binds port 8081 inside Web Publishing and a
+pristine zero-route configuration returns 404 through its default server.
+Deployment probes must use the generated external `ONLYOFFICE_PUBLIC_URL` and
+`WEBMEET_PUBLIC_LIVEKIT_URL` values, not direct host assumptions for private
+ports 8082 or 17000.
+
+LiveKit/TURN media-plane ports cannot be proxied by nginx and remain direct
+`openPorts` when the LiveKit server agent is enabled.
 
 Other in-box ports are unreachable from the host unless you publish them when
 creating the box. Use `--publish HOST:BOX` for a specific port, or use its alias
-`--expose HOST:BOX`; repeat either flag for more ports. Existing boxes keep their
-original port mappings; run `ploinky-box update` with the same flags, or recreate
-the box, when you add new published ports.
+`--expose HOST:BOX`; repeat either flag for more ports. Existing boxes keep the
+publish set they were created with. In particular, host port 8081 cannot be
+assumed when an earlier command created the box before a graph-aware Explorer
+start. Changing `openPorts` or `--profile` affects the desired run arguments for
+a newly created box only. Existing boxes are not reconciled; recreate the box to
+apply changed outer port mappings.
 
 ## Host-mounted core and the dependency volume
 
@@ -85,26 +126,29 @@ writable named volume `<instance>-ploinky-deps` mounted at
 `/opt/ploinky/node_modules`; host-side `node_modules` content is shadowed and
 never used in-box. `stop`/`update` keep the volume; `destroy` removes it.
 
-There is no direct-mode escape and no legacy env-var routing: on hosts
-`ploinky` always drives the box, and inside the box image the same `ploinky`
-script is the direct CLI. The preferred signal is the marker file
-`/etc/ploinky-box`, baked by the Dockerfile; older images that lack it are also
-recognized when the source is mounted at `/opt/ploinky` and the workspace is
-`/workspace`. For CLI development on the host without the box, run
+On hosts `ploinky` always drives the box, and inside the box image the same
+`ploinky` script is the direct CLI. The box image carries the marker file
+`/etc/ploinky-box`; the wrapper also bind-mounts the source-controlled
+`container/ploinky-box-marker` there so host-mounted source runs have the same
+runtime signal. For CLI development on the host without the box, run
 `node cli/index.js` from the checkout.
 
 ## Public `ploinky` Command
 
 Bare `ploinky ...` commands keep their existing Ploinky meaning and execute
-inside the box:
+inside the box, except `destroy`, which removes the selected outer box:
 
 ```bash
 ploinky start explorer
+ploinky start AchillesIDE/explorer --profile dev
 ploinky status
 ploinky stop
-ploinky destroy
 ploinky logs
 ploinky install ...
+```
+
+```bash
+ploinky destroy
 ```
 
 When the host Ploinky checkout is on a non-main branch, `ploinky start ...`
@@ -115,7 +159,14 @@ This keeps branch-scoped stacks reproducible from the ordinary command:
 `PLOINKY_BOX_BRANCH=<branch>` to force a branch for wrapper tests and scripted
 runs.
 
-Outer box lifecycle commands use the explicit `box` namespace:
+`ploinky start <agent> [port] [--profile <name>]` is the public profile boundary.
+The boxed entrypoint accepts `--profile <name>` or `--profile=<name>` anywhere
+in the start arguments and forwards the selected profile into the box. If it is
+omitted, the public boxed entrypoint selects and forwards `default`; a direct
+in-box `ploinky start` with no profile may instead retain the profile already
+stored in `.ploinky/profile`.
+
+Outer box lifecycle commands can also use the explicit `box` namespace:
 
 ```bash
 ploinky box status
@@ -124,20 +175,19 @@ ploinky box update
 ploinky box destroy
 ```
 
-`ploinky destroy` runs the normal in-box Ploinky destroy command. `ploinky box
-destroy` removes the outer container and the three named volumes for the selected
-instance.
+`ploinky destroy` and `ploinky box destroy` both remove the outer container and
+the three named volumes for the selected instance. They do not start the box and
+do not propagate an in-box `ploinky destroy`.
 
 Box selector flags such as `--name` and `--port` can appear before or after a
 public command. Put `--dry-run` before the command for wrapper dry-run; after
 the command it is forwarded to the in-box Ploinky CLI.
 
-## `ploinky-box` Compatibility Commands
+## `ploinky-box` Diagnostic Commands
 
 These commands remain available for direct wrapper diagnostics and standalone
 downloads; public users should prefer `ploinky ...` and `ploinky box ...`.
-This is the ploinky-box compatibility reference for scripts that still call the
-wrapper directly.
+This is the direct wrapper command reference.
 
 | Command | Effect |
 | --- | --- |
@@ -160,12 +210,14 @@ directory basename), `--port N`, `--publish SPEC`, `--expose SPEC`,
 
 ## Isolation contract
 
-The box runs **without `--privileged`**: `--user podman --device /dev/fuse
---device /dev/net/tun --security-opt seccomp=unconfined` (plus `label=disable` whenever the engine
-reports SELinux enabled — e.g. the podman-machine VM on macOS, even though the
-Mac itself has no SELinux). The only crossings of the boundary are: published ports
-(loopback-only unless `--listen-lan`), explicit `cp`, and the opt-in `--mount DIR`
-(bind-mounted read-write at `/workspace/mounted` — you are piercing the sandbox).
+The outer box runs with `--privileged` so nested Podman can create and attach
+manifest-declared named networks for private agent-to-agent service aliases. It
+still runs as the `podman` user inside the box and keeps host crossings explicit:
+published ports (loopback-only unless `--listen-lan`), explicit `cp`, and the
+opt-in `--mount DIR` (bind-mounted read-write at `/workspace/mounted` — you are
+piercing the sandbox). The wrapper also passes `/dev/fuse`, `/dev/net/tun`,
+`seccomp=unconfined`, and `label=disable` whenever the engine reports SELinux
+enabled.
 The ploinky source mount is read-only and is not a crossing: nothing in the box
 can write through it. State lives in three named volumes per instance:
 `<instance>-workspace` (the Ploinky workspace), `<instance>-containers` (nested

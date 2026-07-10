@@ -8,6 +8,7 @@ const {
     coercePositiveInteger,
     validateScriptName,
     normalizeProbeConfig,
+    runContainerScriptReadiness,
     computeBackoffDelay,
     maybeResetBackoff,
     getLivenessState
@@ -42,6 +43,7 @@ test('validateScriptName enforces agent-root scripts', () => {
     assert.equal(validateScriptName('liveness', 'check.sh'), 'check.sh');
     assert.throws(() => validateScriptName('liveness', '../evil.sh'));
     assert.throws(() => validateScriptName('readiness', 'nested/check.sh'));
+    assert.throws(() => validateScriptName('readiness', 'nested\\check.sh'));
 });
 
 test('normalizeProbeConfig applies defaults and ignores missing scripts', () => {
@@ -99,4 +101,93 @@ test('clearLivenessState fully resets container tracking', () => {
     const reset = getLivenessState(containerName);
     assert.equal(reset.retryCount, 0);
     assert.equal(reset.startedAt, null);
+});
+
+function fakeSpawnSequence(results, calls) {
+    return (_runtime, args, options) => {
+        calls.push({ args, options });
+        if (args.at(-1).startsWith('[ -f ')) {
+            return { status: 0, stdout: '', stderr: '' };
+        }
+        return results.shift() || { status: 0, stdout: 'ready\n', stderr: '' };
+    };
+}
+
+test('blocking container script readiness succeeds after the configured success threshold', () => {
+    const calls = [];
+    const result = runContainerScriptReadiness('database', 'database-container', {
+        script: 'healthcheck.sh',
+        interval: 0.001,
+        timeout: 2,
+        failureThreshold: 3,
+        successThreshold: 2,
+    }, {
+        runtime: 'fake-runtime',
+        spawnSyncImpl: fakeSpawnSequence([
+            { status: 0, stdout: 'warming\n', stderr: '' },
+            { status: 0, stdout: 'ready\n', stderr: '' },
+        ], calls),
+        sleepMsImpl() {},
+    });
+
+    assert.equal(result.status, 'success');
+    assert.equal(result.detail, 'ready');
+    assert.equal(calls.length, 3);
+    assert.deepEqual(calls[1].args, [
+        'exec', 'database-container', 'sh', '-lc', 'cd /code && sh "./healthcheck.sh"',
+    ]);
+    assert.equal(calls[1].options.timeout, 2000);
+});
+
+test('blocking container script readiness reports nonzero exhaustion', () => {
+    const calls = [];
+    const result = runContainerScriptReadiness('database', 'database-container', {
+        script: 'healthcheck.sh',
+        interval: 0.001,
+        timeout: 1,
+        failureThreshold: 2,
+    }, {
+        runtime: 'fake-runtime',
+        spawnSyncImpl: fakeSpawnSequence([
+            { status: 9, stdout: '', stderr: 'not ready\n' },
+            { status: 9, stdout: '', stderr: 'still not ready\n' },
+        ], calls),
+        sleepMsImpl() {},
+    });
+
+    assert.deepEqual(result, {
+        status: 'failed',
+        reason: 'exit 9',
+        detail: 'still not ready',
+    });
+});
+
+test('blocking container script readiness reports per-attempt execution timeout', () => {
+    const timeoutError = new Error('timed out');
+    timeoutError.code = 'ETIMEDOUT';
+    const result = runContainerScriptReadiness('database', 'database-container', {
+        script: 'healthcheck.sh',
+        timeout: 0.01,
+        failureThreshold: 1,
+    }, {
+        runtime: 'fake-runtime',
+        spawnSyncImpl: fakeSpawnSequence([
+            { status: null, signal: 'SIGTERM', error: timeoutError, stdout: '', stderr: '' },
+        ], []),
+        sleepMsImpl() {},
+    });
+
+    assert.deepEqual(result, { status: 'failed', reason: 'timeout', detail: '' });
+});
+
+test('blocking container script readiness fails fast when the script is missing', () => {
+    assert.throws(() => runContainerScriptReadiness('database', 'database-container', {
+        script: 'missing.sh',
+    }, {
+        runtime: 'fake-runtime',
+        spawnSyncImpl(_runtime, args) {
+            assert.ok(args.at(-1).startsWith('[ -f '));
+            return { status: 1 };
+        },
+    }), /missing\.sh not found inside container/);
 });

@@ -20,7 +20,8 @@ export function showHelp(args = []) {
   uninstall <name|url>           Uninstall repository and its enabled agents
   remove <name|url>              Alias for uninstall
   update [folderPath]            Update Ploinky, .ploinky/repos, Achilles deps, projects, and default skills
-  start [staticAgent] [port]     Start agents from .ploinky/agents.json and launch Router
+  start <agent> [port] [--profile <name>]
+                                 Start agents from .ploinky/agents.json and launch Router
   shell <agentName>              Open interactive shell in container (attached TTY)
   cli <agentName> [args...]      Run manifest "cli" command (attached TTY)
   webchat [--rotate]             Print the WebChat access URL and support agent URL params
@@ -289,9 +290,9 @@ function showDetailedHelp(topic, subtopic, subsubtopic) {
         },
         'start': {
             description: 'Start enabled agents and the local Router',
-            syntax: 'start [staticAgent] [port] [--branch <branch>] [--repo-branch <repo>=<branch>] [--branch-fallback default|fail] [--reset-repos]',
-            examples: [ 'start MyStaticAgent 8080', 'start', 'start explorer 8080 --branch my-feature' ],
-            notes: 'Reads manifest of static agent: applies repos{} (clone+enable) and enable[] (enable agents). First run needs agent and port. --branch <branch> applies best-effort to the static agent\'s repo, every manifest dependency repo, AND the achillesAgentLib used by agent containers — each uses that branch where it exists, else its default/pinned branch. --repo-branch <repo>=<branch> (repeatable) overrides a single repo; --branch-fallback <default|fail> (fail aborts when a targeted branch is missing); --reset-repos force-checks-out dirty repos. (Advanced escape hatch: export PLOINKY_AGENTLIB_REF=<branch|git+/file: spec> to override just the achillesAgentLib source.)'
+            syntax: 'start <agent> [port] [--profile <name>] [--branch <branch>] [--repo-branch <repo>=<branch>] [--branch-fallback default|fail] [--reset-repos]',
+            examples: [ 'start MyStaticAgent 8080 --profile dev', 'start explorer 8080 --profile prod --branch my-feature' ],
+            notes: 'Reads manifest of static agent: applies repos{} (clone+enable) and enable[] (enable agents). First run needs agent and port. An explicit --profile selects and persists the workspace profile before startup; direct in-box starts that omit it retain the active workspace profile. --branch <branch> applies best-effort to the static agent\'s repo, every manifest dependency repo, AND the achillesAgentLib used by agent containers — each uses that branch where it exists, else its default/pinned branch. --repo-branch <repo>=<branch> (repeatable) overrides a single repo; --branch-fallback <default|fail> (fail aborts when a targeted branch is missing); --reset-repos force-checks-out dirty repos. (Advanced escape hatch: export PLOINKY_AGENTLIB_REF=<branch|git+/file: spec> to override just the achillesAgentLib source.)'
         },
         'status': {
             description: 'Show enabled agents and router configuration',

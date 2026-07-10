@@ -1,8 +1,9 @@
 #!/usr/bin/env node
 // ploinky-box: run the Ploinky runtime isolated inside a rootless-podman container.
 // Host requirements: podman (preferred) or docker, plus Node >= 20.
-// Isolation contract: never --privileged; explicit crossings only (published
-// ports, `cp`, opt-in --mount).
+// Isolation contract: the outer box is privileged so nested Podman can run
+// named service networks; host crossings remain explicit (published ports,
+// `cp`, opt-in --mount).
 // All wrapper logic lives here; `container/ploinky-box` is a thin bash shim.
 import { spawn, spawnSync } from 'node:child_process';
 import net from 'node:net';
@@ -12,6 +13,8 @@ import path from 'node:path';
 import readline from 'node:readline';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { setTimeout as sleep } from 'node:timers/promises';
+import { planBoxPublishesForStart } from './box-publish-planner.mjs';
+import { intervalsOverlap, parseExplicitPublishSpec } from './publish-spec.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const DEFAULT_IMAGE = 'docker.io/assistos/ploinky-box:podman-node24';
@@ -19,22 +22,11 @@ const BOX_PREFIX = 'ploinky-box';
 const PUBLIC_ENTRYPOINT_ENV = 'PLOINKY_PUBLIC_ENTRYPOINT';
 const PUBLIC_PROGRAM = 'ploinky';
 const BOX_PROGRAM = 'ploinky-box';
+const BOX_MARKER_RELATIVE_PATH = path.join('container', 'ploinky-box-marker');
+const BOX_MARKER_CONTAINER_PATH = '/etc/ploinky-box';
 const BOX_COMMANDS = new Set(['up', 'start', 'cli', 'run', 'cp', 'status', 'logs', 'stop', 'update', 'destroy', 'help']);
 const BOX_COMMANDS_REJECT_REMOVED_FLAGS = new Set(['up', 'start', 'cli', 'status', 'logs', 'stop', 'update', 'destroy', 'help']);
 const REMOVED_BOX_FLAGS = new Set(['--webmeet-ports']);
-const EXPLORER_AGENT_NAME = 'explorer';
-const EXPLORER_START_PUBLISH_SPECS = Object.freeze([
-    '127.0.0.1:8081:8081',
-    '127.0.0.1:8082:8082',
-    '127.0.0.1:7681:7681',
-    '127.0.0.1:17000:17000',
-    '127.0.0.1:7880:7880',
-    '127.0.0.1:7881:7881',
-    '127.0.0.1:3478:3478/tcp',
-    '127.0.0.1:3478:3478/udp',
-    '127.0.0.1:7882-7892:7882-7892/udp',
-    '127.0.0.1:20000-20010:20000-20010/udp',
-]);
 let activeProgramName = BOX_PROGRAM;
 
 export function usageText(options = {}) {
@@ -45,14 +37,16 @@ export function usageText(options = {}) {
 Usage: ploinky [flags] [command] [args]
 
 Normal commands keep their existing Ploinky syntax and execute inside the box:
-  ploinky start <agent> [port]
+  ploinky start <agent> [port] [--profile <name>]
   ploinky status
   ploinky stop
-  ploinky destroy
   ploinky logs
   ploinky install ...
   ploinky list agents
   ploinky
+
+Host-side box lifecycle:
+  ploinky destroy
 
 Outer box lifecycle is explicit:
   ploinky box up
@@ -85,9 +79,9 @@ When the local Ploinky checkout is on a non-main branch, public
 \`ploinky start ...\` forwards that branch automatically unless explicit branch
 flags are supplied. Set PLOINKY_BOX_AUTO_BRANCH=0 to disable this.
 
-\`ploinky start explorer\` also publishes Explorer's local browser/data-plane
-ports on 127.0.0.1 by default, including Web Publishing, OnlyOffice, webtty, and
-LiveKit signaling/media/TURN ports.
+\`ploinky start explorer\` also derives selected host-to-box publishes from the
+enabled agents' active manifest openPorts, including Web Publishing and required
+LiveKit/TURN media-plane ports.
 `;
     }
     return `ploinky-box - run Ploinky isolated in a rootless-podman container
@@ -477,8 +471,10 @@ export function buildRunArgs(cfg, { selinux = false } = {}) {
     const instance = instanceName(cfg);
     const { workspace, containers, deps } = volumeNames(cfg);
     const source = cfg.sourceDirResolved || resolveHostPloinkySource();
+    const markerSource = path.join(source, BOX_MARKER_RELATIVE_PATH);
     const depsMountSuffix = cfg.engine === 'podman' ? ':U' : '';
     const args = ['run', '-d', '--init', '--name', instance,
+        '--privileged',
         '--user', 'podman',
         '--device', '/dev/fuse',
         '--device', '/dev/net/tun',
@@ -490,6 +486,7 @@ export function buildRunArgs(cfg, { selinux = false } = {}) {
         '-v', `${workspace}:/workspace`,
         '-v', `${containers}:/home/podman/.local/share/containers`,
         '-v', `${source}:/opt/ploinky:ro`,
+        '-v', `${markerSource}:${BOX_MARKER_CONTAINER_PATH}:ro`,
         '-v', `${deps}:/opt/ploinky/node_modules${depsMountSuffix}`,
         '-e', 'PLOINKY_WORKSPACE_ROOT=/workspace',
     );
@@ -499,32 +496,46 @@ export function buildRunArgs(cfg, { selinux = false } = {}) {
     return args;
 }
 
-function publishTarget(spec) {
-    const raw = String(spec || '').trim();
-    const slash = raw.indexOf('/');
-    const protocol = slash === -1 ? 'tcp' : raw.slice(slash + 1).toLowerCase();
-    const withoutProtocol = slash === -1 ? raw : raw.slice(0, slash);
-    const containerPort = withoutProtocol.split(':').at(-1) || '';
-    return `${containerPort}/${protocol || 'tcp'}`;
-}
-
-function appendDefaultPublishes(cfg, specs) {
-    const exact = new Set(cfg.publish);
-    const targets = new Set(cfg.publish.map((spec) => publishTarget(spec)));
-    for (const spec of specs) {
-        const target = publishTarget(spec);
-        if (exact.has(spec) || targets.has(target)) continue;
-        cfg.publish.push(spec);
-        exact.add(spec);
-        targets.add(target);
+function validatePublishSpecs(cfg) {
+    for (const spec of cfg.publish) {
+        try {
+            parseExplicitPublishSpec(spec);
+        } catch (error) {
+            die(`invalid --publish '${spec}': ${error?.message || error}`);
+        }
     }
 }
 
-function appendExplorerStartPublishes(cfg, startPlan, env = process.env) {
-    const disabled = String(env?.PLOINKY_BOX_EXPLORER_PORTS || '').trim().toLowerCase();
-    if (disabled === '0' || disabled === 'false' || disabled === 'no') return;
-    if (startPlan?.agent !== EXPLORER_AGENT_NAME) return;
-    appendDefaultPublishes(cfg, EXPLORER_START_PUBLISH_SPECS);
+function validateHostPort(value, label) {
+    const raw = String(value || '').trim();
+    if (!/^\d+$/.test(raw)) {
+        die(`${label} must be a number, got '${value}'`);
+    }
+    const port = Number.parseInt(raw, 10);
+    if (!Number.isInteger(port) || port < 1 || port > 65535) {
+        die(`${label} must be between 1 and 65535, got '${value}'`);
+    }
+}
+
+function appendDefaultPublishes(cfg, specs) {
+    const explicitClaims = cfg.publish.map((spec) => parseExplicitPublishSpec(spec));
+    for (const spec of specs) {
+        const generated = parseExplicitPublishSpec(spec);
+        const overlapsExplicit = explicitClaims.some((explicit) => (
+            explicit.protocol === generated.protocol
+            && intervalsOverlap(explicit.containerTarget, generated.containerTarget)
+        ));
+        if (overlapsExplicit) continue;
+        cfg.publish.push(spec);
+    }
+}
+
+function appendGraphDrivenStartPublishes(cfg, startPlan) {
+    const planned = planBoxPublishesForStart({
+        startPlan,
+        sourceDir: cfg.sourceDirResolved || resolveHostPloinkySource(),
+    });
+    appendDefaultPublishes(cfg, planned.publishes);
 }
 
 function ensureImage(cfg) {
@@ -568,7 +579,7 @@ async function waitHealthy(cfg) {
         if (state === 'exited') {
             process.stderr.write(`ploinky-box: '${instance}' failed its self-check:\n`);
             await streamEngineToStderr(cfg, ['logs', instance]);
-            die('fix the reported cause; do NOT fall back to --privileged');
+            die('fix the reported cause; inspect the privileged box runtime before retrying');
         }
         await sleep(1000);
     }
@@ -652,6 +663,8 @@ function askLine(promptText) {
 }
 
 async function cmdUp(cfg, { fatalOnDepsDecline = false } = {}) {
+    validateHostPort(cfg.port, `${cfg.command || 'up'}: host port`);
+    validatePublishSpecs(cfg);
     preflight(cfg);
     if (!cfg.dryRun && boxRunning(cfg)) {
         process.stdout.write(`ploinky-box: '${instanceName(cfg)}' already running.\n`);
@@ -688,14 +701,37 @@ async function probeRouter(port, attempts = 30) {
 
 function splitPublicStartArgs(args, options = {}) {
     const raw = args.map((entry) => String(entry));
-    if (raw.length === 0) {
-        return { hasAgent: false, agent: '', hostPort: '', inBoxArgs: ['start'] };
-    }
     let agent = '';
     let hostPort = '';
+    let profile = 'default';
+    let profileWasExplicit = false;
     const passthrough = [];
+    const selectProfile = (value) => {
+        const normalized = String(value || '').trim().toLowerCase();
+        if (!normalized) {
+            die('start: --profile needs a value');
+        }
+        if (profileWasExplicit && profile !== normalized) {
+            die(`start: conflicting profiles '${profile}' and '${normalized}'; give --profile once`);
+        }
+        profile = normalized;
+        profileWasExplicit = true;
+    };
     for (let i = 0; i < raw.length; i += 1) {
         const arg = raw[i];
+        if (arg === '--profile') {
+            const value = raw[i + 1];
+            if (value === undefined || value === '' || value.startsWith('--')) {
+                die('start: --profile needs a value');
+            }
+            selectProfile(value);
+            i += 1;
+            continue;
+        }
+        if (arg.startsWith('--profile=')) {
+            selectProfile(arg.slice('--profile='.length));
+            continue;
+        }
         if (arg === '--branch' || arg === '--repo-branch' || arg === '--branch-fallback') {
             passthrough.push(arg);
             if (i + 1 < raw.length) passthrough.push(raw[++i]);
@@ -723,11 +759,23 @@ function splitPublicStartArgs(args, options = {}) {
         }
         passthrough.push(arg);
     }
-    if (!agent) {
-        return { hasAgent: false, agent: '', hostPort: '', inBoxArgs: ['start', ...raw] };
-    }
     const implicitBranchArgs = inferPublicStartBranchArgs(raw, options.env || process.env, options.sourceDir || '');
-    return { hasAgent: true, agent, hostPort, inBoxArgs: ['start', agent, '8080', ...passthrough, ...implicitBranchArgs] };
+    if (!agent) {
+        return {
+            hasAgent: false,
+            agent: '',
+            hostPort: '',
+            profile,
+            inBoxArgs: ['start', '--profile', profile, ...passthrough, ...implicitBranchArgs],
+        };
+    }
+    return {
+        hasAgent: true,
+        agent,
+        hostPort,
+        profile,
+        inBoxArgs: ['start', agent, '8080', '--profile', profile, ...passthrough, ...implicitBranchArgs],
+    };
 }
 
 // start <agent> [port]: up + in-box `ploinky start <agent> 8080` + router
@@ -758,8 +806,9 @@ async function cmdStart(cfg, options = {}) {
         }
         cfg.port = startPlan.hostPort;
     }
-    if (!/^\d+$/.test(cfg.port)) die(`start: host port must be a number, got '${cfg.port}'`);
-    if (publicEntrypoint) appendExplorerStartPublishes(cfg, startPlan);
+    validateHostPort(cfg.port, 'start: host port');
+    validatePublishSpecs(cfg);
+    if (publicEntrypoint) appendGraphDrivenStartPublishes(cfg, startPlan);
     await cmdUp(cfg, { fatalOnDepsDecline: publicEntrypoint });
     const published = cfg.dryRun ? cfg.port : (hostPort(cfg) || cfg.port);
     if (!cfg.dryRun && published !== cfg.port) {
@@ -845,6 +894,8 @@ function cmdStop(cfg) {
 }
 
 async function cmdUpdate(cfg) {
+    validateHostPort(cfg.port, 'update: host port');
+    validatePublishSpecs(cfg);
     preflight(cfg);
     runEngine(cfg, ['pull', cfg.image]);
     if (boxExists(cfg)) {
@@ -970,6 +1021,10 @@ async function runPublicCommand(cfg) {
     if (removed) die(`unknown command '${removed}' (see: ${boxHelpTarget()})`);
     detectEngine(cfg);
     resolveInstanceIdentity(cfg);
+    if (cfg.command === 'destroy') {
+        await cmdDestroy(cfg);
+        return;
+    }
     if (!cfg.command) {
         await cmdUp(cfg, { fatalOnDepsDecline: true });
         cmdCli(cfg);

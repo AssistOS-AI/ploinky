@@ -85,6 +85,19 @@ function publicRun(engine, ...args) {
     return { out: `${r.stdout ?? ''}${r.stderr ?? ''}`, status: r.status };
 }
 
+function publicRunWithEnv(extraEnv, engine, ...args) {
+    const r = spawnSync(MJS, args, {
+        encoding: 'utf8',
+        env: {
+            ...process.env,
+            ...extraEnv,
+            PLOINKY_BOX_ENGINE: engine,
+            PLOINKY_PUBLIC_ENTRYPOINT: '1',
+        },
+    });
+    return { out: `${r.stdout ?? ''}${r.stderr ?? ''}`, status: r.status };
+}
+
 function publicRunIn(cwd, engine, ...args) {
     const r = spawnSync(MJS, args, {
         cwd,
@@ -113,6 +126,90 @@ function checkAbsent(out, needle, description) {
 
 function countOccurrences(out, needle) {
     return out.split(needle).length - 1;
+}
+
+function makeFakePloinkyGraphSource({
+    webPublishingOpenPorts = ['127.0.0.1:8081:8081'],
+    webPublishingProfiles = null,
+} = {}) {
+    const workspaceRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-graph-source-'));
+    const sourceDir = path.join(workspaceRoot, 'ploinky');
+    fs.mkdirSync(path.join(sourceDir, 'bin'), { recursive: true });
+    fs.mkdirSync(path.join(sourceDir, 'cli'), { recursive: true });
+    fs.mkdirSync(path.join(sourceDir, 'container'), { recursive: true });
+    fs.mkdirSync(path.join(sourceDir, 'globalDeps'), { recursive: true });
+    fs.writeFileSync(path.join(sourceDir, 'bin', 'ploinky'), '#!/usr/bin/env bash\n');
+    fs.writeFileSync(path.join(sourceDir, 'cli', 'index.js'), '');
+    fs.writeFileSync(path.join(sourceDir, 'container', 'ploinky-box-marker'), 'assistos/ploinky-box\n');
+    fs.writeFileSync(path.join(sourceDir, 'globalDeps', 'package.json'), '{"name":"globalDeps"}\n');
+
+    function writeManifest(repoDir, agentName, manifest) {
+        const agentDir = path.join(workspaceRoot, repoDir, agentName);
+        fs.mkdirSync(agentDir, { recursive: true });
+        fs.writeFileSync(path.join(agentDir, 'manifest.json'), JSON.stringify(manifest, null, 2));
+    }
+
+    writeManifest('AssistOSExplorer', 'explorer', {
+        enable: [
+            'basic/webtty global',
+            'webmeetInfra/liveKitServerAgent no-wait',
+            'onlyOffice global no-wait',
+        ],
+        profiles: {
+            default: {
+                enable: [
+                    {
+                        agent: 'basic/web-publishing global',
+                    },
+                ],
+            },
+        },
+    });
+    writeManifest('basic', 'web-publishing', {
+        profiles: webPublishingProfiles || {
+            default: {
+                openPorts: webPublishingOpenPorts,
+            },
+        },
+    });
+    writeManifest('basic', 'webtty', {
+        profiles: {
+            default: {
+                env: {
+                    PORT: { default: '7681' },
+                },
+            },
+        },
+    });
+    writeManifest('AssistOSExplorer', 'onlyOffice', {
+        profiles: {
+            default: {
+                env: [
+                    { name: 'ONLYOFFICE_JWT_SECRET', required: true },
+                ],
+            },
+        },
+    });
+    writeManifest('webmeetInfra', 'liveKitServerAgent', {
+        profiles: {
+            default: {
+                openPorts: [
+                    '127.0.0.1:7881:7881',
+                    '127.0.0.1:3478:3478/tcp',
+                    '127.0.0.1:3478:3478/udp',
+                    '127.0.0.1:7882-7892:7882-7892/udp',
+                    '127.0.0.1:20000-20010:20000-20010/udp',
+                ],
+            },
+        },
+    });
+
+    return {
+        sourceDir,
+        cleanup() {
+            fs.rmSync(workspaceRoot, { recursive: true, force: true });
+        },
+    };
 }
 
 // Fake checkout + fake npm: asserts the exact install flags and that the
@@ -306,7 +403,8 @@ test('inferred up: cwd basename drives names; isolation contract holds', () => {
         const { out } = boxRunIn(dir, 'podman', '--dry-run', 'up');
         checkIncludes(out, 'DRY-RUN: podman', 'inferred up uses podman');
         checkIncludes(out, '--name ploinky-box-testExplorerFresh', 'cwd basename names the instance');
-        checkIncludes(out, '--user podman', 'inferred up runs rootless user');
+        checkIncludes(out, '--privileged', 'inferred up grants nested podman networking');
+        checkIncludes(out, '--user podman', 'inferred up runs as the podman user inside the box');
         checkIncludes(out, '--device /dev/fuse', 'inferred up passes /dev/fuse');
         checkIncludes(out, '--device /dev/net/tun', 'inferred up passes /dev/net/tun');
         checkIncludes(out, 'seccomp=unconfined', 'inferred up unconfines seccomp');
@@ -314,11 +412,11 @@ test('inferred up: cwd basename drives names; isolation contract holds', () => {
         checkIncludes(out, 'ploinky-box-testExplorerFresh-workspace:/workspace', 'inferred up mounts workspace volume');
         checkIncludes(out, 'ploinky-box-testExplorerFresh-containers:/home/podman/.local/share/containers', 'inferred up mounts containers volume');
         checkIncludes(out, `-v ${path.resolve(HERE, '..')}:/opt/ploinky:ro`, 'inferred up mounts the host checkout read-only');
+        checkIncludes(out, `-v ${path.resolve(HERE, '..', 'container', 'ploinky-box-marker')}:/etc/ploinky-box:ro`, 'inferred up supplies the box marker file');
         checkIncludes(out, 'ploinky-box-testExplorerFresh-ploinky-deps:/opt/ploinky/node_modules:U', 'inferred up mounts the writable deps volume');
         checkAbsent(out, 'PLOINKY_BOX=', 'in-box routing uses the image marker file, not an env var');
         checkIncludes(out, 'docker.io/assistos/ploinky-box:podman-node24', 'inferred up uses default image');
         checkIncludes(out, '--init', 'inferred up reaps zombies');
-        checkAbsent(out, '--privileged', 'no --privileged, ever');
     } finally {
         fs.rmSync(parent, { recursive: true, force: true });
     }
@@ -331,7 +429,7 @@ test('named up: docker engine, instance prefixes, LAN bind', () => {
     checkIncludes(out, 'ploinky-box-qa-workspace:/workspace', 'named up prefixes volumes');
     checkIncludes(out, 'ploinky-box-qa-ploinky-deps:/opt/ploinky/node_modules', 'named up mounts deps volume');
     checkIncludes(out, '0.0.0.0:9090:8080', 'lan flag binds all interfaces');
-    checkAbsent(out, '--privileged', 'named up still not privileged');
+    checkIncludes(out, '--privileged', 'named up grants nested podman networking');
 });
 
 test('image override respected', () => {
@@ -550,9 +648,26 @@ test('up dies with guidance when PLOINKY_BOX_SOURCE is not a ploinky checkout', 
 });
 
 test('parseCli: repeatable --publish and --expose accumulate in order', () => {
-    const cfg = parseCli(['--publish', 'a:1:1', '--expose', 'b:2:2', '--publish', 'c:3:3', 'up'], {});
-    assert.deepEqual(cfg.publish, ['a:1:1', 'b:2:2', 'c:3:3']);
+    const cfg = parseCli([
+        '--publish', '127.0.0.1:1:1',
+        '--expose', '127.0.0.1:2:2',
+        '--publish', '127.0.0.1:3:3',
+        'up',
+    ], {});
+    assert.deepEqual(cfg.publish, ['127.0.0.1:1:1', '127.0.0.1:2:2', '127.0.0.1:3:3']);
     assert.equal(Object.hasOwn(cfg, 'webmeetPorts'), false);
+});
+
+test('up rejects explicit publishes outside the TCP and UDP range', () => {
+    const { out, status } = boxRun(
+        'podman',
+        '--name', 'qa',
+        '--dry-run',
+        '--publish', '0.0.0.0:70000:70000',
+        'up',
+    );
+    assert.equal(status, 1, out);
+    checkIncludes(out, "invalid --publish '0.0.0.0:70000:70000'", 'invalid publish is rejected');
 });
 
 test('instance and volume naming', () => {
@@ -581,13 +696,14 @@ test('buildRunArgs: selinux label only when the engine reports it; image is last
     assert.ok(!plain.join(' ').includes('label=disable'));
     assert.ok(labeled.join(' ').includes('--security-opt label=disable'));
     assert.equal(plain[plain.length - 1], 'docker.io/assistos/ploinky-box:podman-node24');
-    assert.ok(!plain.includes('--privileged'));
+    assert.ok(plain.includes('--privileged'));
 });
 
 test('buildRunArgs: read-only source mount plus writable deps volume', () => {
     const podmanCfg = parseCli(['--engine', 'podman', 'up'], {});
     const podmanArgs = buildRunArgs(podmanCfg, { selinux: false }).join(' ');
     assert.ok(podmanArgs.includes(`-v ${REPO_ROOT}:/opt/ploinky:ro`), podmanArgs);
+    assert.ok(podmanArgs.includes(`-v ${path.join(REPO_ROOT, 'container', 'ploinky-box-marker')}:/etc/ploinky-box:ro`), podmanArgs);
     assert.ok(podmanArgs.includes('-ploinky-deps:/opt/ploinky/node_modules:U'), podmanArgs);
     assert.ok(!podmanArgs.includes('/workspace:ro'), 'workspace stays writable');
     assert.ok(!podmanArgs.includes('PLOINKY_BOX='), 'no PLOINKY_BOX env injection');
@@ -684,6 +800,7 @@ test('public usage describes ploinky and box namespace', () => {
     assert.equal(r.status, 0, r.stderr);
     assert.ok(r.stdout.includes('Usage: ploinky [flags] [command] [args]'), r.stdout);
     assert.ok(r.stdout.includes('ploinky box status'), r.stdout);
+    assert.ok(r.stdout.includes('ploinky start <agent> [port] [--profile <name>]'), r.stdout);
     assert.ok(r.stdout.includes('--expose SPEC'), r.stdout);
     assert.ok(!r.stdout.includes('--webmeet-ports'), r.stdout);
     assert.ok(!r.stdout.includes('PLOINKY_DIRECT'), r.stdout);
@@ -735,20 +852,22 @@ test('public status routes to in-box ploinky status, not outer box status', () =
     }
 });
 
-test('public destroy routes to in-box ploinky destroy, not outer volume removal', () => {
+test('public destroy targets the outer volume destroy command', () => {
     const { out, status } = publicRun('podman', '--name', 'qa', '--dry-run', 'destroy');
     assert.equal(status, 0, out);
-    checkIncludes(out, 'exec -w /workspace ploinky-box-qa ploinky destroy', 'public destroy runs in-box destroy');
-    checkAbsent(out, 'volume rm ploinky-box-qa-workspace', 'public destroy does not remove outer volumes');
+    checkIncludes(out, 'volume rm ploinky-box-qa-workspace ploinky-box-qa-containers ploinky-box-qa-ploinky-deps', 'public destroy removes outer volumes');
+    checkIncludes(out, "'ploinky-box-qa' and its volumes removed.", 'public destroy uses outer destroy behavior');
+    checkAbsent(out, 'DRY-RUN: podman run -d', 'public destroy does not create/start the box first');
+    checkAbsent(out, 'exec -w /workspace ploinky-box-qa ploinky destroy', 'public destroy does not run in-box destroy');
 });
 
-test('public destroy honors --name after the command without forwarding it in-box', () => {
+test('public destroy honors --name after the command for the outer box', () => {
     const { out, status } = publicRun('podman', '--dry-run', 'destroy', '--name', 'qa');
     assert.equal(status, 0, out);
-    checkIncludes(out, '--name ploinky-box-qa', 'post-command --name selects the outer box instance');
-    checkIncludes(out, 'exec -w /workspace ploinky-box-qa ploinky destroy', 'post-command --name still runs in-box destroy');
-    checkAbsent(out, 'ploinky destroy --name qa', 'post-command --name is not forwarded as a misleading in-box arg');
-    checkAbsent(out, 'volume rm ploinky-box-qa-workspace', 'public destroy does not remove outer volumes');
+    checkIncludes(out, 'volume rm ploinky-box-qa-workspace ploinky-box-qa-containers ploinky-box-qa-ploinky-deps', 'post-command --name selects outer volumes');
+    checkIncludes(out, "'ploinky-box-qa' and its volumes removed.", 'post-command --name uses outer destroy behavior');
+    checkAbsent(out, 'ploinky destroy --name qa', 'post-command --name is not forwarded in-box');
+    checkAbsent(out, 'exec -w /workspace ploinky-box-qa ploinky destroy', 'post-command --name does not run in-box destroy');
 });
 
 test('public box status targets the outer box status command', () => {
@@ -783,58 +902,81 @@ test('public no-arg command opens in-box p-cli', () => {
 });
 
 test('public start preserves branch flags while forcing in-box router to 8080', () => {
-    const { out, status } = publicRun(
-        'podman',
-        '--name', 'qa',
-        '--dry-run',
-        'start', 'explorer',
-        '--branch', 'feature-x',
-        '9191',
-        '--repo-branch', 'AssistOSExplorer=peristo-user',
-        '--branch-fallback', 'fail',
-    );
-    assert.equal(status, 0, out);
-    checkIncludes(out, '127.0.0.1:9191:8080', 'public start positional port is host port');
-    checkIncludes(
-        out,
-        'exec -w /workspace ploinky-box-qa ploinky start explorer 8080 --branch feature-x --repo-branch AssistOSExplorer=peristo-user --branch-fallback fail',
-        'public start forwards branch flags after in-box port',
-    );
-    checkAbsent(out, 'ploinky start explorer 9191', 'public start never uses host port inside');
+    const source = makeFakePloinkyGraphSource();
+    try {
+        const { out, status } = publicRunWithEnv(
+            { PLOINKY_BOX_SOURCE: source.sourceDir },
+            'podman',
+            '--name', 'qa',
+            '--dry-run',
+            'start', 'explorer',
+            '--branch', 'feature-x',
+            '9191',
+            '--repo-branch', 'AssistOSExplorer=peristo-user',
+            '--branch-fallback', 'fail',
+        );
+        assert.equal(status, 0, out);
+        checkIncludes(out, '127.0.0.1:9191:8080', 'public start positional port is host port');
+        checkIncludes(
+            out,
+            'exec -w /workspace ploinky-box-qa ploinky start explorer 8080 --profile default --branch feature-x --repo-branch AssistOSExplorer=peristo-user --branch-fallback fail',
+            'public start forwards branch flags after in-box port',
+        );
+        checkAbsent(out, 'ploinky start explorer 9191', 'public start never uses host port inside');
+    } finally {
+        source.cleanup();
+    }
 });
 
 test('public start forwards inferred source branch when no branch flag is supplied', () => {
-    const r = spawnSync(MJS, ['--name', 'qa', '--dry-run', 'start', 'explorer'], {
-        encoding: 'utf8',
-        env: {
-            ...process.env,
-            PLOINKY_BOX_ENGINE: 'podman',
-            PLOINKY_PUBLIC_ENTRYPOINT: '1',
-            PLOINKY_BOX_BRANCH: 'feature-default',
-        },
-    });
-    const out = `${r.stdout ?? ''}${r.stderr ?? ''}`;
-    assert.equal(r.status, 0, out);
-    checkIncludes(
-        out,
-        'exec -w /workspace ploinky-box-qa ploinky start explorer 8080 --branch feature-default',
-        'public start appends the inferred branch after the fixed in-box port',
-    );
+    const source = makeFakePloinkyGraphSource();
+    try {
+        const { out, status } = publicRunWithEnv(
+            {
+                PLOINKY_BOX_BRANCH: 'feature-default',
+                PLOINKY_BOX_SOURCE: source.sourceDir,
+            },
+            'podman',
+            '--name', 'qa',
+            '--dry-run',
+            'start', 'explorer',
+        );
+        assert.equal(status, 0, out);
+        checkIncludes(
+            out,
+            'exec -w /workspace ploinky-box-qa ploinky start explorer 8080 --profile default --branch feature-default',
+            'public start appends the inferred branch after the fixed in-box port',
+        );
+    } finally {
+        source.cleanup();
+    }
 });
 
-test('public start explorer publishes the default Explorer local data-plane ports', () => {
-    const { out, status } = publicRun('podman', '--name', 'qa', '--dry-run', 'start', 'explorer');
-    assert.equal(status, 0, out);
-    checkIncludes(out, '-p 127.0.0.1:8081:8081', 'Explorer start publishes Web Publishing nginx');
-    checkIncludes(out, '-p 127.0.0.1:8082:8082', 'Explorer start publishes OnlyOffice editor');
-    checkIncludes(out, '-p 127.0.0.1:7681:7681', 'Explorer start publishes webtty');
-    checkIncludes(out, '-p 127.0.0.1:17000:17000', 'Explorer start publishes LiveKit health');
-    checkIncludes(out, '-p 127.0.0.1:7880:7880', 'Explorer start publishes LiveKit signaling');
-    checkIncludes(out, '-p 127.0.0.1:3478:3478/tcp', 'Explorer start publishes TURN TCP');
-    checkIncludes(out, '-p 127.0.0.1:3478:3478/udp', 'Explorer start publishes TURN UDP');
-    checkIncludes(out, '-p 127.0.0.1:7882-7892:7882-7892/udp', 'Explorer start publishes LiveKit UDP media range');
-    checkIncludes(out, '-p 127.0.0.1:20000-20010:20000-20010/udp', 'Explorer start publishes TURN relay range');
-    checkAbsent(out, '-p 127.0.0.1:6379:6379', 'Explorer start does not publish Redis by default');
+test('public start explorer publishes graph-derived openPorts only', () => {
+    const source = makeFakePloinkyGraphSource();
+    try {
+        const { out, status } = publicRunWithEnv(
+            { PLOINKY_BOX_SOURCE: source.sourceDir },
+            'podman',
+            '--name', 'qa',
+            '--dry-run',
+            'start', 'explorer',
+        );
+        assert.equal(status, 0, out);
+        checkIncludes(out, '-p 127.0.0.1:8081:8081', 'Explorer start publishes Web Publishing nginx');
+        checkIncludes(out, '-p 127.0.0.1:7881:7881', 'Explorer start publishes LiveKit direct TCP media-plane port');
+        checkIncludes(out, '-p 127.0.0.1:3478:3478', 'Explorer start publishes TURN TCP');
+        checkIncludes(out, '-p 127.0.0.1:3478:3478/udp', 'Explorer start publishes TURN UDP');
+        checkIncludes(out, '-p 127.0.0.1:7882-7892:7882-7892/udp', 'Explorer start publishes LiveKit UDP media range');
+        checkIncludes(out, '-p 127.0.0.1:20000-20010:20000-20010/udp', 'Explorer start publishes TURN relay range');
+        checkAbsent(out, '-p 127.0.0.1:8082:8082', 'Explorer start does not publish OnlyOffice directly');
+        checkAbsent(out, '-p 127.0.0.1:7681:7681', 'Explorer start does not publish webtty directly');
+        checkAbsent(out, '-p 127.0.0.1:17000:17000', 'Explorer start does not publish LiveKit health directly');
+        checkAbsent(out, '-p 127.0.0.1:7880:7880', 'Explorer start does not publish LiveKit signaling directly');
+        checkAbsent(out, '-p 127.0.0.1:6379:6379', 'Explorer start does not publish Redis by default');
+    } finally {
+        source.cleanup();
+    }
 });
 
 test('public start only adds Explorer default publishes for the explorer agent', () => {
@@ -846,45 +988,317 @@ test('public start only adds Explorer default publishes for the explorer agent',
 });
 
 test('public start explorer preserves explicit publishes and skips conflicting defaults', () => {
-    const { out, status } = publicRun(
-        'podman',
-        '--name', 'qa',
-        '--dry-run',
-        '--publish', '0.0.0.0:7880:7880',
-        'start', 'explorer',
-    );
-    assert.equal(status, 0, out);
-    checkIncludes(out, '-p 0.0.0.0:7880:7880', 'explicit LiveKit publish is preserved');
-    checkAbsent(out, '-p 127.0.0.1:7880:7880', 'default LiveKit publish is skipped for the same target');
-    checkIncludes(out, '-p 127.0.0.1:7881:7881', 'other Explorer defaults are still added');
+    const source = makeFakePloinkyGraphSource();
+    try {
+        const { out, status } = publicRunWithEnv(
+            { PLOINKY_BOX_SOURCE: source.sourceDir },
+            'podman',
+            '--name', 'qa',
+            '--dry-run',
+            '--publish', '0.0.0.0:3478:3478/udp',
+            'start', 'explorer',
+        );
+        assert.equal(status, 0, out);
+        checkIncludes(out, '-p 0.0.0.0:3478:3478/udp', 'explicit TURN UDP publish is preserved');
+        checkAbsent(out, '-p 127.0.0.1:3478:3478/udp', 'derived TURN UDP publish is skipped for the same target');
+        checkIncludes(out, '-p 127.0.0.1:3478:3478', 'same port with a different protocol is still added');
+    } finally {
+        source.cleanup();
+    }
 });
 
 test('public start explorer does not duplicate an exact explicit default publish', () => {
-    const { out, status } = publicRun(
-        'podman',
-        '--name', 'qa',
-        '--dry-run',
-        '--publish', '127.0.0.1:7880:7880',
-        'start', 'explorer',
-    );
-    assert.equal(status, 0, out);
-    assert.equal(countOccurrences(out, '-p 127.0.0.1:7880:7880'), 1, out);
+    const source = makeFakePloinkyGraphSource();
+    try {
+        const { out, status } = publicRunWithEnv(
+            { PLOINKY_BOX_SOURCE: source.sourceDir },
+            'podman',
+            '--name', 'qa',
+            '--dry-run',
+            '--publish', '127.0.0.1:3478:3478/udp',
+            'start', 'explorer',
+        );
+        assert.equal(status, 0, out);
+        assert.equal(countOccurrences(out, '-p 127.0.0.1:3478:3478/udp'), 1, out);
+    } finally {
+        source.cleanup();
+    }
+});
+
+test('public start preserves every supported explicit publish form and suppresses the canonical TCP target', () => {
+    const cases = [
+        '8081',
+        '18081:8081',
+        '127.0.0.1:18081:8081',
+    ];
+    for (const explicit of cases) {
+        const source = makeFakePloinkyGraphSource();
+        try {
+            const { out, status } = publicRunWithEnv(
+                { PLOINKY_BOX_SOURCE: source.sourceDir },
+                'podman',
+                '--name', 'qa',
+                '--dry-run',
+                '--publish', explicit,
+                'start', 'explorer',
+            );
+            assert.equal(status, 0, out);
+            checkIncludes(out, `-p ${explicit}`, `explicit publish '${explicit}' is passed through byte-for-byte`);
+            checkAbsent(out, '-p 127.0.0.1:8081:8081', `explicit publish '${explicit}' suppresses generated 8081/tcp`);
+        } finally {
+            source.cleanup();
+        }
+    }
+});
+
+test('public start preserves an engine protocol outside the manifest TCP/UDP policy', () => {
+    const source = makeFakePloinkyGraphSource();
+    try {
+        const explicit = '127.0.0.1:18081:8081/sctp';
+        const { out, status } = publicRunWithEnv(
+            { PLOINKY_BOX_SOURCE: source.sourceDir },
+            'podman',
+            '--name', 'qa',
+            '--dry-run',
+            '--publish', explicit,
+            'start', 'explorer',
+        );
+        assert.equal(status, 0, out);
+        checkIncludes(out, `-p ${explicit}`, 'explicit SCTP publish is left for the engine to interpret');
+        checkIncludes(out, '-p 127.0.0.1:8081:8081', 'SCTP does not suppress generated TCP at the same target');
+    } finally {
+        source.cleanup();
+    }
+});
+
+test('public start canonicalizes leading zeroes only for suppression and never rewrites the raw explicit value', () => {
+    const source = makeFakePloinkyGraphSource();
+    try {
+        const explicit = '127.0.0.1:18081:08081';
+        const { out, status } = publicRunWithEnv(
+            { PLOINKY_BOX_SOURCE: source.sourceDir },
+            'podman',
+            '--name', 'qa',
+            '--dry-run',
+            '--publish', explicit,
+            'start', 'explorer',
+        );
+        assert.equal(status, 0, out);
+        checkIncludes(out, `-p ${explicit}`, 'the engine receives the exact leading-zero publish');
+        checkAbsent(out, '-p 127.0.0.1:8081:8081', 'leading zeroes cannot bypass generated-target suppression');
+    } finally {
+        source.cleanup();
+    }
+});
+
+test('public start suppresses an overlapping generated single port when the explicit target is a range', () => {
+    const source = makeFakePloinkyGraphSource();
+    try {
+        const explicit = '18080-18090:8080-8090';
+        const { out, status } = publicRunWithEnv(
+            { PLOINKY_BOX_SOURCE: source.sourceDir },
+            'podman',
+            '--name', 'qa',
+            '--dry-run',
+            '--publish', explicit,
+            'start', 'explorer',
+        );
+        assert.equal(status, 0, out);
+        checkIncludes(out, `-p ${explicit}`, 'the explicit range is preserved');
+        checkAbsent(out, '-p 127.0.0.1:8081:8081', 'the overlapping generated single port is suppressed');
+    } finally {
+        source.cleanup();
+    }
+});
+
+test('public start suppresses the whole generated range when an explicit single target overlaps it', () => {
+    const source = makeFakePloinkyGraphSource({
+        webPublishingOpenPorts: ['127.0.0.1:9000-9010:9000-9010'],
+    });
+    try {
+        const explicit = '19001:9001';
+        const { out, status } = publicRunWithEnv(
+            { PLOINKY_BOX_SOURCE: source.sourceDir },
+            'podman',
+            '--name', 'qa',
+            '--dry-run',
+            '--publish', explicit,
+            'start', 'explorer',
+        );
+        assert.equal(status, 0, out);
+        checkIncludes(out, `-p ${explicit}`, 'the explicit single-port publish is preserved');
+        checkAbsent(out, '127.0.0.1:9000-9010:9000-9010', 'the overlapping generated range is not emitted');
+        checkAbsent(out, '127.0.0.1:9000:9000', 'the generated range is not split below the overlap');
+        checkAbsent(out, '127.0.0.1:9002-9010:9002-9010', 'the generated range is not split above the overlap');
+    } finally {
+        source.cleanup();
+    }
+});
+
+test('public start keeps generated UDP when an explicit TCP target uses the same port', () => {
+    const source = makeFakePloinkyGraphSource({
+        webPublishingOpenPorts: ['127.0.0.1:8081:8081/udp'],
+    });
+    try {
+        const explicit = '18081:8081/tcp';
+        const { out, status } = publicRunWithEnv(
+            { PLOINKY_BOX_SOURCE: source.sourceDir },
+            'podman',
+            '--name', 'qa',
+            '--dry-run',
+            '--publish', explicit,
+            'start', 'explorer',
+        );
+        assert.equal(status, 0, out);
+        checkIncludes(out, `-p ${explicit}`, 'the explicit TCP publish is preserved');
+        checkIncludes(out, '-p 127.0.0.1:8081:8081/udp', 'same-number UDP remains independent');
+    } finally {
+        source.cleanup();
+    }
+});
+
+test('public qualified Explorer start plans and forwards one explicit development profile', () => {
+    const source = makeFakePloinkyGraphSource({
+        webPublishingProfiles: {
+            default: {
+                openPorts: ['127.0.0.1:8081:8081'],
+            },
+            dev: {
+                openPorts: ['127.0.0.1:9081:8081'],
+            },
+        },
+    });
+    try {
+        const { out, status } = publicRunWithEnv(
+            { PLOINKY_BOX_SOURCE: source.sourceDir },
+            'podman',
+            '--name', 'qa',
+            '--dry-run',
+            'start', 'AchillesIDE/explorer', '8080', '--profile', 'DEV',
+        );
+        assert.equal(status, 0, out);
+        checkIncludes(out, '-p 127.0.0.1:9081:9081', 'the dev openPorts mapping is selected');
+        checkAbsent(out, '-p 127.0.0.1:8081:8081', 'the default-only mapping is replaced');
+        checkIncludes(
+            out,
+            'exec -w /workspace ploinky-box-qa ploinky start AchillesIDE/explorer 8080 --profile dev',
+            'the normalized planner profile reaches the in-box start command',
+        );
+    } finally {
+        source.cleanup();
+    }
+});
+
+test('public bare Explorer start ignores host profile state and plans and forwards default', () => {
+    const source = makeFakePloinkyGraphSource({
+        webPublishingProfiles: {
+            default: {
+                openPorts: ['127.0.0.1:8081:8081'],
+            },
+            dev: {
+                openPorts: ['127.0.0.1:9081:8081'],
+            },
+        },
+    });
+    try {
+        const { out, status } = publicRunWithEnv(
+            {
+                PLOINKY_BOX_SOURCE: source.sourceDir,
+                PLOINKY_PROFILE: 'dev',
+            },
+            'podman',
+            '--name', 'qa',
+            '--dry-run',
+            'start', 'explorer',
+        );
+        assert.equal(status, 0, out);
+        checkIncludes(out, '-p 127.0.0.1:8081:8081', 'omission selects the default publish graph');
+        checkAbsent(out, '-p 127.0.0.1:9081:9081', 'host profile state does not select dev');
+        checkIncludes(
+            out,
+            'exec -w /workspace ploinky-box-qa ploinky start explorer 8080 --profile default',
+            'omission explicitly forwards default in-box',
+        );
+    } finally {
+        source.cleanup();
+    }
+});
+
+test('public start accepts --profile=value before the agent and does not treat it as positional', () => {
+    const source = makeFakePloinkyGraphSource({
+        webPublishingProfiles: {
+            default: { openPorts: ['127.0.0.1:8081:8081'] },
+            dev: { openPorts: ['127.0.0.1:9081:8081'] },
+        },
+    });
+    try {
+        const { out, status } = publicRunWithEnv(
+            { PLOINKY_BOX_SOURCE: source.sourceDir },
+            'podman',
+            '--name', 'qa',
+            '--dry-run',
+            'start', '--profile=dev', 'AssistOSExplorer/explorer', '9191',
+        );
+        assert.equal(status, 0, out);
+        checkIncludes(out, '127.0.0.1:9191:8080', 'the positional host port remains aligned');
+        checkIncludes(
+            out,
+            'ploinky start AssistOSExplorer/explorer 8080 --profile dev',
+            'the profile option is consumed and forwarded canonically',
+        );
+        checkAbsent(out, 'ploinky start dev 8080', 'the profile value never becomes the agent positional');
+    } finally {
+        source.cleanup();
+    }
+});
+
+test('ploinky-box source does not hardcode Explorer publish topology', () => {
+    const source = fs.readFileSync(MJS, 'utf8');
+    const oldPublishConstant = ['EXPLORER', 'START', 'PUBLISH', 'SPECS'].join('_');
+    const oldExplorerEnv = ['PLOINKY', 'BOX', 'EXPLORER', 'PORTS'].join('_');
+    const oldPortMetadata = ['box', 'Publish'].join('');
+    assert.equal(source.includes(oldPublishConstant), false);
+    assert.equal(source.includes(oldExplorerEnv), false);
+    assert.equal(source.includes('127.0.0.1:8082:8082'), false);
+    assert.equal(source.includes(oldPortMetadata), false);
 });
 
 test('public start accepts --port before the agent without forwarding it in-box', () => {
-    const { out, status } = publicRun('podman', '--name', 'qa', '--dry-run', 'start', '--port', '9191', 'explorer');
-    assert.equal(status, 0, out);
-    checkIncludes(out, '127.0.0.1:9191:8080', 'post-command --port before agent is the host port');
-    checkIncludes(out, 'exec -w /workspace ploinky-box-qa ploinky start explorer 8080', 'agent remains explorer');
-    checkAbsent(out, 'ploinky start 9191 8080 --port explorer', 'post-command --port does not reorder into in-box args');
+    const source = makeFakePloinkyGraphSource();
+    try {
+        const { out, status } = publicRunWithEnv(
+            { PLOINKY_BOX_SOURCE: source.sourceDir },
+            'podman',
+            '--name', 'qa',
+            '--dry-run',
+            'start', '--port', '9191', 'explorer',
+        );
+        assert.equal(status, 0, out);
+        checkIncludes(out, '127.0.0.1:9191:8080', 'post-command --port before agent is the host port');
+        checkIncludes(out, 'exec -w /workspace ploinky-box-qa ploinky start explorer 8080', 'agent remains explorer');
+        checkAbsent(out, 'ploinky start 9191 8080 --port explorer', 'post-command --port does not reorder into in-box args');
+    } finally {
+        source.cleanup();
+    }
 });
 
 test('public start accepts --port after the agent without forwarding it in-box', () => {
-    const { out, status } = publicRun('podman', '--name', 'qa', '--dry-run', 'start', 'explorer', '--port', '9192');
-    assert.equal(status, 0, out);
-    checkIncludes(out, '127.0.0.1:9192:8080', 'post-command --port after agent is the host port');
-    checkIncludes(out, 'exec -w /workspace ploinky-box-qa ploinky start explorer 8080', 'agent remains explorer');
-    checkAbsent(out, 'ploinky start explorer 8080 --port 9192', 'post-command --port is not forwarded in-box');
+    const source = makeFakePloinkyGraphSource();
+    try {
+        const { out, status } = publicRunWithEnv(
+            { PLOINKY_BOX_SOURCE: source.sourceDir },
+            'podman',
+            '--name', 'qa',
+            '--dry-run',
+            'start', 'explorer', '--port', '9192',
+        );
+        assert.equal(status, 0, out);
+        checkIncludes(out, '127.0.0.1:9192:8080', 'post-command --port after agent is the host port');
+        checkIncludes(out, 'exec -w /workspace ploinky-box-qa ploinky start explorer 8080', 'agent remains explorer');
+        checkAbsent(out, 'ploinky start explorer 8080 --port 9192', 'post-command --port is not forwarded in-box');
+    } finally {
+        source.cleanup();
+    }
 });
 
 test('public start without an agent forwards in-box start instead of wrapper failing', () => {
@@ -921,11 +1335,12 @@ test('public command rejects removed --webmeet-ports instead of forwarding it in
     );
 });
 
-test('public ploinky forwards every registered top-level CLI command into the box', () => {
+test('public ploinky forwards registered top-level CLI commands into the box except host-side destroy', () => {
     const registry = getCommandRegistry();
     assert.equal(registry.box, undefined, 'box is reserved for outer lifecycle commands');
 
     for (const command of Object.keys(registry)) {
+        if (command === 'destroy') continue;
         const { out, status } = publicRun('podman', '--name', 'qa', '--dry-run', command);
         assert.equal(status, 0, `${command}\n${out}`);
         checkIncludes(out, 'DRY-RUN: podman run -d', `${command}: public command ensures the box`);
@@ -992,7 +1407,8 @@ test('docs describe boxed-by-default ploinky and the host-mounted core', () => {
     assert.ok(rootReadme.includes('node cli/index.js'), rootReadme);
     assert.ok(!rootReadme.includes('PLOINKY_DIRECT'), 'the direct-mode escape is gone');
     assert.ok(boxReadme.includes('ploinky box destroy'), boxReadme);
-    assert.ok(boxReadme.includes('ploinky-box compatibility'), boxReadme);
+    assert.ok(boxReadme.includes('Graph-driven Explorer publishes'), boxReadme);
+    assert.ok(boxReadme.includes('openPorts'), boxReadme);
     assert.ok(boxReadme.includes('/opt/ploinky'), boxReadme);
     assert.ok(boxReadme.includes('read-only'), boxReadme);
     assert.ok(boxReadme.includes('ploinky-deps'), boxReadme);

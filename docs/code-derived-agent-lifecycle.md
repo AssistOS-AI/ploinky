@@ -144,7 +144,7 @@ The enabled record includes:
 | `runMode` | `isolated`, `global`, or `devel`. |
 | `type` | Always `agent` for agent records. |
 | `config.binds` | Initial descriptive binds: per-instance home to `/root`, non-isolated project path to itself, repo `Agent/` to `/Agent`, agent source to `/code`. Runtime startup recomputes actual binds. |
-| `config.ports` | Runtime port mapping metadata from `parseManifestPorts(manifest)` or fallback `{containerPort: 7000}`. Because `parseManifestPorts` only reads profile config, enable-time records normally get the fallback. |
+| `config.ports` | Descriptive enable-time port metadata from `parseManifestPorts(manifest)` or fallback `{containerPort: 7000}`. Runtime startup recomputes profile ports and does not turn this fallback into an implicit port-7000 publish for a start-only service. |
 | `auth` | `{mode}` plus local auth metadata when local password auth is enabled. |
 | `alias` | Optional route/record alias. |
 | `profile` | Optional profile requested by dependency directive or CLI auth options. |
@@ -173,8 +173,8 @@ Ploinky does not load a central manifest schema in the observed paths. Individua
 | `runtime.resources.env` | No | Adds env vars with templates such as `{{PLOINKY_WORKSPACE_ROOT}}`, `{{STORAGE_CONTAINER_PATH}}`, `{{STORAGE_HOST_PATH}}`, `{{secret:NAME}}`, `{{generatedSecret:NAME}}`, and `{{var:NAME}}`. |
 | `lite-sandbox` | No | If true and host sandbox is enabled, selects bwrap on Linux or seatbelt on macOS. If host sandbox is disabled, it falls back to container runtime. |
 | `profiles` | No | If present, `profiles.default` is required. Active profile comes from record profile or `.ploinky/profile`; non-default profiles are merged over default. |
-| `profiles.<name>.openPorts` | No | The only manifest port declarations read by `parseManifestPorts`. If absent at startup, Ploinky maps a random localhost host port to container port 7000 unless host networking is used. |
-| `profiles.<name>.additionalServerPort` | No | Internal port for an agent-owned browser service, usually a bare port such as `"3000"` and optionally `host:port`. The router exposes it at `http://<agent>.localhost:<routerPort>/` without requiring a stable host port for that service. |
+| `profiles.<name>.openPorts` | No | The only manifest port declarations read by `parseManifestPorts`. Each entry exposes a socket to the box and is eligible for graph-driven outer publication. Without an entry, only execution modes that include AgentServer receive an implicit random localhost mapping to container port 7000; start-only services do not. |
+| `profiles.<name>.additionalServerPort` | No | Private port for an agent-owned browser service, usually a bare port such as `"3000"` and optionally `host:port`. The router exposes it at `http://<agent>.localhost:<routerPort>/` without outer box eligibility. Its resolved route can supply TCP startup readiness for a start-only service, but it remains separate from an AgentServer/MCP route. |
 | `profiles.<name>.env` | No | Overrides top-level `env` for the active profile. |
 | `profiles.<name>.secrets` | No | Profile secrets are validated and injected at runtime. |
 | `profiles.<name>.mounts` | No | Controls code/skills mount mode. Default and dev profiles are read-write by default; other profiles are read-only by default. |
@@ -190,7 +190,7 @@ Ploinky does not load a central manifest schema in the observed paths. Individua
 | `env` | No | Manifest env specs. Resolution order in `secretVars.js` is encrypted secrets, `process.env`, `.env`, then default. Profile `env` replaces top-level `env`. |
 | `expose` | No | Adds explicit env values or refs. The `expose` CLI command edits this field in the source manifest. |
 | `repos` | No | Object processed by `applyManifestDirectives` during `start`. Values may be URL strings or objects with `url` and `branch`. Repos are ensured and enabled before dependency enable processing. |
-| `enable` | No | Top-level and profile-level enable arrays are processed during `start` and dependency graph building. Ploinky uses the active profile when the agent declares it, otherwise `profiles.default`. String specs can include `as <alias>` and `no-wait`; object specs can include `agent/ref/spec/name`, `alias/as`, `profile`, and `noWait`/`no-wait`. |
+| `enable` | No | Top-level and profile-level enable arrays are processed during `start` and dependency graph building. The boxed publish planner applies the workspace profile when present and falls back to a child's `profiles.default` when absent. String specs can include `as <alias>` and `no-wait`; object specs can include `agent/ref/spec/name`, `alias/as`, `profile`, and `noWait`/`no-wait`. An explicit edge-local profile must exist on the child. |
 | `configProviders` | No | Top-level startup provider entries processed for the static agent after dependency graph discovery and before dependency env resolution. Profile entries replace the default profile list. |
 | `providesConfig` | No | Declares a startup provider command and output allowlist. Provider stdout must be schema version 1 JSON and is persisted by Ploinky only after allowlist, reserved-name, sensitive-flag, and generated-secret checks pass. |
 | `guest` | No | `guest: true` makes manifest-derived auth mode `guest`. |
@@ -204,12 +204,12 @@ Ploinky does not load a central manifest schema in the observed paths. Individua
 | `workdir` | No | Container working directory fallback is `/code`. |
 | `cli` | No | Command used by `ploinky cli <agent>`. |
 | `commands.cli` | No | CLI command fallback after `cli`. |
-| `readiness.protocol` | No | Startup readiness protocol: `tcp`, `mcp`, or `none`. If absent, manifests with `start` default to `tcp`; otherwise default is `mcp`. |
+| `readiness.protocol` | No | Explicit startup readiness protocol: `tcp`, `mcp`, or `none`. It takes precedence over inferred TCP/MCP and over `health.readiness.script`. Without it, start-only containers prefer a declared health script, otherwise TCP when a private or published route exists; execution modes with AgentServer default to MCP. |
 | `health.liveness` | No | Watchdog container monitor script probe. Script name must be local to agent root, with no slash or `..`. Failure can restart the container with backoff. |
-| `health.readiness` | No | Watchdog container monitor script probe. Failure logs a warning; it does not block startup in the same way as startup readiness. |
+| `health.readiness` | No | Script probe configuration. For a start-only container with no explicit readiness protocol, `health.readiness.script` is executed inside the service container and blocks dependency startup until it succeeds or fails. The watchdog also uses the configuration later as a warning-oriented container health probe. |
 | `volumes` | No | Extra host-to-container mounts. Relative host paths are resolved against the workspace root; absolute host paths are honored as declared. Missing paths are created unless marked generated+required. |
 | `volumeOptions` | No | Per-container-path options for `volumes`: `generated`, `required`, numeric `chmod`, and `makeWorldWritableSubdirs`. |
-| `network` | No | Supports host mode or named network with aliases. Default Docker adds `host.docker.internal`; default Podman uses `slirp4netns:allow_host_loopback=true`. |
+| `network` | No | Supports host mode or named network with aliases, including boxed Podman starts. Default Docker adds `host.docker.internal`; default Podman uses `slirp4netns:allow_host_loopback=true` when no manifest network is declared. |
 | `containerSecurity.privileged` | No | Adds `--privileged` for container runtime when true. |
 | `mcp-config.json` beside manifest/code | No | Copied/synchronized into the persistent agent home, `.data/<agent-or-alias>/mcp-config.json`. Seatbelt writes a rewritten `.seatbelt` config in the same work directory. Default AgentServer also searches `/code/mcp-config.json`. |
 | `httpServices` | No | Router exposes service prefixes that proxy to the agent route using explicit `access: public`, `access: guest`, or `access: authenticated`. |
@@ -218,6 +218,23 @@ Ploinky does not load a central manifest schema in the observed paths. Individua
 | `endpoints.agent-card` | No | Default AgentServer exposes `/agent-card`. |
 
 Removed legacy env features are intentionally rejected: `derive`, `deriveName`, `deriveRepoName`, `deriveRepo`, `deriveAgentName`, `deriveAgent`, `deriveBytes`, `deriveFormat`, `generatedSecretScope`, and `{{derivedMasterSecret:NAME}}`.
+
+### Start Profile Selection
+
+The public boxed form is `ploinky start <agent> [port] [--profile <name>]`;
+both `--profile <name>` and `--profile=<name>` are consumed as explicit
+cross-boundary selectors and forwarded to the in-box CLI. Omission at this
+public boundary selects and forwards `default`, so host environment or an older
+persisted profile cannot silently change the outer publish plan. A direct
+in-box `ploinky start` that omits the flag does not overwrite the active profile
+and may continue using `.ploinky/profile`.
+
+For Explorer publish planning, `explorer`, `AchillesIDE/explorer`, and
+`AssistOSExplorer/explorer` select the same root. The selected workspace profile
+is applied to each graph node; a node that does not define it falls back to its
+own `default` profile. An explicit profile on an `enable` edge is different: it
+must exist on that child manifest or planning fails and reports the child and
+its available profiles.
 
 ## Auth Mode Processing
 
@@ -441,9 +458,51 @@ Open ports come from active profile `openPorts`. Accepted forms include:
 | `8000-8002:7000-7002` | Port range, same length on both sides. |
 | `8080:7000/udp` | UDP mapping. |
 
-If no open ports are defined and networking is not host mode, Ploinky chooses a random host port between 10000 and 59999 and maps it to container port 7000 on localhost.
+If no open ports are defined and networking is not host mode, execution modes
+that include AgentServer choose a random host port between 10000 and 59999 and
+map it to container port 7000 on localhost. A start-only container never gets
+that synthetic AgentServer mapping. It needs an intentional `openPorts` route,
+a private `additionalServerPort`, a blocking `health.readiness.script`, or
+`readiness.protocol: "none"` according to its service contract.
 
-Profile `additionalServerPort` is separate from `openPorts`. It accepts a bare port such as `3000` for a service running inside the agent runtime; `127.0.0.1:3000` is also accepted. At startup and restart, Ploinky publishes that server port on `127.0.0.1` with an ephemeral host port for container runtimes, records the resolved upstream in `.ploinky/routing.json`, and exposes it through the router at `http://<agent>.localhost:<routerPort>/`. The AgentServer/MCP port remains the normal port-7000 route.
+For boxed public Explorer starts, outer publishes are planned before the box is
+created. The planner walks the enabled graph and treats each effective-profile
+`openPorts` declaration as both an inner exposure and outer-boundary
+eligibility. The manifest's box-side port becomes the outer container target;
+the private agent-container target is used for diagnostics and conflict
+comparison, not as the outer target.
+
+Generated claims accept stable nonzero TCP/UDP ports and equal-length ranges.
+Any overlapping box-side interval for the same protocol fails planning unless
+it is a semantically exact duplicate on the same effective graph node. The
+diagnostic names both agent refs, profiles, aliases, bind classes, raw
+declarations, and box-to-private mappings. The same numeric TCP and UDP sockets
+are independent.
+
+Explicit `--publish`/`--expose` values are retained byte-for-byte and in their
+original order. The wrapper parses only the terminal container target interval
+and protocol into a canonical claim. If that target overlaps a generated claim
+for the same protocol, it suppresses the entire generated claim without
+rewriting or splitting the explicit one.
+
+Profile `additionalServerPort` is separate from `openPorts`. It accepts a bare
+port such as `3000` for a service running inside the agent runtime;
+`127.0.0.1:3000` is also accepted. At startup and restart, container runtimes
+publish that server port on localhost with an ephemeral host port, record the
+resolved upstream in `.ploinky/routing.json`, and expose it through the router
+at `http://<agent>.localhost:<routerPort>/`. This private route is not eligible
+for the outer box. It can be the TCP readiness route for a start-only service;
+when AgentServer is present, port 7000 remains the MCP/readiness route.
+
+Changing `openPorts` or `--profile` affects the desired run arguments for a
+newly created outer box only. Existing boxes are not reconciled.
+
+Web Publishing remains the HTTP/WebSocket consolidation layer. Its nginx
+process binds 8081 with a default 404 server even when no routes exist.
+Deployment checks read the generated external OnlyOffice and LiveKit public
+URLs and probe those origins. They do not assume direct host access to private
+ports 8082 or 17000, and they do not assume host 8081 was published when an
+earlier operation created the box before graph-aware Explorer start.
 
 ## Host Sandbox Runtimes
 
@@ -557,14 +616,26 @@ Startup readiness is handled by `workspaceUtil.js`, `startupReadiness.js`, and `
 | `none` | Mark ready without a port-bound probe. |
 | `tcp` | Wait for local host port to open. |
 | `mcp` | Wait for local host port, then perform MCP initialize, initialized notification, and tools/list. |
+| inferred `script` | Run `health.readiness.script` inside the service container from `/code`; success unblocks the wave and failure blocks startup. |
 
-Default startup readiness protocol is `tcp` when the manifest has `start`; otherwise it is `mcp`.
+An explicit manifest `readiness.protocol` (`mcp`, `tcp`, or `none`) wins over a
+declared health script. Without an explicit protocol, a start-only container
+with `health.readiness.script` uses blocking script readiness, a start-only
+service with a resolved `additionalServerPort` uses TCP, and other start-only
+services require an intentional reachable TCP route. Execution modes that
+include AgentServer default to MCP. A start-only service with no script, no
+private or published route, and no explicit `none` policy fails with a manifest
+contract error rather than waiting on a fabricated port 7000.
 
-Health probes are different. The router watchdog's container monitor watches enabled records every few seconds. If a runtime is not running, it schedules a restart through `ensureAgentService` with backoff and a circuit breaker. If a manifest has `health`, a worker runs configured script probes inside the container:
+The router watchdog's later health-probe phase is different from dependency-wave
+startup. Its container monitor watches enabled records every few seconds. If a
+runtime is not running, it schedules a restart through `ensureAgentService`
+with backoff and a circuit breaker. If a manifest has `health`, a worker runs
+configured script probes inside the container:
 
 | Probe | Behavior |
 | --- | --- |
-| `health.readiness.script` | Runs `sh "./<script>"` in `/code`. Success marks probe ready; failure warns. |
+| `health.readiness.script` | During inferred start-only startup, runs as the blocking container readiness probe. During later watchdog monitoring, success marks the health probe ready and failure warns. |
 | `health.liveness.script` | Runs the script repeatedly. Failure restarts the container and applies CrashLoopBackOff. |
 
 Probe script names must be plain filenames in the agent root. Slashes and `..` are rejected.
@@ -644,9 +715,9 @@ MCP tool and resource commands require router-minted invocation headers before c
 
 ## Code-Observed Caveats
 
-1. Enable-time port records are mostly descriptive. `enableAgent` calls `parseManifestPorts` without profile config, and that function only reads profile `openPorts`, so enable-time records normally fall back to container port 7000.
+1. Enable-time port records are mostly descriptive. `enableAgent` calls `parseManifestPorts` without profile config, and that function only reads profile `openPorts`, so enable-time records normally show a port-7000 fallback. Runtime startup recomputes profile ports and does not emit that fallback for start-only execution.
 2. Top-level `manifest.openPorts` is not read by the observed `parseManifestPorts` implementation.
-3. Profile `additionalServerPort` does not require a stable manifest host port; container runtimes publish it automatically on a localhost ephemeral port used only by the router proxy.
+3. Profile `additionalServerPort` does not require a stable manifest host port; container runtimes publish it automatically on a localhost ephemeral port used by the router proxy and, for start-only services, private TCP readiness. It is not outer-boundary eligibility.
 4. Manifest `repos` and `enable` are applied at `start`, not at `enable agent`.
 5. Container runtime dependency installs happen in caches, not in the long-running containers.
 6. Podman and seatbelt copy/stage runtime files; Docker mostly mounts them directly.
@@ -654,4 +725,4 @@ MCP tool and resource commands require router-minted invocation headers before c
 8. `cli/services/help.js` contains cloud help, but `cli/commands/cli.js` treats cloud commands as unavailable in this build.
 9. `client tool --agent` resolves ambiguity, but the observed call path invokes `client.callTool(toolName, payloadObj)` without passing target-agent metadata.
 10. Seatbelt links prepared dependencies into the real agent code path as `node_modules`; it errors if that path exists and is not a symlink.
-11. Manifest health probes are watchdog/container-monitor probes and are separate from startup readiness.
+11. Manifest health scripts remain watchdog/container-monitor probes, but `health.readiness.script` also becomes blocking startup readiness for a start-only container when no explicit `readiness.protocol` overrides it.

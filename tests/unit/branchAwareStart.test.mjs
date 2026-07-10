@@ -211,6 +211,32 @@ test('parseStartArgs: full example with --repo-branch and --reset-repos', () => 
     assert.equal(result.branchPolicy.resetRepos, true);
 });
 
+test('parseStartArgs: consumes --profile NAME before positional values', () => {
+    const result = parseStartArgs(['--profile', 'DEV', 'AchillesIDE/explorer', '8097']);
+    assert.equal(result.staticAgent, 'AchillesIDE/explorer');
+    assert.equal(result.port, '8097');
+    assert.equal(result.profile, 'dev');
+});
+
+test('parseStartArgs: consumes --profile=NAME after positional values', () => {
+    const result = parseStartArgs(['AssistOSExplorer/explorer', '8097', '--profile=Prod']);
+    assert.equal(result.staticAgent, 'AssistOSExplorer/explorer');
+    assert.equal(result.port, '8097');
+    assert.equal(result.profile, 'prod');
+});
+
+test('parseStartArgs: profile omission preserves direct in-box persisted-profile behavior', () => {
+    const result = parseStartArgs(['explorer', '8080']);
+    assert.equal(result.profile, null);
+});
+
+test('parseStartArgs: rejects --profile without a value instead of consuming an agent positional', () => {
+    assert.throws(
+        () => parseStartArgs(['explorer', '--profile']),
+        /--profile needs a value/,
+    );
+});
+
 // ---------------------------------------------------------------------------
 // resolveBranchForRepo tests
 // ---------------------------------------------------------------------------

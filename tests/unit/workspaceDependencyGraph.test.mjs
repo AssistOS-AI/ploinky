@@ -41,6 +41,12 @@ const {
     topologicallyGroupDependencyGraph
 } = graphModule;
 const { applyManifestDirectives, parseEnableDirective } = bootstrapModule;
+const workspaceUtilModuleUrl = new URL('../../cli/services/workspaceUtil.js', import.meta.url);
+const {
+    buildBlockingReadinessEntryFromNode,
+    startWorkspace,
+    waitForReadinessEntries,
+} = await import(`${workspaceUtilModuleUrl.href}${moduleSuffix}`);
 
 test.after(() => {
     process.chdir(originalCwd);
@@ -80,6 +86,52 @@ test('resolveWorkspaceDependencyGraph collects recursive dependencies and preser
     assert.deepEqual(
         Array.from(graph.nodes.get('demo/app').dependencies).sort(),
         ['demo/dep', 'demo/sidecar as media']
+    );
+});
+
+test('a failed blocking script readiness probe prevents the next dependency wave', async () => {
+    const startedWaves = [];
+    const waves = [
+        [{
+            id: 'demo/database',
+            shortAgentName: 'database',
+            isStatic: false,
+            manifest: {
+                start: 'postgres',
+                health: { readiness: { script: 'healthcheck.sh', failureThreshold: 1 } },
+            },
+            route: { container: 'database-container', hostPort: 0 },
+        }],
+        [{
+            id: 'demo/api',
+            shortAgentName: 'api',
+            isStatic: false,
+            manifest: { readiness: { protocol: 'none' } },
+            route: { container: 'api-container', hostPort: 0 },
+        }],
+    ];
+
+    await assert.rejects(async () => {
+        for (let waveIndex = 0; waveIndex < waves.length; waveIndex += 1) {
+            startedWaves.push(waveIndex);
+            const entries = waves[waveIndex].map((node) => (
+                buildBlockingReadinessEntryFromNode(node, node.route, 'app')
+            ));
+            await waitForReadinessEntries(entries, {
+                runContainerScriptReadinessImpl() {
+                    return { status: 'failed', reason: 'exit 1', detail: 'database unavailable' };
+                },
+            });
+        }
+    }, /database unavailable/);
+
+    assert.deepEqual(startedWaves, [0]);
+});
+
+test('start workspace clears a stale host port when start-only readiness resolves no route', () => {
+    assert.match(
+        startWorkspace.toString(),
+        /if \(!resolvedHostPort\) delete nextRoute\.hostPort/,
     );
 });
 

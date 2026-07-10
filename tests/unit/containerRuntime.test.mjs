@@ -90,7 +90,7 @@ process.stdout.write(JSON.stringify(buildRuntimeRouterEnv('docker')));`,
     }
 });
 
-test('buildRuntimeNetworkPlan downgrades named podman networks inside ploinky-box', () => {
+test('buildRuntimeNetworkPlan keeps named podman networks inside ploinky-box', () => {
     const workspaceDir = tempDir();
     try {
         const markerPath = `${workspaceDir}/ploinky-box-marker`;
@@ -108,18 +108,18 @@ process.stdout.write(JSON.stringify(plan));`,
 
         assert.equal(result.status, 0, result.stderr);
         assert.deepEqual(JSON.parse(result.stdout), {
-            args: ['--replace', '--network', 'slirp4netns:allow_host_loopback=true'],
-            ensureNetworkName: '',
+            args: ['--replace', '--network', 'webmeet', '--network-alias', 'liveKitServerAgent', '--network-alias', 'webmeetAgent'],
+            ensureNetworkName: 'webmeet',
             useHostNetwork: false,
-            boxNetworkCompat: true,
-            hashEnv: { PLOINKY_BOX_NETWORK_COMPAT: 'slirp4netns-named-network' },
+            boxNetworkCompat: false,
+            hashEnv: {},
         });
     } finally {
         fs.rmSync(workspaceDir, { recursive: true, force: true });
     }
 });
 
-test('buildRuntimeNetworkPlan detects older ploinky-box images without the marker file', () => {
+test('buildRuntimeNetworkPlan does not infer slirp mode for named podman networks from workspace layout', () => {
     const workspaceDir = tempDir();
     const fakeWorkspace = path.join(workspaceDir, 'workspace');
     fs.mkdirSync(fakeWorkspace, { recursive: true });
@@ -138,11 +138,11 @@ process.stdout.write(JSON.stringify(plan));`,
 
         assert.equal(result.status, 0, result.stderr);
         assert.deepEqual(JSON.parse(result.stdout), {
-            args: ['--replace', '--network', 'slirp4netns:allow_host_loopback=true'],
-            ensureNetworkName: '',
+            args: ['--replace', '--network', 'webmeet'],
+            ensureNetworkName: 'webmeet',
             useHostNetwork: false,
-            boxNetworkCompat: true,
-            hashEnv: { PLOINKY_BOX_NETWORK_COMPAT: 'slirp4netns-named-network' },
+            boxNetworkCompat: false,
+            hashEnv: {},
         });
     } finally {
         fs.rmSync(workspaceDir, { recursive: true, force: true });
@@ -292,26 +292,106 @@ process.stdout.write(JSON.stringify(parseManifestPorts(manifest, profile)));`,
     }
 });
 
-test('parseManifestPorts accepts legacy profile ports field for existing agents', () => {
+test('parseManifestPorts widens loopback binds inside ploinky box runtime', () => {
     const workspaceDir = tempDir();
+    const markerPath = path.join(workspaceDir, 'etc-ploinky-box');
     try {
+        fs.writeFileSync(markerPath, 'assistos/ploinky-box\n');
         const result = runModuleSnippet(
-            `const { parseManifestPorts } = await import(${JSON.stringify(dockerCommonUrl)});
-process.stdout.write(JSON.stringify(parseManifestPorts({}, { ports: ['127.0.0.1:0:9000'] })));`,
+            `const { parseManifestPorts, isPloinkyBoxRuntime } = await import(${JSON.stringify(dockerCommonUrl)});
+const manifest = {};
+const profile = { openPorts: ['127.0.0.1:8081:8081', '127.0.0.1:7882-7892:7882-7892/udp'] };
+process.stdout.write(JSON.stringify({
+  marker: isPloinkyBoxRuntime(${JSON.stringify(markerPath)}),
+  ports: parseManifestPorts(manifest, profile, { boxMarkerPath: ${JSON.stringify(markerPath)} })
+}));`,
             {},
             { cwd: workspaceDir },
         );
 
         assert.equal(result.status, 0, result.stderr);
         assert.deepEqual(JSON.parse(result.stdout), {
-            publishArgs: ['127.0.0.1::9000'],
-            portMappings: [
-                { hostPort: 0, containerPort: 9000, hostIp: '127.0.0.1', protocol: 'tcp' },
-            ],
+            marker: true,
+            ports: {
+                publishArgs: ['0.0.0.0:8081:8081', '0.0.0.0:7882-7892:7882-7892/udp'],
+                portMappings: [
+                    { hostPort: 8081, containerPort: 8081, hostIp: '0.0.0.0', protocol: 'tcp' },
+                    { hostPort: 7882, containerPort: 7882, hostIp: '0.0.0.0', protocol: 'udp' },
+                    { hostPort: 7883, containerPort: 7883, hostIp: '0.0.0.0', protocol: 'udp' },
+                    { hostPort: 7884, containerPort: 7884, hostIp: '0.0.0.0', protocol: 'udp' },
+                    { hostPort: 7885, containerPort: 7885, hostIp: '0.0.0.0', protocol: 'udp' },
+                    { hostPort: 7886, containerPort: 7886, hostIp: '0.0.0.0', protocol: 'udp' },
+                    { hostPort: 7887, containerPort: 7887, hostIp: '0.0.0.0', protocol: 'udp' },
+                    { hostPort: 7888, containerPort: 7888, hostIp: '0.0.0.0', protocol: 'udp' },
+                    { hostPort: 7889, containerPort: 7889, hostIp: '0.0.0.0', protocol: 'udp' },
+                    { hostPort: 7890, containerPort: 7890, hostIp: '0.0.0.0', protocol: 'udp' },
+                    { hostPort: 7891, containerPort: 7891, hostIp: '0.0.0.0', protocol: 'udp' },
+                    { hostPort: 7892, containerPort: 7892, hostIp: '0.0.0.0', protocol: 'udp' },
+                ],
+            },
         });
     } finally {
         fs.rmSync(workspaceDir, { recursive: true, force: true });
     }
+});
+
+test('parseManifestPorts rejects legacy profile ports field', () => {
+    const workspaceDir = tempDir();
+    try {
+        const result = runModuleSnippet(
+            `const { parseManifestPorts } = await import(${JSON.stringify(dockerCommonUrl)});
+try {
+  parseManifestPorts({}, { ports: ['127.0.0.1:0:9000'] });
+} catch (err) {
+  process.stdout.write(err.message);
+}`,
+            {},
+            { cwd: workspaceDir },
+        );
+
+        assert.equal(result.status, 0, result.stderr);
+        assert.match(result.stdout, /profile field 'ports' is unsupported; use 'openPorts'/);
+    } finally {
+        fs.rmSync(workspaceDir, { recursive: true, force: true });
+    }
+});
+
+test('AgentServer execution modes retain an ephemeral private 7000 publish when no port is declared', () => {
+    const result = runModuleSnippet(
+        `const { shouldCreateImplicitAgentServerPublish } = await import(${JSON.stringify(agentServiceManagerUrl)});
+process.stdout.write(JSON.stringify({
+  implicit: shouldCreateImplicitAgentServerPublish({}, []),
+  agentOnly: shouldCreateImplicitAgentServerPublish({ agent: 'node server.mjs' }, []),
+  startAndAgent: shouldCreateImplicitAgentServerPublish({ start: 'node app.mjs', agent: 'node server.mjs' }, []),
+  declaredPort: shouldCreateImplicitAgentServerPublish({ agent: 'node server.mjs' }, ['127.0.0.1::7000']),
+}));`,
+    );
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(JSON.parse(result.stdout), {
+        implicit: true,
+        agentOnly: true,
+        startAndAgent: true,
+        declaredPort: false,
+    });
+});
+
+test('start-only execution never fabricates an AgentServer 7000 publish', () => {
+    const result = runModuleSnippet(
+        `const { shouldCreateImplicitAgentServerPublish } = await import(${JSON.stringify(agentServiceManagerUrl)});
+process.stdout.write(JSON.stringify({
+  script: shouldCreateImplicitAgentServerPublish({ start: 'postgres', health: { readiness: { script: 'healthcheck.sh' } } }, []),
+  none: shouldCreateImplicitAgentServerPublish({ start: 'sleep infinity', readiness: { protocol: 'none' } }, []),
+  privateServer: shouldCreateImplicitAgentServerPublish({ start: 'node app.mjs' }, []),
+}));`,
+    );
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(JSON.parse(result.stdout), {
+        script: false,
+        none: false,
+        privateServer: false,
+    });
 });
 
 test('getConfiguredProjectPath uses .data agent folder for isolated records', () => {
@@ -436,6 +516,8 @@ console.log(JSON.stringify(record));`,
         const record = JSON.parse(result.stdout.trim().split('\n').at(-1));
         assert.equal(record.runMode, 'global');
         assert.equal(record.projectPath, workspaceDir);
+        assert.deepEqual(record.config.ports, []);
+        assert.doesNotMatch(fs.readFileSync(argsFile, 'utf8'), /(?:^|:)7000(?:$|\s)/);
         assert.ok(record.config.binds.some((bind) => (
             bind.source === workspaceDir && bind.target === workspaceDir
         )));

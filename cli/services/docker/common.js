@@ -12,6 +12,29 @@ import { isHostSandboxDisabled } from '../sandboxRuntime.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+const PLOINKY_BOX_MARKER_PATH = '/etc/ploinky-box';
+
+function isPloinkyBoxRuntime(markerPath = PLOINKY_BOX_MARKER_PATH) {
+    try {
+        return fs.statSync(markerPath).isFile();
+    } catch (_) {
+        return false;
+    }
+}
+
+function isLoopbackBindHost(hostIp) {
+    const normalized = String(hostIp || '').trim().toLowerCase();
+    return normalized === '127.0.0.1' || normalized === 'localhost' || normalized === '::1';
+}
+
+function runtimePublishHostIp(hostIp, options = {}) {
+    const markerPath = options.boxMarkerPath || PLOINKY_BOX_MARKER_PATH;
+    const inBoxRuntime = options.boxRuntime === true || isPloinkyBoxRuntime(markerPath);
+    if (inBoxRuntime && isLoopbackBindHost(hostIp)) {
+        return '0.0.0.0';
+    }
+    return hostIp;
+}
 
 function isPathUnderRoot(candidate) {
     if (!candidate) return false;
@@ -405,12 +428,15 @@ function sleepMs(ms) {
     Atomics.wait(SLEEP_ARRAY, 0, 0, ms);
 }
 
-function parseManifestPorts(manifest, profileConfig = null) {
+function parseManifestPorts(manifest, profileConfig = null, options = {}) {
     if (manifest && Object.prototype.hasOwnProperty.call(manifest, 'ports')) {
         throw new Error("manifest field 'ports' was renamed to profile field 'openPorts'");
     }
+    if (profileConfig && Object.prototype.hasOwnProperty.call(profileConfig, 'ports')) {
+        throw new Error("profile field 'ports' is unsupported; use 'openPorts'");
+    }
     // Open ports must be defined in profile configuration.
-    const ports = profileConfig?.openPorts ?? profileConfig?.ports;
+    const ports = profileConfig?.openPorts;
     if (!ports) return { publishArgs: [], portMappings: [] };
 
     const portArray = Array.isArray(ports) ? ports : [ports];
@@ -438,10 +464,11 @@ function parseManifestPorts(manifest, profileConfig = null) {
         }
         const parsed = parsePortPublishSpec(hostPortSpec, containerPortSpec);
         if (parsed) {
-            const normalized = `${hostIp}:${parsed.hostPortSpec}:${parsed.containerPortSpec}${parsed.protocolSuffix}`;
+            const publishHostIp = runtimePublishHostIp(hostIp, options);
+            const normalized = `${publishHostIp}:${parsed.hostPortSpec}:${parsed.containerPortSpec}${parsed.protocolSuffix}`;
             publishArgs.push(normalized);
             for (const mapping of parsed.portMappings) {
-                portMappings.push({ ...mapping, hostIp, protocol: parsed.protocol });
+                portMappings.push({ ...mapping, hostIp: publishHostIp, protocol: parsed.protocol });
             }
         }
     }
@@ -646,6 +673,7 @@ export {
     getHostSandboxDisableHint,
     getHostSandboxInstallHint,
     isContainerRunning,
+    isPloinkyBoxRuntime,
     isSandboxRuntime,
     probeContainerRuntime,
     runtimeFamilyName,
