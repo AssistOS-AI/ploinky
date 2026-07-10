@@ -5,7 +5,7 @@
 // named service networks; host crossings remain explicit (published ports,
 // `cp`, opt-in --mount).
 // The public bin/ploinky launcher delegates directly to this module.
-import { spawn, spawnSync } from 'node:child_process';
+import { spawnSync } from 'node:child_process';
 import net from 'node:net';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -15,13 +15,22 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { showHelp } from '../cli/services/help.js';
 import { planBoxPublishesForStart } from './box-publish-planner.mjs';
-import { intervalsOverlap, parseExplicitPublishSpec } from './publish-spec.mjs';
+import { parseExplicitPublishSpec } from './publish-spec.mjs';
+import { createEngineClient } from './runtime-engine.mjs';
+import {
+    REQUIRED_RUNTIME_CONTRACT,
+    REQUIRED_RUNTIME_IMAGE,
+    buildRuntimeRunArgs,
+    mergeDesiredRuntimeConfig,
+    normalizeContainerInspect,
+    normalizeImageInspect,
+    planReconciliation,
+    validateImageContract,
+} from './runtime-contract.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
-const DEFAULT_IMAGE = 'docker.io/assistos/ploinky-box:podman-node24';
+const DEFAULT_IMAGE = REQUIRED_RUNTIME_IMAGE;
 const BOX_PREFIX = 'ploinky-box';
-const BOX_MARKER_RELATIVE_PATH = path.join('container', 'ploinky-box-marker');
-const BOX_MARKER_CONTAINER_PATH = '/etc/ploinky-box';
 export class SupervisorError extends Error {
     constructor(message, exitCode = 1) {
         super(message);
@@ -252,90 +261,62 @@ function detectEngine(cfg) {
     return null;
 }
 
-function query(cfg, args) {
-    const r = spawnSync(cfg.engine, args, { encoding: 'utf8' });
-    return {
-        ok: r.status === 0 && !r.error,
-        stdout: r.stdout || '',
-        stderr: r.stderr || '',
+function runtimeDependencies(cfg) {
+    return cfg._runtimeDependencies || {
+        stdout: process.stdout,
+        stderr: process.stderr,
+        stdin: process.stdin,
+        env: process.env,
+        sleep,
+        askLine,
+        fetch,
     };
 }
 
-function streamContains(cfg, args, needle) {
-    return new Promise((resolve) => {
-        let tail = '';
-        let settled = false;
-        const done = (found) => {
-            if (settled) return;
-            settled = true;
-            resolve(found);
-        };
-        let child;
-        try {
-            child = spawn(cfg.engine, args, { stdio: ['ignore', 'pipe', 'pipe'] });
-        } catch {
-            done(false);
-            return;
-        }
-        const scan = (chunk) => {
-            const text = `${tail}${chunk}`;
-            if (text.includes(needle)) {
-                done(true);
-                child.kill();
-                return;
-            }
-            tail = text.slice(-Math.max(needle.length - 1, 0));
-        };
-        child.stdout.setEncoding('utf8');
-        child.stderr.setEncoding('utf8');
-        child.stdout.on('data', scan);
-        child.stderr.on('data', scan);
-        child.on('error', () => done(false));
-        child.on('close', () => done(false));
+function output(cfg, text) {
+    runtimeDependencies(cfg).stdout.write(text);
+}
+
+function errorOutput(cfg, text) {
+    runtimeDependencies(cfg).stderr.write(text);
+}
+
+function engineClientFor(cfg) {
+    if (cfg._engineClient) return cfg._engineClient;
+    const deps = runtimeDependencies(cfg);
+    cfg._engineClient = createEngineClient({
+        name: cfg.engine,
+        dryRun: cfg.dryRun,
+        spawnSyncImpl: deps.spawnSyncImpl,
+        spawnImpl: deps.spawnImpl,
+        stdout: deps.stdout,
+        stderr: deps.stderr,
     });
+    return cfg._engineClient;
+}
+
+function query(cfg, args) {
+    return engineClientFor(cfg).query(args);
+}
+
+function streamContains(cfg, args, needle) {
+    return engineClientFor(cfg).streamContains(args, needle);
 }
 
 function streamEngineToStderr(cfg, args) {
-    return new Promise((resolve) => {
-        let child;
-        try {
-            child = spawn(cfg.engine, args, { stdio: ['ignore', 'pipe', 'pipe'] });
-        } catch {
-            resolve(1);
-            return;
-        }
-        child.stdout.pipe(process.stderr, { end: false });
-        child.stderr.pipe(process.stderr, { end: false });
-        child.on('error', () => resolve(1));
-        child.on('close', (code, signal) => {
-            resolve(typeof code === 'number' ? code : 128 + (os.constants.signals[signal] ?? 15));
-        });
-    });
+    return engineClientFor(cfg).streamToStderr(args);
 }
 
-function childExitCode(r) {
-    if (typeof r.status === 'number') return r.status;
-    if (r.signal) return 128 + (os.constants.signals[r.signal] ?? 15);
-    return 1;
-}
-
-function runEngine(cfg, args, { silence = 'none', allowFail = false } = {}) {
-    if (cfg.dryRun) {
-        if (silence === 'none') process.stdout.write(`DRY-RUN: ${cfg.engine} ${args.join(' ')}\n`);
-        return 0;
+function runEngine(cfg, args, options = {}) {
+    try {
+        return engineClientFor(cfg).run(args, options);
+    } catch (error) {
+        if (error instanceof SupervisorError) throw error;
+        throw new SupervisorError(
+            error?.message || String(error),
+            Number.isInteger(error?.exitCode) ? error.exitCode : 1,
+        );
     }
-    const stdio = [
-        'inherit',
-        silence === 'none' ? 'inherit' : 'ignore',
-        silence === 'all' ? 'ignore' : 'inherit',
-    ];
-    const r = spawnSync(cfg.engine, args, { stdio });
-    if (r.error && !allowFail) die(`failed to run ${cfg.engine}: ${r.error.message}`);
-    const code = childExitCode(r);
-    if (code !== 0 && !allowFail) {
-        throw new SupervisorError(`${cfg.engine} command failed`, code);
-    }
-    return code;
 }
 
 function engineSelinuxEnabled(cfg) {
@@ -381,7 +362,7 @@ function prepareMount(cfg) {
     try { isDir = fs.statSync(cfg.mountDir).isDirectory(); } catch { /* not found */ }
     if (!isDir) die(`--mount directory not found: ${cfg.mountDir}`);
     cfg.mountDirResolved = path.resolve(cfg.mountDir);
-    process.stderr.write(`ploinky: WARNING: --mount pierces the isolation boundary for ${cfg.mountDir}\n`);
+    errorOutput(cfg, `ploinky: WARNING: --mount pierces the isolation boundary for ${cfg.mountDir}\n`);
 }
 
 const SOURCE_MARKERS = ['bin/ploinky', 'cli/index.js', 'globalDeps/package.json'];
@@ -402,7 +383,9 @@ export function resolveHostPloinkySource(env = process.env, scriptDir = HERE) {
 }
 
 function prepareSource(cfg) {
-    cfg.sourceDirResolved = resolveHostPloinkySource();
+    cfg.sourceDirResolved = resolveHostPloinkySource(
+        runtimeDependencies(cfg).env,
+    );
     // node_modules must exist on the host: it is the mountpoint for the deps
     // volume, and the engine cannot create it inside a read-only bind mount.
     if (!cfg.dryRun) {
@@ -444,36 +427,6 @@ export function inferPublicStartBranchArgs(args, env = process.env, sourceDir = 
     return ['--branch', branch];
 }
 
-export function buildRunArgs(cfg, { selinux = false } = {}) {
-    const bindIp = cfg.listenLan ? '0.0.0.0' : '127.0.0.1';
-    const instance = instanceName(cfg);
-    const { workspace, containers, deps } = volumeNames(cfg);
-    const source = cfg.sourceDirResolved || resolveHostPloinkySource();
-    const markerSource = path.join(source, BOX_MARKER_RELATIVE_PATH);
-    const depsMountSuffix = cfg.engine === 'podman' ? ':U' : '';
-    const args = ['run', '-d', '--init', '--name', instance,
-        '--privileged',
-        '--user', 'podman',
-        '--device', '/dev/fuse',
-        '--device', '/dev/net/tun',
-        '--security-opt', 'seccomp=unconfined',
-        '-p', `${bindIp}:${cfg.port}:8080`,
-    ];
-    for (const spec of cfg.publish) args.push('-p', spec);
-    args.push(
-        '-v', `${workspace}:/workspace`,
-        '-v', `${containers}:/home/podman/.local/share/containers`,
-        '-v', `${source}:/opt/ploinky:ro`,
-        '-v', `${markerSource}:${BOX_MARKER_CONTAINER_PATH}:ro`,
-        '-v', `${deps}:/opt/ploinky/node_modules${depsMountSuffix}`,
-        '-e', 'PLOINKY_WORKSPACE_ROOT=/workspace',
-    );
-    if (selinux) args.push('--security-opt', 'label=disable');
-    if (cfg.mountDir) args.push('-v', `${cfg.mountDirResolved}:/workspace/mounted`);
-    args.push(cfg.image);
-    return args;
-}
-
 function validatePublishSpecs(cfg) {
     for (const spec of cfg.publish) {
         try {
@@ -495,36 +448,56 @@ function validateHostPort(value, label) {
     }
 }
 
-function appendDefaultPublishes(cfg, specs) {
-    const explicitClaims = cfg.publish.map((spec) => parseExplicitPublishSpec(spec));
-    for (const spec of specs) {
-        const generated = parseExplicitPublishSpec(spec);
-        const overlapsExplicit = explicitClaims.some((explicit) => (
-            explicit.protocol === generated.protocol
-            && intervalsOverlap(explicit.containerTarget, generated.containerTarget)
-        ));
-        if (overlapsExplicit) continue;
-        cfg.publish.push(spec);
-    }
-}
-
 function appendGraphDrivenStartPublishes(cfg, startPlan) {
     const planned = planBoxPublishesForStart({
         startPlan,
-        sourceDir: cfg.sourceDirResolved || resolveHostPloinkySource(),
+        sourceDir: cfg.sourceDirResolved || resolveHostPloinkySource(
+            runtimeDependencies(cfg).env,
+        ),
     });
-    appendDefaultPublishes(cfg, planned.publishes);
+    cfg._generatedPublishes = planned.publishes;
 }
 
-function ensureImage(cfg) {
+function inspectedImage(cfg, imageRef) {
+    const result = query(cfg, ['image', 'inspect', imageRef]);
+    if (!result.ok) return null;
+    try {
+        return normalizeImageInspect(result.stdout);
+    } catch {
+        return null;
+    }
+}
+
+function inspectExistingRuntimeConfig(cfg) {
+    if (cfg.dryRun) return null;
+    const result = query(cfg, ['container', 'inspect', instanceName(cfg)]);
+    if (!result.ok) return null;
+    let existing;
+    try {
+        existing = normalizeContainerInspect(cfg.engine, result.stdout);
+    } catch (error) {
+        die(`cannot parse runtime inspect for '${instanceName(cfg)}': ${error.message || error}`);
+    }
+    const imageRef = existing.imageId || existing.image;
+    const image = imageRef ? inspectedImage(cfg, imageRef) : null;
+    existing.contract = image?.contract || '';
+    return existing;
+}
+
+function ensureImage(cfg, imageRef) {
     if (cfg.dryRun) return;
-    if (query(cfg, ['image', 'inspect', cfg.image]).ok) return;
-    const r = spawnSync(cfg.engine, ['pull', cfg.image], { stdio: 'inherit' });
-    if (childExitCode(r) !== 0) {
-        die(`cannot pull ${cfg.image}.
+    let image = inspectedImage(cfg, imageRef);
+    if (!image) {
+        const code = runEngine(cfg, ['pull', imageRef], { allowFail: true });
+        if (code !== 0) {
+            die(`cannot pull ${imageRef}.
   - Publish it: gh workflow run publish-ploinky-box-image.yml --repo AssistOS-AI/container-image-builds
   - Or point at another image with --image`);
+        }
+        image = inspectedImage(cfg, imageRef);
     }
+    if (!image) die(`cannot inspect runtime image '${imageRef}' after pull`);
+    validateImageContract(image, imageRef);
 }
 
 function portInUse(port, host = '127.0.0.1', timeoutMs = 500) {
@@ -542,24 +515,29 @@ function portInUse(port, host = '127.0.0.1', timeoutMs = 500) {
     });
 }
 
-async function waitHealthy(cfg) {
+async function waitHealthy(cfg, phase) {
     if (cfg.dryRun) return;
+    const injected = runtimeDependencies(cfg).waitHealthy;
+    if (injected) {
+        await injected(cfg, phase);
+        return;
+    }
     const instance = instanceName(cfg);
     for (let i = 0; i < 30; i += 1) {
         const inspect = query(cfg, ['container', 'inspect', '--format', '{{.State.Status}}', instance]);
         const state = inspect.ok ? inspect.stdout.trim() : 'missing';
         if (state === 'running') {
             if (await streamContains(cfg, ['logs', instance], 'self-check OK')) {
-                process.stdout.write(`ploinky: '${instance}' is running (router will publish on port ${cfg.port} once started inside).\n`);
+                output(cfg, `ploinky: '${instance}' is running (router will publish on port ${cfg.port} once started inside).\n`);
                 return;
             }
         }
         if (state === 'exited') {
-            process.stderr.write(`ploinky: '${instance}' failed its self-check:\n`);
+            errorOutput(cfg, `ploinky: '${instance}' failed its self-check:\n`);
             await streamEngineToStderr(cfg, ['logs', instance]);
             die('fix the reported cause; inspect the privileged box runtime before retrying');
         }
-        await sleep(1000);
+        await runtimeDependencies(cfg).sleep(1000);
     }
     die(`'${instance}' did not become healthy within 30s; inspect with: ${cfg.engine} logs ${instanceName(cfg)}`);
 }
@@ -590,13 +568,14 @@ export function shouldInstallDeps(env, isTTY, reply) {
 // before forwarding into a second in-box prompt.
 async function ensureDepsInstalled(cfg, { fatalOnDecline = false } = {}) {
     if (cfg.dryRun || depsInstalled(cfg)) return true;
+    const deps = runtimeDependencies(cfg);
     let reply = null;
-    const envOptIn = String(process.env.PLOINKY_BOX_INSTALL_DEPS || '') === '1';
-    if (!envOptIn && process.stdin.isTTY) {
-        reply = await askLine('Ploinky dependencies are not installed. Install them now? [y/N] ');
+    const envOptIn = String(deps.env.PLOINKY_BOX_INSTALL_DEPS || '') === '1';
+    if (!envOptIn && deps.stdin.isTTY) {
+        reply = await deps.askLine('Ploinky dependencies are not installed. Install them now? [y/N] ');
     }
-    if (!shouldInstallDeps(process.env, process.stdin.isTTY, reply)) {
-        process.stderr.write('ploinky: WARNING: Ploinky cannot run until dependencies are installed.\n'
+    if (!shouldInstallDeps(deps.env, deps.stdin.isTTY, reply)) {
+        errorOutput(cfg, 'ploinky: WARNING: Ploinky cannot run until dependencies are installed.\n'
             + `ploinky: install them with: ${cfg.engine} exec -it ${instanceName(cfg)} /opt/ploinky/bin/ploinky-install-deps\n`);
         if (fatalOnDecline) {
             throw new SupervisorError('Ploinky dependencies are required before running this command');
@@ -616,13 +595,19 @@ function requireRuntimeRunning(cfg) {
 
 function gracefulPloinkyStop(cfg) {
     if (!cfg.dryRun && runtimeRunning(cfg)) {
-        spawnSync(cfg.engine, ['exec', '-w', '/workspace', instanceName(cfg), 'timeout', '30', 'ploinky', 'stop'], { stdio: 'ignore' });
+        runEngine(
+            cfg,
+            ['exec', '-w', '/workspace', instanceName(cfg), 'timeout', '30', 'ploinky', 'stop'],
+            { silence: 'all', allowFail: true },
+        );
     }
 }
 
-async function urlOk(url) {
+async function urlOk(cfg, url) {
     try {
-        const r = await fetch(url, { signal: AbortSignal.timeout(2000) });
+        const r = await runtimeDependencies(cfg).fetch(url, {
+            signal: AbortSignal.timeout(2000),
+        });
         return r.ok;
     } catch { return false; }
 }
@@ -646,39 +631,62 @@ async function ensureRuntime(cfg, { fatalOnDepsDecline = false } = {}) {
     validateHostPort(cfg.port, `${cfg.command || 'runtime'}: host port`);
     validatePublishSpecs(cfg);
     preflight(cfg);
-    if (!cfg.dryRun && runtimeRunning(cfg)) {
-        process.stdout.write(`ploinky: '${instanceName(cfg)}' already running.\n`);
+    const existing = inspectExistingRuntimeConfig(cfg);
+    if (!existing || cfg.explicit.has('--mount')) {
+        prepareMount(cfg);
+    }
+    if (!existing) prepareSource(cfg);
+    const desired = mergeDesiredRuntimeConfig(
+        cfg,
+        existing,
+        cfg._generatedPublishes || [],
+    );
+    const plan = planReconciliation({
+        existing,
+        desired,
+        contractMatches: existing?.contract === REQUIRED_RUNTIME_CONTRACT,
+    });
+    cfg._runtimeConfig = desired;
+    cfg._reconciliationPlan = plan;
+
+    if (existing?.running) {
+        output(cfg, `ploinky: '${instanceName(cfg)}' already running.\n`);
         fixDepsOwnership(cfg);
         if (!await ensureDepsInstalled(cfg, { fatalOnDecline: fatalOnDepsDecline })) {
             throw new SupervisorError('Ploinky dependencies are required before running this command');
         }
         return;
     }
-    if (!cfg.dryRun && runtimeExists(cfg)) {
+    let phase;
+    if (existing) {
         runEngine(cfg, ['start', instanceName(cfg)], { silence: 'stdout' });
+        phase = 'start';
     } else {
-        if (!cfg.dryRun && await portInUse(cfg.port)) {
+        const portCheck = runtimeDependencies(cfg).portInUse || portInUse;
+        if (!cfg.dryRun && await portCheck(desired.routerPublish.hostPort)) {
             die(`host port ${cfg.port} is already in use; choose another with --port`);
         }
-        ensureImage(cfg);
-        prepareMount(cfg);
-        prepareSource(cfg);
+        ensureImage(cfg, desired.image);
         const selinux = cfg.dryRun ? false : engineSelinuxEnabled(cfg);
-        runEngine(cfg, buildRunArgs(cfg, { selinux }));
+        runEngine(cfg, buildRuntimeRunArgs(desired, {
+            engine: cfg.engine,
+            selinux,
+        }));
+        phase = 'create';
     }
-    await waitHealthy(cfg);
+    await waitHealthy(cfg, phase);
     fixDepsOwnership(cfg);
     if (!await ensureDepsInstalled(cfg, { fatalOnDecline: fatalOnDepsDecline })) {
         throw new SupervisorError('Ploinky dependencies are required before running this command');
     }
 }
 
-async function probeRouter(port, attempts = 30) {
+async function probeRouter(cfg, port, attempts = 30) {
     for (let i = 0; i < attempts; i += 1) {
         for (const p of ['status', 'health']) {
-            if (await urlOk(`http://127.0.0.1:${port}/${p}`)) return p;
+            if (await urlOk(cfg, `http://127.0.0.1:${port}/${p}`)) return p;
         }
-        await sleep(1000);
+        await runtimeDependencies(cfg).sleep(1000);
     }
     return null;
 }
@@ -766,7 +774,7 @@ function splitPublicStartArgs(args, options = {}) {
 // source-branch forwarding, and router readiness probe.
 async function startGraph(cfg) {
     const startPlan = splitPublicStartArgs(cfg.args, {
-        env: process.env,
+        env: runtimeDependencies(cfg).env,
         sourceDir: cfg.sourceDirResolved || '',
     });
     if (!startPlan.hasAgent) {
@@ -786,16 +794,16 @@ async function startGraph(cfg) {
     await ensureRuntime(cfg, { fatalOnDepsDecline: true });
     const published = cfg.dryRun ? cfg.port : (runtimeHostPort(cfg) || cfg.port);
     if (!cfg.dryRun && published !== cfg.port) {
-        process.stderr.write(`ploinky: note: existing runtime publishes host port ${published}; the requested port applies only when the runtime is created. Recreate it through normal reconciliation with --port ${cfg.port}.\n`);
+        errorOutput(cfg, `ploinky: note: existing runtime publishes host port ${published}; the requested port applies only when the runtime is created. Recreate it through normal reconciliation with --port ${cfg.port}.\n`);
     }
     runEngine(cfg, ['exec', '-w', '/workspace', instanceName(cfg), 'ploinky', ...startPlan.inBoxArgs]);
     if (cfg.dryRun) return 0;
-    const probePath = await probeRouter(published);
+    const probePath = await probeRouter(cfg, published);
     if (probePath) {
-        process.stdout.write(`ploinky: router responding on http://127.0.0.1:${published}/${probePath}\n`);
+        output(cfg, `ploinky: router responding on http://127.0.0.1:${published}/${probePath}\n`);
         return 0;
     }
-    process.stderr.write(`ploinky: router did not respond on http://127.0.0.1:${published} within 30s; check: ploinky --name ${cfg.name} status\n`);
+    errorOutput(cfg, `ploinky: router did not respond on http://127.0.0.1:${published} within 30s; check: ploinky --name ${cfg.name} status\n`);
     return 1;
 }
 
@@ -812,22 +820,22 @@ async function inspectRuntimeStatus(cfg) {
     preflight(cfg);
     const instance = instanceName(cfg);
     if (cfg.dryRun) {
-        process.stdout.write(`ploinky: '${instance}' does not exist.${inferredNote(cfg)}\n`);
+        output(cfg, `ploinky: '${instance}' does not exist.${inferredNote(cfg)}\n`);
         return 1;
     }
     if (!runtimeExists(cfg)) {
-        process.stdout.write(`ploinky: '${instance}' does not exist.${inferredNote(cfg)}\n`);
+        output(cfg, `ploinky: '${instance}' does not exist.${inferredNote(cfg)}\n`);
         return 1;
     }
     const state = query(cfg, ['container', 'inspect', '--format', '{{.State.Status}}', instance]).stdout.trim();
-    process.stdout.write(`container: ${instance} (${state})\n`);
+    output(cfg, `container: ${instance} (${state})\n`);
     const hp = runtimeHostPort(cfg);
-    if (hp && await urlOk(`http://127.0.0.1:${hp}/status`)) {
-        process.stdout.write(`router:    responding on http://127.0.0.1:${hp}/status\n`);
-    } else if (hp && await urlOk(`http://127.0.0.1:${hp}/health`)) {
-        process.stdout.write(`router:    responding on http://127.0.0.1:${hp}/health\n`);
+    if (hp && await urlOk(cfg, `http://127.0.0.1:${hp}/status`)) {
+        output(cfg, `router:    responding on http://127.0.0.1:${hp}/status\n`);
+    } else if (hp && await urlOk(cfg, `http://127.0.0.1:${hp}/health`)) {
+        output(cfg, `router:    responding on http://127.0.0.1:${hp}/health\n`);
     } else {
-        process.stdout.write(`router:    not responding (run ploinky --name ${cfg.name} start <agent>)\n`);
+        output(cfg, `router:    not responding (run ploinky --name ${cfg.name} start <agent>)\n`);
     }
     return 0;
 }
@@ -835,12 +843,12 @@ async function inspectRuntimeStatus(cfg) {
 function stopRuntime(cfg) {
     preflight(cfg);
     if (!runtimeExists(cfg)) {
-        process.stdout.write(`ploinky: '${instanceName(cfg)}' does not exist.${inferredNote(cfg)}\n`);
+        output(cfg, `ploinky: '${instanceName(cfg)}' does not exist.${inferredNote(cfg)}\n`);
         return 0;
     }
     gracefulPloinkyStop(cfg);
     runEngine(cfg, ['stop', instanceName(cfg)], { silence: 'stdout' });
-    process.stdout.write(`ploinky: '${instanceName(cfg)}' stopped (volumes kept).\n`);
+    output(cfg, `ploinky: '${instanceName(cfg)}' stopped (volumes kept).\n`);
     return 0;
 }
 
@@ -849,7 +857,7 @@ async function destroyRuntime(cfg) {
     const instance = instanceName(cfg);
     const { workspace, containers, deps } = volumeNames(cfg);
     if (cfg.nameSource === 'cwd') {
-        process.stderr.write(`ploinky: targeting '${instance}' (name inferred from the current directory)\n`);
+        errorOutput(cfg, `ploinky: targeting '${instance}' (name inferred from the current directory)\n`);
     }
     if (!cfg.dryRun) {
         const anyVolume = query(cfg, ['volume', 'inspect', workspace]).ok
@@ -858,24 +866,30 @@ async function destroyRuntime(cfg) {
         if (!runtimeExists(cfg) && !anyVolume) {
             die(`nothing to destroy: no container or volumes for '${instance}'${inferredNote(cfg)}`);
         }
-        const reply = await askLine(`Remove container '${instance}' and volumes '${workspace}' + '${containers}' + '${deps}'? [y/N] `);
+        const reply = await runtimeDependencies(cfg).askLine(`Remove container '${instance}' and volumes '${workspace}' + '${containers}' + '${deps}'? [y/N] `);
         if (!/^[yY]$/.test(reply ?? '')) die('aborted');
     }
     runEngine(cfg, ['stop', instance], { silence: 'all', allowFail: true });
     runEngine(cfg, ['rm', instance], { silence: 'all', allowFail: true });
     runEngine(cfg, ['volume', 'rm', workspace, containers, deps], { silence: cfg.dryRun ? 'none' : 'all', allowFail: true });
-    process.stdout.write(`ploinky: '${instance}' and its volumes removed.\n`);
+    output(cfg, `ploinky: '${instance}' and its volumes removed.\n`);
     return 0;
 }
 
 function defaultDependencies() {
     return {
         stdout: process.stdout,
+        stderr: process.stderr,
         stdin: process.stdin,
         cwd: () => process.cwd(),
         env: process.env,
         detectEngine,
         showHelp,
+        sleep,
+        askLine,
+        fetch,
+        portInUse,
+        createEngineClient,
     };
 }
 
@@ -904,6 +918,25 @@ export function createRuntimeSupervisor(dependencies = {}) {
                 throw new SupervisorError('Ploinky requires Podman or Docker on the host');
             }
             if (typeof detected === 'string') invocation.engine = detected;
+            const engineClient = deps.engineClient || deps.createEngineClient({
+                name: invocation.engine,
+                dryRun: invocation.dryRun,
+                spawnSyncImpl: deps.spawnSyncImpl,
+                spawnImpl: deps.spawnImpl,
+                stdout: deps.stdout,
+                stderr: deps.stderr,
+            });
+            Object.defineProperties(invocation, {
+                _runtimeDependencies: {
+                    value: deps,
+                    configurable: true,
+                },
+                _engineClient: {
+                    value: engineClient,
+                    configurable: true,
+                    writable: true,
+                },
+            });
             const cwd = typeof deps.cwd === 'function' ? deps.cwd() : deps.cwd;
             resolveInstanceIdentity(invocation, cwd);
 

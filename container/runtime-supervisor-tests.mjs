@@ -1,6 +1,6 @@
 #!/usr/bin/env node
-// Engine-free tests for the runtime supervisor. Uses --dry-run, which prints
-// the engine command instead of executing it, so no podman/docker is needed.
+// Engine-free tests for the runtime supervisor. They use the injected fake
+// engine or --dry-run, so no Podman/Docker mutation is needed.
 // Runs standalone (`node container/runtime-supervisor-tests.mjs`) and via the
 // unit suite (imported by tests/unit/runtimeSupervisor.test.mjs).
 import { test } from 'node:test';
@@ -11,6 +11,22 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { getCommandRegistry } from '../cli/services/commandRegistry.js';
+import {
+    REQUIRED_RUNTIME_IMAGE,
+    buildRuntimeRunArgs,
+    createDefaultRuntimeConfig,
+    mergeAndValidatePublishes,
+    mergeDesiredRuntimeConfig,
+    normalizeContainerInspect,
+    normalizeImageInspect,
+    planReconciliation,
+    validateImageContract,
+} from './runtime-contract.mjs';
+import { createEngineClient } from './runtime-engine.mjs';
+import {
+    createFakeEngine,
+    createSupervisorHarness,
+} from '../tests/helpers/runtimeSupervisorHarness.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(HERE, '..');
@@ -19,6 +35,848 @@ const PLOINKY = path.join(HERE, '..', 'bin', 'ploinky');
 const PCLI = path.join(HERE, '..', 'bin', 'p-cli');
 const PSH = path.join(HERE, '..', 'bin', 'psh');
 const INSTALL_DEPS = path.join(HERE, '..', 'bin', 'ploinky-install-deps');
+const REQUIRED_IMAGE = REQUIRED_RUNTIME_IMAGE;
+
+const dockerInspect = [{
+    Id: 'container-id',
+    Name: '/ploinky-box-demo',
+    Image: 'sha256:runtime-v1',
+    Config: {
+        Image: 'docker.io/assistos/ploinky-box:podman-node24-runtime-v1',
+        User: 'podman',
+        Env: [
+            'PLOINKY_WORKSPACE_ROOT=/workspace',
+            'PLOINKY_RUNTIME_NAME=ploinky-box-demo',
+        ],
+    },
+    State: { Status: 'running' },
+    HostConfig: {
+        Privileged: true,
+        Binds: [
+            '/src/ploinky:/opt/ploinky:ro',
+            '/host/data:/workspace/mounted',
+        ],
+        PortBindings: {
+            '8080/tcp': [{ HostIp: '127.0.0.1', HostPort: '18080' }],
+            '7880/udp': [{ HostIp: '127.0.0.1', HostPort: '17880' }],
+        },
+        Devices: [
+            { PathOnHost: '/dev/fuse', PathInContainer: '/dev/fuse', CgroupPermissions: 'rwm' },
+            { PathOnHost: '/dev/net/tun', PathInContainer: '/dev/net/tun', CgroupPermissions: 'rwm' },
+        ],
+        SecurityOpt: ['seccomp=unconfined'],
+    },
+    Mounts: [
+        { Type: 'volume', Name: 'ploinky-box-demo-workspace', Destination: '/workspace' },
+        { Type: 'volume', Name: 'ploinky-box-demo-containers', Destination: '/home/podman/.local/share/containers' },
+        { Type: 'volume', Name: 'ploinky-box-demo-ploinky-deps', Destination: '/opt/ploinky/node_modules' },
+        { Type: 'bind', Source: '/src/ploinky', Destination: '/opt/ploinky', Mode: 'ro', RW: false },
+        { Type: 'bind', Source: '/host/data', Destination: '/workspace/mounted', Mode: 'rw', RW: true },
+    ],
+}];
+
+const podmanInspect = [{
+    Id: 'container-id',
+    Name: 'ploinky-box-demo',
+    Image: 'sha256:runtime-v1',
+    ImageName: 'docker.io/assistos/ploinky-box:podman-node24-runtime-v1',
+    Config: {
+        Image: 'docker.io/assistos/ploinky-box:podman-node24-runtime-v1',
+        User: 'podman',
+        Env: [
+            'PLOINKY_WORKSPACE_ROOT=/workspace',
+            'PLOINKY_RUNTIME_NAME=ploinky-box-demo',
+        ],
+    },
+    State: { Status: 'running', Running: true },
+    HostConfig: {
+        Privileged: true,
+        Binds: [
+            '/src/ploinky:/opt/ploinky:ro',
+            '/host/data:/workspace/mounted:rw,rprivate,rbind',
+        ],
+        PortBindings: {
+            '8080/tcp': [{ HostIp: '127.0.0.1', HostPort: '18080' }],
+            '7880/udp': [{ HostIp: '127.0.0.1', HostPort: '17880' }],
+        },
+        Devices: [
+            { PathOnHost: '/dev/fuse', PathInContainer: '/dev/fuse', CgroupPermissions: 'rwm' },
+            { PathOnHost: '/dev/net/tun', PathInContainer: '/dev/net/tun', CgroupPermissions: 'rwm' },
+        ],
+        SecurityOpt: ['seccomp=unconfined'],
+    },
+    Mounts: [
+        { Type: 'volume', Name: 'ploinky-box-demo-workspace', Source: '/var/home/user/.local/share/containers/storage/volumes/ploinky-box-demo-workspace/_data', Destination: '/workspace', Driver: 'local', Mode: '', RW: true, Propagation: '' },
+        { Type: 'volume', Name: 'ploinky-box-demo-containers', Source: '/var/home/user/.local/share/containers/storage/volumes/ploinky-box-demo-containers/_data', Destination: '/home/podman/.local/share/containers', Driver: 'local', Mode: '', RW: true, Propagation: '' },
+        { Type: 'volume', Name: 'ploinky-box-demo-ploinky-deps', Source: '/var/home/user/.local/share/containers/storage/volumes/ploinky-box-demo-ploinky-deps/_data', Destination: '/opt/ploinky/node_modules', Driver: 'local', Mode: 'U', RW: true, Propagation: '' },
+        { Type: 'bind', Source: '/src/ploinky', Destination: '/opt/ploinky', Driver: '', Mode: 'ro', RW: false, Propagation: 'rprivate' },
+        { Type: 'bind', Source: '/host/data', Destination: '/workspace/mounted', Driver: '', Mode: 'rw,rprivate,rbind', RW: true, Propagation: 'rprivate' },
+    ],
+}];
+
+function contractV1Image(id = 'sha256:runtime-v1') {
+    return {
+        Id: id,
+        Config: {
+            Labels: { 'io.assistos.ploinky.runtime-contract': '1' },
+        },
+    };
+}
+
+function legacyImage(id = 'sha256:legacy') {
+    return { Id: id, Config: { Labels: {} } };
+}
+
+function contractV1Images() {
+    const image = contractV1Image();
+    return {
+        [REQUIRED_IMAGE]: image,
+        [image.Id]: image,
+    };
+}
+
+function compatibleRunningContainer(overrides = {}) {
+    return {
+        inspect: structuredClone(dockerInspect[0]),
+        logs: '[ploinky-box] self-check OK\n',
+        coreStatus: 0,
+        coreStdout: 'core: running\n',
+        ...overrides,
+    };
+}
+
+function compatibleStoppedContainer(overrides = {}) {
+    const value = compatibleRunningContainer(overrides);
+    value.inspect.State.Status = 'exited';
+    return value;
+}
+
+function legacyRunningContainerWithCustomConfig() {
+    const value = compatibleRunningContainer();
+    value.inspect.Image = 'sha256:legacy';
+    value.inspect.Config.Image = 'docker.io/assistos/ploinky-box:podman-node24';
+    value.inspect.Config.Env.push('CUSTOM_RUNTIME_SETTING=kept');
+    value.inspect.HostConfig.PortBindings['8080/tcp'][0] = {
+        HostIp: '0.0.0.0',
+        HostPort: '18080',
+    };
+    return value;
+}
+
+function statusScenarios() {
+    return [
+        { name: 'missing', input: { container: null }, code: 1, core: false },
+        { name: 'stopped', input: { container: compatibleStoppedContainer(), images: contractV1Images() }, code: 1, core: false },
+        { name: 'compatible', input: { container: compatibleRunningContainer(), images: contractV1Images() }, code: 0, core: true },
+        {
+            name: 'outdated',
+            input: {
+                container: legacyRunningContainerWithCustomConfig(),
+                images: { 'sha256:legacy': legacyImage() },
+            },
+            code: 1,
+            core: false,
+        },
+        {
+            name: 'image metadata missing',
+            input: {
+                container: compatibleRunningContainer(),
+                images: {},
+            },
+            code: 1,
+            core: false,
+        },
+        {
+            name: 'unhealthy',
+            input: {
+                container: compatibleRunningContainer({ logs: 'self-check failed\n' }),
+                images: contractV1Images(),
+            },
+            code: 1,
+            core: false,
+        },
+        {
+            name: 'core failure',
+            input: {
+                container: compatibleRunningContainer({ coreStatus: 6 }),
+                images: contractV1Images(),
+            },
+            code: 6,
+            core: true,
+        },
+    ];
+}
+
+test('docker and podman inspect normalize to the same runtime config', () => {
+    const dockerConfig = normalizeContainerInspect('docker', dockerInspect);
+    const podmanConfig = normalizeContainerInspect('podman', podmanInspect);
+    assert.deepEqual(
+        { ...podmanConfig, binds: dockerConfig.binds },
+        dockerConfig,
+    );
+    assert.ok(podmanConfig.binds.includes(
+        '/host/data:/workspace/mounted:rw,rprivate,rbind',
+    ));
+    assert.deepEqual(dockerConfig.routerPublish, {
+        hostIp: '127.0.0.1',
+        hostPort: '18080',
+        containerPort: '8080',
+        protocol: 'tcp',
+    });
+    assert.deepEqual(dockerConfig.extraPublishes, [{
+        hostIp: '127.0.0.1',
+        hostPort: '17880',
+        containerPort: '7880',
+        protocol: 'udp',
+    }]);
+    assert.equal(dockerConfig.sourceDir, '/src/ploinky');
+    assert.equal(dockerConfig.mountDir, '/host/data');
+});
+
+test('image inspect normalizes and validates the runtime contract', () => {
+    const image = normalizeImageInspect(contractV1Image());
+    assert.equal(image.id, 'sha256:runtime-v1');
+    assert.equal(image.contract, '1');
+    assert.doesNotThrow(() => validateImageContract(image, REQUIRED_IMAGE));
+    assert.throws(
+        () => validateImageContract(
+            normalizeImageInspect(legacyImage()),
+            'registry.example/legacy:latest',
+        ),
+        /requires io\.assistos\.ploinky\.runtime-contract=1; observed <missing>/,
+    );
+});
+
+test('reconciliation plan creates, starts, reuses, and replaces', () => {
+    const desired = {
+        ...normalizeContainerInspect('docker', dockerInspect),
+        contract: '1',
+    };
+    assert.deepEqual(
+        planReconciliation({ existing: null, desired, contractMatches: true }),
+        { action: 'create', reasons: ['missing'] },
+    );
+    assert.deepEqual(
+        planReconciliation({
+            existing: { ...desired, state: 'exited', running: false },
+            desired,
+            contractMatches: true,
+        }),
+        { action: 'start', reasons: [] },
+    );
+    assert.deepEqual(
+        planReconciliation({
+            existing: { ...desired, state: 'running', running: true },
+            desired,
+            contractMatches: true,
+        }),
+        { action: 'reuse', reasons: [] },
+    );
+    assert.equal(
+        planReconciliation({
+            existing: { ...desired, image: 'legacy' },
+            desired,
+            contractMatches: false,
+        }).action,
+        'replace',
+    );
+});
+
+test('desired config preserves omissions and replaces explicit publishes', () => {
+    const desired = {
+        ...normalizeContainerInspect('docker', dockerInspect),
+        contract: '1',
+    };
+    const existing = {
+        ...desired,
+        image: 'registry.example/custom-runtime:v1',
+        contract: '1',
+        mountDir: '/kept/mount',
+        routerPublish: {
+            hostIp: '0.0.0.0',
+            hostPort: '19000',
+            containerPort: '8080',
+            protocol: 'tcp',
+        },
+        extraPublishes: [{
+            hostIp: '127.0.0.1',
+            hostPort: '7000',
+            containerPort: '7000',
+            protocol: 'tcp',
+        }],
+    };
+    const omitted = mergeDesiredRuntimeConfig(
+        { explicit: new Set(), publish: [] },
+        existing,
+        [],
+    );
+    assert.equal(omitted.image, 'registry.example/custom-runtime:v1');
+    assert.equal(omitted.mountDir, '/kept/mount');
+    assert.equal(omitted.routerPublish.hostPort, '19000');
+    assert.deepEqual(omitted.extraPublishes, existing.extraPublishes);
+
+    const changed = mergeDesiredRuntimeConfig(
+        {
+            explicit: new Set(['--publish']),
+            publish: ['127.0.0.1:9000:9000/tcp'],
+        },
+        existing,
+        ['127.0.0.1:7880:7880/udp', '127.0.0.1:7880:7880/udp'],
+    );
+    assert.deepEqual(changed.extraPublishes, [
+        {
+            hostIp: '127.0.0.1',
+            hostPort: '9000',
+            containerPort: '9000',
+            protocol: 'tcp',
+        },
+        {
+            hostIp: '127.0.0.1',
+            hostPort: '7880',
+            containerPort: '7880',
+            protocol: 'udp',
+        },
+    ]);
+});
+
+test('desired config changes only explicitly selected creation fields', () => {
+    const existing = {
+        ...normalizeContainerInspect('docker', dockerInspect),
+        contract: '1',
+    };
+    const assertOnly = (changed, fields) => {
+        const actualRest = structuredClone(changed);
+        const expectedRest = structuredClone(existing);
+        for (const field of fields) {
+            delete actualRest[field];
+            delete expectedRest[field];
+        }
+        assert.deepEqual(actualRest, expectedRest);
+    };
+
+    const port = mergeDesiredRuntimeConfig(
+        parseHostInvocation(['--port', '19191', 'list', 'agents']),
+        existing,
+    );
+    assert.equal(port.routerPublish.hostPort, '19191');
+    assertOnly(port, ['routerPublish']);
+
+    const image = mergeDesiredRuntimeConfig(
+        parseHostInvocation([
+            '--image', 'registry.example/runtime:v1', 'list', 'agents',
+        ]),
+        existing,
+    );
+    assert.equal(image.image, 'registry.example/runtime:v1');
+    assertOnly(image, ['image']);
+
+    const mount = mergeDesiredRuntimeConfig(
+        parseHostInvocation(['--mount', '/new/mount', 'list', 'agents']),
+        existing,
+    );
+    assert.equal(mount.mountDir, '/new/mount');
+    assert.ok(mount.binds.includes('/new/mount:/workspace/mounted'));
+    assertOnly(mount, ['mountDir', 'binds']);
+
+    const lan = mergeDesiredRuntimeConfig(
+        parseHostInvocation(['--listen-lan', 'list', 'agents']),
+        existing,
+    );
+    assert.equal(lan.routerPublish.hostIp, '0.0.0.0');
+    assertOnly(lan, ['routerPublish']);
+
+    for (const flag of ['--publish', '--expose']) {
+        const publish = mergeDesiredRuntimeConfig(
+            parseHostInvocation([
+                flag, '127.0.0.1:9000:9000/tcp', 'list', 'agents',
+            ]),
+            existing,
+        );
+        assert.deepEqual(publish.extraPublishes, [{
+            hostIp: '127.0.0.1',
+            hostPort: '9000',
+            containerPort: '9000',
+            protocol: 'tcp',
+        }]);
+        assertOnly(publish, ['extraPublishes']);
+    }
+});
+
+test('desired config initializes an explicitly selected missing router publish', () => {
+    const withoutRouterInspect = structuredClone(dockerInspect);
+    delete withoutRouterInspect[0].HostConfig.PortBindings['8080/tcp'];
+    const existing = normalizeContainerInspect(
+        'docker',
+        withoutRouterInspect,
+    );
+    assert.equal(existing.routerPublish, null);
+
+    const omitted = mergeDesiredRuntimeConfig(
+        { explicit: new Set(), publish: [] },
+        existing,
+    );
+    assert.equal(omitted.routerPublish, null);
+
+    const port = mergeDesiredRuntimeConfig(
+        parseHostInvocation(['--port', '19000', 'list', 'agents']),
+        existing,
+    );
+    assert.deepEqual(port.routerPublish, {
+        hostIp: '127.0.0.1',
+        hostPort: '19000',
+        containerPort: '8080',
+        protocol: 'tcp',
+    });
+
+    const lan = mergeDesiredRuntimeConfig(
+        parseHostInvocation(['--listen-lan', 'list', 'agents']),
+        existing,
+    );
+    assert.deepEqual(lan.routerPublish, {
+        hostIp: '0.0.0.0',
+        hostPort: '8080',
+        containerPort: '8080',
+        protocol: 'tcp',
+    });
+});
+
+test('desired config omitted image migrates only the known legacy official reference', () => {
+    const custom = {
+        ...normalizeContainerInspect('docker', dockerInspect),
+        image: 'registry.example/custom-runtime:current',
+        contract: '',
+    };
+    assert.equal(
+        mergeDesiredRuntimeConfig(
+            { explicit: new Set(), publish: [] },
+            custom,
+        ).image,
+        'registry.example/custom-runtime:current',
+    );
+    const legacy = {
+        ...custom,
+        image: 'docker.io/assistos/ploinky-box:podman-node24',
+    };
+    assert.equal(
+        mergeDesiredRuntimeConfig(
+            { explicit: new Set(), publish: [] },
+            legacy,
+        ).image,
+        REQUIRED_RUNTIME_IMAGE,
+    );
+});
+
+test('podman and docker build equivalent creation commands (engine parity)', () => {
+    const dockerConfig = normalizeContainerInspect('docker', dockerInspect);
+    const podmanConfig = normalizeContainerInspect('podman', podmanInspect);
+    const dockerArgs = buildRuntimeRunArgs(dockerConfig, {
+        engine: 'docker',
+        selinux: false,
+    });
+    const podmanArgs = buildRuntimeRunArgs(podmanConfig, {
+        engine: 'podman',
+        selinux: false,
+    });
+    const canonical = args => args.map(value =>
+        value.replace(':/opt/ploinky/node_modules:U', ':/opt/ploinky/node_modules')
+            .replace(':/workspace/mounted:rw,rprivate,rbind', ':/workspace/mounted')
+    );
+    assert.deepEqual(canonical(podmanArgs), canonical(dockerArgs));
+    assert.ok(podmanArgs.includes(
+        'ploinky-box-demo-ploinky-deps:/opt/ploinky/node_modules:U',
+    ));
+    assert.ok(dockerArgs.includes(
+        'ploinky-box-demo-ploinky-deps:/opt/ploinky/node_modules',
+    ));
+    for (const args of [podmanArgs, dockerArgs]) {
+        assert.ok(args.includes('--privileged'));
+        assert.ok(args.includes('/dev/fuse:/dev/fuse:rwm'));
+        assert.ok(args.includes('/dev/net/tun:/dev/net/tun:rwm'));
+        assert.ok(args.includes('seccomp=unconfined'));
+        assert.equal(args.at(-1), REQUIRED_IMAGE);
+    }
+});
+
+test('fake podman and docker construct equivalent runtime creates (engine parity)', async () => {
+    const runArgs = {};
+    for (const engine of ['podman', 'docker']) {
+        const harness = createSupervisorHarness({
+            engine,
+            container: null,
+            images: contractV1Images(),
+        });
+        assert.equal(await harness.supervisor.run(['list', 'agents']), 0);
+        runArgs[engine] = harness.calls.find(call => call.args[0] === 'run').args;
+    }
+    const canonical = args => args.map(value =>
+        value.replace(':/opt/ploinky/node_modules:U', ':/opt/ploinky/node_modules')
+    );
+    assert.deepEqual(canonical(runArgs.podman), canonical(runArgs.docker));
+    assert.ok(runArgs.podman.includes(
+        'ploinky-box-demo-ploinky-deps:/opt/ploinky/node_modules:U',
+    ));
+    assert.ok(runArgs.docker.includes(
+        'ploinky-box-demo-ploinky-deps:/opt/ploinky/node_modules',
+    ));
+});
+
+test('inspect model performs a local existing-image contract lookup', async () => {
+    const harness = createSupervisorHarness({
+        engine: 'podman',
+        container: compatibleRunningContainer(),
+        images: contractV1Images(),
+    });
+    assert.equal(await harness.supervisor.run(['list', 'agents']), 0);
+    assert.ok(harness.calls.some(call =>
+        call.kind === 'query'
+        && call.args[0] === 'image'
+        && call.args[1] === 'inspect'
+        && call.args[2] === 'sha256:runtime-v1'
+    ));
+    assert.ok(!harness.calls.some(call =>
+        call.kind === 'run' && call.args[0] === 'pull'
+    ));
+});
+
+test('review regression: engine failures preserve status, signal, and spawn details through the boundary', async () => {
+    const directCases = [
+        {
+            result: { status: 7, signal: null },
+            exitCode: 7,
+            message: /exited 7/,
+        },
+        {
+            result: { status: null, signal: 'SIGTERM' },
+            exitCode: 143,
+            message: /SIGTERM/,
+        },
+        {
+            result: {
+                status: null,
+                signal: null,
+                error: new Error('spawn podman ENOENT'),
+            },
+            exitCode: 1,
+            message: /spawn podman ENOENT/,
+        },
+    ];
+    for (const expected of directCases) {
+        const client = createEngineClient({
+            name: 'podman',
+            spawnSyncImpl: () => expected.result,
+        });
+        assert.throws(
+            () => client.run(['exec', 'demo']),
+            error => error.exitCode === expected.exitCode
+                && expected.message.test(error.message),
+        );
+    }
+
+    const boundarySpawn = finalResult => (_name, args, options) => {
+        if (options.encoding === 'utf8') {
+            if (args[0] === 'machine') {
+                return { status: 0, stdout: 'running\n', stderr: '' };
+            }
+            if (args[0] === 'container' && args.includes('--format')) {
+                return { status: 0, stdout: 'running\n', stderr: '' };
+            }
+            if (args[0] === 'container') {
+                return {
+                    status: 0,
+                    stdout: JSON.stringify(dockerInspect),
+                    stderr: '',
+                };
+            }
+            if (args[0] === 'image') {
+                return {
+                    status: 0,
+                    stdout: JSON.stringify([contractV1Image()]),
+                    stderr: '',
+                };
+            }
+            if (args[0] === 'exec') {
+                return { status: 0, stdout: '', stderr: '' };
+            }
+            return { status: 1, stdout: '', stderr: 'unsupported query' };
+        }
+        return finalResult;
+    };
+    for (const expected of directCases) {
+        const stderr = captureWritable();
+        const raw = createRuntimeSupervisor({
+            ...minimalSupervisorDependencies(),
+            detectEngine: () => 'podman',
+            spawnSyncImpl: boundarySpawn(expected.result),
+        });
+        assert.equal(
+            await runSupervisorWithBoundary(
+                raw,
+                ['list', 'agents'],
+                stderr.stream,
+            ),
+            expected.exitCode,
+        );
+        assert.match(stderr.text(), expected.message);
+    }
+});
+
+test('review regression: empty or unidentified container inspect fails before mutation', async () => {
+    for (const raw of [[], null, {}, [null], [{}], { State: {} }]) {
+        assert.throws(
+            () => normalizeContainerInspect('podman', raw),
+            /invalid container inspect: missing identifying record/,
+        );
+    }
+    assert.doesNotThrow(() => normalizeContainerInspect('docker', dockerInspect));
+    assert.doesNotThrow(() => normalizeContainerInspect('podman', podmanInspect));
+
+    const harness = createSupervisorHarness({
+        engine: 'podman',
+        container: {
+            inspect: {
+                State: { Status: 'running' },
+                Config: {},
+                HostConfig: {},
+                Mounts: [],
+            },
+        },
+    });
+    assert.equal(await harness.supervisor.run(['list', 'agents']), 1);
+    assert.match(
+        harness.stderr,
+        /invalid container inspect: missing identifying record/,
+    );
+    assert.deepEqual(
+        harness.calls.filter(call => call.kind === 'run'),
+        [],
+    );
+});
+
+test('review regression: structurally malformed container inspect fails before mutation', async () => {
+    const malformed = [
+        { Id: 'x' },
+        { Id: 'x', State: { Status: 'exited' } },
+        {
+            Id: 42,
+            Config: {},
+            State: { Status: 'exited' },
+            HostConfig: {},
+            Mounts: [],
+        },
+        {
+            Id: 'x',
+            Config: [],
+            State: { Status: 'exited' },
+            HostConfig: {},
+            Mounts: [],
+        },
+        {
+            Id: 'x',
+            Config: {},
+            State: { Running: true },
+            HostConfig: {},
+            Mounts: [],
+        },
+        {
+            Id: 'x',
+            Config: {},
+            State: { Status: 1 },
+            HostConfig: {},
+            Mounts: [],
+        },
+        {
+            Id: 'x',
+            Config: {},
+            State: { Status: 'exited' },
+            HostConfig: [],
+            Mounts: [],
+        },
+        {
+            Id: 'x',
+            Config: {},
+            State: { Status: 'exited' },
+            HostConfig: {},
+            Mounts: {},
+        },
+    ];
+
+    for (const inspect of malformed) {
+        assert.throws(
+            () => normalizeContainerInspect('podman', inspect),
+            /invalid container inspect/,
+        );
+        const harness = createSupervisorHarness({
+            engine: 'podman',
+            container: { inspect },
+        });
+        assert.equal(await harness.supervisor.run(['list', 'agents']), 1);
+        assert.match(harness.stderr, /invalid container inspect/);
+        assert.deepEqual(
+            harness.calls.filter(call => call.kind === 'run'),
+            [],
+        );
+    }
+});
+
+test('review regression: merged publishes reject only conflicting host sockets', () => {
+    const claim = (
+        hostIp,
+        hostPort,
+        containerPort,
+        protocol = 'tcp',
+    ) => ({ hostIp, hostPort, containerPort, protocol });
+
+    assert.throws(
+        () => mergeAndValidatePublishes([
+            claim('0.0.0.0', '8080-8082', '9000-9002'),
+            claim('127.0.0.1', '8081', '9100'),
+        ]),
+        /overlapping runtime publish host socket 8081\/tcp: wildcard bind .* conflicts with specific bind /,
+    );
+    assert.throws(
+        () => mergeAndValidatePublishes(
+            [claim('', '8080', '9000')],
+            [claim('127.0.0.1', '8080', '9100')],
+        ),
+        /overlapping runtime publish host socket 8080\/tcp: wildcard bind .* conflicts with specific bind /,
+    );
+
+    assert.equal(
+        mergeAndValidatePublishes(
+            [claim('0.0.0.0', '8080', '9000', 'tcp')],
+            [claim('127.0.0.1', '8080', '9100', 'udp')],
+        ).length,
+        2,
+    );
+    assert.equal(
+        mergeAndValidatePublishes([
+            claim('127.0.0.1', '8080', '9000'),
+            claim('127.0.0.2', '8080', '9100'),
+        ]).length,
+        2,
+    );
+    assert.deepEqual(
+        mergeAndValidatePublishes(
+            [claim('0.0.0.0', '8080', '9000')],
+            [claim('127.0.0.1', '8080', '9000')],
+        ),
+        [claim('0.0.0.0', '8080', '9000')],
+    );
+});
+
+test('review regression: ephemeral host port zero publishes do not collide', () => {
+    const publishes = [
+        {
+            hostIp: '127.0.0.1',
+            hostPort: '0',
+            containerPort: '9000',
+            protocol: 'tcp',
+        },
+        {
+            hostIp: '',
+            hostPort: '0',
+            containerPort: '9100',
+            protocol: 'tcp',
+        },
+    ];
+
+    assert.deepEqual(
+        mergeAndValidatePublishes(publishes),
+        publishes,
+    );
+});
+
+test('review regression: router publish rejects a merged fixed-socket conflict before mutation', async () => {
+    const invocation = {
+        name: 'demo',
+        image: REQUIRED_IMAGE,
+        port: '8080',
+        listenLan: false,
+        publish: ['127.0.0.1:8080:9000/tcp'],
+        explicit: new Set(['--publish']),
+        sourceDirResolved: '/src/ploinky',
+        mountDirResolved: '',
+    };
+    assert.throws(
+        () => mergeDesiredRuntimeConfig(invocation, null),
+        /overlapping runtime publish host socket 8080\/tcp/,
+    );
+
+    const duplicate = mergeDesiredRuntimeConfig({
+        ...invocation,
+        publish: ['127.0.0.1:8080:8080/tcp'],
+    }, null);
+    assert.deepEqual(duplicate.extraPublishes, []);
+
+    const harness = createSupervisorHarness({
+        engine: 'podman',
+        container: null,
+        images: contractV1Images(),
+    });
+    assert.equal(await harness.supervisor.run([
+        '--publish', '127.0.0.1:8080:9000/tcp',
+        'list', 'agents',
+    ]), 1);
+    assert.match(
+        harness.stderr,
+        /overlapping runtime publish host socket 8080\/tcp/,
+    );
+    assert.deepEqual(
+        harness.calls.filter(call => call.kind === 'run'),
+        [],
+    );
+});
+
+test('review regression: fake engine models replacement rollback and health phases', async () => {
+    const replacementArgs = [
+        'run', '-d', '--name', 'ploinky-box-demo', REQUIRED_IMAGE,
+    ];
+    const afterHealthFailure = createFakeEngine({
+        engine: 'podman',
+        container: compatibleRunningContainer(),
+        images: contractV1Images(),
+        failures: { 'run rollback': 9 },
+    });
+    afterHealthFailure.engineClient.query([
+        'container', 'inspect', 'ploinky-box-demo',
+    ]);
+    afterHealthFailure.engineClient.run(['rm', 'ploinky-box-demo']);
+    afterHealthFailure.engineClient.run(replacementArgs);
+    afterHealthFailure.engineClient.run(['rm', 'ploinky-box-demo']);
+    assert.throws(
+        () => afterHealthFailure.engineClient.run(replacementArgs),
+        /run rollback exited 9/,
+    );
+
+    const afterCreationFailure = createFakeEngine({
+        engine: 'podman',
+        container: compatibleRunningContainer(),
+        images: contractV1Images(),
+        failures: { 'run replacement': 8, 'run rollback': 9 },
+    });
+    afterCreationFailure.engineClient.query([
+        'container', 'inspect', 'ploinky-box-demo',
+    ]);
+    afterCreationFailure.engineClient.run(['rm', 'ploinky-box-demo']);
+    assert.throws(
+        () => afterCreationFailure.engineClient.run(replacementArgs),
+        /run replacement exited 8/,
+    );
+    assert.throws(
+        () => afterCreationFailure.engineClient.run(replacementArgs),
+        /run rollback exited 9/,
+    );
+
+    const harness = createSupervisorHarness({
+        engine: 'podman',
+        container: null,
+        images: contractV1Images(),
+    });
+    assert.equal(await harness.supervisor.run(['list', 'agents']), 0);
+    assert.ok(harness.calls.some(call =>
+        call.kind === 'health' && call.phase === 'create'
+    ));
+});
 
 function makeFakeNodeCapture() {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-node-'));
@@ -131,6 +989,16 @@ function checkAbsent(out, needle, description) {
 
 function countOccurrences(out, needle) {
     return out.split(needle).length - 1;
+}
+
+function dryRunPublishTokens(out, engine = 'podman') {
+    const prefix = `DRY-RUN: ${engine} run `;
+    const line = out.split('\n').find(candidate => candidate.startsWith(prefix));
+    assert.ok(line, `missing ${engine} dry-run create command in: ${out}`);
+    const args = line.slice(`DRY-RUN: ${engine} `.length).trim().split(/\s+/);
+    return args.flatMap((token, index) =>
+        token === '-p' ? [args[index + 1]] : []
+    );
 }
 
 function makeFakePloinkyGraphSource({
@@ -256,6 +1124,7 @@ case "$1 $2" in
     exit 1
     ;;
   "image inspect")
+    echo '[{"Id":"sha256:runtime-v1","Config":{"Labels":{"io.assistos.ploinky.runtime-contract":"1"}}}]'
     exit 0
     ;;
   "info --format")
@@ -470,7 +1339,6 @@ test('ploinky-install-deps resets a partial achillesAgentLib before installing w
 // --- Added with the Node implementation: syntax + import-level unit tests ---
 import {
     parseHostInvocation,
-    buildRunArgs,
     instanceName,
     volumeNames,
     publicUsageText,
@@ -483,6 +1351,16 @@ import {
     shouldInstallDeps,
     inferPublicStartBranchArgs,
 } from './runtime-supervisor.mjs';
+
+function buildArgsForInvocation(cfg, options = {}) {
+    cfg.name ||= 'demo';
+    cfg.sourceDirResolved ||= REPO_ROOT;
+    const config = createDefaultRuntimeConfig(cfg);
+    return buildRuntimeRunArgs(config, {
+        engine: cfg.engine || 'podman',
+        ...options,
+    });
+}
 
 test('host routing has no box lifecycle namespace', () => {
     assert.deepEqual(routeHostInvocation(parseHostInvocation([])), { kind: 'repl' });
@@ -681,27 +1559,132 @@ test('volume naming includes the deps volume', () => {
     });
 });
 
-test('buildRunArgs: selinux label only when the engine reports it; image is last', () => {
+test('buildRuntimeRunArgs: selinux label only when the engine reports it; image is last', () => {
     const cfg = parseHostInvocation([], {});
-    const plain = buildRunArgs(cfg, { selinux: false });
-    const labeled = buildRunArgs(cfg, { selinux: true });
+    const plain = buildArgsForInvocation(cfg, { selinux: false });
+    const labeled = buildArgsForInvocation(cfg, { selinux: true });
     assert.ok(!plain.join(' ').includes('label=disable'));
     assert.ok(labeled.join(' ').includes('--security-opt label=disable'));
-    assert.equal(plain[plain.length - 1], 'docker.io/assistos/ploinky-box:podman-node24');
+    assert.equal(plain[plain.length - 1], REQUIRED_IMAGE);
     assert.ok(plain.includes('--privileged'));
 });
 
-test('buildRunArgs: read-only source mount plus writable deps volume', () => {
+test('buildRuntimeRunArgs: explicit publish spelling stays exact while config is normalized', () => {
+    const cases = [
+        {
+            raw: '8081',
+            normalized: {
+                hostIp: '', hostPort: '', containerPort: '8081', protocol: 'tcp',
+            },
+        },
+        {
+            raw: '18081:8081',
+            normalized: {
+                hostIp: '', hostPort: '18081', containerPort: '8081', protocol: 'tcp',
+            },
+        },
+        {
+            raw: '18081:8081/tcp',
+            normalized: {
+                hostIp: '', hostPort: '18081', containerPort: '8081', protocol: 'tcp',
+            },
+        },
+        {
+            raw: '127.0.0.1:18081:8081',
+            normalized: {
+                hostIp: '127.0.0.1', hostPort: '18081', containerPort: '8081', protocol: 'tcp',
+            },
+        },
+        {
+            raw: '127.0.0.1:18081:08081',
+            normalized: {
+                hostIp: '127.0.0.1', hostPort: '18081', containerPort: '8081', protocol: 'tcp',
+            },
+        },
+        {
+            raw: '127.0.0.1::8081',
+            normalized: {
+                hostIp: '127.0.0.1', hostPort: '', containerPort: '8081', protocol: 'tcp',
+            },
+        },
+    ];
+
+    for (const expected of cases) {
+        const invocation = parseHostInvocation([
+            '--publish', expected.raw,
+        ], {});
+        invocation.name ||= 'demo';
+        invocation.sourceDirResolved ||= REPO_ROOT;
+        const config = createDefaultRuntimeConfig(invocation);
+        assert.deepEqual(config.extraPublishes, [expected.normalized]);
+
+        const args = buildRuntimeRunArgs(config, {
+            engine: 'podman',
+            selinux: false,
+        });
+        const publishTokens = args.flatMap((token, index) =>
+            token === '-p' ? [args[index + 1]] : []
+        );
+        assert.deepEqual(publishTokens, [
+            '127.0.0.1:8080:8080',
+            expected.raw,
+        ]);
+    }
+
+    const canonicalInvocation = parseHostInvocation([], {});
+    canonicalInvocation.name ||= 'demo';
+    canonicalInvocation.sourceDirResolved ||= REPO_ROOT;
+    const canonicalConfig = createDefaultRuntimeConfig(canonicalInvocation);
+    canonicalConfig.extraPublishes = mergeAndValidatePublishes([{
+        hostIp: '127.0.0.1',
+        hostPort: '',
+        containerPort: '8081',
+        protocol: 'tcp',
+    }]);
+    const canonicalArgs = buildRuntimeRunArgs(canonicalConfig, {
+        engine: 'podman',
+        selinux: false,
+    });
+    const canonicalPublishes = canonicalArgs.flatMap((token, index) =>
+        token === '-p' ? [canonicalArgs[index + 1]] : []
+    );
+    assert.deepEqual(canonicalPublishes, [
+        '127.0.0.1:8080:8080',
+        '127.0.0.1::8081',
+    ]);
+});
+
+test('buildRuntimeRunArgs: null router keeps exact raw extra publish spelling', () => {
+    const invocation = parseHostInvocation([
+        '--publish', '18081:8081/tcp',
+    ], {});
+    invocation.name ||= 'demo';
+    invocation.sourceDirResolved ||= REPO_ROOT;
+    const config = createDefaultRuntimeConfig(invocation);
+    config.routerPublish = null;
+
+    const args = buildRuntimeRunArgs(config, {
+        engine: 'podman',
+        selinux: false,
+    });
+    const publishTokens = args.flatMap((token, index) =>
+        token === '-p' ? [args[index + 1]] : []
+    );
+    assert.deepEqual(publishTokens, ['18081:8081/tcp']);
+});
+
+test('buildRuntimeRunArgs: read-only source mount plus writable deps volume', () => {
     const podmanCfg = parseHostInvocation(['--engine', 'podman'], {});
-    const podmanArgs = buildRunArgs(podmanCfg, { selinux: false }).join(' ');
+    const podmanArgs = buildArgsForInvocation(podmanCfg, { selinux: false }).join(' ');
     assert.ok(podmanArgs.includes(`-v ${REPO_ROOT}:/opt/ploinky:ro`), podmanArgs);
-    assert.ok(podmanArgs.includes(`-v ${path.join(REPO_ROOT, 'container', 'ploinky-box-marker')}:/etc/ploinky-box:ro`), podmanArgs);
+    assert.ok(!podmanArgs.includes('ploinky-box-marker'), podmanArgs);
+    assert.ok(!podmanArgs.includes(':/etc/ploinky-box'), podmanArgs);
     assert.ok(podmanArgs.includes('-ploinky-deps:/opt/ploinky/node_modules:U'), podmanArgs);
     assert.ok(!podmanArgs.includes('/workspace:ro'), 'workspace stays writable');
     assert.ok(!podmanArgs.includes('PLOINKY_BOX='), 'no PLOINKY_BOX env injection');
 
     const dockerCfg = parseHostInvocation(['--engine', 'docker'], {});
-    const dockerArgs = buildRunArgs(dockerCfg, { selinux: false }).join(' ');
+    const dockerArgs = buildArgsForInvocation(dockerCfg, { selinux: false }).join(' ');
     assert.ok(dockerArgs.includes('-ploinky-deps:/opt/ploinky/node_modules '), dockerArgs);
     assert.ok(!dockerArgs.includes(':U'), 'docker gets no :U volume option');
 });
@@ -760,12 +1743,14 @@ test('automatic runtime preparation exits nonzero when dependency install is dec
     }
 });
 
-test('buildRunArgs: mount is appended only when set, before the image', () => {
+test('buildRuntimeRunArgs: mount is appended only when set, before the image', () => {
     const cfg = parseHostInvocation(['--mount', '/tmp'], {});
     cfg.mountDirResolved = '/tmp';
-    const args = buildRunArgs(cfg, { selinux: false });
-    assert.equal(args[args.length - 3], '-v');
-    assert.equal(args[args.length - 2], '/tmp:/workspace/mounted');
+    const args = buildArgsForInvocation(cfg, { selinux: false });
+    const mountIndex = args.indexOf('/tmp:/workspace/mounted');
+    assert.equal(args[mountIndex - 1], '-v');
+    assert.ok(mountIndex < args.indexOf('-e'));
+    assert.ok(mountIndex < args.length - 1);
 });
 
 test('bin/ploinky bash syntax and single-entry contract', () => {
@@ -962,6 +1947,7 @@ test('public start preserves every supported explicit publish form and suppresse
     const cases = [
         '8081',
         '18081:8081',
+        '18081:8081/tcp',
         '127.0.0.1:18081:8081',
     ];
     for (const explicit of cases) {
@@ -976,8 +1962,15 @@ test('public start preserves every supported explicit publish form and suppresse
                 'start', 'explorer',
             );
             assert.equal(status, 0, out);
-            checkIncludes(out, `-p ${explicit}`, `explicit publish '${explicit}' is passed through byte-for-byte`);
-            checkAbsent(out, '-p 127.0.0.1:8081:8081', `explicit publish '${explicit}' suppresses generated 8081/tcp`);
+            const publishes = dryRunPublishTokens(out);
+            assert.ok(
+                publishes.includes(explicit),
+                `explicit publish '${explicit}' is passed through byte-for-byte\n  in: ${out}`,
+            );
+            assert.ok(
+                !publishes.includes('127.0.0.1:8081:8081'),
+                `explicit publish '${explicit}' suppresses generated 8081/tcp\n  in: ${out}`,
+            );
         } finally {
             source.cleanup();
         }
@@ -1017,8 +2010,15 @@ test('public start canonicalizes leading zeroes only for suppression and never r
             'start', 'explorer',
         );
         assert.equal(status, 0, out);
-        checkIncludes(out, `-p ${explicit}`, 'the engine receives the exact leading-zero publish');
-        checkAbsent(out, '-p 127.0.0.1:8081:8081', 'leading zeroes cannot bypass generated-target suppression');
+        const publishes = dryRunPublishTokens(out);
+        assert.ok(
+            publishes.includes(explicit),
+            `the engine receives the exact leading-zero publish\n  in: ${out}`,
+        );
+        assert.ok(
+            !publishes.includes('127.0.0.1:8081:8081'),
+            `leading zeroes cannot bypass generated-target suppression\n  in: ${out}`,
+        );
     } finally {
         source.cleanup();
     }
@@ -1083,7 +2083,7 @@ test('public start keeps generated UDP when an explicit TCP target uses the same
             'start', 'explorer',
         );
         assert.equal(status, 0, out);
-        checkIncludes(out, `-p ${explicit}`, 'the explicit TCP publish is preserved');
+        checkIncludes(out, '-p 18081:8081', 'the explicit TCP publish is preserved');
         checkIncludes(out, '-p 127.0.0.1:8081:8081/udp', 'same-number UDP remains independent');
     } finally {
         source.cleanup();
