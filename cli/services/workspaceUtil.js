@@ -23,6 +23,10 @@ import { LOGS_DIR, PLOINKY_CWD, PLOINKY_WORKSPACE_ROOT, ROUTING_FILE, RUNNING_DI
 import { classifyDependencyGraphWaitMode, resolveWorkspaceDependencyGraph, topologicallyGroupDependencyGraph } from './workspaceDependencyGraph.js';
 import { mergeRoutingConfig, readRoutingConfig } from './routingFile.js';
 import { waitForAgentReady } from '../server/utils/agentReadiness.js';
+import {
+  formatAgentAttachmentBanner,
+  resolveAgentAttachmentIdentity,
+} from './layerIdentification.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -148,13 +152,13 @@ function shellQuote(str) {
   return `'${s.replace(/'/g, "'\\''")}'`;
 }
 
-function wrapCliWithWebchat(command) {
+function wrapCliWithWebchat(command, env = process.env) {
   const trimmed = (command || '').trim();
   if (!trimmed) return trimmed;
-  if (process.env.PLOINKY_SKIP_MANIFEST_CLI_WEBCHAT === '1') {
+  if (env.PLOINKY_SKIP_MANIFEST_CLI_WEBCHAT === '1') {
     return trimmed;
   }
-  const enableWrap = process.env.PLOINKY_MANIFEST_CLI_WEBCHAT === '1';
+  const enableWrap = env.PLOINKY_MANIFEST_CLI_WEBCHAT === '1';
   if (!enableWrap) {
     return trimmed;
   }
@@ -947,46 +951,68 @@ async function startWorkspace(staticAgentArg, portArg, { refreshComponentToken, 
   }
 }
 
-async function runCli(agentName, args) {
+export async function runCliWithDependencies(agentName, args, dependencies) {
   if (!agentName) { throw new Error('Usage: cli <agentName> [args...]'); }
-  const suppressLauncherLogs = process.env.PLOINKY_NO_TTY === '1';
+  const {
+    env,
+    resolveEnabledAgentRecord,
+    findAgent,
+    enableAgent,
+    readManifest,
+    ensureAgentService,
+    getAgentContainerName,
+    resolveAgentReadinessProtocol: resolveAgentReadinessProtocolImpl = resolveAgentReadinessProtocol,
+    waitForManifestReadiness: waitForManifestReadinessImpl = waitForManifestReadiness,
+    waitForAgentReady: waitForAgentReadyImpl,
+    loadAgentsMap: loadAgentsMapImpl,
+    attachInteractive,
+    attachBwrapInteractive,
+    attachSeatbeltInteractive,
+    projectPath,
+    debugLog = () => {},
+    log = () => {},
+    warn = () => {},
+    error = () => {},
+    withSuspendedInput = callback => callback(),
+  } = dependencies;
+  const suppressLauncherLogs = env.PLOINKY_NO_TTY === '1';
   let registryRecord = null;
   let manifestLookup = agentName;
   try {
-    registryRecord = agentsSvc.resolveEnabledAgentRecord(agentName);
+    registryRecord = resolveEnabledAgentRecord(agentName);
   } catch (err) {
-    console.error(err?.message || err);
+    error(err?.message || err);
     return;
   }
 
   if (!registryRecord) {
     let autoEnableRef = null;
     try {
-      const resolved = utils.findAgent(agentName);
+      const resolved = findAgent(agentName);
       autoEnableRef = `${resolved.repo}/${resolved.shortAgentName}`;
       manifestLookup = autoEnableRef;
     } catch (err) {
-      console.error(`Agent '${agentName}' is not found.`);
+      error(`Agent '${agentName}' is not found.`);
       if (err?.message) {
-        console.error(err.message);
+        error(err.message);
       }
       return;
     }
 
     try {
-      agentsSvc.enableAgent(autoEnableRef, 'global');
+      enableAgent(autoEnableRef, 'global');
     } catch (err) {
-      console.error(`Failed to enable '${agentName}' in global mode: ${err?.message || err}`);
+      error(`Failed to enable '${agentName}' in global mode: ${err?.message || err}`);
       return;
     }
 
     try {
-      registryRecord = agentsSvc.resolveEnabledAgentRecord(agentName);
+      registryRecord = resolveEnabledAgentRecord(agentName);
       if (!registryRecord) {
-        registryRecord = agentsSvc.resolveEnabledAgentRecord(autoEnableRef);
+        registryRecord = resolveEnabledAgentRecord(autoEnableRef);
       }
     } catch (err) {
-      console.error(err?.message || err);
+      error(err?.message || err);
       return;
     }
   }
@@ -994,8 +1020,8 @@ async function runCli(agentName, args) {
   const resolvedManifestRef = registryRecord
     ? `${registryRecord.record.repoName}/${registryRecord.record.agentName}`
     : manifestLookup;
-  const { manifestPath, shortAgentName } = utils.findAgent(resolvedManifestRef);
-  const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+  const { manifestPath, shortAgentName } = findAgent(resolvedManifestRef);
+  const manifest = readManifest(manifestPath);
   const cliBase = getCliCmd(manifest);
   if (!cliBase || !cliBase.trim()) { throw new Error(`Manifest for '${shortAgentName}' has no 'cli' command.`); }
 
@@ -1011,18 +1037,17 @@ async function runCli(agentName, args) {
   }).filter(Boolean);
   const ssoPrefix = ssoExports.length ? 'export ' + ssoExports.join(' ') + '; ' : '';
   const rawCmd = ssoPrefix + cliBase + (regularArgs.length ? (' ' + regularArgs.join(' ')) : '');
-  const cmd = wrapCliWithWebchat(rawCmd);
-  const { ensureAgentService, attachInteractive, getConfiguredProjectPath, getAgentContainerName } = dockerSvc;
+  const cmd = wrapCliWithWebchat(rawCmd, env);
   const agentDir = path.dirname(manifestPath);
   const repoName = path.basename(path.dirname(agentDir));
-  utils.debugLog(`[runCli] agent=${agentName} container=${registryRecord?.containerName || getAgentContainerName(shortAgentName, repoName)}`);
+  debugLog(`[runCli] agent=${agentName} container=${registryRecord?.containerName || getAgentContainerName(shortAgentName, repoName)}`);
   const containerInfo = ensureAgentService(shortAgentName, manifest, agentDir, { containerName: registryRecord?.containerName, alias: registryRecord?.record?.alias });
   const containerName = (containerInfo && containerInfo.containerName)
     || registryRecord?.containerName
     || getAgentContainerName(shortAgentName, repoName);
-  const readinessProtocol = resolveAgentReadinessProtocol(manifest);
+  const readinessProtocol = resolveAgentReadinessProtocolImpl(manifest);
   if (readinessProtocol === 'script') {
-    await waitForManifestReadiness({
+    await waitForManifestReadinessImpl({
       key: `cli:${shortAgentName}`,
       label: shortAgentName,
       manifest,
@@ -1036,13 +1061,13 @@ async function runCli(agentName, args) {
     const hostPort = containerInfo?.hostPort;
     if (!hostPort) {
       if (!suppressLauncherLogs) {
-        console.warn(`[cli] warning: cannot wait for '${shortAgentName}' readiness because no host port was resolved.`);
+        warn(`[cli] warning: cannot wait for '${shortAgentName}' readiness because no host port was resolved.`);
       }
     } else {
       if (!suppressLauncherLogs) {
-        console.log(`[cli] Waiting for '${shortAgentName}' readiness (${readinessProtocol}) on port ${hostPort}...`);
+        log(`[cli] Waiting for '${shortAgentName}' readiness (${readinessProtocol}) on port ${hostPort}...`);
       }
-      const ready = await waitForAgentReady({ hostPort }, {
+      const ready = await waitForAgentReadyImpl({ hostPort }, {
         timeoutMs: 600000,
         protocol: readinessProtocol,
       });
@@ -1051,29 +1076,65 @@ async function runCli(agentName, args) {
       }
     }
   }
-  const projPath = PLOINKY_CWD;
 
   // Determine actual runtime from registry (may differ from manifest if sandbox
   // failed and fell back to container during ensureAgentService)
-  const agents = loadAgentsMap();
+  const agents = loadAgentsMapImpl();
   const registryEntry = agents[containerName] || {};
   const actualRuntime = registryEntry.runtime;
 
+  if (!suppressLauncherLogs) {
+    const identity = resolveAgentAttachmentIdentity(
+      shortAgentName,
+      containerName,
+      agents,
+    );
+    for (const line of formatAgentAttachmentBanner(identity)) {
+      log(line);
+    }
+  }
+
   if (actualRuntime === 'bwrap') {
-    const { attachBwrapInteractive } = await import('./bwrap/bwrapServiceManager.js');
-    runWithSuspendedInput(() => {
-      attachBwrapInteractive(shortAgentName, manifest, agentDir, projPath, cmd, { containerName });
+    const attach = attachBwrapInteractive
+      || (await import('./bwrap/bwrapServiceManager.js')).attachBwrapInteractive;
+    withSuspendedInput(() => {
+      attach(shortAgentName, manifest, agentDir, projectPath, cmd, { containerName });
     });
   } else if (actualRuntime === 'seatbelt') {
-    const { attachSeatbeltInteractive } = await import('./seatbelt/seatbeltServiceManager.js');
-    runWithSuspendedInput(() => {
-      attachSeatbeltInteractive(shortAgentName, manifest, agentDir, projPath, cmd, { containerName });
+    const attach = attachSeatbeltInteractive
+      || (await import('./seatbelt/seatbeltServiceManager.js')).attachSeatbeltInteractive;
+    withSuspendedInput(() => {
+      attach(shortAgentName, manifest, agentDir, projectPath, cmd, { containerName });
     });
   } else {
-    runWithSuspendedInput(() => {
-      attachInteractive(containerName, projPath, cmd);
+    withSuspendedInput(() => {
+      attachInteractive(containerName, projectPath, cmd);
     });
   }
+}
+
+async function runCli(agentName, args) {
+  const { ensureAgentService, attachInteractive, getAgentContainerName } = dockerSvc;
+  return runCliWithDependencies(agentName, args, {
+    env: process.env,
+    resolveEnabledAgentRecord: (...callArgs) => agentsSvc.resolveEnabledAgentRecord(...callArgs),
+    findAgent: (...callArgs) => utils.findAgent(...callArgs),
+    enableAgent: (...callArgs) => agentsSvc.enableAgent(...callArgs),
+    readManifest: manifestPath => JSON.parse(fs.readFileSync(manifestPath, 'utf8')),
+    ensureAgentService,
+    getAgentContainerName,
+    resolveAgentReadinessProtocol,
+    waitForManifestReadiness,
+    waitForAgentReady,
+    loadAgentsMap,
+    attachInteractive,
+    projectPath: PLOINKY_CWD,
+    debugLog: (...callArgs) => utils.debugLog(...callArgs),
+    log: (...callArgs) => console.log(...callArgs),
+    warn: (...callArgs) => console.warn(...callArgs),
+    error: (...callArgs) => console.error(...callArgs),
+    withSuspendedInput: runWithSuspendedInput,
+  });
 }
 
 async function runShell(agentName) {

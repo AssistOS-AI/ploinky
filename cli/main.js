@@ -394,7 +394,7 @@ function startInteractiveMode() {
     // If input is not a TTY, we are in script mode. Don't show initial prompt.
     if (process.stdin.isTTY) {
         console.log('Welcome to Ploinky interactive mode.');
-        console.log("Type 'help' for a list of commands. Use 'exit' to leave, 'shutdown' to close session containers, or 'destroy' to remove all Ploinky containers.");
+        console.log("Type 'help' for a list of commands. Use 'exit' to leave, 'shutdown' to close session containers, or 'destroy' to remove workspace containers while leaving the outer runtime running.");
         rl.prompt();
     }
 }

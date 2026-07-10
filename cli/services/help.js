@@ -1,4 +1,4 @@
-export function showHelp(args = []) {
+export function showHelp(args = [], { surface = 'core' } = {}) {
     // Parse help arguments
     const topic = args[0];
     const subtopic = args[1];
@@ -7,11 +7,30 @@ export function showHelp(args = []) {
     // Detailed help for specific commands
     if (topic) {
         if (topic === 'cloud') { console.log('Cloud commands are not available in this build.'); return; }
-        return showDetailedHelp(topic, subtopic, subsubtopic);
+        return showDetailedHelp(topic, subtopic, subsubtopic, { surface });
     }
-    
-    // Main help overview
-    console.log(`
+
+    console.log(mainHelpText(surface));
+}
+
+function lifecycleHelpLines(surface) {
+    if (surface === 'host') {
+        return [
+            '  status                         Show combined, read-only outer runtime and workspace status',
+            '  stop                           Stop core services, then stop the outer runtime',
+            '  destroy                        Confirm and remove the outer runtime and its three volumes',
+        ];
+    }
+    return [
+        '  status                         Show workspace/router/agent state',
+        '  stop | shutdown | clean         Stop workspace services and leave the outer runtime running',
+        '  destroy                        Remove workspace containers and leave the outer runtime running',
+        '  Exit the REPL before running host ploinky stop or ploinky destroy.',
+    ];
+}
+
+function mainHelpText(surface) {
+    return `
 ╔═══ PLOINKY ═══╗ Container Development & Cloud Platform
 
 ▶ LOCAL DEVELOPMENT
@@ -23,6 +42,7 @@ export function showHelp(args = []) {
   start <agent> [port] [--profile <name>]
                                  Start agents from .ploinky/agents.json and launch Router
   shell <agentName>              Open interactive shell in container (attached TTY)
+  cli                            Open /bin/bash in the managed outer runtime; exit returns to the previous prompt.
   cli <agentName> [args...]      Run manifest "cli" command (attached TTY)
   webchat [--rotate]             Print the WebChat access URL and support agent URL params
   dashboard [--rotate]           Show or rotate Dashboard token and print access URL
@@ -44,11 +64,10 @@ export function showHelp(args = []) {
   client list resources          Aggregate resources exposed by all agents
   client status <agent>          One-line status (HTTP code, parsed)
 
-  status | restart               Show state | restart enabled agents + Router
+${lifecycleHelpLines(surface).join('\n')}
+  restart                        Restart enabled agents + Router
   disable agents-all             Disable all enabled agents and remove their containers
   reinstall <agentName>          Re-create a running agent container (destructive)
-  stop | shutdown | clean        Stop containers | remove containers
-  destroy                        Stop router and remove workspace containers
   logs tail [router]             Follow router logs
   logs last <N>                  Show last N router log lines
 
@@ -58,10 +77,10 @@ export function showHelp(args = []) {
 
 Config stored in .ploinky/ • Type 'help' for commands
 ╚═══════════════════════════════════════════════════════╝
-`);
+`;
 }
 
-function showDetailedHelp(topic, subtopic, subsubtopic) {
+function showDetailedHelp(topic, subtopic, subsubtopic, { surface = 'core' } = {}) {
     const helpContent = {
         // Local development commands
         'add': {
@@ -683,6 +702,55 @@ function showDetailedHelp(topic, subtopic, subsubtopic) {
             }
         }
     };
+
+    const lifecycleDetails = surface === 'host'
+        ? {
+            status: {
+                description: 'Show combined, read-only outer runtime and workspace status.',
+                notes: 'This host-level status inspects the outer runtime and available core state without starting or reconciling anything.',
+            },
+            stop: {
+                description: 'Stop core services, then stop the outer runtime.',
+                notes: 'This host-level command preserves the outer runtime volumes.',
+            },
+            destroy: {
+                description: 'Confirm and remove the outer runtime and its three volumes.',
+                notes: 'This host-level command removes the selected runtime workspace, dependency, and nested-container-storage volumes.',
+            },
+        }
+        : {
+            status: {
+                description: 'Show workspace/router/agent state.',
+                notes: 'This core command leaves the outer runtime running.',
+            },
+            stop: {
+                description: 'Stop workspace services and leave the outer runtime running.',
+                notes: 'Exit the REPL before running host ploinky stop or ploinky destroy.',
+            },
+            destroy: {
+                description: 'Remove workspace containers and leave the outer runtime running.',
+                notes: 'Exit the REPL before running host ploinky stop or ploinky destroy.',
+            },
+        };
+    if (lifecycleDetails[topic]) {
+        helpContent[topic] = {
+            ...helpContent[topic],
+            ...lifecycleDetails[topic],
+        };
+    }
+
+    if (topic === 'cli' && !subtopic) {
+        console.log(`
+╔═══ HELP: cli ═══╗
+
+cli
+  Open /bin/bash in the managed outer runtime; exit returns to the previous prompt.
+
+cli <agentName> [args...]
+  Run the agent manifest CLI command interactively (attached TTY).
+`);
+        return;
+    }
     
     // Display help based on requested topic (removed - not needed since we're already inside showDetailedHelp)
     

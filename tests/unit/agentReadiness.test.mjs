@@ -5,8 +5,66 @@ import net from 'node:net';
 import { waitForAgentReady } from '../../cli/server/utils/agentReadiness.js';
 import {
     buildBlockingReadinessEntryFromNode,
+    runCliWithDependencies,
     waitForReadinessEntries,
 } from '../../cli/services/workspaceUtil.js';
+
+function agentCliHarness({ noTTY = false } = {}) {
+    const events = [];
+    const logs = [];
+    let enabled = false;
+    const record = {
+        containerName: 'nested-explorer',
+        record: {
+            repoName: 'AssistOSExplorer',
+            agentName: 'explorer',
+        },
+    };
+    return {
+        events,
+        logs,
+        dependencies: {
+            env: noTTY ? { PLOINKY_NO_TTY: '1' } : {},
+            resolveEnabledAgentRecord: () => enabled ? record : null,
+            findAgent: () => ({
+                repo: 'AssistOSExplorer',
+                manifestPath: '/fixtures/AssistOSExplorer/explorer/manifest.json',
+                shortAgentName: 'explorer',
+            }),
+            enableAgent: reference => {
+                events.push(['enable', reference]);
+                enabled = true;
+            },
+            readManifest: () => ({
+                cli: '/Agent/default_cli.sh',
+                readiness: { protocol: 'mcp' },
+            }),
+            ensureAgentService: () => {
+                events.push(['ensure']);
+                return { containerName: 'nested-explorer', hostPort: 15517 };
+            },
+            waitForAgentReady: async () => {
+                events.push(['ready']);
+                return true;
+            },
+            loadAgentsMap: () => ({
+                'nested-explorer': {
+                    runtime: 'container',
+                    containerImage: 'docker.io/assistos/ploinky-node:24-bookworm-tools',
+                },
+            }),
+            attachInteractive: (containerName, projectPath, command) => {
+                events.push(['attach', containerName, projectPath, command]);
+            },
+            projectPath: '/workspace',
+            log: line => {
+                logs.push(line);
+                if (line.startsWith('[ploinky] image=')) events.push(['banner']);
+            },
+            warn: line => logs.push(line),
+        },
+    };
+}
 
 function listenOnEphemeralPort() {
     return new Promise((resolve, reject) => {
@@ -209,4 +267,29 @@ test('script readiness failure blocks the caller', async () => {
         }),
         /service.*ready\.sh.*exit 7.*not ready/i,
     );
+});
+
+test('runCli auto-enables waits identifies final image then attaches', async () => {
+    const harness = agentCliHarness();
+    await runCliWithDependencies(
+        'explorer',
+        ['--help'],
+        harness.dependencies,
+    );
+    assert.deepEqual(
+        harness.events.map(event => event[0]),
+        ['enable', 'ensure', 'ready', 'banner', 'attach'],
+    );
+    assert.deepEqual(harness.logs.slice(-3), [
+        "[ploinky] Attaching to agent 'explorer'",
+        '[ploinky] container=nested-explorer',
+        '[ploinky] image=docker.io/assistos/ploinky-node:24-bookworm-tools',
+    ]);
+});
+
+test('runCli no-tty suppresses banners but preserves attachment', async () => {
+    const harness = agentCliHarness({ noTTY: true });
+    await runCliWithDependencies('explorer', [], harness.dependencies);
+    assert.equal(harness.logs.some(line => line.startsWith('[ploinky]')), false);
+    assert.ok(harness.events.some(event => event[0] === 'attach'));
 });
