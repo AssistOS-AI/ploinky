@@ -1737,6 +1737,162 @@ test('stopped status still reports image contract without invoking core', async 
 });
 
 for (const engine of ['podman', 'docker']) {
+    test(engine + ' stop attempts outer stop after core failure', async () => {
+        const harness = createSupervisorHarness({
+            engine,
+            container: compatibleRunningContainer(),
+            failures: { 'exec ploinky stop': 9 },
+        });
+        assert.equal(await harness.supervisor.run(['stop']), 1);
+        const phases = harness.calls
+            .filter(call => call.kind === 'run')
+            .map(call => call.args[0]);
+        assert.deepEqual(phases, ['exec', 'stop']);
+        assert.match(harness.stderr, /core shutdown: failed \(exit 9\)/);
+        assert.match(harness.stdout, /outer runtime stop: succeeded/);
+        assert.equal(harness.calls.some(call => call.args[0] === 'pull'), false);
+    });
+
+    test(engine + ' destroy requires the exact target confirmation', async () => {
+        const harness = createSupervisorHarness({
+            engine,
+            container: compatibleStoppedContainer(),
+            volumes: [
+                'ploinky-box-demo-workspace',
+                'ploinky-box-demo-containers',
+                'ploinky-box-demo-ploinky-deps',
+            ],
+            answer: 'y',
+        });
+        assert.equal(await harness.supervisor.run(['destroy']), 0);
+        assert.match(harness.prompt, /ploinky-box-demo/);
+        assert.match(harness.prompt, /ploinky-box-demo-workspace/);
+        assert.match(harness.prompt, /ploinky-box-demo-containers/);
+        assert.match(harness.prompt, /ploinky-box-demo-ploinky-deps/);
+        assert.deepEqual(
+            harness.calls.find(call => call.args[0] === 'volume').args,
+            [
+                'volume', 'rm',
+                'ploinky-box-demo-workspace',
+                'ploinky-box-demo-containers',
+                'ploinky-box-demo-ploinky-deps',
+            ],
+        );
+    });
+
+    for (const [name, container] of [
+        ['missing', null],
+        ['already stopped', compatibleStoppedContainer()],
+    ]) {
+        test(engine + ' stop is successful when runtime is ' + name, async () => {
+            const harness = createSupervisorHarness({
+                engine,
+                container,
+                images: container ? contractV1Images() : {},
+            });
+            assert.equal(await harness.supervisor.run(['stop']), 0);
+            assert.equal(
+                harness.calls.some(call =>
+                    ['exec', 'stop', 'pull', 'run'].includes(call.args[0])
+                ),
+                false,
+            );
+        });
+    }
+
+    test(engine + ' destroy is idempotent when container and selected volumes are missing', async () => {
+        const harness = createSupervisorHarness({
+            engine,
+            container: null,
+            volumes: [],
+        });
+        assert.equal(await harness.supervisor.run(['destroy']), 0);
+        assert.equal(harness.prompt, '');
+        assert.equal(
+            harness.calls.some(call => call.kind === 'run'),
+            false,
+        );
+    });
+
+    for (const answer of ['n', '']) {
+        test(engine + ' destroy refusal ' + JSON.stringify(answer) + ' mutates nothing', async () => {
+            const harness = createSupervisorHarness({
+                engine,
+                container: compatibleStoppedContainer(),
+                volumes: ['ploinky-box-demo-workspace'],
+                answer,
+            });
+            assert.equal(await harness.supervisor.run(['destroy']), 1);
+            assert.equal(
+                harness.calls.some(call =>
+                    ['stop', 'rm', 'volume'].includes(call.args[0])
+                ),
+                false,
+            );
+        });
+    }
+
+    test(engine + ' destroy reports removal failure and still attempts selected cleanup', async () => {
+        const harness = createSupervisorHarness({
+            engine,
+            container: compatibleStoppedContainer(),
+            volumes: [
+                'ploinky-box-demo-workspace',
+                'ploinky-box-demo-containers',
+                'ploinky-box-demo-ploinky-deps',
+            ],
+            answer: 'y',
+            failures: { 'rm container': 7 },
+        });
+        assert.equal(await harness.supervisor.run(['destroy']), 1);
+        assert.ok(harness.calls.some(call => call.args[0] === 'volume'));
+    });
+
+    const creationFlagCases = [
+        ['--port', '19090'],
+        ['--publish', '127.0.0.1:9000:9000/tcp'],
+        ['--expose', '127.0.0.1:9000:9000/tcp'],
+        ['--image', 'registry.example/runtime:test'],
+        ['--mount', '/tmp/mounted'],
+        ['--listen-lan'],
+    ];
+    for (const command of ['status', 'stop', 'destroy']) {
+        for (const flagArgs of creationFlagCases) {
+            test(engine + ' ' + command + ' rejects creation flag ' + flagArgs[0], async () => {
+                const harness = createSupervisorHarness({
+                    engine,
+                    container: null,
+                    volumes: [],
+                });
+                assert.equal(
+                    await harness.supervisor.run([...flagArgs, command]),
+                    1,
+                );
+                assert.match(harness.stderr, /only valid for runtime creation/);
+                assert.equal(
+                    harness.calls.some(call => call.kind === 'run'),
+                    false,
+                );
+            });
+        }
+    }
+}
+
+test('state commands accept engine and instance selectors', async () => {
+    const harness = createSupervisorHarness({
+        engine: 'docker',
+        container: null,
+    });
+    assert.equal(
+        await harness.supervisor.run([
+            '--engine', 'docker', '--name', 'alternate', 'stop',
+        ]),
+        0,
+    );
+    assert.doesNotMatch(harness.stderr, /only valid for runtime creation/);
+});
+
+for (const engine of ['podman', 'docker']) {
     test(engine + ' matching running runtime is reused without pull or recreation', async () => {
         const harness = createSupervisorHarness({
             engine,
@@ -2827,22 +2983,50 @@ test('public status inspects the inferred runtime without creating it', () => {
     }
 });
 
-test('public destroy targets the outer volume destroy command', () => {
-    const { out, status } = publicRun('podman', '--name', 'qa', '--dry-run', 'destroy');
-    assert.equal(status, 0, out);
-    checkIncludes(out, 'volume rm ploinky-box-qa-workspace ploinky-box-qa-containers ploinky-box-qa-ploinky-deps', 'public destroy removes outer volumes');
-    checkIncludes(out, "'ploinky-box-qa' and its volumes removed.", 'public destroy uses outer destroy behavior');
-    checkAbsent(out, 'DRY-RUN: podman run -d', 'public destroy does not create/start the box first');
-    checkAbsent(out, 'exec -w /workspace ploinky-box-qa ploinky destroy', 'public destroy does not run in-box destroy');
+test('public destroy reports an explicitly selected missing outer runtime', () => {
+    const fake = makeMissingStatusEngine();
+    try {
+        const { out, status } = publicRunWithEnv(
+            { PATH: `${fake.dir}:${process.env.PATH || ''}` },
+            'podman',
+            '--name', 'qa',
+            '--dry-run',
+            'destroy',
+        );
+        assert.equal(status, 0, out);
+        checkIncludes(out, "destroy: nothing to remove for 'ploinky-box-qa'", 'public destroy reports the absent selected runtime');
+        checkAbsent(out, 'DRY-RUN: podman run -d', 'public destroy does not create/start the box first');
+        checkAbsent(out, 'volume rm', 'public destroy does not remove absent volumes');
+        checkAbsent(out, 'exec -w /workspace ploinky-box-qa ploinky destroy', 'public destroy does not run in-box destroy');
+        const calls = fs.readFileSync(fake.calls, 'utf8');
+        checkIncludes(calls, 'container inspect ploinky-box-qa', 'public destroy inspects the selected outer runtime');
+        checkIncludes(calls, 'volume inspect ploinky-box-qa-workspace', 'public destroy inspects the selected workspace volume');
+    } finally {
+        fs.rmSync(fake.dir, { recursive: true, force: true });
+    }
 });
 
-test('public destroy honors --name after the command for the outer box', () => {
-    const { out, status } = publicRun('podman', '--dry-run', 'destroy', '--name', 'qa');
-    assert.equal(status, 0, out);
-    checkIncludes(out, 'volume rm ploinky-box-qa-workspace ploinky-box-qa-containers ploinky-box-qa-ploinky-deps', 'post-command --name selects outer volumes');
-    checkIncludes(out, "'ploinky-box-qa' and its volumes removed.", 'post-command --name uses outer destroy behavior');
-    checkAbsent(out, 'ploinky destroy --name qa', 'post-command --name is not forwarded in-box');
-    checkAbsent(out, 'exec -w /workspace ploinky-box-qa ploinky destroy', 'post-command --name does not run in-box destroy');
+test('public destroy honors --name after the command for the outer runtime', () => {
+    const fake = makeMissingStatusEngine();
+    try {
+        const { out, status } = publicRunWithEnv(
+            { PATH: `${fake.dir}:${process.env.PATH || ''}` },
+            'podman',
+            '--dry-run',
+            'destroy',
+            '--name', 'qa',
+        );
+        assert.equal(status, 0, out);
+        checkIncludes(out, "destroy: nothing to remove for 'ploinky-box-qa'", 'post-command --name selects the outer runtime');
+        checkAbsent(out, 'ploinky destroy --name qa', 'post-command --name is not forwarded in-box');
+        checkAbsent(out, 'volume rm', 'post-command --name does not remove absent volumes');
+        assert.equal(
+            fs.readFileSync(fake.calls, 'utf8').split('\n').filter(Boolean)[0],
+            'container inspect ploinky-box-qa',
+        );
+    } finally {
+        fs.rmSync(fake.dir, { recursive: true, force: true });
+    }
 });
 
 test('public no-arg command opens the in-runtime Ploinky REPL', () => {
@@ -3455,14 +3639,25 @@ test('status targets the inferred instance', () => {
     }
 });
 
-test('destroy targets the inferred instance and says so', () => {
+test('destroy targets an inferred missing instance without mutation', () => {
     const { parent, dir } = makeCwd('testExplorerFresh');
+    const fake = makeMissingStatusEngine();
     try {
-        const { out } = publicRunIn(dir, 'podman', '--dry-run', 'destroy');
-        checkIncludes(out, "targeting 'ploinky-box-testExplorerFresh' (name inferred from the current directory)", 'destroy announces the inferred target');
-        checkIncludes(out, 'volume rm ploinky-box-testExplorerFresh-workspace ploinky-box-testExplorerFresh-containers ploinky-box-testExplorerFresh-ploinky-deps', 'destroy removes all three volumes');
-        checkIncludes(out, "'ploinky-box-testExplorerFresh' and its volumes removed.", 'destroy resolves the inferred name');
+        const { out, status } = publicRunInWithEnv(
+            dir,
+            { PATH: `${fake.dir}:${process.env.PATH || ''}` },
+            'podman',
+            '--dry-run',
+            'destroy',
+        );
+        assert.equal(status, 0, out);
+        checkIncludes(out, "destroy: nothing to remove for 'ploinky-box-testExplorerFresh'", 'destroy resolves and reports the inferred target');
+        checkAbsent(out, 'volume rm', 'destroy does not mutate absent inferred resources');
+        const calls = fs.readFileSync(fake.calls, 'utf8');
+        checkIncludes(calls, 'container inspect ploinky-box-testExplorerFresh', 'destroy inspects the inferred runtime');
+        checkIncludes(calls, 'volume inspect ploinky-box-testExplorerFresh-ploinky-deps', 'destroy inspects all inferred volumes');
     } finally {
         fs.rmSync(parent, { recursive: true, force: true });
+        fs.rmSync(fake.dir, { recursive: true, force: true });
     }
 });

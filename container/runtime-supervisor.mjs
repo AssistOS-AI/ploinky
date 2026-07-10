@@ -189,6 +189,27 @@ export function routeHostInvocation(invocation) {
     };
 }
 
+const CREATION_FLAGS = new Set([
+    '--port',
+    '--publish',
+    '--expose',
+    '--image',
+    '--mount',
+    '--listen-lan',
+]);
+
+export function assertStateCommandFlags(invocation) {
+    if (!['status', 'stop', 'destroy'].includes(invocation.command)) return;
+    const rejected = [...invocation.explicit]
+        .find(flag => CREATION_FLAGS.has(flag));
+    if (rejected) {
+        throw new Error(
+            invocation.command + ': ' + rejected
+            + ' is only valid for runtime creation',
+        );
+    }
+}
+
 export function instanceName(cfg) {
     return `${BOX_PREFIX}-${cfg.name}`;
 }
@@ -218,12 +239,6 @@ export function resolveInstanceIdentity(cfg, cwd = process.cwd()) {
     cfg.name = inferred;
     cfg.nameSource = 'cwd';
     return cfg;
-}
-
-function inferredNote(cfg) {
-    return cfg.nameSource === 'cwd'
-        ? ' (name inferred from the current directory; pass --name X to target another instance)'
-        : '';
 }
 
 function isExecutableFile(candidate) {
@@ -341,20 +356,11 @@ function preflight(cfg) {
     }
 }
 
-function runtimeExists(cfg) {
-    return query(cfg, ['container', 'inspect', instanceName(cfg)]).ok;
-}
-
 function namedRuntimeExists(cfg, instance) {
     return query(
         cfg,
         ['container', 'inspect', '--format', '{{.Id}}', instance],
     ).ok;
-}
-
-function runtimeRunning(cfg) {
-    return query(cfg, ['container', 'inspect', '--format', '{{.State.Status}}', instanceName(cfg)])
-        .stdout.trim() === 'running';
 }
 
 function runtimeHostPort(cfg) {
@@ -589,23 +595,6 @@ async function ensureDepsInstalled(cfg, { fatalOnDecline = false } = {}) {
     }
     runEngine(cfg, ['exec', '-i', instanceName(cfg), '/opt/ploinky/bin/ploinky-install-deps']);
     return true;
-}
-
-function gracefulPloinkyStop(cfg) {
-    if (!cfg.dryRun && runtimeRunning(cfg)) {
-        runEngine(
-            cfg,
-            [
-                'exec',
-                '-e', `PLOINKY_RUNTIME_NAME=${instanceName(cfg)}`,
-                '-w', '/workspace',
-                instanceName(cfg),
-                'timeout', '30',
-                'ploinky', 'stop',
-            ],
-            { silence: 'all', allowFail: true },
-        );
-    }
 }
 
 async function urlOk(cfg, url) {
@@ -1088,40 +1077,102 @@ export async function reportCombinedStatus(context) {
     return coreStatus;
 }
 
-function stopRuntime(cfg) {
-    preflight(cfg);
-    if (!runtimeExists(cfg)) {
-        output(cfg, `ploinky: '${instanceName(cfg)}' does not exist.${inferredNote(cfg)}\n`);
+export function stopSystem({ engine, invocation, stdout, stderr }) {
+    const instance = instanceName(invocation);
+    const existing = inspectRuntimeIfPresent(engine, instance);
+    if (!existing || !existing.running) {
+        stdout.write(`runtime: '${instance}' already stopped\n`);
         return 0;
     }
-    gracefulPloinkyStop(cfg);
-    runEngine(cfg, ['stop', instanceName(cfg)], { silence: 'stdout' });
-    output(cfg, `ploinky: '${instanceName(cfg)}' stopped (volumes kept).\n`);
-    return 0;
+
+    const coreCode = engine.run([
+        'exec',
+        '-e', `PLOINKY_RUNTIME_NAME=${instance}`,
+        '-w', '/workspace',
+        instance,
+        'timeout', '30',
+        'ploinky', 'stop',
+    ], { allowFail: true, silence: 'all' });
+    const outerCode = engine.run(['stop', instance], {
+        allowFail: true,
+        silence: 'all',
+    });
+
+    if (coreCode === 0) stdout.write('core shutdown: succeeded\n');
+    else stderr.write(`core shutdown: failed (exit ${coreCode})\n`);
+    if (outerCode === 0) stdout.write('outer runtime stop: succeeded\n');
+    else stderr.write(`outer runtime stop: failed (exit ${outerCode})\n`);
+    return coreCode === 0 && outerCode === 0 ? 0 : 1;
 }
 
-async function destroyRuntime(cfg) {
-    preflight(cfg);
-    const instance = instanceName(cfg);
-    const { workspace, containers, deps } = volumeNames(cfg);
-    if (cfg.nameSource === 'cwd') {
-        errorOutput(cfg, `ploinky: targeting '${instance}' (name inferred from the current directory)\n`);
+export async function destroySystem({
+    engine,
+    invocation,
+    stdout,
+    stderr,
+    askLine: ask,
+}) {
+    const instance = instanceName(invocation);
+    const { workspace, containers, deps } = volumeNames(invocation);
+    const selectedVolumes = [workspace, containers, deps];
+    const existing = inspectRuntimeIfPresent(engine, instance);
+    const anyVolume = existing
+        ? true
+        : selectedVolumes.some(name =>
+            engine.query(['volume', 'inspect', name]).ok
+        );
+
+    if (!existing && !anyVolume) {
+        stdout.write(`destroy: nothing to remove for '${instance}'\n`);
+        return 0;
     }
-    if (!cfg.dryRun) {
-        const anyVolume = query(cfg, ['volume', 'inspect', workspace]).ok
-            || query(cfg, ['volume', 'inspect', containers]).ok
-            || query(cfg, ['volume', 'inspect', deps]).ok;
-        if (!runtimeExists(cfg) && !anyVolume) {
-            die(`nothing to destroy: no container or volumes for '${instance}'${inferredNote(cfg)}`);
-        }
-        const reply = await runtimeDependencies(cfg).askLine(`Remove container '${instance}' and volumes '${workspace}' + '${containers}' + '${deps}'? [y/N] `);
-        if (!/^[yY]$/.test(reply ?? '')) die('aborted');
+
+    const prompt =
+        `Remove container '${instance}' and volumes '`
+        + `${workspace}' + '${containers}' + '${deps}'? [y/N] `;
+    const reply = await ask(prompt);
+    if (!/^[yY]$/.test(reply || '')) {
+        stderr.write('destroy: aborted\n');
+        return 1;
     }
-    runEngine(cfg, ['stop', instance], { silence: 'all', allowFail: true });
-    runEngine(cfg, ['rm', instance], { silence: 'all', allowFail: true });
-    runEngine(cfg, ['volume', 'rm', workspace, containers, deps], { silence: cfg.dryRun ? 'none' : 'all', allowFail: true });
-    output(cfg, `ploinky: '${instance}' and its volumes removed.\n`);
-    return 0;
+
+    let failed = false;
+    const recordFailure = (label, code) => {
+        if (code === 0) return;
+        failed = true;
+        stderr.write(`destroy: ${label} failed (exit ${code})\n`);
+    };
+
+    if (existing?.running) {
+        recordFailure('core shutdown', engine.run([
+            'exec',
+            '-e', `PLOINKY_RUNTIME_NAME=${instance}`,
+            '-w', '/workspace',
+            instance,
+            'timeout', '30',
+            'ploinky', 'stop',
+        ], { allowFail: true, silence: 'all' }));
+    }
+    if (existing) {
+        recordFailure('outer runtime stop', engine.run(['stop', instance], {
+            allowFail: true,
+            silence: 'all',
+        }));
+        recordFailure('container removal', engine.run(['rm', instance], {
+            allowFail: true,
+            silence: 'all',
+        }));
+    }
+    if (anyVolume) {
+        recordFailure('volume removal', engine.run([
+            'volume', 'rm', ...selectedVolumes,
+        ], { allowFail: true, silence: 'all' }));
+    }
+
+    if (!failed) {
+        stdout.write(`ploinky: '${instance}' and its volumes removed.\n`);
+    }
+    return failed ? 1 : 0;
 }
 
 function defaultDependencies() {
@@ -1160,6 +1211,7 @@ export function createRuntimeSupervisor(dependencies = {}) {
                 }
                 return 0;
             }
+            assertStateCommandFlags(invocation);
             if (
                 route.kind === 'ordinary'
                 && route.forwardedArgs.length === 1
@@ -1214,8 +1266,23 @@ export function createRuntimeSupervisor(dependencies = {}) {
                     stdout: deps.stdout,
                 });
             }
-            if (route.kind === 'stop') return stopRuntime(invocation);
-            if (route.kind === 'destroy') return destroyRuntime(invocation);
+            if (route.kind === 'stop') {
+                return stopSystem({
+                    engine: engineClient,
+                    invocation,
+                    stdout: deps.stdout,
+                    stderr: deps.stderr,
+                });
+            }
+            if (route.kind === 'destroy') {
+                return destroySystem({
+                    engine: engineClient,
+                    invocation,
+                    stdout: deps.stdout,
+                    stderr: deps.stderr,
+                    askLine: deps.askLine,
+                });
+            }
             if (route.kind === 'start') return startGraph(invocation);
 
             const runtime = await reconcileRuntime(invocation, {
