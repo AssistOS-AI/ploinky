@@ -484,20 +484,18 @@ function inspectExistingRuntimeConfig(cfg) {
     return existing;
 }
 
-function ensureImage(cfg, imageRef) {
-    if (cfg.dryRun) return;
-    let image = inspectedImage(cfg, imageRef);
+function obtainAndValidateImage(cfg, imageRef, { forcePull = false } = {}) {
+    if (cfg.dryRun) return null;
+    let image = forcePull ? null : inspectedImage(cfg, imageRef);
     if (!image) {
-        const code = runEngine(cfg, ['pull', imageRef], { allowFail: true });
-        if (code !== 0) {
-            die(`cannot pull ${imageRef}.
-  - Publish it: gh workflow run publish-ploinky-box-image.yml --repo AssistOS-AI/container-image-builds
-  - Or point at another image with --image`);
-        }
+        runEngine(cfg, ['pull', imageRef]);
         image = inspectedImage(cfg, imageRef);
     }
-    if (!image) die(`cannot inspect runtime image '${imageRef}' after pull`);
+    if (!image) {
+        die(`Runtime image '${imageRef}' was unavailable after pull`);
+    }
     validateImageContract(image, imageRef);
+    return image;
 }
 
 function portInUse(port, host = '127.0.0.1', timeoutMs = 500) {
@@ -586,18 +584,18 @@ async function ensureDepsInstalled(cfg, { fatalOnDecline = false } = {}) {
     return true;
 }
 
-function requireRuntimeRunning(cfg) {
-    if (cfg.dryRun) return;
-    if (!runtimeRunning(cfg)) {
-        die(`'${instanceName(cfg)}' is not running; run a normal ploinky command to start it`);
-    }
-}
-
 function gracefulPloinkyStop(cfg) {
     if (!cfg.dryRun && runtimeRunning(cfg)) {
         runEngine(
             cfg,
-            ['exec', '-w', '/workspace', instanceName(cfg), 'timeout', '30', 'ploinky', 'stop'],
+            [
+                'exec',
+                '-e', `PLOINKY_RUNTIME_NAME=${instanceName(cfg)}`,
+                '-w', '/workspace',
+                instanceName(cfg),
+                'timeout', '30',
+                'ploinky', 'stop',
+            ],
             { silence: 'all', allowFail: true },
         );
     }
@@ -627,7 +625,10 @@ function askLine(promptText) {
     });
 }
 
-async function ensureRuntime(cfg, { fatalOnDepsDecline = false } = {}) {
+export async function reconcileRuntime(
+    cfg,
+    { fatalOnDepsDecline = false } = {},
+) {
     validateHostPort(cfg.port, `${cfg.command || 'runtime'}: host port`);
     validatePublishSpecs(cfg);
     preflight(cfg);
@@ -649,35 +650,148 @@ async function ensureRuntime(cfg, { fatalOnDepsDecline = false } = {}) {
     cfg._runtimeConfig = desired;
     cfg._reconciliationPlan = plan;
 
-    if (existing?.running) {
-        output(cfg, `ploinky: '${instanceName(cfg)}' already running.\n`);
-        fixDepsOwnership(cfg);
-        if (!await ensureDepsInstalled(cfg, { fatalOnDecline: fatalOnDepsDecline })) {
-            throw new SupervisorError('Ploinky dependencies are required before running this command');
+    const requireDependencies = async () => {
+        if (!await ensureDepsInstalled(cfg, {
+            fatalOnDecline: fatalOnDepsDecline,
+        })) {
+            throw new SupervisorError(
+                'Ploinky dependencies are required before running this command',
+            );
         }
-        return;
-    }
-    let phase;
-    if (existing) {
-        runEngine(cfg, ['start', instanceName(cfg)], { silence: 'stdout' });
-        phase = 'start';
-    } else {
+    };
+    const running = () => ({
+        ...desired,
+        state: 'running',
+        running: true,
+    });
+
+    switch (plan.action) {
+    case 'reuse':
+        await waitHealthy(cfg, 'reuse');
+        await requireDependencies();
+        return existing;
+    case 'start':
+        runEngine(cfg, ['start', desired.instance], { silence: 'stdout' });
+        await waitHealthy(cfg, 'start');
+        fixDepsOwnership(cfg);
+        await requireDependencies();
+        return running();
+    case 'create': {
         const portCheck = runtimeDependencies(cfg).portInUse || portInUse;
-        if (!cfg.dryRun && await portCheck(desired.routerPublish.hostPort)) {
+        if (
+            !cfg.dryRun
+            && desired.routerPublish
+            && await portCheck(desired.routerPublish.hostPort)
+        ) {
             die(`host port ${cfg.port} is already in use; choose another with --port`);
         }
-        ensureImage(cfg, desired.image);
+        const image = obtainAndValidateImage(cfg, desired.image);
+        if (image) {
+            desired.imageId = image.id;
+            desired.contract = image.contract;
+        }
         const selinux = cfg.dryRun ? false : engineSelinuxEnabled(cfg);
         runEngine(cfg, buildRuntimeRunArgs(desired, {
             engine: cfg.engine,
             selinux,
         }));
-        phase = 'create';
+        try {
+            await waitHealthy(cfg, 'create');
+            fixDepsOwnership(cfg);
+            await requireDependencies();
+            return running();
+        } catch (error) {
+            runEngine(cfg, ['rm', '-f', desired.instance], {
+                allowFail: true,
+                silence: 'all',
+            });
+            throw error;
+        }
     }
-    await waitHealthy(cfg, phase);
-    fixDepsOwnership(cfg);
-    if (!await ensureDepsInstalled(cfg, { fatalOnDecline: fatalOnDepsDecline })) {
-        throw new SupervisorError('Ploinky dependencies are required before running this command');
+    case 'replace':
+        return replaceRuntimeTransaction({
+            cfg,
+            existing,
+            desired,
+            fatalOnDepsDecline,
+        });
+    default:
+        throw new SupervisorError(
+            `unsupported runtime reconciliation action '${plan.action}'`,
+        );
+    }
+}
+
+export async function replaceRuntimeTransaction(context) {
+    const {
+        cfg,
+        existing,
+        desired,
+        fatalOnDepsDecline = false,
+    } = context;
+    const previous = structuredClone(existing);
+    const previousImage = existing.imageId || existing.image;
+
+    const image = obtainAndValidateImage(cfg, desired.image, {
+        forcePull: true,
+    });
+    if (image) {
+        desired.imageId = image.id;
+        desired.contract = image.contract;
+    }
+    const engineOptions = {
+        engine: cfg.engine,
+        selinux: cfg.dryRun ? false : engineSelinuxEnabled(cfg),
+    };
+
+    if (existing.running) {
+        const coreCode = runEngine(cfg, [
+            'exec',
+            '-e', `PLOINKY_RUNTIME_NAME=${existing.instance}`,
+            '-w', '/workspace',
+            existing.instance,
+            'timeout', '30',
+            'ploinky', 'stop',
+        ], { allowFail: true, silence: 'all' });
+        if (coreCode !== 0) {
+            throw new SupervisorError(
+                'runtime replacement aborted: graceful core shutdown exited '
+                + coreCode,
+                coreCode,
+            );
+        }
+        runEngine(cfg, ['stop', existing.instance], { silence: 'all' });
+    }
+    runEngine(cfg, ['rm', existing.instance], { silence: 'all' });
+
+    try {
+        runEngine(cfg, buildRuntimeRunArgs(desired, engineOptions));
+        await waitHealthy(cfg, 'replacement');
+        fixDepsOwnership(cfg);
+        if (!await ensureDepsInstalled(cfg, {
+            fatalOnDecline: fatalOnDepsDecline,
+        })) {
+            throw new SupervisorError(
+                'Ploinky dependencies are required before running this command',
+            );
+        }
+        return {
+            ...desired,
+            state: 'running',
+            running: true,
+        };
+    } catch (error) {
+        runEngine(cfg, ['rm', '-f', desired.instance], {
+            allowFail: true,
+            silence: 'all',
+        });
+        const rollback = { ...previous, image: previousImage };
+        runEngine(cfg, buildRuntimeRunArgs(rollback, engineOptions));
+        await waitHealthy(cfg, 'rollback');
+        throw new SupervisorError(
+            'runtime replacement failed; previous runtime restored: '
+            + (error.message || error),
+        );
     }
 }
 
@@ -778,9 +892,14 @@ async function startGraph(cfg) {
         sourceDir: cfg.sourceDirResolved || '',
     });
     if (!startPlan.hasAgent) {
-        await ensureRuntime(cfg, { fatalOnDepsDecline: true });
-        runEngine(cfg, ['exec', '-w', '/workspace', instanceName(cfg), 'ploinky', ...startPlan.inBoxArgs]);
-        return 0;
+        const runtime = await reconcileRuntime(cfg, {
+            fatalOnDepsDecline: true,
+        });
+        return forwardCoreCommand(
+            forwardingContext(cfg, runtime),
+            startPlan.inBoxArgs,
+            false,
+        );
     }
     if (startPlan.hostPort) {
         if (cfg.explicit.has('--port') && cfg.port !== startPlan.hostPort) {
@@ -791,12 +910,19 @@ async function startGraph(cfg) {
     validateHostPort(cfg.port, 'start: host port');
     validatePublishSpecs(cfg);
     appendGraphDrivenStartPublishes(cfg, startPlan);
-    await ensureRuntime(cfg, { fatalOnDepsDecline: true });
+    const runtime = await reconcileRuntime(cfg, {
+        fatalOnDepsDecline: true,
+    });
     const published = cfg.dryRun ? cfg.port : (runtimeHostPort(cfg) || cfg.port);
     if (!cfg.dryRun && published !== cfg.port) {
         errorOutput(cfg, `ploinky: note: existing runtime publishes host port ${published}; the requested port applies only when the runtime is created. Recreate it through normal reconciliation with --port ${cfg.port}.\n`);
     }
-    runEngine(cfg, ['exec', '-w', '/workspace', instanceName(cfg), 'ploinky', ...startPlan.inBoxArgs]);
+    const coreCode = forwardCoreCommand(
+        forwardingContext(cfg, runtime),
+        startPlan.inBoxArgs,
+        false,
+    );
+    if (coreCode !== 0) return coreCode;
     if (cfg.dryRun) return 0;
     const probePath = await probeRouter(cfg, published);
     if (probePath) {
@@ -807,13 +933,47 @@ async function startGraph(cfg) {
     return 1;
 }
 
-function forwardCoreCommand(cfg, forwardedArgs, { interactive = false } = {}) {
-    preflight(cfg);
-    requireRuntimeRunning(cfg);
+function forwardingContext(cfg, runtime) {
+    const dependencies = runtimeDependencies(cfg);
+    return {
+        invocation: cfg,
+        runtime,
+        engine: engineClientFor(cfg),
+        stdin: dependencies.stdin,
+        stdout: dependencies.stdout,
+    };
+}
+
+export function forwardCoreCommand(context, args, interactive = false) {
+    const {
+        invocation: cfg,
+        runtime,
+        engine,
+        stdin,
+        stdout,
+    } = context;
     const execArgs = ['exec'];
-    if (interactive) execArgs.push('-it');
-    execArgs.push('-w', '/workspace', instanceName(cfg), 'ploinky', ...forwardedArgs);
-    return runEngine(cfg, execArgs);
+    const hasTTY = Boolean(stdin.isTTY && stdout.isTTY);
+    if (interactive) execArgs.push(hasTTY ? '-it' : '-i');
+    if (args[0] === 'cli' && args.length > 1 && !hasTTY) {
+        execArgs.push('-e', 'PLOINKY_NO_TTY=1');
+    }
+    execArgs.push(
+        '-e', `PLOINKY_RUNTIME_NAME=${runtime.instance}`,
+        '-w', '/workspace',
+        runtime.instance,
+    );
+    if (args.length === 0) execArgs.push('p-cli');
+    else execArgs.push('ploinky', ...args);
+    try {
+        return engine.run(execArgs, { allowFail: true });
+    } catch (error) {
+        if (error instanceof SupervisorError) throw error;
+        throw new SupervisorError(
+            error?.message || String(error),
+            Number.isInteger(error?.exitCode) ? error.exitCode : 1,
+        );
+    }
 }
 
 function inspectRuntimeIfPresent(engine, instance) {
@@ -961,6 +1121,16 @@ export function createRuntimeSupervisor(dependencies = {}) {
                 }
                 return 0;
             }
+            if (
+                route.kind === 'ordinary'
+                && route.forwardedArgs.length === 1
+                && route.forwardedArgs[0] === 'cli'
+                && !(deps.stdin.isTTY && deps.stdout.isTTY)
+            ) {
+                throw new SupervisorError(
+                    "cli: parameterless 'cli' requires an interactive terminal.",
+                );
+            }
 
             const engineDryRun = invocation.dryRun
                 && route.kind !== 'status';
@@ -1009,15 +1179,21 @@ export function createRuntimeSupervisor(dependencies = {}) {
             if (route.kind === 'destroy') return destroyRuntime(invocation);
             if (route.kind === 'start') return startGraph(invocation);
 
-            await ensureRuntime(invocation, { fatalOnDepsDecline: true });
-            if (route.kind === 'repl') {
-                forwardCoreCommand(invocation, [], { interactive: true });
-                return 0;
-            }
-            forwardCoreCommand(invocation, route.forwardedArgs, {
-                interactive: route.interactive,
+            const runtime = await reconcileRuntime(invocation, {
+                fatalOnDepsDecline: true,
             });
-            return 0;
+            if (route.kind === 'repl') {
+                return forwardCoreCommand(
+                    forwardingContext(invocation, runtime),
+                    [],
+                    true,
+                );
+            }
+            return forwardCoreCommand(
+                forwardingContext(invocation, runtime),
+                route.forwardedArgs,
+                route.interactive,
+            );
         },
     };
 }

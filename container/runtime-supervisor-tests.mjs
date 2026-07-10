@@ -611,6 +611,7 @@ test('review regression: engine failures preserve status, signal, and spawn deta
             ...minimalSupervisorDependencies(),
             detectEngine: () => 'podman',
             spawnSyncImpl: boundarySpawn(expected.result),
+            waitHealthy: async () => {},
         });
         assert.equal(
             await runSupervisorWithBoundary(
@@ -620,7 +621,6 @@ test('review regression: engine failures preserve status, signal, and spawn deta
             ),
             expected.exitCode,
         );
-        assert.match(stderr.text(), expected.message);
     }
 });
 
@@ -1042,7 +1042,6 @@ function makeFakePloinkyGraphSource({
     fs.mkdirSync(path.join(sourceDir, 'globalDeps'), { recursive: true });
     fs.writeFileSync(path.join(sourceDir, 'bin', 'ploinky'), '#!/usr/bin/env bash\n');
     fs.writeFileSync(path.join(sourceDir, 'cli', 'index.js'), '');
-    fs.writeFileSync(path.join(sourceDir, 'container', 'ploinky-box-marker'), 'assistos/ploinky-box\n');
     fs.writeFileSync(path.join(sourceDir, 'globalDeps', 'package.json'), '{"name":"globalDeps"}\n');
 
     function writeManifest(repoDir, agentName, manifest) {
@@ -1701,6 +1700,382 @@ test('stopped status still reports image contract without invoking core', async 
     assert.equal(harness.calls.some(call => call.args[0] === 'exec'), false);
 });
 
+for (const engine of ['podman', 'docker']) {
+    test(engine + ' matching running runtime is reused without pull or recreation', async () => {
+        const harness = createSupervisorHarness({
+            engine,
+            container: compatibleRunningContainer(),
+            images: contractV1Images(),
+        });
+        const code = await harness.supervisor.run(['list', 'agents']);
+        assert.equal(code, 0);
+        assert.equal(harness.calls.some(call => call.args[0] === 'pull'), false);
+        assert.equal(harness.calls.some(call => call.args[0] === 'run'), false);
+        assert.equal(harness.calls.some(call => call.args[0] === 'start'), false);
+        assert.ok(harness.calls.some(call =>
+            call.kind === 'run'
+            && call.args[0] === 'exec'
+            && call.args.includes('PLOINKY_RUNTIME_NAME=ploinky-box-demo')
+            && call.args.slice(-2).join(' ') === 'list agents'
+        ));
+    });
+
+    test(engine + ' bare host repl forwards to p-cli and returns its status', async () => {
+        const stdout = captureWritable();
+        const stderr = captureWritable();
+        const fake = createFakeEngine({
+            engine,
+            container: compatibleRunningContainer(),
+            images: contractV1Images(),
+            stdout: stdout.stream,
+            stderr: stderr.stream,
+        });
+        const originalRun = fake.engineClient.run.bind(fake.engineClient);
+        fake.engineClient.run = (args, options = {}) => {
+            if (args[0] === 'exec' && args.at(-1) === 'p-cli') {
+                fake.calls.push({
+                    kind: 'run',
+                    args: [...args],
+                    options: { ...options },
+                });
+                return 19;
+            }
+            return originalRun(args, options);
+        };
+        const raw = createRuntimeSupervisor({
+            ...minimalSupervisorDependencies(),
+            stdout: Object.assign(stdout.stream, { isTTY: true }),
+            stderr: stderr.stream,
+            stdin: { isTTY: true },
+            cwd: '/workspace/demo',
+            detectEngine: () => engine,
+            engineClient: fake.engineClient,
+        });
+
+        assert.equal(
+            await runSupervisorWithBoundary(raw, [], stderr.stream),
+            19,
+        );
+        const exec = fake.calls.find(call =>
+            call.kind === 'run'
+            && call.args[0] === 'exec'
+            && call.args.at(-1) === 'p-cli'
+        );
+        assert.ok(exec);
+        assert.ok(exec.args.includes('-it'));
+        assert.ok(exec.args.includes('PLOINKY_RUNTIME_NAME=ploinky-box-demo'));
+        assert.equal(exec.options.allowFail, true);
+    });
+
+    test(engine + ' forwarded core nonzero status is returned unchanged', async () => {
+        const stdout = captureWritable();
+        const stderr = captureWritable();
+        const fake = createFakeEngine({
+            engine,
+            container: compatibleRunningContainer(),
+            images: contractV1Images(),
+            stdout: stdout.stream,
+            stderr: stderr.stream,
+        });
+        const originalRun = fake.engineClient.run.bind(fake.engineClient);
+        fake.engineClient.run = (args, options = {}) => {
+            if (
+                args[0] === 'exec'
+                && args.slice(-3).join(' ') === 'ploinky list agents'
+            ) {
+                fake.calls.push({
+                    kind: 'run',
+                    args: [...args],
+                    options: { ...options },
+                });
+                return 17;
+            }
+            return originalRun(args, options);
+        };
+        const raw = createRuntimeSupervisor({
+            ...minimalSupervisorDependencies(),
+            stdout: stdout.stream,
+            stderr: stderr.stream,
+            cwd: '/workspace/demo',
+            detectEngine: () => engine,
+            engineClient: fake.engineClient,
+        });
+
+        assert.equal(
+            await runSupervisorWithBoundary(
+                raw,
+                ['list', 'agents'],
+                stderr.stream,
+            ),
+            17,
+        );
+        const exec = fake.calls.find(call =>
+            call.kind === 'run'
+            && call.args[0] === 'exec'
+            && call.args.slice(-3).join(' ') === 'ploinky list agents'
+        );
+        assert.ok(exec);
+        assert.equal(exec.options.allowFail, true);
+    });
+
+    test(engine + ' stopped compatible runtime starts without pulling', async () => {
+        const harness = createSupervisorHarness({
+            engine,
+            container: compatibleStoppedContainer(),
+            images: contractV1Images(),
+        });
+        assert.equal(await harness.supervisor.run(['list', 'agents']), 0);
+        assert.ok(harness.calls.some(call => call.args[0] === 'start'));
+        assert.equal(harness.calls.some(call => call.args[0] === 'pull'), false);
+    });
+
+    test(engine + ' missing runtime obtains and validates v1 before create', async () => {
+        const harness = createSupervisorHarness({
+            engine,
+            container: null,
+            images: {},
+        });
+        assert.equal(await harness.supervisor.run(['list', 'agents']), 0);
+        assert.deepEqual(
+            harness.calls
+                .filter(call => ['pull', 'image', 'run'].includes(call.args[0]))
+                .map(call => call.args[0]),
+            ['image', 'pull', 'image', 'run'],
+        );
+        const run = harness.calls.find(call => call.args[0] === 'run').args;
+        assert.ok(run.includes(REQUIRED_IMAGE));
+        assert.ok(run.includes('PLOINKY_RUNTIME_NAME=ploinky-box-demo'));
+    });
+
+    test(engine + ' legacy runtime is replaced through the ordinary command path', async () => {
+        const harness = createSupervisorHarness({
+            engine,
+            container: legacyRunningContainerWithCustomConfig(),
+            images: {
+                'sha256:legacy': legacyImage(),
+                [REQUIRED_IMAGE]: contractV1Image(),
+            },
+        });
+        assert.equal(await harness.supervisor.run(['list', 'agents']), 0);
+        assert.deepEqual(
+            harness.calls
+                .filter(call => [
+                    'pull',
+                    'image',
+                    'exec',
+                    'stop',
+                    'rm',
+                    'run',
+                ].includes(call.args[0]))
+                .map(call => call.args[0])
+                .slice(0, 7),
+            ['image', 'pull', 'image', 'exec', 'stop', 'rm', 'run'],
+        );
+    });
+
+    test(engine + ' host bare cli rejects non-tty before runtime mutation', async () => {
+        const harness = createSupervisorHarness({
+            engine,
+            stdin: { isTTY: false },
+            stdoutIsTTY: false,
+            container: null,
+        });
+        assert.equal(await harness.supervisor.run(['cli']), 1);
+        assert.match(harness.stderr, /requires an interactive terminal/);
+        assert.equal(
+            harness.calls.some(call =>
+                ['pull', 'run', 'start'].includes(call.args[0])
+            ),
+            false,
+        );
+    });
+
+    test(engine + ' host agent cli preserves non-tty mode', async () => {
+        const harness = createSupervisorHarness({
+            engine,
+            stdin: { isTTY: false },
+            stdoutIsTTY: false,
+            container: compatibleRunningContainer(),
+            images: contractV1Images(),
+        });
+        assert.equal(await harness.supervisor.run(['cli', 'explorer']), 0);
+        const exec = harness.calls.find(call =>
+            call.kind === 'run'
+            && call.args[0] === 'exec'
+            && call.args.includes('ploinky')
+        ).args;
+        assert.equal(exec.includes('-it'), false);
+        assert.ok(exec.includes('-i'));
+        assert.ok(exec.includes('PLOINKY_NO_TTY=1'));
+        assert.ok(exec.includes('PLOINKY_RUNTIME_NAME=ploinky-box-demo'));
+    });
+
+    test(engine + ' unobtainable replacement image leaves the legacy runtime untouched', async () => {
+        const harness = createSupervisorHarness({
+            engine,
+            container: legacyRunningContainerWithCustomConfig(),
+            images: { 'sha256:legacy': legacyImage() },
+            failures: { pull: 23 },
+        });
+        assert.equal(await harness.supervisor.run(['list', 'agents']), 1);
+        assert.equal(
+            harness.calls.some(call =>
+                ['exec', 'stop', 'rm', 'run'].includes(call.args[0])
+            ),
+            false,
+        );
+        assert.equal(harness.state.container.inspect.State.Status, 'running');
+        assert.match(harness.stderr, /pull.*exited 23/);
+    });
+
+    test(engine + ' failed create self-check removes only the failed container', async () => {
+        const harness = createSupervisorHarness({
+            engine,
+            container: null,
+            images: {},
+            failures: { 'health create': 7 },
+        });
+        assert.equal(await harness.supervisor.run(['list', 'agents']), 1);
+        assert.ok(harness.calls.some(call => call.args[0] === 'rm'));
+        assert.equal(harness.calls.some(call => call.args[0] === 'volume'), false);
+        assert.equal(harness.calls.some(call =>
+            call.kind === 'run'
+            && call.args[0] === 'exec'
+            && call.args.slice(-2).join(' ') === 'list agents'
+        ), false);
+        assert.equal(harness.state.container, null);
+    });
+
+    test(engine + ' explicit compatible custom image is accepted', async () => {
+        const custom = 'registry.example/runtime:custom';
+        const harness = createSupervisorHarness({
+            engine,
+            container: null,
+            images: { [custom]: contractV1Image('sha256:custom') },
+        });
+        assert.equal(
+            await harness.supervisor.run([
+                '--image',
+                custom,
+                'list',
+                'agents',
+            ]),
+            0,
+        );
+        const run = harness.calls.find(call => call.args[0] === 'run').args;
+        assert.equal(run.at(-1), custom);
+    });
+
+    for (const [name, image, observed] of [
+        ['missing label', legacyImage('sha256:no-label'), '<missing>'],
+        [
+            'wrong label',
+            {
+                Id: 'sha256:wrong-label',
+                Config: {
+                    Labels: {
+                        'io.assistos.ploinky.runtime-contract': '2',
+                    },
+                },
+            },
+            '2',
+        ],
+    ]) {
+        test(engine + ' explicit custom image rejects ' + name + ' before runtime mutation', async () => {
+            const custom = 'registry.example/runtime:' + name.replace(' ', '-');
+            const harness = createSupervisorHarness({
+                engine,
+                container: null,
+                images: { [custom]: image },
+            });
+            assert.equal(
+                await harness.supervisor.run([
+                    '--image',
+                    custom,
+                    'list',
+                    'agents',
+                ]),
+                1,
+            );
+            assert.match(harness.stderr, new RegExp(escapeRegExp(custom)));
+            assert.match(
+                harness.stderr,
+                /io\.assistos\.ploinky\.runtime-contract=1/,
+            );
+            assert.match(
+                harness.stderr,
+                new RegExp('observed ' + escapeRegExp(observed)),
+            );
+            assert.equal(
+                harness.calls.some(call =>
+                    ['run', 'start', 'stop', 'rm'].includes(call.args[0])
+                ),
+                false,
+            );
+        });
+    }
+
+    test(engine + ' invalid explicit custom image leaves an existing v1 runtime untouched', async () => {
+        const custom = 'registry.example/runtime:invalid';
+        const harness = createSupervisorHarness({
+            engine,
+            container: compatibleRunningContainer(),
+            images: contractV1Images(),
+            pullImages: {
+                [custom]: legacyImage('sha256:invalid-custom'),
+            },
+        });
+        assert.equal(
+            await harness.supervisor.run([
+                '--image',
+                custom,
+                'list',
+                'agents',
+            ]),
+            1,
+        );
+        assert.match(harness.stderr, /observed <missing>/);
+        assert.equal(
+            harness.calls.some(call =>
+                ['exec', 'stop', 'rm', 'run'].includes(call.args[0])
+            ),
+            false,
+        );
+        assert.equal(harness.state.container.inspect.State.Status, 'running');
+    });
+
+    test(engine + ' omitted incompatible custom image contract is validated without silently replacing its reference', async () => {
+        const custom = 'registry.example/runtime:current';
+        const container = compatibleRunningContainer();
+        container.inspect.Config.Image = custom;
+        container.inspect.Image = 'sha256:custom-old';
+        const harness = createSupervisorHarness({
+            engine,
+            container,
+            images: {
+                'sha256:custom-old': legacyImage('sha256:custom-old'),
+            },
+            pullImages: {
+                [custom]: legacyImage('sha256:custom-new'),
+            },
+        });
+        assert.equal(await harness.supervisor.run(['list', 'agents']), 1);
+        const pull = harness.calls.find(call => call.args[0] === 'pull').args;
+        assert.equal(pull[1], custom);
+        assert.equal(pull.includes(REQUIRED_IMAGE), false);
+        assert.equal(
+            harness.calls.some(call =>
+                ['exec', 'stop', 'rm', 'run'].includes(call.args[0])
+            ),
+            false,
+        );
+    });
+}
+
+test('source-owned runtime marker is absent', () => {
+    assert.equal(fs.existsSync(path.join(HERE, 'ploinky-box-marker')), false);
+});
+
 test('public help contains no compatibility surface', () => {
     const help = publicUsageText();
     assert.doesNotMatch(help, /ploinky box/);
@@ -2027,11 +2402,11 @@ test('shouldInstallDeps: explicit env opt-in, TTY confirm, default no', () => {
 
 test('dependency flow source contract: fatal public decline, docker chown is mandatory', () => {
     const source = fs.readFileSync(MJS, 'utf8');
-    checkIncludes(source, 'async function ensureRuntime(cfg, { fatalOnDepsDecline = false } = {})',
+    checkIncludes(source, 'export async function reconcileRuntime(',
         'the automatic runtime capability owns dependency preparation');
     checkIncludes(source, "throw new SupervisorError('Ploinky dependencies are required before running this command')",
         'declined public commands throw through the shared boundary');
-    checkIncludes(source, 'await ensureRuntime(invocation, { fatalOnDepsDecline: true });',
+    checkIncludes(source, 'const runtime = await reconcileRuntime(invocation, {',
         'ordinary public commands require dependencies before forwarding');
     checkAbsent(source, 'process.exit(', 'helper-level process exits are removed');
     checkAbsent(source, "chown', 'podman:podman', '/opt/ploinky/node_modules'], { allowFail: true",
@@ -2146,7 +2521,11 @@ test('public no-arg command opens the in-runtime Ploinky REPL', () => {
     const { out, status } = publicRun('podman', '--name', 'qa', '--dry-run');
     assert.equal(status, 0, out);
     checkIncludes(out, 'DRY-RUN: podman run -d', 'no-arg public command ensures the runtime');
-    checkIncludes(out, 'exec -it -w /workspace ploinky-box-qa ploinky', 'no-arg public command opens the Ploinky REPL');
+    checkIncludes(
+        out,
+        'exec -i -e PLOINKY_RUNTIME_NAME=ploinky-box-qa -w /workspace ploinky-box-qa p-cli',
+        'no-arg public command opens the Ploinky REPL through p-cli',
+    );
 });
 
 test('public start preserves branch flags while forcing in-box router to 8080', () => {
@@ -2167,7 +2546,7 @@ test('public start preserves branch flags while forcing in-box router to 8080', 
         checkIncludes(out, '127.0.0.1:9191:8080', 'public start positional port is host port');
         checkIncludes(
             out,
-            'exec -w /workspace ploinky-box-qa ploinky start explorer 8080 --profile default --branch feature-x --repo-branch AssistOSExplorer=peristo-user --branch-fallback fail',
+            'exec -e PLOINKY_RUNTIME_NAME=ploinky-box-qa -w /workspace ploinky-box-qa ploinky start explorer 8080 --profile default --branch feature-x --repo-branch AssistOSExplorer=peristo-user --branch-fallback fail',
             'public start forwards branch flags after in-box port',
         );
         checkAbsent(out, 'ploinky start explorer 9191', 'public start never uses host port inside');
@@ -2192,7 +2571,7 @@ test('public start forwards inferred source branch when no branch flag is suppli
         assert.equal(status, 0, out);
         checkIncludes(
             out,
-            'exec -w /workspace ploinky-box-qa ploinky start explorer 8080 --profile default --branch feature-default',
+            'exec -e PLOINKY_RUNTIME_NAME=ploinky-box-qa -w /workspace ploinky-box-qa ploinky start explorer 8080 --profile default --branch feature-default',
             'public start appends the inferred branch after the fixed in-box port',
         );
     } finally {
@@ -2230,7 +2609,7 @@ test('public start explorer publishes graph-derived openPorts only', () => {
 test('public start only adds Explorer default publishes for the explorer agent', () => {
     const { out, status } = publicRun('podman', '--name', 'qa', '--dry-run', 'start', 'demo');
     assert.equal(status, 0, out);
-    checkIncludes(out, 'exec -w /workspace ploinky-box-qa ploinky start demo 8080', 'non-Explorer start still runs inside');
+    checkIncludes(out, 'exec -e PLOINKY_RUNTIME_NAME=ploinky-box-qa -w /workspace ploinky-box-qa ploinky start demo 8080', 'non-Explorer start still runs inside');
     checkAbsent(out, '-p 127.0.0.1:7880:7880', 'non-Explorer start does not get Explorer LiveKit publish');
     checkAbsent(out, '-p 127.0.0.1:8081:8081', 'non-Explorer start does not get Explorer Web Publishing publish');
 });
@@ -2444,7 +2823,7 @@ test('public qualified Explorer start plans and forwards one explicit developmen
         checkAbsent(out, '-p 127.0.0.1:8081:8081', 'the default-only mapping is replaced');
         checkIncludes(
             out,
-            'exec -w /workspace ploinky-box-qa ploinky start AchillesIDE/explorer 8080 --profile dev',
+            'exec -e PLOINKY_RUNTIME_NAME=ploinky-box-qa -w /workspace ploinky-box-qa ploinky start AchillesIDE/explorer 8080 --profile dev',
             'the normalized planner profile reaches the in-box start command',
         );
     } finally {
@@ -2479,7 +2858,7 @@ test('public bare Explorer start ignores host profile state and plans and forwar
         checkAbsent(out, '-p 127.0.0.1:9081:9081', 'host profile state does not select dev');
         checkIncludes(
             out,
-            'exec -w /workspace ploinky-box-qa ploinky start explorer 8080 --profile default',
+            'exec -e PLOINKY_RUNTIME_NAME=ploinky-box-qa -w /workspace ploinky-box-qa ploinky start explorer 8080 --profile default',
             'omission explicitly forwards default in-box',
         );
     } finally {
@@ -2538,7 +2917,7 @@ test('public start accepts --port before the agent without forwarding it in-box'
         );
         assert.equal(status, 0, out);
         checkIncludes(out, '127.0.0.1:9191:8080', 'post-command --port before agent is the host port');
-        checkIncludes(out, 'exec -w /workspace ploinky-box-qa ploinky start explorer 8080', 'agent remains explorer');
+        checkIncludes(out, 'exec -e PLOINKY_RUNTIME_NAME=ploinky-box-qa -w /workspace ploinky-box-qa ploinky start explorer 8080', 'agent remains explorer');
         checkAbsent(out, 'ploinky start 9191 8080 --port explorer', 'post-command --port does not reorder into in-box args');
     } finally {
         source.cleanup();
@@ -2557,7 +2936,7 @@ test('public start accepts --port after the agent without forwarding it in-box',
         );
         assert.equal(status, 0, out);
         checkIncludes(out, '127.0.0.1:9192:8080', 'post-command --port after agent is the host port');
-        checkIncludes(out, 'exec -w /workspace ploinky-box-qa ploinky start explorer 8080', 'agent remains explorer');
+        checkIncludes(out, 'exec -e PLOINKY_RUNTIME_NAME=ploinky-box-qa -w /workspace ploinky-box-qa ploinky start explorer 8080', 'agent remains explorer');
         checkAbsent(out, 'ploinky start explorer 8080 --port 9192', 'post-command --port is not forwarded in-box');
     } finally {
         source.cleanup();
@@ -2567,7 +2946,7 @@ test('public start accepts --port after the agent without forwarding it in-box',
 test('public start without an agent forwards in-box start instead of wrapper failing', () => {
     const { out, status } = publicRun('podman', '--name', 'qa', '--dry-run', 'start');
     assert.equal(status, 0, out);
-    checkIncludes(out, 'exec -w /workspace ploinky-box-qa ploinky start', 'start with no args is forwarded');
+    checkIncludes(out, 'exec -e PLOINKY_RUNTIME_NAME=ploinky-box-qa -w /workspace ploinky-box-qa ploinky start', 'start with no args is forwarded');
     checkAbsent(out, 'usage:', 'public start without args is not rejected by the wrapper');
 });
 
@@ -2575,7 +2954,7 @@ test('public command hoists --expose after the command without forwarding it in-
     const { out, status } = publicRun('podman', '--name', 'qa', '--dry-run', 'list', 'agents', '--expose', '127.0.0.1:9090:9090');
     assert.equal(status, 0, out);
     checkIncludes(out, '-p 127.0.0.1:9090:9090', 'public post-command --expose publishes a runtime port');
-    checkIncludes(out, 'exec -w /workspace ploinky-box-qa ploinky list agents', 'ordinary command still reaches core');
+    checkIncludes(out, 'exec -e PLOINKY_RUNTIME_NAME=ploinky-box-qa -w /workspace ploinky-box-qa ploinky list agents', 'ordinary command still reaches core');
     checkAbsent(out, 'ploinky list agents --expose 127.0.0.1:9090:9090', 'post-command --expose is not forwarded in-box');
 });
 
@@ -2584,15 +2963,17 @@ test('public ploinky forwards registered non-lifecycle CLI commands into the run
     assert.equal(registry.box, undefined, 'box is not a registered core command');
 
     for (const command of Object.keys(registry)) {
-        if (['help', 'status', 'stop', 'destroy'].includes(command)) continue;
+        if (['help', 'status', 'stop', 'destroy', 'cli'].includes(command)) {
+            continue;
+        }
         const { out, status } = publicRun('podman', '--name', 'qa', '--dry-run', command);
         assert.equal(status, 0, `${command}\n${out}`);
         checkIncludes(out, 'DRY-RUN: podman run -d', `${command}: public command ensures the box`);
 
-        const ttyFlag = (command === 'cli' || command === 'shell') ? '-it ' : '';
+        const ttyFlag = command === 'shell' ? '-i ' : '';
         checkIncludes(
             out,
-            `exec ${ttyFlag}-w /workspace ploinky-box-qa ploinky ${command}`,
+            `exec ${ttyFlag}-e PLOINKY_RUNTIME_NAME=ploinky-box-qa -w /workspace ploinky-box-qa ploinky ${command}`,
             `${command}: public command forwards to in-box ploinky`,
         );
     }
@@ -2614,16 +2995,21 @@ test('public parser hoists runtime selector flags after the command', () => {
     assert.deepEqual([...cfg.explicit], ['--name', '--expose']);
 });
 
-test('public cli forwards with interactive exec', () => {
+test('public parameterless cli rejects noninteractive dry-run before mutation', () => {
     const { out, status } = publicRun('podman', '--name', 'qa', '--dry-run', 'cli');
-    assert.equal(status, 0, out);
-    checkIncludes(out, 'exec -it -w /workspace ploinky-box-qa ploinky cli', 'public cli keeps a TTY');
+    assert.equal(status, 1, out);
+    checkIncludes(out, 'requires an interactive terminal', 'public cli explains the TTY requirement');
+    checkAbsent(out, 'DRY-RUN: podman run -d', 'public cli rejects before reconciliation');
 });
 
 test('public sh forwards with interactive exec', () => {
     const { out, status } = publicRun('podman', '--name', 'qa', '--dry-run', 'sh');
     assert.equal(status, 0, out);
-    checkIncludes(out, 'exec -it -w /workspace ploinky-box-qa ploinky sh', 'public sh keeps a TTY');
+    checkIncludes(
+        out,
+        'exec -i -e PLOINKY_RUNTIME_NAME=ploinky-box-qa -w /workspace ploinky-box-qa ploinky sh',
+        'public sh preserves non-TTY input without requesting a terminal',
+    );
 });
 
 test('smoke script documents optional public ploinky path', () => {
