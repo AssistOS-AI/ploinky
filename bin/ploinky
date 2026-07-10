@@ -67,5 +67,4 @@ if [[ "$in_ploinky_box" == "1" ]]; then
     exec node "$PLOINKY_ROOT/cli/index.js" "$@"
 fi
 
-export PLOINKY_PUBLIC_ENTRYPOINT=1
-exec node "$ROOT_DIR/container/ploinky-box.mjs" "$@"
+exec node "$ROOT_DIR/container/runtime-supervisor.mjs" "$@"
