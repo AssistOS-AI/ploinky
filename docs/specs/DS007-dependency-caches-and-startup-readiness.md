@@ -16,11 +16,36 @@ Ploinky no longer treats dependency installation as an incidental side effect of
 
 Global Node dependencies must be prepared from `globalDeps/package.json` into `.ploinky/deps/global/<runtime-key>/`. Per-agent Node dependencies must be prepared into `.ploinky/deps/agents/<repo>/<agent>/<runtime-key>/` using a merged package definition in which agent dependencies override the global baseline for conflicts.
 
+The managed public-entrypoint boundary is:
+
+| Invocation | Documented effect |
+| --- | --- |
+| `ploinky` or `p-cli` | Reconcile/start outer runtime; open Ploinky REPL |
+| `ploinky cli` | Reconcile/start outer runtime; open `/bin/bash` as `podman` in `/workspace` |
+| `ploinky cli <agent>` | Reconcile/start outer runtime; attach to that agent's manifest CLI |
+| `ploinky start ...` | Reconcile/start outer runtime; preserve graph publishes and router readiness |
+| `ploinky status` | Inspect outer contract/publishes/health and running core status without mutation |
+| `ploinky stop` | Stop core services, then stop outer runtime; keep volumes |
+| `ploinky destroy` | Confirm exact instance and remove its container plus three volumes |
+| REPL `status`/`stop`/`destroy` | Core workspace/router/agent scope; outer runtime remains |
+
+The host supervisor must complete outer reconciliation before invoking core
+startup. A managed `ploinky start ...` must preserve dependency-graph ordering,
+profile-derived publishes, and core readiness behavior. Only after core start
+succeeds may the host layer probe
+`http://127.0.0.1:<selected-host-port>/status`; a failed core start must produce
+no host router probe.
+
 A cache is valid only when the runtime key, the relevant package hash, the stamp version, the installer metadata, and the core marker module all match the current workspace inputs. Cache preparation must use the correct installation backend for the target runtime family. Container-family runtime keys must install inside an install container for the target image, and the prepared stamp must record that image so a manifest image change refreshes the cache even when Node major, platform, libc, and package hashes are otherwise unchanged. Sandbox-family runtime keys must install on the host and must reject preparation for a foreign host runtime key.
 
 The `deps prepare`, `deps status`, and `deps clean` commands form the operator-facing contract for cache maintenance. When no explicit target is provided to `deps prepare`, the command must prepare caches for every enabled agent that actually requires a Node dependency cache. Startup must also prepare or refresh missing and stale caches before runtime launch rather than letting agents run `npm install` inside their service runtime. Cache installs must avoid nonessential startup-time network work such as npm audit/funding checks, use noninteractive package-manager settings inside install containers, and keep long cold installs visibly alive with progress output. Operators should expect cold startup to require npm, git, network access, and native build tools when caches are absent.
 
-Dependency caches are regenerated state, not agent data. `destroy` must clear `.ploinky/deps/` so the next startup rebuilds missing caches, while `.data/<agent-or-alias>/` remains untouched.
+Dependency caches are regenerated state, not agent data. A core `destroy`
+entered in the REPL must clear `.ploinky/deps/` so the next core startup rebuilds
+missing caches, while `.data/<agent-or-alias>/` and the containing outer runtime
+remain untouched. Host `ploinky stop` preserves the outer dependency volume;
+confirmed host `ploinky destroy` removes that volume together with the selected
+outer container and its other two named volumes.
 
 Workspace startup must expand the static agent into a dependency graph using manifest enable directives. The graph must be grouped topologically into waves. A later wave must not start until the earlier wave has been started and all of its members have passed readiness checks.
 
@@ -28,7 +53,7 @@ Startup readiness follows an explicit precedence. A declared `readiness.protocol
 
 For blocking script readiness, Ploinky executes the declared plain-filename script inside the service container from `/code`, applying its interval, per-attempt timeout, success threshold, and failure threshold. A missing script, exhausted failure threshold, or execution error fails the dependency wave and blocks the caller. The same manifest `health.readiness` configuration may later be used by the watchdog as a warning-oriented health probe, but that later behavior does not weaken its blocking role during start-only container startup.
 
-`openPorts` is publication metadata, not a generic readiness annotation. It exposes an agent socket into the box and makes that box-side socket eligible for outer publication during graph-driven boxed starts. A start-only container with no `openPorts` does not receive a fabricated port-7000 AgentServer mapping: it must provide a blocking container script, a private `additionalServerPort` route, an intentional published TCP route, or explicit `readiness.protocol: "none"`. AgentServer execution modes may still receive the random localhost-to-7000 mapping when no port is declared. A host-network service that intentionally uses TCP readiness can name its reachable box-side port through `openPorts`, but doing so also accepts outer-boundary eligibility; a private host-network service should use a private readiness contract instead.
+`openPorts` is publication metadata, not a generic readiness annotation. It exposes an agent socket into the managed outer runtime and makes that runtime-side socket eligible for host publication during graph-driven starts. A start-only container with no `openPorts` does not receive a fabricated port-7000 AgentServer mapping: it must provide a blocking container script, a private `additionalServerPort` route, an intentional published TCP route, or explicit `readiness.protocol: "none"`. AgentServer execution modes may still receive the random localhost-to-7000 mapping when no port is declared. A host-network service that intentionally uses TCP readiness can name its reachable runtime-side port through `openPorts`, but doing so also accepts outer-boundary eligibility; a private host-network service should use a private readiness contract instead.
 
 Some agents are workers rather than servers — they do not bind a port and have no readiness signal beyond "the process is running." Such agents must set `readiness.protocol: "none"`. The runtime treats them as immediately ready and does not probe a port; the dependency wave still tracks them so dependents wait for the container to start, but it does not require a port-open or MCP-handshake response. Use this only for true workers (renewal loops, batch jobs); serving agents must keep a real probe.
 
@@ -56,7 +81,7 @@ The graph contains explicit dependency edges, and tests on this branch validate 
 ### Question #3: Why is `openPorts` not the default readiness signal for every private service?
 
 Response:
-An `openPorts` entry is an exposure decision: inside a box it names the socket the agent exposes to the box and allows that socket to cross the outer boundary. Requiring it merely to make a database, identity provider, LLM runtime, or private health endpoint startable would accidentally turn readiness metadata into publication permission. Blocking `health.readiness.script` and private `additionalServerPort` routes let those start-only services prove readiness without broadening their boundary. A service should use `openPorts` for TCP readiness only when the same socket is intentionally eligible for publication.
+An `openPorts` entry is an exposure decision: inside the managed outer runtime it names the agent socket eligible to cross the host boundary. Requiring it merely to make a database, identity provider, LLM runtime, or private health endpoint startable would accidentally turn readiness metadata into publication permission. Blocking `health.readiness.script` and private `additionalServerPort` routes let those start-only services prove readiness without broadening their boundary. A service should use `openPorts` for TCP readiness only when the same socket is intentionally eligible for publication.
 
 ### Question #4: Why should dependency cache installs print progress?
 
@@ -72,6 +97,11 @@ The blocking wave path produces visible startup output: the wave list, the readi
 
 Response:
 Container runtime keys intentionally group compatible images by Node major, platform, architecture, and libc so cache directories stay understandable and reusable across patch updates. That grouping alone is not enough when a manifest moves to a different image that preinstalls different system libraries or native build prerequisites. Recording the installer image in the stamp lets startup invalidate the cache on an image switch without broadening the runtime-key format.
+
+### Question #7: Why are core cache destruction and outer-runtime destruction separate?
+
+Response:
+Core `destroy` is a workspace operation: it removes workspace agent runtimes and regenerated dependency caches while preserving isolated agent data, the outer container, and its named volumes. Host `ploinky destroy` is an explicitly confirmed system-boundary operation that removes the selected outer container and all three instance volumes. Keeping those scopes separate prevents a core command from gaining control of, or accidentally removing, the runtime that contains it.
 
 ## Conclusion
 

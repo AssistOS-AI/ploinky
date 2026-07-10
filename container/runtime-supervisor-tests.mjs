@@ -30,6 +30,7 @@ import {
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(HERE, '..');
+const ROOT = REPO_ROOT;
 const MJS = path.join(HERE, 'runtime-supervisor.mjs');
 const PLOINKY = path.join(HERE, '..', 'bin', 'ploinky');
 const PCLI = path.join(HERE, '..', 'bin', 'p-cli');
@@ -1054,6 +1055,14 @@ function checkAbsent(out, needle, description) {
 
 function countOccurrences(out, needle) {
     return out.split(needle).length - 1;
+}
+
+function countContiguousSubsequences(values, expected) {
+    return values.reduce((count, _value, index) => (
+        expected.every((value, offset) => values[index + offset] === value)
+            ? count + 1
+            : count
+    ), 0);
 }
 
 function dryRunPublishTokens(out, engine = 'podman') {
@@ -3040,7 +3049,7 @@ test('public no-arg command opens the in-runtime Ploinky REPL', () => {
     );
 });
 
-test('public start preserves branch flags while forcing in-box router to 8080', () => {
+test('managed start preserves branch flags while forcing the core router to 8080', () => {
     const source = makeFakePloinkyGraphSource();
     try {
         const { out, status } = publicRunWithEnv(
@@ -3067,7 +3076,7 @@ test('public start preserves branch flags while forcing in-box router to 8080', 
     }
 });
 
-test('public start forwards inferred source branch when no branch flag is supplied', () => {
+test('managed start forwards an inferred source branch exactly once', () => {
     const source = makeFakePloinkyGraphSource();
     try {
         const { out, status } = publicRunWithEnv(
@@ -3086,12 +3095,36 @@ test('public start forwards inferred source branch when no branch flag is suppli
             'exec -e PLOINKY_RUNTIME_NAME=ploinky-box-qa -w /workspace ploinky-box-qa ploinky start explorer 8080 --profile default --branch feature-default',
             'public start appends the inferred branch after the fixed in-box port',
         );
+        const coreExecCalls = out.split('\n')
+            .filter(line => line.startsWith('DRY-RUN: podman exec '))
+            .map(line => line.slice('DRY-RUN: podman '.length).trim().split(/\s+/))
+            .filter(args => (
+                args[0] === 'exec'
+                && countContiguousSubsequences(
+                    args,
+                    ['ploinky', 'start', 'explorer', '8080'],
+                ) === 1
+            ));
+        assert.equal(coreExecCalls.length, 1, out);
+        assert.equal(
+            countContiguousSubsequences(
+                coreExecCalls[0],
+                ['--branch', 'feature-default'],
+            ),
+            1,
+            out,
+        );
+        assert.equal(
+            coreExecCalls[0].filter(token => token === '--branch').length,
+            1,
+            out,
+        );
     } finally {
         source.cleanup();
     }
 });
 
-test('public start explorer publishes graph-derived openPorts only', () => {
+test('managed start publishes only active-profile graph openPorts', () => {
     const source = makeFakePloinkyGraphSource();
     try {
         const { out, status } = publicRunWithEnv(
@@ -3126,7 +3159,7 @@ test('public start only adds Explorer default publishes for the explorer agent',
     checkAbsent(out, '-p 127.0.0.1:8081:8081', 'non-Explorer start does not get Explorer Web Publishing publish');
 });
 
-test('public start explorer preserves explicit publishes and skips conflicting defaults', () => {
+test('managed start preserves explicit publishes and skips conflicting generated publishes', () => {
     const source = makeFakePloinkyGraphSource();
     try {
         const { out, status } = publicRunWithEnv(
@@ -3146,7 +3179,7 @@ test('public start explorer preserves explicit publishes and skips conflicting d
     }
 });
 
-test('public start explorer does not duplicate an exact explicit default publish', () => {
+test('managed start does not duplicate an exact explicit generated publish', () => {
     const source = makeFakePloinkyGraphSource();
     try {
         const { out, status } = publicRunWithEnv(
@@ -3406,7 +3439,7 @@ test('public start accepts --profile=value before the agent and does not treat i
     }
 });
 
-test('ploinky-box source does not hardcode Explorer publish topology', () => {
+test('runtime supervisor source does not hardcode Explorer publish topology', () => {
     const source = fs.readFileSync(MJS, 'utf8');
     const oldPublishConstant = ['EXPLORER', 'START', 'PUBLISH', 'SPECS'].join('_');
     const oldExplorerEnv = ['PLOINKY', 'BOX', 'EXPLORER', 'PORTS'].join('_');
@@ -3450,6 +3483,128 @@ test('public start accepts --port after the agent without forwarding it in-box',
         checkIncludes(out, '127.0.0.1:9192:8080', 'post-command --port after agent is the host port');
         checkIncludes(out, 'exec -e PLOINKY_RUNTIME_NAME=ploinky-box-qa -w /workspace ploinky-box-qa ploinky start explorer 8080', 'agent remains explorer');
         checkAbsent(out, 'ploinky start explorer 8080 --port 9192', 'post-command --port is not forwarded in-box');
+    } finally {
+        source.cleanup();
+    }
+});
+
+test('managed start maps the selected host router port to container port 8080', () => {
+    const source = makeFakePloinkyGraphSource();
+    try {
+        const { out, status } = publicRunWithEnv(
+            { PLOINKY_BOX_SOURCE: source.sourceDir },
+            'podman',
+            '--name', 'qa',
+            '--dry-run',
+            '--port', '19191',
+            'start', 'explorer',
+        );
+        assert.equal(status, 0, out);
+        checkIncludes(
+            out,
+            '127.0.0.1:19191:8080',
+            'the selected host router port maps to runtime port 8080',
+        );
+        checkIncludes(
+            out,
+            'ploinky start explorer 8080 --profile default',
+            'the core router always receives port 8080',
+        );
+        checkAbsent(
+            out,
+            'ploinky start explorer 19191',
+            'the selected host port is never forwarded to the core router',
+        );
+    } finally {
+        source.cleanup();
+    }
+});
+
+test('managed start probes the selected host router port after core start succeeds', async () => {
+    const source = makeFakePloinkyGraphSource();
+    const coreStartCommand = ['ploinky', 'start', 'explorer', '8080'];
+    try {
+        async function run(coreExitCode) {
+            const stdout = captureWritable();
+            const stderr = captureWritable();
+            const fake = createFakeEngine({
+                engine: 'podman',
+                container: null,
+                images: contractV1Images(),
+                stdout: stdout.stream,
+                stderr: stderr.stream,
+            });
+            const engineClient = {
+                ...fake.engineClient,
+                run(args, options) {
+                    const result = fake.engineClient.run(args, options);
+                    if (
+                        args[0] === 'exec'
+                        && countContiguousSubsequences(
+                            args,
+                            coreStartCommand,
+                        ) === 1
+                    ) {
+                        return coreExitCode;
+                    }
+                    return result;
+                },
+            };
+            const raw = createRuntimeSupervisor({
+                ...minimalSupervisorDependencies(),
+                stdout: stdout.stream,
+                stderr: stderr.stream,
+                cwd: '/workspace/qa',
+                env: {
+                    PLOINKY_BOX_BRANCH: 'main',
+                    PLOINKY_BOX_SOURCE: source.sourceDir,
+                },
+                detectEngine: () => 'podman',
+                engineClient,
+                waitHealthy: async () => {},
+                portInUse: async () => false,
+                fetch: async (url) => {
+                    fake.calls.push({ kind: 'fetch', url });
+                    return { ok: true };
+                },
+            });
+            const code = await runSupervisorWithBoundary(
+                raw,
+                [
+                    '--name', 'qa',
+                    '--port', '19192',
+                    'start', 'explorer',
+                ],
+                stderr.stream,
+            );
+            return { calls: fake.calls, code };
+        }
+
+        const success = await run(0);
+        assert.equal(success.code, 0);
+        const coreStartIndex = success.calls.findIndex(call =>
+            call.kind === 'run'
+            && call.args[0] === 'exec'
+            && countContiguousSubsequences(
+                call.args,
+                coreStartCommand,
+            ) === 1
+        );
+        const fetchIndex = success.calls.findIndex(call =>
+            call.kind === 'fetch'
+            && call.url === 'http://127.0.0.1:19192/status'
+        );
+        assert.notEqual(coreStartIndex, -1, JSON.stringify(success.calls));
+        assert.notEqual(fetchIndex, -1, JSON.stringify(success.calls));
+        assert.ok(coreStartIndex < fetchIndex, JSON.stringify(success.calls));
+
+        const failed = await run(7);
+        assert.equal(failed.code, 7);
+        assert.equal(
+            failed.calls.some(call => call.kind === 'fetch'),
+            false,
+            JSON.stringify(failed.calls),
+        );
     } finally {
         source.cleanup();
     }
@@ -3524,17 +3679,121 @@ test('public sh forwards with interactive exec', () => {
     );
 });
 
-test('smoke script documents optional public ploinky path', () => {
-    const smokeText = fs.readFileSync(path.join(HERE, 'smoke-box.mjs'), 'utf8');
-    assert.ok(smokeText.includes('SMOKE_PUBLIC_PLOINKY'), smokeText);
-    assert.ok(smokeText.includes('bin/ploinky'), smokeText);
+test('runtime smoke exercises only the public ploinky entrypoint', () => {
+    const smokeText = fs.readFileSync(path.join(HERE, 'smoke-runtime.mjs'), 'utf8');
+    assert.match(smokeText, /path\.join\(ROOT, 'bin', 'ploinky'\)/);
+    for (const requiredFlow of [
+        "requireOk('host-local help', ploinky(['help']))",
+        "if (containerExists()) throw new Error('help created the runtime')",
+        "ploinky(['--port', PORT, '--image', IMAGE, 'list', 'agents'])",
+        "return invoke(PLOINKY, ['--engine', ENGINE, '--name', NAME, ...args], options)",
+        "invoke(ENGINE, ['container', 'inspect', INSTANCE])",
+        "invoke(ENGINE, ['volume', 'inspect', name])",
+        "invoke(ENGINE, ['exec', INSTANCE, 'podman', 'version'])",
+        "invoke(ENGINE, ['exec', INSTANCE, 'podman', 'info'])",
+        "requireOk('combined status', ploinky(['status']))",
+        "requireOk('first stop', ploinky(['stop']))",
+        "requireOk('idempotent stop', ploinky(['stop']))",
+        "requireOk('confirmed destroy', ploinky(['destroy'], { input: 'y\\n' }))",
+        "if (containerExists()) throw new Error('destroy left ' + INSTANCE)",
+        "if (volumeExists(volume)) throw new Error('destroy left ' + volume)",
+    ]) {
+        assert.ok(smokeText.includes(requiredFlow), requiredFlow);
+    }
+    assert.doesNotMatch(smokeText, /SMOKE_PUBLIC_PLOINKY/);
+    assert.doesNotMatch(smokeText, /SMOKE_AGENT/);
+    assert.doesNotMatch(smokeText, /container\/ploinky-box(?:\s|$)/);
+    assert.doesNotMatch(
+        smokeText,
+        /path\.(?:join|resolve)\([^;\n]*['"][^'"]*ploinky-box(?:\.mjs)?['"]/,
+    );
+
+    const mainFlow = smokeText.slice(
+        smokeText.indexOf('try {'),
+        smokeText.indexOf('} finally {'),
+    );
+    assert.deepEqual(
+        [...mainFlow.matchAll(/invoke\(ENGINE, \['([^']+)'/g)]
+            .map((match) => match[1]),
+        ['exec', 'exec'],
+    );
+    const cleanup = smokeText.slice(smokeText.indexOf('} finally {'));
+    assert.match(cleanup, /invoke\(ENGINE, \['rm', '-f', INSTANCE\]\)/);
+    assert.match(cleanup, /invoke\(ENGINE, \['volume', 'rm', volume\]\)/);
+    assert.match(cleanup, /fs\.rmSync\(TMP, \{ recursive: true, force: true \}\)/);
+
+    const overrides = [...smokeText.matchAll(/process\.env\.(SMOKE_[A-Z_]+)/g)]
+        .map((match) => match[1]);
+    assert.deepEqual(
+        [...new Set(overrides)].sort(),
+        ['SMOKE_ENGINE', 'SMOKE_IMAGE', 'SMOKE_PORT'],
+    );
 });
 
-test('docs describe boxed-by-default ploinky and the host-mounted core', () => {
+test('authoritative runtime files have no removed public surface', () => {
+    for (const file of [
+        'README.md',
+        'container/README.md',
+        'bin/ploinky',
+        'container/runtime-supervisor.mjs',
+        'container/smoke-runtime.mjs',
+    ]) {
+        const text = fs.readFileSync(path.join(ROOT, file), 'utf8');
+        assert.doesNotMatch(text, /ploinky box/);
+        assert.doesNotMatch(text, /container\/ploinky-box(?:\s|$)/);
+        assert.doesNotMatch(text, /ploinky-box\.mjs/);
+    }
+});
+
+test('docs describe the managed outer runtime and host-mounted core', () => {
     const rootReadme = fs.readFileSync(path.join(HERE, '..', 'README.md'), 'utf8');
     const boxReadme = fs.readFileSync(path.join(HERE, 'README.md'), 'utf8');
-    assert.ok(rootReadme.includes('mounted read-only'), rootReadme);
-    assert.ok(rootReadme.includes('core edits on the host'), rootReadme);
+    const authoritativeDocs = [
+        'README.md',
+        'container/README.md',
+        'docs/code-derived-agent-lifecycle.md',
+        'docs/specs/DS003-agent-manifest-and-registry.md',
+        'docs/specs/DS004-runtime-execution-and-isolation.md',
+        'docs/specs/DS007-dependency-caches-and-startup-readiness.md',
+    ];
+    const invocationRows = [
+        '| `ploinky` or `p-cli` | Reconcile/start outer runtime; open Ploinky REPL |',
+        '| `ploinky cli` | Reconcile/start outer runtime; open `/bin/bash` as `podman` in `/workspace` |',
+        "| `ploinky cli <agent>` | Reconcile/start outer runtime; attach to that agent's manifest CLI |",
+        '| `ploinky start ...` | Reconcile/start outer runtime; preserve graph publishes and router readiness |',
+        '| `ploinky status` | Inspect outer contract/publishes/health and running core status without mutation |',
+        '| `ploinky stop` | Stop core services, then stop outer runtime; keep volumes |',
+        '| `ploinky destroy` | Confirm exact instance and remove its container plus three volumes |',
+        '| REPL `status`/`stop`/`destroy` | Core workspace/router/agent scope; outer runtime remains |',
+    ];
+    for (const file of authoritativeDocs) {
+        const text = fs.readFileSync(path.join(ROOT, file), 'utf8');
+        for (const row of invocationRows) {
+            assert.ok(text.includes(row), `${file}: missing ${row}`);
+        }
+    }
+
+    const legacyMigrationDocs = [
+        'README.md',
+        'docs/code-derived-agent-lifecycle.md',
+        'docs/specs/DS004-runtime-execution-and-isolation.md',
+    ];
+    const legacyMigrationContract = [
+        'Migration applies only when `--image` is omitted and the inspected image is exactly',
+        '`docker.io/assistos/ploinky-box:podman-node24` or',
+        '`assistos/ploinky-box:podman-node24`.',
+    ].join(' ');
+    for (const file of legacyMigrationDocs) {
+        const text = fs.readFileSync(path.join(ROOT, file), 'utf8')
+            .replace(/\s+/g, ' ');
+        assert.ok(
+            text.includes(legacyMigrationContract),
+            `${file}: missing exact legacy migration contract`,
+        );
+    }
+
+    assert.ok(rootReadme.includes('read-only at `/opt/ploinky`'), rootReadme);
+    assert.ok(rootReadme.includes('Reconcile/start outer runtime; open Ploinky REPL'), rootReadme);
     assert.ok(rootReadme.includes('node cli/index.js'), rootReadme);
     assert.ok(!rootReadme.includes('PLOINKY_DIRECT'), 'the direct-mode escape is gone');
     assert.ok(boxReadme.includes('Graph-driven Explorer publishes'), boxReadme);
@@ -3545,7 +3804,11 @@ test('docs describe boxed-by-default ploinky and the host-mounted core', () => {
     assert.ok(boxReadme.includes('PLOINKY_BOX_SOURCE'), boxReadme);
     assert.ok(boxReadme.includes('PLOINKY_BOX_INSTALL_DEPS'), boxReadme);
     assert.ok(boxReadme.includes('Install them now?'), boxReadme);
-    assert.ok(boxReadme.includes('/etc/ploinky-box'), boxReadme);
+    assert.ok(boxReadme.includes('docker.io/assistos/ploinky-box:podman-node24-runtime-v1'), boxReadme);
+    assert.ok(boxReadme.includes('io.assistos.ploinky.runtime-contract=1'), boxReadme);
+    assert.ok(boxReadme.includes('Ordinary agent images intentionally contain neither Podman nor Docker'), boxReadme);
+    assert.match(boxReadme, /Git is optional on the host/);
+    assert.doesNotMatch(boxReadme, /host requires[^.]*Git[^.]*Podman/i);
     assert.ok(!boxReadme.includes('PLOINKY_DIRECT'), 'the direct-mode escape is gone');
 });
 

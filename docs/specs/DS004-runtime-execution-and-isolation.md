@@ -16,9 +16,41 @@ Ploinky runs agents through multiple backend styles, but it must present one coh
 
 Container execution is the default backend. The runtime must prefer `podman` when it is available and fall back to `docker` otherwise. Agent container names must be derived from the repository name, the agent or alias name, and a workspace hash so that multiple workspaces can run the same agent names without collisions.
 
+The managed public-entrypoint boundary is:
+
+| Invocation | Documented effect |
+| --- | --- |
+| `ploinky` or `p-cli` | Reconcile/start outer runtime; open Ploinky REPL |
+| `ploinky cli` | Reconcile/start outer runtime; open `/bin/bash` as `podman` in `/workspace` |
+| `ploinky cli <agent>` | Reconcile/start outer runtime; attach to that agent's manifest CLI |
+| `ploinky start ...` | Reconcile/start outer runtime; preserve graph publishes and router readiness |
+| `ploinky status` | Inspect outer contract/publishes/health and running core status without mutation |
+| `ploinky stop` | Stop core services, then stop outer runtime; keep volumes |
+| `ploinky destroy` | Confirm exact instance and remove its container plus three volumes |
+| REPL `status`/`stop`/`destroy` | Core workspace/router/agent scope; outer runtime remains |
+
+The outer runtime must use the immutable
+`docker.io/assistos/ploinky-box:podman-node24-runtime-v1` image carrying exact
+label `io.assistos.ploinky.runtime-contract=1`. Release order is manual: that
+image must be published and independently validated before Ploinky adopts its
+reference. Omitted creation flags preserve the inspected image, publishes,
+mounts, listening scope, user, environment, devices, security policy, and named
+volumes. Migration applies only when `--image` is omitted and the inspected
+image is exactly `docker.io/assistos/ploinky-box:podman-node24` or
+`assistos/ploinky-box:podman-node24`. A different incompatible custom reference
+stays selected, is force-pulled and validated before mutation, and fails without
+changing the old runtime if contract 1 is still absent. Replacement is
+transactional: a creation or health failure restores the previous image and
+normalized creation configuration and never removes the three persistent
+volumes.
+
+Nested Podman belongs to this outer runtime only. Ordinary agent images
+intentionally contain neither Podman nor Docker and do not receive authority
+over sibling containers.
+
 The container's network namespace is selected from the manifest. The default is a workspace-defined bridge by name; agents that opt into `network.mode: "host"` run with `--network host` and share the host's network namespace directly. The runtime must not emit `-p` port publishes for host-network agents, must not register bridge aliases for them, and must not create a named bridge on their behalf. Sibling agents on a bridge that need to reach a host-network agent must route through the host gateway entry the runtime exposes (`host.containers.internal` on podman with netavark, or the bridge gateway IP); manifest defaults that previously assumed a bridge alias must be either re-pointed or made overridable through operator-supplied vars when the dependency moves to host networking.
 
-Inside a Ploinky box, profile `openPorts` is the reviewed crossing between an agent container and the box and is also eligible for publication across the outer box. The inner runtime widens loopback publish binds to the box interfaces so the outer runtime can reach the box-side socket; the graph planner retains the manifest's outer bind policy when it creates the outer publish. Host-network agents do not need an inner `-p` flag, but their declared box-side sockets remain subject to the same outer eligibility and conflict rules. Private service listeners must instead stay on named service networks or use private router/readiness mechanisms.
+Inside the managed outer runtime, profile `openPorts` is the reviewed crossing between an agent container and that runtime and is also eligible for host publication. The inner runtime widens loopback publish binds to its interfaces so the supervisor can reach the runtime-side socket; the graph planner retains the manifest's outer bind policy when it creates the host publish. Host-network agents do not need an inner `-p` flag, but their declared runtime-side sockets remain subject to the same outer eligibility and conflict rules. Private service listeners must instead stay on named service networks or use private router/readiness mechanisms.
 
 Existing container reuse must compare both the resolved runtime environment and the effective manifest network (`profiles.<profile>.network` when present, otherwise root `manifest.network`). If the effective network changes, the runtime must recreate the container instead of returning an instance attached to the old namespace.
 
@@ -26,15 +58,15 @@ The runtime may also execute agents through host sandbox backends when the manif
 
 Host sandbox teardown must be batch-oriented when multiple sandboxed agents are stopped or destroyed. The runtime must send the graceful signal to every selected sandbox process group first, wait once against the shared deadline, and only then force-kill the remaining process groups before clearing their PID records. A slow or stuck sandboxed agent must not delay graceful signal delivery to the other sandboxed agents in the same stop or destroy operation.
 
-`destroy` must remove workspace runtimes and regenerated runtime caches, including `.ploinky/deps`, but it must not remove agent homes under `.data/<agent-or-alias>/`. Starting the workspace after destroy must recreate runtimes and dependency caches while remounting the preserved `.data` directory at `/root` for each agent.
+A core `destroy` entered in the REPL must remove workspace agent runtimes and regenerated runtime caches, including `.ploinky/deps`, but it must not remove agent homes under `.data/<agent-or-alias>/` or the containing outer runtime. Starting the workspace afterward must recreate agent runtimes and dependency caches while remounting the preserved `.data` directory at `/root` for each agent. Host `ploinky destroy` is a separate supervisor operation: after exact-instance confirmation it removes the outer container and its workspace, nested-container-storage, and outer dependency volumes.
 
 Each agent execution environment must expose the shared `Agent/` payload at `/Agent` for container backends or the equivalent runtime location for sandbox backends. If a manifest does not provide an explicit agent command, the runtime must fall back to `Agent/server/AgentServer.sh`, which supervises `AgentServer.mjs` and restarts it after exit.
 
-Code and skills mounts must be profile-aware. The persisted active profile defaults to `default`; both `default` and `dev` make code and skills writable unless overridden. In `qa` and `prod`, code and skills default to read-only unless the profile explicitly relaxes them. The profile merge order is `profiles.default` plus the selected profile overlay. Workspace-root write access must not bypass read-only code, dependency-cache, staged Agent library, or protected Ploinky state paths. The public boxed start path always forwards an explicit selection—`default` when omitted—while a direct in-box start without `--profile` may retain the persisted profile.
+Code and skills mounts must be profile-aware. The persisted active profile defaults to `default`; both `default` and `dev` make code and skills writable unless overridden. In `qa` and `prod`, code and skills default to read-only unless the profile explicitly relaxes them. The profile merge order is `profiles.default` plus the selected profile overlay. Workspace-root write access must not bypass read-only code, dependency-cache, staged Agent library, or protected Ploinky state paths. The managed host start path always forwards an explicit selection—`default` when omitted—while a core start entered inside the REPL without `--profile` may retain the persisted profile.
 
-Profiles may declare `additionalServerPort` for an agent-owned browser service, usually as a bare port such as `3000`; `127.0.0.1:3000` is also accepted. The active profile overlay replaces the default profile's additional server declaration as one selected upstream. Container runtimes must record the declaration as a container-local upstream unless the effective network is `network.mode: "host"`; host sandbox runtimes must record it as host-local because they share the host network. This declaration must not imply an `openPorts` publish or outer box eligibility. For a start-only service, its resolved private route may be the TCP startup-readiness target. For execution modes that include AgentServer, `additionalServerPort` remains a second browser-service route and does not replace the port-7000 MCP, agent-card, or readiness route.
+Profiles may declare `additionalServerPort` for an agent-owned browser service, usually as a bare port such as `3000`; `127.0.0.1:3000` is also accepted. The active profile overlay replaces the default profile's additional server declaration as one selected upstream. Container runtimes must record the declaration as a container-local upstream unless the effective network is `network.mode: "host"`; host sandbox runtimes must record it as host-local because they share the host network. This declaration must not imply an `openPorts` publish or host-publication eligibility. For a start-only service, its resolved private route may be the TCP startup-readiness target. For execution modes that include AgentServer, `additionalServerPort` remains a second browser-service route and does not replace the port-7000 MCP, agent-card, or readiness route.
 
-Web Publishing nginx is the HTTP/WebSocket consolidation boundary. It must bind port 8081 and install a default server that returns 404 even when no routes have been configured. OnlyOffice and LiveKit deployment probes must use their generated external Web Publishing URLs; direct host access to private service ports 8082 and 17000 is not part of the runtime contract. Host port 8081 also cannot be assumed when a box already existed before graph-aware Explorer planning, because changing `openPorts` or `--profile` changes desired run arguments for a newly created outer box only. Existing outer boxes are not reconciled.
+Web Publishing nginx is the HTTP/WebSocket consolidation boundary. It must bind port 8081 and install a default server that returns 404 even when no routes have been configured. OnlyOffice and LiveKit deployment probes must use their generated external Web Publishing URLs; direct host access to private service ports 8082 and 17000 is not part of the runtime contract. A graph-aware Explorer start adds the selected profile's eligible publishes to the desired outer configuration and reconciles an existing mismatch before core startup; operators must still use the configured publish reported by read-only status rather than assuming a host port.
 
 Manifest volume declarations from the root manifest and active profile must create missing host directories before startup. Relative host paths are resolved against the workspace root, absolute host paths are honored as declared, and manifest volumes are not limited to `.ploinky/`. Writable Podman manifest volumes under `.ploinky/data/` are mounted with the Podman `:U` option so non-root images can write their private runtime state; external manifest volumes keep normal ownership unless the volume option explicitly opts into Podman chowning. Runtime resources declared under `runtime.resources` may create persistent storage under `.ploinky/data/<key>/` and may materialize environment variables from workspace paths, persisted secrets, and variable references.
 
@@ -74,6 +106,16 @@ Host networking changes the agent's port surface, its DNS resolution, and the wa
 
 Response:
 `stop`, `shutdown`, and `destroy` are workspace-level lifecycle operations. If Ploinky waited for each `bwrap` or Seatbelt process before signaling the next one, one stuck agent could keep the rest of the workspace running for the full timeout. Batch signaling gives every selected sandbox the same shutdown window and keeps the total wait bounded by one shared deadline.
+
+### Question #6: Why is outer-runtime replacement transactional?
+
+Response:
+The outer container is replaceable, but its creation configuration and three
+named volumes are operator state. Prevalidating the selected image, capturing
+the normalized prior configuration, and rolling back after a failed replacement
+lets Ploinky adopt an immutable runtime contract without turning an ordinary
+command into destructive migration. Keeping ordinary agent images free of
+container-engine tooling preserves the separate privilege boundary.
 
 ## Conclusion
 

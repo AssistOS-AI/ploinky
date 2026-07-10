@@ -8,7 +8,7 @@ All relative paths below are relative to the workspace directory where `ploinky`
 
 | Area | Primary source files |
 | --- | --- |
-| Executable entrypoint | `bin/ploinky`, `bin/p-cli`, `bin/ploinky-shell`, `bin/psh`, `cli/index.js`, `cli/shell.js` |
+| Executable entrypoint | `bin/ploinky`, `bin/p-cli`, `bin/ploinky-shell`, `bin/psh`, `container/runtime-supervisor.mjs`, `container/runtime-contract.mjs`, `cli/index.js`, `cli/shell.js` |
 | Command dispatch | `cli/commands/cli.js`, `cli/services/commandRegistry.js`, `cli/services/help.js` |
 | Workspace paths | `cli/services/config.js`, `cli/services/workspace.js`, `cli/services/workspaceStructure.js` |
 | Repo discovery and install | `cli/services/repos.js`, `cli/commands/repoAgentCommands.js`, `cli/services/utils.js`, `cli/services/status.js` |
@@ -48,13 +48,58 @@ All relative paths below are relative to the workspace directory where `ploinky`
 
 ## CLI Entrypoints
 
-`bin/ploinky` sets `PLOINKY_ROOT` to the repository root. If the first argument is `-shell`, `sh`, or `--shell`, it execs `bin/ploinky-shell`; otherwise it runs `node cli/index.js "$@"`.
+`bin/ploinky` resolves the source checkout and distinguishes host execution from
+execution already inside the managed outer runtime. On the host it delegates to
+`container/runtime-supervisor.mjs`. Inside the outer runtime it sets
+`PLOINKY_ROOT`, applies the dependency gate, and executes Ploinky core. This is
+the recursion boundary for the single public entrypoint. `bin/p-cli` is an alias
+to `bin/ploinky`; `bin/psh` is an alias to `ploinky sh`.
 
-`bin/p-cli` is an alias to `bin/ploinky`. `bin/psh` is an alias to `ploinky sh`.
+| Invocation | Documented effect |
+| --- | --- |
+| `ploinky` or `p-cli` | Reconcile/start outer runtime; open Ploinky REPL |
+| `ploinky cli` | Reconcile/start outer runtime; open `/bin/bash` as `podman` in `/workspace` |
+| `ploinky cli <agent>` | Reconcile/start outer runtime; attach to that agent's manifest CLI |
+| `ploinky start ...` | Reconcile/start outer runtime; preserve graph publishes and router readiness |
+| `ploinky status` | Inspect outer contract/publishes/health and running core status without mutation |
+| `ploinky stop` | Stop core services, then stop outer runtime; keep volumes |
+| `ploinky destroy` | Confirm exact instance and remove its container plus three volumes |
+| REPL `status`/`stop`/`destroy` | Core workspace/router/agent scope; outer runtime remains |
 
-`cli/index.js` initializes the environment and dispatches a command. With no command arguments, it starts the interactive shell backed by `.ploinky/ploinky_history`. In interactive mode, commands are split on whitespace and passed to the same dispatcher.
+`cli/index.js` initializes the core environment and dispatches a command inside
+the outer runtime. With no command arguments, it starts the interactive shell
+backed by `.ploinky/ploinky_history`. Commands entered there stay at core
+workspace/router/agent scope; they do not control the containing outer runtime.
+Before a core `start` command is handled, `cli/index.js` parses static-agent,
+port, profile, and branch policy flags and bootstraps the requested agent.
 
-Before a `start` command is handled, `cli/index.js` parses static-agent, port, and branch policy flags and runs repo bootstrap for the requested static agent.
+### Outer runtime contract
+
+The required outer image is the immutable
+`docker.io/assistos/ploinky-box:podman-node24-runtime-v1` reference with exact
+label `io.assistos.ploinky.runtime-contract=1`. Runtime release ordering is
+manual: publish and independently validate that image first, then adopt the
+exact reference in Ploinky.
+
+Ordinary host commands reconcile a missing, stopped, or incompatible runtime.
+Omitted creation flags preserve inspected image, publish, bind, mount,
+listening, environment, device, security, user, and named-volume settings;
+explicit flags change only the selected fields. Migration applies only when
+`--image` is omitted and the inspected image is exactly
+`docker.io/assistos/ploinky-box:podman-node24` or
+`assistos/ploinky-box:podman-node24`. A different incompatible custom reference
+remains selected, is force-pulled and contract-validated before mutation, and
+fails without altering the old runtime if it still lacks contract 1.
+Replacement captures the previous normalized configuration and rolls back to
+it if creation or health validation fails. Reconciliation never removes the
+workspace, nested-container-storage, or dependency volumes.
+
+`status` bypasses reconciliation and is read-only. `stop` and `destroy` also
+bypass reconciliation: host stop attempts core shutdown before stopping the
+outer runtime, while host destroy confirms the exact instance and removes the
+outer container plus its three volumes. Ordinary agent images intentionally
+contain neither Podman nor Docker; nested container control exists only in the
+outer runtime.
 
 ## Commands
 
@@ -173,8 +218,8 @@ Ploinky does not load a central manifest schema in the observed paths. Individua
 | `runtime.resources.env` | No | Adds env vars with templates such as `{{PLOINKY_WORKSPACE_ROOT}}`, `{{STORAGE_CONTAINER_PATH}}`, `{{STORAGE_HOST_PATH}}`, `{{secret:NAME}}`, `{{generatedSecret:NAME}}`, and `{{var:NAME}}`. |
 | `lite-sandbox` | No | If true and host sandbox is enabled, selects bwrap on Linux or seatbelt on macOS. If host sandbox is disabled, it falls back to container runtime. |
 | `profiles` | No | If present, `profiles.default` is required. Active profile comes from record profile or `.ploinky/profile`; non-default profiles are merged over default. |
-| `profiles.<name>.openPorts` | No | The only manifest port declarations read by `parseManifestPorts`. Each entry exposes a socket to the box and is eligible for graph-driven outer publication. Without an entry, only execution modes that include AgentServer receive an implicit random localhost mapping to container port 7000; start-only services do not. |
-| `profiles.<name>.additionalServerPort` | No | Private port for an agent-owned browser service, usually a bare port such as `"3000"` and optionally `host:port`. The router exposes it at `http://<agent>.localhost:<routerPort>/` without outer box eligibility. Its resolved route can supply TCP startup readiness for a start-only service, but it remains separate from an AgentServer/MCP route. |
+| `profiles.<name>.openPorts` | No | The only manifest port declarations read by `parseManifestPorts`. Each entry exposes a socket to the managed outer runtime and is eligible for graph-driven host publication. Without an entry, only execution modes that include AgentServer receive an implicit random localhost mapping to container port 7000; start-only services do not. |
+| `profiles.<name>.additionalServerPort` | No | Private port for an agent-owned browser service, usually a bare port such as `"3000"` and optionally `host:port`. The router exposes it at `http://<agent>.localhost:<routerPort>/` without host-publication eligibility. Its resolved route can supply TCP startup readiness for a start-only service, but it remains separate from an AgentServer/MCP route. |
 | `profiles.<name>.env` | No | Overrides top-level `env` for the active profile. |
 | `profiles.<name>.secrets` | No | Profile secrets are validated and injected at runtime. |
 | `profiles.<name>.mounts` | No | Controls code/skills mount mode. Default and dev profiles are read-write by default; other profiles are read-only by default. |
@@ -190,7 +235,7 @@ Ploinky does not load a central manifest schema in the observed paths. Individua
 | `env` | No | Manifest env specs. Resolution order in `secretVars.js` is encrypted secrets, `process.env`, `.env`, then default. Profile `env` replaces top-level `env`. |
 | `expose` | No | Adds explicit env values or refs. The `expose` CLI command edits this field in the source manifest. |
 | `repos` | No | Object processed by `applyManifestDirectives` during `start`. Values may be URL strings or objects with `url` and `branch`. Repos are ensured and enabled before dependency enable processing. |
-| `enable` | No | Top-level and profile-level enable arrays are processed during `start` and dependency graph building. The boxed publish planner applies the workspace profile when present and falls back to a child's `profiles.default` when absent. String specs can include `as <alias>` and `no-wait`; object specs can include `agent/ref/spec/name`, `alias/as`, `profile`, and `noWait`/`no-wait`. An explicit edge-local profile must exist on the child. |
+| `enable` | No | Top-level and profile-level enable arrays are processed during `start` and dependency graph building. The managed-runtime publish planner applies the workspace profile when present and falls back to a child's `profiles.default` when absent. String specs can include `as <alias>` and `no-wait`; object specs can include `agent/ref/spec/name`, `alias/as`, `profile`, and `noWait`/`no-wait`. An explicit edge-local profile must exist on the child. |
 | `configProviders` | No | Top-level startup provider entries processed for the static agent after dependency graph discovery and before dependency env resolution. Profile entries replace the default profile list. |
 | `providesConfig` | No | Declares a startup provider command and output allowlist. Provider stdout must be schema version 1 JSON and is persisted by Ploinky only after allowlist, reserved-name, sensitive-flag, and generated-secret checks pass. |
 | `guest` | No | `guest: true` makes manifest-derived auth mode `guest`. |
@@ -209,7 +254,7 @@ Ploinky does not load a central manifest schema in the observed paths. Individua
 | `health.readiness` | No | Script probe configuration. For a start-only container with no explicit readiness protocol, `health.readiness.script` is executed inside the service container and blocks dependency startup until it succeeds or fails. The watchdog also uses the configuration later as a warning-oriented container health probe. |
 | `volumes` | No | Extra host-to-container mounts. Relative host paths are resolved against the workspace root; absolute host paths are honored as declared. Missing paths are created unless marked generated+required. |
 | `volumeOptions` | No | Per-container-path options for `volumes`: `generated`, `required`, numeric `chmod`, and `makeWorldWritableSubdirs`. |
-| `network` | No | Supports host mode or named network with aliases, including boxed Podman starts. Default Docker adds `host.docker.internal`; default Podman uses `slirp4netns:allow_host_loopback=true` when no manifest network is declared. |
+| `network` | No | Supports host mode or named networks with aliases for agent starts inside the managed runtime. Default Docker adds `host.docker.internal`; default Podman uses `slirp4netns:allow_host_loopback=true` when no manifest network is declared. |
 | `containerSecurity.privileged` | No | Adds `--privileged` for container runtime when true. |
 | `mcp-config.json` beside manifest/code | No | Copied/synchronized into the persistent agent home, `.data/<agent-or-alias>/mcp-config.json`. Seatbelt writes a rewritten `.seatbelt` config in the same work directory. Default AgentServer also searches `/code/mcp-config.json`. |
 | `httpServices` | No | Router exposes service prefixes that proxy to the agent route using explicit `access: public`, `access: guest`, or `access: authenticated`. |
@@ -221,12 +266,12 @@ Removed legacy env features are intentionally rejected: `derive`, `deriveName`, 
 
 ### Start Profile Selection
 
-The public boxed form is `ploinky start <agent> [port] [--profile <name>]`;
+The managed host form is `ploinky start <agent> [port] [--profile <name>]`;
 both `--profile <name>` and `--profile=<name>` are consumed as explicit
-cross-boundary selectors and forwarded to the in-box CLI. Omission at this
-public boundary selects and forwards `default`, so host environment or an older
-persisted profile cannot silently change the outer publish plan. A direct
-in-box `ploinky start` that omits the flag does not overwrite the active profile
+cross-boundary selectors and forwarded to core. Omission at this public
+boundary selects and forwards `default`, so host environment or an older
+persisted profile cannot silently change the outer publish plan. A core
+`ploinky start` entered in the REPL that omits the flag does not overwrite the active profile
 and may continue using `.ploinky/profile`.
 
 For Explorer publish planning, `explorer`, `AchillesIDE/explorer`, and
@@ -465,22 +510,22 @@ that synthetic AgentServer mapping. It needs an intentional `openPorts` route,
 a private `additionalServerPort`, a blocking `health.readiness.script`, or
 `readiness.protocol: "none"` according to its service contract.
 
-For boxed public Explorer starts, outer publishes are planned before the box is
-created. The planner walks the enabled graph and treats each effective-profile
+For managed public Explorer starts, outer publishes are planned before runtime
+reconciliation. The planner walks the enabled graph and treats each effective-profile
 `openPorts` declaration as both an inner exposure and outer-boundary
-eligibility. The manifest's box-side port becomes the outer container target;
+eligibility. The manifest's runtime-side port becomes the outer container target;
 the private agent-container target is used for diagnostics and conflict
 comparison, not as the outer target.
 
 Generated claims accept stable nonzero TCP/UDP ports and equal-length ranges.
-Any overlapping box-side interval for the same protocol fails planning unless
+Any overlapping runtime-side interval for the same protocol fails planning unless
 it is a semantically exact duplicate on the same effective graph node. The
 diagnostic names both agent refs, profiles, aliases, bind classes, raw
-declarations, and box-to-private mappings. The same numeric TCP and UDP sockets
+declarations, and runtime-to-private mappings. The same numeric TCP and UDP sockets
 are independent.
 
 Explicit `--publish`/`--expose` values are retained byte-for-byte and in their
-original order. The wrapper parses only the terminal container target interval
+original order. The supervisor parses only the terminal container target interval
 and protocol into a canonical claim. If that target overlaps a generated claim
 for the same protocol, it suppresses the entire generated claim without
 rewriting or splitting the explicit one.
@@ -491,18 +536,21 @@ port such as `3000` for a service running inside the agent runtime;
 publish that server port on localhost with an ephemeral host port, record the
 resolved upstream in `.ploinky/routing.json`, and expose it through the router
 at `http://<agent>.localhost:<routerPort>/`. This private route is not eligible
-for the outer box. It can be the TCP readiness route for a start-only service;
+for host publication. It can be the TCP readiness route for a start-only service;
 when AgentServer is present, port 7000 remains the MCP/readiness route.
 
-Changing `openPorts` or `--profile` affects the desired run arguments for a
-newly created outer box only. Existing boxes are not reconciled.
+Changing `openPorts` or `--profile` changes the desired outer-runtime creation
+configuration. The supervisor validates the replacement image and performs
+transactional reconciliation when the inspected configuration differs,
+preserving all named volumes and restoring the previous image/configuration if
+replacement creation or health validation fails.
 
 Web Publishing remains the HTTP/WebSocket consolidation layer. Its nginx
 process binds 8081 with a default 404 server even when no routes exist.
 Deployment checks read the generated external OnlyOffice and LiveKit public
 URLs and probe those origins. They do not assume direct host access to private
-ports 8082 or 17000, and they do not assume host 8081 was published when an
-earlier operation created the box before graph-aware Explorer start.
+ports 8082 or 17000. A graph-aware Explorer start reconciles the selected
+profile's eligible outer publishes before core startup and readiness probing.
 
 ## Host Sandbox Runtimes
 

@@ -50,25 +50,42 @@ You can use Ploinky in two ways:
     ploinky list agents
     ```
 
-By default, `ploinky` now runs through the boxed runtime. Existing commands keep
-their syntax, but agents run as nested containers inside one outer box
-container.
-The box does not bake Ploinky core: your local checkout is mounted read-only
-into the box, so core edits on the host apply to a running box without an
-image rebuild. On first use, ploinky asks before installing its npm
-dependencies into the box's dependency volume.
+By default, the public entrypoint reconciles and starts one managed outer
+runtime, then runs Ploinky core inside it. The runtime mounts the local checkout
+read-only at `/opt/ploinky`; its dependencies live in the instance's writable
+dependency volume. Ordinary agent containers run one level inside this runtime.
 
-Use `ploinky box status`, `ploinky box stop`, `ploinky box update`, and
-`ploinky box destroy` for the outer container lifecycle. Bare commands such as
-`ploinky status`, `ploinky stop`, and `ploinky destroy` are forwarded to the
-normal Ploinky CLI inside the box.
+| Invocation | Documented effect |
+| --- | --- |
+| `ploinky` or `p-cli` | Reconcile/start outer runtime; open Ploinky REPL |
+| `ploinky cli` | Reconcile/start outer runtime; open `/bin/bash` as `podman` in `/workspace` |
+| `ploinky cli <agent>` | Reconcile/start outer runtime; attach to that agent's manifest CLI |
+| `ploinky start ...` | Reconcile/start outer runtime; preserve graph publishes and router readiness |
+| `ploinky status` | Inspect outer contract/publishes/health and running core status without mutation |
+| `ploinky stop` | Stop core services, then stop outer runtime; keep volumes |
+| `ploinky destroy` | Confirm exact instance and remove its container plus three volumes |
+| REPL `status`/`stop`/`destroy` | Core workspace/router/agent scope; outer runtime remains |
 
-Box selector flags such as `--name` and `--port` can appear before or after a
-public command. Put `--dry-run` before the command for wrapper dry-run; after
-the command it is forwarded to the in-box Ploinky CLI.
+The required outer image is the immutable
+`docker.io/assistos/ploinky-box:podman-node24-runtime-v1` reference with the
+exact label `io.assistos.ploinky.runtime-contract=1`. Omitted creation flags
+preserve the inspected image, publishes, mounts, listening scope, devices,
+security settings, environment, and named-volume attachments. Migration applies
+only when `--image` is omitted and the inspected image is exactly
+`docker.io/assistos/ploinky-box:podman-node24` or
+`assistos/ploinky-box:podman-node24`. An omitted incompatible custom reference
+remains selected, is force-pulled and validated before any mutation, and fails
+without disturbing the old runtime if it still lacks contract 1. A failed
+replacement restores the previous image and normalized creation configuration
+while leaving all three volumes intact.
 
-For local CLI development without the box, run the CLI entry directly from
-your checkout:
+Release ordering is manual and strict: publish and independently validate the
+immutable runtime image first, then adopt that exact reference in Ploinky.
+Ordinary agent images intentionally contain neither Podman nor Docker; nested
+container control belongs only to the managed outer runtime.
+
+For local core development without entering the managed runtime, run the CLI
+entry directly from your checkout:
 
 ```bash
 node cli/index.js <args>
@@ -81,7 +98,8 @@ node cli/index.js <args>
 - `start <staticAgent> <port>`: first run requires a static agent and port; subsequent runs can just use `start`.
   - Ensures all enabled agents are running and launches the Router on `<port>`.
   - Serves static files from the repository of `<staticAgent>`; non `/<agent>/...` paths are static.
-- `cli <name> [args...]`: run the agent’s CLI command interactively.
+- `cli`: from the managed runtime, open `/bin/bash` as `podman` in `/workspace`.
+- `cli <name> [args...]`: run the agent’s manifest CLI command interactively.
 - `shell <name>`: open interactive `/bin/sh` in the agent container.
 - `webchat [--rotate]`: print the WebChat access URL for the router login flow.
 - `dashboard [--rotate]`: prepare or rotate the dashboard token and print its access URL.
