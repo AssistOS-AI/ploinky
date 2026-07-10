@@ -175,7 +175,7 @@ function statusScenarios() {
                 images: { 'sha256:legacy': legacyImage() },
             },
             code: 1,
-            core: false,
+            core: true,
         },
         {
             name: 'image metadata missing',
@@ -184,7 +184,7 @@ function statusScenarios() {
                 images: {},
             },
             code: 1,
-            core: false,
+            core: true,
         },
         {
             name: 'unhealthy',
@@ -193,7 +193,7 @@ function statusScenarios() {
                 images: contractV1Images(),
             },
             code: 1,
-            core: false,
+            core: true,
         },
         {
             name: 'core failure',
@@ -205,6 +205,10 @@ function statusScenarios() {
             core: true,
         },
     ];
+}
+
+function escapeRegExp(value) {
+    return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
 test('docker and podman inspect normalize to the same runtime config', () => {
@@ -970,6 +974,31 @@ function publicRunIn(cwd, engine, ...args) {
     return { out: `${r.stdout ?? ''}${r.stderr ?? ''}`, status: r.status };
 }
 
+function publicRunInWithEnv(cwd, extraEnv, engine, ...args) {
+    const r = spawnSync(MJS, args, {
+        cwd,
+        encoding: 'utf8',
+        env: {
+            ...process.env,
+            ...extraEnv,
+            PLOINKY_BOX_ENGINE: engine,
+        },
+    });
+    return { out: `${r.stdout ?? ''}${r.stderr ?? ''}`, status: r.status };
+}
+
+function makeMissingStatusEngine() {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-status-engine-'));
+    const calls = path.join(dir, 'calls.log');
+    const engine = path.join(dir, 'podman');
+    fs.writeFileSync(engine, `#!/usr/bin/env bash
+printf '%s\\n' "$*" >> ${JSON.stringify(calls)}
+exit 1
+`);
+    fs.chmodSync(engine, 0o755);
+    return { dir, calls };
+}
+
 // Fixed-basename child inside a random temp parent: deterministic inference,
 // no collision with real containers. Callers clean up the returned parent.
 function makeCwd(basename) {
@@ -1383,6 +1412,295 @@ test('host routing has no box lifecycle namespace', () => {
     });
 });
 
+for (const engine of ['podman', 'docker']) {
+    test(engine + ' status is read-only in every state', async () => {
+        for (const scenario of statusScenarios()) {
+            const harness = createSupervisorHarness({
+                engine,
+                ...scenario.input,
+            });
+            const code = await harness.supervisor.run(['status']);
+            assert.equal(code, scenario.code, scenario.name);
+            const forbidden = new Set([
+                'pull',
+                'run',
+                'start',
+                'stop',
+                'rm',
+                'volume',
+            ]);
+            assert.equal(
+                harness.calls.some(call => forbidden.has(call.args[0])),
+                false,
+                scenario.name,
+            );
+            const coreExecs = harness.calls.filter(call =>
+                call.args[0] === 'exec'
+                && call.args.slice(-2).join(' ') === 'ploinky status'
+            );
+            assert.equal(coreExecs.length, scenario.core ? 1 : 0, scenario.name);
+        }
+    });
+}
+
+test('dry-run status still inspects and reports an existing runtime read-only', async () => {
+    const harness = createSupervisorHarness({
+        container: compatibleRunningContainer(),
+        images: contractV1Images(),
+    });
+    assert.equal(await harness.supervisor.run(['--dry-run', 'status']), 0);
+    assert.match(harness.stdout, /runtime: ploinky-box-demo \(running\)/);
+    assert.equal(harness.calls.some(call =>
+        call.kind === 'query'
+        && call.args.join(' ') === 'container inspect ploinky-box-demo'
+    ), true);
+    const forbidden = new Set(['pull', 'run', 'start', 'stop', 'rm', 'volume']);
+    assert.equal(
+        harness.calls.some(call => forbidden.has(call.args[0])),
+        false,
+    );
+});
+
+test('dry-run status creates a live read-only engine client for core status', async () => {
+    const stdout = captureWritable();
+    const stderr = captureWritable();
+    const fake = createFakeEngine({
+        container: compatibleRunningContainer(),
+        images: contractV1Images(),
+        stdout: stdout.stream,
+        stderr: stderr.stream,
+    });
+    let clientDryRun;
+    const raw = createRuntimeSupervisor({
+        ...minimalSupervisorDependencies(),
+        stdout: stdout.stream,
+        stderr: stderr.stream,
+        cwd: '/workspace/demo',
+        detectEngine: () => 'podman',
+        createEngineClient(options) {
+            clientDryRun = options.dryRun;
+            return fake.engineClient;
+        },
+    });
+
+    assert.equal(
+        await runSupervisorWithBoundary(
+            raw,
+            ['--dry-run', 'status'],
+            stderr.stream,
+        ),
+        0,
+    );
+    assert.equal(clientDryRun, false);
+    assert.equal(fake.calls.filter(call =>
+        call.args[0] === 'exec'
+        && call.args.slice(-2).join(' ') === 'ploinky status'
+    ).length, 1);
+});
+
+test('dry-run status preserves injected detector mutations and caller dry-run state', async () => {
+    const stdout = captureWritable();
+    const stderr = captureWritable();
+    const fake = createFakeEngine({
+        container: compatibleRunningContainer(),
+        images: contractV1Images(),
+        stdout: stdout.stream,
+        stderr: stderr.stream,
+    });
+    let detectedInvocation;
+    let detectedDryRun;
+    let clientName;
+    let clientDryRun;
+    const raw = createRuntimeSupervisor({
+        ...minimalSupervisorDependencies(),
+        stdout: stdout.stream,
+        stderr: stderr.stream,
+        cwd: '/workspace/demo',
+        detectEngine(invocation) {
+            detectedInvocation = invocation;
+            detectedDryRun = invocation.dryRun;
+            invocation.engine = 'podman';
+            return true;
+        },
+        createEngineClient(options) {
+            clientName = options.name;
+            clientDryRun = options.dryRun;
+            return fake.engineClient;
+        },
+    });
+
+    assert.equal(
+        await runSupervisorWithBoundary(
+            raw,
+            ['--dry-run', 'status'],
+            stderr.stream,
+        ),
+        0,
+    );
+    assert.equal(detectedDryRun, false);
+    assert.equal(clientName, 'podman');
+    assert.equal(clientDryRun, false);
+    assert.equal(detectedInvocation.dryRun, true);
+});
+
+test('route-effective dry-run restoration survives detector failure', async () => {
+    const stderr = captureWritable();
+    let detectedInvocation;
+    const raw = createRuntimeSupervisor({
+        ...minimalSupervisorDependencies(),
+        stderr: stderr.stream,
+        detectEngine(invocation) {
+            detectedInvocation = invocation;
+            invocation.engine = 'podman';
+            throw new Error('detector failed');
+        },
+    });
+
+    assert.equal(
+        await runSupervisorWithBoundary(
+            raw,
+            ['--dry-run', 'status'],
+            stderr.stream,
+        ),
+        1,
+    );
+    assert.match(stderr.text(), /detector failed/);
+    assert.equal(detectedInvocation.engine, 'podman');
+    assert.equal(detectedInvocation.dryRun, true);
+});
+
+test('dry-run status validates a missing explicit engine before inspection', async () => {
+    const stdout = captureWritable();
+    const stderr = captureWritable();
+    const missingEngine = `/definitely/missing/ploinky-engine-${process.pid}`;
+    let clientCreations = 0;
+    const raw = createRuntimeSupervisor({
+        ...minimalSupervisorDependencies(),
+        stdout: stdout.stream,
+        stderr: stderr.stream,
+        cwd: '/workspace/demo',
+        env: { PATH: '' },
+        createEngineClient() {
+            clientCreations += 1;
+            return {
+                name: missingEngine,
+                query() {
+                    return {
+                        ok: false,
+                        status: 1,
+                        stdout: '',
+                        stderr: 'must not inspect',
+                    };
+                },
+                streamContains() {
+                    throw new Error('must not read logs');
+                },
+                run() {
+                    throw new Error('must not run core status');
+                },
+            };
+        },
+    });
+
+    assert.equal(
+        await runSupervisorWithBoundary(
+            raw,
+            ['--dry-run', 'status', '--engine', missingEngine],
+            stderr.stream,
+        ),
+        1,
+    );
+    assert.match(stderr.text(), /requested engine .* not found in PATH/);
+    assert.doesNotMatch(stdout.text(), /runtime: .* \(missing\)/);
+    assert.equal(clientCreations, 0);
+});
+
+test('running status treats malformed image metadata as missing and still invokes core', async () => {
+    const stdout = captureWritable();
+    const stderr = captureWritable();
+    const fake = createFakeEngine({
+        container: compatibleRunningContainer(),
+        images: contractV1Images(),
+        stdout: stdout.stream,
+        stderr: stderr.stream,
+    });
+    const originalQuery = fake.engineClient.query.bind(fake.engineClient);
+    fake.engineClient.query = (args) => {
+        if (args[0] !== 'image') return originalQuery(args);
+        fake.calls.push({ kind: 'query', args: [...args], options: {} });
+        return {
+            ok: true,
+            status: 0,
+            stdout: '{',
+            stderr: '',
+        };
+    };
+    const raw = createRuntimeSupervisor({
+        ...minimalSupervisorDependencies(),
+        stdout: stdout.stream,
+        stderr: stderr.stream,
+        cwd: '/workspace/demo',
+        detectEngine: () => 'podman',
+        engineClient: fake.engineClient,
+    });
+
+    assert.equal(
+        await runSupervisorWithBoundary(raw, ['status'], stderr.stream),
+        1,
+    );
+    assert.match(
+        stdout.text(),
+        /contract: outdated \(expected 1, observed <missing>\)/,
+    );
+    assert.match(stdout.text(), /health: healthy/);
+    assert.match(stdout.text(), /core: running/);
+    assert.equal(fake.calls.filter(call =>
+        call.kind === 'streamContains' && call.args[0] === 'logs'
+    ).length, 1);
+    assert.equal(fake.calls.filter(call =>
+        call.args[0] === 'exec'
+        && call.args.slice(-2).join(' ') === 'ploinky status'
+    ).length, 1);
+    const forbidden = new Set(['pull', 'run', 'start', 'stop', 'rm', 'volume']);
+    assert.equal(
+        fake.calls.some(call => forbidden.has(call.args[0])),
+        false,
+    );
+});
+
+test('compatible status prints runtime contract publishes health and core output', async () => {
+    const harness = createSupervisorHarness({
+        container: compatibleRunningContainer(),
+        images: contractV1Images(),
+    });
+    assert.equal(await harness.supervisor.run(['status']), 0);
+    for (const line of [
+        'runtime: ploinky-box-demo (running)',
+        'image: docker.io/assistos/ploinky-box:podman-node24-runtime-v1',
+        'publish: 127.0.0.1:18080 -> 8080/tcp',
+        'publish: 127.0.0.1:17880 -> 7880/udp',
+        'contract: compatible (expected 1, observed 1)',
+        'health: healthy',
+        'core: running',
+    ]) {
+        assert.match(harness.stdout, new RegExp(escapeRegExp(line)));
+    }
+});
+
+test('stopped status still reports image contract without invoking core', async () => {
+    const harness = createSupervisorHarness({
+        container: compatibleStoppedContainer(),
+        images: contractV1Images(),
+    });
+    assert.equal(await harness.supervisor.run(['status']), 1);
+    assert.match(harness.stdout, /runtime: ploinky-box-demo \(exited\)/);
+    assert.match(
+        harness.stdout,
+        /contract: compatible \(expected 1, observed 1\)/,
+    );
+    assert.equal(harness.calls.some(call => call.args[0] === 'exec'), false);
+});
+
 test('public help contains no compatibility surface', () => {
     const help = publicUsageText();
     assert.doesNotMatch(help, /ploinky box/);
@@ -1783,14 +2101,26 @@ test('bin/ploinky-direct is deleted', () => {
 
 test('public status inspects the inferred runtime without creating it', () => {
     const { parent, dir } = makeCwd('testExplorerFresh');
+    const fake = makeMissingStatusEngine();
     try {
-        const { out, status } = publicRunIn(dir, 'podman', '--dry-run', 'status');
+        const { out, status } = publicRunInWithEnv(
+            dir,
+            { PATH: `${fake.dir}:${process.env.PATH || ''}` },
+            'podman',
+            '--dry-run',
+            'status',
+        );
         assert.equal(status, 1, out);
-        checkIncludes(out, "'ploinky-box-testExplorerFresh' does not exist.", 'status resolves the inferred runtime');
+        checkIncludes(out, 'runtime: ploinky-box-testExplorerFresh (missing)', 'status resolves the inferred runtime');
         checkAbsent(out, 'DRY-RUN: podman run -d', 'status does not create the runtime');
         checkAbsent(out, ' podman start ', 'status does not start the runtime');
+        assert.equal(
+            fs.readFileSync(fake.calls, 'utf8').trim(),
+            'container inspect ploinky-box-testExplorerFresh',
+        );
     } finally {
         fs.rmSync(parent, { recursive: true, force: true });
+        fs.rmSync(fake.dir, { recursive: true, force: true });
     }
 });
 
@@ -2390,13 +2720,24 @@ test('un-inferable cwd dies with guidance', () => {
 
 test('status targets the inferred instance', () => {
     const { parent, dir } = makeCwd('testExplorerFresh');
+    const fake = makeMissingStatusEngine();
     try {
-        const { out, status } = publicRunIn(dir, 'podman', '--dry-run', 'status');
+        const { out, status } = publicRunInWithEnv(
+            dir,
+            { PATH: `${fake.dir}:${process.env.PATH || ''}` },
+            'podman',
+            '--dry-run',
+            'status',
+        );
         assert.equal(status, 1, out);
-        checkIncludes(out, "'ploinky-box-testExplorerFresh' does not exist.", 'status resolves the inferred name');
-        checkIncludes(out, 'name inferred from the current directory', 'status explains where the name came from');
+        checkIncludes(out, 'runtime: ploinky-box-testExplorerFresh (missing)', 'status resolves the inferred name');
+        assert.equal(
+            fs.readFileSync(fake.calls, 'utf8').trim(),
+            'container inspect ploinky-box-testExplorerFresh',
+        );
     } finally {
         fs.rmSync(parent, { recursive: true, force: true });
+        fs.rmSync(fake.dir, { recursive: true, force: true });
     }
 });
 

@@ -816,28 +816,77 @@ function forwardCoreCommand(cfg, forwardedArgs, { interactive = false } = {}) {
     return runEngine(cfg, execArgs);
 }
 
-async function inspectRuntimeStatus(cfg) {
-    preflight(cfg);
-    const instance = instanceName(cfg);
-    if (cfg.dryRun) {
-        output(cfg, `ploinky: '${instance}' does not exist.${inferredNote(cfg)}\n`);
+function inspectRuntimeIfPresent(engine, instance) {
+    const result = engine.query(['container', 'inspect', instance]);
+    if (!result.ok) return null;
+    return normalizeContainerInspect(engine.name, result.stdout);
+}
+
+function inspectLocalImage(engine, imageRef) {
+    const result = engine.query(['image', 'inspect', imageRef]);
+    if (!result.ok) return null;
+    try {
+        return normalizeImageInspect(result.stdout);
+    } catch {
+        return null;
+    }
+}
+
+function printRuntimeSummary(stdout, runtime) {
+    stdout.write(`runtime: ${runtime.instance} (${runtime.state})\n`);
+    stdout.write(`image: ${runtime.image}\n`);
+    const publishes = [
+        runtime.routerPublish,
+        ...runtime.extraPublishes,
+    ].filter(Boolean);
+    for (const publish of publishes) {
+        stdout.write(
+            `publish: ${publish.hostIp || '*'}:${publish.hostPort}`
+            + ` -> ${publish.containerPort}/${publish.protocol}\n`,
+        );
+    }
+}
+
+export async function reportCombinedStatus(context) {
+    const { engine, invocation, stdout } = context;
+    const instance = instanceName(invocation);
+    const inspected = inspectRuntimeIfPresent(engine, instance);
+    if (!inspected) {
+        stdout.write(`runtime: ${instance} (missing)\n`);
         return 1;
     }
-    if (!runtimeExists(cfg)) {
-        output(cfg, `ploinky: '${instance}' does not exist.${inferredNote(cfg)}\n`);
-        return 1;
-    }
-    const state = query(cfg, ['container', 'inspect', '--format', '{{.State.Status}}', instance]).stdout.trim();
-    output(cfg, `container: ${instance} (${state})\n`);
-    const hp = runtimeHostPort(cfg);
-    if (hp && await urlOk(cfg, `http://127.0.0.1:${hp}/status`)) {
-        output(cfg, `router:    responding on http://127.0.0.1:${hp}/status\n`);
-    } else if (hp && await urlOk(cfg, `http://127.0.0.1:${hp}/health`)) {
-        output(cfg, `router:    responding on http://127.0.0.1:${hp}/health\n`);
-    } else {
-        output(cfg, `router:    not responding (run ploinky --name ${cfg.name} start <agent>)\n`);
-    }
-    return 0;
+
+    printRuntimeSummary(stdout, inspected);
+    const image = inspectLocalImage(
+        engine,
+        inspected.imageId || inspected.image,
+    );
+    const observed = image?.contract || '<missing>';
+    const compatible = observed === REQUIRED_RUNTIME_CONTRACT;
+    stdout.write(
+        `contract: ${compatible ? 'compatible' : 'outdated'}`
+        + ` (expected ${REQUIRED_RUNTIME_CONTRACT}, observed ${observed})\n`,
+    );
+    if (!inspected.running) return 1;
+
+    const healthy = await engine.streamContains(
+        ['logs', instance],
+        '[ploinky-box] self-check OK',
+    );
+    stdout.write(`health: ${healthy ? 'healthy' : 'unhealthy'}\n`);
+
+    const coreStatus = engine.run([
+        'exec',
+        '-e',
+        `PLOINKY_RUNTIME_NAME=${instance}`,
+        '-w',
+        '/workspace',
+        instance,
+        'ploinky',
+        'status',
+    ], { allowFail: true });
+    if (!compatible || !healthy) return 1;
+    return coreStatus;
 }
 
 function stopRuntime(cfg) {
@@ -913,14 +962,23 @@ export function createRuntimeSupervisor(dependencies = {}) {
                 return 0;
             }
 
-            const detected = deps.detectEngine(invocation);
+            const engineDryRun = invocation.dryRun
+                && route.kind !== 'status';
+            const invocationDryRun = invocation.dryRun;
+            invocation.dryRun = engineDryRun;
+            let detected;
+            try {
+                detected = deps.detectEngine(invocation);
+            } finally {
+                invocation.dryRun = invocationDryRun;
+            }
             if (!detected) {
                 throw new SupervisorError('Ploinky requires Podman or Docker on the host');
             }
             if (typeof detected === 'string') invocation.engine = detected;
             const engineClient = deps.engineClient || deps.createEngineClient({
                 name: invocation.engine,
-                dryRun: invocation.dryRun,
+                dryRun: engineDryRun,
                 spawnSyncImpl: deps.spawnSyncImpl,
                 spawnImpl: deps.spawnImpl,
                 stdout: deps.stdout,
@@ -940,7 +998,13 @@ export function createRuntimeSupervisor(dependencies = {}) {
             const cwd = typeof deps.cwd === 'function' ? deps.cwd() : deps.cwd;
             resolveInstanceIdentity(invocation, cwd);
 
-            if (route.kind === 'status') return inspectRuntimeStatus(invocation);
+            if (route.kind === 'status') {
+                return reportCombinedStatus({
+                    engine: engineClient,
+                    invocation,
+                    stdout: deps.stdout,
+                });
+            }
             if (route.kind === 'stop') return stopRuntime(invocation);
             if (route.kind === 'destroy') return destroyRuntime(invocation);
             if (route.kind === 'start') return startGraph(invocation);
