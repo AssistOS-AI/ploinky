@@ -6,6 +6,7 @@ import path from 'node:path';
 
 import {
     INTERACTIVE_PLOINKY_UPDATE_MESSAGE,
+    PLOINKY_BOX_MARKER_PATH,
     findAchillesDependencyPackages,
     parseGitDependencyRef,
     refreshAchillesDependenciesInRepos,
@@ -77,6 +78,43 @@ test('non-interactive Ploinky self-update pulls and reports changed HEAD', () =>
         assert.equal(result.updated, true);
         assert.equal(result.before, 'old-head');
         assert.equal(result.after, 'new-head');
+    } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+    }
+});
+
+test('Ploinky box self-update skips the read-only source before running git operations', () => {
+    const root = tempDir();
+    const warnings = [];
+    const unexpected = () => {
+        throw new Error('boxed self-update must not inspect or mutate the source checkout');
+    };
+
+    try {
+        fs.mkdirSync(path.join(root, '.git'), { recursive: true });
+
+        const result = updatePloinkySelf({
+            repoPath: root,
+            interactiveSession: true,
+            exists(filePath) {
+                assert.equal(filePath, PLOINKY_BOX_MARKER_PATH);
+                return true;
+            },
+            logger: { warn(message) { warnings.push(message); } },
+            checkUpdate: unexpected,
+            pull: unexpected,
+            getRef: unexpected,
+        });
+
+        assert.deepEqual(result, {
+            skipped: true,
+            boxed: true,
+            reason: 'Ploinky source is mounted read-only inside ploinky-box',
+            repoPath: root,
+        });
+        assert.deepEqual(warnings, [
+            `Skipping Ploinky self-update inside ploinky-box: ${root} is mounted read-only.`,
+        ]);
     } finally {
         fs.rmSync(root, { recursive: true, force: true });
     }

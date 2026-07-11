@@ -267,26 +267,24 @@ process.stdout.write(JSON.stringify({
     }
 });
 
-test('parseManifestPorts emits runtime-chosen localhost openPorts for host port 0', () => {
+test('parseManifestPorts rejects openPorts host port 0 before runtime mutation', () => {
     const workspaceDir = tempDir();
     try {
         const result = runModuleSnippet(
             `const { parseManifestPorts } = await import(${JSON.stringify(dockerCommonUrl)});
 const manifest = {};
 const profile = { openPorts: ['127.0.0.1:0:9000', '127.0.0.1:18080:8080'] };
-process.stdout.write(JSON.stringify(parseManifestPorts(manifest, profile)));`,
+try {
+  parseManifestPorts(manifest, profile);
+} catch (error) {
+  process.stdout.write(JSON.stringify({ code: error.code || '', message: error.message }));
+}`,
             {},
             { cwd: workspaceDir },
         );
 
         assert.equal(result.status, 0, result.stderr);
-        assert.deepEqual(JSON.parse(result.stdout), {
-            publishArgs: ['127.0.0.1::9000', '127.0.0.1:18080:8080'],
-            portMappings: [
-                { hostPort: 0, containerPort: 9000, hostIp: '127.0.0.1', protocol: 'tcp' },
-                { hostPort: 18080, containerPort: 8080, hostIp: '127.0.0.1', protocol: 'tcp' },
-            ],
-        });
+        assert.match(JSON.parse(result.stdout).message, /host port 0 is not valid for outer box publish/);
     } finally {
         fs.rmSync(workspaceDir, { recursive: true, force: true });
     }

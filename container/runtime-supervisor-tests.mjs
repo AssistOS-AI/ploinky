@@ -1,18 +1,25 @@
 #!/usr/bin/env node
-// Engine-free tests for the runtime supervisor. They use the injected fake
-// engine or --dry-run, so no Podman/Docker mutation is needed.
-// Runs standalone (`node container/runtime-supervisor-tests.mjs`) and via the
-// unit suite (imported by tests/unit/runtimeSupervisor.test.mjs).
-import { test } from 'node:test';
+import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { getCommandRegistry } from '../cli/services/commandRegistry.js';
 import {
+    IDENTITY_SCHEMA_LABEL,
+    IDENTITY_SCHEMA_VERSION,
+    EXPLICIT_PUBLISHES_LABEL,
+    GENERATED_PUBLISHES_LABEL,
+    PATH_HASH_LABEL,
+    PUBLISH_PLAN_VERSION_LABEL,
+    REQUESTED_IMAGE_LABEL,
+    REQUIRED_IMAGE_ENV,
     REQUIRED_RUNTIME_IMAGE,
+    REQUIRED_PUBLISH_PLAN_VERSION,
+    RUNTIME_CONTRACT_LABEL,
+    VOLUME_ROLE_LABEL,
+    VOLUME_ROLES,
     buildRuntimeRunArgs,
     createDefaultRuntimeConfig,
     mergeAndValidatePublishes,
@@ -20,3907 +27,1738 @@ import {
     normalizeContainerInspect,
     normalizeImageInspect,
     planReconciliation,
+    runtimeVolumeNames,
     validateImageContract,
 } from './runtime-contract.mjs';
 import { createEngineClient } from './runtime-engine.mjs';
 import {
+    applyAuthoritativePublicationPlan,
+    assertStateCommandFlags,
+    createRuntimeSupervisor,
+    forwardCoreCommand,
+    hostRuntimeLockPath,
+    parseHostInvocation,
+    publicationContractForPlan,
+    publicUsageText,
+    resolveEngineOwnership,
+    resolveHostPloinkySource,
+    resolveInstanceIdentity,
+    routeHostInvocation,
+    runSupervisorWithBoundary,
+    shouldInstallDeps,
+    withHostRuntimeLock,
+    inferPublicStartBranchArgs,
+} from './runtime-supervisor.mjs';
+import {
+    contract1Image,
+    contract2Container,
+    contract2Image,
+    contract2RuntimeFixture,
     createFakeEngine,
     createSupervisorHarness,
+    identityFor,
+    ownedVolume,
 } from '../tests/helpers/runtimeSupervisorHarness.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(HERE, '..');
-const ROOT = REPO_ROOT;
-const MJS = path.join(HERE, 'runtime-supervisor.mjs');
-const PLOINKY = path.join(HERE, '..', 'bin', 'ploinky');
-const PCLI = path.join(HERE, '..', 'bin', 'p-cli');
-const PSH = path.join(HERE, '..', 'bin', 'psh');
-const INSTALL_DEPS = path.join(HERE, '..', 'bin', 'ploinky-install-deps');
-const REQUIRED_IMAGE = REQUIRED_RUNTIME_IMAGE;
+const PLOINKY = path.join(REPO_ROOT, 'bin', 'ploinky');
+const PCLI = path.join(REPO_ROOT, 'bin', 'p-cli');
+const PSH = path.join(REPO_ROOT, 'bin', 'psh');
+const INSTALL_DEPS = path.join(REPO_ROOT, 'bin', 'ploinky-install-deps');
+const SUPERVISOR = path.join(REPO_ROOT, 'container', 'runtime-supervisor.mjs');
 
-const dockerInspect = [{
-    Id: 'container-id',
-    Name: '/ploinky-box-demo',
-    Image: 'sha256:runtime-v1',
-    Config: {
-        Image: 'docker.io/assistos/ploinky-box:podman-node24-runtime-v1',
-        User: 'podman',
-        Env: [
-            'PLOINKY_WORKSPACE_ROOT=/workspace',
-            'PLOINKY_RUNTIME_NAME=ploinky-box-demo',
-        ],
-    },
-    State: { Status: 'running' },
-    HostConfig: {
-        Privileged: true,
-        Binds: [
-            '/src/ploinky:/opt/ploinky:ro',
-            '/host/data:/workspace/mounted',
-        ],
-        PortBindings: {
-            '8080/tcp': [{ HostIp: '127.0.0.1', HostPort: '18080' }],
-            '7880/udp': [{ HostIp: '127.0.0.1', HostPort: '17880' }],
-        },
-        Devices: [
-            { PathOnHost: '/dev/fuse', PathInContainer: '/dev/fuse', CgroupPermissions: 'rwm' },
-            { PathOnHost: '/dev/net/tun', PathInContainer: '/dev/net/tun', CgroupPermissions: 'rwm' },
-        ],
-        SecurityOpt: ['seccomp=unconfined'],
-    },
-    Mounts: [
-        { Type: 'volume', Name: 'ploinky-box-demo-workspace', Destination: '/workspace' },
-        { Type: 'volume', Name: 'ploinky-box-demo-containers', Destination: '/home/podman/.local/share/containers' },
-        { Type: 'volume', Name: 'ploinky-box-demo-ploinky-deps', Destination: '/opt/ploinky/node_modules' },
-        { Type: 'bind', Source: '/src/ploinky', Destination: '/opt/ploinky', Mode: 'ro', RW: false },
-        { Type: 'bind', Source: '/host/data', Destination: '/workspace/mounted', Mode: 'rw', RW: true },
-    ],
-}];
+function runCalls(harness, command) {
+    return harness.calls.filter(call => call.kind === 'run' && call.args[0] === command);
+}
 
-const podmanInspect = [{
-    Id: 'container-id',
-    Name: 'ploinky-box-demo',
-    Image: 'sha256:runtime-v1',
-    ImageName: 'docker.io/assistos/ploinky-box:podman-node24-runtime-v1',
-    Config: {
-        Image: 'docker.io/assistos/ploinky-box:podman-node24-runtime-v1',
-        User: 'podman',
-        Env: [
-            'PLOINKY_WORKSPACE_ROOT=/workspace',
-            'PLOINKY_RUNTIME_NAME=ploinky-box-demo',
-        ],
-    },
-    State: { Status: 'running', Running: true },
-    HostConfig: {
-        Privileged: true,
-        Binds: [
-            '/src/ploinky:/opt/ploinky:ro',
-            '/host/data:/workspace/mounted:rw,rprivate,rbind',
-        ],
-        PortBindings: {
-            '8080/tcp': [{ HostIp: '127.0.0.1', HostPort: '18080' }],
-            '7880/udp': [{ HostIp: '127.0.0.1', HostPort: '17880' }],
-        },
-        Devices: [
-            { PathOnHost: '/dev/fuse', PathInContainer: '/dev/fuse', CgroupPermissions: 'rwm' },
-            { PathOnHost: '/dev/net/tun', PathInContainer: '/dev/net/tun', CgroupPermissions: 'rwm' },
-        ],
-        SecurityOpt: ['seccomp=unconfined'],
-    },
-    Mounts: [
-        { Type: 'volume', Name: 'ploinky-box-demo-workspace', Source: '/var/home/user/.local/share/containers/storage/volumes/ploinky-box-demo-workspace/_data', Destination: '/workspace', Driver: 'local', Mode: '', RW: true, Propagation: '' },
-        { Type: 'volume', Name: 'ploinky-box-demo-containers', Source: '/var/home/user/.local/share/containers/storage/volumes/ploinky-box-demo-containers/_data', Destination: '/home/podman/.local/share/containers', Driver: 'local', Mode: '', RW: true, Propagation: '' },
-        { Type: 'volume', Name: 'ploinky-box-demo-ploinky-deps', Source: '/var/home/user/.local/share/containers/storage/volumes/ploinky-box-demo-ploinky-deps/_data', Destination: '/opt/ploinky/node_modules', Driver: 'local', Mode: 'U', RW: true, Propagation: '' },
-        { Type: 'bind', Source: '/src/ploinky', Destination: '/opt/ploinky', Driver: '', Mode: 'ro', RW: false, Propagation: 'rprivate' },
-        { Type: 'bind', Source: '/host/data', Destination: '/workspace/mounted', Driver: '', Mode: 'rw,rprivate,rbind', RW: true, Propagation: 'rprivate' },
-    ],
-}];
+function mutationCalls(fake) {
+    return fake.calls.filter(call => call.kind === 'run');
+}
 
-function contractV1Image(id = 'sha256:runtime-v1') {
+function rawVolumeSet(identity, roles = Object.keys(VOLUME_ROLES)) {
+    const names = runtimeVolumeNames(identity.instance);
+    return Object.fromEntries(roles.map(role => {
+        const volume = ownedVolume(names[role], identity.pathHash, role);
+        return [volume.Name, volume];
+    }));
+}
+
+function invocationFor(cwd = '/workspace/demo') {
     return {
-        Id: id,
-        Config: {
-            Labels: { 'io.assistos.ploinky.runtime-contract': '1' },
-        },
-    };
-}
-
-function legacyImage(id = 'sha256:legacy') {
-    return { Id: id, Config: { Labels: {} } };
-}
-
-function contractV1Images() {
-    const image = contractV1Image();
-    return {
-        [REQUIRED_IMAGE]: image,
-        [image.Id]: image,
-    };
-}
-
-function compatibleRunningContainer(overrides = {}) {
-    return {
-        inspect: structuredClone(dockerInspect[0]),
-        logs: '[ploinky-box] self-check OK\n',
-        coreStatus: 0,
-        coreStdout: 'core: running\n',
-        ...overrides,
-    };
-}
-
-function compatibleStoppedContainer(overrides = {}) {
-    const value = compatibleRunningContainer(overrides);
-    value.inspect.State.Status = 'exited';
-    return value;
-}
-
-function legacyRunningContainerWithCustomConfig() {
-    const value = compatibleRunningContainer();
-    value.inspect.Image = 'sha256:legacy';
-    value.inspect.Config.Image = 'docker.io/assistos/ploinky-box:podman-node24';
-    value.inspect.Config.Env.push('CUSTOM_RUNTIME_SETTING=kept');
-    value.inspect.HostConfig.PortBindings['8080/tcp'][0] = {
-        HostIp: '0.0.0.0',
-        HostPort: '18080',
-    };
-    return value;
-}
-
-function assertLegacyCreationConfig(args, expectedImage) {
-    for (const value of [
-        '0.0.0.0:18080:8080',
-        '127.0.0.1:17880:7880/udp',
-        '/src/ploinky:/opt/ploinky:ro',
-        '/host/data:/workspace/mounted',
-        'ploinky-box-demo-workspace:/workspace',
-        'ploinky-box-demo-containers:/home/podman/.local/share/containers',
-        '/dev/fuse:/dev/fuse:rwm',
-        '/dev/net/tun:/dev/net/tun:rwm',
-        'seccomp=unconfined',
-        'PLOINKY_WORKSPACE_ROOT=/workspace',
-        'PLOINKY_RUNTIME_NAME=ploinky-box-demo',
-        'CUSTOM_RUNTIME_SETTING=kept',
-    ]) {
-        assert.ok(args.includes(value), value);
-    }
-    const deps =
-        'ploinky-box-demo-ploinky-deps:/opt/ploinky/node_modules';
-    assert.ok(
-        args.includes(deps) || args.includes(deps + ':U'),
-        deps,
-    );
-    assert.ok(args.includes('--privileged'));
-    assert.equal(args[args.indexOf('--user') + 1], 'podman');
-    assert.equal(args.at(-1), expectedImage);
-}
-
-function statusScenarios() {
-    return [
-        { name: 'missing', input: { container: null }, code: 1, core: false },
-        { name: 'stopped', input: { container: compatibleStoppedContainer(), images: contractV1Images() }, code: 1, core: false },
-        { name: 'compatible', input: { container: compatibleRunningContainer(), images: contractV1Images() }, code: 0, core: true },
-        {
-            name: 'outdated',
-            input: {
-                container: legacyRunningContainerWithCustomConfig(),
-                images: { 'sha256:legacy': legacyImage() },
-            },
-            code: 1,
-            core: true,
-        },
-        {
-            name: 'image metadata missing',
-            input: {
-                container: compatibleRunningContainer(),
-                images: {},
-            },
-            code: 1,
-            core: true,
-        },
-        {
-            name: 'unhealthy',
-            input: {
-                container: compatibleRunningContainer({ logs: 'self-check failed\n' }),
-                images: contractV1Images(),
-            },
-            code: 1,
-            core: true,
-        },
-        {
-            name: 'core failure',
-            input: {
-                container: compatibleRunningContainer({ coreStatus: 6 }),
-                images: contractV1Images(),
-            },
-            code: 6,
-            core: true,
-        },
-    ];
-}
-
-function escapeRegExp(value) {
-    return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-}
-
-test('docker and podman inspect normalize to the same runtime config', () => {
-    const dockerConfig = normalizeContainerInspect('docker', dockerInspect);
-    const podmanConfig = normalizeContainerInspect('podman', podmanInspect);
-    assert.deepEqual(
-        { ...podmanConfig, binds: dockerConfig.binds },
-        dockerConfig,
-    );
-    assert.ok(podmanConfig.binds.includes(
-        '/host/data:/workspace/mounted:rw,rprivate,rbind',
-    ));
-    assert.deepEqual(dockerConfig.routerPublish, {
-        hostIp: '127.0.0.1',
-        hostPort: '18080',
-        containerPort: '8080',
-        protocol: 'tcp',
-    });
-    assert.deepEqual(dockerConfig.extraPublishes, [{
-        hostIp: '127.0.0.1',
-        hostPort: '17880',
-        containerPort: '7880',
-        protocol: 'udp',
-    }]);
-    assert.equal(dockerConfig.sourceDir, '/src/ploinky');
-    assert.equal(dockerConfig.mountDir, '/host/data');
-});
-
-test('image inspect normalizes and validates the runtime contract', () => {
-    const image = normalizeImageInspect(contractV1Image());
-    assert.equal(image.id, 'sha256:runtime-v1');
-    assert.equal(image.contract, '1');
-    assert.doesNotThrow(() => validateImageContract(image, REQUIRED_IMAGE));
-    assert.throws(
-        () => validateImageContract(
-            normalizeImageInspect(legacyImage()),
-            'registry.example/legacy:latest',
-        ),
-        /requires io\.assistos\.ploinky\.runtime-contract=1; observed <missing>/,
-    );
-});
-
-test('reconciliation plan creates, starts, reuses, and replaces', () => {
-    const desired = {
-        ...normalizeContainerInspect('docker', dockerInspect),
-        contract: '1',
-    };
-    assert.deepEqual(
-        planReconciliation({ existing: null, desired, contractMatches: true }),
-        { action: 'create', reasons: ['missing'] },
-    );
-    assert.deepEqual(
-        planReconciliation({
-            existing: { ...desired, state: 'exited', running: false },
-            desired,
-            contractMatches: true,
-        }),
-        { action: 'start', reasons: [] },
-    );
-    assert.deepEqual(
-        planReconciliation({
-            existing: { ...desired, state: 'running', running: true },
-            desired,
-            contractMatches: true,
-        }),
-        { action: 'reuse', reasons: [] },
-    );
-    assert.equal(
-        planReconciliation({
-            existing: { ...desired, image: 'legacy' },
-            desired,
-            contractMatches: false,
-        }).action,
-        'replace',
-    );
-});
-
-test('desired config preserves omissions and replaces explicit publishes', () => {
-    const desired = {
-        ...normalizeContainerInspect('docker', dockerInspect),
-        contract: '1',
-    };
-    const existing = {
-        ...desired,
-        image: 'registry.example/custom-runtime:v1',
-        contract: '1',
-        mountDir: '/kept/mount',
-        routerPublish: {
-            hostIp: '0.0.0.0',
-            hostPort: '19000',
-            containerPort: '8080',
-            protocol: 'tcp',
-        },
-        extraPublishes: [{
-            hostIp: '127.0.0.1',
-            hostPort: '7000',
-            containerPort: '7000',
-            protocol: 'tcp',
-        }],
-    };
-    const omitted = mergeDesiredRuntimeConfig(
-        { explicit: new Set(), publish: [] },
-        existing,
-        [],
-    );
-    assert.equal(omitted.image, 'registry.example/custom-runtime:v1');
-    assert.equal(omitted.mountDir, '/kept/mount');
-    assert.equal(omitted.routerPublish.hostPort, '19000');
-    assert.deepEqual(omitted.extraPublishes, existing.extraPublishes);
-
-    const changed = mergeDesiredRuntimeConfig(
-        {
-            explicit: new Set(['--publish']),
-            publish: ['127.0.0.1:9000:9000/tcp'],
-        },
-        existing,
-        ['127.0.0.1:7880:7880/udp', '127.0.0.1:7880:7880/udp'],
-    );
-    assert.deepEqual(changed.extraPublishes, [
-        {
-            hostIp: '127.0.0.1',
-            hostPort: '9000',
-            containerPort: '9000',
-            protocol: 'tcp',
-        },
-        {
-            hostIp: '127.0.0.1',
-            hostPort: '7880',
-            containerPort: '7880',
-            protocol: 'udp',
-        },
-    ]);
-});
-
-test('desired config changes only explicitly selected creation fields', () => {
-    const existing = {
-        ...normalizeContainerInspect('docker', dockerInspect),
-        contract: '1',
-    };
-    const assertOnly = (changed, fields) => {
-        const actualRest = structuredClone(changed);
-        const expectedRest = structuredClone(existing);
-        for (const field of fields) {
-            delete actualRest[field];
-            delete expectedRest[field];
-        }
-        assert.deepEqual(actualRest, expectedRest);
-    };
-
-    const port = mergeDesiredRuntimeConfig(
-        parseHostInvocation(['--port', '19191', 'list', 'agents']),
-        existing,
-    );
-    assert.equal(port.routerPublish.hostPort, '19191');
-    assertOnly(port, ['routerPublish']);
-
-    const image = mergeDesiredRuntimeConfig(
-        parseHostInvocation([
-            '--image', 'registry.example/runtime:v1', 'list', 'agents',
-        ]),
-        existing,
-    );
-    assert.equal(image.image, 'registry.example/runtime:v1');
-    assertOnly(image, ['image']);
-
-    const mount = mergeDesiredRuntimeConfig(
-        parseHostInvocation(['--mount', '/new/mount', 'list', 'agents']),
-        existing,
-    );
-    assert.equal(mount.mountDir, '/new/mount');
-    assert.ok(mount.binds.includes('/new/mount:/workspace/mounted'));
-    assertOnly(mount, ['mountDir', 'binds']);
-
-    const lan = mergeDesiredRuntimeConfig(
-        parseHostInvocation(['--listen-lan', 'list', 'agents']),
-        existing,
-    );
-    assert.equal(lan.routerPublish.hostIp, '0.0.0.0');
-    assertOnly(lan, ['routerPublish']);
-
-    for (const flag of ['--publish', '--expose']) {
-        const publish = mergeDesiredRuntimeConfig(
-            parseHostInvocation([
-                flag, '127.0.0.1:9000:9000/tcp', 'list', 'agents',
-            ]),
-            existing,
-        );
-        assert.deepEqual(publish.extraPublishes, [{
-            hostIp: '127.0.0.1',
-            hostPort: '9000',
-            containerPort: '9000',
-            protocol: 'tcp',
-        }]);
-        assertOnly(publish, ['extraPublishes']);
-    }
-});
-
-test('desired config initializes an explicitly selected missing router publish', () => {
-    const withoutRouterInspect = structuredClone(dockerInspect);
-    delete withoutRouterInspect[0].HostConfig.PortBindings['8080/tcp'];
-    const existing = normalizeContainerInspect(
-        'docker',
-        withoutRouterInspect,
-    );
-    assert.equal(existing.routerPublish, null);
-
-    const omitted = mergeDesiredRuntimeConfig(
-        { explicit: new Set(), publish: [] },
-        existing,
-    );
-    assert.equal(omitted.routerPublish, null);
-
-    const port = mergeDesiredRuntimeConfig(
-        parseHostInvocation(['--port', '19000', 'list', 'agents']),
-        existing,
-    );
-    assert.deepEqual(port.routerPublish, {
-        hostIp: '127.0.0.1',
-        hostPort: '19000',
-        containerPort: '8080',
-        protocol: 'tcp',
-    });
-
-    const lan = mergeDesiredRuntimeConfig(
-        parseHostInvocation(['--listen-lan', 'list', 'agents']),
-        existing,
-    );
-    assert.deepEqual(lan.routerPublish, {
-        hostIp: '0.0.0.0',
-        hostPort: '8080',
-        containerPort: '8080',
-        protocol: 'tcp',
-    });
-});
-
-test('desired config omitted image migrates only the known legacy official reference', () => {
-    const custom = {
-        ...normalizeContainerInspect('docker', dockerInspect),
-        image: 'registry.example/custom-runtime:current',
-        contract: '',
-    };
-    assert.equal(
-        mergeDesiredRuntimeConfig(
-            { explicit: new Set(), publish: [] },
-            custom,
-        ).image,
-        'registry.example/custom-runtime:current',
-    );
-    const legacy = {
-        ...custom,
-        image: 'docker.io/assistos/ploinky-box:podman-node24',
-    };
-    assert.equal(
-        mergeDesiredRuntimeConfig(
-            { explicit: new Set(), publish: [] },
-            legacy,
-        ).image,
-        REQUIRED_RUNTIME_IMAGE,
-    );
-});
-
-test('podman and docker build equivalent creation commands (engine parity)', () => {
-    const dockerConfig = normalizeContainerInspect('docker', dockerInspect);
-    const podmanConfig = normalizeContainerInspect('podman', podmanInspect);
-    const dockerArgs = buildRuntimeRunArgs(dockerConfig, {
-        engine: 'docker',
-        selinux: false,
-    });
-    const podmanArgs = buildRuntimeRunArgs(podmanConfig, {
-        engine: 'podman',
-        selinux: false,
-    });
-    const canonical = args => args.map(value =>
-        value.replace(':/opt/ploinky/node_modules:U', ':/opt/ploinky/node_modules')
-            .replace(':/workspace/mounted:rw,rprivate,rbind', ':/workspace/mounted')
-    );
-    assert.deepEqual(canonical(podmanArgs), canonical(dockerArgs));
-    assert.ok(podmanArgs.includes(
-        'ploinky-box-demo-ploinky-deps:/opt/ploinky/node_modules:U',
-    ));
-    assert.ok(dockerArgs.includes(
-        'ploinky-box-demo-ploinky-deps:/opt/ploinky/node_modules',
-    ));
-    for (const args of [podmanArgs, dockerArgs]) {
-        assert.ok(args.includes('--privileged'));
-        assert.ok(args.includes('/dev/fuse:/dev/fuse:rwm'));
-        assert.ok(args.includes('/dev/net/tun:/dev/net/tun:rwm'));
-        assert.ok(args.includes('seccomp=unconfined'));
-        assert.equal(args.at(-1), REQUIRED_IMAGE);
-    }
-});
-
-test('fake podman and docker construct equivalent runtime creates (engine parity)', async () => {
-    const runArgs = {};
-    for (const engine of ['podman', 'docker']) {
-        const harness = createSupervisorHarness({
-            engine,
-            container: null,
-            images: contractV1Images(),
-        });
-        assert.equal(await harness.supervisor.run(['list', 'agents']), 0);
-        runArgs[engine] = harness.calls.find(call => call.args[0] === 'run').args;
-    }
-    const canonical = args => args.map(value =>
-        value.replace(':/opt/ploinky/node_modules:U', ':/opt/ploinky/node_modules')
-    );
-    assert.deepEqual(canonical(runArgs.podman), canonical(runArgs.docker));
-    assert.ok(runArgs.podman.includes(
-        'ploinky-box-demo-ploinky-deps:/opt/ploinky/node_modules:U',
-    ));
-    assert.ok(runArgs.docker.includes(
-        'ploinky-box-demo-ploinky-deps:/opt/ploinky/node_modules',
-    ));
-});
-
-test('inspect model performs a local existing-image contract lookup', async () => {
-    const harness = createSupervisorHarness({
-        engine: 'podman',
-        container: compatibleRunningContainer(),
-        images: contractV1Images(),
-    });
-    assert.equal(await harness.supervisor.run(['list', 'agents']), 0);
-    assert.ok(harness.calls.some(call =>
-        call.kind === 'query'
-        && call.args[0] === 'image'
-        && call.args[1] === 'inspect'
-        && call.args[2] === 'sha256:runtime-v1'
-    ));
-    assert.ok(!harness.calls.some(call =>
-        call.kind === 'run' && call.args[0] === 'pull'
-    ));
-});
-
-test('review regression: engine failures preserve status, signal, and spawn details through the boundary', async () => {
-    const directCases = [
-        {
-            result: { status: 7, signal: null },
-            exitCode: 7,
-            message: /exited 7/,
-        },
-        {
-            result: { status: null, signal: 'SIGTERM' },
-            exitCode: 143,
-            message: /SIGTERM/,
-        },
-        {
-            result: {
-                status: null,
-                signal: null,
-                error: new Error('spawn podman ENOENT'),
-            },
-            exitCode: 1,
-            message: /spawn podman ENOENT/,
-        },
-    ];
-    for (const expected of directCases) {
-        const client = createEngineClient({
-            name: 'podman',
-            spawnSyncImpl: () => expected.result,
-        });
-        assert.throws(
-            () => client.run(['exec', 'demo']),
-            error => error.exitCode === expected.exitCode
-                && expected.message.test(error.message),
-        );
-    }
-
-    const boundarySpawn = finalResult => (_name, args, options) => {
-        if (options.encoding === 'utf8') {
-            if (args[0] === 'machine') {
-                return { status: 0, stdout: 'running\n', stderr: '' };
-            }
-            if (args[0] === 'container' && args.includes('--format')) {
-                return { status: 0, stdout: 'running\n', stderr: '' };
-            }
-            if (args[0] === 'container') {
-                return {
-                    status: 0,
-                    stdout: JSON.stringify(dockerInspect),
-                    stderr: '',
-                };
-            }
-            if (args[0] === 'image') {
-                return {
-                    status: 0,
-                    stdout: JSON.stringify([contractV1Image()]),
-                    stderr: '',
-                };
-            }
-            if (args[0] === 'exec') {
-                return { status: 0, stdout: '', stderr: '' };
-            }
-            return { status: 1, stdout: '', stderr: 'unsupported query' };
-        }
-        return finalResult;
-    };
-    for (const expected of directCases) {
-        const stderr = captureWritable();
-        const raw = createRuntimeSupervisor({
-            ...minimalSupervisorDependencies(),
-            detectEngine: () => 'podman',
-            spawnSyncImpl: boundarySpawn(expected.result),
-            waitHealthy: async () => {},
-        });
-        assert.equal(
-            await runSupervisorWithBoundary(
-                raw,
-                ['list', 'agents'],
-                stderr.stream,
-            ),
-            expected.exitCode,
-        );
-    }
-});
-
-test('review regression: empty or unidentified container inspect fails before mutation', async () => {
-    for (const raw of [[], null, {}, [null], [{}], { State: {} }]) {
-        assert.throws(
-            () => normalizeContainerInspect('podman', raw),
-            /invalid container inspect: missing identifying record/,
-        );
-    }
-    assert.doesNotThrow(() => normalizeContainerInspect('docker', dockerInspect));
-    assert.doesNotThrow(() => normalizeContainerInspect('podman', podmanInspect));
-
-    const harness = createSupervisorHarness({
-        engine: 'podman',
-        container: {
-            inspect: {
-                State: { Status: 'running' },
-                Config: {},
-                HostConfig: {},
-                Mounts: [],
-            },
-        },
-    });
-    assert.equal(await harness.supervisor.run(['list', 'agents']), 1);
-    assert.match(
-        harness.stderr,
-        /invalid container inspect: missing identifying record/,
-    );
-    assert.deepEqual(
-        harness.calls.filter(call => call.kind === 'run'),
-        [],
-    );
-});
-
-test('review regression: structurally malformed container inspect fails before mutation', async () => {
-    const malformed = [
-        { Id: 'x' },
-        { Id: 'x', State: { Status: 'exited' } },
-        {
-            Id: 42,
-            Config: {},
-            State: { Status: 'exited' },
-            HostConfig: {},
-            Mounts: [],
-        },
-        {
-            Id: 'x',
-            Config: [],
-            State: { Status: 'exited' },
-            HostConfig: {},
-            Mounts: [],
-        },
-        {
-            Id: 'x',
-            Config: {},
-            State: { Running: true },
-            HostConfig: {},
-            Mounts: [],
-        },
-        {
-            Id: 'x',
-            Config: {},
-            State: { Status: 1 },
-            HostConfig: {},
-            Mounts: [],
-        },
-        {
-            Id: 'x',
-            Config: {},
-            State: { Status: 'exited' },
-            HostConfig: [],
-            Mounts: [],
-        },
-        {
-            Id: 'x',
-            Config: {},
-            State: { Status: 'exited' },
-            HostConfig: {},
-            Mounts: {},
-        },
-    ];
-
-    for (const inspect of malformed) {
-        assert.throws(
-            () => normalizeContainerInspect('podman', inspect),
-            /invalid container inspect/,
-        );
-        const harness = createSupervisorHarness({
-            engine: 'podman',
-            container: { inspect },
-        });
-        assert.equal(await harness.supervisor.run(['list', 'agents']), 1);
-        assert.match(harness.stderr, /invalid container inspect/);
-        assert.deepEqual(
-            harness.calls.filter(call => call.kind === 'run'),
-            [],
-        );
-    }
-});
-
-test('review regression: merged publishes reject only conflicting host sockets', () => {
-    const claim = (
-        hostIp,
-        hostPort,
-        containerPort,
-        protocol = 'tcp',
-    ) => ({ hostIp, hostPort, containerPort, protocol });
-
-    assert.throws(
-        () => mergeAndValidatePublishes([
-            claim('0.0.0.0', '8080-8082', '9000-9002'),
-            claim('127.0.0.1', '8081', '9100'),
-        ]),
-        /overlapping runtime publish host socket 8081\/tcp: wildcard bind .* conflicts with specific bind /,
-    );
-    assert.throws(
-        () => mergeAndValidatePublishes(
-            [claim('', '8080', '9000')],
-            [claim('127.0.0.1', '8080', '9100')],
-        ),
-        /overlapping runtime publish host socket 8080\/tcp: wildcard bind .* conflicts with specific bind /,
-    );
-
-    assert.equal(
-        mergeAndValidatePublishes(
-            [claim('0.0.0.0', '8080', '9000', 'tcp')],
-            [claim('127.0.0.1', '8080', '9100', 'udp')],
-        ).length,
-        2,
-    );
-    assert.equal(
-        mergeAndValidatePublishes([
-            claim('127.0.0.1', '8080', '9000'),
-            claim('127.0.0.2', '8080', '9100'),
-        ]).length,
-        2,
-    );
-    assert.deepEqual(
-        mergeAndValidatePublishes(
-            [claim('0.0.0.0', '8080', '9000')],
-            [claim('127.0.0.1', '8080', '9000')],
-        ),
-        [claim('0.0.0.0', '8080', '9000')],
-    );
-});
-
-test('review regression: ephemeral host port zero publishes do not collide', () => {
-    const publishes = [
-        {
-            hostIp: '127.0.0.1',
-            hostPort: '0',
-            containerPort: '9000',
-            protocol: 'tcp',
-        },
-        {
-            hostIp: '',
-            hostPort: '0',
-            containerPort: '9100',
-            protocol: 'tcp',
-        },
-    ];
-
-    assert.deepEqual(
-        mergeAndValidatePublishes(publishes),
-        publishes,
-    );
-});
-
-test('review regression: router publish rejects a merged fixed-socket conflict before mutation', async () => {
-    const invocation = {
-        name: 'demo',
-        image: REQUIRED_IMAGE,
+        ...identityFor(cwd),
+        image: REQUIRED_RUNTIME_IMAGE,
         port: '8080',
-        listenLan: false,
-        publish: ['127.0.0.1:8080:9000/tcp'],
-        explicit: new Set(['--publish']),
-        sourceDirResolved: '/src/ploinky',
+        publish: [],
+        explicit: new Set(),
+        sourceDirResolved: '/source/ploinky',
         mountDirResolved: '',
+        listenLan: false,
     };
-    assert.throws(
-        () => mergeDesiredRuntimeConfig(invocation, null),
-        /overlapping runtime publish host socket 8080\/tcp/,
-    );
+}
 
-    const duplicate = mergeDesiredRuntimeConfig({
-        ...invocation,
-        publish: ['127.0.0.1:8080:8080/tcp'],
-    }, null);
-    assert.deepEqual(duplicate.extraPublishes, []);
-
-    const harness = createSupervisorHarness({
-        engine: 'podman',
-        container: null,
-        images: contractV1Images(),
-    });
-    assert.equal(await harness.supervisor.run([
-        '--publish', '127.0.0.1:8080:9000/tcp',
-        'list', 'agents',
-    ]), 1);
-    assert.match(
-        harness.stderr,
-        /overlapping runtime publish host socket 8080\/tcp/,
-    );
-    assert.deepEqual(
-        harness.calls.filter(call => call.kind === 'run'),
-        [],
-    );
-});
-
-test('review regression: fake engine models replacement rollback and health phases', async () => {
-    const replacementArgs = [
-        'run', '-d', '--name', 'ploinky-box-demo', REQUIRED_IMAGE,
-    ];
-    const afterHealthFailure = createFakeEngine({
-        engine: 'podman',
-        container: compatibleRunningContainer(),
-        images: contractV1Images(),
-        failures: { 'run rollback': 9 },
-    });
-    afterHealthFailure.engineClient.query([
-        'container', 'inspect', 'ploinky-box-demo',
-    ]);
-    afterHealthFailure.engineClient.run(['rm', 'ploinky-box-demo']);
-    afterHealthFailure.engineClient.run(replacementArgs);
-    afterHealthFailure.engineClient.run(['rm', 'ploinky-box-demo']);
-    assert.throws(
-        () => afterHealthFailure.engineClient.run(replacementArgs),
-        /run rollback exited 9/,
-    );
-
-    const afterCreationFailure = createFakeEngine({
-        engine: 'podman',
-        container: compatibleRunningContainer(),
-        images: contractV1Images(),
-        failures: { 'run replacement': 8, 'run rollback': 9 },
-        replacementFailureCreatesContainer: true,
-    });
-    afterCreationFailure.engineClient.query([
-        'container', 'inspect', 'ploinky-box-demo',
-    ]);
-    afterCreationFailure.engineClient.run(['rm', 'ploinky-box-demo']);
-    assert.throws(
-        () => afterCreationFailure.engineClient.run(replacementArgs),
-        /run replacement exited 8/,
-    );
-    assert.throws(
-        () => afterCreationFailure.engineClient.run(replacementArgs),
-        /run rollback failed: container name already in use/,
-    );
-    afterCreationFailure.engineClient.run([
-        'rm', '-f', 'ploinky-box-demo',
-    ]);
-    assert.throws(
-        () => afterCreationFailure.engineClient.run(replacementArgs),
-        /run rollback exited 9/,
-    );
-
-    const harness = createSupervisorHarness({
-        engine: 'podman',
-        container: null,
-        images: contractV1Images(),
-    });
-    assert.equal(await harness.supervisor.run(['list', 'agents']), 0);
-    assert.ok(harness.calls.some(call =>
-        call.kind === 'health' && call.phase === 'create'
-    ));
-});
+function writableBuffer() {
+    let value = '';
+    return {
+        stream: { isTTY: false, write(chunk) { value += String(chunk); return true; } },
+        text: () => value,
+    };
+}
 
 function makeFakeNodeCapture() {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-node-'));
-    const capture = path.join(dir, 'capture.json');
-    const node = path.join(dir, 'node');
-    const realNode = process.execPath;
-    fs.writeFileSync(node, `#!/usr/bin/env bash
-printf '{"argv":[' > ${JSON.stringify(capture)}
-first=1
-for arg in "$@"; do
-  if [ "$first" -eq 0 ]; then printf ',' >> ${JSON.stringify(capture)}; fi
-  first=0
-  ${JSON.stringify(realNode)} -e 'process.stdout.write(JSON.stringify(process.argv[1]))' -- "$arg" >> ${JSON.stringify(capture)}
-done
-printf '],"PLOINKY_PUBLIC_ENTRYPOINT":' >> ${JSON.stringify(capture)}
-${JSON.stringify(realNode)} -e 'process.stdout.write(JSON.stringify(process.env.PLOINKY_PUBLIC_ENTRYPOINT || ""))' >> ${JSON.stringify(capture)}
-printf '}' >> ${JSON.stringify(capture)}
-exit 0
-`);
-    fs.chmodSync(node, 0o755);
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-node-capture-'));
+    const capture = path.join(dir, 'argv.txt');
+    const executable = path.join(dir, 'node');
+    fs.writeFileSync(executable, `#!/bin/sh\nprintf '%s\\n' "$@" > "$CAPTURE_FILE"\n`);
+    fs.chmodSync(executable, 0o755);
     return { dir, capture };
 }
 
-function addReadlinkWithoutDashF(dir) {
-    const readlink = path.join(dir, 'readlink');
-    fs.writeFileSync(readlink, `#!/usr/bin/env bash
-if [ "\${1-}" = "-f" ]; then
-  exit 1
-fi
-/usr/bin/readlink "$@"
-`);
-    fs.chmodSync(readlink, 0o755);
+function capturedArgv(capture) {
+    return fs.readFileSync(capture, 'utf8').trimEnd().split('\n');
 }
 
-function readCapture(capture) {
-    return JSON.parse(fs.readFileSync(capture, 'utf8'));
-}
-
-function captureWritable() {
-    let captured = '';
-    return {
-        stream: {
-            write(chunk) {
-                captured += String(chunk);
-                return true;
-            },
-        },
-        text() {
-            return captured;
-        },
-    };
-}
-
-function minimalSupervisorDependencies() {
-    return {
-        stdout: { write() { return true; }, isTTY: false },
-        stdin: { isTTY: false },
-        cwd: '/workspace/test-runtime',
-        env: {},
-        sleep: async () => {},
-        askLine: async () => null,
-    };
-}
-
-function publicRun(engine, ...args) {
-    const r = spawnSync(MJS, args, {
-        encoding: 'utf8',
-        env: { ...process.env, PLOINKY_BOX_ENGINE: engine },
-    });
-    return { out: `${r.stdout ?? ''}${r.stderr ?? ''}`, status: r.status };
-}
-
-function publicRunWithEnv(extraEnv, engine, ...args) {
-    const r = spawnSync(MJS, args, {
-        encoding: 'utf8',
-        env: {
-            ...process.env,
-            ...extraEnv,
-            PLOINKY_BOX_ENGINE: engine,
-        },
-    });
-    return { out: `${r.stdout ?? ''}${r.stderr ?? ''}`, status: r.status };
-}
-
-function publicRunIn(cwd, engine, ...args) {
-    const r = spawnSync(MJS, args, {
-        cwd,
-        encoding: 'utf8',
-        env: { ...process.env, PLOINKY_BOX_ENGINE: engine },
-    });
-    return { out: `${r.stdout ?? ''}${r.stderr ?? ''}`, status: r.status };
-}
-
-function publicRunInWithEnv(cwd, extraEnv, engine, ...args) {
-    const r = spawnSync(MJS, args, {
-        cwd,
-        encoding: 'utf8',
-        env: {
-            ...process.env,
-            ...extraEnv,
-            PLOINKY_BOX_ENGINE: engine,
-        },
-    });
-    return { out: `${r.stdout ?? ''}${r.stderr ?? ''}`, status: r.status };
-}
-
-function makeMissingStatusEngine() {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-status-engine-'));
-    const calls = path.join(dir, 'calls.log');
-    const engine = path.join(dir, 'podman');
-    fs.writeFileSync(engine, `#!/usr/bin/env bash
-printf '%s\\n' "$*" >> ${JSON.stringify(calls)}
-exit 1
-`);
-    fs.chmodSync(engine, 0o755);
-    return { dir, calls };
-}
-
-// Fixed-basename child inside a random temp parent: deterministic inference,
-// no collision with real containers. Callers clean up the returned parent.
-function makeCwd(basename) {
-    const parent = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-box-cwd-'));
-    const dir = path.join(parent, basename);
-    fs.mkdirSync(dir);
-    return { parent, dir };
-}
-
-function checkIncludes(out, needle, description) {
-    assert.ok(out.includes(needle), `${description}\n  wanted: ${needle}\n  in: ${out}`);
-}
-
-function checkAbsent(out, needle, description) {
-    assert.ok(!out.includes(needle), `${description} (found forbidden '${needle}')\n  in: ${out}`);
-}
-
-function countOccurrences(out, needle) {
-    return out.split(needle).length - 1;
-}
-
-function countContiguousSubsequences(values, expected) {
-    return values.reduce((count, _value, index) => (
-        expected.every((value, offset) => values[index + offset] === value)
-            ? count + 1
-            : count
-    ), 0);
-}
-
-function dryRunPublishTokens(out, engine = 'podman') {
-    const prefix = `DRY-RUN: ${engine} run `;
-    const line = out.split('\n').find(candidate => candidate.startsWith(prefix));
-    assert.ok(line, `missing ${engine} dry-run create command in: ${out}`);
-    const args = line.slice(`DRY-RUN: ${engine} `.length).trim().split(/\s+/);
-    return args.flatMap((token, index) =>
-        token === '-p' ? [args[index + 1]] : []
-    );
-}
-
-function makeFakePloinkyGraphSource({
-    webPublishingOpenPorts = ['127.0.0.1:8081:8081'],
-    webPublishingProfiles = null,
-} = {}) {
-    const workspaceRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-graph-source-'));
-    const sourceDir = path.join(workspaceRoot, 'ploinky');
-    fs.mkdirSync(path.join(sourceDir, 'bin'), { recursive: true });
-    fs.mkdirSync(path.join(sourceDir, 'cli'), { recursive: true });
-    fs.mkdirSync(path.join(sourceDir, 'container'), { recursive: true });
-    fs.mkdirSync(path.join(sourceDir, 'globalDeps'), { recursive: true });
-    fs.writeFileSync(path.join(sourceDir, 'bin', 'ploinky'), '#!/usr/bin/env bash\n');
-    fs.writeFileSync(path.join(sourceDir, 'cli', 'index.js'), '');
-    fs.writeFileSync(path.join(sourceDir, 'globalDeps', 'package.json'), '{"name":"globalDeps"}\n');
-
-    function writeManifest(repoDir, agentName, manifest) {
-        const agentDir = path.join(workspaceRoot, repoDir, agentName);
-        fs.mkdirSync(agentDir, { recursive: true });
-        fs.writeFileSync(path.join(agentDir, 'manifest.json'), JSON.stringify(manifest, null, 2));
-    }
-
-    writeManifest('AssistOSExplorer', 'explorer', {
-        enable: [
-            'basic/webtty global',
-            'webmeetInfra/liveKitServerAgent no-wait',
-            'onlyOffice global no-wait',
-        ],
-        profiles: {
-            default: {
-                enable: [
-                    {
-                        agent: 'basic/web-publishing global',
-                    },
-                ],
-            },
-        },
-    });
-    writeManifest('basic', 'web-publishing', {
-        profiles: webPublishingProfiles || {
-            default: {
-                openPorts: webPublishingOpenPorts,
-            },
-        },
-    });
-    writeManifest('basic', 'webtty', {
-        profiles: {
-            default: {
-                env: {
-                    PORT: { default: '7681' },
-                },
-            },
-        },
-    });
-    writeManifest('AssistOSExplorer', 'onlyOffice', {
-        profiles: {
-            default: {
-                env: [
-                    { name: 'ONLYOFFICE_JWT_SECRET', required: true },
-                ],
-            },
-        },
-    });
-    writeManifest('webmeetInfra', 'liveKitServerAgent', {
-        profiles: {
-            default: {
-                openPorts: [
-                    '127.0.0.1:7881:7881',
-                    '127.0.0.1:3478:3478/tcp',
-                    '127.0.0.1:3478:3478/udp',
-                    '127.0.0.1:7882-7892:7882-7892/udp',
-                    '127.0.0.1:20000-20010:20000-20010/udp',
-                ],
-            },
-        },
-    });
-
-    return {
-        sourceDir,
-        cleanup() {
-            fs.rmSync(workspaceRoot, { recursive: true, force: true });
-        },
-    };
-}
-
-// Fake checkout + fake npm: asserts the exact install flags and that the
-// script verifies both dependency dirs afterwards.
-function makeFakeCheckout({ npmCreatesDeps, npmBody = '' }) {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-fake-root-'));
-    fs.mkdirSync(path.join(root, 'bin'));
-    fs.copyFileSync(INSTALL_DEPS, path.join(root, 'bin', 'ploinky-install-deps'));
-    fs.chmodSync(path.join(root, 'bin', 'ploinky-install-deps'), 0o755);
-    fs.writeFileSync(path.join(root, 'package.json'), '{"name":"fake"}\n');
-    const binDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-fake-npm-'));
-    const argsFile = path.join(binDir, 'npm-args.txt');
-    fs.writeFileSync(path.join(binDir, 'npm'), `#!/usr/bin/env bash
-echo "$@" >> ${JSON.stringify(argsFile)}
-${npmBody || (npmCreatesDeps ? `mkdir -p "$PWD/node_modules/achillesAgentLib" "$PWD/node_modules/mcp-sdk"` : 'true')}
-`);
-    fs.chmodSync(path.join(binDir, 'npm'), 0o755);
-    return { root, binDir, argsFile };
-}
-
-function makeFakePodmanForMissingDeps() {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-fake-podman-'));
-    const calls = path.join(dir, 'calls.log');
-    const state = path.join(dir, 'state');
-    const podman = path.join(dir, 'podman');
-    fs.writeFileSync(podman, `#!/usr/bin/env bash
-printf '%s\\n' "$*" >> ${JSON.stringify(calls)}
-state_file=${JSON.stringify(state)}
-case "$1 $2" in
-  "machine inspect")
-    echo running
-    exit 0
-    ;;
-  "container inspect")
-    if [ -f "$state_file" ]; then
-      if [ "$3" = "--format" ]; then echo running; fi
-      exit 0
-    fi
-    exit 1
-    ;;
-  "image inspect")
-    echo '[{"Id":"sha256:runtime-v1","Config":{"Labels":{"io.assistos.ploinky.runtime-contract":"1"}}}]'
-    exit 0
-    ;;
-  "info --format")
-    echo false
-    exit 0
-    ;;
-  "run -d")
-    echo running > "$state_file"
-    echo fake-container-id
-    exit 0
-    ;;
-  "logs ploinky-box-qa")
-    echo "self-check OK"
-    exit 0
-    ;;
-  "exec ploinky-box-qa")
-    exit 1
-    ;;
-  *)
-    exit 0
-    ;;
-esac
-`);
-    fs.chmodSync(podman, 0o755);
-    return { dir, calls };
-}
-
-test('ploinky-install-deps bash syntax check (bash -n)', () => {
-    const r = spawnSync('bash', ['-n', INSTALL_DEPS], { encoding: 'utf8' });
-    assert.equal(r.status, 0, r.stderr);
+test('contract-2 image normalizes and validates every required metadata field', () => {
+    const normalized = normalizeImageInspect(JSON.stringify([contract2Image()]));
+    assert.equal(normalized.id, 'sha256:runtime-2');
+    assert.equal(normalized.contract, '2');
+    assert.deepEqual(normalized.env, REQUIRED_IMAGE_ENV);
+    assert.equal(validateImageContract(normalized, REQUIRED_RUNTIME_IMAGE), normalized);
 });
 
-test('public bin/ploinky delegates to the runtime supervisor on the host', () => {
-    const fake = makeFakeNodeCapture();
-    try {
-        const env = {
-            ...process.env,
-            PATH: `${fake.dir}:${process.env.PATH || ''}`,
-            PLOINKY_BOX_ENGINE: 'podman',
-        };
-        const r = spawnSync(PLOINKY, ['status', '--dry-run'], { encoding: 'utf8', env });
-        assert.equal(r.status, 0, `${r.stdout}${r.stderr}`);
-        const captured = readCapture(fake.capture);
-        assert.equal(captured.argv[0], MJS);
-        assert.deepEqual(captured.argv.slice(1), ['status', '--dry-run']);
-        assert.equal(captured.PLOINKY_PUBLIC_ENTRYPOINT, '');
-    } finally {
-        fs.rmSync(fake.dir, { recursive: true, force: true });
-    }
-});
-
-test('bin/ploinky resolves its repo root when invoked through a symlink', () => {
-    const fake = makeFakeNodeCapture();
-    const linkDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-link-'));
-    const link = path.join(linkDir, 'ploinky');
-    try {
-        fs.symlinkSync(PLOINKY, link);
-        const env = {
-            ...process.env,
-            PATH: `${fake.dir}:${process.env.PATH || ''}`,
-            PLOINKY_BOX_ENGINE: 'podman',
-        };
-        const r = spawnSync(link, ['status', '--dry-run'], { encoding: 'utf8', env });
-        assert.equal(r.status, 0, `${r.stdout}${r.stderr}`);
-        const captured = readCapture(fake.capture);
-        assert.equal(captured.argv[0], MJS);
-        assert.deepEqual(captured.argv.slice(1), ['status', '--dry-run']);
-    } finally {
-        fs.rmSync(fake.dir, { recursive: true, force: true });
-        fs.rmSync(linkDir, { recursive: true, force: true });
-    }
-});
-
-test('p-cli still delegates through bin/ploinky', () => {
-    const fake = makeFakeNodeCapture();
-    try {
-        addReadlinkWithoutDashF(fake.dir);
-        const env = {
-            ...process.env,
-            PATH: `${fake.dir}:${process.env.PATH || ''}`,
-            PLOINKY_BOX_ENGINE: 'podman',
-        };
-        const r = spawnSync(PCLI, ['status', '--dry-run'], { encoding: 'utf8', env });
-        assert.equal(r.status, 0, `${r.stdout}${r.stderr}`);
-        const captured = readCapture(fake.capture);
-        assert.equal(captured.argv[0], MJS);
-        assert.deepEqual(captured.argv.slice(1), ['status', '--dry-run']);
-        assert.equal(captured.PLOINKY_PUBLIC_ENTRYPOINT, '');
-    } finally {
-        fs.rmSync(fake.dir, { recursive: true, force: true });
-    }
-});
-
-test('p-cli resolves its repo root when invoked through a symlink', () => {
-    const fake = makeFakeNodeCapture();
-    const linkDir = fs.mkdtempSync(path.join(os.tmpdir(), 'p-cli-link-'));
-    const link = path.join(linkDir, 'p-cli');
-    try {
-        addReadlinkWithoutDashF(fake.dir);
-        fs.symlinkSync(PCLI, link);
-        const env = {
-            ...process.env,
-            PATH: `${fake.dir}:${process.env.PATH || ''}`,
-            PLOINKY_BOX_ENGINE: 'podman',
-        };
-        const r = spawnSync(link, ['status'], { encoding: 'utf8', env });
-        assert.equal(r.status, 0, `${r.stdout}${r.stderr}`);
-        const captured = readCapture(fake.capture);
-        assert.equal(captured.argv[0], MJS);
-        assert.deepEqual(captured.argv.slice(1), ['status']);
-        assert.equal(captured.PLOINKY_PUBLIC_ENTRYPOINT, '');
-    } finally {
-        fs.rmSync(fake.dir, { recursive: true, force: true });
-        fs.rmSync(linkDir, { recursive: true, force: true });
-    }
-});
-
-test('psh delegates to ploinky sh through a symlink', () => {
-    const fake = makeFakeNodeCapture();
-    const linkDir = fs.mkdtempSync(path.join(os.tmpdir(), 'psh-link-'));
-    const link = path.join(linkDir, 'psh');
-    try {
-        addReadlinkWithoutDashF(fake.dir);
-        fs.symlinkSync(PSH, link);
-        const env = {
-            ...process.env,
-            PATH: `${fake.dir}:${process.env.PATH || ''}`,
-            PLOINKY_BOX_ENGINE: 'podman',
-        };
-        const r = spawnSync(link, ['--dry-run'], { encoding: 'utf8', env });
-        assert.equal(r.status, 0, `${r.stdout}${r.stderr}`);
-        const captured = readCapture(fake.capture);
-        assert.equal(captured.argv[0], MJS);
-        assert.deepEqual(captured.argv.slice(1), ['sh', '--dry-run']);
-        assert.equal(captured.PLOINKY_PUBLIC_ENTRYPOINT, '');
-    } finally {
-        fs.rmSync(fake.dir, { recursive: true, force: true });
-        fs.rmSync(linkDir, { recursive: true, force: true });
-    }
-});
-
-test('ploinky-install-deps installs with read-only-safe npm flags and verifies deps', () => {
-    const { root, binDir, argsFile } = makeFakeCheckout({ npmCreatesDeps: true });
-    try {
-        const env = { ...process.env, PATH: `${binDir}:${process.env.PATH || ''}` };
-        const r = spawnSync(path.join(root, 'bin', 'ploinky-install-deps'), [], { encoding: 'utf8', env });
-        assert.equal(r.status, 0, `${r.stdout}${r.stderr}`);
-        const npmArgs = fs.readFileSync(argsFile, 'utf8');
-        assert.ok(npmArgs.includes('install --no-package-lock --no-audit --no-fund'), npmArgs);
-        assert.ok(fs.statSync(path.join(root, 'node_modules', 'achillesAgentLib')).isDirectory());
-        assert.ok(fs.statSync(path.join(root, 'node_modules', 'mcp-sdk')).isDirectory());
-        // second run: already installed, npm must not run again
-        const r2 = spawnSync(path.join(root, 'bin', 'ploinky-install-deps'), [], { encoding: 'utf8', env });
-        assert.equal(r2.status, 0, `${r2.stdout}${r2.stderr}`);
-        assert.ok(r2.stdout.includes('already present'), r2.stdout);
-        assert.equal(fs.readFileSync(argsFile, 'utf8'), npmArgs, 'npm not re-invoked when deps exist');
-    } finally {
-        fs.rmSync(root, { recursive: true, force: true });
-        fs.rmSync(binDir, { recursive: true, force: true });
-    }
-});
-
-test('ploinky-install-deps fails loudly when npm leaves deps missing', () => {
-    const { root, binDir } = makeFakeCheckout({ npmCreatesDeps: false });
-    try {
-        const env = { ...process.env, PATH: `${binDir}:${process.env.PATH || ''}` };
-        const r = spawnSync(path.join(root, 'bin', 'ploinky-install-deps'), [], { encoding: 'utf8', env });
-        assert.equal(r.status, 1, `${r.stdout}${r.stderr}`);
-        assert.ok(`${r.stdout}${r.stderr}`.includes('still missing after npm install'), `${r.stdout}${r.stderr}`);
-    } finally {
-        fs.rmSync(root, { recursive: true, force: true });
-        fs.rmSync(binDir, { recursive: true, force: true });
-    }
-});
-
-test('ploinky-install-deps preserves an existing AchillesAgentLib checkout while installing missing mcp-sdk', () => {
-    const { root, binDir, argsFile } = makeFakeCheckout({
-        npmCreatesDeps: false,
-        npmBody: 'mkdir -p "$PWD/node_modules/mcp-sdk"',
-    });
-    try {
-        const localChange = path.join(root, 'node_modules', 'achillesAgentLib', 'local-change.txt');
-        fs.mkdirSync(path.dirname(localChange), { recursive: true });
-        fs.writeFileSync(localChange, 'do not delete\n');
-        const env = { ...process.env, PATH: `${binDir}:${process.env.PATH || ''}` };
-        const r = spawnSync(path.join(root, 'bin', 'ploinky-install-deps'), [], { encoding: 'utf8', env });
-        assert.equal(r.status, 0, `${r.stdout}${r.stderr}`);
-        assert.equal(fs.readFileSync(localChange, 'utf8'), 'do not delete\n');
-        const npmArgs = fs.readFileSync(argsFile, 'utf8');
-        assert.ok(npmArgs.includes('install --ignore-scripts --no-package-lock --no-audit --no-fund'), npmArgs);
-    } finally {
-        fs.rmSync(root, { recursive: true, force: true });
-        fs.rmSync(binDir, { recursive: true, force: true });
-    }
-});
-
-test('ploinky-install-deps resets a partial achillesAgentLib before installing when reset is explicitly allowed', () => {
-    const { root, binDir } = makeFakeCheckout({ npmCreatesDeps: true });
-    try {
-        // partial state: achillesAgentLib exists (would break postinstall's git clone), mcp-sdk missing
-        fs.mkdirSync(path.join(root, 'node_modules', 'achillesAgentLib', '.git'), { recursive: true });
-        const env = { ...process.env, PATH: `${binDir}:${process.env.PATH || ''}`, PLOINKY_INSTALL_DEPS_ALLOW_RESET: '1' };
-        const r = spawnSync(path.join(root, 'bin', 'ploinky-install-deps'), [], { encoding: 'utf8', env });
-        assert.equal(r.status, 0, `${r.stdout}${r.stderr}`);
-        assert.ok(!fs.existsSync(path.join(root, 'node_modules', 'achillesAgentLib', '.git')), 'partial dir was reset');
-    } finally {
-        fs.rmSync(root, { recursive: true, force: true });
-        fs.rmSync(binDir, { recursive: true, force: true });
-    }
-});
-
-// --- Added with the Node implementation: syntax + import-level unit tests ---
-import {
-    parseHostInvocation,
-    instanceName,
-    volumeNames,
-    publicUsageText,
-    routeHostInvocation,
-    createRuntimeSupervisor,
-    runSupervisorWithBoundary,
-    sanitizeBoxSuffix,
-    resolveInstanceIdentity,
-    resolveHostPloinkySource,
-    shouldInstallDeps,
-    inferPublicStartBranchArgs,
-} from './runtime-supervisor.mjs';
-
-function buildArgsForInvocation(cfg, options = {}) {
-    cfg.name ||= 'demo';
-    cfg.sourceDirResolved ||= REPO_ROOT;
-    const config = createDefaultRuntimeConfig(cfg);
-    return buildRuntimeRunArgs(config, {
-        engine: cfg.engine || 'podman',
-        ...options,
-    });
-}
-
-test('host routing has no box lifecycle namespace', () => {
-    assert.deepEqual(routeHostInvocation(parseHostInvocation([])), { kind: 'repl' });
-    assert.deepEqual(routeHostInvocation(parseHostInvocation(['cli'])), {
-        kind: 'ordinary',
-        forwardedArgs: ['cli'],
-        interactive: true,
-    });
-    assert.deepEqual(routeHostInvocation(parseHostInvocation(['status'])), { kind: 'status' });
-    assert.deepEqual(routeHostInvocation(parseHostInvocation(['stop'])), { kind: 'stop' });
-    assert.deepEqual(routeHostInvocation(parseHostInvocation(['destroy'])), { kind: 'destroy' });
-    assert.deepEqual(routeHostInvocation(parseHostInvocation(['start', 'explorer'])), {
-        kind: 'start',
-        forwardedArgs: ['start', 'explorer'],
-    });
-    assert.deepEqual(routeHostInvocation(parseHostInvocation(['box', 'status'])), {
-        kind: 'ordinary',
-        forwardedArgs: ['box', 'status'],
-        interactive: false,
-    });
-});
-
-for (const engine of ['podman', 'docker']) {
-    test(engine + ' status is read-only in every state', async () => {
-        for (const scenario of statusScenarios()) {
-            const harness = createSupervisorHarness({
-                engine,
-                ...scenario.input,
-            });
-            const code = await harness.supervisor.run(['status']);
-            assert.equal(code, scenario.code, scenario.name);
-            const forbidden = new Set([
-                'pull',
-                'run',
-                'start',
-                'stop',
-                'rm',
-                'volume',
-            ]);
-            assert.equal(
-                harness.calls.some(call => forbidden.has(call.args[0])),
-                false,
-                scenario.name,
-            );
-            const coreExecs = harness.calls.filter(call =>
-                call.args[0] === 'exec'
-                && call.args.slice(-2).join(' ') === 'ploinky status'
-            );
-            assert.equal(coreExecs.length, scenario.core ? 1 : 0, scenario.name);
-        }
-    });
-}
-
-test('dry-run status still inspects and reports an existing runtime read-only', async () => {
-    const harness = createSupervisorHarness({
-        container: compatibleRunningContainer(),
-        images: contractV1Images(),
-    });
-    assert.equal(await harness.supervisor.run(['--dry-run', 'status']), 0);
-    assert.match(harness.stdout, /runtime: ploinky-box-demo \(running\)/);
-    assert.equal(harness.calls.some(call =>
-        call.kind === 'query'
-        && call.args.join(' ') === 'container inspect ploinky-box-demo'
-    ), true);
-    const forbidden = new Set(['pull', 'run', 'start', 'stop', 'rm', 'volume']);
-    assert.equal(
-        harness.calls.some(call => forbidden.has(call.args[0])),
-        false,
-    );
-});
-
-test('dry-run status creates a live read-only engine client for core status', async () => {
-    const stdout = captureWritable();
-    const stderr = captureWritable();
-    const fake = createFakeEngine({
-        container: compatibleRunningContainer(),
-        images: contractV1Images(),
-        stdout: stdout.stream,
-        stderr: stderr.stream,
-    });
-    let clientDryRun;
-    const raw = createRuntimeSupervisor({
-        ...minimalSupervisorDependencies(),
-        stdout: stdout.stream,
-        stderr: stderr.stream,
-        cwd: '/workspace/demo',
-        detectEngine: () => 'podman',
-        createEngineClient(options) {
-            clientDryRun = options.dryRun;
-            return fake.engineClient;
-        },
-    });
-
-    assert.equal(
-        await runSupervisorWithBoundary(
-            raw,
-            ['--dry-run', 'status'],
-            stderr.stream,
-        ),
-        0,
-    );
-    assert.equal(clientDryRun, false);
-    assert.equal(fake.calls.filter(call =>
-        call.args[0] === 'exec'
-        && call.args.slice(-2).join(' ') === 'ploinky status'
-    ).length, 1);
-});
-
-test('dry-run status preserves injected detector mutations and caller dry-run state', async () => {
-    const stdout = captureWritable();
-    const stderr = captureWritable();
-    const fake = createFakeEngine({
-        container: compatibleRunningContainer(),
-        images: contractV1Images(),
-        stdout: stdout.stream,
-        stderr: stderr.stream,
-    });
-    let detectedInvocation;
-    let detectedDryRun;
-    let clientName;
-    let clientDryRun;
-    const raw = createRuntimeSupervisor({
-        ...minimalSupervisorDependencies(),
-        stdout: stdout.stream,
-        stderr: stderr.stream,
-        cwd: '/workspace/demo',
-        detectEngine(invocation) {
-            detectedInvocation = invocation;
-            detectedDryRun = invocation.dryRun;
-            invocation.engine = 'podman';
-            return true;
-        },
-        createEngineClient(options) {
-            clientName = options.name;
-            clientDryRun = options.dryRun;
-            return fake.engineClient;
-        },
-    });
-
-    assert.equal(
-        await runSupervisorWithBoundary(
-            raw,
-            ['--dry-run', 'status'],
-            stderr.stream,
-        ),
-        0,
-    );
-    assert.equal(detectedDryRun, false);
-    assert.equal(clientName, 'podman');
-    assert.equal(clientDryRun, false);
-    assert.equal(detectedInvocation.dryRun, true);
-});
-
-test('route-effective dry-run restoration survives detector failure', async () => {
-    const stderr = captureWritable();
-    let detectedInvocation;
-    const raw = createRuntimeSupervisor({
-        ...minimalSupervisorDependencies(),
-        stderr: stderr.stream,
-        detectEngine(invocation) {
-            detectedInvocation = invocation;
-            invocation.engine = 'podman';
-            throw new Error('detector failed');
-        },
-    });
-
-    assert.equal(
-        await runSupervisorWithBoundary(
-            raw,
-            ['--dry-run', 'status'],
-            stderr.stream,
-        ),
-        1,
-    );
-    assert.match(stderr.text(), /detector failed/);
-    assert.equal(detectedInvocation.engine, 'podman');
-    assert.equal(detectedInvocation.dryRun, true);
-});
-
-test('dry-run status validates a missing explicit engine before inspection', async () => {
-    const stdout = captureWritable();
-    const stderr = captureWritable();
-    const missingEngine = `/definitely/missing/ploinky-engine-${process.pid}`;
-    let clientCreations = 0;
-    const raw = createRuntimeSupervisor({
-        ...minimalSupervisorDependencies(),
-        stdout: stdout.stream,
-        stderr: stderr.stream,
-        cwd: '/workspace/demo',
-        env: { PATH: '' },
-        createEngineClient() {
-            clientCreations += 1;
-            return {
-                name: missingEngine,
-                query() {
-                    return {
-                        ok: false,
-                        status: 1,
-                        stdout: '',
-                        stderr: 'must not inspect',
-                    };
-                },
-                streamContains() {
-                    throw new Error('must not read logs');
-                },
-                run() {
-                    throw new Error('must not run core status');
-                },
-            };
-        },
-    });
-
-    assert.equal(
-        await runSupervisorWithBoundary(
-            raw,
-            ['--dry-run', 'status', '--engine', missingEngine],
-            stderr.stream,
-        ),
-        1,
-    );
-    assert.match(stderr.text(), /requested engine .* not found in PATH/);
-    assert.doesNotMatch(stdout.text(), /runtime: .* \(missing\)/);
-    assert.equal(clientCreations, 0);
-});
-
-test('running status treats malformed image metadata as missing and still invokes core', async () => {
-    const stdout = captureWritable();
-    const stderr = captureWritable();
-    const fake = createFakeEngine({
-        container: compatibleRunningContainer(),
-        images: contractV1Images(),
-        stdout: stdout.stream,
-        stderr: stderr.stream,
-    });
-    const originalQuery = fake.engineClient.query.bind(fake.engineClient);
-    fake.engineClient.query = (args) => {
-        if (args[0] !== 'image') return originalQuery(args);
-        fake.calls.push({ kind: 'query', args: [...args], options: {} });
-        return {
-            ok: true,
-            status: 0,
-            stdout: '{',
-            stderr: '',
-        };
-    };
-    const raw = createRuntimeSupervisor({
-        ...minimalSupervisorDependencies(),
-        stdout: stdout.stream,
-        stderr: stderr.stream,
-        cwd: '/workspace/demo',
-        detectEngine: () => 'podman',
-        engineClient: fake.engineClient,
-    });
-
-    assert.equal(
-        await runSupervisorWithBoundary(raw, ['status'], stderr.stream),
-        1,
-    );
-    assert.match(
-        stdout.text(),
-        /contract: outdated \(expected 1, observed <missing>\)/,
-    );
-    assert.match(stdout.text(), /health: healthy/);
-    assert.match(stdout.text(), /core: running/);
-    assert.equal(fake.calls.filter(call =>
-        call.kind === 'streamContains' && call.args[0] === 'logs'
-    ).length, 1);
-    assert.equal(fake.calls.filter(call =>
-        call.args[0] === 'exec'
-        && call.args.slice(-2).join(' ') === 'ploinky status'
-    ).length, 1);
-    const forbidden = new Set(['pull', 'run', 'start', 'stop', 'rm', 'volume']);
-    assert.equal(
-        fake.calls.some(call => forbidden.has(call.args[0])),
-        false,
-    );
-});
-
-test('compatible status prints runtime contract publishes health and core output', async () => {
-    const harness = createSupervisorHarness({
-        container: compatibleRunningContainer(),
-        images: contractV1Images(),
-    });
-    assert.equal(await harness.supervisor.run(['status']), 0);
-    for (const line of [
-        'runtime: ploinky-box-demo (running)',
-        'image: docker.io/assistos/ploinky-box:podman-node24-runtime-v1',
-        'publish: 127.0.0.1:18080 -> 8080/tcp',
-        'publish: 127.0.0.1:17880 -> 7880/udp',
-        'contract: compatible (expected 1, observed 1)',
-        'health: healthy',
-        'core: running',
-    ]) {
-        assert.match(harness.stdout, new RegExp(escapeRegExp(line)));
-    }
-});
-
-test('stopped status still reports image contract without invoking core', async () => {
-    const harness = createSupervisorHarness({
-        container: compatibleStoppedContainer(),
-        images: contractV1Images(),
-    });
-    assert.equal(await harness.supervisor.run(['status']), 1);
-    assert.match(harness.stdout, /runtime: ploinky-box-demo \(exited\)/);
-    assert.match(
-        harness.stdout,
-        /contract: compatible \(expected 1, observed 1\)/,
-    );
-    assert.equal(harness.calls.some(call => call.args[0] === 'exec'), false);
-});
-
-for (const engine of ['podman', 'docker']) {
-    test(engine + ' stop attempts outer stop after core failure', async () => {
-        const harness = createSupervisorHarness({
-            engine,
-            container: compatibleRunningContainer(),
-            failures: { 'exec ploinky stop': 9 },
-        });
-        assert.equal(await harness.supervisor.run(['stop']), 1);
-        const phases = harness.calls
-            .filter(call => call.kind === 'run')
-            .map(call => call.args[0]);
-        assert.deepEqual(phases, ['exec', 'stop']);
-        assert.match(harness.stderr, /core shutdown: failed \(exit 9\)/);
-        assert.match(harness.stdout, /outer runtime stop: succeeded/);
-        assert.equal(harness.calls.some(call => call.args[0] === 'pull'), false);
-    });
-
-    test(engine + ' destroy requires the exact target confirmation', async () => {
-        const harness = createSupervisorHarness({
-            engine,
-            container: compatibleStoppedContainer(),
-            volumes: [
-                'ploinky-box-demo-workspace',
-                'ploinky-box-demo-containers',
-                'ploinky-box-demo-ploinky-deps',
-            ],
-            answer: 'y',
-        });
-        assert.equal(await harness.supervisor.run(['destroy']), 0);
-        assert.match(harness.prompt, /ploinky-box-demo/);
-        assert.match(harness.prompt, /ploinky-box-demo-workspace/);
-        assert.match(harness.prompt, /ploinky-box-demo-containers/);
-        assert.match(harness.prompt, /ploinky-box-demo-ploinky-deps/);
-        assert.deepEqual(
-            harness.calls.find(call => call.args[0] === 'volume').args,
-            [
-                'volume', 'rm',
-                'ploinky-box-demo-workspace',
-                'ploinky-box-demo-containers',
-                'ploinky-box-demo-ploinky-deps',
-            ],
-        );
-    });
-
-    for (const [name, container] of [
-        ['missing', null],
-        ['already stopped', compatibleStoppedContainer()],
-    ]) {
-        test(engine + ' stop is successful when runtime is ' + name, async () => {
-            const harness = createSupervisorHarness({
-                engine,
-                container,
-                images: container ? contractV1Images() : {},
-            });
-            assert.equal(await harness.supervisor.run(['stop']), 0);
-            assert.equal(
-                harness.calls.some(call =>
-                    ['exec', 'stop', 'pull', 'run'].includes(call.args[0])
-                ),
-                false,
-            );
-        });
-    }
-
-    test(engine + ' destroy is idempotent when container and selected volumes are missing', async () => {
-        const harness = createSupervisorHarness({
-            engine,
-            container: null,
-            volumes: [],
-        });
-        assert.equal(await harness.supervisor.run(['destroy']), 0);
-        assert.equal(harness.prompt, '');
-        assert.equal(
-            harness.calls.some(call => call.kind === 'run'),
-            false,
-        );
-    });
-
-    for (const answer of ['n', '']) {
-        test(engine + ' destroy refusal ' + JSON.stringify(answer) + ' mutates nothing', async () => {
-            const harness = createSupervisorHarness({
-                engine,
-                container: compatibleStoppedContainer(),
-                volumes: ['ploinky-box-demo-workspace'],
-                answer,
-            });
-            assert.equal(await harness.supervisor.run(['destroy']), 1);
-            assert.equal(
-                harness.calls.some(call =>
-                    ['stop', 'rm', 'volume'].includes(call.args[0])
-                ),
-                false,
-            );
-        });
-    }
-
-    test(engine + ' destroy reports removal failure and still attempts selected cleanup', async () => {
-        const harness = createSupervisorHarness({
-            engine,
-            container: compatibleStoppedContainer(),
-            volumes: [
-                'ploinky-box-demo-workspace',
-                'ploinky-box-demo-containers',
-                'ploinky-box-demo-ploinky-deps',
-            ],
-            answer: 'y',
-            failures: { 'rm container': 7 },
-        });
-        assert.equal(await harness.supervisor.run(['destroy']), 1);
-        assert.ok(harness.calls.some(call => call.args[0] === 'volume'));
-    });
-
-    const creationFlagCases = [
-        ['--port', '19090'],
-        ['--publish', '127.0.0.1:9000:9000/tcp'],
-        ['--expose', '127.0.0.1:9000:9000/tcp'],
-        ['--image', 'registry.example/runtime:test'],
-        ['--mount', '/tmp/mounted'],
-        ['--listen-lan'],
-    ];
-    for (const command of ['status', 'stop', 'destroy']) {
-        for (const flagArgs of creationFlagCases) {
-            test(engine + ' ' + command + ' rejects creation flag ' + flagArgs[0], async () => {
-                const harness = createSupervisorHarness({
-                    engine,
-                    container: null,
-                    volumes: [],
-                });
-                assert.equal(
-                    await harness.supervisor.run([...flagArgs, command]),
-                    1,
-                );
-                assert.match(harness.stderr, /only valid for runtime creation/);
-                assert.equal(
-                    harness.calls.some(call => call.kind === 'run'),
-                    false,
-                );
-            });
-        }
-    }
-}
-
-test('state commands accept engine and instance selectors', async () => {
-    const harness = createSupervisorHarness({
-        engine: 'docker',
-        container: null,
-    });
-    assert.equal(
-        await harness.supervisor.run([
-            '--engine', 'docker', '--name', 'alternate', 'stop',
-        ]),
-        0,
-    );
-    assert.doesNotMatch(harness.stderr, /only valid for runtime creation/);
-});
-
-for (const engine of ['podman', 'docker']) {
-    test(engine + ' matching running runtime is reused without pull or recreation', async () => {
-        const harness = createSupervisorHarness({
-            engine,
-            container: compatibleRunningContainer(),
-            images: contractV1Images(),
-        });
-        const code = await harness.supervisor.run(['list', 'agents']);
-        assert.equal(code, 0);
-        assert.equal(harness.calls.some(call => call.args[0] === 'pull'), false);
-        assert.equal(harness.calls.some(call => call.args[0] === 'run'), false);
-        assert.equal(harness.calls.some(call => call.args[0] === 'start'), false);
-        assert.ok(harness.calls.some(call =>
-            call.kind === 'run'
-            && call.args[0] === 'exec'
-            && call.args.includes('PLOINKY_RUNTIME_NAME=ploinky-box-demo')
-            && call.args.slice(-2).join(' ') === 'list agents'
-        ));
-    });
-
-    test(engine + ' bare host repl forwards to p-cli and returns its status', async () => {
-        const stdout = captureWritable();
-        const stderr = captureWritable();
-        const fake = createFakeEngine({
-            engine,
-            container: compatibleRunningContainer(),
-            images: contractV1Images(),
-            stdout: stdout.stream,
-            stderr: stderr.stream,
-        });
-        const originalRun = fake.engineClient.run.bind(fake.engineClient);
-        fake.engineClient.run = (args, options = {}) => {
-            if (args[0] === 'exec' && args.at(-1) === 'p-cli') {
-                fake.calls.push({
-                    kind: 'run',
-                    args: [...args],
-                    options: { ...options },
-                });
-                return 19;
-            }
-            return originalRun(args, options);
-        };
-        const raw = createRuntimeSupervisor({
-            ...minimalSupervisorDependencies(),
-            stdout: Object.assign(stdout.stream, { isTTY: true }),
-            stderr: stderr.stream,
-            stdin: { isTTY: true },
-            cwd: '/workspace/demo',
-            detectEngine: () => engine,
-            engineClient: fake.engineClient,
-        });
-
-        assert.equal(
-            await runSupervisorWithBoundary(raw, [], stderr.stream),
-            19,
-        );
-        const exec = fake.calls.find(call =>
-            call.kind === 'run'
-            && call.args[0] === 'exec'
-            && call.args.at(-1) === 'p-cli'
-        );
-        assert.ok(exec);
-        assert.ok(exec.args.includes('-it'));
-        assert.ok(exec.args.includes('PLOINKY_RUNTIME_NAME=ploinky-box-demo'));
-        assert.equal(exec.options.allowFail, true);
-    });
-
-    test(engine + ' forwarded core nonzero status is returned unchanged', async () => {
-        const stdout = captureWritable();
-        const stderr = captureWritable();
-        const fake = createFakeEngine({
-            engine,
-            container: compatibleRunningContainer(),
-            images: contractV1Images(),
-            stdout: stdout.stream,
-            stderr: stderr.stream,
-        });
-        const originalRun = fake.engineClient.run.bind(fake.engineClient);
-        fake.engineClient.run = (args, options = {}) => {
-            if (
-                args[0] === 'exec'
-                && args.slice(-3).join(' ') === 'ploinky list agents'
-            ) {
-                fake.calls.push({
-                    kind: 'run',
-                    args: [...args],
-                    options: { ...options },
-                });
-                return 17;
-            }
-            return originalRun(args, options);
-        };
-        const raw = createRuntimeSupervisor({
-            ...minimalSupervisorDependencies(),
-            stdout: stdout.stream,
-            stderr: stderr.stream,
-            cwd: '/workspace/demo',
-            detectEngine: () => engine,
-            engineClient: fake.engineClient,
-        });
-
-        assert.equal(
-            await runSupervisorWithBoundary(
-                raw,
-                ['list', 'agents'],
-                stderr.stream,
-            ),
-            17,
-        );
-        const exec = fake.calls.find(call =>
-            call.kind === 'run'
-            && call.args[0] === 'exec'
-            && call.args.slice(-3).join(' ') === 'ploinky list agents'
-        );
-        assert.ok(exec);
-        assert.equal(exec.options.allowFail, true);
-    });
-
-    test(engine + ' stopped compatible runtime starts without pulling', async () => {
-        const harness = createSupervisorHarness({
-            engine,
-            container: compatibleStoppedContainer(),
-            images: contractV1Images(),
-        });
-        assert.equal(await harness.supervisor.run(['list', 'agents']), 0);
-        assert.ok(harness.calls.some(call => call.args[0] === 'start'));
-        assert.equal(harness.calls.some(call => call.args[0] === 'pull'), false);
-    });
-
-    test(engine + ' missing runtime obtains and validates v1 before create', async () => {
-        const harness = createSupervisorHarness({
-            engine,
-            container: null,
-            images: {},
-        });
-        assert.equal(await harness.supervisor.run(['list', 'agents']), 0);
-        assert.deepEqual(
-            harness.calls
-                .filter(call => ['pull', 'image', 'run'].includes(call.args[0]))
-                .map(call => call.args[0]),
-            ['image', 'pull', 'image', 'run'],
-        );
-        const run = harness.calls.find(call => call.args[0] === 'run').args;
-        assert.ok(run.includes(REQUIRED_IMAGE));
-        assert.ok(run.includes('PLOINKY_RUNTIME_NAME=ploinky-box-demo'));
-    });
-
-    test(engine + ' legacy runtime is replaced through the ordinary command path', async () => {
-        const harness = createSupervisorHarness({
-            engine,
-            container: legacyRunningContainerWithCustomConfig(),
-            images: {
-                'sha256:legacy': legacyImage(),
-                [REQUIRED_IMAGE]: contractV1Image(),
-            },
-        });
-        assert.equal(await harness.supervisor.run(['list', 'agents']), 0);
-        assert.deepEqual(
-            harness.calls
-                .filter(call => [
-                    'pull',
-                    'image',
-                    'exec',
-                    'stop',
-                    'rm',
-                    'run',
-                ].includes(call.args[0]))
-                .map(call => call.args[0])
-                .slice(0, 7),
-            ['image', 'pull', 'image', 'exec', 'stop', 'rm', 'run'],
-        );
-    });
-
-    test(engine + ' host bare cli rejects non-tty before runtime mutation', async () => {
-        const harness = createSupervisorHarness({
-            engine,
-            stdin: { isTTY: false },
-            stdoutIsTTY: false,
-            container: null,
-        });
-        assert.equal(await harness.supervisor.run(['cli']), 1);
-        assert.match(harness.stderr, /requires an interactive terminal/);
-        assert.equal(
-            harness.calls.some(call =>
-                ['pull', 'run', 'start'].includes(call.args[0])
-            ),
-            false,
-        );
-    });
-
-    test(engine + ' host agent cli preserves non-tty mode', async () => {
-        const harness = createSupervisorHarness({
-            engine,
-            stdin: { isTTY: false },
-            stdoutIsTTY: false,
-            container: compatibleRunningContainer(),
-            images: contractV1Images(),
-        });
-        assert.equal(await harness.supervisor.run(['cli', 'explorer']), 0);
-        const exec = harness.calls.find(call =>
-            call.kind === 'run'
-            && call.args[0] === 'exec'
-            && call.args.includes('ploinky')
-        ).args;
-        assert.equal(exec.includes('-it'), false);
-        assert.ok(exec.includes('-i'));
-        assert.ok(exec.includes('PLOINKY_NO_TTY=1'));
-        assert.ok(exec.includes('PLOINKY_RUNTIME_NAME=ploinky-box-demo'));
-    });
-
-    test(engine + ' unobtainable replacement image leaves the legacy runtime untouched', async () => {
-        const harness = createSupervisorHarness({
-            engine,
-            container: legacyRunningContainerWithCustomConfig(),
-            images: { 'sha256:legacy': legacyImage() },
-            failures: { pull: 23 },
-        });
-        assert.equal(await harness.supervisor.run(['list', 'agents']), 1);
-        assert.equal(
-            harness.calls.some(call =>
-                ['exec', 'stop', 'rm', 'run'].includes(call.args[0])
-            ),
-            false,
-        );
-        assert.equal(harness.state.container.inspect.State.Status, 'running');
-        assert.match(harness.stderr, /pull.*exited 23/);
-    });
-
-    test(engine + ' failed create self-check removes only the failed container', async () => {
-        const harness = createSupervisorHarness({
-            engine,
-            container: null,
-            images: {},
-            failures: { 'health create': 7 },
-        });
-        assert.equal(await harness.supervisor.run(['list', 'agents']), 1);
-        assert.ok(harness.calls.some(call => call.args[0] === 'rm'));
-        assert.equal(harness.calls.some(call => call.args[0] === 'volume'), false);
-        assert.equal(harness.calls.some(call =>
-            call.kind === 'run'
-            && call.args[0] === 'exec'
-            && call.args.slice(-2).join(' ') === 'list agents'
-        ), false);
-        assert.equal(harness.state.container, null);
-    });
-
-    test(engine + ' explicit compatible custom image is accepted', async () => {
-        const custom = 'registry.example/runtime:custom';
-        const harness = createSupervisorHarness({
-            engine,
-            container: null,
-            images: { [custom]: contractV1Image('sha256:custom') },
-        });
-        assert.equal(
-            await harness.supervisor.run([
-                '--image',
-                custom,
-                'list',
-                'agents',
-            ]),
-            0,
-        );
-        const run = harness.calls.find(call => call.args[0] === 'run').args;
-        assert.equal(run.at(-1), custom);
-    });
-
-    for (const [name, image, observed] of [
-        ['missing label', legacyImage('sha256:no-label'), '<missing>'],
-        [
-            'wrong label',
-            {
-                Id: 'sha256:wrong-label',
-                Config: {
-                    Labels: {
-                        'io.assistos.ploinky.runtime-contract': '2',
-                    },
-                },
-            },
-            '2',
-        ],
-    ]) {
-        test(engine + ' explicit custom image rejects ' + name + ' before runtime mutation', async () => {
-            const custom = 'registry.example/runtime:' + name.replace(' ', '-');
-            const harness = createSupervisorHarness({
-                engine,
-                container: null,
-                images: { [custom]: image },
-            });
-            assert.equal(
-                await harness.supervisor.run([
-                    '--image',
-                    custom,
-                    'list',
-                    'agents',
-                ]),
-                1,
-            );
-            assert.match(harness.stderr, new RegExp(escapeRegExp(custom)));
-            assert.match(
-                harness.stderr,
-                /io\.assistos\.ploinky\.runtime-contract=1/,
-            );
-            assert.match(
-                harness.stderr,
-                new RegExp('observed ' + escapeRegExp(observed)),
-            );
-            assert.equal(
-                harness.calls.some(call =>
-                    ['run', 'start', 'stop', 'rm'].includes(call.args[0])
-                ),
-                false,
-            );
-        });
-    }
-
-    test(engine + ' invalid explicit custom image leaves an existing v1 runtime untouched', async () => {
-        const custom = 'registry.example/runtime:invalid';
-        const harness = createSupervisorHarness({
-            engine,
-            container: compatibleRunningContainer(),
-            images: contractV1Images(),
-            pullImages: {
-                [custom]: legacyImage('sha256:invalid-custom'),
-            },
-        });
-        assert.equal(
-            await harness.supervisor.run([
-                '--image',
-                custom,
-                'list',
-                'agents',
-            ]),
-            1,
-        );
-        assert.match(harness.stderr, /observed <missing>/);
-        assert.equal(
-            harness.calls.some(call =>
-                ['exec', 'stop', 'rm', 'run'].includes(call.args[0])
-            ),
-            false,
-        );
-        assert.equal(harness.state.container.inspect.State.Status, 'running');
-    });
-
-    test(engine + ' omitted incompatible custom image contract is validated without silently replacing its reference', async () => {
-        const custom = 'registry.example/runtime:current';
-        const container = compatibleRunningContainer();
-        container.inspect.Config.Image = custom;
-        container.inspect.Image = 'sha256:custom-old';
-        const harness = createSupervisorHarness({
-            engine,
-            container,
-            images: {
-                'sha256:custom-old': legacyImage('sha256:custom-old'),
-            },
-            pullImages: {
-                [custom]: legacyImage('sha256:custom-new'),
-            },
-        });
-        assert.equal(await harness.supervisor.run(['list', 'agents']), 1);
-        const pull = harness.calls.find(call => call.args[0] === 'pull').args;
-        assert.equal(pull[1], custom);
-        assert.equal(pull.includes(REQUIRED_IMAGE), false);
-        assert.equal(
-            harness.calls.some(call =>
-                ['exec', 'stop', 'rm', 'run'].includes(call.args[0])
-            ),
-            false,
-        );
-    });
-
-    test(engine + ' replacement validates before graceful shutdown and preserves volumes', async () => {
-        const harness = createSupervisorHarness({
-            engine,
-            container: legacyRunningContainerWithCustomConfig(),
-            images: {
-                'sha256:legacy': legacyImage(),
-                [REQUIRED_IMAGE]: contractV1Image(),
-            },
-        });
-        assert.equal(await harness.supervisor.run(['list', 'agents']), 0);
-        const phases = harness.calls
-            .filter(call => [
-                'pull',
-                'image',
-                'exec',
-                'stop',
-                'rm',
-                'run',
-            ].includes(call.args[0]))
-            .map(call => call.args[0]);
-        assert.deepEqual(
-            phases.slice(0, 7),
-            ['image', 'pull', 'image', 'exec', 'stop', 'rm', 'run'],
-        );
-        assert.equal(
-            harness.calls.some(call => call.args[0] === 'volume'),
-            false,
-        );
-
-        const replacementRun = harness.calls
-            .filter(call => call.args[0] === 'run')
-            .at(-1).args;
-        assertLegacyCreationConfig(replacementRun, REQUIRED_IMAGE);
-    });
-
-    test(engine + ' graceful core shutdown failure leaves the old runtime running', async () => {
-        const harness = createSupervisorHarness({
-            engine,
-            container: legacyRunningContainerWithCustomConfig(),
-            images: {
-                'sha256:legacy': legacyImage(),
-                [REQUIRED_IMAGE]: contractV1Image(),
-            },
-            failures: { 'exec ploinky stop': 9 },
-        });
-        assert.equal(await harness.supervisor.run(['list', 'agents']), 1);
-        assert.equal(
-            harness.calls.some(call =>
-                ['stop', 'rm', 'run'].includes(call.args[0])
-            ),
-            false,
-        );
-        assert.equal(
-            harness.state.container.inspect.State.Status,
-            'running',
-        );
-    });
-
-    for (const [name, failures] of [
-        ['replacement run', { 'run replacement': 7 }],
-        ['replacement health', { 'health replacement': 7 }],
-    ]) {
-        test(engine + ' ' + name + ' failure restores the prior image and full config', async () => {
-            const harness = createSupervisorHarness({
-                engine,
-                container: legacyRunningContainerWithCustomConfig(),
-                images: {
-                    'sha256:legacy': legacyImage(),
-                    [REQUIRED_IMAGE]: contractV1Image(),
-                },
-                failures,
-            });
-            assert.equal(await harness.supervisor.run(['list', 'agents']), 1);
-            const runs = harness.calls.filter(call => call.args[0] === 'run');
-            const rollback = runs.at(-1).args;
-            assertLegacyCreationConfig(rollback, 'sha256:legacy');
-            assert.ok(harness.calls.some(call =>
-                call.kind === 'health' && call.phase === 'rollback'
-            ));
-            assert.equal(
-                harness.calls.some(call => call.args[0] === 'volume'),
-                false,
-            );
-        });
-    }
-
-    test(engine + ' replacement run failure before container creation rolls back directly', async () => {
-        const harness = createSupervisorHarness({
-            engine,
-            container: legacyRunningContainerWithCustomConfig(),
-            images: {
-                'sha256:legacy': legacyImage(),
-                [REQUIRED_IMAGE]: contractV1Image(),
-            },
-            failures: { 'run replacement': 7 },
-            replacementFailureCreatesContainer: false,
-        });
-        const volumesBefore = [...harness.state.volumes].sort();
-
-        assert.equal(await harness.supervisor.run(['list', 'agents']), 1);
-        assert.match(
-            harness.stderr,
-            /runtime replacement failed; previous runtime restored: .*exited 7/,
-        );
-        assert.doesNotMatch(harness.stderr, /rollback phase:/);
-        const rollback = harness.calls
-            .filter(call => call.args[0] === 'run')
-            .at(-1).args;
-        assertLegacyCreationConfig(rollback, 'sha256:legacy');
-        assert.ok(harness.calls.some(call =>
-            call.kind === 'health' && call.phase === 'rollback'
-        ));
-        assert.equal(
-            harness.calls.some(call =>
-                call.args[0] === 'rm' && call.args.includes('-f')
-            ),
-            false,
-        );
-        assert.equal(
-            harness.calls.some(call => call.args[0] === 'volume'),
-            false,
-        );
-        assert.deepEqual([...harness.state.volumes].sort(), volumesBefore);
-    });
-
-    for (const [name, rollbackFailure] of [
-        ['rollback run', { 'run rollback': 8 }],
-        ['rollback health', { 'health rollback': 8 }],
-    ]) {
-        test(engine + ' ' + name + ' failure reports both phases without removing volumes', async () => {
-            const harness = createSupervisorHarness({
-                engine,
-                container: legacyRunningContainerWithCustomConfig(),
-                images: {
-                    'sha256:legacy': legacyImage(),
-                    [REQUIRED_IMAGE]: contractV1Image(),
-                },
-                failures: {
-                    'run replacement': 7,
-                    ...rollbackFailure,
-                },
-            });
-            assert.equal(await harness.supervisor.run(['list', 'agents']), 1);
-            assert.match(harness.stderr, /replacement phase: .*exited 7/);
-            assert.match(harness.stderr, /rollback phase: .*exited 8/);
-            assert.equal(
-                harness.calls.some(call => call.args[0] === 'volume'),
-                false,
-            );
-        });
-    }
-
-    test(engine + ' failed replacement cleanup reports both phases without attempting rollback', async () => {
-        const harness = createSupervisorHarness({
-            engine,
-            container: legacyRunningContainerWithCustomConfig(),
-            images: {
-                'sha256:legacy': legacyImage(),
-                [REQUIRED_IMAGE]: contractV1Image(),
-            },
-            failures: {
-                'run replacement': 7,
-                'rm replacement cleanup': 8,
-            },
-            replacementFailureCreatesContainer: true,
-        });
-        const volumesBefore = [...harness.state.volumes].sort();
-
-        assert.equal(await harness.supervisor.run(['list', 'agents']), 1);
-        assert.match(harness.stderr, /replacement phase: .*exited 7/);
-        assert.match(harness.stderr, /rollback phase: .*exited 8/);
-        assert.equal(
-            harness.calls.some(call =>
-                call.args[0] === 'run'
-                && call.args.at(-1) === 'sha256:legacy'
-            ),
-            false,
-        );
-        assert.equal(
-            harness.calls.some(call => call.args[0] === 'volume'),
-            false,
-        );
-        assert.deepEqual([...harness.state.volumes].sort(), volumesBefore);
-    });
-
-    test(engine + ' failed cleanup that leaves no replacement still rolls back', async () => {
-        const harness = createSupervisorHarness({
-            engine,
-            container: legacyRunningContainerWithCustomConfig(),
-            images: {
-                'sha256:legacy': legacyImage(),
-                [REQUIRED_IMAGE]: contractV1Image(),
-            },
-            failures: {
-                'run replacement': 7,
-                'rm replacement cleanup': 8,
-            },
-            replacementFailureCreatesContainer: true,
-            replacementCleanupFailureRemovesContainer: true,
-        });
-        const volumesBefore = [...harness.state.volumes].sort();
-
-        assert.equal(await harness.supervisor.run(['list', 'agents']), 1);
-        assert.match(
-            harness.stderr,
-            /runtime replacement failed; previous runtime restored: .*exited 7/,
-        );
-        assert.doesNotMatch(harness.stderr, /rollback phase:/);
-        const rollback = harness.calls
-            .filter(call => call.args[0] === 'run')
-            .at(-1).args;
-        assertLegacyCreationConfig(rollback, 'sha256:legacy');
-        assert.ok(harness.calls.some(call =>
-            call.kind === 'health' && call.phase === 'rollback'
-        ));
-        assert.equal(
-            harness.calls.some(call => call.args[0] === 'volume'),
-            false,
-        );
-        assert.deepEqual([...harness.state.volumes].sort(), volumesBefore);
-    });
-
-    test(engine + ' retry after terminal replacement and rollback failure starts a fresh create', async () => {
-        const harness = createSupervisorHarness({
-            engine,
-            container: legacyRunningContainerWithCustomConfig(),
-            images: {
-                'sha256:legacy': legacyImage(),
-                [REQUIRED_IMAGE]: contractV1Image(),
-            },
-            failures: {
-                'run replacement': 7,
-                'run rollback': 8,
-            },
-        });
-
-        assert.equal(await harness.supervisor.run(['list', 'agents']), 1);
-        assert.match(harness.stderr, /replacement phase: .*exited 7/);
-        assert.match(harness.stderr, /rollback phase: .*exited 8/);
-
-        assert.equal(await harness.supervisor.run(['list', 'agents']), 0);
-        assert.equal(
-            harness.calls.filter(call =>
-                call.kind === 'health' && call.phase === 'create'
-            ).length,
-            1,
-        );
-        assert.equal(
-            harness.calls.filter(call =>
-                call.args[0] === 'run'
-                && call.args.at(-1) === REQUIRED_IMAGE
-            ).length,
-            2,
-        );
-    });
-}
-
-test('explicit port and publish replace only their inspected fields', () => {
-    const existing = {
-        ...normalizeContainerInspect('docker', dockerInspect),
-        contract: '1',
-    };
-    const portChanged = mergeDesiredRuntimeConfig(
-        parseHostInvocation(['--port', '19191', 'list', 'agents']),
-        existing,
-        [],
-    );
-    assert.equal(portChanged.routerPublish.hostPort, '19191');
-    assert.deepEqual(
-        { ...portChanged, routerPublish: existing.routerPublish },
-        existing,
-    );
-
-    const publishChanged = mergeDesiredRuntimeConfig(
-        parseHostInvocation([
-            '--publish', '127.0.0.1:9000:9000/tcp',
-            'list', 'agents',
-        ]),
-        existing,
-        [],
-    );
-    assert.deepEqual(publishChanged.extraPublishes, [{
-        hostIp: '127.0.0.1',
-        hostPort: '9000',
-        containerPort: '9000',
-        protocol: 'tcp',
-    }]);
-    assert.deepEqual(
-        { ...publishChanged, extraPublishes: existing.extraPublishes },
-        existing,
-    );
-});
-
-test('source-owned runtime marker is absent', () => {
-    assert.equal(fs.existsSync(path.join(HERE, 'ploinky-box-marker')), false);
-});
-
-test('public help contains no compatibility surface', () => {
-    const help = publicUsageText();
-    assert.doesNotMatch(help, /ploinky box/);
-    assert.doesNotMatch(help, /ploinky-box\s/);
-    assert.doesNotMatch(help, /\bup\b|\bupdate\b|\bcp\b/);
-});
-
-for (const argv of [['help'], ['--help'], ['-h']]) {
-    test('host help alias ' + argv[0] + ' returns before engine detection', async () => {
-        let detections = 0;
-        const stderr = captureWritable();
-        const raw = createRuntimeSupervisor({
-            ...minimalSupervisorDependencies(),
-            detectEngine: () => {
-                detections += 1;
-                throw new Error('must not be called');
-            },
-        });
-        assert.equal(
-            await runSupervisorWithBoundary(raw, argv, stderr.stream),
-            0,
-        );
-        assert.equal(detections, 0);
-    });
-}
-
-test('ordinary command reports missing host engine before mutation', async () => {
-    const calls = [];
-    const stderr = captureWritable();
-    const raw = createRuntimeSupervisor({
-        ...minimalSupervisorDependencies(),
-        detectEngine: () => null,
-        spawnSyncImpl: (...args) => calls.push(args),
-    });
-    assert.equal(
-        await runSupervisorWithBoundary(raw, ['list', 'agents'], stderr.stream),
-        1,
-    );
-    assert.match(stderr.text(), /requires Podman or Docker on the host/);
-    assert.deepEqual(calls, []);
-});
-
-test('host launcher delegates directly to the public-only supervisor', () => {
-    const launcher = fs.readFileSync(path.join(REPO_ROOT, 'bin', 'ploinky'), 'utf8');
-    assert.match(
-        launcher,
-        /exec node "\$ROOT_DIR\/container\/runtime-supervisor\.mjs" "\$@"/,
-    );
-    assert.doesNotMatch(launcher, /PLOINKY_PUBLIC_ENTRYPOINT/);
-    assert.doesNotMatch(launcher, /container\/ploinky-box\.mjs/);
-});
-
-test('runtime-supervisor.mjs syntax check (node --check)', () => {
-    const r = spawnSync(process.execPath, ['--check', MJS], { encoding: 'utf8' });
-    assert.equal(r.status, 0, r.stderr);
-});
-
-test('runtime-supervisor.mjs main guard works through a symlink', () => {
-    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'runtime-supervisor-test-'));
-    const link = path.join(tmp, 'supervisor-link.mjs');
-    try {
-        fs.symlinkSync(MJS, link);
-        const r = spawnSync(process.execPath, [link, '-h'], { encoding: 'utf8' });
-        assert.equal(r.status, 0, r.stderr);
-        assert.ok(r.stdout.includes('Usage: ploinky [flags] [command] [args]'), r.stdout);
-    } finally {
-        fs.rmSync(tmp, { recursive: true, force: true });
-    }
-});
-
-test('parseHostInvocation: global flags and first non-flag command', () => {
-    const cfg = parseHostInvocation(['--name', 'qa', '--dry-run', 'list', 'agents'], {});
-    assert.equal(cfg.command, 'list');
-    assert.deepEqual(cfg.args, ['agents']);
-    assert.equal(cfg.name, 'qa');
-    assert.equal(cfg.dryRun, true);
-    assert.deepEqual([...cfg.explicit], ['--name', '--dry-run']);
-});
-
-test('parseHostInvocation: PLOINKY_BOX_ENGINE env seeds the engine, --engine overrides', () => {
-    assert.equal(parseHostInvocation([], { PLOINKY_BOX_ENGINE: 'docker' }).engine, 'docker');
-    assert.equal(parseHostInvocation(['--engine', 'podman'], { PLOINKY_BOX_ENGINE: 'docker' }).engine, 'podman');
-});
-
-test('public start infers non-default source branch unless branch flags are explicit', () => {
-    assert.deepEqual(
-        inferPublicStartBranchArgs(['explorer'], { PLOINKY_BOX_BRANCH: 'feature-x' }, REPO_ROOT),
-        ['--branch', 'feature-x'],
-    );
-    assert.deepEqual(
-        inferPublicStartBranchArgs(['explorer'], { PLOINKY_BOX_BRANCH: 'main' }, REPO_ROOT),
-        [],
-    );
-    assert.deepEqual(
-        inferPublicStartBranchArgs(['explorer', '--branch', 'manual'], { PLOINKY_BOX_BRANCH: 'feature-x' }, REPO_ROOT),
-        [],
-    );
-    assert.deepEqual(
-        inferPublicStartBranchArgs(['explorer'], { PLOINKY_BOX_BRANCH: 'feature-x', PLOINKY_BOX_AUTO_BRANCH: '0' }, REPO_ROOT),
-        [],
-    );
-});
-
-test('resolveHostPloinkySource: PLOINKY_BOX_SOURCE override wins, defaults to the checkout', () => {
-    assert.equal(resolveHostPloinkySource({}), REPO_ROOT);
-    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-src-'));
-    try {
-        for (const marker of ['bin', 'cli', 'globalDeps']) fs.mkdirSync(path.join(tmp, marker));
-        fs.writeFileSync(path.join(tmp, 'bin', 'ploinky'), '#!/usr/bin/env bash\n');
-        fs.writeFileSync(path.join(tmp, 'cli', 'index.js'), '// stub\n');
-        fs.writeFileSync(path.join(tmp, 'globalDeps', 'package.json'), '{}\n');
-        assert.equal(resolveHostPloinkySource({ PLOINKY_BOX_SOURCE: tmp }), path.resolve(tmp));
-    } finally {
-        fs.rmSync(tmp, { recursive: true, force: true });
-    }
-});
-
-test('automatic runtime preparation reports an invalid PLOINKY_BOX_SOURCE', () => {
-    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-notsrc-'));
-    try {
-        const r = spawnSync(MJS, ['--name', 'qa', '--dry-run', 'list', 'agents'], {
-            encoding: 'utf8',
-            env: { ...process.env, PLOINKY_BOX_ENGINE: 'podman', PLOINKY_BOX_SOURCE: tmp },
-        });
-        const out = `${r.stdout ?? ''}${r.stderr ?? ''}`;
-        assert.equal(r.status, 1, out);
-        checkIncludes(out, 'ploinky source not found', 'invalid source dies');
-        checkIncludes(out, 'PLOINKY_BOX_SOURCE', 'error names the escape hatch');
-    } finally {
-        fs.rmSync(tmp, { recursive: true, force: true });
-    }
-});
-
-test('parseHostInvocation: repeatable --publish and --expose accumulate in order', () => {
-    const cfg = parseHostInvocation([
-        '--publish', '127.0.0.1:1:1',
-        '--expose', '127.0.0.1:2:2',
-        '--publish', '127.0.0.1:3:3',
-        'list', 'agents',
-    ], {});
-    assert.deepEqual(cfg.publish, ['127.0.0.1:1:1', '127.0.0.1:2:2', '127.0.0.1:3:3']);
-    assert.deepEqual([...cfg.explicit], ['--publish', '--expose']);
-    assert.equal(Object.hasOwn(cfg, 'webmeetPorts'), false);
-});
-
-test('automatic runtime creation rejects publishes outside the TCP and UDP range', () => {
-    const { out, status } = publicRun(
-        'podman',
-        '--name', 'qa',
-        '--dry-run',
-        '--publish', '0.0.0.0:70000:70000',
-        'list', 'agents',
-    );
-    assert.equal(status, 1, out);
-    checkIncludes(out, "invalid --publish '0.0.0.0:70000:70000'", 'invalid publish is rejected');
-});
-
-test('instance and volume naming', () => {
-    const named = parseHostInvocation(['--name', 'qa'], {});
-    assert.equal(instanceName(named), 'ploinky-box-qa');
-    assert.deepEqual(volumeNames(named), {
-        workspace: 'ploinky-box-qa-workspace',
-        containers: 'ploinky-box-qa-containers',
-        deps: 'ploinky-box-qa-ploinky-deps',
-    });
-});
-
-test('volume naming includes the deps volume', () => {
-    const named = parseHostInvocation(['--name', 'qa'], {});
-    assert.deepEqual(volumeNames(named), {
-        workspace: 'ploinky-box-qa-workspace',
-        containers: 'ploinky-box-qa-containers',
-        deps: 'ploinky-box-qa-ploinky-deps',
-    });
-});
-
-test('buildRuntimeRunArgs: selinux label only when the engine reports it; image is last', () => {
-    const cfg = parseHostInvocation([], {});
-    const plain = buildArgsForInvocation(cfg, { selinux: false });
-    const labeled = buildArgsForInvocation(cfg, { selinux: true });
-    assert.ok(!plain.join(' ').includes('label=disable'));
-    assert.ok(labeled.join(' ').includes('--security-opt label=disable'));
-    assert.equal(plain[plain.length - 1], REQUIRED_IMAGE);
-    assert.ok(plain.includes('--privileged'));
-});
-
-test('buildRuntimeRunArgs: explicit publish spelling stays exact while config is normalized', () => {
+test('contract-2 validation emits field-specific failures', async t => {
     const cases = [
-        {
-            raw: '8081',
-            normalized: {
-                hostIp: '', hostPort: '', containerPort: '8081', protocol: 'tcp',
-            },
-        },
-        {
-            raw: '18081:8081',
-            normalized: {
-                hostIp: '', hostPort: '18081', containerPort: '8081', protocol: 'tcp',
-            },
-        },
-        {
-            raw: '18081:8081/tcp',
-            normalized: {
-                hostIp: '', hostPort: '18081', containerPort: '8081', protocol: 'tcp',
-            },
-        },
-        {
-            raw: '127.0.0.1:18081:8081',
-            normalized: {
-                hostIp: '127.0.0.1', hostPort: '18081', containerPort: '8081', protocol: 'tcp',
-            },
-        },
-        {
-            raw: '127.0.0.1:18081:08081',
-            normalized: {
-                hostIp: '127.0.0.1', hostPort: '18081', containerPort: '8081', protocol: 'tcp',
-            },
-        },
-        {
-            raw: '127.0.0.1::8081',
-            normalized: {
-                hostIp: '127.0.0.1', hostPort: '', containerPort: '8081', protocol: 'tcp',
-            },
-        },
+        ['image ID', raw => { raw.Id = ''; }, /image ID/],
+        ['contract label', raw => { delete raw.Config.Labels[RUNTIME_CONTRACT_LABEL]; }, /runtime-contract/],
+        ['user', raw => { raw.Config.User = 'root'; }, /Config\.User/],
+        ['required env missing', raw => {
+            raw.Config.Env = raw.Config.Env.filter(value => !value.startsWith('HOME='));
+        }, /Config\.Env HOME/],
+        ['required env wrong', raw => {
+            raw.Config.Env = raw.Config.Env.map(value => value.startsWith('PATH=') ? 'PATH=/usr/bin' : value);
+        }, /Config\.Env PATH/],
+        ['extra env', raw => { raw.Config.Env.push('SURPRISE=1'); }, /Config\.Env/],
+        ['working directory', raw => { raw.Config.WorkingDir = '/'; }, /Config\.WorkingDir/],
+        ['entrypoint value', raw => { raw.Config.Entrypoint = ['/bin/sh']; }, /Config\.Entrypoint/],
+        ['entrypoint shape', raw => { raw.Config.Entrypoint = '/usr/local/bin/ploinky-box-entrypoint'; }, /Config\.Entrypoint/],
+        ['command', raw => { raw.Config.Cmd = ['bash']; }, /Config\.Cmd/],
+        ['declared volume', raw => { raw.Config.Volumes = { '/home/podman': {} }; }, /Config\.Volumes/],
     ];
-
-    for (const expected of cases) {
-        const invocation = parseHostInvocation([
-            '--publish', expected.raw,
-        ], {});
-        invocation.name ||= 'demo';
-        invocation.sourceDirResolved ||= REPO_ROOT;
-        const config = createDefaultRuntimeConfig(invocation);
-        assert.deepEqual(config.extraPublishes, [expected.normalized]);
-
-        const args = buildRuntimeRunArgs(config, {
-            engine: 'podman',
-            selinux: false,
+    for (const [name, mutate, pattern] of cases) {
+        await t.test(name, () => {
+            const raw = contract2Image();
+            mutate(raw);
+            assert.throws(
+                () => validateImageContract(normalizeImageInspect(raw), REQUIRED_RUNTIME_IMAGE),
+                pattern,
+            );
         });
-        const publishTokens = args.flatMap((token, index) =>
-            token === '-p' ? [args[index + 1]] : []
-        );
-        assert.deepEqual(publishTokens, [
-            '127.0.0.1:8080:8080',
-            expected.raw,
-        ]);
     }
+});
 
-    const canonicalInvocation = parseHostInvocation([], {});
-    canonicalInvocation.name ||= 'demo';
-    canonicalInvocation.sourceDirResolved ||= REPO_ROOT;
-    const canonicalConfig = createDefaultRuntimeConfig(canonicalInvocation);
-    canonicalConfig.extraPublishes = mergeAndValidatePublishes([{
-        hostIp: '127.0.0.1',
-        hostPort: '',
-        containerPort: '8081',
-        protocol: 'tcp',
-    }]);
-    const canonicalArgs = buildRuntimeRunArgs(canonicalConfig, {
-        engine: 'podman',
-        selinux: false,
-    });
-    const canonicalPublishes = canonicalArgs.flatMap((token, index) =>
-        token === '-p' ? [canonicalArgs[index + 1]] : []
-    );
-    assert.deepEqual(canonicalPublishes, [
-        '127.0.0.1:8080:8080',
-        '127.0.0.1::8081',
+test('runtime creation args pin the validated ID and label the logical reference', () => {
+    const invocation = invocationFor();
+    const config = createDefaultRuntimeConfig(invocation);
+    config.imageId = 'sha256:validated';
+    const args = buildRuntimeRunArgs(config, { engine: 'podman' });
+    assert.equal(args.at(-1), 'sha256:validated');
+    assert.ok(args.includes(`${REQUESTED_IMAGE_LABEL}=${REQUIRED_RUNTIME_IMAGE}`));
+    assert.ok(args.includes(`${IDENTITY_SCHEMA_LABEL}=${IDENTITY_SCHEMA_VERSION}`));
+    assert.ok(args.includes(`${PATH_HASH_LABEL}=${invocation.pathHash}`));
+    for (const name of Object.values(runtimeVolumeNames(invocation.instance))) {
+        assert.ok(args.some(value => value.startsWith(`${name}:`)), name);
+    }
+});
+
+test('outer options stop at the first command and downstream argv remains exact', () => {
+    const argv = [
+        '--port=9192', '--publish', '127.0.0.1:9000:9000/udp',
+        'client', 'tool', 'demo', '--port', '44', '--image=x', '--name', 'agent', '--engine=docker',
+    ];
+    const parsed = parseHostInvocation(argv, { PLOINKY_BOX_ENGINE: 'docker' });
+    assert.equal(parsed.port, '9192');
+    assert.deepEqual(parsed.publish, ['127.0.0.1:9000:9000/udp']);
+    assert.equal(parsed.command, 'client');
+    assert.deepEqual(parsed.args, argv.slice(4));
+    assert.deepEqual(routeHostInvocation(parsed).forwardedArgs, ['client', ...argv.slice(4)]);
+});
+
+test('double dash permits a downstream command beginning with an option', () => {
+    const parsed = parseHostInvocation(['--port', '9192', '--', '--agent-field', 'x']);
+    assert.equal(parsed.command, '--agent-field');
+    assert.deepEqual(parsed.args, ['x']);
+});
+
+test('every outer-option spelling remains an ordinary downstream token after the boundary', () => {
+    const tails = [
+        ['--port', '9000'], ['--port=9000'],
+        ['--publish', '9000:9000'], ['--publish=9000:9000'],
+        ['--expose', '9001:9001'], ['--expose=9001:9001'],
+        ['--image', 'example/image:tag'], ['--image=example/image:tag'],
+        ['--mount', '/tmp/data'], ['--mount=/tmp/data'],
+        ['--listen-lan'], ['--dry-run'], ['--help'], ['-h'],
+    ];
+    for (const tail of tails) {
+        const parsed = parseHostInvocation(['cli', 'agent', ...tail]);
+        assert.equal(parsed.command, 'cli');
+        assert.deepEqual(parsed.args, ['agent', ...tail]);
+    }
+    const repeated = parseHostInvocation([
+        '--publish', '9000:9000', '--expose=9001:9001',
+        '--publish', '9002:9002', 'list', 'agents',
+    ]);
+    assert.deepEqual(repeated.publish, ['9000:9000', '9001:9001', '9002:9002']);
+    assert.deepEqual(repeated.args, ['agents']);
+});
+
+test('removed public selectors fail only when they occupy the outer prefix', () => {
+    assert.throws(() => parseHostInvocation(['--name', 'demo', 'status']), /no longer supported/);
+    assert.throws(() => parseHostInvocation(['--engine=docker', 'status']), /no longer supported/);
+    const parsed = parseHostInvocation(['client', 'tool', '--name', 'demo', '--engine=docker']);
+    assert.deepEqual(parsed.args, ['tool', '--name', 'demo', '--engine=docker']);
+});
+
+test('state commands reject creation flags and lifecycle tails', () => {
+    const prefixed = parseHostInvocation(['--image', 'example/image:tag', 'status']);
+    assert.throws(() => assertStateCommandFlags(prefixed), /--image/);
+    const tailed = parseHostInvocation(['destroy', '--force']);
+    assert.throws(() => assertStateCommandFlags(tailed), /unexpected trailing argument/);
+});
+
+test('start-tail --port forms fail before engine discovery or mutation', async t => {
+    for (const tail of [['--port', '9192'], ['--port=9192']]) {
+        await t.test(tail.join(' '), async () => {
+            const harness = createSupervisorHarness();
+            assert.equal(await harness.supervisor.run(['start', 'explorer', ...tail]), 1);
+            assert.match(harness.stderr, /must precede 'start'/);
+            assert.equal(harness.calls.length, 0);
+        });
+    }
+});
+
+test('non-start post-command port tokens are forwarded byte-for-byte', async () => {
+    const fixture = contract2RuntimeFixture();
+    const harness = createSupervisorHarness(fixture);
+    const tail = ['tool', 'sample', '--port', '0', '--port=9192'];
+    assert.equal(await harness.supervisor.run(['client', ...tail]), 0);
+    const call = runCalls(harness, 'exec').at(-1);
+    const core = call.args.indexOf('ploinky');
+    assert.deepEqual(call.args.slice(core), ['ploinky', 'client', ...tail]);
+});
+
+test('exact-directory identity is stable through symlinks and separates directories', () => {
+    const linked = resolveInstanceIdentity({}, '/tmp/link', () => '/srv/projects/demo');
+    const real = resolveInstanceIdentity({}, '/srv/projects/demo', value => value);
+    assert.equal(linked.instance, real.instance);
+    const left = resolveInstanceIdentity({}, '/one/demo', value => value);
+    const right = resolveInstanceIdentity({}, '/two/demo', value => value);
+    const child = resolveInstanceIdentity({}, '/one/demo/child', value => value);
+    const moved = resolveInstanceIdentity({}, '/one/renamed', value => value);
+    assert.notEqual(left.instance, right.instance);
+    assert.notEqual(left.instance, child.instance);
+    assert.notEqual(left.instance, moved.instance);
+    assert.match(left.instance, /^ploinky-box-demo-[a-f0-9]{12}$/);
+    assert.deepEqual(Object.values(runtimeVolumeNames(left.instance)), [
+        `${left.instance}-workspace`,
+        `${left.instance}-containers`,
+        `${left.instance}-ploinky-deps`,
     ]);
 });
 
-test('buildRuntimeRunArgs: null router keeps exact raw extra publish spelling', () => {
-    const invocation = parseHostInvocation([
-        '--publish', '18081:8081/tcp',
-    ], {});
-    invocation.name ||= 'demo';
-    invocation.sourceDirResolved ||= REPO_ROOT;
-    const config = createDefaultRuntimeConfig(invocation);
-    config.routerPublish = null;
+test('host runtime lock serializes one exact directory and permits a different directory', async t => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-host-runtime-lock-'));
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+    const first = identityFor('/workspace/first');
+    const second = identityFor('/workspace/second');
+    const options = {
+        rootDir: root,
+        timeoutMs: 1000,
+        retryMs: 10,
+        staleGraceMs: 10,
+    };
+    let releaseFirst;
+    let firstEntered = false;
+    let sameEntered = false;
+    let otherEntered = false;
+    const gate = new Promise(resolve => { releaseFirst = resolve; });
+    const holding = withHostRuntimeLock(first, async () => {
+        firstEntered = true;
+        await gate;
+    }, options);
+    while (!firstEntered) await new Promise(resolve => setTimeout(resolve, 1));
+    const same = withHostRuntimeLock(first, async () => { sameEntered = true; }, options);
+    const other = withHostRuntimeLock(second, async () => { otherEntered = true; }, options);
+    await new Promise(resolve => setTimeout(resolve, 40));
+    assert.equal(sameEntered, false);
+    assert.equal(otherEntered, true);
+    releaseFirst();
+    await Promise.all([holding, same, other]);
+    assert.equal(sameEntered, true);
+    assert.equal(fs.existsSync(hostRuntimeLockPath(first, options)), false);
+    assert.equal(fs.existsSync(hostRuntimeLockPath(second, options)), false);
+});
 
-    const args = buildRuntimeRunArgs(config, {
-        engine: 'podman',
-        selinux: false,
+test('host runtime lock recovers a dead owner without stealing a live lock', async t => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-host-runtime-stale-'));
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+    const invocation = identityFor('/workspace/stale');
+    const options = {
+        rootDir: root,
+        timeoutMs: 1000,
+        retryMs: 10,
+        staleGraceMs: 0,
+    };
+    const lockPath = hostRuntimeLockPath(invocation, options);
+    fs.mkdirSync(lockPath, { recursive: true });
+    fs.writeFileSync(path.join(lockPath, 'owner.json'), JSON.stringify({
+        token: 'dead',
+        pid: 999_999,
+        canonicalPath: invocation.canonicalPath,
+        acquiredAt: '2000-01-01T00:00:00.000Z',
+    }));
+    let entered = false;
+    await withHostRuntimeLock(invocation, async () => { entered = true; }, options);
+    assert.equal(entered, true);
+    assert.equal(fs.existsSync(lockPath), false);
+});
+
+test('PLOINKY_BOX_ENGINE cannot influence parsing or empty-identity selection', () => {
+    assert.equal(parseHostInvocation([], { PLOINKY_BOX_ENGINE: 'docker' }).engine, '');
+    const invocation = invocationFor();
+    const podman = createFakeEngine({ engine: 'podman' });
+    const docker = createFakeEngine({ engine: 'docker' });
+    const selected = resolveEngineOwnership(invocation, {
+        env: { PLOINKY_BOX_ENGINE: 'docker' },
+        installedEngines: ['podman', 'docker'],
+        engineClients: { podman: podman.engineClient, docker: docker.engineClient },
     });
-    const publishTokens = args.flatMap((token, index) =>
-        token === '-p' ? [args[index + 1]] : []
+    assert.equal(selected.engine, 'podman');
+});
+
+test('cross-engine discovery selects the sole complete or partial resource owner', async t => {
+    for (const owner of ['podman', 'docker']) {
+        await t.test(owner, () => {
+            const invocation = invocationFor();
+            const names = runtimeVolumeNames(invocation.instance);
+            const ownerFake = createFakeEngine({
+                engine: owner,
+                volumes: {
+                    [names.workspace]: ownedVolume(names.workspace, invocation.pathHash, 'workspace'),
+                },
+            });
+            const other = owner === 'podman' ? 'docker' : 'podman';
+            const otherFake = createFakeEngine({ engine: other });
+            const result = resolveEngineOwnership(invocation, {
+                installedEngines: ['podman', 'docker'],
+                engineClients: {
+                    [owner]: ownerFake.engineClient,
+                    [other]: otherFake.engineClient,
+                },
+            });
+            assert.equal(result.engine, owner);
+            assert.equal(result.inventory.volumes.roles.workspace.state, 'valid');
+            assert.equal(result.inventory.volumes.roles.containers.state, 'absent');
+        });
+    }
+});
+
+test('cross-engine discovery rejects split container/volume ownership', () => {
+    const invocation = invocationFor();
+    const names = runtimeVolumeNames(invocation.instance);
+    const podman = createFakeEngine({
+        engine: 'podman',
+        container: contract2Container(),
+    });
+    const docker = createFakeEngine({
+        engine: 'docker',
+        volumes: {
+            [names.workspace]: ownedVolume(names.workspace, invocation.pathHash, 'workspace'),
+        },
+    });
+    const result = resolveEngineOwnership(invocation, {
+        installedEngines: ['podman', 'docker'],
+        engineClients: { podman: podman.engineClient, docker: docker.engineClient },
+    });
+    assert.equal(result.issue.kind, 'split');
+});
+
+test('cross-engine discovery rejects exact-name foreign volumes', () => {
+    const invocation = invocationFor();
+    const names = runtimeVolumeNames(invocation.instance);
+    const podman = createFakeEngine({
+        engine: 'podman',
+        volumes: { [names.workspace]: { Name: names.workspace, Labels: {} } },
+    });
+    const result = resolveEngineOwnership(invocation, {
+        installedEngines: ['podman'],
+        engineClients: { podman: podman.engineClient },
+    });
+    assert.equal(result.issue.kind, 'foreign');
+    assert.match(result.issue.message, /foreign\/unsupported/);
+});
+
+test('an unreachable installed engine is unknown even when the peer owns resources', () => {
+    const invocation = invocationFor();
+    const podman = createFakeEngine({ engine: 'podman', container: contract2Container() });
+    const docker = createFakeEngine({ engine: 'docker', failures: { info: 1 } });
+    const result = resolveEngineOwnership(invocation, {
+        installedEngines: ['podman', 'docker'],
+        engineClients: { podman: podman.engineClient, docker: docker.engineClient },
+    });
+    assert.equal(result.issue.kind, 'unknown');
+    assert.match(result.issue.message, /docker/);
+});
+
+test('generic does-not-exist diagnostics remain unknown instead of proving the box absent', () => {
+    const invocation = invocationFor();
+    const fake = createFakeEngine({ engine: 'podman' });
+    const client = {
+        ...fake.engineClient,
+        query(args, options) {
+            if (args[0] === 'container' && args[1] === 'inspect') {
+                return {
+                    ok: false,
+                    status: 1,
+                    stdout: '',
+                    stderr: 'container inspection failed because the runtime cache does not exist',
+                };
+            }
+            return fake.engineClient.query(args, options);
+        },
+    };
+    const result = resolveEngineOwnership(invocation, {
+        installedEngines: ['podman'],
+        engineClients: { podman: client },
+    });
+    assert.equal(result.issue.kind, 'unknown');
+    assert.match(result.issue.message, /container ownership probe failed/);
+});
+
+test('unknown-engine classification covers absent, unknown, and not-installed peers', async t => {
+    const scenarios = [
+        { name: 'unknown plus absent', installed: ['podman', 'docker'], podmanUnknown: true, dockerUnknown: false, issue: 'unknown' },
+        { name: 'unknown plus unknown', installed: ['podman', 'docker'], podmanUnknown: true, dockerUnknown: true, issue: 'unknown' },
+        { name: 'not-installed peer is omitted', installed: ['docker'], podmanUnknown: false, dockerUnknown: false, engine: 'docker' },
+    ];
+    for (const scenario of scenarios) {
+        await t.test(scenario.name, () => {
+            const invocation = invocationFor();
+            const podman = createFakeEngine({ engine: 'podman', failures: scenario.podmanUnknown ? { info: 1 } : {} });
+            const docker = createFakeEngine({ engine: 'docker', failures: scenario.dockerUnknown ? { info: 1 } : {} });
+            const result = resolveEngineOwnership(invocation, {
+                installedEngines: scenario.installed,
+                engineClients: { podman: podman.engineClient, docker: docker.engineClient },
+            });
+            if (scenario.issue) assert.equal(result.issue.kind, scenario.issue);
+            else assert.equal(result.engine, scenario.engine);
+            if (!scenario.installed.includes('podman')) assert.equal(podman.calls.length, 0);
+        });
+    }
+});
+
+test('unknown discovery gives partial status but blocks ordinary mutation', async () => {
+    const stdout = writableBuffer();
+    const stderr = writableBuffer();
+    const podman = createFakeEngine({ engine: 'podman' });
+    const docker = createFakeEngine({ engine: 'docker', failures: { info: 1 } });
+    const supervisor = createRuntimeSupervisor({
+        stdout: stdout.stream,
+        stderr: stderr.stream,
+        stdin: { isTTY: false },
+        cwd: '/workspace/demo',
+        realpath: value => path.resolve(value),
+        env: {},
+        installedEngines: ['podman', 'docker'],
+        engineClients: { podman: podman.engineClient, docker: docker.engineClient },
+    });
+    assert.equal(await supervisor.run(['status']), 1);
+    assert.match(stdout.text(), /ownership unresolved/);
+    assert.match(stdout.text(), /engine docker: unknown/);
+    await assert.rejects(() => supervisor.run(['list', 'agents']), /make every installed engine answer/);
+    assert.equal(mutationCalls(podman).length, 0);
+    assert.equal(mutationCalls(docker).length, 0);
+});
+
+test('status inventories partial retained resources without creating missing roles', async () => {
+    const identity = identityFor();
+    const names = runtimeVolumeNames(identity.instance);
+    const podman = createFakeEngine({
+        engine: 'podman',
+        volumes: { [names.workspace]: ownedVolume(names.workspace, identity.pathHash, 'workspace') },
+    });
+    const stdout = writableBuffer();
+    const supervisor = createRuntimeSupervisor({
+        stdout: stdout.stream,
+        stderr: writableBuffer().stream,
+        stdin: { isTTY: false },
+        cwd: '/workspace/demo',
+        realpath: value => path.resolve(value),
+        env: {},
+        installedEngines: ['podman'],
+        engineClients: { podman: podman.engineClient },
+    });
+    assert.equal(await supervisor.run(['status']), 1);
+    assert.match(stdout.text(), /workspace=valid/);
+    assert.match(stdout.text(), /containers=absent/);
+    assert.equal(mutationCalls(podman).length, 0);
+});
+
+test('help is local and probes no engine', async () => {
+    const podman = createFakeEngine({ engine: 'podman', failures: { info: 1 } });
+    const stdout = writableBuffer();
+    const supervisor = createRuntimeSupervisor({
+        stdout: stdout.stream,
+        stderr: writableBuffer().stream,
+        stdin: { isTTY: false },
+        installedEngines: ['podman'],
+        engineClients: { podman: podman.engineClient },
+        showHelp: () => {},
+    });
+    assert.equal(await supervisor.run([] .concat('help')), 0);
+    assert.equal(podman.calls.length, 0);
+});
+
+test('every outer mutation route is held by the exact-directory host lock while status and help stay read-only', async t => {
+    const cases = [
+        { argv: ['list', 'agents'] },
+        { argv: ['start', 'explorer'], fetchResponse: { ok: true } },
+        { argv: ['stop'] },
+        { argv: ['destroy'], answer: 'no' },
+        { argv: [], stdoutIsTTY: true },
+    ];
+    for (const entry of cases) {
+        await t.test(entry.argv.join(' ') || 'bare', async () => {
+            const fixture = contract2RuntimeFixture();
+            let locks = 0;
+            const harness = createSupervisorHarness({
+                ...fixture,
+                ...entry,
+                withHostRuntimeLock: async (invocation, callback) => {
+                    locks += 1;
+                    assert.equal(invocation.canonicalPath, fixture.identity.canonicalPath);
+                    return callback();
+                },
+            });
+            await harness.supervisor.run(entry.argv);
+            assert.equal(locks, 1);
+        });
+    }
+
+    for (const argv of [['status'], ['help']]) {
+        await t.test(`${argv[0]} is lock-free`, async () => {
+            const fixture = contract2RuntimeFixture();
+            const harness = createSupervisorHarness({
+                ...fixture,
+                withHostRuntimeLock: async () => {
+                    throw new Error('read-only route acquired mutation lock');
+                },
+            });
+            await harness.supervisor.run(argv);
+            assert.doesNotMatch(harness.stderr, /acquired mutation lock/);
+        });
+    }
+});
+
+test('missing create pulls despite a cached tag, validates, and runs the new ID', async () => {
+    const oldImage = contract2Image('sha256:old');
+    const newImage = contract2Image('sha256:new');
+    const harness = createSupervisorHarness({
+        images: { [REQUIRED_RUNTIME_IMAGE]: oldImage, [oldImage.Id]: oldImage },
+        pullImages: { [REQUIRED_RUNTIME_IMAGE]: newImage },
+    });
+    assert.equal(await harness.supervisor.run(['list', 'agents']), 0);
+    assert.equal(runCalls(harness, 'pull').length, 1);
+    const create = runCalls(harness, 'run')[0];
+    assert.equal(create.args.at(-1), newImage.Id);
+    assert.ok(create.args.includes(`${REQUESTED_IMAGE_LABEL}=${REQUIRED_RUNTIME_IMAGE}`));
+});
+
+test('a custom image is pulled, contract-validated, and pinned by ID', async () => {
+    const reference = 'registry.example/ploinky/custom:runtime';
+    const image = contract2Image('sha256:custom');
+    const harness = createSupervisorHarness({ pullImages: { [reference]: image } });
+    assert.equal(await harness.supervisor.run(['--image', reference, 'list']), 0);
+    assert.deepEqual(runCalls(harness, 'pull')[0].args, ['pull', reference]);
+    const create = runCalls(harness, 'run')[0].args;
+    assert.equal(create.at(-1), image.Id);
+    assert.ok(create.includes(`${REQUESTED_IMAGE_LABEL}=${reference}`));
+});
+
+test('missing create explicitly creates and labels all named volumes before attachment', async () => {
+    const harness = createSupervisorHarness();
+    assert.equal(await harness.supervisor.run(['list', 'agents']), 0);
+    const identity = identityFor();
+    const names = runtimeVolumeNames(identity.instance);
+    const creates = harness.calls.filter(call =>
+        call.kind === 'run' && call.args[0] === 'volume' && call.args[1] === 'create'
     );
-    assert.deepEqual(publishTokens, ['18081:8081/tcp']);
+    assert.equal(creates.length, 3);
+    for (const [role, expectedRole] of Object.entries(VOLUME_ROLES)) {
+        const call = creates.find(entry => entry.args.at(-1) === names[role]);
+        assert.ok(call, role);
+        assert.ok(call.args.includes(`${IDENTITY_SCHEMA_LABEL}=1`));
+        assert.ok(call.args.includes(`${PATH_HASH_LABEL}=${identity.pathHash}`));
+        assert.ok(call.args.includes(`${VOLUME_ROLE_LABEL}=${expectedRole}`));
+        assert.deepEqual(harness.state.volumes.get(names[role]).Labels, {
+            [IDENTITY_SCHEMA_LABEL]: '1',
+            [PATH_HASH_LABEL]: identity.pathHash,
+            [VOLUME_ROLE_LABEL]: expectedRole,
+        });
+    }
+    const createIndex = harness.calls.findIndex(call => call.kind === 'run' && call.args[0] === 'run');
+    assert.ok(creates.every(call => harness.calls.indexOf(call) < createIndex));
 });
 
-test('buildRuntimeRunArgs: read-only source mount plus writable deps volume', () => {
-    const podmanCfg = parseHostInvocation(['--engine', 'podman'], {});
-    const podmanArgs = buildArgsForInvocation(podmanCfg, { selinux: false }).join(' ');
-    assert.ok(podmanArgs.includes(`-v ${REPO_ROOT}:/opt/ploinky:ro`), podmanArgs);
-    assert.ok(!podmanArgs.includes('ploinky-box-marker'), podmanArgs);
-    assert.ok(!podmanArgs.includes(':/etc/ploinky-box'), podmanArgs);
-    assert.ok(podmanArgs.includes('-ploinky-deps:/opt/ploinky/node_modules:U'), podmanArgs);
-    assert.ok(!podmanArgs.includes('/workspace:ro'), 'workspace stays writable');
-    assert.ok(!podmanArgs.includes('PLOINKY_BOX='), 'no PLOINKY_BOX env injection');
-
-    const dockerCfg = parseHostInvocation(['--engine', 'docker'], {});
-    const dockerArgs = buildArgsForInvocation(dockerCfg, { selinux: false }).join(' ');
-    assert.ok(dockerArgs.includes('-ploinky-deps:/opt/ploinky/node_modules '), dockerArgs);
-    assert.ok(!dockerArgs.includes(':U'), 'docker gets no :U volume option');
+test('partial labelled volume sets are reused and only missing roles are created', async () => {
+    const identity = identityFor();
+    const names = runtimeVolumeNames(identity.instance);
+    const harness = createSupervisorHarness({
+        volumes: {
+            [names.workspace]: ownedVolume(names.workspace, identity.pathHash, 'workspace'),
+        },
+    });
+    assert.equal(await harness.supervisor.run(['list', 'agents']), 0);
+    const creates = harness.calls.filter(call =>
+        call.kind === 'run' && call.args[0] === 'volume' && call.args[1] === 'create'
+    );
+    assert.deepEqual(creates.map(call => call.args.at(-1)).sort(), [names.containers, names.deps].sort());
 });
 
-test('automatic runtime preparation fixes Docker deps ownership; Podman relies on :U', () => {
-    const docker = publicRun('docker', '--dry-run', '--name', 'qa', 'list', 'agents');
-    checkIncludes(docker.out, 'exec --user root ploinky-box-qa chown podman:podman /opt/ploinky/node_modules',
-        'Docker preparation chowns the fresh deps volume');
-    const podman = publicRun('podman', '--dry-run', '--name', 'qa', 'list', 'agents');
-    checkAbsent(podman.out, 'chown podman:podman /opt/ploinky/node_modules', 'Podman preparation needs no chown (:U)');
+test('foreign volume discovery fails before pull or mutation', async () => {
+    const identity = identityFor();
+    const names = runtimeVolumeNames(identity.instance);
+    const podman = createFakeEngine({
+        engine: 'podman',
+        volumes: { [names.workspace]: { Name: names.workspace, Labels: {} } },
+    });
+    const stderr = writableBuffer();
+    const supervisor = createRuntimeSupervisor({
+        stdout: writableBuffer().stream,
+        stderr: stderr.stream,
+        stdin: { isTTY: false },
+        cwd: '/workspace/demo',
+        realpath: value => path.resolve(value),
+        env: {},
+        installedEngines: ['podman'],
+        engineClients: { podman: podman.engineClient },
+    });
+    assert.equal(await runSupervisorWithBoundary(supervisor, ['list', 'agents'], stderr.stream), 1);
+    assert.match(stderr.text(), /foreign\/unsupported/);
+    assert.equal(mutationCalls(podman).length, 0);
 });
 
-test('shouldInstallDeps: explicit env opt-in, TTY confirm, default no', () => {
+test('new path-hashed create never attaches legacy basename-only volumes', async () => {
+    const harness = createSupervisorHarness({
+        volumes: {
+            'ploinky-box-demo-workspace': { Name: 'ploinky-box-demo-workspace', Labels: {} },
+            'ploinky-box-demo-containers': { Name: 'ploinky-box-demo-containers', Labels: {} },
+            'ploinky-box-demo-ploinky-deps': { Name: 'ploinky-box-demo-ploinky-deps', Labels: {} },
+        },
+    });
+    assert.equal(await harness.supervisor.run(['list', 'agents']), 0);
+    const args = runCalls(harness, 'run')[0].args;
+    assert.equal(args.some(value => /^ploinky-box-demo-(workspace|containers|ploinky-deps):/.test(value)), false);
+    assert.equal(harness.state.volumes.has('ploinky-box-demo-workspace'), true);
+});
+
+test('compatible running reuse and stopped start perform no registry pull', async t => {
+    for (const state of ['running', 'exited']) {
+        await t.test(state, async () => {
+            const fixture = contract2RuntimeFixture({ state });
+            const harness = createSupervisorHarness(fixture);
+            assert.equal(await harness.supervisor.run(['list', 'agents']), 0);
+            assert.equal(runCalls(harness, 'pull').length, 0);
+            assert.equal(runCalls(harness, 'start').length, state === 'exited' ? 1 : 0);
+        });
+    }
+});
+
+test('current-contract replacement pulls and validates before shutdown', async () => {
+    const fixture = contract2RuntimeFixture();
+    const next = contract2Image('sha256:next');
+    const harness = createSupervisorHarness({
+        ...fixture,
+        pullImages: { [REQUIRED_RUNTIME_IMAGE]: next },
+    });
+    assert.equal(await harness.supervisor.run(['--port', '9192', 'list', 'agents']), 0);
+    const pullIndex = harness.calls.findIndex(call => call.kind === 'run' && call.args[0] === 'pull');
+    const shutdownIndex = harness.calls.findIndex(call =>
+        call.kind === 'run' && call.args.includes('ploinky') && call.args.includes('stop')
+    );
+    assert.ok(pullIndex >= 0 && shutdownIndex > pullIndex);
+    assert.equal(runCalls(harness, 'run').at(-1).args.at(-1), next.Id);
+});
+
+test('pull or image-contract failure leaves the existing box running', async t => {
+    await t.test('pull failure', async () => {
+        const fixture = contract2RuntimeFixture();
+        const harness = createSupervisorHarness({ ...fixture, failures: { pull: 1 } });
+        assert.equal(await harness.supervisor.run(['--port', '9192', 'list']), 1);
+        assert.equal(harness.state.container.inspect.State.Status, 'running');
+        assert.equal(runCalls(harness, 'stop').length, 0);
+    });
+    await t.test('metadata failure', async () => {
+        const fixture = contract2RuntimeFixture();
+        const invalid = contract2Image('sha256:invalid');
+        invalid.Config.User = 'root';
+        const harness = createSupervisorHarness({
+            ...fixture,
+            pullImages: { [REQUIRED_RUNTIME_IMAGE]: invalid },
+        });
+        assert.equal(await harness.supervisor.run(['--port', '9192', 'list']), 1);
+        assert.match(harness.stderr, /Config\.User/);
+        assert.equal(harness.state.container.inspect.State.Status, 'running');
+        assert.equal(runCalls(harness, 'stop').length, 0);
+    });
+});
+
+test('contract-1 ordinary commands fail closed without pull, planner, or mutation', async () => {
+    const fixture = contract2RuntimeFixture({ imageId: 'sha256:runtime-1' });
+    fixture.images = { 'sha256:runtime-1': contract1Image() };
+    let plannerCalls = 0;
+    const harness = createSupervisorHarness({
+        ...fixture,
+        preparePublicationPlan: async () => { plannerCalls += 1; return { schemaVersion: 1, publishes: [] }; },
+    });
+    assert.equal(await harness.supervisor.run(['start', 'explorer']), 1);
+    assert.match(harness.stderr, /unsupported/);
+    assert.match(harness.stderr, /ploinky destroy/);
+    assert.equal(plannerCalls, 0);
+    assert.equal(mutationCalls(harness).length, 0);
+});
+
+test('status, stop, and destroy remain pull-free for contract-1 boxes', async t => {
+    for (const command of ['status', 'stop', 'destroy']) {
+        await t.test(command, async () => {
+            const fixture = contract2RuntimeFixture({ imageId: 'sha256:runtime-1' });
+            fixture.images = { 'sha256:runtime-1': contract1Image() };
+            const harness = createSupervisorHarness({
+                ...fixture,
+                answer: command === 'destroy' ? 'y' : null,
+            });
+            await harness.supervisor.run([command]);
+            assert.equal(runCalls(harness, 'pull').length, 0);
+            if (command === 'destroy') assert.equal(harness.state.container, null);
+        });
+    }
+});
+
+test('failed replacement rolls back prior image ID, labels, environment, config, and volumes', async () => {
+    const fixture = contract2RuntimeFixture();
+    fixture.container.inspect.Config.Labels['example.keep'] = 'yes';
+    fixture.container.inspect.Config.Env.push('CUSTOM_RUNTIME_SETTING=kept');
+    const priorVolumes = cloneVolumeMap(fixture.volumes);
+    const harness = createSupervisorHarness({
+        ...fixture,
+        pullImages: { [REQUIRED_RUNTIME_IMAGE]: contract2Image('sha256:next') },
+        failures: { 'health replacement': 1 },
+    });
+    assert.equal(await harness.supervisor.run(['--port', '9192', 'list']), 1);
+    const runs = runCalls(harness, 'run');
+    assert.equal(runs.length, 2);
+    assert.equal(runs[0].args.at(-1), 'sha256:next');
+    assert.equal(runs[1].args.at(-1), fixture.container.inspect.Image);
+    assert.ok(runs[1].args.includes('example.keep=yes'));
+    assert.ok(runs[1].args.includes('CUSTOM_RUNTIME_SETTING=kept'));
+    assert.ok(runs[1].args.includes('127.0.0.1:8080:8080'));
+    assert.equal(harness.state.container.inspect.Image, fixture.container.inspect.Image);
+    assert.deepEqual(Object.fromEntries(harness.state.volumes), priorVolumes);
+});
+
+function cloneVolumeMap(volumes) {
+    return structuredClone(volumes);
+}
+
+test('replacement transaction restores the prior box when stop or old-container removal fails', async t => {
+    const cases = [
+        { name: 'outer stop fails', failures: { stop: 17 } },
+        { name: 'old remove fails and leaves the box', failures: { 'rm container': 18 } },
+        {
+            name: 'old remove reports failure after removing the box',
+            failures: { 'rm container': 19 },
+            rmFailureRemovesContainer: true,
+        },
+    ];
+    for (const entry of cases) {
+        await t.test(entry.name, async () => {
+            const fixture = contract2RuntimeFixture();
+            fixture.container.inspect.Config.Labels['example.prior'] = 'retained';
+            const harness = createSupervisorHarness({
+                ...fixture,
+                failures: entry.failures,
+                rmFailureRemovesContainer: entry.rmFailureRemovesContainer,
+            });
+            assert.equal(await harness.supervisor.run(['--port', '19191', 'list']), 1);
+            assert.ok(harness.state.container);
+            assert.equal(harness.state.container.inspect.Image, fixture.container.inspect.Image);
+            assert.equal(harness.state.container.inspect.State.Status, 'running');
+            assert.equal(
+                harness.state.container.inspect.Config.Labels['example.prior'],
+                'retained',
+            );
+            assert.deepEqual(
+                harness.state.container.inspect.HostConfig.PortBindings['8080/tcp'],
+                [{ HostIp: '127.0.0.1', HostPort: '8080' }],
+            );
+            assert.match(harness.stderr, /previous runtime restored/);
+        });
+    }
+});
+
+test('failed initial run removes a partially created box and its anonymous volumes', async () => {
+    const harness = createSupervisorHarness({
+        failures: { 'run create': 29 },
+        createFailureCreatesContainer: true,
+    });
+    assert.equal(await harness.supervisor.run(['list', 'agents']), 29);
+    assert.equal(harness.state.container, null);
+    assert.equal(harness.state.anonymousVolumes.size, 0);
+    assert.equal(runCalls(harness, 'rm').length, 1);
+    assert.ok(runCalls(harness, 'rm')[0].args.includes('--volumes'));
+    for (const name of Object.values(runtimeVolumeNames(identityFor().instance))) {
+        assert.equal(harness.state.volumes.has(name), true, name);
+    }
+});
+
+test('destroy directly removes only the outer box, cleans anonymous volumes, and retains named volumes', async () => {
+    const fixture = contract2RuntimeFixture();
+    const labelsBefore = structuredClone(fixture.volumes);
+    const harness = createSupervisorHarness({
+        ...fixture,
+        anonymousVolumes: ['anonymous-image-volume'],
+        answer: 'y',
+    });
+    assert.equal(await harness.supervisor.run(['destroy']), 0);
+    assert.match(harness.prompt, new RegExp(fixture.identity.instance));
+    assert.match(harness.prompt, /named volumes.*retained/i);
+    const rms = runCalls(harness, 'rm');
+    assert.equal(rms.length, 1);
+    assert.deepEqual(rms[0].args, ['rm', '-f', '--volumes', fixture.identity.instance]);
+    assert.equal(runCalls(harness, 'stop').length, 0);
+    assert.equal(runCalls(harness, 'exec').length, 0);
+    assert.equal(harness.calls.some(call => call.kind === 'run' && call.args[0] === 'volume' && call.args[1] === 'rm'), false);
+    assert.equal(harness.state.container, null);
+    assert.equal(harness.state.anonymousVolumes.size, 0);
+    assert.deepEqual(Object.fromEntries(harness.state.volumes), labelsBefore);
+});
+
+test('destroy refusal mutates nothing', async () => {
+    const fixture = contract2RuntimeFixture();
+    const harness = createSupervisorHarness({ ...fixture, answer: 'no' });
+    assert.equal(await harness.supervisor.run(['destroy']), 1);
+    assert.ok(harness.state.container);
+    assert.equal(mutationCalls(harness).length, 0);
+});
+
+test('foreign retained resources block destroy before confirmation or mutation', async () => {
+    const identity = identityFor();
+    const names = runtimeVolumeNames(identity.instance);
+    const podman = createFakeEngine({
+        engine: 'podman',
+        volumes: { [names.workspace]: { Name: names.workspace, Labels: {} } },
+    });
+    const stdout = writableBuffer();
+    const stderr = writableBuffer();
+    let prompts = 0;
+    const supervisor = createRuntimeSupervisor({
+        stdout: stdout.stream,
+        stderr: stderr.stream,
+        stdin: { isTTY: false },
+        cwd: '/workspace/demo',
+        realpath: value => path.resolve(value),
+        env: {},
+        installedEngines: ['podman'],
+        engineClients: { podman: podman.engineClient },
+        askLine: async () => { prompts += 1; return 'y'; },
+    });
+    assert.equal(await runSupervisorWithBoundary(supervisor, ['destroy'], stderr.stream), 1);
+    assert.equal(prompts, 0);
+    assert.equal(mutationCalls(podman).length, 0);
+});
+
+test('destroy is idempotent with a missing box and retained volumes', async () => {
+    const fixture = contract2RuntimeFixture();
+    const harness = createSupervisorHarness({ container: null, volumes: fixture.volumes, answer: 'y' });
+    assert.equal(await harness.supervisor.run(['destroy']), 0);
+    assert.equal(harness.prompt, '');
+    assert.match(harness.stdout, /already absent.*retained named volumes/i);
+    assert.equal(mutationCalls(harness).length, 0);
+});
+
+test('retained named volumes are reattached on recreation', async () => {
+    const fixture = contract2RuntimeFixture();
+    const harness = createSupervisorHarness({ ...fixture, answer: 'y' });
+    assert.equal(await harness.supervisor.run(['destroy']), 0);
+    assert.equal(await harness.supervisor.run(['list', 'agents']), 0);
+    const create = runCalls(harness, 'run').at(-1);
+    for (const name of Object.values(runtimeVolumeNames(fixture.identity.instance))) {
+        assert.ok(create.args.some(value => value.startsWith(`${name}:`)), name);
+        assert.equal(harness.state.volumes.has(name), true);
+    }
+});
+
+test('bare ploinky opens p-cli and parameterless cli opens the in-box Bash route', async () => {
+    const fixture = contract2RuntimeFixture();
+    const bare = createSupervisorHarness({ ...fixture, stdoutIsTTY: true });
+    assert.equal(await bare.supervisor.run([]), 0);
+    const bareExec = runCalls(bare, 'exec').at(-1).args;
+    assert.ok(bareExec.includes('-it'));
+    assert.equal(bareExec.at(-1), 'p-cli');
+
+    const cli = createSupervisorHarness({ ...fixture, stdoutIsTTY: true });
+    assert.equal(await cli.supervisor.run(['cli']), 0);
+    const cliExec = runCalls(cli, 'exec').at(-1).args;
+    assert.deepEqual(cliExec.slice(-2), ['ploinky', 'cli']);
+});
+
+test('parameterless cli fails locally without a TTY', async () => {
+    const harness = createSupervisorHarness();
+    assert.equal(await harness.supervisor.run(['cli']), 1);
+    assert.match(harness.stderr, /interactive terminal/);
+    assert.equal(harness.calls.length, 0);
+});
+
+test('authoritative publication plan produces the core coverage contract', () => {
+    const invocation = invocationFor();
+    const plan = {
+        schemaVersion: 1,
+        operation: 'start',
+        explicitPublishes: [],
+        generatedPublishes: ['127.0.0.1:9000:9000/udp', '9100-9102:9100-9102'],
+        publishes: ['127.0.0.1:9000:9000/udp', '9100-9102:9100-9102'],
+    };
+    applyAuthoritativePublicationPlan(invocation, plan);
+    assert.deepEqual(invocation._generatedPublishes, plan.generatedPublishes);
+    assert.deepEqual(publicationContractForPlan(plan), {
+        schemaVersion: 1,
+        targets: [
+            { start: 9000, end: 9000, protocol: 'udp' },
+            { start: 9100, end: 9102, protocol: 'tcp' },
+        ],
+        publishes: plan.publishes,
+    });
+    assert.throws(
+        () => applyAuthoritativePublicationPlan({}, { schemaVersion: 2 }),
+        /schemaVersion/,
+    );
+
+    const forged = {
+        ...plan,
+        outerPublicationContract: {
+            schemaVersion: 1,
+            targets: [{ start: 65535, end: 65535, protocol: 'tcp' }],
+            publishes: ['65535:65535'],
+        },
+    };
+    assert.deepEqual(publicationContractForPlan(forged), publicationContractForPlan(plan));
+});
+
+test('core forwarding includes the authoritative publication contract environment', () => {
+    const fake = createFakeEngine();
+    const invocation = invocationFor();
+    invocation._outerPublicationContract = {
+        schemaVersion: 1,
+        targets: [{ start: 9000, end: 9000, protocol: 'tcp' }],
+        publishes: ['9000:9000'],
+    };
+    assert.equal(forwardCoreCommand({
+        invocation,
+        runtime: { instance: invocation.instance },
+        engine: fake.engineClient,
+        stdin: { isTTY: false },
+        stdout: { isTTY: false },
+    }, ['start', 'agent']), 0);
+    const exec = mutationCalls(fake).at(-1).args;
+    assert.ok(exec.includes(
+        `PLOINKY_OUTER_PUBLICATION_CONTRACT=${JSON.stringify(invocation._outerPublicationContract)}`,
+    ));
+});
+
+test('injected start planner result is merged before create and forwarded to core', async () => {
+    const requests = [];
+    const harness = createSupervisorHarness({
+        preparePublicationPlan: async request => {
+            requests.push(request);
+            return {
+                schemaVersion: 1,
+                operation: 'start',
+                explicitPublishes: [],
+                generatedPublishes: ['127.0.0.1:9000:9000'],
+                publishes: ['127.0.0.1:9000:9000'],
+            };
+        },
+        fetchResponse: { ok: true },
+    });
+    assert.equal(await harness.supervisor.run(['start', 'explorer']), 0);
+    assert.equal(requests.length, 1);
+    assert.equal(requests[0].operation, 'start');
+    const create = runCalls(harness, 'run')[0].args;
+    assert.ok(create.includes('127.0.0.1:9000:9000'));
+    const exec = runCalls(harness, 'exec').at(-1).args;
+    assert.ok(exec.some(value => value.startsWith('PLOINKY_OUTER_PUBLICATION_CONTRACT=')));
+});
+
+test('production planner executes in a compatible running box without pull or temporary container', async () => {
+    const fixture = contract2RuntimeFixture();
+    const harness = createSupervisorHarness({
+        ...fixture,
+        useProductionPlanner: true,
+        fetchResponse: { ok: true },
+    });
+    assert.equal(await harness.supervisor.run(['start', 'explorer']), 0);
+    const captures = harness.calls.filter(call => call.kind === 'capture');
+    assert.equal(captures.length, 1);
+    assert.deepEqual(captures[0].args.slice(0, 6), [
+        'exec', '-i', '-w', '/workspace', fixture.identity.instance, 'node',
+    ]);
+    assert.equal(captures[0].args.at(-1), '/opt/ploinky/container/box-start-publish-plan.mjs');
+    assert.equal(runCalls(harness, 'pull').length, 0);
+    assert.equal(runCalls(harness, 'rm').length, 0);
+    assert.equal(harness.state.temporaryContainers.size, 0);
+});
+
+test('production planner uses and cleans a short-lived container for a stopped box without starting it first', async () => {
+    const fixture = contract2RuntimeFixture({ state: 'exited' });
+    const harness = createSupervisorHarness({
+        ...fixture,
+        useProductionPlanner: true,
+        fetchResponse: { ok: true },
+    });
+    assert.equal(await harness.supervisor.run(['start', 'explorer']), 0);
+    const captureIndex = harness.calls.findIndex(call => call.kind === 'capture');
+    const startIndex = harness.calls.findIndex(call => call.kind === 'run' && call.args[0] === 'start');
+    assert.ok(captureIndex >= 0 && startIndex > captureIndex);
+    const capture = harness.calls[captureIndex];
+    assert.equal(capture.args[0], 'run');
+    assert.equal(capture.args[1], '-i');
+    assert.ok(capture.args.includes(fixture.container.inspect.Image));
+    assert.match(capture.args[capture.args.indexOf('--name') + 1], /-planner-/);
+    assert.equal(runCalls(harness, 'pull').length, 0);
+    assert.equal(runCalls(harness, 'rm').length, 1);
+    assert.equal(harness.state.temporaryContainers.size, 0);
+});
+
+test('first-use production planning pulls once, pins one image ID, and retains deterministic volumes', async () => {
+    const harness = createSupervisorHarness({
+        useProductionPlanner: true,
+        fetchResponse: { ok: true },
+    });
+    assert.equal(await harness.supervisor.run(['start', 'explorer']), 0);
+    const pullCalls = runCalls(harness, 'pull');
+    const captures = harness.calls.filter(call => call.kind === 'capture');
+    const creates = runCalls(harness, 'run');
+    assert.equal(pullCalls.length, 1);
+    assert.equal(captures.length, 1);
+    assert.equal(captures[0].args[0], 'run');
+    assert.equal(captures[0].args[1], '-i');
+    assert.ok(captures[0].args.includes('sha256:runtime-2'));
+    assert.equal(creates.length, 1);
+    assert.equal(creates[0].args.at(-1), 'sha256:runtime-2');
+    assert.equal(harness.state.temporaryContainers.size, 0);
+    for (const name of Object.values(runtimeVolumeNames(identityFor().instance))) {
+        assert.equal(harness.state.volumes.has(name), true, name);
+    }
+    const pullIndex = harness.calls.indexOf(pullCalls[0]);
+    const plannerIndex = harness.calls.indexOf(captures[0]);
+    const createIndex = harness.calls.indexOf(creates[0]);
+    assert.ok(pullIndex < plannerIndex && plannerIndex < createIndex);
+});
+
+test('planner failure cleans its temporary container, preserves named state, and starts no runtime', async () => {
+    const identity = identityFor();
+    const names = runtimeVolumeNames(identity.instance);
+    const harness = createSupervisorHarness({
+        useProductionPlanner: true,
+        failures: { 'capture planner': 23 },
+    });
+    assert.equal(await harness.supervisor.run(['start', 'explorer']), 1);
+    assert.match(harness.stderr, /publication planner.*failed/);
+    assert.equal(harness.state.container, null);
+    assert.equal(harness.state.temporaryContainers.size, 0);
+    assert.equal(runCalls(harness, 'run').length, 0);
+    assert.deepEqual([...harness.state.volumes.keys()], [names.workspace]);
+});
+
+test('planner timeout preserves running, stopped, and missing managed-box state and cleans temporary containers', async t => {
+    const cases = [
+        { name: 'running', fixture: contract2RuntimeFixture() },
+        { name: 'stopped', fixture: contract2RuntimeFixture({ state: 'exited' }) },
+        { name: 'missing', fixture: {} },
+    ];
+    for (const entry of cases) {
+        await t.test(entry.name, async () => {
+            const harness = createSupervisorHarness({
+                ...entry.fixture,
+                useProductionPlanner: true,
+                plannerCapture: async () => ({
+                    ok: false,
+                    status: 137,
+                    stdout: '',
+                    stderr: '',
+                    error: null,
+                    signal: 'SIGKILL',
+                    timedOut: true,
+                    overflow: false,
+                }),
+            });
+            const before = harness.state.container
+                ? structuredClone(harness.state.container.inspect)
+                : null;
+            assert.equal(await harness.supervisor.run(['start', 'explorer']), 1);
+            assert.match(harness.stderr, /timed out/);
+            assert.deepEqual(harness.state.container?.inspect || null, before);
+            assert.equal(harness.state.temporaryContainers.size, 0);
+            assert.equal(runCalls(harness, 'run').length, 0);
+            assert.equal(runCalls(harness, 'start').length, 0);
+            assert.equal(runCalls(harness, 'stop').length, 0);
+            assert.equal(runCalls(harness, 'pull').length, entry.name === 'missing' ? 1 : 0);
+            if (entry.name === 'missing') {
+                assert.deepEqual(
+                    [...harness.state.volumes.keys()],
+                    [runtimeVolumeNames(identityFor().instance).workspace],
+                );
+            }
+        });
+    }
+});
+
+test('signal-terminated planner execution still cleans its temporary container and preserves the stopped box', async () => {
+    const fixture = contract2RuntimeFixture({ state: 'exited' });
+    const harness = createSupervisorHarness({
+        ...fixture,
+        useProductionPlanner: true,
+        plannerCapture: async () => ({
+            ok: false,
+            status: 143,
+            stdout: '',
+            stderr: '',
+            error: null,
+            signal: 'SIGTERM',
+            timedOut: false,
+            overflow: false,
+        }),
+    });
+    assert.equal(await harness.supervisor.run(['start', 'explorer']), 1);
+    assert.match(harness.stderr, /SIGTERM|exit 143/);
+    assert.equal(harness.state.container.inspect.State.Status, 'exited');
+    assert.equal(harness.state.temporaryContainers.size, 0);
+    assert.equal(runCalls(harness, 'start').length, 0);
+    assert.equal(runCalls(harness, 'pull').length, 0);
+});
+
+test('temporary planner cleanup failure is fatal and does not create the managed box', async () => {
+    const harness = createSupervisorHarness({
+        useProductionPlanner: true,
+        failures: { 'rm planner': 19 },
+    });
+    assert.equal(await harness.supervisor.run(['start', 'explorer']), 1);
+    assert.match(harness.stderr, /failed to remove temporary publication planner/);
+    assert.equal(runCalls(harness, 'run').length, 0);
+    assert.equal(harness.state.container, null);
+    assert.equal(harness.state.temporaryContainers.size, 1);
+});
+
+test('planned replacement retains exact explicit provenance and replaces stale generated publications', async () => {
+    const oldExplicit = '127.0.0.1:19000:9000/udp';
+    const oldGenerated = '127.0.0.1:19100:9100';
+    const nextGenerated = '127.0.0.1:19200:9200';
+    const fixture = contract2RuntimeFixture({
+        labels: {
+            [EXPLICIT_PUBLISHES_LABEL]: JSON.stringify([oldExplicit]),
+            [GENERATED_PUBLISHES_LABEL]: JSON.stringify([oldGenerated]),
+        },
+        publishes: {
+            '9000/udp': [{ HostIp: '127.0.0.1', HostPort: '19000' }],
+            '9100/tcp': [{ HostIp: '127.0.0.1', HostPort: '19100' }],
+        },
+    });
+    const requests = [];
+    const harness = createSupervisorHarness({
+        ...fixture,
+        preparePublicationPlan: async request => {
+            requests.push(request);
+            return {
+                schemaVersion: 1,
+                operation: request.operation,
+                explicitPublishes: request.explicitPublishes,
+                generatedPublishes: [nextGenerated],
+                publishes: [...request.explicitPublishes, nextGenerated],
+            };
+        },
+    });
+    assert.equal(await harness.supervisor.run(['enable', 'explorer']), 0);
+    assert.deepEqual(requests[0].explicitPublishes, [oldExplicit]);
+    const replacement = runCalls(harness, 'run').at(-1).args;
+    assert.ok(replacement.includes(oldExplicit));
+    assert.ok(replacement.includes(nextGenerated));
+    assert.equal(replacement.includes(oldGenerated), false);
+    assert.ok(replacement.includes(
+        `${EXPLICIT_PUBLISHES_LABEL}=${JSON.stringify([oldExplicit])}`,
+    ));
+    assert.ok(replacement.includes(
+        `${GENERATED_PUBLISHES_LABEL}=${JSON.stringify([nextGenerated])}`,
+    ));
+});
+
+test('inspect-expanded, reordered, wildcard, and ephemeral bindings do not cause perpetual replacement', async () => {
+    const explicit = [
+        '9100:9100',
+        '9000:9000',
+        '127.0.0.1::9200/udp',
+    ];
+    const generated = [
+        '127.0.0.1:20000-20002:20000-20002/udp',
+        '127.0.0.1:20000-20002:20000-20002/tcp',
+    ];
+    const publishes = {
+        '9000/tcp': [{ HostIp: '', HostPort: '9000' }],
+        '9100/tcp': [{ HostIp: '0.0.0.0', HostPort: '9100' }],
+        '9200/udp': [{ HostIp: '127.0.0.1', HostPort: '49152' }],
+    };
+    for (const protocol of ['udp', 'tcp']) {
+        for (let port = 20000; port <= 20002; port += 1) {
+            publishes[`${port}/${protocol}`] = [{
+                HostIp: '127.0.0.1',
+                HostPort: String(port),
+            }];
+        }
+    }
+    const fixture = contract2RuntimeFixture({
+        labels: {
+            [EXPLICIT_PUBLISHES_LABEL]: JSON.stringify(explicit),
+            [GENERATED_PUBLISHES_LABEL]: JSON.stringify(generated),
+        },
+        publishes,
+    });
+    const harness = createSupervisorHarness(fixture);
+    assert.equal(await harness.supervisor.run(['list', 'agents']), 0);
+    assert.equal(runCalls(harness, 'pull').length, 0);
+    assert.equal(runCalls(harness, 'run').length, 0);
+    assert.equal(runCalls(harness, 'stop').length, 0);
+});
+
+test('contract-2 boxes without publication provenance fail closed before planning or mutation', async () => {
+    const fixture = contract2RuntimeFixture();
+    delete fixture.container.inspect.Config.Labels[PUBLISH_PLAN_VERSION_LABEL];
+    let plannerCalls = 0;
+    const harness = createSupervisorHarness({
+        ...fixture,
+        preparePublicationPlan: async () => { plannerCalls += 1; },
+    });
+    assert.equal(await harness.supervisor.run(['start', 'explorer']), 1);
+    assert.match(harness.stderr, /publish-plan-version.*destroy/);
+    assert.equal(plannerCalls, 0);
+    assert.equal(mutationCalls(harness).length, 0);
+});
+
+test('every host route capable of starting an agent invokes the planner before forwarding', async t => {
+    const cases = [
+        { argv: ['start', 'explorer'], operation: 'start', root: 'explorer' },
+        { argv: ['start'], operation: 'start', root: undefined },
+        { argv: ['enable', 'explorer'], operation: 'enable', root: 'explorer' },
+        { argv: ['cli', 'explorer'], operation: 'cli', root: 'explorer' },
+        { argv: ['shell', 'explorer'], operation: 'shell', root: 'explorer' },
+        { argv: ['restart', 'explorer'], operation: 'restart', root: 'explorer' },
+        { argv: ['restart', 'router'], operation: 'restart', root: undefined },
+        { argv: ['reinstall', 'agent', 'explorer'], operation: 'reinstall', root: 'explorer' },
+    ];
+    for (const entry of cases) {
+        await t.test(entry.argv.join(' '), async () => {
+            const fixture = contract2RuntimeFixture();
+            const requests = [];
+            let harness;
+            harness = createSupervisorHarness({
+                ...fixture,
+                fetchResponse: { ok: true },
+                preparePublicationPlan: async request => {
+                    requests.push(request);
+                    harness.calls.push({ kind: 'planner', args: [], options: {} });
+                    return {
+                        schemaVersion: 1,
+                        operation: request.operation,
+                        explicitPublishes: request.explicitPublishes,
+                        generatedPublishes: [],
+                        publishes: request.explicitPublishes,
+                    };
+                },
+            });
+            assert.equal(await harness.supervisor.run(entry.argv), 0);
+            assert.equal(requests.length, 1);
+            assert.equal(requests[0].operation, entry.operation);
+            assert.equal(requests[0].root, entry.root);
+            const plannerIndex = harness.calls.findIndex(call => call.kind === 'planner');
+            const forwardIndex = harness.calls.findIndex(call =>
+                call.kind === 'run' && call.args.includes('ploinky')
+            );
+            assert.ok(plannerIndex >= 0 && forwardIndex > plannerIndex);
+        });
+    }
+});
+
+test('master key is inherited only by in-box execs and never persisted or placed in argv', async () => {
+    const secret = 'test-master-key-never-log-this';
+    const harness = createSupervisorHarness({ env: { PLOINKY_MASTER_KEY: secret } });
+    assert.equal(await harness.supervisor.run(['list', 'agents']), 0);
+    const exec = runCalls(harness, 'exec').at(-1);
+    assert.ok(exec.args.includes('PLOINKY_MASTER_KEY'));
+    assert.equal(exec.args.some(value => String(value).includes(secret)), false);
+    assert.equal(exec.options.env.PLOINKY_MASTER_KEY, secret);
+    assert.equal(
+        harness.state.container.inspect.Config.Env.some(value => value.includes('PLOINKY_MASTER_KEY')),
+        false,
+    );
+    assert.equal(JSON.stringify(harness.state.container.inspect).includes(secret), false);
+    assert.equal(harness.stdout.includes(secret), false);
+    assert.equal(harness.stderr.includes(secret), false);
+});
+
+test('the host walked-up .env master key preserves core resolution without entering argv', async t => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-box-master-env-'));
+    const child = path.join(root, 'nested', 'workspace');
+    const secret = 'walked-up-master-key';
+    fs.mkdirSync(child, { recursive: true });
+    fs.writeFileSync(path.join(root, '.env'), `PLOINKY_MASTER_KEY=${secret}\n`);
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+    const harness = createSupervisorHarness({ cwd: child });
+    assert.equal(await harness.supervisor.run(['list', 'agents']), 0);
+    const exec = runCalls(harness, 'exec').at(-1);
+    assert.ok(exec.args.includes('PLOINKY_MASTER_KEY'));
+    assert.equal(exec.args.some(value => String(value).includes(secret)), false);
+    assert.equal(exec.options.env.PLOINKY_MASTER_KEY, secret);
+    assert.equal(JSON.stringify(harness.state.container.inspect).includes(secret), false);
+});
+
+test('status, stop, and replacement shutdown inherit the master key without exposing its value in argv', async t => {
+    for (const argv of [['status'], ['stop'], ['--port', '9192', 'list']]) {
+        await t.test(argv.join(' '), async () => {
+            const secret = `secret-${argv.at(-1)}`;
+            const fixture = contract2RuntimeFixture();
+            const harness = createSupervisorHarness({
+                ...fixture,
+                env: { PLOINKY_MASTER_KEY: secret },
+            });
+            await harness.supervisor.run(argv);
+            const relevant = runCalls(harness, 'exec').filter(call =>
+                call.args.includes('status') || call.args.includes('stop')
+            );
+            assert.ok(relevant.length >= 1);
+            for (const call of relevant) {
+                assert.ok(call.args.includes('PLOINKY_MASTER_KEY'));
+                assert.equal(call.args.some(value => String(value).includes(secret)), false);
+                assert.equal(call.options.env.PLOINKY_MASTER_KEY, secret);
+            }
+        });
+    }
+});
+
+test('engine query and run seams pass planner stdin and environment', () => {
+    const calls = [];
+    const client = createEngineClient({
+        name: 'podman',
+        spawnSyncImpl(command, args, options) {
+            calls.push({ command, args, options });
+            return { status: 0, stdout: '{}', stderr: '' };
+        },
+    });
+    assert.equal(client.query(['exec', 'planner'], {
+        input: '{"schemaVersion":1}',
+        env: { TEST_ENV: 'query' },
+    }).ok, true);
+    assert.equal(client.run(['run', 'planner'], {
+        input: '{"schemaVersion":1}',
+        env: { TEST_ENV: 'run' },
+        silence: 'all',
+    }), 0);
+    assert.equal(calls[0].options.input, '{"schemaVersion":1}');
+    assert.deepEqual(calls[0].options.env, { TEST_ENV: 'query' });
+    assert.equal(calls[1].options.input, '{"schemaVersion":1}');
+    assert.deepEqual(calls[1].options.env, { TEST_ENV: 'run' });
+});
+
+test('engine capture bounds planner stdin, output, and execution time', async () => {
+    const client = createEngineClient({ name: process.execPath });
+    const success = await client.capture([
+        '--input-type=module',
+        '-e',
+        "let value=''; process.stdin.setEncoding('utf8'); process.stdin.on('data', chunk => value += chunk); process.stdin.on('end', () => process.stdout.write(process.env.CAPTURE_TOKEN + ':' + value));",
+    ], {
+        input: 'request-json',
+        env: { ...process.env, CAPTURE_TOKEN: 'inherited' },
+        timeoutMs: 1000,
+        maxBuffer: 1024,
+    });
+    assert.equal(success.ok, true);
+    assert.equal(success.stdout, 'inherited:request-json');
+
+    const overflow = await client.capture([
+        '-e',
+        "process.stdout.write('x'.repeat(4096));",
+    ], { timeoutMs: 1000, maxBuffer: 64 });
+    assert.equal(overflow.ok, false);
+    assert.equal(overflow.overflow, true);
+    assert.ok(Buffer.byteLength(overflow.stdout) <= 64);
+
+    const timeout = await client.capture([
+        '-e',
+        'setInterval(() => {}, 1000);',
+    ], { timeoutMs: 20, maxBuffer: 1024 });
+    assert.equal(timeout.ok, false);
+    assert.equal(timeout.timedOut, true);
+});
+
+test('host launcher and aliases route through the supervisor, including symlinks', async t => {
+    const cases = [
+        { name: 'ploinky', executable: PLOINKY, args: ['status', '--dry-run'], expected: [SUPERVISOR, 'status', '--dry-run'] },
+        { name: 'p-cli', executable: PCLI, args: ['status'], expected: [SUPERVISOR, 'status'] },
+        { name: 'psh', executable: PSH, args: ['--trace'], expected: [SUPERVISOR, 'sh', '--trace'] },
+    ];
+    for (const scenario of cases) {
+        await t.test(scenario.name, () => {
+            const fake = makeFakeNodeCapture();
+            const links = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-launch-link-'));
+            const link = path.join(links, scenario.name);
+            try {
+                fs.symlinkSync(scenario.executable, link);
+                const result = spawnSync(link, scenario.args, {
+                    encoding: 'utf8',
+                    env: {
+                        ...process.env,
+                        PATH: `${fake.dir}:${process.env.PATH || ''}`,
+                        CAPTURE_FILE: fake.capture,
+                    },
+                });
+                assert.equal(result.status, 0, `${result.stdout}${result.stderr}`);
+                assert.deepEqual(capturedArgv(fake.capture), scenario.expected);
+            } finally {
+                fs.rmSync(fake.dir, { recursive: true, force: true });
+                fs.rmSync(links, { recursive: true, force: true });
+            }
+        });
+    }
+});
+
+test('wrapper marker and source mount contracts remain explicit', () => {
+    const launcher = fs.readFileSync(PLOINKY, 'utf8');
+    assert.match(launcher, /-f \/etc\/ploinky-box/);
+    assert.match(launcher, /PLOINKY_WORKSPACE_ROOT.*\/workspace/);
+    assert.match(launcher, /exec node "\$ROOT_DIR\/container\/runtime-supervisor\.mjs"/);
+
+    const invocation = invocationFor();
+    const config = createDefaultRuntimeConfig(invocation);
+    config.imageId = 'sha256:validated';
+    const args = buildRuntimeRunArgs(config, { engine: 'podman' });
+    assert.ok(args.includes(`${invocation.sourceDirResolved}:/opt/ploinky:ro`));
+    assert.equal(args.some(value => value.includes('/etc/ploinky-box')), false);
+    assert.equal(args.some(value => value.startsWith('PLOINKY_BOX=')), false);
+});
+
+test('dependency installer remains syntactically valid and read-only-source safe', () => {
+    const result = spawnSync('bash', ['-n', INSTALL_DEPS], { encoding: 'utf8' });
+    assert.equal(result.status, 0, result.stderr);
+    const source = fs.readFileSync(INSTALL_DEPS, 'utf8');
+    assert.match(source, /--no-package-lock/);
+    assert.match(source, /--no-audit/);
+    assert.match(source, /--no-fund/);
+    assert.match(source, /still missing after npm install/);
+});
+
+test('dependency consent honors environment opt-in and TTY confirmation only', () => {
     assert.equal(shouldInstallDeps({ PLOINKY_BOX_INSTALL_DEPS: '1' }, false, null), true);
     assert.equal(shouldInstallDeps({}, true, 'y'), true);
     assert.equal(shouldInstallDeps({}, true, 'Y'), true);
     assert.equal(shouldInstallDeps({}, true, 'n'), false);
-    assert.equal(shouldInstallDeps({}, true, ''), false);
-    assert.equal(shouldInstallDeps({}, true, null), false);
-    assert.equal(shouldInstallDeps({}, false, 'y'), false); // non-TTY never installs from a piped reply
+    assert.equal(shouldInstallDeps({}, false, 'y'), false);
 });
 
-test('dependency flow source contract: fatal public decline, docker chown is mandatory', () => {
-    const source = fs.readFileSync(MJS, 'utf8');
-    checkIncludes(source, 'export async function reconcileRuntime(',
-        'the automatic runtime capability owns dependency preparation');
-    checkIncludes(source, "throw new SupervisorError('Ploinky dependencies are required before running this command')",
-        'declined public commands throw through the shared boundary');
-    checkIncludes(source, 'const runtime = await reconcileRuntime(invocation, {',
-        'ordinary public commands require dependencies before forwarding');
-    checkAbsent(source, 'process.exit(', 'helper-level process exits are removed');
-    checkAbsent(source, "chown', 'podman:podman', '/opt/ploinky/node_modules'], { allowFail: true",
-        'docker deps chown failures are not ignored');
+test('missing dependencies fail noninteractive commands before core exec', async () => {
+    const fixture = contract2RuntimeFixture();
+    fixture.container.depsInstalled = false;
+    const harness = createSupervisorHarness(fixture);
+    assert.equal(await harness.supervisor.run(['list', 'agents']), 1);
+    assert.match(harness.stderr, /until dependencies are installed/i);
+    assert.equal(runCalls(harness, 'exec').length, 0);
 });
 
-test('automatic runtime preparation exits nonzero when dependency install is declined noninteractively', () => {
-    const fake = makeFakePodmanForMissingDeps();
-    try {
-        const r = spawnSync(MJS, ['--name', 'qa', '--port', '18349', 'list', 'agents'], {
-            encoding: 'utf8',
-            env: {
-                ...process.env,
-                PATH: `${fake.dir}:${process.env.PATH || ''}`,
-                PLOINKY_BOX_ENGINE: 'podman',
-                PLOINKY_BOX_INSTALL_DEPS: '',
-            },
-            input: '',
+test('dependency environment opt-in and TTY approval run the in-box installer', async t => {
+    for (const scenario of [
+        { name: 'environment', env: { PLOINKY_BOX_INSTALL_DEPS: '1' }, stdoutIsTTY: false },
+        { name: 'TTY prompt', env: {}, stdoutIsTTY: true, answer: 'y' },
+    ]) {
+        await t.test(scenario.name, async () => {
+            const fixture = contract2RuntimeFixture();
+            fixture.container.depsInstalled = false;
+            const harness = createSupervisorHarness({ ...fixture, ...scenario });
+            assert.equal(await harness.supervisor.run(['list']), 0);
+            const install = runCalls(harness, 'exec').find(call =>
+                call.args.includes('/opt/ploinky/bin/ploinky-install-deps')
+            );
+            assert.ok(install);
+            if (scenario.stdoutIsTTY) assert.match(harness.prompt, /Install them now/);
         });
-        const out = `${r.stdout ?? ''}${r.stderr ?? ''}`;
-        assert.equal(r.status, 1, out);
-        checkIncludes(out, 'WARNING: Ploinky cannot run until dependencies are installed.', 'declined deps warning is emitted');
-        const calls = fs.readFileSync(fake.calls, 'utf8');
-        checkAbsent(calls, '/opt/ploinky/bin/ploinky-install-deps', 'decline must not run the installer');
-    } finally {
-        fs.rmSync(fake.dir, { recursive: true, force: true });
     }
 });
 
-test('buildRuntimeRunArgs: mount is appended only when set, before the image', () => {
-    const cfg = parseHostInvocation(['--mount', '/tmp'], {});
-    cfg.mountDirResolved = '/tmp';
-    const args = buildArgsForInvocation(cfg, { selinux: false });
-    const mountIndex = args.indexOf('/tmp:/workspace/mounted');
-    assert.equal(args[mountIndex - 1], '-v');
-    assert.ok(mountIndex < args.indexOf('-e'));
-    assert.ok(mountIndex < args.length - 1);
+test('Docker fixes dependency-volume ownership while Podman relies on :U', async () => {
+    const dockerFixture = contract2RuntimeFixture({ engine: 'docker' });
+    const docker = createSupervisorHarness({ ...dockerFixture, engine: 'docker' });
+    assert.equal(await docker.supervisor.run(['list']), 0);
+    assert.ok(runCalls(docker, 'exec').some(call =>
+        call.args.includes('--user')
+        && call.args.includes('root')
+        && call.args.includes('chown')
+        && call.args.includes('/opt/ploinky/node_modules')
+    ));
+
+    const podmanFixture = contract2RuntimeFixture({ engine: 'podman' });
+    const podman = createSupervisorHarness({ ...podmanFixture, engine: 'podman' });
+    assert.equal(await podman.supervisor.run(['list']), 0);
+    assert.equal(runCalls(podman, 'exec').some(call => call.args.includes('chown')), false);
+    const config = createDefaultRuntimeConfig(invocationFor());
+    assert.ok(buildRuntimeRunArgs(config, { engine: 'podman' })
+        .includes(`${config.volumes.deps}:/opt/ploinky/node_modules:U`));
+    assert.ok(buildRuntimeRunArgs(config, { engine: 'docker' })
+        .includes(`${config.volumes.deps}:/opt/ploinky/node_modules`));
 });
 
-test('bin/ploinky bash syntax and single-entry contract', () => {
-    const r = spawnSync('bash', ['-n', PLOINKY], { encoding: 'utf8' });
-    assert.equal(r.status, 0, r.stderr);
-    const entry = fs.readFileSync(PLOINKY, 'utf8');
-    assert.ok(entry.includes('/etc/ploinky-box'), 'entry routes on the image marker file');
-    assert.ok(entry.includes('PLOINKY_WORKSPACE_ROOT'), 'entry supports older images that lack the marker file');
-    assert.ok(entry.includes('/opt/ploinky'), 'entry limits marker fallback to the mounted box source path');
-    assert.ok(entry.includes('Ploinky dependencies are not installed. Install them now? [y/N]'), 'entry carries the confirm prompt');
-    assert.ok(entry.includes('Ploinky cannot run until dependencies are installed.'), 'entry carries the decline warning');
-    assert.ok(entry.includes('ploinky-install-deps'), 'entry points at the installer');
-    assert.ok(entry.includes('cli/index.js'), 'in-box branch execs the CLI');
-    assert.ok(!entry.includes('PLOINKY_DIRECT'), 'PLOINKY_DIRECT is gone');
-    assert.ok(!entry.includes('PLOINKY_BOX'), 'PLOINKY_BOX routing is gone');
-    assert.ok(!entry.includes('ploinky-direct'), 'ploinky-direct is gone');
+test('interactive exec preserves TTY and non-TTY behavior for cli and shell routes', async () => {
+    const fixture = contract2RuntimeFixture();
+    const tty = createSupervisorHarness({ ...fixture, stdoutIsTTY: true });
+    assert.equal(await tty.supervisor.run(['cli', 'agent', '--field', 'value']), 0);
+    const ttyExec = runCalls(tty, 'exec').at(-1).args;
+    assert.ok(ttyExec.includes('-it'));
+    assert.equal(ttyExec.includes('PLOINKY_NO_TTY=1'), false);
+
+    const nonTty = createSupervisorHarness(fixture);
+    assert.equal(await nonTty.supervisor.run(['cli', 'agent']), 0);
+    const nonTtyExec = runCalls(nonTty, 'exec').at(-1).args;
+    assert.ok(nonTtyExec.includes('-i'));
+    assert.ok(nonTtyExec.includes('PLOINKY_NO_TTY=1'));
+
+    const shell = createSupervisorHarness(fixture);
+    assert.equal(await shell.supervisor.run(['sh']), 0);
+    assert.ok(runCalls(shell, 'exec').at(-1).args.includes('-i'));
+
+    const agentShell = createSupervisorHarness(fixture);
+    assert.equal(await agentShell.supervisor.run(['shell', 'agent']), 0);
+    const agentShellExec = runCalls(agentShell, 'exec').at(-1).args;
+    assert.ok(agentShellExec.includes('-i'));
+    assert.ok(agentShellExec.includes('PLOINKY_NO_TTY=1'));
 });
 
-test('bin/ploinky-install-deps recognizes the same in-box context', () => {
-    const installer = fs.readFileSync(path.join(HERE, '..', 'bin', 'ploinky-install-deps'), 'utf8');
-    assert.ok(installer.includes('/etc/ploinky-box'), 'installer honors the image marker file');
-    assert.ok(installer.includes('PLOINKY_WORKSPACE_ROOT'), 'installer supports older images that lack the marker file');
-    assert.ok(installer.includes('/opt/ploinky'), 'installer limits marker fallback to the mounted box source path');
-    assert.ok(installer.includes('PLOINKY_INSTALL_DEPS_ALLOW_RESET'), 'installer keeps the explicit reset override');
+test('compatible and stopped status preserve streaming health/core behavior without mutation', async () => {
+    const runningFixture = contract2RuntimeFixture({
+        publishes: { '9000/udp': [{ HostIp: '127.0.0.1', HostPort: '19000' }] },
+    });
+    const running = createSupervisorHarness(runningFixture);
+    assert.equal(await running.supervisor.run(['status']), 0);
+    assert.match(running.stdout, new RegExp(`runtime: ${runningFixture.identity.instance} \\(running\\)`));
+    assert.match(running.stdout, /contract: compatible \(expected 2, observed 2\)/);
+    assert.match(running.stdout, /health: healthy/);
+    assert.match(running.stdout, /core: running/);
+    assert.match(running.stdout, /19000 -> 9000\/udp/);
+    assert.equal(running.calls.some(call => call.kind === 'streamContains'), true);
+    assert.equal(runCalls(running, 'pull').length, 0);
+
+    const stopped = createSupervisorHarness(contract2RuntimeFixture({ state: 'exited' }));
+    assert.equal(await stopped.supervisor.run(['status']), 1);
+    assert.equal(runCalls(stopped, 'exec').length, 0);
+    assert.equal(stopped.calls.some(call => call.kind === 'streamContains'), false);
 });
 
-test('bin/ploinky-direct is deleted', () => {
-    assert.ok(!fs.existsSync(path.join(HERE, '..', 'bin', 'ploinky-direct')), 'ploinky-direct must not exist');
+test('stop attempts the outer stop after a core shutdown failure and stays pull-free', async () => {
+    const fixture = contract2RuntimeFixture();
+    const harness = createSupervisorHarness({
+        ...fixture,
+        failures: { 'exec ploinky stop': 9 },
+    });
+    assert.equal(await harness.supervisor.run(['stop']), 1);
+    assert.deepEqual(
+        harness.calls.filter(call => call.kind === 'run').map(call => call.args[0]),
+        ['exec', 'stop'],
+    );
+    assert.match(harness.stderr, /core shutdown: failed \(exit 9\)/);
+    assert.match(harness.stdout, /outer runtime stop: succeeded/);
+    assert.equal(runCalls(harness, 'pull').length, 0);
 });
 
-test('public status inspects the inferred runtime without creating it', () => {
-    const { parent, dir } = makeCwd('testExplorerFresh');
-    const fake = makeMissingStatusEngine();
-    try {
-        const { out, status } = publicRunInWithEnv(
-            dir,
-            { PATH: `${fake.dir}:${process.env.PATH || ''}` },
-            'podman',
-            '--dry-run',
-            'status',
-        );
-        assert.equal(status, 1, out);
-        checkIncludes(out, 'runtime: ploinky-box-testExplorerFresh (missing)', 'status resolves the inferred runtime');
-        checkAbsent(out, 'DRY-RUN: podman run -d', 'status does not create the runtime');
-        checkAbsent(out, ' podman start ', 'status does not start the runtime');
-        assert.equal(
-            fs.readFileSync(fake.calls, 'utf8').trim(),
-            'container inspect ploinky-box-testExplorerFresh',
-        );
-    } finally {
-        fs.rmSync(parent, { recursive: true, force: true });
-        fs.rmSync(fake.dir, { recursive: true, force: true });
-    }
+test('managed start probes the selected router port only after core start succeeds', async () => {
+    const plan = async () => ({
+        schemaVersion: 1,
+        operation: 'start',
+        explicitPublishes: [],
+        generatedPublishes: [],
+        publishes: [],
+    });
+    const success = createSupervisorHarness({
+        preparePublicationPlan: plan,
+        fetchResponse: { ok: true },
+    });
+    assert.equal(await success.supervisor.run(['--port', '19192', 'start', 'explorer']), 0);
+    const coreIndex = success.calls.findIndex(call =>
+        call.kind === 'run' && call.args.includes('ploinky') && call.args.includes('start')
+    );
+    const fetchIndex = success.calls.findIndex(call => call.kind === 'fetch');
+    assert.ok(coreIndex >= 0 && fetchIndex > coreIndex);
+    assert.equal(success.calls[fetchIndex].url, 'http://127.0.0.1:19192/status');
+
+    const failed = createSupervisorHarness({
+        preparePublicationPlan: plan,
+        failures: { exec: 7 },
+        fetchResponse: { ok: true },
+    });
+    assert.equal(await failed.supervisor.run(['--port', '19193', 'start', 'explorer']), 7);
+    assert.equal(failed.calls.some(call => call.kind === 'fetch'), false);
 });
 
-test('public destroy reports an explicitly selected missing outer runtime', () => {
-    const fake = makeMissingStatusEngine();
-    try {
-        const { out, status } = publicRunWithEnv(
-            { PATH: `${fake.dir}:${process.env.PATH || ''}` },
-            'podman',
-            '--name', 'qa',
-            '--dry-run',
-            'destroy',
-        );
-        assert.equal(status, 0, out);
-        checkIncludes(out, "destroy: nothing to remove for 'ploinky-box-qa'", 'public destroy reports the absent selected runtime');
-        checkAbsent(out, 'DRY-RUN: podman run -d', 'public destroy does not create/start the box first');
-        checkAbsent(out, 'volume rm', 'public destroy does not remove absent volumes');
-        checkAbsent(out, 'exec -w /workspace ploinky-box-qa ploinky destroy', 'public destroy does not run in-box destroy');
-        const calls = fs.readFileSync(fake.calls, 'utf8');
-        checkIncludes(calls, 'container inspect ploinky-box-qa', 'public destroy inspects the selected outer runtime');
-        checkIncludes(calls, 'volume inspect ploinky-box-qa-workspace', 'public destroy inspects the selected workspace volume');
-    } finally {
-        fs.rmSync(fake.dir, { recursive: true, force: true });
-    }
-});
-
-test('public destroy honors --name after the command for the outer runtime', () => {
-    const fake = makeMissingStatusEngine();
-    try {
-        const { out, status } = publicRunWithEnv(
-            { PATH: `${fake.dir}:${process.env.PATH || ''}` },
-            'podman',
-            '--dry-run',
-            'destroy',
-            '--name', 'qa',
-        );
-        assert.equal(status, 0, out);
-        checkIncludes(out, "destroy: nothing to remove for 'ploinky-box-qa'", 'post-command --name selects the outer runtime');
-        checkAbsent(out, 'ploinky destroy --name qa', 'post-command --name is not forwarded in-box');
-        checkAbsent(out, 'volume rm', 'post-command --name does not remove absent volumes');
-        assert.equal(
-            fs.readFileSync(fake.calls, 'utf8').split('\n').filter(Boolean)[0],
-            'container inspect ploinky-box-qa',
-        );
-    } finally {
-        fs.rmSync(fake.dir, { recursive: true, force: true });
-    }
-});
-
-test('public no-arg command opens the in-runtime Ploinky REPL', () => {
-    const { out, status } = publicRun('podman', '--name', 'qa', '--dry-run');
-    assert.equal(status, 0, out);
-    checkIncludes(out, 'DRY-RUN: podman run -d', 'no-arg public command ensures the runtime');
-    checkIncludes(
-        out,
-        'exec -i -e PLOINKY_RUNTIME_NAME=ploinky-box-qa -w /workspace ploinky-box-qa p-cli',
-        'no-arg public command opens the Ploinky REPL through p-cli',
+test('a positional start port replaces an existing box and publishes the selected router socket', async () => {
+    const fixture = contract2RuntimeFixture();
+    const harness = createSupervisorHarness({
+        ...fixture,
+        fetchResponse: { ok: true },
+    });
+    assert.equal(await harness.supervisor.run(['start', 'explorer', '19194']), 0);
+    const replacements = runCalls(harness, 'run');
+    assert.equal(replacements.length, 1);
+    assert.ok(replacements[0].args.includes('127.0.0.1:19194:8080'));
+    const forwarded = runCalls(harness, 'exec').at(-1).args;
+    assert.deepEqual(
+        forwarded.slice(-6),
+        ['ploinky', 'start', 'explorer', '8080', '--profile', 'default'],
     );
 });
 
-test('managed start preserves branch flags while forcing the core router to 8080', () => {
-    const source = makeFakePloinkyGraphSource();
-    try {
-        const { out, status } = publicRunWithEnv(
-            { PLOINKY_BOX_SOURCE: source.sourceDir },
-            'podman',
-            '--name', 'qa',
-            '--dry-run',
-            'start', 'explorer',
-            '--branch', 'feature-x',
-            '9191',
-            '--repo-branch', 'AssistOSExplorer=peristo-user',
-            '--branch-fallback', 'fail',
-        );
-        assert.equal(status, 0, out);
-        checkIncludes(out, '127.0.0.1:9191:8080', 'public start positional port is host port');
-        checkIncludes(
-            out,
-            'exec -e PLOINKY_RUNTIME_NAME=ploinky-box-qa -w /workspace ploinky-box-qa ploinky start explorer 8080 --profile default --branch feature-x --repo-branch AssistOSExplorer=peristo-user --branch-fallback fail',
-            'public start forwards branch flags after in-box port',
-        );
-        checkAbsent(out, 'ploinky start explorer 9191', 'public start never uses host port inside');
-    } finally {
-        source.cleanup();
-    }
+test('run args preserve mounts, devices, privilege, security, raw publishes, and image-last ordering', () => {
+    const invocation = invocationFor();
+    invocation.mountDirResolved = '/host/mounted';
+    invocation.publish = ['127.0.0.1::9000/udp'];
+    invocation.explicit.add('--mount');
+    invocation.explicit.add('--publish');
+    const config = createDefaultRuntimeConfig(invocation);
+    config.imageId = 'sha256:validated';
+    const plain = buildRuntimeRunArgs(config, { engine: 'podman', selinux: false });
+    const selinux = buildRuntimeRunArgs(config, { engine: 'podman', selinux: true });
+    assert.equal(plain.at(-1), 'sha256:validated');
+    assert.ok(plain.includes('--privileged'));
+    assert.ok(plain.includes('/dev/fuse:/dev/fuse:rwm'));
+    assert.ok(plain.includes('/dev/net/tun:/dev/net/tun:rwm'));
+    assert.ok(plain.includes('seccomp=unconfined'));
+    assert.ok(plain.includes('/host/mounted:/workspace/mounted'));
+    assert.ok(plain.includes('127.0.0.1::9000/udp'));
+    assert.equal(plain.includes('label=disable'), false);
+    assert.ok(selinux.includes('label=disable'));
 });
 
-test('managed start forwards an inferred source branch exactly once', () => {
-    const source = makeFakePloinkyGraphSource();
-    try {
-        const { out, status } = publicRunWithEnv(
-            {
-                PLOINKY_BOX_BRANCH: 'feature-default',
-                PLOINKY_BOX_SOURCE: source.sourceDir,
-            },
-            'podman',
-            '--name', 'qa',
-            '--dry-run',
-            'start', 'explorer',
-        );
-        assert.equal(status, 0, out);
-        checkIncludes(
-            out,
-            'exec -e PLOINKY_RUNTIME_NAME=ploinky-box-qa -w /workspace ploinky-box-qa ploinky start explorer 8080 --profile default --branch feature-default',
-            'public start appends the inferred branch after the fixed in-box port',
-        );
-        const coreExecCalls = out.split('\n')
-            .filter(line => line.startsWith('DRY-RUN: podman exec '))
-            .map(line => line.slice('DRY-RUN: podman '.length).trim().split(/\s+/))
-            .filter(args => (
-                args[0] === 'exec'
-                && countContiguousSubsequences(
-                    args,
-                    ['ploinky', 'start', 'explorer', '8080'],
-                ) === 1
-            ));
-        assert.equal(coreExecCalls.length, 1, out);
-        assert.equal(
-            countContiguousSubsequences(
-                coreExecCalls[0],
-                ['--branch', 'feature-default'],
-            ),
-            1,
-            out,
-        );
-        assert.equal(
-            coreExecCalls[0].filter(token => token === '--branch').length,
-            1,
-            out,
-        );
-    } finally {
-        source.cleanup();
-    }
-});
-
-test('managed start publishes only active-profile graph openPorts', () => {
-    const source = makeFakePloinkyGraphSource();
-    try {
-        const { out, status } = publicRunWithEnv(
-            { PLOINKY_BOX_SOURCE: source.sourceDir },
-            'podman',
-            '--name', 'qa',
-            '--dry-run',
-            'start', 'explorer',
-        );
-        assert.equal(status, 0, out);
-        checkIncludes(out, '-p 127.0.0.1:8081:8081', 'Explorer start publishes Web Publishing nginx');
-        checkIncludes(out, '-p 127.0.0.1:7881:7881', 'Explorer start publishes LiveKit direct TCP media-plane port');
-        checkIncludes(out, '-p 127.0.0.1:3478:3478', 'Explorer start publishes TURN TCP');
-        checkIncludes(out, '-p 127.0.0.1:3478:3478/udp', 'Explorer start publishes TURN UDP');
-        checkIncludes(out, '-p 127.0.0.1:7882-7892:7882-7892/udp', 'Explorer start publishes LiveKit UDP media range');
-        checkIncludes(out, '-p 127.0.0.1:20000-20010:20000-20010/udp', 'Explorer start publishes TURN relay range');
-        checkAbsent(out, '-p 127.0.0.1:8082:8082', 'Explorer start does not publish OnlyOffice directly');
-        checkAbsent(out, '-p 127.0.0.1:7681:7681', 'Explorer start does not publish webtty directly');
-        checkAbsent(out, '-p 127.0.0.1:17000:17000', 'Explorer start does not publish LiveKit health directly');
-        checkAbsent(out, '-p 127.0.0.1:7880:7880', 'Explorer start does not publish LiveKit signaling directly');
-        checkAbsent(out, '-p 127.0.0.1:6379:6379', 'Explorer start does not publish Redis by default');
-    } finally {
-        source.cleanup();
-    }
-});
-
-test('public start only adds Explorer default publishes for the explorer agent', () => {
-    const { out, status } = publicRun('podman', '--name', 'qa', '--dry-run', 'start', 'demo');
-    assert.equal(status, 0, out);
-    checkIncludes(out, 'exec -e PLOINKY_RUNTIME_NAME=ploinky-box-qa -w /workspace ploinky-box-qa ploinky start demo 8080', 'non-Explorer start still runs inside');
-    checkAbsent(out, '-p 127.0.0.1:7880:7880', 'non-Explorer start does not get Explorer LiveKit publish');
-    checkAbsent(out, '-p 127.0.0.1:8081:8081', 'non-Explorer start does not get Explorer Web Publishing publish');
-});
-
-test('managed start preserves explicit publishes and skips conflicting generated publishes', () => {
-    const source = makeFakePloinkyGraphSource();
-    try {
-        const { out, status } = publicRunWithEnv(
-            { PLOINKY_BOX_SOURCE: source.sourceDir },
-            'podman',
-            '--name', 'qa',
-            '--dry-run',
-            '--publish', '0.0.0.0:3478:3478/udp',
-            'start', 'explorer',
-        );
-        assert.equal(status, 0, out);
-        checkIncludes(out, '-p 0.0.0.0:3478:3478/udp', 'explicit TURN UDP publish is preserved');
-        checkAbsent(out, '-p 127.0.0.1:3478:3478/udp', 'derived TURN UDP publish is skipped for the same target');
-        checkIncludes(out, '-p 127.0.0.1:3478:3478', 'same port with a different protocol is still added');
-    } finally {
-        source.cleanup();
-    }
-});
-
-test('managed start does not duplicate an exact explicit generated publish', () => {
-    const source = makeFakePloinkyGraphSource();
-    try {
-        const { out, status } = publicRunWithEnv(
-            { PLOINKY_BOX_SOURCE: source.sourceDir },
-            'podman',
-            '--name', 'qa',
-            '--dry-run',
-            '--publish', '127.0.0.1:3478:3478/udp',
-            'start', 'explorer',
-        );
-        assert.equal(status, 0, out);
-        assert.equal(countOccurrences(out, '-p 127.0.0.1:3478:3478/udp'), 1, out);
-    } finally {
-        source.cleanup();
-    }
-});
-
-test('public start preserves every supported explicit publish form and suppresses the canonical TCP target', () => {
-    const cases = [
-        '8081',
-        '18081:8081',
-        '18081:8081/tcp',
-        '127.0.0.1:18081:8081',
-    ];
-    for (const explicit of cases) {
-        const source = makeFakePloinkyGraphSource();
-        try {
-            const { out, status } = publicRunWithEnv(
-                { PLOINKY_BOX_SOURCE: source.sourceDir },
-                'podman',
-                '--name', 'qa',
-                '--dry-run',
-                '--publish', explicit,
-                'start', 'explorer',
-            );
-            assert.equal(status, 0, out);
-            const publishes = dryRunPublishTokens(out);
-            assert.ok(
-                publishes.includes(explicit),
-                `explicit publish '${explicit}' is passed through byte-for-byte\n  in: ${out}`,
-            );
-            assert.ok(
-                !publishes.includes('127.0.0.1:8081:8081'),
-                `explicit publish '${explicit}' suppresses generated 8081/tcp\n  in: ${out}`,
-            );
-        } finally {
-            source.cleanup();
-        }
-    }
-});
-
-test('public start preserves an engine protocol outside the manifest TCP/UDP policy', () => {
-    const source = makeFakePloinkyGraphSource();
-    try {
-        const explicit = '127.0.0.1:18081:8081/sctp';
-        const { out, status } = publicRunWithEnv(
-            { PLOINKY_BOX_SOURCE: source.sourceDir },
-            'podman',
-            '--name', 'qa',
-            '--dry-run',
-            '--publish', explicit,
-            'start', 'explorer',
-        );
-        assert.equal(status, 0, out);
-        checkIncludes(out, `-p ${explicit}`, 'explicit SCTP publish is left for the engine to interpret');
-        checkIncludes(out, '-p 127.0.0.1:8081:8081', 'SCTP does not suppress generated TCP at the same target');
-    } finally {
-        source.cleanup();
-    }
-});
-
-test('public start canonicalizes leading zeroes only for suppression and never rewrites the raw explicit value', () => {
-    const source = makeFakePloinkyGraphSource();
-    try {
-        const explicit = '127.0.0.1:18081:08081';
-        const { out, status } = publicRunWithEnv(
-            { PLOINKY_BOX_SOURCE: source.sourceDir },
-            'podman',
-            '--name', 'qa',
-            '--dry-run',
-            '--publish', explicit,
-            'start', 'explorer',
-        );
-        assert.equal(status, 0, out);
-        const publishes = dryRunPublishTokens(out);
-        assert.ok(
-            publishes.includes(explicit),
-            `the engine receives the exact leading-zero publish\n  in: ${out}`,
-        );
-        assert.ok(
-            !publishes.includes('127.0.0.1:8081:8081'),
-            `leading zeroes cannot bypass generated-target suppression\n  in: ${out}`,
-        );
-    } finally {
-        source.cleanup();
-    }
-});
-
-test('public start suppresses an overlapping generated single port when the explicit target is a range', () => {
-    const source = makeFakePloinkyGraphSource();
-    try {
-        const explicit = '18080-18090:8080-8090';
-        const { out, status } = publicRunWithEnv(
-            { PLOINKY_BOX_SOURCE: source.sourceDir },
-            'podman',
-            '--name', 'qa',
-            '--dry-run',
-            '--publish', explicit,
-            'start', 'explorer',
-        );
-        assert.equal(status, 0, out);
-        checkIncludes(out, `-p ${explicit}`, 'the explicit range is preserved');
-        checkAbsent(out, '-p 127.0.0.1:8081:8081', 'the overlapping generated single port is suppressed');
-    } finally {
-        source.cleanup();
-    }
-});
-
-test('public start suppresses the whole generated range when an explicit single target overlaps it', () => {
-    const source = makeFakePloinkyGraphSource({
-        webPublishingOpenPorts: ['127.0.0.1:9000-9010:9000-9010'],
+test('mount, publish, and host-port preflight failures occur before pull or volume mutation', async t => {
+    await t.test('missing mount', async () => {
+        const harness = createSupervisorHarness();
+        assert.equal(await harness.supervisor.run(['--mount', '/definitely/missing/ploinky', 'list']), 1);
+        assert.equal(mutationCalls(harness).length, 0);
     });
-    try {
-        const explicit = '19001:9001';
-        const { out, status } = publicRunWithEnv(
-            { PLOINKY_BOX_SOURCE: source.sourceDir },
-            'podman',
-            '--name', 'qa',
-            '--dry-run',
-            '--publish', explicit,
-            'start', 'explorer',
-        );
-        assert.equal(status, 0, out);
-        checkIncludes(out, `-p ${explicit}`, 'the explicit single-port publish is preserved');
-        checkAbsent(out, '127.0.0.1:9000-9010:9000-9010', 'the overlapping generated range is not emitted');
-        checkAbsent(out, '127.0.0.1:9000:9000', 'the generated range is not split below the overlap');
-        checkAbsent(out, '127.0.0.1:9002-9010:9002-9010', 'the generated range is not split above the overlap');
-    } finally {
-        source.cleanup();
-    }
-});
-
-test('public start keeps generated UDP when an explicit TCP target uses the same port', () => {
-    const source = makeFakePloinkyGraphSource({
-        webPublishingOpenPorts: ['127.0.0.1:8081:8081/udp'],
+    await t.test('invalid publish', async () => {
+        const harness = createSupervisorHarness();
+        assert.equal(await harness.supervisor.run(['--publish', '70000:70000', 'list']), 1);
+        assert.match(harness.stderr, /invalid --publish/);
+        assert.equal(mutationCalls(harness).length, 0);
     });
-    try {
-        const explicit = '18081:8081/tcp';
-        const { out, status } = publicRunWithEnv(
-            { PLOINKY_BOX_SOURCE: source.sourceDir },
-            'podman',
-            '--name', 'qa',
-            '--dry-run',
-            '--publish', explicit,
-            'start', 'explorer',
-        );
-        assert.equal(status, 0, out);
-        checkIncludes(out, '-p 18081:8081', 'the explicit TCP publish is preserved');
-        checkIncludes(out, '-p 127.0.0.1:8081:8081/udp', 'same-number UDP remains independent');
-    } finally {
-        source.cleanup();
-    }
-});
-
-test('public qualified Explorer start plans and forwards one explicit development profile', () => {
-    const source = makeFakePloinkyGraphSource({
-        webPublishingProfiles: {
-            default: {
-                openPorts: ['127.0.0.1:8081:8081'],
-            },
-            dev: {
-                openPorts: ['127.0.0.1:9081:8081'],
-            },
-        },
+    await t.test('busy router port', async () => {
+        const stderr = writableBuffer();
+        const fake = createFakeEngine();
+        const supervisor = createRuntimeSupervisor({
+            stdout: writableBuffer().stream,
+            stderr: stderr.stream,
+            stdin: { isTTY: false },
+            cwd: '/workspace/demo',
+            realpath: value => path.resolve(value),
+            env: { PLOINKY_BOX_SOURCE: REPO_ROOT },
+            engineClient: fake.engineClient,
+            portInUse: async () => true,
+        });
+        assert.equal(await runSupervisorWithBoundary(supervisor, ['--port', '19194', 'list'], stderr.stream), 1);
+        assert.equal(mutationCalls(fake).length, 0);
     });
+});
+
+test('publish merging rejects fixed host collisions but permits ephemeral host allocation', () => {
+    assert.throws(() => mergeAndValidatePublishes([
+        { hostIp: '0.0.0.0', hostPort: '9000', containerPort: '8000', protocol: 'tcp' },
+        { hostIp: '127.0.0.1', hostPort: '9000', containerPort: '8001', protocol: 'tcp' },
+    ]), /overlapping runtime publish host socket/);
+    assert.equal(mergeAndValidatePublishes([
+        { hostIp: '', hostPort: '', containerPort: '8000', protocol: 'tcp' },
+        { hostIp: '', hostPort: '', containerPort: '8001', protocol: 'tcp' },
+    ]).length, 2);
+});
+
+test('inspect normalization and reconciliation helpers preserve engine parity and explicit-only changes', () => {
+    const podmanRaw = contract2Container({ engine: 'podman' }).inspect;
+    const dockerRaw = contract2Container({ engine: 'docker' }).inspect;
+    const podman = normalizeContainerInspect('podman', [podmanRaw]);
+    const docker = normalizeContainerInspect('docker', [dockerRaw]);
+    assert.deepEqual(docker, podman);
+
+    podman.contract = '2';
+    const omitted = mergeDesiredRuntimeConfig(invocationFor(), podman, []);
+    assert.equal(planReconciliation({ existing: podman, desired: omitted, contractMatches: true }).action, 'reuse');
+    const changedInvocation = invocationFor();
+    changedInvocation.port = '9192';
+    changedInvocation.explicit.add('--port');
+    const changed = mergeDesiredRuntimeConfig(changedInvocation, podman, []);
+    const plan = planReconciliation({ existing: podman, desired: changed, contractMatches: true });
+    assert.equal(plan.action, 'replace');
+    assert.deepEqual(plan.reasons, ['routerPublish']);
+});
+
+test('source resolution and branch inference retain existing behavior', () => {
+    assert.equal(resolveHostPloinkySource({}), REPO_ROOT);
+    const source = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-source-'));
     try {
-        const { out, status } = publicRunWithEnv(
-            { PLOINKY_BOX_SOURCE: source.sourceDir },
-            'podman',
-            '--name', 'qa',
-            '--dry-run',
-            'start', 'AchillesIDE/explorer', '8080', '--profile', 'DEV',
-        );
-        assert.equal(status, 0, out);
-        checkIncludes(out, '-p 127.0.0.1:9081:9081', 'the dev openPorts mapping is selected');
-        checkAbsent(out, '-p 127.0.0.1:8081:8081', 'the default-only mapping is replaced');
-        checkIncludes(
-            out,
-            'exec -e PLOINKY_RUNTIME_NAME=ploinky-box-qa -w /workspace ploinky-box-qa ploinky start AchillesIDE/explorer 8080 --profile dev',
-            'the normalized planner profile reaches the in-box start command',
-        );
+        fs.mkdirSync(path.join(source, 'bin'));
+        fs.mkdirSync(path.join(source, 'cli'));
+        fs.mkdirSync(path.join(source, 'globalDeps'));
+        fs.writeFileSync(path.join(source, 'bin', 'ploinky'), '#!/bin/sh\n');
+        fs.writeFileSync(path.join(source, 'cli', 'index.js'), '// test\n');
+        fs.writeFileSync(path.join(source, 'globalDeps', 'package.json'), '{}\n');
+        assert.equal(resolveHostPloinkySource({ PLOINKY_BOX_SOURCE: source }), path.resolve(source));
     } finally {
-        source.cleanup();
+        fs.rmSync(source, { recursive: true, force: true });
     }
-});
-
-test('public bare Explorer start ignores host profile state and plans and forwards default', () => {
-    const source = makeFakePloinkyGraphSource({
-        webPublishingProfiles: {
-            default: {
-                openPorts: ['127.0.0.1:8081:8081'],
-            },
-            dev: {
-                openPorts: ['127.0.0.1:9081:8081'],
-            },
-        },
-    });
-    try {
-        const { out, status } = publicRunWithEnv(
-            {
-                PLOINKY_BOX_SOURCE: source.sourceDir,
-                PLOINKY_PROFILE: 'dev',
-            },
-            'podman',
-            '--name', 'qa',
-            '--dry-run',
-            'start', 'explorer',
-        );
-        assert.equal(status, 0, out);
-        checkIncludes(out, '-p 127.0.0.1:8081:8081', 'omission selects the default publish graph');
-        checkAbsent(out, '-p 127.0.0.1:9081:9081', 'host profile state does not select dev');
-        checkIncludes(
-            out,
-            'exec -e PLOINKY_RUNTIME_NAME=ploinky-box-qa -w /workspace ploinky-box-qa ploinky start explorer 8080 --profile default',
-            'omission explicitly forwards default in-box',
-        );
-    } finally {
-        source.cleanup();
-    }
-});
-
-test('public start accepts --profile=value before the agent and does not treat it as positional', () => {
-    const source = makeFakePloinkyGraphSource({
-        webPublishingProfiles: {
-            default: { openPorts: ['127.0.0.1:8081:8081'] },
-            dev: { openPorts: ['127.0.0.1:9081:8081'] },
-        },
-    });
-    try {
-        const { out, status } = publicRunWithEnv(
-            { PLOINKY_BOX_SOURCE: source.sourceDir },
-            'podman',
-            '--name', 'qa',
-            '--dry-run',
-            'start', '--profile=dev', 'AssistOSExplorer/explorer', '9191',
-        );
-        assert.equal(status, 0, out);
-        checkIncludes(out, '127.0.0.1:9191:8080', 'the positional host port remains aligned');
-        checkIncludes(
-            out,
-            'ploinky start AssistOSExplorer/explorer 8080 --profile dev',
-            'the profile option is consumed and forwarded canonically',
-        );
-        checkAbsent(out, 'ploinky start dev 8080', 'the profile value never becomes the agent positional');
-    } finally {
-        source.cleanup();
-    }
-});
-
-test('runtime supervisor source does not hardcode Explorer publish topology', () => {
-    const source = fs.readFileSync(MJS, 'utf8');
-    const oldPublishConstant = ['EXPLORER', 'START', 'PUBLISH', 'SPECS'].join('_');
-    const oldExplorerEnv = ['PLOINKY', 'BOX', 'EXPLORER', 'PORTS'].join('_');
-    const oldPortMetadata = ['box', 'Publish'].join('');
-    assert.equal(source.includes(oldPublishConstant), false);
-    assert.equal(source.includes(oldExplorerEnv), false);
-    assert.equal(source.includes('127.0.0.1:8082:8082'), false);
-    assert.equal(source.includes(oldPortMetadata), false);
-});
-
-test('public start accepts --port before the agent without forwarding it in-box', () => {
-    const source = makeFakePloinkyGraphSource();
-    try {
-        const { out, status } = publicRunWithEnv(
-            { PLOINKY_BOX_SOURCE: source.sourceDir },
-            'podman',
-            '--name', 'qa',
-            '--dry-run',
-            'start', '--port', '9191', 'explorer',
-        );
-        assert.equal(status, 0, out);
-        checkIncludes(out, '127.0.0.1:9191:8080', 'post-command --port before agent is the host port');
-        checkIncludes(out, 'exec -e PLOINKY_RUNTIME_NAME=ploinky-box-qa -w /workspace ploinky-box-qa ploinky start explorer 8080', 'agent remains explorer');
-        checkAbsent(out, 'ploinky start 9191 8080 --port explorer', 'post-command --port does not reorder into in-box args');
-    } finally {
-        source.cleanup();
-    }
-});
-
-test('public start accepts --port after the agent without forwarding it in-box', () => {
-    const source = makeFakePloinkyGraphSource();
-    try {
-        const { out, status } = publicRunWithEnv(
-            { PLOINKY_BOX_SOURCE: source.sourceDir },
-            'podman',
-            '--name', 'qa',
-            '--dry-run',
-            'start', 'explorer', '--port', '9192',
-        );
-        assert.equal(status, 0, out);
-        checkIncludes(out, '127.0.0.1:9192:8080', 'post-command --port after agent is the host port');
-        checkIncludes(out, 'exec -e PLOINKY_RUNTIME_NAME=ploinky-box-qa -w /workspace ploinky-box-qa ploinky start explorer 8080', 'agent remains explorer');
-        checkAbsent(out, 'ploinky start explorer 8080 --port 9192', 'post-command --port is not forwarded in-box');
-    } finally {
-        source.cleanup();
-    }
-});
-
-test('managed start maps the selected host router port to container port 8080', () => {
-    const source = makeFakePloinkyGraphSource();
-    try {
-        const { out, status } = publicRunWithEnv(
-            { PLOINKY_BOX_SOURCE: source.sourceDir },
-            'podman',
-            '--name', 'qa',
-            '--dry-run',
-            '--port', '19191',
-            'start', 'explorer',
-        );
-        assert.equal(status, 0, out);
-        checkIncludes(
-            out,
-            '127.0.0.1:19191:8080',
-            'the selected host router port maps to runtime port 8080',
-        );
-        checkIncludes(
-            out,
-            'ploinky start explorer 8080 --profile default',
-            'the core router always receives port 8080',
-        );
-        checkAbsent(
-            out,
-            'ploinky start explorer 19191',
-            'the selected host port is never forwarded to the core router',
-        );
-    } finally {
-        source.cleanup();
-    }
-});
-
-test('managed start probes the selected host router port after core start succeeds', async () => {
-    const source = makeFakePloinkyGraphSource();
-    const coreStartCommand = ['ploinky', 'start', 'explorer', '8080'];
-    try {
-        async function run(coreExitCode) {
-            const stdout = captureWritable();
-            const stderr = captureWritable();
-            const fake = createFakeEngine({
-                engine: 'podman',
-                container: null,
-                images: contractV1Images(),
-                stdout: stdout.stream,
-                stderr: stderr.stream,
-            });
-            const engineClient = {
-                ...fake.engineClient,
-                run(args, options) {
-                    const result = fake.engineClient.run(args, options);
-                    if (
-                        args[0] === 'exec'
-                        && countContiguousSubsequences(
-                            args,
-                            coreStartCommand,
-                        ) === 1
-                    ) {
-                        return coreExitCode;
-                    }
-                    return result;
-                },
-            };
-            const raw = createRuntimeSupervisor({
-                ...minimalSupervisorDependencies(),
-                stdout: stdout.stream,
-                stderr: stderr.stream,
-                cwd: '/workspace/qa',
-                env: {
-                    PLOINKY_BOX_BRANCH: 'main',
-                    PLOINKY_BOX_SOURCE: source.sourceDir,
-                },
-                detectEngine: () => 'podman',
-                engineClient,
-                waitHealthy: async () => {},
-                portInUse: async () => false,
-                fetch: async (url) => {
-                    fake.calls.push({ kind: 'fetch', url });
-                    return { ok: true };
-                },
-            });
-            const code = await runSupervisorWithBoundary(
-                raw,
-                [
-                    '--name', 'qa',
-                    '--port', '19192',
-                    'start', 'explorer',
-                ],
-                stderr.stream,
-            );
-            return { calls: fake.calls, code };
-        }
-
-        const success = await run(0);
-        assert.equal(success.code, 0);
-        const coreStartIndex = success.calls.findIndex(call =>
-            call.kind === 'run'
-            && call.args[0] === 'exec'
-            && countContiguousSubsequences(
-                call.args,
-                coreStartCommand,
-            ) === 1
-        );
-        const fetchIndex = success.calls.findIndex(call =>
-            call.kind === 'fetch'
-            && call.url === 'http://127.0.0.1:19192/status'
-        );
-        assert.notEqual(coreStartIndex, -1, JSON.stringify(success.calls));
-        assert.notEqual(fetchIndex, -1, JSON.stringify(success.calls));
-        assert.ok(coreStartIndex < fetchIndex, JSON.stringify(success.calls));
-
-        const failed = await run(7);
-        assert.equal(failed.code, 7);
-        assert.equal(
-            failed.calls.some(call => call.kind === 'fetch'),
-            false,
-            JSON.stringify(failed.calls),
-        );
-    } finally {
-        source.cleanup();
-    }
-});
-
-test('public start without an agent forwards in-box start instead of wrapper failing', () => {
-    const { out, status } = publicRun('podman', '--name', 'qa', '--dry-run', 'start');
-    assert.equal(status, 0, out);
-    checkIncludes(out, 'exec -e PLOINKY_RUNTIME_NAME=ploinky-box-qa -w /workspace ploinky-box-qa ploinky start', 'start with no args is forwarded');
-    checkAbsent(out, 'usage:', 'public start without args is not rejected by the wrapper');
-});
-
-test('public command hoists --expose after the command without forwarding it in-box', () => {
-    const { out, status } = publicRun('podman', '--name', 'qa', '--dry-run', 'list', 'agents', '--expose', '127.0.0.1:9090:9090');
-    assert.equal(status, 0, out);
-    checkIncludes(out, '-p 127.0.0.1:9090:9090', 'public post-command --expose publishes a runtime port');
-    checkIncludes(out, 'exec -e PLOINKY_RUNTIME_NAME=ploinky-box-qa -w /workspace ploinky-box-qa ploinky list agents', 'ordinary command still reaches core');
-    checkAbsent(out, 'ploinky list agents --expose 127.0.0.1:9090:9090', 'post-command --expose is not forwarded in-box');
-});
-
-test('public ploinky forwards registered non-lifecycle CLI commands into the runtime', () => {
-    const registry = getCommandRegistry();
-    assert.equal(registry.box, undefined, 'box is not a registered core command');
-
-    for (const command of Object.keys(registry)) {
-        if (['help', 'status', 'stop', 'destroy', 'cli'].includes(command)) {
-            continue;
-        }
-        const { out, status } = publicRun('podman', '--name', 'qa', '--dry-run', command);
-        assert.equal(status, 0, `${command}\n${out}`);
-        checkIncludes(out, 'DRY-RUN: podman run -d', `${command}: public command ensures the box`);
-
-        const ttyFlag = command === 'shell' ? '-i ' : '';
-        checkIncludes(
-            out,
-            `exec ${ttyFlag}-e PLOINKY_RUNTIME_NAME=ploinky-box-qa -w /workspace ploinky-box-qa ploinky ${command}`,
-            `${command}: public command forwards to in-box ploinky`,
-        );
-    }
-});
-
-test('public parser preserves normal command flags after the command', () => {
-    const cfg = parseHostInvocation(['client', 'tool', 'process', '--dry-run'], {});
-    assert.equal(cfg.command, 'client');
-    assert.deepEqual(cfg.args, ['tool', 'process', '--dry-run']);
-    assert.equal(cfg.dryRun, false);
-});
-
-test('public parser hoists runtime selector flags after the command', () => {
-    const cfg = parseHostInvocation(['destroy', '--name', 'qa', '--expose', '127.0.0.1:9090:9090'], {});
-    assert.equal(cfg.command, 'destroy');
-    assert.equal(cfg.name, 'qa');
-    assert.deepEqual(cfg.publish, ['127.0.0.1:9090:9090']);
-    assert.deepEqual(cfg.args, []);
-    assert.deepEqual([...cfg.explicit], ['--name', '--expose']);
-});
-
-test('public parameterless cli rejects noninteractive dry-run before mutation', () => {
-    const { out, status } = publicRun('podman', '--name', 'qa', '--dry-run', 'cli');
-    assert.equal(status, 1, out);
-    checkIncludes(out, 'requires an interactive terminal', 'public cli explains the TTY requirement');
-    checkAbsent(out, 'DRY-RUN: podman run -d', 'public cli rejects before reconciliation');
-});
-
-test('public sh forwards with interactive exec', () => {
-    const { out, status } = publicRun('podman', '--name', 'qa', '--dry-run', 'sh');
-    assert.equal(status, 0, out);
-    checkIncludes(
-        out,
-        'exec -i -e PLOINKY_RUNTIME_NAME=ploinky-box-qa -w /workspace ploinky-box-qa ploinky sh',
-        'public sh preserves non-TTY input without requesting a terminal',
-    );
-});
-
-test('runtime smoke exercises only the public ploinky entrypoint', () => {
-    const smokeText = fs.readFileSync(path.join(HERE, 'smoke-runtime.mjs'), 'utf8');
-    assert.match(smokeText, /path\.join\(ROOT, 'bin', 'ploinky'\)/);
-    for (const requiredFlow of [
-        "requireOk('host-local help', ploinky(['help']))",
-        "if (containerExists()) throw new Error('help created the runtime')",
-        "ploinky(['--port', PORT, '--image', IMAGE, 'list', 'agents'])",
-        "return invoke(PLOINKY, ['--engine', ENGINE, '--name', NAME, ...args], options)",
-        "invoke(ENGINE, ['container', 'inspect', INSTANCE])",
-        "invoke(ENGINE, ['volume', 'inspect', name])",
-        "invoke(ENGINE, ['exec', INSTANCE, 'podman', 'version'])",
-        "invoke(ENGINE, ['exec', INSTANCE, 'podman', 'info'])",
-        "requireOk('combined status', ploinky(['status']))",
-        "requireOk('first stop', ploinky(['stop']))",
-        "requireOk('idempotent stop', ploinky(['stop']))",
-        "requireOk('confirmed destroy', ploinky(['destroy'], { input: 'y\\n' }))",
-        "if (containerExists()) throw new Error('destroy left ' + INSTANCE)",
-        "if (volumeExists(volume)) throw new Error('destroy left ' + volume)",
-    ]) {
-        assert.ok(smokeText.includes(requiredFlow), requiredFlow);
-    }
-    assert.doesNotMatch(smokeText, /SMOKE_PUBLIC_PLOINKY/);
-    assert.doesNotMatch(smokeText, /SMOKE_AGENT/);
-    assert.doesNotMatch(smokeText, /container\/ploinky-box(?:\s|$)/);
-    assert.doesNotMatch(
-        smokeText,
-        /path\.(?:join|resolve)\([^;\n]*['"][^'"]*ploinky-box(?:\.mjs)?['"]/,
-    );
-
-    const mainFlow = smokeText.slice(
-        smokeText.indexOf('try {'),
-        smokeText.indexOf('} finally {'),
+    assert.deepEqual(
+        inferPublicStartBranchArgs(['agent'], { PLOINKY_BOX_BRANCH: 'feature' }, REPO_ROOT),
+        ['--branch', 'feature'],
     );
     assert.deepEqual(
-        [...mainFlow.matchAll(/invoke\(ENGINE, \['([^']+)'/g)]
-            .map((match) => match[1]),
-        ['exec', 'exec'],
-    );
-    const cleanup = smokeText.slice(smokeText.indexOf('} finally {'));
-    assert.match(cleanup, /invoke\(ENGINE, \['rm', '-f', INSTANCE\]\)/);
-    assert.match(cleanup, /invoke\(ENGINE, \['volume', 'rm', volume\]\)/);
-    assert.match(cleanup, /fs\.rmSync\(TMP, \{ recursive: true, force: true \}\)/);
-
-    const overrides = [...smokeText.matchAll(/process\.env\.(SMOKE_[A-Z_]+)/g)]
-        .map((match) => match[1]);
-    assert.deepEqual(
-        [...new Set(overrides)].sort(),
-        ['SMOKE_ENGINE', 'SMOKE_IMAGE', 'SMOKE_PORT'],
+        inferPublicStartBranchArgs(['agent', '--branch', 'manual'], { PLOINKY_BOX_BRANCH: 'feature' }, REPO_ROOT),
+        [],
     );
 });
 
-test('authoritative runtime files have no removed public surface', () => {
-    for (const file of [
-        'README.md',
-        'container/README.md',
-        'bin/ploinky',
-        'container/runtime-supervisor.mjs',
-        'container/smoke-runtime.mjs',
-    ]) {
-        const text = fs.readFileSync(path.join(ROOT, file), 'utf8');
-        assert.doesNotMatch(text, /ploinky box/);
-        assert.doesNotMatch(text, /container\/ploinky-box(?:\s|$)/);
-        assert.doesNotMatch(text, /ploinky-box\.mjs/);
-    }
+test('engine and supervisor boundaries preserve nonzero and signal exit details', async () => {
+    const exited = createEngineClient({
+        name: 'podman',
+        spawnSyncImpl: () => ({ status: 23, stdout: '', stderr: '' }),
+    });
+    assert.throws(() => exited.run(['run', 'x']), error => error.exitCode === 23);
+    const signalled = createEngineClient({
+        name: 'podman',
+        spawnSyncImpl: () => ({ status: null, signal: 'SIGTERM', stdout: '', stderr: '' }),
+    });
+    assert.throws(
+        () => signalled.run(['run', 'x']),
+        error => error.exitCode === 143 && error.signal === 'SIGTERM',
+    );
+    const stderr = writableBuffer();
+    const error = new Error('preserved failure');
+    error.exitCode = 23;
+    assert.equal(await runSupervisorWithBoundary({ run() { throw error; } }, [], stderr.stream), 23);
+    assert.match(stderr.text(), /preserved failure/);
 });
 
-test('docs describe the managed outer runtime and host-mounted core', () => {
-    const rootReadme = fs.readFileSync(path.join(HERE, '..', 'README.md'), 'utf8');
-    const boxReadme = fs.readFileSync(path.join(HERE, 'README.md'), 'utf8');
-    const authoritativeDocs = [
-        'README.md',
-        'container/README.md',
-        'docs/code-derived-agent-lifecycle.md',
-        'docs/specs/DS003-agent-manifest-and-registry.md',
-        'docs/specs/DS004-runtime-execution-and-isolation.md',
-        'docs/specs/DS007-dependency-caches-and-startup-readiness.md',
-    ];
-    const invocationRows = [
-        '| `ploinky` or `p-cli` | Reconcile/start outer runtime; open Ploinky REPL |',
-        '| `ploinky cli` | Reconcile/start outer runtime; open `/bin/bash` as `podman` in `/workspace` |',
-        "| `ploinky cli <agent>` | Reconcile/start outer runtime; attach to that agent's manifest CLI |",
-        '| `ploinky start ...` | Reconcile/start outer runtime; preserve graph publishes and router readiness |',
-        '| `ploinky status` | Inspect outer contract/publishes/health and running core status without mutation |',
-        '| `ploinky stop` | Stop core services, then stop outer runtime; keep volumes |',
-        '| `ploinky destroy` | Confirm exact instance and remove its container plus three volumes |',
-        '| REPL `status`/`stop`/`destroy` | Core workspace/router/agent scope; outer runtime remains |',
-    ];
-    for (const file of authoritativeDocs) {
-        const text = fs.readFileSync(path.join(ROOT, file), 'utf8');
-        for (const row of invocationRows) {
-            assert.ok(text.includes(row), `${file}: missing ${row}`);
-        }
-    }
-
-    const legacyMigrationDocs = [
-        'README.md',
-        'docs/code-derived-agent-lifecycle.md',
-        'docs/specs/DS004-runtime-execution-and-isolation.md',
-    ];
-    const legacyMigrationContract = [
-        'Migration applies only when `--image` is omitted and the inspected image is exactly',
-        '`docker.io/assistos/ploinky-box:podman-node24` or',
-        '`assistos/ploinky-box:podman-node24`.',
-    ].join(' ');
-    for (const file of legacyMigrationDocs) {
-        const text = fs.readFileSync(path.join(ROOT, file), 'utf8')
-            .replace(/\s+/g, ' ');
-        assert.ok(
-            text.includes(legacyMigrationContract),
-            `${file}: missing exact legacy migration contract`,
-        );
-    }
-
-    assert.ok(rootReadme.includes('read-only at `/opt/ploinky`'), rootReadme);
-    assert.ok(rootReadme.includes('Reconcile/start outer runtime; open Ploinky REPL'), rootReadme);
-    assert.ok(rootReadme.includes('node cli/index.js'), rootReadme);
-    assert.ok(!rootReadme.includes('PLOINKY_DIRECT'), 'the direct-mode escape is gone');
-    assert.ok(boxReadme.includes('Graph-driven Explorer publishes'), boxReadme);
-    assert.ok(boxReadme.includes('openPorts'), boxReadme);
-    assert.ok(boxReadme.includes('/opt/ploinky'), boxReadme);
-    assert.ok(boxReadme.includes('read-only'), boxReadme);
-    assert.ok(boxReadme.includes('ploinky-deps'), boxReadme);
-    assert.ok(boxReadme.includes('PLOINKY_BOX_SOURCE'), boxReadme);
-    assert.ok(boxReadme.includes('PLOINKY_BOX_INSTALL_DEPS'), boxReadme);
-    assert.ok(boxReadme.includes('Install them now?'), boxReadme);
-    assert.ok(boxReadme.includes('docker.io/assistos/ploinky-box:podman-node24-runtime-v1'), boxReadme);
-    assert.ok(boxReadme.includes('io.assistos.ploinky.runtime-contract=1'), boxReadme);
-    assert.ok(boxReadme.includes('Ordinary agent images intentionally contain neither Podman nor Docker'), boxReadme);
-    assert.match(boxReadme, /Git is optional on the host/);
-    assert.doesNotMatch(boxReadme, /host requires[^.]*Git[^.]*Podman/i);
-    assert.ok(!boxReadme.includes('PLOINKY_DIRECT'), 'the direct-mode escape is gone');
-});
-
-test('package metadata advertises the Node 20 runtime floor', () => {
-    const packageJson = JSON.parse(fs.readFileSync(path.join(HERE, '..', 'package.json'), 'utf8'));
-    assert.equal(packageJson.engines.node, '>=20.0.0');
-});
-
-test('package metadata exposes ploinky as the public binary', () => {
-    const packageJson = JSON.parse(fs.readFileSync(path.join(HERE, '..', 'package.json'), 'utf8'));
-    assert.equal(packageJson.bin.ploinky, './bin/ploinky');
-});
-
-test('sanitizeBoxSuffix: engine-safe suffixes', () => {
-    assert.equal(sanitizeBoxSuffix('testExplorerFresh'), 'testExplorerFresh');
-    assert.equal(sanitizeBoxSuffix('my repo!'), 'my_repo_');
-    assert.equal(sanitizeBoxSuffix('a.b-c_d'), 'a.b-c_d');
-    assert.equal(sanitizeBoxSuffix('x'.repeat(80)), 'x'.repeat(63));
-    assert.equal(sanitizeBoxSuffix(''), '');
-});
-
-test('resolveInstanceIdentity: cwd inference and --name override', () => {
-    const inferred = resolveInstanceIdentity(parseHostInvocation([], {}), '/home/u/testExplorer2');
-    assert.equal(inferred.name, 'testExplorer2');
-    assert.equal(inferred.nameSource, 'cwd');
-    assert.equal(instanceName(inferred), 'ploinky-box-testExplorer2');
-
-    const flagged = resolveInstanceIdentity(parseHostInvocation(['--name', 'qa'], {}), '/home/u/testExplorer2');
-    assert.equal(flagged.name, 'qa');
-    assert.equal(flagged.nameSource, 'flag');
-});
-
-test('parseHostInvocation: explicit-port tracking for start', () => {
-    assert.equal(parseHostInvocation(['--port', '9090', 'start'], {}).explicit.has('--port'), true);
-    assert.equal(parseHostInvocation(['start'], {}).explicit.has('--port'), false);
-});
-
-test('automatic runtime creation sanitizes the inferred cwd basename', () => {
-    const { parent, dir } = makeCwd('my repo!');
-    try {
-        const { out } = publicRunIn(dir, 'podman', '--dry-run', 'list', 'agents');
-        checkIncludes(out, '--name ploinky-box-my_repo_', 'unsafe chars become underscores');
-    } finally {
-        fs.rmSync(parent, { recursive: true, force: true });
-    }
-});
-
-test('--name overrides the cwd basename', () => {
-    const { parent, dir } = makeCwd('testExplorerFresh');
-    try {
-        const { out } = publicRunIn(dir, 'podman', '--name', 'qa', '--dry-run', 'list', 'agents');
-        checkIncludes(out, '--name ploinky-box-qa', 'explicit --name wins');
-        checkAbsent(out, 'testExplorerFresh', 'cwd basename ignored when --name is given');
-    } finally {
-        fs.rmSync(parent, { recursive: true, force: true });
-    }
-});
-
-test('un-inferable cwd dies with guidance', () => {
-    const { parent, dir } = makeCwd('___');
-    try {
-        const { out, status } = publicRunIn(dir, 'podman', '--dry-run', 'list', 'agents');
-        assert.equal(status, 1, out);
-        checkIncludes(out, 'cannot infer an instance name', 'un-inferable cwd is an error');
-        checkIncludes(out, 'pass --name X', 'error points at the escape hatch');
-    } finally {
-        fs.rmSync(parent, { recursive: true, force: true });
-    }
-});
-
-test('status targets the inferred instance', () => {
-    const { parent, dir } = makeCwd('testExplorerFresh');
-    const fake = makeMissingStatusEngine();
-    try {
-        const { out, status } = publicRunInWithEnv(
-            dir,
-            { PATH: `${fake.dir}:${process.env.PATH || ''}` },
-            'podman',
-            '--dry-run',
-            'status',
-        );
-        assert.equal(status, 1, out);
-        checkIncludes(out, 'runtime: ploinky-box-testExplorerFresh (missing)', 'status resolves the inferred name');
-        assert.equal(
-            fs.readFileSync(fake.calls, 'utf8').trim(),
-            'container inspect ploinky-box-testExplorerFresh',
-        );
-    } finally {
-        fs.rmSync(parent, { recursive: true, force: true });
-        fs.rmSync(fake.dir, { recursive: true, force: true });
-    }
-});
-
-test('destroy targets an inferred missing instance without mutation', () => {
-    const { parent, dir } = makeCwd('testExplorerFresh');
-    const fake = makeMissingStatusEngine();
-    try {
-        const { out, status } = publicRunInWithEnv(
-            dir,
-            { PATH: `${fake.dir}:${process.env.PATH || ''}` },
-            'podman',
-            '--dry-run',
-            'destroy',
-        );
-        assert.equal(status, 0, out);
-        checkIncludes(out, "destroy: nothing to remove for 'ploinky-box-testExplorerFresh'", 'destroy resolves and reports the inferred target');
-        checkAbsent(out, 'volume rm', 'destroy does not mutate absent inferred resources');
-        const calls = fs.readFileSync(fake.calls, 'utf8');
-        checkIncludes(calls, 'container inspect ploinky-box-testExplorerFresh', 'destroy inspects the inferred runtime');
-        checkIncludes(calls, 'volume inspect ploinky-box-testExplorerFresh-ploinky-deps', 'destroy inspects all inferred volumes');
-    } finally {
-        fs.rmSync(parent, { recursive: true, force: true });
-        fs.rmSync(fake.dir, { recursive: true, force: true });
-    }
+test('host help describes automatic identity and direct volume-preserving destroy', () => {
+    const help = publicUsageText();
+    assert.match(help, /canonical current directory/);
+    assert.match(help, /retain named volumes/);
+    assert.match(help, /options \(must precede the command\)/i);
+    assert.doesNotMatch(help, /^\s+--name\s/m);
+    assert.doesNotMatch(help, /^\s+--engine\s/m);
+    assert.doesNotMatch(help, /PLOINKY_BOX_ENGINE=/);
 });

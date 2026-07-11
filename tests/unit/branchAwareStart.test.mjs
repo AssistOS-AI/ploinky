@@ -9,6 +9,10 @@ const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-branch-'));
 const originalCwd = process.cwd();
 process.chdir(tempDir);
 process.env.PLOINKY_MASTER_KEY = '5'.repeat(64);
+process.env.GIT_AUTHOR_NAME = 'Ploinky Tests';
+process.env.GIT_AUTHOR_EMAIL = 'tests@ploinky.invalid';
+process.env.GIT_COMMITTER_NAME = 'Ploinky Tests';
+process.env.GIT_COMMITTER_EMAIL = 'tests@ploinky.invalid';
 
 const moduleSuffix = `?test=${Date.now()}`;
 const reposUrl = new URL('../../cli/services/repos.js', import.meta.url);
@@ -43,8 +47,10 @@ function createBareRepo(name, { branches = [] } = {}) {
     const workPath = path.join(tempDir, 'work', name);
     fs.mkdirSync(workPath, { recursive: true });
     execFileSync('git', ['clone', barePath, workPath], { stdio: 'ignore' });
+    execFileSync('git', ['-C', workPath, 'checkout', '-b', 'main'], { stdio: 'ignore' });
     execFileSync('git', ['-C', workPath, 'commit', '--allow-empty', '-m', 'init'], { stdio: 'ignore' });
     execFileSync('git', ['-C', workPath, 'push', 'origin', 'main'], { stdio: 'ignore' });
+    execFileSync('git', ['--git-dir', barePath, 'symbolic-ref', 'HEAD', 'refs/heads/main'], { stdio: 'ignore' });
 
     for (const br of branches) {
         execFileSync('git', ['-C', workPath, 'checkout', '-b', br], { stdio: 'ignore' });
@@ -64,12 +70,14 @@ function createBareAgentRepo(name, agentName, { branches = [] } = {}) {
     const workPath = path.join(tempDir, 'work', name);
     fs.mkdirSync(path.dirname(workPath), { recursive: true });
     execFileSync('git', ['clone', barePath, workPath], { stdio: 'ignore' });
+    execFileSync('git', ['-C', workPath, 'checkout', '-b', 'main'], { stdio: 'ignore' });
     const manifestDir = path.join(workPath, agentName);
     fs.mkdirSync(manifestDir, { recursive: true });
     fs.writeFileSync(path.join(manifestDir, 'manifest.json'), JSON.stringify({ container: 'node:20' }, null, 2));
     execFileSync('git', ['-C', workPath, 'add', '.'], { stdio: 'ignore' });
     execFileSync('git', ['-C', workPath, 'commit', '-m', 'agent manifest'], { stdio: 'ignore' });
     execFileSync('git', ['-C', workPath, 'push', 'origin', 'main'], { stdio: 'ignore' });
+    execFileSync('git', ['--git-dir', barePath, 'symbolic-ref', 'HEAD', 'refs/heads/main'], { stdio: 'ignore' });
 
     for (const br of branches) {
         execFileSync('git', ['-C', workPath, 'checkout', '-b', br], { stdio: 'ignore' });
@@ -179,6 +187,22 @@ test('parseStartArgs: positional agent and port', () => {
     const result = parseStartArgs(['AchillesIDE/explorer', '8080']);
     assert.equal(result.staticAgent, 'AchillesIDE/explorer');
     assert.equal(result.port, '8080');
+});
+
+test('parseStartArgs: rejects start-tail --port value before start mutation', () => {
+    assert.throws(
+        () => parseStartArgs(['AchillesIDE/explorer', '--port', '8097']),
+        (error) => error.message.includes('start-tail --port')
+            && error.message.includes('ploinky --port PORT start AGENT')
+            && error.message.includes('ploinky start AGENT PORT'),
+    );
+});
+
+test('parseStartArgs: rejects start-tail --port=value before start mutation', () => {
+    assert.throws(
+        () => parseStartArgs(['AchillesIDE/explorer', '--port=8097']),
+        /start-tail --port/,
+    );
 });
 
 test('parseStartArgs: agent with --branch', () => {
@@ -429,6 +453,7 @@ test('bootstrap: global branch policy only applies to the static repo among defa
     const basicPath = initManagedRepo('basic');
     const idePath = initManagedRepo('AchillesIDE', { branches: ['feature-start'] });
     const cliPath = initManagedRepo('AchillesCLI');
+    initManagedRepo('copilot-agents');
 
     assert.doesNotThrow(() => bootstrap({
         staticAgent: 'AchillesIDE/explorer',
@@ -450,7 +475,7 @@ test('bootstrap: global branch policy only applies to the static repo among defa
 
 test('bootstrap: a bare static agent name resolves its own repo for the global branch', () => {
     // Isolate from the prior bootstrap test which reuses these default-repo names.
-    for (const r of ['basic', 'AchillesIDE', 'AchillesCLI']) {
+    for (const r of ['basic', 'AchillesIDE', 'AchillesCLI', 'copilot-agents']) {
         fs.rmSync(path.join(tempDir, '.ploinky', 'repos', r), { recursive: true, force: true });
     }
     fs.rmSync(path.join(tempDir, '.ploinky', 'enabled_repos.json'), { force: true });
@@ -458,6 +483,7 @@ test('bootstrap: a bare static agent name resolves its own repo for the global b
     const idePath = initManagedRepo('AchillesIDE', { branches: ['feature-start'] });
     const basicPath = initManagedRepo('basic');
     initManagedRepo('AchillesCLI');
+    initManagedRepo('copilot-agents');
 
     // findAgent('explorer') must resolve to AchillesIDE; commit the manifest so
     // the repo is clean for the branch checkout.

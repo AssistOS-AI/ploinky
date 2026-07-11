@@ -25,33 +25,43 @@ function isStrictBranchPolicy(branchPolicy) {
         && (Boolean(branchPolicy.branch) || Object.keys(branchPolicy.repoBranches || {}).length > 0);
 }
 
-export function bootstrap({ branchPolicy, staticAgent } = {}) {
-    for (const { name, url } of repos.getDefaultBootRepos()) {
+export function prepareDefaultBootRepositories({
+    branchPolicy,
+    staticAgent,
+    bootRepos = repos.getDefaultBootRepos(),
+    log = console.log,
+    error = console.error,
+    stdio = 'inherit',
+} = {}) {
+    const prepared = [];
+    for (const { name, url } of bootRepos) {
         const repoPath = path.join(PLOINKY_DIR, 'repos', name);
         const repoBranchPolicy = policyForBootRepo(name, branchPolicy, staticAgent);
         if (!fs.existsSync(repoPath)) {
-            console.log(`Default '${name}' repository not found. Cloning...`);
+            log(`Default '${name}' repository not found. Cloning...`);
             try {
-                repos.ensureRepoInstalled(name, url, {
+                const result = repos.ensureRepoInstalled(name, url, {
                     branchPolicy: repoBranchPolicy,
-                    stdio: 'inherit',
+                    stdio,
                 });
-                console.log(`${name} repository cloned successfully.`);
-            } catch (error) {
-                if (isStrictBranchPolicy(repoBranchPolicy)) throw error;
-                console.error(`Error cloning ${name} repository: ${error.message}`);
+                prepared.push({ name, action: result?.status || 'cloned', branch: result?.branch || null });
+                log(`${name} repository cloned successfully.`);
+            } catch (err) {
+                if (isStrictBranchPolicy(repoBranchPolicy)) throw err;
+                error(`Error cloning ${name} repository: ${err.message}`);
             }
         } else if (repoBranchPolicy?.branch || repoBranchPolicy?.repoBranches?.[name]) {
             try {
-                repos.ensureRepoOnBranch(name, {
+                const result = repos.ensureRepoOnBranch(name, {
                     branch: repos.resolveBranchForRepo(name, null, repoBranchPolicy),
                     resetRepos: repoBranchPolicy?.resetRepos || false,
                     fallback: repoBranchPolicy?.fallback || 'default',
-                    stdio: 'inherit',
+                    stdio,
                 });
-            } catch (error) {
-                if (isStrictBranchPolicy(repoBranchPolicy)) throw error;
-                console.error(`Error switching '${name}' to branch: ${error.message}`);
+                prepared.push({ name, action: result?.status || 'exists', branch: result?.branch || null });
+            } catch (err) {
+                if (isStrictBranchPolicy(repoBranchPolicy)) throw err;
+                error(`Error switching '${name}' to branch: ${err.message}`);
             }
         }
     }
@@ -67,17 +77,23 @@ export function bootstrap({ branchPolicy, staticAgent } = {}) {
         try {
             const staticRepo = findAgent(String(staticAgent).trim())?.repo;
             if (staticRepo && fs.existsSync(path.join(PLOINKY_DIR, 'repos', staticRepo))) {
-                repos.ensureRepoOnBranch(staticRepo, {
+                const result = repos.ensureRepoOnBranch(staticRepo, {
                     branch: branchPolicy.branch,
                     resetRepos: branchPolicy.resetRepos || false,
                     fallback: branchPolicy.fallback || 'default',
-                    stdio: 'inherit',
+                    stdio,
                 });
+                prepared.push({ name: staticRepo, action: result?.status || 'exists', branch: result?.branch || null });
             }
-        } catch (error) {
-            if (isStrictBranchPolicy(branchPolicy)) throw error;
-            console.error(`Error switching static agent repo to branch: ${error.message}`);
+        } catch (err) {
+            if (isStrictBranchPolicy(branchPolicy)) throw err;
+            error(`Error switching static agent repo to branch: ${err.message}`);
         }
     }
 
+    return prepared;
+}
+
+export function bootstrap({ branchPolicy, staticAgent } = {}) {
+    return prepareDefaultBootRepositories({ branchPolicy, staticAgent });
 }

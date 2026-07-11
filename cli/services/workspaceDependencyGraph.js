@@ -3,6 +3,7 @@ import path from 'path';
 import { manifestEnableEntries, parseEnableDirective, qualifyEnableSpecForRepo } from './bootstrapManifest.js';
 import { findAgent } from './utils.js';
 import { isSsoProviderManifest } from './agentRegistry.js';
+import { getActiveProfile } from './profileService.js';
 
 function normalizeAuthMode(value) {
     const normalized = String(value || '').trim().toLowerCase();
@@ -112,12 +113,101 @@ function findRegistryRecord(registry, { repoName, shortAgentName, alias = '' }) 
     )) || null;
 }
 
+// Resolve an operator-facing agent token against an already-loaded workspace
+// registry using the same precedence as the runtime command handlers. Keeping
+// this helper pure lets the publication planner use its planning snapshot
+// instead of re-reading agents.json partway through a plan.
+function resolveEnabledAgentRegistryRecord(agentRef, registry = {}) {
+    const input = typeof agentRef === 'string' ? agentRef.trim() : '';
+    if (!input || !registry || typeof registry !== 'object') return null;
+
+    const direct = registry[input];
+    if (direct && direct.type === 'agent') {
+        return { containerName: input, record: direct };
+    }
+
+    const hasNamespace = /[:/]/.test(input);
+    let repoFilter = null;
+    let agentFilter = input;
+    if (hasNamespace) {
+        const parts = input.split(/[:/]/).filter(Boolean);
+        if (parts.length === 2) {
+            [repoFilter, agentFilter] = parts;
+        }
+    }
+
+    const entries = Object.entries(registry)
+        .filter(([key]) => key !== '_config');
+    let aliasEntry = entries.find(([, value]) => (
+        value && value.type === 'agent' && value.alias === input
+    ));
+    if (!aliasEntry && hasNamespace) {
+        aliasEntry = entries.find(([, value]) => (
+            value && value.type === 'agent' && value.alias === agentFilter
+        ));
+    }
+    if (aliasEntry) {
+        return { containerName: aliasEntry[0], record: aliasEntry[1] };
+    }
+
+    const matches = entries
+        .filter(([, value]) => value && typeof value === 'object' && value.type === 'agent')
+        .filter(([, value]) => {
+            if (!value.agentName) return false;
+            if (repoFilter && value.repoName !== repoFilter) return false;
+            return value.agentName === agentFilter;
+        });
+    if (!matches.length) return null;
+    if (matches.length > 1) {
+        const aliases = matches.map(([containerName, value]) => value.alias || containerName);
+        const error = new Error(`Multiple containers found for agent '${agentRef}'. Use alias: ${aliases.join(', ')}`);
+        error.code = 'AGENT_ALIAS_AMBIGUOUS';
+        throw error;
+    }
+
+    const [containerName, record] = matches[0];
+    return { containerName, record };
+}
+
 function normalizeProfileOverride(profile) {
     const normalized = String(profile || '').trim().toLowerCase();
     return normalized || '';
 }
 
-function resolveWorkspaceDependencyGraph({ staticAgentRef, registry = {} } = {}) {
+function resolveEffectiveProfile(manifest, requestedProfile, agentRef, { explicit = false } = {}) {
+    const requested = normalizeProfileOverride(requestedProfile);
+    const profiles = manifest?.profiles && typeof manifest.profiles === 'object'
+        ? manifest.profiles
+        : {};
+    if (!requested) {
+        return 'default';
+    }
+    if (Object.prototype.hasOwnProperty.call(profiles, requested)) {
+        return requested;
+    }
+    if (explicit) {
+        const available = Object.keys(profiles).sort();
+        throw new Error(
+            `profile '${requested}' is not defined by ${agentRef}; available profiles: ${available.join(', ') || '(none)'}`,
+        );
+    }
+    return 'default';
+}
+
+function effectiveInstanceKey(repoName, shortAgentName, alias = '') {
+    return alias
+        ? `${repoName}/${shortAgentName}#alias:${alias}`
+        : `${repoName}/${shortAgentName}#canonical`;
+}
+
+function resolveWorkspaceDependencyGraph({
+    staticAgentRef,
+    registry = {},
+    workspaceProfile = '',
+    rootProfile = '',
+    rootAlias = '',
+    onCycle = null,
+} = {}) {
     if (!staticAgentRef || typeof staticAgentRef !== 'string') {
         throw new Error('Missing static agent reference.');
     }
@@ -125,9 +215,20 @@ function resolveWorkspaceDependencyGraph({ staticAgentRef, registry = {} } = {})
     const nodes = new Map();
     const state = new Map();
 
-    function visit(agentRef, { alias = '', enableSpec = '', profile = '', isStatic = false, stack = [] } = {}) {
+    const selectedWorkspaceProfile = normalizeProfileOverride(workspaceProfile || getActiveProfile());
+
+    function visit(agentRef, {
+        alias = '',
+        enableSpec = '',
+        profile = '',
+        profileExplicit = false,
+        isStatic = false,
+        stack = [],
+        selectionPath = [],
+    } = {}) {
         const resolved = findAgent(agentRef);
         const nodeId = createGraphNodeId(resolved.repo, resolved.shortAgentName, alias);
+        const instanceKey = effectiveInstanceKey(resolved.repo, resolved.shortAgentName, alias);
         const requestedProfile = normalizeProfileOverride(profile);
 
         if (stack.includes(nodeId)) {
@@ -142,12 +243,17 @@ function resolveWorkspaceDependencyGraph({ staticAgentRef, registry = {} } = {})
                 shortAgentName: resolved.shortAgentName,
                 alias
             });
-            const profileName = requestedProfile || normalizeProfileOverride(registryRecord?.profile);
+            const selectedProfile = requestedProfile || normalizeProfileOverride(registryRecord?.profile);
+            const profileName = resolveEffectiveProfile(manifest, selectedProfile, `${resolved.repo}/${resolved.shortAgentName}`, {
+                explicit: profileExplicit || (!requestedProfile && Boolean(registryRecord?.profile)),
+            });
             node = {
                 id: nodeId,
+                instanceKey,
                 agentRef: `${resolved.repo}/${resolved.shortAgentName}`,
                 enableSpec: String(enableSpec || agentRef || `${resolved.repo}/${resolved.shortAgentName}`).trim(),
                 profile: profileName,
+                profileExplicit: Boolean(profileExplicit),
                 repoName: resolved.repo,
                 shortAgentName: resolved.shortAgentName,
                 alias,
@@ -163,13 +269,28 @@ function resolveWorkspaceDependencyGraph({ staticAgentRef, registry = {} } = {})
                 // blocking child of another, so the modifier must live on the
                 // edge rather than on the child node itself.
                 dependencyEdges: new Map(),
-                isStatic: Boolean(isStatic)
+                isStatic: Boolean(isStatic),
+                selectionPath: selectionPath.length ? [...selectionPath] : [nodeId],
             };
             nodes.set(nodeId, node);
         } else if (isStatic) {
             node.isStatic = true;
-        } else if (requestedProfile && node.profile !== requestedProfile) {
-            node.profile = requestedProfile;
+        }
+
+        if (node) {
+            const candidateProfile = resolveEffectiveProfile(
+                node.manifest,
+                requestedProfile || node.profile,
+                node.agentRef,
+                { explicit: profileExplicit },
+            );
+            if (candidateProfile !== node.profile) {
+                const firstPath = node.selectionPath?.join(' -> ') || node.id;
+                const conflictingPath = selectionPath.length ? selectionPath.join(' -> ') : node.id;
+                throw new Error(
+                    `conflicting profiles for effective instance ${node.instanceKey}: profile '${node.profile}' via ${firstPath}; profile '${candidateProfile}' via ${conflictingPath}`,
+                );
+            }
         }
 
         const status = state.get(nodeId);
@@ -200,8 +321,10 @@ function resolveWorkspaceDependencyGraph({ staticAgentRef, registry = {} } = {})
                 const childId = visit(dependencyRef, {
                     alias: qualifiedDependency.alias || '',
                     enableSpec: qualifiedDependency.spec || dependencyRef,
-                    profile: qualifiedDependency.profile || '',
-                    stack: nextStack
+                    profile: qualifiedDependency.profile || selectedWorkspaceProfile,
+                    profileExplicit: Boolean(qualifiedDependency.profile),
+                    stack: nextStack,
+                    selectionPath: [...node.selectionPath, `${node.id} -> ${dependencyRef}${qualifiedDependency.alias ? ` as ${qualifiedDependency.alias}` : ''}`],
                 });
                 node.dependencies.add(childId);
                 const noWait = Boolean(qualifiedDependency.noWait);
@@ -219,7 +342,9 @@ function resolveWorkspaceDependencyGraph({ staticAgentRef, registry = {} } = {})
                 // Cycles are an existing intentional truncation case: log and continue so the parent build can still proceed.
                 // All other resolution failures (missing agents, malformed enable specs, manifest parse errors) fail-closed.
                 if (message.startsWith('Dependency cycle detected:')) {
-                    console.error(`[manifest enable] Failed to resolve dependency '${rawDependency}' for '${node.agentRef}': ${message}`);
+                    const warning = `[manifest enable] Failed to resolve dependency '${rawDependency}' for '${node.agentRef}': ${message}`;
+                    if (typeof onCycle === 'function') onCycle(warning);
+                    else console.error(warning);
                     continue;
                 }
                 throw new Error(`[manifest enable] Failed to resolve dependency '${rawDependency}' for '${node.agentRef}': ${message}`);
@@ -231,7 +356,11 @@ function resolveWorkspaceDependencyGraph({ staticAgentRef, registry = {} } = {})
 
     const staticNodeId = visit(staticAgentRef, {
         enableSpec: staticAgentRef,
-        isStatic: true
+        alias: rootAlias,
+        profile: rootProfile || selectedWorkspaceProfile,
+        profileExplicit: Boolean(rootProfile),
+        isStatic: true,
+        selectionPath: [String(staticAgentRef)],
     });
     return {
         staticNodeId,
@@ -317,7 +446,9 @@ function topologicallyGroupDependencyGraph(graph) {
 export {
     classifyDependencyGraphWaitMode,
     createGraphNodeId,
+    effectiveInstanceKey,
     parseManifestDependencyRef,
+    resolveEnabledAgentRegistryRecord,
     resolveWorkspaceDependencyGraph,
     topologicallyGroupDependencyGraph
 };

@@ -163,10 +163,11 @@ rootful path is unnecessary.
 Creation-failure and replacement-cleanup paths remove the failed container with
 its anonymous volumes. The explicit destroy confirmation identifies the target
 container, any attached anonymous volume identifiers, and the exact three named
-Ploinky volumes. Approval removes the container with its anonymous volumes and
-then removes those three named volumes. Engine `rm --volumes` does not replace
-the explicit named-volume deletion. No path performs a broad volume prune or
-removes resources belonging to another instance.
+Ploinky volumes that will be retained. Approval directly removes the outer
+container with its attached anonymous volumes and leaves all three named
+volumes intact. Engine `rm --volumes` supplies the scoped anonymous-volume
+cleanup; no explicit named-volume deletion follows it. No path performs a broad
+volume prune or removes resources belonging to another instance.
 
 Using `rm --volumes` also cleans an inherited anonymous volume when an operator
 explicitly destroys a legacy runtime. This is cleanup attached to the approved
@@ -183,7 +184,7 @@ destructive command, not a migration guarantee.
 | Current-contract replacement fails after old-container removal | Restore the previous current-contract container and preserve named volumes |
 | Failed new container allocated an unexpected anonymous volume | Remove that volume with the failed container |
 | Explicit destroy is declined | Mutate nothing |
-| One destroy phase fails | Continue the scoped cleanup phases, report each failure, and return nonzero |
+| Direct outer-container removal fails | Report the failure, retain all named volumes, and return nonzero |
 
 Errors must distinguish pull failure, image-contract failure, unsupported
 existing runtime, container creation failure, health failure, rollback failure,

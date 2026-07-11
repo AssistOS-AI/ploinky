@@ -1,7 +1,7 @@
 # Ploinky Box Invariant Alignment Implementation Plan
 
 Date: 2026-07-11
-Status: approved implementation plan (D1-D12 and R1-R6); implementation has not started and publication requires separate approval
+Status: implementation and authorized publication in progress (D1-D12 and R1-R6 approved); final published-image and local-deployment gates pending
 
 ## Goal
 
@@ -28,17 +28,17 @@ This plan spans three repositories:
 | --- | --- |
 | container-image-builds | Build, validate, and publish the contract-2 runtime image |
 | ploinky | Supervise the outer runtime, plan publications, forward commands, and run nested agents |
-| AssistOSExplorer | Replace OnlyOffice's unsupported ephemeral openPorts claim with the approved `127.0.0.1:17000:7000` mapping in every profile |
+| AssistOSExplorer | Replace OnlyOffice's unsupported ephemeral openPorts claim with the approved `127.0.0.1:17002:7000` mapping in every profile, leaving LiveKit on `17000` |
 
 ## Review and Execution Boundary
 
-This document is the approved plan, not authorization to implement or publish.
+This document began as the approved plan. The owner subsequently authorized
+implementation, repository pushes, the image publication workflow, and the
+local acceptance deployment. It remains the execution and verification record.
 
-- D1 through D12 and R1-R6 are approved. No design approvals remain. Do not
-  modify runtime code until the owner gives a separate explicit instruction to
-  start implementation.
-- Do not dispatch the image publication workflow without separate explicit
-  authorization.
+- D1 through D12 and R1-R6 are approved. No design approvals remain.
+- Image publication is authorized, but dispatch occurs only after the exact
+  implementation commits are pushed and all pre-publication checks pass.
 - Publish and verify the contract-2 image before releasing Ploinky code that
   requires it.
 - Preserve the existing modified ploinky/node_modules/achillesAgentLib
@@ -66,7 +66,7 @@ This document is the approved plan, not authorization to implement or publish.
 | Host engine environment override | Remove PLOINKY_BOX_ENGINE; setting it has no effect on public engine resolution |
 | Unreachable host engine | Treat any installed engine that cannot answer as unknown; allow help and partial nonzero status only, and block every other public command before action |
 | Start-tail port flags | Accept prefix --port and positional start AGENT PORT only; reject start-tail --port VALUE and --port=VALUE before outer reconciliation or core mutation |
-| OnlyOffice control port | Keep general port-zero rejection and use 127.0.0.1:17000:7000 in default, dev, and prod; editor mappings remain 8082/18082 to 8080 and storage 9100 remains unpublished |
+| OnlyOffice control port | Keep general port-zero rejection and use 127.0.0.1:17002:7000 in default, dev, and prod; LiveKit remains on 17000, editor mappings remain 8082/18082 to 8080, and storage 9100 remains unpublished |
 | Cross-engine retained resources | Treat the deterministic box and labelled named volumes as one engine-owned set; sole resource owner wins, split or foreign ownership fails closed, and Podman-first applies only to an empty identity |
 | Bare static-agent resolution | From an empty workspace, prepare default boot repositories without enabling or starting agents, then resolve a unique bare root exactly like its qualified forms; require qualification only for genuine ambiguity |
 | Parser migration | Apply the new grammar directly with no warning release |
@@ -97,8 +97,8 @@ This document is the approved plan, not authorization to implement or publish.
 | D11 | Profile conflicts | Retain profiles, but reject conflicting profiles for the same canonical-or-alias effective instance before mutation |
 | D12 | Nested storage cleanup on box boot | Replace blanket podman rm -af with exact-label removal of Ploinky-managed nested containers; preserve unrelated/manual containers, images, and named volumes |
 
-D1 through D12 are approved. No implementation or publication is authorized by
-that approval alone.
+D1 through D12 were approved before execution authorization; implementation and
+publication are now separately authorized under the boundary above.
 
 ## Completed Post-Review Decision Record
 
@@ -107,12 +107,12 @@ that approval alone.
 | R1 | PLOINKY_BOX_ENGINE | Remove the environment override completely; public commands always use automatic engine discovery, unit tests inject engines through internal seams, and real smoke tests exercise public discovery |
 | R2 | Unreachable installed engine | Classify each installed engine as owns, absent, or unknown; if either is unknown, help remains local, status reports partial state and exits nonzero, and every other public command fails before pull, start, exec, stop, destroy, or other mutation |
 | R3 | Start-tail --port | Keep prefix `ploinky --port PORT start AGENT` and positional `ploinky start AGENT PORT`; reject both `start AGENT --port PORT` and `start AGENT --port=PORT` in the host planner and in-box core before reconciliation or mutation, while forwarding post-command --port unchanged for non-start commands |
-| R4 | OnlyOffice port zero | Retain D9's general rejection of box-side port zero; replace all three OnlyOffice profile claims with `127.0.0.1:17000:7000`, preserve loopback-only binding, leave editor/storage topology unchanged, and reject any 17000 conflict before mutation |
+| R4 | OnlyOffice port zero | Retain D9's general rejection of box-side port zero; replace all three OnlyOffice profile claims with `127.0.0.1:17002:7000`, preserve loopback-only binding, leave LiveKit on `17000`, leave editor/storage topology unchanged, and reject any 17002 conflict before mutation |
 | R5 | Cross-engine retained resources | Inventory the exact box and three explicitly labelled volumes on every answering engine; use the sole resource owner, create missing roles only on a later permitted creation path, fail on split/foreign resources, and use Podman-first only when neither engine has any identity resource |
 | R6 | Empty-workspace bare root | `ploinky start explorer --branch=ploinky-box` must prepare the default boot repositories without enable/start mutation, resolve to the same canonical root, selected commit, graph, claims, and publications as `AchillesIDE/explorer` and `AchillesIDE:explorer`, and require qualification only when bare lookup is genuinely ambiguous |
 
-All design decisions are approved. Implementation and image publication remain
-separate actions requiring explicit authorization.
+All design decisions, implementation, and image publication are authorized.
+Publication still follows the ordered gates in this plan.
 
 ## Target Public Behavior
 
@@ -751,7 +751,7 @@ Under approved D7:
 
 | File | Planned change |
 | --- | --- |
-| onlyOffice/manifest.json | Replace unsupported box-side port zero with 127.0.0.1:17000:7000 in all profiles |
+| onlyOffice/manifest.json | Replace unsupported box-side port zero with 127.0.0.1:17002:7000 in all profiles; retain LiveKit's existing 17000 claim |
 | onlyOffice/docs/specs/DS01-ploinky-agent-invariant.md | Replace the dynamic-control-port contract with the approved stable box-side mapping |
 | docs/specs/DS04-onlyoffice-integration.md | Synchronize the OnlyOffice control-port topology |
 | docs/specs/DS06-ploinky-runtime-invariants.md | Record the stable openPorts boundary requirement where applicable |
@@ -773,20 +773,20 @@ Under approved D7:
 - [x] Record approved R1 removal of PLOINKY_BOX_ENGINE.
 - [x] Record approved R2 strict unknown-engine handling.
 - [x] Record approved R3 start-tail port rejection.
-- [x] Record approved R4 fixed OnlyOffice control port 17000.
+- [x] Record approved R4 fixed OnlyOffice control port 17002, leaving LiveKit on 17000.
 - [x] Record approved R5 deterministic cross-engine resource ownership.
 - [x] Record approved R6 empty-workspace bare-root equivalence.
-- [ ] Remove statements that explicit destroy deletes named volumes.
-- [ ] Retain the contract-1 no-migration rule and clarify that old named volumes
+- [x] Remove statements that explicit destroy deletes named volumes.
+- [x] Retain the contract-1 no-migration rule and clarify that old named volumes
       remain untouched for manual recovery while contract 2 uses fresh
       path-hashed volumes.
-- [ ] Record the mutable-tag refresh model: create/replacement only.
-- [ ] Record generic openPorts scope and the REPL fail-closed boundary.
-- [ ] Record the final outer argument grammar.
-- [ ] Reconcile one authoritative image metadata/environment list, including
+- [x] Record the mutable-tag refresh model: create/replacement only.
+- [x] Record generic openPorts scope and the REPL fail-closed boundary.
+- [x] Record the final outer argument grammar.
+- [x] Reconcile one authoritative image metadata/environment list, including
       container, BUILDAH_ISOLATION, _CONTAINERS_USERNS_CONFIGURED, exact PATH,
       and PLOINKY_DISABLE_HOST_SANDBOX.
-- [ ] Re-review the specification before runtime edits.
+- [x] Re-review the specification before runtime edits.
 
 ### Task 2: Write Failing Contract-2 Image Tests
 
@@ -1157,9 +1157,9 @@ Under approved D7:
 
 **Steps**
 
-- [x] Record R4 approval for `127.0.0.1:17000:7000` in every profile.
+- [x] Record R4 approval for `127.0.0.1:17002:7000` in every profile, leaving LiveKit on `17000`.
 - [ ] Replace 127.0.0.1:0:7000 in default, dev, and prod with
-      127.0.0.1:17000:7000.
+      127.0.0.1:17002:7000.
 - [ ] Keep the control listener, editor proxy, and loopback-only storage listener
       as three distinct topology contracts.
 - [ ] Update the specifications that currently require an ephemeral control

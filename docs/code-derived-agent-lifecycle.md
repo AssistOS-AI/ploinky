@@ -13,7 +13,7 @@ All relative paths below are relative to the workspace directory where `ploinky`
 | Workspace paths | `cli/services/config.js`, `cli/services/workspace.js`, `cli/services/workspaceStructure.js` |
 | Repo discovery and install | `cli/services/repos.js`, `cli/commands/repoAgentCommands.js`, `cli/services/utils.js`, `cli/services/status.js` |
 | Agent enable/disable state | `cli/services/agents.js` |
-| Start/restart/runtime orchestration | `cli/services/workspaceUtil.js`, `cli/services/workspaceDependencyGraph.js`, `cli/services/bootstrapManifest.js`, `cli/services/startupConfigProviders.js`, `cli/services/noWaitWorker.js` |
+| Start/restart/runtime orchestration | `cli/services/workspaceUtil.js`, `cli/services/workspaceDependencyGraph.js`, `cli/services/bootstrapManifest.js`, `cli/services/boxStartPublishPlan.js`, `cli/services/boxPublicationCoverage.js`, `cli/services/startupConfigProviders.js`, `cli/services/noWaitWorker.js` |
 | Container runtime | `cli/services/docker/common.js`, `cli/services/docker/agentServiceManager.js`, `cli/services/docker/containerFleet.js` |
 | Host sandbox runtime | `cli/services/sandboxRuntime.js`, `cli/services/bwrap/bwrapServiceManager.js`, `cli/services/seatbelt/seatbeltServiceManager.js`, `cli/services/seatbelt/seatbeltProfile.js` |
 | Dependency cache | `cli/services/dependencyCache.js`, `cli/services/dependencyRuntimeKey.js`, `cli/services/dependencyInstaller.js`, `globalDeps/package.json`, `cli/commands/depsCommands.js` |
@@ -63,7 +63,7 @@ to `bin/ploinky`; `bin/psh` is an alias to `ploinky sh`.
 | `ploinky start ...` | Reconcile/start outer runtime; preserve graph publishes and router readiness |
 | `ploinky status` | Inspect outer contract/publishes/health and running core status without mutation |
 | `ploinky stop` | Stop core services, then stop outer runtime; keep volumes |
-| `ploinky destroy` | Confirm exact instance and remove its container plus three volumes |
+| `ploinky destroy` | Confirm exact instance and directly remove its outer container; retain named volumes |
 | REPL `status`/`stop`/`destroy` | Core workspace/router/agent scope; outer runtime remains |
 
 `cli/index.js` initializes the core environment and dispatches a command inside
@@ -75,31 +75,67 @@ port, profile, and branch policy flags and bootstraps the requested agent.
 
 ### Outer runtime contract
 
-The required outer image is the immutable
-`docker.io/assistos/ploinky-box:podman-node24-runtime-v1` reference with exact
-label `io.assistos.ploinky.runtime-contract=1`. Runtime release ordering is
-manual: publish and independently validate that image first, then adopt the
-exact reference in Ploinky.
+The required release channel is the mutable
+`docker.io/assistos/ploinky-box:runtime` reference. The source-free image must
+satisfy the complete runtime contract 2 metadata checked by
+`container/runtime-contract.mjs`, including exact label
+`io.assistos.ploinky.runtime-contract=2`, user `podman`, workdir `/workspace`,
+the box entrypoint, its allowlisted environment, and no image command or
+declared volumes.
 
-Ordinary host commands reconcile a missing, stopped, or incompatible runtime.
-Omitted creation flags preserve inspected image, publish, bind, mount,
-listening, environment, device, security, user, and named-volume settings;
-explicit flags change only the selected fields. Migration applies only when
-`--image` is omitted and the inspected image is exactly
-`docker.io/assistos/ploinky-box:podman-node24` or
-`assistos/ploinky-box:podman-node24`. A different incompatible custom reference
-remains selected, is force-pulled and contract-validated before mutation, and
-fails without altering the old runtime if it still lacks contract 1.
-Replacement captures the previous normalized configuration and rolls back to
-it if creation or health validation fails. Reconciliation never removes the
-workspace, nested-container-storage, or dependency volumes.
+Every non-help host invocation canonicalizes the current directory and derives
+`ploinky-box-<sanitized-basename>-<12-character-SHA256-path-hash>`. No public
+name or engine selector participates. The supervisor finds each Podman or
+Docker executable on `PATH`, requires every installed engine to answer, and
+inventories the exact box plus its three exact labelled volume names on all of
+them. It selects the sole resource owner, including when only a partial valid
+volume set remains. Split resources, duplicate exact boxes, foreign volume
+labels, or an unknown engine probe fail closed. Podman wins only when neither
+engine owns an identity resource. Engines not installed cannot be inventoried.
+Each volume requires `io.assistos.ploinky.identity-schema=1`, the exact
+`io.assistos.ploinky.path-hash`, and a matching
+`io.assistos.ploinky.volume-role` of `workspace`, `containers`, or
+`ploinky-deps`; the canonical absolute path is not stored in labels.
+
+A missing box causes an unconditional pull and full contract validation. The
+supervisor creates the box from the validated image ID, closing a mutable-tag
+race. A stopped compatible box starts and a running compatible box is reused
+without pulling. A requested configuration replacement pulls and validates
+before the old box is stopped, captures its image ID and normalized
+configuration, and rolls back to them on creation or health failure. Omitted
+creation flags preserve inspected settings except that authoritative generated
+publications may be replaced. Reconciliation never removes the workspace,
+nested-container-storage, or dependency volumes.
+
+Contract 2 is a hard cut: contract-1, malformed, identity-incompatible, or
+publication-provenance-free boxes are blocked before planning, pulling, or
+mutation and require explicit destroy. No old basename-only container or volume
+is copied, adopted, mapped, or discovered by the new path-hashed identity.
+
+First-use planning may create the labelled `-workspace` volume and prepare
+repository checkouts before graph resolution fails. That state is intentionally
+retained for retry. After confirming its data may be lost, an operator can
+remove it directly from the sole owning engine while the box is absent:
+
+```bash
+ENGINE=podman # or docker, as reported by status
+INSTANCE=ploinky-box-WORKSPACE-PATHHASH
+$ENGINE volume rm "$INSTANCE-workspace"
+```
+
+The equivalent deliberate full reset removes all three exact names only after
+the outer box has been destroyed. A legacy basename-only box must be identified
+and removed directly with `$ENGINE rm -f LEGACY_INSTANCE`; omitting the volume
+cleanup flag preserves its old volumes.
 
 `status` bypasses reconciliation and is read-only. `stop` and `destroy` also
 bypass reconciliation: host stop attempts core shutdown before stopping the
-outer runtime, while host destroy confirms the exact instance and removes the
-outer container plus its three volumes. Ordinary agent images intentionally
-contain neither Podman nor Docker; nested container control exists only in the
-outer runtime.
+outer runtime, while host destroy confirms and directly removes the exact outer
+container with anonymous-volume cleanup. The three explicitly named volumes
+remain labelled and attached on the next permitted recreation. An absent box
+with retained volumes is an idempotent destroy success, not a data-cleanup
+request. Ordinary agent images intentionally contain neither Podman nor Docker;
+nested container control exists only in the outer runtime.
 
 ## Commands
 
@@ -115,11 +151,11 @@ The command surface is split between the registry in `cli/services/commandRegist
 | `update all [folder]` | Updates the Ploinky runtime, installed repos, managed-repo default skills, discovered workspace git repos, and default skills for discovered repos. |
 | `reinstall [agent]` / `reinstall agent <agent>` | Removes the running service for an enabled agent, recreates it with `ensureAgentService`, updates routing, and starts the router if needed. |
 | `enable agent <agent> [global|devel <repo>]` | Resolves an agent manifest, writes an enabled-agent record to `.ploinky/agents.json`, and creates work dirs/symlinks. |
-| `enable sandbox` | Allows host sandbox runtimes for manifests with `lite-sandbox: true`. |
+| `enable sandbox` | Outside a Ploinky box, allows host sandbox runtimes for manifests with `lite-sandbox: true`; inside a box, fails because nested Podman is forced. |
 | `disable agent <agent>` | Removes an enabled-agent record only if no live/stopped container or sandbox process exists for it. Symlinks are removed; the work dir is preserved. |
 | `disable agents-all` | Tries to disable all enabled agents and skips ones with live/stopped runtime state. |
-| `disable sandbox` | Disables host sandbox runtimes, causing `lite-sandbox` agents to fall back to containers. |
-| `sandbox status|enable|disable` | Reads or changes the host-sandbox toggle stored under `_config.sandbox`. |
+| `disable sandbox` | Disables host sandbox runtimes, causing `lite-sandbox` agents to fall back to containers; this is already the forced box state. |
+| `sandbox status|enable|disable` | Reads or changes the host-sandbox toggle outside a box; inside a box, status reports forced nested Podman and enable cannot persist an override. |
 | `start [agent] [port] [branch flags]` | Ensures repos/agents/dependencies, starts dependency graph services, writes routing, and launches the router watchdog. |
 | `restart` | Restarts the saved static workspace: kills router, stops configured agents, and calls `startWorkspace`. |
 | `restart router` | Restarts only the router for the saved static workspace. |
@@ -274,10 +310,13 @@ persisted profile cannot silently change the outer publish plan. A core
 `ploinky start` entered in the REPL that omits the flag does not overwrite the active profile
 and may continue using `.ploinky/profile`.
 
-For Explorer publish planning, `explorer`, `AchillesIDE/explorer`, and
-`AssistOSExplorer/explorer` select the same root. The selected workspace profile
-is applied to each graph node; a node that does not define it falls back to its
-own `default` profile. An explicit profile on an `enable` edge is different: it
+The authoritative publication planner applies this profile behavior to any
+resolved root, not to a product-specific allowlist. Bare, slash-qualified, and
+colon-qualified references use normal workspace resolution; in an unambiguous
+boot workspace, `explorer`, `AchillesIDE/explorer`, and
+`AchillesIDE:explorer` are one example of equivalent forms. The selected
+workspace profile is applied to each graph node; a node that does not define it
+falls back to its own `default` profile. An explicit profile on an `enable` edge
 must exist on that child manifest or planning fails and reports the child and
 its available profiles.
 
@@ -364,13 +403,14 @@ Runtime selection details:
 
 | Manifest/config state | Runtime |
 | --- | --- |
+| Inside `/etc/ploinky-box` marked runtime | Nested Podman, regardless of `lite-sandbox` or persisted sandbox configuration. Missing Podman is an error; Docker, bwrap, and Seatbelt are not fallbacks. |
 | `lite-sandbox: true`, sandbox enabled, Linux with `bwrap` | Host bwrap runtime. |
 | `lite-sandbox: true`, sandbox enabled, macOS with `sandbox-exec` | Host seatbelt runtime. |
 | `lite-sandbox: true`, sandbox disabled | Container runtime fallback. |
 | No `lite-sandbox` | Container runtime. |
 | `runtime` is a string | Error. Legacy selector is unsupported. |
 
-The host-sandbox toggle is disabled by default unless `enable sandbox` sets `_config.sandbox.disableHostRuntimes` to false. Environment variable `PLOINKY_DISABLE_HOST_SANDBOX=1` forces host sandbox disabled.
+The host-sandbox toggle is disabled by default unless `enable sandbox` sets `_config.sandbox.disableHostRuntimes` to false. Environment variable `PLOINKY_DISABLE_HOST_SANDBOX=1` forces host sandbox disabled. The box marker makes that policy mandatory: status reports nested Podman as the effective runtime and enabling a host sandbox fails without persisting a misleading setting.
 
 ## Dependency Installation
 
@@ -498,7 +538,7 @@ Open ports come from active profile `openPorts`. Accepted forms include:
 | --- | --- |
 | `7000` | Host port 7000 to container port 7000 on `127.0.0.1`. |
 | `8080:7000` | Host port 8080 to container port 7000 on `127.0.0.1`. |
-| `0:7000` or `:7000` | Ephemeral host port to container port 7000. |
+| `0:7000` or `:7000` | Invalid in `openPorts`; the box-side port must be stable and nonzero. |
 | `127.0.0.1:8080:7000` | Explicit host IP, host port, container port. |
 | `8000-8002:7000-7002` | Port range, same length on both sides. |
 | `8080:7000/udp` | UDP mapping. |
@@ -510,12 +550,26 @@ that synthetic AgentServer mapping. It needs an intentional `openPorts` route,
 a private `additionalServerPort`, a blocking `health.readiness.script`, or
 `readiness.protocol: "none"` according to its service contract.
 
-For managed public Explorer starts, outer publishes are planned before runtime
-reconciliation. The planner walks the enabled graph and treats each effective-profile
-`openPorts` declaration as both an inner exposure and outer-boundary
-eligibility. The manifest's runtime-side port becomes the outer container target;
-the private agent-container target is used for diagnostics and conflict
-comparison, not as the outer target.
+For every managed one-shot path that can start agents, outer publishes are
+planned before runtime reconciliation. This includes `start`, `enable agent`,
+`cli <agent>`, `shell <agent>`, `restart`, and `reinstall`. The authoritative
+planner works from the named workspace's repositories, registry, saved profile,
+branch policy, and normal bare/qualified lookup rules. It includes the resolved
+root, its active transitive graph, aliases as distinct effective instances, and
+additional enabled agents core will start. Each effective-profile `openPorts`
+declaration is both an inner exposure and outer-boundary eligibility. The
+manifest's runtime-side port becomes the outer container target; the private
+agent-container target is used for diagnostics and conflict comparison, not as
+the outer target.
+
+The planner runs through `exec` in a running box. A stopped compatible box stays
+stopped while a uniquely named temporary planner container uses its inspected
+image ID and workspace/source mounts. A missing box first pulls and validates
+the selected image, creates the deterministic labelled workspace volume, plans
+in a temporary container, then creates the final box from the same image ID.
+Temporary containers and anonymous volumes are cleaned on every exit path.
+Allowed checkout preparation and a first-plan workspace volume survive failure
+for retry.
 
 Generated claims accept stable nonzero TCP/UDP ports and equal-length ranges.
 Any overlapping runtime-side interval for the same protocol fails planning unless
@@ -526,9 +580,27 @@ are independent.
 
 Explicit `--publish`/`--expose` values are retained byte-for-byte and in their
 original order. The supervisor parses only the terminal container target interval
-and protocol into a canonical claim. If that target overlaps a generated claim
-for the same protocol, it suppresses the entire generated claim without
-rewriting or splitting the explicit one.
+and protocol into a canonical claim. Explicit target intervals are subtracted
+from same-protocol generated claims: fully covered claims disappear, while
+deterministic uncovered subranges remain without rewriting the explicit values.
+Box-side port zero is rejected before outer or agent mutation. Runtime-generated
+ephemeral mappings for an implicit AgentServer or `additionalServerPort` remain
+separate private routes; they are not declared through `openPorts` and do not
+create an outer claim.
+
+Supported contract-2 boxes persist the publication-plan version and separate
+ordered explicit/generated lists in labels. A new authoritative plan retains
+explicit values when the operator did not restate them and replaces stale
+generated values. Missing, malformed, or oversized provenance fails closed
+rather than inferring ownership from engine inspection.
+
+The supervisor passes the planned socket coverage to core on every forwarded
+one-shot command. Core repeats a coverage check immediately before any runtime
+transition. A REPL, Marketplace, monitor-restart, or other already-in-box path
+cannot recreate its containing box; it proceeds only when existing coverage is
+sufficient. Otherwise it fails before profile, registry, hook, router, or
+agent-container mutation and reports the one-shot host command that can plan
+and reconcile the boundary.
 
 Profile `additionalServerPort` is separate from `openPorts`. It accepts a bare
 port such as `3000` for a service running inside the agent runtime;
@@ -549,12 +621,28 @@ Web Publishing remains the HTTP/WebSocket consolidation layer. Its nginx
 process binds 8081 with a default 404 server even when no routes exist.
 Deployment checks read the generated external OnlyOffice and LiveKit public
 URLs and probe those origins. They do not assume direct host access to private
-ports 8082 or 17000. A graph-aware Explorer start reconciles the selected
-profile's eligible outer publishes before core startup and readiness probing.
+ports 8082, 17000, or 17002. Explorer uses the same generic active-graph reconciliation
+as every other root before core startup and readiness probing.
+
+Every Ploinky-created nested agent, helper, and sidecar container receives the
+exact ownership label `io.assistos.ploinky.managed=1`. On outer-box boot, the
+entrypoint removes running and stopped nested containers selected by that exact
+key/value. It leaves unlabelled, other-value, and near-name containers, nested
+images, and nested named volumes untouched. Enumeration or removal failure
+fails the box self-check. Manual containers have no Ploinky restart or repair
+guarantee.
+
+Because host destroy retains the `-containers` volume, corrupt nested state can
+make the same boot cleanup fail again after recreation. Recovery is explicit:
+inspect and back up that named volume, destroy the outer box, then remove only
+`$INSTANCE-containers` from its owning engine if losing the cached nested
+images, records, and named volumes is acceptable.
 
 ## Host Sandbox Runtimes
 
-Host sandboxes are selected only for `lite-sandbox: true` agents when sandbox support is enabled.
+Outside a marked Ploinky box, host sandboxes are selected only for
+`lite-sandbox: true` agents when sandbox support is enabled. Inside the box,
+the forced nested-Podman rule bypasses both implementations.
 
 ### Linux bwrap
 
@@ -768,7 +856,7 @@ MCP tool and resource commands require router-minted invocation headers before c
 3. Profile `additionalServerPort` does not require a stable manifest host port; container runtimes publish it automatically on a localhost ephemeral port used by the router proxy and, for start-only services, private TCP readiness. It is not outer-boundary eligibility.
 4. Manifest `repos` and `enable` are applied at `start`, not at `enable agent`.
 5. Container runtime dependency installs happen in caches, not in the long-running containers.
-6. Podman and seatbelt copy/stage runtime files; Docker mostly mounts them directly.
+6. Outside a marked box, Podman and seatbelt copy/stage runtime files while Docker mostly mounts them directly; inside the box, every managed agent path uses nested Podman.
 7. `clean` destroys containers but does not explicitly kill the router in the dispatcher path.
 8. `cli/services/help.js` contains cloud help, but `cli/commands/cli.js` treats cloud commands as unavailable in this build.
 9. `client tool --agent` resolves ambiguity, but the observed call path invokes `client.callTool(toolName, payloadObj)` without passing target-agent metadata.

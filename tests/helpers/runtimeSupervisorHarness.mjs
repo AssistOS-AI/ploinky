@@ -1,11 +1,33 @@
+import crypto from 'node:crypto';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import {
     createRuntimeSupervisor,
     runSupervisorWithBoundary,
 } from '../../container/runtime-supervisor.mjs';
 import {
+    IDENTITY_SCHEMA_LABEL,
+    IDENTITY_SCHEMA_VERSION,
+    EXPLICIT_PUBLISHES_LABEL,
+    GENERATED_PUBLISHES_LABEL,
+    PATH_HASH_LABEL,
+    PUBLISH_PLAN_VERSION_LABEL,
+    REQUESTED_IMAGE_LABEL,
+    REQUIRED_IMAGE_ENTRYPOINT,
+    REQUIRED_IMAGE_ENV,
+    REQUIRED_IMAGE_USER,
+    REQUIRED_IMAGE_WORKDIR,
+    REQUIRED_RUNTIME_CONTRACT,
     REQUIRED_RUNTIME_IMAGE,
+    REQUIRED_PUBLISH_PLAN_VERSION,
     RUNTIME_CONTRACT_LABEL,
+    VOLUME_ROLE_LABEL,
+    VOLUME_ROLES,
+    runtimeVolumeNames,
 } from '../../container/runtime-contract.mjs';
+
+const HERE = path.dirname(fileURLToPath(import.meta.url));
+const REPO_ROOT = path.resolve(HERE, '../..');
 
 function writableBuffer() {
     let value = '';
@@ -16,44 +38,207 @@ function writableBuffer() {
                 return true;
             },
         },
-        text() {
-            return value;
-        },
+        text: () => value,
     };
 }
-
-function contractV1Image(id = 'sha256:runtime-v1') {
-    return {
-        Id: id,
-        Config: {
-            Labels: { [RUNTIME_CONTRACT_LABEL]: '1' },
-        },
-    };
-}
-
-function failureCode(failures, signature) {
-    const asCode = (value) => {
-        if (value === undefined || value === null || value === false) return 0;
-        if (value === true) return 1;
-        const code = Number(value);
-        return Number.isFinite(code) && code > 0 ? code : 0;
-    };
-    if (failures instanceof Map) {
-        return asCode(failures.get(signature));
-    }
-    if (failures instanceof Set) return failures.has(signature) ? 1 : 0;
-    if (Array.isArray(failures)) return failures.includes(signature) ? 1 : 0;
-    if (failures && Object.hasOwn(failures, signature)) {
-        return asCode(failures[signature]);
-    }
-    return 0;
-}
-
 function clone(value) {
     return value == null ? value : structuredClone(value);
 }
 
-function publishedBinding(spec) {
+function failureCode(failures, signature) {
+    const raw = failures instanceof Map
+        ? failures.get(signature)
+        : failures instanceof Set
+            ? failures.has(signature)
+            : Array.isArray(failures)
+                ? failures.includes(signature)
+                : failures?.[signature];
+    if (raw === undefined || raw === null || raw === false) return 0;
+    if (raw === true) return 1;
+    const value = Number(raw);
+    return Number.isFinite(value) && value > 0 ? value : 0;
+}
+
+export function identityFor(cwd = '/workspace/demo') {
+    const canonicalPath = path.resolve(cwd);
+    const pathHash = crypto.createHash('sha256')
+        .update(canonicalPath)
+        .digest('hex')
+        .slice(0, 12);
+    const rawSlug = path.basename(canonicalPath)
+        .replace(/[^a-zA-Z0-9_.-]/g, '_')
+        .slice(0, 48);
+    const slug = /[a-zA-Z0-9]/.test(rawSlug) ? rawSlug : 'workspace';
+    return {
+        canonicalPath,
+        pathHash,
+        slug,
+        instance: `ploinky-box-${slug}-${pathHash}`,
+    };
+}
+
+export function contract2Image(id = 'sha256:runtime-2') {
+    return {
+        Id: id,
+        Config: {
+            User: REQUIRED_IMAGE_USER,
+            Env: Object.entries(REQUIRED_IMAGE_ENV)
+                .map(([key, value]) => `${key}=${value}`),
+            WorkingDir: REQUIRED_IMAGE_WORKDIR,
+            Entrypoint: [REQUIRED_IMAGE_ENTRYPOINT],
+            Cmd: null,
+            Volumes: null,
+            Labels: {
+                [RUNTIME_CONTRACT_LABEL]: REQUIRED_RUNTIME_CONTRACT,
+            },
+        },
+    };
+}
+
+export function contract1Image(id = 'sha256:runtime-1') {
+    const image = contract2Image(id);
+    image.Config.Labels[RUNTIME_CONTRACT_LABEL] = '1';
+    return image;
+}
+
+export function ownedVolume(name, pathHash, roleKey) {
+    return {
+        Name: name,
+        Labels: {
+            [IDENTITY_SCHEMA_LABEL]: IDENTITY_SCHEMA_VERSION,
+            [PATH_HASH_LABEL]: pathHash,
+            [VOLUME_ROLE_LABEL]: VOLUME_ROLES[roleKey],
+        },
+    };
+}
+
+export function contract2Container({
+    cwd = '/workspace/demo',
+    engine = 'podman',
+    state = 'running',
+    imageId = 'sha256:runtime-2',
+    requestedImage = REQUIRED_RUNTIME_IMAGE,
+    sourceDir = REPO_ROOT,
+    labels = {},
+    env = {},
+    publishes = {},
+} = {}) {
+    const identity = identityFor(cwd);
+    const names = runtimeVolumeNames(identity.instance);
+    const runtimeLabels = {
+        [REQUESTED_IMAGE_LABEL]: requestedImage,
+        [IDENTITY_SCHEMA_LABEL]: IDENTITY_SCHEMA_VERSION,
+        [PATH_HASH_LABEL]: identity.pathHash,
+        [PUBLISH_PLAN_VERSION_LABEL]: REQUIRED_PUBLISH_PLAN_VERSION,
+        [EXPLICIT_PUBLISHES_LABEL]: '[]',
+        [GENERATED_PUBLISHES_LABEL]: '[]',
+        ...labels,
+    };
+    const raw = {
+        Id: 'container-id-existing',
+        Name: engine === 'docker' ? `/${identity.instance}` : identity.instance,
+        Image: imageId,
+        ImageName: imageId,
+        Config: {
+            Image: imageId,
+            User: 'podman',
+            Env: [
+                ...Object.entries(REQUIRED_IMAGE_ENV)
+                    .map(([key, value]) => `${key}=${value}`),
+                `PLOINKY_RUNTIME_NAME=${identity.instance}`,
+                ...Object.entries(env).map(([key, value]) => `${key}=${value}`),
+            ],
+            Labels: runtimeLabels,
+        },
+        State: { Status: state, Running: state === 'running' },
+        HostConfig: {
+            Privileged: true,
+            Binds: [`${sourceDir}:/opt/ploinky:ro`],
+            PortBindings: {
+                '8080/tcp': [{ HostIp: '127.0.0.1', HostPort: '8080' }],
+                ...publishes,
+            },
+            Devices: [
+                {
+                    PathOnHost: '/dev/fuse',
+                    PathInContainer: '/dev/fuse',
+                    CgroupPermissions: 'rwm',
+                },
+                {
+                    PathOnHost: '/dev/net/tun',
+                    PathInContainer: '/dev/net/tun',
+                    CgroupPermissions: 'rwm',
+                },
+            ],
+            SecurityOpt: ['seccomp=unconfined'],
+        },
+        Mounts: [
+            {
+                Type: 'volume', Name: names.workspace, Source: names.workspace,
+                Destination: '/workspace', Mode: '', RW: true,
+            },
+            {
+                Type: 'volume', Name: names.containers, Source: names.containers,
+                Destination: '/home/podman/.local/share/containers', Mode: '', RW: true,
+            },
+            {
+                Type: 'volume', Name: names.deps, Source: names.deps,
+                Destination: '/opt/ploinky/node_modules', Mode: engine === 'podman' ? 'U' : '', RW: true,
+            },
+            {
+                Type: 'bind', Source: sourceDir, Destination: '/opt/ploinky',
+                Mode: 'ro', RW: false,
+            },
+        ],
+    };
+    return {
+        inspect: raw,
+        logs: '[ploinky-box] self-check OK\n',
+        coreStatus: 0,
+        coreStdout: 'core: running\n',
+        depsInstalled: true,
+    };
+}
+
+export function contract2RuntimeFixture(options = {}) {
+    const cwd = options.cwd || '/workspace/demo';
+    const identity = identityFor(cwd);
+    const names = runtimeVolumeNames(identity.instance);
+    const image = contract2Image(options.imageId);
+    const container = contract2Container({ ...options, cwd, imageId: image.Id });
+    return {
+        container,
+        images: {
+            [image.Id]: image,
+            [options.requestedImage || REQUIRED_RUNTIME_IMAGE]: image,
+        },
+        volumes: Object.fromEntries(Object.keys(VOLUME_ROLES).map(roleKey => {
+            const volume = ownedVolume(names[roleKey], identity.pathHash, roleKey);
+            return [volume.Name, volume];
+        })),
+        identity,
+    };
+}
+
+function normalizeInputVolumes(volumes) {
+    if (volumes instanceof Map) {
+        return new Map([...volumes].map(([name, value]) => [name, clone(value)]));
+    }
+    if (Array.isArray(volumes)) {
+        return new Map(volumes.map(value => {
+            if (typeof value === 'string') return [value, { Name: value, Labels: {} }];
+            return [value.Name, clone(value)];
+        }));
+    }
+    return new Map(Object.entries(volumes || {}).map(([name, value]) => [
+        name,
+        value?.Name
+            ? clone(value)
+            : { Name: name, Labels: clone(value?.Labels || value || {}) },
+    ]));
+}
+
+function parsePublishedBinding(spec) {
     const slash = spec.lastIndexOf('/');
     const protocol = slash === -1 ? 'tcp' : spec.slice(slash + 1);
     const address = slash === -1 ? spec : spec.slice(0, slash);
@@ -63,95 +248,90 @@ function publishedBinding(spec) {
     const hostIp = parts.length >= 3 ? parts.slice(0, -2).join(':') : '';
     return {
         target: `${containerPort}/${protocol}`,
-        value: { HostIp: hostIp, HostPort: hostPort },
+        binding: { HostIp: hostIp, HostPort: hostPort },
     };
 }
 
-function inspectFromRunArgs(engine, args, images, volumes) {
+function inspectFromRunArgs(engine, args, images, anonymousVolumes) {
+    const image = images[args.at(-1)] || {};
+    const imageEnv = image.Config?.Env || [];
     const inspect = {
-        Id: 'container-id-created',
+        Id: `container-id-${Date.now()}`,
         Name: '',
-        Image: '',
-        Config: { Image: args.at(-1), User: '', Env: [] },
+        Image: image.Id || image.ID || args.at(-1),
+        ImageName: args.at(-1),
+        Config: {
+            Image: args.at(-1), User: '', Env: [...imageEnv],
+            Labels: { ...(image.Config?.Labels || {}) },
+        },
         State: { Status: 'running', Running: true },
         HostConfig: {
-            Privileged: false,
-            Binds: [],
-            PortBindings: {},
-            Devices: [],
-            SecurityOpt: [],
+            Privileged: false, Binds: [], PortBindings: {}, Devices: [], SecurityOpt: [],
         },
         Mounts: [],
     };
+    const inheritedVolumes = Object.keys(image.Config?.Volumes || {});
+    for (const destination of inheritedVolumes) {
+        const name = `anonymous-${anonymousVolumes.size + 1}`;
+        anonymousVolumes.add(name);
+        inspect.Mounts.push({
+            Type: 'volume', Name: name, Source: name, Destination: destination,
+            Mode: '', RW: true,
+        });
+    }
     for (let index = 1; index < args.length - 1; index += 1) {
         const arg = args[index];
-        if (arg === '--name') {
-            inspect.Name = args[++index];
-            continue;
-        }
-        if (arg === '--privileged') {
-            inspect.HostConfig.Privileged = true;
-            continue;
-        }
-        if (arg === '--user') {
-            inspect.Config.User = args[++index];
-            continue;
-        }
-        if (arg === '--device') {
-            const [PathOnHost, PathInContainer, CgroupPermissions = 'rwm'] =
-                args[++index].split(':');
-            inspect.HostConfig.Devices.push({
-                PathOnHost,
-                PathInContainer,
-                CgroupPermissions,
-            });
-            continue;
-        }
-        if (arg === '--security-opt') {
-            inspect.HostConfig.SecurityOpt.push(args[++index]);
-            continue;
-        }
-        if (arg === '-p') {
-            const binding = publishedBinding(args[++index]);
-            inspect.HostConfig.PortBindings[binding.target] ||= [];
-            inspect.HostConfig.PortBindings[binding.target].push(binding.value);
-            continue;
-        }
-        if (arg === '-e') {
-            inspect.Config.Env.push(args[++index]);
-            continue;
-        }
-        if (arg === '-v') {
+        if (arg === '--name') inspect.Name = args[++index];
+        else if (arg === '--privileged') inspect.HostConfig.Privileged = true;
+        else if (arg === '--user') inspect.Config.User = args[++index];
+        else if (arg === '--label') {
             const value = args[++index];
-            const [source, destination, ...options] = value.split(':');
-            const mode = options.join(':');
-            const isNamedVolume = !source.startsWith('/');
-            if (isNamedVolume) {
-                volumes.add(source);
-                inspect.Mounts.push({
-                    Type: 'volume',
-                    Name: source,
-                    Source: source,
-                    Destination: destination,
-                    Mode: mode,
-                    RW: !mode.split(',').includes('ro'),
-                });
-            } else {
+            const split = value.indexOf('=');
+            inspect.Config.Labels[value.slice(0, split)] = value.slice(split + 1);
+        } else if (arg === '--device') {
+            const [PathOnHost, PathInContainer, CgroupPermissions = 'rwm'] = args[++index].split(':');
+            inspect.HostConfig.Devices.push({ PathOnHost, PathInContainer, CgroupPermissions });
+        } else if (arg === '--security-opt') inspect.HostConfig.SecurityOpt.push(args[++index]);
+        else if (arg === '-p') {
+            const parsed = parsePublishedBinding(args[++index]);
+            inspect.HostConfig.PortBindings[parsed.target] ||= [];
+            inspect.HostConfig.PortBindings[parsed.target].push(parsed.binding);
+        } else if (arg === '-e') {
+            const entry = args[++index];
+            const key = entry.slice(0, entry.indexOf('='));
+            inspect.Config.Env = inspect.Config.Env.filter(value => !value.startsWith(`${key}=`));
+            inspect.Config.Env.push(entry);
+        } else if (arg === '-v') {
+            const value = args[++index];
+            const [source, destination, ...rest] = value.split(':');
+            const mode = rest.join(':');
+            if (source.startsWith('/')) {
                 inspect.HostConfig.Binds.push(value);
                 inspect.Mounts.push({
-                    Type: 'bind',
-                    Source: source,
-                    Destination: destination,
-                    Mode: mode,
-                    RW: !mode.split(',').includes('ro'),
+                    Type: 'bind', Source: source, Destination: destination,
+                    Mode: mode, RW: !mode.split(',').includes('ro'),
+                });
+            } else {
+                inspect.Mounts.push({
+                    Type: 'volume', Name: source, Source: source, Destination: destination,
+                    Mode: mode, RW: !mode.split(',').includes('ro'),
                 });
             }
         }
     }
-    const image = images[inspect.Config.Image];
-    inspect.Image = image?.Id || image?.ID || 'sha256:runtime-v1';
-    if (engine === 'podman') inspect.ImageName = inspect.Config.Image;
+    if (engine === 'docker') inspect.Name = `/${inspect.Name}`;
     return inspect;
+}
+
+function nextPullImage(pullImages, reference) {
+    const configured = pullImages?.[reference];
+    if (Array.isArray(configured)) {
+        if (configured.length === 0) return null;
+        return clone(configured.shift());
+    }
+    if (typeof configured === 'function') return clone(configured(reference));
+    if (configured) return clone(configured);
+    return reference === REQUIRED_RUNTIME_IMAGE ? contract2Image() : null;
 }
 
 export function createFakeEngine({
@@ -159,46 +339,40 @@ export function createFakeEngine({
     container = null,
     images = {},
     pullImages = {},
-    volumes = [],
+    volumes = {},
+    anonymousVolumes = [],
     failures = {},
     replacementFailureCreatesContainer = false,
-    replacementCleanupFailureRemovesContainer = false,
+    createFailureCreatesContainer = false,
+    rmFailureRemovesContainer = false,
+    plannerCapture,
     stdout = { write() { return true; } },
     stderr = { write() { return true; } },
 } = {}) {
     const calls = [];
-    const configuredVolumes = volumes instanceof Set
-        ? [...volumes]
-        : (Array.isArray(volumes)
-            ? volumes
-            : Object.values(volumes || {}));
     const state = {
         container: clone(container),
         images: clone(images) || {},
-        volumes: new Set(configuredVolumes),
+        volumes: normalizeInputVolumes(volumes),
+        anonymousVolumes: new Set(anonymousVolumes),
+        temporaryContainers: new Set(),
     };
-    const inspectedMounts = state.container?.inspect?.Mounts;
-    for (const mount of Array.isArray(inspectedMounts) ? inspectedMounts : []) {
-        if (mount.Type === 'volume' && mount.Name) {
-            state.volumes.add(mount.Name);
-        }
-    }
     let inspectedOld = false;
-    let reconciliationRunState = 'idle';
+    let reconciliationState = 'idle';
 
+    const result = (ok, stdoutValue = '', stderrValue = '') => ({
+        ok, status: ok ? 0 : 1, stdout: stdoutValue, stderr: stderrValue,
+    });
     const fail = (signature, options = {}) => {
         const code = failureCode(failures, signature);
-        if (code === 0) return 0;
+        if (!code) return 0;
         if (options.allowFail) return code;
-        throw new Error(`${engine} ${signature} exited ${code}`);
+        const error = new Error(`${engine} ${signature} exited ${code}`);
+        error.exitCode = code;
+        throw error;
     };
-    const containerFromRunArgs = (args) => ({
-        inspect: inspectFromRunArgs(
-            engine,
-            args,
-            state.images,
-            state.volumes,
-        ),
+    const createdContainer = args => ({
+        inspect: inspectFromRunArgs(engine, args, state.images, state.anonymousVolumes),
         logs: '[ploinky-box] self-check OK\n',
         coreStatus: 0,
         coreStdout: 'core: running\n',
@@ -207,137 +381,135 @@ export function createFakeEngine({
 
     const engineClient = {
         name: engine,
-        query(args) {
-            calls.push({ kind: 'query', args: [...args], options: {} });
-            if (args[0] === 'machine' && args[1] === 'inspect') {
-                return { ok: true, status: 0, stdout: 'running\n', stderr: '' };
-            }
+        query(args, options = {}) {
+            calls.push({ kind: 'query', args: [...args], options: { ...options } });
             if (args[0] === 'info') {
-                const stdoutValue = args.includes('{{json .SecurityOptions}}')
-                    ? '[]\n'
-                    : (args.includes('{{.Host.Security.SELinuxEnabled}}')
-                        ? 'false\n'
-                        : '{}\n');
-                return { ok: true, status: 0, stdout: stdoutValue, stderr: '' };
+                if (failureCode(failures, 'info')) return result(false, '', 'engine unavailable');
+                if (args.includes('{{json .SecurityOptions}}')) return result(true, '[]\n');
+                if (args.includes('{{.Host.Security.SELinuxEnabled}}')) return result(true, 'false\n');
+                return result(true, '{}\n');
             }
             if (args[0] === 'container' && args[1] === 'inspect') {
-                const fullInspect = !args.includes('--format');
+                if (failureCode(failures, 'container inspect')) {
+                    return result(false, '', 'permission denied');
+                }
+                const formatted = args.includes('--format');
+                const target = args.at(-1);
+                if (state.temporaryContainers.has(target)) {
+                    return formatted
+                        ? result(true, `temporary-${target}\n`)
+                        : result(true, JSON.stringify([{ Id: `temporary-${target}`, Name: target }]));
+                }
+                const managedName = String(state.container?.inspect?.Name || '').replace(/^\//, '');
+                if (state.container && target !== managedName) {
+                    return result(false, '', 'container not found');
+                }
                 if (!state.container) {
-                    if (fullInspect) {
-                        reconciliationRunState = 'idle';
+                    if (!formatted) {
                         inspectedOld = false;
+                        if (reconciliationState !== 'rollback-ready') reconciliationState = 'idle';
                     }
-                    return { ok: false, status: 1, stdout: '', stderr: 'missing' };
+                    return result(false, '', 'container not found');
                 }
-                if (!fullInspect) {
-                    return {
-                        ok: true,
-                        status: 0,
-                        stdout: `${state.container.inspect.State.Status}\n`,
-                        stderr: '',
-                    };
+                if (formatted) {
+                    const format = args[args.indexOf('--format') + 1] || '';
+                    const value = format.includes('State.Status')
+                        ? state.container.inspect.State.Status
+                        : state.container.inspect.Id;
+                    return result(true, `${value}\n`);
                 }
-                reconciliationRunState = 'idle';
                 inspectedOld = true;
-                return {
-                    ok: true,
-                    status: 0,
-                    stdout: JSON.stringify([state.container.inspect]),
-                    stderr: '',
-                };
+                return result(true, JSON.stringify([state.container.inspect]));
             }
             if (args[0] === 'image' && args[1] === 'inspect') {
                 const image = state.images[args[2]];
                 return image
-                    ? {
-                        ok: true,
-                        status: 0,
-                        stdout: JSON.stringify([image]),
-                        stderr: '',
-                    }
-                    : { ok: false, status: 1, stdout: '', stderr: 'missing' };
+                    ? result(true, JSON.stringify([image]))
+                    : result(false, '', 'image not found');
             }
             if (args[0] === 'volume' && args[1] === 'inspect') {
-                const ok = state.volumes.has(args[2]);
-                return { ok, status: ok ? 0 : 1, stdout: '', stderr: '' };
+                if (
+                    failureCode(failures, `volume inspect ${args[2]}`)
+                    || failureCode(failures, 'volume inspect')
+                ) return result(false, '', 'permission denied');
+                const volume = state.volumes.get(args[2]);
+                return volume
+                    ? result(true, JSON.stringify([volume]))
+                    : result(false, '', 'volume not found');
             }
             if (args[0] === 'port') {
                 const binding = state.container?.inspect?.HostConfig
                     ?.PortBindings?.['8080/tcp']?.[0];
-                const value = binding
-                    ? `${binding.HostIp || '0.0.0.0'}:${binding.HostPort}\n`
-                    : '';
-                return {
-                    ok: Boolean(binding),
-                    status: binding ? 0 : 1,
-                    stdout: value,
-                    stderr: '',
-                };
+                return binding
+                    ? result(true, `${binding.HostIp || '0.0.0.0'}:${binding.HostPort}\n`)
+                    : result(false, '', 'port not found');
             }
             if (args[0] === 'exec') {
                 const installed = state.container?.depsInstalled !== false;
-                return {
-                    ok: installed,
-                    status: installed ? 0 : 1,
-                    stdout: '',
-                    stderr: '',
-                };
+                return result(installed, '', installed ? '' : 'dependencies missing');
             }
-            return { ok: false, status: 1, stdout: '', stderr: 'unsupported query' };
+            return result(false, '', 'unsupported query');
         },
         run(args, options = {}) {
             calls.push({ kind: 'run', args: [...args], options: { ...options } });
             if (args[0] === 'pull') {
-                const failed = fail('pull', options);
-                if (failed) return failed;
-                const reference = args[1];
-                const image = reference === REQUIRED_RUNTIME_IMAGE
-                    ? contractV1Image()
-                    : clone(pullImages[reference]);
-                if (!image) {
-                    if (options.allowFail) return 1;
-                    throw new Error(`${engine} pull exited 1`);
-                }
-                state.images[reference] = image;
+                const code = fail('pull', options);
+                if (code) return code;
+                const image = nextPullImage(pullImages, args[1]);
+                if (!image) return fail('pull unavailable', { ...options, allowFail: true }) || 1;
+                state.images[args[1]] = image;
                 state.images[image.Id || image.ID] = image;
                 return 0;
             }
-            if (args[0] === 'run') {
-                const signature = reconciliationRunState === 'rollback-ready'
-                    ? 'run rollback'
-                    : (reconciliationRunState === 'replacement-ready'
-                        ? 'run replacement'
-                        : 'run create');
-                if (state.container) {
-                    if (options.allowFail) return 1;
-                    throw new Error(
-                        `${engine} ${signature} failed: container name already in use`,
-                    );
+            if (args[0] === 'volume' && args[1] === 'create') {
+                const code = fail('volume create', options);
+                if (code) return code;
+                const labels = {};
+                for (let index = 2; index < args.length - 1; index += 1) {
+                    if (args[index] !== '--label') continue;
+                    const raw = args[++index];
+                    const split = raw.indexOf('=');
+                    labels[raw.slice(0, split)] = raw.slice(split + 1);
                 }
+                const name = args.at(-1);
+                if (!state.volumes.has(name)) state.volumes.set(name, { Name: name, Labels: labels });
+                return 0;
+            }
+            if (args[0] === 'run') {
+                const signature = reconciliationState === 'rollback-ready'
+                    ? 'run rollback'
+                    : reconciliationState === 'replacement-ready'
+                        ? 'run replacement'
+                        : 'run create';
+                if (state.container) return fail('run name conflict', { ...options, allowFail: true }) || 1;
                 const code = failureCode(failures, signature);
-                if (code !== 0) {
+                if (code) {
                     if (signature === 'run replacement') {
+                        reconciliationState = 'rollback-ready';
                         if (replacementFailureCreatesContainer) {
-                            state.container = containerFromRunArgs(args);
+                            state.container = createdContainer(args);
                             state.container.inspect.State.Status = 'exited';
                             state.container.inspect.State.Running = false;
                         }
-                        reconciliationRunState = 'rollback-ready';
+                    } else if (signature === 'run create' && createFailureCreatesContainer) {
+                        state.container = createdContainer(args);
+                        state.container.inspect.State.Status = 'exited';
+                        state.container.inspect.State.Running = false;
                     }
                     if (options.allowFail) return code;
-                    throw new Error(`${engine} ${signature} exited ${code}`);
+                    const error = new Error(`${engine} ${signature} exited ${code}`);
+                    error.exitCode = code;
+                    throw error;
                 }
-                state.container = containerFromRunArgs(args);
-                if (signature === 'run replacement') {
-                    reconciliationRunState = 'replacement-created';
-                } else if (signature === 'run rollback') {
-                    reconciliationRunState = 'idle';
-                }
+                state.container = createdContainer(args);
+                reconciliationState = signature === 'run replacement'
+                    ? 'replacement-created'
+                    : 'idle';
                 return 0;
             }
             if (args[0] === 'start') {
-                const failed = fail('start', options);
-                if (failed) return failed;
+                const code = fail('start', options);
+                if (code) return code;
                 if (state.container) {
                     state.container.inspect.State.Status = 'running';
                     state.container.inspect.State.Running = true;
@@ -345,8 +517,8 @@ export function createFakeEngine({
                 return 0;
             }
             if (args[0] === 'stop') {
-                const failed = fail('stop', options);
-                if (failed) return failed;
+                const code = fail('stop', options);
+                if (code) return code;
                 if (state.container) {
                     state.container.inspect.State.Status = 'exited';
                     state.container.inspect.State.Running = false;
@@ -354,74 +526,101 @@ export function createFakeEngine({
                 return 0;
             }
             if (args[0] === 'rm') {
-                const phaseSignature = [
-                    'replacement-created',
-                    'rollback-ready',
-                ].includes(reconciliationRunState)
-                    ? 'rm replacement cleanup'
+                const target = args.at(-1);
+                if (state.temporaryContainers.has(target)) {
+                    const code = fail('rm planner', options);
+                    if (code) return code;
+                    state.temporaryContainers.delete(target);
+                    return 0;
+                }
+                const replacementCleanup = ['replacement-created', 'rollback-ready']
+                    .includes(reconciliationState);
+                const signature = args.includes('-f')
+                    ? replacementCleanup
+                        ? 'rm replacement cleanup'
+                        : 'rm transaction cleanup'
                     : 'rm container';
-                let failed = fail(phaseSignature, options);
-                if (!failed && phaseSignature !== 'rm container') {
-                    failed = fail('rm container', options);
+                if (
+                    signature === 'rm container'
+                    && rmFailureRemovesContainer
+                    && failureCode(failures, signature)
+                ) {
+                    state.container = null;
+                    reconciliationState = 'rollback-ready';
                 }
-                if (failed) {
-                    if (
-                        phaseSignature === 'rm replacement cleanup'
-                        && replacementCleanupFailureRemovesContainer
-                    ) {
-                        state.container = null;
-                        inspectedOld = false;
-                    }
-                    return failed;
-                }
-                if (state.container) {
-                    if (reconciliationRunState === 'replacement-created') {
-                        reconciliationRunState = 'rollback-ready';
-                    } else if (
-                        reconciliationRunState === 'idle'
-                        && inspectedOld
-                    ) {
-                        reconciliationRunState = 'replacement-ready';
-                    }
-                }
+                const code = fail(signature, options);
+                if (code) return code;
+                if (args.includes('--volumes')) state.anonymousVolumes.clear();
+                if (reconciliationState === 'replacement-created') reconciliationState = 'rollback-ready';
+                else if (reconciliationState === 'idle' && inspectedOld) reconciliationState = 'replacement-ready';
                 inspectedOld = false;
                 state.container = null;
                 return 0;
             }
             if (args[0] === 'volume' && args[1] === 'rm') {
-                const failed = fail('volume rm', options);
-                if (failed) return failed;
+                const code = fail('volume rm', options);
+                if (code) return code;
                 for (const name of args.slice(2)) state.volumes.delete(name);
                 return 0;
             }
             if (args[0] === 'exec') {
-                const stopIndex = args.indexOf('ploinky');
-                if (stopIndex !== -1 && args[stopIndex + 1] === 'stop') {
+                const coreIndex = args.indexOf('ploinky');
+                if (coreIndex !== -1 && args[coreIndex + 1] === 'stop') {
                     return fail('exec ploinky stop', options);
                 }
-                if (stopIndex !== -1 && args[stopIndex + 1] === 'status') {
-                    const code = state.container?.coreStatus || 0;
-                    if (state.container?.coreStdout) {
-                        stdout.write(state.container.coreStdout);
-                    }
-                    if (code !== 0 && !options.allowFail) {
-                        throw new Error(`${engine} exec ploinky status exited ${code}`);
-                    }
-                    return code;
+                if (coreIndex !== -1 && args[coreIndex + 1] === 'status') {
+                    if (state.container?.coreStdout) stdout.write(state.container.coreStdout);
+                    return state.container?.coreStatus || 0;
                 }
-                return 0;
+                return fail('exec', options);
             }
             return 0;
         },
+        async capture(args, options = {}) {
+            calls.push({ kind: 'capture', args: [...args], options: { ...options } });
+            if (args[0] === 'run') {
+                const nameIndex = args.indexOf('--name');
+                if (nameIndex >= 0) state.temporaryContainers.add(args[nameIndex + 1]);
+            }
+            if (typeof plannerCapture === 'function') {
+                return plannerCapture(args, options, state);
+            }
+            const code = failureCode(failures, 'capture planner');
+            if (code) {
+                return {
+                    ok: false,
+                    status: code,
+                    stdout: '',
+                    stderr: 'planner failed',
+                    error: null,
+                    signal: null,
+                    timedOut: false,
+                    overflow: false,
+                };
+            }
+            const request = JSON.parse(String(options.input || '{}'));
+            const explicitPublishes = request.explicitPublishes || [];
+            const value = {
+                schemaVersion: 1,
+                operation: request.operation,
+                explicitPublishes,
+                generatedPublishes: [],
+                publishes: explicitPublishes,
+            };
+            return {
+                ok: true,
+                status: 0,
+                stdout: JSON.stringify(value),
+                stderr: '',
+                error: null,
+                signal: null,
+                timedOut: false,
+                overflow: false,
+            };
+        },
         streamContains(args, needle) {
-            calls.push({
-                kind: 'streamContains',
-                args: [...args],
-                options: { needle },
-            });
-            return Promise.resolve(
-                String(state.container?.logs || '').includes(needle),
-            );
+            calls.push({ kind: 'streamContains', args: [...args], options: { needle } });
+            return Promise.resolve(String(state.container?.logs || '').includes(needle));
         },
         streamToStderr(args) {
             calls.push({ kind: 'streamToStderr', args: [...args], options: {} });
@@ -429,7 +628,6 @@ export function createFakeEngine({
             return Promise.resolve(0);
         },
     };
-
     return { engineClient, calls, state };
 }
 
@@ -445,65 +643,62 @@ export function createSupervisorHarness(options = {}) {
         stderr: stderr.stream,
     });
     const stdin = options.stdin || { isTTY: Boolean(options.stdoutIsTTY) };
-    const failures = options.failures || {};
     const waitHealthy = async (_cfg, phase) => {
-        fake.calls.push({
-            kind: 'health',
-            phase,
-            args: [],
-            options: { phase },
-        });
-        const code = failureCode(failures, `health ${phase}`);
-        if (code !== 0) {
-            throw new Error(`health ${phase} exited ${code}`);
-        }
+        fake.calls.push({ kind: 'health', phase, args: [], options: { phase } });
+        const code = failureCode(options.failures || {}, `health ${phase}`);
+        if (code) throw new Error(`health ${phase} exited ${code}`);
     };
     const dependencies = {
-        stdout: Object.assign(stdout.stream, {
-            isTTY: Boolean(options.stdoutIsTTY),
-        }),
+        stdout: Object.assign(stdout.stream, { isTTY: Boolean(options.stdoutIsTTY) }),
         stderr: stderr.stream,
         stdin,
         cwd: options.cwd || '/workspace/demo',
+        realpath: options.realpath || (value => path.resolve(value)),
         env: {
             PLOINKY_BOX_BRANCH: 'main',
+            PLOINKY_BOX_SOURCE: REPO_ROOT,
             ...(options.env || {}),
         },
-        detectEngine: () => engine,
         engineClient: fake.engineClient,
         sleep: async () => {},
         waitHealthy,
         portInUse: async () => false,
-        askLine: async (text) => {
+        askLine: async text => {
             prompt += text;
             stdout.stream.write(text);
             return options.answer ?? null;
         },
-        fetch: async () => options.fetchResponse || { ok: false },
+        fetch: async url => {
+            fake.calls.push({ kind: 'fetch', url, args: [], options: {} });
+            return options.fetchResponse || { ok: false };
+        },
+        preparePublicationPlan: options.useProductionPlanner
+            ? undefined
+            : options.preparePublicationPlan || (async request => ({
+                schemaVersion: 1,
+                operation: request.operation,
+                explicitPublishes: request.explicitPublishes || [],
+                generatedPublishes: [],
+                publishes: request.explicitPublishes || [],
+            })),
+        withHostRuntimeLock: options.withHostRuntimeLock
+            || (async (_invocation, callback) => callback()),
+        showHelp: options.showHelp || (() => {}),
     };
     const rawSupervisor = createRuntimeSupervisor(dependencies);
     const supervisor = {
         run(argv) {
-            return runSupervisorWithBoundary(
-                rawSupervisor,
-                argv,
-                stderr.stream,
-            );
+            return runSupervisorWithBoundary(rawSupervisor, argv, stderr.stream);
         },
     };
     return {
         supervisor,
         rawSupervisor,
+        engineClient: fake.engineClient,
         calls: fake.calls,
         state: fake.state,
-        get stdout() {
-            return stdout.text();
-        },
-        get stderr() {
-            return stderr.text();
-        },
-        get prompt() {
-            return prompt;
-        },
+        get stdout() { return stdout.text(); },
+        get stderr() { return stderr.text(); },
+        get prompt() { return prompt; },
     };
 }

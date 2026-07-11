@@ -1,7 +1,14 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { verifyEnabledAgentStarted } from '../../cli/services/agents.js';
+import { enableAgent, verifyEnabledAgentStarted } from '../../cli/services/agents.js';
+
+test('enable agent forwards its selected explicit profile to the synchronous service launch', () => {
+    assert.match(
+        enableAgent.toString(),
+        /ensureAgentService\([\s\S]*?profileName:\s*profile\s*\|\|\s*undefined/,
+    );
+});
 
 test('verifyEnabledAgentStarted logs when the enabled agent container is running', () => {
     const logs = [];

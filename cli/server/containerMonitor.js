@@ -440,7 +440,11 @@ async function performContainerRestart(monitor, target, reason) {
 
     try {
         const agentDir = path.dirname(target.manifestPath);
-        const result = ensureAgentService(target.agentName, manifest, agentDir, { containerName: target.containerName });
+        const ensureAgentServiceImpl = monitor.ensureAgentService || ensureAgentService;
+        const result = ensureAgentServiceImpl(target.agentName, manifest, agentDir, {
+            containerName: target.containerName,
+            commandHint: `ploinky restart ${target.alias || target.agentName}`,
+        });
         if (result?.containerName && result.containerName !== target.containerName) {
             const oldName = target.containerName;
             monitor.targets.delete(oldName);
@@ -467,7 +471,8 @@ async function performContainerRestart(monitor, target, reason) {
         });
     } catch (error) {
         target.lastError = error?.message || error;
-        logEvent(monitor, 'error', 'container_restart_failed', {
+        const publicationDenied = error?.code === 'PLOINKY_OUTER_PUBLICATION_REQUIRED';
+        logEvent(monitor, 'error', publicationDenied ? 'container_restart_publication_denied' : 'container_restart_failed', {
             container: target.containerName,
             agent: target.agentName,
             repo: target.repoName,
@@ -475,7 +480,8 @@ async function performContainerRestart(monitor, target, reason) {
             error: target.lastError
         });
         target.isRestarting = false;
-        scheduleContainerRestart(monitor, target, 'restart_failed');
+        const scheduleRestart = monitor.scheduleContainerRestart || scheduleContainerRestart;
+        scheduleRestart(monitor, target, publicationDenied ? 'publication_denied' : 'restart_failed');
         return;
     }
 
@@ -597,3 +603,5 @@ export function clearContainerTargets(monitor) {
     stopContainerMonitor(monitor);
     monitor.targets.clear();
 }
+
+export { performContainerRestart };

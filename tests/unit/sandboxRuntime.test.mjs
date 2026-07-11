@@ -259,3 +259,64 @@ test('sandbox startup failure guidance does not promise implicit container fallb
         fs.rmSync(root, { recursive: true, force: true });
     }
 });
+
+test('Ploinky box marker forces every manifest through nested Podman', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-sandbox-box-'));
+    try {
+        const binDir = makeFakeRuntimeBin(root, 'podman');
+        const marker = path.join(root, 'ploinky-box');
+        fs.writeFileSync(marker, '1\n');
+        const script = `
+            const { getSandboxStatus } = await import(${JSON.stringify(sandboxRuntimeUrl)});
+            const { getRuntimeForAgent } = await import(${JSON.stringify(dockerCommonUrl)});
+            console.log(JSON.stringify({
+                status: getSandboxStatus(),
+                lite: getRuntimeForAgent({ 'lite-sandbox': true }),
+                legacy: getRuntimeForAgent({ runtime: 'bwrap' }),
+            }));
+        `;
+        const result = runModuleScript({
+            cwd: root,
+            env: {
+                PATH: `${binDir}${path.delimiter}${process.env.PATH || ''}`,
+                PLOINKY_BOX_MARKER_PATH: marker,
+            },
+            script,
+        });
+        assert.equal(result.status, 0, result.stderr || result.stdout);
+        const output = parseLastJsonLine(result.stdout);
+        assert.equal(output.status.forced, true);
+        assert.equal(output.status.source, 'ploinky-box');
+        assert.equal(output.status.effectiveRuntime, 'podman');
+        assert.equal(output.lite, 'podman');
+        assert.equal(output.legacy, 'podman');
+    } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+    }
+});
+
+test('Ploinky box never falls back to Docker when nested Podman is missing', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-sandbox-box-docker-'));
+    try {
+        const binDir = makeFakeRuntimeBin(root, 'docker');
+        const marker = path.join(root, 'ploinky-box');
+        fs.writeFileSync(marker, '1\n');
+        const script = `
+            const { getRuntime } = await import(${JSON.stringify(dockerCommonUrl)});
+            try { getRuntime(); console.log(JSON.stringify({ ok: true })); }
+            catch (error) { console.log(JSON.stringify({ ok: false, code: error.code, message: error.message })); }
+        `;
+        const result = runModuleScript({
+            cwd: root,
+            env: { PATH: binDir, PLOINKY_BOX_MARKER_PATH: marker },
+            script,
+        });
+        assert.equal(result.status, 0, result.stderr || result.stdout);
+        const output = parseLastJsonLine(result.stdout);
+        assert.equal(output.ok, false);
+        assert.equal(output.code, 'PLOINKY_BOX_PODMAN_REQUIRED');
+        assert.match(output.message, /Docker fallback is not permitted/);
+    } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+    }
+});

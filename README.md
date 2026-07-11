@@ -63,26 +63,39 @@ dependency volume. Ordinary agent containers run one level inside this runtime.
 | `ploinky start ...` | Reconcile/start outer runtime; preserve graph publishes and router readiness |
 | `ploinky status` | Inspect outer contract/publishes/health and running core status without mutation |
 | `ploinky stop` | Stop core services, then stop outer runtime; keep volumes |
-| `ploinky destroy` | Confirm exact instance and remove its container plus three volumes |
+| `ploinky destroy` | Confirm and directly remove the outer container; retain its three named volumes |
 | REPL `status`/`stop`/`destroy` | Core workspace/router/agent scope; outer runtime remains |
 
-The required outer image is the immutable
-`docker.io/assistos/ploinky-box:podman-node24-runtime-v1` reference with the
-exact label `io.assistos.ploinky.runtime-contract=1`. Omitted creation flags
-preserve the inspected image, publishes, mounts, listening scope, devices,
-security settings, environment, and named-volume attachments. Migration applies
-only when `--image` is omitted and the inspected image is exactly
-`docker.io/assistos/ploinky-box:podman-node24` or
-`assistos/ploinky-box:podman-node24`. An omitted incompatible custom reference
-remains selected, is force-pulled and validated before any mutation, and fails
-without disturbing the old runtime if it still lacks contract 1. A failed
-replacement restores the previous image and normalized creation configuration
-while leaving all three volumes intact.
+The required outer image is the mutable
+`docker.io/assistos/ploinky-box:runtime` reference with the exact label
+`io.assistos.ploinky.runtime-contract=2`. Ploinky pulls that reference only when
+creating a missing box or intentionally replacing an existing one, validates the
+complete image metadata, and starts the captured image ID rather than racing the
+mutable tag. Compatible reuse, stopped-box start, status, stop, and destroy do
+not pull. Contract-1 or contract-2 boxes without current identity and publication
+provenance labels are rejected; there is no migration or adoption path.
 
-Release ordering is manual and strict: publish and independently validate the
-immutable runtime image first, then adopt that exact reference in Ploinky.
-Ordinary agent images intentionally contain neither Podman nor Docker; nested
-container control belongs only to the managed outer runtime.
+The outer container and its three explicitly labelled volumes are named from the
+canonical absolute current directory. Ploinky automatically discovers whether
+Podman or Docker owns those exact resources and fails closed on unreachable,
+split, or foreign state; there is no public `--name`, `--engine`, or
+`PLOINKY_BOX_ENGINE` override. `destroy` removes only the selected outer
+container (and any attached anonymous volumes), preserving the workspace,
+nested-container-storage, and Ploinky dependency volumes for recreation.
+
+Before an agent-starting command, the box plans the active manifest graph and
+publishes every eligible `openPorts` socket at the outer boundary. Ordered
+operator `--publish` values are retained separately from generated publications,
+so branch, profile, dependency, or enabled-agent changes replace stale generated
+ports transactionally. A failed replacement restores the previous image ID,
+labels, publications, mounts, and named-volume attachments. The host
+`PLOINKY_MASTER_KEY`, including the normal walked-up `.env` source, is inherited
+only by in-box core executions; its value is not stored in container arguments,
+labels, or persistent image configuration.
+
+Ordinary agent images intentionally contain neither Podman nor Docker. Every
+Ploinky-managed agent and helper container runs through nested Podman inside the
+managed outer runtime.
 
 For local core development without entering the managed runtime, run the CLI
 entry directly from your checkout:

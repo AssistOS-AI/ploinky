@@ -15,6 +15,7 @@ import { buildAgentIdentityEnv, RESERVED_AGENT_ENV_NAMES } from '../agentIdentit
 import { debugLog } from '../utils.js';
 import {
     CONTAINER_CONFIG_PATH,
+    assertOuterPublicationCoverageForManifest,
     containerExists,
     computeEnvHash,
     createHostSandboxStartupError,
@@ -27,6 +28,7 @@ import {
     isContainerRunning,
     isSandboxRuntime,
     loadAgentsMap,
+    managedContainerLabelArgs,
     parseHostPort,
     parseManifestPorts,
     saveAgentsMap,
@@ -662,6 +664,54 @@ function removeContainerForRecreate(runtime, containerName, label) {
     clearLivenessState(containerName);
 }
 
+export function removeAgentContainerForRecreate(containerName, label = 'executionModeChanged') {
+    const runtime = getRuntime();
+    removeContainerForRecreate(runtime, containerName, label);
+}
+
+function buildPersistentAgentRunArgs({
+    runtime,
+    containerName,
+    envHash,
+    containerWorkdir,
+    agentLibMountPath,
+    codeMountPath,
+    codeMountMode = '',
+    useNestedDependencyMounts = false,
+    preparedNodeModulesDir = '',
+    sharedDir,
+    cwd,
+    cwdMountTarget,
+    isolatedHome = true,
+    agentHomeDir = '',
+} = {}) {
+    const nodeModulesMount = runtime === 'podman' ? ':z,ro' : ':ro';
+    const args = [
+        'run', '-d', '--name', containerName,
+        ...managedContainerLabelArgs(),
+        '--label', `ploinky.envhash=${envHash}`,
+        '-w', containerWorkdir,
+        // Agent library (always ro)
+        '-v', `${agentLibMountPath}:/Agent${runtime === 'podman' ? ':z,ro' : ':ro'}`,
+        // Code directory - profile dependent (rw in dev, ro in qa/prod)
+        '-v', `${codeMountPath}:/code${codeMountMode}`,
+        ...(useNestedDependencyMounts ? [
+            // node_modules mounts - ESM resolution walks up from script location
+            // Mount at both /code/node_modules (for agent code) and /Agent/node_modules (for AgentServer.mjs)
+            '-v', `${preparedNodeModulesDir}:/code/node_modules${nodeModulesMount}`,
+            '-v', `${preparedNodeModulesDir}:/Agent/node_modules${nodeModulesMount}`,
+        ] : []),
+        // Shared directory
+        '-v', `${sharedDir}:/shared${runtime === 'podman' ? ':z' : ''}`,
+        // CWD passthrough. Isolated agents receive their host data dir as /root.
+        '-v', `${cwd}:${cwdMountTarget}${runtime === 'podman' ? ':z' : ''}`,
+    ];
+    if (!isolatedHome) {
+        args.push('-v', `${agentHomeDir}:/root${runtime === 'podman' ? ':z' : ''}`);
+    }
+    return args;
+}
+
 function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     const runtime = getRuntime();
     const repoName = path.basename(path.dirname(agentPath));
@@ -669,8 +719,6 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     const agentSnapshot = loadAgentsMap();
     const existingRecord = agentSnapshot[containerName] || {};
     const instanceName = options.alias || existingRecord.alias || agentName;
-    removeContainerForRecreate(runtime, containerName, `startAgentContainer:${agentName}`);
-
     const { raw: explicitAgentCmd } = readManifestAgentCommand(manifest);
     const startCmd = readManifestStartCommand(manifest);
     const useStartEntry = Boolean(startCmd);
@@ -693,7 +741,12 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         const availableProfiles = Object.keys(manifest.profiles || {});
         throw new Error(`[profile] ${agentName}: profile '${activeProfile}' not found. Available: ${availableProfiles.join(', ')}`);
     }
+    assertOuterPublicationCoverageForManifest(manifest, profileConfig, {
+        ownerRef: `${repoName}/${agentName}`,
+        commandHint: options.commandHint || `ploinky start ${repoName}/${agentName}`,
+    });
     assertManifestEnvProfileCompleteness(manifest, profileConfig, { agentName, repoName, profileName: activeProfile });
+    removeContainerForRecreate(runtime, containerName, `startAgentContainer:${agentName}`);
 
     // Ensure workspace structure exists and run preinstall [HOST] before any
     // image-dependent work. Hooks may build local images or seed vars that image
@@ -875,28 +928,23 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
 
     // Build volume mount arguments using new workspace structure
     // Prepared node_modules are mounted read-only; runtime containers never mutate deps.
-    const nodeModulesMount = runtime === 'podman' ? ':z,ro' : ':ro';
     const containerWorkdir = isolatedHome ? '/root' : (String(manifest?.workdir || '/code').trim() || '/code');
-    const args = ['run', '-d', '--name', containerName, '--label', `ploinky.envhash=${envHash}`, '-w', containerWorkdir,
-        // Agent library (always ro)
-        '-v', `${agentLibMountPath}:/Agent${runtime === 'podman' ? ':z,ro' : ':ro'}`,
-        // Code directory - profile dependent (rw in dev, ro in qa/prod)
-        '-v', `${codeMountPath}:/code${codeMountMode}`,
-        ...(useNestedDependencyMounts ? [
-            // node_modules mounts - ESM resolution walks up from script location
-            // Mount at both /code/node_modules (for agent code) and /Agent/node_modules (for AgentServer.mjs)
-            '-v', `${preparedNodeModulesDir}:/code/node_modules${nodeModulesMount}`,
-            '-v', `${preparedNodeModulesDir}:/Agent/node_modules${nodeModulesMount}`,
-        ] : []),
-        // Shared directory
-        '-v', `${sharedDir}:/shared${runtime === 'podman' ? ':z' : ''}`,
-        // CWD passthrough. Isolated agents receive their host data dir as /root.
-        '-v', `${cwd}:${cwdMountTarget}${runtime === 'podman' ? ':z' : ''}`
-    ];
-
-    if (!isolatedHome) {
-        args.push('-v', `${agentHomeDir}:/root${runtime === 'podman' ? ':z' : ''}`);
-    }
+    const args = buildPersistentAgentRunArgs({
+        runtime,
+        containerName,
+        envHash,
+        containerWorkdir,
+        agentLibMountPath,
+        codeMountPath,
+        codeMountMode,
+        useNestedDependencyMounts,
+        preparedNodeModulesDir,
+        sharedDir,
+        cwd,
+        cwdMountTarget,
+        isolatedHome,
+        agentHomeDir,
+    });
 
     // LLM runtime: expose persistent model storage at /models and selected
     // architecture/runtime state at /runtime. These are identity-specific so
@@ -1356,6 +1404,10 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
         const availableProfiles = Object.keys(manifest.profiles || {});
         throw new Error(`[profile] ${agentName}: profile '${activeProfile}' not found. Available: ${availableProfiles.join(', ')}`);
     }
+    assertOuterPublicationCoverageForManifest(manifest, profileConfig, {
+        ownerRef: `${repoName}/${agentName}`,
+        commandHint: options?.commandHint || `ploinky start ${repoName}/${agentName}`,
+    });
     assertManifestEnvProfileCompleteness(manifest, profileConfig, { agentName, repoName, profileName: activeProfile });
     // LLM-runtime agents get their real image from the hardware-aware catalog in
     // startAgentContainer; tolerate an unresolved manifest container placeholder
@@ -1602,6 +1654,7 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
 
 export {
     assertPodmanCodeMountAllowed,
+    buildPersistentAgentRunArgs,
     buildPodmanStagedTargetMounts,
     buildRuntimeNetworkPlan,
     buildRuntimeRouterEnv,

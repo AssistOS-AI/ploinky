@@ -9,12 +9,17 @@ import { buildEnvFlags, buildEnvMap } from '../secretVars.js';
 import { loadAgents, saveAgents } from '../workspace.js';
 import { debugLog } from '../utils.js';
 import { isHostSandboxDisabled } from '../sandboxRuntime.js';
+import { parseManifestOpenPortSpec } from '../../../container/publish-spec.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const PLOINKY_BOX_MARKER_PATH = '/etc/ploinky-box';
+const OUTER_PUBLICATION_CONTRACT_ENV = 'PLOINKY_OUTER_PUBLICATION_CONTRACT';
+const OUTER_PUBLICATION_CONTRACT_SCHEMA_VERSION = 1;
+const MAX_OUTER_PUBLICATION_CONTRACT_BYTES = 256 * 1024;
+const PLOINKY_MANAGED_LABEL = 'io.assistos.ploinky.managed=1';
 
-function isPloinkyBoxRuntime(markerPath = PLOINKY_BOX_MARKER_PATH) {
+function isPloinkyBoxRuntime(markerPath = process.env.PLOINKY_BOX_MARKER_PATH || PLOINKY_BOX_MARKER_PATH) {
     try {
         return fs.statSync(markerPath).isFile();
     } catch (_) {
@@ -106,6 +111,14 @@ function isRuntimeInstalled(runtime) {
 let containerRuntime = null;
 
 function probeContainerRuntime() {
+    if (isPloinkyBoxRuntime()) {
+        if (isRuntimeInstalled('podman')) {
+            containerRuntime = 'podman';
+            return containerRuntime;
+        }
+        containerRuntime = null;
+        return null;
+    }
     if (containerRuntime) return containerRuntime;
     for (const candidate of ['podman', 'docker']) {
         if (isRuntimeInstalled(candidate)) {
@@ -120,6 +133,11 @@ function probeContainerRuntime() {
 function requireContainerRuntime() {
     const rt = probeContainerRuntime();
     if (!rt) {
+        if (isPloinkyBoxRuntime()) {
+            const error = new Error('Ploinky box requires nested Podman, but podman was not found in PATH. Docker fallback is not permitted inside the box.');
+            error.code = 'PLOINKY_BOX_PODMAN_REQUIRED';
+            throw error;
+        }
         console.error('Neither podman nor docker found in PATH. Please install one of them.');
         process.exit(1);
     }
@@ -448,93 +466,172 @@ function parseManifestPorts(manifest, profileConfig = null, options = {}) {
         const portSpec = String(p).trim();
         if (!portSpec) continue;
 
-        const parts = portSpec.split(':');
-        let hostIp = '127.0.0.1';  // Default to localhost for security
-        let hostPortSpec;
-        let containerPortSpec;
-        if (parts.length === 1) {
-            hostPortSpec = containerPortSpec = parts[0];
-        } else if (parts.length === 2) {
-            hostPortSpec = parts[0];
-            containerPortSpec = parts[1];
-        } else if (parts.length === 3) {
-            hostIp = parts[0];  // Respect the specified IP address
-            hostPortSpec = parts[1];
-            containerPortSpec = parts[2];
-        }
-        const parsed = parsePortPublishSpec(hostPortSpec, containerPortSpec);
-        if (parsed) {
-            const publishHostIp = runtimePublishHostIp(hostIp, options);
-            const normalized = `${publishHostIp}:${parsed.hostPortSpec}:${parsed.containerPortSpec}${parsed.protocolSuffix}`;
-            publishArgs.push(normalized);
-            for (const mapping of parsed.portMappings) {
-                portMappings.push({ ...mapping, hostIp: publishHostIp, protocol: parsed.protocol });
-            }
+        const parsed = parseManifestOpenPortSpec(portSpec);
+        const publishHostIp = runtimePublishHostIp(parsed.hostIp, options);
+        const protocolSuffix = parsed.protocol === 'tcp' ? '' : `/${parsed.protocol}`;
+        const normalized = `${publishHostIp}:${formatPortRange(parsed.boxSide)}:${formatPortRange(parsed.privateContainer)}${protocolSuffix}`;
+        publishArgs.push(normalized);
+        for (let offset = 0; offset < parsed.boxSide.length; offset += 1) {
+            portMappings.push({
+                hostPort: parsed.boxSide.start + offset,
+                containerPort: parsed.privateContainer.start + offset,
+                hostIp: publishHostIp,
+                protocol: parsed.protocol,
+            });
         }
     }
 
     return { publishArgs, portMappings };
 }
 
-function parsePortPublishSpec(hostPortSpec, containerPortSpec) {
-    if (hostPortSpec === undefined || hostPortSpec === null || containerPortSpec === undefined || containerPortSpec === null) {
-        return null;
+function managedContainerLabelArgs() {
+    return ['--label', PLOINKY_MANAGED_LABEL];
+}
+
+function parseOuterPublicationContract(rawContract = process.env[OUTER_PUBLICATION_CONTRACT_ENV]) {
+    if (rawContract && typeof rawContract === 'object' && !Array.isArray(rawContract)) {
+        return validateOuterPublicationContract(rawContract);
     }
-    const container = splitPortProtocol(containerPortSpec);
-    const host = splitPortProtocol(hostPortSpec);
-    const protocol = container.protocol || host.protocol || 'tcp';
-    if ((container.protocol && host.protocol && container.protocol !== host.protocol) || !['tcp', 'udp'].includes(protocol)) {
-        return null;
+    const raw = String(rawContract || '');
+    if (!raw) {
+        throw outerPublicationError(`missing ${OUTER_PUBLICATION_CONTRACT_ENV}`);
     }
-    const hostRange = parsePortRange(host.portSpec, { allowEphemeral: true });
-    const containerRange = parsePortRange(container.portSpec);
-    if (!hostRange || !containerRange || hostRange.length !== containerRange.length) {
-        return null;
+    if (Buffer.byteLength(raw, 'utf8') > MAX_OUTER_PUBLICATION_CONTRACT_BYTES) {
+        throw outerPublicationError(`${OUTER_PUBLICATION_CONTRACT_ENV} exceeds ${MAX_OUTER_PUBLICATION_CONTRACT_BYTES} bytes`);
     }
-    if (hostRange.ephemeral && containerRange.length !== 1) {
-        return null;
+    let parsed;
+    try {
+        parsed = JSON.parse(raw);
+    } catch (error) {
+        throw outerPublicationError(`${OUTER_PUBLICATION_CONTRACT_ENV} is not valid JSON: ${error.message}`);
     }
-    const portMappings = [];
-    for (let offset = 0; offset < hostRange.length; offset += 1) {
-        portMappings.push({
-            hostPort: hostRange.start + offset,
-            containerPort: containerRange.start + offset
-        });
+    return validateOuterPublicationContract(parsed);
+}
+
+function validateOuterPublicationContract(contract) {
+    if (!contract || typeof contract !== 'object' || Array.isArray(contract)) {
+        throw outerPublicationError('outer publication contract must be an object');
+    }
+    const allowed = new Set(['schemaVersion', 'targets', 'publishes']);
+    for (const key of Object.keys(contract)) {
+        if (!allowed.has(key)) throw outerPublicationError(`unsupported outer publication contract field '${key}'`);
+    }
+    if (contract.schemaVersion !== OUTER_PUBLICATION_CONTRACT_SCHEMA_VERSION) {
+        throw outerPublicationError(`unsupported outer publication contract schemaVersion '${contract.schemaVersion}'`);
+    }
+    if (!Array.isArray(contract.targets) || contract.targets.length > 4096) {
+        throw outerPublicationError('outer publication contract targets must be an array with at most 4096 entries');
+    }
+    if (contract.publishes !== undefined && (
+        !Array.isArray(contract.publishes)
+        || contract.publishes.length > 4096
+        || contract.publishes.some((entry) => typeof entry !== 'string')
+    )) {
+        throw outerPublicationError('outer publication contract publishes must be an array of strings');
+    }
+    const byProtocol = { tcp: [], udp: [] };
+    for (let index = 0; index < contract.targets.length; index += 1) {
+        const target = contract.targets[index];
+        if (!target || typeof target !== 'object' || Array.isArray(target)) {
+            throw outerPublicationError(`outer publication target ${index} must be an object`);
+        }
+        const keys = Object.keys(target);
+        if (keys.some((key) => !['start', 'end', 'protocol'].includes(key))) {
+            throw outerPublicationError(`outer publication target ${index} has unsupported fields`);
+        }
+        const start = Number(target.start);
+        const end = Number(target.end);
+        const protocol = String(target.protocol || '').trim().toLowerCase();
+        if (!Number.isInteger(start) || !Number.isInteger(end) || start < 1 || end < start || end > 65535) {
+            throw outerPublicationError(`outer publication target ${index} has an invalid interval`);
+        }
+        if (!['tcp', 'udp'].includes(protocol)) {
+            throw outerPublicationError(`outer publication target ${index} has unsupported protocol '${target.protocol}'`);
+        }
+        byProtocol[protocol].push({ start, end });
     }
     return {
-        hostPortSpec: hostRange.ephemeral ? '' : formatPortRange(hostRange),
-        containerPortSpec: formatPortRange(containerRange),
-        protocol,
-        protocolSuffix: protocol === 'tcp' ? '' : `/${protocol}`,
-        portMappings
+        schemaVersion: OUTER_PUBLICATION_CONTRACT_SCHEMA_VERSION,
+        targets: [
+            ...mergeCoverageIntervals(byProtocol.tcp).map((entry) => ({ ...entry, protocol: 'tcp' })),
+            ...mergeCoverageIntervals(byProtocol.udp).map((entry) => ({ ...entry, protocol: 'udp' })),
+        ],
+        publishes: (contract.publishes || []).map((entry) => String(entry)),
     };
 }
 
-function splitPortProtocol(portSpec) {
-    const raw = String(portSpec || '').trim();
-    const match = raw.match(/^(.+?)(?:\/([a-zA-Z]+))?$/);
-    return {
-        portSpec: String(match?.[1] || '').trim(),
-        protocol: String(match?.[2] || '').trim().toLowerCase()
-    };
+function assertOuterPublicationCoverageForClaims(claims, options = {}) {
+    const inBox = options.boxRuntime === true
+        || (options.boxRuntime !== false && isPloinkyBoxRuntime(options.markerPath));
+    if (!inBox) return { enforced: false, covered: true, targets: [] };
+    const contract = parseOuterPublicationContract(options.contract);
+    const missing = [];
+    for (const claim of claims || []) {
+        const interval = claim?.boxSide || claim?.targetInterval;
+        const protocol = String(claim?.protocol || '').trim().toLowerCase();
+        if (!interval || !['tcp', 'udp'].includes(protocol)) {
+            throw outerPublicationError('required publication claim is malformed');
+        }
+        const available = contract.targets.filter((target) => target.protocol === protocol);
+        if (!intervalCovered(interval, available)) {
+            missing.push({
+                start: interval.start,
+                end: interval.end,
+                protocol,
+                ownerRef: claim.ownerRef || claim.agentRef || '',
+                raw: claim.raw || '',
+            });
+        }
+    }
+    if (missing.length) {
+        const targets = missing.map((entry) => `${formatPortRange(entry)}/${entry.protocol}`).join(', ');
+        const hint = String(options.commandHint || 'ploinky start').trim();
+        const error = outerPublicationError(
+            `outer Ploinky box does not publish required socket coverage: ${targets}. `
+            + `Run this one-shot command from the host so the box can be reconciled first: ${hint}`,
+        );
+        error.missingTargets = missing;
+        error.contract = contract;
+        throw error;
+    }
+    return { enforced: true, covered: true, targets: contract.targets };
 }
 
-function parsePortRange(portSpec, options = {}) {
-    const raw = String(portSpec || '').trim();
-    if (options.allowEphemeral && raw === '') {
-        return { start: 0, end: 0, length: 1, ephemeral: true };
+function assertOuterPublicationCoverageForManifest(manifest, profileConfig = null, options = {}) {
+    const ports = profileConfig?.openPorts;
+    const values = ports === undefined || ports === null ? [] : (Array.isArray(ports) ? ports : [ports]);
+    const claims = values.map((entry) => {
+        const parsed = parseManifestOpenPortSpec(entry);
+        return {
+            ...parsed,
+            ownerRef: options.ownerRef || '',
+        };
+    });
+    return assertOuterPublicationCoverageForClaims(claims, options);
+}
+
+function intervalCovered(interval, available) {
+    const merged = mergeCoverageIntervals(available);
+    return merged.some((entry) => entry.start <= interval.start && entry.end >= interval.end);
+}
+
+function mergeCoverageIntervals(intervals) {
+    const sorted = intervals
+        .map((entry) => ({ start: entry.start, end: entry.end }))
+        .sort((left, right) => left.start - right.start || left.end - right.end);
+    const merged = [];
+    for (const interval of sorted) {
+        const previous = merged.at(-1);
+        if (!previous || interval.start > previous.end + 1) merged.push({ ...interval });
+        else previous.end = Math.max(previous.end, interval.end);
     }
-    const match = raw.match(/^(\d+)(?:-(\d+))?$/);
-    if (!match) return null;
-    const start = parseInt(match[1], 10);
-    const end = match[2] ? parseInt(match[2], 10) : start;
-    if (options.allowEphemeral && start === 0 && end === 0 && !match[2]) {
-        return { start: 0, end: 0, length: 1, ephemeral: true };
-    }
-    if (!Number.isInteger(start) || !Number.isInteger(end) || start <= 0 || end <= 0 || end < start) {
-        return null;
-    }
-    return { start, end, length: end - start + 1 };
+    return merged;
+}
+
+function outerPublicationError(message) {
+    const error = new Error(message);
+    error.code = 'PLOINKY_OUTER_PUBLICATION_REQUIRED';
+    return error;
 }
 
 function formatPortRange(range) {
@@ -654,6 +751,10 @@ function runtimeFamilyName(runtime) {
 export {
     CONTAINER_CONFIG_DIR,
     CONTAINER_CONFIG_PATH,
+    MAX_OUTER_PUBLICATION_CONTRACT_BYTES,
+    OUTER_PUBLICATION_CONTRACT_ENV,
+    OUTER_PUBLICATION_CONTRACT_SCHEMA_VERSION,
+    PLOINKY_MANAGED_LABEL,
     PLOINKY_DIR,
     REPOS_DIR,
     containerRuntime,
@@ -680,6 +781,7 @@ export {
     loadAgentsMap,
     parseHostPort,
     parseManifestPorts,
+    parseOuterPublicationContract,
     saveAgentsMap,
     syncAgentMcpConfig,
     waitForContainerRunning,
@@ -687,7 +789,11 @@ export {
     sleepMs,
     createHostSandboxError,
     createHostSandboxStartupError,
-    getRuntimeForAgent
+    getRuntimeForAgent,
+    managedContainerLabelArgs,
+    assertOuterPublicationCoverageForClaims,
+    assertOuterPublicationCoverageForManifest,
+    validateOuterPublicationContract,
 };
 
 function getRuntime() {
@@ -744,6 +850,9 @@ function createLegacyRuntimeStringError(runtimeValue) {
 }
 
 function getRuntimeForAgent(manifest) {
+    if (isPloinkyBoxRuntime()) {
+        return requireContainerRuntime();
+    }
     if (typeof manifest?.runtime === 'string') {
         throw createLegacyRuntimeStringError(manifest.runtime);
     }

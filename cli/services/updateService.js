@@ -6,6 +6,7 @@ import { PLOINKY_DIR } from './config.js';
 
 const ACHILLES_PACKAGE_NAME = 'achillesAgentLib';
 const ACHILLES_REPO_URL = 'https://github.com/AssistOS-AI/achillesAgentLib.git';
+export const PLOINKY_BOX_MARKER_PATH = '/etc/ploinky-box';
 const DEPENDENCY_SECTIONS = [
     'dependencies',
     'devDependencies',
@@ -117,10 +118,24 @@ export function updatePloinkySelf({
     repoPath = resolvePloinkyRoot(),
     interactiveSession = false,
     logger = defaultLogger(),
+    boxMarkerPath = PLOINKY_BOX_MARKER_PATH,
+    exists = fs.existsSync,
     checkUpdate = checkGitUpstreamUpdate,
     pull = pullGitRepo,
     getRef = getGitRef,
 } = {}) {
+    if (exists(boxMarkerPath)) {
+        logger.warn?.(
+            `Skipping Ploinky self-update inside ploinky-box: ${repoPath} is mounted read-only.`,
+        );
+        return {
+            skipped: true,
+            boxed: true,
+            reason: 'Ploinky source is mounted read-only inside ploinky-box',
+            repoPath,
+        };
+    }
+
     if (!isGitRepo(repoPath)) {
         logger.warn?.(`Skipping Ploinky self-update: ${repoPath} is not a git repository.`);
         return { skipped: true, reason: 'not a git repository', repoPath };

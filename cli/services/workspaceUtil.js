@@ -19,14 +19,16 @@ import { resolveAgentExecutionMode, resolveAgentReadinessProtocol } from './star
 import { normalizeProbeConfig, runContainerScriptReadiness } from './docker/healthProbes.js';
 import { applyStartupConfigProvidersForGraph } from './startupConfigProviders.js';
 import { withMaintenanceLock } from './maintenanceLocks.js';
-import { LOGS_DIR, PLOINKY_CWD, PLOINKY_WORKSPACE_ROOT, ROUTING_FILE, RUNNING_DIR } from './config.js';
+import { LOGS_DIR, PLOINKY_CWD, PLOINKY_WORKSPACE_ROOT, REPOS_DIR, ROUTING_FILE, RUNNING_DIR } from './config.js';
 import { classifyDependencyGraphWaitMode, resolveWorkspaceDependencyGraph, topologicallyGroupDependencyGraph } from './workspaceDependencyGraph.js';
 import { mergeRoutingConfig, readRoutingConfig } from './routingFile.js';
 import { waitForAgentReady } from '../server/utils/agentReadiness.js';
+import { getAgentDataDir } from './workspaceStructure.js';
 import {
   formatAgentAttachmentBanner,
   resolveAgentAttachmentIdentity,
 } from './layerIdentification.js';
+import { preflightBoxPublicationForCommand } from './boxPublicationCoverage.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -253,22 +255,127 @@ function findRegistryEntryForGraphNode(reg, node, getAgentContainerName) {
   return null;
 }
 
-function ensureGraphNodesEnabled(graph, reg) {
+function resolveGraphNodeExecutionRecord(node, {
+  workspaceRoot = PLOINKY_WORKSPACE_ROOT,
+  reposDir = REPOS_DIR,
+  getAgentDataDirImpl = getAgentDataDir,
+} = {}) {
+  const normalized = agentsSvc.normalizeEnableArgs(node.enableSpec || node.agentRef);
+  const requestedMode = String(normalized.mode || '').trim().toLowerCase();
+  const instanceName = node.alias || node.shortAgentName;
+
+  if (!requestedMode || requestedMode === 'default' || requestedMode === agentsSvc.DEFAULT_ENABLE_AGENT_MODE) {
+    return {
+      runMode: agentsSvc.DEFAULT_ENABLE_AGENT_MODE,
+      projectPath: getAgentDataDirImpl(instanceName),
+      develRepo: undefined,
+    };
+  }
+  if (requestedMode === 'global') {
+    return {
+      runMode: 'global',
+      projectPath: workspaceRoot,
+      develRepo: undefined,
+    };
+  }
+  if (requestedMode === 'devel') {
+    const develRepo = String(normalized.repoNameParam || '').trim();
+    if (!develRepo) {
+      throw new Error(`Graph node '${node.id}' requests devel mode without a repository name.`);
+    }
+    const projectPath = path.join(reposDir, develRepo);
+    if (!fs.existsSync(projectPath) || !fs.statSync(projectPath).isDirectory()) {
+      throw new Error(`Repository '${develRepo}' required by graph node '${node.id}' was not found in ${reposDir}.`);
+    }
+    return { runMode: 'devel', projectPath, develRepo };
+  }
+  throw new Error(
+    `Graph node '${node.id}' requests unknown mode '${requestedMode}'. Allowed: ${agentsSvc.ENABLE_AGENT_MODES.join(' | ')}`,
+  );
+}
+
+function executionRecordDiffers(record, expected) {
+  const currentProjectPath = String(record?.projectPath || '').trim();
+  const expectedProjectPath = String(expected.projectPath || '').trim();
+  const sameProjectPath = currentProjectPath
+    && expectedProjectPath
+    && path.resolve(currentProjectPath) === path.resolve(expectedProjectPath);
+  const sameDevelRepo = expected.runMode === 'devel'
+    ? String(record?.develRepo || '').trim() === expected.develRepo
+    : !String(record?.develRepo || '').trim();
+  return record?.runMode !== expected.runMode || !sameProjectPath || !sameDevelRepo;
+}
+
+function ensureGraphNodesEnabled(graph, reg, {
+  enableAgent = agentsSvc.enableAgent,
+  removeAgentContainerForRecreate = dockerSvc.removeAgentContainerForRecreate,
+  saveAgents = workspaceSvc.saveAgents,
+  executionRecordOptions,
+} = {}) {
   const nodes = Array.from(graph?.nodes?.values?.() || [])
     .filter((node) => !node.isStatic)
     .sort((a, b) => a.id.localeCompare(b.id));
 
+  // Resolve and validate every retained record before removing anything. If a
+  // later devel target is invalid, the complete existing stack is left alone.
+  const existingPlans = [];
+  const missingNodes = [];
+
   for (const node of nodes) {
     const existing = findRegistryEntryForGraphNode(reg, node, dockerSvc.getAgentContainerName);
-    if (existing) {
-      if (node.profile && existing.rec.profile !== node.profile) {
-        existing.rec.profile = node.profile;
-        reg[existing.key] = existing.rec;
-        workspaceSvc.saveAgents(reg);
-      }
+    if (!existing) {
+      missingNodes.push(node);
       continue;
     }
-    agentsSvc.enableAgent(node.enableSpec || node.agentRef, undefined, undefined, node.alias || undefined, undefined, {
+
+    const normalizedExecution = agentsSvc.normalizeEnableArgs(node.enableSpec || node.agentRef);
+    const hasExplicitExecutionMode = agentsSvc.isEnableAgentMode(normalizedExecution.mode);
+    const expectedExecution = hasExplicitExecutionMode
+      ? resolveGraphNodeExecutionRecord(node, executionRecordOptions)
+      : null;
+    const executionChanged = Boolean(
+      expectedExecution && executionRecordDiffers(existing.rec, expectedExecution),
+    );
+    const profileChanged = Boolean(node.profile && existing.rec.profile !== node.profile);
+    existingPlans.push({ node, existing, expectedExecution, executionChanged, profileChanged });
+  }
+
+  // Removal is deliberately completed before any run-mode registry field is
+  // changed. A safe-removal failure therefore leaves agents.json describing
+  // the still-existing container, and retrying remains deterministic.
+  for (const plan of existingPlans) {
+    if (!plan.executionChanged) continue;
+    removeAgentContainerForRecreate(
+      plan.existing.key,
+      `workspaceGraph:${plan.node.id}:executionModeChanged`,
+    );
+  }
+
+  let registryChanged = false;
+  for (const plan of existingPlans) {
+    if (!plan.executionChanged && !plan.profileChanged) continue;
+    const nextRecord = { ...plan.existing.rec };
+    if (plan.executionChanged) {
+      nextRecord.runMode = plan.expectedExecution.runMode;
+      nextRecord.projectPath = plan.expectedExecution.projectPath;
+      if (plan.expectedExecution.runMode === 'devel') {
+        nextRecord.develRepo = plan.expectedExecution.develRepo;
+      } else {
+        delete nextRecord.develRepo;
+      }
+    }
+    if (plan.profileChanged) {
+      nextRecord.profile = plan.node.profile;
+    }
+    reg[plan.existing.key] = nextRecord;
+    registryChanged = true;
+  }
+  if (registryChanged) {
+    saveAgents(reg);
+  }
+
+  for (const node of missingNodes) {
+    enableAgent(node.enableSpec || node.agentRef, undefined, undefined, node.alias || undefined, undefined, {
       profile: node.profile || undefined,
     });
   }
@@ -533,7 +640,26 @@ async function waitForManifestReadiness({ key, label, kind = 'dependency', manif
   }
 }
 
-async function startWorkspace(staticAgentArg, portArg, { refreshComponentToken, ensureComponentToken, enableAgent, killRouterIfRunning, branchPolicy } = {}) {
+async function startWorkspace(staticAgentArg, portArg, {
+  refreshComponentToken,
+  ensureComponentToken,
+  enableAgent,
+  killRouterIfRunning,
+  branchPolicy,
+  publicationPreflightComplete = false,
+} = {}) {
+  const preflightArgs = [];
+  if (staticAgentArg) preflightArgs.push(String(staticAgentArg));
+  if (portArg) preflightArgs.push(String(portArg));
+  if (branchPolicy?.branch) preflightArgs.push(`--branch=${branchPolicy.branch}`);
+  for (const [repoName, branch] of Object.entries(branchPolicy?.repoBranches || {})) {
+    preflightArgs.push(`--repo-branch=${repoName}=${branch}`);
+  }
+  if (branchPolicy?.fallback) preflightArgs.push(`--branch-fallback=${branchPolicy.fallback}`);
+  if (branchPolicy?.resetRepos) preflightArgs.push('--reset-repos');
+  if (!publicationPreflightComplete) {
+    await preflightBoxPublicationForCommand('start', preflightArgs);
+  }
   // Clear the in-process preinstall dedup set so each workspace start (e.g.
   // a `restart` re-entering this function in the same CLI process) re-runs
   // hooks that may need to regenerate runtime files.
@@ -787,7 +913,8 @@ async function startWorkspace(staticAgentArg, portArg, { refreshComponentToken, 
           const { containerName, hostPort, additionalServerPort } = ensureAgentService(shortAgentName, manifest, agentPath, {
             containerName: name,
             alias: rec.alias,
-            routerPort: staticPort
+            routerPort: staticPort,
+            profileName: rec.profile || undefined
           });
           const executionMode = resolveAgentExecutionMode(manifest);
           const resolvedHostPort = hostPort || (
@@ -1113,7 +1240,10 @@ export async function runCliWithDependencies(agentName, args, dependencies) {
   }
 }
 
-async function runCli(agentName, args) {
+async function runCli(agentName, args, { publicationPreflightComplete = false } = {}) {
+  if (!publicationPreflightComplete) {
+    await preflightBoxPublicationForCommand('cli', [agentName, ...(args || [])]);
+  }
   const { ensureAgentService, attachInteractive, getAgentContainerName } = dockerSvc;
   return runCliWithDependencies(agentName, args, {
     env: process.env,
@@ -1137,7 +1267,10 @@ async function runCli(agentName, args) {
   });
 }
 
-async function runShell(agentName) {
+async function runShell(agentName, { publicationPreflightComplete = false } = {}) {
+  if (!publicationPreflightComplete) {
+    await preflightBoxPublicationForCommand('shell', agentName ? [agentName] : []);
+  }
   if (!agentName) { throw new Error('Usage: shell <agentName>'); }
   let registryRecord = null;
   try {
@@ -1194,7 +1327,10 @@ async function runShell(agentName) {
   }
 }
 
-async function reinstallAgent(agentName) {
+async function reinstallAgent(agentName, { publicationPreflightComplete = false } = {}) {
+    if (!publicationPreflightComplete) {
+        await preflightBoxPublicationForCommand('reinstall', agentName ? [agentName] : []);
+    }
     if (!agentName) { throw new Error('Usage: reinstall <name> | reinstall agent <name>'); }
 
     const { getAgentContainerName, isContainerRunning, stopAndRemove, ensureAgentService } = dockerSvc;
@@ -1360,6 +1496,8 @@ async function reinstallAgent(agentName) {
 
 export {
   buildBlockingReadinessEntryFromNode,
+  ensureGraphNodesEnabled,
+  resolveGraphNodeExecutionRecord,
   waitForManifestReadiness,
   waitForReadinessEntries,
   startWorkspace,

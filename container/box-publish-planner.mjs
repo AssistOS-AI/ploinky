@@ -1,315 +1,181 @@
-import fs from 'node:fs';
-import path from 'node:path';
 import {
     formatPortRange,
     intervalsOverlap,
     manifestClaimsEqual,
+    parseExplicitPublishSpec,
     parseManifestOpenPortSpec,
 } from './publish-spec.mjs';
 
-const EXPLORER_PUBLIC_AGENT = 'explorer';
-const EXPLORER_ROOT_REF = 'AchillesIDE/explorer';
-const DEFAULT_PROFILE = 'default';
-const MODE_TOKENS = new Set(['global', 'isolated', 'devel', 'no-wait']);
-const REPO_DIR_ALIASES = new Map([
-    ['AchillesIDE', 'AssistOSExplorer'],
-    ['AssistOSExplorer', 'AssistOSExplorer'],
-]);
+export const DEFAULT_BOX_ROUTER_PORT = 8080;
 
-export function planBoxPublishesForStart({ startPlan, sourceDir, workspaceRoot = path.dirname(sourceDir) } = {}) {
-    if (!isExplorerStart(startPlan)) {
-        return { publishes: [], graph: [] };
+/**
+ * Validate and turn authoritative, already-resolved graph nodes into outer-box
+ * publication claims. This module deliberately does not discover manifests or
+ * repositories: the in-box planner service owns that workspace-aware work.
+ */
+export function planBoxPublishes({
+    nodes = [],
+    explicitPublishes = [],
+    routerPort = DEFAULT_BOX_ROUTER_PORT,
+} = {}) {
+    if (!Array.isArray(nodes)) {
+        throw new Error('box publish planner requires an array of authoritative nodes');
+    }
+    if (!Array.isArray(explicitPublishes)) {
+        throw new Error('box publish planner requires explicitPublishes to be an array');
     }
 
-    const workspaceProfile = normalizeProfileName(startPlan?.profile) || DEFAULT_PROFILE;
-    const graph = [];
-    const publishes = [];
-    const seenNodes = new Set();
-    const claims = [];
+    const claims = collectManifestClaims(nodes);
+    assertRouterSocketAvailable(claims, routerPort);
 
-    visitAgent(EXPLORER_ROOT_REF, {
-        profile: workspaceProfile,
-        profileExplicit: false,
-        workspaceProfile,
-        alias: '',
-        fromRepo: '',
-        workspaceRoot,
-        graph,
-        publishes,
-        seenNodes,
-        claims,
+    const explicit = explicitPublishes.map((raw, index) => {
+        try {
+            return parseExplicitPublishSpec(raw);
+        } catch (error) {
+            throw new Error(`invalid explicit publish at index ${index}: ${error?.message || error}`);
+        }
+    });
+    const generatedPublishes = claims.flatMap((claim) => {
+        const covering = explicit
+            .filter((entry) => entry.protocol === claim.protocol)
+            .map((entry) => entry.containerTarget);
+        return subtractIntervals(claim.boxSide, covering)
+            .map((interval) => formatGeneratedPublish(claim, interval));
     });
 
-    return { publishes, graph };
+    return {
+        claims,
+        explicitPublishes: explicitPublishes.map((value) => String(value)),
+        generatedPublishes,
+        publishes: [...explicitPublishes.map((value) => String(value)), ...generatedPublishes],
+    };
+}
+
+export function collectManifestClaims(nodes = []) {
+    const claims = [];
+    for (const node of nodes) {
+        const openPorts = normalizeOpenPorts(node?.openPorts, node?.agentRef || node?.id || '<unknown>');
+        for (const raw of openPorts) {
+            const parsed = parseManifestOpenPortSpec(raw);
+            const claim = {
+                ...parsed,
+                ownerRef: String(node?.agentRef || node?.ref || '').trim(),
+                profile: String(node?.profile || 'default').trim().toLowerCase() || 'default',
+                alias: String(node?.alias || '').trim(),
+                nodeKey: String(node?.instanceKey || node?.id || node?.agentRef || '').trim(),
+                path: Array.isArray(node?.selectionPath)
+                    ? node.selectionPath.map((entry) => String(entry))
+                    : [],
+            };
+            let duplicate = false;
+            for (const existing of claims) {
+                if (existing.protocol !== claim.protocol || !intervalsOverlap(existing.boxSide, claim.boxSide)) {
+                    continue;
+                }
+                if (existing.nodeKey === claim.nodeKey && manifestClaimsEqual(existing, claim)) {
+                    duplicate = true;
+                    break;
+                }
+                throw new Error(formatClaimConflict(existing, claim));
+            }
+            if (!duplicate) claims.push(claim);
+        }
+    }
+    return claims;
+}
+
+export function subtractIntervals(source, exclusions = []) {
+    let remaining = [{ start: source.start, end: source.end }];
+    const normalized = mergeIntervals(
+        exclusions
+            .filter((entry) => entry && Number.isInteger(entry.start) && Number.isInteger(entry.end))
+            .filter((entry) => intervalsOverlap(source, entry))
+            .map((entry) => ({
+                start: Math.max(source.start, entry.start),
+                end: Math.min(source.end, entry.end),
+            })),
+    );
+    for (const exclusion of normalized) {
+        const next = [];
+        for (const interval of remaining) {
+            if (!intervalsOverlap(interval, exclusion)) {
+                next.push(interval);
+                continue;
+            }
+            if (interval.start < exclusion.start) {
+                next.push({ start: interval.start, end: exclusion.start - 1 });
+            }
+            if (exclusion.end < interval.end) {
+                next.push({ start: exclusion.end + 1, end: interval.end });
+            }
+        }
+        remaining = next;
+    }
+    return remaining.map((interval) => ({
+        ...interval,
+        length: interval.end - interval.start + 1,
+    }));
+}
+
+export function mergeIntervals(intervals = []) {
+    const sorted = intervals
+        .map((entry) => ({ start: entry.start, end: entry.end }))
+        .sort((left, right) => left.start - right.start || left.end - right.end);
+    const merged = [];
+    for (const interval of sorted) {
+        const previous = merged.at(-1);
+        if (!previous || interval.start > previous.end + 1) {
+            merged.push({ ...interval });
+        } else {
+            previous.end = Math.max(previous.end, interval.end);
+        }
+    }
+    return merged.map((interval) => ({
+        ...interval,
+        length: interval.end - interval.start + 1,
+    }));
 }
 
 export function publishTarget(spec) {
-    return parseOpenPortPublishSpec(spec).target;
+    return parseManifestOpenPortSpec(spec).target;
 }
 
 export function parseOpenPortPublishSpec(spec) {
     return parseManifestOpenPortSpec(spec);
 }
 
-function isExplorerStart(startPlan) {
-    if (!startPlan?.hasAgent) return false;
-    const agent = String(startPlan?.agent || '').trim();
-    return agent === EXPLORER_PUBLIC_AGENT
-        || agent === EXPLORER_ROOT_REF
-        || agent === 'AssistOSExplorer/explorer';
-}
-
-function visitAgent(ref, state) {
-    const resolved = resolveAgentRef(ref, state.fromRepo, state.workspaceRoot);
-    const manifest = readManifest(resolved.manifestPath);
-    const profile = pickProfile(manifest, state.profile, resolved.ref, {
-        explicit: state.profileExplicit,
-    });
-    const alias = normalizeAlias(state.alias);
-    const nodeKey = effectiveNodeKey(resolved.ref, profile, alias);
-    if (state.seenNodes.has(nodeKey)) {
-        return;
-    }
-    state.seenNodes.add(nodeKey);
-
-    const profileConfig = mergeProfileConfig(manifest, profile);
-
-    state.graph.push({
-        ref: resolved.ref,
-        profile,
-        alias,
-        instanceKey: nodeKey,
-        manifestPath: resolved.manifestPath,
-    });
-
-    for (const spec of collectOpenPorts(profileConfig, resolved.ref)) {
-        const parsed = parseOpenPortPublishSpec(spec);
-        const claim = {
-            ...parsed,
-            ownerRef: resolved.ref,
-            profile,
-            alias,
-            nodeKey,
-        };
-        let duplicate = false;
-        for (const existing of state.claims) {
-            if (existing.protocol !== claim.protocol || !intervalsOverlap(existing.boxSide, claim.boxSide)) {
-                continue;
-            }
-            if (existing.nodeKey === claim.nodeKey && manifestClaimsEqual(existing, claim)) {
-                duplicate = true;
-                break;
-            }
-            throw new Error(formatClaimConflict(existing, claim));
-        }
-        if (duplicate) continue;
-        state.claims.push(claim);
-        state.publishes.push(parsed.spec);
-    }
-
-    for (const entry of manifestEnableEntries(manifest, profile)) {
-        const directive = parseEnableDirective(entry);
-        const childRef = resolveAgentRef(directive.spec, resolved.repo, state.workspaceRoot);
-        visitAgent(childRef.ref, {
-            ...state,
-            profile: directive.profile || state.workspaceProfile,
-            profileExplicit: Boolean(directive.profile),
-            alias: directive.alias || '',
-            fromRepo: childRef.repo,
-        });
-    }
-}
-
-function collectOpenPorts(profileConfig, ref) {
-    const ports = profileConfig?.openPorts;
-    if (ports === undefined || ports === null) {
-        return [];
-    }
-    const values = Array.isArray(ports) ? ports : [ports];
-    return values.map((value) => {
-        if (typeof value !== 'string' || !value.trim()) {
+function normalizeOpenPorts(value, ref) {
+    if (value === undefined || value === null) return [];
+    const values = Array.isArray(value) ? value : [value];
+    return values.map((entry) => {
+        if (typeof entry !== 'string' || !entry.trim()) {
             throw new Error(`agent ${ref} has malformed openPorts entry`);
         }
-        return value.trim();
+        return entry.trim();
     });
 }
 
-function manifestEnableEntries(manifest, profile) {
-    const entries = [];
-    if (Array.isArray(manifest?.enable)) {
-        entries.push(...manifest.enable);
+function assertRouterSocketAvailable(claims, routerPort) {
+    const port = Number(routerPort);
+    if (!Number.isInteger(port) || port < 1 || port > 65535) {
+        throw new Error(`invalid reserved router port '${routerPort}'`);
     }
-    const profiles = manifest?.profiles || {};
-    const profileBlock = profiles[profile] || profiles[DEFAULT_PROFILE];
-    if (Array.isArray(profileBlock?.enable)) {
-        entries.push(...profileBlock.enable);
-    }
-    return entries;
-}
-
-function parseEnableDirective(entry) {
-    if (entry && typeof entry === 'object' && !Array.isArray(entry)) {
-        const parsed = parseEnableDirective(entry.agent ?? entry.ref ?? entry.spec ?? entry.name);
-        const profile = normalizeProfileName(entry.profile);
-        const alias = normalizeAlias(entry.alias ?? entry.as ?? parsed.alias);
-        return {
-            ...parsed,
-            profile,
-            alias,
-        };
-    }
-
-    const raw = String(entry || '').trim();
-    if (!raw) {
-        throw new Error('manifest enable entry is missing agent reference');
-    }
-    let tokens = raw.split(/\s+/).filter(Boolean);
-    if (!tokens.length) {
-        throw new Error(`manifest enable entry '${raw}' is missing agent reference`);
-    }
-    tokens = tokens.filter((token) => token.toLowerCase() !== 'no-wait');
-    const aliasIndex = tokens.findIndex((token) => token.toLowerCase() === 'as');
-    let alias = '';
-    if (aliasIndex !== -1) {
-        if (aliasIndex + 1 >= tokens.length) {
-            throw new Error(`manifest enable entry '${raw}' is missing alias name after "as"`);
-        }
-        alias = normalizeAlias(tokens[aliasIndex + 1]);
-        tokens = tokens.slice(0, aliasIndex);
-    }
-    if (!tokens.length || tokens.every((token) => MODE_TOKENS.has(token.toLowerCase()))) {
-        throw new Error(`manifest enable entry '${raw}' is missing agent reference`);
-    }
-    return {
-        spec: tokens.join(' '),
-        profile: '',
-        alias,
-    };
-}
-
-function resolveAgentRef(spec, currentRepo, workspaceRoot) {
-    const token = firstAgentToken(spec);
-    if (!token) {
-        throw new Error(`manifest enable entry '${spec}' is missing agent reference`);
-    }
-
-    const qualified = qualifySameRepoBareRef(token, currentRepo, workspaceRoot);
-    if (qualified) {
-        return qualified;
-    }
-
-    if (token.includes('/')) {
-        const [repoToken, agentName] = token.split('/', 2);
-        return resolveQualifiedRef(repoToken, agentName, workspaceRoot);
-    }
-
-    throw new Error(`missing manifest for enabled agent ${token}`);
-}
-
-function qualifySameRepoBareRef(agentName, currentRepo, workspaceRoot) {
-    const repo = canonicalRepoName(currentRepo);
-    if (!repo || !agentName || agentName.includes('/')) {
-        return null;
-    }
-    const repoDir = repoDirName(repo);
-    const manifestPath = path.join(workspaceRoot, repoDir, agentName, 'manifest.json');
-    if (!fs.existsSync(manifestPath)) {
-        return null;
-    }
-    return {
-        repo,
-        ref: `${repo}/${agentName}`,
-        manifestPath,
-    };
-}
-
-function resolveQualifiedRef(repoToken, agentName, workspaceRoot) {
-    const repo = canonicalRepoName(repoToken);
-    const repoDir = repoDirName(repo);
-    const manifestPath = path.join(workspaceRoot, repoDir, agentName, 'manifest.json');
-    if (!fs.existsSync(manifestPath)) {
-        throw new Error(`missing manifest for enabled agent ${repo}/${agentName}`);
-    }
-    return {
-        repo,
-        ref: `${repo}/${agentName}`,
-        manifestPath,
-    };
-}
-
-function pickProfile(manifest, requestedProfile, ref, { explicit = false } = {}) {
-    const profiles = manifest?.profiles || {};
-    const normalized = normalizeProfileName(requestedProfile);
-    if (!normalized) {
-        return DEFAULT_PROFILE;
-    }
-    if (!Object.prototype.hasOwnProperty.call(profiles, normalized)) {
-        if (!explicit) {
-            return DEFAULT_PROFILE;
-        }
-        const available = Object.keys(profiles).sort();
+    const conflict = claims.find((claim) => (
+        claim.protocol === 'tcp'
+        && claim.boxSide.start <= port
+        && claim.boxSide.end >= port
+    ));
+    if (conflict) {
         throw new Error(
-            `profile ${normalized} is not defined by ${ref}; available profiles: ${available.join(', ') || '(none)'}`,
+            `openPorts claim conflicts with reserved outer router socket ${port}/tcp: ${describeClaim(conflict)}`,
         );
     }
-    return normalized;
 }
 
-function mergeProfileConfig(manifest, profile) {
-    const profiles = manifest?.profiles || {};
-    const base = isPlainObject(profiles[DEFAULT_PROFILE]) ? profiles[DEFAULT_PROFILE] : {};
-    const selected = profile !== DEFAULT_PROFILE && isPlainObject(profiles[profile]) ? profiles[profile] : {};
-    const merged = deepMerge(base, selected);
-    if (Object.prototype.hasOwnProperty.call(selected, 'openPorts')) {
-        merged.openPorts = selected.openPorts;
-    }
-    return merged;
-}
-
-function deepMerge(base, override) {
-    const result = { ...base };
-    for (const [key, value] of Object.entries(override || {})) {
-        if (isPlainObject(value) && isPlainObject(result[key])) {
-            result[key] = deepMerge(result[key], value);
-        } else {
-            result[key] = value;
-        }
-    }
-    return result;
-}
-
-function isPlainObject(value) {
-    return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
-}
-
-function readManifest(manifestPath) {
-    return JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
-}
-
-function canonicalRepoName(repoName) {
-    const raw = String(repoName || '').trim();
-    if (!raw) {
-        return '';
-    }
-    return REPO_DIR_ALIASES.has(raw) && raw !== 'AssistOSExplorer'
-        ? 'AchillesIDE'
-        : (raw === 'AssistOSExplorer' ? 'AchillesIDE' : raw);
-}
-
-function repoDirName(repoName) {
-    return REPO_DIR_ALIASES.get(repoName) || repoName;
-}
-
-function normalizeProfileName(profile) {
-    return String(profile || '').trim().toLowerCase();
-}
-
-function normalizeAlias(alias) {
-    return String(alias || '').trim();
-}
-
-function effectiveNodeKey(ref, profile, alias) {
-    return alias ? `${ref}#${profile}#alias:${alias}` : `${ref}#${profile}#canonical`;
+function formatGeneratedPublish(claim, interval) {
+    const range = formatPortRange(interval);
+    const suffix = claim.protocol === 'tcp' ? '' : `/${claim.protocol}`;
+    return `${claim.hostIp}:${range}:${range}${suffix}`;
 }
 
 function formatClaimConflict(existing, claim) {
@@ -321,9 +187,6 @@ function formatClaimConflict(existing, claim) {
 
 function describeClaim(claim) {
     const identity = claim.alias ? `alias ${claim.alias}` : 'canonical instance';
-    return `${claim.ownerRef} (profile ${claim.profile}, ${identity}, ${claim.bindClass} bind ${claim.hostIp || '(engine default)'}) declares '${claim.raw}' (box ${formatPortRange(claim.boxSide)} -> private ${formatPortRange(claim.privateContainer)})`;
-}
-
-function firstAgentToken(spec) {
-    return String(spec || '').trim().split(/\s+/).filter(Boolean)[0] || '';
+    const path = claim.path?.length ? `, path ${claim.path.join(' -> ')}` : '';
+    return `${claim.ownerRef} (profile ${claim.profile}, ${identity}${path}, ${claim.bindClass} bind ${claim.hostIp || '(engine default)'}) declares '${claim.raw}' (box ${formatPortRange(claim.boxSide)} -> private ${formatPortRange(claim.privateContainer)})`;
 }

@@ -37,6 +37,7 @@ const {
     classifyDependencyGraphWaitMode,
     createGraphNodeId,
     parseManifestDependencyRef,
+    resolveEnabledAgentRegistryRecord,
     resolveWorkspaceDependencyGraph,
     topologicallyGroupDependencyGraph
 } = graphModule;
@@ -44,6 +45,8 @@ const { applyManifestDirectives, parseEnableDirective } = bootstrapModule;
 const workspaceUtilModuleUrl = new URL('../../cli/services/workspaceUtil.js', import.meta.url);
 const {
     buildBlockingReadinessEntryFromNode,
+    ensureGraphNodesEnabled,
+    resolveGraphNodeExecutionRecord,
     startWorkspace,
     waitForReadinessEntries,
 } = await import(`${workspaceUtilModuleUrl.href}${moduleSuffix}`);
@@ -57,6 +60,30 @@ test('parseManifestDependencyRef strips mode and alias syntax down to the agent 
     assert.equal(parseManifestDependencyRef('gitAgent global'), 'gitAgent');
     assert.equal(parseManifestDependencyRef('basic/keycloak as auth'), 'basic/keycloak');
     assert.equal(parseManifestDependencyRef('repo/agent:dev'), 'repo/agent');
+});
+
+test('resolveEnabledAgentRegistryRecord matches core direct, alias, canonical, and ambiguity semantics', () => {
+    const registry = {
+        _config: { static: { agent: 'demo/shared' } },
+        blue_container: {
+            type: 'agent', repoName: 'demo', agentName: 'shared', alias: 'blue', profile: 'dev',
+        },
+        green_container: {
+            type: 'agent', repoName: 'demo', agentName: 'shared', alias: 'green', profile: 'prod',
+        },
+        solo_container: {
+            type: 'agent', repoName: 'demo', agentName: 'solo', profile: 'prod',
+        },
+    };
+
+    assert.equal(resolveEnabledAgentRegistryRecord('blue_container', registry).containerName, 'blue_container');
+    assert.equal(resolveEnabledAgentRegistryRecord('blue', registry).record.profile, 'dev');
+    assert.equal(resolveEnabledAgentRegistryRecord('demo/solo', registry).containerName, 'solo_container');
+    assert.throws(
+        () => resolveEnabledAgentRegistryRecord('demo/shared', registry),
+        (error) => error.code === 'AGENT_ALIAS_AMBIGUOUS'
+            && /Use alias: blue, green/.test(error.message),
+    );
 });
 
 test('resolveWorkspaceDependencyGraph collects recursive dependencies and preserves aliases', () => {
@@ -135,6 +162,13 @@ test('start workspace clears a stale host port when start-only readiness resolve
     );
 });
 
+test('start workspace forwards each dependency registry profile to its synchronous service launch', () => {
+    assert.match(
+        startWorkspace.toString(),
+        /ensureAgentService\(shortAgentName,[\s\S]*?profileName:\s*rec\.profile\s*\|\|\s*undefined/,
+    );
+});
+
 test('resolveWorkspaceDependencyGraph preserves dependency modes while qualifying relative refs', () => {
     writeManifest('demo', 'mode-target', { container: 'node:20-alpine' });
     writeManifest('demo', 'mode-app', {
@@ -146,12 +180,273 @@ test('resolveWorkspaceDependencyGraph preserves dependency modes while qualifyin
     assert.equal(graph.nodes.get('demo/mode-target').enableSpec, 'demo/mode-target global');
 });
 
+test('retained graph records reconcile isolated, global, and devel execution before blocking or no-wait launch', () => {
+    const reposDir = path.join(tempDir, '.ploinky', 'repos');
+    const develRepo = 'mode-devel-repo';
+    const develPath = path.join(reposDir, develRepo);
+    const isolatedPath = path.join(tempDir, '.data', 'background-worker');
+    const preservedNamedData = path.join(isolatedPath, 'preserved.txt');
+    const preservedWorkspaceData = path.join(tempDir, 'workspace-preserved.txt');
+    fs.mkdirSync(isolatedPath, { recursive: true });
+    fs.mkdirSync(develPath, { recursive: true });
+    fs.writeFileSync(preservedNamedData, 'named-data');
+    fs.writeFileSync(preservedWorkspaceData, 'workspace-data');
+
+    const nodes = new Map([
+        ['demo/blocking-global', {
+            id: 'demo/blocking-global', repoName: 'demo', shortAgentName: 'blocking-global',
+            alias: '', agentRef: 'demo/blocking-global', enableSpec: 'demo/blocking-global global',
+            profile: 'default', isStatic: false,
+        }],
+        ['demo/background-worker', {
+            id: 'demo/background-worker', repoName: 'demo', shortAgentName: 'background-worker',
+            alias: '', agentRef: 'demo/background-worker', enableSpec: 'demo/background-worker isolated',
+            profile: 'embedded', isStatic: false,
+        }],
+        ['demo/devel-worker', {
+            id: 'demo/devel-worker', repoName: 'demo', shortAgentName: 'devel-worker',
+            alias: '', agentRef: 'demo/devel-worker', enableSpec: `demo/devel-worker devel ${develRepo}`,
+            profile: 'default', isStatic: false,
+        }],
+        ['demo/implicit-worker', {
+            id: 'demo/implicit-worker', repoName: 'demo', shortAgentName: 'implicit-worker',
+            alias: '', agentRef: 'demo/implicit-worker', enableSpec: 'demo/implicit-worker',
+            profile: 'embedded', isStatic: false,
+        }],
+        ['demo/root', {
+            id: 'demo/root', repoName: 'demo', shortAgentName: 'root',
+            alias: '', agentRef: 'demo/root', enableSpec: 'demo/root',
+            profile: 'default', isStatic: true,
+        }],
+    ]);
+    const registry = {
+        blocking_container: {
+            type: 'agent', repoName: 'demo', agentName: 'blocking-global',
+            runMode: 'isolated', projectPath: path.join(tempDir, '.data', 'blocking-global'),
+            config: { binds: [{ source: '/old', target: '/root' }] },
+        },
+        background_container: {
+            type: 'agent', repoName: 'demo', agentName: 'background-worker',
+            runMode: 'global', projectPath: tempDir, develRepo: 'stale', profile: 'default',
+            config: { binds: [{ source: tempDir, target: tempDir }] },
+        },
+        devel_container: {
+            type: 'agent', repoName: 'demo', agentName: 'devel-worker',
+            runMode: 'global', projectPath: tempDir,
+            config: { binds: [{ source: tempDir, target: tempDir }] },
+        },
+        implicit_container: {
+            type: 'agent', repoName: 'demo', agentName: 'implicit-worker',
+            runMode: 'global', projectPath: tempDir, profile: 'default',
+            config: { binds: [{ source: tempDir, target: tempDir }] },
+        },
+        root_container: {
+            type: 'agent', repoName: 'demo', agentName: 'root', alias: 'root-blue',
+            runMode: 'global', projectPath: tempDir,
+            config: { binds: [{ source: tempDir, target: tempDir }] },
+        },
+    };
+    const removed = [];
+    const saved = [];
+
+    ensureGraphNodesEnabled({ nodes }, registry, {
+        removeAgentContainerForRecreate(containerName) {
+            removed.push(containerName);
+        },
+        saveAgents(nextRegistry) {
+            saved.push(structuredClone(nextRegistry));
+        },
+        enableAgent() {
+            assert.fail('all retained graph nodes should already be enabled');
+        },
+        executionRecordOptions: {
+            workspaceRoot: tempDir,
+            reposDir,
+            getAgentDataDirImpl(instanceName) {
+                return path.join(tempDir, '.data', instanceName);
+            },
+        },
+    });
+
+    assert.deepEqual(removed.sort(), ['background_container', 'blocking_container', 'devel_container']);
+    assert.equal(saved.length, 1);
+    assert.deepEqual(
+        {
+            runMode: registry.blocking_container.runMode,
+            projectPath: registry.blocking_container.projectPath,
+            develRepo: registry.blocking_container.develRepo,
+        },
+        { runMode: 'global', projectPath: tempDir, develRepo: undefined },
+    );
+    assert.deepEqual(
+        {
+            runMode: registry.background_container.runMode,
+            projectPath: registry.background_container.projectPath,
+            develRepo: registry.background_container.develRepo,
+            profile: registry.background_container.profile,
+        },
+        { runMode: 'isolated', projectPath: isolatedPath, develRepo: undefined, profile: 'embedded' },
+    );
+    assert.deepEqual(
+        {
+            runMode: registry.devel_container.runMode,
+            projectPath: registry.devel_container.projectPath,
+            develRepo: registry.devel_container.develRepo,
+        },
+        { runMode: 'devel', projectPath: develPath, develRepo },
+    );
+    assert.deepEqual(
+        {
+            runMode: registry.root_container.runMode,
+            projectPath: registry.root_container.projectPath,
+        },
+        { runMode: 'global', projectPath: tempDir },
+    );
+    assert.deepEqual(
+        {
+            runMode: registry.implicit_container.runMode,
+            projectPath: registry.implicit_container.projectPath,
+            profile: registry.implicit_container.profile,
+        },
+        { runMode: 'global', projectPath: tempDir, profile: 'embedded' },
+    );
+    assert.deepEqual(registry.blocking_container.config.binds, [{ source: '/old', target: '/root' }]);
+    assert.equal(fs.readFileSync(preservedNamedData, 'utf8'), 'named-data');
+    assert.equal(fs.readFileSync(preservedWorkspaceData, 'utf8'), 'workspace-data');
+
+    const startSource = startWorkspace.toString();
+    assert.ok(
+        startSource.indexOf('ensureGraphNodesEnabled') < startSource.indexOf('classifyDependencyGraphWaitMode'),
+        'execution reconciliation must occur before the graph is divided into blocking and no-wait launch paths',
+    );
+});
+
+test('execution-mode reconciliation leaves registry records unchanged when exact-container removal fails', () => {
+    const registry = {
+        retained_container: {
+            type: 'agent', repoName: 'demo', agentName: 'retained',
+            runMode: 'isolated', projectPath: path.join(tempDir, '.data', 'retained'),
+            profile: 'default',
+        },
+    };
+    const before = structuredClone(registry);
+    let saveCount = 0;
+
+    assert.throws(
+        () => ensureGraphNodesEnabled({
+            nodes: new Map([['demo/retained', {
+                id: 'demo/retained', repoName: 'demo', shortAgentName: 'retained', alias: '',
+                agentRef: 'demo/retained', enableSpec: 'demo/retained global', profile: 'embedded', isStatic: false,
+            }]]),
+        }, registry, {
+            removeAgentContainerForRecreate() {
+                throw new Error('safe removal refused');
+            },
+            saveAgents() {
+                saveCount += 1;
+            },
+            executionRecordOptions: { workspaceRoot: tempDir },
+        }),
+        /safe removal refused/,
+    );
+
+    assert.deepEqual(registry, before);
+    assert.equal(saveCount, 0);
+});
+
+test('an empty legacy develRepo field does not force recreation of an otherwise matching mode', () => {
+    const registry = {
+        retained_container: {
+            type: 'agent', repoName: 'demo', agentName: 'retained',
+            runMode: 'global', projectPath: tempDir, develRepo: undefined, profile: 'default',
+        },
+    };
+    let removals = 0;
+    let saves = 0;
+    ensureGraphNodesEnabled({
+        nodes: new Map([['demo/retained', {
+            id: 'demo/retained', repoName: 'demo', shortAgentName: 'retained',
+            alias: '', agentRef: 'demo/retained', enableSpec: 'demo/retained global',
+            profile: 'default', isStatic: false,
+        }]]),
+    }, registry, {
+        removeAgentContainerForRecreate() { removals += 1; },
+        saveAgents() { saves += 1; },
+        enableAgent() { assert.fail('the retained node is already enabled'); },
+        executionRecordOptions: { workspaceRoot: tempDir },
+    });
+    assert.equal(removals, 0);
+    assert.equal(saves, 0);
+});
+
+test('devel execution preflight fails before removing any retained graph container', () => {
+    const registry = {
+        first_container: {
+            type: 'agent', repoName: 'demo', agentName: 'first',
+            runMode: 'isolated', projectPath: path.join(tempDir, '.data', 'first'),
+        },
+        missing_devel_container: {
+            type: 'agent', repoName: 'demo', agentName: 'missing-devel',
+            runMode: 'global', projectPath: tempDir,
+        },
+    };
+    const before = structuredClone(registry);
+    const removed = [];
+
+    assert.throws(
+        () => ensureGraphNodesEnabled({
+            nodes: new Map([
+                ['demo/first', {
+                    id: 'demo/first', repoName: 'demo', shortAgentName: 'first', alias: '',
+                    agentRef: 'demo/first', enableSpec: 'demo/first global', profile: 'default', isStatic: false,
+                }],
+                ['demo/missing-devel', {
+                    id: 'demo/missing-devel', repoName: 'demo', shortAgentName: 'missing-devel', alias: '',
+                    agentRef: 'demo/missing-devel', enableSpec: 'demo/missing-devel devel does-not-exist', profile: 'default', isStatic: false,
+                }],
+            ]),
+        }, registry, {
+            removeAgentContainerForRecreate(containerName) {
+                removed.push(containerName);
+            },
+            saveAgents() {
+                assert.fail('invalid devel preflight must not save the registry');
+            },
+            executionRecordOptions: {
+                workspaceRoot: tempDir,
+                reposDir: path.join(tempDir, '.ploinky', 'repos'),
+            },
+        }),
+        /does-not-exist.*was not found/,
+    );
+
+    assert.deepEqual(removed, []);
+    assert.deepEqual(registry, before);
+});
+
+test('graph execution selection accepts colon mode syntax and alias-specific isolated paths', () => {
+    assert.deepEqual(
+        resolveGraphNodeExecutionRecord({
+            id: 'demo/worker as blue', shortAgentName: 'worker', alias: 'blue',
+            agentRef: 'demo/worker', enableSpec: 'demo/worker:isolated',
+        }, {
+            getAgentDataDirImpl(instanceName) {
+                return `/data/${instanceName}`;
+            },
+        }),
+        { runMode: 'isolated', projectPath: '/data/blue', develRepo: undefined },
+    );
+});
+
 test('resolveWorkspaceDependencyGraph resolves same-repo bare dependencies when enabled repos are filtered', (t) => {
     writeEnabledRepos(['basic']);
     t.after(clearEnabledRepos);
 
     writeManifest('basic', 'webtty', { container: 'node:20-alpine' });
-    writeManifest('AchillesIDE', 'gitAgent', { container: 'node:20-alpine' });
+    writeManifest('AchillesIDE', 'gitAgent', {
+        container: 'node:20-alpine',
+        profiles: { default: {}, embedded: {} },
+    });
     writeManifest('AchillesIDE', 'explorer', {
         container: 'node:20-alpine',
         enable: [

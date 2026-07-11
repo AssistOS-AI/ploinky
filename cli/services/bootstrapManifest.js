@@ -179,7 +179,11 @@ export function manifestEnableEntries(manifest, profileOverride = '') {
     return entries;
 }
 
-function ensurePrefixedRepoInstalled(spec, branchPolicy) {
+function ensurePrefixedRepoInstalled(spec, branchPolicy, {
+    stdio = 'inherit',
+    logError = console.error,
+    activate = true,
+} = {}) {
     if (!spec || typeof spec !== 'string') return;
     const slashIdx = spec.indexOf('/');
     const colonIdx = spec.indexOf(':');
@@ -188,9 +192,17 @@ function ensurePrefixedRepoInstalled(spec, branchPolicy) {
 
     const repoName = spec.slice(0, sepIdx);
     const repoPath = path.join(PLOINKY_DIR, 'repos', repoName);
-    if (fs.existsSync(repoPath)) return;
-
     const source = repos.resolveRepoSource(repoName);
+    if (fs.existsSync(repoPath)) {
+        if (activate) {
+            repos.enableRepo(repoName, {
+                branch: source?.branch || null,
+                branchPolicy,
+                stdio,
+            });
+        }
+        return;
+    }
     if (!source?.url) {
         if (isStrictBranchPolicy(branchPolicy)) {
             throw new Error(`No URL configured for repo '${repoName}'.`);
@@ -202,13 +214,20 @@ function ensurePrefixedRepoInstalled(spec, branchPolicy) {
         repos.ensureRepoInstalled(repoName, source.url, {
             branchPolicy,
             branch: source.branch,
-            stdio: 'inherit',
+            stdio,
         });
+        if (activate) {
+            repos.enableRepo(repoName, {
+                branch: source.branch,
+                branchPolicy,
+                stdio,
+            });
+        }
     } catch (err) {
         if (isStrictBranchPolicy(branchPolicy)) {
             throw new Error(`Auto-install repo '${repoName}' failed: ${errorMessage(err)}`);
         }
-        console.error(`[manifest] Auto-install repo '${repoName}' failed: ${errorMessage(err)}`);
+        logError(`[manifest] Auto-install repo '${repoName}' failed: ${errorMessage(err)}`);
     }
 }
 
@@ -290,6 +309,9 @@ async function applyManifestDirectivesInternal(agentNameOrPath, {
     branchPolicy,
     profile = '',
     visited,
+    enableAgents = true,
+    stdio = 'inherit',
+    logError = console.error,
 } = {}) {
     const { manifest, manifestPath, repoName } = readManifestTarget(agentNameOrPath);
     const visitKey = `${path.resolve(manifestPath)}::${profile || ''}`;
@@ -312,28 +334,32 @@ async function applyManifestDirectivesInternal(agentNameOrPath, {
                     repos.ensureRepoInstalled(name, value.url, {
                         branchPolicy,
                         branch: resolvedBranch,
-                        stdio: 'inherit',
+                        stdio,
                     });
-                    repos.enableRepo(name, {
-                        branch: resolvedBranch,
-                        branchPolicy,
-                        stdio: 'inherit',
-                    });
+                    if (enableAgents) {
+                        repos.enableRepo(name, {
+                            branch: resolvedBranch,
+                            branchPolicy,
+                            stdio,
+                        });
+                    }
                 } else {
                     repos.ensureRepoInstalled(name, value, {
                         branchPolicy,
-                        stdio: 'inherit',
+                        stdio,
                     });
-                    repos.enableRepo(name, {
-                        branchPolicy,
-                        stdio: 'inherit',
-                    });
+                    if (enableAgents) {
+                        repos.enableRepo(name, {
+                            branchPolicy,
+                            stdio,
+                        });
+                    }
                 }
             } catch (err) {
                 if (isStrictBranchPolicy(branchPolicy)) {
                     throw new Error(`[manifest repos] Failed to install repo '${name}': ${errorMessage(err)}`);
                 }
-                console.error(`[manifest repos] Failed to install repo '${name}': ${errorMessage(err)}`);
+                logError(`[manifest repos] Failed to install repo '${name}': ${errorMessage(err)}`);
             }
         }
     }
@@ -348,17 +374,26 @@ async function applyManifestDirectivesInternal(agentNameOrPath, {
                     ...parsed,
                     spec: qualifyEnableSpecForRepo(parsed.spec, repoName),
                 };
-                ensurePrefixedRepoInstalled(qualified.spec, branchPolicy);
+                ensurePrefixedRepoInstalled(qualified.spec, branchPolicy, {
+                    stdio,
+                    logError,
+                    activate: enableAgents,
+                });
                 if (!shouldEnableDirectiveForManifest(qualified, manifest)) {
                     continue;
                 }
-                ensureDirectiveEnabled(qualified);
+                if (enableAgents) {
+                    ensureDirectiveEnabled(qualified);
+                }
                 const childRef = agentRefFromEnableSpec(qualified.spec);
                 if (childRef) {
                     await applyManifestDirectivesInternal(childRef, {
                         branchPolicy,
-                        profile: qualified.profile || '',
+                        profile: qualified.profile || profile || '',
                         visited,
+                        enableAgents,
+                        stdio,
+                        logError,
                     });
                 }
             } catch (err) {
@@ -366,7 +401,7 @@ async function applyManifestDirectivesInternal(agentNameOrPath, {
                 if (isStrictBranchPolicy(branchPolicy)) {
                     throw new Error(`[manifest enable] Failed to enable agent '${rawEntry}': ${message}`);
                 }
-                console.error(`[manifest enable] Failed to enable agent '${rawEntry}': ${message}`);
+                logError(`[manifest enable] Failed to ${enableAgents ? 'enable' : 'prepare'} agent '${rawEntry}': ${message}`);
             }
         }
     }
@@ -376,5 +411,21 @@ export async function applyManifestDirectives(agentNameOrPath, { branchPolicy } 
     return applyManifestDirectivesInternal(agentNameOrPath, {
         branchPolicy,
         visited: new Set(),
+    });
+}
+
+export async function prepareManifestRepositories(agentNameOrPath, {
+    branchPolicy,
+    profile = '',
+    stdio = 'ignore',
+    logError = () => {},
+} = {}) {
+    return applyManifestDirectivesInternal(agentNameOrPath, {
+        branchPolicy,
+        profile,
+        visited: new Set(),
+        enableAgents: false,
+        stdio,
+        logError,
     });
 }

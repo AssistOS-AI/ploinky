@@ -7,6 +7,7 @@ import { resolveMasterKey, setUsersPayload } from './encryptedPasswordStore.js';
 import { hashPassword } from './localAuthPasswords.js';
 import {
     getAgentContainerName,
+    assertOuterPublicationCoverageForManifest,
     parseManifestPorts,
     containerExists,
     isContainerRunning,
@@ -17,6 +18,7 @@ import {
 } from './docker/index.js';
 import { findAgent } from './utils.js';
 import { REPOS_DIR, PLOINKY_WORKSPACE_ROOT, ROUTING_FILE } from './config.js';
+import { getActiveProfile, getProfileConfig } from './profileService.js';
 import {
     createAgentSymlinks,
     removeAgentSymlinks,
@@ -146,7 +148,7 @@ function resolveManifestAuthMode(manifest) {
     return 'none';
 }
 
-function normalizeEnableArgs(agentName, mode, repoNameParam) {
+export function normalizeEnableArgs(agentName, mode, repoNameParam) {
     if (typeof agentName !== 'string') {
         return { agentName, mode, repoNameParam };
     }
@@ -266,6 +268,18 @@ export function enableAgent(agentName, mode, repoNameParam, aliasParam, authMode
     if ((username && !password) || (!username && password)) {
         throw new Error('Use --user and --password together.');
     }
+
+    const coverageProfile = profile || getActiveProfile();
+    const coverageProfileConfig = manifest?.profiles && Object.keys(manifest.profiles).length
+        ? getProfileConfig(`${repoName}/${shortAgentName}`, coverageProfile)
+        : null;
+    if (manifest?.profiles && Object.keys(manifest.profiles).length && !coverageProfileConfig) {
+        throw new Error(`[profile] ${shortAgentName}: profile '${coverageProfile}' not found. Available: ${Object.keys(manifest.profiles).join(', ')}`);
+    }
+    assertOuterPublicationCoverageForManifest(manifest, coverageProfileConfig, {
+        ownerRef: `${repoName}/${shortAgentName}`,
+        commandHint: `ploinky enable agent ${repoName}/${shortAgentName}${alias ? ` as ${alias}` : ''}`,
+    });
 
     const normalizedMode = (normalized.mode || '').toLowerCase();
     let runMode = DEFAULT_ENABLE_AGENT_MODE;
@@ -394,7 +408,8 @@ export function enableAgent(agentName, mode, repoNameParam, aliasParam, authMode
         started = ensureAgentService(shortAgentName, manifest, agentPath, {
             containerName,
             alias: alias || undefined,
-            preferredHostPort
+            preferredHostPort,
+            profileName: profile || undefined
         });
     } catch (error) {
         throw new Error(`enable agent: failed to start '${shortAgentName}': ${error?.message || error}`);

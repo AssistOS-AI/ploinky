@@ -12,7 +12,7 @@ import {
 import { parseRuntimeKey, detectHostRuntimeKey } from './dependencyRuntimeKey.js';
 import { debugLog } from './utils.js';
 import { readGlobalDepsPackage, mergePackageJson } from './dependencyInstaller.js';
-import { getRuntime } from './docker/common.js';
+import { getRuntime, managedContainerLabelArgs } from './docker/common.js';
 import { detectShellForImage, SHELL_FALLBACK_DIRECT } from './docker/shellDetection.js';
 
 export const STAMP_VERSION = 1;
@@ -441,7 +441,7 @@ export function buildContainerInstallRunArgs({
         ? ['--network', 'slirp4netns:allow_host_loopback=true']
         : [];
     return [
-        'run', '--rm',
+        'run', '--rm', ...managedContainerLabelArgs(),
         ...roArgs,
         // Dependency-cache installation is a maintenance step against a writable
         // host cache, so it must not inherit non-root USER defaults from runtime

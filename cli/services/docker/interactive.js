@@ -7,6 +7,7 @@ import { debugLog } from '../utils.js';
 import { getActiveProfile, getProfileConfig } from '../profileService.js';
 import {
     CONTAINER_CONFIG_PATH,
+    PLOINKY_MANAGED_LABEL,
     containerExists,
     getAgentContainerName,
     getConfiguredProjectPath,
@@ -33,6 +34,73 @@ function ensureSharedHostDir() {
     const dir = SHARED_DIR;
     try { fs.mkdirSync(dir, { recursive: true }); } catch (_) {}
     return dir;
+}
+
+function joinShellCommandParts(parts) {
+    return parts.filter((part) => String(part || '').trim()).join(' ');
+}
+
+function buildInteractiveCommandCreateCommand({
+    runtime,
+    containerName,
+    mountOption = '',
+    portOptions = '',
+    envVars = '',
+    containerImage,
+} = {}) {
+    return joinShellCommandParts([
+        runtime,
+        'create',
+        '-it',
+        '--name',
+        containerName,
+        '--label',
+        PLOINKY_MANAGED_LABEL,
+        mountOption,
+        portOptions,
+        envVars,
+        containerImage,
+        '/bin/sh -lc "while :; do sleep 3600; done"',
+    ]);
+}
+
+function buildInteractiveAgentCreateCommand({
+    runtime,
+    containerName,
+    envHash,
+    projectDir,
+    homeDir,
+    agentLibPath,
+    absAgentPath,
+    sharedDir,
+    volumeSuffix = '',
+    readOnlySuffix = ':ro',
+    portOptions = '',
+    envVars = '',
+    containerImage,
+} = {}) {
+    return joinShellCommandParts([
+        runtime,
+        'create',
+        '-it',
+        '--name',
+        containerName,
+        '--label',
+        PLOINKY_MANAGED_LABEL,
+        '--label',
+        `ploinky.envhash=${envHash}`,
+        `-v "${projectDir}:${projectDir}${volumeSuffix}"`,
+        path.resolve(projectDir) === path.resolve(homeDir)
+            ? ''
+            : `-v "${homeDir}:/root${volumeSuffix}"`,
+        `-v "${agentLibPath}:/Agent${readOnlySuffix}"`,
+        `-v "${absAgentPath}:/code${readOnlySuffix}"`,
+        `-v "${sharedDir}:/shared${volumeSuffix}"`,
+        portOptions,
+        envVars,
+        containerImage,
+        '/bin/sh -lc "while :; do sleep 3600; done"',
+    ]);
 }
 
 function runCommandInContainer(agentName, repoName, manifest, command, interactive = false) {
@@ -82,7 +150,14 @@ function runCommandInContainer(agentName, repoName, manifest, command, interacti
         let containerId;
 
         try {
-            const createCommand = `${runtime} create -it --name ${containerName} ${mountOption} ${portOptions} ${envVars} ${containerImage} /bin/sh -lc "while :; do sleep 3600; done"`;
+            const createCommand = buildInteractiveCommandCreateCommand({
+                runtime,
+                containerName,
+                mountOption,
+                portOptions,
+                envVars,
+                containerImage,
+            });
             debugLog(`Executing create command: ${createCommand}`);
             createOutput = execSync(createCommand, { stdio: ['pipe', 'pipe', 'inherit'] }).toString().trim();
             containerId = createOutput;
@@ -97,7 +172,14 @@ function runCommandInContainer(agentName, repoName, manifest, command, interacti
                 }
 
                 console.log(`Retrying with full registry name: ${containerImage}`);
-                const retryCommand = `${runtime} create -it --name ${containerName} ${mountOption} ${portOptions} ${envVars} ${containerImage} /bin/sh -lc \"while :; do sleep 3600; done\"`;
+                const retryCommand = buildInteractiveCommandCreateCommand({
+                    runtime,
+                    containerName,
+                    mountOption,
+                    portOptions,
+                    envVars,
+                    containerImage,
+                });
                 debugLog(`Executing retry command: ${retryCommand}`);
 
                 try {
@@ -268,13 +350,21 @@ function ensureAgentContainer(agentName, repoName, manifest) {
         const { publishArgs: manifestPorts, portMappings } = parseManifestPorts(manifest);
         const portOptions = manifestPorts.map(p => `-p ${p}`).join(' ');
         try {
-            const createCommand = `${runtime} create -it --name ${containerName} --label ploinky.envhash=${envHash} \
-              -v "${projectDir}:${projectDir}${volZ}" \
-              ${path.resolve(projectDir) === path.resolve(homeDir) ? '' : `-v "${homeDir}:/root${volZ}" \\`}
-              -v "${agentLibPath}:/Agent${roOpt}" \
-              -v "${absAgentPath}:/code${roOpt}" \
-              -v "${sharedDir}:/shared${volZ}" \
-              ${portOptions} ${envVars} ${containerImage} /bin/sh -lc "while :; do sleep 3600; done"`;
+            const createCommand = buildInteractiveAgentCreateCommand({
+                runtime,
+                containerName,
+                envHash,
+                projectDir,
+                homeDir,
+                agentLibPath,
+                absAgentPath,
+                sharedDir,
+                volumeSuffix: volZ,
+                readOnlySuffix: roOpt,
+                portOptions,
+                envVars,
+                containerImage,
+            });
             debugLog(`Executing create command: ${createCommand}`);
             execSync(createCommand, { stdio: ['pipe', 'pipe', 'inherit'] });
             createdNew = true;
@@ -283,13 +373,21 @@ function ensureAgentContainer(agentName, repoName, manifest) {
                 if (!containerImage.includes('/')) containerImage = `docker.io/library/${containerImage}`;
                 else if (!containerImage.startsWith('docker.io/') && !containerImage.includes('.')) containerImage = `docker.io/${containerImage}`;
                 console.log(`Retrying with full registry name: ${containerImage}`);
-                const retryCommand = `${runtime} create -it --name ${containerName} --label ploinky.envhash=${envHash} \
-                  -v "${projectDir}:${projectDir}${volZ}" \
-                  ${path.resolve(projectDir) === path.resolve(homeDir) ? '' : `-v "${homeDir}:/root${volZ}" \\`}
-                  -v "${agentLibPath}:/Agent${roOpt}" \
-                  -v "${absAgentPath}:/code${roOpt}" \
-                  -v "${sharedDir}:/shared${volZ}" \
-                  ${portOptions} ${envVars} ${containerImage} /bin/sh -lc \"while :; do sleep 3600; done\"`;
+                const retryCommand = buildInteractiveAgentCreateCommand({
+                    runtime,
+                    containerName,
+                    envHash,
+                    projectDir,
+                    homeDir,
+                    agentLibPath,
+                    absAgentPath,
+                    sharedDir,
+                    volumeSuffix: volZ,
+                    readOnlySuffix: roOpt,
+                    portOptions,
+                    envVars,
+                    containerImage,
+                });
                 debugLog(`Executing retry command: ${retryCommand}`);
                 execSync(retryCommand, { stdio: ['pipe', 'pipe', 'inherit'] });
                 manifest.container = containerImage;
@@ -417,6 +515,8 @@ function attachInteractive(containerName, workdir, entryCommand) {
 export {
     attachInteractive,
     buildExecArgs,
+    buildInteractiveAgentCreateCommand,
+    buildInteractiveCommandCreateCommand,
     ensureAgentContainer,
     runCommandInContainer
 };

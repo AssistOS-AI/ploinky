@@ -1,5 +1,5 @@
 import { spawnSync } from 'child_process';
-import { getRuntime, getRuntimeForAgent, ensureImagePresent } from './docker/common.js';
+import { getRuntime, getRuntimeForAgent, ensureImagePresent, managedContainerLabelArgs } from './docker/common.js';
 import { resolveManifestImage } from './secretVars.js';
 
 const SUPPORTED_FAMILIES = new Set(['bwrap', 'seatbelt', 'container']);
@@ -99,7 +99,7 @@ function isNodeMissingProbeFailure(status, stderr) {
     return /not found|no such file|not in \$?path|executable file/.test(text);
 }
 
-function defaultContainerProbe({ image, runtime }) {
+function buildContainerRuntimeKeyProbeRunArgs(image) {
     const probeScript = [
         'const report = typeof process.report?.getReport === "function" ? process.report.getReport() : null;',
         'const header = report && report.header ? report.header : null;',
@@ -111,11 +111,25 @@ function defaultContainerProbe({ image, runtime }) {
         '  libc',
         '}));',
     ].join('');
+    return [
+        'run',
+        '--rm',
+        ...managedContainerLabelArgs(),
+        '--pull=never',
+        '--entrypoint',
+        'node',
+        image,
+        '-e',
+        probeScript,
+    ];
+}
+
+function defaultContainerProbe({ image, runtime }) {
     // --pull=never: the image must already be present locally (ensureImagePresent
     // pulls it as an explicit, progress-streamed step before we get here). This
     // keeps the probe fast and turns a missing image into an instant, clear error
     // instead of a silent multi-minute pull that trips the timeout.
-    const args = ['run', '--rm', '--pull=never', '--entrypoint', 'node', image, '-e', probeScript];
+    const args = buildContainerRuntimeKeyProbeRunArgs(image);
     const timeoutMs = probeTimeoutMs();
     const res = spawnSync(runtime, args, { stdio: ['ignore', 'pipe', 'pipe'], timeout: timeoutMs });
     if (res.error) {
@@ -187,4 +201,11 @@ export function parseRuntimeKey(runtimeKey) {
     };
 }
 
-export { normalizeRuntimeFamily, buildRuntimeKey, isNoNodeRuntimeKey, NO_NODE_RUNTIME_KEY, SUPPORTED_FAMILIES };
+export {
+    normalizeRuntimeFamily,
+    buildContainerRuntimeKeyProbeRunArgs,
+    buildRuntimeKey,
+    isNoNodeRuntimeKey,
+    NO_NODE_RUNTIME_KEY,
+    SUPPORTED_FAMILIES,
+};

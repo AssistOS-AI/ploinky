@@ -28,6 +28,19 @@ test('cli dispatches solely by argument arity', async () => {
     ]);
 });
 
+test('cli forwards the completed dispatcher preflight receipt to the agent path', async () => {
+    const calls = [];
+    await handleCliCommand(['explorer', '--help'], {
+        publicationPreflightComplete: true,
+        runAgentCliImpl: async (...args) => calls.push(args),
+    });
+    assert.deepEqual(calls, [[
+        'explorer',
+        ['--help'],
+        { publicationPreflightComplete: true },
+    ]]);
+});
+
 test('outer shell validates marker before tty and restores around bash', () => {
     const events = [];
     const lines = [];

@@ -26,15 +26,40 @@ The managed public-entrypoint boundary is:
 | `ploinky start ...` | Reconcile/start outer runtime; preserve graph publishes and router readiness |
 | `ploinky status` | Inspect outer contract/publishes/health and running core status without mutation |
 | `ploinky stop` | Stop core services, then stop outer runtime; keep volumes |
-| `ploinky destroy` | Confirm exact instance and remove its container plus three volumes |
+| `ploinky destroy` | Confirm exact instance and directly remove its outer container; retain named volumes |
 | REPL `status`/`stop`/`destroy` | Core workspace/router/agent scope; outer runtime remains |
 
-The host supervisor must complete outer reconciliation before invoking core
-startup. A managed `ploinky start ...` must preserve dependency-graph ordering,
-profile-derived publishes, and core readiness behavior. Only after core start
-succeeds may the host layer probe
+The host supervisor must complete authoritative publication planning and outer
+reconciliation before invoking core startup. Every one-shot command that can
+start an agent must preserve dependency-graph ordering, effective-profile
+publishes, and core readiness behavior. Only after core start succeeds may the
+host layer probe
 `http://127.0.0.1:<selected-host-port>/status`; a failed core start must produce
 no host router probe.
+
+Publication planning is generic. It resolves the requested root, active
+transitive dependency graph, aliases, profiles, branches, and any additional
+enabled agents core will start from the named workspace rather than from a
+product-specific host checkout. A running box plans through `exec`; a stopped
+box remains stopped while a temporary container uses its inspected image ID.
+For a missing box, the supervisor pulls and validates contract 2, creates the
+labelled workspace volume, plans in a temporary container, and creates the
+final box from the same image ID. Temporary containers and anonymous volumes
+are removed on every planner exit path. A failed first plan may retain prepared
+repositories and the named workspace volume for retry; deliberate cleanup is a
+direct volume removal on the sole owning engine after accepting data loss.
+
+The outer identity is derived from the exact canonical current directory as a
+readable basename plus a 12-character path hash; there is no public name or
+engine override. The supervisor requires every installed Podman/Docker engine
+to answer and inventories the exact box plus all three exact identity-labelled
+volumes before selecting the sole resource owner. Unknown probes, split
+resources, and foreign exact-name volumes fail without mutation. With no
+identity resources, answering Podman is preferred; a non-installed engine
+cannot participate in inventory. The mutable
+`docker.io/assistos/ploinky-box:runtime` channel is pulled only for create or
+replacement, validated as contract 2, and pinned by image ID for execution.
+Contract-1 state is never migrated or adopted.
 
 A cache is valid only when the runtime key, the relevant package hash, the stamp version, the installer metadata, and the core marker module all match the current workspace inputs. Cache preparation must use the correct installation backend for the target runtime family. Container-family runtime keys must install inside an install container for the target image, and the prepared stamp must record that image so a manifest image change refreshes the cache even when Node major, platform, libc, and package hashes are otherwise unchanged. Sandbox-family runtime keys must install on the host and must reject preparation for a foreign host runtime key.
 
@@ -44,8 +69,11 @@ Dependency caches are regenerated state, not agent data. A core `destroy`
 entered in the REPL must clear `.ploinky/deps/` so the next core startup rebuilds
 missing caches, while `.data/<agent-or-alias>/` and the containing outer runtime
 remain untouched. Host `ploinky stop` preserves the outer dependency volume;
-confirmed host `ploinky destroy` removes that volume together with the selected
-outer container and its other two named volumes.
+confirmed host `ploinky destroy` directly removes only the selected outer
+container and its attached anonymous volumes. The dependency, workspace, and
+nested-container-storage named volumes remain labelled and available to the
+next permitted recreation. Removing them for a full reset is a separate,
+explicit engine-level data-cleanup action.
 
 Workspace startup must expand the static agent into a dependency graph using manifest enable directives. The graph must be grouped topologically into waves. A later wave must not start until the earlier wave has been started and all of its members have passed readiness checks.
 
@@ -53,7 +81,11 @@ Startup readiness follows an explicit precedence. A declared `readiness.protocol
 
 For blocking script readiness, Ploinky executes the declared plain-filename script inside the service container from `/code`, applying its interval, per-attempt timeout, success threshold, and failure threshold. A missing script, exhausted failure threshold, or execution error fails the dependency wave and blocks the caller. The same manifest `health.readiness` configuration may later be used by the watchdog as a warning-oriented health probe, but that later behavior does not weaken its blocking role during start-only container startup.
 
-`openPorts` is publication metadata, not a generic readiness annotation. It exposes an agent socket into the managed outer runtime and makes that runtime-side socket eligible for host publication during graph-driven starts. A start-only container with no `openPorts` does not receive a fabricated port-7000 AgentServer mapping: it must provide a blocking container script, a private `additionalServerPort` route, an intentional published TCP route, or explicit `readiness.protocol: "none"`. AgentServer execution modes may still receive the random localhost-to-7000 mapping when no port is declared. A host-network service that intentionally uses TCP readiness can name its reachable runtime-side port through `openPorts`, but doing so also accepts outer-boundary eligibility; a private host-network service should use a private readiness contract instead.
+`openPorts` is publication metadata, not a generic readiness annotation. It exposes an agent socket into the managed outer runtime and makes that runtime-side socket eligible for host publication for any agent-starting command. The planner rejects zero box-side ports, invalid ranges, same-protocol claim conflicts, and incompatible profiles before outer or agent mutation. A start-only container with no `openPorts` does not receive a fabricated port-7000 AgentServer mapping: it must provide a blocking container script, a private `additionalServerPort` route, an intentional published TCP route, or explicit `readiness.protocol: "none"`. AgentServer execution modes may still receive the random localhost-to-7000 mapping when no port is declared. A host-network service that intentionally uses TCP readiness can name its reachable runtime-side port through `openPorts`, but doing so also accepts outer-boundary eligibility; a private host-network service should use a private readiness contract instead.
+
+The outer box persists versioned, separate explicit/generated publication provenance. Replanning preserves ordered explicit values that were not restated and replaces stale generated values. Missing or malformed provenance is unsupported and must not be inferred from inspected port bindings. The supervisor passes the authoritative socket coverage to core. A one-shot host command can reconcile the box before startup; a REPL, Marketplace, monitor, or other already-in-box path proceeds only when existing coverage is sufficient and otherwise fails before profile, registry, hook, router, cache preparation, or agent-container mutation with a one-shot host instruction.
+
+Inside a marked outer box, all Ploinky-managed agents and dependency-install containers use nested Podman. Persisted bwrap/Seatbelt enablement and Docker fallback are ineffective there. Every Ploinky-created nested agent, helper, and sidecar container carries `io.assistos.ploinky.managed=1`; outer boot removes running and stopped exact matches while retaining manual/unlabelled containers, nested images, and nested named volumes. Cleanup enumeration or removal failure fails the box self-check. Because the outer `-containers` volume survives destroy, recovery from corrupt nested state requires inspect/backup followed by explicit removal of that one named volume after the box is absent and data loss is accepted.
 
 Some agents are workers rather than servers — they do not bind a port and have no readiness signal beyond "the process is running." Such agents must set `readiness.protocol: "none"`. The runtime treats them as immediately ready and does not probe a port; the dependency wave still tracks them so dependents wait for the container to start, but it does not require a port-open or MCP-handshake response. Use this only for true workers (renewal loops, batch jobs); serving agents must keep a real probe.
 
@@ -101,7 +133,7 @@ Container runtime keys intentionally group compatible images by Node major, plat
 ### Question #7: Why are core cache destruction and outer-runtime destruction separate?
 
 Response:
-Core `destroy` is a workspace operation: it removes workspace agent runtimes and regenerated dependency caches while preserving isolated agent data, the outer container, and its named volumes. Host `ploinky destroy` is an explicitly confirmed system-boundary operation that removes the selected outer container and all three instance volumes. Keeping those scopes separate prevents a core command from gaining control of, or accidentally removing, the runtime that contains it.
+Core `destroy` is a workspace operation: it removes workspace agent runtimes and regenerated dependency caches while preserving isolated agent data, the outer container, and its named volumes. Host `ploinky destroy` is an explicitly confirmed system-boundary operation that directly removes the selected outer container and its anonymous volumes while retaining all three named instance volumes. Deliberate named-volume deletion is a separate engine-level reset. Keeping those scopes separate prevents a core command from gaining control of, or accidentally removing, the runtime that contains it and prevents ordinary outer replacement from becoming data deletion.
 
 ## Conclusion
 

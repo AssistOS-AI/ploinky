@@ -22,6 +22,7 @@ export {
 
 export {
     ensureAgentService,
+    removeAgentContainerForRecreate,
     resolveHostPort,
     resolveHostPortFromRecord,
     resolveHostPortFromRuntime,
@@ -34,6 +35,7 @@ export {
 } from './containerRegistry.js';
 
 export {
+    assertOuterPublicationCoverageForManifest,
     containerExists,
     getAgentContainerName,
     getConfiguredProjectPath,

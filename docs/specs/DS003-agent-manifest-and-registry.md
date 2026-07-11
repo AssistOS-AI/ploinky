@@ -40,15 +40,60 @@ The managed public-entrypoint boundary is:
 | `ploinky start ...` | Reconcile/start outer runtime; preserve graph publishes and router readiness |
 | `ploinky status` | Inspect outer contract/publishes/health and running core status without mutation |
 | `ploinky stop` | Stop core services, then stop outer runtime; keep volumes |
-| `ploinky destroy` | Confirm exact instance and remove its container plus three volumes |
+| `ploinky destroy` | Confirm exact instance and directly remove its outer container; retain named volumes |
 | REPL `status`/`stop`/`destroy` | Core workspace/router/agent scope; outer runtime remains |
 
-The outer-runtime image is the immutable
-`docker.io/assistos/ploinky-box:podman-node24-runtime-v1` reference and must
-carry `io.assistos.ploinky.runtime-contract=1`. That image owns nested Podman.
-Ordinary agent images intentionally contain neither Podman nor Docker and must
-not gain sibling-container control merely because they are launched inside the
-outer runtime.
+The outer-runtime release channel is the mutable
+`docker.io/assistos/ploinky-box:runtime` reference and its image must satisfy
+the complete contract-2 metadata, including
+`io.assistos.ploinky.runtime-contract=2`. Creating a missing box or replacing a
+compatible box for a requested configuration change must pull and validate the
+selected reference, then run the validated image ID. Reusing a running box or
+starting a stopped compatible box must not pull; an existing box therefore
+stays pinned until an explicit destroy/recreate or configuration replacement.
+Contract-1 and malformed boxes are a hard cut: no migration, adoption, copying,
+or legacy-volume mapping is permitted.
+
+The host supervisor derives the box identity only from the canonical current
+directory: a readable sanitized basename plus a 12-character SHA-256 path
+hash. There is no public name or engine override. It probes every installed
+Podman and Docker engine, inventories the exact box and the three exact labelled
+workspace, nested-storage, and dependency volumes, and selects the sole
+resource owner. Unknown engine state, split resources, or an exact-named volume
+with foreign identity/role labels must fail before mutation. Podman is preferred
+only when no identity resource exists anywhere. Host destroy directly removes
+the selected box with anonymous-volume cleanup and retains all three named
+volumes; an absent box with retained volumes is an idempotent success. Full
+data cleanup is an explicit engine-level operator action.
+
+The three volume labels are exact:
+
+| Label | Required value |
+| --- | --- |
+| `io.assistos.ploinky.identity-schema` | `1` |
+| `io.assistos.ploinky.path-hash` | The derived 12-character path hash |
+| `io.assistos.ploinky.volume-role` | `workspace`, `containers`, or `ploinky-deps`, matching the exact name |
+
+No absolute workspace path is persisted in those labels.
+
+The outer image owns nested Podman. Inside a marked box, every Ploinky-managed
+agent, helper, and sidecar container path must use Podman even when the retained
+workspace enabled a host sandbox; Docker, bwrap, and Seatbelt are not fallback
+runtimes. Each created nested container must carry the exact label
+`io.assistos.ploinky.managed=1`. Outer boot removes running and stopped nested
+containers selected by that exact key/value, while preserving unlabelled,
+other-value, and near-name containers, nested images, and nested named volumes.
+Enumeration or removal failure must fail the outer self-check. Ordinary agent
+images intentionally contain neither Podman nor Docker and must not gain
+sibling-container control merely because they are launched inside the outer
+runtime.
+
+Because ordinary destroy/recreate retains nested storage, a boot-cleanup
+failure caused by corrupt nested state may repeat. The recovery contract is to
+inspect and back up the exact `-containers` volume, remove the outer box, and
+remove only that named volume through its owning engine if the operator accepts
+loss of cached nested images, records, and nested volumes. Manual/unlabelled
+nested containers are outside Ploinky lifecycle repair guarantees.
 
 The optional `routerAccess.httpRoutes` manifest field lets an agent declare agent-relative HTTP paths that the router evaluates through the single HTTP route access policy after route expansion. The field may be an array of entries such as `{ "path": "/read/*", "access": "public" }`, `{ "path": "/workspace/*", "access": "guest" }`, `{ "path": "/account/*", "access": "authenticated" }`, and `{ "path": "/settings/*" }`, or an object whose keys are paths and whose values are entry objects or access strings. Each entry requires `path`; `mode` is not accepted. When `access` is omitted, the entry defaults to `authenticated`; when present, manifest access values are exactly `public`, `guest`, or `authenticated`. Public entries allow anonymous `GET`/`HEAD` only; guest entries mint or reuse a router guest session; authenticated entries require a user-authenticated router session before transparent proxying. Manifest paths are agent-relative and are expanded by the router to `/<routeKey><path>`, where `routeKey` is the alias when present and otherwise the short agent name. Paths use the same normalization, root/root-wildcard rejection, and internal-route rejection rules as the router HTTP route access policy, so raw or encoded `__agent` control-plane segments and router-root internal paths cannot be declared. Agent-relative `/auth/...`, `/admin/...`, and `/metrics` are ordinary agent paths after expansion, not router-root paths.
 
@@ -60,7 +105,7 @@ The manifest `container` (or `image`) field may template `${VAR}` references aga
 
 Profiles must be deploy-complete for non-sensitive configuration. A required manifest env entry that is ordinary topology/config data, such as a URL, hostname, port, public IP, or realm, must declare a profile default or explicit value so `ploinky profile <name>` followed by `ploinky start <agent>` can boot without manual variable setup. Sensitive values, including passwords, tokens, API keys, master keys, and `generatedSecret: true` entries, remain secret-owned and may be required without a default. Ploinky vars, process env, and `.env` values still override manifest defaults; defaults are the baseline, not a ban on operator overrides.
 
-`ploinky start --profile <name>` is the explicit profile selector across the managed outer-runtime boundary. The host supervisor selects and forwards `default` when the flag is omitted; a core start entered inside the REPL with no explicit selector may continue using the profile persisted in `.ploinky/profile`. Graph publish planning applies the selected workspace profile to each enabled graph node and falls back to that manifest's `default` profile when the workspace profile is absent. A `profile` explicitly attached to an `enable` edge is dependency-local and must exist on that child manifest; it must fail with the child reference and available profiles rather than falling back. For managed publish planning, `explorer`, `AchillesIDE/explorer`, and `AssistOSExplorer/explorer` are equivalent root references.
+`ploinky start --profile <name>` is the explicit profile selector across the managed outer-runtime boundary. The host supervisor selects and forwards `default` when the flag is omitted; a core start entered inside the REPL with no explicit selector may continue using the profile persisted in `.ploinky/profile`. Graph publish planning applies the selected workspace profile to each enabled graph node and falls back to that manifest's `default` profile when the workspace profile is absent. A `profile` explicitly attached to an `enable` edge is dependency-local and must exist on that child manifest; it must fail with the child reference and available profiles rather than falling back. Managed publication planning uses normal generic bare, slash-qualified, and colon-qualified workspace resolution. In an unambiguous boot workspace, `explorer`, `AchillesIDE/explorer`, and `AchillesIDE:explorer` are one example of references that resolve to the same canonical root; planning is not restricted to those names.
 
 Generated env entries ignore same-named operator values by default. A generated entry may opt into an explicit override by declaring `explicitOverride: true`; Ploinky then uses the explicit value when present and injects `PLOINKY_ENV_SOURCE_<ENV_NAME>=explicit`. If a generated entry declares `explicitOverrideRequires: ["OTHER_ENV_NAME"]`, Ploinky uses the explicit value only when the generated entry and every listed companion are present in the normal explicit env sources. Generated values are injected with `PLOINKY_ENV_SOURCE_<ENV_NAME>=generated` so shared runtime libraries can distinguish an embedded generated credential from an operator-supplied external credential without inspecting secret values. Cross-agent generated credentials must use `sharedGeneratedSecret: true` and share by source env name, not by custom repo/agent/name fields.
 
@@ -68,17 +113,31 @@ The manifest `network` object selects the container's network namespace. The def
 
 The `network` object may also be set inside a profile block (`manifest.profiles.<profile>.network`) and overrides the root manifest `network` when the active profile defines one. This mirrors how `openPorts`, `env`, and `enable` already specialize per profile and is the supported way to vary the network namespace across deployment targets — for example, a media SFU that needs `network.mode: "host"` in `prod` (where the platform supports it and the UDP/SRC-NAT workaround applies) while keeping a bridge-network configuration in `dev` and `default` (so a developer workstation that cannot expose host-network container ports — notably macOS where podman runs inside a VM — can still serve the readiness probe and reach sibling agents through bridge aliases).
 
-The profile-scoped `openPorts` array is both the agent's inner exposure contract and the allowlist of sockets eligible to cross the managed outer-runtime boundary by default. For public Explorer starts, the supervisor reads the enabled graph and converts each effective-profile entry into an outer publish whose container target is the stable runtime-side port, not the private agent-container port. Accepted generated claims use TCP or UDP, equal-length port ranges, and a nonzero runtime-side port, for example `127.0.0.1:8081:8081`, `127.0.0.1:3478:3478/udp`, or `127.0.0.1:7882-7892:7882-7892/udp`.
+The profile-scoped `openPorts` array is both the agent's inner exposure contract and the allowlist of sockets eligible to cross the managed outer-runtime boundary by default. Before every one-shot host command that can start agents (`start`, `enable agent`, `cli <agent>`, `shell <agent>`, `restart`, and `reinstall`), the authoritative in-box planner reads the selected root graph and any additional enabled agents core will actually start, then converts each effective-profile entry into an outer publish whose container target is the stable runtime-side port, not the private agent-container port. The planner operates on authoritative workspace repositories, registry, saved profile, aliases, branch policy, and recursive enable directives rather than sibling host checkouts. Accepted generated claims use TCP or UDP, equal-length port ranges, and a nonzero runtime-side port, for example `127.0.0.1:8081:8081`, `127.0.0.1:3478:3478/udp`, or `127.0.0.1:7882-7892:7882-7892/udp`. A zero box-side port must fail before outer or agent mutation. Runtime-generated ephemeral mappings for an implicit AgentServer or `additionalServerPort` remain private routes; they cannot be declared as port zero in `openPorts` and do not create a boundary claim.
+
+This `openPorts` validation is a core manifest hard cut, not a box-only parser
+mode. Container-backed starts outside the box also reject port zero, unequal
+ranges, unsupported protocols, and malformed declarations instead of silently
+skipping them. Runtime-generated private ephemeral routes are unaffected
+because they are not manifest `openPorts` claims.
+
+Planner execution depends on outer state. A running compatible box executes the planner under the workspace lock. A stopped box remains stopped while a unique temporary container runs from its inspected image ID. For a missing box, the supervisor pulls and validates the selected image, creates the deterministic labelled workspace volume, runs the temporary planner, and creates the final box from the same image ID. Temporary containers and anonymous volumes must be removed on every exit path. Repository preparation and the named workspace volume may remain after a first-plan failure so retry can reuse them; public destroy retains that volume, and deliberate removal requires an explicit engine-level data-cleanup action.
 
 The graph planner rejects overlapping runtime-side intervals for the same protocol. This includes wildcard/specific-bind overlaps and different private targets; only a semantically exact duplicate from the same effective graph node is deduplicated. Conflict diagnostics must identify both owners, including their profiles, aliases, bind classes, original declarations, and runtime-to-private mappings. TCP and UDP claims for the same numeric port remain independent.
 
-Explicit outer `--publish` and `--expose` arguments remain raw engine arguments and retain their order. Ploinky canonicalizes only their terminal container target interval and protocol to decide whether an overlapping generated claim should be suppressed. It must omit the entire generated claim without rewriting, splitting, or deduplicating the explicit argument.
+An effective instance is keyed by canonical repository/agent plus either its canonical identity or normalized alias; profile is not part of the key. Repeated paths selecting the same profile deduplicate, while different profiles for the same effective instance fail before operational mutation and report both paths. Distinct aliases remain distinct instances.
+
+Explicit outer `--publish` and `--expose` arguments remain raw engine arguments and retain their order. Ploinky canonicalizes only their terminal container target interval and protocol, subtracts the union of those explicit targets from generated claims, and deterministically emits every uncovered generated subrange. A fully covered generated socket disappears; a partially covered range is split without rewriting, reordering, or deduplicating the explicit arguments. TCP and UDP coverage remain independent.
+
+Every supported contract-2 outer container must persist a versioned publication plan and separate ordered explicit/generated publication lists in supervisor-owned labels. A later plan preserves explicit values when they were not restated and replaces stale generated values. Missing, malformed, oversized, or unsupported provenance is incompatible and must fail before planning or mutation rather than inferring ownership from current engine bindings. Replacement rollback must restore the prior image, publications, and provenance labels.
+
+The supervisor passes the authoritative socket coverage to core. One-shot host commands may reconcile the outer box before core mutation. An already-in-box command, including a REPL or Marketplace path, cannot replace its containing outer container and may proceed only when current coverage satisfies its planned claims. Insufficient coverage must fail before profile, registry, filesystem, hook, router, or nested-container mutation and return an actionable one-shot host command. Monitor restart denial must likewise create or start nothing.
 
 Do not put internal-only services, Redis, databases, MCP/control or application surfaces, private health endpoints, identity-provider listeners, LLM APIs, direct document-server ports, private signaling ports, or router-mediated HTTP services in default `openPorts`. Those surfaces must use the router, private service networking, Web Publishing, or an explicit operator `--publish` decision instead. Reviewed LiveKit/TURN media-plane ports, including the required UDP ranges, are the narrow exception because nginx cannot proxy that traffic; they remain direct only when the responsible manifest declares them in `openPorts` and the product's control plane gates their use.
 
 A profile block may also declare `additionalServerPort`, usually as a bare port such as `profiles.default.additionalServerPort: "3000"` and optionally as `127.0.0.1:3000`. This field identifies an agent-owned browser service that the router exposes at `http://<routeKey>.localhost:<routerPort>/` without requiring the manifest to reserve a stable host port for that service. For container runtimes, Ploinky publishes the declared server port on localhost with an ephemeral host port and stores the resolved upstream in routing state for router-only proxying. The value is profile-scoped because service topology may differ across deployment targets. It never makes the service eligible for host publication. For a start-only service it may provide the private route used by TCP startup readiness; when an AgentServer is present it does not replace the normal MCP, agent-card, or readiness route on port 7000.
 
-Changing `openPorts` or the selected `--profile` changes the desired managed-runtime creation configuration. A public start reconciles an existing mismatched outer container transactionally, preserving its named volumes and rolling back to the prior image and normalized creation configuration if replacement creation or health validation fails. Omitted creation flags preserve inspected settings; only explicit flags and the graph-derived start requirements intentionally change the desired configuration.
+Changing the active graph's `openPorts`, branch-selected manifests, enabled set, aliases, or selected profiles changes the desired managed-runtime creation configuration. A public one-shot command reconciles an existing mismatched outer container transactionally, preserving its named volumes and rolling back to the prior image and normalized creation configuration if replacement creation or health validation fails. Omitted creation flags preserve inspected settings and explicit publication provenance; only explicit flags and authoritative graph-derived requirements intentionally change the desired configuration.
 
 The optional manifest `entrypoint` field overrides the container image's `ENTRYPOINT` at run time. Setting it to `/bin/sh` lets agents that ship with a CLI-style entrypoint (for example `certbot/certbot` whose entrypoint is `["certbot"]`) run a manifest-supplied `start` script instead of being interpreted as a CLI subcommand. The runtime must emit `--entrypoint <value>` immediately before the image argument when this field is set; the `start` field then becomes the argument(s) passed to the new entrypoint.
 
@@ -185,12 +244,14 @@ Different deployment profiles have different public topology needs. Development 
 
 Response:
 `openPorts` and profile selection are reviewed manifest intent, not hints that may
-be ignored after the first command creates an outer container. Including the
-selected graph publishes in the desired creation configuration makes public
-start reproducible while the supervisor's prevalidation, configuration capture,
-volume preservation, and rollback keep that reconciliation non-destructive.
-Keeping Podman only in the outer runtime preserves the separate least-privilege
-boundary for ordinary agent images.
+be ignored after the first command creates an outer container. Including every
+active graph publish and its explicit/generated provenance in the desired
+creation configuration makes all agent-starting one-shot commands reproducible,
+while the supervisor's prevalidation, configuration capture, volume
+preservation, and rollback keep reconciliation non-destructive. In-box paths
+that cannot reconcile fail before mutation unless existing coverage is already
+sufficient. Keeping Podman only in the outer runtime preserves the separate
+least-privilege boundary for ordinary agent images.
 
 ## Conclusion
 

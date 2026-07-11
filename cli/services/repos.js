@@ -684,6 +684,11 @@ export function parseStartArgs(rawArgs) {
 
     for (let i = 0; i < args.length; i += 1) {
         const arg = args[i];
+        if (arg === '--port' || arg.startsWith('--port=')) {
+            throw new Error(
+                "start-tail --port is not supported. Use prefix 'ploinky --port PORT start AGENT' or positional 'ploinky start AGENT PORT'.",
+            );
+        }
         if (arg === '--profile') {
             const value = args[i + 1];
             if (value === undefined || value === '' || value.startsWith('--')) {

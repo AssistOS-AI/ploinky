@@ -66,6 +66,7 @@ import ClientCommands from './client.js';
 import { getActiveProfile, getProfileConfig, setActiveProfile } from '../services/profileService.js';
 import { resolveProfileServer } from '../services/profileServer.js';
 import { runOuterRuntimeShell } from '../services/runtimeShell.js';
+import { preflightBoxPublicationForCommand } from '../services/boxPublicationCoverage.js';
 
 let llmAgentsLoadPromise = null;
 const ENABLE_AGENT_CLI_TOKENS = Object.freeze({
@@ -205,20 +206,24 @@ function hasAgentEnableSyntax(options = []) {
 export async function handleCliCommand(options = [], {
     runOuterRuntimeShellImpl = runOuterRuntimeShell,
     runAgentCliImpl = runCli,
+    publicationPreflightComplete = false,
 } = {}) {
     if (options.length === 0) return runOuterRuntimeShellImpl();
-    return runAgentCliImpl(options[0], options.slice(1));
+    return publicationPreflightComplete
+        ? runAgentCliImpl(options[0], options.slice(1), { publicationPreflightComplete: true })
+        : runAgentCliImpl(options[0], options.slice(1));
 }
 
 async function handleCommand(args) {
     const [command, ...options] = args;
+    await preflightBoxPublicationForCommand(command, options);
     switch (command) {
         case 'shell':
             if (!options[0]) { showHelp(); break; }
-            await runShell(options[0]);
+            await runShell(options[0], { publicationPreflightComplete: true });
             break;
         case 'cli':
-            return handleCliCommand(options);
+            return handleCliCommand(options, { publicationPreflightComplete: true });
         // 'agent' command removed; use 'enable agent <agentName>' then 'start'
         case 'add':
             {
@@ -271,7 +276,7 @@ async function handleCommand(args) {
             const target = sub.toLowerCase() === 'agent'
                 ? String(options[1] || '').trim()
                 : sub;
-            if (target) await reinstallAgent(target);
+            if (target) await reinstallAgent(target, { publicationPreflightComplete: true });
             else showHelp();
             break;
         }
@@ -385,6 +390,7 @@ async function handleCommand(args) {
                 enableAgent,
                 killRouterIfRunning,
                 branchPolicy: startParsed.branchPolicy,
+                publicationPreflightComplete: true,
             });
             break;
         }
@@ -447,7 +453,8 @@ async function handleCommand(args) {
                     refreshComponentToken,
                     ensureComponentToken,
                     enableAgent,
-                    killRouterIfRunning: () => { }
+                    killRouterIfRunning: () => { },
+                    publicationPreflightComplete: true,
                 });
                 console.log('[restart] RoutingServer restarted.');
                 break;
@@ -672,7 +679,13 @@ async function handleCommand(args) {
                 if (list.length) { console.log('[restart] Stopped containers:'); list.forEach(n => console.log(` - ${n}`)); }
                 else { console.log('[restart] No containers to stop.'); }
                 console.log('[restart] Starting workspace...');
-                await startWorkspace(undefined, undefined, { refreshComponentToken, ensureComponentToken, enableAgent, killRouterIfRunning });
+                await startWorkspace(undefined, undefined, {
+                    refreshComponentToken,
+                    ensureComponentToken,
+                    enableAgent,
+                    killRouterIfRunning,
+                    publicationPreflightComplete: true,
+                });
                 console.log('[restart] Done.');
             }
             break;
