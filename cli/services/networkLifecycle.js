@@ -79,6 +79,17 @@ function labelsOf(record) {
     return record.Labels || record.labels || record.Config?.Labels || {};
 }
 
+function canonicalDigestReference(reference) {
+    const value = String(reference || '');
+    const digestSeparator = value.lastIndexOf('@');
+    if (digestSeparator < 0) return value;
+    const name = value.slice(0, digestSeparator);
+    const lastSlash = name.lastIndexOf('/');
+    const tagSeparator = name.lastIndexOf(':');
+    const untaggedName = tagSeparator > lastSlash ? name.slice(0, tagSeparator) : name;
+    return `${untaggedName}${value.slice(digestSeparator)}`;
+}
+
 function exactRuntimeAliases(record, explicitAlias) {
     const implicitIdAlias = String(record?.Id || record?.ID || '').slice(0, 12);
     return [explicitAlias, ...(implicitIdAlias ? [implicitIdAlias] : [])].sort();
@@ -362,7 +373,8 @@ export function createNetworkLifecycleAdapter({
     function assertGatewayRecord(gateway, networks, needsLabelDisable, { requireRunning = true } = {}) {
         const name = gatewayContainerName(identity.hash);
         assertExactLabels(name, labelsOf(gateway), expectedGatewayLabels(identity.hash));
-        if (String(gateway.Config?.Image || gateway.ImageName || '') !== gatewayImage) {
+        if (canonicalDigestReference(gateway.Config?.Image || gateway.ImageName)
+            !== canonicalDigestReference(gatewayImage)) {
             throw new Error(`router gateway '${name}' has unexpected image '${gateway.Config?.Image || gateway.ImageName || '<missing>'}'`);
         }
         if (requireRunning && !(gateway.State?.Running === true || gateway.State?.Status === 'running')) {

@@ -484,7 +484,7 @@ test('gateway adoption proves exact permissions and readiness without mutating a
     const logicalName = 'shared';
     const physicalName = physicalNetworkName(identity.hash, logicalName);
     const gatewayName = gatewayContainerName(identity.hash);
-    const image = 'example.invalid/gateway@sha256:exact';
+    const image = 'example.invalid/gateway:1@sha256:exact';
     const networkLabels = {
         [NETWORK_LABELS.managed]: '1', [NETWORK_LABELS.resource]: 'network',
         [NETWORK_LABELS.schema]: '2', [NETWORK_LABELS.workspace]: identity.hash,
@@ -499,7 +499,13 @@ test('gateway adoption proves exact permissions and readiness without mutating a
         Options: {}, IPAM: { Driver: 'host-local', Config: [{ Subnet: '10.3.0.0/24', Gateway: '10.3.0.1' }] },
         Labels: networkLabels,
     };
-    let gateway = gatewayRecord({ name: gatewayName, image, socketPath, networkName: physicalName, labels: gatewayLabels });
+    let gateway = gatewayRecord({
+        name: gatewayName,
+        image: 'example.invalid/gateway@sha256:exact',
+        socketPath,
+        networkName: physicalName,
+        labels: gatewayLabels,
+    });
     gateway.Id = 'abcdef1234567890';
     gateway.NetworkSettings.Networks[physicalName].Aliases.push(gateway.Id.slice(0, 12));
     const mutations = [];
@@ -544,6 +550,10 @@ test('gateway adoption proves exact permissions and readiness without mutating a
         physicalName,
         aliases: ['ploinky-router'],
     }]);
+
+    gateway.Config.Image = 'example.invalid/gateway@sha256:different';
+    assert.throws(() => adapter.ensureGateway([{ name: physicalName, logicalName, primary: true }]), /unexpected image/);
+    gateway.Config.Image = 'example.invalid/gateway@sha256:exact';
 
     gatewayLabels['unexpected.extra'] = 'rejected';
     assert.throws(() => adapter.ensureGateway([{ name: physicalName, logicalName, primary: true }]), /exact label keys/);
