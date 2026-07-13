@@ -18,6 +18,7 @@ export const NETWORK_LABELS = Object.freeze({
     schema: 'io.assistos.ploinky.network-schema',
     workspace: 'io.assistos.ploinky.workspace',
     logical: 'io.assistos.ploinky.logical',
+    routerSocket: 'io.assistos.ploinky.router-socket',
 });
 export const NETWORK_GATEWAY_IMAGE = 'docker.io/assistos/ploinky-network-gateway:1@sha256:68c47ce93d16ea1a2d03944f7b50ce82e6f2f9a26b183d2c9c7fbabcc828fb7e';
 export const NETWORK_GATEWAY_IMAGE_REF = NETWORK_GATEWAY_IMAGE;
@@ -71,13 +72,15 @@ function expectedNetworkLabels(workspaceHash, logicalName) {
     };
 }
 
-function expectedGatewayLabels(workspaceHash) {
-    return {
+function expectedGatewayLabels(workspaceHash, routerSocketIdentity = '') {
+    const labels = {
         [NETWORK_LABELS.managed]: '1',
         [NETWORK_LABELS.resource]: 'gateway',
         [NETWORK_LABELS.schema]: NETWORK_SCHEMA_VERSION,
         [NETWORK_LABELS.workspace]: workspaceHash,
     };
+    if (routerSocketIdentity) labels[NETWORK_LABELS.routerSocket] = routerSocketIdentity;
+    return labels;
 }
 
 function firstRecord(raw, description) {
@@ -413,6 +416,7 @@ export function createNetworkLifecycleAdapter({
         if ((socketStat.mode & 0o777) !== 0o666) {
             throw new Error(`router gateway unavailable: ${routerSocket} must be exactly chmod 0666 for the numeric gateway user`);
         }
+        return `${socketStat.dev}:${socketStat.ino}`;
     }
 
     function inspectGatewayImage() {
@@ -473,9 +477,21 @@ export function createNetworkLifecycleAdapter({
         }
     }
 
-    function assertGatewayRecord(gateway, networks, needsLabelDisable, { requireRunning = true } = {}) {
+    function assertGatewayRecord(gateway, networks, needsLabelDisable, {
+        requireRunning = true,
+        allowMissingSocketIdentity = false,
+    } = {}) {
         const name = gatewayContainerName(identity.hash);
-        assertExactLabels(name, labelsOf(gateway), expectedGatewayLabels(identity.hash));
+        const gatewayLabels = labelsOf(gateway);
+        const observedSocketIdentity = String(gatewayLabels[NETWORK_LABELS.routerSocket] || '');
+        if (!observedSocketIdentity && !allowMissingSocketIdentity) {
+            throw new Error(`router gateway '${name}' is unsupported: router socket identity label is required`);
+        }
+        assertExactLabels(
+            name,
+            gatewayLabels,
+            expectedGatewayLabels(identity.hash, observedSocketIdentity),
+        );
         if (canonicalDigestReference(gateway.Config?.Image || gateway.ImageName)
             !== canonicalDigestReference(gatewayImage)) {
             throw new Error(`router gateway '${name}' has unexpected image '${gateway.Config?.Image || gateway.ImageName || '<missing>'}'`);
@@ -621,11 +637,11 @@ export function createNetworkLifecycleAdapter({
     function ensureGateway(networks) {
         if (!Array.isArray(networks) || networks.length === 0) return null;
         const needsLabelDisable = podmanSelinuxEnabled();
-        assertRouterSocket();
+        const socketIdentity = assertRouterSocket();
         const image = inspectGatewayImage();
         if (!image.ok) throw new Error(`router gateway image '${gatewayImage}' is unavailable; no fallback is permitted`);
         const name = gatewayContainerName(identity.hash);
-        const labels = expectedGatewayLabels(identity.hash);
+        const labels = expectedGatewayLabels(identity.hash, socketIdentity);
         let gateway = inspectContainer(name);
         let created = false;
         const connectionsCreated = [];
@@ -653,7 +669,16 @@ export function createNetworkLifecycleAdapter({
         } else {
             // Validate every existing attachment and immutable setting before
             // adding a missing attachment to a newly-created desired network.
-            assertGatewayRecord(gateway, [], needsLabelDisable);
+            assertGatewayRecord(gateway, [], needsLabelDisable, { allowMissingSocketIdentity: true });
+            const observedSocketIdentity = String(labelsOf(gateway)[NETWORK_LABELS.routerSocket] || '');
+            if (observedSocketIdentity !== socketIdentity) {
+                const removed = execute(['rm', '-f', name]);
+                if (!removed.ok && !missing(removed)) {
+                    throw new Error(`could not replace exact-owned gateway '${name}' after router socket replacement: ${failure(removed)}`);
+                }
+                const replacement = ensureGateway(networks);
+                return { ...replacement, replaced: true };
+            }
         }
         const attached = gateway.NetworkSettings?.Networks || {};
         for (const network of networks) {
@@ -707,7 +732,7 @@ export function createNetworkLifecycleAdapter({
         }
         ensureRootlessPodman();
         const needsLabelDisable = podmanSelinuxEnabled();
-        assertRouterSocket();
+        const socketIdentity = assertRouterSocket();
         const attachments = logical.map((entry) => {
             const name = physicalNetworkName(identity.hash, entry.name);
             const existing = inspectNetwork(name);
@@ -720,8 +745,11 @@ export function createNetworkLifecycleAdapter({
             // A desired network may already exist without being attached after
             // an outer-runtime replacement or a concurrent serialized launch;
             // ensureGateway adds and verifies that missing attachment later.
-            assertGatewayRecord(existingGateway, [], needsLabelDisable);
-            assertGatewayReady(existingGateway, attachments.filter((entry) => entry.existed));
+            assertGatewayRecord(existingGateway, [], needsLabelDisable, { allowMissingSocketIdentity: true });
+            const observedSocketIdentity = String(labelsOf(existingGateway)[NETWORK_LABELS.routerSocket] || '');
+            if (observedSocketIdentity === socketIdentity) {
+                assertGatewayReady(existingGateway, attachments.filter((entry) => entry.existed));
+            }
         }
         return {
             mode: network.mode,
@@ -783,6 +811,21 @@ export function createNetworkLifecycleAdapter({
         const checked = preflight(network, canonicalAgentId, options);
         if (['default', 'bridge'].includes(checked.mode) && !checked.gatewayImageAvailable) ensureGatewayImageAvailable();
         return prepareFromPreflight(checked);
+    }
+
+    function reconcileManagedControlPlane(network, canonicalAgentId, options = {}) {
+        return withNetworkLifecycleLock(() => {
+            const checked = preflight(network, canonicalAgentId, options);
+            if (!['default', 'bridge'].includes(checked.mode)) {
+                throw new Error(`managed control-plane reconciliation cannot run network mode '${checked.mode}'`);
+            }
+            if (!checked.gatewayImageAvailable) ensureGatewayImageAvailable();
+            const attachments = checked.attachments.map((entry) => ({
+                ...ensureNetwork(entry.logicalName),
+                primary: entry.primary,
+            }));
+            return ensureGateway(attachments);
+        }, { lockPath, waitMs: NETWORK_LOCK_WAIT_MS });
     }
 
     function finalizeContainer(containerName, plan) {
@@ -937,7 +980,8 @@ export function createNetworkLifecycleAdapter({
         let gateway = null;
         if (gatewayRecord) {
             const labels = labelsOf(gatewayRecord);
-            const expected = expectedGatewayLabels(identity.hash);
+            const socketIdentity = String(labels[NETWORK_LABELS.routerSocket] || '');
+            const expected = expectedGatewayLabels(identity.hash, socketIdentity);
             const owned = hasExactLabels(labels, expected);
             gateway = {
                 name: gatewayName,
@@ -1012,7 +1056,10 @@ export function createNetworkLifecycleAdapter({
         const gateway = gatewayContainerName(identity.hash);
         const gatewayRecord = inspectContainer(gateway);
         if (gatewayRecord) {
-            assertGatewayRecord(gatewayRecord, [], podmanSelinuxEnabled(), { requireRunning: false });
+            assertGatewayRecord(gatewayRecord, [], podmanSelinuxEnabled(), {
+                requireRunning: false,
+                allowMissingSocketIdentity: true,
+            });
             const allOwnedRemovable = records.filter((record) => record.ownership === 'owned').length === removable.length;
             if (allOwnedRemovable) execute(['rm', '-f', gateway]);
             else for (const record of removable) execute(['network', 'disconnect', record.name, gateway]);
@@ -1025,7 +1072,10 @@ export function createNetworkLifecycleAdapter({
         if (status().networks.filter((record) => record.ownership === 'owned').length === 0) {
             const inspected = inspectContainer(gateway);
             if (inspected) {
-                assertGatewayRecord(inspected, [], podmanSelinuxEnabled(), { requireRunning: false });
+                assertGatewayRecord(inspected, [], podmanSelinuxEnabled(), {
+                    requireRunning: false,
+                    allowMissingSocketIdentity: true,
+                });
                 execute(['rm', '-f', gateway]);
             }
         }
@@ -1040,6 +1090,7 @@ export function createNetworkLifecycleAdapter({
         identity,
         preflight,
         prepare,
+        reconcileManagedControlPlane,
         finalizeContainer,
         runManagedContainerTransaction,
         verifyContainerContract,

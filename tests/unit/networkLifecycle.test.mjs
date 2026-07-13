@@ -255,6 +255,8 @@ async function routerSocketFixture(t) {
 }
 
 function gatewayRecord({ name, image, socketPath, networkName, labels }) {
+    const socketStat = fs.lstatSync(socketPath);
+    labels[NETWORK_LABELS.routerSocket] ||= `${socketStat.dev}:${socketStat.ino}`;
     return {
         Name: name,
         Labels: labels,
@@ -663,6 +665,13 @@ test('gateway adoption proves exact permissions and readiness without mutating a
     const replaced = staleSocket.ensureGateway([{ name: physicalName, logicalName, primary: true }]);
     assert.equal(replaced.created, true);
     assert.equal(replaced.replaced, true);
+    assert.deepEqual(mutations.map((args) => args[0]), ['rm', 'run']);
+
+    mutations.length = 0;
+    gateway.Labels[NETWORK_LABELS.routerSocket] = 'stale-device:stale-inode';
+    const inodeReplaced = adapter.ensureGateway([{ name: physicalName, logicalName, primary: true }]);
+    assert.equal(inodeReplaced.created, true);
+    assert.equal(inodeReplaced.replaced, true);
     assert.deepEqual(mutations.map((args) => args[0]), ['rm', 'run']);
 
     mutations.length = 0;

@@ -1522,9 +1522,11 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
         }
     }
 
-    if (containerExists(containerName) && runtimeNetworkPlan.requiresManagedNetwork) {
-        const networkLifecycle = createNetworkLifecycleAdapter({ runtime });
-        const contractMatches = networkLifecycle.verifyContainerContract(containerName, manifestNetwork, agentName, {
+    const managedNetworkLifecycle = runtimeNetworkPlan.requiresManagedNetwork
+        ? createNetworkLifecycleAdapter({ runtime })
+        : null;
+    if (containerExists(containerName) && managedNetworkLifecycle) {
+        const contractMatches = managedNetworkLifecycle.verifyContainerContract(containerName, manifestNetwork, agentName, {
             instanceKey: effectiveInstanceKey(repoName, agentName, aliasOverride || ''),
             contractHash: networkContractHash(manifestNetwork),
         });
@@ -1569,6 +1571,11 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
             }
         }
         if (canReuseExisting) {
+            if (managedNetworkLifecycle) {
+                managedNetworkLifecycle.reconcileManagedControlPlane(manifestNetwork, agentName, {
+                    instanceKey: effectiveInstanceKey(repoName, agentName, aliasOverride || ''),
+                });
+            }
             debugLog(`[ensureAgentService] ${agentName}: returning early (container exists)`);
             const hostPort = runtimeNetworkPlan.mode === 'host'
                 ? (containerPortCandidates[0] || 0)

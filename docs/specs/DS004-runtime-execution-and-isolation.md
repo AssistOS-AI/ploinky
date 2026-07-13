@@ -93,6 +93,12 @@ under the same acquired transaction, reconciliation may then add and verify a
 missing desired attachment left by an outer-runtime replacement or another
 serialized launch.
 
+The gateway's exact ownership labels record the device and inode of the mounted
+router Unix socket. A router restart that replaces that socket must therefore
+replace the exact-owned gateway even if a timing-sensitive readiness probe can
+still complete against the retiring listener. Foreign or otherwise unsupported
+gateway records remain fail-closed and are never replaced or adopted.
+
 Inside the managed outer runtime, profile `openPorts` is the reviewed crossing between an agent container and that runtime and is also eligible for host publication. The inner runtime widens loopback publish binds to its interfaces so the supervisor can reach the runtime-side socket; the graph planner retains the manifest's outer bind policy when it creates the host publish. Host-network agents do not need an inner `-p` flag, but their declared runtime-side sockets remain subject to the same outer eligibility and conflict rules. Private service listeners must instead stay on named service networks or use private router/readiness mechanisms.
 
 The supervisor passes a versioned, bounded publication-coverage contract into core. Core command boundaries validate it before profile, registry, hook, router, or nested-runtime mutation, and the shared agent transition validates it again before create, start, restart, or recreate. REPL, Marketplace, and monitor paths that cannot reconcile their own outer container fail closed with a host one-shot command; monitor denial is nonfatal and remains under restart backoff.

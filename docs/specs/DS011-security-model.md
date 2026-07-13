@@ -126,6 +126,9 @@ places them on the same logical network. The managed router gateway is attached
 to each bridge as the deliberate route to Ploinky's Unix-socket listener, while
 normal outbound NAT remains available. An existing managed bridge that does not
 prove this exact isolation contract must be rejected rather than adopted.
+The gateway records its mounted router-socket device and inode in its exact
+ownership labels, so replacement of the Unix listener forces a deliberate
+gateway replacement instead of leaving agents connected to a retired socket.
 
 Managed agent containers receive a generated localhost-only `/etc/hosts` file
 through an exact read-only bind while engine-generated hosts entries are
