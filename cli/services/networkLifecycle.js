@@ -341,8 +341,8 @@ export function createNetworkLifecycleAdapter({
             throw new Error(`managed network '${name}' has unsupported bridge isolation, IPv6, or DNS options`);
         }
         const options = record.Options || record.options || {};
-        if (Object.keys(options).length > 0) {
-            throw new Error(`managed network '${name}' has unsupported bridge options`);
+        if (Object.keys(options).length !== 1 || options.isolate !== 'true') {
+            throw new Error(`managed network '${name}' must use the exact bridge option isolate=true`);
         }
         const ipam = record.IPAM?.Driver || record.ipam_options?.driver || '';
         if (String(ipam) !== 'host-local') {
@@ -564,7 +564,7 @@ export function createNetworkLifecycleAdapter({
             assertSupportedNetwork(existing, name, labels);
             return { name, logicalName, created: false };
         }
-        const args = ['network', 'create', '--driver', 'bridge'];
+        const args = ['network', 'create', '--driver', 'bridge', '--opt', 'isolate=true'];
         for (const [key, value] of Object.entries(labels)) args.push('--label', `${key}=${value}`);
         args.push(name);
         const created = execute(args);

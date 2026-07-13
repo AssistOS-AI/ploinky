@@ -119,6 +119,14 @@ Container agents must mount `/Agent` read-only, prepared dependency caches read-
 
 Container-published ports default to localhost when no explicit profile port mapping is declared. Profile port mappings may include an explicit host IP; if a manifest or profile binds to a non-local address, that exposure is intentional operator configuration and must be reviewed as a network security decision.
 
+Within the outer runtime, every Ploinky-managed nested Podman bridge uses the
+exact `isolate=true` bridge option. Direct IP traffic between different managed
+bridges is denied; agents communicate privately only when their manifest graph
+places them on the same logical network. The managed router gateway is attached
+to each bridge as the deliberate route to Ploinky's Unix-socket listener, while
+normal outbound NAT remains available. An existing managed bridge that does not
+prove this exact isolation contract must be rejected rather than adopted.
+
 Bubblewrap agents clear the environment and then set only the constructed environment map. They bind system paths needed for execution as read-only, bind `/Agent` read-only, bind dependency caches read-only, bind code and skills according to profile policy, bind shared and workspace paths as writable where required, and apply read-only overlays to protected Ploinky state such as dependency caches, `.secrets`, profile, routing, server configuration, and staged runtime paths. Bubblewrap currently unshares PID but does not unshare network, because agents need network access and router reachability.
 
 Seatbelt agents run with a generated deny-default SBPL profile. The profile allows system reads, network calls, process execution, temporary writes, shared/workspace writes, profile-controlled code and skills writes, declared volumes, and logs. It denies writes to guarded runtime paths, dependency caches, staged Agent libraries, `.secrets`, profile, routing, and server configuration. Because Seatbelt exposes real host paths rather than a mount namespace, its generated profile is the authoritative access-control layer.

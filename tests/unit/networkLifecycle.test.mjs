@@ -124,6 +124,7 @@ test('network creation proves rootless Podman before mutation and verifies label
                     [NETWORK_LABELS.workspace]: identity.hash,
                     [NETWORK_LABELS.logical]: 'shared',
                 },
+                Options: { isolate: 'true' },
                 IPAM: { Driver: 'host-local', Config: [{ Subnet: '10.1.0.0/24', Gateway: '10.1.0.1' }] },
             }]));
         }
@@ -136,7 +137,8 @@ test('network creation proves rootless Podman before mutation and verifies label
     const result = createNetworkLifecycleAdapter({ runtime: 'podman', run, workspaceRoot }).ensureNetwork('shared');
     assert.equal(result.created, true);
     assert.deepEqual(calls[0], ['info', '--format', '{{json .Host.Security.Rootless}}']);
-    assert.ok(calls.some((args) => args[0] === 'network' && args[1] === 'create'));
+    assert.ok(calls.some((args) => args[0] === 'network' && args[1] === 'create'
+        && args.includes('--opt') && args.includes('isolate=true')));
 
     const extraLabelRecord = {
         Name: name,
@@ -149,6 +151,7 @@ test('network creation proves rootless Podman before mutation and verifies label
             [NETWORK_LABELS.logical]: 'shared',
             'unexpected.extra': 'rejected',
         },
+        Options: { isolate: 'true' },
         IPAM: { Driver: 'host-local', Config: [{ Subnet: '10.1.0.0/24', Gateway: '10.1.0.1' }] },
     };
     const extraLabelAdapter = createNetworkLifecycleAdapter({
@@ -161,6 +164,23 @@ test('network creation proves rootless Podman before mutation and verifies label
         },
     });
     assert.throws(() => extraLabelAdapter.ensureNetwork('shared'), /exact label keys/);
+
+    const unisolatedRecord = {
+        ...extraLabelRecord,
+        Labels: Object.fromEntries(Object.entries(extraLabelRecord.Labels)
+            .filter(([key]) => key !== 'unexpected.extra')),
+        Options: {},
+    };
+    const unisolatedAdapter = createNetworkLifecycleAdapter({
+        runtime: 'podman',
+        workspaceRoot,
+        run: (_runtime, args) => {
+            if (args[0] === 'info') return ok('true\n');
+            if (args[0] === 'network' && args[1] === 'inspect') return ok(JSON.stringify([unisolatedRecord]));
+            return absent('resource');
+        },
+    });
+    assert.throws(() => unisolatedAdapter.ensureNetwork('shared'), /exact bridge option isolate=true/);
 
     const rootful = createNetworkLifecycleAdapter({
         runtime: 'podman',
@@ -272,7 +292,7 @@ test('managed replacement holds one lock through preflight, removal, resource cr
             const name = args.at(-1);
             networks.set(name, {
                 Name: name, Driver: 'bridge', Internal: false, IPv6Enabled: false, DNSEnabled: true,
-                Options: {}, IPAM: { Driver: 'host-local', Config: [{ Subnet: '10.1.0.0/24', Gateway: '10.1.0.1' }] },
+                Options: { isolate: 'true' }, IPAM: { Driver: 'host-local', Config: [{ Subnet: '10.1.0.0/24', Gateway: '10.1.0.1' }] },
                 Labels: labelsFrom(args), Containers: {},
             });
             return ok(name);
@@ -356,7 +376,7 @@ test('managed replacement failure restores and restarts the preserved old contai
     };
     const networkRecord = {
         Name: physicalName, Driver: 'bridge', Internal: false, IPv6Enabled: false, DNSEnabled: true,
-        Options: {}, IPAM: { Driver: 'host-local', Config: [{ Subnet: '10.2.0.0/24', Gateway: '10.2.0.1' }] },
+        Options: { isolate: 'true' }, IPAM: { Driver: 'host-local', Config: [{ Subnet: '10.2.0.0/24', Gateway: '10.2.0.1' }] },
         Labels: networkLabels, Containers: {},
     };
     const gatewayLabels = {
@@ -496,7 +516,7 @@ test('gateway adoption proves exact permissions and readiness without mutating a
     };
     const networkRecord = {
         Name: physicalName, Driver: 'bridge', Internal: false, IPv6Enabled: false, DNSEnabled: true,
-        Options: {}, IPAM: { Driver: 'host-local', Config: [{ Subnet: '10.3.0.0/24', Gateway: '10.3.0.1' }] },
+        Options: { isolate: 'true' }, IPAM: { Driver: 'host-local', Config: [{ Subnet: '10.3.0.0/24', Gateway: '10.3.0.1' }] },
         Labels: networkLabels,
     };
     let gateway = gatewayRecord({

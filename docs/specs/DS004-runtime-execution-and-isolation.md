@@ -60,6 +60,15 @@ and cleanup failure stops boot.
 
 The container's network namespace is selected from the manifest. The default is a workspace-defined bridge by name; agents that opt into `network.mode: "host"` run with `--network host` and share the host's network namespace directly. The runtime must not emit `-p` port publishes for host-network agents, must not register bridge aliases for them, and must not create a named bridge on their behalf. Sibling agents on a bridge that need to reach a host-network agent must route through the host gateway entry the runtime exposes (`host.containers.internal` on podman with netavark, or the bridge gateway IP); manifest defaults that previously assumed a bridge alias must be either re-pointed or made overridable through operator-supplied vars when the dependency moves to host networking.
 
+Every Ploinky-managed nested Podman bridge must be created with the exact
+`isolate=true` bridge option. Existing managed bridges are reusable only when
+inspection proves that exact option and the rest of the managed driver, DNS,
+IPv4 IPAM, subnet, and ownership-label contract. This blocks direct IP routing
+between different managed bridges while preserving connectivity among agents
+that intentionally share a logical network and preserving ordinary outbound
+NAT. Ploinky must fail closed instead of adopting or silently weakening an
+unisolated managed bridge.
+
 Inside the managed outer runtime, profile `openPorts` is the reviewed crossing between an agent container and that runtime and is also eligible for host publication. The inner runtime widens loopback publish binds to its interfaces so the supervisor can reach the runtime-side socket; the graph planner retains the manifest's outer bind policy when it creates the host publish. Host-network agents do not need an inner `-p` flag, but their declared runtime-side sockets remain subject to the same outer eligibility and conflict rules. Private service listeners must instead stay on named service networks or use private router/readiness mechanisms.
 
 The supervisor passes a versioned, bounded publication-coverage contract into core. Core command boundaries validate it before profile, registry, hook, router, or nested-runtime mutation, and the shared agent transition validates it again before create, start, restart, or recreate. REPL, Marketplace, and monitor paths that cannot reconcile their own outer container fail closed with a host one-shot command; monitor denial is nonfatal and remains under restart backoff.
