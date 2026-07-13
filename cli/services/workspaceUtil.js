@@ -688,6 +688,60 @@ async function startWorkspace(staticAgentArg, portArg, {
   if (!publicationPreflightComplete) {
     await preflightBoxPublicationForCommand('start', preflightArgs);
   }
+  let routerReadyForStart = false;
+  let routerPortForStart = 0;
+  let routerContainerForStart = '';
+  const ensureRouterReadyForStart = async ({ staticAgent, staticPort, repoName, shortAgentName }) => {
+    const container = dockerSvc.getAgentContainerName(shortAgentName || staticAgent, repoName || '');
+    if (routerReadyForStart) {
+      if (routerPortForStart !== staticPort || routerContainerForStart !== container) {
+        throw new Error('start: resolved static routing identity changed after the router listener became ready');
+      }
+      await mergeRoutingConfig((current) => ({
+        ...current,
+        port: staticPort,
+        static: { agent: staticAgent, container },
+        routes: current.routes || {},
+      }));
+      return container;
+    }
+
+    await mergeRoutingConfig((current) => ({
+      ...current,
+      port: staticPort,
+      static: { agent: staticAgent, container },
+      routes: current.routes || {},
+    }));
+    console.log(`Static: agent=${utils.colorize(staticAgent, 'cyan')} port=${utils.colorize(String(staticPort), 'yellow')}`);
+    try {
+      await waitForRouterReady(path.join(PLOINKY_DIR, 'run', 'router.sock'), staticPort, null, 300);
+      routerReadyForStart = true;
+      routerPortForStart = staticPort;
+      routerContainerForStart = container;
+      console.log('[start] Existing router listeners are ready; preserving their Unix socket for the managed gateway.');
+      return container;
+    } catch (_) {
+      // No complete listener pair exists. Replace only the router process; the
+      // exact-owned gateway will deliberately reconcile its socket bind if one
+      // exists from an interrupted or explicit router restart.
+    }
+    if (typeof killRouterIfRunning === 'function') {
+      try { killRouterIfRunning(); } catch (_) {}
+    }
+    const runningDir = RUNNING_DIR;
+    fs.mkdirSync(runningDir, { recursive: true });
+    const routerPath = path.resolve(__dirname, '../server/Watchdog.js');
+    const routerPidFile = path.join(runningDir, 'router.pid');
+    const child = spawnWatchdog(routerPath, staticPort, routerPidFile);
+    try { fs.writeFileSync(routerPidFile, String(child.pid)); } catch (_) {}
+    child.unref();
+    await waitForRouterReady(path.join(PLOINKY_DIR, 'run', 'router.sock'), staticPort, child);
+    routerReadyForStart = true;
+    routerPortForStart = staticPort;
+    routerContainerForStart = container;
+    console.log(`[start] Watchdog launched in background (pid ${child.pid}); router listeners are ready.`);
+    return container;
+  };
   // Clear the in-process preinstall dedup set so each workspace start (e.g.
   // a `restart` re-entering this function in the same CLI process) re-runs
   // hooks that may need to regenerate runtime files.
@@ -726,6 +780,12 @@ async function startWorkspace(staticAgentArg, portArg, {
         } catch (_) {
           alreadyEnabled = false;
         }
+        await ensureRouterReadyForStart({
+          staticAgent: aliasResolved || staticAgentArg,
+          staticPort: parseInt(portArg || '0', 10) || 8080,
+          repoName: resolvedAgent.repo,
+          shortAgentName: resolvedAgent.shortAgentName,
+        });
       }
 
         if (!alreadyEnabled) {
@@ -832,6 +892,12 @@ async function startWorkspace(staticAgentArg, portArg, {
     } catch (e) {
       throw new Error(`start: static agent '${staticAgent}' not found in any repo. Use 'enable agent <repo/name>' or check repos.`);
     }
+    await ensureRouterReadyForStart({
+      staticAgent,
+      staticPort,
+      repoName: staticRepoName,
+      shortAgentName: staticShortAgent,
+    });
 
     // Providers must run before manifest enable directives start dependent
     // agents. First install/prepare the complete manifest repo graph without
@@ -940,19 +1006,6 @@ async function startWorkspace(staticAgentArg, portArg, {
         ...(cfg.routes || {})
       }
     }));
-    console.log(`Static: agent=${utils.colorize(staticAgent, 'cyan')} port=${utils.colorize(String(staticPort), 'yellow')}`);
-    if (typeof killRouterIfRunning === 'function') {
-      try { killRouterIfRunning(); } catch (_) {}
-    }
-    const runningDir = RUNNING_DIR;
-    fs.mkdirSync(runningDir, { recursive: true });
-    const routerPath = path.resolve(__dirname, '../server/Watchdog.js');
-    const routerPidFile = path.join(runningDir, 'router.pid');
-    const child = spawnWatchdog(routerPath, staticPort, routerPidFile);
-    try { fs.writeFileSync(routerPidFile, String(child.pid)); } catch (_) {}
-    child.unref();
-    await waitForRouterReady(path.join(PLOINKY_DIR, 'run', 'router.sock'), staticPort, child);
-    console.log(`[start] Watchdog launched in background (pid ${child.pid}); router listeners are ready.`);
     const updateRoutes = async (targetNames = [], { allowFailures = false } = {}) => {
       if (!Array.isArray(targetNames) || !targetNames.length) {
         return;

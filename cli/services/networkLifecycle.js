@@ -19,7 +19,7 @@ export const NETWORK_LABELS = Object.freeze({
     workspace: 'io.assistos.ploinky.workspace',
     logical: 'io.assistos.ploinky.logical',
 });
-export const NETWORK_GATEWAY_IMAGE = 'docker.io/assistos/ploinky-network-gateway:1@sha256:7457da059488e450b750d30d78fdc3b05cf6074ae258775b4dc3f2c98a4dead8';
+export const NETWORK_GATEWAY_IMAGE = 'docker.io/assistos/ploinky-network-gateway:1@sha256:68c47ce93d16ea1a2d03944f7b50ce82e6f2f9a26b183d2c9c7fbabcc828fb7e';
 export const NETWORK_GATEWAY_IMAGE_REF = NETWORK_GATEWAY_IMAGE;
 
 const LOCK_PATH = path.join(PLOINKY_DIR, 'run', 'network.lock');
@@ -552,7 +552,21 @@ export function createNetworkLifecycleAdapter({
         const verified = inspectContainer(name);
         if (!verified) throw new Error(`router gateway '${name}' disappeared during verification`);
         assertGatewayRecord(verified, networks, needsLabelDisable);
-        assertGatewayReady(verified, networks);
+        try {
+            assertGatewayReady(verified, networks);
+        } catch (probeError) {
+            if (created) throw probeError;
+            // A router restart replaces the Unix socket inode. A bind-mounted
+            // exact socket cannot follow that replacement, so deliberately
+            // replace only the exact-owned gateway after its immutable record
+            // has passed validation and its end-to-end probe has failed.
+            const removed = execute(['rm', '-f', name]);
+            if (!removed.ok && !missing(removed)) {
+                throw new Error(`${probeError.message}; could not remove unhealthy exact-owned gateway '${name}': ${failure(removed)}`);
+            }
+            const replacement = ensureGateway(networks);
+            return { ...replacement, replaced: true };
+        }
         return { name, created, connectionsCreated };
         } catch (error) {
             if (created) {

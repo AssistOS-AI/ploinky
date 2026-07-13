@@ -180,6 +180,16 @@ test('startup config providers run before manifest directives can start dependen
     assert.ok(enableIndex > providerIndex, 'providers must finish before manifest enable directives start dependencies');
 });
 
+test('workspace router Unix listener is ready before first-use static agent startup', () => {
+    const source = startWorkspace.toString();
+    const routerIndex = source.indexOf('await ensureRouterReadyForStart({');
+    const enableIndex = source.indexOf('await enableAgent(staticAgentArg)');
+
+    assert.ok(routerIndex >= 0, 'workspace start must establish the router listener');
+    assert.ok(enableIndex > routerIndex, 'the first managed agent must not start before the router Unix listener');
+    assert.match(source, /Existing router listeners are ready; preserving their Unix socket/);
+});
+
 test('resolveWorkspaceDependencyGraph preserves dependency modes while qualifying relative refs', () => {
     writeManifest('demo', 'mode-target', { container: 'node:20-alpine' });
     writeManifest('demo', 'mode-app', {

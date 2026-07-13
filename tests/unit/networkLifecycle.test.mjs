@@ -499,7 +499,7 @@ test('gateway adoption proves exact permissions and readiness without mutating a
         Options: {}, IPAM: { Driver: 'host-local', Config: [{ Subnet: '10.3.0.0/24', Gateway: '10.3.0.1' }] },
         Labels: networkLabels,
     };
-    const gateway = gatewayRecord({ name: gatewayName, image, socketPath, networkName: physicalName, labels: gatewayLabels });
+    let gateway = gatewayRecord({ name: gatewayName, image, socketPath, networkName: physicalName, labels: gatewayLabels });
     gateway.Id = 'abcdef1234567890';
     gateway.NetworkSettings.Networks[physicalName].Aliases.push(gateway.Id.slice(0, 12));
     const mutations = [];
@@ -508,7 +508,26 @@ test('gateway adoption proves exact permissions and readiness without mutating a
         if (args[0] === 'image' && args[1] === 'inspect') return ok('[]');
         if (args[0] === 'network' && args[1] === 'ls') return ok(JSON.stringify([networkRecord]));
         if (args[0] === 'network' && args[1] === 'inspect') return ok(JSON.stringify([networkRecord]));
-        if (args[0] === 'container' && args[1] === 'inspect') return ok(JSON.stringify([gateway]));
+        if (args[0] === 'container' && args[1] === 'inspect') {
+            return gateway ? ok(JSON.stringify([gateway])) : absent('container');
+        }
+        if (args[0] === 'rm' && args.at(-1) === gatewayName) {
+            mutations.push(args);
+            gateway = null;
+            return ok();
+        }
+        if (args[0] === 'run') {
+            mutations.push(args);
+            const labels = {};
+            args.forEach((value, index) => {
+                if (value !== '--label') return;
+                const [key, ...rest] = String(args[index + 1]).split('=');
+                labels[key] = rest.join('=');
+            });
+            const networkName = args[args.indexOf('--network') + 1];
+            gateway = gatewayRecord({ name: gatewayName, image, socketPath, networkName, labels });
+            return ok(gatewayName);
+        }
         mutations.push(args);
         return absent('resource');
     };
@@ -543,16 +562,31 @@ test('gateway adoption proves exact permissions and readiness without mutating a
     assert.deepEqual(namespaceProbeCalls[0].slice(0, 5), ['unshare', 'nsenter', '--target', String(process.pid), '--net']);
     assert.equal(namespaceProbeCalls[0].at(-1), '127.0.0.1');
 
+    mutations.length = 0;
+    let staleProbeCount = 0;
+    const staleSocket = createNetworkLifecycleAdapter({
+        runtime: 'podman', run, workspaceRoot, routerSocket: socketPath, gatewayImage: image,
+        probeGateway: () => {
+            staleProbeCount += 1;
+            return staleProbeCount === 1 ? { ok: false, status: 1, stderr: 'stale socket' } : ok();
+        },
+    });
+    const replaced = staleSocket.ensureGateway([{ name: physicalName, logicalName, primary: true }]);
+    assert.equal(replaced.created, true);
+    assert.equal(replaced.replaced, true);
+    assert.deepEqual(mutations.map((args) => args[0]), ['rm', 'run']);
+
+    mutations.length = 0;
     const unreachable = createNetworkLifecycleAdapter({
         runtime: 'podman', run, workspaceRoot, routerSocket: socketPath, gatewayImage: image,
         probeGateway: () => ({ ok: false, status: 1, stderr: 'unreachable' }),
     });
     assert.throws(() => unreachable.ensureGateway([{ name: physicalName, logicalName, primary: true }]), /TCP 8080.*probe failed/);
-    assert.deepEqual(mutations, []);
+    assert.deepEqual(mutations.map((args) => args[0]), ['rm', 'run', 'rm']);
 
     fs.chmodSync(socketPath, 0o600);
     assert.throws(() => adapter.ensureGateway([{ name: physicalName, logicalName, primary: true }]), /exactly chmod 0666/);
-    assert.deepEqual(mutations, []);
+    assert.deepEqual(mutations.map((args) => args[0]), ['rm', 'run', 'rm']);
 });
 
 test('prune proves rootless ownership and cannot interleave with a held start transaction lock', () => {
