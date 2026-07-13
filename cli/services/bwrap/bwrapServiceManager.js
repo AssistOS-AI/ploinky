@@ -294,7 +294,7 @@ function buildBwrapArgs(options) {
                 || volumeOptions[String(containerPath || '').replace(/\/+$/, '')]
                 || {};
             ensureManifestVolumeHostPath(resolvedHostPath, containerPath, mountOptions);
-            args.push('--bind', resolvedHostPath, containerPath);
+            args.push(mountOptions.readOnly === true ? '--ro-bind' : '--bind', resolvedHostPath, containerPath);
         }
     }
 
@@ -342,7 +342,7 @@ function buildBwrapArgs(options) {
  */
 function buildFullEnvMap(agentName, manifest, profileConfig, agentWorkDir, repoName, activeProfile, runtimeName = 'bwrap', runtimeResourcePlan = null) {
     // Start with manifest env vars (resolved from secrets)
-    const env = buildEnvMap(manifest, profileConfig, { agentName, repoName });
+    const env = buildEnvMap(manifest, profileConfig, { agentName, repoName, forRuntime: true });
 
     // Ploinky internal vars
     env.PLOINKY_MCP_CONFIG_PATH = CONTAINER_CONFIG_PATH;
@@ -665,8 +665,8 @@ function startBwrapProcess(agentName, manifest, agentPath, options = {}) {
     const agents = loadAgentsMap();
     const existingRecord = agents[containerName] || {};
     const declaredEnvNames = [
-        ...getManifestEnvNames(manifest, profileConfig),
-        ...getExposedNames(manifest, profileConfig)
+        ...getManifestEnvNames(manifest, profileConfig, { forRuntime: true }),
+        ...getExposedNames(manifest, profileConfig, { forRuntime: true })
     ];
 
     agents[containerName] = {

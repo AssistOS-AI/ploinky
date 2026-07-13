@@ -42,7 +42,7 @@ function writeExecutable(filePath, contents) {
     fs.chmodSync(filePath, 0o755);
 }
 
-test('buildRuntimeRouterEnv prefers the startup port over stale routing state', () => {
+test('buildRuntimeRouterEnv uses the fixed managed gateway endpoint', () => {
     const workspaceDir = tempDir();
     try {
         fs.mkdirSync(path.join(workspaceDir, '.ploinky'), { recursive: true });
@@ -57,16 +57,16 @@ process.stdout.write(JSON.stringify(buildRuntimeRouterEnv('podman', { routerPort
 
         assert.equal(result.status, 0, result.stderr);
         assert.deepEqual(JSON.parse(result.stdout), {
-            PLOINKY_ROUTER_PORT: '8097',
-            PLOINKY_ROUTER_HOST: 'host.containers.internal',
-            PLOINKY_ROUTER_URL: 'http://host.containers.internal:8097',
+            PLOINKY_ROUTER_PORT: '8080',
+            PLOINKY_ROUTER_HOST: 'ploinky-router',
+            PLOINKY_ROUTER_URL: 'http://ploinky-router:8080',
         });
     } finally {
         fs.rmSync(workspaceDir, { recursive: true, force: true });
     }
 });
 
-test('buildRuntimeRouterEnv reads the seeded routing file when no port override is supplied', () => {
+test('buildRuntimeRouterEnv never falls back to a Docker host gateway', () => {
     const workspaceDir = tempDir();
     try {
         fs.mkdirSync(path.join(workspaceDir, '.ploinky'), { recursive: true });
@@ -81,16 +81,16 @@ process.stdout.write(JSON.stringify(buildRuntimeRouterEnv('docker')));`,
 
         assert.equal(result.status, 0, result.stderr);
         assert.deepEqual(JSON.parse(result.stdout), {
-            PLOINKY_ROUTER_PORT: '8097',
-            PLOINKY_ROUTER_HOST: 'host.docker.internal',
-            PLOINKY_ROUTER_URL: 'http://host.docker.internal:8097',
+            PLOINKY_ROUTER_PORT: '8080',
+            PLOINKY_ROUTER_HOST: 'ploinky-router',
+            PLOINKY_ROUTER_URL: 'http://ploinky-router:8080',
         });
     } finally {
         fs.rmSync(workspaceDir, { recursive: true, force: true });
     }
 });
 
-test('buildRuntimeNetworkPlan keeps named podman networks inside ploinky-box', () => {
+test('buildRuntimeNetworkPlan delegates canonical bridge networks to the lifecycle adapter', () => {
     const workspaceDir = tempDir();
     try {
         const markerPath = `${workspaceDir}/ploinky-box-marker`;
@@ -98,8 +98,8 @@ test('buildRuntimeNetworkPlan keeps named podman networks inside ploinky-box', (
         const result = runModuleSnippet(
             `const { buildRuntimeNetworkPlan } = await import(${JSON.stringify(agentServiceManagerUrl)});
 const plan = buildRuntimeNetworkPlan('podman', {
-  name: 'webmeet',
-  aliases: ['liveKitServerAgent', 'webmeetAgent'],
+  mode: 'bridge',
+  attachments: [{ name: 'webmeet', primary: true }],
 }, { boxMarkerPath: ${JSON.stringify(markerPath)} });
 process.stdout.write(JSON.stringify(plan));`,
             {},
@@ -108,25 +108,26 @@ process.stdout.write(JSON.stringify(plan));`,
 
         assert.equal(result.status, 0, result.stderr);
         assert.deepEqual(JSON.parse(result.stdout), {
-            args: ['--replace', '--network', 'webmeet', '--network-alias', 'liveKitServerAgent', '--network-alias', 'webmeetAgent'],
-            ensureNetworkName: 'webmeet',
+            mode: 'bridge',
+            args: [],
             useHostNetwork: false,
-            boxNetworkCompat: false,
-            hashEnv: {},
+            boxNetworkCompat: true,
+            requiresManagedNetwork: true,
+            hashEnv: { PLOINKY_NETWORK_MODE: 'bridge' },
         });
     } finally {
         fs.rmSync(workspaceDir, { recursive: true, force: true });
     }
 });
 
-test('buildRuntimeNetworkPlan does not infer slirp mode for named podman networks from workspace layout', () => {
+test('buildRuntimeNetworkPlan keeps canonical default mode managed in every workspace', () => {
     const workspaceDir = tempDir();
     const fakeWorkspace = path.join(workspaceDir, 'workspace');
     fs.mkdirSync(fakeWorkspace, { recursive: true });
     try {
         const result = runModuleSnippet(
             `const { buildRuntimeNetworkPlan } = await import(${JSON.stringify(agentServiceManagerUrl)});
-const plan = buildRuntimeNetworkPlan('podman', { name: 'webmeet' }, {
+const plan = buildRuntimeNetworkPlan('podman', { mode: 'default' }, {
   boxMarkerPath: ${JSON.stringify(path.join(workspaceDir, 'missing-marker'))},
   sourceRoot: '/opt/ploinky',
   workspacePath: ${JSON.stringify(fakeWorkspace)},
@@ -138,11 +139,12 @@ process.stdout.write(JSON.stringify(plan));`,
 
         assert.equal(result.status, 0, result.stderr);
         assert.deepEqual(JSON.parse(result.stdout), {
-            args: ['--replace', '--network', 'webmeet'],
-            ensureNetworkName: 'webmeet',
+            mode: 'default',
+            args: [],
             useHostNetwork: false,
-            boxNetworkCompat: false,
-            hashEnv: {},
+            boxNetworkCompat: true,
+            requiresManagedNetwork: true,
+            hashEnv: { PLOINKY_NETWORK_MODE: 'default' },
         });
     } finally {
         fs.rmSync(workspaceDir, { recursive: true, force: true });
@@ -354,7 +356,7 @@ try {
     }
 });
 
-test('AgentServer execution modes retain an ephemeral private 7000 publish when no port is declared', () => {
+test('AgentServer execution modes retain implicit private 7000 unless an explicit mapping targets it', () => {
     const result = runModuleSnippet(
         `const { shouldCreateImplicitAgentServerPublish } = await import(${JSON.stringify(agentServiceManagerUrl)});
 process.stdout.write(JSON.stringify({
@@ -370,7 +372,7 @@ process.stdout.write(JSON.stringify({
         implicit: true,
         agentOnly: true,
         startAndAgent: true,
-        declaredPort: false,
+        declaredPort: true,
     });
 });
 
@@ -464,7 +466,7 @@ case "$1" in
   inspect)
     exit 1
     ;;
-  run)
+  create)
     printf '%s\\n' "$*" > ${JSON.stringify(argsFile)}
     name=""
     prev=""
@@ -495,6 +497,7 @@ esac
         fs.writeFileSync(path.join(agentDir, 'manifest.json'), JSON.stringify({
             container: 'example/demo:latest',
             start: 'sleep 3600',
+            network: { mode: 'host' },
             readiness: { protocol: 'none' },
         }));
 

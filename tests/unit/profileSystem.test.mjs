@@ -123,7 +123,7 @@ test('getProfileConfig returns the profile config when present', () => {
 
     const config = getProfileConfig('repo-two/agent-two', 'dev');
     // Result is merged: default + dev (dev overrides)
-    assert.deepStrictEqual(config, { env: { NODE_ENV: 'development' } });
+    assert.deepStrictEqual(config, { env: { NODE_ENV: 'development' }, network: { mode: 'default' } });
 });
 
 test('getProfileConfig lets active profile network replace default network', () => {
@@ -131,8 +131,8 @@ test('getProfileConfig lets active profile network replace default network', () 
         profiles: {
             default: {
                 network: {
-                    name: 'webmeet',
-                    aliases: ['webmeetLivekitServer'],
+                    mode: 'bridge',
+                    attachments: [{ name: 'webmeet', primary: true }],
                 },
             },
             prod: {
@@ -442,7 +442,7 @@ test('createAgentWorkDir creates agent workspace folder', () => {
     const workDir = createAgentWorkDir(agentName);
 
     assert.strictEqual(workDir, getAgentWorkDir(agentName));
-    assert.strictEqual(workDir, path.join(tempDir, '.data', agentName));
+    assert.strictEqual(workDir, path.join(fs.realpathSync(tempDir), '.data', agentName));
     assert.ok(fs.statSync(workDir).isDirectory());
 });
 

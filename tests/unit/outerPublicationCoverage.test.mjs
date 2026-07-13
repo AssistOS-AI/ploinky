@@ -18,7 +18,7 @@ import {
 } from '../../cli/services/boxPublicationCoverage.js';
 
 function contract(targets) {
-    return { schemaVersion: 1, targets, publishes: [] };
+    return { schemaVersion: 2, targets, publishes: [] };
 }
 
 test('contract parser validates schema and merges complete TCP/UDP intervals independently', () => {
@@ -32,11 +32,11 @@ test('contract parser validates schema and merges complete TCP/UDP intervals ind
         { start: 1000, end: 1002, protocol: 'udp' },
     ]);
     assert.throws(
-        () => parseOuterPublicationContract(JSON.stringify({ schemaVersion: 2, targets: [] })),
+        () => parseOuterPublicationContract(JSON.stringify({ schemaVersion: 1, targets: [] })),
         (error) => error.code === 'PLOINKY_OUTER_PUBLICATION_REQUIRED' && /schemaVersion/.test(error.message),
     );
     assert.throws(
-        () => parseOuterPublicationContract(JSON.stringify({ schemaVersion: 1, targets: [], surprise: true })),
+        () => parseOuterPublicationContract(JSON.stringify({ schemaVersion: 2, targets: [], surprise: true })),
         /unsupported outer publication contract field/,
     );
 });
@@ -126,7 +126,7 @@ test('in-box command preflight proceeds when the authoritative contract covers a
         boxRuntime: true,
         contract: contract([{ start: 17000, end: 17000, protocol: 'tcp' }]),
         createPlan: async (request) => ({
-            schemaVersion: 1,
+            schemaVersion: 2,
             operation: request.operation,
             claims: [{ protocol: 'tcp', boxSide: { start: 17000, end: 17000 } }],
         }),
@@ -173,12 +173,12 @@ test('in-box authoritative preflight uses saved alias and canonical profiles ins
 const { preflightBoxPublicationForCommand } = await import(${JSON.stringify(coverageUrl)});
 const alias = await preflightBoxPublicationForCommand('cli', ['blue'], {
   boxRuntime: true,
-  contract: { schemaVersion: 1, targets: [{ start: 18301, end: 18301, protocol: 'tcp' }], publishes: [] },
+  contract: { schemaVersion: 2, targets: [{ start: 18301, end: 18301, protocol: 'tcp' }], publishes: [] },
   planOptions: { bootRepos: [] },
 });
 const canonical = await preflightBoxPublicationForCommand('reinstall', ['solo'], {
   boxRuntime: true,
-  contract: { schemaVersion: 1, targets: [{ start: 18402, end: 18402, protocol: 'tcp' }], publishes: [] },
+  contract: { schemaVersion: 2, targets: [{ start: 18402, end: 18402, protocol: 'tcp' }], publishes: [] },
   planOptions: { bootRepos: [] },
 });
 process.stdout.write(JSON.stringify({

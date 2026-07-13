@@ -36,7 +36,7 @@ export async function preflightBoxPublicationForCommand(command, options = [], o
 export function plannerRequestForCommand(command, options = [], overrides = {}) {
     const values = (options || []).map((entry) => String(entry));
     const base = {
-        schemaVersion: 1,
+        schemaVersion: 2,
         operation: command,
         routerPort: overrides.routerPort || 8080,
     };

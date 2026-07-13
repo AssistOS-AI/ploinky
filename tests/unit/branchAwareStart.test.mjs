@@ -73,7 +73,10 @@ function createBareAgentRepo(name, agentName, { branches = [] } = {}) {
     execFileSync('git', ['-C', workPath, 'checkout', '-b', 'main'], { stdio: 'ignore' });
     const manifestDir = path.join(workPath, agentName);
     fs.mkdirSync(manifestDir, { recursive: true });
-    fs.writeFileSync(path.join(manifestDir, 'manifest.json'), JSON.stringify({ container: 'node:20' }, null, 2));
+    fs.writeFileSync(path.join(manifestDir, 'manifest.json'), JSON.stringify({
+        container: 'node:20',
+        network: { mode: 'host' },
+    }, null, 2));
     execFileSync('git', ['-C', workPath, 'add', '.'], { stdio: 'ignore' });
     execFileSync('git', ['-C', workPath, 'commit', '-m', 'agent manifest'], { stdio: 'ignore' });
     execFileSync('git', ['-C', workPath, 'push', 'origin', 'main'], { stdio: 'ignore' });
@@ -92,7 +95,10 @@ function createBareAgentRepo(name, agentName, { branches = [] } = {}) {
 function writeAgentManifest(repoName, agentName, manifest) {
     const agentDir = path.join(tempDir, '.ploinky', 'repos', repoName, agentName);
     fs.mkdirSync(agentDir, { recursive: true });
-    fs.writeFileSync(path.join(agentDir, 'manifest.json'), JSON.stringify(manifest, null, 2));
+    fs.writeFileSync(path.join(agentDir, 'manifest.json'), JSON.stringify({
+        network: { mode: 'host' },
+        ...manifest,
+    }, null, 2));
 }
 
 function writeRepoSource(repoName, url, branch = null) {
@@ -659,6 +665,12 @@ test('applyManifestDirectives: duplicate aliased child enables are idempotent un
 // ---------------------------------------------------------------------------
 
 test.after(() => {
+    try {
+        const records = JSON.parse(fs.readFileSync(path.join(tempDir, '.ploinky', 'agents.json'), 'utf8'));
+        for (const containerName of Object.keys(records).filter((name) => name.startsWith('ploinky_'))) {
+            execFileSync('podman', ['rm', '-f', '--time', '0', containerName], { stdio: 'ignore' });
+        }
+    } catch (_) {}
     process.chdir(originalCwd);
     fs.rmSync(tempDir, { recursive: true, force: true });
 });

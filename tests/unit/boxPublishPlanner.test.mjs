@@ -26,6 +26,7 @@ function node(agentRef, openPorts, options = {}) {
         agentRef,
         profile: options.profile || 'default',
         alias,
+        networkMode: options.networkMode || 'default',
         selectionPath: options.path || [agentRef],
         openPorts,
     };
@@ -191,4 +192,40 @@ test('canonical parser helper retains box target and private target separately',
         subtractIntervals({ start: 1, end: 5 }, [{ start: 2, end: 4 }]),
         [{ start: 1, end: 1, length: 1 }, { start: 5, end: 5, length: 1 }],
     );
+});
+
+test('host mode publishes physical ports directly to private box-namespace ports', () => {
+    const plan = planBoxPublishes({
+        nodes: [node('repo/hosted', ['127.0.0.1:19000:7000'], { networkMode: 'host' })],
+    });
+    assert.deepEqual(plan.generatedPublishes, ['127.0.0.1:19000:7000']);
+    assert.equal(plan.claims[0].networkMode, 'host');
+    assert.deepEqual(plan.claims[0].physicalHost, { start: 19000, end: 19000, length: 1 });
+    assert.deepEqual(plan.claims[0].boxSide, { start: 7000, end: 7000, length: 1 });
+    assert.deepEqual(plan.claims[0].privateContainer, { start: 7000, end: 7000, length: 1 });
+});
+
+test('planner detects host/bridge box namespace conflicts even when physical ports differ', () => {
+    assert.throws(() => planBoxPublishes({
+        nodes: [
+            node('repo/bridge', ['127.0.0.1:7000:9000'], { networkMode: 'bridge' }),
+            node('repo/host', ['127.0.0.1:19000:7000'], { networkMode: 'host' }),
+        ],
+    }), /box-namespace socket 7000\/tcp/);
+});
+
+test('bridge implicit AgentServer mapping is deterministic and explicit private 7000 suppresses it', () => {
+    const implicitNode = node('repo/implicit', [], { networkMode: 'bridge' });
+    implicitNode.implicitAgentServer = true;
+    const first = planBoxPublishes({ nodes: [implicitNode] });
+    const second = planBoxPublishes({ nodes: [implicitNode] });
+    assert.deepEqual(first.generatedPublishes, second.generatedPublishes);
+    assert.equal(first.claims.length, 1);
+    assert.equal(first.claims[0].privateContainer.start, 7000);
+
+    const explicitNode = node('repo/explicit', ['127.0.0.1:19000:7000'], { networkMode: 'bridge' });
+    explicitNode.implicitAgentServer = true;
+    const explicit = planBoxPublishes({ nodes: [explicitNode] });
+    assert.equal(explicit.claims.length, 1);
+    assert.deepEqual(explicit.generatedPublishes, ['127.0.0.1:19000:19000']);
 });

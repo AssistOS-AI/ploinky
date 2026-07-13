@@ -318,7 +318,7 @@ export function getManifestEnvSpecs(manifest, profileConfig) {
      * @param {boolean} required - Whether the variable is required
      * @param {*} defaultValue - Default value if not found
      */
-    function addSpec(insideName, sourceName, required, defaultValue, generated = null) {
+    function addSpec(insideName, sourceName, required, defaultValue, generated = null, runtime = true) {
         // Check if this is a wildcard pattern
         if (isWildcardPattern(insideName)) {
             // Expand the wildcard into matching variable names
@@ -331,7 +331,8 @@ export function getManifestEnvSpecs(manifest, profileConfig) {
                     sourceName: expandedName,
                     required: false, // Wildcards are not required by default
                     defaultValue: undefined,
-                    generated: null
+                    generated: null,
+                    runtime
                 });
             }
         } else {
@@ -343,7 +344,8 @@ export function getManifestEnvSpecs(manifest, profileConfig) {
                 sourceName,
                 required,
                 defaultValue,
-                generated
+                generated,
+                runtime
             });
         }
     }
@@ -362,11 +364,15 @@ export function getManifestEnvSpecs(manifest, profileConfig) {
                     sharedGeneratedSecret,
                     explicitOverride,
                     explicitOverrideRequires,
+                    runtime,
                 } = entry;
                 const insideName = typeof name === 'string' ? name.trim() : '';
                 if (!insideName) continue;
                 assertNoLegacyDerivedEnvFields(entry, insideName);
                 assertNoRemovedGeneratedScope(entry, insideName);
+                if (runtime !== undefined && typeof runtime !== 'boolean') {
+                    throw new Error(`Manifest env '${insideName}' field 'runtime' must be a boolean.`);
+                }
                 const sourceName = typeof varName === 'string' && varName.trim() ? varName.trim() : insideName;
                 const resolvedDefault = value !== undefined ? value : defaultValue;
                 const generatedSpec = buildGeneratedEnvSpec({
@@ -377,7 +383,7 @@ export function getManifestEnvSpecs(manifest, profileConfig) {
                     explicitOverride,
                     explicitOverrideRequires,
                 });
-                addSpec(insideName, sourceName, toBool(required, false), resolvedDefault, generatedSpec);
+                addSpec(insideName, sourceName, toBool(required, false), resolvedDefault, generatedSpec, runtime !== false);
                 continue;
             }
             const text = String(entry).trim();
@@ -408,6 +414,9 @@ export function getManifestEnvSpecs(manifest, profileConfig) {
             if (rawSpec && typeof rawSpec === 'object' && !Array.isArray(rawSpec)) {
                 assertNoLegacyDerivedEnvFields(rawSpec, insideName);
                 assertNoRemovedGeneratedScope(rawSpec, insideName);
+                if (rawSpec.runtime !== undefined && typeof rawSpec.runtime !== 'boolean') {
+                    throw new Error(`Manifest env '${insideName}' field 'runtime' must be a boolean.`);
+                }
                 if (typeof rawSpec.varName === 'string' && rawSpec.varName.trim()) {
                     sourceName = rawSpec.varName.trim();
                 } else if (typeof rawSpec.name === 'string' && rawSpec.name.trim()) {
@@ -429,7 +438,7 @@ export function getManifestEnvSpecs(manifest, profileConfig) {
                     explicitOverride: rawSpec.explicitOverride,
                     explicitOverrideRequires: rawSpec.explicitOverrideRequires,
                 });
-                addSpec(insideName, sourceName, required, defaultValue, generatedSpec);
+                addSpec(insideName, sourceName, required, defaultValue, generatedSpec, rawSpec.runtime !== false);
                 continue;
             } else {
                 defaultValue = rawSpec;
@@ -602,7 +611,8 @@ function resolveManifestEnv(manifest, secrets, options = {}) {
             value: normalizedValue,
             defaultValue: Object.prototype.hasOwnProperty.call(spec, 'defaultValue') ? spec.defaultValue : undefined,
             usedDefault,
-            source: valueSource
+            source: valueSource,
+            runtime: spec.runtime !== false
         });
     }
 
@@ -621,8 +631,10 @@ function resolveManifestEnv(manifest, secrets, options = {}) {
     return { resolved, missing };
 }
 
-export function getManifestEnvNames(manifest, profileConfig) {
-    return getManifestEnvSpecs(manifest, profileConfig).map(spec => spec.insideName);
+export function getManifestEnvNames(manifest, profileConfig, options = {}) {
+    return getManifestEnvSpecs(manifest, profileConfig)
+        .filter(spec => options.forRuntime !== true || spec.runtime !== false)
+        .map(spec => spec.insideName);
 }
 
 export function collectManifestEnv(manifest, { enforceRequired = false, profileConfig, agentName = '', repoName = '' } = {}) {
@@ -630,15 +642,22 @@ export function collectManifestEnv(manifest, { enforceRequired = false, profileC
     return resolveManifestEnv(manifest, secrets, { enforceRequired, profileConfig, agentName, repoName });
 }
 
-export function getExposedNames(manifest, profileConfig) {
-    const names = new Set(getManifestEnvNames(manifest, profileConfig));
+export function getExposedNames(manifest, profileConfig, options = {}) {
+    const runtimeExcludedNames = options.forRuntime === true
+        ? new Set(getManifestEnvSpecs(manifest, profileConfig)
+            .filter(spec => spec.runtime === false)
+            .map(spec => spec.insideName))
+        : new Set();
+    const names = new Set(getManifestEnvNames(manifest, profileConfig, options));
     const exp = manifest?.expose;
     if (Array.isArray(exp)) {
         exp.forEach(e => {
-            if (e && e.name) names.add(String(e.name));
+            if (e && e.name && !runtimeExcludedNames.has(String(e.name))) names.add(String(e.name));
         });
     } else if (exp && typeof exp === 'object') {
-        Object.keys(exp).forEach(n => names.add(String(n)));
+        Object.keys(exp).forEach(n => {
+            if (!runtimeExcludedNames.has(String(n))) names.add(String(n));
+        });
     }
     return Array.from(names);
 }
@@ -664,8 +683,12 @@ export function buildEnvFlags(manifest, profileConfig, options = {}) {
         repoName: options.repoName,
         profileName: options.profileName,
     }).resolved;
+    const runtimeExcludedNames = options.forRuntime === true
+        ? new Set(envEntries.filter(entry => entry.runtime === false).map(entry => entry.insideName))
+        : new Set();
     const out = [];
     for (const entry of envEntries) {
+        if (options.forRuntime === true && entry.runtime === false) continue;
         if (entry.value !== undefined) {
             out.push(formatEnvFlag(entry.insideName, entry.value));
             if (entry.source) {
@@ -677,6 +700,7 @@ export function buildEnvFlags(manifest, profileConfig, options = {}) {
     if (Array.isArray(exp)) {
         for (const spec of exp) {
             if (!spec || !spec.name) continue;
+            if (runtimeExcludedNames.has(String(spec.name))) continue;
             if (Object.prototype.hasOwnProperty.call(spec, 'value')) {
                 out.push(formatEnvFlag(spec.name, spec.value));
             } else if (spec.ref) {
@@ -686,6 +710,7 @@ export function buildEnvFlags(manifest, profileConfig, options = {}) {
         }
     } else if (exp && typeof exp === 'object') {
         for (const [name, val] of Object.entries(exp)) {
+            if (runtimeExcludedNames.has(String(name))) continue;
             if (typeof val === 'string' && val.startsWith('$')) {
                 const v = resolveAlias(val, secrets);
                 if (v !== undefined) out.push(formatEnvFlag(name, v ?? ''));
@@ -706,7 +731,11 @@ export function buildEnvMap(manifest, profileConfig, options = {}) {
         agentName: options.agentName,
         repoName: options.repoName,
     }).resolved;
+    const runtimeExcludedNames = options.forRuntime === true
+        ? new Set(envEntries.filter(entry => entry.runtime === false).map(entry => entry.insideName))
+        : new Set();
     for (const entry of envEntries) {
+        if (options.forRuntime === true && entry.runtime === false) continue;
         if (entry.value !== undefined) {
             out[entry.insideName] = entry.value;
             if (entry.source) {
@@ -718,6 +747,7 @@ export function buildEnvMap(manifest, profileConfig, options = {}) {
     if (Array.isArray(exp)) {
         for (const spec of exp) {
             if (!spec || !spec.name) continue;
+            if (runtimeExcludedNames.has(String(spec.name))) continue;
             if (Object.prototype.hasOwnProperty.call(spec, 'value')) {
                 out[spec.name] = String(spec.value);
             } else if (spec.ref) {
@@ -726,6 +756,7 @@ export function buildEnvMap(manifest, profileConfig, options = {}) {
         }
     } else if (exp && typeof exp === 'object') {
         for (const [name, val] of Object.entries(exp)) {
+            if (runtimeExcludedNames.has(String(name))) continue;
             if (typeof val === 'string' && val.startsWith('$')) {
                 out[name] = resolveAlias(val, secrets) ?? '';
             } else {

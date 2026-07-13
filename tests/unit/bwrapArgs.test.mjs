@@ -99,6 +99,39 @@ test('buildBwrapArgs allows manifest volumes outside .ploinky', () => {
     }
 });
 
+test('buildBwrapArgs enforces read-only manifest volume options', () => {
+    const root = tempDir();
+    try {
+        const agentCodePath = path.join(root, '.ploinky', 'repos', 'repo', 'agent');
+        const nodeModulesDir = path.join(root, '.ploinky', 'deps', 'agents', 'repo', 'agent', 'bwrap-linux-x64-node25', 'node_modules');
+        const sharedDir = path.join(root, '.ploinky', 'shared');
+        const agentLibPath = path.join(root, 'Agent');
+        const secretDir = path.join(root, '.ploinky', 'data', 'secret');
+        for (const dir of [agentCodePath, nodeModulesDir, sharedDir, agentLibPath, secretDir]) {
+            fs.mkdirSync(dir, { recursive: true });
+        }
+
+        const args = buildBwrapArgs({
+            agentCodePath,
+            agentLibPath,
+            nodeModulesDir,
+            sharedDir,
+            cwd: root,
+            skillsPath: null,
+            envMap: {},
+            codeReadOnly: true,
+            skillsReadOnly: true,
+            volumes: { [secretDir]: '/run/secret' },
+            volumeOptions: { '/run/secret': { readOnly: true } },
+        });
+
+        assert.ok(hasRoBind(args, secretDir, '/run/secret'));
+        assert.equal(hasBind(args, secretDir, '/run/secret'), false);
+    } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+    }
+});
+
 test('buildBwrapInteractiveCommand forces interactive shell only for TTY shell sessions', () => {
     assert.equal(
         buildBwrapInteractiveCommand('/work', '/bin/sh', { forceInteractiveShell: true }),

@@ -3,7 +3,13 @@ import path from 'path';
 import { manifestEnableEntries, parseEnableDirective, qualifyEnableSpecForRepo } from './bootstrapManifest.js';
 import { findAgent } from './utils.js';
 import { isSsoProviderManifest } from './agentRegistry.js';
-import { getActiveProfile } from './profileService.js';
+import { getActiveProfile, mergeProfiles } from './profileService.js';
+import {
+    assertNetworkStartupCompatibility,
+    effectiveManifestNetwork,
+    preflightNetworkAliases,
+    validateManifestNetworks,
+} from './networkContract.js';
 
 function normalizeAuthMode(value) {
     const normalized = String(value || '').trim().toLowerCase();
@@ -238,6 +244,7 @@ function resolveWorkspaceDependencyGraph({
         let node = nodes.get(nodeId);
         if (!node) {
             const manifest = readManifest(resolved.manifestPath);
+            validateManifestNetworks(manifest, { path: `manifest(${resolved.repo}/${resolved.shortAgentName})` });
             const registryRecord = findRegistryRecord(registry, {
                 repoName: resolved.repo,
                 shortAgentName: resolved.shortAgentName,
@@ -246,6 +253,17 @@ function resolveWorkspaceDependencyGraph({
             const selectedProfile = requestedProfile || normalizeProfileOverride(registryRecord?.profile);
             const profileName = resolveEffectiveProfile(manifest, selectedProfile, `${resolved.repo}/${resolved.shortAgentName}`, {
                 explicit: profileExplicit || (!requestedProfile && Boolean(registryRecord?.profile)),
+            });
+            const network = effectiveManifestNetwork(manifest, profileName, {
+                path: `manifest(${resolved.repo}/${resolved.shortAgentName})`,
+            });
+            const defaultProfileConfig = manifest.profiles?.default || null;
+            const selectedProfileConfig = manifest.profiles?.[profileName] || null;
+            const effectiveProfileConfig = profileName === 'default'
+                ? defaultProfileConfig
+                : mergeProfiles(defaultProfileConfig, selectedProfileConfig);
+            assertNetworkStartupCompatibility(manifest, effectiveProfileConfig, network, {
+                path: `manifest(${resolved.repo}/${resolved.shortAgentName})`,
             });
             node = {
                 id: nodeId,
@@ -260,6 +278,7 @@ function resolveWorkspaceDependencyGraph({
                 manifestPath: resolved.manifestPath,
                 agentPath: path.dirname(resolved.manifestPath),
                 manifest,
+                network,
                 authMode: resolveManifestAuthMode(manifest, registryRecord),
                 dependencies: new Set(),
                 dependents: new Set(),
@@ -362,6 +381,14 @@ function resolveWorkspaceDependencyGraph({
         isStatic: true,
         selectionPath: [String(staticAgentRef)],
     });
+    preflightNetworkAliases(Array.from(nodes.values()).map((node) => ({
+        id: node.id,
+        agentRef: node.agentRef,
+        canonicalAgentId: node.shortAgentName,
+        instanceKey: node.instanceKey,
+        network: node.network,
+        path: `manifest(${node.agentRef})`,
+    })));
     return {
         staticNodeId,
         nodes

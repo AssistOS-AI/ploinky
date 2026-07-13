@@ -67,7 +67,7 @@ test('authoritative plan includes selected graph plus enabled agents without reg
         fs.writeFileSync(registryPath, before);
 
         const plan = runPlan(root, {
-            schemaVersion: 1,
+            schemaVersion: 2,
             operation: 'start',
             root: 'app/root',
             profile: 'default',
@@ -76,11 +76,12 @@ test('authoritative plan includes selected graph plus enabled agents without reg
 
         assert.deepEqual(plan.nodes.map((entry) => entry.agentRef), ['app/root', 'deps/worker', 'extra/enabled']);
         assert.equal(plan.nodes.find((entry) => entry.agentRef === 'deps/worker').profile, 'lan');
-        assert.deepEqual(plan.generatedPublishes, [
+        for (const expected of [
             '127.0.0.1:9001:9001',
             '127.0.0.1:9002:9002/udp',
             '127.0.0.1:9003:9003',
-        ]);
+        ]) assert.ok(plan.generatedPublishes.includes(expected));
+        assert.equal(plan.claims.filter((claim) => claim.privateContainer.start === 7000).length, 3);
         assert.equal(fs.readFileSync(registryPath, 'utf8'), before);
         assert.equal(fs.existsSync(path.join(root, '.data')), false);
         assert.equal(fs.existsSync(path.join(root, '.ploinky', 'routing.json')), false);
@@ -110,7 +111,7 @@ test('effective-instance profile conflicts report both paths and profiles', () =
         const script = `
 const { createBoxStartPublishPlan } = await import(${JSON.stringify(serviceUrl)});
 try {
-  await createBoxStartPublishPlan({ schemaVersion: 1, operation: 'start', root: 'app/root' }, { bootRepos: [] });
+  await createBoxStartPublishPlan({ schemaVersion: 2, operation: 'start', root: 'app/root' }, { bootRepos: [] });
   process.stdout.write(JSON.stringify({ ok: true }));
 } catch (error) {
   process.stdout.write(JSON.stringify({ ok: false, message: error.message }));
@@ -150,12 +151,14 @@ test('distinct aliases may select different profiles for one canonical agent', (
                 prod: { openPorts: ['127.0.0.1:9102:7000'] },
             },
         });
-        const plan = runPlan(root, { schemaVersion: 1, operation: 'start', root: 'app/root' });
+        const plan = runPlan(root, { schemaVersion: 2, operation: 'start', root: 'app/root' });
         assert.deepEqual(
             plan.nodes.filter((entry) => entry.agentRef === 'graph/shared').map(({ alias, profile }) => ({ alias, profile })),
             [{ alias: 'blue', profile: 'dev' }, { alias: 'green', profile: 'prod' }],
         );
-        assert.deepEqual(plan.generatedPublishes, ['127.0.0.1:9101:9101', '127.0.0.1:9102:9102']);
+        assert.ok(plan.generatedPublishes.includes('127.0.0.1:9101:9101'));
+        assert.ok(plan.generatedPublishes.includes('127.0.0.1:9102:9102'));
+        assert.equal(plan.claims.filter((claim) => claim.privateContainer.start === 7000).length, 3);
     } finally {
         fs.rmSync(root, { recursive: true, force: true });
     }
@@ -196,7 +199,7 @@ test('targeted starting operations preserve saved alias and canonical profiles a
 
         for (const operation of ['cli', 'shell', 'restart', 'reinstall']) {
             const aliasPlan = runPlan(root, {
-                schemaVersion: 1,
+                schemaVersion: 2,
                 operation,
                 root: 'blue',
                 // Targeted public commands do not expose a profile option. Even
@@ -221,7 +224,7 @@ test('targeted starting operations preserve saved alias and canonical profiles a
             assert.deepEqual(aliasPlan.generatedPublishes, ['127.0.0.1:18101:18101']);
 
             const canonicalPlan = runPlan(root, {
-                schemaVersion: 1,
+                schemaVersion: 2,
                 operation,
                 root: 'demo/solo',
                 profile: 'dev',
@@ -245,7 +248,7 @@ test('targeted starting operations preserve saved alias and canonical profiles a
         }
 
         const explicitStartPlan = runPlan(root, {
-            schemaVersion: 1,
+            schemaVersion: 2,
             operation: 'start',
             root: 'demo/fresh',
             profile: 'dev',
@@ -275,7 +278,7 @@ test('targeted canonical planning reports the same enabled-instance ambiguity as
 
         assert.throws(
             () => runPlan(root, {
-                schemaVersion: 1, operation: 'cli', root: 'demo/shared', includeEnabled: false,
+                schemaVersion: 2, operation: 'cli', root: 'demo/shared', includeEnabled: false,
             }),
             /Multiple containers found for agent 'demo\/shared'\. Use alias: blue, green/,
         );
@@ -339,7 +342,7 @@ test('independent empty workspaces resolve bare, slash, and colon roots to the s
             workspaces.push(root);
             const options = `{ bootRepos: [{ name: 'AchillesIDE', url: ${JSON.stringify(remote.bare)} }] }`;
             return runPlan(root, {
-                schemaVersion: 1,
+                schemaVersion: 2,
                 operation: 'start',
                 root: rootRef,
                 profile: 'default',
@@ -357,7 +360,8 @@ test('independent empty workspaces resolve bare, slash, and colon roots to the s
         assert.deepEqual(comparable[1], comparable[0]);
         assert.deepEqual(comparable[2], comparable[0]);
         assert.equal(comparable[0].root, 'AchillesIDE/explorer');
-        assert.deepEqual(comparable[0].publishes, ['127.0.0.1:17002:17002']);
+        assert.ok(comparable[0].publishes.includes('127.0.0.1:17002:17002'));
+        assert.equal(comparable[0].claims.some((claim) => claim.privateContainer.start === 7000), true);
     } finally {
         for (const root of workspaces) fs.rmSync(root, { recursive: true, force: true });
         fs.rmSync(remote.root, { recursive: true, force: true });
@@ -372,7 +376,7 @@ test('empty-workspace bare ambiguity inventories boot repos and fails before ope
 const { createBoxStartPublishPlan } = await import(${JSON.stringify(serviceUrl)});
 try {
   await createBoxStartPublishPlan(
-    { schemaVersion: 1, operation: 'start', root: 'explorer' },
+    { schemaVersion: 2, operation: 'start', root: 'explorer' },
     { bootRepos: [
       { name: 'AchillesIDE', url: ${JSON.stringify(remote.bare)} },
       { name: 'OtherIDE', url: ${JSON.stringify(remote.bare)} },
@@ -418,7 +422,7 @@ test('direct-node entry emits one compact JSON document with no prompt or log ou
             enable: ['AchillesIDE/explorer'],
             profiles: { default: {} },
         });
-        const request = JSON.stringify({ schemaVersion: 1, operation: 'start', root: 'explorer' });
+        const request = JSON.stringify({ schemaVersion: 2, operation: 'start', root: 'explorer' });
         const result = spawnSync(process.execPath, [entryPath], {
             cwd: root,
             env: {
@@ -454,7 +458,7 @@ test('direct-node entry suppresses branch-fallback chatter before its JSON respo
             profiles: { default: {} },
         });
         const request = JSON.stringify({
-            schemaVersion: 1,
+            schemaVersion: 2,
             operation: 'start',
             root: 'explorer',
             branchPolicy: {

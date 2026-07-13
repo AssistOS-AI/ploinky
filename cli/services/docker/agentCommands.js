@@ -29,18 +29,27 @@ function splitCommandArgs(command) {
 function launchAgentSidecar({ containerName, agentCommand, agentName }) {
     const command = (agentCommand || '').trim();
     if (!command) return;
-    const startArgs = splitCommandArgs(command);
-    if (!startArgs.length) return;
     if (!waitForContainerRunning(containerName, 40, 250)) {
         throw new Error(`[start] ${agentName || containerName}: container not running; cannot launch agent command.`);
     }
     const runtime = getRuntime();
-    const execArgs = ['exec', '-d', containerName, ...startArgs];
+    // Manifest agent entries are shell commands in every execution mode. Keep
+    // that contract for start+agent containers as well: direct argv splitting
+    // turns operators such as `&&` into inert arguments and can silently exit
+    // before the AgentServer process is launched.
+    const execArgs = buildAgentSidecarExecArgs(containerName, command);
     const execRes = spawnSync(runtime, execArgs, { stdio: 'inherit' });
     if (execRes.status !== 0) {
         throw new Error(`[start] ${agentName || containerName}: failed to launch start command (exit ${execRes.status}).`);
     }
-    console.log(`[start] ${agentName || containerName}: start command launched directly.`);
+    console.log(`[start] ${agentName || containerName}: agent command launched.`);
+}
+
+function buildAgentSidecarExecArgs(containerName, command) {
+    const normalizedContainer = String(containerName || '').trim();
+    const normalizedCommand = String(command || '').trim();
+    if (!normalizedContainer || !normalizedCommand) return [];
+    return ['exec', '-d', normalizedContainer, 'sh', '-lc', normalizedCommand];
 }
 
 function normalizeLifecycleCommands(entry) {
@@ -59,6 +68,7 @@ function normalizeLifecycleCommands(entry) {
 
 export {
     DEFAULT_AGENT_ENTRY,
+    buildAgentSidecarExecArgs,
     launchAgentSidecar,
     normalizeLifecycleCommands,
     readManifestAgentCommand,

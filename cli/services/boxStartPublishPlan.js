@@ -3,20 +3,28 @@ import net from 'net';
 import os from 'os';
 import path from 'path';
 import { execFileSync } from 'child_process';
-import { randomUUID } from 'crypto';
-import { planBoxPublishes } from '../../container/box-publish-planner.mjs';
+import { createHash, randomUUID } from 'crypto';
+import { implicitAgentServerBoxPort, planBoxPublishes } from '../../container/box-publish-planner.mjs';
 import { prepareManifestRepositories } from './bootstrapManifest.js';
 import { PLOINKY_DIR } from './config.js';
 import { prepareDefaultBootRepositories } from './ploinkyboot.js';
 import * as repos from './repos.js';
 import { findAgent } from './utils.js';
+import { readManifestAgentCommand, readManifestStartCommand } from './docker/agentCommands.js';
+import { mergeProfiles } from './profileService.js';
+import {
+    assertNetworkStartupCompatibility,
+    effectiveManifestNetwork,
+    preflightNetworkAliases,
+    validateManifestNetworks,
+} from './networkContract.js';
 import {
     effectiveInstanceKey,
     resolveEnabledAgentRegistryRecord,
     resolveWorkspaceDependencyGraph,
 } from './workspaceDependencyGraph.js';
 
-export const BOX_START_PUBLISH_PLAN_SCHEMA_VERSION = 1;
+export const BOX_START_PUBLISH_PLAN_SCHEMA_VERSION = 2;
 export const BOX_START_PUBLISH_PLAN_LOCK_PATH = path.join(PLOINKY_DIR, '.box-start-publish-plan.lock');
 export const BOX_START_PUBLISH_PLAN_OPERATIONS = Object.freeze([
     'start',
@@ -43,7 +51,6 @@ const REQUEST_KEYS = new Set([
 ]);
 
 const LOCK_OWNER_FILE = 'owner.json';
-const LOCK_SOCKET_FILE = 'owner.sock';
 const LOCK_REAPER_SUFFIX = '.reaper';
 const DEFAULT_LOCK_TIMEOUT_MS = 10 * 60 * 1000;
 const DEFAULT_LOCK_RETRY_MS = 100;
@@ -118,6 +125,14 @@ async function createBoxStartPublishPlanUnlocked(normalized, options) {
         serializedNodes = mergeEnabledNodes(serializedNodes, registry, workspaceProfile);
     }
     serializedNodes.sort(compareSerializedNodes);
+    preflightNetworkAliases(serializedNodes.map((node) => ({
+        id: node.id,
+        agentRef: node.agentRef,
+        canonicalAgentId: node.shortAgentName,
+        instanceKey: node.instanceKey,
+        network: node.network,
+        path: `manifest(${node.agentRef})`,
+    })));
 
     const publishPlan = planBoxPublishes({
         nodes: serializedNodes,
@@ -233,17 +248,19 @@ async function tryAcquirePlanningLock() {
         acquiredAt: new Date().toISOString(),
     };
     let server;
+    const socketPath = planningLockSocketPath();
     try {
         fs.writeFileSync(
             path.join(BOX_START_PUBLISH_PLAN_LOCK_PATH, LOCK_OWNER_FILE),
             JSON.stringify(owner),
             { flag: 'wx', mode: 0o600 },
         );
-        server = await listenForOwnerProbes(path.join(BOX_START_PUBLISH_PLAN_LOCK_PATH, LOCK_SOCKET_FILE));
+        server = await listenForOwnerProbes(socketPath);
         const handle = {
             path: BOX_START_PUBLISH_PLAN_LOCK_PATH,
             token,
             server,
+            socketPath,
             released: false,
             release() {
                 releasePlanningLock(handle);
@@ -254,9 +271,18 @@ async function tryAcquirePlanningLock() {
         return handle;
     } catch (error) {
         try { server?.close(); } catch (_) {}
+        try { fs.unlinkSync(socketPath); } catch (_) {}
         removeOwnedLockDirectory(BOX_START_PUBLISH_PLAN_LOCK_PATH, token);
         throw error;
     }
+}
+
+function planningLockSocketPath() {
+    const suffix = createHash('sha256')
+        .update(BOX_START_PUBLISH_PLAN_LOCK_PATH)
+        .digest('hex')
+        .slice(0, 20);
+    return path.join(os.tmpdir(), `ploinky-plan-${suffix}.sock`);
 }
 
 function listenForOwnerProbes(socketPath) {
@@ -282,7 +308,7 @@ async function recoverStalePlanningLock(settings) {
     const stat = statOrNull(BOX_START_PUBLISH_PLAN_LOCK_PATH);
     if (!stat) return recoverAbandonedReaper(reaperPath, settings.staleGraceMs);
     if (Date.now() - stat.mtimeMs < settings.staleGraceMs) return false;
-    const socketPath = path.join(BOX_START_PUBLISH_PLAN_LOCK_PATH, LOCK_SOCKET_FILE);
+    const socketPath = planningLockSocketPath();
     if (await ownerSocketIsLive(socketPath, settings.probeTimeoutMs)) return false;
 
     if (!acquireReaper(reaperPath, settings.staleGraceMs)) return false;
@@ -291,6 +317,7 @@ async function recoverStalePlanningLock(settings) {
         if (!current || Date.now() - current.mtimeMs < settings.staleGraceMs) return !current;
         if (await ownerSocketIsLive(socketPath, settings.probeTimeoutMs)) return false;
         fs.rmSync(BOX_START_PUBLISH_PLAN_LOCK_PATH, { recursive: true, force: true });
+        try { fs.unlinkSync(socketPath); } catch (_) {}
         return true;
     } finally {
         fs.rmSync(reaperPath, { recursive: true, force: true });
@@ -369,6 +396,7 @@ function releasePlanningLock(handle) {
     if (!handle || handle.released) return;
     handle.released = true;
     try { handle.server?.close(); } catch (_) {}
+    try { fs.unlinkSync(handle.socketPath); } catch (_) {}
     removeOwnedLockDirectory(handle.path, handle.token);
     activePlanningLocks.delete(handle);
     uninstallProcessLockHandlersIfIdle();
@@ -617,9 +645,15 @@ function serializeGraphNodes(graph) {
 function serializeGraphNode(node) {
     if (!node) throw new Error('dependency graph is missing its selected root node');
     const profileConfig = effectiveProfileConfig(node.manifest, node.profile);
+    const network = node.network || effectiveManifestNetwork(node.manifest, node.profile, {
+        path: `manifest(${node.agentRef})`,
+    });
+    const instanceKey = node.instanceKey || effectiveInstanceKey(node.repoName, node.shortAgentName, node.alias);
+    const implicitAgentServer = !readManifestStartCommand(node.manifest)
+        || Boolean(readManifestAgentCommand(node.manifest).raw);
     return {
         id: node.id,
-        instanceKey: node.instanceKey || effectiveInstanceKey(node.repoName, node.shortAgentName, node.alias),
+        instanceKey,
         agentRef: node.agentRef,
         repoName: node.repoName,
         shortAgentName: node.shortAgentName,
@@ -630,6 +664,12 @@ function serializeGraphNode(node) {
         manifestPath: node.manifestPath,
         repoCommit: readRepoCommit(node.agentPath),
         openPorts: normalizeOpenPorts(profileConfig?.openPorts),
+        network,
+        networkMode: network.mode,
+        implicitAgentServer,
+        ...(implicitAgentServer && ['default', 'bridge'].includes(network.mode)
+            ? { implicitAgentServerPort: implicitAgentServerBoxPort(instanceKey) }
+            : {}),
     };
 }
 
@@ -650,6 +690,7 @@ function mergeEnabledNodes(nodes, registry, workspaceProfile) {
         const key = effectiveInstanceKey(record.repoName, record.agentName, alias);
         const resolved = findAgent(`${record.repoName}/${record.agentName}`);
         const manifest = JSON.parse(fs.readFileSync(resolved.manifestPath, 'utf8'));
+        validateManifestNetworks(manifest, { path: `manifest(${resolved.repo}/${resolved.shortAgentName})` });
         const selected = resolveRecordProfile(
             manifest,
             record.profile || workspaceProfile,
@@ -667,6 +708,14 @@ function mergeEnabledNodes(nodes, registry, workspaceProfile) {
             continue;
         }
         const profileConfig = effectiveProfileConfig(manifest, selected);
+        const network = effectiveManifestNetwork(manifest, selected, {
+            path: `manifest(${resolved.repo}/${resolved.shortAgentName})`,
+        });
+        assertNetworkStartupCompatibility(manifest, profileConfig, network, {
+            path: `manifest(${resolved.repo}/${resolved.shortAgentName})`,
+        });
+        const implicitAgentServer = !readManifestStartCommand(manifest)
+            || Boolean(readManifestAgentCommand(manifest).raw);
         byKey.set(key, {
             id: alias ? `${resolved.repo}/${resolved.shortAgentName} as ${alias}` : `${resolved.repo}/${resolved.shortAgentName}`,
             instanceKey: key,
@@ -681,6 +730,12 @@ function mergeEnabledNodes(nodes, registry, workspaceProfile) {
             manifestPath: resolved.manifestPath,
             repoCommit: readRepoCommit(path.dirname(resolved.manifestPath)),
             openPorts: normalizeOpenPorts(profileConfig?.openPorts),
+            network,
+            networkMode: network.mode,
+            implicitAgentServer,
+            ...(implicitAgentServer && ['default', 'bridge'].includes(network.mode)
+                ? { implicitAgentServerPort: implicitAgentServerBoxPort(key) }
+                : {}),
         });
     }
     return Array.from(byKey.values());
@@ -697,7 +752,9 @@ function resolveRecordProfile(manifest, requested, ref, { explicit = false } = {
 
 function effectiveProfileConfig(manifest, profile) {
     const profiles = manifest?.profiles && typeof manifest.profiles === 'object' ? manifest.profiles : {};
-    return profiles[profile] || profiles.default || {};
+    const defaultProfile = profiles.default || {};
+    if (profile === 'default') return defaultProfile;
+    return mergeProfiles(defaultProfile, profiles[profile] || {});
 }
 
 function normalizeOpenPorts(value) {

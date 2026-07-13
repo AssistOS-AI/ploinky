@@ -169,6 +169,17 @@ test('start workspace forwards each dependency registry profile to its synchrono
     );
 });
 
+test('startup config providers run before manifest directives can start dependencies', () => {
+    const source = startWorkspace.toString();
+    const prepareIndex = source.indexOf('prepareManifestRepositories');
+    const providerIndex = source.indexOf('applyStartupConfigProvidersForGraph');
+    const enableIndex = source.indexOf('applyManifestDirectives');
+
+    assert.ok(prepareIndex >= 0, 'workspace start must prepare manifest repositories');
+    assert.ok(providerIndex > prepareIndex, 'providers must run after their repositories are available');
+    assert.ok(enableIndex > providerIndex, 'providers must finish before manifest enable directives start dependencies');
+});
+
 test('resolveWorkspaceDependencyGraph preserves dependency modes while qualifying relative refs', () => {
     writeManifest('demo', 'mode-target', { container: 'node:20-alpine' });
     writeManifest('demo', 'mode-app', {

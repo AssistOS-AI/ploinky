@@ -109,6 +109,8 @@ Profiles must be deploy-complete for non-sensitive configuration. A required man
 
 Generated env entries ignore same-named operator values by default. A generated entry may opt into an explicit override by declaring `explicitOverride: true`; Ploinky then uses the explicit value when present and injects `PLOINKY_ENV_SOURCE_<ENV_NAME>=explicit`. If a generated entry declares `explicitOverrideRequires: ["OTHER_ENV_NAME"]`, Ploinky uses the explicit value only when the generated entry and every listed companion are present in the normal explicit env sources. Generated values are injected with `PLOINKY_ENV_SOURCE_<ENV_NAME>=generated` so shared runtime libraries can distinguish an embedded generated credential from an operator-supplied external credential without inspecting secret values. Cross-agent generated credentials must use `sharedGeneratedSecret: true` and share by source env name, not by custom repo/agent/name fields.
 
+An object-form manifest env entry may declare `runtime: false`. The field must be a JSON boolean. Ploinky still resolves and validates that value for host lifecycle hooks, startup config providers, manifest image templating, and environment-hash reconciliation, but omits both the value and its `PLOINKY_ENV_SOURCE_<ENV_NAME>` marker from container OCI environment metadata and from bwrap or Seatbelt process environments. This exclusion also dominates a duplicate declaration of the same name in `expose`; `expose` cannot reintroduce a host-hook-only value at a runtime boundary. This is the supported boundary for credentials that a host preinstall hook materializes into a generated, read-only runtime input. The default is `runtime: true`; Ploinky does not infer host-only handling from an env name or from a particular agent.
+
 The manifest `network` object selects the container's network namespace. The default is a workspace-defined bridge selected by `network.name` (with optional `network.aliases` for sibling DNS). When an agent declares `network.mode: "host"`, the runtime must run the container with `--network host`, must not create or attach a named bridge, must not emit inner `-p` port publishes, and must not register network aliases. A host-network agent's `openPorts` entries still name its reachable runtime-side sockets and remain eligible for host publication; they are not reduced to probe-only metadata. Sibling agents on a bridge can reach a host-network agent through the runtime-provided host gateway entry (for example `host.containers.internal`) rather than through a bridge alias.
 
 The `network` object may also be set inside a profile block (`manifest.profiles.<profile>.network`) and overrides the root manifest `network` when the active profile defines one. This mirrors how `openPorts`, `env`, and `enable` already specialize per profile and is the supported way to vary the network namespace across deployment targets — for example, a media SFU that needs `network.mode: "host"` in `prod` (where the platform supports it and the UDP/SRC-NAT workaround applies) while keeping a bridge-network configuration in `dev` and `default` (so a developer workstation that cannot expose host-network container ports — notably macOS where podman runs inside a VM — can still serve the readiness probe and reach sibling agents through bridge aliases).
@@ -252,6 +254,11 @@ preservation, and rollback keep reconciliation non-destructive. In-box paths
 that cannot reconcile fail before mutation unless existing coverage is already
 sufficient. Keeping Podman only in the outer runtime preserves the separate
 least-privilege boundary for ordinary agent images.
+
+### Question #15: Why is host-hook-only env an explicit manifest flag?
+
+Response:
+Whether a resolved value is needed by the long-lived runtime is an agent-owned contract, not something Ploinky can safely infer from credential-like names. `runtime: false` lets generic lifecycle code provide the value to trusted host hooks while every runtime backend omits it from the launched process environment and container metadata.
 
 ## Conclusion
 

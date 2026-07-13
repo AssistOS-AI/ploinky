@@ -20,6 +20,7 @@ import {
 } from '../docker/agentCommands.js';
 import { LOGS_DIR, PLOINKY_DIR, PLOINKY_WORKSPACE_ROOT } from '../config.js';
 import { ensureSharedHostDir } from '../docker/agentHooks.js';
+import { readManifestVolumeOptions } from '../manifestVolumePolicy.js';
 import {
     runPreContainerLifecycle,
     runProfileLifecycle
@@ -426,7 +427,14 @@ function startSeatbeltProcess(agentName, manifest, agentPath, options = {}) {
         skillsPath: agentSkillsPath,
         codeReadOnly,
         skillsReadOnly,
-        volumes: manifest.volumes,
+        volumes: {
+            ...(manifest.volumes || {}),
+            ...(profileConfig?.volumes || {}),
+        },
+        volumeOptions: {
+            ...readManifestVolumeOptions(manifest),
+            ...readManifestVolumeOptions(profileConfig),
+        },
         workspaceRoot: PLOINKY_WORKSPACE_ROOT,
         extraReadPaths: getSeatbeltExtraReadPaths(),
         extraWritePaths: [
@@ -504,8 +512,8 @@ function startSeatbeltProcess(agentName, manifest, agentPath, options = {}) {
     const agents = loadAgentsMap();
     const existingRecord = agents[containerName] || {};
     const declaredEnvNames = [
-        ...getManifestEnvNames(manifest, profileConfig),
-        ...getExposedNames(manifest, profileConfig)
+        ...getManifestEnvNames(manifest, profileConfig, { forRuntime: true }),
+        ...getExposedNames(manifest, profileConfig, { forRuntime: true })
     ];
 
     agents[containerName] = {
@@ -733,7 +741,14 @@ function attachSeatbeltInteractive(agentName, manifest, agentPath, workdir, entr
         skillsPath: agentSkillsPath,
         codeReadOnly,
         skillsReadOnly,
-        volumes: manifest.volumes,
+        volumes: {
+            ...(manifest.volumes || {}),
+            ...(profileConfig?.volumes || {}),
+        },
+        volumeOptions: {
+            ...readManifestVolumeOptions(manifest),
+            ...readManifestVolumeOptions(profileConfig),
+        },
         workspaceRoot: PLOINKY_WORKSPACE_ROOT,
         extraReadPaths: getSeatbeltExtraReadPaths(),
         extraWritePaths: [

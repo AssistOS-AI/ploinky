@@ -15,6 +15,7 @@ import { buildAgentIdentityEnv, RESERVED_AGENT_ENV_NAMES } from '../agentIdentit
 import { debugLog } from '../utils.js';
 import {
     CONTAINER_CONFIG_PATH,
+    assertOuterPublicationCoverageForClaims,
     assertOuterPublicationCoverageForManifest,
     containerExists,
     computeEnvHash,
@@ -26,6 +27,7 @@ import {
     getRuntime,
     getRuntimeForAgent,
     isContainerRunning,
+    isPloinkyBoxRuntime,
     isSandboxRuntime,
     loadAgentsMap,
     managedContainerLabelArgs,
@@ -91,6 +93,16 @@ import {
     isLlmRuntimeManifest,
     prepareLlmStartup,
 } from '../llmRuntimeIntegration.js';
+import {
+    assertNetworkStartupCompatibility,
+    canonicalizeNetwork,
+    effectiveManifestNetwork,
+    networkContractHash,
+    validateManifestNetworks,
+} from '../networkContract.js';
+import { createNetworkLifecycleAdapter } from '../networkLifecycle.js';
+import { effectiveInstanceKey } from '../workspaceDependencyGraph.js';
+import { implicitAgentServerBoxPort } from '../../../container/box-publish-planner.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -109,7 +121,6 @@ function resolveLlmRuntimeSharedPath(agentPath) {
 const AGENT_PRIVATE_KEY_CONTAINER_PATH = '/run/ploinky-agent.key';
 const PODMAN_STAGED_NODE_OPTIONS = ['--preserve-symlinks', '--preserve-symlinks-main'];
 const PODMAN_RUNTIME_ROOT = path.join(PLOINKY_DIR, 'container-runtime');
-const PODMAN_ROOTLESS_NETWORK = 'slirp4netns:allow_host_loopback=true';
 
 function pathTypeForSymlink(sourcePath) {
     try {
@@ -243,6 +254,13 @@ function shouldPodmanChownManifestVolume(resolvedHostPath, options = {}) {
 function podmanManifestVolumeMountSuffix(resolvedHostPath, options = {}) {
     if (options?.readOnly === true) return ':z,ro';
     return shouldPodmanChownManifestVolume(resolvedHostPath, options) ? ':z,U' : ':z';
+}
+
+function manifestVolumeMountSuffix(runtime, resolvedHostPath, options = {}) {
+    if (runtime === 'podman') {
+        return podmanManifestVolumeMountSuffix(resolvedHostPath, options);
+    }
+    return options?.readOnly === true ? ':ro' : '';
 }
 
 function readVolumeOptions(source) {
@@ -423,16 +441,6 @@ function resolveSymlinkPath(symlinkPath) {
     return symlinkPath;
 }
 
-function resolveRouterHostForRuntime(runtime) {
-    if (runtime === 'podman') {
-        return 'host.containers.internal';
-    }
-    if (runtime === 'docker') {
-        return 'host.docker.internal';
-    }
-    return '127.0.0.1';
-}
-
 function normalizeRouterPort(value) {
     const trimmed = String(value || '').trim();
     if (!trimmed) return '';
@@ -451,15 +459,17 @@ function readRouterPortFromRoutingFile() {
 }
 
 function buildRuntimeRouterEnv(runtime, options = {}) {
+    const mode = String(options.networkMode || 'default').trim().toLowerCase();
+    if (mode === 'none') return {};
     const routerPort = normalizeRouterPort(options.routerPort)
         || readRouterPortFromRoutingFile()
         || '8080';
     const routerHost = String(options.routerHost || '').trim()
-        || resolveRouterHostForRuntime(runtime);
+        || (mode === 'host' ? '127.0.0.1' : 'ploinky-router');
     return {
-        PLOINKY_ROUTER_PORT: routerPort,
+        PLOINKY_ROUTER_PORT: mode === 'host' ? routerPort : '8080',
         PLOINKY_ROUTER_HOST: routerHost,
-        PLOINKY_ROUTER_URL: `http://${routerHost}:${routerPort}`,
+        PLOINKY_ROUTER_URL: `http://${routerHost}:${mode === 'host' ? routerPort : '8080'}`,
     };
 }
 
@@ -506,99 +516,33 @@ function normalizeMountMode(mode, fallback) {
     return fallback;
 }
 
-function ensureNamedRuntimeNetwork(runtime, networkName) {
-    if (!networkName) return;
-    try {
-        execSync(`${runtime} network inspect ${networkName}`, { stdio: 'ignore' });
-    } catch (_) {
-        execSync(`${runtime} network create ${networkName}`, { stdio: 'inherit' });
-    }
-}
-
-function resolveEffectiveManifestNetwork(manifest, profileConfig) {
-    if (profileConfig?.network && typeof profileConfig.network === 'object') {
-        return profileConfig.network;
-    }
-    if (manifest?.network && typeof manifest.network === 'object') {
-        return manifest.network;
-    }
-    return null;
-}
-
-function normalizeRuntimeNetwork(network) {
-    const normalized = {
-        mode: '',
-        name: '',
-        aliases: []
-    };
-    if (!network || typeof network !== 'object') {
-        return normalized;
-    }
-    normalized.mode = String(network.mode || '').trim().toLowerCase();
-    normalized.name = String(network.name || '').trim();
-    normalized.aliases = Array.isArray(network.aliases)
-        ? network.aliases.map((entry) => String(entry || '').trim()).filter(Boolean)
-        : [];
-    return normalized;
-}
-
 function buildRuntimeNetworkPlan(runtime, manifestNetwork, options = {}) {
-    const network = normalizeRuntimeNetwork(manifestNetwork);
-    const isPodman = runtime === 'podman';
-
+    const network = canonicalizeNetwork(manifestNetwork, { path: options.path || 'manifest.network' });
     if (network.mode === 'host') {
         return {
-            args: isPodman ? ['--replace', '--network', 'host'] : ['--network', 'host'],
-            ensureNetworkName: '',
+            mode: 'host',
+            args: ['--network', 'host'],
             useHostNetwork: true,
             boxNetworkCompat: false,
-            hashEnv: {}
+            hashEnv: { PLOINKY_NETWORK_MODE: 'host' },
         };
     }
-
-    if (network.name) {
-        const args = ['--network', network.name];
-        for (const alias of network.aliases) {
-            args.push('--network-alias', alias);
-        }
-        if (isPodman) {
-            args.unshift('--replace');
-        }
+    if (network.mode === 'none') {
         return {
-            args,
-            ensureNetworkName: network.name,
+            mode: 'none',
+            args: ['--network', 'none'],
             useHostNetwork: false,
             boxNetworkCompat: false,
-            hashEnv: {}
+            hashEnv: { PLOINKY_NETWORK_MODE: 'none' },
         };
     }
-
-    if (isPodman) {
-        return {
-            args: ['--replace', '--network', PODMAN_ROOTLESS_NETWORK],
-            ensureNetworkName: '',
-            useHostNetwork: false,
-            boxNetworkCompat: false,
-            hashEnv: {}
-        };
-    }
-
-    if (runtime === 'docker') {
-        return {
-            args: ['--add-host', 'host.docker.internal:host-gateway'],
-            ensureNetworkName: '',
-            useHostNetwork: false,
-            boxNetworkCompat: false,
-            hashEnv: {}
-        };
-    }
-
     return {
+        mode: network.mode,
         args: [],
-        ensureNetworkName: '',
         useHostNetwork: false,
-        boxNetworkCompat: false,
-        hashEnv: {}
+        boxNetworkCompat: true,
+        requiresManagedNetwork: true,
+        hashEnv: { PLOINKY_NETWORK_MODE: network.mode },
     };
 }
 
@@ -741,13 +685,18 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         const availableProfiles = Object.keys(manifest.profiles || {});
         throw new Error(`[profile] ${agentName}: profile '${activeProfile}' not found. Available: ${availableProfiles.join(', ')}`);
     }
+    validateManifestNetworks(manifest, { path: `manifest(${repoName}/${agentName})` });
+    const manifestNetwork = effectiveManifestNetwork(manifest, activeProfile, {
+        path: `manifest(${repoName}/${agentName})`,
+    });
+    assertNetworkStartupCompatibility(manifest, profileConfig, manifestNetwork, {
+        path: `manifest(${repoName}/${agentName})`,
+    });
     assertOuterPublicationCoverageForManifest(manifest, profileConfig, {
         ownerRef: `${repoName}/${agentName}`,
         commandHint: options.commandHint || `ploinky start ${repoName}/${agentName}`,
     });
     assertManifestEnvProfileCompleteness(manifest, profileConfig, { agentName, repoName, profileName: activeProfile });
-    removeContainerForRecreate(runtime, containerName, `startAgentContainer:${agentName}`);
-
     // Ensure workspace structure exists and run preinstall [HOST] before any
     // image-dependent work. Hooks may build local images or seed vars that image
     // resolution and dependency-cache probes consume.
@@ -767,9 +716,11 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     }
     let image = manifestImage;
     const useProfileLifecycle = Boolean(profileConfig);
-    const manifestNetwork = resolveEffectiveManifestNetwork(manifest, profileConfig);
     const runtimeNetworkPlan = buildRuntimeNetworkPlan(runtime, manifestNetwork);
-    const runtimeRouterEnv = buildRuntimeRouterEnv(runtime, options);
+    const runtimeRouterEnv = buildRuntimeRouterEnv(runtime, {
+        ...options,
+        networkMode: runtimeNetworkPlan.mode,
+    });
     const envHash = computeEnvHash(manifest, profileConfig, {
         ...runtimeRouterEnv,
         ...runtimeNetworkPlan.hashEnv
@@ -790,8 +741,8 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
             env: process.env,
             agentWorkDirRoot: AGENTS_DATA_DIR,
             manifestEnvNames: [
-                ...getManifestEnvNames(manifest, profileConfig),
-                ...getExposedNames(manifest, profileConfig),
+                ...getManifestEnvNames(manifest, profileConfig, { forRuntime: true }),
+                ...getExposedNames(manifest, profileConfig, { forRuntime: true }),
             ],
             envHash,
             effectiveNetwork: effectiveNetworkForLlm,
@@ -992,15 +943,22 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         }
     }
 
-    if (runtimeNetworkPlan.ensureNetworkName) {
-        ensureNamedRuntimeNetwork(runtime, runtimeNetworkPlan.ensureNetworkName);
-    }
-    if (runtimeNetworkPlan.args.length) {
-        args.splice(1, 0, ...runtimeNetworkPlan.args);
-    }
+    const networkLifecycle = createNetworkLifecycleAdapter({ runtime });
+    const unmanagedNetworkLifecyclePlan = runtimeNetworkPlan.requiresManagedNetwork
+        ? null
+        : {
+            mode: runtimeNetworkPlan.mode,
+            args: runtimeNetworkPlan.args,
+            attachments: [],
+            created: [],
+        };
+    args.splice(1, 0,
+        '--label', `io.assistos.ploinky.workspace=${networkLifecycle.identity.hash}`,
+        '--label', `io.assistos.ploinky.network-contract=${networkContractHash(manifestNetwork)}`,
+    );
 
     for (const { resolvedHostPath, containerPath, options } of manifestVolumeMounts) {
-        const mountSuffix = runtime === 'podman' ? podmanManifestVolumeMountSuffix(resolvedHostPath, options) : '';
+        const mountSuffix = manifestVolumeMountSuffix(runtime, resolvedHostPath, options);
         args.push('-v', `${resolvedHostPath}:${containerPath}${mountSuffix}`);
     }
 
@@ -1013,7 +971,10 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     const effectivePortMappings = profileServerPublish
         ? [...basePortMappings, profileServerPublish.mapping]
         : basePortMappings;
-    const pubs = useHostNetwork ? [] : [...manifestPorts, ...runtimePorts, ...profileServerPublishArgs];
+    assertHostPortContract(runtimeNetworkPlan.mode, effectivePortMappings);
+    const pubs = (useHostNetwork || runtimeNetworkPlan.mode === 'none')
+        ? []
+        : [...manifestPorts, ...runtimePorts, ...profileServerPublishArgs];
     for (const p of pubs) {
         if (!p) continue;
         args.splice(1, 0, '-p', String(p));
@@ -1028,7 +989,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     }
 
     const envStrings = [
-        ...buildEnvFlags(manifest, profileConfig, { agentName, repoName, profileName: activeProfile }),
+        ...buildEnvFlags(manifest, profileConfig, { agentName, repoName, profileName: activeProfile, forRuntime: true }),
         formatEnvFlag('PLOINKY_MCP_CONFIG_PATH', CONTAINER_CONFIG_PATH)
     ];
     envStrings.push(formatEnvFlag('AGENT_NAME', agentName));
@@ -1084,7 +1045,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         appendEnvFlagsFromMap(envStrings, profileSecrets);
     }
 
-    appendRuntimeRouterEnvFlags(envStrings, runtimeRouterEnv);
+    if (runtimeNetworkPlan.mode !== 'none') appendRuntimeRouterEnvFlags(envStrings, runtimeRouterEnv);
     if (llmStartup.enabled) {
         envStrings.push(formatEnvFlag('HF_HOME', '/models/hf-cache'));
         envStrings.push(formatEnvFlag('PLOINKY_MODELS_DIR', '/models/artifacts'));
@@ -1178,13 +1139,36 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         }
     }
 
-    console.log(`[start] ${agentName}: ${runtime} run (cwd='${cwd}') -> ${entrySummary}`);
-    const res = spawnSync(runtime, args, { stdio: 'inherit' });
-    if (res.status !== 0) { throw new Error(`${runtime} run failed with code ${res.status}`); }
+    const detachedIndex = args.indexOf('-d');
+    if (detachedIndex !== -1) args.splice(detachedIndex, 1);
+    args[0] = 'create';
+    console.log(`[start] ${agentName}: ${runtime} create (cwd='${cwd}') -> ${entrySummary}`);
+    const createContainer = (plan) => {
+        const createArgs = [...args];
+        if (plan?.args?.length) createArgs.splice(1, 0, ...plan.args);
+        const res = spawnSync(runtime, createArgs, { stdio: 'inherit' });
+        if (res.status !== 0) throw new Error(`${runtime} create failed with code ${res.status}`);
+    };
+    if (runtimeNetworkPlan.requiresManagedNetwork) {
+        networkLifecycle.runManagedContainerTransaction({
+            network: manifestNetwork,
+            canonicalAgentId: agentName,
+            instanceKey: effectiveInstanceKey(repoName, agentName, options.alias || ''),
+            containerName,
+            createContainer,
+        });
+        clearLivenessState(containerName);
+    } else {
+        // All manifest/profile/port/image/mount validation above is complete.
+        // Only now is the old host/none container deliberately replaced.
+        removeContainerForRecreate(runtime, containerName, `startAgentContainer:${agentName}`);
+        createContainer(unmanagedNetworkLifecyclePlan);
+        networkLifecycle.finalizeContainer(containerName, unmanagedNetworkLifecyclePlan);
+    }
     const agents = loadAgentsMap();
     const declaredEnvNames2 = [
-        ...getManifestEnvNames(manifest, profileConfig),
-        ...getExposedNames(manifest, profileConfig),
+        ...getManifestEnvNames(manifest, profileConfig, { forRuntime: true }),
+        ...getExposedNames(manifest, profileConfig, { forRuntime: true }),
         ...Object.keys(profileEnv)
     ];
     const llmRuntimeEnvNames = llmStartup.enabled
@@ -1231,7 +1215,9 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
                 { source: cwd, target: cwdMountTarget }
             ],
             env: Array.from(new Set([...declaredEnvNames2, ...llmRuntimeEnvNames])).map((name) => ({ name })),
-            ports: effectivePortMappings,
+            ports: runtimeNetworkPlan.mode === 'host' || runtimeNetworkPlan.mode === 'none'
+                ? []
+                : effectivePortMappings,
             ...(additionalServerPort ? { additionalServerPort } : {})
         }
     };
@@ -1331,11 +1317,24 @@ function resolvePublishedPortMappings(containerName, portMappings) {
     });
 }
 
-function shouldCreateImplicitAgentServerPublish(manifest, manifestPorts = []) {
-    if (Array.isArray(manifestPorts) && manifestPorts.length > 0) {
+function shouldCreateImplicitAgentServerPublish(manifest, manifestPorts = [], networkMode = 'default', portMappings = []) {
+    if (networkMode === 'host' || networkMode === 'none') return false;
+    if (Array.isArray(portMappings) && portMappings.some((mapping) => Number(mapping?.containerPort) === 7000)) {
         return false;
     }
     return resolveAgentExecutionMode(manifest).type !== 'start_only';
+}
+
+function assertHostPortContract(networkMode, portMappings) {
+    if (networkMode !== 'host' || isPloinkyBoxRuntime()) return;
+    const remapped = (portMappings || []).find((mapping) => (
+        Number(mapping?.hostPort) !== Number(mapping?.containerPort)
+    ));
+    if (remapped) {
+        throw new Error(
+            `direct host network mode cannot remap external port ${remapped.hostPort} to private port ${remapped.containerPort}; the ports must match`,
+        );
+    }
 }
 
 function resolveDirectProfileServerHostPort(profileServer) {
@@ -1404,8 +1403,16 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
         const availableProfiles = Object.keys(manifest.profiles || {});
         throw new Error(`[profile] ${agentName}: profile '${activeProfile}' not found. Available: ${availableProfiles.join(', ')}`);
     }
+    validateManifestNetworks(manifest, { path: `manifest(${repoName}/${agentName})` });
+    const manifestNetwork = effectiveManifestNetwork(manifest, activeProfile, {
+        path: `manifest(${repoName}/${agentName})`,
+    });
+    assertNetworkStartupCompatibility(manifest, profileConfig, manifestNetwork, {
+        path: `manifest(${repoName}/${agentName})`,
+    });
     assertOuterPublicationCoverageForManifest(manifest, profileConfig, {
         ownerRef: `${repoName}/${agentName}`,
+        networkMode: manifestNetwork.mode,
         commandHint: options?.commandHint || `ploinky start ${repoName}/${agentName}`,
     });
     assertManifestEnvProfileCompleteness(manifest, profileConfig, { agentName, repoName, profileName: activeProfile });
@@ -1420,18 +1427,17 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
     }
     const runtimeRouterEnv = buildRuntimeRouterEnv(runtime, {
         routerPort: routerPortOverride,
-        routerHost: routerHostOverride
+        routerHost: routerHostOverride,
+        networkMode: manifestNetwork.mode,
     });
-    const runtimeNetworkPlan = buildRuntimeNetworkPlan(
-        runtime,
-        resolveEffectiveManifestNetwork(manifest, profileConfig)
-    );
+    const runtimeNetworkPlan = buildRuntimeNetworkPlan(runtime, manifestNetwork);
     const envHashExtra = {
         ...runtimeRouterEnv,
         ...runtimeNetworkPlan.hashEnv
     };
 
     const { publishArgs: manifestPorts, portMappings } = parseManifestPorts(manifest, profileConfig);
+    assertHostPortContract(runtimeNetworkPlan.mode, portMappings);
     const additionalServerPort = resolveProfileServer(manifest, profileConfig, {
         runtimeMode: runtimeNetworkPlan.useHostNetwork ? 'host' : 'container'
     });
@@ -1442,24 +1448,35 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
     if (additionalServerContainerPort && !containerPortCandidates.includes(additionalServerContainerPort)) {
         containerPortCandidates.push(additionalServerContainerPort);
     }
-    if (shouldCreateImplicitAgentServerPublish(manifest, manifestPorts)) {
+    if (shouldCreateImplicitAgentServerPublish(manifest, manifestPorts, runtimeNetworkPlan.mode, portMappings)) {
         containerPortCandidates.unshift(7000);
+        if (isPloinkyBoxRuntime()) {
+            const key = effectiveInstanceKey(repoName, agentName, aliasOverride);
+            const boxPort = implicitAgentServerBoxPort(key);
+            assertOuterPublicationCoverageForClaims([{
+                protocol: 'tcp',
+                boxSide: { start: boxPort, end: boxPort },
+                ownerRef: `${repoName}/${agentName}`,
+                raw: `implicit AgentServer ${boxPort}:7000`,
+            }], {
+                boxRuntime: true,
+                ownerRef: `${repoName}/${agentName}`,
+                commandHint: options?.commandHint || `ploinky start ${repoName}/${agentName}`,
+            });
+        }
     }
 
     const { raw: explicitAgentCmd } = readManifestAgentCommand(manifest);
     const startCmd = readManifestStartCommand(manifest);
     const withParallelAgent = Boolean(startCmd && explicitAgentCmd);
-
-    if (forceRecreate && containerExists(containerName)) {
-        removeContainerForRecreate(runtime, containerName, `ensureAgentService:${agentName}:forceRecreate`);
-    }
+    let recreateReason = forceRecreate ? 'forceRecreate' : null;
 
     if (containerExists(containerName)) {
         const desired = computeEnvHash(manifest, profileConfig, envHashExtra, { agentName, repoName });
         const current = getContainerLabel(containerName, 'ploinky.envhash');
         if (desired && desired !== current) {
             debugLog(`[ensureAgentService] ${agentName}: env hash changed (current=${current || '<none>'}, desired=${desired.slice(0, 12)}…), recreating container`);
-            removeContainerForRecreate(runtime, containerName, `ensureAgentService:${agentName}:envHashChanged`);
+            recreateReason ||= 'envHashChanged';
         }
     }
 
@@ -1477,8 +1494,8 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
                 env: process.env,
                 agentWorkDirRoot: AGENTS_DATA_DIR,
                 manifestEnvNames: [
-                    ...getManifestEnvNames(manifest, profileConfig),
-                    ...getExposedNames(manifest, profileConfig),
+                    ...getManifestEnvNames(manifest, profileConfig, { forRuntime: true }),
+                    ...getExposedNames(manifest, profileConfig, { forRuntime: true }),
                 ],
                 envHash: desiredEnvHash,
                 effectiveNetwork: effectiveNetworkForLlm,
@@ -1488,7 +1505,7 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
                 const currentReuse = getContainerLabel(containerName, 'ploinky.reusehash');
                 if (probe.reuseHash && probe.reuseHash !== currentReuse) {
                     debugLog(`[ensureAgentService] ${agentName}: LLM reuse hash changed (current=${currentReuse || '<none>'}, desired=${probe.reuseHash.slice(0, 12)}…), recreating container`);
-                    removeContainerForRecreate(runtime, containerName, `ensureAgentService:${agentName}:llmReuseHashChanged`);
+                    recreateReason ||= 'llmReuseHashChanged';
                 }
             }
         } catch (err) {
@@ -1501,11 +1518,27 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
         const existingProfileServer = resolvePublishedProfileServer(additionalServerPort, existingPortMappings);
         if (!existingProfileServer) {
             debugLog(`[ensureAgentService] ${agentName}: additional server port is not published; recreating container`);
-            removeContainerForRecreate(runtime, containerName, `ensureAgentService:${agentName}:profileServerPublishChanged`);
+            recreateReason ||= 'profileServerPublishChanged';
         }
     }
 
-    if (containerExists(containerName)) {
+    if (containerExists(containerName) && runtimeNetworkPlan.requiresManagedNetwork) {
+        const networkLifecycle = createNetworkLifecycleAdapter({ runtime });
+        const contractMatches = networkLifecycle.verifyContainerContract(containerName, manifestNetwork, agentName, {
+            instanceKey: effectiveInstanceKey(repoName, agentName, aliasOverride || ''),
+            contractHash: networkContractHash(manifestNetwork),
+        });
+        if (!contractMatches) {
+            debugLog(`[ensureAgentService] ${agentName}: managed network contract/attachments drifted; recreating container`);
+            recreateReason ||= 'networkContractDrift';
+        } else if (!isContainerRunning(containerName)) {
+            // A stopped managed container is never started outside the lifecycle
+            // transaction because gateway/network preflight must precede start.
+            recreateReason ||= 'managedContainerStopped';
+        }
+    }
+
+    if (containerExists(containerName) && !recreateReason) {
         debugLog(`[ensureAgentService] ${agentName}: container exists, checking if running...`);
         let canReuseExisting = true;
         if (!isContainerRunning(containerName)) {
@@ -1524,7 +1557,7 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
                 const detail = String(e?.stderr || '').trim() || e?.message || 'unknown error';
                 console.log(`[start] ${agentName}: cannot reuse existing container; recreating.`);
                 debugLog(`[ensureAgentService] ${agentName}: reuse via '${runtime} start' failed (${detail}); recreating.`);
-                removeContainerForRecreate(runtime, containerName, `ensureAgentService:${agentName}:failedStart`);
+                recreateReason ||= 'failedStart';
             }
             if (canReuseExisting && withParallelAgent) {
                 try {
@@ -1537,9 +1570,11 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
         }
         if (canReuseExisting) {
             debugLog(`[ensureAgentService] ${agentName}: returning early (container exists)`);
-            const hostPort = containerPortCandidates.length
-                ? resolveHostPort(containerName, existingRecord, containerPortCandidates)
-                : resolveDirectProfileServerHostPort(additionalServerPort);
+            const hostPort = runtimeNetworkPlan.mode === 'host'
+                ? (containerPortCandidates[0] || 0)
+                : (containerPortCandidates.length
+                    ? resolveHostPort(containerName, existingRecord, containerPortCandidates)
+                    : resolveDirectProfileServerHostPort(additionalServerPort));
             const existingPortMappings = resolvePublishedPortMappings(containerName, existingRecord.config?.ports || []);
             const resolvedProfileServer = resolvePublishedProfileServer(additionalServerPort, existingPortMappings) || additionalServerPort;
             syncAgentMcpConfig(containerName, agentPath, agentName);
@@ -1551,8 +1586,11 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
     let additionalPortMappings = [];
     let allPortMappings = [...portMappings];
 
-    if (shouldCreateImplicitAgentServerPublish(manifest, manifestPorts)) {
-        const hostPort = preferredHostPort || (10000 + Math.floor(Math.random() * 50000));
+    if (shouldCreateImplicitAgentServerPublish(manifest, manifestPorts, runtimeNetworkPlan.mode, portMappings)) {
+        const key = effectiveInstanceKey(repoName, agentName, aliasOverride);
+        const hostPort = isPloinkyBoxRuntime()
+            ? implicitAgentServerBoxPort(key)
+            : (preferredHostPort || (10000 + Math.floor(Math.random() * 50000)));
         const agentServerMapping = { containerPort: 7000, hostPort, hostIp: '127.0.0.1', protocol: 'tcp' };
         additionalPorts = [`127.0.0.1:${hostPort}:7000`];
         additionalPortMappings.push(agentServerMapping);
@@ -1586,8 +1624,8 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
     const agents = loadAgentsMap();
     const startedRecord = agents[containerName] || {};
     const declaredEnvNames3 = [
-        ...getManifestEnvNames(manifest, profileConfig),
-        ...getExposedNames(manifest, profileConfig),
+        ...getManifestEnvNames(manifest, profileConfig, { forRuntime: true }),
+        ...getExposedNames(manifest, profileConfig, { forRuntime: true }),
         ...Object.keys(profileEnv)
     ];
     let projPath = getConfiguredProjectPath(agentName, path.basename(path.dirname(agentPath)), aliasOverride);
@@ -1632,7 +1670,7 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
                 ...(!finalIsolatedHome ? [{ source: finalAgentWorkDir, target: '/root' }] : [])
             ],
             env: Array.from(new Set([...declaredEnvNames3, ...startedEnvNames])).map((name) => ({ name })),
-            ports: allPortMappings,
+            ports: runtimeNetworkPlan.mode === 'host' || runtimeNetworkPlan.mode === 'none' ? [] : allPortMappings,
             ...(resolvedProfileServer ? { additionalServerPort: resolvedProfileServer } : {})
         }
     };
@@ -1645,7 +1683,11 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
     saveAgentsMap(agents);
 
     syncAgentMcpConfig(containerName, agentPath, finalInstanceName, { workDir: finalAgentWorkDir });
-    const returnPort = allPortMappings.find((p) => p.containerPort === 7000)?.hostPort
+    const returnPort = runtimeNetworkPlan.mode === 'host'
+        ? (allPortMappings.find((p) => p.containerPort === 7000)?.containerPort
+            || allPortMappings[0]?.containerPort
+            || 0)
+        : allPortMappings.find((p) => p.containerPort === 7000)?.hostPort
         || allPortMappings[0]?.hostPort
         || resolveDirectProfileServerHostPort(additionalServerPort)
         || 0;
@@ -1664,6 +1706,7 @@ export {
     ensureManifestVolumeHostPath,
     ensurePodmanStagedCodeDir,
     mergeNodeOptions,
+    manifestVolumeMountSuffix,
     podmanManifestVolumeMountSuffix,
     podmanMountSuffix,
     resolveDependencyCachePreparation,

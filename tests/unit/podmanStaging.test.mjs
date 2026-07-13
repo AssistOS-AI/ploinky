@@ -12,6 +12,7 @@ import {
     collectManifestVolumeEntries,
     ensurePodmanStagedCodeDir,
     ensureManifestVolumeHostPath,
+    manifestVolumeMountSuffix,
     mergeNodeOptions,
     podmanManifestVolumeMountSuffix,
     podmanMountSuffix,
@@ -284,6 +285,13 @@ test('podman manifest data volumes chown only managed writable data mounts by de
         podmanManifestVolumeMountSuffix(path.join(os.tmpdir(), 'explicit-podman-volume'), { podmanChown: true }),
         ':z,U',
     );
+});
+
+test('read-only manifest volumes are enforced across container runtimes', () => {
+    const hostPath = path.join(PLOINKY_DIR, 'data', 'readonly');
+    assert.equal(manifestVolumeMountSuffix('podman', hostPath, { readOnly: true }), ':z,ro');
+    assert.equal(manifestVolumeMountSuffix('docker', hostPath, { readOnly: true }), ':ro');
+    assert.equal(manifestVolumeMountSuffix('docker', hostPath, {}), '');
 });
 
 test('manifest volume host paths may resolve outside workspace .ploinky', () => {

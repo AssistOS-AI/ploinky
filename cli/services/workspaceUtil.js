@@ -1,5 +1,6 @@
 import fs from 'fs';
 import path from 'path';
+import net from 'net';
 import { spawn, execSync } from 'child_process';
 import { fileURLToPath } from 'url';
 import * as utils from './utils.js';
@@ -9,7 +10,7 @@ import * as dockerSvc from './docker/index.js';
 import { getRuntimeForAgent, isSandboxRuntime, loadAgentsMap } from './docker/common.js';
 import { isBwrapProcessRunning, stopBwrapProcess } from './bwrap/bwrapFleet.js';
 import * as inputState from './inputState.js';
-import { applyManifestDirectives } from './bootstrapManifest.js';
+import { applyManifestDirectives, prepareManifestRepositories } from './bootstrapManifest.js';
 import { executeHostHook, markPreinstallRunInProcess, resetPreinstallRunInProcess, isInlineCommand } from './lifecycleHooks.js';
 import { getActiveProfile, getProfileConfig, getProfileEnvVars } from './profileService.js';
 import { getSecrets, createEnvWithSecrets, loadEnvFile } from './secretInjector.js';
@@ -19,7 +20,7 @@ import { resolveAgentExecutionMode, resolveAgentReadinessProtocol } from './star
 import { normalizeProbeConfig, runContainerScriptReadiness } from './docker/healthProbes.js';
 import { applyStartupConfigProvidersForGraph } from './startupConfigProviders.js';
 import { withMaintenanceLock } from './maintenanceLocks.js';
-import { LOGS_DIR, PLOINKY_CWD, PLOINKY_WORKSPACE_ROOT, REPOS_DIR, ROUTING_FILE, RUNNING_DIR } from './config.js';
+import { LOGS_DIR, PLOINKY_CWD, PLOINKY_DIR, PLOINKY_WORKSPACE_ROOT, REPOS_DIR, ROUTING_FILE, RUNNING_DIR } from './config.js';
 import { classifyDependencyGraphWaitMode, resolveWorkspaceDependencyGraph, topologicallyGroupDependencyGraph } from './workspaceDependencyGraph.js';
 import { mergeRoutingConfig, readRoutingConfig } from './routingFile.js';
 import { waitForAgentReady } from '../server/utils/agentReadiness.js';
@@ -119,11 +120,38 @@ function spawnWatchdog(routerPath, port, routerPidFile) {
     env: {
       ...buildRouterEnv(),
       PORT: String(port),
+      PLOINKY_WORKSPACE_ROOT,
       PLOINKY_ROUTER_PID_FILE: routerPidFile
     }
   });
   logStdio.closeParentFds();
   return child;
+}
+
+async function waitForRouterReady(socketPath, port, child, timeoutMs = 15000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (child?.exitCode !== null && child?.exitCode !== undefined) {
+      throw new Error(`router exited before Unix listener became ready (exit ${child.exitCode})`);
+    }
+    const unixReady = await new Promise((resolve) => {
+      const socket = net.createConnection(socketPath);
+      const done = (value) => { socket.destroy(); resolve(value); };
+      socket.once('connect', () => done(true));
+      socket.once('error', () => done(false));
+      socket.setTimeout(250, () => done(false));
+    });
+    const tcpReady = unixReady && await new Promise((resolve) => {
+      const socket = net.createConnection({ host: '127.0.0.1', port: Number(port) });
+      const done = (value) => { socket.destroy(); resolve(value); };
+      socket.once('connect', () => done(true));
+      socket.once('error', () => done(false));
+      socket.setTimeout(250, () => done(false));
+    });
+    if (unixReady && tcpReady) return;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  throw new Error(`router listeners did not become ready at ${socketPath} and 127.0.0.1:${port}`);
 }
 
 function runWithSuspendedInput(callback) {
@@ -792,18 +820,6 @@ async function startWorkspace(staticAgentArg, portArg, {
       console.error(`[start] Preinstall hook error: ${preErr.message}`);
     }
 
-    try {
-      await applyManifestDirectives(cfg0.static.agent, { branchPolicy });
-    } catch (err) {
-      throw new Error(`Failed to apply manifest directives for '${cfg0.static.agent}': ${err?.message || err}`);
-    }
-    let reg = deduplicateAgentRegistry(workspaceSvc.loadAgents(), dockerSvc.getAgentContainerName);
-    workspaceSvc.saveAgents(reg);
-
-    const { getAgentContainerName, ensureAgentService } = dockerSvc;
-    let cfg = readRoutingConfig();
-    cfg.routes = cfg.routes || {};
-
     const staticAgent = normalizedStaticAgent || cfg0.static.agent;
     const staticPort = cfg0.static.port;
     let staticRepoName = null;
@@ -817,21 +833,37 @@ async function startWorkspace(staticAgentArg, portArg, {
       throw new Error(`start: static agent '${staticAgent}' not found in any repo. Use 'enable agent <repo/name>' or check repos.`);
     }
 
-    let dependencyGraph;
+    // Providers must run before manifest enable directives start dependent
+    // agents. First install/prepare the complete manifest repo graph without
+    // enabling anything, resolve a planning graph from those manifests, and
+    // apply provider output. The ordinary enable pass may then start every
+    // dependency with the provider-populated environment on its first launch.
     try {
-      dependencyGraph = resolveWorkspaceDependencyGraph({
+      await prepareManifestRepositories(cfg0.static.agent, {
+        branchPolicy,
+        profile: getActiveProfile(),
+      });
+    } catch (err) {
+      throw new Error(`Failed to prepare manifest repositories for '${cfg0.static.agent}': ${err?.message || err}`);
+    }
+    const providerRegistry = deduplicateAgentRegistry(
+      workspaceSvc.loadAgents(),
+      dockerSvc.getAgentContainerName,
+    );
+    let providerDependencyGraph;
+    try {
+      providerDependencyGraph = resolveWorkspaceDependencyGraph({
         staticAgentRef: staticAgent,
-        registry: reg
+        registry: providerRegistry,
       });
     } catch (graphErr) {
-      throw new Error(`Failed to resolve dependency graph for '${staticAgent}': ${graphErr.message}`);
+      throw new Error(`Failed to resolve provider dependency graph for '${staticAgent}': ${graphErr.message}`);
     }
-
     try {
       const providerResult = await applyStartupConfigProvidersForGraph({
-        dependencyGraph,
+        dependencyGraph: providerDependencyGraph,
         profileName: getActiveProfile(),
-        workspaceRoot: PLOINKY_WORKSPACE_ROOT
+        workspaceRoot: PLOINKY_WORKSPACE_ROOT,
       });
       if (providerResult.providers.length) {
         const appliedNames = providerResult.applied.map((entry) => entry.name);
@@ -843,6 +875,28 @@ async function startWorkspace(staticAgentArg, portArg, {
       }
     } catch (providerErr) {
       throw new Error(`Startup config provider preflight failed: ${providerErr?.message || providerErr}`);
+    }
+
+    try {
+      await applyManifestDirectives(cfg0.static.agent, { branchPolicy });
+    } catch (err) {
+      throw new Error(`Failed to apply manifest directives for '${cfg0.static.agent}': ${err?.message || err}`);
+    }
+    let reg = deduplicateAgentRegistry(workspaceSvc.loadAgents(), dockerSvc.getAgentContainerName);
+    workspaceSvc.saveAgents(reg);
+
+    const { getAgentContainerName, ensureAgentService } = dockerSvc;
+    let cfg = readRoutingConfig();
+    cfg.routes = cfg.routes || {};
+
+    let dependencyGraph;
+    try {
+      dependencyGraph = resolveWorkspaceDependencyGraph({
+        staticAgentRef: staticAgent,
+        registry: reg
+      });
+    } catch (graphErr) {
+      throw new Error(`Failed to resolve dependency graph for '${staticAgent}': ${graphErr.message}`);
     }
 
     ensureGraphNodesEnabled(dependencyGraph, reg);
@@ -893,6 +947,12 @@ async function startWorkspace(staticAgentArg, portArg, {
     const runningDir = RUNNING_DIR;
     fs.mkdirSync(runningDir, { recursive: true });
     const routerPath = path.resolve(__dirname, '../server/Watchdog.js');
+    const routerPidFile = path.join(runningDir, 'router.pid');
+    const child = spawnWatchdog(routerPath, staticPort, routerPidFile);
+    try { fs.writeFileSync(routerPidFile, String(child.pid)); } catch (_) {}
+    child.unref();
+    await waitForRouterReady(path.join(PLOINKY_DIR, 'run', 'router.sock'), staticPort, child);
+    console.log(`[start] Watchdog launched in background (pid ${child.pid}); router listeners are ready.`);
     const updateRoutes = async (targetNames = [], { allowFailures = false } = {}) => {
       if (!Array.isArray(targetNames) || !targetNames.length) {
         return;
@@ -1059,12 +1119,6 @@ async function startWorkspace(staticAgentArg, portArg, {
       await updateRoutes(extraNames, { allowFailures: true });
     }
 
-    const routerPidFile = path.join(runningDir, 'router.pid');
-    const child = spawnWatchdog(routerPath, staticPort, routerPidFile);
-    try { fs.writeFileSync(routerPidFile, String(child.pid)); } catch (_) {}
-    // Detach so the CLI can exit while the router keeps running.
-    child.unref();
-    console.log(`[start] Watchdog launched in background (pid ${child.pid}).`);
     console.log(`[start] Watchdog will automatically restart the server if it crashes.`);
     console.log(`[start] Server logs: ${path.join(LOGS_DIR, 'router.log')}`);
     console.log(`[start] Watchdog logs: ${path.join(LOGS_DIR, 'watchdog.log')}`);

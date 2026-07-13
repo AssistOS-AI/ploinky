@@ -67,6 +67,7 @@ import { getActiveProfile, getProfileConfig, setActiveProfile } from '../service
 import { resolveProfileServer } from '../services/profileServer.js';
 import { runOuterRuntimeShell } from '../services/runtimeShell.js';
 import { preflightBoxPublicationForCommand } from '../services/boxPublicationCoverage.js';
+import { createNetworkLifecycleAdapter } from '../services/networkLifecycle.js';
 
 let llmAgentsLoadPromise = null;
 const ENABLE_AGENT_CLI_TOKENS = Object.freeze({
@@ -439,6 +440,32 @@ async function handleCommand(args) {
         case 'status':
             await statusWorkspace();
             break;
+        case 'network': {
+            const subcommand = String(options[0] || '').trim();
+            const runtime = getRuntime();
+            const adapter = createNetworkLifecycleAdapter({ runtime });
+            if (subcommand === 'status') {
+                const json = options.slice(1).includes('--json');
+                if (options.slice(1).some((value) => value !== '--json')) {
+                    throw new Error('Usage: network status [--json]');
+                }
+                const status = adapter.status();
+                if (json) console.log(JSON.stringify(status, null, 2));
+                else if (!status.networks.length && !status.gateway) console.log('No workspace managed-network resources found.');
+                else {
+                    status.networks.forEach((record) => console.log(`${record.ownership}\t${record.physicalName}\t${record.logicalName || '-'}`));
+                    if (status.gateway) console.log(`${status.gateway.ownership}\t${status.gateway.name}\tgateway`);
+                }
+                break;
+            }
+            if (subcommand === 'prune' && options.length === 1) {
+                const report = adapter.prune();
+                for (const name of report.removed) console.log(`removed\t${name}`);
+                for (const record of report.preserved) console.log(`preserved\t${record.name}\t${record.reason}`);
+                break;
+            }
+            throw new Error('Usage: network status [--json] | network prune');
+        }
         case 'restart': {
             const target = (options[0] || '').trim();
             if (target && target.toLowerCase() === 'router') {

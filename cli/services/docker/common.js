@@ -15,7 +15,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const PLOINKY_BOX_MARKER_PATH = '/etc/ploinky-box';
 const OUTER_PUBLICATION_CONTRACT_ENV = 'PLOINKY_OUTER_PUBLICATION_CONTRACT';
-const OUTER_PUBLICATION_CONTRACT_SCHEMA_VERSION = 1;
+const OUTER_PUBLICATION_CONTRACT_SCHEMA_VERSION = 2;
 const MAX_OUTER_PUBLICATION_CONTRACT_BYTES = 256 * 1024;
 const PLOINKY_MANAGED_LABEL = 'io.assistos.ploinky.managed=1';
 
@@ -359,6 +359,7 @@ function getSecretsForAgent(manifest, options = {}) {
     const vars = buildEnvFlags(manifest, null, {
         agentName: options.agentName,
         repoName: options.repoName,
+        forRuntime: true,
     });
     debugLog(`Formatted env vars for ${probeContainerRuntime() || 'container'} command: ${vars.join(' ')}`);
     return vars;
@@ -604,6 +605,10 @@ function assertOuterPublicationCoverageForManifest(manifest, profileConfig = nul
         const parsed = parseManifestOpenPortSpec(entry);
         return {
             ...parsed,
+            boxSide: options.networkMode === 'host'
+                ? { ...parsed.privateContainer }
+                : parsed.boxSide,
+            networkMode: options.networkMode || 'default',
             ownerRef: options.ownerRef || '',
         };
     });

@@ -48,6 +48,8 @@ function mainHelpText(surface) {
   dashboard [--rotate]           Show or rotate Dashboard token and print access URL
   sso enable|disable|status  Bind or inspect SSO provider agents
   sandbox status|disable|enable  Force lite-sandbox agents to use containers, or restore bwrap/seatbelt
+  network status [--json]        Show managed network and gateway topology
+  network prune                  Remove unused workspace-owned managed networks
   vars                           List all variable names (no values)
   var <VAR> <value>              Set a variable value
   echo <VAR|$VAR>                Print the resolved value of a variable
@@ -224,6 +226,16 @@ function showDetailedHelp(topic, subtopic, subsubtopic, { surface = 'core' } = {
                 'enable sandbox'
             ],
             notes: 'Host sandbox is disabled by default; agents whose manifests request `lite-sandbox: true` use podman/docker. Run `sandbox enable` to opt into bwrap (Linux) / seatbelt (macOS). Restart running agents to apply the change. Environment override: PLOINKY_DISABLE_HOST_SANDBOX=1 forces disabled regardless of workspace setting.'
+        },
+        'network': {
+            description: 'Inspect and prune workspace-owned rootless Podman networks.',
+            syntax: 'network status [--json] | network prune',
+            examples: [
+                'network status',
+                'network status --json',
+                'network prune'
+            ],
+            notes: 'Prune removes only unused networks bearing this workspace\'s exact Ploinky ownership labels. Foreign or attached networks are never removed.'
         },
         
         

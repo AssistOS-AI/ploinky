@@ -152,7 +152,7 @@ export function contract2Container({
         },
         State: { Status: state, Running: state === 'running' },
         HostConfig: {
-            Privileged: true,
+            Privileged: false,
             Binds: [`${sourceDir}:/opt/ploinky:ro`],
             PortBindings: {
                 '8080/tcp': [{ HostIp: '127.0.0.1', HostPort: '8080' }],
@@ -170,7 +170,7 @@ export function contract2Container({
                     CgroupPermissions: 'rwm',
                 },
             ],
-            SecurityOpt: ['seccomp=unconfined'],
+            SecurityOpt: ['unmask=ALL'],
         },
         Mounts: [
             {
@@ -352,6 +352,7 @@ export function createFakeEngine({
     const calls = [];
     const state = {
         container: clone(container),
+        backups: new Map(),
         images: clone(images) || {},
         volumes: normalizeInputVolumes(volumes),
         anonymousVolumes: new Set(anonymousVolumes),
@@ -385,6 +386,7 @@ export function createFakeEngine({
             calls.push({ kind: 'query', args: [...args], options: { ...options } });
             if (args[0] === 'info') {
                 if (failureCode(failures, 'info')) return result(false, '', 'engine unavailable');
+                if (args.includes('{{json .Host.Security.Rootless}}')) return result(true, 'true\n');
                 if (args.includes('{{json .SecurityOptions}}')) return result(true, '[]\n');
                 if (args.includes('{{.Host.Security.SELinuxEnabled}}')) return result(true, 'false\n');
                 return result(true, '{}\n');
@@ -401,10 +403,10 @@ export function createFakeEngine({
                         : result(true, JSON.stringify([{ Id: `temporary-${target}`, Name: target }]));
                 }
                 const managedName = String(state.container?.inspect?.Name || '').replace(/^\//, '');
-                if (state.container && target !== managedName) {
-                    return result(false, '', 'container not found');
-                }
-                if (!state.container) {
+                const selected = target === managedName
+                    ? state.container
+                    : state.backups.get(target);
+                if (!selected) {
                     if (!formatted) {
                         inspectedOld = false;
                         if (reconciliationState !== 'rollback-ready') reconciliationState = 'idle';
@@ -414,12 +416,12 @@ export function createFakeEngine({
                 if (formatted) {
                     const format = args[args.indexOf('--format') + 1] || '';
                     const value = format.includes('State.Status')
-                        ? state.container.inspect.State.Status
-                        : state.container.inspect.Id;
+                        ? selected.inspect.State.Status
+                        : selected.inspect.Id;
                     return result(true, `${value}\n`);
                 }
                 inspectedOld = true;
-                return result(true, JSON.stringify([state.container.inspect]));
+                return result(true, JSON.stringify([selected.inspect]));
             }
             if (args[0] === 'image' && args[1] === 'inspect') {
                 const image = state.images[args[2]];
@@ -445,6 +447,12 @@ export function createFakeEngine({
                     : result(false, '', 'port not found');
             }
             if (args[0] === 'exec') {
+                if (args.includes('/proc/self/uid_map') || args.includes('/proc/self/gid_map')) {
+                    return result(true, '0 1000 1\n1 100000 65534\n');
+                }
+                if (args.includes('{{json .Host.Security.Rootless}}')) {
+                    return result(true, 'true\n');
+                }
                 const installed = state.container?.depsInstalled !== false;
                 return result(installed, '', installed ? '' : 'dependencies missing');
             }
@@ -507,6 +515,28 @@ export function createFakeEngine({
                     : 'idle';
                 return 0;
             }
+            if (args[0] === 'rename') {
+                const renameCode = fail('rename', options);
+                if (renameCode) return renameCode;
+                const [, from, to] = args;
+                const managedName = String(state.container?.inspect?.Name || '').replace(/^\//, '');
+                if (state.container && from === managedName) {
+                    state.container.inspect.Name = engine === 'docker' ? `/${to}` : to;
+                    state.backups.set(to, state.container);
+                    state.container = null;
+                    reconciliationState = 'replacement-ready';
+                    return 0;
+                }
+                const backup = state.backups.get(from);
+                if (backup && !state.container) {
+                    state.backups.delete(from);
+                    backup.inspect.Name = engine === 'docker' ? `/${to}` : to;
+                    state.container = backup;
+                    reconciliationState = 'idle';
+                    return 0;
+                }
+                return fail('rename', { ...options, allowFail: true }) || 1;
+            }
             if (args[0] === 'start') {
                 const code = fail('start', options);
                 if (code) return code;
@@ -531,6 +561,12 @@ export function createFakeEngine({
                     const code = fail('rm planner', options);
                     if (code) return code;
                     state.temporaryContainers.delete(target);
+                    return 0;
+                }
+                if (state.backups.has(target)) {
+                    const code = fail('rm backup', options);
+                    if (code) return code;
+                    state.backups.delete(target);
                     return 0;
                 }
                 const replacementCleanup = ['replacement-created', 'rollback-ready']
@@ -601,7 +637,7 @@ export function createFakeEngine({
             const request = JSON.parse(String(options.input || '{}'));
             const explicitPublishes = request.explicitPublishes || [];
             const value = {
-                schemaVersion: 1,
+                schemaVersion: 2,
                 operation: request.operation,
                 explicitPublishes,
                 generatedPublishes: [],
@@ -675,7 +711,7 @@ export function createSupervisorHarness(options = {}) {
         preparePublicationPlan: options.useProductionPlanner
             ? undefined
             : options.preparePublicationPlan || (async request => ({
-                schemaVersion: 1,
+                schemaVersion: 2,
                 operation: request.operation,
                 explicitPublishes: request.explicitPublishes || [],
                 generatedPublishes: [],

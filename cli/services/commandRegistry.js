@@ -8,6 +8,7 @@ const rawCommands = {
     enable: ['repo', 'agent', 'sandbox'],
     disable: ['repo', 'agent', 'sandbox', 'agents-all'],
     sandbox: ['status', 'disable', 'enable'],
+    network: ['status', 'prune'],
     shell: [],
     cli: [],
     start: [],

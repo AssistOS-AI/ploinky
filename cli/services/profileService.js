@@ -4,6 +4,7 @@ import { PROFILE_FILE, PLOINKY_CWD, PLOINKY_DIR, PLOINKY_WORKSPACE_ROOT, REPOS_D
 import { validateSecrets } from './secretInjector.js';
 import { validateManifestEnvProfileCompleteness } from './secretVars.js';
 import { debugLog, findAgent } from './utils.js';
+import { effectiveManifestNetwork, validateManifestNetworks } from './networkContract.js';
 
 // Discover all valid profile names from installed agent manifests.
 // Any profile name declared in a manifest's "profiles" section is valid.
@@ -252,6 +253,7 @@ export function getProfileConfig(agentName, profileName) {
     try {
         const { manifestPath } = findAgent(agentName);
         const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+        validateManifestNetworks(manifest, { path: `manifest(${agentName})` });
         const profiles = manifest?.profiles;
 
         // If no profiles section exists, agent uses legacy mode (no profile config)
@@ -270,16 +272,22 @@ export function getProfileConfig(agentName, profileName) {
 
         // If requesting default or no active profile config exists, return default
         if (activeProfileName === 'default' || !profiles[activeProfileName]) {
-            return defaultProfile;
+            return {
+                ...defaultProfile,
+                network: effectiveManifestNetwork(manifest, 'default', { path: `manifest(${agentName})` }),
+            };
         }
 
         // Merge default with active profile (active overrides default)
         const activeProfile = profiles[activeProfileName];
-        return mergeProfiles(defaultProfile, activeProfile);
+        return {
+            ...mergeProfiles(defaultProfile, activeProfile),
+            network: effectiveManifestNetwork(manifest, activeProfileName, { path: `manifest(${agentName})` }),
+        };
     } catch (err) {
         debugLog(`getProfileConfig: ${err.message}`);
         // Re-throw missing profile errors so they bubble up
-        if (err.message.includes('missing required')) {
+        if (err.message.includes('missing required') || err.code === 'PLOINKY_NETWORK_CONTRACT_INVALID') {
             throw err;
         }
         return null;

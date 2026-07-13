@@ -139,7 +139,7 @@
     "data": "/app/data"               // hostRelPath: containerPath
   },
   "volumeOptions": {                  // Per-volume permissions
-    "data": { "chmod": "0755" }
+    "/app/data": { "chmod": 493, "readOnly": true }
   },
 
   // Directives
@@ -227,7 +227,7 @@
                             <tr>
                                 <td><code>volumeOptions</code></td>
                                 <td>No</td>
-                                <td>Per-volume chmod/permissions. Keys match the <code>volumes</code> keys; values are objects with options such as <code>{ "chmod": "0755" }</code>.</td>
+                                <td>Per-volume behavior keyed by container destination. Numeric <code>chmod</code> applies to the host path; <code>readOnly: true</code> is enforced by Docker, Podman, bwrap, and Seatbelt.</td>
                             </tr>
                             <tr>
                                 <td><code>start</code></td>
@@ -300,6 +300,15 @@
     "name": "AGENT_ENCRYPTION_KEY",
     "required": true,
     "generatedSecret": true
+  }
+]</code></pre>
+                        <h5>4. Host-hook-only Values</h5>
+                        <p>An object-form entry may set <code>runtime: false</code>. Ploinky resolves and validates the value for host lifecycle hooks, startup config providers, image templating, and restart hashing, but omits the value and its provenance marker from container metadata and sandbox process environments. The exclusion dominates a duplicate <code>expose</code> entry with the same name, so <code>expose</code> cannot reintroduce the value at runtime. This is intended for a host hook that materializes a generated, read-only runtime input.</p>
+                        <pre><code>"env": [
+  {
+    "name": "CONFIG_GENERATION_SECRET",
+    "sharedGeneratedSecret": true,
+    "runtime": false
   }
 ]</code></pre>
                     </div>

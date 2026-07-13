@@ -5,8 +5,16 @@ import {
     parseExplicitPublishSpec,
     parseManifestOpenPortSpec,
 } from './publish-spec.mjs';
+import crypto from 'node:crypto';
 
 export const DEFAULT_BOX_ROUTER_PORT = 8080;
+
+export function implicitAgentServerBoxPort(instanceKey) {
+    const key = String(instanceKey || '').trim();
+    if (!key) throw new Error('implicit AgentServer mapping requires an effective instance key');
+    const value = crypto.createHash('sha256').update(key).digest().readUInt32BE(0);
+    return 20000 + (value % 40000);
+}
 
 /**
  * Validate and turn authoritative, already-resolved graph nodes into outer-box
@@ -54,11 +62,38 @@ export function planBoxPublishes({
 export function collectManifestClaims(nodes = []) {
     const claims = [];
     for (const node of nodes) {
+        const networkMode = String(node?.networkMode || node?.network?.mode || 'default').trim();
+        if (!['default', 'bridge', 'host', 'none'].includes(networkMode)) {
+            throw new Error(`agent ${node?.agentRef || node?.id || '<unknown>'} has unsupported network mode '${networkMode}'`);
+        }
         const openPorts = normalizeOpenPorts(node?.openPorts, node?.agentRef || node?.id || '<unknown>');
-        for (const raw of openPorts) {
-            const parsed = parseManifestOpenPortSpec(raw);
+        const parsedOpenPorts = openPorts.map((raw) => parseManifestOpenPortSpec(raw));
+        if (networkMode === 'none' && parsedOpenPorts.length) {
+            throw new Error(`agent ${node?.agentRef || node?.id || '<unknown>'} uses network mode 'none' and cannot declare openPorts`);
+        }
+        const declarations = [...parsedOpenPorts];
+        const private7000Mapped = parsedOpenPorts.some((parsed) => (
+            parsed.protocol === 'tcp'
+            && parsed.privateContainer.start <= 7000
+            && parsed.privateContainer.end >= 7000
+        ));
+        if (node?.implicitAgentServer === true && ['default', 'bridge'].includes(networkMode) && !private7000Mapped) {
+            const port = Number(node.implicitAgentServerPort || implicitAgentServerBoxPort(
+                node?.instanceKey || node?.id || node?.agentRef,
+            ));
+            declarations.push(parseManifestOpenPortSpec(`127.0.0.1:${port}:7000`));
+        }
+        for (const parsed of declarations) {
+            const physicalHost = { ...parsed.boxSide };
+            const boxSide = networkMode === 'host'
+                ? { ...parsed.privateContainer }
+                : { ...parsed.boxSide };
             const claim = {
                 ...parsed,
+                networkMode,
+                physicalHost,
+                boxSide,
+                target: `${formatPortRange(boxSide)}/${parsed.protocol}`,
                 ownerRef: String(node?.agentRef || node?.ref || '').trim(),
                 profile: String(node?.profile || 'default').trim().toLowerCase() || 'default',
                 alias: String(node?.alias || '').trim(),
@@ -69,14 +104,19 @@ export function collectManifestClaims(nodes = []) {
             };
             let duplicate = false;
             for (const existing of claims) {
-                if (existing.protocol !== claim.protocol || !intervalsOverlap(existing.boxSide, claim.boxSide)) {
-                    continue;
-                }
-                if (existing.nodeKey === claim.nodeKey && manifestClaimsEqual(existing, claim)) {
+                if (existing.protocol !== claim.protocol) continue;
+                const boxOverlap = intervalsOverlap(existing.boxSide, claim.boxSide);
+                const physicalOverlap = intervalsOverlap(existing.physicalHost, claim.physicalHost);
+                if (!boxOverlap && !physicalOverlap) continue;
+                if (existing.nodeKey === claim.nodeKey
+                    && manifestClaimsEqual(existing, claim)
+                    && existing.networkMode === claim.networkMode
+                    && existing.physicalHost.start === claim.physicalHost.start
+                    && existing.physicalHost.end === claim.physicalHost.end) {
                     duplicate = true;
                     break;
                 }
-                throw new Error(formatClaimConflict(existing, claim));
+                throw new Error(formatClaimConflict(existing, claim, boxOverlap ? 'box-namespace' : 'physical-host'));
             }
             if (!duplicate) claims.push(claim);
         }
@@ -173,20 +213,28 @@ function assertRouterSocketAvailable(claims, routerPort) {
 }
 
 function formatGeneratedPublish(claim, interval) {
-    const range = formatPortRange(interval);
+    const targetRange = formatPortRange(interval);
+    const offset = interval.start - claim.boxSide.start;
+    const physical = {
+        start: claim.physicalHost.start + offset,
+        end: claim.physicalHost.start + offset + (interval.end - interval.start),
+    };
+    const physicalRange = formatPortRange(physical);
     const suffix = claim.protocol === 'tcp' ? '' : `/${claim.protocol}`;
-    return `${claim.hostIp}:${range}:${range}${suffix}`;
+    return `${claim.hostIp}:${physicalRange}:${targetRange}${suffix}`;
 }
 
-function formatClaimConflict(existing, claim) {
-    const overlapStart = Math.max(existing.boxSide.start, claim.boxSide.start);
-    const overlapEnd = Math.min(existing.boxSide.end, claim.boxSide.end);
+function formatClaimConflict(existing, claim, scope = 'box-namespace') {
+    const left = scope === 'physical-host' ? existing.physicalHost : existing.boxSide;
+    const right = scope === 'physical-host' ? claim.physicalHost : claim.boxSide;
+    const overlapStart = Math.max(left.start, right.start);
+    const overlapEnd = Math.min(left.end, right.end);
     const overlap = formatPortRange({ start: overlapStart, end: overlapEnd });
-    return `overlapping openPorts box-side socket ${overlap}/${claim.protocol}: ${describeClaim(existing)} conflicts with ${describeClaim(claim)}`;
+    return `overlapping openPorts ${scope} socket ${overlap}/${claim.protocol}: ${describeClaim(existing)} conflicts with ${describeClaim(claim)}`;
 }
 
 function describeClaim(claim) {
     const identity = claim.alias ? `alias ${claim.alias}` : 'canonical instance';
     const path = claim.path?.length ? `, path ${claim.path.join(' -> ')}` : '';
-    return `${claim.ownerRef} (profile ${claim.profile}, ${identity}${path}, ${claim.bindClass} bind ${claim.hostIp || '(engine default)'}) declares '${claim.raw}' (box ${formatPortRange(claim.boxSide)} -> private ${formatPortRange(claim.privateContainer)})`;
+    return `${claim.ownerRef} (profile ${claim.profile}, ${identity}${path}, network ${claim.networkMode}, ${claim.bindClass} bind ${claim.hostIp || '(engine default)'}) declares '${claim.raw}' (physical ${formatPortRange(claim.physicalHost)} -> box ${formatPortRange(claim.boxSide)} -> private ${formatPortRange(claim.privateContainer)})`;
 }

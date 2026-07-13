@@ -98,7 +98,7 @@ Outer options (must precede the command):
   --port N          Host port for the router (default 8080)
   --publish SPEC    Extra host-to-runtime publish; repeatable, same form as -p
   --expose SPEC     Alias for --publish; repeatable
-  --image I         Contract-2 runtime image (default ${DEFAULT_IMAGE})
+  --image I         Contract-3 runtime image (default ${DEFAULT_IMAGE})
   --mount DIR       Bind DIR read-write at /workspace/mounted
   --listen-lan      Publish the router on 0.0.0.0 instead of 127.0.0.1
   --dry-run         Print mutations instead of executing them
@@ -595,6 +595,88 @@ function resultFailure(result) {
     ).trim();
 }
 
+export function assertRootlessPodmanEngine(engine) {
+    if (!engine || engine.name !== 'podman') {
+        throw new SupervisorError('Ploinky runtime contract 3 requires rootless Podman; Docker and rootful Podman are unsupported');
+    }
+    const result = engine.query(['info', '--format', '{{json .Host.Security.Rootless}}']);
+    if (!result.ok || String(result.stdout || '').trim() !== 'true') {
+        throw new SupervisorError('Ploinky runtime contract 3 could not prove that the selected Podman engine is rootless');
+    }
+}
+
+function parseIdMap(raw, kind) {
+    const records = String(raw || '').trim().split(/\n+/).filter(Boolean).map((line) => {
+        const fields = line.trim().split(/\s+/).map(Number);
+        if (fields.length !== 3 || fields.some((value) => !Number.isSafeInteger(value) || value < 0) || fields[2] < 1) {
+            throw new SupervisorError(`nested Podman returned a malformed ${kind}_map line: '${line}'`);
+        }
+        return { inside: fields[0], outside: fields[1], length: fields[2] };
+    }).sort((a, b) => a.inside - b.inside);
+    if (records.length === 0) throw new SupervisorError(`nested Podman returned an empty ${kind}_map`);
+    return records;
+}
+
+function validateNestedIdMap(raw, kind) {
+    const records = parseIdMap(raw, kind);
+    const root = records[0];
+    if (root.inside !== 0 || root.length !== 1) {
+        throw new SupervisorError(`nested Podman ${kind}_map must map container ${kind.toUpperCase()} 0 as one distinct identity`);
+    }
+    let cursor = 1;
+    for (const record of records.slice(1)) {
+        if (record.inside !== cursor) {
+            throw new SupervisorError(`nested Podman ${kind}_map is not contiguous at container ${kind.toUpperCase()} ${cursor}`);
+        }
+        cursor += record.length;
+    }
+    const byOutside = [...records].sort((left, right) => left.outside - right.outside);
+    for (let index = 1; index < byOutside.length; index += 1) {
+        const previous = byOutside[index - 1];
+        if (previous.outside + previous.length > byOutside[index].outside) {
+            throw new SupervisorError(`nested Podman ${kind}_map maps distinct container identities onto overlapping host identities`);
+        }
+    }
+    if (cursor !== 65535) {
+        throw new SupervisorError(`nested Podman ${kind}_map must expose exactly 65534 subordinate IDs; observed ${Math.max(0, cursor - 1)}`);
+    }
+    return records;
+}
+
+export function validateNestedUidMap(raw) {
+    return validateNestedIdMap(raw, 'uid');
+}
+
+export function validateNestedGidMap(raw) {
+    return validateNestedIdMap(raw, 'gid');
+}
+
+export function verifyNestedRootlessRuntime(cfg) {
+    if (cfg.dryRun) return true;
+    const instance = instanceName(cfg);
+    const rootless = query(cfg, [
+        'exec', instance, 'podman', 'info', '--format', '{{json .Host.Security.Rootless}}',
+    ]);
+    if (!rootless.ok || String(rootless.stdout || '').trim() !== 'true') {
+        die(`runtime '${instance}' failed nested rootless Podman verification`);
+    }
+    const uidMap = query(cfg, [
+        'exec', instance, 'podman', 'unshare', 'cat', '/proc/self/uid_map',
+    ]);
+    if (!uidMap.ok) {
+        die(`runtime '${instance}' could not read the nested Podman uid_map: ${resultFailure(uidMap)}`);
+    }
+    validateNestedUidMap(uidMap.stdout);
+    const gidMap = query(cfg, [
+        'exec', instance, 'podman', 'unshare', 'cat', '/proc/self/gid_map',
+    ]);
+    if (!gidMap.ok) {
+        die(`runtime '${instance}' could not read the nested Podman gid_map: ${resultFailure(gidMap)}`);
+    }
+    validateNestedGidMap(gidMap.stdout);
+    return true;
+}
+
 function probeEngine(client, instance) {
     const health = client.query(['info']);
     if (!health.ok) {
@@ -946,7 +1028,7 @@ export function publicationContractForPlan(plan = {}) {
             protocol: parsed.protocol,
         };
     });
-    return { schemaVersion: 1, targets, publishes: rawPublishes };
+    return { schemaVersion: 2, targets, publishes: rawPublishes };
 }
 
 function rawPublishList(values, field) {
@@ -994,7 +1076,9 @@ function parseProvenanceList(existing, label) {
 
 function publicationProvenance(existing) {
     if (!existing) return { explicitPublishes: [], generatedPublishes: [] };
-    if (existing.labels?.[PUBLISH_PLAN_VERSION_LABEL] !== REQUIRED_PUBLISH_PLAN_VERSION) {
+    const observedVersion = existing.labels?.[PUBLISH_PLAN_VERSION_LABEL];
+    const supportedLegacy = existing.contract === '2' && observedVersion === '1';
+    if (observedVersion !== REQUIRED_PUBLISH_PLAN_VERSION && !supportedLegacy) {
         die(`runtime '${existing.instance}' is unsupported: ${PUBLISH_PLAN_VERSION_LABEL} is missing or mismatched; run ploinky destroy explicitly`);
     }
     return {
@@ -1011,7 +1095,7 @@ function selectedExplicitPublishes(invocation, existing) {
 }
 
 export function applyAuthoritativePublicationPlan(invocation, plan = {}) {
-    if (!plan || Number(plan.schemaVersion) !== 1) {
+    if (!plan || Number(plan.schemaVersion) !== 2) {
         die('publication planner returned an unsupported or missing schemaVersion');
     }
     const explicitPublishes = rawPublishList(plan.explicitPublishes, 'explicitPublishes');
@@ -1177,7 +1261,7 @@ async function executePublicationPlanner(cfg, request, existing) {
     if (cfg.dryRun) {
         output(cfg, `DRY-RUN: publication planner request ${JSON.stringify(request)}\n`);
         return {
-            schemaVersion: 1,
+            schemaVersion: 2,
             operation: request.operation,
             explicitPublishes: request.explicitPublishes || [],
             generatedPublishes: [],
@@ -1219,7 +1303,7 @@ function plannerRequestForHostCommand(cfg, command, args, existing) {
         && existing
     ) {
         request = {
-            schemaVersion: 1,
+            schemaVersion: 2,
             operation: 'start',
             routerPort: 8080,
             includeEnabled: true,
@@ -1239,7 +1323,7 @@ function applyRetainedPublicationState(cfg, existing) {
     const explicitPublishes = selectedExplicitPublishes(cfg, existing);
     const generatedPublishes = provenance.generatedPublishes;
     applyAuthoritativePublicationPlan(cfg, {
-        schemaVersion: 1,
+        schemaVersion: 2,
         operation: 'retained',
         explicitPublishes,
         generatedPublishes,
@@ -1305,8 +1389,14 @@ function validateExistingRuntime(cfg, existing) {
     if (!image) {
         die(`runtime '${existing.instance}' is unsupported: its deployed image '${imageRef || '<missing>'}' cannot be inspected; run ploinky destroy explicitly`);
     }
+    const upgradeableContract2 = image.contract === '2';
     try {
-        validateImageContract(image, imageRef);
+        validateImageContract(
+            upgradeableContract2
+                ? { ...image, contract: REQUIRED_RUNTIME_CONTRACT }
+                : image,
+            imageRef,
+        );
     } catch (error) {
         die(`runtime '${existing.instance}' is unsupported: ${error.message}; run ploinky destroy explicitly`);
     }
@@ -1322,8 +1412,8 @@ function validateExistingRuntime(cfg, existing) {
     if (!existing.requestedImage) {
         die(`runtime '${existing.instance}' is unsupported: ${REQUESTED_IMAGE_LABEL} is missing; run ploinky destroy explicitly`);
     }
-    existing.publicationProvenance = publicationProvenance(existing);
     existing.contract = image.contract;
+    existing.publicationProvenance = publicationProvenance(existing);
     return image;
 }
 
@@ -1504,6 +1594,9 @@ function askLine(promptText) {
 export async function reconcileRuntime(cfg, { fatalOnDepsDecline = false } = {}) {
     validateHostPort(cfg.port, `${cfg.command || 'runtime'}: host port`);
     validatePublishSpecs(cfg);
+    // Persist the engine's SELinux requirement in desired state so a container
+    // created with label=disable converges instead of being replaced forever.
+    cfg._selinuxEnabled = engineSelinuxEnabled(cfg);
     const existing = inspectExistingRuntimeConfig(cfg);
     if (existing) validateExistingRuntime(cfg, existing);
     if (!existing || cfg.explicit.has('--mount')) prepareMount(cfg);
@@ -1531,12 +1624,14 @@ export async function reconcileRuntime(cfg, { fatalOnDepsDecline = false } = {})
     switch (plan.action) {
     case 'reuse':
         await waitHealthy(cfg, 'reuse');
+        verifyNestedRootlessRuntime(cfg);
         fixDepsOwnership(cfg);
         await requireDependencies();
         return existing;
     case 'start':
         runEngine(cfg, ['start', desired.instance], { silence: 'stdout' });
         await waitHealthy(cfg, 'start');
+        verifyNestedRootlessRuntime(cfg);
         fixDepsOwnership(cfg);
         await requireDependencies();
         return running();
@@ -1557,9 +1652,10 @@ export async function reconcileRuntime(cfg, { fatalOnDepsDecline = false } = {})
         try {
             runEngine(cfg, buildRuntimeRunArgs(desired, {
                 engine: cfg.engine,
-                selinux: engineSelinuxEnabled(cfg),
+                selinux: cfg._selinuxEnabled,
             }));
             await waitHealthy(cfg, 'create');
+            verifyNestedRootlessRuntime(cfg);
             fixDepsOwnership(cfg);
             await requireDependencies();
             return running();
@@ -1616,7 +1712,6 @@ export async function replaceRuntimeTransaction({
     fatalOnDepsDecline = false,
 }) {
     const previous = structuredClone(existing);
-    const previousImageId = existing.imageId;
     const image = obtainAndValidateImage(cfg, desired.image, { forcePull: true });
     if (image) {
         desired.imageId = image.id;
@@ -1625,8 +1720,13 @@ export async function replaceRuntimeTransaction({
     ensureRuntimeVolumes(cfg);
     const engineOptions = {
         engine: cfg.engine,
-        selinux: engineSelinuxEnabled(cfg),
+        selinux: cfg._selinuxEnabled,
     };
+    const backupName = `${existing.instance}-rollback-${crypto.randomBytes(6).toString('hex')}`;
+    if (namedRuntimePresence(cfg, backupName)) {
+        throw new SupervisorError(`runtime replacement backup name collision: '${backupName}'`);
+    }
+    let backupCreated = false;
 
     try {
         if (existing.running) {
@@ -1655,13 +1755,19 @@ export async function replaceRuntimeTransaction({
             }
             runEngine(cfg, ['stop', existing.instance], { silence: 'all' });
         }
-        runEngine(cfg, ['rm', existing.instance], { silence: 'all' });
+        // Preserve the inspected container byte-for-byte. Contract-2 may be
+        // privileged and cannot be reconstructed by the contract-3 run-arg
+        // builder; renaming gives rollback the original object instead.
+        runEngine(cfg, ['rename', existing.instance, backupName], { silence: 'all' });
+        backupCreated = true;
         runEngine(cfg, buildRuntimeRunArgs(desired, engineOptions));
         await waitHealthy(cfg, 'replacement');
+        verifyNestedRootlessRuntime(cfg);
         fixDepsOwnership(cfg);
         if (!await ensureDepsInstalled(cfg, { fatalOnDecline: fatalOnDepsDecline })) {
             throw new SupervisorError('Ploinky dependencies are required before running this command');
         }
+        runEngine(cfg, ['rm', '-f', '--volumes', backupName], { silence: 'all' });
         return { ...desired, state: 'running', running: true };
     } catch (replacementError) {
         const aggregateFailure = rollbackError => new AggregateError(
@@ -1670,22 +1776,18 @@ export async function replaceRuntimeTransaction({
             + `replacement phase: ${replacementError.message || replacementError}; `
             + `rollback phase: ${rollbackError.message || rollbackError}`,
         );
-        try {
-            removeNamedRuntimeForCleanup(cfg, desired.instance);
-        } catch (cleanupError) {
-            throw aggregateFailure(cleanupError);
+        if (!backupCreated) {
+            if (previous.running) {
+                try { runEngine(cfg, ['start', previous.instance], { silence: 'all' }); } catch (_) {}
+            }
+            throw replacementError;
         }
+        try { removeNamedRuntimeForCleanup(cfg, desired.instance); } catch (cleanupError) { throw aggregateFailure(cleanupError); }
         try {
-            const rollback = {
-                ...previous,
-                imageId: previousImageId,
-                image: previous.requestedImage,
-                requestedImage: previous.requestedImage,
-            };
-            runEngine(cfg, buildRuntimeRunArgs(rollback, engineOptions));
-            await waitHealthy(cfg, 'rollback');
-            if (!previous.running) {
-                runEngine(cfg, ['stop', rollback.instance], { silence: 'all' });
+            runEngine(cfg, ['rename', backupName, previous.instance], { silence: 'all' });
+            if (previous.running) {
+                runEngine(cfg, ['start', previous.instance], { silence: 'all' });
+                await waitHealthy(cfg, 'rollback');
             }
         } catch (rollbackError) {
             throw aggregateFailure(rollbackError);
@@ -2153,6 +2255,10 @@ export function createRuntimeSupervisor(dependencies = {}) {
                         askLine: deps.askLine,
                     });
                 }
+                // Read-only lifecycle commands retain access to legacy boxes,
+                // but every start/reconcile path proves rootless Podman before
+                // publication planning, pulls, volume creation, or replacement.
+                assertRootlessPodmanEngine(context.client);
                 if (route.kind === 'start') return startGraph(invocation);
 
                 if (route.kind === 'ordinary') {

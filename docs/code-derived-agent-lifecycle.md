@@ -269,6 +269,7 @@ Ploinky does not load a central manifest schema in the observed paths. Individua
 | `profiles.<name>.hosthook_postinstall` | No | Host hook run after postinstall. |
 | `openPorts` at top level | Effectively no | The observed `parseManifestPorts` implementation reads only profile config, not top-level `manifest.openPorts`. |
 | `env` | No | Manifest env specs. Resolution order in `secretVars.js` is encrypted secrets, `process.env`, `.env`, then default. Profile `env` replaces top-level `env`. |
+| `env[].runtime` or `env.<name>.runtime` | No | Boolean, default `true`. When `false`, host lifecycle/config-provider/image-resolution paths still receive the resolved entry, while container OCI metadata and bwrap/Seatbelt process environments omit the value and its `PLOINKY_ENV_SOURCE_*` marker. |
 | `expose` | No | Adds explicit env values or refs. The `expose` CLI command edits this field in the source manifest. |
 | `repos` | No | Object processed by `applyManifestDirectives` during `start`. Values may be URL strings or objects with `url` and `branch`. Repos are ensured and enabled before dependency enable processing. |
 | `enable` | No | Top-level and profile-level enable arrays are processed during `start` and dependency graph building. The managed-runtime publish planner applies the workspace profile when present and falls back to a child's `profiles.default` when absent. String specs can include `as <alias>` and `no-wait`; object specs can include `agent/ref/spec/name`, `alias/as`, `profile`, and `noWait`/`no-wait`. An explicit edge-local profile must exist on the child. |
@@ -702,6 +703,8 @@ When a configured volume host path does not exist:
 
 Numeric `chmod` is applied best-effort. `makeWorldWritableSubdirs` creates/chmods listed subdirectories.
 
+`volumeOptions.<containerPath>.readOnly: true` is enforced across backends: Podman uses `:z,ro`, Docker uses `:ro`, bwrap uses `--ro-bind`, and Seatbelt excludes the host path from write grants.
+
 `runtime.resources.persistentStorage` is separate from `manifest.volumes`. It creates a per-resource host directory and mounts it to the configured `containerPath`; env templates can refer to the storage paths.
 
 ## Environment and Secrets
@@ -713,6 +716,8 @@ Ploinky builds runtime env from several sources:
 3. Ploinky runtime vars such as `PLOINKY_MCP_CONFIG_PATH`, `AGENT_NAME`, `WORKSPACE_PATH`, and `PLOINKY_WORKSPACE_ROOT`.
 4. Runtime resource env.
 5. Profile vars: `PLOINKY_PROFILE`, `PLOINKY_PROFILE_ENV`, `PLOINKY_AGENT_NAME`, `PLOINKY_REPO_NAME`, `PLOINKY_CWD`, `PLOINKY_CONTAINER_NAME`, and `PLOINKY_CONTAINER_ID`.
+
+An env object with `runtime: false` participates in host hook resolution and env hashing but is removed before these runtime maps or flags are constructed. The corresponding provenance marker is removed with it, and a same-named `expose` declaration cannot add the value back to a runtime map. Startup config providers run after repository-only manifest preparation and before manifest enable directives may launch dependent agents, so provider output is present on each dependency's first runtime env construction.
 6. Profile secrets.
 7. Router vars: `PLOINKY_ROUTER_PORT`, `PLOINKY_ROUTER_HOST`, and `PLOINKY_ROUTER_URL`.
 8. Optional SSO client credentials.

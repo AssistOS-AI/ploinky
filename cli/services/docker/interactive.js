@@ -195,7 +195,10 @@ function runCommandInContainer(agentName, repoName, manifest, command, interacti
             }
         }
 
-        const declaredEnvNames = [...getManifestEnvNames(manifest), ...getExposedNames(manifest)];
+        const declaredEnvNames = [
+            ...getManifestEnvNames(manifest, null, { forRuntime: true }),
+            ...getExposedNames(manifest, null, { forRuntime: true })
+        ];
         agents[containerName] = {
             agentName,
             repoName,
@@ -397,7 +400,10 @@ function ensureAgentContainer(agentName, repoName, manifest) {
                 throw error;
             }
         }
-        const declaredEnvNamesX = [...getManifestEnvNames(manifest), ...getExposedNames(manifest)];
+        const declaredEnvNamesX = [
+            ...getManifestEnvNames(manifest, null, { forRuntime: true }),
+            ...getExposedNames(manifest, null, { forRuntime: true })
+        ];
         agents[containerName] = {
             agentName,
             repoName,

@@ -8,7 +8,7 @@ export const REQUIRED_RUNTIME_IMAGE =
     'docker.io/assistos/ploinky-box:runtime';
 export const RUNTIME_CONTRACT_LABEL =
     'io.assistos.ploinky.runtime-contract';
-export const REQUIRED_RUNTIME_CONTRACT = '2';
+export const REQUIRED_RUNTIME_CONTRACT = '3';
 export const REQUESTED_IMAGE_LABEL =
     'io.assistos.ploinky.requested-image';
 export const IDENTITY_SCHEMA_LABEL =
@@ -24,7 +24,7 @@ export const GENERATED_PUBLISHES_LABEL =
 export const EXPLICIT_PUBLISHES_LABEL =
     'io.assistos.ploinky.explicit-publishes';
 export const IDENTITY_SCHEMA_VERSION = '1';
-export const REQUIRED_PUBLISH_PLAN_VERSION = '1';
+export const REQUIRED_PUBLISH_PLAN_VERSION = '2';
 
 export const REQUIRED_IMAGE_USER = 'podman';
 export const REQUIRED_IMAGE_WORKDIR = '/workspace';
@@ -265,6 +265,7 @@ export function normalizeContainerInspect(engine, raw) {
             containerPath: device.PathInContainer,
             permissions: device.CgroupPermissions || 'rwm',
         })),
+        capAdds: [...(value.HostConfig.CapAdd || [])],
         securityOpts: [...(value.HostConfig.SecurityOpt || [])],
         env: envMap(value.Config.Env || []),
         // Preserve the complete inspected label set. Reconciliation changes
@@ -555,7 +556,7 @@ export function createDefaultRuntimeConfig(invocation) {
         state: '',
         running: false,
         user: 'podman',
-        privileged: true,
+        privileged: false,
         sourceDir,
         mountDir,
         binds: [
@@ -582,7 +583,8 @@ export function createDefaultRuntimeConfig(invocation) {
                 permissions: 'rwm',
             },
         ],
-        securityOpts: ['seccomp=unconfined'],
+        capAdds: [],
+        securityOpts: ['unmask=ALL'],
         env: {
             PLOINKY_RUNTIME_NAME: instance,
         },
@@ -604,6 +606,20 @@ export function mergeDesiredRuntimeConfig(
         : existing?.requestedImage || existing?.image || REQUIRED_RUNTIME_IMAGE;
     desired.image = selectedImage;
     desired.requestedImage = selectedImage;
+    // Contract 3 is a clean security boundary. Never inherit the privileged
+    // or broad seccomp settings from a contract-2 container during replace.
+    desired.contract = REQUIRED_RUNTIME_CONTRACT;
+    desired.user = REQUIRED_IMAGE_USER;
+    desired.privileged = false;
+    desired.devices = [
+        { hostPath: '/dev/fuse', containerPath: '/dev/fuse', permissions: 'rwm' },
+        { hostPath: '/dev/net/tun', containerPath: '/dev/net/tun', permissions: 'rwm' },
+    ];
+    desired.capAdds = [];
+    desired.securityOpts = [
+        'unmask=ALL',
+        ...(invocation._selinuxEnabled ? ['label=disable'] : []),
+    ];
     desired.labels ||= {};
     desired.labels[REQUESTED_IMAGE_LABEL] = selectedImage;
     desired.labels[IDENTITY_SCHEMA_LABEL] = IDENTITY_SCHEMA_VERSION;
@@ -666,7 +682,7 @@ export function diffRuntimeConfig(actual, desired) {
     const fields = [
         'instance', 'image', 'user', 'privileged', 'sourceDir', 'mountDir',
         'binds', 'volumes', 'routerPublish', 'extraPublishes', 'devices',
-        'securityOpts', 'env', 'labels',
+        'capAdds', 'securityOpts', 'env', 'labels',
     ];
     return fields.filter(field => {
         if (field === 'extraPublishes') {
@@ -686,8 +702,13 @@ export function planReconciliation({ existing, desired, contractMatches }) {
 }
 
 export function buildRuntimeRunArgs(config, engineOptions = {}) {
+    if (config.privileged) {
+        throw new Error('runtime contract 3 forbids privileged outer containers');
+    }
+    if ((config.capAdds || []).length > 0) {
+        throw new Error('runtime contract 3 forbids added outer-container capabilities');
+    }
     const args = ['run', '-d', '--init', '--name', config.instance];
-    if (config.privileged) args.push('--privileged');
     if (config.user) args.push('--user', config.user);
     for (const [key, value] of Object.entries(config.labels || {})) {
         args.push('--label', `${key}=${value}`);
