@@ -506,6 +506,12 @@ test('gateway adoption proves exact permissions and readiness without mutating a
         networkName: physicalName,
         labels: gatewayLabels,
     });
+    gateway.HostConfig.CapDrop = [
+        'CAP_CHOWN', 'CAP_DAC_OVERRIDE', 'CAP_FOWNER', 'CAP_FSETID', 'CAP_KILL',
+        'CAP_NET_BIND_SERVICE', 'CAP_SETFCAP', 'CAP_SETGID', 'CAP_SETPCAP',
+        'CAP_SETUID', 'CAP_SYS_CHROOT',
+    ];
+    gateway.HostConfig.Tmpfs['/tmp'] += ',rprivate,tmpcopyup';
     gateway.Id = 'abcdef1234567890';
     gateway.NetworkSettings.Networks[physicalName].Aliases.push(gateway.Id.slice(0, 12));
     const mutations = [];
@@ -554,6 +560,10 @@ test('gateway adoption proves exact permissions and readiness without mutating a
     gateway.Config.Image = 'example.invalid/gateway@sha256:different';
     assert.throws(() => adapter.ensureGateway([{ name: physicalName, logicalName, primary: true }]), /unexpected image/);
     gateway.Config.Image = 'example.invalid/gateway@sha256:exact';
+
+    const removedCapability = gateway.HostConfig.CapDrop.pop();
+    assert.throws(() => adapter.ensureGateway([{ name: physicalName, logicalName, primary: true }]), /exact CapDrop=ALL/);
+    gateway.HostConfig.CapDrop.push(removedCapability);
 
     gatewayLabels['unexpected.extra'] = 'rejected';
     assert.throws(() => adapter.ensureGateway([{ name: physicalName, logicalName, primary: true }]), /exact label keys/);

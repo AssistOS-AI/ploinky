@@ -22,6 +22,20 @@ export const NETWORK_LABELS = Object.freeze({
 export const NETWORK_GATEWAY_IMAGE = 'docker.io/assistos/ploinky-network-gateway:1@sha256:68c47ce93d16ea1a2d03944f7b50ce82e6f2f9a26b183d2c9c7fbabcc828fb7e';
 export const NETWORK_GATEWAY_IMAGE_REF = NETWORK_GATEWAY_IMAGE;
 
+const PODMAN_DEFAULT_CAPABILITIES = Object.freeze([
+    'CHOWN',
+    'DAC_OVERRIDE',
+    'FOWNER',
+    'FSETID',
+    'KILL',
+    'NET_BIND_SERVICE',
+    'SETFCAP',
+    'SETGID',
+    'SETPCAP',
+    'SETUID',
+    'SYS_CHROOT',
+].sort());
+
 const LOCK_PATH = path.join(PLOINKY_DIR, 'run', 'network.lock');
 const LOCK_REAPER_SUFFIX = '.reaper';
 export const NETWORK_LOCK_STALE_GRACE_MS = 5_000;
@@ -88,6 +102,14 @@ function canonicalDigestReference(reference) {
     const tagSeparator = name.lastIndexOf(':');
     const untaggedName = tagSeparator > lastSlash ? name.slice(0, tagSeparator) : name;
     return `${untaggedName}${value.slice(digestSeparator)}`;
+}
+
+function representsAllCapabilitiesDropped(values) {
+    const normalized = (values || [])
+        .map((value) => String(value).toUpperCase().replace(/^CAP_/, ''))
+        .sort();
+    return (normalized.length === 1 && normalized[0] === 'ALL')
+        || JSON.stringify(normalized) === JSON.stringify(PODMAN_DEFAULT_CAPABILITIES);
 }
 
 function exactRuntimeAliases(record, explicitAlias) {
@@ -396,8 +418,9 @@ export function createNetworkLifecycleAdapter({
         if (gateway.HostConfig?.ReadonlyRootfs !== true) {
             throw new Error(`router gateway '${name}' is unsupported: read-only root filesystem is required`);
         }
-        const capDrop = (gateway.HostConfig?.CapDrop || []).map((value) => String(value).toUpperCase());
-        if (capDrop.length !== 1 || capDrop[0] !== 'ALL') throw new Error(`router gateway '${name}' is unsupported: exact CapDrop=ALL is required`);
+        if (!representsAllCapabilitiesDropped(gateway.HostConfig?.CapDrop)) {
+            throw new Error(`router gateway '${name}' is unsupported: exact CapDrop=ALL is required`);
+        }
         if ((gateway.HostConfig?.CapAdd || []).length > 0) {
             throw new Error(`router gateway '${name}' is unsupported: added capabilities are forbidden`);
         }
@@ -419,8 +442,10 @@ export function createNetworkLifecycleAdapter({
         const tmpfsValue = String(configuredTmpfs['/tmp'] || '');
         const observedTmpfsOptions = tmpfsValue.split(',').filter(Boolean).sort();
         const expectedTmpfsOptions = ['rw', 'noexec', 'nosuid', 'nodev', 'mode=1777'].sort();
+        const normalizedPodmanTmpfsOptions = [...expectedTmpfsOptions, 'rprivate', 'tmpcopyup'].sort();
         const exactTmpfs = Object.keys(configuredTmpfs).length === 1
-            && JSON.stringify(observedTmpfsOptions) === JSON.stringify(expectedTmpfsOptions);
+            && [expectedTmpfsOptions, normalizedPodmanTmpfsOptions]
+                .some((expected) => JSON.stringify(observedTmpfsOptions) === JSON.stringify(expected));
         if (!exactTmpfs) throw new Error(`router gateway '${name}' is unsupported: exact private /tmp tmpfs is required`);
         const bindMounts = mounts.filter((mount) => mount?.Type !== 'tmpfs');
         if (bindMounts.length !== 1
