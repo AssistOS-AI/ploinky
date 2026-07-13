@@ -8,7 +8,7 @@ import {
     resolveWebchatWorkspaceBase,
     sanitizeSuggestionQuery,
     listWorkspaceSuggestions
-} from '../../cli/server/handlers/webchat.js';
+} from '../../cli/server/handlers/webchat/workspaceSuggestions.js';
 import {
     applyWorkspacePathSelectionToValue,
     createWorkspacePathsProvider

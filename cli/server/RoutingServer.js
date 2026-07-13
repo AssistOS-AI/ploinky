@@ -3,7 +3,7 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
-import { handleWebChat } from './handlers/webchat.js';
+import { handleWebChat } from './handlers/webchat/index.js';
 import { handleDashboard } from './handlers/dashboard.js';
 import { handleStatus } from './handlers/status.js';
 import { handleBlobs, handleWorkspaceUpload } from './handlers/blobs.js';

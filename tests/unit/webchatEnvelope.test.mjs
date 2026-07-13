@@ -3,14 +3,18 @@ import assert from 'node:assert/strict';
 import path from 'node:path';
 
 import {
-    flushPendingSseEvents,
     resolveWebchatLaunchOptions,
-    resolveRequestPublicOrigin,
     resolveWorkspaceScopedQueryPath,
+} from '../../cli/server/handlers/webchat/launchOptions.js';
+import {
+    resolveRequestPublicOrigin,
     serializeWebchatEnvelopeForAgent,
-    shouldForwardWebchatEnvelope,
+    shouldForwardWebchatEnvelope
+} from '../../cli/server/handlers/webchat/messageEnvelope.js';
+import {
+    flushPendingSseEvents,
     writeOrBufferSseEvent
-} from '../../cli/server/handlers/webchat.js';
+} from '../../cli/server/handlers/webchat/runtimeState.js';
 import {
     extractManifestWebchatOptions
 } from '../../cli/server/webchat/commandResolver.js';

@@ -381,9 +381,6 @@ function buildTerminalEnvArgs(env = process.env, historyName = '') {
 
 function buildWebchatEnvArgs(env = process.env) {
     const args = [];
-    const sessionId = String(env.PLOINKY_WEBCHAT_SESSION_ID || '').trim().toLowerCase();
-    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(sessionId)) return args;
-    args.push('-e', `PLOINKY_WEBCHAT_SESSION_ID=${sessionId}`);
     const hasHistory = String(env.PLOINKY_WEBCHAT_HAS_HISTORY || '').trim();
     if (hasHistory === '0' || hasHistory === '1') {
         args.push('-e', `PLOINKY_WEBCHAT_HAS_HISTORY=${hasHistory}`);

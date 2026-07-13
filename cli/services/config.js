@@ -87,11 +87,8 @@ export const GLOBAL_DEPS_PATH = path.join(path.dirname(new URL(import.meta.url).
 let DEBUG_MODE = process.env.PLOINKY_DEBUG === '1';
 
 export function shouldLogPloinkyDirectory(env = process.env) {
-    const sessionId = String(env.PLOINKY_WEBCHAT_SESSION_ID || '').trim();
     const hasHistory = String(env.PLOINKY_WEBCHAT_HAS_HISTORY || '').trim();
-    const hasValidWebchatSession = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(sessionId)
-        && (hasHistory === '0' || hasHistory === '1');
-    return !hasValidWebchatSession;
+    return hasHistory !== '0' && hasHistory !== '1';
 }
 
 export function logPloinkyDirectory() {

@@ -13,25 +13,28 @@ function makeSession(command, sessionContext = {}) {
     return factory.create({ username: 'guest', id: 'guest', roles: ['guest'] }, sessionContext);
 }
 
-const SESSION_ID = '12345678-1234-4123-8123-123456789abc';
-
-test('webchat child_process: session metadata is validated and exposed through env', async () => {
-    assert.deepEqual(buildWebchatSessionEnv({ sessionId: SESSION_ID, hasHistory: true }), {
-        PLOINKY_WEBCHAT_SESSION_ID: SESSION_ID,
+test('webchat child_process: history state is exposed through env', async () => {
+    assert.deepEqual(buildWebchatSessionEnv({ hasHistory: true }), {
         PLOINKY_WEBCHAT_HAS_HISTORY: '1'
     });
-    assert.deepEqual(buildWebchatSessionEnv({ sessionId: '../unsafe', hasHistory: true }), {});
+    assert.deepEqual(buildWebchatSessionEnv({ hasHistory: false }), {
+        PLOINKY_WEBCHAT_HAS_HISTORY: '0'
+    });
 
+    const previousUnrelatedValue = process.env.PLOINKY_WEBCHAT_UNRELATED;
+    process.env.PLOINKY_WEBCHAT_UNRELATED = 'must-not-be-forwarded';
     const session = makeSession(
-        `sh -c 'printf "%s|%s" "$PLOINKY_WEBCHAT_SESSION_ID" "$PLOINKY_WEBCHAT_HAS_HISTORY"'`,
-        { sessionId: SESSION_ID, hasHistory: true }
+        `sh -c 'printf "HISTORY=%s|UNRELATED=%s\\n" "$PLOINKY_WEBCHAT_HAS_HISTORY" "\${PLOINKY_WEBCHAT_UNRELATED:-unset}"'`,
+        { hasHistory: true }
     );
+    if (previousUnrelatedValue === undefined) delete process.env.PLOINKY_WEBCHAT_UNRELATED;
+    else process.env.PLOINKY_WEBCHAT_UNRELATED = previousUnrelatedValue;
     const chunks = [];
     await new Promise((resolve) => {
         session.onOutput((data) => chunks.push(data));
         session.onClose(resolve);
     });
-    assert.match(chunks.join(''), new RegExp(`${SESSION_ID}\\|1`));
+    assert.match(chunks.join(''), /^HISTORY=1\|UNRELATED=unset$/m);
 });
 
 test('webchat child_process: output is delivered as a string, not a Buffer', async () => {

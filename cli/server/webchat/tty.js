@@ -39,21 +39,17 @@ function shouldAppendIdentityArgs(command) {
     return !/^(?:\/bin\/)?(?:ba)?sh$/i.test(firstToken);
 }
 
-const WEBCHAT_SESSION_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
-
 function buildWebchatSessionEnv(sessionContext = {}) {
-    const sessionId = String(sessionContext?.sessionId || '').trim().toLowerCase();
-    if (!WEBCHAT_SESSION_ID_RE.test(sessionId)) return {};
     return {
-        PLOINKY_WEBCHAT_SESSION_ID: sessionId,
         PLOINKY_WEBCHAT_HAS_HISTORY: sessionContext?.hasHistory === true ? '1' : '0'
     };
 }
 
 function withWebchatSessionEnv(baseEnv, sessionContext) {
     const env = { ...baseEnv };
-    delete env.PLOINKY_WEBCHAT_SESSION_ID;
-    delete env.PLOINKY_WEBCHAT_HAS_HISTORY;
+    for (const key of Object.keys(env)) {
+        if (key.startsWith('PLOINKY_WEBCHAT_')) delete env[key];
+    }
     return Object.assign(env, buildWebchatSessionEnv(sessionContext));
 }
 

@@ -76,7 +76,6 @@ export function initDom() {
     const sessionDialogClose = document.getElementById('sessionDialogClose');
     const sessionList = document.getElementById('sessionList');
 
-    const requiresAuth = body.dataset.auth === 'true';
     const agentName = (body.dataset.agent || '').trim();
     const displayName = (body.dataset.title || '').trim();
     const basePath = (body.dataset.base || '').replace(/\/$/, '') || '';
@@ -220,7 +219,6 @@ export function initDom() {
         TAB_ID,
         dlog,
         markdown,
-        requiresAuth,
         basePath,
         agentName,
         displayName: appTitle,

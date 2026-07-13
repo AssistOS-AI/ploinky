@@ -6,12 +6,19 @@ import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 
 import { handleDashboard } from '../../cli/server/handlers/dashboard.js';
-import { handleWebChat } from '../../cli/server/handlers/webchat.js';
+import { handleWebChat } from '../../cli/server/handlers/webchat/index.js';
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 
 function source(relativePath) {
     return fs.readFileSync(path.join(projectRoot, relativePath), 'utf8');
+}
+
+function sourcesUnder(relativeDirectory) {
+    const absoluteDirectory = path.join(projectRoot, relativeDirectory);
+    return fs.readdirSync(absoluteDirectory, { withFileTypes: true })
+        .filter((entry) => entry.isFile() && entry.name.endsWith('.js'))
+        .map((entry) => path.join(relativeDirectory, entry.name));
 }
 
 function makeRequest(url, method = 'GET') {
@@ -44,8 +51,8 @@ test('transcript storage and conversation rating code is absent from Ploinky', (
     assert.equal(fs.existsSync(path.join(projectRoot, 'cli/server/utils/transcriptCrypto.js')), false);
 
     const checkedSources = [
+        ...sourcesUnder('cli/server/handlers/webchat'),
         'cli/services/config.js',
-        'cli/server/handlers/webchat.js',
         'cli/server/handlers/dashboard.js',
         'cli/server/webchat/index.js',
         'cli/server/webchat/messages.js',

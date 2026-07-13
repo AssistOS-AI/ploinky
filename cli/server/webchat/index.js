@@ -19,7 +19,6 @@ const {
     TAB_ID,
     dlog,
     markdown,
-    requiresAuth,
     basePath,
     toEndpoint,
     showBanner,
@@ -613,13 +612,6 @@ document.addEventListener('keydown', (event) => {
 });
 
 (async () => {
-    if (requiresAuth) {
-        const ok = await fetch(toEndpoint('whoami')).then((res) => res.ok).catch(() => false);
-        if (!ok) {
-            window.location.href = basePath || '.';
-            return;
-        }
-    }
     try {
         await sessionController.bootstrap();
     } catch (error) {

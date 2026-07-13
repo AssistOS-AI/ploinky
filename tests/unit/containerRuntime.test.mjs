@@ -361,11 +361,10 @@ test('buildExecArgs preserves non-tty shell sessions for webchat stdin EOF handl
     );
 });
 
-test('buildExecArgs forwards only validated WebChat session metadata to non-tty containers', () => {
+test('buildExecArgs forwards only validated WebChat history metadata to non-tty containers', () => {
     assert.deepEqual(
         buildExecArgs('agent-container', '/work', 'node /code/src/index.mjs', true, false, {
             env: {
-                PLOINKY_WEBCHAT_SESSION_ID: '12345678-1234-4123-8123-123456789abc',
                 PLOINKY_WEBCHAT_HAS_HISTORY: '1',
                 UNRELATED_VALUE: 'must-not-be-forwarded',
             },
@@ -373,7 +372,6 @@ test('buildExecArgs forwards only validated WebChat session metadata to non-tty 
         [
             'exec',
             '-i',
-            '-e', 'PLOINKY_WEBCHAT_SESSION_ID=12345678-1234-4123-8123-123456789abc',
             '-e', 'PLOINKY_WEBCHAT_HAS_HISTORY=1',
             'agent-container',
             'sh',
@@ -385,8 +383,7 @@ test('buildExecArgs forwards only validated WebChat session metadata to non-tty 
     assert.deepEqual(
         buildExecArgs('agent-container', '/work', 'node /code/src/index.mjs', true, false, {
             env: {
-                PLOINKY_WEBCHAT_SESSION_ID: '../unsafe',
-                PLOINKY_WEBCHAT_HAS_HISTORY: '1',
+                PLOINKY_WEBCHAT_HAS_HISTORY: 'yes',
             },
         }),
         [

@@ -6,6 +6,10 @@ import { fileURLToPath } from 'node:url';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const read = (relative) => fs.readFileSync(path.join(ROOT, relative), 'utf8');
+const readWebchatHandlers = () => fs.readdirSync(path.join(ROOT, 'cli/server/handlers/webchat'))
+    .filter((name) => name.endsWith('.js'))
+    .map((name) => read(path.join('cli/server/handlers/webchat', name)))
+    .join('\n');
 
 test('WebChat exposes folder-session controls and lazy history loading', () => {
     const template = read('cli/server/webchat/chat.html');
@@ -24,11 +28,28 @@ test('WebChat tab identity is restored from sessionStorage before UUID fallback'
 });
 
 test('WebChat session API is authenticated before folder files are handled', () => {
-    const handler = read('cli/server/handlers/webchat.js');
+    const handler = read('cli/server/handlers/webchat/index.js');
+    const conversationRoutes = read('cli/server/handlers/webchat/conversationRoutes.js');
+    const runtimeRoutes = read('cli/server/handlers/webchat/runtimeRoutes.js');
     const authGate = handler.indexOf('if (!authorized(req))');
-    const sessionApi = handler.indexOf("pathname === '/sessions' && req.method === 'GET'");
+    const sessionDispatch = handler.indexOf('await handleConversationRoute');
     assert.ok(authGate >= 0);
-    assert.ok(sessionApi > authGate);
-    assert.match(handler, /buildRuntimeKey\(workspaceDirectory, currentSession\.sessionId/);
-    assert.match(handler, /ttyFactory\.create\(ssoUser, \{[\s\S]*?sessionId: currentSession\.sessionId,[\s\S]*?hasHistory: currentSession\.messages\.length > 0/);
+    assert.ok(sessionDispatch > authGate);
+    assert.match(conversationRoutes, /pathname === '\/sessions' && req\.method === 'GET'/);
+    assert.match(runtimeRoutes, /buildRuntimeKey\(workspaceDirectory, currentSession\.sessionId/);
+    assert.match(runtimeRoutes, /ttyFactory\.create\(ssoUser, \{[\s\S]*?hasHistory: currentSession\.messages\.length > 0/);
+    assert.doesNotMatch(readWebchatHandlers(), /PLOINKY_WEBCHAT_SESSION_ID/);
+});
+
+test('WebChat does not expose or call the obsolete whoami endpoint', () => {
+    const handler = readWebchatHandlers();
+    const client = read('cli/server/webchat/index.js');
+    const domSetup = read('cli/server/webchat/domSetup.js');
+    const template = read('cli/server/webchat/chat.html');
+
+    assert.doesNotMatch(handler, /\/whoami/);
+    assert.doesNotMatch(handler, /__REQUIRES_AUTH__/);
+    assert.doesNotMatch(client, /whoami|requiresAuth/);
+    assert.doesNotMatch(domSetup, /requiresAuth/);
+    assert.doesNotMatch(template, /data-auth|__REQUIRES_AUTH__/);
 });

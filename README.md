@@ -93,7 +93,7 @@ Node-based agents consume a prepared, runtime-keyed dependency cache. `ploinky s
 - A manifest `cli` that points to a plain shell such as `"/bin/sh"` or `"/bin/bash"` does not become conversational by itself. In that setup WebChat mirrors raw input to the shell, and the shell may simply echo or mis-handle the incoming payload.
 - The recommended pattern is a dedicated CLI entrypoint such as `node /code/main.mjs` that parses WebChat input and keeps running for the full session.
 - `ploinky cli <agent>` and WebChat share the same manifest `cli`, so the same command must be suitable for both interactive terminal use and WebChat streaming input.
-- At WebChat startup, the CLI receives `PLOINKY_WEBCHAT_SESSION_ID` and `PLOINKY_WEBCHAT_HAS_HISTORY`. Agents that emit a new-conversation introduction should omit it when `PLOINKY_WEBCHAT_HAS_HISTORY=1`; Ploinky supplies the prior conversation context with the next normal user message.
+- At WebChat startup, the CLI receives `PLOINKY_WEBCHAT_HAS_HISTORY=1` when the selected conversation already contains messages, otherwise `0`. Agents that emit a new-conversation introduction should omit it when the value is `1`; Ploinky supplies the prior conversation context with the next normal user message.
 
 ## Cloud (preview)
 

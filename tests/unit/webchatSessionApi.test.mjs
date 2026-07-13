@@ -10,7 +10,7 @@ const project = path.join(root, 'project');
 fs.mkdirSync(project);
 process.env.PLOINKY_WORKSPACE_ROOT = root;
 
-const { handleWebChat } = await import(`../../cli/server/handlers/webchat.js?session-api=${Date.now()}`);
+const { handleWebChat } = await import(`../../cli/server/handlers/webchat/index.js?session-api=${Date.now()}`);
 
 function makeRequest(url, { method = 'GET', body = '', authenticated = true, cookie = '' } = {}) {
     const req = Readable.from(body ? [Buffer.from(body)] : []);

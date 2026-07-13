@@ -372,11 +372,13 @@ DATABASE_URL=postgres://localhost/db</code></pre>
                     <div class="doc-section" id="web-services">
                         <h2>Web Services Architecture</h2>
                         
-                        <h3>WebChat (cli/server/handlers/webchat.js)</h3>
+                        <h3>WebChat (<code>cli/server/handlers/webchat/</code>)</h3>
                         <p>Chat interface for CLI programs:</p>
                         <ul style="margin-left: 2rem;">
-                            <li>Captures stdout/stdin through PTY</li>
-                            <li>WebSocket-based real-time communication</li>
+                            <li><code>index.js</code> authenticates and dispatches WebChat requests.</li>
+                            <li>Conversation, upload, workspace-suggestion, message-envelope, and runtime responsibilities are isolated in dedicated modules.</li>
+                            <li>Captures stdout/stdin through the selected agent's TTY implementation.</li>
+                            <li>Uses HTTP input requests and server-sent events for real-time output.</li>
                             <li>WhatsApp-style UI with message bubbles</li>
                             <li>Automatic reconnection handling</li>
                         </ul>
@@ -442,14 +444,14 @@ observability.js    // Monitoring views</code></pre>
    → Serve chat.html through the router
    
 3. Browser connects:
-   → WebSocket handshake
+   → Open the server-sent event stream
    → Authenticate through the router login flow
-   → Establish bidirectional channel
+   → Reuse the folder-session runtime across browser tabs
    
 4. Message flow:
    → User types in chat
-   → WebSocket → Server → PTY stdin
-   → Program output → PTY stdout → WebSocket → Browser
+   → HTTP POST → Server → TTY stdin
+   → Program output → TTY stdout → SSE → Browser
    → Display as chat bubble</code></pre>
                     </div>
 
