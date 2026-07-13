@@ -76,6 +76,14 @@ hash includes this runtime policy revision so containers created with the older
 engine-augmented hosts behavior are recreated deliberately instead of retaining
 `host.containers.internal` or equivalent broad box-loopback aliases.
 
+Managed container transactions wait for the workspace network lifecycle lock
+with a bounded timeout. Parallel dependency waves therefore serialize their
+network, gateway, replacement, and start mutations instead of failing on a live
+owner. Gateway preflight validates every attachment that currently exists;
+under the same acquired transaction, reconciliation may then add and verify a
+missing desired attachment left by an outer-runtime replacement or another
+serialized launch.
+
 Inside the managed outer runtime, profile `openPorts` is the reviewed crossing between an agent container and that runtime and is also eligible for host publication. The inner runtime widens loopback publish binds to its interfaces so the supervisor can reach the runtime-side socket; the graph planner retains the manifest's outer bind policy when it creates the host publish. Host-network agents do not need an inner `-p` flag, but their declared runtime-side sockets remain subject to the same outer eligibility and conflict rules. Private service listeners must instead stay on named service networks or use private router/readiness mechanisms.
 
 The supervisor passes a versioned, bounded publication-coverage contract into core. Core command boundaries validate it before profile, registry, hook, router, or nested-runtime mutation, and the shared agent transition validates it again before create, start, restart, or recreate. REPL, Marketplace, and monitor paths that cannot reconcile their own outer container fail closed with a host one-shot command; monitor denial is nonfatal and remains under restart backoff.

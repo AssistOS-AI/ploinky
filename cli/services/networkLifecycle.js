@@ -39,6 +39,7 @@ const PODMAN_DEFAULT_CAPABILITIES = Object.freeze([
 const LOCK_PATH = path.join(PLOINKY_DIR, 'run', 'network.lock');
 const LOCK_REAPER_SUFFIX = '.reaper';
 export const NETWORK_LOCK_STALE_GRACE_MS = 5_000;
+export const NETWORK_LOCK_WAIT_MS = 60_000;
 const ROUTER_SOCKET = path.join(PLOINKY_DIR, 'run', 'router.sock');
 const MINIMAL_HOSTS = path.join(PLOINKY_DIR, 'run', 'managed-hosts');
 
@@ -253,7 +254,25 @@ export function acquireNetworkLifecycleLock({
 }
 
 export function withNetworkLifecycleLock(callback, options = {}) {
-    const lock = acquireNetworkLifecycleLock(options);
+    const waitMs = Math.max(0, Number(options.waitMs || 0));
+    const pollMs = Math.max(10, Number(options.pollMs || 50));
+    const deadline = Date.now() + waitMs;
+    let lock;
+    while (!lock) {
+        try {
+            lock = acquireNetworkLifecycleLock(options);
+        } catch (error) {
+            const contention = /already owned|already in progress|grace period|changed during stale-owner recovery|acquired during stale-owner recovery/i
+                .test(String(error?.message || error));
+            if (!contention || Date.now() >= deadline) {
+                if (contention && waitMs > 0) {
+                    throw new Error(`timed out waiting ${waitMs}ms for network lifecycle serialization: ${error.message}`);
+                }
+                throw error;
+            }
+            Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, Math.min(pollMs, deadline - Date.now()));
+        }
+    }
     try { return callback(lock); } finally { lock.release(); }
 }
 
@@ -697,9 +716,11 @@ export function createNetworkLifecycleAdapter({
         });
         const existingGateway = inspectContainer(gatewayContainerName(identity.hash));
         if (existingGateway) {
-            // Only networks which already exist can already be required. Missing
-            // desired networks are created later, under the same transaction.
-            assertGatewayRecord(existingGateway, attachments.filter((entry) => entry.existed), needsLabelDisable);
+            // Validate the immutable record and every current attachment here.
+            // A desired network may already exist without being attached after
+            // an outer-runtime replacement or a concurrent serialized launch;
+            // ensureGateway adds and verifies that missing attachment later.
+            assertGatewayRecord(existingGateway, [], needsLabelDisable);
             assertGatewayReady(existingGateway, attachments.filter((entry) => entry.existed));
         }
         return {
@@ -866,7 +887,7 @@ export function createNetworkLifecycleAdapter({
                 }
                 throw error;
             }
-        }, { lockPath });
+        }, { lockPath, waitMs: NETWORK_LOCK_WAIT_MS });
     }
 
     function status() {

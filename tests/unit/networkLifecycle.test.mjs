@@ -3,16 +3,19 @@ import fs from 'node:fs';
 import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
+import { once } from 'node:events';
 import test from 'node:test';
 
 import {
     NETWORK_LABELS,
+    NETWORK_LOCK_WAIT_MS,
     acquireNetworkLifecycleLock,
     createNetworkLifecycleAdapter,
     gatewayContainerName,
     physicalNetworkName,
     workspaceNetworkIdentity,
+    withNetworkLifecycleLock,
 } from '../../cli/services/networkLifecycle.js';
 import {
     canonicalizeNetwork,
@@ -213,6 +216,29 @@ test('network lock rejects a concurrent child and recovers stale malformed lock 
     assert.equal(fs.existsSync(`${lockPath}.reaper`), false);
     recovered.release();
     fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('network transaction lock waits for a live owner and then serializes', async (t) => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-network-lock-wait-'));
+    const lockPath = path.join(dir, 'network.lock');
+    const moduleUrl = new URL('../../cli/services/networkLifecycle.js', import.meta.url).href;
+    const child = spawn(process.execPath, [
+        '--input-type=module', '-e',
+        `import { acquireNetworkLifecycleLock } from ${JSON.stringify(moduleUrl)}; const lock = acquireNetworkLifecycleLock({ lockPath: process.argv[1] }); process.stdout.write('ready\\n'); setTimeout(() => { lock.release(); process.exit(0); }, 200);`,
+        lockPath,
+    ], { stdio: ['ignore', 'pipe', 'inherit'] });
+    t.after(() => {
+        child.kill();
+        fs.rmSync(dir, { recursive: true, force: true });
+    });
+    await once(child.stdout, 'data');
+    const started = Date.now();
+    const result = withNetworkLifecycleLock(() => 'serialized', {
+        lockPath, waitMs: NETWORK_LOCK_WAIT_MS, pollMs: 10,
+    });
+    assert.equal(result, 'serialized');
+    assert.ok(Date.now() - started >= 100);
+    if (child.exitCode === null) await once(child, 'exit');
 });
 
 async function routerSocketFixture(t) {
