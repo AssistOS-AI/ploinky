@@ -127,6 +127,12 @@ to each bridge as the deliberate route to Ploinky's Unix-socket listener, while
 normal outbound NAT remains available. An existing managed bridge that does not
 prove this exact isolation contract must be rejected rather than adopted.
 
+Managed agent containers receive a generated localhost-only `/etc/hosts` file
+through an exact read-only bind while engine-generated hosts entries are
+disabled. This removes broad `host.containers.internal` and equivalent aliases
+without disabling network DNS. Reuse validation treats any missing, writable,
+or engine-augmented hosts policy as network-contract drift.
+
 Bubblewrap agents clear the environment and then set only the constructed environment map. They bind system paths needed for execution as read-only, bind `/Agent` read-only, bind dependency caches read-only, bind code and skills according to profile policy, bind shared and workspace paths as writable where required, and apply read-only overlays to protected Ploinky state such as dependency caches, `.secrets`, profile, routing, server configuration, and staged runtime paths. Bubblewrap currently unshares PID but does not unshare network, because agents need network access and router reachability.
 
 Seatbelt agents run with a generated deny-default SBPL profile. The profile allows system reads, network calls, process execution, temporary writes, shared/workspace writes, profile-controlled code and skills writes, declared volumes, and logs. It denies writes to guarded runtime paths, dependency caches, staged Agent libraries, `.secrets`, profile, routing, and server configuration. Because Seatbelt exposes real host paths rather than a mount namespace, its generated profile is the authoritative access-control layer.

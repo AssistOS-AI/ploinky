@@ -366,6 +366,25 @@ export function createNetworkLifecycleAdapter({
         }
     }
 
+    function hasExactMinimalHostsPolicy(record) {
+        const mounts = (record.Mounts || []).filter((mount) => mount?.Destination === '/etc/hosts');
+        if (mounts.length !== 1
+            || mounts[0]?.Type !== 'bind'
+            || mounts[0]?.Source !== minimalHosts
+            || mounts[0]?.RW === true) {
+            return false;
+        }
+        const createCommand = Array.isArray(record.Config?.CreateCommand)
+            ? record.Config.CreateCommand.map(String)
+            : [];
+        const noHosts = createCommand.filter((value) => value === '--no-hosts');
+        return noHosts.length === 1
+            && !createCommand.some((value) => value === '--hosts-file'
+                || value.startsWith('--hosts-file=')
+                || value === '--add-host'
+                || value.startsWith('--add-host='));
+    }
+
     function assertRouterSocket() {
         if (!fs.existsSync(routerSocket)) {
             throw new Error(`router gateway unavailable: Unix router listener is missing at ${routerSocket}`);
@@ -729,7 +748,8 @@ export function createNetworkLifecycleAdapter({
                 args: [
                     '--network', primary.name,
                     '--network-alias', checked.alias,
-                    '--hosts-file', writeMinimalHostsFile(minimalHosts),
+                    '--no-hosts',
+                    '--volume', `${writeMinimalHostsFile(minimalHosts)}:/etc/hosts:ro`,
                 ],
             });
         } catch (error) {
@@ -932,6 +952,7 @@ export function createNetworkLifecycleAdapter({
             || String(labels['io.assistos.ploinky.network-contract'] || '') !== expectedHash) {
             return false;
         }
+        if (!hasExactMinimalHostsPolicy(record)) return false;
         const alias = deriveNetworkAlias(canonicalAgentId);
         const expected = logicalNetworkAttachments(network, canonicalAgentId, { instanceKey })
             .map((entry) => physicalNetworkName(identity.hash, entry.name))

@@ -122,7 +122,11 @@ export function logicalNetworkAttachments(network, canonicalAgentId, { instanceK
 
 export function networkContractHash(network) {
     const canonical = canonicalizeNetwork(network, { path: 'network' });
-    return crypto.createHash('sha256').update(JSON.stringify(canonical)).digest('hex');
+    return crypto.createHash('sha256').update(JSON.stringify({
+        schemaVersion: NETWORK_SCHEMA_VERSION,
+        runtimePolicy: 'managed-hosts-v1',
+        network: canonical,
+    })).digest('hex');
 }
 
 function readinessIsNetworkDependent(manifest) {

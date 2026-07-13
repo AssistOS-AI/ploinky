@@ -342,6 +342,9 @@ test('managed replacement holds one lock through preflight, removal, resource cr
         containerName: 'demo-container',
         createContainer: (plan) => {
             noteMutation();
+            assert.deepEqual(plan.args.slice(4), [
+                '--no-hosts', '--volume', `${path.join(dir, 'hosts')}:/etc/hosts:ro`,
+            ]);
             const primary = plan.attachments.find((entry) => entry.primary) || plan.attachments[0];
             const labels = {
                 'io.assistos.ploinky.workspace': identity.hash,
@@ -477,23 +480,32 @@ test('managed reuse rejects missing contract labels and exact attachment or alia
     const network = canonicalizeNetwork({ mode: 'default' });
     const logicalName = logicalNetworkAttachments(network, 'demo-agent')[0].name;
     const expectedName = physicalNetworkName(identity.hash, logicalName);
+    const hostsPath = '/tmp/ploinky-network-reuse-hosts';
     let record = { Config: { Labels: {} }, NetworkSettings: { Networks: {} } };
     const run = (_runtime, args) => args[0] === 'container'
         ? ok(JSON.stringify([record]))
         : absent('resource');
-    const adapter = createNetworkLifecycleAdapter({ runtime: 'podman', run, workspaceRoot });
+    const adapter = createNetworkLifecycleAdapter({ runtime: 'podman', run, workspaceRoot, minimalHosts: hostsPath });
     const options = { contractHash: networkContractHash(network) };
     assert.equal(adapter.verifyContainerContract('demo', network, 'demo-agent', options), false);
     record = {
-        Config: { Labels: {
-            'io.assistos.ploinky.workspace': identity.hash,
-            'io.assistos.ploinky.network-contract': networkContractHash(network),
-        } },
+        Config: {
+            Labels: {
+                'io.assistos.ploinky.workspace': identity.hash,
+                'io.assistos.ploinky.network-contract': networkContractHash(network),
+            },
+            CreateCommand: ['podman', 'create', '--no-hosts'],
+        },
+        Mounts: [{ Type: 'bind', Source: hostsPath, Destination: '/etc/hosts', RW: false }],
         NetworkSettings: { Networks: { [expectedName]: { Aliases: ['wrong'] } } },
     };
     assert.equal(adapter.verifyContainerContract('demo', network, 'demo-agent', options), false);
     record.NetworkSettings.Networks[expectedName].Aliases = [deriveNetworkAlias('demo-agent')];
     record.NetworkSettings.Networks.extra = { Aliases: [deriveNetworkAlias('demo-agent')] };
+    assert.equal(adapter.verifyContainerContract('demo', network, 'demo-agent', options), false);
+    delete record.NetworkSettings.Networks.extra;
+    assert.equal(adapter.verifyContainerContract('demo', network, 'demo-agent', options), true);
+    record.Config.CreateCommand.push('--add-host', 'host.containers.internal:host-gateway');
     assert.equal(adapter.verifyContainerContract('demo', network, 'demo-agent', options), false);
 });
 
