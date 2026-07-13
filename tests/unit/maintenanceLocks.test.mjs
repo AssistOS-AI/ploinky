@@ -42,3 +42,27 @@ test('expired maintenance lock is treated as stale and removed', () => {
     assert.equal(result.stale, true);
     assert.equal(fs.existsSync(lockFile(containerName)), false);
 });
+
+test('workspace start lock excludes concurrent startup and releases only by token', () => {
+    const lock = locks.createWorkspaceStartLock();
+    const result = locks.inspectWorkspaceStartLock();
+    assert.equal(result.active, true);
+    assert.equal(result.lock.ownerPid, process.pid);
+    assert.throws(() => locks.createWorkspaceStartLock(), /workspace start is already active/);
+    assert.equal(locks.releaseWorkspaceStartLock({ ...lock, token: 'foreign' }), false);
+    assert.equal(locks.inspectWorkspaceStartLock().active, true);
+    assert.equal(locks.releaseWorkspaceStartLock(lock), true);
+    assert.equal(fs.existsSync(locks.WORKSPACE_START_LOCK_PATH), false);
+});
+
+test('expired workspace start lock is reaped before a new owner acquires it', () => {
+    const expired = locks.createWorkspaceStartLock({ ttlMs: -1 });
+    const result = locks.inspectWorkspaceStartLock();
+    assert.equal(result.active, false);
+    assert.equal(result.stale, true);
+    assert.equal(result.lock.token, expired.token);
+
+    const replacement = locks.createWorkspaceStartLock();
+    assert.notEqual(replacement.token, expired.token);
+    assert.equal(locks.releaseWorkspaceStartLock(replacement), true);
+});

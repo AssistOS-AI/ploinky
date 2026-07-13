@@ -184,10 +184,13 @@ test('workspace router Unix listener is ready before first-use static agent star
     const source = startWorkspace.toString();
     const routerIndex = source.indexOf('await ensureRouterReadyForStart({');
     const enableIndex = source.indexOf('await enableAgent(staticAgentArg)');
+    const lockIndex = source.indexOf('createWorkspaceStartLock()');
 
+    assert.ok(lockIndex >= 0 && lockIndex < routerIndex, 'workspace start must suppress watchdog container reconciliation before router startup');
     assert.ok(routerIndex >= 0, 'workspace start must establish the router listener');
     assert.ok(enableIndex > routerIndex, 'the first managed agent must not start before the router Unix listener');
     assert.match(source, /Existing router listeners are ready; preserving their Unix socket/);
+    assert.match(source, /finally\s*\{\s*releaseWorkspaceStartLock\(workspaceStartLock\)/);
 });
 
 test('resolveWorkspaceDependencyGraph preserves dependency modes while qualifying relative refs', () => {

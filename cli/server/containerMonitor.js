@@ -6,7 +6,7 @@ import { fileURLToPath } from 'url';
 import * as workspaceSvc from '../services/workspace.js';
 import { REPOS_DIR, RUNNING_DIR } from '../services/config.js';
 import { mergeRoutingConfig } from '../services/routingFile.js';
-import { inspectMaintenanceLock } from '../services/maintenanceLocks.js';
+import { inspectMaintenanceLock, inspectWorkspaceStartLock } from '../services/maintenanceLocks.js';
 import { ensureAgentService, isContainerRunning } from '../services/docker/index.js';
 import { isSandboxRuntime } from '../services/docker/common.js';
 import { isBwrapProcessRunning } from '../services/bwrap/bwrapFleet.js';
@@ -400,6 +400,15 @@ async function performContainerRestart(monitor, target, reason) {
         target.isRestarting = false;
         return;
     }
+    if (inspectWorkspaceStartLock().active) {
+        target.isRestarting = false;
+        logEvent(monitor, 'info', 'container_restart_deferred_workspace_start', {
+            container: target.containerName,
+            agent: target.agentName,
+            repo: target.repoName,
+        });
+        return;
+    }
 
     if (!fs.existsSync(target.manifestPath)) {
         target.circuitBreakerTripped = true;
@@ -490,6 +499,25 @@ async function performContainerRestart(monitor, target, reason) {
 
 function monitorTick(monitor) {
     if (!monitor || monitor.isShuttingDown()) return;
+
+    const workspaceStart = inspectWorkspaceStartLock();
+    if (workspaceStart.stale) {
+        logEvent(monitor, 'info', 'workspace_start_lock_removed', {
+            ownerPid: workspaceStart.lock?.ownerPid || null,
+            expiresAt: workspaceStart.lock?.expiresAt || null,
+        });
+    }
+    if (workspaceStart.active) {
+        if (!monitor.workspaceStartDeferred) {
+            monitor.workspaceStartDeferred = true;
+            logEvent(monitor, 'info', 'container_monitor_deferred_workspace_start', {
+                ownerPid: workspaceStart.lock?.ownerPid || null,
+                expiresAt: workspaceStart.lock?.expiresAt || null,
+            });
+        }
+        return;
+    }
+    monitor.workspaceStartDeferred = false;
 
     syncManagedContainers(monitor);
 

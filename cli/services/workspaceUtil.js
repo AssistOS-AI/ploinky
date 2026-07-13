@@ -19,7 +19,7 @@ import { buildEnvMap } from './secretVars.js';
 import { resolveAgentExecutionMode, resolveAgentReadinessProtocol } from './startupReadiness.js';
 import { normalizeProbeConfig, runContainerScriptReadiness } from './docker/healthProbes.js';
 import { applyStartupConfigProvidersForGraph } from './startupConfigProviders.js';
-import { withMaintenanceLock } from './maintenanceLocks.js';
+import { createWorkspaceStartLock, releaseWorkspaceStartLock, withMaintenanceLock } from './maintenanceLocks.js';
 import { LOGS_DIR, PLOINKY_CWD, PLOINKY_DIR, PLOINKY_WORKSPACE_ROOT, REPOS_DIR, ROUTING_FILE, RUNNING_DIR } from './config.js';
 import { classifyDependencyGraphWaitMode, resolveWorkspaceDependencyGraph, topologicallyGroupDependencyGraph } from './workspaceDependencyGraph.js';
 import { mergeRoutingConfig, readRoutingConfig } from './routingFile.js';
@@ -746,6 +746,7 @@ async function startWorkspace(staticAgentArg, portArg, {
   // a `restart` re-entering this function in the same CLI process) re-runs
   // hooks that may need to regenerate runtime files.
   resetPreinstallRunInProcess();
+  const workspaceStartLock = createWorkspaceStartLock();
   try {
     if (staticAgentArg) {
       let aliasResolved = null;
@@ -1182,6 +1183,8 @@ async function startWorkspace(staticAgentArg, portArg, {
       throw e;
     }
     throw new Error(`start (workspace) failed: ${message}`);
+  } finally {
+    releaseWorkspaceStartLock(workspaceStartLock);
   }
 }
 
