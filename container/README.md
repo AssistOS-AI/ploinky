@@ -47,10 +47,10 @@ different scopes. Exit the REPL before operating on the outer runtime.
 
 The required multi-architecture release channel is the mutable reference
 `docker.io/assistos/ploinky-box:runtime`. Its image must satisfy runtime
-contract 2, including the exact label:
+contract 3, including the exact label:
 
 ```text
-io.assistos.ploinky.runtime-contract=2
+io.assistos.ploinky.runtime-contract=3
 ```
 
 The contract also requires user `podman`, working directory `/workspace`, the

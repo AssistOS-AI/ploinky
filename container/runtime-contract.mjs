@@ -237,6 +237,31 @@ export function normalizeContainerInspect(engine, raw) {
     ) || null;
     const rawLabels = value.Config.Labels || {};
     const requestedImage = String(rawLabels[REQUESTED_IMAGE_LABEL] || '');
+    const createCommand = Array.isArray(value.Config.CreateCommand)
+        ? value.Config.CreateCommand.map(String)
+        : [];
+    const requestedDevices = [];
+    for (let index = 0; index < createCommand.length; index += 1) {
+        let spec = '';
+        if (createCommand[index] === '--device') spec = createCommand[index + 1] || '';
+        else if (createCommand[index].startsWith('--device=')) spec = createCommand[index].slice(9);
+        if (!spec) continue;
+        const [hostPath, containerPath = hostPath, permissions = 'rwm'] = spec.split(':');
+        requestedDevices.push({ hostPath, containerPath, permissions });
+    }
+    const normalizeDevices = devices => devices.map(device => ({
+        hostPath: device.hostPath ?? device.PathOnHost,
+        containerPath: device.containerPath ?? device.PathInContainer,
+        permissions: device.permissions ?? device.CgroupPermissions ?? 'rwm',
+    })).sort((left, right) => JSON.stringify(left).localeCompare(JSON.stringify(right)));
+    const observedDevices = (value.HostConfig.Devices || []).map(device => ({
+        hostPath: device.PathOnHost,
+        containerPath: device.PathInContainer,
+        permissions: device.CgroupPermissions || 'rwm',
+    }));
+    const normalizeSecurityOpts = values => values.map(option => (
+        String(option).toLowerCase() === 'unmask=all' ? 'unmask=ALL' : String(option)
+    )).sort();
     return {
         instance: String(value.Name || '').replace(/^\//, ''),
         image: requestedImage,
@@ -260,13 +285,9 @@ export function normalizeContainerInspect(engine, raw) {
         },
         routerPublish,
         extraPublishes: publishes.filter(item => item !== routerPublish),
-        devices: (value.HostConfig.Devices || []).map(device => ({
-            hostPath: device.PathOnHost,
-            containerPath: device.PathInContainer,
-            permissions: device.CgroupPermissions || 'rwm',
-        })),
+        devices: normalizeDevices(observedDevices.length > 0 ? observedDevices : requestedDevices),
         capAdds: [...(value.HostConfig.CapAdd || [])],
-        securityOpts: [...(value.HostConfig.SecurityOpt || [])],
+        securityOpts: normalizeSecurityOpts(value.HostConfig.SecurityOpt || []),
         env: envMap(value.Config.Env || []),
         // Preserve the complete inspected label set. Reconciliation changes
         // only supervisor-owned keys, while rollback must restore every prior
@@ -614,12 +635,12 @@ export function mergeDesiredRuntimeConfig(
     desired.devices = [
         { hostPath: '/dev/fuse', containerPath: '/dev/fuse', permissions: 'rwm' },
         { hostPath: '/dev/net/tun', containerPath: '/dev/net/tun', permissions: 'rwm' },
-    ];
+    ].sort((left, right) => JSON.stringify(left).localeCompare(JSON.stringify(right)));
     desired.capAdds = [];
     desired.securityOpts = [
         'unmask=ALL',
         ...(invocation._selinuxEnabled ? ['label=disable'] : []),
-    ];
+    ].sort();
     desired.labels ||= {};
     desired.labels[REQUESTED_IMAGE_LABEL] = selectedImage;
     desired.labels[IDENTITY_SCHEMA_LABEL] = IDENTITY_SCHEMA_VERSION;

@@ -30,13 +30,12 @@ The managed public-entrypoint boundary is:
 | REPL `status`/`stop`/`destroy` | Core workspace/router/agent scope; outer runtime remains |
 
 The outer runtime uses the mutable `docker.io/assistos/ploinky-box:runtime`
-reference carrying exact label `io.assistos.ploinky.runtime-contract=2`. A
+reference carrying exact label `io.assistos.ploinky.runtime-contract=3`. A
 missing-box create or intentional configuration replacement pulls the selected
 logical reference, validates its complete metadata, captures its image ID, and
 runs that ID. Reuse, stopped-box start, status, stop, and destroy do not pull.
-Existing contract-1 boxes and contract-2 boxes without current exact-directory,
-volume-ownership, and publication-provenance labels are unsupported; the hard
-cut has no migration or adoption path.
+Existing contract-1 and contract-2 boxes are unsupported; the hard cut has no
+migration or adoption path.
 
 The outer container and its workspace, nested-container-storage, and dependency
 volumes are deterministically named from the canonical absolute host directory.
@@ -47,6 +46,16 @@ pull, image validation, publication planning, and conflict checks precede old-bo
 shutdown, while any later failure restores the previous image ID and full
 inspected creation configuration. All three named volumes survive replacement
 and direct host destroy.
+
+Runtime inspection is canonicalized before it is compared with the desired
+contract. In particular, Podman's normalized security-option spelling and
+ordering are equivalent to the requested values, and device requests are
+recovered from the inspected create command when `HostConfig.Devices` is empty.
+This normalization is comparison-only: creation still emits the exact
+contract-3 devices and security options, while an actually missing or different
+request remains replacement drift. Repeating an unchanged host command must
+therefore reuse the same compliant outer container without pulling or replacing
+it.
 
 Nested Podman belongs to this outer runtime only. Ordinary agent images
 intentionally contain neither Podman nor Docker and do not receive authority

@@ -22,6 +22,7 @@ import {
     VOLUME_ROLES,
     buildRuntimeRunArgs,
     createDefaultRuntimeConfig,
+    diffRuntimeConfig,
     mergeAndValidatePublishes,
     mergeDesiredRuntimeConfig,
     normalizeContainerInspect,
@@ -1579,6 +1580,27 @@ test('outer capability drift is captured and cleared while SELinux desired state
     assert.equal(planReconciliation({ existing: desired, desired: converged, contractMatches: true }).action, 'reuse');
     desired.capAdds = ['SYS_ADMIN'];
     assert.throws(() => buildRuntimeRunArgs(desired, { engine: 'podman' }), /forbids added/);
+});
+
+test('Podman-normalized outer devices and security options converge without replacement', () => {
+    const fixture = contract2RuntimeFixture();
+    fixture.container.inspect.HostConfig.Devices = [];
+    fixture.container.inspect.HostConfig.SecurityOpt = ['label=disable', 'unmask=all'];
+    fixture.container.inspect.Config.CreateCommand = [
+        'podman', 'run',
+        '--device', '/dev/fuse:/dev/fuse:rwm',
+        '--device=/dev/net/tun:/dev/net/tun:rwm',
+        '--security-opt', 'unmask=ALL',
+        '--security-opt', 'label=disable',
+    ];
+    const actual = normalizeContainerInspect('podman', JSON.stringify([fixture.container.inspect]));
+    const invocation = invocationFor();
+    invocation._selinuxEnabled = true;
+    const desired = mergeDesiredRuntimeConfig(invocation, actual);
+    assert.deepEqual(actual.devices, desired.devices);
+    assert.deepEqual(actual.securityOpts, desired.securityOpts);
+    assert.equal(diffRuntimeConfig(actual, desired).includes('devices'), false);
+    assert.equal(diffRuntimeConfig(actual, desired).includes('securityOpts'), false);
 });
 
 test('interactive exec preserves TTY and non-TTY behavior for cli and shell routes', async () => {
