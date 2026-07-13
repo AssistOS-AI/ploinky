@@ -515,9 +515,11 @@ test('gateway adoption proves exact permissions and readiness without mutating a
     gateway.Id = 'abcdef1234567890';
     gateway.NetworkSettings.Networks[physicalName].Aliases.push(gateway.Id.slice(0, 12));
     const mutations = [];
+    let observedForwarding = '0\n';
     const run = (_runtime, args) => {
         if (args[0] === 'info') return ok(args[2].includes('Rootless') ? 'true\n' : 'false\n');
         if (args[0] === 'image' && args[1] === 'inspect') return ok('[]');
+        if (args[0] === 'unshare') return ok(observedForwarding);
         if (args[0] === 'network' && args[1] === 'ls') return ok(JSON.stringify([networkRecord]));
         if (args[0] === 'network' && args[1] === 'inspect') return ok(JSON.stringify([networkRecord]));
         if (args[0] === 'container' && args[1] === 'inspect') {
@@ -564,6 +566,15 @@ test('gateway adoption proves exact permissions and readiness without mutating a
     const removedCapability = gateway.HostConfig.CapDrop.pop();
     assert.throws(() => adapter.ensureGateway([{ name: physicalName, logicalName, primary: true }]), /exact CapDrop=ALL/);
     gateway.HostConfig.CapDrop.push(removedCapability);
+
+    delete gateway.HostConfig.Sysctls;
+    gateway.Config.CreateCommand = ['podman', 'run', '--sysctl', 'net.ipv4.ip_forward=0', image];
+    assert.equal(adapter.ensureGateway([{ name: physicalName, logicalName, primary: true }]).created, false);
+    observedForwarding = '1\n';
+    assert.throws(() => adapter.ensureGateway([{ name: physicalName, logicalName, primary: true }]), /live IPv4 forwarding is not disabled/);
+    observedForwarding = '0\n';
+    gateway.HostConfig.Sysctls = { 'net.ipv4.ip_forward': '0' };
+    delete gateway.Config.CreateCommand;
 
     gatewayLabels['unexpected.extra'] = 'rejected';
     assert.throws(() => adapter.ensureGateway([{ name: physicalName, logicalName, primary: true }]), /exact label keys/);

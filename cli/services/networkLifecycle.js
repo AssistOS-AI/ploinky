@@ -392,6 +392,49 @@ export function createNetworkLifecycleAdapter({
         if (!image.ok) throw new Error(`router gateway image '${gatewayImage}' remained unavailable after exact pull`);
     }
 
+    function assertGatewayForwardingDisabled(gateway, name) {
+        const configuredSysctls = gateway.HostConfig?.Sysctls;
+        if (configuredSysctls && Object.keys(configuredSysctls).length > 0) {
+            if (Object.keys(configuredSysctls).length !== 1
+                || String(configuredSysctls['net.ipv4.ip_forward'] ?? '') !== '0') {
+                throw new Error(`router gateway '${name}' is unsupported: exact IPv4 forwarding disablement is required`);
+            }
+            return;
+        }
+
+        // Podman 5.8 no longer exposes Sysctls in HostConfig. Prove both the
+        // immutable create request and the live network namespace value.
+        const createCommand = Array.isArray(gateway.Config?.CreateCommand)
+            ? gateway.Config.CreateCommand.map(String)
+            : [];
+        const requestedSysctls = [];
+        for (let index = 0; index < createCommand.length; index += 1) {
+            if (createCommand[index] === '--sysctl') requestedSysctls.push(createCommand[index + 1] || '');
+            else if (createCommand[index].startsWith('--sysctl=')) requestedSysctls.push(createCommand[index].slice(9));
+        }
+        if (requestedSysctls.length !== 1 || requestedSysctls[0] !== 'net.ipv4.ip_forward=0') {
+            throw new Error(`router gateway '${name}' is unsupported: exact IPv4 forwarding disablement is required`);
+        }
+        const pid = Number(gateway.State?.Pid);
+        if (!Number.isInteger(pid) || pid < 1) {
+            throw new Error(`router gateway '${name}' cannot prove IPv4 forwarding disablement without a live container PID`);
+        }
+        let observed = execute([
+            'unshare', 'nsenter', '--target', String(pid), '--net',
+            'cat', '/proc/sys/net/ipv4/ip_forward',
+        ]);
+        if (!observed.ok && /remote podman client/i.test(failure(observed))) {
+            observed = execute([
+                'machine', 'ssh', 'podman', 'unshare',
+                'nsenter', '--target', String(pid), '--net',
+                'cat', '/proc/sys/net/ipv4/ip_forward',
+            ]);
+        }
+        if (!observed.ok || String(observed.stdout || '').trim() !== '0') {
+            throw new Error(`router gateway '${name}' is unsupported: live IPv4 forwarding is not disabled`);
+        }
+    }
+
     function assertGatewayRecord(gateway, networks, needsLabelDisable, { requireRunning = true } = {}) {
         const name = gatewayContainerName(identity.hash);
         assertExactLabels(name, labelsOf(gateway), expectedGatewayLabels(identity.hash));
@@ -429,10 +472,7 @@ export function createNetworkLifecycleAdapter({
         if (JSON.stringify(securityOpts) !== JSON.stringify(expectedSecurity)) {
             throw new Error(`router gateway '${name}' is unsupported: exact security options are required`);
         }
-        const sysctls = gateway.HostConfig?.Sysctls || {};
-        if (Object.keys(sysctls).length !== 1 || String(sysctls['net.ipv4.ip_forward'] ?? '') !== '0') {
-            throw new Error(`router gateway '${name}' is unsupported: exact IPv4 forwarding disablement is required`);
-        }
+        assertGatewayForwardingDisabled(gateway, name);
         const published = gateway.HostConfig?.PortBindings || gateway.NetworkSettings?.Ports || {};
         if (Object.values(published).some((bindings) => Array.isArray(bindings) ? bindings.length > 0 : Boolean(bindings))) {
             throw new Error(`router gateway '${name}' is unsupported: published ports are forbidden`);
