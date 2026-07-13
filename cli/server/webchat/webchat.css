@@ -227,6 +227,129 @@ body {
     gap: 6px;
 }
 
+.wa-session-btn {
+    min-height: 34px;
+    border: 1px solid rgba(255, 255, 255, 0.35);
+    border-radius: 8px;
+    background: rgba(0, 0, 0, 0.08);
+    color: #fff;
+    padding: 0 11px;
+    cursor: pointer;
+    font: inherit;
+}
+
+.wa-session-btn:hover,
+.wa-history-gate button:hover {
+    background: var(--wa-bg-hover);
+}
+
+.wa-history-gate {
+    position: sticky;
+    top: 12px;
+    z-index: 8;
+    display: flex;
+    justify-content: center;
+    pointer-events: none;
+}
+
+.wa-history-gate[hidden] {
+    display: none;
+}
+
+.wa-history-gate button {
+    pointer-events: auto;
+    border: 1px solid var(--wa-border);
+    border-radius: 999px;
+    background: var(--wa-bg-panel);
+    color: var(--wa-text-primary);
+    padding: 8px 16px;
+    box-shadow: var(--wa-shadow-md);
+    cursor: pointer;
+}
+
+.wa-session-dialog-backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 1000;
+    display: grid;
+    place-items: center;
+    padding: 20px;
+    background: rgba(0, 0, 0, 0.45);
+}
+
+.wa-session-dialog-backdrop[hidden] {
+    display: none;
+}
+
+.wa-session-dialog {
+    width: min(560px, 100%);
+    max-height: min(70vh, 640px);
+    overflow: hidden;
+    border: 1px solid var(--wa-border);
+    border-radius: 12px;
+    background: var(--wa-bg-panel);
+    color: var(--wa-text-primary);
+    box-shadow: var(--wa-shadow-md);
+}
+
+.wa-session-dialog-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 14px 16px;
+    border-bottom: 1px solid var(--wa-border);
+}
+
+.wa-session-dialog-header h2 {
+    margin: 0;
+    font-size: 17px;
+}
+
+.wa-session-dialog-header button {
+    border: 0;
+    background: transparent;
+    color: inherit;
+    font-size: 26px;
+    cursor: pointer;
+}
+
+.wa-session-list {
+    max-height: calc(min(70vh, 640px) - 58px);
+    overflow: auto;
+    padding: 8px;
+}
+
+.wa-session-list-item {
+    width: 100%;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 6px 16px;
+    border: 0;
+    border-radius: 9px;
+    background: transparent;
+    color: inherit;
+    padding: 11px 12px;
+    text-align: left;
+    cursor: pointer;
+}
+
+.wa-session-list-item:hover,
+.wa-session-list-item[data-current="true"] {
+    background: var(--wa-bg-hover);
+}
+
+.wa-session-list-preview {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.wa-session-list-time {
+    color: var(--wa-text-muted);
+    white-space: nowrap;
+    font-size: 12px;
+}
+
 .wa-header-workdir {
     position: absolute;
     left: 50%;
@@ -2545,8 +2668,7 @@ body {
     padding: 6px 9px;
 }
 
-.wa-context-menu button:hover,
-.wa-context-menu button[data-active="true"] {
+.wa-context-menu button:hover {
     background: var(--wa-bg-hover);
     color: var(--wa-icon-color-active);
 }

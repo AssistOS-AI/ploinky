@@ -55,9 +55,26 @@ function resolveServerPort(server) {
 function closeWebchatSessions(globalState) {
     try {
         const webchat = globalState?.webchat;
-        if (!webchat || !(webchat.sessions instanceof Map)) {
+        if (!webchat) {
             return;
         }
+        if (webchat.runtimes instanceof Map) {
+            for (const [runtimeKey, runtime] of webchat.runtimes.entries()) {
+                if (runtime?.subscribers instanceof Map) {
+                    for (const subscriber of runtime.subscribers.values()) {
+                        try { subscriber.res.end(); } catch (_) { }
+                        try { subscriber.res.destroy?.(); } catch (_) { }
+                    }
+                    runtime.subscribers.clear();
+                }
+                try {
+                    if (typeof runtime?.tty?.dispose === 'function') runtime.tty.dispose();
+                    else if (typeof runtime?.tty?.kill === 'function') runtime.tty.kill();
+                } catch (_) { }
+                webchat.runtimes.delete(runtimeKey);
+            }
+        }
+        if (!(webchat.sessions instanceof Map)) return;
         for (const [sid, session] of webchat.sessions.entries()) {
             if (!session || !(session.tabs instanceof Map)) {
                 continue;

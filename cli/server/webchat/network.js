@@ -131,10 +131,11 @@ export function createNetwork({
     addClientAttachment,
     addServerMsg,
     addProgressEvent,
-    setLastServerMessageMeta,
     showTypingIndicator,
     hideTypingIndicator,
-    markUserInputSent
+    markUserInputSent,
+    addRemoteUserMessage,
+    onSessionChanged
 }) {
     let es = null;
     let chatBuffer = '';
@@ -142,6 +143,12 @@ export function createNetwork({
     let reconnectAttempts = 0;
     let reconnectTimer = null;
     let pendingUploads = 0;
+    let sessionId = '';
+
+    function sessionEndpoint(path) {
+        const separator = String(path || '').includes('?') ? '&' : '?';
+        return `${path}${separator}sessionId=${encodeURIComponent(sessionId)}`;
+    }
 
     function trackUploadStart() {
         pendingUploads += 1;
@@ -229,16 +236,6 @@ export function createNetwork({
         }
     }
 
-    function applyServerMessageMeta(payload) {
-        if (!payload || typeof payload !== 'object' || typeof setLastServerMessageMeta !== 'function') {
-            return;
-        }
-        setLastServerMessageMeta({
-            messageId: typeof payload.messageId === 'string' ? payload.messageId : '',
-            rating: payload.rating === 'up' || payload.rating === 'down' ? payload.rating : null
-        });
-    }
-
     function start() {
         dlog('SSE connecting');
         showBanner('Connecting…');
@@ -248,7 +245,7 @@ export function createNetwork({
             // Ignore close failures
         }
 
-        es = new EventSource(toEndpoint(`stream?tabId=${TAB_ID}`));
+        es = new EventSource(toEndpoint(sessionEndpoint(`stream?tabId=${TAB_ID}`)));
 
         es.onopen = () => {
             // Reset reconnect attempts on successful connection
@@ -329,14 +326,26 @@ export function createNetwork({
             }
         };
 
-        es.addEventListener('message-meta', (event) => {
+        es.addEventListener('user-message', (event) => {
             try {
                 const payload = JSON.parse(event.data);
-                applyServerMessageMeta(payload);
+                if (payload?.sourceTabId !== TAB_ID && typeof addRemoteUserMessage === 'function') {
+                    addRemoteUserMessage(payload.message, payload);
+                }
             } catch (error) {
-                dlog('message meta error', error);
+                dlog('remote user message error', error);
             }
         });
+
+        es.addEventListener('session-changed', (event) => {
+            try {
+                const payload = JSON.parse(event.data);
+                if (typeof onSessionChanged === 'function') onSessionChanged(payload?.session || null);
+            } catch (error) {
+                dlog('session changed error', error);
+            }
+        });
+
     }
 
     function stop() {
@@ -380,10 +389,18 @@ export function createNetwork({
 
         markUserInputSent();
 
-        return fetch(toEndpoint(`input?tabId=${TAB_ID}`), {
+        const send = () => fetch(toEndpoint(sessionEndpoint(`input?tabId=${TAB_ID}`)), {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: `${serialized}\n`
+            body: `${serialized}\n`,
+            credentials: 'include'
+        });
+        return send().then((response) => {
+            if (response.status === 409) {
+                return new Promise((resolve) => setTimeout(resolve, 250)).then(send);
+            }
+            if (!response.ok) throw new Error(`input_failed_${response.status}`);
+            return response;
         }).catch((error) => {
             dlog('chat error', error);
             if (pendingUploads === 0) {
@@ -562,41 +579,8 @@ export function createNetwork({
         });
     }
 
-    function sendFeedback(messageId, rating) {
-        const normalizedId = typeof messageId === 'string' ? messageId.trim() : '';
-        const normalizedRating = rating === 'up' || rating === 'down' ? rating : null;
-        if (!normalizedId) {
-            return Promise.reject(new Error('missing_message_id'));
-        }
-
-        return fetch(toEndpoint('feedback'), {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                tabId: TAB_ID,
-                messageId: normalizedId,
-                rating: normalizedRating
-            })
-        }).then(async (res) => {
-            if (!res.ok) {
-                let errorPayload = null;
-                try {
-                    errorPayload = await res.json();
-                } catch (_) {
-                    errorPayload = null;
-                }
-                throw new Error(errorPayload?.error || `feedback_failed_${res.status}`);
-            }
-            return res.json().catch(() => ({ ok: true }));
-        }).catch((error) => {
-            dlog('feedback error', error);
-            showBanner('Feedback error', 'err');
-            throw error;
-        });
-    }
-
     function sendControl(controlSeq) {
-        return fetch(toEndpoint(`control?tabId=${TAB_ID}`), {
+        return fetch(toEndpoint(sessionEndpoint(`control?tabId=${TAB_ID}`)), {
             method: 'POST',
             headers: { 'Content-Type': 'text/plain' },
             body: controlSeq
@@ -608,10 +592,19 @@ export function createNetwork({
     return {
         start,
         stop,
+        setSession(nextSessionId, { restart = true } = {}) {
+            const normalized = typeof nextSessionId === 'string' ? nextSessionId.trim() : '';
+            if (normalized === sessionId) return;
+            sessionId = normalized;
+            if (restart) {
+                stop();
+                start();
+            }
+        },
+        getSessionId: () => sessionId,
         sendCommand,
         sendQuickCommand,
         sendAttachments,
-        sendFeedback,
         sendControl
     };
 }

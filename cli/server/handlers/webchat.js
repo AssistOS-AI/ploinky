@@ -3,7 +3,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import crypto from 'crypto';
 import { resolveWebchatCommandsForAgent } from '../webchat/commandResolver.js';
-import { parseCookies, buildCookie, appendSetCookie } from './common.js';
+import { parseCookies, buildCookie, appendSetCookie, readJsonBody } from './common.js';
 import * as staticSrv from '../static/index.js';
 import {
     getWorkspaceRoot,
@@ -19,12 +19,16 @@ import {
 } from './webchatUploads.js';
 import { buildInvocationContextForProviderCall } from '../mcp-proxy/index.js';
 import {
-    appendMessage as appendTranscriptMessage,
-    appendToMessage as appendTranscriptToMessage,
-    closeConversation as closeTranscriptConversation,
-    createConversation as createTranscriptConversation,
-    setTurnRating as setTranscriptTurnRating,
-} from '../utils/transcriptStore.js';
+    appendSessionMessage,
+    appendToAssistantMessage,
+    createSession as createWorkspaceSession,
+    ensureCurrentSession,
+    formatContinuationContext,
+    listSessions as listWorkspaceSessions,
+    loadSession as loadWorkspaceSession,
+    selectSession as selectWorkspaceSession,
+    summarizeSession,
+} from '../webchat/sessionStore.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -268,22 +272,13 @@ function shouldForwardWebchatEnvelope(parsedUrl, effectiveConfig = null) {
         || effectiveConfig?.forwardEnvelope === true;
 }
 
-function buildTranscriptContext(req, appState, tabId) {
-    const sid = getSession(req, appState) || '';
-    return {
-        authMode: req.authMode || (req.user ? 'user' : 'anonymous'),
-        sessionId: sid,
-        userId: req.user?.id || '',
-        tabId
-    };
-}
-
 function buildWebchatQuery(parsedUrl, agentName = '') {
     const params = new URLSearchParams(parsedUrl.searchParams);
     if (agentName) {
         params.set('agent', agentName);
     }
     params.delete('tabId');
+    params.delete('sessionId');
     return params.toString();
 }
 
@@ -305,7 +300,7 @@ function resolveWebchatLaunchOptions(parsedUrl) {
     const cliArgs = [];
     for (const [rawKey, rawValue] of parsedUrl.searchParams.entries()) {
         const key = String(rawKey || '').trim();
-        if (!key || key === 'agent' || key === 'tabId') {
+        if (!key || key === 'agent' || key === 'tabId' || key === 'sessionId') {
             continue;
         }
         if (key === 'workspace-dir' || key === 'workspaceDir') {
@@ -682,96 +677,58 @@ function handleSuggestionsFiles(req, res, parsedUrl, appState) {
     }));
 }
 
-function handleTranscriptAssistantLine(tab, rawLine) {
-    if (!tab?.transcript) {
-        return null;
-    }
-    const transcript = tab.transcript;
+function handleWorkspaceAssistantLine(tab, rawLine) {
+    if (!tab?.workspaceHistory) return;
     const originalText = typeof rawLine === 'string' ? rawLine : String(rawLine || '');
-    if (!originalText) {
-        return null;
-    }
-    if (isProcessingChunk(originalText)) {
-        return null;
-    }
+    if (!originalText || isProcessingChunk(originalText)) return;
     const stripped = stripProcessingPrefix(originalText);
     const normalized = stripped.trim();
-    if (!normalized || looksLikeEnvelopeEcho(normalized) || looksLikeProgressEnvelope(normalized)) {
-        return null;
-    }
-    const pendingEcho = String(transcript.lastClientText || '').trim();
+    if (!normalized || looksLikeEnvelopeEcho(normalized) || looksLikeProgressEnvelope(normalized)) return;
+    const pendingEcho = String(tab.workspaceHistory.lastClientText || '').trim();
     if (pendingEcho && looksLikeReadlinePromptEcho(normalized, pendingEcho)) {
-        transcript.lastClientText = '';
-        return null;
-    }
-    try {
-        let messageId = transcript.lastAssistantMessageId || null;
-        let append = false;
-        if (!transcript.userInputSent && transcript.lastAssistantMessageId) {
-            const appended = appendTranscriptToMessage(transcript.conversationId, transcript.lastAssistantMessageId, stripped);
-            if (!appended) {
-                const created = appendTranscriptMessage(transcript.conversationId, {
-                    role: 'assistant',
-                    text: stripped,
-                    metadata: {
-                        promptMessageId: transcript.lastUserMessageId || null,
-                        turnId: transcript.currentTurnId || null
-                    }
-                });
-                transcript.lastAssistantMessageId = created.messageId;
-                messageId = created.messageId;
-                append = false;
-            } else {
-                messageId = transcript.lastAssistantMessageId;
-                append = true;
-            }
-        } else {
-            const created = appendTranscriptMessage(transcript.conversationId, {
-                role: 'assistant',
-                text: stripped,
-                metadata: {
-                    promptMessageId: transcript.lastUserMessageId || null,
-                    turnId: transcript.currentTurnId || null
-                }
-            });
-            transcript.lastAssistantMessageId = created.messageId;
-            messageId = created.messageId;
-            append = false;
-        }
-        transcript.userInputSent = false;
-        return messageId ? { messageId, append } : null;
-    } catch (_) {
-        // Transcript capture must never break live chat.
-        return null;
-    }
-}
-
-function captureTranscriptOutput(tab, data) {
-    if (!tab?.transcript) {
-        return [];
-    }
-    const transcript = tab.transcript;
-    transcript.buffer += stripCtrlAndAnsi(String(data ?? ''));
-    const lines = transcript.buffer.split(/\r?\n/);
-    transcript.buffer = lines.pop() ?? '';
-    const events = [];
-    for (const line of lines) {
-        const meta = handleTranscriptAssistantLine(tab, line);
-        if (meta?.messageId) {
-            events.push(meta);
-        }
-    }
-    return events;
-}
-
-function flushTranscriptOutput(tab) {
-    if (!tab?.transcript?.buffer) {
+        tab.workspaceHistory.lastClientText = '';
         return;
     }
-    const tail = stripCtrlAndAnsi(tab.transcript.buffer);
-    tab.transcript.buffer = '';
+
+    const workspaceHistory = tab.workspaceHistory;
+    try {
+        if (!workspaceHistory.userInputSent && Number.isInteger(workspaceHistory.lastAssistantMessageIndex)) {
+            appendToAssistantMessage(
+                workspaceHistory.workspaceDirectory,
+                workspaceHistory.sessionId,
+                workspaceHistory.lastAssistantMessageIndex,
+                stripped
+            );
+        } else {
+            const appended = appendSessionMessage(
+                workspaceHistory.workspaceDirectory,
+                workspaceHistory.sessionId,
+                { role: 'assistant', text: stripped }
+            );
+            workspaceHistory.lastAssistantMessageIndex = appended.messageIndex;
+        }
+        workspaceHistory.userInputSent = false;
+    } catch (_) {
+        // Folder history capture must never break the live process.
+    }
+}
+
+function captureWorkspaceHistoryOutput(tab, data) {
+    const workspaceHistory = tab?.workspaceHistory;
+    if (!workspaceHistory) return;
+    workspaceHistory.buffer = String(workspaceHistory.buffer || '') + stripCtrlAndAnsi(String(data ?? ''));
+    const lines = workspaceHistory.buffer.split(/\r?\n/);
+    workspaceHistory.buffer = lines.pop() ?? '';
+    for (const line of lines) handleWorkspaceAssistantLine(tab, line);
+}
+
+function flushWorkspaceHistoryOutput(tab) {
+    const workspaceHistory = tab?.workspaceHistory;
+    if (!workspaceHistory?.buffer) return;
+    const tail = stripCtrlAndAnsi(workspaceHistory.buffer);
+    workspaceHistory.buffer = '';
     if (tail.trim() && !isProcessingChunk(tail)) {
-        handleTranscriptAssistantLine(tab, tail);
+        handleWorkspaceAssistantLine(tab, tail);
     }
 }
 
@@ -843,6 +800,16 @@ function pushPendingSseEvent(tab, payload) {
 
 export function writeOrBufferSseEvent(tab, payload) {
     if (!tab || !payload) return;
+    if (tab.subscribers instanceof Map) {
+        for (const [connectionId, subscriber] of tab.subscribers.entries()) {
+            try {
+                subscriber.res.write(String(payload));
+            } catch (_) {
+                tab.subscribers.delete(connectionId);
+            }
+        }
+        return;
+    }
     if (tab.sseRes) {
         try {
             tab.sseRes.write(String(payload));
@@ -852,6 +819,34 @@ export function writeOrBufferSseEvent(tab, payload) {
         }
     }
     pushPendingSseEvent(tab, payload);
+}
+
+function getRuntimeMap(appState) {
+    if (!(appState.runtimes instanceof Map)) appState.runtimes = new Map();
+    return appState.runtimes;
+}
+
+function buildRuntimeKey(workspaceDirectory, sessionId, effectiveConfig, agentQuery = '') {
+    const agent = String(effectiveConfig?.agentName || effectiveConfig?.displayName || 'webchat').trim();
+    const launchSignature = crypto.createHash('sha256').update(String(agentQuery || '')).digest('hex').slice(0, 16);
+    return `${workspaceDirectory}\0${sessionId}\0${agent}\0${launchSignature}`;
+}
+
+function broadcastWorkspaceSessionChange(appState, workspaceDirectory, session) {
+    const payload = `event: session-changed\ndata: ${JSON.stringify({ session: summarizeSession(session) })}\n\n`;
+    for (const runtime of getRuntimeMap(appState).values()) {
+        if (runtime.workspaceDirectory === workspaceDirectory) {
+            writeOrBufferSseEvent(runtime, payload);
+        }
+    }
+}
+
+function broadcastWorkspaceRuntimeEvent(appState, workspaceDirectory, sessionId, payload) {
+    for (const runtime of getRuntimeMap(appState).values()) {
+        if (runtime.workspaceDirectory === workspaceDirectory && runtime.sessionId === sessionId) {
+            writeOrBufferSseEvent(runtime, payload);
+        }
+    }
 }
 
 export function flushPendingSseEvents(tab) {
@@ -877,8 +872,9 @@ function scheduleDisconnectedTabCleanup(tab, tabId, session, graceMs = STREAM_RE
         tab.cleanupTimer = null;
     }
     tab.cleanupTimer = setTimeout(() => {
-        if (tab.sseRes || tab.disposed) return;
-        console.log(`[webchat] Reconnect grace expired for tab ${tabId}; disposing TTY.`);
+        const hasSubscribers = tab.subscribers instanceof Map ? tab.subscribers.size > 0 : Boolean(tab.sseRes);
+        if (hasSubscribers || tab.disposed) return;
+        console.log(`[webchat] Reconnect grace expired for session ${tab.sessionId || tabId}; disposing TTY.`);
         disposeTab(tab, tabId, session);
     }, Math.max(1000, Number(graceMs) || STREAM_RECONNECT_GRACE_MS));
     tab.cleanupTimer.unref?.();
@@ -890,6 +886,7 @@ function disposeTab(tab, tabId, session) {
     }
     const pid = tab.pid || tab.tty?.pid;
     if (tab.disposed) {
+        if (session?.runtimes instanceof Map) session.runtimes.delete(tabId);
         if (session?.tabs instanceof Map) {
             session.tabs.delete(tabId);
         }
@@ -903,8 +900,8 @@ function disposeTab(tab, tabId, session) {
     }
 
     if (tab.tty) {
-        flushTranscriptOutput(tab);
-        console.log(`[webchat] Disposing TTY for tab ${tabId}`);
+        flushWorkspaceHistoryOutput(tab);
+        console.log(`[webchat] Disposing TTY for session ${tab.sessionId || tabId}`);
         if (typeof tab.tty.dispose === 'function') {
             try {
                 tab.tty.dispose();
@@ -924,6 +921,12 @@ function disposeTab(tab, tabId, session) {
         forceKillPid(pid, tabId);
     }
 
+    if (tab.subscribers instanceof Map) {
+        for (const subscriber of tab.subscribers.values()) {
+            try { subscriber.res.end(); } catch (_) { }
+        }
+        tab.subscribers.clear();
+    }
     if (tab.sseRes) {
         try {
             tab.sseRes.end();
@@ -933,17 +936,11 @@ function disposeTab(tab, tabId, session) {
     }
     tab.sseRes = null;
 
+    if (session?.runtimes instanceof Map) session.runtimes.delete(tabId);
     if (session?.tabs instanceof Map) {
         session.tabs.delete(tabId);
     }
 
-    if (tab.transcript?.conversationId) {
-        try {
-            closeTranscriptConversation(tab.transcript.conversationId);
-        } catch (_) {
-            // Ignore transcript finalization errors.
-        }
-    }
 }
 
 function buildLogoutRedirect(agentQuery) {
@@ -959,9 +956,15 @@ function handleLogout(req, res, appState, agentQuery) {
     const sid = getSession(req, appState);
     const session = sid ? appState.sessions.get(sid) : null;
 
-    if (session?.tabs instanceof Map) {
-        for (const [tabId, tab] of session.tabs.entries()) {
-            disposeTab(tab, tabId, session);
+    for (const [runtimeKey, runtime] of getRuntimeMap(appState).entries()) {
+        if (!(runtime.subscribers instanceof Map)) continue;
+        for (const [connectionId, subscriber] of runtime.subscribers.entries()) {
+            if (subscriber.sid !== sid) continue;
+            try { subscriber.res.end(); } catch (_) { }
+            runtime.subscribers.delete(connectionId);
+        }
+        if (runtime.subscribers.size === 0) {
+            scheduleDisconnectedTabCleanup(runtime, runtimeKey, { runtimes: getRuntimeMap(appState) });
         }
     }
 
@@ -994,7 +997,7 @@ async function handleWebChat(req, res, appConfig, appState) {
     const agentOverride = agentOverrideRaw.trim();
     const launchOptions = resolveWebchatLaunchOptions(parsedUrl);
     let effectiveConfig = appConfig;
-    let agentQuery = '';
+    let agentQuery = buildWebchatQuery(parsedUrl);
 
     if (agentOverride) {
         const overrideCommands = resolveWebchatCommandsForAgent(agentOverride, {
@@ -1034,38 +1037,6 @@ async function handleWebChat(req, res, appConfig, appState) {
         return res.end(JSON.stringify({ ok: authorized(req) }));
     }
 
-    if (pathname === '/feedback' && req.method === 'POST') {
-        const sid = getSession(req, appState);
-        const session = appState.sessions.get(sid);
-        let body;
-        try {
-            body = await readJsonBody(req);
-        } catch (_) {
-            res.writeHead(400, { 'Content-Type': 'application/json' });
-            return res.end(JSON.stringify({ ok: false, error: 'invalid_json' }));
-        }
-        const tabId = String(body?.tabId || '').trim();
-        const messageId = String(body?.messageId || '').trim();
-        const rating = body?.rating === 'up' || body?.rating === 'down' ? body.rating : null;
-        const tab = session?.tabs?.get(tabId);
-        if (!tab?.transcript?.conversationId || !messageId) {
-            res.writeHead(404, { 'Content-Type': 'application/json' });
-            return res.end(JSON.stringify({ ok: false, error: 'message_not_found' }));
-        }
-        try {
-            const updated = setTranscriptTurnRating(tab.transcript.conversationId, messageId, rating);
-            if (!updated) {
-                res.writeHead(404, { 'Content-Type': 'application/json' });
-                return res.end(JSON.stringify({ ok: false, error: 'message_not_found' }));
-            }
-            res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
-            return res.end(JSON.stringify({ ok: true }));
-        } catch (error) {
-            res.writeHead(500, { 'Content-Type': 'application/json' });
-            return res.end(JSON.stringify({ ok: false, error: error?.message || 'feedback_failed' }));
-        }
-    }
-
     if (pathname.startsWith('/assets/')) {
         const rel = pathname.substring('/assets/'.length);
         const assetPath = staticSrv.resolveAssetPath(appName, fallbackAppPath, rel);
@@ -1080,13 +1051,66 @@ async function handleWebChat(req, res, appConfig, appState) {
         return redirectToRouterLogin(req, res, parsedUrl, agentOverride);
     }
 
+    const workspaceBase = resolveWebchatWorkspaceBase(parsedUrl);
+    const workspaceDirectory = workspaceBase.base;
+
+    if (pathname === '/sessions' && req.method === 'GET') {
+        try {
+            const payload = listWorkspaceSessions(workspaceDirectory);
+            res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+            return res.end(JSON.stringify({ ok: true, ...payload }));
+        } catch (error) {
+            res.writeHead(500, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+            return res.end(JSON.stringify({ ok: false, error: error?.message || 'session_store_unavailable' }));
+        }
+    }
+
+    if (pathname === '/sessions' && req.method === 'POST') {
+        try {
+            const created = createWorkspaceSession(workspaceDirectory);
+            broadcastWorkspaceSessionChange(appState, workspaceDirectory, created);
+            res.writeHead(201, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+            return res.end(JSON.stringify({ ok: true, session: summarizeSession(created) }));
+        } catch (error) {
+            res.writeHead(500, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+            return res.end(JSON.stringify({ ok: false, error: error?.message || 'session_create_failed' }));
+        }
+    }
+
+    if (pathname === '/sessions/current' && req.method === 'PUT') {
+        let body;
+        try {
+            body = await readJsonBody(req);
+            const selected = selectWorkspaceSession(workspaceDirectory, body?.sessionId);
+            broadcastWorkspaceSessionChange(appState, workspaceDirectory, selected);
+            res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+            return res.end(JSON.stringify({ ok: true, session: summarizeSession(selected) }));
+        } catch (error) {
+            const status = /invalid_session|ENOENT/.test(String(error?.message || error)) ? 400 : 500;
+            res.writeHead(status, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+            return res.end(JSON.stringify({ ok: false, error: status === 400 ? 'invalid_session' : 'session_select_failed' }));
+        }
+    }
+
+    if (pathname.startsWith('/sessions/') && req.method === 'GET') {
+        try {
+            const sessionId = decodeURIComponent(pathname.slice('/sessions/'.length));
+            const loaded = loadWorkspaceSession(workspaceDirectory, sessionId);
+            res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+            return res.end(JSON.stringify({ ok: true, session: loaded }));
+        } catch (error) {
+            const status = /invalid_session|ENOENT/.test(String(error?.message || error)) ? 404 : 500;
+            res.writeHead(status, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+            return res.end(JSON.stringify({ ok: false, error: status === 404 ? 'session_not_found' : 'session_load_failed' }));
+        }
+    }
+
     if (pathname === '/suggestions/files' && (req.method === 'GET' || req.method === 'HEAD')) {
         return handleSuggestionsFiles(req, res, parsedUrl, appState);
     }
 
     if (pathname === '/uploads') {
         const sessionId = getSession(req, appState);
-        const workspaceBase = resolveWebchatWorkspaceBase(parsedUrl);
         const uploadContext = resolveWebchatUploadContext({ workspaceBase, sessionId });
         if (req.method === 'POST' || req.method === 'PUT') {
             return handleWebchatUploadPost(req, res, parsedUrl, uploadContext);
@@ -1103,7 +1127,12 @@ async function handleWebChat(req, res, appConfig, appState) {
     }
 
     if (pathname === '/' || pathname === '/index.html') {
-        const workspaceBase = resolveWebchatWorkspaceBase(parsedUrl);
+        try {
+            ensureCurrentSession(workspaceDirectory);
+        } catch (error) {
+            res.writeHead(500, { 'Content-Type': 'text/plain', 'Cache-Control': 'no-store' });
+            return res.end(`Unable to initialize WebChat history: ${error?.message || 'session_store_unavailable'}`);
+        }
         const html = renderTemplate(['chat.html', 'index.html'], {
             '__ASSET_BASE__': `/${appName}/assets`,
             '__AGENT_NAME__': effectiveConfig.agentName || '',
@@ -1127,92 +1156,30 @@ async function handleWebChat(req, res, appConfig, appState) {
 
     if (pathname === '/stream') {
         const sid = getSession(req, appState);
-        const session = appState.sessions.get(sid);
-        const tabId = parsedUrl.searchParams.get('tabId');
-        if (!session || !tabId) { res.writeHead(400); return res.end(); }
+        const tabId = String(parsedUrl.searchParams.get('tabId') || '').trim();
+        if (!sid || !tabId) { res.writeHead(400); return res.end(); }
 
-        // CRITICAL FIX: Global limit across ALL sessions to prevent system-wide overload
-        const MAX_GLOBAL_TTYS = 20;
-        let globalTabCount = 0;
-        for (const sess of appState.sessions.values()) {
-            if (sess.tabs instanceof Map) {
-                globalTabCount += sess.tabs.size;
-            }
+        let currentSession;
+        try {
+            currentSession = ensureCurrentSession(workspaceDirectory);
+        } catch (_) {
+            res.writeHead(500); return res.end('Session store unavailable.');
         }
+        const runtimes = getRuntimeMap(appState);
+        const runtimeKey = buildRuntimeKey(workspaceDirectory, currentSession.sessionId, effectiveConfig, agentQuery);
+        let tab = runtimes.get(runtimeKey);
 
-        if (globalTabCount >= MAX_GLOBAL_TTYS) {
-            res.writeHead(503, {
-                'Content-Type': 'text/plain',
-                'Retry-After': '30'
-            });
-            res.end('Server at capacity. Please try again later.');
-            return;
+        if (!tab && runtimes.size >= 20) {
+            res.writeHead(503, { 'Content-Type': 'text/plain', 'Retry-After': '30' });
+            return res.end('Server at capacity. Please try again later.');
         }
-
-        // CRITICAL FIX: Limit concurrent connections per session to prevent process spawn leak
-        const MAX_CONCURRENT_TTYS = 3;
-        if (session.tabs.size >= MAX_CONCURRENT_TTYS) {
-            res.writeHead(429, {
-                'Content-Type': 'text/plain',
-                'Retry-After': '5'
-            });
-            res.end('Too many concurrent connections. Please close other tabs or wait.');
-            return;
-        }
-
-        let tab = session.tabs.get(tabId);
-
-        // CRITICAL FIX: Debounce rapid reconnections to prevent connection storms
-        const now = Date.now();
-        const MIN_RECONNECT_INTERVAL_MS = 1000; // 1 second
-
-        if (tab && tab.lastConnectTime && (now - tab.lastConnectTime) < MIN_RECONNECT_INTERVAL_MS) {
-            res.writeHead(429, {
-                'Content-Type': 'text/plain',
-                'Retry-After': '1'
-            });
-            res.end('Reconnecting too fast. Please wait.');
-            return;
-        }
-
         if (!tab && !effectiveConfig.ttyFactory) {
             res.writeHead(503, { 'Content-Type': 'text/plain' });
-            res.end(effectiveConfig.unavailableReason || 'WebChat is not available for this agent.');
-            return;
+            return res.end(effectiveConfig.unavailableReason || 'WebChat is not available for this agent.');
         }
-
-        res.writeHead(200, {
-            'Content-Type': 'text/event-stream',
-            'Connection': 'keep-alive',
-            'Cache-Control': 'no-cache',
-            'x-accel-buffering': 'no',
-            'alt-svc': 'clear'  // Force HTTP/2, disable HTTP/3 to prevent QUIC errors
-        });
-        res.write(': connected\n\n');
-
-        const KEEPALIVE_INTERVAL_MS = 15000;
-        let keepaliveTimer = null;
-
-        const startKeepalive = () => {
-            if (keepaliveTimer || !Number.isFinite(KEEPALIVE_INTERVAL_MS) || KEEPALIVE_INTERVAL_MS <= 0) {
-                return;
-            }
-            keepaliveTimer = setInterval(() => {
-                try {
-                    res.write(': keepalive\n\n');
-                } catch (_) {
-                    clearInterval(keepaliveTimer);
-                    keepaliveTimer = null;
-                }
-            }, KEEPALIVE_INTERVAL_MS);
-            keepaliveTimer.unref?.();
-        };
-
-        startKeepalive();
 
         if (!tab) {
             try {
-                // Extract SSO user context if available
                 const ssoUser = req.user && req.authMode === 'sso' ? {
                     id: req.user.id,
                     username: req.user.username,
@@ -1220,157 +1187,155 @@ async function handleWebChat(req, res, appConfig, appState) {
                     roles: req.user.roles || [],
                     sessionId: req.sessionId || null
                 } : null;
-
-                let transcript = null;
-                try {
-                    const transcriptContext = buildTranscriptContext(req, appState, tabId);
-                    const createdTranscript = createTranscriptConversation({
-                        agentName: effectiveConfig.agentName || effectiveConfig.displayName || 'webchat',
-                        runtime: effectiveConfig.runtime || 'local',
-                        authMode: transcriptContext.authMode,
-                        sessionId: transcriptContext.sessionId,
-                        userId: transcriptContext.userId,
-                        tabId: transcriptContext.tabId
-                    });
-                    transcript = {
-                        conversationId: createdTranscript.conversationId,
+                const tty = effectiveConfig.ttyFactory.create(ssoUser, {
+                    sessionId: currentSession.sessionId,
+                    hasHistory: currentSession.messages.length > 0
+                });
+                tab = {
+                    tty,
+                    subscribers: new Map(),
+                    createdAt: Date.now(),
+                    pid: tty.pid || null,
+                    cleanupTimer: null,
+                    ttyClosed: false,
+                    runtimeKey,
+                    sessionId: currentSession.sessionId,
+                    workspaceDirectory,
+                    continuationContext: formatContinuationContext(currentSession),
+                    continuationPending: currentSession.messages.length > 0,
+                    workspaceHistory: {
+                        workspaceDirectory,
+                        sessionId: currentSession.sessionId,
                         buffer: '',
                         lastClientText: '',
                         userInputSent: false,
-                        lastAssistantMessageId: null,
-                        lastUserMessageId: null,
-                        currentTurnId: null
-                    };
-                } catch (_) {
-                    transcript = null;
-                }
-
-                const tty = effectiveConfig.ttyFactory.create(ssoUser);
-                tab = {
-                    tty,
-                    sseRes: res,
-                    lastConnectTime: now,
-                    createdAt: now,
-                    pid: tty.pid || null,
-                    cleanupTimer: null,
-                    pendingSseEvents: [],
-                    ttyClosed: false,
-                    transcript
+                        lastAssistantMessageIndex: null
+                    }
                 };
-                session.tabs.set(tabId, tab);
+                runtimes.set(runtimeKey, tab);
 
                 tty.onOutput((data) => {
-                    const transcriptEvents = captureTranscriptOutput(tab, data);
-                    writeOrBufferSseEvent(tab, `data: ${JSON.stringify(data)}\n\n`);
-                    for (const meta of transcriptEvents) {
-                        writeOrBufferSseEvent(tab, 'event: message-meta\n');
-                        writeOrBufferSseEvent(tab, `data: ${JSON.stringify(meta)}\n\n`);
-                    }
+                    captureWorkspaceHistoryOutput(tab, data);
+                    broadcastWorkspaceRuntimeEvent(
+                        appState,
+                        workspaceDirectory,
+                        currentSession.sessionId,
+                        `data: ${JSON.stringify(data)}\n\n`
+                    );
                 });
                 tty.onClose(() => {
-                    writeOrBufferSseEvent(tab, 'event: close\n');
-                    writeOrBufferSseEvent(tab, 'data: {}\n\n');
-                    // Clear force kill timer since process closed normally
-                    if (tab.cleanupTimer) {
-                        clearTimeout(tab.cleanupTimer);
-                        tab.cleanupTimer = null;
-                    }
+                    writeOrBufferSseEvent(tab, 'event: close\ndata: {}\n\n');
                     tab.ttyClosed = true;
                     tab.tty = null;
-                    if (tab.sseRes) {
-                        // Ensure tab resources are fully released so the next reconnect
-                        // creates a fresh TTY session instead of writing into a dead process.
-                        disposeTab(tab, tabId, session);
-                    } else {
-                        scheduleDisconnectedTabCleanup(tab, tabId, session);
-                    }
+                    disposeTab(tab, runtimeKey, { runtimes });
                 });
-
-            } catch (e) {
-                console.error(`[webchat] Failed to create chat session: ${e?.message || e}`);
-                if (!res.headersSent) {
-                    res.writeHead(500);
-                }
-                try { res.end('Failed to create chat session: ' + (e?.message || e)); } catch (_) { }
-                return;
-            }
-        } else {
-            // Reusing existing tab
-            if (tab.cleanupTimer) {
-                clearTimeout(tab.cleanupTimer);
-                tab.cleanupTimer = null;
-            }
-            tab.sseRes = res;
-            tab.lastConnectTime = now;
-            flushPendingSseEvents(tab);
-            if (tab.ttyClosed) {
-                disposeTab(tab, tabId, session);
-                return;
+            } catch (error) {
+                console.error(`[webchat] Failed to create folder session runtime: ${error?.message || error}`);
+                res.writeHead(500, { 'Content-Type': 'text/plain' });
+                return res.end(`Failed to create chat session: ${error?.message || error}`);
             }
         }
 
-        req.on('close', () => {
-            const pid = tab.pid || tab.tty?.pid;
-            console.log(`[webchat] Connection closed for tab ${tabId}, tty pid=${pid}`);
+        if (tab.cleanupTimer) {
+            clearTimeout(tab.cleanupTimer);
+            tab.cleanupTimer = null;
+        }
+        if (tab.ttyClosed) {
+            disposeTab(tab, runtimeKey, { runtimes });
+            res.writeHead(409); return res.end('Session runtime closed. Reconnect to create a new process.');
+        }
+        if (tab.subscribers.size >= 12) {
+            res.writeHead(429, { 'Content-Type': 'text/plain', 'Retry-After': '5' });
+            return res.end('Too many clients connected to this folder session.');
+        }
 
-            if (keepaliveTimer) {
-                clearInterval(keepaliveTimer);
-                keepaliveTimer = null;
-            }
-            if (tab.sseRes === res || !tab.sseRes) {
-                tab.sseRes = null;
-                scheduleDisconnectedTabCleanup(tab, tabId, session);
+        res.writeHead(200, {
+            'Content-Type': 'text/event-stream',
+            'Connection': 'keep-alive',
+            'Cache-Control': 'no-cache',
+            'x-accel-buffering': 'no',
+            'alt-svc': 'clear'
+        });
+        res.write(`: connected session=${currentSession.sessionId}\n\n`);
+        const connectionId = crypto.randomUUID();
+        tab.subscribers.set(connectionId, { res, sid, tabId });
+
+        let keepaliveTimer = setInterval(() => {
+            try { res.write(': keepalive\n\n'); } catch (_) { }
+        }, 15000);
+        keepaliveTimer.unref?.();
+
+        req.on('close', () => {
+            if (keepaliveTimer) clearInterval(keepaliveTimer);
+            keepaliveTimer = null;
+            tab.subscribers.delete(connectionId);
+            console.log(`[webchat] Client ${tabId} disconnected from folder session ${tab.sessionId}, tty pid=${tab.pid || tab.tty?.pid}`);
+            if (tab.subscribers.size === 0) {
+                scheduleDisconnectedTabCleanup(tab, runtimeKey, { runtimes });
             }
         });
         return;
     }
 
     if (pathname === '/input' && req.method === 'POST') {
-        const sid = getSession(req, appState);
-        const session = appState.sessions.get(sid);
-        const tabId = parsedUrl.searchParams.get('tabId');
-        const tab = session && session.tabs.get(tabId);
-        if (!tab) { res.writeHead(400); return res.end(); }
+        const tabId = String(parsedUrl.searchParams.get('tabId') || '').trim();
+        let currentSession;
+        try {
+            currentSession = ensureCurrentSession(workspaceDirectory);
+        } catch (_) {
+            res.writeHead(500); return res.end('Session store unavailable.');
+        }
+        const runtimes = getRuntimeMap(appState);
+        const runtimeKey = buildRuntimeKey(workspaceDirectory, currentSession.sessionId, effectiveConfig, agentQuery);
+        const tab = runtimes.get(runtimeKey);
+        if (!tab?.tty || !tabId) { res.writeHead(409); return res.end('Session runtime unavailable.'); }
+
         let body = '';
         req.on('data', chunk => body += chunk.toString());
-        req.on('end', async () => {
-            let envelope;
-            try {
-                envelope = parseInputEnvelope(body);
-                const hasReferences = Array.isArray(envelope.references) && envelope.references.length > 0;
-                if (tab.transcript && (
-                    String(envelope.text || '').trim()
-                    || (Array.isArray(envelope.attachments) && envelope.attachments.length)
-                    || hasReferences
-                )) {
-                    const turnId = crypto.randomUUID();
-                    const created = appendTranscriptMessage(tab.transcript.conversationId, {
+        req.on('end', () => {
+            const envelope = parseInputEnvelope(body);
+            const hasReferences = Array.isArray(envelope.references) && envelope.references.length > 0;
+            const hasContent = String(envelope.text || '').trim()
+                || (Array.isArray(envelope.attachments) && envelope.attachments.length)
+                || hasReferences;
+            let appendedHistory = null;
+            if (hasContent) {
+                try {
+                    appendedHistory = appendSessionMessage(workspaceDirectory, currentSession.sessionId, {
                         role: 'user',
                         text: envelope.text,
                         attachments: envelope.attachments,
-                        metadata: {
-                            turnId,
-                            references: hasReferences ? envelope.references : undefined
-                        }
+                        references: envelope.references
                     });
-                    tab.transcript.lastClientText = String(envelope.text || '');
-                    tab.transcript.userInputSent = true;
-                    tab.transcript.lastAssistantMessageId = null;
-                    tab.transcript.lastUserMessageId = created.messageId;
-                    tab.transcript.currentTurnId = turnId;
-                }
-            } catch (_) {
-                // Ignore transcript capture errors.
+                    tab.workspaceHistory.lastClientText = String(envelope.text || '');
+                    tab.workspaceHistory.userInputSent = true;
+                    tab.workspaceHistory.lastAssistantMessageIndex = null;
+                    broadcastWorkspaceRuntimeEvent(appState, workspaceDirectory, currentSession.sessionId, `event: user-message\ndata: ${JSON.stringify({
+                        sourceTabId: tabId,
+                        messageIndex: appendedHistory.messageIndex,
+                        message: appendedHistory.message
+                    })}\n\n`);
+                } catch (_) { }
             }
+
+            const rawMessage = typeof envelope.text === 'string' ? envelope.text : body;
+            const shouldRestore = tab.continuationPending
+                && rawMessage.trim()
+                && !rawMessage.trimStart().startsWith('/');
+            const agentMessage = shouldRestore
+                ? `${tab.continuationContext}\n\n[New user message]\n${rawMessage}`
+                : rawMessage;
+            if (shouldRestore) tab.continuationPending = false;
+            const agentEnvelope = { ...envelope, text: agentMessage };
             const text = shouldForwardWebchatEnvelope(parsedUrl, effectiveConfig)
                 ? serializeWebchatEnvelopeForAgent({
                     req,
                     effectiveConfig,
                     tabId,
-                    envelope: envelope || { text: body, attachments: [] },
-                    fallbackText: body
+                    envelope: agentEnvelope,
+                    fallbackText: agentMessage
                 })
-                : ((envelope && typeof envelope.text === 'string') ? envelope.text : body);
+                : agentMessage;
             tab.tty.write(`${text}\n`);
             res.writeHead(204); res.end();
         });
@@ -1378,17 +1343,19 @@ async function handleWebChat(req, res, appConfig, appState) {
     }
 
     if (pathname === '/control' && req.method === 'POST') {
-        const sid = getSession(req, appState);
-        const session = appState.sessions.get(sid);
-        const tabId = parsedUrl.searchParams.get('tabId');
-        const tab = session && session.tabs.get(tabId);
-        if (!tab) { res.writeHead(400); return res.end(); }
+        let currentSession;
+        try {
+            currentSession = ensureCurrentSession(workspaceDirectory);
+        } catch (_) {
+            res.writeHead(500); return res.end();
+        }
+        const runtimeKey = buildRuntimeKey(workspaceDirectory, currentSession.sessionId, effectiveConfig, agentQuery);
+        const tab = getRuntimeMap(appState).get(runtimeKey);
+        if (!tab?.tty) { res.writeHead(409); return res.end(); }
         let body = '';
         req.on('data', chunk => body += chunk.toString());
         req.on('end', () => {
-            try {
-                tab.tty.write(body);
-            } catch (_) { }
+            try { tab.tty.write(body); } catch (_) { }
             res.writeHead(204); res.end();
         });
         return;

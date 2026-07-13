@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createLocalTTYFactory } from '../../cli/server/webchat/tty.js';
+import { buildWebchatSessionEnv, createLocalTTYFactory } from '../../cli/server/webchat/tty.js';
 
 // global.processKill is normally installed by RoutingServer; provide a no-op so
 // the handle's kill()/dispose() paths don't throw when run in isolation.
@@ -8,10 +8,31 @@ if (typeof global.processKill !== 'function') {
     global.processKill = () => {};
 }
 
-function makeSession(command) {
+function makeSession(command, sessionContext = {}) {
     const factory = createLocalTTYFactory({ workdir: process.cwd(), command });
-    return factory.create({ username: 'guest', id: 'guest', roles: ['guest'] });
+    return factory.create({ username: 'guest', id: 'guest', roles: ['guest'] }, sessionContext);
 }
+
+const SESSION_ID = '12345678-1234-4123-8123-123456789abc';
+
+test('webchat child_process: session metadata is validated and exposed through env', async () => {
+    assert.deepEqual(buildWebchatSessionEnv({ sessionId: SESSION_ID, hasHistory: true }), {
+        PLOINKY_WEBCHAT_SESSION_ID: SESSION_ID,
+        PLOINKY_WEBCHAT_HAS_HISTORY: '1'
+    });
+    assert.deepEqual(buildWebchatSessionEnv({ sessionId: '../unsafe', hasHistory: true }), {});
+
+    const session = makeSession(
+        `sh -c 'printf "%s|%s" "$PLOINKY_WEBCHAT_SESSION_ID" "$PLOINKY_WEBCHAT_HAS_HISTORY"'`,
+        { sessionId: SESSION_ID, hasHistory: true }
+    );
+    const chunks = [];
+    await new Promise((resolve) => {
+        session.onOutput((data) => chunks.push(data));
+        session.onClose(resolve);
+    });
+    assert.match(chunks.join(''), new RegExp(`${SESSION_ID}\\|1`));
+});
 
 test('webchat child_process: output is delivered as a string, not a Buffer', async () => {
     const session = makeSession("sh -c 'printf WEBCHAT_OK'");

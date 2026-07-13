@@ -93,35 +93,7 @@ Node-based agents consume a prepared, runtime-keyed dependency cache. `ploinky s
 - A manifest `cli` that points to a plain shell such as `"/bin/sh"` or `"/bin/bash"` does not become conversational by itself. In that setup WebChat mirrors raw input to the shell, and the shell may simply echo or mis-handle the incoming payload.
 - The recommended pattern is a dedicated CLI entrypoint such as `node /code/main.mjs` that parses WebChat input and keeps running for the full session.
 - `ploinky cli <agent>` and WebChat share the same manifest `cli`, so the same command must be suitable for both interactive terminal use and WebChat streaming input.
-
-## Encrypted transcripts
-
-Ploinky can persist WebChat transcripts in an encrypted store and expose them in the Dashboard.
-
-- Transcript files are stored under `.ploinky/transcripts/`.
-- Message content is encrypted at rest; normal router logs remain operational and should not contain conversation bodies.
-- The transcript viewer is available in `Dashboard -> Transcripts`.
-- WebChat feedback is stored at turn level: a `like` / `dislike` applies to the paired `user` prompt and `assistant` reply, not just to the assistant message in isolation.
-- Feedback analytics are available in `Dashboard -> Feedback`.
-- The dashboard feedback API is exposed at `GET /dashboard/api/feedback` and returns aggregate counts plus the rated turns list.
-- Feedback aggregation uses the assistant reply as the source of truth for a rated turn, then resolves the paired user prompt from transcript metadata to avoid double counting.
-
-Relevant configuration:
-
-- `PLOINKY_TRANSCRIPTS_MASTER_KEY`
-  Used to derive the master encryption key for transcript storage.
-- `PLOINKY_TRANSCRIPT_RETENTION_DAYS`
-  Retention window for transcript files. Default is 30 days.
-- `PLOINKY_TRANSCRIPT_VIEWER_ROLES`
-  Comma-separated SSO roles allowed to read transcripts. Default is `admin,security`.
-- `PLOINKY_TRANSCRIPT_VIEWER_ALLOW_LOCAL`
-  When set to `1`/`true`, transcript viewing is also allowed for local dashboard sessions.
-
-Access model:
-
-- SSO users need an allowed role from `PLOINKY_TRANSCRIPT_VIEWER_ROLES`.
-- Local auth users with `req.user` can view transcripts when `PLOINKY_TRANSCRIPT_VIEWER_ALLOW_LOCAL=1`.
-- Legacy dashboard token sessions can also view transcripts when `PLOINKY_TRANSCRIPT_VIEWER_ALLOW_LOCAL=1`.
+- At WebChat startup, the CLI receives `PLOINKY_WEBCHAT_SESSION_ID` and `PLOINKY_WEBCHAT_HAS_HISTORY`. Agents that emit a new-conversation introduction should omit it when `PLOINKY_WEBCHAT_HAS_HISTORY=1`; Ploinky supplies the prior conversation context with the next normal user message.
 
 ## Cloud (preview)
 

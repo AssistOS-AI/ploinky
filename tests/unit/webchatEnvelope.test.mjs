@@ -18,7 +18,7 @@ import { PLOINKY_WORKSPACE_ROOT } from '../../cli/services/config.js';
 
 test('resolveWebchatLaunchOptions forwards agent-owned launch flags unchanged', () => {
     const parsedUrl = new URL(
-        '/webchat?agent=achilles-cli&workspace-dir=projects/demo&feature-tags=1&forward-envelope=1',
+        '/webchat?agent=achilles-cli&workspace-dir=projects/demo&feature-tags=1&forward-envelope=1&tabId=t1&sessionId=s1',
         'http://localhost'
     );
     const { cliArgs } = resolveWebchatLaunchOptions(parsedUrl);
@@ -26,6 +26,8 @@ test('resolveWebchatLaunchOptions forwards agent-owned launch flags unchanged', 
     assert.ok(cliArgs.includes('--feature-tags=1'));
     assert.ok(cliArgs.includes('--forward-envelope=1'));
     assert.equal(cliArgs.some((arg) => arg.startsWith('--workspace-dir=')), false);
+    assert.equal(cliArgs.some((arg) => arg.startsWith('--tabId=')), false);
+    assert.equal(cliArgs.some((arg) => arg.startsWith('--sessionId=')), false);
 });
 
 test('manifest webchat forwardEnvelope opts an agent into WebChat envelopes', () => {
@@ -114,4 +116,18 @@ test('writeOrBufferSseEvent buffers disconnected WebChat output and flushes on r
     flushPendingSseEvents(tab);
     assert.deepEqual(written, ['data: "first"\n\n', 'event: close\n']);
     assert.deepEqual(tab.pendingSseEvents, []);
+});
+
+test('writeOrBufferSseEvent broadcasts folder-session output to all subscribers', () => {
+    const first = [];
+    const second = [];
+    const runtime = {
+        subscribers: new Map([
+            ['first', { res: { write: (payload) => first.push(payload) } }],
+            ['second', { res: { write: (payload) => second.push(payload) } }]
+        ])
+    };
+    writeOrBufferSseEvent(runtime, 'data: "shared"\n\n');
+    assert.deepEqual(first, ['data: "shared"\n\n']);
+    assert.deepEqual(second, ['data: "shared"\n\n']);
 });

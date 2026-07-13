@@ -4,8 +4,9 @@ import { findMentionRanges } from './composerMentionHighlights.js';
 const ENABLE_SELECT_PAGINATION_ACTIONS = false;
 const AUTO_SCROLL_BOTTOM_THRESHOLD_PX = 4;
 
-function formatTime() {
-    const date = new Date();
+function formatTime(timestamp = null) {
+    const parsed = timestamp ? new Date(timestamp) : new Date();
+    const date = Number.isNaN(parsed.getTime()) ? new Date() : parsed;
     const hours = String(date.getHours()).padStart(2, '0');
     const minutes = String(date.getMinutes()).padStart(2, '0');
     return `${hours}:${minutes}`;
@@ -1027,15 +1028,15 @@ export function createMessages({
         });
     }
 
-    function addClientMsg(text) {
-        lastClientCommand = text;
+    function addClientMsg(text, options = {}) {
+        if (!options.historical) lastClientCommand = text;
         const wrapper = document.createElement('div');
         wrapper.className = 'wa-message out';
         wrapper.innerHTML = `
             <div class="wa-message-bubble">
                 <div class="wa-message-text"></div>
                 <span class="wa-message-time">
-                    ${formatTime()}
+                    ${formatTime(options.timestamp)}
                     <svg class="wa-seen-icon" width="10" height="9" viewBox="5.75 -1.55 9.75 9" fill="currentColor"><path d="M11.071.653a.5.5 0 0 0-.707.707l3.289 3.289a.5.5 0 0 0 .707 0L15.354 3.656a.5.5 0 0 0-.707-.707L14 3.596 11.071.653zm-4.207 0a.5.5 0 0 0-.707.707l3.289 3.289a.5.5 0 0 0 .707 0l.994-.993a.5.5 0 0 0-.707-.707L9.793 3.596 6.864.653z"/></svg>
                 </span>
             </div>`;
@@ -1238,24 +1239,7 @@ export function createMessages({
         };
     }
 
-    function setLastServerMessageMeta({ messageId = '', rating = null } = {}) {
-        const bubble = lastServerMsg?.bubble;
-        if (!bubble) {
-            return false;
-        }
-        const normalizedId = typeof messageId === 'string' ? messageId.trim() : '';
-        if (normalizedId) {
-            bubble.dataset.messageId = normalizedId;
-        }
-        if (rating === 'up' || rating === 'down') {
-            bubble.dataset.rating = rating;
-        } else if (rating === null) {
-            delete bubble.dataset.rating;
-        }
-        return true;
-    }
-
-    function addServerMsg(text) {
+    function addServerMsg(text, options = {}) {
         let normalized = typeof text === 'string' ? text : '';
 
         // Filter out raw envelope JSON to prevent it from appearing in chat
@@ -1290,7 +1274,7 @@ export function createMessages({
         }
 
         const previousFullText = typeof lastServerMsg.fullText === 'string' ? lastServerMsg.fullText : '';
-        const appendToExisting = !userInputSent && lastServerMsg.bubble;
+        const appendToExisting = !options.forceNew && !userInputSent && lastServerMsg.bubble;
 
         if (appendToExisting) {
             const combined = previousFullText ? `${previousFullText}\n${normalized}` : normalized;
@@ -1319,7 +1303,7 @@ export function createMessages({
             }
             const timeNode = bubble.querySelector('.wa-message-time');
             if (timeNode) {
-                timeNode.textContent = formatTime();
+                timeNode.textContent = formatTime(options.timestamp);
             }
             appendMessageEl(wrapper);
         }
@@ -1328,12 +1312,53 @@ export function createMessages({
         return true;
     }
 
+    function formatStoredMessageText(message) {
+        const parts = [typeof message?.text === 'string' ? message.text : ''];
+        if (Array.isArray(message?.attachments)) {
+            for (const attachment of message.attachments) {
+                const label = attachment?.filename || attachment?.relativePath || attachment?.localPath || 'Attachment';
+                const url = attachment?.downloadUrl;
+                parts.push(url ? `[${label}](${url})` : `[Attachment: ${label}]`);
+            }
+        }
+        return parts.filter(Boolean).join('\n\n');
+    }
+
+    function clearMessages() {
+        if (!chatList) return;
+        const children = Array.from(chatList.children);
+        for (const child of children) {
+            if (child !== typingIndicator) child.remove();
+        }
+        lastServerMsg.bubble = null;
+        lastServerMsg.fullText = '';
+        lastClientCommand = '';
+        userInputSent = false;
+        resetProgressEvents();
+        hideTypingIndicator(true);
+    }
+
+    function renderHistory(historyMessages = []) {
+        clearMessages();
+        for (const message of Array.isArray(historyMessages) ? historyMessages : []) {
+            const text = formatStoredMessageText(message);
+            if (message?.role === 'user') {
+                addClientMsg(text, { historical: true, timestamp: message.timestamp });
+            } else if (message?.role === 'assistant') {
+                addServerMsg(text, { forceNew: true, timestamp: message.timestamp });
+            }
+        }
+        lastClientCommand = '';
+        userInputSent = false;
+    }
+
     return {
         addClientMsg,
         addClientAttachment,
         addServerMsg,
+        clearMessages,
+        renderHistory,
         addProgressEvent,
-        setLastServerMessageMeta,
         showTypingIndicator,
         hideTypingIndicator,
         applyViewMoreSettingToAllBubbles,

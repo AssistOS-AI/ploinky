@@ -89,11 +89,22 @@ ploinky webchat --rotate # show the same login URL</code></pre>
 
 # launches the selected agent as:
 ploinky cli achilles-cli --path=/absolute/path</code></pre>
-                    <p>The router reserves <code>agent</code> for agent selection and <code>tabId</code> for the browser session stream. Agent CLIs are responsible for interpreting any forwarded flags and values.</p>
+                    <p>The router reserves <code>agent</code> for agent selection, <code>tabId</code> for the browser client, and <code>sessionId</code> for folder-history routing. These internal values are not forwarded as agent CLI flags. Agent CLIs remain responsible for interpreting ordinary forwarded flags and values.</p>
                 </div>
 
                 <div class="doc-section">
                     <h2>Session Experience</h2>
+                    <h3>Folder Sessions</h3>
+                    <p>WebChat stores its selectable continuation history under <code>&lt;cwd&gt;/.copilot_history/</code>. The folder contains <code>current_session.json</code> plus one JSON file per conversation. Refreshing the page reuses the selected folder session and a surviving agent process, while the browser keeps its client-only <code>tabId</code> in <code>sessionStorage</code>.</p>
+                    <ul style="margin-left: 2rem;">
+                        <li><strong>Load History</strong> renders the current session only when requested. The composer remains available while older messages are hidden.</li>
+                        <li><strong>New+</strong> creates an empty session and makes it current for the folder.</li>
+                        <li><strong>Load Session</strong> lists the first user-message preview and relative activity time, such as <code>2 days ago</code>, without message counts or agent metadata.</li>
+                        <li>Connected browser clients using the same working directory receive session changes and new turns through the shared EventSource runtime.</li>
+                    </ul>
+                    <p>If the original process no longer exists, the next conversational message carries the prior messages in a delimited context block. Historical inputs are not replayed as commands. Slash commands remain unchanged and defer restoration until a later conversational message.</p>
+                    <p>A newly started CLI receives <code>PLOINKY_WEBCHAT_SESSION_ID</code> and <code>PLOINKY_WEBCHAT_HAS_HISTORY</code>. A value of <code>1</code> tells a generic agent that this is an existing conversation, so it should not emit new-conversation startup content. Empty sessions, including those created by <strong>New+</strong>, receive <code>0</code>.</p>
+
                     <h3>Message Rendering</h3>
                     <ul style="margin-left: 2rem;">
                         <li>✅ Automatic timestamps for each exchange</li>
@@ -128,6 +139,7 @@ ploinky cli achilles-cli --path=/absolute/path</code></pre>
                     <ul style="margin-left: 2rem;">
                         <li>Use HTTPS or SSH tunnels when exposing the WebChat URL beyond localhost.</li>
                         <li>Protect router session cookies and the encrypted <code>.ploinky/.secrets</code> store used by local auth, dashboard tokens, and manifest env.</li>
+                        <li><code>.copilot_history</code> is authenticated, workspace-confined project state but is plaintext. It receives a local <code>.gitignore</code> to reduce accidental commits.</li>
                     </ul>
                 </div>
 

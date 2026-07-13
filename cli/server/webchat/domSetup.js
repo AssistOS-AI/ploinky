@@ -31,7 +31,6 @@ function readInitialViewMoreLimit() {
 }
 
 export function initDom() {
-    const TAB_ID = crypto.randomUUID();
     const dlog = () => {};
 
     const body = document.body;
@@ -69,6 +68,13 @@ export function initDom() {
     const fileUploadInput = document.getElementById('fileUploadInput');
     const folderUploadInput = document.getElementById('folderUploadInput');
     const filePreviewContainer = document.getElementById('filePreviewContainer');
+    const newSessionBtn = document.getElementById('newSessionBtn');
+    const loadSessionBtn = document.getElementById('loadSessionBtn');
+    const historyGate = document.getElementById('historyGate');
+    const loadHistoryBtn = document.getElementById('loadHistoryBtn');
+    const sessionDialog = document.getElementById('sessionDialog');
+    const sessionDialogClose = document.getElementById('sessionDialogClose');
+    const sessionList = document.getElementById('sessionList');
 
     const requiresAuth = body.dataset.auth === 'true';
     const agentName = (body.dataset.agent || '').trim();
@@ -76,6 +82,15 @@ export function initDom() {
     const basePath = (body.dataset.base || '').replace(/\/$/, '') || '';
     const agentQuery = (body.dataset.agentQuery || '').trim();
     const workdir = (body.dataset.workdir || '').trim();
+    const tabStorageKey = `webchat_tab_id:${workdir}:${agentQuery}`;
+    let TAB_ID = '';
+    try {
+        TAB_ID = sessionStorage.getItem(tabStorageKey) || '';
+    } catch (_) { }
+    if (!TAB_ID) {
+        TAB_ID = crypto.randomUUID();
+        try { sessionStorage.setItem(tabStorageKey, TAB_ID); } catch (_) { }
+    }
 
     const launchConfig = {};
     try {
@@ -209,6 +224,7 @@ export function initDom() {
         basePath,
         agentName,
         displayName: appTitle,
+        workdir,
         launchConfig,
         toEndpoint,
         showBanner,
@@ -249,6 +265,13 @@ export function initDom() {
             folderUploadInput,
             filePreviewContainer,
             attachmentContainer,
+            newSessionBtn,
+            loadSessionBtn,
+            historyGate,
+            loadHistoryBtn,
+            sessionDialog,
+            sessionDialogClose,
+            sessionList,
         },
     };
 }

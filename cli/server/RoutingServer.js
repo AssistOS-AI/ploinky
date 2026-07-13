@@ -87,7 +87,7 @@ if (!global.processKill) {
 }
 // Global state for all services
 const globalState = {
-    webchat: { sessions: new Map() },
+    webchat: { sessions: new Map(), runtimes: new Map() },
     dashboard: { sessions: new Map() },
     status: { sessions: new Map() }
 };
@@ -739,8 +739,11 @@ server.listen(port, () => {
                 console.warn(`[ALERT] ${nodeProcessCount} node processes running (max safe: ${MAX_SAFE_NODE_PROCESSES})`);
 
                 // Log active sessions for debugging
-                let totalTabs = 0;
+                let totalTabs = globalState.webchat?.runtimes instanceof Map
+                    ? globalState.webchat.runtimes.size
+                    : 0;
                 for (const state of Object.values(globalState)) {
+                    if (state === globalState.webchat) continue;
                     if (state.sessions instanceof Map) {
                         for (const session of state.sessions.values()) {
                             if (session.tabs instanceof Map) {

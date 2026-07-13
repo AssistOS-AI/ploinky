@@ -9,6 +9,7 @@ import { createSlashCommandsProvider } from './autocompleteProviders/slashComman
 import { createWorkspacePathsProvider } from './autocompleteProviders/workspacePaths.js';
 import { createAutocompleteState } from './autocompleteState.js';
 import { createComposerMentionHighlighter } from './composerMentionHighlights.js';
+import { createSessionController } from './sessions.js';
 
 const PURGE_TRIGGER_RE = /\bpurge\b/i;
 const EDITABLE_TAGS = ['INPUT', 'TEXTAREA', 'SELECT', 'OPTION'];
@@ -53,7 +54,14 @@ const {
     folderUploadInput,
     filePreviewContainer,
     attachmentContainer,
-    cancelBtn
+    cancelBtn,
+    newSessionBtn,
+    loadSessionBtn,
+    historyGate,
+    loadHistoryBtn,
+    sessionDialog,
+    sessionDialogClose,
+    sessionList
 } = elements;
 
 const sidePanelApi = createSidePanel({
@@ -86,6 +94,7 @@ dom.setViewMoreChangeHandler((limit) => {
 sidePanelApi.bindLinkDelegation(chatList);
 
 dlog('Initializing network for agent:', dom.agentName);
+let sessionController = null;
 const network = createNetwork({
     TAB_ID,
     toEndpoint,
@@ -100,10 +109,28 @@ const network = createNetwork({
     addClientAttachment: messages.addClientAttachment,
     addServerMsg: messages.addServerMsg,
     addProgressEvent: messages.addProgressEvent,
-    setLastServerMessageMeta: messages.setLastServerMessageMeta,
     showTypingIndicator: messages.showTypingIndicator,
     hideTypingIndicator: messages.hideTypingIndicator,
-    markUserInputSent: messages.markUserInputSent
+    markUserInputSent: messages.markUserInputSent,
+    addRemoteUserMessage: (message, payload) => sessionController?.addRemoteUserMessage(message, payload),
+    onSessionChanged: (session) => sessionController?.handleExternalSessionChange(session)
+});
+
+sessionController = createSessionController({
+    toEndpoint,
+    elements: {
+        newSessionBtn,
+        loadSessionBtn,
+        historyGate,
+        loadHistoryBtn,
+        sessionDialog,
+        sessionDialogClose,
+        sessionList
+    },
+    messages,
+    network,
+    showBanner,
+    hideBanner
 });
 
 const composer = createComposer({
@@ -183,35 +210,6 @@ function initMessageToolbar() {
         return (fromDataset || fallback || '').trim();
     };
 
-    const setRating = (bubble, rating) => {
-        if (!bubble) {
-            return;
-        }
-        const menu = bubble.querySelector('.wa-context-menu');
-        if (!menu) {
-            return;
-        }
-        if (rating) {
-            bubble.dataset.rating = rating;
-        } else {
-            delete bubble.dataset.rating;
-        }
-        const upBtn = menu.querySelector('[data-action="thumb-up"]');
-        const downBtn = menu.querySelector('[data-action="thumb-down"]');
-        const mark = (btn, isActive) => {
-            if (!btn) {
-                return;
-            }
-            if (isActive) {
-                btn.dataset.active = 'true';
-            } else {
-                delete btn.dataset.active;
-            }
-        };
-        mark(upBtn, rating === 'up');
-        mark(downBtn, rating === 'down');
-    };
-
     const copyText = async (text) => {
         const value = (text || '').trim();
         if (!value) {
@@ -252,23 +250,6 @@ function initMessageToolbar() {
                 composer.focus();
             }
             return;
-        }
-        if (action === 'thumb-up' || action === 'thumb-down') {
-            const desired = action === 'thumb-up' ? 'up' : 'down';
-            const current = bubble?.dataset?.rating;
-            const next = current === desired ? '' : desired;
-            setRating(bubble, next);
-            const messageId = typeof bubble?.dataset?.messageId === 'string' ? bubble.dataset.messageId.trim() : '';
-            if (!messageId) {
-                setRating(bubble, current || '');
-                showBanner('Feedback unavailable for this message', 'err');
-                return;
-            }
-            try {
-                await network.sendFeedback(messageId, next || null);
-            } catch (_) {
-                setRating(bubble, current || '');
-            }
         }
     };
 
@@ -436,17 +417,11 @@ function initMessageToolbar() {
 
         let menu = bubble.querySelector('.wa-context-menu');
         if (!menu) {
-            const isAssistantMessage = !!(message && message.classList.contains('in'));
             menu = document.createElement('div');
-            menu.className = 'wa-context-menu';
-            if (!isAssistantMessage) {
-                menu.classList.add('wa-context-menu-compact');
-            }
+            menu.className = 'wa-context-menu wa-context-menu-compact';
             menu.innerHTML = `
                 <button type="button" data-action="copy" title="Copy">Copy</button>
                 <button type="button" data-action="insert" title="Insert into prompt">Insert</button>
-                ${isAssistantMessage ? '<button type="button" data-action="thumb-up" title="Thumb up">👍</button>' : ''}
-                ${isAssistantMessage ? '<button type="button" data-action="thumb-down" title="Thumb down">👎</button>' : ''}
             `;
             menu.addEventListener('click', (event) => {
                 const btn = event.target?.closest('button[data-action]');
@@ -645,7 +620,12 @@ document.addEventListener('keydown', (event) => {
             return;
         }
     }
+    try {
+        await sessionController.bootstrap();
+    } catch (error) {
+        showBanner(`Session initialization failed: ${error.message}`, 'err');
+        return;
+    }
     composerAutocomplete.refresh();
+    network.start();
 })();
-
-network.start();

@@ -5,7 +5,7 @@ Ploinky is a workspace-local runtime for repository-backed agents.
 ## Workspace model
 
 - The workspace root is the nearest directory that contains `.ploinky/`.
-- Runtime state lives under `.ploinky/`, including `agents.json`, `routing.json`, `.secrets`, `repos/`, `deps/`, `logs/`, `keys/`, and `transcripts/`.
+- Runtime state lives under `.ploinky/`, including `agents.json`, `routing.json`, `.secrets`, `repos/`, `deps/`, `logs/`, and `keys/`.
 - Agent repositories are cloned under `.ploinky/repos/<repo>/`.
 - The default `start` flow requires a static agent and router port the first time, then reuses the saved configuration.
 
@@ -34,8 +34,8 @@ Ploinky is a workspace-local runtime for repository-backed agents.
 
 ## Web surfaces
 
-- `/webchat`: chat surface over the same TTY stream, with encrypted transcript storage. When opened as `/webchat?agent=<name>&...`, the router forwards every additional query parameter except `tabId` to `ploinky cli <name>` as long-form CLI flags encoded as `--key=value`.
-- `/dashboard`: management surface, including transcript and feedback views.
+- `/webchat`: chat surface over a folder-scoped TTY runtime. It keeps selectable continuation JSON under `<cwd>/.copilot_history/`; existing messages render only through `Load History`. When opened as `/webchat?agent=<name>&...`, the router forwards additional query parameters except router-owned `tabId` and `sessionId` to `ploinky cli <name>` as long-form CLI flags encoded as `--key=value`.
+- `/dashboard`: operational management surface for status, logs, agents, and runtime control.
 - `/status`: read-only browser view that shells out to `ploinky status` and adds router-side server and agent summaries.
 - `/api/marketplace`: JSON endpoint for the first-party agent marketplace. `GET /api/marketplace` is available to authenticated local or SSO users and lists repositories, repository source metadata and kind, discoverable agents, enabled records, and runtime status. `POST /api/marketplace` is admin-only and supports `install_repo`, `uninstall_repo`, `enable_agent`, and `disable_agent`; repository uninstall disables agents from that repository and removes the checkout while preserving source metadata for reinstall. Marketplace agent disablement removes the enabled-agent registry record before removing the runtime container so the watchdog does not restart it during the operation.
 
