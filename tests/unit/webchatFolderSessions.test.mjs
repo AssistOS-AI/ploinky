@@ -16,6 +16,12 @@ test('WebChat exposes folder-session controls and lazy history loading', () => {
     for (const id of ['newSessionBtn', 'loadSessionBtn', 'historyGate', 'loadHistoryBtn', 'sessionDialog', 'sessionList']) {
         assert.match(template, new RegExp(`id="${id}"`));
     }
+    const chatListStart = template.indexOf('id="chatList"');
+    const historyGate = template.indexOf('id="historyGate"');
+    const typingIndicator = template.indexOf('id="typingIndicator"');
+    assert.ok(chatListStart >= 0 && historyGate > chatListStart && typingIndicator > historyGate);
+    assert.match(template, /class="wa-message in wa-history-gate" id="historyGate" hidden/);
+    assert.match(template, /class="wa-message-bubble wa-history-load-button"[^>]*id="loadHistoryBtn"/);
 });
 
 test('WebChat exposes a workspace task overlay and generic task endpoints', () => {

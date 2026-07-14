@@ -238,33 +238,22 @@ body {
     font: inherit;
 }
 
-.wa-session-btn:hover,
-.wa-history-gate button:hover {
-    background: var(--wa-bg-hover);
-}
-
-.wa-history-gate {
-    position: sticky;
-    top: 12px;
-    z-index: 8;
-    display: flex;
-    justify-content: center;
-    pointer-events: none;
+.wa-session-btn:hover {
+    background: #086b58;
 }
 
 .wa-history-gate[hidden] {
     display: none;
 }
 
-.wa-history-gate button {
-    pointer-events: auto;
-    border: 1px solid var(--wa-border);
-    border-radius: 999px;
-    background: var(--wa-bg-panel);
-    color: var(--wa-text-primary);
-    padding: 8px 16px;
-    box-shadow: var(--wa-shadow-md);
+.wa-history-load-button {
+    font: inherit;
+    text-align: left;
     cursor: pointer;
+}
+
+.wa-message.in .wa-history-load-button:hover {
+    background: var(--wa-bg-hover);
 }
 
 .wa-session-dialog-backdrop {

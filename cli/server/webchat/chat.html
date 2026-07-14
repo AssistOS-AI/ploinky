@@ -84,10 +84,12 @@
     <div class="wa-chat-container" id="chatContainer">
         <div class="wa-chat-area" id="chatArea">
             <div class="wa-chat-bg"></div>
-            <div class="wa-history-gate" id="historyGate" hidden>
-                <button type="button" id="loadHistoryBtn">Load History</button>
-            </div>
             <div class="wa-messages" id="chatList">
+                <div class="wa-message in wa-history-gate" id="historyGate" hidden>
+                    <button class="wa-message-bubble wa-history-load-button" type="button" id="loadHistoryBtn">
+                        Load History
+                    </button>
+                </div>
                 <div class="wa-message in wa-typing" id="typingIndicator" aria-hidden="true">
                     <div class="wa-message-bubble">
                         <div class="wa-typing-status" role="status" aria-live="polite" aria-label="Processing">

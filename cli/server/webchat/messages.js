@@ -14,7 +14,8 @@ function formatTime(timestamp = null) {
 
 export function createMessages({
     chatList,
-    typingIndicator
+    typingIndicator,
+    historyGate
 }, {
     markdown,
     initialViewMoreLineLimit,
@@ -1340,7 +1341,7 @@ export function createMessages({
         if (!chatList) return;
         const children = Array.from(chatList.children);
         for (const child of children) {
-            if (child !== typingIndicator) child.remove();
+            if (child !== typingIndicator && child !== historyGate) child.remove();
         }
         lastServerMsg.bubble = null;
         lastServerMsg.fullText = '';

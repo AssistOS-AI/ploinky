@@ -80,10 +80,14 @@ export function createSessionController({
 
     async function loadHistory(sessionId = currentSession?.sessionId) {
         if (!sessionId) return;
+        showHistoryGate(false);
         showBanner('Loading history…');
         try {
             const payload = await request(`sessions/${encodeURIComponent(sessionId)}`);
-            if (payload.session.sessionId !== currentSession?.sessionId) return;
+            if (payload.session.sessionId !== currentSession?.sessionId) {
+                hideBanner();
+                return;
+            }
             messages.renderHistory(payload.session.messages || []);
             currentSession = {
                 ...currentSession,
@@ -93,6 +97,9 @@ export function createSessionController({
             showHistoryGate(false);
             hideBanner();
         } catch (error) {
+            if (sessionId === currentSession?.sessionId && currentSession?.hasHistory) {
+                showHistoryGate(true);
+            }
             showBanner(`Unable to load history: ${error.message}`, 'err');
         }
     }

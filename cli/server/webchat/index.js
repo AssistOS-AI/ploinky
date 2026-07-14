@@ -83,7 +83,8 @@ const sidePanelApi = createSidePanel({
 
 const messages = createMessages({
     chatList,
-    typingIndicator
+    typingIndicator,
+    historyGate
 }, {
     markdown,
     initialViewMoreLineLimit: getViewMoreLineLimit(),

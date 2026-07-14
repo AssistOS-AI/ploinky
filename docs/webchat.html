@@ -103,9 +103,10 @@ ploinky cli achilles-cli --path=/absolute/path</code></pre>
                         Tool names, step indexes, and other progress-envelope metadata are not stored.
                     </p>
                     <ul style="margin-left: 2rem;">
-                        <li><strong>Load History</strong> renders the current session only when requested. The composer remains available while older messages are hidden.</li>
+                        <li><strong>Load History</strong> appears as a fake incoming assistant item inside the scrollable conversation and renders the current session only when requested. It is browser-only, is never stored as a message or sent to the agent, and disappears immediately when activated; the composer remains available while older messages are hidden.</li>
                         <li><strong>New+</strong> creates an empty session and makes it current for the folder.</li>
                         <li><strong>Load Session</strong> lists the first user-message preview and relative activity time, such as <code>2 days ago</code>, without message counts or agent metadata.</li>
+                        <li>The <strong>Tasks</strong>, <strong>New+</strong>, and <strong>Load Session</strong> header controls use a darker green hover state that stays visually integrated with the header.</li>
                         <li>Connected browser clients using the same working directory receive session changes and new turns through the shared EventSource runtime.</li>
                     </ul>
                     <p>
