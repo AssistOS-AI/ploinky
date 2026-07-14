@@ -18,6 +18,18 @@ test('WebChat exposes folder-session controls and lazy history loading', () => {
     }
 });
 
+test('WebChat exposes a workspace task overlay and generic task endpoints', () => {
+    const template = read('cli/server/webchat/chat.html');
+    const network = read('cli/server/webchat/network.js');
+    const taskRoutes = read('cli/server/handlers/webchat/taskRoutes.js');
+    for (const id of ['tasksBtn', 'tasksBadge', 'tasksDialog', 'tasksList', 'taskDetail']) {
+        assert.match(template, new RegExp(`id="${id}"`));
+    }
+    assert.match(network, /addEventListener\('task-update'/);
+    assert.match(taskRoutes, /pathname === '\/tasks' && req\.method === 'GET'/);
+    assert.match(taskRoutes, /\/tasks\\\/\(task_/);
+});
+
 test('WebChat tab identity is restored from sessionStorage before UUID fallback', () => {
     const dom = read('cli/server/webchat/domSetup.js');
     const readIndex = dom.indexOf('sessionStorage.getItem(tabStorageKey)');

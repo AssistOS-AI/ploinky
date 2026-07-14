@@ -14,10 +14,10 @@ import {
 import {
     broadcastWorkspaceRuntimeEvent,
     buildRuntimeKey,
-    captureWorkspaceHistoryOutput,
     disposeTab,
     getRuntimeMap,
     scheduleDisconnectedTabCleanup,
+    routeWorkspaceRuntimeOutput,
     writeOrBufferSseEvent
 } from './runtimeState.js';
 
@@ -86,18 +86,14 @@ export function handleRuntimeRoute({
                         lastClientText: '',
                         userInputSent: false,
                         lastAssistantMessageIndex: null
-                    }
+                    },
+                    backgroundTaskIds: new Set(),
+                    taskProtocolBuffer: ''
                 };
                 runtimes.set(runtimeKey, tab);
 
                 tty.onOutput((data) => {
-                    captureWorkspaceHistoryOutput(tab, data);
-                    broadcastWorkspaceRuntimeEvent(
-                        appState,
-                        workspaceDirectory,
-                        currentSession.sessionId,
-                        `data: ${JSON.stringify(data)}\n\n`
-                    );
+                    routeWorkspaceRuntimeOutput(appState, tab, data);
                 });
                 tty.onClose(() => {
                     writeOrBufferSseEvent(tab, 'event: close\ndata: {}\n\n');

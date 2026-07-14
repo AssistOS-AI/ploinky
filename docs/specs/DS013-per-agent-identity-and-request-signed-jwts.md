@@ -65,6 +65,8 @@ User → router (User Session cookie) → router verifies the session, resolves 
 
 Direct agent-to-agent calls are forbidden. The source agent signs an Agent Assertion with its own secret (`Agent/client/AgentMcpClient.mjs`) and posts a direct `tools/call` to the router at `/<target>/mcp` with `Authorization: Bearer <assertion>`. The router verifies the source identity and `rch`, applies MCP policy for `(source agent, target agent, tool)` — agents may invoke only `internal`-classed tools — and mints a Router Request for the target. The same assertion pattern is used for async MCP task polling: the source signs `GET /task` or `GET /getTaskStatus` with pseudo-tool `__task_status__` and `{ taskId }`, and the router mints a matching target-scoped Router Request before proxying the status read. The target AgentServer verifies and executes. The legacy `/auth/agent-token` client-credentials exchange and the shared-key `x-ploinky-caller-jwt` carrier are retired; the carrier is now `Authorization: Bearer`.
 
+`AgentMcpClient` may expose a process-local asynchronous-task observer. When an MCP response carries AgentServer task metadata, the observer may claim the task and detach the caller from blocking polling while retaining a router-mediated status callback. Without an observer, or when the observer does not claim the task, the existing `onTaskUpdate` polling contract remains unchanged. The observer does not alter assertion signing, policy evaluation, target identity, or task-status request binding.
+
 ### Secret Boundaries and Injected Environment
 
 Every agent container receives the following reserved environment variables from the Ploinky launcher. Manifest-declared values with these names are stripped before injection:

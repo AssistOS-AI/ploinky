@@ -105,6 +105,10 @@ ploinky cli achilles-cli --path=/absolute/path</code></pre>
                     <p>If the original process no longer exists, the next conversational message carries the prior messages in a delimited context block. Historical inputs are not replayed as commands. Slash commands remain unchanged and defer restoration until a later conversational message.</p>
                     <p>A newly started CLI receives <code>PLOINKY_WEBCHAT_HAS_HISTORY</code>. A value of <code>1</code> tells a generic agent that this is an existing conversation, so it should not emit new-conversation startup content. Empty sessions, including those created by <strong>New+</strong>, receive <code>0</code>. The selected folder session id remains private to the router instead of being forwarded into the agent process environment.</p>
 
+                    <h3>Background Tasks</h3>
+                    <p>CLIs may publish generic asynchronous task lifecycle envelopes through their stdout stream. WebChat stores task metadata in <code>.copilot_history/agent_tasks</code>, keeps bounded logs in <code>.copilot_history/task_logs/</code>, and presents both through the authenticated <strong>Tasks</strong> overlay. Task events and logs are not assistant messages and do not enter conversation history.</p>
+                    <p>Closing the browser tab does not stop an ongoing delegated task. WebChat retains the watcher runtime while it owns ongoing work so polling and log capture continue. The runtime returns to the normal reconnect cleanup policy after its tasks reach <code>finished</code>, <code>stopped</code>, or <code>error</code>. A recreated compatible CLI can reattach by target agent and remote task id.</p>
+
                     <h3>Message Rendering</h3>
                     <ul style="margin-left: 2rem;">
                         <li>✅ Automatic timestamps for each exchange</li>
@@ -112,6 +116,7 @@ ploinky cli achilles-cli --path=/absolute/path</code></pre>
                         <li>✅ Long output folding with “Show more” expansion</li>
                         <li>✅ Agent progress metadata displayed as a collapsible block above the final answer</li>
                         <li>✅ Side panel to inspect full message history</li>
+                        <li>✅ Workspace-wide Tasks overlay with live bounded logs and completion notifications</li>
                     </ul>
 
                     <h3>Input Controls</h3>

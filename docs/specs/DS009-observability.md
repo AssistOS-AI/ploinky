@@ -20,6 +20,8 @@ The router health endpoint at `/health` must report process uptime, PID, memory 
 
 WebChat continuation state under `<cwd>/.copilot_history/` is folder-local project data, not operational telemetry. Its session files support selection, lazy history rendering, and context restoration. Ploinky must not duplicate that content into a separate workspace-level conversation store or expose it through Dashboard analytics.
 
+The same folder may contain `agent_tasks` metadata and bounded files under `task_logs/` for user-requested asynchronous agent work. This task state is part of the WebChat project workflow rather than router telemetry. The metadata journal must exclude credentials, invocation grants, raw tool arguments, and live log bodies; log content belongs only in the task-specific bounded files and the authenticated Tasks overlay.
+
 Operational logs must not intentionally record raw prompts or assistant replies. Folder-history files may contain conversation roles, text, timestamps, attachments, and references because they are the explicit continuation data selected by the user. The generated `.gitignore` reduces accidental publication, but the workspace owner remains responsible for the local filesystem trust boundary.
 
 The Dashboard is an operational surface for status, logs, enabled agents, and runtime control. It must not expose conversation history or conversation-rating analytics.

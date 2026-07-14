@@ -5,6 +5,7 @@ import {
     appendToAssistantMessage,
     summarizeSession
 } from '../../webchat/sessionStore.js';
+import { hasOngoingTask, ingestTaskEvent } from '../../webchat/taskStore.js';
 
 const STREAM_RECONNECT_GRACE_MS = 120000;
 const MAX_PENDING_SSE_EVENTS = 200;
@@ -216,6 +217,64 @@ export function broadcastWorkspaceRuntimeEvent(appState, workspaceDirectory, ses
     }
 }
 
+export function broadcastWorkspaceTaskEvent(appState, workspaceDirectory, payload) {
+    for (const runtime of getRuntimeMap(appState).values()) {
+        if (runtime.workspaceDirectory === workspaceDirectory) {
+            writeOrBufferSseEvent(runtime, payload);
+        }
+    }
+}
+
+function routeCompleteOutputLine(appState, tab, line) {
+    const normalized = stripCtrlAndAnsi(String(line || '')).trim();
+    if (normalized.includes('"__webchatTask"')) {
+        try {
+            const envelope = JSON.parse(normalized);
+            if (envelope?.__webchatTask) {
+                const update = ingestTaskEvent(tab.workspaceDirectory, envelope);
+                if (!(tab.backgroundTaskIds instanceof Set)) tab.backgroundTaskIds = new Set();
+                tab.backgroundTaskIds.add(update.task.id);
+                broadcastWorkspaceTaskEvent(
+                    appState,
+                    tab.workspaceDirectory,
+                    `event: task-update\ndata: ${JSON.stringify(update)}\n\n`,
+                );
+                return;
+            }
+        } catch (_) {
+            // Invalid task envelopes fall through as ordinary agent output.
+        }
+    }
+    captureWorkspaceHistoryOutput(tab, line);
+    broadcastWorkspaceRuntimeEvent(
+        appState,
+        tab.workspaceDirectory,
+        tab.sessionId,
+        `data: ${JSON.stringify(line)}\n\n`,
+    );
+}
+
+export function routeWorkspaceRuntimeOutput(appState, tab, data) {
+    const text = String(data ?? '');
+    if (!text) return;
+    let pending = String(tab.taskProtocolBuffer || '') + text;
+    let newlineIndex = pending.indexOf('\n');
+    while (newlineIndex >= 0) {
+        const line = pending.slice(0, newlineIndex + 1);
+        pending = pending.slice(newlineIndex + 1);
+        routeCompleteOutputLine(appState, tab, line);
+        newlineIndex = pending.indexOf('\n');
+    }
+
+    const trimmed = stripCtrlAndAnsi(pending).trimStart();
+    if (trimmed.startsWith('{') && ('{"__webchatTask"'.startsWith(trimmed) || trimmed.includes('"__webchatTask"'))) {
+        tab.taskProtocolBuffer = pending;
+        return;
+    }
+    tab.taskProtocolBuffer = '';
+    if (pending) routeCompleteOutputLine(appState, tab, pending);
+}
+
 export function flushPendingSseEvents(tab) {
     if (!tab?.sseRes || !Array.isArray(tab.pendingSseEvents) || tab.pendingSseEvents.length === 0) {
         return;
@@ -232,6 +291,12 @@ export function flushPendingSseEvents(tab) {
     }
 }
 
+export function hasRuntimeBackgroundTasks(tab) {
+    const taskIds = tab?.backgroundTaskIds instanceof Set ? [...tab.backgroundTaskIds] : [];
+    if (!tab?.workspaceDirectory || taskIds.length === 0) return false;
+    return hasOngoingTask(tab.workspaceDirectory, taskIds);
+}
+
 export function scheduleDisconnectedTabCleanup(tab, tabId, session, graceMs = STREAM_RECONNECT_GRACE_MS) {
     if (!tab || tab.disposed) return;
     if (tab.cleanupTimer) {
@@ -241,6 +306,14 @@ export function scheduleDisconnectedTabCleanup(tab, tabId, session, graceMs = ST
     tab.cleanupTimer = setTimeout(() => {
         const hasSubscribers = tab.subscribers instanceof Map ? tab.subscribers.size > 0 : Boolean(tab.sseRes);
         if (hasSubscribers || tab.disposed) return;
+        try {
+            if (hasRuntimeBackgroundTasks(tab)) {
+                scheduleDisconnectedTabCleanup(tab, tabId, session, graceMs);
+                return;
+            }
+        } catch (error) {
+            console.warn(`[webchat] Unable to inspect background tasks for ${tabId}: ${error?.message || error}`);
+        }
         console.log(`[webchat] Reconnect grace expired for session ${tab.sessionId || tabId}; disposing TTY.`);
         disposeTab(tab, tabId, session);
     }, Math.max(1000, Number(graceMs) || STREAM_RECONNECT_GRACE_MS));
@@ -260,6 +333,11 @@ export function disposeTab(tab, tabId, session) {
         return;
     }
     tab.disposed = true;
+
+    if (tab.taskProtocolBuffer) {
+        captureWorkspaceHistoryOutput(tab, tab.taskProtocolBuffer);
+        tab.taskProtocolBuffer = '';
+    }
 
     if (tab.cleanupTimer) {
         clearTimeout(tab.cleanupTimer);

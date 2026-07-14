@@ -22,6 +22,9 @@
     </div>
     <div class="wa-header-workdir" id="headerWorkdir"></div>
     <div class="wa-header-actions">
+        <button class="wa-session-btn wa-tasks-btn" id="tasksBtn" type="button" title="View background tasks">
+            Tasks <span class="wa-tasks-badge" id="tasksBadge" hidden></span>
+        </button>
         <button class="wa-session-btn" id="newSessionBtn" type="button" title="Start a new session">New+</button>
         <button class="wa-session-btn" id="loadSessionBtn" type="button" title="Load a saved session">Load Session</button>
         <button class="wa-icon-btn" id="settingsBtn" title="Settings" data-tooltip="Settings" aria-label="Settings">
@@ -37,6 +40,22 @@
         </button>
     </div>
 </div>
+
+<div class="wa-tasks-backdrop" id="tasksDialog" hidden>
+    <section class="wa-tasks-dialog" role="dialog" aria-modal="true" aria-labelledby="tasksDialogTitle">
+        <div class="wa-tasks-dialog-header">
+            <h2 id="tasksDialogTitle">Tasks</h2>
+            <button type="button" id="tasksDialogClose" aria-label="Close">×</button>
+        </div>
+        <div class="wa-tasks-layout">
+            <div class="wa-tasks-list" id="tasksList"></div>
+            <div class="wa-task-detail" id="taskDetail">
+                <div class="wa-task-empty">Select a task to view its log.</div>
+            </div>
+        </div>
+    </section>
+</div>
+<div class="wa-task-toast" id="taskToast" role="status" aria-live="polite" hidden></div>
 
 <div class="wa-settings-panel" id="settingsPanel">
     <div class="wa-settings-section">

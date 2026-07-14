@@ -75,6 +75,13 @@ export function initDom() {
     const sessionDialog = document.getElementById('sessionDialog');
     const sessionDialogClose = document.getElementById('sessionDialogClose');
     const sessionList = document.getElementById('sessionList');
+    const tasksBtn = document.getElementById('tasksBtn');
+    const tasksBadge = document.getElementById('tasksBadge');
+    const tasksDialog = document.getElementById('tasksDialog');
+    const tasksDialogClose = document.getElementById('tasksDialogClose');
+    const tasksList = document.getElementById('tasksList');
+    const taskDetail = document.getElementById('taskDetail');
+    const taskToast = document.getElementById('taskToast');
 
     const agentName = (body.dataset.agent || '').trim();
     const displayName = (body.dataset.title || '').trim();
@@ -270,6 +277,13 @@ export function initDom() {
             sessionDialog,
             sessionDialogClose,
             sessionList,
+            tasksBtn,
+            tasksBadge,
+            tasksDialog,
+            tasksDialogClose,
+            tasksList,
+            taskDetail,
+            taskToast,
         },
     };
 }

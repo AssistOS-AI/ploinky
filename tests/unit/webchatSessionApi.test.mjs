@@ -85,3 +85,15 @@ test('folder-session API redirects unauthenticated requests before touching proj
     assert.equal(response.statusCode, 302);
     assert.equal(fs.existsSync(path.join(project, '.copilot_history')), false);
 });
+
+test('workspace task API is authenticated and returns materialized metadata', async () => {
+    const appState = { sessions: new Map(), runtimes: new Map() };
+    const response = await request(appState, '/webchat/tasks?workspace-dir=project');
+    assert.equal(response.statusCode, 200);
+    assert.deepEqual(JSON.parse(response.body), { ok: true, tasks: [] });
+
+    fs.rmSync(path.join(project, '.copilot_history'), { recursive: true, force: true });
+    const denied = await request(appState, '/webchat/tasks?workspace-dir=project', { authenticated: false });
+    assert.equal(denied.statusCode, 302);
+    assert.equal(fs.existsSync(path.join(project, '.copilot_history')), false);
+});

@@ -63,6 +63,10 @@ WebChat must also expose a Cancel button during active agent processing. The Can
 
 WebChat may receive structured progress metadata from chat agents through the same stdout/SSE stream. Lines containing `__webchatProgress` are UI metadata, not assistant text: the browser must render them as in-progress status, keep them out of folder-history capture, and attach them as a collapsible progress block above the next assistant answer.
 
+WebChat may also receive generic `__webchatTask` lifecycle envelopes from a selected CLI. These envelopes must be intercepted before conversation rendering and history capture. Ploinky must store workspace-scoped task metadata as append-only JSON lines in `<cwd>/.copilot_history/agent_tasks`, store bounded per-task logs separately under `.copilot_history/task_logs/`, and expose authenticated `GET /webchat/tasks` and `GET /webchat/tasks/<task-id>/log` routes. Browser updates must use the existing EventSource stream with a `task-update` event; Ploinky must not hardcode target-agent ids or tool names.
+
+When a WebChat runtime has no SSE subscribers but owns a task whose materialized state is `ongoing`, reconnect cleanup must retain that runtime so its agent can continue router-mediated polling and log collection. Once its tasks become terminal, the normal reconnect grace and disposal behavior resumes. If the runtime is recreated after a wider process restart, the selected CLI may reattach from the workspace task journal. Task identity must be based on the target agent and remote task id; a PID is optional diagnostics only.
+
 The router must also expose:
 
 - `/health` for health status.
@@ -129,6 +133,11 @@ They are route-access declarations for transparent proxy paths, not service rewr
 
 Response:
 The working directory is the durable project context shared by CLI agents, while a browser tab is transient. Folder-scoped JSON sessions let refreshes, later visits, and concurrent clients select the same conversation without agent-specific assumptions. `tabId` remains useful for client diagnostics and echo suppression, but it does not select history or own the target process.
+
+### Question #8: Why does WebChat retain a disconnected runtime with ongoing tasks?
+
+Response:
+The target AgentServer owns the actual delegated process, but the selected chat CLI owns router-mediated polling and conversion of bounded task tails into workspace logs. Retaining that watcher while work remains ongoing preserves live diagnostics across a closed browser tab without making the browser or its `tabId` the task owner.
 
 ## Conclusion
 

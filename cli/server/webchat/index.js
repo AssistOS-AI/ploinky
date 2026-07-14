@@ -10,6 +10,7 @@ import { createWorkspacePathsProvider } from './autocompleteProviders/workspaceP
 import { createAutocompleteState } from './autocompleteState.js';
 import { createComposerMentionHighlighter } from './composerMentionHighlights.js';
 import { createSessionController } from './sessions.js';
+import { createTaskController } from './tasks.js';
 
 const PURGE_TRIGGER_RE = /\bpurge\b/i;
 const EDITABLE_TAGS = ['INPUT', 'TEXTAREA', 'SELECT', 'OPTION'];
@@ -60,7 +61,14 @@ const {
     loadHistoryBtn,
     sessionDialog,
     sessionDialogClose,
-    sessionList
+    sessionList,
+    tasksBtn,
+    tasksBadge,
+    tasksDialog,
+    tasksDialogClose,
+    tasksList,
+    taskDetail,
+    taskToast
 } = elements;
 
 const sidePanelApi = createSidePanel({
@@ -94,6 +102,7 @@ sidePanelApi.bindLinkDelegation(chatList);
 
 dlog('Initializing network for agent:', dom.agentName);
 let sessionController = null;
+let taskController = null;
 const network = createNetwork({
     TAB_ID,
     toEndpoint,
@@ -112,7 +121,23 @@ const network = createNetwork({
     hideTypingIndicator: messages.hideTypingIndicator,
     markUserInputSent: messages.markUserInputSent,
     addRemoteUserMessage: (message, payload) => sessionController?.addRemoteUserMessage(message, payload),
-    onSessionChanged: (session) => sessionController?.handleExternalSessionChange(session)
+    onSessionChanged: (session) => sessionController?.handleExternalSessionChange(session),
+    onTaskUpdate: (payload) => taskController?.handleUpdate(payload),
+    onConnected: () => taskController?.refresh().catch(() => {})
+});
+
+taskController = createTaskController({
+    toEndpoint,
+    elements: {
+        tasksBtn,
+        tasksBadge,
+        tasksDialog,
+        tasksDialogClose,
+        tasksList,
+        taskDetail,
+        taskToast,
+    },
+    showBanner,
 });
 
 sessionController = createSessionController({

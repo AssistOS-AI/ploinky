@@ -135,7 +135,9 @@ export function createNetwork({
     hideTypingIndicator,
     markUserInputSent,
     addRemoteUserMessage,
-    onSessionChanged
+    onSessionChanged,
+    onTaskUpdate,
+    onConnected
 }) {
     let es = null;
     let chatBuffer = '';
@@ -261,6 +263,7 @@ export function createNetwork({
             }
             showBanner('Connected', 'ok');
             setTimeout(() => hideBanner(), 800);
+            if (typeof onConnected === 'function') onConnected();
         };
 
         es.onerror = () => {
@@ -343,6 +346,15 @@ export function createNetwork({
                 if (typeof onSessionChanged === 'function') onSessionChanged(payload?.session || null);
             } catch (error) {
                 dlog('session changed error', error);
+            }
+        });
+
+        es.addEventListener('task-update', (event) => {
+            try {
+                const payload = JSON.parse(event.data);
+                if (typeof onTaskUpdate === 'function') onTaskUpdate(payload);
+            } catch (error) {
+                dlog('task update error', error);
             }
         });
 

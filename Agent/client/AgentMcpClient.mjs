@@ -42,6 +42,45 @@ const TASK_POLL_INTERVAL_MS = (() => {
 })();
 
 const taskPollers = new Map();
+let taskObserver = null;
+
+export function setAgentTaskObserver(observer) {
+    if (observer !== null && typeof observer !== 'function') {
+        throw new Error('AgentMcpClient: task observer must be a function or null');
+    }
+    taskObserver = observer;
+    return () => {
+        if (taskObserver === observer) {
+            taskObserver = null;
+        }
+    };
+}
+
+async function applyTaskObserver({ result, agentName, taskId, toolName, toolArgs, metadata }) {
+    if (typeof taskObserver !== 'function') return null;
+    const observation = await taskObserver({
+        agentName,
+        taskId,
+        toolName,
+        arguments: toolArgs,
+        metadata: metadata || {},
+        getTaskStatus: () => getTaskStatus(agentName, taskId),
+    });
+    if (observation?.detached !== true) return null;
+    return {
+        ...result,
+        metadata: {
+            ...(metadata || {}),
+            backgroundTask: {
+                detached: true,
+                id: observation.id || '',
+                description: observation.description || '',
+            },
+        },
+    };
+}
+
+export const __testables = { applyTaskObserver };
 
 function normalizeDelegationToken(token) {
     if (token === undefined || token === null || token === '') return '';
@@ -337,7 +376,7 @@ export async function createAgentClient(agentName, options = {}) {
         }
         const result = unwrapToolResult(json.result);
         const taskId = normalizeTaskId(result);
-        if (typeof callOptions.onTaskUpdate !== 'function' || !taskId) {
+        if (!taskId) {
             return result;
         }
 
@@ -349,6 +388,20 @@ export async function createAgentClient(agentName, options = {}) {
             updatedAt: metadata?.updatedAt,
             toolName: metadata?.toolName || name,
         };
+        const observedResult = await applyTaskObserver({
+            result,
+            agentName,
+            taskId,
+            toolName: metadata?.toolName || name,
+            toolArgs,
+            metadata,
+        });
+        if (observedResult) return observedResult;
+
+        if (typeof callOptions.onTaskUpdate !== 'function') {
+            return result;
+        }
+
         emitTaskUpdate(callOptions.onTaskUpdate, initialUpdate);
 
         const finalTask = await new Promise((resolve, reject) => {

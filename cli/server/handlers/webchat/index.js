@@ -25,6 +25,7 @@ import {
 } from './browserSession.js';
 import { handleConversationRoute } from './conversationRoutes.js';
 import { handleRuntimeRoute } from './runtimeRoutes.js';
+import { handleTaskRoute } from './taskRoutes.js';
 import { ensureCurrentSession } from '../../webchat/sessionStore.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -103,6 +104,7 @@ export async function handleWebChat(req, res, appConfig, appState) {
     const workspaceDirectory = workspaceBase.base;
 
     if (await handleConversationRoute({ pathname, req, res, workspaceDirectory, appState })) return;
+    if (handleTaskRoute({ pathname, req, res, parsedUrl, workspaceDirectory })) return;
 
     if (pathname === '/suggestions/files' && (req.method === 'GET' || req.method === 'HEAD')) {
         return handleSuggestionsFiles(req, res, parsedUrl, getSession(req, appState));
