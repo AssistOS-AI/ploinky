@@ -96,13 +96,23 @@ ploinky cli achilles-cli --path=/absolute/path</code></pre>
                     <h2>Session Experience</h2>
                     <h3>Folder Sessions</h3>
                     <p>WebChat stores its selectable continuation history under <code>&lt;cwd&gt;/.copilot_history/</code>. The folder contains <code>current_session.json</code> plus one JSON file per conversation. Refreshing the page reuses the selected folder session and a surviving agent process, while the browser keeps its client-only <code>tabId</code> in <code>sessionStorage</code>.</p>
+                    <p>
+                        Each submitted turn is stored as the user message followed immediately by an assistant placeholder.
+                        The placeholder starts with empty final text and an optional <code>progress</code> array of strings.
+                        Agent progress reasons are appended to that array while the request is running, and final output updates the same message.
+                        Tool names, step indexes, and other progress-envelope metadata are not stored.
+                    </p>
                     <ul style="margin-left: 2rem;">
                         <li><strong>Load History</strong> renders the current session only when requested. The composer remains available while older messages are hidden.</li>
                         <li><strong>New+</strong> creates an empty session and makes it current for the folder.</li>
                         <li><strong>Load Session</strong> lists the first user-message preview and relative activity time, such as <code>2 days ago</code>, without message counts or agent metadata.</li>
                         <li>Connected browser clients using the same working directory receive session changes and new turns through the shared EventSource runtime.</li>
                     </ul>
-                    <p>If the original process no longer exists, the next conversational message carries the prior messages in a delimited context block. Historical inputs are not replayed as commands. Slash commands remain unchanged and defer restoration until a later conversational message.</p>
+                    <p>
+                        If the original process no longer exists, the next conversational message carries the prior user content and final assistant text in a delimited context block.
+                        Historical inputs are not replayed as commands. Persisted progress and assistant placeholders without final text remain UI-only and are excluded from that context.
+                        Slash commands remain unchanged and defer restoration until a later conversational message.
+                    </p>
                     <p>A newly started CLI receives <code>PLOINKY_WEBCHAT_HAS_HISTORY</code>. A value of <code>1</code> tells a generic agent that this is an existing conversation, so it should not emit new-conversation startup content. Empty sessions, including those created by <strong>New+</strong>, receive <code>0</code>. The selected folder session id remains private to the router instead of being forwarded into the agent process environment.</p>
 
                     <h3>Background Tasks</h3>
@@ -114,7 +124,7 @@ ploinky cli achilles-cli --path=/absolute/path</code></pre>
                         <li>✅ Automatic timestamps for each exchange</li>
                         <li>✅ Rich markdown rendering (tables, code blocks, lists)</li>
                         <li>✅ Long output folding with “Show more” expansion</li>
-                        <li>✅ Agent progress metadata displayed as a collapsible block above the final answer</li>
+                        <li>✅ Agent progress reasons persisted as an ordered string array and displayed as a collapsible block above the final answer</li>
                         <li>✅ Side panel to inspect full message history</li>
                         <li>✅ Workspace-wide Tasks overlay with live bounded logs and completion notifications</li>
                     </ul>

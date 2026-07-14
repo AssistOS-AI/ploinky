@@ -282,6 +282,7 @@ HEAD /blobs/&lt;agentName&gt;/&lt;id&gt;
                             <li><strong>Exponential backoff:</strong> Initial 1s, 2x multiplier, max 30s between restarts.</li>
                             <li><strong>Health checks:</strong> HTTP GET to <code>/health</code> every 30s, restart after 3 consecutive failures.</li>
                             <li><strong>Container monitoring:</strong> Polls container state every 5 seconds.</li>
+                            <li><strong>Maintenance coordination:</strong> Defers automatic container restarts when the same container has an active maintenance lock, including timers scheduled before reinstall or explicit restart began.</li>
                             <li><strong>Logging:</strong> Structured JSON to <code>.ploinky/logs/watchdog.log</code>.</li>
                         </ul>
                     </div>

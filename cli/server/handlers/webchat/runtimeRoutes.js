@@ -1,7 +1,7 @@
 import crypto from 'crypto';
 
 import {
-    appendSessionMessage,
+    appendSessionTurn,
     ensureCurrentSession,
     formatContinuationContext
 } from '../../webchat/sessionStore.js';
@@ -173,19 +173,18 @@ export function handleRuntimeRoute({
             let appendedHistory = null;
             if (hasContent) {
                 try {
-                    appendedHistory = appendSessionMessage(workspaceDirectory, currentSession.sessionId, {
-                        role: 'user',
+                    appendedHistory = appendSessionTurn(workspaceDirectory, currentSession.sessionId, {
                         text: envelope.text,
                         attachments: envelope.attachments,
                         references: envelope.references
                     });
                     tab.workspaceHistory.lastClientText = String(envelope.text || '');
-                    tab.workspaceHistory.userInputSent = true;
-                    tab.workspaceHistory.lastAssistantMessageIndex = null;
+                    tab.workspaceHistory.userInputSent = false;
+                    tab.workspaceHistory.lastAssistantMessageIndex = appendedHistory.assistantMessageIndex;
                     broadcastWorkspaceRuntimeEvent(appState, workspaceDirectory, currentSession.sessionId, `event: user-message\ndata: ${JSON.stringify({
                         sourceTabId: tabId,
-                        messageIndex: appendedHistory.messageIndex,
-                        message: appendedHistory.message
+                        messageIndex: appendedHistory.userMessageIndex,
+                        message: appendedHistory.userMessage
                     })}\n\n`);
                 } catch (_) { }
             }

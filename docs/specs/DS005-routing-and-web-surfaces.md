@@ -20,6 +20,8 @@ The route table must be persisted in `.ploinky/routing.json`. It must contain th
 
 `ploinky reinstall <agent>` recreates the agent container with a new dynamic host port and rewrites its `.ploinky/routing.json` entry; because the router resolves routes from that file per request, the new port takes effect without a router restart. Reinstall waits for the recreated agent's host port to become ready before returning. If a request still returns 502 immediately after a reinstall (for example a slow container image start), run `ploinky restart`.
 
+The watchdog container monitor must defer automatic container restarts while a maintenance lock is active for the same container. It must check the lock both when deciding to schedule a restart and immediately before executing a previously scheduled restart, because a reinstall or explicit restart may acquire the lock after the watchdog timer was created. A deferred timer must release the monitor's in-progress restart state so later ticks can reevaluate the live container after maintenance completes.
+
 The router must provide first-party browser surfaces at `/webchat`, `/dashboard`, and `/status`. Each surface owns its own session cookie and fallback asset directory under `cli/server/<surface>/`. `/webchat` must rely on the router login flow and the authenticated router session; it does not accept surface-specific token login. `/dashboard` and the read-only `/status` surface continue to support dashboard-token access through `WEBDASHBOARD_TOKEN`. Asset resolution may also consult the static host root and `webLibs/`, but the documented fallback implementation for the first-party surfaces lives under `cli/server/`.
 
 For `/webchat`, the router must treat `agent` as an explicit agent-selection query parameter and must preserve the remaining query parameters across the browser session endpoints. When a WebChat request selects an explicit agent, the router must forward every additional query parameter except router-reserved stream/session parameters such as `tabId` and `sessionId` to that agent's `ploinky cli <agent>` launch as long-form CLI flags encoded as single `--key=value` tokens. The router must not hardcode ordinary target-agent parameter names for this forwarding behavior; interpretation belongs to the target agent CLI. The reserved alias parameters `workspace-dir`/`workspaceDir` and `workspace-skill-root`/`workspaceSkillRoot` are resolved by WebChat against the Ploinky workspace root and forwarded as absolute `--dir=` and `--skill-root=` values server-side so browser URLs can avoid leaking absolute host paths. The `ploinky cli <agent>` launch path is expected to resolve the agent manifest from workspace repositories and auto-enable missing agents in the standard global enable flow when needed.
@@ -28,7 +30,23 @@ WebChat must remain a generic transport. It must not hardcode optional catalog a
 
 When `/webchat` is launched with `forward-envelope=1`, messages may be written to the target TTY as the WebChat JSON envelope instead of plain text. The envelope may include sanitized attachment metadata, sanitized structured references (currently only `kind: "workspace-path"` records with `path`, `type`, and optional `label`), a sanitized public origin hint derived from the incoming WebChat request (`origin.publicBaseUrl`), and a short-lived router-minted invocation token scoped to the selected chat agent, allowing that agent to perform delegated MCP calls through the router without WebChat naming the downstream provider. The public origin hint must be limited to an `http` or `https` origin and is intended only for same-origin user-facing links back through the router. Reference paths must be workspace-relative; the server must drop entries containing absolute paths, traversal segments, NUL bytes, or reserved secret-file names before forwarding the envelope. Target CLIs that opt into this flag must tolerate `__webchatMessage` envelopes and normalize them before invoking their normal prompt flow; CLIs that do not recognize `references` or `origin` must ignore them safely.
 
-WebChat conversation identity must be scoped to the canonical working directory resolved from `workspace-dir`/`workspaceDir` or confined `dir`. The router must create or reuse `<cwd>/.copilot_history/`, store one JSON file per conversation, and keep the selected conversation id in `.copilot_history/current_session.json`. Stored messages contain role, text, timestamp, attachments, and references. Writes must be atomic, malformed session files must not appear in the selector, and a symlinked history directory must be rejected.
+WebChat conversation identity must be scoped to the canonical working directory
+resolved from `workspace-dir`/`workspaceDir` or confined `dir`. The router must
+create or reuse `<cwd>/.copilot_history/`, store one JSON file per conversation,
+and keep the selected conversation id in `.copilot_history/current_session.json`.
+Stored messages contain role, text, timestamp, attachments, and references.
+Assistant messages created for a user turn may additionally contain `progress`,
+whose value must be an ordered array of non-empty strings. Writes must be atomic,
+malformed session files must not appear in the selector, and a symlinked history
+directory must be rejected.
+
+When WebChat accepts a non-empty user turn, it must persist the user message and
+an immediately following assistant placeholder in one session update before
+writing the request to the TTY. The placeholder starts with empty `text` and
+empty `progress`. Final output updates the placeholder text, while an interrupted
+turn may retain an empty final text and any progress accumulated before
+interruption. Legacy messages without `progress` remain valid and must not gain
+the property during normalization.
 
 The authenticated session API consists of `GET /webchat/sessions`, `POST /webchat/sessions`, `PUT /webchat/sessions/current`, and `GET /webchat/sessions/<session-id>`. Listing returns the current id and selector metadata without message bodies or counts. Full history is returned only by the per-session GET route. Selector entries expose the first user-message preview and update timestamp; the browser renders that timestamp as relative time.
 
@@ -36,7 +54,15 @@ WebChat's EventSource stream must tolerate brief browser reconnects without kill
 
 WebChat must not render existing messages automatically after refresh. A non-empty session presents `Load History`, while the composer remains usable and new turns append to the current session. `New+` creates and selects an empty session. `Load Session` lists sessions by recent activity using a first-message preview and relative time, without agent or message-count metadata. Selecting an entry makes it current and loads it. Session changes and new turns must be visible to other connected clients using the same working directory.
 
-When a folder session has history but no surviving runtime, WebChat must restore context without replaying historical user inputs as separate TTY commands. The full prior conversation is placed in a delimited context block before the first new non-slash message. Slash commands remain unchanged and defer restoration until a later conversational message. This mechanism must remain generic for plain-text and WebChat-envelope agents and must not special-case AchillesCLI or another target agent.
+When a folder session has history but no surviving runtime, WebChat must restore
+context without replaying historical user inputs as separate TTY commands. The
+prior conversation's user content and final assistant text are placed in a
+delimited context block before the first new non-slash message. Progress strings
+and assistant placeholders with no final content must remain UI-only and must not
+enter this continuation context. Slash commands remain unchanged and defer
+restoration until a later conversational message. This mechanism must remain
+generic for plain-text and WebChat-envelope agents and must not special-case
+AchillesCLI or another target agent.
 
 Every WebChat CLI process must receive `PLOINKY_WEBCHAT_HAS_HISTORY=1` when the selected folder session already contains messages, otherwise `0`. This variable is the allowlisted startup contract for local and containerized agents; the folder session id remains router-owned and must not be forwarded through the process environment. Arbitrary router environment variables must not be forwarded with the history flag. Agents that generate new-conversation startup content should skip it when history exists. Ploinky must not expose message bodies or history file paths through the process environment.
 
@@ -61,7 +87,15 @@ The session upload directory is a per-session UX convenience scope. It must not 
 
 WebChat must also expose a Cancel button during active agent processing. The Cancel button sends a raw control sequence (ESC, `\x1b`) to the agent's TTY session via a dedicated `/webchat/control` endpoint. The agent must interpret this as an interrupt signal and abort the current operation. The Cancel button replaces the Send button while processing is active and reverts when the agent produces output or the session closes.
 
-WebChat may receive structured progress metadata from chat agents through the same stdout/SSE stream. Lines containing `__webchatProgress` are UI metadata, not assistant text: the browser must render them as in-progress status, keep them out of folder-history capture, and attach them as a collapsible progress block above the next assistant answer.
+WebChat may receive structured progress metadata from chat agents through the
+same stdout/SSE stream. For a valid `__webchatProgress` envelope associated with
+the active assistant placeholder, WebChat must append only the trimmed,
+non-empty `reason` string to that message's `progress` array. It must not persist
+`tool`, `type`, `stepIndex`, or other envelope metadata. The browser must render
+live progress as in-progress status and render persisted progress as a
+collapsible block above the final answer. A progress-only placeholder may render
+that block without an empty text bubble. Progress remains UI metadata rather
+than assistant text and must not enter continuation context.
 
 WebChat may also receive generic `__webchatTask` lifecycle envelopes from a selected CLI. These envelopes must be intercepted before conversation rendering and history capture. Ploinky must store workspace-scoped task metadata as append-only JSON lines in `<cwd>/.copilot_history/agent_tasks`, store bounded per-task logs separately under `.copilot_history/task_logs/`, and expose authenticated `GET /webchat/tasks` and `GET /webchat/tasks/<task-id>/log` routes. Browser updates must use the existing EventSource stream with a `task-update` event; Ploinky must not hardcode target-agent ids or tool names.
 
@@ -138,6 +172,20 @@ The working directory is the durable project context shared by CLI agents, while
 
 Response:
 The target AgentServer owns the actual delegated process, but the selected chat CLI owns router-mediated polling and conversion of bounded task tails into workspace logs. Retaining that watcher while work remains ongoing preserves live diagnostics across a closed browser tab without making the browser or its `tabId` the task owner.
+
+### Question #9: Why must the watchdog recheck maintenance state when a restart timer fires?
+
+Response:
+A restart timer can be scheduled immediately before an operator command acquires the container maintenance lock. Checking only when the timer is created leaves that already-scheduled callback free to recreate the same container concurrently with reinstall or explicit restart. Rechecking at execution time makes the scheduled callback defer to the active maintenance owner.
+
+### Question #10: Why does persisted progress contain only strings and stay out of continuation context?
+
+Response:
+The progress `reason` is the only part of the envelope rendered as conversational
+status. Persisting only that ordered string array keeps folder history compatible
+and avoids turning transient tool metadata into a new message schema. Excluding
+progress and empty placeholders from continuation context preserves the
+distinction between the agent's final answer and UI-only execution status.
 
 ## Conclusion
 

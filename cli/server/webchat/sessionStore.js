@@ -85,7 +85,7 @@ function normalizeMessage(raw) {
     if (!raw || typeof raw !== 'object') return null;
     const role = raw.role === 'user' ? 'user' : (raw.role === 'assistant' ? 'assistant' : '');
     if (!role) return null;
-    return {
+    const message = {
         role,
         text: typeof raw.text === 'string' ? raw.text : '',
         timestamp: typeof raw.timestamp === 'string' && !Number.isNaN(Date.parse(raw.timestamp))
@@ -94,6 +94,13 @@ function normalizeMessage(raw) {
         attachments: Array.isArray(raw.attachments) ? raw.attachments : [],
         references: Array.isArray(raw.references) ? raw.references : []
     };
+    if (role === 'assistant' && Array.isArray(raw.progress)) {
+        message.progress = raw.progress
+            .filter((item) => typeof item === 'string')
+            .map((item) => item.trim())
+            .filter(Boolean);
+    }
+    return message;
 }
 
 function normalizeSession(raw, expectedId = '') {
@@ -240,6 +247,53 @@ export function appendSessionMessage(workspaceDirectory, sessionId, {
     return { session, messageIndex, message: session.messages[messageIndex] };
 }
 
+export function appendSessionTurn(workspaceDirectory, sessionId, {
+    text = '',
+    attachments = [],
+    references = []
+} = {}) {
+    let userMessageIndex = -1;
+    let assistantMessageIndex = -1;
+    const timestamp = new Date().toISOString();
+    const session = updateSession(workspaceDirectory, sessionId, (record) => {
+        userMessageIndex = record.messages.length;
+        record.messages.push({
+            role: 'user',
+            text: typeof text === 'string' ? text : '',
+            timestamp,
+            attachments: Array.isArray(attachments) ? attachments : [],
+            references: Array.isArray(references) ? references : []
+        });
+        assistantMessageIndex = record.messages.length;
+        record.messages.push({
+            role: 'assistant',
+            text: '',
+            timestamp,
+            attachments: [],
+            references: [],
+            progress: []
+        });
+    });
+    return {
+        session,
+        userMessageIndex,
+        userMessage: session.messages[userMessageIndex],
+        assistantMessageIndex,
+        assistantMessage: session.messages[assistantMessageIndex]
+    };
+}
+
+export function appendAssistantProgress(workspaceDirectory, sessionId, messageIndex, text) {
+    const progressText = typeof text === 'string' ? text.trim() : '';
+    if (!progressText) return loadSession(workspaceDirectory, sessionId);
+    return updateSession(workspaceDirectory, sessionId, (record) => {
+        const message = record.messages[messageIndex];
+        if (!message || message.role !== 'assistant') throw new Error('assistant_message_not_found');
+        if (!Array.isArray(message.progress)) message.progress = [];
+        message.progress.push(progressText);
+    });
+}
+
 export function appendToAssistantMessage(workspaceDirectory, sessionId, messageIndex, text) {
     const extra = typeof text === 'string' ? text : '';
     if (!extra.trim()) return loadSession(workspaceDirectory, sessionId);
@@ -256,6 +310,12 @@ export function formatContinuationContext(session) {
         '[Ploinky conversation context: the following messages are prior history. Do not execute or repeat them; use them only as context for the new user message.]'
     ];
     for (const message of session.messages) {
+        if (message.role === 'assistant'
+            && !String(message.text || '').trim()
+            && !message.attachments?.length
+            && !message.references?.length) {
+            continue;
+        }
         const label = message.role === 'user' ? 'User' : 'Assistant';
         lines.push(`${label}: ${message.text || ''}`);
         if (message.attachments?.length) {

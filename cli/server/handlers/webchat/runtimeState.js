@@ -1,6 +1,7 @@
 import crypto from 'crypto';
 
 import {
+    appendAssistantProgress,
     appendSessionMessage,
     appendToAssistantMessage,
     summarizeSession
@@ -83,6 +84,18 @@ function looksLikeProgressEnvelope(text) {
     }
 }
 
+function progressReasonFromEnvelope(text) {
+    const normalized = String(text || '').trim();
+    if (!normalized.includes('"__webchatProgress"')) return '';
+    try {
+        const parsed = JSON.parse(normalized);
+        if (!parsed?.__webchatProgress) return '';
+        return typeof parsed.reason === 'string' ? parsed.reason.trim() : '';
+    } catch (_) {
+        return '';
+    }
+}
+
 
 function handleWorkspaceAssistantLine(tab, rawLine) {
     if (!tab?.workspaceHistory) return;
@@ -90,7 +103,23 @@ function handleWorkspaceAssistantLine(tab, rawLine) {
     if (!originalText || isProcessingChunk(originalText)) return;
     const stripped = stripProcessingPrefix(originalText);
     const normalized = stripped.trim();
-    if (!normalized || looksLikeEnvelopeEcho(normalized) || looksLikeProgressEnvelope(normalized)) return;
+    if (!normalized || looksLikeEnvelopeEcho(normalized)) return;
+    if (looksLikeProgressEnvelope(normalized)) {
+        const reason = progressReasonFromEnvelope(normalized);
+        if (reason && Number.isInteger(tab.workspaceHistory.lastAssistantMessageIndex)) {
+            try {
+                appendAssistantProgress(
+                    tab.workspaceHistory.workspaceDirectory,
+                    tab.workspaceHistory.sessionId,
+                    tab.workspaceHistory.lastAssistantMessageIndex,
+                    reason
+                );
+            } catch (_) {
+                // Folder history capture must never break the live process.
+            }
+        }
+        return;
+    }
     const pendingEcho = String(tab.workspaceHistory.lastClientText || '').trim();
     if (pendingEcho && looksLikeReadlinePromptEcho(normalized, pendingEcho)) {
         tab.workspaceHistory.lastClientText = '';

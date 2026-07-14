@@ -93,6 +93,10 @@ export function createMessages({
     let typingActive = false;
 
     function normalizeProgressItem(raw) {
+        if (typeof raw === 'string') {
+            const reason = raw.trim();
+            return reason ? { reason, tool: '', stepIndex: null } : null;
+        }
         if (!raw || typeof raw !== 'object') {
             return null;
         }
@@ -1241,6 +1245,10 @@ export function createMessages({
 
     function addServerMsg(text, options = {}) {
         let normalized = typeof text === 'string' ? text : '';
+        const explicitProgressItems = Array.isArray(options.progressItems)
+            ? options.progressItems.map(normalizeProgressItem).filter(Boolean)
+            : null;
+        const progressItems = explicitProgressItems || pendingProgressItems;
 
         // Filter out raw envelope JSON to prevent it from appearing in chat
         const trimmedNormalized = normalized.trim();
@@ -1266,7 +1274,7 @@ export function createMessages({
             normalized = normalized.replace(/^\n+/, '');
         }
 
-        if (!normalized.trim()) {
+        if (!normalized.trim() && progressItems.length === 0) {
             lastServerMsg.bubble = null;
             lastServerMsg.fullText = '';
             userInputSent = false;
@@ -1280,8 +1288,10 @@ export function createMessages({
             const combined = previousFullText ? `${previousFullText}\n${normalized}` : normalized;
             lastServerMsg.fullText = combined;
             updateBubbleContent(lastServerMsg.bubble, combined);
-            if (pendingProgressItems.length) {
-                attachProgressPanel(lastServerMsg.bubble, pendingProgressItems);
+            if (progressItems.length) {
+                attachProgressPanel(lastServerMsg.bubble, progressItems);
+            }
+            if (explicitProgressItems === null && pendingProgressItems.length) {
                 resetProgressEvents();
             }
         } else {
@@ -1297,8 +1307,10 @@ export function createMessages({
             userInputSent = false;
 
             updateBubbleContent(bubble, normalized);
-            if (pendingProgressItems.length) {
-                attachProgressPanel(bubble, pendingProgressItems);
+            if (progressItems.length) {
+                attachProgressPanel(bubble, progressItems);
+            }
+            if (explicitProgressItems === null && pendingProgressItems.length) {
                 resetProgressEvents();
             }
             const timeNode = bubble.querySelector('.wa-message-time');
@@ -1345,7 +1357,11 @@ export function createMessages({
             if (message?.role === 'user') {
                 addClientMsg(text, { historical: true, timestamp: message.timestamp });
             } else if (message?.role === 'assistant') {
-                addServerMsg(text, { forceNew: true, timestamp: message.timestamp });
+                addServerMsg(text, {
+                    forceNew: true,
+                    timestamp: message.timestamp,
+                    progressItems: Array.isArray(message.progress) ? message.progress : []
+                });
             }
         }
         lastClientCommand = '';

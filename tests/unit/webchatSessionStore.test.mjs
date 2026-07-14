@@ -5,7 +5,9 @@ import path from 'node:path';
 import test from 'node:test';
 
 import {
+    appendAssistantProgress,
     appendSessionMessage,
+    appendSessionTurn,
     appendToAssistantMessage,
     createSession,
     ensureCurrentSession,
@@ -79,6 +81,58 @@ test('selects an existing session and appends ordered messages', (t) => {
         'timestamp'
     ]);
     assert.notEqual(second.sessionId, first.sessionId);
+});
+
+test('persists an assistant placeholder and ordered progress in the same turn', (t) => {
+    const workspace = makeWorkspace(t);
+    const session = ensureCurrentSession(workspace);
+    const turn = appendSessionTurn(workspace, session.sessionId, {
+        text: 'Inspect the repository',
+        references: [{ kind: 'workspace-path', path: 'README.md' }]
+    });
+
+    assert.equal(turn.userMessageIndex, 0);
+    assert.equal(turn.assistantMessageIndex, 1);
+    assert.equal(turn.assistantMessage.text, '');
+    assert.deepEqual(turn.assistantMessage.progress, []);
+
+    appendAssistantProgress(workspace, session.sessionId, turn.assistantMessageIndex, '  Reading files  ');
+    appendAssistantProgress(workspace, session.sessionId, turn.assistantMessageIndex, 'Comparing changes');
+    appendToAssistantMessage(workspace, session.sessionId, turn.assistantMessageIndex, 'Inspection complete');
+
+    const loaded = loadSession(workspace, session.sessionId);
+    assert.equal(loaded.messages.length, 2);
+    assert.equal(loaded.messages[1].text, 'Inspection complete');
+    assert.deepEqual(loaded.messages[1].progress, ['Reading files', 'Comparing changes']);
+    assert.equal(Object.hasOwn(loaded.messages[0], 'progress'), false);
+});
+
+test('normalizes optional assistant progress without changing legacy messages', (t) => {
+    const workspace = makeWorkspace(t);
+    const session = ensureCurrentSession(workspace);
+    const sessionPath = path.join(workspace, '.copilot_history', `${session.sessionId}.json`);
+    const record = JSON.parse(fs.readFileSync(sessionPath, 'utf8'));
+    const timestamp = new Date().toISOString();
+    record.messages = [
+        { role: 'assistant', text: 'Legacy', timestamp, attachments: [], references: [] },
+        {
+            role: 'assistant',
+            text: 'Current',
+            timestamp,
+            attachments: [],
+            references: [],
+            progress: ['  first  ', '', 17, 'second']
+        },
+        { role: 'assistant', text: '', timestamp, attachments: [], references: [], progress: ['UI only'] }
+    ];
+    fs.writeFileSync(sessionPath, `${JSON.stringify(record, null, 2)}\n`);
+
+    const loaded = loadSession(workspace, session.sessionId);
+    assert.equal(Object.hasOwn(loaded.messages[0], 'progress'), false);
+    assert.deepEqual(loaded.messages[1].progress, ['first', 'second']);
+    const context = formatContinuationContext(loaded);
+    assert.doesNotMatch(context, /first|second|UI only/);
+    assert.equal((context.match(/Assistant:/g) || []).length, 2);
 });
 
 test('repairs an invalid current pointer without deleting valid sessions', (t) => {

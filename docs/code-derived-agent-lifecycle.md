@@ -567,6 +567,8 @@ For bwrap agents, monitor liveness checks process state and a separate bwrap hea
 
 The router is launched by `Watchdog.js`, not directly by the CLI foreground process. The watchdog writes logs, starts `RoutingServer.js`, health-checks `/health`, restarts the router process after repeated failures, and starts the container monitor.
 
+The container monitor checks per-container maintenance locks before it schedules an automatic restart and again when a scheduled restart callback executes. The second check covers the interval in which an operator reinstall or explicit restart can acquire the lock after the watchdog has already created its backoff timer. When maintenance is active, the callback clears its in-progress restart state and defers container evaluation to a later monitor tick.
+
 ```mermaid
 sequenceDiagram
   participant CLI as ploinky start
