@@ -105,15 +105,22 @@ test('opens the Sessions dialog and creates a session from its first item', asyn
     }
 });
 
-test('renders Load History as a scrollable DOM-only assistant message', () => {
+test('renders the session-history action as a scrollable DOM-only button', () => {
+    const template = readFileSync(new URL('../../cli/server/webchat/chat.html', import.meta.url), 'utf8');
     const css = readFileSync(new URL('../../cli/server/webchat/webchat.css', import.meta.url), 'utf8');
     const messages = readFileSync(new URL('../../cli/server/webchat/messages.js', import.meta.url), 'utf8');
     const sessions = readFileSync(new URL('../../cli/server/webchat/sessions.js', import.meta.url), 'utf8');
 
     assert.doesNotMatch(css, /\.wa-history-gate\s*\{[^}]*position:\s*sticky/s);
+    assert.match(template, /Click to load session history/);
+    assert.match(css, /\.wa-history-gate\s*\{[^}]*width:\s*100%;[^}]*display:\s*flex;[^}]*justify-content:\s*center/s);
+    assert.doesNotMatch(template, /wa-message(?:-bubble)?[^"\n]*wa-history/);
+    assert.match(css, /\.wa-history-load-button\s*\{[^}]*width:\s*min\(100%, 320px\)[^}]*font-weight:\s*600/s);
+    assert.match(css, /\.wa-history-gate\s*\{[^}]*padding:\s*10px 0 6px/s);
+    assert.match(css, /\.wa-history-load-button::before\s*\{[^}]*content:\s*'↻'/s);
     assert.match(messages, /child !== typingIndicator && child !== historyGate/);
     assert.match(sessions, /async function loadHistory[\s\S]*?showHistoryGate\(false\);[\s\S]*?request\(`sessions\/\$\{encodeURIComponent\(sessionId\)\}`\)/);
-    assert.doesNotMatch(sessions, /addServerMsg\([^)]*Load History/);
+    assert.doesNotMatch(sessions, /addServerMsg\([^)]*Click to load session history/);
 });
 
 test('hides the fake history message during loading and restores it after failure', async () => {

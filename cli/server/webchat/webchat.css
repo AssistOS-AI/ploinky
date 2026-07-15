@@ -246,14 +246,66 @@ body {
     display: none;
 }
 
-.wa-history-load-button {
-    font: inherit;
-    text-align: left;
-    cursor: pointer;
+.wa-history-gate {
+    width: 100%;
+    padding: 10px 0 6px;
+    display: flex;
+    flex: 0 0 auto;
+    align-items: center;
+    justify-content: center;
 }
 
-.wa-message.in .wa-history-load-button:hover {
-    background: var(--wa-bg-hover);
+.wa-history-load-button {
+    width: min(100%, 320px);
+    min-height: 36px;
+    padding: 6px 12px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 7px;
+    border: 1px solid color-mix(in srgb, var(--wa-accent) 34%, var(--wa-border));
+    border-radius: 9px;
+    background: linear-gradient(135deg,
+        color-mix(in srgb, var(--wa-accent) 7%, var(--wa-bg-message-in)),
+        var(--wa-bg-message-in));
+    box-shadow: none;
+    color: var(--wa-accent);
+    font: inherit;
+    font-size: 12px;
+    font-weight: 600;
+    text-align: center;
+    cursor: pointer;
+    transition: transform 0.16s ease, border-color 0.16s ease, box-shadow 0.16s ease;
+}
+
+.wa-history-load-button::before {
+    content: '↻';
+    width: 18px;
+    height: 18px;
+    display: inline-grid;
+    place-items: center;
+    border-radius: 999px;
+    background: color-mix(in srgb, var(--wa-accent) 10%, transparent);
+    font-size: 13px;
+    line-height: 1;
+}
+
+.wa-history-load-button:hover {
+    border-color: var(--wa-accent);
+    background: linear-gradient(135deg,
+        color-mix(in srgb, var(--wa-accent) 12%, var(--wa-bg-message-in)),
+        var(--wa-bg-message-in));
+    box-shadow: var(--wa-shadow-sm);
+    transform: translateY(-1px);
+}
+
+.wa-history-load-button:active {
+    transform: translateY(0);
+}
+
+.wa-history-load-button:focus-visible {
+    outline: 2px solid var(--wa-accent);
+    outline-offset: 3px;
 }
 
 .wa-session-dialog-backdrop {

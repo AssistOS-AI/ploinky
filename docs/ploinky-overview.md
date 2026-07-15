@@ -39,7 +39,7 @@ Ploinky is a workspace-local runtime for repository-backed agents.
   an assistant placeholder whose optional `progress` field is an ordered string
   array updated from agent progress reasons before final text arrives. Persisted
   progress remains UI-only and existing messages render only through
-  `Load History`. A newly started agent receives only
+  `Click to load session history`. A newly started agent receives only
   `PLOINKY_WEBCHAT_HAS_HISTORY=1` or `0` as conversation-start metadata, while
   the folder session id remains router-owned. When opened as
   `/webchat?agent=<name>&...`, the router forwards additional query parameters
