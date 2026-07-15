@@ -6,7 +6,7 @@ import {
     __testables,
 } from '../../Agent/client/AgentMcpClient.mjs';
 
-test('a task observer can detach an async agent call before callback polling', async () => {
+test('a task observer can attach background metadata to a non-blocking call', async () => {
     const observations = [];
     const remove = setAgentTaskObserver(async (task) => {
         observations.push(task);

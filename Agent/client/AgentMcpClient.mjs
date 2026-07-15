@@ -338,15 +338,15 @@ function startTaskPolling(agentName, taskId, callback, _options = {}) {
 }
 
 /**
- * Create a router-mediated client for calling `agentName`'s tools. Only
- * `callTool` is supported: the router's delegated path accepts a direct
- * tools/call, so listing/initialization over agent-to-agent is intentionally
- * unavailable (use a user/session surface for discovery).
+ * Create a router-mediated client for calling `agentName`'s tools. Only tool
+ * calls are supported: the router's delegated path accepts a direct tools/call,
+ * so listing/initialization over agent-to-agent is intentionally unavailable
+ * (use a user/session surface for discovery).
  */
 export async function createAgentClient(agentName, options = {}) {
     const defaultDelegationToken = normalizeDelegationToken(options?.userDelegationToken);
 
-    async function callTool(name, args = {}, callOptions = {}) {
+    async function requestToolCall(name, args = {}, callOptions = {}) {
         const toolArgs = args && typeof args === 'object' && !Array.isArray(args) ? args : {};
         const assertion = signAgentAssertion({
             method: 'POST',
@@ -374,7 +374,14 @@ export async function createAgentClient(agentName, options = {}) {
         if (status >= 400 || !json) {
             throw new Error(`agent-to-agent call failed (status ${status}): ${(text || '').slice(0, 200)}`.trim());
         }
-        const result = unwrapToolResult(json.result);
+        return {
+            result: unwrapToolResult(json.result),
+            toolArgs,
+        };
+    }
+
+    async function callTool(name, args = {}, callOptions = {}) {
+        const { result } = await requestToolCall(name, args, callOptions);
         const taskId = normalizeTaskId(result);
         if (!taskId) {
             return result;
@@ -388,20 +395,6 @@ export async function createAgentClient(agentName, options = {}) {
             updatedAt: metadata?.updatedAt,
             toolName: metadata?.toolName || name,
         };
-        const observedResult = await applyTaskObserver({
-            result,
-            agentName,
-            taskId,
-            toolName: metadata?.toolName || name,
-            toolArgs,
-            metadata,
-        });
-        if (observedResult) return observedResult;
-
-        if (typeof callOptions.onTaskUpdate !== 'function') {
-            return result;
-        }
-
         emitTaskUpdate(callOptions.onTaskUpdate, initialUpdate);
 
         const finalTask = await new Promise((resolve, reject) => {
@@ -436,12 +429,32 @@ export async function createAgentClient(agentName, options = {}) {
         return parseTaskPayload(finalTask);
     }
 
+    async function callToolWithoutWait(name, args = {}, callOptions = {}) {
+        const { result, toolArgs } = await requestToolCall(name, args, callOptions);
+        const taskId = normalizeTaskId(result);
+        if (!taskId) {
+            return result;
+        }
+
+        const metadata = result?.metadata;
+        const observedResult = await applyTaskObserver({
+            result,
+            agentName,
+            taskId,
+            toolName: metadata?.toolName || name,
+            toolArgs,
+            metadata,
+        });
+        return observedResult || result;
+    }
+
     const unsupported = (op) => async () => {
         throw new Error(`${op} is not available via agent-to-agent calls; use callTool`);
     };
 
     return {
         callTool,
+        callToolWithoutWait,
         getTaskStatus: (taskId) => getTaskStatus(agentName, taskId),
         connect: async () => {},
         listTools: unsupported('listTools'),

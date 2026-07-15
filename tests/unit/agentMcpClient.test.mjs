@@ -10,12 +10,17 @@ const originalCwd = process.cwd();
 const originalRouterUrl = process.env.PLOINKY_ROUTER_URL;
 const originalAgentId = process.env.PLOINKY_AGENT_ID;
 const originalAgentSecret = process.env.PLOINKY_AGENT_SECRET;
+const originalPollInterval = process.env.PLOINKY_MCP_TASK_POLL_INTERVAL_MS;
 
 process.chdir(tempDir);
 process.env.PLOINKY_AGENT_ID = 'agent:AssistOSExplorer/onlyOffice';
 process.env.PLOINKY_AGENT_SECRET = 'a'.repeat(64);
+process.env.PLOINKY_MCP_TASK_POLL_INTERVAL_MS = '10';
 
-const { createAgentClient } = await import('../../Agent/client/AgentMcpClient.mjs');
+const {
+    createAgentClient,
+    setAgentTaskObserver,
+} = await import('../../Agent/client/AgentMcpClient.mjs');
 
 function listen(server) {
     return new Promise((resolve, reject) => {
@@ -37,6 +42,8 @@ test.after(() => {
     else process.env.PLOINKY_AGENT_ID = originalAgentId;
     if (originalAgentSecret === undefined) delete process.env.PLOINKY_AGENT_SECRET;
     else process.env.PLOINKY_AGENT_SECRET = originalAgentSecret;
+    if (originalPollInterval === undefined) delete process.env.PLOINKY_MCP_TASK_POLL_INTERVAL_MS;
+    else process.env.PLOINKY_MCP_TASK_POLL_INTERVAL_MS = originalPollInterval;
 });
 
 async function withCaptureServer(t, onRequest) {
@@ -133,4 +140,81 @@ test('createAgentClient rejects non-string delegation tokens', async () => {
         () => client.callTool('dpu_confidential_get', { id: 'doc-1' }, { userDelegationToken: 123 }),
         /userDelegationToken must be a string/,
     );
+});
+
+test('callTool waits for an asynchronous task and does not apply the observer', async (t) => {
+    let statusRequests = 0;
+    await withCaptureServer(t, (req, _body, res) => {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        if (req.method === 'GET') {
+            statusRequests += 1;
+            res.end(JSON.stringify({
+                task: {
+                    id: 'task-wait',
+                    status: 'completed',
+                    result: {
+                        content: [{
+                            type: 'text',
+                            text: JSON.stringify({ ok: true, outputText: 'finished' }),
+                        }],
+                    },
+                },
+            }));
+            return;
+        }
+        res.end(JSON.stringify({
+            jsonrpc: '2.0',
+            id: '1',
+            result: { metadata: { taskId: 'task-wait', status: 'queued' } },
+        }));
+    });
+    let observations = 0;
+    const removeObserver = setAgentTaskObserver(async () => {
+        observations += 1;
+        return { detached: true };
+    });
+    t.after(removeObserver);
+
+    const client = await createAgentClient('asyncAgent');
+    const updates = [];
+    const result = await client.callTool('execute-task', { prompt: 'wait' }, {
+        onTaskUpdate: (task) => updates.push(task),
+    });
+
+    assert.equal(result.status, 'completed');
+    assert.equal(result.ok, true);
+    assert.equal(result.outputText, 'finished');
+    assert.deepEqual(updates.map((task) => task.status), ['queued', 'completed']);
+    assert.equal(statusRequests, 1);
+    assert.equal(observations, 0);
+});
+
+test('callToolWithoutWait applies the observer and returns without polling', async (t) => {
+    let statusRequests = 0;
+    await withCaptureServer(t, (req, _body, res) => {
+        if (req.method === 'GET') {
+            statusRequests += 1;
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+            jsonrpc: '2.0',
+            id: '1',
+            result: { metadata: { taskId: 'task-detach', status: 'queued' } },
+        }));
+    });
+    const observations = [];
+    const removeObserver = setAgentTaskObserver(async (task) => {
+        observations.push(task);
+        return { detached: true, id: 'local-task', description: 'Detached task' };
+    });
+    t.after(removeObserver);
+
+    const client = await createAgentClient('asyncAgent');
+    const result = await client.callToolWithoutWait('execute-task', { prompt: 'detach' });
+
+    assert.equal(observations.length, 1);
+    assert.equal(observations[0].taskId, 'task-detach');
+    assert.equal(result.metadata.backgroundTask.detached, true);
+    assert.equal(result.metadata.backgroundTask.id, 'local-task');
+    assert.equal(statusRequests, 0);
 });
