@@ -54,6 +54,8 @@ The authenticated session API consists of `GET /webchat/sessions`, `POST /webcha
 
 WebChat's EventSource stream must tolerate brief browser reconnects without killing the target TTY. Runtime identity is the canonical working directory, selected folder session, selected agent, and launch configuration; `tabId` identifies only a browser client and must be recovered from `sessionStorage` on refresh. A runtime may have multiple SSE subscribers and remains alive for the bounded reconnect grace window after the last subscriber leaves. Output produced without a subscriber is recovered from folder history on demand rather than replayed automatically from an in-memory tab buffer.
 
+WebChat may accept a generic `__webchatRuntimeState` line envelope from the selected CLI. Version 1 carries an optional selected `model` string or `null`; the envelope must be intercepted before ordinary assistant output, must not enter conversation history, and must be exposed to connected browsers through the `runtime-state` EventSource event. The current runtime-state snapshot must remain memory-only and must be sent to a reconnecting subscriber. The header may show a non-empty model beside the selected agent name and must hide the badge when the model is `null`. Ploinky must not read an agent-owned settings file, infer an effective provider model, or persist this runtime state in folder-session JSON.
+
 WebChat must not render existing messages automatically after refresh. A non-empty session presents `Click to load session history` as a centered standalone button inside the scrollable message stream, not as a chat item, while the composer remains usable and new turns append to the current session. This item is browser-only: it must not be written to folder history, sent to the agent, or included in continuation context. Activating it removes it immediately and loads the real history; a failed request may restore it so the user can retry. The `Sessions` header control opens one selector whose first item is the emphasized `New` action; activating it creates and selects an empty session. The remaining items list sessions by recent activity using a first-message preview and relative time, without agent or message-count metadata. Selecting an existing entry makes it current and loads it. Session changes and new turns must be visible to other connected clients using the same working directory.
 
 The `Tasks` and `Sessions` controls in the WebChat header must use a darker green hover fill that remains visually consistent with the green header, rather than inheriting the theme's neutral panel-hover color.
@@ -215,6 +217,11 @@ distinction between the agent's final answer and UI-only execution status.
 
 Response:
 Keeping agent-provided completions in memory makes local filtering immediate and avoids another authenticated request for every keystroke. The fixed-height viewport keeps the composer compact, while bounded progressive DOM batches make every result reachable through the scrollbar and Arrow Up/Down without inserting the complete catalog into the document at once. Optional fragment matching still lets users narrow catalogs containing hundreds of entries without WebChat learning what those entries represent.
+
+### Question #12: Why does the selected model reach the header through runtime state instead of folder history or direct settings access?
+
+Response:
+The selected CLI owns the meaning and persistence of its model setting, while Ploinky owns only the generic browser transport. A volatile runtime-state envelope lets any compatible agent publish current UI metadata without extending the conversation schema or coupling WebChat to an agent-specific path. Retaining the latest state in the live runtime also restores the header after a brief EventSource reconnect without claiming that the value describes the effective model used for every response.
 
 ## Conclusion
 

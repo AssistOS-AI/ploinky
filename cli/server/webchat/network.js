@@ -113,7 +113,27 @@ function parseProgressEnvelope(text) {
     }
 }
 
-Object.assign(__testables, { serializeEnvelope, normalizeClientReference, parseProgressEnvelope });
+function parseRuntimeStatePayload(text) {
+    try {
+        const payload = typeof text === 'string' ? JSON.parse(text) : text;
+        if (!payload || typeof payload !== 'object' || !Object.prototype.hasOwnProperty.call(payload, 'model')) {
+            return undefined;
+        }
+        if (payload.model === null) return { model: null };
+        if (typeof payload.model !== 'string') return undefined;
+        const model = payload.model.trim();
+        return model ? { model } : { model: null };
+    } catch (_) {
+        return undefined;
+    }
+}
+
+Object.assign(__testables, {
+    serializeEnvelope,
+    normalizeClientReference,
+    parseProgressEnvelope,
+    parseRuntimeStatePayload,
+});
 
 export { serializeEnvelope, normalizeClientReference };
 
@@ -137,6 +157,7 @@ export function createNetwork({
     addRemoteUserMessage,
     onSessionChanged,
     onTaskUpdate,
+    onRuntimeState,
     onConnected
 }) {
     let es = null;
@@ -367,6 +388,13 @@ export function createNetwork({
                 }
             } catch (error) {
                 dlog('task update error', error);
+            }
+        });
+
+        es.addEventListener('runtime-state', (event) => {
+            const runtimeState = parseRuntimeStatePayload(event.data);
+            if (runtimeState !== undefined && typeof onRuntimeState === 'function') {
+                onRuntimeState(runtimeState);
             }
         });
 

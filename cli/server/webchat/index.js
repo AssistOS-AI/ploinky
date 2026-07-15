@@ -141,6 +141,7 @@ const network = createNetwork({
         taskController?.handleUpdate(payload);
         messages.associateTask(payload);
     },
+    onRuntimeState: (state) => dom.setRuntimeModel(state?.model),
     onConnected: () => taskController?.refresh().catch(() => {})
 });
 

@@ -18,6 +18,7 @@ import {
     getRuntimeMap,
     scheduleDisconnectedTabCleanup,
     routeWorkspaceRuntimeOutput,
+    serializeRuntimeStateSseEvent,
     writeOrBufferSseEvent
 } from './runtimeState.js';
 
@@ -131,6 +132,8 @@ export function handleRuntimeRoute({
         res.write(`: connected session=${currentSession.sessionId}\n\n`);
         const connectionId = crypto.randomUUID();
         tab.subscribers.set(connectionId, { res, sid, tabId });
+        const runtimeStateSnapshot = serializeRuntimeStateSseEvent(tab.webchatRuntimeState);
+        if (runtimeStateSnapshot) res.write(runtimeStateSnapshot);
 
         let keepaliveTimer = setInterval(() => {
             try { res.write(': keepalive\n\n'); } catch (_) { }

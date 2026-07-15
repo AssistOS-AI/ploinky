@@ -11,7 +11,9 @@ import { hasOngoingTask, ingestTaskEvent } from '../../webchat/taskStore.js';
 
 const STREAM_RECONNECT_GRACE_MS = 120000;
 const MAX_PENDING_SSE_EVENTS = 200;
+const MAX_RUNTIME_MODEL_LENGTH = 256;
 const PROCESS_PREFIX_RE = /^(?:\s*\.+\s*){3,}/;
+const WEBCHAT_RUNTIME_STATE_FLAG = '__webchatRuntimeState';
 
 function stripCtrlAndAnsi(input) {
     try {
@@ -219,6 +221,37 @@ export function writeOrBufferSseEvent(tab, payload) {
     pushPendingSseEvent(tab, payload);
 }
 
+function normalizeRuntimeModel(value) {
+    if (value === null) return null;
+    if (typeof value !== 'string') return undefined;
+    const model = value.trim();
+    if (!model) return null;
+    if (model.length > MAX_RUNTIME_MODEL_LENGTH || /[\u0000-\u001F\u007F]/.test(model)) {
+        return undefined;
+    }
+    return model;
+}
+
+export function parseWebchatRuntimeState(envelope) {
+    if (!envelope || typeof envelope !== 'object' || !envelope[WEBCHAT_RUNTIME_STATE_FLAG]) {
+        return undefined;
+    }
+    if (envelope.version !== 1) {
+        return undefined;
+    }
+    if (!Object.prototype.hasOwnProperty.call(envelope, 'model')) {
+        return undefined;
+    }
+    const model = normalizeRuntimeModel(envelope.model);
+    return model === undefined ? undefined : { model };
+}
+
+export function serializeRuntimeStateSseEvent(state) {
+    const model = normalizeRuntimeModel(state?.model);
+    if (model === undefined) return '';
+    return `event: runtime-state\ndata: ${JSON.stringify({ model })}\n\n`;
+}
+
 export function getRuntimeMap(appState) {
     if (!(appState.runtimes instanceof Map)) appState.runtimes = new Map();
     return appState.runtimes;
@@ -257,6 +290,21 @@ export function broadcastWorkspaceTaskEvent(appState, workspaceDirectory, payloa
 
 function routeCompleteOutputLine(appState, tab, line) {
     const normalized = stripCtrlAndAnsi(String(line || '')).trim();
+    if (normalized.includes(`"${WEBCHAT_RUNTIME_STATE_FLAG}"`)) {
+        try {
+            const envelope = JSON.parse(normalized);
+            if (envelope?.[WEBCHAT_RUNTIME_STATE_FLAG]) {
+                const runtimeState = parseWebchatRuntimeState(envelope);
+                if (runtimeState !== undefined) {
+                    tab.webchatRuntimeState = runtimeState;
+                    writeOrBufferSseEvent(tab, serializeRuntimeStateSseEvent(runtimeState));
+                }
+                return;
+            }
+        } catch (_) {
+            // Invalid runtime-state envelopes fall through as ordinary agent output.
+        }
+    }
     if (normalized.includes('"__webchatTask"')) {
         try {
             const envelope = JSON.parse(normalized);
@@ -317,7 +365,10 @@ export function routeWorkspaceRuntimeOutput(appState, tab, data) {
     }
 
     const trimmed = stripCtrlAndAnsi(pending).trimStart();
-    if (trimmed.startsWith('{') && ('{"__webchatTask"'.startsWith(trimmed) || trimmed.includes('"__webchatTask"'))) {
+    const isTaskProtocol = '{"__webchatTask"'.startsWith(trimmed) || trimmed.includes('"__webchatTask"');
+    const isRuntimeStateProtocol = `{"${WEBCHAT_RUNTIME_STATE_FLAG}"`.startsWith(trimmed)
+        || trimmed.includes(`"${WEBCHAT_RUNTIME_STATE_FLAG}"`);
+    if (trimmed.startsWith('{') && (isTaskProtocol || isRuntimeStateProtocol)) {
         tab.taskProtocolBuffer = pending;
         return;
     }
@@ -385,7 +436,10 @@ export function disposeTab(tab, tabId, session) {
     tab.disposed = true;
 
     if (tab.taskProtocolBuffer) {
-        captureWorkspaceHistoryOutput(tab, tab.taskProtocolBuffer);
+        const pendingProtocol = stripCtrlAndAnsi(tab.taskProtocolBuffer).trimStart();
+        const isControlEnvelope = pendingProtocol.includes('"__webchatTask"')
+            || pendingProtocol.includes(`"${WEBCHAT_RUNTIME_STATE_FLAG}"`);
+        if (!isControlEnvelope) captureWorkspaceHistoryOutput(tab, tab.taskProtocolBuffer);
         tab.taskProtocolBuffer = '';
     }
 

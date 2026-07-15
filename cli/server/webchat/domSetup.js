@@ -37,6 +37,7 @@ export function initDom() {
     const markdown = window.webchatMarkdown;
 
     const titleBar = document.getElementById('titleBar');
+    const runtimeModel = document.getElementById('runtimeModel');
     const avatarInitial = document.getElementById('avatarInitial');
     const statusEl = document.getElementById('statusText');
     const statusDot = document.querySelector('.wa-status-dot');
@@ -119,6 +120,14 @@ export function initDom() {
     if (avatarInitial) {
         const initial = appTitle.trim().charAt(0) || 'P';
         avatarInitial.textContent = initial.toUpperCase();
+    }
+
+    function setRuntimeModel(value) {
+        if (!runtimeModel) return;
+        const model = typeof value === 'string' ? value.trim() : '';
+        runtimeModel.textContent = model;
+        runtimeModel.title = model ? `Selected model: ${model}` : '';
+        runtimeModel.hidden = !model;
     }
 
     function showBanner(text, cls) {
@@ -233,11 +242,13 @@ export function initDom() {
         toEndpoint,
         showBanner,
         hideBanner,
+        setRuntimeModel,
         getViewMoreLineLimit: () => viewMoreLineLimit,
         setViewMoreChangeHandler,
         elements: {
             body,
             titleBar,
+            runtimeModel,
             avatarInitial,
             statusEl,
             statusDot,
