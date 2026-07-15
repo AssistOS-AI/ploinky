@@ -104,9 +104,9 @@ ploinky cli achilles-cli --path=/absolute/path</code></pre>
                     </p>
                     <ul style="margin-left: 2rem;">
                         <li><strong>Load History</strong> appears as a fake incoming assistant item inside the scrollable conversation and renders the current session only when requested. It is browser-only, is never stored as a message or sent to the agent, and disappears immediately when activated; the composer remains available while older messages are hidden.</li>
-                        <li><strong>New+</strong> creates an empty session and makes it current for the folder.</li>
-                        <li><strong>Load Session</strong> lists the first user-message preview and relative activity time, such as <code>2 days ago</code>, without message counts or agent metadata.</li>
-                        <li>The <strong>Tasks</strong>, <strong>New+</strong>, and <strong>Load Session</strong> header controls use a darker green hover state that stays visually integrated with the header.</li>
+                        <li><strong>Sessions</strong> opens the session selector. Its first, emphasized <strong>New</strong> item creates an empty session and makes it current for the folder.</li>
+                        <li>Existing session items show the first user-message preview and relative activity time, such as <code>2 days ago</code>, without message counts or agent metadata.</li>
+                        <li>The <strong>Tasks</strong> and <strong>Sessions</strong> header controls use a darker green hover state that stays visually integrated with the header.</li>
                         <li>Connected browser clients using the same working directory receive session changes and new turns through the shared EventSource runtime.</li>
                     </ul>
                     <p>
@@ -114,7 +114,7 @@ ploinky cli achilles-cli --path=/absolute/path</code></pre>
                         Historical inputs are not replayed as commands. Persisted progress and assistant placeholders without final text remain UI-only and are excluded from that context.
                         Slash commands remain unchanged and defer restoration until a later conversational message.
                     </p>
-                    <p>A newly started CLI receives <code>PLOINKY_WEBCHAT_HAS_HISTORY</code>. A value of <code>1</code> tells a generic agent that this is an existing conversation, so it should not emit new-conversation startup content. Empty sessions, including those created by <strong>New+</strong>, receive <code>0</code>. The selected folder session id remains private to the router instead of being forwarded into the agent process environment.</p>
+                    <p>A newly started CLI receives <code>PLOINKY_WEBCHAT_HAS_HISTORY</code>. A value of <code>1</code> tells a generic agent that this is an existing conversation, so it should not emit new-conversation startup content. Empty sessions, including those created through <strong>Sessions → New</strong>, receive <code>0</code>. The selected folder session id remains private to the router instead of being forwarded into the agent process environment.</p>
 
                     <h3>Background Tasks</h3>
                     <p>CLIs may publish generic asynchronous task lifecycle envelopes through their stdout stream. WebChat stores task metadata in <code>.copilot_history/agent_tasks</code>, keeps bounded logs in <code>.copilot_history/task_logs/</code>, and presents both through the authenticated <strong>Tasks</strong> overlay. Task events and logs are not assistant messages and do not enter conversation history.</p>

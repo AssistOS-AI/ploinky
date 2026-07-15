@@ -55,8 +55,7 @@ const {
     filePreviewContainer,
     attachmentContainer,
     cancelBtn,
-    newSessionBtn,
-    loadSessionBtn,
+    sessionsBtn,
     historyGate,
     loadHistoryBtn,
     sessionDialog,
@@ -144,8 +143,7 @@ taskController = createTaskController({
 sessionController = createSessionController({
     toEndpoint,
     elements: {
-        newSessionBtn,
-        loadSessionBtn,
+        sessionsBtn,
         historyGate,
         loadHistoryBtn,
         sessionDialog,

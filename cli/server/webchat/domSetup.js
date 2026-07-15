@@ -68,8 +68,7 @@ export function initDom() {
     const fileUploadInput = document.getElementById('fileUploadInput');
     const folderUploadInput = document.getElementById('folderUploadInput');
     const filePreviewContainer = document.getElementById('filePreviewContainer');
-    const newSessionBtn = document.getElementById('newSessionBtn');
-    const loadSessionBtn = document.getElementById('loadSessionBtn');
+    const sessionsBtn = document.getElementById('sessionsBtn');
     const historyGate = document.getElementById('historyGate');
     const loadHistoryBtn = document.getElementById('loadHistoryBtn');
     const sessionDialog = document.getElementById('sessionDialog');
@@ -270,8 +269,7 @@ export function initDom() {
             folderUploadInput,
             filePreviewContainer,
             attachmentContainer,
-            newSessionBtn,
-            loadSessionBtn,
+            sessionsBtn,
             historyGate,
             loadHistoryBtn,
             sessionDialog,

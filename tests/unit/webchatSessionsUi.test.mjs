@@ -19,6 +19,92 @@ test('uses a dark green hover fill for WebChat header session controls', () => {
     assert.doesNotMatch(css, /\.wa-session-btn:hover,\s*\.wa-history-gate button:hover/);
 });
 
+test('renders New as the first emphasized item in the Sessions dialog', () => {
+    const css = readFileSync(new URL('../../cli/server/webchat/webchat.css', import.meta.url), 'utf8');
+    const sessions = readFileSync(new URL('../../cli/server/webchat/sessions.js', import.meta.url), 'utf8');
+    const appendNewIndex = sessions.indexOf('sessionList.appendChild(newSessionButton)');
+    const requestSessionsIndex = sessions.indexOf("await request('sessions')", appendNewIndex);
+
+    assert.match(sessions, /newSessionButton\.className = 'wa-session-list-item wa-session-list-new'/);
+    assert.match(sessions, /newSessionLabel\.textContent = 'New'/);
+    assert.ok(appendNewIndex >= 0);
+    assert.ok(requestSessionsIndex > appendNewIndex);
+    assert.match(css, /\.wa-session-list-new \.wa-session-list-preview\s*\{\s*font-weight:\s*700;\s*\}/);
+});
+
+test('opens the Sessions dialog and creates a session from its first item', async () => {
+    const originalDocument = globalThis.document;
+    const originalFetch = globalThis.fetch;
+    const makeElement = () => ({
+        children: [],
+        dataset: {},
+        listeners: new Map(),
+        append(...children) {
+            this.children.push(...children);
+        },
+        appendChild(child) {
+            this.children.push(child);
+        },
+        addEventListener(type, listener) {
+            this.listeners.set(type, listener);
+        }
+    });
+    const sessionsBtn = makeElement();
+    const sessionDialog = makeElement();
+    sessionDialog.hidden = true;
+    const sessionList = makeElement();
+    sessionList.replaceChildren = function replaceChildren() {
+        this.children = [];
+    };
+    const requests = [];
+    globalThis.document = {
+        createElement: () => makeElement(),
+        addEventListener() {}
+    };
+    globalThis.fetch = async (_url, options = {}) => {
+        requests.push(options.method || 'GET');
+        const payload = options.method === 'POST'
+            ? { session: { sessionId: 'session-new', hasHistory: false } }
+            : {
+                currentSessionId: 'session-current',
+                sessions: [{
+                    sessionId: 'session-current',
+                    preview: 'Existing session',
+                    updatedAt: '2026-07-15T12:00:00.000Z'
+                }]
+            };
+        return { ok: true, status: 200, json: async () => payload };
+    };
+
+    try {
+        createSessionController({
+            toEndpoint: (path) => path,
+            elements: { sessionsBtn, sessionDialog, sessionList },
+            messages: { clearMessages() {}, renderHistory() {} },
+            network: { setSession() {} },
+            showBanner() {},
+            hideBanner() {}
+        });
+
+        sessionsBtn.listeners.get('click')();
+        await new Promise((resolve) => setImmediate(resolve));
+
+        assert.equal(sessionDialog.hidden, false);
+        assert.equal(sessionList.children.length, 2);
+        assert.equal(sessionList.children[0].children[0].textContent, 'New');
+        assert.equal(sessionList.children[1].children[0].textContent, 'Existing session');
+
+        sessionList.children[0].listeners.get('click')();
+        await new Promise((resolve) => setImmediate(resolve));
+
+        assert.equal(sessionDialog.hidden, true);
+        assert.deepEqual(requests, ['GET', 'POST']);
+    } finally {
+        globalThis.document = originalDocument;
+        globalThis.fetch = originalFetch;
+    }
+});
+
 test('renders Load History as a scrollable DOM-only assistant message', () => {
     const css = readFileSync(new URL('../../cli/server/webchat/webchat.css', import.meta.url), 'utf8');
     const messages = readFileSync(new URL('../../cli/server/webchat/messages.js', import.meta.url), 'utf8');

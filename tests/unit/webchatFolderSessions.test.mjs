@@ -13,9 +13,11 @@ const readWebchatHandlers = () => fs.readdirSync(path.join(ROOT, 'cli/server/han
 
 test('WebChat exposes folder-session controls and lazy history loading', () => {
     const template = read('cli/server/webchat/chat.html');
-    for (const id of ['newSessionBtn', 'loadSessionBtn', 'historyGate', 'loadHistoryBtn', 'sessionDialog', 'sessionList']) {
+    for (const id of ['sessionsBtn', 'historyGate', 'loadHistoryBtn', 'sessionDialog', 'sessionList']) {
         assert.match(template, new RegExp(`id="${id}"`));
     }
+    assert.match(template, /id="sessionsBtn"[^>]*>Sessions<\/button>/);
+    assert.doesNotMatch(template, /id="(?:newSessionBtn|loadSessionBtn)"/);
     const chatListStart = template.indexOf('id="chatList"');
     const historyGate = template.indexOf('id="historyGate"');
     const typingIndicator = template.indexOf('id="typingIndicator"');

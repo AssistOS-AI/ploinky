@@ -327,6 +327,10 @@ body {
     background: var(--wa-bg-hover);
 }
 
+.wa-session-list-new .wa-session-list-preview {
+    font-weight: 700;
+}
+
 .wa-session-list-preview {
     overflow: hidden;
     text-overflow: ellipsis;

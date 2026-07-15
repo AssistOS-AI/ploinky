@@ -31,8 +31,7 @@ export function createSessionController({
     hideBanner
 }) {
     const {
-        newSessionBtn,
-        loadSessionBtn,
+        sessionsBtn,
         historyGate,
         loadHistoryBtn,
         sessionDialog,
@@ -139,6 +138,20 @@ export function createSessionController({
         if (!sessionDialog || !sessionList) return;
         sessionDialog.hidden = false;
         sessionList.replaceChildren();
+
+        const newSessionButton = document.createElement('button');
+        newSessionButton.type = 'button';
+        newSessionButton.className = 'wa-session-list-item wa-session-list-new';
+        const newSessionLabel = document.createElement('span');
+        newSessionLabel.className = 'wa-session-list-preview';
+        newSessionLabel.textContent = 'New';
+        newSessionButton.appendChild(newSessionLabel);
+        newSessionButton.addEventListener('click', () => {
+            closeDialog();
+            void createNewSession();
+        });
+        sessionList.appendChild(newSessionButton);
+
         try {
             const payload = await request('sessions');
             for (const session of payload.sessions || []) {
@@ -175,8 +188,7 @@ export function createSessionController({
         });
     }
 
-    newSessionBtn?.addEventListener('click', () => void createNewSession());
-    loadSessionBtn?.addEventListener('click', () => void openDialog());
+    sessionsBtn?.addEventListener('click', () => void openDialog());
     loadHistoryBtn?.addEventListener('click', () => void loadHistory());
     sessionDialogClose?.addEventListener('click', closeDialog);
     sessionDialog?.addEventListener('click', (event) => {
