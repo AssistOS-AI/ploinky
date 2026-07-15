@@ -89,25 +89,58 @@ ploinky webchat --rotate # show the same login URL</code></pre>
 
 # launches the selected agent as:
 ploinky cli achilles-cli --path=/absolute/path</code></pre>
-                    <p>The router reserves <code>agent</code> for agent selection and <code>tabId</code> for the browser session stream. Agent CLIs are responsible for interpreting any forwarded flags and values.</p>
+                    <p>The router reserves <code>agent</code> for agent selection, <code>tabId</code> for the browser client, and <code>sessionId</code> for folder-history routing. These internal values are not forwarded as agent CLI flags. Agent CLIs remain responsible for interpreting ordinary forwarded flags and values.</p>
                 </div>
 
                 <div class="doc-section">
                     <h2>Session Experience</h2>
+                    <h3>Folder Sessions</h3>
+                    <p>WebChat stores its selectable continuation history under <code>&lt;cwd&gt;/.copilot_history/</code>. The folder contains <code>current_session.json</code> plus one JSON file per conversation. Refreshing the page reuses the selected folder session and a surviving agent process, while the browser keeps its client-only <code>tabId</code> in <code>sessionStorage</code>.</p>
+                    <p>
+                        Each submitted turn is stored as the user message followed immediately by an assistant placeholder.
+                        The placeholder starts with empty final text and an optional <code>progress</code> array of strings. An assistant message may also carry one <code>taskId</code> that links it to separately stored task metadata and logs.
+                        Agent progress reasons are appended to that array while the request is running, and final output updates the same message.
+                        Tool names, step indexes, and other progress-envelope metadata are not stored.
+                    </p>
+                    <ul style="margin-left: 2rem;">
+                        <li><strong>Click to load session history</strong> appears as a centered standalone button inside the scrollable conversation, rather than as a chat message, and renders the current session only when requested. It is browser-only, is never stored as a message or sent to the agent, and disappears immediately when activated; the composer remains available while older messages are hidden.</li>
+                        <li><strong>Sessions</strong> opens the session selector. Its first, emphasized <strong>New</strong> item creates an empty session and makes it current for the folder.</li>
+                        <li>Existing session items show the first user-message preview and relative activity time, such as <code>2 days ago</code>, without message counts or agent metadata.</li>
+                        <li>The <strong>Tasks</strong> and <strong>Sessions</strong> header controls use a darker green hover state that stays visually integrated with the header.</li>
+                        <li>Connected browser clients using the same working directory receive session changes and new turns through the shared EventSource runtime.</li>
+                    </ul>
+                    <p>
+                        If the original process no longer exists, the next conversational message carries the prior user content and final assistant text in a delimited context block.
+                        Historical inputs are not replayed as commands. Persisted progress and assistant placeholders without final text remain UI-only and are excluded from that context.
+                        Slash commands remain unchanged and defer restoration until a later conversational message.
+                    </p>
+                    <p>A newly started CLI receives <code>PLOINKY_WEBCHAT_HAS_HISTORY</code>. A value of <code>1</code> tells a generic agent that this is an existing conversation, so it should not emit new-conversation startup content. Empty sessions, including those created through <strong>Sessions → New</strong>, receive <code>0</code>. The selected folder session id remains private to the router instead of being forwarded into the agent process environment.</p>
+
+                    <h3>Runtime Model Status</h3>
+                    <p>A compatible CLI may publish a generic <code>__webchatRuntimeState</code> line envelope containing its currently selected model. WebChat removes that control line from assistant output and history, keeps the latest value only in the live runtime, and shows a compact model badge beside the agent name. The runtime-state snapshot is sent again after an EventSource reconnect. A <code>null</code> model hides the badge.</p>
+                    <p>The badge describes agent-declared configuration, not the effective provider model used for an individual answer. WebChat does not read agent settings files, persist the badge in folder history, or attach model metadata to messages.</p>
+
+                    <h3>Background Tasks</h3>
+                    <p>CLIs may publish generic asynchronous task lifecycle envelopes through their stdout stream. WebChat stores task metadata in <code>.copilot_history/agent_tasks</code>, keeps bounded logs in <code>.copilot_history/task_logs/</code>, and presents both through the authenticated <strong>Tasks</strong> overlay. The task state and logs are not copied into conversation history; the ordinary assistant message stores only its optional <code>taskId</code> association.</p>
+                    <p>A started task also appears as a collapsible module at the bottom of its assistant message. The summary shows the exact agent id, description, current status, and elapsed seconds. Expanding the arrow loads and follows the task log; collapsing it hides the log while updates continue. The module survives completion and history reload. Pending tasks show <code>QUEUED</code>, active tasks show <code>RUNNING</code>, and terminal tasks show <code>COMPLETED</code>, <code>STOPPED</code>, or <code>FAILED</code>.</p>
+                    <p>Task log files preserve their raw diagnostic prefixes. The browser removes prefixes such as <code>[opencode stdout]</code>, <code>[opencode stderr]</code>, and <code>[opencodeAgent/execute-task]</code> only for display. Standard output is visually primary, standard error is lighter, and technical runner start/exit lines are replaced by the task duration shown in the summary.</p>
+                    <p>Closing the browser tab does not stop an ongoing delegated task. WebChat retains the watcher runtime while it owns ongoing work so polling and log capture continue. The runtime returns to the normal reconnect cleanup policy after its tasks reach <code>finished</code>, <code>stopped</code>, or <code>error</code>. A recreated compatible CLI can reattach by target agent and remote task id.</p>
+
                     <h3>Message Rendering</h3>
                     <ul style="margin-left: 2rem;">
                         <li>✅ Automatic timestamps for each exchange</li>
                         <li>✅ Rich markdown rendering (tables, code blocks, lists)</li>
                         <li>✅ Long output folding with “Show more” expansion</li>
-                        <li>✅ Agent progress metadata displayed as a collapsible block above the final answer</li>
+                        <li>✅ Agent progress reasons persisted as an ordered string array and displayed as a collapsible block above the final answer</li>
                         <li>✅ Side panel to inspect full message history</li>
+                        <li>✅ Workspace-wide Tasks overlay with live bounded logs and completion notifications</li>
                     </ul>
 
                     <h3>Input Controls</h3>
                     <ul style="margin-left: 2rem;">
                         <li>✅ Auto-resizing composer with keyboard shortcuts (Enter to send, Shift+Enter for new line)</li>
                         <li>✅ Light/Dark/Explorer/Obsidian Dark theme selector with persistent preference (Explorer loads by default; switch via Settings → Appearance)</li>
-                        <li>✅ Slash command autocomplete — type <code>/</code> to open a command menu; supports agent-declared subcommands and argument completions</li>
+                        <li>✅ Slash command autocomplete — start the composer with <code>/</code> to open a fixed-height menu; later slashes remain argument text, Arrow Up/Down keeps the active item visible, and large agent-declared result sets remain fully accessible through progressively rendered scroll batches</li>
                         <li>✅ Composer <code>@</code> autocomplete — typing <code>@</code> opens a grouped menu of static configured tags plus files and folders uploaded in the current WebChat session; selecting a file inserts a stable <code>@file:uploads/&lt;sessionId&gt;/&lt;path&gt;</code> token and attaches a structured reference to the outgoing envelope</li>
                         <li>✅ Cancel button — appears during active processing; sends an interrupt signal to the agent</li>
                     </ul>
@@ -128,6 +161,7 @@ ploinky cli achilles-cli --path=/absolute/path</code></pre>
                     <ul style="margin-left: 2rem;">
                         <li>Use HTTPS or SSH tunnels when exposing the WebChat URL beyond localhost.</li>
                         <li>Protect router session cookies and the encrypted <code>.ploinky/.secrets</code> store used by local auth, dashboard tokens, and manifest env.</li>
+                        <li><code>.copilot_history</code> is authenticated, workspace-confined project state but is plaintext. It receives a local <code>.gitignore</code> to reduce accidental commits.</li>
                     </ul>
                 </div>
 

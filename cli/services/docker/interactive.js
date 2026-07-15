@@ -483,6 +483,15 @@ function buildTerminalEnvArgs(env = process.env, historyName = '') {
     return args;
 }
 
+function buildWebchatEnvArgs(env = process.env) {
+    const args = [];
+    const hasHistory = String(env.PLOINKY_WEBCHAT_HAS_HISTORY || '').trim();
+    if (hasHistory === '0' || hasHistory === '1') {
+        args.push('-e', `PLOINKY_WEBCHAT_HAS_HISTORY=${hasHistory}`);
+    }
+    return args;
+}
+
 function buildExecArgs(containerName, workdir, entryCommand, interactive = true, allocateTty = true, options = {}) {
     const wd = workdir || process.cwd();
     const cmd = buildInteractiveShellCommand(entryCommand, allocateTty);
@@ -494,6 +503,7 @@ function buildExecArgs(containerName, workdir, entryCommand, interactive = true,
     } else if (interactive) {
         args.push('-i');   // Interactive stdin only, no TTY (for webchat - ensures stdin EOF propagates)
     }
+    args.push(...buildWebchatEnvArgs(options.env || process.env));
     args.push(containerName, 'sh', '-lc', `cd ${shellQuote(wd)} && ${cmd}`);
     return args;
 }
@@ -513,7 +523,10 @@ function attachInteractive(containerName, workdir, entryCommand) {
     // PLOINKY_NO_TTY=1 disables TTY allocation (used by webchat to ensure stdin EOF propagates)
     const allocateTty = process.env.PLOINKY_NO_TTY !== '1';
     const containerWorkdir = resolveContainerWorkdir(containerName, workdir);
-    const execArgs = buildExecArgs(containerName, containerWorkdir, entryCommand, true, allocateTty, { historyName: containerName });
+    const execArgs = buildExecArgs(containerName, containerWorkdir, entryCommand, true, allocateTty, {
+        env: process.env,
+        historyName: containerName
+    });
     const result = spawnSync(runtime, execArgs, { stdio: 'inherit' });
     return result.status ?? 0;
 }

@@ -5,7 +5,7 @@ import {
     sanitizeWebchatReferencesForEnvelope,
     parseInputEnvelope,
     serializeWebchatEnvelopeForAgent
-} from '../../cli/server/handlers/webchat.js';
+} from '../../cli/server/handlers/webchat/messageEnvelope.js';
 import {
     serializeEnvelope,
     normalizeClientReference

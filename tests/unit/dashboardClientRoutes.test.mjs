@@ -31,16 +31,6 @@ function createDashboardContext({ base = '/dashboard' } = {}) {
         'statusOut',
         'logsOut',
         'logCount',
-        'transcriptList',
-        'transcriptDetail',
-        'transcriptRetentionMeta',
-        'refreshTranscripts',
-        'feedbackSummary',
-        'feedbackAgents',
-        'feedbackTurns',
-        'feedbackRetentionMeta',
-        'refreshFeedback',
-        'feedbackFilter',
         'agentsList',
         'refreshAgents',
         'debugPopup',
@@ -61,7 +51,6 @@ function createDashboardContext({ base = '/dashboard' } = {}) {
         elements.set(id, createFakeElement());
     }
     elements.get('logCount').value = '200';
-    elements.get('feedbackFilter').value = 'all';
     elements.get('debugJson').value = '{}';
 
     const fetchCalls = [];

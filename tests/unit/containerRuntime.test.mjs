@@ -635,6 +635,42 @@ test('buildExecArgs preserves non-tty shell sessions for webchat stdin EOF handl
     );
 });
 
+test('buildExecArgs forwards only validated WebChat history metadata to non-tty containers', () => {
+    assert.deepEqual(
+        buildExecArgs('agent-container', '/work', 'node /code/src/index.mjs', true, false, {
+            env: {
+                PLOINKY_WEBCHAT_HAS_HISTORY: '1',
+                UNRELATED_VALUE: 'must-not-be-forwarded',
+            },
+        }),
+        [
+            'exec',
+            '-i',
+            '-e', 'PLOINKY_WEBCHAT_HAS_HISTORY=1',
+            'agent-container',
+            'sh',
+            '-lc',
+            "cd '/work' && node /code/src/index.mjs",
+        ],
+    );
+
+    assert.deepEqual(
+        buildExecArgs('agent-container', '/work', 'node /code/src/index.mjs', true, false, {
+            env: {
+                PLOINKY_WEBCHAT_HAS_HISTORY: 'yes',
+            },
+        }),
+        [
+            'exec',
+            '-i',
+            'agent-container',
+            'sh',
+            '-lc',
+            "cd '/work' && node /code/src/index.mjs",
+        ],
+    );
+});
+
 test('buildExecArgs does not rewrite non-shell commands and quotes workdir', () => {
     assert.deepEqual(
         buildExecArgs('agent-container', "/tmp/it's-here", 'node /code/src/index.mjs', true, true, {

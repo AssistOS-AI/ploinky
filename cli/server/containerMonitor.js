@@ -404,7 +404,7 @@ async function upsertRestartedContainerRoute(target, agentDir, result = {}, netw
     });
 }
 
-async function performContainerRestart(monitor, target, reason) {
+export async function performContainerRestart(monitor, target, reason) {
     if (!monitor || !target) return;
     if (monitor.isShuttingDown()) {
         target.isRestarting = false;
@@ -417,6 +417,14 @@ async function performContainerRestart(monitor, target, reason) {
             agent: target.agentName,
             repo: target.repoName,
         });
+        return;
+    }
+
+    // A restart timer may have been scheduled immediately before a CLI
+    // maintenance operation acquired its lock. Recheck at execution time so
+    // the stale timer cannot race reinstall/restart staging.
+    if (shouldDeferMaintenanceRestart(monitor, target)) {
+        target.isRestarting = false;
         return;
     }
 
@@ -687,5 +695,3 @@ export function clearContainerTargets(monitor) {
     stopContainerMonitor(monitor);
     monitor.targets.clear();
 }
-
-export { performContainerRestart };

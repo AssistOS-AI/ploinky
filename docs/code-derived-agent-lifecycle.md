@@ -835,6 +835,8 @@ continues to enforce JWT issuer/audience, policy, request binding, expiry, and
 replay checks. The `ploinky-router` network alias is no longer reserved, though
 that string remains an authentication issuer/audience identity.
 
+The container monitor checks per-container maintenance locks before it schedules an automatic restart and again when a scheduled restart callback executes. The second check covers the interval in which an operator reinstall or explicit restart can acquire the lock after the watchdog has already created its backoff timer. When maintenance is active, the callback clears its in-progress restart state and defers container evaluation to a later monitor tick.
+
 ```mermaid
 sequenceDiagram
   participant CLI as ploinky start

@@ -20,12 +20,12 @@ import {
     listWorkspaceSuggestions,
     normalizeUploadSuggestionQueryPath,
     rewriteUploadSuggestionItem,
-} from '../../cli/server/handlers/webchat.js';
+} from '../../cli/server/handlers/webchat/workspaceSuggestions.js';
 import {
     handleWebchatUploadGet,
     handleWebchatUploadPost,
     resolveWebchatUploadContext,
-} from '../../cli/server/handlers/webchatUploads.js';
+} from '../../cli/server/handlers/webchat/uploads.js';
 
 function makeTempDir(prefix) {
     return fs.mkdtempSync(path.join(os.tmpdir(), `${prefix}-`));

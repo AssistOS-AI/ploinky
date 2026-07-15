@@ -1,8 +1,21 @@
 const ACHILLES_COMMAND_CATALOG_TOOL = 'list_achilles_cli_commands';
+const MCP_ACCEPT = 'application/json, text/event-stream';
+
+function findCommandSlash(value) {
+    return String(value || '').startsWith('/') ? 0 : -1;
+}
+
+function buildMcpHeaders(sessionId = null) {
+    return {
+        'Content-Type': 'application/json',
+        Accept: MCP_ACCEPT,
+        ...(sessionId ? { 'mcp-session-id': sessionId } : {})
+    };
+}
 
 export function applySlashSelectionToValue(value, cmd) {
     const inputValue = typeof value === 'string' ? value : '';
-    const slashIdx = inputValue.lastIndexOf('/');
+    const slashIdx = findCommandSlash(inputValue);
     if (slashIdx === -1 || !cmd) {
         return null;
     }
@@ -44,7 +57,7 @@ function getSubCommandName(subCommand) {
 export function applySlashInsertTextToValue(value, insertText) {
     const inputValue = typeof value === 'string' ? value : '';
     const safeInsertText = typeof insertText === 'string' ? insertText : '';
-    const slashIdx = inputValue.lastIndexOf('/');
+    const slashIdx = findCommandSlash(inputValue);
     if (slashIdx === -1 || !safeInsertText) {
         return null;
     }
@@ -152,10 +165,28 @@ function isCompletedKnownToken(rawToken, completions) {
 
 function appendArgCompletionSuggestions(suggestions, { cmdName, cmd, argCompletions, argToken, prefixText = '' }) {
     const normalizedArgToken = String(argToken || '').trim().toLowerCase();
-    const matchingArgs = argCompletions.filter((completion) =>
-        completion.value.toLowerCase().startsWith(normalizedArgToken)
-        || completion.label.toLowerCase().startsWith(normalizedArgToken)
-    );
+    const allowFragmentSearch = cmd.argMatchMode === 'fragment';
+    const configuredLimit = Number(cmd.argSuggestionLimit);
+    const suggestionLimit = Number.isInteger(configuredLimit) && configuredLimit > 0
+        ? configuredLimit
+        : null;
+    const matchScore = (completion) => {
+        if (!normalizedArgToken) return 0;
+        const values = [completion.value, completion.label, completion.description]
+            .map((value) => String(value || '').toLowerCase());
+        if (values.some((value) => value === normalizedArgToken)) return 0;
+        if (values.slice(0, 2).some((value) => value.startsWith(normalizedArgToken))) return 1;
+        if (!allowFragmentSearch) return null;
+        if (values.some((value) => value.split(/[^a-z0-9]+/).some((part) => part.startsWith(normalizedArgToken)))) return 2;
+        if (values.some((value) => value.includes(normalizedArgToken))) return 3;
+        return null;
+    };
+    const rankedArgs = argCompletions
+        .map((completion, index) => ({ completion, index, score: matchScore(completion) }))
+        .filter((entry) => entry.score !== null)
+        .sort((left, right) => left.score - right.score || left.index - right.index);
+    const matchingArgs = (suggestionLimit ? rankedArgs.slice(0, suggestionLimit) : rankedArgs)
+        .map((entry) => entry.completion);
     for (const completion of matchingArgs) {
         suggestions.push({
             label: `/${cmdName} ${prefixText}${completion.label}`,
@@ -271,7 +302,7 @@ export function buildSuggestions(commands, {
 async function callMcpInitialize(mcpEndpoint) {
     const initRes = await fetch(mcpEndpoint, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: buildMcpHeaders(),
         body: JSON.stringify({
             jsonrpc: '2.0',
             id: 'wc-init-1',
@@ -289,10 +320,7 @@ async function callMcpInitialize(mcpEndpoint) {
     const sessionId = initRes.headers.get('mcp-session-id') || initBody.result?.meta?.sessionId;
     await fetch(mcpEndpoint, {
         method: 'POST',
-        headers: {
-            'Content-Type': 'application/json',
-            ...(sessionId ? { 'mcp-session-id': sessionId } : {})
-        },
+        headers: buildMcpHeaders(sessionId),
         body: JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' })
     });
     return sessionId;
@@ -304,10 +332,7 @@ async function fetchStructuredCatalog(mcpEndpoint, sessionId, tools, catalogArgu
 
     const callRes = await fetch(mcpEndpoint, {
         method: 'POST',
-        headers: {
-            'Content-Type': 'application/json',
-            ...(sessionId ? { 'mcp-session-id': sessionId } : {})
-        },
+        headers: buildMcpHeaders(sessionId),
         body: JSON.stringify({
             jsonrpc: '2.0',
             id: 'wc-tool-call-commands-1',
@@ -356,6 +381,11 @@ async function fetchStructuredCatalog(mcpEndpoint, sessionId, tools, catalogArgu
             return {
                 name: normalizedName,
                 description: typeof command.description === 'string' ? command.description : '',
+                argMatchMode: command.argMatchMode === 'fragment' ? 'fragment' : 'prefix',
+                argSuggestionLimit: Number.isInteger(Number(command.argSuggestionLimit))
+                    && Number(command.argSuggestionLimit) > 0
+                    ? Number(command.argSuggestionLimit)
+                    : null,
                 subCommands,
                 argCompletions
             };
@@ -372,10 +402,7 @@ async function fetchCommandsFromAgent(agentName, dlog) {
 
         const toolsRes = await fetch(mcpEndpoint, {
             method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                ...(sessionId ? { 'mcp-session-id': sessionId } : {})
-            },
+            headers: buildMcpHeaders(sessionId),
             body: JSON.stringify({ jsonrpc: '2.0', id: 'wc-tools-1', method: 'tools/list' })
         });
         if (!toolsRes.ok) return [];
@@ -417,7 +444,7 @@ export function createSlashCommandsProvider({ agentName, dlog } = {}) {
 
     function detectTrigger(value, caretIndex) {
         const inputValue = typeof value === 'string' ? value : '';
-        const slashIdx = inputValue.lastIndexOf('/', Math.max(0, caretIndex - 1));
+        const slashIdx = findCommandSlash(inputValue);
         if (slashIdx === -1) return null;
         const afterSlash = inputValue.slice(slashIdx + 1, caretIndex);
         if (afterSlash.includes(' ') === false && /\s/.test(afterSlash)) {
@@ -428,7 +455,7 @@ export function createSlashCommandsProvider({ agentName, dlog } = {}) {
 
     function getSuggestions(value, caretIndex) {
         const inputValue = typeof value === 'string' ? value : '';
-        const slashIdx = inputValue.lastIndexOf('/');
+        const slashIdx = findCommandSlash(inputValue);
         if (slashIdx === -1) return [];
         const afterSlash = inputValue.slice(slashIdx + 1);
         const firstChar = afterSlash.charAt(0);

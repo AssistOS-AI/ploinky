@@ -1,7 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { applySlashSelectionToValue, buildSuggestions } from '../../cli/server/webchat/slashAutocomplete.js';
+import {
+    applySlashSelectionToValue,
+    buildSuggestions,
+    createSlashCommandsProvider,
+} from '../../cli/server/webchat/slashAutocomplete.js';
 
 test('applySlashSelectionToValue replaces a bare slash without leaving a trailing slash', () => {
     const result = applySlashSelectionToValue('/', {
@@ -27,16 +31,86 @@ test('applySlashSelectionToValue replaces a partial command token', () => {
     });
 });
 
-test('applySlashSelectionToValue keeps the prefix before the slash command', () => {
+test('applySlashSelectionToValue ignores slashes that are not at the start', () => {
     const result = applySlashSelectionToValue('please run /bu', {
         name: '/build',
         subCommands: []
     });
 
-    assert.deepEqual(result, {
-        value: 'please run /build ',
-        cursor: 'please run /build '.length
-    });
+    assert.equal(result, null);
+});
+
+test('slash provider loads MCP catalog with streamable HTTP headers and preserves slashes in arguments', async () => {
+    const originalFetch = globalThis.fetch;
+    const requests = [];
+    globalThis.fetch = async (url, options = {}) => {
+        const headers = new Headers(options.headers);
+        const payload = JSON.parse(options.body || '{}');
+        requests.push({ url, headers, payload });
+
+        if (payload.method === 'initialize') {
+            return new Response(JSON.stringify({
+                jsonrpc: '2.0',
+                id: payload.id,
+                result: { protocolVersion: '2024-11-05', capabilities: {} },
+            }), {
+                status: 200,
+                headers: {
+                    'content-type': 'application/json',
+                    'mcp-session-id': 'test-session',
+                },
+            });
+        }
+        if (payload.method === 'notifications/initialized') {
+            return new Response(null, { status: 202 });
+        }
+        if (payload.method === 'tools/list') {
+            return Response.json({
+                jsonrpc: '2.0',
+                id: payload.id,
+                result: { tools: [{ name: 'list_achilles_cli_commands' }] },
+            });
+        }
+        if (payload.method === 'tools/call') {
+            const catalog = {
+                type: 'achilles-slash-command-catalog',
+                commands: [{
+                    name: '/model',
+                    description: 'Select a model',
+                    argMatchMode: 'fragment',
+                    argCompletions: [{
+                        value: 'anthropic/claude-sonnet-4-6',
+                        label: 'anthropic/claude-sonnet-4-6',
+                        description: 'Anthropic Sonnet',
+                    }],
+                }],
+            };
+            return Response.json({
+                jsonrpc: '2.0',
+                id: payload.id,
+                result: { content: [{ type: 'text', text: JSON.stringify(catalog) }] },
+            });
+        }
+        throw new Error(`Unexpected MCP method: ${payload.method}`);
+    };
+
+    try {
+        const provider = createSlashCommandsProvider({ agentName: 'achilles-cli' });
+        await provider.refresh();
+
+        assert.ok(requests.length >= 4);
+        assert.ok(requests.every(({ headers }) =>
+            headers.get('accept') === 'application/json, text/event-stream'
+        ));
+        assert.deepEqual(
+            provider.getSuggestions('/model anthropic/claude', '/model anthropic/claude'.length)
+                .map((suggestion) => suggestion.insertText),
+            ['/model anthropic/claude-sonnet-4-6 ']
+        );
+        assert.deepEqual(provider.getSuggestions('text /model anthropic', 21), []);
+    } finally {
+        globalThis.fetch = originalFetch;
+    }
 });
 
 test('buildSuggestions uses generic argument completions for first command argument', () => {
@@ -63,6 +137,46 @@ test('buildSuggestions uses generic argument completions for first command argum
         insertText: '/exec admin-flow ',
         description: 'Admin flow'
     }]);
+});
+
+test('buildSuggestions keeps every model accessible while ranking inner-fragment matches', () => {
+    const modelCompletions = Array.from({ length: 12 }, (_, index) => ({
+        value: `provider/model-${index}`,
+        label: `provider/model-${index}`,
+        description: index === 10 ? 'Anthropic Sonnet' : 'Provider model',
+    }));
+    modelCompletions.unshift({
+        value: 'anthropic/claude-sonnet-4-6',
+        label: 'anthropic/claude-sonnet-4-6',
+        description: 'Anthropic · reasoning',
+    });
+
+    const recommendations = buildSuggestions([{
+        name: '/model',
+        description: 'Select a model',
+        argMatchMode: 'fragment',
+        subCommands: [],
+        argCompletions: modelCompletions,
+    }], {
+        currentToken: 'model',
+        hasSubToken: true,
+        subToken: '',
+    });
+    assert.equal(recommendations.length, 13);
+
+    const search = buildSuggestions([{
+        name: '/model',
+        description: 'Select a model',
+        argMatchMode: 'fragment',
+        subCommands: [],
+        argCompletions: modelCompletions,
+    }], {
+        currentToken: 'model',
+        hasSubToken: true,
+        subToken: 'sonnet',
+    });
+    assert.equal(search[0].insertText, '/model anthropic/claude-sonnet-4-6 ');
+    assert.equal(search.length, 2);
 });
 
 test('buildSuggestions stops suggesting an exact first argument after trailing space', () => {

@@ -77,7 +77,6 @@ export const SHARED_DIR = path.join(PLOINKY_DIR, 'shared');
 export const RUNNING_DIR = path.join(PLOINKY_DIR, 'running');
 export const ROUTING_FILE = path.join(PLOINKY_DIR, 'routing.json');
 export const SERVERS_CONFIG_FILE = path.join(PLOINKY_DIR, 'servers.json');
-export const TRANSCRIPTS_DIR = path.join(PLOINKY_DIR, 'transcripts');
 export const DEPS_DIR = path.join(PLOINKY_DIR, 'deps');
 export const GLOBAL_DEPS_CACHE_DIR = path.join(DEPS_DIR, 'global');
 export const AGENTS_DEPS_CACHE_DIR = path.join(DEPS_DIR, 'agents');
@@ -87,7 +86,13 @@ export const GLOBAL_DEPS_PATH = path.join(path.dirname(new URL(import.meta.url).
 
 let DEBUG_MODE = process.env.PLOINKY_DEBUG === '1';
 
+export function shouldLogPloinkyDirectory(env = process.env) {
+    const hasHistory = String(env.PLOINKY_WEBCHAT_HAS_HISTORY || '').trim();
+    return hasHistory !== '0' && hasHistory !== '1';
+}
+
 export function logPloinkyDirectory() {
+    if (!shouldLogPloinkyDirectory()) return;
     console.error(`[ploinky] using .ploinky: ${path.resolve(PLOINKY_DIR)}`);
 }
 
@@ -112,7 +117,6 @@ export function initEnvironment() {
         LOGS_DIR,
         SHARED_DIR,
         RUNNING_DIR,
-        TRANSCRIPTS_DIR,
         AGENTS_DATA_DIR,
     ];
     for (const dir of requiredDirs) {

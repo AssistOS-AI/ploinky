@@ -53,6 +53,53 @@ const TASK_POLL_INTERVAL_MS = (() => {
 })();
 
 const taskPollers = new Map();
+let taskObserver = null;
+
+export function setAgentTaskObserver(observer) {
+    if (observer !== null && typeof observer !== 'function') {
+        throw new Error('AgentMcpClient: task observer must be a function or null');
+    }
+    taskObserver = observer;
+    return () => {
+        if (taskObserver === observer) {
+            taskObserver = null;
+        }
+    };
+}
+
+async function applyTaskObserver({
+    result,
+    agentName,
+    taskId,
+    toolName,
+    toolArgs,
+    metadata,
+    routerUrl,
+}) {
+    if (typeof taskObserver !== 'function') return null;
+    const observation = await taskObserver({
+        agentName,
+        taskId,
+        toolName,
+        arguments: toolArgs,
+        metadata: metadata || {},
+        getTaskStatus: () => getTaskStatus(agentName, taskId, routerUrl),
+    });
+    if (observation?.detached !== true) return null;
+    return {
+        ...result,
+        metadata: {
+            ...(metadata || {}),
+            backgroundTask: {
+                detached: true,
+                id: observation.id || '',
+                description: observation.description || '',
+            },
+        },
+    };
+}
+
+export const __testables = { applyTaskObserver };
 
 function normalizeDelegationToken(token) {
     if (token === undefined || token === null || token === '') return '';
@@ -310,16 +357,16 @@ function startTaskPolling(agentName, taskId, callback, _options = {}) {
 }
 
 /**
- * Create a router-mediated client for calling `agentName`'s tools. Only
- * `callTool` is supported: the router's delegated path accepts a direct
- * tools/call, so listing/initialization over agent-to-agent is intentionally
- * unavailable (use a user/session surface for discovery).
+ * Create a router-mediated client for calling `agentName`'s tools. Only tool
+ * calls are supported: the router's delegated path accepts a direct tools/call,
+ * so listing/initialization over agent-to-agent is intentionally unavailable
+ * (use a user/session surface for discovery).
  */
 export async function createAgentClient(agentName, options = {}) {
     const routerUrl = getRouterUrl();
     const defaultDelegationToken = normalizeDelegationToken(options?.userDelegationToken);
 
-    async function callTool(name, args = {}, callOptions = {}) {
+    async function requestToolCall(name, args = {}, callOptions = {}) {
         const toolArgs = args && typeof args === 'object' && !Array.isArray(args) ? args : {};
         const assertion = signAgentAssertion({
             method: 'POST',
@@ -347,9 +394,16 @@ export async function createAgentClient(agentName, options = {}) {
         if (status >= 400 || !json) {
             throw new Error(`agent-to-agent call failed (status ${status}): ${(text || '').slice(0, 200)}`.trim());
         }
-        const result = unwrapToolResult(json.result);
+        return {
+            result: unwrapToolResult(json.result),
+            toolArgs,
+        };
+    }
+
+    async function callTool(name, args = {}, callOptions = {}) {
+        const { result } = await requestToolCall(name, args, callOptions);
         const taskId = normalizeTaskId(result);
-        if (typeof callOptions.onTaskUpdate !== 'function' || !taskId) {
+        if (!taskId) {
             return result;
         }
 
@@ -395,12 +449,33 @@ export async function createAgentClient(agentName, options = {}) {
         return parseTaskPayload(finalTask);
     }
 
+    async function callToolWithoutWait(name, args = {}, callOptions = {}) {
+        const { result, toolArgs } = await requestToolCall(name, args, callOptions);
+        const taskId = normalizeTaskId(result);
+        if (!taskId) {
+            return result;
+        }
+
+        const metadata = result?.metadata;
+        const observedResult = await applyTaskObserver({
+            result,
+            agentName,
+            taskId,
+            toolName: metadata?.toolName || name,
+            toolArgs,
+            metadata,
+            routerUrl,
+        });
+        return observedResult || result;
+    }
+
     const unsupported = (op) => async () => {
         throw new Error(`${op} is not available via agent-to-agent calls; use callTool`);
     };
 
     return {
         callTool,
+        callToolWithoutWait,
         getTaskStatus: (taskId) => getTaskStatus(agentName, taskId, routerUrl),
         connect: async () => {},
         listTools: unsupported('listTools'),

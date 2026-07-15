@@ -3,7 +3,7 @@ id: DS008
 title: Secrets, Skills, and LLM Assistance
 status: implemented
 owner: ploinky-team
-summary: Defines secret resolution, wildcard exposure rules, default-skills installation, repository-local skill boundaries, and the LLM helper inputs.
+summary: Defines secret resolution, wildcard exposure rules, default-skills installation, workspace-copied skill boundaries, and the LLM helper inputs.
 ---
 
 # DS008 Secrets, Skills, and LLM Assistance
@@ -28,16 +28,16 @@ Managed repository update flows must refresh `AchillesCopilotBasicSkills` into e
 
 When the all-repository `update` flow refreshes workspace folders, each folder that contains `ploinky-skills-manifest.json` must refresh its skills from the manifest sources. The manifest is an array of repository objects shaped as `{ "url": "...", "name": "...", "branch": null, "skills": ["..."] }`; legacy string-array manifests are invalid. At each `update` run, Ploinky must clone missing manifest repositories into `.ploinky/repos/`, pull existing cached repositories there, and reconstruct `.agents/skills/` strictly from the selected `skills` lists. Duplicate skill names are resolved by manifest order so the last listed source wins. A failure to clone or update a manifest skill source, copy selected skills, or update `.gitignore` is a command failure, not just an informational warning.
 
-The repository-local skills under `.agents/skills/` must be listed consistently in `AGENTS.md` and in the HTML documentation, but they remain maintenance tooling. Host-project docs may summarize them, yet must keep the DS set focused on Ploinky itself rather than creating one DS file per copied skill.
+The Ploinky repository does not own a local skill catalog. Skills supplied by an external agent environment and skills copied into an operator workspace under `.agents/skills/` remain tooling outside the Ploinky runtime-module boundary. Host-project documentation and the DS set must stay focused on Ploinky itself rather than creating pages or DS files for those external or workspace-copied skills.
 
 `ploinky-shell` and invalid-command fallback logic depend on Achilles LLM tooling. The helper must load model-key definitions from Achilles config, inspect available API keys, and include `docs/ploinky-overview.md` as its system context. That file is therefore part of the implemented command-suggestion surface and must be updated whenever command semantics or operator guidance changes.
 
 ## Decisions & Questions
 
-### Question #1: Why are copied or local skills summarized instead of being expanded into host-project DS files?
+### Question #1: Why are external or workspace-copied skills excluded from host-project DS files?
 
 Response:
-The user-facing runtime is Ploinky, not the copied skill catalog. Summarizing the current skill catalog keeps repository maintenance discoverable without collapsing the host/runtime boundary that the GAMP rules require downstream projects to preserve.
+The user-facing runtime is Ploinky, not an external or operator-managed skill catalog. Keeping those skills outside the host documentation preserves the host/runtime boundary while `default-skills` and workspace manifests continue to manage copied skills as operator tooling.
 
 ### Question #2: Why is `docs/ploinky-overview.md` treated as part of the runtime contract?
 

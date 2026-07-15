@@ -13,7 +13,8 @@ import {
 import {
     hasInvocationTokenHeader,
     verifyRouterRequestFromHeaders,
-    verifyOpenAiServiceAuthInfoFromHeaders
+    verifyOpenAiServiceAuthInfoFromHeaders,
+    verifyOpenAiModelsAuthInfoFromHeaders
 } from '../lib/invocationAuth.mjs';
 import { computeRchTool, sha256RawBodyHash } from '../lib/requestHash.mjs';
 import { describeShellFailure } from '../lib/toolError.mjs';
@@ -32,6 +33,7 @@ const DEFAULT_TASK_LOG_TAIL_BYTES = 128 * 1024;
 const TASK_QUEUE_FILE = path.resolve(process.cwd(), '.tasksQueue');
 const invocationReplayCache = createMemoryReplayCache({ maxSize: 4096 });
 const OPENAI_CHAT_COMPLETIONS_PATH = '/v1/chat/completions';
+const OPENAI_MODELS_PATH = '/v1/models';
 const AGENT_CARD_PATH = '/agent-card';
 const TASK_STATUS_PATHS = new Set(['/getTaskStatus', '/task']);
 const TAG_NAME_RE = /^[a-z][a-z0-9_-]{0,63}$/;
@@ -379,6 +381,21 @@ function resolveOpenAiChatKind(manifest) {
 
 export { resolveOpenAiChatKind };
 
+function resolveOpenAiModelsKind(manifest) {
+    const models = manifest && typeof manifest === 'object' && manifest.endpoints && typeof manifest.endpoints === 'object'
+        ? manifest.endpoints.models
+        : null;
+    if (models && typeof models === 'object' && typeof models.command === 'string' && models.command.trim()) {
+        const commandSpec = buildCommandSpec(models, process.env.PLOINKY_CODE_DIR || '/code');
+        if (commandSpec) {
+            return { kind: 'command', commandSpec };
+        }
+    }
+    return { kind: 'fallback' };
+}
+
+export { resolveOpenAiModelsKind };
+
 // Testable core: build the OpenAI completion via the agentic loop. `runResponder`
 // is injectable for tests; production passes runOpenAiAgenticResponse.
 export async function __buildAgenticCompletion({ body, manifest, config, agentId, runResponder = runOpenAiAgenticResponse }) {
@@ -693,6 +710,23 @@ function rejectInvalidOpenAiRouterToken(req, res, rawBody) {
     return false;
 }
 
+function rejectInvalidOpenAiModelsRouterToken(req, res) {
+    const raw = req.headers ? req.headers['x-ploinky-auth-info'] : undefined;
+    const present = (Array.isArray(raw) ? raw[0] : raw);
+    if (!present || typeof present !== 'string' || !present.trim()) {
+        return false;
+    }
+    const verified = verifyOpenAiModelsAuthInfoFromHeaders(req.headers, {
+        env: process.env,
+        replayCache: invocationReplayCache,
+    });
+    if (!verified.ok) {
+        sendOpenAiError(res, 401, 'invocation_rejected', 'invalid_request_error');
+        return true;
+    }
+    return false;
+}
+
 function sendOpenAiError(res, statusCode, message, type = 'server_error') {
     const payload = { error: { message, type } };
     const data = Buffer.from(JSON.stringify(payload));
@@ -860,6 +894,74 @@ async function handleOpenAiChatCompletions(req, res, body) {
     } catch (_) {
         // ignore broken pipes
     }
+}
+
+function buildFallbackModelsResponse(manifest) {
+    const agentName = process.env.AGENT_NAME || manifest?.name || process.env.PLOINKY_AGENT_ID || 'agent';
+    const supportsStreaming = manifest?.endpoints?.chatCompletions?.stream === true
+        || manifest?.endpoints?.chatCompletions?.supportsStream === true
+        || !manifest?.endpoints?.chatCompletions?.command;
+    return {
+        object: 'list',
+        data: [
+            {
+                id: 'default',
+                object: 'model',
+                modelId: 'default',
+                displayName: agentName,
+                supportsTools: true,
+                supportsStreaming,
+                supportsVision: false,
+                tags: ['chat', 'agentic'],
+                capabilities: {
+                    supportsTools: true,
+                    supportsStreaming,
+                    supportsVision: false,
+                },
+                metadata: {
+                    fallback: true,
+                    agent: process.env.PLOINKY_AGENT_ID || null,
+                },
+            },
+        ],
+    };
+}
+
+async function handleOpenAiModels(req, res) {
+    const manifestResult = getManifestResult();
+    const manifest = manifestResult ? manifestResult.manifest : null;
+    const modelsKind = resolveOpenAiModelsKind(manifest);
+
+    if (modelsKind.kind === 'fallback') {
+        const response = buildFallbackModelsResponse(manifest);
+        const data = Buffer.from(JSON.stringify(response));
+        res.writeHead(200, { 'Content-Type': 'application/json', 'Content-Length': data.length });
+        res.end(data);
+        return;
+    }
+
+    const payload = {
+        endpoint: 'openai.models',
+        metadata: {
+            agent: process.env.AGENT_NAME || '',
+            authInfo: parseAuthInfoHeader(req.headers),
+        },
+    };
+    const result = await executeShell(modelsKind.commandSpec, payload);
+    if (result.code !== 0) {
+        sendOpenAiError(res, 500, describeShellFailure(result));
+        return;
+    }
+    let parsed;
+    try {
+        parsed = JSON.parse(result.stdout || '{}');
+    } catch (_) {
+        sendOpenAiError(res, 502, 'Models handler did not return valid JSON');
+        return;
+    }
+    const data = Buffer.from(JSON.stringify(parsed));
+    res.writeHead(200, { 'Content-Type': 'application/json', 'Content-Length': data.length });
+    res.end(data);
 }
 
 function sanitizeAuthInfoForLog(authInfo = null) {
@@ -1366,8 +1468,14 @@ async function main() {
                         } else if (!res.writableEnded) {
                             res.end();
                         }
-                    });
+                });
                 return;
+            }
+            if (method === 'GET' && u.pathname === OPENAI_MODELS_PATH) {
+                if (rejectInvalidOpenAiModelsRouterToken(req, res)) {
+                    return;
+                }
+                return handleOpenAiModels(req, res);
             }
             if (await serveStaticFile(req, res, u.pathname)) {
                 return;

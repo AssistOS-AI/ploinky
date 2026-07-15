@@ -3,7 +3,7 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
-import { handleWebChat } from './handlers/webchat.js';
+import { handleWebChat } from './handlers/webchat/index.js';
 import { handleDashboard } from './handlers/dashboard.js';
 import { handleStatus } from './handlers/status.js';
 import { handleBlobs, handleWorkspaceUpload } from './handlers/blobs.js';
@@ -90,7 +90,7 @@ if (!global.processKill) {
 }
 // Global state for all services
 const globalState = {
-    webchat: { sessions: new Map() },
+    webchat: { sessions: new Map(), runtimes: new Map() },
     dashboard: { sessions: new Map() },
     status: { sessions: new Map() }
 };
@@ -691,7 +691,7 @@ server.listen(port, '0.0.0.0', () => {
     console.log('  WebChat:         /webchat');
     console.log('  Status:          /status');
     console.log('  Health:          /health');
-    console.log('  Agent routes:    /<agent>/{mcp,task,agent-card,v1/chat/completions}');
+    console.log('  Agent routes:    /<agent>/{mcp,task,agent-card,v1/models,v1/chat/completions}');
     console.log('  Agent servers:   http://<agent>.localhost:<port>/');
     console.log('  Aggregate cards: /agent-card');
     appendLog('server_start', { port });
@@ -755,8 +755,11 @@ server.listen(port, '0.0.0.0', () => {
                 console.warn(`[ALERT] ${nodeProcessCount} node processes running (max safe: ${MAX_SAFE_NODE_PROCESSES})`);
 
                 // Log active sessions for debugging
-                let totalTabs = 0;
+                let totalTabs = globalState.webchat?.runtimes instanceof Map
+                    ? globalState.webchat.runtimes.size
+                    : 0;
                 for (const state of Object.values(globalState)) {
+                    if (state === globalState.webchat) continue;
                     if (state.sessions instanceof Map) {
                         for (const session of state.sessions.values()) {
                             if (session.tabs instanceof Map) {

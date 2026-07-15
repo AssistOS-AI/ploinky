@@ -25,7 +25,7 @@
         <header class="chapter-header">
           <p class="eyebrow">Operator Workflow</p>
           <h1>Ploinky Documentation</h1>
-          <p>Operations in Ploinky center on secret resolution, dependency-cache hygiene, observability, transcript handling, test execution, and the maintenance tooling that keeps browser docs, specs, and command-suggestion context aligned with the code.</p>
+          <p>Operations in Ploinky center on secret resolution, dependency-cache hygiene, observability, test execution, and the maintenance tooling that keeps browser docs, specs, and command-suggestion context aligned with the code.</p>
         </header>
 
         <section class="chapter-section">
@@ -46,9 +46,9 @@
         </section>
 
         <section class="chapter-section">
-          <h2>Observability and Transcript Retention</h2>
+          <h2>Observability</h2>
           <p>The watchdog and router write structured logs under <code>.ploinky/logs/</code>. The CLI currently exposes only router log tailing and last-line inspection through <code>logs tail</code> and <code>logs last</code>. The status surface also shells out to <code>ploinky status</code>, then adds router-side server and enabled-agent summaries so operators can compare the CLI view with the browser view.</p>
-          <p>WebChat transcripts are stored under <code>.ploinky/transcripts/</code> with per-conversation data-encryption keys wrapped by a master key derived from <code>PLOINKY_TRANSCRIPTS_MASTER_KEY</code>. If no master key exists, the runtime generates one and persists it. Transcript viewer access is gated separately from general dashboard access and can be restricted to SSO roles or allowed for local sessions through explicit environment flags.</p>
+          <p>WebChat conversation continuation is project state under <code>&lt;cwd&gt;/.copilot_history/</code>, not an operational log. The browser lists folder sessions without message bodies and loads the selected history only when the user requests it.</p>
         </section>
 
         <section class="chapter-section">

@@ -1,11 +1,13 @@
 import { formatBytes, getFileIcon } from './fileHelpers.js';
 import { findMentionRanges } from './composerMentionHighlights.js';
+import { attachInlineTaskPanel } from './taskPresentation.js';
 
 const ENABLE_SELECT_PAGINATION_ACTIONS = false;
 const AUTO_SCROLL_BOTTOM_THRESHOLD_PX = 4;
 
-function formatTime() {
-    const date = new Date();
+function formatTime(timestamp = null) {
+    const parsed = timestamp ? new Date(timestamp) : new Date();
+    const date = Number.isNaN(parsed.getTime()) ? new Date() : parsed;
     const hours = String(date.getHours()).padStart(2, '0');
     const minutes = String(date.getMinutes()).padStart(2, '0');
     return `${hours}:${minutes}`;
@@ -13,11 +15,13 @@ function formatTime() {
 
 export function createMessages({
     chatList,
-    typingIndicator
+    typingIndicator,
+    historyGate
 }, {
     markdown,
     initialViewMoreLineLimit,
     sidePanel,
+    taskController,
     onQuickCommand,
     onTypingStateChange
 }) {
@@ -30,6 +34,9 @@ export function createMessages({
     let autoScrollLocked = true;
     let programmaticScroll = false;
     let pendingProgressItems = [];
+    const assistantBubbles = new Map();
+    const taskAssociations = new Map();
+    const taskPanelCleanups = new Map();
     const tableScrollHintBindings = new WeakMap();
 
     function isScrolledToBottom() {
@@ -92,6 +99,10 @@ export function createMessages({
     let typingActive = false;
 
     function normalizeProgressItem(raw) {
+        if (typeof raw === 'string') {
+            const reason = raw.trim();
+            return reason ? { reason, tool: '', stepIndex: null } : null;
+        }
         if (!raw || typeof raw !== 'object') {
             return null;
         }
@@ -1014,6 +1025,28 @@ export function createMessages({
         panel.appendChild(list);
     }
 
+    function attachTaskPanel(bubble, taskId) {
+        if (!bubble || !taskId || !taskController) return;
+        const existing = bubble.querySelector(':scope > .wa-inline-task');
+        if (existing?.dataset.taskId === taskId) return;
+        taskPanelCleanups.get(bubble)?.();
+        existing?.remove();
+        const dispose = attachInlineTaskPanel({ bubble, taskId, taskController });
+        taskPanelCleanups.set(bubble, () => {
+            dispose();
+            taskPanelCleanups.delete(bubble);
+        });
+    }
+
+    function associateTask(payload) {
+        const taskId = payload?.task?.id;
+        const messageIndex = Number.isInteger(payload?.messageIndex) ? payload.messageIndex : null;
+        if (!taskId || !Number.isInteger(messageIndex)) return;
+        taskAssociations.set(messageIndex, taskId);
+        const bubble = assistantBubbles.get(messageIndex);
+        if (bubble) attachTaskPanel(bubble, taskId);
+    }
+
     function applyViewMoreSettingToAllBubbles() {
         if (!chatList) {
             return;
@@ -1027,15 +1060,15 @@ export function createMessages({
         });
     }
 
-    function addClientMsg(text) {
-        lastClientCommand = text;
+    function addClientMsg(text, options = {}) {
+        if (!options.historical) lastClientCommand = text;
         const wrapper = document.createElement('div');
         wrapper.className = 'wa-message out';
         wrapper.innerHTML = `
             <div class="wa-message-bubble">
                 <div class="wa-message-text"></div>
                 <span class="wa-message-time">
-                    ${formatTime()}
+                    ${formatTime(options.timestamp)}
                     <svg class="wa-seen-icon" width="10" height="9" viewBox="5.75 -1.55 9.75 9" fill="currentColor"><path d="M11.071.653a.5.5 0 0 0-.707.707l3.289 3.289a.5.5 0 0 0 .707 0L15.354 3.656a.5.5 0 0 0-.707-.707L14 3.596 11.071.653zm-4.207 0a.5.5 0 0 0-.707.707l3.289 3.289a.5.5 0 0 0 .707 0l.994-.993a.5.5 0 0 0-.707-.707L9.793 3.596 6.864.653z"/></svg>
                 </span>
             </div>`;
@@ -1238,25 +1271,12 @@ export function createMessages({
         };
     }
 
-    function setLastServerMessageMeta({ messageId = '', rating = null } = {}) {
-        const bubble = lastServerMsg?.bubble;
-        if (!bubble) {
-            return false;
-        }
-        const normalizedId = typeof messageId === 'string' ? messageId.trim() : '';
-        if (normalizedId) {
-            bubble.dataset.messageId = normalizedId;
-        }
-        if (rating === 'up' || rating === 'down') {
-            bubble.dataset.rating = rating;
-        } else if (rating === null) {
-            delete bubble.dataset.rating;
-        }
-        return true;
-    }
-
-    function addServerMsg(text) {
+    function addServerMsg(text, options = {}) {
         let normalized = typeof text === 'string' ? text : '';
+        const explicitProgressItems = Array.isArray(options.progressItems)
+            ? options.progressItems.map(normalizeProgressItem).filter(Boolean)
+            : null;
+        const progressItems = explicitProgressItems || pendingProgressItems;
 
         // Filter out raw envelope JSON to prevent it from appearing in chat
         const trimmedNormalized = normalized.trim();
@@ -1282,7 +1302,9 @@ export function createMessages({
             normalized = normalized.replace(/^\n+/, '');
         }
 
-        if (!normalized.trim()) {
+        const messageIndex = Number.isInteger(options.messageIndex) ? options.messageIndex : null;
+        const taskId = options.taskId || (Number.isInteger(messageIndex) ? taskAssociations.get(messageIndex) : '');
+        if (!normalized.trim() && progressItems.length === 0 && !taskId) {
             lastServerMsg.bubble = null;
             lastServerMsg.fullText = '';
             userInputSent = false;
@@ -1290,14 +1312,17 @@ export function createMessages({
         }
 
         const previousFullText = typeof lastServerMsg.fullText === 'string' ? lastServerMsg.fullText : '';
-        const appendToExisting = !userInputSent && lastServerMsg.bubble;
+        const appendToExisting = !options.forceNew && !userInputSent && lastServerMsg.bubble;
 
         if (appendToExisting) {
             const combined = previousFullText ? `${previousFullText}\n${normalized}` : normalized;
             lastServerMsg.fullText = combined;
             updateBubbleContent(lastServerMsg.bubble, combined);
-            if (pendingProgressItems.length) {
-                attachProgressPanel(lastServerMsg.bubble, pendingProgressItems);
+            if (progressItems.length) {
+                attachProgressPanel(lastServerMsg.bubble, progressItems);
+            }
+            if (taskId) attachTaskPanel(lastServerMsg.bubble, taskId);
+            if (explicitProgressItems === null && pendingProgressItems.length) {
                 resetProgressEvents();
             }
         } else {
@@ -1313,13 +1338,17 @@ export function createMessages({
             userInputSent = false;
 
             updateBubbleContent(bubble, normalized);
-            if (pendingProgressItems.length) {
-                attachProgressPanel(bubble, pendingProgressItems);
+            if (progressItems.length) {
+                attachProgressPanel(bubble, progressItems);
+            }
+            if (Number.isInteger(messageIndex)) assistantBubbles.set(messageIndex, bubble);
+            if (taskId) attachTaskPanel(bubble, taskId);
+            if (explicitProgressItems === null && pendingProgressItems.length) {
                 resetProgressEvents();
             }
             const timeNode = bubble.querySelector('.wa-message-time');
             if (timeNode) {
-                timeNode.textContent = formatTime();
+                timeNode.textContent = formatTime(options.timestamp);
             }
             appendMessageEl(wrapper);
         }
@@ -1328,12 +1357,68 @@ export function createMessages({
         return true;
     }
 
+    function formatStoredMessageText(message) {
+        const parts = [typeof message?.text === 'string' ? message.text : ''];
+        if (Array.isArray(message?.attachments)) {
+            for (const attachment of message.attachments) {
+                const label = attachment?.filename || attachment?.relativePath || attachment?.localPath || 'Attachment';
+                const url = attachment?.downloadUrl;
+                parts.push(url ? `[${label}](${url})` : `[Attachment: ${label}]`);
+            }
+        }
+        return parts.filter(Boolean).join('\n\n');
+    }
+
+    function clearMessages() {
+        if (!chatList) return;
+        const children = Array.from(chatList.children);
+        for (const child of children) {
+            if (child !== typingIndicator && child !== historyGate) {
+                const bubble = child.querySelector?.('.wa-message-bubble');
+                if (bubble) taskPanelCleanups.get(bubble)?.();
+                child.remove();
+            }
+        }
+        assistantBubbles.clear();
+        taskAssociations.clear();
+        lastServerMsg.bubble = null;
+        lastServerMsg.fullText = '';
+        lastClientCommand = '';
+        userInputSent = false;
+        resetProgressEvents();
+        hideTypingIndicator(true);
+    }
+
+    function renderHistory(historyMessages = []) {
+        clearMessages();
+        const messages = Array.isArray(historyMessages) ? historyMessages : [];
+        for (let messageIndex = 0; messageIndex < messages.length; messageIndex += 1) {
+            const message = messages[messageIndex];
+            const text = formatStoredMessageText(message);
+            if (message?.role === 'user') {
+                addClientMsg(text, { historical: true, timestamp: message.timestamp });
+            } else if (message?.role === 'assistant') {
+                addServerMsg(text, {
+                    forceNew: true,
+                    timestamp: message.timestamp,
+                    progressItems: Array.isArray(message.progress) ? message.progress : [],
+                    messageIndex,
+                    taskId: message.taskId,
+                });
+            }
+        }
+        lastClientCommand = '';
+        userInputSent = false;
+    }
+
     return {
         addClientMsg,
         addClientAttachment,
         addServerMsg,
+        clearMessages,
+        renderHistory,
+        associateTask,
         addProgressEvent,
-        setLastServerMessageMeta,
         showTypingIndicator,
         hideTypingIndicator,
         applyViewMoreSettingToAllBubbles,

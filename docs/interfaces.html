@@ -46,11 +46,11 @@
             <tbody>
               <tr>
                 <td><code>/webchat</code></td>
-                <td>TTY-backed chat surface that persists encrypted transcripts, supports uploads, and forwards arbitrary URL query parameters to the selected agent CLI as long-form flags encoded as single <code>--key=value</code> tokens.</td>
+                <td>TTY-backed chat surface with authenticated folder-scoped JSON sessions, lazy history loading, uploads, and generic selected-agent CLI argument forwarding.</td>
               </tr>
               <tr>
                 <td><code>/dashboard</code></td>
-                <td>Management surface with transcript and feedback access controls. The active fallback assets live under <code>cli/server/dashboard/</code>.</td>
+                <td>Operational management surface for status, logs, agents, and runtime control. The active fallback assets live under <code>cli/server/dashboard/</code>.</td>
               </tr>
               <tr>
                 <td><code>/status</code></td>
@@ -61,7 +61,8 @@
           <div class="callout">
             <p>The root-level <code>dashboard/</code> directory is not the active fallback for routed <code>/dashboard</code>. The current implementation resolves fallback dashboard assets from <code>cli/server/dashboard/</code>, which is why the product documentation follows that path.</p>
           </div>
-          <p>For <code>/webchat</code>, the router treats <code>agent</code> as the agent selector and preserves any other query parameters on the browser session URL. When an explicit agent is selected, those additional query parameters are forwarded to <code>ploinky cli &lt;agent&gt;</code> as long-form CLI arguments encoded as single <code>--key=value</code> tokens using the same values carried in the URL.</p>
+          <p>For <code>/webchat</code>, the router treats <code>agent</code> as the agent selector and preserves ordinary query parameters on the browser session URL. When an explicit agent is selected, those parameters are forwarded to <code>ploinky cli &lt;agent&gt;</code> as single-token <code>--key=value</code> arguments. Router-owned <code>tabId</code> and <code>sessionId</code> values are not forwarded.</p>
+          <p>The authenticated folder-session interface uses <code>GET</code>/<code>POST /webchat/sessions</code>, <code>PUT /webchat/sessions/current</code>, and <code>GET /webchat/sessions/&lt;session-id&gt;</code>. Listing exposes selector metadata only; message bodies are returned by the explicit per-session history request.</p>
         </section>
 
         <section class="chapter-section">

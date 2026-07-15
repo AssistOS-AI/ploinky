@@ -31,13 +31,13 @@ function readInitialViewMoreLimit() {
 }
 
 export function initDom() {
-    const TAB_ID = crypto.randomUUID();
     const dlog = () => {};
 
     const body = document.body;
     const markdown = window.webchatMarkdown;
 
     const titleBar = document.getElementById('titleBar');
+    const runtimeModel = document.getElementById('runtimeModel');
     const avatarInitial = document.getElementById('avatarInitial');
     const statusEl = document.getElementById('statusText');
     const statusDot = document.querySelector('.wa-status-dot');
@@ -69,13 +69,34 @@ export function initDom() {
     const fileUploadInput = document.getElementById('fileUploadInput');
     const folderUploadInput = document.getElementById('folderUploadInput');
     const filePreviewContainer = document.getElementById('filePreviewContainer');
+    const sessionsBtn = document.getElementById('sessionsBtn');
+    const historyGate = document.getElementById('historyGate');
+    const loadHistoryBtn = document.getElementById('loadHistoryBtn');
+    const sessionDialog = document.getElementById('sessionDialog');
+    const sessionDialogClose = document.getElementById('sessionDialogClose');
+    const sessionList = document.getElementById('sessionList');
+    const tasksBtn = document.getElementById('tasksBtn');
+    const tasksBadge = document.getElementById('tasksBadge');
+    const tasksDialog = document.getElementById('tasksDialog');
+    const tasksDialogClose = document.getElementById('tasksDialogClose');
+    const tasksList = document.getElementById('tasksList');
+    const taskDetail = document.getElementById('taskDetail');
+    const taskToast = document.getElementById('taskToast');
 
-    const requiresAuth = body.dataset.auth === 'true';
     const agentName = (body.dataset.agent || '').trim();
     const displayName = (body.dataset.title || '').trim();
     const basePath = (body.dataset.base || '').replace(/\/$/, '') || '';
     const agentQuery = (body.dataset.agentQuery || '').trim();
     const workdir = (body.dataset.workdir || '').trim();
+    const tabStorageKey = `webchat_tab_id:${workdir}:${agentQuery}`;
+    let TAB_ID = '';
+    try {
+        TAB_ID = sessionStorage.getItem(tabStorageKey) || '';
+    } catch (_) { }
+    if (!TAB_ID) {
+        TAB_ID = crypto.randomUUID();
+        try { sessionStorage.setItem(tabStorageKey, TAB_ID); } catch (_) { }
+    }
 
     const launchConfig = {};
     try {
@@ -99,6 +120,14 @@ export function initDom() {
     if (avatarInitial) {
         const initial = appTitle.trim().charAt(0) || 'P';
         avatarInitial.textContent = initial.toUpperCase();
+    }
+
+    function setRuntimeModel(value) {
+        if (!runtimeModel) return;
+        const model = typeof value === 'string' ? value.trim() : '';
+        runtimeModel.textContent = model;
+        runtimeModel.title = model ? `Selected model: ${model}` : '';
+        runtimeModel.hidden = !model;
     }
 
     function showBanner(text, cls) {
@@ -205,19 +234,21 @@ export function initDom() {
         TAB_ID,
         dlog,
         markdown,
-        requiresAuth,
         basePath,
         agentName,
         displayName: appTitle,
+        workdir,
         launchConfig,
         toEndpoint,
         showBanner,
         hideBanner,
+        setRuntimeModel,
         getViewMoreLineLimit: () => viewMoreLineLimit,
         setViewMoreChangeHandler,
         elements: {
             body,
             titleBar,
+            runtimeModel,
             avatarInitial,
             statusEl,
             statusDot,
@@ -249,6 +280,19 @@ export function initDom() {
             folderUploadInput,
             filePreviewContainer,
             attachmentContainer,
+            sessionsBtn,
+            historyGate,
+            loadHistoryBtn,
+            sessionDialog,
+            sessionDialogClose,
+            sessionList,
+            tasksBtn,
+            tasksBadge,
+            tasksDialog,
+            tasksDialogClose,
+            tasksList,
+            taskDetail,
+            taskToast,
         },
     };
 }

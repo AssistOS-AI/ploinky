@@ -1,16 +1,49 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { findTriggerAt } from '../../cli/server/webchat/composerAutocomplete.js';
+import {
+    findTriggerAt,
+    keepAutocompleteItemVisible,
+    nextAutocompleteRenderCount,
+} from '../../cli/server/webchat/composerAutocomplete.js';
 import {
     extractMentionTokenAt,
     findMentionRanges,
     renderMentionHighlightHtml,
 } from '../../cli/server/webchat/composerMentionHighlights.js';
 
+test('keepAutocompleteItemVisible scrolls keyboard selection into the menu viewport', () => {
+    const menu = { clientHeight: 100, scrollTop: 0 };
+
+    keepAutocompleteItemVisible(menu, { offsetTop: 90, offsetHeight: 30 });
+    assert.equal(menu.scrollTop, 20);
+
+    keepAutocompleteItemVisible(menu, { offsetTop: 5, offsetHeight: 30 });
+    assert.equal(menu.scrollTop, 5);
+
+    keepAutocompleteItemVisible(menu, { offsetTop: 35, offsetHeight: 30 });
+    assert.equal(menu.scrollTop, 5);
+});
+
+test('nextAutocompleteRenderCount progressively exposes the complete suggestion list', () => {
+    assert.equal(nextAutocompleteRenderCount(24, 352, 24), 48);
+    assert.equal(nextAutocompleteRenderCount(336, 352, 24), 352);
+    assert.equal(nextAutocompleteRenderCount(352, 352, 24), 352);
+});
+
 test('findTriggerAt detects slash at start of input', () => {
     const result = findTriggerAt('/bu', 3, ['/', '@']);
     assert.deepEqual(result, { trigger: '/', triggerIndex: 0, token: 'bu' });
+});
+
+test('findTriggerAt keeps provider slashes inside the initial command argument', () => {
+    const value = '/model anthropic/claude';
+    const result = findTriggerAt(value, value.length, ['/', '@']);
+    assert.deepEqual(result, {
+        trigger: '/',
+        triggerIndex: 0,
+        token: 'model anthropic/claude',
+    });
 });
 
 test('findTriggerAt detects @ after whitespace', () => {

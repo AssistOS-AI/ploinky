@@ -12,6 +12,13 @@ function read(relativePath) {
     return fs.readFileSync(path.join(ROOT, relativePath), 'utf8');
 }
 
+function readWebchatHandlers() {
+    return fs.readdirSync(path.join(ROOT, 'cli/server/handlers/webchat'))
+        .filter((name) => name.endsWith('.js'))
+        .map((name) => read(path.join('cli/server/handlers/webchat', name)))
+        .join('\n');
+}
+
 function exists(relativePath) {
     return fs.existsSync(path.join(ROOT, relativePath));
 }
@@ -23,7 +30,7 @@ function assertPatternsAbsent(source, patterns, label) {
 }
 
 test('WebChat no longer exposes speech routes or provider configuration', () => {
-    const source = read('cli/server/handlers/webchat.js');
+    const source = readWebchatHandlers();
     assertPatternsAbsent(source, [
         /createServerTtsStrategy/,
         /DEFAULT_TTS_PROVIDER/,

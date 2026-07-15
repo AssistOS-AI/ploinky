@@ -12,7 +12,7 @@ import {
     resolveNonCollidingTarget,
     resolveUploadTarget,
     sanitizeUploadRelativePath,
-} from '../webchat/uploadPaths.js';
+} from '../../webchat/uploadPaths.js';
 
 const APP_NAME = 'webchat';
 const ROUTER_RESERVED_QUERY_KEYS = new Set([

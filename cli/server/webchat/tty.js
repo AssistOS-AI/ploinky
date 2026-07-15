@@ -39,12 +39,26 @@ function shouldAppendIdentityArgs(command) {
     return !/^(?:\/bin\/)?(?:ba)?sh$/i.test(firstToken);
 }
 
+function buildWebchatSessionEnv(sessionContext = {}) {
+    return {
+        PLOINKY_WEBCHAT_HAS_HISTORY: sessionContext?.hasHistory === true ? '1' : '0'
+    };
+}
+
+function withWebchatSessionEnv(baseEnv, sessionContext) {
+    const env = { ...baseEnv };
+    for (const key of Object.keys(env)) {
+        if (key.startsWith('PLOINKY_WEBCHAT_')) delete env[key];
+    }
+    return Object.assign(env, buildWebchatSessionEnv(sessionContext));
+}
+
 function createTTYFactory({ runtime, containerName, workdir, entry }) {
     const DEBUG = process.env.WEBTTY_DEBUG === '1';
     const log = (...args) => { if (DEBUG) console.log('[webchat][tty]', ...args); };
-    const factory = (ssoUser) => {
+    const factory = (ssoUser, sessionContext = {}) => {
         const wd = workdir || safeProcessCwd();
-        const env = { ...process.env, TERM: 'xterm-256color' };
+        const env = withWebchatSessionEnv({ ...process.env, TERM: 'xterm-256color' }, sessionContext);
 
         // Build SSO CLI arguments (no env vars)
         const ssoCliArgs = [];
@@ -83,7 +97,7 @@ function createTTYFactory({ runtime, containerName, workdir, entry }) {
 
         // Use interactive mode but NO TTY allocation - this ensures stdin EOF propagates
         // to the container process when the host connection closes
-        const execArgs = buildExecArgs(containerName, wd, shellCmd, true, false);
+        const execArgs = buildExecArgs(containerName, wd, shellCmd, true, false, { env });
         let ptyProc = null;
         const outputHandlers = new Set();
         const closeHandlers = new Set();
@@ -168,15 +182,19 @@ function createTTYFactory({ runtime, containerName, workdir, entry }) {
     return { create: factory };
 }
 
-export { createTTYFactory, createLocalTTYFactory };
+export { buildWebchatSessionEnv, createTTYFactory, createLocalTTYFactory };
 
 function createLocalTTYFactory({ workdir, command }) {
     const DEBUG = process.env.WEBTTY_DEBUG === '1';
     const log = (...args) => { if (DEBUG) console.log('[webchat][tty-local]', ...args); };
-    const factory = (ssoUser) => {
+    const factory = (ssoUser, sessionContext = {}) => {
         const wd = workdir || process.cwd();
         // PLOINKY_NO_TTY=1 ensures stdin EOF propagates when webchat connection closes.
-        const env = { ...process.env, TERM: 'xterm-256color', PLOINKY_NO_TTY: '1' };
+        const env = withWebchatSessionEnv({
+            ...process.env,
+            TERM: 'xterm-256color',
+            PLOINKY_NO_TTY: '1'
+        }, sessionContext);
 
         // Build SSO CLI arguments (no env vars)
         const ssoCliArgs = [];

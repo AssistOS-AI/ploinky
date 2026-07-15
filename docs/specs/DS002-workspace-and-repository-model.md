@@ -22,7 +22,7 @@ The repository must store workspace runtime state under `.ploinky/`, including a
 - `repo_sources.json` for remembered repository URL, branch, and repository-kind metadata.
 - `repos/` for cloned repositories.
 - `agents/` for legacy/internal generated files when still referenced, and `code/` and `skills/` for symlink projections.
-- `logs/`, `running/`, `deps/`, `keys/`, and `transcripts/` for live runtime state.
+- `logs/`, `running/`, `deps/`, and `keys/` for live runtime state.
 - `data/` for manifest-declared durable service data and runtime-resource persistent storage.
 - `.secrets` and `profile` for workspace-local configuration.
 The workspace root also owns `.data/<agent-or-alias>/` as the host-side persistent home for enabled-agent instances. Container runtimes mount this directory at `/root` in every run mode; isolated mode also uses it as the agent workspace.

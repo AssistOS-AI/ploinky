@@ -282,6 +282,7 @@ HEAD /blobs/&lt;agentName&gt;/&lt;id&gt;
                             <li><strong>Exponential backoff:</strong> Initial 1s, 2x multiplier, max 30s between restarts.</li>
                             <li><strong>Health checks:</strong> HTTP GET to <code>/health</code> every 30s, restart after 3 consecutive failures.</li>
                             <li><strong>Container monitoring:</strong> Polls container state every 5 seconds.</li>
+                            <li><strong>Maintenance coordination:</strong> Defers automatic container restarts when the same container has an active maintenance lock, including timers scheduled before reinstall or explicit restart began.</li>
                             <li><strong>Logging:</strong> Structured JSON to <code>.ploinky/logs/watchdog.log</code>.</li>
                         </ul>
                     </div>
@@ -307,7 +308,6 @@ HEAD /blobs/&lt;agentName&gt;/&lt;id&gt;
 ├── running/             # PID files
 ├── routing.json         # Live route table
 ├── servers.json         # Web surface config (ports, tokens)
-├── transcripts/         # Conversation transcripts
 └── deps/                # Dependency caches
     ├── global/          # Global node_modules per runtime key
     └── agents/          # Per-agent node_modules per runtime key</code></pre>
@@ -373,11 +373,13 @@ DATABASE_URL=postgres://localhost/db</code></pre>
                     <div class="doc-section" id="web-services">
                         <h2>Web Services Architecture</h2>
                         
-                        <h3>WebChat (cli/server/handlers/webchat.js)</h3>
+                        <h3>WebChat (<code>cli/server/handlers/webchat/</code>)</h3>
                         <p>Chat interface for CLI programs:</p>
                         <ul style="margin-left: 2rem;">
-                            <li>Captures stdout/stdin through PTY</li>
-                            <li>WebSocket-based real-time communication</li>
+                            <li><code>index.js</code> authenticates and dispatches WebChat requests.</li>
+                            <li>Conversation, upload, workspace-suggestion, message-envelope, and runtime responsibilities are isolated in dedicated modules.</li>
+                            <li>Captures stdout/stdin through the selected agent's TTY implementation.</li>
+                            <li>Uses HTTP input requests and server-sent events for real-time output.</li>
                             <li>WhatsApp-style UI with message bubbles</li>
                             <li>Automatic reconnection handling</li>
                         </ul>
@@ -443,14 +445,14 @@ observability.js    // Monitoring views</code></pre>
    → Serve chat.html through the router
    
 3. Browser connects:
-   → WebSocket handshake
+   → Open the server-sent event stream
    → Authenticate through the router login flow
-   → Establish bidirectional channel
+   → Reuse the folder-session runtime across browser tabs
    
 4. Message flow:
    → User types in chat
-   → WebSocket → Server → PTY stdin
-   → Program output → PTY stdout → WebSocket → Browser
+   → HTTP POST → Server → TTY stdin
+   → Program output → TTY stdout → SSE → Browser
    → Display as chat bubble</code></pre>
                     </div>
 
@@ -528,6 +530,7 @@ observability.js    // Monitoring views</code></pre>
                             <li><strong>Incremental updates:</strong> Each  status response (HTTP 200) updates the console only if the task status changed (pending → running → completed/failed). Terminal states stop the poller immediately.</li>
                             <li><strong>Error handling:</strong> Non-200 responses are logged and the poller keeps retrying (except <code>404 task not found</code>, which stops polling and reports failure), so status checks continue even across transient outages.</li>
                         </ul>
+                        <p><code>AgentMcpClient.callTool()</code> owns blocking task polling and returns the terminal result. Its separate <code>callToolWithoutWait()</code> path returns the initial task response and offers it to a registered process-local observer without starting client-owned polling. A WebChat-aware CLI can use that observer to detach the task, continue polling through the router, and emit generic task envelopes. WebChat stores metadata and logs separately, adds only a <code>taskId</code> association to the owning assistant message, broadcasts <code>task-update</code> over its existing EventSource stream, and retains a disconnected watcher runtime while its tasks remain ongoing. The browser resolves that id into the inline task module after live updates or history loading; it does not persist a second copy of the log.</p>
                     </div>
 
                     <div class="doc-section">
