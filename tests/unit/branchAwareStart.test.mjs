@@ -13,6 +13,11 @@ process.env.GIT_AUTHOR_NAME = 'Ploinky Tests';
 process.env.GIT_AUTHOR_EMAIL = 'tests@ploinky.invalid';
 process.env.GIT_COMMITTER_NAME = 'Ploinky Tests';
 process.env.GIT_COMMITTER_EMAIL = 'tests@ploinky.invalid';
+fs.mkdirSync(path.join(tempDir, '.ploinky'), { recursive: true });
+fs.writeFileSync(
+    path.join(tempDir, '.ploinky', 'routing.json'),
+    JSON.stringify({ port: 8080, routes: {} }, null, 2),
+);
 
 const moduleSuffix = `?test=${Date.now()}`;
 const reposUrl = new URL('../../cli/services/repos.js', import.meta.url);
@@ -193,6 +198,14 @@ test('parseStartArgs: positional agent and port', () => {
     const result = parseStartArgs(['AchillesIDE/explorer', '8080']);
     assert.equal(result.staticAgent, 'AchillesIDE/explorer');
     assert.equal(result.port, '8080');
+});
+
+test('parseStartArgs: preserves malformed explicit ports for strict boundary validation', () => {
+    for (const value of ['0', '-1', '+8080', '8080junk', '1.5', '65536']) {
+        const result = parseStartArgs(['AchillesIDE/explorer', value]);
+        assert.equal(result.staticAgent, 'AchillesIDE/explorer');
+        assert.equal(result.port, value);
+    }
 });
 
 test('parseStartArgs: rejects start-tail --port value before start mutation', () => {

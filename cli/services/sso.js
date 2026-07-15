@@ -2,6 +2,7 @@ import fs from 'fs';
 
 import * as workspaceSvc from './workspace.js';
 import { ROUTING_FILE } from './config.js';
+import { resolvePersistedRouterPort } from './routerPort.js';
 import {
     resolveAgentDescriptor,
     listSsoProviders,
@@ -16,15 +17,7 @@ function readRouting() {
 }
 
 function getRouterPort() {
-    const routing = readRouting();
-    const fromRouting = parseInt(routing.port, 10);
-    if (!Number.isNaN(fromRouting) && fromRouting > 0) return fromRouting;
-    try {
-        const cfg = workspaceSvc.getConfig() || {};
-        const staticPort = parseInt(cfg?.static?.port, 10);
-        if (!Number.isNaN(staticPort) && staticPort > 0) return staticPort;
-    } catch (_) {}
-    return 8080;
+    return resolvePersistedRouterPort();
 }
 
 function extractShortAgentName(agentRef) {

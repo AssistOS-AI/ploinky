@@ -5,6 +5,7 @@ import {
 } from './docker/common.js';
 import { createBoxStartPublishPlan } from './boxStartPublishPlan.js';
 import { parseStartArgs } from './repos.js';
+import { parseRouterPort } from './routerPort.js';
 
 const STARTING_COMMANDS = new Set(['start', 'enable', 'cli', 'shell', 'restart', 'reinstall']);
 
@@ -35,15 +36,30 @@ export async function preflightBoxPublicationForCommand(command, options = [], o
 
 export function plannerRequestForCommand(command, options = [], overrides = {}) {
     const values = (options || []).map((entry) => String(entry));
-    const base = {
+    const base = () => ({
         schemaVersion: 2,
         operation: command,
-        routerPort: overrides.routerPort || 8080,
-    };
+        routerPort: parseRouterPort(overrides.routerPort, {
+            source: `publication planner router port for '${command}'`,
+        }),
+    });
     if (command === 'start') {
         const parsed = parseStartArgs(values);
+        const request = base();
+        if (parsed.port !== null) {
+            const positionalPort = parseRouterPort(parsed.port, {
+                source: 'start positional router port',
+            });
+            if (positionalPort !== request.routerPort) {
+                const error = new Error(
+                    `start positional router port ${positionalPort} does not match publication planner router port ${request.routerPort}`,
+                );
+                error.code = 'PLOINKY_ROUTER_PORT_MISMATCH';
+                throw error;
+            }
+        }
         return {
-            ...base,
+            ...request,
             root: parsed.staticAgent || undefined,
             profile: parsed.profile || undefined,
             branchPolicy: parsed.branchPolicy,
@@ -52,20 +68,20 @@ export function plannerRequestForCommand(command, options = [], overrides = {}) 
     }
     if (command === 'cli') {
         if (!values[0]) return null;
-        return { ...base, root: values[0], includeEnabled: false };
+        return { ...base(), root: values[0], includeEnabled: false };
     }
     if (command === 'shell') {
         if (!values[0]) return null;
-        return { ...base, root: values[0], includeEnabled: false };
+        return { ...base(), root: values[0], includeEnabled: false };
     }
     if (command === 'reinstall') {
         const root = values[0]?.toLowerCase() === 'agent' ? values[1] : values[0];
         if (!root) return null;
-        return { ...base, root, includeEnabled: false };
+        return { ...base(), root, includeEnabled: false };
     }
     if (command === 'restart') {
         const root = values[0] && values[0].toLowerCase() !== 'router' ? values[0] : undefined;
-        return { ...base, root, includeEnabled: !root };
+        return { ...base(), root, includeEnabled: !root };
     }
     if (command === 'enable') {
         const first = String(values[0] || '').toLowerCase();
@@ -75,7 +91,7 @@ export function plannerRequestForCommand(command, options = [], overrides = {}) 
         if (!root) return null;
         const aliasIndex = args.findIndex((entry) => entry.toLowerCase() === 'as');
         const alias = aliasIndex >= 0 ? args.slice(aliasIndex + 1).join(' ').trim() : '';
-        return { ...base, root, alias: alias || undefined, includeEnabled: false };
+        return { ...base(), root, alias: alias || undefined, includeEnabled: false };
     }
     return null;
 }

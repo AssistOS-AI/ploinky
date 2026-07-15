@@ -7,6 +7,7 @@ import http from 'http';
 import { createContainerMonitor, startContainerMonitor, stopContainerMonitor, clearContainerTargets } from './containerMonitor.js';
 import { appendLog } from './utils/logger.js';
 import { LOGS_DIR } from '../services/config.js';
+import { parseRouterPort } from '../services/routerPort.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -32,7 +33,7 @@ const CONFIG = {
     HEALTH_CHECK_FAILURES_THRESHOLD: 3, // Restart after 3 consecutive failures
 
     // Process configuration
-    PORT: process.env.PORT || 8080,
+    PORT: parseRouterPort(process.env.PORT, { source: 'Watchdog PORT' }),
     NODE_OPTIONS: process.env.NODE_OPTIONS || '',
 
     // Container monitoring
@@ -358,6 +359,7 @@ function spawnServer() {
     const env = {
         ...restEnv,
         MANAGED_BY_PROCESS_MANAGER: 'true',
+        PORT: String(CONFIG.PORT),
     };
     
     const nodeExecutable = getRouterNodeExecutable();

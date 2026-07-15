@@ -48,7 +48,7 @@ function mainHelpText(surface) {
   dashboard [--rotate]           Show or rotate Dashboard token and print access URL
   sso enable|disable|status  Bind or inspect SSO provider agents
   sandbox status|disable|enable  Force lite-sandbox agents to use containers, or restore bwrap/seatbelt
-  network status [--json]        Show managed network and gateway topology
+  network status [--json]        Show managed network topology (status schema 3)
   network prune                  Remove unused workspace-owned managed networks
   vars                           List all variable names (no values)
   var <VAR> <value>              Set a variable value
@@ -343,10 +343,10 @@ function showDetailedHelp(topic, subtopic, subsubtopic, { surface = 'core' } = {
             }
         },
         'restart': {
-            description: 'Restarts services. If an agent name is provided, it performs a non-destructive stop and start of that agent\'s container. If no agent name is provided, it restarts all agents and the router.',
+            description: 'Restarts services. A named agent is reconciled through the managed ownership, network, and endpoint transaction. With no name, all agents and the router restart.',
             syntax: 'restart [agentName]',
             examples: [ 'restart', 'restart MyAPI' ],
-            notes: 'The command only affects running containers when an agent name is specified. The general restart fails if start was not configured yet.'
+            notes: 'A named restart requires the persisted RoutingServer port and refuses foreign or old-contract containers. The general restart fails if start was not configured yet.'
         },
         'logs': {
             description: 'Inspect router logs',

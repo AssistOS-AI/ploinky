@@ -12,6 +12,7 @@ import * as repos from './repos.js';
 import { findAgent } from './utils.js';
 import { readManifestAgentCommand, readManifestStartCommand } from './docker/agentCommands.js';
 import { mergeProfiles } from './profileService.js';
+import { parseRouterPort } from './routerPort.js';
 import {
     assertNetworkStartupCompatibility,
     effectiveManifestNetwork,
@@ -505,10 +506,9 @@ export function validateBoxStartPublishPlanRequest(request) {
     if (request.includeEnabled !== undefined && typeof request.includeEnabled !== 'boolean') {
         throw new Error('planner request includeEnabled must be a boolean');
     }
-    const routerPort = request.routerPort === undefined ? 8080 : Number(request.routerPort);
-    if (!Number.isInteger(routerPort) || routerPort < 1 || routerPort > 65535) {
-        throw new Error(`planner request routerPort '${request.routerPort}' is invalid`);
-    }
+    const routerPort = parseRouterPort(request.routerPort, {
+        source: 'planner request routerPort',
+    });
     const explicitPublishes = request.explicitPublishes === undefined ? [] : request.explicitPublishes;
     if (!Array.isArray(explicitPublishes) || explicitPublishes.some((entry) => typeof entry !== 'string')) {
         throw new Error('planner request explicitPublishes must be an array of strings');

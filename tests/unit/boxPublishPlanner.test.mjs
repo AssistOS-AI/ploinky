@@ -32,6 +32,10 @@ function node(agentRef, openPorts, options = {}) {
     };
 }
 
+function planAtDefaultRouterPort(request = {}) {
+    return planBoxPublishes({ routerPort: 8080, ...request });
+}
+
 test('generic authoritative nodes produce TCP, UDP, range, root, dependency, and alias claims', () => {
     const plan = planBoxPublishes({
         nodes: [
@@ -52,13 +56,23 @@ test('generic authoritative nodes produce TCP, UDP, range, root, dependency, and
     assert.equal(plan.claims[3].alias, 'blue');
 });
 
+test('router port is explicit and uses the canonical strict syntax', () => {
+    for (const routerPort of [undefined, '+8080', ' 8080 ', '0x1f90', 0, -1, 65536]) {
+        assert.throws(
+            () => planBoxPublishes({ routerPort }),
+            (error) => error.code === 'PLOINKY_ROUTER_PORT_INVALID',
+        );
+    }
+    assert.doesNotThrow(() => planBoxPublishes({ routerPort: '49123' }));
+});
+
 test('manifest parser rejects box-side port zero and unequal ranges', () => {
     assert.throws(
-        () => planBoxPublishes({ nodes: [node('repo/a', ['127.0.0.1:0:7000'])] }),
+        () => planAtDefaultRouterPort({ nodes: [node('repo/a', ['127.0.0.1:0:7000'])] }),
         /host port 0 is not valid for outer box publish/,
     );
     assert.throws(
-        () => planBoxPublishes({ nodes: [node('repo/a', ['127.0.0.1:9000-9002:7000-7001'])] }),
+        () => planAtDefaultRouterPort({ nodes: [node('repo/a', ['127.0.0.1:9000-9002:7000-7001'])] }),
         /range lengths must match/,
     );
 });
@@ -98,7 +112,7 @@ test('same effective instance deduplicates only a semantically exact repeat', ()
 });
 
 test('TCP and UDP on the same number are independent', () => {
-    const plan = planBoxPublishes({
+    const plan = planAtDefaultRouterPort({
         nodes: [
             node('repo/tcp', ['127.0.0.1:3478:3478/tcp']),
             node('repo/udp', ['127.0.0.1:3478:3478/udp']),
@@ -111,7 +125,7 @@ test('TCP and UDP on the same number are independent', () => {
 });
 
 test('explicit target intervals subtract every covered prefix, middle, and suffix deterministically', () => {
-    const plan = planBoxPublishes({
+    const plan = planAtDefaultRouterPort({
         nodes: [node('repo/media', ['127.0.0.1:1000-1010:2000-2010/udp'])],
         explicitPublishes: [
             '127.0.0.1:41000:1000/udp',
@@ -131,13 +145,13 @@ test('explicit target intervals subtract every covered prefix, middle, and suffi
 });
 
 test('explicit full coverage removes a generated claim while another protocol does not', () => {
-    const full = planBoxPublishes({
+    const full = planAtDefaultRouterPort({
         nodes: [node('repo/media', ['127.0.0.1:1000-1002:2000-2002/udp'])],
         explicitPublishes: ['127.0.0.1:5000-5002:1000-1002/udp'],
     });
     assert.deepEqual(full.generatedPublishes, []);
 
-    const tcpOnly = planBoxPublishes({
+    const tcpOnly = planAtDefaultRouterPort({
         nodes: [node('repo/media', ['127.0.0.1:1000-1002:2000-2002/udp'])],
         explicitPublishes: ['127.0.0.1:5000-5002:1000-1002/tcp'],
     });
@@ -156,7 +170,7 @@ test('reserved router TCP socket conflicts while UDP remains valid', () => {
 
 test('real-shaped OnlyOffice profiles contain stable nonzero claims and produce no internal conflict', () => {
     for (const profile of ['default', 'dev', 'prod']) {
-        const plan = planBoxPublishes({
+        const plan = planAtDefaultRouterPort({
             nodes: [node('AchillesIDE/onlyOffice', onlyOfficeOpenPorts[profile].openPorts, { profile })],
         });
         assert.ok(plan.generatedPublishes.includes('127.0.0.1:17002:17002'));
@@ -165,7 +179,7 @@ test('real-shaped OnlyOffice profiles contain stable nonzero claims and produce 
 });
 
 test('Explorer-shaped OnlyOffice and LiveKit control sockets remain distinct', () => {
-    const plan = planBoxPublishes({
+    const plan = planAtDefaultRouterPort({
         nodes: [
             node(
                 'AchillesIDE/onlyOffice',
@@ -195,7 +209,7 @@ test('canonical parser helper retains box target and private target separately',
 });
 
 test('host mode publishes physical ports directly to private box-namespace ports', () => {
-    const plan = planBoxPublishes({
+    const plan = planAtDefaultRouterPort({
         nodes: [node('repo/hosted', ['127.0.0.1:19000:7000'], { networkMode: 'host' })],
     });
     assert.deepEqual(plan.generatedPublishes, ['127.0.0.1:19000:7000']);
@@ -206,7 +220,7 @@ test('host mode publishes physical ports directly to private box-namespace ports
 });
 
 test('planner detects host/bridge box namespace conflicts even when physical ports differ', () => {
-    assert.throws(() => planBoxPublishes({
+    assert.throws(() => planAtDefaultRouterPort({
         nodes: [
             node('repo/bridge', ['127.0.0.1:7000:9000'], { networkMode: 'bridge' }),
             node('repo/host', ['127.0.0.1:19000:7000'], { networkMode: 'host' }),
@@ -217,15 +231,15 @@ test('planner detects host/bridge box namespace conflicts even when physical por
 test('bridge implicit AgentServer mapping is deterministic and explicit private 7000 suppresses it', () => {
     const implicitNode = node('repo/implicit', [], { networkMode: 'bridge' });
     implicitNode.implicitAgentServer = true;
-    const first = planBoxPublishes({ nodes: [implicitNode] });
-    const second = planBoxPublishes({ nodes: [implicitNode] });
+    const first = planAtDefaultRouterPort({ nodes: [implicitNode] });
+    const second = planAtDefaultRouterPort({ nodes: [implicitNode] });
     assert.deepEqual(first.generatedPublishes, second.generatedPublishes);
     assert.equal(first.claims.length, 1);
     assert.equal(first.claims[0].privateContainer.start, 7000);
 
     const explicitNode = node('repo/explicit', ['127.0.0.1:19000:7000'], { networkMode: 'bridge' });
     explicitNode.implicitAgentServer = true;
-    const explicit = planBoxPublishes({ nodes: [explicitNode] });
+    const explicit = planAtDefaultRouterPort({ nodes: [explicitNode] });
     assert.equal(explicit.claims.length, 1);
     assert.deepEqual(explicit.generatedPublishes, ['127.0.0.1:19000:19000']);
 });

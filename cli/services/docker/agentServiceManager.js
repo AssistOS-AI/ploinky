@@ -40,7 +40,7 @@ import { clearLivenessState } from './healthProbes.js';
 import { stopAndRemove } from './containerFleet.js';
 import { buildContainerSecurityArgs, resolveContainerSecurity } from './containerSecurity.js';
 import { DEFAULT_AGENT_ENTRY, launchAgentSidecar, readManifestAgentCommand, readManifestStartCommand, splitCommandArgs } from './agentCommands.js';
-import { AGENTS_DATA_DIR, PLOINKY_DIR, ROUTING_FILE, PLOINKY_WORKSPACE_ROOT } from '../config.js';
+import { AGENTS_DATA_DIR, PLOINKY_DIR, PLOINKY_WORKSPACE_ROOT } from '../config.js';
 import {
     planRuntimeResources,
     applyRuntimeResourceEnv,
@@ -63,11 +63,9 @@ import {
     validateSecrets
 } from '../secretInjector.js';
 import {
-    getActiveProfile,
     getDefaultMountModes,
-    getProfileConfig,
     getProfileEnvVars,
-    mergeProfiles
+    resolveManifestRuntimeProfile
 } from '../profileService.js';
 import {
     createProfileServerPublish,
@@ -94,15 +92,15 @@ import {
     prepareLlmStartup,
 } from '../llmRuntimeIntegration.js';
 import {
+    assertHostSandboxNetworkCompatibility,
     assertNetworkStartupCompatibility,
     canonicalizeNetwork,
-    effectiveManifestNetwork,
     networkContractHash,
-    validateManifestNetworks,
 } from '../networkContract.js';
 import { createNetworkLifecycleAdapter } from '../networkLifecycle.js';
 import { effectiveInstanceKey } from '../workspaceDependencyGraph.js';
 import { implicitAgentServerBoxPort } from '../../../container/box-publish-planner.mjs';
+import { ROUTER_ENV_NAMES, assertRouterEndpoint } from '../routerPort.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -441,42 +439,31 @@ function resolveSymlinkPath(symlinkPath) {
     return symlinkPath;
 }
 
-function normalizeRouterPort(value) {
-    const trimmed = String(value || '').trim();
-    if (!trimmed) return '';
-    const parsed = Number.parseInt(trimmed, 10);
-    return Number.isFinite(parsed) && parsed > 0 ? String(parsed) : '';
-}
-
-function readRouterPortFromRoutingFile() {
-    try {
-        if (!fs.existsSync(ROUTING_FILE)) return '';
-        const routing = JSON.parse(fs.readFileSync(ROUTING_FILE, 'utf8')) || {};
-        return normalizeRouterPort(routing.port);
-    } catch (_) {
-        return '';
-    }
-}
-
 function buildRuntimeRouterEnv(runtime, options = {}) {
     const mode = String(options.networkMode || 'default').trim().toLowerCase();
-    if (mode === 'none') return {};
-    const routerPort = normalizeRouterPort(options.routerPort)
-        || readRouterPortFromRoutingFile()
-        || '8080';
-    const routerHost = String(options.routerHost || '').trim()
-        || (mode === 'host' ? '127.0.0.1' : 'ploinky-router');
-    return {
-        PLOINKY_ROUTER_PORT: mode === 'host' ? routerPort : '8080',
-        PLOINKY_ROUTER_HOST: routerHost,
-        PLOINKY_ROUTER_URL: `http://${routerHost}:${mode === 'host' ? routerPort : '8080'}`,
-    };
+    if (Object.prototype.hasOwnProperty.call(options, 'routerHost')) {
+        throw new Error('routerHost overrides are not supported; pass the validated routerEndpoint');
+    }
+    const endpoint = assertRouterEndpoint(options.routerEndpoint, mode, {
+        explicitPort: options.routerPort,
+    });
+    return endpoint ? { ...endpoint.env } : {};
 }
 
 function appendRuntimeRouterEnvFlags(envStrings, routerEnv) {
     for (const [name, value] of Object.entries(routerEnv || {})) {
         envStrings.push(formatEnvFlag(name, value));
     }
+}
+
+function replaceRuntimeRouterEnvFlags(envStrings, routerEnv) {
+    const prefixes = ROUTER_ENV_NAMES.map((name) => `-e ${name}=`);
+    for (let index = envStrings.length - 1; index >= 0; index -= 1) {
+        if (prefixes.some((prefix) => String(envStrings[index] || '').startsWith(prefix))) {
+            envStrings.splice(index, 1);
+        }
+    }
+    appendRuntimeRouterEnvFlags(envStrings, routerEnv);
 }
 
 function ensureManifestVolumeHostPaths(manifest, profileConfig = null) {
@@ -675,20 +662,18 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     const sharedDir = ensureSharedHostDir();
     const llmRuntimeSharedPath = resolveLlmRuntimeSharedPath(agentPath);
 
-    // Get active profile and configuration
-    const activeProfile = String(options.profileName || getActiveProfile()).trim() || getActiveProfile();
-    const hasProfileConfig = Boolean(manifest?.profiles && Object.keys(manifest.profiles).length > 0);
-    const profileConfig = hasProfileConfig
-        ? getProfileConfig(`${repoName}/${agentName}`, activeProfile)
-        : null;
-    if (hasProfileConfig && !profileConfig) {
-        const availableProfiles = Object.keys(manifest.profiles || {});
-        throw new Error(`[profile] ${agentName}: profile '${activeProfile}' not found. Available: ${availableProfiles.join(', ')}`);
-    }
-    validateManifestNetworks(manifest, { path: `manifest(${repoName}/${agentName})` });
-    const manifestNetwork = effectiveManifestNetwork(manifest, activeProfile, {
+    // Resolve profile and network as one selection. Explicit CLI and persisted
+    // profile names fail closed; only a missing global profile falls back to
+    // this manifest's default profile.
+    const profileResolution = options.profileResolution || resolveManifestRuntimeProfile(manifest, {
+        agentName: `${repoName}/${agentName}`,
+        profileName: options.profileName,
+        persistedProfileName: existingRecord.profile,
         path: `manifest(${repoName}/${agentName})`,
     });
+    const activeProfile = profileResolution.resolvedProfileName;
+    const profileConfig = profileResolution.profileConfig;
+    const manifestNetwork = profileResolution.network;
     assertNetworkStartupCompatibility(manifest, profileConfig, manifestNetwork, {
         path: `manifest(${repoName}/${agentName})`,
     });
@@ -717,8 +702,12 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     let image = manifestImage;
     const useProfileLifecycle = Boolean(profileConfig);
     const runtimeNetworkPlan = buildRuntimeNetworkPlan(runtime, manifestNetwork);
+    const routerEndpoint = assertRouterEndpoint(options.routerEndpoint, runtimeNetworkPlan.mode, {
+        explicitPort: options.routerPort,
+    });
     const runtimeRouterEnv = buildRuntimeRouterEnv(runtime, {
-        ...options,
+        routerEndpoint,
+        routerPort: options.routerPort,
         networkMode: runtimeNetworkPlan.mode,
     });
     const envHash = computeEnvHash(manifest, profileConfig, {
@@ -952,10 +941,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
             attachments: [],
             created: [],
         };
-    args.splice(1, 0,
-        '--label', `io.assistos.ploinky.workspace=${networkLifecycle.identity.hash}`,
-        '--label', `io.assistos.ploinky.network-contract=${networkContractHash(manifestNetwork)}`,
-    );
+    args.splice(1, 0, ...networkLifecycle.agentIdentityLabelArgs(manifestNetwork));
 
     for (const { resolvedHostPath, containerPath, options } of manifestVolumeMounts) {
         const mountSuffix = manifestVolumeMountSuffix(runtime, resolvedHostPath, options);
@@ -1045,7 +1031,10 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         appendEnvFlagsFromMap(envStrings, profileSecrets);
     }
 
-    if (runtimeNetworkPlan.mode !== 'none') appendRuntimeRouterEnvFlags(envStrings, runtimeRouterEnv);
+    // Router discovery is runtime-owned. Remove every manifest/profile/secret
+    // value first; none mode remains empty while routable modes receive only
+    // the already validated canonical endpoint.
+    replaceRuntimeRouterEnvFlags(envStrings, runtimeRouterEnv);
     if (llmStartup.enabled) {
         envStrings.push(formatEnvFlag('HF_HOME', '/models/hf-cache'));
         envStrings.push(formatEnvFlag('PLOINKY_MODELS_DIR', '/models/artifacts'));
@@ -1156,6 +1145,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
             instanceKey: effectiveInstanceKey(repoName, agentName, options.alias || ''),
             containerName,
             createContainer,
+            networkLockWaitMs: options.networkLockWaitMs,
         });
         clearLivenessState(containerName);
     } else {
@@ -1325,6 +1315,17 @@ function shouldCreateImplicitAgentServerPublish(manifest, manifestPorts = [], ne
     return resolveAgentExecutionMode(manifest).type !== 'start_only';
 }
 
+function appendUniquePortMapping(portMappings, mapping) {
+    const current = Array.isArray(portMappings) ? [...portMappings] : [];
+    const containerPort = Number(mapping?.containerPort);
+    const protocol = String(mapping?.protocol || 'tcp').trim().toLowerCase() || 'tcp';
+    const exists = current.some((entry) => (
+        Number(entry?.containerPort) === containerPort
+        && (String(entry?.protocol || 'tcp').trim().toLowerCase() || 'tcp') === protocol
+    ));
+    return exists ? current : [...current, mapping];
+}
+
 function assertHostPortContract(networkMode, portMappings) {
     if (networkMode !== 'host' || isPloinkyBoxRuntime()) return;
     const remapped = (portMappings || []).find((mapping) => (
@@ -1348,42 +1349,30 @@ function resolveDirectProfileServerHostPort(profileServer) {
 }
 
 function ensureAgentService(agentName, manifest, agentPath, options = {}) {
-    // Check if this agent should use a sandbox runtime instead of containers
-    const agentRuntime = getRuntimeForAgent(manifest);
-    if (agentRuntime === 'bwrap') {
-        try {
-            return ensureBwrapService(agentName, manifest, agentPath, options);
-        } catch (err) {
-            throw createHostSandboxStartupError(agentName, 'bwrap', err);
-        }
+    if (!options || typeof options !== 'object'
+        || !Object.prototype.hasOwnProperty.call(options, 'routerEndpoint')
+        || options.routerEndpoint === undefined) {
+        const error = new Error('ensureAgentService requires a validated routerEndpoint; pass explicit null for network mode none');
+        error.code = 'PLOINKY_ROUTER_ENDPOINT_REQUIRED';
+        throw error;
     }
-    if (agentRuntime === 'seatbelt') {
-        try {
-            return ensureSeatbeltService(agentName, manifest, agentPath, options);
-        } catch (err) {
-            throw createHostSandboxStartupError(agentName, 'seatbelt', err);
-        }
-    }
-    const runtime = getRuntime();
-
     let preferredHostPort;
     let containerOverride;
     let aliasOverride;
     let forceRecreate = false;
     let profileNameOverride;
-    let routerPortOverride;
-    let routerHostOverride;
-    if (typeof options === 'number') {
-        preferredHostPort = options;
-    } else if (options && typeof options === 'object') {
-        preferredHostPort = options.preferredHostPort;
-        containerOverride = options.containerName;
-        aliasOverride = options.alias;
-        forceRecreate = options.forceRecreate === true;
-        profileNameOverride = options.profileName;
-        routerPortOverride = options.routerPort;
-        routerHostOverride = options.routerHost;
+    let routerEndpointOverride;
+    let networkLockWaitMs;
+    preferredHostPort = options.preferredHostPort;
+    containerOverride = options.containerName;
+    aliasOverride = options.alias;
+    forceRecreate = options.forceRecreate === true;
+    profileNameOverride = options.profileName;
+    routerEndpointOverride = options.routerEndpoint;
+    if (Object.prototype.hasOwnProperty.call(options, 'routerHost')) {
+        throw new Error('routerHost overrides are not supported; pass the validated routerEndpoint');
     }
+    networkLockWaitMs = options.networkLockWaitMs;
 
     const repoName = path.basename(path.dirname(agentPath));
     const containerName = containerOverride || getAgentContainerName(agentName, repoName);
@@ -1393,23 +1382,49 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
         aliasOverride = existingRecord.alias;
     }
 
-    // Resolve profile config early - needed for port resolution
-    const activeProfile = String(profileNameOverride || existingRecord.profile || getActiveProfile()).trim() || getActiveProfile();
-    const hasProfileConfig = Boolean(manifest?.profiles && Object.keys(manifest.profiles).length > 0);
-    const profileConfig = hasProfileConfig
-        ? getProfileConfig(`${repoName}/${agentName}`, activeProfile)
-        : null;
-    if (hasProfileConfig && !profileConfig) {
-        const availableProfiles = Object.keys(manifest.profiles || {});
-        throw new Error(`[profile] ${agentName}: profile '${activeProfile}' not found. Available: ${availableProfiles.join(', ')}`);
-    }
-    validateManifestNetworks(manifest, { path: `manifest(${repoName}/${agentName})` });
-    const manifestNetwork = effectiveManifestNetwork(manifest, activeProfile, {
+    // Resolve profile and network before backend dispatch so every runtime uses
+    // the same effective selection. Explicit CLI and persisted profiles are
+    // strict; an unavailable global profile alone may fall back to default.
+    const profileResolution = resolveManifestRuntimeProfile(manifest, {
+        agentName: `${repoName}/${agentName}`,
+        profileName: profileNameOverride,
+        persistedProfileName: existingRecord.profile,
         path: `manifest(${repoName}/${agentName})`,
     });
+    const activeProfile = profileResolution.resolvedProfileName;
+    const profileConfig = profileResolution.profileConfig;
+    const manifestNetwork = profileResolution.network;
     assertNetworkStartupCompatibility(manifest, profileConfig, manifestNetwork, {
         path: `manifest(${repoName}/${agentName})`,
     });
+    const routerEndpoint = assertRouterEndpoint(routerEndpointOverride, manifestNetwork.mode);
+
+    // Host sandboxes share the host network namespace. Fail closed unless the
+    // effective manifest/profile contract explicitly selects host networking.
+    const agentRuntime = getRuntimeForAgent(manifest);
+    if (agentRuntime === 'bwrap' || agentRuntime === 'seatbelt') {
+        const sandboxOptions = { ...options };
+        Object.assign(sandboxOptions, {
+            containerName,
+            alias: aliasOverride,
+            profileName: activeProfile,
+            profileResolution,
+            routerEndpoint,
+        });
+        try {
+            assertHostSandboxNetworkCompatibility(manifestNetwork, {
+                path: `manifest(${repoName}/${agentName}).network`,
+                runtime: agentRuntime,
+            });
+            return agentRuntime === 'bwrap'
+                ? ensureBwrapService(agentName, manifest, agentPath, sandboxOptions)
+                : ensureSeatbeltService(agentName, manifest, agentPath, sandboxOptions);
+        } catch (err) {
+            throw createHostSandboxStartupError(agentName, agentRuntime, err);
+        }
+    }
+
+    const runtime = getRuntime();
     assertOuterPublicationCoverageForManifest(manifest, profileConfig, {
         ownerRef: `${repoName}/${agentName}`,
         networkMode: manifestNetwork.mode,
@@ -1426,8 +1441,7 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
         if (!isLlmRuntimeManifest(manifest, profileConfig)) throw err;
     }
     const runtimeRouterEnv = buildRuntimeRouterEnv(runtime, {
-        routerPort: routerPortOverride,
-        routerHost: routerHostOverride,
+        routerEndpoint,
         networkMode: manifestNetwork.mode,
     });
     const runtimeNetworkPlan = buildRuntimeNetworkPlan(runtime, manifestNetwork);
@@ -1522,18 +1536,23 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
         }
     }
 
-    const managedNetworkLifecycle = runtimeNetworkPlan.requiresManagedNetwork
-        ? createNetworkLifecycleAdapter({ runtime })
-        : null;
-    if (containerExists(containerName) && managedNetworkLifecycle) {
-        const contractMatches = managedNetworkLifecycle.verifyContainerContract(containerName, manifestNetwork, agentName, {
+    // Ownership is independent of the selected transport. Host/none containers
+    // still carry the workspace + contract labels, so inspect them before any
+    // reuse, start, or replacement decision. Only creation/replacement for
+    // default/bridge enters the managed-network transaction below.
+    const networkLifecycle = createNetworkLifecycleAdapter({ runtime });
+    if (containerExists(containerName)) {
+        const contractInspection = networkLifecycle.inspectContainerContract(containerName, manifestNetwork, agentName, {
             instanceKey: effectiveInstanceKey(repoName, agentName, aliasOverride || ''),
             contractHash: networkContractHash(manifestNetwork),
         });
-        if (!contractMatches) {
+        if (contractInspection.state === 'foreign') {
+            throw new Error(`refusing to replace foreign/unsupported exact-name container '${containerName}': managed agent identity labels do not match`);
+        }
+        if (contractInspection.state === 'owned-drift') {
             debugLog(`[ensureAgentService] ${agentName}: managed network contract/attachments drifted; recreating container`);
             recreateReason ||= 'networkContractDrift';
-        } else if (!isContainerRunning(containerName)) {
+        } else if (runtimeNetworkPlan.requiresManagedNetwork && !isContainerRunning(containerName)) {
             // A stopped managed container is never started outside the lifecycle
             // transaction because gateway/network preflight must precede start.
             recreateReason ||= 'managedContainerStopped';
@@ -1571,11 +1590,6 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
             }
         }
         if (canReuseExisting) {
-            if (managedNetworkLifecycle) {
-                managedNetworkLifecycle.reconcileManagedControlPlane(manifestNetwork, agentName, {
-                    instanceKey: effectiveInstanceKey(repoName, agentName, aliasOverride || ''),
-                });
-            }
             debugLog(`[ensureAgentService] ${agentName}: returning early (container exists)`);
             const hostPort = runtimeNetworkPlan.mode === 'host'
                 ? (containerPortCandidates[0] || 0)
@@ -1601,7 +1615,7 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
         const agentServerMapping = { containerPort: 7000, hostPort, hostIp: '127.0.0.1', protocol: 'tcp' };
         additionalPorts = [`127.0.0.1:${hostPort}:7000`];
         additionalPortMappings.push(agentServerMapping);
-        allPortMappings = [agentServerMapping];
+        allPortMappings = appendUniquePortMapping(allPortMappings, agentServerMapping);
     }
 
     const profileServerPublish = createProfileServerPublish(additionalServerPort, allPortMappings);
@@ -1617,8 +1631,9 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
         containerName,
         alias: aliasOverride,
         profileName: activeProfile,
-        routerPort: runtimeRouterEnv.PLOINKY_ROUTER_PORT,
-        routerHost: runtimeRouterEnv.PLOINKY_ROUTER_HOST
+        profileResolution,
+        routerEndpoint,
+        networkLockWaitMs,
     });
     allPortMappings = resolvePublishedPortMappings(containerName, allPortMappings);
     const resolvedProfileServer = resolvePublishedProfileServer(additionalServerPort, allPortMappings) || additionalServerPort;
@@ -1703,6 +1718,7 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
 
 export {
     assertPodmanCodeMountAllowed,
+    appendUniquePortMapping,
     buildPersistentAgentRunArgs,
     buildPodmanStagedTargetMounts,
     buildRuntimeNetworkPlan,
@@ -1721,6 +1737,7 @@ export {
     resolveHostPortFromRecord,
     resolveHostPortFromRuntime,
     resolvePublishedPortMappings,
+    replaceRuntimeRouterEnvFlags,
     shouldCreateImplicitAgentServerPublish,
     startAgentContainer
 };

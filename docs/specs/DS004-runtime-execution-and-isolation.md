@@ -30,12 +30,33 @@ The managed public-entrypoint boundary is:
 | REPL `status`/`stop`/`destroy` | Core workspace/router/agent scope; outer runtime remains |
 
 The outer runtime uses the mutable `docker.io/assistos/ploinky-box:runtime`
-reference carrying exact label `io.assistos.ploinky.runtime-contract=3`. A
+reference carrying exact label `io.assistos.ploinky.runtime-contract=4`. A
 missing-box create or intentional configuration replacement pulls the selected
 logical reference, validates its complete metadata, captures its image ID, and
 runs that ID. Reuse, stopped-box start, status, stop, and destroy do not pull.
-Existing contract-1 and contract-2 boxes are unsupported; the hard cut has no
-migration or adoption path.
+Every non-contract-4 box is unsupported, including contract 2, contract 3,
+malformed, and identity/provenance-incomplete state. It fails before planning,
+pulling, volume creation, or replacement. No automatic restart, upgrade,
+relabel, adoption, or replacement is allowed. The operator must run `ploinky
+destroy` explicitly and then recreate contract 4; all three named volumes are
+retained.
+
+Direct/core installations must cut over before the new release is invoked.
+From the old checkout, use the explicit core entry rather than the public outer
+wrapper:
+
+```sh
+node cli/index.js destroy
+node cli/index.js network prune
+```
+
+Outside a managed box, `ploinky` dispatches to the outer supervisor and is not
+equivalent to these core commands. Inspect or resolve any foreign resources
+reported by the core prune. After proving no container references them,
+one-time cleanup may remove only `.ploinky/run/router.sock`,
+`.ploinky/run/managed-hosts`, and the cached exact image
+`docker.io/assistos/ploinky-network-gateway:1@sha256:68c47ce93d16ea1a2d03944f7b50ce82e6f2f9a26b183d2c9c7fbabcc828fb7e`.
+A broad container, image, volume, or network prune is not part of the cutover.
 
 The outer container and its workspace, nested-container-storage, and dependency
 volumes are deterministically named from the canonical absolute host directory.
@@ -52,22 +73,32 @@ contract. In particular, Podman's normalized security-option spelling and
 ordering are equivalent to the requested values, and device requests are
 recovered from the inspected create command when `HostConfig.Devices` is empty.
 This normalization is comparison-only: creation still emits the exact
-contract-3 devices and security options, while an actually missing or different
+contract-4 devices and security options, while an actually missing or different
 request remains replacement drift. Repeating an unchanged host command must
 therefore reuse the same compliant outer container without pulling or replacing
 it.
 
-Nested Podman belongs to this outer runtime only. Ordinary agent images
+Nested Podman belongs to this outer runtime only. Contract-4 self-check requires
+rootless Podman 5.4 or newer, Netavark, and an operational `pasta`; managed
+networking has no `slirp4netns` fallback. Ordinary agent images
 intentionally contain neither Podman nor Docker and do not receive authority
 over sibling containers. The exact `io.assistos.ploinky.managed=1` label marks
 Ploinky-owned nested containers so box boot removes only those running or stopped
-records while preserving manual containers, nested images, and named volumes.
+records, including old managed gateway and agent records, while preserving
+manual containers, nested images, named volumes, and schema-2 networks.
 Before opening the retained graph root, boot also clears only the outer
 container filesystem's transient rootless-Podman run directories under `/tmp`;
 those paths contain stale process/lock state, not the retained container graph,
 and cleanup failure stops boot.
 
-The container's network namespace is selected from the manifest. The default is a workspace-defined bridge by name; agents that opt into `network.mode: "host"` run with `--network host` and share the host's network namespace directly. The runtime must not emit `-p` port publishes for host-network agents, must not register bridge aliases for them, and must not create a named bridge on their behalf. Sibling agents on a bridge that need to reach a host-network agent must route through the host gateway entry the runtime exposes (`host.containers.internal` on podman with netavark, or the bridge gateway IP); manifest defaults that previously assumed a bridge alias must be either re-pointed or made overridable through operator-supplied vars when the dependency moves to host networking.
+The container's network namespace is selected from the strict manifest modes
+`default`, `bridge`, `host`, and `none`. `default` creates a private logical
+bridge for the effective instance. `bridge` requires explicit attachments and
+exactly one primary; same-network peers communicate by derived alias. `host`
+uses the outer-box namespace without managed bridges, aliases, or inner `-p`
+publishes. `none` has no network or router endpoint and rejects AgentServer,
+network-dependent readiness, `openPorts`, and `additionalServerPort`. Legacy
+`network.name` and `network.aliases` forms are not adopted.
 
 Every Ploinky-managed nested Podman bridge must be created with the exact
 `isolate=true` bridge option. Existing managed bridges are reusable only when
@@ -76,28 +107,37 @@ IPv4 IPAM, subnet, and ownership-label contract. This blocks direct IP routing
 between different managed bridges while preserving connectivity among agents
 that intentionally share a logical network and preserving ordinary outbound
 NAT. Ploinky must fail closed instead of adopting or silently weakening an
-unisolated managed bridge.
+unisolated managed bridge. The schema-2 network labels and inspect result are
+validated before reuse, and router restart must not recreate or mutate these
+networks.
 
-Managed agent containers disable engine-generated hosts entries and bind the
-workspace's generated localhost-only hosts file read-only at `/etc/hosts`.
-Container reuse proves that exact mount and create policy. The network-contract
-hash includes this runtime policy revision so containers created with the older
-engine-augmented hosts behavior are recreated deliberately instead of retaining
-`host.containers.internal` or equivalent broad box-loopback aliases.
+Managed `default` and `bridge` containers use exactly `--hosts-file=none
+--add-host host.containers.internal:host-gateway`. Their validated router
+endpoint is injected through `PLOINKY_ROUTER_HOST`, `PLOINKY_ROUTER_PORT`, and
+`PLOINKY_ROUTER_URL`. `host` uses `127.0.0.1`; `none` receives no endpoint.
+Container reuse proves the exact hosts arguments, attachments, aliases, labels,
+and versioned network-contract hash. A container carrying an older contract
+hash remains foreign and is neither adopted nor recreated. Only an exact-owned
+current-hash container whose mutable runtime configuration drifted may be
+recreated; Ploinky must never weaken the hash to retain prior behavior.
 
 Managed container transactions wait for the workspace network lifecycle lock
 with a bounded timeout. Parallel dependency waves therefore serialize their
-network, gateway, replacement, and start mutations instead of failing on a live
-owner. Gateway preflight validates every attachment that currently exists;
-under the same acquired transaction, reconciliation may then add and verify a
-missing desired attachment left by an outer-runtime replacement or another
-serialized launch.
+network, replacement, and start mutations instead of failing on a live owner.
+Preflight validates every desired attachment before mutation; under the same
+transaction, reconciliation may create and verify missing managed bridges or
+attach the new container. Foreign or unsupported network state remains
+fail-closed and is never replaced or adopted.
 
-The gateway's exact ownership labels record the device and inode of the mounted
-router Unix socket. A router restart that replaces that socket must therefore
-replace the exact-owned gateway even if a timing-sensitive readiness probe can
-still complete against the retiring listener. Foreign or otherwise unsupported
-gateway records remain fail-closed and are never replaced or adopted.
+`RoutingServer.js` listens explicitly on IPv4 `0.0.0.0`; readiness checks its
+TCP listener through `127.0.0.1`. It creates no Unix listener. Wildcard- or
+gateway-bound services in the outer box are reachable from managed bridges,
+while loopback-only box services and Unix sockets are not. Directly reachable
+box services do not inherit router authentication and must provide their own.
+Routed MCP calls retain JWT issuer/audience validation, policy, request binding,
+expiry, and replay protection. The old `ploinky-router` network-name reservation
+is removed, while the same string remains the authentication issuer/audience
+identity.
 
 Inside the managed outer runtime, profile `openPorts` is the reviewed crossing between an agent container and that runtime and is also eligible for host publication. The inner runtime widens loopback publish binds to its interfaces so the supervisor can reach the runtime-side socket; the graph planner retains the manifest's outer bind policy when it creates the host publish. Host-network agents do not need an inner `-p` flag, but their declared runtime-side sockets remain subject to the same outer eligibility and conflict rules. Private service listeners must instead stay on named service networks or use private router/readiness mechanisms.
 

@@ -47,10 +47,10 @@ different scopes. Exit the REPL before operating on the outer runtime.
 
 The required multi-architecture release channel is the mutable reference
 `docker.io/assistos/ploinky-box:runtime`. Its image must satisfy runtime
-contract 3, including the exact label:
+contract 4, including the exact label:
 
 ```text
-io.assistos.ploinky.runtime-contract=3
+io.assistos.ploinky.runtime-contract=4
 ```
 
 The contract also requires user `podman`, working directory `/workspace`, the
@@ -80,11 +80,14 @@ except for authoritative generated publications. Explicit `--port`,
 `--publish`/`--expose`, `--image`, `--mount`, or `--listen-lan` values
 intentionally change their corresponding desired settings.
 
-Contract 2 is a hard cut. A contract-1, malformed, or provenance-free box is
-not migrated, copied, adopted, or transactionally upgraded; ordinary commands
-fail before pulling or mutating it and require an explicit destroy. Legacy
-basename-only boxes and volumes are not discoverable through the new identity
-and remain untouched for manual inspection or removal.
+Contract 4 is a hard cut. Every non-contract-4 box, including contract 2,
+contract 3, malformed, or provenance-free state, fails before planning,
+pulling, volume creation, or replacement. The supervisor does not
+automatically restart, upgrade, relabel, adopt, or replace it. Run `ploinky
+destroy` explicitly, then run an ordinary command to recreate the box from
+contract 4 while retaining all three named volumes. Legacy basename-only boxes
+and volumes are not discoverable through the current identity and remain
+untouched for manual inspection or removal.
 
 ## Instances, engines, and state
 
@@ -241,6 +244,39 @@ state from the outer container filesystem. These paths are not the named
 nested-storage volume; container records, images, and nested named volumes stay
 retained. Failure to clear stale run state aborts boot.
 
+Contract-4 boot requires rootless Podman 5.4 or newer, the Netavark network
+backend, and an operational `pasta` executable. Any failed prerequisite aborts
+self-check; managed networking has no `slirp4netns` fallback. The image is
+built from an immutable `quay.io/podman/stable` index digest that contains both
+the native amd64 and arm64 Podman 5.8.2 manifests.
+
+Managed `default` mode creates one private `isolate=true` bridge for the
+effective agent instance. Managed `bridge` mode attaches the container to the
+declared logical bridges, exactly one of which is primary. Peers on the same
+bridge can communicate by their derived alias, different managed bridges cannot
+route directly by IP, and outbound NAT remains available. `host` uses the
+outer-box namespace; `none` has no network and cannot use a router endpoint or
+network-dependent readiness.
+
+Every managed `default` or `bridge` container is created with exactly
+`--hosts-file=none --add-host
+host.containers.internal:host-gateway`. Its router endpoint is injected as
+`PLOINKY_ROUTER_HOST=host.containers.internal`, the validated
+`PLOINKY_ROUTER_PORT`, and the matching `PLOINKY_ROUTER_URL`. `host` mode uses
+`127.0.0.1` for the same endpoint variables. `none` receives none of them.
+There is no generated hosts-file bind. Router readiness probes the explicit
+IPv4 listener through `127.0.0.1`; `RoutingServer.js` listens on `0.0.0.0` and
+does not create a Unix listener.
+
+This topology makes wildcard- or gateway-bound services in the outer box
+reachable from managed bridges. Box services bound only to loopback, and Unix
+sockets, remain unreachable. A direct reachable service does not inherit
+router authentication: it must implement its own authorization. Routed MCP
+calls continue to enforce the router's JWT issuer/audience, policy, request
+binding, expiry, and replay checks. The historical `ploinky-router` network
+alias is no longer reserved; `ploinky-router` remains the authentication
+issuer/audience identity where specified.
+
 ## Status, shutdown, and destruction
 
 `ploinky status` is strictly read-only. It reports missing, stopped, compatible,
@@ -286,16 +322,35 @@ LEGACY_INSTANCE=ploinky-box-OLDNAME
 $ENGINE rm -f "$LEGACY_INSTANCE"
 ```
 
+For the contract-4 direct/core cutover, invoke the old checkout's core entry
+directly before installing or invoking the new release:
+
+```sh
+node cli/index.js destroy
+node cli/index.js network prune
+```
+
+Do not use the public `ploinky` wrapper for this step: outside a box it controls
+the outer runtime, not the old core workspace. Inspect and resolve any foreign
+resources rather than adopting them. After confirming no container references
+them, remove only the exact stale `.ploinky/run/router.sock` and
+`.ploinky/run/managed-hosts` paths and the unreferenced cached image
+`docker.io/assistos/ploinky-network-gateway:1@sha256:68c47ce93d16ea1a2d03944f7b50ce82e6f2f9a26b183d2c9c7fbabcc828fb7e`.
+Do not use a broad container, image, volume, or network prune.
+
 ## Smoke and release ordering
 
 `node container/smoke-runtime.mjs` is the real engine-backed public-entrypoint
 smoke. It checks that help creates nothing, an ordinary command starts the
 runtime, nested `podman version` and `podman info` work, combined status works,
 stop is idempotent, confirmed destruction retains labelled volumes, and a
-recreated box observes the retained workspace marker. The script accepts
+recreated box observes retained markers in the workspace, nested storage, and
+dependency volumes. The script accepts
 `SMOKE_IMAGE` and `SMOKE_PORT` overrides; engine selection remains automatic.
 
 The publication workflow moves the mutable `:runtime` channel only after
-native amd64 and arm64 candidates both pass contract and nested-Podman gates.
+native amd64 and arm64 candidates both pass contract, hard-cut persistence,
+network-isolation, router-restart, and nested-Podman gates. Each native job
+emits its Podman, Netavark, and `pasta` evidence before release promotion.
 The supervisor consults that channel only for create or replacement and keeps
 existing boxes pinned to their inspected IDs.

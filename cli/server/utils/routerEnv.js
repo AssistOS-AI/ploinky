@@ -1,7 +1,6 @@
-import fs from 'fs';
 import crypto from 'crypto';
 import * as envSvc from '../../services/secretVars.js';
-import { ROUTING_FILE } from '../../services/config.js';
+import { resolvePersistedRouterPort } from '../../services/routerPort.js';
 
 const COMPONENTS = {
   webchat: { label: 'WebChat', path: '/webchat', authMode: 'login' },
@@ -9,25 +8,7 @@ const COMPONENTS = {
 };
 
 function getRouterPort() {
-  let port = null;
-  try {
-    const routing = JSON.parse(fs.readFileSync(ROUTING_FILE, 'utf8'));
-    if (routing && routing.port) {
-      const candidate = parseInt(routing.port, 10);
-      if (!Number.isNaN(candidate) && candidate > 0) port = candidate;
-    }
-  } catch (_) {}
-  if (!port) {
-    try {
-      const val = parseInt(envSvc.resolveVarValue('ROUTER_PORT'), 10);
-      if (!Number.isNaN(val) && val > 0) port = val;
-    } catch (_) {}
-  }
-  if (!port) {
-    const envPort = parseInt(process.env.ROUTER_PORT || '', 10);
-    if (!Number.isNaN(envPort) && envPort > 0) port = envPort;
-  }
-  return port || 8080;
+  return resolvePersistedRouterPort();
 }
 
 function maskToken(token) {

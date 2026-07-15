@@ -6,8 +6,7 @@ import {
     parseManifestOpenPortSpec,
 } from './publish-spec.mjs';
 import crypto from 'node:crypto';
-
-export const DEFAULT_BOX_ROUTER_PORT = 8080;
+import { parseRouterPort } from '../cli/services/routerPort.js';
 
 export function implicitAgentServerBoxPort(instanceKey) {
     const key = String(instanceKey || '').trim();
@@ -24,7 +23,7 @@ export function implicitAgentServerBoxPort(instanceKey) {
 export function planBoxPublishes({
     nodes = [],
     explicitPublishes = [],
-    routerPort = DEFAULT_BOX_ROUTER_PORT,
+    routerPort,
 } = {}) {
     if (!Array.isArray(nodes)) {
         throw new Error('box publish planner requires an array of authoritative nodes');
@@ -196,10 +195,7 @@ function normalizeOpenPorts(value, ref) {
 }
 
 function assertRouterSocketAvailable(claims, routerPort) {
-    const port = Number(routerPort);
-    if (!Number.isInteger(port) || port < 1 || port > 65535) {
-        throw new Error(`invalid reserved router port '${routerPort}'`);
-    }
+    const port = parseRouterPort(routerPort, { source: 'reserved outer router port' });
     const conflict = claims.find((claim) => (
         claim.protocol === 'tcp'
         && claim.boxSide.start <= port

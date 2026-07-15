@@ -1,5 +1,4 @@
 import http from 'http';
-import net from 'net';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -27,6 +26,7 @@ import {
 } from './routerHandlers.js';
 import { collectHttpServiceRoutes, resolveHttpServiceRoute } from './httpServiceRoutes.js';
 import { handleProfileServerUpgrade, proxyProfileServer } from './profileServerProxy.js';
+import { handleHttpServiceUpgrade } from './wsServiceProxy.js';
 
 // Logging
 import { appendLog, logBootEvent, logMemoryUsage } from './utils/logger.js';
@@ -56,16 +56,12 @@ import {
     isDelegatedAgentOpenAiCall,
     handleDelegatedAgentOpenAiCall,
 } from './agentOpenAiDelegation.js';
+import { parseRouterPort } from '../services/routerPort.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const MCP_BROWSER_CLIENT_PATH = path.resolve(__dirname, '../../Agent/client/MCPBrowserClient.js');
-const ROUTER_SOCKET_PATH = path.join(
-    path.resolve(process.env.PLOINKY_WORKSPACE_ROOT || process.cwd()),
-    '.ploinky',
-    'run',
-    'router.sock',
-);
+const port = parseRouterPort(process.env.PORT, { source: 'RoutingServer PORT' });
 
 // Initialize TTY factories
 const { getWebchatFactory } = await initializeTTYFactories();
@@ -662,7 +658,6 @@ const lifecycle = setupProcessLifecycle(server, globalState, agentSessionStore);
 
 // Server error handlers
 server.on('error', (error) => {
-    const port = process.env.PORT ? parseInt(process.env.PORT, 10) : 8080;
     console.error('[FATAL] Server error:', error);
     appendLog('server_error', { error: error.message, code: error.code, port });
 
@@ -690,49 +685,7 @@ server.on('clientError', (error, socket) => {
 });
 
 // Start server
-const port = process.env.PORT ? parseInt(process.env.PORT, 10) : 8080;
-fs.mkdirSync(path.dirname(ROUTER_SOCKET_PATH), { recursive: true, mode: 0o700 });
-fs.chmodSync(path.dirname(ROUTER_SOCKET_PATH), 0o700);
-try { fs.unlinkSync(ROUTER_SOCKET_PATH); } catch (error) {
-    if (error?.code !== 'ENOENT') throw error;
-}
-const routerSocketServer = net.createServer((downstream) => {
-    const upstream = net.createConnection({ host: '127.0.0.1', port });
-    downstream.pipe(upstream);
-    upstream.pipe(downstream);
-    const closeBoth = () => {
-        downstream.destroy();
-        upstream.destroy();
-    };
-    downstream.on('error', closeBoth);
-    upstream.on('error', closeBoth);
-});
-routerSocketServer.on('error', (error) => {
-    console.error(`[FATAL] Router Unix listener failed at ${ROUTER_SOCKET_PATH}:`, error);
-    process.exitCode = 2;
-    try { server.close(); } catch (_) {}
-});
-routerSocketServer.listen(ROUTER_SOCKET_PATH, () => {
-    // The gateway receives only this single socket bind mount and runs as a
-    // fixed non-root UID. The containing host directory remains owner-only;
-    // world-connect on the socket is confined by that directory and the mount.
-    try {
-        fs.chmodSync(ROUTER_SOCKET_PATH, 0o666);
-    } catch (error) {
-        console.error(`[FATAL] Router Unix listener permissions could not be set at ${ROUTER_SOCKET_PATH}:`, error);
-        process.exitCode = 2;
-        try { routerSocketServer.close(); } catch (_) {}
-        try { server.close(); } catch (_) {}
-        try { fs.unlinkSync(ROUTER_SOCKET_PATH); } catch (_) {}
-        return;
-    }
-    console.log(`[RoutingServer] Unix listener ready at ${ROUTER_SOCKET_PATH}`);
-});
-process.on('exit', () => {
-    try { routerSocketServer.close(); } catch (_) {}
-    try { fs.unlinkSync(ROUTER_SOCKET_PATH); } catch (_) {}
-});
-server.listen(port, () => {
+server.listen(port, '0.0.0.0', () => {
     console.log(`[RoutingServer] Ploinky server running on http://127.0.0.1:${port}`);
     console.log('  Dashboard:       /dashboard');
     console.log('  WebChat:         /webchat');

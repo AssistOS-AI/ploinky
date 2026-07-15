@@ -55,12 +55,15 @@ import {
     validateSecrets
 } from '../secretInjector.js';
 import {
-    getActiveProfile,
     getDefaultMountModes,
-    getProfileConfig,
     getProfileEnvVars,
-    mergeProfiles
+    mergeProfiles,
+    resolveManifestRuntimeProfile
 } from '../profileService.js';
+import {
+    assertHostSandboxNetworkCompatibility,
+    assertNetworkStartupCompatibility,
+} from '../networkContract.js';
 import { resolveProfileServer } from '../profileServer.js';
 import {
     getAgentWorkDir,
@@ -80,6 +83,7 @@ import {
     readManifestVolumeOptions,
     resolveManifestVolumeHostPath
 } from '../manifestVolumePolicy.js';
+import { assertRouterEndpoint } from '../routerPort.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -88,8 +92,30 @@ const AGENT_PRIVATE_KEY_CONTAINER_PATH = '/run/ploinky-agent.key';
 
 const BWRAP_PATH = '/usr/bin/bwrap';
 
-function resolveRouterHostForRuntime() {
-    return '127.0.0.1';
+function resolveBwrapRuntimeProfile(agentName, manifest, agentPath, options = {}, existingRecord = {}) {
+    const repoName = path.basename(path.dirname(agentPath));
+    const manifestPath = `manifest(${repoName}/${agentName})`;
+    const resolution = options.profileResolution || resolveManifestRuntimeProfile(manifest, {
+        agentName: `${repoName}/${agentName}`,
+        profileName: options.profileName,
+        persistedProfileName: existingRecord.profile,
+        path: manifestPath,
+    });
+    assertNetworkStartupCompatibility(manifest, resolution.profileConfig, resolution.network, {
+        path: manifestPath,
+    });
+    assertHostSandboxNetworkCompatibility(resolution.network, {
+        path: `${manifestPath}.network`,
+        runtime: 'bwrap',
+    });
+    return resolution;
+}
+
+function resolveSandboxRouterEndpoint(options = {}, networkMode = 'host') {
+    if (options && typeof options === 'object' && Object.prototype.hasOwnProperty.call(options, 'routerHost')) {
+        throw new Error('routerHost overrides are not supported; pass the validated routerEndpoint');
+    }
+    return assertRouterEndpoint(options?.routerEndpoint, networkMode, { explicitPort: options?.routerPort });
 }
 
 function resolveBwrapAgentNodeModules({
@@ -340,7 +366,9 @@ function buildBwrapArgs(options) {
  * Build the full environment map for a bwrap agent.
  * Mirrors the env construction in startAgentContainer.
  */
-function buildFullEnvMap(agentName, manifest, profileConfig, agentWorkDir, repoName, activeProfile, runtimeName = 'bwrap', runtimeResourcePlan = null) {
+function buildFullEnvMap(agentName, manifest, profileConfig, agentWorkDir, repoName, activeProfile, runtimeName = 'bwrap', runtimeResourcePlan = null, routerEndpoint = undefined) {
+    const endpoint = assertRouterEndpoint(routerEndpoint, 'host');
+
     // Start with manifest env vars (resolved from secrets)
     const env = buildEnvMap(manifest, profileConfig, { agentName, repoName, forRuntime: true });
 
@@ -383,20 +411,6 @@ function buildFullEnvMap(agentName, manifest, profileConfig, agentWorkDir, repoN
         }
     }
 
-    // Router port
-    let routerPort = '8080';
-    try {
-        const routingFile = ROUTING_FILE;
-        if (fs.existsSync(routingFile)) {
-            const routing = JSON.parse(fs.readFileSync(routingFile, 'utf8')) || {};
-            if (routing.port) routerPort = String(routing.port);
-        }
-    } catch (_) { }
-    const routerHost = resolveRouterHostForRuntime();
-    env.PLOINKY_ROUTER_PORT = routerPort;
-    env.PLOINKY_ROUTER_HOST = routerHost;
-    env.PLOINKY_ROUTER_URL = `http://${routerHost}:${routerPort}`;
-
     // SSO client credentials
     const agentClientIdVar = `PLOINKY_AGENT_${agentName.toUpperCase().replace(/[^A-Z0-9]/g, '_')}_CLIENT_ID`;
     const agentClientSecretVar = `PLOINKY_AGENT_${agentName.toUpperCase().replace(/[^A-Z0-9]/g, '_')}_CLIENT_SECRET`;
@@ -433,6 +447,10 @@ function buildFullEnvMap(agentName, manifest, profileConfig, agentWorkDir, repoN
     } catch (err) {
         debugLog(`[invocationAuth/bwrap] could not set agent identity: ${err?.message || err}`);
     }
+
+    // Router discovery is a runtime contract, not user configuration. Assert it
+    // after every manifest, profile, environment, and secret layer.
+    Object.assign(env, endpoint.env);
 
     return env;
 }
@@ -515,19 +533,16 @@ function startBwrapProcess(agentName, manifest, agentPath, options = {}) {
     const cwd = getConfiguredProjectPath(agentName, repoName, alias);
     const sharedDir = ensureSharedHostDir();
 
-    // Profile configuration
-    const activeProfile = getActiveProfile();
-    const hasProfileConfig = Boolean(manifest?.profiles && Object.keys(manifest.profiles).length > 0);
-    const profileConfig = hasProfileConfig
-        ? getProfileConfig(`${repoName}/${agentName}`, activeProfile)
-        : null;
-    if (hasProfileConfig && !profileConfig) {
-        const availableProfiles = Object.keys(manifest.profiles || {});
-        throw new Error(`[profile] ${agentName}: profile '${activeProfile}' not found. Available: ${availableProfiles.join(', ')}`);
-    }
+    // Profile and network are resolved atomically before any sandbox work.
+    const profileContainerName = options.containerName || getAgentContainerName(agentName, repoName);
+    const profileRecord = loadAgentsMap()[profileContainerName] || {};
+    const profileResolution = resolveBwrapRuntimeProfile(agentName, manifest, agentPath, options, profileRecord);
+    const activeProfile = profileResolution.resolvedProfileName;
+    const profileConfig = profileResolution.profileConfig;
+    const routerEndpoint = resolveSandboxRouterEndpoint(options, profileResolution.network.mode);
 
     assertManifestEnvProfileCompleteness(manifest, profileConfig, { agentName, repoName, profileName: activeProfile });
-    const envHash = computeEnvHash(manifest, profileConfig, {}, { agentName, repoName });
+    const envHash = computeEnvHash(manifest, profileConfig, routerEndpoint.env, { agentName, repoName });
     const { codeReadOnly, skillsReadOnly } = getProfileMountModes(activeProfile, profileConfig || {});
 
     // Resolve paths
@@ -575,7 +590,7 @@ function startBwrapProcess(agentName, manifest, agentPath, options = {}) {
     const hostPort = allPortMappings[0]?.hostPort;
 
     // Build environment map
-    const envMap = buildFullEnvMap(agentName, manifest, profileConfig, agentWorkDir, repoName, activeProfile, 'bwrap', runtimeResourcePlan);
+    const envMap = buildFullEnvMap(agentName, manifest, profileConfig, agentWorkDir, repoName, activeProfile, 'bwrap', runtimeResourcePlan, routerEndpoint);
     const agentPrivateKeyPath = envMap.__PLOINKY_AGENT_PRIVATE_KEY_HOST_PATH || '';
     delete envMap.__PLOINKY_AGENT_PRIVATE_KEY_HOST_PATH;
 
@@ -739,6 +754,7 @@ function ensureBwrapService(agentName, manifest, agentPath, options = {}) {
     let containerOverride;
     let aliasOverride;
     let forceRecreate = false;
+    let profileNameOverride;
 
     if (typeof options === 'number') {
         preferredHostPort = options;
@@ -747,6 +763,7 @@ function ensureBwrapService(agentName, manifest, agentPath, options = {}) {
         containerOverride = options.containerName;
         aliasOverride = options.alias;
         forceRecreate = options.forceRecreate === true;
+        profileNameOverride = options.profileName;
     }
 
     const repoName = path.basename(path.dirname(agentPath));
@@ -758,12 +775,15 @@ function ensureBwrapService(agentName, manifest, agentPath, options = {}) {
         aliasOverride = existingRecord.alias;
     }
 
-    // Profile config for env hash comparison
-    const activeProfile = getActiveProfile();
-    const hasProfileConfig = Boolean(manifest?.profiles && Object.keys(manifest.profiles).length > 0);
-    const profileConfig = hasProfileConfig
-        ? getProfileConfig(`${repoName}/${agentName}`, activeProfile)
-        : null;
+    // Profile config and host-network compatibility are validated even when the
+    // existing sandbox can otherwise be reused.
+    const profileResolution = resolveBwrapRuntimeProfile(agentName, manifest, agentPath, {
+        ...(options && typeof options === 'object' ? options : {}),
+        profileName: profileNameOverride,
+    }, existingRecord);
+    const activeProfile = profileResolution.resolvedProfileName;
+    const profileConfig = profileResolution.profileConfig;
+    const routerEndpoint = resolveSandboxRouterEndpoint(options, profileResolution.network.mode);
 
     assertManifestEnvProfileCompleteness(manifest, profileConfig, { agentName, repoName, profileName: activeProfile });
     const { portMappings } = parseManifestPorts(manifest, profileConfig);
@@ -783,7 +803,7 @@ function ensureBwrapService(agentName, manifest, agentPath, options = {}) {
     // Check if already running
     if (isBwrapProcessRunning(agentName)) {
         // Compare env hash
-        const desired = computeEnvHash(manifest, profileConfig, {}, { agentName, repoName });
+        const desired = computeEnvHash(manifest, profileConfig, routerEndpoint.env, { agentName, repoName });
         const current = existingRecord.envHash || '';
         if (desired && desired !== current) {
             console.log(`[bwrap] ${agentName}: env hash changed, restarting...`);
@@ -800,7 +820,10 @@ function ensureBwrapService(agentName, manifest, agentPath, options = {}) {
     return startBwrapProcess(agentName, manifest, agentPath, {
         preferredHostPort: allPortMappings[0]?.hostPort,
         containerName,
-        alias: aliasOverride
+        alias: aliasOverride,
+        profileName: activeProfile,
+        profileResolution,
+        routerEndpoint,
     });
 }
 
@@ -820,12 +843,12 @@ function attachBwrapInteractive(agentName, manifest, agentPath, workdir, entryCo
         throw new Error(`[bwrap] ${agentName}: not running as bwrap agent`);
     }
 
-    // Profile configuration (needed for env resolution)
-    const activeProfile = getActiveProfile();
-    const hasProfileConfig = Boolean(manifest?.profiles && Object.keys(manifest.profiles).length > 0);
-    const profileConfig = hasProfileConfig
-        ? getProfileConfig(`${repoName}/${agentName}`, activeProfile)
-        : null;
+    // Use the running record's persisted profile unless the caller explicitly
+    // selected another valid profile for this interactive sandbox.
+    const profileResolution = resolveBwrapRuntimeProfile(agentName, manifest, agentPath, options, record);
+    const activeProfile = profileResolution.resolvedProfileName;
+    const profileConfig = profileResolution.profileConfig;
+    const routerEndpoint = resolveSandboxRouterEndpoint(options, profileResolution.network.mode);
 
     // Resolve paths
     const agentCodePath = resolveSymlinkPath(getAgentCodePath(agentName));
@@ -847,7 +870,7 @@ function attachBwrapInteractive(agentName, manifest, agentPath, workdir, entryCo
     // Build environment (same as running agent)
     const runtimeResourcePlan = planRuntimeResources(manifest, { agentName, repoName });
     assertManifestEnvProfileCompleteness(manifest, profileConfig, { agentName, repoName, profileName: activeProfile });
-    const envMap = buildFullEnvMap(agentName, manifest, profileConfig, agentWorkDir, repoName, activeProfile, 'bwrap', runtimeResourcePlan);
+    const envMap = buildFullEnvMap(agentName, manifest, profileConfig, agentWorkDir, repoName, activeProfile, 'bwrap', runtimeResourcePlan, routerEndpoint);
     const agentPrivateKeyPath = envMap.__PLOINKY_AGENT_PRIVATE_KEY_HOST_PATH || '';
     delete envMap.__PLOINKY_AGENT_PRIVATE_KEY_HOST_PATH;
     const hostPort = record.config?.ports?.[0]?.hostPort;
@@ -896,6 +919,7 @@ function attachBwrapInteractive(agentName, manifest, agentPath, workdir, entryCo
 
 export {
     ensureBwrapService,
+    resolveBwrapRuntimeProfile,
     startBwrapProcess,
     buildBwrapArgs,
     buildFullEnvMap,

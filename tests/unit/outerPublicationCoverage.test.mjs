@@ -108,31 +108,56 @@ test('per-agent defense rejects port zero and missing outer coverage before a ru
 });
 
 test('command request mapping covers every starting command and rejects start-tail --port', () => {
-    assert.equal(plannerRequestForCommand('start', ['repo/root', '8097']).root, 'repo/root');
-    assert.equal(plannerRequestForCommand('enable', ['agent', 'repo/a', 'global']).root, 'repo/a');
-    assert.equal(plannerRequestForCommand('cli', ['repo/a', '--port', 'payload']).root, 'repo/a');
-    assert.equal(plannerRequestForCommand('shell', ['repo/a']).operation, 'shell');
-    assert.equal(plannerRequestForCommand('restart', ['repo/a']).includeEnabled, false);
-    assert.equal(plannerRequestForCommand('restart', []).includeEnabled, true);
-    assert.equal(plannerRequestForCommand('reinstall', ['agent', 'repo/a']).root, 'repo/a');
+    const routerPort = 49123;
+    const overrides = { routerPort };
+    assert.equal(plannerRequestForCommand('start', ['repo/root', String(routerPort)], overrides).root, 'repo/root');
+    assert.equal(plannerRequestForCommand('enable', ['agent', 'repo/a', 'global'], overrides).root, 'repo/a');
+    assert.equal(plannerRequestForCommand('cli', ['repo/a', '--port', 'payload'], overrides).root, 'repo/a');
+    assert.equal(plannerRequestForCommand('shell', ['repo/a'], overrides).operation, 'shell');
+    assert.equal(plannerRequestForCommand('restart', ['repo/a'], overrides).includeEnabled, false);
+    assert.equal(plannerRequestForCommand('restart', [], overrides).includeEnabled, true);
+    assert.equal(plannerRequestForCommand('reinstall', ['agent', 'repo/a'], overrides).root, 'repo/a');
+    assert.equal(plannerRequestForCommand('cli', ['repo/a'], overrides).routerPort, routerPort);
     assert.throws(
-        () => plannerRequestForCommand('start', ['repo/root', '--port=8097']),
+        () => plannerRequestForCommand('start', ['repo/root', '--port=8097'], overrides),
         /start-tail --port/,
     );
+    assert.throws(
+        () => plannerRequestForCommand('start', ['repo/root', '8097'], overrides),
+        (error) => error.code === 'PLOINKY_ROUTER_PORT_MISMATCH',
+    );
+    for (const invalid of ['+49123', '49123junk', '1.5', '-1', ' 49123 ']) {
+        assert.throws(
+            () => plannerRequestForCommand('start', ['repo/root', invalid], overrides),
+            (error) => error.code === 'PLOINKY_ROUTER_PORT_INVALID',
+        );
+    }
+    for (const invalid of [undefined, '+8080', ' 8080 ', '0x1f90', 0, -1, 65536]) {
+        assert.throws(
+            () => plannerRequestForCommand('cli', ['repo/a'], { routerPort: invalid }),
+            (error) => error.code === 'PLOINKY_ROUTER_PORT_INVALID',
+        );
+    }
 });
 
 test('in-box command preflight proceeds when the authoritative contract covers all claims', async () => {
+    let observedRouterPort = null;
     const result = await preflightBoxPublicationForCommand('cli', ['repo/a', '--port=payload'], {
         boxRuntime: true,
+        routerPort: 49123,
         contract: contract([{ start: 17000, end: 17000, protocol: 'tcp' }]),
-        createPlan: async (request) => ({
-            schemaVersion: 2,
-            operation: request.operation,
-            claims: [{ protocol: 'tcp', boxSide: { start: 17000, end: 17000 } }],
-        }),
+        createPlan: async (request) => {
+            observedRouterPort = request.routerPort;
+            return {
+                schemaVersion: 2,
+                operation: request.operation,
+                claims: [{ protocol: 'tcp', boxSide: { start: 17000, end: 17000 } }],
+            };
+        },
     });
     assert.equal(result.enforced, true);
     assert.equal(result.coverage.covered, true);
+    assert.equal(observedRouterPort, 49123);
 });
 
 test('in-box authoritative preflight uses saved alias and canonical profiles instead of workspace profile', () => {
@@ -173,11 +198,13 @@ test('in-box authoritative preflight uses saved alias and canonical profiles ins
 const { preflightBoxPublicationForCommand } = await import(${JSON.stringify(coverageUrl)});
 const alias = await preflightBoxPublicationForCommand('cli', ['blue'], {
   boxRuntime: true,
+  routerPort: 49123,
   contract: { schemaVersion: 2, targets: [{ start: 18301, end: 18301, protocol: 'tcp' }], publishes: [] },
   planOptions: { bootRepos: [] },
 });
 const canonical = await preflightBoxPublicationForCommand('reinstall', ['solo'], {
   boxRuntime: true,
+  routerPort: 49123,
   contract: { schemaVersion: 2, targets: [{ start: 18402, end: 18402, protocol: 'tcp' }], publishes: [] },
   planOptions: { bootRepos: [] },
 });
@@ -231,7 +258,7 @@ process.stdout.write(JSON.stringify({
     }
 });
 
-test('core start denial precedes profile, registry, hook, router, and container mutation', () => {
+test('core start persists the initial router port but publication denial precedes agent mutation', () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-command-coverage-'));
     try {
         const reposDir = path.join(root, '.ploinky', 'repos');
@@ -257,11 +284,13 @@ let error = null;
 try { await handleCommand(['start', 'demo/root', '--profile', 'dev']); }
 catch (caught) { error = { code: caught.code, message: caught.message }; }
 const ploinky = path.join(process.cwd(), '.ploinky');
+const routingPath = path.join(ploinky, 'routing.json');
 process.stdout.write(JSON.stringify({
   error,
   profileExists: fs.existsSync(path.join(ploinky, 'profile')),
   agentsExists: fs.existsSync(path.join(ploinky, 'agents.json')),
-  routingExists: fs.existsSync(path.join(ploinky, 'routing.json')),
+  routingExists: fs.existsSync(routingPath),
+  routingPort: fs.existsSync(routingPath) ? JSON.parse(fs.readFileSync(routingPath, 'utf8')).port : null,
   dataExists: fs.existsSync(path.join(process.cwd(), '.data')),
 }));`;
         const result = spawnSync(process.execPath, ['--input-type=module', '-e', script], {
@@ -283,11 +312,13 @@ process.stdout.write(JSON.stringify({
             profileExists: output.profileExists,
             agentsExists: output.agentsExists,
             routingExists: output.routingExists,
+            routingPort: output.routingPort,
             dataExists: output.dataExists,
         }, {
             profileExists: false,
             agentsExists: false,
-            routingExists: false,
+            routingExists: true,
+            routingPort: 8080,
             dataExists: false,
         });
     } finally {

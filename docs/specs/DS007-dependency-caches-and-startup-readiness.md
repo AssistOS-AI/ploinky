@@ -42,7 +42,7 @@ transitive dependency graph, aliases, profiles, branches, and any additional
 enabled agents core will start from the named workspace rather than from a
 product-specific host checkout. A running box plans through `exec`; a stopped
 box remains stopped while a temporary container uses its inspected image ID.
-For a missing box, the supervisor pulls and validates contract 2, creates the
+For a missing box, the supervisor pulls and validates contract 4, creates the
 labelled workspace volume, plans in a temporary container, and creates the
 final box from the same image ID. Temporary containers and anonymous volumes
 are removed on every planner exit path. A failed first plan may retain prepared
@@ -58,8 +58,12 @@ resources, and foreign exact-name volumes fail without mutation. With no
 identity resources, answering Podman is preferred; a non-installed engine
 cannot participate in inventory. The mutable
 `docker.io/assistos/ploinky-box:runtime` channel is pulled only for create or
-replacement, validated as contract 2, and pinned by image ID for execution.
-Contract-1 state is never migrated or adopted.
+replacement, validated as contract 4, and pinned by image ID for execution.
+Every non-contract-4 box, including contract 2 and contract 3, fails before
+planning, pulling, volume creation, restart, upgrade, or replacement. It is
+never migrated, relabelled, adopted, or automatically replaced. The operator
+must run `ploinky destroy` explicitly before recreation; the workspace,
+nested-container-storage, and dependency named volumes remain retained.
 
 A cache is valid only when the runtime key, the relevant package hash, the stamp version, the installer metadata, and the core marker module all match the current workspace inputs. Cache preparation must use the correct installation backend for the target runtime family. Container-family runtime keys must install inside an install container for the target image, and the prepared stamp must record that image so a manifest image change refreshes the cache even when Node major, platform, libc, and package hashes are otherwise unchanged. Sandbox-family runtime keys must install on the host and must reject preparation for a foreign host runtime key.
 
@@ -86,6 +90,15 @@ For blocking script readiness, Ploinky executes the declared plain-filename scri
 The outer box persists versioned, separate explicit/generated publication provenance. Replanning preserves ordered explicit values that were not restated and replaces stale generated values. Missing or malformed provenance is unsupported and must not be inferred from inspected port bindings. The supervisor passes the authoritative socket coverage to core. A one-shot host command can reconcile the box before startup; a REPL, Marketplace, monitor, or other already-in-box path proceeds only when existing coverage is sufficient and otherwise fails before profile, registry, hook, router, cache preparation, or agent-container mutation with a one-shot host instruction.
 
 Inside a marked outer box, all Ploinky-managed agents and dependency-install containers use nested Podman. Persisted bwrap/Seatbelt enablement and Docker fallback are ineffective there. Every Ploinky-created nested agent, helper, and sidecar container carries `io.assistos.ploinky.managed=1`; outer boot removes running and stopped exact matches while retaining manual/unlabelled containers, nested images, and nested named volumes. Cleanup enumeration or removal failure fails the box self-check. Because the outer `-containers` volume survives destroy, recovery from corrupt nested state requires inspect/backup followed by explicit removal of that one named volume after the box is absent and data loss is accepted.
+
+Contract-4 managed-network startup additionally requires rootless Podman 5.4
+or newer, Netavark, and operational `pasta`. Router startup listens explicitly
+on IPv4 `0.0.0.0`, while readiness tests the same TCP service through
+`127.0.0.1`; no Unix listener participates. Managed `default` and `bridge`
+agents receive the validated router endpoint through
+`host.containers.internal:host-gateway`, `host` agents use box loopback, and
+`none` agents receive no router endpoint and cannot select network-dependent
+readiness.
 
 Some agents are workers rather than servers — they do not bind a port and have no readiness signal beyond "the process is running." Such agents must set `readiness.protocol: "none"`. The runtime treats them as immediately ready and does not probe a port; the dependency wave still tracks them so dependents wait for the container to start, but it does not require a port-open or MCP-handshake response. Use this only for true workers (renewal loops, batch jobs); serving agents must keep a real probe.
 

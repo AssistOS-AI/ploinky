@@ -77,9 +77,9 @@ port, profile, and branch policy flags and bootstraps the requested agent.
 
 The required release channel is the mutable
 `docker.io/assistos/ploinky-box:runtime` reference. The source-free image must
-satisfy the complete runtime contract 2 metadata checked by
+satisfy the complete runtime contract 4 metadata checked by
 `container/runtime-contract.mjs`, including exact label
-`io.assistos.ploinky.runtime-contract=2`, user `podman`, workdir `/workspace`,
+`io.assistos.ploinky.runtime-contract=4`, user `podman`, workdir `/workspace`,
 the box entrypoint, its allowlisted environment, and no image command or
 declared volumes.
 
@@ -107,10 +107,28 @@ creation flags preserve inspected settings except that authoritative generated
 publications may be replaced. Reconciliation never removes the workspace,
 nested-container-storage, or dependency volumes.
 
-Contract 2 is a hard cut: contract-1, malformed, identity-incompatible, or
-publication-provenance-free boxes are blocked before planning, pulling, or
-mutation and require explicit destroy. No old basename-only container or volume
-is copied, adopted, mapped, or discovered by the new path-hashed identity.
+Contract 4 is a hard cut: every non-contract-4 box, including contract 2,
+contract 3, malformed, identity-incompatible, or publication-provenance-free
+state, is blocked before planning, pulling, volume creation, restart, upgrade,
+or replacement. It requires explicit `ploinky destroy`; the supervisor never
+relabels, adopts, or automatically replaces it. The next permitted create
+retains and remounts all three named volumes. No old basename-only container or
+volume is copied, adopted, mapped, or discovered by the path-hashed identity.
+
+Direct/core users must invoke the old checkout's core entry before contract 4:
+
+```sh
+node cli/index.js destroy
+node cli/index.js network prune
+```
+
+They must not use the public `ploinky` wrapper for this step because, outside a
+box, it controls the outer runtime. After inspecting or resolving any foreign
+resources and confirming no container references them, one-time cleanup may
+remove only `.ploinky/run/router.sock`,
+`.ploinky/run/managed-hosts`, and the cached exact image
+`docker.io/assistos/ploinky-network-gateway:1@sha256:68c47ce93d16ea1a2d03944f7b50ce82e6f2f9a26b183d2c9c7fbabcc828fb7e`.
+No broad container, image, volume, or network prune is part of this cutover.
 
 First-use planning may create the labelled `-workspace` volume and prepare
 repository checkouts before graph resolution fails. That state is intentionally
@@ -291,7 +309,7 @@ Ploinky does not load a central manifest schema in the observed paths. Individua
 | `health.readiness` | No | Script probe configuration. For a start-only container with no explicit readiness protocol, `health.readiness.script` is executed inside the service container and blocks dependency startup until it succeeds or fails. The watchdog also uses the configuration later as a warning-oriented container health probe. |
 | `volumes` | No | Extra host-to-container mounts. Relative host paths are resolved against the workspace root; absolute host paths are honored as declared. Missing paths are created unless marked generated+required. |
 | `volumeOptions` | No | Per-container-path options for `volumes`: `generated`, `required`, numeric `chmod`, and `makeWorldWritableSubdirs`. |
-| `network` | No | Supports host mode or named networks with aliases for agent starts inside the managed runtime. Default Docker adds `host.docker.internal`; default Podman uses `slirp4netns:allow_host_loopback=true` when no manifest network is declared. |
+| `network` | No | Exact modes are `default`, `bridge`, `host`, and `none`. Omission means a private per-instance managed bridge. `bridge` requires logical `attachments` with exactly one primary; legacy `name`/`aliases` are rejected. Managed bridge modes use the exact host-gateway mapping and router env, `host` uses box loopback, and `none` receives no router endpoint. |
 | `containerSecurity.privileged` | No | Adds `--privileged` for container runtime when true. |
 | `mcp-config.json` beside manifest/code | No | Copied/synchronized into the persistent agent home, `.data/<agent-or-alias>/mcp-config.json`. Seatbelt writes a rewritten `.seatbelt` config in the same work directory. Default AgentServer also searches `/code/mcp-config.json`. |
 | `httpServices` | No | Router exposes service prefixes that proxy to the agent route using explicit `access: public`, `access: guest`, or `access: authenticated`. |
@@ -529,7 +547,22 @@ Podman uses a staging directory under `.ploinky/container-runtime/<container>`:
 
 Podman receives `NODE_OPTIONS=--preserve-symlinks --preserve-symlinks-main`. It also receives extra self-mounts for real symlink targets. Manifest volumes that target `/code/node_modules` are rejected. Writable Podman manifest volumes under `.ploinky/data/` are mounted with `:U` so non-root images can own their private runtime state; arbitrary external manifest volumes keep the normal `:z` suffix unless `volumeOptions.<containerPath>.podmanChown` opts in.
 
-Default Podman networking uses `slirp4netns:allow_host_loopback=true` and `--replace`. Default Docker networking adds `host.docker.internal:host-gateway`.
+Inside contract 4, managed `default` and `bridge` modes require rootless Podman
+5.4 or newer, Netavark, and operational `pasta`. There is no
+`slirp4netns` fallback. Each managed bridge is created with exact schema-2
+ownership labels and `isolate=true`; same-network peers can communicate by
+derived alias, cross-bridge direct-IP traffic is denied, and outbound egress is
+preserved. Containers receive exactly `--hosts-file=none --add-host
+host.containers.internal:host-gateway` plus the matching
+`PLOINKY_ROUTER_HOST`, `PLOINKY_ROUTER_PORT`, and `PLOINKY_ROUTER_URL`. `host`
+uses `127.0.0.1`; `none` receives no endpoint. Reuse validates the versioned
+network-contract hash and exact attachment/alias/hosts policy. An older hash
+remains foreign and is neither adopted nor recreated. Only exact-owned
+current-hash runtime drift may trigger recreation; the hash is never weakened.
+
+Network status uses schema version 3 and reports the managed networks and agent
+attachments directly. It has no gateway resource field. Restarting the router
+does not recreate or mutate schema-2 networks.
 
 ### Ports
 
@@ -589,11 +622,16 @@ ephemeral mappings for an implicit AgentServer or `additionalServerPort` remain
 separate private routes; they are not declared through `openPorts` and do not
 create an outer claim.
 
-Supported contract-2 boxes persist the publication-plan version and separate
+Supported contract-4 boxes persist the publication-plan version and separate
 ordered explicit/generated lists in labels. A new authoritative plan retains
 explicit values when the operator did not restate them and replaces stale
 generated values. Missing, malformed, or oversized provenance fails closed
 rather than inferring ownership from engine inspection.
+
+Every older runtime contract remains a hard failure before planning, pulling,
+volume creation, or mutation. There is no transition-source exception and no
+automatic replacement; explicit host destroy is required before a contract-4
+create can remount the retained named volumes.
 
 The supervisor passes the planned socket coverage to core on every forwarded
 one-shot command. Core repeats a coverage check immediately before any runtime
@@ -628,8 +666,9 @@ as every other root before core startup and readiness probing.
 Every Ploinky-created nested agent, helper, and sidecar container receives the
 exact ownership label `io.assistos.ploinky.managed=1`. On outer-box boot, the
 entrypoint removes running and stopped nested containers selected by that exact
-key/value. It leaves unlabelled, other-value, and near-name containers, nested
-images, and nested named volumes untouched. Enumeration or removal failure
+key/value, including old managed agent and gateway records. It leaves
+unlabelled, other-value, and near-name containers, nested images, nested named
+volumes, and valid schema-2 networks untouched. Enumeration or removal failure
 fails the box self-check. Manual containers have no Ploinky restart or repair
 guarantee.
 
@@ -785,7 +824,16 @@ For bwrap agents, monitor liveness checks process state and a separate bwrap hea
 
 ## Router and Agent Request Path
 
-The router is launched by `Watchdog.js`, not directly by the CLI foreground process. The watchdog writes logs, starts `RoutingServer.js`, health-checks `/health`, restarts the router process after repeated failures, and starts the container monitor.
+The router is launched by `Watchdog.js`, not directly by the CLI foreground
+process. `RoutingServer.js` listens explicitly on IPv4 `0.0.0.0`, while the
+watchdog health-checks `/health` over TCP through `127.0.0.1`, restarts the
+router process after repeated failures, and starts the container monitor. No
+Unix listener is created. Wildcard- or gateway-bound box services are reachable
+from managed bridges; box-loopback services and Unix sockets are not. Directly
+reachable services need their own authorization, while router-mediated MCP
+continues to enforce JWT issuer/audience, policy, request binding, expiry, and
+replay checks. The `ploinky-router` network alias is no longer reserved, though
+that string remains an authentication issuer/audience identity.
 
 ```mermaid
 sequenceDiagram

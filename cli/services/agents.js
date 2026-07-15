@@ -18,7 +18,9 @@ import {
 } from './docker/index.js';
 import { findAgent } from './utils.js';
 import { REPOS_DIR, PLOINKY_WORKSPACE_ROOT, ROUTING_FILE } from './config.js';
-import { getActiveProfile, getProfileConfig } from './profileService.js';
+import { resolveManifestRuntimeProfile } from './profileService.js';
+import { resolveRouterEndpoint } from './routerPort.js';
+import { mergeRuntimeRoute } from './routingFile.js';
 import {
     createAgentSymlinks,
     removeAgentSymlinks,
@@ -35,6 +37,11 @@ const AUTH_MODES = new Set(['none', 'local', 'pwd', 'sso', 'guest']);
 export const DEFAULT_ENABLE_AGENT_MODE = 'isolated';
 export const ENABLE_AGENT_MODES = Object.freeze(['isolated', 'global', 'devel']);
 const ENABLE_AGENT_MODE_SET = new Set(ENABLE_AGENT_MODES);
+
+export function preferredHostPortForNetworkMode(existingRoute, networkMode) {
+    if (String(networkMode || '').trim().toLowerCase() === 'none') return undefined;
+    return Number(existingRoute?.hostPort || 0) || undefined;
+}
 
 export function isEnableAgentMode(value) {
     return ENABLE_AGENT_MODE_SET.has(String(value || '').trim().toLowerCase());
@@ -269,14 +276,13 @@ export function enableAgent(agentName, mode, repoNameParam, aliasParam, authMode
         throw new Error('Use --user and --password together.');
     }
 
-    const coverageProfile = profile || getActiveProfile();
-    const coverageProfileConfig = manifest?.profiles && Object.keys(manifest.profiles).length
-        ? getProfileConfig(`${repoName}/${shortAgentName}`, coverageProfile)
-        : null;
-    if (manifest?.profiles && Object.keys(manifest.profiles).length && !coverageProfileConfig) {
-        throw new Error(`[profile] ${shortAgentName}: profile '${coverageProfile}' not found. Available: ${Object.keys(manifest.profiles).join(', ')}`);
-    }
-    assertOuterPublicationCoverageForManifest(manifest, coverageProfileConfig, {
+    const profileResolution = resolveManifestRuntimeProfile(manifest, {
+        agentName: `${repoName}/${shortAgentName}`,
+        profileName: profile || undefined,
+        path: `manifest(${repoName}/${shortAgentName})`,
+    });
+    const routerEndpoint = resolveRouterEndpoint(profileResolution.network.mode);
+    assertOuterPublicationCoverageForManifest(manifest, profileResolution.profileConfig, {
         ownerRef: `${repoName}/${shortAgentName}`,
         commandHint: `ploinky enable agent ${repoName}/${shortAgentName}${alias ? ` as ${alias}` : ''}`,
     });
@@ -374,7 +380,10 @@ export function enableAgent(agentName, mode, repoNameParam, aliasParam, authMode
     const routing = loadRoutingConfig();
     routing.routes = routing.routes || {};
     const existingRoute = routing.routes[routeKey] || {};
-    const preferredHostPort = Number(existingRoute.hostPort || 0) || undefined;
+    const preferredHostPort = preferredHostPortForNetworkMode(
+        existingRoute,
+        profileResolution.network.mode,
+    );
 
     for (const key of Object.keys(map)) {
         if (RESERVED_AGENT_KEYS.has(key)) continue;
@@ -409,28 +418,26 @@ export function enableAgent(agentName, mode, repoNameParam, aliasParam, authMode
             containerName,
             alias: alias || undefined,
             preferredHostPort,
-            profileName: profile || undefined
+            profileName: profileResolution.resolvedProfileName,
+            profileResolution,
+            routerEndpoint,
         });
     } catch (error) {
         throw new Error(`enable agent: failed to start '${shortAgentName}': ${error?.message || error}`);
     }
     verifyEnabledAgentStarted(shortAgentName, started?.containerName || containerName);
 
-    const hostPort = started?.hostPort || preferredHostPort || existingRoute.hostPort;
+    const hostPort = profileResolution.network.mode === 'none'
+        ? undefined
+        : started?.hostPort || preferredHostPort;
     const additionalServerPort = started?.additionalServerPort || null;
-    routing.routes[routeKey] = {
-        ...existingRoute,
+    routing.routes[routeKey] = mergeRuntimeRoute(existingRoute, {
         container: started?.containerName || containerName,
         hostPath: agentPath,
         repo: repoName,
         agent: shortAgentName,
         ...(alias ? { alias } : {}),
-        ...(hostPort ? { hostPort } : {}),
-        ...(additionalServerPort ? { additionalServerPort } : {})
-    };
-    if (!additionalServerPort) {
-        delete routing.routes[routeKey].additionalServerPort;
-    }
+    }, { hostPort, additionalServerPort });
     saveRoutingConfig(routing);
 
     return { containerName: started?.containerName || containerName, repoName, shortAgentName, alias: alias || undefined, auth: record.auth, runMode, hostPort };

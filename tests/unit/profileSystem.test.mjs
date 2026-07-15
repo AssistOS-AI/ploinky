@@ -38,6 +38,8 @@ const {
     getProfileEnvVars,
     getValidProfiles,
     isValidProfile,
+    resolveManifestProfile,
+    resolveManifestRuntimeProfile,
 } = profileService;
 
 const {
@@ -145,6 +147,59 @@ test('getProfileConfig lets active profile network replace default network', () 
 
     const config = getProfileConfig('repo-network/agent-network', 'prod');
     assert.deepStrictEqual(config.network, { mode: 'host' });
+});
+
+test('profile fallback resolves the default profile and its network atomically', () => {
+    const manifest = {
+        network: { mode: 'host' },
+        profiles: {
+            default: { env: { TARGET: 'default' }, network: { mode: 'none' } },
+            prod: { env: { TARGET: 'prod' }, network: { mode: 'host' } },
+        },
+    };
+
+    const resolution = resolveManifestProfile(manifest, 'missing-global-profile', {
+        agentName: 'repo/agent',
+    });
+
+    assert.equal(resolution.requestedProfileName, 'missing-global-profile');
+    assert.equal(resolution.resolvedProfileName, 'default');
+    assert.deepEqual(resolution.profileConfig, {
+        env: { TARGET: 'default' },
+        network: { mode: 'none' },
+    });
+    assert.deepEqual(resolution.network, { mode: 'none' });
+});
+
+test('explicit and persisted missing profiles fail instead of inheriting root network', () => {
+    const manifest = {
+        network: { mode: 'host' },
+        profiles: {
+            default: { network: { mode: 'none' } },
+        },
+    };
+
+    for (const selection of [
+        { profileName: 'missing-option' },
+        { persistedProfileName: 'missing-record' },
+    ]) {
+        assert.throws(
+            () => resolveManifestRuntimeProfile(manifest, {
+                agentName: 'repo/agent',
+                fallbackProfileName: 'default',
+                ...selection,
+            }),
+            (error) => error?.code === 'PLOINKY_PROFILE_NOT_FOUND',
+        );
+    }
+
+    assert.throws(
+        () => resolveManifestRuntimeProfile({ network: { mode: 'host' } }, {
+            agentName: 'repo/legacy-agent',
+            profileName: 'prod',
+        }),
+        (error) => error?.code === 'PLOINKY_PROFILE_NOT_FOUND',
+    );
 });
 
 test('getProfileConfig lets active profile additionalServerPort replace default additionalServerPort', () => {

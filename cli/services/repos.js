@@ -721,10 +721,7 @@ export function parseStartArgs(rawArgs) {
 
     if (positional.length >= 1) staticAgent = positional[0];
     if (positional.length >= 2) {
-        const candidate = Number(positional[1]);
-        if (!Number.isNaN(candidate) && candidate > 0) {
-            port = positional[1];
-        }
+        port = positional[1];
     }
 
     return {

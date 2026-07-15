@@ -1,8 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { pathToFileURL } from 'node:url';
 
 const originalCwd = process.cwd();
 const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-graph-'));
@@ -46,7 +48,11 @@ const workspaceUtilModuleUrl = new URL('../../cli/services/workspaceUtil.js', im
 const {
     buildBlockingReadinessEntryFromNode,
     ensureGraphNodesEnabled,
+    reinstallAgent,
     resolveGraphNodeExecutionRecord,
+    resolveManifestRouterEndpoint,
+    runCli,
+    runShell,
     startWorkspace,
     waitForReadinessEntries,
 } = await import(`${workspaceUtilModuleUrl.href}${moduleSuffix}`);
@@ -169,6 +175,112 @@ test('start workspace forwards each dependency registry profile to its synchrono
     );
 });
 
+test('blocking none-mode launches pass explicit null without forwarding a raw router port', () => {
+    assert.equal(resolveManifestRouterEndpoint({ network: { mode: 'none' } }, {
+        explicitPort: 'not-a-port',
+        path: 'manifest(demo/offline)',
+    }), null);
+
+    const source = startWorkspace.toString();
+    const launchStart = source.indexOf('const { containerName, hostPort, additionalServerPort } = ensureAgentService');
+    const launchEnd = source.indexOf('const executionMode = resolveAgentExecutionMode', launchStart);
+    assert.ok(launchStart >= 0 && launchEnd > launchStart, 'blocking service launch must remain discoverable');
+    const launch = source.slice(launchStart, launchEnd);
+    assert.match(launch, /routerEndpoint/);
+    assert.doesNotMatch(launch, /routerPort/);
+
+    const reinstall = reinstallAgent.toString();
+    assert.match(reinstall, /const routerPort = resolvePersistedRouterPort\(\)/);
+    assert.match(reinstall, /resolveManifestRouterEndpoint\(manifest, \{\s*explicitPort: routerPort,/);
+    assert.match(reinstall, /routerEndpoint,/);
+    assert.match(reinstall, /cfg\.port = routerPort/);
+    assert.match(reinstall, /if \(!isRouterUp\(routerPort\)\)/);
+    assert.doesNotMatch(reinstall, /if \(routerEndpoint && !isRouterUp/);
+});
+
+test('workspace publication preflights receive the already resolved router port', () => {
+    assert.match(
+        startWorkspace.toString(),
+        /preflightBoxPublicationForCommand\('start', preflightArgs, \{\s*routerPort: resolvedStartPort/,
+    );
+    for (const [command, fn] of [
+        ['cli', runCli],
+        ['shell', runShell],
+        ['reinstall', reinstallAgent],
+    ]) {
+        const source = fn.toString();
+        assert.match(source, /const routerPort = resolvePersistedRouterPort\(\)/);
+        assert.match(source, new RegExp(`preflightBoxPublicationForCommand\\('${command}'[\\s\\S]*?\\{ routerPort \\}\\)`));
+    }
+});
+
+test('workspace publication preflight reserves the resolved non-default router port', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-workspace-router-port-'));
+    try {
+        const reposDir = path.join(root, '.ploinky', 'repos');
+        for (const repo of ['basic', 'AchillesIDE', 'AchillesCLI', 'copilot-agents', 'demo']) {
+            fs.mkdirSync(path.join(reposDir, repo), { recursive: true });
+        }
+        const agentDir = path.join(reposDir, 'demo', 'root');
+        fs.mkdirSync(agentDir, { recursive: true });
+        fs.writeFileSync(path.join(agentDir, 'manifest.json'), JSON.stringify({
+            profiles: {
+                default: { openPorts: ['127.0.0.1:49123:7000'] },
+            },
+        }));
+        const marker = path.join(root, 'ploinky-box');
+        fs.writeFileSync(marker, '1\n');
+        const workspaceUrl = pathToFileURL(path.resolve(
+            new URL('../..', import.meta.url).pathname,
+            'cli/services/workspaceUtil.js',
+        )).href;
+        const script = `
+import fs from 'node:fs';
+import path from 'node:path';
+const { startWorkspace } = await import(${JSON.stringify(workspaceUrl)});
+let error = null;
+try { await startWorkspace('demo/root', '49123'); }
+catch (caught) { error = { code: caught.code || null, message: caught.message }; }
+const routingPath = path.join(process.cwd(), '.ploinky', 'routing.json');
+process.stdout.write(JSON.stringify({
+  error,
+  routingPort: fs.existsSync(routingPath) ? JSON.parse(fs.readFileSync(routingPath, 'utf8')).port : null,
+  agentsExists: fs.existsSync(path.join(process.cwd(), '.ploinky', 'agents.json')),
+  dataExists: fs.existsSync(path.join(process.cwd(), '.data')),
+}));`;
+        const result = spawnSync(process.execPath, ['--input-type=module', '-e', script], {
+            cwd: root,
+            env: {
+                ...process.env,
+                PLOINKY_WORKSPACE_ROOT: root,
+                PLOINKY_BOX_MARKER_PATH: marker,
+                PLOINKY_OUTER_PUBLICATION_CONTRACT: JSON.stringify({
+                    schemaVersion: 2,
+                    targets: [{ start: 49123, end: 49123, protocol: 'tcp' }],
+                    publishes: [],
+                }),
+                PLOINKY_MASTER_KEY: '7'.repeat(64),
+            },
+            encoding: 'utf8',
+        });
+
+        assert.equal(result.status, 0, result.stderr || result.stdout);
+        const output = JSON.parse(result.stdout);
+        assert.match(output.error?.message || '', /reserved outer router socket 49123\/tcp/);
+        assert.deepEqual({
+            routingPort: output.routingPort,
+            agentsExists: output.agentsExists,
+            dataExists: output.dataExists,
+        }, {
+            routingPort: 49123,
+            agentsExists: false,
+            dataExists: false,
+        });
+    } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+    }
+});
+
 test('startup config providers run before manifest directives can start dependencies', () => {
     const source = startWorkspace.toString();
     const prepareIndex = source.indexOf('prepareManifestRepositories');
@@ -180,7 +292,7 @@ test('startup config providers run before manifest directives can start dependen
     assert.ok(enableIndex > providerIndex, 'providers must finish before manifest enable directives start dependencies');
 });
 
-test('workspace router Unix listener is ready before first-use static agent startup', () => {
+test('workspace router TCP listener is ready before first-use static agent startup', () => {
     const source = startWorkspace.toString();
     const routerIndex = source.indexOf('await ensureRouterReadyForStart({');
     const enableIndex = source.indexOf('await enableAgent(staticAgentArg)');
@@ -188,8 +300,9 @@ test('workspace router Unix listener is ready before first-use static agent star
 
     assert.ok(lockIndex >= 0 && lockIndex < routerIndex, 'workspace start must suppress watchdog container reconciliation before router startup');
     assert.ok(routerIndex >= 0, 'workspace start must establish the router listener');
-    assert.ok(enableIndex > routerIndex, 'the first managed agent must not start before the router Unix listener');
-    assert.match(source, /Existing router listeners are ready; preserving their Unix socket/);
+    assert.ok(enableIndex > routerIndex, 'the first managed agent must not start before the router TCP listener');
+    assert.match(source, /Existing router TCP listener is ready/);
+    assert.doesNotMatch(source, /Unix socket|router\.sock/);
     assert.match(source, /finally\s*\{\s*releaseWorkspaceStartLock\(workspaceStartLock\)/);
 });
 

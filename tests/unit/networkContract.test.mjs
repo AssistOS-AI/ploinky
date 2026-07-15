@@ -1,15 +1,49 @@
 import assert from 'node:assert/strict';
+import crypto from 'node:crypto';
 import test from 'node:test';
 
 import {
+    assertHostSandboxNetworkCompatibility,
     assertNetworkStartupCompatibility,
     canonicalizeNetwork,
     deriveNetworkAlias,
     effectiveManifestNetwork,
     logicalNetworkAttachments,
+    networkContractHash,
     preflightNetworkAliases,
     validateManifestNetworks,
 } from '../../cli/services/networkContract.js';
+
+test('network contract hash hard-cuts to the box host-gateway runtime policy', () => {
+    const network = canonicalizeNetwork({ mode: 'default' });
+    const legacyHash = crypto.createHash('sha256').update(JSON.stringify({
+        schemaVersion: '2',
+        runtimePolicy: 'managed-hosts-v1',
+        network,
+    })).digest('hex');
+    assert.match(networkContractHash(network), /^[a-f0-9]{64}$/);
+    assert.notEqual(networkContractHash(network), legacyHash);
+});
+
+test('host sandboxes fail closed unless the effective network mode is host', () => {
+    assert.deepEqual(
+        assertHostSandboxNetworkCompatibility({ mode: 'host' }, { runtime: 'bwrap' }),
+        { mode: 'host' },
+    );
+
+    for (const network of [
+        undefined,
+        { mode: 'default' },
+        { mode: 'none' },
+        { mode: 'bridge', attachments: [{ name: 'private', primary: true }] },
+    ]) {
+        assert.throws(
+            () => assertHostSandboxNetworkCompatibility(network, { runtime: 'seatbelt' }),
+            (error) => error?.code === 'PLOINKY_NETWORK_CONTRACT_INVALID'
+                && /requires an explicit network\.mode 'host'/.test(error.message),
+        );
+    }
+});
 
 test('network contract canonicalizes only the four exact modes', () => {
     assert.deepEqual(canonicalizeNetwork(undefined), { mode: 'default' });
@@ -51,10 +85,10 @@ test('profile network omission inherits root and a profile block replaces it ato
     assert.equal(validateManifestNetworks(manifest), true);
 });
 
-test('alias derivation is deterministic, bounded, and reserves the router identity', () => {
+test('alias derivation is deterministic, bounded, and permits the former router transport name', () => {
     assert.equal(deriveNetworkAlias('Repo/My Agent'), 'repo-my-agent');
     assert.throws(() => deriveNetworkAlias('---'), /nonempty/);
-    assert.throws(() => deriveNetworkAlias('ploinky-router'), /reserved/);
+    assert.equal(deriveNetworkAlias('ploinky-router'), 'ploinky-router');
     assert.throws(() => deriveNetworkAlias('a'.repeat(64)), /longer than 63/);
     const first = logicalNetworkAttachments({ mode: 'default' }, 'Agent A', { instanceKey: 'repo/agent-a#canonical' });
     const second = logicalNetworkAttachments({ mode: 'default' }, 'Agent A', { instanceKey: 'repo/agent-a#alias:blue' });

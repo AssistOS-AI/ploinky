@@ -2,7 +2,6 @@ import crypto from 'crypto';
 
 export const NETWORK_MODES = Object.freeze(['default', 'none', 'host', 'bridge']);
 export const NETWORK_SCHEMA_VERSION = '2';
-export const RESERVED_NETWORK_ALIASES = Object.freeze(['ploinky-router']);
 
 const NETWORK_FIELDS = new Set(['mode', 'attachments']);
 const ATTACHMENT_FIELDS = new Set(['name', 'primary']);
@@ -106,7 +105,6 @@ export function deriveNetworkAlias(canonicalAgentId, { path = 'agent id' } = {})
         .replace(/^-+|-+$/g, '');
     if (!alias) fail(path, 'does not produce a nonempty network alias');
     if (alias.length > 63) fail(path, 'produces a network alias longer than 63 characters');
-    if (RESERVED_NETWORK_ALIASES.includes(alias)) fail(path, `network alias '${alias}' is reserved`);
     return alias;
 }
 
@@ -124,7 +122,7 @@ export function networkContractHash(network) {
     const canonical = canonicalizeNetwork(network, { path: 'network' });
     return crypto.createHash('sha256').update(JSON.stringify({
         schemaVersion: NETWORK_SCHEMA_VERSION,
-        runtimePolicy: 'managed-hosts-v1',
+        runtimePolicy: 'box-host-gateway-v1',
         network: canonical,
     })).digest('hex');
 }
@@ -162,6 +160,20 @@ export function assertNetworkStartupCompatibility(manifest, profileConfig, netwo
     }
     if (readinessIsNetworkDependent(manifest)) {
         fail(`${path}.network`, "mode 'none' rejects MCP/HTTP/TCP readiness");
+    }
+    return contract;
+}
+
+export function assertHostSandboxNetworkCompatibility(network, {
+    path = 'manifest.network',
+    runtime = 'host sandbox',
+} = {}) {
+    const contract = canonicalizeNetwork(network, { path });
+    if (contract.mode !== 'host') {
+        fail(
+            path,
+            `${runtime} requires an explicit network.mode 'host'; effective mode '${contract.mode}' is unsupported`,
+        );
     }
     return contract;
 }

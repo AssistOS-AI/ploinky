@@ -155,24 +155,6 @@ function runContainerScriptReadiness(agentName, containerName, manifestProbeConf
     return runProbeLoop(agentName, containerName, 'readiness', probe, options);
 }
 
-function restartContainer(agentName, containerName) {
-    const runtime = getRuntime();
-    postProbeLog('warn', `[probe] ${agentName}: restarting container ${containerName} after liveness failure...`);
-    const restartRes = spawnSync(
-        runtime,
-        ['restart', containerName],
-        { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }
-    );
-    if (restartRes.error || restartRes.status !== 0) {
-        const stderr = (restartRes.stderr || '').trim();
-        const message = restartRes.error?.message || stderr || `exit code ${restartRes.status}`;
-        throw new Error(`[probe] ${agentName}: failed to restart ${containerName}: ${message}`);
-    }
-    if (!waitForContainerRunning(containerName, 40, 250)) {
-        throw new Error(`[probe] ${agentName}: container ${containerName} failed to reach running state after restart.`);
-    }
-}
-
 function getLivenessState(containerName) {
     let state = LIVENESS_BACKOFF_STATE.get(containerName);
     if (!state) {
@@ -220,25 +202,19 @@ function ensureLiveness(agentName, containerName, probe) {
         state.startedAt = Date.now();
     }
 
-    while (true) {
-        const result = runProbeLoop(agentName, containerName, 'liveness', probe);
-        if (result.status === 'success') {
-            postProbeLog('info', `[probe] ${agentName}: liveness confirmed.`);
-            clearLivenessState(containerName);
-            return;
-        }
-
-        postProbeLog('warn', `[probe] ${agentName}: liveness probe failed (${result.reason}${result.detail ? `, output='${result.detail}'` : ''}).`);
-        maybeResetBackoff(agentName, state);
-
-        restartContainer(agentName, containerName);
-        state.retryCount += 1;
-        noteContainerStarted(containerName);
-
-        const backoffDelayMs = computeBackoffDelay(state);
-        postProbeLog('warn', `[probe] ${agentName}: CrashLoopBackOff waiting ${Math.round(backoffDelayMs / 1000)}s before next liveness probe (retry ${state.retryCount}).`);
-        sleepMs(backoffDelayMs);
+    const result = runProbeLoop(agentName, containerName, 'liveness', probe);
+    if (result.status === 'success') {
+        postProbeLog('info', `[probe] ${agentName}: liveness confirmed.`);
+        clearLivenessState(containerName);
+        return;
     }
+
+    maybeResetBackoff(agentName, state);
+    state.retryCount += 1;
+    const detail = `${result.reason}${result.detail ? `, output='${result.detail}'` : ''}`;
+    const error = new Error(`[probe] ${agentName}: liveness probe failed (${detail}); managed restart required`);
+    error.code = 'PLOINKY_LIVENESS_FAILED';
+    throw error;
 }
 
 function ensureReadiness(agentName, containerName, probe) {

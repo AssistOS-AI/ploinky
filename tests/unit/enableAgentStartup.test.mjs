@@ -1,13 +1,28 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { enableAgent, verifyEnabledAgentStarted } from '../../cli/services/agents.js';
+import {
+    enableAgent,
+    preferredHostPortForNetworkMode,
+    verifyEnabledAgentStarted,
+} from '../../cli/services/agents.js';
+import { mergeRuntimeRoute } from '../../cli/services/routingFile.js';
 
 test('enable agent forwards its selected explicit profile to the synchronous service launch', () => {
     assert.match(
         enableAgent.toString(),
-        /ensureAgentService\([\s\S]*?profileName:\s*profile\s*\|\|\s*undefined/,
+        /ensureAgentService\([\s\S]*?profileName:\s*profileResolution\.resolvedProfileName/,
     );
+});
+
+test('enable transition to none neither prefers nor retains the old routed host port', () => {
+    const existing = { container: 'old', hostPort: 32001, additionalServerPort: 32002 };
+    assert.equal(preferredHostPortForNetworkMode(existing, 'none'), undefined);
+    assert.deepEqual(mergeRuntimeRoute(existing, { container: 'new' }), { container: 'new' });
+    const source = enableAgent.toString();
+    assert.match(source, /preferredHostPortForNetworkMode/);
+    assert.match(source, /profileResolution\.network\.mode === 'none'/);
+    assert.match(source, /mergeRuntimeRoute/);
 });
 
 test('verifyEnabledAgentStarted logs when the enabled agent container is running', () => {

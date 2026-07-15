@@ -9,7 +9,7 @@ import {
     waitForReadinessEntries,
 } from '../../cli/services/workspaceUtil.js';
 
-function agentCliHarness({ noTTY = false } = {}) {
+function agentCliHarness({ noTTY = false, endpointError = null } = {}) {
     const events = [];
     const logs = [];
     let enabled = false;
@@ -39,6 +39,20 @@ function agentCliHarness({ noTTY = false } = {}) {
                 cli: '/Agent/default_cli.sh',
                 readiness: { protocol: 'mcp' },
             }),
+            resolveRouterEndpointForManifest: () => {
+                if (endpointError) throw endpointError;
+                return {
+                    mode: 'default',
+                    host: 'host.containers.internal',
+                    port: 49123,
+                    url: 'http://host.containers.internal:49123',
+                    env: {
+                        PLOINKY_ROUTER_HOST: 'host.containers.internal',
+                        PLOINKY_ROUTER_PORT: '49123',
+                        PLOINKY_ROUTER_URL: 'http://host.containers.internal:49123',
+                    },
+                };
+            },
             ensureAgentService: () => {
                 events.push(['ensure']);
                 return { containerName: 'nested-explorer', hostPort: 15517 };
@@ -292,4 +306,13 @@ test('runCli no-tty suppresses banners but preserves attachment', async () => {
     await runCliWithDependencies('explorer', [], harness.dependencies);
     assert.equal(harness.logs.some(line => line.startsWith('[ploinky]')), false);
     assert.ok(harness.events.some(event => event[0] === 'attach'));
+});
+
+test('runCli resolves the router endpoint before auto-enable mutation', async () => {
+    const harness = agentCliHarness({ endpointError: new Error('persisted router port is invalid') });
+    await assert.rejects(
+        runCliWithDependencies('explorer', [], harness.dependencies),
+        /persisted router port is invalid/,
+    );
+    assert.deepEqual(harness.events, []);
 });

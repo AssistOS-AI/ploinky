@@ -12,11 +12,13 @@ import { setTimeout as sleep } from 'node:timers/promises';
 import { plannerRequestForCommand } from '../cli/services/boxPublicationCoverage.js';
 import { showHelp } from '../cli/services/help.js';
 import { loadEnvFile } from '../cli/services/masterKey.js';
+import { parseRouterPort } from '../cli/services/routerPort.js';
 import { parseExplicitPublishSpec } from './publish-spec.mjs';
 import { createEngineClient } from './runtime-engine.mjs';
 import {
     IDENTITY_SCHEMA_LABEL,
     IDENTITY_SCHEMA_VERSION,
+    BOX_ROUTER_PORT,
     EXPLICIT_PUBLISHES_LABEL,
     GENERATED_PUBLISHES_LABEL,
     PATH_HASH_LABEL,
@@ -98,7 +100,7 @@ Outer options (must precede the command):
   --port N          Host port for the router (default 8080)
   --publish SPEC    Extra host-to-runtime publish; repeatable, same form as -p
   --expose SPEC     Alias for --publish; repeatable
-  --image I         Contract-3 runtime image (default ${DEFAULT_IMAGE})
+  --image I         Contract-4 runtime image (default ${DEFAULT_IMAGE})
   --mount DIR       Bind DIR read-write at /workspace/mounted
   --listen-lan      Publish the router on 0.0.0.0 instead of 127.0.0.1
   --dry-run         Print mutations instead of executing them
@@ -120,7 +122,7 @@ function optionAssignment(token, name) {
 export function parseHostInvocation(argv, _env = process.env) {
     const invocation = {
         engine: '',
-        port: '8080',
+        port: String(BOX_ROUTER_PORT),
         image: DEFAULT_IMAGE,
         mountDir: '',
         mountDirResolved: '',
@@ -597,11 +599,11 @@ function resultFailure(result) {
 
 export function assertRootlessPodmanEngine(engine) {
     if (!engine || engine.name !== 'podman') {
-        throw new SupervisorError('Ploinky runtime contract 3 requires rootless Podman; Docker and rootful Podman are unsupported');
+        throw new SupervisorError('Ploinky runtime contract 4 requires rootless Podman; Docker and rootful Podman are unsupported');
     }
     const result = engine.query(['info', '--format', '{{json .Host.Security.Rootless}}']);
     if (!result.ok || String(result.stdout || '').trim() !== 'true') {
-        throw new SupervisorError('Ploinky runtime contract 3 could not prove that the selected Podman engine is rootless');
+        throw new SupervisorError('Ploinky runtime contract 4 could not prove that the selected Podman engine is rootless');
     }
 }
 
@@ -1008,11 +1010,10 @@ function validatePublishSpecs(cfg) {
 }
 
 function validateHostPort(value, label) {
-    const raw = String(value || '').trim();
-    if (!/^\d+$/.test(raw)) die(`${label} must be a number, got '${value}'`);
-    const port = Number.parseInt(raw, 10);
-    if (!Number.isInteger(port) || port < 1 || port > 65535) {
-        die(`${label} must be between 1 and 65535, got '${value}'`);
+    try {
+        return String(parseRouterPort(value, { source: label }));
+    } catch (error) {
+        die(error?.message || String(error));
     }
 }
 
@@ -1077,8 +1078,7 @@ function parseProvenanceList(existing, label) {
 function publicationProvenance(existing) {
     if (!existing) return { explicitPublishes: [], generatedPublishes: [] };
     const observedVersion = existing.labels?.[PUBLISH_PLAN_VERSION_LABEL];
-    const supportedLegacy = existing.contract === '2' && observedVersion === '1';
-    if (observedVersion !== REQUIRED_PUBLISH_PLAN_VERSION && !supportedLegacy) {
+    if (observedVersion !== REQUIRED_PUBLISH_PLAN_VERSION) {
         die(`runtime '${existing.instance}' is unsupported: ${PUBLISH_PLAN_VERSION_LABEL} is missing or mismatched; run ploinky destroy explicitly`);
     }
     return {
@@ -1295,7 +1295,7 @@ async function executePublicationPlanner(cfg, request, existing) {
 
 function plannerRequestForHostCommand(cfg, command, args, existing) {
     let request = plannerRequestForCommand(command, args, {
-        routerPort: 8080,
+        routerPort: BOX_ROUTER_PORT,
     });
     if (
         !request
@@ -1305,7 +1305,7 @@ function plannerRequestForHostCommand(cfg, command, args, existing) {
         request = {
             schemaVersion: 2,
             operation: 'start',
-            routerPort: 8080,
+            routerPort: BOX_ROUTER_PORT,
             includeEnabled: true,
         };
     }
@@ -1332,7 +1332,7 @@ function applyRetainedPublicationState(cfg, existing) {
 }
 
 async function prepareHostPublicationPlan(cfg, command, args) {
-    validateHostPort(cfg.port, `${cfg.command || 'runtime'}: host port`);
+    cfg.port = validateHostPort(cfg.port, `${cfg.command || 'runtime'}: host port`);
     validatePublishSpecs(cfg);
     const existing = preflightExistingRuntimeBeforePlanning(cfg);
     const request = plannerRequestForHostCommand(cfg, command, args, existing);
@@ -1389,14 +1389,8 @@ function validateExistingRuntime(cfg, existing) {
     if (!image) {
         die(`runtime '${existing.instance}' is unsupported: its deployed image '${imageRef || '<missing>'}' cannot be inspected; run ploinky destroy explicitly`);
     }
-    const upgradeableContract2 = image.contract === '2';
     try {
-        validateImageContract(
-            upgradeableContract2
-                ? { ...image, contract: REQUIRED_RUNTIME_CONTRACT }
-                : image,
-            imageRef,
-        );
+        validateImageContract(image, imageRef);
     } catch (error) {
         die(`runtime '${existing.instance}' is unsupported: ${error.message}; run ploinky destroy explicitly`);
     }
@@ -1412,6 +1406,13 @@ function validateExistingRuntime(cfg, existing) {
     if (!existing.requestedImage) {
         die(`runtime '${existing.instance}' is unsupported: ${REQUESTED_IMAGE_LABEL} is missing; run ploinky destroy explicitly`);
     }
+    if (!existing.routerPublish) {
+        die(`runtime '${existing.instance}' is unsupported: required ${BOX_ROUTER_PORT}/tcp router publication is missing; run ploinky destroy explicitly`);
+    }
+    validateHostPort(
+        existing.routerPublish.hostPort,
+        `runtime '${existing.instance}' ${BOX_ROUTER_PORT}/tcp host port`,
+    );
     existing.contract = image.contract;
     existing.publicationProvenance = publicationProvenance(existing);
     return image;
@@ -1592,7 +1593,7 @@ function askLine(promptText) {
 }
 
 export async function reconcileRuntime(cfg, { fatalOnDepsDecline = false } = {}) {
-    validateHostPort(cfg.port, `${cfg.command || 'runtime'}: host port`);
+    cfg.port = validateHostPort(cfg.port, `${cfg.command || 'runtime'}: host port`);
     validatePublishSpecs(cfg);
     // Persist the engine's SELinux requirement in desired state so a container
     // created with label=disable converges instead of being replaced forever.
@@ -1755,9 +1756,9 @@ export async function replaceRuntimeTransaction({
             }
             runEngine(cfg, ['stop', existing.instance], { silence: 'all' });
         }
-        // Preserve the inspected container byte-for-byte. Contract-2 may be
-        // privileged and cannot be reconstructed by the contract-3 run-arg
-        // builder; renaming gives rollback the original object instead.
+        // Preserve the inspected container byte-for-byte during a supported
+        // current-contract configuration replacement. Renaming gives rollback
+        // the original object instead of reconstructing it from normalized args.
         runEngine(cfg, ['rename', existing.instance, backupName], { silence: 'all' });
         backupCreated = true;
         runEngine(cfg, buildRuntimeRunArgs(desired, engineOptions));
@@ -1820,7 +1821,7 @@ function splitPublicStartArgs(args, options = {}) {
     const raw = args.map(String);
     rejectStartTailPort(raw);
     let agent = '';
-    let hostPort = '';
+    let hostPort;
     let profile = 'default';
     let profileWasExplicit = false;
     const passthrough = [];
@@ -1873,7 +1874,7 @@ function splitPublicStartArgs(args, options = {}) {
             agent = arg;
             continue;
         }
-        if (!hostPort && /^\d+$/.test(arg)) {
+        if (hostPort === undefined) {
             hostPort = arg;
             continue;
         }
@@ -1888,7 +1889,7 @@ function splitPublicStartArgs(args, options = {}) {
         return {
             hasAgent: false,
             agent: '',
-            hostPort: '',
+            hostPort: undefined,
             profile,
             inBoxArgs: ['start', '--profile', profile, ...passthrough, ...implicitBranchArgs],
         };
@@ -1898,12 +1899,15 @@ function splitPublicStartArgs(args, options = {}) {
         agent,
         hostPort,
         profile,
-        inBoxArgs: ['start', agent, '8080', '--profile', profile, ...passthrough, ...implicitBranchArgs],
+        inBoxArgs: [
+            'start', agent, String(BOX_ROUTER_PORT),
+            '--profile', profile, ...passthrough, ...implicitBranchArgs,
+        ],
     };
 }
 
 function runtimeHostPort(cfg) {
-    const result = query(cfg, ['port', instanceName(cfg), '8080/tcp']);
+    const result = query(cfg, ['port', instanceName(cfg), `${BOX_ROUTER_PORT}/tcp`]);
     const first = result.stdout.split('\n')[0] || '';
     const index = first.lastIndexOf(':');
     return index === -1 ? '' : first.slice(index + 1).trim();
@@ -1917,11 +1921,15 @@ async function startGraph(cfg) {
         env: runtimeDependencies(cfg).env,
         sourceDir: cfg.sourceDirResolved,
     });
-    if (startPlan.hostPort) {
-        if (cfg.explicit.has('--port') && cfg.port !== startPlan.hostPort) {
-            die(`start: conflicting host ports (--port ${cfg.port} vs argument ${startPlan.hostPort}); give the port once`);
+    if (startPlan.hostPort !== undefined) {
+        const positionalPort = validateHostPort(startPlan.hostPort, 'start: positional host port');
+        if (cfg.explicit.has('--port')) {
+            const optionPort = validateHostPort(cfg.port, 'start: --port host port');
+            if (optionPort !== positionalPort) {
+                die(`start: conflicting host ports (--port ${optionPort} vs argument ${positionalPort}); give the port once`);
+            }
         }
-        cfg.port = startPlan.hostPort;
+        cfg.port = positionalPort;
         // A positional start port is the public equivalent of the outer
         // --port option and must participate in existing-box reconciliation.
         cfg.explicit.add('--port');
@@ -2255,9 +2263,10 @@ export function createRuntimeSupervisor(dependencies = {}) {
                         askLine: deps.askLine,
                     });
                 }
-                // Read-only lifecycle commands retain access to legacy boxes,
-                // but every start/reconcile path proves rootless Podman before
-                // publication planning, pulls, volume creation, or replacement.
+                // Read-only lifecycle commands retain access to incompatible
+                // boxes so an operator can inspect, stop, and explicitly destroy
+                // them. Every start/reconcile path proves the current contract
+                // and rootless Podman before planning or mutation.
                 assertRootlessPodmanEngine(context.client);
                 if (route.kind === 'start') return startGraph(invocation);
 

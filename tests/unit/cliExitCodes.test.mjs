@@ -59,7 +59,7 @@ test('one-shot start without initial configuration exits nonzero', (t) => {
     const result = runPloinky(t, ['start']);
 
     assert.notEqual(result.status, 0);
-    assert.match(`${result.stdout}\n${result.stderr}`, /missing static agent or port/);
+    assert.match(`${result.stdout}\n${result.stderr}`, /persisted router port is required/);
 });
 
 test('enable repo marks an installed repository as enabled', (t) => {

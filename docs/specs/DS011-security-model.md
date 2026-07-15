@@ -27,7 +27,14 @@ Some authenticated HTTP-service flows also require the router to carry the verif
 
 Agents are isolated from the host by containers, bubblewrap, or macOS Seatbelt. As of the per-agent identity model (DS013), each agent receives only its own canonical id `PLOINKY_AGENT_ID` and its own derived secret `PLOINKY_AGENT_SECRET`; the shared `PLOINKY_DERIVED_MASTER_KEY` is no longer injected for invocation signing. Code running inside an agent process that can read its environment can therefore forge tokens only for that agent (its own secret) — not for another agent, because it does not hold another agent's secret — and it still cannot decrypt the workspace stores or mint session JWTs, which use distinct derived subkeys the agent never sees. This restores non-repudiation between enabled agents within the single-workspace, operator-controlled trust model. The `derived-master` subkey is retained only as the root for agent-OWNED generated secrets (`generatedSecret`/`sharedGeneratedSecret`), not for request authorization. See DS013 for per-agent secret derivation and the three request-signed JWT families that replace the shared-HMAC invocation model.
 
-The router port is sensitive. The current server starts with `server.listen(port)` and logs a `127.0.0.1` URL, but the implementation does not explicitly pass a bind host. Operators who expose the port outside the local machine must provide network controls, TLS termination, and proxy policy appropriate for the deployment. Public-internet exposure is outside the implemented security assumptions unless additional controls are added.
+The router port is sensitive. `RoutingServer.js` binds explicitly to IPv4
+`0.0.0.0`, and readiness checks the listener over TCP at `127.0.0.1`. This is
+required for managed bridge agents to reach the router through the outer-box
+gateway mapping; it is not a public-exposure authorization decision. Operators
+who publish the port outside the local machine must provide network controls,
+TLS termination, and proxy policy appropriate for the deployment.
+Public-internet exposure is outside the implemented security assumptions unless
+additional controls are added.
 
 ### Workspace Key and Encrypted Storage
 
@@ -122,19 +129,31 @@ Container-published ports default to localhost when no explicit profile port map
 Within the outer runtime, every Ploinky-managed nested Podman bridge uses the
 exact `isolate=true` bridge option. Direct IP traffic between different managed
 bridges is denied; agents communicate privately only when their manifest graph
-places them on the same logical network. The managed router gateway is attached
-to each bridge as the deliberate route to Ploinky's Unix-socket listener, while
-normal outbound NAT remains available. An existing managed bridge that does not
-prove this exact isolation contract must be rejected rather than adopted.
-The gateway records its mounted router-socket device and inode in its exact
-ownership labels, so replacement of the Unix listener forces a deliberate
-gateway replacement instead of leaving agents connected to a retired socket.
+places them on the same logical network, while normal outbound NAT remains
+available. An existing managed bridge that does not prove the exact schema-2
+labels, isolation option, IPAM, DNS, driver, and ownership contract must be
+rejected rather than adopted. Router restart does not recreate or mutate a
+valid managed bridge.
 
-Managed agent containers receive a generated localhost-only `/etc/hosts` file
-through an exact read-only bind while engine-generated hosts entries are
-disabled. This removes broad `host.containers.internal` and equivalent aliases
-without disabling network DNS. Reuse validation treats any missing, writable,
-or engine-augmented hosts policy as network-contract drift.
+Managed `default` and `bridge` agent containers are created with exactly
+`--hosts-file=none --add-host host.containers.internal:host-gateway`. They
+receive the validated router host, port, and URL through environment variables;
+`host` agents use `127.0.0.1`, and `none` agents receive no router endpoint.
+Reuse validation treats any different hosts policy, attachment, alias, label,
+or network-contract hash as drift. An older hash remains foreign and is neither
+adopted nor recreated. Only exact-owned current-hash runtime drift may trigger
+recreation; the hash is never weakened. Contract-4 managed networking requires
+rootless Podman 5.4 or newer, Netavark, and operational `pasta`; no
+`slirp4netns` fallback exists.
+
+Wildcard- or gateway-bound services in the outer box are directly reachable
+from managed bridges. Loopback-only box services and Unix sockets are not.
+Direct reachability does not inherit router authentication; each such service
+must implement its own authorization. Calls that pass through the router,
+including MCP operations, retain JWT issuer/audience checks, tool policy,
+request-content binding, expiry, and replay protection. The former
+`ploinky-router` network-name reservation is gone, but `ploinky-router` remains
+the authentication issuer/audience identity defined by DS013.
 
 Bubblewrap agents clear the environment and then set only the constructed environment map. They bind system paths needed for execution as read-only, bind `/Agent` read-only, bind dependency caches read-only, bind code and skills according to profile policy, bind shared and workspace paths as writable where required, and apply read-only overlays to protected Ploinky state such as dependency caches, `.secrets`, profile, routing, server configuration, and staged runtime paths. Bubblewrap currently unshares PID but does not unshare network, because agents need network access and router reachability.
 
@@ -208,7 +227,12 @@ Containers, bubblewrap, and Seatbelt reduce host filesystem and process exposure
 ### Question #4: Why does the security model call out router network exposure as a deployment risk?
 
 Response:
-The router prints a localhost URL, but the current `RoutingServer.js` call does not pass an explicit hostname to `server.listen()`. The security posture therefore depends on host networking, firewall rules, container or process placement, and any reverse proxy. Documentation must be explicit that exposing the router port changes the threat model.
+The router deliberately binds IPv4 `0.0.0.0` inside its runtime namespace so
+managed bridge agents can reach it through the host-gateway mapping. Readiness
+still checks `127.0.0.1`, and host publication remains a separate explicit
+boundary. The security posture therefore depends on the selected runtime
+namespace, publication configuration, firewall rules, and reverse proxy;
+exposing the router port changes the threat model.
 
 ### Question #5: What unresolved hardening work is required before internet-facing production use?
 

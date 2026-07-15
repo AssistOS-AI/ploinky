@@ -7,42 +7,28 @@ import { spawnSync } from 'child_process';
 import { PLOINKY_DIR, PLOINKY_WORKSPACE_ROOT } from './config.js';
 import {
     NETWORK_SCHEMA_VERSION,
+    canonicalizeNetwork,
     deriveNetworkAlias,
     logicalNetworkAttachments,
     networkContractHash,
 } from './networkContract.js';
 
+export const NETWORK_STATUS_SCHEMA_VERSION = '3';
 export const NETWORK_LABELS = Object.freeze({
     managed: 'io.assistos.ploinky.managed',
     resource: 'io.assistos.ploinky.resource',
     schema: 'io.assistos.ploinky.network-schema',
     workspace: 'io.assistos.ploinky.workspace',
     logical: 'io.assistos.ploinky.logical',
-    routerSocket: 'io.assistos.ploinky.router-socket',
+    contract: 'io.assistos.ploinky.network-contract',
 });
-export const NETWORK_GATEWAY_IMAGE = 'docker.io/assistos/ploinky-network-gateway:1@sha256:68c47ce93d16ea1a2d03944f7b50ce82e6f2f9a26b183d2c9c7fbabcc828fb7e';
-export const NETWORK_GATEWAY_IMAGE_REF = NETWORK_GATEWAY_IMAGE;
 
-const PODMAN_DEFAULT_CAPABILITIES = Object.freeze([
-    'CHOWN',
-    'DAC_OVERRIDE',
-    'FOWNER',
-    'FSETID',
-    'KILL',
-    'NET_BIND_SERVICE',
-    'SETFCAP',
-    'SETGID',
-    'SETPCAP',
-    'SETUID',
-    'SYS_CHROOT',
-].sort());
-
+const MANAGED_HOST_NAME = 'host.containers.internal';
+const MANAGED_HOST_MAPPING = `${MANAGED_HOST_NAME}:host-gateway`;
 const LOCK_PATH = path.join(PLOINKY_DIR, 'run', 'network.lock');
 const LOCK_REAPER_SUFFIX = '.reaper';
 export const NETWORK_LOCK_STALE_GRACE_MS = 5_000;
 export const NETWORK_LOCK_WAIT_MS = 60_000;
-const ROUTER_SOCKET = path.join(PLOINKY_DIR, 'run', 'router.sock');
-const MINIMAL_HOSTS = path.join(PLOINKY_DIR, 'run', 'managed-hosts');
 
 function hash12(value) {
     return crypto.createHash('sha256').update(String(value)).digest('hex').slice(0, 12);
@@ -58,10 +44,6 @@ export function physicalNetworkName(workspaceHash, logicalName) {
     return `ploinky-nw-${workspaceHash}-${hash12(logicalName)}`;
 }
 
-export function gatewayContainerName(workspaceHash) {
-    return `ploinky-gw-${workspaceHash}`;
-}
-
 function expectedNetworkLabels(workspaceHash, logicalName) {
     return {
         [NETWORK_LABELS.managed]: '1',
@@ -72,15 +54,14 @@ function expectedNetworkLabels(workspaceHash, logicalName) {
     };
 }
 
-function expectedGatewayLabels(workspaceHash, routerSocketIdentity = '') {
-    const labels = {
+function expectedAgentLabels(workspaceHash, contractHash) {
+    return {
         [NETWORK_LABELS.managed]: '1',
-        [NETWORK_LABELS.resource]: 'gateway',
+        [NETWORK_LABELS.resource]: 'agent',
         [NETWORK_LABELS.schema]: NETWORK_SCHEMA_VERSION,
         [NETWORK_LABELS.workspace]: workspaceHash,
+        [NETWORK_LABELS.contract]: contractHash,
     };
-    if (routerSocketIdentity) labels[NETWORK_LABELS.routerSocket] = routerSocketIdentity;
-    return labels;
 }
 
 function firstRecord(raw, description) {
@@ -94,26 +75,7 @@ function firstRecord(raw, description) {
 }
 
 function labelsOf(record) {
-    return record.Labels || record.labels || record.Config?.Labels || {};
-}
-
-function canonicalDigestReference(reference) {
-    const value = String(reference || '');
-    const digestSeparator = value.lastIndexOf('@');
-    if (digestSeparator < 0) return value;
-    const name = value.slice(0, digestSeparator);
-    const lastSlash = name.lastIndexOf('/');
-    const tagSeparator = name.lastIndexOf(':');
-    const untaggedName = tagSeparator > lastSlash ? name.slice(0, tagSeparator) : name;
-    return `${untaggedName}${value.slice(digestSeparator)}`;
-}
-
-function representsAllCapabilitiesDropped(values) {
-    const normalized = (values || [])
-        .map((value) => String(value).toUpperCase().replace(/^CAP_/, ''))
-        .sort();
-    return (normalized.length === 1 && normalized[0] === 'ALL')
-        || JSON.stringify(normalized) === JSON.stringify(PODMAN_DEFAULT_CAPABILITIES);
+    return record?.Labels || record?.labels || record?.Config?.Labels || {};
 }
 
 function exactRuntimeAliases(record, explicitAlias) {
@@ -149,6 +111,24 @@ function assertExactLabels(name, observed, expected) {
             throw new Error(`resource '${name}' is foreign/unsupported: label ${key} expected '${value}', observed '${observed?.[key] ?? '<missing>'}'`);
         }
     }
+}
+
+function hasRequiredLabels(observed, expected) {
+    return Object.entries(expected).every(([key, value]) => String(observed?.[key] ?? '') === value);
+}
+
+function assertRequiredLabels(name, observed, expected) {
+    for (const [key, value] of Object.entries(expected)) {
+        if (String(observed?.[key] ?? '') !== value) {
+            throw new Error(`resource '${name}' is foreign/unsupported: label ${key} expected '${value}', observed '${observed?.[key] ?? '<missing>'}'`);
+        }
+    }
+}
+
+function containerRecordId(record, name) {
+    const id = String(record?.Id || record?.ID || '');
+    if (!id) throw new Error(`resource '${name}' is foreign/unsupported: immutable container ID is missing`);
+    return id;
 }
 
 function processAlive(pid) {
@@ -268,8 +248,12 @@ export function withNetworkLifecycleLock(callback, options = {}) {
             const contention = /already owned|already in progress|grace period|changed during stale-owner recovery|acquired during stale-owner recovery/i
                 .test(String(error?.message || error));
             if (!contention || Date.now() >= deadline) {
-                if (contention && waitMs > 0) {
-                    throw new Error(`timed out waiting ${waitMs}ms for network lifecycle serialization: ${error.message}`);
+                if (contention) {
+                    const lockError = new Error(waitMs > 0
+                        ? `timed out waiting ${waitMs}ms for network lifecycle serialization: ${error.message}`
+                        : `network lifecycle is busy: ${error.message}`);
+                    lockError.code = 'PLOINKY_NETWORK_LIFECYCLE_BUSY';
+                    throw lockError;
                 }
                 throw error;
             }
@@ -301,27 +285,134 @@ function missing(result) {
     return !result?.ok && /not found|no such|does not exist|no .* with name/i.test(`${result?.stderr || ''}\n${result?.stdout || ''}`);
 }
 
-function writeMinimalHostsFile(hostsPath = MINIMAL_HOSTS) {
-    fs.mkdirSync(path.dirname(hostsPath), { recursive: true, mode: 0o700 });
-    fs.writeFileSync(hostsPath, '127.0.0.1 localhost\n::1 localhost ip6-localhost ip6-loopback\n', { mode: 0o600 });
-    return hostsPath;
+function jsonScalar(value) {
+    const source = String(value || '').trim();
+    try { return String(JSON.parse(source)); } catch (_) { return source.replace(/^"|"$/g, ''); }
+}
+
+function versionAtLeast(value, minimumMajor, minimumMinor) {
+    const match = String(value || '').trim().match(/^v?(\d+)\.(\d+)(?:\.\d+)?(?:[-+].*)?$/);
+    if (!match) return false;
+    const major = Number(match[1]);
+    const minor = Number(match[2]);
+    return major > minimumMajor || (major === minimumMajor && minor >= minimumMinor);
+}
+
+function configFilesFromDirectory(directory) {
+    try {
+        return fs.readdirSync(directory)
+            .filter((name) => name.endsWith('.conf'))
+            .sort()
+            .map((name) => path.join(directory, name));
+    } catch (_) {
+        return [];
+    }
+}
+
+function effectiveContainersConfigFiles(env, explicitPaths) {
+    if (Array.isArray(explicitPaths)) return explicitPaths.map(String);
+    const override = String(env?.CONTAINERS_CONF_OVERRIDE || '').trim();
+    const selected = String(env?.CONTAINERS_CONF || '').trim();
+    const files = selected ? [selected] : [
+        '/usr/share/containers/containers.conf',
+        '/etc/containers/containers.conf',
+        ...configFilesFromDirectory('/etc/containers/containers.conf.d'),
+    ];
+    const configHome = String(env?.XDG_CONFIG_HOME || '').trim()
+        || (String(env?.HOME || '').trim() ? path.join(String(env.HOME), '.config') : '');
+    if (!selected && configHome) {
+        files.push(path.join(configHome, 'containers', 'containers.conf'));
+        files.push(...configFilesFromDirectory(path.join(configHome, 'containers', 'containers.conf.d')));
+    }
+    if (override) files.push(override);
+    return files;
+}
+
+function stripTomlComment(rawLine) {
+    let quote = '';
+    let escaped = false;
+    for (let index = 0; index < rawLine.length; index += 1) {
+        const character = rawLine[index];
+        if (escaped) {
+            escaped = false;
+            continue;
+        }
+        if (quote === '"' && character === '\\') {
+            escaped = true;
+            continue;
+        }
+        if (quote) {
+            if (character === quote) quote = '';
+            continue;
+        }
+        if (character === '"' || character === "'") quote = character;
+        else if (character === '#') return rawLine.slice(0, index);
+    }
+    return rawLine;
+}
+
+function effectiveHostsConfiguration(env, explicitPaths) {
+    let noHosts = false;
+    let hostGatewayDisabled = false;
+    for (const filePath of effectiveContainersConfigFiles(env, explicitPaths)) {
+        let source;
+        try { source = fs.readFileSync(filePath, 'utf8'); } catch (error) {
+            if (error?.code === 'ENOENT') continue;
+            throw new Error(`cannot read Podman containers configuration '${filePath}': ${error.message}`);
+        }
+        let section = '';
+        for (const rawLine of source.split(/\r?\n/)) {
+            const line = stripTomlComment(rawLine).trim();
+            const sectionMatch = line.match(/^\[([^\]]+)\]$/);
+            if (sectionMatch) {
+                section = sectionMatch[1].trim();
+                continue;
+            }
+            if (section === 'containers') {
+                const noHostsMatch = line.match(/^no_hosts\s*=\s*(true|false)\s*$/i);
+                if (noHostsMatch) noHosts = noHostsMatch[1].toLowerCase() === 'true';
+                const gatewayMatch = line.match(/^host_containers_internal_ip\s*=\s*["']([^"']*)["']\s*$/i);
+                if (gatewayMatch) hostGatewayDisabled = gatewayMatch[1].trim().toLowerCase() === 'none';
+            }
+        }
+    }
+    return { noHosts, hostGatewayDisabled };
+}
+
+function managedHostsPolicyIsExact(record) {
+    const hostConfig = record?.HostConfig || {};
+    return hostConfig.HostsFile === 'none'
+        && Array.isArray(hostConfig.ExtraHosts)
+        && hostConfig.ExtraHosts.length === 1
+        && hostConfig.ExtraHosts[0] === MANAGED_HOST_MAPPING;
+}
+
+function hasExactlyOneManagedHostEntry(contents) {
+    let count = 0;
+    for (const rawLine of String(contents || '').split(/\r?\n/)) {
+        const line = rawLine.replace(/#.*/, '').trim();
+        if (!line) continue;
+        const fields = line.split(/\s+/);
+        count += fields.slice(1).filter((name) => name === MANAGED_HOST_NAME).length;
+    }
+    return count === 1;
 }
 
 export function createNetworkLifecycleAdapter({
     runtime,
     run = defaultRun,
+    env = process.env,
     workspaceRoot = PLOINKY_WORKSPACE_ROOT,
     lockPath = LOCK_PATH,
-    routerSocket = ROUTER_SOCKET,
-    minimalHosts = MINIMAL_HOSTS,
-    gatewayImage = NETWORK_GATEWAY_IMAGE_REF,
-    probeGateway,
+    containersConfigPaths,
+    inspectRunningHosts,
 } = {}) {
     if (!runtime) throw new Error('network lifecycle requires a container runtime');
     const identity = workspaceNetworkIdentity(workspaceRoot);
     const execute = (args, options) => run(runtime, args, options);
     let rootlessPodmanVerified = false;
-    let selinuxEnabled = null;
+    let managedPodmanVerified = false;
+
     const inspectNetwork = (name) => {
         const result = execute(['network', 'inspect', name]);
         if (!result.ok) {
@@ -345,10 +436,59 @@ export function createNetworkLifecycleAdapter({
             throw new Error(`runtime '${runtime}' cannot prove the managed rootless bridge contract; rootless Podman is required`);
         }
         const result = execute(['info', '--format', '{{json .Host.Security.Rootless}}']);
-        if (!result.ok || String(result.stdout || '').trim() !== 'true') {
+        if (!result.ok || jsonScalar(result.stdout) !== 'true') {
             throw new Error(`runtime '${runtime}' cannot prove rootless Podman ownership; refusing managed network mutation`);
         }
         rootlessPodmanVerified = true;
+    }
+
+    function ensureManagedPodman() {
+        if (managedPodmanVerified) return;
+        ensureRootlessPodman();
+        const version = execute(['version', '--format', '{{.Server.Version}}']);
+        if (!version.ok || !versionAtLeast(jsonScalar(version.stdout), 5, 4)) {
+            throw new Error(`managed networking requires Podman server 5.4 or newer; observed '${jsonScalar(version.stdout) || failure(version)}'`);
+        }
+        const backend = execute(['info', '--format', '{{json .Host.NetworkBackend}}']);
+        if (!backend.ok || jsonScalar(backend.stdout).toLowerCase() !== 'netavark') {
+            throw new Error(`managed networking requires Netavark; observed '${jsonScalar(backend.stdout) || failure(backend)}'`);
+        }
+        const pasta = execute(['info', '--format', '{{json .Host.Pasta}}']);
+        let pastaRecord = null;
+        try { pastaRecord = JSON.parse(String(pasta.stdout || 'null')); } catch (_) {}
+        const pastaExecutable = String(pastaRecord?.executable || pastaRecord?.Executable || '').trim();
+        const pastaVersion = String(pastaRecord?.version || pastaRecord?.Version || '').trim();
+        if (!pasta.ok
+            || !pastaRecord
+            || typeof pastaRecord !== 'object'
+            || Array.isArray(pastaRecord)
+            || !pastaExecutable
+            || !pastaVersion) {
+            throw new Error(`managed networking requires operational pasta backend metadata: ${failure(pasta)}`);
+        }
+        const remoteService = execute(['info', '--format', '{{json .Host.ServiceIsRemote}}']);
+        const remoteServiceValue = jsonScalar(remoteService.stdout).toLowerCase();
+        if (!remoteService.ok || !['true', 'false'].includes(remoteServiceValue)) {
+            throw new Error(`managed networking cannot determine whether Podman is local or remote: ${failure(remoteService)}`);
+        }
+        if (remoteServiceValue === 'false') {
+            const pastaProbe = execute(['unshare', pastaExecutable, '--version']);
+            if (!pastaProbe.ok || !String(pastaProbe.stdout || '').trim()) {
+                throw new Error(`managed networking requires an operational pasta backend: ${failure(pastaProbe)}`);
+            }
+            const hostsConfiguration = effectiveHostsConfiguration(env, containersConfigPaths);
+            if (hostsConfiguration.noHosts) {
+                throw new Error("managed networking is incompatible with effective Podman containers.conf setting no_hosts=true");
+            }
+            if (hostsConfiguration.hostGatewayDisabled) {
+                throw new Error("managed networking is incompatible with host_containers_internal_ip='none'");
+            }
+        }
+        // A remote Podman service reads containers.conf on the server, not from
+        // this client. The managed transaction therefore verifies the exact
+        // HostConfig and running /etc/hosts entry after remote container creation
+        // and removes the candidate on any mismatch.
+        managedPodmanVerified = true;
     }
 
     function assertSupportedNetwork(record, name, labels) {
@@ -388,229 +528,28 @@ export function createNetworkLifecycleAdapter({
         }
     }
 
-    function hasExactMinimalHostsPolicy(record) {
-        const mounts = (record.Mounts || []).filter((mount) => mount?.Destination === '/etc/hosts');
-        if (mounts.length !== 1
-            || mounts[0]?.Type !== 'bind'
-            || mounts[0]?.Source !== minimalHosts
-            || mounts[0]?.RW === true) {
-            return false;
-        }
-        const createCommand = Array.isArray(record.Config?.CreateCommand)
-            ? record.Config.CreateCommand.map(String)
-            : [];
-        const noHosts = createCommand.filter((value) => value === '--no-hosts');
-        return noHosts.length === 1
-            && !createCommand.some((value) => value === '--hosts-file'
-                || value.startsWith('--hosts-file=')
-                || value === '--add-host'
-                || value.startsWith('--add-host='));
+    function expectedAttachments(network, canonicalAgentId, instanceKey) {
+        return logicalNetworkAttachments(network, canonicalAgentId, { instanceKey }).map((entry) => ({
+            name: physicalNetworkName(identity.hash, entry.name),
+            logicalName: entry.name,
+            primary: entry.primary === true,
+        }));
     }
 
-    function assertRouterSocket() {
-        if (!fs.existsSync(routerSocket)) {
-            throw new Error(`router gateway unavailable: Unix router listener is missing at ${routerSocket}`);
-        }
-        const socketStat = fs.lstatSync(routerSocket);
-        if (!socketStat.isSocket()) throw new Error(`router gateway unavailable: ${routerSocket} is not a Unix socket`);
-        if ((socketStat.mode & 0o777) !== 0o666) {
-            throw new Error(`router gateway unavailable: ${routerSocket} must be exactly chmod 0666 for the numeric gateway user`);
-        }
-        return `${socketStat.dev}:${socketStat.ino}`;
-    }
-
-    function inspectGatewayImage() {
-        return execute(['image', 'inspect', gatewayImage]);
-    }
-
-    function ensureGatewayImageAvailable() {
-        let image = inspectGatewayImage();
-        if (image.ok) return;
-        const pulled = execute(['pull', gatewayImage]);
-        if (!pulled.ok) {
-            throw new Error(`router gateway image '${gatewayImage}' is unavailable and exact pull failed: ${failure(pulled)}`);
-        }
-        image = inspectGatewayImage();
-        if (!image.ok) throw new Error(`router gateway image '${gatewayImage}' remained unavailable after exact pull`);
-    }
-
-    function assertGatewayForwardingDisabled(gateway, name) {
-        const configuredSysctls = gateway.HostConfig?.Sysctls;
-        if (configuredSysctls && Object.keys(configuredSysctls).length > 0) {
-            if (Object.keys(configuredSysctls).length !== 1
-                || String(configuredSysctls['net.ipv4.ip_forward'] ?? '') !== '0') {
-                throw new Error(`router gateway '${name}' is unsupported: exact IPv4 forwarding disablement is required`);
+    function validateExpectedBridges(network, canonicalAgentId, instanceKey, { requireExisting = false } = {}) {
+        return expectedAttachments(network, canonicalAgentId, instanceKey).map((entry) => {
+            const existing = inspectNetwork(entry.name);
+            if (!existing) {
+                if (requireExisting) throw new Error(`managed network '${entry.name}' is missing`);
+                return { ...entry, existed: false };
             }
-            return;
-        }
-
-        // Podman 5.8 no longer exposes Sysctls in HostConfig. Prove both the
-        // immutable create request and the live network namespace value.
-        const createCommand = Array.isArray(gateway.Config?.CreateCommand)
-            ? gateway.Config.CreateCommand.map(String)
-            : [];
-        const requestedSysctls = [];
-        for (let index = 0; index < createCommand.length; index += 1) {
-            if (createCommand[index] === '--sysctl') requestedSysctls.push(createCommand[index + 1] || '');
-            else if (createCommand[index].startsWith('--sysctl=')) requestedSysctls.push(createCommand[index].slice(9));
-        }
-        if (requestedSysctls.length !== 1 || requestedSysctls[0] !== 'net.ipv4.ip_forward=0') {
-            throw new Error(`router gateway '${name}' is unsupported: exact IPv4 forwarding disablement is required`);
-        }
-        const pid = Number(gateway.State?.Pid);
-        if (!Number.isInteger(pid) || pid < 1) {
-            throw new Error(`router gateway '${name}' cannot prove IPv4 forwarding disablement without a live container PID`);
-        }
-        let observed = execute([
-            'unshare', 'nsenter', '--target', String(pid), '--net',
-            'cat', '/proc/sys/net/ipv4/ip_forward',
-        ]);
-        if (!observed.ok && /remote podman client/i.test(failure(observed))) {
-            observed = execute([
-                'machine', 'ssh', 'podman', 'unshare',
-                'nsenter', '--target', String(pid), '--net',
-                'cat', '/proc/sys/net/ipv4/ip_forward',
-            ]);
-        }
-        if (!observed.ok || String(observed.stdout || '').trim() !== '0') {
-            throw new Error(`router gateway '${name}' is unsupported: live IPv4 forwarding is not disabled`);
-        }
-    }
-
-    function assertGatewayRecord(gateway, networks, needsLabelDisable, {
-        requireRunning = true,
-        allowMissingSocketIdentity = false,
-    } = {}) {
-        const name = gatewayContainerName(identity.hash);
-        const gatewayLabels = labelsOf(gateway);
-        const observedSocketIdentity = String(gatewayLabels[NETWORK_LABELS.routerSocket] || '');
-        if (!observedSocketIdentity && !allowMissingSocketIdentity) {
-            throw new Error(`router gateway '${name}' is unsupported: router socket identity label is required`);
-        }
-        assertExactLabels(
-            name,
-            gatewayLabels,
-            expectedGatewayLabels(identity.hash, observedSocketIdentity),
-        );
-        if (canonicalDigestReference(gateway.Config?.Image || gateway.ImageName)
-            !== canonicalDigestReference(gatewayImage)) {
-            throw new Error(`router gateway '${name}' has unexpected image '${gateway.Config?.Image || gateway.ImageName || '<missing>'}'`);
-        }
-        if (requireRunning && !(gateway.State?.Running === true || gateway.State?.Status === 'running')) {
-            throw new Error(`router gateway '${name}' is not running`);
-        }
-        if (gateway.HostConfig?.Privileged === true) {
-            throw new Error(`router gateway '${name}' is unsupported: privileged mode is forbidden`);
-        }
-        if (String(gateway.Config?.User || '') !== '65532:65532') {
-            throw new Error(`router gateway '${name}' is unsupported: exact numeric user 65532:65532 is required`);
-        }
-        const entrypoint = gateway.Config?.Entrypoint;
-        if (!Array.isArray(entrypoint) || entrypoint.length !== 1 || entrypoint[0] !== '/ploinky-network-gateway') {
-            throw new Error(`router gateway '${name}' is unsupported: fixed entrypoint is required`);
-        }
-        if (Array.isArray(gateway.Config?.Cmd) && gateway.Config.Cmd.length > 0) {
-            throw new Error(`router gateway '${name}' is unsupported: command arguments are forbidden`);
-        }
-        if (gateway.HostConfig?.ReadonlyRootfs !== true) {
-            throw new Error(`router gateway '${name}' is unsupported: read-only root filesystem is required`);
-        }
-        if (!representsAllCapabilitiesDropped(gateway.HostConfig?.CapDrop)) {
-            throw new Error(`router gateway '${name}' is unsupported: exact CapDrop=ALL is required`);
-        }
-        if ((gateway.HostConfig?.CapAdd || []).length > 0) {
-            throw new Error(`router gateway '${name}' is unsupported: added capabilities are forbidden`);
-        }
-        const securityOpts = (gateway.HostConfig?.SecurityOpt || []).map(String).sort();
-        const expectedSecurity = ['no-new-privileges', ...(needsLabelDisable ? ['label=disable'] : [])].sort();
-        if (JSON.stringify(securityOpts) !== JSON.stringify(expectedSecurity)) {
-            throw new Error(`router gateway '${name}' is unsupported: exact security options are required`);
-        }
-        assertGatewayForwardingDisabled(gateway, name);
-        const published = gateway.HostConfig?.PortBindings || gateway.NetworkSettings?.Ports || {};
-        if (Object.values(published).some((bindings) => Array.isArray(bindings) ? bindings.length > 0 : Boolean(bindings))) {
-            throw new Error(`router gateway '${name}' is unsupported: published ports are forbidden`);
-        }
-        const mounts = gateway.Mounts || [];
-        const configuredTmpfs = gateway.HostConfig?.Tmpfs || {};
-        const tmpfsValue = String(configuredTmpfs['/tmp'] || '');
-        const observedTmpfsOptions = tmpfsValue.split(',').filter(Boolean).sort();
-        const expectedTmpfsOptions = ['rw', 'noexec', 'nosuid', 'nodev', 'mode=1777'].sort();
-        const normalizedPodmanTmpfsOptions = [...expectedTmpfsOptions, 'rprivate', 'tmpcopyup'].sort();
-        const exactTmpfs = Object.keys(configuredTmpfs).length === 1
-            && [expectedTmpfsOptions, normalizedPodmanTmpfsOptions]
-                .some((expected) => JSON.stringify(observedTmpfsOptions) === JSON.stringify(expected));
-        if (!exactTmpfs) throw new Error(`router gateway '${name}' is unsupported: exact private /tmp tmpfs is required`);
-        const bindMounts = mounts.filter((mount) => mount?.Type !== 'tmpfs');
-        if (bindMounts.length !== 1
-            || bindMounts[0]?.Source !== routerSocket
-            || bindMounts[0]?.Destination !== '/run/ploinky/router.sock'
-            || bindMounts[0]?.RW === true) {
-            throw new Error(`router gateway '${name}' is unsupported: router socket must be its sole read-only mount`);
-        }
-        const attached = gateway.NetworkSettings?.Networks || {};
-        for (const [physicalName, networkRecord] of Object.entries(attached)) {
-            const inspected = inspectNetwork(physicalName);
-            if (!inspected) throw new Error(`router gateway '${name}' is attached to missing network '${physicalName}'`);
-            const logicalName = String(labelsOf(inspected)?.[NETWORK_LABELS.logical] || '');
-            if (!logicalName) throw new Error(`router gateway '${name}' is attached to unsupported network '${physicalName}' without a logical ownership label`);
-            assertSupportedNetwork(inspected, physicalName, expectedNetworkLabels(identity.hash, logicalName));
-            const aliases = [...(networkRecord?.Aliases || [])].map(String).sort();
-            if (JSON.stringify(aliases) !== JSON.stringify(exactRuntimeAliases(gateway, 'ploinky-router'))) {
-                throw new Error(`router gateway '${name}' has unsupported aliases on '${physicalName}'`);
-            }
-        }
-        for (const network of networks || []) {
-            if (!attached[network.name] && inspectNetwork(network.name)) {
-                throw new Error(`router gateway '${name}' is missing desired network '${network.name}'`);
-            }
-        }
-    }
-
-    function defaultGatewayProbe(gateway) {
-        const pid = Number(gateway.State?.Pid);
-        if (!Number.isInteger(pid) || pid < 1) return { ok: false, stderr: 'gateway has no live container PID' };
-        const script = `const net=require('node:net');const s=net.createConnection({host:process.argv[1],port:8080});`
-            + `const t=setTimeout(()=>{s.destroy();process.exit(2)},3000);`
-            + `s.on('connect',()=>s.write('GET /status HTTP/1.0\\r\\nHost: localhost\\r\\n\\r\\n'));`
-            + `s.on('data',()=>{clearTimeout(t);s.destroy();process.exit(0)});s.on('error',()=>process.exit(1));`;
-        // A rootless host process cannot generally route to the container bridge IP.
-        // Enter the rootless user's namespace, then the gateway network namespace,
-        // and exercise TCP 8080 -> the mounted Unix socket from loopback instead.
-        const local = execute([
-            'unshare', 'nsenter', '--target', String(pid), '--net',
-            process.execPath, '-e', script, '127.0.0.1',
-        ]);
-        if (local.ok || !/remote podman client/i.test(failure(local))) return local;
-        const remoteScript = "exec 3<>/dev/tcp/127.0.0.1/8080; "
-            + "printf 'GET /status HTTP/1.0\\r\\nHost: localhost\\r\\n\\r\\n' >&3; "
-            + "IFS= read -r -t 3 line <&3; [[ $line == HTTP/* ]]";
-        return execute([
-            'machine', 'ssh', 'podman', 'unshare',
-            'nsenter', '--target', String(pid), '--net',
-            'bash', '-lc', remoteScript,
-        ]);
-    }
-
-    function assertGatewayReady(gateway, networks) {
-        const result = (probeGateway || defaultGatewayProbe)(gateway, networks);
-        if (!result?.ok) throw new Error(`router gateway TCP 8080 to Unix socket probe failed: ${failure(result)}`);
-    }
-
-    function podmanSelinuxEnabled() {
-        ensureRootlessPodman();
-        if (selinuxEnabled !== null) return selinuxEnabled;
-        const result = execute(['info', '--format', '{{json .Host.Security.SELinuxEnabled}}']);
-        const value = String(result.stdout || '').trim();
-        if (!result.ok || !['true', 'false'].includes(value)) {
-            throw new Error(`runtime '${runtime}' cannot prove the SELinux state required by the gateway mount policy`);
-        }
-        selinuxEnabled = value === 'true';
-        return selinuxEnabled;
+            assertSupportedNetwork(existing, entry.name, expectedNetworkLabels(identity.hash, entry.logicalName));
+            return { ...entry, existed: true };
+        });
     }
 
     function ensureNetwork(logicalName) {
-        ensureRootlessPodman();
+        ensureManagedPodman();
         const name = physicalNetworkName(identity.hash, logicalName);
         const labels = expectedNetworkLabels(identity.hash, logicalName);
         const existing = inspectNetwork(name);
@@ -628,153 +567,68 @@ export function createNetworkLifecycleAdapter({
             assertSupportedNetwork(raced, name, labels);
             return { name, logicalName, created: false };
         }
-        const verified = inspectNetwork(name);
-        if (!verified) throw new Error(`managed network '${name}' disappeared after creation`);
-        assertSupportedNetwork(verified, name, labels);
-        return { name, logicalName, created: true };
-    }
-
-    function ensureGateway(networks) {
-        if (!Array.isArray(networks) || networks.length === 0) return null;
-        const needsLabelDisable = podmanSelinuxEnabled();
-        const socketIdentity = assertRouterSocket();
-        const image = inspectGatewayImage();
-        if (!image.ok) throw new Error(`router gateway image '${gatewayImage}' is unavailable; no fallback is permitted`);
-        const name = gatewayContainerName(identity.hash);
-        const labels = expectedGatewayLabels(identity.hash, socketIdentity);
-        let gateway = inspectContainer(name);
-        let created = false;
-        const connectionsCreated = [];
+        let verified;
+        let inspectionCompleted = false;
         try {
-        if (!gateway) {
-            const primary = networks.find((entry) => entry.primary) || networks[0];
-            const args = [
-                'run', '-d', '--name', name,
-                '--network', primary.name, '--network-alias', 'ploinky-router',
-                '--user', '65532:65532', '--entrypoint', '/ploinky-network-gateway',
-                '--read-only', '--cap-drop', 'ALL',
-                '--security-opt', 'no-new-privileges',
-                '--tmpfs', '/tmp:rw,noexec,nosuid,nodev,mode=1777',
-                '--sysctl', 'net.ipv4.ip_forward=0',
-                '-v', `${routerSocket}:/run/ploinky/router.sock:ro`,
-            ];
-            if (needsLabelDisable) args.push('--security-opt', 'label=disable');
-            for (const [key, value] of Object.entries(labels)) args.push('--label', `${key}=${value}`);
-            args.push(gatewayImage);
-            const started = execute(args);
-            if (!started.ok) throw new Error(`router gateway startup failed: ${failure(started)}`);
-            created = true;
-            gateway = inspectContainer(name);
-            if (!gateway) throw new Error(`router gateway '${name}' disappeared after startup`);
-        } else {
-            // Validate every existing attachment and immutable setting before
-            // adding a missing attachment to a newly-created desired network.
-            assertGatewayRecord(gateway, [], needsLabelDisable, { allowMissingSocketIdentity: true });
-            const observedSocketIdentity = String(labelsOf(gateway)[NETWORK_LABELS.routerSocket] || '');
-            if (observedSocketIdentity !== socketIdentity) {
-                const removed = execute(['rm', '-f', name]);
-                if (!removed.ok && !missing(removed)) {
-                    throw new Error(`could not replace exact-owned gateway '${name}' after router socket replacement: ${failure(removed)}`);
-                }
-                const replacement = ensureGateway(networks);
-                return { ...replacement, replaced: true };
-            }
-        }
-        const attached = gateway.NetworkSettings?.Networks || {};
-        for (const network of networks) {
-            if (attached[network.name]) continue;
-            const connected = execute(['network', 'connect', '--alias', 'ploinky-router', network.name, name]);
-            if (!connected.ok && !/already.*(connected|exists)/i.test(failure(connected))) {
-                throw new Error(`router gateway could not attach to '${network.name}': ${failure(connected)}`);
-            }
-            if (connected.ok) connectionsCreated.push(network.name);
-        }
-        const verified = inspectContainer(name);
-        if (!verified) throw new Error(`router gateway '${name}' disappeared during verification`);
-        assertGatewayRecord(verified, networks, needsLabelDisable);
-        try {
-            assertGatewayReady(verified, networks);
-        } catch (probeError) {
-            if (created) throw probeError;
-            // A router restart replaces the Unix socket inode. A bind-mounted
-            // exact socket cannot follow that replacement, so deliberately
-            // replace only the exact-owned gateway after its immutable record
-            // has passed validation and its end-to-end probe has failed.
-            const removed = execute(['rm', '-f', name]);
-            if (!removed.ok && !missing(removed)) {
-                throw new Error(`${probeError.message}; could not remove unhealthy exact-owned gateway '${name}': ${failure(removed)}`);
-            }
-            const replacement = ensureGateway(networks);
-            return { ...replacement, replaced: true };
-        }
-        return { name, created, connectionsCreated };
+            verified = inspectNetwork(name);
+            inspectionCompleted = true;
+            if (!verified) throw new Error(`managed network '${name}' disappeared after creation`);
+            assertSupportedNetwork(verified, name, labels);
         } catch (error) {
-            if (created) {
-                const removed = execute(['rm', '-f', name]);
-                if (!removed.ok && !missing(removed)) error.message += `; rollback preserved gateway '${name}': ${failure(removed)}`;
-            } else {
-                for (const networkName of [...connectionsCreated].reverse()) {
-                    execute(['network', 'disconnect', networkName, name]);
+            const exactOwned = !verified || hasExactLabels(labelsOf(verified), labels);
+            if (inspectionCompleted && exactOwned) {
+                const removed = execute(['network', 'rm', name]);
+                if (!removed.ok && !missing(removed)) {
+                    error.message += `; cleanup preserved '${name}': ${failure(removed)}`;
                 }
+            } else if (inspectionCompleted) {
+                error.message += `; cleanup preserved '${name}': exact ownership labels could not be verified`;
+            } else {
+                error.message += `; cleanup preserved '${name}': post-create inspection did not complete`;
             }
             throw error;
         }
+        return { name, logicalName, created: true };
     }
 
     function preflight(network, canonicalAgentId, { instanceKey = canonicalAgentId } = {}) {
+        const contract = canonicalizeNetwork(network, { path: 'network' });
         const alias = deriveNetworkAlias(canonicalAgentId);
-        const logical = logicalNetworkAttachments(network, canonicalAgentId, { instanceKey });
-        if (network.mode === 'none') {
-            return { mode: 'none', alias, args: ['--network', 'none'], attachments: [], routerEnv: {} };
+        if (contract.mode === 'none') {
+            return { mode: 'none', alias, args: ['--network', 'none'], attachments: [] };
         }
-        if (network.mode === 'host') {
-            return { mode: 'host', alias, args: ['--network', 'host'], attachments: [], routerEnv: null };
+        if (contract.mode === 'host') {
+            return { mode: 'host', alias, args: ['--network', 'host'], attachments: [] };
         }
-        ensureRootlessPodman();
-        const needsLabelDisable = podmanSelinuxEnabled();
-        const socketIdentity = assertRouterSocket();
-        const attachments = logical.map((entry) => {
-            const name = physicalNetworkName(identity.hash, entry.name);
-            const existing = inspectNetwork(name);
-            if (existing) assertSupportedNetwork(existing, name, expectedNetworkLabels(identity.hash, entry.name));
-            return { name, logicalName: entry.name, primary: entry.primary === true, existed: Boolean(existing) };
-        });
-        const existingGateway = inspectContainer(gatewayContainerName(identity.hash));
-        if (existingGateway) {
-            // Validate the immutable record and every current attachment here.
-            // A desired network may already exist without being attached after
-            // an outer-runtime replacement or a concurrent serialized launch;
-            // ensureGateway adds and verifies that missing attachment later.
-            assertGatewayRecord(existingGateway, [], needsLabelDisable, { allowMissingSocketIdentity: true });
-            const observedSocketIdentity = String(labelsOf(existingGateway)[NETWORK_LABELS.routerSocket] || '');
-            if (observedSocketIdentity === socketIdentity) {
-                assertGatewayReady(existingGateway, attachments.filter((entry) => entry.existed));
-            }
-        }
+        ensureManagedPodman();
         return {
-            mode: network.mode,
+            mode: contract.mode,
             alias,
-            attachments,
-            routerEnv: {
-                PLOINKY_ROUTER_PORT: '8080',
-                PLOINKY_ROUTER_HOST: 'ploinky-router',
-                PLOINKY_ROUTER_URL: 'http://ploinky-router:8080',
-            },
-            gatewayImageAvailable: inspectGatewayImage().ok,
+            attachments: validateExpectedBridges(contract, canonicalAgentId, instanceKey),
         };
     }
 
     function rollbackResources(plan, error) {
-        const gatewayPlan = plan?.gateway;
-        if (gatewayPlan?.created) {
-            const removed = execute(['rm', '-f', gatewayPlan.name]);
-            if (!removed.ok && !missing(removed)) error.message += `; rollback preserved gateway '${gatewayPlan.name}': ${failure(removed)}`;
-        } else {
-            for (const networkName of [...(gatewayPlan?.connectionsCreated || [])].reverse()) {
-                execute(['network', 'disconnect', networkName, gatewayPlan.name]);
-            }
-        }
         for (const entry of [...(plan?.created || [])].reverse()) {
+            let inspected;
+            try {
+                inspected = inspectNetwork(entry.name);
+            } catch (inspectionError) {
+                error.message += `; rollback could not inspect '${entry.name}': ${inspectionError.message}`;
+                continue;
+            }
+            if (!inspected) continue;
+            try {
+                assertSupportedNetwork(inspected, entry.name, expectedNetworkLabels(identity.hash, entry.logicalName));
+            } catch (inspectionError) {
+                error.message += `; rollback preserved '${entry.name}': ${inspectionError.message}`;
+                continue;
+            }
+            const containers = inspected.Containers || inspected.containers || {};
+            if (Object.keys(containers).length > 0) {
+                error.message += `; rollback preserved in-use network '${entry.name}'`;
+                continue;
+            }
             const removed = execute(['network', 'rm', entry.name]);
             if (!removed.ok && !missing(removed)) error.message += `; rollback preserved '${entry.name}': ${failure(removed)}`;
         }
@@ -782,25 +636,21 @@ export function createNetworkLifecycleAdapter({
 
     function prepareFromPreflight(checked) {
         if (!['default', 'bridge'].includes(checked.mode)) return { ...checked, created: [] };
-        const created = [];
-        const plan = { ...checked, created, gateway: null };
+        const plan = { ...checked, created: [] };
         try {
-            const attachments = checked.attachments.map((entry) => {
+            plan.attachments = checked.attachments.map((entry) => {
                 const ensured = ensureNetwork(entry.logicalName);
-                if (ensured.created) created.push(ensured);
+                if (ensured.created) plan.created.push(ensured);
                 return { ...ensured, primary: entry.primary };
             });
-            plan.attachments = attachments;
-            plan.gateway = ensureGateway(attachments);
-            const primary = attachments.find((entry) => entry.primary) || attachments[0];
-            return Object.assign(plan, {
-                args: [
-                    '--network', primary.name,
-                    '--network-alias', checked.alias,
-                    '--no-hosts',
-                    '--volume', `${writeMinimalHostsFile(minimalHosts)}:/etc/hosts:ro`,
-                ],
-            });
+            const primary = plan.attachments.find((entry) => entry.primary) || plan.attachments[0];
+            plan.args = [
+                '--network', primary.name,
+                '--network-alias', checked.alias,
+                '--hosts-file=none',
+                '--add-host', MANAGED_HOST_MAPPING,
+            ];
+            return plan;
         } catch (error) {
             rollbackResources(plan, error);
             throw error;
@@ -808,49 +658,108 @@ export function createNetworkLifecycleAdapter({
     }
 
     function prepare(network, canonicalAgentId, options = {}) {
-        const checked = preflight(network, canonicalAgentId, options);
-        if (['default', 'bridge'].includes(checked.mode) && !checked.gatewayImageAvailable) ensureGatewayImageAvailable();
-        return prepareFromPreflight(checked);
+        return prepareFromPreflight(preflight(network, canonicalAgentId, options));
     }
 
-    function reconcileManagedControlPlane(network, canonicalAgentId, options = {}) {
-        return withNetworkLifecycleLock(() => {
-            const checked = preflight(network, canonicalAgentId, options);
-            if (!['default', 'bridge'].includes(checked.mode)) {
-                throw new Error(`managed control-plane reconciliation cannot run network mode '${checked.mode}'`);
+    function readRunningHosts(containerId) {
+        if (typeof inspectRunningHosts === 'function') {
+            const observed = inspectRunningHosts(containerId);
+            if (typeof observed === 'string') return { supported: true, contents: observed };
+            if (observed?.ok) return { supported: true, contents: String(observed.stdout || '') };
+            if (observed === null || observed?.supported === false) {
+                return { supported: false, contents: '' };
             }
-            if (!checked.gatewayImageAvailable) ensureGatewayImageAvailable();
-            const attachments = checked.attachments.map((entry) => ({
-                ...ensureNetwork(entry.logicalName),
-                primary: entry.primary,
-            }));
-            return ensureGateway(attachments);
-        }, { lockPath, waitMs: NETWORK_LOCK_WAIT_MS });
+            throw new Error(`cannot inspect running container hosts for '${containerId}'`);
+        }
+        const observed = execute(['exec', containerId, 'cat', '/etc/hosts']);
+        if (!observed.ok) {
+            throw new Error(`cannot inspect running container hosts for '${containerId}': ${failure(observed)}`);
+        }
+        return { supported: true, contents: String(observed.stdout || '') };
     }
 
-    function finalizeContainer(containerName, plan) {
+    function assertManagedContainerRecord(record, containerName, plan, expectedLabels, expectedContainerId = '') {
+        const id = containerRecordId(record, containerName);
+        if (expectedContainerId && id !== expectedContainerId) {
+            throw new Error(`container '${containerName}' changed identity during managed verification`);
+        }
+        assertRequiredLabels(containerName, labelsOf(record), expectedLabels);
+        if (!managedHostsPolicyIsExact(record)) {
+            throw new Error(`container '${containerName}' has unsupported managed hosts policy`);
+        }
+        const attached = record.NetworkSettings?.Networks || {};
+        const expectedNames = (plan.attachments || []).map((entry) => entry.name).sort();
+        if (JSON.stringify(Object.keys(attached).sort()) !== JSON.stringify(expectedNames)) {
+            throw new Error(`container '${containerName}' network attachment set is unsupported`);
+        }
+        for (const attachment of plan.attachments || []) {
+            const observedAliases = [...(attached[attachment.name]?.Aliases || [])].map(String).sort();
+            if (JSON.stringify(observedAliases) !== JSON.stringify(exactRuntimeAliases(record, plan.alias))) {
+                throw new Error(`container '${containerName}' alias verification failed for '${attachment.name}'`);
+            }
+        }
+        return id;
+    }
+
+    function finalizeContainer(containerName, plan, {
+        expectedContainerId = '',
+        expectedLabels = null,
+    } = {}) {
+        if (!expectedContainerId && !expectedLabels) {
+            try {
+                for (const attachment of plan.attachments?.filter((entry) => !entry.primary) || []) {
+                    const result = execute(['network', 'connect', '--alias', plan.alias, attachment.name, containerName]);
+                    if (!result.ok) throw new Error(`cannot attach '${containerName}' to '${attachment.name}': ${failure(result)}`);
+                }
+                const started = execute(['start', containerName], { inherit: true });
+                if (!started.ok) throw new Error(`cannot start '${containerName}': ${failure(started)}`);
+            } catch (error) {
+                execute(['rm', '-f', containerName]);
+                throw error;
+            }
+            return;
+        }
+
+        let ownedContainerId = expectedContainerId;
         try {
+            const initial = inspectContainer(containerName);
+            if (!initial) throw new Error(`container '${containerName}' disappeared after creation`);
+            ownedContainerId = containerRecordId(initial, containerName);
+            if (expectedContainerId && ownedContainerId !== expectedContainerId) {
+                throw new Error(`container '${containerName}' changed identity after creation`);
+            }
+            assertRequiredLabels(containerName, labelsOf(initial), expectedLabels);
+            if (!managedHostsPolicyIsExact(initial)) {
+                throw new Error(`container '${containerName}' has unsupported managed hosts policy`);
+            }
             for (const attachment of plan.attachments?.filter((entry) => !entry.primary) || []) {
-                const result = execute(['network', 'connect', '--alias', plan.alias, attachment.name, containerName]);
+                const result = execute(['network', 'connect', '--alias', plan.alias, attachment.name, ownedContainerId]);
                 if (!result.ok) throw new Error(`cannot attach '${containerName}' to '${attachment.name}': ${failure(result)}`);
             }
-            if ((plan.attachments || []).length > 0) {
-                const inspected = inspectContainer(containerName);
-                for (const attachment of plan.attachments || []) {
-                    const networkRecord = inspected?.NetworkSettings?.Networks?.[attachment.name];
-                    if (!networkRecord) {
-                        throw new Error(`container '${containerName}' network verification failed for '${attachment.name}'`);
-                    }
-                    const observedAliases = [...(networkRecord.Aliases || [])].map(String).sort();
-                    if (JSON.stringify(observedAliases) !== JSON.stringify(exactRuntimeAliases(inspected, plan.alias))) {
-                        throw new Error(`container '${containerName}' alias verification failed for '${attachment.name}'`);
-                    }
+            const configured = inspectContainer(ownedContainerId);
+            if (!configured) throw new Error(`container '${containerName}' disappeared during network verification`);
+            assertManagedContainerRecord(configured, containerName, plan, expectedLabels, ownedContainerId);
+            const started = execute(['start', ownedContainerId], { inherit: true });
+            if (!started.ok) throw new Error(`cannot start '${containerName}': ${failure(started)}`);
+            const running = inspectContainer(ownedContainerId);
+            if (!running || !(running.State?.Running === true || running.State?.Status === 'running')) {
+                throw new Error(`container '${containerName}' did not reach running state`);
+            }
+            assertManagedContainerRecord(running, containerName, plan, expectedLabels, ownedContainerId);
+            const hosts = readRunningHosts(ownedContainerId);
+            if (hosts.supported && !hasExactlyOneManagedHostEntry(hosts.contents)) {
+                throw new Error(`container '${containerName}' must have exactly one ${MANAGED_HOST_NAME} entry`);
+            }
+        } catch (error) {
+            if (ownedContainerId) {
+                let current = null;
+                try { current = inspectContainer(ownedContainerId); } catch (_) {}
+                if (current
+                    && String(current?.Id || current?.ID || '') === ownedContainerId
+                    && hasRequiredLabels(labelsOf(current), expectedLabels)) {
+                    execute(['rm', '-f', ownedContainerId]);
                 }
             }
-            const started = execute(['start', containerName], { inherit: true });
-            if (!started.ok) throw new Error(`cannot start '${containerName}': ${failure(started)}`);
-        } catch (error) {
-            execute(['rm', '-f', containerName]);
             throw error;
         }
     }
@@ -861,41 +770,54 @@ export function createNetworkLifecycleAdapter({
         instanceKey = canonicalAgentId,
         containerName,
         createContainer,
+        networkLockWaitMs = NETWORK_LOCK_WAIT_MS,
     }) {
         if (typeof createContainer !== 'function') throw new Error('managed container transaction requires createContainer');
         return withNetworkLifecycleLock(() => {
-            // This entire read/validate/remove/create/start sequence is one lock
-            // ownership epoch. In particular, unsupported legacy port/profile
-            // input must have been parsed by the caller before entering it.
             const checked = preflight(network, canonicalAgentId, { instanceKey });
             if (!['default', 'bridge'].includes(checked.mode)) {
                 throw new Error(`managed container transaction cannot run network mode '${checked.mode}'`);
             }
-            // Pull the one exact pinned reference only after pure validation and
-            // before any existing container, network, or gateway is mutated.
-            if (!checked.gatewayImageAvailable) ensureGatewayImageAvailable();
-            let plan = null;
+            const agentLabels = expectedAgentLabels(identity.hash, networkContractHash(network));
             const previous = inspectContainer(containerName);
+            let previousId = '';
+            if (previous) {
+                assertRequiredLabels(containerName, labelsOf(previous), agentLabels);
+                previousId = containerRecordId(previous, containerName);
+            }
             const previousWasRunning = previous?.State?.Running === true || previous?.State?.Status === 'running';
             const backupName = `${containerName}-network-rollback-${randomUUID().slice(0, 12)}`;
             let backupCreated = false;
             let candidateCreationAttempted = false;
+            let plan = null;
             try {
                 if (previous) {
+                    const current = inspectContainer(containerName);
+                    if (!current || containerRecordId(current, containerName) !== previousId) {
+                        throw new Error(`resource '${containerName}' changed identity before managed replacement`);
+                    }
+                    assertRequiredLabels(containerName, labelsOf(current), agentLabels);
                     if (previousWasRunning) {
-                        const stopped = execute(['stop', containerName]);
+                        const stopped = execute(['stop', previousId]);
                         if (!stopped.ok) throw new Error(`cannot stop '${containerName}' for managed replacement: ${failure(stopped)}`);
                     }
-                    const renamed = execute(['rename', containerName, backupName]);
+                    const renamed = execute(['rename', previousId, backupName]);
                     if (!renamed.ok) throw new Error(`cannot preserve '${containerName}' for managed replacement: ${failure(renamed)}`);
                     backupCreated = true;
                 }
                 plan = prepareFromPreflight(checked);
                 candidateCreationAttempted = true;
                 createContainer(plan);
-                finalizeContainer(containerName, plan);
+                const candidate = inspectContainer(containerName);
+                if (!candidate) throw new Error(`managed candidate '${containerName}' disappeared after creation`);
+                assertRequiredLabels(containerName, labelsOf(candidate), agentLabels);
+                const candidateId = containerRecordId(candidate, containerName);
+                finalizeContainer(containerName, plan, {
+                    expectedContainerId: candidateId,
+                    expectedLabels: agentLabels,
+                });
                 if (backupCreated) {
-                    const committed = execute(['rm', '-f', backupName]);
+                    const committed = execute(['rm', '-f', previousId]);
                     if (!committed.ok && !missing(committed)) {
                         throw new Error(`cannot commit managed replacement by removing preserved '${backupName}': ${failure(committed)}`);
                     }
@@ -907,37 +829,51 @@ export function createNetworkLifecycleAdapter({
                 try { candidate = inspectContainer(containerName); } catch (inspectError) {
                     error.message += `; rollback could not inspect candidate '${containerName}': ${inspectError.message}`;
                 }
-                const candidateLabels = labelsOf(candidate || {});
                 if (candidateCreationAttempted
                     && candidate
-                    && String(candidateLabels['io.assistos.ploinky.workspace'] || '') === identity.hash
-                    && String(candidateLabels['io.assistos.ploinky.network-contract'] || '') === networkContractHash(network)) {
-                    const removed = execute(['rm', '-f', containerName]);
-                    if (!removed.ok && !missing(removed)) error.message += `; rollback could not remove candidate '${containerName}': ${failure(removed)}`;
+                    && hasRequiredLabels(labelsOf(candidate), agentLabels)) {
+                    const candidateId = String(candidate?.Id || candidate?.ID || '');
+                    if (!candidateId) {
+                        error.message += `; rollback preserved candidate '${containerName}' because its immutable ID was unavailable`;
+                    } else {
+                        const removed = execute(['rm', '-f', candidateId]);
+                        if (!removed.ok && !missing(removed)) error.message += `; rollback could not remove candidate '${containerName}': ${failure(removed)}`;
+                    }
                 }
                 if (plan) rollbackResources(plan, error);
                 if (backupCreated) {
-                    const restored = execute(['rename', backupName, containerName]);
+                    const restored = execute(['rename', previousId, containerName]);
                     if (!restored.ok) {
                         error.message += `; rollback could not restore preserved '${containerName}': ${failure(restored)}`;
                     } else if (previousWasRunning) {
-                        const restarted = execute(['start', containerName]);
+                        const restarted = execute(['start', previousId]);
                         if (!restarted.ok) error.message += `; rollback could not restart preserved '${containerName}': ${failure(restarted)}`;
                     }
-                } else if (previousWasRunning && previous && candidate) {
-                    // Stop may have succeeded while rename failed.
-                    execute(['start', containerName]);
+                } else if (previousWasRunning && previous && candidate
+                    && String(candidate?.Id || candidate?.ID || '') === previousId
+                    && hasRequiredLabels(labelsOf(candidate), agentLabels)) {
+                    execute(['start', previousId]);
                 }
                 throw error;
             }
-        }, { lockPath, waitMs: NETWORK_LOCK_WAIT_MS });
+        }, { lockPath, waitMs: networkLockWaitMs });
+    }
+
+    function attachmentIsOwnedAgent(labels) {
+        return labels?.[NETWORK_LABELS.managed] === '1'
+            && labels?.[NETWORK_LABELS.resource] === 'agent'
+            && labels?.[NETWORK_LABELS.schema] === NETWORK_SCHEMA_VERSION
+            && labels?.[NETWORK_LABELS.workspace] === identity.hash
+            && /^[a-f0-9]{64}$/.test(String(labels?.[NETWORK_LABELS.contract] || ''));
     }
 
     function status() {
         const result = execute(['network', 'ls', '--format', 'json']);
         if (!result.ok) throw new Error(`cannot list networks: ${failure(result)}`);
         let records;
-        try { records = JSON.parse(result.stdout || '[]'); } catch (error) { throw new Error(`network list returned malformed JSON: ${error.message}`); }
+        try { records = JSON.parse(result.stdout || '[]'); } catch (error) {
+            throw new Error(`network list returned malformed JSON: ${error.message}`);
+        }
         if (!Array.isArray(records)) records = [records];
         const prefix = `ploinky-nw-${identity.hash}-`;
         const networks = records.filter((record) => (
@@ -949,135 +885,128 @@ export function createNetworkLifecycleAdapter({
             const labels = labelsOf(inspected);
             const logicalName = String(labels?.[NETWORK_LABELS.logical] || '');
             const expected = logicalName ? expectedNetworkLabels(identity.hash, logicalName) : null;
-            const owned = Boolean(expected) && hasExactLabels(labels, expected);
             const containers = inspected.Containers || inspected.containers || {};
             const attachments = Object.entries(containers).map(([id, entry]) => {
                 const containerName = String(entry?.Name || entry?.name || id);
                 let container = null;
                 try { container = inspectContainer(containerName); } catch (_) {}
-                const containerLabels = labelsOf(container || {});
                 const networkRecord = container?.NetworkSettings?.Networks?.[physicalName] || {};
-                const isGateway = containerName === gatewayContainerName(identity.hash)
-                    && containerLabels?.[NETWORK_LABELS.resource] === 'gateway';
-                const isAgent = containerLabels?.[NETWORK_LABELS.workspace] === identity.hash;
                 return {
                     containerName,
-                    ownership: isGateway ? 'gateway' : (isAgent ? 'agent' : 'unknown'),
+                    ownership: attachmentIsOwnedAgent(labelsOf(container || {})) ? 'agent' : 'unknown',
                     aliases: semanticRuntimeAliases(container, networkRecord.Aliases || entry?.Aliases || []),
                 };
             }).sort((a, b) => a.containerName.localeCompare(b.containerName));
             return {
                 logicalName,
                 physicalName,
-                ownership: owned ? 'owned' : 'foreign',
+                ownership: expected && hasExactLabels(labels, expected) ? 'owned' : 'foreign',
                 driver: String(inspected.Driver || inspected.driver || ''),
                 attachments,
             };
         }).sort((a, b) => a.physicalName.localeCompare(b.physicalName));
-
-        const gatewayName = gatewayContainerName(identity.hash);
-        const gatewayRecord = inspectContainer(gatewayName);
-        let gateway = null;
-        if (gatewayRecord) {
-            const labels = labelsOf(gatewayRecord);
-            const socketIdentity = String(labels[NETWORK_LABELS.routerSocket] || '');
-            const expected = expectedGatewayLabels(identity.hash, socketIdentity);
-            const owned = hasExactLabels(labels, expected);
-            gateway = {
-                name: gatewayName,
-                ownership: owned ? 'owned' : 'foreign',
-                image: String(gatewayRecord.Config?.Image || gatewayRecord.ImageName || ''),
-                state: String(gatewayRecord.State?.Status || (gatewayRecord.State?.Running ? 'running' : 'unknown')),
-                attachments: Object.entries(gatewayRecord.NetworkSettings?.Networks || {})
-                    .map(([physicalName, entry]) => ({
-                        physicalName,
-                        aliases: semanticRuntimeAliases(gatewayRecord, entry?.Aliases || []),
-                    }))
-                    .sort((a, b) => a.physicalName.localeCompare(b.physicalName)),
-            };
-        }
         return {
-            schemaVersion: NETWORK_SCHEMA_VERSION,
+            schemaVersion: NETWORK_STATUS_SCHEMA_VERSION,
             workspaceHash: identity.hash,
             networks,
-            gateway,
         };
     }
 
-    function verifyContainerContract(containerName, network, canonicalAgentId, {
+    function inspectContainerContract(containerName, network, canonicalAgentId, {
         instanceKey = canonicalAgentId,
         contractHash,
     } = {}) {
         const record = inspectContainer(containerName);
-        if (!record) return false;
+        if (!record) return { state: 'absent', id: null };
         const expectedHash = String(contractHash || '');
         const labels = labelsOf(record);
-        if (String(labels['io.assistos.ploinky.workspace'] || '') !== identity.hash
-            || !expectedHash
-            || String(labels['io.assistos.ploinky.network-contract'] || '') !== expectedHash) {
-            return false;
+        const expectedLabels = expectedAgentLabels(identity.hash, expectedHash);
+        if (!expectedHash || !hasRequiredLabels(labels, expectedLabels)) {
+            return { state: 'foreign', id: String(record?.Id || record?.ID || '') || null };
         }
-        if (!hasExactMinimalHostsPolicy(record)) return false;
-        const alias = deriveNetworkAlias(canonicalAgentId);
-        const expected = logicalNetworkAttachments(network, canonicalAgentId, { instanceKey })
-            .map((entry) => physicalNetworkName(identity.hash, entry.name))
-            .sort();
+        let id;
+        try { id = containerRecordId(record, containerName); } catch (_) {
+            return { state: 'foreign', id: null };
+        }
+        const contract = canonicalizeNetwork(network, { path: 'network' });
+        const managedMode = contract.mode === 'default' || contract.mode === 'bridge';
+        if (managedMode) ensureManagedPodman();
+        if (!managedMode && String(record.HostConfig?.NetworkMode || '') !== contract.mode) {
+            return { state: 'owned-drift', id };
+        }
+        const expected = expectedAttachments(contract, canonicalAgentId, instanceKey);
+        let bridgesExact = true;
+        for (const attachment of expected) {
+            const bridge = inspectNetwork(attachment.name);
+            if (!bridge) {
+                bridgesExact = false;
+                continue;
+            }
+            assertSupportedNetwork(
+                bridge,
+                attachment.name,
+                expectedNetworkLabels(identity.hash, attachment.logicalName),
+            );
+        }
+        if (!bridgesExact || (managedMode && !managedHostsPolicyIsExact(record))) {
+            return { state: 'owned-drift', id };
+        }
         const attached = record.NetworkSettings?.Networks || {};
-        const observed = Object.keys(attached).sort();
-        if (JSON.stringify(observed) !== JSON.stringify(expected)) return false;
-        return expected.every((name) => {
-            const aliases = [...(attached[name]?.Aliases || [])].map(String).sort();
+        if (JSON.stringify(Object.keys(attached).sort()) !== JSON.stringify(expected.map((entry) => entry.name).sort())) {
+            return { state: 'owned-drift', id };
+        }
+        const alias = deriveNetworkAlias(canonicalAgentId);
+        const aliasesExact = expected.every((entry) => {
+            const aliases = [...(attached[entry.name]?.Aliases || [])].map(String).sort();
             return JSON.stringify(aliases) === JSON.stringify(exactRuntimeAliases(record, alias));
         });
+        if (!aliasesExact) return { state: 'owned-drift', id };
+        if (managedMode && (record.State?.Running === true || record.State?.Status === 'running')) {
+            const hosts = readRunningHosts(id);
+            if (hosts.supported && !hasExactlyOneManagedHostEntry(hosts.contents)) {
+                return { state: 'owned-drift', id };
+            }
+        }
+        return { state: 'exact', id };
+    }
+
+    function verifyContainerContract(containerName, network, canonicalAgentId, options = {}) {
+        return inspectContainerContract(containerName, network, canonicalAgentId, options).state === 'exact';
+    }
+
+    function agentIdentityLabelArgs(network) {
+        return Object.entries(expectedAgentLabels(identity.hash, networkContractHash(network)))
+            .flatMap(([key, value]) => ['--label', `${key}=${value}`]);
     }
 
     function pruneUnlocked() {
         ensureRootlessPodman();
         const report = { removed: [], preserved: [] };
-        const records = status().networks;
-        const removable = [];
-        for (const record of records) {
-            if (record.ownership !== 'owned') { report.preserved.push({ ...record, name: record.physicalName, reason: 'foreign' }); continue; }
+        for (const record of status().networks) {
+            if (record.ownership !== 'owned') {
+                report.preserved.push({ ...record, name: record.physicalName, reason: 'foreign' });
+                continue;
+            }
             const inspected = inspectNetwork(record.physicalName);
+            if (!inspected) continue;
             try {
-                assertSupportedNetwork(inspected, record.physicalName, expectedNetworkLabels(identity.hash, record.logicalName));
+                assertSupportedNetwork(
+                    inspected,
+                    record.physicalName,
+                    expectedNetworkLabels(identity.hash, record.logicalName),
+                );
             } catch (error) {
                 report.preserved.push({ ...record, name: record.physicalName, reason: `unsupported: ${error.message}` });
                 continue;
             }
-            const containers = inspected?.Containers || inspected?.containers || {};
-            const active = Object.keys(containers).filter((id) => {
-                const name = containers[id]?.Name || containers[id]?.name || '';
-                return name !== gatewayContainerName(identity.hash);
-            });
-            if (active.length) { report.preserved.push({ ...record, name: record.physicalName, reason: 'in-use' }); continue; }
-            removable.push({ ...record, name: record.physicalName });
-        }
-        const gateway = gatewayContainerName(identity.hash);
-        const gatewayRecord = inspectContainer(gateway);
-        if (gatewayRecord) {
-            assertGatewayRecord(gatewayRecord, [], podmanSelinuxEnabled(), {
-                requireRunning: false,
-                allowMissingSocketIdentity: true,
-            });
-            const allOwnedRemovable = records.filter((record) => record.ownership === 'owned').length === removable.length;
-            if (allOwnedRemovable) execute(['rm', '-f', gateway]);
-            else for (const record of removable) execute(['network', 'disconnect', record.name, gateway]);
-        }
-        for (const record of removable) {
-            const removed = execute(['network', 'rm', record.name]);
-            if (removed.ok || missing(removed)) report.removed.push(record.name);
-            else report.preserved.push({ ...record, reason: failure(removed) });
-        }
-        if (status().networks.filter((record) => record.ownership === 'owned').length === 0) {
-            const inspected = inspectContainer(gateway);
-            if (inspected) {
-                assertGatewayRecord(inspected, [], podmanSelinuxEnabled(), {
-                    requireRunning: false,
-                    allowMissingSocketIdentity: true,
-                });
-                execute(['rm', '-f', gateway]);
+            const containers = inspected.Containers || inspected.containers || {};
+            if (Object.keys(containers).length > 0) {
+                report.preserved.push({ ...record, name: record.physicalName, reason: 'in-use' });
+                continue;
             }
+            const removed = execute(['network', 'rm', record.physicalName]);
+            if (removed.ok || missing(removed)) report.removed.push(record.physicalName);
+            else report.preserved.push({ ...record, name: record.physicalName, reason: failure(removed) });
         }
         return report;
     }
@@ -1090,13 +1019,13 @@ export function createNetworkLifecycleAdapter({
         identity,
         preflight,
         prepare,
-        reconcileManagedControlPlane,
         finalizeContainer,
         runManagedContainerTransaction,
+        inspectContainerContract,
         verifyContainerContract,
+        agentIdentityLabelArgs,
         status,
         prune,
         ensureNetwork,
-        ensureGateway,
     };
 }

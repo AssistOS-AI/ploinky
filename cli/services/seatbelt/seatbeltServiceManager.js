@@ -31,12 +31,15 @@ import {
     validateSecrets
 } from '../secretInjector.js';
 import {
-    getActiveProfile,
     getDefaultMountModes,
-    getProfileConfig,
     getProfileEnvVars,
-    mergeProfiles
+    mergeProfiles,
+    resolveManifestRuntimeProfile
 } from '../profileService.js';
+import {
+    assertHostSandboxNetworkCompatibility,
+    assertNetworkStartupCompatibility,
+} from '../networkContract.js';
 import { resolveProfileServer } from '../profileServer.js';
 import {
     getAgentWorkDir,
@@ -69,10 +72,37 @@ import {
 import { buildFullEnvMap } from '../bwrap/bwrapServiceManager.js';
 // Seatbelt profile generator
 import { buildSeatbeltProfile, writeSeatbeltProfile } from './seatbeltProfile.js';
+import { assertRouterEndpoint } from '../routerPort.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const AGENT_LIB_PATH = path.resolve(__dirname, '../../../Agent');
+
+function resolveSeatbeltRuntimeProfile(agentName, manifest, agentPath, options = {}, existingRecord = {}) {
+    const repoName = path.basename(path.dirname(agentPath));
+    const manifestPath = `manifest(${repoName}/${agentName})`;
+    const resolution = options.profileResolution || resolveManifestRuntimeProfile(manifest, {
+        agentName: `${repoName}/${agentName}`,
+        profileName: options.profileName,
+        persistedProfileName: existingRecord.profile,
+        path: manifestPath,
+    });
+    assertNetworkStartupCompatibility(manifest, resolution.profileConfig, resolution.network, {
+        path: manifestPath,
+    });
+    assertHostSandboxNetworkCompatibility(resolution.network, {
+        path: `${manifestPath}.network`,
+        runtime: 'seatbelt',
+    });
+    return resolution;
+}
+
+function resolveSeatbeltRouterEndpoint(options = {}, networkMode = 'host') {
+    if (options && typeof options === 'object' && Object.prototype.hasOwnProperty.call(options, 'routerHost')) {
+        throw new Error('routerHost overrides are not supported; pass the validated routerEndpoint');
+    }
+    return assertRouterEndpoint(options?.routerEndpoint, networkMode, { explicitPort: options?.routerPort });
+}
 const DEFAULT_SEATBELT_PATH = '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin';
 const SEATBELT_RUNTIME_ROOT = path.join(PLOINKY_DIR, 'seatbelt-runtime');
 
@@ -332,19 +362,16 @@ function startSeatbeltProcess(agentName, manifest, agentPath, options = {}) {
     const cwd = getConfiguredProjectPath(agentName, repoName, alias);
     const sharedDir = ensureSharedHostDir();
 
-    // Profile configuration
-    const activeProfile = getActiveProfile();
-    const hasProfileConfig = Boolean(manifest?.profiles && Object.keys(manifest.profiles).length > 0);
-    const profileConfig = hasProfileConfig
-        ? getProfileConfig(`${repoName}/${agentName}`, activeProfile)
-        : null;
-    if (hasProfileConfig && !profileConfig) {
-        const availableProfiles = Object.keys(manifest.profiles || {});
-        throw new Error(`[profile] ${agentName}: profile '${activeProfile}' not found. Available: ${availableProfiles.join(', ')}`);
-    }
+    // Profile and network are resolved atomically before any sandbox work.
+    const profileContainerName = options.containerName || getAgentContainerName(agentName, repoName);
+    const profileRecord = loadAgentsMap()[profileContainerName] || {};
+    const profileResolution = resolveSeatbeltRuntimeProfile(agentName, manifest, agentPath, options, profileRecord);
+    const activeProfile = profileResolution.resolvedProfileName;
+    const profileConfig = profileResolution.profileConfig;
+    const routerEndpoint = resolveSeatbeltRouterEndpoint(options, profileResolution.network.mode);
 
     assertManifestEnvProfileCompleteness(manifest, profileConfig, { agentName, repoName, profileName: activeProfile });
-    const envHash = computeEnvHash(manifest, profileConfig, {}, { agentName, repoName });
+    const envHash = computeEnvHash(manifest, profileConfig, routerEndpoint.env, { agentName, repoName });
     const { codeReadOnly, skillsReadOnly } = getProfileMountModes(activeProfile, profileConfig || {});
 
     // Resolve paths (real host paths — no mount namespaces)
@@ -393,7 +420,7 @@ function startSeatbeltProcess(agentName, manifest, agentPath, options = {}) {
     ensurePersistentStorageHostDir(runtimeResourcePlan);
 
     // Build environment map (reuse bwrap's builder with 'seatbelt' runtimeName)
-    const envMap = buildFullEnvMap(agentName, manifest, profileConfig, agentWorkDir, repoName, activeProfile, 'seatbelt', runtimeResourcePlan);
+    const envMap = buildFullEnvMap(agentName, manifest, profileConfig, agentWorkDir, repoName, activeProfile, 'seatbelt', runtimeResourcePlan, routerEndpoint);
 
     // Set PORT env var
     if (hostPort) {
@@ -587,6 +614,7 @@ function ensureSeatbeltService(agentName, manifest, agentPath, options = {}) {
     let containerOverride;
     let aliasOverride;
     let forceRecreate = false;
+    let profileNameOverride;
 
     if (typeof options === 'number') {
         preferredHostPort = options;
@@ -595,6 +623,7 @@ function ensureSeatbeltService(agentName, manifest, agentPath, options = {}) {
         containerOverride = options.containerName;
         aliasOverride = options.alias;
         forceRecreate = options.forceRecreate === true;
+        profileNameOverride = options.profileName;
     }
 
     const repoName = path.basename(path.dirname(agentPath));
@@ -606,12 +635,15 @@ function ensureSeatbeltService(agentName, manifest, agentPath, options = {}) {
         aliasOverride = existingRecord.alias;
     }
 
-    // Profile config for env hash comparison
-    const activeProfile = getActiveProfile();
-    const hasProfileConfig = Boolean(manifest?.profiles && Object.keys(manifest.profiles).length > 0);
-    const profileConfig = hasProfileConfig
-        ? getProfileConfig(`${repoName}/${agentName}`, activeProfile)
-        : null;
+    // Profile config and host-network compatibility are validated even when the
+    // existing sandbox can otherwise be reused.
+    const profileResolution = resolveSeatbeltRuntimeProfile(agentName, manifest, agentPath, {
+        ...(options && typeof options === 'object' ? options : {}),
+        profileName: profileNameOverride,
+    }, existingRecord);
+    const activeProfile = profileResolution.resolvedProfileName;
+    const profileConfig = profileResolution.profileConfig;
+    const routerEndpoint = resolveSeatbeltRouterEndpoint(options, profileResolution.network.mode);
 
     assertManifestEnvProfileCompleteness(manifest, profileConfig, { agentName, repoName, profileName: activeProfile });
     const { portMappings } = parseManifestPorts(manifest, profileConfig);
@@ -630,7 +662,7 @@ function ensureSeatbeltService(agentName, manifest, agentPath, options = {}) {
 
     // Check if already running
     if (isBwrapProcessRunning(agentName)) {
-        const desired = computeEnvHash(manifest, profileConfig, {}, { agentName, repoName });
+        const desired = computeEnvHash(manifest, profileConfig, routerEndpoint.env, { agentName, repoName });
         const current = existingRecord.envHash || '';
         if (desired && desired !== current) {
             console.log(`[seatbelt] ${agentName}: env hash changed, restarting...`);
@@ -654,7 +686,10 @@ function ensureSeatbeltService(agentName, manifest, agentPath, options = {}) {
     return startSeatbeltProcess(agentName, manifest, agentPath, {
         preferredHostPort: allPortMappings[0]?.hostPort,
         containerName,
-        alias: aliasOverride
+        alias: aliasOverride,
+        profileName: activeProfile,
+        profileResolution,
+        routerEndpoint,
     });
 }
 
@@ -671,12 +706,12 @@ function attachSeatbeltInteractive(agentName, manifest, agentPath, workdir, entr
         throw new Error(`[seatbelt] ${agentName}: not running as seatbelt agent`);
     }
 
-    // Profile configuration
-    const activeProfile = getActiveProfile();
-    const hasProfileConfig = Boolean(manifest?.profiles && Object.keys(manifest.profiles).length > 0);
-    const profileConfig = hasProfileConfig
-        ? getProfileConfig(`${repoName}/${agentName}`, activeProfile)
-        : null;
+    // Use the running record's persisted profile unless the caller explicitly
+    // selected another valid profile for this interactive sandbox.
+    const profileResolution = resolveSeatbeltRuntimeProfile(agentName, manifest, agentPath, options, record);
+    const activeProfile = profileResolution.resolvedProfileName;
+    const profileConfig = profileResolution.profileConfig;
+    const routerEndpoint = resolveSeatbeltRouterEndpoint(options, profileResolution.network.mode);
 
     // Resolve paths
     const agentCodePath = resolveSymlinkPath(getAgentCodePath(agentName));
@@ -714,7 +749,7 @@ function attachSeatbeltInteractive(agentName, manifest, agentPath, workdir, entr
 
     // Build environment (same as running agent)
     assertManifestEnvProfileCompleteness(manifest, profileConfig, { agentName, repoName, profileName: activeProfile });
-    const envMap = buildFullEnvMap(agentName, manifest, profileConfig, agentWorkDir, repoName, activeProfile, 'seatbelt', runtimeResourcePlan);
+    const envMap = buildFullEnvMap(agentName, manifest, profileConfig, agentWorkDir, repoName, activeProfile, 'seatbelt', runtimeResourcePlan, routerEndpoint);
     const hostPort = record.config?.ports?.[0]?.hostPort;
     if (hostPort) envMap.PORT = String(hostPort);
     envMap.PLOINKY_AGENT_LIB_DIR = seatbeltAgentLibPath;
@@ -783,6 +818,7 @@ function attachSeatbeltInteractive(agentName, manifest, agentPath, workdir, entr
 
 export {
     ensureSeatbeltService,
+    resolveSeatbeltRuntimeProfile,
     startSeatbeltProcess,
     attachSeatbeltInteractive,
     rewriteMcpConfig,

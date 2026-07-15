@@ -52,6 +52,32 @@ async function withCaptureServer(t, onRequest) {
     });
 }
 
+test('createAgentClient requires a valid nonempty PLOINKY_ROUTER_URL without fallback synthesis', async () => {
+    const previousUrl = process.env.PLOINKY_ROUTER_URL;
+    const previousPort = process.env.PLOINKY_ROUTER_PORT;
+    try {
+        delete process.env.PLOINKY_ROUTER_URL;
+        process.env.PLOINKY_ROUTER_PORT = '65535';
+        await assert.rejects(
+            () => createAgentClient('dpuAgent'),
+            /PLOINKY_ROUTER_URL is required/,
+        );
+
+        for (const invalid of ['', '   ', 'not-a-url', 'file:///tmp/router', 'http://user:pass@localhost:8080', 'http://localhost:8080/router']) {
+            process.env.PLOINKY_ROUTER_URL = invalid;
+            await assert.rejects(
+                () => createAgentClient('dpuAgent'),
+                /PLOINKY_ROUTER_URL/,
+            );
+        }
+    } finally {
+        if (previousUrl === undefined) delete process.env.PLOINKY_ROUTER_URL;
+        else process.env.PLOINKY_ROUTER_URL = previousUrl;
+        if (previousPort === undefined) delete process.env.PLOINKY_ROUTER_PORT;
+        else process.env.PLOINKY_ROUTER_PORT = previousPort;
+    }
+});
+
 test('createAgentClient sends no delegation header by default', async (t) => {
     let captured = null;
     await withCaptureServer(t, (req, body, res) => {

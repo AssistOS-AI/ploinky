@@ -24,6 +24,11 @@ const HASH = crypto.createHash('sha256').update(TMP).digest('hex').slice(0, 12);
 const SLUG = path.basename(TMP).replace(/[^a-zA-Z0-9_.-]/g, '_').slice(0, 48);
 const INSTANCE = `ploinky-box-${SLUG}-${HASH}`;
 const VOLUMES = runtimeVolumeNames(INSTANCE);
+const RETAINED_MARKERS = Object.freeze([
+    ['/workspace/.runtime-smoke-marker', 'workspace'],
+    ['/home/podman/.local/share/containers/.runtime-smoke-marker', 'containers'],
+    ['/opt/ploinky/node_modules/.runtime-smoke-marker', 'ploinky-deps'],
+]);
 const ENV = {
     ...process.env,
     PLOINKY_BOX_INSTALL_DEPS: '1',
@@ -147,10 +152,12 @@ try {
     requireOk('nested podman version', invoke(owner, ['exec', INSTANCE, 'podman', 'version']));
     requireOk('nested podman info', invoke(owner, ['exec', INSTANCE, 'podman', 'info']));
     installPlanningProbe(owner);
-    requireOk(
-        'write retained-state marker',
-        invoke(owner, ['exec', INSTANCE, 'sh', '-lc', 'printf retained > /workspace/.runtime-smoke-marker']),
-    );
+    for (const [markerPath, markerValue] of RETAINED_MARKERS) {
+        requireOk(
+            `write retained-state marker for ${markerValue}`,
+            invoke(owner, ['exec', INSTANCE, 'sh', '-lc', `printf '${markerValue}' > '${markerPath}'`]),
+        );
+    }
     requireOk('combined status', ploinky(['status']));
     requireOk('stop before real-engine planning', ploinky(['stop']));
     requireOk(
@@ -170,11 +177,15 @@ try {
         ploinky(['--port', PORT, '--image', IMAGE, 'list', 'agents']),
     );
     owner = discoverOwner();
-    const marker = requireOk(
-        'read retained-state marker',
-        invoke(owner, ['exec', INSTANCE, 'cat', '/workspace/.runtime-smoke-marker']),
-    );
-    if (marker.stdout.trim() !== 'retained') throw new Error('workspace state did not survive destroy');
+    for (const [markerPath, markerValue] of RETAINED_MARKERS) {
+        const marker = requireOk(
+            `read retained-state marker for ${markerValue}`,
+            invoke(owner, ['exec', INSTANCE, 'cat', markerPath]),
+        );
+        if (marker.stdout.trim() !== markerValue) {
+            throw new Error(`${markerValue} state did not survive destroy`);
+        }
+    }
     process.stdout.write(`runtime smoke passed (${owner}, ${INSTANCE})\n`);
 } finally {
     for (const engine of ENGINES) {

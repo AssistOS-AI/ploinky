@@ -42,7 +42,7 @@ function writeExecutable(filePath, contents) {
     fs.chmodSync(filePath, 0o755);
 }
 
-test('buildRuntimeRouterEnv uses the fixed managed gateway endpoint', () => {
+test('buildRuntimeRouterEnv uses the validated managed box-host endpoint', () => {
     const workspaceDir = tempDir();
     try {
         fs.mkdirSync(path.join(workspaceDir, '.ploinky'), { recursive: true });
@@ -50,23 +50,25 @@ test('buildRuntimeRouterEnv uses the fixed managed gateway endpoint', () => {
 
         const result = runModuleSnippet(
             `const { buildRuntimeRouterEnv } = await import(${JSON.stringify(agentServiceManagerUrl)});
-process.stdout.write(JSON.stringify(buildRuntimeRouterEnv('podman', { routerPort: 8097 })));`,
+const { buildRouterEndpoint } = await import(${JSON.stringify(pathToFileURL(path.join(repoRoot, 'cli/services/routerPort.js')).href)});
+const routerEndpoint = buildRouterEndpoint('default', 8097);
+process.stdout.write(JSON.stringify(buildRuntimeRouterEnv('podman', { networkMode: 'default', routerPort: 8097, routerEndpoint })));`,
             {},
             { cwd: workspaceDir },
         );
 
         assert.equal(result.status, 0, result.stderr);
         assert.deepEqual(JSON.parse(result.stdout), {
-            PLOINKY_ROUTER_PORT: '8080',
-            PLOINKY_ROUTER_HOST: 'ploinky-router',
-            PLOINKY_ROUTER_URL: 'http://ploinky-router:8080',
+            PLOINKY_ROUTER_PORT: '8097',
+            PLOINKY_ROUTER_HOST: 'host.containers.internal',
+            PLOINKY_ROUTER_URL: 'http://host.containers.internal:8097',
         });
     } finally {
         fs.rmSync(workspaceDir, { recursive: true, force: true });
     }
 });
 
-test('buildRuntimeRouterEnv never falls back to a Docker host gateway', () => {
+test('buildRuntimeRouterEnv receives the same validated endpoint for Docker builders', () => {
     const workspaceDir = tempDir();
     try {
         fs.mkdirSync(path.join(workspaceDir, '.ploinky'), { recursive: true });
@@ -74,16 +76,18 @@ test('buildRuntimeRouterEnv never falls back to a Docker host gateway', () => {
 
         const result = runModuleSnippet(
             `const { buildRuntimeRouterEnv } = await import(${JSON.stringify(agentServiceManagerUrl)});
-process.stdout.write(JSON.stringify(buildRuntimeRouterEnv('docker')));`,
+const { buildRouterEndpoint } = await import(${JSON.stringify(pathToFileURL(path.join(repoRoot, 'cli/services/routerPort.js')).href)});
+const routerEndpoint = buildRouterEndpoint('bridge', 8097);
+process.stdout.write(JSON.stringify(buildRuntimeRouterEnv('docker', { networkMode: 'bridge', routerEndpoint })));`,
             {},
             { cwd: workspaceDir },
         );
 
         assert.equal(result.status, 0, result.stderr);
         assert.deepEqual(JSON.parse(result.stdout), {
-            PLOINKY_ROUTER_PORT: '8080',
-            PLOINKY_ROUTER_HOST: 'ploinky-router',
-            PLOINKY_ROUTER_URL: 'http://ploinky-router:8080',
+            PLOINKY_ROUTER_PORT: '8097',
+            PLOINKY_ROUTER_HOST: 'host.containers.internal',
+            PLOINKY_ROUTER_URL: 'http://host.containers.internal:8097',
         });
     } finally {
         fs.rmSync(workspaceDir, { recursive: true, force: true });
@@ -376,6 +380,33 @@ process.stdout.write(JSON.stringify({
     });
 });
 
+test('implicit AgentServer mapping appends without erasing or duplicating declared ports', () => {
+    const result = runModuleSnippet(
+        `const { appendUniquePortMapping, resolveHostPortFromRecord } = await import(${JSON.stringify(agentServiceManagerUrl)});
+const declared = [{ containerPort: 8080, hostPort: 18080, protocol: 'tcp' }];
+const implicit = { containerPort: 7000, hostPort: 17000, hostIp: '127.0.0.1', protocol: 'tcp' };
+const once = appendUniquePortMapping(declared, implicit);
+const twice = appendUniquePortMapping(once, { ...implicit, hostPort: 27000 });
+const reuseRecord = { config: { ports: twice } };
+process.stdout.write(JSON.stringify({
+  once,
+  twice,
+  declaredReusePort: resolveHostPortFromRecord(reuseRecord, [8080]),
+  agentServerReusePort: resolveHostPortFromRecord(reuseRecord, [7000]),
+}));`,
+    );
+
+    assert.equal(result.status, 0, result.stderr);
+    const output = JSON.parse(result.stdout);
+    assert.deepEqual(output.once, [
+        { containerPort: 8080, hostPort: 18080, protocol: 'tcp' },
+        { containerPort: 7000, hostPort: 17000, hostIp: '127.0.0.1', protocol: 'tcp' },
+    ]);
+    assert.deepEqual(output.twice, output.once);
+    assert.equal(output.declaredReusePort, 18080);
+    assert.equal(output.agentServerReusePort, 17000);
+});
+
 test('start-only execution never fabricates an AgentServer 7000 publish', () => {
     const result = runModuleSnippet(
         `const { shouldCreateImplicitAgentServerPublish } = await import(${JSON.stringify(agentServiceManagerUrl)});
@@ -500,6 +531,7 @@ esac
             network: { mode: 'host' },
             readiness: { protocol: 'none' },
         }));
+        fs.writeFileSync(path.join(workspaceDir, '.ploinky', 'routing.json'), JSON.stringify({ port: 8123, routes: {} }));
 
         const result = runModuleSnippet(
             `const { enableAgent } = await import(${JSON.stringify(pathToFileURL(path.join(repoRoot, 'cli/services/agents.js')).href)});
@@ -528,6 +560,33 @@ console.log(JSON.stringify(record));`,
     } finally {
         fs.rmSync(workspaceDir, { recursive: true, force: true });
         fs.rmSync(binDir, { recursive: true, force: true });
+    }
+});
+
+test('enable rejects a missing persisted router port before registry mutation', () => {
+    const workspaceDir = tempDir();
+    try {
+        const agentDir = path.join(workspaceDir, '.ploinky', 'repos', 'repo', 'demo');
+        fs.mkdirSync(agentDir, { recursive: true });
+        fs.writeFileSync(path.join(agentDir, 'manifest.json'), JSON.stringify({
+            container: 'example/demo:latest',
+            start: 'sleep 3600',
+            network: { mode: 'default' },
+            readiness: { protocol: 'none' },
+        }));
+
+        const result = runModuleSnippet(
+            `const { enableAgent } = await import(${JSON.stringify(pathToFileURL(path.join(repoRoot, 'cli/services/agents.js')).href)});
+enableAgent('repo/demo', 'global');`,
+            {},
+            { cwd: workspaceDir },
+        );
+
+        assert.notEqual(result.status, 0);
+        assert.match(result.stderr, /persisted router port is required/i);
+        assert.equal(fs.existsSync(path.join(workspaceDir, '.ploinky', 'agents.json')), false);
+    } finally {
+        fs.rmSync(workspaceDir, { recursive: true, force: true });
     }
 });
 

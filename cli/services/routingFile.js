@@ -67,7 +67,20 @@ async function mergeRoutingConfig(mutator) {
     }
 }
 
+function mergeRuntimeRoute(existingRoute, route, {
+    hostPort = null,
+    additionalServerPort = null,
+} = {}) {
+    const next = { ...(existingRoute || {}), ...(route || {}) };
+    if (hostPort) next.hostPort = hostPort;
+    else delete next.hostPort;
+    if (additionalServerPort) next.additionalServerPort = additionalServerPort;
+    else delete next.additionalServerPort;
+    return next;
+}
+
 export {
     mergeRoutingConfig,
+    mergeRuntimeRoute,
     readRoutingConfig
 };

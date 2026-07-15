@@ -23,9 +23,10 @@ function writeManifest(root, repo, agent, manifest) {
 }
 
 function runPlan(root, request, optionsSource = '{ bootRepos: [] }') {
+    const requestWithPort = { routerPort: 8080, ...request };
     const script = `
 const { createBoxStartPublishPlan } = await import(${JSON.stringify(serviceUrl)});
-const result = await createBoxStartPublishPlan(${JSON.stringify(request)}, ${optionsSource});
+const result = await createBoxStartPublishPlan(${JSON.stringify(requestWithPort)}, ${optionsSource});
 process.stdout.write(JSON.stringify(result));`;
     const result = spawnSync(process.execPath, ['--input-type=module', '-e', script], {
         cwd: root,
@@ -39,6 +40,18 @@ process.stdout.write(JSON.stringify(result));`;
     if (result.status !== 0) throw new Error(result.stderr || result.stdout);
     return JSON.parse(result.stdout);
 }
+
+test('planner request requires the shared strict router-port syntax', async () => {
+    const { validateBoxStartPublishPlanRequest } = await import(serviceUrl);
+    const request = { schemaVersion: 2, operation: 'start', root: 'app/root' };
+    for (const routerPort of [undefined, '+8080', ' 8080 ', '0x1f90', 0, -1, 65536]) {
+        assert.throws(
+            () => validateBoxStartPublishPlanRequest({ ...request, routerPort }),
+            (error) => error.code === 'PLOINKY_ROUTER_PORT_INVALID',
+        );
+    }
+    assert.equal(validateBoxStartPublishPlanRequest({ ...request, routerPort: '49123' }).routerPort, 49123);
+});
 
 test('authoritative plan includes selected graph plus enabled agents without registry mutation', () => {
     const root = workspace();
@@ -111,7 +124,7 @@ test('effective-instance profile conflicts report both paths and profiles', () =
         const script = `
 const { createBoxStartPublishPlan } = await import(${JSON.stringify(serviceUrl)});
 try {
-  await createBoxStartPublishPlan({ schemaVersion: 2, operation: 'start', root: 'app/root' }, { bootRepos: [] });
+  await createBoxStartPublishPlan({ schemaVersion: 2, operation: 'start', root: 'app/root', routerPort: 8080 }, { bootRepos: [] });
   process.stdout.write(JSON.stringify({ ok: true }));
 } catch (error) {
   process.stdout.write(JSON.stringify({ ok: false, message: error.message }));
@@ -376,7 +389,7 @@ test('empty-workspace bare ambiguity inventories boot repos and fails before ope
 const { createBoxStartPublishPlan } = await import(${JSON.stringify(serviceUrl)});
 try {
   await createBoxStartPublishPlan(
-    { schemaVersion: 2, operation: 'start', root: 'explorer' },
+    { schemaVersion: 2, operation: 'start', root: 'explorer', routerPort: 8080 },
     { bootRepos: [
       { name: 'AchillesIDE', url: ${JSON.stringify(remote.bare)} },
       { name: 'OtherIDE', url: ${JSON.stringify(remote.bare)} },
@@ -422,7 +435,7 @@ test('direct-node entry emits one compact JSON document with no prompt or log ou
             enable: ['AchillesIDE/explorer'],
             profiles: { default: {} },
         });
-        const request = JSON.stringify({ schemaVersion: 2, operation: 'start', root: 'explorer' });
+        const request = JSON.stringify({ schemaVersion: 2, operation: 'start', root: 'explorer', routerPort: 8080 });
         const result = spawnSync(process.execPath, [entryPath], {
             cwd: root,
             env: {
@@ -461,6 +474,7 @@ test('direct-node entry suppresses branch-fallback chatter before its JSON respo
             schemaVersion: 2,
             operation: 'start',
             root: 'explorer',
+            routerPort: 8080,
             branchPolicy: {
                 branch: 'ploinky-box',
                 repoBranches: {},

@@ -5,11 +5,18 @@ import { fileURLToPath } from 'url';
 
 import * as workspaceSvc from '../services/workspace.js';
 import { REPOS_DIR, RUNNING_DIR } from '../services/config.js';
-import { mergeRoutingConfig } from '../services/routingFile.js';
-import { inspectMaintenanceLock, inspectWorkspaceStartLock } from '../services/maintenanceLocks.js';
+import { mergeRoutingConfig, mergeRuntimeRoute } from '../services/routingFile.js';
+import {
+    createWorkspaceMutationLease,
+    inspectMaintenanceLock,
+    inspectWorkspaceStartLock,
+    releaseWorkspaceMutationLease,
+} from '../services/maintenanceLocks.js';
 import { ensureAgentService, isContainerRunning } from '../services/docker/index.js';
 import { isSandboxRuntime } from '../services/docker/common.js';
 import { isBwrapProcessRunning } from '../services/bwrap/bwrapFleet.js';
+import { resolveManifestRuntimeProfile } from '../services/profileService.js';
+import { resolveRouterEndpoint } from '../services/routerPort.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -49,6 +56,7 @@ function createContainerTarget(info, monitor) {
         agentName: info.agentName,
         repoName: info.repoName,
         alias: info.alias || null,
+        profile: info.profile || null,
         type: info.type,
         manifestPath: info.manifestPath,
         restartHistory: [],
@@ -284,7 +292,8 @@ function syncManagedContainers(monitor) {
         }
 
         const runtime = record.runtime || 'container';
-        const info = { containerName, type, agentName, repoName, alias, manifestPath, runtime };
+        const profile = record.profile || null;
+        const info = { containerName, type, agentName, repoName, alias, profile, manifestPath, runtime };
         desired.set(containerName, info);
 
         let target = monitorRef.targets.get(containerName);
@@ -372,7 +381,7 @@ function scheduleContainerRestart(monitor, target, reason) {
     }, backoff);
 }
 
-async function upsertRestartedContainerRoute(target, agentDir, result = {}) {
+async function upsertRestartedContainerRoute(target, agentDir, result = {}, networkMode = 'default') {
     const routeKey = target.alias || target.agentName;
     const route = {
         container: result.containerName || target.containerName,
@@ -380,16 +389,17 @@ async function upsertRestartedContainerRoute(target, agentDir, result = {}) {
         repo: target.repoName,
         agent: target.agentName,
         ...(target.alias ? { alias: target.alias } : {}),
-        ...(result.hostPort ? { hostPort: result.hostPort } : {}),
+        hostPort: networkMode === 'none' ? null : result.hostPort || null,
         additionalServerPort: result.additionalServerPort || null
     };
 
     await mergeRoutingConfig((cfg) => {
         cfg.routes = cfg.routes || {};
-        cfg.routes[routeKey] = { ...(cfg.routes[routeKey] || {}), ...route };
-        if (route.additionalServerPort === null) {
-            delete cfg.routes[routeKey].additionalServerPort;
-        }
+        cfg.routes[routeKey] = mergeRuntimeRoute(
+            cfg.routes[routeKey],
+            route,
+            { hostPort: route.hostPort, additionalServerPort: route.additionalServerPort },
+        );
         return cfg;
     });
 }
@@ -447,12 +457,51 @@ async function performContainerRestart(monitor, target, reason) {
         return;
     }
 
+    let profileResolution;
+    let routerEndpoint;
+    try {
+        const resolveRuntimeProfile = monitor.resolveManifestRuntimeProfile || resolveManifestRuntimeProfile;
+        profileResolution = resolveRuntimeProfile(manifest, {
+            agentName: `${target.repoName}/${target.agentName}`,
+            profileName: target.profile || undefined,
+            path: `manifest(${target.repoName}/${target.agentName})`,
+        });
+        const resolveEndpoint = monitor.resolveRouterEndpoint || resolveRouterEndpoint;
+        routerEndpoint = resolveEndpoint(profileResolution.network.mode);
+    } catch (error) {
+        target.isRestarting = false;
+        throw error;
+    }
+
+    const acquireWorkspaceLease = monitor.createWorkspaceMutationLease || createWorkspaceMutationLease;
+    const releaseWorkspaceLease = monitor.releaseWorkspaceMutationLease || releaseWorkspaceMutationLease;
+    let workspaceLease;
+    try {
+        workspaceLease = acquireWorkspaceLease({ operation: `watchdog-restart:${target.containerName}` });
+    } catch (error) {
+        if (error?.code === 'PLOINKY_WORKSPACE_MUTATION_BUSY') {
+            target.isRestarting = false;
+            logEvent(monitor, 'info', 'container_restart_deferred_workspace_start', {
+                container: target.containerName,
+                agent: target.agentName,
+                repo: target.repoName,
+            });
+            return;
+        }
+        target.isRestarting = false;
+        throw error;
+    }
+
     try {
         const agentDir = path.dirname(target.manifestPath);
         const ensureAgentServiceImpl = monitor.ensureAgentService || ensureAgentService;
         const result = ensureAgentServiceImpl(target.agentName, manifest, agentDir, {
             containerName: target.containerName,
             commandHint: `ploinky restart ${target.alias || target.agentName}`,
+            networkLockWaitMs: 0,
+            profileName: profileResolution.resolvedProfileName,
+            profileResolution,
+            routerEndpoint,
         });
         if (result?.containerName && result.containerName !== target.containerName) {
             const oldName = target.containerName;
@@ -460,7 +509,12 @@ async function performContainerRestart(monitor, target, reason) {
             target.containerName = result.containerName;
             monitor.targets.set(target.containerName, target);
         }
-        await upsertRestartedContainerRoute(target, agentDir, result);
+        await upsertRestartedContainerRoute(
+            target,
+            agentDir,
+            result,
+            profileResolution.network.mode,
+        );
 
         stopProbeWorker(target);
         target.probeState = 'pending';
@@ -492,6 +546,8 @@ async function performContainerRestart(monitor, target, reason) {
         const scheduleRestart = monitor.scheduleContainerRestart || scheduleContainerRestart;
         scheduleRestart(monitor, target, publicationDenied ? 'publication_denied' : 'restart_failed');
         return;
+    } finally {
+        releaseWorkspaceLease(workspaceLease);
     }
 
     target.isRestarting = false;

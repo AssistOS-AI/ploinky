@@ -1,5 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { pathToFileURL } from 'node:url';
 
 import {
     enableMarketplaceAgent,
@@ -32,6 +37,56 @@ test('Marketplace enable runs only after publication preflight succeeds', async 
         ['enable', 'demo/agent', 'devel', 'demo'],
     ]);
     assert.equal(output.result.containerName, 'demo');
+});
+
+test('Marketplace in-box preflight receives the persisted non-default router port', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-marketplace-port-'));
+    try {
+        const ploinkyDir = path.join(root, '.ploinky');
+        fs.mkdirSync(ploinkyDir, { recursive: true });
+        fs.writeFileSync(path.join(ploinkyDir, 'routing.json'), JSON.stringify({
+            port: 49123,
+            routes: {},
+        }));
+        const marker = path.join(root, 'ploinky-box');
+        fs.writeFileSync(marker, '1\n');
+        const routesUrl = pathToFileURL(path.resolve(
+            new URL('../..', import.meta.url).pathname,
+            'cli/server/authHandlers/marketplaceRoutes.js',
+        )).href;
+        const script = `
+const { enableMarketplaceAgent } = await import(${JSON.stringify(routesUrl)});
+let observed = null;
+const output = await enableMarketplaceAgent({ agentRef: 'demo/agent', mode: 'global' }, {
+  async preflight(command, args, options) { observed = { command, args, options }; },
+  enable() { return { containerName: 'demo' }; },
+});
+process.stdout.write(JSON.stringify({ observed, result: output.result }));`;
+        const result = spawnSync(process.execPath, ['--input-type=module', '-e', script], {
+            cwd: root,
+            env: {
+                ...process.env,
+                PLOINKY_WORKSPACE_ROOT: root,
+                PLOINKY_BOX_MARKER_PATH: marker,
+                PLOINKY_MASTER_KEY: '6'.repeat(64),
+            },
+            encoding: 'utf8',
+        });
+
+        assert.equal(result.status, 0, result.stderr || result.stdout);
+        const output = JSON.parse(result.stdout);
+        assert.deepEqual(output.observed, {
+            command: 'enable',
+            args: ['agent', 'demo/agent'],
+            options: {
+                commandHint: 'ploinky enable agent demo/agent global',
+                routerPort: 49123,
+            },
+        });
+        assert.deepEqual(output.result, { containerName: 'demo' });
+    } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+    }
 });
 
 test('Marketplace HTTP enable maps outer publication denial to an actionable 409', async () => {

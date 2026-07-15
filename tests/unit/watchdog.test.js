@@ -1,7 +1,11 @@
 process.env.PLOINKY_WATCHDOG_TEST_MODE = '1';
+process.env.PORT = '49123';
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 
 const {
     determineShouldRestart,
@@ -139,4 +143,31 @@ test('pendingHealthCheckRestart flag is cleared after restart decision', () => {
 
 test('watchdog reuses the current node executable for router launches', () => {
     assert.equal(getRouterNodeExecutable(), process.execPath);
+});
+
+test('watchdog forwards its validated port to every router child', () => {
+    const source = fs.readFileSync(
+        fileURLToPath(new URL('../../cli/server/Watchdog.js', import.meta.url)),
+        'utf8'
+    );
+
+    assert.match(source, /PORT: String\(CONFIG\.PORT\)/);
+});
+
+test('watchdog refuses to start without an exact explicit PORT', () => {
+    const watchdogUrl = new URL('../../cli/server/Watchdog.js', import.meta.url).href;
+    for (const value of [undefined, '', '+8080', '8080junk', '0', '65536']) {
+        const env = {
+            ...process.env,
+            PLOINKY_WATCHDOG_TEST_MODE: '1',
+        };
+        if (value === undefined) delete env.PORT;
+        else env.PORT = value;
+        const result = spawnSync(process.execPath, ['--input-type=module', '-e', `await import(${JSON.stringify(watchdogUrl)})`], {
+            env,
+            encoding: 'utf8',
+        });
+        assert.notEqual(result.status, 0, `expected PORT=${JSON.stringify(value)} to fail`);
+        assert.match(result.stderr, /Watchdog PORT must be an integer number or exact unsigned decimal string/);
+    }
 });

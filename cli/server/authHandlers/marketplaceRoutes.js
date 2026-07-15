@@ -5,8 +5,10 @@ import * as reposSvc from '../../services/repos.js';
 import * as agentsSvc from '../../services/agents.js';
 import * as workspaceSvc from '../../services/workspace.js';
 import { collectLiveAgentContainers } from '../../services/docker/index.js';
+import { isPloinkyBoxRuntime } from '../../services/docker/common.js';
 import { collectAgentsSummary } from '../../services/status.js';
 import { preflightBoxPublicationForCommand } from '../../services/boxPublicationCoverage.js';
+import { resolvePersistedRouterPort } from '../../services/routerPort.js';
 import { isLocalAdminUser } from '../auth/localService.js';
 import { authService, LOCAL_AUTH_COOKIE_NAME, parseCookies, readJsonBody, sendJson, sessionTokenService, SSO_AUTH_COOKIE_NAME } from './shared.js';
 
@@ -74,8 +76,10 @@ export async function enableMarketplaceAgent(body, {
     const ref = normalizeMarketplaceAgentRef(body?.agentRef);
     const mode = normalizeMarketplaceEnableMode(body?.mode || body?.enableMode);
     const repoName = ref.split('/')[0];
+    const routerPort = isPloinkyBoxRuntime() ? resolvePersistedRouterPort() : undefined;
     await preflight('enable', ['agent', ref], {
         commandHint: `ploinky enable agent ${ref}${mode === 'isolated' ? '' : ` ${mode}`}`,
+        ...(routerPort === undefined ? {} : { routerPort }),
     });
     const result = enable(ref, mode === 'isolated' ? undefined : mode, mode === 'devel' ? repoName : undefined);
     return { ref, mode, result };

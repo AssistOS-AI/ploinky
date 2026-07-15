@@ -1,7 +1,8 @@
 import fs from 'fs';
 import path from 'path';
-import { PLOINKY_DIR, ROUTING_FILE } from '../services/config.js';
+import { PLOINKY_DIR } from '../services/config.js';
 import { debugLog, parseParametersString } from '../services/utils.js';
+import { resolvePersistedRouterPort } from '../services/routerPort.js';
 import { createAgentClient as createBrowserClient } from '../../Agent/client/MCPBrowserClient.js';
 import { mintSessionJwt } from '../server/auth/localService.js';
 
@@ -65,12 +66,7 @@ class ClientCommands {
     }
 
     getRouterPort() {
-        try {
-            const cfg = JSON.parse(fs.readFileSync(ROUTING_FILE, 'utf8')) || {};
-            return cfg.port || 8080;
-        } catch (_) {
-            return 8080;
-        }
+        return resolvePersistedRouterPort();
     }
 
     async withRouterClient(fn) {

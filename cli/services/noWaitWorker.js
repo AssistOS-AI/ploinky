@@ -13,7 +13,9 @@ import fs from 'fs';
 import path from 'path';
 import * as dockerSvc from './docker/index.js';
 import { RUNNING_DIR } from './config.js';
-import { mergeRoutingConfig } from './routingFile.js';
+import { resolveManifestRuntimeProfile } from './profileService.js';
+import { resolveRouterEndpoint } from './routerPort.js';
+import { mergeRoutingConfig, mergeRuntimeRoute } from './routingFile.js';
 
 function parseArgs(argv) {
     const out = {};
@@ -49,10 +51,11 @@ function writeStatus(containerName, payload) {
 async function upsertRoute(routeKey, route) {
     await mergeRoutingConfig((cfg) => {
         cfg.routes = cfg.routes || {};
-        cfg.routes[routeKey] = { ...(cfg.routes[routeKey] || {}), ...route };
-        if (route.additionalServerPort === null) {
-            delete cfg.routes[routeKey].additionalServerPort;
-        }
+        cfg.routes[routeKey] = mergeRuntimeRoute(
+            cfg.routes[routeKey],
+            route,
+            { hostPort: route.hostPort, additionalServerPort: route.additionalServerPort },
+        );
         return cfg;
     });
 }
@@ -76,6 +79,19 @@ async function main() {
         process.exit(2);
     }
 
+    // Resolve the effective endpoint before writing status or touching runtime
+    // state. Detached workers must obey the same persisted-port contract as
+    // blocking startup paths.
+    const manifest = loadManifest(manifestPath);
+    const profileResolution = resolveManifestRuntimeProfile(manifest, {
+        agentName: `${repoName}/${shortAgent}`,
+        profileName: profileName || undefined,
+        path: `manifest(${repoName}/${shortAgent})`,
+    });
+    const routerEndpoint = resolveRouterEndpoint(profileResolution.network.mode, {
+        explicitPort: routerPort || undefined,
+    });
+
     const startedAt = new Date().toISOString();
     const baseStatus = {
         containerName,
@@ -93,17 +109,20 @@ async function main() {
     console.log(`[no-wait] ${shortAgent}: starting background launch (pid ${process.pid})`);
 
     try {
-        const manifest = loadManifest(manifestPath);
         const ensureOptions = {
             containerName,
             alias: alias || undefined,
+            profileName: profileResolution.resolvedProfileName,
+            profileResolution,
+            routerEndpoint,
         };
-        if (routerPort) ensureOptions.routerPort = routerPort;
-        if (profileName) ensureOptions.profileName = profileName;
         const result = await dockerSvc.ensureAgentService(shortAgent, manifest, agentPath, ensureOptions);
         const resolvedContainerName = (result && result.containerName) || containerName;
         const hostPort = result && result.hostPort;
         const additionalServerPort = result && result.additionalServerPort;
+        const routedHostPort = profileResolution.network.mode === 'none'
+            ? null
+            : hostPort || null;
 
         await upsertRoute(routeKey, {
             container: resolvedContainerName,
@@ -111,7 +130,7 @@ async function main() {
             repo: repoName,
             agent: shortAgent,
             ...(alias ? { alias } : {}),
-            ...(hostPort ? { hostPort } : {}),
+            hostPort: routedHostPort,
             additionalServerPort: additionalServerPort || null
         });
 
@@ -121,7 +140,7 @@ async function main() {
             state: 'running',
             finishedAt,
             container: resolvedContainerName,
-            hostPort: hostPort || null
+            hostPort: routedHostPort
         });
         console.log(`[no-wait] ${shortAgent}: launch succeeded (container=${resolvedContainerName}${hostPort ? `, hostPort=${hostPort}` : ''})`);
     } catch (err) {

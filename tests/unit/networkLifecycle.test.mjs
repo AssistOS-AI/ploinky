@@ -1,709 +1,643 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
-import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
-import { spawn, spawnSync } from 'node:child_process';
-import { once } from 'node:events';
 import test from 'node:test';
 
 import {
     NETWORK_LABELS,
-    NETWORK_LOCK_WAIT_MS,
-    acquireNetworkLifecycleLock,
+    NETWORK_STATUS_SCHEMA_VERSION,
     createNetworkLifecycleAdapter,
-    gatewayContainerName,
     physicalNetworkName,
     workspaceNetworkIdentity,
-    withNetworkLifecycleLock,
 } from '../../cli/services/networkLifecycle.js';
 import {
     canonicalizeNetwork,
     deriveNetworkAlias,
-    logicalNetworkAttachments,
     networkContractHash,
 } from '../../cli/services/networkContract.js';
 
 function ok(stdout = '') {
-    return { ok: true, status: 0, stdout, stderr: '', error: null };
+    return { ok: true, status: 0, stdout, stderr: '' };
 }
 
-function absent(kind) {
-    return { ok: false, status: 1, stdout: '', stderr: `${kind} not found`, error: null };
+function absent(resource = 'resource') {
+    return { ok: false, status: 125, stdout: '', stderr: `no such ${resource}` };
 }
 
-test('managed physical names are deterministic and workspace-scoped', () => {
-    const first = workspaceNetworkIdentity('/tmp/a');
-    const second = workspaceNetworkIdentity('/tmp/b');
-    assert.notEqual(first.hash, second.hash);
-    assert.equal(physicalNetworkName(first.hash, 'shared'), physicalNetworkName(first.hash, 'shared'));
-    assert.notEqual(physicalNetworkName(first.hash, 'shared'), physicalNetworkName(first.hash, 'other'));
-});
+function platformResult(args, overrides = {}) {
+    if (args[0] === 'version') return ok(`${overrides.version || '5.4.0'}\n`);
+    if (args[0] === 'info' && args[2]?.includes('Rootless')) {
+        return ok(`${overrides.rootless ?? 'true'}\n`);
+    }
+    if (args[0] === 'info' && args[2]?.includes('NetworkBackend')) {
+        return ok(JSON.stringify(overrides.backend || 'netavark'));
+    }
+    if (args[0] === 'info' && args[2]?.includes('Pasta')) {
+        return overrides.pastaMetadata === false
+            ? ok('null')
+            : ok(JSON.stringify({ executable: '/usr/bin/pasta', version: '0^20250620' }));
+    }
+    if (args[0] === 'info' && args[2]?.includes('ServiceIsRemote')) {
+        if (overrides.serviceIsRemoteProbe === false) return absent('remote service metadata');
+        return ok(JSON.stringify(overrides.serviceIsRemote === true));
+    }
+    if (args[0] === 'unshare' && args[1] === '/usr/bin/pasta' && args[2] === '--version') {
+        if (overrides.serviceIsRemote === true) {
+            return { ...absent('pasta'), stderr: 'cannot use command "podman unshare" with the remote podman client' };
+        }
+        return overrides.pastaOperational === false
+            ? { ...absent('pasta'), stderr: 'pasta executable probe failed' }
+            : ok('pasta 0^20250620\n');
+    }
+    return null;
+}
 
-test('router socket permission failure is fatal instead of being swallowed', () => {
-    const sourcePath = new URL('../../cli/server/RoutingServer.js', import.meta.url);
-    const source = fs.readFileSync(sourcePath, 'utf8');
-    assert.match(source, /Router Unix listener permissions could not be set/);
-    assert.doesNotMatch(source, /try \{ fs\.chmodSync\(ROUTER_SOCKET_PATH, 0o666\); \} catch \(_\) \{\}/);
-});
+function labelsFromArgs(args) {
+    return Object.fromEntries(args.flatMap((value, index) => {
+        if (value !== '--label') return [];
+        const [key, ...rest] = String(args[index + 1]).split('=');
+        return [[key, rest.join('=')]];
+    }));
+}
 
-test('network status returns the stable schema-2 topology object and surfaces foreign collisions', () => {
-    const workspaceRoot = '/tmp/ploinky-network-status-workspace';
-    const identity = workspaceNetworkIdentity(workspaceRoot);
-    const ownedName = physicalNetworkName(identity.hash, 'shared');
-    const foreignName = `${physicalNetworkName(identity.hash, 'foreign')}`;
-    const containerId = '1234567890abcdef';
-    const implicitAlias = containerId.slice(0, 12);
-    const explicitAlias = deriveNetworkAlias('demo-agent');
-    const ownedLabels = {
-        [NETWORK_LABELS.managed]: '1',
-        [NETWORK_LABELS.resource]: 'network',
-        [NETWORK_LABELS.schema]: '2',
-        [NETWORK_LABELS.workspace]: identity.hash,
-        [NETWORK_LABELS.logical]: 'shared',
-    };
-    const records = {
-        [ownedName]: {
-            Name: ownedName,
-            Driver: 'bridge',
-            Labels: ownedLabels,
-            Containers: {
-                [containerId]: { Name: 'demo-container', Aliases: [explicitAlias, implicitAlias] },
-            },
-        },
-        [foreignName]: { Name: foreignName, Driver: 'bridge', Labels: {}, Containers: {} },
-    };
-    const run = (_runtime, args) => {
-        if (args[0] === 'network' && args[1] === 'ls') {
-            return ok(JSON.stringify(Object.values(records)));
-        }
-        if (args[0] === 'network' && args[1] === 'inspect') {
-            return records[args[2]] ? ok(JSON.stringify([records[args[2]]])) : absent('network');
-        }
-        if (args[0] === 'container' && args[1] === 'inspect' && args[2] === 'demo-container') {
-            return ok(JSON.stringify([{
-                Id: containerId,
-                Config: { Labels: { [NETWORK_LABELS.workspace]: identity.hash } },
-                NetworkSettings: { Networks: { [ownedName]: { Aliases: [explicitAlias, implicitAlias] } } },
-            }]));
-        }
-        if (args[0] === 'container' && args[1] === 'inspect') return absent('container');
-        return absent('resource');
-    };
-    const status = createNetworkLifecycleAdapter({ runtime: 'podman', run, workspaceRoot }).status();
-    assert.deepEqual(Object.keys(status), ['schemaVersion', 'workspaceHash', 'networks', 'gateway']);
-    assert.equal(status.schemaVersion, '2');
-    assert.equal(status.workspaceHash, identity.hash);
-    assert.deepEqual(status.networks.map((entry) => [entry.physicalName, entry.ownership]), [
-        [foreignName, 'foreign'],
-        [ownedName, 'owned'],
-    ].sort((a, b) => a[0].localeCompare(b[0])));
-    assert.deepEqual(status.networks.find((entry) => entry.physicalName === ownedName).attachments, [{
-        containerName: 'demo-container',
-        ownership: 'agent',
-        aliases: [explicitAlias],
-    }]);
-    assert.equal(status.gateway, null);
-});
-
-test('network creation proves rootless Podman before mutation and verifies labels after create', () => {
-    const workspaceRoot = '/tmp/ploinky-network-create-workspace';
-    const identity = workspaceNetworkIdentity(workspaceRoot);
-    const name = physicalNetworkName(identity.hash, 'shared');
-    const calls = [];
-    let created = false;
-    const run = (_runtime, args) => {
-        calls.push(args);
-        if (args[0] === 'info') return ok('true\n');
-        if (args[0] === 'network' && args[1] === 'inspect') {
-            if (!created) return absent('network');
-            return ok(JSON.stringify([{
-                Name: name,
-                Driver: 'bridge',
-                Labels: {
-                    [NETWORK_LABELS.managed]: '1',
-                    [NETWORK_LABELS.resource]: 'network',
-                    [NETWORK_LABELS.schema]: '2',
-                    [NETWORK_LABELS.workspace]: identity.hash,
-                    [NETWORK_LABELS.logical]: 'shared',
-                },
-                Options: { isolate: 'true' },
-                IPAM: { Driver: 'host-local', Config: [{ Subnet: '10.1.0.0/24', Gateway: '10.1.0.1' }] },
-            }]));
-        }
-        if (args[0] === 'network' && args[1] === 'create') {
-            created = true;
-            return ok(`${name}\n`);
-        }
-        return absent('resource');
-    };
-    const result = createNetworkLifecycleAdapter({ runtime: 'podman', run, workspaceRoot }).ensureNetwork('shared');
-    assert.equal(result.created, true);
-    assert.deepEqual(calls[0], ['info', '--format', '{{json .Host.Security.Rootless}}']);
-    assert.ok(calls.some((args) => args[0] === 'network' && args[1] === 'create'
-        && args.includes('--opt') && args.includes('isolate=true')));
-
-    const extraLabelRecord = {
+function managedNetworkRecord(identity, logicalName, name, containers = {}) {
+    return {
         Name: name,
         Driver: 'bridge',
+        Internal: false,
+        IPv6Enabled: false,
+        DNSEnabled: true,
+        Options: { isolate: 'true' },
+        IPAM: { Driver: 'host-local', Options: {} },
+        Subnets: [{ Subnet: '10.89.0.0/24', Gateway: '10.89.0.1' }],
         Labels: {
             [NETWORK_LABELS.managed]: '1',
             [NETWORK_LABELS.resource]: 'network',
             [NETWORK_LABELS.schema]: '2',
             [NETWORK_LABELS.workspace]: identity.hash,
-            [NETWORK_LABELS.logical]: 'shared',
-            'unexpected.extra': 'rejected',
+            [NETWORK_LABELS.logical]: logicalName,
         },
-        Options: { isolate: 'true' },
-        IPAM: { Driver: 'host-local', Config: [{ Subnet: '10.1.0.0/24', Gateway: '10.1.0.1' }] },
+        Containers: containers,
     };
-    const extraLabelAdapter = createNetworkLifecycleAdapter({
-        runtime: 'podman',
-        workspaceRoot,
-        run: (_runtime, args) => {
-            if (args[0] === 'info') return ok('true\n');
-            if (args[0] === 'network' && args[1] === 'inspect') return ok(JSON.stringify([extraLabelRecord]));
-            return absent('resource');
-        },
-    });
-    assert.throws(() => extraLabelAdapter.ensureNetwork('shared'), /exact label keys/);
-
-    const unisolatedRecord = {
-        ...extraLabelRecord,
-        Labels: Object.fromEntries(Object.entries(extraLabelRecord.Labels)
-            .filter(([key]) => key !== 'unexpected.extra')),
-        Options: {},
-    };
-    const unisolatedAdapter = createNetworkLifecycleAdapter({
-        runtime: 'podman',
-        workspaceRoot,
-        run: (_runtime, args) => {
-            if (args[0] === 'info') return ok('true\n');
-            if (args[0] === 'network' && args[1] === 'inspect') return ok(JSON.stringify([unisolatedRecord]));
-            return absent('resource');
-        },
-    });
-    assert.throws(() => unisolatedAdapter.ensureNetwork('shared'), /exact bridge option isolate=true/);
-
-    const rootful = createNetworkLifecycleAdapter({
-        runtime: 'podman',
-        workspaceRoot,
-        run: () => ok('false\n'),
-    });
-    assert.throws(() => rootful.ensureNetwork('blocked'), /rootless Podman/);
-});
-
-test('network lock rejects a concurrent child and recovers stale malformed lock and reaper metadata after grace', () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-network-lock-'));
-    const lockPath = path.join(dir, 'network.lock');
-    const held = acquireNetworkLifecycleLock({ lockPath, staleGraceMs: 10 });
-    const moduleUrl = new URL('../../cli/services/networkLifecycle.js', import.meta.url).href;
-    const child = spawnSync(process.execPath, [
-        '--input-type=module', '-e',
-        `import { acquireNetworkLifecycleLock } from ${JSON.stringify(moduleUrl)}; try { acquireNetworkLifecycleLock({ lockPath: process.argv[1], staleGraceMs: 10 }); process.exit(0); } catch { process.exit(23); }`,
-        lockPath,
-    ]);
-    assert.equal(child.status, 23);
-    held.release();
-
-    fs.writeFileSync(lockPath, '{malformed', { mode: 0o600 });
-    fs.writeFileSync(`${lockPath}.reaper`, '{also-malformed', { mode: 0o600 });
-    const old = new Date(Date.now() - 60_000);
-    fs.utimesSync(lockPath, old, old);
-    fs.utimesSync(`${lockPath}.reaper`, old, old);
-    const recovered = acquireNetworkLifecycleLock({ lockPath, staleGraceMs: 10 });
-    assert.equal(JSON.parse(fs.readFileSync(lockPath, 'utf8')).token, recovered.token);
-    assert.equal(fs.existsSync(`${lockPath}.reaper`), false);
-    recovered.release();
-    fs.rmSync(dir, { recursive: true, force: true });
-});
-
-test('network transaction lock waits for a live owner and then serializes', async (t) => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-network-lock-wait-'));
-    const lockPath = path.join(dir, 'network.lock');
-    const moduleUrl = new URL('../../cli/services/networkLifecycle.js', import.meta.url).href;
-    const child = spawn(process.execPath, [
-        '--input-type=module', '-e',
-        `import { acquireNetworkLifecycleLock } from ${JSON.stringify(moduleUrl)}; const lock = acquireNetworkLifecycleLock({ lockPath: process.argv[1] }); process.stdout.write('ready\\n'); setTimeout(() => { lock.release(); process.exit(0); }, 200);`,
-        lockPath,
-    ], { stdio: ['ignore', 'pipe', 'inherit'] });
-    t.after(() => {
-        child.kill();
-        fs.rmSync(dir, { recursive: true, force: true });
-    });
-    await once(child.stdout, 'data');
-    const started = Date.now();
-    const result = withNetworkLifecycleLock(() => 'serialized', {
-        lockPath, waitMs: NETWORK_LOCK_WAIT_MS, pollMs: 10,
-    });
-    assert.equal(result, 'serialized');
-    assert.ok(Date.now() - started >= 100);
-    if (child.exitCode === null) await once(child, 'exit');
-});
-
-async function routerSocketFixture(t) {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-router-socket-'));
-    const socketPath = path.join(dir, 'router.sock');
-    const server = net.createServer((socket) => socket.end('HTTP/1.0 200 OK\r\n\r\nok'));
-    await new Promise((resolve, reject) => server.listen(socketPath, (error) => error ? reject(error) : resolve()));
-    fs.chmodSync(socketPath, 0o666);
-    t.after(() => {
-        server.close();
-        fs.rmSync(dir, { recursive: true, force: true });
-    });
-    return { dir, socketPath };
 }
 
-function gatewayRecord({ name, image, socketPath, networkName, labels }) {
-    const socketStat = fs.lstatSync(socketPath);
-    labels[NETWORK_LABELS.routerSocket] ||= `${socketStat.dev}:${socketStat.ino}`;
+function managedAgentLabels(identity, network, contractHash = networkContractHash(network), extra = {}) {
     return {
-        Name: name,
-        Labels: labels,
-        Config: { Labels: labels, Image: image, User: '65532:65532', Entrypoint: ['/ploinky-network-gateway'], Cmd: [] },
-        State: { Running: true, Status: 'running', Pid: process.pid },
-        HostConfig: {
-            Privileged: false,
-            ReadonlyRootfs: true,
-            CapDrop: ['ALL'],
-            CapAdd: [],
-            SecurityOpt: ['no-new-privileges'],
-            Sysctls: { 'net.ipv4.ip_forward': '0' },
-            PortBindings: {},
-            Tmpfs: { '/tmp': 'rw,noexec,nosuid,nodev,mode=1777' },
-        },
-        Mounts: [{ Type: 'bind', Source: socketPath, Destination: '/run/ploinky/router.sock', RW: false }],
-        NetworkSettings: { Ports: {}, Networks: { [networkName]: { Aliases: ['ploinky-router'], IPAddress: '10.1.0.2' } } },
+        [NETWORK_LABELS.managed]: '1',
+        [NETWORK_LABELS.resource]: 'agent',
+        [NETWORK_LABELS.schema]: '2',
+        [NETWORK_LABELS.workspace]: identity.hash,
+        [NETWORK_LABELS.contract]: contractHash,
+        ...extra,
     };
 }
 
-test('managed replacement holds one lock through preflight, removal, resource creation, verification, and start', async (t) => {
-    const { dir, socketPath } = await routerSocketFixture(t);
+function managedAgentRecord({ id, name, labels, networks, running = false, hostsFile = 'none', extraHosts, networkMode } = {}) {
+    return {
+        Id: id,
+        Name: name,
+        Config: { Labels: labels, CreateCommand: ['podman', 'create', '--arbitrary-history'] },
+        HostConfig: {
+            HostsFile: hostsFile,
+            ExtraHosts: extraHosts || ['host.containers.internal:host-gateway'],
+            ...(networkMode ? { NetworkMode: networkMode } : {}),
+        },
+        NetworkSettings: { Networks: networks || {} },
+        State: { Running: running, Status: running ? 'running' : 'configured' },
+    };
+}
+
+function networkHarness(t, { platform = {}, containersConfigPaths } = {}) {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-network-'));
+    t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
     const workspaceRoot = path.join(dir, 'workspace');
+    fs.mkdirSync(workspaceRoot, { recursive: true });
     const identity = workspaceNetworkIdentity(workspaceRoot);
-    const gatewayName = gatewayContainerName(identity.hash);
-    const image = 'example.invalid/gateway:1@sha256:abc';
-    const lockPath = path.join(dir, 'network.lock');
     const networks = new Map();
-    let gateway = null;
-    let agent = { old: true };
-    const backups = new Map();
-    const mutationTokens = [];
-    const labelsFrom = (args) => {
-        const labels = {};
-        args.forEach((value, index) => {
-            if (value === '--label') {
-                const [key, ...rest] = String(args[index + 1]).split('=');
-                labels[key] = rest.join('=');
-            }
-        });
-        return labels;
-    };
-    const noteMutation = () => {
-        assert.equal(fs.existsSync(lockPath), true);
-        mutationTokens.push(JSON.parse(fs.readFileSync(lockPath, 'utf8')).token);
-    };
+    const containers = new Map();
+    const calls = [];
+    const findContainer = (selector) => [...containers.values()].find((record) => (
+        record.Name === selector || record.Id === selector
+    )) || null;
     const run = (_runtime, args) => {
-        if (args[0] === 'info') return ok(args[2].includes('Rootless') ? 'true\n' : 'false\n');
-        if (args[0] === 'image' && args[1] === 'inspect') return ok('[]');
+        calls.push([...args]);
+        const platformResponse = platformResult(args, platform);
+        if (platformResponse) return platformResponse;
         if (args[0] === 'network' && args[1] === 'inspect') {
             const record = networks.get(args[2]);
             return record ? ok(JSON.stringify([record])) : absent('network');
         }
-        if (args[0] === 'container' && args[1] === 'inspect') {
-            if (args[2] === gatewayName) return gateway ? ok(JSON.stringify([gateway])) : absent('container');
-            const selected = args[2] === 'demo-container' ? agent : backups.get(args[2]);
-            return selected ? ok(JSON.stringify([selected])) : absent('container');
-        }
         if (args[0] === 'network' && args[1] === 'create') {
-            noteMutation();
             const name = args.at(-1);
-            networks.set(name, {
-                Name: name, Driver: 'bridge', Internal: false, IPv6Enabled: false, DNSEnabled: true,
-                Options: { isolate: 'true' }, IPAM: { Driver: 'host-local', Config: [{ Subnet: '10.1.0.0/24', Gateway: '10.1.0.1' }] },
-                Labels: labelsFrom(args), Containers: {},
-            });
-            return ok(name);
+            const labels = labelsFromArgs(args);
+            const logicalName = labels[NETWORK_LABELS.logical];
+            networks.set(name, managedNetworkRecord(identity, logicalName, name));
+            return ok(`${name}\n`);
         }
-        if (args[0] === 'run') {
-            noteMutation();
-            const networkName = args[args.indexOf('--network') + 1];
-            gateway = gatewayRecord({ name: gatewayName, image, socketPath, networkName, labels: labelsFrom(args) });
-            return ok(gatewayName);
+        if (args[0] === 'network' && args[1] === 'connect') {
+            const alias = args[args.indexOf('--alias') + 1];
+            const name = args.at(-2);
+            const selector = args.at(-1);
+            const container = findContainer(selector);
+            if (!container) return absent('container');
+            container.NetworkSettings.Networks[name] = { Aliases: [alias, container.Id.slice(0, 12)] };
+            networks.get(name).Containers[container.Id] = { Name: container.Name };
+            return ok();
         }
+        if (args[0] === 'network' && args[1] === 'rm') {
+            const record = networks.get(args[2]);
+            if (!record) return absent('network');
+            if (Object.keys(record.Containers || {}).length) return { ...absent('network'), stderr: 'network in use' };
+            networks.delete(args[2]);
+            return ok();
+        }
+        if (args[0] === 'network' && args[1] === 'ls') {
+            return ok(JSON.stringify([...networks.values()].map(({ Name, Labels }) => ({ Name, Labels }))));
+        }
+        if (args[0] === 'container' && args[1] === 'inspect') {
+            const record = findContainer(args[2]);
+            return record ? ok(JSON.stringify([record])) : absent('container');
+        }
+        if (args[0] === 'exec') return ok('127.0.0.1 localhost\n10.89.0.1 host.containers.internal\n');
         if (args[0] === 'start') {
-            noteMutation();
-            agent.State = { Running: true, Status: 'running' };
+            const record = findContainer(args[1]);
+            if (!record) return absent('container');
+            record.State = { Running: true, Status: 'running' };
+            return ok();
+        }
+        if (args[0] === 'stop') {
+            const record = findContainer(args[1]);
+            if (!record) return absent('container');
+            record.State = { Running: false, Status: 'exited' };
             return ok();
         }
         if (args[0] === 'rename') {
-            noteMutation();
-            if (args[1] === 'demo-container' && agent) {
-                backups.set(args[2], agent);
-                agent = null;
-                return ok();
-            }
-            if (backups.has(args[1]) && args[2] === 'demo-container') {
-                agent = backups.get(args[1]);
-                backups.delete(args[1]);
-                return ok();
-            }
-            return absent('container');
+            const record = findContainer(args[1]);
+            if (!record) return absent('container');
+            record.Name = args[2];
+            return ok();
         }
         if (args[0] === 'rm') {
-            noteMutation();
-            if (args.at(-1) === gatewayName) gateway = null;
-            else if (backups.has(args.at(-1))) backups.delete(args.at(-1));
-            else agent = null;
+            const record = findContainer(args.at(-1));
+            if (!record) return absent('container');
+            containers.delete(record.Id);
+            for (const network of networks.values()) delete network.Containers[record.Id];
             return ok();
         }
         return absent('resource');
     };
     const adapter = createNetworkLifecycleAdapter({
-        runtime: 'podman', run, workspaceRoot, lockPath, routerSocket: socketPath,
-        minimalHosts: path.join(dir, 'hosts'), gatewayImage: image, probeGateway: () => ok(),
+        runtime: 'podman',
+        run,
+        workspaceRoot,
+        lockPath: path.join(dir, 'network.lock'),
+        containersConfigPaths,
     });
-    const network = canonicalizeNetwork({ mode: 'default' });
-    adapter.runManagedContainerTransaction({
-        network,
-        canonicalAgentId: 'demo-agent',
-        containerName: 'demo-container',
-        createContainer: (plan) => {
-            noteMutation();
-            assert.deepEqual(plan.args.slice(4), [
-                '--no-hosts', '--volume', `${path.join(dir, 'hosts')}:/etc/hosts:ro`,
-            ]);
-            const primary = plan.attachments.find((entry) => entry.primary) || plan.attachments[0];
-            const labels = {
-                'io.assistos.ploinky.workspace': identity.hash,
-                'io.assistos.ploinky.network-contract': networkContractHash(network),
-            };
-            agent = {
-                Config: { Labels: labels },
-                NetworkSettings: { Networks: { [primary.name]: { Aliases: [plan.alias] } } },
-            };
-        },
+    return { adapter, calls, containers, dir, identity, networks, run };
+}
+
+test('all modes produce one transport path and exact managed hosts arguments', (t) => {
+    const harness = networkHarness(t);
+    const none = harness.adapter.prepare({ mode: 'none' }, 'demo');
+    const host = harness.adapter.prepare({ mode: 'host' }, 'demo');
+    assert.deepEqual(none.args, ['--network', 'none']);
+    assert.deepEqual(host.args, ['--network', 'host']);
+    assert.equal(harness.calls.some((args) => args[0] === 'info'), false);
+
+    const defaultPlan = harness.adapter.prepare({ mode: 'default' }, 'demo');
+    assert.deepEqual(defaultPlan.args.slice(-3), [
+        '--hosts-file=none',
+        '--add-host',
+        'host.containers.internal:host-gateway',
+    ]);
+    assert.equal(defaultPlan.args.filter((value) => value === '--hosts-file=none').length, 1);
+    assert.equal(defaultPlan.args.filter((value) => value === '--add-host').length, 1);
+    assert.equal(defaultPlan.args.some((value) => value === '--no-hosts' || value === '--volume'), false);
+    assert.equal(harness.calls.some((args) => (
+        args[0] === 'unshare' && args[1] === '/usr/bin/pasta' && args[2] === '--version'
+    )), true);
+
+    const bridge = canonicalizeNetwork({
+        mode: 'bridge',
+        attachments: [{ name: 'front', primary: true }, { name: 'data' }],
     });
-    assert.ok(mutationTokens.length >= 4);
-    assert.equal(new Set(mutationTokens).size, 1);
-    assert.equal(fs.existsSync(lockPath), false);
-    assert.equal(agent.State.Running, true);
+    const bridgePlan = harness.adapter.prepare(bridge, 'demo');
+    assert.equal(bridgePlan.attachments.length, 2);
+    assert.equal(bridgePlan.args.includes('--hosts-file=none'), true);
+    assert.equal(bridgePlan.args.includes('host.containers.internal:host-gateway'), true);
 });
 
-test('managed replacement failure restores and restarts the preserved old container under the same lock', async (t) => {
-    const { dir, socketPath } = await routerSocketFixture(t);
-    const workspaceRoot = path.join(dir, 'workspace');
-    const identity = workspaceNetworkIdentity(workspaceRoot);
-    const network = canonicalizeNetwork({ mode: 'default' });
-    const logicalName = logicalNetworkAttachments(network, 'demo-agent')[0].name;
-    const physicalName = physicalNetworkName(identity.hash, logicalName);
-    const gatewayName = gatewayContainerName(identity.hash);
-    const image = 'example.invalid/gateway:1@sha256:abc';
-    const lockPath = path.join(dir, 'network.lock');
-    const networkLabels = {
-        [NETWORK_LABELS.managed]: '1', [NETWORK_LABELS.resource]: 'network',
-        [NETWORK_LABELS.schema]: '2', [NETWORK_LABELS.workspace]: identity.hash,
-        [NETWORK_LABELS.logical]: logicalName,
-    };
-    const networkRecord = {
-        Name: physicalName, Driver: 'bridge', Internal: false, IPv6Enabled: false, DNSEnabled: true,
-        Options: { isolate: 'true' }, IPAM: { Driver: 'host-local', Config: [{ Subnet: '10.2.0.0/24', Gateway: '10.2.0.1' }] },
-        Labels: networkLabels, Containers: {},
-    };
-    const gatewayLabels = {
-        [NETWORK_LABELS.managed]: '1', [NETWORK_LABELS.resource]: 'gateway',
-        [NETWORK_LABELS.schema]: '2', [NETWORK_LABELS.workspace]: identity.hash,
-    };
-    const gateway = gatewayRecord({
-        name: gatewayName, image, socketPath, networkName: physicalName, labels: gatewayLabels,
+test('managed preflight requires Podman 5.4+, rootless Netavark, operational pasta, and compatible config', (t) => {
+    for (const [overrides, pattern] of [
+        [{ version: '5.3.9' }, /5\.4 or newer/],
+        [{ rootless: 'false' }, /rootless Podman/],
+        [{ backend: 'cni' }, /Netavark/],
+        [{ pastaMetadata: false }, /pasta backend metadata/],
+        [{ serviceIsRemoteProbe: false }, /cannot determine whether Podman is local or remote/],
+        [{ pastaOperational: false }, /operational pasta/],
+    ]) {
+        const harness = networkHarness(t, { platform: overrides });
+        assert.throws(() => harness.adapter.preflight({ mode: 'default' }, 'demo'), pattern);
+        assert.equal(harness.calls.some((args) => args[0] === 'network' && args[1] === 'create'), false);
+    }
+
+    const configDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-containers-conf-'));
+    t.after(() => fs.rmSync(configDir, { recursive: true, force: true }));
+    const configPath = path.join(configDir, 'containers.conf');
+    fs.writeFileSync(configPath, '[containers] # effective container defaults\nno_hosts=true# valid TOML comment\n');
+    const noHosts = networkHarness(t, { containersConfigPaths: [configPath] });
+    assert.throws(
+        () => noHosts.adapter.preflight({ mode: 'default' }, 'demo'),
+        /no_hosts=true/,
+    );
+    assert.equal(noHosts.calls.some((args) => args[0] === 'network' && args[1] === 'create'), false);
+
+    const gatewayDisabledPath = path.join(configDir, '20-gateway-disabled.conf');
+    fs.writeFileSync(gatewayDisabledPath, '[containers]\nhost_containers_internal_ip="none"\n');
+    const gatewayDisabled = networkHarness(t, { containersConfigPaths: [gatewayDisabledPath] });
+    assert.throws(
+        () => gatewayDisabled.adapter.preflight({ mode: 'default' }, 'demo'),
+        /host_containers_internal_ip='none'/,
+    );
+    assert.equal(gatewayDisabled.calls.some((args) => args[0] === 'network' && args[1] === 'create'), false);
+
+    const gatewayEnabledPath = path.join(configDir, '30-gateway-enabled.conf');
+    fs.writeFileSync(gatewayEnabledPath, '[containers]\nhost_containers_internal_ip=""\n');
+    const overriddenGateway = networkHarness(t, {
+        containersConfigPaths: [gatewayDisabledPath, gatewayEnabledPath],
     });
-    const old = { marker: 'old-preserved', State: { Running: true, Status: 'running' }, Config: { Labels: {} } };
-    let agent = old;
-    const backups = new Map();
-    let candidateStartFailed = false;
-    const run = (_runtime, args) => {
-        assert.equal(fs.existsSync(lockPath), true);
-        if (args[0] === 'info') return ok(args[2].includes('Rootless') ? 'true\n' : 'false\n');
-        if (args[0] === 'image' && args[1] === 'inspect') return ok('[]');
-        if (args[0] === 'network' && args[1] === 'inspect') return args[2] === physicalName
-            ? ok(JSON.stringify([networkRecord])) : absent('network');
-        if (args[0] === 'container' && args[1] === 'inspect') {
-            if (args[2] === gatewayName) return ok(JSON.stringify([gateway]));
-            const selected = args[2] === 'demo-container' ? agent : backups.get(args[2]);
-            return selected ? ok(JSON.stringify([selected])) : absent('container');
+    assert.doesNotThrow(() => overriddenGateway.adapter.preflight({ mode: 'default' }, 'demo'));
+});
+
+test('remote managed preflight uses server pasta metadata without invoking client-side unshare', (t) => {
+    const configDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-remote-client-conf-'));
+    t.after(() => fs.rmSync(configDir, { recursive: true, force: true }));
+    const clientConfigPath = path.join(configDir, 'containers.conf');
+    fs.writeFileSync(clientConfigPath, '[containers]\nno_hosts=true\nhost_containers_internal_ip="none"\n');
+    const remote = networkHarness(t, {
+        platform: { serviceIsRemote: true },
+        containersConfigPaths: [clientConfigPath],
+    });
+    assert.doesNotThrow(() => remote.adapter.preflight({ mode: 'default' }, 'demo'));
+    assert.equal(remote.calls.some((args) => args[0] === 'unshare'), false);
+
+    const missingMetadata = networkHarness(t, {
+        platform: { serviceIsRemote: true, pastaMetadata: false },
+    });
+    assert.throws(
+        () => missingMetadata.adapter.preflight({ mode: 'default' }, 'demo'),
+        /operational pasta backend metadata/,
+    );
+    assert.equal(missingMetadata.calls.some((args) => args[0] === 'unshare'), false);
+});
+
+test('post-create verification failure removes a just-created managed network', (t) => {
+    for (const failureMode of ['missing', 'invalid']) {
+        const harness = networkHarness(t);
+        let createdName = '';
+        let failedPostCreateInspection = false;
+        const run = (runtime, args) => {
+            if (args[0] === 'network' && args[1] === 'create') {
+                const result = harness.run(runtime, args);
+                if (result.ok) createdName = args.at(-1);
+                return result;
+            }
+            if (args[0] === 'network'
+                && args[1] === 'inspect'
+                && args[2] === createdName
+                && !failedPostCreateInspection) {
+                failedPostCreateInspection = true;
+                harness.calls.push([...args]);
+                if (failureMode === 'missing') return absent('network');
+                const invalid = JSON.parse(JSON.stringify(harness.networks.get(createdName)));
+                invalid.Options.isolate = 'false';
+                return ok(JSON.stringify([invalid]));
+            }
+            return harness.run(runtime, args);
+        };
+        const adapter = createNetworkLifecycleAdapter({
+            runtime: 'podman',
+            run,
+            workspaceRoot: harness.identity.canonical,
+            lockPath: path.join(harness.dir, `${failureMode}.lock`),
+        });
+
+        assert.throws(
+            () => adapter.prepare({ mode: 'default' }, 'demo'),
+            failureMode === 'missing' ? /disappeared after creation/ : /isolate=true/,
+        );
+        assert.equal(harness.networks.size, 0);
+        assert.equal(harness.calls.some((args) => (
+            args[0] === 'network' && args[1] === 'rm' && args[2] === createdName
+        )), true);
+    }
+});
+
+test('post-create cleanup preserves a network whose ownership labels cannot be verified', (t) => {
+    const harness = networkHarness(t);
+    let createdName = '';
+    let changedOwnership = false;
+    const run = (runtime, args) => {
+        if (args[0] === 'network' && args[1] === 'create') {
+            const result = harness.run(runtime, args);
+            if (result.ok) createdName = args.at(-1);
+            return result;
         }
-        if (args[0] === 'stop' && args[1] === 'demo-container') {
-            agent.State = { Running: false, Status: 'exited' };
-            return ok();
+        if (args[0] === 'network'
+            && args[1] === 'inspect'
+            && args[2] === createdName
+            && !changedOwnership) {
+            changedOwnership = true;
+            harness.networks.get(createdName).Labels.foreign = 'replacement';
         }
-        if (args[0] === 'rename' && args[1] === 'demo-container') {
-            backups.set(args[2], agent); agent = null; return ok();
-        }
-        if (args[0] === 'rename' && backups.has(args[1])) {
-            agent = backups.get(args[1]); backups.delete(args[1]); return ok();
-        }
-        if (args[0] === 'start' && agent?.marker === 'candidate' && !candidateStartFailed) {
-            candidateStartFailed = true;
-            return { ...absent('container'), stderr: 'injected start failure' };
-        }
-        if (args[0] === 'start') {
-            agent.State = { Running: true, Status: 'running' };
-            return ok();
-        }
-        if (args[0] === 'rm' && args.at(-1) === 'demo-container') {
-            agent = null;
-            return ok();
-        }
-        return absent('resource');
+        return harness.run(runtime, args);
     };
     const adapter = createNetworkLifecycleAdapter({
-        runtime: 'podman', run, workspaceRoot, lockPath, routerSocket: socketPath,
-        minimalHosts: path.join(dir, 'hosts'), gatewayImage: image, probeGateway: () => ok(),
+        runtime: 'podman',
+        run,
+        workspaceRoot: harness.identity.canonical,
+        lockPath: path.join(harness.dir, 'foreign-replacement.lock'),
     });
-    assert.throws(() => adapter.runManagedContainerTransaction({
-        network, canonicalAgentId: 'demo-agent', containerName: 'demo-container',
-        createContainer: (plan) => {
-            agent = {
-                marker: 'candidate',
-                Config: { Labels: {
-                    'io.assistos.ploinky.workspace': identity.hash,
-                    'io.assistos.ploinky.network-contract': networkContractHash(network),
-                } },
-                NetworkSettings: { Networks: { [physicalName]: { Aliases: [plan.alias] } } },
-            };
-        },
-    }), /injected start failure/);
-    assert.equal(agent.marker, 'old-preserved');
-    assert.equal(agent.State.Running, true);
-    assert.equal(backups.size, 0);
-    assert.equal(fs.existsSync(lockPath), false);
+
+    assert.throws(
+        () => adapter.prepare({ mode: 'default' }, 'demo'),
+        /cleanup preserved.*exact ownership labels could not be verified/,
+    );
+    assert.equal(harness.networks.has(createdName), true);
+    assert.equal(harness.calls.some((args) => (
+        args[0] === 'network' && args[1] === 'rm' && args[2] === createdName
+    )), false);
 });
 
-test('missing exact gateway image leaves the old managed container untouched', async (t) => {
-    const { dir, socketPath } = await routerSocketFixture(t);
-    const lockPath = path.join(dir, 'network.lock');
-    let removals = 0;
-    const run = (_runtime, args) => {
-        if (args[0] === 'info') return ok(args[2].includes('Rootless') ? 'true\n' : 'false\n');
-        if (args[0] === 'network' && args[1] === 'inspect') return absent('network');
-        if (args[0] === 'container' && args[1] === 'inspect') return absent('container');
-        if (args[0] === 'image' && args[1] === 'inspect') return absent('image');
-        if (args[0] === 'pull') return { ...absent('image'), stderr: 'registry unavailable' };
-        return absent('resource');
-    };
-    const adapter = createNetworkLifecycleAdapter({
-        runtime: 'podman', run, workspaceRoot: path.join(dir, 'workspace'), lockPath,
-        routerSocket: socketPath, minimalHosts: path.join(dir, 'hosts'), gatewayImage: 'example.invalid/gateway@sha256:deadbeef',
-    });
-    assert.throws(() => adapter.runManagedContainerTransaction({
-        network: canonicalizeNetwork({ mode: 'default' }), canonicalAgentId: 'demo-agent', containerName: 'demo-container',
-        removeExisting: () => { removals += 1; }, createContainer: () => assert.fail('must not create'),
-    }), /exact pull failed/);
-    assert.equal(removals, 0);
+test('host and none contract inspection does not require managed bridge host fields', (t) => {
+    const harness = networkHarness(t);
+    for (const mode of ['host', 'none']) {
+        const network = canonicalizeNetwork({ mode });
+        const id = `${mode}123456789012`;
+        const record = managedAgentRecord({
+            id,
+            name: `${mode}-container`,
+            labels: managedAgentLabels(harness.identity, network),
+            networks: {},
+            networkMode: mode,
+        });
+        delete record.HostConfig.HostsFile;
+        record.HostConfig.ExtraHosts = [];
+        harness.containers.set(id, record);
+        assert.equal(harness.adapter.inspectContainerContract(
+            `${mode}-container`,
+            network,
+            mode,
+            { contractHash: networkContractHash(network) },
+        ).state, 'exact');
+        record.HostConfig.NetworkMode = mode === 'host' ? 'none' : 'host';
+        assert.equal(harness.adapter.inspectContainerContract(
+            `${mode}-container`,
+            network,
+            mode,
+            { contractHash: networkContractHash(network) },
+        ).state, 'owned-drift');
+    }
 });
 
-test('managed reuse rejects missing contract labels and exact attachment or alias drift', () => {
-    const workspaceRoot = '/tmp/ploinky-network-reuse-workspace';
-    const identity = workspaceNetworkIdentity(workspaceRoot);
-    const network = canonicalizeNetwork({ mode: 'default' });
-    const logicalName = logicalNetworkAttachments(network, 'demo-agent')[0].name;
-    const expectedName = physicalNetworkName(identity.hash, logicalName);
-    const hostsPath = '/tmp/ploinky-network-reuse-hosts';
-    let record = { Config: { Labels: {} }, NetworkSettings: { Networks: {} } };
-    const run = (_runtime, args) => args[0] === 'container'
-        ? ok(JSON.stringify([record]))
-        : absent('resource');
-    const adapter = createNetworkLifecycleAdapter({ runtime: 'podman', run, workspaceRoot, minimalHosts: hostsPath });
+test('reuse validates HostConfig fields, every bridge, and current contract hash without CreateCommand', (t) => {
+    const harness = networkHarness(t);
+    const network = canonicalizeNetwork({
+        mode: 'bridge',
+        attachments: [{ name: 'front', primary: true }, { name: 'data' }],
+    });
+    const names = network.attachments.map(({ name }) => physicalNetworkName(harness.identity.hash, name));
+    network.attachments.forEach(({ name }, index) => {
+        harness.networks.set(names[index], managedNetworkRecord(harness.identity, name, names[index]));
+    });
+    const id = '0123456789abcdef';
+    const alias = deriveNetworkAlias('demo');
+    const record = managedAgentRecord({
+        id,
+        name: 'demo-container',
+        labels: managedAgentLabels(harness.identity, network, undefined, { 'org.opencontainers.image.title': 'extra-ok' }),
+        networks: Object.fromEntries(names.map((name) => [name, { Aliases: [alias, id.slice(0, 12)] }])),
+        running: true,
+    });
+    harness.containers.set(id, record);
     const options = { contractHash: networkContractHash(network) };
-    assert.equal(adapter.verifyContainerContract('demo', network, 'demo-agent', options), false);
-    record = {
-        Config: {
-            Labels: {
-                'io.assistos.ploinky.workspace': identity.hash,
-                'io.assistos.ploinky.network-contract': networkContractHash(network),
-            },
-            CreateCommand: ['podman', 'create', '--no-hosts'],
-        },
-        Mounts: [{ Type: 'bind', Source: hostsPath, Destination: '/etc/hosts', RW: false }],
-        NetworkSettings: { Networks: { [expectedName]: { Aliases: ['wrong'] } } },
-    };
-    assert.equal(adapter.verifyContainerContract('demo', network, 'demo-agent', options), false);
-    record.NetworkSettings.Networks[expectedName].Aliases = [deriveNetworkAlias('demo-agent')];
-    record.NetworkSettings.Networks.extra = { Aliases: [deriveNetworkAlias('demo-agent')] };
-    assert.equal(adapter.verifyContainerContract('demo', network, 'demo-agent', options), false);
-    delete record.NetworkSettings.Networks.extra;
-    assert.equal(adapter.verifyContainerContract('demo', network, 'demo-agent', options), true);
-    record.Config.CreateCommand.push('--add-host', 'host.containers.internal:host-gateway');
-    assert.equal(adapter.verifyContainerContract('demo', network, 'demo-agent', options), false);
+    assert.equal(harness.adapter.inspectContainerContract('demo-container', network, 'demo', options).state, 'exact');
+    assert.equal(harness.calls.some((args) => args[0] === 'version'), true);
+    assert.equal(harness.calls.some((args) => args[0] === 'info' && args[2]?.includes('NetworkBackend')), true);
+
+    record.Config.CreateCommand = ['podman', 'create', '--no-hosts', '--hosts-file=bad', '--add-host=wrong'];
+    assert.equal(harness.adapter.inspectContainerContract('demo-container', network, 'demo', options).state, 'exact');
+    record.HostConfig.HostsFile = '/etc/hosts';
+    assert.equal(harness.adapter.inspectContainerContract('demo-container', network, 'demo', options).state, 'owned-drift');
+    record.HostConfig.HostsFile = 'none';
+    record.HostConfig.ExtraHosts.push('host.docker.internal:host-gateway');
+    assert.equal(harness.adapter.inspectContainerContract('demo-container', network, 'demo', options).state, 'owned-drift');
+    record.HostConfig.ExtraHosts = ['host.containers.internal:host-gateway'];
+
+    record.Config.Labels[NETWORK_LABELS.contract] = '0'.repeat(64);
+    assert.equal(harness.adapter.inspectContainerContract('demo-container', network, 'demo', options).state, 'foreign');
+    record.Config.Labels[NETWORK_LABELS.contract] = networkContractHash(network);
+    harness.networks.get(names[1]).Options.isolate = 'false';
+    assert.throws(
+        () => harness.adapter.inspectContainerContract('demo-container', network, 'demo', options),
+        /isolate=true/,
+    );
 });
 
-test('gateway adoption proves exact permissions and readiness without mutating an exact existing gateway', async (t) => {
-    const { dir, socketPath } = await routerSocketFixture(t);
-    const workspaceRoot = path.join(dir, 'workspace');
-    const identity = workspaceNetworkIdentity(workspaceRoot);
-    const logicalName = 'shared';
-    const physicalName = physicalNetworkName(identity.hash, logicalName);
-    const gatewayName = gatewayContainerName(identity.hash);
-    const image = 'example.invalid/gateway:1@sha256:exact';
-    const networkLabels = {
-        [NETWORK_LABELS.managed]: '1', [NETWORK_LABELS.resource]: 'network',
-        [NETWORK_LABELS.schema]: '2', [NETWORK_LABELS.workspace]: identity.hash,
-        [NETWORK_LABELS.logical]: logicalName,
-    };
-    const gatewayLabels = {
-        [NETWORK_LABELS.managed]: '1', [NETWORK_LABELS.resource]: 'gateway',
-        [NETWORK_LABELS.schema]: '2', [NETWORK_LABELS.workspace]: identity.hash,
-    };
-    const networkRecord = {
-        Name: physicalName, Driver: 'bridge', Internal: false, IPv6Enabled: false, DNSEnabled: true,
-        Options: { isolate: 'true' }, IPAM: { Driver: 'host-local', Config: [{ Subnet: '10.3.0.0/24', Gateway: '10.3.0.1' }] },
-        Labels: networkLabels,
-    };
-    let gateway = gatewayRecord({
-        name: gatewayName,
-        image: 'example.invalid/gateway@sha256:exact',
-        socketPath,
-        networkName: physicalName,
-        labels: gatewayLabels,
+test('running hosts validation tolerates unrelated entries but rejects duplicate managed names', (t) => {
+    const harness = networkHarness(t);
+    const network = canonicalizeNetwork({ mode: 'default' });
+    const plan = harness.adapter.prepare(network, 'demo');
+    const id = 'abcdef0123456789';
+    harness.containers.set(id, managedAgentRecord({
+        id,
+        name: 'demo-container',
+        labels: managedAgentLabels(harness.identity, network),
+        networks: { [plan.attachments[0].name]: { Aliases: ['demo', id.slice(0, 12)] } },
+        running: true,
+    }));
+    const options = { contractHash: networkContractHash(network) };
+    assert.equal(harness.adapter.inspectContainerContract('demo-container', network, 'demo', options).state, 'exact');
+
+    const duplicateAdapter = createNetworkLifecycleAdapter({
+        runtime: 'podman',
+        run: harness.run,
+        workspaceRoot: harness.identity.canonical,
+        inspectRunningHosts: () => '10.0.0.1 host.containers.internal\n10.0.0.2 host.containers.internal host.docker.internal\n',
     });
-    gateway.HostConfig.CapDrop = [
-        'CAP_CHOWN', 'CAP_DAC_OVERRIDE', 'CAP_FOWNER', 'CAP_FSETID', 'CAP_KILL',
-        'CAP_NET_BIND_SERVICE', 'CAP_SETFCAP', 'CAP_SETGID', 'CAP_SETPCAP',
-        'CAP_SETUID', 'CAP_SYS_CHROOT',
+    assert.equal(duplicateAdapter.inspectContainerContract('demo-container', network, 'demo', options).state, 'owned-drift');
+});
+
+test('status schema 3 requires complete agent labels and allows unrelated extra labels', (t) => {
+    const harness = networkHarness(t);
+    const physicalName = physicalNetworkName(harness.identity.hash, 'shared');
+    const ownedHash = 'a'.repeat(64);
+    const records = [
+        ['owned-agent', managedAgentLabels(harness.identity, { mode: 'default' }, ownedHash, { extra: 'allowed' })],
+        ['partial-agent', { [NETWORK_LABELS.workspace]: harness.identity.hash }],
+        ['uppercase-hash', managedAgentLabels(harness.identity, { mode: 'default' }, 'A'.repeat(64))],
+        ['wrong-resource', { ...managedAgentLabels(harness.identity, { mode: 'default' }, 'b'.repeat(64)), [NETWORK_LABELS.resource]: 'gateway' }],
     ];
-    gateway.HostConfig.Tmpfs['/tmp'] += ',rprivate,tmpcopyup';
-    gateway.Id = 'abcdef1234567890';
-    gateway.NetworkSettings.Networks[physicalName].Aliases.push(gateway.Id.slice(0, 12));
-    const mutations = [];
-    let observedForwarding = '0\n';
-    const run = (_runtime, args) => {
-        if (args[0] === 'info') return ok(args[2].includes('Rootless') ? 'true\n' : 'false\n');
-        if (args[0] === 'image' && args[1] === 'inspect') return ok('[]');
-        if (args[0] === 'unshare') return ok(observedForwarding);
-        if (args[0] === 'network' && args[1] === 'ls') return ok(JSON.stringify([networkRecord]));
-        if (args[0] === 'network' && args[1] === 'inspect') return ok(JSON.stringify([networkRecord]));
-        if (args[0] === 'container' && args[1] === 'inspect') {
-            return gateway ? ok(JSON.stringify([gateway])) : absent('container');
-        }
-        if (args[0] === 'rm' && args.at(-1) === gatewayName) {
-            mutations.push(args);
-            gateway = null;
-            return ok();
-        }
-        if (args[0] === 'run') {
-            mutations.push(args);
-            const labels = {};
-            args.forEach((value, index) => {
-                if (value !== '--label') return;
-                const [key, ...rest] = String(args[index + 1]).split('=');
-                labels[key] = rest.join('=');
-            });
-            const networkName = args[args.indexOf('--network') + 1];
-            gateway = gatewayRecord({ name: gatewayName, image, socketPath, networkName, labels });
-            return ok(gatewayName);
-        }
-        mutations.push(args);
-        return absent('resource');
-    };
-    let probes = 0;
-    const adapter = createNetworkLifecycleAdapter({
-        runtime: 'podman', run, workspaceRoot, routerSocket: socketPath, gatewayImage: image,
-        probeGateway: () => { probes += 1; return ok(); },
-    });
-    const adopted = adapter.ensureGateway([{ name: physicalName, logicalName, primary: true }]);
-    assert.equal(adopted.created, false);
-    assert.equal(probes, 1);
-    assert.deepEqual(mutations, []);
-    assert.deepEqual(adapter.status().gateway.attachments, [{
-        physicalName,
-        aliases: ['ploinky-router'],
-    }]);
-
-    gateway.Config.Image = 'example.invalid/gateway@sha256:different';
-    assert.throws(() => adapter.ensureGateway([{ name: physicalName, logicalName, primary: true }]), /unexpected image/);
-    gateway.Config.Image = 'example.invalid/gateway@sha256:exact';
-
-    const removedCapability = gateway.HostConfig.CapDrop.pop();
-    assert.throws(() => adapter.ensureGateway([{ name: physicalName, logicalName, primary: true }]), /exact CapDrop=ALL/);
-    gateway.HostConfig.CapDrop.push(removedCapability);
-
-    delete gateway.HostConfig.Sysctls;
-    gateway.Config.CreateCommand = ['podman', 'run', '--sysctl', 'net.ipv4.ip_forward=0', image];
-    assert.equal(adapter.ensureGateway([{ name: physicalName, logicalName, primary: true }]).created, false);
-    observedForwarding = '1\n';
-    assert.throws(() => adapter.ensureGateway([{ name: physicalName, logicalName, primary: true }]), /live IPv4 forwarding is not disabled/);
-    observedForwarding = '0\n';
-    gateway.HostConfig.Sysctls = { 'net.ipv4.ip_forward': '0' };
-    delete gateway.Config.CreateCommand;
-
-    gatewayLabels['unexpected.extra'] = 'rejected';
-    assert.throws(() => adapter.ensureGateway([{ name: physicalName, logicalName, primary: true }]), /exact label keys/);
-    delete gatewayLabels['unexpected.extra'];
-
-    const namespaceProbeCalls = [];
-    const namespaceProbe = createNetworkLifecycleAdapter({
-        runtime: 'podman', workspaceRoot, routerSocket: socketPath, gatewayImage: image,
-        run: (runtime, args) => {
-            if (args[0] === 'unshare') { namespaceProbeCalls.push(args); return ok(); }
-            return run(runtime, args);
-        },
-    });
-    namespaceProbe.ensureGateway([{ name: physicalName, logicalName, primary: true }]);
-    assert.equal(namespaceProbeCalls.length, 1);
-    assert.deepEqual(namespaceProbeCalls[0].slice(0, 5), ['unshare', 'nsenter', '--target', String(process.pid), '--net']);
-    assert.equal(namespaceProbeCalls[0].at(-1), '127.0.0.1');
-
-    mutations.length = 0;
-    let staleProbeCount = 0;
-    const staleSocket = createNetworkLifecycleAdapter({
-        runtime: 'podman', run, workspaceRoot, routerSocket: socketPath, gatewayImage: image,
-        probeGateway: () => {
-            staleProbeCount += 1;
-            return staleProbeCount === 1 ? { ok: false, status: 1, stderr: 'stale socket' } : ok();
-        },
-    });
-    const replaced = staleSocket.ensureGateway([{ name: physicalName, logicalName, primary: true }]);
-    assert.equal(replaced.created, true);
-    assert.equal(replaced.replaced, true);
-    assert.deepEqual(mutations.map((args) => args[0]), ['rm', 'run']);
-
-    mutations.length = 0;
-    gateway.Labels[NETWORK_LABELS.routerSocket] = 'stale-device:stale-inode';
-    const inodeReplaced = adapter.ensureGateway([{ name: physicalName, logicalName, primary: true }]);
-    assert.equal(inodeReplaced.created, true);
-    assert.equal(inodeReplaced.replaced, true);
-    assert.deepEqual(mutations.map((args) => args[0]), ['rm', 'run']);
-
-    mutations.length = 0;
-    const unreachable = createNetworkLifecycleAdapter({
-        runtime: 'podman', run, workspaceRoot, routerSocket: socketPath, gatewayImage: image,
-        probeGateway: () => ({ ok: false, status: 1, stderr: 'unreachable' }),
-    });
-    assert.throws(() => unreachable.ensureGateway([{ name: physicalName, logicalName, primary: true }]), /TCP 8080.*probe failed/);
-    assert.deepEqual(mutations.map((args) => args[0]), ['rm', 'run', 'rm']);
-
-    fs.chmodSync(socketPath, 0o600);
-    assert.throws(() => adapter.ensureGateway([{ name: physicalName, logicalName, primary: true }]), /exactly chmod 0666/);
-    assert.deepEqual(mutations.map((args) => args[0]), ['rm', 'run', 'rm']);
+    const attached = {};
+    for (const [index, [name, labels]] of records.entries()) {
+        const id = `${index}`.repeat(16);
+        attached[id] = { Name: name, Aliases: [name] };
+        harness.containers.set(id, managedAgentRecord({
+            id,
+            name,
+            labels,
+            networks: { [physicalName]: { Aliases: [name, id.slice(0, 12)] } },
+        }));
+    }
+    harness.networks.set(physicalName, managedNetworkRecord(harness.identity, 'shared', physicalName, attached));
+    const status = harness.adapter.status();
+    assert.equal(status.schemaVersion, NETWORK_STATUS_SCHEMA_VERSION);
+    assert.deepEqual(Object.keys(status), ['schemaVersion', 'workspaceHash', 'networks']);
+    assert.deepEqual(status.networks[0].attachments.map(({ containerName, ownership }) => [containerName, ownership]), [
+        ['owned-agent', 'agent'],
+        ['partial-agent', 'unknown'],
+        ['uppercase-hash', 'unknown'],
+        ['wrong-resource', 'unknown'],
+    ]);
 });
 
-test('prune proves rootless ownership and cannot interleave with a held start transaction lock', () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-network-prune-lock-'));
-    const lockPath = path.join(dir, 'network.lock');
-    let runtimeCalls = 0;
-    const rootful = createNetworkLifecycleAdapter({
-        runtime: 'podman', lockPath, workspaceRoot: path.join(dir, 'workspace'),
-        run: () => { runtimeCalls += 1; return ok('false\n'); },
-    });
-    assert.throws(() => rootful.prune(), /rootless Podman/);
-    assert.equal(runtimeCalls, 1);
+test('prune re-inspects and removes only exact-owned empty networks without disconnecting attachments', (t) => {
+    const harness = networkHarness(t);
+    const emptyName = physicalNetworkName(harness.identity.hash, 'empty');
+    const usedName = physicalNetworkName(harness.identity.hash, 'used');
+    const foreignName = physicalNetworkName(harness.identity.hash, 'foreign');
+    harness.networks.set(emptyName, managedNetworkRecord(harness.identity, 'empty', emptyName));
+    harness.networks.set(usedName, managedNetworkRecord(harness.identity, 'used', usedName, {
+        unknown: { Name: 'manual-container' },
+    }));
+    const foreign = managedNetworkRecord(harness.identity, 'foreign', foreignName);
+    foreign.Labels.extra = 'spoof';
+    harness.networks.set(foreignName, foreign);
+    const report = harness.adapter.prune();
+    assert.deepEqual(report.removed, [emptyName]);
+    assert.equal(report.preserved.some((entry) => entry.name === usedName && entry.reason === 'in-use'), true);
+    assert.equal(report.preserved.some((entry) => entry.name === foreignName && entry.reason === 'foreign'), true);
+    assert.equal(harness.calls.some((args) => args[0] === 'network' && args[1] === 'disconnect'), false);
+    assert.equal(harness.calls.filter((args) => args[0] === 'network' && args[1] === 'inspect' && args[2] === emptyName).length >= 2, true);
+});
 
-    const held = acquireNetworkLifecycleLock({ lockPath });
-    const prune = createNetworkLifecycleAdapter({
-        runtime: 'podman', lockPath, workspaceRoot: path.join(dir, 'workspace'),
-        run: () => assert.fail('prune must not reach the runtime while start owns the lock'),
+test('managed transaction creates multiple attachments, verifies start, and commits exact policy', (t) => {
+    const harness = networkHarness(t);
+    const network = canonicalizeNetwork({
+        mode: 'bridge',
+        attachments: [{ name: 'front', primary: true }, { name: 'data' }],
     });
-    assert.throws(() => prune.prune(), /already owned/);
-    held.release();
-    fs.rmSync(dir, { recursive: true, force: true });
+    let observedPlan;
+    const result = harness.adapter.runManagedContainerTransaction({
+        network,
+        canonicalAgentId: 'demo',
+        containerName: 'demo-container',
+        createContainer(plan) {
+            observedPlan = plan;
+            const id = 'candidate1234567890';
+            const primary = plan.attachments.find((entry) => entry.primary);
+            const record = managedAgentRecord({
+                id,
+                name: 'demo-container',
+                labels: managedAgentLabels(harness.identity, network),
+                networks: { [primary.name]: { Aliases: [plan.alias, id.slice(0, 12)] } },
+            });
+            harness.containers.set(id, record);
+            harness.networks.get(primary.name).Containers[id] = { Name: record.Name };
+        },
+    });
+    assert.equal(result.attachments.length, 2);
+    assert.deepEqual(observedPlan.args.slice(-3), [
+        '--hosts-file=none', '--add-host', 'host.containers.internal:host-gateway',
+    ]);
+    const candidate = [...harness.containers.values()][0];
+    assert.equal(candidate.State.Running, true);
+    assert.equal(Object.keys(candidate.NetworkSettings.Networks).length, 2);
+});
+
+test('host-gateway start failure removes the candidate, restores prior current-contract agent, and rolls back new networks', (t) => {
+    const harness = networkHarness(t);
+    const network = canonicalizeNetwork({ mode: 'default' });
+    const previousId = 'previous123456789';
+    const previous = managedAgentRecord({
+        id: previousId,
+        name: 'demo-container',
+        labels: managedAgentLabels(harness.identity, network),
+        running: true,
+    });
+    harness.containers.set(previousId, previous);
+    const candidateId = 'candidate123456789';
+    const baseRun = harness.run;
+    const run = (runtime, args) => {
+        if (args[0] === 'start' && args[1] === candidateId) {
+            harness.calls.push([...args]);
+            return { ...absent('host-gateway'), stderr: 'unable to replace host-gateway' };
+        }
+        return baseRun(runtime, args);
+    };
+    const adapter = createNetworkLifecycleAdapter({
+        runtime: 'podman',
+        run,
+        workspaceRoot: harness.identity.canonical,
+        lockPath: path.join(harness.dir, 'failure.lock'),
+    });
+    assert.throws(() => adapter.runManagedContainerTransaction({
+        network,
+        canonicalAgentId: 'demo',
+        containerName: 'demo-container',
+        createContainer(plan) {
+            const primary = plan.attachments[0];
+            const candidate = managedAgentRecord({
+                id: candidateId,
+                name: 'demo-container',
+                labels: managedAgentLabels(harness.identity, network),
+                networks: { [primary.name]: { Aliases: [plan.alias, candidateId.slice(0, 12)] } },
+            });
+            harness.containers.set(candidateId, candidate);
+            harness.networks.get(primary.name).Containers[candidateId] = { Name: candidate.Name };
+        },
+    }), /host-gateway/);
+    assert.equal([...harness.containers.values()].length, 1);
+    assert.equal(previous.Name, 'demo-container');
+    assert.equal(previous.State.Running, true);
+    assert.equal(harness.networks.size, 0);
+    assert.equal(harness.calls.some((args) => args[0] === 'rm' && args.at(-1) === candidateId), true);
+    assert.equal(harness.calls.some((args) => args[0] === 'rename' && args[1] === previousId && args[2] === 'demo-container'), true);
+});
+
+test('old contract hashes remain foreign and block replacement before mutation', (t) => {
+    const harness = networkHarness(t);
+    const network = canonicalizeNetwork({ mode: 'default' });
+    const id = 'legacy1234567890';
+    harness.containers.set(id, managedAgentRecord({
+        id,
+        name: 'demo-container',
+        labels: managedAgentLabels(harness.identity, network, '0'.repeat(64)),
+        running: true,
+    }));
+    assert.throws(() => harness.adapter.runManagedContainerTransaction({
+        network,
+        canonicalAgentId: 'demo',
+        containerName: 'demo-container',
+        createContainer: () => assert.fail('foreign agent must block candidate creation'),
+    }), /network-contract/);
+    assert.equal(harness.calls.some((args) => ['stop', 'rename'].includes(args[0])
+        || (args[0] === 'network' && args[1] === 'create')), false);
+});
+
+test('network lifecycle source contains no removed gateway, socket, managed-hosts, or namespace machinery', () => {
+    const source = fs.readFileSync(new URL('../../cli/services/networkLifecycle.js', import.meta.url), 'utf8');
+    for (const forbidden of [
+        'ploinky-network-gateway',
+        'router.sock',
+        'managed-hosts',
+        'gatewayContainerName',
+        'ensureGateway',
+        'remoteShellCommand',
+        'executeInRootlessNamespace',
+        'reconcileManagedControlPlane',
+    ]) {
+        assert.equal(source.includes(forbidden), false, `unexpected removed transport residue: ${forbidden}`);
+    }
 });

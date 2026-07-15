@@ -12,7 +12,7 @@ import { isBwrapProcessRunning, stopBwrapProcess } from './bwrap/bwrapFleet.js';
 import * as inputState from './inputState.js';
 import { applyManifestDirectives, prepareManifestRepositories } from './bootstrapManifest.js';
 import { executeHostHook, markPreinstallRunInProcess, resetPreinstallRunInProcess, isInlineCommand } from './lifecycleHooks.js';
-import { getActiveProfile, getProfileConfig, getProfileEnvVars } from './profileService.js';
+import { getActiveProfile, getProfileConfig, getProfileEnvVars, resolveManifestRuntimeProfile } from './profileService.js';
 import { getSecrets, createEnvWithSecrets, loadEnvFile } from './secretInjector.js';
 import { readSecretsFile } from './encryptedSecretsFile.js';
 import { buildEnvMap } from './secretVars.js';
@@ -30,6 +30,13 @@ import {
   resolveAgentAttachmentIdentity,
 } from './layerIdentification.js';
 import { preflightBoxPublicationForCommand } from './boxPublicationCoverage.js';
+import {
+  assertRouterEndpoint,
+  parseRouterPort,
+  resolveInitialRouterPort,
+  resolvePersistedRouterPort,
+  resolveRouterEndpoint,
+} from './routerPort.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -128,30 +135,24 @@ function spawnWatchdog(routerPath, port, routerPidFile) {
   return child;
 }
 
-async function waitForRouterReady(socketPath, port, child, timeoutMs = 15000) {
+async function waitForRouterReady(port, child, timeoutMs = 15000) {
+  const validatedPort = parseRouterPort(port, { source: 'router readiness port' });
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     if (child?.exitCode !== null && child?.exitCode !== undefined) {
-      throw new Error(`router exited before Unix listener became ready (exit ${child.exitCode})`);
+      throw new Error(`router exited before TCP listener became ready (exit ${child.exitCode})`);
     }
-    const unixReady = await new Promise((resolve) => {
-      const socket = net.createConnection(socketPath);
+    const tcpReady = await new Promise((resolve) => {
+      const socket = net.createConnection({ host: '127.0.0.1', port: validatedPort });
       const done = (value) => { socket.destroy(); resolve(value); };
       socket.once('connect', () => done(true));
       socket.once('error', () => done(false));
       socket.setTimeout(250, () => done(false));
     });
-    const tcpReady = unixReady && await new Promise((resolve) => {
-      const socket = net.createConnection({ host: '127.0.0.1', port: Number(port) });
-      const done = (value) => { socket.destroy(); resolve(value); };
-      socket.once('connect', () => done(true));
-      socket.once('error', () => done(false));
-      socket.setTimeout(250, () => done(false));
-    });
-    if (unixReady && tcpReady) return;
+    if (tcpReady) return;
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
-  throw new Error(`router listeners did not become ready at ${socketPath} and 127.0.0.1:${port}`);
+  throw new Error(`router TCP listener did not become ready at 127.0.0.1:${validatedPort}`);
 }
 
 function runWithSuspendedInput(callback) {
@@ -196,6 +197,24 @@ function wrapCliWithWebchat(command, env = process.env) {
     return trimmed;
   }
   return `/Agent/bin/webchat -- ${shellQuote(trimmed)}`;
+}
+
+function resolveManifestRouterEndpoint(manifest, {
+  explicitPort,
+  profileName,
+  persistedProfileName,
+  routerEndpoint,
+  path: manifestPath = 'manifest',
+} = {}) {
+  const resolution = resolveManifestRuntimeProfile(manifest, {
+    profileName,
+    persistedProfileName,
+    path: manifestPath,
+  });
+  if (routerEndpoint !== undefined) {
+    return assertRouterEndpoint(routerEndpoint, resolution.network.mode, { explicitPort });
+  }
+  return resolveRouterEndpoint(resolution.network.mode, { explicitPort });
 }
 
 function findAgentManifest(agentName) {
@@ -668,6 +687,30 @@ async function waitForManifestReadiness({ key, label, kind = 'dependency', manif
   }
 }
 
+async function resolveAndPersistStartRouterPort(staticAgentArg, portArg) {
+  const configuredStatic = workspaceSvc.getConfig()?.static;
+  const isInitialRouterStartup = Boolean(staticAgentArg) && !configuredStatic?.agent;
+  const resolvedStartPort = isInitialRouterStartup
+    ? resolveInitialRouterPort({ explicitPort: portArg })
+    : resolvePersistedRouterPort({ explicitPort: portArg });
+  await mergeRoutingConfig((current) => {
+    if (Object.prototype.hasOwnProperty.call(current, 'port')) {
+      const lockedPort = parseRouterPort(current.port, { source: 'persisted router port' });
+      if (lockedPort !== resolvedStartPort) {
+        const error = new Error(`explicit router port ${resolvedStartPort} does not match persisted router port ${lockedPort}`);
+        error.code = 'PLOINKY_ROUTER_PORT_MISMATCH';
+        throw error;
+      }
+    }
+    return {
+      ...current,
+      port: resolvedStartPort,
+      routes: current.routes || {},
+    };
+  });
+  return resolvedStartPort;
+}
+
 async function startWorkspace(staticAgentArg, portArg, {
   refreshComponentToken,
   ensureComponentToken,
@@ -676,9 +719,10 @@ async function startWorkspace(staticAgentArg, portArg, {
   branchPolicy,
   publicationPreflightComplete = false,
 } = {}) {
+  const resolvedStartPort = await resolveAndPersistStartRouterPort(staticAgentArg, portArg);
   const preflightArgs = [];
   if (staticAgentArg) preflightArgs.push(String(staticAgentArg));
-  if (portArg) preflightArgs.push(String(portArg));
+  preflightArgs.push(String(resolvedStartPort));
   if (branchPolicy?.branch) preflightArgs.push(`--branch=${branchPolicy.branch}`);
   for (const [repoName, branch] of Object.entries(branchPolicy?.repoBranches || {})) {
     preflightArgs.push(`--repo-branch=${repoName}=${branch}`);
@@ -686,7 +730,9 @@ async function startWorkspace(staticAgentArg, portArg, {
   if (branchPolicy?.fallback) preflightArgs.push(`--branch-fallback=${branchPolicy.fallback}`);
   if (branchPolicy?.resetRepos) preflightArgs.push('--reset-repos');
   if (!publicationPreflightComplete) {
-    await preflightBoxPublicationForCommand('start', preflightArgs);
+    await preflightBoxPublicationForCommand('start', preflightArgs, {
+      routerPort: resolvedStartPort,
+    });
   }
   let routerReadyForStart = false;
   let routerPortForStart = 0;
@@ -714,16 +760,14 @@ async function startWorkspace(staticAgentArg, portArg, {
     }));
     console.log(`Static: agent=${utils.colorize(staticAgent, 'cyan')} port=${utils.colorize(String(staticPort), 'yellow')}`);
     try {
-      await waitForRouterReady(path.join(PLOINKY_DIR, 'run', 'router.sock'), staticPort, null, 300);
+      await waitForRouterReady(staticPort, null, 300);
       routerReadyForStart = true;
       routerPortForStart = staticPort;
       routerContainerForStart = container;
-      console.log('[start] Existing router listeners are ready; preserving their Unix socket for the managed gateway.');
+      console.log('[start] Existing router TCP listener is ready.');
       return container;
     } catch (_) {
-      // No complete listener pair exists. Replace only the router process; the
-      // exact-owned gateway will deliberately reconcile its socket bind if one
-      // exists from an interrupted or explicit router restart.
+      // No TCP listener exists. Replace only the router process.
     }
     if (typeof killRouterIfRunning === 'function') {
       try { killRouterIfRunning(); } catch (_) {}
@@ -735,11 +779,11 @@ async function startWorkspace(staticAgentArg, portArg, {
     const child = spawnWatchdog(routerPath, staticPort, routerPidFile);
     try { fs.writeFileSync(routerPidFile, String(child.pid)); } catch (_) {}
     child.unref();
-    await waitForRouterReady(path.join(PLOINKY_DIR, 'run', 'router.sock'), staticPort, child);
+    await waitForRouterReady(staticPort, child);
     routerReadyForStart = true;
     routerPortForStart = staticPort;
     routerContainerForStart = container;
-    console.log(`[start] Watchdog launched in background (pid ${child.pid}); router listeners are ready.`);
+    console.log(`[start] Watchdog launched in background (pid ${child.pid}); router TCP listener is ready.`);
     return container;
   };
   // Clear the in-process preinstall dedup set so each workspace start (e.g.
@@ -783,7 +827,7 @@ async function startWorkspace(staticAgentArg, portArg, {
         }
         await ensureRouterReadyForStart({
           staticAgent: aliasResolved || staticAgentArg,
-          staticPort: parseInt(portArg || '0', 10) || 8080,
+          staticPort: resolvedStartPort,
           repoName: resolvedAgent.repo,
           shortAgentName: resolvedAgent.shortAgentName,
         });
@@ -805,7 +849,7 @@ async function startWorkspace(staticAgentArg, portArg, {
       } else {
         utils.debugLog(`startWorkspace: static agent '${staticAgentArg}' already enabled; reusing existing record.`);
       }
-      const portNum = parseInt(portArg || '0', 10) || 8080;
+      const portNum = resolvedStartPort;
       const cfg = workspaceSvc.getConfig() || {};
       cfg.static = { agent: aliasResolved || staticAgentArg, port: portNum };
       workspaceSvc.setConfig(cfg);
@@ -882,7 +926,10 @@ async function startWorkspace(staticAgentArg, portArg, {
     }
 
     const staticAgent = normalizedStaticAgent || cfg0.static.agent;
-    const staticPort = cfg0.static.port;
+    const staticPort = parseRouterPort(cfg0.static.port, { source: 'workspace static router port' });
+    if (staticPort !== resolvedStartPort) {
+      throw new Error(`start: workspace static router port ${staticPort} does not match persisted router port ${resolvedStartPort}`);
+    }
     let staticRepoName = null;
     let staticShortAgent = null;
 
@@ -1024,10 +1071,15 @@ async function startWorkspace(staticAgentArg, portArg, {
           const agentPath = path.dirname(manifestPath0);
           const repoName = rec.repoName || path.basename(path.dirname(agentPath));
           const routeKey = rec.alias || shortAgentName;
+          const routerEndpoint = resolveManifestRouterEndpoint(manifest, {
+            explicitPort: staticPort,
+            persistedProfileName: rec.profile,
+            path: `manifest(${repoName}/${shortAgentName})`,
+          });
           const { containerName, hostPort, additionalServerPort } = ensureAgentService(shortAgentName, manifest, agentPath, {
             containerName: name,
             alias: rec.alias,
-            routerPort: staticPort,
+            routerEndpoint,
             profileName: rec.profile || undefined
           });
           const executionMode = resolveAgentExecutionMode(manifest);
@@ -1205,6 +1257,7 @@ export async function runCliWithDependencies(agentName, args, dependencies) {
     attachInteractive,
     attachBwrapInteractive,
     attachSeatbeltInteractive,
+    resolveRouterEndpointForManifest: resolveRouterEndpointForManifestImpl = resolveManifestRouterEndpoint,
     projectPath,
     debugLog = () => {},
     log = () => {},
@@ -1215,6 +1268,7 @@ export async function runCliWithDependencies(agentName, args, dependencies) {
   const suppressLauncherLogs = env.PLOINKY_NO_TTY === '1';
   let registryRecord = null;
   let manifestLookup = agentName;
+  let routerEndpoint;
   try {
     registryRecord = resolveEnabledAgentRecord(agentName);
   } catch (err) {
@@ -1224,10 +1278,12 @@ export async function runCliWithDependencies(agentName, args, dependencies) {
 
   if (!registryRecord) {
     let autoEnableRef = null;
+    let autoEnableManifestPath = '';
     try {
       const resolved = findAgent(agentName);
       autoEnableRef = `${resolved.repo}/${resolved.shortAgentName}`;
       manifestLookup = autoEnableRef;
+      autoEnableManifestPath = resolved.manifestPath;
     } catch (err) {
       error(`Agent '${agentName}' is not found.`);
       if (err?.message) {
@@ -1235,6 +1291,11 @@ export async function runCliWithDependencies(agentName, args, dependencies) {
       }
       return;
     }
+
+    const manifestBeforeEnable = readManifest(autoEnableManifestPath);
+    routerEndpoint = resolveRouterEndpointForManifestImpl(manifestBeforeEnable, {
+      path: `manifest(${autoEnableRef})`,
+    });
 
     try {
       enableAgent(autoEnableRef, 'global');
@@ -1259,6 +1320,12 @@ export async function runCliWithDependencies(agentName, args, dependencies) {
     : manifestLookup;
   const { manifestPath, shortAgentName } = findAgent(resolvedManifestRef);
   const manifest = readManifest(manifestPath);
+  if (routerEndpoint === undefined) {
+    routerEndpoint = resolveRouterEndpointForManifestImpl(manifest, {
+      persistedProfileName: registryRecord?.record?.profile,
+      path: `manifest(${resolvedManifestRef})`,
+    });
+  }
   const cliBase = getCliCmd(manifest);
   if (!cliBase || !cliBase.trim()) { throw new Error(`Manifest for '${shortAgentName}' has no 'cli' command.`); }
 
@@ -1278,7 +1345,11 @@ export async function runCliWithDependencies(agentName, args, dependencies) {
   const agentDir = path.dirname(manifestPath);
   const repoName = path.basename(path.dirname(agentDir));
   debugLog(`[runCli] agent=${agentName} container=${registryRecord?.containerName || getAgentContainerName(shortAgentName, repoName)}`);
-  const containerInfo = ensureAgentService(shortAgentName, manifest, agentDir, { containerName: registryRecord?.containerName, alias: registryRecord?.record?.alias });
+  const containerInfo = ensureAgentService(shortAgentName, manifest, agentDir, {
+    containerName: registryRecord?.containerName,
+    alias: registryRecord?.record?.alias,
+    routerEndpoint,
+  });
   const containerName = (containerInfo && containerInfo.containerName)
     || registryRecord?.containerName
     || getAgentContainerName(shortAgentName, repoName);
@@ -1335,13 +1406,13 @@ export async function runCliWithDependencies(agentName, args, dependencies) {
     const attach = attachBwrapInteractive
       || (await import('./bwrap/bwrapServiceManager.js')).attachBwrapInteractive;
     withSuspendedInput(() => {
-      attach(shortAgentName, manifest, agentDir, projectPath, cmd, { containerName });
+      attach(shortAgentName, manifest, agentDir, projectPath, cmd, { containerName, routerEndpoint });
     });
   } else if (actualRuntime === 'seatbelt') {
     const attach = attachSeatbeltInteractive
       || (await import('./seatbelt/seatbeltServiceManager.js')).attachSeatbeltInteractive;
     withSuspendedInput(() => {
-      attach(shortAgentName, manifest, agentDir, projectPath, cmd, { containerName });
+      attach(shortAgentName, manifest, agentDir, projectPath, cmd, { containerName, routerEndpoint });
     });
   } else {
     withSuspendedInput(() => {
@@ -1352,7 +1423,8 @@ export async function runCliWithDependencies(agentName, args, dependencies) {
 
 async function runCli(agentName, args, { publicationPreflightComplete = false } = {}) {
   if (!publicationPreflightComplete) {
-    await preflightBoxPublicationForCommand('cli', [agentName, ...(args || [])]);
+    const routerPort = resolvePersistedRouterPort();
+    await preflightBoxPublicationForCommand('cli', [agentName, ...(args || [])], { routerPort });
   }
   const { ensureAgentService, attachInteractive, getAgentContainerName } = dockerSvc;
   return runCliWithDependencies(agentName, args, {
@@ -1379,7 +1451,8 @@ async function runCli(agentName, args, { publicationPreflightComplete = false } 
 
 async function runShell(agentName, { publicationPreflightComplete = false } = {}) {
   if (!publicationPreflightComplete) {
-    await preflightBoxPublicationForCommand('shell', agentName ? [agentName] : []);
+    const routerPort = resolvePersistedRouterPort();
+    await preflightBoxPublicationForCommand('shell', agentName ? [agentName] : [], { routerPort });
   }
   if (!agentName) { throw new Error('Usage: shell <agentName>'); }
   let registryRecord = null;
@@ -1394,16 +1467,21 @@ async function runShell(agentName, { publicationPreflightComplete = false } = {}
     : agentName;
   const { manifestPath, shortAgentName } = utils.findAgent(manifestLookup);
   const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
-  const { ensureAgentService, attachInteractive, getConfiguredProjectPath, getAgentContainerName, isContainerRunning } = dockerSvc;
+  const routerEndpoint = resolveManifestRouterEndpoint(manifest, {
+    persistedProfileName: registryRecord?.record?.profile,
+    path: `manifest(${manifestLookup})`,
+  });
+  const { ensureAgentService, attachInteractive, getConfiguredProjectPath, getAgentContainerName } = dockerSvc;
   const agentDir = path.dirname(manifestPath);
   const repoName = path.basename(path.dirname(agentDir));
   const registeredContainerName = registryRecord?.containerName || getAgentContainerName(shortAgentName, repoName);
-  let containerName = registeredContainerName;
-  if (!isContainerRunning(registeredContainerName)) {
-    const containerInfo = ensureAgentService(shortAgentName, manifest, agentDir, { containerName: registeredContainerName, alias: registryRecord?.record?.alias });
-    containerName = (containerInfo && containerInfo.containerName)
-      || registeredContainerName;
-  }
+  const containerInfo = ensureAgentService(shortAgentName, manifest, agentDir, {
+    containerName: registeredContainerName,
+    alias: registryRecord?.record?.alias,
+    routerEndpoint,
+  });
+  const containerName = (containerInfo && containerInfo.containerName)
+    || registeredContainerName;
   const cmd = '/bin/sh';
   const projPath = getConfiguredProjectPath(shortAgentName, repoName, registryRecord?.record?.alias);
 
@@ -1418,14 +1496,14 @@ async function runShell(agentName, { publicationPreflightComplete = false } = {}
     console.log(`[shell] command: ${cmd}`);
     const { attachBwrapInteractive } = await import('./bwrap/bwrapServiceManager.js');
     runWithSuspendedInput(() => {
-      attachBwrapInteractive(shortAgentName, manifest, agentDir, projPath, cmd, { containerName });
+      attachBwrapInteractive(shortAgentName, manifest, agentDir, projPath, cmd, { containerName, routerEndpoint });
     });
   } else if (actualRuntime === 'seatbelt') {
     console.log(`[shell] seatbelt agent: ${shortAgentName}`);
     console.log(`[shell] command: ${cmd}`);
     const { attachSeatbeltInteractive } = await import('./seatbelt/seatbeltServiceManager.js');
     runWithSuspendedInput(() => {
-      attachSeatbeltInteractive(shortAgentName, manifest, agentDir, projPath, cmd, { containerName });
+      attachSeatbeltInteractive(shortAgentName, manifest, agentDir, projPath, cmd, { containerName, routerEndpoint });
     });
   } else {
     console.log(`[shell] container: ${containerName}`);
@@ -1438,12 +1516,13 @@ async function runShell(agentName, { publicationPreflightComplete = false } = {}
 }
 
 async function reinstallAgent(agentName, { publicationPreflightComplete = false } = {}) {
+    const routerPort = resolvePersistedRouterPort();
     if (!publicationPreflightComplete) {
-        await preflightBoxPublicationForCommand('reinstall', agentName ? [agentName] : []);
+        await preflightBoxPublicationForCommand('reinstall', agentName ? [agentName] : [], { routerPort });
     }
     if (!agentName) { throw new Error('Usage: reinstall <name> | reinstall agent <name>'); }
 
-    const { getAgentContainerName, isContainerRunning, stopAndRemove, ensureAgentService } = dockerSvc;
+    const { getAgentContainerName, isContainerRunning, ensureAgentService } = dockerSvc;
     let registryRecord = null;
     try {
         registryRecord = agentsSvc.resolveEnabledAgentRecord(agentName);
@@ -1473,6 +1552,11 @@ async function reinstallAgent(agentName, { publicationPreflightComplete = false 
         console.error(`Failed to read manifest for '${agentName}': ${err?.message || err}`);
         return;
     }
+    const routerEndpoint = resolveManifestRouterEndpoint(manifest, {
+        explicitPort: routerPort,
+        persistedProfileName: registryRecord?.record?.profile,
+        path: `manifest(${resolved.repo}/${resolved.shortAgentName})`,
+    });
 
     const agentRuntime = getRuntimeForAgent(manifest);
     const bwrapRunning = isSandboxRuntime(agentRuntime) && isBwrapProcessRunning(resolved.shortAgentName);
@@ -1495,16 +1579,19 @@ async function reinstallAgent(agentName, { publicationPreflightComplete = false 
             const short = resolved.shortAgentName;
             const agentPath = path.dirname(resolved.manifestPath);
 
-            // Stop existing process (bwrap or container)
+            // Host sandboxes have no atomic container transaction, so stop only
+            // that process. Managed containers remain in place until the
+            // lifecycle transaction has a verified replacement candidate and
+            // can restore the previous container if candidate start fails.
             if (bwrapRunning) {
                 stopBwrapProcess(short);
             }
-            stopAndRemove(containerName);
             
             const { containerName: newContainerName, hostPort, additionalServerPort } = await ensureAgentService(short, manifest, agentPath, {
                 containerName,
                 alias: registryRecord?.record?.alias,
-                forceRecreate: true
+                forceRecreate: true,
+                routerEndpoint,
             });
 
             console.log(`[reinstall] reinstalled '${short}' [container: ${newContainerName}]`);
@@ -1561,15 +1648,7 @@ async function reinstallAgent(agentName, { publicationPreflightComplete = false 
                 }
             }
             
-            let port = 8080;
-            if (cfg && cfg.port) { port = parseInt(cfg.port, 10) || port; }
-            try {
-                const saved = workspaceSvc.getConfig();
-                if (saved && saved.static && saved.static.port) {
-                    port = parseInt(saved.static.port, 10) || port;
-                }
-            } catch(_) {}
-            cfg.port = port;
+            cfg.port = routerPort;
             fs.mkdirSync(path.dirname(routingFile), { recursive: true });
             fs.writeFileSync(routingFile, JSON.stringify(cfg, null, 2));
 
@@ -1583,15 +1662,15 @@ async function reinstallAgent(agentName, { publicationPreflightComplete = false 
                     return out.includes(`:${p}`) && out.includes('LISTEN');
                 } catch(_) { return false; }
             };
-            if (!isRouterUp(cfg.port)) {
+            if (!isRouterUp(routerPort)) {
                 const runningDir = RUNNING_DIR;
                 fs.mkdirSync(runningDir, { recursive: true });
                 const routerPath = path.resolve(__dirname, '../server/Watchdog.js');
                 const routerPidFile = path.join(runningDir, 'router.pid');
-                const child = spawnWatchdog(routerPath, cfg.port, routerPidFile);
+                const child = spawnWatchdog(routerPath, routerPort, routerPidFile);
                 try { fs.writeFileSync(routerPidFile, String(child.pid)); } catch(_) {}
                 child.unref();
-                console.log(`[reinstall] Watchdog launched (pid ${child.pid}) on port ${cfg.port}.`);
+                console.log(`[reinstall] Watchdog launched (pid ${child.pid}) on port ${routerPort}.`);
                 console.log(`[reinstall] Watchdog will automatically restart the server if needed.`);
             }
         } catch (e) {
@@ -1607,7 +1686,10 @@ async function reinstallAgent(agentName, { publicationPreflightComplete = false 
 export {
   buildBlockingReadinessEntryFromNode,
   ensureGraphNodesEnabled,
+  resolveManifestRouterEndpoint,
+  resolveAndPersistStartRouterPort,
   resolveGraphNodeExecutionRecord,
+  waitForRouterReady,
   waitForManifestReadiness,
   waitForReadinessEntries,
   startWorkspace,

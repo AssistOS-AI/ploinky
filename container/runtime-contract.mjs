@@ -3,12 +3,13 @@ import {
     intervalsOverlap,
     parseExplicitPublishSpec,
 } from './publish-spec.mjs';
+import { parseRouterPort } from '../cli/services/routerPort.js';
 
 export const REQUIRED_RUNTIME_IMAGE =
     'docker.io/assistos/ploinky-box:runtime';
 export const RUNTIME_CONTRACT_LABEL =
     'io.assistos.ploinky.runtime-contract';
-export const REQUIRED_RUNTIME_CONTRACT = '3';
+export const REQUIRED_RUNTIME_CONTRACT = '4';
 export const REQUESTED_IMAGE_LABEL =
     'io.assistos.ploinky.requested-image';
 export const IDENTITY_SCHEMA_LABEL =
@@ -25,6 +26,7 @@ export const EXPLICIT_PUBLISHES_LABEL =
     'io.assistos.ploinky.explicit-publishes';
 export const IDENTITY_SCHEMA_VERSION = '1';
 export const REQUIRED_PUBLISH_PLAN_VERSION = '2';
+export const BOX_ROUTER_PORT = 8080;
 
 export const REQUIRED_IMAGE_USER = 'podman';
 export const REQUIRED_IMAGE_WORKDIR = '/workspace';
@@ -48,6 +50,10 @@ export const VOLUME_ROLES = Object.freeze({
 });
 
 const RAW_EXTRA_PUBLISH_SPECS = Symbol('rawExtraPublishSpecs');
+
+function selectedHostPort(invocation, source) {
+    return String(parseRouterPort(invocation?.port, { source }));
+}
 
 function inspectRecord(raw) {
     const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
@@ -560,6 +566,7 @@ export function createDefaultRuntimeConfig(invocation) {
     const sourceDir = invocation.sourceDirResolved;
     const mountDir = invocation.mountDirResolved || '';
     const requestedImage = invocation.image || REQUIRED_RUNTIME_IMAGE;
+    const hostPort = selectedHostPort(invocation, 'outer runtime host port');
     const labels = {
         [REQUESTED_IMAGE_LABEL]: requestedImage,
         [IDENTITY_SCHEMA_LABEL]: IDENTITY_SCHEMA_VERSION,
@@ -587,8 +594,8 @@ export function createDefaultRuntimeConfig(invocation) {
         volumes,
         routerPublish: {
             hostIp: invocation.listenLan ? '0.0.0.0' : '127.0.0.1',
-            hostPort: String(invocation.port || '8080'),
-            containerPort: '8080',
+            hostPort,
+            containerPort: String(BOX_ROUTER_PORT),
             protocol: 'tcp',
         },
         extraPublishes: (invocation.publish || []).map(normalizePublishSpec),
@@ -621,14 +628,15 @@ export function mergeDesiredRuntimeConfig(
 ) {
     const desired = structuredClone(existing || createDefaultRuntimeConfig(invocation));
     const explicit = invocation.explicit || new Set();
+    const hostPort = selectedHostPort(invocation, 'selected outer runtime host port');
 
     const selectedImage = explicit.has('--image')
         ? invocation.image
         : existing?.requestedImage || existing?.image || REQUIRED_RUNTIME_IMAGE;
     desired.image = selectedImage;
     desired.requestedImage = selectedImage;
-    // Contract 3 is a clean security boundary. Never inherit the privileged
-    // or broad seccomp settings from a contract-2 container during replace.
+    // Contract 4 is a clean security boundary. Never inherit privileged or
+    // broad seccomp settings from an inspected container during replacement.
     desired.contract = REQUIRED_RUNTIME_CONTRACT;
     desired.user = REQUIRED_IMAGE_USER;
     desired.privileged = false;
@@ -652,12 +660,12 @@ export function mergeDesiredRuntimeConfig(
     if (!desired.routerPublish && (explicit.has('--port') || explicit.has('--listen-lan'))) {
         desired.routerPublish = {
             hostIp: invocation.listenLan ? '0.0.0.0' : '127.0.0.1',
-            hostPort: String(invocation.port || '8080'),
-            containerPort: '8080',
+            hostPort,
+            containerPort: String(BOX_ROUTER_PORT),
             protocol: 'tcp',
         };
     }
-    if (explicit.has('--port')) desired.routerPublish.hostPort = invocation.port;
+    if (explicit.has('--port')) desired.routerPublish.hostPort = hostPort;
     if (explicit.has('--listen-lan')) desired.routerPublish.hostIp = '0.0.0.0';
     if (explicit.has('--mount')) {
         const mountDir = invocation.mountDirResolved || invocation.mountDir;
@@ -724,10 +732,10 @@ export function planReconciliation({ existing, desired, contractMatches }) {
 
 export function buildRuntimeRunArgs(config, engineOptions = {}) {
     if (config.privileged) {
-        throw new Error('runtime contract 3 forbids privileged outer containers');
+        throw new Error('runtime contract 4 forbids privileged outer containers');
     }
     if ((config.capAdds || []).length > 0) {
-        throw new Error('runtime contract 3 forbids added outer-container capabilities');
+        throw new Error('runtime contract 4 forbids added outer-container capabilities');
     }
     const args = ['run', '-d', '--init', '--name', config.instance];
     if (config.user) args.push('--user', config.user);

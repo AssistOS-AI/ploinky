@@ -68,12 +68,15 @@ dependency volume. Ordinary agent containers run one level inside this runtime.
 
 The required outer image is the mutable
 `docker.io/assistos/ploinky-box:runtime` reference with the exact label
-`io.assistos.ploinky.runtime-contract=2`. Ploinky pulls that reference only when
+`io.assistos.ploinky.runtime-contract=4`. Ploinky pulls that reference only when
 creating a missing box or intentionally replacing an existing one, validates the
 complete image metadata, and starts the captured image ID rather than racing the
 mutable tag. Compatible reuse, stopped-box start, status, stop, and destroy do
-not pull. Contract-1 or contract-2 boxes without current identity and publication
-provenance labels are rejected; there is no migration or adoption path.
+not pull. Every non-contract-4 box, including contract 2 and contract 3, is
+rejected before planning, pulling, volume creation, or replacement. Ploinky
+does not automatically restart, upgrade, relabel, adopt, or replace such a
+box: run `ploinky destroy` explicitly, then run the desired command to recreate
+it from contract 4. Destroy retains the three named volumes.
 
 The outer container and its three explicitly labelled volumes are named from the
 canonical absolute current directory. Ploinky automatically discovers whether
@@ -95,7 +98,28 @@ labels, or persistent image configuration.
 
 Ordinary agent images intentionally contain neither Podman nor Docker. Every
 Ploinky-managed agent and helper container runs through nested Podman inside the
-managed outer runtime.
+managed outer runtime. Contract-4 managed networking requires rootless Podman
+5.4 or newer with Netavark and an operational `pasta`; there is no
+`slirp4netns` fallback. Managed `default` and `bridge` agents receive only the
+exact `host.containers.internal:host-gateway` mapping and router endpoint env,
+while `host` uses box loopback and `none` receives no router endpoint.
+
+Before updating a direct/core installation to the contract-4 release, run the
+old checkout's core entry directly:
+
+```sh
+node cli/index.js destroy
+node cli/index.js network prune
+```
+
+Do not use the public `ploinky` wrapper for this step: outside a box it controls
+the outer runtime rather than the old core workspace. Inspect or resolve any
+foreign resources reported by the core prune. After confirming no container
+still references them, one-time cleanup may remove the exact stale
+`.ploinky/run/router.sock` and `.ploinky/run/managed-hosts` paths and the now
+unreferenced cached image
+`docker.io/assistos/ploinky-network-gateway:1@sha256:68c47ce93d16ea1a2d03944f7b50ce82e6f2f9a26b183d2c9c7fbabcc828fb7e`.
+Do not use a broad container, image, volume, or network prune for this cutover.
 
 For local core development without entering the managed runtime, run the CLI
 entry directly from your checkout:

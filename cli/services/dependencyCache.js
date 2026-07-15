@@ -437,12 +437,8 @@ export function buildContainerInstallRunArgs({
 } = {}) {
     const resolvedRuntime = runtime || getRuntime();
     const volumeSuffix = resolvedRuntime === 'podman' ? ':z' : '';
-    const roArgs = resolvedRuntime === 'podman'
-        ? ['--network', 'slirp4netns:allow_host_loopback=true']
-        : [];
     return [
         'run', '--rm', ...managedContainerLabelArgs(),
-        ...roArgs,
         // Dependency-cache installation is a maintenance step against a writable
         // host cache, so it must not inherit non-root USER defaults from runtime
         // images such as web-publishing.

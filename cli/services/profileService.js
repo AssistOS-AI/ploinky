@@ -207,6 +207,95 @@ export function getActiveProfile() {
     return 'default';
 }
 
+function profileNotFoundError(agentName, profileName, profiles) {
+    const availableProfiles = Object.keys(profiles || {}).sort();
+    const error = new Error(
+        `[profile] ${agentName}: profile '${profileName}' not found. Available: ${availableProfiles.join(', ') || '(none)'}`,
+    );
+    error.code = 'PLOINKY_PROFILE_NOT_FOUND';
+    return error;
+}
+
+/**
+ * Resolve one atomic profile selection from an already-loaded manifest.
+ * Callers must use resolvedProfileName, profileConfig, and network together.
+ */
+export function resolveManifestProfile(manifest, requestedProfileName, {
+    agentName = 'agent',
+    explicit = false,
+    path: manifestPath = `manifest(${agentName})`,
+} = {}) {
+    const source = manifest && typeof manifest === 'object' && !Array.isArray(manifest)
+        ? manifest
+        : {};
+    validateManifestNetworks(source, { path: manifestPath });
+
+    const profiles = source.profiles && typeof source.profiles === 'object' && !Array.isArray(source.profiles)
+        ? source.profiles
+        : {};
+    const requestedProfile = String(requestedProfileName || 'default').trim().toLowerCase() || 'default';
+    const hasProfiles = Object.keys(profiles).length > 0;
+
+    if (!hasProfiles) {
+        if (explicit && requestedProfile !== 'default') {
+            throw profileNotFoundError(agentName, requestedProfile, profiles);
+        }
+        return {
+            requestedProfileName: requestedProfile,
+            resolvedProfileName: 'default',
+            profileConfig: null,
+            network: effectiveManifestNetwork(source, 'default', { path: manifestPath }),
+        };
+    }
+
+    const defaultProfile = profiles.default;
+    if (!defaultProfile) {
+        throw new Error(`Agent ${agentName} missing required 'default' profile in manifest.json`);
+    }
+
+    const requestedExists = Object.prototype.hasOwnProperty.call(profiles, requestedProfile);
+    if (!requestedExists && explicit) {
+        throw profileNotFoundError(agentName, requestedProfile, profiles);
+    }
+    const resolvedProfileName = requestedExists ? requestedProfile : 'default';
+    const selectedProfile = profiles[resolvedProfileName];
+    const network = effectiveManifestNetwork(source, resolvedProfileName, { path: manifestPath });
+    const mergedProfile = resolvedProfileName === 'default'
+        ? defaultProfile
+        : mergeProfiles(defaultProfile, selectedProfile);
+
+    return {
+        requestedProfileName: requestedProfile,
+        resolvedProfileName,
+        profileConfig: { ...mergedProfile, network },
+        network,
+    };
+}
+
+/**
+ * Resolve the effective runtime profile with stable precedence. CLI options and
+ * persisted records are strict selections; the global profile may fall back to
+ * the manifest's required default profile when it is not declared by an agent.
+ */
+export function resolveManifestRuntimeProfile(manifest, {
+    agentName = 'agent',
+    profileName,
+    persistedProfileName,
+    fallbackProfileName = getActiveProfile(),
+    path: manifestPath = `manifest(${agentName})`,
+} = {}) {
+    const optionProfileName = String(profileName || '').trim().toLowerCase();
+    const recordProfileName = String(persistedProfileName || '').trim().toLowerCase();
+    const globalProfileName = String(fallbackProfileName || 'default').trim().toLowerCase() || 'default';
+    const explicitProfileName = optionProfileName || recordProfileName;
+
+    return resolveManifestProfile(manifest, explicitProfileName || globalProfileName, {
+        agentName,
+        explicit: Boolean(explicitProfileName),
+        path: manifestPath,
+    });
+}
+
 /**
  * Set the active profile.
  * @param {string} profileName - The profile name to set
@@ -253,41 +342,16 @@ export function getProfileConfig(agentName, profileName) {
     try {
         const { manifestPath } = findAgent(agentName);
         const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
-        validateManifestNetworks(manifest, { path: `manifest(${agentName})` });
-        const profiles = manifest?.profiles;
-
-        // If no profiles section exists, agent uses legacy mode (no profile config)
-        if (!profiles || Object.keys(profiles).length === 0) {
-            return null;
-        }
-
-        // If profiles exist, a 'default' profile is required for proper isolation
-        const defaultProfile = profiles.default;
-        if (!defaultProfile) {
-            throw new Error(`Agent ${agentName} missing required 'default' profile in manifest.json`);
-        }
-
-        // Get active profile name
-        const activeProfileName = profileName || getActiveProfile();
-
-        // If requesting default or no active profile config exists, return default
-        if (activeProfileName === 'default' || !profiles[activeProfileName]) {
-            return {
-                ...defaultProfile,
-                network: effectiveManifestNetwork(manifest, 'default', { path: `manifest(${agentName})` }),
-            };
-        }
-
-        // Merge default with active profile (active overrides default)
-        const activeProfile = profiles[activeProfileName];
-        return {
-            ...mergeProfiles(defaultProfile, activeProfile),
-            network: effectiveManifestNetwork(manifest, activeProfileName, { path: `manifest(${agentName})` }),
-        };
+        return resolveManifestProfile(manifest, profileName || getActiveProfile(), {
+            agentName,
+            path: `manifest(${agentName})`,
+        }).profileConfig;
     } catch (err) {
         debugLog(`getProfileConfig: ${err.message}`);
         // Re-throw missing profile errors so they bubble up
-        if (err.message.includes('missing required') || err.code === 'PLOINKY_NETWORK_CONTRACT_INVALID') {
+        if (err.message.includes('missing required')
+            || err.code === 'PLOINKY_NETWORK_CONTRACT_INVALID'
+            || err.code === 'PLOINKY_PROFILE_NOT_FOUND') {
             throw err;
         }
         return null;

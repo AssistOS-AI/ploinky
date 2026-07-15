@@ -45,14 +45,18 @@ The managed public-entrypoint boundary is:
 
 The outer-runtime release channel is the mutable
 `docker.io/assistos/ploinky-box:runtime` reference and its image must satisfy
-the complete contract-2 metadata, including
-`io.assistos.ploinky.runtime-contract=2`. Creating a missing box or replacing a
+the complete contract-4 metadata, including
+`io.assistos.ploinky.runtime-contract=4`. Creating a missing box or replacing a
 compatible box for a requested configuration change must pull and validate the
 selected reference, then run the validated image ID. Reusing a running box or
 starting a stopped compatible box must not pull; an existing box therefore
 stays pinned until an explicit destroy/recreate or configuration replacement.
-Contract-1 and malformed boxes are a hard cut: no migration, adoption, copying,
-or legacy-volume mapping is permitted.
+Every non-contract-4 box is a hard cut, including contract 2, contract 3,
+malformed, identity-incompatible, and publication-provenance-free state. It
+fails before planning, pulling, volume creation, restart, upgrade, or
+replacement. Ploinky does not migrate, relabel, adopt, copy, or automatically
+replace it. The operator must run `ploinky destroy` explicitly and then recreate
+the contract-4 box; all three current named volumes remain retained.
 
 The host supervisor derives the box identity only from the canonical current
 directory: a readable sanitized basename plus a 12-character SHA-256 path
@@ -111,7 +115,23 @@ Generated env entries ignore same-named operator values by default. A generated 
 
 An object-form manifest env entry may declare `runtime: false`. The field must be a JSON boolean. Ploinky still resolves and validates that value for host lifecycle hooks, startup config providers, manifest image templating, and environment-hash reconciliation, but omits both the value and its `PLOINKY_ENV_SOURCE_<ENV_NAME>` marker from container OCI environment metadata and from bwrap or Seatbelt process environments. This exclusion also dominates a duplicate declaration of the same name in `expose`; `expose` cannot reintroduce a host-hook-only value at a runtime boundary. This is the supported boundary for credentials that a host preinstall hook materializes into a generated, read-only runtime input. The default is `runtime: true`; Ploinky does not infer host-only handling from an env name or from a particular agent.
 
-The manifest `network` object selects the container's network namespace. The default is a workspace-defined bridge selected by `network.name` (with optional `network.aliases` for sibling DNS). When an agent declares `network.mode: "host"`, the runtime must run the container with `--network host`, must not create or attach a named bridge, must not emit inner `-p` port publishes, and must not register network aliases. A host-network agent's `openPorts` entries still name its reachable runtime-side sockets and remain eligible for host publication; they are not reduced to probe-only metadata. Sibling agents on a bridge can reach a host-network agent through the runtime-provided host gateway entry (for example `host.containers.internal`) rather than through a bridge alias.
+The manifest `network` object selects exactly one of `default`, `bridge`,
+`host`, or `none`. Omission means `default`, which creates a per-effective-agent
+private managed bridge. `bridge` requires a nonempty `attachments` array of
+portable logical names and exactly one `primary: true`; agents intentionally
+sharing an attachment can reach one another by derived alias. The legacy
+`network.name` and `network.aliases` fields are rejected. `host` runs with
+`--network host`, creates no managed bridge or aliases, and emits no inner `-p`
+publishes. `none` has no network and rejects AgentServer, `openPorts`,
+`additionalServerPort`, router env, and network-dependent readiness.
+
+Inside the managed outer runtime, `default` and `bridge` are rootless-Podman
+managed modes. Each container receives exactly `--hosts-file=none --add-host
+host.containers.internal:host-gateway`; Ploinky injects the validated router
+host, port, and URL using that hostname. `host` receives the router endpoint on
+`127.0.0.1`; `none` receives no endpoint variables. Managed bridge creation
+requires Podman 5.4 or newer, Netavark, and operational `pasta`; there is no
+`slirp4netns` fallback.
 
 The `network` object may also be set inside a profile block (`manifest.profiles.<profile>.network`) and overrides the root manifest `network` when the active profile defines one. This mirrors how `openPorts`, `env`, and `enable` already specialize per profile and is the supported way to vary the network namespace across deployment targets — for example, a media SFU that needs `network.mode: "host"` in `prod` (where the platform supports it and the UDP/SRC-NAT workaround applies) while keeping a bridge-network configuration in `dev` and `default` (so a developer workstation that cannot expose host-network container ports — notably macOS where podman runs inside a VM — can still serve the readiness probe and reach sibling agents through bridge aliases).
 
@@ -131,7 +151,7 @@ An effective instance is keyed by canonical repository/agent plus either its can
 
 Explicit outer `--publish` and `--expose` arguments remain raw engine arguments and retain their order. Ploinky canonicalizes only their terminal container target interval and protocol, subtracts the union of those explicit targets from generated claims, and deterministically emits every uncovered generated subrange. A fully covered generated socket disappears; a partially covered range is split without rewriting, reordering, or deduplicating the explicit arguments. TCP and UDP coverage remain independent.
 
-Every supported contract-2 outer container must persist a versioned publication plan and separate ordered explicit/generated publication lists in supervisor-owned labels. A later plan preserves explicit values when they were not restated and replaces stale generated values. Missing, malformed, oversized, or unsupported provenance is incompatible and must fail before planning or mutation rather than inferring ownership from current engine bindings. Replacement rollback must restore the prior image, publications, and provenance labels.
+Every supported contract-4 outer container must persist a versioned publication plan and separate ordered explicit/generated publication lists in supervisor-owned labels. A later plan preserves explicit values when they were not restated and replaces stale generated values. Missing, malformed, oversized, or unsupported provenance is incompatible and must fail before planning or mutation rather than inferring ownership from current engine bindings. Replacement rollback must restore the prior image, publications, and provenance labels. There is no compatibility exception for an older runtime contract.
 
 The supervisor passes the authoritative socket coverage to core. One-shot host commands may reconcile the outer box before core mutation. An already-in-box command, including a REPL or Marketplace path, cannot replace its containing outer container and may proceed only when current coverage satisfies its planned claims. Insufficient coverage must fail before profile, registry, filesystem, hook, router, or nested-container mutation and return an actionable one-shot host command. Monitor restart denial must likewise create or start nothing.
 
