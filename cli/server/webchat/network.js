@@ -146,6 +146,7 @@ export function createNetwork({
     let reconnectTimer = null;
     let pendingUploads = 0;
     let sessionId = '';
+    let assistantMessageIndex = null;
 
     function sessionEndpoint(path) {
         const separator = String(path || '').includes('?') ? '&' : '?';
@@ -215,7 +216,7 @@ export function createNetwork({
         if (!stripped.trim()) {
             return;
         }
-        const displayed = addServerMsg(stripped);
+        const displayed = addServerMsg(stripped, { messageIndex: assistantMessageIndex });
         if (displayed && pendingUploads === 0) {
             hideTypingIndicator();
         }
@@ -332,6 +333,8 @@ export function createNetwork({
         es.addEventListener('user-message', (event) => {
             try {
                 const payload = JSON.parse(event.data);
+                const userMessageIndex = Number(payload?.messageIndex);
+                assistantMessageIndex = Number.isInteger(userMessageIndex) ? userMessageIndex + 1 : null;
                 if (payload?.sourceTabId !== TAB_ID && typeof addRemoteUserMessage === 'function') {
                     addRemoteUserMessage(payload.message, payload);
                 }
@@ -352,7 +355,16 @@ export function createNetwork({
         es.addEventListener('task-update', (event) => {
             try {
                 const payload = JSON.parse(event.data);
-                if (typeof onTaskUpdate === 'function') onTaskUpdate(payload);
+                if (typeof onTaskUpdate === 'function') {
+                    if (payload?.sessionId && payload.sessionId !== sessionId) {
+                        const workspaceUpdate = { ...payload };
+                        delete workspaceUpdate.sessionId;
+                        delete workspaceUpdate.messageIndex;
+                        onTaskUpdate(workspaceUpdate);
+                    } else {
+                        onTaskUpdate(payload);
+                    }
+                }
             } catch (error) {
                 dlog('task update error', error);
             }
@@ -608,6 +620,7 @@ export function createNetwork({
             const normalized = typeof nextSessionId === 'string' ? nextSessionId.trim() : '';
             if (normalized === sessionId) return;
             sessionId = normalized;
+            assistantMessageIndex = null;
             if (restart) {
                 stop();
                 start();

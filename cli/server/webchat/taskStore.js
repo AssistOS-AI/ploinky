@@ -173,7 +173,13 @@ function ingestLog(logDirectory, taskId, rawLog = {}) {
         resultHash: resultHash || cursor.resultHash,
         truncated: rawLog.truncated === true,
     });
-    return appended;
+    let nextOffset = 0;
+    try {
+        nextOffset = fs.readFileSync(logPath, 'utf8').length;
+    } catch (error) {
+        if (error?.code !== 'ENOENT') throw error;
+    }
+    return { appended, nextOffset };
 }
 
 export function ingestTaskEvent(workspaceDirectory, envelope) {
@@ -190,8 +196,14 @@ export function ingestTaskEvent(workspaceDirectory, envelope) {
         || existing.error !== task.error
         || existing.description !== task.description;
     if (metadataChanged) appendMetadata(journalPath, task);
-    const logAppend = envelope?.log ? ingestLog(logDirectory, task.id, envelope.log) : '';
-    return { task, logAppend };
+    const logUpdate = envelope?.log
+        ? ingestLog(logDirectory, task.id, envelope.log)
+        : { appended: '', nextOffset: null };
+    return {
+        task,
+        logAppend: logUpdate.appended,
+        ...(Number.isInteger(logUpdate.nextOffset) ? { logOffset: logUpdate.nextOffset } : {}),
+    };
 }
 
 export function listTasks(workspaceDirectory) {

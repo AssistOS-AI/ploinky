@@ -1,3 +1,9 @@
+import {
+    renderTaskLog,
+    taskDurationLabel,
+    taskStatusPresentation,
+} from './taskPresentation.js';
+
 function formatTime(value) {
     const date = new Date(value || 0);
     if (Number.isNaN(date.getTime())) return '';
@@ -15,14 +21,47 @@ export function createTaskController({ toEndpoint, elements, showBanner }) {
         taskToast,
     } = elements;
     const tasks = new Map();
+    const logs = new Map();
+    const subscribers = new Map();
     let selectedId = '';
-    let selectedLog = '';
-    let logOffset = 0;
     let toastTimer = null;
     let unreadTerminal = 0;
+    let ready = false;
 
     function orderedTasks() {
         return [...tasks.values()].sort((left, right) => Date.parse(right.updatedAt) - Date.parse(left.updatedAt));
+    }
+
+    function snapshot(taskId) {
+        const log = logs.get(taskId);
+        return {
+            task: tasks.get(taskId) || null,
+            ready,
+            log: log?.loaded ? log.text : '',
+            logLoaded: log?.loaded === true,
+        };
+    }
+
+    function notify(taskId) {
+        const listeners = subscribers.get(taskId);
+        if (!listeners) return;
+        const value = snapshot(taskId);
+        for (const listener of listeners) listener(value);
+    }
+
+    function notifyAll() {
+        for (const taskId of subscribers.keys()) notify(taskId);
+    }
+
+    function subscribe(taskId, listener) {
+        if (!subscribers.has(taskId)) subscribers.set(taskId, new Set());
+        subscribers.get(taskId).add(listener);
+        listener(snapshot(taskId));
+        return () => {
+            const listeners = subscribers.get(taskId);
+            listeners?.delete(listener);
+            if (listeners?.size === 0) subscribers.delete(taskId);
+        };
     }
 
     function updateBadge() {
@@ -36,7 +75,7 @@ export function createTaskController({ toEndpoint, elements, showBanner }) {
 
     function showToast(task) {
         if (!taskToast) return;
-        taskToast.textContent = `${task.description || task.toolName || 'Task'}: ${task.status}`;
+        taskToast.textContent = `${task.description || task.toolName || 'Task'}: ${taskStatusPresentation(task).label}`;
         taskToast.hidden = false;
         if (toastTimer) clearTimeout(toastTimer);
         toastTimer = setTimeout(() => { taskToast.hidden = true; }, 5000);
@@ -59,10 +98,11 @@ export function createTaskController({ toEndpoint, elements, showBanner }) {
         title.textContent = task.description || task.toolName || task.id;
         const meta = document.createElement('div');
         meta.className = 'wa-task-meta';
-        meta.textContent = `${task.targetAgent} · ${task.toolName} · ${formatTime(task.updatedAt)}`;
+        meta.textContent = `${task.targetAgent} · ${task.toolName} · ${formatTime(task.updatedAt)} · ${taskDurationLabel(task)}`;
+        const presentation = taskStatusPresentation(task);
         const status = document.createElement('span');
-        status.className = `wa-task-status is-${task.status}`;
-        status.textContent = task.status;
+        status.className = `wa-task-status is-${presentation.className}`;
+        status.textContent = presentation.label;
         heading.append(title, meta, status);
         if (task.error) {
             const error = document.createElement('div');
@@ -70,9 +110,9 @@ export function createTaskController({ toEndpoint, elements, showBanner }) {
             error.textContent = task.error;
             heading.appendChild(error);
         }
-        const log = document.createElement('pre');
+        const log = document.createElement('div');
         log.className = 'wa-task-log';
-        log.textContent = selectedLog || 'No log output yet.';
+        renderTaskLog(log, logs.get(task.id)?.text || '');
         taskDetail.append(heading, log);
         if (stickToEnd) log.scrollTop = log.scrollHeight;
     }
@@ -99,10 +139,11 @@ export function createTaskController({ toEndpoint, elements, showBanner }) {
             const footer = document.createElement('span');
             footer.className = 'wa-task-list-footer';
             const agent = document.createElement('span');
-            agent.textContent = task.targetAgent || '';
+            agent.textContent = `${task.targetAgent || ''} · ${taskDurationLabel(task)}`;
+            const presentation = taskStatusPresentation(task);
             const status = document.createElement('span');
-            status.className = `wa-task-status is-${task.status}`;
-            status.textContent = task.status;
+            status.className = `wa-task-status is-${presentation.className}`;
+            status.textContent = presentation.label;
             footer.append(agent, status);
             button.append(description, footer);
             button.addEventListener('click', () => void selectTask(task.id));
@@ -114,14 +155,17 @@ export function createTaskController({ toEndpoint, elements, showBanner }) {
         const response = await fetch(toEndpoint(`tasks/${encodeURIComponent(taskId)}/log?offset=0`), { credentials: 'include' });
         if (!response.ok) throw new Error(`task_log_${response.status}`);
         const payload = await response.json();
-        selectedLog = typeof payload.text === 'string' ? payload.text : '';
-        logOffset = Number(payload.nextOffset) || selectedLog.length;
+        logs.set(taskId, {
+            text: typeof payload.text === 'string' ? payload.text : '',
+            offset: Number(payload.nextOffset) || 0,
+            loaded: true,
+        });
+        notify(taskId);
+        return logs.get(taskId).text;
     }
 
     async function selectTask(taskId) {
         selectedId = taskId;
-        selectedLog = '';
-        logOffset = 0;
         renderList();
         renderDetail();
         try {
@@ -138,8 +182,10 @@ export function createTaskController({ toEndpoint, elements, showBanner }) {
         const payload = await response.json();
         tasks.clear();
         for (const task of Array.isArray(payload.tasks) ? payload.tasks : []) tasks.set(task.id, task);
+        ready = true;
         updateBadge();
         renderList();
+        notifyAll();
         if (selectedId && tasks.has(selectedId)) await selectTask(selectedId);
     }
 
@@ -160,6 +206,18 @@ export function createTaskController({ toEndpoint, elements, showBanner }) {
         if (!task?.id) return;
         const previous = tasks.get(task.id);
         tasks.set(task.id, { ...previous, ...task });
+        const cache = logs.get(task.id);
+        const appended = typeof payload.logAppend === 'string' ? payload.logAppend : '';
+        const nextOffset = Number(payload.logOffset);
+        if (cache?.loaded && appended) {
+            if (!Number.isFinite(nextOffset) || nextOffset > cache.offset) {
+                cache.text += appended;
+                cache.offset = Number.isFinite(nextOffset) ? nextOffset : cache.text.length;
+            } else if (nextOffset < cache.offset) {
+                cache.loaded = false;
+                void loadLog(task.id).catch(() => {});
+            }
+        }
         const becameTerminal = previous?.status === 'ongoing' && task.status !== 'ongoing';
         if (becameTerminal) {
             unreadTerminal += 1;
@@ -167,15 +225,11 @@ export function createTaskController({ toEndpoint, elements, showBanner }) {
         }
         updateBadge();
         renderList();
+        notify(task.id);
         if (selectedId === task.id) {
             const currentLog = taskDetail?.querySelector('.wa-task-log');
             const stickToEnd = !currentLog
                 || currentLog.scrollHeight - currentLog.scrollTop - currentLog.clientHeight < 24;
-            const appended = typeof payload.logAppend === 'string' ? payload.logAppend : '';
-            if (appended) {
-                selectedLog += appended;
-                logOffset += appended.length;
-            }
             renderDetail({ stickToEnd });
         }
     }
@@ -188,7 +242,12 @@ export function createTaskController({ toEndpoint, elements, showBanner }) {
     document.addEventListener('keydown', (event) => {
         if (event.key === 'Escape' && tasksDialog && !tasksDialog.hidden) close();
     });
+    setInterval(() => {
+        if (!tasksDialog || tasksDialog.hidden) return;
+        renderList();
+        renderDetail({ stickToEnd: false });
+    }, 1000);
 
     void refresh().catch(() => {});
-    return { handleUpdate, refresh, open, close };
+    return { handleUpdate, refresh, open, close, subscribe, loadLog, getTask: (taskId) => tasks.get(taskId) || null };
 }

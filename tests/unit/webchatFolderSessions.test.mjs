@@ -36,6 +36,15 @@ test('WebChat exposes a workspace task overlay and generic task endpoints', () =
     assert.match(network, /addEventListener\('task-update'/);
     assert.match(taskRoutes, /pathname === '\/tasks' && req\.method === 'GET'/);
     assert.match(taskRoutes, /\/tasks\\\/\(task_/);
+    const messages = read('cli/server/webchat/messages.js');
+    const presentation = read('cli/server/webchat/taskPresentation.js');
+    assert.match(messages, /wa-inline-task/);
+    assert.match(messages, /message\.taskId/);
+    assert.match(presentation, /\(stdout\|stderr\)/);
+    assert.match(presentation, /RUNNER_PREFIX_RE/);
+    assert.match(presentation, /setInterval\(renderSummary, 1000\)/);
+    assert.match(presentation, /stickToEnd \? log\.scrollHeight : previousScrollTop/);
+    assert.doesNotMatch(presentation, /setInterval\(renderLog/);
 });
 
 test('WebChat tab identity is restored from sessionStorage before UUID fallback', () => {

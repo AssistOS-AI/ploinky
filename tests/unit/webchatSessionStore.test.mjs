@@ -15,6 +15,7 @@ import {
     listSessions,
     loadSession,
     selectSession,
+    setAssistantTaskId,
 } from '../../cli/server/webchat/sessionStore.js';
 
 function makeWorkspace(t) {
@@ -133,6 +134,25 @@ test('normalizes optional assistant progress without changing legacy messages', 
     const context = formatContinuationContext(loaded);
     assert.doesNotMatch(context, /first|second|UI only/);
     assert.equal((context.match(/Assistant:/g) || []).length, 2);
+});
+
+test('persists one validated task id only on an assistant message', (t) => {
+    const workspace = makeWorkspace(t);
+    const session = ensureCurrentSession(workspace);
+    const turn = appendSessionTurn(workspace, session.sessionId, { text: 'Run task' });
+    const taskId = 'task_1234567890abcdef12345678';
+
+    setAssistantTaskId(workspace, session.sessionId, turn.assistantMessageIndex, taskId);
+    setAssistantTaskId(workspace, session.sessionId, turn.assistantMessageIndex, taskId);
+
+    const loaded = loadSession(workspace, session.sessionId);
+    assert.equal(loaded.messages[1].taskId, taskId);
+    assert.equal(Object.hasOwn(loaded.messages[0], 'taskId'), false);
+    assert.throws(
+        () => setAssistantTaskId(workspace, session.sessionId, turn.assistantMessageIndex, 'invalid'),
+        /invalid_task_id/,
+    );
+    assert.doesNotMatch(formatContinuationContext(loaded), /task_123456/);
 });
 
 test('repairs an invalid current pointer without deleting valid sessions', (t) => {

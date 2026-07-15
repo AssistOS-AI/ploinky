@@ -15,6 +15,11 @@ import {
     hasRuntimeBackgroundTasks,
     routeWorkspaceRuntimeOutput,
 } from '../../cli/server/handlers/webchat/runtimeState.js';
+import {
+    appendSessionTurn,
+    ensureCurrentSession,
+    loadSession,
+} from '../../cli/server/webchat/sessionStore.js';
 
 function workspace() {
     return fs.mkdtempSync(path.join(os.tmpdir(), 'webchat-tasks-'));
@@ -62,6 +67,13 @@ test('log snapshots append only their new suffix', () => {
     assert.match(__testables.overlapDelta('old', 'new'), /source truncated/);
 });
 
+test('task storage preserves raw stream and runner prefixes for UI-only formatting', () => {
+    const root = workspace();
+    const raw = '[opencode stdout] result\n[opencode stderr] warning\n[opencodeAgent/execute-task] exit code=0\n';
+    ingestTaskEvent(root, event({}, { tail: raw, seq: 1 }));
+    assert.equal(readTaskLog(root, event().task.id).text, raw);
+});
+
 test('task log is capped at one MiB', () => {
     const root = workspace();
     for (let index = 0; index < 6; index += 1) {
@@ -87,4 +99,34 @@ test('structured task output is persisted and broadcast without entering chat hi
     assert.equal(tab.backgroundTaskIds.has(event().task.id), true);
     assert.match(writes.join(''), /event: task-update/);
     assert.equal(hasRuntimeBackgroundTasks(tab), true);
+});
+
+test('a started task is associated with the active assistant placeholder', (t) => {
+    const root = workspace();
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+    const session = ensureCurrentSession(root);
+    const turn = appendSessionTurn(root, session.sessionId, { text: 'Build project' });
+    const writes = [];
+    const tab = {
+        workspaceDirectory: root,
+        sessionId: session.sessionId,
+        backgroundTaskIds: new Set(),
+        subscribers: new Map([['client', { res: { write: (value) => writes.push(value) } }]]),
+        workspaceHistory: {
+            workspaceDirectory: root,
+            sessionId: session.sessionId,
+            lastAssistantMessageIndex: turn.assistantMessageIndex,
+        },
+    };
+    const appState = { runtimes: new Map([['runtime', tab]]) };
+    routeWorkspaceRuntimeOutput(appState, tab, `${JSON.stringify({
+        __webchatTask: 1,
+        event: 'started',
+        task: event().task,
+    })}\n`);
+
+    assert.equal(loadSession(root, session.sessionId).messages[1].taskId, event().task.id);
+    const wire = writes.join('');
+    assert.match(wire, new RegExp(`"sessionId":"${session.sessionId}"`));
+    assert.match(wire, /"messageIndex":1/);
 });

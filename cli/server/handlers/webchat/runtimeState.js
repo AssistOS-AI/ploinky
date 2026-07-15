@@ -4,6 +4,7 @@ import {
     appendAssistantProgress,
     appendSessionMessage,
     appendToAssistantMessage,
+    setAssistantTaskId,
     summarizeSession
 } from '../../webchat/sessionStore.js';
 import { hasOngoingTask, ingestTaskEvent } from '../../webchat/taskStore.js';
@@ -261,12 +262,32 @@ function routeCompleteOutputLine(appState, tab, line) {
             const envelope = JSON.parse(normalized);
             if (envelope?.__webchatTask) {
                 const update = ingestTaskEvent(tab.workspaceDirectory, envelope);
+                let messageIndex = null;
+                if (envelope.event === 'started' && Number.isInteger(tab.workspaceHistory?.lastAssistantMessageIndex)) {
+                    try {
+                        messageIndex = tab.workspaceHistory.lastAssistantMessageIndex;
+                        setAssistantTaskId(
+                            tab.workspaceHistory.workspaceDirectory,
+                            tab.workspaceHistory.sessionId,
+                            messageIndex,
+                            update.task.id,
+                        );
+                    } catch (_) {
+                        messageIndex = null;
+                    }
+                }
                 if (!(tab.backgroundTaskIds instanceof Set)) tab.backgroundTaskIds = new Set();
                 tab.backgroundTaskIds.add(update.task.id);
                 broadcastWorkspaceTaskEvent(
                     appState,
                     tab.workspaceDirectory,
-                    `event: task-update\ndata: ${JSON.stringify(update)}\n\n`,
+                    `event: task-update\ndata: ${JSON.stringify({
+                        ...update,
+                        ...(messageIndex !== null ? {
+                            sessionId: tab.workspaceHistory.sessionId,
+                            messageIndex,
+                        } : {}),
+                    })}\n\n`,
                 );
                 return;
             }

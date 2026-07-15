@@ -1,5 +1,6 @@
 import { formatBytes, getFileIcon } from './fileHelpers.js';
 import { findMentionRanges } from './composerMentionHighlights.js';
+import { attachInlineTaskPanel } from './taskPresentation.js';
 
 const ENABLE_SELECT_PAGINATION_ACTIONS = false;
 const AUTO_SCROLL_BOTTOM_THRESHOLD_PX = 4;
@@ -20,6 +21,7 @@ export function createMessages({
     markdown,
     initialViewMoreLineLimit,
     sidePanel,
+    taskController,
     onQuickCommand,
     onTypingStateChange
 }) {
@@ -32,6 +34,9 @@ export function createMessages({
     let autoScrollLocked = true;
     let programmaticScroll = false;
     let pendingProgressItems = [];
+    const assistantBubbles = new Map();
+    const taskAssociations = new Map();
+    const taskPanelCleanups = new Map();
     const tableScrollHintBindings = new WeakMap();
 
     function isScrolledToBottom() {
@@ -1020,6 +1025,28 @@ export function createMessages({
         panel.appendChild(list);
     }
 
+    function attachTaskPanel(bubble, taskId) {
+        if (!bubble || !taskId || !taskController) return;
+        const existing = bubble.querySelector(':scope > .wa-inline-task');
+        if (existing?.dataset.taskId === taskId) return;
+        taskPanelCleanups.get(bubble)?.();
+        existing?.remove();
+        const dispose = attachInlineTaskPanel({ bubble, taskId, taskController });
+        taskPanelCleanups.set(bubble, () => {
+            dispose();
+            taskPanelCleanups.delete(bubble);
+        });
+    }
+
+    function associateTask(payload) {
+        const taskId = payload?.task?.id;
+        const messageIndex = Number.isInteger(payload?.messageIndex) ? payload.messageIndex : null;
+        if (!taskId || !Number.isInteger(messageIndex)) return;
+        taskAssociations.set(messageIndex, taskId);
+        const bubble = assistantBubbles.get(messageIndex);
+        if (bubble) attachTaskPanel(bubble, taskId);
+    }
+
     function applyViewMoreSettingToAllBubbles() {
         if (!chatList) {
             return;
@@ -1275,7 +1302,9 @@ export function createMessages({
             normalized = normalized.replace(/^\n+/, '');
         }
 
-        if (!normalized.trim() && progressItems.length === 0) {
+        const messageIndex = Number.isInteger(options.messageIndex) ? options.messageIndex : null;
+        const taskId = options.taskId || (Number.isInteger(messageIndex) ? taskAssociations.get(messageIndex) : '');
+        if (!normalized.trim() && progressItems.length === 0 && !taskId) {
             lastServerMsg.bubble = null;
             lastServerMsg.fullText = '';
             userInputSent = false;
@@ -1292,6 +1321,7 @@ export function createMessages({
             if (progressItems.length) {
                 attachProgressPanel(lastServerMsg.bubble, progressItems);
             }
+            if (taskId) attachTaskPanel(lastServerMsg.bubble, taskId);
             if (explicitProgressItems === null && pendingProgressItems.length) {
                 resetProgressEvents();
             }
@@ -1311,6 +1341,8 @@ export function createMessages({
             if (progressItems.length) {
                 attachProgressPanel(bubble, progressItems);
             }
+            if (Number.isInteger(messageIndex)) assistantBubbles.set(messageIndex, bubble);
+            if (taskId) attachTaskPanel(bubble, taskId);
             if (explicitProgressItems === null && pendingProgressItems.length) {
                 resetProgressEvents();
             }
@@ -1341,8 +1373,14 @@ export function createMessages({
         if (!chatList) return;
         const children = Array.from(chatList.children);
         for (const child of children) {
-            if (child !== typingIndicator && child !== historyGate) child.remove();
+            if (child !== typingIndicator && child !== historyGate) {
+                const bubble = child.querySelector?.('.wa-message-bubble');
+                if (bubble) taskPanelCleanups.get(bubble)?.();
+                child.remove();
+            }
         }
+        assistantBubbles.clear();
+        taskAssociations.clear();
         lastServerMsg.bubble = null;
         lastServerMsg.fullText = '';
         lastClientCommand = '';
@@ -1353,7 +1391,9 @@ export function createMessages({
 
     function renderHistory(historyMessages = []) {
         clearMessages();
-        for (const message of Array.isArray(historyMessages) ? historyMessages : []) {
+        const messages = Array.isArray(historyMessages) ? historyMessages : [];
+        for (let messageIndex = 0; messageIndex < messages.length; messageIndex += 1) {
+            const message = messages[messageIndex];
             const text = formatStoredMessageText(message);
             if (message?.role === 'user') {
                 addClientMsg(text, { historical: true, timestamp: message.timestamp });
@@ -1361,7 +1401,9 @@ export function createMessages({
                 addServerMsg(text, {
                     forceNew: true,
                     timestamp: message.timestamp,
-                    progressItems: Array.isArray(message.progress) ? message.progress : []
+                    progressItems: Array.isArray(message.progress) ? message.progress : [],
+                    messageIndex,
+                    taskId: message.taskId,
                 });
             }
         }
@@ -1375,6 +1417,7 @@ export function createMessages({
         addServerMsg,
         clearMessages,
         renderHistory,
+        associateTask,
         addProgressEvent,
         showTypingIndicator,
         hideTypingIndicator,

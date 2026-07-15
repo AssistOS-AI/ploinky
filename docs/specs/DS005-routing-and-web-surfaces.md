@@ -36,7 +36,9 @@ create or reuse `<cwd>/.copilot_history/`, store one JSON file per conversation,
 and keep the selected conversation id in `.copilot_history/current_session.json`.
 Stored messages contain role, text, timestamp, attachments, and references.
 Assistant messages created for a user turn may additionally contain `progress`,
-whose value must be an ordered array of non-empty strings. Writes must be atomic,
+whose value must be an ordered array of non-empty strings, and one validated
+`taskId` that associates the message with separately persisted task state. Task
+status and log content must not be copied into the session JSON. Writes must be atomic,
 malformed session files must not appear in the selector, and a symlinked history
 directory must be rejected.
 
@@ -100,6 +102,26 @@ that block without an empty text bubble. Progress remains UI metadata rather
 than assistant text and must not enter continuation context.
 
 WebChat may also receive generic `__webchatTask` lifecycle envelopes from a selected CLI. These envelopes must be intercepted before conversation rendering and history capture. Ploinky must store workspace-scoped task metadata as append-only JSON lines in `<cwd>/.copilot_history/agent_tasks`, store bounded per-task logs separately under `.copilot_history/task_logs/`, and expose authenticated `GET /webchat/tasks` and `GET /webchat/tasks/<task-id>/log` routes. Browser updates must use the existing EventSource stream with a `task-update` event; Ploinky must not hardcode target-agent ids or tool names.
+
+The first `started` envelope for a user turn must attach its task id to that
+turn's existing assistant placeholder. Live correlation may include the folder
+session id and assistant message index on the EventSource event, but this
+transient routing data must not be duplicated in the task journal. The browser
+must render the task as a collapsible module at the bottom of the ordinary
+assistant bubble, keep collecting updates while collapsed, and recover the same
+module after history loading by resolving `message.taskId` against the task and
+log routes. The module must show the exact target-agent id, description, status,
+and elapsed whole seconds. It remains available after terminal completion; a
+missing task record renders as unavailable.
+
+The Tasks overlay and inline task module must share one presentation policy.
+Pending work is shown as `QUEUED`, active work as `RUNNING`, and terminal states
+as `COMPLETED`, `STOPPED`, or `FAILED`. Raw task log files remain unchanged and
+are written only by task-event ingestion. Browser rendering strips stream and
+runner prefixes such as `[opencode stdout]`, `[opencode stderr]`, and
+`[opencodeAgent/execute-task]`; stdout remains primary and stderr uses a less
+prominent text color. Runner start/exit diagnostics are omitted because duration
+is displayed separately, while timeout and crash information remains visible.
 
 When a WebChat runtime has no SSE subscribers but owns a task whose materialized state is `ongoing`, reconnect cleanup must retain that runtime so its agent can continue router-mediated polling and log collection. Once its tasks become terminal, the normal reconnect grace and disposal behavior resumes. If the runtime is recreated after a wider process restart, the selected CLI may reattach from the workspace task journal. Task identity must be based on the target agent and remote task id; a PID is optional diagnostics only.
 

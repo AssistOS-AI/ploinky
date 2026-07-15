@@ -80,6 +80,22 @@ const sidePanelApi = createSidePanel({
     sidePanelResizer
 }, { markdown });
 
+let sessionController = null;
+let taskController = null;
+taskController = createTaskController({
+    toEndpoint,
+    elements: {
+        tasksBtn,
+        tasksBadge,
+        tasksDialog,
+        tasksDialogClose,
+        tasksList,
+        taskDetail,
+        taskToast,
+    },
+    showBanner,
+});
+
 const messages = createMessages({
     chatList,
     typingIndicator,
@@ -88,6 +104,7 @@ const messages = createMessages({
     markdown,
     initialViewMoreLineLimit: getViewMoreLineLimit(),
     sidePanel: sidePanelApi,
+    taskController,
     onQuickCommand: null,
     onTypingStateChange: (typing) => {
         composer.setProcessingState(Boolean(typing));
@@ -101,8 +118,6 @@ dom.setViewMoreChangeHandler((limit) => {
 sidePanelApi.bindLinkDelegation(chatList);
 
 dlog('Initializing network for agent:', dom.agentName);
-let sessionController = null;
-let taskController = null;
 const network = createNetwork({
     TAB_ID,
     toEndpoint,
@@ -122,22 +137,11 @@ const network = createNetwork({
     markUserInputSent: messages.markUserInputSent,
     addRemoteUserMessage: (message, payload) => sessionController?.addRemoteUserMessage(message, payload),
     onSessionChanged: (session) => sessionController?.handleExternalSessionChange(session),
-    onTaskUpdate: (payload) => taskController?.handleUpdate(payload),
-    onConnected: () => taskController?.refresh().catch(() => {})
-});
-
-taskController = createTaskController({
-    toEndpoint,
-    elements: {
-        tasksBtn,
-        tasksBadge,
-        tasksDialog,
-        tasksDialogClose,
-        tasksList,
-        taskDetail,
-        taskToast,
+    onTaskUpdate: (payload) => {
+        taskController?.handleUpdate(payload);
+        messages.associateTask(payload);
     },
-    showBanner,
+    onConnected: () => taskController?.refresh().catch(() => {})
 });
 
 sessionController = createSessionController({

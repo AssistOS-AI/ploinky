@@ -6,6 +6,7 @@ const HISTORY_DIR_NAME = '.copilot_history';
 const CURRENT_FILE_NAME = 'current_session.json';
 const STORE_GITIGNORE = '*\n!.gitignore\n';
 const SESSION_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const TASK_ID_RE = /^task_[0-9a-f]{24}$/;
 
 function isInside(root, candidate) {
     const relative = path.relative(root, candidate);
@@ -99,6 +100,9 @@ function normalizeMessage(raw) {
             .filter((item) => typeof item === 'string')
             .map((item) => item.trim())
             .filter(Boolean);
+    }
+    if (role === 'assistant' && TASK_ID_RE.test(String(raw.taskId || ''))) {
+        message.taskId = raw.taskId;
     }
     return message;
 }
@@ -294,6 +298,19 @@ export function appendAssistantProgress(workspaceDirectory, sessionId, messageIn
     });
 }
 
+export function setAssistantTaskId(workspaceDirectory, sessionId, messageIndex, taskId) {
+    const normalizedTaskId = String(taskId || '').trim();
+    if (!TASK_ID_RE.test(normalizedTaskId)) throw new Error('invalid_task_id');
+    return updateSession(workspaceDirectory, sessionId, (record) => {
+        const message = record.messages[messageIndex];
+        if (!message || message.role !== 'assistant') throw new Error('assistant_message_not_found');
+        if (message.taskId && message.taskId !== normalizedTaskId) {
+            throw new Error('assistant_task_already_attached');
+        }
+        message.taskId = normalizedTaskId;
+    });
+}
+
 export function appendToAssistantMessage(workspaceDirectory, sessionId, messageIndex, text) {
     const extra = typeof text === 'string' ? text : '';
     if (!extra.trim()) return loadSession(workspaceDirectory, sessionId);
@@ -331,6 +348,7 @@ export function formatContinuationContext(session) {
 
 export const __testables = {
     SESSION_ID_RE,
+    TASK_ID_RE,
     normalizeSession,
     sessionPreview
 };

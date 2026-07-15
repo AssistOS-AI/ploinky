@@ -2808,9 +2808,12 @@ body {
 }
 
 .wa-task-status.is-ongoing { color: #d89b19; }
+.wa-task-status.is-queued { color: #d89b19; }
+.wa-task-status.is-running { color: #3486eb; }
 .wa-task-status.is-finished { color: var(--wa-online); }
 .wa-task-status.is-stopped { color: var(--wa-text-secondary); }
 .wa-task-status.is-error { color: #f15c6d; }
+.wa-task-status.is-unavailable { color: var(--wa-text-muted); }
 
 .wa-task-detail {
     min-width: 0;
@@ -2860,6 +2863,78 @@ body {
     font: 12px/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
     white-space: pre-wrap;
     overflow-wrap: anywhere;
+}
+
+.wa-task-log-line {
+    display: block;
+    min-height: 1.55em;
+}
+
+.wa-task-log-line.is-stderr,
+.wa-task-log-empty {
+    color: color-mix(in srgb, var(--wa-text-secondary) 62%, white);
+}
+
+.wa-inline-task {
+    display: block;
+    clear: both;
+    margin-top: 10px;
+    padding-top: 9px;
+    border-top: 1px solid color-mix(in srgb, var(--wa-border) 62%, transparent);
+}
+
+.wa-inline-task-toggle {
+    width: 100%;
+    padding: 0;
+    display: grid;
+    grid-template-columns: auto auto minmax(0, 1fr) auto auto;
+    align-items: center;
+    gap: 7px;
+    border: 0;
+    background: transparent;
+    color: var(--wa-text-primary);
+    font: inherit;
+    text-align: left;
+    cursor: pointer;
+}
+
+.wa-inline-task-arrow {
+    width: 12px;
+    color: var(--wa-text-secondary);
+}
+
+.wa-inline-task-agent {
+    font-size: 12px;
+}
+
+.wa-inline-task-description {
+    min-width: 0;
+    overflow: hidden;
+    color: var(--wa-text-secondary);
+    font-size: 12px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.wa-inline-task-duration {
+    color: var(--wa-text-muted);
+    font-size: 11px;
+    font-variant-numeric: tabular-nums;
+}
+
+.wa-inline-task-log {
+    max-height: min(360px, 48vh);
+    margin-top: 9px;
+    min-height: 72px;
+}
+
+.wa-inline-task-error {
+    margin-top: 9px;
+}
+
+.wa-inline-task.is-collapsed .wa-inline-task-log,
+.wa-inline-task.is-collapsed .wa-inline-task-error {
+    display: none;
 }
 
 .wa-task-empty {
