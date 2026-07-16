@@ -92,6 +92,11 @@ turn may retain an empty final text and any progress accumulated before
 interruption. Legacy messages without `progress` remain valid and must not gain
 the property during normalization.
 
+WebChat must suppress protocol envelope echoes and an explicit readline prompt
+echo shaped as `you> <submitted text>` before either persistence or browser
+broadcast. It must not classify ordinary assistant output as an echo merely
+because that output is identical to the submitted user text.
+
 The authenticated session API consists of `GET /webchat/sessions`, `POST /webchat/sessions`, `PUT /webchat/sessions/current`, and `GET /webchat/sessions/<session-id>`. Listing returns the current id and selector metadata without message bodies or counts. Full history is returned only by the per-session GET route. Selector entries expose the first user-message preview and update timestamp; the browser renders that timestamp as relative time.
 
 WebChat's EventSource stream must tolerate brief browser reconnects without killing the target TTY. Runtime identity is the canonical working directory, selected folder session, selected agent, and launch configuration; `tabId` identifies only a browser client and must be recovered from `sessionStorage` on refresh. A runtime may have multiple SSE subscribers and remains alive for the bounded reconnect grace window after the last subscriber leaves. Output produced without a subscriber is recovered from folder history on demand rather than replayed automatically from an in-memory tab buffer.
@@ -398,6 +403,15 @@ assistant output before the already visible task items.
 
 Response:
 The enabled-agent registry describes installed workspace intent and must survive periods when an optional worker is stopped. Routing state already identifies runtimes that were explicitly made reachable. Reusing that state lets the watchdog distinguish an intentionally dormant manual agent from an explicitly activated one without adding a second lifecycle store.
+
+### Question #16: Why is ordinary text equality insufficient for WebChat echo detection?
+
+Response:
+An agent may legitimately answer with the same text the user submitted. Treating
+that equality as terminal echo evidence discards a valid assistant response and
+leaves the browser waiting on an empty placeholder. Echo suppression therefore
+uses explicit transport markers, including WebChat envelopes and the `you>`
+readline prompt, rather than conversational text equality.
 
 ## Conclusion
 

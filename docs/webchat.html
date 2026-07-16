@@ -102,6 +102,11 @@ ploinky cli achilles-cli --path=/absolute/path</code></pre>
                         Agent progress reasons are appended to that array while the request is running, and final output updates the same message.
                         Tool names, step indexes, and other progress-envelope metadata are not stored.
                     </p>
+                    <p>
+                        WebChat removes transport echoes such as its structured input envelope and an explicit
+                        <code>you&gt; submitted text</code> readline prompt before storing or displaying output.
+                        Ordinary assistant text remains valid when it happens to equal the submitted user message.
+                    </p>
                     <ul style="margin-left: 2rem;">
                         <li><strong>Click to load session history</strong> appears as a centered standalone button inside the scrollable conversation, rather than as a chat message, and renders the current session only when requested. It is browser-only, is never stored as a message or sent to the agent, and disappears immediately when activated; the composer remains available while older messages are hidden.</li>
                         <li><strong>Sessions</strong> opens the session selector. Its first, emphasized <strong>New</strong> item creates an empty session and makes it current for the folder.</li>

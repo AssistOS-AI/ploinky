@@ -162,7 +162,7 @@ export function createNetwork({
 }) {
     let es = null;
     let chatBuffer = '';
-    const pendingEchoes = [];
+    let pendingUserPrompt = '';
     let reconnectAttempts = 0;
     let reconnectTimer = null;
     let pendingUploads = 0;
@@ -204,6 +204,12 @@ export function createNetwork({
 
         const normalized = stripped.trim();
 
+        if (pendingUserPrompt && normalized.startsWith('you> ')
+            && normalized.slice(5).trim() === pendingUserPrompt) {
+            pendingUserPrompt = '';
+            return;
+        }
+
         const progress = parseProgressEnvelope(normalized);
         if (progress) {
             if (typeof addProgressEvent === 'function') {
@@ -224,13 +230,6 @@ export function createNetwork({
             return;
         }
 
-        if (normalized && pendingEchoes.length) {
-            const expected = pendingEchoes[0];
-            if (normalized === expected) {
-                pendingEchoes.shift();
-                return;
-            }
-        }
         if (stripped !== text) {
             showTypingIndicator();
         }
@@ -424,20 +423,8 @@ export function createNetwork({
         const attachments = Array.isArray(payload.attachments) ? payload.attachments : [];
         const references = Array.isArray(payload.references) ? payload.references : [];
         const serialized = serializeEnvelope({ text, attachments, references });
-        const trimmedEnvelope = serialized.trim();
         const trimmedText = text.trim();
-
-        if (trimmedEnvelope) {
-            pendingEchoes.push(trimmedEnvelope);
-            pendingEchoes.push(serialized);
-            pendingEchoes.push(`${serialized}\n`);
-        }
-        if (trimmedText) {
-            pendingEchoes.push(trimmedText);
-        }
-        if (pendingEchoes.length > 25) {
-            pendingEchoes.splice(0, pendingEchoes.length - 25);
-        }
+        pendingUserPrompt = trimmedText;
 
         markUserInputSent();
 
