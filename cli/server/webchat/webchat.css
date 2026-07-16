@@ -2954,7 +2954,7 @@ body {
     color: color-mix(in srgb, var(--wa-text-secondary) 62%, white);
 }
 
-.wa-inline-task {
+.wa-task-summary {
     display: block;
     clear: both;
     margin-top: 10px;
@@ -2962,37 +2962,29 @@ body {
     border-top: 1px solid color-mix(in srgb, var(--wa-border) 62%, transparent);
 }
 
-.wa-task-item .wa-inline-task {
+.wa-task-item .wa-task-summary {
     margin-top: 0;
     padding-top: 0;
     border-top: 0;
 }
 
-.wa-inline-task-toggle {
+.wa-task-summary-row,
+.wa-task-view-header {
     width: 100%;
-    padding: 0;
     display: grid;
-    grid-template-columns: auto auto minmax(0, 1fr) auto auto;
+    grid-template-columns: auto minmax(0, 1fr) auto auto;
     align-items: center;
     gap: 7px;
-    border: 0;
-    background: transparent;
     color: var(--wa-text-primary);
     font: inherit;
     text-align: left;
-    cursor: pointer;
 }
 
-.wa-inline-task-arrow {
-    width: 12px;
-    color: var(--wa-text-secondary);
-}
-
-.wa-inline-task-agent {
+.wa-task-summary-agent {
     font-size: 12px;
 }
 
-.wa-inline-task-description {
+.wa-task-summary-description {
     min-width: 0;
     overflow: hidden;
     color: var(--wa-text-secondary);
@@ -3001,25 +2993,53 @@ body {
     white-space: nowrap;
 }
 
-.wa-inline-task-duration {
+.wa-task-summary-duration {
     color: var(--wa-text-muted);
     font-size: 11px;
     font-variant-numeric: tabular-nums;
 }
 
-.wa-inline-task-log {
-    max-height: min(360px, 48vh);
-    margin-top: 9px;
-    min-height: 72px;
+.wa-task-log-link {
+    display: inline-block;
+    margin-top: 7px;
+    color: var(--wa-accent);
+    font-size: 12px;
+    font-weight: 600;
+    text-decoration: underline;
+    text-underline-offset: 2px;
 }
 
-.wa-inline-task-error {
-    margin-top: 9px;
+.wa-task-log-link:hover {
+    color: var(--wa-accent-hover);
 }
 
-.wa-inline-task.is-collapsed .wa-inline-task-log,
-.wa-inline-task.is-collapsed .wa-inline-task-error {
-    display: none;
+.wa-task-view-page {
+    min-width: 0;
+    padding: 16px;
+    overflow: hidden;
+    background: var(--wa-bg-panel);
+}
+
+.wa-task-view {
+    width: 100%;
+    min-width: 0;
+    min-height: 0;
+    height: 100%;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+}
+
+.wa-task-view-header {
+    flex: 0 0 auto;
+}
+
+.wa-task-view .wa-task-error {
+    flex: 0 0 auto;
+}
+
+.wa-task-view .wa-task-log {
+    flex: 1 1 auto;
 }
 
 .wa-task-empty {

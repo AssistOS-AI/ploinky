@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8"/>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+    <title>Task logs</title>
+    <link rel="stylesheet" href="__ASSET_BASE__/webchat.css"/>
+</head>
+<body class="wa-task-view-page" data-theme="explorer">
+<main class="wa-task-view">
+    <header class="wa-task-view-header">
+        <strong class="wa-task-summary-agent" id="taskAgent">Task</strong>
+        <span class="wa-task-summary-description" id="taskDescription">Loading task…</span>
+        <span class="wa-task-status is-unavailable" id="taskStatus">LOADING</span>
+        <span class="wa-task-summary-duration" id="taskDuration"></span>
+    </header>
+    <div class="wa-task-error" id="taskError" hidden></div>
+    <div class="wa-task-log" id="taskLog"></div>
+</main>
+<script type="module" src="__ASSET_BASE__/taskView.js"></script>
+</body>
+</html>

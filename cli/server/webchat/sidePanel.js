@@ -29,6 +29,8 @@ export function createSidePanel({
     sidePanelResizer
 }, { markdown }) {
     let activeBubble = null;
+    let activeFrame = null;
+    let activeTaskId = '';
 
     const panelWrapper = sidePanel?.querySelector('.wa-side-panel-content') || null;
 
@@ -167,6 +169,8 @@ export function createSidePanel({
         container.innerHTML = renderMarkdown(markdown, text);
         bindLinkDelegation(container);
         setPanelTitleText('Full Answer');
+        activeFrame = null;
+        activeTaskId = '';
     }
 
     function openText(bubble, text) {
@@ -179,7 +183,7 @@ export function createSidePanel({
         applyPanelSizeFromStorage();
     }
 
-    function openIframe(url) {
+    function openIframe(url, { taskId = '' } = {}) {
         if (!panelWrapper || !sidePanel) {
             return;
         }
@@ -227,6 +231,8 @@ export function createSidePanel({
         }, 2500);
 
         activeBubble = null;
+        activeFrame = frame;
+        activeTaskId = String(taskId || '').trim();
         ensurePanelVisible();
         setPanelTitleLink(url);
         applyPanelSizeFromStorage();
@@ -239,7 +245,24 @@ export function createSidePanel({
         sidePanel.style.display = 'none';
         chatContainer.classList.remove('side-panel-open');
         activeBubble = null;
+        activeFrame = null;
+        activeTaskId = '';
         resetChatAreaSizing();
+    }
+
+    function postTaskUpdate(payload) {
+        const taskId = String(payload?.task?.id || '').trim();
+        if (!activeFrame?.contentWindow || !activeTaskId || taskId !== activeTaskId) {
+            return;
+        }
+        try {
+            activeFrame.contentWindow.postMessage({
+                type: 'webchat-task-update',
+                payload,
+            }, window.location.origin);
+        } catch (_) {
+            // The embedded task view may have closed between the update and delivery.
+        }
     }
 
     function updateIfActive(bubble, text) {
@@ -351,7 +374,7 @@ export function createSidePanel({
                 return;
             }
             event.preventDefault();
-            openIframe(link.href);
+            openIframe(link.href, { taskId: link.dataset.wcTaskId || '' });
         });
         container.dataset.linksBound = 'true';
     }
@@ -359,6 +382,7 @@ export function createSidePanel({
     return {
         openText,
         openIframe,
+        postTaskUpdate,
         close,
         updateIfActive,
         isActive: (bubble) => bubble === activeBubble,

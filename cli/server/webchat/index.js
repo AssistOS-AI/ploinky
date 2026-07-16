@@ -139,6 +139,7 @@ const network = createNetwork({
     onSessionChanged: (session) => sessionController?.handleExternalSessionChange(session),
     onTaskUpdate: (payload) => {
         taskController?.handleUpdate(payload);
+        sidePanelApi.postTaskUpdate(payload);
         messages.associateTask(payload);
     },
     onRuntimeState: (state) => dom.setRuntimeModel(state?.model),

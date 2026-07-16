@@ -97,3 +97,22 @@ test('workspace task API is authenticated and returns materialized metadata', as
     assert.equal(denied.statusCode, 302);
     assert.equal(fs.existsSync(path.join(project, '.copilot_history')), false);
 });
+
+test('task view is authenticated and serves the side-panel page only for valid task ids', async () => {
+    const appState = { sessions: new Map(), runtimes: new Map() };
+    const taskId = 'task_1234567890abcdef12345678';
+    const response = await request(appState, `/webchat/tasks/${taskId}/view?workspace-dir=project`);
+    assert.equal(response.statusCode, 200);
+    assert.match(response.getHeader('content-type'), /text\/html/);
+    assert.equal(response.getHeader('cache-control'), 'no-cache, no-store, must-revalidate');
+    assert.match(response.body, /class="wa-task-view-page"/);
+    assert.match(response.body, /taskView\.js/);
+
+    const invalid = await request(appState, '/webchat/tasks/not-a-task/view?workspace-dir=project');
+    assert.equal(invalid.statusCode, 404);
+
+    const denied = await request(appState, `/webchat/tasks/${taskId}/view?workspace-dir=project`, {
+        authenticated: false,
+    });
+    assert.equal(denied.statusCode, 302);
+});
