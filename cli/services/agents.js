@@ -41,6 +41,7 @@ import {
     withEdgeGenerationApplyLock,
 } from './edgeGeneration.js';
 import { applyEdgeRoutingGeneration } from './coordinatedEdgeApply.js';
+import { resolveManifestStartup } from './manifestStartup.js';
 import {
     createAgentSymlinks,
     removeAgentSymlinks,
@@ -281,6 +282,7 @@ function resolveAgentEnableInput({
     const normalized = normalizeEnableArgs(agentName, mode, repoNameParam);
     const { manifestPath, repo: repoName, shortAgentName } = findAgent(normalized.agentName);
     const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+    resolveManifestStartup(manifest);
     const agentPath = path.dirname(manifestPath);
     const profile = typeof authOptions?.profile === 'string' && authOptions.profile.trim()
         ? authOptions.profile.trim().toLowerCase()

@@ -4,7 +4,7 @@ import {
     appendAssistantProgress,
     appendSessionMessage,
     appendToAssistantMessage,
-    setAssistantTaskId,
+    insertSessionTaskItem,
     summarizeSession
 } from '../../webchat/sessionStore.js';
 import { hasOngoingTask, ingestTaskEvent } from '../../webchat/taskStore.js';
@@ -313,13 +313,13 @@ function routeCompleteOutputLine(appState, tab, line) {
                 let messageIndex = null;
                 if (envelope.event === 'started' && Number.isInteger(tab.workspaceHistory?.lastAssistantMessageIndex)) {
                     try {
-                        messageIndex = tab.workspaceHistory.lastAssistantMessageIndex;
-                        setAssistantTaskId(
+                        const inserted = insertSessionTaskItem(
                             tab.workspaceHistory.workspaceDirectory,
                             tab.workspaceHistory.sessionId,
-                            messageIndex,
+                            tab.workspaceHistory.lastAssistantMessageIndex,
                             update.task.id,
                         );
+                        messageIndex = inserted.messageIndex;
                     } catch (_) {
                         messageIndex = null;
                     }

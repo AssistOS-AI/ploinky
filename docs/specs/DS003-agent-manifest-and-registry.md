@@ -106,6 +106,8 @@ nested images, records, and nested volumes. V5 performs neither recovery path.
 Manual/unlabelled nested containers are outside Ploinky lifecycle repair
 guarantees.
 
+The optional top-level manifest field `startup` controls whether an enabled agent outside the static agent's dependency graph joins a general workspace start. Its only valid values are `automatic` and `manual`; an absent field is equivalent to `automatic`, and any other value is a manifest error. `startup: manual` does not weaken explicit relationships: the saved static agent and every agent reached through a manifest `enable` dependency must still start. An explicit Marketplace enable or generic `ploinky cli` invocation also starts the requested agent independently of this policy. This field is separate from `start`, which remains the runtime command.
+
 The optional `routerAccess.httpRoutes` manifest field lets an agent declare agent-relative HTTP paths that the router evaluates through the single HTTP route access policy after route expansion. The field may be an array of entries such as `{ "path": "/read/*", "access": "public" }`, `{ "path": "/workspace/*", "access": "guest" }`, `{ "path": "/account/*", "access": "authenticated" }`, and `{ "path": "/settings/*" }`, or an object whose keys are paths and whose values are entry objects or access strings. Each entry requires `path`; `mode` is not accepted. When `access` is omitted, the entry defaults to `authenticated`; when present, manifest access values are exactly `public`, `guest`, or `authenticated`. Public entries allow anonymous `GET`/`HEAD` only; guest entries mint or reuse a router guest session; authenticated entries require a user-authenticated router session before transparent proxying. Manifest paths are agent-relative and are expanded by the router to `/<routeKey><path>`, where `routeKey` is the alias when present and otherwise the short agent name. Paths use the same normalization, root/root-wildcard rejection, and internal-route rejection rules as the router HTTP route access policy, so raw or encoded `__agent` control-plane segments and router-root internal paths cannot be declared. Agent-relative `/auth/...`, `/admin/...`, and `/metrics` are ordinary agent paths after expansion, not router-root paths.
 
 When a manifest `enable` entry references a prefixed agent (`repo/agent` or `repo:agent`), the runtime must ensure the referenced repo is installed before attempting to resolve the agent. If the repo is missing, the runtime uses the normal predefined, stored, or manifest-discovered source lookup to clone it, applying the active branch policy when present. This keeps dependency auto-install generic rather than hardcoding product-specific repos.
@@ -359,6 +361,11 @@ compatibility exception during bootstrap. The two-phase batch makes the same
 validated immutable generation authoritative for every graph node before the
 first launch, while later coordinated applies add only the private targets that
 could not exist until a runtime was created.
+
+### Question #17: Why is startup policy separate from `start` and `enable`?
+
+Response:
+`start` describes which command runs inside an agent runtime, while `enable` records an explicit dependency edge. The `startup` field answers a different question: whether an already enabled, otherwise unrelated agent should be included in a general workspace boot. Keeping these meanings separate lets optional workers remain installed and directly invokable without weakening dependency guarantees or overloading command configuration.
 
 ## Conclusion
 

@@ -10,6 +10,7 @@ import {
     preflightNetworkAliases,
     validateManifestNetworks,
 } from './networkContract.js';
+import { resolveManifestStartup } from './manifestStartup.js';
 
 function normalizeAuthMode(value) {
     const normalized = String(value || '').trim().toLowerCase();
@@ -244,6 +245,7 @@ function resolveWorkspaceDependencyGraph({
         if (!node) {
             const manifest = readManifest(resolved.manifestPath);
             validateManifestNetworks(manifest, { path: `manifest(${resolved.repo}/${resolved.shortAgentName})` });
+            resolveManifestStartup(manifest);
             const registryRecord = findRegistryRecord(registry, {
                 repoName: resolved.repo,
                 shortAgentName: resolved.shortAgentName,

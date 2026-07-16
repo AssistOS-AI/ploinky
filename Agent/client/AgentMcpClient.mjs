@@ -10,7 +10,7 @@
 import http from 'node:http';
 import https from 'node:https';
 
-import { signAgentAssertion } from '../lib/agentAssertion.mjs';
+import { signAgentAssertion, signAgentHttpAssertion } from '../lib/agentAssertion.mjs';
 
 export function getRouterUrl() {
     const raw = process.env.PLOINKY_ROUTER_URL;
@@ -37,6 +37,12 @@ export function getAgentMcpUrl(agentName, routerUrl = getRouterUrl()) {
 }
 
 const DEFAULT_TASK_POLL_INTERVAL_MS = 5000;
+const MARKETPLACE_PATH = '/api/marketplace';
+const MARKETPLACE_TARGET = 'ploinky-router';
+const MARKETPLACE_READ_TOOL = 'marketplace.read';
+const MARKETPLACE_ENABLE_TOOL = 'marketplace.enable_agent';
+const DEFAULT_AGENT_START_TIMEOUT_MS = 180000;
+const AGENT_START_POLL_INTERVAL_MS = 250;
 const TASK_POLL_INTERVAL_MS = (() => {
     try {
         if (typeof process !== 'undefined' && process.env) {
@@ -107,6 +113,118 @@ function normalizeDelegationToken(token) {
         throw new Error('AgentMcpClient: userDelegationToken must be a string');
     }
     return token.trim();
+}
+
+function sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function marketplaceUrl(routerUrl = getRouterUrl()) {
+    return new URL(MARKETPLACE_PATH, `${routerUrl.replace(/\/+$/, '')}/`);
+}
+
+function marketplaceToolForRequest(method, body) {
+    return method === 'POST' && body?.action === 'enable_agent'
+        ? MARKETPLACE_ENABLE_TOOL
+        : MARKETPLACE_READ_TOOL;
+}
+
+function requestMarketplace(method = 'GET', body = null, routerUrl = getRouterUrl()) {
+    const url = marketplaceUrl(routerUrl);
+    const httpModule = url.protocol === 'https:' ? https : http;
+    const payload = body ? Buffer.from(JSON.stringify(body), 'utf8') : Buffer.alloc(0);
+    const tool = marketplaceToolForRequest(method, body);
+    const assertion = signAgentHttpAssertion({
+        method,
+        path: MARKETPLACE_PATH,
+        query: '',
+        body: payload,
+        targetAgent: MARKETPLACE_TARGET,
+        tool,
+    });
+
+    return new Promise((resolve, reject) => {
+        const req = httpModule.request({
+            hostname: url.hostname,
+            port: url.port || (url.protocol === 'https:' ? 443 : 80),
+            path: MARKETPLACE_PATH,
+            method,
+            headers: {
+                accept: 'application/json',
+                authorization: `Bearer ${assertion}`,
+                ...(payload.length ? {
+                    'content-type': 'application/json',
+                    'content-length': payload.length,
+                } : {}),
+            },
+        }, (res) => {
+            const chunks = [];
+            res.on('data', (chunk) => chunks.push(chunk));
+            res.on('end', () => {
+                const text = Buffer.concat(chunks).toString('utf8');
+                let json = null;
+                try { json = text ? JSON.parse(text) : null; } catch { json = null; }
+                if ((res.statusCode || 0) >= 400 || !json || json.ok === false) {
+                    const detail = json?.message || json?.error || text || `HTTP ${res.statusCode}`;
+                    reject(new Error(`Marketplace request failed: ${String(detail).slice(0, 300)}`));
+                    return;
+                }
+                resolve(json.marketplace || json);
+            });
+        });
+        req.on('error', reject);
+        if (payload.length) req.write(payload);
+        req.end();
+    });
+}
+
+function findMarketplaceAgent(marketplace, agentRef) {
+    const normalizedRef = String(agentRef || '').trim();
+    if (!normalizedRef) {
+        throw new Error('AgentMcpClient: agentRef is required');
+    }
+    const agents = Array.isArray(marketplace?.agents) ? marketplace.agents : [];
+    const exact = agents.find((agent) => String(agent?.ref || '') === normalizedRef);
+    if (exact) return exact;
+    if (!normalizedRef.includes('/')) {
+        const matches = agents.filter((agent) => String(agent?.name || '') === normalizedRef);
+        if (matches.length === 1) return matches[0];
+        if (matches.length > 1) {
+            throw new Error(`AgentMcpClient: agent '${normalizedRef}' is ambiguous; use repo/agent`);
+        }
+    }
+    return null;
+}
+
+export async function getAgentStatus(agentRef, routerUrl = getRouterUrl()) {
+    const marketplace = await requestMarketplace('GET', null, routerUrl);
+    return findMarketplaceAgent(marketplace, agentRef);
+}
+
+export async function ensureAgentRunning(agentRef, options = {}, routerUrl = getRouterUrl()) {
+    const initial = await getAgentStatus(agentRef, routerUrl);
+    if (!initial) {
+        throw new Error(`AgentMcpClient: agent '${agentRef}' is not installed`);
+    }
+    if (initial.running === true) return initial;
+
+    const mode = typeof options.mode === 'string' ? options.mode.trim() : '';
+    const marketplace = await requestMarketplace('POST', {
+        action: 'enable_agent',
+        agentRef: initial.ref,
+        ...(mode ? { mode } : {}),
+    }, routerUrl);
+    const enabled = findMarketplaceAgent(marketplace, initial.ref);
+    if (enabled?.running === true) return enabled;
+
+    const timeoutMs = Math.max(1000, Number(options.timeoutMs) || DEFAULT_AGENT_START_TIMEOUT_MS);
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+        await sleep(AGENT_START_POLL_INTERVAL_MS);
+        const status = await getAgentStatus(initial.ref, routerUrl);
+        if (status?.running === true) return status;
+    }
+    throw new Error(`AgentMcpClient: agent '${initial.ref}' did not start within ${timeoutMs}ms`);
 }
 
 function postToolCall(agentName, jsonRpcBody, assertion, userDelegationToken = '', routerUrl = getRouterUrl()) {
@@ -476,6 +594,8 @@ export async function createAgentClient(agentName, options = {}) {
     return {
         callTool,
         callToolWithoutWait,
+        getAgentStatus: (agentRef = agentName) => getAgentStatus(agentRef, routerUrl),
+        ensureAgentRunning: (agentRef = agentName, startOptions = {}) => ensureAgentRunning(agentRef, startOptions, routerUrl),
         getTaskStatus: (taskId) => getTaskStatus(agentName, taskId, routerUrl),
         connect: async () => {},
         listTools: unsupported('listTools'),

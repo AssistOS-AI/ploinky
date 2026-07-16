@@ -57,6 +57,11 @@ import {
   prepareHostModeCapabilityForInactiveGeneration,
 } from './edgeGeneration.js';
 import { applyEdgeRoutingGeneration } from './coordinatedEdgeApply.js';
+import {
+  partitionAdditionalStartupAgents,
+  removeInactiveManualRoutes,
+  resolveManifestStartup,
+} from './manifestStartup.js';
 import { waitForAgentReady } from '../server/utils/agentReadiness.js';
 import { createNetworkLifecycleAdapter } from './networkLifecycle.js';
 import { networkContractHash } from './networkContract.js';
@@ -591,6 +596,19 @@ function resolveExtraEnabledRuntimeNodes(graph, reg, getAgentContainerName = doc
         shortAgentName: resolved.shortAgentName,
       };
     });
+}
+
+function loadRegistryManifest(record) {
+  const manifestRef = `${record.repoName}/${record.agentName}`;
+  const manifestPath = findAgentManifest(manifestRef);
+  return JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+}
+
+function isRegistryRuntimeRunning(containerName, record) {
+  if (isSandboxRuntime(record?.runtime)) {
+    return isBwrapProcessRunning(record.agentName);
+  }
+  return dockerSvc.isContainerRunning(containerName);
 }
 
 function ensureGraphNodesEnabled(graph, reg, {
@@ -1619,10 +1637,38 @@ async function startWorkspace(staticAgentArg, portArg, {
       await waitForReadinessEntries(readinessEntries);
     }
 
-    const extraNames = allNames.filter((name) => !graphRegistryNames.has(name));
-    if (extraNames.length) {
-      console.log(`[start] Starting ${extraNames.length} additional enabled agent(s) outside the dependency graph: ${extraNames.join(', ')}`);
-      const extra = await updateRoutes(extraNames, { allowFailures: true });
+    const additionalStartup = partitionAdditionalStartupAgents({
+      registry: reg,
+      names: allNames,
+      graphRegistryNames,
+      loadManifest: loadRegistryManifest,
+      isRuntimeRunning: isRegistryRuntimeRunning,
+    });
+    if (additionalStartup.inactiveManual.length) {
+      cfg = await mergeRoutingConfig((current) => {
+        const routes = removeInactiveManualRoutes({
+          ...(current.routes || {}),
+          ...(cfg.routes || {}),
+        }, additionalStartup.inactiveManual);
+        return {
+          ...current,
+          ...cfg,
+          routes,
+        };
+      }, { coordinate: false });
+      console.log(`[start] Leaving ${additionalStartup.inactiveManual.length} manual agent(s) stopped: ${additionalStartup.inactiveManual.map(({ name }) => name).join(', ')}`);
+    }
+
+    const activeManualNames = additionalStartup.activeManual.map(({ name }) => name);
+    if (additionalStartup.automatic.length) {
+      console.log(`[start] Starting ${additionalStartup.automatic.length} additional enabled agent(s) outside the dependency graph: ${additionalStartup.automatic.join(', ')}`);
+    }
+    if (activeManualNames.length) {
+      console.log(`[start] Retaining ${activeManualNames.length} explicitly active manual agent(s): ${activeManualNames.join(', ')}`);
+    }
+    const additionalNames = [...additionalStartup.automatic, ...activeManualNames];
+    if (additionalNames.length) {
+      const extra = await updateRoutes(additionalNames, { allowFailures: true });
       if (extra.failedAgents.length === 0) {
         const extraReadiness = extra.routeResults.map((result) => buildBlockingReadinessEntryFromNode({
           id: `extra:${result.routeKey}`,
@@ -1778,6 +1824,7 @@ export async function runCliWithDependencies(agentName, args, dependencies) {
     : manifestLookup;
   const { manifestPath, shortAgentName } = findAgent(resolvedManifestRef);
   const manifest = readManifest(manifestPath);
+  resolveManifestStartup(manifest);
   if (routerEndpoint === undefined) {
     routerEndpoint = resolveRouterEndpointForManifestImpl(manifest, {
       persistedProfileName: registryRecord?.record?.profile,

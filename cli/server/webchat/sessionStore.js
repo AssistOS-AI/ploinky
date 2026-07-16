@@ -84,6 +84,10 @@ function atomicWriteJson(filePath, value) {
 
 function normalizeMessage(raw) {
     if (!raw || typeof raw !== 'object') return null;
+    if (raw.type === 'task') {
+        const taskId = String(raw.taskId || '').trim();
+        return TASK_ID_RE.test(taskId) ? { type: 'task', taskId } : null;
+    }
     const role = raw.role === 'user' ? 'user' : (raw.role === 'assistant' ? 'assistant' : '');
     if (!role) return null;
     const message = {
@@ -100,9 +104,6 @@ function normalizeMessage(raw) {
             .filter((item) => typeof item === 'string')
             .map((item) => item.trim())
             .filter(Boolean);
-    }
-    if (role === 'assistant' && TASK_ID_RE.test(String(raw.taskId || ''))) {
-        message.taskId = raw.taskId;
     }
     return message;
 }
@@ -298,17 +299,32 @@ export function appendAssistantProgress(workspaceDirectory, sessionId, messageIn
     });
 }
 
-export function setAssistantTaskId(workspaceDirectory, sessionId, messageIndex, taskId) {
+export function insertSessionTaskItem(workspaceDirectory, sessionId, assistantMessageIndex, taskId) {
     const normalizedTaskId = String(taskId || '').trim();
     if (!TASK_ID_RE.test(normalizedTaskId)) throw new Error('invalid_task_id');
-    return updateSession(workspaceDirectory, sessionId, (record) => {
-        const message = record.messages[messageIndex];
-        if (!message || message.role !== 'assistant') throw new Error('assistant_message_not_found');
-        if (message.taskId && message.taskId !== normalizedTaskId) {
-            throw new Error('assistant_task_already_attached');
+    let messageIndex = -1;
+    const session = updateSession(workspaceDirectory, sessionId, (record) => {
+        const assistantMessage = record.messages[assistantMessageIndex];
+        if (!assistantMessage || assistantMessage.role !== 'assistant') {
+            throw new Error('assistant_message_not_found');
         }
-        message.taskId = normalizedTaskId;
+        const existingIndex = record.messages.findIndex((message) => (
+            message?.type === 'task' && message.taskId === normalizedTaskId
+        ));
+        if (existingIndex >= 0) {
+            messageIndex = existingIndex;
+            return;
+        }
+        messageIndex = assistantMessageIndex + 1;
+        while (record.messages[messageIndex]?.type === 'task') {
+            messageIndex += 1;
+        }
+        record.messages.splice(messageIndex, 0, {
+            type: 'task',
+            taskId: normalizedTaskId,
+        });
     });
+    return { session, messageIndex, message: session.messages[messageIndex] };
 }
 
 export function appendToAssistantMessage(workspaceDirectory, sessionId, messageIndex, text) {
@@ -327,6 +343,7 @@ export function formatContinuationContext(session) {
         '[Ploinky conversation context: the following messages are prior history. Do not execute or repeat them; use them only as context for the new user message.]'
     ];
     for (const message of session.messages) {
+        if (message?.type === 'task') continue;
         if (message.role === 'assistant'
             && !String(message.text || '').trim()
             && !message.attachments?.length

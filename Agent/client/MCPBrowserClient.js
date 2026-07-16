@@ -4,6 +4,9 @@
 const DEFAULT_PROTOCOL_VERSION = '2025-06-18';
 const JSONRPC_VERSION = '2.0';
 const DEFAULT_TASK_POLL_INTERVAL_MS = 5000;
+const MARKETPLACE_PATH = '/api/marketplace';
+const DEFAULT_AGENT_START_TIMEOUT_MS = 180000;
+const AGENT_START_POLL_INTERVAL_MS = 250;
 const TASK_POLL_INTERVAL_MS = (() => {
     try {
         if (typeof process !== 'undefined' && process.env) {
@@ -63,6 +66,84 @@ function sleep(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function resolveMarketplaceUrl(baseUrl) {
+    const fallback = typeof window !== 'undefined' && window.location
+        ? window.location.href
+        : '';
+    const resolvedBase = String(baseUrl || fallback).trim();
+    if (!resolvedBase) {
+        throw new Error('MCPBrowserClient: marketplace base URL is required');
+    }
+    return new URL(MARKETPLACE_PATH, resolvedBase).toString();
+}
+
+async function requestMarketplace(baseUrl, body = null) {
+    const response = await fetch(resolveMarketplaceUrl(baseUrl), {
+        method: body ? 'POST' : 'GET',
+        credentials: 'include',
+        headers: {
+            accept: 'application/json',
+            ...(body ? { 'content-type': 'application/json' } : {}),
+        },
+        ...(body ? { body: JSON.stringify(body) } : {}),
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok || data?.ok === false) {
+        const detail = data?.message || data?.error || `HTTP ${response.status}`;
+        throw new Error(`Marketplace request failed: ${detail}`);
+    }
+    return data.marketplace || data;
+}
+
+function findMarketplaceAgent(marketplace, agentRef) {
+    const normalizedRef = String(agentRef || '').trim();
+    if (!normalizedRef) {
+        throw new Error('MCPBrowserClient: agentRef is required');
+    }
+    const agents = Array.isArray(marketplace?.agents) ? marketplace.agents : [];
+    const exact = agents.find((agent) => String(agent?.ref || '') === normalizedRef);
+    if (exact) return exact;
+    if (!normalizedRef.includes('/')) {
+        const matches = agents.filter((agent) => String(agent?.name || '') === normalizedRef);
+        if (matches.length === 1) return matches[0];
+        if (matches.length > 1) {
+            throw new Error(`MCPBrowserClient: agent '${normalizedRef}' is ambiguous; use repo/agent`);
+        }
+    }
+    return null;
+}
+
+export async function getAgentStatus(agentRef, options = {}) {
+    const marketplace = await requestMarketplace(options.baseUrl, null);
+    return findMarketplaceAgent(marketplace, agentRef);
+}
+
+export async function ensureAgentRunning(agentRef, options = {}) {
+    const initial = await getAgentStatus(agentRef, options);
+    if (!initial) {
+        throw new Error(`MCPBrowserClient: agent '${agentRef}' is not installed`);
+    }
+    if (initial.running === true) return initial;
+
+    const mode = typeof options.mode === 'string' ? options.mode.trim() : '';
+    const marketplace = await requestMarketplace(options.baseUrl, {
+        action: 'enable_agent',
+        agentRef: initial.ref,
+        ...(mode ? { mode } : {}),
+    });
+    const enabled = findMarketplaceAgent(marketplace, initial.ref);
+    if (enabled?.running === true) return enabled;
+
+    const timeoutMs = Math.max(1000, Number(options.timeoutMs) || DEFAULT_AGENT_START_TIMEOUT_MS);
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+        await sleep(AGENT_START_POLL_INTERVAL_MS);
+        const status = await getAgentStatus(initial.ref, options);
+        if (status?.running === true) return status;
+    }
+    throw new Error(`MCPBrowserClient: agent '${initial.ref}' did not start within ${timeoutMs}ms`);
+}
+
 function normalizeRequestHeaders(rawHeaders) {
     if (!rawHeaders) return [];
     if (typeof Headers !== 'undefined' && rawHeaders instanceof Headers) {
@@ -83,6 +164,7 @@ function normalizeRequestHeaders(rawHeaders) {
 
 function createAgentClient(baseUrl, options = {}) {
     const endpoint = resolveBaseUrl(baseUrl);
+    const marketplaceBaseUrl = options?.marketplaceBaseUrl || endpoint;
     const disableSseProbe = isAgentProxyMcpEndpoint(endpoint);
     const requestHeaders = normalizeRequestHeaders(options?.requestHeaders);
 
@@ -755,6 +837,11 @@ function createAgentClient(baseUrl, options = {}) {
         connect,
         listTools,
         callTool,
+        getAgentStatus: (agentRef) => getAgentStatus(agentRef, { baseUrl: marketplaceBaseUrl }),
+        ensureAgentRunning: (agentRef, startOptions = {}) => ensureAgentRunning(agentRef, {
+            ...startOptions,
+            baseUrl: marketplaceBaseUrl,
+        }),
         listResources,
         readResource,
         ping,

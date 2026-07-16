@@ -12,10 +12,10 @@ import {
     createSession,
     ensureCurrentSession,
     formatContinuationContext,
+    insertSessionTaskItem,
     listSessions,
     loadSession,
     selectSession,
-    setAssistantTaskId,
 } from '../../cli/server/webchat/sessionStore.js';
 
 function makeWorkspace(t) {
@@ -136,23 +136,69 @@ test('normalizes optional assistant progress without changing legacy messages', 
     assert.equal((context.match(/Assistant:/g) || []).length, 2);
 });
 
-test('persists one validated task id only on an assistant message', (t) => {
+test('persists multiple validated task items after one assistant message', (t) => {
     const workspace = makeWorkspace(t);
     const session = ensureCurrentSession(workspace);
     const turn = appendSessionTurn(workspace, session.sessionId, { text: 'Run task' });
-    const taskId = 'task_1234567890abcdef12345678';
+    const firstTaskId = 'task_1234567890abcdef12345678';
+    const secondTaskId = 'task_abcdefabcdefabcdefabcdef';
 
-    setAssistantTaskId(workspace, session.sessionId, turn.assistantMessageIndex, taskId);
-    setAssistantTaskId(workspace, session.sessionId, turn.assistantMessageIndex, taskId);
+    const first = insertSessionTaskItem(
+        workspace,
+        session.sessionId,
+        turn.assistantMessageIndex,
+        firstTaskId,
+    );
+    const second = insertSessionTaskItem(
+        workspace,
+        session.sessionId,
+        turn.assistantMessageIndex,
+        secondTaskId,
+    );
+    const duplicate = insertSessionTaskItem(
+        workspace,
+        session.sessionId,
+        turn.assistantMessageIndex,
+        firstTaskId,
+    );
+    appendToAssistantMessage(workspace, session.sessionId, turn.assistantMessageIndex, 'Tasks started');
 
     const loaded = loadSession(workspace, session.sessionId);
-    assert.equal(loaded.messages[1].taskId, taskId);
-    assert.equal(Object.hasOwn(loaded.messages[0], 'taskId'), false);
+    assert.equal(first.messageIndex, 2);
+    assert.equal(second.messageIndex, 3);
+    assert.equal(duplicate.messageIndex, 2);
+    assert.equal(loaded.messages[1].text, 'Tasks started');
+    assert.equal(Object.hasOwn(loaded.messages[1], 'taskId'), false);
+    assert.deepEqual(loaded.messages.slice(2), [
+        { type: 'task', taskId: firstTaskId },
+        { type: 'task', taskId: secondTaskId },
+    ]);
     assert.throws(
-        () => setAssistantTaskId(workspace, session.sessionId, turn.assistantMessageIndex, 'invalid'),
+        () => insertSessionTaskItem(workspace, session.sessionId, turn.assistantMessageIndex, 'invalid'),
         /invalid_task_id/,
     );
-    assert.doesNotMatch(formatContinuationContext(loaded), /task_123456/);
+    assert.doesNotMatch(formatContinuationContext(loaded), /task_123456|task_abcdef/);
+});
+
+test('ignores legacy task ids stored on assistant messages', (t) => {
+    const workspace = makeWorkspace(t);
+    const session = ensureCurrentSession(workspace);
+    const sessionPath = path.join(workspace, '.copilot_history', `${session.sessionId}.json`);
+    const record = JSON.parse(fs.readFileSync(sessionPath, 'utf8'));
+    record.messages = [{
+        role: 'assistant',
+        text: 'Legacy response',
+        timestamp: new Date().toISOString(),
+        attachments: [],
+        references: [],
+        taskId: 'task_1234567890abcdef12345678',
+    }];
+    fs.writeFileSync(sessionPath, `${JSON.stringify(record, null, 2)}\n`);
+
+    const loaded = loadSession(workspace, session.sessionId);
+    assert.equal(loaded.messages.length, 1);
+    assert.equal(loaded.messages[0].role, 'assistant');
+    assert.equal(Object.hasOwn(loaded.messages[0], 'taskId'), false);
 });
 
 test('repairs an invalid current pointer without deleting valid sessions', (t) => {

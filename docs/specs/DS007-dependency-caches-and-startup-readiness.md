@@ -74,6 +74,8 @@ explicit engine-level data-cleanup action.
 
 Workspace startup must expand the static agent into a dependency graph using manifest enable directives. The graph must be grouped topologically into waves. A later wave must not start until the earlier wave has been started and all of its members have passed readiness checks.
 
+After dependency waves, startup processes enabled agents outside the graph according to the manifest `startup` policy defined in DS003. `automatic` agents and manifests without the field start as before. Stopped `manual` agents remain stopped and lose stale routes; already running `manual` agents are retained. Graph membership takes precedence, so a static agent or explicit dependency marked `manual` still starts and participates in normal readiness gating.
+
 Startup readiness follows an explicit precedence. A declared `readiness.protocol`
 of `mcp`, `tcp`, or `none` wins over every inferred choice, including a
 `health.readiness.script`. Without an explicit protocol, a start-only container
@@ -215,6 +217,11 @@ In particular, another process or a degraded composite media runtime can leave
 the container running after the expected UDP owner disappears. A bounded
 recurring probe turns that drift into an authorization failure and exact
 replacement instead of treating one historical success as permanent evidence.
+
+### Question #10: Why does dependency graph membership override manual startup?
+
+Response:
+An `enable` edge is an explicit statement that the parent requires the child for correct operation. Treating `startup: manual` as stronger than that edge would let a manifest silently break its dependents. Manual policy therefore applies only to enabled agents outside the resolved graph.
 
 ## Conclusion
 

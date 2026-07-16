@@ -5,7 +5,7 @@ import { fileURLToPath } from 'url';
 
 import * as workspaceSvc from '../services/workspace.js';
 import { REPOS_DIR, RUNNING_DIR } from '../services/config.js';
-import { mergeRoutingConfig, mergeRuntimeRoute } from '../services/routingFile.js';
+import { mergeRoutingConfig, mergeRuntimeRoute, readRoutingConfig } from '../services/routingFile.js';
 import {
     createWorkspaceMutationLease,
     inspectMaintenanceLock,
@@ -17,6 +17,7 @@ import {
     ensureAgentService,
     isContainerRunning,
 } from '../services/docker/index.js';
+import { shouldMonitorManifestRuntime } from '../services/manifestStartup.js';
 import { isSandboxRuntime } from '../services/docker/common.js';
 import { isBwrapProcessRunning } from '../services/bwrap/bwrapFleet.js';
 import { resolveManifestRuntimeProfile } from '../services/profileService.js';
@@ -298,6 +299,7 @@ function syncManagedContainers(monitor) {
     }
 
     const desired = new Map();
+    const routing = readRoutingConfig();
 
     for (const [containerName, record] of Object.entries(agentsMap)) {
         if (!record || typeof record !== 'object') continue;
@@ -318,6 +320,26 @@ function syncManagedContainers(monitor) {
                 agent: agentName,
                 repo: repoName,
                 manifest: manifestPath
+            });
+            continue;
+        }
+
+        let manifest;
+        try {
+            manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+            const routeKey = alias || agentName;
+            if (!shouldMonitorManifestRuntime(manifest, {
+                hasRoute: Boolean(routing.routes?.[routeKey]),
+            })) {
+                continue;
+            }
+        } catch (error) {
+            logEvent(monitorRef, 'error', 'container_manifest_invalid', {
+                container: containerName,
+                agent: agentName,
+                repo: repoName,
+                manifest: manifestPath,
+                error: error?.message || String(error),
             });
             continue;
         }

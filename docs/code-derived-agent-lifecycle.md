@@ -294,6 +294,7 @@ Ploinky does not load a central manifest schema in the observed paths. Individua
 | `enable` | No | Top-level and profile-level enable arrays are processed during `start` and dependency graph building. The selected workspace profile is applied when present and otherwise a child uses `profiles.default`; this affects only the in-box graph, never outer publications. String specs can include `as <alias>` and `no-wait`; object specs can include `agent/ref/spec/name`, `alias/as`, `profile`, and `noWait`/`no-wait`. An explicit edge-local profile must exist on the child. |
 | `configProviders` | No | Top-level startup provider entries processed for the static agent after dependency graph discovery and before dependency env resolution. Profile entries replace the default profile list. |
 | `providesConfig` | No | Declares a startup provider command and output allowlist. Provider stdout must be schema version 1 JSON and is persisted by Ploinky only after allowlist, reserved-name, sensitive-flag, and generated-secret checks pass. |
+| `startup` | No | General workspace startup policy: `automatic` or `manual`. Absent defaults to `automatic`; invalid values fail validation. Static-agent and dependency graph membership override `manual`. |
 | `guest` | No | `guest: true` makes manifest-derived auth mode `guest`. |
 | `ploinky` | No | String/list directives. `pwd enable` maps to local auth; `sso enable` maps to SSO auth. |
 | `pwd.users` | No | Seeds local password users when local auth is active and CLI user/password were not provided. Each entry needs username/user and password. |
@@ -380,9 +381,10 @@ flowchart TD
   N --> O{"node wait mode"}
   O -- blocking --> P["ensureAgentService and wait for readiness"]
   O -- no-wait --> Q["spawn noWaitWorker"]
-  P --> R["start other enabled agents with allowFailures"]
+  P --> R["start automatic agents outside graph"]
   Q --> R
-  R --> S["launch Watchdog/RoutingServer"]
+  R --> T["retain running manual agents; remove stopped manual routes"]
+  T --> S["launch Watchdog/RoutingServer"]
 ```
 
 Manifest `repos` and `enable` directives are not applied during `enable agent`; they are applied during `startWorkspace`. Dependency graph construction also reads `enable` arrays recursively.
@@ -399,6 +401,8 @@ any graph process starts. Container and sandbox backends must preserve that
 final prepared registry identity. Blocking waves add their resolved private
 targets through coordinated apply before readiness succeeds; detached workers
 use the same prepared identity when they later submit targets.
+
+The manifest `startup` field affects only enabled agents outside that graph. Missing or `automatic` agents start during general workspace startup. A stopped `manual` agent stays stopped and its stale route is removed, while an already running manual agent is retained. Static and dependency nodes always start regardless of `startup`.
 
 `enable` dependency refs can be blocking or no-wait. The graph classifier treats the static node as blocking. A child is blocking when it is reachable through a path with only blocking edges; it is no-wait only when every path to it includes a no-wait edge. Blocking waves are started and then checked for readiness before Ploinky continues.
 
@@ -789,11 +793,7 @@ include AgentServer default to MCP. A start-only service with no script, no
 private or published route, and no explicit `none` policy fails with a manifest
 contract error rather than waiting on a fabricated port 7000.
 
-The router watchdog's later health-probe phase is different from dependency-wave
-startup. Its container monitor watches enabled records every few seconds. If a
-runtime is not running, it schedules a restart through `ensureAgentService`
-with backoff and a circuit breaker. If a manifest has `health`, a worker runs
-configured script probes inside the container:
+The router watchdog's later health-probe phase is different from dependency-wave startup. Its container monitor watches automatic enabled records every few seconds. It also watches a `startup: manual` record while that agent has a live route, because the route records explicit activation. A general restart removes stale routes for stopped manual agents; explicit enable and generic CLI activation recreate them. If a monitored runtime is not running, the watchdog schedules a restart through `ensureAgentService` with backoff and a circuit breaker. If a manifest has `health`, a worker runs configured script probes inside the container:
 
 | Probe | Behavior |
 | --- | --- |

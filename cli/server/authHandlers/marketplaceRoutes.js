@@ -8,7 +8,16 @@ import { collectLiveAgentContainers } from '../../services/docker/index.js';
 import { collectAgentsSummary } from '../../services/status.js';
 import { isLocalAdminUser } from '../auth/localService.js';
 import { verifyAdminMutationRequest } from '../adminControlSecurity.js';
-import { authService, LOCAL_AUTH_COOKIE_NAME, parseCookies, readJsonBody, sendJson, sessionTokenService, SSO_AUTH_COOKIE_NAME } from './shared.js';
+import { computeRchHttp, sha256RawBodyHash } from '../../../Agent/lib/requestHash.mjs';
+import { verifyAgentAssertion } from '../mcp-proxy/invocationMinter.js';
+import { createTokenReplayCache } from '../security/tokens/JwsCodec.js';
+import { authService, LOCAL_AUTH_COOKIE_NAME, parseCookies, sendJson, sessionTokenService, SSO_AUTH_COOKIE_NAME } from './shared.js';
+
+export const MARKETPLACE_PATH = '/api/marketplace';
+export const MARKETPLACE_AGENT_TARGET = 'ploinky-router';
+export const MARKETPLACE_READ_TOOL = 'marketplace.read';
+export const MARKETPLACE_ENABLE_TOOL = 'marketplace.enable_agent';
+const marketplaceAssertionReplayCache = createTokenReplayCache({ maxSize: 4096 });
 
 function parseMarketplacePath(pathname = '') {
     const parts = String(pathname || '').split('/').filter(Boolean);
@@ -27,6 +36,73 @@ function sendMarketplaceError(res, status, code, message = '') {
         error: code,
         ...(message ? { message } : {})
     });
+}
+
+function readAuthorizationBearer(req) {
+    const raw = req?.headers?.authorization ?? req?.headers?.Authorization;
+    const value = Array.isArray(raw) ? raw[0] : raw;
+    if (typeof value !== 'string' || !value.toLowerCase().startsWith('bearer ')) return '';
+    return value.slice(7).trim();
+}
+
+function readMarketplaceBody(req, { maxBytes = 1024 * 1024 } = {}) {
+    return new Promise((resolve, reject) => {
+        const chunks = [];
+        let bytes = 0;
+        let tooLarge = false;
+        req.on('data', (chunk) => {
+            bytes += chunk.length;
+            if (bytes > maxBytes) {
+                tooLarge = true;
+                return;
+            }
+            chunks.push(chunk);
+        });
+        req.on('end', () => {
+            try {
+                if (tooLarge) {
+                    reject(new Error('request_body_too_large'));
+                    return;
+                }
+                const rawBody = Buffer.concat(chunks);
+                const text = rawBody.toString('utf8');
+                resolve({ rawBody, body: text ? JSON.parse(text) : {} });
+            } catch (error) {
+                reject(error);
+            }
+        });
+        req.on('error', reject);
+    });
+}
+
+function verifyMarketplaceAgentRequest({ req, method, query = '', tool, rawBody = Buffer.alloc(0), replayCache = marketplaceAssertionReplayCache }) {
+    const token = readAuthorizationBearer(req);
+    if (!token) throw new Error('missing_agent_assertion');
+    const rch = computeRchHttp({
+        method,
+        path: MARKETPLACE_PATH,
+        query,
+        bodyHash: sha256RawBodyHash(rawBody),
+    });
+    return verifyAgentAssertion({
+        token,
+        method,
+        path: MARKETPLACE_PATH,
+        tool,
+        rch,
+        targetAgentId: MARKETPLACE_AGENT_TARGET,
+        replayCache,
+    });
+}
+
+function ensureMarketplaceAgentRequest(req, res, details) {
+    try {
+        req.marketplaceAgent = verifyMarketplaceAgentRequest({ req, ...details });
+        return true;
+    } catch (_) {
+        sendMarketplaceError(res, 401, 'agent_assertion_rejected', 'Agent authentication failed.');
+        return false;
+    }
 }
 
 function normalizeMarketplaceRepoName(value) {
@@ -229,7 +305,6 @@ async function ensureMarketplaceUser(req, res) {
 export async function handleMarketplaceRoutes(req, res, parsedUrl, {
     routePlan = null,
     ensureAdmin = ensureMarketplaceAdmin,
-    readBody = readJsonBody,
     enableAgentAction = enableMarketplaceAgent,
 } = {}) {
     const route = parseMarketplacePath(parsedUrl.pathname || '/');
@@ -237,8 +312,15 @@ export async function handleMarketplaceRoutes(req, res, parsedUrl, {
 
     const method = (req.method || 'GET').toUpperCase();
     if (method === 'GET' && !route.resource) {
-        if (!(await ensureMarketplaceUser(req, res))) {
-            return true;
+        if (readAuthorizationBearer(req)) {
+            if (!ensureMarketplaceAgentRequest(req, res, {
+                method: 'GET',
+                query: parsedUrl.search ? parsedUrl.search.slice(1) : '',
+                tool: MARKETPLACE_READ_TOOL,
+            })) return true;
+        } else {
+            const authResult = await ensureMarketplaceUser(req, res);
+            if (!authResult.ok) return true;
         }
         sendJson(res, 200, {
             ok: true,
@@ -248,21 +330,22 @@ export async function handleMarketplaceRoutes(req, res, parsedUrl, {
     }
 
     if (method === 'POST' && !route.resource) {
-        if (routePlan?.lease?.commit && routePlan.lease.commit() !== true) {
-            sendMarketplaceError(res, 503, 'edge_generation_changed');
-            return true;
+        const agentRequest = Boolean(readAuthorizationBearer(req));
+        if (!agentRequest) {
+            if (!(await ensureAdmin(req, res, parsedUrl))) {
+                return true;
+            }
+            const mutationDecision = verifyAdminMutationRequest(req, req.sessionId);
+            if (!mutationDecision.ok) {
+                sendMarketplaceError(res, 403, mutationDecision.code.toLowerCase(), 'Exact control Origin and CSRF proof are required.');
+                return true;
+            }
         }
-        if (!(await ensureAdmin(req, res, parsedUrl))) {
-            return true;
-        }
-        const mutationDecision = verifyAdminMutationRequest(req, req.sessionId);
-        if (!mutationDecision.ok) {
-            sendMarketplaceError(res, 403, mutationDecision.code.toLowerCase(), 'Exact control Origin and CSRF proof are required.');
-            return true;
-        }
+
+        let rawBody;
         let body;
         try {
-            body = await readBody(req);
+            ({ rawBody, body } = await readMarketplaceBody(req));
         } catch (_) {
             sendMarketplaceError(res, 400, 'invalid_json', 'Request body must be valid JSON.');
             return true;
@@ -273,6 +356,19 @@ export async function handleMarketplaceRoutes(req, res, parsedUrl, {
         }
 
         const action = String(body?.action || '').trim();
+        if (agentRequest) {
+            if (action !== 'enable_agent') {
+                sendMarketplaceError(res, 403, 'agent_action_forbidden', 'Agents may only enable installed agents.');
+                return true;
+            }
+            if (!ensureMarketplaceAgentRequest(req, res, {
+                method: 'POST',
+                query: parsedUrl.search ? parsedUrl.search.slice(1) : '',
+                tool: MARKETPLACE_ENABLE_TOOL,
+                rawBody,
+            })) return true;
+        }
+
         try {
             if (action === 'install_repo') {
                 const url = normalizeMarketplaceUrl(body?.url);
@@ -345,3 +441,8 @@ export async function handleMarketplaceRoutes(req, res, parsedUrl, {
     res.end(JSON.stringify({ ok: false, error: route.resource ? 'not_found' : 'method_not_allowed' }));
     return true;
 }
+
+export const __testables = {
+    readAuthorizationBearer,
+    verifyMarketplaceAgentRequest,
+};
