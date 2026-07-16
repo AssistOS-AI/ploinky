@@ -17,6 +17,7 @@ import {
 } from './docker/index.js';
 import { findAgent } from './utils.js';
 import { REPOS_DIR, PLOINKY_WORKSPACE_ROOT, ROUTING_FILE } from './config.js';
+import { resolveManifestStartup } from './manifestStartup.js';
 import {
     createAgentSymlinks,
     removeAgentSymlinks,
@@ -231,6 +232,7 @@ export function enableAgent(agentName, mode, repoNameParam, aliasParam, authMode
     const normalized = normalizeEnableArgs(agentName, mode, repoNameParam);
     const { manifestPath, repo: repoName, shortAgentName } = findAgent(normalized.agentName);
     const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+    resolveManifestStartup(manifest);
     const agentPath = path.dirname(manifestPath);
     const alias = normalizeAlias(aliasParam);
     const map = loadAgents();

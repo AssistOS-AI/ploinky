@@ -84,6 +84,36 @@ test('resolveWorkspaceDependencyGraph preserves the original enable spec for dep
     assert.equal(graph.nodes.get('demo/mode-target').enableSpec, 'mode-target global');
 });
 
+test('manual startup does not remove an explicit dependency from the graph', () => {
+    writeManifest('demo', 'manual-dependency', {
+        container: 'node:20-alpine',
+        startup: 'manual',
+    });
+    writeManifest('demo', 'manual-parent', {
+        container: 'node:20-alpine',
+        enable: ['demo/manual-dependency'],
+    });
+
+    const graph = resolveWorkspaceDependencyGraph({ staticAgentRef: 'demo/manual-parent' });
+    assert.ok(graph.nodes.has('demo/manual-dependency'));
+    assert.deepEqual(topologicallyGroupDependencyGraph(graph), [
+        ['demo/manual-dependency'],
+        ['demo/manual-parent'],
+    ]);
+});
+
+test('dependency graph rejects an invalid startup policy explicitly', () => {
+    writeManifest('demo', 'invalid-startup', {
+        container: 'node:20-alpine',
+        startup: 'sometimes',
+    });
+
+    assert.throws(
+        () => resolveWorkspaceDependencyGraph({ staticAgentRef: 'demo/invalid-startup' }),
+        /startup must be 'automatic' or 'manual'/
+    );
+});
+
 test('resolveWorkspaceDependencyGraph respects SSO gating for provider dependencies', () => {
     // SSO provider dependencies are skipped unless the parent manifest requests SSO mode.
     writeManifest('basic', 'keycloak', {

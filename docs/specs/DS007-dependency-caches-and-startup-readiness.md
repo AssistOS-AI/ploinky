@@ -24,6 +24,8 @@ Dependency caches are regenerated state, not agent data. `destroy` must clear `.
 
 Workspace startup must expand the static agent into a dependency graph using manifest enable directives. The graph must be grouped topologically into waves. A later wave must not start until the earlier wave has been started and all of its members have passed readiness checks.
 
+After dependency waves, startup processes enabled agents outside the graph according to the manifest `startup` policy defined in DS003. `automatic` agents and manifests without the field start as before. Stopped `manual` agents remain stopped and lose stale routes; already running `manual` agents are retained. Graph membership takes precedence, so a static agent or explicit dependency marked `manual` still starts and participates in normal readiness gating.
+
 Readiness must probe TCP or MCP according to the manifest-derived protocol. Manifests with only a `start` command default to TCP readiness. Other agent modes default to MCP readiness unless the manifest explicitly sets `readiness.protocol`. Dependency cache preparation happens before runtime readiness checks, so readiness timeouts must describe service startup, not post-start dependency installation inside the agent home.
 
 Readiness probes target a host-side port, derived from the manifest's `openPorts` declarations or the default AgentServer mapping on container port 7000. Agents using `network.mode: "host"` must still declare `openPorts` when readiness targets a non-default service port, even though the runtime does not emit `-p` flags for them; the declarations are probe metadata only and let the runtime know which port to reach on `127.0.0.1`. A manifest with no `openPorts` and no AgentServer-style command falls back to a randomly allocated AgentServer mapping, which is unreachable for a server that binds a different port and will appear as an `ECONNREFUSED` readiness loop. Agent-owned browser services declared through profile `additionalServerPort` do not need a stable host port, but they also do not replace the readiness port unless the manifest explicitly points readiness at that service through `openPorts`.
@@ -70,6 +72,11 @@ The blocking wave path produces visible startup output: the wave list, the readi
 
 Response:
 Container runtime keys intentionally group compatible images by Node major, platform, architecture, and libc so cache directories stay understandable and reusable across patch updates. That grouping alone is not enough when a manifest moves to a different image that preinstalls different system libraries or native build prerequisites. Recording the installer image in the stamp lets startup invalidate the cache on an image switch without broadening the runtime-key format.
+
+### Question #7: Why does dependency graph membership override manual startup?
+
+Response:
+An `enable` edge is an explicit statement that the parent requires the child for correct operation. Treating `startup: manual` as stronger than that edge would let a manifest silently break its dependents. Manual policy therefore applies only to enabled agents outside the resolved graph.
 
 ## Conclusion
 

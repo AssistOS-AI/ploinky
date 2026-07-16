@@ -20,6 +20,11 @@ import { withMaintenanceLock } from './maintenanceLocks.js';
 import { LOGS_DIR, PLOINKY_CWD, PLOINKY_WORKSPACE_ROOT, ROUTING_FILE, RUNNING_DIR } from './config.js';
 import { classifyDependencyGraphWaitMode, resolveWorkspaceDependencyGraph, topologicallyGroupDependencyGraph } from './workspaceDependencyGraph.js';
 import { mergeRoutingConfig, readRoutingConfig } from './routingFile.js';
+import {
+  partitionAdditionalStartupAgents,
+  removeInactiveManualRoutes,
+  resolveManifestStartup,
+} from './manifestStartup.js';
 import { waitForAgentReady } from '../server/utils/agentReadiness.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -245,6 +250,19 @@ function findRegistryEntryForGraphNode(reg, node, getAgentContainerName) {
     }
   }
   return null;
+}
+
+function loadRegistryManifest(record) {
+  const manifestRef = `${record.repoName}/${record.agentName}`;
+  const manifestPath = findAgentManifest(manifestRef);
+  return JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+}
+
+function isRegistryRuntimeRunning(containerName, record) {
+  if (isSandboxRuntime(record?.runtime)) {
+    return isBwrapProcessRunning(record.agentName);
+  }
+  return dockerSvc.isContainerRunning(containerName);
 }
 
 function ensureGraphNodesEnabled(graph, reg) {
@@ -827,10 +845,35 @@ async function startWorkspace(staticAgentArg, portArg, { refreshComponentToken, 
       await waitForReadinessEntries(readinessEntries);
     }
 
-    const extraNames = allNames.filter((name) => !graphRegistryNames.has(name));
-    if (extraNames.length) {
-      console.log(`[start] Starting ${extraNames.length} additional enabled agent(s) outside the dependency graph: ${extraNames.join(', ')}`);
-      await updateRoutes(extraNames, { allowFailures: true });
+    const additionalStartup = partitionAdditionalStartupAgents({
+      registry: reg,
+      names: allNames,
+      graphRegistryNames,
+      loadManifest: loadRegistryManifest,
+      isRuntimeRunning: isRegistryRuntimeRunning,
+    });
+    if (additionalStartup.inactiveManual.length) {
+      cfg = await mergeRoutingConfig((current) => {
+        const routes = removeInactiveManualRoutes({
+          ...(current.routes || {}),
+          ...(cfg.routes || {}),
+        }, additionalStartup.inactiveManual);
+        return {
+          ...current,
+          ...cfg,
+          routes,
+        };
+      });
+      console.log(`[start] Leaving ${additionalStartup.inactiveManual.length} manual agent(s) stopped: ${additionalStartup.inactiveManual.map(({ name }) => name).join(', ')}`);
+    }
+    if (additionalStartup.automatic.length) {
+      console.log(`[start] Starting ${additionalStartup.automatic.length} additional enabled agent(s) outside the dependency graph: ${additionalStartup.automatic.join(', ')}`);
+      await updateRoutes(additionalStartup.automatic, { allowFailures: true });
+    }
+    const activeManualNames = additionalStartup.activeManual.map(({ name }) => name);
+    if (activeManualNames.length) {
+      console.log(`[start] Retaining ${activeManualNames.length} explicitly active manual agent(s): ${activeManualNames.join(', ')}`);
+      await updateRoutes(activeManualNames, { allowFailures: true });
     }
 
     const routerPidFile = path.join(runningDir, 'router.pid');
@@ -897,6 +940,7 @@ async function runCli(agentName, args) {
     : manifestLookup;
   const { manifestPath, shortAgentName } = utils.findAgent(resolvedManifestRef);
   const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+  resolveManifestStartup(manifest);
   const cliBase = getCliCmd(manifest);
   if (!cliBase || !cliBase.trim()) { throw new Error(`Manifest for '${shortAgentName}' has no 'cli' command.`); }
 
@@ -921,6 +965,32 @@ async function runCli(agentName, args) {
   const containerName = (containerInfo && containerInfo.containerName)
     || registryRecord?.containerName
     || getAgentContainerName(shortAgentName, repoName);
+  if (containerInfo?.hostPort) {
+    const routeRepoName = registryRecord?.record?.repoName || repoName;
+    const routeKey = registryRecord?.record?.alias || shortAgentName;
+    await mergeRoutingConfig((current) => {
+      const nextRoute = {
+        ...(current.routes?.[routeKey] || {}),
+        container: containerName,
+        hostPath: agentDir,
+        repo: routeRepoName,
+        agent: shortAgentName,
+        ...(registryRecord?.record?.alias ? { alias: registryRecord.record.alias } : {}),
+        hostPort: containerInfo.hostPort,
+        ...(containerInfo.additionalServerPort ? {
+          additionalServerPort: containerInfo.additionalServerPort,
+        } : {}),
+      };
+      if (!containerInfo.additionalServerPort) delete nextRoute.additionalServerPort;
+      return {
+        ...current,
+        routes: {
+          ...(current.routes || {}),
+          [routeKey]: nextRoute,
+        },
+      };
+    });
+  }
   const readinessProtocol = resolveAgentReadinessProtocol(manifest);
   if (readinessProtocol !== 'none') {
     const hostPort = containerInfo?.hostPort;

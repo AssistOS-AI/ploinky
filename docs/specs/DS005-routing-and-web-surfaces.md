@@ -22,6 +22,8 @@ The route table must be persisted in `.ploinky/routing.json`. It must contain th
 
 The watchdog container monitor must defer automatic container restarts while a maintenance lock is active for the same container. It must check the lock both when deciding to schedule a restart and immediately before executing a previously scheduled restart, because a reinstall or explicit restart may acquire the lock after the watchdog timer was created. A deferred timer must release the monitor's in-progress restart state so later ticks can reevaluate the live container after maintenance completes.
 
+For an agent whose manifest declares `startup: manual`, its route is also the durable activation marker used by watchdog monitoring. General startup removes the route of a stopped manual agent and the watchdog must ignore that registry entry. If the manual agent is already running, startup retains it and ensures its route. An explicit Marketplace enable or `ploinky cli` invocation recreates the route, after which the watchdog monitors and restarts the agent like any other active runtime. Agents with automatic startup remain watchdog targets without requiring this marker.
+
 The router must provide first-party browser surfaces at `/webchat`, `/dashboard`, and `/status`. Each surface owns its own session cookie and fallback asset directory under `cli/server/<surface>/`. `/webchat` must rely on the router login flow and the authenticated router session; it does not accept surface-specific token login. `/dashboard` and the read-only `/status` surface continue to support dashboard-token access through `WEBDASHBOARD_TOKEN`. Asset resolution may also consult the static host root and `webLibs/`, but the documented fallback implementation for the first-party surfaces lives under `cli/server/`.
 
 For `/webchat`, the router must treat `agent` as an explicit agent-selection query parameter and must preserve the remaining query parameters across the browser session endpoints. When a WebChat request selects an explicit agent, the router must forward every additional query parameter except router-reserved stream/session parameters such as `tabId` and `sessionId` to that agent's `ploinky cli <agent>` launch as long-form CLI flags encoded as single `--key=value` tokens. The router must not hardcode ordinary target-agent parameter names for this forwarding behavior; interpretation belongs to the target agent CLI. The reserved alias parameters `workspace-dir`/`workspaceDir` and `workspace-skill-root`/`workspaceSkillRoot` are resolved by WebChat against the Ploinky workspace root and forwarded as absolute `--dir=` and `--skill-root=` values server-side so browser URLs can avoid leaking absolute host paths. The `ploinky cli <agent>` launch path is expected to resolve the agent manifest from workspace repositories and auto-enable missing agents in the standard global enable flow when needed.
@@ -34,13 +36,14 @@ WebChat conversation identity must be scoped to the canonical working directory
 resolved from `workspace-dir`/`workspaceDir` or confined `dir`. The router must
 create or reuse `<cwd>/.copilot_history/`, store one JSON file per conversation,
 and keep the selected conversation id in `.copilot_history/current_session.json`.
-Stored messages contain role, text, timestamp, attachments, and references.
-Assistant messages created for a user turn may additionally contain `progress`,
-whose value must be an ordered array of non-empty strings, and one validated
-`taskId` that associates the message with separately persisted task state. Task
-status and log content must not be copied into the session JSON. Writes must be atomic,
-malformed session files must not appear in the selector, and a symlinked history
-directory must be rejected.
+Ordinary stored messages contain role, text, timestamp, attachments, and
+references. Assistant messages created for a user turn may additionally contain
+`progress`, whose value must be an ordered array of non-empty strings. A task
+reference is instead stored as its own conversation item containing exactly a
+validated `{ "type": "task", "taskId": "task_..." }` shape, with no role or
+text. Task status and log content must not be copied into the session JSON.
+Writes must be atomic, malformed session files must not appear in the selector,
+and a symlinked history directory must be rejected.
 
 When WebChat accepts a non-empty user turn, it must persist the user message and
 an immediately following assistant placeholder in one session update before
@@ -105,16 +108,22 @@ than assistant text and must not enter continuation context.
 
 WebChat may also receive generic `__webchatTask` lifecycle envelopes from a selected CLI. These envelopes must be intercepted before conversation rendering and history capture. Ploinky must store workspace-scoped task metadata as append-only JSON lines in `<cwd>/.copilot_history/agent_tasks`, store bounded per-task logs separately under `.copilot_history/task_logs/`, and expose authenticated `GET /webchat/tasks` and `GET /webchat/tasks/<task-id>/log` routes. Browser updates must use the existing EventSource stream with a `task-update` event; Ploinky must not hardcode target-agent ids or tool names.
 
-The first `started` envelope for a user turn must attach its task id to that
-turn's existing assistant placeholder. Live correlation may include the folder
-session id and assistant message index on the EventSource event, but this
-transient routing data must not be duplicated in the task journal. The browser
-must render the task as a collapsible module at the bottom of the ordinary
-assistant bubble, keep collecting updates while collapsed, and recover the same
-module after history loading by resolving `message.taskId` against the task and
-log routes. The module must show the exact target-agent id, description, status,
-and elapsed whole seconds. It remains available after terminal completion; a
-missing task record renders as unavailable.
+Each first `started` envelope for a task in a user turn must insert one task item
+immediately after that turn's existing assistant placeholder. Multiple tasks are
+allowed and remain in start order; reinserting the same task id is idempotent.
+Live correlation may include the folder session id and inserted task-item index
+on the EventSource event, but this transient routing data must not be duplicated
+in the task journal. The browser must render every task item as its own
+incoming-style chat item containing the existing collapsible task module, keep
+collecting updates while collapsed, and recover the same item after history
+loading by resolving its `taskId` against the task and log routes. A live task
+item may appear before final assistant text arrives; indexed insertion must
+still produce the stable history order `user -> assistant -> task items`. The
+module must show the exact target-agent id, description, status, and elapsed
+whole seconds. It remains available after terminal completion; a missing task
+record renders as unavailable. Task items are UI references and must not enter
+the continuation context. Legacy assistant-message `taskId` properties are
+ignored rather than rendered or migrated.
 
 The Tasks overlay and inline task module must share one presentation policy.
 Pending work is shown as `QUEUED`, active work as `RUNNING`, and terminal states
@@ -130,7 +139,7 @@ When a WebChat runtime has no SSE subscribers but owns a task whose materialized
 The router must also expose:
 
 - `/health` for health status.
-- `/api/marketplace` for the first-party agent marketplace. This route is router-owned and returns JSON rather than proxied agent content. `GET /api/marketplace` must require an authenticated local or SSO user and must report the caller identity, caller marketplace permissions, predefined repositories, installed repositories, remembered repository sources, repository kind, discoverable agents, enabled-agent registry state, and runtime status derived from live Ploinky containers. Non-admin clients must use the returned permissions to hide management controls. `POST /api/marketplace` must require an authenticated local administrator and accepts `install_repo`, `uninstall_repo`, `enable_agent`, and `disable_agent` actions. Repository installation must require a URL, accept an optional name and branch, clone the checkout, and record source metadata including repository kind. Repository uninstall must match the CLI repository contract: it disables enabled agents that came from that repository by container key, removes their runtime containers through the normal disable helper, preserves agent work directories, removes the installed repository checkout, and preserves the source metadata so the repository remains available for reinstall in the correct Marketplace repo category. Agent enablement must use the standard enable path. Agent disablement is marketplace-specific: the route removes the enabled-agent registry record before removing the agent runtime with the normal container removal helper, so the watchdog container monitor does not restart the runtime while the admin operation is in progress. This marketplace behavior must not change the conservative direct `ploinky disable agent` CLI contract, which still refuses to remove records while runtime state exists.
+- `/api/marketplace` for the first-party agent marketplace. This route is router-owned and returns JSON rather than proxied agent content. Browser callers use the existing local or SSO session: authenticated users may read Marketplace state, non-admin clients use the returned permissions to hide management controls, and only an authenticated local administrator may perform the full `install_repo`, `uninstall_repo`, `enable_agent`, and `disable_agent` action set. An already-running Ploinky agent may also call the same endpoint with a request-bound Agent Assertion targeted at `ploinky-router`: `GET` uses the synthetic tool `marketplace.read`, while `POST` is restricted to `enable_agent` and uses `marketplace.enable_agent`. Agent assertions must be bound to the exact method, path, query, and raw body, and must be replay-protected. Agent callers cannot install repositories, uninstall repositories, disable agents, or gain browser admin permissions. The read response reports the caller-facing Marketplace state, predefined repositories, installed repositories, remembered repository sources, repository kind, discoverable agents, enabled-agent registry state, and runtime status derived from live Ploinky containers. Repository installation must require a URL, accept an optional name and branch, clone the checkout, and record source metadata including repository kind. Repository uninstall must match the CLI repository contract: it disables enabled agents that came from that repository by container key, removes their runtime containers through the normal disable helper, preserves agent work directories, removes the installed repository checkout, and preserves the source metadata so the repository remains available for reinstall in the correct Marketplace repo category. Agent enablement must use the standard enable path. Agent disablement is marketplace-specific: the route removes the enabled-agent registry record before removing the agent runtime with the normal container removal helper, so the watchdog container monitor does not restart the runtime while the admin operation is in progress. This marketplace behavior must not change the conservative direct `ploinky disable agent` CLI contract, which still refuses to remove records while runtime state exists.
 - `/upload` and `/blobs` for workspace and agent blob flows.
 - `/workspace-files/...` for authenticated, workspace-confined file reads owned by the router.
 - `/webchat/uploads` for WebChat session-scoped file storage and download under `<cwd>/uploads/<sessionId>`.
@@ -222,6 +231,26 @@ Keeping agent-provided completions in memory makes local filtering immediate and
 
 Response:
 The selected CLI owns the meaning and persistence of its model setting, while Ploinky owns only the generic browser transport. A volatile runtime-state envelope lets any compatible agent publish current UI metadata without extending the conversation schema or coupling WebChat to an agent-specific path. Retaining the latest state in the live runtime also restores the header after a brief EventSource reconnect without claiming that the value describes the effective model used for every response.
+
+### Question #13: Why may an agent enable another agent through Marketplace?
+
+Response:
+Optional workers must remain outside the root manifest dependency graph or they are recursively started with the primary application. Reusing the existing Marketplace enable action gives launchers one lifecycle path instead of a second startup implementation. The agent assertion is deliberately limited to state reads and installed-agent enablement, bound to the exact request, and replay-protected; repository changes, disablement, and browser administrator authority remain unavailable.
+
+### Question #14: Why is each background task a separate conversation item?
+
+Response:
+A single assistant turn may start several independent tasks, so one `taskId` on
+the assistant message cannot represent the complete result. Dedicated reference
+items preserve every task and its start order without duplicating task state or
+logs in conversation history. They also keep assistant text semantically clean
+while letting the browser render task progress immediately and later place final
+assistant output before the already visible task items.
+
+### Question #15: Why does a manual agent route act as an activation marker?
+
+Response:
+The enabled-agent registry describes installed workspace intent and must survive periods when an optional worker is stopped. Routing state already identifies runtimes that were explicitly made reachable. Reusing that state lets the watchdog distinguish an intentionally dormant manual agent from an explicitly activated one without adding a second lifecycle store.
 
 ## Conclusion
 

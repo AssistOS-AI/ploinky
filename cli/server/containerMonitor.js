@@ -5,7 +5,8 @@ import { fileURLToPath } from 'url';
 
 import * as workspaceSvc from '../services/workspace.js';
 import { REPOS_DIR, RUNNING_DIR } from '../services/config.js';
-import { mergeRoutingConfig } from '../services/routingFile.js';
+import { mergeRoutingConfig, readRoutingConfig } from '../services/routingFile.js';
+import { shouldMonitorManifestRuntime } from '../services/manifestStartup.js';
 import { inspectMaintenanceLock } from '../services/maintenanceLocks.js';
 import { ensureAgentService, isContainerRunning } from '../services/docker/index.js';
 import { isSandboxRuntime } from '../services/docker/common.js';
@@ -259,6 +260,7 @@ function syncManagedContainers(monitor) {
     }
 
     const desired = new Map();
+    const routing = readRoutingConfig();
 
     for (const [containerName, record] of Object.entries(agentsMap)) {
         if (!record || typeof record !== 'object') continue;
@@ -279,6 +281,26 @@ function syncManagedContainers(monitor) {
                 agent: agentName,
                 repo: repoName,
                 manifest: manifestPath
+            });
+            continue;
+        }
+
+        let manifest;
+        try {
+            manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+            const routeKey = alias || agentName;
+            if (!shouldMonitorManifestRuntime(manifest, {
+                hasRoute: Boolean(routing.routes?.[routeKey]),
+            })) {
+                continue;
+            }
+        } catch (error) {
+            logEvent(monitorRef, 'error', 'container_manifest_invalid', {
+                container: containerName,
+                agent: agentName,
+                repo: repoName,
+                manifest: manifestPath,
+                error: error?.message || String(error),
             });
             continue;
         }

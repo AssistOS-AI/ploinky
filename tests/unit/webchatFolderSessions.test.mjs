@@ -42,7 +42,9 @@ test('WebChat exposes a workspace task overlay and generic task endpoints', () =
     const messages = read('cli/server/webchat/messages.js');
     const presentation = read('cli/server/webchat/taskPresentation.js');
     assert.match(messages, /wa-inline-task/);
-    assert.match(messages, /message\.taskId/);
+    assert.match(messages, /message\?\.type === 'task'/);
+    assert.match(messages, /wa-task-item/);
+    assert.doesNotMatch(messages, /taskAssociations/);
     assert.match(presentation, /\(stdout\|stderr\)/);
     assert.match(presentation, /RUNNER_PREFIX_RE/);
     assert.match(presentation, /setInterval\(renderSummary, 1000\)/);

@@ -17,6 +17,7 @@ import {
 } from '../../cli/server/handlers/webchat/runtimeState.js';
 import {
     appendSessionTurn,
+    appendToAssistantMessage,
     ensureCurrentSession,
     loadSession,
 } from '../../cli/server/webchat/sessionStore.js';
@@ -101,7 +102,7 @@ test('structured task output is persisted and broadcast without entering chat hi
     assert.equal(hasRuntimeBackgroundTasks(tab), true);
 });
 
-test('a started task is associated with the active assistant placeholder', (t) => {
+test('started tasks become separate ordered items after the active assistant placeholder', (t) => {
     const root = workspace();
     t.after(() => fs.rmSync(root, { recursive: true, force: true }));
     const session = ensureCurrentSession(root);
@@ -124,9 +125,22 @@ test('a started task is associated with the active assistant placeholder', (t) =
         event: 'started',
         task: event().task,
     })}\n`);
+    const secondTaskId = 'task_abcdefabcdefabcdefabcdef';
+    routeWorkspaceRuntimeOutput(appState, tab, `${JSON.stringify({
+        __webchatTask: 1,
+        event: 'started',
+        task: event({ id: secondTaskId, remoteTaskId: 'remote-2' }).task,
+    })}\n`);
+    appendToAssistantMessage(root, session.sessionId, turn.assistantMessageIndex, 'Tasks started');
 
-    assert.equal(loadSession(root, session.sessionId).messages[1].taskId, event().task.id);
+    const messages = loadSession(root, session.sessionId).messages;
+    assert.equal(messages[1].text, 'Tasks started');
+    assert.deepEqual(messages.slice(2), [
+        { type: 'task', taskId: event().task.id },
+        { type: 'task', taskId: secondTaskId },
+    ]);
     const wire = writes.join('');
     assert.match(wire, new RegExp(`"sessionId":"${session.sessionId}"`));
-    assert.match(wire, /"messageIndex":1/);
+    assert.match(wire, /"messageIndex":2/);
+    assert.match(wire, /"messageIndex":3/);
 });

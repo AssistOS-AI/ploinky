@@ -37,6 +37,7 @@
         <section class="chapter-section">
           <h2>Branch-Aware Startup</h2>
           <p><code>ploinky start</code> accepts <code>--branch &lt;branch&gt;</code> to set a candidate branch for managed repos involved in startup, <code>--repo-branch &lt;repo=branch&gt;</code> to override the candidate per repo, <code>--branch-fallback default|fail</code> to control missing-branch behavior, and <code>--reset-repos</code> to permit hard reset of dirty checkouts. Bootstrap applies the global branch only to the prefixed static-agent repo and applies explicit per-repo overrides to default boot repos. Manifest <code>repos</code> values may be objects with an explicit <code>branch</code> field, and prefixed <code>enable</code> entries auto-install missing repos through the normal source lookup. Branch metadata is recorded in <code>.ploinky/repo_sources.json</code> for reproducible restarts.</p>
+          <p>An enabled agent outside the resolved static dependency graph may declare <code>startup: "manual"</code> to remain dormant during general start and restart operations. Missing <code>startup</code> means automatic. Static agents and explicit manifest dependencies always start, even if their own manifest says manual. A running manual agent is retained; a stopped one has its stale route removed until an explicit Marketplace or CLI activation recreates it.</p>
         </section>
 
         <section class="chapter-section">

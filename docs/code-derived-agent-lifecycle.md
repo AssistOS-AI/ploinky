@@ -190,6 +190,7 @@ Ploinky does not load a central manifest schema in the observed paths. Individua
 | `expose` | No | Adds explicit env values or refs. The `expose` CLI command edits this field in the source manifest. |
 | `repos` | No | Object processed by `applyManifestDirectives` during `start`. Values may be URL strings or objects with `url` and `branch`. Repos are ensured and enabled before dependency enable processing. |
 | `enable` | No | Top-level and active-profile enable arrays are processed during `start` and dependency graph building. String specs can include `as <alias>` and `no-wait`; object specs can include `agent/ref/spec/name`, `alias/as`, `profile`, and `noWait`/`no-wait`. |
+| `startup` | No | General workspace startup policy: `automatic` or `manual`. Absent defaults to `automatic`; invalid values fail validation. Static-agent and dependency graph membership override `manual`. |
 | `guest` | No | `guest: true` makes manifest-derived auth mode `guest`. |
 | `ploinky` | No | String/list directives. `pwd enable` maps to local auth; `sso enable` maps to SSO auth. |
 | `pwd.users` | No | Seeds local password users when local auth is active and CLI user/password were not provided. Each entry needs username/user and password. |
@@ -256,12 +257,15 @@ flowchart TD
   N --> O{"node wait mode"}
   O -- blocking --> P["ensureAgentService and wait for readiness"]
   O -- no-wait --> Q["spawn noWaitWorker"]
-  P --> R["start other enabled agents with allowFailures"]
+  P --> R["start automatic agents outside graph"]
   Q --> R
-  R --> S["launch Watchdog/RoutingServer"]
+  R --> T["retain running manual agents; remove stopped manual routes"]
+  T --> S["launch Watchdog/RoutingServer"]
 ```
 
 Manifest `repos` and `enable` directives are not applied during `enable agent`; they are applied during `startWorkspace`. Dependency graph construction also reads `enable` arrays recursively.
+
+The manifest `startup` field affects only enabled agents outside that graph. Missing or `automatic` agents start during general workspace startup. A stopped `manual` agent stays stopped and its stale route is removed, while an already running manual agent is retained. Static and dependency nodes always start regardless of `startup`.
 
 `enable` dependency refs can be blocking or no-wait. The graph classifier treats the static node as blocking. A child is blocking when it is reachable through a path with only blocking edges; it is no-wait only when every path to it includes a no-wait edge. Blocking waves are started and then checked for readiness before Ploinky continues.
 
@@ -552,7 +556,7 @@ Startup readiness is handled by `workspaceUtil.js`, `startupReadiness.js`, and `
 
 Default startup readiness protocol is `tcp` when the manifest has `start`; otherwise it is `mcp`.
 
-Health probes are different. The router watchdog's container monitor watches enabled records every few seconds. If a runtime is not running, it schedules a restart through `ensureAgentService` with backoff and a circuit breaker. If a manifest has `health`, a worker runs configured script probes inside the container:
+Health probes are different. The router watchdog's container monitor watches automatic enabled records every few seconds. It also watches a `startup: manual` record while that agent has a live route, because the route records explicit activation. A general restart removes stale routes for stopped manual agents; explicit enable and generic CLI activation recreate them. If a monitored runtime is not running, the watchdog schedules a restart through `ensureAgentService` with backoff and a circuit breaker. If a manifest has `health`, a worker runs configured script probes inside the container:
 
 | Probe | Behavior |
 | --- | --- |

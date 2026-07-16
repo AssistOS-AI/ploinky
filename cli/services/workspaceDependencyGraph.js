@@ -4,6 +4,7 @@ import { parseEnableDirective } from './bootstrapManifest.js';
 import { findAgent } from './utils.js';
 import { isSsoProviderManifest } from './agentRegistry.js';
 import { getActiveProfile } from './profileService.js';
+import { resolveManifestStartup } from './manifestStartup.js';
 
 function normalizeAuthMode(value) {
     const normalized = String(value || '').trim().toLowerCase();
@@ -138,6 +139,7 @@ function resolveWorkspaceDependencyGraph({ staticAgentRef, registry = {} } = {})
         let node = nodes.get(nodeId);
         if (!node) {
             const manifest = readManifest(resolved.manifestPath);
+            resolveManifestStartup(manifest);
             const registryRecord = findRegistryRecord(registry, {
                 repoName: resolved.repo,
                 shortAgentName: resolved.shortAgentName,

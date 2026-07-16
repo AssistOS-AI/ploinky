@@ -5,6 +5,22 @@ import { attachInlineTaskPanel } from './taskPresentation.js';
 const ENABLE_SELECT_PAGINATION_ACTIONS = false;
 const AUTO_SCROLL_BOTTOM_THRESHOLD_PX = 4;
 
+function findOrderedInsertionPoint(children, messageIndex, typingIndicator, historyGate) {
+    const items = Array.from(children || []);
+    let insertionPoint = items.includes(typingIndicator) ? typingIndicator : null;
+    if (!Number.isInteger(messageIndex)) return insertionPoint;
+    for (const child of items) {
+        if (child === typingIndicator || child === historyGate) continue;
+        const candidateIndex = Number(child?.dataset?.messageIndex);
+        if (Number.isInteger(candidateIndex) && candidateIndex > messageIndex) {
+            return child;
+        }
+    }
+    return insertionPoint;
+}
+
+export const __testables = { findOrderedInsertionPoint };
+
 function formatTime(timestamp = null) {
     const parsed = timestamp ? new Date(timestamp) : new Date();
     const date = Number.isNaN(parsed.getTime()) ? new Date() : parsed;
@@ -34,8 +50,7 @@ export function createMessages({
     let autoScrollLocked = true;
     let programmaticScroll = false;
     let pendingProgressItems = [];
-    const assistantBubbles = new Map();
-    const taskAssociations = new Map();
+    const taskItems = new Map();
     const taskPanelCleanups = new Map();
     const tableScrollHintBindings = new WeakMap();
 
@@ -77,13 +92,22 @@ export function createMessages({
         }, { passive: true });
     }
 
-    function appendMessageEl(node) {
+    function appendMessageEl(node, messageIndex = null) {
         if (!node || !chatList) {
             return;
         }
+        if (Number.isInteger(messageIndex)) {
+            node.dataset.messageIndex = String(messageIndex);
+        }
         try {
-            if (typingIndicator && typingIndicator.parentNode === chatList) {
-                chatList.insertBefore(node, typingIndicator);
+            const insertionPoint = findOrderedInsertionPoint(
+                Array.from(chatList.children).filter((child) => child !== node),
+                messageIndex,
+                typingIndicator,
+                historyGate,
+            );
+            if (insertionPoint) {
+                chatList.insertBefore(node, insertionPoint);
             } else {
                 chatList.appendChild(node);
             }
@@ -1042,9 +1066,23 @@ export function createMessages({
         const taskId = payload?.task?.id;
         const messageIndex = Number.isInteger(payload?.messageIndex) ? payload.messageIndex : null;
         if (!taskId || !Number.isInteger(messageIndex)) return;
-        taskAssociations.set(messageIndex, taskId);
-        const bubble = assistantBubbles.get(messageIndex);
-        if (bubble) attachTaskPanel(bubble, taskId);
+        addTaskItem(taskId, { messageIndex });
+    }
+
+    function addTaskItem(taskId, options = {}) {
+        const normalizedTaskId = String(taskId || '').trim();
+        if (!normalizedTaskId || taskItems.has(normalizedTaskId)) return false;
+        const wrapper = document.createElement('div');
+        wrapper.className = 'wa-message in wa-task-item';
+        wrapper.dataset.taskId = normalizedTaskId;
+        const bubble = document.createElement('div');
+        bubble.className = 'wa-message-bubble';
+        wrapper.appendChild(bubble);
+        attachTaskPanel(bubble, normalizedTaskId);
+        taskItems.set(normalizedTaskId, wrapper);
+        appendMessageEl(wrapper, Number.isInteger(options.messageIndex) ? options.messageIndex : null);
+        scrollToBottomIfLocked();
+        return true;
     }
 
     function applyViewMoreSettingToAllBubbles() {
@@ -1083,7 +1121,7 @@ export function createMessages({
         if (bubble) {
             bubble.dataset.fullText = text;
         }
-        appendMessageEl(wrapper);
+        appendMessageEl(wrapper, Number.isInteger(options.messageIndex) ? options.messageIndex : null);
         scrollToBottomIfLocked();
         lastServerMsg.bubble = null;
     }
@@ -1303,8 +1341,7 @@ export function createMessages({
         }
 
         const messageIndex = Number.isInteger(options.messageIndex) ? options.messageIndex : null;
-        const taskId = options.taskId || (Number.isInteger(messageIndex) ? taskAssociations.get(messageIndex) : '');
-        if (!normalized.trim() && progressItems.length === 0 && !taskId) {
+        if (!normalized.trim() && progressItems.length === 0) {
             lastServerMsg.bubble = null;
             lastServerMsg.fullText = '';
             userInputSent = false;
@@ -1321,7 +1358,6 @@ export function createMessages({
             if (progressItems.length) {
                 attachProgressPanel(lastServerMsg.bubble, progressItems);
             }
-            if (taskId) attachTaskPanel(lastServerMsg.bubble, taskId);
             if (explicitProgressItems === null && pendingProgressItems.length) {
                 resetProgressEvents();
             }
@@ -1341,8 +1377,6 @@ export function createMessages({
             if (progressItems.length) {
                 attachProgressPanel(bubble, progressItems);
             }
-            if (Number.isInteger(messageIndex)) assistantBubbles.set(messageIndex, bubble);
-            if (taskId) attachTaskPanel(bubble, taskId);
             if (explicitProgressItems === null && pendingProgressItems.length) {
                 resetProgressEvents();
             }
@@ -1350,7 +1384,7 @@ export function createMessages({
             if (timeNode) {
                 timeNode.textContent = formatTime(options.timestamp);
             }
-            appendMessageEl(wrapper);
+            appendMessageEl(wrapper, messageIndex);
         }
 
         scrollToBottomIfLocked();
@@ -1379,8 +1413,7 @@ export function createMessages({
                 child.remove();
             }
         }
-        assistantBubbles.clear();
-        taskAssociations.clear();
+        taskItems.clear();
         lastServerMsg.bubble = null;
         lastServerMsg.fullText = '';
         lastClientCommand = '';
@@ -1394,16 +1427,19 @@ export function createMessages({
         const messages = Array.isArray(historyMessages) ? historyMessages : [];
         for (let messageIndex = 0; messageIndex < messages.length; messageIndex += 1) {
             const message = messages[messageIndex];
+            if (message?.type === 'task') {
+                addTaskItem(message.taskId, { messageIndex });
+                continue;
+            }
             const text = formatStoredMessageText(message);
             if (message?.role === 'user') {
-                addClientMsg(text, { historical: true, timestamp: message.timestamp });
+                addClientMsg(text, { historical: true, timestamp: message.timestamp, messageIndex });
             } else if (message?.role === 'assistant') {
                 addServerMsg(text, {
                     forceNew: true,
                     timestamp: message.timestamp,
                     progressItems: Array.isArray(message.progress) ? message.progress : [],
                     messageIndex,
-                    taskId: message.taskId,
                 });
             }
         }

@@ -131,3 +131,79 @@ test('MCP browser client treats agent-first MCP routes as router proxy endpoints
     assert.ok(seenMethods.length >= 2);
     assert.equal(seenMethods.includes('GET'), false);
 });
+
+test('MCP browser client forwards only a caller-selected enable mode', async () => {
+    const requests = [];
+    let running = false;
+    const server = http.createServer((req, res) => {
+        if (req.url !== '/api/marketplace') {
+            res.writeHead(404);
+            res.end();
+            return;
+        }
+        const chunks = [];
+        req.on('data', (chunk) => chunks.push(chunk));
+        req.on('end', () => {
+            const body = chunks.length ? JSON.parse(Buffer.concat(chunks).toString('utf8')) : null;
+            requests.push({ method: req.method, body });
+            if (body?.action === 'enable_agent') running = true;
+            res.writeHead(200, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({
+                ok: true,
+                marketplace: {
+                    agents: [{ ref: 'repo/worker', name: 'worker', running, status: running ? 'running' : 'inactive' }],
+                },
+            }));
+        });
+    });
+
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+    try {
+        const { port } = server.address();
+        const client = createAgentClient(`http://127.0.0.1:${port}/worker/mcp`);
+        const status = await client.ensureAgentRunning('repo/worker', { mode: 'global' });
+        assert.equal(status.running, true);
+        running = false;
+        await client.ensureAgentRunning('repo/worker');
+    } finally {
+        await new Promise((resolve) => server.close(resolve));
+    }
+
+    assert.deepEqual(requests, [
+        { method: 'GET', body: null },
+        {
+            method: 'POST',
+            body: { action: 'enable_agent', agentRef: 'repo/worker', mode: 'global' },
+        },
+        { method: 'GET', body: null },
+        {
+            method: 'POST',
+            body: { action: 'enable_agent', agentRef: 'repo/worker' },
+        },
+    ]);
+});
+
+test('MCP browser client skips enable_agent for an already running agent', async () => {
+    const methods = [];
+    const server = http.createServer((req, res) => {
+        methods.push(req.method);
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({
+            ok: true,
+            marketplace: {
+                agents: [{ ref: 'repo/worker', name: 'worker', running: true, status: 'running' }],
+            },
+        }));
+    });
+
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+    try {
+        const { port } = server.address();
+        const client = createAgentClient(`http://127.0.0.1:${port}/worker/mcp`);
+        await client.ensureAgentRunning('repo/worker');
+    } finally {
+        await new Promise((resolve) => server.close(resolve));
+    }
+
+    assert.deepEqual(methods, ['GET']);
+});
