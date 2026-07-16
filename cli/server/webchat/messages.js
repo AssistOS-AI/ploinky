@@ -43,7 +43,6 @@ export function createMessages({
 }) {
     const lastServerMsg = { bubble: null, fullText: '' };
     let userInputSent = false;
-    let lastClientCommand = '';
     let viewMoreLineLimit = Math.max(1, initialViewMoreLineLimit || 1);
     let quickCommandHandler = typeof onQuickCommand === 'function' ? onQuickCommand : null;
     let typingStateHandler = typeof onTypingStateChange === 'function' ? onTypingStateChange : null;
@@ -1099,7 +1098,6 @@ export function createMessages({
     }
 
     function addClientMsg(text, options = {}) {
-        if (!options.historical) lastClientCommand = text;
         const wrapper = document.createElement('div');
         wrapper.className = 'wa-message out';
         wrapper.innerHTML = `
@@ -1151,8 +1149,6 @@ export function createMessages({
             wrapper.dataset.attachmentCaption = caption;
         }
         wrapper.dataset.attachmentStatus = 'uploading';
-
-        lastClientCommand = caption || displayName;
 
         const bubble = document.createElement('div');
         bubble.className = 'wa-message-bubble';
@@ -1327,19 +1323,6 @@ export function createMessages({
             return false;
         }
 
-        if (lastClientCommand) {
-            const trimmed = lastClientCommand.trim();
-            if (trimmed) {
-                const lines = normalized.split(/\r?\n/);
-                while (lines.length && lines[0].trim() === trimmed) {
-                    lines.shift();
-                }
-                normalized = lines.join('\n');
-            }
-            lastClientCommand = '';
-            normalized = normalized.replace(/^\n+/, '');
-        }
-
         const messageIndex = Number.isInteger(options.messageIndex) ? options.messageIndex : null;
         if (!normalized.trim() && progressItems.length === 0) {
             lastServerMsg.bubble = null;
@@ -1416,7 +1399,6 @@ export function createMessages({
         taskItems.clear();
         lastServerMsg.bubble = null;
         lastServerMsg.fullText = '';
-        lastClientCommand = '';
         userInputSent = false;
         resetProgressEvents();
         hideTypingIndicator(true);
@@ -1443,7 +1425,6 @@ export function createMessages({
                 });
             }
         }
-        lastClientCommand = '';
         userInputSent = false;
     }
 

@@ -62,8 +62,8 @@ function looksLikeReadlinePromptEcho(text, pendingClientText) {
     if (!clientText) {
         return false;
     }
-    return trimmed === clientText
-        || (trimmed.startsWith('you> ') && trimmed.slice(5).trim() === clientText);
+    return trimmed.startsWith('you> ')
+        && trimmed.slice(5).trim() === clientText;
 }
 
 function looksLikeEnvelopeEcho(text) {
@@ -290,6 +290,11 @@ export function broadcastWorkspaceTaskEvent(appState, workspaceDirectory, payloa
 
 function routeCompleteOutputLine(appState, tab, line) {
     const normalized = stripCtrlAndAnsi(String(line || '')).trim();
+    const pendingClientText = String(tab?.workspaceHistory?.lastClientText || '').trim();
+    if (pendingClientText && looksLikeReadlinePromptEcho(normalized, pendingClientText)) {
+        tab.workspaceHistory.lastClientText = '';
+        return;
+    }
     if (normalized.includes(`"${WEBCHAT_RUNTIME_STATE_FLAG}"`)) {
         try {
             const envelope = JSON.parse(normalized);
