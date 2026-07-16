@@ -76,39 +76,51 @@ export function renderTaskLog(container, text, emptyText = 'No log output yet.')
     }
 }
 
-export function attachInlineTaskPanel({ bubble, taskId, taskController }) {
+export function mergeTaskLogUpdate(state, payload) {
+    const text = typeof state?.text === 'string' ? state.text : '';
+    const offset = Number.isFinite(Number(state?.offset)) ? Number(state.offset) : text.length;
+    const appended = typeof payload?.logAppend === 'string' ? payload.logAppend : '';
+    const nextOffset = Number(payload?.logOffset);
+    if (!appended) return { text, offset, needsSync: false };
+    if (!Number.isFinite(nextOffset)) {
+        return { text: text + appended, offset: offset + appended.length, needsSync: false };
+    }
+    if (nextOffset <= offset) return { text, offset, needsSync: false };
+    if (nextOffset - appended.length !== offset) return { text, offset, needsSync: true };
+    return { text: text + appended, offset: nextOffset, needsSync: false };
+}
+
+export function attachTaskSummary({ bubble, taskId, taskController }) {
     const panel = document.createElement('div');
-    panel.className = 'wa-inline-task is-collapsed';
+    panel.className = 'wa-task-summary';
     panel.dataset.taskId = taskId;
-    const toggle = document.createElement('button');
-    toggle.type = 'button';
-    toggle.className = 'wa-inline-task-toggle';
-    toggle.setAttribute('aria-expanded', 'false');
-    const arrow = document.createElement('span');
-    arrow.className = 'wa-inline-task-arrow';
-    arrow.textContent = '▸';
+    const summary = document.createElement('div');
+    summary.className = 'wa-task-summary-row';
     const agent = document.createElement('strong');
-    agent.className = 'wa-inline-task-agent';
+    agent.className = 'wa-task-summary-agent';
     agent.textContent = 'Task';
     const description = document.createElement('span');
-    description.className = 'wa-inline-task-description';
+    description.className = 'wa-task-summary-description';
     const status = document.createElement('span');
     status.className = 'wa-task-status is-unavailable';
     status.textContent = 'LOADING';
     const duration = document.createElement('span');
-    duration.className = 'wa-inline-task-duration';
-    toggle.append(arrow, agent, description, status, duration);
-    const log = document.createElement('div');
-    log.className = 'wa-task-log wa-inline-task-log';
-    const error = document.createElement('div');
-    error.className = 'wa-task-error wa-inline-task-error';
-    error.hidden = true;
-    panel.append(toggle, error, log);
+    duration.className = 'wa-task-summary-duration';
+    summary.append(agent, description, status, duration);
+    const link = document.createElement('a');
+    link.className = 'wa-task-log-link';
+    link.href = taskController.getTaskViewUrl(taskId);
+    link.target = '_blank';
+    link.rel = 'noopener noreferrer';
+    link.dataset.wcLink = 'true';
+    link.dataset.wcTaskId = taskId;
+    link.textContent = 'View live logs';
+    panel.append(summary, link);
     const timeNode = bubble.querySelector(':scope > .wa-message-time');
     if (timeNode) bubble.insertBefore(panel, timeNode);
     else bubble.appendChild(panel);
 
-    let latest = { task: null, ready: false, log: '', logLoaded: false };
+    let latest = { task: null, ready: false };
     let disposed = false;
     const renderSummary = () => {
         if (disposed) return;
@@ -119,41 +131,12 @@ export function attachInlineTaskPanel({ bubble, taskId, taskController }) {
         status.className = `wa-task-status is-${presentation.className}`;
         status.textContent = latest.ready || task ? presentation.label : 'LOADING';
         duration.textContent = taskDurationLabel(task);
-        error.hidden = !task?.error;
-        error.textContent = task?.error || '';
-    };
-    const renderLog = () => {
-        if (disposed || !panel.classList.contains('is-expanded')) return;
-        const previousScrollTop = log.scrollTop;
-        const stickToEnd = log.scrollHeight - log.scrollTop - log.clientHeight < 24;
-        renderTaskLog(log, latest.log, latest.logLoaded ? 'No log output yet.' : 'Loading log…');
-        log.scrollTop = stickToEnd ? log.scrollHeight : previousScrollTop;
     };
     const unsubscribe = taskController.subscribe(taskId, (value) => {
-        const logChanged = value.log !== latest.log || value.logLoaded !== latest.logLoaded;
         latest = value;
         renderSummary();
-        if (logChanged) renderLog();
     });
     const timer = setInterval(renderSummary, 1000);
-    toggle.addEventListener('click', () => {
-        const expanded = panel.classList.toggle('is-expanded');
-        panel.classList.toggle('is-collapsed', !expanded);
-        toggle.setAttribute('aria-expanded', expanded ? 'true' : 'false');
-        arrow.textContent = expanded ? '▾' : '▸';
-        if (expanded && !latest.logLoaded) {
-            renderSummary();
-            renderLog();
-            void taskController.loadLog(taskId).catch(() => {
-                latest = { ...latest, logLoaded: true, log: 'Unable to load task log.' };
-                renderSummary();
-                renderLog();
-            });
-        } else {
-            renderSummary();
-            renderLog();
-        }
-    });
     renderSummary();
     return () => {
         disposed = true;

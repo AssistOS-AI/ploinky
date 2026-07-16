@@ -111,26 +111,38 @@ collapsible block above the final answer. A progress-only placeholder may render
 that block without an empty text bubble. Progress remains UI metadata rather
 than assistant text and must not enter continuation context.
 
-WebChat may also receive generic `__webchatTask` lifecycle envelopes from a selected CLI. These envelopes must be intercepted before conversation rendering and history capture. Ploinky must store workspace-scoped task metadata as append-only JSON lines in `<cwd>/.copilot_history/agent_tasks`, store bounded per-task logs separately under `.copilot_history/task_logs/`, and expose authenticated `GET /webchat/tasks` and `GET /webchat/tasks/<task-id>/log` routes. Browser updates must use the existing EventSource stream with a `task-update` event; Ploinky must not hardcode target-agent ids or tool names.
+WebChat may also receive generic `__webchatTask` lifecycle envelopes from a selected CLI. These envelopes must be intercepted before conversation rendering and history capture. Ploinky must store workspace-scoped task metadata as append-only JSON lines in `<cwd>/.copilot_history/agent_tasks`, store bounded per-task logs separately under `.copilot_history/task_logs/`, and expose authenticated `GET /webchat/tasks`, `GET /webchat/tasks/<task-id>/log`, and `GET /webchat/tasks/<task-id>/view` routes. Browser updates must use the existing EventSource stream with a `task-update` event; Ploinky must not hardcode target-agent ids or tool names.
 
 Each first `started` envelope for a task in a user turn must insert one task item
 immediately after that turn's existing assistant placeholder. Multiple tasks are
 allowed and remain in start order; reinserting the same task id is idempotent.
 Live correlation may include the folder session id and inserted task-item index
 on the EventSource event, but this transient routing data must not be duplicated
-in the task journal. The browser must render every task item as its own
-incoming-style chat item containing the existing collapsible task module, keep
-collecting updates while collapsed, and recover the same item after history
-loading by resolving its `taskId` against the task and log routes. A live task
+in the task journal. The browser must render every task item as its own compact
+incoming-style chat item. Its first row must show the exact target-agent id,
+description, status, and elapsed whole seconds, and its second row must expose a
+`View live logs` link without inline expansion controls or logs. The browser
+must recover the same item after history loading by resolving its `taskId`
+against the task route. A live task
 item may appear before final assistant text arrives; indexed insertion must
 still produce the stable history order `user -> assistant -> task items`. The
-module must show the exact target-agent id, description, status, and elapsed
-whole seconds. It remains available after terminal completion; a missing task
-record renders as unavailable. Task items are UI references and must not enter
+item remains available after terminal completion; a missing task record renders
+as unavailable. Task items are UI references and must not enter
 the continuation context. Legacy assistant-message `taskId` properties are
 ignored rather than rendered or migrated.
 
-The Tasks overlay and inline task module must share one presentation policy.
+The task link must use WebChat's generic side-panel link mechanism to open the
+authenticated task view. That page must reproduce the task header, error, and
+live-log presentation previously available in the expanded chat item. It must
+load its initial task and log state through the authenticated task APIs, then
+receive updates for the active task from the parent WebChat page through a
+same-origin `postMessage` bridge fed by the parent's existing EventSource. It
+must not open another EventSource or create a task-specific live transport.
+Missing log offsets must be recovered through the existing log route. Direct
+navigation may show the current authenticated snapshot without a parent live
+bridge.
+
+The Tasks overlay, compact task item, and task view must share one presentation policy.
 Pending work is shown as `QUEUED`, active work as `RUNNING`, and terminal states
 as `COMPLETED`, `STOPPED`, or `FAILED`. Raw task log files remain unchanged and
 are written only by task-event ingestion. For asynchronous AgentServer tools,
@@ -271,6 +283,16 @@ that equality as terminal echo evidence discards a valid assistant response and
 leaves the browser waiting on an empty placeholder. Echo suppression therefore
 uses explicit transport markers, including WebChat envelopes and the `you>`
 readline prompt, rather than conversational text equality.
+
+### Question #17: Why does the task view reuse the parent WebChat stream instead of opening its own EventSource?
+
+Response:
+The parent WebChat runtime already receives every `task-update` event and owns
+the selected CLI lifecycle. Opening the general WebChat stream from the task
+view could create or retain another runtime merely to inspect logs. Forwarding
+only the active task through a same-origin `postMessage` bridge preserves one
+live transport, while the authenticated task and log routes provide initial
+state and offset-gap recovery.
 
 ## Conclusion
 

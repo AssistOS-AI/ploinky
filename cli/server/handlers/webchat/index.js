@@ -104,7 +104,16 @@ export async function handleWebChat(req, res, appConfig, appState) {
     const workspaceDirectory = workspaceBase.base;
 
     if (await handleConversationRoute({ pathname, req, res, workspaceDirectory, appState })) return;
-    if (handleTaskRoute({ pathname, req, res, parsedUrl, workspaceDirectory })) return;
+    if (handleTaskRoute({
+        pathname,
+        req,
+        res,
+        parsedUrl,
+        workspaceDirectory,
+        renderTaskView: () => renderTemplate(['task-view.html'], {
+            '__ASSET_BASE__': `/${appName}/assets`,
+        }),
+    })) return;
 
     if (pathname === '/suggestions/files' && (req.method === 'GET' || req.method === 'HEAD')) {
         return handleSuggestionsFiles(req, res, parsedUrl, getSession(req, appState));

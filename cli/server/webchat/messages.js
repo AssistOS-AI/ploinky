@@ -1,6 +1,6 @@
 import { formatBytes, getFileIcon } from './fileHelpers.js';
 import { findMentionRanges } from './composerMentionHighlights.js';
-import { attachInlineTaskPanel } from './taskPresentation.js';
+import { attachTaskSummary } from './taskPresentation.js';
 
 const ENABLE_SELECT_PAGINATION_ACTIONS = false;
 const AUTO_SCROLL_BOTTOM_THRESHOLD_PX = 4;
@@ -1050,11 +1050,11 @@ export function createMessages({
 
     function attachTaskPanel(bubble, taskId) {
         if (!bubble || !taskId || !taskController) return;
-        const existing = bubble.querySelector(':scope > .wa-inline-task');
+        const existing = bubble.querySelector(':scope > .wa-task-summary');
         if (existing?.dataset.taskId === taskId) return;
         taskPanelCleanups.get(bubble)?.();
         existing?.remove();
-        const dispose = attachInlineTaskPanel({ bubble, taskId, taskController });
+        const dispose = attachTaskSummary({ bubble, taskId, taskController });
         taskPanelCleanups.set(bubble, () => {
             dispose();
             taskPanelCleanups.delete(bubble);

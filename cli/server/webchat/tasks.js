@@ -249,5 +249,14 @@ export function createTaskController({ toEndpoint, elements, showBanner }) {
     }, 1000);
 
     void refresh().catch(() => {});
-    return { handleUpdate, refresh, open, close, subscribe, loadLog, getTask: (taskId) => tasks.get(taskId) || null };
+    return {
+        handleUpdate,
+        refresh,
+        open,
+        close,
+        subscribe,
+        loadLog,
+        getTask: (taskId) => tasks.get(taskId) || null,
+        getTaskViewUrl: (taskId) => toEndpoint(`tasks/${encodeURIComponent(taskId)}/view`),
+    };
 }
