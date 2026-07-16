@@ -111,10 +111,9 @@ function readCursor(cursorPath) {
         return {
             tail: typeof parsed.tail === 'string' ? parsed.tail.slice(-MAX_REMOTE_TAIL) : '',
             seq: Number.isFinite(Number(parsed.seq)) ? Number(parsed.seq) : null,
-            resultHash: typeof parsed.resultHash === 'string' ? parsed.resultHash : '',
         };
     } catch (_) {
-        return { tail: '', seq: null, resultHash: '' };
+        return { tail: '', seq: null };
     }
 }
 
@@ -161,16 +160,10 @@ function ingestLog(logDirectory, taskId, rawLog = {}) {
     if (tail && (seq === null || cursor.seq === null || seq !== cursor.seq || tail !== cursor.tail)) {
         appended += overlapDelta(cursor.tail, tail);
     }
-    const result = typeof rawLog.result === 'string' ? rawLog.result : '';
-    const resultHash = result ? crypto.createHash('sha256').update(result).digest('hex') : '';
-    if (result && resultHash !== cursor.resultHash) {
-        appended += `${appended && !appended.endsWith('\n') ? '\n' : ''}\n[task result]\n${result}\n`;
-    }
     appendBoundedLog(logPath, appended);
     atomicWriteJson(cursorPath, {
         tail,
         seq,
-        resultHash: resultHash || cursor.resultHash,
         truncated: rawLog.truncated === true,
     });
     let nextOffset = 0;

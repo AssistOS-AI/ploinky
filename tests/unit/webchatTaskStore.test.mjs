@@ -75,6 +75,23 @@ test('task storage preserves raw stream and runner prefixes for UI-only formatti
     assert.equal(readTaskLog(root, event().task.id).text, raw);
 });
 
+test('terminal result payload is never appended to the live log', () => {
+    const root = workspace();
+    const taskId = event().task.id;
+    const tail = 'Final assistant answer\n';
+    ingestTaskEvent(root, event({ status: 'finished', remoteStatus: 'completed' }, {
+        tail,
+        seq: 3,
+        result: 'A different terminal result that must be ignored',
+    }));
+
+    const stored = readTaskLog(root, taskId).text;
+    assert.equal(stored, tail);
+    assert.doesNotMatch(stored, /\[task result\]/);
+    assert.doesNotMatch(stored, /different terminal result/);
+    assert.equal(stored.match(/Final assistant answer/g)?.length, 1);
+});
+
 test('task log is capped at one MiB', () => {
     const root = workspace();
     for (let index = 0; index < 6; index += 1) {

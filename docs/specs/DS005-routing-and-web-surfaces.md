@@ -128,11 +128,17 @@ ignored rather than rendered or migrated.
 The Tasks overlay and inline task module must share one presentation policy.
 Pending work is shown as `QUEUED`, active work as `RUNNING`, and terminal states
 as `COMPLETED`, `STOPPED`, or `FAILED`. Raw task log files remain unchanged and
-are written only by task-event ingestion. Browser rendering strips stream and
-runner prefixes such as `[opencode stdout]`, `[opencode stderr]`, and
-`[opencodeAgent/execute-task]`; stdout remains primary and stderr uses a less
-prominent text color. Runner start/exit diagnostics are omitted because duration
-is displayed separately, while timeout and crash information remains visible.
+are written only by task-event ingestion. For asynchronous AgentServer tools,
+command stdout is the final result channel and must not be copied into the live
+log tail; command stderr is the live diagnostic channel. If stdout is a JSON
+object with a string `outputText`, only that field is exposed as MCP result text,
+while wrapper metadata remains internal. Task-event ingestion must persist only
+the supplied live tail and must never concatenate the terminal MCP result into
+the task log. Provider wrappers are responsible for emitting any final answer
+that belongs in the task item through their live output before completion.
+Browser rendering strips ANSI control sequences and retains presentation
+compatibility for historical logs that contain recognized stream and runner
+prefixes; new raw provider output remains otherwise unchanged.
 
 When a WebChat runtime has no SSE subscribers but owns a task whose materialized state is `ongoing`, reconnect cleanup must retain that runtime so its agent can continue router-mediated polling and log collection. Once its tasks become terminal, the normal reconnect grace and disposal behavior resumes. If the runtime is recreated after a wider process restart, the selected CLI may reattach from the workspace task journal. Task identity must be based on the target agent and remote task id; a PID is optional diagnostics only.
 
