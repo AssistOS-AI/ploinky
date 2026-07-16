@@ -132,7 +132,7 @@ test('TaskQueue preserves async command args across queue persistence', async (t
     assert.equal(restoredEntry?.toolName, 'execute-task');
 });
 
-test('TaskQueue exposes live log tail updates while task is running', async (t) => {
+test('TaskQueue exposes stderr as live logs without leaking stdout result payloads', async (t) => {
     const storagePath = makeTempStorage(t);
     const completions = [];
 
@@ -150,17 +150,47 @@ test('TaskQueue exposes live log tail updates while task is running', async (t) 
 
     const runningTask = await waitFor(() => {
         const task = queue.getTask(id);
-        return task?.status === 'running' && task?.logSeq >= 2 ? task : null;
+        return task?.status === 'running' && task?.logSeq >= 1 ? task : null;
     });
 
-    assert.match(runningTask.logTail, /step 1/);
     assert.match(runningTask.logTail, /step 2/);
+    assert.doesNotMatch(runningTask.logTail, /step 1/);
     assert.equal(runningTask.logTruncated, false);
 
     completions[0]({ code: 0, stdout: 'done', stderr: '' });
     await waitFor(() => queue.getTask(id)?.status === 'completed');
 
     const completed = queue.getTask(id);
-    assert.ok(completed.logSeq >= 2);
-    assert.match(completed.logTail, /step 1/);
+    assert.ok(completed.logSeq >= 1);
+    assert.doesNotMatch(completed.logTail, /step 1/);
+});
+
+test('TaskQueue exposes only outputText from structured command results', async (t) => {
+    const storagePath = makeTempStorage(t);
+    const stdout = JSON.stringify({
+        ok: true,
+        outputText: 'Final assistant answer',
+        projectDir: '/workspace/project',
+        model: '',
+    });
+
+    const queue = new TaskQueue({
+        maxConcurrent: 1,
+        storagePath,
+        executor: async (_spec, _payload, options = {}) => {
+            options.onStdoutChunk?.(stdout);
+            options.onStderrChunk?.('live agent output\n');
+            return { code: 0, stdout, stderr: 'live agent output\n' };
+        },
+    });
+
+    const { id } = queue.enqueueTask(dummyTaskConfig({ job: 'structured-result' }));
+    await waitFor(() => queue.getTask(id)?.status === 'completed');
+
+    const completed = queue.getTask(id);
+    assert.deepEqual(completed.result.content, [
+        { type: 'text', text: 'Final assistant answer' },
+    ]);
+    assert.equal(completed.logTail, 'live agent output\n');
+    assert.doesNotMatch(completed.logTail, /projectDir|outputText/);
 });

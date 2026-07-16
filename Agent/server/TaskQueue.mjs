@@ -12,6 +12,20 @@ function parsePositiveInt(value, fallback) {
     return fallback;
 }
 
+function commandResultText(stdout) {
+    const raw = typeof stdout === 'string' ? stdout : String(stdout ?? '');
+    const trimmed = raw.trim();
+    if (!trimmed) return '(no output)';
+    try {
+        const parsed = JSON.parse(trimmed);
+        if (parsed && typeof parsed === 'object' && typeof parsed.outputText === 'string') {
+            return parsed.outputText || '(no output)';
+        }
+    } catch {
+    }
+    return raw;
+}
+
 export class TaskQueue {
     constructor({ maxConcurrent = 10, storagePath, executor, maxLogTailBytes = DEFAULT_MAX_LOG_TAIL_BYTES }) {
         if (typeof executor !== 'function') {
@@ -312,9 +326,10 @@ export class TaskQueue {
                         }, task.timeoutMs);
                     }
                 },
-                onStdoutChunk: (chunk) => {
-                    forwardToHostLog(process.stdout, chunk);
-                    this.appendTaskLog(task.id, chunk);
+                onStdoutChunk: () => {
+                    // Stdout is the command result channel. It is intentionally
+                    // excluded from live logs so structured wrapper metadata does
+                    // not leak into task presentation.
                 },
                 onStderrChunk: (chunk) => {
                     forwardToHostLog(process.stderr, chunk);
@@ -328,11 +343,7 @@ export class TaskQueue {
 
             const success = !timedOut && result.code === 0;
             if (success) {
-                const textOut = result.stdout?.length ? result.stdout : '(no output)';
-                const content = [{ type: 'text', text: textOut }];
-                if (result.stderr && result.stderr.trim()) {
-                    content.push({ type: 'text', text: `stderr:\n${result.stderr}` });
-                }
+                const content = [{ type: 'text', text: commandResultText(result.stdout) }];
                 task.status = 'completed';
                 task.result = {
                     content,
