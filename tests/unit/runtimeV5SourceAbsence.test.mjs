@@ -19,12 +19,6 @@ const executableRoots = [
 ];
 const normativeRoots = ['docs'];
 const normativeFiles = ['README.md', 'container/README.md'];
-const ignoredDirectories = new Set([
-    path.join('docs', 'superpowers'),
-]);
-const ignoredFiles = new Set([
-    path.join('tests', 'lastRun.results'),
-]);
 
 const legacyRuntimeTokens = [
     ['additional', 'ServerPort'].join(''),
@@ -62,7 +56,7 @@ function collectFiles(relativePath) {
     for (const entry of fs.readdirSync(absolutePath, { withFileTypes: true })) {
         if (entry.name === 'node_modules' || entry.name === '.git') continue;
         const child = path.join(relativePath, entry.name);
-        if (entry.isDirectory() && !ignoredDirectories.has(child)) files.push(...collectFiles(child));
+        if (entry.isDirectory()) files.push(...collectFiles(child));
         else if (entry.isFile()) files.push(child);
     }
     return files;
@@ -71,7 +65,6 @@ function collectFiles(relativePath) {
 function readTextFiles(paths) {
     return paths
         .flatMap(collectFiles)
-        .filter((relativePath) => !ignoredFiles.has(relativePath))
         .map((relativePath) => ({
             relativePath,
             source: fs.readFileSync(path.join(repositoryRoot, relativePath), 'utf8'),
