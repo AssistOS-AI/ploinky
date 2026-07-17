@@ -179,6 +179,7 @@ const slashProvider = createSlashCommandsProvider({
 });
 const workspacePathsProvider = createWorkspacePathsProvider({
     basePath,
+    toEndpoint,
     state: autocompleteState,
     dlog
 });
@@ -187,8 +188,10 @@ const composerAutocomplete = createComposerAutocomplete({
     cmdInput
 }, {
     providers: [slashProvider, workspacePathsProvider],
-    onSelectionApplied: ({ next }) => {
-        mentionHighlighter.recordSelection(next?.value || '', next?.cursor ?? 0);
+    onSelectionApplied: ({ suggestion, next }) => {
+        mentionHighlighter.recordSelection(next?.value || '', next?.cursor ?? 0, {
+            final: suggestion?.keepMenuOpen !== true
+        });
     },
     dlog
 });

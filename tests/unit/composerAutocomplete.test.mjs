@@ -7,6 +7,7 @@ import {
     nextAutocompleteRenderCount,
 } from '../../cli/server/webchat/composerAutocomplete.js';
 import {
+    createComposerMentionHighlighter,
     extractMentionTokenAt,
     findMentionRanges,
     renderMentionHighlightHtml,
@@ -51,6 +52,16 @@ test('findTriggerAt detects @ after whitespace', () => {
     assert.deepEqual(result, { trigger: '@', triggerIndex: 8, token: 'open-i' });
 });
 
+test('findTriggerAt ends @ autocomplete after a trailing space', () => {
+    assert.equal(findTriggerAt('@docs/ ', 7, ['@']), null);
+    assert.equal(findTriggerAt('@docs/file.md ', 14, ['@']), null);
+});
+
+test('findTriggerAt still resolves a manual @ path when the caret is before later text', () => {
+    const result = findTriggerAt('@docs/ later', 6, ['@']);
+    assert.deepEqual(result, { trigger: '@', triggerIndex: 0, token: 'docs/' });
+});
+
 test('findTriggerAt prefers the most recent trigger', () => {
     const result = findTriggerAt('/build @ot', 10, ['/', '@']);
     assert.deepEqual(result, { trigger: '@', triggerIndex: 7, token: 'ot' });
@@ -66,27 +77,87 @@ test('findTriggerAt ignores trigger after a newline boundary between caret and t
     assert.equal(result, null);
 });
 
-test('extractMentionTokenAt returns file mentions and ignores provider-looking tokens', () => {
-    assert.equal(extractMentionTokenAt('@open-interpreter ', 18), '');
-    assert.equal(extractMentionTokenAt('see @file:docs/notes.md ', 24), '@file:docs/notes.md');
+test('extractMentionTokenAt returns a selected plain @ path token', () => {
+    assert.equal(extractMentionTokenAt('@README.md ', 11), '@README.md');
+    assert.equal(extractMentionTokenAt('see @docs/notes.md ', 19), '@docs/notes.md');
 });
 
-test('renderMentionHighlightHtml bolds only recorded file mention tokens', () => {
-    const html = renderMentionHighlightHtml('ask @open-interpreter about @op', ['@open-interpreter']);
+test('renderMentionHighlightHtml highlights only explicitly recorded @ path tokens', () => {
+    const html = renderMentionHighlightHtml('ask @open-interpreter about @src/index.js', ['@src/index.js']);
     assert.doesNotMatch(html, /<strong class="wa-composer-mention">@open-interpreter<\/strong>/);
-    assert.match(html, /about @op$/);
+    assert.match(html, /<strong class="wa-composer-mention">@src\/index\.js<\/strong>$/);
 
-    const fileHtml = renderMentionHighlightHtml('read @file:docs/notes.md', ['@file:docs/notes.md']);
-    assert.match(fileHtml, /<strong class="wa-composer-mention">@file:docs\/notes\.md<\/strong>/);
+    const rootFileHtml = renderMentionHighlightHtml('read @Makefile', ['@Makefile']);
+    assert.match(rootFileHtml, /<strong class="wa-composer-mention">@Makefile<\/strong>/);
 });
 
-test('findMentionRanges detects file mentions and ignores provider-looking tokens', () => {
+test('findMentionRanges detects only supplied workspace reference tokens', () => {
     assert.deepEqual(findMentionRanges('ask @open-interpreter hello'), []);
-    assert.deepEqual(findMentionRanges('read @file:ploinky/cli/server'), [
-        { start: 5, end: 29, token: '@file:ploinky/cli/server' },
+    assert.deepEqual(findMentionRanges('read @ploinky/cli/server', ['@ploinky/cli/server']), [
+        { start: 5, end: 24, token: '@ploinky/cli/server' },
     ]);
 });
 
 test('findMentionRanges ignores embedded email-like at signs', () => {
-    assert.deepEqual(findMentionRanges('email user@example.com about @open-interpreter'), []);
+    assert.deepEqual(findMentionRanges('email user@example.com', ['@example.com']), []);
+});
+
+test('composer mention overlay stays inactive while a folder selection remains open', () => {
+    const originalDocument = globalThis.document;
+    const classes = new Set();
+    const listeners = new Map();
+    const inserted = [];
+    const wrapper = {
+        classList: {
+            add: (name) => classes.add(name),
+            remove: (name) => classes.delete(name),
+        },
+        insertBefore: (node) => inserted.push(node),
+    };
+    const cmdInput = {
+        value: '',
+        scrollTop: 0,
+        scrollLeft: 0,
+        closest: () => wrapper,
+        addEventListener: (name, listener) => {
+            const entries = listeners.get(name) || [];
+            entries.push(listener);
+            listeners.set(name, entries);
+        },
+    };
+
+    globalThis.document = {
+        createElement: () => ({
+            className: '',
+            hidden: false,
+            innerHTML: '',
+            setAttribute() {},
+        }),
+    };
+
+    try {
+        const highlighter = createComposerMentionHighlighter({ cmdInput });
+        assert.equal(inserted.length, 0);
+        assert.equal(classes.has('wa-mention-highlights-active'), false);
+
+        cmdInput.value = '@docs/';
+        highlighter.recordSelection(cmdInput.value, cmdInput.value.length, { final: false });
+        assert.deepEqual(highlighter.tokens, []);
+        assert.equal(inserted.length, 0);
+        assert.equal(classes.has('wa-mention-highlights-active'), false);
+
+        cmdInput.value = '@docs/README.md ';
+        highlighter.recordSelection(cmdInput.value, cmdInput.value.length, { final: true });
+        assert.deepEqual(highlighter.tokens, ['@docs/README.md']);
+        assert.equal(inserted.length, 1);
+        assert.equal(classes.has('wa-mention-highlights-active'), true);
+
+        cmdInput.value = '@docs/README.m ';
+        for (const listener of listeners.get('input') || []) listener();
+        assert.deepEqual(highlighter.tokens, []);
+        assert.equal(inserted[0].hidden, true);
+        assert.equal(classes.has('wa-mention-highlights-active'), false);
+    } finally {
+        globalThis.document = originalDocument;
+    }
 });

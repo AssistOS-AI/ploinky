@@ -5,12 +5,8 @@ import {
     getWorkspaceRoot,
     resolveWorkspacePath
 } from '../../utils/workspacePaths.js';
-import { ensureSessionUploadRoot } from '../../webchat/uploadPaths.js';
-import { resolveWebchatUploadContext } from './uploads.js';
 const RESERVED_SECRET_PATH_RE = /(^|\/)\.secrets$|\.secrets$/i;
 const MAX_SUGGESTION_RESULTS = 30;
-const SUGGESTION_SEARCH_MAX_DEPTH = 4;
-const SUGGESTION_SEARCH_MAX_DIRS = 400;
 
 function isReservedSecretPath(relativePath) {
     const candidate = String(relativePath || '').replace(/^\/+/, '');
@@ -24,11 +20,6 @@ function shouldSkipSuggestionEntry(name) {
     if (!name || name === '.' || name === '..') return true;
     if (name === '.ploinky' || name === 'node_modules') return true;
     return isReservedSecretPath(name);
-}
-
-function shouldDescendSuggestionDirectory(name) {
-    if (name === '.git') return false;
-    return !shouldSkipSuggestionEntry(name);
 }
 
 function isRelativeInside(relativePath) {
@@ -131,50 +122,6 @@ function listImmediateWorkspaceSuggestions({ safeRoot, safeBase, scanDir, leafLo
         const candidate = buildWorkspaceSuggestion({ safeRoot, safeBase, absolute, name, stat });
         if (!candidate) continue;
         candidates.push(candidate);
-        if (candidates.length >= limit * 2) break;
-    }
-    return sortWorkspaceSuggestions(candidates, leafLower).slice(0, limit);
-}
-
-function listRecursiveWorkspaceSuggestions({ safeRoot, safeBase, leafLower, limit }) {
-    const candidates = [];
-    const queue = [{ dir: safeBase, depth: 0 }];
-    let visitedDirs = 0;
-    while (queue.length && visitedDirs < SUGGESTION_SEARCH_MAX_DIRS && candidates.length < limit * 4) {
-        const { dir, depth } = queue.shift();
-        visitedDirs += 1;
-        let entries;
-        try {
-            entries = fs.readdirSync(dir, { withFileTypes: true });
-        } catch (_) {
-            continue;
-        }
-        entries.sort((a, b) => a.name.localeCompare(b.name));
-        for (const entry of entries) {
-            const name = entry.name;
-            if (shouldSkipSuggestionEntry(name)) continue;
-            const absolute = path.join(dir, name);
-            const stat = readSuggestionStat(absolute, safeRoot);
-            if (!stat) continue;
-            const relativeFromBase = path.relative(safeBase, absolute).replace(/\\+/g, '/');
-            if (!isRelativeInside(relativeFromBase)) continue;
-            const normalizedPath = relativeFromBase.toLowerCase();
-            if (normalizedPath.includes(leafLower)) {
-                const candidate = buildWorkspaceSuggestion({
-                    safeRoot,
-                    safeBase,
-                    absolute,
-                    name,
-                    stat,
-                    displayPath: relativeFromBase
-                });
-                if (candidate) candidates.push(candidate);
-            }
-            if (stat.isDirectory() && depth < SUGGESTION_SEARCH_MAX_DEPTH && shouldDescendSuggestionDirectory(name)) {
-                queue.push({ dir: absolute, depth: depth + 1 });
-            }
-            if (candidates.length >= limit * 4) break;
-        }
     }
     return sortWorkspaceSuggestions(candidates, leafLower).slice(0, limit);
 }
@@ -196,8 +143,7 @@ export function sanitizeSuggestionQuery(rawQuery) {
     };
 }
 
-export function resolveWebchatWorkspaceBase(parsedUrl) {
-    const configuredRoot = getWorkspaceRoot();
+export function resolveWebchatWorkspaceBase(parsedUrl, { workspaceRoot: configuredRoot = getWorkspaceRoot() } = {}) {
     let workspaceRoot = configuredRoot;
     try {
         workspaceRoot = fs.realpathSync(configuredRoot);
@@ -210,7 +156,7 @@ export function resolveWebchatWorkspaceBase(parsedUrl) {
     if (rawWorkspaceDir) {
         try {
             const resolved = resolveWorkspacePath(rawWorkspaceDir, { workspaceRoot });
-            const relativeBase = path.relative(workspaceRoot, resolved);
+            const relativeBase = path.relative(workspaceRoot, resolved).replace(/\\+/g, '/');
             return { root: workspaceRoot, base: resolved, relativeBase };
         } catch (_) {
             return { root: workspaceRoot, base: workspaceRoot, relativeBase: '' };
@@ -223,7 +169,7 @@ export function resolveWebchatWorkspaceBase(parsedUrl) {
                 workspaceRoot,
                 leadingSlashIsWorkspaceRelative: false
             });
-            const relativeBase = path.relative(workspaceRoot, resolved);
+            const relativeBase = path.relative(workspaceRoot, resolved).replace(/\\+/g, '/');
             return { root: workspaceRoot, base: resolved, relativeBase };
         } catch (_) {
             return { root: workspaceRoot, base: workspaceRoot, relativeBase: '' };
@@ -242,102 +188,50 @@ export function listWorkspaceSuggestions({
     const safeRoot = workspaceRoot ? path.resolve(workspaceRoot) : getWorkspaceRoot();
     const safeBase = base ? path.resolve(base) : safeRoot;
     if (!safeRoot) return { ok: false, items: [], error: 'workspace_unavailable' };
+    try {
+        resolveWorkspacePath(safeBase, {
+            workspaceRoot: safeRoot,
+            leadingSlashIsWorkspaceRelative: false
+        });
+    } catch (_) {
+        return { ok: true, items: [] };
+    }
     const folderRelative = folder ? folder.replace(/\\+/g, '/').replace(/^\/+/, '') : '';
     let scanDir;
     try {
         scanDir = folderRelative
-            ? resolveWorkspacePath(path.join(safeBase, folderRelative), { workspaceRoot: safeRoot })
+            ? resolveWorkspacePath(path.join(safeBase, folderRelative), {
+                workspaceRoot: safeRoot,
+                leadingSlashIsWorkspaceRelative: false
+            })
             : safeBase;
     } catch (_) {
         return { ok: true, items: [] };
     }
     const leafLower = leaf ? leaf.toLowerCase() : '';
-    const items = !folderRelative && leafLower
-        ? listRecursiveWorkspaceSuggestions({ safeRoot, safeBase, leafLower, limit })
-        : listImmediateWorkspaceSuggestions({ safeRoot, safeBase, scanDir, leafLower, limit });
+    const items = listImmediateWorkspaceSuggestions({
+        safeRoot,
+        safeBase,
+        scanDir,
+        leafLower,
+        limit
+    });
     return { ok: true, items };
 }
 
-export function normalizeUploadSuggestionQueryPath(rawPath, uploadRootRelToCwd) {
-    const normalized = String(rawPath || '').trim().replace(/\\+/g, '/');
-    if (!normalized) return '';
-    if (normalized.startsWith('/')) return normalized;
-    const rootPrefix = String(uploadRootRelToCwd || '').trim().replace(/\\+/g, '/').replace(/^\/+|\/+$/g, '');
-    if (!rootPrefix) return normalized;
-    if (normalized === rootPrefix) return '';
-    if (normalized.startsWith(`${rootPrefix}/`)) {
-        return normalized.slice(rootPrefix.length + 1);
-    }
-    return normalized;
-}
-
-export function rewriteUploadSuggestionItem(item, { uploadRootRelToCwd, uploadRootRelToWorkspace }) {
-    if (!item || typeof item !== 'object') return item;
-    const sessionRelative = String(item.workspacePath || item.relativePath || item.path || '').replace(/^\/+/, '');
-    const joinedCwd = uploadRootRelToCwd
-        ? (sessionRelative ? `${uploadRootRelToCwd}/${sessionRelative}` : uploadRootRelToCwd)
-        : sessionRelative;
-    const joinedWorkspace = uploadRootRelToWorkspace
-        ? (sessionRelative ? `${uploadRootRelToWorkspace}/${sessionRelative}` : uploadRootRelToWorkspace)
-        : sessionRelative;
-    return {
-        ...item,
-        displayPath: sessionRelative || item.displayPath,
-        relativePath: sessionRelative,
-        queryPath: sessionRelative,
-        path: joinedCwd,
-        workspacePath: joinedWorkspace,
-    };
-}
-
-export function handleSuggestionsFiles(req, res, parsedUrl, sessionId) {
+export function handleSuggestionsFiles(req, res, parsedUrl, options = {}) {
     const queryRaw = parsedUrl.searchParams.get('query') || '';
     const limitRaw = parsedUrl.searchParams.get('limit');
     const limitNum = limitRaw ? Math.min(MAX_SUGGESTION_RESULTS, Math.max(1, Number(limitRaw) | 0)) : MAX_SUGGESTION_RESULTS;
-    const baseRaw = parsedUrl.searchParams.get('base') || '';
-    const workspaceBase = resolveWebchatWorkspaceBase(parsedUrl);
-    const uploadContext = resolveWebchatUploadContext({ workspaceBase, sessionId });
-
-    if (!uploadContext) {
-        res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
-        return res.end(JSON.stringify({ ok: true, root: '', items: [] }));
-    }
-    ensureSessionUploadRoot(uploadContext.uploadRoot);
-
-    const uploadRootRelToCwd = path.relative(uploadContext.cwd, uploadContext.uploadRoot).replace(/\\+/g, '/');
-    const uploadRootRelToWorkspace = path.relative(uploadContext.workspaceRoot, uploadContext.uploadRoot).replace(/\\+/g, '/');
-    const queryForUploadRoot = normalizeUploadSuggestionQueryPath(queryRaw, uploadRootRelToCwd);
-    const sanitized = sanitizeSuggestionQuery(queryForUploadRoot);
+    const workspaceBase = resolveWebchatWorkspaceBase(parsedUrl, options);
+    const sanitized = sanitizeSuggestionQuery(queryRaw);
     if (sanitized === null) {
         res.writeHead(400, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
         return res.end(JSON.stringify({ ok: false, error: 'invalid_query' }));
     }
-    const baseForUploadRoot = normalizeUploadSuggestionQueryPath(baseRaw, uploadRootRelToCwd);
-    const baseSanitized = sanitizeSuggestionQuery(baseForUploadRoot);
-    if (baseSanitized === null) {
-        res.writeHead(400, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
-        return res.end(JSON.stringify({ ok: false, error: 'invalid_base' }));
-    }
-
-    let effectiveBase = uploadContext.uploadRoot;
-    if (baseSanitized.folder || baseSanitized.leaf) {
-        try {
-            const combined = baseSanitized.folder
-                ? path.join(baseSanitized.folder, baseSanitized.leaf || '')
-                : (baseSanitized.leaf || '');
-            effectiveBase = combined
-                ? resolveWorkspacePath(path.join(uploadContext.uploadRoot, combined), {
-                    workspaceRoot: uploadContext.uploadRoot
-                })
-                : uploadContext.uploadRoot;
-        } catch (_) {
-            res.writeHead(400, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
-            return res.end(JSON.stringify({ ok: false, error: 'invalid_base' }));
-        }
-    }
     const result = listWorkspaceSuggestions({
-        workspaceRoot: uploadContext.uploadRoot,
-        base: effectiveBase,
+        workspaceRoot: workspaceBase.base,
+        base: workspaceBase.base,
         folder: sanitized.folder,
         leaf: sanitized.leaf,
         limit: limitNum
@@ -346,15 +240,24 @@ export function handleSuggestionsFiles(req, res, parsedUrl, sessionId) {
         res.writeHead(500, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
         return res.end(JSON.stringify({ ok: false, error: result.error || 'lookup_failed' }));
     }
-    const items = result.items.map((item) => rewriteUploadSuggestionItem(item, {
-        uploadRootRelToCwd,
-        uploadRootRelToWorkspace,
-    }));
-    const relativeBase = path.relative(uploadContext.uploadRoot, effectiveBase).replace(/\\+/g, '/');
+    const items = result.items.map((item) => {
+        const relativePath = String(item.path || '').replace(/^\/+/, '');
+        const workspacePath = workspaceBase.relativeBase
+            ? `${workspaceBase.relativeBase}/${relativePath}`
+            : relativePath;
+        return {
+            ...item,
+            displayPath: relativePath,
+            relativePath,
+            queryPath: relativePath,
+            path: relativePath,
+            workspacePath
+        };
+    });
     res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
     return res.end(JSON.stringify({
         ok: true,
-        root: relativeBase,
+        root: '',
         items
     }));
 }

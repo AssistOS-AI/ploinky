@@ -146,7 +146,7 @@ ploinky cli achilles-cli --path=/absolute/path</code></pre>
                         <li>✅ Auto-resizing composer with keyboard shortcuts (Enter to send, Shift+Enter for new line)</li>
                         <li>✅ Light/Dark/Explorer/Obsidian Dark theme selector with persistent preference (Explorer loads by default; switch via Settings → Appearance)</li>
                         <li>✅ Slash command autocomplete — start the composer with <code>/</code> to open a fixed-height menu; later slashes remain argument text, Arrow Up/Down keeps the active item visible, and large agent-declared result sets remain fully accessible through progressively rendered scroll batches</li>
-                        <li>✅ Composer <code>@</code> autocomplete — typing <code>@</code> opens a grouped menu of static configured tags plus files and folders uploaded in the current WebChat session; selecting a file inserts a stable <code>@file:uploads/&lt;sessionId&gt;/&lt;path&gt;</code> token and attaches a structured reference to the outgoing envelope</li>
+                        <li>✅ Composer <code>@</code> path autocomplete — typing <code>@</code> opens the files and folders in the working directory selected by the WebChat <code>dir</code> launch parameter, and every additional path character refreshes the filtered suggestions. Selecting a folder drills into it; typing a space after the folder ends autocomplete so the folder can be referenced directly. Selecting a file inserts a cwd-relative token such as <code>@src/index.js</code> with a structured workspace reference and closes the menu, so the next Enter sends the message.</li>
                         <li>✅ Cancel button — appears during active processing; sends an interrupt signal to the agent</li>
                     </ul>
                 </div>
@@ -156,7 +156,7 @@ ploinky cli achilles-cli --path=/absolute/path</code></pre>
                     <p>WebChat stores uploaded files in a per-session directory under the current working directory: <code>&lt;cwd&gt;/uploads/&lt;webchat_sid&gt;/</code>. <code>webchat_sid</code> is the WebChat session cookie issued to the authenticated browser; it is not the browser tab id.</p>
                     <ul style="margin-left: 2rem;">
                         <li>The attachment menu has <strong>Upload file</strong> and <strong>Upload folder</strong> entries. Folder uploads preserve <code>file.webkitRelativePath</code> as the relative path inside the session upload directory.</li>
-                        <li>Composer <code>@</code> suggestions search only the current session upload directory. Other sessions' uploads never appear.</li>
+                        <li>Composer <code>@</code> suggestions search the WebChat working directory, so uploaded content appears only when its session folder is reached through normal cwd-relative folder navigation.</li>
                         <li>Uploads use <code>POST /webchat/uploads</code> and are read back via <code>GET /webchat/uploads?path=&lt;session-relative-path&gt;</code>. Downloads reuse stored MIME metadata and set <code>X-Content-Type-Options: nosniff</code>. The server rejects absolute paths, traversal segments, NUL bytes, symlink escapes, and reserved <code>.secrets</code>/<code>*.secrets</code> names.</li>
                     </ul>
                 </div>

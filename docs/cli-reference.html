@@ -364,6 +364,9 @@ webchat --rotate     # accepted for compatibility; still uses router login</code
                         <h4>Slash Command Autocomplete</h4>
                         <p>Inside WebChat, typing <code>/</code> opens a command suggestion menu populated from the agent's MCP tool catalog. Navigate with Arrow Up/Down, insert with Enter or Tab. The menu filters as you continue typing. If the agent exposes no MCP tools, the menu stays silent (no error).</p>
 
+                        <h4>Workspace Path Autocomplete</h4>
+                        <p>Typing <code>@</code> opens a generic file and folder menu rooted at the workspace-confined <code>dir</code> supplied when WebChat was opened. Continue typing to filter the current folder, select a folder to drill into it, and select a file to insert a cwd-relative token such as <code>@src/index.js</code>. The menu returns at most 30 entries per folder and does not depend on the selected agent.</p>
+
                         <h4>Cancel Button</h4>
                         <p>While the agent is processing, the Send button is replaced by a Cancel button. Clicking Cancel sends an interrupt signal (ESC) to the agent's TTY session, aborting the current operation. The Send button returns when the agent produces output or the session closes.</p>
 

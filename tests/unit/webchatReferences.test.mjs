@@ -37,14 +37,14 @@ test('parseInputEnvelope keeps sanitized references and falls back when envelope
     const envelope = parseInputEnvelope(JSON.stringify({
         __webchatMessage: 1,
         version: 1,
-        text: 'inspect @file:notes.md',
+        text: 'inspect @notes.md',
         attachments: [],
         references: [
             { kind: 'workspace-path', path: '/etc/passwd' },
             { kind: 'workspace-path', path: 'notes.md', type: 'file' }
         ]
     }));
-    assert.equal(envelope.text, 'inspect @file:notes.md');
+    assert.equal(envelope.text, 'inspect @notes.md');
     assert.deepEqual(envelope.references, [{ kind: 'workspace-path', path: 'notes.md', type: 'file', label: null }]);
 
     const fallback = parseInputEnvelope('hello there');
@@ -72,7 +72,7 @@ test('serializeWebchatEnvelopeForAgent forwards sanitized references when presen
         effectiveConfig: { agentName: '' },
         tabId: 'tab-1',
         envelope: {
-            text: 'context @file:notes.md',
+            text: 'context @notes.md',
             references: [
                 { kind: 'workspace-path', path: 'notes.md', type: 'file', label: 'Notes' },
                 { kind: 'workspace-path', path: '../escape' }
@@ -87,7 +87,7 @@ test('serializeWebchatEnvelopeForAgent forwards sanitized references when presen
 
 test('client serializeEnvelope normalizes and emits references only when valid', () => {
     const text = serializeEnvelope({
-        text: 'check @file:notes.md',
+        text: 'check @notes.md',
         attachments: [],
         references: [
             { kind: 'workspace-path', path: 'notes.md', type: 'file', label: 'Notes' },

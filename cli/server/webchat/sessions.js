@@ -184,7 +184,8 @@ export function createSessionController({
     function addRemoteUserMessage(message) {
         messages.addClientMsg(message?.text || '', {
             historical: true,
-            timestamp: message?.timestamp
+            timestamp: message?.timestamp,
+            references: message?.references
         });
     }
 
