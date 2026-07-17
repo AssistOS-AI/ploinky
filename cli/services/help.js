@@ -44,12 +44,13 @@ function mainHelpText(surface) {
   shell <agentName>              Open interactive shell in container (attached TTY)
   cli                            Open /bin/bash in the managed outer runtime; exit returns to the previous prompt.
   cli <agentName> [args...]      Run manifest "cli" command (attached TTY)
-  webchat [--rotate]             Print the WebChat access URL and support agent URL params
-  dashboard [--rotate]           Show or rotate Dashboard token and print access URL
+  webchat                        Print the authenticated WebChat access URL
+  dashboard                      Print the administrator-only Dashboard access URL
   sso enable|disable|status  Bind or inspect SSO provider agents
   sandbox status|disable|enable  Force lite-sandbox agents to use containers, or restore bwrap/seatbelt
   network status [--json]        Show managed network topology (status schema 3)
   network prune                  Remove unused workspace-owned managed networks
+  edge apply <json-file>         Validate and activate one staged edge desired-state file
   vars                           List all variable names (no values)
   var <VAR> <value>              Set a variable value
   echo <VAR|$VAR>                Print the resolved value of a variable
@@ -132,10 +133,9 @@ function showDetailedHelp(topic, subtopic, subsubtopic, { surface = 'core' } = {
             description: 'Set a workspace variable (stored encrypted in .ploinky/.secrets)',
             syntax: 'var <VAR> <value>',
             examples: [
-                'var WEBDASHBOARD_TOKEN deadbeef  # Override dashboard token manually',
                 'var API_KEY sk-123456'
             ],
-            notes: "Use 'vars' to list variables. WebChat uses the router login flow; only dashboard still uses a surface token."
+            notes: "Use 'vars' to list variables. Router control surfaces use authenticated workspace sessions."
         },
         'vars': {
             description: 'List workspace variables (from encrypted .ploinky/.secrets)',
@@ -177,19 +177,18 @@ function showDetailedHelp(topic, subtopic, subsubtopic, { surface = 'core' } = {
         },
         'webchat': {
             description: 'Print the WebChat URL served at /webchat.',
-            syntax: 'webchat [--rotate]',
+            syntax: 'webchat',
             examples: [
                 'webchat',
-                'webchat --rotate',
                 '/webchat?agent=achilles-cli&path=/absolute/path'
             ],
-            notes: 'WebChat now uses the normal router login flow. `--rotate` no longer changes anything for this surface. When `/webchat` is opened with `?agent=<name>&...`, every extra query parameter except internal router/session fields is forwarded to `ploinky cli <name>` as a single-token long-form CLI flag in the form `--key=value`.'
+            notes: 'WebChat uses the normal Router login flow. When `/webchat` is opened with `?agent=<name>&...`, every extra query parameter except internal router/session fields is forwarded to `ploinky cli <name>` as a single-token long-form CLI flag in the form `--key=value`.'
         },
         'dashboard': {
-            description: 'Display or rotate the Dashboard token used by /dashboard.',
-            syntax: 'dashboard [--rotate]',
-            examples: [ 'dashboard', 'dashboard --rotate' ],
-            notes: 'Writes the token to encrypted .ploinky/.secrets and prints an access URL. `echo $WEBDASHBOARD_TOKEN` to print it.'
+            description: 'Print the administrator-only Dashboard URL served at /dashboard.',
+            syntax: 'dashboard',
+            examples: [ 'dashboard' ],
+            notes: 'The Dashboard accepts only a real authenticated Router administrator session; mutations additionally require exact Origin and CSRF proof.'
         },
         'sso': {
             description: 'Manage the workspace SSO provider.',
@@ -236,6 +235,14 @@ function showDetailedHelp(topic, subtopic, subsubtopic, { surface = 'core' } = {
                 'network prune'
             ],
             notes: 'Prune removes only unused networks bearing this workspace\'s exact Ploinky ownership labels. Foreign or attached networks are never removed.'
+        },
+        'edge': {
+            description: 'Apply one staged edge publication desired-state document through the serialized generation coordinator.',
+            syntax: 'edge apply <json-file>',
+            examples: [
+                'edge apply ./edge-desired.json',
+            ],
+            notes: 'The input must be one non-symlink regular JSON file no larger than 1 MiB. Apply inactivates the current selector first, validates every captured route and policy source, and has no rollback or previous-generation fallback on failure.'
         },
         
         

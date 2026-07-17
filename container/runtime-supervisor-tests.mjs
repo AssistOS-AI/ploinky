@@ -7,40 +7,37 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
+    BOX_MEDIA_PORT,
     BOX_ROUTER_PORT,
     IDENTITY_SCHEMA_LABEL,
     IDENTITY_SCHEMA_VERSION,
-    EXPLICIT_PUBLISHES_LABEL,
-    GENERATED_PUBLISHES_LABEL,
     PATH_HASH_LABEL,
-    PUBLISH_PLAN_VERSION_LABEL,
     REQUESTED_IMAGE_LABEL,
     REQUIRED_IMAGE_ENV,
     REQUIRED_RUNTIME_IMAGE,
-    REQUIRED_PUBLISH_PLAN_VERSION,
     RUNTIME_CONTRACT_LABEL,
     VOLUME_ROLE_LABEL,
     VOLUME_ROLES,
+    assertFixedRuntimePublications,
     buildRuntimeRunArgs,
     createDefaultRuntimeConfig,
     diffRuntimeConfig,
-    mergeAndValidatePublishes,
     mergeDesiredRuntimeConfig,
     normalizeContainerInspect,
     normalizeImageInspect,
+    parseSelectedHostPort,
     planReconciliation,
     runtimeVolumeNames,
     validateImageContract,
 } from './runtime-contract.mjs';
 import { createEngineClient } from './runtime-engine.mjs';
 import {
-    applyAuthoritativePublicationPlan,
     assertStateCommandFlags,
     createRuntimeSupervisor,
+    fixedUdpOwnersFromContainerInspects,
     forwardCoreCommand,
     hostRuntimeLockPath,
     parseHostInvocation,
-    publicationContractForPlan,
     publicUsageText,
     resolveEngineOwnership,
     resolveHostPloinkySource,
@@ -93,11 +90,9 @@ function invocationFor(cwd = '/workspace/demo') {
         ...identityFor(cwd),
         image: REQUIRED_RUNTIME_IMAGE,
         port: '8080',
-        publish: [],
         explicit: new Set(),
         sourceDirResolved: '/source/ploinky',
         mountDirResolved: '',
-        listenLan: false,
     };
 }
 
@@ -122,15 +117,15 @@ function capturedArgv(capture) {
     return fs.readFileSync(capture, 'utf8').trimEnd().split('\n');
 }
 
-test('contract-4 image normalizes and validates every required metadata field', () => {
+test('contract-5 image normalizes and validates every required metadata field', () => {
     const normalized = normalizeImageInspect(JSON.stringify([contract2Image()]));
     assert.equal(normalized.id, 'sha256:runtime-2');
-    assert.equal(normalized.contract, '4');
+    assert.equal(normalized.contract, '5');
     assert.deepEqual(normalized.env, REQUIRED_IMAGE_ENV);
     assert.equal(validateImageContract(normalized, REQUIRED_RUNTIME_IMAGE), normalized);
 });
 
-test('contract-4 validation emits field-specific failures', async t => {
+test('contract-5 validation emits field-specific failures', async t => {
     const cases = [
         ['image ID', raw => { raw.Id = ''; }, /image ID/],
         ['contract label', raw => { delete raw.Config.Labels[RUNTIME_CONTRACT_LABEL]; }, /runtime-contract/],
@@ -176,15 +171,15 @@ test('runtime creation args pin the validated ID and label the logical reference
 
 test('outer options stop at the first command and downstream argv remains exact', () => {
     const argv = [
-        '--port=9192', '--publish', '127.0.0.1:9000:9000/udp',
-        'client', 'tool', 'demo', '--port', '44', '--image=x', '--name', 'agent', '--engine=docker',
+        '--port=9192', '--image=example/image:tag',
+        'client', 'tool', 'demo', '--publish', '127.0.0.1:9000:9000/udp',
+        '--port', '44', '--image=x', '--name', 'agent', '--engine=docker',
     ];
     const parsed = parseHostInvocation(argv, { PLOINKY_BOX_ENGINE: 'docker' });
     assert.equal(parsed.port, '9192');
-    assert.deepEqual(parsed.publish, ['127.0.0.1:9000:9000/udp']);
     assert.equal(parsed.command, 'client');
-    assert.deepEqual(parsed.args, argv.slice(4));
-    assert.deepEqual(routeHostInvocation(parsed).forwardedArgs, ['client', ...argv.slice(4)]);
+    assert.deepEqual(parsed.args, argv.slice(3));
+    assert.deepEqual(routeHostInvocation(parsed).forwardedArgs, ['client', ...argv.slice(3)]);
 });
 
 test('double dash permits a downstream command beginning with an option', () => {
@@ -207,12 +202,25 @@ test('every outer-option spelling remains an ordinary downstream token after the
         assert.equal(parsed.command, 'cli');
         assert.deepEqual(parsed.args, ['agent', ...tail]);
     }
-    const repeated = parseHostInvocation([
-        '--publish', '9000:9000', '--expose=9001:9001',
-        '--publish', '9002:9002', 'list', 'agents',
-    ]);
-    assert.deepEqual(repeated.publish, ['9000:9000', '9001:9001', '9002:9002']);
-    assert.deepEqual(repeated.args, ['agents']);
+});
+
+test('outer publication escape hatches are rejected before engine discovery', async t => {
+    const cases = [
+        ['--publish', '9000:9000'],
+        ['--publish=9000:9000'],
+        ['--expose', '9001'],
+        ['--expose=9001'],
+        ['--listen-lan'],
+        ['--listen-lan=true'],
+    ];
+    for (const prefix of cases) {
+        await t.test(prefix.join(' '), async () => {
+            const harness = createSupervisorHarness();
+            assert.equal(await harness.supervisor.run([...prefix, 'list', 'agents']), 1);
+            assert.match(harness.stderr, /runtime contract 5|forbids physical-host publication|removed/);
+            assert.equal(harness.calls.length, 0);
+        });
+    }
 });
 
 test('removed public selectors fail only when they occupy the outer prefix', () => {
@@ -240,19 +248,12 @@ test('start-tail --port forms fail before engine discovery or mutation', async t
     }
 });
 
-test('malformed public start positional ports fail before planning, pulling, or mutation', async t => {
+test('malformed public start positional ports fail before pulling or mutation', async t => {
     for (const value of ['+9192', '9192junk', '1.5', '-1', ' 9192 ', '0', '65536']) {
         await t.test(JSON.stringify(value), async () => {
-            let plannerCalls = 0;
-            const harness = createSupervisorHarness({
-                preparePublicationPlan: async () => {
-                    plannerCalls += 1;
-                    throw new Error('planner must not run');
-                },
-            });
+            const harness = createSupervisorHarness();
             assert.equal(await harness.supervisor.run(['start', 'explorer', value]), 1);
             assert.match(harness.stderr, /exact unsigned decimal string|range 1\.\.65535/);
-            assert.equal(plannerCalls, 0);
             assert.equal(runCalls(harness, 'pull').length, 0);
             assert.equal(mutationCalls(harness).length, 0);
         });
@@ -268,7 +269,7 @@ test('outer --port is strict and normalized before publication', async () => {
     const normalized = createSupervisorHarness({ fetchResponse: { ok: true } });
     assert.equal(await normalized.supervisor.run(['--port', '019192', 'start', 'explorer']), 0);
     const creation = runCalls(normalized, 'run').at(-1);
-    assert.ok(creation.args.includes('127.0.0.1:19192:8080'));
+    assert.ok(creation.args.includes('127.0.0.1:19192:8080/tcp'));
     assert.equal(creation.args.some(arg => String(arg).includes('019192')), false);
 });
 
@@ -709,100 +710,130 @@ test('compatible running reuse and stopped start perform no registry pull', asyn
     }
 });
 
-test('current-contract replacement pulls and validates before shutdown', async () => {
-    const fixture = contract2RuntimeFixture();
-    const next = contract2Image('sha256:next');
-    const harness = createSupervisorHarness({
-        ...fixture,
-        pullImages: { [REQUIRED_RUNTIME_IMAGE]: next },
-    });
-    assert.equal(await harness.supervisor.run(['--port', '9192', 'list', 'agents']), 0);
-    const pullIndex = harness.calls.findIndex(call => call.kind === 'run' && call.args[0] === 'pull');
-    const shutdownIndex = harness.calls.findIndex(call =>
-        call.kind === 'run' && call.args.includes('ploinky') && call.args.includes('stop')
-    );
-    assert.ok(pullIndex >= 0 && shutdownIndex > pullIndex);
-    assert.equal(runCalls(harness, 'run').at(-1).args.at(-1), next.Id);
-});
+test('current-contract configuration drift requires explicit destroy before any mutation', async t => {
+    const mountDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-box-drift-mount-'));
+    t.after(() => fs.rmSync(mountDir, { recursive: true, force: true }));
+    const cases = [
+        {
+            name: 'router host port',
+            argv: ['--port', '9192', 'list', 'agents'],
+            reason: 'routerPublish',
+        },
+        {
+            name: 'requested image',
+            argv: ['--image', 'docker.io/example/ploinky-box:test', 'list'],
+            reason: 'image',
+        },
+        {
+            name: 'workspace mount',
+            argv: ['--mount', mountDir, 'list'],
+            reason: 'mountDir',
+        },
+        {
+            name: 'inspected capability',
+            argv: ['list'],
+            reason: 'capAdds',
+            mutateInspect(inspect) {
+                inspect.HostConfig.CapAdd = ['SYS_ADMIN'];
+            },
+        },
+    ];
+    for (const entry of cases) {
+        await t.test(entry.name, async () => {
+            const fixture = contract2RuntimeFixture();
+            entry.mutateInspect?.(fixture.container.inspect);
+            const harness = createSupervisorHarness(fixture);
+            const before = structuredClone(harness.state.container.inspect);
 
-test('pull or image-contract failure leaves the existing box running', async t => {
-    await t.test('pull failure', async () => {
-        const fixture = contract2RuntimeFixture();
-        const harness = createSupervisorHarness({ ...fixture, failures: { pull: 1 } });
-        assert.equal(await harness.supervisor.run(['--port', '9192', 'list']), 1);
-        assert.equal(harness.state.container.inspect.State.Status, 'running');
-        assert.equal(runCalls(harness, 'stop').length, 0);
-    });
-    await t.test('metadata failure', async () => {
-        const fixture = contract2RuntimeFixture();
-        const invalid = contract2Image('sha256:invalid');
-        invalid.Config.User = 'root';
-        const harness = createSupervisorHarness({
-            ...fixture,
-            pullImages: { [REQUIRED_RUNTIME_IMAGE]: invalid },
+            assert.equal(await harness.supervisor.run(entry.argv), 1);
+            assert.match(harness.stderr, /configuration differs from contract-5 desired state/);
+            assert.match(harness.stderr, new RegExp(`\\b${entry.reason}\\b`));
+            assert.match(harness.stderr, /run 'ploinky destroy' explicitly/);
+            assert.match(harness.stderr, /rerun the original command to recreate the box/);
+            assert.equal(mutationCalls(harness).length, 0);
+            assert.equal(runCalls(harness, 'pull').length, 0);
+            assert.deepEqual(harness.state.container.inspect, before);
+            assert.equal(harness.state.container.inspect.State.Status, 'running');
         });
-        assert.equal(await harness.supervisor.run(['--port', '9192', 'list']), 1);
-        assert.match(harness.stderr, /Config\.User/);
-        assert.equal(harness.state.container.inspect.State.Status, 'running');
-        assert.equal(runCalls(harness, 'stop').length, 0);
-    });
+    }
 });
 
-test('contract-1 ordinary commands fail closed without pull, planner, or mutation', async () => {
+test('repeated drift reconciliation leaves a stopped current-contract box stopped', async () => {
+    const fixture = contract2RuntimeFixture({ state: 'exited' });
+    const harness = createSupervisorHarness(fixture);
+    const before = structuredClone(harness.state.container.inspect);
+
+    assert.equal(await harness.supervisor.run(['--port', '9192', 'list']), 1);
+    assert.equal(await harness.supervisor.run(['--port', '9192', 'list']), 1);
+    assert.equal(mutationCalls(harness).length, 0);
+    assert.equal(runCalls(harness, 'pull').length, 0);
+    assert.equal(runCalls(harness, 'start').length, 0);
+    assert.deepEqual(harness.state.container.inspect, before);
+    assert.equal(harness.state.container.inspect.State.Status, 'exited');
+});
+
+test('contract-1 ordinary commands fail closed without pull or mutation', async () => {
     const fixture = contract2RuntimeFixture({ imageId: 'sha256:runtime-1' });
     fixture.images = { 'sha256:runtime-1': contract1Image() };
-    let plannerCalls = 0;
-    const harness = createSupervisorHarness({
-        ...fixture,
-        preparePublicationPlan: async () => { plannerCalls += 1; return { schemaVersion: 2, publishes: [] }; },
-    });
+    const harness = createSupervisorHarness(fixture);
     assert.equal(await harness.supervisor.run(['start', 'explorer']), 1);
     assert.match(harness.stderr, /unsupported/);
     assert.match(harness.stderr, /ploinky destroy/);
-    assert.equal(plannerCalls, 0);
     assert.equal(mutationCalls(harness).length, 0);
 });
 
-test('current-contract box missing router publication fails before planning or core mutation', async () => {
+test('current-contract box missing router publication fails before core mutation', async () => {
     const fixture = contract2RuntimeFixture();
     delete fixture.container.inspect.HostConfig.PortBindings[`${BOX_ROUTER_PORT}/tcp`];
-    let plannerCalls = 0;
-    const harness = createSupervisorHarness({
-        ...fixture,
-        preparePublicationPlan: async () => {
-            plannerCalls += 1;
-            return { schemaVersion: 2, publishes: [] };
-        },
-    });
+    const harness = createSupervisorHarness(fixture);
 
     assert.equal(await harness.supervisor.run(['start', 'explorer']), 1);
     assert.match(harness.stderr, /required 8080\/tcp router publication is missing/);
     assert.match(harness.stderr, /ploinky destroy explicitly/);
-    assert.equal(plannerCalls, 0);
     assert.equal(mutationCalls(harness).length, 0);
 });
 
-test('contract-2 and contract-3 boxes require explicit destroy without planning or mutation', async t => {
-    for (const legacyContract of ['2', '3']) {
+test('current-contract boxes fail closed on missing UDP 7882 or any third publication', async t => {
+    await t.test('missing fixed UDP reservation', async () => {
+        const fixture = contract2RuntimeFixture();
+        delete fixture.container.inspect.HostConfig.PortBindings[`${BOX_MEDIA_PORT}/udp`];
+        const harness = createSupervisorHarness(fixture);
+        assert.equal(await harness.supervisor.run(['list', 'agents']), 1);
+        assert.match(harness.stderr, /fixed UDP reservation/);
+        assert.equal(mutationCalls(harness).length, 0);
+    });
+    await t.test('third physical-host mapping', async () => {
+        const fixture = contract2RuntimeFixture();
+        fixture.container.inspect.HostConfig.PortBindings['9000/tcp'] = [
+            { HostIp: '127.0.0.1', HostPort: '9000' },
+        ];
+        const harness = createSupervisorHarness(fixture);
+        assert.equal(await harness.supervisor.run(['list', 'agents']), 1);
+        assert.match(harness.stderr, /exactly two outer publications/);
+        assert.equal(mutationCalls(harness).length, 0);
+    });
+    await t.test('empty wildcard host IP normalizes to 0.0.0.0', async () => {
+        const fixture = contract2RuntimeFixture();
+        fixture.container.inspect.HostConfig.PortBindings[`${BOX_MEDIA_PORT}/udp`][0].HostIp = '';
+        const harness = createSupervisorHarness(fixture);
+        assert.equal(await harness.supervisor.run(['list', 'agents']), 0);
+        assert.equal(runCalls(harness, 'run').length, 0);
+    });
+});
+
+test('contracts 2, 3, and 4 require explicit destroy without mutation', async t => {
+    for (const legacyContract of ['2', '3', '4']) {
         await t.test(`contract ${legacyContract}`, async () => {
             const imageId = `sha256:runtime-legacy-${legacyContract}`;
             const fixture = contract2RuntimeFixture({ imageId });
             const legacyImage = contract2Image(imageId);
             legacyImage.Config.Labels[RUNTIME_CONTRACT_LABEL] = legacyContract;
             fixture.images = { [legacyImage.Id]: legacyImage };
-            let plannerCalls = 0;
-            const harness = createSupervisorHarness({
-                ...fixture,
-                preparePublicationPlan: async () => {
-                    plannerCalls += 1;
-                    return { schemaVersion: 2, publishes: [] };
-                },
-            });
+            const harness = createSupervisorHarness(fixture);
 
             assert.equal(await harness.supervisor.run(['start', 'explorer']), 1);
             assert.match(harness.stderr, /runtime-contract/);
             assert.match(harness.stderr, /ploinky destroy explicitly/);
-            assert.equal(plannerCalls, 0);
             assert.equal(mutationCalls(harness).length, 0);
         });
     }
@@ -820,67 +851,6 @@ test('status, stop, and destroy remain pull-free for contract-1 boxes', async t 
             await harness.supervisor.run([command]);
             assert.equal(runCalls(harness, 'pull').length, 0);
             if (command === 'destroy') assert.equal(harness.state.container, null);
-        });
-    }
-});
-
-test('failed replacement rolls back prior image ID, labels, environment, config, and volumes', async () => {
-    const fixture = contract2RuntimeFixture();
-    fixture.container.inspect.HostConfig.Privileged = true;
-    fixture.container.inspect.Config.Labels['example.keep'] = 'yes';
-    fixture.container.inspect.Config.Env.push('CUSTOM_RUNTIME_SETTING=kept');
-    const priorVolumes = cloneVolumeMap(fixture.volumes);
-    const harness = createSupervisorHarness({
-        ...fixture,
-        pullImages: { [REQUIRED_RUNTIME_IMAGE]: contract2Image('sha256:next') },
-        failures: { 'health replacement': 1 },
-    });
-    assert.equal(await harness.supervisor.run(['--port', '9192', 'list']), 1);
-    const runs = runCalls(harness, 'run');
-    assert.equal(runs.length, 1);
-    assert.equal(runs[0].args.at(-1), 'sha256:next');
-    assert.equal(runs[0].args.includes('--privileged'), false);
-    const renames = runCalls(harness, 'rename');
-    assert.equal(renames.length, 2);
-    assert.equal(renames[0].args[1], identityFor().instance);
-    assert.equal(renames[1].args[2], identityFor().instance);
-    assert.deepEqual(harness.state.container.inspect, fixture.container.inspect);
-    assert.equal(harness.state.container.inspect.HostConfig.Privileged, true);
-    assert.deepEqual(Object.fromEntries(harness.state.volumes), priorVolumes);
-});
-
-function cloneVolumeMap(volumes) {
-    return structuredClone(volumes);
-}
-
-test('replacement transaction preserves or restores the prior box when stop, rename, or replacement fails', async t => {
-    const cases = [
-        { name: 'outer stop fails', failures: { stop: 17 }, expectedCode: 17, restored: false },
-        { name: 'preserve rename fails', failures: { rename: 18 }, expectedCode: 18, restored: false },
-        { name: 'replacement create fails', failures: { 'run replacement': 19 }, expectedCode: 1, restored: true },
-    ];
-    for (const entry of cases) {
-        await t.test(entry.name, async () => {
-            const fixture = contract2RuntimeFixture();
-            fixture.container.inspect.Config.Labels['example.prior'] = 'retained';
-            const harness = createSupervisorHarness({
-                ...fixture,
-                failures: entry.failures,
-                rmFailureRemovesContainer: entry.rmFailureRemovesContainer,
-            });
-            assert.equal(await harness.supervisor.run(['--port', '19191', 'list']), entry.expectedCode);
-            assert.ok(harness.state.container);
-            assert.equal(harness.state.container.inspect.Image, fixture.container.inspect.Image);
-            assert.equal(harness.state.container.inspect.State.Status, 'running');
-            assert.equal(
-                harness.state.container.inspect.Config.Labels['example.prior'],
-                'retained',
-            );
-            assert.deepEqual(
-                harness.state.container.inspect.HostConfig.PortBindings['8080/tcp'],
-                [{ HostIp: '127.0.0.1', HostPort: '8080' }],
-            );
-            if (entry.restored) assert.match(harness.stderr, /previous runtime restored/);
         });
     }
 });
@@ -998,386 +968,6 @@ test('parameterless cli fails locally without a TTY', async () => {
     assert.equal(harness.calls.length, 0);
 });
 
-test('authoritative publication plan produces the core coverage contract', () => {
-    const invocation = invocationFor();
-    const plan = {
-        schemaVersion: 2,
-        operation: 'start',
-        explicitPublishes: [],
-        generatedPublishes: ['127.0.0.1:9000:9000/udp', '9100-9102:9100-9102'],
-        publishes: ['127.0.0.1:9000:9000/udp', '9100-9102:9100-9102'],
-    };
-    applyAuthoritativePublicationPlan(invocation, plan);
-    assert.deepEqual(invocation._generatedPublishes, plan.generatedPublishes);
-    assert.deepEqual(publicationContractForPlan(plan), {
-        schemaVersion: 2,
-        targets: [
-            { start: 9000, end: 9000, protocol: 'udp' },
-            { start: 9100, end: 9102, protocol: 'tcp' },
-        ],
-        publishes: plan.publishes,
-    });
-    assert.throws(
-        () => applyAuthoritativePublicationPlan({}, { schemaVersion: 1 }),
-        /schemaVersion/,
-    );
-
-    const forged = {
-        ...plan,
-        outerPublicationContract: {
-            schemaVersion: 2,
-            targets: [{ start: 65535, end: 65535, protocol: 'tcp' }],
-            publishes: ['65535:65535'],
-        },
-    };
-    assert.deepEqual(publicationContractForPlan(forged), publicationContractForPlan(plan));
-});
-
-test('core forwarding includes the authoritative publication contract environment', () => {
-    const fake = createFakeEngine();
-    const invocation = invocationFor();
-    invocation._outerPublicationContract = {
-        schemaVersion: 2,
-        targets: [{ start: 9000, end: 9000, protocol: 'tcp' }],
-        publishes: ['9000:9000'],
-    };
-    assert.equal(forwardCoreCommand({
-        invocation,
-        runtime: { instance: invocation.instance },
-        engine: fake.engineClient,
-        stdin: { isTTY: false },
-        stdout: { isTTY: false },
-    }, ['start', 'agent']), 0);
-    const exec = mutationCalls(fake).at(-1).args;
-    assert.ok(exec.includes(
-        `PLOINKY_OUTER_PUBLICATION_CONTRACT=${JSON.stringify(invocation._outerPublicationContract)}`,
-    ));
-});
-
-test('injected start planner result is merged before create and forwarded to core', async () => {
-    const requests = [];
-    const harness = createSupervisorHarness({
-        preparePublicationPlan: async request => {
-            requests.push(request);
-            return {
-                schemaVersion: 2,
-                operation: 'start',
-                explicitPublishes: [],
-                generatedPublishes: ['127.0.0.1:9000:9000'],
-                publishes: ['127.0.0.1:9000:9000'],
-            };
-        },
-        fetchResponse: { ok: true },
-    });
-    assert.equal(await harness.supervisor.run(['start', 'explorer']), 0);
-    assert.equal(requests.length, 1);
-    assert.equal(requests[0].operation, 'start');
-    const create = runCalls(harness, 'run')[0].args;
-    assert.ok(create.includes('127.0.0.1:9000:9000'));
-    const exec = runCalls(harness, 'exec').at(-1).args;
-    assert.ok(exec.some(value => value.startsWith('PLOINKY_OUTER_PUBLICATION_CONTRACT=')));
-});
-
-test('production planner executes in a compatible running box without pull or temporary container', async () => {
-    const fixture = contract2RuntimeFixture();
-    const harness = createSupervisorHarness({
-        ...fixture,
-        useProductionPlanner: true,
-        fetchResponse: { ok: true },
-    });
-    assert.equal(await harness.supervisor.run(['start', 'explorer']), 0);
-    const captures = harness.calls.filter(call => call.kind === 'capture');
-    assert.equal(captures.length, 1);
-    assert.deepEqual(captures[0].args.slice(0, 6), [
-        'exec', '-i', '-w', '/workspace', fixture.identity.instance, 'node',
-    ]);
-    assert.equal(captures[0].args.at(-1), '/opt/ploinky/container/box-start-publish-plan.mjs');
-    assert.equal(runCalls(harness, 'pull').length, 0);
-    assert.equal(runCalls(harness, 'rm').length, 0);
-    assert.equal(harness.state.temporaryContainers.size, 0);
-});
-
-test('production planner uses and cleans a short-lived container for a stopped box without starting it first', async () => {
-    const fixture = contract2RuntimeFixture({ state: 'exited' });
-    const harness = createSupervisorHarness({
-        ...fixture,
-        useProductionPlanner: true,
-        fetchResponse: { ok: true },
-    });
-    assert.equal(await harness.supervisor.run(['start', 'explorer']), 0);
-    const captureIndex = harness.calls.findIndex(call => call.kind === 'capture');
-    const startIndex = harness.calls.findIndex(call => call.kind === 'run' && call.args[0] === 'start');
-    assert.ok(captureIndex >= 0 && startIndex > captureIndex);
-    const capture = harness.calls[captureIndex];
-    assert.equal(capture.args[0], 'run');
-    assert.equal(capture.args[1], '-i');
-    assert.ok(capture.args.includes(fixture.container.inspect.Image));
-    assert.match(capture.args[capture.args.indexOf('--name') + 1], /-planner-/);
-    assert.equal(runCalls(harness, 'pull').length, 0);
-    assert.equal(runCalls(harness, 'rm').length, 1);
-    assert.equal(harness.state.temporaryContainers.size, 0);
-});
-
-test('first-use production planning pulls once, pins one image ID, and retains deterministic volumes', async () => {
-    const harness = createSupervisorHarness({
-        useProductionPlanner: true,
-        fetchResponse: { ok: true },
-    });
-    assert.equal(await harness.supervisor.run(['start', 'explorer']), 0);
-    const pullCalls = runCalls(harness, 'pull');
-    const captures = harness.calls.filter(call => call.kind === 'capture');
-    const creates = runCalls(harness, 'run');
-    assert.equal(pullCalls.length, 1);
-    assert.equal(captures.length, 1);
-    assert.equal(captures[0].args[0], 'run');
-    assert.equal(captures[0].args[1], '-i');
-    assert.ok(captures[0].args.includes('sha256:runtime-2'));
-    assert.equal(creates.length, 1);
-    assert.equal(creates[0].args.at(-1), 'sha256:runtime-2');
-    assert.equal(harness.state.temporaryContainers.size, 0);
-    for (const name of Object.values(runtimeVolumeNames(identityFor().instance))) {
-        assert.equal(harness.state.volumes.has(name), true, name);
-    }
-    const pullIndex = harness.calls.indexOf(pullCalls[0]);
-    const plannerIndex = harness.calls.indexOf(captures[0]);
-    const createIndex = harness.calls.indexOf(creates[0]);
-    assert.ok(pullIndex < plannerIndex && plannerIndex < createIndex);
-});
-
-test('planner failure cleans its temporary container, preserves named state, and starts no runtime', async () => {
-    const identity = identityFor();
-    const names = runtimeVolumeNames(identity.instance);
-    const harness = createSupervisorHarness({
-        useProductionPlanner: true,
-        failures: { 'capture planner': 23 },
-    });
-    assert.equal(await harness.supervisor.run(['start', 'explorer']), 1);
-    assert.match(harness.stderr, /publication planner.*failed/);
-    assert.equal(harness.state.container, null);
-    assert.equal(harness.state.temporaryContainers.size, 0);
-    assert.equal(runCalls(harness, 'run').length, 0);
-    assert.deepEqual([...harness.state.volumes.keys()], [names.workspace]);
-});
-
-test('planner timeout preserves running, stopped, and missing managed-box state and cleans temporary containers', async t => {
-    const cases = [
-        { name: 'running', fixture: contract2RuntimeFixture() },
-        { name: 'stopped', fixture: contract2RuntimeFixture({ state: 'exited' }) },
-        { name: 'missing', fixture: {} },
-    ];
-    for (const entry of cases) {
-        await t.test(entry.name, async () => {
-            const harness = createSupervisorHarness({
-                ...entry.fixture,
-                useProductionPlanner: true,
-                plannerCapture: async () => ({
-                    ok: false,
-                    status: 137,
-                    stdout: '',
-                    stderr: '',
-                    error: null,
-                    signal: 'SIGKILL',
-                    timedOut: true,
-                    overflow: false,
-                }),
-            });
-            const before = harness.state.container
-                ? structuredClone(harness.state.container.inspect)
-                : null;
-            assert.equal(await harness.supervisor.run(['start', 'explorer']), 1);
-            assert.match(harness.stderr, /timed out/);
-            assert.deepEqual(harness.state.container?.inspect || null, before);
-            assert.equal(harness.state.temporaryContainers.size, 0);
-            assert.equal(runCalls(harness, 'run').length, 0);
-            assert.equal(runCalls(harness, 'start').length, 0);
-            assert.equal(runCalls(harness, 'stop').length, 0);
-            assert.equal(runCalls(harness, 'pull').length, entry.name === 'missing' ? 1 : 0);
-            if (entry.name === 'missing') {
-                assert.deepEqual(
-                    [...harness.state.volumes.keys()],
-                    [runtimeVolumeNames(identityFor().instance).workspace],
-                );
-            }
-        });
-    }
-});
-
-test('signal-terminated planner execution still cleans its temporary container and preserves the stopped box', async () => {
-    const fixture = contract2RuntimeFixture({ state: 'exited' });
-    const harness = createSupervisorHarness({
-        ...fixture,
-        useProductionPlanner: true,
-        plannerCapture: async () => ({
-            ok: false,
-            status: 143,
-            stdout: '',
-            stderr: '',
-            error: null,
-            signal: 'SIGTERM',
-            timedOut: false,
-            overflow: false,
-        }),
-    });
-    assert.equal(await harness.supervisor.run(['start', 'explorer']), 1);
-    assert.match(harness.stderr, /SIGTERM|exit 143/);
-    assert.equal(harness.state.container.inspect.State.Status, 'exited');
-    assert.equal(harness.state.temporaryContainers.size, 0);
-    assert.equal(runCalls(harness, 'start').length, 0);
-    assert.equal(runCalls(harness, 'pull').length, 0);
-});
-
-test('temporary planner cleanup failure is fatal and does not create the managed box', async () => {
-    const harness = createSupervisorHarness({
-        useProductionPlanner: true,
-        failures: { 'rm planner': 19 },
-    });
-    assert.equal(await harness.supervisor.run(['start', 'explorer']), 1);
-    assert.match(harness.stderr, /failed to remove temporary publication planner/);
-    assert.equal(runCalls(harness, 'run').length, 0);
-    assert.equal(harness.state.container, null);
-    assert.equal(harness.state.temporaryContainers.size, 1);
-});
-
-test('planned replacement retains exact explicit provenance and replaces stale generated publications', async () => {
-    const oldExplicit = '127.0.0.1:19000:9000/udp';
-    const oldGenerated = '127.0.0.1:19100:9100';
-    const nextGenerated = '127.0.0.1:19200:9200';
-    const fixture = contract2RuntimeFixture({
-        labels: {
-            [EXPLICIT_PUBLISHES_LABEL]: JSON.stringify([oldExplicit]),
-            [GENERATED_PUBLISHES_LABEL]: JSON.stringify([oldGenerated]),
-        },
-        publishes: {
-            '9000/udp': [{ HostIp: '127.0.0.1', HostPort: '19000' }],
-            '9100/tcp': [{ HostIp: '127.0.0.1', HostPort: '19100' }],
-        },
-    });
-    const requests = [];
-    const harness = createSupervisorHarness({
-        ...fixture,
-        preparePublicationPlan: async request => {
-            requests.push(request);
-            return {
-                schemaVersion: 2,
-                operation: request.operation,
-                explicitPublishes: request.explicitPublishes,
-                generatedPublishes: [nextGenerated],
-                publishes: [...request.explicitPublishes, nextGenerated],
-            };
-        },
-    });
-    assert.equal(await harness.supervisor.run(['enable', 'explorer']), 0);
-    assert.deepEqual(requests[0].explicitPublishes, [oldExplicit]);
-    const replacement = runCalls(harness, 'run').at(-1).args;
-    assert.ok(replacement.includes(oldExplicit));
-    assert.ok(replacement.includes(nextGenerated));
-    assert.equal(replacement.includes(oldGenerated), false);
-    assert.ok(replacement.includes(
-        `${EXPLICIT_PUBLISHES_LABEL}=${JSON.stringify([oldExplicit])}`,
-    ));
-    assert.ok(replacement.includes(
-        `${GENERATED_PUBLISHES_LABEL}=${JSON.stringify([nextGenerated])}`,
-    ));
-});
-
-test('inspect-expanded, reordered, wildcard, and ephemeral bindings do not cause perpetual replacement', async () => {
-    const explicit = [
-        '9100:9100',
-        '9000:9000',
-        '127.0.0.1::9200/udp',
-    ];
-    const generated = [
-        '127.0.0.1:20000-20002:20000-20002/udp',
-        '127.0.0.1:20000-20002:20000-20002/tcp',
-    ];
-    const publishes = {
-        '9000/tcp': [{ HostIp: '', HostPort: '9000' }],
-        '9100/tcp': [{ HostIp: '0.0.0.0', HostPort: '9100' }],
-        '9200/udp': [{ HostIp: '127.0.0.1', HostPort: '49152' }],
-    };
-    for (const protocol of ['udp', 'tcp']) {
-        for (let port = 20000; port <= 20002; port += 1) {
-            publishes[`${port}/${protocol}`] = [{
-                HostIp: '127.0.0.1',
-                HostPort: String(port),
-            }];
-        }
-    }
-    const fixture = contract2RuntimeFixture({
-        labels: {
-            [EXPLICIT_PUBLISHES_LABEL]: JSON.stringify(explicit),
-            [GENERATED_PUBLISHES_LABEL]: JSON.stringify(generated),
-        },
-        publishes,
-    });
-    const harness = createSupervisorHarness(fixture);
-    assert.equal(await harness.supervisor.run(['list', 'agents']), 0);
-    assert.equal(runCalls(harness, 'pull').length, 0);
-    assert.equal(runCalls(harness, 'run').length, 0);
-    assert.equal(runCalls(harness, 'stop').length, 0);
-});
-
-test('contract-3 boxes fail on the runtime contract before publication provenance or mutation', async () => {
-    const fixture = contract2RuntimeFixture({ imageId: 'sha256:runtime-legacy-3' });
-    const legacyImage = contract2Image('sha256:runtime-legacy-3');
-    legacyImage.Config.Labels[RUNTIME_CONTRACT_LABEL] = '3';
-    fixture.images = { [legacyImage.Id]: legacyImage };
-    delete fixture.container.inspect.Config.Labels[PUBLISH_PLAN_VERSION_LABEL];
-    let plannerCalls = 0;
-    const harness = createSupervisorHarness({
-        ...fixture,
-        preparePublicationPlan: async () => { plannerCalls += 1; },
-    });
-    assert.equal(await harness.supervisor.run(['start', 'explorer']), 1);
-    assert.match(harness.stderr, /runtime-contract.*destroy/);
-    assert.equal(plannerCalls, 0);
-    assert.equal(mutationCalls(harness).length, 0);
-});
-
-test('every host route capable of starting an agent invokes the planner before forwarding', async t => {
-    const cases = [
-        { argv: ['start', 'explorer'], operation: 'start', root: 'explorer' },
-        { argv: ['start'], operation: 'start', root: undefined },
-        { argv: ['enable', 'explorer'], operation: 'enable', root: 'explorer' },
-        { argv: ['cli', 'explorer'], operation: 'cli', root: 'explorer' },
-        { argv: ['shell', 'explorer'], operation: 'shell', root: 'explorer' },
-        { argv: ['restart', 'explorer'], operation: 'restart', root: 'explorer' },
-        { argv: ['restart', 'router'], operation: 'restart', root: undefined },
-        { argv: ['reinstall', 'agent', 'explorer'], operation: 'reinstall', root: 'explorer' },
-    ];
-    for (const entry of cases) {
-        await t.test(entry.argv.join(' '), async () => {
-            const fixture = contract2RuntimeFixture();
-            const requests = [];
-            let harness;
-            harness = createSupervisorHarness({
-                ...fixture,
-                fetchResponse: { ok: true },
-                preparePublicationPlan: async request => {
-                    requests.push(request);
-                    harness.calls.push({ kind: 'planner', args: [], options: {} });
-                    return {
-                        schemaVersion: 2,
-                        operation: request.operation,
-                        explicitPublishes: request.explicitPublishes,
-                        generatedPublishes: [],
-                        publishes: request.explicitPublishes,
-                    };
-                },
-            });
-            assert.equal(await harness.supervisor.run(entry.argv), 0);
-            assert.equal(requests.length, 1);
-            assert.equal(requests[0].operation, entry.operation);
-            assert.equal(requests[0].root, entry.root);
-            const plannerIndex = harness.calls.findIndex(call => call.kind === 'planner');
-            const forwardIndex = harness.calls.findIndex(call =>
-                call.kind === 'run' && call.args.includes('ploinky')
-            );
-            assert.ok(plannerIndex >= 0 && forwardIndex > plannerIndex);
-        });
-    }
-});
-
 test('master key is inherited only by in-box execs and never persisted or placed in argv', async () => {
     const secret = 'test-master-key-never-log-this';
     const harness = createSupervisorHarness({ env: { PLOINKY_MASTER_KEY: secret } });
@@ -1411,8 +1001,8 @@ test('the host walked-up .env master key preserves core resolution without enter
     assert.equal(JSON.stringify(harness.state.container.inspect).includes(secret), false);
 });
 
-test('status, stop, and replacement shutdown inherit the master key without exposing its value in argv', async t => {
-    for (const argv of [['status'], ['stop'], ['--port', '9192', 'list']]) {
+test('status and stop inherit the master key without exposing its value in argv', async t => {
+    for (const argv of [['status'], ['stop']]) {
         await t.test(argv.join(' '), async () => {
             const secret = `secret-${argv.at(-1)}`;
             const fixture = contract2RuntimeFixture();
@@ -1434,7 +1024,7 @@ test('status, stop, and replacement shutdown inherit the master key without expo
     }
 });
 
-test('engine query and run seams pass planner stdin and environment', () => {
+test('engine query and run seams pass bounded stdin and environment', () => {
     const calls = [];
     const client = createEngineClient({
         name: 'podman',
@@ -1443,11 +1033,11 @@ test('engine query and run seams pass planner stdin and environment', () => {
             return { status: 0, stdout: '{}', stderr: '' };
         },
     });
-    assert.equal(client.query(['exec', 'planner'], {
+    assert.equal(client.query(['exec', 'worker'], {
         input: '{"schemaVersion":1}',
         env: { TEST_ENV: 'query' },
     }).ok, true);
-    assert.equal(client.run(['run', 'planner'], {
+    assert.equal(client.run(['run', 'worker'], {
         input: '{"schemaVersion":1}',
         env: { TEST_ENV: 'run' },
         silence: 'all',
@@ -1458,7 +1048,7 @@ test('engine query and run seams pass planner stdin and environment', () => {
     assert.deepEqual(calls[1].options.env, { TEST_ENV: 'run' });
 });
 
-test('engine capture bounds planner stdin, output, and execution time', async () => {
+test('engine capture bounds stdin, output, and execution time', async () => {
     const client = createEngineClient({ name: process.execPath });
     const success = await client.capture([
         '--input-type=module',
@@ -1581,7 +1171,7 @@ test('dependency environment opt-in and TTY approval run the in-box installer', 
     }
 });
 
-test('contract-4 rejects Docker while rootless Podman relies on :U', async () => {
+test('contract-5 rejects Docker while rootless Podman relies on :U', async () => {
     const dockerFixture = contract2RuntimeFixture({ engine: 'docker' });
     const docker = createSupervisorHarness({ ...dockerFixture, engine: 'docker' });
     assert.equal(await docker.supervisor.run(['list']), 1);
@@ -1627,7 +1217,7 @@ test('outer capability drift is captured and cleared while SELinux desired state
     assert.throws(() => buildRuntimeRunArgs(desired, { engine: 'podman' }), /forbids added/);
 });
 
-test('Podman-normalized outer devices and security options converge without replacement', () => {
+test('Podman-normalized outer devices and security options converge without drift', () => {
     const fixture = contract2RuntimeFixture();
     fixture.container.inspect.HostConfig.Devices = [];
     fixture.container.inspect.HostConfig.SecurityOpt = ['label=disable', 'unmask=all'];
@@ -1674,16 +1264,14 @@ test('interactive exec preserves TTY and non-TTY behavior for cli and shell rout
 });
 
 test('compatible and stopped status preserve streaming health/core behavior without mutation', async () => {
-    const runningFixture = contract2RuntimeFixture({
-        publishes: { '9000/udp': [{ HostIp: '127.0.0.1', HostPort: '19000' }] },
-    });
+    const runningFixture = contract2RuntimeFixture();
     const running = createSupervisorHarness(runningFixture);
     assert.equal(await running.supervisor.run(['status']), 0);
     assert.match(running.stdout, new RegExp(`runtime: ${runningFixture.identity.instance} \\(running\\)`));
-    assert.match(running.stdout, /contract: compatible \(expected 4, observed 4\)/);
+    assert.match(running.stdout, /contract: compatible \(expected 5, observed 5\)/);
     assert.match(running.stdout, /health: healthy/);
     assert.match(running.stdout, /core: running/);
-    assert.match(running.stdout, /19000 -> 9000\/udp/);
+    assert.match(running.stdout, /0\.0\.0\.0:7882 -> 7882\/udp/);
     assert.equal(running.calls.some(call => call.kind === 'streamContains'), true);
     assert.equal(runCalls(running, 'pull').length, 0);
 
@@ -1709,63 +1297,49 @@ test('stop attempts the outer stop after a core shutdown failure and stays pull-
     assert.equal(runCalls(harness, 'pull').length, 0);
 });
 
-test('managed start probes the selected router port only after core start succeeds', async () => {
-    const plannerRequests = [];
-    const plan = async request => {
-        plannerRequests.push(request);
-        return {
-            schemaVersion: 2,
-            operation: 'start',
-            explicitPublishes: [],
-            generatedPublishes: [],
-            publishes: [],
-        };
-    };
-    const success = createSupervisorHarness({
-        preparePublicationPlan: plan,
-        fetchResponse: { ok: true },
-    });
+test('managed start probes the supervisor Unix health socket only after core start succeeds', async () => {
+    const success = createSupervisorHarness();
     assert.equal(await success.supervisor.run(['--port', '19192', 'start', 'explorer']), 0);
     const coreIndex = success.calls.findIndex(call =>
         call.kind === 'run' && call.args.includes('ploinky') && call.args.includes('start')
     );
-    const fetchIndex = success.calls.findIndex(call => call.kind === 'fetch');
-    assert.ok(coreIndex >= 0 && fetchIndex > coreIndex);
-    assert.equal(success.calls[fetchIndex].url, 'http://127.0.0.1:19192/status');
-    assert.equal(plannerRequests[0].routerPort, BOX_ROUTER_PORT);
+    const healthIndex = success.calls.findIndex(call =>
+        call.kind === 'query'
+        && call.args[0] === 'exec'
+        && call.args.includes('/workspace/.ploinky/run/router-health.sock')
+    );
+    assert.ok(coreIndex >= 0 && healthIndex > coreIndex);
+    assert.equal(success.calls.some(call => call.kind === 'fetch'), false);
 
     const failed = createSupervisorHarness({
-        preparePublicationPlan: plan,
         failures: { exec: 7 },
-        fetchResponse: { ok: true },
     });
     assert.equal(await failed.supervisor.run(['--port', '19193', 'start', 'explorer']), 7);
-    assert.equal(failed.calls.some(call => call.kind === 'fetch'), false);
+    assert.equal(failed.calls.some(call => call.kind === 'query'
+        && call.args.includes('/workspace/.ploinky/run/router-health.sock')), false);
 });
 
-test('a positional start port replaces an existing box and publishes the selected router socket', async () => {
+test('a positional start port requires explicit destroy when an existing box uses another port', async () => {
     const fixture = contract2RuntimeFixture();
     const harness = createSupervisorHarness({
         ...fixture,
         fetchResponse: { ok: true },
     });
-    assert.equal(await harness.supervisor.run(['start', 'explorer', '19194']), 0);
-    const replacements = runCalls(harness, 'run');
-    assert.equal(replacements.length, 1);
-    assert.ok(replacements[0].args.includes('127.0.0.1:19194:8080'));
-    const forwarded = runCalls(harness, 'exec').at(-1).args;
+    assert.equal(await harness.supervisor.run(['start', 'explorer', '19194']), 1);
+    assert.match(harness.stderr, /configuration differs.*routerPublish/);
+    assert.match(harness.stderr, /ploinky destroy/);
+    assert.equal(mutationCalls(harness).length, 0);
+    assert.equal(harness.calls.some(call => call.kind === 'fetch'), false);
     assert.deepEqual(
-        forwarded.slice(-6),
-        ['ploinky', 'start', 'explorer', '8080', '--profile', 'default'],
+        harness.state.container.inspect.HostConfig.PortBindings['8080/tcp'],
+        [{ HostIp: '127.0.0.1', HostPort: '8080' }],
     );
 });
 
-test('run args preserve mounts, required devices, rootless security, raw publishes, and image-last ordering', () => {
+test('run args preserve mounts, required devices, rootless security, exact publications, and image-last ordering', () => {
     const invocation = invocationFor();
     invocation.mountDirResolved = '/host/mounted';
-    invocation.publish = ['127.0.0.1::9000/udp'];
     invocation.explicit.add('--mount');
-    invocation.explicit.add('--publish');
     const config = createDefaultRuntimeConfig(invocation);
     config.imageId = 'sha256:validated';
     const plain = buildRuntimeRunArgs(config, { engine: 'podman', selinux: false });
@@ -1777,9 +1351,34 @@ test('run args preserve mounts, required devices, rootless security, raw publish
     assert.ok(plain.includes('unmask=ALL'));
     assert.equal(plain.includes('seccomp=unconfined'), false);
     assert.ok(plain.includes('/host/mounted:/workspace/mounted'));
-    assert.ok(plain.includes('127.0.0.1::9000/udp'));
+    const mappings = plain.flatMap((value, index) => value === '-p' ? [plain[index + 1]] : []);
+    assert.deepEqual(mappings, ['127.0.0.1:8080:8080/tcp', '0.0.0.0:7882:7882/udp']);
     assert.equal(plain.includes('label=disable'), false);
     assert.ok(selinux.includes('label=disable'));
+});
+
+test('selected outer host ports are independent from the fixed inner Router port', () => {
+    for (const value of [1, '1', '00001', 18080, '018080', '65535']) {
+        assert.equal(parseSelectedHostPort(value), Number(value));
+    }
+    for (const value of [undefined, null, '', ' 18080', '18080 ', '+18080', '-1', '1.5', 1.5, 0, '0', 65536, '65536']) {
+        assert.throws(() => parseSelectedHostPort(value), { code: 'PLOINKY_HOST_PORT_INVALID' });
+    }
+
+    const invocation = invocationFor();
+    invocation.port = '18080';
+    const desired = createDefaultRuntimeConfig(invocation);
+    assert.deepEqual(desired.routerPublish, {
+        hostIp: '127.0.0.1',
+        hostPort: '18080',
+        containerPort: '8080',
+        protocol: 'tcp',
+    });
+    assert.deepEqual(
+        buildRuntimeRunArgs(desired, { engine: 'podman' })
+            .flatMap((value, index, args) => value === '-p' ? [args[index + 1]] : []),
+        ['127.0.0.1:18080:8080/tcp', '0.0.0.0:7882:7882/udp'],
+    );
 });
 
 test('runtime config requires an explicitly selected host port and never supplies a lower-layer default', () => {
@@ -1787,7 +1386,7 @@ test('runtime config requires an explicitly selected host port and never supplie
     delete invocation.port;
     assert.throws(
         () => createDefaultRuntimeConfig(invocation),
-        (error) => error.code === 'PLOINKY_ROUTER_PORT_INVALID',
+        (error) => error.code === 'PLOINKY_HOST_PORT_INVALID',
     );
     const existing = normalizeContainerInspect(
         'podman',
@@ -1795,20 +1394,20 @@ test('runtime config requires an explicitly selected host port and never supplie
     );
     assert.throws(
         () => mergeDesiredRuntimeConfig(invocation, existing),
-        (error) => error.code === 'PLOINKY_ROUTER_PORT_INVALID',
+        (error) => error.code === 'PLOINKY_HOST_PORT_INVALID',
     );
 });
 
-test('mount, publish, and host-port preflight failures occur before pull or volume mutation', async t => {
+test('mount, forbidden publication, and host-port preflight failures occur before pull or volume mutation', async t => {
     await t.test('missing mount', async () => {
         const harness = createSupervisorHarness();
         assert.equal(await harness.supervisor.run(['--mount', '/definitely/missing/ploinky', 'list']), 1);
         assert.equal(mutationCalls(harness).length, 0);
     });
-    await t.test('invalid publish', async () => {
+    await t.test('forbidden publish', async () => {
         const harness = createSupervisorHarness();
         assert.equal(await harness.supervisor.run(['--publish', '70000:70000', 'list']), 1);
-        assert.match(harness.stderr, /invalid --publish/);
+        assert.match(harness.stderr, /runtime contract 5.*exactly two fixed publications/);
         assert.equal(mutationCalls(harness).length, 0);
     });
     await t.test('busy router port', async () => {
@@ -1823,21 +1422,71 @@ test('mount, publish, and host-port preflight failures occur before pull or volu
             env: { PLOINKY_BOX_SOURCE: REPO_ROOT },
             engineClient: fake.engineClient,
             portInUse: async () => true,
+            udpPortInUse: async () => false,
         });
         assert.equal(await runSupervisorWithBoundary(supervisor, ['--port', '19194', 'list'], stderr.stream), 1);
         assert.equal(mutationCalls(fake).length, 0);
     });
 });
 
-test('publish merging rejects fixed host collisions but permits ephemeral host allocation', () => {
-    assert.throws(() => mergeAndValidatePublishes([
-        { hostIp: '0.0.0.0', hostPort: '9000', containerPort: '8000', protocol: 'tcp' },
-        { hostIp: '127.0.0.1', hostPort: '9000', containerPort: '8001', protocol: 'tcp' },
-    ]), /overlapping runtime publish host socket/);
-    assert.equal(mergeAndValidatePublishes([
-        { hostIp: '', hostPort: '', containerPort: '8000', protocol: 'tcp' },
-        { hostIp: '', hostPort: '', containerPort: '8001', protocol: 'tcp' },
-    ]).length, 2);
+test('fixed UDP 7882 conflicts fail before pull with owner-aware diagnostics', async t => {
+    await t.test('container-engine owner', async () => {
+        const harness = createSupervisorHarness({
+            fixedUdpOwners: async () => [{
+                engine: 'podman',
+                container: 'livekit-from-another-box',
+                hostIp: '0.0.0.0',
+                hostPort: '7882',
+            }],
+        });
+        assert.equal(await harness.supervisor.run(['list', 'agents']), 1);
+        assert.match(
+            harness.stderr,
+            /UDP 7882.*podman container 'livekit-from-another-box'.*stop\/remove that owner/,
+        );
+        assert.equal(runCalls(harness, 'pull').length, 0);
+        assert.equal(runCalls(harness, 'volume').length, 0);
+    });
+    await t.test('non-container socket owner', async () => {
+        const harness = createSupervisorHarness({
+            fixedUdpOwners: async () => [],
+            udpPortInUse: async () => true,
+        });
+        assert.equal(await harness.supervisor.run(['list', 'agents']), 1);
+        assert.match(harness.stderr, /UDP 7882.*no container-engine owner.*ss\/lsof/);
+        assert.equal(runCalls(harness, 'pull').length, 0);
+    });
+    await t.test('engine inspect normalization and own-name exclusion', () => {
+        const inspect = contract2Container().inspect;
+        inspect.HostConfig.PortBindings['7000/udp'] =
+            inspect.HostConfig.PortBindings['7882/udp'];
+        delete inspect.HostConfig.PortBindings['7882/udp'];
+        assert.deepEqual(fixedUdpOwnersFromContainerInspects('podman', [inspect]), [{
+            engine: 'podman',
+            container: identityFor().instance,
+            hostIp: '0.0.0.0',
+            hostPort: '7882',
+        }]);
+        assert.deepEqual(
+            fixedUdpOwnersFromContainerInspects('podman', [inspect], [identityFor().instance]),
+            [],
+        );
+    });
+});
+
+test('fixed publication assertion rejects additional or altered host mappings', () => {
+    const config = createDefaultRuntimeConfig(invocationFor());
+    assert.deepEqual(assertFixedRuntimePublications(config), [
+        config.routerPublish,
+        config.udpReservation,
+    ]);
+    assert.throws(
+        () => assertFixedRuntimePublications({
+            ...config,
+            udpReservation: { ...config.udpReservation, hostPort: '7883' },
+        }),
+        /fixed UDP reservation/,
+    );
 });
 
 test('inspect normalization and reconciliation helpers preserve engine parity and explicit-only changes', () => {
@@ -1847,15 +1496,15 @@ test('inspect normalization and reconciliation helpers preserve engine parity an
     const docker = normalizeContainerInspect('docker', [dockerRaw]);
     assert.deepEqual(docker, podman);
 
-    podman.contract = '2';
-    const omitted = mergeDesiredRuntimeConfig(invocationFor(), podman, []);
+    podman.contract = '5';
+    const omitted = mergeDesiredRuntimeConfig(invocationFor(), podman);
     assert.equal(planReconciliation({ existing: podman, desired: omitted, contractMatches: true }).action, 'reuse');
     const changedInvocation = invocationFor();
     changedInvocation.port = '9192';
     changedInvocation.explicit.add('--port');
-    const changed = mergeDesiredRuntimeConfig(changedInvocation, podman, []);
+    const changed = mergeDesiredRuntimeConfig(changedInvocation, podman);
     const plan = planReconciliation({ existing: podman, desired: changed, contractMatches: true });
-    assert.equal(plan.action, 'replace');
+    assert.equal(plan.action, 'recreate-required');
     assert.deepEqual(plan.reasons, ['routerPublish']);
 });
 
@@ -1905,7 +1554,7 @@ test('engine and supervisor boundaries preserve nonzero and signal exit details'
 });
 
 test('host help describes automatic identity and direct volume-preserving destroy', () => {
-    assert.match(publicUsageText(), /Contract-4 runtime image/);
+    assert.match(publicUsageText(), /Contract-5 runtime image/);
     const help = publicUsageText();
     assert.match(help, /canonical current directory/);
     assert.match(help, /retain named volumes/);

@@ -1,4 +1,5 @@
 import { execSync, spawnSync } from 'child_process';
+import { randomUUID } from 'node:crypto';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -15,8 +16,6 @@ import { buildAgentIdentityEnv, RESERVED_AGENT_ENV_NAMES } from '../agentIdentit
 import { debugLog } from '../utils.js';
 import {
     CONTAINER_CONFIG_PATH,
-    assertOuterPublicationCoverageForClaims,
-    assertOuterPublicationCoverageForManifest,
     containerExists,
     computeEnvHash,
     createHostSandboxStartupError,
@@ -27,7 +26,6 @@ import {
     getRuntime,
     getRuntimeForAgent,
     isContainerRunning,
-    isPloinkyBoxRuntime,
     isSandboxRuntime,
     loadAgentsMap,
     managedContainerLabelArgs,
@@ -36,8 +34,13 @@ import {
     saveAgentsMap,
     syncAgentMcpConfig
 } from './common.js';
-import { clearLivenessState } from './healthProbes.js';
+import { clearLivenessState, runContainerScriptReadiness } from './healthProbes.js';
 import { stopAndRemove } from './containerFleet.js';
+import {
+    TARGETED_DRAIN_ACKNOWLEDGEMENT,
+    drainAndRemoveTargetedContainer,
+    drainTargetedContainer,
+} from './targetedContainerLifecycle.js';
 import { buildContainerSecurityArgs, resolveContainerSecurity } from './containerSecurity.js';
 import { DEFAULT_AGENT_ENTRY, launchAgentSidecar, readManifestAgentCommand, readManifestStartCommand, splitCommandArgs } from './agentCommands.js';
 import { AGENTS_DATA_DIR, PLOINKY_DIR, PLOINKY_WORKSPACE_ROOT } from '../config.js';
@@ -49,6 +52,7 @@ import {
 import { deriveAgentPrincipalId } from '../agentIdentity.js';
 import { ensureSharedHostDir, runPostinstallHook } from './agentHooks.js';
 import { ensureBwrapService } from '../bwrap/bwrapServiceManager.js';
+import { isBwrapProcessRunning, stopBwrapProcess } from '../bwrap/bwrapFleet.js';
 import { ensureSeatbeltService } from '../seatbelt/seatbeltServiceManager.js';
 import { detectShellForImage, SHELL_FALLBACK_DIRECT } from './shellDetection.js';
 import { detectRuntimeKeyForAgent, isNoNodeRuntimeKey } from '../dependencyRuntimeKey.js';
@@ -67,13 +71,7 @@ import {
     getProfileEnvVars,
     resolveManifestRuntimeProfile
 } from '../profileService.js';
-import {
-    createProfileServerPublish,
-    profileServerContainerPort,
-    resolvePublishedProfileServer,
-    resolveProfileServer
-} from '../profileServer.js';
-import { resolveAgentExecutionMode } from '../startupReadiness.js';
+import { resolveAgentExecutionMode, resolveAgentReadinessProtocol } from '../startupReadiness.js';
 import {
     getAgentWorkDir,
     getAgentCodePath,
@@ -99,13 +97,44 @@ import {
 } from '../networkContract.js';
 import { createNetworkLifecycleAdapter } from '../networkLifecycle.js';
 import { effectiveInstanceKey } from '../workspaceDependencyGraph.js';
-import { implicitAgentServerBoxPort } from '../../../container/box-publish-planner.mjs';
-import { ROUTER_ENV_NAMES, assertRouterEndpoint } from '../routerPort.js';
+import {
+    INITIAL_ROUTER_PORT,
+    ROUTER_ENV_NAMES,
+    assertRouterEndpoint,
+    buildRouterEndpoint,
+} from '../routerPort.js';
+import { explicitHttpServicePorts } from '../httpServicePortConfig.js';
+import {
+    abortEdgeRoutingPreparation,
+    assertHostModeGenerationCapability,
+    edgeRuntimeEnvironment,
+    edgeTopologyMount,
+    inactivateEdgeRoutingGeneration,
+    prepareEdgeRoutingGeneration as prepareEdgeRoutingGenerationRaw,
+    prepareHostModeCapabilityForInactiveGeneration,
+    withEdgeGenerationApplyLock,
+} from '../edgeGeneration.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const AGENT_LIB_PATH = path.resolve(__dirname, '../../../Agent');
 const LLM_RUNTIME_SHARED_PATH = path.join(PLOINKY_WORKSPACE_ROOT, 'llm-runtime', 'shared');
+
+function attachRestartCandidate(error, candidate) {
+    const failure = error && typeof error === 'object'
+        ? error
+        : new Error(String(error || 'managed runtime launch failed'));
+    const prior = failure.ploinkyRestartCandidate && typeof failure.ploinkyRestartCandidate === 'object'
+        ? failure.ploinkyRestartCandidate
+        : {};
+    Object.defineProperty(failure, 'ploinkyRestartCandidate', {
+        configurable: true,
+        enumerable: false,
+        writable: false,
+        value: Object.freeze({ ...prior, ...candidate }),
+    });
+    return failure;
+}
 function resolveLlmRuntimeSharedPath(agentPath) {
     // Prefer the shared runtime that ships inside the agent's own repo so
     // clone-based deploys (llm-runtime under .ploinky/repos) mount the real
@@ -447,7 +476,13 @@ function buildRuntimeRouterEnv(runtime, options = {}) {
     const endpoint = assertRouterEndpoint(options.routerEndpoint, mode, {
         explicitPort: options.routerPort,
     });
-    return endpoint ? { ...endpoint.env } : {};
+    if (!endpoint) return {};
+    return {
+        ...endpoint.env,
+        ...edgeRuntimeEnvironment(mode),
+        PLOINKY_ROUTER_HOST: endpoint.host,
+        PLOINKY_ROUTER_PORT: '8080',
+    };
 }
 
 function appendRuntimeRouterEnvFlags(envStrings, routerEnv) {
@@ -595,6 +630,28 @@ function removeContainerForRecreate(runtime, containerName, label) {
     clearLivenessState(containerName);
 }
 
+function normalizeTargetedRestart(value) {
+    if (value === undefined || value === null || value === false) return null;
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+        throw new Error('targetedRestart must be an internal coordinated-restart contract object');
+    }
+    if (value.acknowledgement !== TARGETED_DRAIN_ACKNOWLEDGEMENT) {
+        throw new Error(`targetedRestart.acknowledgement must be '${TARGETED_DRAIN_ACKNOWLEDGEMENT}'`);
+    }
+    if (!Array.isArray(value.affectedSelectors) || value.affectedSelectors.length < 1) {
+        throw new Error('targetedRestart.affectedSelectors must identify at least one exact selector');
+    }
+    if (typeof value.assertSelectorsInactive !== 'function') {
+        throw new Error('targetedRestart.assertSelectorsInactive must prove the exact affected selectors are inactive');
+    }
+    return Object.freeze({
+        acknowledgement: value.acknowledgement,
+        affectedSelectors: Object.freeze([...value.affectedSelectors]),
+        assertSelectorsInactive: value.assertSelectorsInactive,
+        ...(value.timeoutMs === undefined ? {} : { timeoutMs: value.timeoutMs }),
+    });
+}
+
 export function removeAgentContainerForRecreate(containerName, label = 'executionModeChanged') {
     const runtime = getRuntime();
     removeContainerForRecreate(runtime, containerName, label);
@@ -649,6 +706,10 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     const containerName = options.containerName || getAgentContainerName(agentName, repoName);
     const agentSnapshot = loadAgentsMap();
     const existingRecord = agentSnapshot[containerName] || {};
+    const runtimeIdentity = options.runtimeIdentity;
+    if (!runtimeIdentity?.instanceId || !runtimeIdentity?.enableGeneration) {
+        throw new Error(`startAgentContainer(${agentName}) requires an exact instanceId and enableGeneration`);
+    }
     const instanceName = options.alias || existingRecord.alias || agentName;
     const { raw: explicitAgentCmd } = readManifestAgentCommand(manifest);
     const startCmd = readManifestStartCommand(manifest);
@@ -674,14 +735,23 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     const activeProfile = profileResolution.resolvedProfileName;
     const profileConfig = profileResolution.profileConfig;
     const manifestNetwork = profileResolution.network;
+    const explicitServicePorts = explicitHttpServicePorts(manifest);
     assertNetworkStartupCompatibility(manifest, profileConfig, manifestNetwork, {
         path: `manifest(${repoName}/${agentName})`,
     });
-    assertOuterPublicationCoverageForManifest(manifest, profileConfig, {
-        ownerRef: `${repoName}/${agentName}`,
-        commandHint: options.commandHint || `ploinky start ${repoName}/${agentName}`,
-    });
     assertManifestEnvProfileCompleteness(manifest, profileConfig, { agentName, repoName, profileName: activeProfile });
+    const runtimeNetworkPlan = buildRuntimeNetworkPlan(runtime, manifestNetwork);
+    if (runtimeNetworkPlan.mode === 'host') {
+        // A denied host-mode request must not execute a manifest-controlled host
+        // hook or perform any image/dependency/runtime work.
+        assertHostModeGenerationCapability({
+            agentId: deriveAgentPrincipalId(repoName, agentName),
+            instanceId: runtimeIdentity.instanceId,
+            enableGeneration: runtimeIdentity.enableGeneration,
+            routeKey: instanceName,
+            containerName,
+        }, { preparedCapability: options.preparedHostModeCapability });
+    }
     // Ensure workspace structure exists and run preinstall [HOST] before any
     // image-dependent work. Hooks may build local images or seed vars that image
     // resolution and dependency-cache probes consume.
@@ -701,7 +771,6 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     }
     let image = manifestImage;
     const useProfileLifecycle = Boolean(profileConfig);
-    const runtimeNetworkPlan = buildRuntimeNetworkPlan(runtime, manifestNetwork);
     const routerEndpoint = assertRouterEndpoint(options.routerEndpoint, runtimeNetworkPlan.mode, {
         explicitPort: options.routerPort,
     });
@@ -885,6 +954,9 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         isolatedHome,
         agentHomeDir,
     });
+    const topologyMount = edgeTopologyMount();
+    fs.mkdirSync(topologyMount.source, { recursive: true, mode: 0o700 });
+    args.push('-v', `${topologyMount.source}:${topologyMount.target}${runtime === 'podman' ? ':z,ro' : ':ro'}`);
 
     // LLM runtime: expose persistent model storage at /models and selected
     // architecture/runtime state at /runtime. These are identity-specific so
@@ -910,9 +982,6 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         args.push('-v', `${agentSkillsPath}:/code/skills${skillsMountMode}`);
     }
     const useHostNetwork = runtimeNetworkPlan.useHostNetwork;
-    const additionalServerPort = resolveProfileServer(manifest, profileConfig, {
-        runtimeMode: useHostNetwork ? 'host' : 'container'
-    });
     const containerSecurityArgs = buildContainerSecurityArgs(resolveContainerSecurity(manifest, profileConfig));
     if (containerSecurityArgs.length) {
         args.splice(1, 0, ...containerSecurityArgs);
@@ -941,7 +1010,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
             attachments: [],
             created: [],
         };
-    args.splice(1, 0, ...networkLifecycle.agentIdentityLabelArgs(manifestNetwork));
+    args.splice(1, 0, ...networkLifecycle.agentIdentityLabelArgs(manifestNetwork, runtimeIdentity));
 
     for (const { resolvedHostPath, containerPath, options } of manifestVolumeMounts) {
         const mountSuffix = manifestVolumeMountSuffix(runtime, resolvedHostPath, options);
@@ -951,16 +1020,11 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     const { publishArgs: manifestPorts, portMappings } = parseManifestPorts(manifest, profileConfig);
     const runtimePorts = (options && Array.isArray(options.publish)) ? options.publish : [];
     const runtimePortMappings = (options && Array.isArray(options.publishMappings)) ? options.publishMappings : [];
-    const basePortMappings = [...portMappings, ...runtimePortMappings];
-    const profileServerPublish = useHostNetwork ? null : createProfileServerPublish(additionalServerPort, basePortMappings);
-    const profileServerPublishArgs = profileServerPublish ? [profileServerPublish.publishArg] : [];
-    const effectivePortMappings = profileServerPublish
-        ? [...basePortMappings, profileServerPublish.mapping]
-        : basePortMappings;
+    const effectivePortMappings = [...portMappings, ...runtimePortMappings];
     assertHostPortContract(runtimeNetworkPlan.mode, effectivePortMappings);
     const pubs = (useHostNetwork || runtimeNetworkPlan.mode === 'none')
         ? []
-        : [...manifestPorts, ...runtimePorts, ...profileServerPublishArgs];
+        : [...manifestPorts, ...runtimePorts];
     for (const p of pubs) {
         if (!p) continue;
         args.splice(1, 0, '-p', String(p));
@@ -985,18 +1049,6 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     // Apply env from manifest.runtime.resources.env (templates expanded).
     for (const [envKey, envValue] of Object.entries(applyRuntimeResourceEnv(resourcePlan))) {
         envStrings.push(formatEnvFlag(envKey, envValue));
-    }
-
-    try {
-        const repoName = path.basename(path.dirname(agentPath));
-        // Per-agent request-signing identity (DS013). Each agent receives ONLY
-        // its own id + secret — never the master key, never the shared
-        // derived-master key, never another agent's secret.
-        for (const [key, value] of Object.entries(buildAgentIdentityEnv(deriveAgentPrincipalId(repoName, agentName)))) {
-            envStrings.push(formatEnvFlag(key, value));
-        }
-    } catch (err) {
-        debugLog(`[invocationAuth] could not set agent identity for ${agentName}: ${err?.message || err}`);
     }
 
     const profileEnv = normalizeProfileEnv(profileConfig?.env);
@@ -1058,12 +1110,14 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
             envStrings.splice(i, 1);
         }
     }
-    try {
-        for (const [key, value] of Object.entries(buildAgentIdentityEnv(deriveAgentPrincipalId(path.basename(path.dirname(agentPath)), agentName)))) {
-            envStrings.push(formatEnvFlag(key, value));
-        }
-    } catch (err) {
-        debugLog(`[invocationAuth] could not set agent identity for ${agentName}: ${err?.message || err}`);
+    // Per-agent request-signing identity (DS013). Identity derivation is a
+    // launch precondition: a managed runtime must never start without its exact
+    // principal and generation-bound secret.
+    for (const [key, value] of Object.entries(buildAgentIdentityEnv(
+        deriveAgentPrincipalId(path.basename(path.dirname(agentPath)), agentName),
+        runtimeIdentity,
+    ))) {
+        envStrings.push(formatEnvFlag(key, value));
     }
     envStrings.push(formatEnvFlag('HOME', '/root'));
 
@@ -1138,23 +1192,73 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         const res = spawnSync(runtime, createArgs, { stdio: 'inherit' });
         if (res.status !== 0) throw new Error(`${runtime} create failed with code ${res.status}`);
     };
+    let launchedContainerId = '';
     if (runtimeNetworkPlan.requiresManagedNetwork) {
-        networkLifecycle.runManagedContainerTransaction({
+        const launched = networkLifecycle.runManagedContainerTransaction({
             network: manifestNetwork,
             canonicalAgentId: agentName,
             instanceKey: effectiveInstanceKey(repoName, agentName, options.alias || ''),
             containerName,
+            runtimeIdentity,
             createContainer,
             networkLockWaitMs: options.networkLockWaitMs,
         });
+        launchedContainerId = String(launched?.containerId || '');
         clearLivenessState(containerName);
     } else {
         // All manifest/profile/port/image/mount validation above is complete.
         // Only now is the old host/none container deliberately replaced.
         removeContainerForRecreate(runtime, containerName, `startAgentContainer:${agentName}`);
         createContainer(unmanagedNetworkLifecyclePlan);
-        networkLifecycle.finalizeContainer(containerName, unmanagedNetworkLifecyclePlan);
+        launchedContainerId = String(networkLifecycle.finalizeContainer(containerName, unmanagedNetworkLifecyclePlan, {
+            network: manifestNetwork,
+            runtimeIdentity,
+        }) || '');
     }
+    if (!launchedContainerId) {
+        throw new Error(`startAgentContainer(${agentName}) did not capture an immutable container ID`);
+    }
+    const exactLaunchReceipt = Object.freeze({
+        containerName,
+        containerId: launchedContainerId,
+        runtimeNetwork: structuredClone(manifestNetwork),
+        registryRecord: Object.freeze({
+            type: 'agent',
+            agentName,
+            repoName,
+            ...(options.alias ? { alias: options.alias } : {}),
+            instanceId: runtimeIdentity.instanceId,
+            enableGeneration: runtimeIdentity.enableGeneration,
+        }),
+    });
+    const cleanupExactLaunch = (error) => {
+        let exactCleanupPerformed = false;
+        try {
+            const cleanup = networkLifecycle.removeExactContainer(
+                containerName,
+                manifestNetwork,
+                agentName,
+                {
+                    expectedContainerId: launchedContainerId,
+                    instanceKey: effectiveInstanceKey(repoName, agentName, options.alias || ''),
+                    contractHash: networkContractHash(manifestNetwork),
+                    instanceId: runtimeIdentity.instanceId,
+                    enableGeneration: runtimeIdentity.enableGeneration,
+                },
+            );
+            exactCleanupPerformed = cleanup.removed === true || cleanup.state === 'absent';
+            if (!exactCleanupPerformed) {
+                appendExactCleanupFailure(error, cleanup.reason || cleanup.state || 'ownership mismatch');
+            }
+        } catch (cleanupError) {
+            appendExactCleanupFailure(error, cleanupError?.message || cleanupError);
+        }
+        clearLivenessState(containerName);
+        throw attachRestartCandidate(error, {
+            ...exactLaunchReceipt,
+            exactCleanupPerformed,
+        });
+    };
     const agents = loadAgentsMap();
     const declaredEnvNames2 = [
         ...getManifestEnvNames(manifest, profileConfig, { forRuntime: true }),
@@ -1187,9 +1291,12 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         develRepo: persistedRecord.develRepo,
         profile: activeProfile,
         type: 'agent',
+        instanceId: runtimeIdentity.instanceId,
+        enableGeneration: runtimeIdentity.enableGeneration,
         config: {
             binds: [
                 { source: agentLibMountPath, target: '/Agent', ro: true },
+                { source: topologyMount.source, target: topologyMount.target, ro: true },
                 { source: codeMountPath, target: '/code', ro: codeReadOnly },
                 ...(useNestedDependencyMounts ? [
                     { source: preparedNodeModulesDir, target: '/code/node_modules', ro: true },
@@ -1208,7 +1315,6 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
             ports: runtimeNetworkPlan.mode === 'host' || runtimeNetworkPlan.mode === 'none'
                 ? []
                 : effectivePortMappings,
-            ...(additionalServerPort ? { additionalServerPort } : {})
         }
     };
     if (persistedRecord.auth) {
@@ -1218,7 +1324,8 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     if (persistedRecord.alias) {
         agents[containerName].alias = persistedRecord.alias;
     }
-    saveAgentsMap(agents);
+    if (options.preserveRegistryRecord !== true) saveAgentsMap(agents);
+    const registryRecord = structuredClone(agents[containerName]);
     try {
         if (useProfileLifecycle) {
             const lifecycleResult = runProfileLifecycle(agentName, activeProfile, {
@@ -1238,19 +1345,26 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
             runPostinstallHook(agentName, containerName, manifest, cwd);
         }
     } catch (error) {
-        try { stopAndRemove(containerName); } catch (_) { }
-        throw error;
+        cleanupExactLaunch(error);
     }
     if (launchExplicitSidecar) {
         try {
             launchAgentSidecar({ containerName, agentCommand: explicitAgentCmd, agentName });
         } catch (error) {
-            try { stopAndRemove(containerName); } catch (_) { }
-            throw error;
+            cleanupExactLaunch(error);
         }
     }
-    syncAgentMcpConfig(containerName, path.resolve(agentPath), agentName);
-    return containerName;
+    try {
+        syncAgentMcpConfig(containerName, path.resolve(agentPath), agentName);
+    } catch (error) {
+        cleanupExactLaunch(error);
+    }
+    return {
+        containerName,
+        containerId: launchedContainerId,
+        runtimeNetwork: structuredClone(manifestNetwork),
+        registryRecord,
+    };
 }
 
 function resolveHostPort(containerName, existingRecord, containerPortCandidates) {
@@ -1315,6 +1429,38 @@ function shouldCreateImplicitAgentServerPublish(manifest, manifestPorts = [], ne
     return resolveAgentExecutionMode(manifest).type !== 'start_only';
 }
 
+function loopbackMappingFor(portMappings, containerPort) {
+    return (portMappings || []).find((mapping) => (
+        Number(mapping?.containerPort) === Number(containerPort)
+        && String(mapping?.protocol || 'tcp').toLowerCase() === 'tcp'
+        && String(mapping?.hostIp || '').toLowerCase() === '127.0.0.1'
+    )) || null;
+}
+
+function assertNoConflictingExplicitServiceMapping(portMappings, containerPort) {
+    const conflicting = (portMappings || []).find((mapping) => (
+        Number(mapping?.containerPort) === Number(containerPort)
+        && String(mapping?.protocol || 'tcp').toLowerCase() === 'tcp'
+        && String(mapping?.hostIp || '').toLowerCase() !== '127.0.0.1'
+    ));
+    if (conflicting) {
+        throw new Error(`httpServices[].port ${containerPort} must use one Router-private 127.0.0.1 mapping, not ${conflicting.hostIp || 'a wildcard bind'}`);
+    }
+}
+
+function resolveServiceTargets(portMappings, ports, networkMode) {
+    if (networkMode === 'none') return {};
+    return Object.fromEntries(ports.map((containerPort) => {
+        if (networkMode === 'host') return [String(containerPort), containerPort];
+        const mapping = loopbackMappingFor(portMappings, containerPort);
+        const hostPort = Number(mapping?.hostPort || 0);
+        if (!Number.isSafeInteger(hostPort) || hostPort < 1 || hostPort > 65535) {
+            throw new Error(`private mapping for httpServices[].port ${containerPort} was not resolved by the container engine`);
+        }
+        return [String(containerPort), hostPort];
+    }));
+}
+
 function appendUniquePortMapping(portMappings, mapping) {
     const current = Array.isArray(portMappings) ? [...portMappings] : [];
     const containerPort = Number(mapping?.containerPort);
@@ -1327,7 +1473,7 @@ function appendUniquePortMapping(portMappings, mapping) {
 }
 
 function assertHostPortContract(networkMode, portMappings) {
-    if (networkMode !== 'host' || isPloinkyBoxRuntime()) return;
+    if (networkMode !== 'host') return;
     const remapped = (portMappings || []).find((mapping) => (
         Number(mapping?.hostPort) !== Number(mapping?.containerPort)
     ));
@@ -1338,14 +1484,153 @@ function assertHostPortContract(networkMode, portMappings) {
     }
 }
 
-function resolveDirectProfileServerHostPort(profileServer) {
-    if (String(profileServer?.mode || '').trim().toLowerCase() !== 'host') return 0;
-    try {
-        const port = Number.parseInt(new URL(profileServer.url).port, 10);
-        return Number.isInteger(port) && port > 0 ? port : 0;
-    } catch (_) {
-        return 0;
+export function assertPreparedRegistryRecordPreservation(existingRecord, options = {}, {
+    ownerRef = 'agent',
+} = {}) {
+    if (options.preservePreparedRegistryRecord !== true) return false;
+    const stagedInstanceId = String(existingRecord?.instanceId || '');
+    const stagedEnableGeneration = String(existingRecord?.enableGeneration || '');
+    const requestedInstanceId = String(options.instanceId || stagedInstanceId);
+    const requestedEnableGeneration = String(options.enableGeneration || stagedEnableGeneration);
+    if (!stagedInstanceId || !stagedEnableGeneration
+        || requestedInstanceId !== stagedInstanceId
+        || requestedEnableGeneration !== stagedEnableGeneration) {
+        throw new Error(
+            `preserving the prepared registry record for ${ownerRef} requires its exact staged instanceId/enableGeneration`,
+        );
     }
+    return true;
+}
+
+function mintReplacementRuntimeIdentity(existingRecord, uuid = randomUUID) {
+    const instanceId = String(uuid() || '').trim();
+    const enableGeneration = String(uuid() || '').trim();
+    if (!instanceId || !enableGeneration
+        || instanceId === enableGeneration
+        || instanceId === String(existingRecord?.instanceId || '')
+        || instanceId === String(existingRecord?.enableGeneration || '')
+        || enableGeneration === String(existingRecord?.instanceId || '')
+        || enableGeneration === String(existingRecord?.enableGeneration || '')) {
+        throw new Error('replacement runtime identity mint did not produce a fresh instanceId and enableGeneration');
+    }
+    return Object.freeze({ instanceId, enableGeneration });
+}
+
+export function coordinateReplacementRuntimeIdentity({
+    containerName,
+    existingRecord,
+    reason = 'runtime-replacement',
+} = {}, {
+    prepare = prepareEdgeRoutingGenerationRaw,
+    inactivate = inactivateEdgeRoutingGeneration,
+    loadRegistry = loadAgentsMap,
+    saveRegistry = saveAgentsMap,
+    withApplyLock = withEdgeGenerationApplyLock,
+    uuid = randomUUID,
+} = {}) {
+    const exactContainerName = String(containerName || '').trim();
+    if (!exactContainerName) {
+        throw new Error('coordinated runtime replacement requires an exact container name');
+    }
+
+    const coordinationReason = `runtime-identity-rotation:${String(reason || 'runtime-replacement')}:${exactContainerName}`;
+    let runtimeIdentity;
+    let prepared;
+    withApplyLock((applyLockCapability) => {
+        inactivate(coordinationReason, { applyLockCapability });
+
+        const agents = loadRegistry();
+        const current = agents?.[exactContainerName];
+        if (!current || current.type !== 'agent') {
+            throw new Error(`runtime replacement for '${exactContainerName}' requires one exact registered agent record`);
+        }
+        if (String(current.instanceId || '') !== String(existingRecord?.instanceId || '')
+            || String(current.enableGeneration || '') !== String(existingRecord?.enableGeneration || '')) {
+            throw new Error(`runtime identity for '${exactContainerName}' changed before coordinated replacement`);
+        }
+
+        runtimeIdentity = mintReplacementRuntimeIdentity(current, uuid);
+        agents[exactContainerName] = {
+            ...current,
+            instanceId: runtimeIdentity.instanceId,
+            enableGeneration: runtimeIdentity.enableGeneration,
+        };
+        saveRegistry(agents, { coordinate: false, applyLockCapability });
+
+        try {
+            prepared = prepare({ reason: coordinationReason, applyLockCapability });
+        } catch (error) {
+            try {
+                inactivate(`${coordinationReason}:prepare-failed`, {
+                    applyLockCapability,
+                    preserveSelectedGeneration: true,
+                });
+            } catch (_) {}
+            throw error;
+        }
+    });
+    const preparedRecord = prepared?.generation?.agents?.[exactContainerName];
+    if (prepared?.selector?.state !== 'inactive'
+        || String(preparedRecord?.instanceId || '') !== runtimeIdentity.instanceId
+        || String(preparedRecord?.enableGeneration || '') !== runtimeIdentity.enableGeneration) {
+        let aborted = false;
+        try {
+            if (prepared?.preparationLease) {
+                abortEdgeRoutingPreparation(prepared.preparationLease, {
+                    reason: `${coordinationReason}:identity-mismatch`,
+                });
+                aborted = true;
+            }
+        } catch (_) {}
+        if (!aborted) {
+            try { inactivate(`${coordinationReason}:identity-mismatch`, { preserveSelectedGeneration: true }); } catch (_) {}
+        }
+        throw new Error(`coordinated replacement candidate did not remain inactive with the fresh runtime identity for '${exactContainerName}'`);
+    }
+    return Object.freeze({
+        ...runtimeIdentity,
+        ...(prepared?.preparationLease ? { preparationLease: prepared.preparationLease } : {}),
+    });
+}
+
+export function resolveReplacementRuntimeIdentity({
+    containerName,
+    existingRecord,
+    existingRuntime = false,
+    recreateReason = null,
+    preservePreparedRegistryRecord = false,
+    targetedRestart = false,
+    requestedInstanceId = '',
+    requestedEnableGeneration = '',
+} = {}, dependencies = {}) {
+    if (!targetedRestart && !preservePreparedRegistryRecord
+        && existingRuntime && !recreateReason) {
+        const instanceId = String(existingRecord?.instanceId || '').trim();
+        const enableGeneration = String(existingRecord?.enableGeneration || '').trim();
+        if (!instanceId || !enableGeneration) {
+            throw new Error('runtime reuse requires the exact registered instanceId and enableGeneration');
+        }
+        return Object.freeze({ instanceId, enableGeneration });
+    }
+    if (!targetedRestart && !preservePreparedRegistryRecord && (
+        existingRuntime && recreateReason
+        || !existingRuntime && existingRecord?.type === 'agent' && !preservePreparedRegistryRecord
+    )) {
+        return coordinateReplacementRuntimeIdentity({
+            containerName,
+            existingRecord,
+            reason: recreateReason || 'registered-runtime-missing',
+        }, dependencies);
+    }
+    if (targetedRestart || preservePreparedRegistryRecord) {
+        return Object.freeze({
+            instanceId: String(requestedInstanceId || existingRecord?.instanceId || ''),
+            enableGeneration: String(requestedEnableGeneration || existingRecord?.enableGeneration || ''),
+            ...(dependencies.preparationLease ? { preparationLease: dependencies.preparationLease } : {}),
+        });
+    }
+    const uuid = dependencies.uuid || randomUUID;
+    return mintReplacementRuntimeIdentity({}, uuid);
 }
 
 function ensureAgentService(agentName, manifest, agentPath, options = {}) {
@@ -1356,6 +1641,7 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
         error.code = 'PLOINKY_ROUTER_ENDPOINT_REQUIRED';
         throw error;
     }
+    const targetedRestart = normalizeTargetedRestart(options.targetedRestart);
     let preferredHostPort;
     let containerOverride;
     let aliasOverride;
@@ -1378,6 +1664,11 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
     const containerName = containerOverride || getAgentContainerName(agentName, repoName);
     const snapshot = loadAgentsMap();
     const existingRecord = snapshot[containerName] || {};
+    const preservePreparedRegistryRecord = assertPreparedRegistryRecordPreservation(
+        existingRecord,
+        options,
+        { ownerRef: `${repoName}/${agentName}` },
+    );
     if (!aliasOverride && existingRecord.alias) {
         aliasOverride = existingRecord.alias;
     }
@@ -1397,39 +1688,128 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
     assertNetworkStartupCompatibility(manifest, profileConfig, manifestNetwork, {
         path: `manifest(${repoName}/${agentName})`,
     });
+    const explicitServicePorts = explicitHttpServicePorts(manifest);
     const routerEndpoint = assertRouterEndpoint(routerEndpointOverride, manifestNetwork.mode);
 
     // Host sandboxes share the host network namespace. Fail closed unless the
     // effective manifest/profile contract explicitly selects host networking.
     const agentRuntime = getRuntimeForAgent(manifest);
     if (agentRuntime === 'bwrap' || agentRuntime === 'seatbelt') {
-        const sandboxOptions = { ...options };
-        Object.assign(sandboxOptions, {
-            containerName,
-            alias: aliasOverride,
-            profileName: activeProfile,
-            profileResolution,
-            routerEndpoint,
-        });
+        let sandboxRuntimeIdentity = null;
+        let sandboxRequiresEdgeActivation = false;
         try {
             assertHostSandboxNetworkCompatibility(manifestNetwork, {
                 path: `manifest(${repoName}/${agentName}).network`,
                 runtime: agentRuntime,
             });
-            return agentRuntime === 'bwrap'
+            if (targetedRestart) {
+                throw new Error(`targeted drain/restart is unsupported for ${agentRuntime} runtimes`);
+            }
+            const registeredIdentity = String(existingRecord.instanceId || '').trim()
+                && String(existingRecord.enableGeneration || '').trim()
+                ? {
+                    instanceId: String(existingRecord.instanceId),
+                    enableGeneration: String(existingRecord.enableGeneration),
+                }
+                : null;
+            const anyRuntimeRunning = isBwrapProcessRunning(containerName);
+            const runningAtEntry = Boolean(registeredIdentity)
+                && isBwrapProcessRunning(containerName, registeredIdentity);
+            const desiredEnvHash = computeEnvHash(manifest, profileConfig, routerEndpoint?.env || {}, {
+                agentName,
+                repoName,
+            });
+            const currentEnvHash = String(existingRecord.envHash || '');
+            const sandboxRecreateReason = forceRecreate
+                ? 'forceRecreate'
+                : (!runningAtEntry
+                    ? (anyRuntimeRunning ? 'runtimeIdentityDrift' : 'sandboxRuntimeStopped')
+                    : (desiredEnvHash && desiredEnvHash !== currentEnvHash ? 'envHashChanged' : null));
+            const requiresEdgeActivation = Boolean(existingRecord?.type === 'agent' && sandboxRecreateReason);
+            const runtimeIdentity = resolveReplacementRuntimeIdentity({
+                containerName,
+                existingRecord,
+                existingRuntime: anyRuntimeRunning,
+                recreateReason: sandboxRecreateReason,
+                preservePreparedRegistryRecord,
+                requestedInstanceId: String(options.instanceId || existingRecord.instanceId || ''),
+                requestedEnableGeneration: String(options.enableGeneration || existingRecord.enableGeneration || ''),
+            }, { preparationLease: options.preparationLease });
+            sandboxRuntimeIdentity = runtimeIdentity;
+            sandboxRequiresEdgeActivation = requiresEdgeActivation;
+            let preparedHostModeCapability = options.preparedHostModeCapability;
+            const exactOwner = {
+                agentId: deriveAgentPrincipalId(repoName, agentName),
+                instanceId: runtimeIdentity.instanceId,
+                enableGeneration: runtimeIdentity.enableGeneration,
+                routeKey: aliasOverride || agentName,
+                containerName,
+            };
+            if (!preparedHostModeCapability && requiresEdgeActivation) {
+                preparedHostModeCapability = prepareHostModeCapabilityForInactiveGeneration(exactOwner);
+            }
+            assertHostModeGenerationCapability(exactOwner, { preparedCapability: preparedHostModeCapability });
+            const sandboxOptions = {
+                ...options,
+                containerName,
+                alias: aliasOverride,
+                profileName: activeProfile,
+                profileResolution,
+                routerEndpoint,
+                forceRecreate: Boolean(sandboxRecreateReason),
+                instanceId: runtimeIdentity.instanceId,
+                enableGeneration: runtimeIdentity.enableGeneration,
+                preservePreparedRegistryRecord: preservePreparedRegistryRecord || requiresEdgeActivation,
+                preparedHostModeCapability,
+            };
+            const result = agentRuntime === 'bwrap'
                 ? ensureBwrapService(agentName, manifest, agentPath, sandboxOptions)
                 : ensureSeatbeltService(agentName, manifest, agentPath, sandboxOptions);
+            return {
+                ...result,
+                runtimeNetwork: structuredClone(manifestNetwork),
+                requiresEdgeActivation,
+                ...(runtimeIdentity.preparationLease ? { preparationLease: runtimeIdentity.preparationLease } : {}),
+            };
         } catch (err) {
-            throw createHostSandboxStartupError(agentName, agentRuntime, err);
+            const failure = createHostSandboxStartupError(agentName, agentRuntime, err);
+            const identity = {
+                instanceId: String(sandboxRuntimeIdentity?.instanceId || options.instanceId || existingRecord.instanceId || ''),
+                enableGeneration: String(sandboxRuntimeIdentity?.enableGeneration || options.enableGeneration || existingRecord.enableGeneration || ''),
+            };
+            let exactCleanupPerformed = false;
+            if (identity.instanceId && identity.enableGeneration) {
+                try {
+                    if (isBwrapProcessRunning(containerName, identity)) {
+                        stopBwrapProcess(containerName, { expectedIdentity: identity });
+                    }
+                    exactCleanupPerformed = !isBwrapProcessRunning(containerName, identity);
+                } catch (cleanupError) {
+                    appendExactCleanupFailure(failure, cleanupError?.message || cleanupError);
+                }
+            }
+            throw attachRestartCandidate(failure, {
+                containerName,
+                runtimeNetwork: structuredClone(manifestNetwork),
+                registryRecord: {
+                    type: 'agent',
+                    runtime: agentRuntime,
+                    agentName,
+                    repoName,
+                    ...(aliasOverride ? { alias: aliasOverride } : {}),
+                    ...identity,
+                },
+                requiresEdgeActivation: sandboxRequiresEdgeActivation,
+                exactCleanupPerformed,
+                ...((sandboxRuntimeIdentity?.preparationLease || options.preparationLease)
+                    ? { preparationLease: sandboxRuntimeIdentity?.preparationLease || options.preparationLease }
+                    : {}),
+            });
         }
     }
 
     const runtime = getRuntime();
-    assertOuterPublicationCoverageForManifest(manifest, profileConfig, {
-        ownerRef: `${repoName}/${agentName}`,
-        networkMode: manifestNetwork.mode,
-        commandHint: options?.commandHint || `ploinky start ${repoName}/${agentName}`,
-    });
+    const existingRuntimeAtEntry = containerExists(containerName);
     assertManifestEnvProfileCompleteness(manifest, profileConfig, { agentName, repoName, profileName: activeProfile });
     // LLM-runtime agents get their real image from the hardware-aware catalog in
     // startAgentContainer; tolerate an unresolved manifest container placeholder
@@ -1452,38 +1832,31 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
 
     const { publishArgs: manifestPorts, portMappings } = parseManifestPorts(manifest, profileConfig);
     assertHostPortContract(runtimeNetworkPlan.mode, portMappings);
-    const additionalServerPort = resolveProfileServer(manifest, profileConfig, {
-        runtimeMode: runtimeNetworkPlan.useHostNetwork ? 'host' : 'container'
-    });
     const containerPortCandidates = portMappings
         .map((mapping) => mapping?.containerPort)
         .filter((port) => typeof port === 'number' && port > 0);
-    const additionalServerContainerPort = profileServerContainerPort(additionalServerPort);
-    if (additionalServerContainerPort && !containerPortCandidates.includes(additionalServerContainerPort)) {
-        containerPortCandidates.push(additionalServerContainerPort);
+    for (const servicePort of explicitServicePorts) {
+        if (!containerPortCandidates.includes(servicePort)) containerPortCandidates.push(servicePort);
     }
     if (shouldCreateImplicitAgentServerPublish(manifest, manifestPorts, runtimeNetworkPlan.mode, portMappings)) {
         containerPortCandidates.unshift(7000);
-        if (isPloinkyBoxRuntime()) {
-            const key = effectiveInstanceKey(repoName, agentName, aliasOverride);
-            const boxPort = implicitAgentServerBoxPort(key);
-            assertOuterPublicationCoverageForClaims([{
-                protocol: 'tcp',
-                boxSide: { start: boxPort, end: boxPort },
-                ownerRef: `${repoName}/${agentName}`,
-                raw: `implicit AgentServer ${boxPort}:7000`,
-            }], {
-                boxRuntime: true,
-                ownerRef: `${repoName}/${agentName}`,
-                commandHint: options?.commandHint || `ploinky start ${repoName}/${agentName}`,
-            });
-        }
     }
 
     const { raw: explicitAgentCmd } = readManifestAgentCommand(manifest);
     const startCmd = readManifestStartCommand(manifest);
     const withParallelAgent = Boolean(startCmd && explicitAgentCmd);
-    let recreateReason = forceRecreate ? 'forceRecreate' : null;
+    let recreateReason = targetedRestart ? 'targetedRestart' : (forceRecreate ? 'forceRecreate' : null);
+    const requestedEnableGeneration = String(options.enableGeneration || existingRecord.enableGeneration || randomUUID());
+    const requestedInstanceId = String(options.instanceId || existingRecord.instanceId || '');
+    if (containerExists(containerName) && (!existingRecord.instanceId || !existingRecord.enableGeneration)) {
+        recreateReason ||= 'missingRuntimeIdentity';
+    }
+    if (containerExists(containerName) && (
+        (options.instanceId && options.instanceId !== existingRecord.instanceId)
+        || (options.enableGeneration && options.enableGeneration !== existingRecord.enableGeneration)
+    )) {
+        recreateReason ||= 'runtimeIdentityChanged';
+    }
 
     if (containerExists(containerName)) {
         const desired = computeEnvHash(manifest, profileConfig, envHashExtra, { agentName, repoName });
@@ -1527,12 +1900,11 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
         }
     }
 
-    if (containerExists(containerName) && additionalServerPort) {
+    if (containerExists(containerName) && explicitServicePorts.length && runtimeNetworkPlan.mode !== 'host') {
         const existingPortMappings = resolvePublishedPortMappings(containerName, existingRecord.config?.ports || []);
-        const existingProfileServer = resolvePublishedProfileServer(additionalServerPort, existingPortMappings);
-        if (!existingProfileServer) {
-            debugLog(`[ensureAgentService] ${agentName}: additional server port is not published; recreating container`);
-            recreateReason ||= 'profileServerPublishChanged';
+        if (explicitServicePorts.some((servicePort) => !loopbackMappingFor(existingPortMappings, servicePort))) {
+            debugLog(`[ensureAgentService] ${agentName}: explicit HTTP service target is not privately mapped; recreating container`);
+            recreateReason ||= 'serviceTargetMappingChanged';
         }
     }
 
@@ -1541,66 +1913,85 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
     // reuse, start, or replacement decision. Only creation/replacement for
     // default/bridge enters the managed-network transaction below.
     const networkLifecycle = createNetworkLifecycleAdapter({ runtime });
+    let inspectedContainerId = null;
     if (containerExists(containerName)) {
         const contractInspection = networkLifecycle.inspectContainerContract(containerName, manifestNetwork, agentName, {
             instanceKey: effectiveInstanceKey(repoName, agentName, aliasOverride || ''),
             contractHash: networkContractHash(manifestNetwork),
+            instanceId: existingRecord.instanceId,
+            enableGeneration: existingRecord.enableGeneration,
+            requireRuntimeIdentity: true,
         });
         if (contractInspection.state === 'foreign') {
             throw new Error(`refusing to replace foreign/unsupported exact-name container '${containerName}': managed agent identity labels do not match`);
         }
+        inspectedContainerId = contractInspection.id;
         if (contractInspection.state === 'owned-drift') {
-            debugLog(`[ensureAgentService] ${agentName}: managed network contract/attachments drifted; recreating container`);
-            recreateReason ||= 'networkContractDrift';
-        } else if (runtimeNetworkPlan.requiresManagedNetwork && !isContainerRunning(containerName)) {
-            // A stopped managed container is never started outside the lifecycle
-            // transaction because gateway/network preflight must precede start.
-            recreateReason ||= 'managedContainerStopped';
+            const driftReason = contractInspection.reason === 'runtime-identity'
+                ? 'runtimeIdentityDrift'
+                : 'networkContractDrift';
+            debugLog(`[ensureAgentService] ${agentName}: managed runtime contract drifted (${driftReason}); recreating container`);
+            recreateReason ||= driftReason;
+        } else if (!isContainerRunning(containerName)) {
+            // A stopped runtime is an instance replacement, not a process-resume
+            // optimization. Its old identity is inactivated and rotated before
+            // any host/none/managed process can start again.
+            recreateReason ||= 'runtimeStopped';
         }
     }
 
     if (containerExists(containerName) && !recreateReason) {
         debugLog(`[ensureAgentService] ${agentName}: container exists, checking if running...`);
         let canReuseExisting = true;
-        if (!isContainerRunning(containerName)) {
-            ensureManifestVolumeHostPaths(manifest, profileConfig);
-            syncAgentMcpConfig(containerName, agentPath, agentName);
-            try {
-                // Capture stderr so an expected reuse failure does not dump an
-                // alarming raw runtime error. The common case is a prepared
-                // dependency cache that `ploinky update` removed (a moving git dep
-                // advanced): the container's node_modules bind-mount source is gone,
-                // so `podman start` fails its getxattr check. We recreate from
-                // scratch below, which rebuilds the cache cleanly.
-                execSync(`${runtime} start ${containerName}`, { stdio: ['ignore', 'inherit', 'pipe'] });
-            } catch (e) {
-                canReuseExisting = false;
-                const detail = String(e?.stderr || '').trim() || e?.message || 'unknown error';
-                console.log(`[start] ${agentName}: cannot reuse existing container; recreating.`);
-                debugLog(`[ensureAgentService] ${agentName}: reuse via '${runtime} start' failed (${detail}); recreating.`);
-                recreateReason ||= 'failedStart';
-            }
-            if (canReuseExisting && withParallelAgent) {
-                try {
-                    launchAgentSidecar({ containerName, agentCommand: explicitAgentCmd, agentName });
-                } catch (error) {
-                    try { stopAndRemove(containerName); } catch (_) { }
-                    throw error;
-                }
-            }
+        const reuseInspection = networkLifecycle.inspectContainerContract(containerName, manifestNetwork, agentName, {
+            instanceKey: effectiveInstanceKey(repoName, agentName, aliasOverride || ''),
+            contractHash: networkContractHash(manifestNetwork),
+            instanceId: existingRecord.instanceId,
+            enableGeneration: existingRecord.enableGeneration,
+            requireRuntimeIdentity: true,
+        });
+        if (reuseInspection.state === 'foreign') {
+            throw new Error(`refusing to reuse foreign/unsupported exact-name container '${containerName}': managed agent identity labels do not match`);
+        }
+        if (reuseInspection.state !== 'exact' || !inspectedContainerId || reuseInspection.id !== inspectedContainerId) {
+            canReuseExisting = false;
+            recreateReason ||= 'runtimeChangedDuringInspection';
+        } else if (!isContainerRunning(containerName)) {
+            // Never resume a stopped container under its predecessor identity.
+            // Re-enter the coordinated inactive-generation replacement path.
+            canReuseExisting = false;
+            recreateReason ||= 'runtimeStoppedAfterInspection';
         }
         if (canReuseExisting) {
             debugLog(`[ensureAgentService] ${agentName}: returning early (container exists)`);
+            if (runtimeNetworkPlan.mode === 'host') {
+                assertHostModeGenerationCapability({
+                    agentId: deriveAgentPrincipalId(repoName, agentName),
+                    instanceId: String(existingRecord.instanceId || ''),
+                    enableGeneration: String(existingRecord.enableGeneration || ''),
+                    routeKey: aliasOverride || agentName,
+                    containerName,
+                });
+            }
             const hostPort = runtimeNetworkPlan.mode === 'host'
                 ? (containerPortCandidates[0] || 0)
                 : (containerPortCandidates.length
                     ? resolveHostPort(containerName, existingRecord, containerPortCandidates)
-                    : resolveDirectProfileServerHostPort(additionalServerPort));
+                    : 0);
             const existingPortMappings = resolvePublishedPortMappings(containerName, existingRecord.config?.ports || []);
-            const resolvedProfileServer = resolvePublishedProfileServer(additionalServerPort, existingPortMappings) || additionalServerPort;
+            const serviceTargets = resolveServiceTargets(existingPortMappings, explicitServicePorts, runtimeNetworkPlan.mode);
             syncAgentMcpConfig(containerName, agentPath, agentName);
-            return { containerName, hostPort, additionalServerPort: resolvedProfileServer };
+            return {
+                containerName,
+                containerId: reuseInspection.id,
+                hostPort,
+                serviceTargets,
+                registryRecord: structuredClone(existingRecord),
+            };
         }
+    }
+    if (existingRuntimeAtEntry && !containerExists(containerName)) {
+        recreateReason ||= 'runtimeDisappearedAfterInspection';
     }
 
     let additionalPorts = [];
@@ -1608,35 +1999,92 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
     let allPortMappings = [...portMappings];
 
     if (shouldCreateImplicitAgentServerPublish(manifest, manifestPorts, runtimeNetworkPlan.mode, portMappings)) {
-        const key = effectiveInstanceKey(repoName, agentName, aliasOverride);
-        const hostPort = isPloinkyBoxRuntime()
-            ? implicitAgentServerBoxPort(key)
-            : (preferredHostPort || (10000 + Math.floor(Math.random() * 50000)));
+        const hostPort = Number(preferredHostPort || 0);
         const agentServerMapping = { containerPort: 7000, hostPort, hostIp: '127.0.0.1', protocol: 'tcp' };
-        additionalPorts = [`127.0.0.1:${hostPort}:7000`];
+        additionalPorts = [`127.0.0.1:${hostPort || ''}:7000`];
         additionalPortMappings.push(agentServerMapping);
         allPortMappings = appendUniquePortMapping(allPortMappings, agentServerMapping);
     }
 
-    const profileServerPublish = createProfileServerPublish(additionalServerPort, allPortMappings);
-    if (profileServerPublish) {
-        additionalPorts.push(profileServerPublish.publishArg);
-        additionalPortMappings.push(profileServerPublish.mapping);
-        allPortMappings.push(profileServerPublish.mapping);
+    if (runtimeNetworkPlan.mode !== 'host' && runtimeNetworkPlan.mode !== 'none') {
+        for (const servicePort of explicitServicePorts) {
+            assertNoConflictingExplicitServiceMapping(allPortMappings, servicePort);
+            if (loopbackMappingFor(allPortMappings, servicePort)) continue;
+            const mapping = { containerPort: servicePort, hostPort: 0, hostIp: '127.0.0.1', protocol: 'tcp' };
+            additionalPorts.push(`127.0.0.1::${servicePort}`);
+            additionalPortMappings.push(mapping);
+            allPortMappings = appendUniquePortMapping(allPortMappings, mapping);
+        }
     }
 
-    startAgentContainer(agentName, manifest, agentPath, {
-        publish: additionalPorts,
-        publishMappings: additionalPortMappings,
+    const requiresEdgeActivation = !targetedRestart && (
+        (existingRuntimeAtEntry && Boolean(recreateReason))
+        || (!existingRuntimeAtEntry && existingRecord?.type === 'agent' && !preservePreparedRegistryRecord)
+    );
+    const runtimeIdentity = resolveReplacementRuntimeIdentity({
         containerName,
-        alias: aliasOverride,
-        profileName: activeProfile,
-        profileResolution,
-        routerEndpoint,
-        networkLockWaitMs,
-    });
+        existingRecord,
+        existingRuntime: existingRuntimeAtEntry,
+        recreateReason,
+        preservePreparedRegistryRecord,
+        targetedRestart: Boolean(targetedRestart),
+        requestedInstanceId,
+        requestedEnableGeneration,
+    }, { preparationLease: options.preparationLease });
+    const preserveRuntimeRegistryRecord = Boolean(targetedRestart)
+        || preservePreparedRegistryRecord
+        || Boolean(runtimeIdentity.preparationLease);
+    let preparedHostModeCapability = options.preparedHostModeCapability;
+    if (runtimeNetworkPlan.mode === 'host') {
+        const exactOwner = {
+            agentId: deriveAgentPrincipalId(repoName, agentName),
+            instanceId: runtimeIdentity.instanceId,
+            enableGeneration: runtimeIdentity.enableGeneration,
+            routeKey: aliasOverride || agentName,
+            containerName,
+        };
+        if (!preparedHostModeCapability && requiresEdgeActivation) {
+            preparedHostModeCapability = prepareHostModeCapabilityForInactiveGeneration(exactOwner);
+        }
+        assertHostModeGenerationCapability(exactOwner, { preparedCapability: preparedHostModeCapability });
+    }
+
+    if (targetedRestart) {
+        const drainOptions = {
+            runtime,
+            reason: `coordinated-targeted-restart:${containerName}`,
+            acknowledgement: targetedRestart.acknowledgement,
+            affectedSelectors: targetedRestart.affectedSelectors,
+            assertSelectorsInactive: targetedRestart.assertSelectorsInactive,
+            ...(targetedRestart.timeoutMs === undefined ? {} : { timeoutMs: targetedRestart.timeoutMs }),
+        };
+        if (runtimeNetworkPlan.requiresManagedNetwork) {
+            // The managed transaction preserves a stopped predecessor for
+            // diagnostics/rollback, but never restarts it after this drain.
+            drainTargetedContainer(containerName, drainOptions);
+        } else {
+            drainAndRemoveTargetedContainer(containerName, drainOptions);
+        }
+        clearLivenessState(containerName);
+    }
+
+    let started = null;
+    try {
+        started = startAgentContainer(agentName, manifest, agentPath, {
+            publish: additionalPorts,
+            publishMappings: additionalPortMappings,
+            containerName,
+            alias: aliasOverride,
+            profileName: activeProfile,
+            profileResolution,
+            routerEndpoint,
+            networkLockWaitMs,
+            runtimeIdentity,
+            preparedHostModeCapability,
+            preserveRegistryRecord: preserveRuntimeRegistryRecord,
+        });
     allPortMappings = resolvePublishedPortMappings(containerName, allPortMappings);
-    const resolvedProfileServer = resolvePublishedProfileServer(additionalServerPort, allPortMappings) || additionalServerPort;
+    const serviceTargets = resolveServiceTargets(allPortMappings, explicitServicePorts, runtimeNetworkPlan.mode);
 
     const agentCodePath = getAgentCodePath(agentName);
     const agentSkillsPath = getAgentSkillsPath(agentName);
@@ -1644,7 +2092,7 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
     const { codeReadOnly, skillsReadOnly } = getProfileMountModes(activeProfile, runtime, profileConfig || {});
 
     const agents = loadAgentsMap();
-    const startedRecord = agents[containerName] || {};
+    const startedRecord = started?.registryRecord || agents[containerName] || {};
     const declaredEnvNames3 = [
         ...getManifestEnvNames(manifest, profileConfig, { forRuntime: true }),
         ...getExposedNames(manifest, profileConfig, { forRuntime: true }),
@@ -1683,6 +2131,8 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
         develRepo: existingRecord.develRepo,
         profile: activeProfile,
         type: 'agent',
+        instanceId: runtimeIdentity.instanceId,
+        enableGeneration: runtimeIdentity.enableGeneration,
         config: {
             binds: hasStartedBinds ? startedRecord.config.binds : [
                 { source: AGENT_LIB_PATH, target: '/Agent', ro: true },
@@ -1693,7 +2143,6 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
             ],
             env: Array.from(new Set([...declaredEnvNames3, ...startedEnvNames])).map((name) => ({ name })),
             ports: runtimeNetworkPlan.mode === 'host' || runtimeNetworkPlan.mode === 'none' ? [] : allPortMappings,
-            ...(resolvedProfileServer ? { additionalServerPort: resolvedProfileServer } : {})
         }
     };
     if (existingRecord.auth) {
@@ -1702,7 +2151,7 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
     if (aliasOverride) {
         agents[containerName].alias = aliasOverride;
     }
-    saveAgentsMap(agents);
+    if (!preserveRuntimeRegistryRecord) saveAgentsMap(agents);
 
     syncAgentMcpConfig(containerName, agentPath, finalInstanceName, { workDir: finalAgentWorkDir });
     const returnPort = runtimeNetworkPlan.mode === 'host'
@@ -1711,9 +2160,267 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
             || 0)
         : allPortMappings.find((p) => p.containerPort === 7000)?.hostPort
         || allPortMappings[0]?.hostPort
-        || resolveDirectProfileServerHostPort(additionalServerPort)
         || 0;
-    return { containerName, hostPort: returnPort, additionalServerPort: resolvedProfileServer };
+        return {
+            containerName,
+            containerId: started?.containerId,
+            runtimeNetwork: structuredClone(manifestNetwork),
+            hostPort: returnPort,
+            serviceTargets,
+            registryRecord: structuredClone(agents[containerName]),
+            requiresEdgeActivation,
+            ...(runtimeIdentity.preparationLease ? { preparationLease: runtimeIdentity.preparationLease } : {}),
+        };
+    } catch (error) {
+        let exactCleanupPerformed = error?.ploinkyRestartCandidate?.exactCleanupPerformed === true;
+        const candidateId = String(started?.containerId || error?.ploinkyRestartCandidate?.containerId || '');
+        const candidateRecord = started?.registryRecord || error?.ploinkyRestartCandidate?.registryRecord || {
+            type: 'agent',
+            agentName,
+            repoName,
+            ...(aliasOverride ? { alias: aliasOverride } : {}),
+            instanceId: runtimeIdentity.instanceId,
+            enableGeneration: runtimeIdentity.enableGeneration,
+        };
+        if (!exactCleanupPerformed && candidateId) {
+            try {
+                const cleanup = removeExactGenerationCandidate({
+                    containerName,
+                    containerId: candidateId,
+                    network: manifestNetwork,
+                    record: candidateRecord,
+                });
+                exactCleanupPerformed = cleanup.removed === true || cleanup.state === 'absent';
+            } catch (cleanupError) {
+                appendExactCleanupFailure(error, cleanupError?.message || cleanupError);
+            }
+        }
+        throw attachRestartCandidate(error, {
+            containerName,
+            ...(candidateId ? { containerId: candidateId } : {}),
+            runtimeNetwork: structuredClone(manifestNetwork),
+            registryRecord: structuredClone(candidateRecord),
+            requiresEdgeActivation,
+            exactCleanupPerformed,
+            ...(runtimeIdentity.preparationLease ? { preparationLease: runtimeIdentity.preparationLease } : {}),
+        });
+    }
+}
+
+function removeExactGenerationCandidate({
+    containerName,
+    containerId,
+    network,
+    record,
+} = {}) {
+    const cleanup = createNetworkLifecycleAdapter({ runtime: getRuntime() }).removeExactContainer(
+        containerName,
+        network,
+        record.agentName,
+        {
+            expectedContainerId: containerId,
+            instanceKey: effectiveInstanceKey(record.repoName, record.agentName, record.alias || ''),
+            contractHash: networkContractHash(network),
+            instanceId: record.instanceId,
+            enableGeneration: record.enableGeneration,
+        },
+    );
+    if (cleanup.removed !== true && cleanup.state !== 'absent') {
+        throw new Error(`exact failed candidate was preserved (${cleanup.reason || cleanup.state || 'ownership mismatch'})`);
+    }
+    clearLivenessState(containerName);
+    return cleanup;
+}
+
+export function cleanupExactAgentRuntimeCandidate(candidate) {
+    const containerName = String(candidate?.containerName || '').trim();
+    const record = candidate?.registryRecord;
+    if (!containerName || !record || record.type !== 'agent'
+        || !String(record.instanceId || '').trim()
+        || !String(record.enableGeneration || '').trim()) {
+        throw new Error('exact runtime candidate cleanup requires its name and immutable registry identity');
+    }
+    if (record.runtime === 'bwrap' || record.runtime === 'seatbelt') {
+        const identity = {
+            instanceId: record.instanceId,
+            enableGeneration: record.enableGeneration,
+        };
+        if (!isBwrapProcessRunning(containerName, identity)) {
+            return { removed: false, state: 'absent' };
+        }
+        const removed = stopBwrapProcess(containerName, { expectedIdentity: identity });
+        if (!removed || isBwrapProcessRunning(containerName, identity)) {
+            throw new Error('exact sandbox candidate remained live after cleanup');
+        }
+        clearLivenessState(containerName);
+        return { removed: true, state: 'removed' };
+    }
+    const containerId = String(candidate?.containerId || '').trim();
+    if (!containerId || !candidate?.runtimeNetwork) {
+        throw new Error('exact container candidate cleanup requires its immutable ID and runtime network');
+    }
+    return removeExactGenerationCandidate({
+        containerName,
+        containerId,
+        network: candidate.runtimeNetwork,
+        record,
+    });
+}
+
+function appendExactCleanupFailure(error, detail) {
+    if (error && typeof error === 'object') {
+        error.message = `${error.message}; exact candidate cleanup failed: ${detail}`;
+    }
+}
+
+function restartGenerationCapabilityRuntime({
+    generation,
+    owner,
+    affectedSelectors,
+    assertSelectorsInactive,
+    preparedHostModeCapability,
+} = {}, {
+    ensureService = ensureAgentService,
+    isRunning = isContainerRunning,
+    resolveProfile = resolveManifestRuntimeProfile,
+    resolveReadinessProtocol = resolveAgentReadinessProtocol,
+    runScriptReadiness = runContainerScriptReadiness,
+    removeCandidate = removeExactGenerationCandidate,
+} = {}) {
+    if (!generation || !owner || !preparedHostModeCapability) {
+        throw new Error('coordinated capability-runtime restart requires an immutable generation, owner, and prepared capability');
+    }
+    const exactOwner = (generation.compiled?.security?.hostNetworkCapabilities || []).find((entry) => (
+        entry.agentId === owner.agentId
+        && entry.instanceId === owner.instanceId
+        && entry.enableGeneration === owner.enableGeneration
+        && entry.routeKey === owner.routeKey
+        && entry.containerName === owner.containerName
+    ));
+    if (!exactOwner) {
+        throw new Error('coordinated capability-runtime restart owner is not present in the immutable generation');
+    }
+    const route = generation.routing?.routes?.[owner.routeKey];
+    const manifest = generation.manifests?.[owner.routeKey];
+    const record = generation.agents?.[owner.containerName];
+    if (!route || !manifest || !record || record.type !== 'agent'
+        || String(route.container || '') !== owner.containerName
+        || `agent:${record.repoName}/${record.agentName}` !== owner.agentId
+        || String(record.instanceId || '') !== owner.instanceId
+        || String(record.enableGeneration || '') !== owner.enableGeneration) {
+        throw new Error('coordinated capability-runtime restart could not resolve one exact captured runtime record');
+    }
+    const agentPath = String(route.hostPath || '').trim();
+    if (!agentPath) throw new Error('coordinated capability-runtime restart owner has no captured manifest path');
+    const profileResolution = resolveProfile(manifest, {
+        agentName: `${record.repoName}/${record.agentName}`,
+        profileName: record.profile || undefined,
+        path: `manifest(${record.repoName}/${record.agentName})`,
+    });
+    if (profileResolution.network.mode !== 'host') {
+        throw new Error('media capability runtime must resolve to exact host network mode');
+    }
+    const result = ensureService(record.agentName, manifest, agentPath, {
+        containerName: owner.containerName,
+        alias: record.alias || undefined,
+        profileName: profileResolution.resolvedProfileName,
+        profileResolution,
+        routerEndpoint: buildRouterEndpoint('host', INITIAL_ROUTER_PORT),
+        forceRecreate: true,
+        instanceId: owner.instanceId,
+        enableGeneration: owner.enableGeneration,
+        preparedHostModeCapability,
+        targetedRestart: {
+            acknowledgement: TARGETED_DRAIN_ACKNOWLEDGEMENT,
+            affectedSelectors,
+            assertSelectorsInactive,
+        },
+    });
+    try {
+        if (result?.containerName !== owner.containerName
+            || !String(result?.containerId || '')
+            || !isRunning(owner.containerName)) {
+            throw new Error(`coordinated capability-runtime restart did not start exact container '${owner.containerName}' with an immutable ID`);
+        }
+        const readinessProtocol = resolveReadinessProtocol(manifest);
+        if (readinessProtocol !== 'script') {
+            throw new Error('media capability runtime requires an exact semantic script readiness probe before generation activation');
+        }
+        const readiness = runScriptReadiness(record.agentName, owner.containerName, manifest?.health?.readiness);
+        if (readiness && typeof readiness.then === 'function') {
+            throw new Error('media capability runtime readiness must complete synchronously before selector commit');
+        }
+        if (readiness?.status !== 'success') {
+            const detail = readiness?.detail ? `, output='${readiness.detail}'` : '';
+            throw new Error(`media capability runtime semantic readiness failed (${readiness?.reason || 'unknown failure'}${detail})`);
+        }
+    } catch (error) {
+        if (result?.containerName === owner.containerName && String(result?.containerId || '')) {
+            try {
+                removeCandidate({
+                    containerName: owner.containerName,
+                    containerId: result.containerId,
+                    network: profileResolution.network,
+                    record,
+                });
+            } catch (cleanupError) {
+                appendExactCleanupFailure(error, cleanupError?.message || cleanupError);
+            }
+        } else {
+            appendExactCleanupFailure(error, 'candidate receipt did not contain the expected name and immutable ID');
+        }
+        throw error;
+    }
+    return result;
+}
+
+export function isGenerationCapabilityRuntimeEffective({
+    generation,
+    owner,
+} = {}, {
+    exists = containerExists,
+    isRunning = isContainerRunning,
+    inspectContainerContract,
+} = {}) {
+    if (!generation || !owner) return false;
+    const exactOwner = (generation.compiled?.security?.hostNetworkCapabilities || []).find((entry) => (
+        entry.agentId === owner.agentId
+        && entry.instanceId === owner.instanceId
+        && entry.enableGeneration === owner.enableGeneration
+        && entry.routeKey === owner.routeKey
+        && entry.containerName === owner.containerName
+    ));
+    if (!exactOwner) return false;
+    const route = generation.routing?.routes?.[owner.routeKey];
+    const manifest = generation.manifests?.[owner.routeKey];
+    const record = generation.agents?.[owner.containerName];
+    if (!route || !manifest || !record || record.type !== 'agent'
+        || String(route.container || '') !== owner.containerName
+        || `agent:${record.repoName}/${record.agentName}` !== owner.agentId
+        || String(record.instanceId || '') !== owner.instanceId
+        || String(record.enableGeneration || '') !== owner.enableGeneration) {
+        return false;
+    }
+    const profileResolution = resolveManifestRuntimeProfile(manifest, {
+        agentName: `${record.repoName}/${record.agentName}`,
+        profileName: record.profile || undefined,
+        path: `manifest(${record.repoName}/${record.agentName})`,
+    });
+    if (profileResolution.network.mode !== 'host'
+        || !exists(owner.containerName)
+        || !isRunning(owner.containerName)) {
+        return false;
+    }
+    const inspect = inspectContainerContract || createNetworkLifecycleAdapter({ runtime: getRuntime() })
+        .inspectContainerContract;
+    const inspection = inspect(owner.containerName, profileResolution.network, record.agentName, {
+        instanceKey: effectiveInstanceKey(record.repoName, record.agentName, record.alias || ''),
+        contractHash: networkContractHash(profileResolution.network),
+        instanceId: owner.instanceId,
+        enableGeneration: owner.enableGeneration,
+        requireRuntimeIdentity: true,
+    });
+    return inspection?.state === 'exact';
 }
 
 export {
@@ -1737,6 +2444,7 @@ export {
     resolveHostPortFromRecord,
     resolveHostPortFromRuntime,
     resolvePublishedPortMappings,
+    restartGenerationCapabilityRuntime,
     replaceRuntimeRouterEnvFlags,
     shouldCreateImplicitAgentServerPublish,
     startAgentContainer

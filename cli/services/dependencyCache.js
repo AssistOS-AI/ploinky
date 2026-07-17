@@ -441,7 +441,7 @@ export function buildContainerInstallRunArgs({
         'run', '--rm', ...managedContainerLabelArgs(),
         // Dependency-cache installation is a maintenance step against a writable
         // host cache, so it must not inherit non-root USER defaults from runtime
-        // images such as web-publishing.
+        // images.
         '--user', '0:0',
         '-v', `${cwd}:/install${volumeSuffix}`,
         '-w', '/install',

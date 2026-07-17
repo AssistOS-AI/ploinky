@@ -34,7 +34,7 @@ outer runtime.
 | `ploinky` or `p-cli` | Reconcile/start outer runtime; open Ploinky REPL |
 | `ploinky cli` | Reconcile/start outer runtime; open `/bin/bash` as `podman` in `/workspace` |
 | `ploinky cli <agent>` | Reconcile/start outer runtime; attach to that agent's manifest CLI |
-| `ploinky start ...` | Reconcile/start outer runtime; preserve graph publishes and router readiness |
+| `ploinky start ...` | Reconcile/start outer runtime; start the graph behind the fixed boundary |
 | `ploinky status` | Inspect outer contract/publishes/health and running core status without mutation |
 | `ploinky stop` | Stop core services, then stop outer runtime; keep volumes |
 | `ploinky destroy` | Confirm exact instance and directly remove its outer container; retain all named volumes |
@@ -47,10 +47,10 @@ different scopes. Exit the REPL before operating on the outer runtime.
 
 The required multi-architecture release channel is the mutable reference
 `docker.io/assistos/ploinky-box:runtime`. Its image must satisfy runtime
-contract 4, including the exact label:
+contract 5, including the exact label:
 
 ```text
-io.assistos.ploinky.runtime-contract=4
+io.assistos.ploinky.runtime-contract=5
 ```
 
 The contract also requires user `podman`, working directory `/workspace`, the
@@ -59,33 +59,27 @@ environment validated by `runtime-contract.mjs`, and no default command or
 image-declared volumes. The image is source-free; the selected Ploinky checkout
 is mounted read-only at `/opt/ploinky`.
 
-Creating a missing box or intentionally replacing one unconditionally pulls
-the selected reference, validates its complete contract, resolves its local
-image ID, and creates the box from that ID rather than from the mutable tag.
+Creating a missing box unconditionally pulls the selected reference, validates
+its complete contract, resolves its local image ID, and creates the box from
+that ID rather than from the mutable tag.
 Pull failure never falls back to a cached tag. A running compatible box is
 reused, and a stopped compatible box is started, without registry traffic.
 Consequently, publishing a new `:runtime` manifest does not roll existing
 boxes forward. Explicitly destroy the outer box and run an ordinary command to
 pull a refreshed image while reusing its retained named state.
 
-Before a configuration replacement, the supervisor validates the new image
-without stopping the old box. It then captures the old image ID and normalized
-creation configuration, gracefully stops core services, and replaces only the
-outer container. A replacement creation or health failure reconstructs the
-prior container. Workspace, nested-container-storage, and dependency volumes
-are never removed by reconciliation.
+Compatibility is exact after canonical inspection. Any current-contract
+creation drift, including a changed Router host port, image, mount, device, or
+security option, fails before pull or mutation and reports the differences.
+Run `ploinky destroy` explicitly and then recreate; the supervisor has no
+automatic replacement, backup rename, or rollback transaction.
 
-When creation flags are omitted, reconciliation preserves inspected settings
-except for authoritative generated publications. Explicit `--port`,
-`--publish`/`--expose`, `--image`, `--mount`, or `--listen-lan` values
-intentionally change their corresponding desired settings.
-
-Contract 4 is a hard cut. Every non-contract-4 box, including contract 2,
-contract 3, malformed, or provenance-free state, fails before planning,
-pulling, volume creation, or replacement. The supervisor does not
-automatically restart, upgrade, relabel, adopt, or replace it. Run `ploinky
+Contract 5 is a hard cut. Every non-contract-5 box, including contract 4 or
+malformed state, fails before pulling, volume creation, restart, upgrade, or
+replacement. The supervisor does not read it as compatible state or
+automatically migrate, clean, relabel, adopt, or replace it. Run `ploinky
 destroy` explicitly, then run an ordinary command to recreate the box from
-contract 4 while retaining all three named volumes. Legacy basename-only boxes
+contract 5 while retaining all three named volumes. Legacy basename-only boxes
 and volumes are not discoverable through the current identity and remain
 untouched for manual inspection or removal.
 
@@ -141,72 +135,44 @@ remove attached anonymous volumes while retaining all explicitly named
 volumes. If the box is absent, destroy reports any retained named volumes and
 succeeds without prompting or deleting them.
 
-## Ports and graph-aware start
+## Fixed ports and graph-independent start
 
-The selected host router port maps to container port 8080. Core always receives
-`ploinky start <agent> 8080`; after that command succeeds, the supervisor probes
-`http://127.0.0.1:<selected-host-port>/status`. A failed core start does not run
-the router probe.
+The outer wrapper constructs the complete physical-host boundary before a
+workspace exists. Every create and recreate emits exactly:
 
-### Authoritative active-graph publishes
+```text
+127.0.0.1:<selected-host-port>:8080/tcp
+0.0.0.0:7882:7882/udp
+```
 
-Before every one-shot host command that can start an agent (`start`, `enable agent`,
-`cli <agent>`, `shell <agent>`, `restart`, or `reinstall`), an in-box planner
-resolves the requested root, its active transitive dependencies, and any
-additional enabled agents core will start. It reads authoritative repositories,
-registry state, saved profile, branch policy, aliases, and manifest `openPorts`
-from the named workspace. The same generic resolution rules apply to bare,
-slash-qualified, and colon-qualified agent references. For example, in an
-unambiguous boot workspace, `explorer`, `AchillesIDE/explorer`, and
-`AchillesIDE:explorer` resolve to the same canonical root; other agents use the
-same mechanism.
+`--port` changes only `<selected-host-port>`. Outer `--publish`, `--expose`, and
+`--listen-lan` fail before engine discovery. No workspace, graph, profile,
+manifest, readiness result, environment value, label, CLI escape hatch, or
+persisted state can add a third physical-host mapping. A pre-existing host owner
+of UDP `7882` makes creation fail with an actionable owner diagnostic; Ploinky
+does not auto-remap it.
 
-A child that lacks the workspace profile uses its `default` profile; an
-explicit edge-local profile must exist. Selecting different profiles for the
-same effective canonical or aliased instance fails before operational
-mutation. Branch flags are forwarded unchanged, and an inferred source branch
-is appended exactly once only when no explicit branch flag is present.
+After core starts, physical loopback reaches Router public/control `8080`.
+Cloudflared inside the box also uses fixed origin `http://127.0.0.1:8080`,
+regardless of the selected physical port. Router private `8081` is never an outer
+publication. LiveKit is the sole capability-approved in-box owner of UDP
+`7882`; the fixed mapping remains idle when LiveKit is absent.
 
-The planner executes in the running box, or in a unique short-lived container
-from the stopped box's inspected image ID. For a missing box, Ploinky first
-pulls and validates the image, creates the labelled workspace volume, plans in
-a temporary container, and creates the final box from that same image ID.
-Temporary containers and their anonymous volumes are removed on success or
-failure. Repository preparation and the deterministic workspace volume remain
-available for retry when a first plan fails.
+The contract-5 image includes a pinned multi-architecture `cloudflared` binary
+supervised by Ploinky core. Complete credential absence is the explicit
+`local-only` mode: no connector process and no public HTTP hostname. Cloudflare
+mode requires both an existing-tunnel connector token and a separate
+least-privilege API token for DNS/ingress reconciliation. Ploinky creates
+neither quick tunnels nor tunnels. Partial, invalid, or unauthorized
+configuration fails closed in the selected mode, and connector credentials stay
+out of argv, ordinary process environment, logs, status, and diagnostics.
 
-Generated TCP and UDP examples include `8081:8081`, `3478:3478`,
-`3478:3478/udp`, `7882-7892:7882-7892/udp`, and
-`20000-20010:20000-20010/udp`. Internal databases, MCP/control surfaces,
-private health and signaling endpoints, identity providers, LLM APIs, direct
-document-server ports, and router-mediated HTTP services do not belong in
-default `openPorts`. LiveKit/TURN media traffic is a reviewed exception because
-nginx cannot proxy it.
-
-Explicit publish values remain byte-for-byte engine syntax in their original
-order. Ploinky canonicalizes only the terminal target interval and protocol for
-conflict detection and subtracts explicit target coverage from generated
-claims. An explicit `0.0.0.0:3478:3478/udp`, for example, suppresses the
-covered generated UDP socket while leaving TCP and uncovered generated
-subranges intact. Generated wildcard/specific-bind overlaps and other
-same-protocol interval conflicts fail before runtime mutation. Box-side port
-zero is invalid. Runtime-generated ephemeral mappings for an implicit
-AgentServer or `additionalServerPort` remain separate private routes and are not
-declared through `openPorts`.
-
-Every supported box records versioned explicit and generated publication
-provenance in supervisor-owned labels. A later plan preserves explicit
-publishes when they were not restated, removes stale generated publishes, and
-transactionally replaces the box when required. Missing or malformed
-provenance makes the box unsupported instead of guessing which ports an
-operator requested.
-
-The supervisor passes the planned publication coverage into core. A one-shot
-host command may reconcile the outer box before core mutation. A command
-entered inside the REPL, a Marketplace request, or another already-in-box path
-cannot replace its own outer container: it proceeds only when current coverage
-is sufficient, otherwise it fails before registry, profile, hook, router, or
-agent-container mutation and prints a one-shot host command to run.
+Graph ports stay private. `httpServices[].port` creates or reuses one private
+mapping per distinct explicit TCP target, while an omitted port preserves the
+owning agent's primary target. A bridged `openPorts` claim overlapping Router
+TCP `8080`/`8081` or reserved UDP `7882` is rejected. Redis, Postgres, Egress,
+OnlyOffice, Umami, health, storage, AgentServer, and other support listeners may
+exist inside private namespaces but never appear in outer PortBindings.
 
 ## Source, dependencies, and isolation
 
@@ -219,8 +185,8 @@ outer-image rebuild.
 The outer runtime runs as `podman` and contains Bash, Node 24, npm/npx, Git,
 and functional rootless nested Podman. It receives the devices and security
 configuration required by that nested runtime. An explicit `--mount DIR` is a
-writable host grant at `/workspace/mounted`; published ports are loopback-only
-unless `--listen-lan` is explicit.
+writable host grant at `/workspace/mounted`; TCP publication is always the fixed
+loopback Router mapping and LAN listen mode does not exist.
 
 Ordinary agent images intentionally contain neither Podman nor Docker and are
 not granted control of sibling containers. Inside a marked box, every
@@ -230,13 +196,14 @@ even if older workspace state enabled them. Outside a box, existing runtime
 selection behavior remains unchanged.
 
 Every Ploinky-owned nested container carries the exact label
-`io.assistos.ploinky.managed=1`. On each outer-box boot, the entrypoint removes
-running and stopped nested containers matching that exact key/value before
-core starts. It preserves unlabelled containers, other values or near-name
-labels, nested images, and nested named volumes. Enumeration or removal failure
-fails the box self-check instead of continuing with ambiguous state. Manual
-containers are outside Ploinky lifecycle ownership and are not promised
-automatic restart or repair.
+`io.assistos.ploinky.managed=1`. Contract-v5 boot enumerates that exact
+key/value and fails if any retained managed container remains; it never
+deletes, imports, or translates those records. The operator must stop/remove
+managed containers in the old box before explicitly destroying and recreating
+it. Unlabelled containers, other values or near-name labels, nested images, and
+nested named volumes remain untouched. Enumeration failure also fails the box
+self-check. Manual containers are outside Ploinky lifecycle ownership and are
+not promised automatic restart or repair.
 
 Before Podman opens the retained graph root, the entrypoint removes only its
 transient `/tmp/storage-run-<uid>` and `/tmp/podman-run-<uid>` process/lock
@@ -244,7 +211,7 @@ state from the outer container filesystem. These paths are not the named
 nested-storage volume; container records, images, and nested named volumes stay
 retained. Failure to clear stale run state aborts boot.
 
-Contract-4 boot requires rootless Podman 5.4 or newer, the Netavark network
+Contract-5 boot requires rootless Podman 5.4 or newer, the Netavark network
 backend, and an operational `pasta` executable. Any failed prerequisite aborts
 self-check; managed networking has no `slirp4netns` fallback. The image is
 built from an immutable `quay.io/podman/stable` index digest that contains both
@@ -262,16 +229,27 @@ Every managed `default` or `bridge` container is created with exactly
 `--hosts-file=none --add-host
 host.containers.internal:host-gateway`. Its router endpoint is injected as
 `PLOINKY_ROUTER_HOST=host.containers.internal`, the validated
-`PLOINKY_ROUTER_PORT`, and the matching `PLOINKY_ROUTER_URL`. `host` mode uses
-`127.0.0.1` for the same endpoint variables. `none` receives none of them.
-There is no generated hosts-file bind. Router readiness probes the explicit
-IPv4 listener through `127.0.0.1`; `RoutingServer.js` listens on `0.0.0.0` and
-does not create a Unix listener.
+`PLOINKY_ROUTER_PORT`, and the matching `PLOINKY_ROUTER_URL`. Consumers also
+receive `PLOINKY_INTERNAL_ROUTER_URL` and the read-only non-secret snapshot named
+by `PLOINKY_EDGE_TOPOLOGY_FILE` before start. Capability-approved `host` mode
+uses box loopback; `none` receives no Router endpoint. Router owns public/control
+TCP `8080`, managed-private `8081`, and detailed health on an unmounted
+supervisor Unix socket.
 
-This topology makes wildcard- or gateway-bound services in the outer box
-reachable from managed bridges. Box services bound only to loopback, and Unix
-sockets, remain unreachable. A direct reachable service does not inherit
-router authentication: it must implement its own authorization. Routed MCP
+The mounted topology distinguishes three values: the immutable route-and-policy
+authorization generation revalidated before dial, a content-derived
+configuration generation for stable non-secret consumer inputs, and a monotonic
+publication generation for readiness/publication state. Its browser projection
+is authenticated and `no-store`, returns only one active locator plus
+configuration/publication ids, and reveals no authorization id or inventory.
+Long-term TURN material stays in Ploinky core; the private broker returns only
+rate-limited short-lived credentials and expiry to exact current-generation
+consumers.
+
+Network reachability does not inherit router authentication. Private service
+calls require compiled authenticated policy plus an exact current-instance and
+current-generation assertion; TCP admin/control still requires a real admin
+session and mutations require Origin/CSRF. Routed MCP
 calls continue to enforce the router's JWT issuer/audience, policy, request
 binding, expiry, and replay checks. The historical `ploinky-router` network
 alias is no longer reserved; `ploinky-router` remains the authentication
@@ -280,7 +258,7 @@ issuer/audience identity where specified.
 ## Status, shutdown, and destruction
 
 `ploinky status` is strictly read-only. It reports missing, stopped, compatible,
-unsupported, and unhealthy outer state, configured publishes, the observed image
+unsupported, and unhealthy outer state, normalized exact publications, the observed image
 contract, and core status only when the outer runtime is already running. It
 does not pull, create, start, stop, remove, or reconcile.
 
@@ -304,10 +282,10 @@ INSTANCE=ploinky-box-WORKSPACE-PATHHASH
 $ENGINE volume rm "$INSTANCE-workspace" "$INSTANCE-containers" "$INSTANCE-ploinky-deps"
 ```
 
-A failed first-start plan may leave only the labelled workspace volume. Remove
-that exact volume with the same engine command only when its prepared checkout
-state is not needed. If boot cleanup repeatedly fails because nested storage is
-corrupt, inspect and back up `$INSTANCE-containers`, remove the outer box, and
+A failed first create may leave only labelled instance volumes. Remove an exact
+volume with the same engine command only when its retained state is not needed.
+If boot cleanup repeatedly fails because nested storage is corrupt, inspect and
+back up `$INSTANCE-containers`, remove the outer box, and
 remove only that volume when its cached images, container records, and nested
 volumes may be lost; ordinary destroy/recreate deliberately preserves it and
 can repeat the failure.
@@ -322,7 +300,7 @@ LEGACY_INSTANCE=ploinky-box-OLDNAME
 $ENGINE rm -f "$LEGACY_INSTANCE"
 ```
 
-For the contract-4 direct/core cutover, invoke the old checkout's core entry
+For the contract-5 direct/core cutover, invoke the old checkout's core entry
 directly before installing or invoking the new release:
 
 ```sh
@@ -336,21 +314,53 @@ resources rather than adopting them. After confirming no container references
 them, remove only the exact stale `.ploinky/run/router.sock` and
 `.ploinky/run/managed-hosts` paths and the unreferenced cached image
 `docker.io/assistos/ploinky-network-gateway:1@sha256:68c47ce93d16ea1a2d03944f7b50ce82e6f2f9a26b183d2c9c7fbabcc828fb7e`.
-Do not use a broad container, image, volume, or network prune.
+Before v5 activation, revoke the retired publication connector/API tokens and
+delete its plaintext retained state. Contract 5 has no migration or cleanup
+reader for it. Do not use a broad container, image, volume, or network prune.
 
 ## Smoke and release ordering
 
 `node container/smoke-runtime.mjs` is the real engine-backed public-entrypoint
-smoke. It checks that help creates nothing, an ordinary command starts the
-runtime, nested `podman version` and `podman info` work, combined status works,
-stop is idempotent, confirmed destruction retains labelled volumes, and a
-recreated box observes retained markers in the workspace, nested storage, and
-dependency volumes. The script accepts
+smoke. After initial create and explicit recreate it normalizes exhaustive
+`HostConfig.PortBindings` and `podman port` output and requires exactly loopback
+selected-port to `8080/tcp` plus wildcard `7882:7882/udp`. It also proves
+loopback Router reachability, LAN refusal, absence of private `8081` and all
+forbidden third mappings, actionable UDP-owner conflict, and profile-specific
+in-box `ss -H -lntup` ownership. The script accepts
 `SMOKE_IMAGE` and `SMOKE_PORT` overrides; engine selection remains automatic.
 
 The publication workflow moves the mutable `:runtime` channel only after
-native amd64 and arm64 candidates both pass contract, hard-cut persistence,
-network-isolation, router-restart, and nested-Podman gates. Each native job
+native amd64 and arm64 candidates both pass contract, integrated pinned
+cloudflared, exact-port, network-isolation, router-restart, and nested-Podman
+gates. Each native job
 emits its Podman, Netavark, and `pasta` evidence before release promotion.
-The supervisor consults that channel only for create or replacement and keeps
+The supervisor consults that channel only for create and keeps
 existing boxes pinned to their inspected IDs.
+
+The principal functional release gate runs the existing Explorer two-account
+WebMeet smoke against a freshly built v5 box:
+
+```bash
+cd ../AssistOSExplorer/tests/smoke
+SMOKE_BASE_URL=http://127.0.0.1:8080 \
+SMOKE_WEBMEET_MEDIA=1 \
+SMOKE_WEBMEET_SCREEN=1 \
+SMOKE_TEST_TIMEOUT_MS=240000 \
+npm test -- --headed --project=chromium specs/30-webmeet-room-chat.spec.mjs
+```
+
+With screen mode enabled, missing or identical accounts are failures, not
+skips. The test must use two isolated browser contexts and prove screen-share
+publication, remote screen-track attachment/readiness, and screen-specific RTP
+growth in both directions through real Router signaling, LiveKit, and the box
+UDP mapping. The runner uses a deterministic virtual display when the host has
+no usable display and retains redacted trace/video/screenshot, selected ICE
+pair, publication, and RTP diagnostics on failure.
+
+A separate infrastructure gate runs on native Linux amd64 and arm64 with two
+browsers on distinct external networks. It must select the configured public
+IPv4 at UDP `7882`, never TCP `7881` or a discovered/private alternative, then
+repeat with direct SFU UDP blocked to prove external TURN/UDP and with a
+TCP/TLS-only network to prove external TURN/TLS. Absent architectures, distinct
+networks, test accounts, Cloudflare resources, or TURN credentials block release
+rather than weakening or skipping these lanes.

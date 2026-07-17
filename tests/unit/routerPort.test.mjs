@@ -7,10 +7,12 @@ import path from 'node:path';
 import {
     assertRouterEndpoint,
     buildRouterEndpoint,
+    parseRouterHostPort,
     parseRouterPort,
     resolveInitialRouterPort,
     resolvePersistedRouterPort,
     resolveRouterEndpoint,
+    selectedRouterHostPort,
 } from '../../cli/services/routerPort.js';
 
 function tempRouting(contents) {
@@ -23,18 +25,26 @@ function tempRouting(contents) {
     return { root, routingFile };
 }
 
-test('parseRouterPort accepts exact boundary and non-default values', () => {
-    assert.equal(parseRouterPort(1), 1);
-    assert.equal(parseRouterPort('1'), 1);
-    assert.equal(parseRouterPort('08097'), 8097);
-    assert.equal(parseRouterPort(65535), 65535);
-    assert.equal(parseRouterPort('65535'), 65535);
+test('parseRouterPort accepts only the fixed in-box Router port', () => {
+    assert.equal(parseRouterPort(8080), 8080);
+    assert.equal(parseRouterPort('8080'), 8080);
+});
+
+test('selected physical Router host port comes only from the supervisor environment', () => {
+    assert.equal(selectedRouterHostPort({ PLOINKY_ROUTER_HOST_PORT: '19194' }), 19194);
+    assert.equal(selectedRouterHostPort({}), 8080);
+    assert.equal(parseRouterHostPort(65535), 65535);
+    for (const value of ['019194', ' 19194', '19194 ', '19194x', '', null, true, 0, 65536, 1.5]) {
+        assert.throws(() => parseRouterHostPort(value), {
+            code: 'PLOINKY_ROUTER_HOST_PORT_INVALID',
+        });
+    }
 });
 
 test('parseRouterPort rejects missing, signed, fractional, padded, junk, and out-of-range inputs', () => {
     const invalid = [
-        undefined, null, '', ' ', ' 8080', '8080 ', '+8080', '-1',
-        '1.5', 1.5, '8080x', '0', 0, '65536', 65536, Number.MAX_SAFE_INTEGER,
+        undefined, null, '', ' ', ' 8080', '8080 ', '08080', '+8080', '-1',
+        '1.5', 1.5, '8080x', '0', 0, '1', 1, '8097', 8097, '65536', 65536, Number.MAX_SAFE_INTEGER,
         '９', '1e3', {}, [], true,
     ];
     for (const value of invalid) {
@@ -57,19 +67,20 @@ test('only initial resolution may choose 8080 when no port has been persisted', 
     }
 });
 
-test('persisted resolution is strict and explicit ports must match', () => {
-    const { root, routingFile } = tempRouting(JSON.stringify({ port: '8097', routes: {} }));
+test('persisted resolution rejects every pre-v5 non-fixed inner port', () => {
+    const { root, routingFile } = tempRouting(JSON.stringify({ port: '8080', routes: {} }));
     try {
-        assert.equal(resolvePersistedRouterPort({ routingFile }), 8097);
-        assert.equal(resolvePersistedRouterPort({ explicitPort: 8097, routingFile }), 8097);
+        assert.equal(resolvePersistedRouterPort({ routingFile }), 8080);
+        assert.equal(resolvePersistedRouterPort({ explicitPort: 8080, routingFile }), 8080);
         assert.throws(
-            () => resolvePersistedRouterPort({ explicitPort: '8098', routingFile }),
-            { code: 'PLOINKY_ROUTER_PORT_MISMATCH' },
+            () => resolvePersistedRouterPort({ explicitPort: '8097', routingFile }),
+            { code: 'PLOINKY_ROUTER_PORT_INVALID' },
         );
-        assert.throws(
-            () => resolveInitialRouterPort({ explicitPort: 8080, routingFile }),
-            { code: 'PLOINKY_ROUTER_PORT_MISMATCH' },
-        );
+        assert.equal(resolveInitialRouterPort({ explicitPort: 8080, routingFile }), 8080);
+        fs.writeFileSync(routingFile, JSON.stringify({ port: 8097, routes: {} }));
+        assert.throws(() => resolvePersistedRouterPort({ routingFile }), {
+            code: 'PLOINKY_ROUTER_PORT_INVALID',
+        });
     } finally {
         fs.rmSync(root, { recursive: true, force: true });
     }
@@ -98,20 +109,20 @@ test('corrupt persisted router ports fail instead of becoming defaults', () => {
 });
 
 test('endpoint matrix is canonical for default, bridge, host, and none', () => {
-    const { root, routingFile } = tempRouting(JSON.stringify({ port: 49123 }));
+    const { root, routingFile } = tempRouting(JSON.stringify({ port: 8080 }));
     try {
         for (const mode of ['default', 'bridge']) {
-            assert.deepEqual(resolveRouterEndpoint(mode, { routingFile }), buildRouterEndpoint(mode, 49123));
+            assert.deepEqual(resolveRouterEndpoint(mode, { routingFile }), buildRouterEndpoint(mode, 8080));
             assert.deepEqual(resolveRouterEndpoint(mode, { routingFile }).env, {
                 PLOINKY_ROUTER_HOST: 'host.containers.internal',
-                PLOINKY_ROUTER_PORT: '49123',
-                PLOINKY_ROUTER_URL: 'http://host.containers.internal:49123',
+                PLOINKY_ROUTER_PORT: '8080',
+                PLOINKY_ROUTER_URL: 'http://host.containers.internal:8080',
             });
         }
         assert.deepEqual(resolveRouterEndpoint('host', { routingFile }).env, {
             PLOINKY_ROUTER_HOST: '127.0.0.1',
-            PLOINKY_ROUTER_PORT: '49123',
-            PLOINKY_ROUTER_URL: 'http://127.0.0.1:49123',
+            PLOINKY_ROUTER_PORT: '8080',
+            PLOINKY_ROUTER_URL: 'http://127.0.0.1:8080',
         });
         assert.equal(resolveRouterEndpoint('none', { routingFile }), null);
     } finally {
@@ -145,12 +156,12 @@ test('none mode never reads or validates router ports and requires explicit null
 });
 
 test('assertRouterEndpoint rejects arbitrary host, URL, and env overrides', () => {
-    const expected = buildRouterEndpoint('bridge', 8097);
+    const expected = buildRouterEndpoint('bridge', 8080);
     assert.deepEqual(assertRouterEndpoint(expected, 'bridge'), expected);
     for (const endpoint of [
         { ...expected, host: 'host.docker.internal' },
-        { ...expected, url: 'http://127.0.0.1:8097' },
-        { ...expected, env: { ...expected.env, PLOINKY_ROUTER_PORT: '8080' } },
+        { ...expected, url: 'http://127.0.0.1:8080' },
+        { ...expected, env: { ...expected.env, PLOINKY_ROUTER_PORT: '8097' } },
     ]) {
         assert.throws(() => assertRouterEndpoint(endpoint, 'bridge'), {
             code: 'PLOINKY_ROUTER_ENDPOINT_INVALID',

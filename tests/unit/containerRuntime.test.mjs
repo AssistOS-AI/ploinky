@@ -51,17 +51,19 @@ test('buildRuntimeRouterEnv uses the validated managed box-host endpoint', () =>
         const result = runModuleSnippet(
             `const { buildRuntimeRouterEnv } = await import(${JSON.stringify(agentServiceManagerUrl)});
 const { buildRouterEndpoint } = await import(${JSON.stringify(pathToFileURL(path.join(repoRoot, 'cli/services/routerPort.js')).href)});
-const routerEndpoint = buildRouterEndpoint('default', 8097);
-process.stdout.write(JSON.stringify(buildRuntimeRouterEnv('podman', { networkMode: 'default', routerPort: 8097, routerEndpoint })));`,
+const routerEndpoint = buildRouterEndpoint('default', 8080);
+process.stdout.write(JSON.stringify(buildRuntimeRouterEnv('podman', { networkMode: 'default', routerPort: 8080, routerEndpoint })));`,
             {},
             { cwd: workspaceDir },
         );
 
         assert.equal(result.status, 0, result.stderr);
         assert.deepEqual(JSON.parse(result.stdout), {
-            PLOINKY_ROUTER_PORT: '8097',
+            PLOINKY_ROUTER_PORT: '8080',
             PLOINKY_ROUTER_HOST: 'host.containers.internal',
-            PLOINKY_ROUTER_URL: 'http://host.containers.internal:8097',
+            PLOINKY_ROUTER_URL: 'http://host.containers.internal:8080',
+            PLOINKY_INTERNAL_ROUTER_URL: 'http://host.containers.internal:8081',
+            PLOINKY_EDGE_TOPOLOGY_FILE: '/run/ploinky-edge-topology/current.json',
         });
     } finally {
         fs.rmSync(workspaceDir, { recursive: true, force: true });
@@ -72,12 +74,12 @@ test('buildRuntimeRouterEnv receives the same validated endpoint for Docker buil
     const workspaceDir = tempDir();
     try {
         fs.mkdirSync(path.join(workspaceDir, '.ploinky'), { recursive: true });
-        fs.writeFileSync(path.join(workspaceDir, '.ploinky/routing.json'), JSON.stringify({ port: 8097 }));
+        fs.writeFileSync(path.join(workspaceDir, '.ploinky/routing.json'), JSON.stringify({ port: 8080 }));
 
         const result = runModuleSnippet(
             `const { buildRuntimeRouterEnv } = await import(${JSON.stringify(agentServiceManagerUrl)});
 const { buildRouterEndpoint } = await import(${JSON.stringify(pathToFileURL(path.join(repoRoot, 'cli/services/routerPort.js')).href)});
-const routerEndpoint = buildRouterEndpoint('bridge', 8097);
+const routerEndpoint = buildRouterEndpoint('bridge', 8080);
 process.stdout.write(JSON.stringify(buildRuntimeRouterEnv('docker', { networkMode: 'bridge', routerEndpoint })));`,
             {},
             { cwd: workspaceDir },
@@ -85,9 +87,11 @@ process.stdout.write(JSON.stringify(buildRuntimeRouterEnv('docker', { networkMod
 
         assert.equal(result.status, 0, result.stderr);
         assert.deepEqual(JSON.parse(result.stdout), {
-            PLOINKY_ROUTER_PORT: '8097',
+            PLOINKY_ROUTER_PORT: '8080',
             PLOINKY_ROUTER_HOST: 'host.containers.internal',
-            PLOINKY_ROUTER_URL: 'http://host.containers.internal:8097',
+            PLOINKY_ROUTER_URL: 'http://host.containers.internal:8080',
+            PLOINKY_INTERNAL_ROUTER_URL: 'http://host.containers.internal:8081',
+            PLOINKY_EDGE_TOPOLOGY_FILE: '/run/ploinky-edge-topology/current.json',
         });
     } finally {
         fs.rmSync(workspaceDir, { recursive: true, force: true });
@@ -150,73 +154,6 @@ process.stdout.write(JSON.stringify(plan));`,
             requiresManagedNetwork: true,
             hashEnv: { PLOINKY_NETWORK_MODE: 'default' },
         });
-    } finally {
-        fs.rmSync(workspaceDir, { recursive: true, force: true });
-    }
-});
-
-test('ensureImagePresent builds the managed web-publishing image when registry pull fails', () => {
-    const workspaceDir = tempDir();
-    const image = 'docker.io/assistos/web-publishing-agent:node24-nginx-cloudflared';
-    const contextPath = path.join(
-        workspaceDir,
-        '.ploinky',
-        'repos',
-        'container-image-builds',
-        'images',
-        'web-publishing-agent',
-    );
-    const fakeRuntime = path.join(workspaceDir, 'fake-runtime.sh');
-    const callsFile = path.join(workspaceDir, 'runtime-calls.txt');
-
-    try {
-        fs.mkdirSync(contextPath, { recursive: true });
-        fs.writeFileSync(path.join(contextPath, 'Dockerfile'), 'FROM scratch\n');
-        writeExecutable(fakeRuntime, `#!/bin/sh
-printf '%s\\n' "$*" >> "$CALLS_FILE"
-if [ "$1" = "image" ] && [ "$2" = "inspect" ]; then
-  exit 1
-fi
-if [ "$1" = "pull" ]; then
-  exit 125
-fi
-if [ "$1" = "build" ]; then
-  exit 0
-fi
-exit 99
-`);
-
-        const result = runModuleSnippet(
-            `import fs from 'node:fs';
-const { ensureImagePresent } = await import(${JSON.stringify(dockerCommonUrl)});
-const logs = [];
-const changed = ensureImagePresent(${JSON.stringify(image)}, {
-  runtime: ${JSON.stringify(fakeRuntime)},
-  log(message) { logs.push(message); },
-  pullTimeoutMs: 1000,
-  buildTimeoutMs: 1000,
-});
-process.stdout.write(JSON.stringify({
-  changed,
-  logs,
-  calls: fs.readFileSync(${JSON.stringify(callsFile)}, 'utf8').trim().split(/\\n+/),
-}));`,
-            { CALLS_FILE: callsFile },
-            { cwd: workspaceDir },
-        );
-
-        assert.equal(result.status, 0, result.stderr);
-        const output = JSON.parse(result.stdout);
-        assert.equal(output.changed, true);
-        assert.deepEqual(output.calls, [
-            `image inspect ${image}`,
-            `pull ${image}`,
-            `build -t ${image} ${contextPath}`,
-        ]);
-        assert.equal(
-            output.logs.some((entry) => entry.includes('building from container-image-builds/images/web-publishing-agent')),
-            true,
-        );
     } finally {
         fs.rmSync(workspaceDir, { recursive: true, force: true });
     }
@@ -296,7 +233,7 @@ try {
     }
 });
 
-test('parseManifestPorts widens loopback binds inside ploinky box runtime', () => {
+test('parseManifestPorts rejects reserved Router TCP and LiveKit UDP box-side ranges', () => {
     const workspaceDir = tempDir();
     const markerPath = path.join(workspaceDir, 'etc-ploinky-box');
     try {
@@ -304,36 +241,29 @@ test('parseManifestPorts widens loopback binds inside ploinky box runtime', () =
         const result = runModuleSnippet(
             `const { parseManifestPorts, isPloinkyBoxRuntime } = await import(${JSON.stringify(dockerCommonUrl)});
 const manifest = {};
-const profile = { openPorts: ['127.0.0.1:8081:8081', '127.0.0.1:7882-7892:7882-7892/udp'] };
-process.stdout.write(JSON.stringify({
-  marker: isPloinkyBoxRuntime(${JSON.stringify(markerPath)}),
-  ports: parseManifestPorts(manifest, profile, { boxMarkerPath: ${JSON.stringify(markerPath)} })
-}));`,
+const results = [];
+for (const spec of ['127.0.0.1:8080:9000', '127.0.0.1:8079-8081:9000-9002', '127.0.0.1:7882:7882/udp', '127.0.0.1:7880-7884:9000-9004/udp']) {
+  try {
+    parseManifestPorts(manifest, { openPorts: [spec] }, { boxMarkerPath: ${JSON.stringify(markerPath)} });
+    results.push({ spec, accepted: true });
+  } catch (error) {
+    results.push({ spec, code: error.code, message: error.message });
+  }
+}
+process.stdout.write(JSON.stringify({ marker: isPloinkyBoxRuntime(${JSON.stringify(markerPath)}), results }));`,
             {},
             { cwd: workspaceDir },
         );
 
         assert.equal(result.status, 0, result.stderr);
-        assert.deepEqual(JSON.parse(result.stdout), {
-            marker: true,
-            ports: {
-                publishArgs: ['0.0.0.0:8081:8081', '0.0.0.0:7882-7892:7882-7892/udp'],
-                portMappings: [
-                    { hostPort: 8081, containerPort: 8081, hostIp: '0.0.0.0', protocol: 'tcp' },
-                    { hostPort: 7882, containerPort: 7882, hostIp: '0.0.0.0', protocol: 'udp' },
-                    { hostPort: 7883, containerPort: 7883, hostIp: '0.0.0.0', protocol: 'udp' },
-                    { hostPort: 7884, containerPort: 7884, hostIp: '0.0.0.0', protocol: 'udp' },
-                    { hostPort: 7885, containerPort: 7885, hostIp: '0.0.0.0', protocol: 'udp' },
-                    { hostPort: 7886, containerPort: 7886, hostIp: '0.0.0.0', protocol: 'udp' },
-                    { hostPort: 7887, containerPort: 7887, hostIp: '0.0.0.0', protocol: 'udp' },
-                    { hostPort: 7888, containerPort: 7888, hostIp: '0.0.0.0', protocol: 'udp' },
-                    { hostPort: 7889, containerPort: 7889, hostIp: '0.0.0.0', protocol: 'udp' },
-                    { hostPort: 7890, containerPort: 7890, hostIp: '0.0.0.0', protocol: 'udp' },
-                    { hostPort: 7891, containerPort: 7891, hostIp: '0.0.0.0', protocol: 'udp' },
-                    { hostPort: 7892, containerPort: 7892, hostIp: '0.0.0.0', protocol: 'udp' },
-                ],
-            },
-        });
+        const output = JSON.parse(result.stdout);
+        assert.equal(output.marker, true);
+        assert.equal(output.results.length, 4);
+        for (const record of output.results) {
+            assert.equal(record.accepted, undefined, record.spec);
+            assert.equal(record.code, 'PLOINKY_RESERVED_BOX_PORT', record.spec);
+            assert.match(record.message, /overlaps reserved port (8080|8081|7882)/, record.spec);
+        }
     } finally {
         fs.rmSync(workspaceDir, { recursive: true, force: true });
     }
@@ -485,20 +415,50 @@ test('global enabled agents keep workspace projectPath and declare persistent /r
     const binDir = tempDir('ploinky-fake-runtime-');
     try {
         const stateFile = path.join(binDir, 'container-name.txt');
+        const runningFile = path.join(binDir, 'container-running.txt');
         const argsFile = path.join(binDir, 'run-args.txt');
+        const inspectHelper = path.join(binDir, 'inspect-helper.mjs');
         const podmanPath = path.join(binDir, 'podman');
+        fs.writeFileSync(inspectHelper, `
+import fs from 'node:fs';
+const [argsPath, statePath, runningPath] = process.argv.slice(2);
+const args = fs.readFileSync(argsPath, 'utf8').split(/\\r?\\n/).filter(Boolean);
+const labels = {};
+for (let index = 0; index < args.length; index += 1) {
+  if (args[index] !== '--label') continue;
+  const [key, ...value] = String(args[index + 1] || '').split('=');
+  labels[key] = value.join('=');
+}
+const running = fs.existsSync(runningPath);
+process.stdout.write(JSON.stringify([{
+  Id: 'candidate1234567890',
+  Name: fs.readFileSync(statePath, 'utf8').trim(),
+  Config: { Labels: labels },
+  HostConfig: { NetworkMode: 'none' },
+  NetworkSettings: { Networks: {} },
+  State: { Running: running, Status: running ? 'running' : 'configured' },
+}]));
+`);
         fs.writeFileSync(
             podmanPath,
             `#!/bin/sh
+emit_inspect() {
+  [ -f ${JSON.stringify(stateFile)} ] || exit 1
+  ${JSON.stringify(process.execPath)} ${JSON.stringify(inspectHelper)} ${JSON.stringify(argsFile)} ${JSON.stringify(stateFile)} ${JSON.stringify(runningFile)}
+}
 case "$1" in
   image)
     exit 0
     ;;
   inspect)
-    exit 1
+    emit_inspect
+    ;;
+  container)
+    [ "$2" = "inspect" ] || exit 1
+    emit_inspect
     ;;
   create)
-    printf '%s\\n' "$*" > ${JSON.stringify(argsFile)}
+    printf '%s\\n' "$@" > ${JSON.stringify(argsFile)}
     name=""
     prev=""
     for arg in "$@"; do
@@ -506,6 +466,10 @@ case "$1" in
       prev="$arg"
     done
     printf '%s\\n' "$name" > ${JSON.stringify(stateFile)}
+    exit 0
+    ;;
+  start)
+    : > ${JSON.stringify(runningFile)}
     exit 0
     ;;
   ps)
@@ -528,14 +492,29 @@ esac
         fs.writeFileSync(path.join(agentDir, 'manifest.json'), JSON.stringify({
             container: 'example/demo:latest',
             start: 'sleep 3600',
-            network: { mode: 'host' },
+            network: { mode: 'none' },
             readiness: { protocol: 'none' },
         }));
-        fs.writeFileSync(path.join(workspaceDir, '.ploinky', 'routing.json'), JSON.stringify({ port: 8123, routes: {} }));
+        fs.writeFileSync(path.join(workspaceDir, '.ploinky', 'routing.json'), JSON.stringify({ port: 8080, routes: {} }));
+        fs.writeFileSync(path.join(workspaceDir, '.ploinky', 'agents.json'), '{}');
+        fs.mkdirSync(path.join(workspaceDir, '.ploinky', 'data', 'router-security'), { recursive: true });
+        fs.writeFileSync(
+            path.join(workspaceDir, '.ploinky', 'data', 'router-security', 'policy-state.json'),
+            JSON.stringify({ schema: 'router-policy', httpRoutes: [], mcpTools: [] }),
+        );
+        fs.mkdirSync(path.join(workspaceDir, '.ploinky', 'data', 'edge-routing'), { recursive: true });
+        fs.writeFileSync(
+            path.join(workspaceDir, '.ploinky', 'data', 'edge-routing', 'desired.json'),
+            JSON.stringify({
+                schemaVersion: 1,
+                hosts: {},
+                security: { hostNetworkAllowedInstances: [], internalServiceConsumers: {} },
+            }),
+        );
 
         const result = runModuleSnippet(
             `const { enableAgent } = await import(${JSON.stringify(pathToFileURL(path.join(repoRoot, 'cli/services/agents.js')).href)});
-enableAgent('repo/demo', 'global');
+await enableAgent('repo/demo', 'global');
 const fs = await import('node:fs');
 const path = await import('node:path');
 const agents = JSON.parse(fs.readFileSync(path.join(process.cwd(), '.ploinky', 'agents.json'), 'utf8'));
@@ -577,7 +556,7 @@ test('enable rejects a missing persisted router port before registry mutation', 
 
         const result = runModuleSnippet(
             `const { enableAgent } = await import(${JSON.stringify(pathToFileURL(path.join(repoRoot, 'cli/services/agents.js')).href)});
-enableAgent('repo/demo', 'global');`,
+await enableAgent('repo/demo', 'global');`,
             {},
             { cwd: workspaceDir },
         );
@@ -816,6 +795,63 @@ test('preinstall deduplication is process-local and repo scoped', () => {
 
     assert.equal(hasPreinstallRunInProcess(agentName, 'repo-one', 'dev'), true);
     assert.equal(hasPreinstallRunInProcess(agentName, 'repo-two', 'dev'), false);
+});
+
+test('host-mode capability denial occurs before the manifest preinstall hook', () => {
+    const workspaceDir = tempDir('ploinky-host-capability-');
+    try {
+        const agentDir = path.join(workspaceDir, '.ploinky', 'repos', 'repo', 'demo');
+        const marker = path.join(workspaceDir, 'host-hook-ran');
+        fs.mkdirSync(agentDir, { recursive: true });
+        writeExecutable(path.join(agentDir, 'preinstall.sh'), `#!/bin/sh\nprintf ran > ${JSON.stringify(marker)}\n`);
+        const manifest = {
+            container: 'example/demo@sha256:' + 'a'.repeat(64),
+            start: 'sleep 3600',
+            network: { mode: 'host' },
+            profiles: { default: { preinstall: 'preinstall.sh' } },
+            readiness: { protocol: 'none' },
+        };
+        fs.writeFileSync(path.join(agentDir, 'manifest.json'), JSON.stringify(manifest));
+        fs.mkdirSync(path.join(workspaceDir, '.ploinky'), { recursive: true });
+        fs.writeFileSync(path.join(workspaceDir, '.ploinky', 'agents.json'), JSON.stringify({
+            test_host: {
+                type: 'agent',
+                repoName: 'repo',
+                agentName: 'demo',
+                projectPath: workspaceDir,
+                runMode: 'global',
+                instanceId: 'instance-current',
+                enableGeneration: 'enable-current',
+            },
+        }));
+        fs.writeFileSync(path.join(workspaceDir, '.ploinky', 'routing.json'), JSON.stringify({ static: { port: 8080 }, routes: {} }));
+
+        const result = runModuleSnippet(
+            `const fs = await import('node:fs');
+const { startAgentContainer } = await import(${JSON.stringify(agentServiceManagerUrl)});
+const { buildRouterEndpoint } = await import(${JSON.stringify(pathToFileURL(path.join(repoRoot, 'cli/services/routerPort.js')).href)});
+const manifest = JSON.parse(fs.readFileSync(${JSON.stringify(path.join(agentDir, 'manifest.json'))}, 'utf8'));
+try {
+  startAgentContainer('demo', manifest, ${JSON.stringify(agentDir)}, {
+    containerName: 'test_host',
+    profileName: 'default',
+    routerEndpoint: buildRouterEndpoint('host', 8080),
+    runtimeIdentity: { instanceId: 'instance-current', enableGeneration: 'enable-current' },
+  });
+  console.log('UNEXPECTED_SUCCESS');
+} catch (error) {
+  console.log(error.code || error.message);
+}`,
+            { CONTAINER_RUNTIME: 'podman' },
+            { cwd: workspaceDir },
+        );
+
+        assert.equal(result.status, 0, result.stderr);
+        assert.match(result.stdout, /EDGE_GENERATION_INACTIVE|HOST_MODE_CAPABILITY_DENIED/);
+        assert.equal(fs.existsSync(marker), false, 'denied host mode must not execute preinstall');
+    } finally {
+        fs.rmSync(workspaceDir, { recursive: true, force: true });
+    }
 });
 
 test('resetPreinstallRunInProcess clears the in-process dedup set', () => {

@@ -82,13 +82,28 @@ function managedNetworkRecord(identity, logicalName, name, containers = {}) {
     };
 }
 
-function managedAgentLabels(identity, network, contractHash = networkContractHash(network), extra = {}) {
+const TEST_RUNTIME_IDENTITY = Object.freeze({
+    instanceId: 'instance-current',
+    enableGeneration: 'enable-current',
+});
+
+function managedAgentLabels(
+    identity,
+    network,
+    contractHash = networkContractHash(network),
+    extra = {},
+    runtimeIdentity = TEST_RUNTIME_IDENTITY,
+) {
     return {
         [NETWORK_LABELS.managed]: '1',
         [NETWORK_LABELS.resource]: 'agent',
         [NETWORK_LABELS.schema]: '2',
         [NETWORK_LABELS.workspace]: identity.hash,
         [NETWORK_LABELS.contract]: contractHash,
+        ...(runtimeIdentity ? {
+            [NETWORK_LABELS.instanceId]: runtimeIdentity.instanceId,
+            [NETWORK_LABELS.enableGeneration]: runtimeIdentity.enableGeneration,
+        } : {}),
         ...extra,
     };
 }
@@ -401,6 +416,110 @@ test('host and none contract inspection does not require managed bridge host fie
     }
 });
 
+test('runtime identity labels bind inspection and label construction to the exact registry tuple', (t) => {
+    const harness = networkHarness(t);
+    const network = canonicalizeNetwork({ mode: 'host' });
+    const id = 'identity123456789';
+    const record = managedAgentRecord({
+        id,
+        name: 'demo-container',
+        labels: managedAgentLabels(harness.identity, network),
+        networks: {},
+        networkMode: 'host',
+        running: true,
+    });
+    harness.containers.set(id, record);
+
+    const exactOptions = {
+        contractHash: networkContractHash(network),
+        ...TEST_RUNTIME_IDENTITY,
+        requireRuntimeIdentity: true,
+    };
+    assert.deepEqual(
+        harness.adapter.inspectContainerContract('demo-container', network, 'demo', exactOptions),
+        { state: 'exact', id },
+    );
+    assert.deepEqual(
+        harness.adapter.inspectContainerContract('demo-container', network, 'demo', {
+            ...exactOptions,
+            enableGeneration: 'enable-stale',
+        }),
+        { state: 'owned-drift', id, reason: 'runtime-identity' },
+    );
+
+    delete record.Config.Labels[NETWORK_LABELS.instanceId];
+    assert.deepEqual(
+        harness.adapter.inspectContainerContract('demo-container', network, 'demo', exactOptions),
+        { state: 'owned-drift', id, reason: 'runtime-identity' },
+    );
+    record.Config.Labels[NETWORK_LABELS.instanceId] = TEST_RUNTIME_IDENTITY.instanceId;
+
+    const labels = labelsFromArgs(harness.adapter.agentIdentityLabelArgs(network, TEST_RUNTIME_IDENTITY));
+    assert.equal(labels[NETWORK_LABELS.instanceId], TEST_RUNTIME_IDENTITY.instanceId);
+    assert.equal(labels[NETWORK_LABELS.enableGeneration], TEST_RUNTIME_IDENTITY.enableGeneration);
+    assert.throws(
+        () => harness.adapter.agentIdentityLabelArgs(network, { instanceId: TEST_RUNTIME_IDENTITY.instanceId }),
+        /exact instanceId and enableGeneration/,
+    );
+    assert.throws(
+        () => harness.adapter.finalizeContainer('demo-container', { mode: 'host', attachments: [] }),
+        /requires exact ownership and runtime-identity labels/,
+    );
+});
+
+test('exact cleanup preserves swapped or stale tuples and removes only the immutable candidate ID', (t) => {
+    const harness = networkHarness(t);
+    const network = canonicalizeNetwork({ mode: 'host' });
+    const id = 'candidate123456789';
+    harness.containers.set(id, managedAgentRecord({
+        id,
+        name: 'livekit-container',
+        labels: managedAgentLabels(harness.identity, network),
+        networks: {},
+        networkMode: 'host',
+        running: true,
+    }));
+    const cleanupOptions = {
+        expectedContainerId: id,
+        contractHash: networkContractHash(network),
+        ...TEST_RUNTIME_IDENTITY,
+    };
+
+    assert.deepEqual(harness.adapter.removeExactContainer(
+        'livekit-container',
+        network,
+        'livekit',
+        { ...cleanupOptions, enableGeneration: 'enable-stale' },
+    ), {
+        removed: false,
+        state: 'owned-drift',
+        id,
+        reason: 'runtime-identity',
+    });
+    assert.equal(harness.containers.has(id), true);
+
+    assert.deepEqual(harness.adapter.removeExactContainer(
+        'livekit-container',
+        network,
+        'livekit',
+        { ...cleanupOptions, expectedContainerId: 'replaced123456789' },
+    ), {
+        removed: false,
+        state: 'absent',
+        id: 'replaced123456789',
+    });
+    assert.equal(harness.containers.has(id), true);
+
+    assert.deepEqual(harness.adapter.removeExactContainer(
+        'livekit-container',
+        network,
+        'livekit',
+        cleanupOptions,
+    ), { removed: true, state: 'removed', id });
+    assert.equal(harness.containers.has(id), false);
+    assert.equal(harness.calls.some((args) => args[0] === 'rm' && args.at(-1) === id), true);
+});
+
 test('reuse validates HostConfig fields, every bridge, and current contract hash without CreateCommand', (t) => {
     const harness = networkHarness(t);
     const network = canonicalizeNetwork({
@@ -533,6 +652,7 @@ test('managed transaction creates multiple attachments, verifies start, and comm
         network,
         canonicalAgentId: 'demo',
         containerName: 'demo-container',
+        runtimeIdentity: TEST_RUNTIME_IDENTITY,
         createContainer(plan) {
             observedPlan = plan;
             const id = 'candidate1234567890';
@@ -556,7 +676,7 @@ test('managed transaction creates multiple attachments, verifies start, and comm
     assert.equal(Object.keys(candidate.NetworkSettings.Networks).length, 2);
 });
 
-test('host-gateway start failure removes the candidate, restores prior current-contract agent, and rolls back new networks', (t) => {
+test('host-gateway start failure removes the candidate and never restores the predecessor runtime', (t) => {
     const harness = networkHarness(t);
     const network = canonicalizeNetwork({ mode: 'default' });
     const previousId = 'previous123456789';
@@ -586,6 +706,7 @@ test('host-gateway start failure removes the candidate, restores prior current-c
         network,
         canonicalAgentId: 'demo',
         containerName: 'demo-container',
+        runtimeIdentity: TEST_RUNTIME_IDENTITY,
         createContainer(plan) {
             const primary = plan.attachments[0];
             const candidate = managedAgentRecord({
@@ -598,12 +719,13 @@ test('host-gateway start failure removes the candidate, restores prior current-c
             harness.networks.get(primary.name).Containers[candidateId] = { Name: candidate.Name };
         },
     }), /host-gateway/);
-    assert.equal([...harness.containers.values()].length, 1);
-    assert.equal(previous.Name, 'demo-container');
-    assert.equal(previous.State.Running, true);
+    assert.equal([...harness.containers.values()].length, 0);
+    assert.equal(previous.State.Running, false);
     assert.equal(harness.networks.size, 0);
     assert.equal(harness.calls.some((args) => args[0] === 'rm' && args.at(-1) === candidateId), true);
-    assert.equal(harness.calls.some((args) => args[0] === 'rename' && args[1] === previousId && args[2] === 'demo-container'), true);
+    assert.equal(harness.calls.some((args) => args[0] === 'rm' && args.at(-1) === previousId), true);
+    assert.equal(harness.calls.some((args) => args[0] === 'rename'), false);
+    assert.equal(harness.calls.some((args) => args[0] === 'start' && args[1] === previousId), false);
 });
 
 test('old contract hashes remain foreign and block replacement before mutation', (t) => {
@@ -620,6 +742,7 @@ test('old contract hashes remain foreign and block replacement before mutation',
         network,
         canonicalAgentId: 'demo',
         containerName: 'demo-container',
+        runtimeIdentity: TEST_RUNTIME_IDENTITY,
         createContainer: () => assert.fail('foreign agent must block candidate creation'),
     }), /network-contract/);
     assert.equal(harness.calls.some((args) => ['stop', 'rename'].includes(args[0])

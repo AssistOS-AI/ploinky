@@ -11,7 +11,7 @@ const providerDir = path.join(tempDir, '.ploinky', 'repos', 'fake', 'fakeProvide
 fs.mkdirSync(path.join(providerDir, 'runtime'), { recursive: true });
 fs.writeFileSync(
     path.join(tempDir, '.ploinky', 'routing.json'),
-    JSON.stringify({ port: 8123, routes: {} }, null, 2),
+    JSON.stringify({ port: 8080, routes: {} }, null, 2),
 );
 fs.writeFileSync(
     path.join(providerDir, 'manifest.json'),

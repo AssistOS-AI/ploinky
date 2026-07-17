@@ -5,11 +5,9 @@ import * as reposSvc from '../../services/repos.js';
 import * as agentsSvc from '../../services/agents.js';
 import * as workspaceSvc from '../../services/workspace.js';
 import { collectLiveAgentContainers } from '../../services/docker/index.js';
-import { isPloinkyBoxRuntime } from '../../services/docker/common.js';
 import { collectAgentsSummary } from '../../services/status.js';
-import { preflightBoxPublicationForCommand } from '../../services/boxPublicationCoverage.js';
-import { resolvePersistedRouterPort } from '../../services/routerPort.js';
 import { isLocalAdminUser } from '../auth/localService.js';
+import { verifyAdminMutationRequest } from '../adminControlSecurity.js';
 import { authService, LOCAL_AUTH_COOKIE_NAME, parseCookies, readJsonBody, sendJson, sessionTokenService, SSO_AUTH_COOKIE_NAME } from './shared.js';
 
 function parseMarketplacePath(pathname = '') {
@@ -70,18 +68,12 @@ function normalizeMarketplaceEnableMode(value) {
 }
 
 export async function enableMarketplaceAgent(body, {
-    preflight = preflightBoxPublicationForCommand,
     enable = agentsSvc.enableAgent,
 } = {}) {
     const ref = normalizeMarketplaceAgentRef(body?.agentRef);
     const mode = normalizeMarketplaceEnableMode(body?.mode || body?.enableMode);
     const repoName = ref.split('/')[0];
-    const routerPort = isPloinkyBoxRuntime() ? resolvePersistedRouterPort() : undefined;
-    await preflight('enable', ['agent', ref], {
-        commandHint: `ploinky enable agent ${ref}${mode === 'isolated' ? '' : ` ${mode}`}`,
-        ...(routerPort === undefined ? {} : { routerPort }),
-    });
-    const result = enable(ref, mode === 'isolated' ? undefined : mode, mode === 'devel' ? repoName : undefined);
+    const result = await enable(ref, mode === 'isolated' ? undefined : mode, mode === 'devel' ? repoName : undefined);
     return { ref, mode, result };
 }
 
@@ -235,6 +227,7 @@ async function ensureMarketplaceUser(req, res) {
 }
 
 export async function handleMarketplaceRoutes(req, res, parsedUrl, {
+    routePlan = null,
     ensureAdmin = ensureMarketplaceAdmin,
     readBody = readJsonBody,
     enableAgentAction = enableMarketplaceAgent,
@@ -255,7 +248,16 @@ export async function handleMarketplaceRoutes(req, res, parsedUrl, {
     }
 
     if (method === 'POST' && !route.resource) {
+        if (routePlan?.lease?.commit && routePlan.lease.commit() !== true) {
+            sendMarketplaceError(res, 503, 'edge_generation_changed');
+            return true;
+        }
         if (!(await ensureAdmin(req, res, parsedUrl))) {
+            return true;
+        }
+        const mutationDecision = verifyAdminMutationRequest(req, req.sessionId);
+        if (!mutationDecision.ok) {
+            sendMarketplaceError(res, 403, mutationDecision.code.toLowerCase(), 'Exact control Origin and CSRF proof are required.');
             return true;
         }
         let body;
@@ -263,6 +265,10 @@ export async function handleMarketplaceRoutes(req, res, parsedUrl, {
             body = await readBody(req);
         } catch (_) {
             sendMarketplaceError(res, 400, 'invalid_json', 'Request body must be valid JSON.');
+            return true;
+        }
+        if (routePlan?.lease?.commit && routePlan.lease.commit() !== true) {
+            sendMarketplaceError(res, 503, 'edge_generation_changed');
             return true;
         }
 
@@ -329,10 +335,6 @@ export async function handleMarketplaceRoutes(req, res, parsedUrl, {
             sendMarketplaceError(res, 400, 'unknown_action', 'Unsupported marketplace action.');
             return true;
         } catch (error) {
-            if (error?.code === 'PLOINKY_OUTER_PUBLICATION_REQUIRED') {
-                sendMarketplaceError(res, 409, 'outer_publication_required', error.message);
-                return true;
-            }
             sendMarketplaceError(res, 400, 'marketplace_action_failed', error?.message || 'Marketplace action failed.');
             return true;
         }

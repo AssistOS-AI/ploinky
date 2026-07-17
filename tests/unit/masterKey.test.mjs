@@ -216,25 +216,25 @@ test('deriveDerivedMasterKey is the derived-master subkey', () => {
 test('deriveAgentSecret derives deterministic per-agent secrets from the derived master key', () => {
     process.env[MASTER_KEY_VAR] = 'e'.repeat(64);
 
-    const dpuKey = deriveAgentSecret({
-        repoName: 'AssistOSExplorer',
-        agentName: 'dpuAgent',
-        name: 'DPU_MASTER_KEY',
+    const alphaKey = deriveAgentSecret({
+        repoName: 'exampleRepo',
+        agentName: 'alphaAgent',
+        name: 'ALPHA_MASTER_KEY',
     });
-    const dpuKeyAgain = deriveAgentSecret({
-        repoName: 'AssistOSExplorer',
-        agentName: 'dpuAgent',
-        name: 'DPU_MASTER_KEY',
+    const alphaKeyAgain = deriveAgentSecret({
+        repoName: 'exampleRepo',
+        agentName: 'alphaAgent',
+        name: 'ALPHA_MASTER_KEY',
     });
-    const livekitKey = deriveAgentSecret({
-        repoName: 'AssistOSExplorer',
-        agentName: 'webmeetLivekitServer',
-        name: 'WEBMEET_LIVEKIT_API_SECRET',
+    const betaKey = deriveAgentSecret({
+        repoName: 'exampleRepo',
+        agentName: 'betaAgent',
+        name: 'BETA_API_SECRET',
     });
 
-    assert.equal(dpuKey.length, 64);
-    assert.equal(dpuKey, dpuKeyAgain);
-    assert.notEqual(dpuKey, livekitKey);
-    assert.notEqual(dpuKey, deriveDerivedMasterKey().toString('hex'));
-    assert.notEqual(dpuKey, resolveMasterKey().toString('hex'));
+    assert.equal(alphaKey.length, 64);
+    assert.equal(alphaKey, alphaKeyAgain);
+    assert.notEqual(alphaKey, betaKey);
+    assert.notEqual(alphaKey, deriveDerivedMasterKey().toString('hex'));
+    assert.notEqual(alphaKey, resolveMasterKey().toString('hex'));
 });

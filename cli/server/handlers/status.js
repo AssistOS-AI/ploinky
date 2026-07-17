@@ -4,6 +4,7 @@ import { spawn } from 'child_process';
 import { fileURLToPath } from 'url';
 
 import * as staticSrv from '../static/index.js';
+import { requireAdminControlRequest } from '../adminControlSecurity.js';
 import { ROUTING_FILE, PLOINKY_WORKSPACE_ROOT } from '../../services/config.js';
 import { getAllServerStatuses } from '../../services/serverManager.js';
 import { loadAgents } from '../../services/workspace.js';
@@ -117,6 +118,8 @@ function collectStaticInfo() {
 function handleStatus(req, res) {
     const parsedUrl = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
     const pathname = parsedUrl.pathname.substring(`/${appName}`.length) || '/';
+
+    if (!requireAdminControlRequest(req, res)) return;
 
     if (pathname.startsWith('/assets/')) {
         const rel = pathname.substring('/assets/'.length);

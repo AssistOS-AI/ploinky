@@ -30,12 +30,16 @@ function renderLoggedOutHtml(nextPath) {
 function renderExternalAccountHtml({
     providerLabel = 'GitHub',
     returnTo = '/',
-    username = ''
+    username = '',
+    agentName = '',
+    includeAgentSelector = true,
 } = {}) {
     const safeReturnTo = escapeHtml(normalizeRelativePath(returnTo, '/'));
     const safeUsername = escapeHtml(username || '');
     const safeProvider = escapeHtml(providerLabel || 'GitHub');
-    const safeLogoutUrl = escapeHtml(`/auth/logout?returnTo=${encodeURIComponent(normalizeRelativePath(returnTo, '/'))}`);
+    const logoutParams = new URLSearchParams({ returnTo: normalizeRelativePath(returnTo, '/') });
+    if (includeAgentSelector && String(agentName || '').trim()) logoutParams.set('agent', String(agentName).trim());
+    const safeLogoutUrl = escapeHtml(`/auth/logout?${logoutParams.toString()}`);
     return `<!doctype html>
 <html lang="en">
 <head>
@@ -255,14 +259,21 @@ function getAuthPageStyles() {
     }`;
 }
 
-function renderLocalLoginHtml({ agentName, returnTo = '/', error = '', notice = '', usersVar = '' } = {}) {
+function renderLocalLoginHtml({
+    agentName,
+    returnTo = '/',
+    error = '',
+    notice = '',
+    usersVar = '',
+    includeAgentSelector = true,
+} = {}) {
     const rawAgent = String(agentName || '').trim();
     const safeAgent = escapeHtml(rawAgent || 'application');
     const safeReturnTo = escapeHtml(normalizeRelativePath(returnTo, '/'));
     const safeError = escapeHtml(error || '');
     const safeNotice = escapeHtml(notice || '');
     const safeBrandingName = escapeHtml(readRouterSettings().loginBrandingName);
-    const safeLoginAction = escapeHtml(rawAgent
+    const safeLoginAction = escapeHtml(includeAgentSelector && rawAgent
         ? `/auth/login?agent=${encodeURIComponent(rawAgent)}`
         : '/auth/login');
     return `<!doctype html>
@@ -282,7 +293,7 @@ function renderLocalLoginHtml({ agentName, returnTo = '/', error = '', notice = 
       ${safeNotice ? `<div class="auth-notice">${safeNotice}</div>` : ''}
       ${safeError ? `<div class="auth-error">${safeError}</div>` : ''}
       <form method="post" action="${safeLoginAction}" data-auth-login-form>
-        <input type="hidden" name="agent" value="${safeAgent}" />
+        ${includeAgentSelector ? `<input type="hidden" name="agent" value="${safeAgent}" />` : ''}
         <input type="hidden" name="returnTo" value="${safeReturnTo}" />
         <label for="username">Username</label>
         <input id="username" name="username" type="text" autocomplete="username" required />
@@ -315,7 +326,9 @@ function renderLocalAccountHtml({
     error = '',
     notice = '',
     username = '',
-    usersVar = ''
+    usersVar = '',
+    csrfToken = '',
+    includeAgentSelector = true,
 } = {}) {
     const safeAgent = escapeHtml(agentName || 'application');
     const safeReturnTo = escapeHtml(normalizeRelativePath(returnTo, '/'));
@@ -323,7 +336,10 @@ function renderLocalAccountHtml({
     const safeNotice = escapeHtml(notice || '');
     const safeUsername = escapeHtml(username || '');
     const safeUsersVar = escapeHtml(usersVar || '');
-    const safeLogoutUrl = escapeHtml(`/auth/logout?returnTo=${encodeURIComponent(normalizeRelativePath(returnTo, '/'))}`);
+    const safeCsrfToken = escapeHtml(csrfToken || '');
+    const logoutParams = new URLSearchParams({ returnTo: normalizeRelativePath(returnTo, '/') });
+    if (includeAgentSelector && String(agentName || '').trim()) logoutParams.set('agent', String(agentName).trim());
+    const safeLogoutUrl = escapeHtml(`/auth/logout?${logoutParams.toString()}`);
     return `<!doctype html>
 <html lang="en">
 <head>
@@ -343,6 +359,7 @@ function renderLocalAccountHtml({
       ${safeNotice ? `<div class="auth-notice">${safeNotice}</div>` : ''}
       ${safeError ? `<div class="auth-error">${safeError}</div>` : ''}
       <form method="post" action="/auth/account">
+        <input type="hidden" name="csrfToken" value="${safeCsrfToken}" />
         <input type="hidden" name="returnTo" value="${safeReturnTo}" />
         <label for="newUsername">Username</label>
         <input id="newUsername" name="newUsername" type="text" autocomplete="username" value="${safeUsername}" required />
@@ -375,6 +392,47 @@ function renderLocalAccountHtml({
       });
     })();
   </script>
+</body>
+</html>`;
+}
+
+function renderLogoutConfirmationHtml({
+    agentName = '',
+    returnTo = '/',
+    csrfToken = '',
+    includeAgentSelector = true,
+} = {}) {
+    const rawAgent = String(agentName || '').trim();
+    const safeReturnTo = escapeHtml(normalizeRelativePath(returnTo, '/'));
+    const safeCsrfToken = escapeHtml(csrfToken || '');
+    const logoutAction = includeAgentSelector && rawAgent
+        ? `/auth/logout?agent=${encodeURIComponent(rawAgent)}`
+        : '/auth/logout';
+    return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Confirm sign out</title>
+  <style>
+    ${getAuthPageStyles()}
+  </style>
+</head>
+<body>
+  <main class="auth-shell">
+    <section class="auth-card">
+      <div class="auth-kicker">Workspace Access</div>
+      <h1>Sign out?</h1>
+      <p>This closes the current workspace session.</p>
+      <form method="post" action="${escapeHtml(logoutAction)}">
+        <input type="hidden" name="csrfToken" value="${safeCsrfToken}" />
+        <input type="hidden" name="returnTo" value="${safeReturnTo}" />
+        ${includeAgentSelector && rawAgent ? `<input type="hidden" name="agent" value="${escapeHtml(rawAgent)}" />` : ''}
+        <button class="auth-btn" type="submit">Sign out</button>
+      </form>
+      <a class="auth-btn secondary" href="${safeReturnTo}">Cancel</a>
+    </section>
+  </main>
 </body>
 </html>`;
 }
@@ -425,5 +483,6 @@ export {
     renderExternalAccountHtml,
     renderLocalLoginHtml,
     renderLocalAccountHtml,
+    renderLogoutConfirmationHtml,
     renderSsoLoginHtml,
 };

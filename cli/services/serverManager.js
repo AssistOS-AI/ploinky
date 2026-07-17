@@ -1,8 +1,6 @@
 import fs from 'fs';
 import path from 'path';
 import net from 'net';
-import crypto from 'crypto';
-import { setEnvVar } from './secretVars.js';
 import { RUNNING_DIR, SERVERS_CONFIG_FILE } from './config.js';
 import { appendLog } from '../server/utils/logger.js';
 
@@ -41,8 +39,8 @@ export function loadServersConfig() {
         console.warn('Error loading servers config:', e.message);
     }
     return {
-        webchat: { port: null, token: null, command: null },
-        dashboard: { port: null, token: null }
+        webchat: { port: null, command: null },
+        dashboard: { port: null }
     };
 }
 
@@ -67,17 +65,6 @@ export async function ensureServerConfig(serverName, options = {}) {
             server.port = await findAvailablePort();
         }
     }
-
-    if (!server.token || options.forceNewToken) {
-        server.token = crypto.randomBytes(32).toString('hex');
-    }
-
-    try {
-        const tokenName = serverName === 'dashboard'
-            ? 'WEBDASHBOARD_TOKEN'
-            : null;
-        if (tokenName) setEnvVar(tokenName, server.token);
-    } catch (_) {}
 
     if (options.command !== undefined) server.command = options.command;
     if (options.agent !== undefined) server.agent = options.agent;
@@ -172,7 +159,6 @@ export function getAllServerStatuses() {
             running: status.running,
             pid: status.pid,
             port: cfg.port,
-            hasToken: Boolean(cfg.token),
             command: cfg.command,
             agent: cfg.agent
         };

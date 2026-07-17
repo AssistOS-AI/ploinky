@@ -3,10 +3,13 @@ import fs from 'fs';
 import { ROUTING_FILE } from './config.js';
 
 const INITIAL_ROUTER_PORT = 8080;
+const ROUTER_HOST_PORT_ENV = 'PLOINKY_ROUTER_HOST_PORT';
 const ROUTER_ENV_NAMES = Object.freeze([
     'PLOINKY_ROUTER_HOST',
     'PLOINKY_ROUTER_PORT',
     'PLOINKY_ROUTER_URL',
+    'PLOINKY_INTERNAL_ROUTER_URL',
+    'PLOINKY_EDGE_TOPOLOGY_FILE',
 ]);
 const ROUTER_HOST_BY_MODE = Object.freeze({
     default: 'host.containers.internal',
@@ -16,25 +19,33 @@ const ROUTER_HOST_BY_MODE = Object.freeze({
 
 function routerPortError(source, value) {
     const rendered = typeof value === 'string' ? JSON.stringify(value) : String(value);
-    const error = new Error(`${source} must be an integer number or exact unsigned decimal string in the range 1..65535; received ${rendered}`);
+    const error = new Error(`${source} must be exactly ${INITIAL_ROUTER_PORT} in runtime contract v5; --port selects only the outer loopback host port; received ${rendered}`);
     error.code = 'PLOINKY_ROUTER_PORT_INVALID';
     return error;
 }
 
 function parseRouterPort(value, { source = 'router port' } = {}) {
-    if (typeof value === 'number') {
-        if (Number.isInteger(value) && value >= 1 && value <= 65535) {
-            return value;
-        }
-        throw routerPortError(source, value);
-    }
-    if (typeof value === 'string' && /^[0-9]+$/.test(value)) {
-        const parsed = Number(value);
-        if (Number.isInteger(parsed) && parsed >= 1 && parsed <= 65535) {
-            return parsed;
-        }
-    }
+    if (value === INITIAL_ROUTER_PORT || value === String(INITIAL_ROUTER_PORT)) return INITIAL_ROUTER_PORT;
     throw routerPortError(source, value);
+}
+
+function parseRouterHostPort(value, { source = ROUTER_HOST_PORT_ENV } = {}) {
+    const parsed = typeof value === 'number'
+        ? value
+        : (/^[1-9][0-9]{0,4}$/.test(String(value || '')) ? Number(value) : Number.NaN);
+    if (!Number.isSafeInteger(parsed) || parsed < 1 || parsed > 65535) {
+        const error = new Error(`${source} must be an integer TCP port in 1..65535`);
+        error.code = 'PLOINKY_ROUTER_HOST_PORT_INVALID';
+        throw error;
+    }
+    return parsed;
+}
+
+function selectedRouterHostPort(env = process.env) {
+    const value = env?.[ROUTER_HOST_PORT_ENV];
+    return value === undefined
+        ? INITIAL_ROUTER_PORT
+        : parseRouterHostPort(value, { source: ROUTER_HOST_PORT_ENV });
 }
 
 function readPersistedRouterPortValue(routingFile) {
@@ -165,11 +176,14 @@ function resolveRouterEndpoint(networkMode, { explicitPort, routingFile = ROUTIN
 
 export {
     INITIAL_ROUTER_PORT,
+    ROUTER_HOST_PORT_ENV,
     ROUTER_ENV_NAMES,
     assertRouterEndpoint,
     buildRouterEndpoint,
     parseRouterPort,
+    parseRouterHostPort,
     resolveInitialRouterPort,
     resolvePersistedRouterPort,
     resolveRouterEndpoint,
+    selectedRouterHostPort,
 };

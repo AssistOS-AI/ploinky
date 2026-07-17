@@ -202,22 +202,6 @@ test('explicit and persisted missing profiles fail instead of inheriting root ne
     );
 });
 
-test('getProfileConfig lets active profile additionalServerPort replace default additionalServerPort', () => {
-    writeManifest('repo-server', 'agent-server', {
-        profiles: {
-            default: {
-                additionalServerPort: '3000',
-            },
-            prod: {
-                additionalServerPort: '8080',
-            },
-        },
-    });
-
-    const config = getProfileConfig('repo-server/agent-server', 'prod');
-    assert.equal(config.additionalServerPort, '8080');
-});
-
 test('validateProfile reports missing secrets', () => {
     writeManifest('repo-three', 'agent-three', {
         profiles: {
@@ -238,7 +222,7 @@ test('validateProfile reports missing secrets', () => {
     }
 });
 
-test('validateProfile reports required non-sensitive env without profile defaults', () => {
+test('validateProfile resolves operator-required env and reports every missing explicit value', () => {
     writeManifest('repo-profile-env', 'agent-profile-env', {
         profiles: {
             default: {},
@@ -260,7 +244,7 @@ test('validateProfile reports required non-sensitive env without profile default
     const result = validateProfile('repo-profile-env/agent-profile-env', 'prod');
     assert.strictEqual(result.valid, false);
     assert.ok(result.issues.some(issue => issue.includes('PUBLIC_ENDPOINT')));
-    assert.ok(!result.issues.some(issue => issue.includes('SERVICE_API_KEY')));
+    assert.ok(result.issues.some(issue => issue.includes('SERVICE_API_KEY')));
 });
 
 test('validateProfile accepts complete non-sensitive env defaults and generated secrets', () => {
@@ -288,8 +272,15 @@ test('validateProfile accepts complete non-sensitive env defaults and generated 
         }
     });
 
-    const result = validateProfile('repo-profile-complete/agent-profile-complete', 'prod');
-    assert.strictEqual(result.valid, true);
+    const previousServiceSecret = process.env.SERVICE_SECRET;
+    process.env.SERVICE_SECRET = 'operator-supplied-test-secret';
+    try {
+        const result = validateProfile('repo-profile-complete/agent-profile-complete', 'prod');
+        assert.strictEqual(result.valid, true);
+    } finally {
+        if (previousServiceSecret === undefined) delete process.env.SERVICE_SECRET;
+        else process.env.SERVICE_SECRET = previousServiceSecret;
+    }
 });
 
 test('validateProfile succeeds when secrets and hooks are present', () => {

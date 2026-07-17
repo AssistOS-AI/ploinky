@@ -1,6 +1,7 @@
 import http from 'http';
+import net from 'node:net';
 import path from 'node:path';
-import { randomUUID } from 'node:crypto';
+import { createHmac, randomUUID } from 'node:crypto';
 
 import { sendJson } from './authHandlers/index.js';
 import { createAgentClient } from './AgentClient.js';
@@ -13,8 +14,10 @@ import { hasInternalAgentSegment } from './internalAgentPath.js';
 import {
     buildServiceAgentPath,
     loadRoutingConfig,
-    resolveHttpServiceRoute
+    resolveHttpServiceRoute,
+    resolveHttpServiceTarget,
 } from './httpServiceRoutes.js';
+import { commitRoutePlan, resolveEdgeRoutePlan } from './edgeRoutePlan.js';
 import { deriveAgentPrincipalId } from '../services/agentIdentity.js';
 import { ROUTING_FILE } from '../services/config.js';
 import { deriveSubkey } from '../services/masterKey.js';
@@ -24,6 +27,7 @@ const ROUTER_PROTOCOL_VERSION = '2025-06-18';
 const ROUTER_SERVER_INFO = { name: 'ploinky-router', version: '1.0.0' };
 const ROUTER_INSTRUCTIONS = 'Ploinky Router aggregates tools and resources from registered agents.';
 const DEFAULT_HTTP_SERVICE_INVOCATION_MAX_BODY_BYTES = 10 * 1024 * 1024;
+export const PLOINKY_RATE_SOURCE_HEADER = 'x-ploinky-rate-source';
 
 const routerSessions = new Map();
 
@@ -99,12 +103,61 @@ export function proxyMcpPassthrough(req, res, targetPort, agentPath) {
     req.pipe(upstream, { end: true });
 }
 
-export function proxyHttpPassthrough(req, res, targetPort, agentPath, extraHeaders = {}) {
+function rejectStaleLease(res) {
+    if (!res.headersSent) {
+        res.writeHead(503, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+    }
+    res.end(JSON.stringify({ error: 'edge_generation_changed' }));
+}
+
+function staleLeaseError(cause = null) {
+    const error = new Error('edge routing generation changed before upstream connection creation', cause ? { cause } : undefined);
+    error.code = 'EDGE_GENERATION_CHANGED';
+    error.statusCode = 503;
+    return error;
+}
+
+export function createLeaseCommittedAgent(beforeDial, { createConnection = net.createConnection } = {}) {
+    if (typeof beforeDial !== 'function') return undefined;
+    const agent = new http.Agent({ keepAlive: false, maxSockets: 1 });
+    agent.createConnection = (options, callback) => {
+        let committed = false;
+        let failure = null;
+        try {
+            committed = beforeDial() === true;
+        } catch (error) {
+            failure = error;
+        }
+        if (!committed) {
+            const error = staleLeaseError(failure);
+            queueMicrotask(() => callback(error));
+            return undefined;
+        }
+        return createConnection(options, callback);
+    };
+    return agent;
+}
+
+function handleProxyError(res, error) {
+    if (error?.code === 'EDGE_GENERATION_CHANGED') {
+        rejectStaleLease(res);
+        return;
+    }
+    if (!res.headersSent) {
+        res.writeHead(502, { 'Content-Type': 'application/json' });
+    }
+    res.end(JSON.stringify({ error: 'upstream error', detail: String(error) }));
+}
+
+export function proxyHttpPassthrough(req, res, targetPort, agentPath, extraHeaders = {}, { beforeDial = null } = {}) {
     const pathWithLeadingSlash = agentPath.startsWith('/') ? agentPath : `/${agentPath}`;
     const headers = {
-        ...stripRouterIdentityHeaders(req.headers),
+        ...stripRouterIdentityHeaders(req.headers, {
+            preserveAuthorization: false,
+            preserveCookie: false,
+        }),
+        host: `127.0.0.1:${targetPort}`,
         ...extraHeaders,
-        host: `127.0.0.1:${targetPort}`
     };
 
     const upstream = http.request({
@@ -112,17 +165,15 @@ export function proxyHttpPassthrough(req, res, targetPort, agentPath, extraHeade
         port: targetPort,
         path: pathWithLeadingSlash,
         method: req.method,
-        headers
+        headers,
+        agent: createLeaseCommittedAgent(beforeDial),
     }, upstreamRes => {
         res.writeHead(upstreamRes.statusCode || 200, upstreamRes.headers);
         upstreamRes.pipe(res, { end: true });
     });
 
     upstream.on('error', err => {
-        if (!res.headersSent) {
-            res.writeHead(502, { 'Content-Type': 'application/json' });
-        }
-        res.end(JSON.stringify({ error: 'upstream error', detail: String(err) }));
+        handleProxyError(res, err);
     });
 
     req.on('aborted', () => {
@@ -130,6 +181,7 @@ export function proxyHttpPassthrough(req, res, targetPort, agentPath, extraHeade
     });
 
     req.pipe(upstream, { end: true });
+    return upstream;
 }
 
 export function resolveHttpServiceInvocationMaxBodyBytes(env = process.env) {
@@ -148,8 +200,8 @@ function pathOnly(pathWithQuery = '') {
 function buildBufferedProxyHeaders(req, targetPort, body, extraHeaders = {}) {
     const headers = {
         ...stripRouterIdentityHeaders(req.headers),
-        ...extraHeaders,
         host: `127.0.0.1:${targetPort}`,
+        ...extraHeaders,
     };
     for (const name of Object.keys(headers)) {
         const normalized = String(name).toLowerCase();
@@ -161,7 +213,7 @@ function buildBufferedProxyHeaders(req, targetPort, body, extraHeaders = {}) {
     return headers;
 }
 
-export function proxyHttpBuffered(req, res, targetPort, agentPath, body, extraHeaders = {}) {
+export function proxyHttpBuffered(req, res, targetPort, agentPath, body, extraHeaders = {}, { beforeDial = null } = {}) {
     const pathWithLeadingSlash = agentPath.startsWith('/') ? agentPath : `/${agentPath}`;
     const upstream = http.request({
         hostname: '127.0.0.1',
@@ -169,19 +221,18 @@ export function proxyHttpBuffered(req, res, targetPort, agentPath, body, extraHe
         path: pathWithLeadingSlash,
         method: req.method,
         headers: buildBufferedProxyHeaders(req, targetPort, body, extraHeaders),
+        agent: createLeaseCommittedAgent(beforeDial),
     }, upstreamRes => {
         res.writeHead(upstreamRes.statusCode || 200, upstreamRes.headers);
         upstreamRes.pipe(res, { end: true });
     });
 
     upstream.on('error', err => {
-        if (!res.headersSent) {
-            res.writeHead(502, { 'Content-Type': 'application/json' });
-        }
-        res.end(JSON.stringify({ error: 'upstream error', detail: String(err) }));
+        handleProxyError(res, err);
     });
 
     upstream.end(body);
+    return upstream;
 }
 
 export function readRequestBody(req, {
@@ -223,16 +274,91 @@ const ROUTER_IDENTITY_HEADERS = new Set([
     'x-ploinky-user',
     'x-ploinky-user-email',
     'x-ploinky-user-roles',
-    'x-ploinky-session-id'
+    'x-ploinky-session-id',
+    'cf-connecting-ip',
+    'true-client-ip',
+    'x-real-ip',
+    'ploinky-agent-assertion',
+    'forwarded',
+    'x-forwarded-for',
+    'x-forwarded-host',
+    'x-forwarded-proto',
+    'x-forwarded-port',
 ]);
 
-export function stripRouterIdentityHeaders(headers = {}) {
+export function stripRouterIdentityHeaders(headers = {}, { preserveAuthorization = true, preserveCookie = true } = {}) {
     const sanitized = {};
     for (const [name, value] of Object.entries(headers || {})) {
-        if (ROUTER_IDENTITY_HEADERS.has(String(name || '').toLowerCase())) continue;
+        const normalized = String(name || '').toLowerCase();
+        if (ROUTER_IDENTITY_HEADERS.has(normalized)
+            || normalized.startsWith('x-ploinky-')
+            || normalized.startsWith('x-forwarded-')) continue;
+        if (!preserveAuthorization && normalized === 'authorization') continue;
+        if (!preserveCookie && normalized === 'cookie') continue;
         sanitized[name] = value;
     }
     return sanitized;
+}
+
+export function buildTrustedForwardingHeaders(routePlan) {
+    const authority = String(routePlan?.forwarding?.authority || '').trim();
+    const protocol = String(routePlan?.forwarding?.protocol || '').trim();
+    if (!authority || !['http', 'https'].includes(protocol)) return {};
+    return {
+        host: authority,
+        'x-forwarded-host': authority,
+        'x-forwarded-proto': protocol,
+    };
+}
+
+function normalizeRateSourceAddress(value) {
+    if (Array.isArray(value) || typeof value !== 'string') return '';
+    const raw = value.trim();
+    if (!raw || raw !== value || raw.includes(',')) return '';
+    if (raw.startsWith('::ffff:') && net.isIP(raw.slice(7)) === 4) return raw.slice(7);
+    const family = net.isIP(raw);
+    if (family === 4) return raw;
+    if (family !== 6) return '';
+    try {
+        return new URL(`http://[${raw}]/`).hostname.slice(1, -1).toLowerCase();
+    } catch (_) {
+        return '';
+    }
+}
+
+/**
+ * Produce a route-scoped, non-reversible transport-source partition for guest
+ * ingestion services. This is abuse-control metadata only: it is synthesized
+ * after the immutable host/policy plan succeeds and is never authorization or
+ * browser identity. Public-host requests use Cloudflare's connector-provided
+ * source address; local aliases use the TCP peer observed by the Router.
+ */
+export function buildHttpServiceRateSourceHeader(req, routePlan) {
+    if (routePlan?.decision?.access !== 'guest') return {};
+    const publicConnectorRequest = routePlan?.hostSelection?.source === 'public-host';
+    const sourceClass = publicConnectorRequest ? 'cloudflare' : 'socket';
+    const rawAddress = publicConnectorRequest
+        ? req?.headers?.['cf-connecting-ip']
+        : req?.socket?.remoteAddress;
+    const address = normalizeRateSourceAddress(rawAddress);
+    if (!address) {
+        const error = new Error('guest service request has no valid canonical transport source');
+        error.code = 'INVALID_RATE_SOURCE';
+        error.statusCode = 400;
+        throw error;
+    }
+    const routeKey = String(routePlan?.definition?.routeKey || '');
+    const externalPrefix = String(routePlan?.definition?.externalPrefix || '');
+    if (!routeKey || !externalPrefix) {
+        const error = new Error('guest service route has no canonical rate-source scope');
+        error.code = 'INVALID_RATE_SOURCE';
+        error.statusCode = 503;
+        throw error;
+    }
+    const partition = createHmac('sha256', deriveSubkey('router-rate-source', 32))
+        .update(`v1\0${routeKey}\0${externalPrefix}\0${sourceClass}\0${address}`, 'utf8')
+        .digest('hex');
+    return { [PLOINKY_RATE_SOURCE_HEADER]: partition };
 }
 
 export function buildPlainAuthInfoHeader(req) {
@@ -422,31 +548,71 @@ export function readHeaderValue(headers = {}, headerName) {
     return typeof lower === 'string' && lower.trim() ? lower.trim() : '';
 }
 
-export function handleHttpServiceRoute(req, res, parsedUrl, apiRoutes = loadApiRoutes()) {
-    const pathname = parsedUrl?.pathname || '';
-    const definition = resolveHttpServiceRoute(pathname);
-    if (!definition) {
+export function handleHttpServiceRoute(req, res, parsedUrl, routePlan = null) {
+    const plan = routePlan?.kind === 'service'
+        ? routePlan
+        : resolveEdgeRoutePlan({ req, parsedUrl, listener: routePlan?.listener || 'public' });
+    if (!plan?.ok || plan.kind !== 'service') {
         return false;
     }
-
-    const route = apiRoutes[definition.routeKey];
-    if (!route || !route.hostPort) {
-        res.writeHead(404, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: definition.notFoundMessage }));
-        return true;
-    }
-    if (definition.access !== 'public' && (!req.user || typeof req.user !== 'object')) {
+    const definition = plan.definition;
+    const target = plan.target || resolveHttpServiceTarget(definition, plan.snapshot?.routing);
+    const effectiveUrl = plan.parsedUrl || parsedUrl;
+    const pathname = plan.canonicalPath || effectiveUrl?.pathname || '';
+    if (!target) return false;
+    if (definition.access !== 'public'
+        && (!req.user || typeof req.user !== 'object')
+        && (!req.privateAgentIdentity || plan.listener !== 'private')) {
         sendJson(res, 401, { ok: false, error: 'not_authenticated' });
         return true;
     }
-    req.headers = stripRouterIdentityHeaders(req.headers);
+    let rateSourceHeaders = {};
+    try {
+        rateSourceHeaders = buildHttpServiceRateSourceHeader(req, plan);
+    } catch (err) {
+        sendJson(res, err?.statusCode || 400, {
+            ok: false,
+            error: err?.code || 'INVALID_RATE_SOURCE',
+        });
+        return true;
+    }
+    req.headers = stripRouterIdentityHeaders(req.headers, {
+        preserveAuthorization: plan.listener === 'private',
+        preserveCookie: false,
+    });
 
-    const upstreamPath = buildServiceAgentPath(pathname, parsedUrl?.search, definition.externalPrefix, definition.internalPrefix);
+    const upstreamPath = plan.upstreamPath || buildServiceAgentPath(pathname, effectiveUrl?.search, definition.externalPrefix, definition.internalPrefix);
+    const forwardingHeaders = buildTrustedForwardingHeaders(plan);
     // DS014: an http-service `internalPrefix` must never rewrite a request into a
     // router-owned `__agent` control-plane path. The early dispatch guard only
     // sees the external request path, so re-check the synthesized upstream here.
     if (hasInternalAgentSegment(upstreamPath)) {
         sendJson(res, 404, { ok: false, error: 'not_found' });
+        return true;
+    }
+
+    if (Buffer.isBuffer(req.edgeBufferedBody)) {
+        let identityHeaders = {};
+        try {
+            identityHeaders = buildHttpServiceAuthInfoHeader(req, effectiveUrl, definition, {
+                bodyHash: sha256RawBodyHash(req.edgeBufferedBody),
+                servicePath: upstreamPath,
+            });
+        } catch (err) {
+            sendJson(res, 500, {
+                ok: false,
+                error: 'http_service_invocation_unavailable',
+                message: err?.message || String(err),
+            });
+            return true;
+        }
+        proxyHttpBuffered(req, res, target.hostPort, upstreamPath, req.edgeBufferedBody, {
+            ...rateSourceHeaders,
+            ...identityHeaders,
+            ...forwardingHeaders,
+        }, {
+            beforeDial: () => commitRoutePlan(plan),
+        });
         return true;
     }
 
@@ -456,7 +622,7 @@ export function handleHttpServiceRoute(req, res, parsedUrl, apiRoutes = loadApiR
             onSuccess: (body) => {
                 let identityHeaders = {};
                 try {
-                    identityHeaders = buildHttpServiceAuthInfoHeader(req, parsedUrl, definition, {
+                    identityHeaders = buildHttpServiceAuthInfoHeader(req, effectiveUrl, definition, {
                         bodyHash: sha256RawBodyHash(body),
                         servicePath: upstreamPath,
                     });
@@ -468,7 +634,13 @@ export function handleHttpServiceRoute(req, res, parsedUrl, apiRoutes = loadApiR
                     });
                     return;
                 }
-                proxyHttpBuffered(req, res, route.hostPort, upstreamPath, body, identityHeaders);
+                proxyHttpBuffered(req, res, target.hostPort, upstreamPath, body, {
+                    ...rateSourceHeaders,
+                    ...identityHeaders,
+                    ...forwardingHeaders,
+                }, {
+                    beforeDial: () => commitRoutePlan(plan),
+                });
             },
             onTooLarge: ({ limitBytes }) => {
                 sendJson(res, 413, {
@@ -489,7 +661,7 @@ export function handleHttpServiceRoute(req, res, parsedUrl, apiRoutes = loadApiR
 
     let identityHeaders = {};
     try {
-        identityHeaders = buildHttpServiceAuthInfoHeader(req, parsedUrl, definition);
+        identityHeaders = buildHttpServiceAuthInfoHeader(req, effectiveUrl, definition);
     } catch (err) {
         sendJson(res, 500, {
             ok: false,
@@ -498,7 +670,13 @@ export function handleHttpServiceRoute(req, res, parsedUrl, apiRoutes = loadApiR
         });
         return true;
     }
-    proxyHttpPassthrough(req, res, route.hostPort, upstreamPath, identityHeaders);
+    proxyHttpPassthrough(req, res, target.hostPort, upstreamPath, {
+        ...rateSourceHeaders,
+        ...identityHeaders,
+        ...forwardingHeaders,
+    }, {
+        beforeDial: () => commitRoutePlan(plan),
+    });
     return true;
 }
 
@@ -548,15 +726,32 @@ export function proxyApi(req, res, targetPort, identityHeaders = {}) {
     });
 }
 
-export function createAgentRouteEntries() {
-    const routes = loadApiRoutes();
+function commitAggregateLease(routePlan) {
+    return routePlan?.lease?.commit?.() === true;
+}
+
+export function createAgentRouteEntries(routePlan) {
+    const routes = routePlan?.lease?.snapshot?.routing?.routes;
+    if (!routes || typeof routes !== 'object') {
+        const error = new Error('active edge routing generation lease is required for aggregate MCP');
+        error.code = 'EDGE_GENERATION_REQUIRED';
+        error.statusCode = 503;
+        throw error;
+    }
     const entries = [];
     for (const [agentName, route] of Object.entries(routes || {})) {
         if (!route || route.disabled) continue;
         const port = Number(route.hostPort);
         if (!Number.isFinite(port)) continue;
         const baseUrl = `http://127.0.0.1:${port}/mcp`;
-        entries.push({ agentName, port, baseUrl, client: createAgentClient(baseUrl) });
+        const beforeConnect = () => commitAggregateLease(routePlan);
+        entries.push({
+            agentName,
+            port,
+            baseUrl,
+            beforeConnect,
+            client: createAgentClient(baseUrl, { beforeConnect }),
+        });
     }
     return entries;
 }
@@ -640,6 +835,7 @@ async function collectTools(entries) {
                 toolIndex.get(name).push({ entry, tool });
             }
         } catch (err) {
+            if (err?.code === 'EDGE_GENERATION_CHANGED') throw err;
             const message = summarizeMcpError(err, 'listTools');
             errors.push({ agent: entry.agentName, error: message });
             failures.set(entry.agentName, message);
@@ -659,6 +855,7 @@ async function collectResources(entries) {
             const resources = await entry.client.listResources();
             resourcesByAgent.set(entry.agentName, resources || []);
         } catch (err) {
+            if (err?.code === 'EDGE_GENERATION_CHANGED') throw err;
             const message = summarizeMcpError(err, 'listResources');
             errors.push({ agent: entry.agentName, error: message });
             failures.set(entry.agentName, message);
@@ -738,7 +935,10 @@ async function callEntryTool(entry, toolName, args, req) {
     if (!requestHeaders) {
         return await entry.client.callTool(toolName, args);
     }
-    const client = createAgentClient(entry.baseUrl, { requestHeaders });
+    const client = createAgentClient(entry.baseUrl, {
+        requestHeaders,
+        beforeConnect: entry.beforeConnect,
+    });
     try {
         return await client.callTool(toolName, args);
     } finally {
@@ -751,7 +951,10 @@ async function readEntryResource(entry, uri, req) {
     if (!requestHeaders) {
         return await entry.client.readResource(uri);
     }
-    const client = createAgentClient(entry.baseUrl, { requestHeaders });
+    const client = createAgentClient(entry.baseUrl, {
+        requestHeaders,
+        beforeConnect: entry.beforeConnect,
+    });
     try {
         return await client.readResource(uri);
     } finally {
@@ -759,9 +962,17 @@ async function readEntryResource(entry, uri, req) {
     }
 }
 
-async function executeRouterCommand(command, payload = {}, req = null) {
+async function executeRouterCommand(command, payload = {}, req = null, routePlan = null) {
     const normalized = canonicalCommand(command);
-    const entries = createAgentRouteEntries();
+    let entries;
+    try {
+        entries = createAgentRouteEntries(routePlan);
+    } catch (error) {
+        return {
+            statusCode: error?.statusCode || 503,
+            body: { error: error?.code || 'EDGE_GENERATION_REQUIRED' },
+        };
+    }
     if (!entries.length) {
         return {
             statusCode: 503,
@@ -923,6 +1134,9 @@ async function executeRouterCommand(command, payload = {}, req = null) {
                     const resource = await readEntryResource(resolvedEntry, uri, req);
                     return { statusCode: 200, body: { resource, agent: resolvedEntry.agentName, errors } };
                 } catch (err) {
+                    if (err?.code === 'EDGE_GENERATION_CHANGED') {
+                        return { statusCode: 503, body: { error: 'edge_generation_changed' } };
+                    }
                     const message = summarizeMcpError(err, 'readResource');
                     return { statusCode: 500, body: { error: message, errors } };
                 }
@@ -940,6 +1154,9 @@ async function executeRouterCommand(command, payload = {}, req = null) {
                     const result = await entry.client.ping();
                     return { statusCode: 200, body: { result: result ?? {}, agent: entry.agentName } };
                 } catch (err) {
+                    if (err?.code === 'EDGE_GENERATION_CHANGED') {
+                        return { statusCode: 503, body: { error: 'edge_generation_changed' } };
+                    }
                     const message = summarizeMcpError(err, 'ping');
                     return { statusCode: 502, body: { error: message } };
                 }
@@ -952,13 +1169,16 @@ async function executeRouterCommand(command, payload = {}, req = null) {
         }
     } catch (err) {
         const message = err && err.message ? err.message : String(err || 'unknown error');
-        return { statusCode: 500, body: { error: message } };
+        return {
+            statusCode: err?.code === 'EDGE_GENERATION_CHANGED' ? 503 : 500,
+            body: { error: err?.code === 'EDGE_GENERATION_CHANGED' ? 'edge_generation_changed' : message },
+        };
     } finally {
         await Promise.all(entries.map(entry => entry.client.close().catch(() => { })));
     }
 }
 
-async function handleRouterJsonRpc(req, res, payload) {
+async function handleRouterJsonRpc(req, res, payload, routePlan) {
     const isBatch = Array.isArray(payload);
     const messages = isBatch ? payload : [payload];
     if (!messages.length) {
@@ -1022,14 +1242,14 @@ async function handleRouterJsonRpc(req, res, payload) {
             let rpcResultPayload = null;
             switch (message.method) {
                 case 'tools/list':
-                    result = await executeRouterCommand('list_tools', {}, req);
+                    result = await executeRouterCommand('list_tools', {}, req, routePlan);
                     if (result.statusCode < 400) {
                         const tools = Array.isArray(result.body?.tools) ? result.body.tools : [];
                         rpcResultPayload = { tools };
                     }
                     break;
                 case 'resources/list':
-                    result = await executeRouterCommand('list_resources', {}, req);
+                    result = await executeRouterCommand('list_resources', {}, req, routePlan);
                     if (result.statusCode < 400) {
                         const resources = Array.isArray(result.body?.resources) ? result.body.resources : [];
                         rpcResultPayload = { resources };
@@ -1058,7 +1278,7 @@ async function handleRouterJsonRpc(req, res, payload) {
                     if (metaAgent && !commandPayload.agent) {
                         commandPayload.agent = metaAgent;
                     }
-                    result = await executeRouterCommand('tool', commandPayload, req);
+                    result = await executeRouterCommand('tool', commandPayload, req, routePlan);
                     if (result.statusCode < 400) {
                         rpcResultPayload = result.body?.result;
                     }
@@ -1069,7 +1289,7 @@ async function handleRouterJsonRpc(req, res, payload) {
                     if (params._meta && params._meta.router && typeof params._meta.router.agent === 'string' && params.agent === undefined) {
                         params.agent = params._meta.router.agent;
                     }
-                    result = await executeRouterCommand('resources/read', params, req);
+                    result = await executeRouterCommand('resources/read', params, req, routePlan);
                     if (result.statusCode < 400) {
                         rpcResultPayload = result.body?.resource;
                     }
@@ -1080,7 +1300,7 @@ async function handleRouterJsonRpc(req, res, payload) {
                     if (params._meta && params._meta.router && typeof params._meta.router.agent === 'string' && params.agent === undefined) {
                         params.agent = params._meta.router.agent;
                     }
-                    result = await executeRouterCommand('ping', params, req);
+                    result = await executeRouterCommand('ping', params, req, routePlan);
                     if (result.statusCode < 400) {
                         rpcResultPayload = result.body?.result ?? {};
                     }
@@ -1118,7 +1338,7 @@ async function handleRouterJsonRpc(req, res, payload) {
     res.end(JSON.stringify(isBatch ? responses : responses[0]));
 }
 
-export async function handleRouterMcp(req, res) {
+export async function handleRouterMcp(req, res, routePlan) {
     const method = (req.method || 'GET').toUpperCase();
 
     if (method === 'GET') {
@@ -1155,12 +1375,12 @@ export async function handleRouterMcp(req, res) {
             const isRpc = isJsonRpcMessage(payload);
 
             if (isRpc) {
-                await handleRouterJsonRpc(req, res, payload);
+                await handleRouterJsonRpc(req, res, payload, routePlan);
                 return;
             }
 
             const command = payload && typeof payload.command === 'string' ? payload.command : '';
-            const { statusCode, body } = await executeRouterCommand(command, payload, req);
+            const { statusCode, body } = await executeRouterCommand(command, payload, req, routePlan);
             res.writeHead(statusCode, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify(body));
         } catch (err) {

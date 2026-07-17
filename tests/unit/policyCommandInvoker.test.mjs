@@ -7,13 +7,17 @@ import { Readable } from 'node:stream';
 
 const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-invoker-'));
 const originalCwd = process.cwd();
+const originalMasterKey = process.env.PLOINKY_MASTER_KEY;
+process.env.PLOINKY_MASTER_KEY = '8'.repeat(64);
 process.chdir(tempDir);
 
 const moduleSuffix = `?t=${Date.now()}`;
 const { PolicyStateRepository } = await import(`../../cli/server/policy/PolicyStateRepository.js${moduleSuffix}`);
+const { FileSystemPolicyStateStore } = await import(`../../cli/server/policy/FileSystemPolicyStateStore.js${moduleSuffix}`);
 const { PolicyAuditLog } = await import(`../../cli/server/policy/PolicyAuditLog.js${moduleSuffix}`);
 const { PolicyCommandRegistry } = await import(`../../cli/server/policy/PolicyCommandRegistry.js${moduleSuffix}`);
 const { PolicyCommandInvoker } = await import(`../../cli/server/policy/PolicyCommandInvoker.js${moduleSuffix}`);
+const { mintAdminCsrfToken } = await import(`../../cli/server/adminControlSecurity.js${moduleSuffix}`);
 const { HttpRouteAccessPolicy } = await import(`../../cli/server/policy/HttpRouteAccessPolicy.js${moduleSuffix}`);
 const {
     HttpRouteSetCommand,
@@ -29,7 +33,9 @@ const {
 
 const auditFile = path.join(tempDir, '.ploinky', 'data', 'router-security', 'policy-audit.log');
 const policyFile = path.join(tempDir, '.ploinky', 'data', 'router-security', 'policy-state.json');
-const repo = new PolicyStateRepository();
+const repo = new PolicyStateRepository({
+    store: new FileSystemPolicyStateStore({ file: () => policyFile, coordinate: false }),
+});
 const shareAllow = { authorize: async () => ({ allowed: true }) };
 
 function makeRouteAccessPolicy() {
@@ -67,6 +73,8 @@ let invoker = makeInvoker();
 
 test.after(() => {
     process.chdir(originalCwd);
+    if (originalMasterKey === undefined) delete process.env.PLOINKY_MASTER_KEY;
+    else process.env.PLOINKY_MASTER_KEY = originalMasterKey;
     fs.rmSync(tempDir, { recursive: true, force: true });
 });
 
@@ -87,13 +95,24 @@ class MockResponse {
     end(chunk = '') { this.body += chunk ? String(chunk) : ''; }
 }
 
-function makeRequest({ method = 'POST', cookie = '', body } = {}) {
+function makeRequest({ method = 'POST', cookie = '', body, proof = 'valid', origin = 'http://localhost', host = 'localhost', forwarded = false } = {}) {
     const chunks = body === undefined ? [] : [Buffer.from(JSON.stringify(body), 'utf8')];
     const req = Readable.from(chunks);
     req.method = method;
     req.url = '/policy/command';
-    req.headers = { host: 'localhost', ...(cookie ? { cookie: `ploinky_jwt=${cookie}` } : {}), ...(body === undefined ? {} : { 'content-type': 'application/json' }) };
+    req.headers = {
+        host,
+        ...(cookie ? { cookie: `ploinky_jwt=${cookie}` } : {}),
+        ...(body === undefined ? {} : { 'content-type': 'application/json' }),
+        ...(proof === 'missing' ? {} : { origin }),
+    };
     req.socket = { encrypted: false };
+    if (cookie && proof !== 'missing') {
+        req.headers['x-ploinky-csrf-token'] = proof === 'valid'
+            ? mintAdminCsrfToken({ sessionId: cookie, req })
+            : 'v1.invalid';
+    }
+    if (forwarded) req.headers['x-forwarded-host'] = 'attacker.example';
     return req;
 }
 
@@ -161,11 +180,11 @@ test('the invoker dispatches and authorizes all seven commands for an admin', as
     }
 });
 
-test('read commands honor their authorization class through the invoker', async () => {
+test('every policy control command requires a real admin session', async () => {
     resetPolicy();
     const listAsUser = await call({ cookie: 'user', body: { command: 'http.route.list' } });
-    assert.equal(listAsUser.status, 200);
-    assert.equal(listAsUser.json.ok, true);
+    assert.equal(listAsUser.status, 403);
+    assert.equal(listAsUser.json.error.code, 'ADMIN_REQUIRED');
 
     const mcpGetAsUser = await call({ cookie: 'user', body: { command: 'mcp.policy.get', agent: 'dpu', tool: 'y' } });
     assert.equal(mcpGetAsUser.status, 403);
@@ -185,15 +204,17 @@ test('http.route.set rejects removed or invalid access values', async () => {
     }
 });
 
-test('non-admin http.route.set is blocked when the owning share authorizer denies', async () => {
+test('non-admin http.route.set is blocked before the owning share authorizer runs', async () => {
     resetPolicy();
-    const denyingInvoker = makeInvoker({ authorize: async () => ({ allowed: false, reason: 'nope' }) });
+    let calls = 0;
+    const denyingInvoker = makeInvoker({ authorize: async () => { calls += 1; return { allowed: false, reason: 'nope' }; } });
     const r = await call({ cookie: 'user', body: { command: 'http.route.set', path: '/explorer/pub/*', access: 'public' } }, denyingInvoker);
     assert.equal(r.status, 403);
-    assert.equal(r.json.error.code, 'FORBIDDEN');
+    assert.equal(r.json.error.code, 'ADMIN_REQUIRED');
+    assert.equal(calls, 0);
 });
 
-test('non-admin http.route.set passes concrete path, access, and verb to the share authorizer', async () => {
+test('mutations require exact Origin and session-bound CSRF before authorization or persistence', async () => {
     resetPolicy();
     const calls = [];
     const approvingInvoker = makeInvoker({
@@ -202,14 +223,21 @@ test('non-admin http.route.set passes concrete path, access, and verb to the sha
             return { allowed: true, reason: 'ok' };
         },
     });
-    const r = await call({ cookie: 'user', body: { command: 'http.route.set', path: '/explorer/pub/*', access: 'guest' } }, approvingInvoker);
-    assert.equal(r.status, 200);
-    assert.equal(repo.getHttpRouteEntry('/explorer/pub/*').access, 'guest');
-    assert.equal(calls.length, 1);
-    assert.deepEqual(
-        { path: calls[0].normalizedPath, access: calls[0].access, verb: calls[0].verb },
-        { path: '/explorer/pub/*', access: 'guest', verb: 'changing' },
-    );
+    for (const request of [
+        { proof: 'missing' },
+        { proof: 'invalid' },
+        { proof: 'valid', origin: 'http://127.0.0.1' },
+        { proof: 'valid', forwarded: true },
+    ]) {
+        const r = await call({
+            cookie: 'admin',
+            body: { command: 'http.route.set', path: '/explorer/pub/*', access: 'guest' },
+            ...request,
+        }, approvingInvoker);
+        assert.equal(r.status, 403, JSON.stringify(request));
+    }
+    assert.equal(calls.length, 0);
+    assert.equal(repo.getHttpRouteEntry('/explorer/pub/*'), null);
 });
 
 test('corrupt policy file fails closed for http.route commands', async () => {

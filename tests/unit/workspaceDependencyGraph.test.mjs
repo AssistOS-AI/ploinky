@@ -1,10 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { pathToFileURL } from 'node:url';
 
 const originalCwd = process.cwd();
 const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-graph-'));
@@ -46,13 +44,13 @@ const {
 const { applyManifestDirectives, parseEnableDirective } = bootstrapModule;
 const workspaceUtilModuleUrl = new URL('../../cli/services/workspaceUtil.js', import.meta.url);
 const {
+    assertStaticPreinstallSucceeded,
     buildBlockingReadinessEntryFromNode,
     ensureGraphNodesEnabled,
+    reprepareGraphAfterStartupProviders,
     reinstallAgent,
     resolveGraphNodeExecutionRecord,
     resolveManifestRouterEndpoint,
-    runCli,
-    runShell,
     startWorkspace,
     waitForReadinessEntries,
 } = await import(`${workspaceUtilModuleUrl.href}${moduleSuffix}`);
@@ -182,7 +180,7 @@ test('blocking none-mode launches pass explicit null without forwarding a raw ro
     }), null);
 
     const source = startWorkspace.toString();
-    const launchStart = source.indexOf('const { containerName, hostPort, additionalServerPort } = ensureAgentService');
+    const launchStart = source.indexOf('const { containerName, hostPort, serviceTargets, registryRecord } = ensureAgentService');
     const launchEnd = source.indexOf('const executionMode = resolveAgentExecutionMode', launchStart);
     assert.ok(launchStart >= 0 && launchEnd > launchStart, 'blocking service launch must remain discoverable');
     const launch = source.slice(launchStart, launchEnd);
@@ -193,117 +191,96 @@ test('blocking none-mode launches pass explicit null without forwarding a raw ro
     assert.match(reinstall, /const routerPort = resolvePersistedRouterPort\(\)/);
     assert.match(reinstall, /resolveManifestRouterEndpoint\(manifest, \{\s*explicitPort: routerPort,/);
     assert.match(reinstall, /routerEndpoint,/);
-    assert.match(reinstall, /cfg\.port = routerPort/);
+    assert.match(reinstall, /activatePreparedRuntimeAfterReadiness\(\{/);
     assert.match(reinstall, /if \(!isRouterUp\(routerPort\)\)/);
     assert.doesNotMatch(reinstall, /if \(routerEndpoint && !isRouterUp/);
 });
 
-test('workspace publication preflights receive the already resolved router port', () => {
-    assert.match(
-        startWorkspace.toString(),
-        /preflightBoxPublicationForCommand\('start', preflightArgs, \{\s*routerPort: resolvedStartPort/,
-    );
-    for (const [command, fn] of [
-        ['cli', runCli],
-        ['shell', runShell],
-        ['reinstall', reinstallAgent],
-    ]) {
-        const source = fn.toString();
-        assert.match(source, /const routerPort = resolvePersistedRouterPort\(\)/);
-        assert.match(source, new RegExp(`preflightBoxPublicationForCommand\\('${command}'[\\s\\S]*?\\{ routerPort \\}\\)`));
-    }
-});
-
-test('workspace publication preflight reserves the resolved non-default router port', () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-workspace-router-port-'));
-    try {
-        const reposDir = path.join(root, '.ploinky', 'repos');
-        for (const repo of ['basic', 'AchillesIDE', 'AchillesCLI', 'copilot-agents', 'demo']) {
-            fs.mkdirSync(path.join(reposDir, repo), { recursive: true });
-        }
-        const agentDir = path.join(reposDir, 'demo', 'root');
-        fs.mkdirSync(agentDir, { recursive: true });
-        fs.writeFileSync(path.join(agentDir, 'manifest.json'), JSON.stringify({
-            profiles: {
-                default: { openPorts: ['127.0.0.1:49123:7000'] },
-            },
-        }));
-        const marker = path.join(root, 'ploinky-box');
-        fs.writeFileSync(marker, '1\n');
-        const workspaceUrl = pathToFileURL(path.resolve(
-            new URL('../..', import.meta.url).pathname,
-            'cli/services/workspaceUtil.js',
-        )).href;
-        const script = `
-import fs from 'node:fs';
-import path from 'node:path';
-const { startWorkspace } = await import(${JSON.stringify(workspaceUrl)});
-let error = null;
-try { await startWorkspace('demo/root', '49123'); }
-catch (caught) { error = { code: caught.code || null, message: caught.message }; }
-const routingPath = path.join(process.cwd(), '.ploinky', 'routing.json');
-process.stdout.write(JSON.stringify({
-  error,
-  routingPort: fs.existsSync(routingPath) ? JSON.parse(fs.readFileSync(routingPath, 'utf8')).port : null,
-  agentsExists: fs.existsSync(path.join(process.cwd(), '.ploinky', 'agents.json')),
-  dataExists: fs.existsSync(path.join(process.cwd(), '.data')),
-}));`;
-        const result = spawnSync(process.execPath, ['--input-type=module', '-e', script], {
-            cwd: root,
-            env: {
-                ...process.env,
-                PLOINKY_WORKSPACE_ROOT: root,
-                PLOINKY_BOX_MARKER_PATH: marker,
-                PLOINKY_OUTER_PUBLICATION_CONTRACT: JSON.stringify({
-                    schemaVersion: 2,
-                    targets: [{ start: 49123, end: 49123, protocol: 'tcp' }],
-                    publishes: [],
-                }),
-                PLOINKY_MASTER_KEY: '7'.repeat(64),
-            },
-            encoding: 'utf8',
-        });
-
-        assert.equal(result.status, 0, result.stderr || result.stdout);
-        const output = JSON.parse(result.stdout);
-        assert.match(output.error?.message || '', /reserved outer router socket 49123\/tcp/);
-        assert.deepEqual({
-            routingPort: output.routingPort,
-            agentsExists: output.agentsExists,
-            dataExists: output.dataExists,
-        }, {
-            routingPort: 49123,
-            agentsExists: false,
-            dataExists: false,
-        });
-    } finally {
-        fs.rmSync(root, { recursive: true, force: true });
-    }
-});
-
-test('startup config providers run before manifest directives can start dependencies', () => {
+test('coordinated graph topology precedes startup preinstall and config providers', () => {
     const source = startWorkspace.toString();
     const prepareIndex = source.indexOf('prepareManifestRepositories');
+    const generationIndex = source.indexOf('ensureGraphNodesEnabled(dependencyGraph, reg, {');
+    const preinstallIndex = source.indexOf('executeHostHook(hookValue, hookEnv');
     const providerIndex = source.indexOf('applyStartupConfigProvidersForGraph');
-    const enableIndex = source.indexOf('applyManifestDirectives');
+    const finalPreparationIndex = source.indexOf('reprepareGraphAfterStartupProviders(');
+    const launchIndex = source.indexOf('ensureAgentService(shortAgentName');
 
     assert.ok(prepareIndex >= 0, 'workspace start must prepare manifest repositories');
-    assert.ok(providerIndex > prepareIndex, 'providers must run after their repositories are available');
-    assert.ok(enableIndex > providerIndex, 'providers must finish before manifest enable directives start dependencies');
+    assert.ok(generationIndex > prepareIndex, 'graph identities and topology must follow repository preparation');
+    assert.ok(preinstallIndex > generationIndex, 'static preinstall must receive only a captured topology generation');
+    assert.ok(providerIndex > preinstallIndex, 'providers must run after static preinstall has populated shared values');
+    assert.ok(finalPreparationIndex > providerIndex, 'provider output must be captured by a fresh identity generation');
+    assert.ok(launchIndex > finalPreparationIndex, 'no managed process may start before consumer hooks and final identity preparation finish');
+    assert.match(source, /edgeRuntimeEnvironment\('host', \{ workspaceRoot: PLOINKY_WORKSPACE_ROOT \}\)/);
+    assert.doesNotMatch(source, /applyManifestDirectives/, 'workspace start must not use sequential manifest enable/start');
 });
 
-test('workspace router TCP listener is ready before first-use static agent startup', () => {
+test('static preinstall failure is fatal before startup providers can run', () => {
+    assert.throws(
+        () => assertStaticPreinstallSucceeded({ success: false, message: 'fixture failure' }),
+        /static preinstall hook failed: fixture failure/,
+    );
+    assert.doesNotThrow(() => assertStaticPreinstallSucceeded({ success: true }));
+
+    const source = startWorkspace.toString();
+    const assertionIndex = source.indexOf('assertStaticPreinstallSucceeded(result)');
+    const providerIndex = source.indexOf('applyStartupConfigProvidersForGraph');
+    assert.ok(assertionIndex >= 0 && assertionIndex < providerIndex);
+    assert.match(source, /catch \(preErr\) \{\s*throw new Error\(`start: static preinstall preflight failed:/);
+    assert.doesNotMatch(source, /Preinstall failed:|Preinstall hook error:/);
+});
+
+test('workspace router TCP listener and both inactive graph preparations precede every agent startup', () => {
     const source = startWorkspace.toString();
     const routerIndex = source.indexOf('await ensureRouterReadyForStart({');
-    const enableIndex = source.indexOf('await enableAgent(staticAgentArg)');
+    const generationIndex = source.indexOf('ensureGraphNodesEnabled(dependencyGraph, reg, {');
+    const finalPreparationIndex = source.indexOf('reprepareGraphAfterStartupProviders(');
+    const launchIndex = source.indexOf('ensureAgentService(shortAgentName');
     const lockIndex = source.indexOf('createWorkspaceStartLock()');
 
     assert.ok(lockIndex >= 0 && lockIndex < routerIndex, 'workspace start must suppress watchdog container reconciliation before router startup');
     assert.ok(routerIndex >= 0, 'workspace start must establish the router listener');
-    assert.ok(enableIndex > routerIndex, 'the first managed agent must not start before the router TCP listener');
+    assert.ok(generationIndex > routerIndex, 'the complete graph identity generation must follow Router listener startup');
+    assert.ok(finalPreparationIndex > generationIndex, 'provider-sensitive identities require a second inactive preparation');
+    assert.ok(launchIndex > finalPreparationIndex, 'no managed process may start before the final graph identity generation is prepared');
+    assert.match(source, /preparedGeneration\?\.selector\?\.state !== 'inactive'/);
+    assert.match(source, /mergeRoutingConfig\([\s\S]*?reason: 'workspace-runtime-graph-ready',[\s\S]*?preparationLease: workspacePreparationLease/);
+    assert.ok(
+        source.indexOf("reason: 'workspace-runtime-graph-ready'")
+            > source.indexOf('await waitForReadinessEntries(readinessEntries)'),
+        'the graph selector must activate only after semantic readiness',
+    );
     assert.match(source, /Existing router TCP listener is ready/);
     assert.doesNotMatch(source, /Unix socket|router\.sock/);
     assert.match(source, /finally\s*\{\s*releaseWorkspaceStartLock\(workspaceStartLock\)/);
+});
+
+test('prepared runtime records and routes commit together before activation, including no-wait workers', () => {
+    const source = startWorkspace.toString();
+    assert.match(source, /reg\[result\.containerName\] = result\.registryRecord/);
+    assert.ok(
+        source.lastIndexOf('workspaceSvc.saveAgents(reg,')
+            > source.indexOf('await waitForReadinessEntries(readinessEntries)'),
+        'runtime-only registry metadata must be persisted after all host-capability launches',
+    );
+    assert.match(source, /forceRecreate:\s*newlyPreparedContainers\.has\(name\)/);
+    assert.match(source, /forceRecreate:\s*newlyPreparedContainers\.has\(registryName\)/);
+
+    const noWaitSource = fs.readFileSync(
+        new URL('../../cli/services/noWaitWorker.js', import.meta.url),
+        'utf8',
+    );
+    assert.match(noWaitSource, /agents\[containerName\] = registryRecord;\s*saveAgents\(agents, \{ coordinate: false \}\)/);
+    assert.match(noWaitSource, /forceRecreate:\s*args\.forceRecreate === '1'/);
+    assert.match(noWaitSource, /prepareEdgeRoutingGeneration\(\{ reason, applyLockCapability \}\)/);
+    assert.match(noWaitSource, /preparedHostModeCapability:\s*lifecycle\.preparedHostModeCapability/);
+    assert.match(noWaitSource, /preparationLease:\s*lifecycle\.preparationLease/);
+    assert.match(noWaitSource, /await waitForPriorWorker\(waitForStatus\)/);
+    assert.ok(
+        noWaitSource.indexOf('await waitForNoWaitReadiness({')
+            < noWaitSource.indexOf('await upsertRoute(routeKey'),
+        'a detached runtime must pass readiness before route activation',
+    );
 });
 
 test('resolveWorkspaceDependencyGraph preserves dependency modes while qualifying relative refs', () => {
@@ -383,19 +360,52 @@ test('retained graph records reconcile isolated, global, and devel execution bef
             config: { binds: [{ source: tempDir, target: tempDir }] },
         },
     };
+    const events = [];
     const removed = [];
     const saved = [];
+    const idValues = Array.from({ length: 12 }, (_, index) => `fresh-id-${index + 1}`);
+    let idIndex = 0;
+    const routing = {
+        routes: Object.fromEntries(Object.entries(registry).map(([containerName, record], index) => [
+            record.alias || record.agentName,
+            {
+                container: containerName,
+                repo: record.repoName,
+                agent: record.agentName,
+                ...(record.alias ? { alias: record.alias } : {}),
+                hostPort: 4100 + index,
+                serviceTargets: { 3000: 5100 + index },
+            },
+        ])),
+    };
+    registry.blocking_container.auth = { mode: 'local', usersVar: 'AUTH_USERS' };
+    registry.blocking_container.unrelated = { retained: true };
 
-    ensureGraphNodesEnabled({ nodes }, registry, {
+    const prepared = ensureGraphNodesEnabled({ nodes }, registry, {
         removeAgentContainerForRecreate(containerName) {
+            events.push(`remove:${containerName}`);
             removed.push(containerName);
         },
         saveAgents(nextRegistry) {
+            events.push('save-agents');
             saved.push(structuredClone(nextRegistry));
         },
-        enableAgent() {
-            assert.fail('all retained graph nodes should already be enabled');
+        prepareAgentEnableBatch(requests) {
+            events.push('prepare-generation');
+            assert.deepEqual(requests, []);
+            return { plans: [], preparedGeneration: { selector: { state: 'inactive' } } };
         },
+        inactivateGeneration() { events.push('inactivate'); },
+        loadRouting() { return routing; },
+        saveRouting(nextRouting) {
+            events.push('save-routing');
+            for (const route of Object.values(nextRouting.routes)) {
+                assert.equal(Object.hasOwn(route, 'hostPort'), false);
+                assert.equal(Object.hasOwn(route, 'serviceTargets'), false);
+            }
+        },
+        runtimeReplacementReason() { return ''; },
+        uuid() { return idValues[idIndex++]; },
         executionRecordOptions: {
             workspaceRoot: tempDir,
             reposDir,
@@ -405,8 +415,24 @@ test('retained graph records reconcile isolated, global, and devel execution bef
         },
     });
 
-    assert.deepEqual(removed.sort(), ['background_container', 'blocking_container', 'devel_container']);
+    assert.deepEqual(removed.sort(), [
+        'background_container',
+        'blocking_container',
+        'devel_container',
+        'implicit_container',
+        'root_container',
+    ]);
+    assert.deepEqual(prepared.changedContainers, [
+        'background_container',
+        'blocking_container',
+        'devel_container',
+        'implicit_container',
+        'root_container',
+    ]);
     assert.equal(saved.length, 1);
+    assert.ok(events.indexOf('inactivate') < events.indexOf('save-agents'));
+    assert.ok(events.indexOf('save-routing') < events.indexOf('prepare-generation'));
+    assert.ok(events.indexOf('prepare-generation') < events.findIndex((entry) => entry.startsWith('remove:')));
     assert.deepEqual(
         {
             runMode: registry.blocking_container.runMode,
@@ -448,17 +474,23 @@ test('retained graph records reconcile isolated, global, and devel execution bef
         { runMode: 'global', projectPath: tempDir, profile: 'embedded' },
     );
     assert.deepEqual(registry.blocking_container.config.binds, [{ source: '/old', target: '/root' }]);
+    assert.deepEqual(registry.blocking_container.auth, { mode: 'local', usersVar: 'AUTH_USERS' });
+    assert.deepEqual(registry.blocking_container.unrelated, { retained: true });
+    for (const containerName of prepared.changedContainers) {
+        assert.match(registry[containerName].instanceId, /^fresh-id-/);
+        assert.match(registry[containerName].enableGeneration, /^fresh-id-/);
+    }
     assert.equal(fs.readFileSync(preservedNamedData, 'utf8'), 'named-data');
     assert.equal(fs.readFileSync(preservedWorkspaceData, 'utf8'), 'workspace-data');
 
     const startSource = startWorkspace.toString();
     assert.ok(
-        startSource.indexOf('ensureGraphNodesEnabled') < startSource.indexOf('classifyDependencyGraphWaitMode'),
-        'execution reconciliation must occur before the graph is divided into blocking and no-wait launch paths',
+        startSource.indexOf('classifyDependencyGraphWaitMode') < startSource.indexOf('ensureGraphNodesEnabled'),
+        'no-wait classification must be available when the inactive graph generation is staged',
     );
 });
 
-test('execution-mode reconciliation leaves registry records unchanged when exact-container removal fails', () => {
+test('execution-mode removal failure leaves the fresh target-less generation selected inactive without rollback', () => {
     const registry = {
         retained_container: {
             type: 'agent', repoName: 'demo', agentName: 'retained',
@@ -466,7 +498,10 @@ test('execution-mode reconciliation leaves registry records unchanged when exact
             profile: 'default',
         },
     };
-    const before = structuredClone(registry);
+    const events = [];
+    const routing = { routes: { retained: {
+        container: 'retained_container', repo: 'demo', agent: 'retained', hostPort: 49100,
+    } } };
     let saveCount = 0;
 
     assert.throws(
@@ -477,18 +512,58 @@ test('execution-mode reconciliation leaves registry records unchanged when exact
             }]]),
         }, registry, {
             removeAgentContainerForRecreate() {
+                events.push('remove');
                 throw new Error('safe removal refused');
             },
-            saveAgents() {
+            saveAgents(nextRegistry) {
+                events.push('save-agents');
                 saveCount += 1;
+                assert.notEqual(nextRegistry.retained_container.instanceId, undefined);
             },
+            inactivateGeneration() { events.push('inactivate'); },
+            loadRouting() { return routing; },
+            saveRouting(nextRouting) {
+                events.push('save-routing');
+                assert.equal(Object.hasOwn(nextRouting.routes.retained, 'hostPort'), false);
+            },
+            prepareAgentEnableBatch() {
+                events.push('prepare-generation');
+                return {
+                    plans: [],
+                    preparedGeneration: {
+                        selector: { state: 'inactive' },
+                        preparationLease: { transactionId: 'removal-lease' },
+                    },
+                };
+            },
+            abortPreparation(lease) {
+                events.push('abort');
+                assert.equal(lease.transactionId, 'removal-lease');
+            },
+            runtimeReplacementReason() { return ''; },
+            uuid: (() => {
+                const values = ['fresh-instance', 'fresh-enable'];
+                return () => values.shift();
+            })(),
             executionRecordOptions: { workspaceRoot: tempDir },
         }),
         /safe removal refused/,
     );
 
-    assert.deepEqual(registry, before);
-    assert.equal(saveCount, 0);
+    assert.equal(registry.retained_container.runMode, 'global');
+    assert.equal(registry.retained_container.profile, 'embedded');
+    assert.equal(registry.retained_container.instanceId, 'fresh-instance');
+    assert.equal(registry.retained_container.enableGeneration, 'fresh-enable');
+    assert.equal(saveCount, 1);
+    assert.deepEqual(events, [
+        'inactivate',
+        'save-agents',
+        'save-routing',
+        'prepare-generation',
+        'remove',
+        'inactivate',
+        'abort',
+    ]);
 });
 
 test('an empty legacy develRepo field does not force recreation of an otherwise matching mode', () => {
@@ -500,6 +575,14 @@ test('an empty legacy develRepo field does not force recreation of an otherwise 
     };
     let removals = 0;
     let saves = 0;
+    let routingSaves = 0;
+    const routing = { routes: { retained: {
+        container: 'retained_container',
+        repo: 'demo',
+        agent: 'retained',
+        hostPort: 43001,
+        serviceTargets: { 3000: 43002 },
+    } } };
     ensureGraphNodesEnabled({
         nodes: new Map([['demo/retained', {
             id: 'demo/retained', repoName: 'demo', shortAgentName: 'retained',
@@ -509,11 +592,400 @@ test('an empty legacy develRepo field does not force recreation of an otherwise 
     }, registry, {
         removeAgentContainerForRecreate() { removals += 1; },
         saveAgents() { saves += 1; },
-        enableAgent() { assert.fail('the retained node is already enabled'); },
+        inactivateGeneration() {},
+        loadRouting() { return routing; },
+        saveRouting(nextRouting) {
+            routingSaves += 1;
+            assert.equal(Object.hasOwn(nextRouting.routes.retained, 'hostPort'), false);
+            assert.equal(Object.hasOwn(nextRouting.routes.retained, 'serviceTargets'), false);
+        },
+        prepareAgentEnableBatch(requests) {
+            assert.deepEqual(requests, []);
+            return { plans: [], preparedGeneration: { selector: { state: 'inactive' } } };
+        },
+        runtimeReplacementReason() { return ''; },
         executionRecordOptions: { workspaceRoot: tempDir },
     });
     assert.equal(removals, 0);
     assert.equal(saves, 0);
+    assert.equal(routingSaves, 1);
+});
+
+test('a healthy retained blocking runtime is target-less before hooks without rotating its identity', () => {
+    const node = {
+        id: 'demo/healthy',
+        repoName: 'demo',
+        shortAgentName: 'healthy',
+        alias: '',
+        agentRef: 'demo/healthy',
+        enableSpec: 'demo/healthy global',
+        profile: 'default',
+        isStatic: false,
+    };
+    const registry = {
+        healthy_container: {
+            type: 'agent',
+            repoName: 'demo',
+            agentName: 'healthy',
+            runMode: 'global',
+            projectPath: tempDir,
+            profile: 'default',
+            instanceId: 'retained-instance',
+            enableGeneration: 'retained-generation',
+        },
+    };
+    const routing = { routes: { healthy: {
+        container: 'healthy_container',
+        repo: 'demo',
+        agent: 'healthy',
+        hostPort: 43101,
+        serviceTargets: { 3000: 43102 },
+    } } };
+    const events = [];
+
+    const prepared = ensureGraphNodesEnabled({ nodes: new Map([[node.id, node]]) }, registry, {
+        runtimeReplacementReason() { return ''; },
+        inactivateGeneration() { events.push('inactive'); },
+        loadRouting() { return routing; },
+        saveRouting(nextRouting) {
+            events.push('targetless');
+            assert.equal(Object.hasOwn(nextRouting.routes.healthy, 'hostPort'), false);
+            assert.equal(Object.hasOwn(nextRouting.routes.healthy, 'serviceTargets'), false);
+        },
+        saveAgents() {
+            assert.fail('a healthy predecessor must retain its exact identity tuple');
+        },
+        prepareAgentEnableBatch(requests) {
+            events.push('prepared');
+            assert.deepEqual(requests, []);
+            return {
+                plans: [],
+                preparedGeneration: {
+                    selector: { state: 'inactive' },
+                    preparationLease: { transactionId: 'healthy-lease' },
+                },
+            };
+        },
+        removeAgentContainerForRecreate() {
+            assert.fail('a healthy retained runtime must not be removed');
+        },
+        executionRecordOptions: { workspaceRoot: tempDir },
+    });
+
+    assert.deepEqual(events, ['inactive', 'targetless', 'prepared']);
+    assert.deepEqual(prepared.changedContainers, []);
+    assert.equal(registry.healthy_container.instanceId, 'retained-instance');
+    assert.equal(registry.healthy_container.enableGeneration, 'retained-generation');
+});
+
+test('post-provider preparation rotates only retained predecessor tuples and preserves early fresh tuples', () => {
+    const nodes = new Map([
+        ['demo/already', {
+            id: 'demo/already', repoName: 'demo', shortAgentName: 'already', alias: '',
+            agentRef: 'demo/already', enableSpec: 'demo/already global',
+            profile: 'default', isStatic: false,
+        }],
+        ['demo/healthy', {
+            id: 'demo/healthy', repoName: 'demo', shortAgentName: 'healthy', alias: '',
+            agentRef: 'demo/healthy', enableSpec: 'demo/healthy global',
+            profile: 'default', isStatic: false,
+        }],
+    ]);
+    const registry = {
+        already_container: {
+            type: 'agent', repoName: 'demo', agentName: 'already',
+            runMode: 'global', projectPath: tempDir, profile: 'default',
+            instanceId: 'early-fresh-instance', enableGeneration: 'early-fresh-generation',
+        },
+        healthy_container: {
+            type: 'agent', repoName: 'demo', agentName: 'healthy',
+            runMode: 'global', projectPath: tempDir, profile: 'default',
+            instanceId: 'predecessor-instance', enableGeneration: 'predecessor-generation',
+        },
+    };
+    const routing = { routes: {
+        already: {
+            container: 'already_container', repo: 'demo', agent: 'already', hostPort: 43201,
+        },
+        healthy: {
+            container: 'healthy_container', repo: 'demo', agent: 'healthy', hostPort: 43202,
+            serviceTargets: { 3000: 43203 },
+        },
+    } };
+    const initialPreparedGraph = {
+        plans: [{ containerName: 'already_container' }],
+        changedContainers: [],
+        preparedGeneration: {
+            selector: { state: 'inactive' },
+            preparationLease: { transactionId: 'early-lease' },
+        },
+    };
+    const events = [];
+
+    const result = reprepareGraphAfterStartupProviders(
+        { nodes },
+        registry,
+        initialPreparedGraph,
+        {
+            abortPreparation(lease, options) {
+                events.push(`abort:${lease.transactionId}:${options.reason}`);
+            },
+            runtimeReplacementReason(plan) {
+                events.push(`reason:${plan.existing.key}`);
+                assert.equal(plan.existing.rec.instanceId, 'predecessor-instance');
+                return 'envHashChanged';
+            },
+            graphEnableOptions: {
+                inactivateGeneration() { events.push('inactive'); },
+                loadRouting() { return routing; },
+                saveRouting(nextRouting) {
+                    events.push('targetless');
+                    for (const route of Object.values(nextRouting.routes)) {
+                        assert.equal(Object.hasOwn(route, 'hostPort'), false);
+                        assert.equal(Object.hasOwn(route, 'serviceTargets'), false);
+                    }
+                },
+                saveAgents() { events.push('save-agents'); },
+                prepareAgentEnableBatch(requests) {
+                    events.push('prepared');
+                    assert.deepEqual(requests, []);
+                    return {
+                        plans: [],
+                        preparedGeneration: {
+                            selector: { state: 'inactive' },
+                            preparationLease: { transactionId: 'final-lease' },
+                        },
+                    };
+                },
+                removeAgentContainerForRecreate(containerName) {
+                    events.push(`remove:${containerName}`);
+                },
+                uuid: (() => {
+                    const ids = ['provider-instance', 'provider-generation'];
+                    return () => ids.shift();
+                })(),
+                executionRecordOptions: { workspaceRoot: tempDir },
+            },
+        },
+    );
+
+    assert.deepEqual(events, [
+        'abort:early-lease:workspace-start-provider-reprepare',
+        'reason:healthy_container',
+        'inactive',
+        'save-agents',
+        'targetless',
+        'prepared',
+        'remove:healthy_container',
+    ]);
+    assert.deepEqual(result.preparedGraph.changedContainers, ['healthy_container']);
+    assert.equal(result.preparedGraph.preparedGeneration.preparationLease.transactionId, 'final-lease');
+    assert.deepEqual([...result.preparedContainerNames].sort(), [
+        'already_container',
+        'healthy_container',
+    ]);
+    assert.equal(registry.healthy_container.instanceId, 'provider-instance');
+    assert.equal(registry.healthy_container.enableGeneration, 'provider-generation');
+    assert.equal(registry.already_container.instanceId, 'early-fresh-instance');
+    assert.equal(registry.already_container.enableGeneration, 'early-fresh-generation');
+});
+
+test('missing static and dependency nodes are staged in one target-less identity generation', () => {
+    const calls = [];
+    const nodes = new Map([
+        ['demo/root', {
+            id: 'demo/root', repoName: 'demo', shortAgentName: 'root',
+            agentRef: 'demo/root', enableSpec: 'demo/root global', alias: '',
+            profile: 'default', isStatic: true,
+        }],
+        ['media/livekit', {
+            id: 'media/livekit', repoName: 'media', shortAgentName: 'livekit',
+            agentRef: 'media/livekit', enableSpec: 'media/livekit global', alias: 'sfu',
+            profile: 'embedded', isStatic: false,
+        }],
+    ]);
+
+    ensureGraphNodesEnabled({ nodes }, {}, {
+        prepareAgentEnableBatch(requests, options) {
+            calls.push({ requests: structuredClone(requests), options: structuredClone(options) });
+            return { plans: requests };
+        },
+        saveAgents() {
+            assert.fail('an empty retained registry does not need a separate save');
+        },
+    });
+
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].options.reason, 'workspace-graph-enable-prelaunch');
+    assert.deepEqual(calls[0].requests, [
+        {
+            agentName: 'demo/root global',
+            aliasParam: undefined,
+            authOptions: { profile: 'default' },
+        },
+        {
+            agentName: 'media/livekit global',
+            aliasParam: 'sfu',
+            authOptions: { profile: 'embedded' },
+        },
+    ]);
+});
+
+test('an existing stopped no-wait node rotates identity and loses stale targets before removal and pre-worker activation', () => {
+    const node = {
+        id: 'demo/background',
+        repoName: 'demo',
+        shortAgentName: 'background',
+        alias: '',
+        agentRef: 'demo/background',
+        enableSpec: 'demo/background global',
+        profile: 'default',
+        isStatic: false,
+    };
+    const registry = {
+        background_container: {
+            type: 'agent',
+            repoName: 'demo',
+            agentName: 'background',
+            runMode: 'global',
+            projectPath: tempDir,
+            profile: 'default',
+            instanceId: 'old-instance',
+            enableGeneration: 'old-enable',
+            auth: { mode: 'authenticated', retained: true },
+        },
+    };
+    const routing = { routes: { background: {
+        container: 'background_container',
+        repo: 'demo',
+        agent: 'background',
+        hostPort: 43001,
+        serviceTargets: { 3000: 43002 },
+    } } };
+    const events = [];
+    const result = ensureGraphNodesEnabled({ nodes: new Map([[node.id, node]]) }, registry, {
+        deferredNodeIds: new Set([node.id]),
+        runtimeReplacementReason() { return 'runtimeStopped'; },
+        inactivateGeneration() { events.push('inactive'); },
+        loadRouting() { return routing; },
+        saveRouting(next) {
+            events.push('targetless');
+            assert.equal(Object.hasOwn(next.routes.background, 'hostPort'), false);
+            assert.equal(Object.hasOwn(next.routes.background, 'serviceTargets'), false);
+        },
+        saveAgents() { events.push('fresh-identity'); },
+        prepareAgentEnableBatch(requests) {
+            events.push('prepared');
+            assert.deepEqual(requests, []);
+            return {
+                plans: [],
+                preparedGeneration: {
+                    selector: { state: 'inactive' },
+                    preparationLease: { transactionId: 'lease' },
+                },
+            };
+        },
+        removeAgentContainerForRecreate(containerName) {
+            events.push(`removed:${containerName}`);
+        },
+        uuid: (() => {
+            const ids = ['new-instance', 'new-enable'];
+            return () => ids.shift();
+        })(),
+        executionRecordOptions: { workspaceRoot: tempDir },
+    });
+
+    assert.deepEqual(events, [
+        'inactive',
+        'fresh-identity',
+        'targetless',
+        'prepared',
+        'removed:background_container',
+    ]);
+    assert.deepEqual(result.changedContainers, ['background_container']);
+    assert.equal(registry.background_container.instanceId, 'new-instance');
+    assert.equal(registry.background_container.enableGeneration, 'new-enable');
+    assert.deepEqual(registry.background_container.auth, { mode: 'authenticated', retained: true });
+    const source = startWorkspace.toString();
+    assert.match(source, /deferredNodeIds:\s*waitClassification\.noWait/);
+    assert.match(source, /new Set\(postProviderPreparation\.preparedContainerNames\)/);
+    assert.match(source, /preparationLease:\s*workspacePreparationLease/);
+});
+
+test('a stopped enabled runtime outside the dependency graph is staged target-less and rotated before removal', () => {
+    const extraNode = {
+        id: 'extra:outside_container',
+        repoName: 'demo',
+        shortAgentName: 'outside',
+        alias: '',
+        agentRef: 'demo/outside',
+        profile: '',
+        manifest: { container: 'node:20-alpine' },
+        agentPath: path.join(tempDir, '.ploinky', 'repos', 'demo', 'outside'),
+    };
+    const registry = {
+        outside_container: {
+            type: 'agent',
+            repoName: 'demo',
+            agentName: 'outside',
+            runMode: 'global',
+            projectPath: tempDir,
+            instanceId: 'outside-old-instance',
+            enableGeneration: 'outside-old-generation',
+            auth: { mode: 'sso', retained: true },
+        },
+    };
+    const routing = { routes: { outside: {
+        container: 'outside_container',
+        repo: 'demo',
+        agent: 'outside',
+        hostPort: 44000,
+    } } };
+    const events = [];
+
+    const result = ensureGraphNodesEnabled({ nodes: new Map() }, registry, {
+        additionalNodes: [extraNode],
+        runtimeReplacementReason() { return 'registeredRuntimeMissing'; },
+        inactivateGeneration() { events.push('inactive'); },
+        loadRouting() { return routing; },
+        saveAgents() { events.push('registry'); },
+        saveRouting(next) {
+            events.push('route');
+            assert.equal(Object.hasOwn(next.routes.outside, 'hostPort'), false);
+        },
+        prepareAgentEnableBatch(requests) {
+            events.push('prepared');
+            assert.deepEqual(requests, []);
+            return {
+                plans: [],
+                preparedGeneration: {
+                    selector: { state: 'inactive' },
+                    preparationLease: { transactionId: 'extra-lease' },
+                },
+            };
+        },
+        removeAgentContainerForRecreate(containerName) {
+            events.push(`removed:${containerName}`);
+        },
+        uuid: (() => {
+            const ids = ['outside-new-instance', 'outside-new-generation'];
+            return () => ids.shift();
+        })(),
+    });
+
+    assert.deepEqual(events, [
+        'inactive',
+        'registry',
+        'route',
+        'prepared',
+        'removed:outside_container',
+    ]);
+    assert.deepEqual(result.changedContainers, ['outside_container']);
+    assert.equal(registry.outside_container.instanceId, 'outside-new-instance');
+    assert.equal(registry.outside_container.enableGeneration, 'outside-new-generation');
+    assert.deepEqual(registry.outside_container.auth, { mode: 'sso', retained: true });
+    const source = startWorkspace.toString();
+    assert.match(source, /resolveExtraEnabledRuntimeNodes\([\s\S]*?additionalNodes:\s*extraRuntimeNodes/);
 });
 
 test('devel execution preflight fails before removing any retained graph container', () => {

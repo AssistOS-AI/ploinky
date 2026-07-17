@@ -208,7 +208,7 @@ test('explicit MCP readiness takes precedence over a declared health script', ()
     assert.equal(entry.scriptProbe, undefined);
 });
 
-test('start-only additionalServerPort readiness remains TCP and uses its resolved private route', () => {
+test('start-only readiness remains TCP when the primary target has a resolved private route', () => {
     const entry = buildBlockingReadinessEntryFromNode({
         id: 'private-api',
         shortAgentName: 'private-api',
@@ -217,11 +217,6 @@ test('start-only additionalServerPort readiness remains TCP and uses its resolve
     }, {
         container: 'private-api-container',
         hostPort: 42345,
-        additionalServerPort: {
-            url: 'http://127.0.0.1:42345',
-            containerUrl: 'http://127.0.0.1:9000',
-            mode: 'host',
-        },
     }, 'explorer');
 
     assert.equal(entry.protocol, 'tcp');
@@ -234,7 +229,7 @@ test('start-only readiness without a port, script, or none policy fails with a m
         shortAgentName: 'broken-service',
         isStatic: false,
         manifest: { start: 'node service.mjs' },
-    }, { container: 'broken-service-container', hostPort: 0 }, 'explorer'), /start-only.*health\.readiness\.script.*additionalServerPort.*readiness\.protocol.*none/i);
+    }, { container: 'broken-service-container', hostPort: 0 }, 'explorer'), /start-only.*health\.readiness\.script.*httpServices\[\]\.port.*readiness\.protocol.*none/i);
 });
 
 test('script readiness success is dispatched against the route container', async () => {

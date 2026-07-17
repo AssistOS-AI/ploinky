@@ -18,6 +18,21 @@ fs.writeFileSync(
     path.join(tempDir, '.ploinky', 'routing.json'),
     JSON.stringify({ port: 8080, routes: {} }, null, 2),
 );
+fs.writeFileSync(path.join(tempDir, '.ploinky', 'agents.json'), '{}\n');
+fs.mkdirSync(path.join(tempDir, '.ploinky', 'data', 'router-security'), { recursive: true });
+fs.writeFileSync(
+    path.join(tempDir, '.ploinky', 'data', 'router-security', 'policy-state.json'),
+    JSON.stringify({ schema: 'router-policy', httpRoutes: [], mcpTools: [] }, null, 2),
+);
+fs.mkdirSync(path.join(tempDir, '.ploinky', 'data', 'edge-routing'), { recursive: true });
+fs.writeFileSync(
+    path.join(tempDir, '.ploinky', 'data', 'edge-routing', 'desired.json'),
+    JSON.stringify({
+        schemaVersion: 1,
+        hosts: {},
+        security: { hostNetworkAllowedInstances: [], internalServiceConsumers: {} },
+    }, null, 2),
+);
 
 const moduleSuffix = `?test=${Date.now()}`;
 const reposUrl = new URL('../../cli/services/repos.js', import.meta.url);
@@ -80,7 +95,9 @@ function createBareAgentRepo(name, agentName, { branches = [] } = {}) {
     fs.mkdirSync(manifestDir, { recursive: true });
     fs.writeFileSync(path.join(manifestDir, 'manifest.json'), JSON.stringify({
         container: 'node:20',
-        network: { mode: 'host' },
+        start: 'sleep infinity',
+        network: { mode: 'default' },
+        readiness: { protocol: 'none' },
     }, null, 2));
     execFileSync('git', ['-C', workPath, 'add', '.'], { stdio: 'ignore' });
     execFileSync('git', ['-C', workPath, 'commit', '-m', 'agent manifest'], { stdio: 'ignore' });
@@ -101,7 +118,9 @@ function writeAgentManifest(repoName, agentName, manifest) {
     const agentDir = path.join(tempDir, '.ploinky', 'repos', repoName, agentName);
     fs.mkdirSync(agentDir, { recursive: true });
     fs.writeFileSync(path.join(agentDir, 'manifest.json'), JSON.stringify({
-        network: { mode: 'host' },
+        start: 'sleep infinity',
+        network: { mode: 'default' },
+        readiness: { protocol: 'none' },
         ...manifest,
     }, null, 2));
 }

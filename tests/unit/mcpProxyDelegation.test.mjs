@@ -12,6 +12,9 @@ import { mintUserDelegationGrant } from '../../cli/server/mcp-proxy/userDelegati
 const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-mcp-delegation-'));
 const originalCwd = process.cwd();
 const originalMasterKey = process.env.PLOINKY_MASTER_KEY;
+const originalWorkspaceRoot = process.env.PLOINKY_WORKSPACE_ROOT;
+const originalRouterHostPort = process.env.PLOINKY_ROUTER_HOST_PORT;
+const ploinkyDir = path.join(tempDir, '.ploinky');
 const repoDir = path.join(tempDir, '.ploinky', 'repos', 'AssistOSExplorer', 'dpuAgent');
 
 fs.mkdirSync(repoDir, { recursive: true });
@@ -38,13 +41,48 @@ fs.writeFileSync(path.join(gitRepoDir, 'mcp-config.json'), JSON.stringify({
 }, null, 2));
 fs.writeFileSync(path.join(tempDir, '.ploinky', 'routing.json'), JSON.stringify({
     routes: {
-        gitAgent: { repo: 'AssistOSExplorer', agent: 'gitAgent', hostPath: gitRepoDir, hostPort: 7401 },
+        gitAgent: {
+            repo: 'AssistOSExplorer',
+            agent: 'gitAgent',
+            container: 'git-agent-container',
+            hostPath: gitRepoDir,
+            hostPort: 7401,
+        },
     },
+}, null, 2));
+fs.writeFileSync(path.join(ploinkyDir, 'agents.json'), JSON.stringify({
+    'git-agent-container': {
+        type: 'agent',
+        repoName: 'AssistOSExplorer',
+        agentName: 'gitAgent',
+        instanceId: 'git-agent-instance',
+        enableGeneration: 'git-agent-enable-generation',
+        auth: { mode: 'none' },
+    },
+}, null, 2));
+fs.mkdirSync(path.join(ploinkyDir, 'data', 'edge-routing'), { recursive: true });
+fs.mkdirSync(path.join(ploinkyDir, 'data', 'router-security'), { recursive: true });
+fs.writeFileSync(path.join(ploinkyDir, 'data', 'edge-routing', 'desired.json'), JSON.stringify({
+    schemaVersion: 1,
+    hosts: {},
+    security: {
+        hostNetworkAllowedInstances: [],
+        internalServiceConsumers: {},
+    },
+}, null, 2));
+fs.writeFileSync(path.join(ploinkyDir, 'data', 'router-security', 'policy-state.json'), JSON.stringify({
+    schema: 'router-policy',
+    httpRoutes: [],
+    mcpTools: [],
 }, null, 2));
 process.chdir(tempDir);
 process.env.PLOINKY_MASTER_KEY = '9'.repeat(64);
+process.env.PLOINKY_WORKSPACE_ROOT = tempDir;
+process.env.PLOINKY_ROUTER_HOST_PORT = '18080';
 
 const moduleSuffix = `?test=${Date.now()}`;
+const { applyEdgeRoutingGeneration } = await import(`../../cli/services/edgeGeneration.js${moduleSuffix}`);
+applyEdgeRoutingGeneration({ workspaceRoot: tempDir, reason: 'mcp-delegation-test-fixture' });
 const {
     verifyDelegatedAgentToolCall,
     verifyDelegatedAgentTaskStatusCall,
@@ -97,6 +135,10 @@ test.after(() => {
     fs.rmSync(tempDir, { recursive: true, force: true });
     if (originalMasterKey === undefined) delete process.env.PLOINKY_MASTER_KEY;
     else process.env.PLOINKY_MASTER_KEY = originalMasterKey;
+    if (originalWorkspaceRoot === undefined) delete process.env.PLOINKY_WORKSPACE_ROOT;
+    else process.env.PLOINKY_WORKSPACE_ROOT = originalWorkspaceRoot;
+    if (originalRouterHostPort === undefined) delete process.env.PLOINKY_ROUTER_HOST_PORT;
+    else process.env.PLOINKY_ROUTER_HOST_PORT = originalRouterHostPort;
 });
 
 test('mcp proxy verifies agent assertion before user delegation grant', () => {

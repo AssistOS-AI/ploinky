@@ -73,9 +73,6 @@ function resolveAgentReadinessProtocol(manifest, context = {}) {
         if (readManifestReadinessScript(manifest)) {
             return 'script';
         }
-        if (context.additionalServerPort) {
-            return 'tcp';
-        }
         return 'tcp';
     }
 

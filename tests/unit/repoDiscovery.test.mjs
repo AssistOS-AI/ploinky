@@ -5,7 +5,14 @@ import os from 'os';
 import path from 'path';
 import { execFileSync } from 'child_process';
 
-import {
+const originalCwd = process.cwd();
+const originalWorkspaceRoot = process.env.PLOINKY_WORKSPACE_ROOT;
+const suiteWorkspace = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-repo-discovery-suite-'));
+fs.mkdirSync(path.join(suiteWorkspace, '.ploinky'), { recursive: true });
+process.chdir(suiteWorkspace);
+process.env.PLOINKY_WORKSPACE_ROOT = suiteWorkspace;
+
+const [{
     REPO_SOURCES_FILE,
     addRepo,
     checkGitRemoteReachable,
@@ -14,9 +21,18 @@ import {
     resolveRepoSource,
     resolveRepoSourceUrl,
     updateRepo,
-} from '../../cli/services/repos.js';
-import { REPOS_DIR } from '../../cli/services/config.js';
-import { resolveUpdateProjectsRoot } from '../../cli/commands/repoAgentCommands.js';
+}, { REPOS_DIR }, { resolveUpdateProjectsRoot }] = await Promise.all([
+    import('../../cli/services/repos.js'),
+    import('../../cli/services/config.js'),
+    import('../../cli/commands/repoAgentCommands.js'),
+]);
+
+test.after(() => {
+    process.chdir(originalCwd);
+    if (originalWorkspaceRoot === undefined) delete process.env.PLOINKY_WORKSPACE_ROOT;
+    else process.env.PLOINKY_WORKSPACE_ROOT = originalWorkspaceRoot;
+    fs.rmSync(suiteWorkspace, { recursive: true, force: true });
+});
 
 function mkdir(dir) {
     fs.mkdirSync(dir, { recursive: true });

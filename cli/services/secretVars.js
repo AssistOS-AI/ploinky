@@ -457,12 +457,6 @@ function isEmptyValue(value) {
     return str.trim().length === 0;
 }
 
-function formatEnvSpecName(spec) {
-    return (spec.sourceName && spec.sourceName !== spec.insideName)
-        ? `${spec.insideName} (source: ${spec.sourceName})`
-        : spec.insideName;
-}
-
 function resolveExplicitEnvSource(name, secrets, getEnvFile) {
     if (!name) return undefined;
     if (Object.prototype.hasOwnProperty.call(secrets, name)) {
@@ -504,21 +498,14 @@ export function getIncompleteManifestEnvProfileEntries(manifest, profileConfig) 
 }
 
 export function validateManifestEnvProfileCompleteness(manifest, profileConfig, options = {}) {
-    const missing = getIncompleteManifestEnvProfileEntries(manifest, profileConfig);
-    if (!missing.length) {
-        return { valid: true, issues: [], missing: [] };
-    }
-
-    const profileLabel = options.profileName ? ` profile '${options.profileName}'` : ' profile';
-    const agentLabel = options.agentName ? ` for ${options.agentName}` : '';
-    const details = missing.map(formatEnvSpecName);
-    return {
-        valid: false,
-        missing,
-        issues: [
-            `Required non-sensitive env entries${agentLabel}${profileLabel} must define profile defaults: ${details.join(', ')}`
-        ]
-    };
+    // `required: true` already means the runtime must resolve an explicit
+    // operator/provider value when no default exists. Treating that deliberate
+    // declaration as a malformed profile forced security-sensitive topology
+    // values to acquire inferred defaults before the normal required-value
+    // resolver could run. Keep the structural result visible for profile/status
+    // callers, but enforce actual availability only through resolveManifestEnv.
+    const operatorRequired = getIncompleteManifestEnvProfileEntries(manifest, profileConfig);
+    return { valid: true, issues: [], missing: [], operatorRequired };
 }
 
 export function assertManifestEnvProfileCompleteness(manifest, profileConfig, options = {}) {

@@ -21,11 +21,13 @@ export {
 } from './containerFleet.js';
 
 export {
+    cleanupExactAgentRuntimeCandidate,
     ensureAgentService,
     removeAgentContainerForRecreate,
     resolveHostPort,
     resolveHostPortFromRecord,
     resolveHostPortFromRuntime,
+    restartGenerationCapabilityRuntime,
     startAgentContainer
 } from './agentServiceManager.js';
 
@@ -35,7 +37,6 @@ export {
 } from './containerRegistry.js';
 
 export {
-    assertOuterPublicationCoverageForManifest,
     containerExists,
     getAgentContainerName,
     getConfiguredProjectPath,
@@ -46,3 +47,11 @@ export {
 } from './common.js';
 
 export { clearLivenessState } from './healthProbes.js';
+
+export {
+    TARGETED_DRAIN_ACKNOWLEDGEMENT,
+    TARGETED_DRAIN_POLL_MS,
+    TARGETED_DRAIN_TIMEOUT_MS,
+    drainAndRemoveTargetedContainer,
+    drainTargetedContainer,
+} from './targetedContainerLifecycle.js';

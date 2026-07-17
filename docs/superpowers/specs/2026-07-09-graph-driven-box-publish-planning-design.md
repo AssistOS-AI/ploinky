@@ -1,7 +1,7 @@
 # Graph-Driven Box Publish Planning Design
 
 Date: 2026-07-09
-Status: implemented
+Status: archived; superseded by the approved 2026-07-15 box edge-routing and publication design
 
 ## Summary
 

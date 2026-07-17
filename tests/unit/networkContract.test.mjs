@@ -114,6 +114,5 @@ test('none mode fails preflight for every network-dependent startup surface', ()
     assert.deepEqual(assertNetworkStartupCompatibility({ start: 'sleep infinity' }, {}, none), none);
     assert.throws(() => assertNetworkStartupCompatibility({}, {}, none), /AgentServer/);
     assert.throws(() => assertNetworkStartupCompatibility({ start: 'x' }, { openPorts: ['9000'] }, none), /openPorts/);
-    assert.throws(() => assertNetworkStartupCompatibility({ start: 'x' }, { additionalServerPort: 9000 }, none), /additionalServerPort/);
     assert.throws(() => assertNetworkStartupCompatibility({ start: 'x', readiness: { protocol: 'http' } }, {}, none), /readiness/);
 });

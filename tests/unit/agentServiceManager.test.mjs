@@ -3,20 +3,238 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 
 import {
+    assertPreparedRegistryRecordPreservation,
     buildRuntimeRouterEnv,
     ensureAgentService,
+    isGenerationCapabilityRuntimeEffective,
+    restartGenerationCapabilityRuntime,
     replaceRuntimeRouterEnvFlags,
 } from '../../cli/services/docker/agentServiceManager.js';
 import { buildRouterEndpoint } from '../../cli/services/routerPort.js';
 
+test('prepared graph launches suppress intermediate registry persistence only for the exact staged identity', () => {
+    const staged = {
+        instanceId: 'instance-current',
+        enableGeneration: 'enable-current',
+    };
+    for (const ownerRef of ['repo/non-host-dependency', 'media/livekit']) {
+        assert.equal(assertPreparedRegistryRecordPreservation(staged, {
+            preservePreparedRegistryRecord: true,
+            instanceId: staged.instanceId,
+            enableGeneration: staged.enableGeneration,
+        }, { ownerRef }), true);
+    }
+    assert.equal(assertPreparedRegistryRecordPreservation(staged, {}, {
+        ownerRef: 'repo/ordinary-enable',
+    }), false);
+    assert.throws(
+        () => assertPreparedRegistryRecordPreservation(staged, {
+            preservePreparedRegistryRecord: true,
+            instanceId: staged.instanceId,
+            enableGeneration: 'stale-enable',
+        }, { ownerRef: 'media/livekit' }),
+        /exact staged instanceId\/enableGeneration/,
+    );
+    assert.throws(
+        () => assertPreparedRegistryRecordPreservation({}, {
+            preservePreparedRegistryRecord: true,
+        }, { ownerRef: 'repo/non-host-dependency' }),
+        /exact staged instanceId\/enableGeneration/,
+    );
+
+    const source = fs.readFileSync(new URL('../../cli/services/docker/agentServiceManager.js', import.meta.url), 'utf8');
+    assert.match(source, /const preserveRuntimeRegistryRecord = Boolean\(targetedRestart\)[\s\S]*Boolean\(runtimeIdentity\.preparationLease\)/);
+    assert.match(source, /preserveRegistryRecord:\s*preserveRuntimeRegistryRecord/);
+    assert.match(source, /if \(!preserveRuntimeRegistryRecord\) saveAgentsMap\(agents\)/);
+    assert.match(source, /registryRecord:\s*structuredClone\(agents\[containerName\]\)/);
+
+    for (const runtime of ['bwrap', 'seatbelt']) {
+        const runtimeSource = fs.readFileSync(
+            new URL(`../../cli/services/${runtime}/${runtime}ServiceManager.js`, import.meta.url),
+            'utf8',
+        );
+        assert.match(runtimeSource, /preservePreparedRegistryRecord:\s*options\.preservePreparedRegistryRecord/);
+        assert.match(runtimeSource, /registryRecord:\s*structuredClone\(agents\[containerName\]\)/);
+    }
+});
+
+test('effective generation capability requires the exact managed runtime to be running', () => {
+    const owner = {
+        agentId: 'agent:repo/livekit',
+        instanceId: 'instance-current',
+        enableGeneration: 'enable-current',
+        routeKey: 'livekit',
+        containerName: 'livekit-container',
+    };
+    const generation = {
+        compiled: { security: { hostNetworkCapabilities: [owner] } },
+        routing: {
+            routes: {
+                livekit: {
+                    container: owner.containerName,
+                    hostPath: '/workspace/.ploinky/repos/repo/livekit',
+                },
+            },
+        },
+        manifests: {
+            livekit: { network: { mode: 'host' } },
+        },
+        agents: {
+            [owner.containerName]: {
+                type: 'agent',
+                repoName: 'repo',
+                agentName: 'livekit',
+                instanceId: owner.instanceId,
+                enableGeneration: owner.enableGeneration,
+            },
+        },
+    };
+    const neverInspect = () => assert.fail('non-running runtime must not be inspected');
+    assert.equal(isGenerationCapabilityRuntimeEffective({ generation, owner }, {
+        exists: () => false,
+        isRunning: () => false,
+        inspectContainerContract: neverInspect,
+    }), false);
+    assert.equal(isGenerationCapabilityRuntimeEffective({ generation, owner }, {
+        exists: () => true,
+        isRunning: () => false,
+        inspectContainerContract: neverInspect,
+    }), false);
+    assert.equal(isGenerationCapabilityRuntimeEffective({ generation, owner }, {
+        exists: () => true,
+        isRunning: () => true,
+        inspectContainerContract: () => ({ state: 'foreign' }),
+    }), false);
+    assert.equal(isGenerationCapabilityRuntimeEffective({ generation, owner }, {
+        exists: () => true,
+        isRunning: () => true,
+        inspectContainerContract: (containerName, _network, agentName, options) => {
+            assert.equal(containerName, owner.containerName);
+            assert.equal(agentName, 'livekit');
+            assert.equal(options.instanceId, owner.instanceId);
+            assert.equal(options.enableGeneration, owner.enableGeneration);
+            assert.equal(options.requireRuntimeIdentity, true);
+            return { state: 'exact', id: 'candidate-current' };
+        },
+    }), true);
+    assert.equal(isGenerationCapabilityRuntimeEffective({ generation, owner }, {
+        exists: () => true,
+        isRunning: () => true,
+        inspectContainerContract: () => ({ state: 'owned-drift', reason: 'runtime-identity' }),
+    }), false);
+});
+
+test('targeted capability restart cannot activate before exact semantic readiness succeeds', () => {
+    const owner = {
+        agentId: 'agent:media/livekit',
+        instanceId: 'instance-current',
+        enableGeneration: 'enable-current',
+        routeKey: 'livekit',
+        containerName: 'livekit-container',
+    };
+    const generation = {
+        compiled: { security: { hostNetworkCapabilities: [owner] } },
+        routing: {
+            routes: {
+                livekit: { container: owner.containerName, hostPath: '/code/livekit' },
+            },
+        },
+        manifests: {
+            livekit: {
+                network: { mode: 'host' },
+                health: { readiness: { script: 'healthcheck.sh' } },
+            },
+        },
+        agents: {
+            [owner.containerName]: {
+                type: 'agent',
+                repoName: 'media',
+                agentName: 'livekit',
+                instanceId: owner.instanceId,
+                enableGeneration: owner.enableGeneration,
+            },
+        },
+    };
+    let readinessCalls = 0;
+    const cleanupCalls = [];
+    assert.throws(() => restartGenerationCapabilityRuntime({
+        generation,
+        owner,
+        affectedSelectors: ['media:agent:media/livekit'],
+        assertSelectorsInactive: () => true,
+        preparedHostModeCapability: Object.freeze({}),
+    }, {
+        resolveProfile: () => ({ network: { mode: 'host' }, resolvedProfileName: 'default' }),
+        resolveReadinessProtocol: () => 'script',
+        ensureService: () => ({
+            containerName: owner.containerName,
+            containerId: 'candidate-current',
+        }),
+        isRunning: () => true,
+        runScriptReadiness: () => {
+            readinessCalls += 1;
+            return { status: 'failed', reason: 'udp owner mismatch' };
+        },
+        removeCandidate: (candidate) => {
+            cleanupCalls.push(candidate);
+            return { removed: true };
+        },
+    }), /semantic readiness failed.*udp owner mismatch/);
+    assert.equal(readinessCalls, 1);
+    assert.equal(cleanupCalls.length, 1);
+    assert.equal(cleanupCalls[0].containerName, owner.containerName);
+    assert.equal(cleanupCalls[0].containerId, 'candidate-current');
+    assert.deepEqual(cleanupCalls[0].record, generation.agents[owner.containerName]);
+    assert.equal(cleanupCalls[0].network.mode, 'host');
+
+    assert.deepEqual(restartGenerationCapabilityRuntime({
+        generation,
+        owner,
+        affectedSelectors: ['media:agent:media/livekit'],
+        assertSelectorsInactive: () => true,
+        preparedHostModeCapability: Object.freeze({}),
+    }, {
+        resolveProfile: () => ({ network: { mode: 'host' }, resolvedProfileName: 'default' }),
+        resolveReadinessProtocol: () => 'script',
+        ensureService: () => ({
+            containerName: owner.containerName,
+            containerId: 'candidate-ready',
+            marker: 'ready',
+        }),
+        isRunning: () => true,
+        runScriptReadiness: () => ({ status: 'success' }),
+        removeCandidate: () => assert.fail('ready candidate must not be removed'),
+    }), {
+        containerName: owner.containerName,
+        containerId: 'candidate-ready',
+        marker: 'ready',
+    });
+});
+
+test('managed Docker identity derivation is a fail-closed launch precondition', () => {
+    const source = fs.readFileSync(new URL('../../cli/services/docker/agentServiceManager.js', import.meta.url), 'utf8');
+    assert.equal((source.match(/buildAgentIdentityEnv\(/g) || []).length, 1);
+    assert.doesNotMatch(source, /could not set agent identity/);
+    assert.doesNotMatch(source, /try\s*\{[\s\S]{0,500}buildAgentIdentityEnv\(/);
+    assert.match(source, /for \(const \[key, value\] of Object\.entries\(buildAgentIdentityEnv\([\s\S]*?runtimeIdentity,[\s\S]*?\)\)\) \{\s*envStrings\.push\(formatEnvFlag\(key, value\)\);\s*\}/);
+});
+
 test('container router env builder preserves endpoint parity for every network mode', () => {
     for (const mode of ['default', 'bridge', 'host']) {
-        const endpoint = buildRouterEndpoint(mode, 65535);
-        assert.deepEqual(buildRuntimeRouterEnv('podman', {
+        const endpoint = buildRouterEndpoint(mode, 8080);
+        const env = buildRuntimeRouterEnv('podman', {
             networkMode: mode,
             routerEndpoint: endpoint,
-            routerPort: 65535,
-        }), endpoint.env);
+            routerPort: 8080,
+        });
+        assert.deepEqual({
+            PLOINKY_ROUTER_HOST: env.PLOINKY_ROUTER_HOST,
+            PLOINKY_ROUTER_PORT: env.PLOINKY_ROUTER_PORT,
+            PLOINKY_ROUTER_URL: env.PLOINKY_ROUTER_URL,
+        }, endpoint.env);
+        assert.equal(env.PLOINKY_INTERNAL_ROUTER_URL, `http://${endpoint.host}:8081`);
+        assert.equal(typeof env.PLOINKY_EDGE_TOPOLOGY_FILE, 'string');
+        assert.notEqual(env.PLOINKY_EDGE_TOPOLOGY_FILE, '');
     }
     assert.deepEqual(buildRuntimeRouterEnv('podman', {
         networkMode: 'none',
@@ -42,15 +260,15 @@ test('container router env builder has no default, reread, or host override path
     assert.throws(
         () => buildRuntimeRouterEnv('podman', {
             networkMode: 'bridge',
-            routerEndpoint: buildRouterEndpoint('bridge', 8097),
-            routerPort: 8080,
+            routerEndpoint: buildRouterEndpoint('bridge', 8080),
+            routerPort: 8097,
         }),
-        { code: 'PLOINKY_ROUTER_PORT_MISMATCH' },
+        { code: 'PLOINKY_ROUTER_PORT_INVALID' },
     );
     assert.throws(
         () => buildRuntimeRouterEnv('podman', {
             networkMode: 'bridge',
-            routerEndpoint: buildRouterEndpoint('bridge', 8097),
+            routerEndpoint: buildRouterEndpoint('bridge', 8080),
             routerHost: 'host.docker.internal',
         }),
         /routerHost overrides are not supported/,
@@ -67,7 +285,7 @@ test('runtime router env replaces config values and none mode strips them entire
     replaceRuntimeRouterEnvFlags(supplied, {});
     assert.deepEqual(supplied, ['-e SAFE="kept"']);
 
-    const endpoint = buildRouterEndpoint('default', 49123);
+    const endpoint = buildRouterEndpoint('default', 8080);
     replaceRuntimeRouterEnvFlags(supplied, endpoint.env);
     assert.equal(supplied[0], '-e SAFE="kept"');
     for (const [name, value] of Object.entries(endpoint.env)) {
@@ -81,7 +299,47 @@ test('runtime router env replaces config values and none mode strips them entire
 test('existing-container ownership inspection is unconditional across network modes', () => {
     const source = fs.readFileSync(new URL('../../cli/services/docker/agentServiceManager.js', import.meta.url), 'utf8');
     assert.doesNotMatch(source, /\bresolveRouterEndpoint\s*\(/, 'service manager must not reread persisted routing state');
-    assert.match(source, /const networkLifecycle = createNetworkLifecycleAdapter\(\{ runtime \}\);\s+if \(containerExists\(containerName\)\) \{\s+const contractInspection = networkLifecycle\.inspectContainerContract/);
+    assert.match(source, /const networkLifecycle = createNetworkLifecycleAdapter\(\{ runtime \}\);[\s\S]*?if \(containerExists\(containerName\)\) \{\s+const contractInspection = networkLifecycle\.inspectContainerContract/);
     assert.doesNotMatch(source, /if \(containerExists\(containerName\) && managedNetworkLifecycle\)/);
-    assert.match(source, /runtimeNetworkPlan\.requiresManagedNetwork && !isContainerRunning\(containerName\)/);
+    assert.match(source, /else if \(!isContainerRunning\(containerName\)\)/);
+    assert.match(source, /recreateReason \|\|= 'runtimeStopped'/);
+    assert.match(source, /reuseInspection\.id !== inspectedContainerId/);
+    assert.match(source, /recreateReason \|\|= 'runtimeStoppedAfterInspection'/);
+    assert.match(source, /recreateReason \|\|= 'runtimeDisappearedAfterInspection'/);
+    assert.doesNotMatch(source, /execSync\(`\$\{runtime\} start \$\{containerName\}`/);
+});
+
+test('drain-aware replacement is explicit and does not rewrite ordinary fleet lifecycle', () => {
+    const managerSource = fs.readFileSync(new URL('../../cli/services/docker/agentServiceManager.js', import.meta.url), 'utf8');
+    const fleetSource = fs.readFileSync(new URL('../../cli/services/docker/containerFleet.js', import.meta.url), 'utf8');
+    const drainSource = fs.readFileSync(new URL('../../cli/services/docker/targetedContainerLifecycle.js', import.meta.url), 'utf8');
+
+    assert.match(managerSource, /const targetedRestart = normalizeTargetedRestart\(options\.targetedRestart\)/);
+    assert.match(managerSource, /if \(targetedRestart\) \{[\s\S]*drainTargetedContainer\(containerName, drainOptions\)/);
+    assert.match(managerSource, /if \(runtimeNetworkPlan\.requiresManagedNetwork\)[\s\S]*drainTargetedContainer[\s\S]*else \{[\s\S]*drainAndRemoveTargetedContainer/);
+    assert.doesNotMatch(fleetSource, /targetedContainerLifecycle|drainTargetedContainer|targetedRestart/);
+    assert.doesNotMatch(drainSource, /inactivateEdgeRoutingGeneration/);
+});
+
+test('fleet cleanup never expands an exact registry key to a derived alias or canonical name', () => {
+    const source = fs.readFileSync(new URL('../../cli/services/docker/containerFleet.js', import.meta.url), 'utf8');
+    assert.match(source, /return name \? \[name\] : \[\]/);
+    assert.doesNotMatch(source, /getAgentContainerName/);
+});
+
+test('targeted restart contract cannot be enabled implicitly', () => {
+    for (const targetedRestart of [true, {}, {
+        acknowledgement: 'exit-zero-after-drain',
+        affectedSelectors: ['service:route/editor'],
+    }]) {
+        assert.throws(
+            () => ensureAgentService(
+                'agent',
+                { network: { mode: 'none' } },
+                '/tmp/repo/agent',
+                { routerEndpoint: null, targetedRestart },
+            ),
+            /targetedRestart/,
+        );
+    }
 });

@@ -287,7 +287,7 @@ function findEnabledDirectiveRecord(parsedDirective) {
     return null;
 }
 
-function ensureDirectiveEnabled(parsedDirective) {
+async function ensureDirectiveEnabled(parsedDirective) {
     const existing = findEnabledDirectiveRecord(parsedDirective);
     if (existing) {
         const profile = typeof parsedDirective?.profile === 'string' && parsedDirective.profile.trim()
@@ -300,7 +300,7 @@ function ensureDirectiveEnabled(parsedDirective) {
         }
         return;
     }
-    enableAgent(parsedDirective.spec, undefined, undefined, parsedDirective.alias, undefined, {
+    await enableAgent(parsedDirective.spec, undefined, undefined, parsedDirective.alias, undefined, {
         profile: parsedDirective.profile,
     });
 }
@@ -383,7 +383,7 @@ async function applyManifestDirectivesInternal(agentNameOrPath, {
                     continue;
                 }
                 if (enableAgents) {
-                    ensureDirectiveEnabled(qualified);
+                    await ensureDirectiveEnabled(qualified);
                 }
                 const childRef = agentRefFromEnableSpec(qualified.spec);
                 if (childRef) {

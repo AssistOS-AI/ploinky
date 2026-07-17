@@ -21,6 +21,8 @@ export const NETWORK_LABELS = Object.freeze({
     workspace: 'io.assistos.ploinky.workspace',
     logical: 'io.assistos.ploinky.logical',
     contract: 'io.assistos.ploinky.network-contract',
+    instanceId: 'io.assistos.ploinky.instance-id',
+    enableGeneration: 'io.assistos.ploinky.enable-generation',
 });
 
 const MANAGED_HOST_NAME = 'host.containers.internal';
@@ -54,13 +56,31 @@ function expectedNetworkLabels(workspaceHash, logicalName) {
     };
 }
 
-function expectedAgentLabels(workspaceHash, contractHash) {
+function expectedAgentOwnershipLabels(workspaceHash, contractHash) {
     return {
         [NETWORK_LABELS.managed]: '1',
         [NETWORK_LABELS.resource]: 'agent',
         [NETWORK_LABELS.schema]: NETWORK_SCHEMA_VERSION,
         [NETWORK_LABELS.workspace]: workspaceHash,
         [NETWORK_LABELS.contract]: contractHash,
+    };
+}
+
+function exactRuntimeIdentity(runtimeIdentity, description = 'managed agent runtime') {
+    const instanceId = String(runtimeIdentity?.instanceId || '').trim();
+    const enableGeneration = String(runtimeIdentity?.enableGeneration || '').trim();
+    if (!instanceId || !enableGeneration) {
+        throw new Error(`${description} requires an exact instanceId and enableGeneration`);
+    }
+    return Object.freeze({ instanceId, enableGeneration });
+}
+
+function expectedAgentLabels(workspaceHash, contractHash, runtimeIdentity) {
+    const exactIdentity = exactRuntimeIdentity(runtimeIdentity);
+    return {
+        ...expectedAgentOwnershipLabels(workspaceHash, contractHash),
+        [NETWORK_LABELS.instanceId]: exactIdentity.instanceId,
+        [NETWORK_LABELS.enableGeneration]: exactIdentity.enableGeneration,
     };
 }
 
@@ -684,7 +704,8 @@ export function createNetworkLifecycleAdapter({
             throw new Error(`container '${containerName}' changed identity during managed verification`);
         }
         assertRequiredLabels(containerName, labelsOf(record), expectedLabels);
-        if (!managedHostsPolicyIsExact(record)) {
+        const managedMode = plan?.mode === 'default' || plan?.mode === 'bridge';
+        if (managedMode && !managedHostsPolicyIsExact(record)) {
             throw new Error(`container '${containerName}' has unsupported managed hosts policy`);
         }
         const attached = record.NetworkSettings?.Networks || {};
@@ -704,20 +725,14 @@ export function createNetworkLifecycleAdapter({
     function finalizeContainer(containerName, plan, {
         expectedContainerId = '',
         expectedLabels = null,
+        network = null,
+        runtimeIdentity = null,
     } = {}) {
-        if (!expectedContainerId && !expectedLabels) {
-            try {
-                for (const attachment of plan.attachments?.filter((entry) => !entry.primary) || []) {
-                    const result = execute(['network', 'connect', '--alias', plan.alias, attachment.name, containerName]);
-                    if (!result.ok) throw new Error(`cannot attach '${containerName}' to '${attachment.name}': ${failure(result)}`);
-                }
-                const started = execute(['start', containerName], { inherit: true });
-                if (!started.ok) throw new Error(`cannot start '${containerName}': ${failure(started)}`);
-            } catch (error) {
-                execute(['rm', '-f', containerName]);
-                throw error;
-            }
-            return;
+        const exactLabels = expectedLabels || (network && runtimeIdentity
+            ? expectedAgentLabels(identity.hash, networkContractHash(network), runtimeIdentity)
+            : null);
+        if (!exactLabels) {
+            throw new Error(`finalizing managed container '${containerName}' requires exact ownership and runtime-identity labels`);
         }
 
         let ownedContainerId = expectedContainerId;
@@ -728,8 +743,9 @@ export function createNetworkLifecycleAdapter({
             if (expectedContainerId && ownedContainerId !== expectedContainerId) {
                 throw new Error(`container '${containerName}' changed identity after creation`);
             }
-            assertRequiredLabels(containerName, labelsOf(initial), expectedLabels);
-            if (!managedHostsPolicyIsExact(initial)) {
+            assertRequiredLabels(containerName, labelsOf(initial), exactLabels);
+            const managedMode = plan?.mode === 'default' || plan?.mode === 'bridge';
+            if (managedMode && !managedHostsPolicyIsExact(initial)) {
                 throw new Error(`container '${containerName}' has unsupported managed hosts policy`);
             }
             for (const attachment of plan.attachments?.filter((entry) => !entry.primary) || []) {
@@ -738,25 +754,28 @@ export function createNetworkLifecycleAdapter({
             }
             const configured = inspectContainer(ownedContainerId);
             if (!configured) throw new Error(`container '${containerName}' disappeared during network verification`);
-            assertManagedContainerRecord(configured, containerName, plan, expectedLabels, ownedContainerId);
+            assertManagedContainerRecord(configured, containerName, plan, exactLabels, ownedContainerId);
             const started = execute(['start', ownedContainerId], { inherit: true });
             if (!started.ok) throw new Error(`cannot start '${containerName}': ${failure(started)}`);
             const running = inspectContainer(ownedContainerId);
             if (!running || !(running.State?.Running === true || running.State?.Status === 'running')) {
                 throw new Error(`container '${containerName}' did not reach running state`);
             }
-            assertManagedContainerRecord(running, containerName, plan, expectedLabels, ownedContainerId);
-            const hosts = readRunningHosts(ownedContainerId);
-            if (hosts.supported && !hasExactlyOneManagedHostEntry(hosts.contents)) {
-                throw new Error(`container '${containerName}' must have exactly one ${MANAGED_HOST_NAME} entry`);
+            assertManagedContainerRecord(running, containerName, plan, exactLabels, ownedContainerId);
+            if (managedMode) {
+                const hosts = readRunningHosts(ownedContainerId);
+                if (hosts.supported && !hasExactlyOneManagedHostEntry(hosts.contents)) {
+                    throw new Error(`container '${containerName}' must have exactly one ${MANAGED_HOST_NAME} entry`);
+                }
             }
+            return ownedContainerId;
         } catch (error) {
             if (ownedContainerId) {
                 let current = null;
                 try { current = inspectContainer(ownedContainerId); } catch (_) {}
                 if (current
                     && String(current?.Id || current?.ID || '') === ownedContainerId
-                    && hasRequiredLabels(labelsOf(current), expectedLabels)) {
+                    && hasRequiredLabels(labelsOf(current), exactLabels)) {
                     execute(['rm', '-f', ownedContainerId]);
                 }
             }
@@ -769,6 +788,7 @@ export function createNetworkLifecycleAdapter({
         canonicalAgentId,
         instanceKey = canonicalAgentId,
         containerName,
+        runtimeIdentity,
         createContainer,
         networkLockWaitMs = NETWORK_LOCK_WAIT_MS,
     }) {
@@ -778,16 +798,14 @@ export function createNetworkLifecycleAdapter({
             if (!['default', 'bridge'].includes(checked.mode)) {
                 throw new Error(`managed container transaction cannot run network mode '${checked.mode}'`);
             }
-            const agentLabels = expectedAgentLabels(identity.hash, networkContractHash(network));
+            const ownershipLabels = expectedAgentOwnershipLabels(identity.hash, networkContractHash(network));
+            const agentLabels = expectedAgentLabels(identity.hash, networkContractHash(network), runtimeIdentity);
             const previous = inspectContainer(containerName);
             let previousId = '';
             if (previous) {
-                assertRequiredLabels(containerName, labelsOf(previous), agentLabels);
+                assertRequiredLabels(containerName, labelsOf(previous), ownershipLabels);
                 previousId = containerRecordId(previous, containerName);
             }
-            const previousWasRunning = previous?.State?.Running === true || previous?.State?.Status === 'running';
-            const backupName = `${containerName}-network-rollback-${randomUUID().slice(0, 12)}`;
-            let backupCreated = false;
             let candidateCreationAttempted = false;
             let plan = null;
             try {
@@ -796,14 +814,15 @@ export function createNetworkLifecycleAdapter({
                     if (!current || containerRecordId(current, containerName) !== previousId) {
                         throw new Error(`resource '${containerName}' changed identity before managed replacement`);
                     }
-                    assertRequiredLabels(containerName, labelsOf(current), agentLabels);
-                    if (previousWasRunning) {
+                    assertRequiredLabels(containerName, labelsOf(current), ownershipLabels);
+                    if (previous?.State?.Running === true || previous?.State?.Status === 'running') {
                         const stopped = execute(['stop', previousId]);
                         if (!stopped.ok) throw new Error(`cannot stop '${containerName}' for managed replacement: ${failure(stopped)}`);
                     }
-                    const renamed = execute(['rename', previousId, backupName]);
-                    if (!renamed.ok) throw new Error(`cannot preserve '${containerName}' for managed replacement: ${failure(renamed)}`);
-                    backupCreated = true;
+                    const removed = execute(['rm', '-f', previousId]);
+                    if (!removed.ok && !missing(removed)) {
+                        throw new Error(`cannot remove predecessor '${containerName}' for managed replacement: ${failure(removed)}`);
+                    }
                 }
                 plan = prepareFromPreflight(checked);
                 candidateCreationAttempted = true;
@@ -812,48 +831,28 @@ export function createNetworkLifecycleAdapter({
                 if (!candidate) throw new Error(`managed candidate '${containerName}' disappeared after creation`);
                 assertRequiredLabels(containerName, labelsOf(candidate), agentLabels);
                 const candidateId = containerRecordId(candidate, containerName);
-                finalizeContainer(containerName, plan, {
+                const containerId = finalizeContainer(containerName, plan, {
                     expectedContainerId: candidateId,
                     expectedLabels: agentLabels,
                 });
-                if (backupCreated) {
-                    const committed = execute(['rm', '-f', previousId]);
-                    if (!committed.ok && !missing(committed)) {
-                        throw new Error(`cannot commit managed replacement by removing preserved '${backupName}': ${failure(committed)}`);
-                    }
-                    backupCreated = false;
-                }
-                return plan;
+                return { ...plan, containerId };
             } catch (error) {
                 let candidate = null;
                 try { candidate = inspectContainer(containerName); } catch (inspectError) {
-                    error.message += `; rollback could not inspect candidate '${containerName}': ${inspectError.message}`;
+                    error.message += `; failure cleanup could not inspect candidate '${containerName}': ${inspectError.message}`;
                 }
                 if (candidateCreationAttempted
                     && candidate
                     && hasRequiredLabels(labelsOf(candidate), agentLabels)) {
                     const candidateId = String(candidate?.Id || candidate?.ID || '');
                     if (!candidateId) {
-                        error.message += `; rollback preserved candidate '${containerName}' because its immutable ID was unavailable`;
+                        error.message += `; failure cleanup preserved candidate '${containerName}' because its immutable ID was unavailable`;
                     } else {
                         const removed = execute(['rm', '-f', candidateId]);
-                        if (!removed.ok && !missing(removed)) error.message += `; rollback could not remove candidate '${containerName}': ${failure(removed)}`;
+                        if (!removed.ok && !missing(removed)) error.message += `; failure cleanup could not remove candidate '${containerName}': ${failure(removed)}`;
                     }
                 }
                 if (plan) rollbackResources(plan, error);
-                if (backupCreated) {
-                    const restored = execute(['rename', previousId, containerName]);
-                    if (!restored.ok) {
-                        error.message += `; rollback could not restore preserved '${containerName}': ${failure(restored)}`;
-                    } else if (previousWasRunning) {
-                        const restarted = execute(['start', previousId]);
-                        if (!restarted.ok) error.message += `; rollback could not restart preserved '${containerName}': ${failure(restarted)}`;
-                    }
-                } else if (previousWasRunning && previous && candidate
-                    && String(candidate?.Id || candidate?.ID || '') === previousId
-                    && hasRequiredLabels(labelsOf(candidate), agentLabels)) {
-                    execute(['start', previousId]);
-                }
                 throw error;
             }
         }, { lockPath, waitMs: networkLockWaitMs });
@@ -864,7 +863,9 @@ export function createNetworkLifecycleAdapter({
             && labels?.[NETWORK_LABELS.resource] === 'agent'
             && labels?.[NETWORK_LABELS.schema] === NETWORK_SCHEMA_VERSION
             && labels?.[NETWORK_LABELS.workspace] === identity.hash
-            && /^[a-f0-9]{64}$/.test(String(labels?.[NETWORK_LABELS.contract] || ''));
+            && /^[a-f0-9]{64}$/.test(String(labels?.[NETWORK_LABELS.contract] || ''))
+            && Boolean(String(labels?.[NETWORK_LABELS.instanceId] || '').trim())
+            && Boolean(String(labels?.[NETWORK_LABELS.enableGeneration] || '').trim());
     }
 
     function status() {
@@ -915,18 +916,30 @@ export function createNetworkLifecycleAdapter({
     function inspectContainerContract(containerName, network, canonicalAgentId, {
         instanceKey = canonicalAgentId,
         contractHash,
+        instanceId = '',
+        enableGeneration = '',
+        requireRuntimeIdentity = false,
     } = {}) {
         const record = inspectContainer(containerName);
         if (!record) return { state: 'absent', id: null };
         const expectedHash = String(contractHash || '');
         const labels = labelsOf(record);
-        const expectedLabels = expectedAgentLabels(identity.hash, expectedHash);
-        if (!expectedHash || !hasRequiredLabels(labels, expectedLabels)) {
+        const ownershipLabels = expectedAgentOwnershipLabels(identity.hash, expectedHash);
+        if (!expectedHash || !hasRequiredLabels(labels, ownershipLabels)) {
             return { state: 'foreign', id: String(record?.Id || record?.ID || '') || null };
         }
         let id;
         try { id = containerRecordId(record, containerName); } catch (_) {
             return { state: 'foreign', id: null };
+        }
+        if (requireRuntimeIdentity) {
+            const expectedInstanceId = String(instanceId || '').trim();
+            const expectedEnableGeneration = String(enableGeneration || '').trim();
+            if (!expectedInstanceId || !expectedEnableGeneration
+                || String(labels?.[NETWORK_LABELS.instanceId] || '') !== expectedInstanceId
+                || String(labels?.[NETWORK_LABELS.enableGeneration] || '') !== expectedEnableGeneration) {
+                return { state: 'owned-drift', id, reason: 'runtime-identity' };
+            }
         }
         const contract = canonicalizeNetwork(network, { path: 'network' });
         const managedMode = contract.mode === 'default' || contract.mode === 'bridge';
@@ -974,9 +987,45 @@ export function createNetworkLifecycleAdapter({
         return inspectContainerContract(containerName, network, canonicalAgentId, options).state === 'exact';
     }
 
-    function agentIdentityLabelArgs(network) {
-        return Object.entries(expectedAgentLabels(identity.hash, networkContractHash(network)))
+    function agentIdentityLabelArgs(network, runtimeIdentity) {
+        return Object.entries(expectedAgentLabels(identity.hash, networkContractHash(network), runtimeIdentity))
             .flatMap(([key, value]) => ['--label', `${key}=${value}`]);
+    }
+
+    function removeExactContainer(containerName, network, canonicalAgentId, {
+        expectedContainerId,
+        instanceKey = canonicalAgentId,
+        contractHash,
+        instanceId,
+        enableGeneration,
+    } = {}) {
+        const exactContainerId = String(expectedContainerId || '').trim();
+        if (!exactContainerId) {
+            throw new Error(`exact cleanup for '${containerName}' requires an immutable container ID`);
+        }
+        const inspection = inspectContainerContract(exactContainerId, network, canonicalAgentId, {
+            instanceKey,
+            contractHash,
+            instanceId,
+            enableGeneration,
+            requireRuntimeIdentity: true,
+        });
+        if (inspection.state === 'absent') {
+            return { removed: false, state: 'absent', id: exactContainerId };
+        }
+        if (inspection.state !== 'exact' || inspection.id !== exactContainerId) {
+            return {
+                removed: false,
+                state: inspection.state,
+                id: inspection.id || exactContainerId,
+                reason: inspection.reason || 'ownership-mismatch',
+            };
+        }
+        const removed = execute(['rm', '-f', exactContainerId]);
+        if (!removed.ok && !missing(removed)) {
+            throw new Error(`cannot remove exact failed candidate '${containerName}' (${exactContainerId}): ${failure(removed)}`);
+        }
+        return { removed: true, state: 'removed', id: exactContainerId };
     }
 
     function pruneUnlocked() {
@@ -1024,6 +1073,7 @@ export function createNetworkLifecycleAdapter({
         inspectContainerContract,
         verifyContainerContract,
         agentIdentityLabelArgs,
+        removeExactContainer,
         status,
         prune,
         ensureNetwork,

@@ -8,17 +8,142 @@ import path from 'node:path';
 import { Readable, Writable } from 'node:stream';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
-import { createMemoryReplayCache } from '../../Agent/lib/jwtVerify.mjs';
-import { verifyRouterRequestToken } from '../../Agent/lib/requestSignedTokens.mjs';
-import { deriveAgentRequestSecret, deriveSubkey } from '../../cli/services/masterKey.js';
-import { computeRchHttp } from '../../Agent/lib/requestHash.mjs';
-import { collectHttpServiceRoutes, normalizeServiceSpec } from '../../cli/server/httpServiceRoutes.js';
-import { verifyUserDelegationGrant } from '../../cli/server/mcp-proxy/userDelegationGrant.js';
-
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const REPO_ROOT = path.resolve(__dirname, '../..');
 const MASTER_KEY = '5'.repeat(64);
+const ORIGINAL_CWD = process.cwd();
+const ORIGINAL_MASTER_KEY = process.env.PLOINKY_MASTER_KEY;
+const ORIGINAL_WORKSPACE_ROOT = process.env.PLOINKY_WORKSPACE_ROOT;
+const SUITE_WORKSPACE = mkdtempSync(path.join(os.tmpdir(), 'ploinky-http-service-suite-'));
+const SUITE_PLOINKY_DIR = path.join(SUITE_WORKSPACE, '.ploinky');
+
+mkdirSync(SUITE_PLOINKY_DIR, { recursive: true });
+process.chdir(SUITE_WORKSPACE);
+process.env.PLOINKY_MASTER_KEY = MASTER_KEY;
+process.env.PLOINKY_WORKSPACE_ROOT = SUITE_WORKSPACE;
+
+// Load every Ploinky module only after selecting the suite-owned workspace.
+// Several dependencies capture config paths at module initialization; static
+// imports here would otherwise point tests at the developer's real .ploinky.
+const [
+    { createMemoryReplayCache },
+    { verifyRouterRequestToken },
+    { deriveAgentRequestSecret, deriveSubkey },
+    { computeRchHttp },
+    { collectHttpServiceRoutes, normalizeServiceSpec },
+    { buildHttpServiceRateSourceHeader, PLOINKY_RATE_SOURCE_HEADER, stripRouterIdentityHeaders },
+    { verifyUserDelegationGrant },
+] = await Promise.all([
+    import('../../Agent/lib/jwtVerify.mjs'),
+    import('../../Agent/lib/requestSignedTokens.mjs'),
+    import('../../cli/services/masterKey.js'),
+    import('../../Agent/lib/requestHash.mjs'),
+    import('../../cli/server/httpServiceRoutes.js'),
+    import('../../cli/server/routerHandlers.js'),
+    import('../../cli/server/mcp-proxy/userDelegationGrant.js'),
+]);
+
+test.after(() => {
+    process.chdir(ORIGINAL_CWD);
+    if (ORIGINAL_MASTER_KEY === undefined) delete process.env.PLOINKY_MASTER_KEY;
+    else process.env.PLOINKY_MASTER_KEY = ORIGINAL_MASTER_KEY;
+    if (ORIGINAL_WORKSPACE_ROOT === undefined) delete process.env.PLOINKY_WORKSPACE_ROOT;
+    else process.env.PLOINKY_WORKSPACE_ROOT = ORIGINAL_WORKSPACE_ROOT;
+    rmSync(SUITE_WORKSPACE, { recursive: true, force: true });
+});
+
+test('router strips every forwarding and Ploinky identity header before public upstream dial', () => {
+    const sanitized = stripRouterIdentityHeaders({
+        authorization: 'Bearer attacker',
+        cookie: 'ploinky_jwt=attacker',
+        forwarded: 'for=attacker',
+        'x-forwarded-client-cert': 'spoofed',
+        'x-forwarded-arbitrary': 'spoofed',
+        'x-ploinky-auth-info': 'spoofed',
+        'x-ploinky-future-identity': 'spoofed',
+        'cf-connecting-ip': '198.51.100.11',
+        'true-client-ip': '198.51.100.12',
+        'x-real-ip': '198.51.100.13',
+        accept: 'application/json',
+    }, { preserveAuthorization: false, preserveCookie: false });
+    assert.deepEqual(sanitized, { accept: 'application/json' });
+});
+
+test('guest rate-source partitions are opaque, transport-derived, route-scoped, and spoof-proof', () => {
+    const routePlan = {
+        decision: { access: 'guest' },
+        definition: {
+            routeKey: 'services/umamiAgent',
+            externalPrefix: '/public-services/umami-telemetry/',
+        },
+        hostSelection: { source: 'local-alias' },
+    };
+    const first = buildHttpServiceRateSourceHeader({
+        headers: { [PLOINKY_RATE_SOURCE_HEADER]: 'f'.repeat(64) },
+        sessionId: 'session-a',
+        socket: { remoteAddress: '::ffff:192.0.2.44' },
+    }, routePlan)[PLOINKY_RATE_SOURCE_HEADER];
+    const sameSourceNewSession = buildHttpServiceRateSourceHeader({
+        headers: {},
+        sessionId: 'session-b',
+        socket: { remoteAddress: '192.0.2.44' },
+    }, routePlan)[PLOINKY_RATE_SOURCE_HEADER];
+    const otherSource = buildHttpServiceRateSourceHeader({
+        headers: {},
+        socket: { remoteAddress: '192.0.2.45' },
+    }, routePlan)[PLOINKY_RATE_SOURCE_HEADER];
+    const otherRoute = buildHttpServiceRateSourceHeader({
+        headers: {},
+        socket: { remoteAddress: '192.0.2.44' },
+    }, {
+        ...routePlan,
+        definition: { ...routePlan.definition, routeKey: 'other/telemetry' },
+    })[PLOINKY_RATE_SOURCE_HEADER];
+
+    assert.match(first, /^[a-f0-9]{64}$/);
+    assert.equal(first, sameSourceNewSession);
+    assert.notEqual(first, otherSource);
+    assert.notEqual(first, otherRoute);
+    assert.notEqual(first, 'f'.repeat(64));
+    assert.equal(first.includes('192.0.2.44'), false);
+    assert.equal(first.includes('session-'), false);
+});
+
+test('public-host guest rate partition requires one canonical Cloudflare source address', () => {
+    const routePlan = {
+        decision: { access: 'guest' },
+        definition: {
+            routeKey: 'services/umamiAgent',
+            externalPrefix: '/public-services/umami-telemetry/',
+        },
+        hostSelection: { source: 'public-host' },
+    };
+    const expanded = buildHttpServiceRateSourceHeader({
+        headers: { 'cf-connecting-ip': '2001:0db8:0:0:0:0:0:1' },
+        socket: { remoteAddress: '127.0.0.1' },
+    }, routePlan)[PLOINKY_RATE_SOURCE_HEADER];
+    const compressed = buildHttpServiceRateSourceHeader({
+        headers: { 'cf-connecting-ip': '2001:db8::1' },
+        socket: { remoteAddress: '198.51.100.9' },
+    }, routePlan)[PLOINKY_RATE_SOURCE_HEADER];
+    assert.equal(expanded, compressed);
+    assert.throws(
+        () => buildHttpServiceRateSourceHeader({ headers: {}, socket: { remoteAddress: '127.0.0.1' } }, routePlan),
+        /no valid canonical transport source/,
+    );
+    assert.throws(
+        () => buildHttpServiceRateSourceHeader({
+            headers: { 'cf-connecting-ip': '192.0.2.1, 192.0.2.2' },
+            socket: { remoteAddress: '127.0.0.1' },
+        }, routePlan),
+        /no valid canonical transport source/,
+    );
+    assert.deepEqual(buildHttpServiceRateSourceHeader({}, {
+        ...routePlan,
+        decision: { access: 'authenticated' },
+    }), {});
+});
 
 const VALID_DELEGATION_SPEC = {
     externalPrefix: '/services/onlyoffice/',
@@ -157,6 +282,36 @@ test('collectHttpServiceRoutes skips one invalid service spec without dropping v
     } finally {
         console.error = originalError;
     }
+});
+
+test('service slugs are route-scoped and may repeat across distinct route prefixes', () => {
+    const definitions = collectHttpServiceRoutes({
+        routes: {
+            alpha: {
+                hostPort: 7101,
+                httpServices: [{
+                    slug: 'dashboard',
+                    externalPrefix: '/services/alpha-dashboard/',
+                    internalPrefix: '/',
+                    access: 'authenticated',
+                }],
+            },
+            beta: {
+                hostPort: 7102,
+                httpServices: [{
+                    slug: 'dashboard',
+                    externalPrefix: '/services/beta-dashboard/',
+                    internalPrefix: '/',
+                    access: 'authenticated',
+                }],
+            },
+        },
+    });
+
+    assert.deepEqual(definitions.map(({ routeKey, slug }) => ({ routeKey, slug })), [
+        { routeKey: 'alpha', slug: 'dashboard' },
+        { routeKey: 'beta', slug: 'dashboard' },
+    ]);
 });
 
 test('normalizeServiceSpec rejects delegation targets that are not canonical agent ids', () => {
@@ -428,7 +583,7 @@ function makeRequest({ method = 'GET', url, cookie = '', headers = {}, body = nu
         ...(bodyBuffer ? { 'content-length': String(bodyBuffer.length) } : {}),
         ...(cookie ? { cookie } : {})
     };
-    req.socket = { encrypted: false };
+    req.socket = { encrypted: false, remoteAddress: '127.0.0.1' };
     return req;
 }
 
@@ -523,12 +678,16 @@ function writeWorkspaceConfig(ploinkyDir, servicePort) {
             type: 'agent',
             agentName: 'explorer',
             repoName: 'AchillesIDE',
+            instanceId: 'explorer-instance',
+            enableGeneration: 'explorer-enable-generation',
             auth: { mode: 'local', usersVar: 'PLOINKY_AUTH_EXPLORER_USERS' }
         },
         browserUseAgent: {
             type: 'agent',
             agentName: 'browserUseAgent',
             repoName: 'services',
+            instanceId: 'browser-use-instance',
+            enableGeneration: 'browser-use-enable-generation',
             auth: { mode: 'none' }
         }
     }, null, 2));
@@ -537,12 +696,14 @@ function writeWorkspaceConfig(ploinkyDir, servicePort) {
             explorer: {
                 agent: 'explorer',
                 repo: 'AchillesIDE',
+                container: 'explorer',
                 hostPort: 55289,
                 hostPath: explorerManifestDir
             },
             browserUseAgent: {
                 agent: 'browserUseAgent',
                 repo: 'services',
+                container: 'browserUseAgent',
                 hostPort: servicePort,
                 hostPath: serviceManifestDir
             }
@@ -596,6 +757,8 @@ function writeOnlyOfficeDelegationConfig(ploinkyDir, servicePort) {
             type: 'agent',
             agentName: 'onlyOffice',
             repoName: 'AssistOSExplorer',
+            instanceId: 'onlyoffice-instance',
+            enableGeneration: 'onlyoffice-enable-generation',
             auth: { mode: 'none' }
         }
     }, null, 2));
@@ -604,6 +767,7 @@ function writeOnlyOfficeDelegationConfig(ploinkyDir, servicePort) {
             onlyOffice: {
                 agent: 'onlyOffice',
                 repo: 'AssistOSExplorer',
+                container: 'onlyOffice',
                 hostPort: servicePort,
                 hostPath: onlyOfficeManifestDir
             }
@@ -612,7 +776,16 @@ function writeOnlyOfficeDelegationConfig(ploinkyDir, servicePort) {
 }
 
 function writeBrokenPrincipalConfig(ploinkyDir, servicePort) {
-    writeFileSync(path.join(ploinkyDir, 'agents.json'), JSON.stringify({}, null, 2));
+    writeFileSync(path.join(ploinkyDir, 'agents.json'), JSON.stringify({
+        brokenService: {
+            type: 'agent',
+            agentName: 'brokenService',
+            repoName: 'fixtures',
+            instanceId: 'broken-service-instance',
+            enableGeneration: 'broken-service-enable-generation',
+            auth: { mode: 'none' },
+        },
+    }, null, 2));
     writeFileSync(path.join(ploinkyDir, 'routing.json'), JSON.stringify({
         routes: {
             brokenService: {
@@ -630,37 +803,44 @@ function writeBrokenPrincipalConfig(ploinkyDir, servicePort) {
     }, null, 2));
 }
 
+function writeEdgeSourceDocuments(ploinkyDir) {
+    const edgeDir = path.join(ploinkyDir, 'data', 'edge-routing');
+    const policyDir = path.join(ploinkyDir, 'data', 'router-security');
+    mkdirSync(edgeDir, { recursive: true });
+    mkdirSync(policyDir, { recursive: true });
+    writeFileSync(path.join(edgeDir, 'desired.json'), JSON.stringify({
+        schemaVersion: 1,
+        hosts: {},
+        security: {
+            hostNetworkAllowedInstances: [],
+            internalServiceConsumers: {},
+        },
+    }, null, 2));
+    writeFileSync(path.join(policyDir, 'policy-state.json'), JSON.stringify({
+        schema: 'router-policy',
+        httpRoutes: [],
+        mcpTools: [],
+    }, null, 2));
+}
+
 async function withRouterModules(t, servicePort, writeConfig = writeWorkspaceConfig) {
-    const workspace = mkdtempSync(path.join(os.tmpdir(), 'ploinky-http-service-'));
-    const ploinkyDir = path.join(workspace, '.ploinky');
+    const workspace = SUITE_WORKSPACE;
+    const ploinkyDir = SUITE_PLOINKY_DIR;
+    rmSync(ploinkyDir, { recursive: true, force: true });
     mkdirSync(ploinkyDir, { recursive: true });
     writeFileSync(path.join(ploinkyDir, '.secrets'), '# test secrets\n');
     writeConfig(ploinkyDir, servicePort);
+    writeEdgeSourceDocuments(ploinkyDir);
 
-    const previousCwd = process.cwd();
-    const previousMasterKey = process.env.PLOINKY_MASTER_KEY;
-    const previousWorkspaceRoot = process.env.PLOINKY_WORKSPACE_ROOT;
-    process.chdir(workspace);
-    process.env.PLOINKY_MASTER_KEY = MASTER_KEY;
-    process.env.PLOINKY_WORKSPACE_ROOT = workspace;
-    t.after(() => {
-        process.chdir(previousCwd);
-        if (previousMasterKey === undefined) {
-            delete process.env.PLOINKY_MASTER_KEY;
-        } else {
-            process.env.PLOINKY_MASTER_KEY = previousMasterKey;
-        }
-        if (previousWorkspaceRoot === undefined) {
-            delete process.env.PLOINKY_WORKSPACE_ROOT;
-        } else {
-            process.env.PLOINKY_WORKSPACE_ROOT = previousWorkspaceRoot;
-        }
-        rmSync(workspace, { recursive: true, force: true });
-    });
+    const edgeGeneration = await import(`${pathToFileURL(path.join(REPO_ROOT, 'cli/services/edgeGeneration.js')).href}?test=${Date.now()}-${Math.random()}`);
+    edgeGeneration.applyEdgeRoutingGeneration({ workspaceRoot: workspace, reason: 'http-service-test-fixture' });
 
     const nonce = `${Date.now()}-${Math.random()}`;
     const authHandlers = await import(`${pathToFileURL(path.join(REPO_ROOT, 'cli/server/authHandlers/index.js')).href}?test=${nonce}`);
-    const localService = await import(`${pathToFileURL(path.join(REPO_ROOT, 'cli/server/auth/localService.js')).href}?test=${nonce}`);
+    // authHandlers imports the canonical localService module. Use that same
+    // module instance so its in-memory user/session view cannot diverge from a
+    // query-suffixed test copy.
+    const localService = await import(pathToFileURL(path.join(REPO_ROOT, 'cli/server/auth/localService.js')).href);
     const routerHandlers = await import(`${pathToFileURL(path.join(REPO_ROOT, 'cli/server/routerHandlers.js')).href}?test=${nonce}`);
     return { authHandlers, localService, routerHandlers };
 }
@@ -712,7 +892,11 @@ test('authenticated HTTP service falls back to static auth and injects router au
         url: '/services/browser-use/sessions/sess_1?view=1',
         cookie: `ploinky_jwt=${login.sessionId}`,
         headers: {
-            'x-ploinky-auth-info': '{"user":{"id":"spoofed"}}'
+            'x-ploinky-auth-info': '{"user":{"id":"spoofed"}}',
+            forwarded: 'host=attacker.invalid;proto=https',
+            'x-forwarded-host': 'attacker.invalid',
+            'x-forwarded-proto': 'https',
+            'x-forwarded-for': '198.51.100.10',
         }
     });
     const res = new MockWritableResponse();
@@ -730,6 +914,11 @@ test('authenticated HTTP service falls back to static auth and injects router au
     assert.equal(res.statusCode, 200);
     assert.equal(res.body, 'ok');
     assert.equal(captured?.url, '/browser-use/sessions/sess_1?view=1');
+    assert.equal(captured?.headers.host, 'localhost:8080');
+    assert.equal(captured?.headers['x-forwarded-host'], 'localhost:8080');
+    assert.equal(captured?.headers['x-forwarded-proto'], 'http');
+    assert.equal(captured?.headers.forwarded, undefined);
+    assert.equal(captured?.headers['x-forwarded-for'], undefined);
 
     const authInfo = JSON.parse(captured?.headers['x-ploinky-auth-info'] || '{}');
     assert.equal(authInfo.user?.id, userId);
@@ -1070,6 +1259,7 @@ test('guest HTTP service invocation records guest actor kind', async (t) => {
     const { routerHandlers } = await withRouterModules(t, servicePort);
     const req = makeRequest({
         url: '/public-services/browser-use-guest/sessions/sess_guest?view=1',
+        headers: { [PLOINKY_RATE_SOURCE_HEADER]: 'f'.repeat(64) },
     });
     req.user = {
         id: 'guest:abc',
@@ -1102,6 +1292,8 @@ test('guest HTTP service invocation records guest actor kind', async (t) => {
 
     assert.equal(verified.payload.actor.kind, 'guest');
     assert.deepEqual(verified.payload.actor.roles, ['guest']);
+    assert.match(captured?.headers[PLOINKY_RATE_SOURCE_HEADER] || '', /^[a-f0-9]{64}$/);
+    assert.notEqual(captured?.headers[PLOINKY_RATE_SOURCE_HEADER], 'f'.repeat(64));
 });
 
 test('authenticated HTTP service fails closed when invocation principal cannot be resolved', async (t) => {

@@ -83,6 +83,19 @@ function createDashboardContext({ base = '/dashboard' } = {}) {
         },
         fetch: async (url, options = {}) => {
             fetchCalls.push({ url: String(url), options });
+            if (String(url) === '/auth/token') {
+                return {
+                    ok: true,
+                    json: async () => ({
+                        ok: true,
+                        adminControl: {
+                            origin: 'http://127.0.0.1:8080',
+                            csrfToken: 'v1.test-proof',
+                        },
+                    }),
+                    text: async () => '{}',
+                };
+            }
             return {
                 ok: true,
                 json: async () => ({ ok: true, stdout: 'Agent: explorer (port: 3000)\n' }),
@@ -114,8 +127,11 @@ test('dashboard client fetches mounted dashboard routes', async () => {
     const fetchUrls = fetchCalls.map((call) => call.url);
     assert.ok(fetchUrls.length >= 3);
     assert.ok(fetchUrls.every((url) => url !== 'run'));
+    assert.ok(fetchUrls.includes('/auth/token'));
     assert.ok(fetchUrls.includes('/dashboard/run'));
     for (const call of fetchCalls.filter((item) => item.url === '/dashboard/run')) {
         assert.equal(call.options.keepalive, true);
+        assert.equal(call.options.credentials, 'include');
+        assert.equal(call.options.headers['X-Ploinky-CSRF-Token'], 'v1.test-proof');
     }
 });

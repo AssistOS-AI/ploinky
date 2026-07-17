@@ -243,7 +243,7 @@ export function verifyDelegatedAgentTaskStatusCall({
 /**
  * Handle JSON-RPC requests to agent MCP endpoints
  */
-async function handleAgentJsonRpc(req, res, route, agentName, payload) {
+async function handleAgentJsonRpc(req, res, route, agentName, payload, { beforeDial = null } = {}) {
     const isBatch = Array.isArray(payload);
     const messages = isBatch ? payload : [payload];
     if (messages.length !== 1) {
@@ -317,7 +317,8 @@ async function handleAgentJsonRpc(req, res, route, agentName, payload) {
         return null;
     }
 
-    const agentClient = createAgentClient(baseUrl);
+    const clientOptions = beforeDial ? { beforeConnect: beforeDial } : undefined;
+    const agentClient = createAgentClient(baseUrl, clientOptions);
     try {
         switch (message.method) {
             case 'tools/list': {
@@ -360,7 +361,10 @@ async function handleAgentJsonRpc(req, res, route, agentName, payload) {
                 // Mint a router-signed invocation token scoped to this tool call
                 // and open a short-lived client with that token in the header.
                 const toolHeaders = buildRequestHeadersForToolCall(name, canonicalArgs);
-                const toolClient = createAgentClient(baseUrl, toolHeaders ? { requestHeaders: toolHeaders } : undefined);
+                const toolClient = createAgentClient(baseUrl, {
+                    ...(toolHeaders ? { requestHeaders: toolHeaders } : {}),
+                    ...(beforeDial ? { beforeConnect: beforeDial } : {}),
+                });
 
                 try {
                     const result = await toolClient.callTool(name, canonicalArgs);
@@ -384,7 +388,10 @@ async function handleAgentJsonRpc(req, res, route, agentName, payload) {
                     break;
                 }
                 const resourceHeaders = buildRequestHeadersForToolCall('resources/read', { uri });
-                const resourceClient = createAgentClient(baseUrl, resourceHeaders ? { requestHeaders: resourceHeaders } : undefined);
+                const resourceClient = createAgentClient(baseUrl, {
+                    ...(resourceHeaders ? { requestHeaders: resourceHeaders } : {}),
+                    ...(beforeDial ? { beforeConnect: beforeDial } : {}),
+                });
                 try {
                     const result = await resourceClient.readResource(uri);
                     sendResponse(200, { jsonrpc: '2.0', id: message.id ?? null, result }, sessionIdHeader);
@@ -412,7 +419,10 @@ async function handleAgentJsonRpc(req, res, route, agentName, payload) {
 /**
  * Handle HTTP requests to agent MCP endpoints
  */
-async function handleAgentMcpRequest(req, res, route, agentName) {
+async function handleAgentMcpRequest(req, res, route, agentName, {
+    beforeDial = null,
+    routePlan = null,
+} = {}) {
     const method = (req.method || 'GET').toUpperCase();
     const isDelegatedAgentRequest = Boolean(readAuthorizationBearer(req));
 
@@ -503,7 +513,7 @@ async function handleAgentMcpRequest(req, res, route, agentName) {
             // Defensive auth attach for browser MCP calls. The router should already do this,
             // but the proxy must not rely on auth context being pre-populated if cookies exist.
             if (!req.agent && !req.user) {
-                const authResult = await ensureAuthenticated(req, res, parsedUrl);
+                const authResult = await ensureAuthenticated(req, res, parsedUrl, { routePlan });
                 if (!authResult.ok) {
                     return;
                 }
@@ -527,7 +537,8 @@ async function handleAgentMcpRequest(req, res, route, agentName) {
         const isReady = await waitForAgentReady(route, {
             timeoutMs: 5000,
             intervalMs: 125,
-            probeTimeoutMs: 250
+            probeTimeoutMs: 250,
+            beforeProbe: beforeDial,
         });
         if (!isReady) {
             if (isJsonRpc) {
@@ -552,7 +563,7 @@ async function handleAgentMcpRequest(req, res, route, agentName) {
 
         try {
             if (isJsonRpc) {
-                await handleAgentJsonRpc(req, res, route, agentName, payload);
+                await handleAgentJsonRpc(req, res, route, agentName, payload, { beforeDial });
                 return;
             }
 

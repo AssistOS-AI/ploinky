@@ -56,9 +56,9 @@
                 <div class="content-wrapper">
                     <div class="doc-section">
                         <h1>CLI Command Reference</h1>
-                        <p>Complete reference for all Ploinky CLI commands. Commands are organized by category for easy navigation.</p>
+                        <p>Complete reference for the managed host supervisor and the in-box Ploinky core CLI. Commands are organized by category for easy navigation.</p>
                         <div class="alert alert-info">
-                            <strong>Note on command prefixes:</strong> The commands in this documentation are shown without the <code>ploinky</code> prefix, assuming they are run from within the project's interactive shell. For global usage from your system's terminal, prepend each command with <code>ploinky</code> (e.g., <code>ploinky list agents</code>).
+                            <strong>Command boundary:</strong> Unprefixed commands are core commands entered in the Ploinky REPL. A host command prefixed with <code>ploinky</code> first reconciles the managed outer runtime and then forwards supported core work. The two surfaces are not interchangeable for lifecycle operations: host <code>ploinky stop</code>/<code>ploinky destroy</code> affect the outer box, while REPL <code>stop</code>/<code>destroy</code> leave that box running.
                         </div>
                     </div>
 
@@ -198,8 +198,12 @@ disable repoName/demo      # remove agent using repo-qualified name</code></pre>
                         <h2>Workspace Commands</h2>
                         
                         <h3>start</h3>
-                        <p>Start agents from .ploinky/agents.json and launch Router.</p>
-                        <pre><code>start [staticAgent] [port] [--branch &lt;branch&gt;] [--repo-branch &lt;repo=branch&gt;]... [--branch-fallback default|fail] [--reset-repos]</code></pre>
+                        <p>Start agents from <code>.ploinky/agents.json</code> and launch Router. In the managed box, Router always owns inner port <code>8080</code>. The canonical host form puts <code>--port</code> before <code>start</code>; it selects only the physical-host loopback side of the fixed mapping. The public wrapper also accepts the documented positional host-port shorthand and converts it to the same outer selection before forwarding fixed inner <code>8080</code>.</p>
+                        <pre><code># Ploinky REPL / core
+start [staticAgent] [8080] [--branch &lt;branch&gt;] [--repo-branch &lt;repo=branch&gt;]... [--branch-fallback default|fail] [--reset-repos]
+
+# Host supervisor (canonical)
+ploinky [--port &lt;hostPort&gt;] start [staticAgent] [branch-options...]</code></pre>
                         <table class="command-table">
                             <tr>
                                 <th>Parameter</th>
@@ -210,8 +214,8 @@ disable repoName/demo      # remove agent using repo-qualified name</code></pre>
                                 <td>Primary agent to serve static files (required first time)</td>
                             </tr>
                             <tr>
-                                <td><code>[port]</code></td>
-                                <td>Router port (default: 8080)</td>
+                                <td><code>[8080]</code></td>
+                                <td>Fixed inner Router port for a core/REPL start. Do not put the physical-host port here when using the canonical host form.</td>
                             </tr>
                             <tr>
                                 <td><code>--branch &lt;branch&gt;</code></td>
@@ -242,8 +246,11 @@ start AchillesIDE/explorer 8080 --branch feature-branch
 # Per-repo branch override
 start AchillesIDE/explorer 8080 --branch feature-branch --repo-branch proxies=main
 
-# Strict CI/deploy mode
-start AchillesIDE/explorer 8097 --branch feature-branch --branch-fallback fail --reset-repos</code></pre>
+# Strict CI/deploy mode through the public wrapper; host loopback 8097, inner 8080
+ploinky --port 8097 start AchillesIDE/explorer --branch feature-branch --branch-fallback fail --reset-repos</code></pre>
+                        <div class="alert alert-warning">
+                            Contract v5 always creates exactly <code>127.0.0.1:&lt;hostPort&gt;:8080/tcp</code> and <code>0.0.0.0:7882:7882/udp</code>. Outer <code>--publish</code>, <code>--expose</code>, and <code>--listen-lan</code> are rejected; no manifest, graph, profile, readiness result, environment value, label, or saved state can add a third physical-host mapping.
+                        </div>
 
                         <h3>shell</h3>
                         <p>Open an interactive shell session inside an agent runtime. For containerized agents this enters the agent container with full TTY support and the same mounted home directory the agent uses.</p>
@@ -271,14 +278,21 @@ ploinky cli codexAgent</code></pre>
                         <pre><code>status</code></pre>
 
                         <h3>list routes</h3>
-                        <p>List configured routes from <code>.ploinky/routing.json</code>.</p>
+                        <p>Print the staged candidate from <code>.ploinky/routing.json</code>. This command does not inspect, prove, or activate the current immutable authorization generation.</p>
                         <pre><code>list routes</code></pre>
                         <pre><code># Example output
 Routing configuration (.ploinky/routing.json):
-- Port: 8088
-- Static: agent=demo root=/path/to/demo/agent
-Configured routes:
-- demo: hostPort=7001 container=ploinky_project_service_demo</code></pre>
+- Port: 8080
+- Static agent: demo
+- Routes:
+  demo -&gt; agent=demo method=- hostPort=-</code></pre>
+
+                        <h3>edge apply</h3>
+                        <p>Apply one staged edge desired-state JSON document through the serialized generation coordinator. The input must be a non-symlink regular file no larger than 1 MiB. Apply inactivates affected selectors first, captures and validates the exact route/policy sources, and has no rollback or previous-generation fallback if validation fails.</p>
+                        <pre><code>edge apply &lt;json-file&gt;
+
+# Example
+edge apply ./edge-desired.json</code></pre>
 
                         <h3>restart</h3>
                         <p>Restarts services. If an agent name is provided, it performs a non-destructive stop and start of that agent's container, preserving the container ID. This only affects running containers. If no agent name is provided, it restarts all agents and the router.</p>
@@ -294,21 +308,8 @@ restart MyAPI    # Stop and then start the existing container for MyAPI</code></
                         <h3>var</h3>
                         <p>Set a workspace variable (stored in .ploinky/.secrets).</p>
                         <pre><code>var &lt;VAR&gt; &lt;value&gt;</code></pre>
-                        <table class="command-table">
-                            <tr>
-                                <th>Variable</th>
-                                <th>Description</th>
-                                <th>Default</th>
-                            </tr>
-                            <tr>
-                                <td><code>WEBDASHBOARD_TOKEN</code></td>
-                                <td>Dashboard authentication token</td>
-                                <td>(randomly generated)</td>
-                            </tr>
-                        </table>
                         <pre><code># Examples
-var API_KEY sk-123456789
-var WEBDASHBOARD_TOKEN deadbeef</code></pre>
+var API_KEY sk-123456789</code></pre>
 
                         <h3>vars</h3>
                         <p>List all workspace variables.</p>
@@ -366,11 +367,10 @@ webchat --rotate     # accepted for compatibility; still uses router login</code
                         <h4>Cancel Button</h4>
                         <p>While the agent is processing, the Send button is replaced by a Cancel button. Clicking Cancel sends an interrupt signal (ESC) to the agent's TTY session, aborting the current operation. The Send button returns when the agent produces output or the session closes.</p>
 
-                        <h3>dashboard</h3>
-                        <p>Prepare access for the Dashboard. Prints URL with token. Use --rotate to mint a new token.</p>
-                        <pre><code>dashboard [--rotate]</code></pre>
+                        <h3>/dashboard and /status</h3>
+                        <p>These are local-control browser surfaces, not token-minting CLI commands. Both require a real router-authenticated local-admin session on an exact local-control Host; assertions, invitations, media credentials, and localhost provenance do not grant administrator access. Mutations additionally require the exact Origin and a session-bound CSRF proof.</p>
                         <div class="alert alert-info">
-                            Access at: http://127.0.0.1:8080/dashboard?token=&lt;WEBDASHBOARD_TOKEN&gt;
+                            Local control: http://127.0.0.1:8080/dashboard
                         </div>
 
                     </div>
@@ -483,9 +483,18 @@ MCP ping succeeded.</code></pre>
 
                     <div class="doc-section" id="system">
                         <h2>System Management</h2>
+
+                        <table class="command-table">
+                            <tr><th>Surface</th><th>Command</th><th>Effect</th></tr>
+                            <tr><td>Host terminal</td><td><code>ploinky stop</code></td><td>Stops core services, then stops the managed outer container; named volumes are retained.</td></tr>
+                            <tr><td>Ploinky REPL</td><td><code>stop</code></td><td>Stops workspace Router and agent runtimes; the outer container stays running.</td></tr>
+                            <tr><td>Host terminal</td><td><code>ploinky destroy</code></td><td>Confirms the exact instance and directly removes the outer container plus anonymous volumes. It does not run core destroy first; all three named volumes are retained.</td></tr>
+                            <tr><td>Ploinky REPL</td><td><code>destroy</code></td><td>Stops the workspace Router, removes workspace runtimes, and clears regenerated <code>.ploinky/deps/</code>; the outer container and <code>.data/</code> homes remain.</td></tr>
+                            <tr><td>Ploinky REPL</td><td><code>clean</code></td><td>Removes workspace runtimes and clears regenerated <code>.ploinky/deps/</code> without explicitly stopping the Router first; the outer container and <code>.data/</code> homes remain.</td></tr>
+                        </table>
                         
                         <h3>stop</h3>
-                        <p>Stop the router and all agent runtimes without removing reusable runtime state. Containers can be restarted later. Host-sandboxed agents are signaled in a batch before Ploinky waits for exits.</p>
+                        <p>This unprefixed REPL command stops the router and all agent runtimes without removing reusable runtime state or the outer box. Host-sandboxed agents are signaled in a batch before Ploinky waits for exits.</p>
                         <pre><code>stop</code></pre>
 
                         <h3>shutdown</h3>
@@ -493,9 +502,12 @@ MCP ping succeeded.</code></pre>
                         <pre><code>shutdown</code></pre>
 
                         <h3>destroy</h3>
-                        <p>Stop the router, remove ALL Ploinky runtimes in the workspace, and clear the regenerated dependency cache under <code>.ploinky/deps/</code>. <code>clean</code> is an alias for <code>destroy</code>. Persistent agent home data under <code>.data/&lt;agent-or-alias&gt;/</code> is preserved and mounted again on the next start. Host-sandboxed agents receive the graceful signal together, then any remaining process groups are force-killed after the shared timeout.</p>
-                        <pre><code>destroy
-clean</code></pre>
+                        <p>This unprefixed REPL command stops the Router, removes workspace Ploinky runtimes, and clears the regenerated dependency cache under <code>.ploinky/deps/</code>. Persistent agent home data under <code>.data/&lt;agent-or-alias&gt;/</code> and the outer box are preserved. Host-sandboxed agents receive the graceful signal together, then any remaining process groups are force-killed after the shared timeout.</p>
+                        <pre><code>destroy</code></pre>
+
+                        <h3>clean</h3>
+                        <p>This unprefixed REPL command runs the same workspace-runtime removal and dependency-cache cleanup without explicitly stopping the Router first. Use <code>destroy</code> when the Router must also be stopped.</p>
+                        <pre><code>clean</code></pre>
                     </div>
 
                     <div class="doc-section" id="logs">
@@ -585,7 +597,9 @@ help cli       # Help for cli command</code></pre>
 ├── logs/             # Router and watchdog logs
 ├── shared/           # Shared data
 ├── running/          # PID files
-├── routing.json      # Router configuration
+├── routing.json      # Staged candidate; inert until coordinated apply
+├── edge-generations/ # Immutable validated route-and-policy generations
+├── topology/         # Box-owned non-secret topology generations
 ├── servers.json      # Web surface tokens
 └── deps/             # Dependency caches
     ├── global/

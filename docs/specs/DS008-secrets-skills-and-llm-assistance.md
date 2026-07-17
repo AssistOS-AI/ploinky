@@ -16,7 +16,14 @@ Ploinky’s operator tooling depends on a shared secret-resolution model and on 
 
 Secret resolution must prefer process environment variables, then `.ploinky/.secrets`, then the nearest `.env` file found by walking upward from the current working directory. This precedence model applies across runtime resource templating, auth configuration, dependency helpers, and LLM settings discovery. Manifest env entries with `generatedSecret: true` are exceptions: they derive from `PLOINKY_DERIVED_MASTER_KEY` and ignore operator variables with the same name so Ploinky-owned and agent-owned generated secrets cannot drift away from the workspace derivation invariant. The narrow exceptions are generated entries with `explicitOverride: true`, which may accept an explicit operator value directly, and entries with `explicitOverrideRequires`, which may accept an explicit operator value only when all listed companion variables are also explicitly present. Ploinky injects `PLOINKY_ENV_SOURCE_<ENV_NAME>` as `generated` or `explicit` for generated env entries that resolve to a value. `generatedSecret: true` is the manifest form for a generated secret owned by the current agent and derives from the current repo, current agent, and env name. Shared service credentials that must be identical across agents use `sharedGeneratedSecret: true` and derive from the source env name, not custom repo/agent/name fields.
 
-Manifest profile defaults are the required baseline for non-sensitive required env entries. A required URL, hostname, public IP, realm, port, or similar topology value must be present in the active profile as a `default` or `value`, while required secrets may remain unset in the profile and resolve from secure sources or `generatedSecret: true`. This keeps profile startup reproducible without weakening operator overrides: `ploinky var`, process env, and `.env` values still take precedence over the manifest default.
+Required manifest env entries may deliberately omit a profile default when no
+safe deployment-independent value exists. Such an entry is an explicit
+operator/provider prerequisite, not an implicit empty value: profile readiness
+and runtime launch resolve encrypted `ploinky var` state, provider output,
+process env, and `.env`, then fail with the exact missing name if none supplies
+it. No URL, hostname, public IP, realm, port, or Origin is inferred. Safe
+portable values should still use `default` or `value`; secrets and
+`generatedSecret: true` retain their existing resolution rules.
 
 Startup config providers (DS015) are another writer for the encrypted workspace var store, but not another secret-ownership model. Provider subprocesses return an allowlisted JSON patch, and Ploinky validates and persists accepted values through the same encrypted `.ploinky/.secrets` store used by `ploinky var`. Provider output may include provider-owned external credentials when declared sensitive, but it must not overwrite `generatedSecret` or `sharedGeneratedSecret` names owned by any enabled graph node. Provider metadata under `.ploinky/config-providers/` is redacted and must not contain raw values.
 

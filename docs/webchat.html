@@ -160,7 +160,7 @@ ploinky cli achilles-cli --path=/absolute/path</code></pre>
                     <h2>Security Practices</h2>
                     <ul style="margin-left: 2rem;">
                         <li>Use HTTPS or SSH tunnels when exposing the WebChat URL beyond localhost.</li>
-                        <li>Protect router session cookies and the encrypted <code>.ploinky/.secrets</code> store used by local auth, dashboard tokens, and manifest env.</li>
+                        <li>Protect router session cookies and the encrypted <code>.ploinky/.secrets</code> store used by local auth and manifest env.</li>
                         <li><code>.copilot_history</code> is authenticated, workspace-confined project state but is plaintext. It receives a local <code>.gitignore</code> to reduce accidental commits.</li>
                     </ul>
                 </div>
@@ -169,7 +169,7 @@ ploinky cli achilles-cli --path=/absolute/path</code></pre>
                     <h2>Troubleshooting</h2>
                     <ul style="margin-left: 2rem;">
                         <li><strong>Blank session?</strong> Verify the static agent has a <code>cli</code> command in its manifest.</li>
-                        <li><strong>401 errors?</strong> Run <code>ploinky webchat</code> again to confirm the token and URL.</li>
+                        <li><strong>401 errors?</strong> Run <code>ploinky webchat</code> again to confirm the login URL, then authenticate in the router session.</li>
                         <li><strong>Need a different command?</strong> Update the agent manifest and restart the workspace so WebChat picks up the change.</li>
                         <li><strong>Custom launch flags ignored?</strong> Confirm you opened <code>/webchat</code> with <code>?agent=&lt;name&gt;</code>; without an explicit agent selection the router uses the default WebChat target and does not synthesize agent-specific CLI flags.</li>
                     </ul>

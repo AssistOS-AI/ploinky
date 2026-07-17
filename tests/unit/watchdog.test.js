@@ -1,9 +1,12 @@
 process.env.PLOINKY_WATCHDOG_TEST_MODE = '1';
-process.env.PORT = '49123';
+process.env.PORT = '8080';
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import http from 'node:http';
+import os from 'node:os';
+import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
@@ -17,7 +20,8 @@ const {
     CONFIG,
     getTestLogs,
     clearTestLogs,
-    getRouterNodeExecutable
+    getRouterNodeExecutable,
+    performHealthCheck,
 } = await import('../../cli/server/Watchdog.js');
 
 const extractEvents = () => getTestLogs().map(entry => entry.event);
@@ -154,6 +158,29 @@ test('watchdog forwards its validated port to every router child', () => {
     assert.match(source, /PORT: String\(CONFIG\.PORT\)/);
 });
 
+test('watchdog health uses the supervisor-only Unix socket, not anonymous TCP', async t => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-watchdog-health-'));
+    const socketPath = path.join(dir, 'router-health.sock');
+    const previousSocket = CONFIG.HEALTH_SOCKET;
+    const server = http.createServer((req, res) => {
+        assert.equal(req.url, '/health');
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ status: 'healthy' }));
+    });
+    t.after(async () => {
+        CONFIG.HEALTH_SOCKET = previousSocket;
+        await new Promise(resolve => server.close(resolve));
+        fs.rmSync(dir, { recursive: true, force: true });
+    });
+    await new Promise((resolve, reject) => {
+        server.once('error', reject);
+        server.listen(socketPath, resolve);
+    });
+    CONFIG.HEALTH_SOCKET = socketPath;
+    resetManagerState();
+    assert.equal(await performHealthCheck(), true);
+});
+
 test('watchdog refuses to start without an exact explicit PORT', () => {
     const watchdogUrl = new URL('../../cli/server/Watchdog.js', import.meta.url).href;
     for (const value of [undefined, '', '+8080', '8080junk', '0', '65536']) {
@@ -168,6 +195,6 @@ test('watchdog refuses to start without an exact explicit PORT', () => {
             encoding: 'utf8',
         });
         assert.notEqual(result.status, 0, `expected PORT=${JSON.stringify(value)} to fail`);
-        assert.match(result.stderr, /Watchdog PORT must be an integer number or exact unsigned decimal string/);
+        assert.match(result.stderr, /Watchdog PORT must be exactly 8080/);
     }
 });

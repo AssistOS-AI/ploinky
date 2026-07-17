@@ -246,6 +246,20 @@ function deriveAgentRequestSecret(agentId, { encoding = 'hex' } = {}) {
     return raw.toString('hex');
 }
 
+function derivePrivateAgentRequestSecret(agentId, instanceId, enableGeneration, { encoding = 'hex' } = {}) {
+    const id = String(agentId || '').trim();
+    const instance = String(instanceId || '').trim();
+    const generation = String(enableGeneration || '').trim();
+    if (!id || !instance || !generation) {
+        throw new Error('derivePrivateAgentRequestSecret: agentId, instanceId, and enableGeneration are required');
+    }
+    const raw = deriveSubkey(`private-agent-secret/${id}/${instance}/${generation}`, 32);
+    if (encoding === 'buffer') return raw;
+    if (encoding === 'base64') return raw.toString('base64');
+    if (encoding === 'base64url') return raw.toString('base64url');
+    return raw.toString('hex');
+}
+
 function deriveAgentSecret({
     repoName = 'unknown',
     agentName = 'unknown',
@@ -310,6 +324,7 @@ function deriveWorkspaceSecret({
 
 export {
     deriveAgentRequestSecret,
+    derivePrivateAgentRequestSecret,
     deriveAgentSecret,
     deriveSubkey,
     deriveDerivedMasterKey,

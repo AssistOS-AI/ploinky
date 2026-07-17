@@ -1,35 +1,71 @@
 import fs from 'fs';
 import path from 'path';
 import net from 'net';
+import { randomUUID } from 'node:crypto';
 import { spawn, execSync } from 'child_process';
 import { fileURLToPath } from 'url';
 import * as utils from './utils.js';
 import * as agentsSvc from './agents.js';
 import * as workspaceSvc from './workspace.js';
 import * as dockerSvc from './docker/index.js';
-import { getRuntimeForAgent, isSandboxRuntime, loadAgentsMap } from './docker/common.js';
-import { isBwrapProcessRunning, stopBwrapProcess } from './bwrap/bwrapFleet.js';
+import {
+  computeEnvHash,
+  getContainerLabel,
+  getRuntime,
+  getRuntimeForAgent,
+  isSandboxRuntime,
+  loadAgentsMap,
+} from './docker/common.js';
+import {
+  buildRuntimeNetworkPlan,
+  buildRuntimeRouterEnv,
+  resolvePublishedPortMappings,
+} from './docker/agentServiceManager.js';
+import { isBwrapProcessRunning } from './bwrap/bwrapFleet.js';
 import * as inputState from './inputState.js';
-import { applyManifestDirectives, prepareManifestRepositories } from './bootstrapManifest.js';
+import { prepareManifestRepositories } from './bootstrapManifest.js';
 import { executeHostHook, markPreinstallRunInProcess, resetPreinstallRunInProcess, isInlineCommand } from './lifecycleHooks.js';
 import { getActiveProfile, getProfileConfig, getProfileEnvVars, resolveManifestRuntimeProfile } from './profileService.js';
 import { getSecrets, createEnvWithSecrets, loadEnvFile } from './secretInjector.js';
 import { readSecretsFile } from './encryptedSecretsFile.js';
-import { buildEnvMap } from './secretVars.js';
+import { buildEnvMap, getExposedNames, getManifestEnvNames } from './secretVars.js';
+import { isLlmRuntimeManifest, prepareLlmStartup } from './llmRuntimeIntegration.js';
 import { resolveAgentExecutionMode, resolveAgentReadinessProtocol } from './startupReadiness.js';
 import { normalizeProbeConfig, runContainerScriptReadiness } from './docker/healthProbes.js';
 import { applyStartupConfigProvidersForGraph } from './startupConfigProviders.js';
 import { createWorkspaceStartLock, releaseWorkspaceStartLock, withMaintenanceLock } from './maintenanceLocks.js';
-import { LOGS_DIR, PLOINKY_CWD, PLOINKY_DIR, PLOINKY_WORKSPACE_ROOT, REPOS_DIR, ROUTING_FILE, RUNNING_DIR } from './config.js';
+import {
+  AGENTS_DATA_DIR,
+  LOGS_DIR,
+  PLOINKY_CWD,
+  PLOINKY_WORKSPACE_ROOT,
+  REPOS_DIR,
+  RUNNING_DIR,
+} from './config.js';
 import { classifyDependencyGraphWaitMode, resolveWorkspaceDependencyGraph, topologicallyGroupDependencyGraph } from './workspaceDependencyGraph.js';
-import { mergeRoutingConfig, readRoutingConfig } from './routingFile.js';
+import {
+  mergeRoutingConfig,
+  mergeRuntimeRoute,
+  readRoutingConfig,
+  writeRoutingConfig,
+} from './routingFile.js';
+import {
+  abortEdgeRoutingPreparation,
+  edgeRuntimeEnvironment,
+  initializeFreshEdgeRoutingSources,
+  inactivateEdgeRoutingGeneration,
+  prepareHostModeCapabilityForInactiveGeneration,
+} from './edgeGeneration.js';
+import { applyEdgeRoutingGeneration } from './coordinatedEdgeApply.js';
 import { waitForAgentReady } from '../server/utils/agentReadiness.js';
+import { createNetworkLifecycleAdapter } from './networkLifecycle.js';
+import { networkContractHash } from './networkContract.js';
+import { explicitHttpServicePorts } from './httpServicePortConfig.js';
 import { getAgentDataDir } from './workspaceStructure.js';
 import {
   formatAgentAttachmentBanner,
   resolveAgentAttachmentIdentity,
 } from './layerIdentification.js';
-import { preflightBoxPublicationForCommand } from './boxPublicationCoverage.js';
 import {
   assertRouterEndpoint,
   parseRouterPort,
@@ -81,7 +117,15 @@ function buildRouterEnv() {
   return { ...envFile, ...secrets, ...process.env };
 }
 
-function spawnNoWaitWorker({ node, registryName, routeKey, registryAlias, routerPort }) {
+function spawnNoWaitWorker({
+  node,
+  registryName,
+  routeKey,
+  registryAlias,
+  routerPort,
+  forceRecreate = false,
+  waitForStatusFile = '',
+}) {
   const containerName = registryName;
   const noWaitLogDir = path.join(LOGS_DIR, 'no-wait');
   const noWaitStatusDir = path.join(RUNNING_DIR, 'no-wait');
@@ -107,6 +151,17 @@ function spawnNoWaitWorker({ node, registryName, routeKey, registryAlias, router
   }
   if (routerPort) {
     args.push('--router-port', String(routerPort));
+  }
+  if (forceRecreate) {
+    args.push('--force-recreate', '1');
+  }
+  if (waitForStatusFile) {
+    args.push('--wait-for-status', waitForStatusFile);
+  }
+  // A successor must never mistake a terminal status from an earlier start
+  // invocation for completion of this worker.
+  try { fs.unlinkSync(statusFile); } catch (error) {
+    if (error?.code !== 'ENOENT') throw error;
   }
   const logStdio = createAppendLogStdio(logFile);
   const child = spawn(process.execPath, args, {
@@ -135,7 +190,9 @@ function spawnWatchdog(routerPath, port, routerPidFile) {
   return child;
 }
 
-async function waitForRouterReady(port, child, timeoutMs = 15000) {
+async function waitForRouterReady(port, child, timeoutMs = 15000, {
+  createConnection = net.createConnection,
+} = {}) {
   const validatedPort = parseRouterPort(port, { source: 'router readiness port' });
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -143,7 +200,7 @@ async function waitForRouterReady(port, child, timeoutMs = 15000) {
       throw new Error(`router exited before TCP listener became ready (exit ${child.exitCode})`);
     }
     const tcpReady = await new Promise((resolve) => {
-      const socket = net.createConnection({ host: '127.0.0.1', port: validatedPort });
+      const socket = createConnection({ host: '127.0.0.1', port: validatedPort });
       const done = (value) => { socket.destroy(); resolve(value); };
       socket.once('connect', () => done(true));
       socket.once('error', () => done(false));
@@ -353,14 +410,208 @@ function executionRecordDiffers(record, expected) {
   return record?.runMode !== expected.runMode || !sameProjectPath || !sameDevelRepo;
 }
 
+function mintChangedRuntimeIdentityPair(record, uuid) {
+  const instanceId = String(uuid() || '').trim();
+  const enableGeneration = String(uuid() || '').trim();
+  const prior = new Set([
+    String(record?.instanceId || '').trim(),
+    String(record?.enableGeneration || '').trim(),
+  ].filter(Boolean));
+  if (!instanceId || !enableGeneration
+      || instanceId === enableGeneration
+      || prior.has(instanceId)
+      || prior.has(enableGeneration)) {
+    throw new Error('workspace graph could not mint a fresh instanceId/enableGeneration pair');
+  }
+  return Object.freeze({ instanceId, enableGeneration });
+}
+
+function effectiveGraphInstanceKey(node) {
+  return node.alias
+    ? `${node.repoName}/${node.shortAgentName}#alias:${node.alias}`
+    : `${node.repoName}/${node.shortAgentName}#canonical`;
+}
+
+function graphNodeRuntimeReplacementReason(plan, {
+  containerExistsImpl = dockerSvc.containerExists,
+  isContainerRunningImpl = dockerSvc.isContainerRunning,
+  isSandboxRunningImpl = isBwrapProcessRunning,
+  getRuntimeForAgentImpl = getRuntimeForAgent,
+  getRuntimeImpl = getRuntime,
+  getContainerLabelImpl = getContainerLabel,
+  computeEnvHashImpl = computeEnvHash,
+  createNetworkLifecycleAdapterImpl = createNetworkLifecycleAdapter,
+  resolvePublishedPortMappingsImpl = resolvePublishedPortMappings,
+  isLlmRuntimeManifestImpl = isLlmRuntimeManifest,
+  prepareLlmStartupImpl = prepareLlmStartup,
+  getManifestEnvNamesImpl = getManifestEnvNames,
+  getExposedNamesImpl = getExposedNames,
+} = {}) {
+  const { node, existing } = plan;
+  const record = existing.rec;
+  if (!String(record.instanceId || '').trim() || !String(record.enableGeneration || '').trim()) {
+    return 'missingRuntimeIdentity';
+  }
+
+  const profileResolution = resolveManifestRuntimeProfile(node.manifest, {
+    agentName: `${node.repoName}/${node.shortAgentName}`,
+    profileName: node.profile || undefined,
+    path: `manifest(${node.repoName}/${node.shortAgentName})`,
+  });
+  const runtimeKind = getRuntimeForAgentImpl(node.manifest);
+  const routerEndpoint = resolveManifestRouterEndpoint(node.manifest, {
+    explicitPort: resolvePersistedRouterPort(),
+    profileName: node.profile || undefined,
+    path: `manifest(${node.repoName}/${node.shortAgentName})`,
+  });
+  if (isSandboxRuntime(runtimeKind)) {
+    if (!isSandboxRunningImpl(existing.key, {
+      instanceId: record.instanceId,
+      enableGeneration: record.enableGeneration,
+    })) return 'sandboxRuntimeStopped';
+    const desired = computeEnvHashImpl(
+      node.manifest,
+      profileResolution.profileConfig,
+      routerEndpoint?.env || {},
+      { agentName: node.shortAgentName, repoName: node.repoName },
+    );
+    if (desired && desired !== String(record.envHash || '')) return 'envHashChanged';
+    return '';
+  }
+
+  if (!containerExistsImpl(existing.key)) return 'registeredRuntimeMissing';
+  if (!isContainerRunningImpl(existing.key)) return 'runtimeStopped';
+
+  const runtime = getRuntimeImpl();
+  const runtimeNetworkPlan = buildRuntimeNetworkPlan(runtime, profileResolution.network);
+  const runtimeRouterEnv = buildRuntimeRouterEnv(runtime, {
+    routerEndpoint,
+    networkMode: profileResolution.network.mode,
+  });
+  const desiredEnvHash = computeEnvHashImpl(
+    node.manifest,
+    profileResolution.profileConfig,
+    { ...runtimeRouterEnv, ...runtimeNetworkPlan.hashEnv },
+    { agentName: node.shortAgentName, repoName: node.repoName },
+  );
+  if (desiredEnvHash && desiredEnvHash !== getContainerLabelImpl(existing.key, 'ploinky.envhash')) {
+    return 'envHashChanged';
+  }
+  if (isLlmRuntimeManifestImpl(node.manifest, profileResolution.profileConfig)) {
+    const probe = prepareLlmStartupImpl({
+      runtime,
+      manifest: node.manifest,
+      profileConfig: profileResolution.profileConfig,
+      agentName: node.shortAgentName,
+      alias: node.alias || '',
+      env: process.env,
+      agentWorkDirRoot: AGENTS_DATA_DIR,
+      manifestEnvNames: [
+        ...getManifestEnvNamesImpl(node.manifest, profileResolution.profileConfig, { forRuntime: true }),
+        ...getExposedNamesImpl(node.manifest, profileResolution.profileConfig, { forRuntime: true }),
+      ],
+      envHash: desiredEnvHash,
+      effectiveNetwork: profileResolution.profileConfig?.network ?? node.manifest?.network ?? null,
+      writeState: false,
+    });
+    if (probe.enabled
+        && probe.reuseHash
+        && probe.reuseHash !== getContainerLabelImpl(existing.key, 'ploinky.reusehash')) {
+      return 'llmReuseHashChanged';
+    }
+  }
+
+  if (profileResolution.network.mode !== 'host' && profileResolution.network.mode !== 'none') {
+    const explicitPorts = explicitHttpServicePorts(node.manifest, {
+      label: `manifest(${node.repoName}/${node.shortAgentName})`,
+    });
+    if (explicitPorts.length) {
+      const mappings = resolvePublishedPortMappingsImpl(existing.key, record.config?.ports || []);
+      const missingTarget = explicitPorts.some((port) => !mappings.some((mapping) => (
+        Number(mapping?.containerPort) === port
+        && String(mapping?.protocol || 'tcp').toLowerCase() === 'tcp'
+        && String(mapping?.hostIp || '') === '127.0.0.1'
+        && Number(mapping?.hostPort || 0) > 0
+      )));
+      if (missingTarget) return 'serviceTargetMappingChanged';
+    }
+  }
+
+  const inspection = createNetworkLifecycleAdapterImpl({ runtime }).inspectContainerContract(
+    existing.key,
+    profileResolution.network,
+    node.shortAgentName,
+    {
+      instanceKey: effectiveGraphInstanceKey(node),
+      contractHash: networkContractHash(profileResolution.network),
+      instanceId: record.instanceId,
+      enableGeneration: record.enableGeneration,
+      requireRuntimeIdentity: true,
+    },
+  );
+  if (inspection?.state === 'foreign') {
+    throw new Error(`refusing graph replacement of foreign runtime '${existing.key}'`);
+  }
+  if (inspection?.state === 'owned-drift') {
+    return inspection.reason === 'runtime-identity'
+      ? 'runtimeIdentityDrift'
+      : 'networkContractDrift';
+  }
+  return '';
+}
+
+function resolveExtraEnabledRuntimeNodes(graph, reg, getAgentContainerName = dockerSvc.getAgentContainerName) {
+  const graphRegistryNames = new Set();
+  for (const node of graph?.nodes?.values?.() || []) {
+    const existing = findRegistryEntryForGraphNode(reg, node, getAgentContainerName);
+    if (existing) graphRegistryNames.add(existing.key);
+  }
+  return Object.entries(reg || {})
+    .filter(([containerName, record]) => (
+      containerName !== '_config'
+      && record?.type === 'agent'
+      && !graphRegistryNames.has(containerName)
+    ))
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([containerName, record]) => {
+      const ref = record.repoName
+        ? `${record.repoName}/${record.agentName}`
+        : record.agentName;
+      const resolved = utils.findAgent(ref);
+      const manifest = JSON.parse(fs.readFileSync(resolved.manifestPath, 'utf8'));
+      return {
+        id: `extra:${containerName}`,
+        agentRef: ref,
+        agentPath: path.dirname(resolved.manifestPath),
+        alias: record.alias || '',
+        manifest,
+        manifestPath: resolved.manifestPath,
+        profile: record.profile || '',
+        repoName: resolved.repo,
+        shortAgentName: resolved.shortAgentName,
+      };
+    });
+}
+
 function ensureGraphNodesEnabled(graph, reg, {
-  enableAgent = agentsSvc.enableAgent,
+  prepareAgentEnableBatch = agentsSvc.prepareAgentEnableBatch,
   removeAgentContainerForRecreate = dockerSvc.removeAgentContainerForRecreate,
   saveAgents = workspaceSvc.saveAgents,
+  loadRouting = readRoutingConfig,
+  saveRouting = (routing) => writeRoutingConfig(routing, { coordinate: false }),
+  inactivateGeneration = inactivateEdgeRoutingGeneration,
+  abortPreparation = abortEdgeRoutingPreparation,
+  uuid = randomUUID,
+  deferredNodeIds = new Set(),
+  runtimeReplacementReason = graphNodeRuntimeReplacementReason,
+  runtimeReplacementOptions,
   executionRecordOptions,
+  additionalNodes = [],
 } = {}) {
-  const nodes = Array.from(graph?.nodes?.values?.() || [])
-    .filter((node) => !node.isStatic)
+  const nodes = [
+    ...Array.from(graph?.nodes?.values?.() || []),
+    ...(Array.isArray(additionalNodes) ? additionalNodes : []),
+  ]
     .sort((a, b) => a.id.localeCompare(b.id));
 
   // Resolve and validate every retained record before removing anything. If a
@@ -384,24 +635,46 @@ function ensureGraphNodesEnabled(graph, reg, {
       expectedExecution && executionRecordDiffers(existing.rec, expectedExecution),
     );
     const profileChanged = Boolean(node.profile && existing.rec.profile !== node.profile);
-    existingPlans.push({ node, existing, expectedExecution, executionChanged, profileChanged });
+    const preliminary = { node, existing, expectedExecution, executionChanged, profileChanged };
+    const runtimeReason = executionChanged || profileChanged
+      ? ''
+      : String(runtimeReplacementReason(preliminary, runtimeReplacementOptions) || '');
+    existingPlans.push({ ...preliminary, runtimeReason });
   }
 
-  // Removal is deliberately completed before any run-mode registry field is
-  // changed. A safe-removal failure therefore leaves agents.json describing
-  // the still-existing container, and retrying remains deterministic.
-  for (const plan of existingPlans) {
-    if (!plan.executionChanged) continue;
-    removeAgentContainerForRecreate(
-      plan.existing.key,
-      `workspaceGraph:${plan.node.id}:executionModeChanged`,
-    );
+  const changedPlans = existingPlans
+    .filter((plan) => plan.executionChanged || plan.profileChanged || plan.runtimeReason)
+    .sort((left, right) => left.node.id.localeCompare(right.node.id));
+  const changedContainers = changedPlans.map((plan) => plan.existing.key);
+  // Every retained route must be target-less in the prelaunch generation,
+  // including a healthy blocking runtime that can later be reused. Keeping a
+  // predecessor's resolved hostPort/serviceTargets here would make the topology
+  // prepared for hooks only nominally reconciling rather than truly target-less.
+  // Identity rotation and physical removal remain limited to changedPlans.
+  const stagedPlans = existingPlans
+    .sort((left, right) => left.node.id.localeCompare(right.node.id));
+  let routing = null;
+  if (stagedPlans.length) {
+    // Authorization is revoked before either desired-state file changes and
+    // before the old process is touched. A failed compile or physical removal
+    // intentionally leaves the fresh identity generation selected inactive.
+    inactivateGeneration('workspace-graph-runtime-change-prelaunch');
+    routing = loadRouting();
+    routing.routes = routing.routes || {};
   }
 
-  let registryChanged = false;
-  for (const plan of existingPlans) {
-    if (!plan.executionChanged && !plan.profileChanged) continue;
-    const nextRecord = { ...plan.existing.rec };
+  for (const plan of stagedPlans) {
+    const identityChanged = plan.executionChanged || plan.profileChanged || plan.runtimeReason;
+    const freshIdentity = identityChanged
+      ? mintChangedRuntimeIdentityPair(plan.existing.rec, uuid)
+      : null;
+    const nextRecord = identityChanged
+      ? {
+          ...plan.existing.rec,
+          instanceId: freshIdentity.instanceId,
+          enableGeneration: freshIdentity.enableGeneration,
+        }
+      : plan.existing.rec;
     if (plan.executionChanged) {
       nextRecord.runMode = plan.expectedExecution.runMode;
       nextRecord.projectPath = plan.expectedExecution.projectPath;
@@ -414,18 +687,121 @@ function ensureGraphNodesEnabled(graph, reg, {
     if (plan.profileChanged) {
       nextRecord.profile = plan.node.profile;
     }
-    reg[plan.existing.key] = nextRecord;
-    registryChanged = true;
-  }
-  if (registryChanged) {
-    saveAgents(reg);
+    if (identityChanged) reg[plan.existing.key] = nextRecord;
+    const routeKey = nextRecord.alias || plan.node.alias || plan.node.shortAgentName;
+    routing.routes[routeKey] = mergeRuntimeRoute(routing.routes[routeKey], {
+      container: plan.existing.key,
+      hostPath: plan.node.agentPath || routing.routes[routeKey]?.hostPath,
+      repo: plan.node.repoName,
+      agent: plan.node.shortAgentName,
+      ...(nextRecord.alias ? { alias: nextRecord.alias } : {}),
+    }, { hostPort: null, serviceTargets: null });
   }
 
-  for (const node of missingNodes) {
-    enableAgent(node.enableSpec || node.agentRef, undefined, undefined, node.alias || undefined, undefined, {
-      profile: node.profile || undefined,
-    });
+  if (stagedPlans.length) {
+    if (changedPlans.length) saveAgents(reg, { coordinate: false });
+    saveRouting(routing);
   }
+
+  const prepared = prepareAgentEnableBatch(missingNodes.map((node) => ({
+    agentName: node.enableSpec || node.agentRef,
+    aliasParam: node.alias || undefined,
+    authOptions: {
+      profile: node.profile || undefined,
+    },
+  })), { reason: 'workspace-graph-enable-prelaunch' });
+  if (prepared?.preparedGeneration?.selector
+      && prepared.preparedGeneration.selector.state !== 'inactive') {
+    throw new Error('workspace graph prelaunch generation unexpectedly became active');
+  }
+
+  try {
+    for (const plan of changedPlans) {
+      const reasons = [
+        ...(plan.executionChanged ? ['executionModeChanged'] : []),
+        ...(plan.profileChanged ? ['profileChanged'] : []),
+        ...(plan.runtimeReason ? [plan.runtimeReason] : []),
+      ];
+      removeAgentContainerForRecreate(
+        plan.existing.key,
+        `workspaceGraph:${plan.node.id}:${reasons.join('+')}`,
+      );
+    }
+  } catch (error) {
+    try {
+      inactivateGeneration('workspace-graph-runtime-removal-failed', {
+        preserveSelectedGeneration: true,
+      });
+    } catch (_) {}
+    try {
+      const lease = prepared?.preparedGeneration?.preparationLease;
+      if (lease) abortPreparation(lease, { reason: 'workspace-graph-runtime-removal-failed' });
+    } catch (_) {}
+    throw error;
+  }
+
+  return {
+    ...prepared,
+    changedContainers: Object.freeze([...changedContainers]),
+  };
+}
+
+function preparedContainerNames(preparedGraph) {
+  return new Set([
+    ...(preparedGraph?.plans || []).map((plan) => plan.containerName),
+    ...(preparedGraph?.changedContainers || []),
+  ].filter(Boolean));
+}
+
+/**
+ * Startup providers may change secrets consumed by a retained runtime. The
+ * early generation exists so hooks can safely read target-less topology, but
+ * it cannot remain the runtime-identity authority after those providers run.
+ * Abort that lease, re-evaluate every predecessor that was not already staged,
+ * and capture one fresh target-less generation before any process launch.
+ */
+function reprepareGraphAfterStartupProviders(graph, reg, initialPreparedGraph, {
+  deferredNodeIds = new Set(),
+  additionalNodes = [],
+  abortPreparation = abortEdgeRoutingPreparation,
+  ensureGraphNodesEnabledImpl = ensureGraphNodesEnabled,
+  runtimeReplacementReason = graphNodeRuntimeReplacementReason,
+  runtimeReplacementOptions,
+  graphEnableOptions = {},
+} = {}) {
+  const initialLease = initialPreparedGraph?.preparedGeneration?.preparationLease;
+  if (!initialLease) {
+    throw new Error('start: startup-provider identity re-evaluation requires the exact early preparation lease');
+  }
+  const alreadyPrepared = preparedContainerNames(initialPreparedGraph);
+
+  abortPreparation(initialLease, {
+    reason: 'workspace-start-provider-reprepare',
+  });
+
+  const preparedGraph = ensureGraphNodesEnabledImpl(graph, reg, {
+    ...graphEnableOptions,
+    deferredNodeIds,
+    additionalNodes,
+    runtimeReplacementOptions,
+    runtimeReplacementReason(plan, options) {
+      // A record minted earlier in this same start has no predecessor running
+      // under that tuple. Re-check only retained predecessor identities; those
+      // must rotate if preinstall/provider output changed their runtime hash.
+      if (alreadyPrepared.has(plan.existing.key)) return '';
+      return runtimeReplacementReason(plan, options);
+    },
+  });
+  if (preparedGraph?.preparedGeneration?.selector?.state !== 'inactive') {
+    throw new Error('start: post-provider graph generation did not remain inactive');
+  }
+
+  const allPrepared = preparedContainerNames(preparedGraph);
+  for (const containerName of alreadyPrepared) allPrepared.add(containerName);
+  return Object.freeze({
+    preparedGraph,
+    preparedContainerNames: Object.freeze([...allPrepared]),
+  });
 }
 
 function formatGraphNodeLabel(node, staticLabel) {
@@ -456,9 +832,7 @@ function buildReadinessEntryFromNode(node, route, staticLabel) {
     10
   );
 
-  const protocol = resolveAgentReadinessProtocol(node.manifest, {
-    additionalServerPort: route?.additionalServerPort
-  });
+  const protocol = resolveAgentReadinessProtocol(node.manifest);
   const entry = {
     key: node.id,
     label: formatGraphNodeLabel(node, staticLabel),
@@ -511,7 +885,7 @@ function buildBlockingReadinessEntryFromNode(node, route, staticLabel) {
     if (resolveAgentExecutionMode(node.manifest).type === 'start_only') {
       throw new Error(
         `${node.isStatic ? 'Static agent' : 'Dependent agent'} '${formatGraphNodeLabel(node, staticLabel)}' is start-only but has no reachable readiness contract. `
-        + 'Declare health.readiness.script, a private additionalServerPort/openPorts route, or readiness.protocol none.'
+        + 'Declare health.readiness.script, an httpServices[].port target, or readiness.protocol none.'
       );
     }
     throw new Error(`${node.isStatic ? 'Static agent' : 'Dependent agent'} '${formatGraphNodeLabel(node, staticLabel)}' did not expose a host port.`);
@@ -687,13 +1061,73 @@ async function waitForManifestReadiness({ key, label, kind = 'dependency', manif
   }
 }
 
-async function resolveAndPersistStartRouterPort(staticAgentArg, portArg) {
+async function activatePreparedRuntimeAfterReadiness({
+  result,
+  routeKey,
+  repoName,
+  shortAgentName,
+  agentPath,
+  alias = '',
+}) {
+  if (!result?.requiresEdgeActivation) return false;
+  if (!result?.containerName || !result?.registryRecord) {
+    throw new Error('runtime replacement activation requires one exact returned container and registry record');
+  }
+  if (!result?.preparationLease) {
+    throw new Error('runtime replacement activation requires its exact preparation lease');
+  }
+  try {
+    await mergeRoutingConfig((cfg) => {
+      const agents = workspaceSvc.loadAgents();
+      agents[result.containerName] = result.registryRecord;
+      workspaceSvc.saveAgents(agents, { coordinate: false });
+      cfg.routes = cfg.routes || {};
+      cfg.routes[routeKey] = {
+        ...(cfg.routes[routeKey] || {}),
+        container: result.containerName,
+        hostPath: agentPath,
+        repo: repoName,
+        agent: shortAgentName,
+        ...(alias ? { alias } : {}),
+        ...(result.hostPort ? { hostPort: result.hostPort } : {}),
+        ...(result.serviceTargets && Object.keys(result.serviceTargets).length
+          ? { serviceTargets: result.serviceTargets }
+          : {}),
+      };
+      if (!result.hostPort) delete cfg.routes[routeKey].hostPort;
+      if (!result.serviceTargets || !Object.keys(result.serviceTargets).length) {
+        delete cfg.routes[routeKey].serviceTargets;
+      }
+      return cfg;
+    }, {
+      reason: 'runtime-replacement-ready',
+      preparationLease: result.preparationLease,
+    });
+    return true;
+  } catch (error) {
+    try {
+      inactivateEdgeRoutingGeneration('runtime-replacement-activation-failed', {
+        preserveSelectedGeneration: true,
+      });
+    } catch (_) {}
+    try {
+      abortEdgeRoutingPreparation(result.preparationLease, {
+        reason: 'runtime-replacement-activation-failed',
+      });
+    } catch (_) {}
+    throw error;
+  }
+}
+
+async function resolveAndPersistStartRouterPort(staticAgentArg, portArg, {
+  coordinate = true,
+} = {}) {
   const configuredStatic = workspaceSvc.getConfig()?.static;
   const isInitialRouterStartup = Boolean(staticAgentArg) && !configuredStatic?.agent;
   const resolvedStartPort = isInitialRouterStartup
     ? resolveInitialRouterPort({ explicitPort: portArg })
     : resolvePersistedRouterPort({ explicitPort: portArg });
-  await mergeRoutingConfig((current) => {
+  const update = (current) => {
     if (Object.prototype.hasOwnProperty.call(current, 'port')) {
       const lockedPort = parseRouterPort(current.port, { source: 'persisted router port' });
       if (lockedPort !== resolvedStartPort) {
@@ -707,33 +1141,37 @@ async function resolveAndPersistStartRouterPort(staticAgentArg, portArg) {
       port: resolvedStartPort,
       routes: current.routes || {},
     };
-  });
+  };
+  if (coordinate) {
+    await mergeRoutingConfig(update);
+  } else {
+    const current = readRoutingConfig();
+    writeRoutingConfig(update(current), { coordinate: false });
+  }
   return resolvedStartPort;
 }
 
+function assertStaticPreinstallSucceeded(result) {
+  if (result?.success === true) return result;
+  throw new Error(`static preinstall hook failed: ${result?.message || 'unknown hook failure'}`);
+}
+
 async function startWorkspace(staticAgentArg, portArg, {
-  refreshComponentToken,
-  ensureComponentToken,
-  enableAgent,
   killRouterIfRunning,
   branchPolicy,
-  publicationPreflightComplete = false,
 } = {}) {
-  const resolvedStartPort = await resolveAndPersistStartRouterPort(staticAgentArg, portArg);
-  const preflightArgs = [];
-  if (staticAgentArg) preflightArgs.push(String(staticAgentArg));
-  preflightArgs.push(String(resolvedStartPort));
-  if (branchPolicy?.branch) preflightArgs.push(`--branch=${branchPolicy.branch}`);
-  for (const [repoName, branch] of Object.entries(branchPolicy?.repoBranches || {})) {
-    preflightArgs.push(`--repo-branch=${repoName}=${branch}`);
-  }
-  if (branchPolicy?.fallback) preflightArgs.push(`--branch-fallback=${branchPolicy.fallback}`);
-  if (branchPolicy?.resetRepos) preflightArgs.push('--reset-repos');
-  if (!publicationPreflightComplete) {
-    await preflightBoxPublicationForCommand('start', preflightArgs, {
-      routerPort: resolvedStartPort,
-    });
-  }
+  // The workspace mutation lease covers source initialization, candidate
+  // writes, both inactive prelaunch preparations, and every subsequent start.
+  // Only the final post-provider lease may authorize runtime targets.
+  resetPreinstallRunInProcess();
+  const workspaceStartLock = createWorkspaceStartLock();
+  let workspacePreparationLease = null;
+  try {
+  initializeFreshEdgeRoutingSources({ workspaceRoot: PLOINKY_WORKSPACE_ROOT });
+  inactivateEdgeRoutingGeneration('workspace-start-prepare', { workspaceRoot: PLOINKY_WORKSPACE_ROOT });
+  const resolvedStartPort = await resolveAndPersistStartRouterPort(staticAgentArg, portArg, {
+    coordinate: false,
+  });
   let routerReadyForStart = false;
   let routerPortForStart = 0;
   let routerContainerForStart = '';
@@ -743,21 +1181,23 @@ async function startWorkspace(staticAgentArg, portArg, {
       if (routerPortForStart !== staticPort || routerContainerForStart !== container) {
         throw new Error('start: resolved static routing identity changed after the router listener became ready');
       }
-      await mergeRoutingConfig((current) => ({
-        ...current,
+      const routingCandidate = readRoutingConfig();
+      writeRoutingConfig({
+        ...routingCandidate,
         port: staticPort,
         static: { agent: staticAgent, container },
-        routes: current.routes || {},
-      }));
+        routes: routingCandidate.routes || {},
+      }, { coordinate: false });
       return container;
     }
 
-    await mergeRoutingConfig((current) => ({
-      ...current,
+    const routingCandidate = readRoutingConfig();
+    writeRoutingConfig({
+      ...routingCandidate,
       port: staticPort,
       static: { agent: staticAgent, container },
-      routes: current.routes || {},
-    }));
+      routes: routingCandidate.routes || {},
+    }, { coordinate: false });
     console.log(`Static: agent=${utils.colorize(staticAgent, 'cyan')} port=${utils.colorize(String(staticPort), 'yellow')}`);
     try {
       await waitForRouterReady(staticPort, null, 300);
@@ -786,12 +1226,6 @@ async function startWorkspace(staticAgentArg, portArg, {
     console.log(`[start] Watchdog launched in background (pid ${child.pid}); router TCP listener is ready.`);
     return container;
   };
-  // Clear the in-process preinstall dedup set so each workspace start (e.g.
-  // a `restart` re-entering this function in the same CLI process) re-runs
-  // hooks that may need to regenerate runtime files.
-  resetPreinstallRunInProcess();
-  const workspaceStartLock = createWorkspaceStartLock();
-  try {
     if (staticAgentArg) {
       let aliasResolved = null;
       try {
@@ -801,53 +1235,6 @@ async function startWorkspace(staticAgentArg, portArg, {
         }
       } catch (_) {
         aliasResolved = null;
-      }
-      let alreadyEnabled = false;
-      let resolvedAgent = null;
-      try {
-        resolvedAgent = utils.findAgent(aliasResolved || staticAgentArg);
-      } catch (_) { resolvedAgent = null; }
-
-      if (resolvedAgent) {
-        try {
-          const agentsMap = workspaceSvc.loadAgents();
-          const expectedKey = dockerSvc.getAgentContainerName(resolvedAgent.shortAgentName, resolvedAgent.repo);
-          const existingByKey = agentsMap[expectedKey];
-          if (existingByKey && existingByKey.type === 'agent') {
-            alreadyEnabled = true;
-          } else {
-            alreadyEnabled = Object.values(agentsMap).some((value) => (
-              value && value.type === 'agent' &&
-              value.agentName === resolvedAgent.shortAgentName &&
-              value.repoName === resolvedAgent.repo
-            ));
-          }
-        } catch (_) {
-          alreadyEnabled = false;
-        }
-        await ensureRouterReadyForStart({
-          staticAgent: aliasResolved || staticAgentArg,
-          staticPort: resolvedStartPort,
-          repoName: resolvedAgent.repo,
-          shortAgentName: resolvedAgent.shortAgentName,
-        });
-      }
-
-        if (!alreadyEnabled) {
-          if (enableAgent) {
-          await enableAgent(staticAgentArg);
-          } else {
-            try {
-            const info = agentsSvc.enableAgent(staticAgentArg);
-            if (info && info.shortAgentName) {
-              console.log(`✓ Agent '${info.shortAgentName}' from repo '${info.repoName}' enabled. Use 'start' to start all configured agents.`);
-            }
-          } catch (e) {
-            throw new Error(`start: failed to enable agent '${staticAgentArg}': ${e?.message || e}`);
-          }
-        }
-      } else {
-        utils.debugLog(`startWorkspace: static agent '${staticAgentArg}' already enabled; reusing existing record.`);
       }
       const portNum = resolvedStartPort;
       const cfg = workspaceSvc.getConfig() || {};
@@ -870,61 +1257,6 @@ async function startWorkspace(staticAgentArg, portArg, {
     if (!cfg0.static || !cfg0.static.agent || !cfg0.static.port) {
       throw new Error('start: missing static agent or port. Usage: start <staticAgent> <port> (first time).');
     }
-    if (typeof refreshComponentToken === 'function' || typeof ensureComponentToken === 'function') {
-      try {
-        const ensureToken = ensureComponentToken || refreshComponentToken;
-        if (ensureComponentToken) {
-          ensureComponentToken('webchat', { quiet: true });
-        }
-        refreshComponentToken && refreshComponentToken('dashboard', { quiet: true });
-      } catch (e) {
-        utils.debugLog('Failed to refresh component tokens:', e.message);
-      }
-    }
-    // Run preinstall hook for the static (main) agent BEFORE starting dependencies.
-    // This allows the main agent's preinstall to set ploinky vars that dependencies need.
-    // Note: This only runs the preinstall hook; workspace init/symlinks are done in agentServiceManager.
-    try {
-      const staticAgentForPreinstall = cfg0.static.agent;
-      if (staticAgentForPreinstall) {
-        const resolved = utils.findAgent(staticAgentForPreinstall);
-        if (resolved) {
-          const agentPath = path.dirname(resolved.manifestPath);
-          const activeProfile = getActiveProfile();
-          const profileConfig = getProfileConfig(`${resolved.repo}/${resolved.shortAgentName}`, activeProfile);
-          if (profileConfig?.preinstall) {
-            console.log(`[start] Running preinstall hook for ${resolved.shortAgentName} (profile: ${activeProfile})...`);
-            // For inline commands, pass as-is; for script paths, join with agentPath
-            const hookValue = isInlineCommand(profileConfig.preinstall)
-              ? profileConfig.preinstall
-              : path.join(agentPath, profileConfig.preinstall);
-            
-            // Build environment for the hook
-            const envVars = getProfileEnvVars(resolved.shortAgentName, resolved.repo, activeProfile, {});
-            let manifestEnv = {};
-            try {
-              const manifest = JSON.parse(fs.readFileSync(resolved.manifestPath, 'utf8'));
-              manifestEnv = buildEnvMap(manifest, profileConfig, {
-                agentName: resolved.shortAgentName,
-                repoName: resolved.repo
-              });
-            } catch (_) { }
-            const secrets = profileConfig.secrets ? getSecrets(profileConfig.secrets) : {};
-            const hookEnv = createEnvWithSecrets({ ...envVars, ...manifestEnv }, secrets);
-            
-            const result = executeHostHook(hookValue, hookEnv, { cwd: PLOINKY_WORKSPACE_ROOT });
-            if (!result.success) {
-              console.error(`[start] Preinstall failed: ${result.message}`);
-            } else {
-              markPreinstallRunInProcess(resolved.shortAgentName, resolved.repo, activeProfile);
-            }
-          }
-        }
-      }
-    } catch (preErr) {
-      console.error(`[start] Preinstall hook error: ${preErr.message}`);
-    }
-
     const staticAgent = normalizedStaticAgent || cfg0.static.agent;
     const staticPort = parseRouterPort(cfg0.static.port, { source: 'workspace static router port' });
     if (staticPort !== resolvedStartPort) {
@@ -938,7 +1270,7 @@ async function startWorkspace(staticAgentArg, portArg, {
       staticRepoName = resolvedStaticAgent.repo;
       staticShortAgent = resolvedStaticAgent.shortAgentName;
     } catch (e) {
-      throw new Error(`start: static agent '${staticAgent}' not found in any repo. Use 'enable agent <repo/name>' or check repos.`);
+      throw new Error(`start: Agent '${staticAgent}' not found in any repo. Use 'enable agent <repo/name>' or check repos.`);
     }
     await ensureRouterReadyForStart({
       staticAgent,
@@ -947,11 +1279,10 @@ async function startWorkspace(staticAgentArg, portArg, {
       shortAgentName: staticShortAgent,
     });
 
-    // Providers must run before manifest enable directives start dependent
-    // agents. First install/prepare the complete manifest repo graph without
-    // enabling anything, resolve a planning graph from those manifests, and
-    // apply provider output. The ordinary enable pass may then start every
-    // dependency with the provider-populated environment on its first launch.
+    // Install/prepare the complete manifest repo graph without starting any
+    // consumer, then compile one target-less inactive edge generation. Static
+    // preinstall and config-provider hooks receive that exact topology before
+    // any agent process or container is allowed to start.
     try {
       await prepareManifestRepositories(cfg0.static.agent, {
         branchPolicy,
@@ -964,18 +1295,82 @@ async function startWorkspace(staticAgentArg, portArg, {
       workspaceSvc.loadAgents(),
       dockerSvc.getAgentContainerName,
     );
-    let providerDependencyGraph;
+    let dependencyGraph;
     try {
-      providerDependencyGraph = resolveWorkspaceDependencyGraph({
+      dependencyGraph = resolveWorkspaceDependencyGraph({
         staticAgentRef: staticAgent,
         registry: providerRegistry,
       });
     } catch (graphErr) {
-      throw new Error(`Failed to resolve provider dependency graph for '${staticAgent}': ${graphErr.message}`);
+      throw new Error(`Failed to resolve dependency graph for '${staticAgent}': ${graphErr.message}`);
     }
+
+    let reg = providerRegistry;
+    workspaceSvc.saveAgents(reg);
+
+    const { getAgentContainerName, ensureAgentService } = dockerSvc;
+
+    const waitClassification = classifyDependencyGraphWaitMode(dependencyGraph);
+    const extraRuntimeNodes = resolveExtraEnabledRuntimeNodes(
+      dependencyGraph,
+      reg,
+      dockerSvc.getAgentContainerName,
+    );
+    let preparedGraph = ensureGraphNodesEnabled(dependencyGraph, reg, {
+      deferredNodeIds: waitClassification.noWait,
+      additionalNodes: extraRuntimeNodes,
+    });
+    workspacePreparationLease = preparedGraph?.preparedGeneration?.preparationLease || null;
+    if (preparedGraph?.preparedGeneration?.selector?.state !== 'inactive') {
+      throw new Error('start: graph prelaunch generation did not remain inactive');
+    }
+
+    // Run the static (main) agent preinstall only after the inactive topology
+    // exists. This hook may populate values consumed by startup config
+    // providers, but it must never observe raw candidate files before their
+    // coordinated generation has been captured and validated.
+    try {
+      const staticAgentForPreinstall = cfg0.static.agent;
+      if (staticAgentForPreinstall) {
+        const resolved = utils.findAgent(staticAgentForPreinstall);
+        if (resolved) {
+          const agentPath = path.dirname(resolved.manifestPath);
+          const activeProfile = getActiveProfile();
+          const profileConfig = getProfileConfig(`${resolved.repo}/${resolved.shortAgentName}`, activeProfile);
+          if (profileConfig?.preinstall) {
+            console.log(`[start] Running preinstall hook for ${resolved.shortAgentName} (profile: ${activeProfile})...`);
+            const hookValue = isInlineCommand(profileConfig.preinstall)
+              ? profileConfig.preinstall
+              : path.join(agentPath, profileConfig.preinstall);
+
+            const envVars = getProfileEnvVars(resolved.shortAgentName, resolved.repo, activeProfile, {});
+            let manifestEnv = {};
+            try {
+              const manifest = JSON.parse(fs.readFileSync(resolved.manifestPath, 'utf8'));
+              manifestEnv = buildEnvMap(manifest, profileConfig, {
+                agentName: resolved.shortAgentName,
+                repoName: resolved.repo,
+              });
+            } catch (_) {}
+            const secrets = profileConfig.secrets ? getSecrets(profileConfig.secrets) : {};
+            const hookEnv = {
+              ...createEnvWithSecrets({ ...envVars, ...manifestEnv }, secrets),
+              ...edgeRuntimeEnvironment('host', { workspaceRoot: PLOINKY_WORKSPACE_ROOT }),
+            };
+
+            const result = executeHostHook(hookValue, hookEnv, { cwd: PLOINKY_WORKSPACE_ROOT });
+            assertStaticPreinstallSucceeded(result);
+            markPreinstallRunInProcess(resolved.shortAgentName, resolved.repo, activeProfile);
+          }
+        }
+      }
+    } catch (preErr) {
+      throw new Error(`start: static preinstall preflight failed: ${preErr?.message || preErr}`);
+    }
+
     try {
       const providerResult = await applyStartupConfigProvidersForGraph({
-        dependencyGraph: providerDependencyGraph,
+        dependencyGraph,
         profileName: getActiveProfile(),
         workspaceRoot: PLOINKY_WORKSPACE_ROOT,
       });
@@ -991,35 +1386,33 @@ async function startWorkspace(staticAgentArg, portArg, {
       throw new Error(`Startup config provider preflight failed: ${providerErr?.message || providerErr}`);
     }
 
-    try {
-      await applyManifestDirectives(cfg0.static.agent, { branchPolicy });
-    } catch (err) {
-      throw new Error(`Failed to apply manifest directives for '${cfg0.static.agent}': ${err?.message || err}`);
-    }
-    let reg = deduplicateAgentRegistry(workspaceSvc.loadAgents(), dockerSvc.getAgentContainerName);
-    workspaceSvc.saveAgents(reg);
+    // Preinstall/provider output can change a retained runtime's effective
+    // environment after the early topology generation was captured. Re-check
+    // predecessor identities now and replace the early lease before any launch.
+    // The early batch persisted newly enabled records, so reload them before
+    // re-preparation; otherwise they would be mistaken for missing a second
+    // time instead of retaining their already-fresh, never-launched tuple.
+    reg = deduplicateAgentRegistry(workspaceSvc.loadAgents(), getAgentContainerName);
+    const postProviderPreparation = reprepareGraphAfterStartupProviders(
+      dependencyGraph,
+      reg,
+      preparedGraph,
+      {
+        deferredNodeIds: waitClassification.noWait,
+        additionalNodes: extraRuntimeNodes,
+      },
+    );
+    preparedGraph = postProviderPreparation.preparedGraph;
+    workspacePreparationLease = preparedGraph?.preparedGeneration?.preparationLease || null;
 
-    const { getAgentContainerName, ensureAgentService } = dockerSvc;
+    const newlyPreparedContainers = new Set(postProviderPreparation.preparedContainerNames);
+    reg = deduplicateAgentRegistry(workspaceSvc.loadAgents(), getAgentContainerName);
     let cfg = readRoutingConfig();
     cfg.routes = cfg.routes || {};
 
-    let dependencyGraph;
-    try {
-      dependencyGraph = resolveWorkspaceDependencyGraph({
-        staticAgentRef: staticAgent,
-        registry: reg
-      });
-    } catch (graphErr) {
-      throw new Error(`Failed to resolve dependency graph for '${staticAgent}': ${graphErr.message}`);
-    }
-
-    ensureGraphNodesEnabled(dependencyGraph, reg);
-    reg = deduplicateAgentRegistry(workspaceSvc.loadAgents(), getAgentContainerName);
-    workspaceSvc.saveAgents(reg);
-
     const allNames = Object.keys(reg || {}).filter((name) => name !== '_config');
     const graphWaves = topologicallyGroupDependencyGraph(dependencyGraph);
-    const { noWait: noWaitNodeIds } = classifyDependencyGraphWaitMode(dependencyGraph);
+    const { noWait: noWaitNodeIds } = waitClassification;
     const graphRegistryNames = new Set();
     const registryNameByNodeId = new Map();
     const graphWaveNames = graphWaves.map((waveNodeIds) => waveNodeIds.map((nodeId) => {
@@ -1044,19 +1437,14 @@ async function startWorkspace(staticAgentArg, portArg, {
     const staticRegistryEntry = findRegistryEntryForGraphNode(reg, staticNode, getAgentContainerName);
     const staticContainer = staticRegistryEntry?.key || getAgentContainerName(staticShortAgent || staticAgent, staticRepoName || '');
 
-    cfg.port = staticPort;
-    cfg.static = { agent: staticAgent, container: staticContainer };
-    cfg = await mergeRoutingConfig((current) => ({
-      ...current,
-      ...cfg,
-      routes: {
-        ...(current.routes || {}),
-        ...(cfg.routes || {})
-      }
-    }));
+    if (Number(cfg.port) !== staticPort
+        || cfg.static?.agent !== staticAgent
+        || cfg.static?.container !== staticContainer) {
+      throw new Error('start: prepared routing generation does not contain the exact static Router identity');
+    }
     const updateRoutes = async (targetNames = [], { allowFailures = false } = {}) => {
       if (!Array.isArray(targetNames) || !targetNames.length) {
-        return;
+        return { failedAgents: [], routeResults: [] };
       }
       cfg.routes = cfg.routes || {};
       const failedAgents = [];
@@ -1076,12 +1464,35 @@ async function startWorkspace(staticAgentArg, portArg, {
             persistedProfileName: rec.profile,
             path: `manifest(${repoName}/${shortAgentName})`,
           });
-          const { containerName, hostPort, additionalServerPort } = ensureAgentService(shortAgentName, manifest, agentPath, {
+          const launchProfile = resolveManifestRuntimeProfile(manifest, {
+            agentName: `${repoName}/${shortAgentName}`,
+            profileName: rec.profile || undefined,
+            path: `manifest(${repoName}/${shortAgentName})`,
+          });
+          const preparedHostModeCapability = launchProfile.network.mode === 'host'
+            ? prepareHostModeCapabilityForInactiveGeneration({
+                agentId: `agent:${repoName}/${shortAgentName}`,
+                instanceId: rec.instanceId,
+                enableGeneration: rec.enableGeneration,
+                routeKey,
+                containerName: name,
+              })
+            : undefined;
+          const { containerName, hostPort, serviceTargets, registryRecord } = ensureAgentService(shortAgentName, manifest, agentPath, {
             containerName: name,
             alias: rec.alias,
             routerEndpoint,
-            profileName: rec.profile || undefined
+            profileName: rec.profile || undefined,
+            instanceId: rec.instanceId,
+            enableGeneration: rec.enableGeneration,
+            forceRecreate: newlyPreparedContainers.has(name),
+            preservePreparedRegistryRecord: true,
+            preparationLease: workspacePreparationLease,
+            preparedHostModeCapability,
           });
+          if (!registryRecord) {
+            throw new Error(`runtime '${containerName}' returned no exact registry record`);
+          }
           const executionMode = resolveAgentExecutionMode(manifest);
           const resolvedHostPort = hostPort || (
             executionMode.type === 'start_only' ? 0 : cfg.routes[routeKey]?.hostPort
@@ -1094,15 +1505,18 @@ async function startWorkspace(staticAgentArg, portArg, {
             agent: shortAgentName,
             ...(rec.alias ? { alias: rec.alias } : {}),
             ...(resolvedHostPort ? { hostPort: resolvedHostPort } : {}),
-            ...(additionalServerPort ? { additionalServerPort } : {})
+            ...(serviceTargets && Object.keys(serviceTargets).length ? { serviceTargets } : {})
           };
           if (!resolvedHostPort) delete nextRoute.hostPort;
-          if (!additionalServerPort) delete nextRoute.additionalServerPort;
+          if (!serviceTargets || !Object.keys(serviceTargets).length) delete nextRoute.serviceTargets;
           return {
             ok: true,
+            containerName,
+            registryRecord,
             shortAgentName,
             routeKey,
-            route: nextRoute
+            route: nextRoute,
+            manifest,
           };
         } catch (agentErr) {
           console.error(`[start] Failed to start agent '${shortAgentName}': ${agentErr.message}`);
@@ -1121,6 +1535,10 @@ async function startWorkspace(staticAgentArg, portArg, {
         cfg.routes[result.routeKey] = result.route;
       }
       cfg = await mergeRoutingConfig((current) => {
+        for (const result of routeResults) {
+          if (!result?.ok) continue;
+          reg[result.containerName] = result.registryRecord;
+        }
         const next = {
           ...current,
           ...cfg,
@@ -1134,17 +1552,19 @@ async function startWorkspace(staticAgentArg, portArg, {
           next.routes[result.routeKey] = result.route;
         }
         return next;
-      });
+      }, { coordinate: false });
       if (failedAgents.length > 0) {
         const message = `${failedAgents.length} agent(s) failed to start: ${failedAgents.join(', ')}`;
         if (allowFailures) {
           console.warn(`[start] ${message}`);
-          return;
+          return { failedAgents, routeResults: routeResults.filter((result) => result?.ok) };
         }
         throw new Error(message);
       }
+      return { failedAgents, routeResults: routeResults.filter((result) => result?.ok) };
     };
 
+    const deferredNoWaitLaunches = [];
     for (let waveIndex = 0; waveIndex < graphWaves.length; waveIndex += 1) {
       const waveNodeIds = graphWaves[waveIndex];
       const waveNodes = waveNodeIds
@@ -1152,11 +1572,10 @@ async function startWorkspace(staticAgentArg, portArg, {
         .filter(Boolean);
       if (!waveNodes.length) continue;
 
-      // Split the wave: blocking nodes follow the existing wave-by-wave
-      // ensureAgentService + readiness path; no-wait nodes get spawned as
-      // detached background workers that report their progress through
-      // .ploinky/logs/no-wait/ and .ploinky/running/no-wait/ without delaying
-      // later waves or the static agent.
+      // Blocking nodes follow the wave-by-wave start/readiness path. Defer
+      // detached no-wait workers until every coordinated blocking launch is
+      // complete so their independent route applies cannot transiently
+      // inactivate an exact host-generation capability during process create.
       const blockingNodes = [];
       const blockingNames = [];
       const noWaitWaveNodes = [];
@@ -1181,26 +1600,7 @@ async function startWorkspace(staticAgentArg, portArg, {
         : blockingLabel;
       console.log(`[start] Dependency wave ${waveIndex + 1}/${graphWaves.length}: ${waveSummary}`);
 
-      for (const { node, registryName } of noWaitWaveNodes) {
-        if (!registryName) {
-          console.warn(`[start] no-wait node '${formatGraphNodeLabel(node, staticAgent)}' missing registry entry; skipping background launch.`);
-          continue;
-        }
-        const rec = reg[registryName] || {};
-        const routeKey = rec.alias || node.shortAgentName;
-        try {
-          const { pid, logFile, statusFile } = spawnNoWaitWorker({
-            node,
-            registryName,
-            routeKey,
-            registryAlias: rec.alias || node.alias || '',
-            routerPort: staticPort
-          });
-          console.log(`[start] ${formatGraphNodeLabel(node, staticAgent)}: no-wait launch started (pid ${pid}). log=${logFile} status=${statusFile}`);
-        } catch (spawnErr) {
-          console.error(`[start] no-wait launch for '${formatGraphNodeLabel(node, staticAgent)}' failed to spawn: ${spawnErr?.message || spawnErr}`);
-        }
-      }
+      deferredNoWaitLaunches.push(...noWaitWaveNodes);
 
       if (blockingNames.length) {
         await updateRoutes(blockingNames);
@@ -1222,7 +1622,56 @@ async function startWorkspace(staticAgentArg, portArg, {
     const extraNames = allNames.filter((name) => !graphRegistryNames.has(name));
     if (extraNames.length) {
       console.log(`[start] Starting ${extraNames.length} additional enabled agent(s) outside the dependency graph: ${extraNames.join(', ')}`);
-      await updateRoutes(extraNames, { allowFailures: true });
+      const extra = await updateRoutes(extraNames, { allowFailures: true });
+      if (extra.failedAgents.length === 0) {
+        const extraReadiness = extra.routeResults.map((result) => buildBlockingReadinessEntryFromNode({
+          id: `extra:${result.routeKey}`,
+          shortAgentName: result.shortAgentName,
+          isStatic: false,
+          manifest: result.manifest,
+        }, result.route, result.shortAgentName));
+        await waitForReadinessEntries(extraReadiness);
+      } else {
+        throw new Error('additional runtime failure left edge selectors inactive; repair and run start again');
+      }
+    }
+
+    // Runtime-only registry metadata may change while the lifecycle binding
+    // remains exact. Persist it once, after all capability-sensitive launches
+    // have completed, so one wave cannot invalidate the selector-bound host
+    // launch token needed by a later wave.
+    await mergeRoutingConfig((current) => {
+      workspaceSvc.saveAgents(reg, { coordinate: false });
+      return current;
+    }, {
+      reason: 'workspace-runtime-graph-ready',
+      preparationLease: workspacePreparationLease,
+    });
+    workspacePreparationLease = null;
+
+    let previousNoWaitStatusFile = '';
+    for (const { node, registryName } of deferredNoWaitLaunches) {
+      if (!registryName) {
+        console.warn(`[start] no-wait node '${formatGraphNodeLabel(node, staticAgent)}' missing registry entry; skipping background launch.`);
+        continue;
+      }
+      const rec = reg[registryName] || {};
+      const routeKey = rec.alias || node.shortAgentName;
+      try {
+        const { pid, logFile, statusFile } = spawnNoWaitWorker({
+          node,
+          registryName,
+          routeKey,
+          registryAlias: rec.alias || node.alias || '',
+          routerPort: staticPort,
+          forceRecreate: newlyPreparedContainers.has(registryName),
+          waitForStatusFile: previousNoWaitStatusFile,
+        });
+        previousNoWaitStatusFile = statusFile;
+        console.log(`[start] ${formatGraphNodeLabel(node, staticAgent)}: no-wait launch started (pid ${pid}). log=${logFile} status=${statusFile}`);
+      } catch (spawnErr) {
+        console.error(`[start] no-wait launch for '${formatGraphNodeLabel(node, staticAgent)}' failed to spawn: ${spawnErr?.message || spawnErr}`);
+      }
     }
 
     console.log(`[start] Watchdog will automatically restart the server if it crashes.`);
@@ -1230,6 +1679,14 @@ async function startWorkspace(staticAgentArg, portArg, {
     console.log(`[start] Watchdog logs: ${path.join(LOGS_DIR, 'watchdog.log')}`);
     console.log(`[start] Dashboard: http://127.0.0.1:${staticPort}/dashboard`);
   } catch (e) {
+    if (workspacePreparationLease) {
+      try {
+        abortEdgeRoutingPreparation(workspacePreparationLease, {
+          reason: 'workspace-start-failed',
+        });
+      } catch (_) {}
+      workspacePreparationLease = null;
+    }
     const message = e?.message || String(e);
     if (message.startsWith('start:') || message.startsWith('start (workspace) failed:')) {
       throw e;
@@ -1253,6 +1710,7 @@ export async function runCliWithDependencies(agentName, args, dependencies) {
     resolveAgentReadinessProtocol: resolveAgentReadinessProtocolImpl = resolveAgentReadinessProtocol,
     waitForManifestReadiness: waitForManifestReadinessImpl = waitForManifestReadiness,
     waitForAgentReady: waitForAgentReadyImpl,
+    activateRuntimeAfterReadiness: activateRuntimeAfterReadinessImpl = activatePreparedRuntimeAfterReadiness,
     loadAgentsMap: loadAgentsMapImpl,
     attachInteractive,
     attachBwrapInteractive,
@@ -1298,7 +1756,7 @@ export async function runCliWithDependencies(agentName, args, dependencies) {
     });
 
     try {
-      enableAgent(autoEnableRef, 'global');
+      await enableAgent(autoEnableRef, 'global');
     } catch (err) {
       error(`Failed to enable '${agentName}' in global mode: ${err?.message || err}`);
       return;
@@ -1362,12 +1820,15 @@ export async function runCliWithDependencies(agentName, args, dependencies) {
       route: {
         container: containerName,
         hostPort: containerInfo?.hostPort || 0,
-        ...(containerInfo?.additionalServerPort ? { additionalServerPort: containerInfo.additionalServerPort } : {})
+        ...(containerInfo?.serviceTargets ? { serviceTargets: containerInfo.serviceTargets } : {})
       }
     });
   } else if (readinessProtocol !== 'none') {
     const hostPort = containerInfo?.hostPort;
     if (!hostPort) {
+      if (containerInfo?.requiresEdgeActivation) {
+        throw new Error(`Agent '${shortAgentName}' replacement cannot activate without a resolved '${readinessProtocol}' readiness target.`);
+      }
       if (!suppressLauncherLogs) {
         warn(`[cli] warning: cannot wait for '${shortAgentName}' readiness because no host port was resolved.`);
       }
@@ -1384,6 +1845,15 @@ export async function runCliWithDependencies(agentName, args, dependencies) {
       }
     }
   }
+
+  await activateRuntimeAfterReadinessImpl({
+    result: containerInfo,
+    routeKey: registryRecord?.record?.alias || shortAgentName,
+    repoName,
+    shortAgentName,
+    agentPath: agentDir,
+    alias: registryRecord?.record?.alias || '',
+  });
 
   // Determine actual runtime from registry (may differ from manifest if sandbox
   // failed and fell back to container during ensureAgentService)
@@ -1421,11 +1891,7 @@ export async function runCliWithDependencies(agentName, args, dependencies) {
   }
 }
 
-async function runCli(agentName, args, { publicationPreflightComplete = false } = {}) {
-  if (!publicationPreflightComplete) {
-    const routerPort = resolvePersistedRouterPort();
-    await preflightBoxPublicationForCommand('cli', [agentName, ...(args || [])], { routerPort });
-  }
+async function runCli(agentName, args) {
   const { ensureAgentService, attachInteractive, getAgentContainerName } = dockerSvc;
   return runCliWithDependencies(agentName, args, {
     env: process.env,
@@ -1449,11 +1915,7 @@ async function runCli(agentName, args, { publicationPreflightComplete = false } 
   });
 }
 
-async function runShell(agentName, { publicationPreflightComplete = false } = {}) {
-  if (!publicationPreflightComplete) {
-    const routerPort = resolvePersistedRouterPort();
-    await preflightBoxPublicationForCommand('shell', agentName ? [agentName] : [], { routerPort });
-  }
+async function runShell(agentName) {
   if (!agentName) { throw new Error('Usage: shell <agentName>'); }
   let registryRecord = null;
   try {
@@ -1482,6 +1944,25 @@ async function runShell(agentName, { publicationPreflightComplete = false } = {}
   });
   const containerName = (containerInfo && containerInfo.containerName)
     || registeredContainerName;
+  await waitForManifestReadiness({
+    key: `shell:${shortAgentName}`,
+    label: shortAgentName,
+    kind: 'dependency',
+    manifest,
+    route: {
+      container: containerName,
+      hostPort: containerInfo?.hostPort || 0,
+      ...(containerInfo?.serviceTargets ? { serviceTargets: containerInfo.serviceTargets } : {}),
+    },
+  });
+  await activatePreparedRuntimeAfterReadiness({
+    result: containerInfo,
+    routeKey: registryRecord?.record?.alias || shortAgentName,
+    repoName,
+    shortAgentName,
+    agentPath: agentDir,
+    alias: registryRecord?.record?.alias || '',
+  });
   const cmd = '/bin/sh';
   const projPath = getConfiguredProjectPath(shortAgentName, repoName, registryRecord?.record?.alias);
 
@@ -1515,11 +1996,8 @@ async function runShell(agentName, { publicationPreflightComplete = false } = {}
   }
 }
 
-async function reinstallAgent(agentName, { publicationPreflightComplete = false } = {}) {
+async function reinstallAgent(agentName) {
     const routerPort = resolvePersistedRouterPort();
-    if (!publicationPreflightComplete) {
-        await preflightBoxPublicationForCommand('reinstall', agentName ? [agentName] : [], { routerPort });
-    }
     if (!agentName) { throw new Error('Usage: reinstall <name> | reinstall agent <name>'); }
 
     const { getAgentContainerName, isContainerRunning, ensureAgentService } = dockerSvc;
@@ -1559,7 +2037,12 @@ async function reinstallAgent(agentName, { publicationPreflightComplete = false 
     });
 
     const agentRuntime = getRuntimeForAgent(manifest);
-    const bwrapRunning = isSandboxRuntime(agentRuntime) && isBwrapProcessRunning(resolved.shortAgentName);
+    const bwrapRunning = isSandboxRuntime(agentRuntime)
+        && Boolean(registryRecord?.record?.instanceId && registryRecord?.record?.enableGeneration)
+        && isBwrapProcessRunning(containerName, {
+            instanceId: registryRecord.record.instanceId,
+            enableGeneration: registryRecord.record.enableGeneration,
+        });
 
     if (!isContainerRunning(containerName) && !bwrapRunning) {
         console.error(`Agent '${agentName}' is not running.`);
@@ -1579,22 +2062,16 @@ async function reinstallAgent(agentName, { publicationPreflightComplete = false 
             const short = resolved.shortAgentName;
             const agentPath = path.dirname(resolved.manifestPath);
 
-            // Host sandboxes have no atomic container transaction, so stop only
-            // that process. Managed containers remain in place until the
-            // lifecycle transaction has a verified replacement candidate and
-            // can restore the previous container if candidate start fails.
-            if (bwrapRunning) {
-                stopBwrapProcess(short);
-            }
-            
-            const { containerName: newContainerName, hostPort, additionalServerPort } = await ensureAgentService(short, manifest, agentPath, {
+            // The shared runtime manager owns inactivation and physical
+            // replacement for every backend, including host sandboxes.
+            const reinstallResult = await ensureAgentService(short, manifest, agentPath, {
                 containerName,
                 alias: registryRecord?.record?.alias,
                 forceRecreate: true,
                 routerEndpoint,
             });
+            const { containerName: newContainerName, hostPort, serviceTargets } = reinstallResult;
 
-            console.log(`[reinstall] reinstalled '${short}' [container: ${newContainerName}]`);
             const repoName = path.basename(path.dirname(agentPath));
             const routeKey = registryRecord?.record.alias || short;
 
@@ -1606,51 +2083,18 @@ async function reinstallAgent(agentName, { publicationPreflightComplete = false 
                 route: {
                     container: newContainerName,
                     hostPort: hostPort || 0,
-                    ...(additionalServerPort ? { additionalServerPort } : {})
+                    ...(serviceTargets ? { serviceTargets } : {})
                 }
             });
 
-            // Routing update logic from original restart command
-            try {
-            const routingFile = ROUTING_FILE;
-            let cfg = { routes: {} };
-            try { cfg = JSON.parse(fs.readFileSync(routingFile, 'utf8')) || { routes: {} }; } catch(_) {}
-            cfg.routes = cfg.routes || {};
-            cfg.routes[routeKey] = cfg.routes[routeKey] || {};
-            cfg.routes[routeKey].container = newContainerName;
-            cfg.routes[routeKey].hostPath = agentPath;
-            cfg.routes[routeKey].repo = repoName;
-            cfg.routes[routeKey].agent = short;
-            if (registryRecord?.record.alias) cfg.routes[routeKey].alias = registryRecord.record.alias;
-            if (hostPort) {
-                cfg.routes[routeKey].hostPort = hostPort;
-            } else {
-                delete cfg.routes[routeKey].hostPort;
-            }
-            if (additionalServerPort) {
-                cfg.routes[routeKey].additionalServerPort = additionalServerPort;
-            } else {
-                delete cfg.routes[routeKey].additionalServerPort;
-            }
-
-            const savedCfg = workspaceSvc.getConfig();
-            if (!cfg.static && savedCfg?.static?.agent) {
-                cfg.static = { ...savedCfg.static };
-            }
-            const staticAgent = String(cfg.static?.agent || '').trim();
-            if (staticAgent) {
-                const matches = new Set([short, `${repoName}/${short}`, `${repoName}:${short}`]);
-                if (registryRecord?.record?.alias) {
-                    matches.add(registryRecord.record.alias);
-                }
-                if (matches.has(staticAgent)) {
-                    cfg.static.container = newContainerName;
-                }
-            }
-            
-            cfg.port = routerPort;
-            fs.mkdirSync(path.dirname(routingFile), { recursive: true });
-            fs.writeFileSync(routingFile, JSON.stringify(cfg, null, 2));
+            await activatePreparedRuntimeAfterReadiness({
+                result: reinstallResult,
+                routeKey,
+                repoName,
+                shortAgentName: short,
+                agentPath,
+                alias: registryRecord?.record?.alias || '',
+            });
 
             const isRouterUp = (p) => {
                 try {
@@ -1673,19 +2117,21 @@ async function reinstallAgent(agentName, { publicationPreflightComplete = false 
                 console.log(`[reinstall] Watchdog launched (pid ${child.pid}) on port ${routerPort}.`);
                 console.log(`[reinstall] Watchdog will automatically restart the server if needed.`);
             }
-        } catch (e) {
-            console.error('[reinstall] routing update/router start failed:', e?.message||e);
-        }
+            console.log(`[reinstall] reinstalled '${short}' [container: ${newContainerName}]`);
         });
     } catch (e) {
         console.error(`[reinstall] ${agentName}: ${e?.message||e}`);
-        if (e?.code === 'PLOINKY_READINESS_FAILED') throw e;
+        throw e;
     }
 }
 
 export {
+  assertStaticPreinstallSucceeded,
   buildBlockingReadinessEntryFromNode,
+  activatePreparedRuntimeAfterReadiness,
   ensureGraphNodesEnabled,
+  reprepareGraphAfterStartupProviders,
+  resolveExtraEnabledRuntimeNodes,
   resolveManifestRouterEndpoint,
   resolveAndPersistStartRouterPort,
   resolveGraphNodeExecutionRecord,

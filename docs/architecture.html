@@ -201,13 +201,15 @@ handleCommand(args) {
 }</code></pre>
 
                         <h3>Runtime Detection</h3>
-                        <p>Automatically detects the runtime from the manifest and host:</p>
+                        <p>Outside a marked Ploinky box, runtime selection follows the manifest and host. Inside a contract-v5 marked box, every managed agent, helper, sidecar, probe, and install-container path uses nested Podman; Docker, bwrap, and Seatbelt are not fallbacks:</p>
                         <pre><code>// Runtime preference: podman > docker
 // Default: podman/docker
 // Host sandbox:
 //   manifest "lite-sandbox": true → macOS: seatbelt, Linux: bwrap
 // Container override:
 //   ploinky sandbox disable → podman/docker even for lite-sandbox agents
+// Marked box:
+//   nested podman only for every Ploinky-managed container path
 // Legacy string selectors such as "runtime": "bwrap" are rejected.</code></pre>
                     </div>
 
@@ -215,34 +217,37 @@ handleCommand(args) {
                         <h2>Routing Server</h2>
                         
                         <h3>Purpose</h3>
-                        <p>The RoutingServer (cli/server/RoutingServer.js) acts as a reverse proxy, routing API requests to appropriate agent containers:</p>
-                        
-                        <pre><code>// routing.json structure
+                        <p>The RoutingServer (<code>cli/server/RoutingServer.js</code>) is the sole HTTP/SSE/WebSocket edge inside a managed box. It owns public/control port <code>8080</code> and is designed to own the un-published box-private port <code>8081</code>, plus an unmounted Unix health socket. Its authorization unit is a validated immutable route-and-policy authorization generation, not a mutable candidate file or topology publication counter.</p>
+                        <p>The outer wrapper always constructs exactly <code>127.0.0.1:&lt;selected-router-host-port&gt;:8080/tcp</code> and <code>0.0.0.0:7882:7882/udp</code>. Outer <code>--port</code> changes only the first mapping's physical-host side; <code>--publish</code>, <code>--expose</code>, and <code>--listen-lan</code> are rejected. No graph, manifest, profile, readiness result, environment value, label, or persisted state can add a third physical-host mapping.</p>
+                        <p>Coordinated apply requires exact readable routing, policy, desired-state, enabled-agent, and manifest sources. Missing input is never substituted with an empty policy or registry. Only a genuinely fresh workspace initializes all four persisted source documents together; a partial set or retained generation evidence stays inactive until explicit repair.</p>
+                        <p><strong>Current rootless gate:</strong> the observed Podman <code>host-gateway</code> terminates on the box outer-facing interface rather than loopback or an assigned managed-bridge address. Bridge access to private <code>8081</code> therefore remains fail-closed; Ploinky does not install a wider bind or forwarding fallback. DS004 Question #8 records the required architecture decision.</p>
+
+                        <pre><code>// Conceptual activated generation (illustrative fields only)
 {
-    "port": 8088,
-    "static": {
-        "agent": "demo",
-        "container": "ploinky_myproject_abc123_service_demo",
-        "hostPath": "/path/to/demo/agent"
-    },
+    "authorizationGeneration": "sha256:...",
+    "staticAgent": "explorer",
     "routes": {
-        "agent1": {
-            "container": "ploinky_myproject_abc123_service_agent1",
-            "hostPort": 7001
-        },
-        "agent2": {
-            "container": "ploinky_myproject_abc123_service_agent2",
-            "hostPort": 7002
+        "explorer": {
+            "instance": "...",
+            "enableGeneration": "...",
+            "primaryTarget": "private-tcp-target",
+            "services": {
+                "dashboard": { "slug": "dashboard", "port": 3000, "externalPrefix": "/dashboard" }
+            }
         }
-    }
+    },
+    "policyDigest": "sha256:..."
 }</code></pre>
 
                         <h3>Request Flow</h3>
                         <ol style="margin-left: 2rem;">
-                            <li>Client sends request to <code>http://localhost:8088/apis/agent1/method</code></li>
-                            <li>RoutingServer extracts agent name from path</li>
-                            <li>Looks up agent's container port in routing.json</li>
-                            <li>Proxies request to <code>http://localhost:7001/api/method</code></li>
+                            <li>Client sends a request through the loopback edge or an authenticated Cloudflare hostname.</li>
+                            <li>RoutingServer resolves listener class and the exact Host before examining the pathname.</li>
+                            <li>The selected host surface resolves one declared service and canonicalizes its external prefix.</li>
+                            <li>The provider and effective route policy independently admit the request against one immutable authorization generation.</li>
+                            <li>For a guest ingestion route, RoutingServer strips spoofable source and identity headers and creates one route-scoped opaque transport-source HMAC for per-source throttling; this value is never authorization or user identity.</li>
+                            <li>RoutingServer revalidates that captured authorization generation immediately before creating the upstream connection.</li>
+                            <li>RoutingServer proxies to that generation's private primary or explicit-port TCP target.</li>
                             <li>Returns response to client</li>
                         </ol>
 
@@ -280,8 +285,9 @@ HEAD /blobs/&lt;agentName&gt;/&lt;id&gt;
                         <ul style="margin-left: 2rem;">
                             <li><strong>Circuit breaker:</strong> Max 5 restarts in 60 seconds; trips and halts on breach.</li>
                             <li><strong>Exponential backoff:</strong> Initial 1s, 2x multiplier, max 30s between restarts.</li>
-                            <li><strong>Health checks:</strong> HTTP GET to <code>/health</code> every 30s, restart after 3 consecutive failures.</li>
+                            <li><strong>Health checks:</strong> Detailed probes use the supervisor-only unmounted Unix socket; no unauthenticated TCP health route is exposed.</li>
                             <li><strong>Container monitoring:</strong> Polls container state every 5 seconds.</li>
+                            <li><strong>Recurring semantic ownership:</strong> Repeats manifest health probes on a bounded interval; failure inactivates routing and forces a fresh exact-generation replacement rather than trusting one startup success.</li>
                             <li><strong>Maintenance coordination:</strong> Defers automatic container restarts when the same container has an active maintenance lock, including timers scheduled before reinstall or explicit restart began.</li>
                             <li><strong>Logging:</strong> Structured JSON to <code>.ploinky/logs/watchdog.log</code>.</li>
                         </ul>
@@ -306,7 +312,9 @@ HEAD /blobs/&lt;agentName&gt;/&lt;id&gt;
 ├── logs/                # Router and watchdog logs
 ├── shared/              # Shared data between agents
 ├── running/             # PID files
-├── routing.json         # Live route table
+├── routing.json         # Candidate route input; inert until coordinated apply
+├── edge-generations/    # Immutable validated route-and-policy generations
+├── topology/            # Box-owned non-secret topology generations
 ├── servers.json         # Web surface config (ports, tokens)
 └── deps/                # Dependency caches
     ├── global/          # Global node_modules per runtime key
@@ -346,10 +354,10 @@ HEAD /blobs/&lt;agentName&gt;/&lt;id&gt;
                         
                         <h3>Container Isolation</h3>
                         <ul style="margin-left: 2rem;">
-                            <li><strong>Filesystem:</strong> Containers only access current workspace directory</li>
-                            <li><strong>Network:</strong> Isolated network namespace per container</li>
-                            <li><strong>Process:</strong> No access to host processes</li>
-                            <li><strong>Resources:</strong> Can set CPU/memory limits</li>
+                            <li><strong>Filesystem:</strong> Manifests receive only their declared, profile-resolved mounts; writable code and host paths remain trusted capabilities.</li>
+                            <li><strong>Network:</strong> Managed bridge launches use exactly <code>--hosts-file=none --add-host host.containers.internal:host-gateway</code>; this is fixed transport configuration, not a capability. Host mode separately requires an exact effective-instance/current-generation capability and is not proof of authorization. Only one current capability owner may bind reserved UDP <code>7882</code>.</li>
+                            <li><strong>Process:</strong> Container, bubblewrap, and Seatbelt reduce exposure but do not create a hostile multi-tenant boundary inside one operator workspace.</li>
+                            <li><strong>Edge:</strong> Physical-host TCP is loopback-only; public HTTP is an outbound Cloudflare tunnel to Router. Private Router and support listeners are never outer-published.</li>
                         </ul>
 
                         <h3>Secret Management</h3>
@@ -366,8 +374,13 @@ DATABASE_URL=postgres://localhost/db</code></pre>
                             <li><strong>sso (OIDC):</strong> Delegates to the configured SSO provider agent marked with <code>"ssoProvider": true</code>. Supports PKCE flow. Cookie: <code>ploinky_sso</code>.</li>
                         </ul>
 
-                        <h3>Secure Wire Protocol</h3>
-                        <p>Agent-to-agent and browser-to-agent calls use HS256-signed invocation JWTs (60-second TTL) for request authentication. The shared agent runtime key (<code>PLOINKY_DERIVED_MASTER_KEY</code>) is derived from the resolved workspace master seed and also roots agent-owned generated secrets declared with <code>generatedSecret: true</code>. Replay protection is enforced via a memory cache.</p>
+                        <h3>Request-Bound Identity and Policy</h3>
+                        <p>Ploinky derives a distinct HMAC secret for each agent. User Sessions, Agent Assertions, Router Requests, and the distinct private-service assertion profile are direction-typed, short-lived, replay-protected, and bound to method, canonical path, and request content. A private assertion additionally binds the exact effective instance and current enable generation, but is never a user or administrator credential.</p>
+                        <p>Exact Host and listener class select a closed route surface before path dispatch. All HTTP, SSE, and WebSocket authorization uses one immutable route-and-policy authorization generation and revalidates its lease immediately before dialing. Every TCP admin/control/status handler requires a real local-admin session, and mutations additionally require exact Origin/CSRF validation.</p>
+
+                        <h3>Cloudflare, Topology, and TURN</h3>
+                        <p>The pinned in-box <code>cloudflared</code> process exists only in complete Cloudflare mode and always uses <code>http://127.0.0.1:8080</code> as origin. Local-only mode starts no connector. A coordinated apply already selects credential-absent state as <code>local-ready</code>, so the publication supervisor adopts that exact generation without a duplicate route apply; a previous Cloudflare ownership journal still requires fail-closed teardown and coordinated commit. Ploinky creates neither quick tunnels nor tunnels, and keeps connector/API credentials out of argv, status, diagnostics, and ordinary agent environments.</p>
+                        <p>The box-owned topology carries only non-secret logical locators and distinguishes the immutable route-and-policy authorization generation, a content-derived configuration generation, and a monotonic readiness/publication generation. The authenticated <code>no-store</code> browser projection returns one active locator plus configuration/publication ids, never the authorization id or inventory. TURN long-term credentials remain in core; exact current-generation consumers receive only short-lived brokered credentials and their expiry.</p>
                     </div>
 
                     <div class="doc-section" id="web-services">
@@ -409,12 +422,19 @@ observability.js    // Monitoring views</code></pre>
    → Register in .ploinky/agents.json
    → Generate container name
 
-2. User: start demo 8088
-   → Read agents registry
-   → Start container for each agent
-   → Map ports (container:7000 → host:7001)
-   → Update routing.json
-   → Start RoutingServer on 8088
+2. Host user: ploinky --port 8088 start demo
+   → Select physical loopback 8088; forward fixed inner Router port 8080
+   → Require the exact private 8081 listener set, then start public/control 8080; fail closed when an approved 8081 bind is unavailable
+	   → Prepare recursive manifest repositories and resolve the planning graph without enabling processes
+	   → Capture an early inactive generation with exact identities and every retained route targetless
+	   → Run fatal static preinstall, then startup config providers
+	   → Abort the early lease, reload registry, re-evaluate retained runtime hashes, and rotate newly stale tuples
+	   → Capture the final inactive targetless generation and exact launch lease
+	   → Start blocking waves while preserving the final exact identities
+   → Create/reuse private mappings for primary and explicit TCP service targets
+   → Apply each blocking wave's resolved targets before readiness authorizes dependents
+   → Start additional enabled agents outside the graph
+   → Spawn detached no-wait helpers last without waiting for their completion
 
 3. Container startup:
    → Pull image if needed
@@ -423,17 +443,18 @@ observability.js    // Monitoring views</code></pre>
    → Run agent command or supervisor</code></pre>
 
                         <h3>API Request Routing</h3>
-                        <pre><code>1. Client: GET http://localhost:8088/apis/simulator/monty-hall
-   
+                        <pre><code>1. Client: GET http://simulator.localhost:8088/apis/simulator/monty-hall
+
 2. RoutingServer:
-   → Extract agent: "simulator"
-   → Lookup in routing.json: hostPort: 7002
-   → Proxy to: http://localhost:7002/api/monty-hall
-   
+   → Resolve public listener plus exact host surface
+   → Resolve and authorize against the captured immutable authorization generation
+   → Revalidate that authorization generation immediately before dialing
+   → Proxy to the private target selected by the service route
+
 3. Agent Container:
    → Process request
    → Return response
-   
+
 4. RoutingServer:
    → Forward response to client</code></pre>
 
@@ -458,7 +479,7 @@ observability.js    // Monitoring views</code></pre>
 
                     <div class="doc-section" id="agent-mcp">
                         <h2>Agent MCP Bridge</h2>
-                        <p>AgentServer (Agent/server/AgentServer.mjs) expune capabilități prin <strong>Model Context Protocol (MCP)</strong> folosind transport <em>Streamable HTTP</em> la ruta <code>/mcp</code> pe portul containerului (implicit 7000).</p>
+                        <p>AgentServer (<code>Agent/server/AgentServer.mjs</code>) exposes capabilities through the <strong>Model Context Protocol (MCP)</strong> using <em>Streamable HTTP</em> at <code>/mcp</code> on the container port (default <code>7000</code>).</p>
 
                         <h3>Router ↔ Agent Communication</h3>
                         <ul style="margin-left: 2rem;">
@@ -546,7 +567,7 @@ observability.js    // Monitoring views</code></pre>
 
                         <h3>Network Efficiency</h3>
                         <ul style="margin-left: 2rem;">
-                            <li>Local port mapping avoids network overhead</li>
+                            <li>Private in-box TCP targets avoid physical-host publication</li>
                             <li>HTTP keep-alive for persistent connections</li>
                             <li>WebSocket for real-time communication</li>
                             <li>Request buffering and batching</li>
@@ -554,7 +575,7 @@ observability.js    // Monitoring views</code></pre>
 
                         <h3>Resource Management</h3>
                         <ul style="margin-left: 2rem;">
-                            <li>Automatic container cleanup on exit</li>
+                            <li>Explicit scoped cleanup through the separate core and host lifecycle commands</li>
                             <li>PID file tracking for process management</li>
                             <li>Log rotation for long-running services</li>
                             <li>Memory-efficient streaming for large outputs</li>

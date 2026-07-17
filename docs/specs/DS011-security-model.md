@@ -1,10 +1,10 @@
 ---
 id: DS011
 title: Security Model
-status: implemented
+status: partially implemented (rootless private-router reachability blocked)
 owner: ploinky-team
 supersedes: DS006 (partial - auth wire protocol)
-summary: Defines Ploinky's trust boundaries, master-keyed storage, authentication modes, secure-wire invocation flow, runtime isolation, file controls, and residual security limits.
+summary: Defines Ploinky trust boundaries for Cloudflare edge publication, closed Router surfaces, immutable generations, private service assertions, topology, TURN custody, and runtime isolation.
 ---
 
 # DS011 Security Model
@@ -27,14 +27,22 @@ Some authenticated HTTP-service flows also require the router to carry the verif
 
 Agents are isolated from the host by containers, bubblewrap, or macOS Seatbelt. As of the per-agent identity model (DS013), each agent receives only its own canonical id `PLOINKY_AGENT_ID` and its own derived secret `PLOINKY_AGENT_SECRET`; the shared `PLOINKY_DERIVED_MASTER_KEY` is no longer injected for invocation signing. Code running inside an agent process that can read its environment can therefore forge tokens only for that agent (its own secret) — not for another agent, because it does not hold another agent's secret — and it still cannot decrypt the workspace stores or mint session JWTs, which use distinct derived subkeys the agent never sees. This restores non-repudiation between enabled agents within the single-workspace, operator-controlled trust model. The `derived-master` subkey is retained only as the root for agent-OWNED generated secrets (`generatedSecret`/`sharedGeneratedSecret`), not for request authorization. See DS013 for per-agent secret derivation and the three request-signed JWT families that replace the shared-HMAC invocation model.
 
-The router port is sensitive. `RoutingServer.js` binds explicitly to IPv4
-`0.0.0.0`, and readiness checks the listener over TCP at `127.0.0.1`. This is
-required for managed bridge agents to reach the router through the outer-box
-gateway mapping; it is not a public-exposure authorization decision. Operators
-who publish the port outside the local machine must provide network controls,
-TLS termination, and proxy policy appropriate for the deployment.
-Public-internet exposure is outside the implemented security assumptions unless
-additional controls are added.
+The Router public/control listener binds inside the box, and the approved design
+adds a private managed-interface listener; reachability alone is never
+authorization. The outer engine publishes only public/control `8080` to the
+physical host's selected loopback port; private `8081` is not an outer mapping.
+The exact `host.containers.internal:host-gateway` mapping is fixed transport
+configuration for managed bridge callers, not a capability. On the observed
+rootless topology it cannot reach an approved private-interface bind, so that
+lane remains inactive. Host-mode callers require an exact current-generation
+capability before launch and use box loopback, but capability grants network
+placement only; it does not authorize a request. Public HTTP reaches `8080` only through
+the supervised outbound Cloudflare tunnel. Listener/interface class and exact
+Host select a closed route surface before pathname dispatch, and every control
+or private request must still satisfy its application credentials and policy.
+The observed rootless Podman host-gateway currently cannot satisfy the managed-
+interface bind without using the outer-facing interface, so bridge private
+service activation stays fail-closed as documented in DS004 Question #8.
 
 ### Workspace Key and Encrypted Storage
 
@@ -43,6 +51,9 @@ The workspace master seed is the root cryptographic secret. It is consumed as 25
 The master key bytes must never be used as a cryptographic key directly. Every per-purpose secret in Ploinky is derived from the master through `deriveSubkey(purpose)` in `cli/services/masterKey.js`, which applies HKDF-SHA256 with an empty salt and a domain-separated `info` of `ploinky/<purpose>/v1`. The current purposes are:
 
 - `agent-secret/<agentId>` — per-agent request-signing secret. `deriveAgentRequestSecret(agentId)` derives each agent's `PLOINKY_AGENT_SECRET` (DS013); the router signs Router Requests with the target agent's value and derives a source agent's value to verify its Agent Assertion. Router/launcher-only; only the per-agent result is injected.
+- `private-agent-secret/<agentId>/<instanceId>/<enableGeneration>` — exact runtime-generation request-signing secret for private Router assertions. The launcher injects only that one derived value into the matching runtime; the router derives it again for verification.
+- `router-admin-csrf` — session-and-Origin-bound proof used for local control mutations. Router-only; never a user or agent credential.
+- `router-rate-source` — Router-only HMAC key for opaque, route-scoped guest-ingestion source partitions. The input is the canonical Cloudflare connector source address for an active public hostname or the observed TCP peer for a local alias; the raw address, session id, and user identity are never forwarded.
 - `derived-master` — root for agent-OWNED generated secrets only. `deriveAgentSecret()` derives Ploinky-owned and agent-owned generated secrets from it with labels for repo, agent, and secret name. It is no longer used for request authorization and is no longer injected as `PLOINKY_DERIVED_MASTER_KEY`.
 - `session` — HS256 signing/verification key for local session JWTs (`ploinky_jwt` cookie). Router-only; never injected anywhere.
 - `storage/secrets` — AES-256-GCM key for `.ploinky/.secrets`.
@@ -52,7 +63,15 @@ Adding a new persistent secret requires picking a fresh purpose label rather tha
 
 Agent-owned generated secrets must derive from `PLOINKY_DERIVED_MASTER_KEY`, not from `PLOINKY_MASTER_KEY` and not from random persistent storage. Manifests declare ordinary per-agent generated secrets with `generatedSecret: true`; this derives from a domain-separated label containing the current repo name, current agent name, and env name. Runtime resources use `{{generatedSecret:NAME}}` for the same per-agent behavior. Cross-agent service credentials that must be identical, such as a shared media-service API key, must use `sharedGeneratedSecret: true` so the value derives from the source env name rather than a custom logical repo/agent/name tuple. Shared generated credentials are still explicit manifest choices and should be reserved for credentials that truly must be shared. A generated env entry may set `explicitOverride: true` when an operator-provided external credential is allowed to replace the generated value, or `explicitOverrideRequires` when that external credential must travel together with companion topology. Runtime managers expose only the source class, `PLOINKY_ENV_SOURCE_<ENV_NAME>=generated|explicit`, not the secret material itself. External provider credentials and operator-supplied API keys remain explicitly configured because their values originate outside the workspace.
 
-Startup config-provider subprocesses are host-side helper commands, not trusted runtime key holders. Ploinky builds a sanitized provider environment, strips `PLOINKY_MASTER_KEY`, `PLOINKY_DERIVED_MASTER_KEY`, `PLOINKY_AGENT_SECRET`, `PLOINKY_AGENT_ID`, `PLOINKY_AGENT_API_KEY`, and `PLOINKY_AGENT_API_PUBLIC_KEY`, then validates provider stdout before writing accepted values itself. Providers therefore cannot decrypt workspace stores or mint router credentials through environment inheritance. Provider output is also rejected when it targets reserved Ploinky names or generated/shared-generated secret names owned by the dependency graph.
+Startup config-provider subprocesses are host-side helper commands, not trusted
+runtime key holders. After manifest env resolution, Ploinky strips the complete
+shared reserved-agent environment set: workspace master material, TURN and
+Cloudflare credentials, all `PLOINKY_AGENT_*` identity, instance, generation,
+and signing values, plus their generated-provenance markers. It then validates
+provider stdout before writing accepted values itself. Providers therefore
+cannot decrypt workspace stores, mint Router credentials, or inherit box-edge
+credentials. Provider output is also rejected when it targets reserved Ploinky
+names or generated/shared-generated secret names owned by the dependency graph.
 
 `.ploinky/.secrets` must be stored as an AES-256-GCM JSON envelope through `cli/services/encryptedSecretsFile.js`, encrypted with the `storage/secrets` subkey. Legacy plaintext key-value files are migrated into the encrypted envelope on first read. The envelope encrypts both variable names and values inside the ciphertext payload. Writes use a temporary file and rename, and the implementation attempts to set mode `0600`.
 
@@ -84,21 +103,76 @@ SSO pending state must be short lived. The generic bridge currently keeps pendin
 
 Guest auth is enabled by `guest: true` in an agent manifest, by `routerAccess.httpRoutes` entries with `access: "guest"`, or by `httpServices` entries with `access: "guest"`. Normal guest routes first honor an existing authenticated local or SSO session when one is present; otherwise the router mints a scoped guest session. Guest session JWTs live in `ploinky_guest`, expire after one hour, carry a `guest` role and random guest id, and may carry a `gscope` value that prevents reuse outside the declaring route or service. Guest sessions are `typ: "guest-session"` (audience `ploinky-router`) and resolve through the same `getSession()` path and revocation list as user sessions. Guest identity is pseudonymous and short lived; agents enforce guest limitations from the `actor.roles` claim in the Router Request the router mints, and the MCP tool policy (DS014) denies guests any `admin` or `internal` tool.
 
+Guest-session identity is not the source key for public-ingestion throttling: a
+browser can decline cookie persistence and receive another guest session. After
+an immutable guest route and policy decision succeeds, the Router strips every
+caller-supplied `x-ploinky-*` and source-address header and synthesizes an
+`x-ploinky-rate-source` HMAC partition from the canonical transport source plus
+the route key and external prefix. Active public-host requests require one
+valid `CF-Connecting-IP` supplied by the supervised Cloudflare connector; local
+aliases use the Router-observed TCP peer. Services may use this opaque value
+only for abuse-control accounting, never authentication, authorization, or
+identity, and must remove it before their application upstream.
+
 ### Router Route Protection
 
 The router must attach authenticated identity to `req.user`, `req.session`, `req.sessionId`, and `req.authMode` before protected browser surfaces and first-party MCP requests execute. The route auth context is resolved from the request path, explicit `agent` query parameter, route table, and static-agent configuration. For `/webchat?agent=<target>`, the target agent manifest may declare `"webchat": { "auth": "static" }` to authenticate the webchat surface with the static agent's route policy while still running the target chat agent.
 
-`/health` and `/MCPBrowserClient.js` are intentionally reachable before route authentication. `/health` exposes operational metadata needed by the watchdog. `/MCPBrowserClient.js` serves first-party client code and must not contain secrets.
+`/MCPBrowserClient.js` may be reachable before route authentication only on a
+host class whose closed surface explicitly includes that bootstrap asset; it
+must contain no secrets. Detailed `/health` is absent from TCP and is available
+only to the supervisor over an unmounted Unix socket. An authenticated TCP
+summary exposes no private targets, policy source, caller ACL, or topology
+inventory.
 
 `/auth/*` handles login, logout, account, token, and callback flows. `/api/agents/<agent>/users` performs its own local-admin authorization because it must authenticate against the target agent's local-auth policy. `/mcp` is protected by normal route authentication before router-level MCP aggregation. `/<agent>/mcp` defers browser authentication or delegated-caller verification until the JSON-RPC body is available, because secure-wire tokens are body-bound.
 
-Dashboard access has two modes. If router auth has established `req.user`, the Dashboard creates its own surface session and treats the router-authenticated user as authorized. If no router user exists, the Dashboard can still use the legacy `WEBDASHBOARD_TOKEN` flow. The Dashboard `/run` endpoint can execute `ploinky` commands with user-supplied arguments and must remain behind Dashboard authorization. Production-oriented deployments should remove or tightly constrain that endpoint before exposing Dashboard beyond a trusted operator network.
+Dashboard and Status require a real router-authenticated local-admin session on
+an exact local-control Host. They do not accept a surface token, invitation,
+agent credential, media credential, private assertion, or loopback provenance
+as administrator identity. The Dashboard `/run` endpoint can execute allowlisted
+`ploinky` commands with bounded user-supplied arguments and output; it remains a
+high-trust local control action. Every mutation, including `/run`, additionally
+requires the exact request Origin and the session-bound CSRF header minted by
+the router.
 
-The Status surface is protected by the router auth context when a route policy requires auth. Its handler does not implement an additional token challenge. If the active route context resolves to auth mode `none`, Status data is effectively public on the router port.
+Status is a control surface, not a route-policy fallback. It requires a real
+authenticated admin session on an allowed local-control host and never becomes
+public because an agent route uses auth mode `none`. Agent Assertions, Router
+Requests, LiveKit JWTs, delegations, and localhost provenance cannot satisfy it.
 
 Manifest-declared route access through `routerAccess.httpRoutes` is trusted manifest power over transparent proxy paths. A public declaration can expose read-only agent HTTP content to anonymous callers, a guest declaration ensures an anonymous identity when no user session exists, and an authenticated declaration can tighten selected paths under an otherwise unauthenticated agent route. If a manifest route entry omits `access`, the router treats it as `authenticated`; explicit empty or unknown values are invalid. Public declarations never make state-changing methods anonymous; `POST`, `PUT`, `PATCH`, and `DELETE` are denied unless a more restrictive decision applies. Authenticated declarations require a user-authenticated router session for all methods, using the owning route user-auth policy when configured, falling back to the static route's user-auth policy, and failing closed with `authenticated_http_route_auth_not_configured` when neither route can authenticate a user. Guest auth mode and guest sessions are not sufficient for authenticated route access. Manifest route access cannot open root, root wildcard, raw or encoded `__agent` control-plane segments, or router-root internal paths. Agent-relative `/auth/...`, `/admin/...`, and `/metrics` declarations expand under the agent route key and are not equivalent to the router-owned paths of the same names.
 
 HTTP service routes are declared by agent manifests through `httpServices`; the router must not encode product-specific service paths in core handlers. Each declaration uses explicit `access` with exactly `public`, `guest`, or `authenticated`; retired service fields are invalid and unmount only the offending service. A `public` declaration intentionally bypasses router identity. A `guest` declaration honors an existing local or SSO login, otherwise mints a scoped guest identity, and forwards a router-issued `__http_service__` invocation token. Authenticated service routes under `/services/...` must not become anonymous or guest-only just because the service-owning agent route is configured with `auth.mode: "none"` or `auth.mode: "guest"`; the router must prefer the owning route's user-auth policy, fall back to the static route's user-auth policy, and reject the request if no user-auth policy is available. Authenticated and guest service routes may pass a compact `x-ploinky-auth-info` header derived from `req.user`. When the downstream service may need to trust that identity or make delegated agent calls, the router includes both a router-issued invocation token and the signed invocation body in that auth-info payload. Only authenticated service delegations are allowed, and they may be conditioned with `when: { queryParam, pathRoots }`; the router evaluates the decoded query parameter with boundary-aware path matching before minting, so a service can request DPU delegation only for `/Confidential` sessions while ordinary workspace sessions receive no delegation grant. This token is scoped to `http-service:<routeKey>` and `tool: "__http_service__"`, so it is not equivalent to broad first-party provider access. If the router cannot resolve the service route to an installed-agent principal while minting that token, it must fail closed and not proxy the request. The invocation body is the canonical `__http_service__` call payload containing method, signed internal path, external path, search string, route key, and `bodyHash` for the exact request body bytes the router forwards. The signed path is the rewritten upstream path that the service receives and can independently verify; `externalPath` is route context only. To avoid unbounded memory use while signing exact body bytes, the router buffers at most `PLOINKY_HTTP_SERVICE_INVOCATION_MAX_BODY_BYTES` bytes (default 10 MiB) for authenticated and guest service routes that mint invocation tokens and returns `413 http_service_body_too_large` before proxying when the limit is exceeded. Downstream services that use router SSO must call `verifyHttpServiceAuthInfoFromHeaders()` or perform the equivalent checks: verify the Router Request JWT audience, method, signed path, tool, `rch` computed with `computeRchHttp({method, path, query, bodyHash})`, replay id, and the received body hash before trusting the header. The helper supplies a bounded in-memory replay cache by default; multi-process services that need process-wide replay resistance may pass a shared replay cache explicitly. Services can also re-enter `/<agent>/mcp` with an Agent Assertion JWT carried as `Authorization: Bearer` when making delegated calls (DS013; the legacy `X-Ploinky-Caller-JWT` carrier is retired). The identity fields in `x-ploinky-auth-info` are not a signed secure-wire grant by themselves; downstream services must trust them only after the invocation token verifies for the forwarded service request. The router strips caller-supplied Ploinky identity headers before proxying and regenerates authoritative identity headers from the authenticated request context.
+
+Each service also retains a validated slug and may declare one optional integer
+`port`; an omitted port preserves the owning agent's primary target. Slug,
+prefix, target, all effective policy providers, and exact source-byte digests
+are compiled into one immutable route-and-policy authorization generation. Raw
+file edits have no live effect.
+Apply inactivates affected selectors before acknowledgement, and HTTP, SSE, and
+WebSocket revalidate the captured generation immediately before dialing. A
+stale or corrupt generation returns `503` without an upstream connection.
+
+Listener/interface class and exact Host are resolved before pathname dispatch.
+Dedicated service and agent-root hosts have closed allowlists, so an accepted
+service Host cannot expose admin, health, policy, discovery, aggregate MCP,
+Dashboard, Status, WebChat, broker, or private-service paths. Unknown,
+malformed, suffix-confusable, stale, and unauthorized host/path combinations
+fail before dialing. Incoming `Forwarded`, every `X-Forwarded-*`, cookies,
+`Authorization`, and `x-ploinky-*` identity/assertion headers are stripped or
+handled at their exact trusted boundary; canonical forwarding and identity
+values are synthesized from the selected topology and authenticated context.
+
+Private services use listener `8081` and require both the compiled canonical
+service policy to resolve effectively to `authenticated` and an exact
+current-instance/current-enable-generation caller ACL. The private assertion is
+a distinct replay-protected credential binding audience, caller, generation,
+method, path, body, expiry, and nonce. It does not mint or stand in for a user,
+guest, or admin session. Assertions are accepted only on the private listener,
+their header is removed before proxying, and service-specific upstream
+authorization may be preserved. Every TCP control/status action still requires
+a real admin session; mutations additionally require exact Origin and CSRF.
 
 ### Secure-Wire Invocation Model
 
@@ -120,11 +194,17 @@ Legacy agent client-credential auth is removed. `/auth/agent-token` returns gone
 
 ### Runtime Isolation and Mount Policy
 
-The default runtime backend is a container runtime, preferring Podman when available and falling back to Docker. Host sandboxes are disabled by default and are selected only when the operator opts in via `ploinky sandbox enable` *and* the manifest requests `lite-sandbox: true`: Linux uses bubblewrap, macOS uses Seatbelt, and unsupported or unavailable host sandboxes fail with operator guidance rather than silently falling back. The environment variable `PLOINKY_DISABLE_HOST_SANDBOX=1` overrides any workspace opt-in and forces the container path.
+Outside a marked Ploinky box, the default runtime backend is a container runtime, preferring Podman when available and falling back to Docker. Host sandboxes are disabled by default and are selected only when the operator opts in via `ploinky sandbox enable` *and* the manifest requests `lite-sandbox: true`: Linux uses bubblewrap, macOS uses Seatbelt, and unsupported or unavailable host sandboxes fail with operator guidance rather than silently falling back. The environment variable `PLOINKY_DISABLE_HOST_SANDBOX=1` overrides any workspace opt-in and forces the container path. Inside a contract-v5 marked box, every managed agent, helper, sidecar, probe, and install-container path uses nested Podman; retained sandbox preferences, Docker, bwrap, and Seatbelt are not fallbacks.
 
 Container agents must mount `/Agent` read-only, prepared dependency caches read-only, code and skills according to the active profile, `.data/<agent-or-alias>/` at `/root` as the persistent agent home, and workspace or shared paths as required by the run mode. Every container agent receives `HOME=/root`; isolated agents use `/root` as their workspace path, while global agents keep the workspace root as their run-mode write surface. The `dev` profile defaults code and skills to read-write. `qa` and `prod` default them to read-only unless a profile explicitly relaxes them. Prepared `node_modules` caches must remain read-only in runtime containers. Podman-staged symlink trees must mount each symlink target at its real path with the same read/write policy instead of relying on a broad writable workspace mount. Root and active profile manifest volumes and runtime resources are explicit operator-granted write surfaces and must be treated as trusted manifest power. Manifest volume host paths may resolve outside `.ploinky/`; runtime-resource data should still prefer `.ploinky/data/`, while agent home data should prefer `.data/`.
 
-Container-published ports default to localhost when no explicit profile port mapping is declared. Profile port mappings may include an explicit host IP; if a manifest or profile binds to a non-local address, that exposure is intentional operator configuration and must be reviewed as a network security decision.
+The outer container has exactly two physical-host mappings: loopback selected
+Router TCP to box `8080`, and wildcard `7882:7882/udp`. No manifest, profile,
+`openPorts`, readiness result, environment value, label, or retained state can
+add a third mapping. The wrapper rejects `--publish`, `--expose`, and
+`--listen-lan`; Router private `8081` and every agent/support TCP listener remain
+un-published. A pre-existing physical UDP owner makes box creation fail with an
+owner-aware diagnostic instead of auto-remapping.
 
 Within the outer runtime, every Ploinky-managed nested Podman bridge uses the
 exact `isolate=true` bridge option. Direct IP traffic between different managed
@@ -138,18 +218,35 @@ valid managed bridge.
 Managed `default` and `bridge` agent containers are created with exactly
 `--hosts-file=none --add-host host.containers.internal:host-gateway`. They
 receive the validated router host, port, and URL through environment variables;
-`host` agents use `127.0.0.1`, and `none` agents receive no router endpoint.
+they also receive the box-owned non-secret topology snapshot and private Router
+locator before start. `host` agents use `127.0.0.1` only after an exact
+effective-instance/current-generation capability grant, and `none` agents
+receive no router endpoint.
 Reuse validation treats any different hosts policy, attachment, alias, label,
-or network-contract hash as drift. An older hash remains foreign and is neither
+network-contract hash, or immutable instance/enable-generation ownership label
+as drift. Engine inspection must match those launch labels to the selected
+generation before reuse or capability-effectiveness can succeed; mutable
+registry state alone is insufficient. An older hash remains foreign and is neither
 adopted nor recreated. Only exact-owned current-hash runtime drift may trigger
-recreation; the hash is never weakened. Contract-4 managed networking requires
+recreation; the hash is never weakened. Contract-5 managed networking requires
 rootless Podman 5.4 or newer, Netavark, and operational `pasta`; no
 `slirp4netns` fallback exists.
 
-Wildcard- or gateway-bound services in the outer box are directly reachable
-from managed bridges. Loopback-only box services and Unix sockets are not.
-Direct reachability does not inherit router authentication; each such service
-must implement its own authorization. Calls that pass through the router,
+Host sandbox ownership uses the equivalent schema-2 PID record: exact runtime
+key, PID start identity, `instanceId`, and `enableGeneration`. Missing, corrupt,
+schema-1, or stale-generation records fail closed before reuse. Every runtime
+backend derives and injects its exact tuple-bound private secret as a mandatory
+launch step; identity-store failure cannot degrade startup to an unauthenticated
+process. Semantic health recurs after startup, and a socket-owner failure
+inactivates routing before any replacement attempt.
+
+The private Router listener is intended to be reachable only through an approved
+managed interface or capability-approved box-loopback host mode and still
+requires policy plus exact caller-generation credentials. The managed-bridge
+lane is currently unavailable on the observed rootless topology and stays
+fail-closed; no outer-facing bind or forwarding fallback is permitted.
+Detailed health remains Unix-socket-only. Network reachability and localhost
+provenance never inherit authentication. Calls that pass through the router,
 including MCP operations, retain JWT issuer/audience checks, tool policy,
 request-content binding, expiry, and replay protection. The former
 `ploinky-router` network-name reservation is gone, but `ploinky-router` remains
@@ -197,9 +294,50 @@ LLM runtime manifests still use the ordinary Ploinky MCP contract. The public co
 
 Ploinky writes `.data/<agent-or-alias>/runtime/selected-architecture.json` before container start and mounts it at `/runtime/selected-architecture.json`. Long-lived Hugging Face and model artifacts are mounted separately at `/models` and must remain under `/models/hf-cache`, `/models/artifacts`, and `/models/derived`; `/runtime` is for selected-architecture metadata, launch configs, PIDs, state, and redacted logs. Image references cannot contain secrets — the only template token Ploinky substitutes inside catalog `image.ref` is `${AGENT_IMAGE_NAME}`, replaced with a validated agent identity (`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`). `HF_TOKEN` (and other Hugging Face tokens) is treated as a manifest-declared env secret only; it must never appear in container image refs, container labels, command-line arguments, the selected-architecture state file, model-profile state, launcher configs, or runtime logs. Ploinky core does not load, execute, or interpret catalog code: catalogs are JSON data files validated with strict schema-equivalent allowlists, with path-traversal guards on every referenced architecture and image file. The published JSON Schemas are kept in parity with the runtime validators by catalog tests. See DS012 for the catalog contract.
 
+The box image includes a pinned multi-architecture `cloudflared`, supervised by
+Ploinky core. Credential absence selects the complete `local-only` operating
+mode: the connector process is absent and no public HTTP hostname exists.
+Cloudflare mode requires an existing tunnel connector token and a separate
+least-privilege API token for DNS/ingress reconciliation. Ploinky never creates
+a tunnel or quick tunnel. Partial, invalid, or unauthorized configuration fails
+closed without switching modes, and the connector always targets in-box
+`http://127.0.0.1:8080`. Token values stay out of argv, ordinary process env,
+logs, diagnostics, status, and read APIs. Before v5 activation operators revoke
+the retired connector/API tokens and delete its plaintext state; v5 contains no
+reader, migration, cleanup, or fallback for it.
+
+A coordinated edge apply already commits a credential-absent generation as
+`local-ready`. The publication supervisor adopts that exact selected generation
+without inactivating and applying it again. This avoids a second writer racing
+agent-enable generation work and does not weaken validation: invalid or partial
+Cloudflare input still fails closed, and a prior Cloudflare ownership journal
+always forces the normal inactivate, remote teardown, and coordinated commit
+sequence before local-only is reported.
+
+The box-owned topology snapshot is non-secret and generation-based. It records
+the immutable route-and-policy `authorizationGeneration`, a content-derived
+`configurationGeneration` for stable non-secret consumer inputs, and a
+monotonic `publicationGeneration` for readiness/publication state. It excludes
+Cloudflare account data, private target ports, credential handles, callback
+tokens, and TURN credentials. Browsers receive only one authenticated active
+locator with `Cache-Control: no-store`, configuration/publication ids, and no
+authorization id or inventory. TURN long-term secrets stay in core. The private
+broker mints rate-limited short-lived credentials only for exact
+current-generation consumers, returns expiry, and logs no credential value.
+Agents never receive the long-term secret through their environment or mounted
+topology.
+
 ### Residual Security Requirements
 
-Ploinky's implemented controls are sufficient for local, operator-controlled workspaces when the router port is not exposed to untrusted networks. Per-agent credentials (DS013) and fail-closed router policy (DS014) are now implemented. Before treating Ploinky as an internet-facing or multi-tenant service, the implementation must still add explicit bind-host configuration, TLS guidance or enforcement behind a proxy, CSRF or origin checks for cookie-authenticated state-changing routes, login rate limiting, upload quotas, hardened Dashboard command policy, and the deferred anonymous-token identities (anonymous tokens / limited API keys).
+Contract 5 supports selected internet-facing HTTP services only through the
+outbound Cloudflare tunnel and exact Router host/service policy. It does not
+claim hostile multi-tenant isolation. Origin/CSRF checks, login and broker rate
+limits, upload/body quotas, closed host surfaces, header synthesis, immutable
+generation leases, and scoped private assertions are mandatory for that public
+mode. Dashboard command execution remains a high-trust local-admin surface and
+must not be included on public service or agent-root hosts. Anonymous-token or
+limited-API-key identities remain deferred and are not substituted by guest
+sessions or agent assertions.
 
 ## Decisions & Questions
 
@@ -223,17 +361,23 @@ Containers, bubblewrap, and Seatbelt reduce host filesystem and process exposure
 ### Question #4: Why does the security model call out router network exposure as a deployment risk?
 
 Response:
-The router deliberately binds IPv4 `0.0.0.0` inside its runtime namespace so
-managed bridge agents can reach it through the host-gateway mapping. Readiness
-still checks `127.0.0.1`, and host publication remains a separate explicit
-boundary. The security posture therefore depends on the selected runtime
-namespace, publication configuration, firewall rules, and reverse proxy;
-exposing the router port changes the threat model.
+The public/control listener is reachable inside the box but the physical host
+publishes it only on loopback. Public HTTP arrives through an outbound
+cloudflared connection to fixed in-box `127.0.0.1:8080`; the private listener is
+not an outer publication. Host/interface classification, exact Host, closed
+surface allowlists, and application policy therefore remain necessary even
+though no physical-host TCP socket is LAN-visible.
 
 ### Question #5: What unresolved hardening work is required before internet-facing production use?
 
 Response:
-Per-agent credential isolation is now implemented (DS013) and the router enforces fail-closed route/tool policy (DS014), closing the two items previously named here. The remaining unresolved items are explicit CSRF or origin checks, login rate limiting, upload quotas, a hardened replacement for Dashboard command execution, an ephemeral-token implementation for WebChat Realtime browser credentials, and the deferred anonymous-token identities (anonymous tokens / limited API keys). These are not defects for the documented local workspace model, but they are blockers for a broader hosted security claim.
+Per-agent credential isolation, fail-closed route/tool policy, Origin/CSRF for
+mutations, closed host surfaces, exact generation leases, and scoped private
+assertions are required by contract 5. A hostile multi-tenant claim remains out
+of scope because enabled code, lifecycle hooks, host-mode capability, writable
+mounts, Dashboard command execution, and the workspace master key stay in one
+operator trust domain. Anonymous-token identities and any browser provider-token
+surface require a separate design rather than a fallback credential.
 
 ### Question #6: Why treat manifest-declared HTTP route access as trusted manifest power?
 

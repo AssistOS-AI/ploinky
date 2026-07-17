@@ -2,9 +2,10 @@ import fs from 'fs';
 import path from 'path';
 import { PROFILE_FILE, PLOINKY_CWD, PLOINKY_DIR, PLOINKY_WORKSPACE_ROOT, REPOS_DIR } from './config.js';
 import { validateSecrets } from './secretInjector.js';
-import { validateManifestEnvProfileCompleteness } from './secretVars.js';
+import { collectManifestEnv, validateManifestEnvProfileCompleteness } from './secretVars.js';
 import { debugLog, findAgent } from './utils.js';
 import { effectiveManifestNetwork, validateManifestNetworks } from './networkContract.js';
+import { validateManifestHttpServices } from './httpServicePortConfig.js';
 
 // Discover all valid profile names from installed agent manifests.
 // Any profile name declared in a manifest's "profiles" section is valid.
@@ -176,11 +177,6 @@ export function mergeProfiles(defaultProfile, activeProfile) {
         merged.network = activeProfile.network;
     }
 
-    // Merge additional server port - active replaces default because it selects one upstream.
-    if (activeProfile.additionalServerPort !== undefined) {
-        merged.additionalServerPort = activeProfile.additionalServerPort;
-    }
-
     // Startup config providers are profile-selected lifecycle inputs. The
     // active profile replaces the default list so deployment profiles can opt
     // into providers without changing development startup.
@@ -228,6 +224,7 @@ export function resolveManifestProfile(manifest, requestedProfileName, {
     const source = manifest && typeof manifest === 'object' && !Array.isArray(manifest)
         ? manifest
         : {};
+    validateManifestHttpServices(source, { label: manifestPath });
     validateManifestNetworks(source, { path: manifestPath });
 
     const profiles = source.profiles && typeof source.profiles === 'object' && !Array.isArray(source.profiles)
@@ -340,7 +337,8 @@ export function setActiveProfile(profileName) {
  */
 export function getProfileConfig(agentName, profileName) {
     try {
-        const { manifestPath } = findAgent(agentName);
+        const resolvedAgent = findAgent(agentName);
+        const { manifestPath } = resolvedAgent;
         const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
         return resolveManifestProfile(manifest, profileName || getActiveProfile(), {
             agentName,
@@ -351,6 +349,8 @@ export function getProfileConfig(agentName, profileName) {
         // Re-throw missing profile errors so they bubble up
         if (err.message.includes('missing required')
             || err.code === 'PLOINKY_NETWORK_CONTRACT_INVALID'
+            || err.code === 'PLOINKY_REMOVED_MANIFEST_FIELD'
+            || err.code === 'PLOINKY_MANIFEST_HTTP_SERVICE_INVALID'
             || err.code === 'PLOINKY_PROFILE_NOT_FOUND') {
             throw err;
         }
@@ -371,7 +371,8 @@ export function validateProfile(agentName, profileName) {
     let config = null;
 
     try {
-        const { manifestPath } = findAgent(agentName);
+        const resolvedAgent = findAgent(agentName);
+        const { manifestPath } = resolvedAgent;
         const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
 
         if (!manifest.profiles) {
@@ -398,6 +399,17 @@ export function validateProfile(agentName, profileName) {
             profileName,
         });
         issues.push(...envProfileValidation.issues);
+        const envResolution = collectManifestEnv(manifest, {
+            profileConfig: config,
+            agentName: resolvedAgent.shortAgentName,
+            repoName: resolvedAgent.repo,
+        });
+        for (const spec of envResolution.missing) {
+            const rendered = spec.sourceName && spec.sourceName !== spec.insideName
+                ? `${spec.insideName} (source: ${spec.sourceName})`
+                : spec.insideName;
+            issues.push(`Missing required environment variable: ${rendered}`);
+        }
 
         // Validate required secrets
         if (config.secrets && Array.isArray(config.secrets)) {

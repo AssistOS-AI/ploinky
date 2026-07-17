@@ -6,6 +6,7 @@ import { resolveEnabledAgentRecord } from '../../services/agents.js';
 import { findAgent } from '../../services/utils.js';
 import { GUEST_SESSION_TTL_SECONDS, getSessionCookieMaxAge as getLocalSessionCookieMaxAge, mintGuestSessionJwt, mintSessionJwt } from '../auth/localService.js';
 import { waitForAgentReady } from '../utils/agentReadiness.js';
+import { BROWSER_CSRF_COOKIE_NAME, mintBrowserCsrfToken } from '../browserMutationSecurity.js';
 import {
     appendLog,
     appendSetCookie,
@@ -21,7 +22,13 @@ import {
     wantsJsonResponse,
 } from './shared.js';
 
-function readRouting() {
+function snapshotFromOptions(options = {}) {
+    return options?.snapshot || options?.routePlan?.snapshot || options?.routePlan?.lease?.snapshot || null;
+}
+
+function readRouting(options = {}) {
+    const snapshot = snapshotFromOptions(options);
+    if (snapshot) return snapshot.routing || {};
     const dynamicRoutingFile = process.env.PLOINKY_ROUTING_FILE
         || path.join(resolveCurrentWorkspaceRoot(), '.ploinky', 'routing.json');
     const routingFile = fs.existsSync(dynamicRoutingFile) ? dynamicRoutingFile : ROUTING_FILE;
@@ -32,19 +39,63 @@ function readRouting() {
     }
 }
 
+function resolveEnabledAgentRecordFromSnapshot(agentRef, snapshot) {
+    const input = String(agentRef || '').trim();
+    if (!input || !snapshot || typeof snapshot !== 'object') return null;
+    const agents = snapshot.agents && typeof snapshot.agents === 'object' ? snapshot.agents : {};
+    const routing = snapshot.routing && typeof snapshot.routing === 'object' ? snapshot.routing : {};
+    const route = routing.routes?.[input] || null;
+    const exactContainer = String(route?.container || '').trim();
+    if (exactContainer && agents[exactContainer]?.type === 'agent') {
+        return { containerName: exactContainer, record: agents[exactContainer] };
+    }
+
+    const parts = input.split(/[:/]/).filter(Boolean);
+    const namespaced = parts.length === 2;
+    const repoName = namespaced ? parts[0] : String(route?.repo || '').trim();
+    const agentName = namespaced ? parts[1] : String(route?.agent || input).trim();
+    const matches = Object.entries(agents).filter(([, record]) => (
+        record?.type === 'agent'
+        && (
+            String(record.alias || '') === input
+            || (repoName && agentName
+                && String(record.repoName || '') === repoName
+                && String(record.agentName || '') === agentName)
+            || (!repoName && String(record.agentName || '') === agentName)
+        )
+    ));
+    if (matches.length > 1) {
+        const error = new Error(`active edge generation has ambiguous auth owner '${input}'`);
+        error.code = 'EDGE_GENERATION_INVALID';
+        throw error;
+    }
+    return matches.length === 1 ? { containerName: matches[0][0], record: matches[0][1] } : null;
+}
+
+function resolveEnabledAgentRecordForAuth(routeKey, options = {}) {
+    const snapshot = snapshotFromOptions(options);
+    if (snapshot) return resolveEnabledAgentRecordFromSnapshot(routeKey, snapshot);
+    return resolveEnabledAgentRecord(routeKey);
+}
+
 function resolveCurrentWorkspaceRoot() {
     return String(process.env.PLOINKY_WORKSPACE_ROOT || '').trim() || PLOINKY_WORKSPACE_ROOT;
 }
 
-async function waitForAgentRedirectReady(agentName) {
+async function waitForAgentRedirectReady(agentName, options = {}) {
     const normalizedAgent = typeof agentName === 'string' ? agentName.trim() : '';
     if (!normalizedAgent) {
         return true;
     }
-    return waitForAgentReady(normalizedAgent, {
+    const snapshot = snapshotFromOptions(options);
+    const route = snapshot?.routing?.routes?.[normalizedAgent] || normalizedAgent;
+    return waitForAgentReady(route, {
         timeoutMs: 5000,
         intervalMs: 125,
-        probeTimeoutMs: 250
+        probeTimeoutMs: 250,
+        beforeProbe: options.routePlan?.lease?.commit
+            ? () => options.routePlan.lease.commit() === true
+            : null,
     });
 }
 
@@ -57,9 +108,12 @@ function readJsonFileIfExists(filePath) {
     }
 }
 
-function readEnabledAgentManifest(routeKey, routes = {}) {
+function readEnabledAgentManifest(routeKey, routes = {}, options = {}) {
     const normalizedRouteKey = String(routeKey || '').trim();
     if (!normalizedRouteKey) return null;
+
+    const snapshot = snapshotFromOptions(options);
+    if (snapshot) return snapshot.manifests?.[normalizedRouteKey] || null;
 
     const routeHostPath = String(routes?.[normalizedRouteKey]?.hostPath || '').trim();
     const routeManifest = readJsonFileIfExists(routeHostPath ? path.join(routeHostPath, 'manifest.json') : '');
@@ -82,12 +136,12 @@ function readEnabledAgentManifest(routeKey, routes = {}) {
     }
 }
 
-function resolveSurfaceAuthRouteKey(surfaceName, targetRouteKey, routing = {}) {
+function resolveSurfaceAuthRouteKey(surfaceName, targetRouteKey, routing = {}, options = {}) {
     const normalizedSurface = String(surfaceName || '').trim();
     const normalizedTarget = String(targetRouteKey || '').trim();
     if (!normalizedSurface || !normalizedTarget) return '';
 
-    const manifest = readEnabledAgentManifest(normalizedTarget, routing.routes || {});
+    const manifest = readEnabledAgentManifest(normalizedTarget, routing.routes || {}, options);
     const surfaceConfig = manifest?.[normalizedSurface];
     const authPolicy = typeof surfaceConfig === 'string'
         ? surfaceConfig
@@ -103,15 +157,15 @@ function resolveSurfaceAuthRouteKey(surfaceName, targetRouteKey, routing = {}) {
     return '';
 }
 
-function resolveAuthRouteKey(parsedUrl) {
+function resolveAuthRouteKey(parsedUrl, options = {}) {
     const pathname = parsedUrl.pathname || '/';
     const parts = pathname.split('/').filter(Boolean);
-    const routing = readRouting();
+    const routing = readRouting(options);
     const routes = routing.routes || {};
     const explicit = String(parsedUrl.searchParams.get('agent') || '').trim();
     const staticAgent = String(routing.static?.agent || '').trim();
     if (parts[0] === 'webchat' && explicit) {
-        const surfaceAuthRoute = resolveSurfaceAuthRouteKey('webchat', explicit, routing);
+        const surfaceAuthRoute = resolveSurfaceAuthRouteKey('webchat', explicit, routing, options);
         if (surfaceAuthRoute) {
             return surfaceAuthRoute;
         }
@@ -120,7 +174,7 @@ function resolveAuthRouteKey(parsedUrl) {
         const pathAgent = parts[0];
         if (explicit) return explicit;
         try {
-            const resolved = resolveEnabledAgentRecord(pathAgent);
+            const resolved = resolveEnabledAgentRecordForAuth(pathAgent, options);
             const pathAuthMode = String(resolved?.record?.auth?.mode || 'none').trim().toLowerCase() || 'none';
             if (pathAuthMode !== 'none') {
                 return pathAgent;
@@ -133,24 +187,24 @@ function resolveAuthRouteKey(parsedUrl) {
     return staticAgent || null;
 }
 
-function resolveAuthContext(parsedUrl) {
-    const routeKey = resolveAuthRouteKey(parsedUrl);
+function resolveAuthContext(parsedUrl, options = {}) {
+    const routeKey = resolveAuthRouteKey(parsedUrl, options);
     if (!routeKey) {
         return { routeKey: null, mode: 'none', policy: { mode: 'none' }, record: null };
     }
-    const resolved = resolveEnabledAgentRecord(routeKey);
+    const resolved = resolveEnabledAgentRecordForAuth(routeKey, options);
     const record = resolved?.record || null;
     const policy = record?.auth || { mode: 'none' };
     const mode = String(policy.mode || 'none').trim().toLowerCase() || 'none';
     return { routeKey, mode, policy, record };
 }
 
-function resolveAuthContextForRouteKey(routeKey) {
+function resolveAuthContextForRouteKey(routeKey, options = {}) {
     const normalizedRouteKey = String(routeKey || '').trim();
     if (!normalizedRouteKey) {
         return { routeKey: null, mode: 'none', policy: { mode: 'none' }, record: null };
     }
-    const resolved = resolveEnabledAgentRecord(normalizedRouteKey);
+    const resolved = resolveEnabledAgentRecordForAuth(normalizedRouteKey, options);
     const record = resolved?.record || null;
     const policy = record?.auth || { mode: 'none' };
     const mode = String(policy.mode || 'none').trim().toLowerCase() || 'none';
@@ -162,15 +216,15 @@ function isUserAuthenticatedAuthMode(mode) {
     return Boolean(normalized && normalized !== 'none' && normalized !== 'guest');
 }
 
-function resolveAuthenticatedRouteAuthContext(routeKey) {
+function resolveAuthenticatedRouteAuthContext(routeKey, options = {}) {
     const normalizedRouteKey = String(routeKey || '').trim();
-    const routing = readRouting();
-    const ownerContext = resolveAuthContextForRouteKey(normalizedRouteKey);
+    const routing = readRouting(options);
+    const ownerContext = resolveAuthContextForRouteKey(normalizedRouteKey, options);
     if (isUserAuthenticatedAuthMode(ownerContext.mode)) return ownerContext;
 
     const staticRouteKey = String(routing.static?.agent || '').trim();
     if (staticRouteKey && staticRouteKey !== normalizedRouteKey) {
-        const staticContext = resolveAuthContextForRouteKey(staticRouteKey);
+        const staticContext = resolveAuthContextForRouteKey(staticRouteKey, options);
         if (isUserAuthenticatedAuthMode(staticContext.mode)) {
             return { ...staticContext, serviceRouteKey: normalizedRouteKey };
         }
@@ -186,6 +240,49 @@ function resolveAuthenticatedRouteAuthContext(routeKey) {
     };
 }
 
+function routePlanSelectedRouteKey(routePlan) {
+    return String(
+        routePlan?.hostSelection?.record?.routeKey
+        || routePlan?.definition?.routeKey
+        || routePlan?.routeKey
+        || '',
+    ).trim();
+}
+
+function isHostBoundRoutePlan(routePlan) {
+    return ['agent-root', 'dedicated-service'].includes(String(routePlan?.hostSelection?.kind || ''));
+}
+
+export function resolveAuthContextForRoutePlan(parsedUrl, routePlan, { browserAuth = false } = {}) {
+    const snapshot = snapshotFromOptions({ routePlan });
+    const selectedRouteKey = routePlanSelectedRouteKey(routePlan);
+    if (browserAuth && isHostBoundRoutePlan(routePlan) && selectedRouteKey) {
+        return {
+            ...resolveAuthenticatedRouteAuthContext(selectedRouteKey, { snapshot }),
+            boundHostRouteKey: selectedRouteKey,
+            boundGeneration: String(routePlan?.lease?.id || snapshot?.generation || ''),
+        };
+    }
+
+    const decision = routePlan?.decision;
+    if (decision?.access === 'guest') {
+        return resolveGuestRouteAuthContext(decision.routeKey, decision);
+    }
+    if (decision?.access === 'authenticated') {
+        return resolveAuthenticatedRouteAuthContext(decision.routeKey, { snapshot });
+    }
+    if (selectedRouteKey && routePlan?.kind === 'agent-root') {
+        const routeDefault = snapshot?.compiled?.policy?.routeDefaults?.[selectedRouteKey];
+        if (routeDefault?.access === 'authenticated') {
+            return resolveAuthenticatedRouteAuthContext(selectedRouteKey, { snapshot });
+        }
+        if (routeDefault?.access === 'guest') {
+            return resolveGuestRouteAuthContext(selectedRouteKey, routeDefault);
+        }
+    }
+    return resolveAuthContext(parsedUrl, { snapshot });
+}
+
 function resolveGuestRouteAuthContext(routeKey, options = {}) {
     return {
         routeKey: String(routeKey || '').trim(),
@@ -198,9 +295,9 @@ function resolveGuestRouteAuthContext(routeKey, options = {}) {
     };
 }
 
-export function resolveRouteDefaultHttpAccess(routeKey) {
+export function resolveRouteDefaultHttpAccess(routeKey, options = {}) {
     const normalizedRouteKey = String(routeKey || '').trim();
-    const context = resolveAuthContextForRouteKey(normalizedRouteKey);
+    const context = resolveAuthContextForRouteKey(normalizedRouteKey, options);
     if (context.mode === 'guest') {
         return { access: 'guest', routeKey: normalizedRouteKey, source: 'routeDefault' };
     }
@@ -208,9 +305,9 @@ export function resolveRouteDefaultHttpAccess(routeKey) {
         return { access: 'authenticated', routeKey: normalizedRouteKey, source: 'routeDefault' };
     }
 
-    const staticRouteKey = String(readRouting().static?.agent || '').trim();
+    const staticRouteKey = String(readRouting(options).static?.agent || '').trim();
     if (staticRouteKey && staticRouteKey !== normalizedRouteKey) {
-        const staticContext = resolveAuthContextForRouteKey(staticRouteKey);
+        const staticContext = resolveAuthContextForRouteKey(staticRouteKey, options);
         if (isUserAuthenticatedAuthMode(staticContext.mode)) {
             return { access: 'authenticated', routeKey: normalizedRouteKey, source: 'routeDefault' };
         }
@@ -260,11 +357,11 @@ async function resolveSessionForAuthContext(authContext, sessionId) {
     return session;
 }
 
-function respondUnauthenticated(req, res, parsedUrl, authContext = resolveAuthContext(parsedUrl)) {
+function respondUnauthenticated(req, res, parsedUrl, authContext = resolveAuthContext(parsedUrl), options = {}) {
     const pathname = parsedUrl.pathname || '/';
     const returnTo = `${pathname || '/'}${parsedUrl.search || ''}`;
     const query = new URLSearchParams({ returnTo });
-    if (authContext?.routeKey) query.set('agent', authContext.routeKey);
+    if (authContext?.routeKey && !isHostBoundRoutePlan(options.routePlan)) query.set('agent', authContext.routeKey);
     const loginUrl = `/auth/login?${query.toString()}`;
     const cookieName = getCookieNameForMode(authContext?.mode);
     const clearCookie = buildCookie(cookieName, '', req, '/', { maxAge: 0, sameSite: 'Lax' });
@@ -312,7 +409,39 @@ export async function ensureAgentAuthenticated(req, res, parsedUrl) {
     };
 }
 
-async function ensureAuthenticatedWithContext(req, res, parsedUrl, authContext) {
+function finalizeAuthenticatedRequest(req, res, authContext, options, session) {
+    req.edgeAuthContext = authContext;
+    if (req.sessionId && options.routePlan?.lease?.id) {
+        try {
+            const csrfToken = mintBrowserCsrfToken({
+                req,
+                routePlan: options.routePlan,
+                authContext,
+                sessionId: req.sessionId,
+            });
+            const csrfCookie = buildCookie(BROWSER_CSRF_COOKIE_NAME, csrfToken, req, '/', {
+                maxAge: req.authMode === 'guest'
+                    ? GUEST_SESSION_TTL_SECONDS
+                    : (req.authMode === 'local'
+                        ? getLocalSessionCookieMaxAge()
+                        : authService.getSessionCookieMaxAge()),
+                sameSite: 'Strict',
+            });
+            appendSetCookie(res, csrfCookie);
+            req.browserCsrfToken = csrfToken;
+        } catch (_) {
+            // The route remains authenticated, but every state-changing browser
+            // request will fail closed when no exact generation/origin proof exists.
+        }
+    }
+    return { ok: true, session };
+}
+
+async function ensureAuthenticatedWithContext(req, res, parsedUrl, authContext, options = {}) {
+    if (options.routePlan?.lease?.commit && options.routePlan.lease.commit() !== true) {
+        sendJson(res, 503, { ok: false, error: 'edge_generation_changed' });
+        return { ok: false, error: 'edge_generation_changed' };
+    }
     if (authContext.error === 'authenticated_http_route_auth_not_configured') {
         sendJson(res, 503, {
             ok: false,
@@ -331,7 +460,7 @@ async function ensureAuthenticatedWithContext(req, res, parsedUrl, authContext) 
                 req.session = localSession;
                 req.sessionId = localCookie;
                 req.authMode = 'local';
-                return { ok: true, session: localSession };
+                return finalizeAuthenticatedRequest(req, res, authContext, options, localSession);
             }
         }
         return { ok: true };
@@ -350,7 +479,7 @@ async function ensureAuthenticatedWithContext(req, res, parsedUrl, authContext) 
                 req.session = authSession;
                 req.sessionId = existingAuth;
                 req.authMode = 'local';
-                return { ok: true, session: authSession };
+                return finalizeAuthenticatedRequest(req, res, authContext, options, authSession);
             }
         }
         const ssoCookie = cookies.get(SSO_AUTH_COOKIE_NAME);
@@ -361,7 +490,7 @@ async function ensureAuthenticatedWithContext(req, res, parsedUrl, authContext) 
                 req.session = ssoSession;
                 req.sessionId = ssoCookie;
                 req.authMode = 'sso';
-                return { ok: true, session: ssoSession };
+                return finalizeAuthenticatedRequest(req, res, authContext, options, ssoSession);
             }
         }
         const guestCookie = cookies.get(GUEST_AUTH_COOKIE_NAME);
@@ -372,7 +501,7 @@ async function ensureAuthenticatedWithContext(req, res, parsedUrl, authContext) 
                 req.session = guestSession;
                 req.sessionId = guestCookie;
                 req.authMode = 'guest';
-                return { ok: true, session: guestSession };
+                return finalizeAuthenticatedRequest(req, res, authContext, options, guestSession);
             }
         }
         const guestJwt = mintGuestSessionJwt({ policy: authContext.policy });
@@ -387,14 +516,14 @@ async function ensureAuthenticatedWithContext(req, res, parsedUrl, authContext) 
         req.sessionId = guestJwt;
         req.authMode = 'guest';
         appendLog('auth_guest_session_created', { path: parsedUrl.pathname });
-        return { ok: true, session: guestSession };
+        return finalizeAuthenticatedRequest(req, res, authContext, options, guestSession);
     }
 
     const cookieName = getCookieNameForMode(authContext.mode);
     const sessionId = cookies.get(cookieName);
     if (!sessionId) {
         appendLog('auth_missing_cookie', { path: parsedUrl.pathname });
-        return respondUnauthenticated(req, res, parsedUrl, authContext);
+        return respondUnauthenticated(req, res, parsedUrl, authContext, options);
     }
     let session = authContext.mode === 'local'
         ? await sessionTokenService.getUserSession(sessionId, { policy: authContext.policy })
@@ -409,7 +538,7 @@ async function ensureAuthenticatedWithContext(req, res, parsedUrl, authContext) 
     }
     if (!session) {
         appendLog('auth_session_invalid', { sessionId: '[redacted]', mode: authContext.mode });
-        return respondUnauthenticated(req, res, parsedUrl, authContext);
+        return respondUnauthenticated(req, res, parsedUrl, authContext, options);
     }
     req.user = session.user;
     req.session = session;
@@ -434,14 +563,17 @@ async function ensureAuthenticatedWithContext(req, res, parsedUrl, authContext) 
             appendSetCookie(res, cookie);
         }
     } catch (_) { }
-    return { ok: true, session };
+    return finalizeAuthenticatedRequest(req, res, authContext, options, session);
 }
 
-export async function ensureAuthenticated(req, res, parsedUrl) {
-    return ensureAuthenticatedWithContext(req, res, parsedUrl, resolveAuthContext(parsedUrl));
+export async function ensureAuthenticated(req, res, parsedUrl, options = {}) {
+    const authContext = options.routePlan
+        ? resolveAuthContextForRoutePlan(parsedUrl, options.routePlan)
+        : resolveAuthContext(parsedUrl, options);
+    return ensureAuthenticatedWithContext(req, res, parsedUrl, authContext, options);
 }
 
-export async function ensureHttpRouteAccess(req, res, parsedUrl, decision) {
+export async function ensureHttpRouteAccess(req, res, parsedUrl, decision, options = {}) {
     if (decision?.access === 'public') return { ok: true };
     if (decision?.access === 'guest') {
         return ensureAuthenticatedWithContext(
@@ -449,6 +581,7 @@ export async function ensureHttpRouteAccess(req, res, parsedUrl, decision) {
             res,
             parsedUrl,
             resolveGuestRouteAuthContext(decision.routeKey, decision),
+            options,
         );
     }
     if (decision?.access === 'authenticated') {
@@ -456,7 +589,10 @@ export async function ensureHttpRouteAccess(req, res, parsedUrl, decision) {
             req,
             res,
             parsedUrl,
-            resolveAuthenticatedRouteAuthContext(decision.routeKey),
+            resolveAuthenticatedRouteAuthContext(decision.routeKey, {
+                snapshot: snapshotFromOptions(options),
+            }),
+            options,
         );
     }
 

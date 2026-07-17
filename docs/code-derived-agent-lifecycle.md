@@ -13,7 +13,7 @@ All relative paths below are relative to the workspace directory where `ploinky`
 | Workspace paths | `cli/services/config.js`, `cli/services/workspace.js`, `cli/services/workspaceStructure.js` |
 | Repo discovery and install | `cli/services/repos.js`, `cli/commands/repoAgentCommands.js`, `cli/services/utils.js`, `cli/services/status.js` |
 | Agent enable/disable state | `cli/services/agents.js` |
-| Start/restart/runtime orchestration | `cli/services/workspaceUtil.js`, `cli/services/workspaceDependencyGraph.js`, `cli/services/bootstrapManifest.js`, `cli/services/boxStartPublishPlan.js`, `cli/services/boxPublicationCoverage.js`, `cli/services/startupConfigProviders.js`, `cli/services/noWaitWorker.js` |
+| Start/restart/runtime orchestration | `cli/services/workspaceUtil.js`, `cli/services/workspaceDependencyGraph.js`, `cli/services/bootstrapManifest.js`, `cli/services/routingFile.js`, `cli/services/edgeGeneration.js`, `cli/services/startupConfigProviders.js`, `cli/services/noWaitWorker.js` |
 | Container runtime | `cli/services/docker/common.js`, `cli/services/docker/agentServiceManager.js`, `cli/services/docker/containerFleet.js` |
 | Host sandbox runtime | `cli/services/sandboxRuntime.js`, `cli/services/bwrap/bwrapServiceManager.js`, `cli/services/seatbelt/seatbeltServiceManager.js`, `cli/services/seatbelt/seatbeltProfile.js` |
 | Dependency cache | `cli/services/dependencyCache.js`, `cli/services/dependencyRuntimeKey.js`, `cli/services/dependencyInstaller.js`, `globalDeps/package.json`, `cli/commands/depsCommands.js` |
@@ -40,7 +40,7 @@ All relative paths below are relative to the workspace directory where `ploinky`
 | `.ploinky/logs` | Router, watchdog, no-wait worker, and other logs. |
 | `.ploinky/running` | PID/status files, including router PID and no-wait worker status. |
 | `.ploinky/routing.json` | Router route table written during start/restart. |
-| `.ploinky/.secrets` | Encrypted secret store used by `var`, auth, dashboard tokens, and manifest env. |
+| `.ploinky/.secrets` | Encrypted secret store used by `var`, authentication configuration, and manifest env. |
 | `.ploinky/profile` | Active profile name, defaulting to `default`. |
 | `.ploinky/data/<key>` | Default host location for `runtime.resources.persistentStorage`. |
 | `.ploinky/container-runtime/<container>` | Podman staging directory used when symlink-heavy code needs a real mounted tree. |
@@ -60,7 +60,7 @@ to `bin/ploinky`; `bin/psh` is an alias to `ploinky sh`.
 | `ploinky` or `p-cli` | Reconcile/start outer runtime; open Ploinky REPL |
 | `ploinky cli` | Reconcile/start outer runtime; open `/bin/bash` as `podman` in `/workspace` |
 | `ploinky cli <agent>` | Reconcile/start outer runtime; attach to that agent's manifest CLI |
-| `ploinky start ...` | Reconcile/start outer runtime; preserve graph publishes and router readiness |
+| `ploinky start ...` | Reconcile/start outer runtime; start the graph behind the fixed boundary |
 | `ploinky status` | Inspect outer contract/publishes/health and running core status without mutation |
 | `ploinky stop` | Stop core services, then stop outer runtime; keep volumes |
 | `ploinky destroy` | Confirm exact instance and directly remove its outer container; retain named volumes |
@@ -77,9 +77,9 @@ port, profile, and branch policy flags and bootstraps the requested agent.
 
 The required release channel is the mutable
 `docker.io/assistos/ploinky-box:runtime` reference. The source-free image must
-satisfy the complete runtime contract 4 metadata checked by
+satisfy the complete runtime contract 5 metadata checked by
 `container/runtime-contract.mjs`, including exact label
-`io.assistos.ploinky.runtime-contract=4`, user `podman`, workdir `/workspace`,
+`io.assistos.ploinky.runtime-contract=5`, user `podman`, workdir `/workspace`,
 the box entrypoint, its allowlisted environment, and no image command or
 declared volumes.
 
@@ -100,22 +100,23 @@ Each volume requires `io.assistos.ploinky.identity-schema=1`, the exact
 A missing box causes an unconditional pull and full contract validation. The
 supervisor creates the box from the validated image ID, closing a mutable-tag
 race. A stopped compatible box starts and a running compatible box is reused
-without pulling. A requested configuration replacement pulls and validates
-before the old box is stopped, captures its image ID and normalized
-configuration, and rolls back to them on creation or health failure. Omitted
-creation flags preserve inspected settings except that authoritative generated
-publications may be replaced. Reconciliation never removes the workspace,
-nested-container-storage, or dependency volumes.
+without pulling.
 
-Contract 4 is a hard cut: every non-contract-4 box, including contract 2,
-contract 3, malformed, identity-incompatible, or publication-provenance-free
-state, is blocked before planning, pulling, volume creation, restart, upgrade,
-or replacement. It requires explicit `ploinky destroy`; the supervisor never
+Here, compatible means an exact normalized creation-configuration match. Any
+drift in a contract-5 box is reported as recreate-required before pull, stop,
+rename, removal, or creation. The operator must run `ploinky destroy`
+explicitly and then recreate it; there is no automatic replacement or rollback
+transaction.
+
+Contract 5 is a hard cut: every non-contract-5 box, including contract 4,
+malformed or identity-incompatible state, is blocked before pulling, volume
+creation, restart, upgrade, or replacement. It requires explicit `ploinky
+destroy`; the supervisor never reads it as compatible state or migrates, cleans,
 relabels, adopts, or automatically replaces it. The next permitted create
 retains and remounts all three named volumes. No old basename-only container or
 volume is copied, adopted, mapped, or discovered by the path-hashed identity.
 
-Direct/core users must invoke the old checkout's core entry before contract 4:
+Direct/core users must invoke the old checkout's core entry before contract 5:
 
 ```sh
 node cli/index.js destroy
@@ -128,11 +129,13 @@ resources and confirming no container references them, one-time cleanup may
 remove only `.ploinky/run/router.sock`,
 `.ploinky/run/managed-hosts`, and the cached exact image
 `docker.io/assistos/ploinky-network-gateway:1@sha256:68c47ce93d16ea1a2d03944f7b50ce82e6f2f9a26b183d2c9c7fbabcc828fb7e`.
+Operators must also revoke retired publication connector/API tokens and delete
+its plaintext state before v5 activation; v5 has no migration or cleanup reader.
 No broad container, image, volume, or network prune is part of this cutover.
 
-First-use planning may create the labelled `-workspace` volume and prepare
-repository checkouts before graph resolution fails. That state is intentionally
-retained for retry. After confirming its data may be lost, an operator can
+First create may leave labelled instance volumes when a later startup gate
+fails. That state is retained for retry. After confirming its data may be lost,
+an operator can
 remove it directly from the sole owning engine while the box is absent:
 
 ```bash
@@ -157,7 +160,7 @@ nested container control exists only in the outer runtime.
 
 ## Commands
 
-The command surface is split between the registry in `cli/services/commandRegistry.js` and explicit switch cases in `cli/commands/cli.js`. The registry is used for known-command checks; dispatcher-only cases such as `webchat`, `dashboard`, `sso`, and `deps` still run because `handleCommand()` has direct cases for them.
+The command surface is split between the registry in `cli/services/commandRegistry.js` and explicit switch cases in `cli/commands/cli.js`. The registry is used for known-command checks; dispatcher-only cases such as `webchat`, `sso`, and `deps` still run because `handleCommand()` has direct cases for them.
 
 | Command | Main behavior |
 | --- | --- |
@@ -174,7 +177,7 @@ The command surface is split between the registry in `cli/services/commandRegist
 | `disable agents-all` | Tries to disable all enabled agents and skips ones with live/stopped runtime state. |
 | `disable sandbox` | Disables host sandbox runtimes, causing `lite-sandbox` agents to fall back to containers; this is already the forced box state. |
 | `sandbox status|enable|disable` | Reads or changes the host-sandbox toggle outside a box; inside a box, status reports forced nested Podman and enable cannot persist an override. |
-| `start [agent] [port] [branch flags]` | Ensures repos/agents/dependencies, starts dependency graph services, writes routing, and launches the router watchdog. |
+| `start [agent] [8080] [branch flags]` | Ensures repos/agents/dependencies, starts dependency graph services, writes routing, and launches the fixed inner Router watchdog. The public wrapper consumes any selected physical-host port and forwards inner `8080`. |
 | `restart` | Restarts the saved static workspace: kills router, stops configured agents, and calls `startWorkspace`. |
 | `restart router` | Restarts only the router for the saved static workspace. |
 | `restart <agent>` | Recreates or restarts one enabled agent and refreshes its route. |
@@ -189,7 +192,6 @@ The command surface is split between the registry in `cli/services/commandRegist
 | `shell <agent>` | Ensures the agent service is running, then attaches an interactive shell. |
 | `cli <agent> [args]` | Ensures the agent service is running, then attaches the manifest CLI command or default CLI script. |
 | `webchat` | Prints the `/webchat` URL for the router login flow. Positional config arguments are rejected as removed. |
-| `dashboard` | Prints a tokenized dashboard URL. |
 | `client status|list|tool` | Talks to the local router MCP endpoint. `call`, `methods`, `task`, and `task-status` are old forms that print migration guidance. |
 | `/settings` / `settings` | Opens the settings menu and refreshes the LLM suggestion cache when env changes. |
 | `set` | Legacy spelling; prints that the command was renamed to `/settings`. |
@@ -272,15 +274,14 @@ Ploinky does not load a central manifest schema in the observed paths. Individua
 | `runtime.resources.env` | No | Adds env vars with templates such as `{{PLOINKY_WORKSPACE_ROOT}}`, `{{STORAGE_CONTAINER_PATH}}`, `{{STORAGE_HOST_PATH}}`, `{{secret:NAME}}`, `{{generatedSecret:NAME}}`, and `{{var:NAME}}`. |
 | `lite-sandbox` | No | If true and host sandbox is enabled, selects bwrap on Linux or seatbelt on macOS. If host sandbox is disabled, it falls back to container runtime. |
 | `profiles` | No | If present, `profiles.default` is required. Active profile comes from record profile or `.ploinky/profile`; non-default profiles are merged over default. |
-| `profiles.<name>.openPorts` | No | The only manifest port declarations read by `parseManifestPorts`. Each entry exposes a socket to the managed outer runtime and is eligible for graph-driven host publication. Without an entry, only execution modes that include AgentServer receive an implicit random localhost mapping to container port 7000; start-only services do not. |
-| `profiles.<name>.additionalServerPort` | No | Private port for an agent-owned browser service, usually a bare port such as `"3000"` and optionally `host:port`. The router exposes it at `http://<agent>.localhost:<routerPort>/` without host-publication eligibility. Its resolved route can supply TCP startup readiness for a start-only service, but it remains separate from an AgentServer/MCP route. |
+| `profiles.<name>.openPorts` | No | Private inner-runtime mappings read by `parseManifestPorts`; they never alter physical-host publications. TCP overlaps with Router `8080`/`8081` and UDP overlap with reserved `7882` are rejected. Without an entry, execution modes that include AgentServer receive an engine-assigned private mapping to container port 7000; start-only services do not. |
 | `profiles.<name>.env` | No | Overrides top-level `env` for the active profile. |
 | `profiles.<name>.secrets` | No | Profile secrets are validated and injected at runtime. |
 | `profiles.<name>.mounts` | No | Controls code/skills mount mode. Default and dev profiles are read-write by default; other profiles are read-only by default. |
 | `profiles.<name>.network` | No | Overrides top-level `network`. |
 | `profiles.<name>.containerSecurity` | No | Overrides top-level `containerSecurity`. Currently only `privileged: true` is implemented. |
 | `profiles.<name>.configProviders` | No | Replaces default-profile startup config providers for the active profile. Entries name provider agents and may select the provider profile. |
-| `profiles.<name>.preinstall` | No | Host hook run before container/sandbox creation. For the static agent, `startWorkspace` can run it before manifest directives and dependency graph setup. |
+| `profiles.<name>.preinstall` | No | Host hook run before container/sandbox creation. For the static agent, `startWorkspace` runs it only after recursive repository/graph preparation and the early inactive targetless generation; failure is fatal and prevents provider execution. |
 | `profiles.<name>.hosthook_aftercreation` | No | Host hook run after runtime creation. |
 | `profiles.<name>.install` | No | Inserted into the runtime entry command before the start/agent/default server command. |
 | `profiles.<name>.postinstall` | No | Container/sandbox command run after creation. Without profile handling, legacy `manifest.profiles.default.postinstall` is also checked. |
@@ -290,7 +291,7 @@ Ploinky does not load a central manifest schema in the observed paths. Individua
 | `env[].runtime` or `env.<name>.runtime` | No | Boolean, default `true`. When `false`, host lifecycle/config-provider/image-resolution paths still receive the resolved entry, while container OCI metadata and bwrap/Seatbelt process environments omit the value and its `PLOINKY_ENV_SOURCE_*` marker. |
 | `expose` | No | Adds explicit env values or refs. The `expose` CLI command edits this field in the source manifest. |
 | `repos` | No | Object processed by `applyManifestDirectives` during `start`. Values may be URL strings or objects with `url` and `branch`. Repos are ensured and enabled before dependency enable processing. |
-| `enable` | No | Top-level and profile-level enable arrays are processed during `start` and dependency graph building. The managed-runtime publish planner applies the workspace profile when present and falls back to a child's `profiles.default` when absent. String specs can include `as <alias>` and `no-wait`; object specs can include `agent/ref/spec/name`, `alias/as`, `profile`, and `noWait`/`no-wait`. An explicit edge-local profile must exist on the child. |
+| `enable` | No | Top-level and profile-level enable arrays are processed during `start` and dependency graph building. The selected workspace profile is applied when present and otherwise a child uses `profiles.default`; this affects only the in-box graph, never outer publications. String specs can include `as <alias>` and `no-wait`; object specs can include `agent/ref/spec/name`, `alias/as`, `profile`, and `noWait`/`no-wait`. An explicit edge-local profile must exist on the child. |
 | `configProviders` | No | Top-level startup provider entries processed for the static agent after dependency graph discovery and before dependency env resolution. Profile entries replace the default profile list. |
 | `providesConfig` | No | Declares a startup provider command and output allowlist. Provider stdout must be schema version 1 JSON and is persisted by Ploinky only after allowlist, reserved-name, sensitive-flag, and generated-secret checks pass. |
 | `guest` | No | `guest: true` makes manifest-derived auth mode `guest`. |
@@ -312,7 +313,7 @@ Ploinky does not load a central manifest schema in the observed paths. Individua
 | `network` | No | Exact modes are `default`, `bridge`, `host`, and `none`. Omission means a private per-instance managed bridge. `bridge` requires logical `attachments` with exactly one primary; legacy `name`/`aliases` are rejected. Managed bridge modes use the exact host-gateway mapping and router env, `host` uses box loopback, and `none` receives no router endpoint. |
 | `containerSecurity.privileged` | No | Adds `--privileged` for container runtime when true. |
 | `mcp-config.json` beside manifest/code | No | Copied/synchronized into the persistent agent home, `.data/<agent-or-alias>/mcp-config.json`. Seatbelt writes a rewritten `.seatbelt` config in the same work directory. Default AgentServer also searches `/code/mcp-config.json`. |
-| `httpServices` | No | Router exposes service prefixes that proxy to the agent route using explicit `access: public`, `access: guest`, or `access: authenticated`. |
+| `httpServices` | No | Router services retain validated `slug`, prefixes, access/identity/delegation semantics, and may add optional integer `port`. An omitted port uses the primary target; each distinct explicit TCP port receives one private mapping. All targets live in an immutable route-and-policy authorization generation shared by HTTP, SSE, and WebSocket. |
 | `routerAccess.httpRoutes` | No | Declares agent-relative HTTP route access using `access` only. Valid values are `public`, `guest`, and `authenticated`; public entries expose anonymous `GET`/`HEAD`, guest entries use or mint a guest session, and authenticated entries require a user session before transparent proxying. |
 | `endpoints.chatCompletions` | No | Default AgentServer exposes an OpenAI-style chat completions endpoint backed by a command spec. |
 | `endpoints.agent-card` | No | Default AgentServer exposes `/agent-card`. |
@@ -325,19 +326,17 @@ The managed host form is `ploinky start <agent> [port] [--profile <name>]`;
 both `--profile <name>` and `--profile=<name>` are consumed as explicit
 cross-boundary selectors and forwarded to core. Omission at this public
 boundary selects and forwards `default`, so host environment or an older
-persisted profile cannot silently change the outer publish plan. A core
+persisted profile cannot silently change the selected in-box graph. A core
 `ploinky start` entered in the REPL that omits the flag does not overwrite the active profile
 and may continue using `.ploinky/profile`.
 
-The authoritative publication planner applies this profile behavior to any
-resolved root, not to a product-specific allowlist. Bare, slash-qualified, and
-colon-qualified references use normal workspace resolution; in an unambiguous
-boot workspace, `explorer`, `AchillesIDE/explorer`, and
-`AchillesIDE:explorer` are one example of equivalent forms. The selected
+Profile selection is generic and product-independent. Bare, slash-qualified,
+and colon-qualified references use normal workspace resolution. The selected
 workspace profile is applied to each graph node; a node that does not define it
 falls back to its own `default` profile. An explicit profile on an `enable` edge
-must exist on that child manifest or planning fails and reports the child and
-its available profiles.
+must exist on that child manifest or graph resolution fails and reports the
+child and its available profiles. None of these choices changes contract 5's
+fixed outer arguments.
 
 ## Auth Mode Processing
 
@@ -362,21 +361,22 @@ For local auth, the record gets a generated users variable name such as `PLOINKY
 
 ```mermaid
 flowchart TD
-  A["ploinky start [agent] [port]"] --> B["parse static agent, port, branch policy"]
+  A["ploinky start [agent] [host port]"] --> B["select outer loopback port; pass inner 8080; parse branch policy"]
   B --> C["bootstrap requested repo/agent before dispatch"]
   C --> D["startWorkspace"]
   D --> E{"static agent supplied?"}
   E -- yes --> F["enable static agent if needed and save _config.static"]
   E -- no --> G["load saved _config.static"]
-  F --> H["refresh dashboard token and print WebChat login URL"]
+  F --> H["print WebChat login URL"]
   G --> H
-  H --> I["run static preinstall hook early when profile has preinstall"]
-  I --> J["apply manifest repos and enable directives"]
+  H --> J["prepare recursive manifest repositories"]
   J --> K["build recursive dependency graph"]
-  K --> KP["run startup config-provider preflight"]
-  KP --> L["enable missing graph nodes"]
-  L --> M["merge .ploinky/routing.json base config"]
-  M --> N["start dependency waves"]
+  K --> EGEN["capture early inactive generation: exact identities, all retained routes target-less"]
+  EGEN --> I["run fatal static preinstall hook when configured"]
+  I --> KP["run startup config-provider preflight"]
+  KP --> RECHECK["abort early lease; reload registry; re-evaluate retained hashes; rotate newly stale tuples"]
+  RECHECK --> M["capture final inactive target-less generation and launch lease"]
+  M --> N["start dependency waves with final exact identities"]
   N --> O{"node wait mode"}
   O -- blocking --> P["ensureAgentService and wait for readiness"]
   O -- no-wait --> Q["spawn noWaitWorker"]
@@ -388,6 +388,17 @@ flowchart TD
 Manifest `repos` and `enable` directives are not applied during `enable agent`; they are applied during `startWorkspace`. Dependency graph construction also reads `enable` arrays recursively.
 
 Startup config providers are applied after dependency graph construction and before dependency startup. The static/profile manifest supplies `configProviders`; provider manifests supply `providesConfig`. Ploinky resolves provider agents from the graph or installed repositories, runs their provider command with a sanitized host-side environment, validates stdout against the provider manifest allowlist, rejects generated-secret and reserved names, and writes accepted values into `.ploinky/.secrets` before consumer env maps are built.
+
+Before hooks run, the early preparation assigns exact tuples to missing or
+changed graph nodes and strips resolved targets from every retained graph route.
+After providers finish, Ploinky aborts that lease, reloads the registry, and
+re-evaluates retained predecessor runtime hashes. Newly stale predecessors
+receive fresh tuples; tuples minted earlier in the same start remain unchanged.
+Ploinky then captures the final inactive target-less generation and lease before
+any graph process starts. Container and sandbox backends must preserve that
+final prepared registry identity. Blocking waves add their resolved private
+targets through coordinated apply before readiness succeeds; detached workers
+use the same prepared identity when they later submit targets.
 
 `enable` dependency refs can be blocking or no-wait. The graph classifier treats the static node as blocking. A child is blocking when it is reachable through a path with only blocking edges; it is no-wait only when every path to it includes a no-wait edge. Blocking waves are started and then checked for readiness before Ploinky continues.
 
@@ -547,15 +558,17 @@ Podman uses a staging directory under `.ploinky/container-runtime/<container>`:
 
 Podman receives `NODE_OPTIONS=--preserve-symlinks --preserve-symlinks-main`. It also receives extra self-mounts for real symlink targets. Manifest volumes that target `/code/node_modules` are rejected. Writable Podman manifest volumes under `.ploinky/data/` are mounted with `:U` so non-root images can own their private runtime state; arbitrary external manifest volumes keep the normal `:z` suffix unless `volumeOptions.<containerPath>.podmanChown` opts in.
 
-Inside contract 4, managed `default` and `bridge` modes require rootless Podman
+Inside contract 5, managed `default` and `bridge` modes require rootless Podman
 5.4 or newer, Netavark, and operational `pasta`. There is no
 `slirp4netns` fallback. Each managed bridge is created with exact schema-2
 ownership labels and `isolate=true`; same-network peers can communicate by
 derived alias, cross-bridge direct-IP traffic is denied, and outbound egress is
 preserved. Containers receive exactly `--hosts-file=none --add-host
 host.containers.internal:host-gateway` plus the matching
-`PLOINKY_ROUTER_HOST`, `PLOINKY_ROUTER_PORT`, and `PLOINKY_ROUTER_URL`. `host`
-uses `127.0.0.1`; `none` receives no endpoint. Reuse validates the versioned
+`PLOINKY_ROUTER_HOST`, `PLOINKY_ROUTER_PORT`, and `PLOINKY_ROUTER_URL`.
+Consumers also receive `PLOINKY_INTERNAL_ROUTER_URL` and the read-only snapshot
+named by `PLOINKY_EDGE_TOPOLOGY_FILE`. `host` requires an exact current-
+generation capability and uses `127.0.0.1`; `none` receives no endpoint. Reuse validates the versioned
 network-contract hash and exact attachment/alias/hosts policy. An older hash
 remains foreign and is neither adopted nor recreated. Only exact-owned
 current-hash runtime drift may trigger recreation; the hash is never weakened.
@@ -566,117 +579,83 @@ does not recreate or mutate schema-2 networks.
 
 ### Ports
 
-Open ports come from active profile `openPorts`. Accepted forms include:
+The sole outer `-p` emission constructs exactly two publications for every box:
 
-| Form | Meaning |
+| Mapping | Meaning |
 | --- | --- |
-| `7000` | Host port 7000 to container port 7000 on `127.0.0.1`. |
-| `8080:7000` | Host port 8080 to container port 7000 on `127.0.0.1`. |
-| `0:7000` or `:7000` | Invalid in `openPorts`; the box-side port must be stable and nonzero. |
-| `127.0.0.1:8080:7000` | Explicit host IP, host port, container port. |
-| `8000-8002:7000-7002` | Port range, same length on both sides. |
-| `8080:7000/udp` | UDP mapping. |
+| `127.0.0.1:<selectedRouterHostPort>:8080/tcp` | Loopback-only physical Router access. `--port` selects only the host side. |
+| `0.0.0.0:7882:7882/udp` | Unconditional reserved LiveKit UDP slot; idle when no capability owner runs. |
 
-If no open ports are defined and networking is not host mode, execution modes
-that include AgentServer choose a random host port between 10000 and 59999 and
-map it to container port 7000 on localhost. A start-only container never gets
-that synthetic AgentServer mapping. It needs an intentional `openPorts` route,
-a private `additionalServerPort`, a blocking `health.readiness.script`, or
-`readiness.protocol: "none"` according to its service contract.
+`--publish`, `--expose`, and `--listen-lan` are rejected before engine
+discovery. Workspace, graph, profile, manifest, `openPorts`, readiness,
+environment, labels, and persisted state never participate in outer arguments.
+Contract 4 is rejected and requires explicit destroy/recreate; no publication
+provenance or compatibility reader remains.
 
-For every managed one-shot path that can start agents, outer publishes are
-planned before runtime reconciliation. This includes `start`, `enable agent`,
-`cli <agent>`, `shell <agent>`, `restart`, and `reinstall`. The authoritative
-planner works from the named workspace's repositories, registry, saved profile,
-branch policy, and normal bare/qualified lookup rules. It includes the resolved
-root, its active transitive graph, aliases as distinct effective instances, and
-additional enabled agents core will start. Each effective-profile `openPorts`
-declaration is both an inner exposure and outer-boundary eligibility. The
-manifest's runtime-side port becomes the outer container target; the private
-agent-container target is used for diagnostics and conflict comparison, not as
-the outer target.
+Profile `openPorts` remains private inner-runtime metadata. A normal bridged
+launch rejects TCP intervals overlapping Router `8080`/`8081` and UDP intervals
+overlapping reserved `7882`. Other declarations can create private box targets
+but never a physical-host mapping. AgentServer gets an engine-assigned private
+mapping to port `7000` when its execution mode needs one; a start-only service
+instead uses a blocking health script, a resolved explicit HTTP-service target,
+another intentional private readiness target, or `readiness.protocol: "none"`.
 
-The planner runs through `exec` in a running box. A stopped compatible box stays
-stopped while a uniquely named temporary planner container uses its inspected
-image ID and workspace/source mounts. A missing box first pulls and validates
-the selected image, creates the deterministic labelled workspace volume, plans
-in a temporary container, then creates the final box from the same image ID.
-Temporary containers and anonymous volumes are cleaned on every exit path.
-Allowed checkout preparation and a first-plan workspace volume survive failure
-for retry.
+`httpServices[].port` is the only additional service-target manifest field. The
+launcher creates or reuses one engine-assigned private mapping for each distinct
+explicit TCP target; omitted port retains the primary route target. Every
+service target is installed into one immutable exact-byte route-and-policy
+authorization generation used by HTTP, SSE, and WebSocket. Candidate
+route/policy files do not change live decisions until coordinated apply
+inactivates affected selectors, validates the complete candidate, and atomically
+installs it. Every request revalidates its captured authorization generation
+immediately before upstream dial.
 
-Generated claims accept stable nonzero TCP/UDP ports and equal-length ranges.
-Any overlapping runtime-side interval for the same protocol fails planning unless
-it is a semantically exact duplicate on the same effective graph node. The
-diagnostic names both agent refs, profiles, aliases, bind classes, raw
-declarations, and runtime-to-private mappings. The same numeric TCP and UDP sockets
-are independent.
+RoutingServer owns public/control `8080` and managed-private `8081`; the latter
+is not outer-published. Detailed health is on an unmounted supervisor Unix
+socket. Cloudflared is pinned in the outer image and always targets in-box
+`http://127.0.0.1:8080`; no separate publication agent or nginx layer exists.
+Credential absence is explicit local-only mode with no connector or public HTTP
+hostname. Complete Cloudflare mode requires an existing-tunnel connector token
+and a separate least-privilege DNS/ingress API token; partial or invalid state
+fails closed and Ploinky never creates a quick tunnel or new tunnel.
+An already-selected `local-ready` generation is adopted by the publication
+supervisor without a duplicate route apply when no previous Cloudflare ownership
+journal exists. Cloudflare activation and teardown still inactivate first and
+use the serialized coordinated-apply path.
 
-Explicit `--publish`/`--expose` values are retained byte-for-byte and in their
-original order. The supervisor parses only the terminal container target interval
-and protocol into a canonical claim. Explicit target intervals are subtracted
-from same-protocol generated claims: fully covered claims disappear, while
-deterministic uncovered subranges remain without rewriting the explicit values.
-Box-side port zero is rejected before outer or agent mutation. Runtime-generated
-ephemeral mappings for an implicit AgentServer or `additionalServerPort` remain
-separate private routes; they are not declared through `openPorts` and do not
-create an outer claim.
+Before consumers start, Ploinky mounts a box-owned non-secret topology snapshot.
+It distinguishes the immutable route-and-policy authorization generation, a
+content-derived configuration generation, and a monotonic readiness/publication
+generation. Browser projection is authenticated and `no-store`, returns one
+active locator plus configuration/publication ids, and exposes no authorization
+id or inventory.
 
-Supported contract-4 boxes persist the publication-plan version and separate
-ordered explicit/generated lists in labels. A new authoritative plan retains
-explicit values when the operator did not restate them and replaces stale
-generated values. Missing, malformed, or oversized provenance fails closed
-rather than inferring ownership from engine inspection.
-
-Every older runtime contract remains a hard failure before planning, pulling,
-volume creation, or mutation. There is no transition-source exception and no
-automatic replacement; explicit host destroy is required before a contract-4
-create can remount the retained named volumes.
-
-The supervisor passes the planned socket coverage to core on every forwarded
-one-shot command. Core repeats a coverage check immediately before any runtime
-transition. A REPL, Marketplace, monitor-restart, or other already-in-box path
-cannot recreate its containing box; it proceeds only when existing coverage is
-sufficient. Otherwise it fails before profile, registry, hook, router, or
-agent-container mutation and reports the one-shot host command that can plan
-and reconcile the boundary.
-
-Profile `additionalServerPort` is separate from `openPorts`. It accepts a bare
-port such as `3000` for a service running inside the agent runtime;
-`127.0.0.1:3000` is also accepted. At startup and restart, container runtimes
-publish that server port on localhost with an ephemeral host port, record the
-resolved upstream in `.ploinky/routing.json`, and expose it through the router
-at `http://<agent>.localhost:<routerPort>/`. This private route is not eligible
-for host publication. It can be the TCP readiness route for a start-only service;
-when AgentServer is present, port 7000 remains the MCP/readiness route.
-
-Changing `openPorts` or `--profile` changes the desired outer-runtime creation
-configuration. The supervisor validates the replacement image and performs
-transactional reconciliation when the inspected configuration differs,
-preserving all named volumes and restoring the previous image/configuration if
-replacement creation or health validation fails.
-
-Web Publishing remains the HTTP/WebSocket consolidation layer. Its nginx
-process binds 8081 with a default 404 server even when no routes exist.
-Deployment checks read the generated external OnlyOffice and LiveKit public
-URLs and probe those origins. They do not assume direct host access to private
-ports 8082, 17000, or 17002. Explorer uses the same generic active-graph reconciliation
-as every other root before core startup and readiness probing.
+Private service calls on `8081` require effective authenticated policy plus an
+exact current-instance/current-enable-generation ACL. The caller receives
+`PLOINKY_AGENT_INSTANCE_ID`, `PLOINKY_AGENT_ENABLE_GENERATION`, and one
+tuple-derived `PLOINKY_AGENT_PRIVATE_SECRET`; its assertion binds type, audience,
+caller, generation, method, canonical path, query, body hash, expiry, and replay
+state. It is not user/admin identity. TURN's long-term secret remains in core,
+and only exact current-generation consumers can obtain rate-limited short-lived
+credentials and expiry through the private broker.
 
 Every Ploinky-created nested agent, helper, and sidecar container receives the
-exact ownership label `io.assistos.ploinky.managed=1`. On outer-box boot, the
-entrypoint removes running and stopped nested containers selected by that exact
-key/value, including old managed agent and gateway records. It leaves
-unlabelled, other-value, and near-name containers, nested images, nested named
-volumes, and valid schema-2 networks untouched. Enumeration or removal failure
-fails the box self-check. Manual containers have no Ploinky restart or repair
-guarantee.
+exact ownership label `io.assistos.ploinky.managed=1`. On contract-v5 boot, the
+entrypoint enumerates that exact key/value and rejects any retained managed
+record, including old managed agent and gateway records. It never deletes,
+imports, or translates them. Operators remove the managed records in the old
+box before explicit destroy/recreate. Unlabelled, other-value, and near-name
+containers, nested images, nested named volumes, and valid schema-2 networks
+remain untouched. Enumeration failure fails the box self-check. Manual
+containers have no Ploinky restart or repair guarantee.
 
-Because host destroy retains the `-containers` volume, corrupt nested state can
-make the same boot cleanup fail again after recreation. Recovery is explicit:
-inspect and back up that named volume, destroy the outer box, then remove only
-`$INSTANCE-containers` from its owning engine if losing the cached nested
-images, records, and named volumes is acceptable.
+Because host destroy retains the `-containers` volume, retained managed state
+can make the same hard-cut rejection recur after recreation. Recovery is
+explicit: inspect and back up that named volume, remove managed containers in
+the old box before destroy, or—if recovery is impossible—remove only
+`$INSTANCE-containers` from its owning engine after the box is absent and after
+accepting loss of cached nested images, records, and named volumes. Runtime v5
+does not execute either destructive action.
 
 ## Host Sandbox Runtimes
 
@@ -765,7 +744,10 @@ An env object with `runtime: false` participates in host hook resolution and env
 
 Manifest env resolution order is encrypted `.ploinky/.secrets`, then `process.env`, then `.env`, then manifest default. Wildcards are supported, with API-key-like names excluded from broad wildcard expansion.
 
-Required non-sensitive env entries must have defaults in profile definitions unless they are generated or sensitive.
+Required env entries without defaults are explicit operator/provider
+prerequisites. Profile readiness and launch resolve them through encrypted vars,
+startup-provider output, process env, or `.env` and fail with the exact missing
+name; Ploinky does not infer topology or Origin values.
 
 Startup config providers can write values into encrypted `.ploinky/.secrets` before dependency env maps are built. Provider subprocesses do not receive `PLOINKY_MASTER_KEY`, `PLOINKY_DERIVED_MASTER_KEY`, router-issued agent identity secrets, or caller-supplied identity values. Provider metadata is written under `.ploinky/config-providers/` with values redacted.
 
@@ -801,7 +783,7 @@ Startup readiness is handled by `workspaceUtil.js`, `startupReadiness.js`, and `
 An explicit manifest `readiness.protocol` (`mcp`, `tcp`, or `none`) wins over a
 declared health script. Without an explicit protocol, a start-only container
 with `health.readiness.script` uses blocking script readiness, a start-only
-service with a resolved `additionalServerPort` uses TCP, and other start-only
+service with a resolved explicit HTTP-service target uses TCP, and other start-only
 services require an intentional reachable TCP route. Execution modes that
 include AgentServer default to MCP. A start-only service with no script, no
 private or published route, and no explicit `none` policy fails with a manifest
@@ -825,44 +807,66 @@ For bwrap agents, monitor liveness checks process state and a separate bwrap hea
 ## Router and Agent Request Path
 
 The router is launched by `Watchdog.js`, not directly by the CLI foreground
-process. `RoutingServer.js` listens explicitly on IPv4 `0.0.0.0`, while the
-watchdog health-checks `/health` over TCP through `127.0.0.1`, restarts the
-router process after repeated failures, and starts the container monitor. No
-Unix listener is created. Wildcard- or gateway-bound box services are reachable
-from managed bridges; box-loopback services and Unix sockets are not. Directly
-reachable services need their own authorization, while router-mediated MCP
-continues to enforce JWT issuer/audience, policy, request binding, expiry, and
-replay checks. The `ploinky-router` network alias is no longer reserved, though
-that string remains an authentication issuer/audience identity.
+process. `RoutingServer.js` owns the public/control listener on fixed in-box
+port `8080`, the un-published managed-private listener on `8081`, and a detailed
+health listener on an unmounted Unix socket. The watchdog probes that socket,
+restarts Router after repeated failures, and starts the container monitor. A
+managed bridge gets exactly `--hosts-file=none` plus one
+`host.containers.internal:host-gateway` mapping; host mode is a separate exact
+generation capability. Neither network provenance nor a JWT/assertion is a
+user/admin session.
 
 The container monitor checks per-container maintenance locks before it schedules an automatic restart and again when a scheduled restart callback executes. The second check covers the interval in which an operator reinstall or explicit restart can acquire the lock after the watchdog has already created its backoff timer. When maintenance is active, the callback clears its in-progress restart state and defers container evaluation to a later monitor tick.
 
 ```mermaid
 sequenceDiagram
   participant CLI as ploinky start
-  participant Agent as ensureAgentService
-  participant Route as .ploinky/routing.json
+  participant Agent as graph runtimes
+  participant Candidate as candidate route/policy bytes
+  participant Generation as immutable authorization generation
   participant Watchdog as Watchdog.js
   participant Router as RoutingServer.js
   participant Runtime as Agent runtime
 
-  CLI->>Agent: start blocking/no-wait agents
-  Agent-->>CLI: hostPort/containerName
-  CLI->>Route: upsert route entry
   CLI->>Watchdog: spawn detached watchdog
-  Watchdog->>Router: spawn router on configured port
-  Router->>Route: load routes
-  Router->>Runtime: proxy /<agent>/... to 127.0.0.1:hostPort
+  Watchdog->>Router: spawn 8080, 8081, Unix health
+  CLI->>Candidate: stage early graph identities with every retained route target-less
+  CLI->>Generation: capture early inactive generation for static preinstall/providers
+  CLI->>Candidate: reload, re-evaluate retained hashes, rotate newly stale tuples
+  CLI->>Generation: abort early lease; capture final inactive generation and launch lease
+  CLI->>Agent: start waves with final exact staged identities
+  Agent-->>CLI: private targets/containerName
+  CLI->>Candidate: stage resolved private targets
+  CLI->>Generation: coordinated apply before dependent readiness
+  Router->>Generation: capture Host-first route/policy lease
+  Router->>Generation: revalidate immediately before dial
+  Router->>Runtime: proxy /<agent>/... to private target
   Router->>Runtime: aggregate /mcp across agent routes
 ```
 
-Router-owned paths include `/health`, `/mcp`, `/agent-card`, `/auth/*`, `/api/agents/*`, `/api/marketplace`, `/webchat`, `/dashboard`, `/status`, `/upload`, `/blobs`, `/workspace-files`, `/metrics`, `/admin`, and `/__agent`.
+Router paths are not one global pathname namespace. Listener/interface class and
+exact normalized Host are resolved first. A dedicated service host contains
+only its selected service plus exact required auth transactions; an agent-root
+host contains only its root/mounts and validated named `routerSurfaces`; managed
+private traffic contains only private handlers. Health, admin, policy,
+discovery, aggregate MCP, dashboard, status, WebChat, broker, and private-service
+paths are absent from every host class whose closed allowlist omits them.
 
 `/api/marketplace` is a first-party JSON management API for the Marketplace plugin. GET requires an authenticated local or SSO user and returns repository, source metadata, repository kind, agent, enabled-registry, and live runtime-status data. POST requires a local admin session and supports `install_repo`, `uninstall_repo`, `enable_agent`, and marketplace-specific `disable_agent`. Repository install requires a URL, accepts an optional name and branch, clones the checkout, and records source metadata. Repository uninstall disables enabled agents from that repo by container key, removes their runtime containers, removes the checkout, and preserves `repo_sources.json` metadata so the repo can be installed again. Marketplace deactivation removes the enabled-agent registry entry before removing the runtime container; the ordinary direct `disable agent` CLI command remains conservative and refuses to remove records while runtime state exists.
 
-Agent routes are stored under `routing.routes[routeKey]`. The route key is the alias when present, otherwise the short agent name. A plain `/` request redirects to the static route's `/index.html` when a static route exists.
+Candidate routes use the alias as route key when present, otherwise the short
+agent name. They have no request-path effect until coordinated apply captures
+the exact bytes and installs one immutable route-and-policy authorization generation. A plain
+`/` request redirects to the static route's `/index.html` only on a host surface
+that explicitly includes that mount.
 
-`httpServices` can expose agent-backed HTTP prefixes through the router. Service declarations choose `public`, `guest`, or `authenticated` access. Authenticated service routes can issue invocation metadata and validate delegation config. Public service routes run without router identity, while guest service routes use an existing user session or a scoped guest session.
+`httpServices` exposes agent-backed HTTP prefixes and optional explicit private
+TCP targets through the router. An omitted `port` uses the primary target; each
+distinct explicit port creates one private mapping. A selected service Host is
+canonicalized to the declaration's `externalPrefix`, then the provider and
+effective `HttpRouteAccessPolicy` independently decide `public`, `guest`, or
+`authenticated` admission. HTTP, SSE, and WebSocket use the same resolver,
+generation lease, and target.
 
 ## Default In-Container Agent Server
 
@@ -882,7 +886,7 @@ The default server provides:
 
 | Endpoint/capability | Behavior |
 | --- | --- |
-| `GET /health` | Returns server health. |
+| `GET /health` | Returns a non-detailed summary only to an authenticated Router administrator; supervisors use the detailed Unix-socket health endpoint. |
 | `GET /agent-card` | Returns manifest endpoint card when configured. |
 | `GET /getTaskStatus` / `/task` | Returns async task status when authorized by invocation token. |
 | `/mcp` | Streamable HTTP MCP server for configured tools/resources/prompts. |
@@ -908,7 +912,7 @@ MCP tool and resource commands require router-minted invocation headers before c
 
 1. Enable-time port records are mostly descriptive. `enableAgent` calls `parseManifestPorts` without profile config, and that function only reads profile `openPorts`, so enable-time records normally show a port-7000 fallback. Runtime startup recomputes profile ports and does not emit that fallback for start-only execution.
 2. Top-level `manifest.openPorts` is not read by the observed `parseManifestPorts` implementation.
-3. Profile `additionalServerPort` does not require a stable manifest host port; container runtimes publish it automatically on a localhost ephemeral port used by the router proxy and, for start-only services, private TCP readiness. It is not outer-boundary eligibility.
+3. `httpServices[].port` creates only an engine-assigned private target; omitted port preserves the primary AgentServer target, and neither form affects the two outer mappings.
 4. Manifest `repos` and `enable` are applied at `start`, not at `enable agent`.
 5. Container runtime dependency installs happen in caches, not in the long-running containers.
 6. Outside a marked box, Podman and seatbelt copy/stage runtime files while Docker mostly mounts them directly; inside the box, every managed agent path uses nested Podman.

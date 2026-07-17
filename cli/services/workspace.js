@@ -1,6 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import { PLOINKY_DIR } from './config.js';
+import { inactivateEdgeRoutingGeneration } from './edgeGeneration.js';
 
 function resolveWorkspaceRoot() {
     const explicitRoot = String(process.env.PLOINKY_WORKSPACE_ROOT || '').trim();
@@ -31,16 +32,28 @@ export function loadAgents() {
         if (!fs.existsSync(agentsFile)) return {};
         const data = fs.readFileSync(agentsFile, 'utf8');
         return JSON.parse(data || '{}') || {};
-    } catch (_) {
-        return {};
+    } catch (error) {
+        const wrapped = new Error(`agents registry is unreadable or corrupt: ${error?.message || error}`);
+        wrapped.code = 'EDGE_GENERATION_INVALID';
+        throw wrapped;
     }
 }
 
-export function saveAgents(map) {
+export function saveAgents(map, {
+    coordinate = true,
+    applyLockCapability,
+} = {}) {
     ensureDirs();
-    try {
-        fs.writeFileSync(resolveAgentsFile(), JSON.stringify(map || {}, null, 2));
-    } catch (_) {}
+    const target = resolveAgentsFile();
+    const temporary = `${target}.${process.pid}.${Date.now()}.tmp`;
+    fs.writeFileSync(temporary, JSON.stringify(map || {}, null, 2), { mode: 0o600 });
+    fs.renameSync(temporary, target);
+    if (coordinate) {
+        inactivateEdgeRoutingGeneration('agents-candidate-change', {
+            workspaceRoot: resolveWorkspaceRoot(),
+            applyLockCapability,
+        });
+    }
 }
 
 export function listAgents() {
@@ -72,5 +85,7 @@ export function getConfig() {
 export function setConfig(cfg) {
     const map = loadAgents();
     map._config = cfg || {};
-    saveAgents(map);
+    // _config is not an edge authorization source. Persisting SSO/sandbox
+    // preferences must not take the Router offline indefinitely.
+    saveAgents(map, { coordinate: false });
 }

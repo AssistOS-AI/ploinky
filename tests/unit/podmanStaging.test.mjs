@@ -241,7 +241,7 @@ test('profile manifest volumes are collected with profile volume options', () =>
         },
     }, {
         volumes: {
-            '.ploinky/data/web-publishing': '/data',
+            '.ploinky/data/example-service': '/data',
         },
         volumeOptions: {
             '/data': { podmanChown: true },
@@ -256,9 +256,9 @@ test('profile manifest volumes are collected with profile volume options', () =>
             options: { readOnly: true },
         },
         {
-            hostPath: '.ploinky/data/web-publishing',
+            hostPath: '.ploinky/data/example-service',
             containerPath: '/data',
-            resolvedHostPath: path.join(PLOINKY_DIR, 'data', 'web-publishing'),
+            resolvedHostPath: path.join(PLOINKY_DIR, 'data', 'example-service'),
             options: { podmanChown: true },
         },
     ]);
@@ -266,7 +266,7 @@ test('profile manifest volumes are collected with profile volume options', () =>
 
 test('podman manifest data volumes chown only managed writable data mounts by default', () => {
     assert.equal(
-        podmanManifestVolumeMountSuffix(path.join(PLOINKY_DIR, 'data', 'web-publishing'), {}),
+        podmanManifestVolumeMountSuffix(path.join(PLOINKY_DIR, 'data', 'example-service'), {}),
         ':z,U',
     );
     assert.equal(

@@ -1,9 +1,9 @@
 ---
 id: DS007
 title: Dependency Caches and Startup Readiness
-status: implemented
+status: partially implemented (rootless private-router reachability blocked)
 owner: ploinky-team
-summary: Defines runtime-keyed dependency caches, manifest-aware startup preparation, and readiness gating across dependency waves.
+summary: Defines runtime-keyed dependency caches, publication-independent startup, private-target readiness, topology ordering, and coordinated generation apply across dependency waves.
 ---
 
 # DS007 Dependency Caches and Startup Readiness
@@ -23,31 +23,20 @@ The managed public-entrypoint boundary is:
 | `ploinky` or `p-cli` | Reconcile/start outer runtime; open Ploinky REPL |
 | `ploinky cli` | Reconcile/start outer runtime; open `/bin/bash` as `podman` in `/workspace` |
 | `ploinky cli <agent>` | Reconcile/start outer runtime; attach to that agent's manifest CLI |
-| `ploinky start ...` | Reconcile/start outer runtime; preserve graph publishes and router readiness |
+| `ploinky start ...` | Reconcile/start outer runtime; start the graph behind the fixed boundary |
 | `ploinky status` | Inspect outer contract/publishes/health and running core status without mutation |
 | `ploinky stop` | Stop core services, then stop outer runtime; keep volumes |
 | `ploinky destroy` | Confirm exact instance and directly remove its outer container; retain named volumes |
 | REPL `status`/`stop`/`destroy` | Core workspace/router/agent scope; outer runtime remains |
 
-The host supervisor must complete authoritative publication planning and outer
-reconciliation before invoking core startup. Every one-shot command that can
-start an agent must preserve dependency-graph ordering, effective-profile
-publishes, and core readiness behavior. Only after core start succeeds may the
-host layer probe
-`http://127.0.0.1:<selected-host-port>/status`; a failed core start must produce
-no host router probe.
-
-Publication planning is generic. It resolves the requested root, active
-transitive dependency graph, aliases, profiles, branches, and any additional
-enabled agents core will start from the named workspace rather than from a
-product-specific host checkout. A running box plans through `exec`; a stopped
-box remains stopped while a temporary container uses its inspected image ID.
-For a missing box, the supervisor pulls and validates contract 4, creates the
-labelled workspace volume, plans in a temporary container, and creates the
-final box from the same image ID. Temporary containers and anonymous volumes
-are removed on every planner exit path. A failed first plan may retain prepared
-repositories and the named workspace volume for retry; deliberate cleanup is a
-direct volume removal on the sole owning engine after accepting data loss.
+The host supervisor constructs contract 5 before invoking core startup and
+without reading a workspace, graph, profile, manifest, readiness result, or
+persisted publication state. Every one-shot command that can start an agent
+preserves dependency-graph ordering and core readiness behavior, but it cannot
+change the outer arguments. Only after core start succeeds may the host layer
+probe the authenticated summary through
+`http://127.0.0.1:<selected-host-port>/`; detailed readiness remains on the
+supervisor Unix socket.
 
 The outer identity is derived from the exact canonical current directory as a
 readable basename plus a 12-character path hash; there is no public name or
@@ -57,13 +46,17 @@ volumes before selecting the sole resource owner. Unknown probes, split
 resources, and foreign exact-name volumes fail without mutation. With no
 identity resources, answering Podman is preferred; a non-installed engine
 cannot participate in inventory. The mutable
-`docker.io/assistos/ploinky-box:runtime` channel is pulled only for create or
-replacement, validated as contract 4, and pinned by image ID for execution.
-Every non-contract-4 box, including contract 2 and contract 3, fails before
-planning, pulling, volume creation, restart, upgrade, or replacement. It is
-never migrated, relabelled, adopted, or automatically replaced. The operator
+`docker.io/assistos/ploinky-box:runtime` channel is pulled only for create,
+validated as contract 5, and pinned by image ID for execution. Every
+non-contract-5 box, including contract 4, fails before pulling, volume creation,
+restart, upgrade, or replacement. It is never read as compatible state,
+migrated, relabelled, adopted, cleaned, or automatically replaced. The operator
 must run `ploinky destroy` explicitly before recreation; the workspace,
 nested-container-storage, and dependency named volumes remain retained.
+Creation-configuration drift in a contract-5 box follows the same explicit
+boundary: reconciliation reports the exact drift and performs no pull, stop,
+rename, removal, replacement, or rollback. Only an exactly compatible stopped
+box may be started in place.
 
 A cache is valid only when the runtime key, the relevant package hash, the stamp version, the installer metadata, and the core marker module all match the current workspace inputs. Cache preparation must use the correct installation backend for the target runtime family. Container-family runtime keys must install inside an install container for the target image, and the prepared stamp must record that image so a manifest image change refreshes the cache even when Node major, platform, libc, and package hashes are otherwise unchanged. Sandbox-family runtime keys must install on the host and must reject preparation for a foreign host runtime key.
 
@@ -81,35 +74,83 @@ explicit engine-level data-cleanup action.
 
 Workspace startup must expand the static agent into a dependency graph using manifest enable directives. The graph must be grouped topologically into waves. A later wave must not start until the earlier wave has been started and all of its members have passed readiness checks.
 
-Startup readiness follows an explicit precedence. A declared `readiness.protocol` of `mcp`, `tcp`, or `none` wins over every inferred choice, including a `health.readiness.script`. Without an explicit protocol, a start-only container with `health.readiness.script` uses blocking script readiness; a start-only service with a resolved private `additionalServerPort` uses TCP readiness; other start-only services default to TCP only when they have a reachable route. Execution modes that include AgentServer default to MCP. Dependency cache preparation happens before these checks, so readiness timeouts must describe service startup, not post-start dependency installation inside the agent home.
+Startup readiness follows an explicit precedence. A declared `readiness.protocol`
+of `mcp`, `tcp`, or `none` wins over every inferred choice, including a
+`health.readiness.script`. Without an explicit protocol, a start-only container
+with `health.readiness.script` uses blocking script readiness; a start-only
+service with a resolved `httpServices[].port` target may use TCP readiness;
+other start-only services default to TCP only when they have a reachable private
+target. Execution modes that include AgentServer default to MCP. Dependency
+cache preparation happens before these checks, so readiness timeouts must
+describe service startup, not post-start dependency installation inside the
+agent home.
 
-For blocking script readiness, Ploinky executes the declared plain-filename script inside the service container from `/code`, applying its interval, per-attempt timeout, success threshold, and failure threshold. A missing script, exhausted failure threshold, or execution error fails the dependency wave and blocks the caller. The same manifest `health.readiness` configuration may later be used by the watchdog as a warning-oriented health probe, but that later behavior does not weaken its blocking role during start-only container startup.
+For blocking script readiness, Ploinky executes the declared plain-filename script inside the service container from `/code`, applying its interval, per-attempt timeout, success threshold, and failure threshold. A missing script, exhausted failure threshold, or execution error fails the dependency wave and blocks the caller. The watchdog then reruns the same semantic health contract at a bounded recurring interval; a prior success is not permanent. A later failure inactivates routing before scheduling a fresh exact-identity replacement, and failed replacement readiness cannot reactivate the selector. LiveKit's recurring script must continue to prove ownership of the reserved UDP socket, not merely process liveness.
 
-`openPorts` is publication metadata, not a generic readiness annotation. It exposes an agent socket into the managed outer runtime and makes that runtime-side socket eligible for host publication for any agent-starting command. The planner rejects zero box-side ports, invalid ranges, same-protocol claim conflicts, and incompatible profiles before outer or agent mutation. A start-only container with no `openPorts` does not receive a fabricated port-7000 AgentServer mapping: it must provide a blocking container script, a private `additionalServerPort` route, an intentional published TCP route, or explicit `readiness.protocol: "none"`. AgentServer execution modes may still receive the random localhost-to-7000 mapping when no port is declared. A host-network service that intentionally uses TCP readiness can name its reachable runtime-side port through `openPorts`, but doing so also accepts outer-boundary eligibility; a private host-network service should use a private readiness contract instead.
+`openPorts` is private inner-runtime metadata, not a generic readiness annotation
+and never physical-host publication permission. A start-only container with no
+`openPorts` does not receive a fabricated port-7000 AgentServer mapping: it must
+provide a blocking script, a private HTTP-service target, another explicit
+private TCP target, or `readiness.protocol: "none"`. AgentServer execution modes
+may still receive an engine-assigned private mapping to port 7000. The launcher
+rejects reserved Router TCP `8080`/`8081` and LiveKit UDP `7882` overlaps before
+mutation.
 
-The outer box persists versioned, separate explicit/generated publication provenance. Replanning preserves ordered explicit values that were not restated and replaces stale generated values. Missing or malformed provenance is unsupported and must not be inferred from inspected port bindings. The supervisor passes the authoritative socket coverage to core. A one-shot host command can reconcile the box before startup; a REPL, Marketplace, monitor, or other already-in-box path proceeds only when existing coverage is sufficient and otherwise fails before profile, registry, hook, router, cache preparation, or agent-container mutation with a one-shot host instruction.
+The outer box has no publication provenance or graph coverage contract. Its
+sole `-p` emission always creates loopback Router TCP and wildcard UDP `7882`,
+independent of startup state. Private readiness can advance only the topology
+publication generation; it cannot change the route-and-policy authorization
+generation, change stable configuration, create a host mapping, or restart
+unrelated consumers.
 
-Inside a marked outer box, all Ploinky-managed agents and dependency-install containers use nested Podman. Persisted bwrap/Seatbelt enablement and Docker fallback are ineffective there. Every Ploinky-created nested agent, helper, and sidecar container carries `io.assistos.ploinky.managed=1`; outer boot removes running and stopped exact matches while retaining manual/unlabelled containers, nested images, and nested named volumes. Cleanup enumeration or removal failure fails the box self-check. Because the outer `-containers` volume survives destroy, recovery from corrupt nested state requires inspect/backup followed by explicit removal of that one named volume after the box is absent and data loss is accepted.
+Inside a marked outer box, all Ploinky-managed agents and dependency-install containers use nested Podman. Persisted bwrap/Seatbelt enablement and Docker fallback are ineffective there. Every Ploinky-created nested agent, helper, and sidecar container carries `io.assistos.ploinky.managed=1`; contract-v5 boot rejects retained exact matches without deleting or importing them. The old box must be made quiescent and its managed containers removed before explicit destroy/recreate. Enumeration failure fails the box self-check. Because the outer `-containers` volume survives destroy, unrecoverable state requires inspect/backup followed by explicit removal of that one named volume after the box is absent and data loss is accepted; v5 performs no cleanup path.
 
-Contract-4 managed-network startup additionally requires rootless Podman 5.4
-or newer, Netavark, and operational `pasta`. Router startup listens explicitly
-on IPv4 `0.0.0.0`, while readiness tests the same TCP service through
-`127.0.0.1`; no Unix listener participates. Managed `default` and `bridge`
-agents receive the validated router endpoint through
-`host.containers.internal:host-gateway`, `host` agents use box loopback, and
-`none` agents receive no router endpoint and cannot select network-dependent
-readiness.
+Contract-5 managed-network startup additionally requires rootless Podman 5.4
+or newer, Netavark, and operational `pasta`. Router public/control `8080` starts
+before consumers, private `8081` is intended to be reachable only from allowed
+managed interfaces, and detailed health uses the unmounted supervisor Unix
+socket. Managed `default` and `bridge` agents receive the private endpoint only
+through the exact `host.containers.internal:host-gateway` mapping;
+capability-approved host agents use box loopback, and `none` agents receive no
+Router endpoint. On the currently observed rootless Podman topology that
+host-gateway terminates on the box outer-facing interface, so the bridge lane is
+blocked and remains fail-closed pending DS004 Question #8. Startup must not
+widen the listener or install a compatibility forwarder.
+
+After recursive repository preparation, Ploinky resolves a provider planning
+graph and stages an early inactive generation before static preinstall and
+startup config providers run. That generation assigns exact tuples to missing
+or changed nodes and strips resolved targets from every retained graph route.
+After providers finish, Ploinky reloads the registry, aborts the early lease,
+re-evaluates retained predecessor hashes, rotates newly stale tuples, and
+captures the final inactive targetless generation. Only then does it start the
+topological waves. Runtime backends must preserve the staged identity, and only
+the final preparation lease may authorize targets. Each blocking wave records its resolved private targets through a
+coordinated apply before readiness can authorize dependents; detached no-wait
+workers use the same prepared identity and the same apply path when their target
+exists. Additional already-enabled agents outside the graph start after all
+blocking waves. No-wait helpers are spawned only after those additional starts,
+so an independent background apply cannot transiently inactivate an exact
+host-generation capability while a blocking runtime is being created.
 
 Some agents are workers rather than servers — they do not bind a port and have no readiness signal beyond "the process is running." Such agents must set `readiness.protocol: "none"`. The runtime treats them as immediately ready and does not probe a port; the dependency wave still tracks them so dependents wait for the container to start, but it does not require a port-open or MCP-handshake response. Use this only for true workers (renewal loops, batch jobs); serving agents must keep a real probe.
 
-A manifest `enable[]` entry tagged with `no-wait` (see DS003) opts that dependency out of wave-by-wave gating. The runtime must still enable the dependency, register it in the workspace registry, and launch it, but it must do so without blocking on dependency-cache preparation, container creation, runtime startup, or readiness checks. A node is treated as no-wait when every path from the static agent to that node traverses at least one no-wait edge; a node with any blocking path remains in the blocking set and is gated normally. Static-agent startup must still wait on its full blocking dependency chain.
+A manifest `enable[]` entry tagged with `no-wait` (see DS003) opts that dependency out of wave-by-wave gating. The runtime still enables and registers it during the common prelaunch phase, but defers its detached launch until the complete blocking graph and any additional already-enabled agents have started. Once the helper is spawned, the main command does not block on that node's dependency-cache preparation, container creation, runtime startup, or readiness checks. A node is treated as no-wait when every path from the static agent to that node traverses at least one no-wait edge; a node with any blocking path remains in the blocking set and is gated normally. Static-agent startup must still wait on its full blocking dependency chain.
 
 For each no-wait node, startup spawns a detached helper that calls the standard `ensureAgentService` path in the background and writes durable progress records:
 
 - a log stream at `.ploinky/logs/no-wait/<container>.log`, capturing stdout and stderr of the worker
 - a status JSON at `.ploinky/running/no-wait/<container>.json` with at minimum `state` (`starting`, `running`, or `failed`), `startedAt`, `finishedAt`, `pid`, the resolved container name, the host port when assigned, and any captured error message and stack
 
-The main `ploinky start <staticAgent>` command must succeed even when a no-wait launch is still in progress or has failed. A no-wait failure must surface only through the durable log and status records, never as a non-zero exit from the main command. The helper is responsible for updating `routing.json` with its own route entry when its container exposes a host port, so the router can discover the background dependency once it is up without forcing the main start to wait. Runtime route writes from the foreground start path and no-wait helper must use a serialized merge so a background route cannot be overwritten by a later blocking dependency wave. Watchdog container monitoring must defer restart attempts while a no-wait status file is `starting` or `failed`; the helper owns startup until it records `running`, and a failed no-wait dependency should remain visible until the operator reruns startup. Blocking dependencies remain fail-closed as before.
+The main `ploinky start <staticAgent>` command must succeed even when a no-wait
+launch is still in progress or has failed. A no-wait failure surfaces through
+durable log and status records, never as a non-zero exit from the main command.
+When its targets become ready, the helper submits them to the same coordinated
+exact-byte generation apply as the foreground path; writing candidate
+`routing.json` alone cannot activate the selector. Watchdog monitoring defers
+restart attempts while a no-wait status is `starting` or `failed`. A failed
+candidate remains inactive until an operator reruns startup. Blocking
+dependencies remain fail-closed.
 
 ## Decisions & Questions
 
@@ -126,7 +167,12 @@ The graph contains explicit dependency edges, and tests on this branch validate 
 ### Question #3: Why is `openPorts` not the default readiness signal for every private service?
 
 Response:
-An `openPorts` entry is an exposure decision: inside the managed outer runtime it names the agent socket eligible to cross the host boundary. Requiring it merely to make a database, identity provider, LLM runtime, or private health endpoint startable would accidentally turn readiness metadata into publication permission. Blocking `health.readiness.script` and private `additionalServerPort` routes let those start-only services prove readiness without broadening their boundary. A service should use `openPorts` for TCP readiness only when the same socket is intentionally eligible for publication.
+An `openPorts` entry is an inner-runtime exposure decision. It is never eligible
+to cross the physical-host boundary, so making it the default readiness signal
+would still create unnecessary box-level sockets for databases, identity
+providers, or health endpoints. Blocking scripts and private
+`httpServices[].port` targets let start-only services prove semantic readiness
+without broadening their in-box reachability.
 
 ### Question #4: Why should dependency cache installs print progress?
 
@@ -146,7 +192,29 @@ Container runtime keys intentionally group compatible images by Node major, plat
 ### Question #7: Why are core cache destruction and outer-runtime destruction separate?
 
 Response:
-Core `destroy` is a workspace operation: it removes workspace agent runtimes and regenerated dependency caches while preserving isolated agent data, the outer container, and its named volumes. Host `ploinky destroy` is an explicitly confirmed system-boundary operation that directly removes the selected outer container and its anonymous volumes while retaining all three named instance volumes. Deliberate named-volume deletion is a separate engine-level reset. Keeping those scopes separate prevents a core command from gaining control of, or accidentally removing, the runtime that contains it and prevents ordinary outer replacement from becoming data deletion.
+Core `destroy` is a workspace operation: it removes workspace agent runtimes and regenerated dependency caches while preserving isolated agent data, the outer container, and its named volumes. Host `ploinky destroy` is an explicitly confirmed system-boundary operation that directly removes the selected outer container and its anonymous volumes while retaining all three named instance volumes. Deliberate named-volume deletion is a separate engine-level reset. Keeping those scopes separate prevents a core command from gaining control of, or accidentally removing, the runtime that contains it and prevents the explicit outer destroy/recreate boundary from becoming implicit data deletion.
+
+### Question #8: Why does dependency startup stage every graph identity before launching the first wave?
+
+Response:
+Private assertions and host-mode grants are current-generation capabilities, so
+there can be no bootstrap interval in which a process runs under an identity
+that the selected generation has not validated. The early batch makes hooks see
+one complete targetless graph; after provider output, its lease is aborted and
+retained predecessors are re-evaluated before one final targetless generation
+and launch lease are captured. No runtime starts between those stages. Target
+addresses remain absent until their runtimes exist and are added later by the
+normal coordinated route apply; that sequencing does not weaken the final exact
+identity contract.
+
+### Question #9: Why does the watchdog repeat semantic readiness after startup?
+
+Response:
+Process liveness does not prove continued socket ownership or service semantics.
+In particular, another process or a degraded composite media runtime can leave
+the container running after the expected UDP owner disappears. A bounded
+recurring probe turns that drift into an authorization failure and exact
+replacement instead of treating one historical success as permanent evidence.
 
 ## Conclusion
 

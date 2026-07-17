@@ -91,7 +91,7 @@ test('container dependency install runs as root for non-root runtime images', ()
     assert.equal(args[userIndex + 1], '0:0');
     assert.ok(userIndex < volumeIndex, 'user override should apply to the container run');
     assert.deepEqual(args.slice(-3), ['example/image:tag', '-lc', 'echo ok']);
-    assert.equal(args.includes('--network'), false, 'installer must use the contract-4 Podman network default');
+    assert.equal(args.includes('--network'), false, 'installer must use the managed Podman network default');
     assert.equal(args.some((arg) => String(arg).includes('slirp4netns')), false);
 });
 

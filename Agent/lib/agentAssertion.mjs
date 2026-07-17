@@ -16,6 +16,8 @@ import { readAgentSecret, expectedAudienceForSelf } from './invocationAuth.mjs';
  */
 
 const ASSERTION_TTL_SECONDS = 60;
+const PRIVATE_ASSERTION_TTL_SECONDS = 30;
+const PRIVATE_ROUTER_AUDIENCE = 'ploinky-private-router';
 
 /**
  * Internal helper that builds and signs the `typ:'agent-assertion'` payload from
@@ -107,7 +109,60 @@ export function signAgentHttpAssertion({
     });
 }
 
+/**
+ * Sign a box-private Router request. This capability deliberately does not
+ * reuse the stable DS013 PLOINKY_AGENT_SECRET: disable/re-enable and instance
+ * replacement rotate PLOINKY_AGENT_PRIVATE_SECRET, while the bound instance
+ * and enable generation let the Router compare the assertion with its captured
+ * current registry before dialing a private service.
+ */
+export function signPrivateRouterAssertion({
+    method = 'POST',
+    path,
+    query = '',
+    body = Buffer.alloc(0),
+    audience = PRIVATE_ROUTER_AUDIENCE,
+    env = process.env,
+} = {}) {
+    const encodedSecret = String(env?.PLOINKY_AGENT_PRIVATE_SECRET || '').trim();
+    const self = String(env?.PLOINKY_AGENT_ID || '').trim();
+    const instanceId = String(env?.PLOINKY_AGENT_INSTANCE_ID || '').trim();
+    const enableGeneration = String(env?.PLOINKY_AGENT_ENABLE_GENERATION || '').trim();
+    const normalizedPath = String(path || '').trim();
+    const normalizedMethod = String(method || '').trim().toUpperCase();
+    const normalizedAudience = String(audience || '').trim();
+    if (!/^[a-f0-9]{64}$/i.test(encodedSecret)) {
+        throw new Error('agentAssertion: PLOINKY_AGENT_PRIVATE_SECRET must be a 32-byte hex secret');
+    }
+    if (!self) throw new Error('agentAssertion: PLOINKY_AGENT_ID not configured');
+    if (!instanceId) throw new Error('agentAssertion: PLOINKY_AGENT_INSTANCE_ID not configured');
+    if (!enableGeneration) throw new Error('agentAssertion: PLOINKY_AGENT_ENABLE_GENERATION not configured');
+    if (!normalizedPath.startsWith('/')) throw new Error('agentAssertion: private path is required');
+    if (!normalizedMethod || !normalizedAudience) throw new Error('agentAssertion: private method and audience are required');
+    const bodyHash = sha256RawBodyHash(body);
+    const rch = computeRchHttp({ method: normalizedMethod, path: normalizedPath, query, bodyHash });
+    const iat = Math.floor(Date.now() / 1000);
+    return signHmacJwt({
+        secret: Buffer.from(encodedSecret, 'hex'),
+        payload: {
+            typ: 'private-agent-assertion',
+            iss: self,
+            sub: self,
+            aud: normalizedAudience,
+            instanceId,
+            enableGeneration,
+            method: normalizedMethod,
+            path: normalizedPath,
+            rch,
+            iat,
+            exp: iat + PRIVATE_ASSERTION_TTL_SECONDS,
+            jti: crypto.randomBytes(16).toString('base64url'),
+        },
+    });
+}
+
 export default {
     signAgentAssertion,
     signAgentHttpAssertion,
+    signPrivateRouterAssertion,
 };

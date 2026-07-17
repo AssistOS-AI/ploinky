@@ -19,7 +19,7 @@ const { deriveAgentPrincipalId } = await import(`../../cli/services/agentIdentit
 // The single identity injector that docker, bwrap, and lifecycle all route through.
 const { buildAgentIdentityEnv, stripReservedAgentEnv } = await import(`../../cli/services/agentIdentityEnv.js${moduleSuffix}`);
 const { verifySubjectIdentityKey, getSubjectIdentityPublicKey } = await import(`../../cli/services/subjectIdentityKey.js${moduleSuffix}`);
-const routerEndpoint = buildRouterEndpoint('host', 42817);
+const routerEndpoint = buildRouterEndpoint('host', 8080);
 
 test.after(() => {
     process.chdir(originalCwd);

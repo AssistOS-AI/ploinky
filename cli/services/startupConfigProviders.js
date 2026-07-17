@@ -3,8 +3,10 @@ import path from 'path';
 import { spawnSync } from 'child_process';
 
 import { parseEnableDirective } from './bootstrapManifest.js';
+import { stripReservedAgentEnv } from './agentIdentityEnv.js';
 import { PLOINKY_WORKSPACE_ROOT } from './config.js';
 import { readSecretsFile, setSecretValue } from './encryptedSecretsFile.js';
+import { edgeRuntimeEnvironment } from './edgeGeneration.js';
 import { getProfileConfig } from './profileService.js';
 import { buildEnvMap, getManifestEnvSpecs } from './secretVars.js';
 import { findAgent } from './utils.js';
@@ -33,7 +35,7 @@ function assertValidEnvName(name) {
 
 function isReservedOutputName(name) {
     const normalized = normalizeEnvName(name);
-    return RESERVED_OUTPUT_NAMES.has(normalized) || normalized.startsWith('PLOINKY_AGENT_');
+    return RESERVED_OUTPUT_NAMES.has(normalized) || normalized.startsWith('PLOINKY_');
 }
 
 function toBool(value, defaultValue = false) {
@@ -136,20 +138,6 @@ function providerAgentId(provider) {
     return `agent:${providerAgentRef(provider)}`;
 }
 
-function stripReservedProviderEnv(env) {
-    for (const key of Object.keys(env)) {
-        if (key === 'PLOINKY_MASTER_KEY'
-            || key === 'PLOINKY_DERIVED_MASTER_KEY'
-            || key === 'PLOINKY_AGENT_SECRET'
-            || key === 'PLOINKY_AGENT_ID'
-            || key === 'PLOINKY_AGENT_API_KEY'
-            || key === 'PLOINKY_AGENT_API_PUBLIC_KEY') {
-            delete env[key];
-        }
-    }
-    return env;
-}
-
 export function buildProviderSubprocessEnv({
     provider,
     workspaceRoot = PLOINKY_WORKSPACE_ROOT,
@@ -171,7 +159,10 @@ export function buildProviderSubprocessEnv({
         PLOINKY_PROVIDER_DATA_DIR: path.join(workspaceRoot, '.ploinky', 'data', provider.shortAgentName),
         ...manifestEnv,
     };
-    return stripReservedProviderEnv(env);
+    return {
+        ...stripReservedAgentEnv(env),
+        ...edgeRuntimeEnvironment('host', { workspaceRoot }),
+    };
 }
 
 export function redactProviderValue(_name, _value, _sensitive = false) {

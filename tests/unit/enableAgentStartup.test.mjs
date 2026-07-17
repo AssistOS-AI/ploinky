@@ -8,19 +8,33 @@ import {
 } from '../../cli/services/agents.js';
 import { mergeRuntimeRoute } from '../../cli/services/routingFile.js';
 
-test('enable agent forwards its selected explicit profile to the synchronous service launch', () => {
+test('enable agent forwards its selected explicit profile to the service launch', () => {
     assert.match(
         enableAgent.toString(),
         /ensureAgentService\([\s\S]*?profileName:\s*profileResolution\.resolvedProfileName/,
     );
 });
 
+test('enable keeps the prepared selector inactive until semantic readiness succeeds', () => {
+    const source = enableAgent.toString();
+    const prepare = source.indexOf('prepareAgentEnableBatch');
+    const launch = source.indexOf('ensureAgentService');
+    const readiness = source.indexOf('await waitForEnabledAgentReadiness');
+    const activation = source.indexOf("reason: 'agent-enable-runtime-finalize'");
+    assert.ok(prepare >= 0 && launch > prepare);
+    assert.ok(readiness > launch);
+    assert.ok(activation > readiness);
+    assert.match(source, /preparationLease:\s*prepared\.preparedGeneration\?\.preparationLease/);
+    assert.match(source, /preserveSelectedGeneration: true/);
+});
+
 test('enable transition to none neither prefers nor retains the old routed host port', () => {
-    const existing = { container: 'old', hostPort: 32001, additionalServerPort: 32002 };
+    const existing = { container: 'old', hostPort: 32001, serviceTargets: { '9000': 32002 } };
     assert.equal(preferredHostPortForNetworkMode(existing, 'none'), undefined);
     assert.deepEqual(mergeRuntimeRoute(existing, { container: 'new' }), { container: 'new' });
     const source = enableAgent.toString();
-    assert.match(source, /preferredHostPortForNetworkMode/);
+    assert.match(source, /preferredHostPort,/);
+    assert.match(source, /prepareAgentEnableBatch/);
     assert.match(source, /profileResolution\.network\.mode === 'none'/);
     assert.match(source, /mergeRuntimeRoute/);
 });

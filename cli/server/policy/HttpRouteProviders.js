@@ -75,11 +75,13 @@ export function normalizeManifestHttpRouteAccess(spec, { routeKey } = {}) {
     return { ok: true, path: normalized.path, access, routeKey: normalizedRouteKey, source: 'manifest' };
 }
 
-export function collectManifestHttpRouteAccess(routes = {}) {
+export function collectManifestHttpRouteAccess(routes = {}, { manifests = null } = {}) {
     const entries = [];
     for (const [routeKey, route] of Object.entries(routes || {})) {
         if (!route || route.disabled) continue;
-        const manifest = readJsonFileIfExists(getManifestHttpRouteManifestPath(routeKey, route));
+        const manifest = manifests && Object.prototype.hasOwnProperty.call(manifests, routeKey)
+            ? manifests[routeKey]
+            : readJsonFileIfExists(getManifestHttpRouteManifestPath(routeKey, route));
         if (!manifest) continue;
         for (const spec of asRouteSpecs(manifest)) {
             const normalized = normalizeManifestHttpRouteAccess(spec, { routeKey });

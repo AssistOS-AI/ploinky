@@ -35,6 +35,16 @@ protected route aliases, manifest-specific route handling, and HTTP-service
 auth branches. The router now evaluates one policy decision and enforces it
 through one executor before proxying.
 
+Runtime contract v5 compiles that decision together with its route target into
+one immutable, exact-byte route-and-policy generation. Raw routing, manifest,
+or policy candidate edits have no live authorization effect. A coordinated
+apply first inactivates the affected selectors and installs a fully validated
+replacement atomically; failure leaves them inactive and never restores an old
+generation. Exact listener/interface class and exact `Host` are resolved before
+pathname dispatch, and HTTP, SSE, and WebSocket transports capture and
+revalidate the same generation lease immediately before creating an upstream
+connection.
+
 ## Trust Boundaries
 
 Ploinky is still a local workspace runtime. The trusted assets are the operator
@@ -44,11 +54,12 @@ mutually hostile tenants.
 
 | Boundary | What It Protects | Current Rule |
 | --- | --- | --- |
-| Router public HTTP listener | Browser routes, HTTP services, first-party surfaces, policy commands, MCP entry points. | The router owns authentication, route access, internal path rejection, and proxy dispatch. |
+| Router public/control listener `8080` | Browser routes, public HTTP services, first-party surfaces, policy commands, MCP entry points. | Exact control, agent-root, and dedicated-service Hosts select closed route surfaces before path dispatch. The outer wrapper publishes this listener only through the selected physical-host loopback port; cloudflared, when explicitly configured, always dials in-box `127.0.0.1:8080`. |
+| Router private listener `8081` | Current-generation agent-to-service HTTP, SSE, and WebSocket calls. | It is never an outer publication. Effective authenticated policy and an exact caller instance/enable-generation ACL plus request-bound replay-protected private assertion are all required. |
 | Workspace master key | Session signing, encrypted stores, per-agent request secrets, generated secrets. | The resolved master seed is high trust; explicit `PLOINKY_MASTER_KEY` / `.env` values and the generated `.ploinky/master-key` fallback all root the same HKDF tree. |
 | Agent environment | Agent identity and per-agent signing. | Agents receive only `PLOINKY_AGENT_ID`, `PLOINKY_AGENT_PRINCIPAL`, and their own `PLOINKY_AGENT_SECRET`; they never receive the master or shared derived-master request key. |
 | Policy state | Operator/admin HTTP and MCP policy. | Corrupt or old schema state fails the whole document closed. |
-| Manifest declarations | Agent-owned routing/service intent. | Manifests may declare route access and HTTP services in the new vocabulary. Manifest route entries may omit `access` to default to `authenticated`; services must be explicit. Invalid local specs are skipped or unmounted locally. |
+| Manifest declarations | Candidate agent-owned routing/service intent. | Manifests may declare route access and slim HTTP services in the new vocabulary. Exact bytes are effective only after coordinated generation apply; invalid candidate state installs nothing and leaves affected selectors inactive. |
 
 The router is the trust broker. Browser cookies stop at the router. Agents do
 not receive user session JWTs, guest session JWTs, or router policy state.
@@ -63,12 +74,13 @@ agent routes and declared HTTP services:
 
 | Step | Component | Responsibility |
 | --- | --- | --- |
-| 1 | `RoutingServer.js` | Parse the URL, load active routes, identify router-owned paths, detect agent route or HTTP service route. |
-| 2 | `internalAgentPath.js` plus `HttpRouteAccessPath` | Reject literal or encoded internal `__agent` paths and unroutable path shapes. |
-| 3 | `HttpRouteAccessPolicy.evaluate()` | Compose persisted policy, manifest routes, HTTP service entries, and route defaults. |
-| 4 | `ensureHttpRouteAccess()` | Enforce `public`, `guest`, or `authenticated`; deny everything else. |
-| 5 | Router dispatch | Serve first-party surfaces, declared services, agent static/proxy routes, or MCP routes. |
-| 6 | Proxy/header minting | Strip caller-supplied identity headers and regenerate router-owned identity metadata only after access is satisfied. |
+| 1 | Listener classifier and `RoutingServer.js` | Resolve public/control versus private listener and validate the exact `Host`; select only that host class's closed route surface. |
+| 2 | Installed `edgeRoutePlan` generation | Capture one immutable route target and policy generation lease; raw candidate files are not consulted as authorization. |
+| 3 | `internalAgentPath.js` plus `HttpRouteAccessPath` | Reject literal or encoded internal `__agent` paths and unroutable path shapes. |
+| 4 | `HttpRouteAccessPolicy.evaluate()` | Compose the installed operator policy, manifest routes, HTTP service entry, and route defaults. |
+| 5 | `ensureHttpRouteAccess()` | Enforce `public`, `guest`, or `authenticated`; private calls additionally prove the exact current caller ACL and assertion. |
+| 6 | Router dispatch | Serve only the selected host surface: first-party control, declared service, agent-root static/proxy, or MCP route. |
+| 7 | Dial boundary | Strip caller-supplied identity/source headers, regenerate router-owned metadata, and revalidate the captured generation immediately before each HTTP/SSE/WebSocket upstream connection. Guest ingestion receives only an opaque route-scoped transport-source HMAC for per-source rate accounting. |
 
 The policy evaluator is intentionally separate from sessions and JWTs. It
 decides what access class applies to a path and method. The executor then
@@ -128,6 +140,7 @@ real users.
 | Scope | Guest sessions may carry a `gscope` that limits reuse to the route or service that minted them. |
 | MCP role | Browser guest MCP callers have actor kind `guest`; they may satisfy MCP `authenticated`, but never `internal` or `admin`. |
 | Delegation | Guests never receive User Delegation Grants. |
+| Ingestion rate source | Guest session ids are not source identity. After host/policy validation, the Router replaces every spoofable source header with `x-ploinky-rate-source`, a 64-hex route-scoped HMAC over the canonical Cloudflare source address or local TCP peer. It contains no raw address or user/session identity and cannot authorize access. |
 
 Guest identity is not a compatibility alias for unauthenticated pass-through.
 It is a router-issued, expiring identity with limited authority.
@@ -156,9 +169,9 @@ the same evaluator.
 
 | Source | Owner | File / Module | Notes |
 | --- | --- | --- | --- |
-| Persisted `httpRoutes` | Operator/admin policy | `.ploinky/data/router-security/policy-state.json`, `PolicyStateRepository.js` | Written by `http.route.set`; listed by `http.route.list`. |
-| Manifest `routerAccess.httpRoutes` | Enabled agent manifest | `HttpRouteProviders.js` | Runtime-only declarations expanded under the active route key. |
-| Manifest `httpServices` | Enabled agent manifest | `httpServiceRoutes.js`, `HttpRouteProviders.js` | Valid services contribute route access for their external prefix. |
+| Persisted `httpRoutes` | Operator/admin candidate policy | `.ploinky/data/router-security/policy-state.json`, `PolicyStateRepository.js` | Staged by `http.route.set`; effective only after coordinated generation apply. |
+| Manifest `routerAccess.httpRoutes` | Enabled agent manifest candidate | `HttpRouteProviders.js`, `HttpRoutePolicyCompiler.js` | Exact bytes are captured, digested, validated, and expanded during coordinated apply. |
+| Manifest `httpServices` | Enabled agent manifest candidate | `httpServiceRoutes.js`, `HttpRouteProviders.js` | Validated service target and route policy are installed in the same immutable generation. |
 | Route default | Router fallback | `authHandlers.js` | Preserves static-agent deference and otherwise defaults to guest. |
 
 When multiple sources match, the most restrictive access wins:
@@ -216,14 +229,12 @@ agent-relative and expand under the active route key or alias.
 | Router-looking names | Agent-relative `/auth/...`, `/admin/...`, and `/metrics` expand under `/<routeKey>/...`; they are not router-root internals. |
 | Persistence | Manifest declarations are not copied into policy-state. |
 
-Manifest entries are cached by manifest mtime and size in
-`HttpRouteProviders.js`. This avoids re-reading unchanged manifests on every
-request while still updating when the enabled manifest changes.
-
-Invalid manifest route entries are skipped locally. They do not create router
-wide 500s and do not make the path public by accident. This manifest-only
-default does not apply to persisted `httpRoutes` or `httpServices`, where
-missing `access` remains invalid and fail-closed.
+Manifest entries are candidate input. Coordinated apply captures and digests
+their exact bytes; neither mtime/size changes nor a same-size replacement can
+authorize a live request. Invalid input prevents the affected generation from
+installing and leaves its selectors inactive. Omitted manifest-route `access`
+still defaults to `authenticated`; persisted `httpRoutes` and `httpServices`
+require explicit valid access.
 
 ## HTTP Services
 
@@ -231,15 +242,23 @@ HTTP services are agent-declared routes with an external prefix and an
 internal upstream prefix. They use the same `access` vocabulary and the same
 evaluator/executor path as transparent routes.
 
+The slim service shape retains current fields and adds only optional integer
+`port`. Omitted `port` targets the agent's primary listener. A present port must
+be a validated TCP port; Ploinky creates or reuses one private inner mapping per
+distinct explicit target and records it in the immutable generation. A
+validated unique `slug` is required only when a dedicated service Host or mount
+needs a service name. No service field can add a physical-host publication.
+
 | Service Access | Identity Forwarded | Delegation Grants | Notes |
 | --- | --- | --- | --- |
 | `public` | None. | Never. | Anonymous read/write depends on the service declaration and method handling, but no user identity is provided. |
 | `guest` | Existing user or scoped guest identity. | Never. | The router may mint `ploinky_guest`; auth-info carries guest/user context, not delegation. |
 | `authenticated` | User identity. | Optional, if explicitly configured and condition matches. | Requires a user session and may receive scoped User Delegation Grants. |
 
-Removed service fields such as `auth`, `mode`, and `forceGuest` invalidate the
-offending service spec. An invalid service is logged and left unmounted; valid
-sibling services still mount.
+Removed service fields such as `auth`, `mode`, `forceGuest`, and
+`additionalServerPort` invalidate the candidate. There is no profile-server
+special path or compatibility proxy. Invalid candidate input cannot install an
+authorization generation.
 
 For services that receive router identity, the router strips caller-supplied
 identity headers and regenerates its own `x-ploinky-auth-info`. When invocation
@@ -290,12 +309,14 @@ Old documents using removed HTTP vocabulary are invalid. Remediation is:
 | Step | Action |
 | --- | --- |
 | 1 | Stop the router. |
-| 2 | Delete `.ploinky/data/router-security/policy-state.json`. |
-| 3 | Restart the router so MCP defaults bootstrap from `mcp-config.json`. |
-| 4 | Re-add intended HTTP routes through `http.route.set`. |
+| 2 | Back up and inspect the invalid file without changing the selected generation. |
+| 3 | Replace it atomically with one complete, schema-valid policy document and restore every other required routing/agent/desired/manifest source. Do not leave the file missing or delete only this source. |
+| 4 | Invoke coordinated apply, verify the new active digest, then re-add any intended policy through the authenticated admin commands. |
 
 There is no entry-level tolerance for old rows, because partial acceptance of a
-security document is harder to audit than a closed failure.
+security document is harder to audit than a closed failure. Restart does not
+interpret a missing document as empty and does not reconstruct or roll back old
+state automatically.
 
 ## MCP Policy and Guest Actors
 
@@ -415,6 +436,9 @@ translating them.
 | `forceGuest` | Invalid. Use `access: "guest"` and let user sessions take precedence. |
 | `publicServices` | Gone. Use `httpServices` with explicit `access`. |
 | HTTP-service auth branch in `resolveAuthContext` | Gone. Services go through route access evaluator plus executor. |
+| `additionalServerPort` and profile-server proxy | Gone. Use optional `httpServices[].port` for a private explicit TCP target. |
+| Raw manifest/policy hot reload | Gone. Candidate bytes require coordinated generation apply. |
+| Host or path fallback routing | Gone. Unknown, malformed, stale, or suffix-confusable Hosts and paths fail before dial. |
 
 The router does not provide aliases, migration translation, or compatibility
 shims for these names. Old persisted policy-state documents fail closed.
@@ -509,8 +533,10 @@ delegation:
 {
   "httpServices": [
     {
+      "slug": "editor",
       "externalPrefix": "/services/editor",
       "upstreamPrefix": "/internal/editor",
+      "port": 7000,
       "access": "authenticated",
       "delegations": [
         {
@@ -536,6 +562,10 @@ with delegation settings is invalid.
 | Decision values and helpers | `cli/server/policy/HttpRouteAccessDecision.js` |
 | Effective HTTP route evaluation | `cli/server/policy/HttpRouteAccessPolicy.js` |
 | Manifest and HTTP service providers | `cli/server/policy/HttpRouteProviders.js` |
+| Exact-byte policy compilation | `cli/server/policy/HttpRoutePolicyCompiler.js` |
+| Immutable route plan and dial lease | `cli/server/edgeRoutePlan.js`, `cli/services/edgeGeneration.js`, `cli/services/coordinatedEdgeApply.js` |
+| Host and listener classification | `cli/server/listenerInterfaceClassifier.js`, `cli/server/RoutingServer.js` |
+| Private service assertions | `cli/server/privateRouter.js`, `Agent/lib/agentAssertion.mjs` |
 | Persistent policy state | `cli/server/policy/PolicyStateRepository.js`, `FileSystemPolicyStateStore.js` |
 | Policy commands | `cli/server/policy/commands/httpRouteCommands.js`, `mcpPolicyCommands.js`, `PolicyCommandInvoker.js` |
 | HTTP executor and sessions | `cli/server/authHandlers.js`, `cli/server/auth/localService.js`, `cli/server/auth/genericAuthBridge.js` |
@@ -559,7 +589,11 @@ sessions, MCP policy, or token services.
 | Guest separation | `guest-session` JWT in `ploinky_jwt` never satisfies authenticated route access. |
 | Route defaults | Static user-auth deference yields `authenticated`; otherwise no-auth routes default to `guest`, never public. |
 | Internal paths | Literal and encoded `__agent` are blocked in path normalization, front-door dispatch, and synthesized upstream handling. |
-| HTTP services | Services use the same evaluator and executor path; invalid service specs unmount locally. |
+| HTTP services | Services use the same evaluator and executor path; an invalid service candidate prevents the affected generation from installing. |
+| Candidate isolation | Raw routing, manifest, and policy edits have no runtime effect before coordinated apply. |
+| Transport parity | HTTP, SSE, and WebSocket select and revalidate the same route-and-policy generation before dial. |
+| Host-first closure | Unknown, malformed, stale, and suffix-confusable Hosts fail before pathname dispatch or upstream connection. |
+| Private calls | Effective authenticated admission, exact current caller ACL, and request/body/replay-bound assertion are all required. |
 | Policy state | Old or corrupt `policy-state.json` fails the whole document closed. |
 | MCP guests | Guests never satisfy `internal` or `admin` and never receive User Delegation Grants. |
 | Router Requests | `typ: "router-request"`, 30-second TTL clamp, optional fields omitted when absent. |
@@ -586,14 +620,17 @@ A started workspace on port 8080 should satisfy the following probes:
 
 ## Deployment Limits
 
-This model is designed for the documented local, operator-controlled workspace
-trust boundary. It does not by itself make Ploinky a hostile multi-tenant or
-public-internet service.
+Runtime contract v5 supports an explicitly configured Cloudflare edge while
+remaining an operator-controlled workspace runtime rather than a hostile
+multi-tenant platform. Local-only mode has no connector and no public HTTP
+hostname. Complete Cloudflare mode requires an existing tunnel connector token
+and a separate least-privilege API token; invalid or incomplete configuration
+fails closed and never creates a quick or new tunnel.
 
 | Limit | Impact |
 | --- | --- |
-| Router network exposure | The router port is sensitive; external exposure requires host firewall, TLS/proxy, and deployment policy outside this document. |
-| CSRF/origin checks | Cookie-authenticated state-changing browser routes still need explicit hardening before internet-facing use. |
+| Router network exposure | The physical-host Router mapping is loopback-only. Public HTTP, when configured, reaches fixed in-box `127.0.0.1:8080` through the supervised outbound cloudflared connector; private `8081` is never published. |
+| CSRF/origin checks | Every TCP admin/control/status handler requires a real admin session; every mutation also requires exact Origin and session-bound CSRF. Product services still need their own narrow Origin/body contracts. |
 | Login rate limiting | Local/SSO auth flows need deployment-level protection for untrusted networks. |
 | Upload quotas | Blob and upload routes need quota controls before broad exposure. |
 | Dashboard command execution | Dashboard command routes remain trusted-operator surfaces. |
@@ -603,9 +640,10 @@ public-internet service.
 
 The new security model reduces HTTP reachability to one route access decision:
 `public`, `guest`, or `authenticated`. It composes operator policy, manifest
-routes, HTTP services, and route defaults into a single effective decision,
-then enforces that decision through one executor before any transparent proxy
-or service dispatch. Guests are first-class anonymous identities, not users.
+routes, HTTP services, and route defaults into one exact-byte immutable route
+and policy generation, then enforces and revalidates that captured generation
+before any HTTP, SSE, or WebSocket dial. Exact listener and Host select a closed
+surface before path dispatch. Guests are first-class anonymous identities, not users.
 Authenticated routes structurally reject guest JWTs. MCP tool policy remains a
 separate domain with its own values. Token handling is split into explicit
 services so User Sessions, Agent Assertions, Router Requests, and User

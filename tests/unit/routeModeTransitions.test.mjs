@@ -7,14 +7,14 @@ import { mergeRuntimeRoute } from '../../cli/services/routingFile.js';
 const oldRouted = {
     container: 'old-container',
     hostPort: 30101,
-    additionalServerPort: 30102,
+    serviceTargets: { '9000': 30102 },
 };
 
 test('no-wait default-to-none route transition deletes stale ports', () => {
     assert.deepEqual(
         mergeRuntimeRoute(oldRouted, { container: 'none-container' }, {
             hostPort: null,
-            additionalServerPort: null,
+            serviceTargets: null,
         }),
         { container: 'none-container' },
     );
@@ -28,7 +28,7 @@ test('monitor default-to-none route transition deletes stale ports', () => {
     assert.deepEqual(
         mergeRuntimeRoute(oldRouted, { container: 'restarted-none-container' }, {
             hostPort: 0,
-            additionalServerPort: null,
+            serviceTargets: null,
         }),
         { container: 'restarted-none-container' },
     );
@@ -38,16 +38,16 @@ test('monitor default-to-none route transition deletes stale ports', () => {
     assert.match(source, /mergeRuntimeRoute/);
 });
 
-test('routable route updates replace both runtime ports', () => {
+test('routable route updates replace primary and explicit service targets', () => {
     assert.deepEqual(
         mergeRuntimeRoute(oldRouted, { container: 'new-container' }, {
             hostPort: 40101,
-            additionalServerPort: 40102,
+            serviceTargets: { '9000': 40102 },
         }),
         {
             container: 'new-container',
             hostPort: 40101,
-            additionalServerPort: 40102,
+            serviceTargets: { '9000': 40102 },
         },
     );
 });

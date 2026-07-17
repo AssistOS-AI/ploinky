@@ -1,15 +1,8 @@
-import {
-    formatPortRange,
-    intervalsOverlap,
-    parseExplicitPublishSpec,
-} from './publish-spec.mjs';
-import { parseRouterPort } from '../cli/services/routerPort.js';
-
 export const REQUIRED_RUNTIME_IMAGE =
     'docker.io/assistos/ploinky-box:runtime';
 export const RUNTIME_CONTRACT_LABEL =
     'io.assistos.ploinky.runtime-contract';
-export const REQUIRED_RUNTIME_CONTRACT = '4';
+export const REQUIRED_RUNTIME_CONTRACT = '5';
 export const REQUESTED_IMAGE_LABEL =
     'io.assistos.ploinky.requested-image';
 export const IDENTITY_SCHEMA_LABEL =
@@ -18,15 +11,9 @@ export const PATH_HASH_LABEL =
     'io.assistos.ploinky.path-hash';
 export const VOLUME_ROLE_LABEL =
     'io.assistos.ploinky.volume-role';
-export const PUBLISH_PLAN_VERSION_LABEL =
-    'io.assistos.ploinky.publish-plan-version';
-export const GENERATED_PUBLISHES_LABEL =
-    'io.assistos.ploinky.generated-publishes';
-export const EXPLICIT_PUBLISHES_LABEL =
-    'io.assistos.ploinky.explicit-publishes';
 export const IDENTITY_SCHEMA_VERSION = '1';
-export const REQUIRED_PUBLISH_PLAN_VERSION = '2';
 export const BOX_ROUTER_PORT = 8080;
+export const BOX_MEDIA_PORT = 7882;
 
 export const REQUIRED_IMAGE_USER = 'podman';
 export const REQUIRED_IMAGE_WORKDIR = '/workspace';
@@ -49,10 +36,26 @@ export const VOLUME_ROLES = Object.freeze({
     deps: 'ploinky-deps',
 });
 
-const RAW_EXTRA_PUBLISH_SPECS = Symbol('rawExtraPublishSpecs');
+export function parseSelectedHostPort(value, { source = 'outer runtime host port' } = {}) {
+    const validNumber = typeof value === 'number'
+        && Number.isSafeInteger(value)
+        && value >= 1
+        && value <= 65535;
+    const validString = typeof value === 'string'
+        && /^[0-9]+$/.test(value)
+        && Number(value) >= 1
+        && Number(value) <= 65535;
+    if (!validNumber && !validString) {
+        const rendered = typeof value === 'string' ? JSON.stringify(value) : String(value);
+        const error = new Error(`${source} must be an integer number or exact unsigned decimal string in the range 1..65535; received ${rendered}`);
+        error.code = 'PLOINKY_HOST_PORT_INVALID';
+        throw error;
+    }
+    return Number(value);
+}
 
 function selectedHostPort(invocation, source) {
-    return String(parseRouterPort(invocation?.port, { source }));
+    return String(parseSelectedHostPort(invocation?.port, { source }));
 }
 
 function inspectRecord(raw) {
@@ -238,9 +241,14 @@ export function normalizeContainerInspect(engine, raw) {
     ]);
     const byDestination = destination =>
         mounts.find(mount => mount.Destination === destination);
-    const routerPublish = publishes.find(item =>
+    const routerPublishes = publishes.filter(item =>
         item.containerPort === '8080' && item.protocol === 'tcp'
-    ) || null;
+    );
+    const udpReservations = publishes.filter(item =>
+        item.containerPort === String(BOX_MEDIA_PORT) && item.protocol === 'udp'
+    );
+    const routerPublish = routerPublishes.length === 1 ? routerPublishes[0] : null;
+    const udpReservation = udpReservations.length === 1 ? udpReservations[0] : null;
     const rawLabels = value.Config.Labels || {};
     const requestedImage = String(rawLabels[REQUESTED_IMAGE_LABEL] || '');
     const createCommand = Array.isArray(value.Config.CreateCommand)
@@ -290,14 +298,14 @@ export function normalizeContainerInspect(engine, raw) {
             deps: byDestination('/opt/ploinky/node_modules')?.Name || '',
         },
         routerPublish,
-        extraPublishes: publishes.filter(item => item !== routerPublish),
+        udpReservation,
+        observedPublishes: publishes,
         devices: normalizeDevices(observedDevices.length > 0 ? observedDevices : requestedDevices),
         capAdds: [...(value.HostConfig.CapAdd || [])],
         securityOpts: normalizeSecurityOpts(value.HostConfig.SecurityOpt || []),
         env: envMap(value.Config.Env || []),
-        // Preserve the complete inspected label set. Reconciliation changes
-        // only supervisor-owned keys, while rollback must restore every prior
-        // creation label byte-for-byte.
+        // Preserve the complete inspected label set so reconciliation can
+        // identify drift without reconstructing an existing container.
         labels: { ...rawLabels },
         allLabels: { ...rawLabels },
     };
@@ -366,191 +374,10 @@ export function validateVolumeOwnership(volume, invocation, roleKey, expectedNam
     return volume;
 }
 
-function normalizePublishSpec(spec) {
-    const parsed = parseExplicitPublishSpec(spec);
-    return {
-        hostIp: parsed.hostIp,
-        hostPort: parsed.hostInterval
-            ? formatPortRange(parsed.hostInterval)
-            : '',
-        containerPort: formatPortRange(parsed.containerTarget),
-        protocol: parsed.protocol,
-    };
-}
-
 function publishSpec(record) {
-    const protocol = record.protocol === 'tcp' ? '' : '/' + record.protocol;
-    if (!String(record.hostPort ?? '').trim()) {
-        const host = record.hostIp ? record.hostIp + '::' : '';
-        return host + record.containerPort + protocol;
-    }
+    const protocol = '/' + record.protocol;
     const host = record.hostIp ? record.hostIp + ':' : '';
     return host + record.hostPort + ':' + record.containerPort + protocol;
-}
-
-function publishIdentity(record) {
-    return [
-        record.hostIp,
-        record.hostPort,
-        record.containerPort,
-        record.protocol,
-    ].join('\0');
-}
-
-function attachRawExtraPublishSpecs(config, specs = []) {
-    const byIdentity = new Map();
-    for (const spec of specs) {
-        const identity = publishIdentity(normalizePublishSpec(spec));
-        if (!byIdentity.has(identity)) byIdentity.set(identity, String(spec));
-    }
-    Object.defineProperty(config, RAW_EXTRA_PUBLISH_SPECS, {
-        configurable: true,
-        enumerable: false,
-        value: byIdentity,
-    });
-    return config;
-}
-
-function isWildcardHost(hostIp) {
-    const normalized = String(hostIp || '').trim().toLowerCase();
-    return normalized === '' || normalized === '0.0.0.0' || normalized === '*';
-}
-
-function bindScopesConflict(left, right) {
-    if (isWildcardHost(left.hostIp) || isWildcardHost(right.hostIp)) return true;
-    return String(left.hostIp).trim().toLowerCase()
-        === String(right.hostIp).trim().toLowerCase();
-}
-
-function describeBind(claim) {
-    return isWildcardHost(claim.hostIp)
-        ? `wildcard bind ${claim.hostIp || '(engine default)'}`
-        : `specific bind ${claim.hostIp}`;
-}
-
-function formatInterval(start, end) {
-    return start === end ? String(start) : `${start}-${end}`;
-}
-
-function isEphemeralHostClaim(parsed) {
-    return !parsed.hostInterval
-        || (parsed.hostInterval.start === 0 && parsed.hostInterval.end === 0);
-}
-
-function normalizedBindScope(hostIp) {
-    const value = String(hostIp || '').trim().toLowerCase();
-    return ['', '*', '0.0.0.0', '::'].includes(value) ? '*' : value;
-}
-
-function atomicPublishBindings(records) {
-    const bindings = [];
-    for (const record of records || []) {
-        const parsed = parseExplicitPublishSpec(publishSpec(record));
-        const ephemeral = isEphemeralHostClaim(parsed);
-        for (
-            let offset = 0;
-            offset <= parsed.containerTarget.end - parsed.containerTarget.start;
-            offset += 1
-        ) {
-            bindings.push({
-                scope: normalizedBindScope(parsed.hostIp),
-                hostPort: ephemeral ? null : parsed.hostInterval.start + offset,
-                containerPort: parsed.containerTarget.start + offset,
-                protocol: parsed.protocol,
-                ephemeral,
-            });
-        }
-    }
-    return bindings;
-}
-
-function publishesSemanticallyEqual(actual, desired) {
-    const remaining = atomicPublishBindings(actual);
-    const requested = atomicPublishBindings(desired);
-    if (remaining.length !== requested.length) return false;
-    for (const expected of requested) {
-        const index = remaining.findIndex(observed =>
-            observed.scope === expected.scope
-            && observed.containerPort === expected.containerPort
-            && observed.protocol === expected.protocol
-            && (expected.ephemeral || observed.hostPort === expected.hostPort)
-        );
-        if (index === -1) return false;
-        remaining.splice(index, 1);
-    }
-    return remaining.length === 0;
-}
-
-function validateHostSocketClaims(records) {
-    const claims = records.map(record => ({
-        record,
-        parsed: parseExplicitPublishSpec(publishSpec(record)),
-    }));
-    for (let index = 0; index < claims.length; index += 1) {
-        const claim = claims[index];
-        for (let prior = 0; prior < index; prior += 1) {
-            const existing = claims[prior];
-            if (
-                isEphemeralHostClaim(existing.parsed)
-                || isEphemeralHostClaim(claim.parsed)
-                || existing.parsed.protocol !== claim.parsed.protocol
-                || !intervalsOverlap(existing.parsed.hostInterval, claim.parsed.hostInterval)
-                || !bindScopesConflict(existing.record, claim.record)
-            ) continue;
-            const overlapStart = Math.max(
-                existing.parsed.hostInterval.start,
-                claim.parsed.hostInterval.start,
-            );
-            const overlapEnd = Math.min(
-                existing.parsed.hostInterval.end,
-                claim.parsed.hostInterval.end,
-            );
-            throw new Error(
-                'overlapping runtime publish host socket '
-                + formatInterval(overlapStart, overlapEnd)
-                + '/' + claim.parsed.protocol + ': '
-                + describeBind(existing.record) + " '"
-                + publishSpec(existing.record) + "' conflicts with "
-                + describeBind(claim.record) + " '"
-                + publishSpec(claim.record) + "'",
-            );
-        }
-    }
-}
-
-export function mergeAndValidatePublishes(
-    selectedPublishes = [],
-    generatedPublishes = [],
-) {
-    const selected = [];
-    const identities = new Set();
-    for (const record of selectedPublishes) {
-        const normalized = normalizePublishSpec(publishSpec(record));
-        const identity = publishIdentity(normalized);
-        if (identities.has(identity)) continue;
-        identities.add(identity);
-        selected.push(normalized);
-    }
-
-    const selectedClaims = selected.map(record =>
-        parseExplicitPublishSpec(publishSpec(record))
-    );
-    const result = [...selected];
-    for (const record of generatedPublishes) {
-        const normalized = normalizePublishSpec(publishSpec(record));
-        const generated = parseExplicitPublishSpec(publishSpec(normalized));
-        const overlapsSelected = selectedClaims.some(explicit =>
-            explicit.protocol === generated.protocol
-            && intervalsOverlap(explicit.containerTarget, generated.containerTarget)
-        );
-        if (overlapsSelected) continue;
-        const identity = publishIdentity(normalized);
-        if (identities.has(identity)) continue;
-        identities.add(identity);
-        result.push(normalized);
-    }
-    validateHostSocketClaims(result);
-    return result;
 }
 
 function replaceDestinationBind(binds, destination, replacement) {
@@ -572,9 +399,6 @@ export function createDefaultRuntimeConfig(invocation) {
         [IDENTITY_SCHEMA_LABEL]: IDENTITY_SCHEMA_VERSION,
         [PATH_HASH_LABEL]: String(invocation.pathHash || ''),
     };
-    if (invocation._configurationLabels) {
-        Object.assign(labels, invocation._configurationLabels);
-    }
     const config = {
         instance,
         image: requestedImage,
@@ -593,12 +417,17 @@ export function createDefaultRuntimeConfig(invocation) {
         ],
         volumes,
         routerPublish: {
-            hostIp: invocation.listenLan ? '0.0.0.0' : '127.0.0.1',
+            hostIp: '127.0.0.1',
             hostPort,
             containerPort: String(BOX_ROUTER_PORT),
             protocol: 'tcp',
         },
-        extraPublishes: (invocation.publish || []).map(normalizePublishSpec),
+        udpReservation: {
+            hostIp: '0.0.0.0',
+            hostPort: String(BOX_MEDIA_PORT),
+            containerPort: String(BOX_MEDIA_PORT),
+            protocol: 'udp',
+        },
         devices: [
             {
                 hostPath: '/dev/fuse',
@@ -618,14 +447,10 @@ export function createDefaultRuntimeConfig(invocation) {
         },
         labels,
     };
-    return attachRawExtraPublishSpecs(config, invocation.publish || []);
+    return config;
 }
 
-export function mergeDesiredRuntimeConfig(
-    invocation,
-    existing,
-    generatedPublishes = [],
-) {
+export function mergeDesiredRuntimeConfig(invocation, existing) {
     const desired = structuredClone(existing || createDefaultRuntimeConfig(invocation));
     const explicit = invocation.explicit || new Set();
     const hostPort = selectedHostPort(invocation, 'selected outer runtime host port');
@@ -635,8 +460,8 @@ export function mergeDesiredRuntimeConfig(
         : existing?.requestedImage || existing?.image || REQUIRED_RUNTIME_IMAGE;
     desired.image = selectedImage;
     desired.requestedImage = selectedImage;
-    // Contract 4 is a clean security boundary. Never inherit privileged or
-    // broad seccomp settings from an inspected container during replacement.
+    // Contract 5 is a clean security boundary. Never treat privileged or broad
+    // seccomp settings from an inspected container as desired configuration.
     desired.contract = REQUIRED_RUNTIME_CONTRACT;
     desired.user = REQUIRED_IMAGE_USER;
     desired.privileged = false;
@@ -653,20 +478,20 @@ export function mergeDesiredRuntimeConfig(
     desired.labels[REQUESTED_IMAGE_LABEL] = selectedImage;
     desired.labels[IDENTITY_SCHEMA_LABEL] = IDENTITY_SCHEMA_VERSION;
     desired.labels[PATH_HASH_LABEL] = String(invocation.pathHash || '');
-    if (invocation._configurationLabels) {
-        Object.assign(desired.labels, invocation._configurationLabels);
-    }
-
-    if (!desired.routerPublish && (explicit.has('--port') || explicit.has('--listen-lan'))) {
-        desired.routerPublish = {
-            hostIp: invocation.listenLan ? '0.0.0.0' : '127.0.0.1',
-            hostPort,
-            containerPort: String(BOX_ROUTER_PORT),
-            protocol: 'tcp',
-        };
-    }
-    if (explicit.has('--port')) desired.routerPublish.hostPort = hostPort;
-    if (explicit.has('--listen-lan')) desired.routerPublish.hostIp = '0.0.0.0';
+    desired.routerPublish = {
+        hostIp: '127.0.0.1',
+        hostPort: explicit.has('--port')
+            ? hostPort
+            : String(existing?.routerPublish?.hostPort || hostPort),
+        containerPort: String(BOX_ROUTER_PORT),
+        protocol: 'tcp',
+    };
+    desired.udpReservation = {
+        hostIp: '0.0.0.0',
+        hostPort: String(BOX_MEDIA_PORT),
+        containerPort: String(BOX_MEDIA_PORT),
+        protocol: 'udp',
+    };
     if (explicit.has('--mount')) {
         const mountDir = invocation.mountDirResolved || invocation.mountDir;
         desired.mountDir = mountDir;
@@ -676,67 +501,42 @@ export function mergeDesiredRuntimeConfig(
             mountDir + ':/workspace/mounted',
         );
     }
-    const selectedExplicitPublishes = Array.isArray(invocation._selectedExplicitPublishes)
-        ? invocation._selectedExplicitPublishes
-        : null;
-    if (selectedExplicitPublishes) {
-        desired.extraPublishes = selectedExplicitPublishes.map(normalizePublishSpec);
-    } else if (explicit.has('--publish') || explicit.has('--expose')) {
-        desired.extraPublishes = invocation.publish.map(normalizePublishSpec);
-    }
-    desired.extraPublishes = mergeAndValidatePublishes(
-        desired.extraPublishes,
-        generatedPublishes.map(normalizePublishSpec),
-    );
-    const routerIdentity = desired.routerPublish
-        ? publishIdentity(desired.routerPublish)
-        : '';
-    desired.extraPublishes = desired.extraPublishes.filter(publish =>
-        !routerIdentity || publishIdentity(publish) !== routerIdentity
-    );
-    validateHostSocketClaims([
-        desired.routerPublish,
-        ...desired.extraPublishes,
-    ].filter(Boolean));
+    // Engine inspection evidence is validation-only. It must not become part
+    // of desired configuration when checking whether explicit options drift.
+    delete desired.observedPublishes;
     desired.env ||= {};
     desired.env.PLOINKY_RUNTIME_NAME = desired.instance;
-    const rawExtraPublishes = selectedExplicitPublishes
-        || (!existing || explicit.has('--publish') || explicit.has('--expose')
-            ? invocation.publish || []
-            : []);
-    return attachRawExtraPublishSpecs(desired, rawExtraPublishes);
+    return desired;
 }
 
 export function diffRuntimeConfig(actual, desired) {
     const fields = [
         'instance', 'image', 'user', 'privileged', 'sourceDir', 'mountDir',
-        'binds', 'volumes', 'routerPublish', 'extraPublishes', 'devices',
+        'binds', 'volumes', 'routerPublish', 'udpReservation', 'devices',
         'capAdds', 'securityOpts', 'env', 'labels',
     ];
-    return fields.filter(field => {
-        if (field === 'extraPublishes') {
-            return !publishesSemanticallyEqual(actual[field], desired[field]);
-        }
-        return JSON.stringify(actual[field]) !== JSON.stringify(desired[field]);
-    });
+    return fields.filter(field =>
+        JSON.stringify(actual[field]) !== JSON.stringify(desired[field])
+    );
 }
 
 export function planReconciliation({ existing, desired, contractMatches }) {
     if (!existing) return { action: 'create', reasons: ['missing'] };
     const reasons = diffRuntimeConfig(existing, desired);
     if (!contractMatches) reasons.unshift('runtime-contract');
-    if (reasons.length > 0) return { action: 'replace', reasons };
+    if (reasons.length > 0) return { action: 'recreate-required', reasons };
     if (!existing.running) return { action: 'start', reasons: [] };
     return { action: 'reuse', reasons: [] };
 }
 
 export function buildRuntimeRunArgs(config, engineOptions = {}) {
     if (config.privileged) {
-        throw new Error('runtime contract 4 forbids privileged outer containers');
+        throw new Error('runtime contract 5 forbids privileged outer containers');
     }
     if ((config.capAdds || []).length > 0) {
-        throw new Error('runtime contract 4 forbids added outer-container capabilities');
+        throw new Error('runtime contract 5 forbids added outer-container capabilities');
     }
+    assertFixedRuntimePublications(config);
     const args = ['run', '-d', '--init', '--name', config.instance];
     if (config.user) args.push('--user', config.user);
     for (const [key, value] of Object.entries(config.labels || {})) {
@@ -752,18 +552,8 @@ export function buildRuntimeRunArgs(config, engineOptions = {}) {
     if (engineOptions.selinux && !config.securityOpts.includes('label=disable')) {
         args.push('--security-opt', 'label=disable');
     }
-    const rawExtraPublishes = config[RAW_EXTRA_PUBLISH_SPECS] || new Map();
-    const publishes = [
-        ...(config.routerPublish
-            ? [{ publish: config.routerPublish, rawSpec: '' }]
-            : []),
-        ...config.extraPublishes.map(publish => ({
-            publish,
-            rawSpec: rawExtraPublishes.get(publishIdentity(publish)),
-        })),
-    ];
-    for (const { publish, rawSpec } of publishes) {
-        args.push('-p', rawSpec || publishSpec(publish));
+    for (const publish of [config.routerPublish, config.udpReservation]) {
+        args.push('-p', publishSpec(publish));
     }
     args.push(
         '-v', `${config.volumes.workspace}:/workspace`,
@@ -785,4 +575,53 @@ export function buildRuntimeRunArgs(config, engineOptions = {}) {
     }
     args.push(config.imageId || config.image);
     return args;
+}
+
+export function assertFixedRuntimePublications(config) {
+    const router = config?.routerPublish;
+    const media = config?.udpReservation;
+    const routerPort = String(parseSelectedHostPort(router?.hostPort, {
+        source: 'runtime contract 5 router host port',
+    }));
+    const expectedRouter = {
+        hostIp: '127.0.0.1',
+        hostPort: routerPort,
+        containerPort: String(BOX_ROUTER_PORT),
+        protocol: 'tcp',
+    };
+    const expectedMedia = {
+        hostIp: '0.0.0.0',
+        hostPort: String(BOX_MEDIA_PORT),
+        containerPort: String(BOX_MEDIA_PORT),
+        protocol: 'udp',
+    };
+    if (JSON.stringify(router) !== JSON.stringify(expectedRouter)) {
+        throw new Error(
+            `runtime contract 5 requires ${publishSpec(expectedRouter)} as its only TCP publication`,
+        );
+    }
+    if (JSON.stringify(media) !== JSON.stringify(expectedMedia)) {
+        throw new Error(
+            `runtime contract 5 requires ${publishSpec(expectedMedia)} as its fixed UDP reservation`,
+        );
+    }
+    if (Object.hasOwn(config || {}, 'observedPublishes')) {
+        const expectedObserved = normalizedPublishes({
+            [`${BOX_ROUTER_PORT}/tcp`]: [{
+                HostIp: expectedRouter.hostIp,
+                HostPort: expectedRouter.hostPort,
+            }],
+            [`${BOX_MEDIA_PORT}/udp`]: [{
+                HostIp: expectedMedia.hostIp,
+                HostPort: expectedMedia.hostPort,
+            }],
+        });
+        if (JSON.stringify(config.observedPublishes) !== JSON.stringify(expectedObserved)) {
+            throw new Error(
+                'runtime contract 5 requires exactly two outer publications; observed '
+                + JSON.stringify(config.observedPublishes),
+            );
+        }
+    }
+    return [expectedRouter, expectedMedia];
 }

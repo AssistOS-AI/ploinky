@@ -2,6 +2,7 @@
 // Public host supervisor for the managed Ploinky outer runtime.
 import { spawnSync } from 'node:child_process';
 import crypto from 'node:crypto';
+import dgram from 'node:dgram';
 import net from 'node:net';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -9,25 +10,20 @@ import path from 'node:path';
 import readline from 'node:readline';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { setTimeout as sleep } from 'node:timers/promises';
-import { plannerRequestForCommand } from '../cli/services/boxPublicationCoverage.js';
 import { showHelp } from '../cli/services/help.js';
 import { loadEnvFile } from '../cli/services/masterKey.js';
-import { parseRouterPort } from '../cli/services/routerPort.js';
-import { parseExplicitPublishSpec } from './publish-spec.mjs';
 import { createEngineClient } from './runtime-engine.mjs';
 import {
     IDENTITY_SCHEMA_LABEL,
     IDENTITY_SCHEMA_VERSION,
+    BOX_MEDIA_PORT,
     BOX_ROUTER_PORT,
-    EXPLICIT_PUBLISHES_LABEL,
-    GENERATED_PUBLISHES_LABEL,
     PATH_HASH_LABEL,
-    PUBLISH_PLAN_VERSION_LABEL,
     REQUESTED_IMAGE_LABEL,
-    REQUIRED_PUBLISH_PLAN_VERSION,
     REQUIRED_RUNTIME_CONTRACT,
     REQUIRED_RUNTIME_IMAGE,
     VOLUME_ROLES,
+    assertFixedRuntimePublications,
     buildRuntimeRunArgs,
     buildVolumeCreateArgs,
     createDefaultRuntimeConfig,
@@ -35,6 +31,7 @@ import {
     normalizeContainerInspect,
     normalizeImageInspect,
     normalizeVolumeInspect,
+    parseSelectedHostPort,
     planReconciliation,
     runtimeVolumeNames,
     validateImageContract,
@@ -47,11 +44,8 @@ const BOX_PREFIX = 'ploinky-box';
 const ENGINE_NAMES = Object.freeze(['podman', 'docker']);
 const CREATION_FLAGS = new Set([
     '--port',
-    '--publish',
-    '--expose',
     '--image',
     '--mount',
-    '--listen-lan',
 ]);
 const SOURCE_MARKERS = ['bin/ploinky', 'cli/index.js', 'globalDeps/package.json'];
 const DEFAULT_SOURCE_BRANCHES = new Set(['main', 'master', 'HEAD']);
@@ -61,9 +55,6 @@ const BRANCH_POLICY_FLAGS = new Set([
     '--branch-fallback',
     '--reset-repos',
 ]);
-const PLANNER_ENTRY = '/opt/ploinky/container/box-start-publish-plan.mjs';
-const PLANNER_TIMEOUT_MS = 10 * 60 * 1000;
-const MAX_PROVENANCE_LABEL_BYTES = 64 * 1024;
 const HOST_LOCK_TIMEOUT_MS = 10 * 60 * 1000;
 const HOST_LOCK_RETRY_MS = 100;
 const HOST_LOCK_STALE_GRACE_MS = 2000;
@@ -90,7 +81,7 @@ Commands:
   p-cli                          Alias for ploinky
   ploinky cli                    Open Bash as podman in /workspace
   ploinky cli <agent> [args...]  Attach to an agent manifest CLI
-  ploinky start ...              Plan publications, start the graph, and probe readiness
+  ploinky start ...              Start the graph and probe readiness
   ploinky status                 Combined read-only runtime and core status
   ploinky stop                   Stop core services, then the outer runtime
   ploinky destroy                Confirm and remove the outer runtime; retain named volumes
@@ -98,11 +89,8 @@ Commands:
 
 Outer options (must precede the command):
   --port N          Host port for the router (default 8080)
-  --publish SPEC    Extra host-to-runtime publish; repeatable, same form as -p
-  --expose SPEC     Alias for --publish; repeatable
-  --image I         Contract-4 runtime image (default ${DEFAULT_IMAGE})
+  --image I         Contract-5 runtime image (default ${DEFAULT_IMAGE})
   --mount DIR       Bind DIR read-write at /workspace/mounted
-  --listen-lan      Publish the router on 0.0.0.0 instead of 127.0.0.1
   --dry-run         Print mutations instead of executing them
   -h, --help        Show host help
 
@@ -127,9 +115,7 @@ export function parseHostInvocation(argv, _env = process.env) {
         mountDir: '',
         mountDirResolved: '',
         sourceDirResolved: '',
-        listenLan: false,
         dryRun: false,
-        publish: [],
         explicit: new Set(),
         help: false,
         command: '',
@@ -178,19 +164,11 @@ export function parseHostInvocation(argv, _env = process.env) {
             invocation.port = assignedPort;
             continue;
         }
-        if (token === '--publish' || token === '--expose') {
-            invocation.publish.push(need(token));
-            continue;
+        if (token === '--publish' || token.startsWith('--publish=')) {
+            die('--publish is not supported by runtime contract 5; the outer box has exactly two fixed publications');
         }
-        const assignedPublish = assigned(token, '--publish');
-        if (assignedPublish !== null) {
-            invocation.publish.push(assignedPublish);
-            continue;
-        }
-        const assignedExpose = assigned(token, '--expose');
-        if (assignedExpose !== null) {
-            invocation.publish.push(assignedExpose);
-            continue;
+        if (token === '--expose' || token.startsWith('--expose=')) {
+            die('--expose is not supported by runtime contract 5; the outer box has exactly two fixed publications');
         }
         if (token === '--image') {
             invocation.image = need('--image');
@@ -210,11 +188,8 @@ export function parseHostInvocation(argv, _env = process.env) {
             invocation.mountDir = assignedMount;
             continue;
         }
-        if (token === '--listen-lan') {
-            invocation.listenLan = true;
-            invocation.explicit.add(token);
-            i += 1;
-            continue;
+        if (token === '--listen-lan' || token.startsWith('--listen-lan=')) {
+            die('--listen-lan is not supported by runtime contract 5; router TCP is physical-host loopback only');
         }
         if (token === '--dry-run') {
             invocation.dryRun = true;
@@ -599,11 +574,11 @@ function resultFailure(result) {
 
 export function assertRootlessPodmanEngine(engine) {
     if (!engine || engine.name !== 'podman') {
-        throw new SupervisorError('Ploinky runtime contract 4 requires rootless Podman; Docker and rootful Podman are unsupported');
+        throw new SupervisorError('Ploinky runtime contract 5 requires rootless Podman; Docker and rootful Podman are unsupported');
     }
     const result = engine.query(['info', '--format', '{{json .Host.Security.Rootless}}']);
     if (!result.ok || String(result.stdout || '').trim() !== 'true') {
-        throw new SupervisorError('Ploinky runtime contract 4 could not prove that the selected Podman engine is rootless');
+        throw new SupervisorError('Ploinky runtime contract 5 could not prove that the selected Podman engine is rootless');
     }
 }
 
@@ -999,354 +974,12 @@ export function inferPublicStartBranchArgs(args, env = process.env, sourceDir = 
     return ['--branch', branch];
 }
 
-function validatePublishSpecs(cfg) {
-    for (const spec of cfg.publish) {
-        try {
-            parseExplicitPublishSpec(spec);
-        } catch (error) {
-            die(`invalid --publish '${spec}': ${error?.message || error}`);
-        }
-    }
-}
-
 function validateHostPort(value, label) {
     try {
-        return String(parseRouterPort(value, { source: label }));
+        return String(parseSelectedHostPort(value, { source: label }));
     } catch (error) {
         die(error?.message || String(error));
     }
-}
-
-export function publicationContractForPlan(plan = {}) {
-    const rawPublishes = (plan.publishes || []).map(entry =>
-        typeof entry === 'string' ? entry : entry.spec
-    ).filter(Boolean);
-    const targets = rawPublishes.map(spec => {
-        const parsed = parseExplicitPublishSpec(spec);
-        return {
-            start: parsed.containerTarget.start,
-            end: parsed.containerTarget.end,
-            protocol: parsed.protocol,
-        };
-    });
-    return { schemaVersion: 2, targets, publishes: rawPublishes };
-}
-
-function rawPublishList(values, field) {
-    if (values === undefined) return [];
-    if (!Array.isArray(values)) die(`publication planner field '${field}' must be an array`);
-    return values.map((entry, index) => {
-        const raw = typeof entry === 'string' ? entry : entry?.spec;
-        if (typeof raw !== 'string' || !raw.trim()) {
-            die(`publication planner field '${field}' has an invalid entry at index ${index}`);
-        }
-        try {
-            parseExplicitPublishSpec(raw);
-        } catch (error) {
-            die(`publication planner field '${field}' has invalid publish '${raw}': ${error.message || error}`);
-        }
-        return raw;
-    });
-}
-
-function provenanceLabelValue(values, label) {
-    const value = JSON.stringify(values);
-    if (Buffer.byteLength(value) > MAX_PROVENANCE_LABEL_BYTES) {
-        die(`${label} exceeds the ${MAX_PROVENANCE_LABEL_BYTES}-byte provenance limit`);
-    }
-    return value;
-}
-
-function parseProvenanceList(existing, label) {
-    const raw = existing.labels?.[label];
-    if (typeof raw !== 'string' || Buffer.byteLength(raw) > MAX_PROVENANCE_LABEL_BYTES) {
-        die(`runtime '${existing.instance}' is unsupported: ${label} is missing or oversized; run ploinky destroy explicitly`);
-    }
-    let parsed;
-    try {
-        parsed = JSON.parse(raw);
-    } catch (error) {
-        die(`runtime '${existing.instance}' is unsupported: ${label} is malformed (${error.message}); run ploinky destroy explicitly`);
-    }
-    try {
-        return rawPublishList(parsed, label);
-    } catch (error) {
-        die(`runtime '${existing.instance}' is unsupported: ${error.message || error}; run ploinky destroy explicitly`);
-    }
-}
-
-function publicationProvenance(existing) {
-    if (!existing) return { explicitPublishes: [], generatedPublishes: [] };
-    const observedVersion = existing.labels?.[PUBLISH_PLAN_VERSION_LABEL];
-    if (observedVersion !== REQUIRED_PUBLISH_PLAN_VERSION) {
-        die(`runtime '${existing.instance}' is unsupported: ${PUBLISH_PLAN_VERSION_LABEL} is missing or mismatched; run ploinky destroy explicitly`);
-    }
-    return {
-        explicitPublishes: parseProvenanceList(existing, EXPLICIT_PUBLISHES_LABEL),
-        generatedPublishes: parseProvenanceList(existing, GENERATED_PUBLISHES_LABEL),
-    };
-}
-
-function selectedExplicitPublishes(invocation, existing) {
-    if (invocation.explicit.has('--publish') || invocation.explicit.has('--expose')) {
-        return rawPublishList(invocation.publish, 'explicitPublishes');
-    }
-    return publicationProvenance(existing).explicitPublishes;
-}
-
-export function applyAuthoritativePublicationPlan(invocation, plan = {}) {
-    if (!plan || Number(plan.schemaVersion) !== 2) {
-        die('publication planner returned an unsupported or missing schemaVersion');
-    }
-    const explicitPublishes = rawPublishList(plan.explicitPublishes, 'explicitPublishes');
-    const generatedPublishes = rawPublishList(plan.generatedPublishes, 'generatedPublishes');
-    const publishes = plan.publishes === undefined
-        ? [...explicitPublishes, ...generatedPublishes]
-        : rawPublishList(plan.publishes, 'publishes');
-    if (JSON.stringify(publishes) !== JSON.stringify([...explicitPublishes, ...generatedPublishes])) {
-        die('publication planner combined publishes do not equal explicitPublishes plus generatedPublishes');
-    }
-    const normalizedPlan = {
-        ...plan,
-        explicitPublishes,
-        generatedPublishes,
-        publishes,
-    };
-    invocation._selectedExplicitPublishes = explicitPublishes;
-    invocation._generatedPublishes = generatedPublishes;
-    invocation._configurationLabels = {
-        ...(invocation._configurationLabels || {}),
-        [PUBLISH_PLAN_VERSION_LABEL]: REQUIRED_PUBLISH_PLAN_VERSION,
-        [EXPLICIT_PUBLISHES_LABEL]: provenanceLabelValue(
-            explicitPublishes,
-            EXPLICIT_PUBLISHES_LABEL,
-        ),
-        [GENERATED_PUBLISHES_LABEL]: provenanceLabelValue(
-            generatedPublishes,
-            GENERATED_PUBLISHES_LABEL,
-        ),
-    };
-    invocation._publicationPlan = normalizedPlan;
-    invocation._outerPublicationContract = publicationContractForPlan(normalizedPlan);
-    return invocation;
-}
-
-function plannerContainerName(cfg) {
-    return `${instanceName(cfg)}-planner-${process.pid}-${crypto.randomBytes(4).toString('hex')}`;
-}
-
-function plannerRequestInput(request) {
-    return `${JSON.stringify(request)}\n`;
-}
-
-function parsePlannerResult(result, context) {
-    if (!result?.ok) {
-        const detail = result?.timedOut
-            ? `timed out after ${PLANNER_TIMEOUT_MS}ms`
-            : result?.overflow
-                ? 'exceeded the planner output limit'
-                : resultFailure(result);
-        die(`publication planner ${context} failed: ${detail}`);
-    }
-    if (String(result.stderr || '').trim()) {
-        die(`publication planner ${context} wrote unexpected stderr: ${String(result.stderr).trim()}`);
-    }
-    const raw = String(result.stdout || '').trim();
-    if (!raw) die(`publication planner ${context} returned no JSON`);
-    let plan;
-    try {
-        plan = JSON.parse(raw);
-    } catch (error) {
-        die(`publication planner ${context} returned malformed JSON: ${error.message}`);
-    }
-    return plan;
-}
-
-async function capturePlannerCommand(cfg, args, request, context) {
-    const engine = engineClientFor(cfg);
-    if (typeof engine.capture !== 'function') {
-        die('selected engine client does not support captured planner execution');
-    }
-    const controller = new AbortController();
-    let interrupted = '';
-    const handlers = new Map(['SIGINT', 'SIGTERM'].map(signal => [
-        signal,
-        () => {
-            interrupted ||= signal;
-            controller.abort();
-        },
-    ]));
-    for (const [signal, handler] of handlers) process.once(signal, handler);
-    let result;
-    try {
-        result = await engine.capture(args, {
-            input: plannerRequestInput(request),
-            timeoutMs: PLANNER_TIMEOUT_MS,
-            maxBuffer: 4 * 1024 * 1024,
-            signal: controller.signal,
-        });
-    } finally {
-        for (const [signal, handler] of handlers) process.removeListener(signal, handler);
-    }
-    if (interrupted) {
-        throw new SupervisorError(
-            `publication planner interrupted by ${interrupted}`,
-            interrupted === 'SIGINT' ? 130 : 143,
-        );
-    }
-    return parsePlannerResult(result, context);
-}
-
-function plannerTempRunArgs(cfg, containerName, imageId) {
-    const args = [
-        'run',
-        '-i',
-        '--name', containerName,
-        '--user', 'podman',
-        '--entrypoint', 'node',
-    ];
-    if (engineSelinuxEnabled(cfg)) args.push('--security-opt', 'label=disable');
-    args.push(
-        '-v', `${volumeNames(cfg).workspace}:/workspace`,
-        '-v', `${cfg.sourceDirResolved}:/opt/ploinky:ro`,
-        imageId,
-        PLANNER_ENTRY,
-    );
-    return args;
-}
-
-async function runTemporaryPlanner(cfg, imageId, request, mode) {
-    prepareSource(cfg);
-    ensureRuntimeVolumes(cfg, ['workspace']);
-    const name = plannerContainerName(cfg);
-    let plan;
-    let plannerError;
-    try {
-        plan = await capturePlannerCommand(
-            cfg,
-            plannerTempRunArgs(cfg, name, imageId),
-            request,
-            `${mode} container '${name}'`,
-        );
-    } catch (error) {
-        plannerError = error;
-    }
-    runEngine(cfg, ['rm', '-f', '--volumes', name], {
-        allowFail: true,
-        silence: 'all',
-    });
-    const remains = query(cfg, ['container', 'inspect', name]);
-    const cleanupFailed = remains.ok || !recognizedMissing(remains, 'container', name);
-    if (cleanupFailed) {
-        const cleanupError = new SupervisorError(
-            `failed to remove temporary publication planner '${name}'`,
-        );
-        if (plannerError) {
-            throw new AggregateError(
-                [plannerError, cleanupError],
-                `publication planning failed and temporary planner cleanup failed: ${plannerError.message || plannerError}; ${cleanupError.message}`,
-            );
-        }
-        throw cleanupError;
-    }
-    if (plannerError) throw plannerError;
-    return plan;
-}
-
-async function executePublicationPlanner(cfg, request, existing) {
-    const deps = runtimeDependencies(cfg);
-    if (typeof deps.preparePublicationPlan === 'function') {
-        return deps.preparePublicationPlan(request, { invocation: cfg, existing });
-    }
-    if (cfg.dryRun) {
-        output(cfg, `DRY-RUN: publication planner request ${JSON.stringify(request)}\n`);
-        return {
-            schemaVersion: 2,
-            operation: request.operation,
-            explicitPublishes: request.explicitPublishes || [],
-            generatedPublishes: [],
-            publishes: request.explicitPublishes || [],
-        };
-    }
-    if (existing?.running) {
-        return capturePlannerCommand(
-            cfg,
-            [
-                'exec', '-i', '-w', '/workspace', existing.instance,
-                'node', PLANNER_ENTRY,
-            ],
-            request,
-            `exec in running box '${existing.instance}'`,
-        );
-    }
-    if (existing) {
-        return runTemporaryPlanner(
-            cfg,
-            existing.imageId,
-            request,
-            'stopped-box',
-        );
-    }
-    const image = obtainAndValidateImage(cfg, cfg.image, { forcePull: true });
-    if (!image) die(`publication planner could not resolve '${cfg.image}' to a validated image ID`);
-    cfg._preparedCreateImage = { reference: cfg.image, image };
-    return runTemporaryPlanner(cfg, image.id, request, 'missing-box');
-}
-
-function plannerRequestForHostCommand(cfg, command, args, existing) {
-    let request = plannerRequestForCommand(command, args, {
-        routerPort: BOX_ROUTER_PORT,
-    });
-    if (
-        !request
-        && (cfg.explicit.has('--publish') || cfg.explicit.has('--expose'))
-        && existing
-    ) {
-        request = {
-            schemaVersion: 2,
-            operation: 'start',
-            routerPort: BOX_ROUTER_PORT,
-            includeEnabled: true,
-        };
-    }
-    if (!request) return null;
-    return {
-        ...request,
-        explicitPublishes: selectedExplicitPublishes(cfg, existing),
-    };
-}
-
-function applyRetainedPublicationState(cfg, existing) {
-    const provenance = existing
-        ? existing.publicationProvenance || publicationProvenance(existing)
-        : { explicitPublishes: rawPublishList(cfg.publish, 'explicitPublishes'), generatedPublishes: [] };
-    const explicitPublishes = selectedExplicitPublishes(cfg, existing);
-    const generatedPublishes = provenance.generatedPublishes;
-    applyAuthoritativePublicationPlan(cfg, {
-        schemaVersion: 2,
-        operation: 'retained',
-        explicitPublishes,
-        generatedPublishes,
-        publishes: [...explicitPublishes, ...generatedPublishes],
-    });
-}
-
-async function prepareHostPublicationPlan(cfg, command, args) {
-    cfg.port = validateHostPort(cfg.port, `${cfg.command || 'runtime'}: host port`);
-    validatePublishSpecs(cfg);
-    const existing = preflightExistingRuntimeBeforePlanning(cfg);
-    const request = plannerRequestForHostCommand(cfg, command, args, existing);
-    if (!request) {
-        applyRetainedPublicationState(cfg, existing);
-        return null;
-    }
-    const plan = await executePublicationPlanner(cfg, request, existing);
-    const returnedExplicit = rawPublishList(plan?.explicitPublishes, 'explicitPublishes');
-    if (JSON.stringify(returnedExplicit) !== JSON.stringify(request.explicitPublishes || [])) {
-        die('publication planner changed the ordered explicit publication request');
-    }
-    applyAuthoritativePublicationPlan(cfg, plan);
-    return plan;
 }
 
 function inspectedImage(cfg, imageRef) {
@@ -1413,8 +1046,12 @@ function validateExistingRuntime(cfg, existing) {
         existing.routerPublish.hostPort,
         `runtime '${existing.instance}' ${BOX_ROUTER_PORT}/tcp host port`,
     );
+    try {
+        assertFixedRuntimePublications(existing);
+    } catch (error) {
+        die(`runtime '${existing.instance}' is unsupported: ${error.message}; run ploinky destroy explicitly`);
+    }
     existing.contract = image.contract;
-    existing.publicationProvenance = publicationProvenance(existing);
     return image;
 }
 
@@ -1500,6 +1137,118 @@ function portInUse(port, host = '127.0.0.1', timeoutMs = 500) {
     });
 }
 
+function udpPortInUse(port, host = '0.0.0.0') {
+    return new Promise((resolve, reject) => {
+        const socket = dgram.createSocket('udp4');
+        let settled = false;
+        const finish = (error, value) => {
+            if (settled) return;
+            settled = true;
+            try { socket.close(); } catch (_) {}
+            if (error) reject(error);
+            else resolve(value);
+        };
+        socket.once('error', error => {
+            if (error?.code === 'EADDRINUSE') finish(null, true);
+            else finish(error);
+        });
+        socket.once('listening', () => finish(null, false));
+        socket.bind(Number(port), host);
+    });
+}
+
+function parseEngineContainerRecords(raw, engine) {
+    let parsed;
+    try {
+        parsed = JSON.parse(String(raw || ''));
+    } catch (error) {
+        throw new SupervisorError(
+            `cannot parse ${engine} container inventory while checking ${BOX_MEDIA_PORT}/udp: ${error.message}`,
+        );
+    }
+    return Array.isArray(parsed) ? parsed : [parsed];
+}
+
+export function fixedUdpOwnersFromContainerInspects(engine, inspected, ignoredNames = []) {
+    const ignored = new Set(ignoredNames.map(value => String(value).replace(/^\//, '')));
+    const owners = [];
+    for (const record of inspected || []) {
+        const name = String(record?.Name || record?.Names?.[0] || '').replace(/^\//, '');
+        if (!name || ignored.has(name)) continue;
+        const running = record?.State?.Running === true
+            || String(record?.State?.Status || '').trim().toLowerCase() === 'running';
+        if (!running) continue;
+        for (const [target, bindings] of Object.entries(
+            record?.HostConfig?.PortBindings || {},
+        )) {
+            if (!String(target).toLowerCase().endsWith('/udp')) continue;
+            for (const binding of bindings || []) {
+                if (String(binding?.HostPort || '') !== String(BOX_MEDIA_PORT)) continue;
+                owners.push({
+                    engine,
+                    container: name,
+                    hostIp: String(binding?.HostIp || '0.0.0.0'),
+                    hostPort: String(binding.HostPort),
+                });
+            }
+        }
+    }
+    return owners;
+}
+
+function inspectFixedUdpOwners(cfg, ignoredNames = []) {
+    const clients = cfg._engineContext?.clients
+        || { [cfg.engine]: engineClientFor(cfg) };
+    const owners = [];
+    for (const [engine, client] of Object.entries(clients)) {
+        const listed = client.query(['ps', '--all', '--format', '{{.Names}}']);
+        if (!listed.ok) {
+            die(`cannot inventory ${engine} containers while checking fixed ${BOX_MEDIA_PORT}/udp: ${resultFailure(listed)}`);
+        }
+        const names = String(listed.stdout || '').split(/\r?\n/).map(value => value.trim()).filter(Boolean);
+        for (const name of names) {
+            const result = client.query(['container', 'inspect', name]);
+            if (!result.ok) {
+                die(`cannot inspect ${engine} container '${name}' while checking fixed ${BOX_MEDIA_PORT}/udp: ${resultFailure(result)}`);
+            }
+            owners.push(...fixedUdpOwnersFromContainerInspects(
+                engine,
+                parseEngineContainerRecords(result.stdout, engine),
+                ignoredNames,
+            ));
+        }
+    }
+    return owners;
+}
+
+async function assertFixedUdpAvailable(cfg, ignoredNames = []) {
+    if (cfg.dryRun) return;
+    const dependencies = runtimeDependencies(cfg);
+    const owners = typeof dependencies.fixedUdpOwners === 'function'
+        ? await dependencies.fixedUdpOwners(cfg, ignoredNames)
+        : inspectFixedUdpOwners(cfg, ignoredNames);
+    if (owners.length > 0) {
+        const detail = owners.map(owner => (
+            `${owner.engine} container '${owner.container}' (${owner.hostIp}:${owner.hostPort}/udp)`
+        )).join(', ');
+        die(
+            `physical-host UDP ${BOX_MEDIA_PORT} is already reserved by ${detail}; stop/remove that owner before creating this Ploinky box`,
+        );
+    }
+    const probe = dependencies.udpPortInUse || udpPortInUse;
+    let occupied;
+    try {
+        occupied = await probe(BOX_MEDIA_PORT, '0.0.0.0');
+    } catch (error) {
+        die(`cannot prove physical-host UDP ${BOX_MEDIA_PORT} availability: ${error.message || error}`);
+    }
+    if (occupied) {
+        die(
+            `physical-host UDP ${BOX_MEDIA_PORT} is already in use, but no container-engine owner was found; inspect owner-aware ss/lsof output and release the socket before retrying`,
+        );
+    }
+}
+
 async function waitHealthy(cfg, phase) {
     if (cfg.dryRun) return;
     const injected = runtimeDependencies(cfg).waitHealthy;
@@ -1566,17 +1315,6 @@ async function ensureDepsInstalled(cfg, { fatalOnDecline = false } = {}) {
     return true;
 }
 
-async function urlOk(cfg, url) {
-    try {
-        const response = await runtimeDependencies(cfg).fetch(url, {
-            signal: AbortSignal.timeout(2000),
-        });
-        return response.ok;
-    } catch {
-        return false;
-    }
-}
-
 function askLine(promptText) {
     return new Promise(resolve => {
         process.stdout.write(promptText);
@@ -1594,19 +1332,14 @@ function askLine(promptText) {
 
 export async function reconcileRuntime(cfg, { fatalOnDepsDecline = false } = {}) {
     cfg.port = validateHostPort(cfg.port, `${cfg.command || 'runtime'}: host port`);
-    validatePublishSpecs(cfg);
     // Persist the engine's SELinux requirement in desired state so a container
-    // created with label=disable converges instead of being replaced forever.
+    // created with label=disable converges instead of reporting perpetual drift.
     cfg._selinuxEnabled = engineSelinuxEnabled(cfg);
     const existing = inspectExistingRuntimeConfig(cfg);
     if (existing) validateExistingRuntime(cfg, existing);
     if (!existing || cfg.explicit.has('--mount')) prepareMount(cfg);
     if (!existing) prepareSource(cfg);
-    const desired = mergeDesiredRuntimeConfig(
-        cfg,
-        existing,
-        cfg._generatedPublishes || [],
-    );
+    const desired = mergeDesiredRuntimeConfig(cfg, existing);
     const plan = planReconciliation({
         existing,
         desired,
@@ -1641,6 +1374,7 @@ export async function reconcileRuntime(cfg, { fatalOnDepsDecline = false } = {})
         if (!cfg.dryRun && desired.routerPublish && await portCheck(desired.routerPublish.hostPort)) {
             die(`host port ${cfg.port} is already in use; choose another with --port`);
         }
+        await assertFixedUdpAvailable(cfg);
         const prepared = cfg._preparedCreateImage;
         const image = prepared?.reference === desired.image
             ? prepared.image
@@ -1672,13 +1406,12 @@ export async function reconcileRuntime(cfg, { fatalOnDepsDecline = false } = {})
             throw error;
         }
     }
-    case 'replace':
-        return replaceRuntimeTransaction({
-            cfg,
-            existing,
-            desired,
-            fatalOnDepsDecline,
-        });
+    case 'recreate-required':
+        throw new SupervisorError(
+            `runtime '${existing.instance}' configuration differs from contract-5 desired state `
+            + `(${plan.reasons.join(', ')}); run 'ploinky destroy' explicitly, then rerun `
+            + 'the original command to recreate the box',
+        );
     default:
         throw new SupervisorError(`unsupported runtime reconciliation action '${plan.action}'`);
     }
@@ -1706,104 +1439,14 @@ function removeNamedRuntimeForCleanup(cfg, instance) {
     }
 }
 
-export async function replaceRuntimeTransaction({
-    cfg,
-    existing,
-    desired,
-    fatalOnDepsDecline = false,
-}) {
-    const previous = structuredClone(existing);
-    const image = obtainAndValidateImage(cfg, desired.image, { forcePull: true });
-    if (image) {
-        desired.imageId = image.id;
-        desired.contract = image.contract;
-    }
-    ensureRuntimeVolumes(cfg);
-    const engineOptions = {
-        engine: cfg.engine,
-        selinux: cfg._selinuxEnabled,
-    };
-    const backupName = `${existing.instance}-rollback-${crypto.randomBytes(6).toString('hex')}`;
-    if (namedRuntimePresence(cfg, backupName)) {
-        throw new SupervisorError(`runtime replacement backup name collision: '${backupName}'`);
-    }
-    let backupCreated = false;
-
-    try {
-        if (existing.running) {
-            const stopArgs = ['exec'];
-            const stopEnv = appendCoreExecEnvironment(
-                stopArgs,
-                cfg,
-                existing.instance,
-                { coverage: false },
-            );
-            stopArgs.push(
-                '-w', '/workspace',
-                existing.instance,
-                'timeout', '30',
-                'ploinky', 'stop',
-            );
-            const coreCode = runEngine(cfg, stopArgs, {
-                allowFail: true,
-                silence: 'all',
-                env: stopEnv,
-            });
-            if (coreCode !== 0) {
-                throw new SupervisorError(
-                    `runtime replacement aborted: graceful core shutdown exited ${coreCode}`,
-                );
-            }
-            runEngine(cfg, ['stop', existing.instance], { silence: 'all' });
-        }
-        // Preserve the inspected container byte-for-byte during a supported
-        // current-contract configuration replacement. Renaming gives rollback
-        // the original object instead of reconstructing it from normalized args.
-        runEngine(cfg, ['rename', existing.instance, backupName], { silence: 'all' });
-        backupCreated = true;
-        runEngine(cfg, buildRuntimeRunArgs(desired, engineOptions));
-        await waitHealthy(cfg, 'replacement');
-        verifyNestedRootlessRuntime(cfg);
-        fixDepsOwnership(cfg);
-        if (!await ensureDepsInstalled(cfg, { fatalOnDecline: fatalOnDepsDecline })) {
-            throw new SupervisorError('Ploinky dependencies are required before running this command');
-        }
-        runEngine(cfg, ['rm', '-f', '--volumes', backupName], { silence: 'all' });
-        return { ...desired, state: 'running', running: true };
-    } catch (replacementError) {
-        const aggregateFailure = rollbackError => new AggregateError(
-            [replacementError, rollbackError],
-            'runtime replacement failed and rollback failed; '
-            + `replacement phase: ${replacementError.message || replacementError}; `
-            + `rollback phase: ${rollbackError.message || rollbackError}`,
-        );
-        if (!backupCreated) {
-            if (previous.running) {
-                try { runEngine(cfg, ['start', previous.instance], { silence: 'all' }); } catch (_) {}
-            }
-            throw replacementError;
-        }
-        try { removeNamedRuntimeForCleanup(cfg, desired.instance); } catch (cleanupError) { throw aggregateFailure(cleanupError); }
-        try {
-            runEngine(cfg, ['rename', backupName, previous.instance], { silence: 'all' });
-            if (previous.running) {
-                runEngine(cfg, ['start', previous.instance], { silence: 'all' });
-                await waitHealthy(cfg, 'rollback');
-            }
-        } catch (rollbackError) {
-            throw aggregateFailure(rollbackError);
-        }
-        throw new SupervisorError(
-            `runtime replacement failed; previous runtime restored: ${replacementError.message || replacementError}`,
-        );
-    }
-}
-
 async function probeRouter(cfg, port, attempts = 30) {
     for (let attempt = 0; attempt < attempts; attempt += 1) {
-        for (const suffix of ['status', 'health']) {
-            if (await urlOk(cfg, `http://127.0.0.1:${port}/${suffix}`)) return suffix;
-        }
+        const result = query(cfg, [
+            'exec', instanceName(cfg), 'node', '-e',
+            'const http=require("node:http");const req=http.get({socketPath:process.argv[1],path:"/health"},res=>{res.resume();process.exit(res.statusCode===200?0:1)});req.setTimeout(2000,()=>{req.destroy();process.exit(1)});req.on("error",()=>process.exit(1));',
+            '/workspace/.ploinky/run/router-health.sock',
+        ]);
+        if (result.ok) return 'health-socket';
         await runtimeDependencies(cfg).sleep(1000);
     }
     return null;
@@ -1934,11 +1577,6 @@ async function startGraph(cfg) {
         // --port option and must participate in existing-box reconciliation.
         cfg.explicit.add('--port');
     }
-    await prepareHostPublicationPlan(
-        cfg,
-        'start',
-        startPlan.inBoxArgs.slice(1),
-    );
     const runtime = await reconcileRuntime(cfg, { fatalOnDepsDecline: true });
     const published = cfg.dryRun ? cfg.port : (runtimeHostPort(cfg) || cfg.port);
     const coreCode = forwardCoreCommand(
@@ -1968,8 +1606,28 @@ function forwardingContext(cfg, runtime) {
     };
 }
 
-function appendCoreExecEnvironment(args, cfg, instance, { coverage = true } = {}) {
+function appendCoreExecEnvironment(args, cfg, instance) {
     args.push('-e', `PLOINKY_RUNTIME_NAME=${instance}`);
+    let routerHostPort;
+    if (cfg.dryRun) {
+        routerHostPort = validateHostPort(cfg.port, 'dry-run selected Router host port');
+    } else {
+        const inspected = inspectRuntimeIfPresent(engineClientFor(cfg), instance);
+        if (!inspected) {
+            throw new SupervisorError(`cannot derive Router host port: runtime '${instance}' is absent`);
+        }
+        try {
+            assertFixedRuntimePublications(inspected);
+            routerHostPort = String(parseSelectedHostPort(inspected.routerPublish?.hostPort, {
+                source: `inspected ${BOX_ROUTER_PORT}/tcp HostPort for runtime '${instance}'`,
+            }));
+        } catch (error) {
+            throw new SupervisorError(
+                `cannot derive Router host port from the fixed inspected ${BOX_ROUTER_PORT}/tcp publication: ${error?.message || error}`,
+            );
+        }
+    }
+    args.push('-e', `PLOINKY_ROUTER_HOST_PORT=${routerHostPort}`);
     const inherited = runtimeDependencies(cfg).env || process.env;
     const processValue = String(inherited.PLOINKY_MASTER_KEY || '').trim();
     const fileValue = processValue
@@ -1982,12 +1640,6 @@ function appendCoreExecEnvironment(args, cfg, instance, { coverage = true } = {}
         // Passing only the variable name keeps the secret out of argv, labels,
         // inspect output, diagnostics, and the persistent outer configuration.
         args.push('-e', 'PLOINKY_MASTER_KEY');
-    }
-    if (coverage && cfg._outerPublicationContract) {
-        args.push(
-            '-e',
-            `PLOINKY_OUTER_PUBLICATION_CONTRACT=${JSON.stringify(cfg._outerPublicationContract)}`,
-        );
     }
     return env;
 }
@@ -2034,7 +1686,7 @@ function printRuntimeSummary(stdout, runtime) {
     stdout.write(`runtime: ${runtime.instance} (${runtime.state})\n`);
     stdout.write(`image: ${runtime.requestedImage || runtime.configuredImage || '<unknown>'}\n`);
     stdout.write(`image-id: ${runtime.imageId || '<missing>'}\n`);
-    const publishes = [runtime.routerPublish, ...runtime.extraPublishes].filter(Boolean);
+    const publishes = [runtime.routerPublish, runtime.udpReservation].filter(Boolean);
     for (const publish of publishes) {
         stdout.write(
             `publish: ${publish.hostIp || '*'}:${publish.hostPort}`
@@ -2060,7 +1712,7 @@ export async function reportCombinedStatus({ engine, invocation, stdout }) {
         detail = image.contract || '<missing>';
         try {
             validateImageContract(image, inspected.imageId || inspected.configuredImage);
-            publicationProvenance(inspected);
+            assertFixedRuntimePublications(inspected);
             compatible = inspected.labels?.[IDENTITY_SCHEMA_LABEL] === IDENTITY_SCHEMA_VERSION
                 && inspected.labels?.[PATH_HASH_LABEL] === invocation.pathHash
                 && Boolean(inspected.requestedImage);
@@ -2079,12 +1731,7 @@ export async function reportCombinedStatus({ engine, invocation, stdout }) {
     );
     stdout.write(`health: ${healthy ? 'healthy' : 'unhealthy'}\n`);
     const statusArgs = ['exec'];
-    const statusEnv = appendCoreExecEnvironment(
-        statusArgs,
-        invocation,
-        instance,
-        { coverage: false },
-    );
+    const statusEnv = appendCoreExecEnvironment(statusArgs, invocation, instance);
     statusArgs.push(
         '-w', '/workspace',
         instance,
@@ -2106,12 +1753,7 @@ export function stopSystem({ engine, invocation, stdout, stderr }) {
         return 0;
     }
     const stopArgs = ['exec'];
-    const stopEnv = appendCoreExecEnvironment(
-        stopArgs,
-        invocation,
-        instance,
-        { coverage: false },
-    );
+    const stopEnv = appendCoreExecEnvironment(stopArgs, invocation, instance);
     stopArgs.push(
         '-w', '/workspace',
         instance,
@@ -2266,19 +1908,9 @@ export function createRuntimeSupervisor(dependencies = {}) {
                 // Read-only lifecycle commands retain access to incompatible
                 // boxes so an operator can inspect, stop, and explicitly destroy
                 // them. Every start/reconcile path proves the current contract
-                // and rootless Podman before planning or mutation.
+                // and rootless Podman before mutation.
                 assertRootlessPodmanEngine(context.client);
                 if (route.kind === 'start') return startGraph(invocation);
-
-                if (route.kind === 'ordinary') {
-                    await prepareHostPublicationPlan(
-                        invocation,
-                        invocation.command,
-                        invocation.args,
-                    );
-                } else {
-                    await prepareHostPublicationPlan(invocation, '', []);
-                }
 
                 const runtime = await reconcileRuntime(invocation, {
                     fatalOnDepsDecline: true,

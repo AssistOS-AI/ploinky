@@ -133,7 +133,7 @@ test('bwrap and seatbelt env builders consume one validated host endpoint withou
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-sandbox-router-'));
     try {
         fs.mkdirSync(path.join(root, '.ploinky'), { recursive: true });
-        fs.writeFileSync(path.join(root, '.ploinky', 'routing.json'), JSON.stringify({ port: 49123 }));
+        fs.writeFileSync(path.join(root, '.ploinky', 'routing.json'), JSON.stringify({ port: 8080 }));
         const script = `
             const { buildFullEnvMap } = await import(${JSON.stringify(bwrapServiceManagerUrl)});
             const { resolveRouterEndpoint } = await import(${JSON.stringify(pathToFileURL(path.join(repoRoot, 'cli/services/routerPort.js')).href)});
@@ -169,8 +169,8 @@ test('bwrap and seatbelt env builders consume one validated host endpoint withou
         assert.equal(result.status, 0, result.stderr || result.stdout);
         const expected = {
             host: '127.0.0.1',
-            port: '49123',
-            url: 'http://127.0.0.1:49123',
+            port: '8080',
+            url: 'http://127.0.0.1:8080',
         };
         assert.deepEqual(parseLastJsonLine(result.stdout), {
             bwrap: expected,
@@ -182,13 +182,121 @@ test('bwrap and seatbelt env builders consume one validated host endpoint withou
     }
 });
 
+test('managed sandbox env identity is bound to one exact instance and enable generation', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-sandbox-identity-'));
+    try {
+        const script = `
+            const { buildFullEnvMap } = await import(${JSON.stringify(bwrapServiceManagerUrl)});
+            const { buildRouterEndpoint } = await import(${JSON.stringify(pathToFileURL(path.join(repoRoot, 'cli/services/routerPort.js')).href)});
+            const { derivePrivateAgentRequestSecret } = await import(${JSON.stringify(pathToFileURL(path.join(repoRoot, 'cli/services/masterKey.js')).href)});
+            const endpoint = buildRouterEndpoint('host', 8080);
+            const runtimeIdentity = {
+                instanceId: 'instance-exact-1',
+                enableGeneration: 'enable-exact-1',
+            };
+            const principal = 'agent:repo/agent';
+            const work = ${JSON.stringify(path.join(root, 'work'))};
+            const result = {};
+            for (const runtime of ['bwrap', 'seatbelt']) {
+                const env = buildFullEnvMap(
+                    'agent', {}, {}, work, 'repo', 'default', runtime, null,
+                    endpoint, runtimeIdentity,
+                );
+                result[runtime] = {
+                    instanceId: env.PLOINKY_AGENT_INSTANCE_ID,
+                    enableGeneration: env.PLOINKY_AGENT_ENABLE_GENERATION,
+                    privateSecretMatches: env.PLOINKY_AGENT_PRIVATE_SECRET
+                        === derivePrivateAgentRequestSecret(
+                            principal,
+                            runtimeIdentity.instanceId,
+                            runtimeIdentity.enableGeneration,
+                        ),
+                };
+            }
+            let incompleteError = '';
+            try {
+                buildFullEnvMap(
+                    'agent', {}, {}, work, 'repo', 'default', 'bwrap', null,
+                    endpoint, { instanceId: runtimeIdentity.instanceId },
+                );
+            } catch (error) {
+                incompleteError = error.message;
+            }
+            console.log(JSON.stringify({ result, incompleteError }));
+        `;
+        const result = runModuleScript({
+            cwd: root,
+            env: {
+                PLOINKY_WORKSPACE_ROOT: root,
+                PLOINKY_MASTER_KEY: 'cd'.repeat(32),
+            },
+            script,
+        });
+        assert.equal(result.status, 0, result.stderr || result.stdout);
+        assert.deepEqual(parseLastJsonLine(result.stdout), {
+            result: {
+                bwrap: {
+                    instanceId: 'instance-exact-1',
+                    enableGeneration: 'enable-exact-1',
+                    privateSecretMatches: true,
+                },
+                seatbelt: {
+                    instanceId: 'instance-exact-1',
+                    enableGeneration: 'enable-exact-1',
+                    privateSecretMatches: true,
+                },
+            },
+            incompleteError: 'sandbox runtime identity requires exact instanceId and enableGeneration',
+        });
+    } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+    }
+});
+
+test('sandbox env construction fails closed when identity key material cannot be loaded', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-sandbox-identity-failure-'));
+    try {
+        fs.writeFileSync(path.join(root, '.ploinky'), 'not-a-directory');
+        const script = `
+            const { buildFullEnvMap } = await import(${JSON.stringify(bwrapServiceManagerUrl)});
+            const { buildRouterEndpoint } = await import(${JSON.stringify(pathToFileURL(path.join(repoRoot, 'cli/services/routerPort.js')).href)});
+            const endpoint = buildRouterEndpoint('host', 8080);
+            let failure = null;
+            try {
+                buildFullEnvMap(
+                    'agent', {}, {}, ${JSON.stringify(path.join(root, 'work'))},
+                    'repo', 'default', 'bwrap', null, endpoint,
+                    { instanceId: 'instance-fail', enableGeneration: 'generation-fail' },
+                );
+            } catch (error) {
+                failure = { code: error.code || '', message: error.message };
+            }
+            console.log(JSON.stringify({ failure }));
+        `;
+        const result = runModuleScript({
+            cwd: root,
+            env: {
+                PLOINKY_WORKSPACE_ROOT: root,
+                PLOINKY_MASTER_KEY: 'ef'.repeat(32),
+            },
+            script,
+        });
+        assert.equal(result.status, 0, result.stderr || result.stdout);
+        const evidence = parseLastJsonLine(result.stdout);
+        assert.ok(evidence.failure, 'identity key-store failure must escape env construction');
+        assert.match(evidence.failure.message, /not a directory|ENOTDIR|EEXIST/i);
+    } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+    }
+});
+
 test('profile environment and secrets cannot override sandbox router discovery', () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-sandbox-router-env-'));
     try {
         const script = `
             const { buildFullEnvMap } = await import(${JSON.stringify(bwrapServiceManagerUrl)});
             const { buildRouterEndpoint } = await import(${JSON.stringify(pathToFileURL(path.join(repoRoot, 'cli/services/routerPort.js')).href)});
-            const endpoint = buildRouterEndpoint('host', 49123);
+            const endpoint = buildRouterEndpoint('host', 8080);
             const profile = {
                 env: {
                     PLOINKY_ROUTER_HOST: 'profile.invalid',
@@ -223,8 +331,8 @@ test('profile environment and secrets cannot override sandbox router discovery',
         assert.equal(result.status, 0, result.stderr || result.stdout);
         const expected = {
             host: '127.0.0.1',
-            port: '49123',
-            url: 'http://127.0.0.1:49123',
+            port: '8080',
+            url: 'http://127.0.0.1:8080',
         };
         assert.deepEqual(parseLastJsonLine(result.stdout), {
             bwrap: expected,

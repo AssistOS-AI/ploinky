@@ -9,10 +9,6 @@ import path from 'node:path';
 import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 
-import { createMemoryReplayCache } from '../../Agent/lib/jwtVerify.mjs';
-import { computeRchHttp } from '../../Agent/lib/requestHash.mjs';
-import { verifyRouterRequestToken } from '../../Agent/lib/requestSignedTokens.mjs';
-import { deriveAgentRequestSecret } from '../../cli/services/masterKey.js';
 import { acceptWebSocketUpgrade, WebSocket } from '../../cli/server/utils/websocket.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -29,6 +25,7 @@ test('router proxies authenticated WebSocket upgrades to HTTP-service agents', a
         captured = {
             url: req.url,
             authInfo: req.headers['x-ploinky-auth-info'],
+            headers: req.headers,
         };
         const ws = acceptWebSocketUpgrade(req, socket, head);
         ws?.on('message', (message) => {
@@ -47,7 +44,21 @@ test('router proxies authenticated WebSocket upgrades to HTTP-service agents', a
         rmSync(fixture.workspace, { recursive: true, force: true });
     });
 
-    const localService = await import(`../../cli/server/auth/localService.js?e2e=${Date.now()}`);
+    const [
+        { createMemoryReplayCache },
+        { computeRchHttp },
+        { verifyRouterRequestToken },
+        { deriveAgentRequestSecret },
+        edgeGeneration,
+        localService,
+    ] = await Promise.all([
+        import('../../Agent/lib/jwtVerify.mjs'),
+        import('../../Agent/lib/requestHash.mjs'),
+        import('../../Agent/lib/requestSignedTokens.mjs'),
+        import(`../../cli/services/masterKey.js?e2e=${Date.now()}`),
+        import(`../../cli/services/edgeGeneration.js?e2e=${Date.now()}`),
+        import(`../../cli/server/auth/localService.js?e2e=${Date.now()}`),
+    ]);
     const authPolicy = { mode: 'local', usersVar: 'PLOINKY_AUTH_EXPLORER_USERS' };
     localService.createLocalAuthUser({
         policy: authPolicy,
@@ -61,7 +72,11 @@ test('router proxies authenticated WebSocket upgrades to HTTP-service agents', a
         password: 'correct horse battery staple',
     });
 
-    const routerPort = await getFreePort();
+    edgeGeneration.applyEdgeRoutingGeneration({
+        workspaceRoot: fixture.workspace,
+        reason: 'ws-proxy-e2e-fixture',
+    });
+    const routerPort = 8080;
     router = spawn(process.execPath, ['cli/server/RoutingServer.js'], {
         cwd: REPO_ROOT,
         env: {
@@ -80,6 +95,9 @@ test('router proxies authenticated WebSocket upgrades to HTTP-service agents', a
         url: `ws://127.0.0.1:${routerPort}/services/demo/management/ws/logs?tail=1`,
         headers: {
             cookie: `ploinky_jwt=${login.sessionId}`,
+            forwarded: 'host=attacker.invalid;proto=https',
+            'x-forwarded-host': 'attacker.invalid',
+            'x-forwarded-proto': 'https',
         },
     });
     const { statusCode } = connected;
@@ -92,6 +110,10 @@ test('router proxies authenticated WebSocket upgrades to HTTP-service agents', a
     assert.equal(message.toString('utf8'), 'echo:ping');
     assert.equal(captured?.url, '/internal/management/ws/logs?tail=1');
     assert.equal(typeof captured?.authInfo, 'string');
+    assert.equal(captured?.headers.host, '127.0.0.1:8080');
+    assert.equal(captured?.headers['x-forwarded-host'], '127.0.0.1:8080');
+    assert.equal(captured?.headers['x-forwarded-proto'], 'http');
+    assert.equal(captured?.headers.forwarded, undefined);
 
     const authInfo = JSON.parse(captured.authInfo);
     assert.equal(authInfo.user.id, 'local:admin');
@@ -133,10 +155,14 @@ function createRoutingFixture(servicePort) {
     const ploinkyDir = path.join(workspace, '.ploinky');
     const explorerManifestDir = path.join(ploinkyDir, 'repos', 'fixtures', 'explorer');
     const serviceManifestDir = path.join(ploinkyDir, 'repos', 'fixtures', 'demoService');
+    const edgeDir = path.join(ploinkyDir, 'data', 'edge-routing');
+    const policyDir = path.join(ploinkyDir, 'data', 'router-security');
     const routingFile = path.join(ploinkyDir, 'routing.json');
 
     mkdirSync(explorerManifestDir, { recursive: true });
     mkdirSync(serviceManifestDir, { recursive: true });
+    mkdirSync(edgeDir, { recursive: true });
+    mkdirSync(policyDir, { recursive: true });
     writeFileSync(path.join(explorerManifestDir, 'manifest.json'), JSON.stringify({ about: 'Explorer' }, null, 2));
     writeFileSync(path.join(serviceManifestDir, 'manifest.json'), JSON.stringify({
         httpServices: [{
@@ -151,12 +177,16 @@ function createRoutingFixture(servicePort) {
             type: 'agent',
             agentName: 'explorer',
             repoName: 'fixtures',
+            instanceId: 'explorer-instance',
+            enableGeneration: 'explorer-enable-generation',
             auth: { mode: 'local', usersVar: 'PLOINKY_AUTH_EXPLORER_USERS' },
         },
         demoService: {
             type: 'agent',
             agentName: 'demoService',
             repoName: 'fixtures',
+            instanceId: 'demo-service-instance',
+            enableGeneration: 'demo-service-enable-generation',
             auth: { mode: 'none' },
         },
     }, null, 2));
@@ -165,12 +195,14 @@ function createRoutingFixture(servicePort) {
             explorer: {
                 agent: 'explorer',
                 repo: 'fixtures',
+                container: 'explorer',
                 hostPort: 55289,
                 hostPath: explorerManifestDir,
             },
             demoService: {
                 agent: 'demoService',
                 repo: 'fixtures',
+                container: 'demoService',
                 hostPort: servicePort,
                 hostPath: serviceManifestDir,
             },
@@ -178,7 +210,21 @@ function createRoutingFixture(servicePort) {
         static: {
             agent: 'explorer',
             hostPath: explorerManifestDir,
+            port: 8080,
         },
+    }, null, 2));
+    writeFileSync(path.join(edgeDir, 'desired.json'), JSON.stringify({
+        schemaVersion: 1,
+        hosts: {},
+        security: {
+            hostNetworkAllowedInstances: [],
+            internalServiceConsumers: {},
+        },
+    }, null, 2));
+    writeFileSync(path.join(policyDir, 'policy-state.json'), JSON.stringify({
+        schema: 'router-policy',
+        httpRoutes: [],
+        mcpTools: [],
     }, null, 2));
 
     return { workspace, routingFile };
@@ -266,7 +312,10 @@ function connectWebSocketWithStatus({ url, headers = {} }) {
             const chunks = [];
             res.on('data', (chunk) => chunks.push(Buffer.from(chunk)));
             res.on('end', () => {
-                reject(new Error(`expected upgrade, got ${res.statusCode}: ${Buffer.concat(chunks).toString('utf8')}`));
+                reject(new Error(
+                    `expected upgrade, got ${res.statusCode} (${res.headers.location || 'no location'}): `
+                    + Buffer.concat(chunks).toString('utf8'),
+                ));
             });
         });
         req.on('error', reject);
@@ -284,17 +333,6 @@ function waitForMessage(ws, timeoutMs = 3000) {
         ws.once('error', (error) => {
             clearTimeout(timer);
             reject(error);
-        });
-    });
-}
-
-function getFreePort() {
-    const server = http.createServer();
-    return new Promise((resolve, reject) => {
-        server.once('error', reject);
-        server.listen(0, '127.0.0.1', () => {
-            const { port } = server.address();
-            server.close(() => resolve(port));
         });
     });
 }

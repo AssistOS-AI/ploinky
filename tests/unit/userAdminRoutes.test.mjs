@@ -10,6 +10,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const REPO_ROOT = path.resolve(__dirname, '../..');
 const MASTER_KEY = '3'.repeat(64);
+let mintAdminCsrfToken = null;
 
 class MockResponse {
     constructor() {
@@ -38,7 +39,7 @@ class MockResponse {
     }
 }
 
-function makeRequest({ method = 'GET', url, body, cookie = '' }) {
+function makeRequest({ method = 'GET', url, body, cookie = '', csrf = 'valid' }) {
     const chunks = body === undefined ? [] : [Buffer.from(JSON.stringify(body), 'utf8')];
     const req = Readable.from(chunks);
     req.method = method;
@@ -50,6 +51,13 @@ function makeRequest({ method = 'GET', url, body, cookie = '' }) {
         ...(body === undefined ? {} : { 'content-type': 'application/json' }),
     };
     req.socket = { encrypted: false };
+    if (['POST', 'PATCH', 'DELETE'].includes(method) && csrf !== 'missing') {
+        req.headers.origin = 'http://localhost';
+        const sessionId = String(cookie).split(';').map((part) => part.trim()).find((part) => part.startsWith('ploinky_jwt='))?.slice('ploinky_jwt='.length) || '';
+        req.headers['x-ploinky-csrf-token'] = csrf === 'valid' && mintAdminCsrfToken
+            ? mintAdminCsrfToken({ sessionId, req })
+            : 'v1.invalid';
+    }
     return req;
 }
 
@@ -108,6 +116,7 @@ test('user admin routes enforce admin access, CRUD, rev invalidation, and agent 
 
     const nonce = Date.now();
     const authHandlers = await import(`${pathToFileURL(path.join(REPO_ROOT, 'cli/server/authHandlers/index.js')).href}?test=${nonce}`);
+    ({ mintAdminCsrfToken } = await import(`${pathToFileURL(path.join(REPO_ROOT, 'cli/server/adminControlSecurity.js')).href}?test=${nonce}`));
     const localService = await import(`${pathToFileURL(path.join(REPO_ROOT, 'cli/server/auth/localService.js')).href}?test=${nonce}`);
     const passwordStore = await import(`${pathToFileURL(path.join(REPO_ROOT, 'cli/services/encryptedPasswordStore.js')).href}?test=${nonce}`);
     const passwords = await import(`${pathToFileURL(path.join(REPO_ROOT, 'cli/services/localAuthPasswords.js')).href}?test=${nonce}`);
@@ -200,6 +209,16 @@ test('user admin routes enforce admin access, CRUD, rev invalidation, and agent 
     });
     assert.equal(result.statusCode, 200);
     assert.equal(result.body.settings.loginBrandingName, 'Acme Workspace');
+
+    result = await invoke(authHandlers.handleUserAdminRoutes, {
+        method: 'PATCH',
+        url: '/api/agents/explorer/settings',
+        cookie: authCookie(explorerAdmin.sessionId),
+        csrf: 'missing',
+        body: { loginBrandingName: 'Cross-site mutation' },
+    });
+    assert.equal(result.statusCode, 403);
+    assert.equal(result.body.error, 'control_origin_required');
 
     result = await invoke(authHandlers.handleUserAdminRoutes, {
         url: '/api/agents/explorer/users',

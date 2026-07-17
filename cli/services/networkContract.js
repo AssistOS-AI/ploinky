@@ -150,13 +150,9 @@ export function assertNetworkStartupCompatibility(manifest, profileConfig, netwo
     const executionHasAgentServer = !String(manifest?.start || '').trim()
         || Boolean(String(manifest?.agent || manifest?.commands?.run || '').trim());
     const openPorts = profileConfig?.openPorts ?? manifest?.openPorts;
-    const additionalServerPort = profileConfig?.additionalServerPort ?? manifest?.additionalServerPort;
     if (executionHasAgentServer) fail(`${path}.network`, "mode 'none' rejects AgentServer startup");
     if (openPorts !== undefined && (!Array.isArray(openPorts) || openPorts.length > 0)) {
         fail(`${path}.network`, "mode 'none' rejects openPorts");
-    }
-    if (additionalServerPort !== undefined && additionalServerPort !== null && additionalServerPort !== '') {
-        fail(`${path}.network`, "mode 'none' rejects additionalServerPort");
     }
     if (readinessIsNetworkDependent(manifest)) {
         fail(`${path}.network`, "mode 'none' rejects MCP/HTTP/TCP readiness");

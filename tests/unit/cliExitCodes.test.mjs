@@ -19,9 +19,23 @@ const bootRepos = ['basic', 'AchillesIDE', 'AchillesCLI', 'copilot-agents'];
 
 function createWorkspace(t) {
     const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-cli-exit-'));
+    const ploinky = path.join(workspace, '.ploinky');
     for (const repoName of bootRepos) {
-        fs.mkdirSync(path.join(workspace, '.ploinky', 'repos', repoName), { recursive: true });
+        fs.mkdirSync(path.join(ploinky, 'repos', repoName), { recursive: true });
     }
+    fs.writeFileSync(path.join(ploinky, 'routing.json'), JSON.stringify({ routes: {} }));
+    fs.writeFileSync(path.join(ploinky, 'agents.json'), '{}');
+    fs.mkdirSync(path.join(ploinky, 'data', 'router-security'), { recursive: true });
+    fs.writeFileSync(
+        path.join(ploinky, 'data', 'router-security', 'policy-state.json'),
+        JSON.stringify({ schema: 'router-policy', httpRoutes: [], mcpTools: [] }),
+    );
+    fs.mkdirSync(path.join(ploinky, 'data', 'edge-routing'), { recursive: true });
+    fs.writeFileSync(path.join(ploinky, 'data', 'edge-routing', 'desired.json'), JSON.stringify({
+        schemaVersion: 1,
+        hosts: {},
+        security: { hostNetworkAllowedInstances: [], internalServiceConsumers: {} },
+    }));
     t.after(() => {
         fs.rmSync(workspace, { recursive: true, force: true });
     });
@@ -49,7 +63,7 @@ test('one-shot enable agent failure exits nonzero', (t) => {
 });
 
 test('one-shot start failure exits nonzero', (t) => {
-    const result = runPloinky(t, ['start', 'demo', '18080']);
+    const result = runPloinky(t, ['start', 'demo', '8080']);
 
     assert.notEqual(result.status, 0);
     assert.match(`${result.stdout}\n${result.stderr}`, /Agent 'demo' not found/);
@@ -60,6 +74,14 @@ test('one-shot start without initial configuration exits nonzero', (t) => {
 
     assert.notEqual(result.status, 0);
     assert.match(`${result.stdout}\n${result.stderr}`, /persisted router port is required/);
+});
+
+test('removed component-token rotation flags fail hard', (t) => {
+    for (const component of ['webchat', 'dashboard']) {
+        const result = runPloinky(t, [component, '--rotate']);
+        assert.notEqual(result.status, 0, `${component} unexpectedly accepted --rotate`);
+        assert.match(`${result.stdout}\n${result.stderr}`, new RegExp(`Usage: ${component}`));
+    }
 });
 
 test('enable repo marks an installed repository as enabled', (t) => {

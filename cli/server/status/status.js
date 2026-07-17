@@ -58,7 +58,7 @@
     const entries = Object.entries(servers || {});
     entries.forEach(([key, info]) => {
       const name = info.displayName || key;
-      const configured = Boolean(info.hasToken || info.agent || info.command || info.port);
+      const configured = Boolean(info.agent || info.command || info.port);
       const pillClass = configured ? '' : ' default';
       const label = configured ? 'service' : 'built-in';
       cards.push(`<div class="ps-item"><div class="ps-item-title">${name}<span class="ps-pill${pillClass}">${label}</span></div><div class="ps-item-status"></div></div>`);

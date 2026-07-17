@@ -1,5 +1,6 @@
 import fs from 'fs';
 import path from 'path';
+import crypto from 'node:crypto';
 
 import {
     buildCwdRelativePath,
@@ -13,6 +14,10 @@ import {
     resolveUploadTarget,
     sanitizeUploadRelativePath,
 } from '../../webchat/uploadPaths.js';
+import {
+    streamAdmittedUpload,
+    UPLOAD_ROUTE_POLICIES,
+} from '../uploadAdmission.js';
 
 const APP_NAME = 'webchat';
 const ROUTER_RESERVED_QUERY_KEYS = new Set([
@@ -96,12 +101,24 @@ function resolveUploadMetadataPath(context, sessionRelativePath) {
 function writeUploadMetadata(context, sessionRelativePath, metadata) {
     const target = resolveUploadMetadataPath(context, sessionRelativePath);
     if (!target) return false;
+    let temporaryPath = '';
+    let committed = false;
     try {
         fs.mkdirSync(target.metadataRoot, { recursive: true });
         if (!isRealPathInsideRoot(context.cwd, target.metadataRoot)) return false;
-        fs.writeFileSync(target.metadataPath, `${JSON.stringify(metadata)}\n`, { encoding: 'utf8', flag: 'wx' });
+        temporaryPath = `${target.metadataPath}.${process.pid}.${crypto.randomBytes(8).toString('hex')}.tmp`;
+        fs.writeFileSync(temporaryPath, `${JSON.stringify(metadata)}\n`, { encoding: 'utf8', flag: 'wx' });
+        fs.linkSync(temporaryPath, target.metadataPath);
+        committed = true;
+        fs.unlinkSync(temporaryPath);
         return true;
     } catch (_) {
+        if (temporaryPath) {
+            try { fs.unlinkSync(temporaryPath); } catch (_) { /* ignore */ }
+        }
+        if (committed) {
+            try { fs.unlinkSync(target.metadataPath); } catch (_) { /* ignore */ }
+        }
         return false;
     }
 }
@@ -144,7 +161,7 @@ export function resolveWebchatUploadContext({ workspaceBase, sessionId }) {
     };
 }
 
-export function handleWebchatUploadPost(req, res, parsedUrl, context) {
+export function handleWebchatUploadPost(req, res, parsedUrl, context, { policy, timers } = {}) {
     if (!context) {
         return writeJson(res, 400, { ok: false, error: 'invalid_session' });
     }
@@ -179,50 +196,56 @@ export function handleWebchatUploadPost(req, res, parsedUrl, context) {
         return writeJson(res, 500, { ok: false, error: 'mkdir_failed' });
     }
 
-    let size = 0;
-    let aborted = false;
-    const out = fs.createWriteStream(target.absolutePath);
-    req.on('data', (chunk) => {
-        size += chunk.length;
-    });
-    req.on('aborted', () => {
-        aborted = true;
-        try { out.destroy(); } catch (_) { /* ignore */ }
-        try { fs.unlinkSync(target.absolutePath); } catch (_) { /* ignore */ }
-    });
-    req.pipe(out);
-    out.on('error', () => {
-        try { fs.unlinkSync(target.absolutePath); } catch (_) { /* ignore */ }
-        if (!res.headersSent) {
-            writeJson(res, 500, { ok: false, error: 'write_failed' });
-        }
-    });
-    out.on('finish', () => {
-        if (aborted) return;
-        const sessionRelative = buildSessionRelativePath(context.uploadRoot, target.absolutePath);
-        const workspaceRelative = buildWorkspaceRelativePath(context.workspaceRoot, target.absolutePath);
-        const cwdRelative = buildCwdRelativePath(context.cwd, target.absolutePath);
-        const filename = path.basename(target.absolutePath);
-        const mime = mimeHeader;
-        writeUploadMetadata(context, sessionRelative, {
-            filename,
-            relativePath: sessionRelative,
-            localPath: cwdRelative,
-            workspacePath: workspaceRelative,
-            size,
-            mime,
-            uploadedAt: new Date().toISOString(),
-        });
-        writeJson(res, 201, {
-            ok: true,
-            filename,
-            relativePath: sessionRelative,
-            localPath: cwdRelative,
-            workspacePath: workspaceRelative,
-            downloadUrl: buildDownloadUrl(parsedUrl, sessionRelative),
-            size,
-            mime,
-        });
+    let responseDetails = null;
+    return streamAdmittedUpload(req, {
+        storageRoot: context.uploadRoot,
+        targetPath: target.absolutePath,
+        policy: policy || UPLOAD_ROUTE_POLICIES.webchat,
+        timers,
+        finalize: ({ size }) => {
+            const sessionRelative = buildSessionRelativePath(context.uploadRoot, target.absolutePath);
+            const workspaceRelative = buildWorkspaceRelativePath(context.workspaceRoot, target.absolutePath);
+            const cwdRelative = buildCwdRelativePath(context.cwd, target.absolutePath);
+            const filename = path.basename(target.absolutePath);
+            const mime = mimeHeader;
+            const downloadUrl = buildDownloadUrl(parsedUrl, sessionRelative);
+            const metadata = {
+                filename,
+                relativePath: sessionRelative,
+                localPath: cwdRelative,
+                workspacePath: workspaceRelative,
+                size,
+                mime,
+                uploadedAt: new Date().toISOString(),
+            };
+            if (!writeUploadMetadata(context, sessionRelative, metadata)) {
+                throw new Error('Unable to persist upload metadata.');
+            }
+            responseDetails = {
+                ...metadata,
+                downloadUrl,
+            };
+        },
+        onSuccess: () => {
+            writeJson(res, 201, {
+                ok: true,
+                filename: responseDetails.filename,
+                relativePath: responseDetails.relativePath,
+                localPath: responseDetails.localPath,
+                workspacePath: responseDetails.workspacePath,
+                downloadUrl: responseDetails.downloadUrl,
+                size: responseDetails.size,
+                mime: responseDetails.mime,
+            });
+        },
+        onFailure: error => {
+            if (!res.headersSent) {
+                writeJson(res, error.status || 500, {
+                    ok: false,
+                    error: error.code || 'upload_failed',
+                });
+            }
+        },
     });
 }
 

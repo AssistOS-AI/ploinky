@@ -1,46 +1,3 @@
-import crypto from 'crypto';
-import * as secretVars from '../../services/secretVars.js';
-
-const TOKEN_VARS = {
-    dashboard: 'WEBDASHBOARD_TOKEN',
-    status: 'WEBDASHBOARD_TOKEN'
-};
-
-function loadToken(component) {
-    const varName = TOKEN_VARS[component];
-    if (!varName) throw new Error(`Unknown component '${component}'`);
-    const fromEnv = (key) => {
-        const raw = process.env[key];
-        return raw && String(raw).trim();
-    };
-    let token = '';
-    let source = 'secrets';
-    try {
-        const secrets = secretVars.parseSecrets();
-        const raw = secrets[varName];
-        if (raw && String(raw).trim()) {
-            token = secretVars.resolveVarValue(varName);
-        }
-    } catch (_) {
-        token = '';
-    }
-    if (!token) {
-        const envToken = fromEnv(varName) || '';
-        if (envToken) {
-            token = envToken;
-            source = 'env';
-        }
-    }
-    if (!token) {
-        token = crypto.randomBytes(32).toString('hex');
-        source = 'generated';
-    }
-    if (source !== 'secrets') {
-        try { secretVars.setEnvVar(varName, token); } catch (_) { }
-    }
-    return token;
-}
-
 function parseCookies(req) {
     const header = req.headers.cookie || '';
     const map = new Map();
@@ -198,7 +155,6 @@ function parseMultipartFormData(req) {
 }
 
 export {
-    loadToken,
     parseCookies,
     buildCookie,
     readJsonBody,

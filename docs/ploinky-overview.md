@@ -17,7 +17,7 @@ Ploinky is a workspace-local runtime for repository-backed agents.
 - `ploinky update repos`: update installed `.ploinky/repos/` entries, refresh `AchillesCopilotBasicSkills` in eligible managed repositories, and refresh both the Ploinky runtime Achilles checkout and managed-repo Achilles dependencies.
 - `ploinky update repo <name>`: update one repository under `.ploinky/repos/` and refresh `AchillesCopilotBasicSkills` in that repo when it is eligible.
 - `ploinky enable agent <name|repo/name> [global|devel [repo]] [--auth none|pwd|sso] [as <alias>]`: register an agent in `.ploinky/agents.json`. Isolated agents use `.data/<agent-or-alias>/` as their host-side home and work directory.
-- `ploinky start [staticAgent] [port] [--branch <branch>] [--repo-branch <repo=branch>]... [--branch-fallback default|fail] [--reset-repos]`: resolve dependency waves, start enabled agents, write `routing.json`, and launch the router under the watchdog. `--branch` sets a candidate branch for all repos involved in this start; `--repo-branch` overrides it per repo. `--branch-fallback default` (the default) keeps repos on their configured branch when the candidate is missing; `fail` aborts. `--reset-repos` permits hard reset of dirty managed repos.
+- `ploinky start [staticAgent] [hostPort] [--branch <branch>] [--repo-branch <repo=branch>]... [--branch-fallback default|fail] [--reset-repos]`: resolve dependency waves, start enabled agents, write `routing.json`, and launch the fixed inner Router on `8080` under the watchdog. At the public wrapper, the optional positional port selects only the loopback physical-host side of that mapping; direct/core start accepts only `8080`. `--branch` sets a candidate branch for all repos involved in this start; `--repo-branch` overrides it per repo. `--branch-fallback default` (the default) keeps repos on their configured branch when the candidate is missing; `fail` aborts. `--reset-repos` permits hard reset of dirty managed repos.
 - `ploinky status`: show SSO state, router listening state, installed and remembered repositories, and running agent containers.
 - `ploinky list routes`: inspect the current `.ploinky/routing.json` route table.
 - `ploinky restart`: restart enabled agents and the router.
@@ -29,7 +29,6 @@ Ploinky is a workspace-local runtime for repository-backed agents.
 - `ploinky clean`: alias for `destroy`.
 - `ploinky logs tail [router]` and `ploinky logs last <N> [router]`: inspect router logs. Router logs are the only logs exposed through the CLI.
 - `ploinky webchat [--rotate]`: print the WebChat access URL. WebChat uses the router login flow; `--rotate` is accepted for compatibility but does not mint a WebChat-specific token.
-- `ploinky dashboard [--rotate]`: show or rotate the dashboard token used for `/dashboard` and invitation-style `/status` access.
 - `ploinky client list tools|resources`, `ploinky client status <agent>`, and `ploinky client tool <name>`: inspect or call MCP surfaces through the router.
 
 ## Web surfaces
@@ -49,7 +48,12 @@ Ploinky is a workspace-local runtime for repository-backed agents.
 - `/status`: read-only browser view that shells out to `ploinky status` and adds router-side server and agent summaries.
 - `/api/marketplace`: JSON endpoint for the first-party agent marketplace. `GET /api/marketplace` is available to authenticated local or SSO users and lists repositories, repository source metadata and kind, discoverable agents, enabled records, and runtime status. `POST /api/marketplace` is admin-only and supports `install_repo`, `uninstall_repo`, `enable_agent`, and `disable_agent`; repository uninstall disables agents from that repository and removes the checkout while preserving source metadata for reinstall. Marketplace agent disablement removes the enabled-agent registry record before removing the runtime container so the watchdog does not restart it during the operation.
 
-`/webchat` uses the normal router login flow. `/dashboard` still supports `WEBDASHBOARD_TOKEN`, and `/status` reuses the dashboard token or dashboard invitation link for read-only access.
+`/webchat` uses the normal router login flow. `/dashboard` and `/status` are
+local-control surfaces that require a real router-authenticated local-admin
+session on an exact control Host. They do not accept a component token,
+invitation, agent assertion, media credential, or localhost provenance as admin
+identity; mutations additionally require the exact Origin and a session-bound
+CSRF proof.
 
 ## Auth and agent cards
 
@@ -59,7 +63,7 @@ Ploinky is a workspace-local runtime for repository-backed agents.
 - `GET /agent-card` on the router lists successful capability responses from active agents without enforcing a fixed payload shape; `GET /<agent>/agent-card` proxies one agent's metadata.
 - `POST /<agent>/v1/chat/completions` routes OpenAI-compatible requests to one agent, with `stream: true` selecting SSE streaming and normal JSON returned otherwise.
 - `/<agent>/...` routes are transparent per-agent proxy routes after router-owned paths are handled. The router strips the `/<agent>` prefix; the target agent owns paths such as `/index.html`, `/agent-card`, `/v1/chat/completions`, and custom HTTP endpoints. `/<agent>/mcp` remains special so the router can preserve MCP session mediation and secure-wire token minting.
-- `http://<agent>.localhost:<routerPort>/` proxies the active profile's `additionalServerPort` when declared, allowing an agent-owned browser service to stay on an internal container port instead of occupying a stable host port.
+- `http://<service-slug>.localhost:<routerPort>/` selects a uniquely slugged `httpServices` entry. Its optional `port` resolves to an engine-assigned private target; omitted port preserves the owning agent's primary target. All HTTP, SSE, and WebSocket traffic uses the same immutable route-and-policy authorization generation.
 - Delegated MCP calls use router-minted invocation JWTs. The router verifies the caller's session and forwards a fresh target invocation token.
 
 ## Dependency and profile commands

@@ -16,6 +16,7 @@ process.env.PLOINKY_DERIVED_MASTER_KEY = 'must-not-be-forwarded';
 const moduleSuffix = `?test=${Date.now()}`;
 const providerModule = await import(`../../cli/services/startupConfigProviders.js${moduleSuffix}`);
 const secretsModule = await import(`../../cli/services/encryptedSecretsFile.js${moduleSuffix}`);
+const identityEnvModule = await import(`../../cli/services/agentIdentityEnv.js${moduleSuffix}`);
 
 const {
     applyStartupConfigProviders,
@@ -25,6 +26,7 @@ const {
     redactProviderValue,
 } = providerModule;
 const { readSecretsFile } = secretsModule;
+const { RESERVED_AGENT_ENV_NAMES } = identityEnvModule;
 
 test.after(() => {
     process.chdir(originalCwd);
@@ -43,22 +45,22 @@ test.after(() => {
 
 function providerDescriptor(overrides = {}) {
     return {
-        repoName: 'basic',
-        shortAgentName: 'web-publishing',
+        repoName: 'example',
+        shortAgentName: 'config-provider',
         agentPath: tempDir,
         profileName: 'default',
         manifest: {
             providesConfig: {
                 command: 'node runtime/provider.mjs',
                 outputs: [
-                    { name: 'ONLYOFFICE_PUBLIC_URL', sensitive: false },
-                    { name: 'WEB_PUBLISHING_CLOUDFLARED_TUNNEL_TOKEN', sensitive: true },
+                    { name: 'EXAMPLE_PUBLIC_URL', sensitive: false },
+                    { name: 'EXAMPLE_PROVIDER_TOKEN', sensitive: true },
                 ],
             },
             profiles: {
                 default: {
                     env: [
-                        'WEB_PUBLISHING_BASE_DOMAIN=example.test',
+                        'EXAMPLE_REGION=eu-test-1',
                         'PLOINKY_MASTER_KEY',
                     ],
                 },
@@ -66,7 +68,7 @@ function providerDescriptor(overrides = {}) {
         },
         profileConfig: {
             env: [
-                'WEB_PUBLISHING_BASE_DOMAIN=example.test',
+                'EXAMPLE_REGION=eu-test-1',
                 'PLOINKY_MASTER_KEY',
             ],
         },
@@ -85,12 +87,12 @@ test('collectStartupConfigProviderEntries reads active profile providers', () =>
         profiles: {
             default: {
                 configProviders: [
-                    { agent: 'basic/web-publishing global', profile: 'default' },
+                    { agent: 'example/config-provider global', profile: 'default' },
                 ],
             },
             qa: {
                 configProviders: [
-                    { agent: 'basic/web-publishing global', profile: 'qa' },
+                    { agent: 'example/config-provider global', profile: 'qa' },
                 ],
             },
         },
@@ -98,25 +100,55 @@ test('collectStartupConfigProviderEntries reads active profile providers', () =>
 
     assert.deepEqual(
         collectStartupConfigProviderEntries(manifest, manifest.profiles.qa),
-        [{ agent: 'basic/web-publishing global', profile: 'qa' }]
+        [{ agent: 'example/config-provider global', profile: 'qa' }]
     );
 });
 
 test('buildProviderSubprocessEnv includes only allowlisted runtime and provider inputs', () => {
+    const reservedOverrides = Object.fromEntries(
+        RESERVED_AGENT_ENV_NAMES.map((name) => [name, `attacker-controlled-${name}`]),
+    );
     const env = buildProviderSubprocessEnv({
-        provider: providerDescriptor(),
+        provider: providerDescriptor({
+            manifest: {
+                ...providerDescriptor().manifest,
+                profiles: {
+                    default: {
+                        env: reservedOverrides,
+                    },
+                },
+            },
+            profileConfig: {
+                env: {
+                    EXAMPLE_REGION: 'eu-test-1',
+                    ...reservedOverrides,
+                },
+            },
+        }),
         workspaceRoot: tempDir,
         profileName: 'qa',
     });
 
     assert.equal(env.PLOINKY_WORKSPACE_ROOT, tempDir);
     assert.equal(env.PLOINKY_PROFILE, 'qa');
-    assert.equal(env.PLOINKY_PROVIDER_AGENT, 'basic/web-publishing');
-    assert.equal(env.PLOINKY_PROVIDER_AGENT_ID, 'agent:basic/web-publishing');
-    assert.equal(env.WEB_PUBLISHING_BASE_DOMAIN, 'example.test');
-    assert.equal(env.PLOINKY_MASTER_KEY, undefined);
-    assert.equal(env.PLOINKY_DERIVED_MASTER_KEY, undefined);
-    assert.equal(env.PLOINKY_AGENT_SECRET, undefined);
+    assert.equal(env.PLOINKY_PROVIDER_AGENT, 'example/config-provider');
+    assert.equal(env.PLOINKY_PROVIDER_AGENT_ID, 'agent:example/config-provider');
+    assert.equal(env.EXAMPLE_REGION, 'eu-test-1');
+    assert.equal(
+        env.PLOINKY_EDGE_TOPOLOGY_FILE,
+        path.join(tempDir, '.ploinky', 'run', 'edge-topology', 'current.json'),
+    );
+    assert.equal(env.PLOINKY_ROUTER_URL, 'http://127.0.0.1:8080');
+    assert.equal(env.PLOINKY_INTERNAL_ROUTER_URL, 'http://127.0.0.1:8081');
+    const authoritativeProviderRuntimeNames = new Set([
+        'PLOINKY_EDGE_TOPOLOGY_FILE',
+        'PLOINKY_ROUTER_URL',
+        'PLOINKY_INTERNAL_ROUTER_URL',
+    ]);
+    for (const name of RESERVED_AGENT_ENV_NAMES) {
+        if (authoritativeProviderRuntimeNames.has(name)) continue;
+        assert.equal(env[name], undefined, `${name} must not reach a config-provider process`);
+    }
 });
 
 test('applyStartupConfigProviders persists declared outputs and redacted metadata', async () => {
@@ -128,16 +160,16 @@ test('applyStartupConfigProviders persists declared outputs and redacted metadat
             version: 1,
             values: [
                 {
-                    name: 'ONLYOFFICE_PUBLIC_URL',
-                    value: 'https://office.example.test',
+                    name: 'EXAMPLE_PUBLIC_URL',
+                    value: 'https://service.example.test',
                     sensitive: false,
                     source: 'generated',
                 },
                 {
-                    name: 'WEB_PUBLISHING_CLOUDFLARED_TUNNEL_TOKEN',
+                    name: 'EXAMPLE_PROVIDER_TOKEN',
                     value: 'secret-token-value',
                     sensitive: true,
-                    source: 'tunnel-token',
+                    source: 'provider-token',
                 },
             ],
             warnings: [],
@@ -146,15 +178,15 @@ test('applyStartupConfigProviders persists declared outputs and redacted metadat
 
     assert.equal(result.applied.length, 2);
     assert.deepEqual(readSecretsFile(), {
-        ONLYOFFICE_PUBLIC_URL: 'https://office.example.test',
-        WEB_PUBLISHING_CLOUDFLARED_TUNNEL_TOKEN: 'secret-token-value',
+        EXAMPLE_PUBLIC_URL: 'https://service.example.test',
+        EXAMPLE_PROVIDER_TOKEN: 'secret-token-value',
     });
 
-    const metadataPath = path.join(tempDir, '.ploinky', 'config-providers', 'web-publishing.json');
+    const metadataPath = path.join(tempDir, '.ploinky', 'config-providers', 'config-provider.json');
     const metadata = JSON.parse(fs.readFileSync(metadataPath, 'utf8'));
-    assert.equal(metadata.providerAgentId, 'agent:basic/web-publishing');
+    assert.equal(metadata.providerAgentId, 'agent:example/config-provider');
     assert.equal(metadata.outputs.length, 2);
-    assert.doesNotMatch(JSON.stringify(metadata), /secret-token-value|https:\/\/office\.example\.test/);
+    assert.doesNotMatch(JSON.stringify(metadata), /secret-token-value|https:\/\/service\.example\.test/);
     assert.match(JSON.stringify(metadata), /redacted/);
 });
 
@@ -167,7 +199,7 @@ test('applyStartupConfigProviders rejects undeclared and reserved outputs', asyn
             runProviderCommand: () => ({
                 version: 1,
                 values: [
-                    { name: 'CLOUDFLARED_TUNNEL_TOKEN', value: 'legacy', sensitive: true },
+                    { name: 'UNDECLARED_PROVIDER_VALUE', value: 'unexpected', sensitive: true },
                 ],
             }),
         }),
@@ -195,6 +227,28 @@ test('applyStartupConfigProviders rejects undeclared and reserved outputs', asyn
         }),
         /reserved/
     );
+
+    await assert.rejects(
+        () => applyStartupConfigProviders({
+            providers: [providerDescriptor({
+                manifest: {
+                    providesConfig: {
+                        command: 'node runtime/provider.mjs',
+                        outputs: [{ name: 'PLOINKY_EDGE_TOPOLOGY_FILE', sensitive: false }],
+                    },
+                },
+            })],
+            workspaceRoot: tempDir,
+            profileName: 'qa',
+            runProviderCommand: () => ({
+                version: 1,
+                values: [
+                    { name: 'PLOINKY_EDGE_TOPOLOGY_FILE', value: '/forbidden', sensitive: false },
+                ],
+            }),
+        }),
+        /reserved/
+    );
 });
 
 test('applyStartupConfigProviders rejects sensitive flag mismatches and generated secret names', async () => {
@@ -207,7 +261,7 @@ test('applyStartupConfigProviders rejects sensitive flag mismatches and generate
                 version: 1,
                 values: [
                     {
-                        name: 'WEB_PUBLISHING_CLOUDFLARED_TUNNEL_TOKEN',
+                        name: 'EXAMPLE_PROVIDER_TOKEN',
                         value: 'secret-token-value',
                         sensitive: false,
                     },
@@ -222,13 +276,13 @@ test('applyStartupConfigProviders rejects sensitive flag mismatches and generate
             providers: [providerDescriptor()],
             workspaceRoot: tempDir,
             profileName: 'qa',
-            protectedOutputNames: new Set(['ONLYOFFICE_PUBLIC_URL']),
+            protectedOutputNames: new Set(['EXAMPLE_PUBLIC_URL']),
             runProviderCommand: () => ({
                 version: 1,
                 values: [
                     {
-                        name: 'ONLYOFFICE_PUBLIC_URL',
-                        value: 'https://office.example.test',
+                        name: 'EXAMPLE_PUBLIC_URL',
+                        value: 'https://service.example.test',
                         sensitive: false,
                     },
                 ],
@@ -240,11 +294,11 @@ test('applyStartupConfigProviders rejects sensitive flag mismatches and generate
 
 test('redactProviderValue never returns raw secret material', () => {
     assert.equal(redactProviderValue('TOKEN_NAME', 'secret-token', true), '[redacted]');
-    assert.equal(redactProviderValue('PUBLIC_URL', 'https://office.example.test', false), '[redacted]');
+    assert.equal(redactProviderValue('PUBLIC_URL', 'https://service.example.test', false), '[redacted]');
 });
 
 test('applyStartupConfigProvidersForGraph runs active profile providers from the dependency graph', async () => {
-    writeRepoManifest('basic', 'web-publishing-graph', {
+    writeRepoManifest('example', 'config-provider-graph', {
         providesConfig: {
             command: 'node runtime/provider.mjs',
             outputs: [
@@ -254,36 +308,36 @@ test('applyStartupConfigProvidersForGraph runs active profile providers from the
         profiles: {
             default: {
                 env: [
-                    'WEB_PUBLISHING_BASE_DOMAIN=graph.example.test',
+                    'EXAMPLE_REGION=graph-test-1',
                 ],
             },
         },
     });
-    writeRepoManifest('app', 'explorer-graph', {
+    writeRepoManifest('app', 'application-graph', {
         container: 'node:20-alpine',
         profiles: {
             default: {
                 configProviders: [
-                    { agent: 'basic/web-publishing-graph global', profile: 'default' },
+                    { agent: 'example/config-provider-graph global', profile: 'default' },
                 ],
             },
         },
         enable: [
-            'basic/web-publishing-graph global',
+            'example/config-provider-graph global',
         ],
     });
 
     const graphModule = await import(`../../cli/services/workspaceDependencyGraph.js${moduleSuffix}&graph=1`);
     const graph = graphModule.resolveWorkspaceDependencyGraph({
-        staticAgentRef: 'app/explorer-graph',
+        staticAgentRef: 'app/application-graph',
     });
     const result = await applyStartupConfigProvidersForGraph({
         dependencyGraph: graph,
         workspaceRoot: tempDir,
         profileName: 'default',
         runProviderCommand: ({ env }) => {
-            assert.equal(env.PLOINKY_PROVIDER_AGENT, 'basic/web-publishing-graph');
-            assert.equal(env.WEB_PUBLISHING_BASE_DOMAIN, 'graph.example.test');
+            assert.equal(env.PLOINKY_PROVIDER_AGENT, 'example/config-provider-graph');
+            assert.equal(env.EXAMPLE_REGION, 'graph-test-1');
             return {
                 version: 1,
                 values: [
@@ -304,11 +358,11 @@ test('applyStartupConfigProvidersForGraph runs active profile providers from the
 });
 
 test('applyStartupConfigProvidersForGraph rejects outputs for graph generated secrets', async () => {
-    writeRepoManifest('basic', 'generated-secret-provider', {
+    writeRepoManifest('example', 'generated-secret-provider', {
         providesConfig: {
             command: 'node runtime/provider.mjs',
             outputs: [
-                { name: 'ONLYOFFICE_JWT_SECRET', sensitive: true },
+                { name: 'EXAMPLE_SHARED_SECRET', sensitive: true },
             ],
         },
         profiles: {
@@ -322,17 +376,17 @@ test('applyStartupConfigProvidersForGraph rejects outputs for graph generated se
         profiles: {
             default: {
                 configProviders: [
-                    { agent: 'basic/generated-secret-provider global', profile: 'default' },
+                    { agent: 'example/generated-secret-provider global', profile: 'default' },
                 ],
             },
         },
         enable: [
-            'basic/generated-secret-provider global',
+            'example/generated-secret-provider global',
         ],
         env: [
             {
                 name: 'JWT_SECRET',
-                varName: 'ONLYOFFICE_JWT_SECRET',
+                varName: 'EXAMPLE_SHARED_SECRET',
                 sharedGeneratedSecret: true,
             },
         ],
@@ -352,7 +406,7 @@ test('applyStartupConfigProvidersForGraph rejects outputs for graph generated se
                 version: 1,
                 values: [
                     {
-                        name: 'ONLYOFFICE_JWT_SECRET',
+                        name: 'EXAMPLE_SHARED_SECRET',
                         value: 'provider-owned-secret',
                         sensitive: true,
                         source: 'generated',

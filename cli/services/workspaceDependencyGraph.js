@@ -121,8 +121,7 @@ function findRegistryRecord(registry, { repoName, shortAgentName, alias = '' }) 
 
 // Resolve an operator-facing agent token against an already-loaded workspace
 // registry using the same precedence as the runtime command handlers. Keeping
-// this helper pure lets the publication planner use its planning snapshot
-// instead of re-reading agents.json partway through a plan.
+// this helper pure avoids re-reading agents.json during graph resolution.
 function resolveEnabledAgentRegistryRecord(agentRef, registry = {}) {
     const input = typeof agentRef === 'string' ? agentRef.trim() : '';
     if (!input || !registry || typeof registry !== 'object') return null;

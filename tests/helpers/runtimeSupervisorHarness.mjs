@@ -8,10 +8,7 @@ import {
 import {
     IDENTITY_SCHEMA_LABEL,
     IDENTITY_SCHEMA_VERSION,
-    EXPLICIT_PUBLISHES_LABEL,
-    GENERATED_PUBLISHES_LABEL,
     PATH_HASH_LABEL,
-    PUBLISH_PLAN_VERSION_LABEL,
     REQUESTED_IMAGE_LABEL,
     REQUIRED_IMAGE_ENTRYPOINT,
     REQUIRED_IMAGE_ENV,
@@ -19,7 +16,6 @@ import {
     REQUIRED_IMAGE_WORKDIR,
     REQUIRED_RUNTIME_CONTRACT,
     REQUIRED_RUNTIME_IMAGE,
-    REQUIRED_PUBLISH_PLAN_VERSION,
     RUNTIME_CONTRACT_LABEL,
     VOLUME_ROLE_LABEL,
     VOLUME_ROLES,
@@ -129,9 +125,6 @@ export function contract2Container({
         [REQUESTED_IMAGE_LABEL]: requestedImage,
         [IDENTITY_SCHEMA_LABEL]: IDENTITY_SCHEMA_VERSION,
         [PATH_HASH_LABEL]: identity.pathHash,
-        [PUBLISH_PLAN_VERSION_LABEL]: REQUIRED_PUBLISH_PLAN_VERSION,
-        [EXPLICIT_PUBLISHES_LABEL]: '[]',
-        [GENERATED_PUBLISHES_LABEL]: '[]',
         ...labels,
     };
     const raw = {
@@ -156,6 +149,7 @@ export function contract2Container({
             Binds: [`${sourceDir}:/opt/ploinky:ro`],
             PortBindings: {
                 '8080/tcp': [{ HostIp: '127.0.0.1', HostPort: '8080' }],
+                '7882/udp': [{ HostIp: '0.0.0.0', HostPort: '7882' }],
                 ...publishes,
             },
             Devices: [
@@ -345,7 +339,6 @@ export function createFakeEngine({
     replacementFailureCreatesContainer = false,
     createFailureCreatesContainer = false,
     rmFailureRemovesContainer = false,
-    plannerCapture,
     stdout = { write() { return true; } },
     stderr = { write() { return true; } },
 } = {}) {
@@ -356,7 +349,6 @@ export function createFakeEngine({
         images: clone(images) || {},
         volumes: normalizeInputVolumes(volumes),
         anonymousVolumes: new Set(anonymousVolumes),
-        temporaryContainers: new Set(),
     };
     let inspectedOld = false;
     let reconciliationState = 'idle';
@@ -391,17 +383,19 @@ export function createFakeEngine({
                 if (args.includes('{{.Host.Security.SELinuxEnabled}}')) return result(true, 'false\n');
                 return result(true, '{}\n');
             }
+            if (args[0] === 'ps' && args.includes('--all')) {
+                const names = [
+                    String(state.container?.inspect?.Name || '').replace(/^\//, ''),
+                    ...state.backups.keys(),
+                ].filter(Boolean);
+                return result(true, names.join('\n') + (names.length > 0 ? '\n' : ''));
+            }
             if (args[0] === 'container' && args[1] === 'inspect') {
                 if (failureCode(failures, 'container inspect')) {
                     return result(false, '', 'permission denied');
                 }
                 const formatted = args.includes('--format');
                 const target = args.at(-1);
-                if (state.temporaryContainers.has(target)) {
-                    return formatted
-                        ? result(true, `temporary-${target}\n`)
-                        : result(true, JSON.stringify([{ Id: `temporary-${target}`, Name: target }]));
-                }
                 const managedName = String(state.container?.inspect?.Name || '').replace(/^\//, '');
                 const selected = target === managedName
                     ? state.container
@@ -440,8 +434,9 @@ export function createFakeEngine({
                     : result(false, '', 'volume not found');
             }
             if (args[0] === 'port') {
+                const target = args.at(-1);
                 const binding = state.container?.inspect?.HostConfig
-                    ?.PortBindings?.['8080/tcp']?.[0];
+                    ?.PortBindings?.[target]?.[0];
                 return binding
                     ? result(true, `${binding.HostIp || '0.0.0.0'}:${binding.HostPort}\n`)
                     : result(false, '', 'port not found');
@@ -557,12 +552,6 @@ export function createFakeEngine({
             }
             if (args[0] === 'rm') {
                 const target = args.at(-1);
-                if (state.temporaryContainers.has(target)) {
-                    const code = fail('rm planner', options);
-                    if (code) return code;
-                    state.temporaryContainers.delete(target);
-                    return 0;
-                }
                 if (state.backups.has(target)) {
                     const code = fail('rm backup', options);
                     if (code) return code;
@@ -612,48 +601,6 @@ export function createFakeEngine({
             }
             return 0;
         },
-        async capture(args, options = {}) {
-            calls.push({ kind: 'capture', args: [...args], options: { ...options } });
-            if (args[0] === 'run') {
-                const nameIndex = args.indexOf('--name');
-                if (nameIndex >= 0) state.temporaryContainers.add(args[nameIndex + 1]);
-            }
-            if (typeof plannerCapture === 'function') {
-                return plannerCapture(args, options, state);
-            }
-            const code = failureCode(failures, 'capture planner');
-            if (code) {
-                return {
-                    ok: false,
-                    status: code,
-                    stdout: '',
-                    stderr: 'planner failed',
-                    error: null,
-                    signal: null,
-                    timedOut: false,
-                    overflow: false,
-                };
-            }
-            const request = JSON.parse(String(options.input || '{}'));
-            const explicitPublishes = request.explicitPublishes || [];
-            const value = {
-                schemaVersion: 2,
-                operation: request.operation,
-                explicitPublishes,
-                generatedPublishes: [],
-                publishes: explicitPublishes,
-            };
-            return {
-                ok: true,
-                status: 0,
-                stdout: JSON.stringify(value),
-                stderr: '',
-                error: null,
-                signal: null,
-                timedOut: false,
-                overflow: false,
-            };
-        },
         streamContains(args, needle) {
             calls.push({ kind: 'streamContains', args: [...args], options: { needle } });
             return Promise.resolve(String(state.container?.logs || '').includes(needle));
@@ -698,7 +645,11 @@ export function createSupervisorHarness(options = {}) {
         engineClient: fake.engineClient,
         sleep: async () => {},
         waitHealthy,
-        portInUse: async () => false,
+        portInUse: options.portInUse || (async () => false),
+        udpPortInUse: options.udpPortInUse || (async () => false),
+        ...(options.fixedUdpOwners
+            ? { fixedUdpOwners: options.fixedUdpOwners }
+            : {}),
         askLine: async text => {
             prompt += text;
             stdout.stream.write(text);
@@ -708,15 +659,6 @@ export function createSupervisorHarness(options = {}) {
             fake.calls.push({ kind: 'fetch', url, args: [], options: {} });
             return options.fetchResponse || { ok: false };
         },
-        preparePublicationPlan: options.useProductionPlanner
-            ? undefined
-            : options.preparePublicationPlan || (async request => ({
-                schemaVersion: 2,
-                operation: request.operation,
-                explicitPublishes: request.explicitPublishes || [],
-                generatedPublishes: [],
-                publishes: request.explicitPublishes || [],
-            })),
         withHostRuntimeLock: options.withHostRuntimeLock
             || (async (_invocation, callback) => callback()),
         showHelp: options.showHelp || (() => {}),

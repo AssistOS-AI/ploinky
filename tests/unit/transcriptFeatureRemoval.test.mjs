@@ -27,7 +27,7 @@ function makeRequest(url, method = 'GET') {
     req.method = method;
     req.headers = { host: '127.0.0.1' };
     req.socket = {};
-    req.user = { id: 'local:test', username: 'test', roles: ['user'] };
+    req.user = { id: 'local:admin', username: 'admin', roles: ['user', 'admin'] };
     return req;
 }
 

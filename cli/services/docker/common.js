@@ -9,14 +9,11 @@ import { buildEnvFlags, buildEnvMap } from '../secretVars.js';
 import { loadAgents, saveAgents } from '../workspace.js';
 import { debugLog } from '../utils.js';
 import { isHostSandboxDisabled } from '../sandboxRuntime.js';
-import { parseManifestOpenPortSpec } from '../../../container/publish-spec.mjs';
+import { intervalsOverlap, parseManifestOpenPortSpec } from '../../../container/publish-spec.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const PLOINKY_BOX_MARKER_PATH = '/etc/ploinky-box';
-const OUTER_PUBLICATION_CONTRACT_ENV = 'PLOINKY_OUTER_PUBLICATION_CONTRACT';
-const OUTER_PUBLICATION_CONTRACT_SCHEMA_VERSION = 2;
-const MAX_OUTER_PUBLICATION_CONTRACT_BYTES = 256 * 1024;
 const PLOINKY_MANAGED_LABEL = 'io.assistos.ploinky.managed=1';
 
 function isPloinkyBoxRuntime(markerPath = process.env.PLOINKY_BOX_MARKER_PATH || PLOINKY_BOX_MARKER_PATH) {
@@ -25,20 +22,6 @@ function isPloinkyBoxRuntime(markerPath = process.env.PLOINKY_BOX_MARKER_PATH ||
     } catch (_) {
         return false;
     }
-}
-
-function isLoopbackBindHost(hostIp) {
-    const normalized = String(hostIp || '').trim().toLowerCase();
-    return normalized === '127.0.0.1' || normalized === 'localhost' || normalized === '::1';
-}
-
-function runtimePublishHostIp(hostIp, options = {}) {
-    const markerPath = options.boxMarkerPath || PLOINKY_BOX_MARKER_PATH;
-    const inBoxRuntime = options.boxRuntime === true || isPloinkyBoxRuntime(markerPath);
-    if (inBoxRuntime && isLoopbackBindHost(hostIp)) {
-        return '0.0.0.0';
-    }
-    return hostIp;
 }
 
 function isPathUnderRoot(candidate) {
@@ -146,12 +129,7 @@ function requireContainerRuntime() {
 
 const DEFAULT_IMAGE_PULL_TIMEOUT_MS = 30 * 60 * 1000;
 const DEFAULT_IMAGE_BUILD_TIMEOUT_MS = 30 * 60 * 1000;
-const LOCAL_IMAGE_BUILD_DEFINITIONS = {
-    'docker.io/assistos/web-publishing-agent:node24-nginx-cloudflared': {
-        repoName: 'container-image-builds',
-        context: 'images/web-publishing-agent',
-    },
-};
+const LOCAL_IMAGE_BUILD_DEFINITIONS = Object.freeze({});
 
 function imagePullTimeoutMs() {
     const raw = Number(process.env.PLOINKY_IMAGE_PULL_TIMEOUT_MS);
@@ -306,8 +284,8 @@ function loadAgentsMap() {
     return loadAgents();
 }
 
-function saveAgentsMap(map) {
-    return saveAgents(map);
+function saveAgentsMap(map, options = {}) {
+    return saveAgents(map, options);
 }
 
 function getAgentContainerName(agentName, repoName) {
@@ -468,7 +446,24 @@ function parseManifestPorts(manifest, profileConfig = null, options = {}) {
         if (!portSpec) continue;
 
         const parsed = parseManifestOpenPortSpec(portSpec);
-        const publishHostIp = runtimePublishHostIp(parsed.hostIp, options);
+        const reserved = parsed.protocol === 'tcp'
+            ? [
+                { port: 8080, owner: 'public/control Router' },
+                { port: 8081, owner: 'box-private Router' },
+            ]
+            : [{ port: 7882, owner: 'fixed media UDP mux capability' }];
+        const conflict = reserved.find(({ port }) => intervalsOverlap(
+            parsed.boxSide,
+            { start: port, end: port },
+        ));
+        if (conflict) {
+            const error = new Error(
+                `openPorts ${parsed.protocol} box-side range ${formatPortRange(parsed.boxSide)} overlaps reserved port ${conflict.port} (${conflict.owner})`,
+            );
+            error.code = 'PLOINKY_RESERVED_BOX_PORT';
+            throw error;
+        }
+        const publishHostIp = parsed.hostIp;
         const protocolSuffix = parsed.protocol === 'tcp' ? '' : `/${parsed.protocol}`;
         const normalized = `${publishHostIp}:${formatPortRange(parsed.boxSide)}:${formatPortRange(parsed.privateContainer)}${protocolSuffix}`;
         publishArgs.push(normalized);
@@ -487,156 +482,6 @@ function parseManifestPorts(manifest, profileConfig = null, options = {}) {
 
 function managedContainerLabelArgs() {
     return ['--label', PLOINKY_MANAGED_LABEL];
-}
-
-function parseOuterPublicationContract(rawContract = process.env[OUTER_PUBLICATION_CONTRACT_ENV]) {
-    if (rawContract && typeof rawContract === 'object' && !Array.isArray(rawContract)) {
-        return validateOuterPublicationContract(rawContract);
-    }
-    const raw = String(rawContract || '');
-    if (!raw) {
-        throw outerPublicationError(`missing ${OUTER_PUBLICATION_CONTRACT_ENV}`);
-    }
-    if (Buffer.byteLength(raw, 'utf8') > MAX_OUTER_PUBLICATION_CONTRACT_BYTES) {
-        throw outerPublicationError(`${OUTER_PUBLICATION_CONTRACT_ENV} exceeds ${MAX_OUTER_PUBLICATION_CONTRACT_BYTES} bytes`);
-    }
-    let parsed;
-    try {
-        parsed = JSON.parse(raw);
-    } catch (error) {
-        throw outerPublicationError(`${OUTER_PUBLICATION_CONTRACT_ENV} is not valid JSON: ${error.message}`);
-    }
-    return validateOuterPublicationContract(parsed);
-}
-
-function validateOuterPublicationContract(contract) {
-    if (!contract || typeof contract !== 'object' || Array.isArray(contract)) {
-        throw outerPublicationError('outer publication contract must be an object');
-    }
-    const allowed = new Set(['schemaVersion', 'targets', 'publishes']);
-    for (const key of Object.keys(contract)) {
-        if (!allowed.has(key)) throw outerPublicationError(`unsupported outer publication contract field '${key}'`);
-    }
-    if (contract.schemaVersion !== OUTER_PUBLICATION_CONTRACT_SCHEMA_VERSION) {
-        throw outerPublicationError(`unsupported outer publication contract schemaVersion '${contract.schemaVersion}'`);
-    }
-    if (!Array.isArray(contract.targets) || contract.targets.length > 4096) {
-        throw outerPublicationError('outer publication contract targets must be an array with at most 4096 entries');
-    }
-    if (contract.publishes !== undefined && (
-        !Array.isArray(contract.publishes)
-        || contract.publishes.length > 4096
-        || contract.publishes.some((entry) => typeof entry !== 'string')
-    )) {
-        throw outerPublicationError('outer publication contract publishes must be an array of strings');
-    }
-    const byProtocol = { tcp: [], udp: [] };
-    for (let index = 0; index < contract.targets.length; index += 1) {
-        const target = contract.targets[index];
-        if (!target || typeof target !== 'object' || Array.isArray(target)) {
-            throw outerPublicationError(`outer publication target ${index} must be an object`);
-        }
-        const keys = Object.keys(target);
-        if (keys.some((key) => !['start', 'end', 'protocol'].includes(key))) {
-            throw outerPublicationError(`outer publication target ${index} has unsupported fields`);
-        }
-        const start = Number(target.start);
-        const end = Number(target.end);
-        const protocol = String(target.protocol || '').trim().toLowerCase();
-        if (!Number.isInteger(start) || !Number.isInteger(end) || start < 1 || end < start || end > 65535) {
-            throw outerPublicationError(`outer publication target ${index} has an invalid interval`);
-        }
-        if (!['tcp', 'udp'].includes(protocol)) {
-            throw outerPublicationError(`outer publication target ${index} has unsupported protocol '${target.protocol}'`);
-        }
-        byProtocol[protocol].push({ start, end });
-    }
-    return {
-        schemaVersion: OUTER_PUBLICATION_CONTRACT_SCHEMA_VERSION,
-        targets: [
-            ...mergeCoverageIntervals(byProtocol.tcp).map((entry) => ({ ...entry, protocol: 'tcp' })),
-            ...mergeCoverageIntervals(byProtocol.udp).map((entry) => ({ ...entry, protocol: 'udp' })),
-        ],
-        publishes: (contract.publishes || []).map((entry) => String(entry)),
-    };
-}
-
-function assertOuterPublicationCoverageForClaims(claims, options = {}) {
-    const inBox = options.boxRuntime === true
-        || (options.boxRuntime !== false && isPloinkyBoxRuntime(options.markerPath));
-    if (!inBox) return { enforced: false, covered: true, targets: [] };
-    const contract = parseOuterPublicationContract(options.contract);
-    const missing = [];
-    for (const claim of claims || []) {
-        const interval = claim?.boxSide || claim?.targetInterval;
-        const protocol = String(claim?.protocol || '').trim().toLowerCase();
-        if (!interval || !['tcp', 'udp'].includes(protocol)) {
-            throw outerPublicationError('required publication claim is malformed');
-        }
-        const available = contract.targets.filter((target) => target.protocol === protocol);
-        if (!intervalCovered(interval, available)) {
-            missing.push({
-                start: interval.start,
-                end: interval.end,
-                protocol,
-                ownerRef: claim.ownerRef || claim.agentRef || '',
-                raw: claim.raw || '',
-            });
-        }
-    }
-    if (missing.length) {
-        const targets = missing.map((entry) => `${formatPortRange(entry)}/${entry.protocol}`).join(', ');
-        const hint = String(options.commandHint || 'ploinky start').trim();
-        const error = outerPublicationError(
-            `outer Ploinky box does not publish required socket coverage: ${targets}. `
-            + `Run this one-shot command from the host so the box can be reconciled first: ${hint}`,
-        );
-        error.missingTargets = missing;
-        error.contract = contract;
-        throw error;
-    }
-    return { enforced: true, covered: true, targets: contract.targets };
-}
-
-function assertOuterPublicationCoverageForManifest(manifest, profileConfig = null, options = {}) {
-    const ports = profileConfig?.openPorts;
-    const values = ports === undefined || ports === null ? [] : (Array.isArray(ports) ? ports : [ports]);
-    const claims = values.map((entry) => {
-        const parsed = parseManifestOpenPortSpec(entry);
-        return {
-            ...parsed,
-            boxSide: options.networkMode === 'host'
-                ? { ...parsed.privateContainer }
-                : parsed.boxSide,
-            networkMode: options.networkMode || 'default',
-            ownerRef: options.ownerRef || '',
-        };
-    });
-    return assertOuterPublicationCoverageForClaims(claims, options);
-}
-
-function intervalCovered(interval, available) {
-    const merged = mergeCoverageIntervals(available);
-    return merged.some((entry) => entry.start <= interval.start && entry.end >= interval.end);
-}
-
-function mergeCoverageIntervals(intervals) {
-    const sorted = intervals
-        .map((entry) => ({ start: entry.start, end: entry.end }))
-        .sort((left, right) => left.start - right.start || left.end - right.end);
-    const merged = [];
-    for (const interval of sorted) {
-        const previous = merged.at(-1);
-        if (!previous || interval.start > previous.end + 1) merged.push({ ...interval });
-        else previous.end = Math.max(previous.end, interval.end);
-    }
-    return merged;
-}
-
-function outerPublicationError(message) {
-    const error = new Error(message);
-    error.code = 'PLOINKY_OUTER_PUBLICATION_REQUIRED';
-    return error;
 }
 
 function formatPortRange(range) {
@@ -756,9 +601,6 @@ function runtimeFamilyName(runtime) {
 export {
     CONTAINER_CONFIG_DIR,
     CONTAINER_CONFIG_PATH,
-    MAX_OUTER_PUBLICATION_CONTRACT_BYTES,
-    OUTER_PUBLICATION_CONTRACT_ENV,
-    OUTER_PUBLICATION_CONTRACT_SCHEMA_VERSION,
     PLOINKY_MANAGED_LABEL,
     PLOINKY_DIR,
     REPOS_DIR,
@@ -786,7 +628,6 @@ export {
     loadAgentsMap,
     parseHostPort,
     parseManifestPorts,
-    parseOuterPublicationContract,
     saveAgentsMap,
     syncAgentMcpConfig,
     waitForContainerRunning,
@@ -796,9 +637,6 @@ export {
     createHostSandboxStartupError,
     getRuntimeForAgent,
     managedContainerLabelArgs,
-    assertOuterPublicationCoverageForClaims,
-    assertOuterPublicationCoverageForManifest,
-    validateOuterPublicationContract,
 };
 
 function getRuntime() {

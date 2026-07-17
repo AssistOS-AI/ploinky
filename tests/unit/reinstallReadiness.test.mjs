@@ -86,7 +86,14 @@ test('reinstall readiness retains MCP and TCP host-port dispatch', async () => {
 });
 
 test('reinstall and workspace restart paths both use the shared blocking readiness dispatcher', () => {
-    assert.match(reinstallAgent.toString(), /waitForManifestReadiness/);
-    assert.match(reinstallAgent.toString(), /PLOINKY_READINESS_FAILED/);
+    const reinstallSource = reinstallAgent.toString();
+    const readiness = reinstallSource.indexOf('await waitForManifestReadiness');
+    const activation = reinstallSource.indexOf('await activatePreparedRuntimeAfterReadiness', readiness);
+    const success = reinstallSource.indexOf('console.log(`[reinstall] reinstalled', activation);
+
+    assert.ok(readiness >= 0, 'reinstall must wait for manifest readiness');
+    assert.ok(activation > readiness, 'prepared activation must follow successful readiness');
+    assert.ok(success > activation, 'success must be logged only after generation activation');
+    assert.match(reinstallSource, /catch \(e\) \{[\s\S]*?throw e;/);
     assert.match(startWorkspace.toString(), /waitForReadinessEntries/);
 });

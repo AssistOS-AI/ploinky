@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -9,7 +10,14 @@ const originalCwd = process.cwd();
 process.chdir(tempDir);
 
 const { PolicyStateRepository } = await import(`../../cli/server/policy/PolicyStateRepository.js?t=${Date.now()}`);
+const { FileSystemPolicyStateStore } = await import(`../../cli/server/policy/FileSystemPolicyStateStore.js?t=${Date.now()}`);
+const {
+    initializeFreshEdgeRoutingSources,
+    loadActiveEdgeRoutingGeneration,
+} = await import(`../../cli/services/edgeGeneration.js?t=${Date.now()}`);
 const file = path.join(tempDir, '.ploinky', 'data', 'router-security', 'policy-state.json');
+const edgeGenerationModuleUrl = new URL('../../cli/services/edgeGeneration.js', import.meta.url).href;
+const maintenanceLocksModuleUrl = new URL('../../cli/services/maintenanceLocks.js', import.meta.url).href;
 
 test.after(() => {
     process.chdir(originalCwd);
@@ -63,7 +71,9 @@ test('corrupt file fails closed: isCorrupt true, accessors signal corrupt, mutat
 
 test('mutate writes atomically and re-reads the new state', () => {
     writeState([], []);
-    const repo = new PolicyStateRepository();
+    const repo = new PolicyStateRepository({
+        store: new FileSystemPolicyStateStore({ file: () => file, coordinate: false }),
+    });
     repo.mutate((state) => { state.mcpTools.push(mcp('a', 'b', 'internal')); return state; });
     assert.equal(repo.getMcpToolEntry('a', 'b').access, 'internal');
     const onDisk = JSON.parse(fs.readFileSync(file, 'utf8'));
@@ -81,4 +91,67 @@ test('mutate throws a POLICY_PERSISTENCE_ERROR-coded error when corrupt', () => 
     } catch (err) {
         assert.equal(err.code, 'POLICY_PERSISTENCE_ERROR');
     }
+});
+
+test('coordinated policy write excludes a competing apply until candidate replacement and activation', () => {
+    fs.rmSync(path.join(tempDir, '.ploinky'), { recursive: true, force: true });
+    const { paths } = initializeFreshEdgeRoutingSources({ workspaceRoot: tempDir });
+    const originalPolicy = fs.readFileSync(paths.policyFile, 'utf8');
+    const nextPolicy = {
+        schema: 'router-policy',
+        httpRoutes: [],
+        mcpTools: [mcp('explorer', 'docs', 'authenticated')],
+    };
+    let competingApply = null;
+    let candidateRenameCount = 0;
+    const store = new FileSystemPolicyStateStore({
+        testHooks: {
+            beforeCandidateReplace({ file: candidateFile }) {
+                assert.equal(fs.realpathSync(candidateFile), fs.realpathSync(paths.policyFile));
+                candidateRenameCount += 1;
+                const selector = JSON.parse(fs.readFileSync(paths.activeSelectorFile, 'utf8'));
+                assert.equal(selector.state, 'inactive');
+                assert.equal(fs.readFileSync(paths.policyFile, 'utf8'), originalPolicy);
+                const script = `
+                    const { applyEdgeRoutingGeneration } = await import(${JSON.stringify(edgeGenerationModuleUrl)});
+                    const { createWorkspaceMutationLease } = await import(${JSON.stringify(maintenanceLocksModuleUrl)});
+                    let workspaceLease;
+                    try {
+                        createWorkspaceMutationLease({ operation: 'competing-policy-probe' });
+                        workspaceLease = { outcome: 'acquired' };
+                    } catch (error) {
+                        workspaceLease = { outcome: 'rejected', code: error.code, message: error.message };
+                    }
+                    try {
+                        const result = applyEdgeRoutingGeneration({ workspaceRoot: process.env.PLOINKY_WORKSPACE_ROOT });
+                        process.stdout.write(JSON.stringify({ workspaceLease, apply: { outcome: 'activated', generation: result.selector.generation } }));
+                    } catch (error) {
+                        process.stdout.write(JSON.stringify({ workspaceLease, apply: { outcome: 'rejected', code: error.code, message: error.message } }));
+                    }
+                `;
+                competingApply = JSON.parse(execFileSync(process.execPath, ['--input-type=module', '-e', script], {
+                    cwd: tempDir,
+                    env: { ...process.env, PLOINKY_WORKSPACE_ROOT: tempDir },
+                    encoding: 'utf8',
+                }));
+            },
+        },
+    });
+
+    store.write(nextPolicy);
+
+    assert.equal(candidateRenameCount, 1);
+    assert.equal(competingApply.workspaceLease.outcome, 'rejected');
+    assert.equal(competingApply.workspaceLease.code, 'PLOINKY_WORKSPACE_MUTATION_BUSY');
+    assert.match(competingApply.workspaceLease.message, /policy-write.*already active/);
+    assert.deepEqual(competingApply.apply, {
+        outcome: 'rejected',
+        code: 'EDGE_GENERATION_BUSY',
+        message: 'edge generation apply is already in progress',
+    });
+    const active = loadActiveEdgeRoutingGeneration({ workspaceRoot: tempDir });
+    assert.equal(active.selector.state, 'active');
+    assert.equal(active.generation.policy.mcpTools[0].agent, 'explorer');
+    assert.equal(active.generation.policy.mcpTools[0].tool, 'docs');
+    assert.equal(active.generation.policy.mcpTools[0].access, 'authenticated');
 });
