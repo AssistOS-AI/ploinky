@@ -458,7 +458,7 @@ export function createMessages({
         return Boolean(parent.closest('a, code, pre, .wa-message-mention'));
     }
 
-    function highlightMentions(container) {
+    function highlightMentions(container, tokens = []) {
         if (
             !(container instanceof Element)
             || typeof document === 'undefined'
@@ -474,7 +474,7 @@ export function createMessages({
                 if (shouldSkipMentionHighlight(node)) {
                     return nodeFilter.FILTER_REJECT;
                 }
-                return findMentionRanges(node.nodeValue || '').length
+                return findMentionRanges(node.nodeValue || '', tokens).length
                     ? nodeFilter.FILTER_ACCEPT
                     : nodeFilter.FILTER_REJECT;
             },
@@ -485,7 +485,7 @@ export function createMessages({
         }
         for (const node of nodes) {
             const value = node.nodeValue || '';
-            const ranges = findMentionRanges(value);
+            const ranges = findMentionRanges(value, tokens);
             if (!ranges.length) continue;
             const fragment = document.createDocumentFragment();
             let cursor = 0;
@@ -1110,9 +1110,14 @@ export function createMessages({
             </div>`;
         const textDiv = wrapper.querySelector('.wa-message-text');
         const bubble = wrapper.querySelector('.wa-message-bubble');
+        const referenceTokens = Array.isArray(options.references)
+            ? options.references
+                .filter((reference) => reference?.kind === 'workspace-path' && typeof reference.path === 'string')
+                .map((reference) => `@${reference.path}`)
+            : [];
         if (textDiv) {
             textDiv.innerHTML = renderMarkdown(text);
-            highlightMentions(textDiv);
+            highlightMentions(textDiv, referenceTokens);
             enhanceMarkdownTables(textDiv);
             sidePanel.bindLinkDelegation(textDiv);
         }
@@ -1415,7 +1420,12 @@ export function createMessages({
             }
             const text = formatStoredMessageText(message);
             if (message?.role === 'user') {
-                addClientMsg(text, { historical: true, timestamp: message.timestamp, messageIndex });
+                addClientMsg(text, {
+                    historical: true,
+                    timestamp: message.timestamp,
+                    messageIndex,
+                    references: message.references
+                });
             } else if (message?.role === 'assistant') {
                 addServerMsg(text, {
                     forceNew: true,

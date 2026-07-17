@@ -9,7 +9,7 @@ function escapeHtml(value) {
 
 function normalizeToken(token) {
     const value = String(token || '').trim();
-    if (!value.startsWith('@file:') || value.length <= '@file:'.length || /\s/.test(value)) return '';
+    if (!value.startsWith('@') || value.length <= 1 || /\s/.test(value)) return '';
     return value;
 }
 
@@ -46,24 +46,22 @@ export function extractMentionTokenAt(value, cursor) {
     return normalizeToken(text.slice(start, end));
 }
 
-export function findMentionRanges(value) {
+export function findMentionRanges(value, tokens = []) {
     const text = typeof value === 'string' ? value : '';
     if (!text) return [];
 
     const ranges = [];
-    const mentionPattern = /@file:[^\s<>()),;:!?]+/g;
-    let match;
-    while ((match = mentionPattern.exec(text)) !== null) {
-        const token = normalizeToken(match[0]);
-        if (!token) continue;
-        const start = match.index;
-        const end = start + token.length;
-        if (!isStartBoundary(text, start) || !isDetectedEndBoundary(text, end)) {
-            continue;
+    for (const token of normalizeTokens(tokens)) {
+        let start = text.indexOf(token);
+        while (start !== -1) {
+            const end = start + token.length;
+            if (isStartBoundary(text, start) && isDetectedEndBoundary(text, end)) {
+                ranges.push({ start, end, token });
+            }
+            start = text.indexOf(token, start + token.length);
         }
-        ranges.push({ start, end, token });
     }
-    return ranges;
+    return ranges.sort((a, b) => a.start - b.start || b.end - a.end);
 }
 
 function normalizeTokens(tokens) {
@@ -111,8 +109,14 @@ export function createComposerMentionHighlighter({ cmdInput } = {}) {
         overlay.className = 'wa-composer-input-highlights';
         overlay.setAttribute('aria-hidden', 'true');
         wrapper.insertBefore(overlay, cmdInput);
-        wrapper.classList.add('wa-mention-highlights-active');
         return overlay;
+    }
+
+    function deactivateOverlay() {
+        wrapper?.classList?.remove('wa-mention-highlights-active');
+        if (!overlay) return;
+        overlay.hidden = true;
+        overlay.innerHTML = '';
     }
 
     function pruneByText(text) {
@@ -131,11 +135,18 @@ export function createComposerMentionHighlighter({ cmdInput } = {}) {
     }
 
     function render() {
-        const target = ensureOverlay();
-        if (!target || !cmdInput) return;
+        if (!cmdInput) return;
         const value = cmdInput.value || '';
         pruneByText(value);
+        if (selectedTokens.size === 0) {
+            deactivateOverlay();
+            return;
+        }
+        const target = ensureOverlay();
+        if (!target) return;
         target.innerHTML = renderMentionHighlightHtml(value, selectedTokens);
+        target.hidden = false;
+        wrapper.classList.add('wa-mention-highlights-active');
         syncScroll();
     }
 
@@ -146,13 +157,18 @@ export function createComposerMentionHighlighter({ cmdInput } = {}) {
         render();
     }
 
-    function recordSelection(value, cursor) {
+    function recordSelection(value, cursor, { final = true } = {}) {
+        if (!final) {
+            pruneByText(value);
+            render();
+            return;
+        }
         addToken(extractMentionTokenAt(value, cursor));
     }
 
     function clear() {
         selectedTokens.clear();
-        if (overlay) overlay.innerHTML = '';
+        deactivateOverlay();
     }
 
     if (cmdInput) {

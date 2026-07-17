@@ -18,8 +18,6 @@ import {
 } from '../../cli/server/webchat/uploadPaths.js';
 import {
     listWorkspaceSuggestions,
-    normalizeUploadSuggestionQueryPath,
-    rewriteUploadSuggestionItem,
 } from '../../cli/server/handlers/webchat/workspaceSuggestions.js';
 import {
     handleWebchatUploadGet,
@@ -295,57 +293,6 @@ test('listWorkspaceSuggestions scoped to session upload root excludes sibling se
     } finally {
         fs.rmSync(cwd, { recursive: true, force: true });
     }
-});
-
-test('upload suggestion path rewriting keeps nested session-relative paths', () => {
-    const cwd = makeTempDir('webchat-session-rewrite');
-    try {
-        const sid = 'sessionA';
-        const uploadRoot = buildSessionUploadRoot(cwd, sid);
-        ensureSessionUploadRoot(uploadRoot);
-        fs.mkdirSync(path.join(uploadRoot, 'folder'), { recursive: true });
-        fs.writeFileSync(path.join(uploadRoot, 'folder', 'nested.txt'), 'a');
-
-        const result = listWorkspaceSuggestions({
-            workspaceRoot: uploadRoot,
-            base: path.join(uploadRoot, 'folder'),
-            folder: '',
-            leaf: '',
-            limit: 20,
-        });
-        assert.equal(result.ok, true);
-        const nested = result.items.find((entry) => entry.label === 'nested.txt');
-        assert.ok(nested);
-        const rewritten = rewriteUploadSuggestionItem(nested, {
-            uploadRootRelToCwd: `uploads/${sid}`,
-            uploadRootRelToWorkspace: `uploads/${sid}`,
-        });
-        assert.equal(rewritten.relativePath, 'folder/nested.txt');
-        assert.equal(rewritten.queryPath, 'folder/nested.txt');
-        assert.equal(rewritten.path, `uploads/${sid}/folder/nested.txt`);
-        assert.equal(rewritten.workspacePath, `uploads/${sid}/folder/nested.txt`);
-    } finally {
-        fs.rmSync(cwd, { recursive: true, force: true });
-    }
-});
-
-test('normalizeUploadSuggestionQueryPath strips cwd-relative upload prefixes for folder drill-down', () => {
-    assert.equal(
-        normalizeUploadSuggestionQueryPath('uploads/sessionA/folder/', 'uploads/sessionA'),
-        'folder/'
-    );
-    assert.equal(
-        normalizeUploadSuggestionQueryPath('uploads/sessionA', 'uploads/sessionA'),
-        ''
-    );
-    assert.equal(
-        normalizeUploadSuggestionQueryPath('uploads/sessionB/folder/', 'uploads/sessionA'),
-        'uploads/sessionB/folder/'
-    );
-    assert.equal(
-        normalizeUploadSuggestionQueryPath('/uploads/sessionA/folder/', 'uploads/sessionA'),
-        '/uploads/sessionA/folder/'
-    );
 });
 
 test('webchat upload GET preserves MIME metadata written at POST time', async () => {

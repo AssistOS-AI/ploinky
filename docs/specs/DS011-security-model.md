@@ -129,7 +129,7 @@ Lifecycle hooks are trusted host or runtime code. `preinstall` runs on the host 
 
 Workspace file reads and uploads must remain confined to the workspace root. `cli/server/utils/workspacePaths.js` rejects null bytes, resolves leading slashes as workspace-relative when requested, canonicalizes paths through realpath-aware logic, and denies symlink escapes outside the workspace.
 
-The WebChat composer autocomplete file-suggestion endpoint (`/webchat/suggestions/files`) must apply the same workspace-confinement rules as Explorer's filesystem reads. The endpoint additionally narrows its search root to the current WebChat session upload directory `<cwd>/uploads/<sessionId>`, where `sessionId` is the `webchat_sid` cookie value, and rejects absolute caller paths, traversal (`..`), NUL bytes, symlink escapes outside both the workspace root and the session upload root, and the reserved secret files `.secrets` and `*.secrets`. Sibling session upload directories must never appear in suggestion results. The endpoint must not return host absolute paths to the browser. The endpoint provides suggestions only; downstream chat agents must still validate any structured `workspace-path` references they receive before reading file content. WebChat must sanitize references on the way out by dropping absolute paths, traversal, NUL bytes, reserved secret-file names, and any non-string path values.
+The WebChat composer autocomplete file-suggestion endpoint (`/webchat/suggestions/files`) must apply the same workspace-confinement rules as Explorer's filesystem reads. It narrows its search root to the workspace-confined current directory resolved from the WebChat launch query and rejects absolute caller paths, traversal (`..`), NUL bytes, symlink escapes outside that directory, Ploinky runtime state, dependency directories, and the reserved secret files `.secrets` and `*.secrets`. The endpoint must return only cwd-relative or workspace-relative paths and must not return host absolute paths to the browser. The endpoint provides suggestions only; downstream chat agents must still validate any structured `workspace-path` references they receive before reading file content. WebChat must sanitize references on the way out by dropping absolute paths, traversal, NUL bytes, reserved secret-file names, and any non-string path values.
 
 WebChat session-scoped uploads must follow the same containment rules. `POST /webchat/uploads` accepts file bytes and an optional `X-Relative-Path` header (for browser folder selection via `webkitdirectory`) and writes the result to `<cwd>/uploads/<sessionId>/<sanitized-relative-path>`. The server must reject absolute caller paths, traversal segments, NUL bytes, reserved secret-file names, and any path whose canonical resolution leaves the session upload root via a symlink. Existing target files are not overwritten; a deterministic ` (n)` suffix is appended to the leaf name. Responses report only relative paths scoped to the WebChat working directory or workspace root (e.g. `uploads/<sessionId>/notes.md`) and never expose host absolute paths. Stored MIME metadata for download responses lives in `uploads/.webchat-upload-metadata/<sessionId>/`, outside the user-visible session upload tree. `GET /webchat/uploads?path=...` and `HEAD /webchat/uploads?path=...` stream previously stored content with stored `Content-Type`, `X-Content-Type-Options: nosniff`, and the same unsafe path rejection. The session upload directory is a UX convenience scope, not a security boundary between hostile sessions; the workspace operator trust model still applies.
 
@@ -198,6 +198,17 @@ Per-agent credential isolation is now implemented (DS013) and the router enforce
 
 Response:
 A manifest already controls runtime commands, env defaults, mounts, profiles, and service declarations for an enabled agent. Letting the same manifest declare public read-only or protected transparent proxy paths keeps that routing intent with the agent source, but it must be documented as trusted power because `public` changes anonymous reachability. The security boundary is preserved by limiting public to `GET`/`HEAD`, by making protected win over public on overlaps, and by reusing the router's internal-path rejection before any declaration can affect request handling.
+
+### Question #7: Why must path autocomplete remain confined to the resolved WebChat working directory?
+
+Response:
+The workspace root is the broad operator trust boundary, but a WebChat launch
+may intentionally select a narrower project directory. Treating that resolved
+directory as the suggestion root prevents the browser from using autocomplete
+to enumerate sibling projects and ensures every returned token has the same
+relative-path meaning for the launched CLI. Downstream agents must still
+validate references before reading them because autocomplete is discovery, not
+read authorization.
 
 ## Conclusion
 

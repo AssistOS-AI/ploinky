@@ -1975,8 +1975,12 @@ body {
 }
 
 .wa-composer-mention {
-    font-weight: 700;
+    font-weight: inherit;
     color: var(--wa-text-primary);
+    text-decoration: underline;
+    text-decoration-color: rgba(91, 111, 102, 0.72);
+    text-decoration-thickness: 1px;
+    text-underline-offset: 2px;
 }
 
 .wa-message-mention {

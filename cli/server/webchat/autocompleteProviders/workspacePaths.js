@@ -1,11 +1,10 @@
-const MAX_INFLIGHT_CACHE = 16;
+const MAX_SUGGESTION_CACHE_ENTRIES = 16;
 
 function sanitizeBrowserToken(token) {
     const raw = String(token || '').trim();
     if (!raw) return { folder: '', leaf: '' };
     if (raw.includes('\0')) return null;
-    const body = raw.startsWith('file:') ? raw.slice('file:'.length) : raw;
-    const normalized = body.replace(/\\+/g, '/');
+    const normalized = raw.replace(/\\+/g, '/');
     if (normalized.startsWith('/')) return null;
     if (normalized.split('/').some((segment) => segment === '..')) return null;
     const lastSlash = normalized.lastIndexOf('/');
@@ -37,8 +36,7 @@ export function applyWorkspacePathSelectionToValue(value, relativePath, type, tr
     const inputValue = typeof value === 'string' ? value : '';
     const range = tokenRangeForTrigger(inputValue, triggerInfo, '@');
     if (!range) return null;
-    const tokenBody = `file:${relativePath}`;
-    const insertText = type === 'folder' ? `@${tokenBody}/` : `@${tokenBody} `;
+    const insertText = type === 'folder' ? `@${relativePath}/` : `@${relativePath} `;
     const tailStart = insertText.endsWith(' ') && /\s/.test(inputValue.charAt(range.tokenEnd))
         ? range.tokenEnd + 1
         : range.tokenEnd;
@@ -49,13 +47,13 @@ export function applyWorkspacePathSelectionToValue(value, relativePath, type, tr
     };
 }
 
-function suggestionRecord(item, { state, basePath, dlog }) {
+function suggestionRecord(item, { state, dlog }) {
     const kind = item.kind === 'folder' ? 'folder' : 'file';
     const relativePath = String(item.path || '').replace(/^\/+/, '');
     const label = String(item.label || relativePath);
     const displayPath = String(item.displayPath || relativePath || label).replace(/^\/+/, '');
     const description = kind === 'folder' ? 'Folder' : 'File';
-    const token = `@file:${relativePath}`;
+    const token = `@${relativePath}`;
     return {
         label: kind === 'folder'
             ? `${displayPath.replace(/\/+$/, '')}/`
@@ -81,45 +79,51 @@ function suggestionRecord(item, { state, basePath, dlog }) {
     };
 }
 
-export function createWorkspacePathsProvider({ basePath, state, dlog } = {}) {
+export function createWorkspacePathsProvider({ basePath, toEndpoint, state, dlog } = {}) {
     const endpointBase = String(basePath || '').replace(/\/+$/, '') || '';
-    const endpoint = endpointBase ? `${endpointBase}/suggestions/files` : '/webchat/suggestions/files';
-    let cachedItems = [];
-    let cachedKey = '';
-    let pendingKey = '';
-    const seenKeys = new Map();
+    const buildEndpoint = typeof toEndpoint === 'function'
+        ? toEndpoint
+        : (suffix) => endpointBase
+            ? `${endpointBase}/${String(suffix || '').replace(/^\/+/, '')}`
+            : `/webchat/${String(suffix || '').replace(/^\/+/, '')}`;
+    const itemsByKey = new Map();
+    const requestsByKey = new Map();
 
-    async function fetchSuggestions(folder, leaf) {
+    function cacheItems(key, items) {
+        if (itemsByKey.has(key)) itemsByKey.delete(key);
+        itemsByKey.set(key, items);
+        while (itemsByKey.size > MAX_SUGGESTION_CACHE_ENTRIES) {
+            const oldestKey = itemsByKey.keys().next().value;
+            if (oldestKey === undefined) break;
+            itemsByKey.delete(oldestKey);
+        }
+    }
+
+    function fetchSuggestions(folder, leaf) {
         const key = `${folder}::${leaf}`;
-        if (key === cachedKey) return cachedItems;
-        if (seenKeys.has(key)) return seenKeys.get(key);
-        if (pendingKey === key) return cachedItems;
-        pendingKey = key;
-        const params = new URLSearchParams();
-        params.set('query', folder ? `${folder}/${leaf || ''}` : (leaf || ''));
-        const url = `${endpoint}?${params.toString()}`;
-        try {
-            const res = await fetch(url, { credentials: 'include' });
-            if (!res.ok) {
-                pendingKey = '';
+        if (itemsByKey.has(key)) return Promise.resolve(itemsByKey.get(key));
+        if (requestsByKey.has(key)) return requestsByKey.get(key);
+
+        const request = (async () => {
+            const params = new URLSearchParams();
+            params.set('query', folder ? `${folder}/${leaf || ''}` : (leaf || ''));
+            const url = buildEndpoint(`suggestions/files?${params.toString()}`);
+            try {
+                const res = await fetch(url, { credentials: 'include' });
+                if (!res.ok) return [];
+                const body = await res.json().catch(() => null);
+                const items = Array.isArray(body?.items) ? body.items : [];
+                cacheItems(key, items);
+                return items;
+            } catch (err) {
+                dlog?.('WorkspacePathsProvider: suggestion fetch failed', err?.message || err);
                 return [];
             }
-            const body = await res.json().catch(() => null);
-            const items = Array.isArray(body?.items) ? body.items : [];
-            cachedItems = items;
-            cachedKey = key;
-            if (seenKeys.size >= MAX_INFLIGHT_CACHE) {
-                const firstKey = seenKeys.keys().next().value;
-                if (firstKey !== undefined) seenKeys.delete(firstKey);
-            }
-            seenKeys.set(key, items);
-            return items;
-        } catch (err) {
-            dlog?.('WorkspacePathsProvider: suggestion fetch failed', err?.message || err);
-            return [];
-        } finally {
-            pendingKey = '';
-        }
+        })();
+        requestsByKey.set(key, request);
+        return request.finally(() => {
+            if (requestsByKey.get(key) === request) requestsByKey.delete(key);
+        });
     }
 
     function tokenFromTrigger(triggerInfo) {
@@ -133,7 +137,8 @@ export function createWorkspacePathsProvider({ basePath, state, dlog } = {}) {
         const parsed = tokenFromTrigger(triggerInfo);
         if (parsed === null) return [];
         const key = `${parsed.folder}::${parsed.leaf}`;
-        if (key !== cachedKey) return [];
+        const cachedItems = itemsByKey.get(key);
+        if (!cachedItems) return [];
         const leafLower = parsed.leaf ? parsed.leaf.toLowerCase() : '';
         const matches = cachedItems.filter((item) => {
             const label = String(item?.label || '');
@@ -142,7 +147,7 @@ export function createWorkspacePathsProvider({ basePath, state, dlog } = {}) {
             return label.toLowerCase().includes(leafLower)
                 || displayPath.toLowerCase().includes(leafLower);
         });
-        return matches.map((item) => suggestionRecord(item, { state, basePath, dlog }));
+        return matches.map((item) => suggestionRecord(item, { state, dlog }));
     }
 
     function requestSuggestions(value, triggerInfo) {

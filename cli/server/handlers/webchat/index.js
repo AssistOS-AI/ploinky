@@ -116,7 +116,7 @@ export async function handleWebChat(req, res, appConfig, appState) {
     })) return;
 
     if (pathname === '/suggestions/files' && (req.method === 'GET' || req.method === 'HEAD')) {
-        return handleSuggestionsFiles(req, res, parsedUrl, getSession(req, appState));
+        return handleSuggestionsFiles(req, res, parsedUrl);
     }
 
     if (pathname === '/uploads') {

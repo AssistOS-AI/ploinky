@@ -17,6 +17,7 @@ export function findTriggerAt(value, caretIndex, triggers) {
             if (prev && !/\s/.test(prev) && prev !== '\n') continue;
         }
         const after = inputValue.slice(idx + 1, safeCaret);
+        if (triggerChar === '@' && /\s/.test(after)) continue;
         if (/[\n\r]/.test(after)) continue;
         if (!best || idx > best.triggerIndex) {
             best = { trigger: triggerChar, triggerIndex: idx, token: after };
@@ -64,6 +65,7 @@ export function createComposerAutocomplete({ cmdInput }, { providers = [], dlog,
     let selectedIndex = -1;
     let renderedSuggestionCount = MENU_RENDER_BATCH;
     let renderingMenu = false;
+    let requestGeneration = 0;
 
     function ensureMenuElement() {
         if (menuEl) return menuEl;
@@ -100,7 +102,8 @@ export function createComposerAutocomplete({ cmdInput }, { providers = [], dlog,
         menuEl.style.width = `${Math.max(320, rect.width)}px`;
     }
 
-    function hideMenu() {
+    function hideMenu({ invalidatePending = false } = {}) {
+        if (invalidatePending) requestGeneration += 1;
         if (menuEl) {
             menuEl.style.display = 'none';
         }
@@ -166,6 +169,7 @@ export function createComposerAutocomplete({ cmdInput }, { providers = [], dlog,
         }
         if (!next) return;
         cmdInput.value = next.value;
+        cmdInput.focus();
         try {
             cmdInput.setSelectionRange(next.cursor, next.cursor);
         } catch (_) { /* selection support is best-effort */ }
@@ -177,7 +181,9 @@ export function createComposerAutocomplete({ cmdInput }, { providers = [], dlog,
             }
         }
         cmdInput.dispatchEvent(new Event('input', { bubbles: true }));
-        cmdInput.focus();
+        try {
+            cmdInput.setSelectionRange(next.cursor, next.cursor);
+        } catch (_) { /* input listeners must not leave the caret at a stale position */ }
         if (typeof suggestion.onSelected === 'function') {
             try {
                 suggestion.onSelected();
@@ -190,7 +196,7 @@ export function createComposerAutocomplete({ cmdInput }, { providers = [], dlog,
             renderMenu();
             return;
         }
-        hideMenu();
+        hideMenu({ invalidatePending: true });
     }
 
     function renderMenu({ preserveScrollTop = null, ensureSelectedVisible = true } = {}) {
@@ -317,9 +323,10 @@ export function createComposerAutocomplete({ cmdInput }, { providers = [], dlog,
     function scheduleFetchAndRender() {
         const triggerInfo = activeTrigger();
         if (!triggerInfo) {
-            hideMenu();
+            hideMenu({ invalidatePending: true });
             return;
         }
+        const generation = ++requestGeneration;
         const matched = providerList.filter((p) => p.trigger === triggerInfo.trigger);
         renderMenu();
         for (const provider of matched) {
@@ -330,7 +337,7 @@ export function createComposerAutocomplete({ cmdInput }, { providers = [], dlog,
                     dlog?.('ComposerAutocomplete: provider requestSuggestions failed', err?.message || err);
                 })
                 .finally(() => {
-                    if (cmdInput && activeTrigger()) {
+                    if (generation === requestGeneration && cmdInput && activeTrigger()) {
                         renderMenu({
                             preserveScrollTop: menuEl?.scrollTop ?? 0,
                             ensureSelectedVisible: false,
@@ -343,7 +350,7 @@ export function createComposerAutocomplete({ cmdInput }, { providers = [], dlog,
     function onInputChange() {
         const triggerInfo = activeTrigger();
         if (!triggerInfo) {
-            hideMenu();
+            hideMenu({ invalidatePending: true });
             return;
         }
         selectedIndex = -1;
@@ -374,7 +381,7 @@ export function createComposerAutocomplete({ cmdInput }, { providers = [], dlog,
         }
         if (event.key === 'Escape') {
             event.preventDefault();
-            hideMenu();
+            hideMenu({ invalidatePending: true });
             return true;
         }
         return false;
@@ -391,7 +398,7 @@ export function createComposerAutocomplete({ cmdInput }, { providers = [], dlog,
     }
 
     function destroy() {
-        hideMenu();
+        hideMenu({ invalidatePending: true });
         if (menuEl) {
             menuEl.remove();
             menuEl = null;

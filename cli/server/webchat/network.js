@@ -454,7 +454,7 @@ export function createNetwork({
     function sendCommand(cmd, options = {}) {
         const message = typeof cmd === 'string' ? cmd : '';
         const references = Array.isArray(options?.references) ? options.references : [];
-        addClientMsg(message);
+        addClientMsg(message, { references });
         postEnvelope({ text: message, references });
         if (pendingUploads === 0) {
             showTypingIndicator();
