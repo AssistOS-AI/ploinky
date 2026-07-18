@@ -12,6 +12,7 @@ import {
 import { normalizeManifestHttpRouteAccess } from '../server/policy/HttpRouteProviders.js';
 import { compileHttpRoutePolicy } from '../server/policy/HttpRoutePolicyCompiler.js';
 import {
+    assertNoHttpServicePublicationFields,
     normalizeHttpServicePort,
     normalizeHttpServiceSlug,
     serviceSlug,
@@ -496,6 +497,7 @@ function normalizePrefix(value, fallback, label) {
 
 function normalizeServiceDefinition(routeKey, route, spec, label) {
     assertObject(spec, label);
+    assertNoHttpServicePublicationFields(spec, label);
     for (const removed of ['auth', 'mode', 'forceGuest']) {
         if (Object.prototype.hasOwnProperty.call(spec, removed)) {
             throw edgeError(`${label}.${removed} was removed; use access`);
@@ -876,6 +878,7 @@ function validateRoutingShape(routing, manifests) {
             try {
                 validateManifestHttpServices(manifest, { label: `manifest(${routeKey})` });
             } catch (error) {
+                if (error?.code === 'PLOINKY_MANIFEST_HTTP_SERVICE_INVALID') throw error;
                 throw edgeError(error?.message || String(error));
             }
         }

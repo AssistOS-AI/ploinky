@@ -11,10 +11,28 @@ function manifestContractError(message) {
 }
 
 const REMOVED_EXTRA_SERVICE_PORT_FIELD = ['additional', 'ServerPort'].join('');
+const PUBLICATION_SHAPED_HTTP_SERVICE_FIELDS = Object.freeze([
+    'hostPort',
+    'hostIp',
+    'publish',
+    'publishedPort',
+    'expose',
+    'listenLan',
+]);
 
 function assertRemovedExtraServicePortAbsent(value, label) {
     if (own(value, REMOVED_EXTRA_SERVICE_PORT_FIELD)) {
         throw manifestContractError(`${label}.${REMOVED_EXTRA_SERVICE_PORT_FIELD} was removed; use httpServices[].port`);
+    }
+}
+
+function assertNoHttpServicePublicationFields(spec, label = 'httpServices[]') {
+    for (const field of PUBLICATION_SHAPED_HTTP_SERVICE_FIELDS) {
+        if (own(spec, field)) {
+            throw manifestContractError(
+                `${label}.${field} is a physical-host publication field; httpServices[].port is a private service target selector and never a physical-host publication`,
+            );
+        }
     }
 }
 
@@ -76,6 +94,7 @@ function validateHttpServiceEntries(manifest, { label = 'manifest' } = {}) {
         if (!service || typeof service !== 'object' || Array.isArray(service)) {
             throw manifestContractError(`${serviceLabel} must be an object`);
         }
+        assertNoHttpServicePublicationFields(service, serviceLabel);
         serviceSlug(service, serviceLabel);
         normalizeHttpServicePort(service.port, `${serviceLabel}.port`);
     }
@@ -121,6 +140,7 @@ function resolveHostHttpServiceTargets(manifest = {}, options = {}) {
 }
 
 export {
+    assertNoHttpServicePublicationFields,
     SERVICE_SLUG_PATTERN,
     collectHttpServiceEntries,
     explicitHttpServicePorts,

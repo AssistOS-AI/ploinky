@@ -4,6 +4,7 @@ import test from 'node:test';
 import { normalizeServiceSpec } from '../../cli/server/httpServiceRoutes.js';
 import {
     explicitHttpServicePorts,
+    resolveHostHttpServiceTargets,
     validateManifestHttpServices,
 } from '../../cli/services/httpServicePortConfig.js';
 import { resolveManifestRuntimeProfile } from '../../cli/services/profileService.js';
@@ -54,4 +55,74 @@ test('removed extra service port field is rejected at manifest and profile bound
             production: { [removedField]: 3000 },
         },
     }, { agentName: 'fixtures/removed-profile' }), /was removed/);
+});
+
+test('httpServices reject physical-host publication-shaped fields at manifest and profile boundaries', () => {
+    for (const [field, value] of [
+        ['hostPort', 3000],
+        ['hostIp', '127.0.0.1'],
+        ['publish', true],
+        ['publishedPort', 3000],
+        ['expose', true],
+        ['listenLan', true],
+    ]) {
+        for (const manifest of [
+            {
+                httpServices: [{
+                    slug: 'dashboard',
+                    externalPrefix: '/dashboard/',
+                    access: 'authenticated',
+                    [field]: value,
+                }],
+            },
+            {
+                profiles: {
+                    default: {
+                        httpServices: [{
+                            slug: 'dashboard',
+                            externalPrefix: '/dashboard/',
+                            access: 'authenticated',
+                            [field]: value,
+                        }],
+                    },
+                },
+            },
+        ]) {
+            assert.throws(
+                () => validateManifestHttpServices(manifest),
+                (error) => error?.code === 'PLOINKY_MANIFEST_HTTP_SERVICE_INVALID'
+                    && /physical-host publication|private service target|httpServices\[\]\.port/.test(error.message),
+            );
+        }
+    }
+});
+
+test('httpServices explicit ports remain private target selectors only', () => {
+    const manifest = {
+        httpServices: [
+            { slug: 'dashboard', port: 3000, externalPrefix: '/dashboard/', access: 'authenticated' },
+            { slug: 'telemetry', port: 3001, externalPrefix: '/telemetry/', access: 'guest' },
+        ],
+    };
+    const forbiddenFields = ['hostIp', 'hostPort', 'publish', 'publishedPort', 'expose', 'listenLan'];
+
+    assert.deepEqual(explicitHttpServicePorts(manifest), [3000, 3001]);
+    const targets = resolveHostHttpServiceTargets(manifest);
+    assert.deepEqual(targets, { 3000: 3000, 3001: 3001 });
+    for (const field of forbiddenFields) {
+        assert.equal(Object.hasOwn(targets, field), false);
+    }
+});
+
+test('route service normalization rejects physical-host publication-shaped fields', () => {
+    assert.throws(
+        () => normalizeServiceSpec('alpha', { hostPort: 43101 }, {
+            slug: 'dashboard',
+            externalPrefix: '/dashboard/',
+            access: 'authenticated',
+            hostPort: 3000,
+        }),
+        (error) => error?.code === 'PLOINKY_MANIFEST_HTTP_SERVICE_INVALID'
+            && /physical-host publication|private service target/.test(error.message),
+    );
 });

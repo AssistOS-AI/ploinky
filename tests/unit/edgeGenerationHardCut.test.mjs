@@ -148,6 +148,33 @@ function generationFile(result) {
     );
 }
 
+test('coordinated generation rejects publication-shaped httpServices fields', (t) => {
+    const fixture = createFixture(t, {
+        routes: [{
+            routeKey: 'alpha',
+            repo: 'fixtures',
+            agent: 'alpha',
+            hostPort: 43101,
+            services: [{
+                slug: 'dashboard',
+                externalPrefix: '/services/alpha-dashboard/',
+                internalPrefix: '/',
+                access: 'authenticated',
+                hostPort: 3000,
+            }],
+        }],
+    });
+
+    assert.throws(
+        () => applyEdgeRoutingGeneration({
+            workspaceRoot: fixture.workspace,
+            reason: 'publication-shaped-service-field',
+        }),
+        (error) => error?.code === 'PLOINKY_MANIFEST_HTTP_SERVICE_INVALID'
+            && /physical-host publication|httpServices\[\]\.port/.test(error.message),
+    );
+});
+
 test('fresh edge initialization creates every explicit empty source exactly once', (t) => {
     const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-edge-fresh-'));
     t.after(() => fs.rmSync(workspace, { recursive: true, force: true }));

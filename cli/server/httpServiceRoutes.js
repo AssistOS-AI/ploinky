@@ -8,6 +8,7 @@ import { resolveMaxTtlSeconds } from './mcp-proxy/userDelegationGrant.js';
 import { normalizeHttpRouteAccess } from './policy/HttpRouteAccessDecision.js';
 import { loadActiveEdgeRoutingGeneration } from '../services/edgeGeneration.js';
 import {
+    assertNoHttpServicePublicationFields,
     normalizeHttpServicePort,
     serviceSlug,
 } from '../services/httpServicePortConfig.js';
@@ -251,6 +252,7 @@ function validateAndNormalizeDelegations(spec, access, route = {}) {
 
 function normalizeServiceSpec(routeKey, route, spec) {
     if (!spec || typeof spec !== 'object') return null;
+    assertNoHttpServicePublicationFields(spec, `HTTP service '${routeKey}'`);
     for (const field of REMOVED_SERVICE_SPEC_FIELDS) {
         if (Object.prototype.hasOwnProperty.call(spec, field)) {
             throw new Error(`HTTP service spec field '${field}' was removed; declare access: public | guest | authenticated`);
