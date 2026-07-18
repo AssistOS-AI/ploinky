@@ -124,3 +124,46 @@ DS005 frontmatter was unchanged, and `docs/specs/matrix.md` was not touched.
 ### Concerns
 
 None.
+
+## Review Finding Fix: Complete Tuple Validation Before Router Startup
+
+### What Changed
+
+- Moved the existing `ensureRouterReadyForStart()` call in `startWorkspace()` to immediately after the first inactive `ensureGraphNodesEnabled()` preparation.
+- Kept `initializeFreshEdgeRoutingSources()` unchanged: a complete four-source tuple remains a bootstrap no-op with no repair, rollback, cleanup, retry, or new classifier validation.
+- Updated the workspace dependency-graph source-order guard to require normal graph preparation before the Router/Watchdog startup call. That preparation reaches `prepareAgentEnableBatch()`, the existing owner of complete-tuple parse/schema validation.
+- Updated DS005 and the architecture page to state that malformed, unreadable, or inconsistent complete state stops startup before Router/Watchdog launch through normal generation preparation.
+
+### TDD RED
+
+Command:
+
+```bash
+node --test tests/unit/workspaceDependencyGraph.test.mjs
+```
+
+Observed result: 41 passed and 1 failed out of 42 tests. The new `workspace graph preparation precedes Router startup and every agent startup` guard failed with `normal graph preparation must reject malformed complete edge sources before Router startup`, proving the prior source order launched the Router first.
+
+### GREEN And Focused Verification
+
+| Check | Result |
+| --- | --- |
+| `node --test tests/unit/workspaceDependencyGraph.test.mjs` | PASS, 42/42 |
+| `node --test tests/unit/edgeGenerationHardCut.test.mjs tests/unit/workspaceDependencyGraph.test.mjs` | PASS, 94/94 |
+| `git diff --check` | PASS, no output and exit 0 |
+
+### Files Changed
+
+- `cli/services/workspaceUtil.js`
+- `tests/unit/workspaceDependencyGraph.test.mjs`
+- `docs/specs/DS005-routing-and-web-surfaces.md`
+- `docs/architecture.html`
+- `.superpowers/sdd/task-4-report.md`
+
+### Matrix And Frontmatter
+
+DS005 frontmatter was unchanged, so `docs/specs/matrix.md` was not regenerated.
+
+### Concerns
+
+None.

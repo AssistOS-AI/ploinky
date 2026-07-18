@@ -258,7 +258,7 @@ test('static preinstall failure is fatal before startup providers can run', () =
     assert.doesNotMatch(source, /Preinstall failed:|Preinstall hook error:/);
 });
 
-test('workspace router TCP listener and both inactive graph preparations precede every agent startup', () => {
+test('workspace graph preparation precedes Router startup and every agent startup', () => {
     const source = startWorkspace.toString();
     const routerIndex = source.indexOf('await ensureRouterReadyForStart({');
     const generationIndex = source.indexOf('ensureGraphNodesEnabled(dependencyGraph, reg, {');
@@ -268,7 +268,7 @@ test('workspace router TCP listener and both inactive graph preparations precede
 
     assert.ok(lockIndex >= 0 && lockIndex < routerIndex, 'workspace start must suppress watchdog container reconciliation before router startup');
     assert.ok(routerIndex >= 0, 'workspace start must establish the router listener');
-    assert.ok(generationIndex > routerIndex, 'the complete graph identity generation must follow Router listener startup');
+    assert.ok(generationIndex >= 0 && generationIndex < routerIndex, 'normal graph preparation must reject malformed complete edge sources before Router startup');
     assert.ok(finalPreparationIndex > generationIndex, 'provider-sensitive identities require a second inactive preparation');
     assert.ok(launchIndex > finalPreparationIndex, 'no managed process may start before the final graph identity generation is prepared');
     assert.match(source, /preparedGeneration\?\.selector\?\.state !== 'inactive'/);

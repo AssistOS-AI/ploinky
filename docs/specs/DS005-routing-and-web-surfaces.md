@@ -43,7 +43,10 @@ Unreadable or corrupt input, a digest mismatch, an interrupted apply, and an
 invalid candidate leave the selectors inactive; no prior generation is restored
 as a fallback. A missing policy, desired-state, enabled-agent, routing, manifest,
 or provider source is unavailable input and is never substituted with an empty
-document. A complete four-file source tuple remains a bootstrap no-op. A
+document. A complete four-file source tuple remains a bootstrap no-op. Before
+Router/Watchdog launch, normal graph generation preparation owns parse and
+schema validation for that complete tuple; malformed, unreadable, or
+inconsistent state stops startup without bootstrap repair. A
 genuinely fresh workspace initializes the four persisted source documents
 together before its first mutation only when all four documents are absent and
 no persisted generation evidence or legacy bootstrap residue is present. A

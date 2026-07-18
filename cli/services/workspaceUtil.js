@@ -1272,13 +1272,6 @@ async function startWorkspace(staticAgentArg, portArg, {
     } catch (e) {
       throw new Error(`start: Agent '${staticAgent}' not found in any repo. Use 'enable agent <repo/name>' or check repos.`);
     }
-    await ensureRouterReadyForStart({
-      staticAgent,
-      staticPort,
-      repoName: staticRepoName,
-      shortAgentName: staticShortAgent,
-    });
-
     // Install/prepare the complete manifest repo graph without starting any
     // consumer, then compile one target-less inactive edge generation. Static
     // preinstall and config-provider hooks receive that exact topology before
@@ -1324,6 +1317,12 @@ async function startWorkspace(staticAgentArg, portArg, {
     if (preparedGraph?.preparedGeneration?.selector?.state !== 'inactive') {
       throw new Error('start: graph prelaunch generation did not remain inactive');
     }
+    await ensureRouterReadyForStart({
+      staticAgent,
+      staticPort,
+      repoName: staticRepoName,
+      shortAgentName: staticShortAgent,
+    });
 
     // Run the static (main) agent preinstall only after the inactive topology
     // exists. This hook may populate values consumed by startup config
