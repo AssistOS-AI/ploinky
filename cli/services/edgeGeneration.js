@@ -545,7 +545,7 @@ function normalizeCompiledDelegations(spec, route, access, label) {
             String(entry || '').trim()
         )).filter(Boolean))];
         if (!tools.length || !scope.length) throw edgeError(`${label}.delegations[${index}] requires tools and scopes`);
-        const ttlRaw = Number.parseInt(String(delegation.ttlSeconds), 10);
+        const ttlRaw = Number.parseInt(String(delegation.ttlSeconds || ''), 10);
         const ttlSeconds = Number.isFinite(ttlRaw) ? ttlRaw : 1800;
         if (!Number.isSafeInteger(ttlSeconds) || ttlSeconds < 30 || ttlSeconds > resolveMaxTtlSeconds()) {
             throw edgeError(`${label}.delegations[${index}].ttlSeconds is invalid`);

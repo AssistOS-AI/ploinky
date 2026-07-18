@@ -1007,7 +1007,7 @@ test('generation canonicalizes delegation queryPathRoots aliases', (t) => {
     });
 });
 
-test('generation rejects delegation ttlSeconds below the minimum', (t) => {
+test('generation defaults falsy delegation ttlSeconds to 1800', (t) => {
     const fixture = createFixture(t, {
         routes: [{
             routeKey: 'alpha',
@@ -1029,10 +1029,12 @@ test('generation rejects delegation ttlSeconds below the minimum', (t) => {
         }],
     });
 
-    assert.throws(
-        () => applyEdgeRoutingGeneration({ workspaceRoot: fixture.workspace, reason: 'delegation-zero-ttl' }),
-        /ttlSeconds is invalid/,
-    );
+    const applied = applyEdgeRoutingGeneration({
+        workspaceRoot: fixture.workspace,
+        reason: 'delegation-zero-ttl',
+    });
+
+    assert.equal(applied.generation.compiled.services[0].delegations[0].ttlSeconds, 1800);
 });
 
 test('generation rejects invalid delegations.scopes before falling back to scope', (t) => {
