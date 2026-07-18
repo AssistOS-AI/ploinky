@@ -54,6 +54,10 @@ const {
     startWorkspace,
     waitForReadinessEntries,
 } = await import(`${workspaceUtilModuleUrl.href}${moduleSuffix}`);
+const agentsModuleUrl = new URL('../../cli/services/agents.js', import.meta.url);
+const {
+    prepareAgentEnableBatch,
+} = await import(`${agentsModuleUrl.href}${moduleSuffix}`);
 
 test.after(() => {
     process.chdir(originalCwd);
@@ -164,6 +168,30 @@ test('start workspace clears a stale host port when start-only readiness resolve
         startWorkspace.toString(),
         /if \(!resolvedHostPort\) delete nextRoute\.hostPort/,
     );
+});
+
+test('workspace start and agent-enable preparation classify fresh edge sources before mutation', () => {
+    const workspaceStartSource = startWorkspace.toString();
+    const workspaceInitializeIndex = workspaceStartSource.indexOf('initializeFreshEdgeRoutingSources');
+    const workspaceInactivateIndex = workspaceStartSource.indexOf("inactivateEdgeRoutingGeneration('workspace-start-prepare'");
+    const workspacePortIndex = workspaceStartSource.indexOf('resolveAndPersistStartRouterPort');
+    const workspaceRepositoriesIndex = workspaceStartSource.indexOf('prepareManifestRepositories');
+
+    assert.ok(workspaceInitializeIndex >= 0, 'workspace start must classify fresh edge sources');
+    assert.ok(workspaceInitializeIndex < workspaceInactivateIndex, 'workspace start must classify before generation inactivation');
+    assert.ok(workspaceInitializeIndex < workspacePortIndex, 'workspace start must classify before router-port persistence');
+    assert.ok(workspaceInitializeIndex < workspaceRepositoriesIndex, 'workspace start must classify before repository preparation');
+
+    const agentEnableSource = prepareAgentEnableBatch.toString();
+    const agentInitializeIndex = agentEnableSource.indexOf('initializeFreshEdgeRoutingSources');
+    const agentLoadAgentsIndex = agentEnableSource.indexOf('loadAgents()');
+    const agentLoadRoutingIndex = agentEnableSource.indexOf('loadRoutingConfig()');
+    const agentLockIndex = agentEnableSource.indexOf('withEdgeGenerationApplyLock');
+
+    assert.ok(agentInitializeIndex >= 0, 'agent-enable preparation must classify fresh edge sources');
+    assert.ok(agentInitializeIndex < agentLoadAgentsIndex, 'agent-enable preparation must classify before agent reads');
+    assert.ok(agentInitializeIndex < agentLoadRoutingIndex, 'agent-enable preparation must classify before routing reads');
+    assert.ok(agentInitializeIndex < agentLockIndex, 'agent-enable preparation must classify before edge apply locking');
 });
 
 test('start workspace forwards each dependency registry profile to its synchronous service launch', () => {

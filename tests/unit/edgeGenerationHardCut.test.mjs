@@ -17,6 +17,7 @@ import {
     normalizePublicMediaIPv4,
     prepareEdgeRoutingGeneration,
     readCurrentEdgeTopology,
+    resolveEdgeGenerationPaths,
     withEdgeGenerationApplyLock,
 } from '../../cli/services/edgeGeneration.js';
 import { resolveEdgeRoutePlan } from '../../cli/server/edgeRoutePlan.js';
@@ -189,6 +190,92 @@ test('fresh edge initialization creates every explicit empty source exactly once
     });
     assert.deepEqual(JSON.parse(fs.readFileSync(initialized.paths.desiredFile, 'utf8')), localDesired());
     assert.equal(initializeFreshEdgeRoutingSources({ workspaceRoot: workspace }).initialized, false);
+});
+
+test('fresh edge initialization rejects partial source subsets with clean-workspace guidance and no mutation', (t) => {
+    const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-edge-partial-'));
+    t.after(() => fs.rmSync(workspace, { recursive: true, force: true }));
+    const paths = resolveEdgeGenerationPaths({ workspaceRoot: workspace });
+    const sentinel = Buffer.from('{"routes":{"kept":{"hostPort":43101}}}');
+    fs.mkdirSync(path.dirname(paths.routingFile), { recursive: true });
+    fs.writeFileSync(paths.routingFile, sentinel);
+
+    assert.throws(
+        () => initializeFreshEdgeRoutingSources({ workspaceRoot: workspace }),
+        (error) => error?.code === 'EDGE_GENERATION_SOURCE_UNAVAILABLE'
+            && /partial|incomplete/.test(error.message)
+            && /destroy|recreate|clean workspace/.test(error.message),
+    );
+
+    assert.deepEqual(fs.readFileSync(paths.routingFile), sentinel);
+    assert.equal(fs.existsSync(paths.agentsFile), false);
+    assert.equal(fs.existsSync(paths.policyFile), false);
+    assert.equal(fs.existsSync(paths.desiredFile), false);
+});
+
+test('fresh edge initialization refuses generation evidence and legacy bootstrap residue without creating sources', (t) => {
+    const cases = [
+        {
+            label: 'active generation selector',
+            create(paths) {
+                fs.mkdirSync(paths.edgeDir, { recursive: true });
+                fs.writeFileSync(paths.activeSelectorFile, '{}');
+                return paths.activeSelectorFile;
+            },
+            message: /generation evidence/,
+        },
+        {
+            label: 'generated edge state',
+            create(paths) {
+                const evidenceFile = path.join(paths.generationsDir, 'stale.json');
+                fs.mkdirSync(path.dirname(evidenceFile), { recursive: true });
+                fs.writeFileSync(evidenceFile, '{}');
+                return evidenceFile;
+            },
+            message: /generation evidence/,
+        },
+        {
+            label: 'legacy bootstrap transaction',
+            create(paths) {
+                const residueFile = path.join(paths.edgeDir, '.bootstrap-transaction.json');
+                fs.mkdirSync(path.dirname(residueFile), { recursive: true });
+                fs.writeFileSync(residueFile, '{}');
+                return residueFile;
+            },
+            message: /bootstrap residue/,
+        },
+        {
+            label: 'legacy bootstrap release residue',
+            create(paths) {
+                const residueFile = path.join(paths.edgeDir, '.bootstrap.lock.release-123');
+                fs.mkdirSync(path.dirname(residueFile), { recursive: true });
+                fs.writeFileSync(residueFile, '{}');
+                return residueFile;
+            },
+            message: /bootstrap residue/,
+        },
+    ];
+
+    for (const { label, create, message } of cases) {
+        const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-edge-evidence-'));
+        const paths = resolveEdgeGenerationPaths({ workspaceRoot: workspace });
+        const evidenceFile = create(paths);
+        t.after(() => fs.rmSync(workspace, { recursive: true, force: true }));
+
+        assert.throws(
+            () => initializeFreshEdgeRoutingSources({ workspaceRoot: workspace }),
+            (error) => error?.code === 'EDGE_GENERATION_SOURCE_UNAVAILABLE'
+                && message.test(error.message)
+                && /destroy|recreate|clean workspace/.test(error.message),
+            label,
+        );
+
+        assert.equal(fs.existsSync(paths.routingFile), false, `${label} must not create routing.json`);
+        assert.equal(fs.existsSync(paths.agentsFile), false, `${label} must not create agents.json`);
+        assert.equal(fs.existsSync(paths.policyFile), false, `${label} must not create policy-state.json`);
+        assert.equal(fs.existsSync(paths.desiredFile), false, `${label} must not create desired.json`);
+        assert.equal(fs.existsSync(evidenceFile), true, `${label} must remain present`);
+    }
 });
 
 test('prepared immutable generation remains inactive and publishes no active locator', (t) => {

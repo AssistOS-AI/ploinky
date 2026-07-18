@@ -218,17 +218,39 @@ function readExact(file, { label = file } = {}) {
 }
 
 function hasPersistedGenerationEvidence(paths) {
-    if (fs.existsSync(paths.activeSelectorFile) || fs.existsSync(paths.topologyCurrentFile)) return true;
-    for (const directory of [paths.generationsDir, paths.topologyGenerationsDir]) {
+    const evidence = [];
+    if (fs.existsSync(paths.activeSelectorFile)) {
+        evidence.push('generation evidence (active selector)');
+    }
+    if (fs.existsSync(paths.topologyCurrentFile)) {
+        evidence.push('generation evidence (topology current marker)');
+    }
+    for (const [directory, label] of [
+        [paths.generationsDir, 'edge generations'],
+        [paths.topologyGenerationsDir, 'topology generations'],
+    ]) {
         try {
-            if (fs.readdirSync(directory).length > 0) return true;
+            if (fs.readdirSync(directory).length > 0) {
+                evidence.push(`generation evidence (${label})`);
+            }
         } catch (error) {
             if (error?.code !== 'ENOENT') {
                 throw edgeError(`edge initialization evidence is unavailable: ${error?.message || error}`);
             }
         }
     }
-    return false;
+    try {
+        for (const entry of fs.readdirSync(paths.edgeDir)) {
+            if (entry === '.bootstrap-transaction.json' || entry.startsWith('.bootstrap.lock.release-')) {
+                evidence.push(`legacy bootstrap residue (${entry})`);
+            }
+        }
+    } catch (error) {
+        if (error?.code !== 'ENOENT') {
+            throw edgeError(`edge initialization evidence is unavailable: ${error?.message || error}`);
+        }
+    }
+    return evidence;
 }
 
 export function initializeFreshEdgeRoutingSources(options = {}) {
@@ -243,14 +265,19 @@ export function initializeFreshEdgeRoutingSources(options = {}) {
         ];
         const present = sources.map(([, file]) => fs.existsSync(file));
         if (present.every(Boolean)) return Object.freeze({ initialized: false, paths });
-        if (present.some(Boolean) || hasPersistedGenerationEvidence(paths)) {
+        const evidence = hasPersistedGenerationEvidence(paths);
+        if (present.some(Boolean) || evidence.length) {
             const missing = sources
                 .filter((_, index) => !present[index])
                 .map(([label]) => label)
                 .join(', ');
+            const condition = present.some(Boolean)
+                ? `edge routing sources are incomplete; missing ${missing || 'required source files'}`
+                : 'edge routing sources are absent';
+            const evidenceDetail = evidence.length ? `; ${evidence.join(', ')} detected` : '';
             throw edgeError(
-                `edge routing sources are incomplete; missing ${missing || 'required source files'}; `
-                + 'restore exact validated sources before coordinated apply',
+                `${condition}${evidenceDetail}; destroy this workspace and recreate it with a clean workspace volume, `
+                + 'or restore a complete backup; automatic repair is unavailable',
                 'EDGE_GENERATION_SOURCE_UNAVAILABLE',
             );
         }
