@@ -181,6 +181,9 @@ physical Router port. `--publish`, `--expose`, and `--listen-lan` are rejected.
 Profiles, manifests, readiness, environment, labels, and retained state cannot
 produce a third mapping.
 
+Product service ports, including every explicit `httpServices[].port` target,
+are private box-network mappings and are never physical-host publications.
+
 Inside the box, `openPorts` remains private inner-runtime metadata. A bridged
 TCP claim overlapping `8080` or `8081`, or a UDP claim overlapping `7882`, is
 rejected before launch. Other reviewed mappings may connect a private target to

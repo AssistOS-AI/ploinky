@@ -185,7 +185,7 @@
 }</code></pre>
 
                         <div class="alert alert-warning">
-                            <strong>Slim edge boundary:</strong> A manifest may retain ordinary <code>httpServices</code> semantics and add only optional <code>httpServices[].port</code> for an explicit private TCP target. <code>additionalServerPort</code> is removed. Do not add <code>edgePorts</code>, outer/physical publication, UDP, Cloudflare, tunnel, DNS, topology, consumer-binding, or generic server-inventory fields. <code>openPorts</code> is inner-runtime metadata only. No manifest field can change contract v5's two fixed outer mappings or publish private Router <code>8081</code>.
+                            <strong>Slim edge boundary:</strong> A manifest may retain ordinary <code>httpServices</code> semantics and add only optional <code>httpServices[].port</code> for an explicit private inner TCP target. <code>hostPort</code>, <code>hostIp</code>, <code>publish</code>, <code>publishedPort</code>, <code>expose</code>, and <code>listenLan</code> are invalid service fields. <code>additionalServerPort</code> is removed. Do not add <code>edgePorts</code>, outer/physical publication, UDP, Cloudflare, tunnel, DNS, topology, consumer-binding, or generic server-inventory fields. <code>openPorts</code> is inner-runtime metadata only. No manifest field can change contract v5's two fixed outer mappings or publish private Router <code>8081</code>.
                         </div>
 
                         <h3>Field Descriptions</h3>
@@ -308,7 +308,7 @@
                             <tr>
                                 <td><code>httpServices</code></td>
                                 <td>No</td>
-                                <td>Declares Router-owned browser/protocol services with validated slug, prefixes, access policy, and optional integer <code>port</code>. Omitted port uses the agent's primary private target; each distinct explicit port creates or reuses one private TCP mapping.</td>
+                                <td>Declares Router-owned browser/protocol services with validated slug, prefixes, access policy, and optional integer <code>port</code>. Omitted port uses the agent's primary private target; each distinct explicit port creates or reuses one private TCP mapping. Publication-shaped fields are invalid.</td>
                             </tr>
                             <tr>
                                 <td><code>routerAccess.httpRoutes</code></td>

@@ -172,7 +172,8 @@ mapping per distinct explicit TCP target, while an omitted port preserves the
 owning agent's primary target. A bridged `openPorts` claim overlapping Router
 TCP `8080`/`8081` or reserved UDP `7882` is rejected. Redis, Postgres, Egress,
 OnlyOffice, Umami, health, storage, AgentServer, and other support listeners may
-exist inside private namespaces but never appear in outer PortBindings.
+exist inside private namespaces but never appear in outer PortBindings. Product
+service ports are never physical-host publications.
 
 ## Source, dependencies, and isolation
 
@@ -328,6 +329,13 @@ loopback Router reachability, LAN refusal, absence of private `8081` and all
 forbidden third mappings, actionable UDP-owner conflict, and profile-specific
 in-box `ss -H -lntup` ownership. The script accepts
 `SMOKE_IMAGE` and `SMOKE_PORT` overrides; engine selection remains automatic.
+
+`node container/smoke-http-router.mjs` is the narrow rootless-Podman
+routing-probe for one manifest-declared `httpServices[].port` target. It copies
+the fixture service into a fresh box, reaches it through the selected Router
+host port, repeats after one shutdown/restart, and proves `HostConfig.PortBindings`
+and `podman port` remain exactly `127.0.0.1:<selected-router-host-port>:8080/tcp`
+plus `0.0.0.0:7882:7882/udp`, without publishing `7000/tcp` or private `8081/tcp`.
 
 The publication workflow moves the mutable `:runtime` channel only after
 native amd64 and arm64 candidates both pass contract, integrated pinned

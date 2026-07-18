@@ -181,6 +181,10 @@ and shares that target across entries naming the same port. No secondary target
 field or special proxy exists. Invalid or ambiguous slugs, prefixes, ports,
 policies, or target state leave the affected selectors inactive.
 
+`httpServices[].port` is an optional private inner service target only.
+Publication-shaped `hostPort`, `hostIp`, `publish`, `publishedPort`, `expose`,
+and `listenLan` fields are invalid in every service declaration and profile.
+
 This is deliberately a slim service declaration. `additionalServerPort` is
 removed, and manifests must not add `edgePorts`, outer/physical publication,
 UDP, Cloudflare, tunnel, DNS, topology, consumer-binding, or generic

@@ -1,0 +1,14 @@
+{
+  "container": "docker.io/library/node:22-alpine",
+  "start": "node /workspace/.ploinky/repos/smoke/http-router-service/server.mjs",
+  "readiness": { "protocol": "tcp" },
+  "httpServices": [
+    {
+      "slug": "probe",
+      "port": 7000,
+      "externalPrefix": "/services/http-router-service/",
+      "internalPrefix": "/",
+      "access": "public"
+    }
+  ]
+}

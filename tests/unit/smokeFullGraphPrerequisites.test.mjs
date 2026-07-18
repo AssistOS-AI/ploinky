@@ -28,3 +28,28 @@ test('routing probe is removed before the strict full-graph listener inventory',
     assert.ok(fullGraph > cleanup, 'probe cleanup must precede full Explorer startup and inventory');
     assert.match(source, /assertExactOuterBoundary\('post-routing-probe-removal'\)/);
 });
+
+test('dedicated HTTP router smoke exercises one manifest-declared private httpService through the Router', () => {
+    const smokeSource = fs.readFileSync(
+        new URL('../../container/smoke-http-router.mjs', import.meta.url),
+        'utf8',
+    );
+    const fixtureManifest = fs.readFileSync(
+        new URL('../fixtures/http-router-service/manifest.json', import.meta.url),
+        'utf8',
+    );
+
+    assert.match(smokeSource, /httpServices/);
+    assert.match(smokeSource, /\/services\/http-router-service\//);
+    assert.match(smokeSource, /assertRouterHttpService/);
+    assert.match(smokeSource, /assertExactOuterBoundary\('started'\)/);
+    assert.match(smokeSource, /assertExactOuterBoundary\('restarted'\)/);
+    assert.doesNotMatch(
+        smokeSource,
+        /runConfiguredFullGraph|SMOKE_FULL_GRAPH_ARGS_JSON|FULL_EXPLORER_GRAPH|cloudflare|TURN|browser/,
+    );
+
+    assert.match(fixtureManifest, /httpServices/);
+    assert.match(fixtureManifest, /"port": 7000/);
+    assert.match(fixtureManifest, /"externalPrefix": "\/services\/http-router-service\/"/);
+});

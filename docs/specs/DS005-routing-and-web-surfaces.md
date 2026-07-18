@@ -63,6 +63,10 @@ candidate for operator inspection; it does not prove or print the active
 immutable generation. Only coordinated `edge apply <json-file>` can validate
 candidate state and install a generation.
 
+At request time, service-route authority is exclusively
+`activeGeneration.compiled.services`. Manifests and routing candidates are
+compile-time inputs only and are never consulted to select a live upstream.
+
 `ploinky reinstall <agent>` creates new private targets and coordinates a new
 generation before acknowledging the change. HTTP, SSE, and WebSocket requests
 capture one route plan and authorization lease, then revalidate that generation
