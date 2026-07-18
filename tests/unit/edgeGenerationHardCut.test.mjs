@@ -1007,6 +1007,62 @@ test('generation canonicalizes delegation queryPathRoots aliases', (t) => {
     });
 });
 
+test('generation rejects delegation ttlSeconds below the minimum', (t) => {
+    const fixture = createFixture(t, {
+        routes: [{
+            routeKey: 'alpha',
+            repo: 'fixtures',
+            agent: 'alpha',
+            hostPort: 43101,
+            services: [{
+                slug: 'dashboard',
+                externalPrefix: '/services/alpha-dashboard/',
+                internalPrefix: '/',
+                access: 'authenticated',
+                delegations: [{
+                    targetAgentId: 'agent:fixtures/beta',
+                    tools: ['records.read'],
+                    scopes: ['records:read'],
+                    ttlSeconds: 0,
+                }],
+            }],
+        }],
+    });
+
+    assert.throws(
+        () => applyEdgeRoutingGeneration({ workspaceRoot: fixture.workspace, reason: 'delegation-zero-ttl' }),
+        /ttlSeconds is invalid/,
+    );
+});
+
+test('generation rejects invalid delegations.scopes before falling back to scope', (t) => {
+    const fixture = createFixture(t, {
+        routes: [{
+            routeKey: 'alpha',
+            repo: 'fixtures',
+            agent: 'alpha',
+            hostPort: 43101,
+            services: [{
+                slug: 'dashboard',
+                externalPrefix: '/services/alpha-dashboard/',
+                internalPrefix: '/',
+                access: 'authenticated',
+                delegations: [{
+                    targetAgentId: 'agent:fixtures/beta',
+                    tools: ['records.read'],
+                    scopes: 'records:read',
+                    scope: ['records:read'],
+                }],
+            }],
+        }],
+    });
+
+    assert.throws(
+        () => applyEdgeRoutingGeneration({ workspaceRoot: fixture.workspace, reason: 'delegation-invalid-scopes' }),
+        /requires tools and scopes/,
+    );
+});
+
 test('reconciling and error topology omit active locators and all secret handles', (t) => {
     const fixture = createFixture(t, {
         desired: localDesired({

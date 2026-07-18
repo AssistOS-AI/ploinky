@@ -105,3 +105,35 @@ git diff --check
 ```
 
 Result: 101 passed, 0 failed. `git diff --check` produced no output and exited successfully. The focused generation test verifies `queryPathRoots: ['/Confidential', 'Confidential/', '']` compiles to `pathRoots: ['/Confidential']` with the default `queryParam: 'path'`.
+
+## Re-review Fix: Delegation Normalization Parity
+
+The generation compiler now keeps explicit `ttlSeconds: 0` through validation instead of replacing it with the default TTL, and it applies the existing delegation normalizer's truthy `scopes` precedence before accepting a `scope` fallback. A truthy non-array `scopes` value therefore normalizes to an empty list and fails generation even when `scope` is otherwise valid.
+
+### RED
+
+Command:
+
+```bash
+cd /Users/danielsava/work/file-parser/ploinky/.worktrees/ploinky-phase1-http-router-proxy-mvp
+node --test --test-name-pattern='generation rejects delegation' tests/unit/edgeGenerationHardCut.test.mjs
+```
+
+Result: 0 passed, 1 failed as expected. `generation rejects delegation ttlSeconds below the minimum` failed because `applyEdgeRoutingGeneration()` completed without throwing for `ttlSeconds: 0`.
+
+### GREEN
+
+Commands:
+
+```bash
+cd /Users/danielsava/work/file-parser/ploinky/.worktrees/ploinky-phase1-http-router-proxy-mvp
+node --test tests/unit/edgeGenerationHardCut.test.mjs
+node --test tests/unit/edgeRoutePlanInterface.test.mjs tests/unit/edgeHostRouting.test.mjs tests/unit/edgeDialLease.test.mjs tests/unit/httpServiceInvocation.test.mjs tests/unit/wsServiceProxy.test.mjs tests/unit/edgeGenerationHardCut.test.mjs
+git diff --check
+```
+
+Result: focused generation tests: 48 passed, 0 failed. Packet 3 suite: 103 passed, 0 failed. `git diff --check` produced no output and exited successfully.
+
+### Concerns
+
+None.

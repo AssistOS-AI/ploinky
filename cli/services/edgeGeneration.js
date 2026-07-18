@@ -540,14 +540,13 @@ function normalizeCompiledDelegations(spec, route, access, label) {
         const tools = [...new Set((Array.isArray(delegation.tools) ? delegation.tools : []).map((entry) => (
             String(entry || '').trim()
         )).filter(Boolean))];
-        const scopeValues = Array.isArray(delegation.scopes)
-            ? delegation.scopes
-            : (Array.isArray(delegation.scope) ? delegation.scope : []);
-        const scope = [...new Set(scopeValues.map((entry) => (
+        const scopeValues = delegation.scopes || delegation.scope || [];
+        const scope = [...new Set((Array.isArray(scopeValues) ? scopeValues : []).map((entry) => (
             String(entry || '').trim()
         )).filter(Boolean))];
         if (!tools.length || !scope.length) throw edgeError(`${label}.delegations[${index}] requires tools and scopes`);
-        const ttlSeconds = Number.parseInt(String(delegation.ttlSeconds || 1800), 10);
+        const ttlRaw = Number.parseInt(String(delegation.ttlSeconds), 10);
+        const ttlSeconds = Number.isFinite(ttlRaw) ? ttlRaw : 1800;
         if (!Number.isSafeInteger(ttlSeconds) || ttlSeconds < 30 || ttlSeconds > resolveMaxTtlSeconds()) {
             throw edgeError(`${label}.delegations[${index}].ttlSeconds is invalid`);
         }
