@@ -78,3 +78,30 @@ The explicit compile-time helper mode remains intact. Existing HTTP invocation, 
 ## Concerns
 
 `cli/services/edgeGeneration.js` was not named in the Task 3.1 or Task 3.2 file lists, but the reset plan's Packet 3 section includes it and the exact green suite demonstrated it was necessary. The change is limited to compiling service metadata already consumed by the pre-existing proxy contract; it does not add a new request-time authority or broaden the packet into bootstrap, publication, or routing-schema work.
+
+## Review Finding Fix: Delegation `queryPathRoots` Compatibility
+
+The generation compiler now accepts the established `when.queryPathRoots` alias and emits canonical, non-empty `when.pathRoots` values in compiled service delegations. This preserves authenticated HTTP service delegation behavior without reopening request-time manifest reads.
+
+### RED
+
+Command:
+
+```bash
+cd /Users/danielsava/work/file-parser/ploinky/.worktrees/ploinky-phase1-http-router-proxy-mvp
+node --test --test-name-pattern='generation canonicalizes delegation queryPathRoots aliases' tests/unit/edgeGenerationHardCut.test.mjs
+```
+
+Result: 0 passed, 1 failed as expected. `applyEdgeRoutingGeneration()` rejected the supported alias with `manifest(alpha).httpServices[0].delegations[0].when is invalid` from `normalizeCompiledDelegations()`.
+
+### GREEN
+
+Command:
+
+```bash
+cd /Users/danielsava/work/file-parser/ploinky/.worktrees/ploinky-phase1-http-router-proxy-mvp
+node --test tests/unit/edgeRoutePlanInterface.test.mjs tests/unit/edgeHostRouting.test.mjs tests/unit/edgeDialLease.test.mjs tests/unit/httpServiceInvocation.test.mjs tests/unit/wsServiceProxy.test.mjs tests/unit/edgeGenerationHardCut.test.mjs
+git diff --check
+```
+
+Result: 101 passed, 0 failed. `git diff --check` produced no output and exited successfully. The focused generation test verifies `queryPathRoots: ['/Confidential', 'Confidential/', '']` compiles to `pathRoots: ['/Confidential']` with the default `queryParam: 'path'`.

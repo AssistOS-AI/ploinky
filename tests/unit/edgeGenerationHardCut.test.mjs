@@ -974,6 +974,39 @@ test('alias collisions and overlapping service prefixes fail generation compilat
     );
 });
 
+test('generation canonicalizes delegation queryPathRoots aliases', (t) => {
+    const fixture = createFixture(t, {
+        routes: [{
+            routeKey: 'alpha',
+            repo: 'fixtures',
+            agent: 'alpha',
+            hostPort: 43101,
+            services: [{
+                slug: 'dashboard',
+                externalPrefix: '/services/alpha-dashboard/',
+                internalPrefix: '/',
+                access: 'authenticated',
+                delegations: [{
+                    targetAgentId: 'agent:fixtures/beta',
+                    tools: ['records.read'],
+                    scopes: ['records:read'],
+                    when: { queryPathRoots: ['/Confidential', 'Confidential/', ''] },
+                }],
+            }],
+        }],
+    });
+
+    const applied = applyEdgeRoutingGeneration({
+        workspaceRoot: fixture.workspace,
+        reason: 'delegation-query-path-roots',
+    });
+
+    assert.deepEqual(applied.generation.compiled.services[0].delegations[0].when, {
+        queryParam: 'path',
+        pathRoots: ['/Confidential'],
+    });
+});
+
 test('reconciling and error topology omit active locators and all secret handles', (t) => {
     const fixture = createFixture(t, {
         desired: localDesired({

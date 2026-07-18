@@ -496,6 +496,28 @@ function normalizePrefix(value, fallback, label) {
     return normalized.endsWith('/') ? normalized : `${normalized}/`;
 }
 
+function normalizeDelegationPathRoot(raw) {
+    const value = String(raw || '').trim().replace(/\\/g, '/');
+    if (!value) return '';
+    const prefixed = value.startsWith('/') ? value : `/${value}`;
+    const collapsed = path.posix.normalize(prefixed);
+    if (!collapsed || collapsed === '.') return '';
+    return collapsed === '/' ? '/' : collapsed.replace(/\/+$/g, '');
+}
+
+function normalizeDelegationPathRoots(values) {
+    if (!Array.isArray(values)) return [];
+    const out = [];
+    const seen = new Set();
+    for (const raw of values) {
+        const value = normalizeDelegationPathRoot(raw);
+        if (!value || seen.has(value)) continue;
+        seen.add(value);
+        out.push(value);
+    }
+    return out;
+}
+
 function normalizeCompiledDelegations(spec, route, access, label) {
     if (!Array.isArray(spec.delegations)) return [];
     if (access !== 'authenticated') {
@@ -530,10 +552,16 @@ function normalizeCompiledDelegations(spec, route, access, label) {
             throw edgeError(`${label}.delegations[${index}].ttlSeconds is invalid`);
         }
         const when = delegation.when === undefined || delegation.when === null ? null : delegation.when;
-        if (when !== null && (!isPlainObject(when)
-            || !/^[A-Za-z0-9_.-]+$/.test(String(when.queryParam || 'path').trim())
-            || !(Array.isArray(when.pathRoots) && when.pathRoots.length))) {
-            throw edgeError(`${label}.delegations[${index}].when is invalid`);
+        let normalizedWhen = null;
+        if (when !== null) {
+            const queryParam = String(when?.queryParam || 'path').trim();
+            const pathRoots = normalizeDelegationPathRoots(when?.pathRoots || when?.queryPathRoots || []);
+            if (!isPlainObject(when)
+                || !/^[A-Za-z0-9_.-]+$/.test(queryParam)
+                || !pathRoots.length) {
+                throw edgeError(`${label}.delegations[${index}].when is invalid`);
+            }
+            normalizedWhen = { queryParam, pathRoots };
         }
         out.push({
             key: String(delegation.key || '').trim(),
@@ -541,12 +569,7 @@ function normalizeCompiledDelegations(spec, route, access, label) {
             tools,
             scope,
             ttlSeconds,
-            ...(when ? {
-                when: {
-                    queryParam: String(when.queryParam || 'path').trim(),
-                    pathRoots: when.pathRoots.map((entry) => String(entry || '').trim()).filter(Boolean),
-                },
-            } : {}),
+            ...(normalizedWhen ? { when: normalizedWhen } : {}),
         });
     }
     return out;
