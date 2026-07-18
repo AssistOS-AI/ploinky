@@ -44,9 +44,13 @@ invalid candidate leave the selectors inactive; no prior generation is restored
 as a fallback. A missing policy, desired-state, enabled-agent, routing, manifest,
 or provider source is unavailable input and is never substituted with an empty
 document. A genuinely fresh workspace initializes the four persisted source
-documents together before its first mutation; any partial set or retained
-generation evidence requires explicit repair. Status exposes generation identity
-and digest, never source contents.
+documents together before its first mutation only when all four documents are
+absent and no persisted generation evidence or legacy bootstrap residue is
+present. Any partial source set, generation evidence, or legacy bootstrap
+residue fails closed with `EDGE_GENERATION_SOURCE_UNAVAILABLE` and leaves
+existing files untouched; operators must destroy and recreate with a clean
+workspace, or restore a complete backup. Status exposes generation identity and
+digest, never source contents.
 
 The core `list routes` command reports the staged `.ploinky/routing.json`
 candidate for operator inspection; it does not prove or print the active
