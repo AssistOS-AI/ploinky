@@ -1159,6 +1159,8 @@ function assertStaticPreinstallSucceeded(result) {
 async function startWorkspace(staticAgentArg, portArg, {
   killRouterIfRunning,
   branchPolicy,
+  spawnWatchdogImpl = spawnWatchdog,
+  waitForRouterReadyImpl = waitForRouterReady,
 } = {}) {
   // The workspace mutation lease covers source initialization, candidate
   // writes, both inactive prelaunch preparations, and every subsequent start.
@@ -1200,7 +1202,7 @@ async function startWorkspace(staticAgentArg, portArg, {
     }, { coordinate: false });
     console.log(`Static: agent=${utils.colorize(staticAgent, 'cyan')} port=${utils.colorize(String(staticPort), 'yellow')}`);
     try {
-      await waitForRouterReady(staticPort, null, 300);
+      await waitForRouterReadyImpl(staticPort, null, 300);
       routerReadyForStart = true;
       routerPortForStart = staticPort;
       routerContainerForStart = container;
@@ -1216,10 +1218,10 @@ async function startWorkspace(staticAgentArg, portArg, {
     fs.mkdirSync(runningDir, { recursive: true });
     const routerPath = path.resolve(__dirname, '../server/Watchdog.js');
     const routerPidFile = path.join(runningDir, 'router.pid');
-    const child = spawnWatchdog(routerPath, staticPort, routerPidFile);
+    const child = spawnWatchdogImpl(routerPath, staticPort, routerPidFile);
     try { fs.writeFileSync(routerPidFile, String(child.pid)); } catch (_) {}
     child.unref();
-    await waitForRouterReady(staticPort, child);
+    await waitForRouterReadyImpl(staticPort, child);
     routerReadyForStart = true;
     routerPortForStart = staticPort;
     routerContainerForStart = container;

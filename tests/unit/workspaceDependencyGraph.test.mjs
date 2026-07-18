@@ -194,6 +194,62 @@ test('workspace start and agent-enable preparation classify fresh edge sources b
     assert.ok(agentInitializeIndex < agentLockIndex, 'agent-enable preparation must classify before edge apply locking');
 });
 
+test('start workspace rejects malformed complete edge sources before launching Watchdog', async () => {
+    const ploinkyDir = path.join(tempDir, '.ploinky');
+    const backupDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-graph-start-backup-'));
+    const backupPloinkyDir = path.join(backupDir, '.ploinky');
+    const hadPloinkyDir = fs.existsSync(ploinkyDir);
+    if (hadPloinkyDir) fs.cpSync(ploinkyDir, backupPloinkyDir, { recursive: true });
+
+    try {
+        fs.rmSync(ploinkyDir, { recursive: true, force: true });
+        writeEnabledRepos(['fixture']);
+        writeManifest('fixture', 'router', { container: 'node:20-alpine' });
+
+        const edgeDir = path.join(ploinkyDir, 'data', 'edge-routing');
+        const policyDir = path.join(ploinkyDir, 'data', 'router-security');
+        fs.mkdirSync(edgeDir, { recursive: true });
+        fs.mkdirSync(policyDir, { recursive: true });
+        fs.writeFileSync(path.join(ploinkyDir, 'routing.json'), JSON.stringify({
+            port: 8080,
+            static: { agent: 'fixture/router' },
+            routes: {},
+        }, null, 2));
+        fs.writeFileSync(path.join(ploinkyDir, 'agents.json'), JSON.stringify({
+            _config: { static: { agent: 'fixture/router', port: 8080 } },
+        }, null, 2));
+        fs.writeFileSync(path.join(policyDir, 'policy-state.json'), JSON.stringify({
+            schema: 'router-policy',
+            httpRoutes: [],
+            mcpTools: [],
+        }, null, 2));
+        fs.writeFileSync(path.join(edgeDir, 'desired.json'), '{"schemaVersion":');
+
+        let watchdogLaunches = 0;
+        let routerReadinessChecks = 0;
+        await assert.rejects(
+            startWorkspace(undefined, undefined, {
+                spawnWatchdogImpl() {
+                    watchdogLaunches += 1;
+                    throw new Error('Watchdog launch must not be reached');
+                },
+                waitForRouterReadyImpl() {
+                    routerReadinessChecks += 1;
+                    throw new Error('Router readiness must not be reached');
+                },
+            }),
+            /edge desired state is not valid JSON/,
+        );
+
+        assert.equal(watchdogLaunches, 0);
+        assert.equal(routerReadinessChecks, 0);
+    } finally {
+        fs.rmSync(ploinkyDir, { recursive: true, force: true });
+        if (hadPloinkyDir) fs.cpSync(backupPloinkyDir, ploinkyDir, { recursive: true });
+        fs.rmSync(backupDir, { recursive: true, force: true });
+    }
+});
+
 test('start workspace forwards each dependency registry profile to its synchronous service launch', () => {
     assert.match(
         startWorkspace.toString(),

@@ -167,3 +167,43 @@ DS005 frontmatter was unchanged, so `docs/specs/matrix.md` was not regenerated.
 ### Concerns
 
 None.
+
+## Re-review Fix: Behavioral Complete-Tuple Rejection Before Watchdog
+
+### What Changed
+
+- Added a focused `startWorkspace()` behavioral test that arranges all four persisted edge source files, with malformed `desired.json`, and verifies that startup rejects during normal graph generation preparation before either Router readiness or Watchdog launch is reached.
+- Added backward-compatible internal `spawnWatchdogImpl` and `waitForRouterReadyImpl` options to `startWorkspace()`. Their defaults remain the existing `spawnWatchdog` and `waitForRouterReady` helpers; the test uses them only as tripwires so an ordering regression cannot spawn a real Watchdog.
+- Kept the existing graph-preparation-before-`ensureRouterReadyForStart()` ordering, complete-four-file bootstrap no-op semantics, and source-order guards unchanged.
+
+### TDD RED Baseline
+
+Command:
+
+```bash
+node --test tests/unit/workspaceDependencyGraph.test.mjs
+```
+
+Observed result: 43 passed, 0 failed. The newly written behavioral test passed before the seam because the prior commit had already moved normal graph preparation ahead of Router/Watchdog startup. The result confirms the reviewed production ordering was present; the seam was then added solely to make the regression test safe against a future ordering regression.
+
+### GREEN And Focused Verification
+
+| Check | Result |
+| --- | --- |
+| `node --test tests/unit/workspaceDependencyGraph.test.mjs` | PASS, 43/43 |
+| `node --test tests/unit/edgeGenerationHardCut.test.mjs tests/unit/workspaceDependencyGraph.test.mjs` | PASS, 95/95 |
+| `git diff --check` | PASS, no output and exit 0 |
+
+### Files Changed
+
+- `cli/services/workspaceUtil.js`
+- `tests/unit/workspaceDependencyGraph.test.mjs`
+- `.superpowers/sdd/task-4-report.md`
+
+### Documentation, Frontmatter, And Matrix
+
+No documentation changes were needed: DS005 and the architecture page already state that malformed complete source state stops startup through normal generation preparation before Router/Watchdog launch. No DS frontmatter changed, so `docs/specs/matrix.md` was not regenerated.
+
+### Concerns
+
+The requested RED run did not fail because the existing checkout already had the correct runtime ordering. No production concern remains; the added test closes the missing behavioral coverage and uses the injection seam to remain safe if that ordering regresses.
