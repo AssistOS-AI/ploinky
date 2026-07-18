@@ -1135,6 +1135,66 @@ test('dependency installer remains syntactically valid and read-only-source safe
     assert.match(source, /still missing after npm install/);
 });
 
+test('dependency installer runs npm outside a broken worktree source root', () => {
+    const fixture = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-install-root-'));
+    const fakeBin = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-install-bin-'));
+    const observed = path.join(fakeBin, 'npm-observed.txt');
+    const fakeNpm = path.join(fakeBin, 'npm');
+    const escapedFixture = fixture.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    fs.writeFileSync(path.join(fixture, '.git'), 'gitdir: /missing/path\n');
+    fs.mkdirSync(path.join(fixture, 'node_modules'), { recursive: true });
+    fs.writeFileSync(fakeNpm, `#!/usr/bin/env bash
+set -euo pipefail
+printf 'pwd=%s\\nargs=%s\\n' "$PWD" "$*" > "$OBSERVED"
+if [[ "$PWD" == "$PLOINKY_ROOT" ]]; then
+    echo "npm ran from PLOINKY_ROOT" >&2
+    exit 42
+fi
+prefix=""
+previous=""
+for arg in "$@"; do
+    if [[ "$previous" == "--prefix" ]]; then
+        prefix="$arg"
+        break
+    fi
+    case "$arg" in
+        --prefix=*)
+            prefix="\${arg#--prefix=}"
+            break
+            ;;
+    esac
+    previous="$arg"
+done
+if [[ "$prefix" != "$PLOINKY_ROOT" ]]; then
+    echo "missing --prefix PLOINKY_ROOT" >&2
+    exit 43
+fi
+mkdir -p "$prefix/node_modules/achillesAgentLib" "$prefix/node_modules/mcp-sdk"
+`);
+    fs.chmodSync(fakeNpm, 0o755);
+    try {
+        const result = spawnSync('bash', [INSTALL_DEPS], {
+            cwd: os.tmpdir(),
+            encoding: 'utf8',
+            env: {
+                ...process.env,
+                OBSERVED: observed,
+                PATH: `${fakeBin}${path.delimiter}${process.env.PATH}`,
+                PLOINKY_ROOT: fixture,
+            },
+        });
+        assert.equal(result.status, 0, `${result.stdout}${result.stderr}`);
+        const npmObserved = fs.readFileSync(observed, 'utf8');
+        assert.match(npmObserved, new RegExp(`pwd=(?!${escapedFixture})`));
+        assert.match(npmObserved, new RegExp(`--prefix(=| )${escapedFixture}`));
+        assert.ok(fs.existsSync(path.join(fixture, 'node_modules', 'achillesAgentLib')));
+        assert.ok(fs.existsSync(path.join(fixture, 'node_modules', 'mcp-sdk')));
+    } finally {
+        fs.rmSync(fixture, { recursive: true, force: true });
+        fs.rmSync(fakeBin, { recursive: true, force: true });
+    }
+});
+
 test('dependency consent honors environment opt-in and TTY confirmation only', () => {
     assert.equal(shouldInstallDeps({ PLOINKY_BOX_INSTALL_DEPS: '1' }, false, null), true);
     assert.equal(shouldInstallDeps({}, true, 'y'), true);

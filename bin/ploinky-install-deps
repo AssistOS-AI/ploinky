@@ -28,6 +28,8 @@ if [[ ! -d "$DEPS_DIR" || ! -w "$DEPS_DIR" ]]; then
 fi
 
 install_args=(install --no-package-lock --no-audit --no-fund)
+npm_cwd="${TMPDIR:-/tmp}"
+[[ -d "$npm_cwd" ]] || npm_cwd="/tmp"
 
 allow_achilles_reset=0
 in_ploinky_box=0
@@ -62,7 +64,7 @@ elif [[ -d "$DEPS_DIR/achillesAgentLib" ]]; then
     fi
 fi
 
-(cd "$PLOINKY_ROOT" && npm "${install_args[@]}")
+(cd "$npm_cwd" && npm --prefix "$PLOINKY_ROOT" "${install_args[@]}")
 
 for dep in achillesAgentLib mcp-sdk; do
     if [[ ! -d "$DEPS_DIR/$dep" ]]; then
