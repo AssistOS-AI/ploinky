@@ -255,32 +255,33 @@ function hasPersistedGenerationEvidence(paths) {
 
 export function initializeFreshEdgeRoutingSources(options = {}) {
     const paths = resolveEdgeGenerationPaths(options);
+    const sources = [
+        ['routing.json', paths.routingFile, EMPTY_ROUTING_BYTES, 0o600],
+        ['agents.json', paths.agentsFile, EMPTY_AGENTS_BYTES, 0o600],
+        ['policy-state.json', paths.policyFile, EMPTY_POLICY_BYTES, 0o600],
+        ['edge desired state', paths.desiredFile, EMPTY_DESIRED_BYTES, 0o600],
+    ];
+    const present = sources.map(([, file]) => fs.existsSync(file));
+    if (present.every(Boolean)) return Object.freeze({ initialized: false, paths });
+    const evidence = hasPersistedGenerationEvidence(paths);
+    if (present.some(Boolean) || evidence.length) {
+        const missing = sources
+            .filter((_, index) => !present[index])
+            .map(([label]) => label)
+            .join(', ');
+        const condition = present.some(Boolean)
+            ? `edge routing sources are incomplete; missing ${missing || 'required source files'}`
+            : 'edge routing sources are absent';
+        const evidenceDetail = evidence.length ? `; ${evidence.join(', ')} detected` : '';
+        throw edgeError(
+            `${condition}${evidenceDetail}; destroy this workspace and recreate it with a clean workspace volume, `
+            + 'or restore a complete backup; automatic repair is unavailable',
+            'EDGE_GENERATION_SOURCE_UNAVAILABLE',
+        );
+    }
+
     const release = acquireApplyLock(paths, options);
     try {
-        const sources = [
-            ['routing.json', paths.routingFile, EMPTY_ROUTING_BYTES, 0o600],
-            ['agents.json', paths.agentsFile, EMPTY_AGENTS_BYTES, 0o600],
-            ['policy-state.json', paths.policyFile, EMPTY_POLICY_BYTES, 0o600],
-            ['edge desired state', paths.desiredFile, EMPTY_DESIRED_BYTES, 0o600],
-        ];
-        const present = sources.map(([, file]) => fs.existsSync(file));
-        if (present.every(Boolean)) return Object.freeze({ initialized: false, paths });
-        const evidence = hasPersistedGenerationEvidence(paths);
-        if (present.some(Boolean) || evidence.length) {
-            const missing = sources
-                .filter((_, index) => !present[index])
-                .map(([label]) => label)
-                .join(', ');
-            const condition = present.some(Boolean)
-                ? `edge routing sources are incomplete; missing ${missing || 'required source files'}`
-                : 'edge routing sources are absent';
-            const evidenceDetail = evidence.length ? `; ${evidence.join(', ')} detected` : '';
-            throw edgeError(
-                `${condition}${evidenceDetail}; destroy this workspace and recreate it with a clean workspace volume, `
-                + 'or restore a complete backup; automatic repair is unavailable',
-                'EDGE_GENERATION_SOURCE_UNAVAILABLE',
-            );
-        }
         for (const [label, file, bytes, mode] of sources) {
             installImmutableDurable(file, bytes, mode, {
                 conflictMessage: `${label} appeared during fresh edge initialization`,

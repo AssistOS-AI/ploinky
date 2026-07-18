@@ -211,6 +211,8 @@ test('fresh edge initialization rejects partial source subsets with clean-worksp
     assert.equal(fs.existsSync(paths.agentsFile), false);
     assert.equal(fs.existsSync(paths.policyFile), false);
     assert.equal(fs.existsSync(paths.desiredFile), false);
+    assert.equal(fs.existsSync(paths.edgeDir), false, 'partial classification must not create edge-routing');
+    assert.equal(fs.existsSync(paths.applyLockFile), false, 'partial classification must not create apply.lock');
 });
 
 for (const missingSource of ['routing.json', 'agents.json', 'policy-state.json', 'desired.json']) {
@@ -239,6 +241,7 @@ for (const missingSource of ['routing.json', 'agents.json', 'policy-state.json',
                 .filter(([source]) => source !== missingSource)
                 .map(([, [file]]) => [file, fs.readFileSync(file)]),
         );
+        const edgeDirExistedBeforeClassification = fs.existsSync(paths.edgeDir);
 
         assert.throws(
             () => initializeFreshEdgeRoutingSources({ workspaceRoot: workspace }),
@@ -254,6 +257,12 @@ for (const missingSource of ['routing.json', 'agents.json', 'policy-state.json',
                 assert.deepEqual(fs.readFileSync(file), existingBytes.get(file), `${source} must be unchanged`);
             }
         }
+        assert.equal(
+            fs.existsSync(paths.edgeDir),
+            edgeDirExistedBeforeClassification,
+            'partial classification must not create edge-routing',
+        );
+        assert.equal(fs.existsSync(paths.applyLockFile), false, 'partial classification must not create apply.lock');
     });
 }
 
@@ -275,6 +284,15 @@ test('fresh edge initialization refuses generation evidence and legacy bootstrap
                 fs.mkdirSync(path.dirname(evidenceFile), { recursive: true });
                 fs.writeFileSync(evidenceFile, '{}');
                 return evidenceFile;
+            },
+            message: /generation evidence/,
+        },
+        {
+            label: 'topology current marker',
+            create(paths) {
+                fs.mkdirSync(paths.topologyDir, { recursive: true });
+                fs.writeFileSync(paths.topologyCurrentFile, '{}');
+                return paths.topologyCurrentFile;
             },
             message: /generation evidence/,
         },
@@ -304,6 +322,7 @@ test('fresh edge initialization refuses generation evidence and legacy bootstrap
         const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-edge-evidence-'));
         const paths = resolveEdgeGenerationPaths({ workspaceRoot: workspace });
         const evidenceFile = create(paths);
+        const edgeDirExistedBeforeClassification = fs.existsSync(paths.edgeDir);
         t.after(() => fs.rmSync(workspace, { recursive: true, force: true }));
 
         assert.throws(
@@ -319,6 +338,12 @@ test('fresh edge initialization refuses generation evidence and legacy bootstrap
         assert.equal(fs.existsSync(paths.policyFile), false, `${label} must not create policy-state.json`);
         assert.equal(fs.existsSync(paths.desiredFile), false, `${label} must not create desired.json`);
         assert.equal(fs.existsSync(evidenceFile), true, `${label} must remain present`);
+        assert.equal(
+            fs.existsSync(paths.edgeDir),
+            edgeDirExistedBeforeClassification,
+            `${label} must not create edge-routing`,
+        );
+        assert.equal(fs.existsSync(paths.applyLockFile), false, `${label} must not create apply.lock`);
     }
 });
 
