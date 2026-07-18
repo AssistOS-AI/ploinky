@@ -106,6 +106,25 @@ test('private listener set binds loopback and exact current gateways without a w
     assert.deepEqual(observed, ['127.0.0.1', gateway, gateway]);
 });
 
+test('private listener startup leaves unavailable managed gateways inactive while loopback starts', async (t) => {
+    const port = await freePort();
+    const unavailableGateway = '192.0.2.1';
+    const listenerSet = createPrivateListenerSet({
+        httpServer: http.createServer((_req, res) => res.end('loopback-only')),
+        interfaceClassifier: fakeClassifier([unavailableGateway]),
+        port,
+        refreshIntervalMs: 60_000,
+    });
+    t.after(() => listenerSet.close());
+
+    const snapshot = await listenerSet.start();
+    assert.deepEqual(snapshot.addresses, ['127.0.0.1']);
+    assert.deepEqual(snapshot.desiredAddresses, ['127.0.0.1', unavailableGateway].sort());
+    assert.match(snapshot.lastError, /EADDRNOTAVAIL|address not available/);
+    assert.deepEqual((await request('127.0.0.1', port)), { status: 200, body: 'loopback-only' });
+    assert.equal(snapshot.addresses.includes(unavailableGateway), false);
+});
+
 test('private listener startup rejects and closes partial binds when a managed gateway is occupied', async (t) => {
     const port = await freePort();
     const gateway = exactNonLoopbackAddress();

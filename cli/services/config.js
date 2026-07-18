@@ -125,10 +125,6 @@ export function initEnvironment() {
         }
     }
 
-    if (!fs.existsSync(AGENTS_FILE)) {
-        fs.writeFileSync(AGENTS_FILE, JSON.stringify({}, null, 2));
-    }
-
     if (!fs.existsSync(HISTORY_FILE)) {
         fs.writeFileSync(HISTORY_FILE, '');
     }

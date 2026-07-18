@@ -13,6 +13,10 @@ function normalizeSocketAddress(value) {
     return address;
 }
 
+function isInactiveManagedGatewayBind(error) {
+    return error?.expectedClass === 'managed' && error?.code === 'EADDRNOTAVAIL';
+}
+
 function assertDependencies({ httpServer, interfaceClassifier, port, refreshIntervalMs }) {
     if (!httpServer || typeof httpServer.emit !== 'function') {
         throw new TypeError('private listener set requires an HTTP server');
@@ -207,7 +211,11 @@ export function createPrivateListenerSet({
                 await bindAddress(address, expectedClass);
             } catch (error) {
                 const message = `cannot bind private Router to ${address}:${port}: ${errorMessage(error)}`;
-                bindErrors.push(new Error(message, { cause: error }));
+                const wrapped = new Error(message, { cause: error });
+                wrapped.code = error?.code || 'PRIVATE_LISTENER_BIND_FAILED';
+                wrapped.address = address;
+                wrapped.expectedClass = expectedClass;
+                bindErrors.push(wrapped);
                 emitAudit('private_listener_bind_failed', {
                     address,
                     port,
@@ -220,8 +228,9 @@ export function createPrivateListenerSet({
         reconciledAt = Date.now();
         lastError = bindErrors[0]?.message || String(classifierSnapshot?.lastError || '');
         const snapshot = publicSnapshot();
-        if (strict && bindErrors.length) {
-            const error = new AggregateError(bindErrors, 'private Router exact listener set is incomplete');
+        const fatalBindErrors = bindErrors.filter((error) => !isInactiveManagedGatewayBind(error));
+        if (strict && fatalBindErrors.length) {
+            const error = new AggregateError(fatalBindErrors, 'private Router exact listener set is incomplete');
             error.code = 'PRIVATE_LISTENER_SET_INCOMPLETE';
             error.snapshot = snapshot;
             throw error;
