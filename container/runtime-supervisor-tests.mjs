@@ -1271,7 +1271,9 @@ test('compatible and stopped status preserve streaming health/core behavior with
     assert.match(running.stdout, /contract: compatible \(expected 5, observed 5\)/);
     assert.match(running.stdout, /health: healthy/);
     assert.match(running.stdout, /core: running/);
+    assert.match(running.stdout, /127\.0\.0\.1:8080 -> 8080\/tcp/);
     assert.match(running.stdout, /0\.0\.0\.0:7882 -> 7882\/udp/);
+    assert.doesNotMatch(running.stdout, /8081|3000|3001|7000/);
     assert.equal(running.calls.some(call => call.kind === 'streamContains'), true);
     assert.equal(runCalls(running, 'pull').length, 0);
 
@@ -1317,6 +1319,34 @@ test('managed start probes the supervisor Unix health socket only after core sta
     assert.equal(await failed.supervisor.run(['--port', '19193', 'start', 'explorer']), 7);
     assert.equal(failed.calls.some(call => call.kind === 'query'
         && call.args.includes('/workspace/.ploinky/run/router-health.sock')), false);
+});
+
+test('start publishes only the selected outer Router port and fixed UDP reservation', async () => {
+    const harness = createSupervisorHarness();
+    assert.equal(await harness.supervisor.run(['--port', '19192', 'start', 'explorer']), 0);
+
+    const createArgs = runCalls(harness, 'run')[0].args;
+    const mappings = createArgs.flatMap((value, index) =>
+        value === '-p' ? [createArgs[index + 1]] : []
+    );
+    assert.deepEqual(mappings, [
+        '127.0.0.1:19192:8080/tcp',
+        '0.0.0.0:7882:7882/udp',
+    ]);
+    for (const mapping of mappings) {
+        assert.doesNotMatch(mapping, /8081|3000|3001|7000/);
+    }
+    assert.equal(mappings.some(mapping => mapping.includes(':19192:')), true);
+    assert.equal(mappings.some(mapping => mapping.includes(':19192/')), false);
+
+    const coreStart = runCalls(harness, 'exec').find(call =>
+        call.args.includes('ploinky') && call.args.includes('start')
+    );
+    assert.ok(coreStart);
+    assert.ok(coreStart.args.includes('start'));
+    assert.ok(coreStart.args.includes('explorer'));
+    assert.ok(coreStart.args.includes('8080'));
+    assert.equal(coreStart.args.includes('19192'), false);
 });
 
 test('a positional start port requires explicit destroy when an existing box uses another port', async () => {
