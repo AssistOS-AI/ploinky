@@ -213,6 +213,50 @@ test('fresh edge initialization rejects partial source subsets with clean-worksp
     assert.equal(fs.existsSync(paths.desiredFile), false);
 });
 
+for (const missingSource of ['routing.json', 'agents.json', 'policy-state.json', 'desired.json']) {
+    test(`fresh edge initialization rejects partial source subsets with missing ${missingSource}`, (t) => {
+        const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-edge-partial-class-'));
+        t.after(() => fs.rmSync(workspace, { recursive: true, force: true }));
+        const paths = resolveEdgeGenerationPaths({ workspaceRoot: workspace });
+        const sources = {
+            'routing.json': [paths.routingFile, Buffer.from('{"routes":{}}')],
+            'agents.json': [paths.agentsFile, Buffer.from('{}')],
+            'policy-state.json': [paths.policyFile, Buffer.from(JSON.stringify({
+                schema: 'router-policy',
+                httpRoutes: [],
+                mcpTools: [],
+            }))],
+            'desired.json': [paths.desiredFile, Buffer.from(JSON.stringify(localDesired()))],
+        };
+
+        for (const [source, [file, bytes]] of Object.entries(sources)) {
+            if (source === missingSource) continue;
+            fs.mkdirSync(path.dirname(file), { recursive: true });
+            fs.writeFileSync(file, bytes);
+        }
+        const existingBytes = new Map(
+            Object.entries(sources)
+                .filter(([source]) => source !== missingSource)
+                .map(([, [file]]) => [file, fs.readFileSync(file)]),
+        );
+
+        assert.throws(
+            () => initializeFreshEdgeRoutingSources({ workspaceRoot: workspace }),
+            (error) => error?.code === 'EDGE_GENERATION_SOURCE_UNAVAILABLE'
+                && /partial|incomplete/.test(error.message)
+                && /destroy|recreate|clean workspace/.test(error.message),
+        );
+
+        for (const [source, [file]] of Object.entries(sources)) {
+            if (source === missingSource) {
+                assert.equal(fs.existsSync(file), false, `${source} must remain absent`);
+            } else {
+                assert.deepEqual(fs.readFileSync(file), existingBytes.get(file), `${source} must be unchanged`);
+            }
+        }
+    });
+}
+
 test('fresh edge initialization refuses generation evidence and legacy bootstrap residue without creating sources', (t) => {
     const cases = [
         {
