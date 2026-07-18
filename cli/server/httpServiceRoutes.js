@@ -288,7 +288,7 @@ function normalizeServiceSpec(routeKey, route, spec) {
     };
 }
 
-export { normalizeServiceSpec };
+export { normalizeDelegation, normalizeServiceSpec };
 
 const loggedInvalidServiceSpecs = new Set();
 

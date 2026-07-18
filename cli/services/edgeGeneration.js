@@ -12,6 +12,7 @@ import {
 import { normalizeManifestHttpRouteAccess } from '../server/policy/HttpRouteProviders.js';
 import { compileHttpRoutePolicy } from '../server/policy/HttpRoutePolicyCompiler.js';
 import { resolveMaxTtlSeconds } from '../server/mcp-proxy/userDelegationGrant.js';
+import { normalizeDelegation } from '../server/httpServiceRoutes.js';
 import {
     assertNoHttpServicePublicationFields,
     normalizeHttpServicePort,
@@ -519,13 +520,13 @@ function normalizeDelegationPathRoots(values) {
 }
 
 function normalizeCompiledDelegations(spec, route, access, label) {
-    if (!Array.isArray(spec.delegations)) return [];
+    const normalized = normalizeDelegation(spec);
+    if (!normalized.hasDelegations) return [];
     if (access !== 'authenticated') {
         throw edgeError(`${label}.delegations are only supported for authenticated HTTP services`);
     }
     const out = [];
-    for (const [index, delegation] of spec.delegations.entries()) {
-        assertObject(delegation, `${label}.delegations[${index}]`);
+    for (const [index, delegation] of normalized.entries.entries()) {
         let targetAgentId = String(delegation.targetAgentId || '').trim();
         const sourceRepo = String(route.repo || '').trim();
         const relativeMatch = targetAgentId.match(/^agent:\.\/([^/\s:]+)$/);

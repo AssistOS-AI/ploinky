@@ -1037,6 +1037,66 @@ test('generation defaults falsy delegation ttlSeconds to 1800', (t) => {
     assert.equal(applied.generation.compiled.services[0].delegations[0].ttlSeconds, 1800);
 });
 
+test('generation case-insensitively deduplicates delegation tools and scopes', (t) => {
+    const fixture = createFixture(t, {
+        routes: [{
+            routeKey: 'alpha',
+            repo: 'fixtures',
+            agent: 'alpha',
+            hostPort: 43101,
+            services: [{
+                slug: 'dashboard',
+                externalPrefix: '/services/alpha-dashboard/',
+                internalPrefix: '/',
+                access: 'authenticated',
+                delegations: [{
+                    targetAgentId: 'agent:fixtures/beta',
+                    tools: ['Records.Read', 'records.read', 'Records.Write'],
+                    scopes: ['Records:Read', 'records:read', 'Records:Write'],
+                }],
+            }],
+        }],
+    });
+
+    const applied = applyEdgeRoutingGeneration({
+        workspaceRoot: fixture.workspace,
+        reason: 'delegation-case-insensitive-deduplication',
+    });
+
+    assert.deepEqual(applied.generation.compiled.services[0].delegations[0], {
+        key: '',
+        targetAgentId: 'agent:fixtures/beta',
+        tools: ['Records.Read', 'Records.Write'],
+        scope: ['Records:Read', 'Records:Write'],
+        ttlSeconds: 1800,
+    });
+});
+
+test('generation filters no-op authenticated service delegations', (t) => {
+    const fixture = createFixture(t, {
+        routes: [{
+            routeKey: 'alpha',
+            repo: 'fixtures',
+            agent: 'alpha',
+            hostPort: 43101,
+            services: [{
+                slug: 'dashboard',
+                externalPrefix: '/services/alpha-dashboard/',
+                internalPrefix: '/',
+                access: 'authenticated',
+                delegations: [{}],
+            }],
+        }],
+    });
+
+    const applied = applyEdgeRoutingGeneration({
+        workspaceRoot: fixture.workspace,
+        reason: 'delegation-no-op-filtering',
+    });
+
+    assert.deepEqual(applied.generation.compiled.services[0].delegations, []);
+});
+
 test('generation rejects invalid delegations.scopes before falling back to scope', (t) => {
     const fixture = createFixture(t, {
         routes: [{
