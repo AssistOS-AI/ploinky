@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -24,6 +25,26 @@ function writeEnabledRepos(repoNames = []) {
 
 function clearEnabledRepos() {
     fs.rmSync(path.join(tempDir, '.ploinky', 'enabled_repos.json'), { force: true });
+}
+
+function freshEdgeSourceDocuments() {
+    return {
+        routing: { routes: {} },
+        agents: {},
+        policy: {
+            schema: 'router-policy',
+            httpRoutes: [],
+            mcpTools: [],
+        },
+        desired: {
+            schemaVersion: 1,
+            hosts: {},
+            security: {
+                hostNetworkAllowedInstances: [],
+                internalServiceConsumers: {},
+            },
+        },
+    };
 }
 
 process.chdir(tempDir);
@@ -173,11 +194,13 @@ test('start workspace clears a stale host port when start-only readiness resolve
 test('workspace start and agent-enable preparation classify fresh edge sources before mutation', () => {
     const workspaceStartSource = startWorkspace.toString();
     const workspaceInitializeIndex = workspaceStartSource.indexOf('initializeFreshEdgeRoutingSources');
+    const workspaceStartLockIndex = workspaceStartSource.indexOf('createWorkspaceStartLock()');
     const workspaceInactivateIndex = workspaceStartSource.indexOf("inactivateEdgeRoutingGeneration('workspace-start-prepare'");
     const workspacePortIndex = workspaceStartSource.indexOf('resolveAndPersistStartRouterPort');
     const workspaceRepositoriesIndex = workspaceStartSource.indexOf('prepareManifestRepositories');
 
     assert.ok(workspaceInitializeIndex >= 0, 'workspace start must classify fresh edge sources');
+    assert.ok(workspaceInitializeIndex < workspaceStartLockIndex, 'workspace start must classify before acquiring the workspace-start lease');
     assert.ok(workspaceInitializeIndex < workspaceInactivateIndex, 'workspace start must classify before generation inactivation');
     assert.ok(workspaceInitializeIndex < workspacePortIndex, 'workspace start must classify before router-port persistence');
     assert.ok(workspaceInitializeIndex < workspaceRepositoriesIndex, 'workspace start must classify before repository preparation');
@@ -192,6 +215,115 @@ test('workspace start and agent-enable preparation classify fresh edge sources b
     assert.ok(agentInitializeIndex < agentLoadAgentsIndex, 'agent-enable preparation must classify before agent reads');
     assert.ok(agentInitializeIndex < agentLoadRoutingIndex, 'agent-enable preparation must classify before routing reads');
     assert.ok(agentInitializeIndex < agentLockIndex, 'agent-enable preparation must classify before edge apply locking');
+});
+
+test('start workspace rejects partial edge sources before creating a workspace-start lease', async () => {
+    const ploinkyDir = path.join(tempDir, '.ploinky');
+    const backupDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-graph-start-partial-backup-'));
+    const backupPloinkyDir = path.join(backupDir, '.ploinky');
+    const hadPloinkyDir = fs.existsSync(ploinkyDir);
+    if (hadPloinkyDir) fs.cpSync(ploinkyDir, backupPloinkyDir, { recursive: true });
+
+    try {
+        fs.rmSync(ploinkyDir, { recursive: true, force: true });
+        const routingFile = path.join(ploinkyDir, 'routing.json');
+        const partialRouting = Buffer.from('{"routes":{"kept":{"hostPort":43101}}}');
+        fs.mkdirSync(path.dirname(routingFile), { recursive: true });
+        fs.writeFileSync(routingFile, partialRouting);
+
+        await assert.rejects(
+            startWorkspace(undefined, undefined, {
+                spawnWatchdogImpl() {
+                    throw new Error('Watchdog launch must not be reached');
+                },
+                waitForRouterReadyImpl() {
+                    throw new Error('Router readiness must not be reached');
+                },
+            }),
+            (error) => error?.code === 'EDGE_GENERATION_SOURCE_UNAVAILABLE'
+                && /partial|incomplete/.test(error.message),
+        );
+
+        assert.deepEqual(fs.readFileSync(routingFile), partialRouting);
+        assert.equal(fs.existsSync(path.join(ploinkyDir, 'agents.json')), false);
+        assert.equal(fs.existsSync(path.join(ploinkyDir, 'data', 'router-security', 'policy-state.json')), false);
+        assert.equal(fs.existsSync(path.join(ploinkyDir, 'data', 'edge-routing', 'desired.json')), false);
+        assert.equal(fs.existsSync(path.join(ploinkyDir, 'running')), false);
+        assert.equal(fs.existsSync(path.join(ploinkyDir, 'running', 'workspace-start.json')), false);
+    } finally {
+        fs.rmSync(ploinkyDir, { recursive: true, force: true });
+        if (hadPloinkyDir) fs.cpSync(backupPloinkyDir, ploinkyDir, { recursive: true });
+        fs.rmSync(backupDir, { recursive: true, force: true });
+    }
+});
+
+test('start workspace installs fresh edge sources before Watchdog launch', async () => {
+    const ploinkyDir = path.join(tempDir, '.ploinky');
+    const backupDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-graph-start-fresh-backup-'));
+    const backupPloinkyDir = path.join(backupDir, '.ploinky');
+    const hadPloinkyDir = fs.existsSync(ploinkyDir);
+    if (hadPloinkyDir) fs.cpSync(ploinkyDir, backupPloinkyDir, { recursive: true });
+
+    const sources = freshEdgeSourceDocuments();
+    const sourceFiles = {
+        routing: path.join(ploinkyDir, 'routing.json'),
+        agents: path.join(ploinkyDir, 'agents.json'),
+        policy: path.join(ploinkyDir, 'data', 'router-security', 'policy-state.json'),
+        desired: path.join(ploinkyDir, 'data', 'edge-routing', 'desired.json'),
+    };
+    const installedFreshSources = new Map();
+    const originalLinkSync = fs.linkSync;
+
+    try {
+        fs.rmSync(ploinkyDir, { recursive: true, force: true });
+        writeEnabledRepos(['fixture']);
+        writeManifest('fixture', 'router', { container: 'node:20-alpine' });
+
+        fs.linkSync = (existingPath, newPath, ...args) => {
+            const result = originalLinkSync(existingPath, newPath, ...args);
+            const sourceName = Object.entries(sourceFiles)
+                .find(([, sourceFile]) => (
+                    fs.existsSync(sourceFile)
+                    && fs.realpathSync(sourceFile) === fs.realpathSync(newPath)
+                ))?.[0];
+            if (sourceName && !installedFreshSources.has(sourceName)) {
+                installedFreshSources.set(sourceName, fs.readFileSync(newPath));
+            }
+            return result;
+        };
+        syncBuiltinESMExports();
+
+        const sentinel = new Error('Watchdog launch reached after fresh edge bootstrap');
+        let watchdogLaunches = 0;
+        await assert.rejects(
+            startWorkspace('fixture/router', 8080, {
+                spawnWatchdogImpl() {
+                    watchdogLaunches += 1;
+                    for (const [sourceName, sourceFile] of Object.entries(sourceFiles)) {
+                        assert.equal(fs.existsSync(sourceFile), true, `${sourceName} source must exist before Watchdog launch`);
+                        assert.ok(installedFreshSources.has(sourceName), `${sourceName} must be installed during fresh bootstrap`);
+                        assert.deepEqual(
+                            JSON.parse(installedFreshSources.get(sourceName).toString('utf8')),
+                            sources[sourceName],
+                            `${sourceName} must have been installed with fresh-source defaults before later startup preparation`,
+                        );
+                    }
+                    throw sentinel;
+                },
+                waitForRouterReadyImpl() {
+                    throw new Error('Router listener is not ready');
+                },
+            }),
+            (error) => error?.message.includes(sentinel.message),
+        );
+        assert.equal(watchdogLaunches, 1);
+    } finally {
+        fs.linkSync = originalLinkSync;
+        syncBuiltinESMExports();
+        fs.rmSync(ploinkyDir, { recursive: true, force: true });
+        if (hadPloinkyDir) fs.cpSync(backupPloinkyDir, ploinkyDir, { recursive: true });
+        fs.rmSync(backupDir, { recursive: true, force: true });
+    }
 });
 
 test('start workspace rejects malformed complete edge sources before launching Watchdog', async () => {

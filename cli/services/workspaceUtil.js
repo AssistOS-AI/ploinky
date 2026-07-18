@@ -1162,14 +1162,16 @@ async function startWorkspace(staticAgentArg, portArg, {
   spawnWatchdogImpl = spawnWatchdog,
   waitForRouterReadyImpl = waitForRouterReady,
 } = {}) {
-  // The workspace mutation lease covers source initialization, candidate
-  // writes, both inactive prelaunch preparations, and every subsequent start.
+  // Bootstrap classification must precede the workspace-start lease because a
+  // partial source tuple must fail without creating runtime lock artifacts.
+  // The lease then covers candidate writes, both inactive prelaunch
+  // preparations, and every subsequent start.
   // Only the final post-provider lease may authorize runtime targets.
   resetPreinstallRunInProcess();
+  initializeFreshEdgeRoutingSources({ workspaceRoot: PLOINKY_WORKSPACE_ROOT });
   const workspaceStartLock = createWorkspaceStartLock();
   let workspacePreparationLease = null;
   try {
-  initializeFreshEdgeRoutingSources({ workspaceRoot: PLOINKY_WORKSPACE_ROOT });
   inactivateEdgeRoutingGeneration('workspace-start-prepare', { workspaceRoot: PLOINKY_WORKSPACE_ROOT });
   const resolvedStartPort = await resolveAndPersistStartRouterPort(staticAgentArg, portArg, {
     coordinate: false,
@@ -1692,7 +1694,9 @@ async function startWorkspace(staticAgentArg, portArg, {
     if (message.startsWith('start:') || message.startsWith('start (workspace) failed:')) {
       throw e;
     }
-    throw new Error(`start (workspace) failed: ${message}`);
+    const error = new Error(`start (workspace) failed: ${message}`);
+    if (e?.code) error.code = e.code;
+    throw error;
   } finally {
     releaseWorkspaceStartLock(workspaceStartLock);
   }
