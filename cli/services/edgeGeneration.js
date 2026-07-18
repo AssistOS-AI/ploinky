@@ -11,6 +11,7 @@ import {
 } from './config.js';
 import { normalizeManifestHttpRouteAccess } from '../server/policy/HttpRouteProviders.js';
 import { compileHttpRoutePolicy } from '../server/policy/HttpRoutePolicyCompiler.js';
+import { resolveMaxTtlSeconds } from '../server/mcp-proxy/userDelegationGrant.js';
 import {
     assertNoHttpServicePublicationFields,
     normalizeHttpServicePort,
@@ -495,6 +496,62 @@ function normalizePrefix(value, fallback, label) {
     return normalized.endsWith('/') ? normalized : `${normalized}/`;
 }
 
+function normalizeCompiledDelegations(spec, route, access, label) {
+    if (!Array.isArray(spec.delegations)) return [];
+    if (access !== 'authenticated') {
+        throw edgeError(`${label}.delegations are only supported for authenticated HTTP services`);
+    }
+    const out = [];
+    for (const [index, delegation] of spec.delegations.entries()) {
+        assertObject(delegation, `${label}.delegations[${index}]`);
+        let targetAgentId = String(delegation.targetAgentId || '').trim();
+        const sourceRepo = String(route.repo || '').trim();
+        const relativeMatch = targetAgentId.match(/^agent:\.\/([^/\s:]+)$/);
+        if (relativeMatch) {
+            if (!sourceRepo) throw edgeError(`${label}.delegations[${index}] cannot expand a relative target without a source repo`);
+            targetAgentId = `agent:${sourceRepo}/${relativeMatch[1]}`;
+        }
+        const targetMatch = targetAgentId.match(/^agent:([^/\s:]+)\/([^/\s:]+)$/);
+        if (!targetMatch || targetMatch.slice(1).some((segment) => segment === '.' || segment === '..')) {
+            throw edgeError(`${label}.delegations[${index}].targetAgentId is invalid`);
+        }
+        const tools = [...new Set((Array.isArray(delegation.tools) ? delegation.tools : []).map((entry) => (
+            String(entry || '').trim()
+        )).filter(Boolean))];
+        const scopeValues = Array.isArray(delegation.scopes)
+            ? delegation.scopes
+            : (Array.isArray(delegation.scope) ? delegation.scope : []);
+        const scope = [...new Set(scopeValues.map((entry) => (
+            String(entry || '').trim()
+        )).filter(Boolean))];
+        if (!tools.length || !scope.length) throw edgeError(`${label}.delegations[${index}] requires tools and scopes`);
+        const ttlSeconds = Number.parseInt(String(delegation.ttlSeconds || 1800), 10);
+        if (!Number.isSafeInteger(ttlSeconds) || ttlSeconds < 30 || ttlSeconds > resolveMaxTtlSeconds()) {
+            throw edgeError(`${label}.delegations[${index}].ttlSeconds is invalid`);
+        }
+        const when = delegation.when === undefined || delegation.when === null ? null : delegation.when;
+        if (when !== null && (!isPlainObject(when)
+            || !/^[A-Za-z0-9_.-]+$/.test(String(when.queryParam || 'path').trim())
+            || !(Array.isArray(when.pathRoots) && when.pathRoots.length))) {
+            throw edgeError(`${label}.delegations[${index}].when is invalid`);
+        }
+        out.push({
+            key: String(delegation.key || '').trim(),
+            targetAgentId,
+            tools,
+            scope,
+            ttlSeconds,
+            ...(when ? {
+                when: {
+                    queryParam: String(when.queryParam || 'path').trim(),
+                    pathRoots: when.pathRoots.map((entry) => String(entry || '').trim()).filter(Boolean),
+                },
+            } : {}),
+        });
+    }
+    return out;
+}
+
 function normalizeServiceDefinition(routeKey, route, spec, label) {
     assertObject(spec, label);
     assertNoHttpServicePublicationFields(spec, label);
@@ -543,6 +600,11 @@ function normalizeServiceDefinition(routeKey, route, spec, label) {
         notFoundMessage: String(spec.notFoundMessage || 'HTTP service route not found.'),
         port,
         target,
+        route: {
+            repo: String(route.repo || '').trim(),
+            agent: String(route.agent || '').trim(),
+        },
+        delegations: normalizeCompiledDelegations(spec, route, access, label),
     };
 }
 

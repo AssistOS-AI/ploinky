@@ -314,6 +314,43 @@ test('service slugs are route-scoped and may repeat across distinct route prefix
     ]);
 });
 
+test('default HTTP service collection consumes active compiled services without re-reading manifests', async (t) => {
+    const servicePort = 43123;
+    await withRouterModules(t, servicePort);
+
+    writeFileSync(
+        path.join(SUITE_PLOINKY_DIR, 'repos', 'services', 'browserUseAgent', 'manifest.json'),
+        '{ invalid JSON',
+    );
+
+    const definitions = collectHttpServiceRoutes();
+    assert.deepEqual(definitions.map((definition) => definition.slug), [
+        'browser-use',
+        'browser-use-guest',
+    ]);
+    assert.deepEqual(definitions[0].target, {
+        hostname: '127.0.0.1',
+        hostPort: servicePort,
+        containerPort: null,
+    });
+    assert.equal(definitions[0].externalPrefix, '/services/browser-use/');
+
+    const explicitDefinitions = collectHttpServiceRoutes({
+        routes: {
+            explicit: {
+                hostPort: 43124,
+                httpServices: [{
+                    slug: 'explicit-service',
+                    externalPrefix: '/services/explicit-service/',
+                    internalPrefix: '/',
+                    access: 'authenticated',
+                }],
+            },
+        },
+    });
+    assert.equal(explicitDefinitions[0].externalPrefix, '/services/explicit-service/');
+});
+
 test('normalizeServiceSpec rejects delegation targets that are not canonical agent ids', () => {
     assert.throws(() => normalizeServiceSpec('onlyOffice', { agent: 'onlyOffice', repo: 'AssistOSExplorer' }, {
         slug: 'onlyoffice',

@@ -58,6 +58,12 @@ function createFixture(t, desired = desiredState()) {
             internalPrefix: '/',
             access: 'authenticated',
         }, {
+            slug: 'metrics',
+            port: 3000,
+            externalPrefix: '/services/alpha-metrics/',
+            internalPrefix: '/metrics/',
+            access: 'guest',
+        }, {
             slug: 'internal-api',
             externalPrefix: '/services/internal-api/',
             internalPrefix: '/private/',
@@ -87,6 +93,7 @@ function createFixture(t, desired = desiredState()) {
             container: `${input.routeKey}-container`,
             hostPath: manifestDir,
             hostPort: input.hostPort,
+            ...(input.routeKey === 'alpha' ? { serviceTargets: { 3000: 43211 } } : {}),
         };
         agents[`${input.routeKey}-container`] = {
             type: 'agent',
@@ -171,6 +178,7 @@ test('compiler emits closed host, surface, mount, alias, and private-service tab
     }]);
     assert.deepEqual(applied.generation.compiled.localAliases, {
         'dashboard.alpha.localhost': { routeKey: 'alpha', slug: 'dashboard' },
+        'metrics.alpha.localhost': { routeKey: 'alpha', slug: 'metrics' },
         'telemetry.beta.localhost': { routeKey: 'beta', slug: 'telemetry' },
     });
     assert.equal(Object.hasOwn(applied.generation.compiled.localAliases, 'internal-api.alpha.localhost'), false);
@@ -229,6 +237,29 @@ test('host-first routing selects roots, mounts, dedicated services, and closed s
     assert.equal(resolve('dashboard.example.test', '/auth/login').surface, 'browser-auth');
     assert.equal(resolve('dashboard.example.test', '/api/edge/topology').code, 'ROUTE_SURFACE_DENIED');
     assert.equal(resolve('dashboard.example.test', '/dashboard').code, 'ROUTE_SURFACE_DENIED');
+});
+
+test('request-time service plans expose compiled targets for primary and explicit private ports', (t) => {
+    const fixture = createFixture(t);
+    applyEdgeRoutingGeneration({
+        workspaceRoot: fixture.workspace,
+        reason: 'compiled-target-test',
+        publicationState: 'cloudflare-ready',
+    });
+
+    const primary = resolve('dashboard.example.test', '/widgets');
+    assert.equal(primary.ok, true);
+    assert.deepEqual(primary.definition.target, primary.target);
+    assert.equal(primary.definition.target.hostPort, 43201);
+    assert.equal(primary.definition.target.containerPort, null);
+
+    const explicit = resolve('localhost', '/services/alpha-metrics/items');
+    assert.equal(explicit.ok, true);
+    assert.equal(explicit.definition.port, 3000);
+    assert.deepEqual(explicit.definition.target, explicit.target);
+    assert.equal(explicit.target.hostPort, 43211);
+    assert.equal(explicit.target.containerPort, 3000);
+    assert.equal(explicit.upstreamPath, '/metrics/items');
 });
 
 test('dedicated service auth surface excludes token and account operations', (t) => {

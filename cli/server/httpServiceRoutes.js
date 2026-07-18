@@ -316,23 +316,22 @@ function collectRouteServiceSpecs(routeKey, route, routes, manifests = null) {
 }
 
 export function collectHttpServiceRoutes(routing = null, { manifests = null } = {}) {
-    let selectedRouting = routing;
-    let selectedManifests = manifests;
-    if (!selectedRouting) {
+    if (!routing) {
         try {
             const active = loadActiveRoutingState();
-            selectedRouting = active.routing;
-            selectedManifests = active.manifests;
+            const services = active.snapshot?.compiled?.services;
+            if (!Array.isArray(services)) return [];
+            return services.map((definition) => structuredClone(definition));
         } catch (_) {
             return [];
         }
     }
-    const routes = selectedRouting?.routes || {};
+    const routes = routing?.routes || {};
     const definitions = [];
     const prefixes = new Set();
     for (const [routeKey, route] of Object.entries(routes)) {
         if (!route || route.disabled) continue;
-        for (const definition of collectRouteServiceSpecs(routeKey, route, routes, selectedManifests)) {
+        for (const definition of collectRouteServiceSpecs(routeKey, route, routes, manifests)) {
             if (prefixes.has(definition.externalPrefix)) {
                 throw new Error(`duplicate HTTP service prefix '${definition.externalPrefix}' in active generation`);
             }

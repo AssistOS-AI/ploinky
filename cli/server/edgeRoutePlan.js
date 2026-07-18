@@ -3,11 +3,7 @@ import { domainToASCII } from 'node:url';
 
 import { captureEdgeRoutingLease } from '../services/edgeGeneration.js';
 import { selectedRouterHostPort } from '../services/routerPort.js';
-import {
-    buildServiceAgentPath,
-    collectHttpServiceRoutes,
-    resolveHttpServiceTarget,
-} from './httpServiceRoutes.js';
+import { buildServiceAgentPath } from './httpServiceRoutes.js';
 import { hasInternalAgentSegment } from './internalAgentPath.js';
 import { HttpRouteAccessPolicy } from './policy/HttpRouteAccessPolicy.js';
 
@@ -75,25 +71,26 @@ function exactRoute(routes, routeKey) {
 }
 
 function runtimeServices(snapshot) {
-    const definitions = collectHttpServiceRoutes(snapshot.routing, { manifests: snapshot.manifests || {} });
-    const compiled = snapshot.compiled?.services || [];
-    if (definitions.length !== compiled.length) throw new Error('compiled HTTP service inventory mismatch');
-    const compiledByKey = new Map(compiled.map((entry) => [serviceInventoryKey(entry), entry]));
-    if (compiledByKey.size !== compiled.length) throw new Error('compiled HTTP service inventory is ambiguous');
-    for (const definition of definitions) {
-        const expected = compiledByKey.get(serviceInventoryKey(definition));
-        if (!expected
-            || expected.externalPrefix !== definition.externalPrefix
-            || expected.internalPrefix !== definition.internalPrefix
-            || expected.access !== definition.access
-            || expected.port !== definition.port
-            || expected.guestScope !== definition.guestScope
-            || expected.issueInvocation !== definition.issueInvocation
-            || expected.includeAuthInfo !== definition.includeAuthInfo) {
-            throw new Error('compiled HTTP service semantics mismatch');
+    const compiled = snapshot.compiled?.services;
+    if (!Array.isArray(compiled)) throw new Error('compiled HTTP service inventory is invalid');
+    const identities = new Set();
+    const prefixes = new Set();
+    return compiled.map((definition) => {
+        if (!definition || typeof definition !== 'object'
+            || !String(definition.routeKey || '').trim()
+            || !String(definition.externalPrefix || '').trim()
+            || !String(definition.internalPrefix || '').trim()
+            || !String(definition.access || '').trim()) {
+            throw new Error('compiled HTTP service definition is invalid');
         }
-    }
-    return definitions;
+        const identity = serviceInventoryKey(definition);
+        if (identities.has(identity) || prefixes.has(definition.externalPrefix)) {
+            throw new Error('compiled HTTP service inventory is ambiguous');
+        }
+        identities.add(identity);
+        prefixes.add(definition.externalPrefix);
+        return structuredClone(definition);
+    });
 }
 
 function internalServiceKeys(snapshot) {
@@ -293,7 +290,6 @@ function servicePlan({
     hostSelection,
     definition,
     dedicated,
-    services,
     snapshot,
     lease,
 }) {
@@ -319,15 +315,16 @@ function servicePlan({
             decision,
         });
     }
-    const target = resolveHttpServiceTarget(definition, snapshot.routing);
-    const inventoryKey = serviceInventoryKey(definition);
-    const compiled = snapshot.compiled.services.find((entry) => (
-        serviceInventoryKey(entry) === inventoryKey
-    ));
-    if (!target || !compiled?.target
-        || target.hostname !== compiled.target.hostname
-        || target.hostPort !== compiled.target.hostPort
-        || target.containerPort !== compiled.target.containerPort) {
+    const target = definition.target;
+    if (!target
+        || typeof target !== 'object'
+        || typeof target.hostname !== 'string'
+        || !target.hostname
+        || !Number.isSafeInteger(target.hostPort)
+        || target.hostPort < 1
+        || target.hostPort > 65535
+        || (target.containerPort !== null && (!Number.isSafeInteger(target.containerPort)
+            || target.containerPort < 1 || target.containerPort > 65535))) {
         return deny(503, 'TARGET_INACTIVE', { lease, hostSelection, definition, decision });
     }
     const upstreamPath = buildServiceAgentPath(
@@ -467,7 +464,6 @@ export function resolveEdgeRoutePlan({ req, parsedUrl = null, listener = 'public
             hostSelection,
             definition,
             dedicated: false,
-            services,
             snapshot,
             lease,
         });
@@ -505,7 +501,6 @@ export function resolveEdgeRoutePlan({ req, parsedUrl = null, listener = 'public
             hostSelection,
             definition,
             dedicated: true,
-            services,
             snapshot,
             lease,
         });
@@ -530,7 +525,6 @@ export function resolveEdgeRoutePlan({ req, parsedUrl = null, listener = 'public
                 hostSelection,
                 definition,
                 dedicated: false,
-                services,
                 snapshot,
                 lease,
             });
@@ -576,7 +570,6 @@ export function resolveEdgeRoutePlan({ req, parsedUrl = null, listener = 'public
             hostSelection,
             definition: selectedByPath,
             dedicated: false,
-            services,
             snapshot,
             lease,
         });

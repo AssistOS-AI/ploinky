@@ -7,6 +7,14 @@ import path from 'node:path';
 import { applyEdgeRoutingGeneration } from '../../cli/services/edgeGeneration.js';
 import { isPrivateInterfaceAllowed, resolveEdgeRoutePlan } from '../../cli/server/edgeRoutePlan.js';
 
+test('edge route plan service authority is compiled-only at request time', () => {
+    const source = fs.readFileSync(path.join(process.cwd(), 'cli', 'server', 'edgeRoutePlan.js'), 'utf8');
+
+    assert.doesNotMatch(source, /collectHttpServiceRoutes/);
+    assert.doesNotMatch(source, /resolveHttpServiceTarget/);
+    assert.match(source, /snapshot\.compiled\?\.services|snapshot\.compiled\.services/);
+});
+
 test('private listener class admits bridge-gateway requests without IP provenance', () => {
     const bridgeRequest = {
         ploinkyListenerClass: 'private',
@@ -121,11 +129,11 @@ test('local service aliases are route-scoped and internal consumers are private-
 
     const prefixOne = plan('localhost', '/public-prefix-one/items');
     assert.equal(prefixOne.ok, true, `${prefixOne.code || 'unknown'}: ${prefixOne.status || 'no status'}`);
-    assert.equal(Object.hasOwn(prefixOne.definition, 'slug'), false);
+    assert.equal(prefixOne.definition.slug, '');
     assert.equal(prefixOne.upstreamPath, '/one/items');
     const prefixTwo = plan('localhost', '/public-prefix-two/items');
     assert.equal(prefixTwo.ok, true, `${prefixTwo.code || 'unknown'}: ${prefixTwo.status || 'no status'}`);
-    assert.equal(Object.hasOwn(prefixTwo.definition, 'slug'), false);
+    assert.equal(prefixTwo.definition.slug, '');
     assert.equal(prefixTwo.upstreamPath, '/two/items');
 
     const privatePlan = plan('host.containers.internal', '/services/internal-api/items', 'private');
