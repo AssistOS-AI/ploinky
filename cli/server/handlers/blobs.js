@@ -5,6 +5,10 @@ import crypto from 'crypto';
 import { loadAgents } from '../../services/workspace.js';
 import { SHARED_DIR } from '../../services/config.js';
 import { getWorkspaceRoot, resolveWorkspacePath } from '../utils/workspacePaths.js';
+import {
+    streamAdmittedUpload,
+    UPLOAD_ROUTE_POLICIES,
+} from './uploadAdmission.js';
 
 function ensureSharedHostDir() {
     const dir = SHARED_DIR;
@@ -149,10 +153,19 @@ function writeMeta(agent, id, meta) {
     ensureAgentBlobsDir(agent);
     const paths = getAgentPaths(agent, id);
     if (!paths) return false;
+    const temporaryPath = `${paths.metaPath}.${process.pid}.${crypto.randomBytes(8).toString('hex')}.tmp`;
+    let committed = false;
     try {
-        fs.writeFileSync(paths.metaPath, JSON.stringify(meta || {}, null, 2));
+        fs.writeFileSync(temporaryPath, JSON.stringify(meta || {}, null, 2), { flag: 'wx' });
+        fs.linkSync(temporaryPath, paths.metaPath);
+        committed = true;
+        fs.unlinkSync(temporaryPath);
         return true;
     } catch (_) {
+        try { fs.unlinkSync(temporaryPath); } catch (_) { /* ignore */ }
+        if (committed) {
+            try { fs.unlinkSync(paths.metaPath); } catch (_) { /* ignore */ }
+        }
         return false;
     }
 }
@@ -198,57 +211,83 @@ function parseUploadFilename(req) {
     return '';
 }
 
-function handlePost(req, res, agent) {
+function isBlobStorageEntry({ relativePath }) {
+    return !/^[a-f0-9]{48}\.json$/i.test(relativePath);
+}
+
+function writeBlobUploadError(res, error) {
+    if (res.headersSent) return;
+    res.writeHead(error.status || 500, {
+        'Content-Type': 'text/plain',
+        'X-Content-Type-Options': 'nosniff',
+    });
+    res.end(error.code || 'upload_failed');
+}
+
+function buildBlobUploadDetails(req, agent, id, originalName) {
+    const routeUrl = getRouteUrl(agent, id);
+    const protoHeader = readHeader(req, 'x-forwarded-proto');
+    const forwardedHost = readHeader(req, 'x-forwarded-host');
+    const hostHeader = readHeader(req, 'host');
+    const protoRaw = (Array.isArray(protoHeader) ? protoHeader[0] : protoHeader) || '';
+    const proto = protoRaw
+        ? String(protoRaw).split(',')[0].trim()
+        : (req.socket?.encrypted ? 'https' : 'http');
+    const hostRaw = (Array.isArray(forwardedHost) ? forwardedHost[0] : forwardedHost)
+        || (Array.isArray(hostHeader) ? hostHeader[0] : hostHeader)
+        || '';
+    const host = hostRaw ? String(hostRaw).split(',')[0].trim() : '';
+    return {
+        displayName: originalName || null,
+        localPath: getLocalPath(agent, id),
+        absoluteUrl: host ? `${proto}://${host}${routeUrl}` : null,
+    };
+}
+
+function handlePost(req, res, agent, { policy, timers } = {}) {
     try {
         const mime = req.headers['x-mime-type'] || req.headers['content-type'] || 'application/octet-stream';
         const id = newId();
         ensureAgentBlobsDir(agent);
         const paths = getAgentPaths(agent, id);
         if (!paths) { res.writeHead(400); return res.end('Bad id'); }
-        const out = fs.createWriteStream(paths.filePath);
-        let size = 0;
         const originalName = parseUploadFilename(req);
-        req.on('data', chunk => { size += chunk.length; });
-        req.pipe(out);
-        out.on('finish', () => {
-            const displayName = originalName || null;
-            const routeUrl = getRouteUrl(agent, id);
-            const localPath = getLocalPath(agent, id);
-            const protoHeader = readHeader(req, 'x-forwarded-proto');
-            const forwardedHost = readHeader(req, 'x-forwarded-host');
-            const hostHeader = readHeader(req, 'host');
-            const protoRaw = (Array.isArray(protoHeader) ? protoHeader[0] : protoHeader) || '';
-            const proto = protoRaw ? String(protoRaw).split(',')[0].trim() : (req.socket?.encrypted ? 'https' : 'http');
-            const hostRaw = (Array.isArray(forwardedHost) ? forwardedHost[0] : forwardedHost) || (Array.isArray(hostHeader) ? hostHeader[0] : hostHeader) || '';
-            const host = hostRaw ? String(hostRaw).split(',')[0].trim() : '';
-            const absoluteUrl = host ? `${proto}://${host}${routeUrl}` : null;
-            const meta = {
-                id,
-                mime,
-                size,
-                createdAt: new Date().toISOString(),
-                agent: agent.canonicalName,
-                repo: agent.repoName,
-                filename: displayName,
-                localPath,
-                downloadUrl: absoluteUrl
-            };
-            writeMeta(agent, id, meta);
-            res.writeHead(201, { 'Content-Type': 'application/json', 'X-Content-Type-Options': 'nosniff' });
-            res.end(JSON.stringify({
-                id,
-                localPath,
-                size,
-                mime,
-                agent: agent.canonicalName,
-                filename: displayName,
-                downloadUrl: absoluteUrl
-            }));
-        });
-        out.on('error', (e) => {
-            try { fs.unlinkSync(paths.filePath); } catch (_) { }
-            res.writeHead(500);
-            res.end('Write error');
+        const details = buildBlobUploadDetails(req, agent, id, originalName);
+        return streamAdmittedUpload(req, {
+            storageRoot: agent.blobsDir,
+            targetPath: paths.filePath,
+            policy: policy || UPLOAD_ROUTE_POLICIES.blobs,
+            includeEntry: isBlobStorageEntry,
+            timers,
+            finalize: ({ size }) => {
+                const meta = {
+                    id,
+                    mime,
+                    size,
+                    createdAt: new Date().toISOString(),
+                    agent: agent.canonicalName,
+                    repo: agent.repoName,
+                    filename: details.displayName,
+                    localPath: details.localPath,
+                    downloadUrl: details.absoluteUrl
+                };
+                if (!writeMeta(agent, id, meta)) {
+                    throw new Error('Unable to persist blob metadata.');
+                }
+            },
+            onSuccess: ({ size }) => {
+                res.writeHead(201, { 'Content-Type': 'application/json', 'X-Content-Type-Options': 'nosniff' });
+                res.end(JSON.stringify({
+                    id,
+                    localPath: details.localPath,
+                    size,
+                    mime,
+                    agent: agent.canonicalName,
+                    filename: details.displayName,
+                    downloadUrl: details.absoluteUrl
+                }));
+            },
+            onFailure: error => writeBlobUploadError(res, error),
         });
     } catch (e) {
         res.writeHead(500); res.end('Upload error');
@@ -313,14 +352,14 @@ function handleGetHead(req, res, agent, id, isHead = false) {
     }
 }
 
-function resolveWorkspaceUploadPath(inputPath) {
+function resolveWorkspaceUploadPath(inputPath, workspaceRoot = getWorkspaceRoot()) {
     return resolveWorkspacePath(inputPath, {
-        workspaceRoot: getWorkspaceRoot(),
+        workspaceRoot,
         leadingSlashIsWorkspaceRelative: true
     });
 }
 
-function handleWorkspaceUpload(req, res) {
+function handleWorkspaceUpload(req, res, { policy, timers, workspaceRoot } = {}) {
     if (req.method !== 'POST' && req.method !== 'PUT') {
         res.writeHead(405, { 'Content-Type': 'application/json', Allow: 'POST, PUT' });
         res.end(JSON.stringify({ ok: false, error: 'Method not allowed' }));
@@ -329,28 +368,32 @@ function handleWorkspaceUpload(req, res) {
 
     try {
         const u = new URL(req.url || '/upload', `http://${req.headers.host || 'localhost'}`);
-        const targetPath = resolveWorkspaceUploadPath(u.searchParams.get('path') || '');
+        const quotaRoot = path.resolve(workspaceRoot || getWorkspaceRoot());
+        const targetPath = resolveWorkspaceUploadPath(u.searchParams.get('path') || '', quotaRoot);
         const parentDir = path.dirname(targetPath);
         fs.mkdirSync(parentDir, { recursive: true });
-
-        const out = fs.createWriteStream(targetPath);
-        let size = 0;
-        req.on('data', chunk => {
-            size += chunk.length;
-        });
-        req.pipe(out);
-        out.on('finish', () => {
-            res.writeHead(200, { 'Content-Type': 'application/json', 'X-Content-Type-Options': 'nosniff' });
-            res.end(JSON.stringify({
-                ok: true,
-                path: targetPath,
-                size
-            }));
-        });
-        out.on('error', () => {
-            try { fs.unlinkSync(targetPath); } catch (_) {}
-            res.writeHead(500, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ ok: false, error: 'Write error' }));
+        return streamAdmittedUpload(req, {
+            storageRoot: quotaRoot,
+            targetPath,
+            policy: policy || UPLOAD_ROUTE_POLICIES.workspace,
+            replaceExisting: true,
+            timers,
+            onSuccess: ({ size }) => {
+                res.writeHead(200, { 'Content-Type': 'application/json', 'X-Content-Type-Options': 'nosniff' });
+                res.end(JSON.stringify({
+                    ok: true,
+                    path: targetPath,
+                    size
+                }));
+            },
+            onFailure: error => {
+                if (res.headersSent) return;
+                res.writeHead(error.status || 500, {
+                    'Content-Type': 'application/json',
+                    'X-Content-Type-Options': 'nosniff',
+                });
+                res.end(JSON.stringify({ ok: false, error: error.code || 'upload_failed' }));
+            },
         });
     } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
@@ -359,7 +402,7 @@ function handleWorkspaceUpload(req, res) {
     }
 }
 
-function handleBlobs(req, res) {
+function handleBlobs(req, res, options = {}) {
     const u = new URL(req.url || '/blobs', `http://${req.headers.host || 'localhost'}`);
     const pathname = u.pathname || '/blobs';
     const segments = pathname.split('/').filter(Boolean);
@@ -368,19 +411,27 @@ function handleBlobs(req, res) {
     }
 
     if (req.method === 'POST' && segments.length === 1) {
-        const resolved = resolveSharedRecord();
-        return handlePost(req, res, resolved.agent);
+        const resolver = options.sharedRecordResolver || resolveSharedRecord;
+        const resolved = resolver();
+        return handlePost(req, res, resolved.agent, {
+            policy: options.policy,
+            timers: options.timers,
+        });
     }
 
     if (req.method === 'POST' && segments.length === 2) {
         const agentSegment = segments[1];
-        const resolved = resolveAgentRecord(agentSegment);
+        const resolver = options.agentRecordResolver || resolveAgentRecord;
+        const resolved = resolver(agentSegment);
         if (!resolved.ok) {
             res.writeHead(resolved.status, { 'Content-Type': 'text/plain' });
             res.end(resolved.message);
             return;
         }
-        return handlePost(req, res, resolved.agent);
+        return handlePost(req, res, resolved.agent, {
+            policy: options.policy,
+            timers: options.timers,
+        });
     }
 
     if ((req.method === 'GET' || req.method === 'HEAD') && segments.length === 2) {

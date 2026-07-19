@@ -106,7 +106,9 @@ function closeWebchatSessions(globalState) {
     }
 }
 
-function createGracefulShutdown(server, globalState, agentSessionStore) {
+function createGracefulShutdown(server, globalState, agentSessionStore, { beforeClose = [] } = {}) {
+    const servers = Array.isArray(server) ? server.filter(Boolean) : [server].filter(Boolean);
+    const primaryServer = servers[0];
     return function gracefulShutdown(signal, exitCode = 0) {
         if (isShuttingDown) {
             console.log('[SHUTDOWN] Already shutting down...');
@@ -128,19 +130,24 @@ function createGracefulShutdown(server, globalState, agentSessionStore) {
 
         // Attempt graceful shutdown
         closeWebchatSessions(globalState);
-        server.close((err) => {
+        let remaining = servers.length;
+        let firstError = null;
+        const afterClose = (err) => {
+            if (err && !firstError) firstError = err;
+            remaining -= 1;
+            if (remaining > 0) return;
             clearTimeout(forceExitTimer);
 
-            const resolvedPort = resolveServerPort(server);
+            const resolvedPort = resolveServerPort(primaryServer);
             let port = resolvedPort;
             if (port == null) {
                 const envPort = Number.parseInt(process.env.PORT || '', 10);
                 port = Number.isNaN(envPort) ? null : envPort;
             }
 
-            if (err) {
-                console.error('[SHUTDOWN] Error during server close:', err.message);
-                logShutdown('server_close_error', 1, { error: err.message, originalReason: shutdownReason });
+            if (firstError) {
+                console.error('[SHUTDOWN] Error during server close:', firstError.message);
+                logShutdown('server_close_error', 1, { error: firstError.message, originalReason: shutdownReason });
             } else {
                 console.log('[SHUTDOWN] Server closed successfully');
             }
@@ -169,20 +176,40 @@ function createGracefulShutdown(server, globalState, agentSessionStore) {
 
             clearPidFile();
             process.exit(exitCode);
-        });
+        };
+        const closeServers = () => {
+            if (!servers.length) afterClose(null);
+            for (const entry of servers) entry.close(afterClose);
 
-        // Stop accepting new connections immediately
-        server.unref();
+            // Stop accepting new connections immediately
+            for (const entry of servers) entry.unref();
+        };
+        const callbacks = Array.isArray(beforeClose) ? beforeClose.filter((entry) => typeof entry === 'function') : [];
+        if (!callbacks.length) {
+            closeServers();
+            return;
+        }
+        void Promise.allSettled(callbacks.map((callback) => Promise.resolve().then(callback)))
+            .then((results) => {
+                for (const result of results) {
+                    if (result.status === 'rejected') {
+                        appendLog('shutdown_preclose_error', {
+                            error: result.reason?.message || String(result.reason),
+                        });
+                    }
+                }
+            })
+            .finally(closeServers);
     };
 }
 
 /**
  * Setup all process lifecycle handlers
  */
-function setupProcessLifecycle(server, globalState, agentSessionStore) {
+function setupProcessLifecycle(server, globalState, agentSessionStore, options = {}) {
     ensurePidFile();
 
-    const gracefulShutdown = createGracefulShutdown(server, globalState, agentSessionStore);
+    const gracefulShutdown = createGracefulShutdown(server, globalState, agentSessionStore, options);
 
     // Exit handler
     process.on('exit', (code) => {

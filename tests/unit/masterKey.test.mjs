@@ -18,6 +18,12 @@ const {
     MASTER_KEY_VAR,
 } = await import(`../../cli/services/masterKey.js${moduleSuffix}`);
 
+let freshImportCounter = 0;
+async function importFreshMasterKeyModule(label) {
+    freshImportCounter += 1;
+    return import(`../../cli/services/masterKey.js?test=${Date.now()}-${freshImportCounter}-${label}`);
+}
+
 test.after(() => {
     process.chdir(originalCwd);
     fs.rmSync(tempDir, { recursive: true, force: true });
@@ -25,23 +31,127 @@ test.after(() => {
 
 test.beforeEach(() => {
     delete process.env[MASTER_KEY_VAR];
+    delete process.env.PLOINKY_WORKSPACE_ROOT;
 });
 
-test('resolveMasterKey throws and logs when neither process.env nor .env defines the key', () => {
+test('resolveMasterKey creates a persistent fallback when neither process.env nor .env defines the key', () => {
     const errors = [];
     const originalError = console.error;
     console.error = (msg) => { errors.push(String(msg)); };
     try {
-        assert.throws(
-            () => resolveMasterKey(),
-            /PLOINKY_MASTER_KEY is required.*\.env walked upward/
-        );
+        const key = resolveMasterKey();
+        const fallbackSeedPath = path.join(tempDir, '.ploinky', 'master-key');
+        const fallbackSeed = fs.readFileSync(fallbackSeedPath, 'utf8').trim();
+        const expected = crypto.createHash('sha256').update(fallbackSeed, 'utf8').digest();
+        assert.equal(key.length, 32);
+        assert.match(fallbackSeed, /^[0-9a-f]{64}$/);
+        assert.deepEqual(key, expected);
+        assert.deepEqual(resolveMasterKey(), expected);
         assert.ok(
-            errors.some((m) => m.includes('[ploinky]') && m.includes(MASTER_KEY_VAR)),
-            'expected an error to be logged via console.error'
+            errors.some((m) => m.includes('[ploinky]') && m.includes(MASTER_KEY_VAR) && m.includes('generated fallback')),
+            'expected a generated fallback warning to be logged via console.error'
         );
     } finally {
         console.error = originalError;
+    }
+});
+
+test('resolveMasterKey warns when using the built-in fallback seed', async () => {
+    const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-mkey-builtin-'));
+    const previousCwd = process.cwd();
+    const previousRoot = process.env.PLOINKY_WORKSPACE_ROOT;
+    const errors = [];
+    const originalError = console.error;
+    console.error = (msg) => { errors.push(String(msg)); };
+    try {
+        const blockedPath = path.join(workspace, '.ploinky', 'master-key');
+        fs.mkdirSync(blockedPath, { recursive: true });
+        process.chdir(workspace);
+        process.env.PLOINKY_WORKSPACE_ROOT = workspace;
+
+        const freshModule = await importFreshMasterKeyModule('built-in-fallback-warning');
+        const key = freshModule.resolveMasterKey({ purpose: 'test encrypted storage' });
+        const expected = crypto
+            .createHash('sha256')
+            .update('ploinky-default-master-key-v1', 'utf8')
+            .digest();
+
+        assert.deepEqual(key, expected);
+        assert.ok(
+            errors.some((m) => (
+                m.includes('[ploinky]')
+                && m.includes(MASTER_KEY_VAR)
+                && m.includes('insecure built-in fallback seed')
+                && m.includes('Could not persist')
+                && m.includes('Set PLOINKY_MASTER_KEY')
+            )),
+            'expected a built-in fallback warning to be logged via console.error'
+        );
+    } finally {
+        console.error = originalError;
+        process.chdir(previousCwd);
+        if (previousRoot === undefined) {
+            delete process.env.PLOINKY_WORKSPACE_ROOT;
+        } else {
+            process.env.PLOINKY_WORKSPACE_ROOT = previousRoot;
+        }
+        fs.rmSync(workspace, { recursive: true, force: true });
+    }
+});
+
+test('resolveMasterKey ignores stale explicit workspace roots that are not directories', async () => {
+    const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-mkey-root-'));
+    const previousCwd = process.cwd();
+    const previousRoot = process.env.PLOINKY_WORKSPACE_ROOT;
+    try {
+        fs.mkdirSync(path.join(workspace, '.ploinky'), { recursive: true });
+        process.chdir(workspace);
+        process.env.PLOINKY_WORKSPACE_ROOT = path.join(workspace, 'missing-root');
+
+        const freshModule = await importFreshMasterKeyModule('stale-workspace-root');
+        freshModule.resolveMasterKey();
+
+        assert.equal(fs.existsSync(path.join(workspace, '.ploinky', 'master-key')), true);
+        assert.equal(fs.existsSync(path.join(workspace, 'missing-root')), false);
+    } finally {
+        process.chdir(previousCwd);
+        if (previousRoot === undefined) {
+            delete process.env.PLOINKY_WORKSPACE_ROOT;
+        } else {
+            process.env.PLOINKY_WORKSPACE_ROOT = previousRoot;
+        }
+        fs.rmSync(workspace, { recursive: true, force: true });
+    }
+});
+
+test('resolveMasterKey does not overwrite an empty generated key file', async () => {
+    const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-mkey-empty-'));
+    const previousCwd = process.cwd();
+    const previousRoot = process.env.PLOINKY_WORKSPACE_ROOT;
+    try {
+        const keyPath = path.join(workspace, '.ploinky', 'master-key');
+        fs.mkdirSync(path.dirname(keyPath), { recursive: true });
+        fs.writeFileSync(keyPath, '');
+        process.chdir(workspace);
+        process.env.PLOINKY_WORKSPACE_ROOT = workspace;
+
+        const freshModule = await importFreshMasterKeyModule('empty-generated-key');
+        const key = freshModule.resolveMasterKey();
+        const expected = crypto
+            .createHash('sha256')
+            .update('ploinky-default-master-key-v1', 'utf8')
+            .digest();
+
+        assert.deepEqual(key, expected);
+        assert.equal(fs.readFileSync(keyPath, 'utf8'), '');
+    } finally {
+        process.chdir(previousCwd);
+        if (previousRoot === undefined) {
+            delete process.env.PLOINKY_WORKSPACE_ROOT;
+        } else {
+            process.env.PLOINKY_WORKSPACE_ROOT = previousRoot;
+        }
+        fs.rmSync(workspace, { recursive: true, force: true });
     }
 });
 
@@ -106,25 +216,25 @@ test('deriveDerivedMasterKey is the derived-master subkey', () => {
 test('deriveAgentSecret derives deterministic per-agent secrets from the derived master key', () => {
     process.env[MASTER_KEY_VAR] = 'e'.repeat(64);
 
-    const dpuKey = deriveAgentSecret({
-        repoName: 'AssistOSExplorer',
-        agentName: 'dpuAgent',
-        name: 'DPU_MASTER_KEY',
+    const alphaKey = deriveAgentSecret({
+        repoName: 'exampleRepo',
+        agentName: 'alphaAgent',
+        name: 'ALPHA_MASTER_KEY',
     });
-    const dpuKeyAgain = deriveAgentSecret({
-        repoName: 'AssistOSExplorer',
-        agentName: 'dpuAgent',
-        name: 'DPU_MASTER_KEY',
+    const alphaKeyAgain = deriveAgentSecret({
+        repoName: 'exampleRepo',
+        agentName: 'alphaAgent',
+        name: 'ALPHA_MASTER_KEY',
     });
-    const livekitKey = deriveAgentSecret({
-        repoName: 'AssistOSExplorer',
-        agentName: 'webmeetLivekitServer',
-        name: 'WEBMEET_LIVEKIT_API_SECRET',
+    const betaKey = deriveAgentSecret({
+        repoName: 'exampleRepo',
+        agentName: 'betaAgent',
+        name: 'BETA_API_SECRET',
     });
 
-    assert.equal(dpuKey.length, 64);
-    assert.equal(dpuKey, dpuKeyAgain);
-    assert.notEqual(dpuKey, livekitKey);
-    assert.notEqual(dpuKey, deriveDerivedMasterKey().toString('hex'));
-    assert.notEqual(dpuKey, resolveMasterKey().toString('hex'));
+    assert.equal(alphaKey.length, 64);
+    assert.equal(alphaKey, alphaKeyAgain);
+    assert.notEqual(alphaKey, betaKey);
+    assert.notEqual(alphaKey, deriveDerivedMasterKey().toString('hex'));
+    assert.notEqual(alphaKey, resolveMasterKey().toString('hex'));
 });

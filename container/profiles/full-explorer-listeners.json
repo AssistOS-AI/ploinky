@@ -1,0 +1,599 @@
+{
+  "schemaVersion": 1,
+  "id": "full-explorer-v5",
+  "description": "Expected listener ownership for a freshly built Ploinky Box v5 running the complete Explorer dependency graph.",
+  "requireManagedContainers": true,
+  "rejectAdditionalContainers": true,
+  "requireProcessOwners": true,
+  "controlPorts": [
+    80,
+    443,
+    3000,
+    3001,
+    3478,
+    4369,
+    5349,
+    5432,
+    5672,
+    6379,
+    7000,
+    7301,
+    7681,
+    7880,
+    7881,
+    7882,
+    7980,
+    7981,
+    8000,
+    8080,
+    8081,
+    8082,
+    8888,
+    8890,
+    9000,
+    9100,
+    17000,
+    17001,
+    17002,
+    19000,
+    25672
+  ],
+  "requiredContainers": [
+    {
+      "id": "explorer-git",
+      "namePattern": "^ploinky_AssistOSExplorer_gitAgent_",
+      "networkModePattern": "^(?!host$|none$).+$",
+      "effectiveInstance": "agent:AssistOSExplorer/gitAgent"
+    },
+    {
+      "id": "explorer-dpu",
+      "namePattern": "^ploinky_AssistOSExplorer_dpuAgent_",
+      "networkModePattern": "^(?!host$|none$).+$",
+      "effectiveInstance": "agent:AssistOSExplorer/dpuAgent"
+    },
+    {
+      "id": "explorer-soplang",
+      "namePattern": "^ploinky_AssistOSExplorer_soplangAgent_",
+      "networkModePattern": "^(?!host$|none$).+$",
+      "effectiveInstance": "agent:AssistOSExplorer/soplangAgent"
+    },
+    {
+      "id": "explorer-tasks",
+      "namePattern": "^ploinky_AssistOSExplorer_tasksAgent_",
+      "networkModePattern": "^(?!host$|none$).+$",
+      "effectiveInstance": "agent:AssistOSExplorer/tasksAgent"
+    },
+    {
+      "id": "explorer-webmeet",
+      "namePattern": "^ploinky_AssistOSExplorer_webmeetAgent_",
+      "networkModePattern": "^(?!host$|none$).+$",
+      "effectiveInstance": "agent:AssistOSExplorer/webmeetAgent"
+    },
+    {
+      "id": "explorer-stt",
+      "namePattern": "^ploinky_AssistOSExplorer_webmeetStt_",
+      "networkModePattern": "^(?!host$|none$).+$",
+      "effectiveInstance": "agent:AssistOSExplorer/webmeetStt"
+    },
+    {
+      "id": "explorer-multimedia",
+      "namePattern": "^ploinky_AssistOSExplorer_multimedia_",
+      "networkModePattern": "^(?!host$|none$).+$",
+      "effectiveInstance": "agent:AssistOSExplorer/multimedia"
+    },
+    {
+      "id": "explorer-onlyoffice",
+      "namePattern": "^ploinky_AssistOSExplorer_onlyOffice_",
+      "networkModePattern": "^(?!host$|none$).+$",
+      "effectiveInstance": "agent:AssistOSExplorer/onlyOffice"
+    },
+    {
+      "id": "explorer-webassist",
+      "namePattern": "^ploinky_AssistOSExplorer_webAssist_",
+      "networkModePattern": "^(?!host$|none$).+$",
+      "effectiveInstance": "agent:AssistOSExplorer/webAssist"
+    },
+    {
+      "id": "achilles-cli",
+      "namePattern": "^ploinky_AchillesCLI_achilles-cli_",
+      "networkModePattern": "^(?!host$|none$).+$",
+      "effectiveInstance": "agent:AchillesCLI/achilles-cli"
+    },
+    {
+      "id": "achilles-opencode",
+      "namePattern": "^ploinky_AchillesCLI_opencodeAgent_",
+      "networkModePattern": "^(?!host$|none$).+$",
+      "effectiveInstance": "agent:AchillesCLI/opencodeAgent"
+    },
+    {
+      "id": "achilles-pi",
+      "namePattern": "^ploinky_AchillesCLI_piAgent_",
+      "networkModePattern": "^(?!host$|none$).+$",
+      "effectiveInstance": "agent:AchillesCLI/piAgent"
+    },
+    {
+      "id": "achilles-codex",
+      "namePattern": "^ploinky_AchillesCLI_codexAgent_",
+      "networkModePattern": "^(?!host$|none$).+$",
+      "effectiveInstance": "agent:AchillesCLI/codexAgent"
+    },
+    {
+      "id": "achilles-gpt-researcher",
+      "namePattern": "^ploinky_AchillesCLI_GPTResearcher_",
+      "networkModePattern": "^(?!host$|none$).+$",
+      "effectiveInstance": "agent:AchillesCLI/GPTResearcher"
+    },
+    {
+      "id": "webtty",
+      "namePattern": "^ploinky_basic_webtty_",
+      "networkModePattern": "^(?!host$|none$).+$",
+      "effectiveInstance": "agent:basic/webtty"
+    },
+    {
+      "id": "livekit",
+      "namePattern": "^ploinky_webmeetInfra_liveKitServerAgent_",
+      "networkModePattern": "^host$",
+      "effectiveInstance": "agent:webmeetInfra/liveKitServerAgent"
+    },
+    {
+      "id": "soul-gateway",
+      "namePattern": "^ploinky_proxies_soul-gateway_",
+      "networkModePattern": "^(?!host$|none$).+$",
+      "effectiveInstance": "agent:proxies/soul-gateway"
+    },
+    {
+      "id": "search-agent",
+      "namePattern": "^ploinky_proxies_searchAgent_",
+      "networkModePattern": "^(?!host$|none$).+$",
+      "effectiveInstance": "agent:proxies/searchAgent"
+    },
+    {
+      "id": "default-local-llm-backend",
+      "namePattern": "^ploinky_proxies_default-local-llm_",
+      "networkModePattern": "^(?!host$|none$).+$",
+      "effectiveInstance": "agent:proxies/default-local-llm"
+    },
+    {
+      "id": "umami",
+      "namePattern": "^ploinky_UmamiAgent_umamiAgent_",
+      "networkModePattern": "^(?!host$|none$).+$",
+      "effectiveInstance": "agent:UmamiAgent/umamiAgent"
+    }
+  ],
+  "forbiddenSockets": [
+    {
+      "id": "no-livekit-ice-tcp",
+      "protocols": ["tcp"],
+      "ports": [7881]
+    },
+    {
+      "id": "no-local-turn",
+      "protocols": ["tcp", "udp"],
+      "ports": [3478, 5349]
+    },
+    {
+      "id": "no-livekit-udp-range",
+      "protocols": ["udp"],
+      "portRanges": [
+        { "start": 7883, "end": 7892 }
+      ]
+    },
+    {
+      "id": "no-local-turn-relay-range",
+      "protocols": ["udp"],
+      "portRanges": [
+        { "start": 20000, "end": 20010 }
+      ]
+    },
+    {
+      "id": "no-public-tls-listener",
+      "protocols": ["tcp"],
+      "ports": [443]
+    },
+    {
+      "id": "no-retired-web-publication",
+      "protocols": ["tcp"],
+      "ports": [8082]
+    },
+    {
+      "id": "no-stable-agent-box-mappings",
+      "namespacePattern": "^outer$",
+      "protocols": ["tcp"],
+      "ports": [17001, 17002, 19000]
+    }
+  ],
+  "rules": [
+    {
+      "id": "router-public",
+      "namespacePattern": "^outer$",
+      "protocols": ["tcp"],
+      "ports": [8080],
+      "bindAddresses": ["0.0.0.0"],
+      "ownerPattern": "^(?:node|MainThread)$",
+      "effectiveInstance": "ploinky-core",
+      "reviewedSensitive": true,
+      "minMatches": 1,
+      "maxMatches": 1,
+      "rationale": "RoutingServer public/control listener; the outer engine publishes it only to physical-host loopback."
+    },
+    {
+      "id": "router-private",
+      "namespacePattern": "^outer$",
+      "protocols": ["tcp"],
+      "ports": [8081],
+      "dynamicBindSet": "loopback-and-managed-gateways",
+      "ownerPattern": "^(?:node|MainThread)$",
+      "effectiveInstance": "ploinky-core",
+      "reviewedSensitive": true,
+      "minMatches": 1,
+      "rationale": "RoutingServer private listener bound exactly once on box loopback and on every exact current managed bridge gateway; it has no wildcard bind or outer publication."
+    },
+    {
+      "id": "livekit-signal",
+      "namespacePattern": "^outer$",
+      "protocols": ["tcp"],
+      "ports": [7880],
+      "bindAddresses": ["127.0.0.1"],
+      "exactOwners": ["livekit-server"],
+      "ownerContainerPattern": "^ploinky_webmeetInfra_liveKitServerAgent_",
+      "effectiveInstance": "agent:webmeetInfra/liveKitServerAgent",
+      "reviewedSensitive": true,
+      "minMatches": 1,
+      "maxMatches": 1,
+      "rationale": "LiveKit signaling and Twirp share a loopback-only HTTP listener reached through the public and private Router services."
+    },
+    {
+      "id": "livekit-udp-mux",
+      "namespacePattern": "^outer$",
+      "protocols": ["udp"],
+      "ports": [7882],
+      "bindAddresses": ["0.0.0.0"],
+      "exactOwners": ["livekit-server"],
+      "ownerContainerPattern": "^ploinky_webmeetInfra_liveKitServerAgent_",
+      "effectiveInstance": "agent:webmeetInfra/liveKitServerAgent",
+      "reviewedSensitive": true,
+      "exclusiveSocket": true,
+      "minMatches": 1,
+      "maxMatches": 1,
+      "rationale": "The exact current host-network LiveKit runtime exclusively owns the box UDP 7882 ICE mux."
+    },
+    {
+      "id": "livekit-redis",
+      "namespacePattern": "^outer$",
+      "protocols": ["tcp"],
+      "ports": [6379],
+      "bindAddresses": ["127.0.0.1"],
+      "ownerPattern": "^redis-server$",
+      "ownerContainerPattern": "^ploinky_webmeetInfra_liveKitServerAgent_",
+      "effectiveInstance": "agent:webmeetInfra/liveKitServerAgent",
+      "reviewedSensitive": true,
+      "minMatches": 1,
+      "maxMatches": 1,
+      "rationale": "LiveKit's composite Redis is loopback-only in the host-network runtime namespace."
+    },
+    {
+      "id": "livekit-egress-template",
+      "namespacePattern": "^outer$",
+      "protocols": ["tcp"],
+      "ports": [7980],
+      "bindAddresses": ["127.0.0.1"],
+      "ownerPattern": "^egress$",
+      "ownerContainerPattern": "^ploinky_webmeetInfra_liveKitServerAgent_",
+      "effectiveInstance": "agent:webmeetInfra/liveKitServerAgent",
+      "reviewedSensitive": true,
+      "minMatches": 1,
+      "maxMatches": 1,
+      "rationale": "Pinned LiveKit Egress template service is private and semantically probed separately from health."
+    },
+    {
+      "id": "livekit-egress-health",
+      "namespacePattern": "^outer$",
+      "protocols": ["tcp"],
+      "ports": [7981],
+      "bindAddresses": ["127.0.0.1"],
+      "ownerPattern": "^egress$",
+      "ownerContainerPattern": "^ploinky_webmeetInfra_liveKitServerAgent_",
+      "effectiveInstance": "agent:webmeetInfra/liveKitServerAgent",
+      "reviewedSensitive": true,
+      "minMatches": 1,
+      "maxMatches": 1,
+      "rationale": "Pinned loopback-patched Egress semantic health listener is reachable only by the composite supervisor."
+    },
+    {
+      "id": "livekit-supervisor-health",
+      "namespacePattern": "^outer$",
+      "protocols": ["tcp"],
+      "ports": [17000],
+      "bindAddresses": ["127.0.0.1"],
+      "exactOwners": ["node"],
+      "ownerContainerPattern": "^ploinky_webmeetInfra_liveKitServerAgent_",
+      "effectiveInstance": "agent:webmeetInfra/liveKitServerAgent",
+      "reviewedSensitive": true,
+      "minMatches": 1,
+      "maxMatches": 1,
+      "rationale": "LiveKit composite readiness summary is loopback-only; detailed health remains on its private Unix socket."
+    },
+    {
+      "id": "standard-agentserver",
+      "namespacePattern": "^nested:",
+      "containerPattern": "^ploinky_(?:AssistOSExplorer_(?:gitAgent|dpuAgent|soplangAgent|tasksAgent|webmeetAgent|multimedia|webAssist)|AchillesCLI_(?:achilles-cli|opencodeAgent|piAgent|codexAgent|GPTResearcher)|proxies_(?:soul-gateway|searchAgent|default-local-llm)|UmamiAgent_umamiAgent)_",
+      "protocols": ["tcp"],
+      "ports": [7000],
+      "bindClasses": ["wildcard"],
+      "exactOwners": ["node"],
+      "reviewedSensitive": true,
+      "minMatches": 16,
+      "maxMatches": 16,
+      "rationale": "One standard AgentServer endpoint per routed Explorer dependency, isolated inside that dependency's managed namespace."
+    },
+    {
+      "id": "webtty-service",
+      "namespacePattern": "^nested:",
+      "containerPattern": "^ploinky_basic_webtty_",
+      "protocols": ["tcp"],
+      "ports": [7681],
+      "bindClasses": ["wildcard"],
+      "exactOwners": ["node"],
+      "reviewedSensitive": true,
+      "minMatches": 1,
+      "maxMatches": 1,
+      "rationale": "WebTTY HTTP/SSE target is reachable only through its authenticated Router service mapping."
+    },
+    {
+      "id": "webmeet-stt",
+      "namespacePattern": "^nested:",
+      "containerPattern": "^ploinky_AssistOSExplorer_webmeetStt_",
+      "protocols": ["tcp"],
+      "ports": [9000],
+      "bindClasses": ["wildcard"],
+      "ownerPattern": "^python",
+      "reviewedSensitive": true,
+      "minMatches": 1,
+      "maxMatches": 1,
+      "rationale": "WebMeet STT remains a private dependency listener and has no stable box or physical-host publication."
+    },
+    {
+      "id": "onlyoffice-control",
+      "namespacePattern": "^nested:",
+      "containerPattern": "^ploinky_AssistOSExplorer_onlyOffice_",
+      "protocols": ["tcp"],
+      "ports": [7000],
+      "bindClasses": ["wildcard"],
+      "exactOwners": ["node"],
+      "reviewedSensitive": true,
+      "minMatches": 1,
+      "maxMatches": 1,
+      "rationale": "OnlyOffice authenticated control target is reachable only through the selected Router service."
+    },
+    {
+      "id": "onlyoffice-editor",
+      "namespacePattern": "^nested:",
+      "containerPattern": "^ploinky_AssistOSExplorer_onlyOffice_",
+      "protocols": ["tcp"],
+      "ports": [8080],
+      "bindClasses": ["wildcard"],
+      "exactOwners": ["node"],
+      "reviewedSensitive": true,
+      "minMatches": 1,
+      "maxMatches": 1,
+      "rationale": "OnlyOffice narrowly public editor transport target is private to its isolated managed container and Router mapping."
+    },
+    {
+      "id": "onlyoffice-storage",
+      "namespacePattern": "^nested:",
+      "containerPattern": "^ploinky_AssistOSExplorer_onlyOffice_",
+      "protocols": ["tcp"],
+      "ports": [9100],
+      "bindClasses": ["loopback"],
+      "exactOwners": ["node"],
+      "reviewedSensitive": true,
+      "minMatches": 1,
+      "maxMatches": 1,
+      "rationale": "OnlyOffice source storage and callback endpoint is process-loopback-only and is never a Router target."
+    },
+    {
+      "id": "onlyoffice-documentserver",
+      "namespacePattern": "^nested:",
+      "containerPattern": "^ploinky_AssistOSExplorer_onlyOffice_",
+      "protocols": ["tcp"],
+      "ports": [80],
+      "bindClasses": ["loopback"],
+      "ownerPattern": "^nginx$",
+      "reviewedSensitive": true,
+      "minMatches": 1,
+      "maxMatches": 2,
+      "rationale": "Embedded DocumentServer nginx is process-loopback-only behind the editor decorator."
+    },
+    {
+      "id": "onlyoffice-docservice",
+      "namespacePattern": "^nested:",
+      "containerPattern": "^ploinky_AssistOSExplorer_onlyOffice_",
+      "protocols": ["tcp"],
+      "ports": [8000],
+      "bindClasses": ["loopback"],
+      "ownerPattern": "^docservice$",
+      "reviewedSensitive": true,
+      "minMatches": 1,
+      "maxMatches": 2,
+      "rationale": "OnlyOffice coauthoring service remains process-loopback-only behind embedded nginx."
+    },
+    {
+      "id": "onlyoffice-postgres",
+      "namespacePattern": "^nested:",
+      "containerPattern": "^ploinky_AssistOSExplorer_onlyOffice_",
+      "protocols": ["tcp"],
+      "ports": [5432],
+      "bindClasses": ["loopback"],
+      "ownerPattern": "^postgres$",
+      "reviewedSensitive": true,
+      "minMatches": 1,
+      "maxMatches": 2,
+      "rationale": "OnlyOffice bundled Postgres is process-loopback-only inside the composite container."
+    },
+    {
+      "id": "onlyoffice-rabbitmq",
+      "namespacePattern": "^nested:",
+      "containerPattern": "^ploinky_AssistOSExplorer_onlyOffice_",
+      "protocols": ["tcp"],
+      "ports": [5672, 25672],
+      "bindClasses": ["loopback"],
+      "ownerPattern": "^beam\\.smp$",
+      "reviewedSensitive": true,
+      "minMatches": 2,
+      "maxMatches": 4,
+      "rationale": "OnlyOffice bundled RabbitMQ client and distribution sockets are process-loopback-only."
+    },
+    {
+      "id": "onlyoffice-epmd",
+      "namespacePattern": "^nested:",
+      "containerPattern": "^ploinky_AssistOSExplorer_onlyOffice_",
+      "protocols": ["tcp"],
+      "ports": [4369],
+      "bindClasses": ["loopback"],
+      "ownerPattern": "^epmd$",
+      "reviewedSensitive": true,
+      "minMatches": 1,
+      "maxMatches": 2,
+      "rationale": "OnlyOffice RabbitMQ's Erlang mapper is restricted to process loopback with the rest of the bundled broker."
+    },
+    {
+      "id": "onlyoffice-redis",
+      "namespacePattern": "^nested:",
+      "containerPattern": "^ploinky_AssistOSExplorer_onlyOffice_",
+      "protocols": ["tcp"],
+      "ports": [6379],
+      "bindClasses": ["loopback"],
+      "ownerPattern": "^redis-server$",
+      "reviewedSensitive": true,
+      "minMatches": 0,
+      "maxMatches": 2,
+      "rationale": "The pinned DocumentServer Redis support process, when enabled, is process-loopback-only inside the composite container."
+    },
+    {
+      "id": "onlyoffice-adminpanel",
+      "namespacePattern": "^nested:",
+      "containerPattern": "^ploinky_AssistOSExplorer_onlyOffice_",
+      "protocols": ["tcp"],
+      "ports": [9000],
+      "bindClasses": ["loopback"],
+      "ownerPattern": "^node$",
+      "reviewedSensitive": true,
+      "minMatches": 0,
+      "maxMatches": 2,
+      "rationale": "The pinned DocumentServer AdminPanel support process, when present, must remain process-loopback-only and is never a Router target."
+    },
+    {
+      "id": "umami-dashboard",
+      "namespacePattern": "^nested:",
+      "containerPattern": "^ploinky_UmamiAgent_umamiAgent_",
+      "protocols": ["tcp"],
+      "ports": [3000],
+      "bindClasses": ["wildcard"],
+      "exactOwners": ["node"],
+      "reviewedSensitive": true,
+      "minMatches": 1,
+      "maxMatches": 1,
+      "rationale": "Umami dashboard is an authenticated Router target inside its isolated managed namespace."
+    },
+    {
+      "id": "umami-telemetry",
+      "namespacePattern": "^nested:",
+      "containerPattern": "^ploinky_UmamiAgent_umamiAgent_",
+      "protocols": ["tcp"],
+      "ports": [3001],
+      "bindClasses": ["wildcard"],
+      "exactOwners": ["node"],
+      "reviewedSensitive": true,
+      "minMatches": 1,
+      "maxMatches": 1,
+      "rationale": "Umami telemetry is the dedicated narrow guest Router target inside its isolated managed namespace."
+    },
+    {
+      "id": "umami-mcp",
+      "namespacePattern": "^nested:",
+      "containerPattern": "^ploinky_UmamiAgent_umamiAgent_",
+      "protocols": ["tcp"],
+      "ports": [7301],
+      "bindClasses": ["loopback"],
+      "ownerPattern": "^(bun|node)$",
+      "reviewedSensitive": true,
+      "minMatches": 1,
+      "maxMatches": 1,
+      "rationale": "Umami MCP upstream is process-loopback-only and is called only by the routed AgentServer adapter."
+    },
+    {
+      "id": "umami-postgres",
+      "namespacePattern": "^nested:",
+      "containerPattern": "^ploinky_UmamiAgent_umamiAgent_",
+      "protocols": ["tcp"],
+      "ports": [5432],
+      "bindClasses": ["loopback"],
+      "ownerPattern": "^postgres$",
+      "reviewedSensitive": true,
+      "minMatches": 1,
+      "maxMatches": 2,
+      "rationale": "Umami Postgres is process-loopback-only inside the composite agent container."
+    },
+    {
+      "id": "gpt-researcher-ui",
+      "namespacePattern": "^nested:",
+      "containerPattern": "^ploinky_AchillesCLI_GPTResearcher_",
+      "protocols": ["tcp"],
+      "ports": [8000],
+      "bindClasses": ["wildcard"],
+      "ownerPattern": "^python",
+      "reviewedSensitive": true,
+      "minMatches": 1,
+      "maxMatches": 1,
+      "rationale": "GPTResearcher UI/API is a private explicit Router target with verified base-path behavior."
+    },
+    {
+      "id": "search-searxng",
+      "namespacePattern": "^nested:",
+      "containerPattern": "^ploinky_proxies_searchAgent_",
+      "protocols": ["tcp"],
+      "ports": [8888],
+      "bindClasses": ["loopback"],
+      "ownerPattern": "^(python|python3)$",
+      "reviewedSensitive": true,
+      "minMatches": 1,
+      "maxMatches": 1,
+      "rationale": "SearchAgent's SearXNG support service is process-loopback-only and is not a Router target."
+    },
+    {
+      "id": "search-browser-pool",
+      "namespacePattern": "^nested:",
+      "containerPattern": "^ploinky_proxies_searchAgent_",
+      "protocols": ["tcp"],
+      "ports": [8890],
+      "bindClasses": ["loopback"],
+      "ownerPattern": "^node$",
+      "reviewedSensitive": true,
+      "minMatches": 0,
+      "maxMatches": 1,
+      "rationale": "Optional SearchAgent browser pool is process-loopback-only and is never directly routed."
+    },
+    {
+      "id": "default-local-llm",
+      "namespacePattern": "^nested:",
+      "containerPattern": "^ploinky_proxies_default-local-llm_",
+      "protocols": ["tcp"],
+      "ports": [8080],
+      "bindClasses": ["loopback"],
+      "ownerPattern": "^llama-server$",
+      "reviewedSensitive": true,
+      "minMatches": 1,
+      "maxMatches": 1,
+      "rationale": "The local llama server is process-loopback-only behind its AgentServer provider adapter."
+    },
+    {
+      "id": "private-loopback-support",
+      "namespacePattern": "^nested:",
+      "protocols": ["tcp", "udp"],
+      "bindClasses": ["loopback"],
+      "reviewedSensitive": false,
+      "minMatches": 0,
+      "rationale": "Non-control process-loopback support socket inside a reviewed isolated composite; it has no Router or outer publication."
+    }
+  ]
+}

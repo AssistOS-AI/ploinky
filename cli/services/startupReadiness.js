@@ -21,6 +21,11 @@ function readManifestAgentCommand(manifest) {
     return String(value || '').trim();
 }
 
+function readManifestReadinessScript(manifest) {
+    const value = manifest?.health?.readiness?.script;
+    return typeof value === 'string' ? value.trim() : '';
+}
+
 function resolveAgentExecutionMode(manifest) {
     const startCmd = readManifestStartCommand(manifest);
     const explicitAgentCmd = readManifestAgentCommand(manifest);
@@ -57,7 +62,7 @@ function resolveAgentExecutionMode(manifest) {
     };
 }
 
-function resolveAgentReadinessProtocol(manifest) {
+function resolveAgentReadinessProtocol(manifest, context = {}) {
     const explicit = normalizeProtocol(manifest?.readiness?.protocol);
     if (explicit) {
         return explicit;
@@ -65,6 +70,9 @@ function resolveAgentReadinessProtocol(manifest) {
 
     const executionMode = resolveAgentExecutionMode(manifest);
     if (executionMode.type === 'start_only') {
+        if (readManifestReadinessScript(manifest)) {
+            return 'script';
+        }
         return 'tcp';
     }
 
@@ -73,6 +81,7 @@ function resolveAgentReadinessProtocol(manifest) {
 
 export {
     readManifestAgentCommand,
+    readManifestReadinessScript,
     readManifestStartCommand,
     resolveAgentExecutionMode,
     resolveAgentReadinessProtocol

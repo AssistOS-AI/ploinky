@@ -1,0 +1,99 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+
+import {
+    PLOINKY_MANAGED_LABEL,
+    managedContainerLabelArgs,
+} from '../../cli/services/docker/common.js';
+import { buildPersistentAgentRunArgs } from '../../cli/services/docker/agentServiceManager.js';
+import {
+    buildInteractiveAgentCreateCommand,
+    buildInteractiveCommandCreateCommand,
+} from '../../cli/services/docker/interactive.js';
+import { buildShellDetectionRunArgs } from '../../cli/services/docker/shellDetection.js';
+import { buildContainerInstallRunArgs } from '../../cli/services/dependencyCache.js';
+import { buildContainerRuntimeKeyProbeRunArgs } from '../../cli/services/dependencyRuntimeKey.js';
+
+const managed = 'io.assistos.ploinky.managed=1';
+
+function labelValues(args) {
+    const values = [];
+    for (let index = 0; index < args.length; index += 1) {
+        if (args[index] === '--label') values.push(args[index + 1]);
+    }
+    return values;
+}
+
+function assertExactManagedArgv(args) {
+    assert.equal(labelValues(args).filter((value) => value === managed).length, 1);
+}
+
+function assertExactManagedCommand(command) {
+    assertExactManagedArgv(String(command).trim().split(/\s+/));
+}
+
+test('managed label helper emits the exact D12 ownership label', () => {
+    assert.equal(PLOINKY_MANAGED_LABEL, managed);
+    assert.deepEqual(managedContainerLabelArgs(), ['--label', managed]);
+});
+
+test('dependency-install helper containers carry the exact managed label', () => {
+    const args = buildContainerInstallRunArgs({
+        cwd: '/tmp/cache', image: 'example/image', runtime: 'podman', shellPath: '/bin/sh', installScript: 'true',
+    });
+    const index = args.indexOf('--label');
+    assert.notEqual(index, -1);
+    assert.equal(args[index + 1], managed);
+});
+
+test('persistent agent run builder carries the exact managed label', () => {
+    const args = buildPersistentAgentRunArgs({
+        runtime: 'podman',
+        containerName: 'ploinky_demo',
+        envHash: 'hash',
+        containerWorkdir: '/root',
+        agentLibMountPath: '/workspace/.ploinky/runtime/Agent',
+        codeMountPath: '/workspace/.ploinky/runtime/code',
+        codeMountMode: ':z,ro',
+        sharedDir: '/workspace/.ploinky/shared',
+        cwd: '/workspace/.data/demo',
+        cwdMountTarget: '/root',
+    });
+    assertExactManagedArgv(args);
+});
+
+test('both interactive create/retry command families carry the exact managed label', () => {
+    for (const containerImage of ['node:24', 'docker.io/library/node:24']) {
+        assertExactManagedCommand(buildInteractiveCommandCreateCommand({
+            runtime: 'podman',
+            containerName: 'ploinky_demo',
+            mountOption: '-v "/workspace:/workspace"',
+            portOptions: '-p 127.0.0.1:17002:7000',
+            envVars: '-e HOME=/root',
+            containerImage,
+        }));
+        assertExactManagedCommand(buildInteractiveAgentCreateCommand({
+            runtime: 'podman',
+            containerName: 'ploinky_demo',
+            envHash: 'hash',
+            projectDir: '/workspace',
+            homeDir: '/workspace/.data/demo',
+            agentLibPath: '/opt/ploinky/Agent',
+            absAgentPath: '/workspace/.ploinky/repos/demo/agent',
+            sharedDir: '/workspace/.ploinky/shared',
+            volumeSuffix: ':z',
+            readOnlySuffix: ':ro,z',
+            portOptions: '-p 127.0.0.1:17002:7000',
+            envVars: '-e HOME=/root',
+            containerImage,
+        }));
+    }
+});
+
+test('shell-detection probe builder carries the exact managed label', () => {
+    assertExactManagedArgv(buildShellDetectionRunArgs('example/image', '/bin/sh'));
+});
+
+test('runtime-key probe builder carries the exact managed label', () => {
+    assertExactManagedArgv(buildContainerRuntimeKeyProbeRunArgs('example/image'));
+});

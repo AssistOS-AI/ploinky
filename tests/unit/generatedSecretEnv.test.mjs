@@ -15,7 +15,14 @@ process.env.GENERATED_SECRET_TEST_SECRET = 'operator-value';
 process.env.SHARED_GENERATED_SECRET = 'operator-shared-value';
 
 const moduleSuffix = `?test=${Date.now()}`;
-const { buildEnvMap, validateManifestEnvProfileCompleteness } = await import(`../../cli/services/secretVars.js${moduleSuffix}`);
+const {
+    buildEnvFlags,
+    buildEnvMap,
+    getExposedNames,
+    getManifestEnvNames,
+    getManifestEnvSpecs,
+    validateManifestEnvProfileCompleteness,
+} = await import(`../../cli/services/secretVars.js${moduleSuffix}`);
 const { deriveAgentSecret, deriveWorkspaceSecret } = await import(`../../cli/services/masterKey.js${moduleSuffix}`);
 
 test.after(() => {
@@ -120,6 +127,102 @@ test('sharedGeneratedSecret entries can derive from varName', () => {
     assert.equal(env.JWT_SECRET, deriveWorkspaceSecret({
         name: 'ONLYOFFICE_JWT_SECRET',
     }));
+});
+
+test('runtime false env remains available to host hooks but is omitted from runtime injection', () => {
+    const manifest = {
+        env: [
+            {
+                name: 'SHARED_GENERATED_SECRET',
+                sharedGeneratedSecret: true,
+                runtime: false,
+            },
+        ],
+    };
+    const options = {
+        repoName: 'repo-one',
+        agentName: 'agent-one',
+    };
+
+    const hostEnv = buildEnvMap(manifest, null, options);
+    assert.equal(hostEnv.SHARED_GENERATED_SECRET, deriveWorkspaceSecret({
+        name: 'SHARED_GENERATED_SECRET',
+    }));
+    assert.equal(hostEnv.PLOINKY_ENV_SOURCE_SHARED_GENERATED_SECRET, 'generated');
+
+    const runtimeEnv = buildEnvMap(manifest, null, { ...options, forRuntime: true });
+    assert.equal(Object.hasOwn(runtimeEnv, 'SHARED_GENERATED_SECRET'), false);
+    assert.equal(Object.hasOwn(runtimeEnv, 'PLOINKY_ENV_SOURCE_SHARED_GENERATED_SECRET'), false);
+    assert.deepEqual(buildEnvFlags(manifest, null, { ...options, forRuntime: true }), []);
+    assert.deepEqual(getManifestEnvNames(manifest, null, { forRuntime: true }), []);
+    assert.equal(getManifestEnvSpecs(manifest)[0].runtime, false);
+});
+
+test('runtime false dominates duplicate expose declarations at every runtime boundary', () => {
+    const options = {
+        repoName: 'repo-one',
+        agentName: 'agent-one',
+        forRuntime: true,
+    };
+    const objectExposeManifest = {
+        env: [{
+            name: 'SHARED_GENERATED_SECRET',
+            sharedGeneratedSecret: true,
+            runtime: false,
+        }],
+        expose: {
+            SHARED_GENERATED_SECRET: 'resurrected',
+            SAFE_RUNTIME_VALUE: 'visible',
+        },
+    };
+
+    assert.deepEqual(buildEnvMap(objectExposeManifest, null, options), {
+        SAFE_RUNTIME_VALUE: 'visible',
+    });
+    assert.deepEqual(buildEnvFlags(objectExposeManifest, null, options), [
+        '-e SAFE_RUNTIME_VALUE="visible"',
+    ]);
+    assert.deepEqual(getExposedNames(objectExposeManifest, null, { forRuntime: true }), [
+        'SAFE_RUNTIME_VALUE',
+    ]);
+
+    const arrayExposeManifest = {
+        ...objectExposeManifest,
+        expose: [
+            { name: 'SHARED_GENERATED_SECRET', value: 'resurrected' },
+            { name: 'SAFE_RUNTIME_VALUE', value: 'visible' },
+        ],
+    };
+    assert.deepEqual(buildEnvMap(arrayExposeManifest, null, options), {
+        SAFE_RUNTIME_VALUE: 'visible',
+    });
+    assert.deepEqual(getExposedNames(arrayExposeManifest, null, { forRuntime: true }), [
+        'SAFE_RUNTIME_VALUE',
+    ]);
+});
+
+test('runtime false is supported in object-form env and must be boolean', () => {
+    const manifest = {
+        env: {
+            SHARED_GENERATED_SECRET: {
+                sharedGeneratedSecret: true,
+                runtime: false,
+            },
+        },
+    };
+    assert.deepEqual(buildEnvMap(manifest, null, {
+        repoName: 'repo-one',
+        agentName: 'agent-one',
+        forRuntime: true,
+    }), {});
+    assert.throws(
+        () => getManifestEnvSpecs({ env: [{ name: 'BAD_RUNTIME', runtime: 'false' }] }),
+        /field 'runtime' must be a boolean/,
+    );
+    assert.throws(
+        () => getManifestEnvSpecs({ env: { BAD_RUNTIME: { runtime: 0 } } }),
+        /field 'runtime' must be a boolean/,
+    );
 });
 
 test('generatedSecret works in object-form env declarations', () => {

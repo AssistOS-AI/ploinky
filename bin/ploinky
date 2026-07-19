@@ -1,23 +1,70 @@
-#!/bin/bash
+#!/usr/bin/env bash
+set -euo pipefail
 
-# Get the directory where the script is located
-SCRIPT_DIR=$(dirname "$(readlink -f "$0")")
-export PLOINKY_ROOT=$(realpath "$SCRIPT_DIR/..")
+SCRIPT_PATH="${BASH_SOURCE[0]}"
+while [[ -L "$SCRIPT_PATH" ]]; do
+    SCRIPT_DIR="$(cd -P "$(dirname "$SCRIPT_PATH")" >/dev/null 2>&1 && pwd)"
+    SCRIPT_PATH="$(readlink "$SCRIPT_PATH")"
+    [[ "$SCRIPT_PATH" != /* ]] && SCRIPT_PATH="$SCRIPT_DIR/$SCRIPT_PATH"
+done
+SCRIPT_DIR="$(cd -P "$(dirname "$SCRIPT_PATH")" >/dev/null 2>&1 && pwd)"
+ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-if [[ ! -d "$PLOINKY_ROOT/node_modules/achillesAgentLib" ]]; then
-    echo "Ploinky dependency missing: $PLOINKY_ROOT/node_modules/achillesAgentLib" >&2
-    echo "Run 'npm install' from $PLOINKY_ROOT before running ploinky." >&2
+if ! command -v node >/dev/null 2>&1; then
+    echo "ploinky: node >= 20 is required (https://nodejs.org)." >&2
     exit 1
 fi
 
-# Route shell (formerly light) mode explicitly to the dedicated launcher
-if [[ "$1" == "-shell" || "$1" == "sh" || "$1" == "--shell" ]]; then
-    shift
-    exec "$SCRIPT_DIR/ploinky-shell" "$@"
+# Single entry: inside the ploinky-box image (marker baked by its Dockerfile)
+# ploinky IS the direct CLI; everywhere else it drives the boxed runtime. The
+# workspace/source check keeps older images usable when the marker is missing.
+in_ploinky_box=0
+if [[ -f /etc/ploinky-box ]]; then
+    in_ploinky_box=1
+elif [[ "${PLOINKY_WORKSPACE_ROOT:-}" == "/workspace" && "$ROOT_DIR" == "/opt/ploinky" && -d /workspace ]]; then
+    in_ploinky_box=1
 fi
 
-# Construct the path to the Node.js script
-NODE_SCRIPT="$SCRIPT_DIR/../cli/index.js"
+if [[ "$in_ploinky_box" == "1" ]]; then
+    export PLOINKY_ROOT="$ROOT_DIR"
 
-# Execute the Node.js script with all passed arguments
-node "$NODE_SCRIPT" "$@"
+    skip_dependency_gate=0
+    case "${1:-}" in
+        help|--help|-h)
+            skip_dependency_gate=1
+            ;;
+        cli)
+            [[ "$#" -eq 1 ]] && skip_dependency_gate=1
+            ;;
+    esac
+
+    if [[ "$skip_dependency_gate" == "0" ]]; then
+        deps_missing=0
+        [[ -d "$PLOINKY_ROOT/node_modules/achillesAgentLib" ]] || deps_missing=1
+        [[ -d "$PLOINKY_ROOT/node_modules/mcp-sdk" ]] || deps_missing=1
+        if [[ "$deps_missing" == "1" ]]; then
+            # First-run flow: ask on a TTY, never install silently. Non-interactive
+            # contexts (podman exec without -t, scripts, CI) default to "no".
+            answer="n"
+            if [[ -t 0 ]]; then
+                printf 'Ploinky dependencies are not installed. Install them now? [y/N] ' >&2
+                read -r answer || answer="n"
+            fi
+            if [[ "$answer" =~ ^[yY]$ ]]; then
+                "$SCRIPT_DIR/ploinky-install-deps"
+            else
+                echo "WARNING: Ploinky cannot run until dependencies are installed." >&2
+                echo "Install them with: $SCRIPT_DIR/ploinky-install-deps" >&2
+                exit 1
+            fi
+        fi
+    fi
+
+    if [[ "${1:-}" == "-shell" || "${1:-}" == "sh" || "${1:-}" == "--shell" ]]; then
+        shift
+        exec "$SCRIPT_DIR/ploinky-shell" "$@"
+    fi
+    exec node "$PLOINKY_ROOT/cli/index.js" "$@"
+fi
+
+exec node "$ROOT_DIR/container/runtime-supervisor.mjs" "$@"

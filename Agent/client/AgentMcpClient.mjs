@@ -13,16 +13,27 @@ import https from 'node:https';
 import { signAgentAssertion } from '../lib/agentAssertion.mjs';
 
 export function getRouterUrl() {
-    const routerUrl = process.env.PLOINKY_ROUTER_URL;
-    if (routerUrl && typeof routerUrl === 'string' && routerUrl.trim()) {
-        return routerUrl.trim();
+    const raw = process.env.PLOINKY_ROUTER_URL;
+    if (typeof raw !== 'string' || !raw.trim()) {
+        throw new Error('AgentMcpClient: PLOINKY_ROUTER_URL is required and must be a valid nonempty HTTP(S) URL');
     }
-    const routerPort = process.env.PLOINKY_ROUTER_PORT || '8080';
-    return `http://127.0.0.1:${routerPort}`;
+    let url;
+    try {
+        url = new URL(raw.trim());
+    } catch (error) {
+        throw new Error('AgentMcpClient: PLOINKY_ROUTER_URL must be a valid nonempty HTTP(S) URL', { cause: error });
+    }
+    if (!['http:', 'https:'].includes(url.protocol) || !url.hostname || url.username || url.password) {
+        throw new Error('AgentMcpClient: PLOINKY_ROUTER_URL must be a valid nonempty HTTP(S) URL without credentials');
+    }
+    if ((url.pathname && url.pathname !== '/') || url.search || url.hash) {
+        throw new Error('AgentMcpClient: PLOINKY_ROUTER_URL must identify the router origin without a path, query, or fragment');
+    }
+    return url.origin;
 }
 
-export function getAgentMcpUrl(agentName) {
-    return `${getRouterUrl()}/${agentName}/mcp`;
+export function getAgentMcpUrl(agentName, routerUrl = getRouterUrl()) {
+    return `${routerUrl}/${agentName}/mcp`;
 }
 
 const DEFAULT_TASK_POLL_INTERVAL_MS = 5000;
@@ -56,7 +67,15 @@ export function setAgentTaskObserver(observer) {
     };
 }
 
-async function applyTaskObserver({ result, agentName, taskId, toolName, toolArgs, metadata }) {
+async function applyTaskObserver({
+    result,
+    agentName,
+    taskId,
+    toolName,
+    toolArgs,
+    metadata,
+    routerUrl,
+}) {
     if (typeof taskObserver !== 'function') return null;
     const observation = await taskObserver({
         agentName,
@@ -64,7 +83,7 @@ async function applyTaskObserver({ result, agentName, taskId, toolName, toolArgs
         toolName,
         arguments: toolArgs,
         metadata: metadata || {},
-        getTaskStatus: () => getTaskStatus(agentName, taskId),
+        getTaskStatus: () => getTaskStatus(agentName, taskId, routerUrl),
     });
     if (observation?.detached !== true) return null;
     return {
@@ -90,8 +109,8 @@ function normalizeDelegationToken(token) {
     return token.trim();
 }
 
-function postToolCall(agentName, jsonRpcBody, assertion, userDelegationToken = '') {
-    const url = new URL(getAgentMcpUrl(agentName));
+function postToolCall(agentName, jsonRpcBody, assertion, userDelegationToken = '', routerUrl = getRouterUrl()) {
+    const url = new URL(getAgentMcpUrl(agentName, routerUrl));
     const httpModule = url.protocol === 'https:' ? https : http;
     const payload = Buffer.from(JSON.stringify(jsonRpcBody), 'utf8');
     const delegationToken = normalizeDelegationToken(userDelegationToken);
@@ -123,12 +142,12 @@ function postToolCall(agentName, jsonRpcBody, assertion, userDelegationToken = '
     });
 }
 
-function getTaskStatus(agentName, taskId) {
+function getTaskStatus(agentName, taskId, routerUrl = getRouterUrl()) {
     const normalizedTaskId = String(taskId || '').trim();
     if (!normalizedTaskId) {
         throw new Error('AgentMcpClient: taskId is required');
     }
-    const url = new URL(getRouterUrl());
+    const url = new URL(routerUrl);
     url.pathname = `/${agentName}/task`;
     url.searchParams.set('taskId', normalizedTaskId);
     const httpModule = url.protocol === 'https:' ? https : http;
@@ -260,8 +279,8 @@ function stopAllTaskPollers() {
     taskPollers.clear();
 }
 
-function parseTaskStatusResponse(agentName, taskId) {
-    return getTaskStatus(agentName, taskId)
+function parseTaskStatusResponse(agentName, taskId, routerUrl) {
+    return getTaskStatus(agentName, taskId, routerUrl)
         .then((task) => ({ state: 'ok', task }))
         .catch((error) => {
             if (isTaskNotFoundError(error)) {
@@ -277,7 +296,7 @@ async function pollTaskStatus(agentName, taskId, callback, options = {}) {
         return;
     }
     try {
-        const result = await parseTaskStatusResponse(agentName, taskId);
+        const result = await parseTaskStatusResponse(agentName, taskId, options.routerUrl);
         if (result.state === 'not_found') {
             stopTaskPoller(taskId);
             callback({
@@ -344,6 +363,7 @@ function startTaskPolling(agentName, taskId, callback, _options = {}) {
  * (use a user/session surface for discovery).
  */
 export async function createAgentClient(agentName, options = {}) {
+    const routerUrl = getRouterUrl();
     const defaultDelegationToken = normalizeDelegationToken(options?.userDelegationToken);
 
     async function requestToolCall(name, args = {}, callOptions = {}) {
@@ -364,7 +384,7 @@ export async function createAgentClient(agentName, options = {}) {
         const delegationToken = Object.prototype.hasOwnProperty.call(callOptions || {}, 'userDelegationToken')
             ? callOptions.userDelegationToken
             : defaultDelegationToken;
-        const { status, json, text } = await postToolCall(agentName, body, assertion, delegationToken);
+        const { status, json, text } = await postToolCall(agentName, body, assertion, delegationToken, routerUrl);
         if (json && json.error) {
             const err = new Error(json.error.message || 'agent-to-agent call failed');
             err.code = json.error.code;
@@ -423,7 +443,7 @@ export async function createAgentClient(agentName, options = {}) {
                 } else if (status === 'failed' || status === 'cancelled' || status === 'not_found') {
                     finalize(taskError(task), true);
                 }
-            });
+            }, { routerUrl });
         });
 
         return parseTaskPayload(finalTask);
@@ -444,6 +464,7 @@ export async function createAgentClient(agentName, options = {}) {
             toolName: metadata?.toolName || name,
             toolArgs,
             metadata,
+            routerUrl,
         });
         return observedResult || result;
     }
@@ -455,7 +476,7 @@ export async function createAgentClient(agentName, options = {}) {
     return {
         callTool,
         callToolWithoutWait,
-        getTaskStatus: (taskId) => getTaskStatus(agentName, taskId),
+        getTaskStatus: (taskId) => getTaskStatus(agentName, taskId, routerUrl),
         connect: async () => {},
         listTools: unsupported('listTools'),
         listResources: unsupported('listResources'),

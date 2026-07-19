@@ -5,14 +5,30 @@ import os from 'os';
 import path from 'path';
 import { execFileSync } from 'child_process';
 
-import {
+const originalCwd = process.cwd();
+const originalWorkspaceRoot = process.env.PLOINKY_WORKSPACE_ROOT;
+const suiteWorkspace = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-skills-manifest-suite-'));
+fs.mkdirSync(path.join(suiteWorkspace, '.ploinky'), { recursive: true });
+process.chdir(suiteWorkspace);
+process.env.PLOINKY_WORKSPACE_ROOT = suiteWorkspace;
+
+const [{
     SKILLS_MANIFEST_FILE,
     installSkillsFromManifest,
     readSkillsManifest,
     findWorkspaceFoldersWithSkillsManifest,
-} from '../../cli/services/skills.js';
-import { REPOS_DIR } from '../../cli/services/config.js';
-import { REPO_SOURCES_FILE } from '../../cli/services/repos.js';
+}, { REPOS_DIR }, { REPO_SOURCES_FILE }] = await Promise.all([
+    import('../../cli/services/skills.js'),
+    import('../../cli/services/config.js'),
+    import('../../cli/services/repos.js'),
+]);
+
+test.after(() => {
+    process.chdir(originalCwd);
+    if (originalWorkspaceRoot === undefined) delete process.env.PLOINKY_WORKSPACE_ROOT;
+    else process.env.PLOINKY_WORKSPACE_ROOT = originalWorkspaceRoot;
+    fs.rmSync(suiteWorkspace, { recursive: true, force: true });
+});
 
 function writeSkill(root, name, files) {
     const skillRoot = path.join(root, name);

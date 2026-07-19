@@ -5,7 +5,7 @@ Ploinky is a lightweight runtime for AI agents. It is technology‑agnostic: an 
 Beyond a single agent, Ploinky supports a multi‑agent workspace. Each agent runs in its own container. A local web router serves a simple web app and proxies API calls to the containers, so you can build applications that orchestrate multiple agents. A companion cloud component (in progress) will host multiple such custom apps, each with its own agents and routes.
 
 ## Prerequisites
-- Node.js 18+
+- Node.js 20+
 - Docker or Podman
 - Git
 
@@ -22,7 +22,7 @@ p-cli
 
 # Enable an agent and start the workspace
 enable agent my-agent
-start my-agent 8088
+start my-agent 8080
 
 # Browser chat surface
 webchat
@@ -50,17 +50,118 @@ You can use Ploinky in two ways:
     ploinky list agents
     ```
 
+By default, the public entrypoint reconciles and starts one managed outer
+runtime, then runs Ploinky core inside it. The runtime mounts the local checkout
+read-only at `/opt/ploinky`; its dependencies live in the instance's writable
+dependency volume. Ordinary agent containers run one level inside this runtime.
+
+| Invocation | Documented effect |
+| --- | --- |
+| `ploinky` or `p-cli` | Reconcile/start outer runtime; open Ploinky REPL |
+| `ploinky cli` | Reconcile/start outer runtime; open `/bin/bash` as `podman` in `/workspace` |
+| `ploinky cli <agent>` | Reconcile/start outer runtime; attach to that agent's manifest CLI |
+| `ploinky start ...` | Reconcile/start outer runtime; start the graph behind the fixed boundary |
+| `ploinky status` | Inspect outer contract/publishes/health and running core status without mutation |
+| `ploinky stop` | Stop core services, then stop outer runtime; keep volumes |
+| `ploinky destroy` | Confirm and directly remove the outer container; retain its three named volumes |
+| REPL `status`/`stop`/`destroy` | Core workspace/router/agent scope; outer runtime remains |
+
+The required outer image is the mutable
+`docker.io/assistos/ploinky-box:runtime` reference with the exact label
+`io.assistos.ploinky.runtime-contract=5`. Ploinky pulls that reference only when
+creating a missing box, validates the complete image metadata, and starts the
+captured image ID rather than racing the mutable tag. Compatible reuse,
+stopped-box start, status, stop, and destroy do not pull. Every non-contract-5
+box, including contract 4, is rejected before pulling, volume creation, restart,
+upgrade, or replacement. Ploinky does not read, migrate, clean, relabel, adopt,
+or replace it: run `ploinky destroy` explicitly, then recreate contract 5.
+Destroy retains the three named volumes.
+
+A contract-5 box is reused or started only when its creation configuration is
+an exact normalized match. Any port, image, mount, device, security, or other
+creation drift fails before registry traffic or container mutation and requires
+an explicit `ploinky destroy` followed by recreation; there is no transactional
+replacement or rollback path.
+
+The outer container and its three explicitly labelled volumes are named from the
+canonical absolute current directory. Ploinky automatically discovers whether
+Podman or Docker owns those exact resources and fails closed on unreachable,
+split, or foreign state; there is no public `--name`, `--engine`, or
+`PLOINKY_BOX_ENGINE` override. `destroy` removes only the selected outer
+container (and any attached anonymous volumes), preserving the workspace,
+nested-container-storage, and Ploinky dependency volumes for recreation.
+
+Every managed box has exactly two engine publications, independent of graph or
+workspace state: `127.0.0.1:<selectedRouterHostPort>:8080/tcp` and
+`0.0.0.0:7882:7882/udp`. `--port` changes only the physical Router port;
+`--publish`, `--expose`, and `--listen-lan` are rejected. Agent `openPorts`,
+HTTP-service targets, readiness, profiles, manifests, labels, and retained state
+remain private and cannot add a third mapping. The host `PLOINKY_MASTER_KEY`,
+including the normal walked-up `.env` source, is inherited only by in-box core
+executions; its value is not stored in container arguments, labels, or persistent
+image configuration.
+
+The box image includes pinned multi-architecture `cloudflared`, supervised by
+Ploinky core. No Cloudflare credentials selects explicit `local-only` mode: the
+connector is absent and no public HTTP hostname exists. Complete Cloudflare mode
+requires an existing-tunnel connector token plus a separate least-privilege API
+token for DNS/ingress. Invalid or partial configuration fails closed without
+changing modes; Ploinky never creates a quick tunnel or a new tunnel, and the
+connector origin is always in-box `http://127.0.0.1:8080`.
+
+Ordinary agent images intentionally contain neither Podman nor Docker. Every
+Ploinky-managed agent and helper container runs through nested Podman inside the
+managed outer runtime. Contract-5 managed networking requires rootless Podman
+5.4 or newer with Netavark and an operational `pasta`; there is no
+`slirp4netns` fallback. Managed `default` and `bridge` agents receive only the
+exact `host.containers.internal:host-gateway` mapping, private Router locator,
+and non-secret topology snapshot. Host mode requires an exact current-generation
+capability; `none` receives no Router endpoint.
+
+Topology is box-owned and mounted before consumers start. It distinguishes the
+immutable route-and-policy authorization generation, a content-derived
+configuration generation, and a monotonic readiness/publication generation.
+The authenticated browser projection returns only one active `no-store` locator
+plus configuration/publication ids, never the authorization id or inventory.
+
+Before updating a direct/core installation to the contract-5 release, run the
+old checkout's core entry directly:
+
+```sh
+node cli/index.js destroy
+node cli/index.js network prune
+```
+
+Do not use the public `ploinky` wrapper for this step: outside a box it controls
+the outer runtime rather than the old core workspace. Inspect or resolve any
+foreign resources reported by the core prune. After confirming no container
+still references them, one-time cleanup may remove the exact stale
+`.ploinky/run/router.sock` and `.ploinky/run/managed-hosts` paths and the now
+unreferenced cached image
+`docker.io/assistos/ploinky-network-gateway:1@sha256:68c47ce93d16ea1a2d03944f7b50ce82e6f2f9a26b183d2c9c7fbabcc828fb7e`.
+Before v5 activation, revoke the retired publication connector/API tokens and
+delete its plaintext retained state; contract 5 contains no migration or cleanup
+reader. Do not use a broad container, image, volume, or network prune for this
+cutover.
+
+For local core development without entering the managed runtime, run the CLI
+entry directly from your checkout:
+
+```bash
+node cli/index.js <args>
+```
+
 ## Core commands (in p-cli)
 
 - `enable agent <name> [as <alias>]`: register an agent in `.ploinky/agents.json` (creates a minimal manifest if missing). Use `as <alias>` to spin up additional instances with unique container names.
 - `update [folderPath]`: update the Ploinky checkout, refresh `node_modules/achillesAgentLib`, update managed repos, refresh `AchillesCopilotBasicSkills` in eligible managed repos, and refresh discovered project repositories and default skills.
-- `start <staticAgent> <port>`: first run requires a static agent and port; subsequent runs can just use `start`.
-  - Ensures all enabled agents are running and launches the Router on `<port>`.
+- `start <staticAgent> 8080`: first core start requires a static agent; subsequent runs can just use `start`.
+  - Ensures all enabled agents are running and launches the fixed inner Router on `8080`. On the host-facing public wrapper, `ploinky start <agent> <port>` treats that positional port only as the loopback physical-host selection and still forwards inner `8080` to core.
   - Serves static files from the repository of `<staticAgent>`; non `/<agent>/...` paths are static.
-- `cli <name> [args...]`: run the agent’s CLI command interactively.
+- `cli`: from the managed runtime, open `/bin/bash` as `podman` in `/workspace`.
+- `cli <name> [args...]`: run the agent’s manifest CLI command interactively.
 - `shell <name>`: open interactive `/bin/sh` in the agent container.
 - `webchat [--rotate]`: print the WebChat access URL for the router login flow.
-- `dashboard [--rotate]`: prepare or rotate the dashboard token and print its access URL.
 - `client tool <toolName> [--agent <agent>] [--parameters <params>] [-key value...]`: call an MCP tool exposed by an enabled agent.
 - `client list tools|resources`: list MCP tools or resources exposed by enabled agents.
 - `client status <agent>`: check agent health status.
@@ -70,6 +171,12 @@ You can use Ploinky in two ways:
 - `deps prepare [<repo>/<agent>]`: build the prepared node_modules cache for the current runtime.
 - `deps status`: list prepared global and per-agent caches with their runtime keys and validity.
 - `deps clean <repo>/<agent>|--global|--all`: remove a cache directory.
+
+The `/dashboard` and `/status` TCP control surfaces require a real
+router-authenticated local-admin session on an exact local-control Host. A
+component token, invitation, agent assertion, media credential, or loopback
+source is not administrator identity. Mutations also require exact Origin and a
+session-bound CSRF proof.
 
 ## Dependency caches
 

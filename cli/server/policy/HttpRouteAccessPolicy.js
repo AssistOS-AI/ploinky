@@ -26,20 +26,47 @@ function accessPathForEntry(entry) {
     return String(entry?.path || '').trim();
 }
 
-function decisionForEntry(entry, source) {
+function invalidEntry(strict, label, message) {
+    if (!strict) return null;
+    const error = new Error(`${label}: ${message}`);
+    error.code = 'HTTP_ROUTE_POLICY_INVALID';
+    throw error;
+}
+
+export function normalizeHttpRoutePolicyEntry(entry, source, {
+    strict = false,
+    label = `${source || 'policy'} entry`,
+} = {}) {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+        return invalidEntry(strict, label, 'entry must be an object');
+    }
+    if (entry.enabled !== undefined && typeof entry.enabled !== 'boolean') {
+        return invalidEntry(strict, label, 'enabled must be a boolean when present');
+    }
     const access = normalizeHttpRouteAccess(entry?.access);
-    if (!access || entry?.enabled === false) return null;
+    if (!access) return invalidEntry(strict, label, 'access must be public, guest, or authenticated');
     const path = accessPathForEntry(entry);
     const normalized = HttpRouteAccessPath.normalize(path);
-    if (!normalized.ok) return null;
+    if (!normalized.ok) return invalidEntry(strict, label, normalized.error || 'path is invalid');
+    const explicitRouteKey = entry.routeKey;
+    if (explicitRouteKey !== undefined && (typeof explicitRouteKey !== 'string' || !explicitRouteKey.trim())) {
+        return invalidEntry(strict, label, 'routeKey must be a non-empty string when present');
+    }
+    const routeKey = String(explicitRouteKey || HttpRouteAccessPath.routeKeyForPath(normalized.path)).trim();
+    if (!routeKey) return invalidEntry(strict, label, 'routeKey could not be derived');
+    const guestScope = entry.guestScope === undefined ? '' : String(entry.guestScope || '').trim();
+    if (entry.guestScope !== undefined && (typeof entry.guestScope !== 'string' || !guestScope)) {
+        return invalidEntry(strict, label, 'guestScope must be a non-empty string when present');
+    }
+    if (entry?.enabled === false) return null;
     return {
         path: normalized.path,
         access,
-        routeKey: String(entry.routeKey || HttpRouteAccessPath.routeKeyForPath(normalized.path)),
+        routeKey,
         source: String(entry.source || source),
         // The guest executor needs the service-declared scope when it creates
         // a guest identity for this service route.
-        ...(entry.guestScope ? { guestScope: String(entry.guestScope) } : {}),
+        ...(guestScope ? { guestScope } : {}),
     };
 }
 
@@ -118,16 +145,16 @@ export class HttpRouteAccessPolicy {
         const loaded = this._repo?.listHttpRoutes?.() || { corrupt: false, entries: [] };
         if (!loaded.corrupt) {
             for (const entry of loaded.entries || []) {
-                const normalized = decisionForEntry(entry, 'policy');
+                const normalized = normalizeHttpRoutePolicyEntry(entry, 'policy');
                 if (normalized) yield normalized;
             }
         }
         for (const entry of this._manifestRouteProvider() || []) {
-            const normalized = decisionForEntry(entry, 'manifest');
+            const normalized = normalizeHttpRoutePolicyEntry(entry, 'manifest');
             if (normalized) yield normalized;
         }
         for (const entry of this._httpServiceProvider() || []) {
-            const normalized = decisionForEntry(entry, 'httpService');
+            const normalized = normalizeHttpRoutePolicyEntry(entry, 'httpService');
             if (normalized) yield normalized;
         }
     }

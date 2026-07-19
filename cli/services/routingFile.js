@@ -2,6 +2,11 @@ import fs from 'fs';
 import path from 'path';
 
 import { ROUTING_FILE } from './config.js';
+import {
+    inactivateEdgeRoutingGeneration,
+    withEdgeGenerationApplyLock,
+} from './edgeGeneration.js';
+import { applyEdgeRoutingGeneration } from './coordinatedEdgeApply.js';
 
 const ROUTING_LOCK_FILE = `${ROUTING_FILE}.lock`;
 
@@ -42,32 +47,95 @@ function readRoutingConfig() {
             parsed.routes = parsed.routes && typeof parsed.routes === 'object' ? parsed.routes : {};
             return parsed;
         }
-    } catch (_) {}
+    } catch (error) {
+        if (error?.code !== 'ENOENT') {
+            const wrapped = new Error(`routing.json is invalid; refusing mutation: ${error?.message || error}`);
+            wrapped.code = 'ROUTING_STATE_INVALID';
+            throw wrapped;
+        }
+    }
     return { routes: {} };
 }
 
-function writeRoutingConfig(config) {
+function writeRoutingConfig(config, {
+    coordinate = true,
+    reason = 'routing-write',
+    preparationLease,
+} = {}) {
     const target = config && typeof config === 'object' ? config : {};
     target.routes = target.routes && typeof target.routes === 'object' ? target.routes : {};
-    fs.mkdirSync(path.dirname(ROUTING_FILE), { recursive: true });
-    const tempFile = `${ROUTING_FILE}.${process.pid}.${Date.now()}.tmp`;
-    fs.writeFileSync(tempFile, JSON.stringify(target, null, 2));
-    fs.renameSync(tempFile, ROUTING_FILE);
+    const write = () => {
+        fs.mkdirSync(path.dirname(ROUTING_FILE), { recursive: true });
+        const tempFile = `${ROUTING_FILE}.${process.pid}.${Date.now()}.tmp`;
+        fs.writeFileSync(tempFile, JSON.stringify(target, null, 2));
+        fs.renameSync(tempFile, ROUTING_FILE);
+        return target;
+    };
+    if (!coordinate) return write();
+    return withEdgeGenerationApplyLock((applyLockCapability) => {
+        // A lifecycle preparation lease is bound to one exact inactive
+        // selector. Re-inactivating here would rotate that selector before the
+        // prepared apply can validate it. The preparation phase has already
+        // installed the fail-closed selector; ordinary unprepared writes still
+        // have to inactivate before mutating candidate bytes.
+        if (!preparationLease) {
+            inactivateEdgeRoutingGeneration(reason, { applyLockCapability });
+        }
+        write();
+        applyEdgeRoutingGeneration({ reason, preparationLease, applyLockCapability });
+        return target;
+    }, { preparationLease });
 }
 
-async function mergeRoutingConfig(mutator) {
+async function mergeRoutingConfig(mutator, {
+    coordinate = true,
+    reason = 'routing-merge',
+    preparationLease,
+} = {}) {
     const release = await acquireRoutingLock();
     try {
-        const current = readRoutingConfig();
-        const next = await mutator(current) || current;
-        writeRoutingConfig(next);
-        return next;
+        const mutate = async (applyLockCapability = undefined) => {
+            if (coordinate && !preparationLease) {
+                inactivateEdgeRoutingGeneration(reason, { applyLockCapability });
+            }
+            const current = readRoutingConfig();
+            const next = await mutator(current) || current;
+            writeRoutingConfig(next, { coordinate: false });
+            if (coordinate) {
+                applyEdgeRoutingGeneration({
+                    reason,
+                    preparationLease,
+                    applyLockCapability,
+                });
+            }
+            return next;
+        };
+        return coordinate
+            ? await withEdgeGenerationApplyLock(mutate, { preparationLease })
+            : await mutate();
     } finally {
         release();
     }
 }
 
+function mergeRuntimeRoute(existingRoute, route, {
+    hostPort = null,
+    serviceTargets = null,
+} = {}) {
+    const next = { ...(existingRoute || {}), ...(route || {}) };
+    if (hostPort) next.hostPort = hostPort;
+    else delete next.hostPort;
+    if (serviceTargets && typeof serviceTargets === 'object' && Object.keys(serviceTargets).length) {
+        next.serviceTargets = Object.fromEntries(Object.entries(serviceTargets).map(([port, target]) => [String(port), Number(target)]));
+    } else {
+        delete next.serviceTargets;
+    }
+    return next;
+}
+
 export {
     mergeRoutingConfig,
-    readRoutingConfig
+    mergeRuntimeRoute,
+    readRoutingConfig,
+    writeRoutingConfig,
 };

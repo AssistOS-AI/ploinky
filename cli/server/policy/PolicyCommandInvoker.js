@@ -1,4 +1,5 @@
 import { parseCookies, readJsonBody } from '../handlers/common.js';
+import { verifyAdminMutationRequest } from '../adminControlSecurity.js';
 import { Caller } from './Caller.js';
 
 // Inlined (matching authHandlers.sendJson) so the policy layer does not pull in
@@ -21,13 +22,15 @@ function sendJson(res, statusCode, body) {
  */
 
 const LOCAL_AUTH_COOKIE_NAME = 'ploinky_jwt';
+const MUTATING_COMMANDS = new Set(['http.route.set', 'http.route.remove', 'mcp.policy.set']);
 
 export class PolicyCommandInvoker {
-    constructor({ registry, auditLog, getSession, isAdminUser }) {
+    constructor({ registry, auditLog, getSession, isAdminUser, verifyMutationRequest = verifyAdminMutationRequest }) {
         this._registry = registry;
         this._audit = auditLog;
         this._getSession = getSession;
         this._isAdminUser = isAdminUser;
+        this._verifyMutationRequest = verifyMutationRequest;
     }
 
     async handle(req, res) {
@@ -42,6 +45,14 @@ export class PolicyCommandInvoker {
             sendJson(res, 401, { ok: false, error: { code: 'AUTH_REQUIRED', message: 'Authentication is required.' } });
             return true;
         }
+        const user = session.user;
+        if (!this._isAdminUser(user)) {
+            sendJson(res, 403, { ok: false, error: { code: 'ADMIN_REQUIRED', message: 'A real administrator session is required.' } });
+            return true;
+        }
+        req.user = user;
+        req.session = session;
+        req.sessionId = cookie;
         let body = {};
         try {
             body = await readJsonBody(req);
@@ -49,13 +60,21 @@ export class PolicyCommandInvoker {
             sendJson(res, 400, { ok: false, error: { code: 'UNKNOWN_COMMAND', message: 'Invalid JSON body.' } });
             return true;
         }
-        const user = session.user;
         const actorId = user?.id ? `user:${user.id}` : 'user:unknown';
         const command = this._registry.get(body?.command);
         if (!command) {
             this._audit.record({ user: actorId, command: String(body?.command || ''), ok: false, code: 'UNKNOWN_COMMAND' });
             sendJson(res, 400, { ok: false, error: { code: 'UNKNOWN_COMMAND', message: `Unknown command '${body?.command}'.` } });
             return true;
+        }
+        if (MUTATING_COMMANDS.has(command.name)) {
+            const mutationDecision = this._verifyMutationRequest(req, cookie);
+            if (!mutationDecision?.ok) {
+                const code = mutationDecision?.code || 'CSRF_INVALID';
+                this._audit.record({ user: actorId, command: command.name, ok: false, code });
+                sendJson(res, 403, { ok: false, error: { code, message: 'Exact control Origin and CSRF proof are required.' } });
+                return true;
+            }
         }
         const ctx = { command: command.name, body: body || {}, user, isAdmin: this._isAdminUser(user), caller: Caller.fromRequest(req) };
         let result = await command.authorize(ctx);

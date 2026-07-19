@@ -1,8 +1,9 @@
 import { spawnSync } from 'child_process';
-import { getRuntime, getRuntimeForAgent, ensureImagePresent } from './docker/common.js';
+import { getRuntime, getRuntimeForAgent, ensureImagePresent, managedContainerLabelArgs } from './docker/common.js';
 import { resolveManifestImage } from './secretVars.js';
 
 const SUPPORTED_FAMILIES = new Set(['bwrap', 'seatbelt', 'container']);
+const NO_NODE_RUNTIME_KEY = 'container-no-node';
 
 // The probe only starts a container and runs a tiny `node -e` script, so it
 // should finish in seconds. Keep the timeout short (env-overridable) so it
@@ -38,6 +39,10 @@ function buildRuntimeKey({ family, platform, arch, nodeMajor, variant = '' }) {
     return `${family}-${platform}-${arch}${variantSuffix}-node${nodeMajor}`;
 }
 
+function isNoNodeRuntimeKey(runtimeKey) {
+    return String(runtimeKey || '') === NO_NODE_RUNTIME_KEY;
+}
+
 export function detectHostRuntimeKey(runtimeFamily) {
     const family = normalizeRuntimeFamily(runtimeFamily);
     if (family === 'container') {
@@ -71,6 +76,9 @@ export function parseContainerProbeOutput(raw) {
     } catch (err) {
         throw new Error(`Container runtime-key probe returned invalid JSON: ${err.message}`);
     }
+    if (parsed?.noNode === true) {
+        return { noNode: true };
+    }
     const platform = String(parsed?.platform || '').trim();
     const arch = String(parsed?.arch || '').trim();
     const nodeMajor = Number.parseInt(parsed?.nodeMajor, 10);
@@ -84,7 +92,14 @@ export function parseContainerProbeOutput(raw) {
     return { platform, arch, nodeMajor, variant };
 }
 
-function defaultContainerProbe({ image, runtime }) {
+function isNodeMissingProbeFailure(status, stderr) {
+    if (status !== 127) return false;
+    const text = String(stderr || '').toLowerCase();
+    if (!text.includes('node')) return false;
+    return /not found|no such file|not in \$?path|executable file/.test(text);
+}
+
+function buildContainerRuntimeKeyProbeRunArgs(image) {
     const probeScript = [
         'const report = typeof process.report?.getReport === "function" ? process.report.getReport() : null;',
         'const header = report && report.header ? report.header : null;',
@@ -96,11 +111,25 @@ function defaultContainerProbe({ image, runtime }) {
         '  libc',
         '}));',
     ].join('');
+    return [
+        'run',
+        '--rm',
+        ...managedContainerLabelArgs(),
+        '--pull=never',
+        '--entrypoint',
+        'node',
+        image,
+        '-e',
+        probeScript,
+    ];
+}
+
+function defaultContainerProbe({ image, runtime }) {
     // --pull=never: the image must already be present locally (ensureImagePresent
     // pulls it as an explicit, progress-streamed step before we get here). This
     // keeps the probe fast and turns a missing image into an instant, clear error
     // instead of a silent multi-minute pull that trips the timeout.
-    const args = ['run', '--rm', '--pull=never', '--entrypoint', 'node', image, '-e', probeScript];
+    const args = buildContainerRuntimeKeyProbeRunArgs(image);
     const timeoutMs = probeTimeoutMs();
     const res = spawnSync(runtime, args, { stdio: ['ignore', 'pipe', 'pipe'], timeout: timeoutMs });
     if (res.error) {
@@ -115,6 +144,9 @@ function defaultContainerProbe({ image, runtime }) {
         if (/image not known|no such image|unable to find image|image not present/i.test(stderr)) {
             throw new Error(`Container image '${image}' is not present locally (probe uses --pull=never). `
                 + `Pull it first: '${runtime} pull ${image}'.`);
+        }
+        if (isNodeMissingProbeFailure(res.status, stderr)) {
+            return JSON.stringify({ noNode: true });
         }
         throw new Error(`Container runtime-key probe exited with code ${res.status}${stderr ? `: ${stderr}` : ''}`);
     }
@@ -145,6 +177,9 @@ export function detectContainerRuntimeKey({
     ensureImage({ image: resolvedImage, runtime: resolvedRuntime, manifest, repoName, agentName });
     const output = execProbe({ image: resolvedImage, runtime: resolvedRuntime, manifest, repoName, agentName });
     const probe = parseContainerProbeOutput(output);
+    if (probe.noNode === true) {
+        return NO_NODE_RUNTIME_KEY;
+    }
     return buildRuntimeKey({
         family: 'container',
         platform: probe.platform,
@@ -166,4 +201,11 @@ export function parseRuntimeKey(runtimeKey) {
     };
 }
 
-export { normalizeRuntimeFamily, buildRuntimeKey, SUPPORTED_FAMILIES };
+export {
+    normalizeRuntimeFamily,
+    buildContainerRuntimeKeyProbeRunArgs,
+    buildRuntimeKey,
+    isNoNodeRuntimeKey,
+    NO_NODE_RUNTIME_KEY,
+    SUPPORTED_FAMILIES,
+};

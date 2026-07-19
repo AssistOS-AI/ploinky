@@ -6,7 +6,8 @@ import http from 'http';
 
 import { createContainerMonitor, startContainerMonitor, stopContainerMonitor, clearContainerTargets } from './containerMonitor.js';
 import { appendLog } from './utils/logger.js';
-import { LOGS_DIR } from '../services/config.js';
+import { LOGS_DIR, PLOINKY_DIR } from '../services/config.js';
+import { parseRouterPort } from '../services/routerPort.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -30,9 +31,11 @@ const CONFIG = {
     HEALTH_CHECK_INTERVAL_MS: 30000,   // Check every 30 seconds
     HEALTH_CHECK_TIMEOUT_MS: 5000,     // 5 second timeout
     HEALTH_CHECK_FAILURES_THRESHOLD: 3, // Restart after 3 consecutive failures
+    HEALTH_SOCKET: process.env.PLOINKY_ROUTER_HEALTH_SOCKET
+        || path.join(PLOINKY_DIR, 'run', 'router-health.sock'),
 
     // Process configuration
-    PORT: process.env.PORT || 8080,
+    PORT: parseRouterPort(process.env.PORT, { source: 'Watchdog PORT' }),
     NODE_OPTIONS: process.env.NODE_OPTIONS || '',
 
     // Container monitoring
@@ -220,14 +223,16 @@ async function performHealthCheck() {
     }
     
     return new Promise((resolve) => {
-        const healthUrl = `http://127.0.0.1:${CONFIG.PORT}/health`;
-        
         const timeout = setTimeout(() => {
             req.destroy();
             resolve(false);
         }, CONFIG.HEALTH_CHECK_TIMEOUT_MS);
-        
-        const req = http.get(healthUrl, (res) => {
+
+        const req = http.get({
+            socketPath: CONFIG.HEALTH_SOCKET,
+            path: '/health',
+            method: 'GET',
+        }, (res) => {
             clearTimeout(timeout);
             
             let data = '';
@@ -358,6 +363,7 @@ function spawnServer() {
     const env = {
         ...restEnv,
         MANAGED_BY_PROCESS_MANAGER: 'true',
+        PORT: String(CONFIG.PORT),
     };
     
     const nodeExecutable = getRouterNodeExecutable();
@@ -675,5 +681,6 @@ export {
     getTestLogs,
     clearTestLogs,
     getRouterNodeExecutable,
+    performHealthCheck,
     IS_TEST_MODE as __IS_TEST_MODE
 };

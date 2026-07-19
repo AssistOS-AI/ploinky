@@ -2,13 +2,14 @@ import fs from 'fs';
 import path from 'path';
 import { execSync } from 'child_process';
 import { appendLog } from '../server/utils/logger.js';
-import { DEPS_DIR, ROUTING_FILE, RUNNING_DIR } from '../services/config.js';
+import { DEPS_DIR, RUNNING_DIR } from '../services/config.js';
 import {
     addSessionContainer,
     cleanupSessionSet,
     destroyWorkspaceContainers
 } from '../services/docker/index.js';
 import { debugLog } from '../services/utils.js';
+import { resolvePersistedRouterPort } from '../services/routerPort.js';
 
 function registerSessionContainer(name) {
     try { addSessionContainer(name); } catch (_) { }
@@ -22,11 +23,8 @@ function killRouterIfRunning() {
     try {
         const pidFile = path.join(RUNNING_DIR, 'router.pid');
         let stopped = false;
-        let port = 8080;
-        try {
-            const routing = JSON.parse(fs.readFileSync(ROUTING_FILE, 'utf8')) || {};
-            if (routing.port) port = parseInt(routing.port, 10) || port;
-        } catch (_) { }
+        let port = null;
+        try { port = resolvePersistedRouterPort(); } catch (_) { }
 
         const logRouterStop = (pid, signal, source) => {
             try {
@@ -36,6 +34,7 @@ function killRouterIfRunning() {
 
         const findPids = () => {
             const pids = new Set();
+            if (!port) return [];
             try {
                 const out = execSync(`lsof -t -i :${port} -sTCP:LISTEN`, { stdio: 'pipe' }).toString();
                 out.split(/\s+/).filter(Boolean).forEach(x => { const n = parseInt(x, 10); if (!Number.isNaN(n)) pids.add(n); });

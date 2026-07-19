@@ -93,7 +93,7 @@ export function shouldLogPloinkyDirectory(env = process.env) {
 
 export function logPloinkyDirectory() {
     if (!shouldLogPloinkyDirectory()) return;
-    console.log(`[ploinky] using .ploinky: ${path.resolve(PLOINKY_DIR)}`);
+    console.error(`[ploinky] using .ploinky: ${path.resolve(PLOINKY_DIR)}`);
 }
 
 export function setDebugMode(enabled) {

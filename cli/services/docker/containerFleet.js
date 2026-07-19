@@ -3,7 +3,6 @@ import { debugLog } from '../utils.js';
 import { loadAgents } from '../workspace.js';
 import {
     containerExists,
-    getAgentContainerName,
     getRuntime,
     isContainerRunning,
     isSandboxRuntime,
@@ -74,15 +73,10 @@ function forceStopContainers(names, { prefix } = {}) {
 }
 
 function getContainerCandidates(name, rec) {
-    const candidates = new Set();
-    if (name) candidates.add(name);
-    if (rec && rec.agentName) {
-        try {
-            const repoName = rec.repoName || '';
-            candidates.add(getAgentContainerName(rec.agentName, repoName));
-        } catch (_) { }
-    }
-    return Array.from(candidates);
+    // Registry keys are the exact runtime identifiers. Expanding an alias into
+    // a derived canonical name can stop or delete a different current runtime
+    // without any ownership proof.
+    return name ? [name] : [];
 }
 
 function stopConfiguredAgents({ fast = false } = {}) {
@@ -97,8 +91,8 @@ function stopConfiguredAgents({ fast = false } = {}) {
     for (const [name, rec] of entries) {
         if (isSandboxRuntime(rec?.runtime)) {
             const agentName = rec.agentName || name;
-            if (isBwrapProcessRunning(agentName)) {
-                bwrapEntries.push({ name, agentName, runtime: rec.runtime });
+            if (isBwrapProcessRunning(name)) {
+                bwrapEntries.push({ name, runtimeKey: name, agentName, runtime: rec.runtime });
             } else {
                 console.log(`[stop] ${agentName}: no running ${rec.runtime} process found.`);
             }
@@ -107,11 +101,11 @@ function stopConfiguredAgents({ fast = false } = {}) {
         }
     }
     if (bwrapEntries.length) {
-        const stoppedSandboxAgents = new Set(stopBwrapProcesses(bwrapEntries.map((entry) => entry.agentName), {
+        const stoppedSandboxRuntimes = new Set(stopBwrapProcesses(bwrapEntries.map((entry) => entry.runtimeKey), {
             timeout: fast ? 100 : 5000
         }));
         for (const entry of bwrapEntries) {
-            if (!stoppedSandboxAgents.has(entry.agentName)) continue;
+            if (!stoppedSandboxRuntimes.has(entry.runtimeKey)) continue;
             console.log(`[stop] Stopped ${entry.agentName} (${entry.runtime})`);
             bwrapStopped.push(entry.name);
         }
@@ -158,14 +152,13 @@ function stopAndRemoveMany(names, { fast = false } = {}) {
         if (!agentName) continue;
         const rec = agents ? agents[agentName] : null;
         if (isSandboxRuntime(rec?.runtime)) {
-            const bwrapAgentName = rec.agentName || agentName;
-            bwrapEntries.push({ agentName, bwrapAgentName });
+            bwrapEntries.push({ agentName, runtimeKey: agentName });
             continue;
         }
         containerNames.push(agentName);
     }
     if (bwrapEntries.length) {
-        stopBwrapProcesses(bwrapEntries.map((entry) => entry.bwrapAgentName), {
+        stopBwrapProcesses(bwrapEntries.map((entry) => entry.runtimeKey), {
             timeout: fast ? 100 : 5000
         });
     }

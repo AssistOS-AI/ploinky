@@ -1,6 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import { execSync } from 'child_process';
+import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'url';
 import { loadAgents, saveAgents } from './workspace.js';
 import { resolveMasterKey, setUsersPayload } from './encryptedPasswordStore.js';
@@ -13,10 +14,33 @@ import {
     waitForContainerRunning,
     stopAndRemove,
     stopAndRemoveMany,
+    cleanupExactAgentRuntimeCandidate,
     ensureAgentService
 } from './docker/index.js';
 import { findAgent } from './utils.js';
-import { REPOS_DIR, PLOINKY_WORKSPACE_ROOT, ROUTING_FILE } from './config.js';
+import { isSandboxRuntime } from './docker/common.js';
+import { isBwrapProcessRunning, stopBwrapProcess } from './bwrap/bwrapFleet.js';
+import { REPOS_DIR, PLOINKY_WORKSPACE_ROOT } from './config.js';
+import { resolveManifestRuntimeProfile } from './profileService.js';
+import { resolveRouterEndpoint } from './routerPort.js';
+import { resolveAgentExecutionMode, resolveAgentReadinessProtocol } from './startupReadiness.js';
+import { normalizeProbeConfig, runContainerScriptReadiness } from './docker/healthProbes.js';
+import { waitForAgentReady } from '../server/utils/agentReadiness.js';
+import {
+    mergeRoutingConfig,
+    mergeRuntimeRoute,
+    readRoutingConfig,
+    writeRoutingConfig,
+} from './routingFile.js';
+import {
+    initializeFreshEdgeRoutingSources,
+    abortEdgeRoutingPreparation,
+    inactivateEdgeRoutingGeneration,
+    prepareEdgeRoutingGeneration,
+    prepareHostModeCapabilityForInactiveGeneration,
+    withEdgeGenerationApplyLock,
+} from './edgeGeneration.js';
+import { applyEdgeRoutingGeneration } from './coordinatedEdgeApply.js';
 import {
     createAgentSymlinks,
     removeAgentSymlinks,
@@ -33,6 +57,11 @@ const AUTH_MODES = new Set(['none', 'local', 'pwd', 'sso', 'guest']);
 export const DEFAULT_ENABLE_AGENT_MODE = 'isolated';
 export const ENABLE_AGENT_MODES = Object.freeze(['isolated', 'global', 'devel']);
 const ENABLE_AGENT_MODE_SET = new Set(ENABLE_AGENT_MODES);
+
+export function preferredHostPortForNetworkMode(existingRoute, networkMode) {
+    if (String(networkMode || '').trim().toLowerCase() === 'none') return undefined;
+    return Number(existingRoute?.hostPort || 0) || undefined;
+}
 
 export function isEnableAgentMode(value) {
     return ENABLE_AGENT_MODE_SET.has(String(value || '').trim().toLowerCase());
@@ -87,11 +116,40 @@ export function verifyEnabledAgentStarted(shortAgentName, containerName, {
     if (!containerName) {
         throw new Error(`enable agent: failed to start '${shortAgentName}': no container was returned.`);
     }
-    const running = isRunning(containerName) || waitRunning(containerName, 8, 250);
+    const running = isRunning(containerName) || waitRunning(containerName, 40, 250);
     if (!running) {
         throw new Error(`enable agent: failed to start '${shortAgentName}': container '${containerName}' exited during startup. Check container logs for details.`);
     }
     log(`Agent '${shortAgentName}' started successfully in container '${containerName}'.`);
+}
+
+async function waitForEnabledAgentReadiness(shortAgentName, manifest, started) {
+    const protocol = resolveAgentReadinessProtocol(manifest);
+    if (protocol === 'none') return;
+    if (protocol === 'script') {
+        const probe = normalizeProbeConfig('readiness', manifest?.health?.readiness);
+        const result = await Promise.resolve(runContainerScriptReadiness(
+            shortAgentName,
+            started?.containerName,
+            probe,
+        ));
+        if (result?.status !== 'success') {
+            const detail = result?.detail ? `, output='${result.detail}'` : '';
+            throw new Error(`readiness script failed (${result?.reason || 'unknown failure'}${detail})`);
+        }
+        return;
+    }
+    const hostPort = Number(started?.hostPort || 0);
+    if (!hostPort) {
+        throw new Error(`readiness protocol '${protocol}' requires one resolved private target port`);
+    }
+    const ready = await waitForAgentReady({ hostPort }, {
+        timeoutMs: Number.parseInt(process.env.PLOINKY_ENABLE_AGENT_READY_TIMEOUT_MS || '120000', 10),
+        intervalMs: Number.parseInt(process.env.PLOINKY_ENABLE_AGENT_READY_INTERVAL_MS || '250', 10),
+        probeTimeoutMs: Number.parseInt(process.env.PLOINKY_ENABLE_AGENT_READY_PROBE_TIMEOUT_MS || '1000', 10),
+        protocol,
+    });
+    if (!ready) throw new Error(`readiness protocol '${protocol}' did not succeed`);
 }
 
 function parsePloinkyDirectives(rawValue) {
@@ -146,7 +204,7 @@ function resolveManifestAuthMode(manifest) {
     return 'none';
 }
 
-function normalizeEnableArgs(agentName, mode, repoNameParam) {
+export function normalizeEnableArgs(agentName, mode, repoNameParam) {
     if (typeof agentName !== 'string') {
         return { agentName, mode, repoNameParam };
     }
@@ -211,29 +269,59 @@ function normalizeEnableArgs(agentName, mode, repoNameParam) {
 }
 
 function loadRoutingConfig() {
-    try {
-        if (!fs.existsSync(ROUTING_FILE)) return { routes: {} };
-        const data = JSON.parse(fs.readFileSync(ROUTING_FILE, 'utf8') || '{}');
-        return data && typeof data === 'object' ? data : { routes: {} };
-    } catch (_) {
-        return { routes: {} };
-    }
+    return readRoutingConfig();
 }
 
-function saveRoutingConfig(config) {
-    try {
-        fs.mkdirSync(path.dirname(ROUTING_FILE), { recursive: true });
-        fs.writeFileSync(ROUTING_FILE, JSON.stringify(config || { routes: {} }, null, 2));
-    } catch (_) {}
-}
-
-export function enableAgent(agentName, mode, repoNameParam, aliasParam, authModeParam, authOptions = {}) {
+function resolveAgentEnableInput({
+    agentName,
+    mode,
+    repoNameParam,
+    authOptions = {},
+}) {
     const normalized = normalizeEnableArgs(agentName, mode, repoNameParam);
     const { manifestPath, repo: repoName, shortAgentName } = findAgent(normalized.agentName);
     const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
     const agentPath = path.dirname(manifestPath);
+    const profile = typeof authOptions?.profile === 'string' && authOptions.profile.trim()
+        ? authOptions.profile.trim().toLowerCase()
+        : '';
+    const profileResolution = resolveManifestRuntimeProfile(manifest, {
+        agentName: `${repoName}/${shortAgentName}`,
+        profileName: profile || undefined,
+        path: `manifest(${repoName}/${shortAgentName})`,
+    });
+    const routerEndpoint = resolveRouterEndpoint(profileResolution.network.mode);
+    return {
+        agentPath,
+        manifest,
+        normalized,
+        profile,
+        profileResolution,
+        repoName,
+        routerEndpoint,
+        shortAgentName,
+    };
+}
+
+function planAgentEnable({
+    agentName,
+    mode,
+    repoNameParam,
+    aliasParam,
+    authModeParam,
+    authOptions = {},
+}, map, routing, resolvedInput = undefined) {
+    const {
+        agentPath,
+        manifest,
+        normalized,
+        profile,
+        profileResolution,
+        repoName,
+        routerEndpoint,
+        shortAgentName,
+    } = resolvedInput || resolveAgentEnableInput({ agentName, mode, repoNameParam, authOptions });
     const alias = normalizeAlias(aliasParam);
-    const map = loadAgents();
     if (alias) {
         const aliasExists = Object.entries(map || {}).some(([key, value]) => {
             if (key === alias) return true;
@@ -257,9 +345,6 @@ export function enableAgent(agentName, mode, repoNameParam, aliasParam, authMode
     const password = typeof authOptions?.password === 'string' && authOptions.password.length
         ? authOptions.password
         : '';
-    const profile = typeof authOptions?.profile === 'string' && authOptions.profile.trim()
-        ? authOptions.profile.trim().toLowerCase()
-        : '';
     if ((username || password) && authMode !== 'local') {
         throw new Error('The --user and --password options are only valid with --auth pwd.');
     }
@@ -274,7 +359,6 @@ export function enableAgent(agentName, mode, repoNameParam, aliasParam, authMode
     if (!normalizedMode || normalizedMode === 'default' || normalizedMode === DEFAULT_ENABLE_AGENT_MODE) {
         runMode = DEFAULT_ENABLE_AGENT_MODE;
         projectPath = getAgentDataDir(instanceName);
-        try { fs.mkdirSync(projectPath, { recursive: true }); } catch (_) {}
     } else if (normalizedMode === 'global') {
         runMode = 'global';
         projectPath = PLOINKY_WORKSPACE_ROOT;
@@ -294,13 +378,21 @@ export function enableAgent(agentName, mode, repoNameParam, aliasParam, authMode
         throw new Error(`Unknown mode '${errorMode}'. Allowed: ${formatEnableAgentModes()}`);
     }
 
-    // Parse port mappings from manifest
+    // Capture only ports the selected execution/network contract can own. The
+    // runtime will later replace dynamic host-port zeros in one coordinated
+    // final generation after every prepared process has launched.
     const { portMappings } = parseManifestPorts(manifest);
-    // If no ports specified, use default 7000
-    const ports = portMappings.length > 0 ? portMappings : [{ containerPort: 7000 }];
+    const networkMode = profileResolution.network.mode;
+    const ports = networkMode === 'host' || networkMode === 'none'
+        ? []
+        : (portMappings.length > 0
+            ? portMappings
+            : (resolveAgentExecutionMode(manifest).usesImplicitAgentServer ? [{ containerPort: 7000 }] : []));
     const projectMountTarget = runMode === DEFAULT_ENABLE_AGENT_MODE ? '/root' : projectPath;
     const homePath = getAgentDataDir(instanceName);
-    try { fs.mkdirSync(homePath, { recursive: true }); } catch (_) {}
+    const instanceId = randomUUID();
+    const enableGeneration = randomUUID();
+    let credentialUpdate = null;
     
     const record = {
         agentName: shortAgentName,
@@ -311,6 +403,8 @@ export function enableAgent(agentName, mode, repoNameParam, aliasParam, authMode
         runMode,
         develRepo: runMode === 'devel' ? String(normalized.repoNameParam || '') : undefined,
         type: 'agent',
+        instanceId,
+        enableGeneration,
         config: {
             binds: [
                 { source: projectPath, target: projectMountTarget },
@@ -329,7 +423,9 @@ export function enableAgent(agentName, mode, repoNameParam, aliasParam, authMode
             ...buildDefaultLocalAuthVars(routeKey)
         };
         if (username && password) {
-            setUsersPayload(record.auth.usersVar, {
+            credentialUpdate = {
+                usersVar: record.auth.usersVar,
+                payload: {
                 version: 1,
                 users: [{
                     id: `local:${username}`,
@@ -340,12 +436,16 @@ export function enableAgent(agentName, mode, repoNameParam, aliasParam, authMode
                     roles: ['local', 'admin'],
                     rev: 1
                 }]
-            });
+                }
+            };
         } else if (manifestPwdUsers.length) {
-            setUsersPayload(record.auth.usersVar, {
-                version: 1,
-                users: manifestPwdUsers
-            });
+            credentialUpdate = {
+                usersVar: record.auth.usersVar,
+                payload: {
+                    version: 1,
+                    users: manifestPwdUsers
+                }
+            };
         }
     } else {
         record.auth = { mode: authMode };
@@ -353,14 +453,17 @@ export function enableAgent(agentName, mode, repoNameParam, aliasParam, authMode
     if (alias) {
         record.alias = alias;
     }
-    if (profile) {
-        record.profile = profile;
-    }
+    // Persist the exact resolved launch profile in the inactive candidate.
+    // Runtime finalization must not introduce a default-profile value that was
+    // absent from the preparation digest.
+    record.profile = profileResolution.resolvedProfileName;
 
-    const routing = loadRoutingConfig();
     routing.routes = routing.routes || {};
     const existingRoute = routing.routes[routeKey] || {};
-    const preferredHostPort = Number(existingRoute.hostPort || 0) || undefined;
+    const preferredHostPort = preferredHostPortForNetworkMode(
+        existingRoute,
+        profileResolution.network.mode,
+    );
 
     for (const key of Object.keys(map)) {
         if (RESERVED_AGENT_KEYS.has(key)) continue;
@@ -375,18 +478,161 @@ export function enableAgent(agentName, mode, repoNameParam, aliasParam, authMode
         try { delete map[key]; } catch (_) {}
     }
     map[containerName] = record;
-    saveAgents(map);
+    routing.routes[routeKey] = mergeRuntimeRoute(existingRoute, {
+        container: containerName,
+        hostPath: agentPath,
+        repo: repoName,
+        agent: shortAgentName,
+        ...(alias ? { alias } : {}),
+    }, { hostPort: null, serviceTargets: null });
 
-    // Create workspace structure for the agent
+    return {
+        agentPath,
+        alias,
+        containerName,
+        credentialUpdate,
+        enableGeneration,
+        existingRoute,
+        instanceId,
+        instanceName,
+        manifest,
+        preferredHostPort,
+        profileResolution,
+        record,
+        repoName,
+        routeKey,
+        routerEndpoint,
+        runMode,
+        shortAgentName,
+    };
+}
+
+function createPreparedWorkspaceStructure(plan) {
     try {
-        // Create per-instance data directory: $PLOINKY_WORKSPACE_ROOT/.data/<alias|agentName>/
-        createAgentWorkDir(instanceName);
-
-        // Create symlinks: $PLOINKY_WORKSPACE_ROOT/.ploinky/code/<agentName> and .ploinky/skills/<agentName>
-        createAgentSymlinks(shortAgentName, repoName, agentPath);
-    } catch (err) {
-        console.error(`Warning: Failed to create workspace structure for ${shortAgentName}: ${err.message}`);
+        createAgentWorkDir(plan.instanceName);
+        createAgentSymlinks(plan.shortAgentName, plan.repoName, plan.agentPath);
+    } catch (error) {
+        console.error(`Warning: Failed to create workspace structure for ${plan.shortAgentName}: ${error.message}`);
     }
+}
+
+/**
+ * Stage exact identities and target-less routes for a set of agents, then
+ * compile one immutable generation before any of their processes start.
+ * Requests are ordinary enable-agent argument objects; no request can grant a
+ * capability. The already-staged desired state remains the sole authority.
+ */
+export function prepareAgentEnableBatch(requests, {
+    reason = 'agent-enable-batch-prelaunch',
+} = {}) {
+    if (!Array.isArray(requests)) {
+        throw new Error('prepare agent enable batch: requests must be an array');
+    }
+
+    const resolvedRequests = requests.map((request) => {
+        if (!request || typeof request !== 'object' || Array.isArray(request)) {
+            throw new Error('prepare agent enable batch: each enable batch request must be an object');
+        }
+        return { request, input: resolveAgentEnableInput(request) };
+    });
+
+    initializeFreshEdgeRoutingSources({ workspaceRoot: PLOINKY_WORKSPACE_ROOT });
+    const map = loadAgents();
+    const routing = loadRoutingConfig();
+    routing.routes = routing.routes || {};
+    const previousAgents = structuredClone(map);
+    const previousRouting = structuredClone(routing);
+    const plans = [];
+    let preparedGeneration = null;
+    let mutationStarted = false;
+
+    try {
+        for (const { request, input } of resolvedRequests) {
+            plans.push(planAgentEnable(request, map, routing, input));
+        }
+        withEdgeGenerationApplyLock((applyLockCapability) => {
+            // Credential payloads are dynamically consumed by the active
+            // Router. Do not write any payload until the whole batch has
+            // validated and the selector is inactive; a later planning error
+            // must have zero effect on active authorization state.
+            mutationStarted = true;
+            inactivateEdgeRoutingGeneration(`${reason}:source-stage`, { applyLockCapability });
+            for (const plan of plans) {
+                if (!plan.credentialUpdate) continue;
+                setUsersPayload(plan.credentialUpdate.usersVar, plan.credentialUpdate.payload);
+            }
+            saveAgents(map, { coordinate: false, applyLockCapability });
+            writeRoutingConfig(routing, { coordinate: false });
+            preparedGeneration = prepareEdgeRoutingGeneration({ reason, applyLockCapability });
+            for (const plan of plans) {
+                if (plan.profileResolution.network.mode !== 'host') continue;
+                plan.preparedHostModeCapability = prepareHostModeCapabilityForInactiveGeneration({
+                    agentId: `agent:${plan.repoName}/${plan.shortAgentName}`,
+                    instanceId: plan.instanceId,
+                    enableGeneration: plan.enableGeneration,
+                    routeKey: plan.routeKey,
+                    containerName: plan.containerName,
+                });
+            }
+        });
+    } catch (error) {
+        if (mutationStarted) {
+            try {
+                inactivateEdgeRoutingGeneration('agent-enable-batch-prepare-failed', {
+                    preserveSelectedGeneration: true,
+                });
+            } catch (_) {}
+            try {
+                if (preparedGeneration?.preparationLease) {
+                    abortEdgeRoutingPreparation(preparedGeneration.preparationLease, {
+                        reason: 'agent-enable-batch-prepare-failed',
+                    });
+                }
+            } catch (_) {}
+        }
+        throw new Error(`prepare agent enable batch: candidate generation rejected: ${error?.message || error}`);
+    }
+
+    for (const plan of plans) createPreparedWorkspaceStructure(plan);
+    return {
+        plans,
+        previousAgents,
+        previousRouting,
+        preparedGeneration,
+    };
+}
+
+export async function enableAgent(agentName, mode, repoNameParam, aliasParam, authModeParam, authOptions = {}) {
+    let prepared;
+    try {
+        prepared = prepareAgentEnableBatch([{
+            agentName,
+            mode,
+            repoNameParam,
+            aliasParam,
+            authModeParam,
+            authOptions,
+        }], { reason: 'agent-enable-prelaunch' });
+    } catch (error) {
+        throw new Error(`enable agent: candidate generation rejected: ${error?.message || error}`);
+    }
+    const [plan] = prepared.plans;
+    const {
+        agentPath,
+        alias,
+        containerName,
+        enableGeneration,
+        instanceId,
+        manifest,
+        preferredHostPort,
+        profileResolution,
+        record,
+        repoName,
+        routeKey,
+        routerEndpoint,
+        runMode,
+        shortAgentName,
+    } = plan;
 
     let started = null;
     try {
@@ -394,34 +640,173 @@ export function enableAgent(agentName, mode, repoNameParam, aliasParam, authMode
         started = ensureAgentService(shortAgentName, manifest, agentPath, {
             containerName,
             alias: alias || undefined,
-            preferredHostPort
+            preferredHostPort,
+            profileName: profileResolution.resolvedProfileName,
+            profileResolution,
+            routerEndpoint,
+            instanceId,
+            enableGeneration,
+            forceRecreate: true,
+            preservePreparedRegistryRecord: true,
+            preparationLease: prepared.preparedGeneration?.preparationLease,
+            preparedHostModeCapability: plan.preparedHostModeCapability,
         });
+        verifyEnabledAgentStarted(shortAgentName, started?.containerName || containerName);
+        await waitForEnabledAgentReadiness(shortAgentName, manifest, started);
+
+        const hostPort = profileResolution.network.mode === 'none'
+            ? undefined
+            : started?.hostPort || preferredHostPort;
+        const serviceTargets = started?.serviceTargets || null;
+        if (!started?.registryRecord) {
+            throw new Error(`runtime '${containerName}' returned no exact registry record`);
+        }
+        await mergeRoutingConfig((routing) => {
+            const agents = loadAgents();
+            agents[started.containerName || containerName] = started.registryRecord;
+            saveAgents(agents, { coordinate: false });
+            routing.routes = routing.routes || {};
+            routing.routes[routeKey] = mergeRuntimeRoute(routing.routes[routeKey], {
+                container: started?.containerName || containerName,
+                hostPath: agentPath,
+                repo: repoName,
+                agent: shortAgentName,
+                ...(alias ? { alias } : {}),
+            }, { hostPort, serviceTargets });
+            return routing;
+        }, {
+            reason: 'agent-enable-runtime-finalize',
+            preparationLease: prepared.preparedGeneration?.preparationLease,
+        });
+
+        return { containerName: started?.containerName || containerName, repoName, shortAgentName, alias: alias || undefined, auth: record.auth, runMode, hostPort };
     } catch (error) {
+        const failedCandidate = started || error?.ploinkyRestartCandidate || null;
+        if (failedCandidate?.containerName && failedCandidate.exactCleanupPerformed !== true) {
+            try {
+                cleanupExactAgentRuntimeCandidate(failedCandidate);
+            } catch (cleanupError) {
+                error.message = `${error.message}; exact candidate cleanup failed: ${cleanupError?.message || cleanupError}`;
+            }
+        }
+        // The prepared candidate remains the exact selected repair state. Do
+        // not restore or reactivate its predecessor after a failed launch or
+        // readiness check.
+        try { inactivateEdgeRoutingGeneration('agent-enable-start-failed', { preserveSelectedGeneration: true }); } catch (_) {}
+        try {
+            if (prepared?.preparedGeneration?.preparationLease) {
+                abortEdgeRoutingPreparation(prepared.preparedGeneration.preparationLease, {
+                    reason: 'agent-enable-start-failed',
+                });
+            }
+        } catch (_) {}
         throw new Error(`enable agent: failed to start '${shortAgentName}': ${error?.message || error}`);
     }
-    verifyEnabledAgentStarted(shortAgentName, started?.containerName || containerName);
-
-    const hostPort = started?.hostPort || preferredHostPort || existingRoute.hostPort;
-    const additionalServerPort = started?.additionalServerPort || null;
-    routing.routes[routeKey] = {
-        ...existingRoute,
-        container: started?.containerName || containerName,
-        hostPath: agentPath,
-        repo: repoName,
-        agent: shortAgentName,
-        ...(alias ? { alias } : {}),
-        ...(hostPort ? { hostPort } : {}),
-        ...(additionalServerPort ? { additionalServerPort } : {})
-    };
-    if (!additionalServerPort) {
-        delete routing.routes[routeKey].additionalServerPort;
-    }
-    saveRoutingConfig(routing);
-
-    return { containerName: started?.containerName || containerName, repoName, shortAgentName, alias: alias || undefined, auth: record.auth, runMode, hostPort };
 }
 
-export function disableAgent(agentRef) {
+function routeKeyForEnabledRecord(record) {
+    return String(record?.alias || record?.agentName || '').trim();
+}
+
+function removeDisabledRoutes(routing, disabledRecords) {
+    const next = routing && typeof routing === 'object' ? routing : { routes: {} };
+    next.routes = next.routes && typeof next.routes === 'object' ? next.routes : {};
+    for (const { containerName, record } of disabledRecords) {
+        const routeKey = routeKeyForEnabledRecord(record);
+        const route = next.routes[routeKey];
+        const exactOwner = route
+            && String(route.repo || '') === String(record?.repoName || '')
+            && String(route.agent || '') === String(record?.agentName || '')
+            && String(route.alias || '') === String(record?.alias || '');
+        if (route && (String(route.container || '') === containerName || exactOwner)) {
+            delete next.routes[routeKey];
+        }
+        if (String(next.static?.container || '') === containerName) {
+            delete next.static;
+        }
+    }
+    return next;
+}
+
+function stageAgentDisableGeneration(map, disabledRecords, {
+    reason,
+    inactivateGeneration = inactivateEdgeRoutingGeneration,
+    saveAgentsImpl = saveAgents,
+    readRoutingImpl = loadRoutingConfig,
+    writeRoutingImpl = (routing) => writeRoutingConfig(routing, { coordinate: false }),
+    prepareGeneration = prepareEdgeRoutingGeneration,
+    withApplyLock = withEdgeGenerationApplyLock,
+} = {}) {
+    return withApplyLock((applyLockCapability) => {
+        inactivateGeneration(reason, { applyLockCapability });
+        const routing = removeDisabledRoutes(readRoutingImpl(), disabledRecords);
+        saveAgentsImpl(map, { coordinate: false, applyLockCapability });
+        writeRoutingImpl(routing, { coordinate: false, applyLockCapability });
+        const prepared = prepareGeneration({ reason, applyLockCapability });
+        if (prepared?.selector?.state !== 'inactive') {
+            throw new Error('disable agent: prepared route-removal generation did not remain inactive');
+        }
+        return prepared;
+    });
+}
+
+function commitAgentDisableGeneration(prepared, {
+    reason,
+    applyGeneration = applyEdgeRoutingGeneration,
+    inactivateGeneration = inactivateEdgeRoutingGeneration,
+    abortPreparation = abortEdgeRoutingPreparation,
+} = {}) {
+    try {
+        return applyGeneration({
+            reason,
+            preparationLease: prepared?.preparationLease,
+        });
+    } catch (error) {
+        try {
+            inactivateGeneration(`${reason}-failed`, {
+                preserveSelectedGeneration: true,
+            });
+        } catch (_) {}
+        try {
+            if (prepared?.preparationLease) {
+                abortPreparation(prepared.preparationLease, { reason: `${reason}-failed` });
+            }
+        } catch (_) {}
+        throw error;
+    }
+}
+
+function removeDisabledRuntimes(disabledRecords, {
+    stopAndRemoveImpl = stopAndRemove,
+    stopAndRemoveManyImpl = stopAndRemoveMany,
+    isSandboxRuntimeImpl = isSandboxRuntime,
+    stopSandboxImpl = stopBwrapProcess,
+    sandboxRunningImpl = isBwrapProcessRunning,
+    containerExistsImpl = containerExists,
+} = {}) {
+    const containerTargets = [];
+    for (const { containerName, record } of disabledRecords) {
+        if (isSandboxRuntimeImpl(record?.runtime)) {
+            stopSandboxImpl(containerName);
+            if (sandboxRunningImpl(containerName)) {
+                throw new Error(`sandbox runtime '${containerName}' is still running`);
+            }
+        } else {
+            containerTargets.push(containerName);
+        }
+    }
+    if (containerTargets.length === 1) {
+        stopAndRemoveImpl(containerTargets[0]);
+    } else if (containerTargets.length > 1) {
+        stopAndRemoveManyImpl(containerTargets);
+    }
+    const retained = containerTargets.filter((containerName) => containerExistsImpl(containerName));
+    if (retained.length) {
+        throw new Error(`runtime removal left existing container(s): ${retained.join(', ')}`);
+    }
+}
+
+export function disableAgent(agentRef, dependencies = {}) {
     const input = typeof agentRef === 'string' ? agentRef.trim() : '';
     if (!input) {
         throw new Error("disable agent: missing agent name. Usage: disable <agentName>");
@@ -439,7 +824,11 @@ export function disableAgent(agentRef) {
         [targetRepo, targetAgent] = parts;
     }
 
-    const map = loadAgents();
+    const loadAgentsImpl = dependencies.loadAgentsImpl || loadAgents;
+    const applyGeneration = dependencies.applyGeneration || applyEdgeRoutingGeneration;
+    const inactivateGeneration = dependencies.inactivateGeneration || inactivateEdgeRoutingGeneration;
+    const abortPreparation = dependencies.abortPreparation || abortEdgeRoutingPreparation;
+    const map = loadAgentsImpl();
     const config = (map && typeof map._config === 'object') ? map._config : null;
     const directRecord = (map && map[input] && map[input].type === 'agent') ? map[input] : null;
 
@@ -505,9 +894,42 @@ export function disableAgent(agentRef) {
     }
 
     if (!matches.length) {
+        const staticContainer = String(config?.static?.container || '').trim();
         const staticCleared = clearStaticConfig({ repoName: targetRepo, shortName: targetAgent, rawInput: input, containerName: null });
         if (staticCleared) {
-            saveAgents(map);
+            const disabledStaticRecords = staticContainer ? [{
+                containerName: staticContainer,
+                record: {
+                    agentName: targetAgent,
+                    repoName: targetRepo || '',
+                },
+            }] : [];
+            const prepared = stageAgentDisableGeneration(map, disabledStaticRecords, {
+                ...dependencies,
+                inactivateGeneration,
+                reason: 'agent-disable-static-prepare',
+            });
+            try {
+                removeDisabledRuntimes(disabledStaticRecords, dependencies);
+            } catch (error) {
+                try {
+                    inactivateGeneration('agent-disable-static-runtime-removal-failed', {
+                        preserveSelectedGeneration: true,
+                    });
+                } catch (_) {}
+                try {
+                    abortPreparation(prepared.preparationLease, {
+                        reason: 'agent-disable-static-runtime-removal-failed',
+                    });
+                } catch (_) {}
+                throw new Error(`disable agent: failed to stop and remove static runtime '${staticContainer}': ${error?.message || error}`);
+            }
+            commitAgentDisableGeneration(prepared, {
+                reason: 'agent-disable-static-commit',
+                applyGeneration,
+                inactivateGeneration,
+                abortPreparation,
+            });
             return {
                 status: 'static-removed',
                 requested: input
@@ -538,13 +960,29 @@ export function disableAgent(agentRef) {
         rawInput: input
     });
 
-    saveAgents(map);
-
+    const disabledRecords = [{ containerName, record }];
+    const prepared = stageAgentDisableGeneration(map, disabledRecords, {
+        ...dependencies,
+        inactivateGeneration,
+        reason: 'agent-disable-prepare',
+    });
     try {
-        stopAndRemove(containerName);
+        removeDisabledRuntimes(disabledRecords, dependencies);
     } catch (error) {
+        try {
+            inactivateGeneration('agent-disable-runtime-removal-failed', {
+                preserveSelectedGeneration: true,
+            });
+        } catch (_) {}
+        try { abortPreparation(prepared.preparationLease, { reason: 'agent-disable-runtime-removal-failed' }); } catch (_) {}
         throw new Error(`disable agent: failed to stop and remove container '${containerName}': ${error?.message || error}`);
     }
+    commitAgentDisableGeneration(prepared, {
+        reason: 'agent-disable-commit',
+        applyGeneration,
+        inactivateGeneration,
+        abortPreparation,
+    });
 
     // Remove workspace structure for the agent
     try {
@@ -565,15 +1003,20 @@ export function disableAgent(agentRef) {
     };
 }
 
-export function disableAgentContainers(containerNames = []) {
+export function disableAgentContainers(containerNames = [], dependencies = {}) {
     const targets = Array.from(new Set((containerNames || [])
         .map(name => String(name || '').trim())
         .filter(Boolean)));
     if (!targets.length) return [];
 
-    const map = loadAgents();
+    const loadAgentsImpl = dependencies.loadAgentsImpl || loadAgents;
+    const applyGeneration = dependencies.applyGeneration || applyEdgeRoutingGeneration;
+    const inactivateGeneration = dependencies.inactivateGeneration || inactivateEdgeRoutingGeneration;
+    const abortPreparation = dependencies.abortPreparation || abortEdgeRoutingPreparation;
+    const map = loadAgentsImpl();
     const config = (map && typeof map._config === 'object') ? map._config : null;
     const disabled = [];
+    const disabledRuntimeRecords = [];
 
     const clearStaticConfig = ({ repoName, shortName, containerName }) => {
         if (!config || !config.static) return false;
@@ -625,15 +1068,33 @@ export function disableAgentContainers(containerNames = []) {
             shortAgentName: record.agentName,
             repoName: record.repoName
         });
+        disabledRuntimeRecords.push({ containerName, record });
     }
 
-    saveAgents(map);
-
+    if (!disabledRuntimeRecords.length) return disabled;
+    const disabledRecords = disabledRuntimeRecords;
+    const prepared = stageAgentDisableGeneration(map, disabledRecords, {
+        ...dependencies,
+        inactivateGeneration,
+        reason: 'agent-disable-batch-prepare',
+    });
     try {
-        stopAndRemoveMany(targets);
+        removeDisabledRuntimes(disabledRecords, dependencies);
     } catch (error) {
+        try {
+            inactivateGeneration('agent-disable-batch-runtime-removal-failed', {
+                preserveSelectedGeneration: true,
+            });
+        } catch (_) {}
+        try { abortPreparation(prepared.preparationLease, { reason: 'agent-disable-batch-runtime-removal-failed' }); } catch (_) {}
         throw new Error(`disable agents: failed to stop and remove containers: ${error?.message || error}`);
     }
+    commitAgentDisableGeneration(prepared, {
+        reason: 'agent-disable-batch-commit',
+        applyGeneration,
+        inactivateGeneration,
+        abortPreparation,
+    });
 
     for (const item of disabled) {
         if (item.status !== 'removed' || !item.shortAgentName) continue;

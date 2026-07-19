@@ -1,8 +1,27 @@
 import fs from 'fs';
 import path from 'path';
-import { PLOINKY_DIR, ROUTING_FILE } from '../services/config.js';
+import { PLOINKY_DIR } from '../services/config.js';
 import { debugLog, parseParametersString } from '../services/utils.js';
+import { resolvePersistedRouterPort } from '../services/routerPort.js';
 import { createAgentClient as createBrowserClient } from '../../Agent/client/MCPBrowserClient.js';
+import { mintSessionJwt } from '../server/auth/localService.js';
+
+const LOCAL_AUTH_COOKIE_NAME = 'ploinky_jwt';
+
+export function buildLocalCliSessionHeaders() {
+    try {
+        const token = mintSessionJwt({
+            id: 'local:admin',
+            username: 'admin',
+            name: 'Local CLI',
+            email: '',
+            roles: ['user', 'admin'],
+        }, 1);
+        return { cookie: `${LOCAL_AUTH_COOKIE_NAME}=${token}` };
+    } catch (_) {
+        return {};
+    }
+}
 
 class ClientCommands {
     constructor() {
@@ -47,17 +66,14 @@ class ClientCommands {
     }
 
     getRouterPort() {
-        try {
-            const cfg = JSON.parse(fs.readFileSync(ROUTING_FILE, 'utf8')) || {};
-            return cfg.port || 8080;
-        } catch (_) {
-            return 8080;
-        }
+        return resolvePersistedRouterPort();
     }
 
     async withRouterClient(fn) {
         const baseUrl = `http://127.0.0.1:${this.getRouterPort()}/mcp`;
-        const client = createBrowserClient(baseUrl);
+        const client = createBrowserClient(baseUrl, {
+            requestHeaders: buildLocalCliSessionHeaders(),
+        });
         try {
             return await fn(client);
         } finally {

@@ -332,7 +332,7 @@ test('getManifestEnvSpecs: mixed wildcards and explicit variables', () => {
     }
 });
 
-test('validateManifestEnvProfileCompleteness rejects required non-sensitive env without defaults', () => {
+test('validateManifestEnvProfileCompleteness records operator-required non-sensitive env without inventing defaults', () => {
     const manifest = {
         profiles: {
             prod: {
@@ -351,8 +351,9 @@ test('validateManifestEnvProfileCompleteness rejects required non-sensitive env 
         profileName: 'prod'
     });
 
-    assert.strictEqual(result.valid, false);
-    assert.match(result.issues[0], /PUBLIC_SERVICE_URL/);
+    assert.strictEqual(result.valid, true);
+    assert.deepEqual(result.issues, []);
+    assert.deepEqual(result.operatorRequired.map((entry) => entry.insideName), ['PUBLIC_SERVICE_URL']);
 });
 
 test('validateManifestEnvProfileCompleteness allows derived and sensitive required env without defaults', () => {

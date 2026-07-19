@@ -1,6 +1,6 @@
 import fs from 'fs';
 import path from 'path';
-import { execSync, spawn } from 'child_process';
+import { spawn } from 'child_process';
 import { debugLog, findAgent } from '../services/utils.js';
 import { isKnownCommand } from '../services/commandRegistry.js';
 import { showHelp } from '../services/help.js';
@@ -8,22 +8,27 @@ import * as envSvc from '../services/secretVars.js';
 import * as agentsSvc from '../services/agents.js';
 import { listRepos, listAgents, listCurrentAgents, listRoutes, statusWorkspace } from '../services/status.js';
 import { logsTail, showLast } from '../services/logUtils.js';
-import { startWorkspace, runCli, runShell, reinstallAgent } from '../services/workspaceUtil.js';
+import {
+    startWorkspace,
+    runCli,
+    runShell,
+    reinstallAgent,
+    waitForManifestReadiness,
+    activatePreparedRuntimeAfterReadiness,
+} from '../services/workspaceUtil.js';
 import { withMaintenanceLock } from '../services/maintenanceLocks.js';
-import { refreshComponentToken, ensureComponentToken } from '../server/utils/routerEnv.js';
+import { printComponentAccess } from '../server/utils/routerEnv.js';
 import {
     getAgentContainerName,
     getRuntime,
     containerExists,
     isContainerRunning,
-    parseManifestPorts,
-    resolveHostPortFromRuntime,
     stopConfiguredAgents,
     destroyWorkspaceContainers,
     ensureAgentService
 } from '../services/docker/index.js';
 import { getRuntimeForAgent, isSandboxRuntime } from '../services/docker/common.js';
-import { isBwrapProcessRunning, stopBwrapProcess } from '../services/bwrap/bwrapFleet.js';
+import { isBwrapProcessRunning } from '../services/bwrap/bwrapFleet.js';
 import * as workspaceSvc from '../services/workspace.js';
 import { handleSystemCommand, handleInvalidCommand, resetLlmInvokerCache } from './llmSystemCommands.js';
 import * as inputState from '../services/inputState.js';
@@ -32,6 +37,8 @@ import {
     getAgentNames,
     installRepo,
     addRepo,
+    enableRepo,
+    disableRepo,
     uninstallRepo,
     updateRepo,
     updatePloinkyRepos,
@@ -50,7 +57,6 @@ import {
 import { handleDefaultSkillsCommand } from './skillsCommands.js';
 import { runSettingsMenu } from '../services/settingsMenu.js';
 import { handleProfileCommand } from './profileCommands.js';
-import { ROUTING_FILE } from '../services/config.js';
 import {
     cleanupSessionContainers,
     destroyAll,
@@ -61,8 +67,17 @@ import { handleSsoCommand } from './ssoCommands.js';
 import { handleDepsCommand } from './depsCommands.js';
 import { disableHostSandbox, enableHostSandbox, handleSandboxCommand } from './sandboxCommands.js';
 import ClientCommands from './client.js';
-import { getActiveProfile, getProfileConfig } from '../services/profileService.js';
-import { resolveProfileServer } from '../services/profileServer.js';
+import {
+    getValidProfiles,
+    isValidProfile,
+    resolveManifestRuntimeProfile,
+    setActiveProfile,
+} from '../services/profileService.js';
+import { resolvePersistedRouterPort, resolveRouterEndpoint } from '../services/routerPort.js';
+import { runOuterRuntimeShell } from '../services/runtimeShell.js';
+import { createNetworkLifecycleAdapter } from '../services/networkLifecycle.js';
+import { applyEdgeDesiredStateFile } from '../services/coordinatedEdgeApply.js';
+import { inactivateEdgeRoutingGeneration } from '../services/edgeGeneration.js';
 
 let llmAgentsLoadPromise = null;
 const ENABLE_AGENT_CLI_TOKENS = Object.freeze({
@@ -167,13 +182,18 @@ function parseInstallRepoArgs(options = []) {
         branch = tokens[branchIdx + 1];
         tokens.splice(branchIdx, 2);
     }
-    if (String(tokens[0] || '').toLowerCase() === 'repo') {
+    if (['repo', 'repository'].includes(String(tokens[0] || '').toLowerCase())) {
         tokens.shift();
     }
     const url = tokens[0];
     const name = tokens[1] || null;
     if (!branch && tokens[2]) branch = tokens[2];
     return { url, name, branch };
+}
+
+function parseRepoToggleArgs(options = []) {
+    const parsed = parseInstallRepoArgs(options);
+    return { repoName: parsed.url, branch: parsed.branch };
 }
 
 function parseUninstallRepoTarget(options = []) {
@@ -191,20 +211,29 @@ function hasAgentEnableSyntax(options = []) {
     });
 }
 
-
-
+export async function handleCliCommand(options = [], {
+    runOuterRuntimeShellImpl = runOuterRuntimeShell,
+    runAgentCliImpl = runCli,
+} = {}) {
+    if (options.length === 0) return runOuterRuntimeShellImpl();
+    return runAgentCliImpl(options[0], options.slice(1));
+}
 
 async function handleCommand(args) {
     const [command, ...options] = args;
+    if (command === 'start') {
+        const parsed = parseStartArgs(options);
+        if (parsed.profile && !isValidProfile(parsed.profile)) {
+            throw new Error(`Invalid profile '${parsed.profile}'. Valid profiles are: ${getValidProfiles().join(', ')}`);
+        }
+    }
     switch (command) {
         case 'shell':
             if (!options[0]) { showHelp(); break; }
             await runShell(options[0]);
             break;
         case 'cli':
-            if (!options[0]) { showHelp(); break; }
-            await runCli(options[0], options.slice(1));
-            break;
+            return handleCliCommand(options);
         // 'agent' command removed; use 'enable agent <agentName>' then 'start'
         case 'add':
             {
@@ -262,7 +291,11 @@ async function handleCommand(args) {
             break;
         }
         case 'enable':
-            if (options[0] === 'agent') {
+            if (String(options[0] || '').toLowerCase() === 'repo' || String(options[0] || '').toLowerCase() === 'repository') {
+                const parsed = parseRepoToggleArgs(options);
+                enableRepo(parsed.repoName, parsed.branch);
+            }
+            else if (options[0] === 'agent') {
                 const parsed = parseEnableAgentArgs(options.slice(1));
                 await enableAgent(parsed.agentName, parsed.mode, parsed.repoName, parsed.alias, parsed.authMode, parsed.username, parsed.password);
             }
@@ -292,6 +325,12 @@ async function handleCommand(args) {
 
             if (String(options[0] || '').toLowerCase() === 'agents-all') {
                 disableAllAgents();
+                break;
+            }
+
+            if (String(options[0] || '').toLowerCase() === 'repo' || String(options[0] || '').toLowerCase() === 'repository') {
+                const parsed = parseRepoToggleArgs(options);
+                disableRepo(parsed.repoName);
                 break;
             }
 
@@ -340,6 +379,12 @@ async function handleCommand(args) {
         // 'run' legacy commands removed; use 'start', 'cli', 'shell', 'console'.
         case 'start': {
             const startParsed = parseStartArgs(options);
+            if (startParsed.profile) {
+                const profileResult = setActiveProfile(startParsed.profile);
+                if (!profileResult.success) {
+                    throw new Error(profileResult.message);
+                }
+            }
             // The global --branch also drives the achillesAgentLib used by agent
             // containers (best-effort: the branch when the achillesAgentLib remote
             // has it, else the pinned #master). Propagated via PLOINKY_AGENTLIB_REF,
@@ -349,9 +394,7 @@ async function handleCommand(args) {
             if (agentlibRef) {
                 process.env.PLOINKY_AGENTLIB_REF = agentlibRef;
             }
-            await startWorkspace(startParsed.staticAgent, startParsed.port, {
-                refreshComponentToken,
-                ensureComponentToken,
+            await startWorkspace(startParsed.staticAgent, startParsed.port ?? undefined, {
                 enableAgent,
                 killRouterIfRunning,
                 branchPolicy: startParsed.branchPolicy,
@@ -360,23 +403,8 @@ async function handleCommand(args) {
         }
         // 'route' and 'probe' commands removed (replaced by start/status and client commands)
         case 'webchat': {
-            const argsList = (options || []).filter(Boolean);
-            let rotate = false;
-            const positional = [];
-            for (const arg of argsList) {
-                if (String(arg).startsWith('--')) {
-                    if (arg === '--rotate') rotate = true;
-                } else {
-                    positional.push(arg);
-                }
-            }
-
-            if (rotate) refreshComponentToken('webchat');
-            else ensureComponentToken('webchat');
-
-            if (!rotate && positional.length) {
-                console.warn('webchat: argument-based configuration has been removed; this command now only prints the access URL.');
-            }
+            if ((options || []).filter(Boolean).length) throw new Error('Usage: webchat');
+            printComponentAccess('webchat');
             break;
         }
         case 'sso':
@@ -389,9 +417,8 @@ async function handleCommand(args) {
             await handleDepsCommand(options);
             break;
         case 'dashboard': {
-            const rotate = (options || []).includes('--rotate');
-            if (rotate) await refreshComponentToken('dashboard');
-            else ensureComponentToken('dashboard');
+            if ((options || []).filter(Boolean).length) throw new Error('Usage: dashboard');
+            printComponentAccess('dashboard');
             break;
         }
         case 'list':
@@ -403,6 +430,39 @@ async function handleCommand(args) {
         case 'status':
             await statusWorkspace();
             break;
+        case 'network': {
+            const subcommand = String(options[0] || '').trim();
+            const runtime = getRuntime();
+            const adapter = createNetworkLifecycleAdapter({ runtime });
+            if (subcommand === 'status') {
+                const json = options.slice(1).includes('--json');
+                if (options.slice(1).some((value) => value !== '--json')) {
+                    throw new Error('Usage: network status [--json]');
+                }
+                const status = adapter.status();
+                if (json) console.log(JSON.stringify(status, null, 2));
+                else if (!status.networks.length) console.log('No workspace managed-network resources found.');
+                else {
+                    status.networks.forEach((record) => console.log(`${record.ownership}\t${record.physicalName}\t${record.logicalName || '-'}`));
+                }
+                break;
+            }
+            if (subcommand === 'prune' && options.length === 1) {
+                const report = adapter.prune();
+                for (const name of report.removed) console.log(`removed\t${name}`);
+                for (const record of report.preserved) console.log(`preserved\t${record.name}\t${record.reason}`);
+                break;
+            }
+            throw new Error('Usage: network status [--json] | network prune');
+        }
+        case 'edge': {
+            if (String(options[0] || '') !== 'apply' || options.length !== 2) {
+                throw new Error('Usage: edge apply <json-file>');
+            }
+            const result = applyEdgeDesiredStateFile(options[1]);
+            console.log(`Edge desired state active: ${result.selector.generation} (${result.selector.publicationState})`);
+            break;
+        }
         case 'restart': {
             const target = (options[0] || '').trim();
             if (target && target.toLowerCase() === 'router') {
@@ -411,13 +471,13 @@ async function handleCommand(args) {
                     console.error('restart router: start is not configured. Run: start <staticAgent> <port> first.');
                     break;
                 }
+                inactivateEdgeRoutingGeneration('cli-router-restart');
                 console.log('[restart] Restarting RoutingServer (containers untouched)...');
+                resolvePersistedRouterPort();
                 killRouterIfRunning();
                 await startWorkspace(undefined, undefined, {
-                    refreshComponentToken,
-                    ensureComponentToken,
                     enableAgent,
-                    killRouterIfRunning: () => { }
+                    killRouterIfRunning: () => { },
                 });
                 console.log('[restart] RoutingServer restarted.');
                 break;
@@ -452,12 +512,25 @@ async function handleCommand(args) {
                     return;
                 }
 
+                const profileResolution = resolveManifestRuntimeProfile(manifest, {
+                    agentName: `${registryRecord?.record?.repoName || resolved.repo}/${resolved.shortAgentName}`,
+                    profileName: registryRecord?.record?.profile || undefined,
+                    path: `manifest(${registryRecord?.record?.repoName || resolved.repo}/${resolved.shortAgentName})`,
+                });
+                const routerEndpoint = resolveRouterEndpoint(profileResolution.network.mode);
+
                 const agentRuntime = getRuntimeForAgent(manifest);
                 const containerName = registryRecord?.containerName || getAgentContainerName(resolved.shortAgentName, resolved.repo);
 
                 if (isSandboxRuntime(agentRuntime)) {
                     // Sandbox restart: stop process, then re-create via ensureAgentService
-                    const bwrapRunning = isBwrapProcessRunning(resolved.shortAgentName);
+                    const bwrapRunning = Boolean(
+                        registryRecord?.record?.instanceId
+                        && registryRecord?.record?.enableGeneration,
+                    ) && isBwrapProcessRunning(containerName, {
+                        instanceId: registryRecord.record.instanceId,
+                        enableGeneration: registryRecord.record.enableGeneration,
+                    });
                     const containerAlsoRunning = isContainerRunning(containerName);
                     const containerPresent = containerAlsoRunning || containerExists(containerName) || Boolean(registryRecord?.containerName);
                     if (!bwrapRunning && !containerPresent) {
@@ -466,8 +539,7 @@ async function handleCommand(args) {
                     }
 
                     if (!bwrapRunning && !containerAlsoRunning && containerPresent) {
-                        const runtime = getRuntime();
-                        console.log(`Starting (${runtime}) agent '${agentName}'...`);
+                        console.log(`Starting (${agentRuntime}) agent '${agentName}'...`);
                         try {
                             await withMaintenanceLock(containerName, {
                                 operation: 'start',
@@ -476,7 +548,32 @@ async function handleCommand(args) {
                                     repo: resolved.repo,
                                 },
                             }, async () => {
-                                execSync(`${runtime} start ${containerName}`, { stdio: 'inherit' });
+                                const result = ensureAgentService(resolved.shortAgentName, manifest, path.dirname(resolved.manifestPath), {
+                                    containerName,
+                                    alias: registryRecord?.record?.alias,
+                                    profileName: profileResolution.resolvedProfileName,
+                                    profileResolution,
+                                    routerEndpoint,
+                                });
+                                await waitForManifestReadiness({
+                                    key: `start:${resolved.shortAgentName}`,
+                                    label: resolved.shortAgentName,
+                                    kind: 'reinstall',
+                                    manifest,
+                                    route: {
+                                        container: result?.containerName || containerName,
+                                        hostPort: result?.hostPort || 0,
+                                        ...(result?.serviceTargets ? { serviceTargets: result.serviceTargets } : {}),
+                                    },
+                                });
+                                await activatePreparedRuntimeAfterReadiness({
+                                    result,
+                                    routeKey: registryRecord?.record?.alias || resolved.shortAgentName,
+                                    repoName: registryRecord?.record?.repoName || resolved.repo,
+                                    shortAgentName: resolved.shortAgentName,
+                                    agentPath: path.dirname(resolved.manifestPath),
+                                    alias: registryRecord?.record?.alias || '',
+                                });
                             });
                             console.log('✓ Agent started.');
                         } catch (e) {
@@ -495,63 +592,40 @@ async function handleCommand(args) {
                                 repo: resolved.repo,
                             },
                         }, async () => {
-                            // Stop existing process (bwrap or container if transitioning)
-                            if (bwrapRunning) {
-                                stopBwrapProcess(resolved.shortAgentName);
-                            }
-                            if (containerAlsoRunning) {
-                                try {
-                                    const { stopAndRemove } = await import('../services/docker/containerFleet.js');
-                                    stopAndRemove(containerName);
-                                } catch (_) {}
-                            }
-
                             const agentPath = path.dirname(resolved.manifestPath);
-                            const { containerName: newContainerName, hostPort, additionalServerPort } = ensureAgentService(resolved.shortAgentName, manifest, agentPath, {
+                            const restartResult = ensureAgentService(resolved.shortAgentName, manifest, agentPath, {
                                 containerName,
                                 alias: registryRecord?.record?.alias,
-                                forceRecreate: true
+                                forceRecreate: true,
+                                profileName: profileResolution.resolvedProfileName,
+                                profileResolution,
+                                routerEndpoint,
+                            });
+                            const {
+                                containerName: newContainerName,
+                                hostPort,
+                                serviceTargets,
+                            } = restartResult;
+                            await waitForManifestReadiness({
+                                key: `restart:${resolved.shortAgentName}`,
+                                label: resolved.shortAgentName,
+                                kind: 'reinstall',
+                                manifest,
+                                route: {
+                                    container: newContainerName,
+                                    hostPort: hostPort || 0,
+                                    ...(serviceTargets ? { serviceTargets } : {}),
+                                },
                             });
 
-                            if (!hostPort) {
-                                throw new Error(`Failed to resolve host port for restarted agent '${resolved.shortAgentName}'.`);
-                            }
-
-                            try {
-                                const routingFile = ROUTING_FILE;
-                                let cfg = { routes: {} };
-                                try { cfg = JSON.parse(fs.readFileSync(routingFile, 'utf8')) || { routes: {} }; } catch (_) {}
-                                cfg.routes = cfg.routes || {};
-                                const repoName = registryRecord?.record?.repoName || resolved.repo;
-                                const routeKey = registryRecord?.record?.alias || resolved.shortAgentName;
-                                cfg.routes[routeKey] = cfg.routes[routeKey] || {};
-                                cfg.routes[routeKey].container = newContainerName;
-                                cfg.routes[routeKey].hostPath = agentPath;
-                                cfg.routes[routeKey].repo = repoName;
-                                cfg.routes[routeKey].agent = resolved.shortAgentName;
-                                if (registryRecord?.record?.alias) cfg.routes[routeKey].alias = registryRecord.record.alias;
-                                cfg.routes[routeKey].hostPort = hostPort;
-                                if (additionalServerPort) {
-                                    cfg.routes[routeKey].additionalServerPort = additionalServerPort;
-                                } else {
-                                    delete cfg.routes[routeKey].additionalServerPort;
-                                }
-
-                                const staticAgent = String(cfg.static?.agent || '').trim();
-                                if (staticAgent) {
-                                    const matches = new Set([resolved.shortAgentName, `${repoName}/${resolved.shortAgentName}`, `${repoName}:${resolved.shortAgentName}`]);
-                                    if (registryRecord?.record?.alias) {
-                                        matches.add(registryRecord.record.alias);
-                                    }
-                                    if (matches.has(staticAgent)) {
-                                        cfg.static.container = newContainerName;
-                                    }
-                                }
-
-                                fs.writeFileSync(routingFile, JSON.stringify(cfg, null, 2));
-                            } catch (routingError) {
-                                throw new Error(`routing update failed: ${routingError?.message || routingError}`);
-                            }
+                            await activatePreparedRuntimeAfterReadiness({
+                                result: restartResult,
+                                routeKey: registryRecord?.record?.alias || resolved.shortAgentName,
+                                repoName: registryRecord?.record?.repoName || resolved.repo,
+                                shortAgentName: resolved.shortAgentName,
+                                agentPath,
+                                alias: registryRecord?.record?.alias || '',
+                            });
                         });
 
                         console.log(`✓ Agent restarted (${agentRuntime}).`);
@@ -559,8 +633,9 @@ async function handleCommand(args) {
                         console.error(`Failed to restart agent '${agentName}' via ${agentRuntime}: ${e.message}`);
                     }
                 } else {
-                    // Container restart: keep the watchdog from racing a split stop/start.
-                    const runtime = getRuntime();
+                    // Recreate through the managed transaction so a manual
+                    // restart cannot bypass endpoint, bridge, or ownership
+                    // validation on a stopped or legacy container.
                     const containerRunning = isContainerRunning(containerName);
                     const containerPresent = containerRunning || containerExists(containerName) || Boolean(registryRecord?.containerName);
                     if (!containerPresent) {
@@ -568,8 +643,8 @@ async function handleCommand(args) {
                         return;
                     }
 
-                    const runtimeAction = containerRunning ? 'restart' : 'start';
-                    console.log(`${containerRunning ? 'Restarting' : 'Starting'} (${runtime}) agent '${agentName}'...`);
+                    const runtimeAction = 'restart';
+                    console.log(`Restarting (${getRuntime()}) agent '${agentName}'...`);
                     try {
                         await withMaintenanceLock(containerName, {
                             operation: runtimeAction,
@@ -578,56 +653,39 @@ async function handleCommand(args) {
                                 repo: resolved.repo,
                             },
                         }, async () => {
-                            execSync(`${runtime} ${runtimeAction} ${containerName}`, { stdio: 'inherit' });
                             try {
-                                const { portMappings } = parseManifestPorts(manifest);
-                                const containerPortCandidates = portMappings
-                                    .map((mapping) => mapping?.containerPort)
-                                    .filter((port) => typeof port === 'number' && port > 0);
-                                if (!containerPortCandidates.includes(7000)) {
-                                    containerPortCandidates.push(7000);
-                                }
-                                const hostPort = resolveHostPortFromRuntime(containerName, containerPortCandidates);
-                                if (hostPort) {
-                                    let cfg = { routes: {} };
-                                    try { cfg = JSON.parse(fs.readFileSync(ROUTING_FILE, 'utf8')) || { routes: {} }; } catch (_) {}
-                                    cfg.routes = cfg.routes || {};
-                                    const repoName = registryRecord?.record?.repoName || resolved.repo;
-                                    const routeKey = registryRecord?.record?.alias || resolved.shortAgentName;
-                                    cfg.routes[routeKey] = cfg.routes[routeKey] || {};
-                                    cfg.routes[routeKey].container = containerName;
-                                    cfg.routes[routeKey].hostPath = path.dirname(resolved.manifestPath);
-                                    cfg.routes[routeKey].repo = repoName;
-                                    cfg.routes[routeKey].agent = resolved.shortAgentName;
-                                    if (registryRecord?.record?.alias) cfg.routes[routeKey].alias = registryRecord.record.alias;
-                                    cfg.routes[routeKey].hostPort = hostPort;
-                                    const activeProfile = getActiveProfile();
-                                    const profileConfig = getProfileConfig(`${repoName}/${resolved.shortAgentName}`, activeProfile);
-                                    const additionalServerPort = resolveProfileServer(manifest, profileConfig, { runtimeMode: 'container' });
-                                    if (additionalServerPort) {
-                                        cfg.routes[routeKey].additionalServerPort = additionalServerPort;
-                                    } else {
-                                        delete cfg.routes[routeKey].additionalServerPort;
-                                    }
-
-                                    const staticAgent = String(cfg.static?.agent || '').trim();
-                                    if (staticAgent) {
-                                        const matches = new Set([resolved.shortAgentName, `${repoName}/${resolved.shortAgentName}`, `${repoName}:${resolved.shortAgentName}`]);
-                                        if (registryRecord?.record?.alias) {
-                                            matches.add(registryRecord.record.alias);
-                                        }
-                                        if (matches.has(staticAgent)) {
-                                            cfg.static.container = containerName;
-                                        }
-                                    }
-
-                                    fs.writeFileSync(ROUTING_FILE, JSON.stringify(cfg, null, 2));
-                                }
+                                const result = ensureAgentService(resolved.shortAgentName, manifest, path.dirname(resolved.manifestPath), {
+                                    containerName,
+                                    alias: registryRecord?.record?.alias,
+                                    forceRecreate: true,
+                                    profileName: profileResolution.resolvedProfileName,
+                                    profileResolution,
+                                    routerEndpoint,
+                                });
+                                await waitForManifestReadiness({
+                                    key: `restart:${resolved.shortAgentName}`,
+                                    label: resolved.shortAgentName,
+                                    kind: 'reinstall',
+                                    manifest,
+                                    route: {
+                                        container: result?.containerName || containerName,
+                                        hostPort: result?.hostPort || 0,
+                                        ...(result?.serviceTargets ? { serviceTargets: result.serviceTargets } : {}),
+                                    },
+                                });
+                                await activatePreparedRuntimeAfterReadiness({
+                                    result,
+                                    routeKey: registryRecord?.record?.alias || resolved.shortAgentName,
+                                    repoName: registryRecord?.record?.repoName || resolved.repo,
+                                    shortAgentName: resolved.shortAgentName,
+                                    agentPath: path.dirname(resolved.manifestPath),
+                                    alias: registryRecord?.record?.alias || '',
+                                });
                             } catch (routeError) {
-                                console.warn(`[restart] Agent '${agentName}' restarted, but routing update failed: ${routeError?.message || routeError}`);
+                                throw new Error(`managed restart failed: ${routeError?.message || routeError}`);
                             }
                         });
-                        console.log(`✓ Agent ${containerRunning ? 'restarted' : 'started'}.`);
+                        console.log('✓ Agent restarted.');
                     } catch (e) {
                         console.error(`Failed to ${runtimeAction} container ${containerName}: ${e.message}`);
                     }
@@ -635,6 +693,8 @@ async function handleCommand(args) {
             } else {
                 const cfg = workspaceSvc.getConfig();
                 if (!cfg || !cfg.static || !cfg.static.agent || !cfg.static.port) { console.error('restart: start is not configured. Run: start <staticAgent> <port>'); break; }
+                resolvePersistedRouterPort();
+                inactivateEdgeRoutingGeneration('cli-workspace-restart');
                 console.log('[restart] Stopping Router and configured agents...');
                 killRouterIfRunning();
                 console.log('[restart] Stopping configured agent containers...');
@@ -642,7 +702,10 @@ async function handleCommand(args) {
                 if (list.length) { console.log('[restart] Stopped containers:'); list.forEach(n => console.log(` - ${n}`)); }
                 else { console.log('[restart] No containers to stop.'); }
                 console.log('[restart] Starting workspace...');
-                await startWorkspace(undefined, undefined, { refreshComponentToken, ensureComponentToken, enableAgent, killRouterIfRunning });
+                await startWorkspace(undefined, undefined, {
+                    enableAgent,
+                    killRouterIfRunning,
+                });
                 console.log('[restart] Done.');
             }
             break;
@@ -651,6 +714,7 @@ async function handleCommand(args) {
             showHelp();
             break;
         case 'shutdown': {
+            inactivateEdgeRoutingGeneration('cli-workspace-shutdown');
             console.log('[shutdown] Stopping RoutingServer...');
             killRouterIfRunning();
             console.log('[shutdown] Removing workspace containers...');
@@ -667,6 +731,7 @@ async function handleCommand(args) {
                 showHelp(['stop']);
                 break;
             }
+            inactivateEdgeRoutingGeneration('cli-workspace-stop');
             console.log('[stop] Stopping RoutingServer...');
             killRouterIfRunning();
             console.log('[stop] Stopping configured agent containers...');
@@ -679,6 +744,7 @@ async function handleCommand(args) {
             break;
         }
         case 'destroy':
+            inactivateEdgeRoutingGeneration('cli-workspace-destroy');
             console.log('[destroy] Stopping RoutingServer...');
             killRouterIfRunning();
             console.log('[destroy] Removing all workspace containers...');
@@ -699,6 +765,7 @@ async function handleCommand(args) {
             break;
         }
         case 'clean':
+            inactivateEdgeRoutingGeneration('cli-workspace-clean');
             console.log('[clean] Removing all workspace containers...');
             await destroyAll();
             break;

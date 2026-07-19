@@ -1,0 +1,38 @@
+{
+  "schemaVersion": 1,
+  "id": "routing-graph-v5",
+  "description": "Expected outer-namespace Router listeners after the isolated routing probe starts.",
+  "requireManagedContainers": true,
+  "rejectAdditionalContainers": true,
+  "requireProcessOwners": true,
+  "controlPorts": [8080, 8081],
+  "requiredContainers": [],
+  "forbiddenSockets": [],
+  "rules": [
+    {
+      "id": "router-public",
+      "namespacePattern": "^outer$",
+      "protocols": ["tcp"],
+      "ports": [8080],
+      "bindAddresses": ["0.0.0.0"],
+      "ownerPattern": "^(?:node|MainThread)$",
+      "effectiveInstance": "ploinky-core",
+      "reviewedSensitive": true,
+      "minMatches": 1,
+      "maxMatches": 1,
+      "rationale": "RoutingServer public/control listener is reachable by the fixed outer loopback publication."
+    },
+    {
+      "id": "router-private",
+      "namespacePattern": "^outer$",
+      "protocols": ["tcp"],
+      "ports": [8081],
+      "dynamicBindSet": "loopback-and-managed-gateways",
+      "ownerPattern": "^(?:node|MainThread)$",
+      "effectiveInstance": "ploinky-core",
+      "reviewedSensitive": true,
+      "minMatches": 1,
+      "rationale": "RoutingServer private listener is bound exactly once on loopback and on every exact current managed bridge gateway."
+    }
+  ]
+}

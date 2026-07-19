@@ -59,6 +59,32 @@ async function withCaptureServer(t, onRequest) {
     });
 }
 
+test('createAgentClient requires a valid nonempty PLOINKY_ROUTER_URL without fallback synthesis', async () => {
+    const previousUrl = process.env.PLOINKY_ROUTER_URL;
+    const previousPort = process.env.PLOINKY_ROUTER_PORT;
+    try {
+        delete process.env.PLOINKY_ROUTER_URL;
+        process.env.PLOINKY_ROUTER_PORT = '65535';
+        await assert.rejects(
+            () => createAgentClient('dpuAgent'),
+            /PLOINKY_ROUTER_URL is required/,
+        );
+
+        for (const invalid of ['', '   ', 'not-a-url', 'file:///tmp/router', 'http://user:pass@localhost:8080', 'http://localhost:8080/router']) {
+            process.env.PLOINKY_ROUTER_URL = invalid;
+            await assert.rejects(
+                () => createAgentClient('dpuAgent'),
+                /PLOINKY_ROUTER_URL/,
+            );
+        }
+    } finally {
+        if (previousUrl === undefined) delete process.env.PLOINKY_ROUTER_URL;
+        else process.env.PLOINKY_ROUTER_URL = previousUrl;
+        if (previousPort === undefined) delete process.env.PLOINKY_ROUTER_PORT;
+        else process.env.PLOINKY_ROUTER_PORT = previousPort;
+    }
+});
+
 test('createAgentClient sends no delegation header by default', async (t) => {
     let captured = null;
     await withCaptureServer(t, (req, body, res) => {
@@ -217,4 +243,62 @@ test('callToolWithoutWait applies the observer and returns without polling', asy
     assert.equal(result.metadata.backgroundTask.detached, true);
     assert.equal(result.metadata.backgroundTask.id, 'local-task');
     assert.equal(statusRequests, 0);
+});
+
+test('task observer status callbacks stay pinned to the client router', async (t) => {
+    let firstRouterPosts = 0;
+    let firstRouterGets = 0;
+    let secondRouterRequests = 0;
+    const firstRouter = http.createServer((req, res) => {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        if (req.method === 'GET') {
+            firstRouterGets += 1;
+            res.end(JSON.stringify({
+                task: { id: 'task-pinned', status: 'completed' },
+            }));
+            return;
+        }
+        firstRouterPosts += 1;
+        req.resume();
+        req.on('end', () => {
+            res.end(JSON.stringify({
+                jsonrpc: '2.0',
+                id: '1',
+                result: { metadata: { taskId: 'task-pinned', status: 'queued' } },
+            }));
+        });
+    });
+    const secondRouter = http.createServer((req, res) => {
+        secondRouterRequests += 1;
+        req.resume();
+        req.on('end', () => {
+            res.writeHead(500, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'wrong router' }));
+        });
+    });
+    const firstPort = await listen(firstRouter);
+    const secondPort = await listen(secondRouter);
+    const previousRouterUrl = process.env.PLOINKY_ROUTER_URL;
+    t.after(async () => {
+        if (previousRouterUrl === undefined) delete process.env.PLOINKY_ROUTER_URL;
+        else process.env.PLOINKY_ROUTER_URL = previousRouterUrl;
+        await Promise.all([close(firstRouter), close(secondRouter)]);
+    });
+
+    process.env.PLOINKY_ROUTER_URL = `http://127.0.0.1:${firstPort}`;
+    const client = await createAgentClient('asyncAgent');
+    process.env.PLOINKY_ROUTER_URL = `http://127.0.0.1:${secondPort}`;
+    const removeObserver = setAgentTaskObserver(async (task) => {
+        const status = await task.getTaskStatus();
+        assert.equal(status.id, 'task-pinned');
+        return { detached: true, id: 'local-pinned', description: 'Pinned task' };
+    });
+    t.after(removeObserver);
+
+    const result = await client.callToolWithoutWait('execute-task', { prompt: 'pin router' });
+
+    assert.equal(result.metadata.backgroundTask.id, 'local-pinned');
+    assert.equal(firstRouterPosts, 1);
+    assert.equal(firstRouterGets, 1);
+    assert.equal(secondRouterRequests, 0);
 });

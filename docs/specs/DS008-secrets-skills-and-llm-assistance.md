@@ -3,7 +3,7 @@ id: DS008
 title: Secrets, Skills, and LLM Assistance
 status: implemented
 owner: ploinky-team
-summary: Defines secret resolution, wildcard exposure rules, default-skills installation, repository-local skill boundaries, and the LLM helper inputs.
+summary: Defines secret resolution, wildcard exposure rules, default-skills installation, workspace-copied skill boundaries, and the LLM helper inputs.
 ---
 
 # DS008 Secrets, Skills, and LLM Assistance
@@ -16,7 +16,16 @@ Ploinky’s operator tooling depends on a shared secret-resolution model and on 
 
 Secret resolution must prefer process environment variables, then `.ploinky/.secrets`, then the nearest `.env` file found by walking upward from the current working directory. This precedence model applies across runtime resource templating, auth configuration, dependency helpers, and LLM settings discovery. Manifest env entries with `generatedSecret: true` are exceptions: they derive from `PLOINKY_DERIVED_MASTER_KEY` and ignore operator variables with the same name so Ploinky-owned and agent-owned generated secrets cannot drift away from the workspace derivation invariant. The narrow exceptions are generated entries with `explicitOverride: true`, which may accept an explicit operator value directly, and entries with `explicitOverrideRequires`, which may accept an explicit operator value only when all listed companion variables are also explicitly present. Ploinky injects `PLOINKY_ENV_SOURCE_<ENV_NAME>` as `generated` or `explicit` for generated env entries that resolve to a value. `generatedSecret: true` is the manifest form for a generated secret owned by the current agent and derives from the current repo, current agent, and env name. Shared service credentials that must be identical across agents use `sharedGeneratedSecret: true` and derive from the source env name, not custom repo/agent/name fields.
 
-Manifest profile defaults are the required baseline for non-sensitive required env entries. A required URL, hostname, public IP, realm, port, or similar topology value must be present in the active profile as a `default` or `value`, while required secrets may remain unset in the profile and resolve from secure sources or `generatedSecret: true`. This keeps profile startup reproducible without weakening operator overrides: `ploinky var`, process env, and `.env` values still take precedence over the manifest default.
+Required manifest env entries may deliberately omit a profile default when no
+safe deployment-independent value exists. Such an entry is an explicit
+operator/provider prerequisite, not an implicit empty value: profile readiness
+and runtime launch resolve encrypted `ploinky var` state, provider output,
+process env, and `.env`, then fail with the exact missing name if none supplies
+it. No URL, hostname, public IP, realm, port, or Origin is inferred. Safe
+portable values should still use `default` or `value`; secrets and
+`generatedSecret: true` retain their existing resolution rules.
+
+Startup config providers (DS015) are another writer for the encrypted workspace var store, but not another secret-ownership model. Provider subprocesses return an allowlisted JSON patch, and Ploinky validates and persists accepted values through the same encrypted `.ploinky/.secrets` store used by `ploinky var`. Provider output may include provider-owned external credentials when declared sensitive, but it must not overwrite `generatedSecret` or `sharedGeneratedSecret` names owned by any enabled graph node. Provider metadata under `.ploinky/config-providers/` is redacted and must not contain raw values.
 
 Workspace variable commands must preserve explicit operator control. `var` writes workspace-local values, `vars` lists known names, `echo` resolves aliases, and `expose` maps values into agent environments. Wildcard expansion is allowed, but the all-match `*` pattern must exclude variable names containing `API_KEY` or `APIKEY`. Sensitive values therefore require explicit manifest or operator intent rather than accidental blanket inclusion.
 
@@ -26,16 +35,16 @@ Managed repository update flows must refresh `AchillesCopilotBasicSkills` into e
 
 When the all-repository `update` flow refreshes workspace folders, each folder that contains `ploinky-skills-manifest.json` must refresh its skills from the manifest sources. The manifest is an array of repository objects shaped as `{ "url": "...", "name": "...", "branch": null, "skills": ["..."] }`; legacy string-array manifests are invalid. At each `update` run, Ploinky must clone missing manifest repositories into `.ploinky/repos/`, pull existing cached repositories there, and reconstruct `.agents/skills/` strictly from the selected `skills` lists. Duplicate skill names are resolved by manifest order so the last listed source wins. A failure to clone or update a manifest skill source, copy selected skills, or update `.gitignore` is a command failure, not just an informational warning.
 
-The repository-local skills under `.agents/skills/` must be listed consistently in `AGENTS.md` and in the HTML documentation, but they remain maintenance tooling. Host-project docs may summarize them, yet must keep the DS set focused on Ploinky itself rather than creating one DS file per copied skill.
+The Ploinky repository does not own a local skill catalog. Skills supplied by an external agent environment and skills copied into an operator workspace under `.agents/skills/` remain tooling outside the Ploinky runtime-module boundary. Host-project documentation and the DS set must stay focused on Ploinky itself rather than creating pages or DS files for those external or workspace-copied skills.
 
 `ploinky-shell` and invalid-command fallback logic depend on Achilles LLM tooling. The helper must load model-key definitions from Achilles config, inspect available API keys, and include `docs/ploinky-overview.md` as its system context. That file is therefore part of the implemented command-suggestion surface and must be updated whenever command semantics or operator guidance changes.
 
 ## Decisions & Questions
 
-### Question #1: Why are copied or local skills summarized instead of being expanded into host-project DS files?
+### Question #1: Why are external or workspace-copied skills excluded from host-project DS files?
 
 Response:
-The user-facing runtime is Ploinky, not the copied skill catalog. Summarizing the current skill catalog keeps repository maintenance discoverable without collapsing the host/runtime boundary that the GAMP rules require downstream projects to preserve.
+The user-facing runtime is Ploinky, not an external or operator-managed skill catalog. Keeping those skills outside the host documentation preserves the host/runtime boundary while `default-skills` and workspace manifests continue to manage copied skills as operator tooling.
 
 ### Question #2: Why is `docs/ploinky-overview.md` treated as part of the runtime contract?
 
@@ -46,6 +55,11 @@ The LLM helper in `cli/commands/llmSystemCommands.js` reads that file directly t
 
 Response:
 `default-skills` treats skill names from the selected source repository as owned, so it removes and replaces only those directories to preserve other operator-managed skill folders. `update`, by design, treats `ploinky-skills-manifest.json` as the explicit skill set for that workspace and therefore reconstructs `.agents/skills/` from scratch each run.
+
+### Question #4: Why do startup config providers persist through `.ploinky/.secrets` even for non-sensitive public values?
+
+Response:
+The existing manifest env resolver already consumes workspace vars from the encrypted store before applying profile defaults. Using the same store gives provider output one consistent precedence path and avoids a second public-topology state file that every runtime manager would need to understand. Redacted metadata gives operators provenance without turning public URLs or mixed config payloads into an unencrypted diagnostic channel.
 
 ## Conclusion
 

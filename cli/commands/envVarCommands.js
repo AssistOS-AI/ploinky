@@ -1,5 +1,4 @@
 import path from 'path';
-import crypto from 'crypto';
 import { showHelp } from '../services/help.js';
 import * as envSvc from '../services/secretVars.js';
 import { findAgent } from '../services/utils.js';
@@ -47,14 +46,8 @@ function handleVarsCommand() {
         if (!secrets.APP_NAME || !String(secrets.APP_NAME).trim()) {
             try { env.setEnvVar('APP_NAME', path.basename(process.cwd())); } catch (_) { }
         }
-        const tokens = ['WEBDASHBOARD_TOKEN'];
-        for (const t of tokens) {
-            if (!secrets[t] || !String(secrets[t]).trim()) {
-                try { env.setEnvVar(t, crypto.randomBytes(32).toString('hex')); } catch (_) { }
-            }
-        }
         const merged = env.parseSecrets();
-        const printOrder = ['APP_NAME', 'WEBDASHBOARD_TOKEN'];
+        const printOrder = ['APP_NAME'];
         const keys = Array.from(new Set([...printOrder, ...Object.keys(merged).sort()]));
         keys.forEach(k => console.log(`${k}=${merged[k] ?? ''}`));
     } catch (e) { console.error('Failed to list variables:', e.message); }

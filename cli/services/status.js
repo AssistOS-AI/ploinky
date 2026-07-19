@@ -373,7 +373,7 @@ export async function statusWorkspace() {
     const ssoStatus = gatherSsoStatus();
     printSsoStatusSummary(ssoStatus);
 
-    const routerPort = Number(ssoStatus.routerPort) || 8080;
+    const routerPort = ssoStatus.routerPort;
     const routerListening = await isPortListening(routerPort);
     printRouterStatus(routerPort, routerListening);
 

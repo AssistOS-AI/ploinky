@@ -421,3 +421,152 @@ fast_test_dependency_failure_blocks_router_startup() (
   assert_file_not_exists "$workspace/.ploinky/running/router.pid"
   fast_graph_assert_route_missing "$workspace" "root"
 )
+
+fast_test_startup_config_provider_preflight() (
+  set -euo pipefail
+
+  local workspace
+  local router_port
+  local repo_root
+  local provider_dir
+  local root_dir
+  local start_log
+  local echo_output
+  local metadata_file
+
+  workspace=$(mktemp -d -t ploinky-config-provider-XXXXXX)
+  trap "fast_graph_cleanup_workspace $(printf '%q' "$workspace")" EXIT
+
+  router_port=$(allocate_port)
+  fast_graph_init_workspace "$workspace" "$router_port"
+  repo_root="$workspace/.ploinky/repos/graphRepo"
+  provider_dir="$repo_root/provider"
+  root_dir="$repo_root/root"
+
+  mkdir -p "$provider_dir" "$root_dir"
+  fast_graph_write_http_service_script "$provider_dir"
+
+  cat >"$provider_dir/provider.js" <<'EOF'
+const fs = require('node:fs');
+const path = require('node:path');
+
+const workspaceRoot = process.env.PLOINKY_WORKSPACE_ROOT;
+if (!workspaceRoot) {
+  process.exit(2);
+}
+const markerDir = path.join(workspaceRoot, 'markers');
+fs.mkdirSync(markerDir, { recursive: true });
+fs.writeFileSync(
+  path.join(markerDir, 'provider-env.txt'),
+  process.env.PLOINKY_MASTER_KEY ? 'present' : 'absent',
+  'utf8'
+);
+process.stdout.write(JSON.stringify({
+  version: 1,
+  values: [
+    {
+      name: 'TEST_PROVIDER_VALUE',
+      value: 'from-shell-provider',
+      sensitive: false,
+      source: 'generated'
+    }
+  ],
+  warnings: []
+}));
+EOF
+
+  cat >"$provider_dir/manifest.json" <<'EOF'
+{
+  "lite-sandbox": true,
+  "container": "node:20-bullseye",
+  "start": "node /code/delayed-http.js",
+  "providesConfig": {
+    "command": "node provider.js",
+    "outputs": [
+      { "name": "TEST_PROVIDER_VALUE", "sensitive": false }
+    ]
+  },
+  "profiles": {
+    "default": {
+      "env": {
+        "RESPONSE_TEXT": "provider-ok"
+      }
+    }
+  }
+}
+EOF
+
+  cat >"$root_dir/root.js" <<'EOF'
+const http = require('node:http');
+const fs = require('node:fs');
+const path = require('node:path');
+
+const port = Number(process.env.PORT || 7000);
+const providerValue = process.env.TEST_PROVIDER_VALUE || '';
+const workspacePath = process.env.WORKSPACE_PATH || process.cwd();
+const markerDir = path.join(workspacePath, 'markers');
+fs.mkdirSync(markerDir, { recursive: true });
+fs.writeFileSync(path.join(markerDir, 'root-provider-value.txt'), providerValue, 'utf8');
+
+http.createServer((_req, res) => {
+  res.writeHead(200, { 'content-type': 'application/json' });
+  res.end(JSON.stringify({ ok: true, provider: providerValue }));
+}).listen(port, '0.0.0.0');
+EOF
+
+  cat >"$root_dir/manifest.json" <<'EOF'
+{
+  "lite-sandbox": true,
+  "container": "node:20-bullseye",
+  "start": "node /code/root.js",
+  "configProviders": [
+    { "agent": "graphRepo/provider", "profile": "default" }
+  ],
+  "profiles": {
+    "default": {
+      "env": [
+        { "name": "TEST_PROVIDER_VALUE", "required": true }
+      ]
+    }
+  }
+}
+EOF
+
+  (
+    cd "$workspace"
+    ploinky enable repo graphRepo >/dev/null 2>&1
+    ploinky enable agent graphRepo/root >/dev/null 2>&1
+  )
+
+  start_log="$workspace/.ploinky/logs/config-provider-start.log"
+  (
+    cd "$workspace"
+    PLOINKY_MASTER_KEY="shell-master-key" \
+    PLOINKY_STATIC_AGENT_READY_TIMEOUT_MS=12000 \
+    PLOINKY_STATIC_AGENT_READY_INTERVAL_MS=100 \
+    PLOINKY_STATIC_AGENT_READY_PROBE_TIMEOUT_MS=250 \
+    ploinky start root "$router_port" >"$start_log" 2>&1
+  )
+  fast_graph_wait_for_router_port "$router_port" "$start_log"
+
+  find_file_pattern_line "$start_log" "[start] Startup config providers applied: TEST_PROVIDER_VALUE" >/dev/null
+  assert_file_contains "$workspace/markers/provider-env.txt" "absent"
+  assert_file_contains "$workspace/markers/root-provider-value.txt" "from-shell-provider"
+  fast_graph_assert_http_route_contains "$workspace" "root" "/health" '"provider":"from-shell-provider"'
+
+  echo_output=$(
+    cd "$workspace"
+    PLOINKY_MASTER_KEY="shell-master-key" ploinky echo TEST_PROVIDER_VALUE
+  )
+  if [[ "$echo_output" != *"TEST_PROVIDER_VALUE=from-shell-provider"* ]]; then
+    echo "Expected ploinky echo to include provider value; got: $echo_output" >&2
+    return 1
+  fi
+
+  metadata_file="$workspace/.ploinky/config-providers/provider.json"
+  assert_file_contains "$metadata_file" "TEST_PROVIDER_VALUE"
+  if grep -q "from-shell-provider" "$metadata_file"; then
+    echo "Provider metadata must not contain raw output values." >&2
+    return 1
+  fi
+)

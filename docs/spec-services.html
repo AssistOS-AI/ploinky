@@ -452,14 +452,15 @@ function getExposedEnv(manifest) {
                     <div class="doc-section" id="routing">
                         <h2>Routing Server</h2>
                         <p><strong>File:</strong> <code>cli/server/RoutingServer.js</code></p>
-                        <p>HTTP reverse proxy that routes requests to agent containers. Supervised by a Watchdog with circuit breaker (5 restarts / 60 s window), exponential backoff, and health checks every 30 s.</p>
+                        <p>The sole in-box HTTP/SSE/WebSocket edge. RoutingServer owns fixed public/control port <code>8080</code>, un-published box-private port <code>8081</code>, and an unmounted Unix health socket. Watchdog supervises it with circuit breaking, exponential backoff, and Unix-socket health checks.</p>
+                        <p>Managed runtime ownership is generation-bound: container labels or schema-2 sandbox PID records carry the exact instance and enable generation, identity injection is mandatory, and recurring semantic probes inactivate routing before replacing a runtime whose socket ownership drifts.</p>
+                        <p>The rootless managed-bridge <code>host-gateway</code> lane is currently blocked because it terminates on the box outer-facing interface. The implementation remains fail-closed and installs no wider listener or compatibility proxy; DS004 Question #8 tracks the unresolved architecture choice.</p>
 
                         <h3>Served Routes</h3>
                         <pre><code>// Routes served by the RoutingServer:
 /webchat                   // Chat-style interface
 /dashboard                 // Management dashboard
 /status                    // Workspace status summary
-/health                    // Server health check
 /upload                    // File upload endpoint
 /blobs                     // Blob storage endpoint
 /workspace-files           // Workspace-confined file reads
@@ -467,53 +468,46 @@ function getExposedEnv(manifest) {
 /&lt;agent&gt;/...          // Transparent per-agent proxy
 /&lt;agent&gt;/mcp          // Per-agent MCP proxy with secure-wire minting
 /auth/*                    // Authentication routes
+/edge/topology/locator     // Authenticated one-locator no-store projection
 /MCPBrowserClient.js       // Browser MCP client script</code></pre>
 
                         <h3>Server Implementation</h3>
-                        <pre><code>// RoutingServer dispatches router-owned paths first.
-if (pathname === '/health') return health();
-if (pathname.startsWith('/auth/')) return auth();
-if (pathname === '/workspace-files' || pathname.startsWith('/workspace-files/')) {
-    return serveWorkspaceFileRequest(req, res);
-}
-if (pathname === '/mcp') return handleRouterMcp(req, res);
+                        <pre><code>// One shared resolver is used for HTTP, SSE, and WebSocket.
+const classification = classifyListenerAndExactHost(req);
+const lease = activeGeneration.capture(classification);
+const plan = resolveClosedRouteSurface(lease, req.url);
 
-// After router-owned paths, the first path segment is a route key.
-const agentName = extractAgentName(pathname, routing.routes);
-if (agentName) {
-    const route = routing.routes[agentName];
-    const upstreamPath = stripMountPrefix(pathname, agentName);
-    if (upstreamPath === '/mcp') {
-        return handleAgentMcpRequest(req, res, route, agentName);
-    }
-    return proxyHttpPassthrough(req, res, route.hostPort, upstreamPath);
-}
+// A service Host canonicalizes to its declared externalPrefix.
+// Provider and HttpRouteAccessPolicy independently admit it.
+await authorizeRoutePlan(plan, req);
 
-if (pathname === '/' || pathname === '/index.html') {
-    return redirect(`/${routing.static.agent}/index.html`);
-}</code></pre>
+// Target/policy/enablement changes revoke every uncommitted dial.
+if (!activeGeneration.revalidate(lease)) {
+    return fail(503, 'ROUTING_GENERATION_INACTIVE');
+}
+return proxyUsingGenerationTarget(plan, req, res);</code></pre>
 
                         <h3>Routing Configuration</h3>
-                        <pre><code>// .ploinky/routing.json
+                        <pre><code>// Candidate input; inert until coordinated exact-byte apply
 {
-    "port": 8088,
-    "static": {
-        "agent": "demo",
-        "container": "ploinky_basic_demo_myproject_a3f1c9"
-    },
+    "static": { "agent": "demo" },
     "routes": {
         "agent1": {
             "container": "ploinky_basic_agent1_myproject_a3f1c9",
-            "hostPort": 7001,
-            "hostPath": ".ploinky/repos/basic/agent1"
-        },
-        "agent2": {
-            "container": "ploinky_basic_agent2_myproject_a3f1c9",
-            "hostPort": 7002,
-            "hostPath": ".ploinky/repos/basic/agent2"
+            "instance": "...",
+            "enableGeneration": "...",
+            "targets": {
+                "primary": "private-target",
+                "dashboard": "private-target"
+            }
         }
     }
-}</code></pre>
+}
+
+// Only the installed immutable authorization generation permits a dial.
+// Admin/supervisor status can distinguish authorization, topology
+// configuration, and topology publication ids without source bytes.
+// The browser locator exposes only configuration/publication ids.</code></pre>
 
                         <h3>Dependency System</h3>
                         <pre><code>// Global dependencies (globalDeps/) are merged with each

@@ -6,19 +6,35 @@ import { resolveEnabledAgentRecord } from '../services/agents.js';
 import { findAgent } from '../services/utils.js';
 import { resolveMaxTtlSeconds } from './mcp-proxy/userDelegationGrant.js';
 import { normalizeHttpRouteAccess } from './policy/HttpRouteAccessDecision.js';
+import { loadActiveEdgeRoutingGeneration } from '../services/edgeGeneration.js';
+import {
+    normalizeHttpServicePort,
+    serviceSlug,
+} from '../services/httpServicePortConfig.js';
 
 const DEFAULT_DELEGATION_TTL_SECONDS = 1800;
 const REMOVED_SERVICE_SPEC_FIELDS = ['auth', 'mode', ['force', 'Guest'].join('')];
 
+function resolveCurrentWorkspaceRoot() {
+    return String(process.env.PLOINKY_WORKSPACE_ROOT || '').trim() || PLOINKY_WORKSPACE_ROOT;
+}
+
 export function loadRoutingConfig() {
-    const dynamicRoutingFile = process.env.PLOINKY_ROUTING_FILE
-        || path.join(PLOINKY_WORKSPACE_ROOT, '.ploinky', 'routing.json');
-    const routingFile = fs.existsSync(dynamicRoutingFile) ? dynamicRoutingFile : ROUTING_FILE;
     try {
-        return JSON.parse(fs.readFileSync(routingFile, 'utf8')) || {};
+        return loadActiveEdgeRoutingGeneration().generation.routing || {};
     } catch (_) {
         return {};
     }
+}
+
+export function loadActiveRoutingState() {
+    const active = loadActiveEdgeRoutingGeneration();
+    return {
+        generation: active.selector.generation,
+        routing: active.generation.routing || { routes: {} },
+        manifests: active.generation.manifests || {},
+        snapshot: active.generation,
+    };
 }
 
 function readJsonFileIfExists(filePath) {
@@ -240,7 +256,8 @@ function normalizeServiceSpec(routeKey, route, spec) {
             throw new Error(`HTTP service spec field '${field}' was removed; declare access: public | guest | authenticated`);
         }
     }
-    const slug = String(spec.slug || spec.name || '').trim().replace(/^\/+|\/+$/g, '');
+    const slug = serviceSlug(spec, `HTTP service '${routeKey}'`);
+    const port = normalizeHttpServicePort(spec.port, `HTTP service '${slug || routeKey}'.port`);
     const access = normalizeServiceAccess(spec.access);
     if (!access) {
         throw new Error(`HTTP service '${slug || routeKey}' requires access: public | guest | authenticated`);
@@ -256,6 +273,8 @@ function normalizeServiceSpec(routeKey, route, spec) {
     return {
         routeKey,
         route,
+        ...(slug ? { slug } : {}),
+        port,
         externalPrefix,
         internalPrefix,
         access,
@@ -271,8 +290,10 @@ export { normalizeServiceSpec };
 
 const loggedInvalidServiceSpecs = new Set();
 
-function collectRouteServiceSpecs(routeKey, route, routes) {
-    const manifest = readEnabledAgentManifest(routeKey, routes) || {};
+function collectRouteServiceSpecs(routeKey, route, routes, manifests = null) {
+    const manifest = manifests && Object.prototype.hasOwnProperty.call(manifests, routeKey)
+        ? manifests[routeKey]
+        : readEnabledAgentManifest(routeKey, routes) || {};
     const collected = [];
     for (const { spec } of [
         ...asServiceSpecEntries(route?.httpServices),
@@ -292,22 +313,51 @@ function collectRouteServiceSpecs(routeKey, route, routes) {
     return collected;
 }
 
-export function collectHttpServiceRoutes(routing = loadRoutingConfig()) {
-    const routes = routing?.routes || {};
+export function collectHttpServiceRoutes(routing = null, { manifests = null } = {}) {
+    let selectedRouting = routing;
+    let selectedManifests = manifests;
+    if (!selectedRouting) {
+        try {
+            const active = loadActiveRoutingState();
+            selectedRouting = active.routing;
+            selectedManifests = active.manifests;
+        } catch (_) {
+            return [];
+        }
+    }
+    const routes = selectedRouting?.routes || {};
     const definitions = [];
+    const prefixes = new Set();
     for (const [routeKey, route] of Object.entries(routes)) {
         if (!route || route.disabled) continue;
-        definitions.push(...collectRouteServiceSpecs(routeKey, route, routes));
+        for (const definition of collectRouteServiceSpecs(routeKey, route, routes, selectedManifests)) {
+            if (prefixes.has(definition.externalPrefix)) {
+                throw new Error(`duplicate HTTP service prefix '${definition.externalPrefix}' in active generation`);
+            }
+            prefixes.add(definition.externalPrefix);
+            definitions.push(definition);
+        }
     }
     return definitions;
 }
 
-export function resolveHttpServiceRoute(pathname, routing = loadRoutingConfig()) {
+export function resolveHttpServiceRoute(pathname, routing = null, options = {}) {
     const normalizedPathname = String(pathname || '');
-    return collectHttpServiceRoutes(routing).find((definition) =>
+    return collectHttpServiceRoutes(routing, options).find((definition) =>
         normalizedPathname === definition.externalPrefix.replace(/\/$/, '')
         || normalizedPathname.startsWith(definition.externalPrefix)
     ) || null;
+}
+
+export function resolveHttpServiceTarget(definition, routing) {
+    if (!definition || !routing || typeof routing !== 'object') return null;
+    const route = routing.routes?.[definition.routeKey];
+    if (!route || route.disabled) return null;
+    const hostPort = definition.port === null
+        ? Number(route.hostPort || 0)
+        : Number(route.serviceTargets?.[String(definition.port)] || 0);
+    if (!Number.isSafeInteger(hostPort) || hostPort < 1 || hostPort > 65535) return null;
+    return Object.freeze({ hostname: '127.0.0.1', hostPort, containerPort: definition.port || null });
 }
 
 export function buildServiceAgentPath(pathname, search = '', externalPrefix, internalPrefix) {

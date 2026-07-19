@@ -2,8 +2,10 @@ import fs from 'fs';
 import path from 'path';
 import { PROFILE_FILE, PLOINKY_CWD, PLOINKY_DIR, PLOINKY_WORKSPACE_ROOT, REPOS_DIR } from './config.js';
 import { validateSecrets } from './secretInjector.js';
-import { validateManifestEnvProfileCompleteness } from './secretVars.js';
+import { collectManifestEnv, validateManifestEnvProfileCompleteness } from './secretVars.js';
 import { debugLog, findAgent } from './utils.js';
+import { effectiveManifestNetwork, validateManifestNetworks } from './networkContract.js';
+import { validateManifestHttpServices } from './httpServicePortConfig.js';
 
 // Discover all valid profile names from installed agent manifests.
 // Any profile name declared in a manifest's "profiles" section is valid.
@@ -175,9 +177,11 @@ export function mergeProfiles(defaultProfile, activeProfile) {
         merged.network = activeProfile.network;
     }
 
-    // Merge additional server port - active replaces default because it selects one upstream.
-    if (activeProfile.additionalServerPort !== undefined) {
-        merged.additionalServerPort = activeProfile.additionalServerPort;
+    // Startup config providers are profile-selected lifecycle inputs. The
+    // active profile replaces the default list so deployment profiles can opt
+    // into providers without changing development startup.
+    if (activeProfile.configProviders !== undefined) {
+        merged.configProviders = activeProfile.configProviders;
     }
 
     return merged;
@@ -197,6 +201,96 @@ export function getActiveProfile() {
         }
     } catch (_) {}
     return 'default';
+}
+
+function profileNotFoundError(agentName, profileName, profiles) {
+    const availableProfiles = Object.keys(profiles || {}).sort();
+    const error = new Error(
+        `[profile] ${agentName}: profile '${profileName}' not found. Available: ${availableProfiles.join(', ') || '(none)'}`,
+    );
+    error.code = 'PLOINKY_PROFILE_NOT_FOUND';
+    return error;
+}
+
+/**
+ * Resolve one atomic profile selection from an already-loaded manifest.
+ * Callers must use resolvedProfileName, profileConfig, and network together.
+ */
+export function resolveManifestProfile(manifest, requestedProfileName, {
+    agentName = 'agent',
+    explicit = false,
+    path: manifestPath = `manifest(${agentName})`,
+} = {}) {
+    const source = manifest && typeof manifest === 'object' && !Array.isArray(manifest)
+        ? manifest
+        : {};
+    validateManifestHttpServices(source, { label: manifestPath });
+    validateManifestNetworks(source, { path: manifestPath });
+
+    const profiles = source.profiles && typeof source.profiles === 'object' && !Array.isArray(source.profiles)
+        ? source.profiles
+        : {};
+    const requestedProfile = String(requestedProfileName || 'default').trim().toLowerCase() || 'default';
+    const hasProfiles = Object.keys(profiles).length > 0;
+
+    if (!hasProfiles) {
+        if (explicit && requestedProfile !== 'default') {
+            throw profileNotFoundError(agentName, requestedProfile, profiles);
+        }
+        return {
+            requestedProfileName: requestedProfile,
+            resolvedProfileName: 'default',
+            profileConfig: null,
+            network: effectiveManifestNetwork(source, 'default', { path: manifestPath }),
+        };
+    }
+
+    const defaultProfile = profiles.default;
+    if (!defaultProfile) {
+        throw new Error(`Agent ${agentName} missing required 'default' profile in manifest.json`);
+    }
+
+    const requestedExists = Object.prototype.hasOwnProperty.call(profiles, requestedProfile);
+    if (!requestedExists && explicit) {
+        throw profileNotFoundError(agentName, requestedProfile, profiles);
+    }
+    const resolvedProfileName = requestedExists ? requestedProfile : 'default';
+    const selectedProfile = profiles[resolvedProfileName];
+    const network = effectiveManifestNetwork(source, resolvedProfileName, { path: manifestPath });
+    const mergedProfile = resolvedProfileName === 'default'
+        ? defaultProfile
+        : mergeProfiles(defaultProfile, selectedProfile);
+
+    return {
+        requestedProfileName: requestedProfile,
+        resolvedProfileName,
+        profileConfig: { ...mergedProfile, network },
+        network,
+    };
+}
+
+/**
+ * Resolve the effective runtime profile with stable precedence. CLI options and
+ * persisted records are strict selections; the global profile may fall back to
+ * the manifest's required default profile when it is not declared by an agent.
+ */
+export function resolveManifestRuntimeProfile(manifest, {
+    agentName = 'agent',
+    profileName,
+    persistedProfileName,
+    fallbackProfileName = getActiveProfile(),
+    path: manifestPath = `manifest(${agentName})`,
+} = {}) {
+    const optionProfileName = String(profileName || '').trim().toLowerCase();
+    const recordProfileName = String(persistedProfileName || '').trim().toLowerCase();
+    const globalProfileName = String(fallbackProfileName || 'default').trim().toLowerCase() || 'default';
+    const explicitProfileName = optionProfileName || recordProfileName;
+
+    return resolveManifestProfile(manifest, explicitProfileName || globalProfileName, {
+        agentName,
+        explicit: Boolean(explicitProfileName),
+        path: manifestPath,
+    });
 }
 
 /**
@@ -243,36 +337,21 @@ export function setActiveProfile(profileName) {
  */
 export function getProfileConfig(agentName, profileName) {
     try {
-        const { manifestPath } = findAgent(agentName);
+        const resolvedAgent = findAgent(agentName);
+        const { manifestPath } = resolvedAgent;
         const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
-        const profiles = manifest?.profiles;
-
-        // If no profiles section exists, agent uses legacy mode (no profile config)
-        if (!profiles || Object.keys(profiles).length === 0) {
-            return null;
-        }
-
-        // If profiles exist, a 'default' profile is required for proper isolation
-        const defaultProfile = profiles.default;
-        if (!defaultProfile) {
-            throw new Error(`Agent ${agentName} missing required 'default' profile in manifest.json`);
-        }
-
-        // Get active profile name
-        const activeProfileName = profileName || getActiveProfile();
-
-        // If requesting default or no active profile config exists, return default
-        if (activeProfileName === 'default' || !profiles[activeProfileName]) {
-            return defaultProfile;
-        }
-
-        // Merge default with active profile (active overrides default)
-        const activeProfile = profiles[activeProfileName];
-        return mergeProfiles(defaultProfile, activeProfile);
+        return resolveManifestProfile(manifest, profileName || getActiveProfile(), {
+            agentName,
+            path: `manifest(${agentName})`,
+        }).profileConfig;
     } catch (err) {
         debugLog(`getProfileConfig: ${err.message}`);
         // Re-throw missing profile errors so they bubble up
-        if (err.message.includes('missing required')) {
+        if (err.message.includes('missing required')
+            || err.code === 'PLOINKY_NETWORK_CONTRACT_INVALID'
+            || err.code === 'PLOINKY_REMOVED_MANIFEST_FIELD'
+            || err.code === 'PLOINKY_MANIFEST_HTTP_SERVICE_INVALID'
+            || err.code === 'PLOINKY_PROFILE_NOT_FOUND') {
             throw err;
         }
         return null;
@@ -292,7 +371,8 @@ export function validateProfile(agentName, profileName) {
     let config = null;
 
     try {
-        const { manifestPath } = findAgent(agentName);
+        const resolvedAgent = findAgent(agentName);
+        const { manifestPath } = resolvedAgent;
         const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
 
         if (!manifest.profiles) {
@@ -319,6 +399,17 @@ export function validateProfile(agentName, profileName) {
             profileName,
         });
         issues.push(...envProfileValidation.issues);
+        const envResolution = collectManifestEnv(manifest, {
+            profileConfig: config,
+            agentName: resolvedAgent.shortAgentName,
+            repoName: resolvedAgent.repo,
+        });
+        for (const spec of envResolution.missing) {
+            const rendered = spec.sourceName && spec.sourceName !== spec.insideName
+                ? `${spec.insideName} (source: ${spec.sourceName})`
+                : spec.insideName;
+            issues.push(`Missing required environment variable: ${rendered}`);
+        }
 
         // Validate required secrets
         if (config.secrets && Array.isArray(config.secrets)) {

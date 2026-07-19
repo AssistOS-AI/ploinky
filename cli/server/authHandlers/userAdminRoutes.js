@@ -1,4 +1,5 @@
 import { createLocalAuthUser, deleteLocalAuthUser, getSession as getLocalSession, getSessionCookieMaxAge as getLocalSessionCookieMaxAge, isLocalAdminUser, listLocalAuthRoles, listLocalAuthUsers, updateLocalAuthUser } from '../auth/localService.js';
+import { verifyAdminMutationRequest } from '../adminControlSecurity.js';
 import { readRouterSettings, updateRouterSettings } from '../../services/routerSettings.js';
 import { buildCookie, LOCAL_AUTH_COOKIE_NAME, parseCookies, readJsonBody, sendJson } from './shared.js';
 import { resolveAuthContextForRouteKey } from './authContext.js';
@@ -97,13 +98,19 @@ async function readUserAdminBody(req) {
     }
 }
 
-export async function handleUserAdminRoutes(req, res, parsedUrl) {
+export async function handleUserAdminRoutes(req, res, parsedUrl, { routePlan = null } = {}) {
     const pathname = parsedUrl.pathname || '/';
     const route = parseUserAdminPath(pathname);
     if (!route) return false;
 
     const method = (req.method || 'GET').toUpperCase();
-    const authContext = resolveAuthContextForRouteKey(route.agent);
+    if (routePlan?.lease?.commit && routePlan.lease.commit() !== true) {
+        sendJson(res, 503, { ok: false, error: 'edge_generation_changed' });
+        return true;
+    }
+    const authContext = resolveAuthContextForRouteKey(route.agent, {
+        snapshot: routePlan?.snapshot || routePlan?.lease?.snapshot || null,
+    });
     if (authContext.mode !== 'local' || !authContext.policy?.usersVar) {
         sendUserAdminError(res, 'local_auth_disabled');
         return true;
@@ -119,6 +126,20 @@ export async function handleUserAdminRoutes(req, res, parsedUrl) {
     if (!isLocalAdminUser(session.user)) {
         sendUserAdminError(res, 'admin_required');
         return true;
+    }
+    req.user = session.user;
+    req.session = session;
+    req.sessionId = sessionId;
+    if (['POST', 'PATCH', 'DELETE'].includes(method)) {
+        const mutationDecision = verifyAdminMutationRequest(req, sessionId);
+        if (!mutationDecision.ok) {
+            sendJson(res, 403, {
+                ok: false,
+                error: mutationDecision.code.toLowerCase(),
+                message: 'Exact control Origin and CSRF proof are required.',
+            });
+            return true;
+        }
     }
 
     try {
@@ -143,6 +164,10 @@ export async function handleUserAdminRoutes(req, res, parsedUrl) {
             }
             if (method === 'PATCH') {
                 const body = await readUserAdminBody(req);
+                if (routePlan?.lease?.commit && routePlan.lease.commit() !== true) {
+                    sendJson(res, 503, { ok: false, error: 'edge_generation_changed' });
+                    return true;
+                }
                 const settings = updateRouterSettings({
                     loginBrandingName: body?.loginBrandingName
                 });
@@ -172,6 +197,10 @@ export async function handleUserAdminRoutes(req, res, parsedUrl) {
 
         if (method === 'POST' && !route.userId) {
             const body = await readUserAdminBody(req);
+            if (routePlan?.lease?.commit && routePlan.lease.commit() !== true) {
+                sendJson(res, 503, { ok: false, error: 'edge_generation_changed' });
+                return true;
+            }
             const user = createLocalAuthUser({
                 policy: authContext.policy,
                 username: body?.username,
@@ -190,6 +219,10 @@ export async function handleUserAdminRoutes(req, res, parsedUrl) {
 
         if (method === 'PATCH' && route.userId) {
             const body = await readUserAdminBody(req);
+            if (routePlan?.lease?.commit && routePlan.lease.commit() !== true) {
+                sendJson(res, 503, { ok: false, error: 'edge_generation_changed' });
+                return true;
+            }
             const user = updateLocalAuthUser({
                 policy: authContext.policy,
                 id: route.userId,
@@ -208,6 +241,10 @@ export async function handleUserAdminRoutes(req, res, parsedUrl) {
         }
 
         if (method === 'DELETE' && route.userId) {
+            if (routePlan?.lease?.commit && routePlan.lease.commit() !== true) {
+                sendJson(res, 503, { ok: false, error: 'edge_generation_changed' });
+                return true;
+            }
             const user = deleteLocalAuthUser({
                 policy: authContext.policy,
                 id: route.userId

@@ -3,7 +3,7 @@ id: DS014
 title: Router Access Control - HTTP Route Access and MCP Tool Policy
 status: implemented
 owner: ploinky-team
-summary: Defines HTTP route access and MCP tool policy, their fail-closed evaluation, administrative commands, runtime manifest composition, and corrupt-state handling.
+summary: Defines fail-closed HTTP/MCP policy compilation into exact-byte immutable generations, pathname-complete partitions, private policy composition, and coordinated administration.
 ---
 
 # DS014 Router Access Control: HTTP Route Access and MCP Tool Policy
@@ -41,32 +41,70 @@ An HTTP route decision may come from four sources:
 
 | Source | Ownership | Notes |
 | --- | --- | --- |
-| Persisted `httpRoutes` | Operator/admin policy in `policy-state.json` | Written by `http.route.set`; listed by `http.route.list`. |
-| Manifest `routerAccess.httpRoutes` | Agent self-declaration | Evaluated at runtime from enabled manifests; never written to policy state. Omitted `access` is `authenticated`; explicit values must be `public`, `guest`, or `authenticated`. |
-| Manifest `httpServices` | Agent service declaration | Converted to route access for the external service prefix. |
+| Persisted `httpRoutes` | Operator/admin policy in `policy-state.json` | Staged by `http.route.set`; effective only after coordinated generation apply. |
+| Manifest `routerAccess.httpRoutes` | Agent self-declaration | Captured from exact manifest bytes during coordinated apply; omitted `access` is `authenticated`. |
+| Manifest `httpServices` | Agent service declaration | The Host-selected service is canonicalized to its external prefix before its provider is compiled. |
 | Route default | Router fallback for ordinary transparent routes | Preserves static-agent deference: `auth.mode: "none"` behind a user-authenticated static agent becomes `authenticated`; otherwise it becomes `guest`. Defaults never produce `public`. |
 
 When entries overlap, the router chooses the most restrictive access: `authenticated` over `guest` over `public`. `public` allows only `GET` and `HEAD`; write methods receive `403 PUBLIC_ROUTE_WRITE_DENIED` before proxying. `guest` accepts an existing local or SSO user session first; only requests without a user session mint or reuse `ploinky_guest`. `authenticated` requires a real user session and rejects guest-session JWTs even if they arrive in the `ploinky_jwt` cookie.
 
 `HttpRouteAccessPath` normalizes route paths. It requires a leading slash; strips query and fragment data; rejects NUL bytes, URL schemes, backslashes, double slashes, encoded slash or backslash bytes, dot segments, root-only paths, non-trailing wildcards, and router-owned internal paths. A trailing `/*` is a prefix match; other `*` usage is invalid. Literal and percent-encoded `__agent` segments are internal and denied at write time, policy evaluation time, the `RoutingServer` request front door, and the synthesized-upstream guard for HTTP services.
 
-### Why Manifest Routes Are Never Persisted
+### Why Manifest Routes Are Never Copied Into Operator Policy
 
-Manifest `routerAccess.httpRoutes` are runtime declarations, evaluated fresh from the enabled agent manifest using the provider cache. They are never written into `policy-state.json`, because persisting them would:
+Manifest `routerAccess.httpRoutes` are generation inputs captured from exact
+enabled-manifest bytes. They are never copied into `policy-state.json`, because
+doing so would:
 
 - mix operator policy with agent-owned declarations in one collection;
 - leave stale copies after an agent redeploy or manifest edit;
 - make removal ambiguous when an agent or declaration disappears.
 
-Persisted `httpRoutes` are exclusively operator/admin policy written through `POST /policy/command`. Manifest and service declarations compose in memory with persisted entries on every decision, and the restrictive merge rule lets an operator entry tighten any agent declaration without letting an agent weaken operator policy.
+Persisted `httpRoutes` remain exclusively operator/admin policy staged through
+`POST /policy/command`. Manifest, service, route-default, and persisted inputs
+compose during coordinated compilation. The installed immutable route-and-policy
+authorization generation—not a timestamp cache, topology publication counter,
+or raw file read—is the only authorization state.
 
 ### HTTP Services
 
-Declared HTTP services use the same evaluator as ordinary routes. A valid service declaration must provide an external prefix, an internal upstream prefix, and `access` with one of `public`, `guest`, or `authenticated`. Invalid service declarations are logged and only that service is left unmounted; collection never throws into the request path.
+Declared HTTP services use the same evaluator as ordinary routes. A valid
+service declaration must provide a validated slug, external prefix, internal
+upstream prefix, optional integer target port, and `access` with one of
+`public`, `guest`, or `authenticated`. A dedicated Host selects one declared
+service and canonicalizes the request to that service's external prefix before
+`createHttpServiceProvider` is evaluated. Invalid, ambiguous, or unresolved
+declarations keep every affected selector inactive.
 
 The manifest-route omitted-access default does not apply to HTTP services. A service without explicit `access` is invalid and is not mounted.
 
 `public` services run without router identity. `guest` services use an existing local or SSO user session when present, otherwise they mint or reuse a scoped guest session. `authenticated` services require user authentication using the owning route policy first and the static route policy as fallback. Only authenticated services may receive user delegation grants. Authenticated and guest services receive scoped `__http_service__` invocation metadata unless the manifest disables invocation minting.
+
+After a guest service's host and effective policy are validated, HTTP, SSE, and
+WebSocket execution also receives one Router-owned
+`x-ploinky-rate-source: <64 lowercase hex>` abuse-control partition. It is a
+route-scoped HMAC of the canonical Cloudflare source address for an active
+public host, or of the Router-observed TCP peer for a local alias. It is stable
+across guest-cookie replacement for the same transport source, contains no raw
+address/session/user value, and is not an authorization input. Missing or
+malformed public-host source metadata fails before dial. Caller-supplied
+partitions and raw source headers are stripped, and the narrow ingestion proxy
+must remove the Router partition before its application upstream.
+
+Private service execution on listener `8081` does not bypass this evaluator. Its
+canonical POST partitions must have an effective `authenticated` decision and
+the caller must separately match the exact current-instance/current-enable-
+generation ACL with a request-bound replay-protected assertion. A valid user
+session without the ACL, or a valid assertion without authenticated policy,
+fails before dial.
+
+Compilation is pathname-complete. For every selected host namespace it builds
+representatives for every match-set partition formed by intersecting exact and
+wildcard provider paths, records the winning provider, route key, effective
+guest scope, and GET/HEAD/write outcome, and rejects access-relevant equal-rank
+ambiguity only when execution metadata differs. Equivalent public ties carry no
+execution metadata; guest ties compare effective scope; authenticated ties
+compare route key.
 
 ### MCP Tool Policy
 
@@ -84,12 +122,17 @@ There is one delegated-user path: a verified source agent may call an `authentic
 
 ### Administrative Surface
 
-`POST /policy/command` is the authenticated administrative endpoint. It is router-owned and cannot be opened through HTTP route access. Agents cannot present a browser session cookie and are rejected.
+`POST /policy/command` is the authenticated administrative endpoint. It is
+router-owned, local-control-host-only, and cannot be opened through HTTP route
+access. It requires a real admin/share-authorized user session as specified
+below plus exact Origin/CSRF for mutations. Agent Assertions, Router Requests,
+delegations, private assertions, and LiveKit JWTs are rejected as admin
+credentials.
 
 | Command | Caller | Effect |
 | --- | --- | --- |
-| `http.route.set` | admin, or a normal user approved by the owning agent's share authorizer | Add or update a persisted route entry. |
-| `http.route.remove` | admin, or share-authorized user | Remove a persisted route entry. |
+| `http.route.set` | admin, or a normal user approved by the owning agent's share authorizer | Inactivate affected selectors, stage the entry, compile and atomically install a valid generation before acknowledgement. |
+| `http.route.remove` | admin, or share-authorized user | Inactivate affected selectors, stage removal, and atomically install the valid replacement generation before acknowledgement. |
 | `http.route.check` | authenticated browser user | Return the effective decision for one path and method using the same singleton evaluator and providers as dispatch. |
 | `http.route.list` | authenticated browser user | Return only persisted operator entries. |
 | `mcp.policy.set` | admin only | Set access for an agent tool. |
@@ -104,15 +147,33 @@ The router-owned Marketplace API under `/api/marketplace` is not administered th
 
 `mcp-config.json` tool tags seed defaults only. Empty or absent tags seed `authenticated`; `internal` seeds `internal`; `admin` seeds `admin`; mixed or unknown access tags seed no entry, so enforcement denies until an admin sets policy. Persisted operator entries always win and are never overwritten by bootstrap.
 
-`data/router-security/policy-state.json` uses schema `router-policy` under the workspace `.ploinky/` directory. Reads are cached by the store version. Writes are atomic. A corrupt or schema-invalid document fails closed: HTTP route access and MCP tool policy both deny, and mutation refuses to overwrite the document.
+`data/router-security/policy-state.json` uses schema `router-policy` under the
+workspace `.ploinky/` directory, but it is staging state rather than live
+authorization. Coordinated apply captures every input's exact bytes, computes a
+content digest, inactivates affected selectors before acknowledgement, validates
+all source-health and pathname partitions, and installs the immutable
+route-and-policy authorization generation atomically. Same-size/same-mtime replacement has no live
+effect before apply. HTTP, SSE, and WebSocket hold an authorization-to-dial
+lease and revalidate it immediately before upstream connection creation.
 
-Old state documents with missing or retired HTTP access vocabulary fail the whole document closed. Remediation is to delete `.ploinky/data/router-security/policy-state.json`, restart the router so MCP defaults bootstrap from `mcp-config.json`, and re-add HTTP route entries through `http.route.set`.
+An unreadable candidate, a corrupt active digest on restart, schema-invalid
+input, or a crash between inactivation and installation leaves no selector
+active. Contract 5 never translates, skips, repairs, imports, deletes, or falls
+back to old state. The operator repairs the staged source and invokes the normal
+coordinated apply; the invalid generation is not resurrected.
 
 ### Internal Paths
 
-Router-owned surfaces are never controlled by HTTP route access. This includes `/policy/command`, `/api/marketplace`, `/auth`, `/auth/*`, `/admin`, `/admin/*`, `/metrics`, `/health/internal`, the bare root, root wildcards, and any path containing an `__agent` segment in raw, encoded, or double-encoded form. The `RoutingServer` front-door guard and the routerHandlers synthesized-upstream guard both enforce the same segment rule as `HttpRouteAccessPath`.
+Router-owned surfaces are never controlled by HTTP route access. This includes
+`/policy/command`, `/api/marketplace`, `/auth`, `/auth/*`, `/admin`, `/admin/*`,
+`/metrics`, the bare root, root wildcards, and any path containing an `__agent`
+segment in raw, encoded, or double-encoded form. Detailed health is absent from
+TCP. Before any path check, the listener/interface plus exact Host selects a
+closed surface: service hosts receive only their service and exact auth
+transactions; agent-root hosts receive only explicitly selected named
+`routerSurfaces`; managed/private traffic receives only private handlers.
 
-Transparent agent proxying strips caller-supplied identity headers and regenerates router-owned headers only after the access decision has been satisfied.
+Transparent agent proxying strips caller-supplied identity and source headers and regenerates router-owned headers only after the access decision has been satisfied. Guest ingestion receives a route-scoped transport-source partition for rate limiting; it is not user identity and cannot authorize a request.
 
 ### Errors
 
@@ -128,6 +189,7 @@ Transparent agent proxying strips caller-supplied identity headers and regenerat
 | Non-admin caller on admin-only command or tool | 403 | `ADMIN_REQUIRED` |
 | Agent lacks policy for a tool | 403 | `AGENT_POLICY_DENIED` |
 | Persistence failure or corrupt state | 500 | `POLICY_PERSISTENCE_ERROR` |
+| Inactive or superseded generation lease | 503 | `ROUTING_GENERATION_INACTIVE` |
 
 Guest-facing errors stay generic and never confirm that a private resource exists. Audit records may keep the exact deny code but never tokens or secrets.
 
@@ -142,11 +204,18 @@ Response: The router needs one closed vocabulary for HTTP decisions. `public` me
 ### Question #3: Why do defaults never produce `public`?
 Response: Anonymous access must be explicit. Defaults exist only to preserve ordinary route behavior: user-authenticated static agents stay user-authenticated, and open or guest-auth routes become guest identity routes rather than no-session pass-through.
 
-### Question #4: Why are manifest route declarations runtime-only?
-Response: Agent manifests are the agent's source of truth and may change independently from operator policy. Runtime composition removes stale rows automatically when the manifest or agent disappears, while persisted policy remains an operator-owned audit trail.
+### Question #4: Why are raw manifest route edits not runtime authorization?
+Response: A path decision is safe only when route target, host selector, all
+policy providers, caller ACLs, and source health were validated together. Raw
+edits can represent a partial or same-timestamp replacement, so they remain
+candidate input until coordinated apply installs one exact-byte generation.
 
-### Question #5: Why does an old policy-state file fail the whole document closed?
-Response: HTTP and MCP policy share one persisted security document. If validation cannot prove every entry uses the current schema, the router refuses to reason from partial data. Operators recover by deleting the file, restarting, and re-adding the intended route entries.
+### Question #5: Why does corrupt generation state recover inactive?
+Response: If validation cannot prove every route, target, policy entry, and
+digest belongs to the same installed generation, using any subset could remove a
+restrictive rule or dial a stale target. Contract 5 therefore installs no
+selector until repaired candidate bytes pass a new coordinated apply; deletion,
+translation, or an older-generation fallback is not a recovery path.
 
 ## Conclusion
 

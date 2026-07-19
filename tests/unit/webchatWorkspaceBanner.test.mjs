@@ -19,16 +19,21 @@ test('workspace directory banner is hidden only for WebChat history metadata', (
 test('normal CLI keeps the workspace directory banner', () => {
     const previousHasHistory = process.env.PLOINKY_WEBCHAT_HAS_HISTORY;
     const originalLog = console.log;
-    const calls = [];
+    const originalError = console.error;
+    const stdoutCalls = [];
+    const stderrCalls = [];
     try {
         delete process.env.PLOINKY_WEBCHAT_HAS_HISTORY;
-        console.log = (...args) => calls.push(args.join(' '));
+        console.log = (...args) => stdoutCalls.push(args.join(' '));
+        console.error = (...args) => stderrCalls.push(args.join(' '));
         logPloinkyDirectory();
     } finally {
         console.log = originalLog;
+        console.error = originalError;
         if (previousHasHistory === undefined) delete process.env.PLOINKY_WEBCHAT_HAS_HISTORY;
         else process.env.PLOINKY_WEBCHAT_HAS_HISTORY = previousHasHistory;
     }
-    assert.equal(calls.length, 1);
-    assert.match(calls[0], /^\[ploinky\] using \.ploinky:/);
+    assert.equal(stdoutCalls.length, 0);
+    assert.equal(stderrCalls.length, 1);
+    assert.match(stderrCalls[0], /^\[ploinky\] using \.ploinky:/);
 });

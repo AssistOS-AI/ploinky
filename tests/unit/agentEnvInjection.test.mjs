@@ -13,11 +13,13 @@ process.env.PLOINKY_MASTER_KEY = 'a1b2c3d4'.repeat(8);
 
 const moduleSuffix = `?test=${Date.now()}`;
 const { buildFullEnvMap } = await import(`../../cli/services/bwrap/bwrapServiceManager.js${moduleSuffix}`);
+const { buildRouterEndpoint } = await import(`../../cli/services/routerPort.js${moduleSuffix}`);
 const { deriveAgentRequestSecret, deriveDerivedMasterKey } = await import(`../../cli/services/masterKey.js${moduleSuffix}`);
 const { deriveAgentPrincipalId } = await import(`../../cli/services/agentIdentity.js${moduleSuffix}`);
 // The single identity injector that docker, bwrap, and lifecycle all route through.
 const { buildAgentIdentityEnv, stripReservedAgentEnv } = await import(`../../cli/services/agentIdentityEnv.js${moduleSuffix}`);
 const { verifySubjectIdentityKey, getSubjectIdentityPublicKey } = await import(`../../cli/services/subjectIdentityKey.js${moduleSuffix}`);
+const routerEndpoint = buildRouterEndpoint('host', 8080);
 
 test.after(() => {
     process.chdir(originalCwd);
@@ -27,7 +29,7 @@ test.after(() => {
 function envForAgent(repoName, agentName) {
     const workDir = path.join(tempDir, 'work', agentName);
     fs.mkdirSync(workDir, { recursive: true });
-    return buildFullEnvMap(agentName, {}, {}, workDir, repoName, 'dev');
+    return buildFullEnvMap(agentName, {}, {}, workDir, repoName, 'dev', 'bwrap', null, routerEndpoint);
 }
 
 test('injected env carries PLOINKY_AGENT_ID + PLOINKY_AGENT_SECRET = the canonical per-agent values', () => {
@@ -130,7 +132,7 @@ test('profile config cannot inject a master key or override the agent secret (bw
     // A profile that maliciously tries to leak the master and override the secret.
     const env = buildFullEnvMap('dpuAgent', {}, {
         env: { PLOINKY_MASTER_KEY: 'leak', PLOINKY_AGENT_SECRET: 'override', SAFE: 'ok' },
-    }, workDir, 'AssistOSExplorer', 'dev');
+    }, workDir, 'AssistOSExplorer', 'dev', 'bwrap', null, routerEndpoint);
     assert.equal(env.SAFE, 'ok');                              // ordinary env survives
     assert.equal(env.PLOINKY_MASTER_KEY, undefined);          // master never injected
     assert.equal(env.PLOINKY_DERIVED_MASTER_KEY, undefined);
@@ -155,7 +157,7 @@ test('manifest/profile cannot override the generated signed identity key or publ
             PLOINKY_ENV_SOURCE_PLOINKY_AGENT_API_KEY: 'manifest',
             SAFE: 'ok',
         },
-    }, workDir, 'AssistOSExplorer', 'dev');
+    }, workDir, 'AssistOSExplorer', 'dev', 'bwrap', null, routerEndpoint);
     assert.equal(env.SAFE, 'ok');                                     // ordinary env survives
     // The authoritative generated values win for every reserved name.
     assert.equal(env.PLOINKY_AGENT_API_KEY, idEnv.PLOINKY_AGENT_API_KEY);

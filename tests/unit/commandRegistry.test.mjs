@@ -10,4 +10,7 @@ test('core CLI exposes no research-specific enable command', () => {
     assert.equal(commands.research, undefined);
     assert.equal(commands.enable.includes('research'), false);
     assert.equal(commands.enable.includes('research-agents'), false);
+    assert.deepEqual(commands.edge, ['apply']);
+    assert.equal(commands.publish, undefined);
+    assert.equal(commands.publication, undefined);
 });

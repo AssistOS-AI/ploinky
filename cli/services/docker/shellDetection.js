@@ -1,7 +1,7 @@
 import { spawnSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';
-import { getRuntime } from './common.js';
+import { getRuntime, managedContainerLabelArgs } from './common.js';
 
 const SHELL_PROBE_PATHS = ['/bin/bash', '/bin/sh', '/bin/ash', '/bin/dash', '/bin/zsh', '/bin/fish', '/bin/ksh'];
 const SHELL_FALLBACK_DIRECT = Symbol('no-shell');
@@ -49,11 +49,24 @@ function detectShellViaImageMount(image, runtime) {
     }
 }
 
+function buildShellDetectionRunArgs(image, shellPath) {
+    return [
+        'run',
+        '--rm',
+        ...managedContainerLabelArgs(),
+        '--entrypoint',
+        'test',
+        image,
+        '-x',
+        shellPath,
+    ];
+}
+
 function detectShellViaContainerRun(image, runtime) {
     for (const shellPath of SHELL_PROBE_PATHS) {
         // Use --entrypoint to bypass any custom ENTRYPOINT (e.g. Keycloak's
         // kc.sh) that would intercept the probe command.
-        const res = spawnSync(runtime, ['run', '--rm', '--entrypoint', 'test', image, '-x', shellPath], { stdio: 'ignore' });
+        const res = spawnSync(runtime, buildShellDetectionRunArgs(image, shellPath), { stdio: 'ignore' });
         if (res.status === 0) {
             return shellPath;
         }
@@ -79,5 +92,6 @@ function detectShellForImage(agentName, image, runtime = null) {
 
 export {
     SHELL_FALLBACK_DIRECT,
+    buildShellDetectionRunArgs,
     detectShellForImage
 };

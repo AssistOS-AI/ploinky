@@ -1,4 +1,4 @@
-export function showHelp(args = []) {
+export function showHelp(args = [], { surface = 'core' } = {}) {
     // Parse help arguments
     const topic = args[0];
     const subtopic = args[1];
@@ -7,11 +7,30 @@ export function showHelp(args = []) {
     // Detailed help for specific commands
     if (topic) {
         if (topic === 'cloud') { console.log('Cloud commands are not available in this build.'); return; }
-        return showDetailedHelp(topic, subtopic, subsubtopic);
+        return showDetailedHelp(topic, subtopic, subsubtopic, { surface });
     }
-    
-    // Main help overview
-    console.log(`
+
+    console.log(mainHelpText(surface));
+}
+
+function lifecycleHelpLines(surface) {
+    if (surface === 'host') {
+        return [
+            '  status                         Show combined, read-only outer runtime and workspace status',
+            '  stop                           Stop core services, then stop the outer runtime',
+            '  destroy                        Confirm and directly remove the outer runtime; retain its named volumes',
+        ];
+    }
+    return [
+        '  status                         Show workspace/router/agent state',
+        '  stop | shutdown | clean         Stop workspace services and leave the outer runtime running',
+        '  destroy                        Remove workspace containers and leave the outer runtime running',
+        '  Exit the REPL before running host ploinky stop or ploinky destroy.',
+    ];
+}
+
+function mainHelpText(surface) {
+    return `
 ╔═══ PLOINKY ═══╗ Container Development & Cloud Platform
 
 ▶ LOCAL DEVELOPMENT
@@ -20,13 +39,18 @@ export function showHelp(args = []) {
   uninstall <name|url>           Uninstall repository and its enabled agents
   remove <name|url>              Alias for uninstall
   update [folderPath]            Update Ploinky, .ploinky/repos, Achilles deps, projects, and default skills
-  start [staticAgent] [port]     Start agents from .ploinky/agents.json and launch Router
+  start <agent> [port] [--profile <name>]
+                                 Start agents from .ploinky/agents.json and launch Router
   shell <agentName>              Open interactive shell in container (attached TTY)
+  cli                            Open /bin/bash in the managed outer runtime; exit returns to the previous prompt.
   cli <agentName> [args...]      Run manifest "cli" command (attached TTY)
-  webchat [--rotate]             Print the WebChat access URL and support agent URL params
-  dashboard [--rotate]           Show or rotate Dashboard token and print access URL
+  webchat                        Print the authenticated WebChat access URL
+  dashboard                      Print the administrator-only Dashboard access URL
   sso enable|disable|status  Bind or inspect SSO provider agents
   sandbox status|disable|enable  Force lite-sandbox agents to use containers, or restore bwrap/seatbelt
+  network status [--json]        Show managed network topology (status schema 3)
+  network prune                  Remove unused workspace-owned managed networks
+  edge apply <json-file>         Validate and activate one staged edge desired-state file
   vars                           List all variable names (no values)
   var <VAR> <value>              Set a variable value
   echo <VAR|$VAR>                Print the resolved value of a variable
@@ -43,11 +67,10 @@ export function showHelp(args = []) {
   client list resources          Aggregate resources exposed by all agents
   client status <agent>          One-line status (HTTP code, parsed)
 
-  status | restart               Show state | restart enabled agents + Router
+${lifecycleHelpLines(surface).join('\n')}
+  restart                        Restart enabled agents + Router
   disable agents-all             Disable all enabled agents and remove their containers
   reinstall <agentName>          Re-create a running agent container (destructive)
-  stop | shutdown | clean        Stop containers | remove containers
-  destroy                        Stop router and remove workspace containers
   logs tail [router]             Follow router logs
   logs last <N>                  Show last N router log lines
 
@@ -57,10 +80,10 @@ export function showHelp(args = []) {
 
 Config stored in .ploinky/ • Type 'help' for commands
 ╚═══════════════════════════════════════════════════════╝
-`);
+`;
 }
 
-function showDetailedHelp(topic, subtopic, subsubtopic) {
+function showDetailedHelp(topic, subtopic, subsubtopic, { surface = 'core' } = {}) {
     const helpContent = {
         // Local development commands
         'add': {
@@ -110,10 +133,9 @@ function showDetailedHelp(topic, subtopic, subsubtopic) {
             description: 'Set a workspace variable (stored encrypted in .ploinky/.secrets)',
             syntax: 'var <VAR> <value>',
             examples: [
-                'var WEBDASHBOARD_TOKEN deadbeef  # Override dashboard token manually',
                 'var API_KEY sk-123456'
             ],
-            notes: "Use 'vars' to list variables. WebChat uses the router login flow; only dashboard still uses a surface token."
+            notes: "Use 'vars' to list variables. Router control surfaces use authenticated workspace sessions."
         },
         'vars': {
             description: 'List workspace variables (from encrypted .ploinky/.secrets)',
@@ -125,7 +147,7 @@ function showDetailedHelp(topic, subtopic, subsubtopic) {
             description: 'Update Ploinky itself, its Achilles runtime checkout, workspace repositories, Achilles dependencies, and project repositories',
             syntax: 'update [folderPath] | update all [folderPath] | update repos | update repo <name>',
             examples: [ 'update', 'update /work/projects', 'update all /work/projects', 'update repos', 'update repo basic' ],
-            notes: '`update` is the same full workflow as `update all`: it runs git pull --rebase --autostash for the Ploinky checkout, refreshes ploinky/node_modules/achillesAgentLib, updates .ploinky/repos, and updates git repositories discovered recursively from folderPath. Without folderPath, discovery starts at the current working directory. Missing or unreachable remotes in discovered project repositories are logged and skipped instead of failing the full update; managed .ploinky/repos updates remain strict. `update`, `update all`, `update repos`, and `update repo <name>` refresh `AchillesCopilotBasicSkills` into eligible installed .ploinky/repos entries, maintaining `.claude` compatibility and the managed `.gitignore` block; the refresh skips the `AchillesCopilotBasicSkills` source repo and skills-only repos. `update repos` also updates the Ploinky runtime achillesAgentLib checkout and managed-repo achillesAgentLib packages. Discovered workspace folders can define `ploinky-skills-manifest.json`; when present, that file must be an array of objects with url/name/branch/skills and selects the exact skills to install into `.agents/skills` for that workspace folder. In an interactive Ploinky session, a detected Ploinky self-update is deferred: close the session, run `ploinky update`, then restart Ploinky so the new code is loaded.'
+            notes: '`update` is the same full workflow as `update all`: it runs git pull --rebase --autostash for the Ploinky checkout, refreshes ploinky/node_modules/achillesAgentLib, updates .ploinky/repos, and updates git repositories discovered recursively from folderPath. Inside a Ploinky box, the read-only source self-pull is skipped while writable runtime dependencies, managed repos, projects, and skills continue updating. Without folderPath, discovery starts at the current working directory. Missing or unreachable remotes in discovered project repositories are logged and skipped instead of failing the full update; managed .ploinky/repos updates remain strict. `update`, `update all`, `update repos`, and `update repo <name>` refresh `AchillesCopilotBasicSkills` into eligible installed .ploinky/repos entries, maintaining `.claude` compatibility and the managed `.gitignore` block; the refresh skips the `AchillesCopilotBasicSkills` source repo and skills-only repos. `update repos` also updates the Ploinky runtime achillesAgentLib checkout and managed-repo achillesAgentLib packages. Discovered workspace folders can define `ploinky-skills-manifest.json`; when present, that file must be an array of objects with url/name/branch/skills and selects the exact skills to install into `.agents/skills` for that workspace folder. In an interactive Ploinky session, a detected Ploinky self-update is deferred: close the session, run `ploinky update`, then restart Ploinky so the new code is loaded.'
         },
         
         
@@ -155,19 +177,18 @@ function showDetailedHelp(topic, subtopic, subsubtopic) {
         },
         'webchat': {
             description: 'Print the WebChat URL served at /webchat.',
-            syntax: 'webchat [--rotate]',
+            syntax: 'webchat',
             examples: [
                 'webchat',
-                'webchat --rotate',
                 '/webchat?agent=achilles-cli&path=/absolute/path'
             ],
-            notes: 'WebChat now uses the normal router login flow. `--rotate` no longer changes anything for this surface. When `/webchat` is opened with `?agent=<name>&...`, every extra query parameter except internal router/session fields is forwarded to `ploinky cli <name>` as a single-token long-form CLI flag in the form `--key=value`.'
+            notes: 'WebChat uses the normal Router login flow. When `/webchat` is opened with `?agent=<name>&...`, every extra query parameter except internal router/session fields is forwarded to `ploinky cli <name>` as a single-token long-form CLI flag in the form `--key=value`.'
         },
         'dashboard': {
-            description: 'Display or rotate the Dashboard token used by /dashboard.',
-            syntax: 'dashboard [--rotate]',
-            examples: [ 'dashboard', 'dashboard --rotate' ],
-            notes: 'Writes the token to encrypted .ploinky/.secrets and prints an access URL. `echo $WEBDASHBOARD_TOKEN` to print it.'
+            description: 'Print the administrator-only Dashboard URL served at /dashboard.',
+            syntax: 'dashboard',
+            examples: [ 'dashboard' ],
+            notes: 'The Dashboard accepts only a real authenticated Router administrator session; mutations additionally require exact Origin and CSRF proof.'
         },
         'sso': {
             description: 'Manage the workspace SSO provider.',
@@ -204,6 +225,24 @@ function showDetailedHelp(topic, subtopic, subsubtopic) {
                 'enable sandbox'
             ],
             notes: 'Host sandbox is disabled by default; agents whose manifests request `lite-sandbox: true` use podman/docker. Run `sandbox enable` to opt into bwrap (Linux) / seatbelt (macOS). Restart running agents to apply the change. Environment override: PLOINKY_DISABLE_HOST_SANDBOX=1 forces disabled regardless of workspace setting.'
+        },
+        'network': {
+            description: 'Inspect and prune workspace-owned rootless Podman networks.',
+            syntax: 'network status [--json] | network prune',
+            examples: [
+                'network status',
+                'network status --json',
+                'network prune'
+            ],
+            notes: 'Prune removes only unused networks bearing this workspace\'s exact Ploinky ownership labels. Foreign or attached networks are never removed.'
+        },
+        'edge': {
+            description: 'Apply one staged edge publication desired-state document through the serialized generation coordinator.',
+            syntax: 'edge apply <json-file>',
+            examples: [
+                'edge apply ./edge-desired.json',
+            ],
+            notes: 'The input must be one non-symlink regular JSON file no larger than 1 MiB. Apply inactivates the current selector first, validates every captured route and policy source, and has no rollback or previous-generation fallback on failure.'
         },
         
         
@@ -289,9 +328,9 @@ function showDetailedHelp(topic, subtopic, subsubtopic) {
         },
         'start': {
             description: 'Start enabled agents and the local Router',
-            syntax: 'start [staticAgent] [port] [--branch <branch>] [--repo-branch <repo>=<branch>] [--branch-fallback default|fail] [--reset-repos]',
-            examples: [ 'start MyStaticAgent 8080', 'start', 'start explorer 8080 --branch my-feature' ],
-            notes: 'Reads manifest of static agent: applies repos{} (clone+enable) and enable[] (enable agents). First run needs agent and port. --branch <branch> applies best-effort to the static agent\'s repo, every manifest dependency repo, AND the achillesAgentLib used by agent containers — each uses that branch where it exists, else its default/pinned branch. --repo-branch <repo>=<branch> (repeatable) overrides a single repo; --branch-fallback <default|fail> (fail aborts when a targeted branch is missing); --reset-repos force-checks-out dirty repos. (Advanced escape hatch: export PLOINKY_AGENTLIB_REF=<branch|git+/file: spec> to override just the achillesAgentLib source.)'
+            syntax: 'start <agent> [port] [--profile <name>] [--branch <branch>] [--repo-branch <repo>=<branch>] [--branch-fallback default|fail] [--reset-repos]',
+            examples: [ 'start MyStaticAgent 8080 --profile dev', 'start explorer 8080 --profile prod --branch my-feature' ],
+            notes: 'Reads manifest of static agent: applies repos{} (clone+enable) and enable[] (enable agents). First run needs agent and port. An explicit --profile selects and persists the workspace profile before startup; direct in-box starts that omit it retain the active workspace profile. --branch <branch> applies best-effort to the static agent\'s repo, every manifest dependency repo, AND the achillesAgentLib used by agent containers — each uses that branch where it exists, else its default/pinned branch. --repo-branch <repo>=<branch> (repeatable) overrides a single repo; --branch-fallback <default|fail> (fail aborts when a targeted branch is missing); --reset-repos force-checks-out dirty repos. (Advanced escape hatch: export PLOINKY_AGENTLIB_REF=<branch|git+/file: spec> to override just the achillesAgentLib source.)'
         },
         'status': {
             description: 'Show enabled agents and router configuration',
@@ -311,10 +350,10 @@ function showDetailedHelp(topic, subtopic, subsubtopic) {
             }
         },
         'restart': {
-            description: 'Restarts services. If an agent name is provided, it performs a non-destructive stop and start of that agent\'s container. If no agent name is provided, it restarts all agents and the router.',
+            description: 'Restarts services. A named agent is reconciled through the managed ownership, network, and endpoint transaction. With no name, all agents and the router restart.',
             syntax: 'restart [agentName]',
             examples: [ 'restart', 'restart MyAPI' ],
-            notes: 'The command only affects running containers when an agent name is specified. The general restart fails if start was not configured yet.'
+            notes: 'A named restart requires the persisted RoutingServer port and refuses foreign or old-contract containers. The general restart fails if start was not configured yet.'
         },
         'logs': {
             description: 'Inspect router logs',
@@ -682,6 +721,55 @@ function showDetailedHelp(topic, subtopic, subsubtopic) {
             }
         }
     };
+
+    const lifecycleDetails = surface === 'host'
+        ? {
+            status: {
+                description: 'Show combined, read-only outer runtime and workspace status.',
+                notes: 'This host-level status inspects the outer runtime and available core state without starting or reconciling anything.',
+            },
+            stop: {
+                description: 'Stop core services, then stop the outer runtime.',
+                notes: 'This host-level command preserves the outer runtime volumes.',
+            },
+            destroy: {
+                description: 'Confirm and directly remove the outer runtime while retaining its three named volumes.',
+                notes: 'This host-level command does not run core stop or a separate outer stop. Attached anonymous volumes are cleaned; the selected workspace, dependency, and nested-container-storage named volumes remain.',
+            },
+        }
+        : {
+            status: {
+                description: 'Show workspace/router/agent state.',
+                notes: 'This core command leaves the outer runtime running.',
+            },
+            stop: {
+                description: 'Stop workspace services and leave the outer runtime running.',
+                notes: 'Exit the REPL before running host ploinky stop or ploinky destroy.',
+            },
+            destroy: {
+                description: 'Remove workspace containers and leave the outer runtime running.',
+                notes: 'Exit the REPL before running host ploinky stop or ploinky destroy.',
+            },
+        };
+    if (lifecycleDetails[topic]) {
+        helpContent[topic] = {
+            ...helpContent[topic],
+            ...lifecycleDetails[topic],
+        };
+    }
+
+    if (topic === 'cli' && !subtopic) {
+        console.log(`
+╔═══ HELP: cli ═══╗
+
+cli
+  Open /bin/bash in the managed outer runtime; exit returns to the previous prompt.
+
+cli <agentName> [args...]
+  Run the agent manifest CLI command interactively (attached TTY).
+`);
+        return;
+    }
     
     // Display help based on requested topic (removed - not needed since we're already inside showDetailedHelp)
     

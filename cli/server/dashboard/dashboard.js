@@ -44,6 +44,28 @@
     const suffix = String(path || '').replace(/^\/+/, '');
     return `${dashboardBasePath}/${suffix}`;
   }
+
+  let adminControlPromise = null;
+  function loadAdminControl() {
+    if (!adminControlPromise) {
+      adminControlPromise = fetch('/auth/token', {
+        method: 'GET',
+        credentials: 'include',
+        cache: 'no-store',
+      }).then(async (res) => {
+        const payload = await res.json().catch(() => ({}));
+        const proof = payload && payload.adminControl;
+        if (!res.ok || !proof || !proof.csrfToken || proof.origin !== window.location.origin) {
+          throw new Error('Administrator control proof is unavailable.');
+        }
+        return proof;
+      }).catch((error) => {
+        adminControlPromise = null;
+        throw error;
+      });
+    }
+    return adminControlPromise;
+  }
   
   function setTab(name) { 
     tabs.forEach(t => t.classList.toggle('active', t.dataset.tab === name)); 
@@ -57,9 +79,14 @@
 
   // /run helper
   async function run(cmd) { 
+    const adminControl = await loadAdminControl();
     const res = await fetch(dashboardPath('run'), { 
       method: 'POST', 
-      headers: {'Content-Type': 'application/json'}, 
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Ploinky-CSRF-Token': adminControl.csrfToken,
+      },
+      credentials: 'include',
       keepalive: true,
       body: JSON.stringify({ cmd }) 
     }); 

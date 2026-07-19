@@ -1,9 +1,9 @@
 ---
 id: DS005
 title: Routing and Web Surfaces
-status: implemented
+status: partially implemented (rootless private-router reachability blocked)
 owner: ploinky-team
-summary: Defines the router, watchdog, route table, static serving rules, and browser surfaces exposed by Ploinky.
+summary: Defines dual-listener RoutingServer, host-first closed surfaces, immutable route-and-policy generations, HTTP-service targets, private assertions, topology, and browser surfaces.
 ---
 
 # DS005 Routing and Web Surfaces
@@ -14,15 +14,54 @@ The routed interface is the operator-visible face of a running Ploinky workspace
 
 ## Core Content
 
-The router must be supervised by `cli/server/Watchdog.js`, which launches and restarts `cli/server/RoutingServer.js`, records restart events, performs health checks against `/health`, and writes watchdog logs under `.ploinky/logs/watchdog.log`. The router itself must write request and lifecycle logs under `.ploinky/logs/router.log`.
+The router must be supervised by `cli/server/Watchdog.js`, which launches and
+restarts `cli/server/RoutingServer.js`, records restart events, checks detailed
+health through an unmounted supervisor Unix socket, and writes watchdog logs
+under `.ploinky/logs/watchdog.log`. The router itself must write redacted request
+and lifecycle logs under `.ploinky/logs/router.log`.
 
-The route table must be persisted in `.ploinky/routing.json`. It must contain the router port, static agent metadata, and the current per-agent route entries resolved during startup. Per-agent route entries provide the upstream host port and metadata such as repository, agent name, container name, alias, and host path. The static-agent metadata identifies the workspace entry agent and container; it is not the router's static-file root.
+RoutingServer owns a public/control listener on box port `8080` and is designed
+to own a private managed-interface listener on `8081`. The outer box maps only
+the former to a loopback physical-host port. An exact-capability host-mode
+runtime can use private box loopback, but network reachability never replaces
+policy, assertion, or caller-ACL checks. Managed bridges are intended to reach
+only the private interface through the fixed
+`host.containers.internal:host-gateway` address contract; that mapping is not a
+capability. On the currently observed rootless Podman topology the gateway
+terminates on the box outer-facing interface, so the managed-bridge lane cannot
+satisfy the approved bind boundary and remains inactive and fail-closed. Ploinky
+does not widen the listener or install a compatibility forwarder. DS004 Question
+#8 records the unresolved architecture choice. Private `8081` is never a
+physical-host or Cloudflare route, and detailed health is not available over
+either TCP listener.
 
-`ploinky reinstall <agent>` recreates the agent container with a new dynamic host port and rewrites its `.ploinky/routing.json` entry; because the router resolves routes from that file per request, the new port takes effect without a router restart. Reinstall waits for the recreated agent's host port to become ready before returning. If a request still returns 502 immediately after a reinstall (for example a slow container image start), run `ploinky restart`.
+`.ploinky/routing.json`, manifests, and policy files are candidate inputs. They
+have no live authorization effect until one coordinator inactivates affected
+selectors, captures and digests their exact bytes, validates the complete
+route-and-policy candidate, and atomically installs an immutable generation.
+Unreadable or corrupt input, a digest mismatch, an interrupted apply, and an
+invalid candidate leave the selectors inactive; no prior generation is restored
+as a fallback. A missing policy, desired-state, enabled-agent, routing, manifest,
+or provider source is unavailable input and is never substituted with an empty
+document. A genuinely fresh workspace initializes the four persisted source
+documents together before its first mutation; any partial set or retained
+generation evidence requires explicit repair. Status exposes generation identity
+and digest, never source contents.
+
+The core `list routes` command reports the staged `.ploinky/routing.json`
+candidate for operator inspection; it does not prove or print the active
+immutable generation. Only coordinated `edge apply <json-file>` can validate
+candidate state and install a generation.
+
+`ploinky reinstall <agent>` creates new private targets and coordinates a new
+generation before acknowledging the change. HTTP, SSE, and WebSocket requests
+capture one route plan and authorization lease, then revalidate that generation
+immediately before opening the upstream connection. A superseded lease returns
+`503` without dialing or sending request bytes.
 
 The watchdog container monitor must defer automatic container restarts while a maintenance lock is active for the same container. It must check the lock both when deciding to schedule a restart and immediately before executing a previously scheduled restart, because a reinstall or explicit restart may acquire the lock after the watchdog timer was created. A deferred timer must release the monitor's in-progress restart state so later ticks can reevaluate the live container after maintenance completes.
 
-The router must provide first-party browser surfaces at `/webchat`, `/dashboard`, and `/status`. Each surface owns its own session cookie and fallback asset directory under `cli/server/<surface>/`. `/webchat` must rely on the router login flow and the authenticated router session; it does not accept surface-specific token login. `/dashboard` and the read-only `/status` surface continue to support dashboard-token access through `WEBDASHBOARD_TOKEN`. Asset resolution may also consult the static host root and `webLibs/`, but the documented fallback implementation for the first-party surfaces lives under `cli/server/`.
+The router must provide first-party browser surfaces at `/webchat`, `/dashboard`, and `/status`. Their fallback asset directories live under `cli/server/<surface>/`. `/webchat` relies on the router login flow and the authenticated router session; it does not accept surface-specific token login. `/dashboard` and `/status` are local control surfaces and require a real authenticated local-admin session on an allowed control Host. They do not accept an invitation, component token, Agent Assertion, Router Request, private assertion, LiveKit JWT, or localhost provenance as administrator identity. Every control mutation additionally requires the exact browser Origin and a session-bound CSRF proof. Asset resolution may also consult the static host root and `webLibs/`, but the documented fallback implementation for the first-party surfaces lives under `cli/server/`.
 
 For `/webchat`, the router must treat `agent` as an explicit agent-selection query parameter and must preserve the remaining query parameters across the browser session endpoints. When a WebChat request selects an explicit agent, the router must forward every additional query parameter except router-reserved stream/session parameters such as `tabId` and `sessionId` to that agent's `ploinky cli <agent>` launch as long-form CLI flags encoded as single `--key=value` tokens. The router must not hardcode ordinary target-agent parameter names for this forwarding behavior; interpretation belongs to the target agent CLI. The reserved alias parameters `workspace-dir`/`workspaceDir` and `workspace-skill-root`/`workspaceSkillRoot` are resolved by WebChat against the Ploinky workspace root and forwarded as absolute `--dir=` and `--skill-root=` values server-side so browser URLs can avoid leaking absolute host paths. The `ploinky cli <agent>` launch path is expected to resolve the agent manifest from workspace repositories and auto-enable missing agents in the standard global enable flow when needed.
 
@@ -129,19 +168,39 @@ When a WebChat runtime has no SSE subscribers but owns a task whose materialized
 
 The router must also expose:
 
-- `/health` for health status.
+- authenticated, non-detailed health summary on the local control surface; detailed health is Unix-socket-only.
 - `/api/marketplace` for the first-party agent marketplace. This route is router-owned and returns JSON rather than proxied agent content. `GET /api/marketplace` must require an authenticated local or SSO user and must report the caller identity, caller marketplace permissions, predefined repositories, installed repositories, remembered repository sources, repository kind, discoverable agents, enabled-agent registry state, and runtime status derived from live Ploinky containers. Non-admin clients must use the returned permissions to hide management controls. `POST /api/marketplace` must require an authenticated local administrator and accepts `install_repo`, `uninstall_repo`, `enable_agent`, and `disable_agent` actions. Repository installation must require a URL, accept an optional name and branch, clone the checkout, and record source metadata including repository kind. Repository uninstall must match the CLI repository contract: it disables enabled agents that came from that repository by container key, removes their runtime containers through the normal disable helper, preserves agent work directories, removes the installed repository checkout, and preserves the source metadata so the repository remains available for reinstall in the correct Marketplace repo category. Agent enablement must use the standard enable path. Agent disablement is marketplace-specific: the route removes the enabled-agent registry record before removing the agent runtime with the normal container removal helper, so the watchdog container monitor does not restart the runtime while the admin operation is in progress. This marketplace behavior must not change the conservative direct `ploinky disable agent` CLI contract, which still refuses to remove records while runtime state exists.
 - `/upload` and `/blobs` for workspace and agent blob flows.
 - `/workspace-files/...` for authenticated, workspace-confined file reads owned by the router.
 - `/webchat/uploads` for WebChat session-scoped file storage and download under `<cwd>/uploads/<sessionId>`.
 - `/agent-card` for aggregate discovery of routable agents that expose capability metadata. The router must query each active route's internal `/agent-card` endpoint, include successful responses without validating their field shape, and report per-agent errors separately.
 - `/mcp` for router-level MCP aggregation.
-- manifest-declared HTTP service prefixes for downstream HTTP services.
+- manifest-declared HTTP service prefixes and exact service-host aliases for downstream HTTP services.
 - `POST /policy/command` is the single administrative endpoint for the router's access-control policy (DS014). It is authenticated, never route-policy-controlled, and handles `http.route.*` and `mcp.policy.*` namespaces.
-- `http://<agent>.localhost:<routerPort>/` for the active profile's `additionalServerPort` when declared. The router must use the request host to select the route key, preserve the root-relative path and query string, and proxy the request to the configured HTTP server. For container-local declarations, the launcher must publish the declared container port on `127.0.0.1` with an ephemeral host port and write the resolved host-mode upstream into routing state; the router then proxies to that host URL rather than relying on container IP reachability. This root-mounted host-based surface is for agent-owned browser services and must not replace the default AgentServer route used for MCP, agent-card, and runtime control paths.
+- `http://<service-slug>.localhost:<routerPort>/` for each uniquely slugged enabled HTTP service. Slugless services remain prefix-only. Dedicated hosts canonicalize the request to the selected service's `externalPrefix` and cannot select another service through the path or query.
 - `/<agent>/...` for transparent per-agent proxying after the router-owned paths above have been considered. The router strips the `/<agent>` mount prefix and forwards the remaining path and query string to the route's upstream host port. The target agent owns paths such as `/index.html`, `/agent-card`, `/v1/models`, `/v1/chat/completions`, `/task`, and any custom HTTP endpoints. `/<agent>/mcp` remains the special MCP proxy path because the router must preserve MCP session mediation and per-agent Router Request minting (DS013) plus MCP tool policy enforcement (DS014) for tool and resource operations. Agent-to-agent task-status polling for async MCP tasks is also router-mediated: a delegated caller presents an Agent Assertion for `GET /task` or `GET /getTaskStatus`, and the router mints a target-scoped Router Request before proxying the status read. Agent-to-agent OpenAI-compatible calls also have path-exact delegated handling for `POST /<agent>/v1/chat/completions` and `GET /<agent>/v1/models`; both use HTTP Agent Assertions and target-scoped Router Requests rather than direct container access.
 
-In addition to the surfaces above, the router reserves a set of internal, router-owned paths that are never proxied to an agent and never route-policy-controlled: `/policy/command`, `/auth/*`, `/admin/*`, `/metrics`, `/health/internal`, the router-level `/__agent/*`, and any agent-level `/<agent>/__agent/*` control-plane path (reached only by the router via a Router Request; transparent proxying strips caller-supplied identity headers). The router evaluates the HTTP route access policy (DS014) before transparent agent HTTP proxying and declared HTTP-service dispatch. Public decisions allow anonymous `GET`/`HEAD` only; guest decisions prefer an existing local or SSO user session and otherwise mint a scoped guest session; authenticated decisions require a user-authenticated route or static-agent auth policy.
+Listener/interface class and exact normalized Host are resolved before pathname
+dispatch. Local control, configured service, configured agent-root, and managed
+private traffic are distinct classes. Unknown, malformed, suffix-confusable,
+stale, and mismatched tuples fail without proxying. A dedicated service host has
+a closed surface containing only its selected service and the exact auth
+transaction paths that service needs. An agent-root host has only the root/mounts
+and explicitly validated named `routerSurfaces` capabilities. Health, admin,
+policy, discovery, aggregate MCP, dashboard, status, WebChat, broker, and private
+service routes are absent unless the selected class and closed allowlist permit
+them. Raw capability names are invalid configuration.
+
+Router-owned paths such as `/policy/command`, `/auth/*`, `/admin/*`, `/metrics`,
+and `/__agent/*` never become reachable merely because a caller supplies a local
+or configured Host. Every TCP admin/control/status handler still requires a real
+admin session; Agent Assertions, LiveKit JWTs, delegations, and network provenance
+are not admin credentials. Mutations also require Origin and CSRF validation.
+The router evaluates the HTTP route access policy (DS014) before transparent
+agent HTTP proxying and declared HTTP-service dispatch. Public decisions allow
+anonymous `GET`/`HEAD` only; guest decisions prefer an existing local or SSO user
+session and otherwise mint a scoped guest session; authenticated decisions
+require a user-authenticated route or static-agent auth policy.
 
 Enabled agent manifests may also declare `routerAccess.httpRoutes`. The router expands each agent-relative declaration to `/<routeKey><path>` using the active route key or alias, then evaluates those declarations beside persisted `httpRoutes` and declared HTTP-service prefixes. Manifest entries require `path`; `access` may be omitted and then defaults to `authenticated`. When `access` is present it must be exactly `public`, `guest`, or `authenticated`; removed aliases are invalid and skipped for that agent. Public entries allow anonymous read-only access, guest entries ensure a guest or user session identity, and authenticated entries require a user-authenticated router session for every method. Authenticated entries prefer the owning route user-auth policy, fall back to the static route user-auth policy when the route is otherwise `none` or `guest`, and fail closed with `authenticated_http_route_auth_not_configured` if neither policy can authenticate a user. Guest auth mode and guest sessions do not satisfy authenticated route access. When entries overlap, the most restrictive access wins. Manifest declarations do not make internal `__agent` control-plane paths reachable. Because manifest paths are agent-relative before expansion, `/auth/...`, `/admin/...`, and `/metrics` inside a manifest are ordinary agent paths under `/<routeKey>/...`, not router-root reserved paths.
 
@@ -149,7 +208,50 @@ Agent-to-agent callers may access `/agent-card` and direct per-agent HTTP routes
 
 Agent MCP sessions are runtime-owned and ephemeral. Clients that finish with a session should send `DELETE /mcp` with the `mcp-session-id` header so the agent runtime can close the SDK transport immediately. The shared `AgentServer` must also reap idle sessions defensively for clients that disconnect without a delete, but it must treat any session with an open HTTP response as active so long-running tool calls and SSE streams are not closed by idle cleanup.
 
-HTTP service routes must be declared by the target agent rather than hard-coded into router handlers. An enabled agent may provide `httpServices` entries with an external prefix, internal upstream prefix, and `access`, where the only valid values are `public`, `guest`, and `authenticated`. Retired service fields are invalid; an invalid service declaration is logged and that one service is not mounted. The router resolves valid declarations from the route table and agent manifest, then forwards matching requests to the owning agent route. Public service declarations intentionally run without router identity. Guest declarations follow the normal guest policy: an existing user-authenticated session takes precedence, otherwise the router mints a scoped guest session. Authenticated declarations must establish a user-authenticated router identity before proxying: the router prefers the owning route's user-auth policy, falls back to the static route's user-auth policy when the service-owning agent is otherwise unauthenticated or guest-authenticated, and rejects the request when no user-auth policy is available. Only authenticated service declarations may configure delegations, optionally with `when: { queryParam, pathRoots }`; the router normalizes the decoded query-parameter value and only mints that delegation when it is exactly the configured root or below it by path boundary. Authenticated and guest HTTP services receive a scoped `__http_service__` invocation token by default unless the manifest entry explicitly sets `invocation: false`. For routes that mint that token, the router buffers at most `PLOINKY_HTTP_SERVICE_INVOCATION_MAX_BODY_BYTES` bytes (default 10 MiB), hashes the exact request body bytes it forwards, and signs the HTTP request surface with `computeRchHttp({method, path, query, bodyHash})`. The signed `path` is the rewritten internal path the service actually receives, while `externalPath` remains route context in the auth-info payload. The auth-info payload carries method, signed path, external path, search string, route key, and the matching `bodyHash`. Oversized buffered bodies fail closed with `413 http_service_body_too_large` before the router proxies the request. Router-owned identity headers are stripped from caller input and regenerated by the router for authenticated or guest service requests. If a service route requests invocation minting but the owning route cannot be resolved to an installed-agent principal, the router fails the request closed instead of forwarding unsigned identity metadata.
+HTTP service routes must be declared by the target agent rather than hard-coded
+into router handlers. An enabled agent may provide `httpServices` entries with a
+validated `slug`, external prefix, internal upstream prefix, optional integer
+`port`, and `access`, where the only valid values are `public`, `guest`, and
+`authenticated`. An omitted port retains the owning agent's primary target. The
+launcher creates or reuses one private mapping for every distinct explicit TCP
+port. The prelaunch generation intentionally contains exact identities and
+targetless routes; only the later coordinated runtime apply records resolved
+targets in an installed generation. Invalid, ambiguous,
+or unresolved entries leave affected selectors inactive; HTTP, SSE, and
+WebSocket never rediscover a target from mutable route state.
+
+The Host-selected service is canonicalized to its `externalPrefix` before
+`createHttpServiceProvider` participates in `HttpRouteAccessPolicy`. The provider
+and the effective policy independently decide admission, so hostname
+publication cannot override `public`, `guest`, or `authenticated` ownership.
+Public services run without router identity and remain read-only under existing
+policy semantics. Guest declarations prefer an authenticated user and otherwise
+mint a service-scoped guest. Authenticated declarations require user identity
+and may retain current conditional delegations. Invocation-bearing service
+requests keep the bounded exact-body hashing and signed internal-path contract;
+caller-supplied forwarding, authorization, cookie, and `x-ploinky-*` identity
+headers are stripped and authoritative values are synthesized from the selected
+topology and authenticated request.
+
+Private service calls use the same compiled canonical service policy on listener
+`8081`, but they additionally require an exact current-instance/current-enable-
+generation caller ACL and a short-lived replay-protected assertion. Assertions
+bind audience, caller, generation, method, path, body, and nonce; they never mint
+a user or guest identity and never satisfy admin authentication. The assertion
+header is stripped before dialing while a service-specific upstream
+`Authorization` header may be preserved.
+
+Ploinky publishes a box-owned topology snapshot before consumers start. It
+names three deliberately different generations: the route-and-policy
+`authorizationGeneration` that is revalidated before dial, a content-derived
+`configurationGeneration` for stable non-secret consumer configuration, and a
+monotonic `publicationGeneration` for readiness/publication changes. The
+snapshot contains only non-secret logical locators—never raw target ports,
+private listeners, credential handles, or product-specific fields. Readiness
+changes advance only publication state. Browsers use one authenticated,
+`no-store` locator projection that returns no inventory or authorization
+generation and reports `503` while the requested locator is inactive; dedicated
+service hosts cannot access it.
 
 The default workspace entry paths `/` and `/index.html` redirect to the configured static agent's routed `/<agent>/index.html` URL. The router does not read application assets from `static.hostPath`; the target agent server is responsible for serving `index.html` and related static resources from its own runtime code root. The shared `AgentServer` serves static files from `PLOINKY_CODE_DIR` or `/code` after its built-in API endpoints, while agents with custom `manifest.agent` commands must implement equivalent static serving themselves.
 
@@ -223,6 +325,48 @@ Keeping agent-provided completions in memory makes local filtering immediate and
 Response:
 The selected CLI owns the meaning and persistence of its model setting, while Ploinky owns only the generic browser transport. A volatile runtime-state envelope lets any compatible agent publish current UI metadata without extending the conversation schema or coupling WebChat to an agent-specific path. Retaining the latest state in the live runtime also restores the header after a brief EventSource reconnect without claiming that the value describes the effective model used for every response.
 
+### Question #13: Why must interface and exact Host resolve before pathname dispatch?
+
+Response:
+A path is meaningful only inside a selected transport and host namespace. If a
+generic handler sees the path first, a managed caller can spoof a public or
+localhost Host and reach a control route that was never part of its surface.
+Classifying the tuple first gives every service and agent-root host a closed
+allowlist and guarantees rejection before an upstream target is observable.
+
+### Question #14: Why does every transport hold an authorization-to-dial generation lease?
+
+Response:
+Authentication may complete before a concurrent policy, target, or enablement
+change. Revalidating one captured immutable generation immediately before the
+HTTP, SSE, or WebSocket connection commits prevents an already-authorized but
+not-yet-dialed request from sending bytes to a stale or newly unauthorized
+target. A mutable file timestamp cannot provide that property.
+
+### Question #15: Why are private Router and topology separate from outer publication?
+
+Response:
+The private listener carries exact current-generation service calls, while the
+topology snapshot tells consumers which logical locator is active. Neither is a
+new physical-host edge: listener `8081` stays unpublished, topology contains no
+raw target or secret, and the outer contract remains exactly loopback Router TCP
+plus LiveKit UDP 7882.
+
+### Question #16: Why does topology distinguish authorization, configuration, and publication generations?
+
+Response:
+They protect different transitions. The authorization generation proves that
+the exact route, target, policy, and caller ACL validated together and is the
+lease checked before dial. The configuration generation changes only when the
+stable non-secret consumer inputs change. The publication generation advances
+when readiness or publication state changes without pretending the underlying
+configuration changed. The browser needs only the latter two; withholding the
+authorization id and inventory avoids turning the locator projection into a
+routing oracle.
+
 ## Conclusion
 
-Ploinky’s routed interface depends on a supervised router, a persisted route table, and stable prefixed browser surfaces. The implementation and the documentation must continue to describe those route families and their current fallback asset locations accurately.
+Ploinky’s routed interface depends on a supervised dual-listener Router, closed
+host surfaces, immutable route-and-policy generations, and stable prefixed
+browser surfaces. Candidate files describe desired state, but only coordinated
+generation apply authorizes a route or target.

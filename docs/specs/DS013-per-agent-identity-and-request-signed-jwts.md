@@ -4,7 +4,7 @@ title: Per-Agent Identity and Request-Signed JWT Families
 status: implemented
 owner: ploinky-team
 supersedes: DS011 (partial - shared-HMAC invocation model), DS006 (partial - secure wire)
-summary: Defines per-agent secret derivation and the three direction-typed HS256 JWT families (User Session, Agent Assertion, Router Request) with request-content-hash binding that replace the shared-HMAC single-key invocation model.
+summary: Defines per-agent secrets and direction-typed request-bound JWTs, including exact instance/enable-generation private assertions that never substitute for user or admin identity.
 ---
 
 # DS013 Per-Agent Identity and Request-Signed JWT Families
@@ -45,6 +45,27 @@ All three are JWS with HS256; the verifier fixes the algorithm and never reads i
 
 **Agent Assertion** (`Agent/lib/agentAssertion.mjs` signer; `verifyAgentAssertion` in `cli/server/mcp-proxy/invocationMinter.js` verifier): claims `typ:agent-assertion`, `iss == sub == agent:<repo>/<agent>`, `aud:ploinky-router`, `method`, `path`, `targetAgent`, `tool`, `rch`, `iat`, `exp` (≤60s), `jti`. The router parses `iss` UNTRUSTED, requires it to match `agent:<repo>/<agent>`, derives that agent's secret, and verifies HS256 with it — so an agent that holds only its own secret cannot forge an assertion for another agent. It then requires `typ`, `aud:ploinky-router`, `sub == iss`, `method`/`path`/`tool`/`rch` to match the actual request, `targetAgent` to match the addressed route, time validity, and `jti` single-use. Identity ≠ authorization: MCP policy (DS014) is applied after the assertion verifies.
 
+Private HTTP-service assertions are a distinct private-Router assertion variant
+with their own `typ`, audience, header, and per-instance/per-enable-generation
+derived secret. Their authoritative identity tuple is the canonical
+`agent:<repo>/<agent>` id, the exact effective runtime instance id, and the
+current enable generation. The route key or alias selects the enabled record and
+service ACL but never substitutes for any tuple member. The common prelaunch
+batch assigns and activates this tuple before process creation; runtime launch
+must preserve it exactly. Re-enable, replacement, or rebinding assigns a new
+tuple, so a stable per-agent secret or stale route alias is insufficient for a
+private call. Assertions bind the exact effective instance id and current enable
+generation, method, canonical path, query, body hash, target service, expiry,
+and replay id. Verification on listener `8081` requires the compiled service
+policy to admit `authenticated`, the caller ACL to name that exact current
+instance/generation, and the route-and-policy authorization-generation lease to
+remain current immediately before dial. Omitted or wildcard identity, a
+re-enabled/stale generation, replay, wrong type/audience/path/method/body, or
+presentation on the public listener fails. The assertion header is stripped
+before upstream connection creation. A private assertion is not a User Session,
+User Delegation Grant, Router Request, LiveKit JWT, or admin credential and never
+mints a user/guest identity.
+
 **Router Request** (`buildRouterRequest` in `cli/server/mcp-proxy/invocationMinter.js`; `verifyRouterRequestFromHeaders` in `Agent/lib/invocationAuth.mjs`): claims `typ:router-request`, `iss:ploinky-router`, `aud:agent:<repo>/<agent>`, `sub`, `actor{kind,id,roles}`, `method`, `path`, optional `tool`, `rch`, `iat`, `exp` (≤30s), `jti`, optional singular `delegation`, and optional plural `delegations`. The singular `delegation` claim describes the delegation this request is running under after the router has verified a User Delegation Grant. The plural `delegations` claim carries router-minted downstream grants that the target agent may present back to the router later. These two claims are intentionally independent and must not be normalized into each other. The router signs with the TARGET agent's secret. The target agent verifies with its own `PLOINKY_AGENT_SECRET` and `PLOINKY_AGENT_ID` audience: signature, `typ:router-request`, `iss:ploinky-router`, `aud == PLOINKY_AGENT_ID`, `method`/`path`/`tool` match, recompute and match `rch`, time validity, `jti` single-use. A valid HMAC with the wrong type, audience, method, path, tool, or `rch` is not valid for execution.
 
 ### Router-Issued User Delegation Grant
@@ -76,12 +97,20 @@ Every agent container receives the following reserved environment variables from
 | `PLOINKY_AGENT_ID` | Canonical agent principal: `agent:<repo>/<agentName>` |
 | `PLOINKY_AGENT_PRINCIPAL` | Alias for `PLOINKY_AGENT_ID` |
 | `PLOINKY_AGENT_SECRET` | Per-agent HMAC signing secret (hex) derived from master via HKDF |
+| `PLOINKY_AGENT_INSTANCE_ID` | Exact effective runtime instance bound into private Router assertions |
+| `PLOINKY_AGENT_ENABLE_GENERATION` | Exact enable generation bound into private Router assertions and caller ACLs |
+| `PLOINKY_AGENT_PRIVATE_SECRET` | 32-byte hex assertion secret derived for this exact agent/instance/enable-generation tuple |
 | `PLOINKY_AGENT_API_KEY` | Signed-subject identity key: `<subjectId>|<base64url-ed25519-sig>` |
 | `PLOINKY_AGENT_API_PUBLIC_KEY` | Ed25519 public key for verifying signed-subject identity keys |
 | `PLOINKY_ENV_SOURCE_PLOINKY_AGENT_API_KEY` | Always `generated` (provenance marker) |
 | `PLOINKY_ENV_SOURCE_PLOINKY_AGENT_API_PUBLIC_KEY` | Always `generated` (provenance marker) |
 
-`PLOINKY_MASTER_KEY` and `PLOINKY_DERIVED_MASTER_KEY` are never injected into an agent (asserted by `tests/unit/agentEnvInjection.test.mjs`). The agent verifier reads only `PLOINKY_AGENT_SECRET` with no fallback to the master or a shared key. Router and agent logs must not record secrets or whole JWTs.
+`PLOINKY_MASTER_KEY` and `PLOINKY_DERIVED_MASTER_KEY` are never injected into an agent (asserted by `tests/unit/agentEnvInjection.test.mjs`). Ordinary Agent Assertions and Router Requests use only `PLOINKY_AGENT_SECRET`; private service calls use only the exact tuple's `PLOINKY_AGENT_PRIVATE_SECRET`. Neither path falls back to the master, the other assertion secret, or a shared key. Router and agent logs must not record secrets or whole JWTs.
+
+This injection contract is identical for container, bwrap, and Seatbelt
+runtimes. Identity construction is mandatory and fail-closed. Container labels
+and sandbox PID records persist the exact instance/enable-generation tuple so a
+name or mutable registry entry cannot reuse credentials for an older process.
 
 This remains true even for delegated-user flows. Agents do not receive the router's session key or delegation-signing key and cannot mint User Delegation Grants themselves; they still receive only their own per-agent secret.
 
@@ -144,6 +173,25 @@ Response: HKDF is one-way, so the router/launcher derive and inject only the per
 
 ### Question #5: Why was the service-specific credential alias removed?
 Response: Decision 2026-06-24: the signed-subject API credential is router-owned subject identity material, not a service-specific credential. Agents receive `PLOINKY_AGENT_API_KEY` and `PLOINKY_AGENT_API_PUBLIC_KEY` only; the temporary explicit-override bridge is removed. The identity signing keypair name changed with this hard cut, so first router start after the change creates a new identity signing keypair and a coordinated restart is required for consumers to receive the matching public key.
+
+### Question #6: Why is a private assertion not a user or administrator credential?
+Response: The assertion proves that one exact effective instance at one enable
+generation originated one request-bound service call. It carries no human
+identity, consent, or administrative role, so treating it as a session would let
+an agent convert launch capability into browser or control-plane authority. The
+private listener therefore verifies the separately derived tuple secret and
+composes the assertion with authenticated service policy plus an exact caller
+ACL without minting a user or guest. Re-enable rotates both the tuple and its
+secret, making a previously valid runtime unable to call as its replacement.
+
+### Question #7: Why bind launcher ownership records as well as assertion claims?
+
+Response:
+A correctly signed assertion is current only if the process holding its derived
+secret is the process selected by the immutable generation. Engine labels or a
+sandbox PID/start-identity record bind that physical launch to the same tuple;
+without that independent evidence, mutable state or name reuse could make an
+older runtime appear current.
 
 ## Conclusion
 

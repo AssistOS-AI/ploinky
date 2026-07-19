@@ -7,6 +7,7 @@ import * as workspaceSvc from '../../services/workspace.js';
 import { collectLiveAgentContainers } from '../../services/docker/index.js';
 import { collectAgentsSummary } from '../../services/status.js';
 import { isLocalAdminUser } from '../auth/localService.js';
+import { verifyAdminMutationRequest } from '../adminControlSecurity.js';
 import { authService, LOCAL_AUTH_COOKIE_NAME, parseCookies, readJsonBody, sendJson, sessionTokenService, SSO_AUTH_COOKIE_NAME } from './shared.js';
 
 function parseMarketplacePath(pathname = '') {
@@ -64,6 +65,16 @@ function normalizeMarketplaceEnableMode(value) {
         throw new Error('invalid_enable_mode');
     }
     return mode;
+}
+
+export async function enableMarketplaceAgent(body, {
+    enable = agentsSvc.enableAgent,
+} = {}) {
+    const ref = normalizeMarketplaceAgentRef(body?.agentRef);
+    const mode = normalizeMarketplaceEnableMode(body?.mode || body?.enableMode);
+    const repoName = ref.split('/')[0];
+    const result = await enable(ref, mode === 'isolated' ? undefined : mode, mode === 'devel' ? repoName : undefined);
+    return { ref, mode, result };
 }
 
 function disableMarketplaceAgentsForRepo(repoName) {
@@ -215,7 +226,12 @@ async function ensureMarketplaceUser(req, res) {
     return { ok: false };
 }
 
-export async function handleMarketplaceRoutes(req, res, parsedUrl) {
+export async function handleMarketplaceRoutes(req, res, parsedUrl, {
+    routePlan = null,
+    ensureAdmin = ensureMarketplaceAdmin,
+    readBody = readJsonBody,
+    enableAgentAction = enableMarketplaceAgent,
+} = {}) {
     const route = parseMarketplacePath(parsedUrl.pathname || '/');
     if (!route) return false;
 
@@ -232,14 +248,27 @@ export async function handleMarketplaceRoutes(req, res, parsedUrl) {
     }
 
     if (method === 'POST' && !route.resource) {
-        if (!(await ensureMarketplaceAdmin(req, res, parsedUrl))) {
+        if (routePlan?.lease?.commit && routePlan.lease.commit() !== true) {
+            sendMarketplaceError(res, 503, 'edge_generation_changed');
+            return true;
+        }
+        if (!(await ensureAdmin(req, res, parsedUrl))) {
+            return true;
+        }
+        const mutationDecision = verifyAdminMutationRequest(req, req.sessionId);
+        if (!mutationDecision.ok) {
+            sendMarketplaceError(res, 403, mutationDecision.code.toLowerCase(), 'Exact control Origin and CSRF proof are required.');
             return true;
         }
         let body;
         try {
-            body = await readJsonBody(req);
+            body = await readBody(req);
         } catch (_) {
             sendMarketplaceError(res, 400, 'invalid_json', 'Request body must be valid JSON.');
+            return true;
+        }
+        if (routePlan?.lease?.commit && routePlan.lease.commit() !== true) {
+            sendMarketplaceError(res, 503, 'edge_generation_changed');
             return true;
         }
 
@@ -277,10 +306,7 @@ export async function handleMarketplaceRoutes(req, res, parsedUrl) {
             }
 
             if (action === 'enable_agent') {
-                const ref = normalizeMarketplaceAgentRef(body?.agentRef);
-                const mode = normalizeMarketplaceEnableMode(body?.mode || body?.enableMode);
-                const repoName = ref.split('/')[0];
-                const result = agentsSvc.enableAgent(ref, mode === 'isolated' ? undefined : mode, mode === 'devel' ? repoName : undefined);
+                const { result } = await enableAgentAction(body);
                 sendJson(res, 200, {
                     ok: true,
                     action,

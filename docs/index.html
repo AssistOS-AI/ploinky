@@ -199,6 +199,7 @@
                     <h3>Installation</h3>
                     <pre><code>$ git clone https://github.com/AssistOS-AI/ploinky.git
 $ cd ploinky
+$ # Optional but recommended for an operator-managed workspace key
 $ echo 'PLOINKY_MASTER_KEY=change-me-to-a-random-secret' &gt; .env
 $ npm install
 $ echo 'export PATH="$PATH:$HOME/Desktop/work/ploinky/bin"' &gt;&gt; ~/.bashrc
@@ -206,7 +207,7 @@ $ source ~/.bashrc
 $ cd ~/Desktop/work
 $ ploinky start explorer
 </code></pre>
-                    <p><code>PLOINKY_MASTER_KEY</code> is required before Ploinky can start because it derives workspace secrets from that value. Any non-empty value works for local testing, but a long random value is recommended. You can keep it in the project <code>.env</code> file as shown above or export it in your shell.</p>
+                    <p><code>PLOINKY_MASTER_KEY</code> is recommended because Ploinky derives workspace secrets from the resolved master seed. Any non-empty value works for local testing, but a long random value is better for operator-managed deployments. If neither the process environment nor a walked-up <code>.env</code> defines the key, Ploinky creates a persistent fallback seed at <code>.ploinky/master-key</code> so local agent startup can continue.</p>
                     <p>The <code>PATH</code> line above points to the cloned Ploinky <code>bin</code> directory and makes <code>ploinky</code> available in new Bash sessions. If your clone lives somewhere else, replace <code>$HOME/Desktop/work/ploinky/bin</code> with that path. For Zsh, add the same line to <code>~/.zshrc</code>.</p>
 
                     <div style="text-align: center; margin-top: 3rem;">

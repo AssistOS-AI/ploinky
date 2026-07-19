@@ -3,6 +3,8 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 
 const originalCwd = process.cwd();
 const originalMasterKey = process.env.PLOINKY_MASTER_KEY;
@@ -36,6 +38,8 @@ const {
     getProfileEnvVars,
     getValidProfiles,
     isValidProfile,
+    resolveManifestProfile,
+    resolveManifestRuntimeProfile,
 } = profileService;
 
 const {
@@ -121,7 +125,7 @@ test('getProfileConfig returns the profile config when present', () => {
 
     const config = getProfileConfig('repo-two/agent-two', 'dev');
     // Result is merged: default + dev (dev overrides)
-    assert.deepStrictEqual(config, { env: { NODE_ENV: 'development' } });
+    assert.deepStrictEqual(config, { env: { NODE_ENV: 'development' }, network: { mode: 'default' } });
 });
 
 test('getProfileConfig lets active profile network replace default network', () => {
@@ -129,8 +133,8 @@ test('getProfileConfig lets active profile network replace default network', () 
         profiles: {
             default: {
                 network: {
-                    name: 'webmeet',
-                    aliases: ['webmeetLivekitServer'],
+                    mode: 'bridge',
+                    attachments: [{ name: 'webmeet', primary: true }],
                 },
             },
             prod: {
@@ -145,20 +149,57 @@ test('getProfileConfig lets active profile network replace default network', () 
     assert.deepStrictEqual(config.network, { mode: 'host' });
 });
 
-test('getProfileConfig lets active profile additionalServerPort replace default additionalServerPort', () => {
-    writeManifest('repo-server', 'agent-server', {
+test('profile fallback resolves the default profile and its network atomically', () => {
+    const manifest = {
+        network: { mode: 'host' },
         profiles: {
-            default: {
-                additionalServerPort: '3000',
-            },
-            prod: {
-                additionalServerPort: '8080',
-            },
+            default: { env: { TARGET: 'default' }, network: { mode: 'none' } },
+            prod: { env: { TARGET: 'prod' }, network: { mode: 'host' } },
         },
+    };
+
+    const resolution = resolveManifestProfile(manifest, 'missing-global-profile', {
+        agentName: 'repo/agent',
     });
 
-    const config = getProfileConfig('repo-server/agent-server', 'prod');
-    assert.equal(config.additionalServerPort, '8080');
+    assert.equal(resolution.requestedProfileName, 'missing-global-profile');
+    assert.equal(resolution.resolvedProfileName, 'default');
+    assert.deepEqual(resolution.profileConfig, {
+        env: { TARGET: 'default' },
+        network: { mode: 'none' },
+    });
+    assert.deepEqual(resolution.network, { mode: 'none' });
+});
+
+test('explicit and persisted missing profiles fail instead of inheriting root network', () => {
+    const manifest = {
+        network: { mode: 'host' },
+        profiles: {
+            default: { network: { mode: 'none' } },
+        },
+    };
+
+    for (const selection of [
+        { profileName: 'missing-option' },
+        { persistedProfileName: 'missing-record' },
+    ]) {
+        assert.throws(
+            () => resolveManifestRuntimeProfile(manifest, {
+                agentName: 'repo/agent',
+                fallbackProfileName: 'default',
+                ...selection,
+            }),
+            (error) => error?.code === 'PLOINKY_PROFILE_NOT_FOUND',
+        );
+    }
+
+    assert.throws(
+        () => resolveManifestRuntimeProfile({ network: { mode: 'host' } }, {
+            agentName: 'repo/legacy-agent',
+            profileName: 'prod',
+        }),
+        (error) => error?.code === 'PLOINKY_PROFILE_NOT_FOUND',
+    );
 });
 
 test('validateProfile reports missing secrets', () => {
@@ -181,7 +222,7 @@ test('validateProfile reports missing secrets', () => {
     }
 });
 
-test('validateProfile reports required non-sensitive env without profile defaults', () => {
+test('validateProfile resolves operator-required env and reports every missing explicit value', () => {
     writeManifest('repo-profile-env', 'agent-profile-env', {
         profiles: {
             default: {},
@@ -203,7 +244,7 @@ test('validateProfile reports required non-sensitive env without profile default
     const result = validateProfile('repo-profile-env/agent-profile-env', 'prod');
     assert.strictEqual(result.valid, false);
     assert.ok(result.issues.some(issue => issue.includes('PUBLIC_ENDPOINT')));
-    assert.ok(!result.issues.some(issue => issue.includes('SERVICE_API_KEY')));
+    assert.ok(result.issues.some(issue => issue.includes('SERVICE_API_KEY')));
 });
 
 test('validateProfile accepts complete non-sensitive env defaults and generated secrets', () => {
@@ -231,8 +272,15 @@ test('validateProfile accepts complete non-sensitive env defaults and generated 
         }
     });
 
-    const result = validateProfile('repo-profile-complete/agent-profile-complete', 'prod');
-    assert.strictEqual(result.valid, true);
+    const previousServiceSecret = process.env.SERVICE_SECRET;
+    process.env.SERVICE_SECRET = 'operator-supplied-test-secret';
+    try {
+        const result = validateProfile('repo-profile-complete/agent-profile-complete', 'prod');
+        assert.strictEqual(result.valid, true);
+    } finally {
+        if (previousServiceSecret === undefined) delete process.env.SERVICE_SECRET;
+        else process.env.SERVICE_SECRET = previousServiceSecret;
+    }
 });
 
 test('validateProfile succeeds when secrets and hooks are present', () => {
@@ -440,7 +488,7 @@ test('createAgentWorkDir creates agent workspace folder', () => {
     const workDir = createAgentWorkDir(agentName);
 
     assert.strictEqual(workDir, getAgentWorkDir(agentName));
-    assert.strictEqual(workDir, path.join(tempDir, '.data', agentName));
+    assert.strictEqual(workDir, path.join(fs.realpathSync(tempDir), '.data', agentName));
     assert.ok(fs.statSync(workDir).isDirectory());
 });
 
@@ -579,4 +627,40 @@ test('getProfileConfig falls back to default when agent has no matching semantic
 
     const config = getProfileConfig('semantic-fallback/agent-fallback', 'embedded');
     assert.deepStrictEqual(config.env, { PORT: '8042' });
+});
+
+test('start command rejects an invalid explicit profile before creating workspace start state', () => {
+    const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-start-profile-'));
+    const cliCommandsPath = fileURLToPath(new URL('../../cli/commands/cli.js', import.meta.url));
+    try {
+        const script = `
+            const { handleCommand } = await import(${JSON.stringify(new URL(`file://${cliCommandsPath}`).href)});
+            try {
+                await handleCommand(['start', 'explorer', '--profile', 'does-not-exist']);
+                console.log(JSON.stringify({ ok: true }));
+            } catch (error) {
+                console.log(JSON.stringify({ ok: false, message: error.message }));
+            }
+        `;
+        const result = spawnSync(process.execPath, ['--input-type=module', '-e', script], {
+            cwd: workspace,
+            encoding: 'utf8',
+            env: { ...process.env, PLOINKY_MASTER_KEY: '5'.repeat(64) },
+        });
+        assert.equal(result.status, 0, result.stderr || result.stdout);
+        const output = JSON.parse(result.stdout.trim().split('\n').at(-1));
+        assert.equal(output.ok, false);
+        assert.match(output.message, /Invalid profile 'does-not-exist'/);
+        assert.equal(fs.existsSync(path.join(workspace, '.ploinky', 'workspace.json')), false);
+    } finally {
+        fs.rmSync(workspace, { recursive: true, force: true });
+    }
+});
+
+test('public and in-box help use the canonical start profile form', () => {
+    const helpSource = fs.readFileSync(
+        fileURLToPath(new URL('../../cli/services/help.js', import.meta.url)),
+        'utf8',
+    );
+    assert.match(helpSource, /start <agent> \[port\] \[--profile <name>\]/);
 });

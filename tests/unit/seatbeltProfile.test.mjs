@@ -60,6 +60,31 @@ test('buildSeatbeltProfile grants root and parent literals for scoped paths', ()
     assert.ok(profile.includes('(allow file-write* (subpath "/Users/alice/workspace/workspace-data/uploads"))'));
 });
 
+test('buildSeatbeltProfile does not grant writes to read-only manifest volumes', () => {
+    const profile = buildSeatbeltProfile({
+        agentCodePath: '/Users/alice/workspace/.ploinky/repos/repo/agent',
+        agentLibPath: '/Users/alice/workspace/Agent',
+        nodeModulesDir: '/Users/alice/workspace/.ploinky/deps/node_modules',
+        agentWorkDir: '/Users/alice/workspace/.data/agent',
+        sharedDir: '/Users/alice/workspace/.ploinky/shared',
+        cwd: '/Users/alice/workspace',
+        skillsPath: null,
+        codeReadOnly: true,
+        skillsReadOnly: true,
+        volumes: {
+            '.ploinky/data/secret': '/run/secret',
+        },
+        volumeOptions: {
+            '/run/secret': { readOnly: true },
+        },
+        workspaceRoot: '/Users/alice/workspace',
+    });
+
+    assert.match(profile, /\(subpath "\/Users\/alice\/workspace\/\.ploinky\/data\/secret"\)/);
+    assert.doesNotMatch(profile, /\(allow file-write\* \(subpath "\/Users\/alice\/workspace\/\.ploinky\/data\/secret"\)\)/);
+    assert.match(profile, /\(deny file-write\*[\s\S]*\(subpath "\/Users\/alice\/workspace\/\.ploinky\/data\/secret"\)/);
+});
+
 test('buildSeatbeltProfile protects read-only paths even under writable workspace', () => {
     const profile = buildSeatbeltProfile({
         agentCodePath: '/Users/alice/workspace/.ploinky/repos/AchillesIDE/explorer',

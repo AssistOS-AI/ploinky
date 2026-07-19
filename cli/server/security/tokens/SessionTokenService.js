@@ -60,7 +60,7 @@ export class SessionTokenService {
         if (usersVar && payloadUsersVar !== usersVar) {
             return null;
         }
-        if (this._resolveUserRev) {
+        if (this._resolveUserRev && usersVar) {
             const currentRev = this._resolveUserRev(usersVar, payload.usr.username || '');
             if (currentRev !== (payload.rev || 1)) return null;
         }

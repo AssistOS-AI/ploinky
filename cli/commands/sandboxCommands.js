@@ -6,6 +6,10 @@ import {
 function printSandboxStatus(status = getSandboxStatus()) {
     const state = status.disabled ? 'disabled' : 'enabled';
     console.log(`Host sandbox runtimes: ${state} (${status.source})`);
+    if (status.forced) {
+        console.log('Ploinky box policy is forced: every managed agent uses nested Podman.');
+        return;
+    }
     if (status.disabled) {
         console.log('Agents that request bwrap/seatbelt will use podman/docker instead.');
     } else {

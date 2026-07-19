@@ -13,19 +13,37 @@ import * as staticSrv from './static/index.js';
 import {
     ensureAuthenticated,
     ensureHttpRouteAccess,
+    buildIdentityHeaders,
     handleAuthRoutes,
     handleMarketplaceRoutes,
     handleUserAdminRoutes,
     resolveRouteDefaultHttpAccess,
 } from './authHandlers/index.js';
 import {
+    buildTrustedForwardingHeaders,
     loadApiRoutes,
     handleRouterMcp,
     handleHttpServiceRoute,
     proxyHttpPassthrough
 } from './routerHandlers.js';
-import { collectHttpServiceRoutes, resolveHttpServiceRoute } from './httpServiceRoutes.js';
-import { handleProfileServerUpgrade, proxyProfileServer } from './profileServerProxy.js';
+import { collectHttpServiceRoutes } from './httpServiceRoutes.js';
+import { handleHttpServiceUpgrade } from './wsServiceProxy.js';
+import {
+    commitRoutePlan,
+    normalizeExactHost,
+    resolveEdgeRoutePlan,
+} from './edgeRoutePlan.js';
+import {
+    authorizePrivateRoutePlan,
+    mintTurnCredentials,
+    readPrivateRequestBody,
+    sendPrivateError,
+} from './privateRouter.js';
+import { handleEdgeTopologyProjection } from './edgeTopologyRoute.js';
+import { createListenerInterfaceClassifier } from './listenerInterfaceClassifier.js';
+import { createPrivateListenerSet } from './privateListenerSet.js';
+import { verifyBrowserMutationRequest } from './browserMutationSecurity.js';
+import { requireAdminControlRequest } from './adminControlSecurity.js';
 
 // Logging
 import { appendLog, logBootEvent, logMemoryUsage } from './utils/logger.js';
@@ -55,10 +73,22 @@ import {
     isDelegatedAgentOpenAiCall,
     handleDelegatedAgentOpenAiCall,
 } from './agentOpenAiDelegation.js';
+import { PLOINKY_DIR } from '../services/config.js';
+import { startCloudflarePublicationRuntime } from '../services/cloudflarePublicationRuntime.js';
+import { requestAgentCard } from './agentCardFanout.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const MCP_BROWSER_CLIENT_PATH = path.resolve(__dirname, '../../Agent/client/MCPBrowserClient.js');
+const port = 8080;
+const privatePort = 8081;
+const detailedHealthSocket = process.env.PLOINKY_ROUTER_HEALTH_SOCKET
+    || path.join(PLOINKY_DIR, 'run', 'router-health.sock');
+const interfaceClassifier = createListenerInterfaceClassifier();
+
+if (Object.prototype.hasOwnProperty.call(process.env, 'PORT') && process.env.PORT !== String(port)) {
+    throw new Error('runtime contract v5 requires PORT to be exactly 8080 when set; --port selects only the outer loopback host port');
+}
 
 // Initialize TTY factories
 const { getWebchatFactory } = await initializeTTYFactories();
@@ -156,19 +186,6 @@ function extractAgentName(pathname, routes = loadApiRoutes()) {
     return agentName;
 }
 
-function extractProfileServerHostAgentName(hostHeader, routes = loadApiRoutes()) {
-    const host = String(hostHeader || '').split(':')[0].trim().toLowerCase();
-    if (!host.endsWith('.localhost')) return null;
-    const label = host.slice(0, -'.localhost'.length);
-    if (!label) return null;
-    for (const routeKey of Object.keys(routes || {})) {
-        if (String(routeKey || '').toLowerCase() === label && routes[routeKey]?.additionalServerPort) {
-            return routeKey;
-        }
-    }
-    return null;
-}
-
 function isRouterOwnedPath(pathname) {
     return pathname === '/agent-card'
         || pathname === '/agent-card/'
@@ -179,6 +196,7 @@ function isRouterOwnedPath(pathname) {
         || pathname === '/api/marketplace'
         || pathname.startsWith('/api/marketplace/')
         || pathname.startsWith('/api/router/')
+        || pathname === '/api/edge/topology'
         // Internal, non-policy-routable router-owned routes (DS014).
         || pathname === '/policy/command'
         || pathname === '/metrics'
@@ -211,10 +229,6 @@ function buildAgentProxyPath(agentName, parsedUrl) {
     return `${upstreamPath || '/'}${parsedUrl?.search || ''}`;
 }
 
-function buildRootProxyPath(parsedUrl) {
-    return `${parsedUrl?.pathname || '/'}${parsedUrl?.search || ''}`;
-}
-
 function hasDelegatedAgentAssertion(req) {
     // Agent-to-agent calls carry an Agent Assertion as `Authorization: Bearer`.
     // Browser callers use session cookies, so a bearer at /<agent>/mcp signals an
@@ -235,8 +249,10 @@ function isAgentTaskStatusProxyPath(agentProxyPath) {
     return value === '/task' || value === '/getTaskStatus';
 }
 
-function getStaticRouteName(routes = loadApiRoutes()) {
-    const staticAgent = staticSrv.getStaticAgentName();
+function getStaticRouteName(routes, snapshot) {
+    const staticAgent = typeof snapshot?.routing?.static?.agent === 'string'
+        ? snapshot.routing.static.agent.trim()
+        : '';
     if (!staticAgent) return null;
     const shortName = staticAgent.includes('/') ? staticAgent.split('/').pop() : staticAgent;
     if (routes[staticAgent]) return staticAgent;
@@ -248,83 +264,23 @@ function getStaticRouteName(routes = loadApiRoutes()) {
     return null;
 }
 
-function requestAgentCard(route, agentName, identityHeaders = {}) {
-    return new Promise((resolve) => {
-        const upstream = http.request({
-            hostname: '127.0.0.1',
-            port: route.hostPort,
-            path: '/agent-card',
-            method: 'GET',
-            headers: {
-                accept: 'application/json',
-                ...identityHeaders
-            },
-            timeout: 5000
-        }, upstreamRes => {
-            const chunks = [];
-            upstreamRes.on('data', chunk => chunks.push(chunk));
-            upstreamRes.on('end', () => {
-                const body = Buffer.concat(chunks).toString('utf8');
-                const statusCode = upstreamRes.statusCode || 0;
-                if (statusCode < 200 || statusCode >= 300) {
-                    resolve({
-                        ok: false,
-                        error: {
-                            name: agentName,
-                            statusCode,
-                            error: body || `HTTP ${statusCode}`
-                        }
-                    });
-                    return;
-                }
-                try {
-                    resolve({
-                        ok: true,
-                        agent: {
-                            name: agentName,
-                            statusCode,
-                            payload: body ? JSON.parse(body) : null
-                        }
-                    });
-                } catch (_) {
-                    resolve({
-                        ok: true,
-                        agent: {
-                            name: agentName,
-                            statusCode,
-                            body
-                        }
-                    });
-                }
-            });
-        });
-        upstream.on('timeout', () => {
-            upstream.destroy(new Error('agent-card request timed out'));
-        });
-        upstream.on('error', err => {
-            resolve({
-                ok: false,
-                error: {
-                    name: agentName,
-                    error: err?.message || String(err)
-                }
-            });
-        });
-        upstream.end();
-    });
-}
-
-async function handleRoutedAggregateAgentCard(req, res) {
+async function handleRoutedAggregateAgentCard(req, res, routePlan) {
     const method = (req.method || 'GET').toUpperCase();
     if (method !== 'GET') {
         sendJsonResponse(res, 405, { error: 'method_not_allowed' }, { Allow: 'GET' });
         return;
     }
-    const apiRoutes = loadApiRoutes();
+    if (!routePlan?.lease?.commit?.()) {
+        sendJsonResponse(res, 503, { error: 'edge_generation_changed' }, { 'Cache-Control': 'no-store' });
+        return;
+    }
+    const apiRoutes = routePlan.lease.snapshot?.routing?.routes || {};
     const candidates = Object.entries(apiRoutes || {})
         .filter(([, route]) => route && !route.disabled && route.hostPort);
     const results = await Promise.all(candidates.map(([agentName, route]) =>
-        requestAgentCard(route, agentName, req.headers)
+        requestAgentCard(route, agentName, req.headers, {
+            beforeDial: () => routePlan?.lease?.commit?.() === true,
+        })
             .catch(error => ({
                 ok: false,
                 error: {
@@ -335,6 +291,10 @@ async function handleRoutedAggregateAgentCard(req, res) {
     ));
     const agents = [];
     const errors = [];
+    if (results.some((result) => result?.generationChanged)) {
+        sendJsonResponse(res, 503, { error: 'edge_generation_changed' }, { 'Cache-Control': 'no-store' });
+        return;
+    }
     for (const result of results) {
         if (result.ok) {
             agents.push(result.agent);
@@ -349,16 +309,45 @@ async function handleRoutedAggregateAgentCard(req, res) {
  * Main request processor
  */
 async function processRequest(req, res) {
-    const parsedUrl = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
-    const pathname = parsedUrl.pathname || '/';
+    const exactHost = normalizeExactHost(req.headers.host);
+    if (!exactHost || !String(req.url || '').startsWith('/')) {
+        sendJsonResponse(res, 400, { error: 'malformed_request_target_or_host' }, { 'Cache-Control': 'no-store' });
+        return;
+    }
+    let requestedUrl;
+    try {
+        requestedUrl = new URL(req.url || '/', `http://${exactHost === '::1' ? '[::1]' : exactHost}`);
+    } catch (_) {
+        sendJsonResponse(res, 400, { error: 'malformed_request_target_or_host' }, { 'Cache-Control': 'no-store' });
+        return;
+    }
+    const listener = interfaceClassifier.classify(req.socket?.localAddress) === 'managed'
+        ? 'managed'
+        : 'public';
+    req.ploinkyListenerClass = listener;
+    const routePlan = resolveEdgeRoutePlan({ req, parsedUrl: requestedUrl, listener });
+    const controlMiss = !routePlan.ok
+        && routePlan.code === 'ROUTE_NOT_FOUND'
+        && routePlan.hostSelection?.kind === 'control';
+    if (!routePlan.ok && !controlMiss) {
+        const proofHeaders = routePlan.code === 'HOST_SELECTOR_INACTIVE' && routePlan.lease?.id
+            ? { 'X-Ploinky-Edge-Generation': routePlan.lease.id }
+            : {};
+        sendJsonResponse(
+            res,
+            routePlan.status || 404,
+            { error: routePlan.code || 'route_denied' },
+            { 'Cache-Control': 'no-store', ...proofHeaders },
+        );
+        return;
+    }
+    const parsedUrl = routePlan.ok && routePlan.parsedUrl ? routePlan.parsedUrl : requestedUrl;
+    const pathname = routePlan.ok && routePlan.canonicalPath ? routePlan.canonicalPath : requestedUrl.pathname || '/';
     const routedAggregateAgentCard = pathname === '/agent-card' || pathname === '/agent-card/';
-    const apiRoutes = loadApiRoutes();
-    const profileServerHostAgentName = extractProfileServerHostAgentName(req.headers.host, apiRoutes);
-    const agentName = profileServerHostAgentName || (isRouterOwnedPath(pathname) ? null : extractAgentName(pathname, apiRoutes));
+    const apiRoutes = routePlan.snapshot?.routing?.routes || routePlan.lease?.snapshot?.routing?.routes || {};
+    const agentName = routePlan.ok && routePlan.kind === 'agent-root' ? routePlan.routeKey : null;
     const route = agentName ? apiRoutes[agentName] : null;
-    const agentProxyPath = profileServerHostAgentName
-        ? buildRootProxyPath(parsedUrl)
-        : (agentName ? buildAgentProxyPath(agentName, parsedUrl) : '');
+    const agentProxyPath = agentName ? routePlan.upstreamPath : '';
     const isAgentMcpRoute = Boolean(agentName && (agentProxyPath === '/mcp' || agentProxyPath.startsWith('/mcp?') || agentProxyPath.startsWith('/mcp/')));
     // Path-exact delegated agent OpenAI bypass: ONLY POST /<routeKey>/v1/chat/completions
     // with an Agent Assertion. No other agent-prefixed HTTP path uses this bypass.
@@ -368,18 +357,9 @@ async function processRequest(req, res) {
         agentProxyPath,
         req,
     });
-    const serviceDefinition = !agentName && !profileServerHostAgentName && !isRouterOwnedPath(pathname)
-        ? resolveHttpServiceRoute(pathname)
-        : null;
-    const policyGatedRouteKey = agentName && !isAgentMcpRoute
-        ? agentName
-        : serviceDefinition?.routeKey || '';
-    const httpRouteAccess = (!profileServerHostAgentName && agentName && !isAgentMcpRoute) || serviceDefinition
-        ? policy.httpRouteAccessPolicy.evaluate({
-            pathname,
-            method: req.method || 'GET',
-            routeKey: policyGatedRouteKey,
-        })
+    const serviceDefinition = routePlan.ok && routePlan.kind === 'service' ? routePlan.definition : null;
+    const httpRouteAccess = routePlan.ok && (agentName && !isAgentMcpRoute || serviceDefinition)
+        ? routePlan.decision
         : null;
     const isDelegatedAgentTaskStatusRoute = Boolean(
         agentName
@@ -389,33 +369,6 @@ async function processRequest(req, res) {
     );
     let agentProxyExtraHeaders = {};
     appendLog('http_request', { method: req.method, path: pathname });
-
-    // Health check endpoint (no auth required)
-    if (pathname === '/health') {
-        const memUsage = process.memoryUsage();
-        const healthData = {
-            status: 'healthy',
-            uptime: process.uptime(),
-            timestamp: new Date().toISOString(),
-            pid: process.pid,
-            memory: {
-                rss: memUsage.rss,
-                heapUsed: memUsage.heapUsed,
-                heapTotal: memUsage.heapTotal,
-                rssMB: Math.round(memUsage.rss / 1024 / 1024),
-                heapUsedMB: Math.round(memUsage.heapUsed / 1024 / 1024)
-            },
-            activeSessions: {
-                webchat: globalState.webchat.sessions.size,
-                dashboard: globalState.dashboard.sessions.size,
-                status: globalState.status.sessions.size,
-                agent: agentSessionStore.size
-            }
-        };
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify(healthData, null, 2));
-        return;
-    }
 
     // MCP Browser Client
     if (pathname === '/MCPBrowserClient.js') {
@@ -440,17 +393,17 @@ async function processRequest(req, res) {
 
     // Authentication routes
     if (pathname.startsWith('/auth/')) {
-        const handled = await handleAuthRoutes(req, res, parsedUrl);
+        const handled = await handleAuthRoutes(req, res, parsedUrl, { routePlan });
         if (handled) return;
     }
 
     if (pathname.startsWith('/api/agents/')) {
-        const handled = await handleUserAdminRoutes(req, res, parsedUrl);
+        const handled = await handleUserAdminRoutes(req, res, parsedUrl, { routePlan });
         if (handled) return;
     }
 
     if (pathname === '/api/marketplace' || pathname.startsWith('/api/marketplace/')) {
-        const handled = await handleMarketplaceRoutes(req, res, parsedUrl);
+        const handled = await handleMarketplaceRoutes(req, res, parsedUrl, { routePlan });
         if (handled) return;
     }
 
@@ -474,7 +427,7 @@ async function processRequest(req, res) {
     if (routedAggregateAgentCard) {
         // Public aggregate route
     } else if (pathname === '/mcp' || pathname === '/mcp/') {
-        const authResult = await ensureAuthenticated(req, res, parsedUrl);
+        const authResult = await ensureAuthenticated(req, res, parsedUrl, { routePlan });
         if (!authResult.ok) return;
     } else if (agentName && isAgentMcpRoute && hasDelegatedAgentAssertion(req)) {
         // Agent-to-agent MCP: the MCP proxy verifies the Agent Assertion.
@@ -510,7 +463,7 @@ async function processRequest(req, res) {
         }
     } else if (agentName && isAgentMcpRoute) {
         // Browser MCP keeps the existing surface auth (static fallback included).
-        const authResult = await ensureAuthenticated(req, res, parsedUrl);
+        const authResult = await ensureAuthenticated(req, res, parsedUrl, { routePlan });
         if (!authResult.ok) return;
     } else if (isDelegatedAgentOpenAi) {
         // Agent-to-agent OpenAI call: the delegation handler verifies the HTTP
@@ -518,11 +471,47 @@ async function processRequest(req, res) {
         // token. Skip browser/session auth for this path-exact bypass only.
     } else if (httpRouteAccess) {
         // One executor for transparent agent routes and declared HTTP services.
-        const accessResult = await ensureHttpRouteAccess(req, res, parsedUrl, httpRouteAccess);
+        const accessResult = await ensureHttpRouteAccess(req, res, parsedUrl, httpRouteAccess, { routePlan });
         if (!accessResult.ok) return;
     } else {
-        const authResult = await ensureAuthenticated(req, res, parsedUrl);
+        const authResult = await ensureAuthenticated(req, res, parsedUrl, { routePlan });
         if (!authResult.ok) return;
+    }
+
+    // The TCP health summary is a local control surface: authenticate first and
+    // require a real administrator session. Supervisors use the detailed Unix
+    // socket below, so readiness never depends on an anonymous TCP exception.
+    if (pathname === '/health') {
+        if (!requireAdminControlRequest(req, res)) return;
+        if ((req.method || 'GET').toUpperCase() !== 'GET') {
+            sendJsonResponse(res, 405, { error: 'method_not_allowed' }, {
+                'Allow': 'GET',
+                'Cache-Control': 'no-store',
+            });
+            return;
+        }
+        sendJsonResponse(res, 200, { status: 'healthy' }, { 'Cache-Control': 'no-store' });
+        return;
+    }
+
+    const method = String(req.method || 'GET').toUpperCase();
+    if (!['GET', 'HEAD', 'OPTIONS'].includes(method)
+        && (req.authMode === 'local' || req.authMode === 'sso')) {
+        const mutationProof = verifyBrowserMutationRequest(req, {
+            routePlan,
+            authContext: req.edgeAuthContext,
+            sessionId: req.sessionId,
+        });
+        if (!mutationProof.ok) {
+            sendJsonResponse(res, 403, {
+                error: String(mutationProof.code || 'BROWSER_MUTATION_DENIED').toLowerCase(),
+            }, { 'Cache-Control': 'no-store' });
+            return;
+        }
+        if (!commitRoutePlan(routePlan)) {
+            sendJsonResponse(res, 503, { error: 'edge_generation_changed' }, { 'Cache-Control': 'no-store' });
+            return;
+        }
     }
 
     // Router-owned: mint a router-signed user identity key. Reached only after
@@ -530,6 +519,11 @@ async function processRequest(req, res) {
     // for any unauthenticated caller and derives admin status internally).
     if (pathname === USER_IDENTITY_KEY_PATH) {
         const handled = await handleUserIdentityKeyRoute(req, res, parsedUrl);
+        if (handled) return;
+    }
+
+    if (pathname === '/api/edge/topology') {
+        const handled = handleEdgeTopologyProjection(req, res, parsedUrl, { routePlan });
         if (handled) return;
     }
 
@@ -546,12 +540,10 @@ async function processRequest(req, res) {
         return handleBlobs(req, res);
     } else if (staticSrv.serveWorkspaceFileRequest(req, res)) {
         return;
-    } else if (handleHttpServiceRoute(req, res, parsedUrl)) {
+    } else if (handleHttpServiceRoute(req, res, parsedUrl, routePlan)) {
         return;
     } else if (routedAggregateAgentCard) {
-        return handleRoutedAggregateAgentCard(req, res);
-    } else if (profileServerHostAgentName) {
-        return proxyProfileServer(req, res, route, agentProxyPath, agentProxyExtraHeaders);
+        return handleRoutedAggregateAgentCard(req, res, routePlan);
     } else if (agentName) {
         if (!route) {
             sendJsonResponse(res, 404, { error: 'agent_not_found', agent: agentName });
@@ -562,23 +554,38 @@ async function processRequest(req, res) {
             return;
         }
         if (isAgentMcpRoute) {
-            return handleAgentMcpRequest(req, res, route, agentName);
+            return handleAgentMcpRequest(req, res, route, agentName, {
+                beforeDial: () => commitRoutePlan(routePlan),
+                routePlan,
+            });
         }
         if (isDelegatedAgentOpenAi) {
-            return handleDelegatedAgentOpenAiCall(req, res, route, agentName, agentProxyPath);
+            return handleDelegatedAgentOpenAiCall(req, res, route, agentName, agentProxyPath, {
+                beforeDial: () => commitRoutePlan(routePlan),
+            });
         }
         // `__agent` control-plane paths are already refused at the top of the
         // dispatch (before http-service/passthrough handling), so anything that
         // reaches here is a normal agent request.
-        if (await staticSrv.serveAgentStaticRequest(req, res)) {
+        if (await staticSrv.serveAgentStaticRequest(req, res, {
+            routeKey: agentName,
+            hostPath: route.hostPath,
+            beforeRead: () => commitRoutePlan(routePlan),
+        })) {
             return;
         }
-        return proxyHttpPassthrough(req, res, route.hostPort, agentProxyPath, agentProxyExtraHeaders);
+        return proxyHttpPassthrough(req, res, route.hostPort, agentProxyPath, {
+            ...buildIdentityHeaders(req),
+            ...agentProxyExtraHeaders,
+            ...buildTrustedForwardingHeaders(routePlan),
+        }, {
+            beforeDial: () => commitRoutePlan(routePlan),
+        });
     } else if (pathname === '/mcp' || pathname === '/mcp/') {
-        return handleRouterMcp(req, res);
+        return handleRouterMcp(req, res, routePlan);
     } else {
         if (pathname === '/' || pathname === '/index.html') {
-            const staticRouteName = getStaticRouteName(apiRoutes);
+            const staticRouteName = getStaticRouteName(apiRoutes, routePlan?.lease?.snapshot);
             if (staticRouteName) {
                 res.writeHead(302, {
                     Location: `/${encodeURIComponent(staticRouteName)}/index.html`,
@@ -596,51 +603,231 @@ async function processRequest(req, res) {
 /**
  * Create and configure HTTP server
  */
-const server = http.createServer((req, res) => {
-    processRequest(req, res).catch(err => {
-        appendLog('request_error', { error: err?.message || String(err) });
-        if (!res.headersSent) {
-            try {
-                res.writeHead(500, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ ok: false, error: 'internal_error' }));
-            } catch (_) {
+function handleAsyncRequest(processor, eventName) {
+    return (req, res) => {
+        processor(req, res).catch(err => {
+            appendLog(eventName, { error: err?.message || String(err) });
+            if (!res.headersSent) {
+                try {
+                    res.writeHead(500, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+                    res.end(JSON.stringify({ ok: false, error: 'internal_error' }));
+                } catch (_) {
+                    try { res.end(); } catch (_) { }
+                }
+            } else {
                 try { res.end(); } catch (_) { }
             }
-        } else {
-            try { res.end(); } catch (_) { }
+        });
+    };
+}
+
+async function processPrivateRequest(req, res) {
+    const interfaceClass = interfaceClassifier.classify(req.socket?.localAddress);
+    req.ploinkyListenerClass = interfaceClass === 'managed' || interfaceClass === 'loopback'
+        ? 'private'
+        : 'denied';
+    const exactHost = normalizeExactHost(req.headers.host);
+    if (!exactHost || !String(req.url || '').startsWith('/')) {
+        sendJsonResponse(res, 400, { error: 'malformed_request_target_or_host' }, { 'Cache-Control': 'no-store' });
+        return;
+    }
+    let parsedUrl;
+    try {
+        parsedUrl = new URL(req.url || '/', `http://${exactHost === '::1' ? '[::1]' : exactHost}`);
+    } catch (_) {
+        sendJsonResponse(res, 400, { error: 'malformed_request_target_or_host' }, { 'Cache-Control': 'no-store' });
+        return;
+    }
+    const routePlan = resolveEdgeRoutePlan({ req, parsedUrl, listener: 'private' });
+    if (!routePlan.ok) {
+        sendJsonResponse(res, routePlan.status || 404, { error: routePlan.code || 'private_route_denied' }, { 'Cache-Control': 'no-store' });
+        return;
+    }
+    let body;
+    try {
+        body = await readPrivateRequestBody(req);
+        authorizePrivateRoutePlan({ req, plan: routePlan, body });
+    } catch (error) {
+        sendPrivateError(res, error);
+        return;
+    }
+    if (routePlan.kind === 'private-operation' && routePlan.operation === 'turn-credentials') {
+        if (!commitRoutePlan(routePlan)) {
+            sendJsonResponse(res, 503, { error: 'edge_generation_changed' }, { 'Cache-Control': 'no-store' });
+            return;
         }
-    });
+        try {
+            const credentials = mintTurnCredentials({
+                plan: routePlan,
+                body,
+                callerIdentity: req.privateAgentIdentity,
+            });
+            appendLog('turn_credentials_minted', {
+                callerAgentId: req.privateAgentIdentity?.agentId,
+                instanceId: req.privateAgentIdentity?.instanceId,
+                enableGeneration: req.privateAgentIdentity?.enableGeneration,
+                expiresAt: credentials.expiresAt,
+                lanes: credentials.urls.length,
+            });
+            sendJsonResponse(res, 200, credentials, { 'Cache-Control': 'no-store' });
+        } catch (error) {
+            appendLog('turn_credentials_rejected', {
+                callerAgentId: req.privateAgentIdentity?.agentId,
+                code: error?.code || 'TURN_CREDENTIAL_MINT_FAILED',
+            });
+            sendPrivateError(res, error);
+        }
+        return;
+    }
+    req.edgeBufferedBody = body;
+    if (!handleHttpServiceRoute(req, res, routePlan.parsedUrl, routePlan)) {
+        sendJsonResponse(res, 404, { error: 'private_route_not_found' }, { 'Cache-Control': 'no-store' });
+    }
+}
+
+function detailedHealthData() {
+    const memUsage = process.memoryUsage();
+    let edgePublication = null;
+    try { edgePublication = cloudflarePublicationRuntime?.getStatus() || null; } catch (_) {}
+    return {
+        status: 'healthy',
+        uptime: process.uptime(),
+        timestamp: new Date().toISOString(),
+        pid: process.pid,
+        memory: {
+            rss: memUsage.rss,
+            heapUsed: memUsage.heapUsed,
+            heapTotal: memUsage.heapTotal,
+        },
+        activeSessions: {
+            webchat: globalState.webchat.sessions.size,
+            dashboard: globalState.dashboard.sessions.size,
+            status: globalState.status.sessions.size,
+            agent: agentSessionStore.size,
+        },
+        edgePublication,
+    };
+}
+
+async function processDetailedHealthRequest(req, res) {
+    if ((req.method || 'GET').toUpperCase() !== 'GET' || req.url !== '/health') {
+        sendJsonResponse(res, 404, { error: 'not_found' }, { 'Cache-Control': 'no-store' });
+        return;
+    }
+    sendJsonResponse(res, 200, detailedHealthData(), { 'Cache-Control': 'no-store' });
+}
+
+const server = http.createServer(handleAsyncRequest(processRequest, 'request_error'));
+const privateServer = http.createServer(handleAsyncRequest(processPrivateRequest, 'private_request_error'));
+const healthServer = http.createServer(handleAsyncRequest(processDetailedHealthRequest, 'health_request_error'));
+const privateListenerSet = createPrivateListenerSet({
+    httpServer: privateServer,
+    interfaceClassifier,
+    port: privatePort,
+    audit: (event, value) => appendLog(event, value),
 });
+let cloudflarePublicationRuntime = null;
+let publicListenerReady = false;
+let privateListenerReady = false;
+
+function maybeStartCloudflarePublicationRuntime() {
+    if (!publicListenerReady || !privateListenerReady || cloudflarePublicationRuntime) return;
+    try {
+        cloudflarePublicationRuntime = startCloudflarePublicationRuntime({
+            audit: (event, value) => appendLog(event, value),
+        });
+        appendLog('cloudflare_publication_runtime_start', {});
+    } catch (error) {
+        appendLog('cloudflare_publication_runtime_start_error', {
+            code: error?.code || 'CLOUDFLARE_RUNTIME_START_FAILED',
+            error: String(error?.message || error).slice(0, 1024),
+        });
+    }
+}
 
 server.on('upgrade', async (req, socket, head) => {
     try {
-        const parsedUrl = new URL(req.url, `http://${req.headers.host || 'router.local'}`);
-        const apiRoutes = loadApiRoutes();
-        const profileServerHostAgentName = extractProfileServerHostAgentName(req.headers.host, apiRoutes);
-        if (profileServerHostAgentName) {
-            const handled = await handleProfileServerUpgrade({
-                req,
-                socket,
-                head,
-                route: apiRoutes[profileServerHostAgentName],
-                agentProxyPath: buildRootProxyPath(parsedUrl),
-                parsedUrl
-            });
-            if (handled) return;
+        const exactHost = normalizeExactHost(req.headers.host);
+        if (!exactHost || !String(req.url || '').startsWith('/')) {
+            socket.write('HTTP/1.1 400 Bad Request\r\n\r\n');
+            socket.destroy();
+            return;
         }
-        const handled = await handleHttpServiceUpgrade({ req, socket, head, parsedUrl, policy });
+        const parsedUrl = new URL(req.url, `http://${exactHost === '::1' ? '[::1]' : exactHost}`);
+        const listener = interfaceClassifier.classify(socket.localAddress) === 'managed'
+            ? 'managed'
+            : 'public';
+        req.ploinkyListenerClass = listener;
+        const routePlan = resolveEdgeRoutePlan({ req, parsedUrl, listener });
+        if (!routePlan.ok || !['service', 'agent-root'].includes(routePlan.kind)) {
+            socket.write(`HTTP/1.1 ${routePlan.status || 404} Not Found\r\n\r\n`);
+            socket.destroy();
+            return;
+        }
+        const handled = await handleHttpServiceUpgrade({ req, socket, head, parsedUrl: routePlan.parsedUrl, routePlan });
         if (!handled) { socket.write('HTTP/1.1 404 Not Found\r\n\r\n'); socket.destroy(); }
     } catch (_) {
         try { socket.destroy(); } catch (_) {}
     }
 });
 
-// Setup process lifecycle management
-const lifecycle = setupProcessLifecycle(server, globalState, agentSessionStore);
+privateServer.on('upgrade', async (req, socket, head) => {
+    try {
+        const interfaceClass = interfaceClassifier.classify(socket.localAddress);
+        req.ploinkyListenerClass = interfaceClass === 'managed' || interfaceClass === 'loopback'
+            ? 'private'
+            : 'denied';
+        const exactHost = normalizeExactHost(req.headers.host);
+        if (!exactHost || !String(req.url || '').startsWith('/')) throw new Error('malformed request');
+        const parsedUrl = new URL(req.url, `http://${exactHost === '::1' ? '[::1]' : exactHost}`);
+        const routePlan = resolveEdgeRoutePlan({ req, parsedUrl, listener: 'private' });
+        if (!routePlan.ok || routePlan.kind !== 'service') throw new Error('private route denied');
+        authorizePrivateRoutePlan({ req, plan: routePlan, body: Buffer.alloc(0) });
+        const handled = await handleHttpServiceUpgrade({
+            req,
+            socket,
+            head,
+            parsedUrl: routePlan.parsedUrl,
+            listener: 'private',
+            routePlan,
+        });
+        if (!handled) throw new Error('private route not found');
+    } catch (_) {
+        try { socket.write('HTTP/1.1 403 Forbidden\r\n\r\n'); } catch (_) {}
+        try { socket.destroy(); } catch (_) {}
+    }
+});
+
+function prepareHealthSocket() {
+    fs.mkdirSync(path.dirname(detailedHealthSocket), { recursive: true, mode: 0o700 });
+    try {
+        const stat = fs.lstatSync(detailedHealthSocket);
+        if (!stat.isSocket()) throw new Error(`refusing to replace non-socket detailed health path: ${detailedHealthSocket}`);
+        fs.unlinkSync(detailedHealthSocket);
+    } catch (error) {
+        if (error?.code !== 'ENOENT') throw error;
+    }
+}
+
+prepareHealthSocket();
+
+// Setup process lifecycle management for every listener.
+const lifecycle = setupProcessLifecycle(
+    [server, healthServer],
+    globalState,
+    agentSessionStore,
+    {
+        beforeClose: [async () => {
+            await privateListenerSet.close();
+            const runtime = cloudflarePublicationRuntime;
+            cloudflarePublicationRuntime = null;
+            await runtime?.stop();
+        }],
+    },
+);
 
 // Server error handlers
 server.on('error', (error) => {
-    const port = process.env.PORT ? parseInt(process.env.PORT, 10) : 8080;
     console.error('[FATAL] Server error:', error);
     appendLog('server_error', { error: error.message, code: error.code, port });
 
@@ -655,6 +842,19 @@ server.on('error', (error) => {
     }
 });
 
+privateServer.on('error', (error) => {
+    console.error('[FATAL] Private Router server error:', error);
+    appendLog('private_server_error', { error: error.message, code: error.code, port: privatePort });
+    if (error.code === 'EADDRINUSE' || error.code === 'EACCES') process.exit(2);
+    lifecycle.gracefulShutdown('private_server_error', 1);
+});
+
+healthServer.on('error', (error) => {
+    console.error('[FATAL] Detailed health socket error:', error);
+    appendLog('health_server_error', { error: error.message, code: error.code });
+    lifecycle.gracefulShutdown('health_server_error', 1);
+});
+
 server.on('clientError', (error, socket) => {
     appendLog('client_error', {
         error: error.message,
@@ -667,19 +867,52 @@ server.on('clientError', (error, socket) => {
     }
 });
 
+privateServer.on('clientError', (_error, socket) => {
+    if (!socket.destroyed) socket.end('HTTP/1.1 400 Bad Request\r\n\r\n');
+});
+
+healthServer.on('clientError', (_error, socket) => {
+    if (!socket.destroyed) socket.end('HTTP/1.1 400 Bad Request\r\n\r\n');
+});
+
+try {
+    const snapshot = await privateListenerSet.start();
+    privateListenerReady = true;
+    appendLog('private_server_start', {
+        port: privatePort,
+        addresses: snapshot.addresses,
+        classifierError: snapshot.classifierError || undefined,
+    });
+    logBootEvent('private_server_listening', { port: privatePort, addresses: snapshot.addresses });
+    maybeStartCloudflarePublicationRuntime();
+} catch (error) {
+    console.error('[FATAL] Private Router exact listener set failed:', error);
+    appendLog('private_server_start_error', {
+        code: error?.code || 'PRIVATE_LISTENER_SET_START_FAILED',
+        error: String(error?.message || error),
+    });
+    process.exit(2);
+}
+
+healthServer.listen(detailedHealthSocket, () => {
+    fs.chmodSync(detailedHealthSocket, 0o600);
+    appendLog('health_server_start', { socket: detailedHealthSocket });
+});
+
 // Start server
-const port = process.env.PORT ? parseInt(process.env.PORT, 10) : 8080;
-server.listen(port, () => {
+server.listen(port, '0.0.0.0', () => {
+    publicListenerReady = true;
     console.log(`[RoutingServer] Ploinky server running on http://127.0.0.1:${port}`);
     console.log('  Dashboard:       /dashboard');
     console.log('  WebChat:         /webchat');
     console.log('  Status:          /status');
     console.log('  Health:          /health');
     console.log('  Agent routes:    /<agent>/{mcp,task,agent-card,v1/models,v1/chat/completions}');
-    console.log('  Agent servers:   http://<agent>.localhost:<port>/');
+    console.log('  Service hosts:   http://<service>.localhost/');
     console.log('  Aggregate cards: /agent-card');
     appendLog('server_start', { port });
     logBootEvent('server_listening', { port });
+    maybeStartCloudflarePublicationRuntime();
 
     // Bootstrap MCP tool policy from each enabled agent's mcp-config tags
     // (persisted admin policy always wins). Without this, fail-closed

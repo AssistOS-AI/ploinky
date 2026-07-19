@@ -21,9 +21,15 @@ function createAgentClient(baseUrl, options = {}) {
   const requestHeaders = options && typeof options === 'object' && options.requestHeaders && typeof options.requestHeaders === 'object'
     ? options.requestHeaders
     : null;
+  const beforeConnect = typeof options?.beforeConnect === 'function' ? options.beforeConnect : null;
 
   async function connect() {
     if (connected && client && transport) return;
+    if (beforeConnect && beforeConnect() !== true) {
+      const error = new Error('edge routing generation changed before upstream connection');
+      error.code = 'EDGE_GENERATION_CHANGED';
+      throw error;
+    }
     transport = new StreamableHTTPClientTransport(new URL(baseUrl), requestHeaders
       ? { requestInit: { headers: requestHeaders } }
       : undefined);

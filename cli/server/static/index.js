@@ -128,8 +128,10 @@ function getStaticAllowedRoots() {
     return [staticRoot, path.resolve(staticRoot, '..')];
 }
 
-function getAgentAllowedRoots(agentName) {
-    const agentRoot = getAgentHostPath(agentName);
+function getAgentAllowedRoots(agentName, options = {}) {
+    const agentRoot = Object.prototype.hasOwnProperty.call(options, 'hostPath')
+        ? normalizeAgentHostPath(options.hostPath)
+        : getAgentHostPath(agentName);
     if (!agentRoot) return [];
     return [agentRoot, path.resolve(agentRoot, '..')];
 }
@@ -567,6 +569,15 @@ function getAgentHostPath(agentName) {
     return null;
 }
 
+function normalizeAgentHostPath(hostPath) {
+    if (typeof hostPath !== 'string' || !hostPath.trim()) return null;
+    try {
+        const abs = path.resolve(hostPath);
+        if (fs.existsSync(abs) && fs.statSync(abs).isDirectory()) return abs;
+    } catch (_) { }
+    return null;
+}
+
 function safeJoin(base, rel) {
     const cleaned = sanitizeRelativeRequestPath(rel || '');
     if (cleaned === null) return null;
@@ -577,10 +588,13 @@ function safeJoin(base, rel) {
     return abs;
 }
 
-async function resolveAgentStaticFile(agentName, agentRelPath) {
-    const root = getAgentHostPath(agentName);
+async function resolveAgentStaticFile(agentName, agentRelPath, options = {}) {
+    const capturedHostPath = Object.prototype.hasOwnProperty.call(options, 'hostPath');
+    const root = capturedHostPath
+        ? normalizeAgentHostPath(options.hostPath)
+        : getAgentHostPath(agentName);
     if (!root) return null;
-    const allowedRoots = getAgentAllowedRoots(agentName);
+    const allowedRoots = getAgentAllowedRoots(agentName, capturedHostPath ? { hostPath: root } : {});
     const candidate = safeJoin(root, agentRelPath);
     if (!candidate) return null;
     try {
@@ -606,16 +620,31 @@ async function resolveAgentStaticFile(agentName, agentRelPath) {
     return null;
 }
 
-async function serveAgentStaticRequest(req, res) {
+async function serveAgentStaticRequest(req, res, {
+    routeKey = null,
+    hostPath = null,
+    beforeRead = null,
+} = {}) {
     try {
         const parsed = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
         const pathname = decodeURIComponent(parsed.pathname || '/');
         const parts = pathname.split('/').filter(Boolean);
         if (parts.length < 2) return false;
         const agent = parts[0];
+        if (routeKey !== null && agent !== routeKey) return false;
         const rest = parts.slice(1).join('/');
-        const target = await resolveAgentStaticFile(agent, rest);
-        if (target && sendFile(res, target)) return true;
+        const target = await resolveAgentStaticFile(agent, rest, routeKey !== null ? { hostPath } : {});
+        if (target) {
+            if (typeof beforeRead === 'function' && beforeRead() !== true) {
+                res.writeHead(503, {
+                    'Content-Type': 'application/json',
+                    'Cache-Control': 'no-store',
+                });
+                res.end(JSON.stringify({ error: 'edge_generation_changed' }));
+                return true;
+            }
+            if (sendFile(res, target)) return true;
+        }
     } catch (_) { }
     return false;
 }

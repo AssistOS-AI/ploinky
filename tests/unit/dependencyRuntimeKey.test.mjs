@@ -4,6 +4,8 @@ import assert from 'node:assert/strict';
 import {
     detectHostRuntimeKey,
     detectContainerRuntimeKey,
+    isNoNodeRuntimeKey,
+    NO_NODE_RUNTIME_KEY,
     parseContainerProbeOutput,
     parseRuntimeKey,
     normalizeRuntimeFamily,
@@ -143,6 +145,28 @@ test('detectContainerRuntimeKey resolves manifest image templates before probing
 
     assert.equal(probedImage, 'example/service:v9');
     assert.equal(key, 'container-linux-x64-glibc-node20');
+});
+
+test('detectContainerRuntimeKey classifies a node-less container manifest without throwing', () => {
+    const calls = [];
+    const key = detectContainerRuntimeKey({
+        manifest: {
+            container: 'alpine:latest',
+        },
+        runtime: 'podman',
+        ensureImage({ image }) {
+            calls.push(`ensure:${image}`);
+        },
+        execProbe({ image }) {
+            calls.push(`probe:${image}`);
+            return '{"noNode":true}';
+        },
+    });
+
+    assert.deepEqual(calls, ['ensure:alpine:latest', 'probe:alpine:latest']);
+    assert.equal(key, NO_NODE_RUNTIME_KEY);
+    assert.equal(isNoNodeRuntimeKey(key), true);
+    assert.equal(parseRuntimeKey(key), null);
 });
 
 test('detectContainerRuntimeKey requires an image', () => {

@@ -34,6 +34,7 @@ function buildSeatbeltProfile(options) {
         codeReadOnly,
         skillsReadOnly,
         volumes,
+        volumeOptions = {},
         workspaceRoot = PLOINKY_WORKSPACE_ROOT,
         extraReadPaths = [],
         extraWritePaths = []
@@ -44,7 +45,18 @@ function buildSeatbeltProfile(options) {
         workspaceRoot,
         ploinkyDir: path.join(workspaceRoot, '.ploinky'),
     });
-    const protectedWritePaths = collectProtectedWritePaths({
+    const volumeAccess = Object.entries(volumes || {}).map(([hostPath, containerPath]) => {
+        const options = volumeOptions[containerPath]
+            || volumeOptions[String(containerPath || '').replace(/\/+$/, '')]
+            || {};
+        return {
+            hostPath: path.isAbsolute(hostPath) ? path.resolve(hostPath) : path.resolve(workspaceRoot, hostPath),
+            readOnly: options.readOnly === true,
+        };
+    });
+    const writableVolumes = volumeAccess.filter(entry => !entry.readOnly).map(entry => entry.hostPath);
+    const protectedWritePaths = [
+        ...collectProtectedWritePaths({
         agentCodePath,
         agentLibPath,
         nodeModulesDir,
@@ -52,7 +64,9 @@ function buildSeatbeltProfile(options) {
         skillsPath,
         codeReadOnly,
         skillsReadOnly,
-    });
+        }),
+        ...volumeAccess.filter(entry => entry.readOnly).map(entry => ({ kind: 'subpath', path: entry.hostPath })),
+    ];
     const lines = [];
     lines.push('(version 1)');
     lines.push('(deny default)');
@@ -173,7 +187,7 @@ function buildSeatbeltProfile(options) {
         const volumeEntries = Object.entries(volumes);
         if (volumeEntries.length) {
             lines.push('; Custom volumes');
-            for (const resolvedHostPath of normalizedVolumes) {
+            for (const resolvedHostPath of writableVolumes) {
                 lines.push(`(allow file-write* (subpath ${sbplQuote(resolvedHostPath)}))`);
             }
             lines.push('');

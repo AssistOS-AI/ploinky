@@ -47,6 +47,9 @@ function validateScriptName(type, script) {
     if (trimmed.includes('..')) {
         throw new Error(`[probe] ${type}: script '${trimmed}' cannot navigate directories.`);
     }
+    if (!/^[A-Za-z0-9._-]+$/.test(trimmed)) {
+        throw new Error(`[probe] ${type}: script '${trimmed}' contains unsafe characters.`);
+    }
     return trimmed;
 }
 
@@ -63,10 +66,11 @@ function normalizeProbeConfig(type, manifestProbeConfig = null) {
     };
 }
 
-function runProbeOnce(agentName, containerName, probe) {
-    const runtime = getRuntime();
+function runProbeOnce(agentName, containerName, probe, options = {}) {
+    const runtime = options.runtime || getRuntime();
+    const spawnSyncImpl = options.spawnSyncImpl || spawnSync;
     const execCommand = ['exec', containerName, 'sh', '-lc', `cd /code && sh "./${probe.script}"`];
-    const execRes = spawnSync(
+    const execRes = spawnSyncImpl(
         runtime,
         execCommand,
         { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: probe.timeout * 1000 }
@@ -89,10 +93,11 @@ function runProbeOnce(agentName, containerName, probe) {
     };
 }
 
-function ensureScriptExists(agentName, containerName, probe) {
-    const runtime = getRuntime();
+function ensureScriptExists(agentName, containerName, probe, options = {}) {
+    const runtime = options.runtime || getRuntime();
+    const spawnSyncImpl = options.spawnSyncImpl || spawnSync;
     const scriptPath = `/code/${probe.script}`;
-    const exists = spawnSync(
+    const exists = spawnSyncImpl(
         runtime,
         ['exec', containerName, 'sh', '-lc', `[ -f "${scriptPath}" ]`],
         { stdio: 'ignore' }
@@ -107,13 +112,13 @@ function ensureScriptExists(agentName, containerName, probe) {
     }
 }
 
-function runProbeLoop(agentName, containerName, type, probe) {
-    ensureScriptExists(agentName, containerName, probe);
+function runProbeLoop(agentName, containerName, type, probe, options = {}) {
+    ensureScriptExists(agentName, containerName, probe, options);
     postProbeLog('info', `[probe] ${agentName}: ${type} probe -> script='${probe.script}', interval=${probe.interval}s, timeout=${probe.timeout}s, successThreshold=${probe.successThreshold}, failureThreshold=${probe.failureThreshold}`);
     let consecutiveSuccesses = 0;
     let consecutiveFailures = 0;
     while (true) {
-        const result = runProbeOnce(agentName, containerName, probe);
+        const result = runProbeOnce(agentName, containerName, probe, options);
 
         const detail = (result.stdout || result.stderr || '').trim();
         if (result.success) {
@@ -133,27 +138,21 @@ function runProbeLoop(agentName, containerName, type, probe) {
 
         const intervalMs = Math.max(0, Math.round(probe.interval * 1000));
         if (intervalMs > 0) {
-            sleepMs(intervalMs);
+            const sleepMsImpl = options.sleepMsImpl || sleepMs;
+            sleepMsImpl(intervalMs);
         }
     }
 }
 
-function restartContainer(agentName, containerName) {
-    const runtime = getRuntime();
-    postProbeLog('warn', `[probe] ${agentName}: restarting container ${containerName} after liveness failure...`);
-    const restartRes = spawnSync(
-        runtime,
-        ['restart', containerName],
-        { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }
-    );
-    if (restartRes.error || restartRes.status !== 0) {
-        const stderr = (restartRes.stderr || '').trim();
-        const message = restartRes.error?.message || stderr || `exit code ${restartRes.status}`;
-        throw new Error(`[probe] ${agentName}: failed to restart ${containerName}: ${message}`);
+function runContainerScriptReadiness(agentName, containerName, manifestProbeConfig, options = {}) {
+    const probe = normalizeProbeConfig('readiness', manifestProbeConfig);
+    if (!probe) {
+        throw new Error(`[probe] ${agentName}: blocking script readiness requires health.readiness.script.`);
     }
-    if (!waitForContainerRunning(containerName, 40, 250)) {
-        throw new Error(`[probe] ${agentName}: container ${containerName} failed to reach running state after restart.`);
+    if (!String(containerName || '').trim()) {
+        throw new Error(`[probe] ${agentName}: blocking script readiness requires the service container name.`);
     }
+    return runProbeLoop(agentName, containerName, 'readiness', probe, options);
 }
 
 function getLivenessState(containerName) {
@@ -203,25 +202,19 @@ function ensureLiveness(agentName, containerName, probe) {
         state.startedAt = Date.now();
     }
 
-    while (true) {
-        const result = runProbeLoop(agentName, containerName, 'liveness', probe);
-        if (result.status === 'success') {
-            postProbeLog('info', `[probe] ${agentName}: liveness confirmed.`);
-            clearLivenessState(containerName);
-            return;
-        }
-
-        postProbeLog('warn', `[probe] ${agentName}: liveness probe failed (${result.reason}${result.detail ? `, output='${result.detail}'` : ''}).`);
-        maybeResetBackoff(agentName, state);
-
-        restartContainer(agentName, containerName);
-        state.retryCount += 1;
-        noteContainerStarted(containerName);
-
-        const backoffDelayMs = computeBackoffDelay(state);
-        postProbeLog('warn', `[probe] ${agentName}: CrashLoopBackOff waiting ${Math.round(backoffDelayMs / 1000)}s before next liveness probe (retry ${state.retryCount}).`);
-        sleepMs(backoffDelayMs);
+    const result = runProbeLoop(agentName, containerName, 'liveness', probe);
+    if (result.status === 'success') {
+        postProbeLog('info', `[probe] ${agentName}: liveness confirmed.`);
+        clearLivenessState(containerName);
+        return;
     }
+
+    maybeResetBackoff(agentName, state);
+    state.retryCount += 1;
+    const detail = `${result.reason}${result.detail ? `, output='${result.detail}'` : ''}`;
+    const error = new Error(`[probe] ${agentName}: liveness probe failed (${detail}); managed restart required`);
+    error.code = 'PLOINKY_LIVENESS_FAILED';
+    throw error;
 }
 
 function ensureReadiness(agentName, containerName, probe) {
@@ -265,11 +258,14 @@ export function runHealthProbes(agentName, containerName, manifest = {}) {
     ensureReadiness(agentName, containerName, readinessProbe);
 }
 
+export { normalizeProbeConfig, runContainerScriptReadiness };
+
 export const __testHooks = {
     coercePositiveNumber,
     coercePositiveInteger,
     validateScriptName,
     normalizeProbeConfig,
+    runContainerScriptReadiness,
     computeBackoffDelay,
     maybeResetBackoff,
     getLivenessState,

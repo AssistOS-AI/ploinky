@@ -5,15 +5,35 @@ import { fileURLToPath } from 'url';
 
 import * as workspaceSvc from '../services/workspace.js';
 import { REPOS_DIR, RUNNING_DIR } from '../services/config.js';
-import { mergeRoutingConfig } from '../services/routingFile.js';
-import { inspectMaintenanceLock } from '../services/maintenanceLocks.js';
-import { ensureAgentService, isContainerRunning } from '../services/docker/index.js';
+import { mergeRoutingConfig, mergeRuntimeRoute } from '../services/routingFile.js';
+import {
+    createWorkspaceMutationLease,
+    inspectMaintenanceLock,
+    inspectWorkspaceStartLock,
+    releaseWorkspaceMutationLease,
+} from '../services/maintenanceLocks.js';
+import {
+    cleanupExactAgentRuntimeCandidate,
+    ensureAgentService,
+    isContainerRunning,
+} from '../services/docker/index.js';
 import { isSandboxRuntime } from '../services/docker/common.js';
 import { isBwrapProcessRunning } from '../services/bwrap/bwrapFleet.js';
+import { resolveManifestRuntimeProfile } from '../services/profileService.js';
+import { resolveRouterEndpoint } from '../services/routerPort.js';
+import { resolveAgentReadinessProtocol } from '../services/startupReadiness.js';
+import { runContainerScriptReadiness } from '../services/docker/healthProbes.js';
+import { waitForAgentReady } from './utils/agentReadiness.js';
+import { applyEdgeRoutingGeneration } from '../services/coordinatedEdgeApply.js';
+import {
+    abortEdgeRoutingPreparation,
+    inactivateEdgeRoutingGeneration,
+} from '../services/edgeGeneration.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const PROBE_WORKER_URL = new URL('./probeWorker.js', import.meta.url);
+const LOGGED_RESTART_FAILURES = new WeakSet();
 
 function noopLog() {}
 
@@ -49,6 +69,9 @@ function createContainerTarget(info, monitor) {
         agentName: info.agentName,
         repoName: info.repoName,
         alias: info.alias || null,
+        profile: info.profile || null,
+        instanceId: info.instanceId || null,
+        enableGeneration: info.enableGeneration || null,
         type: info.type,
         manifestPath: info.manifestPath,
         restartHistory: [],
@@ -61,7 +84,8 @@ function createContainerTarget(info, monitor) {
         circuitBreakerTripped: false,
         lastError: null,
         probeState: 'pending',
-        probeWorker: null
+        probeWorker: null,
+        probeLastSuccessAt: null,
     };
 }
 
@@ -85,7 +109,7 @@ function stopProbeWorker(target) {
     }
 }
 
-function handleProbeFailure(monitor, target, message) {
+function handleProbeFailure(monitor, target, message, { runtimeHealth = false } = {}) {
     if (!monitor || !target) return;
     target.probeState = 'failed';
     target.lastError = message;
@@ -97,6 +121,20 @@ function handleProbeFailure(monitor, target, message) {
         error: message,
         failures: target.probeFailures
     });
+    if (runtimeHealth) {
+        const inactivate = monitor.inactivateEdgeRoutingGeneration || inactivateEdgeRoutingGeneration;
+        try {
+            inactivate(`continuous-runtime-probe-failed:${target.containerName}`);
+        } catch (error) {
+            logEvent(monitor, 'error', 'container_probe_inactivation_failed', {
+                container: target.containerName,
+                agent: target.agentName,
+                repo: target.repoName,
+                error: error?.message || error,
+            });
+        }
+        scheduleContainerRestart(monitor, target, 'semantic_probe_failed');
+    }
 }
 
 function startProbeWorker(monitor, target) {
@@ -157,6 +195,7 @@ function startProbeWorker(monitor, target) {
         }
         if (msg.status === 'success') {
             target.probeState = 'success';
+            target.probeLastSuccessAt = Date.now();
             logEvent(monitor, 'info', 'container_probe_succeeded', {
                 container: target.containerName,
                 agent: target.agentName,
@@ -166,13 +205,13 @@ function startProbeWorker(monitor, target) {
         } else if (msg.status === 'error') {
             stopProbeWorker(target);
             const message = msg.error || 'Probe worker reported failure.';
-            handleProbeFailure(monitor, target, message);
+            handleProbeFailure(monitor, target, message, { runtimeHealth: true });
         }
     });
 
     worker.on('error', (error) => {
         stopProbeWorker(target);
-        handleProbeFailure(monitor, target, error?.message || error);
+        handleProbeFailure(monitor, target, error?.message || error, { runtimeHealth: true });
     });
 
     worker.on('exit', (code) => {
@@ -180,7 +219,7 @@ function startProbeWorker(monitor, target) {
             target.probeWorker = null;
         }
         if (code !== 0 && target.probeState === 'running') {
-            handleProbeFailure(monitor, target, `Probe worker exited with code ${code}`);
+            handleProbeFailure(monitor, target, `Probe worker exited with code ${code}`, { runtimeHealth: true });
         }
     });
 }
@@ -284,7 +323,21 @@ function syncManagedContainers(monitor) {
         }
 
         const runtime = record.runtime || 'container';
-        const info = { containerName, type, agentName, repoName, alias, manifestPath, runtime };
+        const profile = record.profile || null;
+        const instanceId = String(record.instanceId || '').trim() || null;
+        const enableGeneration = String(record.enableGeneration || '').trim() || null;
+        const info = {
+            containerName,
+            type,
+            agentName,
+            repoName,
+            alias,
+            profile,
+            manifestPath,
+            runtime,
+            instanceId,
+            enableGeneration,
+        };
         desired.set(containerName, info);
 
         let target = monitorRef.targets.get(containerName);
@@ -302,6 +355,9 @@ function syncManagedContainers(monitor) {
             target.agentName = agentName;
             target.repoName = repoName;
             target.alias = alias;
+            target.profile = profile;
+            target.instanceId = instanceId;
+            target.enableGeneration = enableGeneration;
             target.type = type;
             target.manifestPath = manifestPath;
             target.runtime = runtime;
@@ -359,39 +415,169 @@ function scheduleContainerRestart(monitor, target, reason) {
         target.pendingRestartTimer = null;
         performContainerRestart(monitor, target, reason).catch((error) => {
             target.lastError = error?.message || error;
-            logEvent(monitor, 'error', 'container_restart_failed', {
-                container: target.containerName,
-                agent: target.agentName,
-                repo: target.repoName,
-                reason,
-                error: target.lastError
-            });
+            if (!error || typeof error !== 'object' || !LOGGED_RESTART_FAILURES.has(error)) {
+                logEvent(monitor, 'error', 'container_restart_failed', {
+                    container: target.containerName,
+                    agent: target.agentName,
+                    repo: target.repoName,
+                    reason,
+                    error: target.lastError
+                });
+            }
             target.isRestarting = false;
             scheduleContainerRestart(monitor, target, 'restart_failed');
         });
     }, backoff);
 }
 
-async function upsertRestartedContainerRoute(target, agentDir, result = {}) {
+function positiveInteger(value, fallback) {
+    const parsed = Number.parseInt(String(value ?? ''), 10);
+    return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function assertRestartPreparationResult(target, result) {
+    const containerName = String(result?.containerName || '').trim();
+    const record = result?.registryRecord;
+    if (!containerName || containerName !== String(target.containerName || '')
+        || !record || typeof record !== 'object' || Array.isArray(record)
+        || record.type !== 'agent'
+        || String(record.repoName || '') !== String(target.repoName || '')
+        || String(record.agentName || '') !== String(target.agentName || '')
+        || String(record.alias || '') !== String(target.alias || '')
+        || !String(record.instanceId || '')
+        || !String(record.enableGeneration || '')) {
+        throw new Error(`watchdog runtime ensure returned a mismatched exact registry identity for '${containerName || target.containerName}'`);
+    }
+    if (result?.requiresEdgeActivation !== true) return null;
+    if (!result.preparationLease) {
+        throw new Error('watchdog runtime replacement requires its exact preparation lease');
+    }
+    return { containerName, record };
+}
+
+async function waitForRestartedContainerReadiness(monitor, target, manifest, result) {
+    const resolveProtocol = monitor.resolveAgentReadinessProtocol || resolveAgentReadinessProtocol;
+    const protocol = resolveProtocol(manifest);
+    if (protocol === 'none') return;
+    if (protocol === 'script') {
+        const runScript = monitor.runContainerScriptReadiness || runContainerScriptReadiness;
+        const probe = await Promise.resolve(runScript(
+            target.agentName,
+            result.containerName,
+            manifest?.health?.readiness,
+        ));
+        if (probe?.status !== 'success') {
+            const detail = probe?.detail ? `, output='${probe.detail}'` : '';
+            throw new Error(`watchdog readiness script failed (${probe?.reason || 'unknown failure'}${detail})`);
+        }
+        return;
+    }
+    if (protocol !== 'tcp' && protocol !== 'mcp') {
+        throw new Error(`watchdog resolved unsupported readiness protocol '${protocol}'`);
+    }
+    const hostPort = Number(result.hostPort || 0);
+    if (!Number.isInteger(hostPort) || hostPort < 1 || hostPort > 65535) {
+        throw new Error(`watchdog readiness protocol '${protocol}' requires one resolved private target port`);
+    }
+    const waitUntilReady = monitor.waitForAgentReady || waitForAgentReady;
+    const ready = await waitUntilReady({ hostPort }, {
+        timeoutMs: positiveInteger(
+            monitor?.config?.CONTAINER_RESTART_READY_TIMEOUT_MS
+                ?? process.env.PLOINKY_CONTAINER_MONITOR_READY_TIMEOUT_MS,
+            120000,
+        ),
+        intervalMs: positiveInteger(
+            monitor?.config?.CONTAINER_RESTART_READY_INTERVAL_MS
+                ?? process.env.PLOINKY_CONTAINER_MONITOR_READY_INTERVAL_MS,
+            250,
+        ),
+        probeTimeoutMs: positiveInteger(
+            monitor?.config?.CONTAINER_RESTART_READY_PROBE_TIMEOUT_MS
+                ?? process.env.PLOINKY_CONTAINER_MONITOR_READY_PROBE_TIMEOUT_MS,
+            1000,
+        ),
+        protocol,
+    });
+    if (!ready) {
+        throw new Error(`watchdog readiness protocol '${protocol}' did not succeed`);
+    }
+}
+
+async function activateRestartedContainerRoute(monitor, target, agentDir, result, networkMode) {
+    const prepared = assertRestartPreparationResult(target, result);
+    if (!prepared) return false;
     const routeKey = target.alias || target.agentName;
     const route = {
-        container: result.containerName || target.containerName,
+        container: prepared.containerName,
         hostPath: agentDir,
         repo: target.repoName,
         agent: target.agentName,
         ...(target.alias ? { alias: target.alias } : {}),
-        ...(result.hostPort ? { hostPort: result.hostPort } : {}),
-        additionalServerPort: result.additionalServerPort || null
+        hostPort: networkMode === 'none' ? null : result.hostPort || null,
+        serviceTargets: result.serviceTargets || null
     };
 
-    await mergeRoutingConfig((cfg) => {
-        cfg.routes = cfg.routes || {};
-        cfg.routes[routeKey] = { ...(cfg.routes[routeKey] || {}), ...route };
-        if (route.additionalServerPort === null) {
-            delete cfg.routes[routeKey].additionalServerPort;
+    const mergeRoute = monitor.mergeRoutingConfig || mergeRoutingConfig;
+    const loadAgents = monitor.loadAgents || workspaceSvc.loadAgents;
+    const saveAgents = monitor.saveAgents || workspaceSvc.saveAgents;
+    await mergeRoute((cfg) => {
+        const agents = loadAgents();
+        const staged = agents?.[prepared.containerName];
+        if (!staged || staged.type !== 'agent'
+            || String(staged.instanceId || '') !== String(prepared.record.instanceId)
+            || String(staged.enableGeneration || '') !== String(prepared.record.enableGeneration)) {
+            throw new Error(`watchdog runtime replacement lost its staged registry identity for '${prepared.containerName}'`);
         }
+        agents[prepared.containerName] = structuredClone(prepared.record);
+        saveAgents(agents, { coordinate: false });
+        cfg.routes = cfg.routes || {};
+        cfg.routes[routeKey] = mergeRuntimeRoute(
+            cfg.routes[routeKey],
+            route,
+            { hostPort: route.hostPort, serviceTargets: route.serviceTargets },
+        );
         return cfg;
-    });
+    }, { coordinate: false });
+
+    const applyGeneration = monitor.applyEdgeRoutingGeneration || applyEdgeRoutingGeneration;
+    await Promise.resolve(applyGeneration({
+        reason: `watchdog-runtime-ready:${routeKey}`,
+        preparationLease: result.preparationLease,
+    }));
+    return true;
+}
+
+async function abortFailedRestartPreparation(monitor, target, result, reason) {
+    if (result?.preparationLease) {
+        const abortPreparation = monitor.abortEdgeRoutingPreparation || abortEdgeRoutingPreparation;
+        try {
+            await Promise.resolve(abortPreparation(result.preparationLease, {
+                reason: `watchdog-runtime-failed:${reason}`,
+            }));
+        } catch (error) {
+            logEvent(monitor, 'error', 'container_restart_preparation_abort_failed', {
+                container: result.containerName || target.containerName,
+                agent: target.agentName,
+                repo: target.repoName,
+                error: error?.message || error,
+            });
+        }
+    }
+    if (result?.requiresEdgeActivation !== true || result?.exactCleanupPerformed === true) return;
+    try {
+        if (typeof monitor.cleanupFailedRuntime === 'function') {
+            await Promise.resolve(monitor.cleanupFailedRuntime(result.containerName || target.containerName, target));
+        } else {
+            await Promise.resolve(cleanupExactAgentRuntimeCandidate(result));
+        }
+    } catch (error) {
+        logEvent(monitor, 'error', 'container_restart_candidate_cleanup_failed', {
+            container: result.containerName || target.containerName,
+            agent: target.agentName,
+            repo: target.repoName,
+            error: error?.message || error,
+        });
+    }
 }
 
 export async function performContainerRestart(monitor, target, reason) {
@@ -400,23 +586,20 @@ export async function performContainerRestart(monitor, target, reason) {
         target.isRestarting = false;
         return;
     }
+    if (inspectWorkspaceStartLock().active) {
+        target.isRestarting = false;
+        logEvent(monitor, 'info', 'container_restart_deferred_workspace_start', {
+            container: target.containerName,
+            agent: target.agentName,
+            repo: target.repoName,
+        });
+        return;
+    }
 
     // A restart timer may have been scheduled immediately before a CLI
     // maintenance operation acquired its lock. Recheck at execution time so
     // the stale timer cannot race reinstall/restart staging.
     if (shouldDeferMaintenanceRestart(monitor, target)) {
-        target.isRestarting = false;
-        return;
-    }
-
-    if (!fs.existsSync(target.manifestPath)) {
-        target.circuitBreakerTripped = true;
-        logEvent(monitor, 'error', 'container_manifest_missing', {
-            container: target.containerName,
-            agent: target.agentName,
-            repo: target.repoName,
-            manifest: target.manifestPath
-        });
         target.isRestarting = false;
         return;
     }
@@ -430,32 +613,119 @@ export async function performContainerRestart(monitor, target, reason) {
         return;
     }
 
-    let manifest;
+    const acquireWorkspaceLease = monitor.createWorkspaceMutationLease || createWorkspaceMutationLease;
+    const releaseWorkspaceLease = monitor.releaseWorkspaceMutationLease || releaseWorkspaceMutationLease;
+    let workspaceLease;
     try {
-        const manifestContent = fs.readFileSync(target.manifestPath, 'utf8');
-        manifest = JSON.parse(manifestContent || '{}');
+        workspaceLease = acquireWorkspaceLease({ operation: `watchdog-restart:${target.containerName}` });
     } catch (error) {
-        target.circuitBreakerTripped = true;
-        target.lastError = error?.message || error;
-        logEvent(monitor, 'error', 'container_manifest_parse_error', {
-            container: target.containerName,
-            manifest: target.manifestPath,
-            error: target.lastError
-        });
+        if (error?.code === 'PLOINKY_WORKSPACE_MUTATION_BUSY') {
+            target.isRestarting = false;
+            logEvent(monitor, 'info', 'container_restart_deferred_workspace_start', {
+                container: target.containerName,
+                agent: target.agentName,
+                repo: target.repoName,
+            });
+            return;
+        }
         target.isRestarting = false;
-        return;
+        throw error;
     }
 
+    let result = null;
     try {
+        let manifestBytes;
+        let manifest;
+        try {
+            manifestBytes = fs.readFileSync(target.manifestPath);
+            manifest = JSON.parse(manifestBytes.toString('utf8') || '{}');
+        } catch (error) {
+            target.circuitBreakerTripped = true;
+            target.lastError = error?.message || error;
+            logEvent(monitor, 'error', fs.existsSync(target.manifestPath)
+                ? 'container_manifest_parse_error'
+                : 'container_manifest_missing', {
+                container: target.containerName,
+                agent: target.agentName,
+                repo: target.repoName,
+                manifest: target.manifestPath,
+                error: target.lastError,
+            });
+            target.isRestarting = false;
+            return;
+        }
+        const assertManifestUnchanged = () => {
+            let current;
+            try {
+                current = fs.readFileSync(target.manifestPath);
+            } catch (error) {
+                const changed = new Error(`watchdog manifest changed or disappeared during restart: ${error?.message || error}`);
+                changed.code = 'PLOINKY_RESTART_MANIFEST_CHANGED';
+                throw changed;
+            }
+            if (!current.equals(manifestBytes)) {
+                const changed = new Error('watchdog manifest bytes changed during restart; a fresh replacement is required');
+                changed.code = 'PLOINKY_RESTART_MANIFEST_CHANGED';
+                throw changed;
+            }
+        };
+        const resolveRuntimeProfile = monitor.resolveManifestRuntimeProfile || resolveManifestRuntimeProfile;
+        const profileResolution = resolveRuntimeProfile(manifest, {
+            agentName: `${target.repoName}/${target.agentName}`,
+            profileName: target.profile || undefined,
+            path: `manifest(${target.repoName}/${target.agentName})`,
+        });
+        const resolveEndpoint = monitor.resolveRouterEndpoint || resolveRouterEndpoint;
+        const routerEndpoint = resolveEndpoint(profileResolution.network.mode);
         const agentDir = path.dirname(target.manifestPath);
-        const result = ensureAgentService(target.agentName, manifest, agentDir, { containerName: target.containerName });
-        if (result?.containerName && result.containerName !== target.containerName) {
+        const ensureAgentServiceImpl = monitor.ensureAgentService || ensureAgentService;
+        result = await Promise.resolve(ensureAgentServiceImpl(target.agentName, manifest, agentDir, {
+            containerName: target.containerName,
+            commandHint: `ploinky restart ${target.alias || target.agentName}`,
+            networkLockWaitMs: 0,
+            profileName: profileResolution.resolvedProfileName,
+            profileResolution,
+            routerEndpoint,
+            forceRecreate: reason === 'semantic_probe_failed',
+        }));
+        // Preparation rereads the manifest for generation capture, while the
+        // physical launch consumes the object above. Exact-byte comparisons on
+        // both sides of semantic readiness prevent those inputs from diverging.
+        assertManifestUnchanged();
+
+        const prepared = assertRestartPreparationResult(target, result);
+        if (!prepared) {
+            target.lastSeenRunningAt = Date.now();
+            target.currentBackoff = monitor?.config?.INITIAL_BACKOFF_MS ?? 1000;
+            target.lastError = null;
+            logEvent(monitor, 'info', 'container_restart_reused_running', {
+                container: result?.containerName || target.containerName,
+                agent: target.agentName,
+                repo: target.repoName,
+                reason,
+            });
+            target.isRestarting = false;
+            return;
+        }
+
+        await waitForRestartedContainerReadiness(monitor, target, manifest, result);
+        assertManifestUnchanged();
+        await activateRestartedContainerRoute(
+            monitor,
+            target,
+            agentDir,
+            result,
+            profileResolution.network.mode,
+        );
+        target.instanceId = String(result?.registryRecord?.instanceId || '') || null;
+        target.enableGeneration = String(result?.registryRecord?.enableGeneration || '') || null;
+
+        if (prepared.containerName !== target.containerName) {
             const oldName = target.containerName;
             monitor.targets.delete(oldName);
-            target.containerName = result.containerName;
+            target.containerName = prepared.containerName;
             monitor.targets.set(target.containerName, target);
         }
-        await upsertRestartedContainerRoute(target, agentDir, result);
 
         stopProbeWorker(target);
         target.probeState = 'pending';
@@ -474,6 +744,8 @@ export async function performContainerRestart(monitor, target, reason) {
             reason
         });
     } catch (error) {
+        const failedResult = result || error?.ploinkyRestartCandidate || null;
+        await abortFailedRestartPreparation(monitor, target, failedResult, reason);
         target.lastError = error?.message || error;
         logEvent(monitor, 'error', 'container_restart_failed', {
             container: target.containerName,
@@ -482,9 +754,11 @@ export async function performContainerRestart(monitor, target, reason) {
             reason,
             error: target.lastError
         });
+        if (error && typeof error === 'object') LOGGED_RESTART_FAILURES.add(error);
         target.isRestarting = false;
-        scheduleContainerRestart(monitor, target, 'restart_failed');
-        return;
+        throw error;
+    } finally {
+        releaseWorkspaceLease(workspaceLease);
     }
 
     target.isRestarting = false;
@@ -492,6 +766,25 @@ export async function performContainerRestart(monitor, target, reason) {
 
 function monitorTick(monitor) {
     if (!monitor || monitor.isShuttingDown()) return;
+
+    const workspaceStart = inspectWorkspaceStartLock();
+    if (workspaceStart.stale) {
+        logEvent(monitor, 'info', 'workspace_start_lock_removed', {
+            ownerPid: workspaceStart.lock?.ownerPid || null,
+            expiresAt: workspaceStart.lock?.expiresAt || null,
+        });
+    }
+    if (workspaceStart.active) {
+        if (!monitor.workspaceStartDeferred) {
+            monitor.workspaceStartDeferred = true;
+            logEvent(monitor, 'info', 'container_monitor_deferred_workspace_start', {
+                ownerPid: workspaceStart.lock?.ownerPid || null,
+                expiresAt: workspaceStart.lock?.expiresAt || null,
+            });
+        }
+        return;
+    }
+    monitor.workspaceStartDeferred = false;
 
     syncManagedContainers(monitor);
 
@@ -502,7 +795,11 @@ function monitorTick(monitor) {
         let running = false;
         try {
             if (isSandboxRuntime(target.runtime)) {
-                running = isBwrapProcessRunning(target.agentName);
+                running = Boolean(target.instanceId && target.enableGeneration)
+                    && isBwrapProcessRunning(target.containerName, {
+                        instanceId: target.instanceId,
+                        enableGeneration: target.enableGeneration,
+                    });
             } else {
                 running = isContainerRunning(target.containerName);
             }
@@ -530,6 +827,16 @@ function monitorTick(monitor) {
                     agent: target.agentName,
                     repo: target.repoName
                 });
+            }
+            const continuousProbeIntervalMs = positiveInteger(
+                monitor?.config?.CONTINUOUS_PROBE_INTERVAL_MS
+                    ?? process.env.PLOINKY_CONTAINER_MONITOR_CONTINUOUS_PROBE_INTERVAL_MS,
+                30_000,
+            );
+            if (target.probeState === 'success'
+                && (!target.probeLastSuccessAt
+                    || now - target.probeLastSuccessAt >= continuousProbeIntervalMs)) {
+                target.probeState = 'pending';
             }
             startProbeWorker(monitor, target);
             continue;

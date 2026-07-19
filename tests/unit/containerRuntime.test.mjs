@@ -37,7 +37,12 @@ function runModuleSnippet(source, env = {}, options = {}) {
     });
 }
 
-test('buildRuntimeRouterEnv prefers the startup port over stale routing state', () => {
+function writeExecutable(filePath, contents) {
+    fs.writeFileSync(filePath, contents);
+    fs.chmodSync(filePath, 0o755);
+}
+
+test('buildRuntimeRouterEnv uses the validated managed box-host endpoint', () => {
     const workspaceDir = tempDir();
     try {
         fs.mkdirSync(path.join(workspaceDir, '.ploinky'), { recursive: true });
@@ -45,40 +50,109 @@ test('buildRuntimeRouterEnv prefers the startup port over stale routing state', 
 
         const result = runModuleSnippet(
             `const { buildRuntimeRouterEnv } = await import(${JSON.stringify(agentServiceManagerUrl)});
-process.stdout.write(JSON.stringify(buildRuntimeRouterEnv('podman', { routerPort: 8097 })));`,
+const { buildRouterEndpoint } = await import(${JSON.stringify(pathToFileURL(path.join(repoRoot, 'cli/services/routerPort.js')).href)});
+const routerEndpoint = buildRouterEndpoint('default', 8080);
+process.stdout.write(JSON.stringify(buildRuntimeRouterEnv('podman', { networkMode: 'default', routerPort: 8080, routerEndpoint })));`,
             {},
             { cwd: workspaceDir },
         );
 
         assert.equal(result.status, 0, result.stderr);
         assert.deepEqual(JSON.parse(result.stdout), {
-            PLOINKY_ROUTER_PORT: '8097',
+            PLOINKY_ROUTER_PORT: '8080',
             PLOINKY_ROUTER_HOST: 'host.containers.internal',
-            PLOINKY_ROUTER_URL: 'http://host.containers.internal:8097',
+            PLOINKY_ROUTER_URL: 'http://host.containers.internal:8080',
+            PLOINKY_INTERNAL_ROUTER_URL: 'http://host.containers.internal:8081',
+            PLOINKY_EDGE_TOPOLOGY_FILE: '/run/ploinky-edge-topology/current.json',
         });
     } finally {
         fs.rmSync(workspaceDir, { recursive: true, force: true });
     }
 });
 
-test('buildRuntimeRouterEnv reads the seeded routing file when no port override is supplied', () => {
+test('buildRuntimeRouterEnv receives the same validated endpoint for Docker builders', () => {
     const workspaceDir = tempDir();
     try {
         fs.mkdirSync(path.join(workspaceDir, '.ploinky'), { recursive: true });
-        fs.writeFileSync(path.join(workspaceDir, '.ploinky/routing.json'), JSON.stringify({ port: 8097 }));
+        fs.writeFileSync(path.join(workspaceDir, '.ploinky/routing.json'), JSON.stringify({ port: 8080 }));
 
         const result = runModuleSnippet(
             `const { buildRuntimeRouterEnv } = await import(${JSON.stringify(agentServiceManagerUrl)});
-process.stdout.write(JSON.stringify(buildRuntimeRouterEnv('docker')));`,
+const { buildRouterEndpoint } = await import(${JSON.stringify(pathToFileURL(path.join(repoRoot, 'cli/services/routerPort.js')).href)});
+const routerEndpoint = buildRouterEndpoint('bridge', 8080);
+process.stdout.write(JSON.stringify(buildRuntimeRouterEnv('docker', { networkMode: 'bridge', routerEndpoint })));`,
             {},
             { cwd: workspaceDir },
         );
 
         assert.equal(result.status, 0, result.stderr);
         assert.deepEqual(JSON.parse(result.stdout), {
-            PLOINKY_ROUTER_PORT: '8097',
-            PLOINKY_ROUTER_HOST: 'host.docker.internal',
-            PLOINKY_ROUTER_URL: 'http://host.docker.internal:8097',
+            PLOINKY_ROUTER_PORT: '8080',
+            PLOINKY_ROUTER_HOST: 'host.containers.internal',
+            PLOINKY_ROUTER_URL: 'http://host.containers.internal:8080',
+            PLOINKY_INTERNAL_ROUTER_URL: 'http://host.containers.internal:8081',
+            PLOINKY_EDGE_TOPOLOGY_FILE: '/run/ploinky-edge-topology/current.json',
+        });
+    } finally {
+        fs.rmSync(workspaceDir, { recursive: true, force: true });
+    }
+});
+
+test('buildRuntimeNetworkPlan delegates canonical bridge networks to the lifecycle adapter', () => {
+    const workspaceDir = tempDir();
+    try {
+        const markerPath = `${workspaceDir}/ploinky-box-marker`;
+        fs.writeFileSync(markerPath, 'assistos/ploinky-box\n');
+        const result = runModuleSnippet(
+            `const { buildRuntimeNetworkPlan } = await import(${JSON.stringify(agentServiceManagerUrl)});
+const plan = buildRuntimeNetworkPlan('podman', {
+  mode: 'bridge',
+  attachments: [{ name: 'webmeet', primary: true }],
+}, { boxMarkerPath: ${JSON.stringify(markerPath)} });
+process.stdout.write(JSON.stringify(plan));`,
+            {},
+            { cwd: workspaceDir },
+        );
+
+        assert.equal(result.status, 0, result.stderr);
+        assert.deepEqual(JSON.parse(result.stdout), {
+            mode: 'bridge',
+            args: [],
+            useHostNetwork: false,
+            boxNetworkCompat: true,
+            requiresManagedNetwork: true,
+            hashEnv: { PLOINKY_NETWORK_MODE: 'bridge' },
+        });
+    } finally {
+        fs.rmSync(workspaceDir, { recursive: true, force: true });
+    }
+});
+
+test('buildRuntimeNetworkPlan keeps canonical default mode managed in every workspace', () => {
+    const workspaceDir = tempDir();
+    const fakeWorkspace = path.join(workspaceDir, 'workspace');
+    fs.mkdirSync(fakeWorkspace, { recursive: true });
+    try {
+        const result = runModuleSnippet(
+            `const { buildRuntimeNetworkPlan } = await import(${JSON.stringify(agentServiceManagerUrl)});
+const plan = buildRuntimeNetworkPlan('podman', { mode: 'default' }, {
+  boxMarkerPath: ${JSON.stringify(path.join(workspaceDir, 'missing-marker'))},
+  sourceRoot: '/opt/ploinky',
+  workspacePath: ${JSON.stringify(fakeWorkspace)},
+});
+process.stdout.write(JSON.stringify(plan));`,
+            { PLOINKY_WORKSPACE_ROOT: '/workspace' },
+            { cwd: workspaceDir },
+        );
+
+        assert.equal(result.status, 0, result.stderr);
+        assert.deepEqual(JSON.parse(result.stdout), {
+            mode: 'default',
+            args: [],
+            useHostNetwork: false,
+            boxNetworkCompat: true,
+            requiresManagedNetwork: true,
+            hashEnv: { PLOINKY_NETWORK_MODE: 'default' },
         });
     } finally {
         fs.rmSync(workspaceDir, { recursive: true, force: true });
@@ -136,26 +210,60 @@ process.stdout.write(JSON.stringify({
     }
 });
 
-test('parseManifestPorts emits runtime-chosen localhost openPorts for host port 0', () => {
+test('parseManifestPorts rejects openPorts host port 0 before runtime mutation', () => {
     const workspaceDir = tempDir();
     try {
         const result = runModuleSnippet(
             `const { parseManifestPorts } = await import(${JSON.stringify(dockerCommonUrl)});
 const manifest = {};
 const profile = { openPorts: ['127.0.0.1:0:9000', '127.0.0.1:18080:8080'] };
-process.stdout.write(JSON.stringify(parseManifestPorts(manifest, profile)));`,
+try {
+  parseManifestPorts(manifest, profile);
+} catch (error) {
+  process.stdout.write(JSON.stringify({ code: error.code || '', message: error.message }));
+}`,
             {},
             { cwd: workspaceDir },
         );
 
         assert.equal(result.status, 0, result.stderr);
-        assert.deepEqual(JSON.parse(result.stdout), {
-            publishArgs: ['127.0.0.1::9000', '127.0.0.1:18080:8080'],
-            portMappings: [
-                { hostPort: 0, containerPort: 9000, hostIp: '127.0.0.1', protocol: 'tcp' },
-                { hostPort: 18080, containerPort: 8080, hostIp: '127.0.0.1', protocol: 'tcp' },
-            ],
-        });
+        assert.match(JSON.parse(result.stdout).message, /host port 0 is not valid for outer box publish/);
+    } finally {
+        fs.rmSync(workspaceDir, { recursive: true, force: true });
+    }
+});
+
+test('parseManifestPorts rejects reserved Router TCP and LiveKit UDP box-side ranges', () => {
+    const workspaceDir = tempDir();
+    const markerPath = path.join(workspaceDir, 'etc-ploinky-box');
+    try {
+        fs.writeFileSync(markerPath, 'assistos/ploinky-box\n');
+        const result = runModuleSnippet(
+            `const { parseManifestPorts, isPloinkyBoxRuntime } = await import(${JSON.stringify(dockerCommonUrl)});
+const manifest = {};
+const results = [];
+for (const spec of ['127.0.0.1:8080:9000', '127.0.0.1:8079-8081:9000-9002', '127.0.0.1:7882:7882/udp', '127.0.0.1:7880-7884:9000-9004/udp']) {
+  try {
+    parseManifestPorts(manifest, { openPorts: [spec] }, { boxMarkerPath: ${JSON.stringify(markerPath)} });
+    results.push({ spec, accepted: true });
+  } catch (error) {
+    results.push({ spec, code: error.code, message: error.message });
+  }
+}
+process.stdout.write(JSON.stringify({ marker: isPloinkyBoxRuntime(${JSON.stringify(markerPath)}), results }));`,
+            {},
+            { cwd: workspaceDir },
+        );
+
+        assert.equal(result.status, 0, result.stderr);
+        const output = JSON.parse(result.stdout);
+        assert.equal(output.marker, true);
+        assert.equal(output.results.length, 4);
+        for (const record of output.results) {
+            assert.equal(record.accepted, undefined, record.spec);
+            assert.equal(record.code, 'PLOINKY_RESERVED_BOX_PORT', record.spec);
+            assert.match(record.message, /overlaps reserved port (8080|8081|7882)/, record.spec);
+        }
     } finally {
         fs.rmSync(workspaceDir, { recursive: true, force: true });
     }
@@ -176,10 +284,75 @@ try {
         );
 
         assert.equal(result.status, 0, result.stderr);
-        assert.match(result.stdout, /renamed to 'openPorts'/);
+        assert.match(result.stdout, /profile field 'ports' is unsupported; use 'openPorts'/);
     } finally {
         fs.rmSync(workspaceDir, { recursive: true, force: true });
     }
+});
+
+test('AgentServer execution modes retain implicit private 7000 unless an explicit mapping targets it', () => {
+    const result = runModuleSnippet(
+        `const { shouldCreateImplicitAgentServerPublish } = await import(${JSON.stringify(agentServiceManagerUrl)});
+process.stdout.write(JSON.stringify({
+  implicit: shouldCreateImplicitAgentServerPublish({}, []),
+  agentOnly: shouldCreateImplicitAgentServerPublish({ agent: 'node server.mjs' }, []),
+  startAndAgent: shouldCreateImplicitAgentServerPublish({ start: 'node app.mjs', agent: 'node server.mjs' }, []),
+  declaredPort: shouldCreateImplicitAgentServerPublish({ agent: 'node server.mjs' }, ['127.0.0.1::7000']),
+}));`,
+    );
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(JSON.parse(result.stdout), {
+        implicit: true,
+        agentOnly: true,
+        startAndAgent: true,
+        declaredPort: true,
+    });
+});
+
+test('implicit AgentServer mapping appends without erasing or duplicating declared ports', () => {
+    const result = runModuleSnippet(
+        `const { appendUniquePortMapping, resolveHostPortFromRecord } = await import(${JSON.stringify(agentServiceManagerUrl)});
+const declared = [{ containerPort: 8080, hostPort: 18080, protocol: 'tcp' }];
+const implicit = { containerPort: 7000, hostPort: 17000, hostIp: '127.0.0.1', protocol: 'tcp' };
+const once = appendUniquePortMapping(declared, implicit);
+const twice = appendUniquePortMapping(once, { ...implicit, hostPort: 27000 });
+const reuseRecord = { config: { ports: twice } };
+process.stdout.write(JSON.stringify({
+  once,
+  twice,
+  declaredReusePort: resolveHostPortFromRecord(reuseRecord, [8080]),
+  agentServerReusePort: resolveHostPortFromRecord(reuseRecord, [7000]),
+}));`,
+    );
+
+    assert.equal(result.status, 0, result.stderr);
+    const output = JSON.parse(result.stdout);
+    assert.deepEqual(output.once, [
+        { containerPort: 8080, hostPort: 18080, protocol: 'tcp' },
+        { containerPort: 7000, hostPort: 17000, hostIp: '127.0.0.1', protocol: 'tcp' },
+    ]);
+    assert.deepEqual(output.twice, output.once);
+    assert.equal(output.declaredReusePort, 18080);
+    assert.equal(output.agentServerReusePort, 17000);
+});
+
+test('start-only execution never fabricates an AgentServer 7000 publish', () => {
+    const result = runModuleSnippet(
+        `const { shouldCreateImplicitAgentServerPublish } = await import(${JSON.stringify(agentServiceManagerUrl)});
+process.stdout.write(JSON.stringify({
+  script: shouldCreateImplicitAgentServerPublish({ start: 'postgres', health: { readiness: { script: 'healthcheck.sh' } } }, []),
+  none: shouldCreateImplicitAgentServerPublish({ start: 'sleep infinity', readiness: { protocol: 'none' } }, []),
+  privateServer: shouldCreateImplicitAgentServerPublish({ start: 'node app.mjs' }, []),
+}));`,
+    );
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(JSON.parse(result.stdout), {
+        script: false,
+        none: false,
+        privateServer: false,
+    });
 });
 
 test('getConfiguredProjectPath uses .data agent folder for isolated records', () => {
@@ -242,20 +415,50 @@ test('global enabled agents keep workspace projectPath and declare persistent /r
     const binDir = tempDir('ploinky-fake-runtime-');
     try {
         const stateFile = path.join(binDir, 'container-name.txt');
+        const runningFile = path.join(binDir, 'container-running.txt');
         const argsFile = path.join(binDir, 'run-args.txt');
+        const inspectHelper = path.join(binDir, 'inspect-helper.mjs');
         const podmanPath = path.join(binDir, 'podman');
+        fs.writeFileSync(inspectHelper, `
+import fs from 'node:fs';
+const [argsPath, statePath, runningPath] = process.argv.slice(2);
+const args = fs.readFileSync(argsPath, 'utf8').split(/\\r?\\n/).filter(Boolean);
+const labels = {};
+for (let index = 0; index < args.length; index += 1) {
+  if (args[index] !== '--label') continue;
+  const [key, ...value] = String(args[index + 1] || '').split('=');
+  labels[key] = value.join('=');
+}
+const running = fs.existsSync(runningPath);
+process.stdout.write(JSON.stringify([{
+  Id: 'candidate1234567890',
+  Name: fs.readFileSync(statePath, 'utf8').trim(),
+  Config: { Labels: labels },
+  HostConfig: { NetworkMode: 'none' },
+  NetworkSettings: { Networks: {} },
+  State: { Running: running, Status: running ? 'running' : 'configured' },
+}]));
+`);
         fs.writeFileSync(
             podmanPath,
             `#!/bin/sh
+emit_inspect() {
+  [ -f ${JSON.stringify(stateFile)} ] || exit 1
+  ${JSON.stringify(process.execPath)} ${JSON.stringify(inspectHelper)} ${JSON.stringify(argsFile)} ${JSON.stringify(stateFile)} ${JSON.stringify(runningFile)}
+}
 case "$1" in
   image)
     exit 0
     ;;
   inspect)
-    exit 1
+    emit_inspect
     ;;
-  run)
-    printf '%s\\n' "$*" > ${JSON.stringify(argsFile)}
+  container)
+    [ "$2" = "inspect" ] || exit 1
+    emit_inspect
+    ;;
+  create)
+    printf '%s\\n' "$@" > ${JSON.stringify(argsFile)}
     name=""
     prev=""
     for arg in "$@"; do
@@ -263,6 +466,10 @@ case "$1" in
       prev="$arg"
     done
     printf '%s\\n' "$name" > ${JSON.stringify(stateFile)}
+    exit 0
+    ;;
+  start)
+    : > ${JSON.stringify(runningFile)}
     exit 0
     ;;
   ps)
@@ -285,12 +492,29 @@ esac
         fs.writeFileSync(path.join(agentDir, 'manifest.json'), JSON.stringify({
             container: 'example/demo:latest',
             start: 'sleep 3600',
+            network: { mode: 'none' },
             readiness: { protocol: 'none' },
         }));
+        fs.writeFileSync(path.join(workspaceDir, '.ploinky', 'routing.json'), JSON.stringify({ port: 8080, routes: {} }));
+        fs.writeFileSync(path.join(workspaceDir, '.ploinky', 'agents.json'), '{}');
+        fs.mkdirSync(path.join(workspaceDir, '.ploinky', 'data', 'router-security'), { recursive: true });
+        fs.writeFileSync(
+            path.join(workspaceDir, '.ploinky', 'data', 'router-security', 'policy-state.json'),
+            JSON.stringify({ schema: 'router-policy', httpRoutes: [], mcpTools: [] }),
+        );
+        fs.mkdirSync(path.join(workspaceDir, '.ploinky', 'data', 'edge-routing'), { recursive: true });
+        fs.writeFileSync(
+            path.join(workspaceDir, '.ploinky', 'data', 'edge-routing', 'desired.json'),
+            JSON.stringify({
+                schemaVersion: 1,
+                hosts: {},
+                security: { hostNetworkAllowedInstances: [], internalServiceConsumers: {} },
+            }),
+        );
 
         const result = runModuleSnippet(
             `const { enableAgent } = await import(${JSON.stringify(pathToFileURL(path.join(repoRoot, 'cli/services/agents.js')).href)});
-enableAgent('repo/demo', 'global');
+await enableAgent('repo/demo', 'global');
 const fs = await import('node:fs');
 const path = await import('node:path');
 const agents = JSON.parse(fs.readFileSync(path.join(process.cwd(), '.ploinky', 'agents.json'), 'utf8'));
@@ -304,6 +528,8 @@ console.log(JSON.stringify(record));`,
         const record = JSON.parse(result.stdout.trim().split('\n').at(-1));
         assert.equal(record.runMode, 'global');
         assert.equal(record.projectPath, workspaceDir);
+        assert.deepEqual(record.config.ports, []);
+        assert.doesNotMatch(fs.readFileSync(argsFile, 'utf8'), /(?:^|:)7000(?:$|\s)/);
         assert.ok(record.config.binds.some((bind) => (
             bind.source === workspaceDir && bind.target === workspaceDir
         )));
@@ -313,6 +539,33 @@ console.log(JSON.stringify(record));`,
     } finally {
         fs.rmSync(workspaceDir, { recursive: true, force: true });
         fs.rmSync(binDir, { recursive: true, force: true });
+    }
+});
+
+test('enable rejects a missing persisted router port before registry mutation', () => {
+    const workspaceDir = tempDir();
+    try {
+        const agentDir = path.join(workspaceDir, '.ploinky', 'repos', 'repo', 'demo');
+        fs.mkdirSync(agentDir, { recursive: true });
+        fs.writeFileSync(path.join(agentDir, 'manifest.json'), JSON.stringify({
+            container: 'example/demo:latest',
+            start: 'sleep 3600',
+            network: { mode: 'default' },
+            readiness: { protocol: 'none' },
+        }));
+
+        const result = runModuleSnippet(
+            `const { enableAgent } = await import(${JSON.stringify(pathToFileURL(path.join(repoRoot, 'cli/services/agents.js')).href)});
+await enableAgent('repo/demo', 'global');`,
+            {},
+            { cwd: workspaceDir },
+        );
+
+        assert.notEqual(result.status, 0);
+        assert.match(result.stderr, /persisted router port is required/i);
+        assert.equal(fs.existsSync(path.join(workspaceDir, '.ploinky', 'agents.json')), false);
+    } finally {
+        fs.rmSync(workspaceDir, { recursive: true, force: true });
     }
 });
 
@@ -542,6 +795,63 @@ test('preinstall deduplication is process-local and repo scoped', () => {
 
     assert.equal(hasPreinstallRunInProcess(agentName, 'repo-one', 'dev'), true);
     assert.equal(hasPreinstallRunInProcess(agentName, 'repo-two', 'dev'), false);
+});
+
+test('host-mode capability denial occurs before the manifest preinstall hook', () => {
+    const workspaceDir = tempDir('ploinky-host-capability-');
+    try {
+        const agentDir = path.join(workspaceDir, '.ploinky', 'repos', 'repo', 'demo');
+        const marker = path.join(workspaceDir, 'host-hook-ran');
+        fs.mkdirSync(agentDir, { recursive: true });
+        writeExecutable(path.join(agentDir, 'preinstall.sh'), `#!/bin/sh\nprintf ran > ${JSON.stringify(marker)}\n`);
+        const manifest = {
+            container: 'example/demo@sha256:' + 'a'.repeat(64),
+            start: 'sleep 3600',
+            network: { mode: 'host' },
+            profiles: { default: { preinstall: 'preinstall.sh' } },
+            readiness: { protocol: 'none' },
+        };
+        fs.writeFileSync(path.join(agentDir, 'manifest.json'), JSON.stringify(manifest));
+        fs.mkdirSync(path.join(workspaceDir, '.ploinky'), { recursive: true });
+        fs.writeFileSync(path.join(workspaceDir, '.ploinky', 'agents.json'), JSON.stringify({
+            test_host: {
+                type: 'agent',
+                repoName: 'repo',
+                agentName: 'demo',
+                projectPath: workspaceDir,
+                runMode: 'global',
+                instanceId: 'instance-current',
+                enableGeneration: 'enable-current',
+            },
+        }));
+        fs.writeFileSync(path.join(workspaceDir, '.ploinky', 'routing.json'), JSON.stringify({ static: { port: 8080 }, routes: {} }));
+
+        const result = runModuleSnippet(
+            `const fs = await import('node:fs');
+const { startAgentContainer } = await import(${JSON.stringify(agentServiceManagerUrl)});
+const { buildRouterEndpoint } = await import(${JSON.stringify(pathToFileURL(path.join(repoRoot, 'cli/services/routerPort.js')).href)});
+const manifest = JSON.parse(fs.readFileSync(${JSON.stringify(path.join(agentDir, 'manifest.json'))}, 'utf8'));
+try {
+  startAgentContainer('demo', manifest, ${JSON.stringify(agentDir)}, {
+    containerName: 'test_host',
+    profileName: 'default',
+    routerEndpoint: buildRouterEndpoint('host', 8080),
+    runtimeIdentity: { instanceId: 'instance-current', enableGeneration: 'enable-current' },
+  });
+  console.log('UNEXPECTED_SUCCESS');
+} catch (error) {
+  console.log(error.code || error.message);
+}`,
+            { CONTAINER_RUNTIME: 'podman' },
+            { cwd: workspaceDir },
+        );
+
+        assert.equal(result.status, 0, result.stderr);
+        assert.match(result.stdout, /EDGE_GENERATION_INACTIVE|HOST_MODE_CAPABILITY_DENIED/);
+        assert.equal(fs.existsSync(marker), false, 'denied host mode must not execute preinstall');
+    } finally {
+        fs.rmSync(workspaceDir, { recursive: true, force: true });
+    }
 });
 
 test('resetPreinstallRunInProcess clears the in-process dedup set', () => {

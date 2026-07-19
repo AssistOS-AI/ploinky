@@ -9,9 +9,20 @@ import { buildEnvFlags, buildEnvMap } from '../secretVars.js';
 import { loadAgents, saveAgents } from '../workspace.js';
 import { debugLog } from '../utils.js';
 import { isHostSandboxDisabled } from '../sandboxRuntime.js';
+import { intervalsOverlap, parseManifestOpenPortSpec } from '../../../container/publish-spec.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+const PLOINKY_BOX_MARKER_PATH = '/etc/ploinky-box';
+const PLOINKY_MANAGED_LABEL = 'io.assistos.ploinky.managed=1';
+
+function isPloinkyBoxRuntime(markerPath = process.env.PLOINKY_BOX_MARKER_PATH || PLOINKY_BOX_MARKER_PATH) {
+    try {
+        return fs.statSync(markerPath).isFile();
+    } catch (_) {
+        return false;
+    }
+}
 
 function isPathUnderRoot(candidate) {
     if (!candidate) return false;
@@ -83,6 +94,14 @@ function isRuntimeInstalled(runtime) {
 let containerRuntime = null;
 
 function probeContainerRuntime() {
+    if (isPloinkyBoxRuntime()) {
+        if (isRuntimeInstalled('podman')) {
+            containerRuntime = 'podman';
+            return containerRuntime;
+        }
+        containerRuntime = null;
+        return null;
+    }
     if (containerRuntime) return containerRuntime;
     for (const candidate of ['podman', 'docker']) {
         if (isRuntimeInstalled(candidate)) {
@@ -97,6 +116,11 @@ function probeContainerRuntime() {
 function requireContainerRuntime() {
     const rt = probeContainerRuntime();
     if (!rt) {
+        if (isPloinkyBoxRuntime()) {
+            const error = new Error('Ploinky box requires nested Podman, but podman was not found in PATH. Docker fallback is not permitted inside the box.');
+            error.code = 'PLOINKY_BOX_PODMAN_REQUIRED';
+            throw error;
+        }
         console.error('Neither podman nor docker found in PATH. Please install one of them.');
         process.exit(1);
     }
@@ -104,10 +128,17 @@ function requireContainerRuntime() {
 }
 
 const DEFAULT_IMAGE_PULL_TIMEOUT_MS = 30 * 60 * 1000;
+const DEFAULT_IMAGE_BUILD_TIMEOUT_MS = 30 * 60 * 1000;
+const LOCAL_IMAGE_BUILD_DEFINITIONS = Object.freeze({});
 
 function imagePullTimeoutMs() {
     const raw = Number(process.env.PLOINKY_IMAGE_PULL_TIMEOUT_MS);
     return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_IMAGE_PULL_TIMEOUT_MS;
+}
+
+function imageBuildTimeoutMs() {
+    const raw = Number(process.env.PLOINKY_IMAGE_BUILD_TIMEOUT_MS);
+    return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_IMAGE_BUILD_TIMEOUT_MS;
 }
 
 function imageExists(image, runtime) {
@@ -165,6 +196,53 @@ function pullImage(image, options = {}) {
     }
 }
 
+function resolveLocalImageBuildSource(image, options = {}) {
+    const img = String(image || '').trim();
+    const definition = LOCAL_IMAGE_BUILD_DEFINITIONS[img];
+    if (!definition) return null;
+    const reposDir = options.reposDir || REPOS_DIR;
+    const contextPath = path.join(reposDir, definition.repoName, definition.context);
+    const dockerfilePath = path.join(contextPath, definition.dockerfile || 'Dockerfile');
+    if (!fs.existsSync(dockerfilePath)) return null;
+    return {
+        ...definition,
+        image: img,
+        contextPath,
+        dockerfilePath,
+    };
+}
+
+function buildLocalImage(image, options = {}) {
+    const rt = options.runtime || getRuntime();
+    const img = String(image || '').trim();
+    if (!img) throw new Error('buildLocalImage: image is required');
+    const source = options.source || resolveLocalImageBuildSource(img, options);
+    if (!source) return false;
+    const log = typeof options.log === 'function' ? options.log : ((msg) => console.log(msg));
+    const timeoutMs = Number.isFinite(options.timeoutMs) && options.timeoutMs > 0
+        ? options.timeoutMs
+        : imageBuildTimeoutMs();
+    log(`[build] ${rt} build -t ${img} ${source.contextPath} (timeout ${Math.round(timeoutMs / 1000)}s)`);
+    const startedAt = Date.now();
+    const res = spawnSync(rt, ['build', '-t', img, source.contextPath], {
+        stdio: ['ignore', 'inherit', 'inherit'],
+        timeout: timeoutMs,
+    });
+    const elapsedSec = Math.max(1, Math.round((Date.now() - startedAt) / 1000));
+    if (res.error) {
+        if (res.error.code === 'ETIMEDOUT') {
+            throw new Error(`Image build for '${img}' timed out after ${Math.round(timeoutMs / 1000)}s. `
+                + 'Increase PLOINKY_IMAGE_BUILD_TIMEOUT_MS or pre-build it.');
+        }
+        throw new Error(`Image build for '${img}' failed: ${res.error.message}`);
+    }
+    if (res.status !== 0) {
+        throw new Error(`Image build for '${img}' exited with code ${res.status}.`);
+    }
+    log(`[build] ${img} ready from ${source.repoName}/${source.context} in ${elapsedSec}s`);
+    return true;
+}
+
 // Ensure an image is present locally, pulling it (with streamed progress) only
 // when missing. Returns true if a pull happened, false if it was already cached.
 function ensureImagePresent(image, options = {}) {
@@ -174,7 +252,27 @@ function ensureImagePresent(image, options = {}) {
     if (imageExists(img, rt)) return false;
     const log = typeof options.log === 'function' ? options.log : ((msg) => console.log(msg));
     log(`[pull] image '${img}' not present locally — pulling before runtime probe...`);
-    pullImage(img, { runtime: rt, log, timeoutMs: options.pullTimeoutMs });
+    try {
+        pullImage(img, { runtime: rt, log, timeoutMs: options.pullTimeoutMs });
+    } catch (pullError) {
+        const source = resolveLocalImageBuildSource(img, options);
+        if (!source) throw pullError;
+        log(`[pull] ${img} could not be pulled (${pullError.message}); building from ${source.repoName}/${source.context}...`);
+        try {
+            buildLocalImage(img, {
+                ...options,
+                runtime: rt,
+                log,
+                source,
+                timeoutMs: options.buildTimeoutMs,
+            });
+        } catch (buildError) {
+            throw new Error(
+                `Image pull for '${img}' failed and local build fallback failed: ${buildError.message} `
+                + `Original pull error: ${pullError.message}`
+            );
+        }
+    }
     return true;
 }
 
@@ -186,8 +284,8 @@ function loadAgentsMap() {
     return loadAgents();
 }
 
-function saveAgentsMap(map) {
-    return saveAgents(map);
+function saveAgentsMap(map, options = {}) {
+    return saveAgents(map, options);
 }
 
 function getAgentContainerName(agentName, repoName) {
@@ -239,6 +337,7 @@ function getSecretsForAgent(manifest, options = {}) {
     const vars = buildEnvFlags(manifest, null, {
         agentName: options.agentName,
         repoName: options.repoName,
+        forRuntime: true,
     });
     debugLog(`Formatted env vars for ${probeContainerRuntime() || 'container'} command: ${vars.join(' ')}`);
     return vars;
@@ -326,7 +425,13 @@ function sleepMs(ms) {
     Atomics.wait(SLEEP_ARRAY, 0, 0, ms);
 }
 
-function parseManifestPorts(manifest, profileConfig = null) {
+function parseManifestPorts(manifest, profileConfig = null, options = {}) {
+    if (manifest && Object.prototype.hasOwnProperty.call(manifest, 'ports')) {
+        throw new Error("manifest field 'ports' was renamed to profile field 'openPorts'");
+    }
+    if (profileConfig && Object.prototype.hasOwnProperty.call(profileConfig, 'ports')) {
+        throw new Error("profile field 'ports' is unsupported; use 'openPorts'");
+    }
     // Open ports must be defined in profile configuration.
     const ports = profileConfig?.openPorts;
     if (!ports) return { publishArgs: [], portMappings: [] };
@@ -340,92 +445,43 @@ function parseManifestPorts(manifest, profileConfig = null) {
         const portSpec = String(p).trim();
         if (!portSpec) continue;
 
-        const parts = portSpec.split(':');
-        let hostIp = '127.0.0.1';  // Default to localhost for security
-        let hostPortSpec;
-        let containerPortSpec;
-        if (parts.length === 1) {
-            hostPortSpec = containerPortSpec = parts[0];
-        } else if (parts.length === 2) {
-            hostPortSpec = parts[0];
-            containerPortSpec = parts[1];
-        } else if (parts.length === 3) {
-            hostIp = parts[0];  // Respect the specified IP address
-            hostPortSpec = parts[1];
-            containerPortSpec = parts[2];
+        const parsed = parseManifestOpenPortSpec(portSpec);
+        const reserved = parsed.protocol === 'tcp'
+            ? [
+                { port: 8080, owner: 'public/control Router' },
+                { port: 8081, owner: 'box-private Router' },
+            ]
+            : [{ port: 7882, owner: 'fixed media UDP mux capability' }];
+        const conflict = reserved.find(({ port }) => intervalsOverlap(
+            parsed.boxSide,
+            { start: port, end: port },
+        ));
+        if (conflict) {
+            const error = new Error(
+                `openPorts ${parsed.protocol} box-side range ${formatPortRange(parsed.boxSide)} overlaps reserved port ${conflict.port} (${conflict.owner})`,
+            );
+            error.code = 'PLOINKY_RESERVED_BOX_PORT';
+            throw error;
         }
-        const parsed = parsePortPublishSpec(hostPortSpec, containerPortSpec);
-        if (parsed) {
-            const normalized = `${hostIp}:${parsed.hostPortSpec}:${parsed.containerPortSpec}${parsed.protocolSuffix}`;
-            publishArgs.push(normalized);
-            for (const mapping of parsed.portMappings) {
-                portMappings.push({ ...mapping, hostIp, protocol: parsed.protocol });
-            }
+        const publishHostIp = parsed.hostIp;
+        const protocolSuffix = parsed.protocol === 'tcp' ? '' : `/${parsed.protocol}`;
+        const normalized = `${publishHostIp}:${formatPortRange(parsed.boxSide)}:${formatPortRange(parsed.privateContainer)}${protocolSuffix}`;
+        publishArgs.push(normalized);
+        for (let offset = 0; offset < parsed.boxSide.length; offset += 1) {
+            portMappings.push({
+                hostPort: parsed.boxSide.start + offset,
+                containerPort: parsed.privateContainer.start + offset,
+                hostIp: publishHostIp,
+                protocol: parsed.protocol,
+            });
         }
     }
 
     return { publishArgs, portMappings };
 }
 
-function parsePortPublishSpec(hostPortSpec, containerPortSpec) {
-    if (hostPortSpec === undefined || hostPortSpec === null || containerPortSpec === undefined || containerPortSpec === null) {
-        return null;
-    }
-    const container = splitPortProtocol(containerPortSpec);
-    const host = splitPortProtocol(hostPortSpec);
-    const protocol = container.protocol || host.protocol || 'tcp';
-    if ((container.protocol && host.protocol && container.protocol !== host.protocol) || !['tcp', 'udp'].includes(protocol)) {
-        return null;
-    }
-    const hostRange = parsePortRange(host.portSpec, { allowEphemeral: true });
-    const containerRange = parsePortRange(container.portSpec);
-    if (!hostRange || !containerRange || hostRange.length !== containerRange.length) {
-        return null;
-    }
-    if (hostRange.ephemeral && containerRange.length !== 1) {
-        return null;
-    }
-    const portMappings = [];
-    for (let offset = 0; offset < hostRange.length; offset += 1) {
-        portMappings.push({
-            hostPort: hostRange.start + offset,
-            containerPort: containerRange.start + offset
-        });
-    }
-    return {
-        hostPortSpec: hostRange.ephemeral ? '' : formatPortRange(hostRange),
-        containerPortSpec: formatPortRange(containerRange),
-        protocol,
-        protocolSuffix: protocol === 'tcp' ? '' : `/${protocol}`,
-        portMappings
-    };
-}
-
-function splitPortProtocol(portSpec) {
-    const raw = String(portSpec || '').trim();
-    const match = raw.match(/^(.+?)(?:\/([a-zA-Z]+))?$/);
-    return {
-        portSpec: String(match?.[1] || '').trim(),
-        protocol: String(match?.[2] || '').trim().toLowerCase()
-    };
-}
-
-function parsePortRange(portSpec, options = {}) {
-    const raw = String(portSpec || '').trim();
-    if (options.allowEphemeral && raw === '') {
-        return { start: 0, end: 0, length: 1, ephemeral: true };
-    }
-    const match = raw.match(/^(\d+)(?:-(\d+))?$/);
-    if (!match) return null;
-    const start = parseInt(match[1], 10);
-    const end = match[2] ? parseInt(match[2], 10) : start;
-    if (options.allowEphemeral && start === 0 && end === 0 && !match[2]) {
-        return { start: 0, end: 0, length: 1, ephemeral: true };
-    }
-    if (!Number.isInteger(start) || !Number.isInteger(end) || start <= 0 || end <= 0 || end < start) {
-        return null;
-    }
-    return { start, end, length: end - start + 1 };
+function managedContainerLabelArgs() {
+    return ['--label', PLOINKY_MANAGED_LABEL];
 }
 
 function formatPortRange(range) {
@@ -545,13 +601,16 @@ function runtimeFamilyName(runtime) {
 export {
     CONTAINER_CONFIG_DIR,
     CONTAINER_CONFIG_PATH,
+    PLOINKY_MANAGED_LABEL,
     PLOINKY_DIR,
     REPOS_DIR,
     containerRuntime,
     containerExists,
+    buildLocalImage,
     ensureImagePresent,
     imageExists,
     pullImage,
+    resolveLocalImageBuildSource,
     computeEnvHash,
     getAgentContainerName,
     getAgentMcpConfigPath,
@@ -562,6 +621,7 @@ export {
     getHostSandboxDisableHint,
     getHostSandboxInstallHint,
     isContainerRunning,
+    isPloinkyBoxRuntime,
     isSandboxRuntime,
     probeContainerRuntime,
     runtimeFamilyName,
@@ -575,7 +635,8 @@ export {
     sleepMs,
     createHostSandboxError,
     createHostSandboxStartupError,
-    getRuntimeForAgent
+    getRuntimeForAgent,
+    managedContainerLabelArgs,
 };
 
 function getRuntime() {
@@ -632,6 +693,9 @@ function createLegacyRuntimeStringError(runtimeValue) {
 }
 
 function getRuntimeForAgent(manifest) {
+    if (isPloinkyBoxRuntime()) {
+        return requireContainerRuntime();
+    }
     if (typeof manifest?.runtime === 'string') {
         throw createLegacyRuntimeStringError(manifest.runtime);
     }

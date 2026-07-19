@@ -10,14 +10,20 @@ check_preinstall_run() {
   local i
   for (( i=0; i<attempts; i++ )); do
     # Primary check: look for lifecycle hook log entries in the start log.
-    if [[ -f "$log_path" ]] && grep -Eq "\[(preinstall|install)\] explorer:" "$log_path"; then
+    if [[ -f "$log_path" ]] && grep -Eq "(\[(preinstall|install)\] explorer:|Running preinstall hook for explorer)" "$log_path"; then
+      return 0
+    fi
+
+    local explorer_root="${TEST_RUN_DIR}/.ploinky/repos/fileExplorer/explorer"
+    if [[ -f "${explorer_root}/shared/vendor/axi-face/src/axi-face.mjs" \
+       && -f "${explorer_root}/shared/vendor/axi-face/packs/index.json" ]]; then
       return 0
     fi
 
     # Also check the testAgent start log — the watchdog launched during the
     # first start may have created the explorer container there.
     local agent_log="${TEST_AGENT_START_LOG:-}"
-    if [[ -n "$agent_log" && -f "$agent_log" ]] && grep -Eq "\[(preinstall|install)\] explorer:" "$agent_log"; then
+    if [[ -n "$agent_log" && -f "$agent_log" ]] && grep -Eq "(\[(preinstall|install)\] explorer:|Running preinstall hook for explorer)" "$agent_log"; then
       return 0
     fi
 
@@ -45,7 +51,7 @@ check_preinstall_run() {
   done
 
   echo "No preinstall/install evidence for explorer found after ${attempts}s." >&2
-  echo "Checked: start-demo.log, testAgent_start_log, and container logs." >&2
+  echo "Checked: start-demo.log, AxiFace vendored assets, testAgent_start_log, and container logs." >&2
   if [[ -f "$log_path" ]]; then
     echo "--- start log tail ---" >&2
     tail -n 40 "$log_path" >&2

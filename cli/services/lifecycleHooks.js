@@ -8,6 +8,8 @@ import { validateSecrets, getSecrets, createEnvWithSecrets, formatMissingSecrets
 import { buildEnvMap } from './secretVars.js';
 import { buildAgentIdentityEnv, stripReservedAgentEnv } from './agentIdentityEnv.js';
 import { deriveAgentPrincipalId } from './agentIdentity.js';
+import { edgeRuntimeEnvironment } from './edgeGeneration.js';
+import { resolveMasterKeySeed } from './masterKey.js';
 import {
     initWorkspaceStructure,
     createAgentSymlinks,
@@ -48,7 +50,10 @@ function readManifest(agentPath) {
     }
 }
 
-function buildLifecycleHookEnv({ agentName, repoName, profileName, profileConfig, agentPath, containerInfo = {} }) {
+export function buildLifecycleHookEnv(
+    { agentName, repoName, profileName, profileConfig, agentPath, containerInfo = {} },
+    { buildIdentityEnv = buildAgentIdentityEnv } = {},
+) {
     const envVars = getProfileEnvVars(agentName, repoName, profileName || getActiveProfile(), containerInfo);
     const manifest = readManifest(agentPath);
     const manifestEnv = buildEnvMap(manifest, profileConfig, { agentName, repoName });
@@ -60,8 +65,14 @@ function buildLifecycleHookEnv({ agentName, repoName, profileName, profileConfig
     // shared key, and never an override from profile/manifest/secret config.
     stripReservedAgentEnv(merged);
     try {
-        Object.assign(merged, buildAgentIdentityEnv(deriveAgentPrincipalId(repoName, agentName)));
+        Object.assign(merged, buildIdentityEnv(deriveAgentPrincipalId(repoName, agentName)));
     } catch (_) { }
+    // The topology locator and both Router URLs are box-owned runtime values.
+    // Assert them after every manifest/profile/secret and identity layer so a
+    // host hook always observes the exact loopback listeners for this box.
+    Object.assign(merged, edgeRuntimeEnvironment('host', {
+        workspaceRoot: PLOINKY_WORKSPACE_ROOT,
+    }));
     return merged;
 }
 
@@ -142,6 +153,12 @@ export function executeHostHook(scriptPath, env = {}, options = {}) {
     // operator-exported process env) always wins.
     if (!hookEnv.PLOINKY_WORKSPACE_ROOT) {
         hookEnv.PLOINKY_WORKSPACE_ROOT = cwd;
+    }
+    if (!String(hookEnv.PLOINKY_MASTER_KEY || '').trim()) {
+        hookEnv.PLOINKY_MASTER_KEY = resolveMasterKeySeed({
+            purpose: 'host lifecycle hooks',
+            startDir: hookEnv.PLOINKY_WORKSPACE_ROOT || cwd,
+        });
     }
 
     // Check if this is an inline command

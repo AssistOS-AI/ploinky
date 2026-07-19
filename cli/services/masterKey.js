@@ -3,6 +3,10 @@ import fs from 'fs';
 import path from 'path';
 
 const MASTER_KEY_VAR = 'PLOINKY_MASTER_KEY';
+const GENERATED_MASTER_KEY_FILE = 'master-key';
+const BUILT_IN_FALLBACK_MASTER_KEY_SEED = 'ploinky-default-master-key-v1';
+
+let generatedFallbackWarningEmitted = false;
 
 function parseKeyValueText(raw = '') {
     const result = {};
@@ -68,19 +72,124 @@ function loadEnvFile(startDir = process.cwd()) {
     return envPath ? parseKeyValueFile(envPath) : {};
 }
 
-function resolveMasterKey({ purpose = 'Ploinky encrypted storage' } = {}) {
+function resolveGeneratedMasterKeyRoot(startDir = process.cwd()) {
+    const explicitRoot = String(process.env.PLOINKY_WORKSPACE_ROOT || '').trim();
+    if (explicitRoot) {
+        const normalizedExplicit = path.resolve(explicitRoot);
+        try {
+            if (fs.statSync(normalizedExplicit).isDirectory()) {
+                return normalizedExplicit;
+            }
+        } catch (_) { }
+    }
+
+    let current = path.resolve(startDir);
+    while (true) {
+        try {
+            if (fs.statSync(path.join(current, '.ploinky')).isDirectory()) {
+                return current;
+            }
+        } catch (_) { }
+
+        const parent = path.dirname(current);
+        if (parent === current) {
+            return path.resolve(startDir);
+        }
+        current = parent;
+    }
+}
+
+function resolveGeneratedMasterKeyPath(startDir = process.cwd()) {
+    return path.join(resolveGeneratedMasterKeyRoot(startDir), '.ploinky', GENERATED_MASTER_KEY_FILE);
+}
+
+function readGeneratedMasterKeySeed(filePath) {
+    try {
+        const raw = String(fs.readFileSync(filePath, 'utf8') || '').trim();
+        return raw || '';
+    } catch (_) {
+        return '';
+    }
+}
+
+function writeGeneratedMasterKeySeed(filePath) {
+    const generated = crypto.randomBytes(32).toString('hex');
+    fs.mkdirSync(path.dirname(filePath), { recursive: true });
+    try {
+        fs.writeFileSync(filePath, `${generated}\n`, { encoding: 'utf8', mode: 0o600, flag: 'wx' });
+        try { fs.chmodSync(filePath, 0o600); } catch (_) { }
+        return generated;
+    } catch (error) {
+        if (error?.code === 'EEXIST') {
+            for (let attempt = 0; attempt < 50; attempt += 1) {
+                const existing = readGeneratedMasterKeySeed(filePath);
+                if (existing) {
+                    return existing;
+                }
+                const waitBuffer = new SharedArrayBuffer(4);
+                Atomics.wait(new Int32Array(waitBuffer), 0, 0, 10);
+            }
+            throw new Error(`Generated master key file exists but is empty: ${filePath}`);
+        }
+        throw error;
+    }
+}
+
+function resolveGeneratedMasterKeySeed(startDir = process.cwd()) {
+    const filePath = resolveGeneratedMasterKeyPath(startDir);
+    const existing = readGeneratedMasterKeySeed(filePath);
+    if (existing) {
+        return { seed: existing, filePath, source: 'existing generated fallback' };
+    }
+    try {
+        return {
+            seed: writeGeneratedMasterKeySeed(filePath),
+            filePath,
+            source: 'generated fallback',
+        };
+    } catch (error) {
+        return {
+            seed: BUILT_IN_FALLBACK_MASTER_KEY_SEED,
+            filePath,
+            source: 'built-in fallback',
+            error,
+        };
+    }
+}
+
+function warnGeneratedFallback({ purpose, source, filePath, error }) {
+    if (generatedFallbackWarningEmitted) {
+        return;
+    }
+    generatedFallbackWarningEmitted = true;
+    const using = source === 'built-in fallback'
+        ? `using insecure built-in fallback seed because generated fallback could not be persisted at ${filePath}.`
+        : `using ${source} at ${filePath}.`;
+    const detail = error ? ` Could not persist ${filePath}: ${error?.message || String(error)}.` : '';
+    console.error(
+        `[ploinky] ${MASTER_KEY_VAR} is not set for ${purpose}; ${using}`
+        + `${detail} Set ${MASTER_KEY_VAR} in the process environment or a walked-up .env for an operator-managed key.`
+    );
+}
+
+function resolveMasterKeySeed({ purpose = 'Ploinky encrypted storage', startDir = process.cwd() } = {}) {
     let raw = String(process.env[MASTER_KEY_VAR] || '').trim();
     if (!raw) {
         // Walk up from cwd looking for a .env that defines the master key.
         // Operators frequently keep a single .env in a parent directory that
         // shadows multiple workspaces, so this matches that workflow.
-        raw = String(loadEnvFile()[MASTER_KEY_VAR] || '').trim();
+        raw = String(loadEnvFile(startDir)[MASTER_KEY_VAR] || '').trim();
     }
     if (!raw) {
-        const message = `${MASTER_KEY_VAR} is required for ${purpose}. Set it in the process environment or define it in a .env walked upward from the current directory.`;
-        console.error(`[ploinky] ${message}`);
-        throw new Error(message);
+        const fallback = resolveGeneratedMasterKeySeed(startDir);
+        raw = fallback.seed;
+        warnGeneratedFallback({ purpose, ...fallback });
     }
+    return raw;
+}
+
+function resolveMasterKey({ purpose = 'Ploinky encrypted storage', startDir = process.cwd() } = {}) {
+    const raw = resolveMasterKeySeed({ purpose, startDir });
     return crypto.createHash('sha256').update(raw, 'utf8').digest();
 }
 
@@ -89,7 +198,7 @@ function resolveMasterKey({ purpose = 'Ploinky encrypted storage' } = {}) {
 // directly. Domain separation is carried in the `info` parameter so that
 // rotating one purpose (by bumping its version segment) cannot collide with
 // another. Empty salt is fine because the master key is already a
-// SHA-256 digest of the operator-supplied seed.
+// SHA-256 digest of the resolved workspace seed.
 function deriveSubkey(purpose, length = 32) {
     const trimmedPurpose = String(purpose || '').trim();
     if (!trimmedPurpose) {
@@ -134,6 +243,20 @@ function deriveAgentRequestSecret(agentId, { encoding = 'hex' } = {}) {
     if (encoding === 'base64url') {
         return raw.toString('base64url');
     }
+    return raw.toString('hex');
+}
+
+function derivePrivateAgentRequestSecret(agentId, instanceId, enableGeneration, { encoding = 'hex' } = {}) {
+    const id = String(agentId || '').trim();
+    const instance = String(instanceId || '').trim();
+    const generation = String(enableGeneration || '').trim();
+    if (!id || !instance || !generation) {
+        throw new Error('derivePrivateAgentRequestSecret: agentId, instanceId, and enableGeneration are required');
+    }
+    const raw = deriveSubkey(`private-agent-secret/${id}/${instance}/${generation}`, 32);
+    if (encoding === 'buffer') return raw;
+    if (encoding === 'base64') return raw.toString('base64');
+    if (encoding === 'base64url') return raw.toString('base64url');
     return raw.toString('hex');
 }
 
@@ -201,6 +324,7 @@ function deriveWorkspaceSecret({
 
 export {
     deriveAgentRequestSecret,
+    derivePrivateAgentRequestSecret,
     deriveAgentSecret,
     deriveSubkey,
     deriveDerivedMasterKey,
@@ -211,4 +335,5 @@ export {
     parseKeyValueFile,
     parseKeyValueText,
     resolveMasterKey,
+    resolveMasterKeySeed,
 };

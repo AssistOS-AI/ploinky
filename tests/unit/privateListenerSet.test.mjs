@@ -1,0 +1,132 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import http from 'node:http';
+import net from 'node:net';
+import os from 'node:os';
+
+import { createPrivateListenerSet } from '../../cli/server/privateListenerSet.js';
+
+function freePort() {
+    return new Promise((resolve, reject) => {
+        const probe = net.createServer();
+        probe.once('error', reject);
+        probe.listen({ host: '0.0.0.0', port: 0 }, () => {
+            const { port } = probe.address();
+            probe.close((error) => error ? reject(error) : resolve(port));
+        });
+    });
+}
+
+function exactNonLoopbackAddress() {
+    for (const records of Object.values(os.networkInterfaces())) {
+        for (const record of records || []) {
+            if (record.family === 'IPv4' && !record.internal && net.isIP(record.address) === 4) {
+                return record.address;
+            }
+        }
+    }
+    throw new Error('private-listener tests require one configured non-loopback IPv4 interface');
+}
+
+function request(address, port) {
+    return new Promise((resolve, reject) => {
+        const req = http.get({
+            host: address,
+            port,
+            path: '/',
+            agent: false,
+            headers: { Host: 'host.containers.internal:8081' },
+        }, (res) => {
+            let body = '';
+            res.setEncoding('utf8');
+            res.on('data', (chunk) => { body += chunk; });
+            res.on('end', () => resolve({ status: res.statusCode, body }));
+        });
+        req.once('error', reject);
+    });
+}
+
+function fakeClassifier(initialGateways = []) {
+    let gateways = new Set(initialGateways);
+    let lastError = '';
+    return {
+        refresh() {},
+        classify(address) {
+            if (address === '127.0.0.1') return 'loopback';
+            return gateways.has(address) && !lastError ? 'managed' : 'unmanaged';
+        },
+        snapshot() {
+            return { gateways: lastError ? [] : [...gateways], lastError, refreshedAt: Date.now() };
+        },
+        replace(next) {
+            gateways = new Set(next);
+            lastError = '';
+        },
+        fail(message) {
+            gateways = new Set();
+            lastError = message;
+        },
+    };
+}
+
+test('private listener set binds loopback and exact current gateways without a wildcard', async (t) => {
+    const port = await freePort();
+    const gateway = exactNonLoopbackAddress();
+    const classifier = fakeClassifier([gateway]);
+    const observed = [];
+    const httpServer = http.createServer((req, res) => {
+        observed.push(req.socket.localAddress);
+        res.writeHead(200, { 'Content-Type': 'text/plain' });
+        res.end(req.socket.localAddress);
+    });
+    const listenerSet = createPrivateListenerSet({
+        httpServer,
+        interfaceClassifier: classifier,
+        port,
+        refreshIntervalMs: 60_000,
+    });
+    t.after(() => listenerSet.close());
+
+    assert.deepEqual((await listenerSet.start()).addresses, ['127.0.0.1', gateway].sort());
+    assert.deepEqual((await request('127.0.0.1', port)), { status: 200, body: '127.0.0.1' });
+    assert.deepEqual((await request(gateway, port)), { status: 200, body: gateway });
+
+    classifier.replace([]);
+    assert.deepEqual((await listenerSet.sync()).addresses, ['127.0.0.1']);
+    await assert.rejects(() => request(gateway, port));
+    classifier.replace([gateway]);
+    assert.deepEqual((await listenerSet.sync()).addresses, ['127.0.0.1', gateway].sort());
+    assert.deepEqual((await request(gateway, port)), { status: 200, body: gateway });
+
+    classifier.fail('managed network inspection failed');
+    const failedClosed = await listenerSet.sync();
+    assert.deepEqual(failedClosed.addresses, ['127.0.0.1']);
+    assert.equal(failedClosed.lastError, 'managed network inspection failed');
+    await assert.rejects(() => request(gateway, port));
+    assert.deepEqual(observed, ['127.0.0.1', gateway, gateway]);
+});
+
+test('private listener startup rejects and closes partial binds when a managed gateway is occupied', async (t) => {
+    const port = await freePort();
+    const gateway = exactNonLoopbackAddress();
+    const blocker = net.createServer();
+    await new Promise((resolve, reject) => {
+        blocker.once('error', reject);
+        blocker.listen({ host: gateway, port }, resolve);
+    });
+    t.after(() => new Promise((resolve) => blocker.close(resolve)));
+
+    const listenerSet = createPrivateListenerSet({
+        httpServer: http.createServer((_req, res) => res.end('unexpected')),
+        interfaceClassifier: fakeClassifier([gateway]),
+        port,
+        refreshIntervalMs: 60_000,
+    });
+    await assert.rejects(
+        () => listenerSet.start(),
+        (error) => error?.code === 'PRIVATE_LISTENER_SET_INCOMPLETE'
+            && /exact listener set is incomplete/.test(error.message),
+    );
+    assert.deepEqual(listenerSet.snapshot().addresses, []);
+    await assert.rejects(() => request('127.0.0.1', port));
+});

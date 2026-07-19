@@ -36,25 +36,25 @@ test('encrypted .secrets round-trips and enforces the master key', async (t) => 
 
     assert.deepEqual(store.readSecretsFile(), {});
 
-    store.setSecretValue('WEBDASHBOARD_TOKEN', 'token-value');
-    store.setSecretValue('ONLYOFFICE_JWT_SECRET', 'office-secret');
+    store.setSecretValue('TEST_SECRET_TOKEN', 'token-value');
+    store.setSecretValue('TEST_SIGNING_SECRET', 'office-secret');
     assert.deepEqual(store.readSecretsFile(), {
-        WEBDASHBOARD_TOKEN: 'token-value',
-        ONLYOFFICE_JWT_SECRET: 'office-secret',
+        TEST_SECRET_TOKEN: 'token-value',
+        TEST_SIGNING_SECRET: 'office-secret',
     });
 
     let encryptedText = readFileSync(path.join(ploinkyDir, '.secrets'), 'utf8');
     // Packed-base64 envelope: a single line of base64 + trailing newline, no JSON braces.
     assert.match(encryptedText, /^[A-Za-z0-9+/]+={0,2}\n?$/);
-    assert.doesNotMatch(encryptedText, /token-value|office-secret|WEBDASHBOARD_TOKEN|ONLYOFFICE_JWT_SECRET/);
+    assert.doesNotMatch(encryptedText, /token-value|office-secret|TEST_SECRET_TOKEN|TEST_SIGNING_SECRET/);
 
     store.setSecretValue('DPU_MASTER_KEY', 'dpu-secret');
     assert.equal(store.readSecretsFile().DPU_MASTER_KEY, 'dpu-secret');
     encryptedText = readFileSync(path.join(ploinkyDir, '.secrets'), 'utf8');
     assert.doesNotMatch(encryptedText, /dpu-secret|DPU_MASTER_KEY/);
 
-    store.deleteSecretValue('WEBDASHBOARD_TOKEN');
-    assert.equal(store.readSecretsFile().WEBDASHBOARD_TOKEN, undefined);
+    store.deleteSecretValue('TEST_SECRET_TOKEN');
+    assert.equal(store.readSecretsFile().TEST_SECRET_TOKEN, undefined);
 
     // process.env wins over .env: the file was encrypted with ENV_KEY (set in
     // process.env above), so removing process.env should leave only FILE_KEY
@@ -62,7 +62,7 @@ test('encrypted .secrets round-trips and enforces the master key', async (t) => 
     delete process.env.PLOINKY_MASTER_KEY;
     assert.throws(
         () => store.readSecretsFile(),
-        /Unable to decrypt .ploinky\/.secrets/,
+        /Unable to decrypt .ploinky\/.secrets: .*Check PLOINKY_MASTER_KEY.*\.env.*\.ploinky\/master-key/s,
         '.env uses a different key, so process env must have taken precedence while writing',
     );
 
@@ -74,7 +74,7 @@ test('encrypted .secrets round-trips and enforces the master key', async (t) => 
     writeFileSync(path.join(workspace, '.env'), '');
     assert.throws(
         () => store.readSecretsFile(),
-        /PLOINKY_MASTER_KEY is required/,
+        /Unable to decrypt \.ploinky\/\.secrets: .*Check PLOINKY_MASTER_KEY.*\.env.*\.ploinky\/master-key/s,
     );
 
     // Arbitrary strings are now accepted as seeds, so the wrong seed produces
@@ -82,7 +82,6 @@ test('encrypted .secrets round-trips and enforces the master key', async (t) => 
     process.env.PLOINKY_MASTER_KEY = 'abc';
     assert.throws(
         () => store.readSecretsFile(),
-        /Unable to decrypt .ploinky\/.secrets/,
+        /Unable to decrypt .ploinky\/.secrets: .*Check PLOINKY_MASTER_KEY.*\.env.*\.ploinky\/master-key/s,
     );
 });
-

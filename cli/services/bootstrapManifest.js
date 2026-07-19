@@ -62,6 +62,36 @@ export function parseEnableDirective(entry) {
     return { spec, alias, noWait };
 }
 
+function firstEnableSpecToken(spec) {
+    return String(spec || '').trim().split(/\s+/).filter(Boolean)[0] || '';
+}
+
+function isPrefixedAgentToken(token) {
+    return String(token || '').includes('/') || String(token || '').includes(':');
+}
+
+function hasSameRepoBareAgent(repoName, agentName) {
+    const repo = String(repoName || '').trim();
+    const agent = String(agentName || '').trim();
+    if (!repo || !agent) return false;
+    return fs.existsSync(path.join(PLOINKY_DIR, 'repos', repo, agent, 'manifest.json'));
+}
+
+export function qualifyEnableSpecForRepo(spec, repoName) {
+    const raw = String(spec || '').trim();
+    const repo = String(repoName || '').trim();
+    if (!raw || !repo) return raw;
+
+    const tokens = raw.split(/\s+/).filter(Boolean);
+    if (!tokens.length || isPrefixedAgentToken(tokens[0])) {
+        return raw;
+    }
+    if (!hasSameRepoBareAgent(repo, tokens[0])) {
+        return raw;
+    }
+    return [`${repo}/${tokens[0]}`, ...tokens.slice(1)].join(' ');
+}
+
 function parsePloinkyDirectives(rawValue) {
     if (Array.isArray(rawValue)) {
         return rawValue.flatMap((item) => parsePloinkyDirectives(item)).filter(Boolean);
@@ -89,7 +119,7 @@ function resolveManifestAuthMode(manifest) {
 function agentRefFromEnableSpec(spec) {
     const raw = String(spec || '').trim();
     if (!raw) return '';
-    const token = raw.split(/\s+/).filter(Boolean)[0] || '';
+    const token = firstEnableSpecToken(raw);
     const slashIndex = token.indexOf('/');
     const colonIndex = token.indexOf(':');
     if (slashIndex !== -1 && colonIndex > slashIndex) {
@@ -131,14 +161,17 @@ function errorMessage(err) {
     return err && err.message ? err.message : String(err);
 }
 
-function manifestEnableEntries(manifest, profileOverride = '') {
+export function manifestEnableEntries(manifest, profileOverride = '') {
     const entries = [];
     if (Array.isArray(manifest?.enable)) {
         entries.push(...manifest.enable);
     }
     try {
         const activeProfile = profileOverride || getActiveProfile();
-        const profileBlock = manifest?.profiles?.[activeProfile];
+        const profiles = manifest?.profiles || {};
+        // Agents that do not declare the active semantic profile still use their
+        // default profile dependency contract.
+        const profileBlock = profiles[activeProfile] || profiles.default;
         if (profileBlock && Array.isArray(profileBlock.enable)) {
             entries.push(...profileBlock.enable);
         }
@@ -146,7 +179,11 @@ function manifestEnableEntries(manifest, profileOverride = '') {
     return entries;
 }
 
-function ensurePrefixedRepoInstalled(spec, branchPolicy) {
+function ensurePrefixedRepoInstalled(spec, branchPolicy, {
+    stdio = 'inherit',
+    logError = console.error,
+    activate = true,
+} = {}) {
     if (!spec || typeof spec !== 'string') return;
     const slashIdx = spec.indexOf('/');
     const colonIdx = spec.indexOf(':');
@@ -155,9 +192,17 @@ function ensurePrefixedRepoInstalled(spec, branchPolicy) {
 
     const repoName = spec.slice(0, sepIdx);
     const repoPath = path.join(PLOINKY_DIR, 'repos', repoName);
-    if (fs.existsSync(repoPath)) return;
-
     const source = repos.resolveRepoSource(repoName);
+    if (fs.existsSync(repoPath)) {
+        if (activate) {
+            repos.enableRepo(repoName, {
+                branch: source?.branch || null,
+                branchPolicy,
+                stdio,
+            });
+        }
+        return;
+    }
     if (!source?.url) {
         if (isStrictBranchPolicy(branchPolicy)) {
             throw new Error(`No URL configured for repo '${repoName}'.`);
@@ -169,28 +214,48 @@ function ensurePrefixedRepoInstalled(spec, branchPolicy) {
         repos.ensureRepoInstalled(repoName, source.url, {
             branchPolicy,
             branch: source.branch,
-            stdio: 'inherit',
+            stdio,
         });
+        if (activate) {
+            repos.enableRepo(repoName, {
+                branch: source.branch,
+                branchPolicy,
+                stdio,
+            });
+        }
     } catch (err) {
         if (isStrictBranchPolicy(branchPolicy)) {
             throw new Error(`Auto-install repo '${repoName}' failed: ${errorMessage(err)}`);
         }
-        console.error(`[manifest] Auto-install repo '${repoName}' failed: ${errorMessage(err)}`);
+        logError(`[manifest] Auto-install repo '${repoName}' failed: ${errorMessage(err)}`);
     }
+}
+
+function repoNameFromManifestPath(manifestPath) {
+    const reposRoot = path.join(PLOINKY_DIR, 'repos');
+    const repoPath = path.dirname(path.dirname(path.resolve(manifestPath)));
+    const relative = path.relative(reposRoot, repoPath);
+    if (!relative || relative.startsWith('..') || path.isAbsolute(relative)) {
+        return '';
+    }
+    return relative.split(path.sep).filter(Boolean)[0] || '';
 }
 
 function readManifestTarget(agentNameOrPath) {
     let manifest;
     let manifestPath;
+    let repoName = '';
     if (agentNameOrPath.endsWith('.json')) {
         manifestPath = agentNameOrPath;
         manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+        repoName = repoNameFromManifestPath(manifestPath);
     } else {
         const resolved = findAgent(agentRefFromEnableSpec(agentNameOrPath) || agentNameOrPath);
         manifestPath = resolved.manifestPath;
         manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+        repoName = resolved.repo || repoNameFromManifestPath(manifestPath);
     }
-    return { manifest, manifestPath };
+    return { manifest, manifestPath, repoName };
 }
 
 function findEnabledDirectiveRecord(parsedDirective) {
@@ -222,7 +287,7 @@ function findEnabledDirectiveRecord(parsedDirective) {
     return null;
 }
 
-function ensureDirectiveEnabled(parsedDirective) {
+async function ensureDirectiveEnabled(parsedDirective) {
     const existing = findEnabledDirectiveRecord(parsedDirective);
     if (existing) {
         const profile = typeof parsedDirective?.profile === 'string' && parsedDirective.profile.trim()
@@ -235,7 +300,7 @@ function ensureDirectiveEnabled(parsedDirective) {
         }
         return;
     }
-    enableAgent(parsedDirective.spec, undefined, undefined, parsedDirective.alias, undefined, {
+    await enableAgent(parsedDirective.spec, undefined, undefined, parsedDirective.alias, undefined, {
         profile: parsedDirective.profile,
     });
 }
@@ -244,8 +309,11 @@ async function applyManifestDirectivesInternal(agentNameOrPath, {
     branchPolicy,
     profile = '',
     visited,
+    enableAgents = true,
+    stdio = 'inherit',
+    logError = console.error,
 } = {}) {
-    const { manifest, manifestPath } = readManifestTarget(agentNameOrPath);
+    const { manifest, manifestPath, repoName } = readManifestTarget(agentNameOrPath);
     const visitKey = `${path.resolve(manifestPath)}::${profile || ''}`;
     if (visited.has(visitKey)) {
         return;
@@ -266,19 +334,32 @@ async function applyManifestDirectivesInternal(agentNameOrPath, {
                     repos.ensureRepoInstalled(name, value.url, {
                         branchPolicy,
                         branch: resolvedBranch,
-                        stdio: 'inherit',
+                        stdio,
                     });
+                    if (enableAgents) {
+                        repos.enableRepo(name, {
+                            branch: resolvedBranch,
+                            branchPolicy,
+                            stdio,
+                        });
+                    }
                 } else {
                     repos.ensureRepoInstalled(name, value, {
                         branchPolicy,
-                        stdio: 'inherit',
+                        stdio,
                     });
+                    if (enableAgents) {
+                        repos.enableRepo(name, {
+                            branchPolicy,
+                            stdio,
+                        });
+                    }
                 }
             } catch (err) {
                 if (isStrictBranchPolicy(branchPolicy)) {
                     throw new Error(`[manifest repos] Failed to install repo '${name}': ${errorMessage(err)}`);
                 }
-                console.error(`[manifest repos] Failed to install repo '${name}': ${errorMessage(err)}`);
+                logError(`[manifest repos] Failed to install repo '${name}': ${errorMessage(err)}`);
             }
         }
     }
@@ -289,17 +370,30 @@ async function applyManifestDirectivesInternal(agentNameOrPath, {
             try {
                 const parsed = parseEnableDirective(rawEntry);
                 if (!parsed) continue;
-                ensurePrefixedRepoInstalled(parsed.spec, branchPolicy);
-                if (!shouldEnableDirectiveForManifest(parsed, manifest)) {
+                const qualified = {
+                    ...parsed,
+                    spec: qualifyEnableSpecForRepo(parsed.spec, repoName),
+                };
+                ensurePrefixedRepoInstalled(qualified.spec, branchPolicy, {
+                    stdio,
+                    logError,
+                    activate: enableAgents,
+                });
+                if (!shouldEnableDirectiveForManifest(qualified, manifest)) {
                     continue;
                 }
-                ensureDirectiveEnabled(parsed);
-                const childRef = agentRefFromEnableSpec(parsed.spec);
+                if (enableAgents) {
+                    await ensureDirectiveEnabled(qualified);
+                }
+                const childRef = agentRefFromEnableSpec(qualified.spec);
                 if (childRef) {
                     await applyManifestDirectivesInternal(childRef, {
                         branchPolicy,
-                        profile: parsed.profile || '',
+                        profile: qualified.profile || profile || '',
                         visited,
+                        enableAgents,
+                        stdio,
+                        logError,
                     });
                 }
             } catch (err) {
@@ -307,7 +401,7 @@ async function applyManifestDirectivesInternal(agentNameOrPath, {
                 if (isStrictBranchPolicy(branchPolicy)) {
                     throw new Error(`[manifest enable] Failed to enable agent '${rawEntry}': ${message}`);
                 }
-                console.error(`[manifest enable] Failed to enable agent '${rawEntry}': ${message}`);
+                logError(`[manifest enable] Failed to ${enableAgents ? 'enable' : 'prepare'} agent '${rawEntry}': ${message}`);
             }
         }
     }
@@ -317,5 +411,21 @@ export async function applyManifestDirectives(agentNameOrPath, { branchPolicy } 
     return applyManifestDirectivesInternal(agentNameOrPath, {
         branchPolicy,
         visited: new Set(),
+    });
+}
+
+export async function prepareManifestRepositories(agentNameOrPath, {
+    branchPolicy,
+    profile = '',
+    stdio = 'ignore',
+    logError = () => {},
+} = {}) {
+    return applyManifestDirectivesInternal(agentNameOrPath, {
+        branchPolicy,
+        profile,
+        visited: new Set(),
+        enableAgents: false,
+        stdio,
+        logError,
     });
 }

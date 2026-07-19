@@ -13,6 +13,8 @@ const cliCommandsUrl = pathToFileURL(path.join(repoRoot, 'cli/commands/cli.js'))
 const dockerCommonUrl = pathToFileURL(path.join(repoRoot, 'cli/services/docker/common.js')).href;
 const sandboxRuntimeUrl = pathToFileURL(path.join(repoRoot, 'cli/services/sandboxRuntime.js')).href;
 const workspaceUrl = pathToFileURL(path.join(repoRoot, 'cli/services/workspace.js')).href;
+const bwrapServiceManagerUrl = pathToFileURL(path.join(repoRoot, 'cli/services/bwrap/bwrapServiceManager.js')).href;
+const seatbeltServiceManagerUrl = pathToFileURL(path.join(repoRoot, 'cli/services/seatbelt/seatbeltServiceManager.js')).href;
 
 function makeFakeRuntimeBin(root, name = 'podman') {
     const binDir = path.join(root, 'bin');
@@ -38,6 +40,308 @@ function parseLastJsonLine(stdout) {
     const line = stdout.trim().split('\n').at(-1);
     return JSON.parse(line);
 }
+
+test('sandbox profile resolution honors explicit profiles and requires host networking', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-sandbox-profile-'));
+
+    try {
+        const script = `
+            const { resolveBwrapRuntimeProfile } = await import(${JSON.stringify(bwrapServiceManagerUrl)});
+            const { resolveSeatbeltRuntimeProfile } = await import(${JSON.stringify(seatbeltServiceManagerUrl)});
+            const manifest = {
+                network: { mode: 'host' },
+                profiles: {
+                    default: { env: { TARGET: 'default' } },
+                    prod: { env: { TARGET: 'prod' } },
+                },
+            };
+            const bwrap = resolveBwrapRuntimeProfile('agent', manifest, '/tmp/repo/agent', {
+                profileName: 'prod',
+            }, { profile: 'default' });
+            const seatbelt = resolveSeatbeltRuntimeProfile('agent', manifest, '/tmp/repo/agent', {
+                profileName: 'prod',
+            }, {
+                profile: 'default',
+            });
+            let missingProfileCode = '';
+            try {
+                resolveBwrapRuntimeProfile('agent', manifest, '/tmp/repo/agent', {
+                    profileName: 'missing',
+                });
+            } catch (error) {
+                missingProfileCode = error.code;
+            }
+            const unsupportedNetworks = [
+                { mode: 'none' },
+                { mode: 'default' },
+                { mode: 'bridge', attachments: [{ name: 'private', primary: true }] },
+                { mode: 'default', name: 'legacy' },
+            ];
+            const rejectedNetworks = {};
+            for (const [runtime, resolver] of [
+                ['bwrap', resolveBwrapRuntimeProfile],
+                ['seatbelt', resolveSeatbeltRuntimeProfile],
+            ]) {
+                rejectedNetworks[runtime] = unsupportedNetworks.map((network) => {
+                    try {
+                        resolver('agent', {
+                            start: 'sleep infinity',
+                            network,
+                        }, '/tmp/repo/agent');
+                        return 'accepted';
+                    } catch (error) {
+                        return error.code;
+                    }
+                });
+            }
+            console.log(JSON.stringify({
+                bwrapProfile: bwrap.resolvedProfileName,
+                bwrapTarget: bwrap.profileConfig.env.TARGET,
+                seatbeltProfile: seatbelt.resolvedProfileName,
+                seatbeltTarget: seatbelt.profileConfig.env.TARGET,
+                missingProfileCode,
+                rejectedNetworks,
+            }));
+        `;
+        const result = runModuleScript({ cwd: root, script });
+
+        assert.equal(result.status, 0, result.stderr || result.stdout);
+        assert.deepEqual(parseLastJsonLine(result.stdout), {
+            bwrapProfile: 'prod',
+            bwrapTarget: 'prod',
+            seatbeltProfile: 'prod',
+            seatbeltTarget: 'prod',
+            missingProfileCode: 'PLOINKY_PROFILE_NOT_FOUND',
+            rejectedNetworks: {
+                bwrap: Array(4).fill('PLOINKY_NETWORK_CONTRACT_INVALID'),
+                seatbelt: Array(4).fill('PLOINKY_NETWORK_CONTRACT_INVALID'),
+            },
+        });
+    } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+    }
+});
+
+test('bwrap and seatbelt env builders consume one validated host endpoint without rereading or defaulting', () => {
+    for (const relativePath of [
+        'cli/services/bwrap/bwrapServiceManager.js',
+        'cli/services/seatbelt/seatbeltServiceManager.js',
+    ]) {
+        const source = fs.readFileSync(path.join(repoRoot, relativePath), 'utf8');
+        assert.doesNotMatch(source, /\bresolveRouterEndpoint\s*\(/, `${relativePath} must not reread routing.json`);
+    }
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-sandbox-router-'));
+    try {
+        fs.mkdirSync(path.join(root, '.ploinky'), { recursive: true });
+        fs.writeFileSync(path.join(root, '.ploinky', 'routing.json'), JSON.stringify({ port: 8080 }));
+        const script = `
+            const { buildFullEnvMap } = await import(${JSON.stringify(bwrapServiceManagerUrl)});
+            const { resolveRouterEndpoint } = await import(${JSON.stringify(pathToFileURL(path.join(repoRoot, 'cli/services/routerPort.js')).href)});
+            const endpoint = resolveRouterEndpoint('host');
+            const work = ${JSON.stringify(path.join(root, 'work'))};
+            const bwrap = buildFullEnvMap('agent', {}, {}, work, 'repo', 'default', 'bwrap', null, endpoint);
+            const seatbelt = buildFullEnvMap('agent', {}, {}, work, 'repo', 'default', 'seatbelt', null, endpoint);
+            let missingCode = '';
+            try { buildFullEnvMap('agent', {}, {}, work, 'repo', 'default', 'bwrap'); }
+            catch (error) { missingCode = error.code; }
+            console.log(JSON.stringify({
+                bwrap: {
+                    host: bwrap.PLOINKY_ROUTER_HOST,
+                    port: bwrap.PLOINKY_ROUTER_PORT,
+                    url: bwrap.PLOINKY_ROUTER_URL,
+                },
+                seatbelt: {
+                    host: seatbelt.PLOINKY_ROUTER_HOST,
+                    port: seatbelt.PLOINKY_ROUTER_PORT,
+                    url: seatbelt.PLOINKY_ROUTER_URL,
+                },
+                missingCode,
+            }));
+        `;
+        const result = runModuleScript({
+            cwd: root,
+            env: {
+                PLOINKY_WORKSPACE_ROOT: root,
+                PLOINKY_MASTER_KEY: 'ab'.repeat(32),
+            },
+            script,
+        });
+        assert.equal(result.status, 0, result.stderr || result.stdout);
+        const expected = {
+            host: '127.0.0.1',
+            port: '8080',
+            url: 'http://127.0.0.1:8080',
+        };
+        assert.deepEqual(parseLastJsonLine(result.stdout), {
+            bwrap: expected,
+            seatbelt: expected,
+            missingCode: 'PLOINKY_ROUTER_ENDPOINT_REQUIRED',
+        });
+    } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+    }
+});
+
+test('managed sandbox env identity is bound to one exact instance and enable generation', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-sandbox-identity-'));
+    try {
+        const script = `
+            const { buildFullEnvMap } = await import(${JSON.stringify(bwrapServiceManagerUrl)});
+            const { buildRouterEndpoint } = await import(${JSON.stringify(pathToFileURL(path.join(repoRoot, 'cli/services/routerPort.js')).href)});
+            const { derivePrivateAgentRequestSecret } = await import(${JSON.stringify(pathToFileURL(path.join(repoRoot, 'cli/services/masterKey.js')).href)});
+            const endpoint = buildRouterEndpoint('host', 8080);
+            const runtimeIdentity = {
+                instanceId: 'instance-exact-1',
+                enableGeneration: 'enable-exact-1',
+            };
+            const principal = 'agent:repo/agent';
+            const work = ${JSON.stringify(path.join(root, 'work'))};
+            const result = {};
+            for (const runtime of ['bwrap', 'seatbelt']) {
+                const env = buildFullEnvMap(
+                    'agent', {}, {}, work, 'repo', 'default', runtime, null,
+                    endpoint, runtimeIdentity,
+                );
+                result[runtime] = {
+                    instanceId: env.PLOINKY_AGENT_INSTANCE_ID,
+                    enableGeneration: env.PLOINKY_AGENT_ENABLE_GENERATION,
+                    privateSecretMatches: env.PLOINKY_AGENT_PRIVATE_SECRET
+                        === derivePrivateAgentRequestSecret(
+                            principal,
+                            runtimeIdentity.instanceId,
+                            runtimeIdentity.enableGeneration,
+                        ),
+                };
+            }
+            let incompleteError = '';
+            try {
+                buildFullEnvMap(
+                    'agent', {}, {}, work, 'repo', 'default', 'bwrap', null,
+                    endpoint, { instanceId: runtimeIdentity.instanceId },
+                );
+            } catch (error) {
+                incompleteError = error.message;
+            }
+            console.log(JSON.stringify({ result, incompleteError }));
+        `;
+        const result = runModuleScript({
+            cwd: root,
+            env: {
+                PLOINKY_WORKSPACE_ROOT: root,
+                PLOINKY_MASTER_KEY: 'cd'.repeat(32),
+            },
+            script,
+        });
+        assert.equal(result.status, 0, result.stderr || result.stdout);
+        assert.deepEqual(parseLastJsonLine(result.stdout), {
+            result: {
+                bwrap: {
+                    instanceId: 'instance-exact-1',
+                    enableGeneration: 'enable-exact-1',
+                    privateSecretMatches: true,
+                },
+                seatbelt: {
+                    instanceId: 'instance-exact-1',
+                    enableGeneration: 'enable-exact-1',
+                    privateSecretMatches: true,
+                },
+            },
+            incompleteError: 'sandbox runtime identity requires exact instanceId and enableGeneration',
+        });
+    } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+    }
+});
+
+test('sandbox env construction fails closed when identity key material cannot be loaded', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-sandbox-identity-failure-'));
+    try {
+        fs.writeFileSync(path.join(root, '.ploinky'), 'not-a-directory');
+        const script = `
+            const { buildFullEnvMap } = await import(${JSON.stringify(bwrapServiceManagerUrl)});
+            const { buildRouterEndpoint } = await import(${JSON.stringify(pathToFileURL(path.join(repoRoot, 'cli/services/routerPort.js')).href)});
+            const endpoint = buildRouterEndpoint('host', 8080);
+            let failure = null;
+            try {
+                buildFullEnvMap(
+                    'agent', {}, {}, ${JSON.stringify(path.join(root, 'work'))},
+                    'repo', 'default', 'bwrap', null, endpoint,
+                    { instanceId: 'instance-fail', enableGeneration: 'generation-fail' },
+                );
+            } catch (error) {
+                failure = { code: error.code || '', message: error.message };
+            }
+            console.log(JSON.stringify({ failure }));
+        `;
+        const result = runModuleScript({
+            cwd: root,
+            env: {
+                PLOINKY_WORKSPACE_ROOT: root,
+                PLOINKY_MASTER_KEY: 'ef'.repeat(32),
+            },
+            script,
+        });
+        assert.equal(result.status, 0, result.stderr || result.stdout);
+        const evidence = parseLastJsonLine(result.stdout);
+        assert.ok(evidence.failure, 'identity key-store failure must escape env construction');
+        assert.match(evidence.failure.message, /not a directory|ENOTDIR|EEXIST/i);
+    } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+    }
+});
+
+test('profile environment and secrets cannot override sandbox router discovery', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-sandbox-router-env-'));
+    try {
+        const script = `
+            const { buildFullEnvMap } = await import(${JSON.stringify(bwrapServiceManagerUrl)});
+            const { buildRouterEndpoint } = await import(${JSON.stringify(pathToFileURL(path.join(repoRoot, 'cli/services/routerPort.js')).href)});
+            const endpoint = buildRouterEndpoint('host', 8080);
+            const profile = {
+                env: {
+                    PLOINKY_ROUTER_HOST: 'profile.invalid',
+                    PLOINKY_ROUTER_PORT: '1',
+                    PLOINKY_ROUTER_URL: 'http://profile.invalid:1',
+                },
+                secrets: ['PLOINKY_ROUTER_HOST', 'PLOINKY_ROUTER_PORT', 'PLOINKY_ROUTER_URL'],
+            };
+            const work = ${JSON.stringify(path.join(root, 'work'))};
+            const result = {};
+            for (const runtime of ['bwrap', 'seatbelt']) {
+                const env = buildFullEnvMap('agent', {}, profile, work, 'repo', 'default', runtime, null, endpoint);
+                result[runtime] = {
+                    host: env.PLOINKY_ROUTER_HOST,
+                    port: env.PLOINKY_ROUTER_PORT,
+                    url: env.PLOINKY_ROUTER_URL,
+                };
+            }
+            console.log(JSON.stringify(result));
+        `;
+        const result = runModuleScript({
+            cwd: root,
+            env: {
+                PLOINKY_WORKSPACE_ROOT: root,
+                PLOINKY_MASTER_KEY: 'ab'.repeat(32),
+                PLOINKY_ROUTER_HOST: 'secret.invalid',
+                PLOINKY_ROUTER_PORT: '2',
+                PLOINKY_ROUTER_URL: 'http://secret.invalid:2',
+            },
+            script,
+        });
+        assert.equal(result.status, 0, result.stderr || result.stdout);
+        const expected = {
+            host: '127.0.0.1',
+            port: '8080',
+            url: 'http://127.0.0.1:8080',
+        };
+        assert.deepEqual(parseLastJsonLine(result.stdout), {
+            bwrap: expected,
+            seatbelt: expected,
+        });
+    } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+    }
+});
 
 test('sandbox disable and enable persist workspace host sandbox setting', () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-sandbox-command-'));
@@ -255,6 +559,67 @@ test('sandbox startup failure guidance does not promise implicit container fallb
         assert.match(output.message, /profile denied/);
         assert.match(output.message, /ploinky sandbox disable/);
         assert.doesNotMatch(output.message, /falling back/i);
+    } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+    }
+});
+
+test('Ploinky box marker forces every manifest through nested Podman', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-sandbox-box-'));
+    try {
+        const binDir = makeFakeRuntimeBin(root, 'podman');
+        const marker = path.join(root, 'ploinky-box');
+        fs.writeFileSync(marker, '1\n');
+        const script = `
+            const { getSandboxStatus } = await import(${JSON.stringify(sandboxRuntimeUrl)});
+            const { getRuntimeForAgent } = await import(${JSON.stringify(dockerCommonUrl)});
+            console.log(JSON.stringify({
+                status: getSandboxStatus(),
+                lite: getRuntimeForAgent({ 'lite-sandbox': true }),
+                legacy: getRuntimeForAgent({ runtime: 'bwrap' }),
+            }));
+        `;
+        const result = runModuleScript({
+            cwd: root,
+            env: {
+                PATH: `${binDir}${path.delimiter}${process.env.PATH || ''}`,
+                PLOINKY_BOX_MARKER_PATH: marker,
+            },
+            script,
+        });
+        assert.equal(result.status, 0, result.stderr || result.stdout);
+        const output = parseLastJsonLine(result.stdout);
+        assert.equal(output.status.forced, true);
+        assert.equal(output.status.source, 'ploinky-box');
+        assert.equal(output.status.effectiveRuntime, 'podman');
+        assert.equal(output.lite, 'podman');
+        assert.equal(output.legacy, 'podman');
+    } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+    }
+});
+
+test('Ploinky box never falls back to Docker when nested Podman is missing', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-sandbox-box-docker-'));
+    try {
+        const binDir = makeFakeRuntimeBin(root, 'docker');
+        const marker = path.join(root, 'ploinky-box');
+        fs.writeFileSync(marker, '1\n');
+        const script = `
+            const { getRuntime } = await import(${JSON.stringify(dockerCommonUrl)});
+            try { getRuntime(); console.log(JSON.stringify({ ok: true })); }
+            catch (error) { console.log(JSON.stringify({ ok: false, code: error.code, message: error.message })); }
+        `;
+        const result = runModuleScript({
+            cwd: root,
+            env: { PATH: binDir, PLOINKY_BOX_MARKER_PATH: marker },
+            script,
+        });
+        assert.equal(result.status, 0, result.stderr || result.stdout);
+        const output = parseLastJsonLine(result.stdout);
+        assert.equal(output.ok, false);
+        assert.equal(output.code, 'PLOINKY_BOX_PODMAN_REQUIRED');
+        assert.match(output.message, /Docker fallback is not permitted/);
     } finally {
         fs.rmSync(root, { recursive: true, force: true });
     }

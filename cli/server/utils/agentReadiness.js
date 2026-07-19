@@ -202,7 +202,8 @@ export async function waitForAgentReady(agentOrRoute, {
     intervalMs = 125,
     probeTimeoutMs = 250,
     protocol = 'mcp',
-    onProgress = null
+    onProgress = null,
+    beforeProbe = null,
 } = {}) {
     const port = resolveAgentPort(agentOrRoute);
     if (!port) {
@@ -214,6 +215,7 @@ export async function waitForAgentReady(agentOrRoute, {
     let attempt = 0;
     while (true) {
         attempt += 1;
+        if (beforeProbe && beforeProbe() !== true) return false;
         const portProbe = await probeLocalPortDetailed(port, probeTimeoutMs);
         if (portProbe.ok) {
             if (normalizedProtocol === 'tcp') {
@@ -231,6 +233,7 @@ export async function waitForAgentReady(agentOrRoute, {
                 }
                 return true;
             }
+            if (beforeProbe && beforeProbe() !== true) return false;
             const mcpReady = await probeAgentMcp(port, Math.max(500, probeTimeoutMs * 2));
             if (mcpReady) {
                 if (typeof onProgress === 'function') {
