@@ -6,9 +6,9 @@ import {
     readTaskLog,
 } from '../../webchat/taskStore.js';
 import {
-    loadRoutingConfig,
     readEnabledAgentManifest,
 } from '../../httpServiceRoutes.js';
+import { getActiveGenerationRoutes } from '../../generation/runtimeContext.js';
 import {
     invokeAuthenticatedAgentTool,
     readAuthenticatedAgentTask,
@@ -41,7 +41,7 @@ function sendHtml(res, status, html) {
 }
 
 function resolveAgentRoute(targetAgent) {
-    const routes = loadRoutingConfig().routes || {};
+    const routes = getActiveGenerationRoutes();
     if (routes[targetAgent]) return { agentName: targetAgent, route: routes[targetAgent] };
     for (const [agentName, route] of Object.entries(routes)) {
         const routeRef = route?.repo && route?.agent ? `${route.repo}/${route.agent}` : '';
@@ -57,7 +57,7 @@ async function routeIsReady(resolved, {
     waitUntilReady,
     readManifest,
 }) {
-    if (!resolved?.route?.hostPort) return false;
+    if (!resolved?.route?.relay || !resolved?.route?.primaryService) return false;
     const manifest = readManifest(resolved.agentName);
     const protocol = resolveAgentReadinessProtocol(manifest || {});
     if (protocol === 'none') return true;
@@ -75,7 +75,7 @@ async function ensureContinuationAgentRoute(targetAgent, {
     waitUntilReady = waitForAgentReady,
     readManifest = (agentName) => readEnabledAgentManifest(
         agentName,
-        loadRoutingConfig().routes || {},
+        getActiveGenerationRoutes(),
     ),
 } = {}) {
     const normalizedTarget = String(targetAgent || '').trim();

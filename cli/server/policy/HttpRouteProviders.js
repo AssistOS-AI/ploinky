@@ -1,44 +1,9 @@
-import fs from 'node:fs';
-import path from 'node:path';
-
-import { resolveEnabledAgentRecord } from '../../utils/agents.js';
-import { findAgent } from '../../utils/utils.js';
 import { hasInternalAgentSegment } from '../internalAgentPath.js';
 import { normalizeHttpRouteAccess } from './HttpRouteAccessDecision.js';
 import { HttpRouteAccessPath } from './HttpRouteAccessPath.js';
 
-function readJsonFileIfExists(filePath) {
-    try {
-        if (!filePath || !fs.existsSync(filePath)) return null;
-        return JSON.parse(fs.readFileSync(filePath, 'utf8'));
-    } catch {
-        return null;
-    }
-}
-
-export function getManifestHttpRouteManifestPath(routeKey, route = {}) {
-    const hostPath = String(route?.hostPath || '').trim();
-    if (hostPath) return path.join(hostPath, 'manifest.json');
-
-    let resolved = null;
-    try {
-        resolved = resolveEnabledAgentRecord(String(routeKey || '').trim());
-    } catch (_) {
-        resolved = null;
-    }
-    const record = resolved?.record || null;
-    if (!record?.repoName || !record?.agentName) return '';
-
-    try {
-        const found = findAgent(`${record.repoName}/${record.agentName}`);
-        return String(found?.manifestPath || '');
-    } catch (_) {
-        return '';
-    }
-}
-
-function asRouteSpecs(manifest) {
-    const routes = manifest?.routerAccess?.httpRoutes;
+function asRouteSpecs(route) {
+    const routes = route?.routerAccess?.httpRoutes || route?.manifest?.routerAccess?.httpRoutes;
     if (!routes) return [];
     if (Array.isArray(routes)) return routes;
     if (typeof routes === 'object') {
@@ -79,9 +44,7 @@ export function collectManifestHttpRouteAccess(routes = {}) {
     const entries = [];
     for (const [routeKey, route] of Object.entries(routes || {})) {
         if (!route || route.disabled) continue;
-        const manifest = readJsonFileIfExists(getManifestHttpRouteManifestPath(routeKey, route));
-        if (!manifest) continue;
-        for (const spec of asRouteSpecs(manifest)) {
+        for (const spec of asRouteSpecs(route)) {
             const normalized = normalizeManifestHttpRouteAccess(spec, { routeKey });
             if (!normalized.ok) continue;
             entries.push({
@@ -95,37 +58,13 @@ export function collectManifestHttpRouteAccess(routes = {}) {
     return entries;
 }
 
-const manifestRouteCache = { key: '', entries: [] };
-
-function manifestFileCacheStamp(routeKey, route = {}) {
-    const manifestPath = getManifestHttpRouteManifestPath(routeKey, route);
-    if (!manifestPath) return '';
-    try {
-        const stats = fs.statSync(manifestPath);
-        return `${stats.mtimeMs}:${stats.size}`;
-    } catch (_) {
-        return '';
-    }
-}
-
-function manifestRouteCacheKey(routes = {}) {
-    return JSON.stringify(Object.entries(routes || {})
-        .sort(([left], [right]) => left.localeCompare(right))
-        .map(([routeKey, route]) => [
-            routeKey,
-            route?.disabled === true,
-            String(route?.hostPath || ''),
-            String(route?.hostPort || ''),
-            manifestFileCacheStamp(routeKey, route),
-        ]));
-}
+const manifestRouteCache = { routes: null, entries: [] };
 
 export function createManifestRouteProvider(loadRoutes) {
     return () => {
         const routes = loadRoutes() || {};
-        const key = manifestRouteCacheKey(routes);
-        if (manifestRouteCache.key !== key) {
-            manifestRouteCache.key = key;
+        if (manifestRouteCache.routes !== routes) {
+            manifestRouteCache.routes = routes;
             manifestRouteCache.entries = collectManifestHttpRouteAccess(routes);
         }
         return manifestRouteCache.entries;

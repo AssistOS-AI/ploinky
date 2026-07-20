@@ -1,8 +1,3 @@
-import fs from 'node:fs';
-import path from 'node:path';
-
-import { REPOS_DIR } from '../../utils/config.js';
-
 /**
  * McpToolPolicy — MCP tool access decisions (DS014). Maps mcp-config `tags` to
  * default access classes, bootstraps persisted policy at boot (persisted wins),
@@ -41,25 +36,6 @@ export class McpToolPolicy {
         return { access: 'authenticated' };
     }
 
-    _readMcpConfigTools(agentDir) {
-        if (!agentDir) return [];
-        try {
-            const parsed = JSON.parse(fs.readFileSync(path.join(agentDir, 'mcp-config.json'), 'utf8'));
-            return Array.isArray(parsed?.tools) ? parsed.tools : [];
-        } catch {
-            return [];
-        }
-    }
-
-    _resolveAgentDir(route) {
-        if (route && typeof route.hostPath === 'string' && route.hostPath) {
-            return route.hostPath;
-        }
-        const repo = String(route?.repo || '').trim();
-        const agent = String(route?.agent || '').trim();
-        return repo && agent ? path.join(REPOS_DIR, repo, agent) : '';
-    }
-
     // Build `[{ agent, tool, access }]` defaults from each route's mcp-config
     // tags. Tools with invalid tags are skipped (logged) → deny by default.
     // The policy key is the ROUTE KEY (the URL/alias segment), because that is
@@ -71,7 +47,8 @@ export class McpToolPolicy {
         for (const [routeKey, route] of Object.entries(routes || {})) {
             const agentName = String(routeKey || route?.agent || '').trim();
             if (!agentName) continue;
-            for (const tool of this._readMcpConfigTools(this._resolveAgentDir(route))) {
+            const tools = Array.isArray(route.mcpConfig?.tools) ? route.mcpConfig.tools : [];
+            for (const tool of tools) {
                 const toolName = typeof tool?.name === 'string' ? tool.name : '';
                 if (!toolName) continue;
                 const classified = this.accessFromTags(tool.tags);

@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
-import http from 'node:http';
 import { sendJson, ensureAuthenticated } from '../authHandlers/index.js';
-import { createAgentClient } from '../AgentClient.js';
+import { createAgentRelayClient } from '../AgentClient.js';
+import { relayHttpCall } from '../proxy/relayHttpCall.js';
 import { waitForAgentReady } from '../utils/agentReadiness.js';
 import {
     buildRouterRequest,
@@ -146,13 +146,12 @@ export async function invokeAuthenticatedAgentTool({
         error.status = decision.status || 403;
         throw error;
     }
-    if (!route?.hostPort) {
+    if (!route?.relay || !route?.primaryService) {
         const error = new Error('continuation_agent_unavailable');
         error.status = 409;
         throw error;
     }
-    const baseUrl = `http://127.0.0.1:${route.hostPort}/mcp`;
-    const agentClient = createAgentClient(baseUrl);
+    const agentClient = createAgentRelayClient(agentName);
     try {
         const args = await canonicalizeToolArguments(agentName, agentClient, toolName, rawArguments);
         const context = buildInvocationContextForProviderCall({
@@ -161,7 +160,7 @@ export async function invokeAuthenticatedAgentTool({
             toolName,
             toolArgs: args,
         });
-        const toolClient = createAgentClient(baseUrl, context?.token
+        const toolClient = createAgentRelayClient(agentName, context?.token
             ? { requestHeaders: { authorization: `Bearer ${context.token}` } }
             : undefined);
         try {
@@ -181,7 +180,7 @@ export async function readAuthenticatedAgentTask({ req, route, agentName, taskId
         error.status = 401;
         throw error;
     }
-    if (!route?.hostPort) {
+    if (!route?.relay || !route?.primaryService) {
         const error = new Error('continuation_agent_unavailable');
         error.status = 409;
         throw error;
@@ -195,34 +194,23 @@ export async function readAuthenticatedAgentTask({ req, route, agentName, taskId
         method: 'GET',
         path: '/task',
     });
-    const url = new URL(`http://127.0.0.1:${route.hostPort}/task`);
-    url.searchParams.set('taskId', normalizedTaskId);
-    return await new Promise((resolve, reject) => {
-        const request = http.request(url, {
-            method: 'GET',
-            headers: {
-                accept: 'application/json',
-                ...(context?.token ? { authorization: `Bearer ${context.token}` } : {}),
-            },
-        }, (response) => {
-            const chunks = [];
-            response.on('data', (chunk) => chunks.push(chunk));
-            response.on('end', () => {
-                const text = Buffer.concat(chunks).toString('utf8');
-                let payload = null;
-                try { payload = JSON.parse(text); } catch (_) { }
-                if ((response.statusCode || 500) >= 400 || !payload?.task) {
-                    const error = new Error(payload?.reason || payload?.error || `task_status_${response.statusCode}`);
-                    error.status = response.statusCode || 502;
-                    reject(error);
-                    return;
-                }
-                resolve(payload.task);
-            });
-        });
-        request.on('error', reject);
-        request.end();
+    const response = await relayHttpCall({
+        routeKey: agentName,
+        method: 'GET',
+        target: `/task?taskId=${encodeURIComponent(normalizedTaskId)}`,
+        headers: {
+            accept: 'application/json',
+            ...(context?.token ? { authorization: `Bearer ${context.token}` } : {}),
+        },
     });
+    let payload = null;
+    try { payload = JSON.parse(response.body.toString('utf8')); } catch (_) { }
+    if (response.statusCode >= 400 || !payload?.task) {
+        const error = new Error(payload?.reason || payload?.error || `task_status_${response.statusCode}`);
+        error.status = response.statusCode || 502;
+        throw error;
+    }
+    return payload.task;
 }
 
 export function buildInvocationContextForProviderCall({ req, agentName, toolName, toolArgs, method = 'POST', path = '/mcp' }) {
@@ -356,8 +344,6 @@ async function handleAgentJsonRpc(req, res, route, agentName, payload) {
     }
 
     const message = messages[0];
-    const baseUrl = `http://127.0.0.1:${route.hostPort}/mcp`;
-
     const sessionIdHeader = readAgentSessionId(req);
     const sessionEntry = sessionIdHeader ? agentSessionStore.get(sessionIdHeader) : null;
 
@@ -374,7 +360,7 @@ async function handleAgentJsonRpc(req, res, route, agentName, payload) {
 
     if (message.method === 'initialize') {
         const newSessionId = randomUUID();
-        agentSessionStore.set(newSessionId, { agentName, baseUrl });
+        agentSessionStore.set(newSessionId, { agentName });
         sendResponse(200, {
             jsonrpc: '2.0',
             id: message.id ?? null,
@@ -420,7 +406,7 @@ async function handleAgentJsonRpc(req, res, route, agentName, payload) {
         return null;
     }
 
-    const agentClient = createAgentClient(baseUrl);
+    const agentClient = createAgentRelayClient(agentName);
     try {
         switch (message.method) {
             case 'tools/list': {
@@ -463,7 +449,7 @@ async function handleAgentJsonRpc(req, res, route, agentName, payload) {
                 // Mint a router-signed invocation token scoped to this tool call
                 // and open a short-lived client with that token in the header.
                 const toolHeaders = buildRequestHeadersForToolCall(name, canonicalArgs);
-                const toolClient = createAgentClient(baseUrl, toolHeaders ? { requestHeaders: toolHeaders } : undefined);
+                const toolClient = createAgentRelayClient(agentName, toolHeaders ? { requestHeaders: toolHeaders } : undefined);
 
                 try {
                     const result = await toolClient.callTool(name, canonicalArgs);
@@ -487,7 +473,7 @@ async function handleAgentJsonRpc(req, res, route, agentName, payload) {
                     break;
                 }
                 const resourceHeaders = buildRequestHeadersForToolCall('resources/read', { uri });
-                const resourceClient = createAgentClient(baseUrl, resourceHeaders ? { requestHeaders: resourceHeaders } : undefined);
+                const resourceClient = createAgentRelayClient(agentName, resourceHeaders ? { requestHeaders: resourceHeaders } : undefined);
                 try {
                     const result = await resourceClient.readResource(uri);
                     sendResponse(200, { jsonrpc: '2.0', id: message.id ?? null, result }, sessionIdHeader);

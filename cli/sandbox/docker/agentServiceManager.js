@@ -1,4 +1,5 @@
-import { execSync, spawnSync } from 'child_process';
+import { execFileSync, execSync, spawnSync } from 'child_process';
+import { randomUUID } from 'node:crypto';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -27,8 +28,6 @@ import {
     isContainerRunning,
     isSandboxRuntime,
     loadAgentsMap,
-    parseHostPort,
-    parseManifestPorts,
     saveAgentsMap,
     syncAgentMcpConfig
 } from './common.js';
@@ -66,11 +65,6 @@ import {
     mergeProfiles
 } from '../../utils/runtime/profileService.js';
 import {
-    createProfileServerPublish,
-    resolvePublishedProfileServer,
-    resolveProfileServer
-} from '../../utils/runtime/profileServer.js';
-import {
     getAgentWorkDir,
     getAgentCodePath,
     getAgentSkillsPath
@@ -106,6 +100,65 @@ function resolveLlmRuntimeSharedPath(agentPath) {
 const AGENT_PRIVATE_KEY_CONTAINER_PATH = '/run/ploinky-agent.key';
 const PODMAN_STAGED_NODE_OPTIONS = ['--preserve-symlinks', '--preserve-symlinks-main'];
 const PODMAN_RUNTIME_ROOT = path.join(PLOINKY_DIR, 'container-runtime');
+
+function inspectRuntimeIdentity(runtime, containerName) {
+    const parsed = JSON.parse(execFileSync(runtime, ['inspect', containerName], {
+        encoding: 'utf8',
+        timeout: 5000,
+        maxBuffer: 4 * 1024 * 1024,
+    }));
+    const record = Array.isArray(parsed) ? parsed[0] : parsed;
+    const containerId = String(record?.Id || record?.ID || '').trim().toLowerCase();
+    const networkMode = String(record?.HostConfig?.NetworkMode || record?.NetworkSettings?.NetworkMode || '').trim().toLowerCase();
+    if (!/^[a-f0-9]{64}$/.test(containerId) || !networkMode) {
+        throw new Error(`[runtime] ${containerName}: incomplete immutable container identity`);
+    }
+    return { containerId, networkMode };
+}
+
+function buildRuntimeServiceDescriptor({ runtime, containerName, agentName, repoName, manifest, existingRecord = {} }) {
+    const { containerId, networkMode } = inspectRuntimeIdentity(runtime, containerName);
+    const targetAgentId = deriveAgentPrincipalId(repoName, agentName);
+    const enableGeneration = String(existingRecord.enableGeneration || randomUUID());
+    const effectiveInstanceId = String(existingRecord.effectiveInstanceId || `${targetAgentId}@${enableGeneration}`);
+    const hasRuntimePrimaryService = !readManifestStartCommand(manifest) && !readManifestAgentCommand(manifest).raw;
+    const confined = networkMode !== 'host' && networkMode !== 'none';
+    return {
+        containerName,
+        runtime,
+        containerId,
+        networkMode,
+        targetAgentId,
+        effectiveInstanceId,
+        enableGeneration,
+        relay: confined ? {
+            kind: 'container-exec-stdio',
+            runtime,
+            containerId,
+            containerName,
+            targetAgentId,
+            effectiveInstanceId,
+            networkMode,
+        } : null,
+        primaryService: hasRuntimePrimaryService ? { port: 7000 } : null,
+    };
+}
+
+function buildUnconfinedServiceDescriptor(runtime, started, agentName, repoName) {
+    const existingRecord = loadAgentsMap()[started.containerName] || {};
+    const targetAgentId = deriveAgentPrincipalId(repoName, agentName);
+    const enableGeneration = String(existingRecord.enableGeneration || randomUUID());
+    return {
+        ...started,
+        runtime,
+        networkMode: 'host',
+        targetAgentId,
+        enableGeneration,
+        effectiveInstanceId: String(existingRecord.effectiveInstanceId || `${targetAgentId}@${enableGeneration}`),
+        relay: null,
+        primaryService: null,
+    };
+}
 
 function pathTypeForSymlink(sourcePath) {
     try {
@@ -748,9 +801,6 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         ? manifestNetwork.aliases.map((entry) => String(entry || '').trim()).filter(Boolean)
         : [];
     const useHostNetwork = manifestNetworkMode === 'host';
-    const additionalServerPort = resolveProfileServer(manifest, profileConfig, {
-        runtimeMode: useHostNetwork ? 'host' : 'container'
-    });
     const containerSecurityArgs = buildContainerSecurityArgs(resolveContainerSecurity(manifest, profileConfig));
     if (containerSecurityArgs.length) {
         args.splice(1, 0, ...containerSecurityArgs);
@@ -793,21 +843,6 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
 
     for (const { resolvedHostPath, containerPath } of manifestVolumeMounts) {
         args.push('-v', `${resolvedHostPath}:${containerPath}${runtime === 'podman' ? ':z' : ''}`);
-    }
-
-    const { publishArgs: manifestPorts, portMappings } = parseManifestPorts(manifest, profileConfig);
-    const runtimePorts = (options && Array.isArray(options.publish)) ? options.publish : [];
-    const runtimePortMappings = (options && Array.isArray(options.publishMappings)) ? options.publishMappings : [];
-    const basePortMappings = [...portMappings, ...runtimePortMappings];
-    const profileServerPublish = useHostNetwork ? null : createProfileServerPublish(additionalServerPort, basePortMappings);
-    const profileServerPublishArgs = profileServerPublish ? [profileServerPublish.publishArg] : [];
-    const effectivePortMappings = profileServerPublish
-        ? [...basePortMappings, profileServerPublish.mapping]
-        : basePortMappings;
-    const pubs = useHostNetwork ? [] : [...manifestPorts, ...runtimePorts, ...profileServerPublishArgs];
-    for (const p of pubs) {
-        if (!p) continue;
-        args.splice(1, 0, '-p', String(p));
     }
 
     // Manifest-driven runtime resources (persistent storage + declared env).
@@ -982,6 +1017,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         ? ['HF_HOME', 'PLOINKY_MODELS_DIR', 'PLOINKY_DERIVED_DIR', 'PLOINKY_RUNTIME_DIR', 'PLOINKY_LAUNCHERS_DIR', 'PLOINKY_MCP_PORT', 'PLOINKY_LLM_PUBLIC_PORT', 'PLOINKY_LLM_MCP_PORT', 'PLOINKY_LLM_CONTROL_PORT', 'PLOINKY_INFERENCE_PORT']
         : [];
     const persistedRecord = agents[containerName] || existingRecord;
+    const runtimeService = buildRuntimeServiceDescriptor({ runtime, containerName, agentName, repoName, manifest, existingRecord: persistedRecord });
     agents[containerName] = {
         agentName,
         repoName,
@@ -1004,6 +1040,13 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         develRepo: persistedRecord.develRepo,
         profile: activeProfile,
         type: 'agent',
+        runtime: runtimeService.runtime,
+        containerId: runtimeService.containerId,
+        networkMode: runtimeService.networkMode,
+        targetAgentId: runtimeService.targetAgentId,
+        effectiveInstanceId: runtimeService.effectiveInstanceId,
+        enableGeneration: runtimeService.enableGeneration,
+        primaryService: runtimeService.primaryService,
         config: {
             binds: [
                 { source: agentLibMountPath, target: '/Agent', ro: true },
@@ -1021,9 +1064,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
                 ...(skillsPathExists && !skillsPathInsideCode && runtime !== 'podman' ? [{ source: agentSkillsPath, target: '/code/skills', ro: skillsReadOnly }] : []),
                 { source: cwd, target: cwdMountTarget }
             ],
-            env: Array.from(new Set([...declaredEnvNames2, ...llmRuntimeEnvNames])).map((name) => ({ name })),
-            ports: effectivePortMappings,
-            ...(additionalServerPort ? { additionalServerPort } : {})
+            env: Array.from(new Set([...declaredEnvNames2, ...llmRuntimeEnvNames])).map((name) => ({ name }))
         }
     };
     if (persistedRecord.auth) {
@@ -1068,90 +1109,34 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     return containerName;
 }
 
-function resolveHostPort(containerName, existingRecord, containerPortCandidates) {
-    const fromRecord = resolveHostPortFromRecord(existingRecord, containerPortCandidates);
-    if (fromRecord) return fromRecord;
-    return resolveHostPortFromRuntime(containerName, containerPortCandidates);
-}
-
-function resolveHostPortFromRecord(record, containerPortCandidates) {
-    const ports = record?.config?.ports;
-    if (!Array.isArray(ports) || !ports.length) return 0;
-    for (const containerPort of containerPortCandidates) {
-        const match = ports.find((p) => p && p.containerPort === containerPort);
-        if (match?.hostPort) {
-            return match.hostPort;
-        }
-    }
-    return ports[0]?.hostPort || 0;
-}
-
-function resolveHostPortFromRuntime(containerName, containerPortCandidates) {
-    const runtime = getRuntime();
-    for (const containerPort of containerPortCandidates) {
-        try {
-            const portMap = execSync(`${runtime} port ${containerName} ${containerPort}/tcp`, { stdio: 'pipe' }).toString().trim();
-            const hostPort = parseHostPort(portMap);
-            if (hostPort) {
-                return hostPort;
-            }
-        } catch (_) {
-            // ignore and try next
-        }
-    }
-    return 0;
-}
-
-function resolvePublishedPortMappings(containerName, portMappings) {
-    if (!Array.isArray(portMappings) || portMappings.length === 0) {
-        return [];
-    }
-    return portMappings.map((mapping) => {
-        const hostPort = Number(mapping?.hostPort);
-        const containerPort = Number(mapping?.containerPort);
-        if (!Number.isFinite(containerPort) || containerPort <= 0) {
-            return mapping;
-        }
-        if (Number.isFinite(hostPort) && hostPort > 0) {
-            return mapping;
-        }
-        const resolvedHostPort = resolveHostPortFromRuntime(containerName, [containerPort]);
-        return resolvedHostPort > 0
-            ? { ...mapping, hostPort: resolvedHostPort }
-            : mapping;
-    });
-}
-
 function ensureAgentService(agentName, manifest, agentPath, options = {}) {
     // Check if this agent should use a sandbox runtime instead of containers
     const agentRuntime = getRuntimeForAgent(manifest);
     if (agentRuntime === 'bwrap') {
         try {
-            return ensureBwrapService(agentName, manifest, agentPath, options);
+            const started = ensureBwrapService(agentName, manifest, agentPath, options);
+            return buildUnconfinedServiceDescriptor('bwrap', started, agentName, path.basename(path.dirname(agentPath)));
         } catch (err) {
             throw createHostSandboxStartupError(agentName, 'bwrap', err);
         }
     }
     if (agentRuntime === 'seatbelt') {
         try {
-            return ensureSeatbeltService(agentName, manifest, agentPath, options);
+            const started = ensureSeatbeltService(agentName, manifest, agentPath, options);
+            return buildUnconfinedServiceDescriptor('seatbelt', started, agentName, path.basename(path.dirname(agentPath)));
         } catch (err) {
             throw createHostSandboxStartupError(agentName, 'seatbelt', err);
         }
     }
     const runtime = getRuntime();
 
-    let preferredHostPort;
     let containerOverride;
     let aliasOverride;
     let forceRecreate = false;
     let profileNameOverride;
     let routerPortOverride;
     let routerHostOverride;
-    if (typeof options === 'number') {
-        preferredHostPort = options;
-    } else if (options && typeof options === 'object') {
-        preferredHostPort = options.preferredHostPort;
+    if (options && typeof options === 'object') {
         containerOverride = options.containerName;
         aliasOverride = options.alias;
         forceRecreate = options.forceRecreate === true;
@@ -1192,15 +1177,6 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
         routerPort: routerPortOverride,
         routerHost: routerHostOverride
     });
-
-    const { publishArgs: manifestPorts, portMappings } = parseManifestPorts(manifest, profileConfig);
-    const additionalServerPort = resolveProfileServer(manifest, profileConfig, { runtimeMode: 'container' });
-    const containerPortCandidates = portMappings
-        .map((mapping) => mapping?.containerPort)
-        .filter((port) => typeof port === 'number' && port > 0);
-    if (!containerPortCandidates.length) {
-        containerPortCandidates.push(7000);
-    }
 
     const { raw: explicitAgentCmd } = readManifestAgentCommand(manifest);
     const startCmd = readManifestStartCommand(manifest);
@@ -1252,15 +1228,6 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
         }
     }
 
-    if (containerExists(containerName) && additionalServerPort) {
-        const existingPortMappings = resolvePublishedPortMappings(containerName, existingRecord.config?.ports || []);
-        const existingProfileServer = resolvePublishedProfileServer(additionalServerPort, existingPortMappings);
-        if (!existingProfileServer) {
-            debugLog(`[ensureAgentService] ${agentName}: additional server port is not published; recreating container`);
-            removeContainerForRecreate(runtime, containerName, `ensureAgentService:${agentName}:profileServerPublishChanged`);
-        }
-    }
-
     if (containerExists(containerName)) {
         debugLog(`[ensureAgentService] ${agentName}: container exists, checking if running...`);
         let canReuseExisting = true;
@@ -1293,44 +1260,19 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
         }
         if (canReuseExisting) {
             debugLog(`[ensureAgentService] ${agentName}: returning early (container exists)`);
-            const hostPort = resolveHostPort(containerName, existingRecord, containerPortCandidates);
-            const existingPortMappings = resolvePublishedPortMappings(containerName, existingRecord.config?.ports || []);
-            const resolvedProfileServer = resolvePublishedProfileServer(additionalServerPort, existingPortMappings) || additionalServerPort;
             syncAgentMcpConfig(containerName, agentPath, agentName);
-            return { containerName, hostPort, additionalServerPort: resolvedProfileServer };
+            return buildRuntimeServiceDescriptor({ runtime, containerName, agentName, repoName, manifest, existingRecord });
         }
     }
 
-    let additionalPorts = [];
-    let additionalPortMappings = [];
-    let allPortMappings = [...portMappings];
-
-    if (manifestPorts.length === 0) {
-        const hostPort = preferredHostPort || (10000 + Math.floor(Math.random() * 50000));
-        const agentServerMapping = { containerPort: 7000, hostPort, hostIp: '127.0.0.1', protocol: 'tcp' };
-        additionalPorts = [`127.0.0.1:${hostPort}:7000`];
-        additionalPortMappings.push(agentServerMapping);
-        allPortMappings = [agentServerMapping];
-    }
-
-    const profileServerPublish = createProfileServerPublish(additionalServerPort, allPortMappings);
-    if (profileServerPublish) {
-        additionalPorts.push(profileServerPublish.publishArg);
-        additionalPortMappings.push(profileServerPublish.mapping);
-        allPortMappings.push(profileServerPublish.mapping);
-    }
-
     startAgentContainer(agentName, manifest, agentPath, {
-        publish: additionalPorts,
-        publishMappings: additionalPortMappings,
         containerName,
         alias: aliasOverride,
         profileName: activeProfile,
         routerPort: runtimeRouterEnv.PLOINKY_ROUTER_PORT,
         routerHost: runtimeRouterEnv.PLOINKY_ROUTER_HOST
     });
-    allPortMappings = resolvePublishedPortMappings(containerName, allPortMappings);
-    const resolvedProfileServer = resolvePublishedProfileServer(additionalServerPort, allPortMappings) || additionalServerPort;
+    const runtimeService = buildRuntimeServiceDescriptor({ runtime, containerName, agentName, repoName, manifest, existingRecord });
 
     const agentCodePath = getAgentCodePath(agentName);
     const agentSkillsPath = getAgentSkillsPath(agentName);
@@ -1377,6 +1319,13 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
         develRepo: existingRecord.develRepo,
         profile: activeProfile,
         type: 'agent',
+        runtime: runtimeService.runtime,
+        containerId: runtimeService.containerId,
+        networkMode: runtimeService.networkMode,
+        targetAgentId: runtimeService.targetAgentId,
+        effectiveInstanceId: runtimeService.effectiveInstanceId,
+        enableGeneration: runtimeService.enableGeneration,
+        primaryService: runtimeService.primaryService,
         config: {
             binds: hasStartedBinds ? startedRecord.config.binds : [
                 { source: AGENT_LIB_PATH, target: '/Agent', ro: true },
@@ -1385,9 +1334,7 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
                 { source: projPath, target: finalWorkTarget },
                 ...(!finalIsolatedHome ? [{ source: finalAgentWorkDir, target: '/root' }] : [])
             ],
-            env: Array.from(new Set([...declaredEnvNames3, ...startedEnvNames])).map((name) => ({ name })),
-            ports: allPortMappings,
-            ...(resolvedProfileServer ? { additionalServerPort: resolvedProfileServer } : {})
+            env: Array.from(new Set([...declaredEnvNames3, ...startedEnvNames])).map((name) => ({ name }))
         }
     };
     if (existingRecord.auth) {
@@ -1399,8 +1346,7 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
     saveAgentsMap(agents);
 
     syncAgentMcpConfig(containerName, agentPath, finalInstanceName, { workDir: finalAgentWorkDir });
-    const returnPort = allPortMappings.find((p) => p.containerPort === 7000)?.hostPort || allPortMappings[0]?.hostPort || 0;
-    return { containerName, hostPort: returnPort, additionalServerPort: resolvedProfileServer };
+    return runtimeService;
 }
 
 export {
@@ -1413,9 +1359,5 @@ export {
     ensurePodmanStagedCodeDir,
     mergeNodeOptions,
     podmanMountSuffix,
-    resolveHostPort,
-    resolveHostPortFromRecord,
-    resolveHostPortFromRuntime,
-    resolvePublishedPortMappings,
     startAgentContainer
 };

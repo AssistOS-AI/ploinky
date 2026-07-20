@@ -289,7 +289,7 @@ test('mcp proxy rejects expired delegation grants', () => {
     }), /delegation expired/);
 });
 
-test('user-originated configured tool call mints delegations on the shared mint path', () => {
+test('generic provider calls do not embed product-specific delegation rules', () => {
     const ctx = buildInvocationContextForProviderCall({
         req: { user: { id: 'local:admin', username: 'admin', email: '', roles: ['admin'] } },
         agentName: 'gitAgent',
@@ -297,18 +297,7 @@ test('user-originated configured tool call mints delegations on the shared mint 
         toolArgs: { token: 'redacted-by-test' },
     });
     assert.equal(ctx.payload.actor.kind, 'user');
-    const entry = ctx.payload.delegations.dpuGitSecrets;
-    assert.ok(entry.token);
-    assert.equal(entry.targetAgentId, 'agent:AssistOSExplorer/dpuAgent');
-
-    const verified = verifyUserDelegationGrant({
-        signingSecret: deriveSubkey('router-user-delegation', 32),
-        token: entry.token,
-        expectedSourceAgentId: 'agent:AssistOSExplorer/gitAgent',
-        expectedTargetAgentId: 'agent:AssistOSExplorer/dpuAgent',
-        expectedTool: 'dpu_secret_put',
-    });
-    assert.equal(verified.user.id, 'local:admin');
+    assert.equal(ctx.payload.delegations, undefined);
 });
 
 test('user call to an unconfigured tool mints no delegations', () => {

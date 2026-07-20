@@ -136,52 +136,6 @@ process.stdout.write(JSON.stringify({
     }
 });
 
-test('parseManifestPorts emits runtime-chosen localhost openPorts for host port 0', () => {
-    const workspaceDir = tempDir();
-    try {
-        const result = runModuleSnippet(
-            `const { parseManifestPorts } = await import(${JSON.stringify(dockerCommonUrl)});
-const manifest = {};
-const profile = { openPorts: ['127.0.0.1:0:9000', '127.0.0.1:18080:8080'] };
-process.stdout.write(JSON.stringify(parseManifestPorts(manifest, profile)));`,
-            {},
-            { cwd: workspaceDir },
-        );
-
-        assert.equal(result.status, 0, result.stderr);
-        assert.deepEqual(JSON.parse(result.stdout), {
-            publishArgs: ['127.0.0.1::9000', '127.0.0.1:18080:8080'],
-            portMappings: [
-                { hostPort: 0, containerPort: 9000, hostIp: '127.0.0.1', protocol: 'tcp' },
-                { hostPort: 18080, containerPort: 8080, hostIp: '127.0.0.1', protocol: 'tcp' },
-            ],
-        });
-    } finally {
-        fs.rmSync(workspaceDir, { recursive: true, force: true });
-    }
-});
-
-test('parseManifestPorts rejects legacy profile ports field', () => {
-    const workspaceDir = tempDir();
-    try {
-        const result = runModuleSnippet(
-            `const { parseManifestPorts } = await import(${JSON.stringify(dockerCommonUrl)});
-try {
-  parseManifestPorts({}, { ports: ['127.0.0.1:0:9000'] });
-} catch (err) {
-  process.stdout.write(err.message);
-}`,
-            {},
-            { cwd: workspaceDir },
-        );
-
-        assert.equal(result.status, 0, result.stderr);
-        assert.match(result.stdout, /renamed to 'openPorts'/);
-    } finally {
-        fs.rmSync(workspaceDir, { recursive: true, force: true });
-    }
-});
-
 test('getConfiguredProjectPath uses .data agent folder for isolated records', () => {
     const workspaceDir = tempDir();
     try {
@@ -252,7 +206,9 @@ case "$1" in
     exit 0
     ;;
   inspect)
-    exit 1
+    if [ ! -s ${JSON.stringify(stateFile)} ]; then exit 1; fi
+    printf '%s\n' '[{"Id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","HostConfig":{"NetworkMode":"bridge"}}]'
+    exit 0
     ;;
   run)
     printf '%s\\n' "$*" > ${JSON.stringify(argsFile)}
@@ -412,70 +368,6 @@ test('buildExecArgs does not rewrite non-shell commands and quotes workdir', () 
             "cd '/tmp/it'\\''s-here' && node /code/src/index.mjs",
         ],
     );
-});
-
-test('parseManifestPorts rejects legacy manifest ports field', () => {
-    const workspaceDir = tempDir();
-    try {
-        const result = runModuleSnippet(
-            `const { parseManifestPorts } = await import(${JSON.stringify(dockerCommonUrl)});
-try {
-  parseManifestPorts({ ports: ['7000'] }, {});
-} catch (err) {
-  process.stdout.write(err.message);
-}`,
-            {},
-            { cwd: workspaceDir },
-        );
-
-        assert.equal(result.status, 0, result.stderr);
-        assert.match(result.stdout, /renamed to profile field 'openPorts'/);
-    } finally {
-        fs.rmSync(workspaceDir, { recursive: true, force: true });
-    }
-});
-
-test('resolvePublishedPortMappings records host ports assigned by the container runtime', () => {
-    const binDir = tempDir();
-    try {
-        const podmanPath = path.join(binDir, 'podman');
-        fs.writeFileSync(
-            podmanPath,
-            `#!/bin/sh
-case "$1" in
-  port)
-    if [ "$3" = "9000/tcp" ]; then
-      printf '%s\\n' '127.0.0.1:49152'
-      exit 0
-    fi
-    exit 1
-    ;;
-  *)
-    exit 0
-    ;;
-esac
-`,
-        );
-        fs.chmodSync(podmanPath, 0o755);
-
-        const result = runModuleSnippet(
-            `const { resolvePublishedPortMappings } = await import(${JSON.stringify(agentServiceManagerUrl)});
-const mappings = [
-  { hostPort: 0, containerPort: 9000, hostIp: '127.0.0.1', protocol: 'tcp' },
-  { hostPort: 18080, containerPort: 8080, hostIp: '127.0.0.1', protocol: 'tcp' },
-];
-process.stdout.write(JSON.stringify(resolvePublishedPortMappings('demo-container', mappings)));`,
-            { PATH: binDir },
-        );
-
-        assert.equal(result.status, 0, result.stderr);
-        assert.deepEqual(JSON.parse(result.stdout), [
-            { hostPort: 49152, containerPort: 9000, hostIp: '127.0.0.1', protocol: 'tcp' },
-            { hostPort: 18080, containerPort: 8080, hostIp: '127.0.0.1', protocol: 'tcp' },
-        ]);
-    } finally {
-        fs.rmSync(binDir, { recursive: true, force: true });
-    }
 });
 
 test('collectLiveAgentContainers probes the runtime before listing live containers', () => {

@@ -145,22 +145,6 @@ test('getProfileConfig lets active profile network replace default network', () 
     assert.deepStrictEqual(config.network, { mode: 'host' });
 });
 
-test('getProfileConfig lets active profile additionalServerPort replace default additionalServerPort', () => {
-    writeManifest('repo-server', 'agent-server', {
-        profiles: {
-            default: {
-                additionalServerPort: '3000',
-            },
-            prod: {
-                additionalServerPort: '8080',
-            },
-        },
-    });
-
-    const config = getProfileConfig('repo-server/agent-server', 'prod');
-    assert.equal(config.additionalServerPort, '8080');
-});
-
 test('validateProfile reports missing secrets', () => {
     writeManifest('repo-three', 'agent-three', {
         profiles: {

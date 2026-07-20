@@ -1,9 +1,10 @@
-import http from 'http';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 
 import { sendJson } from './authHandlers/index.js';
-import { createAgentClient } from './AgentClient.js';
+import { createAgentRelayClient } from './AgentClient.js';
+import { getActiveGenerationRoutes } from './generation/runtimeContext.js';
+import { relayHttpCall } from './proxy/relayHttpCall.js';
 import { buildInvocationContextForProviderCall } from './mcp-proxy/index.js';
 import { buildRouterRequest } from './mcp-proxy/invocationMinter.js';
 import { deriveDelegationKey } from './mcp-proxy/mcpDelegations.js';
@@ -12,7 +13,6 @@ import { policy } from './policy/index.js';
 import { hasInternalAgentSegment } from './internalAgentPath.js';
 import {
     buildServiceAgentPath,
-    loadRoutingConfig,
     resolveHttpServiceRoute
 } from './httpServiceRoutes.js';
 import { deriveAgentPrincipalId } from '../utils/security/agentIdentity.js';
@@ -28,7 +28,7 @@ const DEFAULT_HTTP_SERVICE_INVOCATION_MAX_BODY_BYTES = 10 * 1024 * 1024;
 const routerSessions = new Map();
 
 export function loadApiRoutes() {
-    return loadRoutingConfig().routes || {};
+    return getActiveGenerationRoutes();
 }
 
 export function buildAgentPath(parsedUrl, includeSearch = true) {
@@ -38,98 +38,37 @@ export function buildAgentPath(parsedUrl, includeSearch = true) {
     return `/mcp${pathname}${search}`;
 }
 
-export function postJsonToAgent(targetPort, payload, res, agentPath, extraHeaders = {}) {
+function writeRelayResponse(res, response) {
+    res.writeHead(response.statusCode, response.headers);
+    res.end(response.body);
+}
+
+export async function postJsonToAgent(routeKey, payload, res, agentPath, extraHeaders = {}) {
     try {
-        const data = Buffer.from(JSON.stringify(payload || {}));
-        const opts = {
-            hostname: '127.0.0.1',
-            port: targetPort,
-            path: agentPath && agentPath.length ? agentPath : '/mcp',
+        const response = await relayHttpCall({
+            routeKey,
             method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'Content-Length': data.length,
-                ...extraHeaders
-            }
-        };
-        const upstream = http.request(opts, upstreamRes => {
-            res.writeHead(upstreamRes.statusCode || 200, upstreamRes.headers);
-            upstreamRes.pipe(res, { end: true });
+            target: agentPath && agentPath.length ? agentPath : '/mcp',
+            headers: { 'content-type': 'application/json', ...extraHeaders },
+            body: Buffer.from(JSON.stringify(payload || {})),
         });
-        upstream.on('error', err => {
-            res.statusCode = 502;
-            res.end(JSON.stringify({ error: 'upstream error', detail: String(err) }));
-        });
-        upstream.end(data);
-    } catch (err) {
-        res.statusCode = 500;
-        res.end(JSON.stringify({ error: 'proxy failure', detail: String(err) }));
+        writeRelayResponse(res, response);
+    } catch (_) {
+        res.writeHead(502, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'upstream_unavailable' }));
     }
 }
 
-export function proxyMcpPassthrough(req, res, targetPort, agentPath) {
-    const pathWithLeadingSlash = agentPath.startsWith('/') ? agentPath : `/${agentPath}`;
-    const opts = {
-        hostname: '127.0.0.1',
-        port: targetPort,
-        path: pathWithLeadingSlash,
-        method: req.method,
-        headers: {
-            ...req.headers,
-            host: `127.0.0.1:${targetPort}`
-        }
-    };
-
-    const upstream = http.request(opts, upstreamRes => {
-        res.writeHead(upstreamRes.statusCode || 200, upstreamRes.headers);
-        upstreamRes.pipe(res, { end: true });
-    });
-
-    upstream.on('error', err => {
-        if (!res.headersSent) {
-            res.writeHead(502, { 'Content-Type': 'application/json' });
-        }
-        res.end(JSON.stringify({ error: 'upstream error', detail: String(err) }));
-    });
-
-    req.on('aborted', () => {
-        upstream.destroy();
-    });
-
-    req.pipe(upstream, { end: true });
+export function proxyMcpPassthrough(req, res, routeKey, agentPath) {
+    return proxyHttpPassthrough(req, res, routeKey, agentPath);
 }
 
-export function proxyHttpPassthrough(req, res, targetPort, agentPath, extraHeaders = {}) {
-    const pathWithLeadingSlash = agentPath.startsWith('/') ? agentPath : `/${agentPath}`;
-    const headers = {
-        ...stripRouterIdentityHeaders(req.headers),
-        ...extraHeaders,
-        host: `127.0.0.1:${targetPort}`
-    };
-
-    const upstream = http.request({
-        hostname: '127.0.0.1',
-        port: targetPort,
-        path: pathWithLeadingSlash,
-        method: req.method,
-        headers
-    }, upstreamRes => {
-        res.writeHead(upstreamRes.statusCode || 200, upstreamRes.headers);
-        upstreamRes.pipe(res, { end: true });
+export function proxyHttpPassthrough(req, res, routeKey, agentPath, extraHeaders = {}) {
+    readRequestBody(req, {
+        onSuccess: body => proxyHttpBuffered(req, res, routeKey, agentPath, body, extraHeaders),
+        onTooLarge: () => sendJson(res, 413, { error: 'request_too_large' }),
+        onError: () => sendJson(res, 400, { error: 'request_invalid' }),
     });
-
-    upstream.on('error', err => {
-        if (!res.headersSent) {
-            res.writeHead(502, { 'Content-Type': 'application/json' });
-        }
-        res.end(JSON.stringify({ error: 'upstream error', detail: String(err) }));
-    });
-
-    req.on('aborted', () => {
-        upstream.destroy();
-    });
-
-    req.pipe(upstream, { end: true });
 }
 
 export function resolveHttpServiceInvocationMaxBodyBytes(env = process.env) {
@@ -145,11 +84,10 @@ function pathOnly(pathWithQuery = '') {
     return index >= 0 ? value.slice(0, index) : value;
 }
 
-function buildBufferedProxyHeaders(req, targetPort, body, extraHeaders = {}) {
+function buildBufferedProxyHeaders(req, body, extraHeaders = {}) {
     const headers = {
         ...stripRouterIdentityHeaders(req.headers),
         ...extraHeaders,
-        host: `127.0.0.1:${targetPort}`,
     };
     for (const name of Object.keys(headers)) {
         const normalized = String(name).toLowerCase();
@@ -161,27 +99,20 @@ function buildBufferedProxyHeaders(req, targetPort, body, extraHeaders = {}) {
     return headers;
 }
 
-export function proxyHttpBuffered(req, res, targetPort, agentPath, body, extraHeaders = {}) {
+export async function proxyHttpBuffered(req, res, routeKey, agentPath, body, extraHeaders = {}) {
     const pathWithLeadingSlash = agentPath.startsWith('/') ? agentPath : `/${agentPath}`;
-    const upstream = http.request({
-        hostname: '127.0.0.1',
-        port: targetPort,
-        path: pathWithLeadingSlash,
-        method: req.method,
-        headers: buildBufferedProxyHeaders(req, targetPort, body, extraHeaders),
-    }, upstreamRes => {
-        res.writeHead(upstreamRes.statusCode || 200, upstreamRes.headers);
-        upstreamRes.pipe(res, { end: true });
-    });
-
-    upstream.on('error', err => {
-        if (!res.headersSent) {
-            res.writeHead(502, { 'Content-Type': 'application/json' });
-        }
-        res.end(JSON.stringify({ error: 'upstream error', detail: String(err) }));
-    });
-
-    upstream.end(body);
+    try {
+        const response = await relayHttpCall({
+            routeKey,
+            method: req.method,
+            target: pathWithLeadingSlash,
+            headers: buildBufferedProxyHeaders(req, body, extraHeaders),
+            body,
+        });
+        writeRelayResponse(res, response);
+    } catch (_) {
+        sendJson(res, 502, { error: 'upstream_unavailable' });
+    }
 }
 
 export function readRequestBody(req, {
@@ -219,11 +150,16 @@ export function readRequestBody(req, {
 const ROUTER_IDENTITY_HEADERS = new Set([
     'x-ploinky-auth-info',
     'x-ploinky-user-delegation',
+    'x-ploinky-agent-assertion',
+    'x-ploinky-machine-assertion',
     'x-ploinky-user-id',
     'x-ploinky-user',
     'x-ploinky-user-email',
     'x-ploinky-user-roles',
-    'x-ploinky-session-id'
+    'x-ploinky-session-id',
+    'x-ploinky-target-agent',
+    'x-ploinky-target-port',
+    'x-ploinky-relay',
 ]);
 
 export function stripRouterIdentityHeaders(headers = {}) {
@@ -430,7 +366,7 @@ export function handleHttpServiceRoute(req, res, parsedUrl, apiRoutes = loadApiR
     }
 
     const route = apiRoutes[definition.routeKey];
-    if (!route || !route.hostPort) {
+    if (!route?.relay || !route?.primaryService) {
         res.writeHead(404, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: definition.notFoundMessage }));
         return true;
@@ -468,7 +404,7 @@ export function handleHttpServiceRoute(req, res, parsedUrl, apiRoutes = loadApiR
                     });
                     return;
                 }
-                proxyHttpBuffered(req, res, route.hostPort, upstreamPath, body, identityHeaders);
+                proxyHttpBuffered(req, res, definition.routeKey, upstreamPath, body, identityHeaders);
             },
             onTooLarge: ({ limitBytes }) => {
                 sendJson(res, 413, {
@@ -498,11 +434,11 @@ export function handleHttpServiceRoute(req, res, parsedUrl, apiRoutes = loadApiR
         });
         return true;
     }
-    proxyHttpPassthrough(req, res, route.hostPort, upstreamPath, identityHeaders);
+    proxyHttpPassthrough(req, res, definition.routeKey, upstreamPath, identityHeaders);
     return true;
 }
 
-export function proxyApi(req, res, targetPort, identityHeaders = {}) {
+export function proxyApi(req, res, routeKey, identityHeaders = {}) {
     const method = (req.method || 'GET').toUpperCase();
     const parsed = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
     const includeSearch = method !== 'GET';
@@ -513,7 +449,7 @@ export function proxyApi(req, res, targetPort, identityHeaders = {}) {
         parsed.searchParams.forEach((value, key) => {
             params[key] = value;
         });
-        return postJsonToAgent(targetPort, params, res, agentPath, identityHeaders);
+        return postJsonToAgent(routeKey, params, res, agentPath, identityHeaders);
     }
 
     const chunks = [];
@@ -521,26 +457,10 @@ export function proxyApi(req, res, targetPort, identityHeaders = {}) {
     req.on('end', () => {
         const body = Buffer.concat(chunks);
         const data = body.length ? body : Buffer.from('{}');
-        const opts = {
-            hostname: '127.0.0.1',
-            port: targetPort,
-            path: agentPath,
-            method: method,
-            headers: {
-                'Content-Type': req.headers['content-type'] || 'application/json',
-                'Content-Length': data.length,
-                ...identityHeaders
-            }
-        };
-        const upstream = http.request(opts, upstreamRes => {
-            res.writeHead(upstreamRes.statusCode || 200, upstreamRes.headers);
-            upstreamRes.pipe(res, { end: true });
+        proxyHttpBuffered(req, res, routeKey, agentPath, data, {
+            'content-type': req.headers['content-type'] || 'application/json',
+            ...identityHeaders,
         });
-        upstream.on('error', err => {
-            res.statusCode = 502;
-            res.end(JSON.stringify({ error: 'upstream error', detail: String(err) }));
-        });
-        upstream.end(data);
     });
     req.on('error', err => {
         res.statusCode = 500;
@@ -553,10 +473,8 @@ export function createAgentRouteEntries() {
     const entries = [];
     for (const [agentName, route] of Object.entries(routes || {})) {
         if (!route || route.disabled) continue;
-        const port = Number(route.hostPort);
-        if (!Number.isFinite(port)) continue;
-        const baseUrl = `http://127.0.0.1:${port}/mcp`;
-        entries.push({ agentName, port, baseUrl, client: createAgentClient(baseUrl) });
+        if (!route.relay || !route.primaryService) continue;
+        entries.push({ agentName, client: createAgentRelayClient(agentName) });
     }
     return entries;
 }
@@ -738,7 +656,7 @@ async function callEntryTool(entry, toolName, args, req) {
     if (!requestHeaders) {
         return await entry.client.callTool(toolName, args);
     }
-    const client = createAgentClient(entry.baseUrl, { requestHeaders });
+    const client = createAgentRelayClient(entry.agentName, { requestHeaders });
     try {
         return await client.callTool(toolName, args);
     } finally {
@@ -751,7 +669,7 @@ async function readEntryResource(entry, uri, req) {
     if (!requestHeaders) {
         return await entry.client.readResource(uri);
     }
-    const client = createAgentClient(entry.baseUrl, { requestHeaders });
+    const client = createAgentRelayClient(entry.agentName, { requestHeaders });
     try {
         return await client.readResource(uri);
     } finally {

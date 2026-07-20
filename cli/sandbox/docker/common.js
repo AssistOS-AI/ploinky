@@ -326,124 +326,6 @@ function sleepMs(ms) {
     Atomics.wait(SLEEP_ARRAY, 0, 0, ms);
 }
 
-function parseManifestPorts(manifest, profileConfig = null) {
-    // Open ports must be defined in profile configuration.
-    const ports = profileConfig?.openPorts;
-    if (!ports) return { publishArgs: [], portMappings: [] };
-
-    const portArray = Array.isArray(ports) ? ports : [ports];
-    const publishArgs = [];
-    const portMappings = [];
-
-    for (const p of portArray) {
-        if (!p) continue;
-        const portSpec = String(p).trim();
-        if (!portSpec) continue;
-
-        const parts = portSpec.split(':');
-        let hostIp = '127.0.0.1';  // Default to localhost for security
-        let hostPortSpec;
-        let containerPortSpec;
-        if (parts.length === 1) {
-            hostPortSpec = containerPortSpec = parts[0];
-        } else if (parts.length === 2) {
-            hostPortSpec = parts[0];
-            containerPortSpec = parts[1];
-        } else if (parts.length === 3) {
-            hostIp = parts[0];  // Respect the specified IP address
-            hostPortSpec = parts[1];
-            containerPortSpec = parts[2];
-        }
-        const parsed = parsePortPublishSpec(hostPortSpec, containerPortSpec);
-        if (parsed) {
-            const normalized = `${hostIp}:${parsed.hostPortSpec}:${parsed.containerPortSpec}${parsed.protocolSuffix}`;
-            publishArgs.push(normalized);
-            for (const mapping of parsed.portMappings) {
-                portMappings.push({ ...mapping, hostIp, protocol: parsed.protocol });
-            }
-        }
-    }
-
-    return { publishArgs, portMappings };
-}
-
-function parsePortPublishSpec(hostPortSpec, containerPortSpec) {
-    if (hostPortSpec === undefined || hostPortSpec === null || containerPortSpec === undefined || containerPortSpec === null) {
-        return null;
-    }
-    const container = splitPortProtocol(containerPortSpec);
-    const host = splitPortProtocol(hostPortSpec);
-    const protocol = container.protocol || host.protocol || 'tcp';
-    if ((container.protocol && host.protocol && container.protocol !== host.protocol) || !['tcp', 'udp'].includes(protocol)) {
-        return null;
-    }
-    const hostRange = parsePortRange(host.portSpec, { allowEphemeral: true });
-    const containerRange = parsePortRange(container.portSpec);
-    if (!hostRange || !containerRange || hostRange.length !== containerRange.length) {
-        return null;
-    }
-    if (hostRange.ephemeral && containerRange.length !== 1) {
-        return null;
-    }
-    const portMappings = [];
-    for (let offset = 0; offset < hostRange.length; offset += 1) {
-        portMappings.push({
-            hostPort: hostRange.start + offset,
-            containerPort: containerRange.start + offset
-        });
-    }
-    return {
-        hostPortSpec: hostRange.ephemeral ? '' : formatPortRange(hostRange),
-        containerPortSpec: formatPortRange(containerRange),
-        protocol,
-        protocolSuffix: protocol === 'tcp' ? '' : `/${protocol}`,
-        portMappings
-    };
-}
-
-function splitPortProtocol(portSpec) {
-    const raw = String(portSpec || '').trim();
-    const match = raw.match(/^(.+?)(?:\/([a-zA-Z]+))?$/);
-    return {
-        portSpec: String(match?.[1] || '').trim(),
-        protocol: String(match?.[2] || '').trim().toLowerCase()
-    };
-}
-
-function parsePortRange(portSpec, options = {}) {
-    const raw = String(portSpec || '').trim();
-    if (options.allowEphemeral && raw === '') {
-        return { start: 0, end: 0, length: 1, ephemeral: true };
-    }
-    const match = raw.match(/^(\d+)(?:-(\d+))?$/);
-    if (!match) return null;
-    const start = parseInt(match[1], 10);
-    const end = match[2] ? parseInt(match[2], 10) : start;
-    if (options.allowEphemeral && start === 0 && end === 0 && !match[2]) {
-        return { start: 0, end: 0, length: 1, ephemeral: true };
-    }
-    if (!Number.isInteger(start) || !Number.isInteger(end) || start <= 0 || end <= 0 || end < start) {
-        return null;
-    }
-    return { start, end, length: end - start + 1 };
-}
-
-function formatPortRange(range) {
-    if (!range) return '';
-    return range.start === range.end ? String(range.start) : `${range.start}-${range.end}`;
-}
-
-function parseHostPort(output) {
-    try {
-        if (!output) return 0;
-        const firstLine = String(output).split(/\n+/)[0].trim();
-        const match = firstLine.match(/(\d+)\s*$/);
-        return match ? parseInt(match[1], 10) : 0;
-    } catch (_) {
-        return 0;
-    }
-}
-
 function hasOwnObject(target, key) {
     return Boolean(
         target
@@ -566,8 +448,6 @@ export {
     probeContainerRuntime,
     runtimeFamilyName,
     loadAgentsMap,
-    parseHostPort,
-    parseManifestPorts,
     saveAgentsMap,
     syncAgentMcpConfig,
     waitForContainerRunning,

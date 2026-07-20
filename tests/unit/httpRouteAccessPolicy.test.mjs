@@ -34,13 +34,6 @@ function policy(entries, options = {}) {
     });
 }
 
-function writeManifest(root, routeKey, manifest) {
-    const agentDir = path.join(root, routeKey);
-    fs.mkdirSync(agentDir, { recursive: true });
-    fs.writeFileSync(path.join(agentDir, 'manifest.json'), JSON.stringify(manifest, null, 2));
-    return agentDir;
-}
-
 test('evaluates persisted public, guest, and authenticated entries', () => {
     const subject = policy([
         { path: '/explorer/public/*', access: 'public', enabled: true },
@@ -190,10 +183,11 @@ test('manifest route access treats agent-relative router-looking paths as agent 
     );
 });
 
-test('collects manifest route access from routing hostPath entries', () => {
-    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-manifest-routes-'));
-    try {
-        const explorerDir = writeManifest(tempDir, 'explorer', {
+test('collects manifest route access from captured generation entries', () => {
+    const routes = {
+        explorer: {
+            agent: 'explorer',
+            repo: 'AchillesIDE',
             routerAccess: {
                 httpRoutes: [
                     { path: '/public/*', access: 'public' },
@@ -204,28 +198,18 @@ test('collects manifest route access from routing hostPath entries', () => {
                     { path: '/old/*', access: ['pro', 'tected'].join('') },
                 ],
             },
-        });
-        const routes = {
-            explorer: {
-                agent: 'explorer',
-                repo: 'AchillesIDE',
-                hostPath: explorerDir,
-                hostPort: 7011,
-            },
-        };
-        const entries = collectManifestHttpRouteAccess(routes);
-        assert.deepEqual(entries.map((entry) => ({ path: entry.path, access: entry.access, source: entry.source })), [
-            { path: '/explorer/public/*', access: 'public', source: 'manifest' },
-            { path: '/explorer/work/*', access: 'guest', source: 'manifest' },
-            { path: '/explorer/account/*', access: 'authenticated', source: 'manifest' },
-            { path: '/explorer/implicit/*', access: 'authenticated', source: 'manifest' },
-        ]);
-    } finally {
-        fs.rmSync(tempDir, { recursive: true, force: true });
-    }
+        },
+    };
+    const entries = collectManifestHttpRouteAccess(routes);
+    assert.deepEqual(entries.map((entry) => ({ path: entry.path, access: entry.access, source: entry.source })), [
+        { path: '/explorer/public/*', access: 'public', source: 'manifest' },
+        { path: '/explorer/work/*', access: 'guest', source: 'manifest' },
+        { path: '/explorer/account/*', access: 'authenticated', source: 'manifest' },
+        { path: '/explorer/implicit/*', access: 'authenticated', source: 'manifest' },
+    ]);
 });
 
-test('collects manifest route access through enabled-agent fallback when hostPath is absent', () => {
+test('manifest route access never falls back to staging files', () => {
     const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-manifest-routes-fallback-'));
     try {
         const ploinkyDir = path.join(tempDir, '.ploinky');
@@ -277,50 +261,33 @@ test('collects manifest route access through enabled-agent fallback when hostPat
         });
 
         assert.equal(child.status, 0, child.stderr);
-        assert.deepEqual(JSON.parse(child.stdout), [
-            { path: '/fallbackAgent/public/*', access: 'public', routeKey: 'fallbackAgent' },
-            { path: '/fallbackAgent/account/*', access: 'authenticated', routeKey: 'fallbackAgent' },
-        ]);
+        assert.deepEqual(JSON.parse(child.stdout), []);
     } finally {
         fs.rmSync(tempDir, { recursive: true, force: true });
     }
 });
 
-test('manifest route provider caches by manifest mtime stamp', () => {
-    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-manifest-route-cache-'));
+test('manifest route provider caches by immutable route-set identity', () => {
     const fixtureRouteKey = 'explorer';
-    const manifestPath = path.join(tempDir, fixtureRouteKey, 'manifest.json');
-    try {
-        const explorerDir = writeManifest(tempDir, fixtureRouteKey, {
+    let fixtureRoutes = {
+        [fixtureRouteKey]: {
             routerAccess: {
                 httpRoutes: [{ path: '/public/*', access: 'public' }],
             },
-        });
-        const fixtureRoutes = {
-            [fixtureRouteKey]: {
-                agent: fixtureRouteKey,
-                repo: 'AchillesIDE',
-                hostPath: explorerDir,
-                hostPort: 7011,
-            },
-        };
-        const provider = createManifestRouteProvider(() => fixtureRoutes);
-        const first = provider();
-        assert.equal(provider(), first);
-
-        fs.writeFileSync(manifestPath, JSON.stringify({
+        },
+    };
+    const provider = createManifestRouteProvider(() => fixtureRoutes);
+    const first = provider();
+    assert.equal(provider(), first);
+    fixtureRoutes = {
+        [fixtureRouteKey]: {
             routerAccess: {
                 httpRoutes: [{ path: '/changed/*', access: 'guest' }],
             },
-        }, null, 2));
-        const nextTime = new Date(Date.now() + 2000);
-        fs.utimesSync(manifestPath, nextTime, nextTime);
-
-        const second = provider();
-        assert.notEqual(second, first);
-        assert.equal(second[0].path, `/${fixtureRouteKey}/changed/*`);
-        assert.equal(second[0].access, 'guest');
-    } finally {
-        fs.rmSync(tempDir, { recursive: true, force: true });
-    }
+        },
+    };
+    const second = provider();
+    assert.notEqual(second, first);
+    assert.equal(second[0].path, `/${fixtureRouteKey}/changed/*`);
+    assert.equal(second[0].access, 'guest');
 });

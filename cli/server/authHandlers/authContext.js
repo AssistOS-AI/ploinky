@@ -1,11 +1,6 @@
-import fs from 'fs';
-import path from 'path';
-
-import { PLOINKY_WORKSPACE_ROOT, ROUTING_FILE } from '../../utils/config.js';
-import { resolveEnabledAgentRecord } from '../../utils/agents.js';
-import { findAgent } from '../../utils/utils.js';
 import { GUEST_SESSION_TTL_SECONDS, getSessionCookieMaxAge as getLocalSessionCookieMaxAge, mintGuestSessionJwt, mintSessionJwt } from '../auth/localService.js';
 import { waitForAgentReady } from '../utils/agentReadiness.js';
+import { getActiveRoutingSnapshot } from '../generation/runtimeContext.js';
 import {
     appendLog,
     appendSetCookie,
@@ -21,20 +16,7 @@ import {
     wantsJsonResponse,
 } from './shared.js';
 
-function readRouting() {
-    const dynamicRoutingFile = process.env.PLOINKY_ROUTING_FILE
-        || path.join(resolveCurrentWorkspaceRoot(), '.ploinky', 'routing.json');
-    const routingFile = fs.existsSync(dynamicRoutingFile) ? dynamicRoutingFile : ROUTING_FILE;
-    try {
-        return JSON.parse(fs.readFileSync(routingFile, 'utf8')) || {};
-    } catch (_) {
-        return {};
-    }
-}
-
-function resolveCurrentWorkspaceRoot() {
-    return String(process.env.PLOINKY_WORKSPACE_ROOT || '').trim() || PLOINKY_WORKSPACE_ROOT;
-}
+function activeRouting() { return getActiveRoutingSnapshot(); }
 
 async function waitForAgentRedirectReady(agentName) {
     const normalizedAgent = typeof agentName === 'string' ? agentName.trim() : '';
@@ -48,38 +30,11 @@ async function waitForAgentRedirectReady(agentName) {
     });
 }
 
-function readJsonFileIfExists(filePath) {
-    try {
-        if (!filePath || !fs.existsSync(filePath)) return null;
-        return JSON.parse(fs.readFileSync(filePath, 'utf8'));
-    } catch (_) {
-        return null;
-    }
-}
-
 function readEnabledAgentManifest(routeKey, routes = {}) {
     const normalizedRouteKey = String(routeKey || '').trim();
     if (!normalizedRouteKey) return null;
-
-    const routeHostPath = String(routes?.[normalizedRouteKey]?.hostPath || '').trim();
-    const routeManifest = readJsonFileIfExists(routeHostPath ? path.join(routeHostPath, 'manifest.json') : '');
-    if (routeManifest) return routeManifest;
-
-    let resolved = null;
-    try {
-        resolved = resolveEnabledAgentRecord(normalizedRouteKey);
-    } catch (_) {
-        resolved = null;
-    }
-    const record = resolved?.record || null;
-    if (!record?.repoName || !record?.agentName) return null;
-
-    try {
-        const found = findAgent(`${record.repoName}/${record.agentName}`);
-        return readJsonFileIfExists(found?.manifestPath || '');
-    } catch (_) {
-        return null;
-    }
+    const manifest = routes?.[normalizedRouteKey]?.manifest;
+    return manifest && typeof manifest === 'object' ? manifest : null;
 }
 
 function resolveSurfaceAuthRouteKey(surfaceName, targetRouteKey, routing = {}) {
@@ -106,7 +61,7 @@ function resolveSurfaceAuthRouteKey(surfaceName, targetRouteKey, routing = {}) {
 function resolveAuthRouteKey(parsedUrl) {
     const pathname = parsedUrl.pathname || '/';
     const parts = pathname.split('/').filter(Boolean);
-    const routing = readRouting();
+    const routing = activeRouting();
     const routes = routing.routes || {};
     const explicit = String(parsedUrl.searchParams.get('agent') || '').trim();
     const staticAgent = String(routing.static?.agent || '').trim();
@@ -119,13 +74,8 @@ function resolveAuthRouteKey(parsedUrl) {
     if (parts.length >= 1 && routes[parts[0]]) {
         const pathAgent = parts[0];
         if (explicit) return explicit;
-        try {
-            const resolved = resolveEnabledAgentRecord(pathAgent);
-            const pathAuthMode = String(resolved?.record?.auth?.mode || 'none').trim().toLowerCase() || 'none';
-            if (pathAuthMode !== 'none') {
-                return pathAgent;
-            }
-        } catch (_) { }
+        const pathAuthMode = String(routes[pathAgent]?.auth?.mode || 'none').trim().toLowerCase() || 'none';
+        if (pathAuthMode !== 'none') return pathAgent;
         if (!staticAgent) return pathAgent;
         if (staticAgent) return staticAgent;
     }
@@ -138,11 +88,7 @@ function resolveAuthContext(parsedUrl) {
     if (!routeKey) {
         return { routeKey: null, mode: 'none', policy: { mode: 'none' }, record: null };
     }
-    const resolved = resolveEnabledAgentRecord(routeKey);
-    const record = resolved?.record || null;
-    const policy = record?.auth || { mode: 'none' };
-    const mode = String(policy.mode || 'none').trim().toLowerCase() || 'none';
-    return { routeKey, mode, policy, record };
+    return resolveAuthContextForRouteKey(routeKey);
 }
 
 function resolveAuthContextForRouteKey(routeKey) {
@@ -150,11 +96,10 @@ function resolveAuthContextForRouteKey(routeKey) {
     if (!normalizedRouteKey) {
         return { routeKey: null, mode: 'none', policy: { mode: 'none' }, record: null };
     }
-    const resolved = resolveEnabledAgentRecord(normalizedRouteKey);
-    const record = resolved?.record || null;
-    const policy = record?.auth || { mode: 'none' };
+    const route = activeRouting().routes?.[normalizedRouteKey] || null;
+    const policy = route?.auth || { mode: 'none' };
     const mode = String(policy.mode || 'none').trim().toLowerCase() || 'none';
-    return { routeKey: normalizedRouteKey, mode, policy, record };
+    return { routeKey: normalizedRouteKey, mode, policy, record: route };
 }
 
 function isUserAuthenticatedAuthMode(mode) {
@@ -164,7 +109,7 @@ function isUserAuthenticatedAuthMode(mode) {
 
 function resolveAuthenticatedRouteAuthContext(routeKey) {
     const normalizedRouteKey = String(routeKey || '').trim();
-    const routing = readRouting();
+    const routing = activeRouting();
     const ownerContext = resolveAuthContextForRouteKey(normalizedRouteKey);
     if (isUserAuthenticatedAuthMode(ownerContext.mode)) return ownerContext;
 
@@ -208,7 +153,7 @@ export function resolveRouteDefaultHttpAccess(routeKey) {
         return { access: 'authenticated', routeKey: normalizedRouteKey, source: 'routeDefault' };
     }
 
-    const staticRouteKey = String(readRouting().static?.agent || '').trim();
+    const staticRouteKey = String(activeRouting().static?.agent || '').trim();
     if (staticRouteKey && staticRouteKey !== normalizedRouteKey) {
         const staticContext = resolveAuthContextForRouteKey(staticRouteKey);
         if (isUserAuthenticatedAuthMode(staticContext.mode)) {
@@ -220,6 +165,18 @@ export function resolveRouteDefaultHttpAccess(routeKey) {
     }
 
     return { access: 'guest', routeKey: normalizedRouteKey, source: 'routeDefault' };
+}
+
+export function resolveConventionDefaultHttpAccess(routeKey) {
+    const normalizedRouteKey = String(routeKey || '').trim();
+    if (!normalizedRouteKey) {
+        return { access: 'deny', status: 404, code: 'UNROUTABLE_PATH', routeKey: '', source: 'agentPortConventionDefault' };
+    }
+    return {
+        access: 'authenticated',
+        routeKey: normalizedRouteKey,
+        source: 'agentPortConventionDefault',
+    };
 }
 
 function getLocalRouteKey(parsedUrl, session = null, fallback = '') {

@@ -8,7 +8,7 @@ import {
     sanitizeRelativeRequestPath,
     toRealPathSafe
 } from '../utils/workspacePaths.js';
-import { ROUTING_FILE } from '../../utils/config.js';
+import { getActiveRoutingSnapshot } from '../generation/runtimeContext.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PROJECT_ROOT = path.resolve(__dirname, '../../..');
@@ -17,13 +17,7 @@ const MCP_BROWSER_CLIENT_FILE = path.resolve(PROJECT_ROOT, 'Agent/client/MCPBrow
 const PROJECT_WEB_LIBS = path.resolve(PROJECT_ROOT, 'webLibs');
 const WORKSPACE_FILES_URL_PREFIX = '/workspace-files/';
 
-function readRouting() {
-    try {
-        return JSON.parse(fs.readFileSync(ROUTING_FILE, 'utf8')) || {};
-    } catch (_) {
-        return {};
-    }
-}
+function readRouting() { return getActiveRoutingSnapshot(); }
 
 function getStaticHostPath() {
     const cfg = readRouting();

@@ -34,7 +34,7 @@ function extractShortAgentName(agentRef) {
     return tokens[tokens.length - 1];
 }
 
-function getAgentHostPort(agentName) {
+function getAgentPrimaryPort(agentName) {
     if (!agentName) return null;
     const shortName = extractShortAgentName(agentName);
     const routing = readRouting();
@@ -44,20 +44,8 @@ function getAgentHostPort(agentName) {
         route = Object.values(routes || {}).find(entry => entry && entry.agent === shortName) || null;
     }
     if (!route) return null;
-    if (Array.isArray(route.ports) && route.ports.length) {
-        const preferred = route.ports.find(p => p && (p.primary || p.name === 'http')) || route.ports[0];
-        const hostPort = parseInt(preferred?.hostPort, 10);
-        if (!Number.isNaN(hostPort) && hostPort > 0) return hostPort;
-    }
-    if (route.portMap && typeof route.portMap === 'object') {
-        const httpPort = parseInt(route.portMap.http, 10);
-        if (!Number.isNaN(httpPort) && httpPort > 0) return httpPort;
-        const first = Object.values(route.portMap).map(v => parseInt(v, 10)).find(v => !Number.isNaN(v) && v > 0);
-        if (first) return first;
-    }
-    const fallback = parseInt(route.hostPort, 10);
-    if (!Number.isNaN(fallback) && fallback > 0) return fallback;
-    return null;
+    const primary = Number(route.primaryService?.port);
+    return Number.isInteger(primary) && primary > 0 && primary <= 65535 ? primary : null;
 }
 
 function normalizeBaseUrl(raw) {
@@ -140,7 +128,7 @@ function gatherSsoStatus() {
         config,
         secrets: getSsoSecrets(),
         routerPort: getRouterPort(),
-        providerHostPort: getAgentHostPort(config.providerAgentShort)
+        providerAgentPort: getAgentPrimaryPort(config.providerAgentShort)
     };
 }
 
@@ -199,7 +187,7 @@ export {
     getSsoSecrets,
     gatherSsoStatus,
     getRouterPort,
-    getAgentHostPort,
+    getAgentPrimaryPort,
     normalizeBaseUrl,
     extractShortAgentName,
     bindSsoProvider,

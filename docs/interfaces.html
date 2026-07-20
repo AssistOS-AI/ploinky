@@ -31,7 +31,7 @@
         <section class="chapter-section">
           <h2>RoutingServer and Watchdog</h2>
           <p><code>cli/server/RoutingServer.js</code> owns HTTP request dispatch. <code>cli/server/Watchdog.js</code> owns process supervision, health-check restarts, restart backoff, and container monitoring. The router exposes a health endpoint at <code>/health</code>, browser assets, blob upload and download endpoints, and both router-level and agent-level MCP routes.</p>
-          <p>The router uses the active route table from <code>.ploinky/routing.json</code>. Its protected paths are authenticated before dispatch, except where a route is explicitly defined as public or where agent-delegated MCP verification must inspect the request body before making an auth decision.</p>
+          <p>The router captures <code>.ploinky/routing.json</code> and policy bytes into one content-addressed immutable generation. Request handling resolves only from the captured generation, and an authorization-to-dial lease must still be current immediately before an exec relay is used. Invalid replacement state deactivates routing rather than retaining or translating a legacy target.</p>
         </section>
 
         <section class="chapter-section">
@@ -90,7 +90,8 @@
         <section class="chapter-section">
           <h2>MCP and HTTP Service Paths</h2>
           <p>The router aggregates tools and resources at <code>/mcp</code>, while agent-specific MCP endpoints are exposed under <code>/&lt;agent&gt;/mcp</code>. Agent task-status passthrough lives at <code>/&lt;agent&gt;/task</code>. Public and authenticated HTTP service routes are defined separately and may inject compact auth headers for downstream agents; protected service invocation tokens bind the forwarded method, rewritten service path, query string, and body hash.</p>
-          <p>This split lets Ploinky expose first-party routing behavior and agent-specific protocol proxies without forcing every browser surface through the same transport semantics.</p>
+          <p>Primary agent requests and the conventional <code>/base-agent-additional-server/&lt;agent&gt;/&lt;port&gt;/&lt;suffix&gt;</code> surface converge on one immutable HTTP/1.1 route plan. The convention defaults to authenticated access and carries HTTP, streamed responses, SSE, and WebSocket traffic through a signed exec/stdio relay in the selected container. RoutingServer strips its own cookies and identity carriers, preserves independently permitted application credentials, and never discloses a relay address or host-side target port.</p>
+          <p>The public listener uses the operator-selected bind. The machine-call listener binds exactly to host <code>127.0.0.1:8081</code> and is enabled for container callers only after the runtime-owned host alias proves it reaches that loopback socket. The assertion binds caller and enable generation, target principal and port, method, path, body hash, active generation, expiry, and nonce. Its generation ACL must independently match the exact caller, target port, method, and canonical path before a private request can obtain a relay; wildcard ACL entries are rejected.</p>
         </section>
       </article>
     </div>

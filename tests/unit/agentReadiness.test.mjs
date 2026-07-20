@@ -1,93 +1,65 @@
-import { test } from 'node:test';
+import test from 'node:test';
 import assert from 'node:assert/strict';
-import net from 'node:net';
 
 import { waitForAgentReady } from '../../cli/server/utils/agentReadiness.js';
 import { buildBlockingReadinessEntryFromNode } from '../../cli/commands/workspaceUtil.js';
+import { compileGeneration } from '../../cli/server/generation/compileGeneration.js';
+import { generationInput } from './routingProxyTestFixtures.mjs';
 
-function listenOnEphemeralPort() {
-    return new Promise((resolve, reject) => {
-        const server = net.createServer((socket) => {
-            // Accept and immediately drop connections; the readiness probe
-            // only needs the TCP handshake to succeed for protocol 'tcp'.
-            socket.destroy();
-        });
-        server.once('error', reject);
-        server.listen(0, '127.0.0.1', () => {
-            const { port } = server.address();
-            resolve({ server, port });
-        });
-    });
+function route() {
+    return compileGeneration(generationInput()).routes.alpha;
 }
 
-function findFreePort() {
-    // Open a server to reserve a port number, then close it so the port is
-    // (almost certainly) free and refusing connections for the test.
-    return new Promise((resolve, reject) => {
-        const server = net.createServer();
-        server.once('error', reject);
-        server.listen(0, '127.0.0.1', () => {
-            const { port } = server.address();
-            server.close((err) => {
-                if (err) {
-                    reject(err);
-                    return;
-                }
-                resolve(port);
-            });
-        });
+test('waitForAgentReady probes only a confined primary service', async () => {
+    let observed;
+    const ready = await waitForAgentReady(route(), {
+        protocol: 'mcp',
+        timeoutMs: 100,
+        probe: async (selectedRoute, protocol) => {
+            observed = { selectedRoute, protocol };
+            return true;
+        },
     });
-}
-
-test('waitForAgentReady resolves true when the host port is open (tcp)', async () => {
-    const { server, port } = await listenOnEphemeralPort();
-    try {
-        const ready = await waitForAgentReady({ hostPort: port }, {
-            protocol: 'tcp',
-            timeoutMs: 2000,
-        });
-        assert.equal(ready, true);
-    } finally {
-        await new Promise((resolve) => server.close(resolve));
-    }
+    assert.equal(ready, true);
+    assert.equal(observed.selectedRoute.relay.kind, 'container-exec-stdio');
+    assert.equal(observed.selectedRoute.primaryService.port, 7000);
+    assert.equal(observed.protocol, 'mcp');
 });
-
-test('waitForAgentReady resolves false within the timeout for a closed port (tcp)', async () => {
-    const port = await findFreePort();
+test('waitForAgentReady is bounded and returns false when relay probes fail', async () => {
+    let attempts = 0;
     const startedAt = Date.now();
-    const ready = await waitForAgentReady({ hostPort: port }, {
+    const ready = await waitForAgentReady(route(), {
         protocol: 'tcp',
-        timeoutMs: 600,
-        intervalMs: 100,
-        probeTimeoutMs: 100,
+        timeoutMs: 60,
+        intervalMs: 10,
+        probe: async () => {
+            attempts += 1;
+            throw new Error('relay unavailable');
+        },
     });
-    const elapsedMs = Date.now() - startedAt;
     assert.equal(ready, false);
-    // Must give up around the timeout, not hang indefinitely.
-    assert.ok(elapsedMs < 4000, `expected to bail out fast, took ${elapsedMs}ms`);
+    assert.ok(attempts >= 2);
+    assert.ok(Date.now() - startedAt < 1000);
 });
 
-test('blocking startup readiness allows protocol none without a host port', () => {
+test('waitForAgentReady rejects routes without a relay primary descriptor', async () => {
+    assert.equal(await waitForAgentReady({ primaryService: { port: 7000 } }), false);
+    assert.equal(await waitForAgentReady({ relay: route().relay }), false);
+});
+
+test('blocking startup readiness allows protocol none without a primary relay', () => {
     const entry = buildBlockingReadinessEntryFromNode({
         id: 'worker',
         shortAgentName: 'worker',
-        isStatic: false,
-        manifest: {
-            readiness: { protocol: 'none' },
-        },
+        manifest: { readiness: { protocol: 'none' } },
     }, {}, 'explorer');
-
     assert.equal(entry.protocol, 'none');
-    assert.equal(entry.route?.hostPort, undefined);
 });
 
-test('blocking startup readiness still requires a host port for tcp agents', () => {
+test('blocking startup readiness requires a confined primary service', () => {
     assert.throws(() => buildBlockingReadinessEntryFromNode({
         id: 'api',
         shortAgentName: 'api',
-        isStatic: false,
-        manifest: {
-            readiness: { protocol: 'tcp' },
-        },
-    }, {}, 'explorer'), /did not expose a host port/);
+        manifest: { readiness: { protocol: 'tcp' } },
+    }, {}, 'explorer'), /no confined primary service/);
 });

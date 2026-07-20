@@ -47,6 +47,10 @@ export class FileSystemPolicyStateStore extends PolicyStateStore {
         return { found: true, document };
     }
 
+    readRawBytes() {
+        return fs.readFileSync(this._file());
+    }
+
     write(document) {
         const file = this._file();
         const dir = path.dirname(file);

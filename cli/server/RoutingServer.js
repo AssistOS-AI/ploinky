@@ -19,13 +19,27 @@ import {
     resolveRouteDefaultHttpAccess,
 } from './authHandlers/index.js';
 import {
-    loadApiRoutes,
+    buildHttpServiceAuthInfoHeader,
     handleRouterMcp,
-    handleHttpServiceRoute,
-    proxyHttpPassthrough
 } from './routerHandlers.js';
-import { collectHttpServiceRoutes, resolveHttpServiceRoute } from './httpServiceRoutes.js';
-import { handleProfileServerUpgrade, proxyProfileServer } from './profileServerProxy.js';
+import { buildServiceAgentPath, collectHttpServiceRoutes, resolveHttpServiceRoute } from './httpServiceRoutes.js';
+import { RoutingRuntime } from './generation/RoutingRuntime.js';
+import { classifyRequestAuthority, normalizeAuthority } from './generation/authority.js';
+import { clearRoutingRuntime, setRoutingRuntime } from './generation/runtimeContext.js';
+import { createRelayHttpAgent, executeHttpPlan, RelayDuplex } from './proxy/executeHttpPlan.js';
+import { executeWebSocketPlan } from './proxy/executeWebSocketPlan.js';
+import { sanitizeRequestHeaders } from './proxy/sanitizeRequestHeaders.js';
+import { recordProxyOutcome } from './proxy/recordProxyOutcome.js';
+import { locateAgentPort } from './agentPortConvention/locator.js';
+import { AGENT_PORT_CONVENTION_ROUTE_KEY } from '../utils/runtime/reservedRouteKeys.js';
+import { ROUTING_FILE } from '../utils/config.js';
+import { buildStatusLine, createCapturingRes } from './wsServiceProxy.js';
+import { finalizePlanAfterAdmission } from './proxy/RoutePlan.js';
+import { sha256RawBodyHash } from '../../Agent/lib/requestHash.mjs';
+import { createPrivateListener, createPrivateRouteHandler } from './privateListener.js';
+import { proveContainerLoopbackBinding } from './privateListenerBindings/containerLoopbackBinding.js';
+import { MachineCallAssertionService } from './security/tokens/MachineCallAssertionService.js';
+import { deriveAgentRequestSecret } from '../utils/security/masterKey.js';
 
 // Logging
 import { appendLog, logBootEvent, logMemoryUsage } from './utils/logger.js';
@@ -59,6 +73,13 @@ import {
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const MCP_BROWSER_CLIENT_PATH = path.resolve(__dirname, '../../Agent/client/MCPBrowserClient.js');
+const routerPort = process.env.PORT ? parseInt(process.env.PORT, 10) : 8080;
+const publicBind = String(process.env.PLOINKY_PUBLIC_BIND || '127.0.0.1').trim();
+const publicAuthority = normalizeAuthority(process.env.PLOINKY_PUBLIC_AUTHORITY || `${publicBind}:${routerPort}`, 'public');
+
+if ((publicBind === '0.0.0.0' || publicBind === '::') && !process.env.PLOINKY_PUBLIC_AUTHORITY) {
+    throw new Error('PLOINKY_PUBLIC_AUTHORITY is required for a wildcard public bind');
+}
 
 // Initialize TTY factories
 const { getWebchatFactory } = await initializeTTYFactories();
@@ -91,6 +112,40 @@ const globalState = {
     dashboard: { sessions: new Map() },
     status: { sessions: new Map() }
 };
+
+policy.httpRouteAccessPolicy.bindProviders({
+    manifestRouteProvider: createManifestRouteProvider(() => routingRuntime?.store.active?.routes || {}),
+    httpServiceProvider: createHttpServiceProvider(() => collectHttpServiceRoutes()),
+    routeDefaultProvider: ({ routeKey }) => resolveRouteDefaultHttpAccess(routeKey),
+});
+
+const routingRuntime = new RoutingRuntime({
+    routingFile: ROUTING_FILE,
+    policy,
+    publicAuthority,
+});
+setRoutingRuntime(routingRuntime);
+const machineCallAssertions = new MachineCallAssertionService({
+    resolveAgentSecret: deriveAgentRequestSecret,
+    generationStore: routingRuntime.store,
+});
+policy.repository.onMutation(() => {
+    try { routingRuntime.refresh(); } catch (error) {
+        appendLog('routing_generation_rejected', { error: error?.message || String(error) });
+    }
+});
+let privateServer = null;
+
+try {
+    routingRuntime.refresh();
+    routingRuntime.watch(error => appendLog('routing_generation_rejected', { error: error?.message || String(error) }));
+} catch (error) {
+    appendLog('routing_generation_inactive', { error: error?.message || String(error) });
+}
+
+function activeRoutes() {
+    return routingRuntime.store.active?.routes || {};
+}
 
 /**
  * Serve MCP Browser Client
@@ -140,6 +195,15 @@ function sendJsonResponse(res, statusCode, body, extraHeaders = {}) {
     res.end(data);
 }
 
+function rejectUpgrade(socket, captured, fallbackStatus = 401) {
+    const candidateStatus = Number(captured?.statusCode);
+    const status = candidateStatus >= 300 && candidateStatus <= 599 ? candidateStatus : fallbackStatus;
+    const headers = { ...(captured?.getHeaders?.() || {}), connection: 'close' };
+    try { socket.end(buildStatusLine(status, http.STATUS_CODES[status] || 'Request Rejected', headers)); } catch (_) {
+        try { socket.destroy(); } catch (_) {}
+    }
+}
+
 function decodePathSegment(value) {
     try {
         return decodeURIComponent(value || '');
@@ -148,25 +212,12 @@ function decodePathSegment(value) {
     }
 }
 
-function extractAgentName(pathname, routes = loadApiRoutes()) {
+function extractAgentName(pathname, routes = {}) {
     const parts = String(pathname || '').split('/').filter(Boolean);
     if (!parts.length) return null;
     const agentName = decodePathSegment(parts[0]).trim();
     if (!agentName || !routes?.[agentName]) return null;
     return agentName;
-}
-
-function extractProfileServerHostAgentName(hostHeader, routes = loadApiRoutes()) {
-    const host = String(hostHeader || '').split(':')[0].trim().toLowerCase();
-    if (!host.endsWith('.localhost')) return null;
-    const label = host.slice(0, -'.localhost'.length);
-    if (!label) return null;
-    for (const routeKey of Object.keys(routes || {})) {
-        if (String(routeKey || '').toLowerCase() === label && routes[routeKey]?.additionalServerPort) {
-            return routeKey;
-        }
-    }
-    return null;
 }
 
 function isRouterOwnedPath(pathname) {
@@ -179,6 +230,7 @@ function isRouterOwnedPath(pathname) {
         || pathname === '/api/marketplace'
         || pathname.startsWith('/api/marketplace/')
         || pathname.startsWith('/api/router/')
+        || pathname === '/api/agent-port-locator'
         // Internal, non-policy-routable router-owned routes (DS014).
         || pathname === '/policy/command'
         || pathname === '/metrics'
@@ -211,10 +263,6 @@ function buildAgentProxyPath(agentName, parsedUrl) {
     return `${upstreamPath || '/'}${parsedUrl?.search || ''}`;
 }
 
-function buildRootProxyPath(parsedUrl) {
-    return `${parsedUrl?.pathname || '/'}${parsedUrl?.search || ''}`;
-}
-
 function hasDelegatedAgentAssertion(req) {
     // Agent-to-agent calls carry an Agent Assertion as `Authorization: Bearer`.
     // Browser callers use session cookies, so a bearer at /<agent>/mcp signals an
@@ -235,7 +283,7 @@ function isAgentTaskStatusProxyPath(agentProxyPath) {
     return value === '/task' || value === '/getTaskStatus';
 }
 
-function getStaticRouteName(routes = loadApiRoutes()) {
+function getStaticRouteName(routes = {}) {
     const staticAgent = staticSrv.getStaticAgentName();
     if (!staticAgent) return null;
     const shortName = staticAgent.includes('/') ? staticAgent.split('/').pop() : staticAgent;
@@ -248,18 +296,39 @@ function getStaticRouteName(routes = loadApiRoutes()) {
     return null;
 }
 
-function requestAgentCard(route, agentName, identityHeaders = {}) {
-    return new Promise((resolve) => {
+async function requestAgentCard(_route, agentName, identityHeaders = {}) {
+    let lease;
+    let channel;
+    let relayAgent;
+    try {
+        lease = routingRuntime.acquire({ listenerClass: 'public', authority: publicAuthority });
+        const plan = finalizePlanAfterAdmission(routingRuntime.resolvePrimary({
+            lease,
+            routeKey: agentName,
+            method: 'GET',
+            externalPath: `/${encodeURIComponent(agentName)}/agent-card`,
+            targetPath: '/agent-card',
+            authority: publicAuthority,
+        }));
+        if (!plan) throw new Error('primary service unavailable');
+        const applicationHeaders = sanitizeRequestHeaders(identityHeaders, plan, {});
+        applicationHeaders.accept = 'application/json';
+        channel = await routingRuntime.relayManager.checkout({ plan, lease, authorized: true });
+        const relayStream = await channel.openRequest({
+            plan,
+            bodyMode: 'none-v1',
+            bodyHash: sha256RawBodyHash(Buffer.alloc(0)),
+            headers: applicationHeaders,
+        });
+        const connection = new RelayDuplex(relayStream);
+        relayAgent = createRelayHttpAgent(connection);
+        return await new Promise((resolve) => {
         const upstream = http.request({
-            hostname: '127.0.0.1',
-            port: route.hostPort,
             path: '/agent-card',
             method: 'GET',
-            headers: {
-                accept: 'application/json',
-                ...identityHeaders
-            },
-            timeout: 5000
+            headers: applicationHeaders,
+            timeout: 5000,
+            agent: relayAgent,
         }, upstreamRes => {
             const chunks = [];
             upstreamRes.on('data', chunk => chunks.push(chunk));
@@ -312,6 +381,14 @@ function requestAgentCard(route, agentName, identityHeaders = {}) {
         });
         upstream.end();
     });
+    } catch (error) {
+        lease?.release();
+        return { ok: false, error: { name: agentName, error: error?.message || String(error) } };
+    } finally {
+        relayAgent?.destroy();
+        channel?.close();
+        lease?.release();
+    }
 }
 
 async function handleRoutedAggregateAgentCard(req, res) {
@@ -320,9 +397,9 @@ async function handleRoutedAggregateAgentCard(req, res) {
         sendJsonResponse(res, 405, { error: 'method_not_allowed' }, { Allow: 'GET' });
         return;
     }
-    const apiRoutes = loadApiRoutes();
+    const apiRoutes = activeRoutes();
     const candidates = Object.entries(apiRoutes || {})
-        .filter(([, route]) => route && !route.disabled && route.hostPort);
+        .filter(([, route]) => route && route.enabled && route.relay && route.primaryService);
     const results = await Promise.all(candidates.map(([agentName, route]) =>
         requestAgentCard(route, agentName, req.headers)
             .catch(error => ({
@@ -349,16 +426,69 @@ async function handleRoutedAggregateAgentCard(req, res) {
  * Main request processor
  */
 async function processRequest(req, res) {
-    const parsedUrl = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
+    let classification;
+    try {
+        classification = classifyRequestAuthority(req, {
+            expectedAuthority: publicAuthority,
+            scheme: req.socket?.encrypted ? 'https' : 'http',
+        });
+    } catch (error) {
+        sendJsonResponse(res, error?.status || 400, { error: error?.status === 404 ? 'route_not_found' : 'invalid_authority' });
+        return;
+    }
+    req.url = classification.requestTarget;
+    req.headers.host = classification.authority;
+    const parsedUrl = new URL(req.url, `http://${classification.authority}`);
     const pathname = parsedUrl.pathname || '/';
     const routedAggregateAgentCard = pathname === '/agent-card' || pathname === '/agent-card/';
-    const apiRoutes = loadApiRoutes();
-    const profileServerHostAgentName = extractProfileServerHostAgentName(req.headers.host, apiRoutes);
-    const agentName = profileServerHostAgentName || (isRouterOwnedPath(pathname) ? null : extractAgentName(pathname, apiRoutes));
+    const apiRoutes = activeRoutes();
+    let generationLease = null;
+    let conventionPlan = null;
+    const conventionPrefix = `/${AGENT_PORT_CONVENTION_ROUTE_KEY}`;
+    if (String(req.url || '').split('?', 1)[0] === conventionPrefix
+        || String(req.url || '').startsWith(`${conventionPrefix}/`)) {
+        try {
+            generationLease = routingRuntime.acquire({ listenerClass: 'public', authority: req.headers.host });
+            conventionPlan = routingRuntime.resolveConvention({
+                lease: generationLease,
+                requestTarget: req.url || '/',
+                method: req.method || 'GET',
+                authority: req.headers.host,
+                listenerClass: 'public',
+                scheme: req.socket?.encrypted ? 'https' : 'http',
+                transport: 'http',
+            });
+        } catch (error) {
+            generationLease?.release();
+            const status = error?.name === 'AgentPortSelectorError' ? error.status || 400
+                : error?.message?.includes('owner is not active') ? 404 : 503;
+            sendJsonResponse(res, status, { error: status === 400 ? 'invalid_agent_port_selector' : status === 404 ? 'agent_not_found' : 'routing_unavailable' });
+            return;
+        }
+    }
+    const agentName = isRouterOwnedPath(pathname) || conventionPlan ? null : extractAgentName(pathname, apiRoutes);
     const route = agentName ? apiRoutes[agentName] : null;
-    const agentProxyPath = profileServerHostAgentName
-        ? buildRootProxyPath(parsedUrl)
-        : (agentName ? buildAgentProxyPath(agentName, parsedUrl) : '');
+    const agentProxyPath = agentName ? buildAgentProxyPath(agentName, parsedUrl) : '';
+    let primaryLease = null;
+    let primaryPlan = null;
+    if (agentName) {
+        try {
+            primaryLease = routingRuntime.acquire({ listenerClass: 'public', authority: req.headers.host });
+            primaryPlan = routingRuntime.resolvePrimary({
+                lease: primaryLease,
+                routeKey: agentName,
+                method: req.method || 'GET',
+                externalPath: pathname,
+                targetPath: pathOnly(agentProxyPath),
+                query: parsedUrl.search ? parsedUrl.search.slice(1) : '',
+                authority: req.headers.host,
+                scheme: req.socket?.encrypted ? 'https' : 'http',
+            });
+        } catch (_) {
+            primaryLease?.release();
+            primaryLease = null;
+        }
+    }
     const isAgentMcpRoute = Boolean(agentName && (agentProxyPath === '/mcp' || agentProxyPath.startsWith('/mcp?') || agentProxyPath.startsWith('/mcp/')));
     // Path-exact delegated agent OpenAI bypass: ONLY POST /<routeKey>/v1/chat/completions
     // with an Agent Assertion. No other agent-prefixed HTTP path uses this bypass.
@@ -368,19 +498,70 @@ async function processRequest(req, res) {
         agentProxyPath,
         req,
     });
-    const serviceDefinition = !agentName && !profileServerHostAgentName && !isRouterOwnedPath(pathname)
-        ? resolveHttpServiceRoute(pathname)
-        : null;
+    let serviceDefinition = null;
+    let serviceLease = null;
+    let servicePlan = null;
+    if (!agentName && !conventionPlan && !isRouterOwnedPath(pathname)) {
+        try {
+            serviceLease = routingRuntime.acquire({ listenerClass: 'public', authority: req.headers.host });
+            serviceDefinition = resolveHttpServiceRoute(pathname, {
+                routes: serviceLease.generation.routes,
+            });
+            if (!serviceDefinition) {
+                serviceLease.release();
+                serviceLease = null;
+            }
+        } catch (_) {
+            serviceLease?.release();
+            serviceLease = null;
+        }
+    }
+    if (serviceDefinition && serviceLease) {
+        try {
+            const target = buildServiceAgentPath(pathname, parsedUrl.search, serviceDefinition.externalPrefix, serviceDefinition.internalPrefix);
+            servicePlan = routingRuntime.resolvePrimary({
+                lease: serviceLease,
+                routeKey: serviceDefinition.routeKey,
+                method: req.method || 'GET',
+                externalPath: pathname,
+                targetPath: pathOnly(target),
+                query: target.includes('?') ? target.slice(target.indexOf('?') + 1) : '',
+                forwardedPrefix: serviceDefinition.externalPrefix,
+                declaredAccess: serviceDefinition.access,
+                declaredGuestScope: serviceDefinition.guestScope,
+                authority: req.headers.host,
+                scheme: req.socket?.encrypted ? 'https' : 'http',
+            });
+            if (!servicePlan) {
+                serviceLease.release();
+                serviceLease = null;
+            }
+        } catch (_) {
+            serviceLease?.release();
+            serviceLease = null;
+        }
+    }
+    const releaseSelectionLeases = () => {
+        generationLease?.release();
+        primaryLease?.release();
+        serviceLease?.release();
+    };
     const policyGatedRouteKey = agentName && !isAgentMcpRoute
         ? agentName
         : serviceDefinition?.routeKey || '';
-    const httpRouteAccess = (!profileServerHostAgentName && agentName && !isAgentMcpRoute) || serviceDefinition
+    const unavailableServiceAccess = serviceDefinition && !servicePlan ? {
+        access: serviceDefinition.access,
+        routeKey: serviceDefinition.routeKey,
+        guestScope: serviceDefinition.guestScope,
+        source: 'generation-http-service',
+    } : null;
+    const httpRouteAccess = conventionPlan?.access || primaryPlan?.access || servicePlan?.access || unavailableServiceAccess || ((agentName && !isAgentMcpRoute)
         ? policy.httpRouteAccessPolicy.evaluate({
             pathname,
             method: req.method || 'GET',
             routeKey: policyGatedRouteKey,
         })
-        : null;
+        : null);
     const isDelegatedAgentTaskStatusRoute = Boolean(
         agentName
         && !isAgentMcpRoute
@@ -434,6 +615,7 @@ async function processRequest(req, res) {
     // passthrough handling can forward one to an agent. Generic 404 so the reply
     // does not confirm the internal route exists.
     if (hasInternalAgentSegment(pathname)) {
+        releaseSelectionLeases();
         sendJsonResponse(res, 404, { error: 'not_found' });
         return;
     }
@@ -452,6 +634,34 @@ async function processRequest(req, res) {
     if (pathname === '/api/marketplace' || pathname.startsWith('/api/marketplace/')) {
         const handled = await handleMarketplaceRoutes(req, res, parsedUrl);
         if (handled) return;
+    }
+
+    if (pathname === '/api/agent-port-locator') {
+        const authResult = await ensureAuthenticated(req, res, parsedUrl);
+        if (!authResult.ok || !req.user) return;
+        const routeKey = String(parsedUrl.searchParams.get('agent') || '').trim();
+        const selectedPort = Number(parsedUrl.searchParams.get('port'));
+        const policyPath = `/${AGENT_PORT_CONVENTION_ROUTE_KEY}/${encodeURIComponent(routeKey)}/${selectedPort}/`;
+        let locatorLease;
+        try {
+            locatorLease = routingRuntime.acquire({ listenerClass: 'public', authority: req.headers.host });
+            const plan = routingRuntime.resolveConvention({
+                lease: locatorLease,
+                requestTarget: policyPath,
+                method: 'GET',
+                authority: req.headers.host,
+                listenerClass: 'public',
+                scheme: req.socket?.encrypted ? 'https' : 'http',
+            });
+            if (!plan || plan.access.access === 'deny') throw new Error('locator policy denied');
+            const locator = locateAgentPort({ generation: locatorLease.generation, routeKey, port: selectedPort, authenticated: true });
+            sendJsonResponse(res, 200, { url: locator.url, generationDigest: locator.generationDigest }, { 'Cache-Control': 'no-store' });
+        } catch (_) {
+            sendJsonResponse(res, 503, { error: 'locator_unavailable' }, { 'Cache-Control': 'no-store' });
+        } finally {
+            locatorLease?.release();
+        }
+        return;
     }
 
     // Single administrative endpoint for router access-control policy (DS014).
@@ -502,6 +712,7 @@ async function processRequest(req, res) {
                 agentProxyExtraHeaders = { authorization: `Bearer ${ctx.token}` };
             }
         } catch (error) {
+            releaseSelectionLeases();
             sendJsonResponse(res, 401, {
                 error: 'delegated_task_status_rejected',
                 reason: error?.message || 'delegated task status verification failed',
@@ -511,7 +722,10 @@ async function processRequest(req, res) {
     } else if (agentName && isAgentMcpRoute) {
         // Browser MCP keeps the existing surface auth (static fallback included).
         const authResult = await ensureAuthenticated(req, res, parsedUrl);
-        if (!authResult.ok) return;
+        if (!authResult.ok) {
+            releaseSelectionLeases();
+            return;
+        }
     } else if (isDelegatedAgentOpenAi) {
         // Agent-to-agent OpenAI call: the delegation handler verifies the HTTP
         // Agent Assertion against the buffered body and mints a router-request
@@ -519,10 +733,86 @@ async function processRequest(req, res) {
     } else if (httpRouteAccess) {
         // One executor for transparent agent routes and declared HTTP services.
         const accessResult = await ensureHttpRouteAccess(req, res, parsedUrl, httpRouteAccess);
-        if (!accessResult.ok) return;
+        if (!accessResult.ok) {
+            if (conventionPlan) {
+                recordProxyOutcome({
+                    plan: conventionPlan,
+                    outcome: 'denied',
+                    status: res.statusCode || 403,
+                    leaseOutcome: 'released',
+                    relayOutcome: 'not_started',
+                    upstreamOutcome: 'not_started',
+                    sink: event => appendLog(event.event, event),
+                });
+            }
+            releaseSelectionLeases();
+            return;
+        }
     } else {
         const authResult = await ensureAuthenticated(req, res, parsedUrl);
-        if (!authResult.ok) return;
+        if (!authResult.ok) {
+            releaseSelectionLeases();
+            return;
+        }
+    }
+
+    if (conventionPlan) {
+        return executeHttpPlan({
+            req,
+            res,
+            plan: conventionPlan,
+            lease: generationLease,
+            relayManager: routingRuntime.relayManager,
+            authorized: true,
+            trustedHeaders: req.user?.id ? { userId: req.user.id } : {},
+            auditSink: event => appendLog(event.event, event),
+        });
+    }
+
+
+    if (primaryPlan && !isAgentMcpRoute && !isDelegatedAgentOpenAi) {
+        return executeHttpPlan({
+            req,
+            res,
+            plan: primaryPlan,
+            lease: primaryLease,
+            relayManager: routingRuntime.relayManager,
+            authorized: true,
+            trustedHeaders: {
+                ...(req.user?.id ? { userId: req.user.id } : {}),
+                applicationHeaders: agentProxyExtraHeaders,
+            },
+            auditSink: event => appendLog(event.event, event),
+        });
+    }
+
+    if (servicePlan) {
+        return executeHttpPlan({
+            req,
+            res,
+            plan: servicePlan,
+            lease: serviceLease,
+            relayManager: routingRuntime.relayManager,
+            authorized: true,
+            trustedHeadersFactory: ({ bodyHash }) => {
+                const identityHeaders = buildHttpServiceAuthInfoHeader(req, parsedUrl, serviceDefinition, {
+                    bodyHash,
+                    servicePath: servicePlan.unmatchedSuffix,
+                });
+                return {
+                    ...(req.user?.id ? { userId: req.user.id } : {}),
+                    ...(identityHeaders['x-ploinky-auth-info']
+                        ? { authInfo: identityHeaders['x-ploinky-auth-info'] }
+                        : {}),
+                };
+            },
+            auditSink: event => appendLog(event.event, event),
+        });
+    }
+
+    if (serviceDefinition) {
+        sendJsonResponse(res, 503, { error: 'service_runtime_unavailable' });
+        return;
     }
 
     // Router-owned: mint a router-signed user identity key. Reached only after
@@ -546,26 +836,29 @@ async function processRequest(req, res) {
         return handleBlobs(req, res);
     } else if (staticSrv.serveWorkspaceFileRequest(req, res)) {
         return;
-    } else if (handleHttpServiceRoute(req, res, parsedUrl)) {
-        return;
     } else if (routedAggregateAgentCard) {
         return handleRoutedAggregateAgentCard(req, res);
-    } else if (profileServerHostAgentName) {
-        return proxyProfileServer(req, res, route, agentProxyPath, agentProxyExtraHeaders);
     } else if (agentName) {
         if (!route) {
             sendJsonResponse(res, 404, { error: 'agent_not_found', agent: agentName });
             return;
         }
-        if (!route.hostPort) {
-            sendJsonResponse(res, 404, { error: 'agent_not_found', agent: agentName });
+        if (!primaryPlan) {
+            primaryLease?.release();
+            sendJsonResponse(res, 503, { error: 'agent_runtime_unavailable', agent: agentName });
             return;
         }
         if (isAgentMcpRoute) {
+            primaryLease.release();
             return handleAgentMcpRequest(req, res, route, agentName);
         }
         if (isDelegatedAgentOpenAi) {
-            return handleDelegatedAgentOpenAiCall(req, res, route, agentName, agentProxyPath);
+            return handleDelegatedAgentOpenAiCall(req, res, route, agentName, agentProxyPath, {
+                plan: primaryPlan,
+                lease: primaryLease,
+                relayManager: routingRuntime.relayManager,
+                auditSink: event => appendLog(event.event, event),
+            });
         }
         // `__agent` control-plane paths are already refused at the top of the
         // dispatch (before http-service/passthrough handling), so anything that
@@ -573,7 +866,9 @@ async function processRequest(req, res) {
         if (await staticSrv.serveAgentStaticRequest(req, res)) {
             return;
         }
-        return proxyHttpPassthrough(req, res, route.hostPort, agentProxyPath, agentProxyExtraHeaders);
+        primaryLease?.release();
+        sendJsonResponse(res, 503, { error: 'agent_runtime_unavailable', agent: agentName });
+        return;
     } else if (pathname === '/mcp' || pathname === '/mcp/') {
         return handleRouterMcp(req, res);
     } else {
@@ -614,22 +909,181 @@ const server = http.createServer((req, res) => {
 
 server.on('upgrade', async (req, socket, head) => {
     try {
-        const parsedUrl = new URL(req.url, `http://${req.headers.host || 'router.local'}`);
-        const apiRoutes = loadApiRoutes();
-        const profileServerHostAgentName = extractProfileServerHostAgentName(req.headers.host, apiRoutes);
-        if (profileServerHostAgentName) {
-            const handled = await handleProfileServerUpgrade({
-                req,
-                socket,
-                head,
-                route: apiRoutes[profileServerHostAgentName],
-                agentProxyPath: buildRootProxyPath(parsedUrl),
-                parsedUrl
+        let classification;
+        try {
+            classification = classifyRequestAuthority(req, {
+                expectedAuthority: publicAuthority,
+                scheme: req.socket?.encrypted ? 'https' : 'http',
             });
-            if (handled) return;
+        } catch (error) {
+            socket.end(buildStatusLine(error?.status || 400, http.STATUS_CODES[error?.status || 400], {
+                connection: 'close',
+                'cache-control': 'no-store',
+            }));
+            return;
         }
-        const handled = await handleHttpServiceUpgrade({ req, socket, head, parsedUrl, policy });
-        if (!handled) { socket.write('HTTP/1.1 404 Not Found\r\n\r\n'); socket.destroy(); }
+        req.url = classification.requestTarget;
+        req.headers.host = classification.authority;
+        const parsedUrl = new URL(req.url, `http://${classification.authority}`);
+        const conventionPrefix = `/${AGENT_PORT_CONVENTION_ROUTE_KEY}`;
+        if (String(req.url || '').split('?', 1)[0] === conventionPrefix
+            || String(req.url || '').startsWith(`${conventionPrefix}/`)) {
+            let lease;
+            try {
+                lease = routingRuntime.acquire({ listenerClass: 'public', authority: req.headers.host });
+                const plan = routingRuntime.resolveConvention({
+                    lease,
+                    requestTarget: req.url || '/',
+                    method: 'GET',
+                    authority: req.headers.host,
+                    listenerClass: 'public',
+                    scheme: req.socket?.encrypted ? 'https' : 'http',
+                    transport: 'websocket',
+                });
+                const captured = createCapturingRes();
+                const access = await ensureHttpRouteAccess(req, captured, parsedUrl, plan.access);
+                if (!access.ok) {
+                    recordProxyOutcome({
+                        plan,
+                        outcome: 'denied',
+                        status: captured.statusCode || 403,
+                        leaseOutcome: 'released',
+                        relayOutcome: 'not_started',
+                        upstreamOutcome: 'not_started',
+                        sink: event => appendLog(event.event, event),
+                    });
+                    lease.release();
+                    rejectUpgrade(socket, captured);
+                    return;
+                }
+                await executeWebSocketPlan({
+                    req,
+                    socket,
+                    head,
+                    plan,
+                    lease,
+                    relayManager: routingRuntime.relayManager,
+                    authorized: true,
+                    trustedHeaders: req.user?.id ? { userId: req.user.id } : {},
+                    auditSink: event => appendLog(event.event, event),
+                });
+                return;
+            } catch (_) {
+                lease?.release();
+                socket.end('HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n');
+                return;
+            }
+        }
+        let serviceLease;
+        let definition;
+        try {
+            serviceLease = routingRuntime.acquire({ listenerClass: 'public', authority: req.headers.host });
+            definition = resolveHttpServiceRoute(parsedUrl.pathname, {
+                routes: serviceLease.generation.routes,
+            });
+            if (!definition) {
+                serviceLease.release();
+                serviceLease = null;
+            }
+        } catch (_) {
+            serviceLease?.release();
+            serviceLease = null;
+        }
+        if (definition && serviceLease) {
+            try {
+                const target = buildServiceAgentPath(parsedUrl.pathname, parsedUrl.search, definition.externalPrefix, definition.internalPrefix);
+                const plan = routingRuntime.resolvePrimary({
+                    lease: serviceLease,
+                    routeKey: definition.routeKey,
+                    method: 'GET',
+                    externalPath: parsedUrl.pathname,
+                    targetPath: pathOnly(target),
+                    query: target.includes('?') ? target.slice(target.indexOf('?') + 1) : '',
+                    forwardedPrefix: definition.externalPrefix,
+                    declaredAccess: definition.access,
+                    declaredGuestScope: definition.guestScope,
+                    authority: req.headers.host,
+                    scheme: req.socket?.encrypted ? 'https' : 'http',
+                    transport: 'websocket',
+                });
+                if (!plan) throw new Error('service runtime unavailable');
+                const captured = createCapturingRes();
+                const access = await ensureHttpRouteAccess(req, captured, parsedUrl, plan.access);
+                if (!access.ok) {
+                    serviceLease.release();
+                    rejectUpgrade(socket, captured);
+                    return;
+                }
+                await executeWebSocketPlan({
+                    req, socket, head, plan, lease: serviceLease,
+                    relayManager: routingRuntime.relayManager,
+                    authorized: true,
+                    trustedHeaders: (() => {
+                        const identityHeaders = buildHttpServiceAuthInfoHeader(req, parsedUrl, definition, {
+                            bodyHash: sha256RawBodyHash(Buffer.alloc(0)),
+                            servicePath: target,
+                        });
+                        return {
+                            ...(req.user?.id ? { userId: req.user.id } : {}),
+                            ...(identityHeaders['x-ploinky-auth-info']
+                                ? { authInfo: identityHeaders['x-ploinky-auth-info'] }
+                                : {}),
+                        };
+                    })(),
+                    auditSink: event => appendLog(event.event, event),
+                });
+                return;
+            } catch (_) {
+                serviceLease?.release();
+                socket.end('HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n');
+                return;
+            }
+        }
+        const routes = activeRoutes();
+        const agentName = isRouterOwnedPath(parsedUrl.pathname) ? null : extractAgentName(parsedUrl.pathname, routes);
+        if (agentName) {
+            let lease;
+            try {
+                lease = routingRuntime.acquire({ listenerClass: 'public', authority: req.headers.host });
+                const target = buildAgentProxyPath(agentName, parsedUrl);
+                const plan = routingRuntime.resolvePrimary({
+                    lease,
+                    routeKey: agentName,
+                    method: 'GET',
+                    externalPath: parsedUrl.pathname,
+                    targetPath: pathOnly(target),
+                    query: parsedUrl.search.slice(1),
+                    authority: req.headers.host,
+                    scheme: req.socket?.encrypted ? 'https' : 'http',
+                    transport: 'websocket',
+                });
+                if (!plan) throw new Error('agent runtime unavailable');
+                const captured = createCapturingRes();
+                const access = await ensureHttpRouteAccess(req, captured, parsedUrl, plan.access);
+                if (!access.ok) {
+                    lease.release();
+                    rejectUpgrade(socket, captured);
+                    return;
+                }
+                await executeWebSocketPlan({
+                    req,
+                    socket,
+                    head,
+                    plan,
+                    lease,
+                    relayManager: routingRuntime.relayManager,
+                    authorized: true,
+                    trustedHeaders: req.user?.id ? { userId: req.user.id } : {},
+                    auditSink: event => appendLog(event.event, event),
+                });
+                return;
+            } catch (_) {
+                lease?.release();
+                socket.end('HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n');
+                return;
+            }
+        }
+        socket.write('HTTP/1.1 404 Not Found\r\n\r\n'); socket.destroy();
     } catch (_) {
         try { socket.destroy(); } catch (_) {}
     }
@@ -637,6 +1091,11 @@ server.on('upgrade', async (req, socket, head) => {
 
 // Setup process lifecycle management
 const lifecycle = setupProcessLifecycle(server, globalState, agentSessionStore);
+server.once('close', () => {
+    privateServer?.close();
+    routingRuntime.close();
+    clearRoutingRuntime(routingRuntime);
+});
 
 // Server error handlers
 server.on('error', (error) => {
@@ -668,39 +1127,55 @@ server.on('clientError', (error, socket) => {
 });
 
 // Start server
-const port = process.env.PORT ? parseInt(process.env.PORT, 10) : 8080;
-server.listen(port, () => {
-    console.log(`[RoutingServer] Ploinky server running on http://127.0.0.1:${port}`);
+const port = routerPort;
+server.listen(port, publicBind, () => {
+    console.log(`[RoutingServer] Ploinky server running on http://${publicAuthority}`);
     console.log('  Dashboard:       /dashboard');
     console.log('  WebChat:         /webchat');
     console.log('  Status:          /status');
     console.log('  Health:          /health');
     console.log('  Agent routes:    /<agent>/{mcp,task,agent-card,v1/models,v1/chat/completions}');
-    console.log('  Agent servers:   http://<agent>.localhost:<port>/');
+    console.log(`  Agent ports:     /${AGENT_PORT_CONVENTION_ROUTE_KEY}/<agent>/<port>/`);
     console.log('  Aggregate cards: /agent-card');
     appendLog('server_start', { port });
     logBootEvent('server_listening', { port });
+
+    const proofRoute = Object.values(activeRoutes()).find(candidate => candidate?.relay);
+    if (proofRoute) {
+        const relay = proofRoute.relay;
+        createPrivateListener({
+            handler: createPrivateRouteHandler({
+                runtime: routingRuntime,
+                assertionService: machineCallAssertions,
+                auditSink: event => appendLog(event.event, event),
+            }),
+            proveBinding: proof => proveContainerLoopbackBinding({
+                ...proof,
+                runtime: relay.runtime,
+                containerId: relay.containerId,
+                hostAlias: relay.runtime === 'podman' ? 'host.containers.internal' : 'host.docker.internal',
+            }),
+        }).then(listener => {
+            privateServer = listener;
+            appendLog('private_listener_enabled', { bind: '127.0.0.1', port: 8081 });
+        }).catch(error => {
+            appendLog('private_listener_disabled', { error: error?.message || String(error) });
+        });
+    } else {
+        appendLog('private_listener_disabled', { error: 'no trusted container runtime proof route' });
+    }
 
     // Bootstrap MCP tool policy from each enabled agent's mcp-config tags
     // (persisted admin policy always wins). Without this, fail-closed
     // enforcement would deny every tool call because no entries exist yet.
     try {
-        const { added } = policy.mcpToolPolicy.bootstrap(loadApiRoutes());
+        const { added } = policy.mcpToolPolicy.bootstrap(activeRoutes());
         appendLog('mcp_policy_bootstrap', { added });
     } catch (err) {
         appendLog('mcp_policy_bootstrap_error', { error: err?.message || String(err) });
     }
 
-    try {
-        policy.httpRouteAccessPolicy.bindProviders({
-            manifestRouteProvider: createManifestRouteProvider(() => loadApiRoutes()),
-            httpServiceProvider: createHttpServiceProvider(() => collectHttpServiceRoutes()),
-            routeDefaultProvider: ({ routeKey }) => resolveRouteDefaultHttpAccess(routeKey),
-        });
-        appendLog('http_route_access_providers_bound', {});
-    } catch (err) {
-        appendLog('http_route_access_providers_bind_error', { error: err?.message || String(err) });
-    }
+    appendLog('http_route_access_providers_bound', {});
 
     // Log initial memory usage
     logMemoryUsage();

@@ -106,15 +106,12 @@ export function listCurrentAgents() {
             const created = r.createdAt || '-';
             const binds = r.config?.binds ? r.config.binds.length : 0;
             const envs = r.config?.env ? r.config.env.length : 0;
-            const ports = r.config?.ports
-                ? r.config.ports.map(p => `${p.containerPort}->${p.hostPort}`).join(', ')
-                : '';
             console.log(`- ${styles.name(name)}`);
             console.log(`    ${styles.label('type')}: ${type}  ${styles.label('agent')}: ${styles.accent(agent)}  ${styles.label('repo')}: ${styles.accent(repo)}`);
             console.log(`    ${styles.label('image')}: ${img}`);
             console.log(`    ${styles.label('created')}: ${created}`);
             console.log(`    ${styles.label('cwd')}: ${cwd}`);
-            console.log(`    ${styles.label('binds')}: ${binds}  ${styles.label('env')}: ${envs}${ports ? `  ${styles.label('ports')}: ${ports}` : ''}`);
+            console.log(`    ${styles.label('binds')}: ${binds}  ${styles.label('env')}: ${envs}`);
         }
         return;
     }
@@ -122,10 +119,6 @@ export function listCurrentAgents() {
     for (const entry of live) {
         const binds = entry.config?.binds?.length || 0;
         const envs = entry.config?.env?.length || 0;
-        const ports = (entry.config?.ports || [])
-            .map(p => `${p.containerPort}->${p.hostPort || ''}`)
-            .filter(Boolean)
-            .join(', ');
         const status = (entry.state?.status || '-').toLowerCase();
         const statusFormatter = ({
             running: styles.success,
@@ -145,9 +138,6 @@ export function listCurrentAgents() {
             `${styles.label('binds')}: ${binds}`,
             `${styles.label('env')}: ${envs}`
         ];
-        if (ports) {
-            resourceParts.push(`${styles.label('ports')}: ${ports}`);
-        }
         console.log(`     ${resourceParts.join('  ')}`);
         console.log('');
     }
@@ -270,11 +260,12 @@ export function listRoutes() {
         if (Object.keys(routes).length) {
             console.log('- Routes:');
             for (const [route, config] of Object.entries(routes)) {
-                const hostPort = config.hostPort !== undefined ? config.hostPort : '-';
                 const method = config.method || '-';
                 const agent = config.agent || '-';
+                const relayState = config.relay ? 'confined' : 'unavailable';
+                const primary = config.primaryService?.port || '-';
                 console.log(
-                    `  ${route} -> agent=${agent} method=${method} hostPort=${hostPort}`
+                    `  ${route} -> agent=${agent} method=${method} relay=${relayState} primary=${primary}`
                 );
             }
         } else {

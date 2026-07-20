@@ -1,58 +1,17 @@
-import fs from 'fs';
 import path from 'path';
 
-import { ROUTING_FILE, PLOINKY_WORKSPACE_ROOT } from '../utils/config.js';
-import { resolveEnabledAgentRecord } from '../utils/agents.js';
-import { findAgent } from '../utils/utils.js';
 import { resolveMaxTtlSeconds } from './mcp-proxy/userDelegationGrant.js';
 import { normalizeHttpRouteAccess } from './policy/HttpRouteAccessDecision.js';
+import { getActiveGenerationRoutes } from './generation/runtimeContext.js';
 
 const DEFAULT_DELEGATION_TTL_SECONDS = 1800;
 const REMOVED_SERVICE_SPEC_FIELDS = ['auth', 'mode', ['force', 'Guest'].join('')];
 
-export function loadRoutingConfig() {
-    const dynamicRoutingFile = process.env.PLOINKY_ROUTING_FILE
-        || path.join(PLOINKY_WORKSPACE_ROOT, '.ploinky', 'routing.json');
-    const routingFile = fs.existsSync(dynamicRoutingFile) ? dynamicRoutingFile : ROUTING_FILE;
-    try {
-        return JSON.parse(fs.readFileSync(routingFile, 'utf8')) || {};
-    } catch (_) {
-        return {};
-    }
-}
-
-function readJsonFileIfExists(filePath) {
-    try {
-        if (!filePath || !fs.existsSync(filePath)) return null;
-        return JSON.parse(fs.readFileSync(filePath, 'utf8'));
-    } catch (_) {
-        return null;
-    }
-}
-
 export function readEnabledAgentManifest(routeKey, routes = {}) {
     const normalizedRouteKey = String(routeKey || '').trim();
     if (!normalizedRouteKey) return null;
-
-    const routeHostPath = String(routes?.[normalizedRouteKey]?.hostPath || '').trim();
-    const routeManifest = readJsonFileIfExists(routeHostPath ? path.join(routeHostPath, 'manifest.json') : '');
-    if (routeManifest) return routeManifest;
-
-    let resolved = null;
-    try {
-        resolved = resolveEnabledAgentRecord(normalizedRouteKey);
-    } catch (_) {
-        resolved = null;
-    }
-    const record = resolved?.record || null;
-    if (!record?.repoName || !record?.agentName) return null;
-
-    try {
-        const found = findAgent(`${record.repoName}/${record.agentName}`);
-        return readJsonFileIfExists(found?.manifestPath || '');
-    } catch (_) {
-        return null;
-    }
+    const manifest = routes?.[normalizedRouteKey]?.manifest;
+    return manifest && typeof manifest === 'object' ? manifest : null;
 }
 
 function asServiceSpecEntries(value) {
@@ -271,13 +230,10 @@ export { normalizeServiceSpec };
 
 const loggedInvalidServiceSpecs = new Set();
 
-function collectRouteServiceSpecs(routeKey, route, routes) {
-    const manifest = readEnabledAgentManifest(routeKey, routes) || {};
+function collectRouteServiceSpecs(routeKey, route) {
     const collected = [];
-    for (const { spec } of [
-        ...asServiceSpecEntries(route?.httpServices),
-        ...asServiceSpecEntries(manifest?.httpServices),
-    ]) {
+    const serviceSource = route?.httpServices;
+    for (const { spec } of asServiceSpecEntries(serviceSource)) {
         try {
             const definition = normalizeServiceSpec(routeKey, route, spec);
             if (definition) collected.push(definition);
@@ -292,17 +248,17 @@ function collectRouteServiceSpecs(routeKey, route, routes) {
     return collected;
 }
 
-export function collectHttpServiceRoutes(routing = loadRoutingConfig()) {
+export function collectHttpServiceRoutes(routing = { routes: getActiveGenerationRoutes() }) {
     const routes = routing?.routes || {};
     const definitions = [];
     for (const [routeKey, route] of Object.entries(routes)) {
         if (!route || route.disabled) continue;
-        definitions.push(...collectRouteServiceSpecs(routeKey, route, routes));
+        definitions.push(...collectRouteServiceSpecs(routeKey, route));
     }
     return definitions;
 }
 
-export function resolveHttpServiceRoute(pathname, routing = loadRoutingConfig()) {
+export function resolveHttpServiceRoute(pathname, routing = { routes: getActiveGenerationRoutes() }) {
     const normalizedPathname = String(pathname || '');
     return collectHttpServiceRoutes(routing).find((definition) =>
         normalizedPathname === definition.externalPrefix.replace(/\/$/, '')

@@ -53,6 +53,13 @@
         </section>
 
         <section class="chapter-section">
+          <h2>Routing and Socket-Boundary Checks</h2>
+          <p>Routing activation is content-addressed and fail-closed. A candidate must contain complete agent, enable-generation, effective-instance, container, relay, listener, limits, denied-port, policy, and private-ACL inputs. Editing staging files does not change an in-flight request; a successfully compiled replacement atomically activates and invalidates uncommitted leases.</p>
+          <p>The expected network boundary is one operator-selected public RoutingServer TCP listener. Agent application ports and the exec/stdio relay are not host-published. The private machine-call listener is exactly <code>127.0.0.1:8081</code> and remains disabled when a container-side proof cannot reach that loopback binding through the runtime-owned host alias. Media UDP provisioning, when present in a deployment fixture, remains a separate direct plane.</p>
+          <p>Run <code>npm run e2e:routing-proxy</code> to exercise the real container relay, private exposure, capacity/failure, network-boundary, and Playwright base-path gates. Run the same command with <code>-- --livekit</code> only with <code>PLOINKY_LIVEKIT_E2E_COMMAND</code> configured for a real deployment; the command must emit final JSON evidence for routed signaling, no browser private dial, a remote screen-share track, increased media bytes, and private assertion-plus-ACL enforcement.</p>
+        </section>
+
+        <section class="chapter-section">
           <h2>Access Tokens and Invitations</h2>
           <p><code>webchat</code> prints the router login URL for the chat surface. Only <code>dashboard</code> mints or reuses a workspace token through <code>WEBDASHBOARD_TOKEN</code>.</p>
           <p>The read-only <code>/status</code> surface does not have a separate token namespace; it accepts a dashboard invitation link or the dashboard token instead.</p>

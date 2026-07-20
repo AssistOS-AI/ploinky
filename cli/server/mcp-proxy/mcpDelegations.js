@@ -1,30 +1,7 @@
-import fs from 'node:fs';
-import path from 'node:path';
-
-import { loadRoutingConfig } from '../httpServiceRoutes.js';
+import { getActiveGenerationRoutes } from '../generation/runtimeContext.js';
 import { mintUserDelegationGrant, resolveMaxTtlSeconds } from './userDelegationGrant.js';
 import { deriveSubkey } from '../../utils/security/masterKey.js';
 import { deriveAgentPrincipalId } from '../../utils/security/agentIdentity.js';
-import { REPOS_DIR } from '../../utils/config.js';
-
-function readMcpConfigTools(agentDir) {
-    if (!agentDir) return [];
-    try {
-        const parsed = JSON.parse(fs.readFileSync(path.join(agentDir, 'mcp-config.json'), 'utf8'));
-        return Array.isArray(parsed?.tools) ? parsed.tools : [];
-    } catch {
-        return [];
-    }
-}
-
-function resolveAgentDir(route) {
-    if (route && typeof route.hostPath === 'string' && route.hostPath) {
-        return route.hostPath;
-    }
-    const repo = String(route?.repo || '').trim();
-    const agent = String(route?.agent || '').trim();
-    return repo && agent ? path.join(REPOS_DIR, repo, agent) : '';
-}
 
 function uniqueTrimmedStrings(values) {
     if (!Array.isArray(values)) return [];
@@ -110,7 +87,7 @@ export function normalizeMcpDelegationEntries(entries, { route = {}, toolName = 
 }
 
 export function resolveMcpToolDelegations({ routeKey, toolName, routes } = {}) {
-    const resolvedRoutes = routes || loadRoutingConfig().routes || {};
+    const resolvedRoutes = routes || getActiveGenerationRoutes();
     const route = resolvedRoutes?.[String(routeKey || '').trim()] || null;
     if (!route) return [];
     const repo = String(route.repo || '').trim();
@@ -122,7 +99,8 @@ export function resolveMcpToolDelegations({ routeKey, toolName, routes } = {}) {
     } catch {
         return [];
     }
-    const tool = readMcpConfigTools(resolveAgentDir(route))
+    const tools = Array.isArray(route.mcpConfig?.tools) ? route.mcpConfig.tools : [];
+    const tool = tools
         .find((entry) => entry && typeof entry === 'object' && String(entry.name || '') === String(toolName || ''));
     if (!tool || !Array.isArray(tool.delegations) || !tool.delegations.length) return [];
     return normalizeMcpDelegationEntries(tool.delegations, { route, toolName: String(toolName || ''), sourceAgentId });

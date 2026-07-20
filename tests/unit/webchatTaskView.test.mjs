@@ -108,7 +108,7 @@ test('task continuation activates a missing provider globally and waits for read
             activations.push({ agent, mode: 'global' });
             route = {
                 agentName: 'workerAgent',
-                route: { hostPort: 32123 },
+                route: { relay: { kind: 'container-exec-stdio' }, primaryService: { port: 7000 } },
             };
             return {
                 repoName: 'workers',
@@ -148,7 +148,7 @@ test('concurrent task continuations share one provider activation', async () => 
             await activationGate;
             route = {
                 agentName: 'sharedWorker',
-                route: { hostPort: 32124 },
+                route: { relay: { kind: 'container-exec-stdio' }, primaryService: { port: 7000 } },
             };
             return {
                 repoName: 'workers',

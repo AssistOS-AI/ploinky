@@ -53,17 +53,18 @@ function makeManifestReader(manifestByRouteKey) {
     return reader;
 }
 
+const ACTIVE_RELAY = Object.freeze({ relay: Object.freeze({ kind: 'container-exec-stdio' }), primaryService: Object.freeze({ port: 7000 }) });
 const ROUTES = {
-    // Enabled, active port, manifest WITHOUT endpoints.chatCompletions.
-    llmAssistant: { hostPort: 4101, hostPath: '/ignored', repo: 'AssistOSExplorer', agent: 'llmAssistant' },
-    // Enabled, active port, manifest WITH chat config (streaming on).
-    soplangAgent: { hostPort: 4102, hostPath: '/ignored', repo: 'AssistOSExplorer', agent: 'soplangAgent' },
-    // Disabled — must be excluded even though it has a port + manifest.
-    disabledAgent: { hostPort: 4103, disabled: true, repo: 'AssistOSExplorer', agent: 'disabledAgent' },
-    // No host port — must be excluded.
-    portlessAgent: { repo: 'AssistOSExplorer', agent: 'portlessAgent' },
-    // Active port but manifest cannot be resolved — must be excluded.
-    manifestlessAgent: { hostPort: 4104, repo: 'AssistOSExplorer', agent: 'manifestlessAgent' },
+    // Enabled relay, manifest WITHOUT endpoints.chatCompletions.
+    llmAssistant: { ...ACTIVE_RELAY, hostPath: '/ignored', repo: 'AssistOSExplorer', agent: 'llmAssistant' },
+    // Enabled relay, manifest WITH chat config (streaming on).
+    soplangAgent: { ...ACTIVE_RELAY, hostPath: '/ignored', repo: 'AssistOSExplorer', agent: 'soplangAgent' },
+    // Disabled — must be excluded even though it has a relay + manifest.
+    disabledAgent: { ...ACTIVE_RELAY, disabled: true, repo: 'AssistOSExplorer', agent: 'disabledAgent' },
+    // No primary relay — must be excluded.
+    unavailableAgent: { repo: 'AssistOSExplorer', agent: 'unavailableAgent' },
+    // Active relay but manifest cannot be resolved — must be excluded.
+    manifestlessAgent: { ...ACTIVE_RELAY, repo: 'AssistOSExplorer', agent: 'manifestlessAgent' },
 };
 
 const MANIFESTS = {
@@ -108,7 +109,7 @@ test('builder marks usesDefaultOpenAiResponder false (and streaming) when manife
 
 test('responderKind: command when manifest has a chat command', () => {
     const { agents } = buildOpenAiAgentDiscovery({
-        routes: { demo: { hostPort: 5, repo: 'r', agent: 'demo' } },
+        routes: { demo: { ...ACTIVE_RELAY, repo: 'r', agent: 'demo' } },
         readManifest: () => ({ name: 'demo', endpoints: { chatCompletions: { command: '/h' } } }),
     });
     assert.equal(agents[0].responderKind, 'command');
@@ -117,7 +118,7 @@ test('responderKind: command when manifest has a chat command', () => {
 
 test('responderKind: inert when model is none', () => {
     const { agents } = buildOpenAiAgentDiscovery({
-        routes: { demo: { hostPort: 5, repo: 'r', agent: 'demo' } },
+        routes: { demo: { ...ACTIVE_RELAY, repo: 'r', agent: 'demo' } },
         readManifest: () => ({ name: 'demo', endpoints: { chatCompletions: { model: 'none' } } }),
     });
     assert.equal(agents[0].responderKind, 'inert');
@@ -127,7 +128,7 @@ test('responderKind: inert when model is none', () => {
 
 test('responderKind: llm + streaming when no chatCompletions block', () => {
     const { agents } = buildOpenAiAgentDiscovery({
-        routes: { demo: { hostPort: 5, repo: 'r', agent: 'demo' } },
+        routes: { demo: { ...ACTIVE_RELAY, repo: 'r', agent: 'demo' } },
         readManifest: () => ({ name: 'demo' }),
     });
     assert.equal(agents[0].responderKind, 'llm');
@@ -135,13 +136,13 @@ test('responderKind: llm + streaming when no chatCompletions block', () => {
     assert.equal(agents[0].supportsStreaming, true);
 });
 
-test('builder omits disabled, portless, and manifest-less routes', () => {
+test('builder omits disabled, relay-unavailable, and manifest-less routes', () => {
     const reader = makeManifestReader(MANIFESTS);
     const { agents } = buildOpenAiAgentDiscovery({ routes: ROUTES, readManifest: reader });
     const keys = agents.map((a) => a.routeKey).sort();
     assert.deepEqual(keys, ['llmAssistant', 'soplangAgent']);
     assert.equal(agents.some((a) => a.routeKey === 'disabledAgent'), false);
-    assert.equal(agents.some((a) => a.routeKey === 'portlessAgent'), false);
+    assert.equal(agents.some((a) => a.routeKey === 'unavailableAgent'), false);
     assert.equal(agents.some((a) => a.routeKey === 'manifestlessAgent'), false);
 });
 
@@ -167,9 +168,8 @@ test('builder output contains no 127.0.0.1 or router-port base URLs', () => {
     const serialized = JSON.stringify(result);
     assert.equal(serialized.includes('127.0.0.1'), false);
     assert.equal(serialized.includes('localhost'), false);
-    // The container-internal host ports must never leak into the response.
-    assert.equal(serialized.includes('4101'), false);
-    assert.equal(serialized.includes('4102'), false);
+    // The container-internal application port must never leak into the response.
+    assert.equal(serialized.includes('7000'), false);
     // Only relative path fields are emitted.
     for (const agent of result.agents) {
         assert.match(agent.routerPath, /^\/[^/]/);

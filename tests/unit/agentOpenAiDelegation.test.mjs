@@ -1,6 +1,5 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import http from 'node:http';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -31,7 +30,7 @@ fs.mkdirSync(targetAgentDir, { recursive: true });
 fs.writeFileSync(path.join(targetAgentDir, 'manifest.json'), JSON.stringify({ about: 'llm assistant fixture' }, null, 2));
 fs.writeFileSync(path.join(tempDir, '.ploinky', 'routing.json'), JSON.stringify({
     routes: {
-        llmAssistant: { repo: 'AssistOSExplorer', agent: 'llmAssistant', hostPath: targetAgentDir, hostPort: 7501 },
+        llmAssistant: { repo: 'AssistOSExplorer', agent: 'llmAssistant' },
     },
 }, null, 2));
 process.chdir(tempDir);
@@ -48,7 +47,7 @@ const { deriveAgentRequestSecret } = await import(`../../cli/utils/security/mast
 const SOURCE_AGENT = 'agent:AssistOSExplorer/soulGateway';
 const TARGET_ROUTE = 'llmAssistant';
 const TARGET_AGENT = 'agent:AssistOSExplorer/llmAssistant';
-const ROUTE = { repo: 'AssistOSExplorer', agent: 'llmAssistant', hostPath: targetAgentDir, hostPort: 7501 };
+const ROUTE = { repo: 'AssistOSExplorer', agent: 'llmAssistant' };
 const BODY = Buffer.from(JSON.stringify({ model: 'axl/fast', messages: [{ role: 'user', content: 'hi' }] }));
 
 function envFor(agentId) {
@@ -379,84 +378,5 @@ test('the minted header set contains only x-ploinky-auth-info and no legacy iden
     assert.deepEqual(headerNames, ['x-ploinky-auth-info']);
     for (const banned of ['x-soul-id', 'x-agent-name', 'x-soul-agent']) {
         assert.equal(banned in result.authInfoHeader, false);
-    }
-});
-
-// ---------------------------------------------------------------------------
-// 7. End-to-end HTTP: handleDelegatedAgentOpenAiCall buffers the body once,
-//    forwards the IDENTICAL bytes, strips any client x-ploinky-auth-info, and the
-//    upstream agent verifies the router-minted token against the raw bytes.
-// ---------------------------------------------------------------------------
-
-test('handleDelegatedAgentOpenAiCall forwards identical bytes the upstream agent verifies', async (t) => {
-    const { handleDelegatedAgentOpenAiCall } = await import(`../../cli/server/agentOpenAiDelegation.js?e2e=${Date.now()}-${Math.random()}`);
-
-    let captured = null;
-    let upstreamVerified = null;
-    const upstream = http.createServer((req, res) => {
-        const chunks = [];
-        req.on('data', (chunk) => chunks.push(chunk));
-        req.on('end', () => {
-            const rawBody = Buffer.concat(chunks);
-            captured = { url: req.url, headers: req.headers, body: rawBody };
-            // The upstream agent recomputes the hash over the EXACT bytes it got
-            // and verifies the router-minted token (as AgentServer does).
-            upstreamVerified = verifyOpenAiServiceAuthInfoFromHeaders(req.headers, {
-                env: targetEnv(),
-                replayCache: createMemoryReplayCache(),
-                body: rawBody,
-            });
-            res.writeHead(200, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ ok: true }));
-        });
-    });
-    const upstreamPort = await new Promise((resolve) => upstream.listen(0, '127.0.0.1', () => resolve(upstream.address().port)));
-    t.after(() => new Promise((resolve) => upstream.close(() => resolve())));
-
-    const bearer = signAgentHttpAssertion({ path: OPENAI_PATH, body: BODY, targetAgent: TARGET_ROUTE, tool: OPENAI_TOOL, env: envFor(SOURCE_AGENT) });
-
-    // Drive a real router that calls the handler, so body buffering + proxy run
-    // over a real socket.
-    const router = http.createServer((req, res) => {
-        handleDelegatedAgentOpenAiCall(req, res, { repo: 'AssistOSExplorer', agent: 'llmAssistant', hostPort: upstreamPort }, TARGET_ROUTE, OPENAI_PATH);
-    });
-    const routerPort = await new Promise((resolve) => router.listen(0, '127.0.0.1', () => resolve(router.address().port)));
-    t.after(() => new Promise((resolve) => router.close(() => resolve())));
-
-    const response = await new Promise((resolve, reject) => {
-        const reqClient = http.request({
-            hostname: '127.0.0.1',
-            port: routerPort,
-            path: `/${TARGET_ROUTE}${OPENAI_PATH}`,
-            method: 'POST',
-            headers: {
-                'content-type': 'application/json',
-                authorization: `Bearer ${bearer}`,
-                // A spoofed client-supplied router header that MUST be stripped.
-                'x-ploinky-auth-info': '{"invocationToken":"spoofed","invocationBody":{}}',
-                'content-length': String(BODY.length),
-            },
-        }, (res) => {
-            const chunks = [];
-            res.on('data', (c) => chunks.push(c));
-            res.on('end', () => resolve({ statusCode: res.statusCode, body: Buffer.concat(chunks).toString('utf8') }));
-        });
-        reqClient.on('error', reject);
-        reqClient.end(BODY);
-    });
-
-    assert.equal(response.statusCode, 200, response.body);
-    // The upstream received the EXACT same bytes the client sent.
-    assert.equal(captured.body.toString('utf8'), BODY.toString('utf8'));
-    assert.equal(captured.url, OPENAI_PATH);
-    // The client-supplied x-ploinky-auth-info was replaced by the router's, and
-    // the upstream verification of the router-minted token succeeded.
-    assert.notEqual(captured.headers['x-ploinky-auth-info'], '{"invocationToken":"spoofed","invocationBody":{}}');
-    assert.equal(upstreamVerified.ok, true, upstreamVerified.reason);
-    assert.equal(upstreamVerified.payload.tool, OPENAI_TOOL);
-    assert.equal(upstreamVerified.payload.sub, SOURCE_AGENT);
-    // No legacy identity headers were forwarded.
-    for (const banned of ['x-soul-id', 'x-agent-name', 'x-soul-agent']) {
-        assert.equal(captured.headers[banned], undefined);
     }
 });

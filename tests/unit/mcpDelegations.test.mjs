@@ -22,7 +22,7 @@ const { deriveSubkey } = await import(`../../cli/utils/security/masterKey.js${mo
 
 const SOURCE_DIR = path.join(tempDir, 'agents', 'gitAgent');
 fs.mkdirSync(SOURCE_DIR, { recursive: true });
-fs.writeFileSync(path.join(SOURCE_DIR, 'mcp-config.json'), JSON.stringify({
+const MCP_CONFIG = {
     tools: [
         {
             name: 'git_auth_store_token',
@@ -38,9 +38,10 @@ fs.writeFileSync(path.join(SOURCE_DIR, 'mcp-config.json'), JSON.stringify({
         },
         { name: 'git_status' },
     ],
-}, null, 2));
+};
+fs.writeFileSync(path.join(SOURCE_DIR, 'mcp-config.json'), JSON.stringify(MCP_CONFIG, null, 2));
 
-const ROUTE = { repo: 'AchillesIDE', agent: 'gitAgent', hostPath: SOURCE_DIR };
+const ROUTE = { repo: 'AchillesIDE', agent: 'gitAgent', hostPath: SOURCE_DIR, mcpConfig: MCP_CONFIG };
 const ROUTES = { gitAgent: ROUTE };
 
 test.after(() => {

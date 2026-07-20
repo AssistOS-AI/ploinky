@@ -94,7 +94,7 @@ export class HttpRouteAccessPolicy {
         return Boolean(this._manifestRouteProvider && this._httpServiceProvider && this._routeDefaultProvider);
     }
 
-    evaluate({ pathname, method = 'GET', routeKey = '' } = {}) {
+    evaluate({ pathname, method = 'GET', routeKey = '', surfaceKind = '' } = {}) {
         if (!this.hasProviders()) return providersUnboundDecision();
 
         const requestPath = normalizedRequest(pathname);
@@ -108,7 +108,13 @@ export class HttpRouteAccessPolicy {
 
         if (decision.access === 'none') {
             const derivedRouteKey = routeKey || HttpRouteAccessPath.routeKeyForPath(requestPath);
-            decision = this._routeDefaultProvider({ pathname: requestPath, method, routeKey: derivedRouteKey }) || noHttpRouteAccess();
+            decision = surfaceKind === 'agent-port-convention'
+                ? {
+                    access: 'authenticated',
+                    routeKey: derivedRouteKey,
+                    source: 'agentPortConventionDefault',
+                }
+                : this._routeDefaultProvider({ pathname: requestPath, method, routeKey: derivedRouteKey }) || noHttpRouteAccess();
         }
 
         return applyPublicWriteGuard(decision, method);

@@ -26,6 +26,7 @@ import {
   resolveManifestStartup,
 } from '../utils/runtime/manifestStartup.js';
 import { waitForAgentReady } from '../server/utils/agentReadiness.js';
+import { buildRuntimeRoute } from '../utils/runtime/runtimeRoute.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -70,7 +71,7 @@ function buildRouterEnv() {
   return { ...envFile, ...secrets, ...process.env };
 }
 
-function spawnNoWaitWorker({ node, registryName, routeKey, registryAlias, routerPort }) {
+function spawnNoWaitWorker({ node, registryName, routeKey, registryAlias, routerPort, authPolicy }) {
   const containerName = registryName;
   const noWaitLogDir = path.join(LOGS_DIR, 'no-wait');
   const noWaitStatusDir = path.join(RUNNING_DIR, 'no-wait');
@@ -96,6 +97,9 @@ function spawnNoWaitWorker({ node, registryName, routeKey, registryAlias, router
   }
   if (routerPort) {
     args.push('--router-port', String(routerPort));
+  }
+  if (authPolicy && typeof authPolicy === 'object') {
+    args.push('--auth-policy', Buffer.from(JSON.stringify(authPolicy)).toString('base64url'));
   }
   const logStdio = createAppendLogStdio(logFile);
   const child = spawn(process.execPath, args, {
@@ -352,8 +356,8 @@ function resolveManifestReadinessWaitOptions(manifest, fallbackTimeoutMs = 12000
 
 function buildBlockingReadinessEntryFromNode(node, route, staticLabel) {
   const entry = buildReadinessEntryFromNode(node, route, staticLabel);
-  if (!route?.hostPort && entry.protocol !== 'none') {
-    throw new Error(`${node.isStatic ? 'Static agent' : 'Dependent agent'} '${formatGraphNodeLabel(node, staticLabel)}' did not expose a host port.`);
+  if ((!route?.relay || !route?.primaryService) && entry.protocol !== 'none') {
+    throw new Error(`${node.isStatic ? 'Static agent' : 'Dependent agent'} '${formatGraphNodeLabel(node, staticLabel)}' has no confined primary service.`);
   }
   return entry;
 }
@@ -361,8 +365,8 @@ function buildBlockingReadinessEntryFromNode(node, route, staticLabel) {
 function formatReadyProgress({ elapsedMs, timeoutMs, portOpen, protocol, stage, lastError }) {
   const elapsedSec = Math.floor(Math.max(0, elapsedMs) / 1000);
   const timeoutSec = Math.floor(Math.max(0, timeoutMs) / 1000);
-  if (stage === 'waiting_for_port') {
-    return `still waiting (${elapsedSec}s/${timeoutSec}s): port not open yet${lastError ? `, last probe=${lastError}` : ''}`;
+  if (stage === 'waiting_for_relay') {
+    return `still waiting (${elapsedSec}s/${timeoutSec}s): confined relay target not ready${lastError ? `, last probe=${lastError}` : ''}`;
   }
   if (protocol === 'tcp') {
     return `still waiting (${elapsedSec}s/${timeoutSec}s): port is open, waiting for TCP readiness`;
@@ -413,7 +417,7 @@ async function waitForReadinessEntries(readinessEntries) {
     if (entry.protocol === 'none') {
       console.log(`[start] Marking ${waitLabel} '${entry.label}' ready (no port-bound readiness probe).`);
     } else {
-      console.log(`[start] Waiting for ${waitLabel} '${entry.label}' to become ready on port ${entry.route.hostPort}...`);
+      console.log(`[start] Waiting for ${waitLabel} '${entry.label}' through its confined runtime relay...`);
     }
     readinessProgress.set(entry.key, {
       ready: false,
@@ -708,22 +712,18 @@ async function startWorkspace(staticAgentArg, portArg, { refreshComponentToken, 
           const agentPath = path.dirname(manifestPath0);
           const repoName = rec.repoName || path.basename(path.dirname(agentPath));
           const routeKey = rec.alias || shortAgentName;
-          const { containerName, hostPort, additionalServerPort } = ensureAgentService(shortAgentName, manifest, agentPath, {
+          const runtimeService = ensureAgentService(shortAgentName, manifest, agentPath, {
             containerName: name,
             alias: rec.alias,
             routerPort: staticPort
           });
-          const nextRoute = {
-            ...(cfg.routes[routeKey] || {}),
-            container: containerName,
-            hostPath: agentPath,
-            repo: repoName,
-            agent: shortAgentName,
-            ...(rec.alias ? { alias: rec.alias } : {}),
-            hostPort: hostPort || cfg.routes[routeKey]?.hostPort,
-            ...(additionalServerPort ? { additionalServerPort } : {})
-          };
-          if (!additionalServerPort) delete nextRoute.additionalServerPort;
+          const nextRoute = buildRuntimeRoute(routeKey, runtimeService, {
+            agentPath,
+            repoName,
+            agentName: shortAgentName,
+            alias: rec.alias,
+            auth: rec.auth,
+          });
           return {
             ok: true,
             shortAgentName,
@@ -820,7 +820,8 @@ async function startWorkspace(staticAgentArg, portArg, { refreshComponentToken, 
             registryName,
             routeKey,
             registryAlias: rec.alias || node.alias || '',
-            routerPort: staticPort
+            routerPort: staticPort,
+            authPolicy: rec.auth,
           });
           console.log(`[start] ${formatGraphNodeLabel(node, staticAgent)}: no-wait launch started (pid ${pid}). log=${logFile} status=${statusFile}`);
         } catch (spawnErr) {
@@ -965,23 +966,17 @@ async function runCli(agentName, args) {
   const containerName = (containerInfo && containerInfo.containerName)
     || registryRecord?.containerName
     || getAgentContainerName(shortAgentName, repoName);
-  if (containerInfo?.hostPort) {
+  {
     const routeRepoName = registryRecord?.record?.repoName || repoName;
     const routeKey = registryRecord?.record?.alias || shortAgentName;
     await mergeRoutingConfig((current) => {
-      const nextRoute = {
-        ...(current.routes?.[routeKey] || {}),
-        container: containerName,
-        hostPath: agentDir,
-        repo: routeRepoName,
-        agent: shortAgentName,
-        ...(registryRecord?.record?.alias ? { alias: registryRecord.record.alias } : {}),
-        hostPort: containerInfo.hostPort,
-        ...(containerInfo.additionalServerPort ? {
-          additionalServerPort: containerInfo.additionalServerPort,
-        } : {}),
-      };
-      if (!containerInfo.additionalServerPort) delete nextRoute.additionalServerPort;
+      const nextRoute = buildRuntimeRoute(routeKey, containerInfo, {
+        agentPath: agentDir,
+        repoName: routeRepoName,
+        agentName: shortAgentName,
+        alias: registryRecord?.record?.alias,
+        auth: registryRecord?.record?.auth,
+      });
       return {
         ...current,
         routes: {
@@ -993,16 +988,25 @@ async function runCli(agentName, args) {
   }
   const readinessProtocol = resolveAgentReadinessProtocol(manifest);
   if (readinessProtocol !== 'none') {
-    const hostPort = containerInfo?.hostPort;
-    if (!hostPort) {
+    if (!containerInfo?.relay || !containerInfo?.primaryService) {
       if (!suppressLauncherLogs) {
-        console.warn(`[cli] warning: cannot wait for '${shortAgentName}' readiness because no host port was resolved.`);
+        console.warn(`[cli] warning: cannot wait for '${shortAgentName}' readiness because no confined primary service is available.`);
       }
     } else {
       if (!suppressLauncherLogs) {
-        console.log(`[cli] Waiting for '${shortAgentName}' readiness (${readinessProtocol}) on port ${hostPort}...`);
+        console.log(`[cli] Waiting for '${shortAgentName}' readiness (${readinessProtocol}) through its confined runtime relay...`);
       }
-      const ready = await waitForAgentReady({ hostPort }, {
+      const ready = await waitForAgentReady(buildRuntimeRoute(
+        registryRecord?.record?.alias || shortAgentName,
+        containerInfo,
+        {
+          agentPath: agentDir,
+          repoName: registryRecord?.record?.repoName || repoName,
+          agentName: shortAgentName,
+          alias: registryRecord?.record?.alias,
+          auth: registryRecord?.record?.auth,
+        },
+      ), {
         timeoutMs: 600000,
         protocol: readinessProtocol,
       });
@@ -1154,15 +1158,16 @@ async function reinstallAgent(agentName) {
             }
             stopAndRemove(containerName);
             
-            const { containerName: newContainerName, hostPort, additionalServerPort } = await ensureAgentService(short, manifest, agentPath, {
+            const runtimeService = await ensureAgentService(short, manifest, agentPath, {
                 containerName,
                 alias: registryRecord?.record?.alias,
                 forceRecreate: true
             });
+            const newContainerName = runtimeService.containerName;
 
             const readinessProtocol = resolveAgentReadinessProtocol(manifest);
-            if (!hostPort && readinessProtocol !== 'none') {
-                throw new Error(`Failed to resolve host port for restarted agent '${short}'.`);
+            if ((!runtimeService.relay || !runtimeService.primaryService) && readinessProtocol !== 'none') {
+                throw new Error(`Restarted agent '${short}' has no confined primary service.`);
             }
             console.log(`[reinstall] reinstalled '${short}' [container: ${newContainerName}]`);
 
@@ -1174,22 +1179,13 @@ async function reinstallAgent(agentName) {
             cfg.routes = cfg.routes || {};
             const repoName = path.basename(path.dirname(agentPath));
             const routeKey = registryRecord?.record.alias || short;
-            cfg.routes[routeKey] = cfg.routes[routeKey] || {};
-            cfg.routes[routeKey].container = newContainerName;
-            cfg.routes[routeKey].hostPath = agentPath;
-            cfg.routes[routeKey].repo = repoName;
-            cfg.routes[routeKey].agent = short;
-            if (registryRecord?.record.alias) cfg.routes[routeKey].alias = registryRecord.record.alias;
-            if (hostPort) {
-                cfg.routes[routeKey].hostPort = hostPort;
-            } else {
-                delete cfg.routes[routeKey].hostPort;
-            }
-            if (additionalServerPort) {
-                cfg.routes[routeKey].additionalServerPort = additionalServerPort;
-            } else {
-                delete cfg.routes[routeKey].additionalServerPort;
-            }
+            cfg.routes[routeKey] = buildRuntimeRoute(routeKey, runtimeService, {
+                agentPath,
+                repoName,
+                agentName: short,
+                alias: registryRecord?.record.alias,
+                auth: registryRecord?.record.auth,
+            });
 
             const savedCfg = workspaceSvc.getConfig();
             if (!cfg.static && savedCfg?.static?.agent) {
@@ -1220,14 +1216,14 @@ async function reinstallAgent(agentName) {
 
             if (readinessProtocol !== 'none') {
                 const readinessWait = resolveManifestReadinessWaitOptions(manifest, 15000);
-                const ready = await waitForAgentReady({ hostPort }, {
+                const ready = await waitForAgentReady(cfg.routes[routeKey], {
                     timeoutMs: readinessWait.timeoutMs,
                     intervalMs: readinessWait.intervalMs,
                     probeTimeoutMs: readinessWait.probeTimeoutMs,
                     protocol: readinessProtocol,
                 });
                 if (!ready) {
-                    console.error(`[reinstall] warning: agent '${short}' (host port ${hostPort}) is not ready yet; if requests 502, run 'ploinky restart'.`);
+                    console.error(`[reinstall] warning: agent '${short}' is not ready through its confined relay yet; if requests fail, run 'ploinky restart'.`);
                 }
             }
 

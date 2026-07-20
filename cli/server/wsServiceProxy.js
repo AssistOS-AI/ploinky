@@ -1,11 +1,10 @@
-import http from 'http';
 import { resolveHttpServiceRoute, buildServiceAgentPath } from './httpServiceRoutes.js';
-import { buildHttpServiceAuthInfoHeader, stripRouterIdentityHeaders, loadApiRoutes } from './routerHandlers.js';
+import { buildHttpServiceAuthInfoHeader, stripRouterIdentityHeaders } from './routerHandlers.js';
 import { hasInternalAgentSegment } from './internalAgentPath.js';
 import { sha256RawBodyHash } from '../../Agent/lib/requestHash.mjs';
 import { ensureHttpRouteAccess } from './authHandlers/authContext.js';
-
-const HANDSHAKE_TIMEOUT_MS = 10_000;
+import { getRoutingRuntime } from './generation/runtimeContext.js';
+import { executeWebSocketPlan } from './proxy/executeWebSocketPlan.js';
 
 function lowerKeys(obj = {}) {
     const out = {};
@@ -25,6 +24,7 @@ export function createCapturingRes() {
         finished: false,
         setHeader(name, value) { headers[String(name).toLowerCase()] = value; },
         getHeader(name) { return headers[String(name).toLowerCase()]; },
+        getHeaders() { return { ...headers }; },
         removeHeader(name) { delete headers[String(name).toLowerCase()]; },
         writeHead(status, maybeHeaders) {
             this.statusCode = status;
@@ -39,25 +39,55 @@ export function createCapturingRes() {
 
 export async function resolveUpgradeTarget({ req, parsedUrl, policy }) {
     const pathname = parsedUrl?.pathname || '';
-    const definition = resolveHttpServiceRoute(pathname);
-    if (!definition) return { matched: false };
+    const runtime = getRoutingRuntime();
+    let lease;
+    let plan;
+    let definition;
+    try {
+        lease = runtime.acquire({ listenerClass: 'public', authority: req.headers.host });
+        definition = resolveHttpServiceRoute(pathname, { routes: lease.generation.routes });
+        if (!definition) {
+            lease.release();
+            return { matched: false };
+        }
+        const target = buildServiceAgentPath(pathname, parsedUrl?.search, definition.externalPrefix, definition.internalPrefix);
+        plan = runtime.resolvePrimary({
+            lease,
+            routeKey: definition.routeKey,
+            method: 'GET',
+            externalPath: pathname,
+            targetPath: target.split('?', 1)[0],
+            query: target.includes('?') ? target.slice(target.indexOf('?') + 1) : '',
+            authority: req.headers.host,
+            scheme: req.socket?.encrypted ? 'https' : 'http',
+            transport: 'websocket',
+        });
+    } catch (_) {
+        lease?.release();
+        return { matched: true, ok: false, status: 503 };
+    }
+    if (!plan) {
+        lease.release();
+        return { matched: true, ok: false, status: 404 };
+    }
 
-    const route = loadApiRoutes()[definition.routeKey];
-    if (!route || !route.hostPort) return { matched: true, ok: false, status: 404 };
-
-    const decision = policy.httpRouteAccessPolicy.evaluate({ pathname, method: 'GET', routeKey: definition.routeKey });
     const capRes = createCapturingRes();
-    const access = await ensureHttpRouteAccess(req, capRes, parsedUrl, decision);
+    const access = await ensureHttpRouteAccess(req, capRes, parsedUrl, plan.access);
     if (!access || access.ok !== true) {
+        lease.release();
         return { matched: true, ok: false, status: capRes.statusCode || 401 };
     }
     if (definition.access !== 'public' && (!req.user || typeof req.user !== 'object')) {
+        lease.release();
         return { matched: true, ok: false, status: 401 };
     }
 
     req.headers = stripRouterIdentityHeaders(req.headers);
     const upstreamPath = buildServiceAgentPath(pathname, parsedUrl?.search, definition.externalPrefix, definition.internalPrefix);
-    if (hasInternalAgentSegment(upstreamPath)) return { matched: true, ok: false, status: 404 };
+    if (hasInternalAgentSegment(upstreamPath)) {
+        lease.release();
+        return { matched: true, ok: false, status: 404 };
+    }
 
     // Mirror the HTTP path: always call the builder (it returns {} unless
     // includeAuthInfo && req.user, and adds the signed invocation token only
@@ -70,18 +100,24 @@ export async function resolveUpgradeTarget({ req, parsedUrl, policy }) {
             servicePath: upstreamPath,
         });
     } catch (_) {
+        lease.release();
         return { matched: true, ok: false, status: 500 };
     }
     if (definition.access !== 'public' && definition.includeAuthInfo && !identityHeaders['x-ploinky-auth-info']) {
+        lease.release();
         return { matched: true, ok: false, status: 401 }; // fail closed
     }
 
     const setCookie = capRes.getHeader('set-cookie');
     return {
         matched: true, ok: true,
-        hostPort: route.hostPort,
-        upstreamPath,
-        identityHeaders,
+        plan,
+        lease,
+        relayManager: runtime.relayManager,
+        trustedHeaders: {
+            ...(identityHeaders['x-ploinky-auth-info'] ? { authInfo: identityHeaders['x-ploinky-auth-info'] } : {}),
+            ...(req.user?.id ? { userId: req.user.id } : {}),
+        },
         responseHeaders: setCookie ? { 'set-cookie': setCookie } : {},
     };
 }
@@ -100,48 +136,17 @@ export function closeSocket(socket, status, message, headers = {}) {
     try { socket.destroy(); } catch (_) {}
 }
 
-export function proxyWsUpgrade({ socket, head, hostPort, upstreamPath, forwardHeaders, extraResponseHeaders, upstreamHostname = '127.0.0.1' }) {
-    const proxyReq = http.request({
-        hostname: upstreamHostname, port: hostPort, method: 'GET', path: upstreamPath,
-        headers: { ...forwardHeaders, host: `${upstreamHostname}:${hostPort}` },
+export function proxyWsUpgrade({ req, socket, head, plan, lease, relayManager, trustedHeaders }) {
+    return executeWebSocketPlan({
+        req,
+        socket,
+        head,
+        plan,
+        lease,
+        relayManager,
+        authorized: true,
+        trustedHeaders,
     });
-    let settled = false;
-    const timer = setTimeout(() => {
-        if (settled) return;
-        settled = true;
-        try { proxyReq.destroy(); } catch (_) {}
-        closeSocket(socket, 504, 'Gateway Timeout');
-    }, HANDSHAKE_TIMEOUT_MS);
-
-    proxyReq.on('upgrade', (proxyRes, agentSocket, agentHead) => {
-        if (settled) { try { agentSocket.destroy(); } catch (_) {} return; }
-        settled = true; clearTimeout(timer);
-        socket.write(buildStatusLine(proxyRes.statusCode, proxyRes.statusMessage, { ...proxyRes.headers, ...extraResponseHeaders }));
-        if (agentHead && agentHead.length) socket.write(agentHead);   // upstream → browser
-        if (head && head.length) agentSocket.write(head);             // client → agent
-        agentSocket.pipe(socket);
-        socket.pipe(agentSocket);
-        const teardown = () => { try { agentSocket.destroy(); } catch (_) {} try { socket.destroy(); } catch (_) {} };
-        agentSocket.on('error', teardown); socket.on('error', teardown);
-        agentSocket.on('close', () => { try { socket.destroy(); } catch (_) {} });
-        socket.on('close', () => { try { agentSocket.destroy(); } catch (_) {} });
-    });
-
-    proxyReq.on('response', (proxyRes) => {            // agent refused upgrade (e.g. 401)
-        if (settled) return;
-        settled = true; clearTimeout(timer);
-        socket.write(buildStatusLine(proxyRes.statusCode, proxyRes.statusMessage, proxyRes.headers));
-        proxyRes.pipe(socket);
-        proxyRes.on('end', () => { try { socket.destroy(); } catch (_) {} });
-    });
-
-    proxyReq.on('error', () => {
-        if (settled) return;
-        settled = true; clearTimeout(timer);
-        closeSocket(socket, 502, 'Bad Gateway');
-    });
-
-    proxyReq.end();
 }
 
 export async function handleHttpServiceUpgrade({ req, socket, head, parsedUrl, policy }) {
@@ -154,12 +159,6 @@ export async function handleHttpServiceUpgrade({ req, socket, head, parsedUrl, p
     }
     if (!target.matched) return false;
     if (!target.ok) { closeSocket(socket, target.status || 401); return true; }
-    proxyWsUpgrade({
-        socket, head,
-        hostPort: target.hostPort,
-        upstreamPath: target.upstreamPath,
-        forwardHeaders: { ...req.headers, ...target.identityHeaders },
-        extraResponseHeaders: target.responseHeaders || {},
-    });
+    await proxyWsUpgrade({ req, socket, head, ...target });
     return true;
 }

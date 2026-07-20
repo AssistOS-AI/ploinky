@@ -22,9 +22,6 @@ export {
 
 export {
     ensureAgentService,
-    resolveHostPort,
-    resolveHostPortFromRecord,
-    resolveHostPortFromRuntime,
     startAgentContainer
 } from './agentServiceManager.js';
 
@@ -39,7 +36,6 @@ export {
     getConfiguredProjectPath,
     getRuntime,
     isContainerRunning,
-    parseManifestPorts,
     waitForContainerRunning
 } from './common.js';
 

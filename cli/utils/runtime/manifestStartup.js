@@ -1,3 +1,5 @@
+import { assertRouteKeyAvailable } from './reservedRouteKeys.js';
+
 const AUTOMATIC_STARTUP = 'automatic';
 const MANUAL_STARTUP = 'manual';
 const STARTUP_VALUES = new Set([AUTOMATIC_STARTUP, MANUAL_STARTUP]);
@@ -34,9 +36,10 @@ function partitionAdditionalStartupAgents({
             automatic.push(name);
             continue;
         }
+        const routeKey = assertRouteKeyAvailable(record.alias || record.agentName, { label: 'Agent route key' });
         const entry = {
             name,
-            routeKey: record.alias || record.agentName,
+            routeKey,
         };
         if (isRuntimeRunning(name, record)) activeManual.push(entry);
         else inactiveManual.push(entry);

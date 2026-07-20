@@ -18,7 +18,6 @@ import {
     getAgentContainerName,
     getConfiguredProjectPath,
     loadAgentsMap,
-    parseManifestPorts,
     saveAgentsMap,
     syncAgentMcpConfig
 } from '../docker/common.js';
@@ -61,7 +60,6 @@ import {
     getProfileEnvVars,
     mergeProfiles
 } from '../../utils/runtime/profileService.js';
-import { resolveProfileServer } from '../../utils/runtime/profileServer.js';
 import {
     getAgentWorkDir,
     getAgentCodePath,
@@ -562,9 +560,7 @@ function startBwrapProcess(agentName, manifest, agentPath, options = {}) {
 
     // Port resolution — with shared host network, hostPort === containerPort
     // Must happen before env map so PORT is set correctly
-    const { portMappings } = parseManifestPorts(manifest, profileConfig);
-    const additionalServerPort = resolveProfileServer(manifest, profileConfig, { runtimeMode: 'host' });
-    let allPortMappings = [...portMappings];
+    let allPortMappings = [];
     if (!allPortMappings.length) {
         const containerName = options.containerName || getAgentContainerName(agentName, repoName);
         const existingAgents = loadAgentsMap();
@@ -692,7 +688,6 @@ function startBwrapProcess(agentName, manifest, agentPath, options = {}) {
             ],
             env: Array.from(new Set(declaredEnvNames)).map((name) => ({ name })),
             ports: allPortMappings,
-            ...(additionalServerPort ? { additionalServerPort } : {})
         }
     };
     if (existingRecord.auth) {
@@ -727,7 +722,7 @@ function startBwrapProcess(agentName, manifest, agentPath, options = {}) {
     syncAgentMcpConfig(containerName, path.resolve(agentPath), agentName);
 
     const returnPort = allPortMappings.find((p) => p.containerPort === 7000)?.hostPort || allPortMappings[0]?.hostPort || 0;
-    return { containerName, hostPort: returnPort, additionalServerPort };
+    return { containerName, hostPort: returnPort };
 }
 
 /**
@@ -766,9 +761,7 @@ function ensureBwrapService(agentName, manifest, agentPath, options = {}) {
         : null;
 
     assertManifestEnvProfileCompleteness(manifest, profileConfig, { agentName, repoName, profileName: activeProfile });
-    const { portMappings } = parseManifestPorts(manifest, profileConfig);
-    const additionalServerPort = resolveProfileServer(manifest, profileConfig, { runtimeMode: 'host' });
-    let allPortMappings = [...portMappings];
+    let allPortMappings = [];
     if (!allPortMappings.length) {
         const hostPort = preferredHostPort || existingRecord?.config?.ports?.[0]?.hostPort || (10000 + Math.floor(Math.random() * 50000));
         allPortMappings = [{ containerPort: hostPort, hostPort }];
@@ -792,7 +785,7 @@ function ensureBwrapService(agentName, manifest, agentPath, options = {}) {
             debugLog(`[bwrap] ${agentName}: already running (PID ${getBwrapPid(agentName)})`);
             const hostPort = allPortMappings[0]?.hostPort || 0;
             syncAgentMcpConfig(containerName, agentPath, agentName);
-            return { containerName, hostPort, additionalServerPort };
+            return { containerName, hostPort };
         }
     }
 

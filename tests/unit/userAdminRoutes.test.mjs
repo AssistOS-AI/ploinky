@@ -111,6 +111,9 @@ test('user admin routes enforce admin access, CRUD, rev invalidation, and agent 
     const localService = await import(`${pathToFileURL(path.join(REPO_ROOT, 'cli/server/auth/localService.js')).href}?test=${nonce}`);
     const passwordStore = await import(`${pathToFileURL(path.join(REPO_ROOT, 'cli/utils/security/encryptedPasswordStore.js')).href}?test=${nonce}`);
     const passwords = await import(`${pathToFileURL(path.join(REPO_ROOT, 'cli/utils/security/localAuthPasswords.js')).href}?test=${nonce}`);
+    const { compileGeneration } = await import(`${pathToFileURL(path.join(REPO_ROOT, 'cli/server/generation/compileGeneration.js')).href}?test=${nonce}`);
+    const { GenerationStore } = await import(`${pathToFileURL(path.join(REPO_ROOT, 'cli/server/generation/GenerationStore.js')).href}?test=${nonce}`);
+    const runtimeContext = await import(pathToFileURL(path.join(REPO_ROOT, 'cli/server/generation/runtimeContext.js')).href);
 
     const explorerPolicy = { usersVar: 'PLOINKY_AUTH_EXPLORER_USERS' };
     const dpuPolicy = { usersVar: 'PLOINKY_AUTH_DPUAGENT_USERS' };
@@ -128,6 +131,33 @@ test('user admin routes enforce admin access, CRUD, rev invalidation, and agent 
             auth: { mode: 'local', ...dpuPolicy },
         },
     }, null, 2));
+    const generationStore = new GenerationStore();
+    generationStore.activate(compileGeneration({
+        routingBytes: Buffer.from(JSON.stringify({
+            surfaces: { public: { authority: 'localhost' } },
+            routes: {
+                explorer: {
+                    repo: 'AssistOSExplorer', agent: 'explorer',
+                    effectiveInstanceId: 'explorer-instance', enableGeneration: 'explorer-generation',
+                    auth: { mode: 'local', ...explorerPolicy },
+                },
+                dpuAgent: {
+                    repo: 'AssistOSExplorer', agent: 'dpuAgent',
+                    effectiveInstanceId: 'dpu-instance', enableGeneration: 'dpu-generation',
+                    auth: { mode: 'local', ...dpuPolicy },
+                },
+            },
+        })),
+        policyBytes: Buffer.from('{"entries":[]}'),
+        publicAuthority: 'localhost',
+    }));
+    const routingRuntime = {
+        store: generationStore,
+        acquire() { throw new Error('not used by auth route test'); },
+        resolvePrimary() { throw new Error('not used by auth route test'); },
+    };
+    runtimeContext.setRoutingRuntime(routingRuntime);
+    t.after(() => runtimeContext.clearRoutingRuntime(routingRuntime));
 
     passwordStore.setUsersPayload(explorerPolicy.usersVar, {
         version: 1,

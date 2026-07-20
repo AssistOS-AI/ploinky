@@ -1,0 +1,11 @@
+{
+  "mountedApplications": [
+    {
+      "name": "base-path-conformance",
+      "routeKey": "alpha",
+      "port": 7000,
+      "mount": "/app/",
+      "checks": ["html", "relative-asset", "api", "redirect", "cookie", "cors", "sse", "websocket"]
+    }
+  ]
+}

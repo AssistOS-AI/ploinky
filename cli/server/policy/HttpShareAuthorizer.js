@@ -1,11 +1,8 @@
-import fs from 'node:fs';
-import path from 'node:path';
-import http from 'node:http';
-
 import { deriveAgentPrincipalId } from '../../utils/security/agentIdentity.js';
-import { PLOINKY_WORKSPACE_ROOT } from '../../utils/config.js';
 import { buildRouterRequest } from '../mcp-proxy/invocationMinter.js';
 import { computeRch } from '../../../Agent/lib/requestHash.mjs';
+import { getActiveGenerationRoutes } from '../generation/runtimeContext.js';
+import { relayHttpCall } from '../proxy/relayHttpCall.js';
 
 /**
  * ShareAuthorizer (abstract) + HttpShareAuthorizer (concrete) — deny-by-default
@@ -32,20 +29,10 @@ export class ShareAuthorizer {
     }
 }
 
-function readRoutingRoutes() {
-    try {
-        const file = path.join(PLOINKY_WORKSPACE_ROOT, '.ploinky', 'routing.json');
-        const parsed = JSON.parse(fs.readFileSync(file, 'utf8'));
-        return parsed && typeof parsed.routes === 'object' ? parsed.routes : {};
-    } catch {
-        return {};
-    }
-}
-
 function resolveOwningRoute(agentName) {
-    const routes = readRoutingRoutes();
+    const routes = getActiveGenerationRoutes();
     const route = routes[agentName];
-    if (!route || !route.hostPort) return null;
+    if (!route?.relay || !route?.primaryService) return null;
     const repo = String(route.repo || '').trim();
     const agent = String(route.agent || agentName || '').trim();
     if (!repo || !agent) return null;
@@ -55,33 +42,7 @@ function resolveOwningRoute(agentName) {
     } catch {
         return null;
     }
-    return { hostPort: route.hostPort, principalId, agent };
-}
-
-function postJson(hostPort, requestPath, headers, bodyObject, timeoutMs = 2000) {
-    return new Promise((resolve) => {
-        let settled = false;
-        const done = (value) => { if (!settled) { settled = true; resolve(value); } };
-        const payload = Buffer.from(JSON.stringify(bodyObject), 'utf8');
-        const req = http.request({
-            host: '127.0.0.1',
-            port: hostPort,
-            path: requestPath,
-            method: 'POST',
-            headers: { 'content-type': 'application/json', 'content-length': payload.length, ...headers },
-        }, (res) => {
-            const chunks = [];
-            res.on('data', (c) => chunks.push(c));
-            res.on('end', () => {
-                let json = null;
-                try { json = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}'); } catch { json = null; }
-                done({ status: res.statusCode, json });
-            });
-        });
-        req.on('error', () => done({ status: 0, json: null }));
-        req.setTimeout(timeoutMs, () => { req.destroy(); done({ status: 0, json: null }); });
-        req.end(payload);
-    });
+    return { routeKey: agentName, principalId, agent };
 }
 
 export class HttpShareAuthorizer extends ShareAuthorizer {
@@ -106,8 +67,17 @@ export class HttpShareAuthorizer extends ShareAuthorizer {
                 tool: SHARE_TOOL,
                 rch: computeRch(bodyObject),
             });
-            const response = await postJson(owning.hostPort, SHARE_AUTHORIZE_PATH, { authorization: `Bearer ${built.token}` }, bodyObject);
-            if (response.status === 200 && response.json && response.json.allowed === true) {
+            const response = await relayHttpCall({
+                routeKey: owning.routeKey,
+                method: 'POST',
+                target: SHARE_AUTHORIZE_PATH,
+                timeoutMs: 2_000,
+                headers: { authorization: `Bearer ${built.token}`, 'content-type': 'application/json' },
+                body: Buffer.from(JSON.stringify(bodyObject), 'utf8'),
+            });
+            let payload = null;
+            try { payload = JSON.parse(response.body.toString('utf8') || '{}'); } catch (_) {}
+            if (response.statusCode === 200 && payload?.allowed === true) {
                 return { allowed: true, reason: 'agent_approved' };
             }
             return { allowed: false, reason: 'agent_denied' };

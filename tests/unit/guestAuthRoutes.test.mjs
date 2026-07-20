@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { Readable } from 'node:stream';
@@ -10,6 +10,24 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const REPO_ROOT = path.resolve(__dirname, '../..');
 const MASTER_KEY = '4'.repeat(64);
+const AUTH_WORKSPACE = mkdtempSync(path.join(os.tmpdir(), 'ploinky-guest-auth-'));
+const AUTH_PLOINKY_DIR = path.join(AUTH_WORKSPACE, '.ploinky');
+const ORIGINAL_CWD = process.cwd();
+const ORIGINAL_MASTER_KEY = process.env.PLOINKY_MASTER_KEY;
+const ORIGINAL_WORKSPACE_ROOT = process.env.PLOINKY_WORKSPACE_ROOT;
+
+process.chdir(AUTH_WORKSPACE);
+process.env.PLOINKY_MASTER_KEY = MASTER_KEY;
+process.env.PLOINKY_WORKSPACE_ROOT = AUTH_WORKSPACE;
+
+test.after(() => {
+    process.chdir(ORIGINAL_CWD);
+    if (ORIGINAL_MASTER_KEY === undefined) delete process.env.PLOINKY_MASTER_KEY;
+    else process.env.PLOINKY_MASTER_KEY = ORIGINAL_MASTER_KEY;
+    if (ORIGINAL_WORKSPACE_ROOT === undefined) delete process.env.PLOINKY_WORKSPACE_ROOT;
+    else process.env.PLOINKY_WORKSPACE_ROOT = ORIGINAL_WORKSPACE_ROOT;
+    rmSync(AUTH_WORKSPACE, { recursive: true, force: true });
+});
 
 class MockResponse {
     constructor() {
@@ -133,52 +151,64 @@ function writeWorkspaceConfig(ploinkyDir, { staticAuthMode = 'local' } = {}) {
             auth: { mode: 'none' },
         },
     }, null, 2));
-    writeFileSync(path.join(ploinkyDir, 'routing.json'), JSON.stringify({
+    const routing = {
         routes: {
-            explorer: { agent: 'explorer', repo: 'AchillesIDE', hostPort: 55289 },
-            webAssist: { agent: 'webAssist', repo: 'webassist', hostPort: 53659, hostPath: webAssistManifestDir },
-            manifestGuest: { agent: 'manifestGuest', repo: 'webassist', hostPort: 53660, hostPath: staleManifestGuestDir },
-            webAdmin: { agent: 'webAdmin', repo: 'webassist', hostPort: 41155 },
+            explorer: {
+                agent: 'explorer',
+                repo: 'AchillesIDE',
+                auth: staticAuthMode === 'local'
+                    ? { mode: 'local', usersVar: 'PLOINKY_AUTH_EXPLORER_USERS' }
+                    : { mode: 'none' },
+                manifest: {},
+            },
+            webAssist: {
+                agent: 'webAssist',
+                repo: 'webassist',
+                hostPath: webAssistManifestDir,
+                auth: { mode: 'guest' },
+                manifest: JSON.parse(readFileSync(path.join(webAssistManifestDir, 'manifest.json'), 'utf8')),
+            },
+            manifestGuest: {
+                agent: 'manifestGuest',
+                repo: 'webassist',
+                hostPath: staleManifestGuestDir,
+                auth: { mode: 'none' },
+                manifest: { guest: true },
+            },
+            webAdmin: {
+                agent: 'webAdmin',
+                repo: 'webassist',
+                auth: { mode: 'none' },
+                manifest: { webchat: { auth: 'static' } },
+            },
             guestAgent: {
                 agent: 'guestAgent',
                 repo: 'services',
-                hostPort: 43111,
                 hostPath: serviceManifestDir,
+                auth: { mode: 'none' },
+                manifest: JSON.parse(readFileSync(path.join(serviceManifestDir, 'manifest.json'), 'utf8')),
             },
         },
         static: {
             agent: 'explorer',
             hostPath: '/tmp/explorer',
         },
-    }, null, 2));
+    };
+    writeFileSync(path.join(ploinkyDir, 'routing.json'), JSON.stringify(routing, null, 2));
+    return routing;
 }
 
 async function withAuthModules(t, options = {}) {
-    const workspace = mkdtempSync(path.join(os.tmpdir(), 'ploinky-guest-auth-'));
-    const ploinkyDir = path.join(workspace, '.ploinky');
-    mkdirSync(ploinkyDir, { recursive: true });
-    writeWorkspaceConfig(ploinkyDir, options);
-
-    const previousCwd = process.cwd();
-    const previousMasterKey = process.env.PLOINKY_MASTER_KEY;
-    const previousWorkspaceRoot = process.env.PLOINKY_WORKSPACE_ROOT;
-    process.chdir(workspace);
-    process.env.PLOINKY_MASTER_KEY = MASTER_KEY;
-    process.env.PLOINKY_WORKSPACE_ROOT = workspace;
-    t.after(() => {
-        process.chdir(previousCwd);
-        if (previousMasterKey === undefined) {
-            delete process.env.PLOINKY_MASTER_KEY;
-        } else {
-            process.env.PLOINKY_MASTER_KEY = previousMasterKey;
-        }
-        if (previousWorkspaceRoot === undefined) {
-            delete process.env.PLOINKY_WORKSPACE_ROOT;
-        } else {
-            process.env.PLOINKY_WORKSPACE_ROOT = previousWorkspaceRoot;
-        }
-        rmSync(workspace, { recursive: true, force: true });
-    });
+    rmSync(AUTH_PLOINKY_DIR, { recursive: true, force: true });
+    mkdirSync(AUTH_PLOINKY_DIR, { recursive: true });
+    const routingSnapshot = writeWorkspaceConfig(AUTH_PLOINKY_DIR, options);
+    const runtimeContext = await import(pathToFileURL(path.join(REPO_ROOT, 'cli/server/generation/runtimeContext.js')).href);
+    const runtime = {
+        store: { active: { routes: routingSnapshot.routes, static: routingSnapshot.static } },
+        acquire() {},
+        resolvePrimary() {},
+    };
+    runtimeContext.setRoutingRuntime(runtime);
 
     const nonce = `${Date.now()}-${Math.random()}`;
     const authHandlers = await import(`${pathToFileURL(path.join(REPO_ROOT, 'cli/server/authHandlers/index.js')).href}?test=${nonce}`);
@@ -224,19 +254,6 @@ test('guest routes use the guest agent policy instead of the static Explorer pol
     assert.deepEqual(body.user.roles, ['guest']);
     assert.match(String(tokenRes.getHeader('set-cookie') || ''), /^ploinky_guest=/);
     assert.match(String(tokenRes.getHeader('set-cookie') || ''), /Max-Age=3600/);
-
-    const manifestGuestReq = makeRequest({
-        method: 'POST',
-        url: '/manifestGuest/mcp',
-    });
-    const manifestGuestRes = new MockResponse();
-    const manifestGuestParsedUrl = new URL(manifestGuestReq.url, 'http://localhost');
-    const manifestGuestResult = await authHandlers.ensureAuthenticated(manifestGuestReq, manifestGuestRes, manifestGuestParsedUrl);
-
-    assert.equal(manifestGuestResult.ok, true);
-    assert.equal(manifestGuestReq.authMode, 'guest');
-    assert.equal(manifestGuestReq.user?.username, 'visitor');
-    assert.match(String(manifestGuestRes.getHeader('set-cookie') || ''), /^ploinky_guest=/);
 
     const noAuthMcpReq = makeRequest({
         method: 'POST',

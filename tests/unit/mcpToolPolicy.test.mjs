@@ -73,7 +73,13 @@ test('collectDefaults keys policy on the route key, not route.agent (alias safet
     fs.writeFileSync(path.join(agentDir, 'mcp-config.json'), JSON.stringify({
         tools: [{ name: 'do_thing', tags: [] }, { name: 'admin_thing', tags: ['admin'] }],
     }));
-    const defaults = policy.collectDefaults({ myAlias: { hostPath: agentDir, agent: 'realAgentName' } });
+    const defaults = policy.collectDefaults({
+        myAlias: {
+            hostPath: agentDir,
+            agent: 'realAgentName',
+            mcpConfig: { tools: [{ name: 'do_thing', tags: [] }, { name: 'admin_thing', tags: ['admin'] }] },
+        },
+    });
     assert.deepEqual(defaults, [
         { agent: 'myAlias', tool: 'do_thing', access: 'authenticated' },
         { agent: 'myAlias', tool: 'admin_thing', access: 'admin' },

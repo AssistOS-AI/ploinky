@@ -1,5 +1,5 @@
-import { readEnabledAgentManifest, loadRoutingConfig } from './httpServiceRoutes.js';
-import { resolveEnabledAgentRecord } from '../utils/agents.js';
+import { readEnabledAgentManifest } from './httpServiceRoutes.js';
+import { getActiveGenerationRoutes } from './generation/runtimeContext.js';
 import { deriveAgentPrincipalId } from '../utils/security/agentIdentity.js';
 import { verifyAgentAssertion } from './mcp-proxy/invocationMinter.js';
 import { createTokenReplayCache } from './security/tokens/JwsCodec.js';
@@ -10,9 +10,8 @@ import { computeRchHttp, sha256RawBodyHash } from '../../Agent/lib/requestHash.m
  * enabled agents an OpenAI-compatible gateway consumer may address as chat backends.
  *
  * GET /api/router/openai-agent-discovery returns one row per enabled route that
- * resolves to a manifest AND has an active host port. The response is built from
- * `route.hostPath` (via the exported readEnabledAgentManifest) plus the
- * enabled-agent fallback — never a `route.manifestPath`. It deliberately emits NO
+ * resolves to a manifest and an active generation relay. The response is built from
+ * the manifest captured in the active immutable route generation. It deliberately emits NO
  * `http://127.0.0.1:<routerPort>` base URLs: the consumer composes the actual
  * call URL from its own PLOINKY_ROUTER_URL, the returned `routerPath`, and
  * `chatCompletionsPath`. The container-internal port stays inside the router.
@@ -34,25 +33,15 @@ const CHAT_COMPLETIONS_PATH = '/v1/chat/completions';
 // would make replay protection a no-op.
 const discoveryReplayCache = createTokenReplayCache({ maxSize: 4096 });
 
-function isActiveHostPort(value) {
-    const port = Number(value);
-    return Number.isFinite(port) && port > 0;
+function isActiveRelayRoute(route) {
+    return Boolean(route?.relay && Number.isInteger(route?.primaryService?.port));
 }
 
-function resolveRepoAgent(routeKey, route) {
+function resolveRepoAgent(route) {
     const repoFromRoute = String(route?.repo || '').trim();
     const agentFromRoute = String(route?.agent || '').trim();
     if (repoFromRoute && agentFromRoute) {
         return { repo: repoFromRoute, agent: agentFromRoute };
-    }
-    try {
-        const resolved = resolveEnabledAgentRecord(routeKey);
-        const record = resolved?.record || null;
-        const repo = String(record?.repoName || repoFromRoute || '').trim();
-        const agent = String(record?.agentName || agentFromRoute || '').trim();
-        if (repo && agent) return { repo, agent };
-    } catch (_) {
-        // fall through
     }
     return null;
 }
@@ -82,7 +71,7 @@ function resolveResponderKind(manifest) {
 }
 
 function buildAgentRow(routeKey, route, manifest) {
-    const repoAgent = resolveRepoAgent(routeKey, route);
+    const repoAgent = resolveRepoAgent(route);
     if (!repoAgent) return null;
     const subjectId = resolveSubjectId(repoAgent.repo, repoAgent.agent);
     if (!subjectId) return null;
@@ -108,13 +97,12 @@ function buildAgentRow(routeKey, route, manifest) {
 }
 
 /**
- * Pure, unit-testable builder. For each ENABLED route with an active host port and
+ * Pure, unit-testable builder. For each enabled generation route with an active relay and
  * a resolvable manifest, emit one discovery row. Disabled routes, routes without a
- * host port, and routes whose manifest cannot be resolved are excluded. `complete`
+ * primary service, and routes whose manifest cannot be resolved are excluded. `complete`
  * is true only when every enabled route was inspected without an unrecoverable
- * error. `readManifest` is injectable so tests can drive it without on-disk agents;
- * it defaults to the exported readEnabledAgentManifest (hostPath + enabled-agent
- * fallback, never route.manifestPath).
+ * error. `readManifest` is injectable so tests can drive it without staging files;
+ * it defaults to the manifest captured in each active generation route.
  */
 export function buildOpenAiAgentDiscovery({ routes = {}, readManifest = readEnabledAgentManifest } = {}) {
     const agents = [];
@@ -122,7 +110,7 @@ export function buildOpenAiAgentDiscovery({ routes = {}, readManifest = readEnab
 
     for (const [routeKey, route] of Object.entries(routes || {})) {
         if (!route || route.disabled) continue;
-        if (!isActiveHostPort(route.hostPort)) continue;
+        if (!isActiveRelayRoute(route)) continue;
         let manifest = null;
         try {
             manifest = readManifest(routeKey, routes);
@@ -170,7 +158,7 @@ function sendJson(res, statusCode, body) {
  * as failed and preserves its existing rows.
  */
 export function handleOpenAiAgentDiscoveryRoute(req, res, parsedUrl, {
-    routing = loadRoutingConfig(),
+    routing = { routes: getActiveGenerationRoutes() },
     replayCache = discoveryReplayCache,
 } = {}) {
     const pathname = parsedUrl?.pathname || '';

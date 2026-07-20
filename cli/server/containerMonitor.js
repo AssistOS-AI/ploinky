@@ -402,16 +402,20 @@ async function upsertRestartedContainerRoute(target, agentDir, result = {}) {
         repo: target.repoName,
         agent: target.agentName,
         ...(target.alias ? { alias: target.alias } : {}),
-        ...(result.hostPort ? { hostPort: result.hostPort } : {}),
-        additionalServerPort: result.additionalServerPort || null
+        runtime: result.runtime,
+        containerId: result.containerId,
+        networkMode: result.networkMode,
+        targetAgentId: result.targetAgentId,
+        effectiveInstanceId: result.effectiveInstanceId,
+        enableGeneration: result.enableGeneration,
+        relay: result.relay,
+        primaryService: result.primaryService,
+        deniedPorts: []
     };
 
     await mergeRoutingConfig((cfg) => {
         cfg.routes = cfg.routes || {};
         cfg.routes[routeKey] = { ...(cfg.routes[routeKey] || {}), ...route };
-        if (route.additionalServerPort === null) {
-            delete cfg.routes[routeKey].additionalServerPort;
-        }
         return cfg;
     });
 }

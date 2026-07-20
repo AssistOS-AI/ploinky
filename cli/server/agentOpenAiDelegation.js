@@ -1,4 +1,3 @@
-import { resolveEnabledAgentRecord } from '../utils/agents.js';
 import { deriveAgentPrincipalId } from '../utils/security/agentIdentity.js';
 import { verifyAgentAssertion, buildRouterRequest } from './mcp-proxy/invocationMinter.js';
 import { createTokenReplayCache } from './security/tokens/JwsCodec.js';
@@ -10,10 +9,10 @@ import {
     OPENAI_MODELS_PATH,
 } from '../../Agent/lib/invocationAuth.mjs';
 import {
-    proxyHttpBuffered,
     readRequestBody,
     resolveHttpServiceInvocationMaxBodyBytes,
 } from './routerHandlers.js';
+import { executeHttpPlan } from './proxy/executeHttpPlan.js';
 
 /**
  * agentOpenAiDelegation.js — router-mediated agent-to-agent OpenAI calls.
@@ -103,26 +102,17 @@ function resolveOpenAiSurface(method, agentProxyPath) {
     return null;
 }
 
-function resolveRepoAgent(routeKey, route) {
+function resolveRepoAgent(route) {
     const repoFromRoute = String(route?.repo || '').trim();
     const agentFromRoute = String(route?.agent || '').trim();
     if (repoFromRoute && agentFromRoute) {
         return { repo: repoFromRoute, agent: agentFromRoute };
     }
-    try {
-        const resolved = resolveEnabledAgentRecord(routeKey);
-        const record = resolved?.record || null;
-        const repo = String(record?.repoName || repoFromRoute || '').trim();
-        const agent = String(record?.agentName || agentFromRoute || '').trim();
-        if (repo && agent) return { repo, agent };
-    } catch (_) {
-        // fall through
-    }
     return null;
 }
 
-function resolveTargetAgentPrincipal(routeKey, route) {
-    const repoAgent = resolveRepoAgent(routeKey, route);
+function resolveTargetAgentPrincipal(_routeKey, route) {
+    const repoAgent = resolveRepoAgent(route);
     if (!repoAgent) return null;
     try {
         return deriveAgentPrincipalId(repoAgent.repo, repoAgent.agent);
@@ -257,12 +247,18 @@ function sendJson(res, statusCode, body) {
  */
 export function handleDelegatedAgentOpenAiCall(req, res, route, routeKey, agentProxyPath, {
     replayCache = assertionReplayCache,
+    plan,
+    lease,
+    relayManager,
+    auditSink,
 } = {}) {
-    if (!route || !route.hostPort) {
+    if (!route?.relay || !route?.primaryService || !plan || !lease || !relayManager) {
+        lease?.release?.();
         sendJson(res, 404, { error: 'agent_not_found', agent: routeKey });
         return;
     }
     if (readAgenticDepth(req.headers) >= MAX_AGENTIC_DEPTH) {
+        lease.release();
         sendJson(res, 400, { error: { message: `agentic recursion depth exceeded (${MAX_AGENTIC_DEPTH})`, type: 'invalid_request_error' } });
         return;
     }
@@ -272,6 +268,7 @@ export function handleDelegatedAgentOpenAiCall(req, res, route, routeKey, agentP
         onSuccess: (body) => {
             const surface = resolveOpenAiSurface(req.method, agentProxyPath);
             if (!surface) {
+                lease.release();
                 sendJson(res, 404, { error: 'not_found' });
                 return;
             }
@@ -285,22 +282,34 @@ export function handleDelegatedAgentOpenAiCall(req, res, route, routeKey, agentP
                 replayCache,
             });
             if (!result.ok) {
+                lease.release();
                 sendJson(res, result.status, { error: result.error });
                 return;
             }
-            // proxyHttpBuffered strips any client x-ploinky-auth-info (via
-            // stripRouterIdentityHeaders) and then applies the router-owned header,
-            // forwarding the EXACT buffered bytes (content-length set, no re-encode).
-            proxyHttpBuffered(req, res, route.hostPort, agentProxyPath, body, {
-                ...result.authInfoHeader,
-                [AGENTIC_DEPTH_HEADER]: String(readAgenticDepth(req.headers) + 1),
+            executeHttpPlan({
+                req,
+                res,
+                plan,
+                lease,
+                relayManager,
+                authorized: true,
+                prebufferedBody: body,
+                trustedHeaders: {
+                    authInfo: result.authInfoHeader['x-ploinky-auth-info'],
+                    applicationHeaders: {
+                        [AGENTIC_DEPTH_HEADER]: String(readAgenticDepth(req.headers) + 1),
+                    },
+                },
+                auditSink,
             });
         },
         onTooLarge: ({ limitBytes }) => {
+            lease.release();
             const surface = resolveOpenAiSurface(req.method, agentProxyPath) || OPENAI_SURFACES.chat;
             sendJson(res, 413, { error: surface.bodyTooLargeError, limitBytes });
         },
         onError: (err) => {
+            lease.release();
             if (!res.headersSent) {
                 res.writeHead(500, { 'Content-Type': 'application/json' });
             }

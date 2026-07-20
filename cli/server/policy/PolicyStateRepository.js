@@ -71,6 +71,7 @@ export class PolicyStateRepository {
         this._store = store || new FileSystemPolicyStateStore();
         this._cache = null;
         this._cacheKey = '';
+        this._mutationListeners = new Set();
     }
 
     // Returns { ok:true, state, index } or { ok:false, corrupt:true }.
@@ -134,6 +135,21 @@ export class PolicyStateRepository {
         return { corrupt: false, entries: loaded.state.httpRoutes.map((entry) => ({ ...entry })) };
     }
 
+    captureStateBytes() {
+        const loaded = this._load();
+        if (!loaded.ok) throw new Error('policy-state is corrupt');
+        if (typeof this._store.readRawBytes === 'function' && this._store.currentVersion() !== null) {
+            return Buffer.from(this._store.readRawBytes());
+        }
+        return Buffer.from(JSON.stringify(loaded.state), 'utf8');
+    }
+
+    onMutation(listener) {
+        if (typeof listener !== 'function') throw new Error('policy-state mutation listener must be a function');
+        this._mutationListeners.add(listener);
+        return () => this._mutationListeners.delete(listener);
+    }
+
     getHttpRouteEntry(normalizedPath) {
         const loaded = this._load();
         if (!loaded.ok) return { corrupt: true };
@@ -158,6 +174,7 @@ export class PolicyStateRepository {
         const validated = validateState(result);
         this._store.write(validated);
         this.invalidate();
+        for (const listener of this._mutationListeners) listener(validated);
         return validated;
     }
 }

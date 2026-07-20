@@ -14,7 +14,6 @@ import {
     getSecretsForAgent,
     isContainerRunning,
     loadAgentsMap,
-    parseManifestPorts,
     saveAgentsMap,
     syncAgentMcpConfig,
     computeEnvHash,
@@ -74,15 +73,12 @@ function runCommandInContainer(agentName, repoName, manifest, command, interacti
             ];
         const mountOption = mountOptions.join(' ');
 
-        const { publishArgs: manifestPorts, portMappings } = parseManifestPorts(manifest);
-        const portOptions = manifestPorts.map(p => `-p ${p}`).join(' ');
-
         let containerImage = manifest.container;
         let createOutput;
         let containerId;
 
         try {
-            const createCommand = `${runtime} create -it --name ${containerName} ${mountOption} ${portOptions} ${envVars} ${containerImage} /bin/sh -lc "while :; do sleep 3600; done"`;
+            const createCommand = `${runtime} create -it --name ${containerName} ${mountOption} ${envVars} ${containerImage} /bin/sh -lc "while :; do sleep 3600; done"`;
             debugLog(`Executing create command: ${createCommand}`);
             createOutput = execSync(createCommand, { stdio: ['pipe', 'pipe', 'inherit'] }).toString().trim();
             containerId = createOutput;
@@ -97,7 +93,7 @@ function runCommandInContainer(agentName, repoName, manifest, command, interacti
                 }
 
                 console.log(`Retrying with full registry name: ${containerImage}`);
-                const retryCommand = `${runtime} create -it --name ${containerName} ${mountOption} ${portOptions} ${envVars} ${containerImage} /bin/sh -lc \"while :; do sleep 3600; done\"`;
+                const retryCommand = `${runtime} create -it --name ${containerName} ${mountOption} ${envVars} ${containerImage} /bin/sh -lc \"while :; do sleep 3600; done\"`;
                 debugLog(`Executing retry command: ${retryCommand}`);
 
                 try {
@@ -129,7 +125,7 @@ function runCommandInContainer(agentName, repoName, manifest, command, interacti
                     { source: sharedDir, target: '/shared' }
                 ],
                 env: Array.from(new Set(declaredEnvNames)).map(name => ({ name })),
-                ports: portMappings
+                ports: []
             }
         };
         saveAgentsMap(agents);
@@ -265,8 +261,6 @@ function ensureAgentContainer(agentName, repoName, manifest) {
         const roOpt = (runtime === 'podman') ? ':ro,z' : ':ro';
         let containerImage = manifest.container;
         const envHash = computeEnvHash(manifest, profileConfig, {}, { agentName, repoName });
-        const { publishArgs: manifestPorts, portMappings } = parseManifestPorts(manifest);
-        const portOptions = manifestPorts.map(p => `-p ${p}`).join(' ');
         try {
             const createCommand = `${runtime} create -it --name ${containerName} --label ploinky.envhash=${envHash} \
               -v "${projectDir}:${projectDir}${volZ}" \
@@ -274,7 +268,7 @@ function ensureAgentContainer(agentName, repoName, manifest) {
               -v "${agentLibPath}:/Agent${roOpt}" \
               -v "${absAgentPath}:/code${roOpt}" \
               -v "${sharedDir}:/shared${volZ}" \
-              ${portOptions} ${envVars} ${containerImage} /bin/sh -lc "while :; do sleep 3600; done"`;
+              ${envVars} ${containerImage} /bin/sh -lc "while :; do sleep 3600; done"`;
             debugLog(`Executing create command: ${createCommand}`);
             execSync(createCommand, { stdio: ['pipe', 'pipe', 'inherit'] });
             createdNew = true;
@@ -289,7 +283,7 @@ function ensureAgentContainer(agentName, repoName, manifest) {
                   -v "${agentLibPath}:/Agent${roOpt}" \
                   -v "${absAgentPath}:/code${roOpt}" \
                   -v "${sharedDir}:/shared${volZ}" \
-                  ${portOptions} ${envVars} ${containerImage} /bin/sh -lc \"while :; do sleep 3600; done\"`;
+                  ${envVars} ${containerImage} /bin/sh -lc \"while :; do sleep 3600; done\"`;
                 debugLog(`Executing retry command: ${retryCommand}`);
                 execSync(retryCommand, { stdio: ['pipe', 'pipe', 'inherit'] });
                 manifest.container = containerImage;
@@ -315,8 +309,7 @@ function ensureAgentContainer(agentName, repoName, manifest) {
                     { source: absAgentPath, target: '/code', ro: true },
                     { source: sharedDir, target: '/shared' }
                 ],
-                env: Array.from(new Set(declaredEnvNamesX)).map(name => ({ name })),
-                ports: portMappings
+                env: Array.from(new Set(declaredEnvNamesX)).map(name => ({ name }))
             }
         };
         saveAgentsMap(agents);

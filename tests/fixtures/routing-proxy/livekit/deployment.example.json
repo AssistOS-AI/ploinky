@@ -1,0 +1,5 @@
+{
+  "publicConventionUrl": "https://router.example/base-agent-additional-server/media-agent/7880/",
+  "privateControlUrl": "http://host.containers.internal:8081/media-agent/control",
+  "requiredEvidence": ["remote-screen-share-track", "media-byte-counter-increase", "private-assertion-and-acl"]
+}

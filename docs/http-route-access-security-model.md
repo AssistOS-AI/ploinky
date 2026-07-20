@@ -45,6 +45,8 @@ mutually hostile tenants.
 | Boundary | What It Protects | Current Rule |
 | --- | --- | --- |
 | Router public HTTP listener | Browser routes, HTTP services, first-party surfaces, policy commands, MCP entry points. | The router owns authentication, route access, internal path rejection, and proxy dispatch. |
+| Router private HTTP listener | Trusted container machine calls only. | Binds exactly to host `127.0.0.1:8081`; startup proves the runtime-owned host alias reaches that socket. A request needs a request-bound machine assertion and an active-generation ACL matching the exact caller principal, target port, method, and canonical path. Wildcards are invalid. |
+| Agent runtime relay | Primary and convention-selected agent-local HTTP/1.1 services. | Ploinky launches an authenticated exec/stdio child inside the immutable container identity. It has no TCP listener and dials only the policy-selected numeric container-loopback port. |
 | Workspace master key | Session signing, encrypted stores, per-agent request secrets, generated secrets. | `PLOINKY_MASTER_KEY` is high trust; all purpose keys are HKDF-derived from it. |
 | Agent environment | Agent identity and per-agent signing. | Agents receive only `PLOINKY_AGENT_ID`, `PLOINKY_AGENT_PRINCIPAL`, and their own `PLOINKY_AGENT_SECRET`; they never receive the master or shared derived-master request key. |
 | Policy state | Operator/admin HTTP and MCP policy. | Corrupt or old schema state fails the whole document closed. |
@@ -63,12 +65,13 @@ agent routes and declared HTTP services:
 
 | Step | Component | Responsibility |
 | --- | --- | --- |
-| 1 | `RoutingServer.js` | Parse the URL, load active routes, identify router-owned paths, detect agent route or HTTP service route. |
+| 1 | `RoutingServer.js` | Parse the URL, acquire the active immutable generation, identify the exact listener authority and route surface. |
 | 2 | `internalAgentPath.js` plus `HttpRouteAccessPath` | Reject literal or encoded internal `__agent` paths and unroutable path shapes. |
 | 3 | `HttpRouteAccessPolicy.evaluate()` | Compose persisted policy, manifest routes, HTTP service entries, and route defaults. |
 | 4 | `ensureHttpRouteAccess()` | Enforce `public`, `guest`, or `authenticated`; deny everything else. |
-| 5 | Router dispatch | Serve first-party surfaces, declared services, agent static/proxy routes, or MCP routes. |
-| 6 | Proxy/header minting | Strip caller-supplied identity headers and regenerate router-owned identity metadata only after access is satisfied. |
+| 5 | Generation lease | Bind the selected owner, relay, limits, denied ports, path rewrite, and policy to the captured generation; invalidate uncommitted work when activation changes. |
+| 6 | Router dispatch | Serve first-party surfaces or commit the authorization-to-dial lease immediately before relay checkout. |
+| 7 | Proxy/header minting | Strip caller-supplied identity headers and regenerate router-owned identity metadata only after access is satisfied. |
 
 The policy evaluator is intentionally separate from sessions and JWTs. It
 decides what access class applies to a path and method. The executor then
@@ -182,6 +185,7 @@ persisted route, manifest route, or HTTP service declaration.
 | Route has guest mode | `guest` |
 | Route has local or SSO user auth | `authenticated` |
 | Route cannot be resolved safely | Deny |
+| Agent-port convention without an explicit policy | `authenticated` |
 
 The subtle rule is static-agent deference. A route configured as auth mode
 `none` behind a user-authenticated static agent remains user-authenticated.
@@ -216,9 +220,10 @@ agent-relative and expand under the active route key or alias.
 | Router-looking names | Agent-relative `/auth/...`, `/admin/...`, and `/metrics` expand under `/<routeKey>/...`; they are not router-root internals. |
 | Persistence | Manifest declarations are not copied into policy-state. |
 
-Manifest entries are cached by manifest mtime and size in
-`HttpRouteProviders.js`. This avoids re-reading unchanged manifests on every
-request while still updating when the enabled manifest changes.
+Manifest-derived route declarations and HTTP services are captured into the
+immutable routing generation. `HttpRouteProviders.js` reads only that captured
+snapshot during request evaluation. An enabled manifest edit has no effect
+until route reconciliation compiles and atomically activates a new generation.
 
 Invalid manifest route entries are skipped locally. They do not create router
 wide 500s and do not make the path public by accident. This manifest-only
@@ -540,6 +545,10 @@ with delegation settings is invalid.
 | Policy commands | `cli/server/policy/commands/httpRouteCommands.js`, `mcpPolicyCommands.js`, `PolicyCommandInvoker.js` |
 | HTTP executor and sessions | `cli/server/authHandlers.js`, `cli/server/auth/localService.js`, `cli/server/auth/genericAuthBridge.js` |
 | Router dispatch | `cli/server/RoutingServer.js`, `cli/server/routerHandlers.js` |
+| Immutable generation and leases | `cli/server/generation/*.js` |
+| Agent-port selector and locator | `cli/server/agentPortConvention/*.js` |
+| Relay protocol and executors | `cli/server/runtimeRelay/*.js`, `cli/server/proxy/*.js`, `Agent/server/RuntimeHttpRelay.mjs` |
+| Private machine-call listener | `cli/server/privateListener.js`, `cli/server/privateListenerBindings/*.js`, `cli/server/security/tokens/MachineCallAssertionService.js` |
 | HTTP service specs and dispatch | `cli/server/httpServiceRoutes.js` |
 | MCP caller classification | `cli/server/policy/Caller.js`, `McpToolPolicy.js` |
 | Token services | `cli/server/security/tokens/*.js` |
@@ -558,6 +567,9 @@ sessions, MCP policy, or token services.
 | Guest precedence | Local and SSO user sessions take precedence over guest minting. |
 | Guest separation | `guest-session` JWT in `ploinky_jwt` never satisfies authenticated route access. |
 | Route defaults | Static user-auth deference yields `authenticated`; otherwise no-auth routes default to `guest`, never public. |
+| Convention default | An unmatched conventional path defaults to `authenticated`, never ordinary-route guest behavior. |
+| Generation race | Replacement invalidates every uncommitted lease before relay checkout or the first target byte. |
+| Socket boundary | The relay owns no listener, agent TCP ports are not host-published, and private `8081` is loopback-only. |
 | Internal paths | Literal and encoded `__agent` are blocked in path normalization, front-door dispatch, and synthesized upstream handling. |
 | HTTP services | Services use the same evaluator and executor path; invalid service specs unmount locally. |
 | Policy state | Old or corrupt `policy-state.json` fails the whole document closed. |

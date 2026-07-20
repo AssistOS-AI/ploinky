@@ -7,7 +7,6 @@ import { resolveMasterKey, setUsersPayload } from './security/encryptedPasswordS
 import { hashPassword } from './security/localAuthPasswords.js';
 import {
     getAgentContainerName,
-    parseManifestPorts,
     containerExists,
     isContainerRunning,
     waitForContainerRunning,
@@ -18,6 +17,8 @@ import {
 import { findAgent } from './utils.js';
 import { REPOS_DIR, PLOINKY_WORKSPACE_ROOT, ROUTING_FILE } from './config.js';
 import { resolveManifestStartup } from './runtime/manifestStartup.js';
+import { assertRouteKeyAvailable, isReservedRouteKey } from './runtime/reservedRouteKeys.js';
+import { buildRuntimeRoute } from './runtime/runtimeRoute.js';
 import {
     createAgentSymlinks,
     removeAgentSymlinks,
@@ -28,7 +29,6 @@ import {
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-const RESERVED_AGENT_KEYS = new Set(['_config']);
 const ALIAS_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/;
 const AUTH_MODES = new Set(['none', 'local', 'pwd', 'sso', 'guest']);
 export const DEFAULT_ENABLE_AGENT_MODE = 'isolated';
@@ -55,10 +55,7 @@ function normalizeAlias(aliasInput) {
     if (!ALIAS_PATTERN.test(alias)) {
         throw new Error("Alias must start with a letter or number and may contain only letters, numbers, '.', '_' or '-'.");
     }
-    if (RESERVED_AGENT_KEYS.has(alias)) {
-        throw new Error(`Alias '${alias}' is reserved. Choose a different alias.`);
-    }
-    return alias;
+    return assertRouteKeyAvailable(alias, { label: 'Alias' });
 }
 
 function normalizeAuthMode(authMode) {
@@ -248,6 +245,7 @@ export function enableAgent(agentName, mode, repoNameParam, aliasParam, authMode
     const containerBaseName = alias || shortAgentName;
     const containerName = getAgentContainerName(containerBaseName, repoName);
     const routeKey = alias || shortAgentName;
+    assertRouteKeyAvailable(routeKey, { label: 'Agent route key' });
     const instanceName = alias || shortAgentName;
     const authMode = authModeParam === undefined || authModeParam === null || String(authModeParam).trim() === ''
         ? resolveManifestAuthMode(manifest)
@@ -296,10 +294,6 @@ export function enableAgent(agentName, mode, repoNameParam, aliasParam, authMode
         throw new Error(`Unknown mode '${errorMode}'. Allowed: ${formatEnableAgentModes()}`);
     }
 
-    // Parse port mappings from manifest
-    const { portMappings } = parseManifestPorts(manifest);
-    // If no ports specified, use default 7000
-    const ports = portMappings.length > 0 ? portMappings : [{ containerPort: 7000 }];
     const projectMountTarget = runMode === DEFAULT_ENABLE_AGENT_MODE ? '/root' : projectPath;
     const homePath = getAgentDataDir(instanceName);
     try { fs.mkdirSync(homePath, { recursive: true }); } catch (_) {}
@@ -320,8 +314,7 @@ export function enableAgent(agentName, mode, repoNameParam, aliasParam, authMode
                 { source: path.resolve(__dirname, '../../../Agent'), target: '/Agent' },
                 { source: agentPath, target: '/code' }
             ],
-            env: [],
-            ports
+            env: []
         }
     };
     if (authMode === 'local') {
@@ -361,11 +354,9 @@ export function enableAgent(agentName, mode, repoNameParam, aliasParam, authMode
 
     const routing = loadRoutingConfig();
     routing.routes = routing.routes || {};
-    const existingRoute = routing.routes[routeKey] || {};
-    const preferredHostPort = Number(existingRoute.hostPort || 0) || undefined;
 
     for (const key of Object.keys(map)) {
-        if (RESERVED_AGENT_KEYS.has(key)) continue;
+        if (isReservedRouteKey(key)) continue;
         if (!map[key] || typeof map[key] !== 'object') continue;
         if (alias && key === containerName) continue;
         const r = map[key];
@@ -395,32 +386,23 @@ export function enableAgent(agentName, mode, repoNameParam, aliasParam, authMode
         console.log(`Starting agent '${shortAgentName}' from repo '${repoName}'...`);
         started = ensureAgentService(shortAgentName, manifest, agentPath, {
             containerName,
-            alias: alias || undefined,
-            preferredHostPort
+            alias: alias || undefined
         });
     } catch (error) {
         throw new Error(`enable agent: failed to start '${shortAgentName}': ${error?.message || error}`);
     }
     verifyEnabledAgentStarted(shortAgentName, started?.containerName || containerName);
 
-    const hostPort = started?.hostPort || preferredHostPort || existingRoute.hostPort;
-    const additionalServerPort = started?.additionalServerPort || null;
-    routing.routes[routeKey] = {
-        ...existingRoute,
-        container: started?.containerName || containerName,
-        hostPath: agentPath,
-        repo: repoName,
-        agent: shortAgentName,
-        ...(alias ? { alias } : {}),
-        ...(hostPort ? { hostPort } : {}),
-        ...(additionalServerPort ? { additionalServerPort } : {})
-    };
-    if (!additionalServerPort) {
-        delete routing.routes[routeKey].additionalServerPort;
-    }
+    routing.routes[routeKey] = buildRuntimeRoute(routeKey, started, {
+        agentPath,
+        repoName,
+        agentName: shortAgentName,
+        alias,
+        auth: record.auth,
+    });
     saveRoutingConfig(routing);
 
-    return { containerName: started?.containerName || containerName, repoName, shortAgentName, alias: alias || undefined, auth: record.auth, runMode, hostPort };
+    return { containerName: started?.containerName || containerName, repoName, shortAgentName, alias: alias || undefined, auth: record.auth, runMode };
 }
 
 export function disableAgent(agentRef) {

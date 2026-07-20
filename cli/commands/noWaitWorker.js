@@ -14,6 +14,8 @@ import path from 'path';
 import * as dockerSvc from '../sandbox/docker/index.js';
 import { RUNNING_DIR } from '../utils/config.js';
 import { mergeRoutingConfig } from '../server/routingFile.js';
+import { assertRouteKeyAvailable } from '../utils/runtime/reservedRouteKeys.js';
+import { buildRuntimeRoute } from '../utils/runtime/runtimeRoute.js';
 
 function parseArgs(argv) {
     const out = {};
@@ -49,10 +51,7 @@ function writeStatus(containerName, payload) {
 async function upsertRoute(routeKey, route) {
     await mergeRoutingConfig((cfg) => {
         cfg.routes = cfg.routes || {};
-        cfg.routes[routeKey] = { ...(cfg.routes[routeKey] || {}), ...route };
-        if (route.additionalServerPort === null) {
-            delete cfg.routes[routeKey].additionalServerPort;
-        }
+        cfg.routes[routeKey] = route;
         return cfg;
     });
 }
@@ -65,10 +64,20 @@ async function main() {
     const repoName = args.repo;
     const alias = args.alias || '';
     const routeKey = args.routeKey || alias || shortAgent;
+    assertRouteKeyAvailable(routeKey, { label: 'Agent route key' });
     const manifestPath = args.manifestPath;
     const agentPath = args.agentPath || (manifestPath ? path.dirname(manifestPath) : '');
     const routerPort = args.routerPort || '';
     const profileName = args.profile || '';
+    let authPolicy;
+    try {
+        authPolicy = args.authPolicy
+            ? JSON.parse(Buffer.from(args.authPolicy, 'base64url').toString('utf8'))
+            : undefined;
+    } catch (_) {
+        console.error('[no-wait] invalid captured auth policy; refusing to run.');
+        process.exit(2);
+    }
 
     if (!containerName || !shortAgent || !repoName || !manifestPath || !agentPath) {
         console.error('[no-wait] missing required arguments; refusing to run.');
@@ -102,28 +111,23 @@ async function main() {
         if (profileName) ensureOptions.profileName = profileName;
         const result = await dockerSvc.ensureAgentService(shortAgent, manifest, agentPath, ensureOptions);
         const resolvedContainerName = (result && result.containerName) || containerName;
-        const hostPort = result && result.hostPort;
-        const additionalServerPort = result && result.additionalServerPort;
 
-        await upsertRoute(routeKey, {
-            container: resolvedContainerName,
-            hostPath: agentPath,
-            repo: repoName,
-            agent: shortAgent,
-            ...(alias ? { alias } : {}),
-            ...(hostPort ? { hostPort } : {}),
-            additionalServerPort: additionalServerPort || null
-        });
+        await upsertRoute(routeKey, buildRuntimeRoute(routeKey, result, {
+            agentPath,
+            repoName,
+            agentName: shortAgent,
+            alias,
+            auth: authPolicy,
+        }));
 
         const finishedAt = new Date().toISOString();
         writeStatus(containerName, {
             ...baseStatus,
             state: 'running',
             finishedAt,
-            container: resolvedContainerName,
-            hostPort: hostPort || null
+            container: resolvedContainerName
         });
-        console.log(`[no-wait] ${shortAgent}: launch succeeded (container=${resolvedContainerName}${hostPort ? `, hostPort=${hostPort}` : ''})`);
+        console.log(`[no-wait] ${shortAgent}: launch succeeded (container=${resolvedContainerName})`);
     } catch (err) {
         const finishedAt = new Date().toISOString();
         const error = {
