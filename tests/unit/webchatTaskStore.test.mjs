@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 
 import {
+    beginTaskContinuation,
     ingestTaskEvent,
     listTasks,
     readTaskLog,
@@ -100,6 +101,60 @@ test('task log is capped at one MiB', () => {
     }
     const logPath = path.join(root, '.copilot_history', 'task_logs', 'task_1234567890abcdef12345678.log');
     assert.ok(fs.statSync(logPath).size <= __testables.MAX_LOG_BYTES);
+});
+
+test('full-retention task logs are not capped at one MiB', () => {
+    const root = workspace();
+    const content = 'x'.repeat(__testables.MAX_LOG_BYTES + 4096);
+    ingestTaskEvent(root, event({ logRetention: 'full' }, {
+        tail: content,
+        seq: 1,
+    }));
+    assert.equal(readTaskLog(root, event().task.id).text.length, content.length);
+});
+
+test('continuation keeps the local task id and advances only its turn', () => {
+    const root = workspace();
+    const taskId = event().task.id;
+    const continuation = {
+        version: 1,
+        targetAgent: 'opencodeAgent',
+        toolName: 'continue-task',
+        handle: '12345678-1234-4123-8123-123456789abc',
+    };
+    ingestTaskEvent(root, event({
+        status: 'finished',
+        remoteStatus: 'completed',
+        continuation,
+        logRetention: 'full',
+    }, {
+        tail: 'first answer\n',
+        seq: 1,
+        sourceId: 'remote-1',
+    }));
+
+    const next = beginTaskContinuation(root, taskId, {
+        remoteTaskId: 'remote-2',
+        message: 'Continue with tests',
+        updatedAt: '2026-07-14T10:05:00.000Z',
+    });
+
+    assert.equal(next.id, taskId);
+    assert.equal(next.turn, 2);
+    assert.equal(next.remoteTaskId, 'remote-2');
+    assert.equal(next.status, 'ongoing');
+    assert.equal(listTasks(root).length, 1);
+    assert.match(readTaskLog(root, taskId).text, /first answer[\s\S]*Continuation 2[\s\S]*Continue with tests/);
+
+    ingestTaskEvent(root, event({
+        status: 'finished',
+        remoteStatus: 'completed',
+        continuation,
+        turn: 1,
+        remoteTaskId: 'remote-1',
+    }));
+    assert.equal(listTasks(root)[0].turn, 2, 'late events from the previous turn are ignored');
+    assert.equal(listTasks(root)[0].remoteTaskId, 'remote-2');
 });
 
 test('structured task output is persisted and broadcast without entering chat history', () => {

@@ -194,3 +194,42 @@ test('TaskQueue exposes only outputText from structured command results', async 
     assert.equal(completed.logTail, 'live agent output\n');
     assert.doesNotMatch(completed.logTail, /projectDir|outputText/);
 });
+
+test('TaskQueue propagates a validated continuation and retains full logs', async (t) => {
+    const storagePath = makeTempStorage(t);
+    const stdout = JSON.stringify({
+        outputText: 'Done',
+        continuation: {
+            version: 1,
+            handle: '12345678-1234-4123-8123-123456789abc',
+            toolName: 'continue-task',
+        },
+    });
+    const queue = new TaskQueue({
+        maxConcurrent: 1,
+        storagePath,
+        maxLogTailBytes: 8,
+        executor: async (_spec, _payload, options = {}) => {
+            options.onStderrChunk?.('more than eight bytes');
+            return { code: 0, stdout, stderr: '' };
+        },
+    });
+
+    const { id, continuationCapability, logRetention } = queue.enqueueTask({
+        ...dummyTaskConfig(),
+        logRetention: 'full',
+        continuationTool: 'continue-task',
+    });
+    await waitFor(() => queue.getTask(id)?.status === 'completed');
+
+    const task = queue.getTask(id);
+    assert.equal(logRetention, 'full');
+    assert.deepEqual(continuationCapability, { version: 1, toolName: 'continue-task' });
+    assert.equal(task.logTail, 'more than eight bytes');
+    assert.equal(task.logTruncated, false);
+    assert.deepEqual(task.result.metadata.continuation, {
+        version: 1,
+        handle: '12345678-1234-4123-8123-123456789abc',
+        toolName: 'continue-task',
+    });
+});

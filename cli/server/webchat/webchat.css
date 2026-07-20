@@ -657,6 +657,8 @@ body {
 
 .wa-chat-container.side-panel-open .wa-resizer {
     display: block;
+    align-self: flex-start;
+    height: calc(100% - var(--wa-floating-composer-space));
 }
 
 .wa-resizer::before {
@@ -757,10 +759,14 @@ body {
     border-left: 1px solid var(--wa-border);
     display: none; /* Hidden by default */
     flex-direction: column;
+    min-height: 0;
 }
 
 .wa-chat-container.side-panel-open .wa-side-panel {
     display: flex; /* Shown when class is applied */
+    align-self: flex-start;
+    height: calc(100% - var(--wa-floating-composer-space));
+    max-height: calc(100% - var(--wa-floating-composer-space));
 }
 
 .wa-side-panel-header {
@@ -837,7 +843,9 @@ body {
 
 .wa-side-panel-content {
     flex: 1;
-    overflow-y: auto;
+    min-height: 0;
+    overflow: auto;
+    overscroll-behavior: contain;
     padding: 16px;
 }
 
@@ -3044,6 +3052,66 @@ body {
 
 .wa-task-view .wa-task-log {
     flex: 1 1 auto;
+}
+
+.wa-task-continuation {
+    flex: 0 0 auto;
+    display: flex;
+    flex-direction: column;
+    gap: 7px;
+}
+
+.wa-task-continuation[hidden] {
+    display: none;
+}
+
+.wa-task-continuation label {
+    color: var(--wa-text-secondary);
+    font-size: 12px;
+    font-weight: 600;
+}
+
+.wa-task-continuation-row {
+    display: flex;
+    align-items: flex-end;
+    gap: 8px;
+}
+
+.wa-task-continuation textarea {
+    min-width: 0;
+    min-height: 40px;
+    max-height: 132px;
+    flex: 1 1 auto;
+    resize: none;
+    overflow-y: hidden;
+    padding: 9px 11px;
+    border: 1px solid var(--wa-border);
+    border-radius: 9px;
+    background: var(--wa-bg-input);
+    color: var(--wa-text-primary);
+    font: inherit;
+}
+
+.wa-task-continuation button {
+    flex: 0 0 auto;
+    padding: 9px 15px;
+    border: 1px solid var(--wa-accent);
+    border-radius: 9px;
+    background: var(--wa-accent);
+    color: #fff;
+    cursor: pointer;
+    font: inherit;
+    font-weight: 600;
+}
+
+.wa-task-continuation button:disabled {
+    cursor: progress;
+    opacity: 0.6;
+}
+
+.wa-task-continuation-error {
+    color: #f15c6d;
+    font-size: 12px;
 }
 
 .wa-task-empty {
