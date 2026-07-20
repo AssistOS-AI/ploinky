@@ -30,6 +30,7 @@ test('task log updates append in order, ignore duplicates, and request gap recov
 test('task status presentation preserves queued work and maps lifecycle labels', () => {
     assert.equal(taskStatusPresentation({ status: 'ongoing', remoteStatus: 'pending' }).label, 'QUEUED');
     assert.equal(taskStatusPresentation({ status: 'ongoing', remoteStatus: 'running' }).label, 'RUNNING');
+    assert.equal(taskStatusPresentation({ status: 'ongoing', remoteStatus: 'cancelling' }).label, 'STOPPING');
     assert.equal(taskStatusPresentation({ status: 'finished' }).label, 'COMPLETED');
     assert.equal(taskStatusPresentation({ status: 'error' }).label, 'FAILED');
     assert.equal(taskStatusPresentation(null).label, 'UNAVAILABLE');
@@ -125,7 +126,7 @@ test('chat task summary shows metadata and a delegated live-log link without inl
         'Build project',
         'RUNNING',
     ]);
-    assert.equal(link.textContent, 'View live logs');
+    assert.equal(link.textContent, 'View task details');
     assert.equal(link.dataset.wcLink, 'true');
     assert.equal(link.dataset.wcTaskId, task.id);
     assert.equal(link.href, `/webchat/tasks/${task.id}/view`);

@@ -10,6 +10,7 @@ import {
     readEnabledAgentManifest,
 } from '../../httpServiceRoutes.js';
 import {
+    cancelAuthenticatedAgentTask,
     invokeAuthenticatedAgentTool,
     readAuthenticatedAgentTask,
 } from '../../mcp-proxy/index.js';
@@ -188,6 +189,36 @@ function taskResultText(task) {
         .join('\n');
 }
 
+function ingestRemoteTask(workspaceDirectory, task, remote) {
+    const continuation = remote?.result?.metadata?.continuation?.handle
+        ? {
+            version: 1,
+            targetAgent: task.targetAgent,
+            toolName: remote.result.metadata.continuation.toolName
+                || task.continuation?.toolName
+                || '',
+            handle: remote.result.metadata.continuation.handle,
+        }
+        : task.continuation;
+    return ingestTaskEvent(workspaceDirectory, {
+        task: {
+            ...task,
+            status: remoteStatus(remote?.status),
+            remoteStatus: String(remote?.status || 'running'),
+            updatedAt: remote?.updatedAt || new Date().toISOString(),
+            error: String(remote?.error || ''),
+            ...(continuation ? { continuation } : {}),
+        },
+        log: {
+            tail: typeof remote?.logTail === 'string' ? remote.logTail : '',
+            seq: Number.isFinite(Number(remote?.logSeq)) ? Number(remote.logSeq) : null,
+            sourceId: task.remoteTaskId,
+            truncated: remote?.logTruncated === true,
+        },
+        finalOutput: taskResultText(remote),
+    });
+}
+
 export async function handleTaskRoute({
     pathname,
     req,
@@ -265,16 +296,48 @@ export async function handleTaskRoute({
         return true;
     }
 
+    const stopMatch = /^\/tasks\/(task_[0-9a-f]{24})\/stop$/.exec(pathname);
+    if (stopMatch && req.method === 'POST') {
+        try {
+            const task = getTask(workspaceDirectory, stopMatch[1]);
+            if (!task) throw Object.assign(new Error('task_not_found'), { status: 404 });
+            if (task.status !== 'ongoing') {
+                throw Object.assign(new Error('task_not_running'), { status: 409 });
+            }
+            const resolved = resolveAgentRoute(task.targetAgent);
+            if (!resolved?.route?.hostPort) {
+                throw Object.assign(new Error('task_agent_unavailable'), { status: 409 });
+            }
+            const remote = await cancelAuthenticatedAgentTask({
+                req,
+                route: resolved.route,
+                agentName: resolved.agentName,
+                taskId: task.remoteTaskId,
+            });
+            const update = ingestRemoteTask(workspaceDirectory, task, remote);
+            broadcastTaskUpdate(appState, workspaceDirectory, update);
+            sendJson(res, 202, { ok: true, ...update });
+        } catch (error) {
+            sendJson(res, error?.status || 500, {
+                ok: false,
+                error: error?.message || 'task_stop_failed',
+            });
+        }
+        return true;
+    }
+
     const refreshMatch = /^\/tasks\/(task_[0-9a-f]{24})\/refresh$/.exec(pathname);
     if (refreshMatch && req.method === 'GET') {
         try {
             const task = getTask(workspaceDirectory, refreshMatch[1]);
             if (!task) throw Object.assign(new Error('task_not_found'), { status: 404 });
-            if (task.status !== 'ongoing' || !task.continuation) {
+            if (task.status !== 'ongoing') {
                 sendJson(res, 200, { ok: true, task });
                 return true;
             }
-            const resolved = await ensureContinuationAgentRoute(task.continuation.targetAgent);
+            const resolved = await ensureContinuationAgentRoute(
+                task.continuation?.targetAgent || task.targetAgent,
+            );
             if (!resolved) {
                 throw Object.assign(new Error('continuation_agent_unavailable'), { status: 409 });
             }
@@ -284,31 +347,7 @@ export async function handleTaskRoute({
                 agentName: resolved.agentName,
                 taskId: task.remoteTaskId,
             });
-            const continuation = remote?.result?.metadata?.continuation?.handle
-                ? {
-                    version: 1,
-                    targetAgent: task.targetAgent,
-                    toolName: remote.result.metadata.continuation.toolName || task.continuation.toolName,
-                    handle: remote.result.metadata.continuation.handle,
-                }
-                : task.continuation;
-            const update = ingestTaskEvent(workspaceDirectory, {
-                task: {
-                    ...task,
-                    status: remoteStatus(remote?.status),
-                    remoteStatus: String(remote?.status || 'running'),
-                    updatedAt: remote?.updatedAt || new Date().toISOString(),
-                    error: String(remote?.error || ''),
-                    continuation,
-                },
-                log: {
-                    tail: typeof remote?.logTail === 'string' ? remote.logTail : '',
-                    seq: Number.isFinite(Number(remote?.logSeq)) ? Number(remote.logSeq) : null,
-                    sourceId: task.remoteTaskId,
-                    truncated: remote?.logTruncated === true,
-                },
-                finalOutput: taskResultText(remote),
-            });
+            const update = ingestRemoteTask(workspaceDirectory, task, remote);
             broadcastTaskUpdate(appState, workspaceDirectory, update);
             sendJson(res, 200, { ok: true, ...update });
         } catch (error) {
@@ -338,5 +377,6 @@ export const __testables = {
     ensureContinuationAgentRoute,
     remoteStatus,
     resolveAgentRoute,
+    ingestRemoteTask,
     taskResultText,
 };

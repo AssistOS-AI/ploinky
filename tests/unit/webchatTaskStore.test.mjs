@@ -204,6 +204,31 @@ test('failed task with a provider session can start another turn', () => {
     assert.equal(next.error, '');
 });
 
+test('cancelled task with a provider session can start another turn', () => {
+    const root = workspace();
+    const taskId = event().task.id;
+    ingestTaskEvent(root, event({
+        status: 'stopped',
+        remoteStatus: 'cancelled',
+        continuation: {
+            version: 1,
+            targetAgent: 'opencodeAgent',
+            toolName: 'continue-task',
+            handle: '12345678-1234-4123-8123-123456789abc',
+        },
+    }));
+
+    const next = beginTaskContinuation(root, taskId, {
+        remoteTaskId: 'remote-after-stop',
+        message: 'Resume from the saved session',
+    });
+
+    assert.equal(next.id, taskId);
+    assert.equal(next.turn, 2);
+    assert.equal(next.status, 'ongoing');
+    assert.equal(next.error, '');
+});
+
 test('structured task output is persisted and broadcast without entering chat history', () => {
     const root = workspace();
     const writes = [];

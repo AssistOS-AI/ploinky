@@ -46,7 +46,7 @@ test('WebChat exposes a workspace task overlay and generic task endpoints', () =
     assert.match(messages, /message\?\.type === 'task'/);
     assert.match(messages, /wa-task-item/);
     assert.doesNotMatch(messages, /taskAssociations/);
-    assert.match(presentation, /View live logs/);
+    assert.match(presentation, /View task details/);
     assert.match(presentation, /data.*wcTaskId|dataset\.wcTaskId/);
     assert.doesNotMatch(presentation, /wa-inline-task-arrow|wa-inline-task-log/);
     assert.match(presentation, /\(stdout\|stderr\)/);

@@ -21,6 +21,8 @@ const AGENT_PROXY_PROTOCOL_VERSION = '2025-06-18';
 const AGENT_PROXY_SERVER_INFO = { name: 'ploinky-router-proxy', version: '1.0.0' };
 const TOOL_SCHEMA_CACHE_TTL_MS = 30_000;
 const TASK_STATUS_TOOL = '__task_status__';
+const TASK_CANCEL_TOOL = '__task_cancel__';
+const TASK_CANCEL_PATH = '/task/cancel';
 // Replay cache for verified Agent Assertions (agent-to-agent jti single-use).
 const assertionReplayCache = createTokenReplayCache({ maxSize: 4096 });
 
@@ -222,6 +224,65 @@ export async function readAuthenticatedAgentTask({ req, route, agentName, taskId
         });
         request.on('error', reject);
         request.end();
+    });
+}
+
+export async function cancelAuthenticatedAgentTask({ req, route, agentName, taskId }) {
+    const caller = policy.resolveCaller(req);
+    if (caller?.kind !== 'user') {
+        const error = new Error('authenticated_user_required');
+        error.status = 401;
+        throw error;
+    }
+    if (!route?.hostPort) {
+        const error = new Error('task_agent_unavailable');
+        error.status = 409;
+        throw error;
+    }
+    const normalizedTaskId = String(taskId || '').trim();
+    if (!normalizedTaskId) {
+        const error = new Error('invalid_remote_task_id');
+        error.status = 400;
+        throw error;
+    }
+    const args = { taskId: normalizedTaskId };
+    const context = buildInvocationContextForProviderCall({
+        req,
+        agentName,
+        toolName: TASK_CANCEL_TOOL,
+        toolArgs: args,
+        method: 'POST',
+        path: TASK_CANCEL_PATH,
+    });
+    const payload = Buffer.from(JSON.stringify(args), 'utf8');
+    const url = new URL(`http://127.0.0.1:${route.hostPort}${TASK_CANCEL_PATH}`);
+    return await new Promise((resolve, reject) => {
+        const request = http.request(url, {
+            method: 'POST',
+            headers: {
+                accept: 'application/json',
+                'content-type': 'application/json',
+                'content-length': payload.length,
+                ...(context?.token ? { authorization: `Bearer ${context.token}` } : {}),
+            },
+        }, (response) => {
+            const chunks = [];
+            response.on('data', (chunk) => chunks.push(chunk));
+            response.on('end', () => {
+                const text = Buffer.concat(chunks).toString('utf8');
+                let body = null;
+                try { body = JSON.parse(text); } catch (_) { }
+                if ((response.statusCode || 500) >= 400 || !body?.task) {
+                    const error = new Error(body?.reason || body?.error || `task_cancel_${response.statusCode}`);
+                    error.status = response.statusCode || 502;
+                    reject(error);
+                    return;
+                }
+                resolve(body.task);
+            });
+        });
+        request.on('error', reject);
+        request.end(payload);
     });
 }
 

@@ -97,6 +97,22 @@ test('task continuation input submits on Enter and auto-resizes without manual r
     );
 });
 
+test('task view stops ongoing work through the local task route', () => {
+    const source = fs.readFileSync(
+        new URL('../../cli/server/webchat/taskView.js', import.meta.url),
+        'utf8',
+    );
+    const html = fs.readFileSync(
+        new URL('../../cli/server/webchat/task-view.html', import.meta.url),
+        'utf8',
+    );
+    assert.match(html, /id="taskStop"/);
+    assert.match(source, /task\?\.status === 'ongoing'/);
+    assert.match(source, /remoteStatus \|\| ''\).*=== 'cancelling'/);
+    assert.match(source, /tasks\/\$\{encodeURIComponent\(taskId\)\}\/stop/);
+    assert.match(source, /Stopping…/);
+});
+
 test('task continuation activates a missing provider globally and waits for readiness', async () => {
     let route = null;
     const activations = [];

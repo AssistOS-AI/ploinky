@@ -36,6 +36,8 @@ const OPENAI_CHAT_COMPLETIONS_PATH = '/v1/chat/completions';
 const OPENAI_MODELS_PATH = '/v1/models';
 const AGENT_CARD_PATH = '/agent-card';
 const TASK_STATUS_PATHS = new Set(['/getTaskStatus', '/task']);
+const TASK_CANCEL_PATH = '/task/cancel';
+const TASK_CANCEL_TOOL = '__task_cancel__';
 const TAG_NAME_RE = /^[a-z][a-z0-9_-]{0,63}$/;
 
 function verifyInvocationForRequest({ requestHeaders, method, path, tool, argumentsObj }) {
@@ -586,7 +588,8 @@ function executeShell(spec, payload, options = {}) {
             cwd,
             env: { ...process.env, ...env },
             stdio: ['pipe', 'pipe', 'pipe'],
-            timeout: timeoutMs
+            timeout: timeoutMs,
+            detached: options.detached === true,
         });
         if (typeof options.onSpawn === 'function') {
             try {
@@ -1386,6 +1389,35 @@ async function main() {
                     return sendJson(401, { error: 'invocation_rejected', reason: invocationResult.reason });
                 }
                 const task = taskQueue.getTask(taskId);
+                if (!task) {
+                    return sendJson(404, { error: 'task not found' });
+                }
+                return sendJson(200, { task });
+            }
+            if (method === 'POST' && u.pathname === TASK_CANCEL_PATH) {
+                const parsedBody = await readJsonBody(req);
+                if (!parsedBody.ok || !parsedBody.body || typeof parsedBody.body !== 'object') {
+                    return sendJson(400, { error: 'invalid_json' });
+                }
+                const taskId = typeof parsedBody.body.taskId === 'string'
+                    ? parsedBody.body.taskId.trim()
+                    : '';
+                if (!taskId) {
+                    return sendJson(400, { error: 'missing taskId' });
+                }
+                const invocationResult = hasInvocationTokenHeader(req.headers)
+                    ? verifyInvocationForRequest({
+                        requestHeaders: req.headers,
+                        method: 'POST',
+                        path: TASK_CANCEL_PATH,
+                        tool: TASK_CANCEL_TOOL,
+                        argumentsObj: { taskId },
+                    })
+                    : { ok: false, reason: 'missing secure wire headers' };
+                if (!invocationResult.ok) {
+                    return sendJson(401, { error: 'invocation_rejected', reason: invocationResult.reason });
+                }
+                const task = taskQueue.cancelTask(taskId);
                 if (!task) {
                     return sendJson(404, { error: 'task not found' });
                 }

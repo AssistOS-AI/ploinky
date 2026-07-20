@@ -269,3 +269,102 @@ test('TaskQueue preserves a validated continuation when the provider task fails'
         toolName: 'continue-task',
     });
 });
+
+test('TaskQueue cancels queued work without starting it', async (t) => {
+    const storagePath = makeTempStorage(t);
+    const executions = [];
+    const queue = new TaskQueue({
+        maxConcurrent: 1,
+        storagePath,
+        executor: (_spec, payload) => new Promise((resolve) => {
+            executions.push({ taskId: payload.taskId, resolve });
+        }),
+    });
+    const runningId = queue.enqueueTask(dummyTaskConfig({ order: 1 })).id;
+    const queuedId = queue.enqueueTask(dummyTaskConfig({ order: 2 })).id;
+    await waitFor(() => executions.length === 1);
+
+    assert.equal(queue.cancelTask(queuedId)?.status, 'cancelled');
+    executions[0].resolve({ code: 0, stdout: 'done', stderr: '' });
+    await waitFor(() => queue.getTask(runningId)?.status === 'completed');
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    assert.equal(executions.length, 1);
+    assert.equal(queue.getTask(queuedId)?.status, 'cancelled');
+});
+
+test('TaskQueue keeps a running task in cancelling until cleanup returns its continuation', async (t) => {
+    const storagePath = makeTempStorage(t);
+    const signals = [];
+    let complete;
+    const queue = new TaskQueue({
+        maxConcurrent: 1,
+        storagePath,
+        executor: (_spec, _payload, options = {}) => new Promise((resolve) => {
+            complete = resolve;
+            options.onSpawn?.({
+                pid: null,
+                kill(signal) {
+                    signals.push(signal);
+                    return true;
+                },
+            });
+        }),
+    });
+    const { id } = queue.enqueueTask({
+        ...dummyTaskConfig(),
+        continuationTool: 'continue-task',
+    });
+    await waitFor(() => queue.getTask(id)?.status === 'running');
+
+    assert.equal(queue.cancelTask(id)?.status, 'cancelling');
+    assert.deepEqual(signals, ['SIGTERM']);
+    complete({
+        code: 1,
+        stderr: 'cancelled',
+        stdout: JSON.stringify({
+            outputText: '',
+            continuation: {
+                version: 1,
+                handle: '12345678-1234-4123-8123-123456789abc',
+                toolName: 'continue-task',
+            },
+        }),
+    });
+    await waitFor(() => queue.getTask(id)?.status === 'cancelled');
+
+    assert.equal(queue.getTask(id)?.error, null);
+    assert.equal(
+        queue.getTask(id)?.result?.metadata?.continuation?.handle,
+        '12345678-1234-4123-8123-123456789abc',
+    );
+});
+
+test('TaskQueue force-kills cleanup that exceeds the cancellation grace period', async (t) => {
+    const storagePath = makeTempStorage(t);
+    const signals = [];
+    let complete;
+    const queue = new TaskQueue({
+        maxConcurrent: 1,
+        storagePath,
+        cancelGraceMs: 10,
+        executor: (_spec, _payload, options = {}) => new Promise((resolve) => {
+            complete = resolve;
+            options.onSpawn?.({
+                pid: null,
+                kill(signal) {
+                    signals.push(signal);
+                    return true;
+                },
+            });
+        }),
+    });
+    const { id } = queue.enqueueTask(dummyTaskConfig());
+    await waitFor(() => queue.getTask(id)?.status === 'running');
+    queue.cancelTask(id);
+    await waitFor(() => signals.includes('SIGKILL'));
+    complete({ code: null, signal: 'SIGKILL', stdout: '', stderr: '' });
+    await waitFor(() => queue.getTask(id)?.status === 'cancelled');
+
+    assert.deepEqual(signals, ['SIGTERM', 'SIGKILL']);
+});

@@ -3,8 +3,10 @@ import fs from 'node:fs';
 import { describeShellFailure } from '../lib/toolError.mjs';
 
 const DEFAULT_MAX_LOG_TAIL_BYTES = 128 * 1024;
+const DEFAULT_CANCEL_GRACE_MS = 2000;
 const CONTINUATION_HANDLE_RE = /^[A-Za-z0-9_-]{16,200}$/;
 const TOOL_NAME_RE = /^[A-Za-z0-9._-]{1,160}$/;
+const TERMINAL_STATUSES = new Set(['completed', 'failed', 'cancelled']);
 
 function parsePositiveInt(value, fallback) {
     const parsed = Number.parseInt(value, 10);
@@ -42,7 +44,13 @@ function commandResult(stdout) {
 }
 
 export class TaskQueue {
-    constructor({ maxConcurrent = 10, storagePath, executor, maxLogTailBytes = DEFAULT_MAX_LOG_TAIL_BYTES }) {
+    constructor({
+        maxConcurrent = 10,
+        storagePath,
+        executor,
+        maxLogTailBytes = DEFAULT_MAX_LOG_TAIL_BYTES,
+        cancelGraceMs = DEFAULT_CANCEL_GRACE_MS,
+    }) {
         if (typeof executor !== 'function') {
             throw new Error('TaskQueue requires an executor function');
         }
@@ -50,10 +58,13 @@ export class TaskQueue {
         this.storagePath = storagePath;
         this.executor = executor;
         this.maxLogTailBytes = parsePositiveInt(maxLogTailBytes, DEFAULT_MAX_LOG_TAIL_BYTES);
+        this.cancelGraceMs = parsePositiveInt(cancelGraceMs, DEFAULT_CANCEL_GRACE_MS);
         this.tasks = new Map();
         this.taskLogs = new Map();
         this.pending = [];
         this.running = new Set();
+        this.activeChildren = new Map();
+        this.cancelTimers = new Map();
         this.initialized = false;
     }
 
@@ -70,7 +81,13 @@ export class TaskQueue {
             return aTime - bTime;
         });
         for (const task of restartable) {
-            if (task.status === 'pending' || task.status === 'running') {
+            if (task.status === 'cancelling') {
+                task.status = 'cancelled';
+                task.error = null;
+                task.updatedAt = new Date().toISOString();
+                task.result = null;
+                needsPersist = true;
+            } else if (task.status === 'pending' || task.status === 'running') {
                 task.status = 'failed';
                 task.error = 'Task interrupted before completion (agent restart)';
                 task.updatedAt = new Date().toISOString();
@@ -273,6 +290,7 @@ export class TaskQueue {
             updatedAt: new Date().toISOString(),
             error: null,
             result: null,
+            cancelRequested: false,
             logTail: '',
             logSeq: 0,
             logTruncated: false
@@ -315,6 +333,58 @@ export class TaskQueue {
         }
     }
 
+    signalTaskProcess(child, signal) {
+        if (!child) return false;
+        const pid = Number(child.pid);
+        if (Number.isInteger(pid) && pid > 0 && process.platform !== 'win32') {
+            try {
+                process.kill(-pid, signal);
+                return true;
+            } catch (_) {
+            }
+        }
+        try {
+            return child.kill(signal) !== false;
+        } catch (_) {
+            return false;
+        }
+    }
+
+    requestRunningTaskCancellation(task, child) {
+        if (!task || !child) return;
+        this.signalTaskProcess(child, 'SIGTERM');
+        if (this.cancelTimers.has(task.id)) return;
+        const timer = setTimeout(() => {
+            this.cancelTimers.delete(task.id);
+            const activeChild = this.activeChildren.get(task.id);
+            if (activeChild) this.signalTaskProcess(activeChild, 'SIGKILL');
+        }, this.cancelGraceMs);
+        timer.unref?.();
+        this.cancelTimers.set(task.id, timer);
+    }
+
+    cancelTask(taskId) {
+        this.initialize();
+        const task = this.tasks.get(String(taskId || ''));
+        if (!task) return null;
+        if (TERMINAL_STATUSES.has(task.status)) return this.getTask(task.id);
+        task.cancelRequested = true;
+        task.error = null;
+        task.updatedAt = new Date().toISOString();
+        if (task.status === 'pending') {
+            this.pending = this.pending.filter((candidate) => candidate !== task.id);
+            task.status = 'cancelled';
+            this.persistTasks();
+            this.processQueue();
+            return this.getTask(task.id);
+        }
+        task.status = 'cancelling';
+        this.persistTasks();
+        const child = this.activeChildren.get(task.id);
+        if (child) this.requestRunningTaskCancellation(task, child);
+        return this.getTask(task.id);
+    }
+
     startTask(task) {
         if (!task) {
             return;
@@ -353,12 +423,16 @@ export class TaskQueue {
             };
             const result = await this.executor(task.commandSpec, task.payload, {
                 onSpawn: (child) => {
+                    this.activeChildren.set(task.id, child);
+                    if (task.cancelRequested) {
+                        this.requestRunningTaskCancellation(task, child);
+                    }
                     if (Number.isFinite(task.timeoutMs) && task.timeoutMs > 0) {
                         timer = setTimeout(() => {
                             if (!child.killed) {
                                 timedOut = true;
                                 try {
-                                    child.kill('SIGKILL');
+                                    this.signalTaskProcess(child, 'SIGKILL');
                                 } catch (err) {
                                     console.error('[AgentServer/MCP] Failed to kill timed-out task:', err);
                                 }
@@ -374,7 +448,8 @@ export class TaskQueue {
                 onStderrChunk: (chunk) => {
                     forwardToHostLog(process.stderr, chunk);
                     this.appendTaskLog(task.id, chunk);
-                }
+                },
+                detached: true,
             });
 
             if (timer) {
@@ -387,7 +462,19 @@ export class TaskQueue {
                 && parsedResult.continuation?.toolName === task.continuationTool
                 ? parsedResult.continuation
                 : null;
-            if (success) {
+            if (task.cancelRequested || task.status === 'cancelling') {
+                task.status = 'cancelled';
+                task.error = null;
+                task.result = continuation
+                    ? {
+                        content: [],
+                        metadata: {
+                            agent: process.env.AGENT_NAME || task.toolName,
+                            continuation,
+                        },
+                    }
+                    : null;
+            } else if (success) {
                 const content = [{ type: 'text', text: parsedResult.text }];
                 task.status = 'completed';
                 task.result = {
@@ -418,10 +505,20 @@ export class TaskQueue {
             if (timer) {
                 clearTimeout(timer);
             }
-            task.status = 'failed';
-            task.error = err?.message || 'Task execution failed';
-            task.result = null;
+            if (task.cancelRequested || task.status === 'cancelling') {
+                task.status = 'cancelled';
+                task.error = null;
+                task.result = null;
+            } else {
+                task.status = 'failed';
+                task.error = err?.message || 'Task execution failed';
+                task.result = null;
+            }
         } finally {
+            this.activeChildren.delete(task.id);
+            const cancelTimer = this.cancelTimers.get(task.id);
+            if (cancelTimer) clearTimeout(cancelTimer);
+            this.cancelTimers.delete(task.id);
             task.updatedAt = new Date().toISOString();
             this.persistTasks();
         }

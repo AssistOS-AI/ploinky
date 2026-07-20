@@ -151,7 +151,7 @@ on the EventSource event, but this transient routing data must not be duplicated
 in the task journal. The browser must render every task item as its own compact
 incoming-style chat item. Its first row must show the exact target-agent id,
 description, status, and elapsed whole seconds, and its second row must expose a
-`View live logs` link without inline expansion controls or logs. The browser
+`View task details` link without inline expansion controls or logs. The browser
 must recover the same item after history loading by resolving its `taskId`
 against the task route. A live task
 item may appear before final assistant text arrives; indexed insertion must
@@ -171,6 +171,26 @@ must not open another EventSource or create a task-specific live transport.
 Missing log offsets must be recovered through the existing log route. Direct
 navigation may show the current authenticated snapshot without a parent live
 bridge.
+
+The task page must expose a direct `Stop` action while the current remote task
+is queued or running. The authenticated WebChat route resolves the already
+stored target agent and remote task id; it must not accept either value from the
+browser, silently choose another provider, or activate an unavailable agent.
+It sends a request-bound Router Request to the target AgentServer
+`POST /task/cancel` surface. Queued work becomes `cancelled` without starting.
+Running work first becomes `cancelling`, receives graceful termination, and is
+force-terminated after a two-second cleanup grace period if it has not exited.
+Repeated stop requests and requests against terminal work are idempotent. The
+local task remains `ongoing` while remote cleanup is in progress and becomes
+`stopped` when the remote task reports `cancelled`.
+
+Cancellation never creates a replacement WebChat task. If a running provider
+created and persisted a continuation handle before it stopped, the same local
+task remains continuable: a later message increments its turn and starts a new
+remote execution exactly as failed-task continuation does. A queued task
+cancelled before provider execution has no provider session and therefore no
+continuation input. The continuation field is capability-driven, not granted
+merely because a task has `stopped` status.
 
 The generic side panel used by task views and every other delegated link must
 remain vertically bounded above WebChat's floating composer. Its available

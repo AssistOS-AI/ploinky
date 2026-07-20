@@ -9,6 +9,9 @@ export function taskStatusPresentation(task) {
     if (task.status === 'stopped') return { label: 'STOPPED', className: 'stopped' };
     if (task.status === 'error') return { label: 'FAILED', className: 'error' };
     const remoteStatus = String(task.remoteStatus || '').trim().toLowerCase();
+    if (remoteStatus === 'cancelling') {
+        return { label: 'STOPPING', className: 'cancelling' };
+    }
     if (remoteStatus === 'pending' || remoteStatus === 'queued') {
         return { label: 'QUEUED', className: 'queued' };
     }
@@ -146,7 +149,7 @@ export function attachTaskSummary({ bubble, taskId, taskController }) {
     link.rel = 'noopener noreferrer';
     link.dataset.wcLink = 'true';
     link.dataset.wcTaskId = taskId;
-    link.textContent = 'View live logs';
+    link.textContent = 'View task details';
     panel.append(summary, link);
     const timeNode = bubble.querySelector(':scope > .wa-message-time');
     if (timeNode) bubble.insertBefore(panel, timeNode);

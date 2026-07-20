@@ -299,3 +299,85 @@ test('AgentServer idle GC does not close a session while a tool response is in f
     assert.equal(stillAlive.status, 200, stillAlive.text);
     assert.equal(stillAlive.json?.error, undefined, stillAlive.text);
 });
+
+test('AgentServer cancels an asynchronous task only with a matching Router Request', async (t) => {
+    const tmp = await createTempDir(t);
+    const slowScript = path.join(tmp, 'slow-async-tool.mjs');
+    const configPath = path.join(tmp, 'mcp-config.json');
+    await fs.writeFile(slowScript, [
+        "import { setTimeout as sleep } from 'node:timers/promises';",
+        "await sleep(10_000);",
+        "console.log('unexpected-completion');"
+    ].join('\n'));
+    await fs.writeFile(configPath, JSON.stringify({
+        tools: [{
+            name: 'slow-async',
+            command: process.execPath,
+            args: [slowScript],
+            inputSchema: {},
+            async: true
+        }]
+    }, null, 2));
+
+    const secret = crypto.randomBytes(32);
+    const audience = 'agent:test-agent';
+    const { port } = await startAgentServer(t, {
+        tmp,
+        configPath,
+        env: {
+            PLOINKY_AGENT_SECRET: secret.toString('hex'),
+            PLOINKY_AGENT_ID: audience
+        }
+    });
+    const sessionId = await initializeSession(port);
+    await mcpPost(port, {
+        jsonrpc: '2.0',
+        method: 'notifications/initialized'
+    }, { sessionId });
+
+    const call = await mcpPost(port, {
+        jsonrpc: '2.0',
+        id: 'call-slow-async',
+        method: 'tools/call',
+        params: { name: 'slow-async', arguments: {} }
+    }, {
+        sessionId,
+        authorization: `Bearer ${mintRouterRequest({
+            secret,
+            audience,
+            tool: 'slow-async',
+            args: {}
+        })}`
+    });
+    assert.equal(call.status, 200, call.text);
+    const taskId = call.json?.result?.metadata?.taskId;
+    assert.ok(taskId, call.text);
+
+    const body = JSON.stringify({ taskId });
+    const unauthenticated = await fetch(`http://127.0.0.1:${port}/task/cancel`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body
+    });
+    assert.equal(unauthenticated.status, 401);
+
+    const token = mintRouterRequest({
+        secret,
+        audience,
+        tool: '__task_cancel__',
+        args: { taskId },
+        reqPath: '/task/cancel'
+    });
+    const cancelled = await fetch(`http://127.0.0.1:${port}/task/cancel`, {
+        method: 'POST',
+        headers: {
+            'content-type': 'application/json',
+            authorization: `Bearer ${token}`
+        },
+        body
+    });
+    const cancelledText = await cancelled.text();
+    assert.equal(cancelled.status, 200, cancelledText);
+    const payload = JSON.parse(cancelledText);
+    assert.match(payload.task?.status || '', /^(cancelling|cancelled)$/);
+});

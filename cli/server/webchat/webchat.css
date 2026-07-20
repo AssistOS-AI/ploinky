@@ -2901,6 +2901,7 @@ body {
 .wa-task-status.is-ongoing { color: #d89b19; }
 .wa-task-status.is-queued { color: #d89b19; }
 .wa-task-status.is-running { color: #3486eb; }
+.wa-task-status.is-cancelling { color: #d89b19; }
 .wa-task-status.is-finished { color: var(--wa-online); }
 .wa-task-status.is-stopped { color: var(--wa-text-secondary); }
 .wa-task-status.is-error { color: #f15c6d; }
@@ -3000,6 +3001,10 @@ body {
     text-align: left;
 }
 
+.wa-task-view-header {
+    grid-template-columns: auto minmax(0, 1fr) auto auto auto;
+}
+
 .wa-task-summary-agent {
     font-size: 12px;
 }
@@ -3056,6 +3061,33 @@ body {
 
 .wa-task-view .wa-task-error {
     flex: 0 0 auto;
+}
+
+.wa-task-action-error {
+    flex: 0 0 auto;
+    color: #f15c6d;
+    font-size: 12px;
+}
+
+.wa-task-stop {
+    padding: 5px 10px;
+    border: 1px solid #f15c6d;
+    border-radius: 8px;
+    background: transparent;
+    color: #f15c6d;
+    cursor: pointer;
+    font: inherit;
+    font-size: 12px;
+    font-weight: 700;
+}
+
+.wa-task-stop:hover:not(:disabled) {
+    background: rgba(241, 92, 109, 0.12);
+}
+
+.wa-task-stop:disabled {
+    cursor: progress;
+    opacity: 0.6;
 }
 
 .wa-task-view .wa-task-log {

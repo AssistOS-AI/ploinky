@@ -14,6 +14,8 @@ const description = document.getElementById('taskDescription');
 const status = document.getElementById('taskStatus');
 const duration = document.getElementById('taskDuration');
 const error = document.getElementById('taskError');
+const stopButton = document.getElementById('taskStop');
+const actionError = document.getElementById('taskActionError');
 const log = document.getElementById('taskLog');
 const continuationForm = document.getElementById('taskContinuation');
 const continuationInput = document.getElementById('taskContinuationInput');
@@ -29,6 +31,7 @@ let initialLoadComplete = false;
 let logSync = null;
 let refreshSync = null;
 let continuationSubmitting = false;
+let stopSubmitting = false;
 const pendingUpdates = [];
 const TERMINAL_STATUSES = new Set(['finished', 'stopped', 'error']);
 
@@ -88,6 +91,11 @@ function renderTask() {
     duration.textContent = taskDurationLabel(task);
     error.hidden = !task?.error;
     error.textContent = task?.error || '';
+    const taskOngoing = task?.status === 'ongoing';
+    const taskStopping = String(task?.remoteStatus || '').trim().toLowerCase() === 'cancelling';
+    stopButton.hidden = !taskOngoing;
+    stopButton.disabled = stopSubmitting || taskStopping;
+    stopButton.textContent = stopSubmitting || taskStopping ? 'Stopping…' : 'Stop';
     const canContinue = Boolean(task?.continuation?.handle)
         && TERMINAL_STATUSES.has(task?.status);
     continuationForm.hidden = !canContinue;
@@ -120,7 +128,7 @@ async function fetchJson(url, options = {}) {
 }
 
 async function refreshTask() {
-    if (refreshSync || task?.status !== 'ongoing' || !task?.continuation) return refreshSync;
+    if (refreshSync || task?.status !== 'ongoing') return refreshSync;
     refreshSync = fetchJson(endpoint(`tasks/${encodeURIComponent(taskId)}/refresh`))
         .then((payload) => {
             applyUpdate(payload);
@@ -131,6 +139,27 @@ async function refreshTask() {
             refreshSync = null;
         });
     return refreshSync;
+}
+
+async function stopTask() {
+    if (stopSubmitting || task?.status !== 'ongoing') return;
+    stopSubmitting = true;
+    actionError.hidden = true;
+    actionError.textContent = '';
+    renderTask();
+    try {
+        const payload = await fetchJson(endpoint(`tasks/${encodeURIComponent(taskId)}/stop`), {
+            method: 'POST',
+        });
+        applyUpdate(payload);
+        await syncLog(logOffset);
+    } catch (stopError) {
+        actionError.hidden = false;
+        actionError.textContent = `Unable to stop task: ${stopError?.message || stopError}`;
+    } finally {
+        stopSubmitting = false;
+        renderTask();
+    }
 }
 
 async function syncLog(offset = logOffset) {
@@ -238,6 +267,7 @@ window.addEventListener('message', (event) => {
 
 applyTheme();
 continuationForm.addEventListener('submit', submitContinuation);
+stopButton.addEventListener('click', () => void stopTask());
 continuationInput.addEventListener('input', autoResizeContinuationInput);
 continuationInput.addEventListener('keydown', (event) => {
     if (event.defaultPrevented || event.isComposing || event.key !== 'Enter') return;
