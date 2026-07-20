@@ -179,6 +179,15 @@ function remoteStatus(status) {
     return 'ongoing';
 }
 
+function taskResultText(task) {
+    const content = task?.result?.content;
+    if (!Array.isArray(content)) return '';
+    return content
+        .filter((entry) => entry?.type === 'text' && typeof entry.text === 'string')
+        .map((entry) => entry.text)
+        .join('\n');
+}
+
 export async function handleTaskRoute({
     pathname,
     req,
@@ -298,6 +307,7 @@ export async function handleTaskRoute({
                     sourceId: task.remoteTaskId,
                     truncated: remote?.logTruncated === true,
                 },
+                finalOutput: taskResultText(remote),
             });
             broadcastTaskUpdate(appState, workspaceDirectory, update);
             sendJson(res, 200, { ok: true, ...update });
@@ -328,4 +338,5 @@ export const __testables = {
     ensureContinuationAgentRoute,
     remoteStatus,
     resolveAgentRoute,
+    taskResultText,
 };

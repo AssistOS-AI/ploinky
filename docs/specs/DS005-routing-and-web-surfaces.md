@@ -113,11 +113,12 @@ than assistant text and must not enter continuation context.
 
 WebChat may also receive generic `__webchatTask` lifecycle envelopes from a selected CLI. These envelopes must be intercepted before conversation rendering and history capture. Ploinky must store workspace-scoped task metadata as append-only JSON lines in `<cwd>/.copilot_history/agent_tasks`, store per-task logs separately under `.copilot_history/task_logs/`, and expose authenticated `GET /webchat/tasks`, `GET /webchat/tasks/<task-id>/log`, and `GET /webchat/tasks/<task-id>/view` routes. Logs are bounded by default; an asynchronous tool may explicitly declare full retention for tasks whose complete multi-turn transcript must survive. Browser updates must use the existing EventSource stream with a `task-update` event; Ploinky must not hardcode target-agent ids or tool names.
 
-An asynchronous tool may advertise a generic continuation tool. Its successful
-structured result may return a versioned opaque continuation handle, which
-Ploinky stores with the target agent and tool name in the task record. A
-terminal task carrying that capability must show a message input in its
-authenticated task view. `POST /webchat/tasks/<task-id>/continue` invokes only
+An asynchronous tool may advertise a generic continuation tool. Its structured
+result may return a versioned opaque continuation handle even when execution
+fails after the provider session was created. Ploinky stores that handle with
+the target agent and tool name in the task record. A completed or failed task
+carrying that capability must show a message input in its authenticated task
+view. `POST /webchat/tasks/<task-id>/continue` invokes only
 the stored target and stored tool with that opaque handle and the new message,
 through normal MCP policy evaluation and a newly minted request-bound Router
 Request; it must never forward the browser session token to the target agent.
@@ -182,17 +183,19 @@ composer.
 The Tasks overlay, compact task item, and task view must share one presentation policy.
 Pending work is shown as `QUEUED`, active work as `RUNNING`, and terminal states
 as `COMPLETED`, `STOPPED`, or `FAILED`. Raw task log files remain unchanged and
-are written only by task-event ingestion. For asynchronous AgentServer tools,
-command stdout is the final result channel and must not be copied into the live
-log tail; command stderr is the live diagnostic channel. If stdout is a JSON
-object with a string `outputText`, only that field is exposed as MCP result text,
-while wrapper metadata remains internal. Task-event ingestion must persist only
-the supplied live tail and must never concatenate the terminal MCP result into
-the task log. Provider wrappers are responsible for emitting any final answer
-that belongs in the task item through their live output before completion.
-Browser rendering strips ANSI control sequences and retains presentation
-compatibility for historical logs that contain recognized stream and runner
-prefixes; new raw provider output remains otherwise unchanged.
+are written only by task-event ingestion. The terminal task envelope may carry
+the final MCP result as presentation metadata, but ingestion must never append
+or duplicate that result in the log. Instead, it locates the last identical
+range already present in the persisted raw log and stores only its offset and
+length in `agent_tasks`. Continuation clears that range until the next terminal
+result. The Tasks overlay and task view render log lines outside the range with
+the secondary grey text color and lines intersecting it with the primary text
+color, so intermediate provider activity remains visibly distinct from the
+final answer. If no exact range is available, the raw output remains visible
+with the intermediate style. Browser rendering strips ANSI control sequences
+and retains presentation compatibility for historical logs that contain
+recognized stream and runner prefixes; new raw provider output remains
+otherwise unchanged.
 
 When a WebChat runtime has no SSE subscribers but owns a task whose materialized state is `ongoing`, reconnect cleanup must retain that runtime so its agent can continue router-mediated polling and log collection. Once its tasks become terminal, the normal reconnect grace and disposal behavior resumes. If the runtime is recreated after a wider process restart, the selected CLI may reattach from the workspace task journal. Initial task identity is derived from target agent and remote task id; after continuation, the stable local task id plus its monotonically increasing turn select the current remote task. A PID is optional diagnostics only.
 

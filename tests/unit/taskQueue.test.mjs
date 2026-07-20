@@ -233,3 +233,39 @@ test('TaskQueue propagates a validated continuation and retains full logs', asyn
         toolName: 'continue-task',
     });
 });
+
+test('TaskQueue preserves a validated continuation when the provider task fails', async (t) => {
+    const storagePath = makeTempStorage(t);
+    const stdout = JSON.stringify({
+        outputText: 'Provider rejected the configured model.',
+        continuation: {
+            version: 1,
+            handle: '12345678-1234-4123-8123-123456789abc',
+            toolName: 'continue-task',
+        },
+    });
+    const queue = new TaskQueue({
+        maxConcurrent: 1,
+        storagePath,
+        executor: async () => ({
+            code: 1,
+            stdout,
+            stderr: 'insufficient credits',
+        }),
+    });
+
+    const { id } = queue.enqueueTask({
+        ...dummyTaskConfig(),
+        continuationTool: 'continue-task',
+    });
+    await waitFor(() => queue.getTask(id)?.status === 'failed');
+
+    const task = queue.getTask(id);
+    assert.equal(task.error, 'insufficient credits');
+    assert.deepEqual(task.result.content, []);
+    assert.deepEqual(task.result.metadata.continuation, {
+        version: 1,
+        handle: '12345678-1234-4123-8123-123456789abc',
+        toolName: 'continue-task',
+    });
+});

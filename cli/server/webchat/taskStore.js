@@ -66,6 +66,12 @@ function normalizeTask(raw) {
         executionStartedAt: validTimestamp(raw.executionStartedAt) || createdAt,
         turn: Number.isSafeInteger(raw.turn) && raw.turn > 0 ? raw.turn : 1,
         error: String(raw.error || '').trim().slice(0, 1000),
+        finalOutputOffset: Number.isSafeInteger(raw.finalOutputOffset) && raw.finalOutputOffset >= 0
+            ? raw.finalOutputOffset
+            : null,
+        finalOutputLength: Number.isSafeInteger(raw.finalOutputLength) && raw.finalOutputLength > 0
+            ? raw.finalOutputLength
+            : 0,
         ...(raw.logRetention === 'full' ? { logRetention: 'full' } : {}),
         ...(continuation ? { continuation } : {}),
         ...(Number.isInteger(raw.pid) && raw.pid > 0 ? { pid: raw.pid } : {}),
@@ -213,6 +219,28 @@ function ingestLog(logDirectory, task, rawLog = {}) {
     return { appended, nextOffset };
 }
 
+function locateFinalOutput(logDirectory, taskId, finalOutput) {
+    if (typeof finalOutput !== 'string' || !finalOutput) {
+        return { offset: null, length: 0 };
+    }
+    const { logPath } = taskPaths(logDirectory, taskId);
+    assertRegularFileOrMissing(logPath);
+    let text = '';
+    try {
+        text = fs.readFileSync(logPath, 'utf8');
+    } catch (error) {
+        if (error?.code !== 'ENOENT') throw error;
+    }
+    const candidates = [finalOutput];
+    const trimmed = finalOutput.trim();
+    if (trimmed && trimmed !== finalOutput) candidates.push(trimmed);
+    for (const candidate of candidates) {
+        const offset = text.lastIndexOf(candidate);
+        if (offset >= 0) return { offset, length: candidate.length };
+    }
+    return { offset: null, length: 0 };
+}
+
 export function ingestTaskEvent(workspaceDirectory, envelope) {
     const { logDirectory, journalPath } = ensureTaskStorage(workspaceDirectory);
     const incoming = normalizeTask(envelope?.task);
@@ -224,7 +252,7 @@ export function ingestTaskEvent(workspaceDirectory, envelope) {
         && incoming.remoteTaskId !== existing.remoteTaskId;
     const invalidRegression = existing && TERMINAL_STATUSES.has(existing.status)
         && incoming.status === 'ongoing' && incoming.turn <= existing.turn;
-    const task = staleTurn || staleSource || invalidRegression
+    let task = staleTurn || staleSource || invalidRegression
         ? existing
         : {
             ...existing,
@@ -233,6 +261,17 @@ export function ingestTaskEvent(workspaceDirectory, envelope) {
                 ? { continuation: existing.continuation }
                 : {}),
         };
+    const logUpdate = envelope?.log
+        ? ingestLog(logDirectory, task, envelope.log)
+        : { appended: '', nextOffset: null };
+    if (!staleTurn && !staleSource && !invalidRegression && TERMINAL_STATUSES.has(task.status)) {
+        const finalOutput = locateFinalOutput(logDirectory, task.id, envelope?.finalOutput);
+        task = {
+            ...task,
+            finalOutputOffset: finalOutput.offset,
+            finalOutputLength: finalOutput.length,
+        };
+    }
     const metadataChanged = !existing
         || existing.status !== task.status
         || existing.remoteStatus !== task.remoteStatus
@@ -240,11 +279,10 @@ export function ingestTaskEvent(workspaceDirectory, envelope) {
         || existing.description !== task.description
         || existing.remoteTaskId !== task.remoteTaskId
         || existing.turn !== task.turn
-        || existing.continuation?.handle !== task.continuation?.handle;
+        || existing.continuation?.handle !== task.continuation?.handle
+        || existing.finalOutputOffset !== task.finalOutputOffset
+        || existing.finalOutputLength !== task.finalOutputLength;
     if (metadataChanged) appendMetadata(journalPath, task);
-    const logUpdate = envelope?.log
-        ? ingestLog(logDirectory, task, envelope.log)
-        : { appended: '', nextOffset: null };
     return {
         task,
         logAppend: logUpdate.appended,
@@ -289,6 +327,8 @@ export function beginTaskContinuation(workspaceDirectory, taskId, {
         executionStartedAt: validTimestamp(updatedAt) || new Date().toISOString(),
         turn: existing.turn + 1,
         error: '',
+        finalOutputOffset: null,
+        finalOutputLength: 0,
         logRetention: 'full',
     };
     appendMetadata(journalPath, next);
@@ -336,5 +376,6 @@ export const __testables = {
     normalizeContinuation,
     normalizeTask,
     overlapDelta,
+    locateFinalOutput,
     readJournal,
 };

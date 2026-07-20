@@ -93,6 +93,25 @@ test('terminal result payload is never appended to the live log', () => {
     assert.equal(stored.match(/Final assistant answer/g)?.length, 1);
 });
 
+test('terminal final output is located in the existing log without being duplicated', () => {
+    const root = workspace();
+    const taskId = event().task.id;
+    const tail = 'Read package.json\nRan tests\nFinal assistant answer\n';
+    const update = ingestTaskEvent(root, {
+        ...event({ status: 'finished', remoteStatus: 'completed' }, {
+            tail,
+            seq: 3,
+        }),
+        finalOutput: 'Final assistant answer\n',
+    });
+
+    assert.equal(update.task.finalOutputOffset, tail.indexOf('Final assistant answer'));
+    assert.equal(update.task.finalOutputLength, 'Final assistant answer\n'.length);
+    assert.equal(readTaskLog(root, taskId).text, tail);
+    const journal = fs.readFileSync(path.join(root, '.copilot_history', 'agent_tasks'), 'utf8');
+    assert.doesNotMatch(journal, /Final assistant answer/);
+});
+
 test('task log is capped at one MiB', () => {
     const root = workspace();
     for (let index = 0; index < 6; index += 1) {
@@ -143,6 +162,8 @@ test('continuation keeps the local task id and advances only its turn', () => {
     assert.equal(next.turn, 2);
     assert.equal(next.remoteTaskId, 'remote-2');
     assert.equal(next.status, 'ongoing');
+    assert.equal(next.finalOutputOffset, null);
+    assert.equal(next.finalOutputLength, 0);
     assert.equal(listTasks(root).length, 1);
     assert.match(readTaskLog(root, taskId).text, /first answer[\s\S]*Continuation 2[\s\S]*Continue with tests/);
 
@@ -155,6 +176,32 @@ test('continuation keeps the local task id and advances only its turn', () => {
     }));
     assert.equal(listTasks(root)[0].turn, 2, 'late events from the previous turn are ignored');
     assert.equal(listTasks(root)[0].remoteTaskId, 'remote-2');
+});
+
+test('failed task with a provider session can start another turn', () => {
+    const root = workspace();
+    const taskId = event().task.id;
+    ingestTaskEvent(root, event({
+        status: 'error',
+        remoteStatus: 'failed',
+        error: 'insufficient credits',
+        continuation: {
+            version: 1,
+            targetAgent: 'opencodeAgent',
+            toolName: 'continue-task',
+            handle: '12345678-1234-4123-8123-123456789abc',
+        },
+    }));
+
+    const next = beginTaskContinuation(root, taskId, {
+        remoteTaskId: 'remote-retry',
+        message: 'Resume with the corrected model',
+    });
+
+    assert.equal(next.id, taskId);
+    assert.equal(next.turn, 2);
+    assert.equal(next.status, 'ongoing');
+    assert.equal(next.error, '');
 });
 
 test('structured task output is persisted and broadcast without entering chat history', () => {

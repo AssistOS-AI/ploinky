@@ -100,7 +100,12 @@ function renderTask() {
 function renderLog({ stickToEnd = true } = {}) {
     const previousScrollTop = log.scrollTop;
     const wasAtEnd = log.scrollHeight - log.scrollTop - log.clientHeight < 24;
-    renderTaskLog(log, logText, initialLoadComplete ? 'No log output yet.' : 'Loading log…');
+    renderTaskLog(
+        log,
+        logText,
+        initialLoadComplete ? 'No log output yet.' : 'Loading log…',
+        task,
+    );
     if (stickToEnd && wasAtEnd) log.scrollTop = log.scrollHeight;
     else log.scrollTop = previousScrollTop;
 }

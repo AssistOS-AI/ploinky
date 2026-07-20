@@ -382,12 +382,12 @@ export class TaskQueue {
             }
 
             const success = !timedOut && result.code === 0;
+            const parsedResult = commandResult(result.stdout);
+            const continuation = task.continuationTool
+                && parsedResult.continuation?.toolName === task.continuationTool
+                ? parsedResult.continuation
+                : null;
             if (success) {
-                const parsedResult = commandResult(result.stdout);
-                const continuation = task.continuationTool
-                    && parsedResult.continuation?.toolName === task.continuationTool
-                    ? parsedResult.continuation
-                    : null;
                 const content = [{ type: 'text', text: parsedResult.text }];
                 task.status = 'completed';
                 task.result = {
@@ -404,7 +404,15 @@ export class TaskQueue {
                     : describeShellFailure(result);
                 task.status = 'failed';
                 task.error = message;
-                task.result = null;
+                task.result = continuation
+                    ? {
+                        content: [],
+                        metadata: {
+                            agent: process.env.AGENT_NAME || task.toolName,
+                            continuation,
+                        },
+                    }
+                    : null;
             }
         } catch (err) {
             if (timer) {

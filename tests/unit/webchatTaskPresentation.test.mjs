@@ -5,6 +5,7 @@ import {
     attachTaskSummary,
     mergeTaskLogUpdate,
     parseTaskLog,
+    parseTaskLogPresentation,
     taskDurationSeconds,
     taskStatusPresentation,
 } from '../../cli/server/webchat/taskPresentation.js';
@@ -55,6 +56,23 @@ test('task log parsing strips runner prefixes and keeps stderr visually distinct
         { text: 'secondary output', stream: 'stderr' },
         { text: 'timeout after 300s; sending SIGTERM', stream: 'stderr' },
     ]);
+});
+
+test('task log presentation marks only the terminal result lines as final', () => {
+    const text = 'Read package.json\nRan tests\nFinal answer\n';
+    const finalOutputOffset = text.indexOf('Final answer');
+    assert.deepEqual(
+        parseTaskLogPresentation(text, {
+            finalOutputOffset,
+            finalOutputLength: 'Final answer\n'.length,
+        }).map(({ text: line, tone }) => ({ text: line, tone })),
+        [
+            { text: 'Read package.json', tone: 'intermediate' },
+            { text: 'Ran tests', tone: 'intermediate' },
+            { text: 'Final answer', tone: 'final' },
+            { text: '', tone: 'intermediate' },
+        ],
+    );
 });
 
 test('chat task summary shows metadata and a delegated live-log link without inline expansion', (t) => {

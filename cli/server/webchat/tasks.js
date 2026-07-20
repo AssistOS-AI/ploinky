@@ -112,7 +112,7 @@ export function createTaskController({ toEndpoint, elements, showBanner }) {
         }
         const log = document.createElement('div');
         log.className = 'wa-task-log';
-        renderTaskLog(log, logs.get(task.id)?.text || '');
+        renderTaskLog(log, logs.get(task.id)?.text || '', 'No log output yet.', task);
         taskDetail.append(heading, log);
         if (stickToEnd) log.scrollTop = log.scrollHeight;
     }

@@ -29,9 +29,27 @@ export function taskDurationLabel(task, now = Date.now()) {
     return seconds === null ? '' : `${seconds}s`;
 }
 
-export function parseTaskLog(text) {
-    const lines = String(text || '').replace(ANSI_RE, '').split(/\r?\n/);
-    return lines.flatMap((rawLine) => {
+function parseTaskLogEntries(text, finalOutput = null) {
+    const rawText = String(text || '');
+    const lines = rawText.split(/\r?\n/);
+    let cursor = 0;
+    return lines.flatMap((unstrippedLine) => {
+        const lineStart = cursor;
+        const lineEnd = lineStart + unstrippedLine.length;
+        const separatorLength = rawText.startsWith('\r\n', lineEnd)
+            ? 2
+            : (rawText[lineEnd] === '\n' ? 1 : 0);
+        cursor = lineEnd + separatorLength;
+        const finalStart = Number.isSafeInteger(finalOutput?.offset)
+            ? finalOutput.offset
+            : null;
+        const finalEnd = finalStart === null
+            ? null
+            : finalStart + Math.max(0, Number(finalOutput?.length) || 0);
+        const tone = finalStart !== null && finalEnd > lineStart && finalStart < lineEnd
+            ? 'final'
+            : 'intermediate';
+        const rawLine = unstrippedLine.replace(ANSI_RE, '');
         let line = rawLine;
         let stream = 'stdout';
         const streamMatch = STREAM_PREFIX_RE.exec(line);
@@ -48,19 +66,33 @@ export function parseTaskLog(text) {
         if (/^\[(?:task result|older task log content truncated)\]$/i.test(line.trim())) {
             return line.trim().toLowerCase() === '[task result]'
                 ? []
-                : [{ text: 'Older task log content was truncated.', stream: 'stderr' }];
+                : [{ text: 'Older task log content was truncated.', stream: 'stderr', tone }];
         }
         if (/^\[task log source truncated or restarted\]$/i.test(line.trim())) {
-            return [{ text: 'Task log source was truncated or restarted.', stream: 'stderr' }];
+            return [{ text: 'Task log source was truncated or restarted.', stream: 'stderr', tone }];
         }
-        return [{ text: line, stream }];
+        return [{ text: line, stream, tone }];
     });
 }
 
-export function renderTaskLog(container, text, emptyText = 'No log output yet.') {
+export function parseTaskLog(text) {
+    return parseTaskLogEntries(text).map(({ text: lineText, stream }) => ({
+        text: lineText,
+        stream,
+    }));
+}
+
+export function parseTaskLogPresentation(text, task = null) {
+    return parseTaskLogEntries(text, {
+        offset: task?.finalOutputOffset,
+        length: task?.finalOutputLength,
+    });
+}
+
+export function renderTaskLog(container, text, emptyText = 'No log output yet.', task = null) {
     if (!container) return;
     container.replaceChildren();
-    const lines = parseTaskLog(text);
+    const lines = parseTaskLogPresentation(text, task);
     if (!lines.length || lines.every((line) => !line.text)) {
         const empty = document.createElement('span');
         empty.className = 'wa-task-log-empty';
@@ -70,7 +102,7 @@ export function renderTaskLog(container, text, emptyText = 'No log output yet.')
     }
     for (const entry of lines) {
         const line = document.createElement('span');
-        line.className = `wa-task-log-line is-${entry.stream}`;
+        line.className = `wa-task-log-line is-${entry.stream} is-${entry.tone}`;
         line.textContent = entry.text || '\u00a0';
         container.appendChild(line);
     }

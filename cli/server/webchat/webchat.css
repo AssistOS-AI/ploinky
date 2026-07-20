@@ -2966,6 +2966,14 @@ body {
     color: color-mix(in srgb, var(--wa-text-secondary) 62%, white);
 }
 
+.wa-task-log-line.is-intermediate {
+    color: var(--wa-text-secondary);
+}
+
+.wa-task-log-line.is-final {
+    color: var(--wa-text-primary);
+}
+
 .wa-task-summary {
     display: block;
     clear: both;

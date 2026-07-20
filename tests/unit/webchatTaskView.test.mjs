@@ -72,6 +72,7 @@ test('task view exposes continuation only through the same local task route', ()
     );
     assert.match(html, /id="taskContinuationInput"/);
     assert.match(source, /tasks\/\$\{encodeURIComponent\(taskId\)\}\/continue/);
+    assert.match(source, /TERMINAL_STATUSES = new Set\(\['finished', 'stopped', 'error'\]\)/);
     assert.match(source, /TERMINAL_STATUSES\.has\(task\?\.status\)/);
     assert.match(source, /applyUpdate\(payload\)/);
 });
@@ -187,4 +188,14 @@ test('generic side panel stops above the floating composer and scrolls its conte
         css,
         /\.wa-side-panel-content\s*\{[^}]*min-height:\s*0[^}]*overflow:\s*auto/s,
     );
+});
+test('task refresh extracts terminal text separately from log transport', () => {
+    assert.equal(taskRouteTestables.taskResultText({
+        result: {
+            content: [
+                { type: 'text', text: 'Final answer' },
+                { type: 'image', data: 'ignored' },
+            ],
+        },
+    }), 'Final answer');
 });
