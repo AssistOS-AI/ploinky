@@ -10,7 +10,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import { createMemoryReplayCache } from '../../Agent/lib/jwtVerify.mjs';
 import { verifyRouterRequestToken } from '../../Agent/lib/requestSignedTokens.mjs';
-import { deriveAgentRequestSecret, deriveSubkey } from '../../cli/services/masterKey.js';
+import { deriveAgentRequestSecret, deriveSubkey } from '../../cli/utils/security/masterKey.js';
 import { computeRchHttp } from '../../Agent/lib/requestHash.mjs';
 import { collectHttpServiceRoutes, normalizeServiceSpec } from '../../cli/server/httpServiceRoutes.js';
 import { verifyUserDelegationGrant } from '../../cli/server/mcp-proxy/userDelegationGrant.js';

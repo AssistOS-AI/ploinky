@@ -109,8 +109,8 @@ test('user admin routes enforce admin access, CRUD, rev invalidation, and agent 
     const nonce = Date.now();
     const authHandlers = await import(`${pathToFileURL(path.join(REPO_ROOT, 'cli/server/authHandlers/index.js')).href}?test=${nonce}`);
     const localService = await import(`${pathToFileURL(path.join(REPO_ROOT, 'cli/server/auth/localService.js')).href}?test=${nonce}`);
-    const passwordStore = await import(`${pathToFileURL(path.join(REPO_ROOT, 'cli/services/encryptedPasswordStore.js')).href}?test=${nonce}`);
-    const passwords = await import(`${pathToFileURL(path.join(REPO_ROOT, 'cli/services/localAuthPasswords.js')).href}?test=${nonce}`);
+    const passwordStore = await import(`${pathToFileURL(path.join(REPO_ROOT, 'cli/utils/security/encryptedPasswordStore.js')).href}?test=${nonce}`);
+    const passwords = await import(`${pathToFileURL(path.join(REPO_ROOT, 'cli/utils/security/localAuthPasswords.js')).href}?test=${nonce}`);
 
     const explorerPolicy = { usersVar: 'PLOINKY_AUTH_EXPLORER_USERS' };
     const dpuPolicy = { usersVar: 'PLOINKY_AUTH_DPUAGENT_USERS' };

@@ -1,8 +1,8 @@
 import fs from 'node:fs';
 import path from 'node:path';
 
-import { resolveEnabledAgentRecord } from '../../services/agents.js';
-import { findAgent } from '../../services/utils.js';
+import { resolveEnabledAgentRecord } from '../../utils/agents.js';
+import { findAgent } from '../../utils/utils.js';
 import { hasInternalAgentSegment } from '../internalAgentPath.js';
 import { normalizeHttpRouteAccess } from './HttpRouteAccessDecision.js';
 import { HttpRouteAccessPath } from './HttpRouteAccessPath.js';

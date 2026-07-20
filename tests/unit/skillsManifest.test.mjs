@@ -10,9 +10,9 @@ import {
     installSkillsFromManifest,
     readSkillsManifest,
     findWorkspaceFoldersWithSkillsManifest,
-} from '../../cli/services/skills.js';
-import { REPOS_DIR } from '../../cli/services/config.js';
-import { REPO_SOURCES_FILE } from '../../cli/services/repos.js';
+} from '../../cli/commands/skills.js';
+import { REPOS_DIR } from '../../cli/utils/config.js';
+import { REPO_SOURCES_FILE } from '../../cli/utils/repos.js';
 
 function writeSkill(root, name, files) {
     const skillRoot = path.join(root, name);

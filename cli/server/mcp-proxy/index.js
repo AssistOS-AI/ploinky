@@ -12,9 +12,9 @@ import { buildMcpDelegationsForUserCall } from './mcpDelegations.js';
 import { computeRchTool } from '../../../Agent/lib/requestHash.mjs';
 import { createTokenReplayCache } from '../security/tokens/JwsCodec.js';
 import { sanitizeArgumentsForTool } from './toolArguments.js';
-import { getAgentDescriptorByPrincipal } from '../../services/agentRegistry.js';
+import { getAgentDescriptorByPrincipal } from '../../utils/agentRegistry.js';
 import { policy } from '../policy/index.js';
-import { deriveSubkey } from '../../services/masterKey.js';
+import { deriveSubkey } from '../../utils/security/masterKey.js';
 import { verifyUserDelegationGrant } from './userDelegationGrant.js';
 
 const AGENT_PROXY_PROTOCOL_VERSION = '2025-06-18';

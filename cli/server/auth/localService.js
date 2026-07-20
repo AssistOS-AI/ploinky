@@ -1,8 +1,8 @@
 import crypto from 'node:crypto';
 
-import { getUsersPayload, setUsersPayload } from '../../services/encryptedPasswordStore.js';
-import { deriveSubkey } from '../../services/masterKey.js';
-import { hashPassword, verifyPasswordHash } from '../../services/localAuthPasswords.js';
+import { getUsersPayload, setUsersPayload } from '../../utils/security/encryptedPasswordStore.js';
+import { deriveSubkey } from '../../utils/security/masterKey.js';
+import { hashPassword, verifyPasswordHash } from '../../utils/security/localAuthPasswords.js';
 import { JwsCodec } from '../security/tokens/JwsCodec.js';
 import { createSessionStore } from './sessionStore.js';
 import { isSessionRevoked } from './sessionRevocations.js';

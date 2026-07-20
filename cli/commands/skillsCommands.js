@@ -1,4 +1,4 @@
-import * as skillsSvc from '../services/skills.js';
+import * as skillsSvc from './skills.js';
 
 const USAGE = 'Usage: default-skills <repoName>';
 

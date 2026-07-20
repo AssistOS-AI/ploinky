@@ -8,10 +8,10 @@ import {
     sanitizeRelativeRequestPath,
     toRealPathSafe
 } from '../utils/workspacePaths.js';
-import { ROUTING_FILE } from '../../services/config.js';
+import { ROUTING_FILE } from '../../utils/config.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const PROJECT_ROOT = path.resolve(__dirname, '../../../');
+const PROJECT_ROOT = path.resolve(__dirname, '../../..');
 const MCP_BROWSER_CLIENT_URL = '/MCPBrowserClient.js';
 const MCP_BROWSER_CLIENT_FILE = path.resolve(PROJECT_ROOT, 'Agent/client/MCPBrowserClient.js');
 const PROJECT_WEB_LIBS = path.resolve(PROJECT_ROOT, 'webLibs');

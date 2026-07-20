@@ -108,8 +108,8 @@ async function loadModules(t) {
 
     const nonce = `${Date.now()}-${Math.random()}`;
     const route = await import(`${pathToFileURL(path.join(REPO_ROOT, 'cli/server/userIdentityKeyRoute.js')).href}?test=${nonce}`);
-    const pure = await import(`${pathToFileURL(path.join(REPO_ROOT, 'cli/services/userIdentityKey.js')).href}?test=${nonce}`);
-    const primitive = await import(`${pathToFileURL(path.join(REPO_ROOT, 'cli/services/subjectIdentityKey.js')).href}?test=${nonce}`);
+    const pure = await import(`${pathToFileURL(path.join(REPO_ROOT, 'cli/server/security/userIdentityKey.js')).href}?test=${nonce}`);
+    const primitive = await import(`${pathToFileURL(path.join(REPO_ROOT, 'cli/utils/security/subjectIdentityKey.js')).href}?test=${nonce}`);
     return { route, pure, primitive };
 }
 

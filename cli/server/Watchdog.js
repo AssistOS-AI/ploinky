@@ -6,7 +6,7 @@ import http from 'http';
 
 import { createContainerMonitor, startContainerMonitor, stopContainerMonitor, clearContainerTargets } from './containerMonitor.js';
 import { appendLog } from './utils/logger.js';
-import { LOGS_DIR } from '../services/config.js';
+import { LOGS_DIR } from '../utils/config.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);

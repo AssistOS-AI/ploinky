@@ -8,7 +8,7 @@ import { after, test } from 'node:test';
 import { createMemoryReplayCache } from '../../Agent/lib/jwtVerify.mjs';
 import { computeRchHttp } from '../../Agent/lib/requestHash.mjs';
 import { verifyRouterRequestToken } from '../../Agent/lib/requestSignedTokens.mjs';
-import { deriveAgentRequestSecret } from '../../cli/services/masterKey.js';
+import { deriveAgentRequestSecret } from '../../cli/utils/security/masterKey.js';
 
 const MASTER_KEY = '5'.repeat(64);
 const fixture = createRoutingFixture();

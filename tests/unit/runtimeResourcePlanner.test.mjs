@@ -12,10 +12,10 @@ process.chdir(tempDir);
 process.env.PLOINKY_MASTER_KEY = '6'.repeat(64);
 
 const moduleSuffix = `?test=${Date.now()}`;
-const { setSecretValue } = await import(`../../cli/services/encryptedSecretsFile.js${moduleSuffix}`);
+const { setSecretValue } = await import(`../../cli/utils/security/encryptedSecretsFile.js${moduleSuffix}`);
 setSecretValue('DPU_MASTER_KEY', 'test-master-key-123');
-const { deriveAgentSecret } = await import(`../../cli/services/masterKey.js${moduleSuffix}`);
-const plannerModule = await import(`../../cli/services/runtimeResourcePlanner.js${moduleSuffix}`);
+const { deriveAgentSecret } = await import(`../../cli/utils/security/masterKey.js${moduleSuffix}`);
+const plannerModule = await import(`../../cli/utils/runtime/runtimeResourcePlanner.js${moduleSuffix}`);
 const { planRuntimeResources, applyRuntimeResourceEnv, ensurePersistentStorageHostDir } = plannerModule;
 
 test.after(() => {

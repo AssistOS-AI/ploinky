@@ -10,9 +10,9 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const repoRoot = path.resolve(__dirname, '../..');
 const cliCommandsUrl = pathToFileURL(path.join(repoRoot, 'cli/commands/cli.js')).href;
-const dockerCommonUrl = pathToFileURL(path.join(repoRoot, 'cli/services/docker/common.js')).href;
-const sandboxRuntimeUrl = pathToFileURL(path.join(repoRoot, 'cli/services/sandboxRuntime.js')).href;
-const workspaceUrl = pathToFileURL(path.join(repoRoot, 'cli/services/workspace.js')).href;
+const dockerCommonUrl = pathToFileURL(path.join(repoRoot, 'cli/sandbox/docker/common.js')).href;
+const sandboxRuntimeUrl = pathToFileURL(path.join(repoRoot, 'cli/utils/runtime/sandboxRuntime.js')).href;
+const workspaceUrl = pathToFileURL(path.join(repoRoot, 'cli/utils/workspace.js')).href;
 
 function makeFakeRuntimeBin(root, name = 'podman') {
     const binDir = path.join(root, 'bin');

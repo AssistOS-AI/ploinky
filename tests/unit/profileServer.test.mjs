@@ -6,7 +6,7 @@ import {
     normalizeProfileServer,
     resolvePublishedProfileServer,
     resolveProfileServer
-} from '../../cli/services/profileServer.js';
+} from '../../cli/utils/runtime/profileServer.js';
 import {
     buildProfileServerPath,
     resolveProfileServerTarget

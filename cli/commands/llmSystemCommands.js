@@ -4,15 +4,15 @@ import os from 'os';
 import { execSync, spawn } from 'child_process';
 import { fileURLToPath, pathToFileURL } from 'url';
 import { createRequire } from 'module';
-import { debugLog } from '../services/utils.js';
+import { debugLog } from '../utils/utils.js';
 import {
     loadValidLlmApiKeys,
     collectAvailableLlmKeys,
     populateProcessEnvFromEnvFile,
     resolveEnvFilePath,
-} from '../services/llmProviderUtils.js';
-import { getSecret } from '../services/secretInjector.js';
-import * as inputState from '../services/inputState.js';
+} from './llmProviderUtils.js';
+import { getSecret } from '../utils/security/secretInjector.js';
+import * as inputState from './inputState.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);

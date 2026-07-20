@@ -14,8 +14,8 @@ import {
     resolveRepoSource,
     resolveRepoSourceUrl,
     updateRepo,
-} from '../../cli/services/repos.js';
-import { REPOS_DIR } from '../../cli/services/config.js';
+} from '../../cli/utils/repos.js';
+import { REPOS_DIR } from '../../cli/utils/config.js';
 import { resolveUpdateProjectsRoot } from '../../cli/commands/repoAgentCommands.js';
 
 function mkdir(dir) {

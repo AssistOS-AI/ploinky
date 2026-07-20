@@ -32,7 +32,7 @@ test('encrypted .secrets round-trips and enforces the master key', async (t) => 
     });
 
     const nonce = Date.now();
-    const store = await import(`${pathToFileURL(path.join(REPO_ROOT, 'cli/services/encryptedSecretsFile.js')).href}?test=${nonce}`);
+    const store = await import(`${pathToFileURL(path.join(REPO_ROOT, 'cli/utils/security/encryptedSecretsFile.js')).href}?test=${nonce}`);
 
     assert.deepEqual(store.readSecretsFile(), {});
 

@@ -17,7 +17,7 @@ delete process.env.PLOINKY_MASTER_KEY;
 
 const moduleNonce = Date.now();
 const { resolveManifestImage } = await import(
-    `${pathToFileURL(path.join(repoRoot, 'cli/services/secretVars.js')).href}?test=${moduleNonce}`
+    `${pathToFileURL(path.join(repoRoot, 'cli/utils/security/secretVars.js')).href}?test=${moduleNonce}`
 );
 
 test.after(() => {

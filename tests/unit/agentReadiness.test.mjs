@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import net from 'node:net';
 
 import { waitForAgentReady } from '../../cli/server/utils/agentReadiness.js';
-import { buildBlockingReadinessEntryFromNode } from '../../cli/services/workspaceUtil.js';
+import { buildBlockingReadinessEntryFromNode } from '../../cli/commands/workspaceUtil.js';
 
 function listenOnEphemeralPort() {
     return new Promise((resolve, reject) => {

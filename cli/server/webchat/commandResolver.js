@@ -1,6 +1,6 @@
 import fs from 'fs';
 import path from 'path';
-import { ROUTING_FILE } from '../../services/config.js';
+import { ROUTING_FILE } from '../../utils/config.js';
 
 function trimCommand(value) {
     if (!value) return '';

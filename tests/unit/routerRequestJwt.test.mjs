@@ -16,7 +16,7 @@ process.env.PLOINKY_MASTER_KEY = '7'.repeat(64);
 
 const moduleSuffix = `?test=${Date.now()}`;
 const { buildRouterRequest } = await import(`../../cli/server/mcp-proxy/invocationMinter.js${moduleSuffix}`);
-const { deriveAgentRequestSecret } = await import(`../../cli/services/masterKey.js${moduleSuffix}`);
+const { deriveAgentRequestSecret } = await import(`../../cli/utils/security/masterKey.js${moduleSuffix}`);
 
 const TARGET = 'agent:explorer/docs-agent';
 const OTHER = 'agent:explorer/other-agent';

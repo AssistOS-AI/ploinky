@@ -1,8 +1,8 @@
 import path from 'path';
 import crypto from 'crypto';
-import { showHelp } from '../services/help.js';
-import * as envSvc from '../services/secretVars.js';
-import { findAgent } from '../services/utils.js';
+import { showHelp } from './help.js';
+import * as envSvc from '../utils/security/secretVars.js';
+import { findAgent } from '../utils/utils.js';
 
 const INLINE_ASSIGNMENT_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
 

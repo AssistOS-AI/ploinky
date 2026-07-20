@@ -1,7 +1,7 @@
 import fs from 'fs';
 import path from 'path';
-import { PLOINKY_DIR, ROUTING_FILE } from '../services/config.js';
-import { debugLog, parseParametersString } from '../services/utils.js';
+import { PLOINKY_DIR, ROUTING_FILE } from '../utils/config.js';
+import { debugLog, parseParametersString } from '../utils/utils.js';
 import { createAgentClient as createBrowserClient } from '../../Agent/client/MCPBrowserClient.js';
 
 class ClientCommands {

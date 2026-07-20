@@ -2,8 +2,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import http from 'node:http';
 
-import { deriveAgentPrincipalId } from '../../services/agentIdentity.js';
-import { PLOINKY_WORKSPACE_ROOT } from '../../services/config.js';
+import { deriveAgentPrincipalId } from '../../utils/security/agentIdentity.js';
+import { PLOINKY_WORKSPACE_ROOT } from '../../utils/config.js';
 import { buildRouterRequest } from '../mcp-proxy/invocationMinter.js';
 import { computeRch } from '../../../Agent/lib/requestHash.mjs';
 

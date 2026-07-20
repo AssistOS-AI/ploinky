@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { getCommandRegistry, isKnownCommand } from '../../cli/services/commandRegistry.js';
+import { getCommandRegistry, isKnownCommand } from '../../cli/commands/commandRegistry.js';
 
 test('core CLI exposes no research-specific enable command', () => {
     const commands = getCommandRegistry();

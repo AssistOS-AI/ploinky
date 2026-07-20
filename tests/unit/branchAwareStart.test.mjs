@@ -11,9 +11,9 @@ process.chdir(tempDir);
 process.env.PLOINKY_MASTER_KEY = '5'.repeat(64);
 
 const moduleSuffix = `?test=${Date.now()}`;
-const reposUrl = new URL('../../cli/services/repos.js', import.meta.url);
-const bootstrapManifestUrl = new URL('../../cli/services/bootstrapManifest.js', import.meta.url);
-const ploinkybootUrl = new URL('../../cli/services/ploinkyboot.js', import.meta.url);
+const reposUrl = new URL('../../cli/utils/repos.js', import.meta.url);
+const bootstrapManifestUrl = new URL('../../cli/utils/runtime/bootstrapManifest.js', import.meta.url);
+const ploinkybootUrl = new URL('../../cli/commands/ploinkyboot.js', import.meta.url);
 
 const reposMod = await import(`${reposUrl.href}${moduleSuffix}`);
 const bootstrapManifestMod = await import(`${bootstrapManifestUrl.href}${moduleSuffix}`);

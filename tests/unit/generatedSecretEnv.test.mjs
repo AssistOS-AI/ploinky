@@ -15,8 +15,8 @@ process.env.GENERATED_SECRET_TEST_SECRET = 'operator-value';
 process.env.SHARED_GENERATED_SECRET = 'operator-shared-value';
 
 const moduleSuffix = `?test=${Date.now()}`;
-const { buildEnvMap, validateManifestEnvProfileCompleteness } = await import(`../../cli/services/secretVars.js${moduleSuffix}`);
-const { deriveAgentSecret, deriveWorkspaceSecret } = await import(`../../cli/services/masterKey.js${moduleSuffix}`);
+const { buildEnvMap, validateManifestEnvProfileCompleteness } = await import(`../../cli/utils/security/secretVars.js${moduleSuffix}`);
+const { deriveAgentSecret, deriveWorkspaceSecret } = await import(`../../cli/utils/security/masterKey.js${moduleSuffix}`);
 
 test.after(() => {
     process.chdir(originalCwd);

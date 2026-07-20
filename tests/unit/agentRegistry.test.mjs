@@ -19,7 +19,7 @@ function writeManifest(repoName, agentName, manifest) {
 process.chdir(tempDir);
 
 const moduleSuffix = `?test=${Date.now()}`;
-const registryModule = await import(`../../cli/services/agentRegistry.js${moduleSuffix}`);
+const registryModule = await import(`../../cli/utils/agentRegistry.js${moduleSuffix}`);
 const {
     buildAgentIndex,
     listSsoProviders,

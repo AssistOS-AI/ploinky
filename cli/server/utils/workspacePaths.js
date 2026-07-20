@@ -1,7 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 
-import { PLOINKY_WORKSPACE_ROOT } from '../../services/config.js';
+import { PLOINKY_WORKSPACE_ROOT } from '../../utils/config.js';
 
 export function getWorkspaceRoot() {
     return path.resolve(PLOINKY_WORKSPACE_ROOT);

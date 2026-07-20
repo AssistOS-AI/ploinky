@@ -1,4 +1,4 @@
-import { resolveVarValue } from '../../services/secretVars.js';
+import { resolveVarValue } from '../../utils/security/secretVars.js';
 
 export function getAppName() {
     const secretName = resolveVarValue('APP_NAME');

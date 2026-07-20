@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 
-import { REPOS_DIR } from '../../services/config.js';
+import { REPOS_DIR } from '../../utils/config.js';
 
 /**
  * McpToolPolicy — MCP tool access decisions (DS014). Maps mcp-config `tags` to

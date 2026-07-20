@@ -8,7 +8,7 @@ import {
     buildBwrapArgs,
     buildBwrapInteractiveCommand,
     buildShellCommand,
-} from '../../cli/services/bwrap/bwrapServiceManager.js';
+} from '../../cli/sandbox/bwrap/bwrapServiceManager.js';
 
 function tempDir(prefix = 'bwrap-args-') {
     return fs.mkdtempSync(path.join(os.tmpdir(), prefix));

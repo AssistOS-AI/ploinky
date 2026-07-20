@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { parseParametersString } from '../../cli/services/utils.js';
+import { parseParametersString } from '../../cli/utils/utils.js';
 
 test('should parse a simple flag/value pair', () => {
     const input = '-name John';

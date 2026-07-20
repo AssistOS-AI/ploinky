@@ -1,5 +1,5 @@
 import crypto from 'crypto';
-import * as secretVars from '../../services/secretVars.js';
+import * as secretVars from '../../utils/security/secretVars.js';
 
 const TOKEN_VARS = {
     dashboard: 'WEBDASHBOARD_TOKEN',

@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-const module = await import('../../cli/services/docker/healthProbes.js');
+const module = await import('../../cli/sandbox/docker/healthProbes.js');
 const { clearLivenessState, __testHooks, __testConstants } = module;
 const {
     coercePositiveNumber,

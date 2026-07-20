@@ -1,4 +1,4 @@
-import { buildExecArgs } from '../../services/docker/index.js';
+import { buildExecArgs } from '../../sandbox/docker/index.js';
 import { spawn } from 'child_process';
 
 import fs from 'fs';

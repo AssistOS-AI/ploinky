@@ -1,0 +1,708 @@
+import fs from 'fs';
+import path from 'path';
+import { execSync } from 'child_process';
+import { fileURLToPath } from 'url';
+import { loadAgents, saveAgents } from './workspace.js';
+import { resolveMasterKey, setUsersPayload } from './security/encryptedPasswordStore.js';
+import { hashPassword } from './security/localAuthPasswords.js';
+import {
+    getAgentContainerName,
+    parseManifestPorts,
+    containerExists,
+    isContainerRunning,
+    waitForContainerRunning,
+    stopAndRemove,
+    stopAndRemoveMany,
+    ensureAgentService
+} from '../sandbox/docker/index.js';
+import { findAgent } from './utils.js';
+import { REPOS_DIR, PLOINKY_WORKSPACE_ROOT, ROUTING_FILE } from './config.js';
+import { resolveManifestStartup } from './runtime/manifestStartup.js';
+import {
+    createAgentSymlinks,
+    removeAgentSymlinks,
+    createAgentWorkDir,
+    removeAgentWorkDir,
+    getAgentDataDir
+} from './workspaceStructure.js';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const RESERVED_AGENT_KEYS = new Set(['_config']);
+const ALIAS_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/;
+const AUTH_MODES = new Set(['none', 'local', 'pwd', 'sso', 'guest']);
+export const DEFAULT_ENABLE_AGENT_MODE = 'isolated';
+export const ENABLE_AGENT_MODES = Object.freeze(['isolated', 'global', 'devel']);
+const ENABLE_AGENT_MODE_SET = new Set(ENABLE_AGENT_MODES);
+
+export function isEnableAgentMode(value) {
+    return ENABLE_AGENT_MODE_SET.has(String(value || '').trim().toLowerCase());
+}
+
+function formatEnableAgentModes() {
+    return ENABLE_AGENT_MODES.join(' | ');
+}
+
+function normalizeAlias(aliasInput) {
+    if (aliasInput === undefined || aliasInput === null) {
+        return '';
+    }
+    if (typeof aliasInput === 'string' && !aliasInput.trim()) {
+        return '';
+    }
+    const alias = String(aliasInput).trim();
+    if (!alias) return '';
+    if (!ALIAS_PATTERN.test(alias)) {
+        throw new Error("Alias must start with a letter or number and may contain only letters, numbers, '.', '_' or '-'.");
+    }
+    if (RESERVED_AGENT_KEYS.has(alias)) {
+        throw new Error(`Alias '${alias}' is reserved. Choose a different alias.`);
+    }
+    return alias;
+}
+
+function normalizeAuthMode(authMode) {
+    const normalized = String(authMode || 'none').trim().toLowerCase();
+    if (!AUTH_MODES.has(normalized)) {
+        throw new Error(`Unknown auth mode '${authMode}'. Allowed: none | pwd | sso`);
+    }
+    return normalized === 'pwd' ? 'local' : normalized;
+}
+
+function buildDefaultLocalAuthVars(routeKey) {
+    const suffix = String(routeKey || 'agent')
+        .trim()
+        .replace(/[^a-zA-Z0-9]+/g, '_')
+        .replace(/^_+|_+$/g, '')
+        .toUpperCase() || 'AGENT';
+    return {
+        usersVar: `PLOINKY_AUTH_${suffix}_USERS`
+    };
+}
+
+export function verifyEnabledAgentStarted(shortAgentName, containerName, {
+    isRunning = isContainerRunning,
+    waitRunning = waitForContainerRunning,
+    log = console.log
+} = {}) {
+    if (!containerName) {
+        throw new Error(`enable agent: failed to start '${shortAgentName}': no container was returned.`);
+    }
+    const running = isRunning(containerName) || waitRunning(containerName, 8, 250);
+    if (!running) {
+        throw new Error(`enable agent: failed to start '${shortAgentName}': container '${containerName}' exited during startup. Check container logs for details.`);
+    }
+    log(`Agent '${shortAgentName}' started successfully in container '${containerName}'.`);
+}
+
+function parsePloinkyDirectives(rawValue) {
+    if (Array.isArray(rawValue)) {
+        return rawValue.flatMap((item) => parsePloinkyDirectives(item)).filter(Boolean);
+    }
+    if (typeof rawValue !== 'string') {
+        return [];
+    }
+    return rawValue
+        .split(/[,\n;]+/)
+        .map((entry) => entry.trim().toLowerCase())
+        .filter(Boolean);
+}
+
+function normalizeManifestPwdUsers(manifest) {
+    const users = Array.isArray(manifest?.pwd?.users) ? manifest.pwd.users : [];
+    return users
+        .map((entry) => {
+            const username = String(entry?.username ?? entry?.user ?? '').trim();
+            const password = String(entry?.password ?? '');
+            const name = String(entry?.name ?? username).trim();
+            const email = String(entry?.email ?? '').trim();
+            const roles = Array.isArray(entry?.roles) ? entry.roles.map((role) => String(role || '').trim()).filter(Boolean) : [];
+            if (!username || !password) {
+                return null;
+            }
+            return {
+                id: `local:${username}`,
+                username,
+                name: name || username,
+                email: email || null,
+                passwordHash: hashPassword(password),
+                roles: roles.length ? Array.from(new Set(['local', ...roles])) : ['local'],
+                rev: 1
+            };
+        })
+        .filter(Boolean);
+}
+
+function resolveManifestAuthMode(manifest) {
+    if (manifest?.guest === true) {
+        return 'guest';
+    }
+    const ploinkyDirectives = parsePloinkyDirectives(manifest?.ploinky);
+    if (ploinkyDirectives.includes('pwd enable')) {
+        return 'local';
+    }
+    if (ploinkyDirectives.includes('sso enable')) {
+        return 'sso';
+    }
+    return 'none';
+}
+
+function normalizeEnableArgs(agentName, mode, repoNameParam) {
+    if (typeof agentName !== 'string') {
+        return { agentName, mode, repoNameParam };
+    }
+    const trimmed = agentName.trim();
+    if (!trimmed) {
+        return { agentName: trimmed, mode, repoNameParam };
+    }
+    if (mode) {
+        return { agentName: trimmed, mode, repoNameParam };
+    }
+
+    let parsedAgent = trimmed;
+    let parsedMode = mode;
+    let parsedRepo = repoNameParam;
+
+    const spaceTokens = trimmed.split(/\s+/).filter(Boolean);
+    if (spaceTokens.length > 1) {
+        const candidateMode = spaceTokens[1].toLowerCase();
+        if (isEnableAgentMode(candidateMode)) {
+            parsedAgent = spaceTokens[0];
+            parsedMode = candidateMode;
+            if (candidateMode === 'devel' && parsedRepo === undefined) {
+                const remainder = spaceTokens.slice(2).join(' ').trim();
+                if (remainder) parsedRepo = remainder;
+            }
+        }
+    }
+
+    if (parsedMode) {
+        return { agentName: parsedAgent, mode: parsedMode, repoNameParam: parsedRepo };
+    }
+
+    const colonIndex = trimmed.indexOf(':');
+    if (colonIndex === -1) {
+        return { agentName: parsedAgent, mode: parsedMode, repoNameParam: parsedRepo };
+    }
+
+    const target = trimmed.slice(0, colonIndex).trim();
+    const remainder = trimmed.slice(colonIndex + 1).trim();
+    if (!target || !remainder) {
+        return { agentName: parsedAgent, mode: parsedMode, repoNameParam: parsedRepo };
+    }
+
+    const tokens = remainder.split(/\s+/).filter(Boolean);
+    if (!tokens.length) {
+        return { agentName: parsedAgent, mode: parsedMode, repoNameParam: parsedRepo };
+    }
+
+    const inferredMode = tokens[0].toLowerCase();
+    if (!isEnableAgentMode(inferredMode)) {
+        return { agentName: parsedAgent, mode: parsedMode, repoNameParam: parsedRepo };
+    }
+
+    const repoFromDirective = tokens.slice(1).join(' ');
+    return {
+        agentName: target,
+        mode: inferredMode,
+        repoNameParam: inferredMode === 'devel'
+            ? (repoNameParam !== undefined ? repoNameParam : repoFromDirective)
+            : (repoNameParam !== undefined ? repoNameParam : undefined)
+    };
+}
+
+function loadRoutingConfig() {
+    try {
+        if (!fs.existsSync(ROUTING_FILE)) return { routes: {} };
+        const data = JSON.parse(fs.readFileSync(ROUTING_FILE, 'utf8') || '{}');
+        return data && typeof data === 'object' ? data : { routes: {} };
+    } catch (_) {
+        return { routes: {} };
+    }
+}
+
+function saveRoutingConfig(config) {
+    try {
+        fs.mkdirSync(path.dirname(ROUTING_FILE), { recursive: true });
+        fs.writeFileSync(ROUTING_FILE, JSON.stringify(config || { routes: {} }, null, 2));
+    } catch (_) {}
+}
+
+export function enableAgent(agentName, mode, repoNameParam, aliasParam, authModeParam, authOptions = {}) {
+    const normalized = normalizeEnableArgs(agentName, mode, repoNameParam);
+    const { manifestPath, repo: repoName, shortAgentName } = findAgent(normalized.agentName);
+    const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+    resolveManifestStartup(manifest);
+    const agentPath = path.dirname(manifestPath);
+    const alias = normalizeAlias(aliasParam);
+    const map = loadAgents();
+    if (alias) {
+        const aliasExists = Object.entries(map || {}).some(([key, value]) => {
+            if (key === alias) return true;
+            return value && value.type === 'agent' && value.alias === alias;
+        });
+        if (aliasExists) {
+            throw new Error('alias already exists');
+        }
+    }
+    const containerBaseName = alias || shortAgentName;
+    const containerName = getAgentContainerName(containerBaseName, repoName);
+    const routeKey = alias || shortAgentName;
+    const instanceName = alias || shortAgentName;
+    const authMode = authModeParam === undefined || authModeParam === null || String(authModeParam).trim() === ''
+        ? resolveManifestAuthMode(manifest)
+        : normalizeAuthMode(authModeParam);
+    const manifestPwdUsers = normalizeManifestPwdUsers(manifest);
+    const username = typeof authOptions?.username === 'string' && authOptions.username.trim()
+        ? authOptions.username.trim()
+        : '';
+    const password = typeof authOptions?.password === 'string' && authOptions.password.length
+        ? authOptions.password
+        : '';
+    const profile = typeof authOptions?.profile === 'string' && authOptions.profile.trim()
+        ? authOptions.profile.trim().toLowerCase()
+        : '';
+    if ((username || password) && authMode !== 'local') {
+        throw new Error('The --user and --password options are only valid with --auth pwd.');
+    }
+    if ((username && !password) || (!username && password)) {
+        throw new Error('Use --user and --password together.');
+    }
+
+    const normalizedMode = (normalized.mode || '').toLowerCase();
+    let runMode = DEFAULT_ENABLE_AGENT_MODE;
+    let projectPath = '';
+
+    if (!normalizedMode || normalizedMode === 'default' || normalizedMode === DEFAULT_ENABLE_AGENT_MODE) {
+        runMode = DEFAULT_ENABLE_AGENT_MODE;
+        projectPath = getAgentDataDir(instanceName);
+        try { fs.mkdirSync(projectPath, { recursive: true }); } catch (_) {}
+    } else if (normalizedMode === 'global') {
+        runMode = 'global';
+        projectPath = PLOINKY_WORKSPACE_ROOT;
+    } else if (normalizedMode === 'devel') {
+        const repoCandidate = String(normalized.repoNameParam || '').trim();
+        if (!repoCandidate) {
+            throw new Error("enable agent devel: missing repoName. Usage: enable agent <name> devel <repoName>");
+        }
+        const repoPath = path.join(REPOS_DIR, repoCandidate);
+        if (!fs.existsSync(repoPath) || !fs.statSync(repoPath).isDirectory()) {
+            throw new Error(`Repository '${repoCandidate}' not found in ${path.join(REPOS_DIR)}`);
+        }
+        runMode = 'devel';
+        projectPath = repoPath;
+    } else {
+        const errorMode = normalized.mode || mode || '';
+        throw new Error(`Unknown mode '${errorMode}'. Allowed: ${formatEnableAgentModes()}`);
+    }
+
+    // Parse port mappings from manifest
+    const { portMappings } = parseManifestPorts(manifest);
+    // If no ports specified, use default 7000
+    const ports = portMappings.length > 0 ? portMappings : [{ containerPort: 7000 }];
+    const projectMountTarget = runMode === DEFAULT_ENABLE_AGENT_MODE ? '/root' : projectPath;
+    const homePath = getAgentDataDir(instanceName);
+    try { fs.mkdirSync(homePath, { recursive: true }); } catch (_) {}
+    
+    const record = {
+        agentName: shortAgentName,
+        repoName,
+        containerImage: manifest.container || manifest.image || 'node:18-alpine',
+        createdAt: new Date().toISOString(),
+        projectPath,
+        runMode,
+        develRepo: runMode === 'devel' ? String(normalized.repoNameParam || '') : undefined,
+        type: 'agent',
+        config: {
+            binds: [
+                { source: projectPath, target: projectMountTarget },
+                ...(runMode === DEFAULT_ENABLE_AGENT_MODE ? [] : [{ source: homePath, target: '/root' }]),
+                { source: path.resolve(__dirname, '../../../Agent'), target: '/Agent' },
+                { source: agentPath, target: '/code' }
+            ],
+            env: [],
+            ports
+        }
+    };
+    if (authMode === 'local') {
+        resolveMasterKey();
+        record.auth = {
+            mode: authMode,
+            ...buildDefaultLocalAuthVars(routeKey)
+        };
+        if (username && password) {
+            setUsersPayload(record.auth.usersVar, {
+                version: 1,
+                users: [{
+                    id: `local:${username}`,
+                    username,
+                    name: username,
+                    email: null,
+                    passwordHash: hashPassword(password),
+                    roles: ['local', 'admin'],
+                    rev: 1
+                }]
+            });
+        } else if (manifestPwdUsers.length) {
+            setUsersPayload(record.auth.usersVar, {
+                version: 1,
+                users: manifestPwdUsers
+            });
+        }
+    } else {
+        record.auth = { mode: authMode };
+    }
+    if (alias) {
+        record.alias = alias;
+    }
+    if (profile) {
+        record.profile = profile;
+    }
+
+    const routing = loadRoutingConfig();
+    routing.routes = routing.routes || {};
+    const existingRoute = routing.routes[routeKey] || {};
+    const preferredHostPort = Number(existingRoute.hostPort || 0) || undefined;
+
+    for (const key of Object.keys(map)) {
+        if (RESERVED_AGENT_KEYS.has(key)) continue;
+        if (!map[key] || typeof map[key] !== 'object') continue;
+        if (alias && key === containerName) continue;
+        const r = map[key];
+        if (!r || r.type !== 'agent') continue;
+        const sameAgent = r.agentName === shortAgentName && r.repoName === repoName;
+        if (!sameAgent) continue;
+        if (alias || r.alias) continue;
+        if (key === containerName) continue;
+        try { delete map[key]; } catch (_) {}
+    }
+    map[containerName] = record;
+    saveAgents(map);
+
+    // Create workspace structure for the agent
+    try {
+        // Create per-instance data directory: $PLOINKY_WORKSPACE_ROOT/.data/<alias|agentName>/
+        createAgentWorkDir(instanceName);
+
+        // Create symlinks: $PLOINKY_WORKSPACE_ROOT/.ploinky/code/<agentName> and .ploinky/skills/<agentName>
+        createAgentSymlinks(shortAgentName, repoName, agentPath);
+    } catch (err) {
+        console.error(`Warning: Failed to create workspace structure for ${shortAgentName}: ${err.message}`);
+    }
+
+    let started = null;
+    try {
+        console.log(`Starting agent '${shortAgentName}' from repo '${repoName}'...`);
+        started = ensureAgentService(shortAgentName, manifest, agentPath, {
+            containerName,
+            alias: alias || undefined,
+            preferredHostPort
+        });
+    } catch (error) {
+        throw new Error(`enable agent: failed to start '${shortAgentName}': ${error?.message || error}`);
+    }
+    verifyEnabledAgentStarted(shortAgentName, started?.containerName || containerName);
+
+    const hostPort = started?.hostPort || preferredHostPort || existingRoute.hostPort;
+    const additionalServerPort = started?.additionalServerPort || null;
+    routing.routes[routeKey] = {
+        ...existingRoute,
+        container: started?.containerName || containerName,
+        hostPath: agentPath,
+        repo: repoName,
+        agent: shortAgentName,
+        ...(alias ? { alias } : {}),
+        ...(hostPort ? { hostPort } : {}),
+        ...(additionalServerPort ? { additionalServerPort } : {})
+    };
+    if (!additionalServerPort) {
+        delete routing.routes[routeKey].additionalServerPort;
+    }
+    saveRoutingConfig(routing);
+
+    return { containerName: started?.containerName || containerName, repoName, shortAgentName, alias: alias || undefined, auth: record.auth, runMode, hostPort };
+}
+
+export function disableAgent(agentRef) {
+    const input = typeof agentRef === 'string' ? agentRef.trim() : '';
+    if (!input) {
+        throw new Error("disable agent: missing agent name. Usage: disable <agentName>");
+    }
+
+    const hasNamespace = /[:/]/.test(input);
+    let targetRepo = null;
+    let targetAgent = input;
+
+    if (hasNamespace) {
+        const parts = input.split(/[:/]/).filter(Boolean);
+        if (parts.length !== 2) {
+            throw new Error(`disable agent: invalid identifier '${input}'. Use <repo>/<agent>.`);
+        }
+        [targetRepo, targetAgent] = parts;
+    }
+
+    const map = loadAgents();
+    const config = (map && typeof map._config === 'object') ? map._config : null;
+    const directRecord = (map && map[input] && map[input].type === 'agent') ? map[input] : null;
+
+    const clearStaticConfig = ({ repoName, shortName, containerName, rawInput }) => {
+        if (!config || !config.static) return false;
+        const comparisons = new Set();
+        if (shortName) comparisons.add(String(shortName).trim().toLowerCase());
+        if (repoName && shortName) {
+            const repo = String(repoName).trim().toLowerCase();
+            const short = String(shortName).trim().toLowerCase();
+            comparisons.add(`${repo}/${short}`);
+            comparisons.add(`${repo}:${short}`);
+        }
+        if (rawInput) comparisons.add(String(rawInput).trim().toLowerCase());
+
+        const staticAgent = String(config.static.agent || '').trim().toLowerCase();
+        const staticContainer = String(config.static.container || '').trim();
+
+        const matchesAgent = staticAgent && (comparisons.has(staticAgent));
+        const matchesContainer = containerName && staticContainer && staticContainer === containerName;
+
+        if (!matchesAgent && !matchesContainer) return false;
+
+        delete config.static;
+        if (Object.keys(config).length === 0) {
+            delete map._config;
+        } else {
+            map._config = config;
+        }
+        return true;
+    };
+
+    const entries = Object.entries(map || {})
+        .filter(([key, value]) => key !== '_config' && value && typeof value === 'object')
+        .filter(([, value]) => value.type === 'agent');
+
+    const aliasEntry = (!directRecord)
+        ? entries.find(([, value]) => {
+            if (!value || !value.alias) return false;
+            if (value.alias === input) return true;
+            if (hasNamespace) {
+                return value.alias === targetAgent;
+            }
+            return false;
+        })
+        : null;
+
+    let matches;
+    if (directRecord) {
+        matches = [[input, directRecord]];
+    } else if (aliasEntry) {
+        matches = [[aliasEntry[0], aliasEntry[1]]];
+    } else {
+        matches = entries.filter(([, value]) => {
+            const repoName = String(value.repoName || '').trim();
+            const agentName = String(value.agentName || '').trim();
+            if (!agentName) return false;
+            if (hasNamespace) {
+                return agentName === targetAgent && repoName === targetRepo;
+            }
+            return agentName === targetAgent;
+        });
+    }
+
+    if (!matches.length) {
+        const staticCleared = clearStaticConfig({ repoName: targetRepo, shortName: targetAgent, rawInput: input, containerName: null });
+        if (staticCleared) {
+            saveAgents(map);
+            return {
+                status: 'static-removed',
+                requested: input
+            };
+        }
+        return {
+            status: 'not-found',
+            requested: input
+        };
+    }
+
+    if (!hasNamespace && !directRecord && matches.length > 1) {
+        return {
+            status: 'ambiguous',
+            requested: input,
+            matches: matches.map(([, value]) => `${value.repoName}/${value.agentName}`)
+        };
+    }
+
+    const [containerName, record] = matches[0];
+
+    delete map[containerName];
+
+    clearStaticConfig({
+        repoName: record.repoName,
+        shortName: record.agentName,
+        containerName,
+        rawInput: input
+    });
+
+    saveAgents(map);
+
+    try {
+        stopAndRemove(containerName);
+    } catch (error) {
+        throw new Error(`disable agent: failed to stop and remove container '${containerName}': ${error?.message || error}`);
+    }
+
+    // Remove workspace structure for the agent
+    try {
+        // Remove symlinks: $CWD/code/<agentName> and $CWD/skills/<agentName>
+        removeAgentSymlinks(record.agentName);
+
+        // Note: We don't remove the agent work directory by default to preserve data
+        // Use removeAgentWorkDir(record.agentName, true) to force removal if needed
+    } catch (err) {
+        console.error(`Warning: Failed to remove workspace structure for ${record.agentName}: ${err.message}`);
+    }
+
+    return {
+        status: 'removed',
+        containerName,
+        shortAgentName: record.agentName,
+        repoName: record.repoName
+    };
+}
+
+export function disableAgentContainers(containerNames = []) {
+    const targets = Array.from(new Set((containerNames || [])
+        .map(name => String(name || '').trim())
+        .filter(Boolean)));
+    if (!targets.length) return [];
+
+    const map = loadAgents();
+    const config = (map && typeof map._config === 'object') ? map._config : null;
+    const disabled = [];
+
+    const clearStaticConfig = ({ repoName, shortName, containerName }) => {
+        if (!config || !config.static) return false;
+        const comparisons = new Set();
+        if (shortName) comparisons.add(String(shortName).trim().toLowerCase());
+        if (repoName && shortName) {
+            const repo = String(repoName).trim().toLowerCase();
+            const short = String(shortName).trim().toLowerCase();
+            comparisons.add(`${repo}/${short}`);
+            comparisons.add(`${repo}:${short}`);
+        }
+
+        const staticAgent = String(config.static.agent || '').trim().toLowerCase();
+        const staticContainer = String(config.static.container || '').trim();
+        const matchesAgent = staticAgent && comparisons.has(staticAgent);
+        const matchesContainer = containerName && staticContainer && staticContainer === containerName;
+
+        if (!matchesAgent && !matchesContainer) return false;
+
+        delete config.static;
+        if (Object.keys(config).length === 0) {
+            delete map._config;
+        } else {
+            map._config = config;
+        }
+        return true;
+    };
+
+    for (const containerName of targets) {
+        const record = map?.[containerName];
+        if (!record || record.type !== 'agent') {
+            disabled.push({
+                status: 'not-found',
+                containerName
+            });
+            continue;
+        }
+
+        delete map[containerName];
+        clearStaticConfig({
+            repoName: record.repoName,
+            shortName: record.agentName,
+            containerName
+        });
+
+        disabled.push({
+            status: 'removed',
+            containerName,
+            shortAgentName: record.agentName,
+            repoName: record.repoName
+        });
+    }
+
+    saveAgents(map);
+
+    try {
+        stopAndRemoveMany(targets);
+    } catch (error) {
+        throw new Error(`disable agents: failed to stop and remove containers: ${error?.message || error}`);
+    }
+
+    for (const item of disabled) {
+        if (item.status !== 'removed' || !item.shortAgentName) continue;
+        try {
+            removeAgentSymlinks(item.shortAgentName);
+        } catch (err) {
+            console.error(`Warning: Failed to remove workspace structure for ${item.shortAgentName}: ${err.message}`);
+        }
+    }
+
+    return disabled;
+}
+
+export function resolveEnabledAgentRecord(agentRef) {
+    const input = typeof agentRef === 'string' ? agentRef.trim() : '';
+    if (!input) return null;
+
+    const map = loadAgents();
+    if (!map || typeof map !== 'object') return null;
+
+    const direct = map[input];
+    if (direct && direct.type === 'agent') {
+        return { containerName: input, record: direct };
+    }
+
+    const hasNamespace = /[:/]/.test(input);
+    let repoFilter = null;
+    let agentFilter = input;
+    if (hasNamespace) {
+        const parts = input.split(/[:/]/).filter(Boolean);
+        if (parts.length === 2) {
+            [repoFilter, agentFilter] = parts;
+        }
+    }
+
+    let aliasEntry = Object.entries(map || {})
+        .filter(([key]) => !RESERVED_AGENT_KEYS.has(key))
+        .find(([, value]) => value && value.type === 'agent' && value.alias === input);
+    if (!aliasEntry && hasNamespace) {
+        aliasEntry = Object.entries(map || {})
+            .filter(([key]) => !RESERVED_AGENT_KEYS.has(key))
+            .find(([, value]) => value && value.type === 'agent' && value.alias === agentFilter);
+    }
+    if (aliasEntry) {
+        return { containerName: aliasEntry[0], record: aliasEntry[1] };
+    }
+
+    const matches = Object.entries(map)
+        .filter(([key, value]) => !RESERVED_AGENT_KEYS.has(key) && value && typeof value === 'object')
+        .filter(([, value]) => value.type === 'agent')
+        .filter(([, value]) => {
+            if (!value.agentName) return false;
+            if (repoFilter && value.repoName !== repoFilter) return false;
+            return value.agentName === agentFilter;
+        });
+
+    if (!matches.length) {
+        return null;
+    }
+
+    if (matches.length > 1) {
+        const aliasList = matches.map(([containerName, value]) => value.alias || containerName);
+        const err = new Error(`Multiple containers found for agent '${agentRef}'. Use alias: ${aliasList.join(', ')}`);
+        err.code = 'AGENT_ALIAS_AMBIGUOUS';
+        throw err;
+    }
+
+    const [containerName, record] = matches[0];
+    return { containerName, record };
+}

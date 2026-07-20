@@ -8,7 +8,7 @@ import {
     expandEnvWildcard,
     getManifestEnvSpecs,
     validateManifestEnvProfileCompleteness
-} from '../../cli/services/secretVars.js';
+} from '../../cli/utils/security/secretVars.js';
 
 // ================================
 // isWildcardPattern tests
