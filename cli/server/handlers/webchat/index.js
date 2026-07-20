@@ -104,12 +104,13 @@ export async function handleWebChat(req, res, appConfig, appState) {
     const workspaceDirectory = workspaceBase.base;
 
     if (await handleConversationRoute({ pathname, req, res, workspaceDirectory, appState })) return;
-    if (handleTaskRoute({
+    if (await handleTaskRoute({
         pathname,
         req,
         res,
         parsedUrl,
         workspaceDirectory,
+        appState,
         renderTaskView: () => renderTemplate(['task-view.html'], {
             '__ASSET_BASE__': `/${appName}/assets`,
         }),

@@ -3,6 +3,8 @@ import fs from 'node:fs';
 import { describeShellFailure } from '../lib/toolError.mjs';
 
 const DEFAULT_MAX_LOG_TAIL_BYTES = 128 * 1024;
+const CONTINUATION_HANDLE_RE = /^[A-Za-z0-9_-]{16,200}$/;
+const TOOL_NAME_RE = /^[A-Za-z0-9._-]{1,160}$/;
 
 function parsePositiveInt(value, fallback) {
     const parsed = Number.parseInt(value, 10);
@@ -12,18 +14,31 @@ function parsePositiveInt(value, fallback) {
     return fallback;
 }
 
-function commandResultText(stdout) {
+function normalizeContinuation(raw) {
+    if (!raw || typeof raw !== 'object') return null;
+    const handle = String(raw.handle || '').trim();
+    const toolName = String(raw.toolName || '').trim();
+    if (raw.version !== 1 || !CONTINUATION_HANDLE_RE.test(handle) || !TOOL_NAME_RE.test(toolName)) {
+        return null;
+    }
+    return { version: 1, handle, toolName };
+}
+
+function commandResult(stdout) {
     const raw = typeof stdout === 'string' ? stdout : String(stdout ?? '');
     const trimmed = raw.trim();
-    if (!trimmed) return '(no output)';
+    if (!trimmed) return { text: '(no output)', continuation: null };
     try {
         const parsed = JSON.parse(trimmed);
         if (parsed && typeof parsed === 'object' && typeof parsed.outputText === 'string') {
-            return parsed.outputText || '(no output)';
+            return {
+                text: parsed.outputText || '(no output)',
+                continuation: normalizeContinuation(parsed.continuation),
+            };
         }
     } catch {
     }
-    return raw;
+    return { text: raw, continuation: null };
 }
 
 export class TaskQueue {
@@ -97,6 +112,10 @@ export class TaskQueue {
                         payload: entry.payload,
                         status: entry.status || 'pending',
                         timeoutMs: entry.timeoutMs ?? null,
+                        logRetention: entry.logRetention === 'full' ? 'full' : 'bounded',
+                        continuationTool: TOOL_NAME_RE.test(String(entry.continuationTool || '').trim())
+                            ? String(entry.continuationTool).trim()
+                            : '',
                         createdAt: entry.createdAt || new Date().toISOString(),
                         updatedAt: entry.updatedAt || entry.createdAt || new Date().toISOString(),
                         error: entry.error ?? null,
@@ -129,7 +148,9 @@ export class TaskQueue {
                 timeoutMs: task.timeoutMs,
                 createdAt: task.createdAt,
                 updatedAt: task.updatedAt,
-                error: task.error
+                error: task.error,
+                logRetention: task.logRetention,
+                continuationTool: task.continuationTool,
             }));
             fs.writeFileSync(this.storagePath, JSON.stringify(snapshot, null, 2));
         } catch (err) {
@@ -186,7 +207,8 @@ export class TaskQueue {
         state.tail += text;
         state.tailBytes += Buffer.byteLength(text, 'utf8');
 
-        if (state.tailBytes > this.maxLogTailBytes) {
+        const task = this.tasks.get(taskId);
+        if (task?.logRetention !== 'full' && state.tailBytes > this.maxLogTailBytes) {
             state.truncated = true;
             while (state.tailBytes > this.maxLogTailBytes && state.tail.length > 0) {
                 const bytesToDrop = state.tailBytes - this.maxLogTailBytes;
@@ -217,7 +239,14 @@ export class TaskQueue {
         };
     }
 
-    enqueueTask({ toolName, commandSpec, payload, timeoutMs }) {
+    enqueueTask({
+        toolName,
+        commandSpec,
+        payload,
+        timeoutMs,
+        logRetention = 'bounded',
+        continuationTool = '',
+    }) {
         this.initialize();
         const id = this.generateId();
         const payloadWithId = { ...payload, taskId: id };
@@ -235,6 +264,10 @@ export class TaskQueue {
             },
             payload: payloadWithId,
             timeoutMs: Number.isFinite(timeoutMs) ? timeoutMs : null,
+            logRetention: logRetention === 'full' ? 'full' : 'bounded',
+            continuationTool: TOOL_NAME_RE.test(String(continuationTool || '').trim())
+                ? String(continuationTool).trim()
+                : '',
             status: 'pending',
             createdAt: new Date().toISOString(),
             updatedAt: new Date().toISOString(),
@@ -254,7 +287,14 @@ export class TaskQueue {
             toolName: task.toolName,
             status: task.status,
             createdAt: task.createdAt,
-            updatedAt: task.updatedAt
+            updatedAt: task.updatedAt,
+            logRetention: task.logRetention,
+            ...(task.continuationTool ? {
+                continuationCapability: {
+                    version: 1,
+                    toolName: task.continuationTool,
+                },
+            } : {}),
         };
     }
 
@@ -343,11 +383,19 @@ export class TaskQueue {
 
             const success = !timedOut && result.code === 0;
             if (success) {
-                const content = [{ type: 'text', text: commandResultText(result.stdout) }];
+                const parsedResult = commandResult(result.stdout);
+                const continuation = task.continuationTool
+                    && parsedResult.continuation?.toolName === task.continuationTool
+                    ? parsedResult.continuation
+                    : null;
+                const content = [{ type: 'text', text: parsedResult.text }];
                 task.status = 'completed';
                 task.result = {
                     content,
-                    metadata: { agent: process.env.AGENT_NAME || task.toolName }
+                    metadata: {
+                        agent: process.env.AGENT_NAME || task.toolName,
+                        ...(continuation ? { continuation } : {}),
+                    }
                 };
                 task.error = null;
             } else {

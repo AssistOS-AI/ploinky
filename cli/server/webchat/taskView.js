@@ -15,13 +15,49 @@ const status = document.getElementById('taskStatus');
 const duration = document.getElementById('taskDuration');
 const error = document.getElementById('taskError');
 const log = document.getElementById('taskLog');
+const continuationForm = document.getElementById('taskContinuation');
+const continuationInput = document.getElementById('taskContinuationInput');
+const continuationSend = document.getElementById('taskContinuationSend');
+const continuationError = document.getElementById('taskContinuationError');
+const MIN_CONTINUATION_INPUT_HEIGHT_PX = 40;
+const MAX_CONTINUATION_INPUT_HEIGHT_PX = 132;
 
 let task = null;
 let logText = '';
 let logOffset = 0;
 let initialLoadComplete = false;
 let logSync = null;
+let refreshSync = null;
+let continuationSubmitting = false;
 const pendingUpdates = [];
+const TERMINAL_STATUSES = new Set(['finished', 'stopped', 'error']);
+
+function autoResizeContinuationInput() {
+    continuationInput.style.height = 'auto';
+    const scrollHeight = Math.ceil(continuationInput.scrollHeight);
+    const nextHeight = Math.min(
+        MAX_CONTINUATION_INPUT_HEIGHT_PX,
+        Math.max(MIN_CONTINUATION_INPUT_HEIGHT_PX, scrollHeight),
+    );
+    continuationInput.style.height = `${nextHeight}px`;
+    continuationInput.style.overflowY = scrollHeight > MAX_CONTINUATION_INPUT_HEIGHT_PX
+        ? 'auto'
+        : 'hidden';
+    if (scrollHeight <= MAX_CONTINUATION_INPUT_HEIGHT_PX) {
+        continuationInput.scrollTop = 0;
+    }
+}
+
+function insertContinuationNewline() {
+    const start = typeof continuationInput.selectionStart === 'number'
+        ? continuationInput.selectionStart
+        : continuationInput.value.length;
+    const end = typeof continuationInput.selectionEnd === 'number'
+        ? continuationInput.selectionEnd
+        : start;
+    continuationInput.setRangeText('\n', start, end, 'end');
+    continuationInput.dispatchEvent(new Event('input', { bubbles: true }));
+}
 
 function applyTheme() {
     const supported = new Set(['light', 'dark', 'explorer', 'obsidian']);
@@ -52,6 +88,12 @@ function renderTask() {
     duration.textContent = taskDurationLabel(task);
     error.hidden = !task?.error;
     error.textContent = task?.error || '';
+    const canContinue = Boolean(task?.continuation?.handle)
+        && TERMINAL_STATUSES.has(task?.status);
+    continuationForm.hidden = !canContinue;
+    continuationInput.disabled = continuationSubmitting || !canContinue;
+    continuationSend.disabled = continuationSubmitting || !canContinue;
+    continuationSend.textContent = continuationSubmitting ? 'Sending…' : 'Send';
     document.title = `${description.textContent} · Task logs`;
 }
 
@@ -63,13 +105,27 @@ function renderLog({ stickToEnd = true } = {}) {
     else log.scrollTop = previousScrollTop;
 }
 
-async function fetchJson(url) {
-    const response = await fetch(url, { credentials: 'include' });
+async function fetchJson(url, options = {}) {
+    const response = await fetch(url, { credentials: 'include', ...options });
     const payload = await response.json().catch(() => ({}));
     if (!response.ok || payload.ok === false) {
         throw new Error(payload.error || `task_view_${response.status}`);
     }
     return payload;
+}
+
+async function refreshTask() {
+    if (refreshSync || task?.status !== 'ongoing' || !task?.continuation) return refreshSync;
+    refreshSync = fetchJson(endpoint(`tasks/${encodeURIComponent(taskId)}/refresh`))
+        .then((payload) => {
+            applyUpdate(payload);
+            return syncLog(logOffset);
+        })
+        .catch(showLoadError)
+        .finally(() => {
+            refreshSync = null;
+        });
+    return refreshSync;
 }
 
 async function syncLog(offset = logOffset) {
@@ -113,6 +169,34 @@ function showLoadError(loadError) {
     error.textContent = `Unable to load task data: ${loadError?.message || loadError}`;
 }
 
+async function submitContinuation(event) {
+    event.preventDefault();
+    if (continuationSubmitting) return;
+    const message = String(continuationInput.value || '').trim();
+    if (!message) return;
+    continuationSubmitting = true;
+    continuationError.hidden = true;
+    continuationError.textContent = '';
+    renderTask();
+    try {
+        const payload = await fetchJson(endpoint(`tasks/${encodeURIComponent(taskId)}/continue`), {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ message }),
+        });
+        continuationInput.value = '';
+        autoResizeContinuationInput();
+        applyUpdate(payload);
+        await syncLog(logOffset);
+    } catch (submitError) {
+        continuationError.hidden = false;
+        continuationError.textContent = `Unable to continue task: ${submitError?.message || submitError}`;
+    } finally {
+        continuationSubmitting = false;
+        renderTask();
+    }
+}
+
 async function initialize() {
     if (!taskId) {
         initialLoadComplete = true;
@@ -134,6 +218,7 @@ async function initialize() {
         renderTask();
         renderLog();
         for (const payload of pendingUpdates.splice(0)) applyUpdate(payload);
+        void refreshTask();
     }
 }
 
@@ -147,7 +232,22 @@ window.addEventListener('message', (event) => {
 });
 
 applyTheme();
+continuationForm.addEventListener('submit', submitContinuation);
+continuationInput.addEventListener('input', autoResizeContinuationInput);
+continuationInput.addEventListener('keydown', (event) => {
+    if (event.defaultPrevented || event.isComposing || event.key !== 'Enter') return;
+    if (event.ctrlKey || event.metaKey) {
+        event.preventDefault();
+        insertContinuationNewline();
+        return;
+    }
+    if (event.shiftKey) return;
+    event.preventDefault();
+    continuationForm.requestSubmit();
+});
+autoResizeContinuationInput();
 renderTask();
 renderLog();
 setInterval(renderTask, 1000);
+setInterval(() => void refreshTask(), 2000);
 void initialize();

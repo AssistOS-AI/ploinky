@@ -16,7 +16,7 @@ export function taskStatusPresentation(task) {
 }
 
 export function taskDurationSeconds(task, now = Date.now()) {
-    const start = Date.parse(task?.createdAt || '');
+    const start = Date.parse(task?.executionStartedAt || task?.createdAt || '');
     if (!Number.isFinite(start)) return null;
     const terminal = TERMINAL_STATUSES.has(task?.status);
     const end = terminal ? Date.parse(task?.updatedAt || '') : now;

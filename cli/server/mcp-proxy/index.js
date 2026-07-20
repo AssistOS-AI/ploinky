@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import http from 'node:http';
 import { sendJson, ensureAuthenticated } from '../authHandlers/index.js';
 import { createAgentClient } from '../AgentClient.js';
 import { waitForAgentReady } from '../utils/agentReadiness.js';
@@ -120,6 +121,108 @@ async function canonicalizeToolArguments(agentName, agentClient, toolName, args)
     } catch (_) {
         return args && typeof args === 'object' && !Array.isArray(args) ? args : {};
     }
+}
+
+export async function invokeAuthenticatedAgentTool({
+    req,
+    route,
+    agentName,
+    toolName,
+    arguments: rawArguments = {},
+}) {
+    const caller = policy.resolveCaller(req);
+    if (caller?.kind !== 'user') {
+        const error = new Error('authenticated_user_required');
+        error.status = 401;
+        throw error;
+    }
+    const decision = policy.mcpToolPolicy.evaluate({
+        agent: agentName,
+        tool: toolName,
+        caller,
+    });
+    if (!decision.allow) {
+        const error = new Error(decision.code || 'AGENT_POLICY_DENIED');
+        error.status = decision.status || 403;
+        throw error;
+    }
+    if (!route?.hostPort) {
+        const error = new Error('continuation_agent_unavailable');
+        error.status = 409;
+        throw error;
+    }
+    const baseUrl = `http://127.0.0.1:${route.hostPort}/mcp`;
+    const agentClient = createAgentClient(baseUrl);
+    try {
+        const args = await canonicalizeToolArguments(agentName, agentClient, toolName, rawArguments);
+        const context = buildInvocationContextForProviderCall({
+            req,
+            agentName,
+            toolName,
+            toolArgs: args,
+        });
+        const toolClient = createAgentClient(baseUrl, context?.token
+            ? { requestHeaders: { authorization: `Bearer ${context.token}` } }
+            : undefined);
+        try {
+            return await toolClient.callTool(toolName, args);
+        } finally {
+            await toolClient.close().catch(() => {});
+        }
+    } finally {
+        await agentClient.close().catch(() => {});
+    }
+}
+
+export async function readAuthenticatedAgentTask({ req, route, agentName, taskId }) {
+    const caller = policy.resolveCaller(req);
+    if (caller?.kind !== 'user') {
+        const error = new Error('authenticated_user_required');
+        error.status = 401;
+        throw error;
+    }
+    if (!route?.hostPort) {
+        const error = new Error('continuation_agent_unavailable');
+        error.status = 409;
+        throw error;
+    }
+    const normalizedTaskId = String(taskId || '').trim();
+    const context = buildInvocationContextForProviderCall({
+        req,
+        agentName,
+        toolName: TASK_STATUS_TOOL,
+        toolArgs: { taskId: normalizedTaskId },
+        method: 'GET',
+        path: '/task',
+    });
+    const url = new URL(`http://127.0.0.1:${route.hostPort}/task`);
+    url.searchParams.set('taskId', normalizedTaskId);
+    return await new Promise((resolve, reject) => {
+        const request = http.request(url, {
+            method: 'GET',
+            headers: {
+                accept: 'application/json',
+                ...(context?.token ? { authorization: `Bearer ${context.token}` } : {}),
+            },
+        }, (response) => {
+            const chunks = [];
+            response.on('data', (chunk) => chunks.push(chunk));
+            response.on('end', () => {
+                const text = Buffer.concat(chunks).toString('utf8');
+                let payload = null;
+                try { payload = JSON.parse(text); } catch (_) { }
+                if ((response.statusCode || 500) >= 400 || !payload?.task) {
+                    const error = new Error(payload?.reason || payload?.error || `task_status_${response.statusCode}`);
+                    error.status = response.statusCode || 502;
+                    reject(error);
+                    return;
+                }
+                resolve(payload.task);
+            });
+        });
+        request.on('error', reject);
+        request.end();
+    });
 }
 
 export function buildInvocationContextForProviderCall({ req, agentName, toolName, toolArgs, method = 'POST', path = '/mcp' }) {

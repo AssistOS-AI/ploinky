@@ -1097,7 +1097,13 @@ async function registerFromConfig(server, config, helpers) {
             };
 
             const isAsync = tool.async === true;
-            const asyncTimeout = Number.isFinite(tool.timeout) ? tool.timeout : undefined;
+            const asyncTimeout = Number.isFinite(tool.timeoutMs)
+                ? tool.timeoutMs
+                : (Number.isFinite(tool.timeout) ? tool.timeout : undefined);
+            const taskLogRetention = tool.taskLogRetention === 'full' ? 'full' : 'bounded';
+            const continuationTool = typeof tool.continuationTool === 'string'
+                ? tool.continuationTool.trim()
+                : '';
             const invocation = async (...cbArgs) => {
                 let args = cbArgs[0] ?? {};
                 let context = cbArgs[1] ?? {};
@@ -1128,7 +1134,9 @@ async function registerFromConfig(server, config, helpers) {
                         toolName: name,
                         commandSpec,
                         payload,
-                        timeoutMs: asyncTimeout
+                        timeoutMs: asyncTimeout,
+                        logRetention: taskLogRetention,
+                        continuationTool,
                     });
                     return {
                         content: [{ type: 'text', text: `Task '${name}' queued with id ${enqueued.id}` }],
@@ -1138,7 +1146,11 @@ async function registerFromConfig(server, config, helpers) {
                             toolName: enqueued.toolName,
                             status: enqueued.status,
                             createdAt: enqueued.createdAt,
-                            updatedAt: enqueued.updatedAt
+                            updatedAt: enqueued.updatedAt,
+                            logRetention: enqueued.logRetention,
+                            ...(enqueued.continuationCapability
+                                ? { continuationCapability: enqueued.continuationCapability }
+                                : {}),
                         }
                     };
                 }

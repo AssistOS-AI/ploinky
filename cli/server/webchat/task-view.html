@@ -16,6 +16,15 @@
     </header>
     <div class="wa-task-error" id="taskError" hidden></div>
     <div class="wa-task-log" id="taskLog"></div>
+    <form class="wa-task-continuation" id="taskContinuation" hidden>
+        <label for="taskContinuationInput">Continue this agent session</label>
+        <div class="wa-task-continuation-row">
+            <textarea id="taskContinuationInput" rows="1" maxlength="32768"
+                placeholder="Send another message to this coding agent"></textarea>
+            <button type="submit" id="taskContinuationSend">Send</button>
+        </div>
+        <div class="wa-task-continuation-error" id="taskContinuationError" hidden></div>
+    </form>
 </main>
 <script type="module" src="__ASSET_BASE__/taskView.js"></script>
 </body>

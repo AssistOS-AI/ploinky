@@ -221,6 +221,16 @@ export function writeOrBufferSseEvent(tab, payload) {
     pushPendingSseEvent(tab, payload);
 }
 
+export function broadcastTaskUpdate(appState, workspaceDirectory, update) {
+    if (!update?.task?.id) return;
+    const payload = `event: task-update\ndata: ${JSON.stringify(update)}\n\n`;
+    for (const runtime of getRuntimeMap(appState).values()) {
+        if (runtime?.workspaceDirectory === workspaceDirectory) {
+            writeOrBufferSseEvent(runtime, payload);
+        }
+    }
+}
+
 function normalizeRuntimeModel(value) {
     if (value === null) return null;
     if (typeof value !== 'string') return undefined;

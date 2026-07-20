@@ -111,7 +111,36 @@ collapsible block above the final answer. A progress-only placeholder may render
 that block without an empty text bubble. Progress remains UI metadata rather
 than assistant text and must not enter continuation context.
 
-WebChat may also receive generic `__webchatTask` lifecycle envelopes from a selected CLI. These envelopes must be intercepted before conversation rendering and history capture. Ploinky must store workspace-scoped task metadata as append-only JSON lines in `<cwd>/.copilot_history/agent_tasks`, store bounded per-task logs separately under `.copilot_history/task_logs/`, and expose authenticated `GET /webchat/tasks`, `GET /webchat/tasks/<task-id>/log`, and `GET /webchat/tasks/<task-id>/view` routes. Browser updates must use the existing EventSource stream with a `task-update` event; Ploinky must not hardcode target-agent ids or tool names.
+WebChat may also receive generic `__webchatTask` lifecycle envelopes from a selected CLI. These envelopes must be intercepted before conversation rendering and history capture. Ploinky must store workspace-scoped task metadata as append-only JSON lines in `<cwd>/.copilot_history/agent_tasks`, store per-task logs separately under `.copilot_history/task_logs/`, and expose authenticated `GET /webchat/tasks`, `GET /webchat/tasks/<task-id>/log`, and `GET /webchat/tasks/<task-id>/view` routes. Logs are bounded by default; an asynchronous tool may explicitly declare full retention for tasks whose complete multi-turn transcript must survive. Browser updates must use the existing EventSource stream with a `task-update` event; Ploinky must not hardcode target-agent ids or tool names.
+
+An asynchronous tool may advertise a generic continuation tool. Its successful
+structured result may return a versioned opaque continuation handle, which
+Ploinky stores with the target agent and tool name in the task record. A
+terminal task carrying that capability must show a message input in its
+authenticated task view. `POST /webchat/tasks/<task-id>/continue` invokes only
+the stored target and stored tool with that opaque handle and the new message,
+through normal MCP policy evaluation and a newly minted request-bound Router
+Request; it must never forward the browser session token to the target agent.
+The continuation input must submit on unmodified Enter, preserve a newline on
+Ctrl/Cmd+Enter or Shift+Enter, disable manual textarea resizing, and grow
+upward with its content to the same bounded height as the main WebChat
+composer. Beyond that height its own content must scroll, and deleting content
+must shrink it again.
+The provider invocation creates a new remote AgentServer task, but WebChat must
+retain the exact same local `taskId`, increment its positive `turn`, replace its
+current `remoteTaskId`, set the task back to `ongoing`, and append subsequent
+logs to the same task log. Late lifecycle events from an older turn or remote
+task id must not overwrite the current turn. The original task description and
+creation time remain stable, while `executionStartedAt` tracks the current turn.
+The task view may poll an authenticated refresh route while the continued turn
+is active; parent-stream updates remain the normal live path. If the stored
+agent is installed but has no ready route, including after a general restart
+left a `startup: manual` provider stopped, the task route must activate that
+exact agent in global mode through Ploinky's internal enable lifecycle, publish
+its route, and wait for readiness before invoking or polling it. Concurrent
+requests for the same provider must share one activation. Startup or readiness
+failure must remain explicit instead of changing the local task identity or
+silently selecting another provider.
 
 Each first `started` envelope for a task in a user turn must insert one task item
 immediately after that turn's existing assistant placeholder. Multiple tasks are
@@ -142,6 +171,14 @@ Missing log offsets must be recovered through the existing log route. Direct
 navigation may show the current authenticated snapshot without a parent live
 bridge.
 
+The generic side panel used by task views and every other delegated link must
+remain vertically bounded above WebChat's floating composer. Its available
+height must follow the composer height dynamically when the textarea expands
+or attachment previews appear. The panel header remains fixed within that
+bounded region, while its content area and embedded iframe use the remaining
+height and provide their own scrolling instead of extending underneath the
+composer.
+
 The Tasks overlay, compact task item, and task view must share one presentation policy.
 Pending work is shown as `QUEUED`, active work as `RUNNING`, and terminal states
 as `COMPLETED`, `STOPPED`, or `FAILED`. Raw task log files remain unchanged and
@@ -157,7 +194,7 @@ Browser rendering strips ANSI control sequences and retains presentation
 compatibility for historical logs that contain recognized stream and runner
 prefixes; new raw provider output remains otherwise unchanged.
 
-When a WebChat runtime has no SSE subscribers but owns a task whose materialized state is `ongoing`, reconnect cleanup must retain that runtime so its agent can continue router-mediated polling and log collection. Once its tasks become terminal, the normal reconnect grace and disposal behavior resumes. If the runtime is recreated after a wider process restart, the selected CLI may reattach from the workspace task journal. Task identity must be based on the target agent and remote task id; a PID is optional diagnostics only.
+When a WebChat runtime has no SSE subscribers but owns a task whose materialized state is `ongoing`, reconnect cleanup must retain that runtime so its agent can continue router-mediated polling and log collection. Once its tasks become terminal, the normal reconnect grace and disposal behavior resumes. If the runtime is recreated after a wider process restart, the selected CLI may reattach from the workspace task journal. Initial task identity is derived from target agent and remote task id; after continuation, the stable local task id plus its monotonically increasing turn select the current remote task. A PID is optional diagnostics only.
 
 The router must also expose:
 
@@ -304,6 +341,26 @@ absolute path or requiring an agent-specific prefix. Immediate-folder listing
 with explicit drill-down keeps lookup bounded and makes a plain token such as
 `@src/index.js` unambiguous once WebChat records its structured
 `workspace-path` reference.
+
+### Question #19: Why does continuation increment `turn` instead of creating another local task?
+
+Response:
+The user is continuing one piece of work and expects its title, history, and
+logs to remain together. AgentServer still needs a new remote execution record
+for each asynchronous invocation, so `turn` separates those executions without
+changing the WebChat identity. Binding updates to both turn and current remote
+task id also prevents a delayed poll from the prior execution from regressing
+the continued task.
+
+### Question #20: Why may task continuation activate a manual provider?
+
+Response:
+The continuation handle is already bound to one installed provider, while a
+general workspace restart intentionally leaves unrelated `startup: manual`
+agents stopped and removes their routes. Treating the user's continuation
+request as explicit activation restores that exact provider through the normal
+global enable lifecycle. Deduplicating activation and waiting for readiness
+avoid duplicate starts and immediate calls to an MCP server that is not ready.
 
 ## Conclusion
 
