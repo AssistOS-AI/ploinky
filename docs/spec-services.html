@@ -57,7 +57,7 @@
 
                     <div class="doc-section" id="workspace">
                         <h2>Workspace Service</h2>
-                        <p><strong>File:</strong> <code>cli/services/workspace.js</code></p>
+                        <p><strong>File:</strong> <code>cli/utils/workspace.js</code></p>
                         <p>Manages the .ploinky directory structure and workspace configuration.</p>
                         
                         <h3>Key Functions</h3>
@@ -122,7 +122,7 @@ function setConfig(config) {
 
                     <div class="doc-section" id="docker">
                         <h2>Runtime Backends</h2>
-                        <p><strong>Directories:</strong> <code>cli/services/docker/</code> (also supports Podman), <code>cli/services/bwrap/</code>, <code>cli/services/seatbelt/</code></p>
+                        <p><strong>Directories:</strong> <code>cli/sandbox/docker/</code> (also supports Podman), <code>cli/sandbox/bwrap/</code>, <code>cli/sandbox/seatbelt/</code></p>
                         <p>Ploinky supports three runtime backends for agent isolation:</p>
                         <ul style="margin-left: 2rem;">
                             <li><strong>docker/</strong> &mdash; OCI container runtime via Docker or Podman (Podman is preferred; checked first in PATH).</li>
@@ -238,7 +238,7 @@ function findFreePort(start, end) {
 
                     <div class="doc-section" id="repos">
                         <h2>Repository Service</h2>
-                        <p><strong>File:</strong> <code>cli/services/repos.js</code></p>
+                        <p><strong>File:</strong> <code>cli/utils/repos.js</code></p>
                         <p>Manages agent repositories including predefined and custom repos.</p>
                         
                         <h3>Predefined Repositories</h3>
@@ -322,7 +322,7 @@ function getActiveRepos(reposDir) {
 
                     <div class="doc-section" id="agents">
                         <h2>Agents Service</h2>
-                        <p><strong>File:</strong> <code>cli/services/agents.js</code></p>
+                        <p><strong>File:</strong> <code>cli/utils/agents.js</code></p>
                         <p>Handles agent registration and lifecycle management.</p>
                         
                         <h3>Agent Registration</h3>
@@ -366,7 +366,7 @@ function enableAgent(agentName) {
 
                     <div class="doc-section" id="secrets">
                         <h2>Secrets Service</h2>
-                        <p><strong>File:</strong> <code>cli/services/secretVars.js</code></p>
+                        <p><strong>File:</strong> <code>cli/utils/security/secretVars.js</code></p>
                         <p>Manages environment variables and secrets with aliasing support.</p>
                         
                         <h3>Variable Management</h3>
@@ -518,7 +518,7 @@ return proxyUsingGenerationTarget(plan, req, res);</code></pre>
 
                     <div class="doc-section" id="bootstrap">
                         <h2>Bootstrap Service</h2>
-                        <p><strong>File:</strong> <code>cli/services/bootstrapManifest.js</code></p>
+                        <p><strong>File:</strong> <code>cli/utils/runtime/bootstrapManifest.js</code></p>
                         <p>Handles manifest directives for auto-configuration.</p>
                         
                         <h3>Manifest Directives</h3>
@@ -560,7 +560,7 @@ async function applyManifestDirectives(agentName) {
 
                     <div class="doc-section" id="utils">
                         <h2>Utilities</h2>
-                        <p><strong>File:</strong> <code>cli/services/utils.js</code></p>
+                        <p><strong>File:</strong> <code>cli/utils/utils.js</code></p>
                         <p>Common utility functions used across services.</p>
                         
                         <h3>Agent Discovery</h3>

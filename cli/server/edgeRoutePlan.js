@@ -1,8 +1,8 @@
 import net from 'node:net';
 import { domainToASCII } from 'node:url';
 
-import { captureEdgeRoutingLease } from '../services/edgeGeneration.js';
-import { selectedRouterHostPort } from '../services/routerPort.js';
+import { captureEdgeRoutingLease } from '../sandbox/edgeGeneration.js';
+import { selectedRouterHostPort } from '../sandbox/routerPort.js';
 import {
     buildServiceAgentPath,
     collectHttpServiceRoutes,

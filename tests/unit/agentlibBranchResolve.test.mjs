@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 process.env.PLOINKY_MASTER_KEY = process.env.PLOINKY_MASTER_KEY || '5'.repeat(64);
 
 const suffix = `?t=${Date.now()}`;
-const depInstallerUrl = new URL('../../cli/services/dependencyInstaller.js', import.meta.url);
+const depInstallerUrl = new URL('../../cli/utils/dependencies/dependencyInstaller.js', import.meta.url);
 const { resolveAgentlibBranchRef } = await import(`${depInstallerUrl.href}${suffix}`);
 
 const yes = () => true;   // stub: branch exists on the achillesAgentLib remote

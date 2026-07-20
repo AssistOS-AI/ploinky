@@ -1,4 +1,4 @@
-import { resolvePersistedRouterPort } from '../../services/routerPort.js';
+import { resolvePersistedRouterPort } from '../../sandbox/routerPort.js';
 
 const COMPONENTS = {
   webchat: { label: 'WebChat', path: '/webchat', administratorOnly: false },

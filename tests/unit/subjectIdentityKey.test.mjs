@@ -20,7 +20,7 @@ const {
     buildSubjectIdentityKey,
     verifySubjectIdentityKey,
     SubjectIdentityKeyError,
-} = await import(`../../cli/services/subjectIdentityKey.js${moduleSuffix}`);
+} = await import(`../../cli/utils/security/subjectIdentityKey.js${moduleSuffix}`);
 
 test.after(() => {
     process.chdir(originalCwd);

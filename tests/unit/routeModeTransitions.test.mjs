@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 
-import { mergeRuntimeRoute } from '../../cli/services/routingFile.js';
+import { mergeRuntimeRoute } from '../../cli/server/routingFile.js';
 
 const oldRouted = {
     container: 'old-container',
@@ -18,7 +18,7 @@ test('no-wait default-to-none route transition deletes stale ports', () => {
         }),
         { container: 'none-container' },
     );
-    const source = fs.readFileSync(new URL('../../cli/services/noWaitWorker.js', import.meta.url), 'utf8');
+    const source = fs.readFileSync(new URL('../../cli/commands/noWaitWorker.js', import.meta.url), 'utf8');
     assert.match(source, /profileResolution\.network\.mode === 'none'/);
     assert.match(source, /hostPort: routedHostPort/);
     assert.match(source, /mergeRuntimeRoute/);

@@ -5,8 +5,8 @@ import {
     enableAgent,
     preferredHostPortForNetworkMode,
     verifyEnabledAgentStarted,
-} from '../../cli/services/agents.js';
-import { mergeRuntimeRoute } from '../../cli/services/routingFile.js';
+} from '../../cli/utils/agents.js';
+import { mergeRuntimeRoute } from '../../cli/server/routingFile.js';
 
 test('enable agent forwards its selected explicit profile to the service launch', () => {
     assert.match(

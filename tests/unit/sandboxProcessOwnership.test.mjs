@@ -6,7 +6,7 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
 
-const fleetModuleUrl = pathToFileURL(path.resolve('cli/services/bwrap/bwrapFleet.js')).href;
+const fleetModuleUrl = pathToFileURL(path.resolve('cli/sandbox/bwrap/bwrapFleet.js')).href;
 
 test('sandbox PID ownership is isolated by exact runtime key and rejects stale identities', () => {
     const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-sandbox-owner-'));
@@ -114,10 +114,10 @@ test('sandbox PID ownership is isolated by exact runtime key and rejects stale i
 });
 
 test('sandbox lifecycle call sites use the exact container runtime key', () => {
-    const bwrapManager = fs.readFileSync('cli/services/bwrap/bwrapServiceManager.js', 'utf8');
-    const seatbeltManager = fs.readFileSync('cli/services/seatbelt/seatbeltServiceManager.js', 'utf8');
-    const serviceManager = fs.readFileSync('cli/services/docker/agentServiceManager.js', 'utf8');
-    const containerFleet = fs.readFileSync('cli/services/docker/containerFleet.js', 'utf8');
+    const bwrapManager = fs.readFileSync('cli/sandbox/bwrap/bwrapServiceManager.js', 'utf8');
+    const seatbeltManager = fs.readFileSync('cli/sandbox/seatbelt/seatbeltServiceManager.js', 'utf8');
+    const serviceManager = fs.readFileSync('cli/sandbox/docker/agentServiceManager.js', 'utf8');
+    const containerFleet = fs.readFileSync('cli/sandbox/docker/containerFleet.js', 'utf8');
 
     for (const source of [bwrapManager, seatbeltManager]) {
         assert.match(source, /saveBwrapPid\(containerName, child\.pid, runtimeIdentity\)/);

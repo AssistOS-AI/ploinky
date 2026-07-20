@@ -14,10 +14,10 @@ const { FileSystemPolicyStateStore } = await import(`../../cli/server/policy/Fil
 const {
     initializeFreshEdgeRoutingSources,
     loadActiveEdgeRoutingGeneration,
-} = await import(`../../cli/services/edgeGeneration.js?t=${Date.now()}`);
+} = await import(`../../cli/sandbox/edgeGeneration.js?t=${Date.now()}`);
 const file = path.join(tempDir, '.ploinky', 'data', 'router-security', 'policy-state.json');
-const edgeGenerationModuleUrl = new URL('../../cli/services/edgeGeneration.js', import.meta.url).href;
-const maintenanceLocksModuleUrl = new URL('../../cli/services/maintenanceLocks.js', import.meta.url).href;
+const edgeGenerationModuleUrl = new URL('../../cli/sandbox/edgeGeneration.js', import.meta.url).href;
+const maintenanceLocksModuleUrl = new URL('../../cli/utils/runtime/maintenanceLocks.js', import.meta.url).href;
 
 test.after(() => {
     process.chdir(originalCwd);

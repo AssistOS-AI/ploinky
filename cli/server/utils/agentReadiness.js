@@ -1,7 +1,7 @@
 import fs from 'fs';
 import http from 'http';
 import net from 'net';
-import { ROUTING_FILE } from '../../services/config.js';
+import { ROUTING_FILE } from '../../utils/config.js';
 
 function readRouting() {
     try {

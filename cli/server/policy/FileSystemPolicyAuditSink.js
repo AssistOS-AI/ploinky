@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { PLOINKY_WORKSPACE_ROOT } from '../../services/config.js';
+import { PLOINKY_WORKSPACE_ROOT } from '../../utils/config.js';
 
 import { PolicyAuditSink } from './PolicyAuditSink.js';
 

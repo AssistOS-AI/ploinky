@@ -3,7 +3,7 @@ import test from 'node:test';
 
 import { signPrivateRouterAssertion } from '../../Agent/lib/agentAssertion.mjs';
 import { createMemoryReplayCache } from '../../Agent/lib/jwtVerify.mjs';
-import { derivePrivateAgentRequestSecret } from '../../cli/services/masterKey.js';
+import { derivePrivateAgentRequestSecret } from '../../cli/utils/security/masterKey.js';
 import {
     authorizePrivateRoutePlan,
     createTurnCredentialRateLimiter,

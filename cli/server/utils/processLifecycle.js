@@ -1,6 +1,6 @@
 import fs from 'fs';
 import path from 'path';
-import { appendLog, logCrash, logShutdown } from '../utils/logger.js';
+import { appendLog, logCrash, logShutdown } from './logger.js';
 
 const PID_FILE = process.env.PLOINKY_ROUTER_PID_FILE || null;
 const GRACEFUL_SHUTDOWN_TIMEOUT = 10000; // 10 seconds

@@ -8,7 +8,7 @@ import {
     createEdgePublicationRouteCoordinator,
     createExternalHostnameProbe,
     startCloudflarePublicationRuntime,
-} from '../../cli/services/cloudflarePublicationRuntime.js';
+} from '../../cli/sandbox/cloudflarePublicationRuntime.js';
 
 const GENERATION = `sha256:${'a'.repeat(64)}`;
 

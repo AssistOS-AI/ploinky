@@ -37,7 +37,7 @@ const [
 ] = await Promise.all([
     import('../../Agent/lib/jwtVerify.mjs'),
     import('../../Agent/lib/requestSignedTokens.mjs'),
-    import('../../cli/services/masterKey.js'),
+    import('../../cli/utils/security/masterKey.js'),
     import('../../Agent/lib/requestHash.mjs'),
     import('../../cli/server/httpServiceRoutes.js'),
     import('../../cli/server/routerHandlers.js'),
@@ -832,7 +832,7 @@ async function withRouterModules(t, servicePort, writeConfig = writeWorkspaceCon
     writeConfig(ploinkyDir, servicePort);
     writeEdgeSourceDocuments(ploinkyDir);
 
-    const edgeGeneration = await import(`${pathToFileURL(path.join(REPO_ROOT, 'cli/services/edgeGeneration.js')).href}?test=${Date.now()}-${Math.random()}`);
+    const edgeGeneration = await import(`${pathToFileURL(path.join(REPO_ROOT, 'cli/sandbox/edgeGeneration.js')).href}?test=${Date.now()}-${Math.random()}`);
     edgeGeneration.applyEdgeRoutingGeneration({ workspaceRoot: workspace, reason: 'http-service-test-fixture' });
 
     const nonce = `${Date.now()}-${Math.random()}`;

@@ -1,8 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { NO_NODE_RUNTIME_KEY } from '../../cli/services/dependencyRuntimeKey.js';
-import { resolveDependencyCachePreparation } from '../../cli/services/docker/agentServiceManager.js';
+import { NO_NODE_RUNTIME_KEY } from '../../cli/utils/dependencies/dependencyRuntimeKey.js';
+import { resolveDependencyCachePreparation } from '../../cli/sandbox/docker/agentServiceManager.js';
 
 test('node-less container agent without package.json skips dependency cache preparation', () => {
     const plan = resolveDependencyCachePreparation({

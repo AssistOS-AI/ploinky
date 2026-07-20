@@ -4,15 +4,15 @@ import assert from 'node:assert/strict';
 import {
     PLOINKY_MANAGED_LABEL,
     managedContainerLabelArgs,
-} from '../../cli/services/docker/common.js';
-import { buildPersistentAgentRunArgs } from '../../cli/services/docker/agentServiceManager.js';
+} from '../../cli/sandbox/docker/common.js';
+import { buildPersistentAgentRunArgs } from '../../cli/sandbox/docker/agentServiceManager.js';
 import {
     buildInteractiveAgentCreateCommand,
     buildInteractiveCommandCreateCommand,
-} from '../../cli/services/docker/interactive.js';
-import { buildShellDetectionRunArgs } from '../../cli/services/docker/shellDetection.js';
-import { buildContainerInstallRunArgs } from '../../cli/services/dependencyCache.js';
-import { buildContainerRuntimeKeyProbeRunArgs } from '../../cli/services/dependencyRuntimeKey.js';
+} from '../../cli/sandbox/docker/interactive.js';
+import { buildShellDetectionRunArgs } from '../../cli/sandbox/docker/shellDetection.js';
+import { buildContainerInstallRunArgs } from '../../cli/utils/dependencies/dependencyCache.js';
+import { buildContainerRuntimeKeyProbeRunArgs } from '../../cli/utils/dependencies/dependencyRuntimeKey.js';
 
 const managed = 'io.assistos.ploinky.managed=1';
 

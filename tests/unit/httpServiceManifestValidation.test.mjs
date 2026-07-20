@@ -5,8 +5,8 @@ import { normalizeServiceSpec } from '../../cli/server/httpServiceRoutes.js';
 import {
     explicitHttpServicePorts,
     validateManifestHttpServices,
-} from '../../cli/services/httpServicePortConfig.js';
-import { resolveManifestRuntimeProfile } from '../../cli/services/profileService.js';
+} from '../../cli/sandbox/httpServicePortConfig.js';
+import { resolveManifestRuntimeProfile } from '../../cli/utils/runtime/profileService.js';
 
 test('httpServices port accepts only an actual JSON safe integer in range', () => {
     assert.deepEqual(explicitHttpServicePorts({

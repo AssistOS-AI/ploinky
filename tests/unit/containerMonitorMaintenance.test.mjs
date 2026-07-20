@@ -8,7 +8,7 @@ const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-container-monit
 fs.mkdirSync(path.join(workspace, '.ploinky'), { recursive: true });
 process.env.PLOINKY_WORKSPACE_ROOT = workspace;
 
-const locks = await import(`../../cli/services/maintenanceLocks.js?test=${Date.now()}`);
+const locks = await import(`../../cli/utils/runtime/maintenanceLocks.js?test=${Date.now()}`);
 const { performContainerRestart } = await import(`../../cli/server/containerMonitor.js?test=${Date.now()}`);
 
 test('scheduled watchdog restart defers when maintenance starts before execution', async () => {

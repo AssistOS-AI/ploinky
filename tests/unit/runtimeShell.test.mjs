@@ -4,9 +4,9 @@ import { handleCliCommand } from '../../cli/commands/cli.js';
 import {
     isSuspended,
     registerInterface,
-} from '../../cli/services/inputState.js';
-import { runReplCommand } from '../../cli/services/replCommandRunner.js';
-import { runOuterRuntimeShell } from '../../cli/services/runtimeShell.js';
+} from '../../cli/commands/inputState.js';
+import { runReplCommand } from '../../cli/sandbox/replCommandRunner.js';
+import { runOuterRuntimeShell } from '../../cli/sandbox/runtimeShell.js';
 
 test('cli dispatches solely by argument arity', async () => {
     const calls = [];

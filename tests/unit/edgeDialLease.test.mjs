@@ -10,7 +10,7 @@ import test from 'node:test';
 import {
     applyEdgeRoutingGeneration,
     inactivateEdgeRoutingGeneration,
-} from '../../cli/services/edgeGeneration.js';
+} from '../../cli/sandbox/edgeGeneration.js';
 import { commitRoutePlan, resolveEdgeRoutePlan } from '../../cli/server/edgeRoutePlan.js';
 import {
     createAgentRouteEntries,

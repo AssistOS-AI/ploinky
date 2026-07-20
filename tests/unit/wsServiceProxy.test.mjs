@@ -28,8 +28,8 @@ const [
     import('../../Agent/lib/jwtVerify.mjs'),
     import('../../Agent/lib/requestHash.mjs'),
     import('../../Agent/lib/requestSignedTokens.mjs'),
-    import('../../cli/services/masterKey.js'),
-    import('../../cli/services/edgeGeneration.js'),
+    import('../../cli/utils/security/masterKey.js'),
+    import('../../cli/sandbox/edgeGeneration.js'),
 ]);
 applyEdgeRoutingGeneration({ workspaceRoot: fixture.workspace, reason: 'ws-service-test-fixture' });
 

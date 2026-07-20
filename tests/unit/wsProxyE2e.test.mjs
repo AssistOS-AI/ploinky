@@ -55,8 +55,8 @@ test('router proxies authenticated WebSocket upgrades to HTTP-service agents', a
         import('../../Agent/lib/jwtVerify.mjs'),
         import('../../Agent/lib/requestHash.mjs'),
         import('../../Agent/lib/requestSignedTokens.mjs'),
-        import(`../../cli/services/masterKey.js?e2e=${Date.now()}`),
-        import(`../../cli/services/edgeGeneration.js?e2e=${Date.now()}`),
+        import(`../../cli/utils/security/masterKey.js?e2e=${Date.now()}`),
+        import(`../../cli/sandbox/edgeGeneration.js?e2e=${Date.now()}`),
         import(`../../cli/server/auth/localService.js?e2e=${Date.now()}`),
     ]);
     const authPolicy = { mode: 'local', usersVar: 'PLOINKY_AUTH_EXPLORER_USERS' };

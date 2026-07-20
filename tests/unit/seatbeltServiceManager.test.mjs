@@ -7,7 +7,7 @@ import path from 'node:path';
 import {
     buildSeatbeltEntryCommand,
     ensureSeatbeltCodeNodeModules,
-} from '../../cli/services/seatbelt/seatbeltServiceManager.js';
+} from '../../cli/sandbox/seatbelt/seatbeltServiceManager.js';
 
 function tempDir(prefix = 'seatbelt-service-') {
     return fs.mkdtempSync(path.join(os.tmpdir(), prefix));

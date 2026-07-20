@@ -1,8 +1,8 @@
 import net from 'node:net';
 import { spawnSync } from 'node:child_process';
 
-import { NETWORK_SCHEMA_VERSION } from '../services/networkContract.js';
-import { NETWORK_LABELS, workspaceNetworkIdentity } from '../services/networkLifecycle.js';
+import { NETWORK_SCHEMA_VERSION } from '../sandbox/networkContract.js';
+import { NETWORK_LABELS, workspaceNetworkIdentity } from '../sandbox/networkLifecycle.js';
 
 const REFRESH_INTERVAL_MS = 1_000;
 

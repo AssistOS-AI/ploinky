@@ -7,7 +7,7 @@ import {
     buildBlockingReadinessEntryFromNode,
     runCliWithDependencies,
     waitForReadinessEntries,
-} from '../../cli/services/workspaceUtil.js';
+} from '../../cli/commands/workspaceUtil.js';
 
 function agentCliHarness({ noTTY = false, endpointError = null } = {}) {
     const events = [];

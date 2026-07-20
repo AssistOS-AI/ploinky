@@ -7,7 +7,7 @@ import {
     computeRuntimePolicyHash,
     emitRunArgs,
     validatePolicyShape,
-} from '../../cli/services/containerRuntimePolicy.js';
+} from '../../cli/sandbox/docker/containerRuntimePolicy.js';
 
 test('validatePolicyShape rejects rawArgs', () => {
     assert.throws(

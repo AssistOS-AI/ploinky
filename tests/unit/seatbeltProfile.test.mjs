@@ -8,7 +8,7 @@ import { spawnSync } from 'node:child_process';
 import {
     buildSeatbeltProfile,
     collectLiteralPathAccess
-} from '../../cli/services/seatbelt/seatbeltProfile.js';
+} from '../../cli/sandbox/seatbelt/seatbeltProfile.js';
 
 test('buildSeatbeltProfile does not emit duplicate exec permissions', () => {
     const profile = buildSeatbeltProfile({

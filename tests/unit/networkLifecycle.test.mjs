@@ -10,12 +10,12 @@ import {
     createNetworkLifecycleAdapter,
     physicalNetworkName,
     workspaceNetworkIdentity,
-} from '../../cli/services/networkLifecycle.js';
+} from '../../cli/sandbox/networkLifecycle.js';
 import {
     canonicalizeNetwork,
     deriveNetworkAlias,
     networkContractHash,
-} from '../../cli/services/networkContract.js';
+} from '../../cli/sandbox/networkContract.js';
 
 function ok(stdout = '') {
     return { ok: true, status: 0, stdout, stderr: '' };
@@ -750,7 +750,7 @@ test('old contract hashes remain foreign and block replacement before mutation',
 });
 
 test('network lifecycle source contains no removed gateway, socket, managed-hosts, or namespace machinery', () => {
-    const source = fs.readFileSync(new URL('../../cli/services/networkLifecycle.js', import.meta.url), 'utf8');
+    const source = fs.readFileSync(new URL('../../cli/sandbox/networkLifecycle.js', import.meta.url), 'utf8');
     for (const forbidden of [
         'ploinky-network-gateway',
         'router.sock',

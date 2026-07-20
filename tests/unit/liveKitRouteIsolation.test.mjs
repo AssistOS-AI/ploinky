@@ -21,8 +21,8 @@ const [
 ] = await Promise.all([
     import('../../Agent/lib/agentAssertion.mjs'),
     import('../../Agent/lib/jwtVerify.mjs'),
-    import('../../cli/services/masterKey.js'),
-    import('../../cli/services/edgeGeneration.js'),
+    import('../../cli/utils/security/masterKey.js'),
+    import('../../cli/sandbox/edgeGeneration.js'),
     import('../../cli/server/edgeRoutePlan.js'),
     import('../../cli/server/privateRouter.js'),
     import('../../cli/server/wsServiceProxy.js'),

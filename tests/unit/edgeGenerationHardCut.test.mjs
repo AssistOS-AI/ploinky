@@ -18,7 +18,7 @@ import {
     prepareEdgeRoutingGeneration,
     readCurrentEdgeTopology,
     withEdgeGenerationApplyLock,
-} from '../../cli/services/edgeGeneration.js';
+} from '../../cli/sandbox/edgeGeneration.js';
 import { resolveEdgeRoutePlan } from '../../cli/server/edgeRoutePlan.js';
 
 function localDesired(overrides = {}) {

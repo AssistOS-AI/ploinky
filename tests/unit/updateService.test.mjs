@@ -13,7 +13,7 @@ import {
     refreshPloinkyRuntimeAchillesDependency,
     resolveMovingGitDepCommits,
     updatePloinkySelf,
-} from '../../cli/services/updateService.js';
+} from '../../cli/commands/updateService.js';
 
 function tempDir(prefix = 'ploinky-update-') {
     return fs.mkdtempSync(path.join(os.tmpdir(), prefix));

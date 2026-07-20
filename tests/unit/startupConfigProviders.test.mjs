@@ -14,9 +14,9 @@ process.env.PLOINKY_MASTER_KEY = '8'.repeat(64);
 process.env.PLOINKY_DERIVED_MASTER_KEY = 'must-not-be-forwarded';
 
 const moduleSuffix = `?test=${Date.now()}`;
-const providerModule = await import(`../../cli/services/startupConfigProviders.js${moduleSuffix}`);
-const secretsModule = await import(`../../cli/services/encryptedSecretsFile.js${moduleSuffix}`);
-const identityEnvModule = await import(`../../cli/services/agentIdentityEnv.js${moduleSuffix}`);
+const providerModule = await import(`../../cli/sandbox/startupConfigProviders.js${moduleSuffix}`);
+const secretsModule = await import(`../../cli/utils/security/encryptedSecretsFile.js${moduleSuffix}`);
+const identityEnvModule = await import(`../../cli/utils/security/agentIdentityEnv.js${moduleSuffix}`);
 
 const {
     applyStartupConfigProviders,
@@ -327,7 +327,7 @@ test('applyStartupConfigProvidersForGraph runs active profile providers from the
         ],
     });
 
-    const graphModule = await import(`../../cli/services/workspaceDependencyGraph.js${moduleSuffix}&graph=1`);
+    const graphModule = await import(`../../cli/utils/workspaceDependencyGraph.js${moduleSuffix}&graph=1`);
     const graph = graphModule.resolveWorkspaceDependencyGraph({
         staticAgentRef: 'app/application-graph',
     });
@@ -392,7 +392,7 @@ test('applyStartupConfigProvidersForGraph rejects outputs for graph generated se
         ],
     });
 
-    const graphModule = await import(`../../cli/services/workspaceDependencyGraph.js${moduleSuffix}&graph=2`);
+    const graphModule = await import(`../../cli/utils/workspaceDependencyGraph.js${moduleSuffix}&graph=2`);
     const graph = graphModule.resolveWorkspaceDependencyGraph({
         staticAgentRef: 'app/generated-secret-consumer',
     });

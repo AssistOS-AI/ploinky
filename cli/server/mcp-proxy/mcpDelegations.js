@@ -3,9 +3,9 @@ import path from 'node:path';
 
 import { loadRoutingConfig } from '../httpServiceRoutes.js';
 import { mintUserDelegationGrant, resolveMaxTtlSeconds } from './userDelegationGrant.js';
-import { deriveSubkey } from '../../services/masterKey.js';
-import { deriveAgentPrincipalId } from '../../services/agentIdentity.js';
-import { REPOS_DIR } from '../../services/config.js';
+import { deriveSubkey } from '../../utils/security/masterKey.js';
+import { deriveAgentPrincipalId } from '../../utils/security/agentIdentity.js';
+import { REPOS_DIR } from '../../utils/config.js';
 
 function readMcpConfigTools(agentDir) {
     if (!agentDir) return [];

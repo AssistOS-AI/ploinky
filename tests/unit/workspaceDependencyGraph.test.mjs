@@ -29,9 +29,9 @@ function clearEnabledRepos() {
 process.chdir(tempDir);
 
 const moduleSuffix = `?test=${Date.now()}`;
-const graphModuleUrl = new URL('../../cli/services/workspaceDependencyGraph.js', import.meta.url);
+const graphModuleUrl = new URL('../../cli/utils/workspaceDependencyGraph.js', import.meta.url);
 const graphModule = await import(`${graphModuleUrl.href}${moduleSuffix}`);
-const bootstrapModuleUrl = new URL('../../cli/services/bootstrapManifest.js', import.meta.url);
+const bootstrapModuleUrl = new URL('../../cli/utils/runtime/bootstrapManifest.js', import.meta.url);
 const bootstrapModule = await import(`${bootstrapModuleUrl.href}${moduleSuffix}`);
 const {
     classifyDependencyGraphWaitMode,
@@ -42,7 +42,7 @@ const {
     topologicallyGroupDependencyGraph
 } = graphModule;
 const { applyManifestDirectives, parseEnableDirective } = bootstrapModule;
-const workspaceUtilModuleUrl = new URL('../../cli/services/workspaceUtil.js', import.meta.url);
+const workspaceUtilModuleUrl = new URL('../../cli/commands/workspaceUtil.js', import.meta.url);
 const {
     assertStaticPreinstallSucceeded,
     buildBlockingReadinessEntryFromNode,
@@ -267,7 +267,7 @@ test('prepared runtime records and routes commit together before activation, inc
     assert.match(source, /forceRecreate:\s*newlyPreparedContainers\.has\(registryName\)/);
 
     const noWaitSource = fs.readFileSync(
-        new URL('../../cli/services/noWaitWorker.js', import.meta.url),
+        new URL('../../cli/commands/noWaitWorker.js', import.meta.url),
         'utf8',
     );
     assert.match(noWaitSource, /agents\[containerName\] = registryRecord;\s*saveAgents\(agents, \{ coordinate: false \}\)/);

@@ -1,6 +1,6 @@
 import crypto from 'node:crypto';
 
-import { deriveSubkey } from '../services/masterKey.js';
+import { deriveSubkey } from '../utils/security/masterKey.js';
 import { isLocalAdminUser } from './auth/localService.js';
 
 export const ADMIN_CSRF_HEADER = 'x-ploinky-csrf-token';

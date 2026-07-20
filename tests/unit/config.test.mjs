@@ -9,7 +9,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const repoRoot = path.resolve(__dirname, '../..');
-const configUrl = pathToFileURL(path.join(repoRoot, 'cli/services/config.js')).href;
+const configUrl = pathToFileURL(path.join(repoRoot, 'cli/utils/config.js')).href;
 
 test('config resolves workspace root from parent .ploinky', () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-config-'));

@@ -1,15 +1,15 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { PLOINKY_WORKSPACE_ROOT } from '../../services/config.js';
+import { PLOINKY_WORKSPACE_ROOT } from '../../utils/config.js';
 import {
     inactivateEdgeRoutingGeneration,
     withEdgeGenerationApplyLock,
-} from '../../services/edgeGeneration.js';
-import { applyEdgeRoutingGeneration } from '../../services/coordinatedEdgeApply.js';
+} from '../../sandbox/edgeGeneration.js';
+import { applyEdgeRoutingGeneration } from '../../sandbox/coordinatedEdgeApply.js';
 import {
     createWorkspaceMutationLease,
     releaseWorkspaceMutationLease,
-} from '../../services/maintenanceLocks.js';
+} from '../../utils/runtime/maintenanceLocks.js';
 
 import { PolicyStateStore } from './PolicyStateStore.js';
 

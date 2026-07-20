@@ -12,7 +12,7 @@ import {
     networkContractHash,
     preflightNetworkAliases,
     validateManifestNetworks,
-} from '../../cli/services/networkContract.js';
+} from '../../cli/sandbox/networkContract.js';
 
 test('network contract hash hard-cuts to the box host-gateway runtime policy', () => {
     const network = canonicalizeNetwork({ mode: 'default' });

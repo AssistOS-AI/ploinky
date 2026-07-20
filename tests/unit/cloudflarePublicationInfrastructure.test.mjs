@@ -8,14 +8,14 @@ import test from 'node:test';
 
 import {
     CloudflarePublicationApiClient,
-} from '../../cli/services/cloudflarePublicationApi.js';
+} from '../../cli/sandbox/cloudflarePublicationApi.js';
 import {
     buildCloudflaredArguments,
     createCloudflaredConnector,
-} from '../../cli/services/cloudflarePublicationConnector.js';
+} from '../../cli/sandbox/cloudflarePublicationConnector.js';
 import {
     createCloudflarePublicationJournal,
-} from '../../cli/services/cloudflarePublicationJournal.js';
+} from '../../cli/sandbox/cloudflarePublicationJournal.js';
 
 function temporaryDirectory(t) {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-cloudflare-test-'));

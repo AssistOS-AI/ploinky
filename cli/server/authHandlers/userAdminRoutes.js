@@ -1,6 +1,6 @@
 import { createLocalAuthUser, deleteLocalAuthUser, getSession as getLocalSession, getSessionCookieMaxAge as getLocalSessionCookieMaxAge, isLocalAdminUser, listLocalAuthRoles, listLocalAuthUsers, updateLocalAuthUser } from '../auth/localService.js';
 import { verifyAdminMutationRequest } from '../adminControlSecurity.js';
-import { readRouterSettings, updateRouterSettings } from '../../services/routerSettings.js';
+import { readRouterSettings, updateRouterSettings } from '../auth/routerSettings.js';
 import { buildCookie, LOCAL_AUTH_COOKIE_NAME, parseCookies, readJsonBody, sendJson } from './shared.js';
 import { resolveAuthContextForRouteKey } from './authContext.js';
 

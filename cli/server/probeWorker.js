@@ -1,6 +1,6 @@
 import { parentPort, workerData } from 'worker_threads';
 
-import { runHealthProbes } from '../services/docker/healthProbes.js';
+import { runHealthProbes } from '../sandbox/docker/healthProbes.js';
 
 async function main() {
     const { agentName, containerName, manifest } = workerData || {};

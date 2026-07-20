@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-import { applyEdgeRoutingGeneration } from '../../cli/services/edgeGeneration.js';
+import { applyEdgeRoutingGeneration } from '../../cli/sandbox/edgeGeneration.js';
 import { isPrivateInterfaceAllowed, resolveEdgeRoutePlan } from '../../cli/server/edgeRoutePlan.js';
 
 test('private listener class admits bridge-gateway requests without IP provenance', () => {

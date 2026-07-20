@@ -9,8 +9,8 @@ import {
     isGenerationCapabilityRuntimeEffective,
     restartGenerationCapabilityRuntime,
     replaceRuntimeRouterEnvFlags,
-} from '../../cli/services/docker/agentServiceManager.js';
-import { buildRouterEndpoint } from '../../cli/services/routerPort.js';
+} from '../../cli/sandbox/docker/agentServiceManager.js';
+import { buildRouterEndpoint } from '../../cli/sandbox/routerPort.js';
 
 test('prepared graph launches suppress intermediate registry persistence only for the exact staged identity', () => {
     const staged = {
@@ -42,7 +42,7 @@ test('prepared graph launches suppress intermediate registry persistence only fo
         /exact staged instanceId\/enableGeneration/,
     );
 
-    const source = fs.readFileSync(new URL('../../cli/services/docker/agentServiceManager.js', import.meta.url), 'utf8');
+    const source = fs.readFileSync(new URL('../../cli/sandbox/docker/agentServiceManager.js', import.meta.url), 'utf8');
     assert.match(source, /const preserveRuntimeRegistryRecord = Boolean\(targetedRestart\)[\s\S]*Boolean\(runtimeIdentity\.preparationLease\)/);
     assert.match(source, /preserveRegistryRecord:\s*preserveRuntimeRegistryRecord/);
     assert.match(source, /if \(!preserveRuntimeRegistryRecord\) saveAgentsMap\(agents\)/);
@@ -50,7 +50,7 @@ test('prepared graph launches suppress intermediate registry persistence only fo
 
     for (const runtime of ['bwrap', 'seatbelt']) {
         const runtimeSource = fs.readFileSync(
-            new URL(`../../cli/services/${runtime}/${runtime}ServiceManager.js`, import.meta.url),
+            new URL(`../../cli/sandbox/${runtime}/${runtime}ServiceManager.js`, import.meta.url),
             'utf8',
         );
         assert.match(runtimeSource, /preservePreparedRegistryRecord:\s*options\.preservePreparedRegistryRecord/);
@@ -212,7 +212,7 @@ test('targeted capability restart cannot activate before exact semantic readines
 });
 
 test('managed Docker identity derivation is a fail-closed launch precondition', () => {
-    const source = fs.readFileSync(new URL('../../cli/services/docker/agentServiceManager.js', import.meta.url), 'utf8');
+    const source = fs.readFileSync(new URL('../../cli/sandbox/docker/agentServiceManager.js', import.meta.url), 'utf8');
     assert.equal((source.match(/buildAgentIdentityEnv\(/g) || []).length, 1);
     assert.doesNotMatch(source, /could not set agent identity/);
     assert.doesNotMatch(source, /try\s*\{[\s\S]{0,500}buildAgentIdentityEnv\(/);
@@ -297,7 +297,7 @@ test('runtime router env replaces config values and none mode strips them entire
 });
 
 test('existing-container ownership inspection is unconditional across network modes', () => {
-    const source = fs.readFileSync(new URL('../../cli/services/docker/agentServiceManager.js', import.meta.url), 'utf8');
+    const source = fs.readFileSync(new URL('../../cli/sandbox/docker/agentServiceManager.js', import.meta.url), 'utf8');
     assert.doesNotMatch(source, /\bresolveRouterEndpoint\s*\(/, 'service manager must not reread persisted routing state');
     assert.match(source, /const networkLifecycle = createNetworkLifecycleAdapter\(\{ runtime \}\);[\s\S]*?if \(containerExists\(containerName\)\) \{\s+const contractInspection = networkLifecycle\.inspectContainerContract/);
     assert.doesNotMatch(source, /if \(containerExists\(containerName\) && managedNetworkLifecycle\)/);
@@ -310,9 +310,9 @@ test('existing-container ownership inspection is unconditional across network mo
 });
 
 test('drain-aware replacement is explicit and does not rewrite ordinary fleet lifecycle', () => {
-    const managerSource = fs.readFileSync(new URL('../../cli/services/docker/agentServiceManager.js', import.meta.url), 'utf8');
-    const fleetSource = fs.readFileSync(new URL('../../cli/services/docker/containerFleet.js', import.meta.url), 'utf8');
-    const drainSource = fs.readFileSync(new URL('../../cli/services/docker/targetedContainerLifecycle.js', import.meta.url), 'utf8');
+    const managerSource = fs.readFileSync(new URL('../../cli/sandbox/docker/agentServiceManager.js', import.meta.url), 'utf8');
+    const fleetSource = fs.readFileSync(new URL('../../cli/sandbox/docker/containerFleet.js', import.meta.url), 'utf8');
+    const drainSource = fs.readFileSync(new URL('../../cli/sandbox/docker/targetedContainerLifecycle.js', import.meta.url), 'utf8');
 
     assert.match(managerSource, /const targetedRestart = normalizeTargetedRestart\(options\.targetedRestart\)/);
     assert.match(managerSource, /if \(targetedRestart\) \{[\s\S]*drainTargetedContainer\(containerName, drainOptions\)/);
@@ -322,7 +322,7 @@ test('drain-aware replacement is explicit and does not rewrite ordinary fleet li
 });
 
 test('fleet cleanup never expands an exact registry key to a derived alias or canonical name', () => {
-    const source = fs.readFileSync(new URL('../../cli/services/docker/containerFleet.js', import.meta.url), 'utf8');
+    const source = fs.readFileSync(new URL('../../cli/sandbox/docker/containerFleet.js', import.meta.url), 'utf8');
     assert.match(source, /return name \? \[name\] : \[\]/);
     assert.doesNotMatch(source, /getAgentContainerName/);
 });

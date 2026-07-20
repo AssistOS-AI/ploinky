@@ -6,8 +6,8 @@ import { createMemoryReplayCache } from '../../Agent/lib/jwtVerify.mjs';
 import { authorizePrivateRoutePlan } from '../../cli/server/privateRouter.js';
 import {
     resolveReplacementRuntimeIdentity,
-} from '../../cli/services/docker/agentServiceManager.js';
-import { derivePrivateAgentRequestSecret } from '../../cli/services/masterKey.js';
+} from '../../cli/sandbox/docker/agentServiceManager.js';
+import { derivePrivateAgentRequestSecret } from '../../cli/utils/security/masterKey.js';
 
 const previousMasterKey = process.env.PLOINKY_MASTER_KEY;
 process.env.PLOINKY_MASTER_KEY = '9'.repeat(64);

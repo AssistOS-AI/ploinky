@@ -4,9 +4,9 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-import { RESERVED_AGENT_ENV_NAMES } from '../../cli/services/agentIdentityEnv.js';
-import { PLOINKY_WORKSPACE_ROOT } from '../../cli/services/config.js';
-import { buildLifecycleHookEnv, executeHostHook } from '../../cli/services/lifecycleHooks.js';
+import { RESERVED_AGENT_ENV_NAMES } from '../../cli/utils/security/agentIdentityEnv.js';
+import { PLOINKY_WORKSPACE_ROOT } from '../../cli/utils/config.js';
+import { buildLifecycleHookEnv, executeHostHook } from '../../cli/utils/runtime/lifecycleHooks.js';
 
 // Host hooks (preinstall, hosthook_aftercreation, hosthook_postinstall) run on the
 // HOST before the container exists, so the container-only PLOINKY_WORKSPACE_ROOT

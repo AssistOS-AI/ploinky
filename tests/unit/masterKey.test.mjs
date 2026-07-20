@@ -16,12 +16,12 @@ const {
     deriveDerivedMasterKey,
     resolveMasterKey,
     MASTER_KEY_VAR,
-} = await import(`../../cli/services/masterKey.js${moduleSuffix}`);
+} = await import(`../../cli/utils/security/masterKey.js${moduleSuffix}`);
 
 let freshImportCounter = 0;
 async function importFreshMasterKeyModule(label) {
     freshImportCounter += 1;
-    return import(`../../cli/services/masterKey.js?test=${Date.now()}-${freshImportCounter}-${label}`);
+    return import(`../../cli/utils/security/masterKey.js?test=${Date.now()}-${freshImportCounter}-${label}`);
 }
 
 test.after(() => {

@@ -6,7 +6,7 @@ import path from 'node:path';
 
 import { createMemoryReplayCache } from '../../Agent/lib/jwtVerify.mjs';
 import { signAgentAssertion } from '../../Agent/lib/agentAssertion.mjs';
-import { deriveAgentRequestSecret } from '../../cli/services/masterKey.js';
+import { deriveAgentRequestSecret } from '../../cli/utils/security/masterKey.js';
 import { mintUserDelegationGrant } from '../../cli/server/mcp-proxy/userDelegationGrant.js';
 
 const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-mcp-delegation-'));
@@ -81,14 +81,14 @@ process.env.PLOINKY_WORKSPACE_ROOT = tempDir;
 process.env.PLOINKY_ROUTER_HOST_PORT = '18080';
 
 const moduleSuffix = `?test=${Date.now()}`;
-const { applyEdgeRoutingGeneration } = await import(`../../cli/services/edgeGeneration.js${moduleSuffix}`);
+const { applyEdgeRoutingGeneration } = await import(`../../cli/sandbox/edgeGeneration.js${moduleSuffix}`);
 applyEdgeRoutingGeneration({ workspaceRoot: tempDir, reason: 'mcp-delegation-test-fixture' });
 const {
     verifyDelegatedAgentToolCall,
     verifyDelegatedAgentTaskStatusCall,
     buildInvocationContextForProviderCall,
 } = await import(`../../cli/server/mcp-proxy/index.js${moduleSuffix}`);
-const { deriveSubkey } = await import(`../../cli/services/masterKey.js${moduleSuffix}`);
+const { deriveSubkey } = await import(`../../cli/utils/security/masterKey.js${moduleSuffix}`);
 const { verifyUserDelegationGrant } = await import(`../../cli/server/mcp-proxy/userDelegationGrant.js${moduleSuffix}`);
 
 const SOURCE_AGENT = 'agent:AssistOSExplorer/onlyOffice';

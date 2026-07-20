@@ -10,7 +10,7 @@ const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-disable-generat
 process.chdir(workspace);
 process.env.PLOINKY_WORKSPACE_ROOT = workspace;
 
-const agents = await import(new URL('../../cli/services/agents.js', import.meta.url).href);
+const agents = await import(new URL('../../cli/utils/agents.js', import.meta.url).href);
 
 test.after(() => {
     process.chdir(originalCwd);

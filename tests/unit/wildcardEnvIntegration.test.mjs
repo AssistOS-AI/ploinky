@@ -14,7 +14,7 @@ import {
     expandEnvWildcard,
     isApiKeyVariable,
     getAllAvailableEnvNames
-} from '../../cli/services/secretVars.js';
+} from '../../cli/utils/security/secretVars.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);

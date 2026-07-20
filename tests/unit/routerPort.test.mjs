@@ -13,7 +13,7 @@ import {
     resolvePersistedRouterPort,
     resolveRouterEndpoint,
     selectedRouterHostPort,
-} from '../../cli/services/routerPort.js';
+} from '../../cli/sandbox/routerPort.js';
 
 function tempRouting(contents) {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-router-port-'));

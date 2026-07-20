@@ -3,13 +3,21 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import {
     CatalogValidationError,
+    DEFAULT_CATALOG_PATH,
     loadCatalog,
     validateRuntimePolicy,
     validateArchitectureRecord,
-} from '../../cli/services/llmArchitectureCatalog.js';
+} from '../../cli/sandbox/docker/llmArchitectureCatalog.js';
+
+test('default catalog path remains the repository sibling after relocation', () => {
+    const testDirectory = path.dirname(fileURLToPath(import.meta.url));
+    const expectedPath = path.resolve(testDirectory, '..', '..', '..', 'local-llm-architectures');
+    assert.equal(DEFAULT_CATALOG_PATH, expectedPath);
+});
 
 function makeValidCatalog(rootPath) {
     fs.mkdirSync(path.join(rootPath, 'architectures'), { recursive: true });

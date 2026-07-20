@@ -1,8 +1,8 @@
 import { sendJson } from './authHandlers/index.js';
 import { readJsonBody } from './handlers/common.js';
 import { Caller } from './policy/Caller.js';
-import { buildUserApiKeyResult } from '../services/userIdentityKey.js';
-import { SubjectIdentityKeyError } from '../services/subjectIdentityKey.js';
+import { buildUserApiKeyResult } from './security/userIdentityKey.js';
+import { SubjectIdentityKeyError } from '../utils/security/subjectIdentityKey.js';
 
 // Router-owned endpoint: POST /api/router/identity/user-api-key
 //

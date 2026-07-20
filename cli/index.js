@@ -2,8 +2,8 @@
 
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { showHelp } from './services/help.js';
-import { runOuterRuntimeShell } from './services/runtimeShell.js';
+import { showHelp } from './commands/help.js';
+import { runOuterRuntimeShell } from './sandbox/runtimeShell.js';
 
 export async function launchCli(args = process.argv.slice(2), {
     showHelpImpl = showHelp,

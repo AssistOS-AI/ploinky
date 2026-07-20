@@ -73,8 +73,8 @@ import {
     isDelegatedAgentOpenAiCall,
     handleDelegatedAgentOpenAiCall,
 } from './agentOpenAiDelegation.js';
-import { PLOINKY_DIR } from '../services/config.js';
-import { startCloudflarePublicationRuntime } from '../services/cloudflarePublicationRuntime.js';
+import { PLOINKY_DIR } from '../utils/config.js';
+import { startCloudflarePublicationRuntime } from '../sandbox/cloudflarePublicationRuntime.js';
 import { requestAgentCard } from './agentCardFanout.js';
 
 const __filename = fileURLToPath(import.meta.url);

@@ -16,7 +16,7 @@ process.env.PLOINKY_MASTER_KEY = 'm'.repeat(64);
 
 const suffix = `?test=${Date.now()}`;
 const marketplaceModule = await import(`../../cli/server/authHandlers/marketplaceRoutes.js${suffix}`);
-const { deriveAgentRequestSecret } = await import(`../../cli/services/masterKey.js${suffix}`);
+const { deriveAgentRequestSecret } = await import(`../../cli/utils/security/masterKey.js${suffix}`);
 
 const caller = 'agent:repo/caller';
 const agentEnv = {

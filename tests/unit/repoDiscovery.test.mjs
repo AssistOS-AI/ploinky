@@ -22,8 +22,8 @@ const [{
     resolveRepoSourceUrl,
     updateRepo,
 }, { REPOS_DIR }, { resolveUpdateProjectsRoot }] = await Promise.all([
-    import('../../cli/services/repos.js'),
-    import('../../cli/services/config.js'),
+    import('../../cli/utils/repos.js'),
+    import('../../cli/utils/config.js'),
     import('../../cli/commands/repoAgentCommands.js'),
 ]);
 

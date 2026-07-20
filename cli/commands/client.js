@@ -1,8 +1,8 @@
 import fs from 'fs';
 import path from 'path';
-import { PLOINKY_DIR } from '../services/config.js';
-import { debugLog, parseParametersString } from '../services/utils.js';
-import { resolvePersistedRouterPort } from '../services/routerPort.js';
+import { PLOINKY_DIR } from '../utils/config.js';
+import { debugLog, parseParametersString } from '../utils/utils.js';
+import { resolvePersistedRouterPort } from '../sandbox/routerPort.js';
 import { createAgentClient as createBrowserClient } from '../../Agent/client/MCPBrowserClient.js';
 import { mintSessionJwt } from '../server/auth/localService.js';
 

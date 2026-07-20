@@ -1,4 +1,4 @@
-import { readCurrentEdgeTopology } from '../services/edgeGeneration.js';
+import { readCurrentEdgeTopology } from '../sandbox/edgeGeneration.js';
 import { resolveEdgeRoutePlan } from './edgeRoutePlan.js';
 
 function send(res, status, payload) {

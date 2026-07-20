@@ -18,10 +18,10 @@ import {
     collectAvailableLlmKeys,
     populateProcessEnvFromEnvFile,
     resolveEnvFilePath,
-} from './services/llmProviderUtils.js';
-import { loadSoulModelCatalog, runSettingsMenu } from './services/settingsMenu.js';
-import { getSecret } from './services/secretInjector.js';
-import * as inputState from './services/inputState.js';
+} from './commands/llmProviderUtils.js';
+import { loadSoulModelCatalog, runSettingsMenu } from './commands/settingsMenu.js';
+import { getSecret } from './utils/security/secretInjector.js';
+import * as inputState from './commands/inputState.js';
 
 const WORKSPACE_ENV_FILENAME = '.env';
 const ANSI_RESET = '\x1b[0m';

@@ -5,7 +5,7 @@ import {
     CLOUDFLARE_ORIGIN,
     CloudflarePublicationController,
     CloudflarePublicationError,
-} from '../../cli/services/cloudflarePublication.js';
+} from '../../cli/sandbox/cloudflarePublication.js';
 
 const CONNECTOR_TOKEN = 'connector-secret-value';
 const API_TOKEN = 'api-secret-value';

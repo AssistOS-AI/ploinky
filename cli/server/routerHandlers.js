@@ -18,9 +18,9 @@ import {
     resolveHttpServiceTarget,
 } from './httpServiceRoutes.js';
 import { commitRoutePlan, resolveEdgeRoutePlan } from './edgeRoutePlan.js';
-import { deriveAgentPrincipalId } from '../services/agentIdentity.js';
-import { ROUTING_FILE } from '../services/config.js';
-import { deriveSubkey } from '../services/masterKey.js';
+import { deriveAgentPrincipalId } from '../utils/security/agentIdentity.js';
+import { ROUTING_FILE } from '../utils/config.js';
+import { deriveSubkey } from '../utils/security/masterKey.js';
 import { mintUserDelegationGrant } from './mcp-proxy/userDelegationGrant.js';
 
 const ROUTER_PROTOCOL_VERSION = '2025-06-18';

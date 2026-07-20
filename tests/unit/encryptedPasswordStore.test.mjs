@@ -28,7 +28,7 @@ test('encrypted password store round-trips and enforces the master key', async (
         rmSync(workspace, { recursive: true, force: true });
     });
 
-    const store = await import(`${pathToFileURL(path.join(REPO_ROOT, 'cli/services/encryptedPasswordStore.js')).href}?test=${Date.now()}`);
+    const store = await import(`${pathToFileURL(path.join(REPO_ROOT, 'cli/utils/security/encryptedPasswordStore.js')).href}?test=${Date.now()}`);
     store.setUsersPayload('PLOINKY_AUTH_ALPHA_USERS', {
         version: 1,
         users: [

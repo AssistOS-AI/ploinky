@@ -32,8 +32,8 @@ test('local auth credentials update through the encrypted password store', async
 
     const nonce = Date.now();
     const localService = await import(`${pathToFileURL(path.join(REPO_ROOT, 'cli/server/auth/localService.js')).href}?test=${nonce}`);
-    const passwordStore = await import(`${pathToFileURL(path.join(REPO_ROOT, 'cli/services/encryptedPasswordStore.js')).href}?test=${nonce}`);
-    const passwords = await import(`${pathToFileURL(path.join(REPO_ROOT, 'cli/services/localAuthPasswords.js')).href}?test=${nonce}`);
+    const passwordStore = await import(`${pathToFileURL(path.join(REPO_ROOT, 'cli/utils/security/encryptedPasswordStore.js')).href}?test=${nonce}`);
+    const passwords = await import(`${pathToFileURL(path.join(REPO_ROOT, 'cli/utils/security/localAuthPasswords.js')).href}?test=${nonce}`);
 
     const policy = {
         usersVar: 'PLOINKY_AUTH_TEST_USERS',

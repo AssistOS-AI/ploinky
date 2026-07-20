@@ -12,7 +12,7 @@ process.env.PLOINKY_MASTER_KEY = '9'.repeat(64);
 
 const moduleSuffix = `?test=${Date.now()}`;
 const localService = await import(`../../cli/server/auth/localService.js${moduleSuffix}`);
-const { deriveSubkey } = await import(`../../cli/services/masterKey.js${moduleSuffix}`);
+const { deriveSubkey } = await import(`../../cli/utils/security/masterKey.js${moduleSuffix}`);
 const { signHmacJwt } = await import(`../../Agent/lib/jwtSign.mjs${moduleSuffix}`);
 const { revokeSessionId } = await import(`../../cli/server/auth/sessionRevocations.js${moduleSuffix}`);
 

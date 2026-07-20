@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 
-import { applyEdgeRoutingGeneration } from '../../cli/services/edgeGeneration.js';
+import { applyEdgeRoutingGeneration } from '../../cli/sandbox/edgeGeneration.js';
 import { resolveEdgeRoutePlan } from '../../cli/server/edgeRoutePlan.js';
 import { handleEdgeTopologyProjection } from '../../cli/server/edgeTopologyRoute.js';
 

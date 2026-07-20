@@ -1,6 +1,6 @@
 import crypto from 'node:crypto';
 
-import { deriveSubkey } from '../services/masterKey.js';
+import { deriveSubkey } from '../utils/security/masterKey.js';
 import { canonicalControlOrigin } from './adminControlSecurity.js';
 
 export const BROWSER_CSRF_HEADER = 'x-ploinky-browser-csrf-token';

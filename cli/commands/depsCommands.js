@@ -8,22 +8,22 @@ import {
     isGlobalCacheValid,
     hashMergedPackage,
     resolveGlobalCacheManifest,
-} from '../services/dependencyCache.js';
-import { detectRuntimeKeyForAgent, isNoNodeRuntimeKey } from '../services/dependencyRuntimeKey.js';
+} from '../utils/dependencies/dependencyCache.js';
+import { detectRuntimeKeyForAgent, isNoNodeRuntimeKey } from '../utils/dependencies/dependencyRuntimeKey.js';
 import {
     DEPS_DIR,
     GLOBAL_DEPS_CACHE_DIR,
     AGENTS_DEPS_CACHE_DIR,
-} from '../services/config.js';
-import { loadAgents } from '../services/workspace.js';
-import { findAgent } from '../services/utils.js';
+} from '../utils/config.js';
+import { loadAgents } from '../utils/workspace.js';
+import { findAgent } from '../utils/utils.js';
 import {
     readGlobalDepsPackage,
     mergePackageJson,
-} from '../services/dependencyInstaller.js';
-import { getRepoAgentCodePath } from '../services/workspaceStructure.js';
-import { getRuntimeForAgent } from '../services/docker/common.js';
-import { readManifestStartCommand } from '../services/docker/agentCommands.js';
+} from '../utils/dependencies/dependencyInstaller.js';
+import { getRepoAgentCodePath } from '../utils/workspaceStructure.js';
+import { getRuntimeForAgent } from '../sandbox/docker/common.js';
+import { readManifestStartCommand } from '../sandbox/docker/agentCommands.js';
 
 const USAGE = [
     'Usage:',

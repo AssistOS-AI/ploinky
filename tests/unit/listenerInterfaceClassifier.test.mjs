@@ -1,8 +1,8 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { NETWORK_SCHEMA_VERSION } from '../../cli/services/networkContract.js';
-import { NETWORK_LABELS, workspaceNetworkIdentity } from '../../cli/services/networkLifecycle.js';
+import { NETWORK_SCHEMA_VERSION } from '../../cli/sandbox/networkContract.js';
+import { NETWORK_LABELS, workspaceNetworkIdentity } from '../../cli/sandbox/networkLifecycle.js';
 import {
     createListenerInterfaceClassifier,
     validatedManagedGateway,

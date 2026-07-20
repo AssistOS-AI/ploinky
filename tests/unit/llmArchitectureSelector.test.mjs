@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import {
     ArchitectureSelectionError,
     selectArchitecture,
-} from '../../cli/services/llmArchitectureSelector.js';
+} from '../../cli/sandbox/docker/llmArchitectureSelector.js';
 
 function makeCatalog(overrides = {}) {
     const architectures = new Map();

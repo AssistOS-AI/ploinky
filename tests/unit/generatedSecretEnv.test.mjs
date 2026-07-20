@@ -22,8 +22,8 @@ const {
     getManifestEnvNames,
     getManifestEnvSpecs,
     validateManifestEnvProfileCompleteness,
-} = await import(`../../cli/services/secretVars.js${moduleSuffix}`);
-const { deriveAgentSecret, deriveWorkspaceSecret } = await import(`../../cli/services/masterKey.js${moduleSuffix}`);
+} = await import(`../../cli/utils/security/secretVars.js${moduleSuffix}`);
+const { deriveAgentSecret, deriveWorkspaceSecret } = await import(`../../cli/utils/security/masterKey.js${moduleSuffix}`);
 
 test.after(() => {
     process.chdir(originalCwd);

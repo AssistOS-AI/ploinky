@@ -7,7 +7,7 @@ import {
     normalizeCloudflarePublicationDesired,
     publicPlanSummary,
     redactCloudflareText,
-} from '../../cli/services/cloudflarePublicationPlan.js';
+} from '../../cli/sandbox/cloudflarePublicationPlan.js';
 
 const GENERATION = `sha256:${'a'.repeat(64)}`;
 const COMPLETE = Object.freeze({

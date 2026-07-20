@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 
 const cliSource = fs.readFileSync(new URL('../../cli/commands/cli.js', import.meta.url), 'utf8');
-const workspaceSource = fs.readFileSync(new URL('../../cli/services/workspaceUtil.js', import.meta.url), 'utf8');
+const workspaceSource = fs.readFileSync(new URL('../../cli/commands/workspaceUtil.js', import.meta.url), 'utf8');
 
 function assertOrdered(source, labels) {
     let previous = -1;

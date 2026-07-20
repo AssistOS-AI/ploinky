@@ -18,9 +18,9 @@ const [{
     readSkillsManifest,
     findWorkspaceFoldersWithSkillsManifest,
 }, { REPOS_DIR }, { REPO_SOURCES_FILE }] = await Promise.all([
-    import('../../cli/services/skills.js'),
-    import('../../cli/services/config.js'),
-    import('../../cli/services/repos.js'),
+    import('../../cli/commands/skills.js'),
+    import('../../cli/utils/config.js'),
+    import('../../cli/utils/repos.js'),
 ]);
 
 test.after(() => {

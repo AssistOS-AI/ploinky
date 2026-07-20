@@ -10,12 +10,12 @@ import {
     hasPreinstallRunInProcess,
     markPreinstallRunInProcess,
     resetPreinstallRunInProcess,
-} from '../../cli/services/lifecycleHooks.js';
-import { buildExecArgs } from '../../cli/services/docker/interactive.js';
+} from '../../cli/utils/runtime/lifecycleHooks.js';
+import { buildExecArgs } from '../../cli/sandbox/docker/interactive.js';
 
 const repoRoot = path.resolve(fileURLToPath(new URL('../..', import.meta.url)));
-const agentServiceManagerUrl = pathToFileURL(path.join(repoRoot, 'cli/services/docker/agentServiceManager.js')).href;
-const dockerCommonUrl = pathToFileURL(path.join(repoRoot, 'cli/services/docker/common.js')).href;
+const agentServiceManagerUrl = pathToFileURL(path.join(repoRoot, 'cli/sandbox/docker/agentServiceManager.js')).href;
+const dockerCommonUrl = pathToFileURL(path.join(repoRoot, 'cli/sandbox/docker/common.js')).href;
 
 function tempDir(prefix = 'ploinky-runtime-test-') {
     return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
@@ -50,7 +50,7 @@ test('buildRuntimeRouterEnv uses the validated managed box-host endpoint', () =>
 
         const result = runModuleSnippet(
             `const { buildRuntimeRouterEnv } = await import(${JSON.stringify(agentServiceManagerUrl)});
-const { buildRouterEndpoint } = await import(${JSON.stringify(pathToFileURL(path.join(repoRoot, 'cli/services/routerPort.js')).href)});
+const { buildRouterEndpoint } = await import(${JSON.stringify(pathToFileURL(path.join(repoRoot, 'cli/sandbox/routerPort.js')).href)});
 const routerEndpoint = buildRouterEndpoint('default', 8080);
 process.stdout.write(JSON.stringify(buildRuntimeRouterEnv('podman', { networkMode: 'default', routerPort: 8080, routerEndpoint })));`,
             {},
@@ -78,7 +78,7 @@ test('buildRuntimeRouterEnv receives the same validated endpoint for Docker buil
 
         const result = runModuleSnippet(
             `const { buildRuntimeRouterEnv } = await import(${JSON.stringify(agentServiceManagerUrl)});
-const { buildRouterEndpoint } = await import(${JSON.stringify(pathToFileURL(path.join(repoRoot, 'cli/services/routerPort.js')).href)});
+const { buildRouterEndpoint } = await import(${JSON.stringify(pathToFileURL(path.join(repoRoot, 'cli/sandbox/routerPort.js')).href)});
 const routerEndpoint = buildRouterEndpoint('bridge', 8080);
 process.stdout.write(JSON.stringify(buildRuntimeRouterEnv('docker', { networkMode: 'bridge', routerEndpoint })));`,
             {},
@@ -513,7 +513,7 @@ esac
         );
 
         const result = runModuleSnippet(
-            `const { enableAgent } = await import(${JSON.stringify(pathToFileURL(path.join(repoRoot, 'cli/services/agents.js')).href)});
+            `const { enableAgent } = await import(${JSON.stringify(pathToFileURL(path.join(repoRoot, 'cli/utils/agents.js')).href)});
 await enableAgent('repo/demo', 'global');
 const fs = await import('node:fs');
 const path = await import('node:path');
@@ -555,7 +555,7 @@ test('enable rejects a missing persisted router port before registry mutation', 
         }));
 
         const result = runModuleSnippet(
-            `const { enableAgent } = await import(${JSON.stringify(pathToFileURL(path.join(repoRoot, 'cli/services/agents.js')).href)});
+            `const { enableAgent } = await import(${JSON.stringify(pathToFileURL(path.join(repoRoot, 'cli/utils/agents.js')).href)});
 await enableAgent('repo/demo', 'global');`,
             {},
             { cwd: workspaceDir },
@@ -754,7 +754,7 @@ esac
         fs.chmodSync(podmanPath, 0o755);
 
         const result = runModuleSnippet(
-            `import { collectLiveAgentContainers } from './cli/services/docker/containerRegistry.js';
+            `import { collectLiveAgentContainers } from './cli/sandbox/docker/containerRegistry.js';
 process.stdout.write(JSON.stringify(collectLiveAgentContainers()));`,
             { PATH: binDir },
         );
@@ -775,7 +775,7 @@ test('collectLiveAgentContainers is non-fatal when no container runtime is insta
     const emptyBin = tempDir();
     try {
         const result = runModuleSnippet(
-            `import { collectLiveAgentContainers } from './cli/services/docker/containerRegistry.js';
+            `import { collectLiveAgentContainers } from './cli/sandbox/docker/containerRegistry.js';
 process.stdout.write(JSON.stringify(collectLiveAgentContainers()));`,
             { PATH: emptyBin },
         );
@@ -829,7 +829,7 @@ test('host-mode capability denial occurs before the manifest preinstall hook', (
         const result = runModuleSnippet(
             `const fs = await import('node:fs');
 const { startAgentContainer } = await import(${JSON.stringify(agentServiceManagerUrl)});
-const { buildRouterEndpoint } = await import(${JSON.stringify(pathToFileURL(path.join(repoRoot, 'cli/services/routerPort.js')).href)});
+const { buildRouterEndpoint } = await import(${JSON.stringify(pathToFileURL(path.join(repoRoot, 'cli/sandbox/routerPort.js')).href)});
 const manifest = JSON.parse(fs.readFileSync(${JSON.stringify(path.join(agentDir, 'manifest.json'))}, 'utf8'));
 try {
   startAgentContainer('demo', manifest, ${JSON.stringify(agentDir)}, {

@@ -10,11 +10,11 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const repoRoot = path.resolve(__dirname, '../..');
 const cliCommandsUrl = pathToFileURL(path.join(repoRoot, 'cli/commands/cli.js')).href;
-const dockerCommonUrl = pathToFileURL(path.join(repoRoot, 'cli/services/docker/common.js')).href;
-const sandboxRuntimeUrl = pathToFileURL(path.join(repoRoot, 'cli/services/sandboxRuntime.js')).href;
-const workspaceUrl = pathToFileURL(path.join(repoRoot, 'cli/services/workspace.js')).href;
-const bwrapServiceManagerUrl = pathToFileURL(path.join(repoRoot, 'cli/services/bwrap/bwrapServiceManager.js')).href;
-const seatbeltServiceManagerUrl = pathToFileURL(path.join(repoRoot, 'cli/services/seatbelt/seatbeltServiceManager.js')).href;
+const dockerCommonUrl = pathToFileURL(path.join(repoRoot, 'cli/sandbox/docker/common.js')).href;
+const sandboxRuntimeUrl = pathToFileURL(path.join(repoRoot, 'cli/utils/runtime/sandboxRuntime.js')).href;
+const workspaceUrl = pathToFileURL(path.join(repoRoot, 'cli/utils/workspace.js')).href;
+const bwrapServiceManagerUrl = pathToFileURL(path.join(repoRoot, 'cli/sandbox/bwrap/bwrapServiceManager.js')).href;
+const seatbeltServiceManagerUrl = pathToFileURL(path.join(repoRoot, 'cli/sandbox/seatbelt/seatbeltServiceManager.js')).href;
 
 function makeFakeRuntimeBin(root, name = 'podman') {
     const binDir = path.join(root, 'bin');
@@ -124,8 +124,8 @@ test('sandbox profile resolution honors explicit profiles and requires host netw
 
 test('bwrap and seatbelt env builders consume one validated host endpoint without rereading or defaulting', () => {
     for (const relativePath of [
-        'cli/services/bwrap/bwrapServiceManager.js',
-        'cli/services/seatbelt/seatbeltServiceManager.js',
+        'cli/sandbox/bwrap/bwrapServiceManager.js',
+        'cli/sandbox/seatbelt/seatbeltServiceManager.js',
     ]) {
         const source = fs.readFileSync(path.join(repoRoot, relativePath), 'utf8');
         assert.doesNotMatch(source, /\bresolveRouterEndpoint\s*\(/, `${relativePath} must not reread routing.json`);
@@ -136,7 +136,7 @@ test('bwrap and seatbelt env builders consume one validated host endpoint withou
         fs.writeFileSync(path.join(root, '.ploinky', 'routing.json'), JSON.stringify({ port: 8080 }));
         const script = `
             const { buildFullEnvMap } = await import(${JSON.stringify(bwrapServiceManagerUrl)});
-            const { resolveRouterEndpoint } = await import(${JSON.stringify(pathToFileURL(path.join(repoRoot, 'cli/services/routerPort.js')).href)});
+            const { resolveRouterEndpoint } = await import(${JSON.stringify(pathToFileURL(path.join(repoRoot, 'cli/sandbox/routerPort.js')).href)});
             const endpoint = resolveRouterEndpoint('host');
             const work = ${JSON.stringify(path.join(root, 'work'))};
             const bwrap = buildFullEnvMap('agent', {}, {}, work, 'repo', 'default', 'bwrap', null, endpoint);
@@ -187,8 +187,8 @@ test('managed sandbox env identity is bound to one exact instance and enable gen
     try {
         const script = `
             const { buildFullEnvMap } = await import(${JSON.stringify(bwrapServiceManagerUrl)});
-            const { buildRouterEndpoint } = await import(${JSON.stringify(pathToFileURL(path.join(repoRoot, 'cli/services/routerPort.js')).href)});
-            const { derivePrivateAgentRequestSecret } = await import(${JSON.stringify(pathToFileURL(path.join(repoRoot, 'cli/services/masterKey.js')).href)});
+            const { buildRouterEndpoint } = await import(${JSON.stringify(pathToFileURL(path.join(repoRoot, 'cli/sandbox/routerPort.js')).href)});
+            const { derivePrivateAgentRequestSecret } = await import(${JSON.stringify(pathToFileURL(path.join(repoRoot, 'cli/utils/security/masterKey.js')).href)});
             const endpoint = buildRouterEndpoint('host', 8080);
             const runtimeIdentity = {
                 instanceId: 'instance-exact-1',
@@ -259,7 +259,7 @@ test('sandbox env construction fails closed when identity key material cannot be
         fs.writeFileSync(path.join(root, '.ploinky'), 'not-a-directory');
         const script = `
             const { buildFullEnvMap } = await import(${JSON.stringify(bwrapServiceManagerUrl)});
-            const { buildRouterEndpoint } = await import(${JSON.stringify(pathToFileURL(path.join(repoRoot, 'cli/services/routerPort.js')).href)});
+            const { buildRouterEndpoint } = await import(${JSON.stringify(pathToFileURL(path.join(repoRoot, 'cli/sandbox/routerPort.js')).href)});
             const endpoint = buildRouterEndpoint('host', 8080);
             let failure = null;
             try {
@@ -295,7 +295,7 @@ test('profile environment and secrets cannot override sandbox router discovery',
     try {
         const script = `
             const { buildFullEnvMap } = await import(${JSON.stringify(bwrapServiceManagerUrl)});
-            const { buildRouterEndpoint } = await import(${JSON.stringify(pathToFileURL(path.join(repoRoot, 'cli/services/routerPort.js')).href)});
+            const { buildRouterEndpoint } = await import(${JSON.stringify(pathToFileURL(path.join(repoRoot, 'cli/sandbox/routerPort.js')).href)});
             const endpoint = buildRouterEndpoint('host', 8080);
             const profile = {
                 env: {

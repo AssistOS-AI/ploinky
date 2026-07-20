@@ -1,11 +1,11 @@
 import path from 'path';
 
-import { PLOINKY_DIR } from '../../services/config.js';
-import * as reposSvc from '../../services/repos.js';
-import * as agentsSvc from '../../services/agents.js';
-import * as workspaceSvc from '../../services/workspace.js';
-import { collectLiveAgentContainers } from '../../services/docker/index.js';
-import { collectAgentsSummary } from '../../services/status.js';
+import { PLOINKY_DIR } from '../../utils/config.js';
+import * as reposSvc from '../../utils/repos.js';
+import * as agentsSvc from '../../utils/agents.js';
+import * as workspaceSvc from '../../utils/workspace.js';
+import { collectLiveAgentContainers } from '../../sandbox/docker/index.js';
+import { collectAgentsSummary } from '../../utils/status.js';
 import { isLocalAdminUser } from '../auth/localService.js';
 import { verifyAdminMutationRequest } from '../adminControlSecurity.js';
 import { computeRchHttp, sha256RawBodyHash } from '../../../Agent/lib/requestHash.mjs';

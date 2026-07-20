@@ -69,7 +69,7 @@ fast_check_agent_blob_upload() {
   fi
 
   # The runtime agent registry overwrites `projectPath` to the workspace root
-  # (cli/services/docker/agentServiceManager.js:454), so the blob handler stores
+  # (cli/sandbox/docker/agentServiceManager.js:454), so the blob handler stores
   # files under $TEST_RUN_DIR/blobs/<id> rather than the per-agent workdir the
   # tests originally pointed at. Resolve the actual location from the running
   # agents.json instead of guessing — this also keeps the test correct on Linux

@@ -6,7 +6,7 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
-import { waitForRouterReady } from '../../cli/services/workspaceUtil.js';
+import { waitForRouterReady } from '../../cli/commands/workspaceUtil.js';
 
 const repoRoot = path.resolve(fileURLToPath(new URL('../..', import.meta.url)));
 const routingServerPath = path.join(repoRoot, 'cli/server/RoutingServer.js');

@@ -6,7 +6,7 @@ import {
     TARGETED_DRAIN_TIMEOUT_MS,
     drainAndRemoveTargetedContainer,
     drainTargetedContainer,
-} from '../../cli/services/docker/targetedContainerLifecycle.js';
+} from '../../cli/sandbox/docker/targetedContainerLifecycle.js';
 
 function fixture({ runningChecks = [true, false], exitCode = 0 } = {}) {
     const events = [];

@@ -2,8 +2,8 @@ import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
 
-import { loadAgents } from '../../services/workspace.js';
-import { SHARED_DIR } from '../../services/config.js';
+import { loadAgents } from '../../utils/workspace.js';
+import { SHARED_DIR } from '../../utils/config.js';
 import { getWorkspaceRoot, resolveWorkspacePath } from '../utils/workspacePaths.js';
 import {
     streamAdmittedUpload,

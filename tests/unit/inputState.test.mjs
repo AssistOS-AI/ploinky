@@ -5,7 +5,7 @@ import {
     prepareForExternalCommand,
     registerInterface,
     resume as resumeInputState,
-} from '../../cli/services/inputState.js';
+} from '../../cli/commands/inputState.js';
 
 function resetInputState(t) {
     t.after(() => {

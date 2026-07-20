@@ -5,9 +5,9 @@ import { computeRchHttp, sha256RawBodyHash } from '../../Agent/lib/requestHash.m
 import {
     PRIVATE_ROUTER_AUDIENCE,
     currentEnabledAgentIdentity,
-} from '../services/edgeGeneration.js';
-import { readSecretsFile } from '../services/encryptedSecretsFile.js';
-import { derivePrivateAgentRequestSecret } from '../services/masterKey.js';
+} from '../sandbox/edgeGeneration.js';
+import { readSecretsFile } from '../utils/security/encryptedSecretsFile.js';
+import { derivePrivateAgentRequestSecret } from '../utils/security/masterKey.js';
 
 const PRIVATE_ASSERTION_HEADER = 'ploinky-agent-assertion';
 const PRIVATE_BODY_MAX_BYTES = 10 * 1024 * 1024;

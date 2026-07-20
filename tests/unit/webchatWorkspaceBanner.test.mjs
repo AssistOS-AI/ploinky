@@ -4,7 +4,7 @@ import test from 'node:test';
 import {
     logPloinkyDirectory,
     shouldLogPloinkyDirectory,
-} from '../../cli/services/config.js';
+} from '../../cli/utils/config.js';
 
 test('workspace directory banner is hidden only for WebChat history metadata', () => {
     assert.equal(shouldLogPloinkyDirectory({}), true);

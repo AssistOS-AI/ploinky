@@ -16,13 +16,13 @@ import {
     mergeNodeOptions,
     podmanManifestVolumeMountSuffix,
     podmanMountSuffix,
-} from '../../cli/services/docker/agentServiceManager.js';
-import { PLOINKY_DIR, PLOINKY_WORKSPACE_ROOT } from '../../cli/services/config.js';
-import { resolveManifestVolumeHostPath } from '../../cli/services/manifestVolumePolicy.js';
+} from '../../cli/sandbox/docker/agentServiceManager.js';
+import { PLOINKY_DIR, PLOINKY_WORKSPACE_ROOT } from '../../cli/utils/config.js';
+import { resolveManifestVolumeHostPath } from '../../cli/utils/runtime/manifestVolumePolicy.js';
 import {
     prepareFreshRuntimeRoot,
     pruneStaleRuntimeEntries,
-} from '../../cli/services/runtimeStaging.js';
+} from '../../cli/utils/runtime/runtimeStaging.js';
 
 function tempDir(prefix = 'podman-staging-') {
     return path.resolve(fs.mkdtempSync(path.join(os.tmpdir(), prefix)));

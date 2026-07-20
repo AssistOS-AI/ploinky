@@ -6,7 +6,7 @@ import { fileURLToPath } from 'url';
 import { readJsonBody } from './common.js';
 import * as staticSrv from '../static/index.js';
 import { requireAdminControlRequest } from '../adminControlSecurity.js';
-import { PLOINKY_WORKSPACE_ROOT } from '../../services/config.js';
+import { PLOINKY_WORKSPACE_ROOT } from '../../utils/config.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);

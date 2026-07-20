@@ -1,16 +1,16 @@
 import fs from 'fs';
 import path from 'path';
 
-import { ROUTING_FILE, PLOINKY_WORKSPACE_ROOT } from '../services/config.js';
-import { resolveEnabledAgentRecord } from '../services/agents.js';
-import { findAgent } from '../services/utils.js';
+import { ROUTING_FILE, PLOINKY_WORKSPACE_ROOT } from '../utils/config.js';
+import { resolveEnabledAgentRecord } from '../utils/agents.js';
+import { findAgent } from '../utils/utils.js';
 import { resolveMaxTtlSeconds } from './mcp-proxy/userDelegationGrant.js';
 import { normalizeHttpRouteAccess } from './policy/HttpRouteAccessDecision.js';
-import { loadActiveEdgeRoutingGeneration } from '../services/edgeGeneration.js';
+import { loadActiveEdgeRoutingGeneration } from '../sandbox/edgeGeneration.js';
 import {
     normalizeHttpServicePort,
     serviceSlug,
-} from '../services/httpServicePortConfig.js';
+} from '../sandbox/httpServicePortConfig.js';
 
 const DEFAULT_DELEGATION_TTL_SECONDS = 1800;
 const REMOVED_SERVICE_SPEC_FIELDS = ['auth', 'mode', ['force', 'Guest'].join('')];

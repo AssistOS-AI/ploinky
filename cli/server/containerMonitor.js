@@ -3,33 +3,33 @@ import path from 'path';
 import { Worker } from 'worker_threads';
 import { fileURLToPath } from 'url';
 
-import * as workspaceSvc from '../services/workspace.js';
-import { REPOS_DIR, RUNNING_DIR } from '../services/config.js';
-import { mergeRoutingConfig, mergeRuntimeRoute, readRoutingConfig } from '../services/routingFile.js';
+import * as workspaceSvc from '../utils/workspace.js';
+import { REPOS_DIR, RUNNING_DIR } from '../utils/config.js';
+import { mergeRoutingConfig, mergeRuntimeRoute, readRoutingConfig } from './routingFile.js';
 import {
     createWorkspaceMutationLease,
     inspectMaintenanceLock,
     inspectWorkspaceStartLock,
     releaseWorkspaceMutationLease,
-} from '../services/maintenanceLocks.js';
+} from '../utils/runtime/maintenanceLocks.js';
 import {
     cleanupExactAgentRuntimeCandidate,
     ensureAgentService,
     isContainerRunning,
-} from '../services/docker/index.js';
-import { shouldMonitorManifestRuntime } from '../services/manifestStartup.js';
-import { isSandboxRuntime } from '../services/docker/common.js';
-import { isBwrapProcessRunning } from '../services/bwrap/bwrapFleet.js';
-import { resolveManifestRuntimeProfile } from '../services/profileService.js';
-import { resolveRouterEndpoint } from '../services/routerPort.js';
-import { resolveAgentReadinessProtocol } from '../services/startupReadiness.js';
-import { runContainerScriptReadiness } from '../services/docker/healthProbes.js';
+} from '../sandbox/docker/index.js';
+import { shouldMonitorManifestRuntime } from '../utils/runtime/manifestStartup.js';
+import { isSandboxRuntime } from '../sandbox/docker/common.js';
+import { isBwrapProcessRunning } from '../sandbox/bwrap/bwrapFleet.js';
+import { resolveManifestRuntimeProfile } from '../utils/runtime/profileService.js';
+import { resolveRouterEndpoint } from '../sandbox/routerPort.js';
+import { resolveAgentReadinessProtocol } from '../utils/runtime/startupReadiness.js';
+import { runContainerScriptReadiness } from '../sandbox/docker/healthProbes.js';
 import { waitForAgentReady } from './utils/agentReadiness.js';
-import { applyEdgeRoutingGeneration } from '../services/coordinatedEdgeApply.js';
+import { applyEdgeRoutingGeneration } from '../sandbox/coordinatedEdgeApply.js';
 import {
     abortEdgeRoutingPreparation,
     inactivateEdgeRoutingGeneration,
-} from '../services/edgeGeneration.js';
+} from '../sandbox/edgeGeneration.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);

@@ -31,12 +31,12 @@ writeManifest('media', 'livekit', {
 // Import one shared module graph. The prepared host capability is deliberately
 // opaque and module-local, so query-string copies would create unrelated
 // capability registries that production never uses.
-const edge = await import(new URL('../../cli/services/edgeGeneration.js', import.meta.url).href);
-const routing = await import(new URL('../../cli/services/routingFile.js', import.meta.url).href);
-const agents = await import(new URL('../../cli/services/agents.js', import.meta.url).href);
-const manager = await import(new URL('../../cli/services/docker/agentServiceManager.js', import.meta.url).href);
-const coordinated = await import(new URL('../../cli/services/coordinatedEdgeApply.js', import.meta.url).href);
-const passwordStore = await import(new URL('../../cli/services/encryptedPasswordStore.js', import.meta.url).href);
+const edge = await import(new URL('../../cli/sandbox/edgeGeneration.js', import.meta.url).href);
+const routing = await import(new URL('../../cli/server/routingFile.js', import.meta.url).href);
+const agents = await import(new URL('../../cli/utils/agents.js', import.meta.url).href);
+const manager = await import(new URL('../../cli/sandbox/docker/agentServiceManager.js', import.meta.url).href);
+const coordinated = await import(new URL('../../cli/sandbox/coordinatedEdgeApply.js', import.meta.url).href);
+const passwordStore = await import(new URL('../../cli/utils/security/encryptedPasswordStore.js', import.meta.url).href);
 
 test.after(() => {
     process.chdir(originalCwd);

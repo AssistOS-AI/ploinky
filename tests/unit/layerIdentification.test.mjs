@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import {
     formatAgentAttachmentBanner,
     resolveAgentAttachmentIdentity,
-} from '../../cli/services/layerIdentification.js';
+} from '../../cli/sandbox/layerIdentification.js';
 
 test('agent banner uses the post-start registry image', () => {
     const identity = resolveAgentAttachmentIdentity('explorer', 'nested-explorer', {

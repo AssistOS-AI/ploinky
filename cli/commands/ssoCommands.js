@@ -1,11 +1,11 @@
-import { showHelp } from '../services/help.js';
+import { showHelp } from './help.js';
 import {
     bindSsoProvider,
     unbindSsoProvider,
     gatherSsoStatus,
     getSsoConfig,
     listAuthProviders
-} from '../services/sso.js';
+} from '../utils/security/sso.js';
 
 function printProviderChoices(providers = []) {
     if (!providers.length) {

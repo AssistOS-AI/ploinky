@@ -5,7 +5,7 @@ import {
     reinstallAgent,
     startWorkspace,
     waitForManifestReadiness,
-} from '../../cli/services/workspaceUtil.js';
+} from '../../cli/commands/workspaceUtil.js';
 
 function scriptManifest() {
     return {

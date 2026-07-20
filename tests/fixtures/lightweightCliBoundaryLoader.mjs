@@ -16,7 +16,7 @@ const runtimeShellStub =
 export async function resolve(specifier, context, nextResolve) {
     const resolved = await nextResolve(specifier, context);
     const pathname = new URL(resolved.url).pathname;
-    if (pathname.endsWith('/cli/services/runtimeShell.js')) {
+    if (pathname.endsWith('/cli/sandbox/runtimeShell.js')) {
         return { url: runtimeShellStub, shortCircuit: true };
     }
     if (/\/cli\/(?:main\.js|commands\/)/.test(pathname)) {

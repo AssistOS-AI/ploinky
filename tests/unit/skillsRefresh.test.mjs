@@ -6,11 +6,11 @@ import os from 'os';
 import path from 'path';
 import { fileURLToPath, pathToFileURL } from 'url';
 
-import { PLOINKY_DIR, REPOS_DIR } from '../../cli/services/config.js';
+import { PLOINKY_DIR, REPOS_DIR } from '../../cli/utils/config.js';
 import {
     refreshDefaultSkillsInPloinkyRepos,
 } from '../../cli/commands/repoAgentCommands.js';
-import { copySkill, installDefaultSkills } from '../../cli/services/skills.js';
+import { copySkill, installDefaultSkills } from '../../cli/commands/skills.js';
 
 function writeSkill(root, name, files) {
     const skillRoot = path.join(root, name);
@@ -53,7 +53,7 @@ function projectFileUrl(relPath) {
 
 function runAggregateUpdateChild(workspaceRoot, body) {
     const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
-    const configUrl = projectFileUrl('cli/services/config.js');
+    const configUrl = projectFileUrl('cli/utils/config.js');
     const commandsUrl = projectFileUrl('cli/commands/repoAgentCommands.js');
     const runtimeRoot = path.join(workspaceRoot, '.fixtures', 'runtime-root');
 
@@ -476,7 +476,7 @@ test('refreshDefaultSkillsInPloinkyRepos reports default skill install failures'
 test('updateRepo reports default skill refresh failures after updating a managed repo', () => {
     const workspaceRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-update-default-skills-'));
     const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
-    const configUrl = projectFileUrl('cli/services/config.js');
+    const configUrl = projectFileUrl('cli/utils/config.js');
     const commandsUrl = projectFileUrl('cli/commands/repoAgentCommands.js');
 
     try {

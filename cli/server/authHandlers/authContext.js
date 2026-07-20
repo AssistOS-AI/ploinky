@@ -1,9 +1,9 @@
 import fs from 'fs';
 import path from 'path';
 
-import { PLOINKY_WORKSPACE_ROOT, ROUTING_FILE } from '../../services/config.js';
-import { resolveEnabledAgentRecord } from '../../services/agents.js';
-import { findAgent } from '../../services/utils.js';
+import { PLOINKY_WORKSPACE_ROOT, ROUTING_FILE } from '../../utils/config.js';
+import { resolveEnabledAgentRecord } from '../../utils/agents.js';
+import { findAgent } from '../../utils/utils.js';
 import { GUEST_SESSION_TTL_SECONDS, getSessionCookieMaxAge as getLocalSessionCookieMaxAge, mintGuestSessionJwt, mintSessionJwt } from '../auth/localService.js';
 import { waitForAgentReady } from '../utils/agentReadiness.js';
 import { BROWSER_CSRF_COOKIE_NAME, mintBrowserCsrfToken } from '../browserMutationSecurity.js';

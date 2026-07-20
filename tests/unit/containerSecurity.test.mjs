@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import {
     buildContainerSecurityArgs,
     resolveContainerSecurity,
-} from '../../cli/services/docker/containerSecurity.js';
+} from '../../cli/sandbox/docker/containerSecurity.js';
 
 test('container security defaults to no extra runtime flags', () => {
     assert.deepEqual(resolveContainerSecurity({}, null), { privileged: false });
