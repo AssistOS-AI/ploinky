@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { verifyEnabledAgentStarted } from '../../cli/services/agents.js';
+import { verifyEnabledAgentStarted } from '../../cli/utils/agents.js';
 
 test('verifyEnabledAgentStarted logs when the enabled agent container is running', () => {
     const logs = [];

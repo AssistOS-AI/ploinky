@@ -52,7 +52,7 @@ test('transcript storage and conversation rating code is absent from Ploinky', (
 
     const checkedSources = [
         ...sourcesUnder('cli/server/handlers/webchat'),
-        'cli/services/config.js',
+        'cli/utils/config.js',
         'cli/server/handlers/dashboard.js',
         'cli/server/webchat/index.js',
         'cli/server/webchat/messages.js',

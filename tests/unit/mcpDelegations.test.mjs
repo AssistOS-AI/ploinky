@@ -18,7 +18,7 @@ const {
     deriveDelegationKey,
 } = await import(`../../cli/server/mcp-proxy/mcpDelegations.js${moduleSuffix}`);
 const { verifyUserDelegationGrant } = await import(`../../cli/server/mcp-proxy/userDelegationGrant.js${moduleSuffix}`);
-const { deriveSubkey } = await import(`../../cli/services/masterKey.js${moduleSuffix}`);
+const { deriveSubkey } = await import(`../../cli/utils/security/masterKey.js${moduleSuffix}`);
 
 const SOURCE_DIR = path.join(tempDir, 'agents', 'gitAgent');
 fs.mkdirSync(SOURCE_DIR, { recursive: true });

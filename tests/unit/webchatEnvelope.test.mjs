@@ -18,7 +18,7 @@ import {
 import {
     extractManifestWebchatOptions
 } from '../../cli/server/webchat/commandResolver.js';
-import { PLOINKY_WORKSPACE_ROOT } from '../../cli/services/config.js';
+import { PLOINKY_WORKSPACE_ROOT } from '../../cli/utils/config.js';
 
 test('resolveWebchatLaunchOptions forwards agent-owned launch flags unchanged', () => {
     const parsedUrl = new URL(

@@ -8,7 +8,7 @@ const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-maintenance-loc
 fs.mkdirSync(path.join(workspace, '.ploinky'), { recursive: true });
 process.env.PLOINKY_WORKSPACE_ROOT = workspace;
 
-const locks = await import(`../../cli/services/maintenanceLocks.js?test=${Date.now()}`);
+const locks = await import(`../../cli/utils/runtime/maintenanceLocks.js?test=${Date.now()}`);
 
 function lockFile(containerName) {
     return path.join(workspace, '.ploinky', 'running', 'maintenance', `${containerName}.json`);

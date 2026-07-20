@@ -7,7 +7,7 @@ import path from 'node:path';
 import {
     isLlmRuntimeManifest,
     prepareLlmStartup,
-} from '../../cli/services/llmRuntimeIntegration.js';
+} from '../../cli/sandbox/docker/llmRuntimeIntegration.js';
 
 function withTempDirs(fn) {
     const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-llm-integration-'));

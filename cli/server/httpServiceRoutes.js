@@ -1,9 +1,9 @@
 import fs from 'fs';
 import path from 'path';
 
-import { ROUTING_FILE, PLOINKY_WORKSPACE_ROOT } from '../services/config.js';
-import { resolveEnabledAgentRecord } from '../services/agents.js';
-import { findAgent } from '../services/utils.js';
+import { ROUTING_FILE, PLOINKY_WORKSPACE_ROOT } from '../utils/config.js';
+import { resolveEnabledAgentRecord } from '../utils/agents.js';
+import { findAgent } from '../utils/utils.js';
 import { resolveMaxTtlSeconds } from './mcp-proxy/userDelegationGrant.js';
 import { normalizeHttpRouteAccess } from './policy/HttpRouteAccessDecision.js';
 

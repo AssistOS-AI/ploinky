@@ -24,7 +24,7 @@ import {
     ensureCacheDir,
     ensureAgentCacheForFamily,
     nodeModulesDir,
-} from '../../cli/services/dependencyCache.js';
+} from '../../cli/utils/dependencies/dependencyCache.js';
 
 function tempDir(prefix = 'deps-cache-test-') {
     return fs.mkdtempSync(path.join(os.tmpdir(), prefix));

@@ -20,7 +20,7 @@ fs.writeFileSync(path.join(providerDir, 'runtime', 'index.mjs'), 'export functio
 process.chdir(tempDir);
 
 const moduleSuffix = `?test=${Date.now()}`;
-const ssoModule = await import(`../../cli/services/sso.js${moduleSuffix}`);
+const ssoModule = await import(`../../cli/utils/security/sso.js${moduleSuffix}`);
 const {
     bindSsoProvider,
     unbindSsoProvider,

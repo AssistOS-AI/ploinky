@@ -6,9 +6,9 @@ import {
     getValidProfiles,
     getDefaultMountModes,
     getProfileConfig
-} from '../services/profileService.js';
-import { loadAgents } from '../services/workspace.js';
-import { colorize } from '../services/utils.js';
+} from '../utils/runtime/profileService.js';
+import { loadAgents } from '../utils/workspace.js';
+import { colorize } from '../utils/utils.js';
 
 /**
  * Handle the profile command.

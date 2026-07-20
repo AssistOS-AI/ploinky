@@ -12,12 +12,12 @@ process.chdir(tempDir);
 process.env.PLOINKY_MASTER_KEY = 'a1b2c3d4'.repeat(8);
 
 const moduleSuffix = `?test=${Date.now()}`;
-const { buildFullEnvMap } = await import(`../../cli/services/bwrap/bwrapServiceManager.js${moduleSuffix}`);
-const { deriveAgentRequestSecret, deriveDerivedMasterKey } = await import(`../../cli/services/masterKey.js${moduleSuffix}`);
-const { deriveAgentPrincipalId } = await import(`../../cli/services/agentIdentity.js${moduleSuffix}`);
+const { buildFullEnvMap } = await import(`../../cli/sandbox/bwrap/bwrapServiceManager.js${moduleSuffix}`);
+const { deriveAgentRequestSecret, deriveDerivedMasterKey } = await import(`../../cli/utils/security/masterKey.js${moduleSuffix}`);
+const { deriveAgentPrincipalId } = await import(`../../cli/utils/security/agentIdentity.js${moduleSuffix}`);
 // The single identity injector that docker, bwrap, and lifecycle all route through.
-const { buildAgentIdentityEnv, stripReservedAgentEnv } = await import(`../../cli/services/agentIdentityEnv.js${moduleSuffix}`);
-const { verifySubjectIdentityKey, getSubjectIdentityPublicKey } = await import(`../../cli/services/subjectIdentityKey.js${moduleSuffix}`);
+const { buildAgentIdentityEnv, stripReservedAgentEnv } = await import(`../../cli/utils/security/agentIdentityEnv.js${moduleSuffix}`);
+const { verifySubjectIdentityKey, getSubjectIdentityPublicKey } = await import(`../../cli/utils/security/subjectIdentityKey.js${moduleSuffix}`);
 
 test.after(() => {
     process.chdir(originalCwd);

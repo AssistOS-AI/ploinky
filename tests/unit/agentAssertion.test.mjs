@@ -16,7 +16,7 @@ process.env.PLOINKY_MASTER_KEY = 'c'.repeat(64);
 
 const moduleSuffix = `?test=${Date.now()}`;
 const { verifyAgentAssertion } = await import(`../../cli/server/mcp-proxy/invocationMinter.js${moduleSuffix}`);
-const { deriveAgentRequestSecret } = await import(`../../cli/services/masterKey.js${moduleSuffix}`);
+const { deriveAgentRequestSecret } = await import(`../../cli/utils/security/masterKey.js${moduleSuffix}`);
 
 const AGENT_A = 'agent:explorer/source-agent';
 const AGENT_B = 'agent:dpu/dpu-agent';

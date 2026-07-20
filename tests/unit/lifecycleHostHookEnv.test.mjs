@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-import { executeHostHook } from '../../cli/services/lifecycleHooks.js';
+import { executeHostHook } from '../../cli/utils/runtime/lifecycleHooks.js';
 
 // Host hooks (preinstall, hosthook_aftercreation, hosthook_postinstall) run on the
 // HOST before the container exists, so the container-only PLOINKY_WORKSPACE_ROOT

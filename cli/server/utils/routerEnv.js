@@ -1,7 +1,7 @@
 import fs from 'fs';
 import crypto from 'crypto';
-import * as envSvc from '../../services/secretVars.js';
-import { ROUTING_FILE } from '../../services/config.js';
+import * as envSvc from '../../utils/security/secretVars.js';
+import { ROUTING_FILE } from '../../utils/config.js';
 
 const COMPONENTS = {
   webchat: { label: 'WebChat', path: '/webchat', authMode: 'login' },

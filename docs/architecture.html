@@ -116,46 +116,46 @@ handleCommand(args) {
     }
 }</code></pre>
 
-                        <h3>Service Layer (cli/services/)</h3>
+                        <h3>Shared Utilities and Sandbox Backends</h3>
                         <table class="command-table">
                             <tr>
                                 <th>Service</th>
                                 <th>Responsibility</th>
                             </tr>
                             <tr>
-                                <td><code>workspace.js</code></td>
+                                <td><code>cli/utils/workspace.js</code></td>
                                 <td>Manages .ploinky directory and configuration</td>
                             </tr>
                             <tr>
-                                <td><code>docker/</code></td>
+                                <td><code>cli/sandbox/docker/</code></td>
                                 <td>Container lifecycle management modules (runtime helpers, interactive commands, agent management)</td>
                             </tr>
                             <tr>
-                                <td><code>repos.js</code></td>
+                                <td><code>cli/utils/repos.js</code></td>
                                 <td>Repository management and agent discovery</td>
                             </tr>
                             <tr>
-                                <td><code>agents.js</code></td>
+                                <td><code>cli/utils/agents.js</code></td>
                                 <td>Agent registration and configuration</td>
                             </tr>
                             <tr>
-                                <td><code>secretVars.js</code></td>
+                                <td><code>cli/utils/security/secretVars.js</code></td>
                                 <td>Environment variable and secrets management</td>
                             </tr>
                             <tr>
-                                <td><code>config.js</code></td>
+                                <td><code>cli/utils/config.js</code></td>
                                 <td>Global configuration constants</td>
                             </tr>
                             <tr>
-                                <td><code>help.js</code></td>
+                                <td><code>cli/commands/help.js</code></td>
                                 <td>Help system and documentation</td>
                             </tr>
                             <tr>
-                                <td><code>bwrap/</code></td>
+                                <td><code>cli/sandbox/bwrap/</code></td>
                                 <td>Bubblewrap sandbox lifecycle management (Linux)</td>
                             </tr>
                             <tr>
-                                <td><code>seatbelt/</code></td>
+                                <td><code>cli/sandbox/seatbelt/</code></td>
                                 <td>Seatbelt sandbox lifecycle management (macOS)</td>
                             </tr>
                             <tr>

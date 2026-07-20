@@ -6,7 +6,7 @@ import {
     normalizeArch,
     normalizePlatform,
     summarizeAcceleratorFamilies,
-} from '../../cli/services/hardwareDetection.js';
+} from '../../cli/sandbox/docker/hardwareDetection.js';
 
 test('normalizeArch maps Node and uname variants to amd64/arm64', () => {
     assert.equal(normalizeArch('x64'), 'amd64');

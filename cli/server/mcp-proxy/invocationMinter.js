@@ -1,5 +1,5 @@
-import { deriveAgentRequestSecret } from '../../services/masterKey.js';
-import { resolveAgentDescriptor } from '../../services/agentRegistry.js';
+import { deriveAgentRequestSecret } from '../../utils/security/masterKey.js';
+import { resolveAgentDescriptor } from '../../utils/agentRegistry.js';
 import {
     AgentAssertionService,
     RouterRequestTokenService,

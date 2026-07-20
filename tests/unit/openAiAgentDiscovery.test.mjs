@@ -27,7 +27,7 @@ const {
     OPENAI_AGENT_DISCOVERY_TOOL,
     OPENAI_AGENT_DISCOVERY_TARGET,
 } = await import(`../../cli/server/openAiAgentDiscovery.js${moduleSuffix}`);
-const { deriveAgentRequestSecret } = await import(`../../cli/services/masterKey.js${moduleSuffix}`);
+const { deriveAgentRequestSecret } = await import(`../../cli/utils/security/masterKey.js${moduleSuffix}`);
 
 test.after(() => {
     process.chdir(originalCwd);

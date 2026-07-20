@@ -4,9 +4,9 @@ import { spawn } from 'child_process';
 import { fileURLToPath } from 'url';
 
 import * as staticSrv from '../static/index.js';
-import { ROUTING_FILE, PLOINKY_WORKSPACE_ROOT } from '../../services/config.js';
-import { getAllServerStatuses } from '../../services/serverManager.js';
-import { loadAgents } from '../../services/workspace.js';
+import { ROUTING_FILE, PLOINKY_WORKSPACE_ROOT } from '../../utils/config.js';
+import { getAllServerStatuses } from '../serverManager.js';
+import { loadAgents } from '../../utils/workspace.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);

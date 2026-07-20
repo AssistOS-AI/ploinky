@@ -16,7 +16,7 @@ const {
     deriveDerivedMasterKey,
     resolveMasterKey,
     MASTER_KEY_VAR,
-} = await import(`../../cli/services/masterKey.js${moduleSuffix}`);
+} = await import(`../../cli/utils/security/masterKey.js${moduleSuffix}`);
 
 test.after(() => {
     process.chdir(originalCwd);

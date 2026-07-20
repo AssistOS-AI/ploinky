@@ -43,7 +43,7 @@ const {
     verifyAndMintAgentOpenAiCall,
 } = await import(`../../cli/server/agentOpenAiDelegation.js${moduleSuffix}`);
 const { verifyAgentAssertion } = await import(`../../cli/server/mcp-proxy/invocationMinter.js${moduleSuffix}`);
-const { deriveAgentRequestSecret } = await import(`../../cli/services/masterKey.js${moduleSuffix}`);
+const { deriveAgentRequestSecret } = await import(`../../cli/utils/security/masterKey.js${moduleSuffix}`);
 
 const SOURCE_AGENT = 'agent:AssistOSExplorer/soulGateway';
 const TARGET_ROUTE = 'llmAssistant';

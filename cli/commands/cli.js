@@ -1,15 +1,15 @@
 import fs from 'fs';
 import path from 'path';
 import { execSync, spawn } from 'child_process';
-import { debugLog, findAgent } from '../services/utils.js';
-import { isKnownCommand } from '../services/commandRegistry.js';
-import { showHelp } from '../services/help.js';
-import * as envSvc from '../services/secretVars.js';
-import * as agentsSvc from '../services/agents.js';
-import { listRepos, listAgents, listCurrentAgents, listRoutes, statusWorkspace } from '../services/status.js';
-import { logsTail, showLast } from '../services/logUtils.js';
-import { startWorkspace, runCli, runShell, reinstallAgent } from '../services/workspaceUtil.js';
-import { withMaintenanceLock } from '../services/maintenanceLocks.js';
+import { debugLog, findAgent } from '../utils/utils.js';
+import { isKnownCommand } from './commandRegistry.js';
+import { showHelp } from './help.js';
+import * as envSvc from '../utils/security/secretVars.js';
+import * as agentsSvc from '../utils/agents.js';
+import { listRepos, listAgents, listCurrentAgents, listRoutes, statusWorkspace } from '../utils/status.js';
+import { logsTail, showLast } from './logUtils.js';
+import { startWorkspace, runCli, runShell, reinstallAgent } from './workspaceUtil.js';
+import { withMaintenanceLock } from '../utils/runtime/maintenanceLocks.js';
 import { refreshComponentToken, ensureComponentToken } from '../server/utils/routerEnv.js';
 import {
     getAgentContainerName,
@@ -21,12 +21,12 @@ import {
     stopConfiguredAgents,
     destroyWorkspaceContainers,
     ensureAgentService
-} from '../services/docker/index.js';
-import { getRuntimeForAgent, isSandboxRuntime } from '../services/docker/common.js';
-import { isBwrapProcessRunning, stopBwrapProcess } from '../services/bwrap/bwrapFleet.js';
-import * as workspaceSvc from '../services/workspace.js';
+} from '../sandbox/docker/index.js';
+import { getRuntimeForAgent, isSandboxRuntime } from '../sandbox/docker/common.js';
+import { isBwrapProcessRunning, stopBwrapProcess } from '../sandbox/bwrap/bwrapFleet.js';
+import * as workspaceSvc from '../utils/workspace.js';
 import { handleSystemCommand, handleInvalidCommand, resetLlmInvokerCache } from './llmSystemCommands.js';
-import * as inputState from '../services/inputState.js';
+import * as inputState from './inputState.js';
 import {
     getRepoNames,
     getAgentNames,
@@ -39,8 +39,8 @@ import {
     enableAgent,
     findAgentManifest,
 } from './repoAgentCommands.js';
-import { parseStartArgs } from '../services/repos.js';
-import { resolveAgentlibBranchRef } from '../services/dependencyInstaller.js';
+import { parseStartArgs } from '../utils/repos.js';
+import { resolveAgentlibBranchRef } from '../utils/dependencies/dependencyInstaller.js';
 import {
     handleVarsCommand,
     handleVarCommand,
@@ -48,9 +48,9 @@ import {
     handleExposeCommand,
 } from './envVarCommands.js';
 import { handleDefaultSkillsCommand } from './skillsCommands.js';
-import { runSettingsMenu } from '../services/settingsMenu.js';
+import { runSettingsMenu } from './settingsMenu.js';
 import { handleProfileCommand } from './profileCommands.js';
-import { ROUTING_FILE } from '../services/config.js';
+import { ROUTING_FILE } from '../utils/config.js';
 import {
     cleanupSessionContainers,
     destroyAll,
@@ -61,8 +61,8 @@ import { handleSsoCommand } from './ssoCommands.js';
 import { handleDepsCommand } from './depsCommands.js';
 import { disableHostSandbox, enableHostSandbox, handleSandboxCommand } from './sandboxCommands.js';
 import ClientCommands from './client.js';
-import { getActiveProfile, getProfileConfig } from '../services/profileService.js';
-import { resolveProfileServer } from '../services/profileServer.js';
+import { getActiveProfile, getProfileConfig } from '../utils/runtime/profileService.js';
+import { resolveProfileServer } from '../utils/runtime/profileServer.js';
 
 let llmAgentsLoadPromise = null;
 const ENABLE_AGENT_CLI_TOKENS = Object.freeze({
@@ -501,7 +501,7 @@ async function handleCommand(args) {
                             }
                             if (containerAlsoRunning) {
                                 try {
-                                    const { stopAndRemove } = await import('../services/docker/containerFleet.js');
+                                    const { stopAndRemove } = await import('../sandbox/docker/containerFleet.js');
                                     stopAndRemove(containerName);
                                 } catch (_) {}
                             }

@@ -1,25 +1,25 @@
 # Ploinky Agent Lifecycle and Runtime Treatment
 
-This document is derived from implementation code only. Existing Ploinky docs and specs were not used as source material. The main code paths consulted are the CLI entrypoints in `bin/` and `cli/`, the runtime managers under `cli/services/`, the router under `cli/server/`, and the default in-container agent server under `Agent/server/`.
+This document is derived from implementation code only. Existing Ploinky docs and specs were not used as source material. The main code paths consulted are the CLI entrypoints in `bin/` and `cli/`, the shared runtime helpers under `cli/utils/runtime/`, the backend managers under `cli/sandbox/`, the router under `cli/server/`, and the default in-container agent server under `Agent/server/`.
 
-All relative paths below are relative to the workspace directory where `ploinky` is run, because `cli/services/config.js` sets `PLOINKY_WORKSPACE_ROOT` to the resolved workspace path.
+All relative paths below are relative to the workspace directory where `ploinky` is run, because `cli/utils/config.js` sets `PLOINKY_WORKSPACE_ROOT` to the resolved workspace path.
 
 ## Source Map
 
 | Area | Primary source files |
 | --- | --- |
 | Executable entrypoint | `bin/ploinky`, `bin/p-cli`, `bin/ploinky-shell`, `bin/psh`, `cli/index.js`, `cli/shell.js` |
-| Command dispatch | `cli/commands/cli.js`, `cli/services/commandRegistry.js`, `cli/services/help.js` |
-| Workspace paths | `cli/services/config.js`, `cli/services/workspace.js`, `cli/services/workspaceStructure.js` |
-| Repo discovery and install | `cli/services/repos.js`, `cli/commands/repoAgentCommands.js`, `cli/services/utils.js`, `cli/services/status.js` |
-| Agent enable/disable state | `cli/services/agents.js` |
-| Start/restart/runtime orchestration | `cli/services/workspaceUtil.js`, `cli/services/workspaceDependencyGraph.js`, `cli/services/bootstrapManifest.js`, `cli/services/noWaitWorker.js` |
-| Container runtime | `cli/services/docker/common.js`, `cli/services/docker/agentServiceManager.js`, `cli/services/docker/containerFleet.js` |
-| Host sandbox runtime | `cli/services/sandboxRuntime.js`, `cli/services/bwrap/bwrapServiceManager.js`, `cli/services/seatbelt/seatbeltServiceManager.js`, `cli/services/seatbelt/seatbeltProfile.js` |
-| Dependency cache | `cli/services/dependencyCache.js`, `cli/services/dependencyRuntimeKey.js`, `cli/services/dependencyInstaller.js`, `globalDeps/package.json`, `cli/commands/depsCommands.js` |
-| Manifest env, profiles, lifecycle hooks | `cli/services/secretVars.js`, `cli/services/profileService.js`, `cli/services/lifecycleHooks.js`, `cli/services/manifestVolumePolicy.js`, `cli/services/runtimeResourcePlanner.js` |
+| Command dispatch | `cli/commands/cli.js`, `cli/commands/commandRegistry.js`, `cli/commands/help.js` |
+| Workspace paths | `cli/utils/config.js`, `cli/utils/workspace.js`, `cli/utils/workspaceStructure.js` |
+| Repo discovery and install | `cli/utils/repos.js`, `cli/commands/repoAgentCommands.js`, `cli/utils/utils.js`, `cli/utils/status.js` |
+| Agent enable/disable state | `cli/utils/agents.js` |
+| Start/restart/runtime orchestration | `cli/commands/workspaceUtil.js`, `cli/utils/workspaceDependencyGraph.js`, `cli/utils/runtime/bootstrapManifest.js`, `cli/commands/noWaitWorker.js` |
+| Container runtime | `cli/sandbox/docker/common.js`, `cli/sandbox/docker/agentServiceManager.js`, `cli/sandbox/docker/containerFleet.js` |
+| Host sandbox runtime | `cli/utils/runtime/sandboxRuntime.js`, `cli/sandbox/bwrap/bwrapServiceManager.js`, `cli/sandbox/seatbelt/seatbeltServiceManager.js`, `cli/sandbox/seatbelt/seatbeltProfile.js` |
+| Dependency cache | `cli/utils/dependencies/dependencyCache.js`, `cli/utils/dependencies/dependencyRuntimeKey.js`, `cli/utils/dependencies/dependencyInstaller.js`, `globalDeps/package.json`, `cli/commands/depsCommands.js` |
+| Manifest env, profiles, lifecycle hooks | `cli/utils/security/secretVars.js`, `cli/utils/runtime/profileService.js`, `cli/utils/runtime/lifecycleHooks.js`, `cli/utils/runtime/manifestVolumePolicy.js`, `cli/utils/runtime/runtimeResourcePlanner.js` |
 | Router/watchdog | `cli/server/Watchdog.js`, `cli/server/RoutingServer.js`, `cli/server/containerMonitor.js`, `cli/server/probeWorker.js`, `cli/server/httpServiceRoutes.js` |
-| Startup and health checks | `cli/services/startupReadiness.js`, `cli/server/utils/agentReadiness.js`, `cli/services/docker/healthProbes.js`, `cli/services/bwrap/bwrapHealthProbes.js` |
+| Startup and health checks | `cli/utils/runtime/startupReadiness.js`, `cli/server/utils/agentReadiness.js`, `cli/sandbox/docker/healthProbes.js`, `cli/sandbox/bwrap/bwrapHealthProbes.js` |
 | Default agent server | `Agent/server/AgentServer.mjs`, `Agent/server/AgentServer.sh` |
 
 ## Workspace State
@@ -58,11 +58,11 @@ Before a `start` command is handled, `cli/index.js` parses static-agent, port, a
 
 ## Commands
 
-The command surface is split between the registry in `cli/services/commandRegistry.js` and explicit switch cases in `cli/commands/cli.js`. The registry is used for known-command checks; dispatcher-only cases such as `webchat`, `dashboard`, `sso`, and `deps` still run because `handleCommand()` has direct cases for them.
+The command surface is split between the registry in `cli/commands/commandRegistry.js` and explicit switch cases in `cli/commands/cli.js`. The registry is used for known-command checks; dispatcher-only cases such as `webchat`, `dashboard`, `sso`, and `deps` still run because `handleCommand()` has direct cases for them.
 
 | Command | Main behavior |
 | --- | --- |
-| `help` | Prints generated help from `cli/services/help.js`. |
+| `help` | Prints generated help from `cli/commands/help.js`. |
 | `install [repo] <url> [name] [branch]` / `add [repo] <url> [name] [branch]` | Clones a repo under `.ploinky/repos/<name>`, deriving the name from the URL when omitted, and stores source metadata. |
 | `uninstall [repo] <name-or-url>` / `remove [repo] <name-or-url>` | Disables enabled agents from that repo by container key, removes their runtime containers, removes `.ploinky/repos/<name>`, and preserves source metadata for reinstall. |
 | `update repo <name>` | Updates one installed repo with `git pull --rebase --autostash` or reclones a non-git repo when source metadata exists, then refreshes `AchillesCopilotBasicSkills` there when eligible. |
@@ -649,7 +649,7 @@ MCP tool and resource commands require router-minted invocation headers before c
 5. Container runtime dependency installs happen in caches, not in the long-running containers.
 6. Podman and seatbelt copy/stage runtime files; Docker mostly mounts them directly.
 7. `clean` destroys containers but does not explicitly kill the router in the dispatcher path.
-8. `cli/services/help.js` contains cloud help, but `cli/commands/cli.js` treats cloud commands as unavailable in this build.
+8. `cli/commands/help.js` contains cloud help, but `cli/commands/cli.js` treats cloud commands as unavailable in this build.
 9. `client tool --agent` resolves ambiguity, but the observed call path invokes `client.callTool(toolName, payloadObj)` without passing target-agent metadata.
 10. Seatbelt links prepared dependencies into the real agent code path as `node_modules`; it errors if that path exists and is not a symlink.
 11. Manifest health probes are watchdog/container-monitor probes and are separate from startup readiness.

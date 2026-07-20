@@ -48,7 +48,7 @@ process.env.PLOINKY_MASTER_KEY = process.env.PLOINKY_MASTER_KEY || ROUTER_OPENAI
 // Import the REAL per-agent secret derivation so the token we sign here is one
 // the AgentServer (running with the same master key) accepts. Other suites
 // (httpServiceInvocation) import this router service the same way.
-const { deriveAgentRequestSecret } = await import('../../cli/services/masterKey.js');
+const { deriveAgentRequestSecret } = await import('../../cli/utils/security/masterKey.js');
 
 function buildRouterRequestAuthInfo({ agentId, body = '', method = 'POST', path = OPENAI_PATH, tool = OPENAI_TOOL, overrides = {} }) {
     const secret = deriveAgentRequestSecret(agentId, { encoding: 'buffer' });

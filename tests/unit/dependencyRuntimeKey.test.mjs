@@ -9,7 +9,7 @@ import {
     normalizeRuntimeFamily,
     buildRuntimeKey,
     SUPPORTED_FAMILIES,
-} from '../../cli/services/dependencyRuntimeKey.js';
+} from '../../cli/utils/dependencies/dependencyRuntimeKey.js';
 
 test('detectHostRuntimeKey returns <family>-<platform>-<arch>-node<major> for bwrap', () => {
     const key = detectHostRuntimeKey('bwrap');

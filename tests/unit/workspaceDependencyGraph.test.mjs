@@ -19,9 +19,9 @@ function writeManifest(repoName, agentName, manifest) {
 process.chdir(tempDir);
 
 const moduleSuffix = `?test=${Date.now()}`;
-const graphModuleUrl = new URL('../../cli/services/workspaceDependencyGraph.js', import.meta.url);
+const graphModuleUrl = new URL('../../cli/utils/workspaceDependencyGraph.js', import.meta.url);
 const graphModule = await import(`${graphModuleUrl.href}${moduleSuffix}`);
-const bootstrapModuleUrl = new URL('../../cli/services/bootstrapManifest.js', import.meta.url);
+const bootstrapModuleUrl = new URL('../../cli/utils/runtime/bootstrapManifest.js', import.meta.url);
 const bootstrapModule = await import(`${bootstrapModuleUrl.href}${moduleSuffix}`);
 const {
     classifyDependencyGraphWaitMode,

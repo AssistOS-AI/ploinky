@@ -14,8 +14,8 @@ import {
     readAuthenticatedAgentTask,
 } from '../../mcp-proxy/index.js';
 import { waitForAgentReady } from '../../utils/agentReadiness.js';
-import * as agentsSvc from '../../../services/agents.js';
-import { resolveAgentReadinessProtocol } from '../../../services/startupReadiness.js';
+import * as agentsSvc from '../../../utils/agents.js';
+import { resolveAgentReadinessProtocol } from '../../../utils/runtime/startupReadiness.js';
 import { broadcastTaskUpdate } from './runtimeState.js';
 
 const MAX_CONTINUATION_MESSAGE_BYTES = 32 * 1024;

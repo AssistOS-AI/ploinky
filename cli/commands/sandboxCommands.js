@@ -1,7 +1,7 @@
 import {
     getSandboxStatus,
     setHostSandboxDisabled,
-} from '../services/sandboxRuntime.js';
+} from '../utils/runtime/sandboxRuntime.js';
 
 function printSandboxStatus(status = getSandboxStatus()) {
     const state = status.disabled ? 'disabled' : 'enabled';

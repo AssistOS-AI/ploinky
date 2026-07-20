@@ -12,7 +12,7 @@ import { fileURLToPath } from 'node:url';
 import { createMemoryReplayCache } from '../../Agent/lib/jwtVerify.mjs';
 import { computeRchHttp } from '../../Agent/lib/requestHash.mjs';
 import { verifyRouterRequestToken } from '../../Agent/lib/requestSignedTokens.mjs';
-import { deriveAgentRequestSecret } from '../../cli/services/masterKey.js';
+import { deriveAgentRequestSecret } from '../../cli/utils/security/masterKey.js';
 import { acceptWebSocketUpgrade, WebSocket } from '../../cli/server/utils/websocket.js';
 
 const __filename = fileURLToPath(import.meta.url);

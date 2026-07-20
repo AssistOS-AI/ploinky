@@ -6,7 +6,7 @@ import {
     removeInactiveManualRoutes,
     resolveManifestStartup,
     shouldMonitorManifestRuntime,
-} from '../../cli/services/manifestStartup.js';
+} from '../../cli/utils/runtime/manifestStartup.js';
 
 test('manifest startup defaults to automatic and accepts only explicit supported values', () => {
     assert.equal(resolveManifestStartup({}), 'automatic');

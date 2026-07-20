@@ -18,7 +18,7 @@ const {
     deriveSubkey,
     resolveMasterKey,
     MASTER_KEY_VAR,
-} = await import(`../../cli/services/masterKey.js${moduleSuffix}`);
+} = await import(`../../cli/utils/security/masterKey.js${moduleSuffix}`);
 
 process.env[MASTER_KEY_VAR] = 'f'.repeat(64);
 

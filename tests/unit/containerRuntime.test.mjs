@@ -10,12 +10,12 @@ import {
     hasPreinstallRunInProcess,
     markPreinstallRunInProcess,
     resetPreinstallRunInProcess,
-} from '../../cli/services/lifecycleHooks.js';
-import { buildExecArgs } from '../../cli/services/docker/interactive.js';
+} from '../../cli/utils/runtime/lifecycleHooks.js';
+import { buildExecArgs } from '../../cli/sandbox/docker/interactive.js';
 
 const repoRoot = path.resolve(fileURLToPath(new URL('../..', import.meta.url)));
-const agentServiceManagerUrl = pathToFileURL(path.join(repoRoot, 'cli/services/docker/agentServiceManager.js')).href;
-const dockerCommonUrl = pathToFileURL(path.join(repoRoot, 'cli/services/docker/common.js')).href;
+const agentServiceManagerUrl = pathToFileURL(path.join(repoRoot, 'cli/sandbox/docker/agentServiceManager.js')).href;
+const dockerCommonUrl = pathToFileURL(path.join(repoRoot, 'cli/sandbox/docker/common.js')).href;
 
 function tempDir(prefix = 'ploinky-runtime-test-') {
     return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
@@ -289,7 +289,7 @@ esac
         }));
 
         const result = runModuleSnippet(
-            `const { enableAgent } = await import(${JSON.stringify(pathToFileURL(path.join(repoRoot, 'cli/services/agents.js')).href)});
+            `const { enableAgent } = await import(${JSON.stringify(pathToFileURL(path.join(repoRoot, 'cli/utils/agents.js')).href)});
 enableAgent('repo/demo', 'global');
 const fs = await import('node:fs');
 const path = await import('node:path');
@@ -501,7 +501,7 @@ esac
         fs.chmodSync(podmanPath, 0o755);
 
         const result = runModuleSnippet(
-            `import { collectLiveAgentContainers } from './cli/services/docker/containerRegistry.js';
+            `import { collectLiveAgentContainers } from './cli/sandbox/docker/containerRegistry.js';
 process.stdout.write(JSON.stringify(collectLiveAgentContainers()));`,
             { PATH: binDir },
         );
@@ -522,7 +522,7 @@ test('collectLiveAgentContainers is non-fatal when no container runtime is insta
     const emptyBin = tempDir();
     try {
         const result = runModuleSnippet(
-            `import { collectLiveAgentContainers } from './cli/services/docker/containerRegistry.js';
+            `import { collectLiveAgentContainers } from './cli/sandbox/docker/containerRegistry.js';
 process.stdout.write(JSON.stringify(collectLiveAgentContainers()));`,
             { PATH: emptyBin },
         );

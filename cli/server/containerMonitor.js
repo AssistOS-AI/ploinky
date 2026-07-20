@@ -3,14 +3,14 @@ import path from 'path';
 import { Worker } from 'worker_threads';
 import { fileURLToPath } from 'url';
 
-import * as workspaceSvc from '../services/workspace.js';
-import { REPOS_DIR, RUNNING_DIR } from '../services/config.js';
-import { mergeRoutingConfig, readRoutingConfig } from '../services/routingFile.js';
-import { shouldMonitorManifestRuntime } from '../services/manifestStartup.js';
-import { inspectMaintenanceLock } from '../services/maintenanceLocks.js';
-import { ensureAgentService, isContainerRunning } from '../services/docker/index.js';
-import { isSandboxRuntime } from '../services/docker/common.js';
-import { isBwrapProcessRunning } from '../services/bwrap/bwrapFleet.js';
+import * as workspaceSvc from '../utils/workspace.js';
+import { REPOS_DIR, RUNNING_DIR } from '../utils/config.js';
+import { mergeRoutingConfig, readRoutingConfig } from './routingFile.js';
+import { shouldMonitorManifestRuntime } from '../utils/runtime/manifestStartup.js';
+import { inspectMaintenanceLock } from '../utils/runtime/maintenanceLocks.js';
+import { ensureAgentService, isContainerRunning } from '../sandbox/docker/index.js';
+import { isSandboxRuntime } from '../sandbox/docker/common.js';
+import { isBwrapProcessRunning } from '../sandbox/bwrap/bwrapFleet.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);

@@ -1,5 +1,5 @@
-import { resolveEnabledAgentRecord } from '../services/agents.js';
-import { deriveAgentPrincipalId } from '../services/agentIdentity.js';
+import { resolveEnabledAgentRecord } from '../utils/agents.js';
+import { deriveAgentPrincipalId } from '../utils/security/agentIdentity.js';
 import { verifyAgentAssertion, buildRouterRequest } from './mcp-proxy/invocationMinter.js';
 import { createTokenReplayCache } from './security/tokens/JwsCodec.js';
 import { computeRchHttp, sha256RawBodyHash } from '../../Agent/lib/requestHash.mjs';

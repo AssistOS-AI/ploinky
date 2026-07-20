@@ -4,10 +4,10 @@ import { fileURLToPath, pathToFileURL } from 'url';
 
 import { createSessionStore } from './sessionStore.js';
 import { randomId } from './utils.js';
-import { resolveVarValue } from '../../services/secretVars.js';
-import { getConfig as getWorkspaceConfig } from '../../services/workspace.js';
-import { resolveAgentDescriptor } from '../../services/agentRegistry.js';
-import { findAgent } from '../../services/utils.js';
+import { resolveVarValue } from '../../utils/security/secretVars.js';
+import { getConfig as getWorkspaceConfig } from '../../utils/workspace.js';
+import { resolveAgentDescriptor } from '../../utils/agentRegistry.js';
+import { findAgent } from '../../utils/utils.js';
 
 /**
  * genericAuthBridge.js

@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { getDefaultBootRepos } from '../../cli/services/repos.js';
+import { getDefaultBootRepos } from '../../cli/utils/repos.js';
 
 test('default boot repos include basic, AchillesIDE, AchillesCLI, and copilot-agents', () => {
     const names = getDefaultBootRepos().map(repo => repo.name);

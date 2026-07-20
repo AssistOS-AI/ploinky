@@ -20,7 +20,7 @@ Shell scripts must remain explicit and defensive. New shell entry points and tes
 
 JSON files that are edited directly in the repository should use two-space indentation. This applies to repository-managed documentation metadata, manifests, workspace examples, and other hand-maintained JSON content.
 
-Source files should stay close to the subsystem they extend. Router and browser-surface logic belongs under `cli/server/`. CLI command handlers belong under `cli/commands/`. Shared runtime services belong under `cli/services/`. Shared agent payload belongs under `Agent/`. Test shell fragments belong under `tests/`, using the existing stage, helper, and unit-test split.
+Source files should stay close to the subsystem they extend. Router and browser-surface logic belongs under `cli/server/`. CLI command handlers belong under `cli/commands/`. Cross-subsystem utilities belong under `cli/utils/`, with cohesive dependency, runtime, and security helpers grouped in subdirectories. Runtime backend implementations belong under `cli/sandbox/`, whose immediate children are `bwrap/`, `docker/`, and `seatbelt/`. Shared agent payload belongs under `Agent/`. Test shell fragments belong under `tests/`, using the existing stage, helper, and unit-test split.
 
 Documentation is part of the style contract. When behavior changes, the change set must update the affected HTML pages under `docs/`, the relevant DS files under `docs/specs/`, and `docs/ploinky-overview.md` when CLI or LLM helper behavior changed. `docs/specs/matrix.md` must be regenerated instead of edited manually.
 

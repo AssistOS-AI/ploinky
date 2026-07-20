@@ -11,10 +11,10 @@ process.chdir(tempDir);
 process.env.PLOINKY_MASTER_KEY = '5'.repeat(64);
 
 const moduleSuffix = `?test=${Date.now()}`;
-const profileServiceUrl = new URL('../../cli/services/profileService.js', import.meta.url);
-const secretInjectorUrl = new URL('../../cli/services/secretInjector.js', import.meta.url);
-const workspaceStructureUrl = new URL('../../cli/services/workspaceStructure.js', import.meta.url);
-const encryptedSecretsUrl = new URL('../../cli/services/encryptedSecretsFile.js', import.meta.url);
+const profileServiceUrl = new URL('../../cli/utils/runtime/profileService.js', import.meta.url);
+const secretInjectorUrl = new URL('../../cli/utils/security/secretInjector.js', import.meta.url);
+const workspaceStructureUrl = new URL('../../cli/utils/workspaceStructure.js', import.meta.url);
+const encryptedSecretsUrl = new URL('../../cli/utils/security/encryptedSecretsFile.js', import.meta.url);
 
 const profileService = await import(`${profileServiceUrl.href}${moduleSuffix}`);
 const secretInjector = await import(`${secretInjectorUrl.href}${moduleSuffix}`);

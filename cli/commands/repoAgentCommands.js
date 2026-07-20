@@ -1,22 +1,22 @@
 import fs from 'fs';
 import path from 'path';
-import { PLOINKY_DIR } from '../services/config.js';
-import { showHelp } from '../services/help.js';
-import * as reposSvc from '../services/repos.js';
-import * as agentsSvc from '../services/agents.js';
-import * as skillsSvc from '../services/skills.js';
-import * as workspaceSvc from '../services/workspace.js';
+import { PLOINKY_DIR } from '../utils/config.js';
+import { showHelp } from './help.js';
+import * as reposSvc from '../utils/repos.js';
+import * as agentsSvc from '../utils/agents.js';
+import * as skillsSvc from './skills.js';
+import * as workspaceSvc from '../utils/workspace.js';
 import {
     refreshAchillesDependenciesInRepos,
     refreshPloinkyRuntimeAchillesDependency,
     resolveMovingGitDepCommits,
     resolvePloinkyRoot,
     updatePloinkySelf,
-} from '../services/updateService.js';
-import { invalidateDepsCacheForMovingGitDeps } from '../services/dependencyCache.js';
-import { readGlobalDepsPackage } from '../services/dependencyInstaller.js';
-import { collectAgentsSummary } from '../services/status.js';
-import { findAgent } from '../services/utils.js';
+} from './updateService.js';
+import { invalidateDepsCacheForMovingGitDeps } from '../utils/dependencies/dependencyCache.js';
+import { readGlobalDepsPackage } from '../utils/dependencies/dependencyInstaller.js';
+import { collectAgentsSummary } from '../utils/status.js';
+import { findAgent } from '../utils/utils.js';
 
 const REPOS_DIR = path.join(PLOINKY_DIR, 'repos');
 const DEFAULT_SKILLS_REPO_NAME = 'AchillesCopilotBasicSkills';

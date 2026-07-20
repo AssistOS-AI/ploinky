@@ -1,4 +1,4 @@
-import { readRouterSettings } from '../../services/routerSettings.js';
+import { readRouterSettings } from '../auth/routerSettings.js';
 import { escapeHtml, normalizeRelativePath } from './shared.js';
 
 function renderLoggedOutHtml(nextPath) {

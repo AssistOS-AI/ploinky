@@ -6,7 +6,7 @@ import {
     readManifestStartCommand,
     resolveAgentExecutionMode,
     resolveAgentReadinessProtocol
-} from '../../cli/services/startupReadiness.js';
+} from '../../cli/utils/runtime/startupReadiness.js';
 
 test('read manifest commands trims explicit start and agent values', () => {
     const manifest = {

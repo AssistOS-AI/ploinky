@@ -2,13 +2,13 @@ import fs from 'fs';
 import path from 'path';
 import { execSync } from 'child_process';
 import { appendLog } from '../server/utils/logger.js';
-import { DEPS_DIR, ROUTING_FILE, RUNNING_DIR } from '../services/config.js';
+import { DEPS_DIR, ROUTING_FILE, RUNNING_DIR } from '../utils/config.js';
 import {
     addSessionContainer,
     cleanupSessionSet,
     destroyWorkspaceContainers
-} from '../services/docker/index.js';
-import { debugLog } from '../services/utils.js';
+} from '../sandbox/docker/index.js';
+import { debugLog } from '../utils/utils.js';
 
 function registerSessionContainer(name) {
     try { addSessionContainer(name); } catch (_) { }

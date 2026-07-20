@@ -4,8 +4,8 @@ import assert from 'node:assert/strict';
 process.env.PLOINKY_MASTER_KEY = process.env.PLOINKY_MASTER_KEY || '5'.repeat(64);
 
 const suffix = `?t=${Date.now()}`;
-const depInstUrl = new URL('../../cli/services/dependencyInstaller.js', import.meta.url);
-const depCacheUrl = new URL('../../cli/services/dependencyCache.js', import.meta.url);
+const depInstUrl = new URL('../../cli/utils/dependencies/dependencyInstaller.js', import.meta.url);
+const depCacheUrl = new URL('../../cli/utils/dependencies/dependencyCache.js', import.meta.url);
 
 const { readGlobalDepsPackage } = await import(`${depInstUrl.href}${suffix}`);
 const { resolveGlobalCacheManifest } = await import(`${depCacheUrl.href}${suffix}`);
