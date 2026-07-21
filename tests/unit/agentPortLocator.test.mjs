@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { locateAgentPort } from '../../cli/server/agentPortConvention/locator.js';
+import { getAgentPortLocatorAccess, locateAgentPort } from '../../cli/server/agentPortConvention/locator.js';
 import { compileGeneration } from '../../cli/server/generation/compileGeneration.js';
 import { generationInput } from './routingProxyTestFixtures.mjs';
 
@@ -13,6 +13,14 @@ test('locator returns one authenticated, no-store, generation-bound public URL',
     assert.equal(result.cacheControl, 'no-store');
     assert.equal(JSON.stringify(result).includes('container'), false);
     assert.equal(JSON.stringify(result).includes('8081'), false);
+});
+test('locator authentication is bound to the selected route without inheriting its auth mode', () => {
+    assert.deepEqual(getAgentPortLocatorAccess('liveKitServerAgent'), {
+        access: 'authenticated',
+        routeKey: 'liveKitServerAgent',
+        source: 'agent-port-locator',
+    });
+    assert.throws(() => getAgentPortLocatorAccess(''), /route key required/);
 });
 test('locator fails closed for unauthenticated, inactive, missing, and denied selections', () => {
     const generation = compileGeneration(generationInput());

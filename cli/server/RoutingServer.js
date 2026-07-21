@@ -34,7 +34,7 @@ import { createRelayHttpAgent, executeHttpPlan, RelayDuplex } from './proxy/exec
 import { executeWebSocketPlan } from './proxy/executeWebSocketPlan.js';
 import { sanitizeRequestHeaders } from './proxy/sanitizeRequestHeaders.js';
 import { recordProxyOutcome } from './proxy/recordProxyOutcome.js';
-import { locateAgentPort } from './agentPortConvention/locator.js';
+import { getAgentPortLocatorAccess, locateAgentPort } from './agentPortConvention/locator.js';
 import { AGENT_PORT_CONVENTION_ROUTE_KEY } from '../utils/runtime/reservedRouteKeys.js';
 import { ROUTING_FILE } from '../utils/config.js';
 import { buildStatusLine, createCapturingRes } from './wsServiceProxy.js';
@@ -663,13 +663,19 @@ async function processRequest(req, res) {
     }
 
     if (pathname === '/api/agent-port-locator') {
-        const authResult = await ensureAuthenticated(req, res, parsedUrl);
-        if (!authResult.ok || !req.user) return;
         const routeKey = String(parsedUrl.searchParams.get('agent') || '').trim();
         const selectedPort = Number(parsedUrl.searchParams.get('port'));
         const policyPath = `/${AGENT_PORT_CONVENTION_ROUTE_KEY}/${encodeURIComponent(routeKey)}/${selectedPort}/`;
         let locatorLease;
         try {
+            const authResult = await ensureHttpRouteAccess(
+                req,
+                res,
+                parsedUrl,
+                getAgentPortLocatorAccess(routeKey),
+            );
+            if (!authResult.ok) return;
+            if (!req.user) throw new Error('locator authentication did not produce a user');
             locatorLease = routingRuntime.acquire({ listenerClass: 'public', authority: req.headers.host });
             const plan = routingRuntime.resolveConvention({
                 lease: locatorLease,

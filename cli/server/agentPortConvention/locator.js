@@ -1,5 +1,15 @@
 import { AGENT_PORT_CONVENTION_ROUTE_KEY } from '../../utils/runtime/reservedRouteKeys.js';
 
+export function getAgentPortLocatorAccess(routeKey) {
+    const normalizedRouteKey = String(routeKey || '').trim();
+    if (!normalizedRouteKey) throw new Error('agentPortLocator: route key required');
+    return Object.freeze({
+        access: 'authenticated',
+        routeKey: normalizedRouteKey,
+        source: 'agent-port-locator',
+    });
+}
+
 export function locateAgentPort({ generation, routeKey, port, authenticated = false } = {}) {
     if (authenticated !== true) throw new Error('agentPortLocator: authenticated user required');
     if (!generation?.active) throw new Error('agentPortLocator: no active generation');
