@@ -138,6 +138,14 @@
 
 <div class="wa-composer">
     <div id="filePreviewContainer" class="wa-file-preview-container"></div>
+    <section id="interactionPrompt" class="wa-interaction-prompt" role="dialog" aria-modal="true" aria-labelledby="interactionPromptTitle" tabindex="-1" hidden>
+        <div class="wa-interaction-copy">
+            <strong id="interactionPromptTitle"></strong>
+            <span id="interactionPromptMessage"></span>
+            <code id="interactionPromptDetail"></code>
+        </div>
+        <div id="interactionPromptOptions" class="wa-interaction-options" role="listbox" aria-label="Available actions"></div>
+    </section>
     <div class="wa-composer-main">
         <div class="wa-attachment-container">
             <button class="wa-icon-btn" id="attachmentBtn" title="Attach">

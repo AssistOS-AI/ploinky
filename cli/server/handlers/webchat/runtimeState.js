@@ -14,6 +14,10 @@ const MAX_PENDING_SSE_EVENTS = 200;
 const MAX_RUNTIME_MODEL_LENGTH = 256;
 const PROCESS_PREFIX_RE = /^(?:\s*\.+\s*){3,}/;
 const WEBCHAT_RUNTIME_STATE_FLAG = '__webchatRuntimeState';
+const WEBCHAT_INTERACTION_FLAG = '__webchatInteraction';
+const WEBCHAT_INTERACTION_RESOLVED_FLAG = '__webchatInteractionResolved';
+const INTERACTION_ID_RE = /^[A-Za-z0-9_-]{8,128}$/;
+const INTERACTION_TOKEN_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 
 function stripCtrlAndAnsi(input) {
     try {
@@ -262,6 +266,67 @@ export function serializeRuntimeStateSseEvent(state) {
     return `event: runtime-state\ndata: ${JSON.stringify({ model })}\n\n`;
 }
 
+function normalizeInteractionText(value, maxLength, { required = false } = {}) {
+    if (typeof value !== 'string' || value.includes('\0')) return required ? undefined : '';
+    const text = value.trim();
+    if ((required && !text) || text.length > maxLength) return undefined;
+    return text;
+}
+
+export function parseWebchatInteraction(envelope) {
+    if (!envelope || typeof envelope !== 'object' || !envelope[WEBCHAT_INTERACTION_FLAG]) return undefined;
+    if (envelope.version !== 1) return undefined;
+    const id = normalizeInteractionText(envelope.id, 128, { required: true });
+    const kind = normalizeInteractionText(envelope.kind, 64, { required: true });
+    const title = normalizeInteractionText(envelope.title, 120, { required: true });
+    const message = normalizeInteractionText(envelope.message, 1000);
+    const detail = normalizeInteractionText(envelope.detail, 4000);
+    if (!id || !INTERACTION_ID_RE.test(id) || !kind || !INTERACTION_TOKEN_RE.test(kind) || !title) return undefined;
+    if (message === undefined || detail === undefined) return undefined;
+    if (!Array.isArray(envelope.options) || envelope.options.length < 1 || envelope.options.length > 8) return undefined;
+    const seen = new Set();
+    const options = [];
+    for (const raw of envelope.options) {
+        const optionId = normalizeInteractionText(raw?.id, 64, { required: true });
+        const label = normalizeInteractionText(raw?.label, 100, { required: true });
+        if (!optionId || !INTERACTION_TOKEN_RE.test(optionId) || !label || seen.has(optionId)) return undefined;
+        seen.add(optionId);
+        options.push({
+            id: optionId,
+            label,
+            tone: raw?.tone === 'danger' ? 'danger' : 'default',
+        });
+    }
+    const requestedDefault = normalizeInteractionText(envelope.defaultOptionId, 64);
+    const defaultOptionId = seen.has(requestedDefault) ? requestedDefault : options[0].id;
+    return { id, kind, title, message, detail, options, defaultOptionId };
+}
+
+export function parseWebchatInteractionResolved(envelope) {
+    if (!envelope || typeof envelope !== 'object' || !envelope[WEBCHAT_INTERACTION_RESOLVED_FLAG]) return undefined;
+    if (envelope.version !== 1) return undefined;
+    const id = normalizeInteractionText(envelope.id, 128, { required: true });
+    const optionId = envelope.optionId === null ? null : normalizeInteractionText(envelope.optionId, 64);
+    const status = normalizeInteractionText(envelope.status, 64, { required: true });
+    if (!id || !INTERACTION_ID_RE.test(id) || !status || !INTERACTION_TOKEN_RE.test(status)) return undefined;
+    if (optionId !== null && (!optionId || !INTERACTION_TOKEN_RE.test(optionId))) return undefined;
+    return { id, optionId, status };
+}
+
+export function serializeInteractionRequestSseEvent(interaction) {
+    const normalized = parseWebchatInteraction({ [WEBCHAT_INTERACTION_FLAG]: 1, version: 1, ...interaction });
+    return normalized ? `event: interaction-request\ndata: ${JSON.stringify(normalized)}\n\n` : '';
+}
+
+export function serializeInteractionResolvedSseEvent(resolution) {
+    const normalized = parseWebchatInteractionResolved({
+        [WEBCHAT_INTERACTION_RESOLVED_FLAG]: 1,
+        version: 1,
+        ...resolution,
+    });
+    return normalized ? `event: interaction-resolved\ndata: ${JSON.stringify(normalized)}\n\n` : '';
+}
+
 export function getRuntimeMap(appState) {
     if (!(appState.runtimes instanceof Map)) appState.runtimes = new Map();
     return appState.runtimes;
@@ -304,6 +369,30 @@ function routeCompleteOutputLine(appState, tab, line) {
     if (pendingClientText && looksLikeReadlinePromptEcho(normalized, pendingClientText)) {
         tab.workspaceHistory.lastClientText = '';
         return;
+    }
+    if (normalized.includes(`"${WEBCHAT_INTERACTION_FLAG}"`)) {
+        try {
+            const interaction = parseWebchatInteraction(JSON.parse(normalized));
+            if (interaction) {
+                tab.pendingInteraction = interaction;
+                writeOrBufferSseEvent(tab, serializeInteractionRequestSseEvent(interaction));
+                return;
+            }
+        } catch (_) {
+            // Invalid interaction envelopes fall through as ordinary agent output.
+        }
+    }
+    if (normalized.includes(`"${WEBCHAT_INTERACTION_RESOLVED_FLAG}"`)) {
+        try {
+            const resolution = parseWebchatInteractionResolved(JSON.parse(normalized));
+            if (resolution) {
+                if (tab.pendingInteraction?.id === resolution.id) tab.pendingInteraction = null;
+                writeOrBufferSseEvent(tab, serializeInteractionResolvedSseEvent(resolution));
+                return;
+            }
+        } catch (_) {
+            // Invalid interaction resolution envelopes fall through as ordinary agent output.
+        }
     }
     if (normalized.includes(`"${WEBCHAT_RUNTIME_STATE_FLAG}"`)) {
         try {
@@ -383,7 +472,11 @@ export function routeWorkspaceRuntimeOutput(appState, tab, data) {
     const isTaskProtocol = '{"__webchatTask"'.startsWith(trimmed) || trimmed.includes('"__webchatTask"');
     const isRuntimeStateProtocol = `{"${WEBCHAT_RUNTIME_STATE_FLAG}"`.startsWith(trimmed)
         || trimmed.includes(`"${WEBCHAT_RUNTIME_STATE_FLAG}"`);
-    if (trimmed.startsWith('{') && (isTaskProtocol || isRuntimeStateProtocol)) {
+    const isInteractionProtocol = `{"${WEBCHAT_INTERACTION_FLAG}"`.startsWith(trimmed)
+        || trimmed.includes(`"${WEBCHAT_INTERACTION_FLAG}"`)
+        || `{"${WEBCHAT_INTERACTION_RESOLVED_FLAG}"`.startsWith(trimmed)
+        || trimmed.includes(`"${WEBCHAT_INTERACTION_RESOLVED_FLAG}"`);
+    if (trimmed.startsWith('{') && (isTaskProtocol || isRuntimeStateProtocol || isInteractionProtocol)) {
         tab.taskProtocolBuffer = pending;
         return;
     }
@@ -453,7 +546,9 @@ export function disposeTab(tab, tabId, session) {
     if (tab.taskProtocolBuffer) {
         const pendingProtocol = stripCtrlAndAnsi(tab.taskProtocolBuffer).trimStart();
         const isControlEnvelope = pendingProtocol.includes('"__webchatTask"')
-            || pendingProtocol.includes(`"${WEBCHAT_RUNTIME_STATE_FLAG}"`);
+            || pendingProtocol.includes(`"${WEBCHAT_RUNTIME_STATE_FLAG}"`)
+            || pendingProtocol.includes(`"${WEBCHAT_INTERACTION_FLAG}"`)
+            || pendingProtocol.includes(`"${WEBCHAT_INTERACTION_RESOLVED_FLAG}"`);
         if (!isControlEnvelope) captureWorkspaceHistoryOutput(tab, tab.taskProtocolBuffer);
         tab.taskProtocolBuffer = '';
     }

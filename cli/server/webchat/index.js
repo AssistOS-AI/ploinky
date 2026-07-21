@@ -11,6 +11,7 @@ import { createAutocompleteState } from './autocompleteState.js';
 import { createComposerMentionHighlighter } from './composerMentionHighlights.js';
 import { createSessionController } from './sessions.js';
 import { createTaskController } from './tasks.js';
+import { createInteractionPrompt } from './interactionPrompt.js';
 
 const PURGE_TRIGGER_RE = /\bpurge\b/i;
 const EDITABLE_TAGS = ['INPUT', 'TEXTAREA', 'SELECT', 'OPTION'];
@@ -67,7 +68,12 @@ const {
     tasksDialogClose,
     tasksList,
     taskDetail,
-    taskToast
+    taskToast,
+    interactionPrompt,
+    interactionPromptTitle,
+    interactionPromptMessage,
+    interactionPromptDetail,
+    interactionPromptOptions
 } = elements;
 
 const sidePanelApi = createSidePanel({
@@ -82,6 +88,8 @@ const sidePanelApi = createSidePanel({
 
 let sessionController = null;
 let taskController = null;
+let interactionController = null;
+let composerAutocomplete = null;
 taskController = createTaskController({
     toEndpoint,
     elements: {
@@ -143,6 +151,8 @@ const network = createNetwork({
         messages.associateTask(payload);
     },
     onRuntimeState: (state) => dom.setRuntimeModel(state?.model),
+    onInteractionRequest: (interaction) => interactionController?.show(interaction),
+    onInteractionResolved: (resolution) => interactionController?.resolve(resolution),
     onConnected: () => taskController?.refresh().catch(() => {})
 });
 
@@ -170,6 +180,21 @@ const composer = createComposer({
     purgeTriggerRe: PURGE_TRIGGER_RE
 });
 
+interactionController = createInteractionPrompt({
+    root: interactionPrompt,
+    title: interactionPromptTitle,
+    message: interactionPromptMessage,
+    detail: interactionPromptDetail,
+    options: interactionPromptOptions,
+}, {
+    onSubmit: (interactionId, optionId) => network.sendInteractionResponse(interactionId, optionId),
+    onActiveChange: (active) => {
+        composer.setInteractionState(active);
+        attachmentBtn?.toggleAttribute?.('disabled', active);
+        if (active) composerAutocomplete?.hide?.();
+    },
+});
+
 const autocompleteState = createAutocompleteState();
 const mentionHighlighter = createComposerMentionHighlighter({ cmdInput });
 
@@ -184,7 +209,7 @@ const workspacePathsProvider = createWorkspacePathsProvider({
     dlog
 });
 
-const composerAutocomplete = createComposerAutocomplete({
+composerAutocomplete = createComposerAutocomplete({
     cmdInput
 }, {
     providers: [slashProvider, workspacePathsProvider],

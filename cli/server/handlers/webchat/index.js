@@ -166,7 +166,8 @@ export async function handleWebChat(req, res, appConfig, appState) {
 
     if (pathname === '/stream'
         || (pathname === '/input' && req.method === 'POST')
-        || (pathname === '/control' && req.method === 'POST')) {
+        || (pathname === '/control' && req.method === 'POST')
+        || (pathname === '/interaction' && req.method === 'POST')) {
         return handleRuntimeRoute({
             pathname,
             req,

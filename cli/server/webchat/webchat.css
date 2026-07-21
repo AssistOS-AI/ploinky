@@ -1925,6 +1925,62 @@ body {
     padding: 0 14px 14px;
 }
 
+.wa-interaction-prompt {
+    width: min(760px, 100%);
+    margin: 0 auto 10px;
+    padding: 14px;
+    border: 1px solid var(--wa-border);
+    border-radius: 18px;
+    background: var(--wa-bg-panel);
+    box-shadow: 0 12px 30px rgba(17, 27, 33, 0.16);
+    outline: none;
+}
+
+.wa-interaction-copy {
+    display: grid;
+    gap: 5px;
+    margin-bottom: 12px;
+}
+
+.wa-interaction-copy code {
+    display: block;
+    overflow-x: auto;
+    padding: 8px 10px;
+    border-radius: 10px;
+    background: var(--wa-bg-hover);
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+}
+
+.wa-interaction-options {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+}
+
+.wa-interaction-option {
+    padding: 8px 14px;
+    border: 1px solid var(--wa-border);
+    border-radius: 999px;
+    background: transparent;
+    color: var(--wa-text-primary);
+    cursor: pointer;
+}
+
+.wa-interaction-option.is-selected {
+    border-color: var(--wa-accent);
+    background: var(--wa-accent);
+    color: white;
+}
+
+.wa-interaction-option.is-danger:not(.is-selected) {
+    color: #b42318;
+}
+
+.wa-interaction-prompt.is-submitting {
+    opacity: 0.72;
+}
+
 .wa-composer-main {
     display: flex;
     align-items: flex-end;

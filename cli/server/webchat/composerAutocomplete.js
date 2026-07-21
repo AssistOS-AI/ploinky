@@ -410,6 +410,7 @@ export function createComposerAutocomplete({ cmdInput }, { providers = [], dlog,
         onInputChange,
         handleKeydown,
         refresh,
+        hide: () => hideMenu({ invalidatePending: true }),
         destroy,
         get isActive() { return active; }
     };

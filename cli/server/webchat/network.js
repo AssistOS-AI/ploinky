@@ -128,11 +128,40 @@ function parseRuntimeStatePayload(text) {
     }
 }
 
+function parseInteractionPayload(text) {
+    try {
+        const payload = typeof text === 'string' ? JSON.parse(text) : text;
+        if (!payload || typeof payload !== 'object') return null;
+        const id = typeof payload.id === 'string' ? payload.id.trim() : '';
+        const kind = typeof payload.kind === 'string' ? payload.kind.trim() : '';
+        const title = typeof payload.title === 'string' ? payload.title.trim() : '';
+        const options = Array.isArray(payload.options)
+            ? payload.options.filter((option) => option && typeof option.id === 'string' && typeof option.label === 'string')
+            : [];
+        if (!id || !kind || !title || options.length === 0) return null;
+        return { ...payload, id, kind, title, options };
+    } catch (_) {
+        return null;
+    }
+}
+
+function parseInteractionResolutionPayload(text) {
+    try {
+        const payload = typeof text === 'string' ? JSON.parse(text) : text;
+        const id = typeof payload?.id === 'string' ? payload.id.trim() : '';
+        return id ? { ...payload, id } : null;
+    } catch (_) {
+        return null;
+    }
+}
+
 Object.assign(__testables, {
     serializeEnvelope,
     normalizeClientReference,
     parseProgressEnvelope,
     parseRuntimeStatePayload,
+    parseInteractionPayload,
+    parseInteractionResolutionPayload,
 });
 
 export { serializeEnvelope, normalizeClientReference };
@@ -158,6 +187,8 @@ export function createNetwork({
     onSessionChanged,
     onTaskUpdate,
     onRuntimeState,
+    onInteractionRequest,
+    onInteractionResolved,
     onConnected
 }) {
     let es = null;
@@ -397,6 +428,20 @@ export function createNetwork({
             }
         });
 
+        es.addEventListener('interaction-request', (event) => {
+            const interaction = parseInteractionPayload(event.data);
+            if (interaction && typeof onInteractionRequest === 'function') {
+                onInteractionRequest(interaction);
+            }
+        });
+
+        es.addEventListener('interaction-resolved', (event) => {
+            const resolution = parseInteractionResolutionPayload(event.data);
+            if (resolution && typeof onInteractionResolved === 'function') {
+                onInteractionResolved(resolution);
+            }
+        });
+
     }
 
     function stop() {
@@ -628,6 +673,22 @@ export function createNetwork({
         });
     }
 
+    function sendInteractionResponse(interactionId, optionId) {
+        return fetch(toEndpoint(sessionEndpoint(`interaction?tabId=${TAB_ID}`)), {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ interactionId, optionId }),
+            credentials: 'include'
+        }).then((response) => {
+            if (!response.ok) throw new Error(`interaction_failed_${response.status}`);
+            return response;
+        }).catch((error) => {
+            dlog('interaction response error', error);
+            showBanner('Approval response failed', 'err');
+            throw error;
+        });
+    }
+
     return {
         start,
         stop,
@@ -636,6 +697,7 @@ export function createNetwork({
             if (normalized === sessionId) return;
             sessionId = normalized;
             assistantMessageIndex = null;
+            if (typeof onInteractionResolved === 'function') onInteractionResolved({ id: null, status: 'session-changed' });
             if (restart) {
                 stop();
                 start();
@@ -645,6 +707,7 @@ export function createNetwork({
         sendCommand,
         sendQuickCommand,
         sendAttachments,
-        sendControl
+        sendControl,
+        sendInteractionResponse
     };
 }

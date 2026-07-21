@@ -69,6 +69,11 @@ export function initDom() {
     const fileUploadInput = document.getElementById('fileUploadInput');
     const folderUploadInput = document.getElementById('folderUploadInput');
     const filePreviewContainer = document.getElementById('filePreviewContainer');
+    const interactionPrompt = document.getElementById('interactionPrompt');
+    const interactionPromptTitle = document.getElementById('interactionPromptTitle');
+    const interactionPromptMessage = document.getElementById('interactionPromptMessage');
+    const interactionPromptDetail = document.getElementById('interactionPromptDetail');
+    const interactionPromptOptions = document.getElementById('interactionPromptOptions');
     const sessionsBtn = document.getElementById('sessionsBtn');
     const historyGate = document.getElementById('historyGate');
     const loadHistoryBtn = document.getElementById('loadHistoryBtn');
@@ -279,6 +284,11 @@ export function initDom() {
             fileUploadInput,
             folderUploadInput,
             filePreviewContainer,
+            interactionPrompt,
+            interactionPromptTitle,
+            interactionPromptMessage,
+            interactionPromptDetail,
+            interactionPromptOptions,
             attachmentContainer,
             sessionsBtn,
             historyGate,

@@ -101,6 +101,12 @@ The session upload directory is a per-session UX convenience scope. It must not 
 
 WebChat must also expose a Cancel button during active agent processing. The Cancel button sends a raw control sequence (ESC, `\x1b`) to the agent's TTY session via a dedicated `/webchat/control` endpoint. The agent must interpret this as an interrupt signal and abort the current operation. The Cancel button replaces the Send button while processing is active and reverts when the agent produces output or the session closes.
 
+WebChat may receive a generic `__webchatInteraction` line envelope from the selected CLI while a turn is running. Version 1 carries a unique interaction id, a kind, bounded title/message/detail text, an ordered list of option ids and labels, and one default option id. The runtime must intercept valid envelopes before transcript rendering or history capture, retain only the currently pending interaction in memory, emit it as a named `interaction-request` SSE event, and replay the pending snapshot after EventSource reconnect. A matching `__webchatInteractionResolved` envelope clears that volatile state and emits `interaction-resolved`.
+
+While an interaction is active, the browser must disable ordinary prompt submission and show a dedicated choice selector above the composer. Arrow Up/Down moves through the agent-declared order with wrapping, Enter submits the selected option, and pointer selection submits the clicked option. The default choice must be selected on first render. The selector is control UI: its text and response must not become chat messages.
+
+The browser submits the decision to authenticated `POST /webchat/interaction` with the active tab id, session id, interaction id, and option id. The route must require an active subscriber for the same authenticated runtime, reject unknown or stale interactions and undeclared options, and write a structured interaction response to the selected CLI's TTY. The first valid response clears the browser-visible pending state; later responses for that interaction are rejected and cannot cause duplicate execution. Ploinky transports declared choices generically and must not assign semantics to option ids such as approval or denial.
+
 WebChat may receive structured progress metadata from chat agents through the
 same stdout/SSE stream. For a valid `__webchatProgress` envelope associated with
 the active assistant placeholder, WebChat must append only the trimmed,
@@ -384,6 +390,11 @@ agents stopped and removes their routes. Treating the user's continuation
 request as explicit activation restores that exact provider through the normal
 global enable lifecycle. Deduplicating activation and waiting for readiness
 avoid duplicate starts and immediate calls to an MCP server that is not ready.
+
+### Question #21: Why does a WebChat interaction use a dedicated endpoint and SSE events?
+
+Response:
+An interaction response controls an already running CLI request and is not a new user prompt. A dedicated authenticated endpoint can bind it to the active tab, folder session, request id, and declared option, while named SSE events keep the transient selector out of conversation history and allow it to recover after a transport reconnect.
 
 ## Conclusion
 
