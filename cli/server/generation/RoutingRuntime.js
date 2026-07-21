@@ -70,6 +70,7 @@ export class RoutingRuntime {
     close() {
         this.watcher?.close();
         this.watcher = null;
+        this.relayManager.close();
         this.store.deactivate();
     }
 
