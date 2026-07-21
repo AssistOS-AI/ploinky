@@ -155,10 +155,10 @@ function ensurePrefixedRepoInstalled(spec, branchPolicy) {
 
     const repoName = spec.slice(0, sepIdx);
     const repoPath = path.join(PLOINKY_DIR, 'repos', repoName);
-    if (fs.existsSync(repoPath)) return;
+    const repoExists = fs.existsSync(repoPath);
 
     const source = repos.resolveRepoSource(repoName);
-    if (!source?.url) {
+    if (!source?.url && !repoExists) {
         if (isStrictBranchPolicy(branchPolicy)) {
             throw new Error(`No URL configured for repo '${repoName}'.`);
         }
@@ -166,9 +166,13 @@ function ensurePrefixedRepoInstalled(spec, branchPolicy) {
     }
 
     try {
-        repos.ensureRepoInstalled(repoName, source.url, {
+        // Default boot repos may already exist on their default branch before
+        // manifest traversal establishes that they are real dependencies. Run
+        // them through the normal install helper even when present so the
+        // active branch policy is reconciled for every referenced repo.
+        repos.ensureRepoInstalled(repoName, source?.url, {
             branchPolicy,
-            branch: source.branch,
+            branch: source?.branch,
             stdio: 'inherit',
         });
     } catch (err) {

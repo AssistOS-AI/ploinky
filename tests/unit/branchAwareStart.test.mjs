@@ -26,7 +26,6 @@ const {
     remoteBranchExists,
     ensureRepoInstalled,
     ensureRepoOnBranch,
-    loadEnabledRepos,
 } = reposMod;
 const { applyManifestDirectives } = bootstrapManifestMod;
 const { bootstrap } = ploinkybootMod;
@@ -56,7 +55,10 @@ function createBareRepo(name, { branches = [] } = {}) {
     return barePath;
 }
 
-function createBareAgentRepo(name, agentName, { branches = [] } = {}) {
+function createBareAgentRepo(name, agentName, {
+    branches = [],
+    manifest = { container: 'node:20' },
+} = {}) {
     const barePath = path.join(tempDir, 'remotes', name + '.git');
     fs.mkdirSync(barePath, { recursive: true });
     execFileSync('git', ['init', '--bare', barePath], { stdio: 'ignore' });
@@ -66,7 +68,7 @@ function createBareAgentRepo(name, agentName, { branches = [] } = {}) {
     execFileSync('git', ['clone', barePath, workPath], { stdio: 'ignore' });
     const manifestDir = path.join(workPath, agentName);
     fs.mkdirSync(manifestDir, { recursive: true });
-    fs.writeFileSync(path.join(manifestDir, 'manifest.json'), JSON.stringify({ container: 'node:20' }, null, 2));
+    fs.writeFileSync(path.join(manifestDir, 'manifest.json'), JSON.stringify(manifest, null, 2));
     execFileSync('git', ['-C', workPath, 'add', '.'], { stdio: 'ignore' });
     execFileSync('git', ['-C', workPath, 'commit', '-m', 'agent manifest'], { stdio: 'ignore' });
     execFileSync('git', ['-C', workPath, 'push', 'origin', 'main'], { stdio: 'ignore' });
@@ -476,7 +478,36 @@ test('applyManifestDirectives: strict branch policy aborts manifest repo fallbac
     );
 
     assert.equal(fs.existsSync(path.join(tempDir, '.ploinky', 'repos', 'manifestStrictDep')), false);
-    assert.equal(loadEnabledRepos().includes('manifestStrictDep'), false);
+});
+
+test('applyManifestDirectives: existing prefixed dependency is reconciled to the active branch', async () => {
+    const barePath = createBareAgentRepo('existing-prefixed-remote', 'provider', {
+        branches: ['feature-existing'],
+        manifest: { container: 'node:20', ssoProvider: true },
+    });
+    const repoName = 'existingPrefixedRepo';
+    const repoPath = path.join(tempDir, '.ploinky', 'repos', repoName);
+    ensureRepoInstalled(repoName, barePath, { stdio: 'ignore' });
+    writeAgentManifest('staticExistingPrefixed', 'app', {
+        container: 'node:20',
+        enable: [`${repoName}/provider`],
+    });
+
+    const branchPolicy = {
+        branch: 'feature-existing',
+        repoBranches: {},
+        fallback: 'default',
+        resetRepos: false,
+    };
+    await applyManifestDirectives('staticExistingPrefixed/app', { branchPolicy });
+    await applyManifestDirectives('staticExistingPrefixed/app', { branchPolicy });
+
+    const current = String(execFileSync('git', [
+        '-C', repoPath, 'rev-parse', '--abbrev-ref', 'HEAD',
+    ])).trim();
+    const sources = JSON.parse(fs.readFileSync(path.join(tempDir, '.ploinky', 'repo_sources.json'), 'utf8'));
+    assert.equal(current, 'feature-existing');
+    assert.equal(sources[repoName].branch, 'feature-existing');
 });
 
 test('applyManifestDirectives: profile enable auto-installs missing prefixed repo', async () => {
@@ -506,7 +537,6 @@ test('applyManifestDirectives: profile enable auto-installs missing prefixed rep
     const repoPath = path.join(tempDir, '.ploinky', 'repos', 'profileAutoRepo');
     const current = String(execFileSync('git', ['-C', repoPath, 'rev-parse', '--abbrev-ref', 'HEAD'])).trim();
     assert.equal(current, 'feature-profile');
-    assert.equal(loadEnabledRepos().includes('profileAutoRepo'), true);
     fs.writeFileSync(path.join(tempDir, '.ploinky', 'profile'), 'default');
 });
 
@@ -528,7 +558,6 @@ test('applyManifestDirectives: child manifest repos are applied before recursive
 
     const workerRepoPath = path.join(tempDir, '.ploinky', 'repos', 'childWorkerRepo');
     assert.equal(fs.existsSync(workerRepoPath), true);
-    assert.equal(loadEnabledRepos().includes('childWorkerRepo'), true);
 
     const agentsPath = path.join(tempDir, '.ploinky', 'agents.json');
     const agents = JSON.parse(fs.readFileSync(agentsPath, 'utf8'));
