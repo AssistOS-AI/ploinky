@@ -24,7 +24,11 @@ import {
 } from './routerHandlers.js';
 import { buildServiceAgentPath, collectHttpServiceRoutes, resolveHttpServiceRoute } from './httpServiceRoutes.js';
 import { RoutingRuntime } from './generation/RoutingRuntime.js';
-import { classifyRequestAuthority, normalizeAuthority } from './generation/authority.js';
+import {
+    classifyRequestAuthority,
+    normalizeAuthority,
+    resolveLoopbackAuthorityRedirect,
+} from './generation/authority.js';
 import { clearRoutingRuntime, setRoutingRuntime } from './generation/runtimeContext.js';
 import { createRelayHttpAgent, executeHttpPlan, RelayDuplex } from './proxy/executeHttpPlan.js';
 import { executeWebSocketPlan } from './proxy/executeWebSocketPlan.js';
@@ -193,6 +197,26 @@ function sendJsonResponse(res, statusCode, body, extraHeaders = {}) {
         ...extraHeaders
     });
     res.end(data);
+}
+
+function redirectLoopbackAlias(req, res) {
+    const location = resolveLoopbackAuthorityRedirect(req, {
+        expectedAuthority: publicAuthority,
+        scheme: req.socket?.encrypted ? 'https' : 'http',
+    });
+    if (!location) return false;
+
+    appendLog('loopback_authority_redirect', {
+        authority: req.headers.host,
+        location,
+    });
+    res.writeHead(307, {
+        Location: location,
+        'Cache-Control': 'no-store',
+        'Content-Length': '0',
+    });
+    res.end();
+    return true;
 }
 
 function rejectUpgrade(socket, captured, fallbackStatus = 401) {
@@ -426,6 +450,8 @@ async function handleRoutedAggregateAgentCard(req, res) {
  * Main request processor
  */
 async function processRequest(req, res) {
+    if (redirectLoopbackAlias(req, res)) return;
+
     let classification;
     try {
         classification = classifyRequestAuthority(req, {

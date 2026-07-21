@@ -48,6 +48,46 @@ function normalizeRequestTarget(rawTarget, authority, scheme) {
     return target;
 }
 
+function authorityParts(authority) {
+    const parsed = new URL(`http://${authority}/`);
+    return {
+        hostname: parsed.hostname.toLowerCase().replace(/^\[|\]$/g, ''),
+        port: parsed.port,
+    };
+}
+
+export function resolveLoopbackAuthorityRedirect(req, {
+    expectedAuthority,
+    scheme = 'http',
+} = {}) {
+    const method = String(req?.method || 'GET').toUpperCase();
+    if (method !== 'GET' && method !== 'HEAD') return null;
+
+    const normalizedScheme = String(scheme || '').toLowerCase();
+    if (normalizedScheme !== 'http' && normalizedScheme !== 'https') return null;
+
+    try {
+        const values = hostHeaderValues(req);
+        if (values.length !== 1) return null;
+
+        const authority = normalizeAuthority(values[0]);
+        const expected = normalizeAuthority(expectedAuthority, 'configured');
+        if (authority === expected) return null;
+
+        const actualParts = authorityParts(authority);
+        const expectedParts = authorityParts(expected);
+        if (actualParts.hostname !== 'localhost') return null;
+        if (expectedParts.hostname !== '127.0.0.1' && expectedParts.hostname !== '::1') return null;
+        if (actualParts.port !== expectedParts.port) return null;
+
+        const requestTarget = normalizeRequestTarget(req?.url, authority, normalizedScheme);
+        if (/[\u0000-\u001f\u007f]/.test(requestTarget)) return null;
+        return `${normalizedScheme}://${expected}${requestTarget}`;
+    } catch (_) {
+        return null;
+    }
+}
+
 export function classifyRequestAuthority(req, {
     expectedAuthority,
     scheme = 'http',
