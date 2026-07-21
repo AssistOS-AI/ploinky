@@ -122,6 +122,64 @@ process.stdout.write(JSON.stringify({
     }
 });
 
+test('default Podman networking preserves Podman Machine host resolution only on macOS', () => {
+    const workspaceDir = tempDir();
+    try {
+        const result = runModuleSnippet(
+            `const { buildDefaultPodmanNetworkArgs } = await import(${JSON.stringify(agentServiceManagerUrl)});
+process.stdout.write(JSON.stringify({
+    darwin: buildDefaultPodmanNetworkArgs('darwin'),
+    linux: buildDefaultPodmanNetworkArgs('linux'),
+}));`,
+            {},
+            { cwd: workspaceDir },
+        );
+
+        assert.equal(result.status, 0, result.stderr);
+        assert.deepEqual(JSON.parse(result.stdout), {
+            darwin: ['--network', 'pasta', '--no-hosts'],
+            linux: ['--network', 'pasta'],
+        });
+    } finally {
+        fs.rmSync(workspaceDir, { recursive: true, force: true });
+    }
+});
+
+test('container reuse requires a matching workspace runtime identity', () => {
+    const workspaceDir = tempDir();
+    try {
+        const result = runModuleSnippet(
+            `const { hasReusableRuntimeIdentity } = await import(${JSON.stringify(agentServiceManagerUrl)});
+const identity = { containerId: 'a'.repeat(64), networkMode: 'pasta' };
+const tracked = {
+    type: 'agent',
+    runtime: 'podman',
+    containerId: identity.containerId,
+    networkMode: identity.networkMode,
+    targetAgentId: 'agent:repo/demo',
+    enableGeneration: 'generation-one',
+    effectiveInstanceId: 'agent:repo/demo@generation-one',
+};
+process.stdout.write(JSON.stringify({
+    tracked: hasReusableRuntimeIdentity(tracked, 'podman', identity, 'agent:repo/demo'),
+    untracked: hasReusableRuntimeIdentity({ type: 'agent' }, 'podman', identity, 'agent:repo/demo'),
+    replaced: hasReusableRuntimeIdentity({ ...tracked, containerId: 'b'.repeat(64) }, 'podman', identity, 'agent:repo/demo'),
+}));`,
+            {},
+            { cwd: workspaceDir },
+        );
+
+        assert.equal(result.status, 0, result.stderr);
+        assert.deepEqual(JSON.parse(result.stdout), {
+            tracked: true,
+            untracked: false,
+            replaced: false,
+        });
+    } finally {
+        fs.rmSync(workspaceDir, { recursive: true, force: true });
+    }
+});
+
 test('computeEnvHash preserves legacy shape when no network is declared', () => {
     const workspaceDir = tempDir();
     try {
@@ -303,6 +361,12 @@ console.log(JSON.stringify(record));`,
         assert.ok(record.config.binds.some((bind) => (
             bind.source === path.join(workspaceDir, '.data', 'demo') && bind.target === '/root'
         )));
+        const runArgs = fs.readFileSync(argsFile, 'utf8');
+        assert.match(runArgs, /(?:^|\s)--network pasta(?:\s|$)/);
+        assert.doesNotMatch(runArgs, /slirp4netns/);
+        if (process.platform === 'darwin') {
+            assert.match(runArgs, /(?:^|\s)--no-hosts(?:\s|$)/);
+        }
     } finally {
         fs.rmSync(workspaceDir, { recursive: true, force: true });
         fs.rmSync(binDir, { recursive: true, force: true });

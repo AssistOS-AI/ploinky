@@ -9,6 +9,7 @@ import {
     STAMP_FILENAME,
     CORE_MARKER_MODULE,
     NPM_INSTALL_ARGS,
+    buildContainerInstallArgs,
     buildContainerInstallScript,
     sha256,
     hashFile,
@@ -73,6 +74,27 @@ test('container dependency installer disables audit/fund and emits a heartbeat',
     assert.match(script, /still running/);
     assert.match(script, /sleep 7/);
     assert.deepEqual(NPM_INSTALL_ARGS, ['install', '--no-package-lock', '--no-audit', '--no-fund']);
+});
+
+test('container dependency installer uses pasta only for Podman', () => {
+    const podmanArgs = buildContainerInstallArgs('/tmp/cache', {
+        image: 'example/image:latest',
+        runtime: 'podman',
+        shellPath: '/bin/sh',
+        installScript: 'npm install',
+    });
+    const networkIndex = podmanArgs.indexOf('--network');
+    assert.notEqual(networkIndex, -1);
+    assert.equal(podmanArgs[networkIndex + 1], 'pasta');
+    assert.equal(podmanArgs.some(arg => String(arg).includes('slirp4netns')), false);
+
+    const dockerArgs = buildContainerInstallArgs('/tmp/cache', {
+        image: 'example/image:latest',
+        runtime: 'docker',
+        shellPath: '/bin/sh',
+        installScript: 'npm install',
+    });
+    assert.equal(dockerArgs.includes('--network'), false);
 });
 
 test('writeStamp + readStamp round-trip', () => {

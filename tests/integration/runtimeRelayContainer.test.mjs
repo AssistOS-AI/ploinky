@@ -56,7 +56,7 @@ test('exec/stdio relay reaches only the selected container loopback service with
     ].join(';');
     const started = spawnSync('podman', [
         'run', '-d', '--rm', '--name', name,
-        '--network', 'slirp4netns:allow_host_loopback=true',
+        '--network', 'pasta',
         '-e', `PLOINKY_AGENT_ID=${TARGET_AGENT}`,
         '-e', `PLOINKY_AGENT_SECRET=${SECRET.toString('hex')}`,
         '-v', `${path.join(REPO_ROOT, 'Agent')}:/Agent:ro`,

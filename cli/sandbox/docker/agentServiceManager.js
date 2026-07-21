@@ -444,6 +444,13 @@ function buildRuntimeRouterEnv(runtime, options = {}) {
     };
 }
 
+function buildDefaultPodmanNetworkArgs(platform = process.platform) {
+    return [
+        '--network', 'pasta',
+        ...(platform === 'darwin' ? ['--no-hosts'] : []),
+    ];
+}
+
 function appendRuntimeRouterEnvFlags(envStrings, routerEnv) {
     for (const [name, value] of Object.entries(routerEnv || {})) {
         envStrings.push(formatEnvFlag(name, value));
@@ -850,7 +857,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
             args.splice(1, 0, '--replace');
         }
     } else if (runtime === 'podman') {
-        args.splice(1, 0, '--network', 'slirp4netns:allow_host_loopback=true');
+        args.splice(1, 0, ...buildDefaultPodmanNetworkArgs());
         args.splice(1, 0, '--replace');
     } else if (runtime === 'docker') {
         args.splice(1, 0, '--add-host', 'host.docker.internal:host-gateway');
@@ -1375,6 +1382,7 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
 
 export {
     assertPodmanCodeMountAllowed,
+    buildDefaultPodmanNetworkArgs,
     buildPodmanStagedTargetMounts,
     buildRuntimeRouterEnv,
     codeRelativeMountPath,
