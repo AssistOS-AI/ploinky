@@ -87,6 +87,41 @@ process.stdout.write(JSON.stringify(buildRuntimeRouterEnv('docker')));`,
     }
 });
 
+test('container reuse requires a matching workspace runtime identity', () => {
+    const workspaceDir = tempDir();
+    try {
+        const result = runModuleSnippet(
+            `const { hasReusableRuntimeIdentity } = await import(${JSON.stringify(agentServiceManagerUrl)});
+const identity = { containerId: 'a'.repeat(64), networkMode: 'pasta' };
+const tracked = {
+    type: 'agent',
+    runtime: 'podman',
+    containerId: identity.containerId,
+    networkMode: identity.networkMode,
+    targetAgentId: 'agent:repo/demo',
+    enableGeneration: 'generation-one',
+    effectiveInstanceId: 'agent:repo/demo@generation-one',
+};
+process.stdout.write(JSON.stringify({
+    tracked: hasReusableRuntimeIdentity(tracked, 'podman', identity, 'agent:repo/demo'),
+    untracked: hasReusableRuntimeIdentity({ type: 'agent' }, 'podman', identity, 'agent:repo/demo'),
+    replaced: hasReusableRuntimeIdentity({ ...tracked, containerId: 'b'.repeat(64) }, 'podman', identity, 'agent:repo/demo'),
+}));`,
+            {},
+            { cwd: workspaceDir },
+        );
+
+        assert.equal(result.status, 0, result.stderr);
+        assert.deepEqual(JSON.parse(result.stdout), {
+            tracked: true,
+            untracked: false,
+            replaced: false,
+        });
+    } finally {
+        fs.rmSync(workspaceDir, { recursive: true, force: true });
+    }
+});
+
 test('computeEnvHash preserves legacy shape when no network is declared', () => {
     const workspaceDir = tempDir();
     try {

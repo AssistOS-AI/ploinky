@@ -116,6 +116,18 @@ function inspectRuntimeIdentity(runtime, containerName) {
     return { containerId, networkMode };
 }
 
+function hasReusableRuntimeIdentity(existingRecord, runtime, runtimeIdentity, targetAgentId) {
+    const recordedContainerId = String(existingRecord?.containerId || '').trim().toLowerCase();
+    const recordedNetworkMode = String(existingRecord?.networkMode || '').trim().toLowerCase();
+    return existingRecord?.type === 'agent'
+        && existingRecord?.runtime === runtime
+        && recordedContainerId === runtimeIdentity.containerId
+        && recordedNetworkMode === runtimeIdentity.networkMode
+        && existingRecord?.targetAgentId === targetAgentId
+        && Boolean(String(existingRecord?.enableGeneration || '').trim())
+        && Boolean(String(existingRecord?.effectiveInstanceId || '').trim());
+}
+
 function buildRuntimeServiceDescriptor({ runtime, containerName, agentName, repoName, manifest, existingRecord = {} }) {
     const { containerId, networkMode } = inspectRuntimeIdentity(runtime, containerName);
     const targetAgentId = deriveAgentPrincipalId(repoName, agentName);
@@ -1190,6 +1202,15 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
     }
 
     if (containerExists(containerName)) {
+        const runtimeIdentity = inspectRuntimeIdentity(runtime, containerName);
+        const targetAgentId = deriveAgentPrincipalId(repoName, agentName);
+        if (!hasReusableRuntimeIdentity(existingRecord, runtime, runtimeIdentity, targetAgentId)) {
+            console.log(`[start] ${agentName}: existing container is not tracked by this workspace generation; recreating.`);
+            removeContainerForRecreate(runtime, containerName, `ensureAgentService:${agentName}:untrackedContainer`);
+        }
+    }
+
+    if (containerExists(containerName)) {
         const desired = computeEnvHash(manifest, profileConfig, runtimeRouterEnv, { agentName, repoName });
         const current = getContainerLabel(containerName, 'ploinky.envhash');
         if (desired && desired !== current) {
@@ -1360,6 +1381,7 @@ export {
     ensureAgentService,
     ensureManifestVolumeHostPath,
     ensurePodmanStagedCodeDir,
+    hasReusableRuntimeIdentity,
     mergeNodeOptions,
     podmanMountSuffix,
     startAgentContainer

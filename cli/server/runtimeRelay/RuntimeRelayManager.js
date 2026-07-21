@@ -7,6 +7,7 @@ import { RelayFrameDecoder, RUNTIME_RELAY_PROTOCOL_VERSION, encodeRelayFrame } f
 import { normalizeRelayDescriptor, verifyInspectedContainer } from './confinement.js';
 
 const DEFAULT_CHANNEL_IDLE_TIMEOUT_MS = 30_000;
+const MAX_RELAY_STDERR_BYTES = 4096;
 
 class RelayRequestStream extends EventEmitter {
     constructor(channel, requestId) {
@@ -59,6 +60,7 @@ class RuntimeRelayChannel extends EventEmitter {
         this.checkoutCount = 0;
         this.idleTimer = null;
         this.closed = false;
+        this.stderr = '';
         const decoder = new RelayFrameDecoder();
         child.stdout.on('data', chunk => {
             try { decoder.push(chunk); } catch (error) { this._fail(error); }
@@ -76,9 +78,17 @@ class RuntimeRelayChannel extends EventEmitter {
             }
         });
         decoder.on('error', error => this._fail(error));
+        child.stderr?.on?.('data', chunk => {
+            this.stderr = `${this.stderr}${String(chunk)}`.slice(-MAX_RELAY_STDERR_BYTES);
+        });
         child.once('error', error => this._fail(error));
         child.once('exit', (code, signal) => {
-            if (!this.closed) this._fail(new Error(`runtime relay exited (${code ?? signal ?? 'unknown'})`));
+            if (!this.closed) {
+                const detail = this.stderr.trim().replace(/\s+/g, ' ');
+                this._fail(new Error(
+                    `runtime relay exited (${code ?? signal ?? 'unknown'})${detail ? `: ${detail}` : ''}`,
+                ));
+            }
         });
     }
 
@@ -267,7 +277,6 @@ export class RuntimeRelayManager {
             'exec', '-i', relay.containerId,
             'node', '/Agent/server/RuntimeHttpRelay.mjs',
         ], { stdio: ['pipe', 'pipe', 'pipe'] });
-        child.stderr?.resume?.();
         try {
             const session = await this.minter.mintSession({
                 targetAgentId: relay.targetAgentId,

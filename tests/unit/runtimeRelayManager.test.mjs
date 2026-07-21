@@ -263,6 +263,27 @@ test('relay exit fails active streams, evicts the channel, and starts a replacem
     manager.close();
 });
 
+test('relay startup failure includes bounded stderr diagnostics', async () => {
+    const minter = new RelayRequestMinter({ resolveAgentSecret: async () => AGENT_SECRET });
+    const manager = new RuntimeRelayManager({
+        minter,
+        inspectContainer: inspectedContainer,
+        spawnProcess: () => {
+            const child = fakeChild((_hello, activeChild) => {
+                activeChild.stderr.write('node: cannot find /Agent/server/RuntimeHttpRelay.mjs\n');
+                activeChild.emit('exit', 1, null);
+            });
+            return child;
+        },
+    });
+
+    await assert.rejects(
+        () => manager.checkout({ plan: routePlan(), lease: validLease(), authorized: true }),
+        /runtime relay exited \(1\): node: cannot find \/Agent\/server\/RuntimeHttpRelay\.mjs/,
+    );
+    manager.close();
+});
+
 test('capacity remains request-scoped when requests share a relay channel', async () => {
     let spawnCalls = 0;
     const minter = new RelayRequestMinter({ resolveAgentSecret: async () => AGENT_SECRET });

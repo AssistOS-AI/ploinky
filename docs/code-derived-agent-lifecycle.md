@@ -272,6 +272,8 @@ SSO-provider dependencies are special. A manifest that looks like an SSO provide
 
 `ensureAgentService` is the common runtime entrypoint. It selects host sandbox or container runtime, prepares lifecycle hooks/dependencies, creates or reuses runtime state, and records actual runtime metadata.
 
+Container reuse is generation-bound. A same-named container is recreated unless the current workspace record matches its immutable container id, runtime, network mode, agent principal, enable generation, and effective instance. This prevents a fresh `.ploinky` directory from adopting an orphan whose staged `/Agent` or `/code` bind sources belonged to deleted workspace state.
+
 ```mermaid
 flowchart TD
   A["ensureAgentService(agent, manifest, agentPath)"] --> B["resolve active/default profile"]
