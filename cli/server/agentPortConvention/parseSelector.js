@@ -2,6 +2,7 @@ import { AGENT_PORT_CONVENTION_ROUTE_KEY } from '../../utils/runtime/reservedRou
 
 const ROUTE_KEY_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_.-]*$/;
 const PORT_PATTERN = /^[1-9][0-9]{0,4}$/;
+const PCHAR_PERCENT_ENCODING = /%(?:24|26|2B|2C|3A|3B|3D|40)/g;
 
 export class AgentPortSelectorError extends Error {
     constructor(code, message, status = 400) {
@@ -16,7 +17,14 @@ function reject(code, message, status) {
     throw new AgentPortSelectorError(code, message, status);
 }
 
-function decodeCanonicalSegment(raw, label) {
+function encodeCanonicalSuffixSegment(value) {
+    return encodeURIComponent(value).replace(
+        PCHAR_PERCENT_ENCODING,
+        encoded => decodeURIComponent(encoded),
+    );
+}
+
+function decodeCanonicalSegment(raw, label, canonicalize = encodeURIComponent) {
     if (!raw || raw.includes('\\') || /%2f|%5c/i.test(raw)) {
         reject('MALFORMED_SELECTOR', `${label} is not canonical`);
     }
@@ -32,7 +40,7 @@ function decodeCanonicalSegment(raw, label) {
     if (decoded === '.' || decoded === '..') {
         reject('MALFORMED_SELECTOR', `${label} contains a dot segment`);
     }
-    if (encodeURIComponent(decoded) !== raw) {
+    if (canonicalize(decoded) !== raw) {
         reject('NON_CANONICAL_SELECTOR', `${label} does not round-trip canonically`);
     }
     return decoded;
@@ -100,11 +108,14 @@ export function parseAgentPortSelector(requestTarget, { deniedPorts = [] } = {})
     }
 
     const suffixSegments = rawSegments.slice(3);
-    if (suffixSegments.length === 1 && suffixSegments[0] === '') suffixSegments.length = 0;
+    const hasTrailingSlash = suffixSegments.at(-1) === '';
+    if (hasTrailingSlash) suffixSegments.pop();
     for (const [index, segment] of suffixSegments.entries()) {
-        decodeCanonicalSegment(segment, `suffix segment ${index + 1}`);
+        decodeCanonicalSegment(segment, `suffix segment ${index + 1}`, encodeCanonicalSuffixSegment);
     }
-    const suffix = suffixSegments.length ? `/${suffixSegments.join('/')}` : '/';
+    const suffix = suffixSegments.length
+        ? `/${suffixSegments.join('/')}${hasTrailingSlash ? '/' : ''}`
+        : '/';
     return Object.freeze({
         convention: AGENT_PORT_CONVENTION_ROUTE_KEY,
         agent,

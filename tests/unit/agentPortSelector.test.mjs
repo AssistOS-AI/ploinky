@@ -26,6 +26,19 @@ test('agent-port selector accepts canonical routes and preserves the raw query',
     assert.equal(parseAgentPortSelector('/alpha/7000'), null);
     assert.equal(parseAgentPortSelector('/base-agent-additional-server-lookalike/alpha/7000'), null);
 });
+
+test('agent-port selector accepts RFC path characters and a trailing slash in the upstream suffix', () => {
+    const asset = parseAgentPortSelector(
+        `${PREFIX}/onlyOffice/8080/9.3.1-build/web-apps/resources/iconssmall@2.5x.svg`,
+    );
+    assert.equal(asset.suffix, '/9.3.1-build/web-apps/resources/iconssmall@2.5x.svg');
+
+    const collaboration = parseAgentPortSelector(
+        `${PREFIX}/onlyOffice/8080/9.3.1-build/doc/document-key/c/?shardkey=document-key&EIO=4&transport=websocket`,
+    );
+    assert.equal(collaboration.suffix, '/9.3.1-build/doc/document-key/c/');
+    assert.equal(collaboration.query, 'shardkey=document-key&EIO=4&transport=websocket');
+});
 const invalidTargets = [
     PREFIX,
     `${PREFIX}/`,
@@ -47,6 +60,7 @@ const invalidTargets = [
     `${PREFIX}/alpha/7000/%252Fetc`,
     `${PREFIX}/alpha/7000/%5Cetc`,
     `${PREFIX}/alpha/7000/%00`,
+    `${PREFIX}/alpha/7000/icon%40scale.svg`,
     `${PREFIX}/%61lpha/7000`,
     `${PREFIX}/alpha%2Fbeta/7000`,
     `${PREFIX}/alpha%5Cbeta/7000`,
