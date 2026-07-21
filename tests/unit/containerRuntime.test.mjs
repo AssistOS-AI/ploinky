@@ -55,6 +55,7 @@ process.stdout.write(JSON.stringify(buildRuntimeRouterEnv('podman', { routerPort
             PLOINKY_ROUTER_PORT: '8097',
             PLOINKY_ROUTER_HOST: 'host.containers.internal',
             PLOINKY_ROUTER_URL: 'http://host.containers.internal:8097',
+            PLOINKY_ROUTER_AUTHORITY: '127.0.0.1:8097',
         });
     } finally {
         fs.rmSync(workspaceDir, { recursive: true, force: true });
@@ -79,6 +80,7 @@ process.stdout.write(JSON.stringify(buildRuntimeRouterEnv('docker')));`,
             PLOINKY_ROUTER_PORT: '8097',
             PLOINKY_ROUTER_HOST: 'host.docker.internal',
             PLOINKY_ROUTER_URL: 'http://host.docker.internal:8097',
+            PLOINKY_ROUTER_AUTHORITY: '127.0.0.1:8097',
         });
     } finally {
         fs.rmSync(workspaceDir, { recursive: true, force: true });

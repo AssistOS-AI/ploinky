@@ -422,10 +422,13 @@ function buildRuntimeRouterEnv(runtime, options = {}) {
         || '8080';
     const routerHost = String(options.routerHost || '').trim()
         || resolveRouterHostForRuntime(runtime);
+    const routerAuthority = String(options.routerAuthority || process.env.PLOINKY_PUBLIC_AUTHORITY || '').trim()
+        || `${String(process.env.PLOINKY_PUBLIC_BIND || '127.0.0.1').trim()}:${routerPort}`;
     return {
         PLOINKY_ROUTER_PORT: routerPort,
         PLOINKY_ROUTER_HOST: routerHost,
         PLOINKY_ROUTER_URL: `http://${routerHost}:${routerPort}`,
+        PLOINKY_ROUTER_AUTHORITY: routerAuthority,
     };
 }
 

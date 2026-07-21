@@ -47,6 +47,47 @@ test('custom-command routes without a primary descriptor remain convention-only'
     lease.release();
 });
 
+test('declared HTTP services on custom-command agents use the confined control listener only', () => {
+    const generation = compileGeneration(generationInput({ route: {
+        primaryService: null,
+        httpServices: [{
+            slug: 'control',
+            externalPrefix: '/services/control/',
+            internalPrefix: '/control/',
+            access: 'authenticated',
+        }],
+    } }));
+    const runtime = Object.create(RoutingRuntime.prototype);
+    runtime.store = new GenerationStore();
+    runtime.store.activate(generation);
+    const lease = runtime.acquire({ listenerClass: 'public', authority: '127.0.0.1:8080' });
+
+    const servicePlan = runtime.resolveHttpService({
+        lease,
+        routeKey: 'alpha',
+        method: 'GET',
+        externalPath: '/services/control/status',
+        targetPath: '/control/status',
+        authority: '127.0.0.1:8080',
+        declaredAccess: 'authenticated',
+    });
+    const finalized = finalizePlanAfterAdmission(servicePlan);
+
+    assert.equal(finalized.surfaceKind, 'agent-http-service');
+    assert.equal(finalized.port, 7000);
+    assert.equal(finalized.targetPath, '/control/status');
+    assert.equal(finalized.access.access, 'authenticated');
+    assert.equal(runtime.resolvePrimary({
+        lease,
+        routeKey: 'alpha',
+        method: 'GET',
+        externalPath: '/alpha/control/status',
+        targetPath: '/control/status',
+        authority: '127.0.0.1:8080',
+    }), null, 'the named service must not enable generic primary routing');
+    lease.release();
+});
+
 test('primary route default access is compiled from captured agent auth policy', () => {
     const generation = compileGeneration(generationInput({ route: { auth: { mode: 'local', usersVar: 'USERS' } } }));
     const runtime = Object.create(RoutingRuntime.prototype);

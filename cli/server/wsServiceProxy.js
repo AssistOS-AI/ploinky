@@ -51,7 +51,7 @@ export async function resolveUpgradeTarget({ req, parsedUrl, policy }) {
             return { matched: false };
         }
         const target = buildServiceAgentPath(pathname, parsedUrl?.search, definition.externalPrefix, definition.internalPrefix);
-        plan = runtime.resolvePrimary({
+        plan = runtime.resolveHttpService({
             lease,
             routeKey: definition.routeKey,
             method: 'GET',

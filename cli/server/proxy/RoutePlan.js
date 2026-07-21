@@ -52,7 +52,7 @@ export function finalizePlanAfterAdmission(plan) {
     if (plan?.surfaceKind === 'agent-port-convention') {
         return finalizeRoutePlan(plan, { targetPath: plan.unmatchedSuffix || '/', query: plan.query || '' });
     }
-    if (plan?.surfaceKind === 'agent-primary') {
+    if (plan?.surfaceKind === 'agent-primary' || plan?.surfaceKind === 'agent-http-service') {
         return finalizeRoutePlan(plan, { targetPath: plan.unmatchedSuffix || '/', query: plan.query || '' });
     }
     throw new Error('RoutePlan: unsupported route surface');

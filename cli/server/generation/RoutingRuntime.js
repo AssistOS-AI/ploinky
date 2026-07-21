@@ -12,6 +12,8 @@ import { GenerationStore } from './GenerationStore.js';
 import { evaluateGenerationAccess } from './evaluateGenerationAccess.js';
 import { normalizeAuthority } from './authority.js';
 
+const AGENT_HTTP_SERVICE_PORT = 7000;
+
 export class RoutingRuntime {
     constructor({ routingFile, policy, publicAuthority, privateAuthority = '127.0.0.1:8081' } = {}) {
         if (!routingFile || !policy || !publicAuthority) throw new Error('RoutingRuntime: routing file, policy, and public authority required');
@@ -111,6 +113,51 @@ export class RoutingRuntime {
             policyPath: externalPath,
             convention: 'agent-primary',
             forwardedPrefix: forwardedPrefix || `/${encodeURIComponent(routeKey)}`,
+            unmatchedSuffix: targetPath || '/',
+            relay: route.relay,
+            deniedPorts: route.deniedPorts,
+            allowedRouterCapabilities: [],
+            access,
+            scheme,
+            origin: `${scheme}://${normalizeAuthority(authority)}`,
+            limits: route.limits,
+            generationDigest: generation.digest,
+            auditId: crypto.randomUUID(),
+            method: String(method || 'GET').toUpperCase(),
+            query,
+            transport,
+            credentialPolicy: route.credentialPolicy,
+            responsePolicy: route.responsePolicy,
+            originPolicy: route.originPolicy,
+            allowRequestStreaming: route.allowRequestStreaming,
+        });
+    }
+
+    resolveHttpService({ lease, routeKey, method, externalPath, targetPath, query = '', authority, listenerClass = 'public', scheme = 'http', transport = 'http', forwardedPrefix, declaredAccess, declaredGuestScope }) {
+        const generation = lease.generation;
+        const route = generation.routes?.[routeKey];
+        if (!route?.relay) return null;
+        const port = route.primaryService?.port || AGENT_HTTP_SERVICE_PORT;
+        if (route.deniedPorts?.includes(port)) return null;
+        const access = evaluateGenerationAccess({
+            generation,
+            pathname: externalPath,
+            method,
+            routeKey,
+            surfaceKind: 'agent-http-service',
+            declaredAccess,
+            declaredGuestScope,
+        });
+        return createRoutePlan({
+            listenerClass,
+            authority: normalizeAuthority(authority),
+            surfaceKind: 'agent-http-service',
+            owner: { effectiveInstanceId: route.effectiveInstanceId, enableGeneration: route.enableGeneration },
+            routeKey,
+            port,
+            policyPath: externalPath,
+            convention: 'manifest-http-service',
+            forwardedPrefix,
             unmatchedSuffix: targetPath || '/',
             relay: route.relay,
             deniedPorts: route.deniedPorts,

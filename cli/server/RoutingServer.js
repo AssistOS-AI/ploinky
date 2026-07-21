@@ -545,7 +545,7 @@ async function processRequest(req, res) {
     if (serviceDefinition && serviceLease) {
         try {
             const target = buildServiceAgentPath(pathname, parsedUrl.search, serviceDefinition.externalPrefix, serviceDefinition.internalPrefix);
-            servicePlan = routingRuntime.resolvePrimary({
+            servicePlan = routingRuntime.resolveHttpService({
                 lease: serviceLease,
                 routeKey: serviceDefinition.routeKey,
                 method: req.method || 'GET',
@@ -1024,7 +1024,7 @@ server.on('upgrade', async (req, socket, head) => {
         if (definition && serviceLease) {
             try {
                 const target = buildServiceAgentPath(parsedUrl.pathname, parsedUrl.search, definition.externalPrefix, definition.internalPrefix);
-                const plan = routingRuntime.resolvePrimary({
+                const plan = routingRuntime.resolveHttpService({
                     lease: serviceLease,
                     routeKey: definition.routeKey,
                     method: 'GET',

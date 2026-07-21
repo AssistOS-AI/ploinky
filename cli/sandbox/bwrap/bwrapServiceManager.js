@@ -394,6 +394,8 @@ function buildFullEnvMap(agentName, manifest, profileConfig, agentWorkDir, repoN
     env.PLOINKY_ROUTER_PORT = routerPort;
     env.PLOINKY_ROUTER_HOST = routerHost;
     env.PLOINKY_ROUTER_URL = `http://${routerHost}:${routerPort}`;
+    env.PLOINKY_ROUTER_AUTHORITY = String(process.env.PLOINKY_PUBLIC_AUTHORITY || '').trim()
+        || `${String(process.env.PLOINKY_PUBLIC_BIND || '127.0.0.1').trim()}:${routerPort}`;
 
     // SSO client credentials
     const agentClientIdVar = `PLOINKY_AGENT_${agentName.toUpperCase().replace(/[^A-Z0-9]/g, '_')}_CLIENT_ID`;
