@@ -31,6 +31,7 @@ test('config resolves workspace root from parent .ploinky', () => {
                 cwdPloinkyExists: fs.existsSync('./.ploinky'),
                 dataExists: fs.existsSync(path.join(PLOINKY_WORKSPACE_ROOT, '.data')),
                 legacyAgentsDirExists: fs.existsSync(path.join(PLOINKY_WORKSPACE_ROOT, '.ploinky', 'agents')),
+                agentsFileExists: fs.existsSync(path.join(PLOINKY_WORKSPACE_ROOT, '.ploinky', 'agents.json')),
             }));
         `;
         const result = spawnSync(process.execPath, ['--input-type=module', '-e', script], {
@@ -48,6 +49,7 @@ test('config resolves workspace root from parent .ploinky', () => {
         assert.equal(output.cwdPloinkyExists, false);
         assert.equal(output.dataExists, true);
         assert.equal(output.legacyAgentsDirExists, false);
+        assert.equal(output.agentsFileExists, false);
         assert.equal(fs.existsSync(path.join(child, '.ploinky')), false);
     } finally {
         fs.rmSync(root, { recursive: true, force: true });

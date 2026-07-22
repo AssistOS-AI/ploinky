@@ -76,6 +76,41 @@ test('one-shot start without initial configuration exits nonzero', (t) => {
     assert.match(`${result.stdout}\n${result.stderr}`, /persisted router port is required/);
 });
 
+test('first core command initializes the complete edge source set together', (t) => {
+    const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-cli-fresh-sources-'));
+    for (const repoName of bootRepos) {
+        fs.mkdirSync(path.join(workspace, '.ploinky', 'repos', repoName), { recursive: true });
+    }
+    t.after(() => fs.rmSync(workspace, { recursive: true, force: true }));
+
+    const result = spawnSync(process.execPath, [cliEntry, 'list', 'agents'], {
+        cwd: workspace,
+        encoding: 'utf8',
+        env: {
+            ...process.env,
+            PLOINKY_WORKSPACE_ROOT: workspace,
+            PLOINKY_MASTER_KEY: '5'.repeat(64),
+        },
+    });
+
+    assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
+    const ploinky = path.join(workspace, '.ploinky');
+    assert.deepEqual(JSON.parse(fs.readFileSync(path.join(ploinky, 'agents.json'), 'utf8')), {});
+    assert.deepEqual(JSON.parse(fs.readFileSync(path.join(ploinky, 'routing.json'), 'utf8')), { routes: {} });
+    assert.deepEqual(JSON.parse(fs.readFileSync(
+        path.join(ploinky, 'data', 'router-security', 'policy-state.json'),
+        'utf8',
+    )), { schema: 'router-policy', httpRoutes: [], mcpTools: [] });
+    assert.deepEqual(JSON.parse(fs.readFileSync(
+        path.join(ploinky, 'data', 'edge-routing', 'desired.json'),
+        'utf8',
+    )), {
+        schemaVersion: 1,
+        hosts: {},
+        security: { hostNetworkAllowedInstances: [], internalServiceConsumers: {} },
+    });
+});
+
 test('removed component-token rotation flags fail hard', (t) => {
     for (const component of ['webchat', 'dashboard']) {
         const result = runPloinky(t, [component, '--rotate']);

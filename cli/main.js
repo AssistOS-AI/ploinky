@@ -2,7 +2,13 @@ import readline from 'readline';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { HISTORY_FILE, initEnvironment, logPloinkyDirectory, setDebugMode } from './utils/config.js';
+import {
+    HISTORY_FILE,
+    PLOINKY_WORKSPACE_ROOT,
+    initEnvironment,
+    logPloinkyDirectory,
+    setDebugMode,
+} from './utils/config.js';
 import { handleCommand, getAgentNames, getRepoNames, cleanupSessionContainers as cleanupCliSessions } from './commands/cli.js';
 import { getCommandRegistry } from './commands/commandRegistry.js';
 import { debugLog } from './utils/utils.js';
@@ -11,6 +17,7 @@ import { runReplCommand } from './sandbox/replCommandRunner.js';
 import { bootstrap } from './commands/ploinkyboot.js';
 import { enableMultilineNavigation } from './commands/multilineNavigation.js';
 import { getPredefinedRepos, parseStartArgs } from './utils/repos.js';
+import { initializeFreshEdgeRoutingSources } from './sandbox/edgeGeneration.js';
 
 const COMMANDS = getCommandRegistry();
 const PLOINKY_ROOT = process.env.PLOINKY_ROOT || path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -413,6 +420,7 @@ export async function runCoreCli(args = []) {
 
     debugLog('Raw arguments:', args);
     initEnvironment();
+    initializeFreshEdgeRoutingSources({ workspaceRoot: PLOINKY_WORKSPACE_ROOT });
     let startParsed;
     let branchPolicy;
     if (args.length && args[0] === 'start') {

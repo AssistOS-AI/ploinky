@@ -66,13 +66,19 @@ export function createPodmanHarness(t, candidateReference, {
     async function cleanup() {
         const inspect = runner.query('podman', ['container', 'inspect', identity.instance]);
         if (inspect.ok) {
+            let records;
             try {
-                const records = JSON.parse(inspect.stdout);
-                const id = String(records[0]?.Id || records[0]?.ID || '');
-                if (/^[a-f0-9]{12,64}$/.test(id)) {
-                    runner.query('podman', ['container', 'rm', '-f', '--volumes', id]);
-                }
-            } catch {}
+                records = JSON.parse(inspect.stdout);
+            } catch {
+                assert.fail(`native Box inspection returned invalid JSON for ${identity.instance}`);
+            }
+            const id = String(records[0]?.Id || records[0]?.ID || '');
+            assert.match(id, /^[a-f0-9]{12,64}$/,
+                `native Box inspection returned an invalid ID for ${identity.instance}`);
+            const removed = runner.query('podman', [
+                'container', 'rm', '-f', '--time', '0', '--volumes', id,
+            ], { timeoutMs: 120_000 });
+            assert.equal(removed.ok, true, `failed to clean native Box ${id}: ${removed.stderr}`);
         }
         for (const name of Object.values(identity.volumes)) {
             runner.query('podman', ['volume', 'rm', '-f', name]);

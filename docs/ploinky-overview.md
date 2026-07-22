@@ -6,6 +6,10 @@ Ploinky is a workspace-local runtime for repository-backed agents.
 
 - The workspace root is the nearest directory that contains `.ploinky/`.
 - Runtime state lives under `.ploinky/`, including `agents.json`, `routing.json`, `.secrets`, `repos/`, `deps/`, `logs/`, and `keys/`.
+- The first core command in a genuinely fresh workspace creates `agents.json`,
+  `routing.json`, `data/router-security/policy-state.json`, and
+  `data/edge-routing/desired.json` together before any registry mutation.
+  A partial set remains fail-closed and requires explicit repair.
 - Agent repositories are cloned under `.ploinky/repos/<repo>/`.
 - The default `start` flow requires a static agent and router port the first time, then reuses the saved configuration.
 

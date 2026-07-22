@@ -39,10 +39,11 @@ Unreadable or corrupt input, a digest mismatch, an interrupted apply, and an
 invalid candidate leave the selectors inactive; no prior generation is restored
 as a fallback. A missing policy, desired-state, enabled-agent, routing, manifest,
 or provider source is unavailable input and is never substituted with an empty
-document. A genuinely fresh workspace initializes the four persisted source
-documents together before its first mutation; any partial set or retained
-generation evidence requires explicit repair. Status exposes generation identity
-and digest, never source contents.
+document. A genuinely fresh core command initializes the four persisted source
+documents together after creating the workspace directories and before bootstrap
+or registry mutation; generic environment setup does not create `agents.json`
+independently. Any partial set or retained generation evidence requires explicit
+repair. Status exposes generation identity and digest, never source contents.
 
 The core `list routes` command reports the staged `.ploinky/routing.json`
 candidate for operator inspection; it does not prove or print the active
