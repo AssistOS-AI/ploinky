@@ -10,6 +10,14 @@ import { classifyRequestAuthority } from './generation/authority.js';
 export const PRIVATE_LISTENER_HOST = '127.0.0.1';
 export const PRIVATE_LISTENER_PORT = 8081;
 
+function normalizePrivateListenerHost(value) {
+    const host = String(value || PRIVATE_LISTENER_HOST).trim();
+    if (host !== PRIVATE_LISTENER_HOST && host !== '0.0.0.0') {
+        throw new Error('privateListener: bind host must be loopback or IPv4 wildcard');
+    }
+    return host;
+}
+
 function sendPrivateError(res, statusCode, error) {
     res.writeHead(statusCode, { 'content-type': 'application/json', 'cache-control': 'no-store' });
     res.end(JSON.stringify({ error }));
@@ -141,8 +149,10 @@ export async function createPrivateListener({
     handler,
     proveBinding,
     port = PRIVATE_LISTENER_PORT,
+    host = PRIVATE_LISTENER_HOST,
 } = {}) {
     if (typeof handler !== 'function') throw new Error('privateListener: handler required');
+    const bindHost = normalizePrivateListenerHost(host);
     const proofNonce = crypto.randomBytes(18).toString('base64url');
     const proofPath = `/.well-known/ploinky-private-proof/${proofNonce}`;
     const server = http.createServer((req, res) => {
@@ -155,7 +165,7 @@ export async function createPrivateListener({
     });
     await new Promise((resolve, reject) => {
         server.once('error', reject);
-        server.listen(port, PRIVATE_LISTENER_HOST, () => {
+        server.listen(port, bindHost, () => {
             server.off('error', reject);
             resolve();
         });

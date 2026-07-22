@@ -1175,7 +1175,9 @@ server.listen(port, publicBind, () => {
     const proofRoute = Object.values(activeRoutes()).find(candidate => candidate?.relay);
     if (proofRoute) {
         const relay = proofRoute.relay;
+        const privateBind = String(process.env.PLOINKY_PRIVATE_BIND || '127.0.0.1').trim();
         createPrivateListener({
+            host: privateBind,
             handler: createPrivateRouteHandler({
                 runtime: routingRuntime,
                 assertionService: machineCallAssertions,
@@ -1189,7 +1191,7 @@ server.listen(port, publicBind, () => {
             }),
         }).then(listener => {
             privateServer = listener;
-            appendLog('private_listener_enabled', { bind: '127.0.0.1', port: 8081 });
+            appendLog('private_listener_enabled', { bind: privateBind, port: 8081 });
         }).catch(error => {
             appendLog('private_listener_disabled', { error: error?.message || String(error) });
         });

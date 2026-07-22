@@ -1,0 +1,13 @@
+{
+  "contract": 6,
+  "repositories": {
+    "mcp-sdk": {
+      "url": "https://github.com/AssistOS-AI/MCPSDK.git",
+      "commit": "7efe9d17f52a625743e411089d3a6879f6f89156"
+    },
+    "achillesAgentLib": {
+      "url": "https://github.com/AssistOS-AI/AchillesAgentLib.git",
+      "commit": "42894def87b4fd2d59a8ce01fea7e25cdc7881ba"
+    }
+  }
+}

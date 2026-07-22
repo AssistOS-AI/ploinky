@@ -122,6 +122,58 @@ process.stdout.write(JSON.stringify({
     }
 });
 
+test('runtime primary-service classification follows manifest execution semantics', () => {
+    const workspaceDir = tempDir();
+    try {
+        const result = runModuleSnippet(
+            `const { manifestHasRuntimePrimaryService, manifestNeedsCoreDependencies, resolveRuntimePrimaryService } = await import(${JSON.stringify(agentServiceManagerUrl)});
+process.stdout.write(JSON.stringify({
+    defaultAgent: manifestHasRuntimePrimaryService({}),
+    explicitAgent: manifestHasRuntimePrimaryService({ agent: 'sh /code/startAgent.sh' }),
+    startAndAgent: manifestHasRuntimePrimaryService({ start: 'sh /code/start.sh', agent: 'sh /code/startAgent.sh' }),
+    startOnly: manifestHasRuntimePrimaryService({ start: 'sh /code/start.sh' }),
+    startOnlyPort: resolveRuntimePrimaryService(
+        { start: 'node /opt/webtty-agent/server.mjs' },
+        { env: { PORT: { default: '7681' } }, openPorts: ['127.0.0.1:7681:7681'] },
+    ),
+    ambiguousStartOnly: resolveRuntimePrimaryService(
+        { start: 'sh /code/start.sh' },
+        { openPorts: ['127.0.0.1:7001:7001', '127.0.0.1:7002:7002'] },
+    ),
+    malformedStartOnlyPort: resolveRuntimePrimaryService(
+        { start: 'node /opt/webtty-agent/server.mjs' },
+        { env: { PORT: { default: '7681junk' } } },
+    ),
+    routedStartOnlyNeedsCoreDeps: manifestNeedsCoreDependencies(
+        { start: 'node /opt/webtty-agent/server.mjs' },
+        { env: { PORT: { default: '7681' } }, openPorts: ['127.0.0.1:7681:7681'] },
+    ),
+    unroutedStartOnlySkipsCoreDeps: manifestNeedsCoreDependencies(
+        { start: 'sh /code/start.sh' },
+        { openPorts: ['127.0.0.1:7001:7001', '127.0.0.1:7002:7002'] },
+    ),
+}));`,
+            {},
+            { cwd: workspaceDir },
+        );
+
+        assert.equal(result.status, 0, result.stderr);
+        assert.deepEqual(JSON.parse(result.stdout), {
+            defaultAgent: true,
+            explicitAgent: true,
+            startAndAgent: true,
+            startOnly: false,
+            startOnlyPort: { port: 7681 },
+            ambiguousStartOnly: null,
+            malformedStartOnlyPort: null,
+            routedStartOnlyNeedsCoreDeps: true,
+            unroutedStartOnlySkipsCoreDeps: false,
+        });
+    } finally {
+        fs.rmSync(workspaceDir, { recursive: true, force: true });
+    }
+});
+
 test('default Podman networking preserves Podman Machine host resolution only on macOS', () => {
     const workspaceDir = tempDir();
     try {

@@ -214,20 +214,30 @@ function resetBackoff() {
 }
 
 // Health check function
+function buildHealthCheckRequestOptions(port = CONFIG.PORT, env = process.env) {
+    const publicAuthority = String(env.PLOINKY_PUBLIC_AUTHORITY || '').trim();
+    return {
+        hostname: '127.0.0.1',
+        port,
+        path: '/health',
+        headers: {
+            Host: publicAuthority || `127.0.0.1:${port}`,
+        },
+    };
+}
+
 async function performHealthCheck() {
     if (!CONFIG.HEALTH_CHECK_ENABLED || state.isShuttingDown) {
         return true;
     }
     
     return new Promise((resolve) => {
-        const healthUrl = `http://127.0.0.1:${CONFIG.PORT}/health`;
-        
         const timeout = setTimeout(() => {
             req.destroy();
             resolve(false);
         }, CONFIG.HEALTH_CHECK_TIMEOUT_MS);
         
-        const req = http.get(healthUrl, (res) => {
+        const req = http.get(buildHealthCheckRequestOptions(), (res) => {
             clearTimeout(timeout);
             
             let data = '';
@@ -675,5 +685,6 @@ export {
     getTestLogs,
     clearTestLogs,
     getRouterNodeExecutable,
+    buildHealthCheckRequestOptions,
     IS_TEST_MODE as __IS_TEST_MODE
 };

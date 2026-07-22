@@ -40,6 +40,28 @@ function rejectLegacy(value, path = 'routing') {
     }
 }
 
+function rejectLegacyRoute(route, path) {
+    if (!route || typeof route !== 'object') return;
+    for (const [key, child] of Object.entries(route)) {
+        if (LEGACY_KEYS.has(key)) throw new Error(`generationCompile: forbidden legacy field ${path}.${key}`);
+        if (key === 'manifest' || key === 'mcpConfig') continue;
+        rejectLegacy(child, `${path}.${key}`);
+    }
+}
+
+function rejectLegacyRoutingState(routing) {
+    for (const [key, child] of Object.entries(routing || {})) {
+        if (LEGACY_KEYS.has(key)) throw new Error(`generationCompile: forbidden legacy field routing.${key}`);
+        if (key !== 'routes') {
+            rejectLegacy(child, `routing.${key}`);
+            continue;
+        }
+        for (const [routeKey, route] of Object.entries(child || {})) {
+            rejectLegacyRoute(route, `routing.routes.${routeKey}`);
+        }
+    }
+}
+
 function compileSurfaces(routing, options) {
     const source = routing.surfaces || options.surfaces || {};
     const publicAuthority = normalizeAuthority(source.public?.authority || options.publicAuthority, 'public');
@@ -241,7 +263,7 @@ export function compileGeneration({ routingBytes, policyBytes = '{}', ...options
     const capturedPolicyBytes = exactBytes(policyBytes, 'policy');
     const routing = parseJson(capturedRoutingBytes, 'routing');
     const policy = parseJson(capturedPolicyBytes, 'policy');
-    rejectLegacy(routing);
+    rejectLegacyRoutingState(routing);
     const limits = compileProxyLimits(routing.limits || options.limits || {});
     const surfaces = compileSurfaces(routing, options);
     const routes = {};

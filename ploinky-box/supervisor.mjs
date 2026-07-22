@@ -1,0 +1,351 @@
+import path from 'node:path';
+import http from 'node:http';
+
+import { BOX_IMAGE_REFERENCE, BOX_LABELS } from './constants.mjs';
+import { inspectAndValidateExistingImage } from './contract/image.mjs';
+import { discoverBoxOwnership } from './engine/discovery.mjs';
+import { PloinkyBoxError } from './errors.mjs';
+import { resolveWorkspaceIdentity } from './identity.mjs';
+import { createMutationLockManager, withWorkspaceMutationLock } from './locks.mjs';
+import { buildEngineProcessEnvironment, createProcessRunner } from './process.mjs';
+import {
+    removeContainerById,
+    stopCoreByContainerId,
+} from './lifecycle/container.mjs';
+import { reconcileBoxContainer } from './lifecycle/transactions.mjs';
+
+function supervisorError(message, code = 'PLOINKY_BOX_SUPERVISOR_FAILED') {
+    return new PloinkyBoxError(message, { code });
+}
+
+function assertMutableOwnership(ownership) {
+    if (!['absent', 'owned'].includes(ownership?.state)) {
+        throw supervisorError(
+            ownership?.message || `Box ownership is ${ownership?.state || 'unknown'}`,
+            `PLOINKY_BOX_${String(ownership?.state || 'unknown').toUpperCase()}`,
+        );
+    }
+    return ownership;
+}
+
+function defaultDiscovery(identity, runner, platform, env) {
+    return discoverBoxOwnership(identity, { runner, platform, env });
+}
+
+export function createBoxSupervisor({
+    runner = createProcessRunner({ env: buildEngineProcessEnvironment() }),
+    lockManager = createMutationLockManager(),
+    resolveIdentity = () => resolveWorkspaceIdentity(),
+    discover = defaultDiscovery,
+    platform = process.platform,
+    env = process.env,
+    repositoryRoot = path.resolve(import.meta.dirname, '..'),
+    reconcile = reconcileBoxContainer,
+    validateExistingImage = inspectAndValidateExistingImage,
+    startCore = runBoundedCoreStart,
+    healthCheck = checkBoxHealth,
+    stdout = process.stdout,
+    stderr = process.stderr,
+} = {}) {
+    function inspect(identity) {
+        return discover(identity, runner, platform, env);
+    }
+
+    async function lockedMutation(execute) {
+        return withWorkspaceMutationLock({
+            resolveIdentity,
+            lockManager,
+            beforeAnchor(identity) {
+                return assertMutableOwnership(inspect(identity));
+            },
+            execute,
+        });
+    }
+
+    async function prepareBoxForCommand({
+        explicitPort,
+        imageRef = BOX_IMAGE_REFERENCE,
+    } = {}) {
+        return lockedMutation(async (identity, lock, ownership) => {
+            const prepared = await reconcile({
+                identity,
+                ownership,
+                engine: ownership.engine,
+                runner,
+                lock,
+                repositoryRoot,
+                explicitPort,
+                imageRef,
+                platform,
+                env,
+            });
+            const containerId = prepared.ownership.handles.container.id;
+            ensureBoxDependencies(ownership.engine, containerId, runner);
+            return Object.freeze({ identity, ...prepared, containerId, engine: ownership.engine });
+        });
+    }
+
+    async function runStartTransaction(coreArgs = [], options = {}) {
+        return lockedMutation(async (identity, lock, ownership) => {
+            const prepared = await reconcile({
+                identity,
+                ownership,
+                engine: ownership.engine,
+                runner,
+                lock,
+                repositoryRoot,
+                explicitPort: options.explicitPort,
+                imageRef: options.imageRef || BOX_IMAGE_REFERENCE,
+                platform,
+                env,
+            });
+            const containerId = prepared.ownership.handles.container.id;
+            ensureBoxDependencies(ownership.engine, containerId, runner);
+            await startCore(
+                ownership.engine,
+                containerId,
+                coreArgs,
+                prepared.hostPort,
+                runner,
+                { stdout, stderr },
+            );
+            await healthCheck(prepared.hostPort);
+            return Object.freeze({ identity, ...prepared, containerId });
+        });
+    }
+
+    async function runStopTransaction() {
+        return lockedMutation(async (identity, lock, ownership) => {
+            const container = ownership.handles?.container;
+            if (!container) {
+                return Object.freeze({ identity, action: 'absent' });
+            }
+            if (container.runtime.running) {
+                let helperError = null;
+                try {
+                    stopCoreByContainerId(ownership.engine, container.id, runner);
+                } catch (error) {
+                    helperError = error;
+                } finally {
+                    runner.run(ownership.engine.name, [
+                        'container', 'stop', '--time', '30', container.id,
+                    ]);
+                }
+                if (helperError) {
+                    throw supervisorError(
+                        `Outer Box stopped after the dependency-free core stop reported: ${helperError.message}`,
+                    );
+                }
+            }
+            return Object.freeze({ identity, action: 'stopped', containerId: container.id });
+        });
+    }
+
+    async function runDestroyTransaction(expectedContainerId) {
+        return lockedMutation(async (identity, lock, ownership) => {
+            const container = ownership.handles?.container;
+            if (!container) {
+                return Object.freeze({ identity, action: 'absent' });
+            }
+            if (!expectedContainerId || container.id !== expectedContainerId) {
+                throw supervisorError('Box changed after destroy confirmation; nothing was removed');
+            }
+            removeContainerById(ownership.engine, container.id, runner);
+            return Object.freeze({ identity, action: 'destroyed', containerId: container.id });
+        });
+    }
+
+    function inspectBoxStatus() {
+        const identity = resolveIdentity();
+        const ownership = inspect(identity);
+        if (ownership.state !== 'owned') {
+            return Object.freeze({ identity, ownership, state: ownership.state });
+        }
+        const container = ownership.handles?.container;
+        if (!container) {
+            return Object.freeze({ identity, ownership, state: 'absent-retained-volumes' });
+        }
+        try {
+            validateExistingImage(
+                ownership.engine.name,
+                container.runtime?.imageId,
+                container.labels?.[BOX_LABELS.imageRef],
+                runner,
+            );
+        } catch (error) {
+            return Object.freeze({
+                identity,
+                ownership,
+                state: 'incompatible',
+                detail: String(error.message || 'Owned Box image is incompatible'),
+            });
+        }
+        if (!container.runtime.running) {
+            return Object.freeze({ identity, ownership, state: 'stopped' });
+        }
+        const inbox = runner.query(ownership.engine.name, [
+            'container', 'exec',
+            '--user', 'podman',
+            '--workdir', '/workspace',
+            container.id,
+            '/usr/local/bin/node',
+            '/opt/ploinky/ploinky-box/inbox/readStatus.mjs',
+        ]);
+        if (!inbox.ok) {
+            return Object.freeze({
+                identity,
+                ownership,
+                state: 'running-transient',
+                inbox: null,
+            });
+        }
+        try {
+            const parsed = JSON.parse(String(inbox.stdout || '').trim());
+            const allowlisted = Object.freeze({
+                state: String(parsed.state || 'unknown'),
+                initialized: parsed.initialized === true,
+                routingConfigured: parsed.routingConfigured === true,
+                trackedAgents: Number(parsed.trackedAgents) || 0,
+                runningAgents: Number(parsed.runningAgents) || 0,
+                warnings: Object.freeze(Array.isArray(parsed.warnings)
+                    ? parsed.warnings.map(String)
+                    : []),
+            });
+            return Object.freeze({
+                identity,
+                ownership,
+                state: allowlisted.initialized ? 'running-initialized' : 'running-uninitialized',
+                inbox: allowlisted,
+            });
+        } catch {
+            return Object.freeze({
+                identity,
+                ownership,
+                state: 'running-transient',
+                inbox: null,
+            });
+        }
+    }
+
+    function planDryRun(options = {}) {
+        const { identity, ownership } = inspectBoxStatus();
+        return Object.freeze({
+            identity: identity.instance,
+            ownership: ownership.state,
+            desiredImage: BOX_IMAGE_REFERENCE,
+            desiredHostPort: options.explicitPort || null,
+            mutationPerformed: false,
+        });
+    }
+
+    return Object.freeze({
+        prepareBoxForCommand,
+        runStartTransaction,
+        runStopTransaction,
+        runDestroyTransaction,
+        inspectBoxStatus,
+        planDryRun,
+    });
+}
+
+export function ensureBoxDependencies(engine, containerId, runner) {
+    runner.run(engine.name, [
+        'container', 'exec',
+        '--user', 'podman',
+        '--workdir', '/workspace',
+        containerId,
+        '/opt/ploinky/bin/ploinky-install-deps',
+    ]);
+}
+
+export function formatBoxStatus(status) {
+    const lines = [
+        `Ploinky Box: ${status.state}`,
+        `Workspace identity: ${status.identity.instance}`,
+    ];
+    if (status.inbox) {
+        lines.push(`Core initialized: ${status.inbox.initialized ? 'yes' : 'no'}`);
+        lines.push(`Routing configured: ${status.inbox.routingConfigured ? 'yes' : 'no'}`);
+        lines.push(`Tracked agents: ${status.inbox.trackedAgents}`);
+        lines.push(`Running agents: ${status.inbox.runningAgents}`);
+        for (const warning of status.inbox.warnings) lines.push(`Warning: ${warning}`);
+    } else if (status.detail || status.ownership?.message) {
+        lines.push(`Detail: ${status.detail || status.ownership.message}`);
+    }
+    return `${lines.join('\n')}\n`;
+}
+
+export async function runBoundedCoreStart(
+    engine,
+    containerId,
+    coreArgv,
+    hostPort,
+    runner,
+    {
+        stdout = process.stdout,
+        stderr = process.stderr,
+        timeoutMs = 1_800_000,
+    } = {},
+) {
+    if (!Array.isArray(coreArgv) || !coreArgv.includes('start')) {
+        throw supervisorError('Bounded core start requires normalized start argv');
+    }
+    const result = runner.query(engine.name, [
+        'container', 'exec',
+        '--user', 'podman',
+        '--workdir', '/workspace',
+        containerId,
+        '/opt/ploinky/bin/ploinky-local',
+        ...coreArgv,
+    ], { timeoutMs });
+    if (result.stdout) stdout.write(result.stdout);
+    if (result.stderr) stderr.write(result.stderr);
+    if (!result.ok) {
+        throw supervisorError(`In-box start failed with status ${result.status}`);
+    }
+    const externalDashboard = `http://127.0.0.1:${hostPort}/dashboard`;
+    if (!String(result.stdout || '').includes(`[start] Dashboard: ${externalDashboard}`)) {
+        throw supervisorError(`In-box start did not report the public Dashboard URL ${externalDashboard}`);
+    }
+    if (Number(hostPort) !== 8080
+        && String(result.stdout || '').includes('[start] Dashboard: http://127.0.0.1:8080/dashboard')) {
+        throw supervisorError('In-box start advertised its internal-only Dashboard URL');
+    }
+    return result.status;
+}
+
+export function checkBoxHealth(hostPort, {
+    httpGet,
+    timeoutMs = 5_000,
+} = {}) {
+    return new Promise((resolve, reject) => {
+        const selectedGet = httpGet || http.get;
+        try {
+            const request = selectedGet({
+                hostname: '127.0.0.1',
+                port: Number(hostPort),
+                path: '/health',
+                headers: { Host: `127.0.0.1:${hostPort}` },
+            }, (response) => {
+                let body = '';
+                response.setEncoding('utf8');
+                response.on('data', (chunk) => { body += chunk; });
+                response.on('end', () => {
+                    try {
+                        const health = JSON.parse(body);
+                        if (response.statusCode === 200 && health.status === 'healthy') resolve(true);
+                        else reject(supervisorError('Public Box health check was unhealthy'));
+                    } catch (error) {
+                        reject(supervisorError('Public Box health response was malformed'));
+                    }
+                });
+            });
+            request.setTimeout(timeoutMs, () => request.destroy(new Error('health timeout')));
+            request.on('error', (error) => reject(supervisorError(`Public Box health check failed: ${error.message}`)));
+        } catch (error) {
+            reject(supervisorError(`Public Box health check failed: ${error.message}`));
+        }
+    });
+}
+
+export const defaultBoxSupervisor = createBoxSupervisor;

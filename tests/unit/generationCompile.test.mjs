@@ -60,6 +60,33 @@ test('generation compilation rejects legacy targets, ambiguous surfaces, and inc
     })), /denied port/);
 });
 
+test('generation compilation treats captured manifest and MCP documents as opaque', () => {
+    const input = generationInput({
+        route: {
+            manifest: {
+                profiles: {
+                    default: { openPorts: ['127.0.0.1:7681:7681'] },
+                },
+            },
+            mcpConfig: {
+                tools: [{ inputSchema: { hostPort: { type: 'number' } } }],
+            },
+        },
+    });
+    const generation = compileGeneration(input);
+    assert.deepEqual(
+        generation.routes.alpha.manifest.profiles.default.openPorts,
+        ['127.0.0.1:7681:7681'],
+    );
+
+    const state = JSON.parse(input.routingBytes);
+    state.routes.alpha.relay.openPorts = [7000];
+    assert.throws(() => compileGeneration({
+        ...input,
+        routingBytes: Buffer.from(JSON.stringify(state)),
+    }), /forbidden legacy field routing\.routes\.alpha\.relay\.openPorts/);
+});
+
 test('generation compilation rejects reserved owners and invalid trusted limits', () => {
     const state = routingState();
     state.routes['base-agent-additional-server'] = state.routes.alpha;

@@ -128,12 +128,50 @@ function hasReusableRuntimeIdentity(existingRecord, runtime, runtimeIdentity, ta
         && Boolean(String(existingRecord?.effectiveInstanceId || '').trim());
 }
 
-function buildRuntimeServiceDescriptor({ runtime, containerName, agentName, repoName, manifest, existingRecord = {} }) {
+function validServicePort(value) {
+    const text = String(value ?? '').trim();
+    if (!/^\d+$/.test(text)) return null;
+    const port = Number.parseInt(text, 10);
+    return Number.isInteger(port) && port >= 1 && port <= 65535 ? port : null;
+}
+
+function resolveRuntimePrimaryService(manifest, profileConfig = null) {
+    const startCommand = readManifestStartCommand(manifest);
+    const agentCommand = readManifestAgentCommand(manifest).raw;
+    if (!startCommand || agentCommand) return { port: 7000 };
+
+    const portSetting = profileConfig?.env?.PORT;
+    const profilePort = validServicePort(
+        portSetting && typeof portSetting === 'object' ? portSetting.default : portSetting,
+    );
+    return profilePort ? { port: profilePort } : null;
+}
+
+function manifestHasRuntimePrimaryService(manifest, profileConfig = null) {
+    return Boolean(resolveRuntimePrimaryService(manifest, profileConfig));
+}
+
+function manifestNeedsCoreDependencies(manifest, profileConfig = null, options = {}) {
+    const hasStartCommand = Boolean(readManifestStartCommand(manifest));
+    return !hasStartCommand
+        || options.agentHasPackageJson === true
+        || options.llmRuntime === true
+        || manifestHasRuntimePrimaryService(manifest, profileConfig);
+}
+
+function buildRuntimeServiceDescriptor({
+    runtime,
+    containerName,
+    agentName,
+    repoName,
+    manifest,
+    profileConfig = null,
+    existingRecord = {},
+}) {
     const { containerId, networkMode } = inspectRuntimeIdentity(runtime, containerName);
     const targetAgentId = deriveAgentPrincipalId(repoName, agentName);
     const enableGeneration = String(existingRecord.enableGeneration || randomUUID());
     const effectiveInstanceId = String(existingRecord.effectiveInstanceId || `${targetAgentId}@${enableGeneration}`);
-    const hasRuntimePrimaryService = !readManifestStartCommand(manifest) && !readManifestAgentCommand(manifest).raw;
     const confined = networkMode !== 'host' && networkMode !== 'none';
     return {
         containerName,
@@ -152,7 +190,7 @@ function buildRuntimeServiceDescriptor({ runtime, containerName, agentName, repo
             effectiveInstanceId,
             networkMode,
         } : null,
-        primaryService: hasRuntimePrimaryService ? { port: 7000 } : null,
+        primaryService: resolveRuntimePrimaryService(manifest, profileConfig),
     };
 }
 
@@ -682,7 +720,10 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     // INSTALL PHASE — runtime containers never run npm install. Dependency
     // preparation happens here, before runtime boot, via a dedicated cache.
     const agentHasPackageJson = fs.existsSync(path.join(agentCodePath, 'package.json'));
-    const needsCoreDeps = !useStartEntry || agentHasPackageJson || isLlmRuntimeManifest(manifest, profileConfig);
+    const needsCoreDeps = manifestNeedsCoreDependencies(manifest, profileConfig, {
+        agentHasPackageJson,
+        llmRuntime: isLlmRuntimeManifest(manifest, profileConfig),
+    });
     let preparedNodeModulesDir = path.join(agentWorkDir, 'node_modules');
     if (needsCoreDeps) {
         const runtimeKey = detectRuntimeKeyForAgent(manifest, repoName, agentName, profileConfig, image);
@@ -1039,7 +1080,10 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         ? ['HF_HOME', 'PLOINKY_MODELS_DIR', 'PLOINKY_DERIVED_DIR', 'PLOINKY_RUNTIME_DIR', 'PLOINKY_LAUNCHERS_DIR', 'PLOINKY_MCP_PORT', 'PLOINKY_LLM_PUBLIC_PORT', 'PLOINKY_LLM_MCP_PORT', 'PLOINKY_LLM_CONTROL_PORT', 'PLOINKY_INFERENCE_PORT']
         : [];
     const persistedRecord = agents[containerName] || existingRecord;
-    const runtimeService = buildRuntimeServiceDescriptor({ runtime, containerName, agentName, repoName, manifest, existingRecord: persistedRecord });
+    const runtimeService = buildRuntimeServiceDescriptor({
+        runtime, containerName, agentName, repoName, manifest, profileConfig,
+        existingRecord: persistedRecord,
+    });
     agents[containerName] = {
         agentName,
         repoName,
@@ -1292,7 +1336,9 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
         if (canReuseExisting) {
             debugLog(`[ensureAgentService] ${agentName}: returning early (container exists)`);
             syncAgentMcpConfig(containerName, agentPath, agentName);
-            return buildRuntimeServiceDescriptor({ runtime, containerName, agentName, repoName, manifest, existingRecord });
+            return buildRuntimeServiceDescriptor({
+                runtime, containerName, agentName, repoName, manifest, profileConfig, existingRecord,
+            });
         }
     }
 
@@ -1303,7 +1349,9 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
         routerPort: runtimeRouterEnv.PLOINKY_ROUTER_PORT,
         routerHost: runtimeRouterEnv.PLOINKY_ROUTER_HOST
     });
-    const runtimeService = buildRuntimeServiceDescriptor({ runtime, containerName, agentName, repoName, manifest, existingRecord });
+    const runtimeService = buildRuntimeServiceDescriptor({
+        runtime, containerName, agentName, repoName, manifest, profileConfig, existingRecord,
+    });
 
     const agentCodePath = getAgentCodePath(agentName);
     const agentSkillsPath = getAgentSkillsPath(agentName);
@@ -1390,6 +1438,9 @@ export {
     ensureManifestVolumeHostPath,
     ensurePodmanStagedCodeDir,
     hasReusableRuntimeIdentity,
+    manifestHasRuntimePrimaryService,
+    manifestNeedsCoreDependencies,
+    resolveRuntimePrimaryService,
     mergeNodeOptions,
     podmanMountSuffix,
     startAgentContainer

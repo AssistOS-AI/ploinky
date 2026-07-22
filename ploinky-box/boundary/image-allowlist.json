@@ -1,0 +1,8 @@
+[
+  "images/ploinky-box/Dockerfile",
+  "images/ploinky-box/entrypoint.sh",
+  ".github/workflows/publish-ploinky-box-image.yml",
+  "tests/image-definitions.test.mjs",
+  "tests/box-transport-entrypoint.test.mjs",
+  "README.md"
+]

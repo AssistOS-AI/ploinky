@@ -1,0 +1,256 @@
+import {
+    BOX_RUNTIME_CONTRACT,
+    BOX_RUNTIME_CONTRACT_LABEL,
+} from '../constants.mjs';
+import { PloinkyBoxError } from '../errors.mjs';
+
+export const IMAGE_CONTRACT = Object.freeze({
+    user: 'podman',
+    home: '/home/podman',
+    workdir: '/workspace',
+    path: '/opt/ploinky/bin:/usr/local/bin:/usr/bin',
+    entrypoint: '/usr/local/bin/ploinky-box-entrypoint',
+    command: Object.freeze([]),
+    volumes: Object.freeze({}),
+    environment: Object.freeze({
+        PATH: '/opt/ploinky/bin:/usr/local/bin:/usr/bin',
+        USER: 'podman',
+        HOME: '/home/podman',
+        PLOINKY_WORKSPACE_ROOT: '/workspace',
+        PLOINKY_DISABLE_HOST_SANDBOX: '1',
+        container: 'oci',
+        _CONTAINERS_USERNS_CONFIGURED: '',
+        BUILDAH_ISOLATION: 'chroot',
+    }),
+    contractLabel: BOX_RUNTIME_CONTRACT_LABEL,
+    contract: BOX_RUNTIME_CONTRACT,
+    requiredBinaries: Object.freeze([
+        'node',
+        'podman',
+        'bash',
+        'ip',
+        'fuse-overlayfs',
+        '/usr/local/bin/ploinky-box-entrypoint',
+    ]),
+    networkHelpers: Object.freeze(['pasta', 'slirp4netns']),
+});
+
+function contractError(
+    imageRef,
+    field,
+    expected,
+    observed,
+    code = 'PLOINKY_BOX_IMAGE_CONTRACT_INVALID',
+    guidance = '',
+) {
+    const shown = observed === undefined || observed === null || observed === ''
+        ? '<missing>'
+        : JSON.stringify(observed);
+    return new PloinkyBoxError(
+        `Runtime image '${imageRef}' has invalid ${field}; expected ${expected}, observed ${shown}${guidance}`,
+        { code },
+    );
+}
+
+function singularRecord(raw) {
+    const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
+    if (Array.isArray(parsed)) {
+        if (parsed.length !== 1) {
+            throw new Error('image inspection must contain exactly one record');
+        }
+        return parsed[0];
+    }
+    return parsed;
+}
+
+function isRecord(value) {
+    return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function envMap(entries) {
+    if (!Array.isArray(entries)) {
+        return null;
+    }
+    const result = {};
+    for (const entry of entries) {
+        const text = String(entry);
+        const separator = text.indexOf('=');
+        const key = separator < 0 ? text : text.slice(0, separator);
+        if (!key || Object.hasOwn(result, key)) {
+            return null;
+        }
+        result[key] = separator < 0 ? '' : text.slice(separator + 1);
+    }
+    return result;
+}
+
+export function normalizeImageInspect(raw) {
+    let record;
+    try {
+        record = singularRecord(raw);
+    } catch (error) {
+        throw contractError('<unknown>', 'inspection', 'one complete record', error.message);
+    }
+    if (!isRecord(record) || !isRecord(record.Config)) {
+        throw contractError('<unknown>', 'inspection', 'one complete record', record);
+    }
+    const config = record.Config;
+    return Object.freeze({
+        id: String(record.Id ?? record.ID ?? '').trim(),
+        user: String(config.User ?? ''),
+        workdir: String(config.WorkingDir ?? ''),
+        environment: envMap(config.Env),
+        entrypoint: Array.isArray(config.Entrypoint)
+            ? config.Entrypoint.map(String)
+            : null,
+        command: config.Cmd === null || config.Cmd === undefined
+            ? []
+            : Array.isArray(config.Cmd) ? config.Cmd.map(String) : null,
+        volumes: config.Volumes === null || config.Volumes === undefined
+            ? {}
+            : isRecord(config.Volumes) ? { ...config.Volumes } : null,
+        labels: isRecord(config.Labels) ? { ...config.Labels } : {},
+    });
+}
+
+function sameRecord(left, right) {
+    const leftKeys = Object.keys(left || {}).sort();
+    const rightKeys = Object.keys(right || {}).sort();
+    return leftKeys.length === rightKeys.length
+        && leftKeys.every((key, index) => (
+            key === rightKeys[index] && left[key] === right[key]
+        ));
+}
+
+export function validateImageContract(image, imageRef, {
+    availableBinaries,
+} = {}) {
+    if (!image || typeof image !== 'object') {
+        throw contractError(imageRef, 'inspection', 'one complete record', image);
+    }
+    if (!image.id) {
+        throw contractError(imageRef, 'image ID', 'a nonempty immutable ID', image.id);
+    }
+    const observedContract = image.labels?.[BOX_RUNTIME_CONTRACT_LABEL];
+    if (observedContract !== BOX_RUNTIME_CONTRACT) {
+        throw contractError(
+            imageRef,
+            BOX_RUNTIME_CONTRACT_LABEL,
+            JSON.stringify(BOX_RUNTIME_CONTRACT),
+            observedContract,
+            'PLOINKY_BOX_IMAGE_CONTRACT_HARD_CUT',
+            '; destroy and recreate the Box with a contract-6 image',
+        );
+    }
+    if (image.user !== IMAGE_CONTRACT.user) {
+        throw contractError(imageRef, 'Config.User', JSON.stringify(IMAGE_CONTRACT.user), image.user);
+    }
+    if (image.workdir !== IMAGE_CONTRACT.workdir) {
+        throw contractError(imageRef, 'Config.WorkingDir', JSON.stringify(IMAGE_CONTRACT.workdir), image.workdir);
+    }
+    if (!sameRecord(image.environment, IMAGE_CONTRACT.environment)) {
+        throw contractError(
+            imageRef,
+            'Config.Env',
+            `exactly ${JSON.stringify(IMAGE_CONTRACT.environment)}`,
+            image.environment,
+        );
+    }
+    if (!Array.isArray(image.entrypoint)
+        || image.entrypoint.length !== 1
+        || image.entrypoint[0] !== IMAGE_CONTRACT.entrypoint) {
+        throw contractError(
+            imageRef,
+            'Config.Entrypoint',
+            JSON.stringify([IMAGE_CONTRACT.entrypoint]),
+            image.entrypoint,
+        );
+    }
+    if (!Array.isArray(image.command) || image.command.length !== 0) {
+        throw contractError(imageRef, 'Config.Cmd', 'absent or empty', image.command);
+    }
+    if (!isRecord(image.volumes) || Object.keys(image.volumes).length !== 0) {
+        throw contractError(imageRef, 'Config.Volumes', 'absent or empty', image.volumes);
+    }
+    if (availableBinaries !== undefined) {
+        validateImageBinaries(availableBinaries, imageRef);
+    }
+    return Object.freeze({ ...image, immutableId: image.id });
+}
+
+export function validateImageBinaries(availableBinaries, imageRef) {
+    const available = new Set(Array.isArray(availableBinaries) ? availableBinaries : []);
+    for (const binary of IMAGE_CONTRACT.requiredBinaries) {
+        if (!available.has(binary)) {
+            throw contractError(imageRef, `required binary ${binary}`, 'present and executable', 'missing');
+        }
+    }
+    if (!IMAGE_CONTRACT.networkHelpers.some((binary) => available.has(binary))) {
+        throw contractError(
+            imageRef,
+            'rootless network helper',
+            'pasta or slirp4netns',
+            'missing',
+        );
+    }
+    return Object.freeze([...available]);
+}
+
+export function probeImageBinaries(engine, imageId, runner) {
+    const result = runner.query(engine, [
+        'run',
+        '--rm',
+        '--network=none',
+        '--entrypoint=/bin/bash',
+        imageId,
+        '-c',
+        [
+            'set -eu',
+            "for name in node podman bash ip fuse-overlayfs; do command -v \"$name\"; done",
+            'test -x /usr/local/bin/ploinky-box-entrypoint',
+            "printf '%s\\n' /usr/local/bin/ploinky-box-entrypoint",
+            "if command -v pasta >/dev/null 2>&1; then command -v pasta; elif command -v slirp4netns >/dev/null 2>&1; then command -v slirp4netns; else exit 17; fi",
+        ].join('; '),
+    ]);
+    if (!result.ok) {
+        throw contractError(imageId, 'required binaries', 'all contract-6 tools', 'probe failed');
+    }
+    const observedPaths = String(result.stdout || '').split(/\r?\n/).filter(Boolean);
+    const available = observedPaths.map((value) => (
+        value === IMAGE_CONTRACT.entrypoint ? value : value.split('/').pop()
+    ));
+    return validateImageBinaries(available, imageId);
+}
+
+export function inspectAndValidateImage(engine, imageRef, runner) {
+    const result = runner.query(engine, ['image', 'inspect', imageRef]);
+    if (!result.ok) {
+        throw new PloinkyBoxError(`Unable to inspect runtime image '${imageRef}'`, {
+            code: 'PLOINKY_BOX_IMAGE_INSPECT_FAILED',
+        });
+    }
+    const image = normalizeImageInspect(result.stdout);
+    validateImageContract(image, imageRef);
+    const availableBinaries = probeImageBinaries(engine, image.id, runner);
+    return validateImageContract(image, imageRef, { availableBinaries });
+}
+
+export function inspectAndValidateExistingImage(engine, imageId, imageRef, runner) {
+    const result = runner.query(engine, ['image', 'inspect', imageId]);
+    if (!result.ok) {
+        throw new PloinkyBoxError(
+            `Unable to verify the owned Box image '${imageId}'; destroy and recreate the Box`,
+            { code: 'PLOINKY_BOX_EXISTING_IMAGE_INSPECT_FAILED' },
+        );
+    }
+    const image = validateImageContract(normalizeImageInspect(result.stdout), imageRef);
+    if (image.immutableId !== imageId) {
+        throw contractError(
+            imageRef,
+            'image ID',
+            JSON.stringify(imageId),
+            image.immutableId,
+        );
+    }
+    return image;
+}

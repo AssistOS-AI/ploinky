@@ -476,6 +476,13 @@ async function waitForReadinessEntries(readinessEntries) {
   }));
 }
 
+function buildDashboardUrl(staticPort, env = process.env) {
+  const publicAuthority = String(env.PLOINKY_PUBLIC_AUTHORITY || '').trim();
+  return publicAuthority
+    ? `http://${publicAuthority}/dashboard`
+    : `http://127.0.0.1:${staticPort}/dashboard`;
+}
+
 async function startWorkspace(staticAgentArg, portArg, { refreshComponentToken, ensureComponentToken, enableAgent, killRouterIfRunning, branchPolicy } = {}) {
   // Clear the in-process preinstall dedup set so each workspace start (e.g.
   // a `restart` re-entering this function in the same CLI process) re-runs
@@ -886,7 +893,7 @@ async function startWorkspace(staticAgentArg, portArg, { refreshComponentToken, 
     console.log(`[start] Watchdog will automatically restart the server if it crashes.`);
     console.log(`[start] Server logs: ${path.join(LOGS_DIR, 'router.log')}`);
     console.log(`[start] Watchdog logs: ${path.join(LOGS_DIR, 'watchdog.log')}`);
-    console.log(`[start] Dashboard: http://127.0.0.1:${staticPort}/dashboard`);
+    console.log(`[start] Dashboard: ${buildDashboardUrl(staticPort)}`);
   } catch (e) {
     console.error('start (workspace) failed:', e.message);
   }
@@ -1259,6 +1266,7 @@ async function reinstallAgent(agentName) {
 
 export {
   buildBlockingReadinessEntryFromNode,
+  buildDashboardUrl,
   startWorkspace,
   runCli,
   runShell,
