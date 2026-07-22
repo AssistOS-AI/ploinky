@@ -114,7 +114,11 @@ export function validateContainerPublications(containerHandle, expectedHostPort)
         },
     ].sort((left, right) => JSON.stringify(left).localeCompare(JSON.stringify(right)));
     if (JSON.stringify(runtime.publications) !== JSON.stringify(expected)) {
-        throw publicationError('Owned Box publications do not match the fixed TCP/UDP contract');
+        throw publicationError(
+            'Owned Box publications do not match the fixed TCP/UDP contract: '
+            + `observed=${JSON.stringify(runtime.publications)} `
+            + `expected=${JSON.stringify(expected)}`,
+        );
     }
     if (containerHandle.labels?.[BOX_LABELS.routerHostPort] !== port) {
         throw publicationError('Owned Box host-port label does not match its publication');
