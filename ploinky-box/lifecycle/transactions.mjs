@@ -26,10 +26,11 @@ import {
 } from './container.mjs';
 
 function transactionError(message, cause, rollbackFailures = []) {
+    const causeSuffix = cause?.message ? `: ${cause.message}` : '';
     const suffix = rollbackFailures.length > 0
         ? `; rollback failures: ${rollbackFailures.join('; ')}`
         : '';
-    return new PloinkyBoxError(`${message}${suffix}`, {
+    return new PloinkyBoxError(`${message}${causeSuffix}${suffix}`, {
         code: rollbackFailures.length > 0
             ? 'PLOINKY_BOX_TRANSACTION_ROLLBACK_FAILED'
             : 'PLOINKY_BOX_TRANSACTION_FAILED',

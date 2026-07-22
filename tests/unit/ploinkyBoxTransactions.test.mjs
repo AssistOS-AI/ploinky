@@ -15,6 +15,7 @@ import { buildWorkspaceIdentity } from '../../ploinky-box/identity.mjs';
 import {
     containerCreateArgs,
     readContainerIdFromCidfile,
+    waitForReadyLine,
 } from '../../ploinky-box/lifecycle/container.mjs';
 import { reconcileBoxContainer } from '../../ploinky-box/lifecycle/transactions.mjs';
 
@@ -495,6 +496,25 @@ test('missing or corrupt cidfiles are fail-closed primitives', (t) => {
     const corrupt = path.join(state.root, 'corrupt.cid');
     fs.writeFileSync(corrupt, 'not-an-id\n');
     assert.throws(() => readContainerIdFromCidfile(corrupt), /corrupt/);
+});
+
+test('readiness failure preserves bounded container self-check diagnostics', async () => {
+    const runner = {
+        query(_command, args) {
+            if (args[1] === 'logs') {
+                return {
+                    ok: true,
+                    stdout: '',
+                    stderr: '[ploinky-box] SELF-CHECK FAILED: inner runtime is unavailable\n',
+                };
+            }
+            return { ok: true, stdout: 'exited\n', stderr: '' };
+        },
+    };
+    await assert.rejects(
+        () => waitForReadyLine({ name: 'podman' }, 'a'.repeat(64), runner),
+        /container logs: \[ploinky-box\] SELF-CHECK FAILED: inner runtime is unavailable/,
+    );
 });
 
 test('a corrupt cidfile can recover only through rediscovered immutable image identity', async (t) => {

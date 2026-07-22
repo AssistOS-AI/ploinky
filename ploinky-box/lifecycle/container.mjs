@@ -17,6 +17,17 @@ function lifecycleError(message, code = 'PLOINKY_BOX_LIFECYCLE_FAILED', cause) {
     return new PloinkyBoxError(message, { code, cause });
 }
 
+function containerLogDiagnostic(logs, limit = 2048) {
+    const text = [logs?.stdout, logs?.stderr]
+        .map((value) => String(value || '').trim())
+        .filter(Boolean)
+        .join('\n')
+        .replace(/\s+/g, ' ');
+    if (!text) return 'container logs were empty';
+    const bounded = text.length <= limit ? text : `…${text.slice(-limit)}`;
+    return `container logs: ${bounded}`;
+}
+
 export function containerCreateArgs({
     identity,
     imageId,
@@ -128,11 +139,17 @@ export async function waitForReadyLine(engine, containerId, runner, {
             'container', 'inspect', '--format', '{{.State.Status}}', containerId,
         ]);
         if (state.ok && !['created', 'running'].includes(String(state.stdout || '').trim())) {
-            throw lifecycleError(`Box container exited before ${readyLine}`);
+            throw lifecycleError(
+                `Box container exited before ${readyLine}; ${containerLogDiagnostic(logs)}`,
+            );
         }
         await delay(intervalMs);
     }
-    throw lifecycleError(`Timed out waiting for exact ready line: ${readyLine}`, 'PLOINKY_BOX_READY_TIMEOUT');
+    const logs = runner.query(engine.name, ['container', 'logs', containerId]);
+    throw lifecycleError(
+        `Timed out waiting for exact ready line: ${readyLine}; ${containerLogDiagnostic(logs)}`,
+        'PLOINKY_BOX_READY_TIMEOUT',
+    );
 }
 
 export function validateCreatedContainer(ownership, desired) {
