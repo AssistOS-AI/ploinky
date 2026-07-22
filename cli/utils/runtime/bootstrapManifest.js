@@ -287,7 +287,7 @@ function findEnabledDirectiveRecord(parsedDirective) {
     return null;
 }
 
-async function ensureDirectiveEnabled(parsedDirective) {
+async function ensureDirectiveEnabled(parsedDirective, enableAgentImpl = enableAgent) {
     const existing = findEnabledDirectiveRecord(parsedDirective);
     if (existing) {
         const profile = typeof parsedDirective?.profile === 'string' && parsedDirective.profile.trim()
@@ -300,7 +300,7 @@ async function ensureDirectiveEnabled(parsedDirective) {
         }
         return;
     }
-    await enableAgent(parsedDirective.spec, undefined, undefined, parsedDirective.alias, undefined, {
+    await enableAgentImpl(parsedDirective.spec, undefined, undefined, parsedDirective.alias, undefined, {
         profile: parsedDirective.profile,
     });
 }
@@ -310,6 +310,7 @@ async function applyManifestDirectivesInternal(agentNameOrPath, {
     profile = '',
     visited,
     enableAgents = true,
+    enableAgentImpl = enableAgent,
     stdio = 'inherit',
     logError = console.error,
 } = {}) {
@@ -383,7 +384,7 @@ async function applyManifestDirectivesInternal(agentNameOrPath, {
                     continue;
                 }
                 if (enableAgents) {
-                    await ensureDirectiveEnabled(qualified);
+                    await ensureDirectiveEnabled(qualified, enableAgentImpl);
                 }
                 const childRef = agentRefFromEnableSpec(qualified.spec);
                 if (childRef) {
@@ -392,6 +393,7 @@ async function applyManifestDirectivesInternal(agentNameOrPath, {
                         profile: qualified.profile || profile || '',
                         visited,
                         enableAgents,
+                        enableAgentImpl,
                         stdio,
                         logError,
                     });
@@ -407,9 +409,13 @@ async function applyManifestDirectivesInternal(agentNameOrPath, {
     }
 }
 
-export async function applyManifestDirectives(agentNameOrPath, { branchPolicy } = {}) {
+export async function applyManifestDirectives(agentNameOrPath, {
+    branchPolicy,
+    enableAgentImpl = enableAgent,
+} = {}) {
     return applyManifestDirectivesInternal(agentNameOrPath, {
         branchPolicy,
+        enableAgentImpl,
         visited: new Set(),
     });
 }

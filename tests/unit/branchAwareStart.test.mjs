@@ -149,6 +149,26 @@ function initManagedRepo(name, { branches = [] } = {}) {
     return repoPath;
 }
 
+async function recordEnabledAgentWithoutRuntime(agentSpec, _mode, _repoName, alias, _authMode, authOptions = {}) {
+    const [reference, ...modifiers] = String(agentSpec || '').trim().split(/\s+/).filter(Boolean);
+    const [repoName, agentName] = String(reference || '').split('/');
+    assert.ok(repoName && agentName, `expected a qualified agent reference, got '${agentSpec}'`);
+    const agentsPath = path.join(tempDir, '.ploinky', 'agents.json');
+    const agents = JSON.parse(fs.readFileSync(agentsPath, 'utf8'));
+    const routeName = alias || agentName;
+    const containerName = `ploinky_test_${repoName}_${routeName}`;
+    agents[containerName] = {
+        type: 'agent',
+        repoName,
+        agentName,
+        runMode: modifiers.includes('global') ? 'global' : 'local',
+        ...(alias ? { alias } : {}),
+        ...(authOptions.profile ? { profile: authOptions.profile } : {}),
+    };
+    fs.writeFileSync(agentsPath, `${JSON.stringify(agents, null, 2)}\n`);
+    return { containerName, repoName, shortAgentName: agentName, alias };
+}
+
 // ---------------------------------------------------------------------------
 // parseBranchPolicy tests
 // ---------------------------------------------------------------------------
@@ -585,6 +605,7 @@ test('applyManifestDirectives: profile enable auto-installs missing prefixed rep
     });
 
     await applyManifestDirectives('staticProfile/app', {
+        enableAgentImpl: recordEnabledAgentWithoutRuntime,
         branchPolicy: {
             branch: 'feature-profile',
             repoBranches: {},
@@ -632,7 +653,9 @@ test('applyManifestDirectives: child manifest repos are applied before recursive
         enable: ['toolRepo/tool global'],
     });
 
-    await applyManifestDirectives('staticChildRepos/app');
+    await applyManifestDirectives('staticChildRepos/app', {
+        enableAgentImpl: recordEnabledAgentWithoutRuntime,
+    });
 
     const workerRepoPath = path.join(tempDir, '.ploinky', 'repos', 'childWorkerRepo');
     assert.equal(fs.existsSync(workerRepoPath), true);
@@ -672,6 +695,7 @@ test('applyManifestDirectives: duplicate aliased child enables are idempotent un
     });
 
     await assert.doesNotReject(() => applyManifestDirectives('staticDiamond/app', {
+        enableAgentImpl: recordEnabledAgentWithoutRuntime,
         branchPolicy: {
             branch: 'main',
             repoBranches: {},

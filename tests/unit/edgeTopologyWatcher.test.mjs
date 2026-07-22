@@ -30,14 +30,12 @@ function waitForGeneration(observed, generation) {
     if (observed.some((entry) => entry.publicationGeneration === generation)) return Promise.resolve();
     return new Promise((resolve, reject) => {
         const deadline = setTimeout(() => reject(new Error(`topology generation ${generation} was not observed`)), 2_000);
-        deadline.unref?.();
         const poll = setInterval(() => {
             if (!observed.some((entry) => entry.publicationGeneration === generation)) return;
             clearInterval(poll);
             clearTimeout(deadline);
             resolve();
         }, 10);
-        poll.unref?.();
     });
 }
 

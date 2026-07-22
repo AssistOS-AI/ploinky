@@ -107,10 +107,10 @@ validate_existing_file() {
   [ ! -L "$path" ] || die_setup_error "artifact must not be a symlink: $path"
   [ -f "$path" ] || die_setup_error "artifact must be a regular file: $path"
   local mode owner_uid this_uid
-  mode=$(stat -f '%Lp' "$path" 2>/dev/null || stat -c '%a' "$path" 2>/dev/null || echo "")
+  mode=$(stat -c '%a' "$path" 2>/dev/null || stat -f '%Lp' "$path" 2>/dev/null || echo "")
   [ "$mode" = "$expected_mode" ] || [ "$mode" = "$normalized_mode" ] \
     || die_setup_error "artifact mode mismatch for $path: got ${mode:-unknown}, expected $expected_mode"
-  owner_uid=$(stat -f '%u' "$path" 2>/dev/null || stat -c '%u' "$path" 2>/dev/null || echo "")
+  owner_uid=$(stat -c '%u' "$path" 2>/dev/null || stat -f '%u' "$path" 2>/dev/null || echo "")
   this_uid=$(id -u)
   [ "$owner_uid" = "$this_uid" ] || die_setup_error "artifact must be owned by this user: $path"
 }
