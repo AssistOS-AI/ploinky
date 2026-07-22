@@ -5,7 +5,6 @@
     "type": "module",
     "main": "cloud/core/server.js",
     "bin": {
-        "p-cloud": "./bin/p-cloud",
         "ploinky": "./bin/ploinky",
         "ploinky-local": "./bin/ploinky-local"
     },
@@ -13,6 +12,7 @@
         "start": "cd test_run_dir node bin/p-cloud",
         "clean": "rm -rf test_run_dir",
         "test": "./tests/run-all.sh",
+        "e2e:routing-proxy": "node tests/e2e/routingProxy/run.mjs",
         "postinstall": "cd node_modules; git clone https://github.com/AssistOS-AI/AchillesAgentLib.git achillesAgentLib"
     },
     "keywords": [
@@ -26,13 +26,13 @@
     "author": "Ploinky Team",
     "license": "MIT",
     "engines": {
-        "node": ">=20.0.0"
+        "node": ">=14.0.0"
     },
     "repository": {
         "type": "git",
         "url": "https://github.com/AssistOS-AI/ploinky.git"
     },
     "dependencies": {
-        "mcp-sdk": "git+https://github.com/AssistOS-AI/MCPSDK.git#main"
+        "mcp-sdk": "github:AssistOS-AI/MCPSDK#main"
     }
 }

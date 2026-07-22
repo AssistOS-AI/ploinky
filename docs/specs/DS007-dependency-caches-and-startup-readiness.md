@@ -1,7 +1,7 @@
 ---
 id: DS007
 title: Dependency Caches and Startup Readiness
-status: partially implemented (rootless private-router reachability blocked)
+status: implemented
 owner: ploinky-team
 summary: Defines runtime-keyed dependency caches, publication-independent startup, private-target readiness, topology ordering, and coordinated generation apply across dependency waves.
 ---
@@ -29,7 +29,7 @@ The managed public-entrypoint boundary is:
 | `ploinky destroy` | Confirm exact instance and directly remove its outer container; retain named volumes |
 | REPL `status`/`stop`/`destroy` | Core workspace/router/agent scope; outer runtime remains |
 
-The host supervisor constructs contract 5 before invoking core startup and
+The host supervisor constructs outer contract 6 before invoking core startup and
 without reading a workspace, graph, profile, manifest, readiness result, or
 persisted publication state. Every one-shot command that can start an agent
 preserves dependency-graph ordering and core readiness behavior, but it cannot
@@ -47,13 +47,13 @@ resources, and foreign exact-name volumes fail without mutation. With no
 identity resources, answering Podman is preferred; a non-installed engine
 cannot participate in inventory. The mutable
 `docker.io/assistos/ploinky-box:runtime` channel is pulled only for create,
-validated as contract 5, and pinned by image ID for execution. Every
-non-contract-5 box, including contract 4, fails before pulling, volume creation,
+validated as outer contract 6, and pinned by image ID for execution. Every
+non-contract-6 box, including contracts 4 and 5, fails before pulling, volume creation,
 restart, upgrade, or replacement. It is never read as compatible state,
 migrated, relabelled, adopted, cleaned, or automatically replaced. The operator
 must run `ploinky destroy` explicitly before recreation; the workspace,
 nested-container-storage, and dependency named volumes remain retained.
-Creation-configuration drift in a contract-5 box follows the same explicit
+Creation-configuration drift in a contract-6 box follows the same explicit
 boundary: reconciliation reports the exact drift and performs no pull, stop,
 rename, removal, replacement, or rollback. Only an exactly compatible stopped
 box may be started in place.
@@ -107,17 +107,18 @@ unrelated consumers.
 
 Inside a marked outer box, all Ploinky-managed agents and dependency-install containers use nested Podman. Persisted bwrap/Seatbelt enablement and Docker fallback are ineffective there. Every Ploinky-created nested agent, helper, and sidecar container carries `io.assistos.ploinky.managed=1`; contract-v5 boot rejects retained exact matches without deleting or importing them. The old box must be made quiescent and its managed containers removed before explicit destroy/recreate. Enumeration failure fails the box self-check. Because the outer `-containers` volume survives destroy, unrecoverable state requires inspect/backup followed by explicit removal of that one named volume after the box is absent and data loss is accepted; v5 performs no cleanup path.
 
-Contract-5 managed-network startup additionally requires rootless Podman 5.4
+Core contract-v5 managed-network startup additionally requires rootless Podman 5.4
 or newer, Netavark, and operational `pasta`. Router public/control `8080` starts
-before consumers, private `8081` is intended to be reachable only from allowed
-managed interfaces, and detailed health uses the unmounted supervisor Unix
-socket. Managed `default` and `bridge` agents receive the private endpoint only
-through the exact `host.containers.internal:host-gateway` mapping;
+before consumers. Inside a marked Box, private `8081` binds the Box namespace
+wildcard but remains unpublished by the outer runtime; detailed health uses the
+unmounted supervisor Unix socket. Managed `default` and `bridge` agents receive
+the private endpoint only through the exact
+`host.containers.internal:host-gateway` mapping;
 capability-approved host agents use box loopback, and `none` agents receive no
-Router endpoint. On the currently observed rootless Podman topology that
-host-gateway terminates on the box outer-facing interface, so the bridge lane is
-blocked and remains fail-closed pending DS004 Question #8. Startup must not
-widen the listener or install a compatibility forwarder.
+Router endpoint. The host-gateway mapping grants transport reachability only;
+every request remains fail-closed behind policy, caller ACL, and an exact
+generation-bound private assertion. Startup does not install a compatibility
+forwarder or publish `8081`.
 
 After recursive repository preparation, Ploinky resolves a provider planning
 graph and stages an early inactive generation before static preinstall and

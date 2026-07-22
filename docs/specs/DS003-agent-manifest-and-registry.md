@@ -3,7 +3,7 @@ id: DS003
 title: Agent Manifest and Registry
 status: implemented
 owner: ploinky-team
-summary: Defines manifest and registry semantics, including slim HTTP service targets, inner-only open ports, exact host capability grants, and contract-v5 outer-boundary independence.
+summary: Defines manifest and registry semantics, including slim HTTP service targets, inner-only open ports, exact host capability grants, and outer-contract-6 boundary independence.
 ---
 
 # DS003 Agent Manifest and Registry
@@ -45,19 +45,19 @@ The managed public-entrypoint boundary is:
 
 The outer-runtime release channel is the mutable
 `docker.io/assistos/ploinky-box:runtime` reference and its image must satisfy
-the complete contract-5 metadata, including
-`io.assistos.ploinky.runtime-contract=5`. Only creating a missing box may pull
+the complete outer contract-6 metadata, including
+`io.assistos.ploinky.runtime-contract=6`. Only creating a missing box may pull
 and validate the selected reference, then run the validated image ID. Reusing a
 running box or starting a stopped, exactly compatible box must not pull; an
 existing box therefore stays pinned until an explicit destroy/recreate. Any
-creation-configuration drift in a contract-5 box is also recreate-required and
+creation-configuration drift in a contract-6 box is also recreate-required and
 fails before pull or mutation: the operator must explicitly destroy the box and
-then recreate it. Every non-contract-5 box is a
-hard cut, including contract 4, malformed, or identity-incompatible state. It
-fails before pulling, volume creation, restart, upgrade, or replacement.
+then recreate it. Every non-contract-6 box is a hard cut, including contracts 4
+and 5, malformed, or identity-incompatible state. It fails before pulling,
+volume creation, restart, upgrade, or replacement.
 Ploinky does not read, migrate, relabel, adopt, copy, clean, or automatically
 replace an older contract. The operator must run `ploinky destroy` explicitly
-and then recreate the contract-5 box; all three current named volumes remain
+and then recreate the contract-6 box; all three current named volumes remain
 retained.
 
 The host supervisor derives the box identity only from the canonical current

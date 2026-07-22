@@ -1,12 +1,8 @@
-#!/usr/bin/env bash
-set -euo pipefail
+#!/bin/bash
 
-SCRIPT_PATH="${BASH_SOURCE[0]}"
-while [[ -L "$SCRIPT_PATH" ]]; do
-    SCRIPT_DIR="$(cd -P "$(dirname "$SCRIPT_PATH")" >/dev/null 2>&1 && pwd)"
-    SCRIPT_PATH="$(readlink "$SCRIPT_PATH")"
-    [[ "$SCRIPT_PATH" != /* ]] && SCRIPT_PATH="$SCRIPT_DIR/$SCRIPT_PATH"
-done
-SCRIPT_DIR="$(cd -P "$(dirname "$SCRIPT_PATH")" >/dev/null 2>&1 && pwd)"
+# p-cli is an alias to ploinky command
+# Get the directory where the script is located
+SCRIPT_DIR=$(dirname "$(readlink -f "$0")")
 
-exec "$SCRIPT_DIR/ploinky" "$@"
+# Execute ploinky with all passed arguments
+"$SCRIPT_DIR/ploinky" "$@"

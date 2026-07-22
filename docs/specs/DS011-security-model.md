@@ -1,7 +1,7 @@
 ---
 id: DS011
 title: Security Model
-status: partially implemented (rootless private-router reachability blocked)
+status: implemented
 owner: ploinky-team
 supersedes: DS006 (partial - auth wire protocol)
 summary: Defines Ploinky trust boundaries for Cloudflare edge publication, closed Router surfaces, immutable generations, private service assertions, topology, TURN custody, and runtime isolation.
@@ -27,22 +27,23 @@ Some authenticated HTTP-service flows also require the router to carry the verif
 
 Agents are isolated from the host by containers, bubblewrap, or macOS Seatbelt. As of the per-agent identity model (DS013), each agent receives only its own canonical id `PLOINKY_AGENT_ID` and its own derived secret `PLOINKY_AGENT_SECRET`; the shared `PLOINKY_DERIVED_MASTER_KEY` is no longer injected for invocation signing. Code running inside an agent process that can read its environment can therefore forge tokens only for that agent (its own secret) — not for another agent, because it does not hold another agent's secret — and it still cannot decrypt the workspace stores or mint session JWTs, which use distinct derived subkeys the agent never sees. This restores non-repudiation between enabled agents within the single-workspace, operator-controlled trust model. The `derived-master` subkey is retained only as the root for agent-OWNED generated secrets (`generatedSecret`/`sharedGeneratedSecret`), not for request authorization. See DS013 for per-agent secret derivation and the three request-signed JWT families that replace the shared-HMAC invocation model.
 
-The Router public/control listener binds inside the box, and the approved design
-adds a private managed-interface listener; reachability alone is never
-authorization. The outer engine publishes only public/control `8080` to the
-physical host's selected loopback port; private `8081` is not an outer mapping.
-The exact `host.containers.internal:host-gateway` mapping is fixed transport
-configuration for managed bridge callers, not a capability. On the observed
-rootless topology it cannot reach an approved private-interface bind, so that
-lane remains inactive. Host-mode callers require an exact current-generation
-capability before launch and use box loopback, but capability grants network
-placement only; it does not authorize a request. Public HTTP reaches `8080` only through
+The Router public/control listener binds inside the box, and reachability alone
+is never authorization. Inside a marked Box the private listener binds the Box
+namespace wildcard so nested rootless Podman can reach it through the exact
+`host.containers.internal:host-gateway` transport mapping. Outside a marked Box,
+the listener uses exact loopback/managed addresses. The outer engine publishes
+only public/control `8080` to the physical host's selected loopback port;
+private `8081` is not an outer mapping. Host-mode callers require an exact
+current-generation capability before launch and use box loopback, but
+capability grants network placement only; it does not authorize a request.
+Public HTTP reaches `8080` only through
 the supervised outbound Cloudflare tunnel. Listener/interface class and exact
 Host select a closed route surface before pathname dispatch, and every control
 or private request must still satisfy its application credentials and policy.
-The observed rootless Podman host-gateway currently cannot satisfy the managed-
-interface bind without using the outer-facing interface, so bridge private
-service activation stays fail-closed as documented in DS004 Question #8.
+The Box-only wildcard bind resolves rootless Podman host-gateway transport while
+the absence of an outer `8081` publication and the exact private assertion
+contract preserve the physical-host and authorization boundaries documented in
+DS004 Question #8.
 
 ### Workspace Key and Encrypted Storage
 
@@ -194,7 +195,7 @@ Legacy agent client-credential auth is removed. `/auth/agent-token` returns gone
 
 ### Runtime Isolation and Mount Policy
 
-Outside a marked Ploinky box, the default runtime backend is a container runtime, preferring Podman when available and falling back to Docker. Host sandboxes are disabled by default and are selected only when the operator opts in via `ploinky sandbox enable` *and* the manifest requests `lite-sandbox: true`: Linux uses bubblewrap, macOS uses Seatbelt, and unsupported or unavailable host sandboxes fail with operator guidance rather than silently falling back. The environment variable `PLOINKY_DISABLE_HOST_SANDBOX=1` overrides any workspace opt-in and forces the container path. Inside a contract-v5 marked box, every managed agent, helper, sidecar, probe, and install-container path uses nested Podman; retained sandbox preferences, Docker, bwrap, and Seatbelt are not fallbacks.
+Outside a marked Ploinky box, the default runtime backend is a container runtime, preferring Podman when available and falling back to Docker. Host sandboxes are disabled by default and are selected only when the operator opts in via `ploinky sandbox enable` *and* the manifest requests `lite-sandbox: true`: Linux uses bubblewrap, macOS uses Seatbelt, and unsupported or unavailable host sandboxes fail with operator guidance rather than silently falling back. The environment variable `PLOINKY_DISABLE_HOST_SANDBOX=1` overrides any workspace opt-in and forces the container path. Inside an outer-contract-6 marked box, every managed agent, helper, sidecar, probe, and install-container path uses nested Podman; retained sandbox preferences, Docker, bwrap, and Seatbelt are not fallbacks.
 
 Container agents must mount `/Agent` read-only, prepared dependency caches read-only, code and skills according to the active profile, `.data/<agent-or-alias>/` at `/root` as the persistent agent home, and workspace or shared paths as required by the run mode. Every container agent receives `HOME=/root`; isolated agents use `/root` as their workspace path, while global agents keep the workspace root as their run-mode write surface. The `dev` profile defaults code and skills to read-write. `qa` and `prod` default them to read-only unless a profile explicitly relaxes them. Prepared `node_modules` caches must remain read-only in runtime containers. Podman-staged symlink trees must mount each symlink target at its real path with the same read/write policy instead of relying on a broad writable workspace mount. Root and active profile manifest volumes and runtime resources are explicit operator-granted write surfaces and must be treated as trusted manifest power. Manifest volume host paths may resolve outside `.ploinky/`; runtime-resource data should still prefer `.ploinky/data/`, while agent home data should prefer `.data/`.
 
@@ -228,7 +229,7 @@ as drift. Engine inspection must match those launch labels to the selected
 generation before reuse or capability-effectiveness can succeed; mutable
 registry state alone is insufficient. An older hash remains foreign and is neither
 adopted nor recreated. Only exact-owned current-hash runtime drift may trigger
-recreation; the hash is never weakened. Contract-5 managed networking requires
+recreation; the hash is never weakened. Core contract-v5 managed networking requires
 rootless Podman 5.4 or newer, Netavark, and operational `pasta`; no
 `slirp4netns` fallback exists.
 
@@ -240,11 +241,12 @@ launch step; identity-store failure cannot degrade startup to an unauthenticated
 process. Semantic health recurs after startup, and a socket-owner failure
 inactivates routing before any replacement attempt.
 
-The private Router listener is intended to be reachable only through an approved
-managed interface or capability-approved box-loopback host mode and still
-requires policy plus exact caller-generation credentials. The managed-bridge
-lane is currently unavailable on the observed rootless topology and stays
-fail-closed; no outer-facing bind or forwarding fallback is permitted.
+Inside a marked Box the private Router listener is reachable through the Box
+namespace wildcard by approved managed-network callers and through box loopback
+by capability-approved host-mode callers. Outside a marked Box it retains exact
+loopback/managed-address binds. Every request still requires policy plus exact
+caller-generation credentials; network reachability is never sufficient. No
+outer publication or forwarding fallback is permitted.
 Detailed health remains Unix-socket-only. Network reachability and localhost
 provenance never inherit authentication. Calls that pass through the router,
 including MCP operations, retain JWT issuer/audience checks, tool policy,
@@ -329,7 +331,7 @@ topology.
 
 ### Residual Security Requirements
 
-Contract 5 supports selected internet-facing HTTP services only through the
+Core contract v5 supports selected internet-facing HTTP services only through the
 outbound Cloudflare tunnel and exact Router host/service policy. It does not
 claim hostile multi-tenant isolation. Origin/CSRF checks, login and broker rate
 limits, upload/body quotas, closed host surfaces, header synthesis, immutable
@@ -364,7 +366,9 @@ Response:
 The public/control listener is reachable inside the box but the physical host
 publishes it only on loopback. Public HTTP arrives through an outbound
 cloudflared connection to fixed in-box `127.0.0.1:8080`; the private listener is
-not an outer publication. Host/interface classification, exact Host, closed
+not an outer publication even though it binds the Box namespace wildcard.
+Private request policy, caller ACL, and generation-bound assertions remain
+mandatory; public host/interface classification, exact Host, closed
 surface allowlists, and application policy therefore remain necessary even
 though no physical-host TCP socket is LAN-visible.
 
@@ -373,7 +377,7 @@ though no physical-host TCP socket is LAN-visible.
 Response:
 Per-agent credential isolation, fail-closed route/tool policy, Origin/CSRF for
 mutations, closed host surfaces, exact generation leases, and scoped private
-assertions are required by contract 5. A hostile multi-tenant claim remains out
+assertions are required by core contract v5. A hostile multi-tenant claim remains out
 of scope because enabled code, lifecycle hooks, host-mode capability, writable
 mounts, Dashboard command execution, and the workspace master key stay in one
 operator trust domain. Anonymous-token identities and any browser provider-token

@@ -1,7 +1,7 @@
 ---
 id: DS005
 title: Routing and Web Surfaces
-status: partially implemented (rootless private-router reachability blocked)
+status: implemented
 owner: ploinky-team
 summary: Defines dual-listener RoutingServer, host-first closed surfaces, immutable route-and-policy generations, HTTP-service targets, private assertions, topology, and browser surfaces.
 ---
@@ -20,19 +20,15 @@ health through an unmounted supervisor Unix socket, and writes watchdog logs
 under `.ploinky/logs/watchdog.log`. The router itself must write redacted request
 and lifecycle logs under `.ploinky/logs/router.log`.
 
-RoutingServer owns a public/control listener on box port `8080` and is designed
-to own a private managed-interface listener on `8081`. The outer box maps only
-the former to a loopback physical-host port. An exact-capability host-mode
-runtime can use private box loopback, but network reachability never replaces
-policy, assertion, or caller-ACL checks. Managed bridges are intended to reach
-only the private interface through the fixed
-`host.containers.internal:host-gateway` address contract; that mapping is not a
-capability. On the currently observed rootless Podman topology the gateway
-terminates on the box outer-facing interface, so the managed-bridge lane cannot
-satisfy the approved bind boundary and remains inactive and fail-closed. Ploinky
-does not widen the listener or install a compatibility forwarder. DS004 Question
-#8 records the unresolved architecture choice. Private `8081` is never a
-physical-host or Cloudflare route, and detailed health is not available over
+RoutingServer owns a public/control listener on box port `8080` and a private
+listener on `8081`. The outer box maps only the former to a loopback
+physical-host port. Inside a marked Box, `8081` binds the Box namespace wildcard
+so nested rootless Podman can reach it through the fixed
+`host.containers.internal:host-gateway` address contract. Outside a marked Box,
+the private listener retains the exact loopback/managed-address bind model. An
+exact-capability host-mode runtime can use private box loopback, but network
+reachability never replaces policy, assertion, or caller-ACL checks. Private
+`8081` is never a physical-host or Cloudflare route, and detailed health is not available over
 either TCP listener.
 
 `.ploinky/routing.json`, manifests, and policy files are candidate inputs. They

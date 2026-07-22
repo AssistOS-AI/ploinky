@@ -217,10 +217,10 @@ handleCommand(args) {
                         <h2>Routing Server</h2>
                         
                         <h3>Purpose</h3>
-                        <p>The RoutingServer (<code>cli/server/RoutingServer.js</code>) is the sole HTTP/SSE/WebSocket edge inside a managed box. It owns public/control port <code>8080</code> and is designed to own the un-published box-private port <code>8081</code>, plus an unmounted Unix health socket. Its authorization unit is a validated immutable route-and-policy authorization generation, not a mutable candidate file or topology publication counter.</p>
+                        <p>The RoutingServer (<code>cli/server/RoutingServer.js</code>) is the sole HTTP/SSE/WebSocket edge inside a managed box. It owns public/control port <code>8080</code> and the un-published box-private port <code>8081</code>, plus an unmounted Unix health socket. Its authorization unit is a validated immutable route-and-policy authorization generation, not a mutable candidate file or topology publication counter.</p>
                         <p>The outer wrapper always constructs exactly <code>127.0.0.1:&lt;selected-router-host-port&gt;:8080/tcp</code> and <code>0.0.0.0:7882:7882/udp</code>. Outer <code>--port</code> changes only the first mapping's physical-host side; <code>--publish</code>, <code>--expose</code>, and <code>--listen-lan</code> are rejected. No graph, manifest, profile, readiness result, environment value, label, or persisted state can add a third physical-host mapping.</p>
                         <p>Coordinated apply requires exact readable routing, policy, desired-state, enabled-agent, and manifest sources. Missing input is never substituted with an empty policy or registry. Only a genuinely fresh workspace initializes all four persisted source documents together; a partial set or retained generation evidence stays inactive until explicit repair.</p>
-                        <p><strong>Current rootless gate:</strong> the observed Podman <code>host-gateway</code> terminates on the box outer-facing interface rather than loopback or an assigned managed-bridge address. Bridge access to private <code>8081</code> therefore remains fail-closed; Ploinky does not install a wider bind or forwarding fallback. DS004 Question #8 records the required architecture decision.</p>
+                        <p><strong>Rootless private transport:</strong> inside a marked Box, private <code>8081</code> binds the Box namespace wildcard so nested Podman can reach it through <code>host.containers.internal:host-gateway</code>. The outer runtime never publishes <code>8081</code>, and every request remains fail-closed behind route policy, caller ACL, and a generation-bound private assertion. Outside a marked Box, private listeners retain exact loopback/managed-address binds.</p>
 
                         <pre><code>// Conceptual activated generation (illustrative fields only)
 {
@@ -425,7 +425,7 @@ observability.js    // Monitoring views</code></pre>
 
 2. Host user: ploinky --port 8088 start demo
    → Select physical loopback 8088; forward fixed inner Router port 8080
-   → Require the exact private 8081 listener set, then start public/control 8080; fail closed when an approved 8081 bind is unavailable
+   → Bind private 8081 to the Box namespace wildcard (exact addresses outside a Box), then start public/control 8080
 	   → Prepare recursive manifest repositories and resolve the planning graph without enabling processes
 	   → Capture an early inactive generation with exact identities and every retained route targetless
 	   → Run fatal static preinstall, then startup config providers

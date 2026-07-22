@@ -2,6 +2,7 @@ import net from 'node:net';
 
 const DEFAULT_REFRESH_INTERVAL_MS = 1_000;
 const LOOPBACK_ADDRESS = '127.0.0.1';
+const WILDCARD_ADDRESS = '0.0.0.0';
 
 function errorMessage(error) {
     return String(error?.message || error || 'unknown error');
@@ -32,8 +33,9 @@ function assertDependencies({ httpServer, interfaceClassifier, port, refreshInte
 }
 
 /**
- * Reconcile the private Router onto an exact address set instead of opening a
- * wildcard socket. One transport listener feeds each accepted socket into the
+ * Reconcile the private Router onto an exact address set outside a Box, or the
+ * Box namespace wildcard when rootless nested Podman requires host-gateway
+ * reachability. One transport listener feeds each accepted socket into the
  * shared HTTP server so HTTP and WebSocket handling remain identical across
  * loopback and managed bridge gateways.
  */
@@ -44,13 +46,15 @@ export function createPrivateListenerSet({
     refreshIntervalMs = DEFAULT_REFRESH_INTERVAL_MS,
     createServer = (options) => net.createServer(options),
     audit = () => {},
+    wildcardHost = false,
 } = {}) {
     assertDependencies({ httpServer, interfaceClassifier, port, refreshIntervalMs });
     if (typeof createServer !== 'function') throw new TypeError('private listener server factory must be a function');
     if (typeof audit !== 'function') throw new TypeError('private listener audit sink must be a function');
 
     const listeners = new Map();
-    let desired = new Map([[LOOPBACK_ADDRESS, 'loopback']]);
+    if (typeof wildcardHost !== 'boolean') throw new TypeError('private listener wildcardHost must be boolean');
+    let desired = new Map([[wildcardHost ? WILDCARD_ADDRESS : LOOPBACK_ADDRESS, wildcardHost ? 'box-wildcard' : 'loopback']]);
     let timer = null;
     let started = false;
     let closing = false;
@@ -103,6 +107,24 @@ export function createPrivateListenerSet({
 
     function admitSocket(record, socket) {
         const address = normalizeSocketAddress(socket.localAddress);
+        if (wildcardHost) {
+            const exactRecord = listeners.get(WILDCARD_ADDRESS) === record && record.current && record.ready;
+            if (!exactRecord || net.isIP(address) === 0) {
+                emitAudit('private_listener_connection_rejected', {
+                    address,
+                    expectedAddress: WILDCARD_ADDRESS,
+                    observedClass: 'invalid',
+                    expectedClass: 'box-wildcard',
+                });
+                socket.destroy();
+                return;
+            }
+            record.sockets.add(socket);
+            socket.once('close', () => record.sockets.delete(socket));
+            httpServer.emit('connection', socket);
+            socket.resume();
+            return;
+        }
         let observedClass = 'unmanaged';
         try { observedClass = interfaceClassifier.classify(address); } catch (_) {}
         const exactRecord = listeners.get(record.address) === record && record.current && record.ready;
@@ -174,13 +196,19 @@ export function createPrivateListenerSet({
 
     async function reconcile({ strict = false } = {}) {
         if (closing) return publicSnapshot();
-        interfaceClassifier.refresh({ force: true });
-        const classifierSnapshot = interfaceClassifier.snapshot();
-        const nextDesired = new Map([[LOOPBACK_ADDRESS, 'loopback']]);
-        for (const gateway of classifierSnapshot?.gateways || []) {
-            const address = normalizeSocketAddress(gateway);
-            if (net.isIP(address) !== 4 || address === LOOPBACK_ADDRESS) continue;
-            nextDesired.set(address, 'managed');
+        let classifierSnapshot = interfaceClassifier.snapshot();
+        const nextDesired = new Map();
+        if (wildcardHost) {
+            nextDesired.set(WILDCARD_ADDRESS, 'box-wildcard');
+        } else {
+            interfaceClassifier.refresh({ force: true });
+            classifierSnapshot = interfaceClassifier.snapshot();
+            nextDesired.set(LOOPBACK_ADDRESS, 'loopback');
+            for (const gateway of classifierSnapshot?.gateways || []) {
+                const address = normalizeSocketAddress(gateway);
+                if (net.isIP(address) !== 4 || address === LOOPBACK_ADDRESS) continue;
+                nextDesired.set(address, 'managed');
+            }
         }
         desired = nextDesired;
 

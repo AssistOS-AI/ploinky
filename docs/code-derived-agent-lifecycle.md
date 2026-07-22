@@ -76,10 +76,10 @@ port, profile, and branch policy flags and bootstraps the requested agent.
 ### Outer runtime contract
 
 The required release channel is the mutable
-`docker.io/assistos/ploinky-box:runtime` reference. The source-free image must
-satisfy the complete runtime contract 5 metadata checked by
-`container/runtime-contract.mjs`, including exact label
-`io.assistos.ploinky.runtime-contract=5`, user `podman`, workdir `/workspace`,
+`docker.io/assistos/ploinky-box:runtime` reference. The source-owned image must
+satisfy the complete outer runtime contract 6 metadata checked by
+`ploinky-box/contract/image.mjs`, including exact label
+`io.assistos.ploinky.runtime-contract=6`, user `podman`, workdir `/workspace`,
 the box entrypoint, its allowlisted environment, and no image command or
 declared volumes.
 
@@ -103,12 +103,12 @@ race. A stopped compatible box starts and a running compatible box is reused
 without pulling.
 
 Here, compatible means an exact normalized creation-configuration match. Any
-drift in a contract-5 box is reported as recreate-required before pull, stop,
+drift in a contract-6 box is reported as recreate-required before pull, stop,
 rename, removal, or creation. The operator must run `ploinky destroy`
 explicitly and then recreate it; there is no automatic replacement or rollback
 transaction.
 
-Contract 5 is a hard cut: every non-contract-5 box, including contract 4,
+Contract 6 is a hard cut: every non-contract-6 box, including contracts 4 and 5,
 malformed or identity-incompatible state, is blocked before pulling, volume
 creation, restart, upgrade, or replacement. It requires explicit `ploinky
 destroy`; the supervisor never reads it as compatible state or migrates, cleans,

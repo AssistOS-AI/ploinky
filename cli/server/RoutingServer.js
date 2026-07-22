@@ -76,6 +76,7 @@ import {
 import { PLOINKY_DIR } from '../utils/config.js';
 import { startCloudflarePublicationRuntime } from '../sandbox/cloudflarePublicationRuntime.js';
 import { requestAgentCard } from './agentCardFanout.js';
+import { isInsideBox } from '../../ploinky-box/lib/boxMarker.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -724,6 +725,7 @@ const privateListenerSet = createPrivateListenerSet({
     httpServer: privateServer,
     interfaceClassifier,
     port: privatePort,
+    wildcardHost: isInsideBox(),
     audit: (event, value) => appendLog(event, value),
 });
 let cloudflarePublicationRuntime = null;

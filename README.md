@@ -68,16 +68,16 @@ dependency volume. Ordinary agent containers run one level inside this runtime.
 
 The required outer image is the mutable
 `docker.io/assistos/ploinky-box:runtime` reference with the exact label
-`io.assistos.ploinky.runtime-contract=5`. Ploinky pulls that reference only when
+`io.assistos.ploinky.runtime-contract=6`. Ploinky pulls that reference only when
 creating a missing box, validates the complete image metadata, and starts the
 captured image ID rather than racing the mutable tag. Compatible reuse,
-stopped-box start, status, stop, and destroy do not pull. Every non-contract-5
-box, including contract 4, is rejected before pulling, volume creation, restart,
-upgrade, or replacement. Ploinky does not read, migrate, clean, relabel, adopt,
-or replace it: run `ploinky destroy` explicitly, then recreate contract 5.
+stopped-box start, status, stop, and destroy do not pull. Every non-contract-6
+box, including contracts 4 and 5, is rejected before pulling, volume creation,
+restart, upgrade, or replacement. Ploinky does not read, migrate, clean, relabel, adopt,
+or replace it: run `ploinky destroy` explicitly, then recreate contract 6.
 Destroy retains the three named volumes.
 
-A contract-5 box is reused or started only when its creation configuration is
+A contract-6 box is reused or started only when its creation configuration is
 an exact normalized match. Any port, image, mount, device, security, or other
 creation drift fails before registry traffic or container mutation and requires
 an explicit `ploinky destroy` followed by recreation; there is no transactional
@@ -111,7 +111,7 @@ connector origin is always in-box `http://127.0.0.1:8080`.
 
 Ordinary agent images intentionally contain neither Podman nor Docker. Every
 Ploinky-managed agent and helper container runs through nested Podman inside the
-managed outer runtime. Contract-5 managed networking requires rootless Podman
+managed outer runtime. Core contract-v5 managed networking requires rootless Podman
 5.4 or newer with Netavark and an operational `pasta`; there is no
 `slirp4netns` fallback. Managed `default` and `bridge` agents receive only the
 exact `host.containers.internal:host-gateway` mapping, private Router locator,

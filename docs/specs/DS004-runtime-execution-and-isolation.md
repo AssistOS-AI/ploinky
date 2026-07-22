@@ -1,9 +1,9 @@
 ---
 id: DS004
 title: Runtime Execution and Isolation
-status: partially implemented (rootless private-router reachability blocked)
+status: implemented
 owner: ploinky-team
-summary: Defines execution backends, runtime contract v5, exact outer publications, private target mappings, topology mounts, and generation-scoped isolation capabilities.
+summary: Defines execution backends, outer Box contract 6, core runtime v5, exact outer publications, private target mappings, topology mounts, and generation-scoped isolation capabilities.
 ---
 
 # DS004 Runtime Execution and Isolation
@@ -30,15 +30,15 @@ The managed public-entrypoint boundary is:
 | REPL `status`/`stop`/`destroy` | Core workspace/router/agent scope; outer runtime remains |
 
 The outer runtime uses the mutable `docker.io/assistos/ploinky-box:runtime`
-reference carrying exact label `io.assistos.ploinky.runtime-contract=5`. A
+reference carrying exact label `io.assistos.ploinky.runtime-contract=6`. A
 missing-box create pulls the selected logical reference, validates its complete
 metadata, captures its image ID, and runs that ID. Reuse, stopped-box start,
-status, stop, and destroy do not pull. Every non-contract-5 box is unsupported,
+status, stop, and destroy do not pull. Every non-contract-6 box is unsupported,
 including contract 4, malformed, and identity-incomplete state. It fails before
 pulling, volume creation, restart, upgrade, or replacement. No automatic
 restart, upgrade, relabel, adoption, cleanup, migration, or replacement is
 allowed. The operator must run `ploinky destroy` explicitly and then recreate
-contract 5; all three named volumes are retained.
+contract 6; all three named volumes are retained.
 
 Direct/core installations must cut over before the new release is invoked.
 From the old checkout, use the explicit core entry rather than the public outer
@@ -73,19 +73,19 @@ contract. In particular, Podman's normalized security-option spelling and
 ordering are equivalent to the requested values, and device requests are
 recovered from the inspected create command when `HostConfig.Devices` is empty.
 This normalization is comparison-only: creation still emits the exact
-contract-5 devices, security options, and fixed publications. An actually
+contract-6 devices, security options, and fixed publications. An actually
 missing or different request is recreate-required drift: reconciliation fails
 before pull, stop, rename, removal, or creation and tells the operator to run
 `ploinky destroy` explicitly before recreating the box. Repeating an unchanged
 host command must therefore reuse the same compliant outer container without
 pulling or replacing it.
 
-Nested Podman belongs to this outer runtime only. Contract-5 self-check requires
+Nested Podman belongs to this outer runtime only. Contract-6 self-check requires
 rootless Podman 5.4 or newer, Netavark, and an operational `pasta`; managed
 networking has no `slirp4netns` fallback. Ordinary agent images
 intentionally contain neither Podman nor Docker and do not receive authority
 over sibling containers. The exact `io.assistos.ploinky.managed=1` label marks
-Ploinky-owned nested containers. Contract-v5 boot rejects retained exact-label
+Ploinky-owned nested containers. Contract-6 boot rejects retained exact-label
 records, including old managed gateway and agent records, without deleting or
 importing them. The operator removes managed records in the old box before the
 explicit destroy/recreate boundary; manual containers, nested images, named
@@ -149,30 +149,23 @@ transaction, reconciliation may create and verify missing managed bridges or
 attach the new container. Foreign or unsupported network state remains
 fail-closed and is never replaced or adopted.
 
-`RoutingServer.js` owns a public/control listener on box port `8080` and is
-designed to own a managed-interface-only private listener on `8081`. The first
+`RoutingServer.js` owns a public/control listener on box port `8080` and an
+unpublished private listener on `8081`. The first
 is reachable through the fixed loopback physical-host publication and from
 in-box cloudflared; the second must never be an outer publication.
-Capability-approved host-mode runtimes can use the box-loopback private lane,
-but the managed-bridge lane is not currently activatable on the observed
-rootless topology described below. Detailed health is supervisor-only on an
+Inside a marked Box, the private listener binds the Box namespace wildcard so
+nested rootless Podman can reach it through Podman's `host-gateway`; outside a
+Box it retains the exact loopback/managed-gateway listener set. The wildcard is
+not a publication or an authorization grant: outer contract 6 never publishes
+TCP 8081, and every private request still requires its exact generation-bound,
+method/path/body-bound, replay-protected agent assertion. Detailed health is supervisor-only on an
 unmounted Unix socket. Listener/interface class and exact
 Host are resolved before pathname dispatch. Routed calls retain JWT
 issuer/audience validation, policy, request binding, expiry, and replay
 protection; TCP control/status still requires a real admin session, and
 mutations require Origin/CSRF even when a caller can reach box loopback.
 
-Implementation status (2026-07-15): managed-bridge private-service activation
-is fail-closed on the observed rootless Podman topology. An exact
-`host.containers.internal:host-gateway` entry in the child resolves through the
-outer container's outer-facing interface, not box loopback or an address owned
-by the managed inner bridge. Binding `8081` there would violate the approved
-interface boundary, while binding the inner bridge's IPAM gateway fails because
-that address is not assigned in the outer namespace. Ploinky therefore does not
-install an outer-facing fallback; the affected release slice remains blocked
-pending Question #8.
-
-Every contract-5 outer box has exactly two engine publications, constructed by
+Every contract-6 outer box has exactly two engine publications, constructed by
 the outer wrapper without reading graph state:
 `127.0.0.1:<selectedRouterHostPort>:8080/tcp` and
 `0.0.0.0:7882:7882/udp`. The first is the sole TCP boundary; the second is an
@@ -271,14 +264,14 @@ slot and prevents localhost provenance from becoming authorization.
 Response:
 `stop`, `shutdown`, and `destroy` are workspace-level lifecycle operations. If Ploinky waited for each `bwrap` or Seatbelt process before signaling the next one, one stuck agent could keep the rest of the workspace running for the full timeout. Batch signaling gives every selected sandbox the same shutdown window and keeps the total wait bounded by one shared deadline.
 
-### Question #6: Why is a v4 outer runtime not replaced automatically?
+### Question #6: Why is an older outer runtime not replaced automatically?
 
 Response:
-Contract 5 removes the prior publication model and credential ownership. An
+Contract 6 removes the prior publication model and credential ownership. An
 automatic replacement would be a migration and could activate a different host
 boundary before the operator revoked old credentials and removed plaintext
-state. The supervisor therefore rejects v4 and requires explicit destroy and
-recreate while retaining named volumes.
+state. The supervisor therefore rejects every non-contract-6 box and requires
+explicit destroy and recreate while retaining named volumes.
 
 ### Question #7: Why must read-only and host-hook-only declarations be enforced by every backend?
 
@@ -287,17 +280,17 @@ Both declarations are security boundaries in the manifest contract. Treating the
 
 ### Question #8: How can a rootless managed bridge reach private Router `8081` without binding the box outer-facing interface?
 
-Options:
-
-- Require a rootless Podman/Netavark mechanism that maps `host-gateway` to box
-  loopback or to a genuinely assigned managed-interface address, retaining the
-  approved listener model unchanged.
-- Amend the approved design to add an explicitly isolated in-box forwarding
-  namespace whose only destination is loopback `8081`; this requires a new
-  architecture decision and security review.
-- Amend the approved design to bind the outer-facing interface and rely on an
-  exact interface firewall. This changes the stated bind contract and must not
-  be implemented implicitly.
+Response:
+Inside a marked Ploinky Box, Router `8081` binds the Box namespace wildcard so
+rootless nested Podman can resolve and reach it through Podman's
+`host.containers.internal:host-gateway` mapping. The outer runtime never
+publishes `8081`, so this does not create a physical-host TCP edge. Reachability
+is not authorization: every private request must still pass private-listener
+classification, effective route policy, caller ACL, and an exact
+instance-and-enable-generation assertion with method, path, body, expiry, and
+replay binding. Outside a marked Box, the listener retains the exact
+loopback/managed-address bind model. This resolves the rootless transport gap
+without adding an outer mapping, compatibility proxy, or firewall dependency.
 
 ## Conclusion
 

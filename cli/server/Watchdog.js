@@ -35,7 +35,7 @@ const CONFIG = {
         || path.join(PLOINKY_DIR, 'run', 'router-health.sock'),
 
     // Process configuration
-    PORT: parseRouterPort(process.env.PORT, { source: 'Watchdog PORT' }),
+    PORT: parseRouterPort(process.env.PORT || '8080', { source: 'Watchdog PORT' }),
     NODE_OPTIONS: process.env.NODE_OPTIONS || '',
 
     // Container monitoring
@@ -217,6 +217,18 @@ function resetBackoff() {
 }
 
 // Health check function
+function buildHealthCheckRequestOptions(port = CONFIG.PORT, env = process.env) {
+    const publicAuthority = String(env.PLOINKY_PUBLIC_AUTHORITY || '').trim();
+    return {
+        hostname: '127.0.0.1',
+        port,
+        path: '/health',
+        headers: {
+            Host: publicAuthority || `127.0.0.1:${port}`,
+        },
+    };
+}
+
 async function performHealthCheck() {
     if (!CONFIG.HEALTH_CHECK_ENABLED || state.isShuttingDown) {
         return true;
@@ -681,6 +693,7 @@ export {
     getTestLogs,
     clearTestLogs,
     getRouterNodeExecutable,
+    buildHealthCheckRequestOptions,
     performHealthCheck,
     IS_TEST_MODE as __IS_TEST_MODE
 };

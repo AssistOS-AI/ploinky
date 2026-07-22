@@ -454,7 +454,7 @@ function getExposedEnv(manifest) {
                         <p><strong>File:</strong> <code>cli/server/RoutingServer.js</code></p>
                         <p>The sole in-box HTTP/SSE/WebSocket edge. RoutingServer owns fixed public/control port <code>8080</code>, un-published box-private port <code>8081</code>, and an unmounted Unix health socket. Watchdog supervises it with circuit breaking, exponential backoff, and Unix-socket health checks.</p>
                         <p>Managed runtime ownership is generation-bound: container labels or schema-2 sandbox PID records carry the exact instance and enable generation, identity injection is mandatory, and recurring semantic probes inactivate routing before replacing a runtime whose socket ownership drifts.</p>
-                        <p>The rootless managed-bridge <code>host-gateway</code> lane is currently blocked because it terminates on the box outer-facing interface. The implementation remains fail-closed and installs no wider listener or compatibility proxy; DS004 Question #8 tracks the unresolved architecture choice.</p>
+                        <p>Inside a marked Box, private <code>8081</code> binds the Box namespace wildcard so rootless managed-bridge callers can reach it through <code>host-gateway</code>. It remains absent from the outer publication set, and every request requires route policy, caller ACL, and an exact generation-bound private assertion; no compatibility proxy is installed.</p>
 
                         <h3>Served Routes</h3>
                         <pre><code>// Routes served by the RoutingServer:

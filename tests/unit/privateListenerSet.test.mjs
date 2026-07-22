@@ -130,3 +130,21 @@ test('private listener startup rejects and closes partial binds when a managed g
     assert.deepEqual(listenerSet.snapshot().addresses, []);
     await assert.rejects(() => request('127.0.0.1', port));
 });
+
+test('Box private listener uses one unpublished wildcard socket and relies on assertion admission', async (t) => {
+    const port = await freePort();
+    const classifier = fakeClassifier([]);
+    const httpServer = http.createServer((_req, res) => res.end('box-private'));
+    const listenerSet = createPrivateListenerSet({
+        httpServer,
+        interfaceClassifier: classifier,
+        port,
+        wildcardHost: true,
+        refreshIntervalMs: 60_000,
+    });
+    t.after(() => listenerSet.close());
+
+    assert.deepEqual((await listenerSet.start()).addresses, ['0.0.0.0']);
+    assert.deepEqual(await request('127.0.0.1', port), { status: 200, body: 'box-private' });
+    assert.deepEqual((await listenerSet.sync()).addresses, ['0.0.0.0']);
+});

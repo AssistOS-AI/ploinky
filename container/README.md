@@ -47,10 +47,10 @@ different scopes. Exit the REPL before operating on the outer runtime.
 
 The required multi-architecture release channel is the mutable reference
 `docker.io/assistos/ploinky-box:runtime`. Its image must satisfy runtime
-contract 5, including the exact label:
+contract 6, including the exact label:
 
 ```text
-io.assistos.ploinky.runtime-contract=5
+io.assistos.ploinky.runtime-contract=6
 ```
 
 The contract also requires user `podman`, working directory `/workspace`, the
@@ -74,12 +74,12 @@ security option, fails before pull or mutation and reports the differences.
 Run `ploinky destroy` explicitly and then recreate; the supervisor has no
 automatic replacement, backup rename, or rollback transaction.
 
-Contract 5 is a hard cut. Every non-contract-5 box, including contract 4 or
+Contract 6 is a hard cut. Every non-contract-6 box, including contract 5 or
 malformed state, fails before pulling, volume creation, restart, upgrade, or
 replacement. The supervisor does not read it as compatible state or
 automatically migrate, clean, relabel, adopt, or replace it. Run `ploinky
 destroy` explicitly, then run an ordinary command to recreate the box from
-contract 5 while retaining all three named volumes. Legacy basename-only boxes
+contract 6 while retaining all three named volumes. Legacy basename-only boxes
 and volumes are not discoverable through the current identity and remain
 untouched for manual inspection or removal.
 
@@ -158,7 +158,7 @@ regardless of the selected physical port. Router private `8081` is never an oute
 publication. LiveKit is the sole capability-approved in-box owner of UDP
 `7882`; the fixed mapping remains idle when LiveKit is absent.
 
-The contract-5 image includes a pinned multi-architecture `cloudflared` binary
+The contract-6 image includes a pinned multi-architecture `cloudflared` binary
 supervised by Ploinky core. Complete credential absence is the explicit
 `local-only` mode: no connector process and no public HTTP hostname. Cloudflare
 mode requires both an existing-tunnel connector token and a separate
@@ -211,7 +211,7 @@ state from the outer container filesystem. These paths are not the named
 nested-storage volume; container records, images, and nested named volumes stay
 retained. Failure to clear stale run state aborts boot.
 
-Contract-5 boot requires rootless Podman 5.4 or newer, the Netavark network
+Core contract-v5 boot requires rootless Podman 5.4 or newer, the Netavark network
 backend, and an operational `pasta` executable. Any failed prerequisite aborts
 self-check; managed networking has no `slirp4netns` fallback. The image is
 built from an immutable `quay.io/podman/stable` index digest that contains both
