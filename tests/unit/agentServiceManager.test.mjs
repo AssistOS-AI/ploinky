@@ -4,6 +4,8 @@ import fs from 'node:fs';
 
 import {
     assertPreparedRegistryRecordPreservation,
+    buildBoxPodmanHostArgs,
+    buildRuntimeNetworkPlan,
     buildRuntimeRouterEnv,
     ensureAgentService,
     isGenerationCapabilityRuntimeEffective,
@@ -11,6 +13,50 @@ import {
     replaceRuntimeRouterEnvFlags,
 } from '../../cli/sandbox/docker/agentServiceManager.js';
 import { buildRouterEndpoint } from '../../cli/sandbox/routerPort.js';
+
+function boxMarkerFs(contents = '6\n') {
+    return {
+        lstatSync() {
+            return {
+                isFile: () => true,
+                isSymbolicLink: () => false,
+                nlink: 1,
+            };
+        },
+        readFileSync() {
+            return Buffer.from(contents);
+        },
+    };
+}
+
+test('Box host-gateway compatibility does not duplicate the managed network mapping', () => {
+    const fsApi = boxMarkerFs();
+    for (const network of [
+        { mode: 'default' },
+        { mode: 'bridge', attachments: [{ name: 'front', primary: true }] },
+    ]) {
+        const plan = buildRuntimeNetworkPlan('podman', network);
+        assert.equal(plan.requiresManagedNetwork, true);
+        assert.deepEqual(buildBoxPodmanHostArgs({
+            fsApi,
+            markerPath: '/probe/ploinky-box',
+            managedNetwork: plan.requiresManagedNetwork,
+        }), []);
+    }
+
+    const hostPlan = buildRuntimeNetworkPlan('podman', { mode: 'host' });
+    assert.deepEqual(buildBoxPodmanHostArgs({
+        fsApi,
+        markerPath: '/probe/ploinky-box',
+        managedNetwork: hostPlan.requiresManagedNetwork === true,
+    }), ['--add-host', 'host.containers.internal:host-gateway']);
+
+    assert.throws(() => buildBoxPodmanHostArgs({
+        fsApi: boxMarkerFs('5\n'),
+        markerPath: '/probe/ploinky-box',
+        managedNetwork: true,
+    }), /marker must contain exactly contract 6/);
+});
 
 test('prepared graph launches suppress intermediate registry persistence only for the exact staged identity', () => {
     const staged = {

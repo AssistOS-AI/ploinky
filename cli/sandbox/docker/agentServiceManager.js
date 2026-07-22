@@ -496,10 +496,15 @@ function buildDefaultPodmanNetworkArgs(platform = process.platform) {
 function buildBoxPodmanHostArgs({
     fsApi = fs,
     markerPath,
+    managedNetwork = false,
 } = {}) {
     const markerOptions = { fsApi };
     if (markerPath) markerOptions.markerPath = markerPath;
     if (!isInsideBox(markerOptions)) return [];
+    // Managed default/bridge launches receive this exact mapping from the
+    // network lifecycle transaction. Adding it here as well produces two
+    // HostConfig.ExtraHosts entries, which the fail-closed verifier rejects.
+    if (managedNetwork) return [];
     return ['--add-host', 'host.containers.internal:host-gateway'];
 }
 function appendRuntimeRouterEnvFlags(envStrings, routerEnv) {
@@ -1034,7 +1039,9 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         args.push('-v', `${resolvedHostPath}:${containerPath}${mountSuffix}`);
     }
     if (runtime === 'podman') {
-        const boxHostArgs = buildBoxPodmanHostArgs();
+        const boxHostArgs = buildBoxPodmanHostArgs({
+            managedNetwork: runtimeNetworkPlan.requiresManagedNetwork === true,
+        });
         if (boxHostArgs.length) args.splice(1, 0, ...boxHostArgs);
     }
 
