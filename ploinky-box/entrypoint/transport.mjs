@@ -193,7 +193,6 @@ export function writeTransportPair({
         Buffer.from(`${JSON.stringify(transport)}\n`),
         Buffer.from([
             '[containers]',
-            `host_containers_internal_ip="${transport.address}"`,
             'volumes=["/proc:/proc"]',
             'default_sysctls=[]',
             '',

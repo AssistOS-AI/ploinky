@@ -76,8 +76,7 @@ test('exact route and assigned address produce one private atomic transport pair
     assert.equal(fs.readFileSync(paths.transport, 'utf8'),
         '{"address":"10.88.0.17","interface":"eth0"}\n');
     assert.equal(fs.readFileSync(paths.containersConf, 'utf8'),
-        '[containers]\nhost_containers_internal_ip="10.88.0.17"\n'
-        + 'volumes=["/proc:/proc"]\ndefault_sysctls=[]\n');
+        '[containers]\nvolumes=["/proc:/proc"]\ndefault_sysctls=[]\n');
     assert.equal(mode(paths.transport), 0o600);
     assert.equal(mode(paths.containersConf), 0o600);
     assert.equal(mode(path.dirname(paths.transport)), 0o700);

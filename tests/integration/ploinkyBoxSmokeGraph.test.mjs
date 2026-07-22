@@ -86,7 +86,6 @@ test('pinned seven-repository graph starts through one immutable Box candidate',
     ]);
     assert.equal(containersConf, [
         '[containers]',
-        `host_containers_internal_ip="${transport.address}"`,
         'volumes=["/proc:/proc"]',
         'default_sysctls=[]',
     ].join('\n'));
@@ -103,15 +102,17 @@ test('pinned seven-repository graph starts through one immutable Box candidate',
     ]);
     const hostMappings = hosts.split(/\n/).filter((line) => line.includes('host.containers.internal'));
     assert.equal(hostMappings.length, 1);
-    assert.equal(hostMappings[0].trim().split(/\s+/)[0], transport.address);
+    assert.notEqual(hostMappings[0].trim().split(/\s+/)[0], transport.address);
     const routerEnvironment = execInBox(harness.runner, started.containerId, [
         'podman', 'container', 'exec', agent.id, 'env',
     ]);
     assert.match(routerEnvironment, /^PLOINKY_ROUTER_HOST=host\.containers\.internal$/m);
     assert.match(routerEnvironment, /^PLOINKY_ROUTER_URL=http:\/\/host\.containers\.internal:8080$/m);
+    assert.match(routerEnvironment,
+        new RegExp(`^PLOINKY_ROUTER_AUTHORITY=127\\.0\\.0\\.1:${route.hostPort}$`, 'm'));
     execInBox(harness.runner, started.containerId, [
         'podman', 'container', 'exec', agent.id, '/usr/local/bin/node', '-e',
-        "require('node:http').get('http://host.containers.internal:8080/health',r=>{r.resume();process.exit(r.statusCode===200?0:1)}).on('error',()=>process.exit(2))",
+        "const h=require('node:http');h.get({hostname:process.env.PLOINKY_ROUTER_HOST,port:process.env.PLOINKY_ROUTER_PORT,path:'/health',headers:{Host:process.env.PLOINKY_ROUTER_AUTHORITY}},r=>{r.resume();process.exit(r.statusCode===200?0:1)}).on('error',()=>process.exit(2))",
     ]);
 
     const nestedImageId = execInBox(harness.runner, started.containerId, [
