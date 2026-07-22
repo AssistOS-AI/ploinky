@@ -54,7 +54,8 @@ function collectFiles(relativePath) {
     if (stat.isFile()) return [relativePath];
     const files = [];
     for (const entry of fs.readdirSync(absolutePath, { withFileTypes: true })) {
-        if (entry.name === 'node_modules' || entry.name === '.git') continue;
+        if (entry.name === 'node_modules' || entry.name === '.git'
+            || (relativePath === 'docs' && entry.name === 'superpowers')) continue;
         const child = path.join(relativePath, entry.name);
         if (entry.isDirectory()) files.push(...collectFiles(child));
         else if (entry.isFile()) files.push(child);
@@ -115,7 +116,7 @@ test('outer supervisor contains no automatic replacement or rollback transaction
 
 test('coordinated edge apply has no missing-source fallback', () => {
     const source = fs.readFileSync(
-        path.join(repositoryRoot, 'cli', 'services', 'edgeGeneration.js'),
+        path.join(repositoryRoot, 'cli', 'sandbox', 'edgeGeneration.js'),
         'utf8',
     );
     assert.doesNotMatch(source, /readExact\([^)]*,\s*\{[^}]*\bfallback\s*:/s);

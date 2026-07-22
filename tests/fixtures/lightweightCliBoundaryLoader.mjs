@@ -19,7 +19,9 @@ export async function resolve(specifier, context, nextResolve) {
     if (pathname.endsWith('/cli/sandbox/runtimeShell.js')) {
         return { url: runtimeShellStub, shortCircuit: true };
     }
-    if (/\/cli\/(?:main\.js|commands\/)/.test(pathname)) {
+    const isHelpModule = pathname.endsWith('/cli/commands/help.js');
+    if (pathname.endsWith('/cli/main.js')
+        || (pathname.includes('/cli/commands/') && !isHelpModule)) {
         throw new Error('FORBIDDEN_CORE_MODULE:' + pathname);
     }
     return resolved;

@@ -10,8 +10,8 @@ import path from 'node:path';
 import readline from 'node:readline';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { setTimeout as sleep } from 'node:timers/promises';
-import { showHelp } from '../cli/services/help.js';
-import { loadEnvFile } from '../cli/services/masterKey.js';
+import { showHelp } from '../cli/commands/help.js';
+import { loadEnvFile } from '../cli/utils/security/masterKey.js';
 import { createEngineClient } from './runtime-engine.mjs';
 import {
     IDENTITY_SCHEMA_LABEL,

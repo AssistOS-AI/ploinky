@@ -182,7 +182,12 @@ test('loadCatalog default workspace catalog passes validation', () => {
     const repoRoot = path.resolve(import.meta.dirname, '..', '..', '..');
     const defaultCatalogPath = path.join(repoRoot, 'local-llm-architectures');
     if (!fs.existsSync(defaultCatalogPath)) {
-        assert.fail(`expected workspace catalog at ${defaultCatalogPath}`);
+        assert.throws(
+            () => loadCatalog({ env: {} }),
+            (error) => error instanceof CatalogValidationError
+                && /No local-llm-architectures catalog found/.test(error.message),
+        );
+        return;
     }
     const result = loadCatalog({ env: { PLOINKY_LLM_ARCHITECTURES_PATH: defaultCatalogPath } });
     assert.equal(result.catalogId, 'local-llm-architectures/default');

@@ -185,11 +185,18 @@ export function listWorkspaceSuggestions({
     leaf,
     limit = MAX_SUGGESTION_RESULTS
 } = {}) {
-    const safeRoot = workspaceRoot ? path.resolve(workspaceRoot) : getWorkspaceRoot();
-    const safeBase = base ? path.resolve(base) : safeRoot;
+    const requestedRoot = workspaceRoot ? path.resolve(workspaceRoot) : getWorkspaceRoot();
+    let safeRoot;
+    try {
+        safeRoot = fs.realpathSync(requestedRoot);
+    } catch (_) {
+        safeRoot = requestedRoot;
+    }
+    const requestedBase = base ? path.resolve(base) : safeRoot;
+    let safeBase;
     if (!safeRoot) return { ok: false, items: [], error: 'workspace_unavailable' };
     try {
-        resolveWorkspacePath(safeBase, {
+        safeBase = resolveWorkspacePath(requestedBase, {
             workspaceRoot: safeRoot,
             leadingSlashIsWorkspaceRelative: false
         });

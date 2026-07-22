@@ -68,6 +68,9 @@ const PCLI = path.join(REPO_ROOT, 'bin', 'p-cli');
 const PSH = path.join(REPO_ROOT, 'bin', 'psh');
 const INSTALL_DEPS = path.join(REPO_ROOT, 'bin', 'ploinky-install-deps');
 const SUPERVISOR = path.join(REPO_ROOT, 'container', 'runtime-supervisor.mjs');
+const BOX_CLI_FROM_BIN = `${path.join(REPO_ROOT, 'bin')}/../ploinky-box/bin/ploinky-box.mjs`;
+const LOCAL_SHELL_FROM_BIN = `${path.join(REPO_ROOT, 'bin')}/../cli/shell.js`;
+const BOX_DEPENDENCY_INSTALLER = path.join(REPO_ROOT, 'ploinky-box', 'entrypoint', 'install-dependencies.mjs');
 
 function runCalls(harness, command) {
     return harness.calls.filter(call => call.kind === 'run' && call.args[0] === command);
@@ -1079,11 +1082,11 @@ test('engine capture bounds stdin, output, and execution time', async () => {
     assert.equal(timeout.timedOut, true);
 });
 
-test('host launcher and aliases route through the supervisor, including symlinks', async t => {
+test('public and local aliases route to their current entrypoints, including symlinks', async t => {
     const cases = [
-        { name: 'ploinky', executable: PLOINKY, args: ['status', '--dry-run'], expected: [SUPERVISOR, 'status', '--dry-run'] },
-        { name: 'p-cli', executable: PCLI, args: ['status'], expected: [SUPERVISOR, 'status'] },
-        { name: 'psh', executable: PSH, args: ['--trace'], expected: [SUPERVISOR, 'sh', '--trace'] },
+        { name: 'ploinky', executable: PLOINKY, args: ['status', '--dry-run'], expected: [BOX_CLI_FROM_BIN, 'status', '--dry-run'] },
+        { name: 'p-cli', executable: PCLI, args: ['status'], expected: [BOX_CLI_FROM_BIN, 'status'] },
+        { name: 'psh', executable: PSH, args: ['--trace'], expected: [LOCAL_SHELL_FROM_BIN, '--trace'] },
     ];
     for (const scenario of cases) {
         await t.test(scenario.name, () => {
@@ -1112,9 +1115,8 @@ test('host launcher and aliases route through the supervisor, including symlinks
 
 test('wrapper marker and source mount contracts remain explicit', () => {
     const launcher = fs.readFileSync(PLOINKY, 'utf8');
-    assert.match(launcher, /-f \/etc\/ploinky-box/);
-    assert.match(launcher, /PLOINKY_WORKSPACE_ROOT.*\/workspace/);
-    assert.match(launcher, /exec node "\$ROOT_DIR\/container\/runtime-supervisor\.mjs"/);
+    assert.match(launcher, /exec node "\$SCRIPT_DIR\/\.\.\/ploinky-box\/bin\/ploinky-box\.mjs"/);
+    assert.doesNotMatch(launcher, /container\/runtime-supervisor\.mjs/);
 
     const invocation = invocationFor();
     const config = createDefaultRuntimeConfig(invocation);
@@ -1128,11 +1130,14 @@ test('wrapper marker and source mount contracts remain explicit', () => {
 test('dependency installer remains syntactically valid and read-only-source safe', () => {
     const result = spawnSync('bash', ['-n', INSTALL_DEPS], { encoding: 'utf8' });
     assert.equal(result.status, 0, result.stderr);
-    const source = fs.readFileSync(INSTALL_DEPS, 'utf8');
-    assert.match(source, /--no-package-lock/);
-    assert.match(source, /--no-audit/);
-    assert.match(source, /--no-fund/);
-    assert.match(source, /still missing after npm install/);
+    const wrapper = fs.readFileSync(INSTALL_DEPS, 'utf8');
+    assert.match(wrapper, /ploinky-box\/entrypoint\/install-dependencies\.mjs/);
+    const installer = fs.readFileSync(BOX_DEPENDENCY_INSTALLER, 'utf8');
+    assert.match(installer, /--no-package-lock/);
+    assert.match(installer, /--no-audit/);
+    assert.match(installer, /--no-fund/);
+    assert.match(installer, /Installed \$\{name\} HEAD does not match its immutable pin/);
+    assert.match(installer, /Staged \$\{name\} HEAD does not match its immutable pin/);
 });
 
 test('dependency consent honors environment opt-in and TTY confirmation only', () => {

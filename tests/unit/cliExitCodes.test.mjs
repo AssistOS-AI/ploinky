@@ -169,20 +169,10 @@ test('help and direct-core bare cli do not load the core command graph', () => {
     }
 });
 
-test('managed launcher bypasses its dependency gate only for help and bare cli', () => {
+test('managed launcher delegates every command to the Box entrypoint', () => {
     const launcher = fs.readFileSync(path.join(repoRoot, 'bin', 'ploinky'), 'utf8');
-    assert.match(
-        launcher,
-        /case "\$\{1:-\}" in[\s\S]*help\|--help\|-h[\s\S]*cli[\s\S]*skip_dependency_gate=1/,
-    );
-    assert.ok(
-        launcher.indexOf('skip_dependency_gate=1')
-        < launcher.indexOf('deps_missing=0'),
-    );
-    assert.match(
-        launcher,
-        /cli\)[\s\S]{0,160}\[\[ "\$#" -eq 1 \]\] && skip_dependency_gate=1/,
-    );
+    assert.match(launcher, /ploinky-box\/bin\/ploinky-box\.mjs" "\$@"/);
+    assert.doesNotMatch(launcher, /skip_dependency_gate|deps_missing/);
 });
 
 test('one-shot bare cli propagates the exact shell exit code', () => {

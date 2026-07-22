@@ -7,9 +7,9 @@ import { spawnSync } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
 
 const repoRoot = path.resolve(new URL('../..', import.meta.url).pathname);
-const utilsUrl = pathToFileURL(path.join(repoRoot, 'cli', 'services', 'utils.js')).href;
-const bootstrapManifestUrl = pathToFileURL(path.join(repoRoot, 'cli', 'services', 'bootstrapManifest.js')).href;
-const reposUrl = pathToFileURL(path.join(repoRoot, 'cli', 'services', 'repos.js')).href;
+const utilsUrl = pathToFileURL(path.join(repoRoot, 'cli', 'utils', 'utils.js')).href;
+const bootstrapManifestUrl = pathToFileURL(path.join(repoRoot, 'cli', 'utils', 'runtime', 'bootstrapManifest.js')).href;
+const reposUrl = pathToFileURL(path.join(repoRoot, 'cli', 'utils', 'repos.js')).href;
 
 function writeManifest(workspace, repoName, agentName) {
     const agentDir = path.join(workspace, '.ploinky', 'repos', repoName, agentName);

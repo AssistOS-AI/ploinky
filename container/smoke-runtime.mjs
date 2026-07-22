@@ -29,7 +29,7 @@ import {
     parseSsOutput,
     validateListenerInventory,
 } from './listener-inventory.mjs';
-import { normalizePublicMediaIPv4 } from '../cli/services/edgeGeneration.js';
+import { normalizePublicMediaIPv4 } from '../cli/sandbox/edgeGeneration.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, '..');

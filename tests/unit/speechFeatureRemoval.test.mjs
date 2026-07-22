@@ -154,47 +154,8 @@ test('speech-only strategy modules are deleted', () => {
 });
 
 test('WebMeet no longer exposes dictation or read-aloud UI', () => {
-    const template = read('cli/server/webmeet/webmeet.html');
-    assertPatternsAbsent(template, [
-        /id="sttBtn"/,
-        /id="sttEnable"/,
-        /id="sttLang"/,
-        /id="sttStatus"/,
-        /Voice Settings/,
-        /Voice dictation/,
-        /speech dictation/,
-        /dictate/,
-        /audio\.js/,
-    ], 'WebMeet template');
-
-    const files = [
-        'cli/server/webmeet/webmeet-ui.js',
-        'cli/server/webmeet/webmeet-store.js',
-        'cli/server/webmeet/webmeet-media.js',
-        'cli/server/webmeet/webmeet-client.js',
-        'cli/server/webmeet/webrtc-room.js',
-        'cli/server/webmeet/webmeet.css',
-        'cli/server/handlers/webmeet.js',
-    ];
-
-    for (const relativePath of files) {
-        const source = read(relativePath);
-        assertPatternsAbsent(source, [
-            /SpeechRecognition/,
-            /webkitSpeechRecognition/,
-            /SpeechSynthesisUtterance/,
-            /speechSynthesis/,
-            /webMeetAudio/,
-            /createTTSButton/,
-            /toggleDictation/,
-            /stopRecognition/,
-            /vc_stt_/,
-            /\bstt[A-Z_]/,
-            /\bstt:/,
-            /speech-to-text/,
-            /Read aloud/,
-        ], relativePath);
-    }
+    assert.equal(exists('cli/server/webmeet'), false, 'WebMeet UI is agent-owned, not Ploinky core');
+    assert.equal(exists('cli/server/handlers/webmeet.js'), false, 'WebMeet handler is agent-owned');
 });
 
 test('public docs no longer advertise Ploinky speech features', () => {
@@ -202,8 +163,9 @@ test('public docs no longer advertise Ploinky speech features', () => {
         'docs/specs/DS011-security-model.md',
         'docs/webchat.html',
         'docs/interfaces.html',
-        'docs/spec-webmeet.html',
     ];
+
+    assert.equal(exists('docs/spec-webmeet.html'), false, 'WebMeet documentation is agent-owned');
 
     for (const relativePath of docs) {
         const source = read(relativePath);
