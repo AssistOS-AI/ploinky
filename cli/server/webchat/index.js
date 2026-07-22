@@ -22,6 +22,7 @@ const {
     dlog,
     markdown,
     basePath,
+    workspaceBase,
     toEndpoint,
     showBanner,
     hideBanner,
@@ -84,7 +85,7 @@ const sidePanelApi = createSidePanel({
     sidePanelClose,
     sidePanelTitle,
     sidePanelResizer
-}, { markdown });
+}, { markdown, workspaceBase, webchatBasePath: basePath });
 
 let sessionController = null;
 let taskController = null;
@@ -110,6 +111,8 @@ const messages = createMessages({
     historyGate
 }, {
     markdown,
+    workspaceBase,
+    webchatBasePath: basePath,
     initialViewMoreLineLimit: getViewMoreLineLimit(),
     sidePanel: sidePanelApi,
     taskController,

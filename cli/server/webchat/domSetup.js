@@ -93,6 +93,12 @@ export function initDom() {
     const basePath = (body.dataset.base || '').replace(/\/$/, '') || '';
     const agentQuery = (body.dataset.agentQuery || '').trim();
     const workdir = (body.dataset.workdir || '').trim();
+    let workspaceBase = '';
+    try {
+        workspaceBase = decodeURIComponent((body.dataset.workspaceBase || '').trim());
+    } catch (_) {
+        workspaceBase = '';
+    }
     const tabStorageKey = `webchat_tab_id:${workdir}:${agentQuery}`;
     let TAB_ID = '';
     try {
@@ -243,6 +249,7 @@ export function initDom() {
         agentName,
         displayName: appTitle,
         workdir,
+        workspaceBase,
         launchConfig,
         toEndpoint,
         showBanner,

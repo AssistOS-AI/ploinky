@@ -1,4 +1,7 @@
+import { enhanceWorkspaceFileLinks, workspaceFilePreviewKind } from './workspaceFileLinks.js';
+
 const PANEL_SIZE_KEY = 'webchat_sidepanel_pct';
+const MAX_INLINE_TEXT_CHARACTERS = 2_000_000;
 
 function clamp(value, min, max) {
     return Math.max(min, Math.min(max, value));
@@ -27,11 +30,11 @@ export function createSidePanel({
     sidePanelClose,
     sidePanelTitle,
     sidePanelResizer
-}, { markdown }) {
+}, { markdown, workspaceBase = '', webchatBasePath = '/webchat' }) {
     let activeBubble = null;
     let activeFrame = null;
     let activeTaskId = '';
-
+    let activeFileRequest = 0;
     const panelWrapper = sidePanel?.querySelector('.wa-side-panel-content') || null;
 
     function clearPanelTitle() {
@@ -56,7 +59,7 @@ export function createSidePanel({
         sidePanelTitle.textContent = text || '';
     }
 
-    function setPanelTitleLink(url) {
+    function setPanelTitleLink(url, label = url) {
         if (!sidePanelTitle) {
             return;
         }
@@ -66,7 +69,7 @@ export function createSidePanel({
         anchor.href = url;
         anchor.target = '_blank';
         anchor.rel = 'noopener noreferrer';
-        anchor.textContent = url;
+        anchor.textContent = label;
         anchor.title = url;
         anchor.style.color = 'var(--wa-accent)';
         anchor.style.textDecoration = 'none';
@@ -167,6 +170,7 @@ export function createSidePanel({
             return;
         }
         container.innerHTML = renderMarkdown(markdown, text);
+        enhanceWorkspaceFileLinks(container, { workspaceBase, webchatBasePath });
         bindLinkDelegation(container);
         setPanelTitleText('Full Answer');
         activeFrame = null;
@@ -177,16 +181,18 @@ export function createSidePanel({
         if (!sidePanel) {
             return;
         }
+        activeFileRequest += 1;
         showText(text);
         activeBubble = bubble || null;
         ensurePanelVisible();
         applyPanelSizeFromStorage();
     }
 
-    function openIframe(url, { taskId = '' } = {}) {
+    function openIframe(url, { taskId = '', sandbox = false, title = url } = {}) {
         if (!panelWrapper || !sidePanel) {
             return;
         }
+        activeFileRequest += 1;
         panelWrapper.innerHTML = '';
 
         const holder = document.createElement('div');
@@ -202,6 +208,9 @@ export function createSidePanel({
         frame.style.height = '100%';
         frame.referrerPolicy = 'no-referrer';
         frame.loading = 'lazy';
+        if (sandbox) {
+            frame.setAttribute?.('sandbox', '');
+        }
 
         const overlay = document.createElement('div');
         overlay.className = 'wa-iframe-error';
@@ -234,8 +243,95 @@ export function createSidePanel({
         activeFrame = frame;
         activeTaskId = String(taskId || '').trim();
         ensurePanelVisible();
-        setPanelTitleLink(url);
+        setPanelTitleLink(url, title);
         applyPanelSizeFromStorage();
+    }
+
+    function showFileMessage(message, className = '') {
+        if (!panelWrapper) return;
+        panelWrapper.innerHTML = '';
+        const body = document.createElement('div');
+        body.className = `wa-side-panel-body wa-workspace-file-status ${className}`.trim();
+        body.textContent = message;
+        panelWrapper.appendChild(body);
+    }
+    function showTextFile(text, { path, markdownFile }) {
+        if (!panelWrapper) return;
+        panelWrapper.innerHTML = '';
+        const container = document.createElement('div');
+        container.className = 'wa-side-panel-body wa-workspace-file-text';
+        panelWrapper.appendChild(container);
+        if (markdownFile) {
+            container.innerHTML = renderMarkdown(markdown, text);
+            enhanceWorkspaceFileLinks(container, { workspaceBase, webchatBasePath });
+            bindLinkDelegation(container);
+            return;
+        }
+        const pre = document.createElement('pre');
+        const code = document.createElement('code');
+        code.textContent = text;
+        if (path) code.dataset.path = path;
+        pre.appendChild(code);
+        container.appendChild(pre);
+    }
+    function showImageFile(url, path) {
+        if (!panelWrapper) return;
+        panelWrapper.innerHTML = '';
+        const holder = document.createElement('div');
+        holder.className = 'wa-workspace-file-image-wrap';
+        const img = document.createElement('img');
+        img.className = 'wa-workspace-file-image';
+        img.src = url;
+        img.alt = path || 'Workspace file';
+        img.addEventListener('error', () => {
+            showFileMessage('Unable to preview this image.', 'is-error');
+        }, { once: true });
+        holder.appendChild(img);
+        panelWrapper.appendChild(holder);
+    }
+    async function openWorkspaceFile(url, { path = '' } = {}) {
+        if (!panelWrapper || !sidePanel) return;
+        const kind = workspaceFilePreviewKind(path || url);
+        const requestId = ++activeFileRequest;
+        activeBubble = null;
+        activeFrame = null;
+        activeTaskId = '';
+        ensurePanelVisible();
+        applyPanelSizeFromStorage();
+        setPanelTitleLink(url, path || url);
+        if (kind === 'image') {
+            showImageFile(url, path);
+            return;
+        }
+        if (kind === 'pdf') {
+            openIframe(url, { title: path || url });
+            return;
+        }
+        if (kind === 'html') {
+            openIframe(url, { sandbox: true, title: path || url });
+            return;
+        }
+        if (kind !== 'markdown' && kind !== 'text') {
+            showFileMessage('Preview is not available for this file type.', 'is-error');
+            return;
+        }
+        showFileMessage('Loading file…', 'is-loading');
+        try {
+            const response = await fetch(url, { credentials: 'include' });
+            if (!response.ok) {
+                throw new Error(response.status === 404 ? 'File not found.' : 'Unable to load this file.');
+            }
+            const text = await response.text();
+            if (requestId !== activeFileRequest) return;
+            if (text.length > MAX_INLINE_TEXT_CHARACTERS) {
+                showFileMessage('This file is too large to preview.', 'is-error');
+                return;
+            }
+            showTextFile(text, { path, markdownFile: kind === 'markdown' });
+        } catch (error) {
+            if (requestId !== activeFileRequest) return;
+            showFileMessage(error?.message || 'Unable to load this file.', 'is-error');
+        }
     }
 
     function close() {
@@ -247,6 +343,7 @@ export function createSidePanel({
         activeBubble = null;
         activeFrame = null;
         activeTaskId = '';
+        activeFileRequest += 1;
         resetChatAreaSizing();
     }
 
@@ -374,6 +471,12 @@ export function createSidePanel({
                 return;
             }
             event.preventDefault();
+            if (link.dataset.wcFile === 'true') {
+                void openWorkspaceFile(link.href, {
+                    path: link.dataset.wcFilePath || '',
+                });
+                return;
+            }
             openIframe(link.href, { taskId: link.dataset.wcTaskId || '' });
         });
         container.dataset.linksBound = 'true';
@@ -382,6 +485,7 @@ export function createSidePanel({
     return {
         openText,
         openIframe,
+        openWorkspaceFile,
         postTaskUpdate,
         close,
         updateIfActive,

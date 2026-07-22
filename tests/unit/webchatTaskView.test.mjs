@@ -205,6 +205,136 @@ test('generic side panel stops above the floating composer and scrolls its conte
         /\.wa-side-panel-content\s*\{[^}]*min-height:\s*0[^}]*overflow:\s*auto/s,
     );
 });
+
+test('workspace Markdown and text files are fetched and rendered inside the side panel', async (t) => {
+    const originalDocument = globalThis.document;
+    const originalWindow = globalThis.window;
+    const originalFetch = globalThis.fetch;
+    const elements = [];
+    const makeElement = (tagName = 'div') => {
+        const element = {
+            tagName: tagName.toUpperCase(),
+            children: [],
+            className: '',
+            dataset: {},
+            style: {},
+            _innerHTML: '',
+            appendChild(child) {
+                this.children.push(child);
+                return child;
+            },
+            addEventListener() {},
+            setAttribute() {},
+        };
+        Object.defineProperty(element, 'innerHTML', {
+            get() { return this._innerHTML; },
+            set(value) {
+                this._innerHTML = String(value);
+                this.children = [];
+            },
+        });
+        elements.push(element);
+        return element;
+    };
+    const panelWrapper = makeElement();
+    const sidePanel = makeElement();
+    sidePanel.querySelector = () => panelWrapper;
+    const chatContainer = makeElement();
+    chatContainer.classList = { add() {}, remove() {} };
+    globalThis.document = { createElement: (tagName) => makeElement(tagName) };
+    globalThis.window = { location: { origin: 'http://localhost:8080' } };
+    globalThis.fetch = async (url, options) => {
+        assert.equal(options.credentials, 'include');
+        if (url === '/workspace-files/project/README.md') {
+            return { ok: true, text: async () => '# Report' };
+        }
+        assert.equal(url, '/workspace-files/project/output.log');
+        return { ok: true, text: async () => '<unsafe>\nline 2' };
+    };
+    t.after(() => {
+        globalThis.document = originalDocument;
+        globalThis.window = originalWindow;
+        globalThis.fetch = originalFetch;
+    });
+
+    const api = createSidePanel({
+        chatContainer,
+        chatArea: null,
+        sidePanel,
+        sidePanelContent: null,
+        sidePanelClose: null,
+        sidePanelTitle: null,
+        sidePanelResizer: null,
+    }, {
+        markdown: { render: (text) => `<h1>${text.slice(2)}</h1>` },
+        workspaceBase: 'project',
+    });
+    await api.openWorkspaceFile('/workspace-files/project/README.md', { path: 'README.md' });
+
+    const rendered = panelWrapper.children.at(-1);
+    assert.equal(rendered.className, 'wa-side-panel-body wa-workspace-file-text');
+    assert.equal(rendered.innerHTML, '<h1>Report</h1>');
+
+    await api.openWorkspaceFile('/workspace-files/project/output.log', { path: 'output.log' });
+    const textContainer = panelWrapper.children.at(-1);
+    const code = textContainer.children[0].children[0];
+    assert.equal(code.textContent, '<unsafe>\nline 2');
+    assert.equal(textContainer.innerHTML, '');
+});
+
+test('workspace HTML files use a sandboxed iframe', (t) => {
+    const originalDocument = globalThis.document;
+    const originalWindow = globalThis.window;
+    const originalSetTimeout = globalThis.setTimeout;
+    let iframe = null;
+    const makeElement = (tagName = 'div') => ({
+        tagName: tagName.toUpperCase(),
+        children: [],
+        attributes: new Map(),
+        className: '',
+        dataset: {},
+        style: {},
+        appendChild(child) {
+            this.children.push(child);
+            return child;
+        },
+        addEventListener() {},
+        setAttribute(name, value) { this.attributes.set(name, String(value)); },
+    });
+    const panelWrapper = makeElement();
+    const sidePanel = makeElement();
+    sidePanel.querySelector = () => panelWrapper;
+    const chatContainer = makeElement();
+    chatContainer.classList = { add() {}, remove() {} };
+    globalThis.document = {
+        createElement(tagName) {
+            const element = makeElement(tagName);
+            if (tagName === 'iframe') iframe = element;
+            return element;
+        },
+    };
+    globalThis.window = { location: { origin: 'http://localhost:8080' } };
+    globalThis.setTimeout = () => 0;
+    t.after(() => {
+        globalThis.document = originalDocument;
+        globalThis.window = originalWindow;
+        globalThis.setTimeout = originalSetTimeout;
+    });
+
+    const api = createSidePanel({
+        chatContainer,
+        chatArea: null,
+        sidePanel,
+        sidePanelContent: null,
+        sidePanelClose: null,
+        sidePanelTitle: null,
+        sidePanelResizer: null,
+    }, { markdown: null });
+    api.openWorkspaceFile('/workspace-files/project/report.html', { path: 'report.html' });
+
+    assert.ok(iframe);
+    assert.equal(iframe.attributes.get('sandbox'), '');
+});
 test('task refresh extracts terminal text separately from log transport', () => {
     assert.equal(taskRouteTestables.taskResultText({
         result: {

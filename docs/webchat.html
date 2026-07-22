@@ -145,6 +145,11 @@ ploinky cli achilles-cli --path=/absolute/path</code></pre>
                         <li>✅ Long output folding with “Show more” expansion</li>
                         <li>✅ Agent progress reasons persisted as an ordered string array and displayed as a collapsible block above the final answer</li>
                         <li>✅ Side panel to inspect full message history</li>
+                        <li>✅ Workspace file previews — recognizable cwd-relative paths in assistant output become links
+                            without changing the stored message. Markdown is rendered with the WebChat Markdown renderer,
+                            text and source files use an escaped code view, images and PDFs use native previews, and HTML
+                            opens in a sandboxed frame. All content is read through the existing authenticated
+                            <code>/workspace-files/...</code> route.</li>
                         <li>✅ Workspace-wide Tasks overlay with live bounded logs and completion notifications</li>
                     </ul>
 

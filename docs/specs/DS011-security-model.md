@@ -139,7 +139,22 @@ WebChat interaction responses are state-changing control traffic and must use th
 
 Browser autocomplete must not treat URL query parameters as authority to call arbitrary MCP tools. Ploinky WebChat must not expose provider tag catalogs from URL parameters; dynamic backend discovery belongs to the selected chat agent or relay during a real delegated request that carries a router-minted invocation token.
 
-Router-owned workspace file serving sanitizes relative paths and denies `..` traversal before resolving under the workspace root. Agent application static serving is no longer implemented by reading `static.hostPath` inside the router; the router forwards `/<agent>/...` to the selected agent, and that agent is responsible for static-file confinement. The shared `AgentServer` serves static files from `PLOINKY_CODE_DIR` or `/code`, denies traversal segments and NUL bytes, and checks resolved paths stay inside that root. Custom agent HTTP servers that serve `index.html` or other application assets must enforce the same containment rule. Operators must not place secrets in directories reachable by agent static roots.
+Router-owned workspace file serving sanitizes relative paths and denies `..`
+traversal before resolving under the workspace root. Assistant path enhancement
+in WebChat must not widen this read boundary: it constructs authenticated
+`/workspace-files/...` links and performs the actual read only after an explicit
+user click. Supported text responses must be served inline with an
+extension-derived MIME type and `X-Content-Type-Options: nosniff`; WebChat must
+escape source and plain-text content, render Markdown through its existing
+renderer, and sandbox workspace HTML previews. Agent application static serving
+is no longer implemented by reading `static.hostPath` inside the router; the
+router forwards `/<agent>/...` to the selected agent, and that agent is
+responsible for static-file confinement. The shared `AgentServer` serves static
+files from `PLOINKY_CODE_DIR` or `/code`, denies traversal segments and NUL bytes,
+and checks resolved paths stay inside that root. Custom agent HTTP servers that
+serve `index.html` or other application assets must enforce the same containment
+rule. Operators must not place secrets in directories reachable by agent static
+roots.
 
 Blob upload and download paths use random hexadecimal ids and reject ids containing characters outside the allowed id set. Original filenames and MIME types are stored as metadata and must not control filesystem paths. Blob and upload handlers currently do not enforce a repository-wide content-size limit or quota. Any deployment that exposes uploads beyond a trusted local user must add request-size limits and storage quotas at the router or proxy layer.
 

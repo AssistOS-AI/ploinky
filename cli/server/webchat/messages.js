@@ -1,6 +1,7 @@
 import { formatBytes, getFileIcon } from './fileHelpers.js';
 import { findMentionRanges } from './composerMentionHighlights.js';
 import { attachTaskSummary } from './taskPresentation.js';
+import { enhanceWorkspaceFileLinks } from './workspaceFileLinks.js';
 
 const ENABLE_SELECT_PAGINATION_ACTIONS = false;
 const AUTO_SCROLL_BOTTOM_THRESHOLD_PX = 4;
@@ -35,6 +36,8 @@ export function createMessages({
     historyGate
 }, {
     markdown,
+    workspaceBase = '',
+    webchatBasePath = '/webchat',
     initialViewMoreLineLimit,
     sidePanel,
     taskController,
@@ -961,6 +964,8 @@ export function createMessages({
             textContainer.innerHTML = renderMarkdown(displayText);
             if (bubble.closest('.wa-message.out')) {
                 highlightMentions(textContainer);
+            } else {
+                enhanceWorkspaceFileLinks(textContainer, { workspaceBase, webchatBasePath });
             }
             enhanceMarkdownTables(textContainer);
             sidePanel.bindLinkDelegation(textContainer);

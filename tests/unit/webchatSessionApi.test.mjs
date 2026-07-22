@@ -52,6 +52,14 @@ async function request(appState, url, options = {}) {
 
 test.after(() => fs.rmSync(root, { recursive: true, force: true }));
 
+test('WebChat page exposes the workspace-relative base used by file preview links', async () => {
+    const appState = { sessions: new Map(), runtimes: new Map() };
+    const response = await request(appState, '/webchat/?workspace-dir=project');
+
+    assert.equal(response.statusCode, 200);
+    assert.match(response.body, /data-workspace-base="project"/);
+});
+
 test('folder-session API creates, lists, selects, and loads history without exposing messages in listings', async () => {
     const appState = { sessions: new Map(), runtimes: new Map() };
     const suffix = '?workspace-dir=project';

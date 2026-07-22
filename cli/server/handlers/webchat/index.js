@@ -151,7 +151,8 @@ export async function handleWebChat(req, res, appConfig, appState) {
             '__RUNTIME__': effectiveConfig.runtime || 'local',
             '__BASE_PATH__': `/${appName}`,
             '__AGENT_QUERY__': agentQuery,
-            '__WORKDIR__': workspaceBase.base
+            '__WORKDIR__': workspaceBase.base,
+            '__WORKSPACE_BASE__': encodeURIComponent(workspaceBase.relativeBase || ''),
         });
         if (html) {
             res.writeHead(200, {

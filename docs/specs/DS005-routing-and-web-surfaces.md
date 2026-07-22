@@ -88,6 +88,22 @@ WebChat must provide a generic composer autocomplete surface driven by trigger p
 - `@` opens the workspace-paths provider only. The provider preserves the WebChat launch query when it requests `/webchat/suggestions/files`, so the router resolves the same workspace-confined working directory supplied through `dir`, `workspace-dir`, or `workspaceDir`, with the workspace root as fallback. It shows at most 30 immediate children of the active folder under a `Files and folders` group. Text typed after `@` must continue to request and filter the active folder case-insensitively even when responses for older fragments arrive later. Selecting a folder inserts a cwd-relative token such as `@reports/` and drills into it. Selecting a file inserts a token such as `@reports/summary.md`, records a structured `workspace-path` reference on the outgoing envelope, and closes autocomplete so the next unmodified Enter submits the message. A space typed after a folder token terminates that token and closes autocomplete; moving the caret before that separator may reactivate autocomplete for the path fragment at the caret.
 Selected workspace-path tokens should be visually emphasized in the composer and in rendered user messages when their structured reference metadata is available, while preserving the plain textarea value submitted to the selected chat agent.
 
+Assistant messages must enhance recognizable workspace file paths after Markdown
+rendering without modifying the raw message stored in folder history or supplied
+to continuation context. Detection must cover cwd-relative paths with supported
+document, text, source, image, PDF, or HTML extensions. Inline-code paths may
+contain spaces, while fenced code blocks, external links, URLs, traversal paths,
+and host-absolute paths must not be rewritten. Existing relative Markdown file
+links may be normalized to the same preview route. The browser must prefix
+cwd-relative candidates with the WebChat working directory's workspace-relative
+base and point them at the existing authenticated `/workspace-files/...` route.
+Explicit `/workspace-files/...` links remain workspace-root-relative and must not
+receive the cwd prefix a second time. Clicking a detected path must open the side
+panel: Markdown uses the existing Markdown renderer, text and source content use
+an escaped code view, images use an image preview, PDFs use the browser viewer,
+and HTML uses a sandboxed iframe. Unknown binary types must not trigger a download
+from an automatically detected path.
+
 WebChat must not hardcode optional agent ids, backend tags, or agent-owned tool names for `@` suggestions. It must not offer an `Agents` suggestion group or highlight arbitrary `@word` tokens as provider mentions. Unknown `@word` mentions remain ordinary chat text; semantic provider routing, if any, belongs to the selected chat agent after it receives the message envelope.
 
 Ploinky must not add a research-specific enable command or WebChat availability toggle for optional provider agents. From the framework's perspective, a provider becomes selectable only when the selected chat agent exposes a launcher skill or equivalent agent-owned command for it. Backend health checks and unavailable messages belong to that launcher or downstream relay, not to Ploinky's command registry, composer, or router.
@@ -232,7 +248,11 @@ The router must also expose:
 - `/health` for health status.
 - `/api/marketplace` for the first-party agent marketplace. This route is router-owned and returns JSON rather than proxied agent content. Browser callers use the existing local or SSO session: authenticated users may read Marketplace state, non-admin clients use the returned permissions to hide management controls, and only an authenticated local administrator may perform the full `install_repo`, `uninstall_repo`, `enable_agent`, and `disable_agent` action set. An already-running Ploinky agent may also call the same endpoint with a request-bound Agent Assertion targeted at `ploinky-router`: `GET` uses the synthetic tool `marketplace.read`, while `POST` is restricted to `enable_agent` and uses `marketplace.enable_agent`. Agent assertions must be bound to the exact method, path, query, and raw body, and must be replay-protected. Agent callers cannot install repositories, uninstall repositories, disable agents, or gain browser admin permissions. The read response reports the caller-facing Marketplace state, predefined repositories, installed repositories, remembered repository sources, repository kind, discoverable agents, enabled-agent registry state, and runtime status derived from live Ploinky containers. Repository installation must require a URL, accept an optional name and branch, clone the checkout, and record source metadata including repository kind. Repository uninstall must match the CLI repository contract: it disables enabled agents that came from that repository by container key, removes their runtime containers through the normal disable helper, preserves agent work directories, removes the installed repository checkout, and preserves the source metadata so the repository remains available for reinstall in the correct Marketplace repo category. Agent enablement must use the standard enable path. Agent disablement is marketplace-specific: the route removes the enabled-agent registry record before removing the agent runtime with the normal container removal helper, so the watchdog container monitor does not restart the runtime while the admin operation is in progress. This marketplace behavior must not change the conservative direct `ploinky disable agent` CLI contract, which still refuses to remove records while runtime state exists.
 - `/upload` and `/blobs` for workspace and agent blob flows.
-- `/workspace-files/...` for authenticated, workspace-confined file reads owned by the router.
+- `/workspace-files/...` for authenticated, workspace-confined file reads owned
+  by the router. Responses must derive `Content-Type` from the file extension,
+  attach UTF-8 charsets to supported text formats, set
+  `Content-Disposition: inline`, and set `X-Content-Type-Options: nosniff` so
+  WebChat can preview content without an automatic download.
 - `/webchat/uploads` for WebChat session-scoped file storage and download under `<cwd>/uploads/<sessionId>`.
 - `/agent-card` for aggregate discovery of routable agents that expose capability metadata. The router must query each active route's internal `/agent-card` endpoint, include successful responses without validating their field shape, and report per-agent errors separately.
 - `/mcp` for router-level MCP aggregation.
@@ -397,6 +417,17 @@ avoid duplicate starts and immediate calls to an MCP server that is not ready.
 
 Response:
 An interaction response controls an already running CLI request and is not a new user prompt. A dedicated authenticated endpoint can bind it to the active tab, folder session, request id, and declared option, while named SSE events keep the transient selector out of conversation history and allow it to recover after a transport reconnect.
+
+### Question #22: Why does assistant file-link enhancement reuse `/workspace-files` without pre-validating every candidate?
+
+Response:
+The assistant may describe files using several ordinary textual forms, and the
+browser can recognize those forms without changing the conversation schema or
+making a request during every streaming update. Reusing the authenticated
+router-owned file route keeps canonical path validation at the read boundary. A
+syntactic false positive therefore becomes at most a failed preview after an
+explicit user click, while the agent receives no additional filesystem
+capability and the stored assistant text remains unchanged.
 
 ## Conclusion
 
