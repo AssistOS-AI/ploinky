@@ -36,10 +36,11 @@ function normalizePortBindings(bindings) {
             return null;
         }
         for (const value of values) {
+            const inspectedHostIp = String(value?.HostIp ?? '');
             result.push({
                 containerPort: String(containerPort),
                 protocol: String(protocol),
-                hostIp: String(value?.HostIp ?? ''),
+                hostIp: inspectedHostIp === '' ? '0.0.0.0' : inspectedHostIp,
                 hostPort: String(value?.HostPort ?? ''),
             });
         }

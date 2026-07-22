@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import { BOX_LABELS } from '../../ploinky-box/constants.mjs';
+import { normalizeContainerRuntime } from '../../ploinky-box/contract/container.mjs';
 import {
     preflightPublications,
     resolveEffectiveHostPort,
@@ -66,6 +67,24 @@ test('publication mismatch reports the normalized observed and expected bindings
             return true;
         },
     );
+});
+
+test('Podman empty HostIp inspection normalizes to an explicit wildcard', () => {
+    const runtime = normalizeContainerRuntime({
+        Config: { Env: [] },
+        HostConfig: {
+            PortBindings: {
+                '7882/udp': [{ HostIp: '', HostPort: '7882' }],
+                '8080/tcp': [{ HostIp: '127.0.0.1', HostPort: '19090' }],
+            },
+        },
+        State: { Running: true },
+    });
+
+    assert.deepEqual(runtime.publications, [
+        { containerPort: '7882', protocol: 'udp', hostIp: '0.0.0.0', hostPort: '7882' },
+        { containerPort: '8080', protocol: 'tcp', hostIp: '127.0.0.1', hostPort: '19090' },
+    ]);
 });
 
 test('preflight reports conflicts before a caller can perform engine mutation', async () => {
