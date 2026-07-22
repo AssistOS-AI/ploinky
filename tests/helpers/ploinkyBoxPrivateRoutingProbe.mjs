@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { execFile, execFileSync } from 'node:child_process';
+import fs from 'node:fs';
 
 import { createPrivateListener } from '../../cli/server/privateListener.js';
 import { proveContainerLoopbackBinding } from '../../cli/server/privateListenerBindings/containerLoopbackBinding.js';
@@ -37,6 +38,22 @@ function selectedPodmanInfo(info) {
     };
 }
 
+function pastaProcessArguments(fsApi = fs) {
+    const processes = [];
+    for (const entry of fsApi.readdirSync('/proc', { withFileTypes: true })) {
+        if (!entry.isDirectory() || !/^\d+$/.test(entry.name)) continue;
+        try {
+            const argv = fsApi.readFileSync(`/proc/${entry.name}/cmdline`, 'utf8')
+                .split('\0')
+                .filter(Boolean);
+            if (argv.some((argument) => /(?:^|\/)pasta$/.test(argument))) {
+                processes.push(argv);
+            }
+        } catch {}
+    }
+    return processes;
+}
+
 const nestedNetworkScript = [
     "const d=require('node:dns'),f=require('node:fs'),o=require('node:os');",
     "const result={hosts:f.readFileSync('/etc/hosts','utf8'),networkInterfaces:o.networkInterfaces(),ipv4Routes:f.readFileSync('/proc/net/route','utf8')};",
@@ -66,10 +83,7 @@ try {
     evidence.nestedPodman.info = selectedPodmanInfo(
         commandJson('podman', ['info', '--format', 'json']),
     );
-    evidence.nestedPodman.pastaProcesses = commandText('ps', ['-eo', 'args='])
-        .split(/\n/)
-        .map((line) => line.trim())
-        .filter((line) => /(?:^|\/)pasta(?:\s|$)/.test(line));
+    evidence.nestedPodman.pastaProcesses = pastaProcessArguments();
     const nestedInspection = commandJson('podman', ['container', 'inspect', nestedContainerId])[0];
     evidence.nestedContainer.inspect = {
         id: String(nestedInspection?.Id || ''),
