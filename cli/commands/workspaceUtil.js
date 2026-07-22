@@ -21,8 +21,8 @@ import { LOGS_DIR, PLOINKY_CWD, PLOINKY_WORKSPACE_ROOT, ROUTING_FILE, RUNNING_DI
 import { classifyDependencyGraphWaitMode, resolveWorkspaceDependencyGraph, topologicallyGroupDependencyGraph } from '../utils/workspaceDependencyGraph.js';
 import { mergeRoutingConfig, readRoutingConfig } from '../server/routingFile.js';
 import {
+  finalizeStartupRoutes,
   partitionAdditionalStartupAgents,
-  removeInactiveManualRoutes,
   resolveManifestStartup,
 } from '../utils/runtime/manifestStartup.js';
 import { waitForAgentReady } from '../server/utils/agentReadiness.js';
@@ -854,10 +854,11 @@ async function startWorkspace(staticAgentArg, portArg, { refreshComponentToken, 
     });
     if (additionalStartup.inactiveManual.length) {
       cfg = await mergeRoutingConfig((current) => {
-        const routes = removeInactiveManualRoutes({
-          ...(current.routes || {}),
-          ...(cfg.routes || {}),
-        }, additionalStartup.inactiveManual);
+        const routes = finalizeStartupRoutes(
+          cfg.routes,
+          current.routes,
+          additionalStartup.inactiveManual,
+        );
         return {
           ...current,
           ...cfg,

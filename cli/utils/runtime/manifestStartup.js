@@ -58,8 +58,16 @@ function removeInactiveManualRoutes(routes = {}, inactiveManual = []) {
     return nextRoutes;
 }
 
+function finalizeStartupRoutes(snapshotRoutes = {}, persistedRoutes = {}, inactiveManual = []) {
+    return removeInactiveManualRoutes({
+        ...(snapshotRoutes || {}),
+        ...(persistedRoutes || {}),
+    }, inactiveManual);
+}
+
 export {
     AUTOMATIC_STARTUP,
+    finalizeStartupRoutes,
     MANUAL_STARTUP,
     partitionAdditionalStartupAgents,
     removeInactiveManualRoutes,
