@@ -179,6 +179,10 @@ export function stageSmokeGraph({
             throw smokeError(`${name} in-box HEAD changed during graph staging`);
         }
     }
+    runner.run(engine, [
+        'container', 'exec', '--user', 'podman', '--workdir', '/workspace', containerId,
+        '/opt/ploinky/bin/ploinky-local', 'list', 'agents',
+    ]);
     const desiredDirectory = '/workspace/.ploinky/data/edge-routing';
     const desiredTarget = `${desiredDirectory}/desired.json`;
     const desiredCandidateTarget = `${desiredTarget}.smoke-candidate`;

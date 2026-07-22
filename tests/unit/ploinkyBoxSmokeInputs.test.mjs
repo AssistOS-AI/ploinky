@@ -70,6 +70,17 @@ test('smoke graph requires exactly seven clean absolute real checkouts at exact 
     )));
     assert.ok(copyCalls.every((call) => !call.at(-1).endsWith('/AssistOSExplorer')));
     assert.ok(copyCalls.some((call) => call.at(-1).endsWith('/desired.json.smoke-candidate')));
+    const initializeIndex = calls.findIndex((call) => (
+        call.includes('/opt/ploinky/bin/ploinky-local')
+        && call.slice(-2).join(' ') === 'list agents'
+    ));
+    const desiredCopyIndex = calls.findIndex((call) => (
+        call[1] === 'container'
+        && call[2] === 'cp'
+        && call.at(-1).endsWith('/desired.json.smoke-candidate')
+    ));
+    assert.ok(initializeIndex >= 0);
+    assert.ok(initializeIndex < desiredCopyIndex);
     assert.throws(() => stageSmokeGraph({
         graph,
         containerId,
