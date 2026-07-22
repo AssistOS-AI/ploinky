@@ -1,3 +1,4 @@
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 
@@ -41,6 +42,48 @@ function exactKeys(record, label) {
     }
 }
 
+function readDesiredCandidate(value, fsApi) {
+    const suppliedPath = String(value || '');
+    if (!path.isAbsolute(suppliedPath)) {
+        throw smokeError('SMOKE_GRAPH_EDGE_DESIRED_FILE must be an absolute path');
+    }
+    let realPath;
+    let stat;
+    let bytes;
+    try {
+        realPath = fsApi.realpathSync(suppliedPath);
+        stat = fsApi.lstatSync(suppliedPath);
+        bytes = fsApi.readFileSync(suppliedPath);
+    } catch (error) {
+        throw smokeError('SMOKE_GRAPH_EDGE_DESIRED_FILE must be a readable real file', error);
+    }
+    if (path.resolve(suppliedPath) !== realPath || !stat.isFile() || stat.isSymbolicLink()) {
+        throw smokeError('SMOKE_GRAPH_EDGE_DESIRED_FILE must be a non-symlink regular real path');
+    }
+    let document;
+    try {
+        document = JSON.parse(bytes.toString('utf8'));
+    } catch (error) {
+        throw smokeError('SMOKE_GRAPH_EDGE_DESIRED_FILE must contain valid JSON', error);
+    }
+    if (document?.schemaVersion !== 1
+        || !document.hosts
+        || typeof document.hosts !== 'object'
+        || Array.isArray(document.hosts)
+        || Object.keys(document.hosts).length !== 0
+        || document.cloudflare !== undefined) {
+        throw smokeError('smoke desired state must be schema 1 and local-only with no selected hosts');
+    }
+    if (!Array.isArray(document?.security?.hostNetworkAllowedInstances)
+        || document.security.hostNetworkAllowedInstances.length !== 1) {
+        throw smokeError('smoke desired state must select exactly one host-network capability owner');
+    }
+    return Object.freeze({
+        path: realPath,
+        digest: crypto.createHash('sha256').update(bytes).digest('hex'),
+    });
+}
+
 export function readSmokeGraphInputs(env = process.env, {
     fsApi = fs,
     runner,
@@ -53,6 +96,10 @@ export function readSmokeGraphInputs(env = process.env, {
     const revisions = parseJson(
         env.SMOKE_GRAPH_REVISIONS_JSON,
         'SMOKE_GRAPH_REVISIONS_JSON',
+    );
+    const desiredCandidate = readDesiredCandidate(
+        env.SMOKE_GRAPH_EDGE_DESIRED_FILE,
+        fsApi,
     );
     if (!Array.isArray(args) || args.length < 2 || args.some((value) => typeof value !== 'string')) {
         throw smokeError('SMOKE_GRAPH_ARGS_JSON must be a nonempty string argv array');
@@ -97,6 +144,7 @@ export function readSmokeGraphInputs(env = process.env, {
     }
     return Object.freeze({
         args: Object.freeze([...args]),
+        desiredCandidate,
         repositories: Object.freeze(selected),
     });
 }
@@ -130,5 +178,36 @@ export function stageSmokeGraph({
         if (!head.ok || String(head.stdout || '').trim() !== repository.revision) {
             throw smokeError(`${name} in-box HEAD changed during graph staging`);
         }
+    }
+    const desiredDirectory = '/workspace/.ploinky/data/edge-routing';
+    const desiredTarget = `${desiredDirectory}/desired.json`;
+    const desiredCandidateTarget = `${desiredTarget}.smoke-candidate`;
+    runner.run(engine, [
+        'container', 'exec', '--user', 'podman', containerId,
+        'mkdir', '-p', desiredDirectory,
+    ]);
+    runner.run(engine, [
+        'container', 'exec', '--user', 'podman', containerId,
+        'chmod', '700', desiredDirectory,
+    ]);
+    runner.run(engine, [
+        'container', 'cp', graph.desiredCandidate.path,
+        `${containerId}:${desiredCandidateTarget}`,
+    ]);
+    runner.run(engine, [
+        'container', 'exec', '--user', 'podman', containerId,
+        'mv', desiredCandidateTarget, desiredTarget,
+    ]);
+    runner.run(engine, [
+        'container', 'exec', '--user', 'podman', containerId,
+        'chmod', '600', desiredTarget,
+    ]);
+    const desiredDigest = runner.query(engine, [
+        'container', 'exec', '--user', 'podman', containerId,
+        'sha256sum', desiredTarget,
+    ]);
+    if (!desiredDigest.ok
+        || String(desiredDigest.stdout || '').trim().split(/\s+/)[0] !== graph.desiredCandidate.digest) {
+        throw smokeError('in-box edge desired state changed during graph staging');
     }
 }

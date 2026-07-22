@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -23,6 +24,18 @@ test('smoke graph requires exactly seven clean absolute real checkouts at exact 
     const revisions = {};
     const sha = 'a'.repeat(40);
     const calls = [];
+    const desiredCandidate = path.join(root, 'edge-desired.json');
+    fs.writeFileSync(desiredCandidate, JSON.stringify({
+        schemaVersion: 1,
+        hosts: {},
+        security: {
+            hostNetworkAllowedInstances: ['media/livekit'],
+            internalServiceConsumers: {},
+        },
+    }));
+    const desiredDigest = crypto.createHash('sha256')
+        .update(fs.readFileSync(desiredCandidate))
+        .digest('hex');
     for (const name of SMOKE_GRAPH_REPOSITORIES) {
         const target = path.join(root, name);
         fs.mkdirSync(target);
@@ -35,14 +48,17 @@ test('smoke graph requires exactly seven clean absolute real checkouts at exact 
         },
         query(command, args) {
             if (args.includes('rev-parse')) return { ok: true, stdout: `${sha}\n` };
+            if (args.includes('sha256sum')) return { ok: true, stdout: `${desiredDigest}  desired.json\n` };
             return { ok: true, stdout: '' };
         },
     };
-    const graph = readSmokeGraphInputs({
+    const baseEnvironment = {
         SMOKE_GRAPH_ARGS_JSON: '["start","AchillesIDE/explorer","19090"]',
         SMOKE_GRAPH_REPOSITORIES_JSON: JSON.stringify(repositories),
         SMOKE_GRAPH_REVISIONS_JSON: JSON.stringify(revisions),
-    }, { runner });
+        SMOKE_GRAPH_EDGE_DESIRED_FILE: desiredCandidate,
+    };
+    const graph = readSmokeGraphInputs(baseEnvironment, { runner });
     assert.equal(Object.keys(graph.repositories).length, 7);
     assert.deepEqual(graph.args, ['start', 'AchillesIDE/explorer', '19090']);
 
@@ -53,14 +69,52 @@ test('smoke graph requires exactly seven clean absolute real checkouts at exact 
         `${containerId}:/workspace/.ploinky/repos/AchillesIDE`
     )));
     assert.ok(copyCalls.every((call) => !call.at(-1).endsWith('/AssistOSExplorer')));
+    assert.ok(copyCalls.some((call) => call.at(-1).endsWith('/desired.json.smoke-candidate')));
+    assert.throws(() => stageSmokeGraph({
+        graph,
+        containerId,
+        runner: {
+            ...runner,
+            query(command, args) {
+                if (args.includes('sha256sum')) {
+                    return { ok: true, stdout: `${'0'.repeat(64)}  desired.json\n` };
+                }
+                return runner.query(command, args);
+            },
+        },
+    }), /desired state changed during graph staging/);
 
     const missing = { ...repositories };
     delete missing.basic;
     assert.throws(() => readSmokeGraphInputs({
-        SMOKE_GRAPH_ARGS_JSON: JSON.stringify(graph.args),
+        ...baseEnvironment,
         SMOKE_GRAPH_REPOSITORIES_JSON: JSON.stringify(missing),
-        SMOKE_GRAPH_REVISIONS_JSON: JSON.stringify(revisions),
     }, { runner }), /exactly the seven/);
+
+    assert.throws(() => readSmokeGraphInputs({
+        ...baseEnvironment,
+        SMOKE_GRAPH_EDGE_DESIRED_FILE: 'edge-desired.json',
+    }, { runner }), /must be an absolute path/);
+
+    const desiredSymlink = path.join(root, 'edge-desired-link.json');
+    fs.symlinkSync(desiredCandidate, desiredSymlink);
+    assert.throws(() => readSmokeGraphInputs({
+        ...baseEnvironment,
+        SMOKE_GRAPH_EDGE_DESIRED_FILE: desiredSymlink,
+    }, { runner }), /non-symlink regular real path/);
+
+    const overGrantedCandidate = path.join(root, 'edge-desired-over-granted.json');
+    fs.writeFileSync(overGrantedCandidate, JSON.stringify({
+        schemaVersion: 1,
+        hosts: {},
+        security: {
+            hostNetworkAllowedInstances: ['media/livekit', 'media/turn'],
+        },
+    }));
+    assert.throws(() => readSmokeGraphInputs({
+        ...baseEnvironment,
+        SMOKE_GRAPH_EDGE_DESIRED_FILE: overGrantedCandidate,
+    }, { runner }), /exactly one host-network capability owner/);
 });
 
 test('generated candidate proxy embeds one digest outside the repository and writes NUL-safe traces', (t) => {
