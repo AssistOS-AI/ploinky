@@ -197,6 +197,109 @@ process.stdout.write(JSON.stringify({
     }
 });
 
+test('Box Podman networking binds the router host alias to trusted transport state', () => {
+    const workspaceDir = tempDir();
+    try {
+        const markerPath = path.join(workspaceDir, 'box-contract');
+        const transportPath = path.join(workspaceDir, 'box-transport.json');
+        fs.writeFileSync(markerPath, '6\n');
+        fs.writeFileSync(transportPath, JSON.stringify({
+            address: '10.88.0.29',
+            interface: 'eth0',
+        }));
+
+        const result = runModuleSnippet(
+            `const { buildBoxPodmanHostArgs } = await import(${JSON.stringify(agentServiceManagerUrl)});
+process.stdout.write(JSON.stringify(buildBoxPodmanHostArgs({
+    markerPath: ${JSON.stringify(markerPath)},
+    transportPath: ${JSON.stringify(transportPath)},
+})));`,
+            {},
+            { cwd: workspaceDir },
+        );
+
+        assert.equal(result.status, 0, result.stderr);
+        assert.deepEqual(JSON.parse(result.stdout), [
+            '--add-host',
+            'host.containers.internal:10.88.0.29',
+        ]);
+    } finally {
+        fs.rmSync(workspaceDir, { recursive: true, force: true });
+    }
+});
+
+test('Box Podman networking is inert outside a Box', () => {
+    const workspaceDir = tempDir();
+    try {
+        const result = runModuleSnippet(
+            `const { buildBoxPodmanHostArgs } = await import(${JSON.stringify(agentServiceManagerUrl)});
+process.stdout.write(JSON.stringify(buildBoxPodmanHostArgs({
+    markerPath: ${JSON.stringify(path.join(workspaceDir, 'missing-marker'))},
+    transportPath: ${JSON.stringify(path.join(workspaceDir, 'missing-transport'))},
+})));`,
+            {},
+            { cwd: workspaceDir },
+        );
+
+        assert.equal(result.status, 0, result.stderr);
+        assert.deepEqual(JSON.parse(result.stdout), []);
+    } finally {
+        fs.rmSync(workspaceDir, { recursive: true, force: true });
+    }
+});
+
+test('Box Podman networking rejects untrusted transport state', () => {
+    const workspaceDir = tempDir();
+    try {
+        const markerPath = path.join(workspaceDir, 'box-contract');
+        const realTransportPath = path.join(workspaceDir, 'real-transport.json');
+        const transportPath = path.join(workspaceDir, 'box-transport.json');
+        fs.writeFileSync(markerPath, '6\n');
+        fs.writeFileSync(realTransportPath, JSON.stringify({ address: '127.0.0.1', interface: 'lo' }));
+        fs.symlinkSync(realTransportPath, transportPath);
+
+        const result = runModuleSnippet(
+            `const { buildBoxPodmanHostArgs } = await import(${JSON.stringify(agentServiceManagerUrl)});
+try {
+    buildBoxPodmanHostArgs({
+        markerPath: ${JSON.stringify(markerPath)},
+        transportPath: ${JSON.stringify(transportPath)},
+    });
+    process.exitCode = 7;
+} catch (error) {
+    process.stdout.write(error.message);
+}`,
+            {},
+            { cwd: workspaceDir },
+        );
+
+        assert.equal(result.status, 0, result.stderr);
+        assert.match(result.stdout, /not a single regular file/);
+
+        fs.unlinkSync(transportPath);
+        fs.writeFileSync(transportPath, JSON.stringify({ address: '127.0.0.1', interface: 'lo' }));
+        const unroutable = runModuleSnippet(
+            `const { buildBoxPodmanHostArgs } = await import(${JSON.stringify(agentServiceManagerUrl)});
+try {
+    buildBoxPodmanHostArgs({
+        markerPath: ${JSON.stringify(markerPath)},
+        transportPath: ${JSON.stringify(transportPath)},
+    });
+    process.exitCode = 7;
+} catch (error) {
+    process.stdout.write(error.message);
+}`,
+            {},
+            { cwd: workspaceDir },
+        );
+
+        assert.equal(unroutable.status, 0, unroutable.stderr);
+        assert.match(unroutable.stdout, /lacks a routable IPv4 address/);
+    } finally {
+        fs.rmSync(workspaceDir, { recursive: true, force: true });
+    }
+});
+
 test('container reuse requires a matching workspace runtime identity', () => {
     const workspaceDir = tempDir();
     try {
