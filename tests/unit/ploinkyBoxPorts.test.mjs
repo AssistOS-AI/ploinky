@@ -50,6 +50,24 @@ test('existing label, publication, and authority must agree exactly', () => {
     }) }), /publications/);
 });
 
+test('publication mismatch reports the normalized observed and expected bindings', () => {
+    const mismatched = owned(19090, {
+        publications: [
+            { containerPort: '7882', protocol: 'udp', hostIp: '', hostPort: '7882' },
+            { containerPort: '8080', protocol: 'tcp', hostIp: '127.0.0.1', hostPort: '19090' },
+        ],
+    });
+
+    assert.throws(
+        () => resolveEffectiveHostPort({ ownership: mismatched }),
+        (error) => {
+            assert.match(error.message, /observed=.*\"hostIp\":\"\"/);
+            assert.match(error.message, /expected=.*\"hostIp\":\"0\.0\.0\.0\"/);
+            return true;
+        },
+    );
+});
+
 test('preflight reports conflicts before a caller can perform engine mutation', async () => {
     const calls = [];
     await assert.rejects(() => preflightPublications({
