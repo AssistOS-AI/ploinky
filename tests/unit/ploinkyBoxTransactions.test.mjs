@@ -55,6 +55,10 @@ function containerHandle({ identity, repositoryRoot, imageId, imageRef, hostPort
             imageId,
             configuredImage: imageId,
             user: 'podman',
+            createCommand: [
+                'podman', 'container', 'create',
+                '--device', '/dev/fuse', '--device', '/dev/net/tun',
+            ],
             environment: {
                 ...IMAGE_CONTRACT.environment,
                 PLOINKY_PRIVATE_BIND: '0.0.0.0',
@@ -127,6 +131,7 @@ test('Podman Machine validation tolerates its omitted device inspection only', (
         imageRef: 'runtime',
         hostPort: 19090,
     };
+    handle.runtime.createCommand = null;
     assert.throws(
         () => validateContainerConfiguration(handle, desired),
         /device set is incompatible/,
@@ -139,6 +144,10 @@ test('Podman Machine validation tolerates its omitted device inspection only', (
         /security options are incompatible/,
     );
     handle.runtime.securityOptions = ['label=disable', 'unmask=ALL'];
+    handle.runtime.createCommand = [
+        'podman', 'container', 'create',
+        '--device', '/dev/fuse', '--device', '/dev/net/tun',
+    ];
     assert.doesNotThrow(() => validateContainerConfiguration(handle, {
         ...desired,
         hostKind: 'podman-machine',
@@ -156,6 +165,7 @@ test('native device mismatch reports normalized observed and expected devices', 
         id: 'b'.repeat(64),
     });
     handle.runtime.devices = [];
+    handle.runtime.createCommand = null;
 
     assert.throws(
         () => validateContainerConfiguration(handle, {
@@ -165,7 +175,34 @@ test('native device mismatch reports normalized observed and expected devices', 
             imageRef: 'runtime',
             hostPort: 19090,
         }),
-        /observed=\[\] expected=\[\"\/dev\/fuse\",\"\/dev\/net\/tun\"\] hostKind=native-linux/,
+        /observed=\[\] recorded=null expected=\[\"\/dev\/fuse\",\"\/dev\/net\/tun\"\] hostKind=native-linux/,
+    );
+});
+
+test('omitted device inspection requires the exact recorded device arguments', (t) => {
+    const state = fixture(t);
+    const handle = containerHandle({
+        identity: state.identity,
+        repositoryRoot: state.root,
+        imageId: 'a'.repeat(64),
+        imageRef: 'runtime',
+        hostPort: 19090,
+        id: 'b'.repeat(64),
+    });
+    handle.runtime.devices = [];
+    const desired = {
+        identity: state.identity,
+        repositoryRoot: state.root,
+        imageId: 'a'.repeat(64),
+        imageRef: 'runtime',
+        hostPort: 19090,
+    };
+
+    assert.doesNotThrow(() => validateContainerConfiguration(handle, desired));
+    handle.runtime.createCommand.push('--device', '/dev/kvm');
+    assert.throws(
+        () => validateContainerConfiguration(handle, desired),
+        /device set is incompatible/,
     );
 });
 
