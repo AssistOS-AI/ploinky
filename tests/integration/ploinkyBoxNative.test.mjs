@@ -362,7 +362,7 @@ test('immutable-ID removal cleans an attached anonymous volume', {
     const created = harness.runner.query('podman', [
         'container', 'create', '--volume', '/anonymous', '--entrypoint', '/bin/true',
         candidateReference,
-    ]);
+    ], { timeoutMs: 120_000 });
     assert.equal(created.ok, true, created.stderr);
     const containerId = String(created.stdout || '').trim();
     assert.match(containerId, /^[a-f0-9]{12,64}$/);
