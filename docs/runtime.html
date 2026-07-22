@@ -107,6 +107,7 @@
           <h2>Dependency Waves and Readiness Gating</h2>
           <p>The static agent is expanded into a dependency graph through manifest <code>enable</code> directives. The graph is topologically grouped into waves. Each wave is started, routed, and then blocked on readiness before the next wave is allowed to boot. This guarantees that a dependent agent does not start before its prerequisites are reachable.</p>
           <p>Readiness protocol defaults are derived from the manifest: <code>start</code>-only agents default to TCP readiness, while agents exposing an MCP server default to an MCP handshake. Manifests may override the protocol explicitly through <code>readiness.protocol</code>.</p>
+          <p>Dependencies marked <code>no-wait</code> launch in detached workers and publish their resolved routes through a serialized update to <code>.ploinky/routing.json</code>. Foreground startup finalization preserves those freshly persisted routes instead of replacing them with its earlier in-memory snapshot, so dynamically assigned host ports remain reachable after startup completes.</p>
         </section>
 
         <section class="chapter-section">

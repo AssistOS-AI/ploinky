@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import {
+    finalizeStartupRoutes,
     partitionAdditionalStartupAgents,
     removeInactiveManualRoutes,
     resolveManifestStartup,
@@ -66,4 +67,21 @@ test('general startup removes only routes for stopped manual agents', () => {
         active: { hostPort: 7103 },
     });
     assert.ok(routes.inactiveManual, 'the input routing snapshot must not be mutated');
+});
+
+test('startup finalization preserves newer routes persisted by no-wait workers', () => {
+    const routes = finalizeStartupRoutes({
+        soulGateway: { hostPort: 43196 },
+        inactiveManual: { hostPort: 7102 },
+    }, {
+        soulGateway: { hostPort: 30549 },
+        currentWorker: { hostPort: 7103 },
+    }, [
+        { name: 'inactiveManual', routeKey: 'inactiveManual' },
+    ]);
+
+    assert.deepEqual(routes, {
+        soulGateway: { hostPort: 30549 },
+        currentWorker: { hostPort: 7103 },
+    });
 });
