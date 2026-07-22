@@ -201,7 +201,11 @@ export function validateContainerConfiguration(containerHandle, {
             || device.permissions !== 'rwm'
         ))
     )) {
-        throw publicationError('Owned Box device set is incompatible');
+        throw publicationError(
+            'Owned Box device set is incompatible: '
+            + `observed=${JSON.stringify(runtime.devices)} `
+            + `expected=${JSON.stringify(expectedDevices)} hostKind=${hostKind}`,
+        );
     }
     const expectedMounts = {
         '/opt/ploinky': { type: 'bind', source: repositoryRoot, rw: false },
