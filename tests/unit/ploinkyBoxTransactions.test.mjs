@@ -145,6 +145,30 @@ test('Podman Machine validation tolerates its omitted device inspection only', (
     }));
 });
 
+test('native device mismatch reports normalized observed and expected devices', (t) => {
+    const state = fixture(t);
+    const handle = containerHandle({
+        identity: state.identity,
+        repositoryRoot: state.root,
+        imageId: 'a'.repeat(64),
+        imageRef: 'runtime',
+        hostPort: 19090,
+        id: 'b'.repeat(64),
+    });
+    handle.runtime.devices = [];
+
+    assert.throws(
+        () => validateContainerConfiguration(handle, {
+            identity: state.identity,
+            repositoryRoot: state.root,
+            imageId: 'a'.repeat(64),
+            imageRef: 'runtime',
+            hostPort: 19090,
+        }),
+        /observed=\[\] expected=\[\"\/dev\/fuse\",\"\/dev\/net\/tun\"\] hostKind=native-linux/,
+    );
+});
+
 test('Podman Machine container argv disables only its outer SELinux label confinement', (t) => {
     const state = fixture(t);
     const args = containerCreateArgs({
