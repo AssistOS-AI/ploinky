@@ -48,6 +48,22 @@ function normalizePortBindings(bindings) {
     return result.sort((left, right) => JSON.stringify(left).localeCompare(JSON.stringify(right)));
 }
 
+function repeatedOptionValues(argv, option) {
+    if (!Array.isArray(argv)) return null;
+    const result = [];
+    for (let index = 0; index < argv.length; index += 1) {
+        const argument = String(argv[index]);
+        if (argument === option) {
+            if (index + 1 >= argv.length) return null;
+            result.push(String(argv[index + 1]));
+            index += 1;
+        } else if (argument.startsWith(`${option}=`)) {
+            result.push(argument.slice(option.length + 1));
+        }
+    }
+    return result;
+}
+
 export function normalizeContainerRuntime(record) {
     const config = record?.Config;
     const hostConfig = record?.HostConfig;
@@ -62,6 +78,9 @@ export function normalizeContainerRuntime(record) {
         configuredImage: String(config?.Image ?? '').trim(),
         user: String(config?.User ?? ''),
         environment: envMap(config?.Env),
+        createCommand: Array.isArray(config?.CreateCommand)
+            ? config.CreateCommand.map(String)
+            : null,
         publications: normalizePortBindings(hostConfig?.PortBindings),
         running: state?.Running === true || String(state?.Status || '') === 'running',
         status: String(state?.Status ?? ''),
@@ -189,10 +208,11 @@ export function validateContainerConfiguration(containerHandle, {
         throw publicationError('Owned Box security options are incompatible');
     }
     const expectedDevices = ['/dev/fuse', '/dev/net/tun'];
-    const podmanMachineOmitsDevices = hostKind === 'podman-machine'
-        && Array.isArray(runtime.devices)
-        && runtime.devices.length === 0;
-    if (!podmanMachineOmitsDevices && (
+    const recordedDevices = repeatedOptionValues(runtime.createCommand, '--device');
+    const omittedDeviceInspectionIsProven = Array.isArray(runtime.devices)
+        && runtime.devices.length === 0
+        && JSON.stringify(recordedDevices) === JSON.stringify(expectedDevices);
+    if (!omittedDeviceInspectionIsProven && (
         !Array.isArray(runtime.devices)
         || runtime.devices.length !== 2
         || runtime.devices.some((device, index) => (
@@ -204,6 +224,7 @@ export function validateContainerConfiguration(containerHandle, {
         throw publicationError(
             'Owned Box device set is incompatible: '
             + `observed=${JSON.stringify(runtime.devices)} `
+            + `recorded=${JSON.stringify(recordedDevices)} `
             + `expected=${JSON.stringify(expectedDevices)} hostKind=${hostKind}`,
         );
     }
