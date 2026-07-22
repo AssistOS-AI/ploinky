@@ -8,6 +8,7 @@ import test from 'node:test';
 import {
     readSmokeGraphInputs,
     SMOKE_GRAPH_REPOSITORIES,
+    stageSmokeGraph,
 } from '../../ploinky-box/smoke/graph.mjs';
 import {
     readProxyTrace,
@@ -21,6 +22,7 @@ test('smoke graph requires exactly seven clean absolute real checkouts at exact 
     const repositories = {};
     const revisions = {};
     const sha = 'a'.repeat(40);
+    const calls = [];
     for (const name of SMOKE_GRAPH_REPOSITORIES) {
         const target = path.join(root, name);
         fs.mkdirSync(target);
@@ -28,18 +30,29 @@ test('smoke graph requires exactly seven clean absolute real checkouts at exact 
         revisions[name] = sha;
     }
     const runner = {
+        run(command, args) {
+            calls.push([command, ...args]);
+        },
         query(command, args) {
             if (args.includes('rev-parse')) return { ok: true, stdout: `${sha}\n` };
             return { ok: true, stdout: '' };
         },
     };
     const graph = readSmokeGraphInputs({
-        SMOKE_GRAPH_ARGS_JSON: '["start","AssistOSExplorer/explorer","19090"]',
+        SMOKE_GRAPH_ARGS_JSON: '["start","AchillesIDE/explorer","19090"]',
         SMOKE_GRAPH_REPOSITORIES_JSON: JSON.stringify(repositories),
         SMOKE_GRAPH_REVISIONS_JSON: JSON.stringify(revisions),
     }, { runner });
     assert.equal(Object.keys(graph.repositories).length, 7);
-    assert.deepEqual(graph.args, ['start', 'AssistOSExplorer/explorer', '19090']);
+    assert.deepEqual(graph.args, ['start', 'AchillesIDE/explorer', '19090']);
+
+    const containerId = 'b'.repeat(64);
+    stageSmokeGraph({ graph, containerId, runner });
+    const copyCalls = calls.filter((call) => call[1] === 'container' && call[2] === 'cp');
+    assert.ok(copyCalls.some((call) => call.at(-1) === (
+        `${containerId}:/workspace/.ploinky/repos/AchillesIDE`
+    )));
+    assert.ok(copyCalls.every((call) => !call.at(-1).endsWith('/AssistOSExplorer')));
 
     const missing = { ...repositories };
     delete missing.basic;
