@@ -181,9 +181,9 @@ test('watchdog health uses the supervisor-only Unix socket, not anonymous TCP', 
     assert.equal(await performHealthCheck(), true);
 });
 
-test('watchdog refuses to start without an exact explicit PORT', () => {
+test('watchdog defaults to fixed Router port 8080 and rejects malformed overrides', () => {
     const watchdogUrl = new URL('../../cli/server/Watchdog.js', import.meta.url).href;
-    for (const value of [undefined, '', '+8080', '8080junk', '0', '65536']) {
+    const runWithPort = (value) => {
         const env = {
             ...process.env,
             PLOINKY_WATCHDOG_TEST_MODE: '1',
@@ -194,6 +194,14 @@ test('watchdog refuses to start without an exact explicit PORT', () => {
             env,
             encoding: 'utf8',
         });
+        return result;
+    };
+    for (const value of [undefined, '', '8080']) {
+        const result = runWithPort(value);
+        assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
+    }
+    for (const value of ['+8080', '8080junk', '0', '65536']) {
+        const result = runWithPort(value);
         assert.notEqual(result.status, 0, `expected PORT=${JSON.stringify(value)} to fail`);
         assert.match(result.stderr, /Watchdog PORT must be exactly 8080/);
     }
