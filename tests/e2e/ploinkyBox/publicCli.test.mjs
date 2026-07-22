@@ -219,6 +219,16 @@ test('installed public shims use only the fixed logical image through the candid
     ]);
     assert.notEqual(innerHelp.trim(), '');
     assert.doesNotMatch(innerHelp, /managed outer Box/);
+
+    // The staging Box is mounted from this source checkout. Hand the retained
+    // volumes to the packed CLI so its Box is mounted from the installed tree
+    // and the exact /opt/ploinky source invariant remains fail-closed.
+    const stagingDestroyed = publicCommand(['destroy'], { input: 'yes\n' });
+    assert.equal(stagingDestroyed.status, 0, stagingDestroyed.stderr);
+    const retained = publicCommand(['status']);
+    assert.equal(retained.status, 0, retained.stderr);
+    assert.match(retained.stdout, /absent-retained-volumes/);
+
     const started = publicCommand(['--debug', ...graph.args]);
     assert.equal(started.status, 0, started.stderr);
     assert.equal(started.stdout.match(/Debug mode enabled/g)?.length, 1);
