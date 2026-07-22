@@ -44,6 +44,25 @@ function normalizePortBindings(bindings) {
     ]));
 }
 
+function mappedGuestAddresses(pastaProcesses) {
+    const addresses = [];
+    for (const argv of pastaProcesses || []) {
+        for (let index = 0; index < argv.length; index += 1) {
+            if (argv[index] === '--map-guest-addr' && argv[index + 1]) {
+                addresses.push(argv[index + 1]);
+            }
+        }
+    }
+    return addresses;
+}
+
+function hostsMapsAlias(hosts, address, alias) {
+    return String(hosts || '').split(/\n/).some((line) => {
+        const [mappedAddress, ...aliases] = line.trim().split(/\s+/);
+        return mappedAddress === address && aliases.includes(alias);
+    });
+}
+
 function writeEvidence(evidence) {
     const artifact = String(process.env.PLOINKY_BOX_PRIVATE_ROUTING_ARTIFACT || '').trim();
     if (artifact) {
@@ -154,7 +173,26 @@ test('one nested rootless-Podman container reaches the unpublished private liste
         assert.equal(evidence.probe.privateRequest.responseMatched, true);
         assert.equal(evidence.probe.nestedPodman.info.rootless, true);
         assert.equal(evidence.probe.nestedPodman.info.networkBackend, 'netavark');
-        assert.equal(evidence.probe.nestedContainer.inspect.networkMode, 'pasta:--map-gw');
+        // Podman normalizes the inspected mode to "pasta". The requested
+        // pasta options are asserted above; Podman 5 materializes host-gateway
+        // as --map-guest-addr in the live pasta process.
+        assert.equal(evidence.probe.nestedContainer.inspect.networkMode, 'pasta');
+        const mappedAddresses = mappedGuestAddresses(
+            evidence.probe.nestedPodman.pastaProcesses,
+        );
+        assert.ok(mappedAddresses.length > 0, JSON.stringify(
+            evidence.probe.nestedPodman.pastaProcesses,
+        ));
+        assert.ok(mappedAddresses.some((address) => (
+            hostsMapsAlias(
+                evidence.probe.nestedContainer.namespace.hosts,
+                address,
+                'host.containers.internal',
+            )
+        )), JSON.stringify({
+            mappedAddresses,
+            hosts: evidence.probe.nestedContainer.namespace.hosts,
+        }));
         assert.match(
             evidence.probe.nestedContainer.namespace.hosts,
             /host\.containers\.internal/,
