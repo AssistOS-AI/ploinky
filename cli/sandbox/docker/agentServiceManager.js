@@ -484,7 +484,7 @@ function buildRuntimeRouterEnv(runtime, options = {}) {
 
 function buildDefaultPodmanNetworkArgs(platform = process.platform) {
     return [
-        '--network', 'pasta',
+        '--network', platform === 'darwin' ? 'pasta' : 'pasta:--map-gw',
         ...(platform === 'darwin' ? ['--no-hosts'] : []),
     ];
 }

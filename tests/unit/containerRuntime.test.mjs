@@ -190,7 +190,7 @@ process.stdout.write(JSON.stringify({
         assert.equal(result.status, 0, result.stderr);
         assert.deepEqual(JSON.parse(result.stdout), {
             darwin: ['--network', 'pasta', '--no-hosts'],
-            linux: ['--network', 'pasta'],
+            linux: ['--network', 'pasta:--map-gw'],
         });
     } finally {
         fs.rmSync(workspaceDir, { recursive: true, force: true });
@@ -414,7 +414,9 @@ console.log(JSON.stringify(record));`,
             bind.source === path.join(workspaceDir, '.data', 'demo') && bind.target === '/root'
         )));
         const runArgs = fs.readFileSync(argsFile, 'utf8');
-        assert.match(runArgs, /(?:^|\s)--network pasta(?:\s|$)/);
+        assert.match(runArgs, process.platform === 'darwin'
+            ? /(?:^|\s)--network pasta(?:\s|$)/
+            : /(?:^|\s)--network pasta:--map-gw(?:\s|$)/);
         assert.doesNotMatch(runArgs, /slirp4netns/);
         if (process.platform === 'darwin') {
             assert.match(runArgs, /(?:^|\s)--no-hosts(?:\s|$)/);

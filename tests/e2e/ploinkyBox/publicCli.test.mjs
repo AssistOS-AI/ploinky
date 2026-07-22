@@ -96,11 +96,12 @@ function assertNestedRoutingAndSecretBoundary(containerId, harness) {
     ]);
     assert.match(environment, /^PLOINKY_ROUTER_HOST=host\.containers\.internal$/m);
     assert.match(environment, /^PLOINKY_ROUTER_URL=http:\/\/host\.containers\.internal:8080$/m);
+    assert.match(environment, /^PLOINKY_ROUTER_AUTHORITY=127\.0\.0\.1:\d+$/m);
     assert.equal(environment.includes('HOST_MASTER_KEY_CANARY'), false);
     assert.doesNotMatch(environment, /^PLOINKY_MASTER_KEY=/m);
     execInBox(harness.runner, containerId, [
         'podman', 'container', 'exec', agent.id, '/usr/local/bin/node', '-e',
-        "require('node:http').get('http://host.containers.internal:8080/health',r=>{r.resume();process.exit(r.statusCode===200?0:1)}).on('error',()=>process.exit(2))",
+        "const h=require('node:http');h.get({hostname:process.env.PLOINKY_ROUTER_HOST,port:process.env.PLOINKY_ROUTER_PORT,path:'/health',headers:{Host:process.env.PLOINKY_ROUTER_AUTHORITY}},r=>{r.resume();process.exit(r.statusCode===200?0:1)}).on('error',()=>process.exit(2))",
     ]);
     return agent;
 }
