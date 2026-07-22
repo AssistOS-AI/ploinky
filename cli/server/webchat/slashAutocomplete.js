@@ -5,7 +5,8 @@ export {
     applySlashSelectionToValue,
     applySlashInsertTextToValue,
     buildSuggestions,
-    createSlashCommandsProvider
+    createSlashCommandsProvider,
+    loadSlashCommandsWithRetry
 } from './autocompleteProviders/slashCommands.js';
 
 export function createSlashAutocomplete({ cmdInput }, { agentName, dlog } = {}) {
