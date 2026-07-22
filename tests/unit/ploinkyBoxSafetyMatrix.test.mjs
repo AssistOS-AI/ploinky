@@ -1,0 +1,237 @@
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import test from 'node:test';
+
+import { runOuterCli } from '../../ploinky-box/bin/ploinky-box.mjs';
+import { buildContainerExecArgs } from '../../ploinky-box/command/execute.mjs';
+import { containerCreateArgs } from '../../ploinky-box/lifecycle/container.mjs';
+import { buildWorkspaceIdentity, resolveWorkspaceIdentity } from '../../ploinky-box/identity.mjs';
+import { buildEngineProcessEnvironment } from '../../ploinky-box/process.mjs';
+import { createBoxSupervisor } from '../../ploinky-box/supervisor.mjs';
+import { stripReservedAgentEnv } from '../../cli/utils/security/agentIdentityEnv.js';
+
+function bufferStream(isTTY = false) {
+    let bytes = '';
+    return {
+        isTTY,
+        write(chunk) { bytes += String(chunk); },
+        value() { return bytes; },
+    };
+}
+
+function owned(identity, { running = true } = {}) {
+    return {
+        state: 'owned',
+        engine: { name: 'podman', identity: 'engine-fingerprint' },
+        handles: {
+            container: { id: 'a'.repeat(64), runtime: { running } },
+            volumes: {},
+        },
+    };
+}
+
+function matrixSupervisor(identity, events) {
+    const ownership = owned(identity);
+    let acquisitions = 0;
+    const lockManager = {
+        get acquisitions() { return acquisitions; },
+        async acquire(instance) {
+            acquisitions += 1;
+            events.push('lock');
+            let released = false;
+            return {
+                assertHeld(expected) {
+                    assert.equal(expected, instance);
+                    assert.equal(released, false);
+                },
+                release() {
+                    assert.equal(released, false);
+                    released = true;
+                    events.push('release');
+                },
+            };
+        },
+    };
+    const runner = {
+        run(command, args) { events.push(`run:${args.join(' ')}`); },
+        query(command, args) {
+            events.push(`query:${args.join(' ')}`);
+            return {
+                ok: true,
+                status: 0,
+                stdout: JSON.stringify({
+                    state: 'initialized', initialized: true, routingConfigured: true,
+                    trackedAgents: 0, runningAgents: 0, warnings: [],
+                }),
+                stderr: '',
+            };
+        },
+    };
+    const supervisor = createBoxSupervisor({
+        resolveIdentity: () => identity,
+        discover: () => ownership,
+        lockManager,
+        runner,
+        validateExistingImage: () => ({ immutableId: 'b'.repeat(64) }),
+        reconcile: async ({ lock }) => {
+            lock.assertHeld(identity.instance);
+            events.push('reconcile');
+            return { ownership, hostPort: 8080, action: 'reused' };
+        },
+        startCore: async () => { events.push('start-core'); },
+        healthCheck: async () => { events.push('health'); },
+    });
+    return { supervisor, lockManager };
+}
+
+test('every public verb has the required single-lock depth and release boundary', async (t) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-box-verb-matrix-'));
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+    fs.mkdirSync(path.join(root, '.ploinky'));
+    const identity = buildWorkspaceIdentity(root, { markerFound: true });
+    const cases = [
+        { name: 'help', argv: ['help'], locks: 0 },
+        { name: 'status', argv: ['status'], locks: 0 },
+        { name: 'dry-run', argv: ['--dry-run', 'start', 'Agent'], locks: 0 },
+        { name: 'stop', argv: ['stop'], locks: 1 },
+        { name: 'destroy', argv: ['destroy'], locks: 1 },
+        { name: 'start', argv: ['start', 'Agent'], locks: 1 },
+        { name: 'repl', argv: [], locks: 1, forwarded: true },
+        { name: 'bash', argv: ['cli'], locks: 1, forwarded: true },
+        { name: 'agent-cli', argv: ['cli', 'Agent'], locks: 1, forwarded: true },
+        { name: 'generic', argv: ['logs', '--tail'], locks: 1, forwarded: true },
+    ];
+    for (const scenario of cases) {
+        const events = [];
+        const { supervisor, lockManager } = matrixSupervisor(identity, events);
+        const execute = () => { events.push('execute'); return 0; };
+        const code = await runOuterCli(scenario.argv, {
+            env: {},
+            input: { isTTY: false },
+            output: bufferStream(),
+            errorOutput: bufferStream(),
+            supervisor,
+            execute,
+            confirmDestroy: async () => true,
+        });
+        assert.equal(code, 0, scenario.name);
+        assert.equal(lockManager.acquisitions, scenario.locks, scenario.name);
+        assert.equal(events.filter((event) => event === 'lock').length, scenario.locks, scenario.name);
+        assert.equal(events.filter((event) => event === 'release').length, scenario.locks, scenario.name);
+        assert.equal(events.some((event) => event.includes(' pull ')), false, scenario.name);
+        if (scenario.forwarded) {
+            assert.ok(events.indexOf('release') < events.indexOf('execute'), scenario.name);
+        }
+        if (scenario.name === 'start') {
+            assert.ok(events.indexOf('health') < events.indexOf('release'));
+        }
+        if (scenario.name === 'stop') {
+            const outerStop = events.findIndex((event) => event.includes('container stop --time 30'));
+            assert.ok(outerStop >= 0 && outerStop < events.indexOf('release'));
+        }
+    }
+});
+
+test('foreign ownership blocks every lifecycle path with zero engine mutation', async (t) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-box-foreign-matrix-'));
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+    const identity = buildWorkspaceIdentity(root, { markerFound: false });
+    for (const argv of [['status'], ['stop'], ['destroy'], ['start', 'Agent'], ['logs']]) {
+        const mutations = [];
+        const supervisor = createBoxSupervisor({
+            resolveIdentity: () => identity,
+            discover: () => ({ state: 'foreign', message: 'foreign exact-name resource' }),
+            runner: {
+                run(command, args) { mutations.push([command, ...args]); },
+                query(command, args) { mutations.push([command, ...args]); return { ok: false }; },
+            },
+        });
+        const invocation = runOuterCli(argv, {
+            env: {}, supervisor,
+            input: { isTTY: false }, output: bufferStream(), errorOutput: bufferStream(),
+            execute() { mutations.push(['execute']); return 0; },
+            confirmDestroy: async () => { throw new Error('foreign destroy must not prompt'); },
+        });
+        if (argv[0] === 'status' || argv[0] === 'destroy') {
+            assert.equal(await invocation, 1, argv.join(' '));
+        } else {
+            await assert.rejects(invocation, /foreign exact-name resource/, argv.join(' '));
+        }
+        assert.deepEqual(mutations, [], argv.join(' '));
+        assert.equal(fs.existsSync(path.join(root, '.ploinky')), false, argv.join(' '));
+    }
+});
+
+test('master-key and arbitrary host canaries cannot cross outer or agent boundaries', () => {
+    const host = {
+        PATH: '/usr/bin:/bin',
+        HOME: '/private/home',
+        USER: 'operator',
+        XDG_CONFIG_HOME: '/private/config',
+        PLOINKY_MASTER_KEY: 'HOST_MASTER_CANARY',
+        UNRELATED_SECRET: 'UNRELATED_CANARY',
+    };
+    const engineEnvironment = buildEngineProcessEnvironment(host);
+    assert.deepEqual(engineEnvironment, {
+        PATH: '/usr/bin:/bin',
+        HOME: '/private/home',
+        USER: 'operator',
+        XDG_CONFIG_HOME: '/private/config',
+    });
+    const identity = Object.freeze({
+        instance: 'ploinky-box-workspace-123456789abc',
+        pathHash: '123456789abc',
+        volumes: {
+            workspace: 'ploinky-box-workspace-123456789abc-workspace',
+            containers: 'ploinky-box-workspace-123456789abc-containers',
+            dependencies: 'ploinky-box-workspace-123456789abc-ploinky-deps',
+        },
+    });
+    const createArgs = containerCreateArgs({
+        identity,
+        imageId: 'b'.repeat(64),
+        imageRef: 'docker.io/assistos/ploinky-box:runtime',
+        hostPort: 8080,
+        repositoryRoot: '/opt/source',
+        cidfile: '/private/lock/candidate.cid',
+    });
+    const execArgs = buildContainerExecArgs('a'.repeat(64), ['status']);
+    for (const canary of Object.values(host).filter((value) => /CANARY/.test(value))) {
+        assert.equal(JSON.stringify(engineEnvironment).includes(canary), false);
+        assert.equal(JSON.stringify(createArgs).includes(canary), false);
+        assert.equal(JSON.stringify(execArgs).includes(canary), false);
+    }
+    const agentEnvironment = { SAFE: 'yes', ...host };
+    stripReservedAgentEnv(agentEnvironment);
+    assert.equal(agentEnvironment.PLOINKY_MASTER_KEY, undefined);
+});
+
+test('generated workspace key has one trusted Watchdog-to-Router inheritance path and is never logged', () => {
+    const workspaceUtil = fs.readFileSync(path.join(
+        import.meta.dirname, '../../cli/commands/workspaceUtil.js',
+    ), 'utf8');
+    const watchdog = fs.readFileSync(path.join(
+        import.meta.dirname, '../../cli/server/Watchdog.js',
+    ), 'utf8');
+    assert.match(workspaceUtil, /env:\s*\{\s*\.\.\.buildRouterEnv\(\),/);
+    assert.match(watchdog, /const env = \{\s*\.\.\.restEnv,\s*MANAGED_BY_PROCESS_MANAGER:/);
+    assert.doesNotMatch(workspaceUtil, /console\.(?:log|error)\([^\n]*PLOINKY_MASTER_KEY/);
+    assert.doesNotMatch(watchdog, /(?:log|safeConsole)\([^\n]*PLOINKY_MASTER_KEY/);
+});
+
+test('first parent mutation makes every child resolution reuse one identity', async (t) => {
+    const parent = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-box-parent-child-'));
+    t.after(() => fs.rmSync(parent, { recursive: true, force: true }));
+    const child = path.join(parent, 'child');
+    fs.mkdirSync(child);
+    const initial = resolveWorkspaceIdentity({ env: {}, cwd: () => parent });
+    fs.mkdirSync(initial.anchorPath);
+    const fromParent = resolveWorkspaceIdentity({ env: {}, cwd: () => parent });
+    const fromChild = resolveWorkspaceIdentity({ env: {}, cwd: () => child });
+    assert.equal(fromParent.instance, initial.instance);
+    assert.equal(fromChild.instance, initial.instance);
+    assert.equal(fromChild.workspaceRoot, parent);
+    assert.deepEqual(fromChild.volumes, initial.volumes);
+});

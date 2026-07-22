@@ -6,7 +6,8 @@
     "main": "cloud/core/server.js",
     "bin": {
         "p-cloud": "./bin/p-cloud",
-        "ploinky": "./bin/ploinky"
+        "ploinky": "./bin/ploinky",
+        "ploinky-local": "./bin/ploinky-local"
     },
     "scripts": {
         "start": "cd test_run_dir node bin/p-cloud",

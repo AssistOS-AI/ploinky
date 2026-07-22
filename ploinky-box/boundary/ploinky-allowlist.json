@@ -1,0 +1,23 @@
+[
+  "ploinky-box/**",
+  "tests/unit/ploinkyBox*.test.js",
+  "tests/unit/ploinkyBox*.test.mjs",
+  "tests/unit/ploinkyBox*.test.cjs",
+  "tests/integration/ploinkyBox*.test.js",
+  "tests/integration/ploinkyBox*.test.mjs",
+  "tests/integration/ploinkyBox*.test.cjs",
+  "tests/e2e/ploinkyBox/**",
+  "tests/fixtures/ploinky-box/**",
+  "bin/ploinky",
+  "bin/ploinky-local",
+  "bin/ploinky-install-deps",
+  "bin/psh",
+  "package.json",
+  "cli/server/Watchdog.js",
+  "cli/commands/workspaceUtil.js",
+  "README.md",
+  "docs/index.html",
+  "docs/runtime.html",
+  "docs/operations.html",
+  "docs/superpowers/plans/2026-07-21-ploinky-box-implementation-plan-revised.md"
+]

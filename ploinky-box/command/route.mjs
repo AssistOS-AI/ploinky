@@ -1,0 +1,53 @@
+import { PloinkyBoxError } from '../errors.mjs';
+
+function routeError(message) {
+    return new PloinkyBoxError(message, { code: 'PLOINKY_BOX_ARGUMENT_INVALID' });
+}
+
+function requireNoArgs(parsed, command) {
+    if (parsed.commandArgs.length > 0) {
+        throw routeError(`${command}: unexpected trailing argument '${parsed.commandArgs[0]}'`);
+    }
+    if (parsed.explicitPort !== null) {
+        throw routeError(`${command}: --port is not supported`);
+    }
+}
+
+export function routeOuterCommand(parsed) {
+    if (parsed.help || parsed.command === 'help') {
+        return Object.freeze({ kind: 'help', topic: parsed.commandArgs });
+    }
+    if (parsed.command === 'status') {
+        requireNoArgs(parsed, 'status');
+        return Object.freeze({ kind: 'status' });
+    }
+    if (parsed.command === 'stop') {
+        requireNoArgs(parsed, 'stop');
+        return Object.freeze({ kind: 'stop' });
+    }
+    if (parsed.command === 'destroy') {
+        requireNoArgs(parsed, 'destroy');
+        return Object.freeze({ kind: 'destroy' });
+    }
+    if (parsed.command === 'start') {
+        return Object.freeze({
+            kind: parsed.dryRun ? 'dry-run' : 'start',
+            hostPort: parsed.start.hostPort,
+            coreArgv: parsed.start.coreArgv,
+        });
+    }
+    if (!parsed.command) {
+        return Object.freeze({ kind: parsed.dryRun ? 'dry-run' : 'repl', coreArgv: parsed.forwardingArgv });
+    }
+    if (['bash', 'shell'].includes(parsed.command)
+        || (parsed.command === 'cli' && parsed.commandArgs.length === 0)) {
+        return Object.freeze({ kind: parsed.dryRun ? 'dry-run' : 'bash' });
+    }
+    if (parsed.command === 'cli') {
+        return Object.freeze({ kind: parsed.dryRun ? 'dry-run' : 'agent-cli', coreArgv: parsed.forwardingArgv });
+    }
+    return Object.freeze({
+        kind: parsed.dryRun ? 'dry-run' : 'generic',
+        coreArgv: parsed.forwardingArgv,
+    });
+}

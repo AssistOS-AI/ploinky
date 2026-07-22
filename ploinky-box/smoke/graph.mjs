@@ -1,0 +1,129 @@
+import fs from 'node:fs';
+import path from 'node:path';
+
+import { PloinkyBoxError } from '../errors.mjs';
+
+export const SMOKE_GRAPH_REPOSITORIES = Object.freeze([
+    'AssistOSExplorer',
+    'webmeetInfra',
+    'UmamiAgent',
+    'AchillesCLI',
+    'proxies',
+    'basic',
+    'container-image-builds',
+]);
+
+function smokeError(message, cause) {
+    return new PloinkyBoxError(message, {
+        code: 'PLOINKY_BOX_SMOKE_INPUT_INVALID',
+        cause,
+    });
+}
+
+function parseJson(value, name) {
+    if (!String(value || '').trim()) throw smokeError(`${name} is required`);
+    try {
+        return JSON.parse(value);
+    } catch (error) {
+        throw smokeError(`${name} must be valid JSON`, error);
+    }
+}
+
+function exactKeys(record, label) {
+    const actual = Object.keys(record || {}).sort();
+    const expected = [...SMOKE_GRAPH_REPOSITORIES].sort();
+    if (JSON.stringify(actual) !== JSON.stringify(expected)) {
+        throw smokeError(`${label} must contain exactly the seven pinned graph repositories`);
+    }
+}
+
+export function readSmokeGraphInputs(env = process.env, {
+    fsApi = fs,
+    runner,
+} = {}) {
+    const args = parseJson(env.SMOKE_GRAPH_ARGS_JSON, 'SMOKE_GRAPH_ARGS_JSON');
+    const repositories = parseJson(
+        env.SMOKE_GRAPH_REPOSITORIES_JSON,
+        'SMOKE_GRAPH_REPOSITORIES_JSON',
+    );
+    const revisions = parseJson(
+        env.SMOKE_GRAPH_REVISIONS_JSON,
+        'SMOKE_GRAPH_REVISIONS_JSON',
+    );
+    if (!Array.isArray(args) || args.length < 2 || args.some((value) => typeof value !== 'string')) {
+        throw smokeError('SMOKE_GRAPH_ARGS_JSON must be a nonempty string argv array');
+    }
+    if (!repositories || typeof repositories !== 'object' || Array.isArray(repositories)) {
+        throw smokeError('SMOKE_GRAPH_REPOSITORIES_JSON must be an object');
+    }
+    if (!revisions || typeof revisions !== 'object' || Array.isArray(revisions)) {
+        throw smokeError('SMOKE_GRAPH_REVISIONS_JSON must be an object');
+    }
+    exactKeys(repositories, 'SMOKE_GRAPH_REPOSITORIES_JSON');
+    exactKeys(revisions, 'SMOKE_GRAPH_REVISIONS_JSON');
+    const selected = {};
+    for (const name of SMOKE_GRAPH_REPOSITORIES) {
+        const suppliedPath = String(repositories[name] || '');
+        const revision = String(revisions[name] || '');
+        if (!path.isAbsolute(suppliedPath)) {
+            throw smokeError(`${name} repository path must be absolute`);
+        }
+        let realPath;
+        try {
+            realPath = fsApi.realpathSync(suppliedPath);
+        } catch (error) {
+            throw smokeError(`${name} repository path is not a real checkout`, error);
+        }
+        if (path.resolve(suppliedPath) !== realPath) {
+            throw smokeError(`${name} repository path must already be its absolute real path`);
+        }
+        if (!/^[a-f0-9]{40}$/.test(revision)) {
+            throw smokeError(`${name} revision must be one exact 40-character SHA`);
+        }
+        if (!runner) throw smokeError('Smoke graph validation requires a process runner');
+        const head = runner.query('git', ['-C', realPath, 'rev-parse', 'HEAD']);
+        const status = runner.query('git', ['-C', realPath, 'status', '--porcelain=v1']);
+        if (!head.ok || String(head.stdout || '').trim() !== revision) {
+            throw smokeError(`${name} checkout HEAD does not equal its supplied revision`);
+        }
+        if (!status.ok || String(status.stdout || '').trim() !== '') {
+            throw smokeError(`${name} checkout must be clean`);
+        }
+        selected[name] = Object.freeze({ path: realPath, revision });
+    }
+    return Object.freeze({
+        args: Object.freeze([...args]),
+        repositories: Object.freeze(selected),
+    });
+}
+
+export function stageSmokeGraph({
+    graph,
+    engine = 'podman',
+    containerId,
+    runner,
+} = {}) {
+    if (!/^[a-f0-9]{12,64}$/.test(String(containerId || ''))) {
+        throw smokeError('Smoke graph staging requires an immutable outer container ID');
+    }
+    runner.run(engine, [
+        'container', 'exec', '--user', 'podman', containerId,
+        'mkdir', '-p', '/workspace/.ploinky/repos',
+    ]);
+    for (const name of SMOKE_GRAPH_REPOSITORIES) {
+        const repository = graph.repositories[name];
+        const destination = `/workspace/.ploinky/repos/${name}`;
+        runner.run(engine, [
+            'container', 'exec', '--user', 'podman', containerId,
+            'mkdir', '-p', destination,
+        ]);
+        runner.run(engine, ['container', 'cp', `${repository.path}/.`, `${containerId}:${destination}`]);
+        const head = runner.query(engine, [
+            'container', 'exec', '--user', 'podman', containerId,
+            'git', '-C', destination, 'rev-parse', 'HEAD',
+        ]);
+        if (!head.ok || String(head.stdout || '').trim() !== repository.revision) {
+            throw smokeError(`${name} in-box HEAD changed during graph staging`);
+        }
+    }
+}
