@@ -13,6 +13,10 @@ export const SMOKE_GRAPH_REPOSITORIES = Object.freeze([
     'container-image-builds',
 ]);
 
+const SMOKE_GRAPH_DESTINATIONS = Object.freeze({
+    AssistOSExplorer: 'AchillesIDE',
+});
+
 function smokeError(message, cause) {
     return new PloinkyBoxError(message, {
         code: 'PLOINKY_BOX_SMOKE_INPUT_INVALID',
@@ -112,7 +116,8 @@ export function stageSmokeGraph({
     ]);
     for (const name of SMOKE_GRAPH_REPOSITORIES) {
         const repository = graph.repositories[name];
-        const destination = `/workspace/.ploinky/repos/${name}`;
+        const destinationName = SMOKE_GRAPH_DESTINATIONS[name] || name;
+        const destination = `/workspace/.ploinky/repos/${destinationName}`;
         runner.run(engine, [
             'container', 'exec', '--user', 'podman', containerId,
             'mkdir', '-p', destination,
