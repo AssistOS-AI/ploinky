@@ -34,6 +34,16 @@ function selectedPodmanInfo(info) {
     };
 }
 
+function normalizePortBindings(bindings) {
+    return Object.fromEntries(Object.entries(bindings || {}).map(([port, entries]) => [
+        port,
+        (entries || []).map((entry) => ({
+            HostIp: String(entry?.HostIp || '') || '0.0.0.0',
+            HostPort: String(entry?.HostPort || ''),
+        })),
+    ]));
+}
+
 function writeEvidence(evidence) {
     const artifact = String(process.env.PLOINKY_BOX_PRIVATE_ROUTING_ARTIFACT || '').trim();
     if (artifact) {
@@ -79,7 +89,8 @@ test('one nested rootless-Podman container reaches the unpublished private liste
             id: prepared.containerId,
             contract: outerInspection?.Config?.Labels?.['io.assistos.ploinky.runtime-contract'] || '',
             exposedPorts: outerInspection?.Config?.ExposedPorts || null,
-            portBindings: outerInspection?.HostConfig?.PortBindings || {},
+            rawPortBindings: outerInspection?.HostConfig?.PortBindings || {},
+            portBindings: normalizePortBindings(outerInspection?.HostConfig?.PortBindings),
             sourceMount: sourceMount ? {
                 source: '<source-checkout>',
                 destination: sourceMount.Destination,
