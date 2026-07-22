@@ -1,6 +1,7 @@
 import { execSync, spawnSync } from 'child_process';
 import { randomUUID } from 'node:crypto';
 import fs from 'fs';
+import net from 'node:net';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import {
@@ -114,6 +115,7 @@ import {
     prepareHostModeCapabilityForInactiveGeneration,
     withEdgeGenerationApplyLock,
 } from '../edgeGeneration.js';
+import { isInsideBox } from '../../../ploinky-box/lib/boxMarker.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -148,6 +150,7 @@ function resolveLlmRuntimeSharedPath(agentPath) {
 const AGENT_PRIVATE_KEY_CONTAINER_PATH = '/run/ploinky-agent.key';
 const PODMAN_STAGED_NODE_OPTIONS = ['--preserve-symlinks', '--preserve-symlinks-main'];
 const PODMAN_RUNTIME_ROOT = path.join(PLOINKY_DIR, 'container-runtime');
+const BOX_TRANSPORT_PATH = '/run/ploinky/box-transport.json';
 
 function pathTypeForSymlink(sourcePath) {
     try {
@@ -485,6 +488,51 @@ function buildRuntimeRouterEnv(runtime, options = {}) {
     };
 }
 
+function buildDefaultPodmanNetworkArgs(platform = process.platform) {
+    return [
+        '--network', platform === 'darwin' ? 'pasta' : 'pasta:--map-gw',
+        ...(platform === 'darwin' ? ['--no-hosts'] : []),
+    ];
+}
+
+function validBoxTransportAddress(value) {
+    const address = String(value || '').trim();
+    if (net.isIP(address) !== 4) return '';
+    const firstOctet = Number(address.split('.')[0]);
+    return firstOctet > 0 && firstOctet !== 127 && firstOctet < 224 ? address : '';
+}
+
+function buildBoxPodmanHostArgs({
+    fsApi = fs,
+    markerPath,
+    transportPath = BOX_TRANSPORT_PATH,
+} = {}) {
+    const markerOptions = { fsApi };
+    if (markerPath) markerOptions.markerPath = markerPath;
+    if (!isInsideBox(markerOptions)) return [];
+
+    let stat;
+    try {
+        stat = fsApi.lstatSync(transportPath);
+    } catch (error) {
+        throw new Error(`Unable to inspect Ploinky Box transport state ${transportPath}`, { cause: error });
+    }
+    if (stat.isSymbolicLink() || !stat.isFile() || stat.nlink !== 1) {
+        throw new Error(`Ploinky Box transport state is not a single regular file: ${transportPath}`);
+    }
+
+    let transport;
+    try {
+        transport = JSON.parse(fsApi.readFileSync(transportPath, 'utf8'));
+    } catch (error) {
+        throw new Error(`Unable to parse Ploinky Box transport state ${transportPath}`, { cause: error });
+    }
+    const address = validBoxTransportAddress(transport?.address);
+    if (!address) {
+        throw new Error(`Ploinky Box transport state lacks a routable IPv4 address: ${transportPath}`);
+    }
+    return ['--add-host', `host.containers.internal:${address}`];
+}
 function appendRuntimeRouterEnvFlags(envStrings, routerEnv) {
     for (const [name, value] of Object.entries(routerEnv || {})) {
         envStrings.push(formatEnvFlag(name, value));
@@ -1015,6 +1063,10 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     for (const { resolvedHostPath, containerPath, options } of manifestVolumeMounts) {
         const mountSuffix = manifestVolumeMountSuffix(runtime, resolvedHostPath, options);
         args.push('-v', `${resolvedHostPath}:${containerPath}${mountSuffix}`);
+    }
+    if (runtime === 'podman') {
+        const boxHostArgs = buildBoxPodmanHostArgs();
+        if (boxHostArgs.length) args.splice(1, 0, ...boxHostArgs);
     }
 
     const { publishArgs: manifestPorts, portMappings } = parseManifestPorts(manifest, profileConfig);
@@ -2427,6 +2479,8 @@ export {
     assertPodmanCodeMountAllowed,
     appendUniquePortMapping,
     buildPersistentAgentRunArgs,
+    buildBoxPodmanHostArgs,
+    buildDefaultPodmanNetworkArgs,
     buildPodmanStagedTargetMounts,
     buildRuntimeNetworkPlan,
     buildRuntimeRouterEnv,
