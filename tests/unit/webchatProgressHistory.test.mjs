@@ -6,8 +6,11 @@ import path from 'node:path';
 import test from 'node:test';
 
 import {
+    appendSessionMessage,
     appendSessionTurn,
+    buildContinuationHistory,
     ensureCurrentSession,
+    formatContinuationContext,
     loadSession,
 } from '../../cli/server/webchat/sessionStore.js';
 import { handleRuntimeRoute } from '../../cli/server/handlers/webchat/runtimeRoutes.js';
@@ -76,6 +79,117 @@ test('input persists the assistant placeholder before writing to the TTY', (t) =
     assert.deepEqual(sessionAtWrite.messages[1].progress, []);
     assert.equal(tab.workspaceHistory.lastAssistantMessageIndex, 1);
 });
+
+test('a recreated envelope runtime receives prior turns as role-separated history exactly once', (t) => {
+    const workspaceDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-webchat-structured-history-'));
+    t.after(() => fs.rmSync(workspaceDirectory, { recursive: true, force: true }));
+    const created = ensureCurrentSession(workspaceDirectory);
+    appendSessionMessage(workspaceDirectory, created.sessionId, { role: 'user', text: 'Earlier question' });
+    appendSessionMessage(workspaceDirectory, created.sessionId, { role: 'assistant', text: 'Earlier answer' });
+    const session = loadSession(workspaceDirectory, created.sessionId);
+    const effectiveConfig = { agentName: 'demo-agent', forwardEnvelope: true };
+    const runtimeKey = buildRuntimeKey(workspaceDirectory, session.sessionId, effectiveConfig, '');
+    const writes = [];
+    const tab = {
+        tty: { write: (value) => writes.push(value) },
+        workspaceDirectory,
+        sessionId: session.sessionId,
+        subscribers: new Map(),
+        continuationHistory: buildContinuationHistory(session),
+        continuationContext: formatContinuationContext(session),
+        continuationPending: true,
+        workspaceHistory: {
+            workspaceDirectory,
+            sessionId: session.sessionId,
+            buffer: '',
+            lastClientText: '',
+            userInputSent: false,
+            lastAssistantMessageIndex: null,
+        },
+    };
+    const appState = { runtimes: new Map([[runtimeKey, tab]]) };
+
+    submitRuntimeInput({
+        appState,
+        workspaceDirectory,
+        effectiveConfig,
+        text: 'Current question',
+    });
+    submitRuntimeInput({
+        appState,
+        workspaceDirectory,
+        effectiveConfig,
+        text: 'Following question',
+    });
+
+    const firstPayload = JSON.parse(writes[0]);
+    const secondPayload = JSON.parse(writes[1]);
+    assert.equal(firstPayload.text, 'Current question');
+    assert.deepEqual(firstPayload.history, [
+        { role: 'user', message: 'Earlier question' },
+        { role: 'assistant', message: 'Earlier answer' },
+    ]);
+    assert.doesNotMatch(writes[0], /Ploinky conversation context|End of prior conversation context|New user message/);
+    assert.equal(secondPayload.text, 'Following question');
+    assert.equal(secondPayload.history, undefined);
+});
+
+test('a slash command defers structured history until the next conversational message', (t) => {
+    const workspaceDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-webchat-deferred-history-'));
+    t.after(() => fs.rmSync(workspaceDirectory, { recursive: true, force: true }));
+    const created = ensureCurrentSession(workspaceDirectory);
+    appendSessionMessage(workspaceDirectory, created.sessionId, { role: 'user', text: 'Earlier question' });
+    appendSessionMessage(workspaceDirectory, created.sessionId, { role: 'assistant', text: 'Earlier answer' });
+    const session = loadSession(workspaceDirectory, created.sessionId);
+    const effectiveConfig = { agentName: 'demo-agent', forwardEnvelope: true };
+    const runtimeKey = buildRuntimeKey(workspaceDirectory, session.sessionId, effectiveConfig, '');
+    const writes = [];
+    const tab = {
+        tty: { write: (value) => writes.push(value) },
+        workspaceDirectory,
+        sessionId: session.sessionId,
+        subscribers: new Map(),
+        continuationHistory: buildContinuationHistory(session),
+        continuationContext: formatContinuationContext(session),
+        continuationPending: true,
+        workspaceHistory: {
+            workspaceDirectory,
+            sessionId: session.sessionId,
+            buffer: '',
+            lastClientText: '',
+            userInputSent: false,
+            lastAssistantMessageIndex: null,
+        },
+    };
+    const appState = { runtimes: new Map([[runtimeKey, tab]]) };
+
+    submitRuntimeInput({ appState, workspaceDirectory, effectiveConfig, text: '/help' });
+    submitRuntimeInput({ appState, workspaceDirectory, effectiveConfig, text: 'Continue' });
+
+    assert.equal(JSON.parse(writes[0]).history, undefined);
+    assert.deepEqual(JSON.parse(writes[1]).history, [
+        { role: 'user', message: 'Earlier question' },
+        { role: 'assistant', message: 'Earlier answer' },
+    ]);
+});
+
+function submitRuntimeInput({ appState, workspaceDirectory, effectiveConfig, text }) {
+    const req = new EventEmitter();
+    req.method = 'POST';
+    const res = { writeHead() {}, end() {} };
+    handleRuntimeRoute({
+        pathname: '/input',
+        req,
+        res,
+        parsedUrl: new URL('http://localhost/input?tabId=tab-1'),
+        appState,
+        workspaceDirectory,
+        effectiveConfig,
+        agentQuery: '',
+    });
+    req.emit('data', JSON.stringify({ __webchatMessage: 1, text, attachments: [] }));
+    req.emit('end');
+}
 
 test('runtime progress updates the active placeholder before final output', (t) => {
     const workspaceDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-webchat-progress-'));

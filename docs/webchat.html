@@ -115,8 +115,8 @@ ploinky cli achilles-cli --path=/absolute/path</code></pre>
                         <li>Connected browser clients using the same working directory receive session changes and new turns through the shared EventSource runtime.</li>
                     </ul>
                     <p>
-                        If the original process no longer exists, the next conversational message carries the prior user content and final assistant text in a delimited context block.
-                        Historical inputs are not replayed as commands. Persisted progress and assistant placeholders without final text remain UI-only and are excluded from that context.
+                        If the original process no longer exists, an envelope-aware CLI receives prior user content and final assistant text as an ordered role-separated history array, while the next conversational message remains separate.
+                        Historical inputs are not replayed as commands, and synthetic transcript delimiters are not added to structured history. Plain-text CLIs retain the delimited context fallback. Persisted progress, task items, and assistant placeholders without final text remain UI-only and are excluded from both representations.
                         Slash commands remain unchanged and defer restoration until a later conversational message.
                     </p>
                     <p>A newly started CLI receives <code>PLOINKY_WEBCHAT_HAS_HISTORY</code>. A value of <code>1</code> tells a generic agent that this is an existing conversation, so it should not emit new-conversation startup content. Empty sessions, including those created through <strong>Sessions → New</strong>, receive <code>0</code>. The selected folder session id remains private to the router instead of being forwarded into the agent process environment.</p>

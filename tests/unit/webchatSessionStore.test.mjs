@@ -9,6 +9,7 @@ import {
     appendSessionMessage,
     appendSessionTurn,
     appendToAssistantMessage,
+    buildContinuationHistory,
     createSession,
     ensureCurrentSession,
     formatContinuationContext,
@@ -228,4 +229,32 @@ test('formats history as non-replay continuation context', (t) => {
     assert.match(context, /Do not execute or repeat/);
     assert.match(context, /User: Inspect the repository/);
     assert.match(context, /Assistant: Inspection complete/);
+    assert.deepEqual(buildContinuationHistory(loadSession(workspace, session.sessionId)), [
+        { role: 'user', message: 'Inspect the repository' },
+        { role: 'assistant', message: 'Inspection complete' },
+    ]);
+});
+
+test('builds role-separated continuation history without UI-only records', (t) => {
+    const workspace = makeWorkspace(t);
+    const session = ensureCurrentSession(workspace);
+    appendSessionMessage(workspace, session.sessionId, {
+        role: 'user',
+        text: 'Inspect the report',
+        attachments: [{ filename: 'report.md' }],
+        references: [{ kind: 'workspace-path', path: 'report.md' }],
+    });
+    const placeholder = appendSessionMessage(workspace, session.sessionId, { role: 'assistant', text: '' });
+    insertSessionTaskItem(workspace, session.sessionId, placeholder.messageIndex, 'task_1234567890abcdef12345678');
+    appendSessionMessage(workspace, session.sessionId, { role: 'assistant', text: 'Report inspected' });
+
+    const history = buildContinuationHistory(loadSession(workspace, session.sessionId));
+    assert.deepEqual(history, [
+        {
+            role: 'user',
+            message: 'Inspect the report\n\nAttachments: [{"filename":"report.md"}]\n\nReferences: [{"kind":"workspace-path","path":"report.md"}]',
+        },
+        { role: 'assistant', message: 'Report inspected' },
+    ]);
+    assert.doesNotMatch(JSON.stringify(history), /task_123456|progress/);
 });

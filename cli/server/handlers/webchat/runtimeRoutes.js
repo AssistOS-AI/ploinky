@@ -2,6 +2,7 @@ import crypto from 'crypto';
 
 import {
     appendSessionTurn,
+    buildContinuationHistory,
     ensureCurrentSession,
     formatContinuationContext
 } from '../../webchat/sessionStore.js';
@@ -63,6 +64,7 @@ export function handleRuntimeRoute({
 
         if (!tab) {
             try {
+                const continuationHistory = buildContinuationHistory(currentSession);
                 const ssoUser = req.user && req.authMode === 'sso' ? {
                     id: req.user.id,
                     username: req.user.username,
@@ -83,8 +85,9 @@ export function handleRuntimeRoute({
                     runtimeKey,
                     sessionId: currentSession.sessionId,
                     workspaceDirectory,
+                    continuationHistory,
                     continuationContext: formatContinuationContext(currentSession),
-                    continuationPending: currentSession.messages.length > 0,
+                    continuationPending: continuationHistory.length > 0,
                     workspaceHistory: {
                         workspaceDirectory,
                         sessionId: currentSession.sessionId,
@@ -206,12 +209,16 @@ export function handleRuntimeRoute({
             const shouldRestore = tab.continuationPending
                 && rawMessage.trim()
                 && !rawMessage.trimStart().startsWith('/');
-            const agentMessage = shouldRestore
+            const forwardEnvelope = shouldForwardWebchatEnvelope(parsedUrl, effectiveConfig);
+            const agentMessage = shouldRestore && !forwardEnvelope
                 ? `${tab.continuationContext}\n\n[New user message]\n${rawMessage}`
                 : rawMessage;
             if (shouldRestore) tab.continuationPending = false;
             const agentEnvelope = { ...envelope, text: agentMessage };
-            const text = shouldForwardWebchatEnvelope(parsedUrl, effectiveConfig)
+            if (shouldRestore && forwardEnvelope) {
+                agentEnvelope.history = tab.continuationHistory;
+            }
+            const text = forwardEnvelope
                 ? serializeWebchatEnvelopeForAgent({
                     req,
                     effectiveConfig,

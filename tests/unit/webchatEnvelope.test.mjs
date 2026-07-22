@@ -8,6 +8,7 @@ import {
 } from '../../cli/server/handlers/webchat/launchOptions.js';
 import {
     resolveRequestPublicOrigin,
+    sanitizeWebchatHistoryForEnvelope,
     serializeWebchatEnvelopeForAgent,
     shouldForwardWebchatEnvelope
 } from '../../cli/server/handlers/webchat/messageEnvelope.js';
@@ -77,6 +78,38 @@ test('serializeWebchatEnvelopeForAgent does not name a concrete downstream agent
     assert.deepEqual(payload.origin, { publicBaseUrl: 'http://127.0.0.1:8080' });
     assert.equal(payload.invocation, undefined);
     assert.doesNotMatch(text, /concreteDownstreamAgent|concrete_downstream_tool/);
+});
+
+test('serializeWebchatEnvelopeForAgent carries sanitized role-separated history', () => {
+    assert.deepEqual(sanitizeWebchatHistoryForEnvelope([
+        { role: 'user', message: 'Earlier question', ignored: true },
+        { role: 'assistant', message: 'Earlier answer' },
+        { role: 'system', message: 'drop' },
+        { role: 'user', message: '' },
+    ]), [
+        { role: 'user', message: 'Earlier question' },
+        { role: 'assistant', message: 'Earlier answer' },
+    ]);
+
+    const payload = JSON.parse(serializeWebchatEnvelopeForAgent({
+        req: { headers: { host: '127.0.0.1:8080' } },
+        effectiveConfig: { agentName: '' },
+        tabId: 'tab-1',
+        envelope: {
+            text: 'Current question',
+            history: [
+                { role: 'user', message: 'Earlier question' },
+                { role: 'assistant', message: 'Earlier answer' },
+            ],
+        },
+    }));
+
+    assert.equal(payload.text, 'Current question');
+    assert.deepEqual(payload.history, [
+        { role: 'user', message: 'Earlier question' },
+        { role: 'assistant', message: 'Earlier answer' },
+    ]);
+    assert.doesNotMatch(JSON.stringify(payload), /Ploinky conversation context|New user message/);
 });
 
 test('serializeWebchatEnvelopeForAgent prefers forwarded public origin headers', () => {

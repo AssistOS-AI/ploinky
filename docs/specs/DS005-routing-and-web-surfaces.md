@@ -30,7 +30,7 @@ For `/webchat`, the router must treat `agent` as an explicit agent-selection que
 
 WebChat must remain a generic transport. It must not hardcode optional catalog agent ids, backend tags, MCP tool names, or domain-specific dispatch logic. Query parameters such as `feature-mode`, `forward-envelope`, or future agent-owned options are ordinary target-agent launch flags once they pass the router-reserved parameter filter. Their interpretation belongs to the selected agent CLI or to an explicitly configured downstream integration, not to Ploinky's router or WebChat handler.
 
-When `/webchat` is launched with `forward-envelope=1`, messages may be written to the target TTY as the WebChat JSON envelope instead of plain text. The envelope may include sanitized attachment metadata, sanitized structured references (currently only `kind: "workspace-path"` records with `path`, `type`, and optional `label`), a sanitized public origin hint derived from the incoming WebChat request (`origin.publicBaseUrl`), and a short-lived router-minted invocation token scoped to the selected chat agent, allowing that agent to perform delegated MCP calls through the router without WebChat naming the downstream provider. The public origin hint must be limited to an `http` or `https` origin and is intended only for same-origin user-facing links back through the router. Reference paths must be workspace-relative; the server must drop entries containing absolute paths, traversal segments, NUL bytes, or reserved secret-file names before forwarding the envelope. Target CLIs that opt into this flag must tolerate `__webchatMessage` envelopes and normalize them before invoking their normal prompt flow; CLIs that do not recognize `references` or `origin` must ignore them safely.
+When `/webchat` is launched with `forward-envelope=1`, messages may be written to the target TTY as the WebChat JSON envelope instead of plain text. The envelope may include sanitized attachment metadata, sanitized structured references (currently only `kind: "workspace-path"` records with `path`, `type`, and optional `label`), role-separated continuation history shaped as ordered `{ role, message }` records, a sanitized public origin hint derived from the incoming WebChat request (`origin.publicBaseUrl`), and a short-lived router-minted invocation token scoped to the selected chat agent, allowing that agent to perform delegated MCP calls through the router without WebChat naming the downstream provider. The server, not the browser, must derive continuation history from the selected folder session, and the invocation token must bind that history together with the current text and resource metadata. The public origin hint must be limited to an `http` or `https` origin and is intended only for same-origin user-facing links back through the router. Reference paths must be workspace-relative; the server must drop entries containing absolute paths, traversal segments, NUL bytes, or reserved secret-file names before forwarding the envelope. Target CLIs that opt into this flag must tolerate `__webchatMessage` envelopes and normalize them before invoking their normal prompt flow; CLIs that do not recognize optional envelope fields must ignore them safely.
 
 WebChat conversation identity must be scoped to the canonical working directory
 resolved from `workspace-dir`/`workspaceDir` or confined `dir`. The router must
@@ -69,14 +69,16 @@ WebChat must not render existing messages automatically after refresh. A non-emp
 The `Tasks` and `Sessions` controls in the WebChat header must use a darker green hover fill that remains visually consistent with the green header, rather than inheriting the theme's neutral panel-hover color.
 
 When a folder session has history but no surviving runtime, WebChat must restore
-context without replaying historical user inputs as separate TTY commands. The
-prior conversation's user content and final assistant text are placed in a
-delimited context block before the first new non-slash message. Progress strings
-and assistant placeholders with no final content must remain UI-only and must not
-enter this continuation context. Slash commands remain unchanged and defer
-restoration until a later conversational message. This mechanism must remain
-generic for plain-text and WebChat-envelope agents and must not special-case
-AchillesCLI or another target agent.
+context without replaying historical user inputs as separate TTY commands. For
+an envelope-aware agent, prior user content and final assistant text must be sent
+once as an ordered `{ role, message }` history array while the first new non-slash
+message remains in the envelope's separate `text` field. Synthetic transcript
+delimiters must not enter that structured history. A plain-text agent retains the
+legacy delimited context block as a compatibility fallback. Progress strings,
+task items, and assistant placeholders with no final content must remain UI-only
+and must not enter either representation. Slash commands remain unchanged and
+defer restoration until a later conversational message. This mechanism must
+remain generic and must not special-case AchillesCLI or another target agent.
 
 Every WebChat CLI process must receive `PLOINKY_WEBCHAT_HAS_HISTORY=1` when the selected folder session already contains messages, otherwise `0`. This variable is the allowlisted startup contract for local and containerized agents; the folder session id remains router-owned and must not be forwarded through the process environment. Arbitrary router environment variables must not be forwarded with the history flag. Agents that generate new-conversation startup content should skip it when history exists. Ploinky must not expose message bodies or history file paths through the process environment.
 

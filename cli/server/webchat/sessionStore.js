@@ -363,6 +363,35 @@ export function formatContinuationContext(session) {
     return lines.join('\n\n');
 }
 
+export function buildContinuationHistory(session) {
+    if (!session?.messages?.length) return [];
+    const history = [];
+    for (const storedMessage of session.messages) {
+        if (storedMessage?.type === 'task') continue;
+        const role = storedMessage?.role === 'user'
+            ? 'user'
+            : (storedMessage?.role === 'assistant' ? 'assistant' : '');
+        if (!role) continue;
+        const message = formatContinuationMessage(storedMessage);
+        if (!message) continue;
+        history.push({ role, message });
+    }
+    return history;
+}
+
+function formatContinuationMessage(storedMessage) {
+    const parts = [];
+    const text = String(storedMessage?.text || '');
+    if (text.trim()) parts.push(text);
+    if (storedMessage?.attachments?.length) {
+        parts.push(`Attachments: ${JSON.stringify(storedMessage.attachments)}`);
+    }
+    if (storedMessage?.references?.length) {
+        parts.push(`References: ${JSON.stringify(storedMessage.references)}`);
+    }
+    return parts.join('\n\n');
+}
+
 export const __testables = {
     SESSION_ID_RE,
     TASK_ID_RE,

@@ -41,7 +41,10 @@ Ploinky is a workspace-local runtime for repository-backed agents.
   progress remains UI-only and existing messages render only through
   `Click to load session history`. A newly started agent receives only
   `PLOINKY_WEBCHAT_HAS_HISTORY=1` or `0` as conversation-start metadata, while
-  the folder session id remains router-owned. When opened as
+  the folder session id remains router-owned. An envelope-aware recreated runtime
+  receives the prior user/assistant turns once as ordered `{ role, message }`
+  history with the current message kept separate; plain-text CLIs retain the
+  legacy delimited fallback. When opened as
   `/webchat?agent=<name>&...`, the router forwards additional query parameters
   except router-owned `tabId` and `sessionId` to `ploinky cli <name>` as
   long-form CLI flags encoded as `--key=value`.
