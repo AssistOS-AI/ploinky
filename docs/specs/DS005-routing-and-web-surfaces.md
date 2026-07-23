@@ -64,6 +64,8 @@ WebChat's EventSource stream must tolerate brief browser reconnects without kill
 
 WebChat may accept a generic `__webchatRuntimeState` line envelope from the selected CLI. Version 1 carries an optional selected `model` string or `null`; the envelope must be intercepted before ordinary assistant output, must not enter conversation history, and must be exposed to connected browsers through the `runtime-state` EventSource event. The current runtime-state snapshot must remain memory-only and must be sent to a reconnecting subscriber. The header may show a non-empty model beside the selected agent name and must hide the badge when the model is `null`. Ploinky must not read an agent-owned settings file, infer an effective provider model, or persist this runtime state in folder-session JSON.
 
+Version 1 runtime state may also carry a `runtimeInstanceId` generated once by the selected CLI process as a version-4 UUID. Ploinky must treat this value as an internal process-lifetime marker, must not expose it in browser runtime-state events, and must not persist it in folder-session JSON. The first valid identifier establishes the live process identity. A later identifier change on the same WebChat runtime means that the CLI process was replaced: Ploinky must reload the runtime's selected folder session, rebuild structured and plain-text continuation forms, clear any process-local pending interaction, and rearm one-time continuation delivery for the next non-slash message. Repeated state from the same identifier, including model changes and browser EventSource reconnects, must not rearm history. Agents that omit the optional identifier retain the version-1 compatibility behavior without process-replacement detection.
+
 WebChat must not render existing messages automatically after refresh. A non-empty session presents `Click to load session history` as a centered standalone button inside the scrollable message stream, not as a chat item, while the composer remains usable and new turns append to the current session. This item is browser-only: it must not be written to folder history, sent to the agent, or included in continuation context. Activating it removes it immediately and loads the real history; a failed request may restore it so the user can retry. The `Sessions` header control opens one selector whose first item is the emphasized `New` action; activating it creates and selects an empty session. The remaining items list sessions by recent activity using a first-message preview and relative time, without agent or message-count metadata. Selecting an existing entry makes it current and loads it. Session changes and new turns must be visible to other connected clients using the same working directory.
 
 The `Tasks` and `Sessions` controls in the WebChat header must use a darker green hover fill that remains visually consistent with the green header, rather than inheriting the theme's neutral panel-hover color.
@@ -428,6 +430,11 @@ router-owned file route keeps canonical path validation at the read boundary. A
 syntactic false positive therefore becomes at most a failed preview after an
 explicit user click, while the agent receives no additional filesystem
 capability and the stored assistant text remains unchanged.
+
+### Question #23: Why is continuation rearmed from a CLI-generated runtime instance id rather than a browser reconnect or PID?
+
+Response:
+A browser EventSource may reconnect while the same CLI and MainAgent session remain alive, so reconnection is not evidence that in-memory conversation state was lost. A host PID may identify a launcher or wrapper rather than the selected CLI and may eventually be reused. A random identifier emitted by the CLI process changes precisely when that process-lifetime memory is replaced. Comparing that identifier lets WebChat reload durable folder history after restart, reinstall, stop/start, disable/enable, destruction, or crash without duplicating history after an ordinary network interruption.
 
 ## Conclusion
 

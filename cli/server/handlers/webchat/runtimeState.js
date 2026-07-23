@@ -4,7 +4,10 @@ import {
     appendAssistantProgress,
     appendSessionMessage,
     appendToAssistantMessage,
+    buildContinuationHistory,
+    formatContinuationContext,
     insertSessionTaskItem,
+    loadSession,
     summarizeSession
 } from '../../webchat/sessionStore.js';
 import { hasOngoingTask, ingestTaskEvent } from '../../webchat/taskStore.js';
@@ -12,6 +15,7 @@ import { hasOngoingTask, ingestTaskEvent } from '../../webchat/taskStore.js';
 const STREAM_RECONNECT_GRACE_MS = 120000;
 const MAX_PENDING_SSE_EVENTS = 200;
 const MAX_RUNTIME_MODEL_LENGTH = 256;
+const RUNTIME_INSTANCE_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const PROCESS_PREFIX_RE = /^(?:\s*\.+\s*){3,}/;
 const WEBCHAT_RUNTIME_STATE_FLAG = '__webchatRuntimeState';
 const WEBCHAT_INTERACTION_FLAG = '__webchatInteraction';
@@ -257,13 +261,41 @@ export function parseWebchatRuntimeState(envelope) {
         return undefined;
     }
     const model = normalizeRuntimeModel(envelope.model);
-    return model === undefined ? undefined : { model };
+    if (model === undefined) return undefined;
+    if (!Object.prototype.hasOwnProperty.call(envelope, 'runtimeInstanceId')) {
+        return { model };
+    }
+    const runtimeInstanceId = typeof envelope.runtimeInstanceId === 'string'
+        ? envelope.runtimeInstanceId.trim()
+        : '';
+    if (!RUNTIME_INSTANCE_ID_RE.test(runtimeInstanceId)) return undefined;
+    return { model, runtimeInstanceId };
 }
 
 export function serializeRuntimeStateSseEvent(state) {
     const model = normalizeRuntimeModel(state?.model);
     if (model === undefined) return '';
     return `event: runtime-state\ndata: ${JSON.stringify({ model })}\n\n`;
+}
+
+function restoreContinuationAfterRuntimeReplacement(tab, nextState) {
+    const previousRuntimeInstanceId = tab?.webchatRuntimeState?.runtimeInstanceId;
+    const nextRuntimeInstanceId = nextState?.runtimeInstanceId;
+    if (!previousRuntimeInstanceId
+        || !nextRuntimeInstanceId
+        || previousRuntimeInstanceId === nextRuntimeInstanceId) {
+        return;
+    }
+    try {
+        const session = loadSession(tab.workspaceDirectory, tab.sessionId);
+        const continuationHistory = buildContinuationHistory(session);
+        tab.continuationHistory = continuationHistory;
+        tab.continuationContext = formatContinuationContext(session);
+        tab.continuationPending = continuationHistory.length > 0;
+        tab.pendingInteraction = null;
+    } catch (error) {
+        console.warn(`[webchat] Unable to restore history after runtime replacement: ${error?.message || error}`);
+    }
 }
 
 function normalizeInteractionText(value, maxLength, { required = false } = {}) {
@@ -400,6 +432,7 @@ function routeCompleteOutputLine(appState, tab, line) {
             if (envelope?.[WEBCHAT_RUNTIME_STATE_FLAG]) {
                 const runtimeState = parseWebchatRuntimeState(envelope);
                 if (runtimeState !== undefined) {
+                    restoreContinuationAfterRuntimeReplacement(tab, runtimeState);
                     tab.webchatRuntimeState = runtimeState;
                     writeOrBufferSseEvent(tab, serializeRuntimeStateSseEvent(runtimeState));
                 }
