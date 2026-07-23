@@ -290,6 +290,52 @@ function getTaskStatus(agentName, taskId) {
     });
 }
 
+function cancelTask(agentName, taskId) {
+    const normalizedTaskId = String(taskId || '').trim();
+    if (!normalizedTaskId) throw new Error('AgentMcpClient: taskId is required');
+    const args = { taskId: normalizedTaskId };
+    const url = new URL(getRouterUrl());
+    url.pathname = `/${agentName}/task/cancel`;
+    const payload = Buffer.from(JSON.stringify(args), 'utf8');
+    const httpModule = url.protocol === 'https:' ? https : http;
+    const assertion = signAgentAssertion({
+        method: 'POST',
+        path: '/task/cancel',
+        targetAgent: agentName,
+        tool: '__task_cancel__',
+        argumentsObj: args,
+    });
+    return new Promise((resolve, reject) => {
+        const req = httpModule.request({
+            hostname: url.hostname,
+            port: url.port || (url.protocol === 'https:' ? 443 : 80),
+            path: url.pathname,
+            method: 'POST',
+            headers: {
+                accept: 'application/json',
+                'content-type': 'application/json',
+                'content-length': payload.length,
+                authorization: `Bearer ${assertion}`,
+            },
+        }, (res) => {
+            const chunks = [];
+            res.on('data', (chunk) => chunks.push(chunk));
+            res.on('end', () => {
+                const text = Buffer.concat(chunks).toString('utf8');
+                let json = null;
+                try { json = text ? JSON.parse(text) : null; } catch { json = null; }
+                if (res.statusCode >= 400 || !json?.task) {
+                    reject(new Error(json?.reason || json?.error || `agent task cancel failed (status ${res.statusCode})`));
+                    return;
+                }
+                resolve(json.task);
+            });
+        });
+        req.on('error', reject);
+        req.end(payload);
+    });
+}
+
 function unwrapToolResult(result) {
     const content = Array.isArray(result?.content) ? result.content : [];
     if (content.length !== 1) {
@@ -576,6 +622,7 @@ export async function createAgentClient(agentName, options = {}) {
         getAgentStatus: (agentRef = agentName) => getAgentStatus(agentRef),
         ensureAgentRunning: (agentRef = agentName, startOptions = {}) => ensureAgentRunning(agentRef, startOptions),
         getTaskStatus: (taskId) => getTaskStatus(agentName, taskId),
+        cancelTask: (taskId) => cancelTask(agentName, taskId),
         connect: async () => {},
         listTools: unsupported('listTools'),
         listResources: unsupported('listResources'),

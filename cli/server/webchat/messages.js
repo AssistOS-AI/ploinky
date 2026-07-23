@@ -20,7 +20,13 @@ function findOrderedInsertionPoint(children, messageIndex, typingIndicator, hist
     return insertionPoint;
 }
 
-export const __testables = { findOrderedInsertionPoint };
+function shouldDeferUnindexedTask(payload) {
+    return payload?.event === 'started'
+        && Boolean(payload?.task?.id)
+        && !Number.isInteger(payload?.messageIndex);
+}
+
+export const __testables = { findOrderedInsertionPoint, shouldDeferUnindexedTask };
 
 function formatTime(timestamp = null) {
     const parsed = timestamp ? new Date(timestamp) : new Date();
@@ -53,6 +59,7 @@ export function createMessages({
     let programmaticScroll = false;
     let pendingProgressItems = [];
     const taskItems = new Map();
+    const pendingUnindexedTaskIds = [];
     const taskPanelCleanups = new Map();
     const tableScrollHintBindings = new WeakMap();
 
@@ -1069,8 +1076,21 @@ export function createMessages({
     function associateTask(payload) {
         const taskId = payload?.task?.id;
         const messageIndex = Number.isInteger(payload?.messageIndex) ? payload.messageIndex : null;
-        if (!taskId || !Number.isInteger(messageIndex)) return;
+        if (!taskId) return;
+        if (shouldDeferUnindexedTask(payload)) {
+            if (!taskItems.has(taskId) && !pendingUnindexedTaskIds.includes(taskId)) {
+                pendingUnindexedTaskIds.push(taskId);
+            }
+            return;
+        }
+        if (!Number.isInteger(messageIndex)) return;
         addTaskItem(taskId, { messageIndex });
+    }
+
+    function flushPendingUnindexedTasks() {
+        for (const taskId of pendingUnindexedTaskIds.splice(0)) {
+            addTaskItem(taskId);
+        }
     }
 
     function addTaskItem(taskId, options = {}) {
@@ -1380,6 +1400,7 @@ export function createMessages({
             appendMessageEl(wrapper, messageIndex);
         }
 
+        flushPendingUnindexedTasks();
         scrollToBottomIfLocked();
         return true;
     }
@@ -1407,6 +1428,7 @@ export function createMessages({
             }
         }
         taskItems.clear();
+        pendingUnindexedTaskIds.length = 0;
         lastServerMsg.bubble = null;
         lastServerMsg.fullText = '';
         userInputSent = false;

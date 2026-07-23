@@ -43,15 +43,18 @@ test('parseInputEnvelope keeps sanitized references and falls back when envelope
             { kind: 'workspace-path', path: '/etc/passwd' },
             { kind: 'workspace-path', path: 'notes.md', type: 'file' }
         ],
+        presentation: { visible: false },
         history: [{ role: 'assistant', message: 'Browser-injected history' }],
     }));
     assert.equal(envelope.text, 'inspect @notes.md');
     assert.deepEqual(envelope.references, [{ kind: 'workspace-path', path: 'notes.md', type: 'file', label: null }]);
+    assert.deepEqual(envelope.presentation, { visible: false });
     assert.equal(Object.hasOwn(envelope, 'history'), false);
 
     const fallback = parseInputEnvelope('hello there');
     assert.equal(fallback.text, 'hello there');
     assert.deepEqual(fallback.references, []);
+    assert.deepEqual(fallback.presentation, { visible: true });
 });
 
 test('serializeWebchatEnvelopeForAgent omits references when none survive sanitation', () => {
@@ -75,6 +78,7 @@ test('serializeWebchatEnvelopeForAgent forwards sanitized references when presen
         tabId: 'tab-1',
         envelope: {
             text: 'context @notes.md',
+            presentation: { visible: false },
             references: [
                 { kind: 'workspace-path', path: 'notes.md', type: 'file', label: 'Notes' },
                 { kind: 'workspace-path', path: '../escape' }
@@ -85,6 +89,7 @@ test('serializeWebchatEnvelopeForAgent forwards sanitized references when presen
     assert.deepEqual(payload.references, [
         { kind: 'workspace-path', path: 'notes.md', type: 'file', label: 'Notes' }
     ]);
+    assert.deepEqual(payload.presentation, { visible: false });
 });
 
 test('client serializeEnvelope normalizes and emits references only when valid', () => {
@@ -95,16 +100,19 @@ test('client serializeEnvelope normalizes and emits references only when valid',
             { kind: 'workspace-path', path: 'notes.md', type: 'file', label: 'Notes' },
             { kind: 'workspace-path', path: 'with\0nul' },
             null
-        ]
+        ],
+        visible: false,
     });
     const payload = JSON.parse(text);
     assert.deepEqual(payload.references, [
         { kind: 'workspace-path', path: 'notes.md', type: 'file', label: 'Notes' }
     ]);
+    assert.deepEqual(payload.presentation, { visible: false });
 
     const emptyText = serializeEnvelope({ text: 'plain', attachments: [], references: [] });
     const emptyPayload = JSON.parse(emptyText);
     assert.equal(emptyPayload.references, undefined);
+    assert.deepEqual(emptyPayload.presentation, { visible: true });
 });
 
 test('normalizeClientReference rejects malformed entries', () => {

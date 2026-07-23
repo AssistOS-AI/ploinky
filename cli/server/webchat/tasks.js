@@ -10,7 +10,7 @@ function formatTime(value) {
     return date.toLocaleString();
 }
 
-export function createTaskController({ toEndpoint, elements, showBanner }) {
+export function createTaskController({ toEndpoint, sendQuickCommand, elements, showBanner }) {
     const {
         tasksBtn,
         tasksBadge,
@@ -152,16 +152,8 @@ export function createTaskController({ toEndpoint, elements, showBanner }) {
     }
 
     async function loadLog(taskId) {
-        const response = await fetch(toEndpoint(`tasks/${encodeURIComponent(taskId)}/log?offset=0`), { credentials: 'include' });
-        if (!response.ok) throw new Error(`task_log_${response.status}`);
-        const payload = await response.json();
-        logs.set(taskId, {
-            text: typeof payload.text === 'string' ? payload.text : '',
-            offset: Number(payload.nextOffset) || 0,
-            loaded: true,
-        });
-        notify(taskId);
-        return logs.get(taskId).text;
+        if (!sendQuickCommand?.(`/task view ${taskId}`)) throw new Error('task_command_unavailable');
+        return '';
     }
 
     async function selectTask(taskId) {
@@ -170,31 +162,23 @@ export function createTaskController({ toEndpoint, elements, showBanner }) {
         renderDetail();
         try {
             await loadLog(taskId);
-            if (selectedId === taskId) renderDetail();
         } catch (error) {
             showBanner(`Unable to load task log: ${error.message}`, 'err');
         }
     }
 
     async function refresh() {
-        const response = await fetch(toEndpoint('tasks'), { credentials: 'include' });
-        if (!response.ok) throw new Error(`tasks_${response.status}`);
-        const payload = await response.json();
-        tasks.clear();
-        for (const task of Array.isArray(payload.tasks) ? payload.tasks : []) tasks.set(task.id, task);
-        ready = true;
-        updateBadge();
-        renderList();
-        notifyAll();
-        if (selectedId && tasks.has(selectedId)) await selectTask(selectedId);
+        if (!sendQuickCommand?.('/tasks')) throw new Error('task_command_unavailable');
     }
 
-    function open() {
+    function open({ refresh: shouldRefresh = true } = {}) {
         if (!tasksDialog) return;
         unreadTerminal = 0;
         updateBadge();
         tasksDialog.hidden = false;
-        void refresh().catch((error) => showBanner(`Unable to load tasks: ${error.message}`, 'err'));
+        if (shouldRefresh) {
+            void refresh().catch((error) => showBanner(`Unable to load tasks: ${error.message}`, 'err'));
+        }
     }
 
     function close() {
@@ -202,10 +186,26 @@ export function createTaskController({ toEndpoint, elements, showBanner }) {
     }
 
     function handleUpdate(payload) {
+        if (payload?.event === 'list') {
+            tasks.clear();
+            for (const item of Array.isArray(payload.tasks) ? payload.tasks : []) tasks.set(item.id, item);
+            ready = true;
+            updateBadge();
+            renderList();
+            notifyAll();
+            return;
+        }
         const task = payload?.task;
         if (!task?.id) return;
         const previous = tasks.get(task.id);
         tasks.set(task.id, { ...previous, ...task });
+        if (payload.event === 'view' && payload.log) {
+            logs.set(task.id, {
+                text: typeof payload.log.text === 'string' ? payload.log.text : '',
+                offset: Number(payload.log.nextOffset) || 0,
+                loaded: true,
+            });
+        }
         const cache = logs.get(task.id);
         const appended = typeof payload.logAppend === 'string' ? payload.logAppend : '';
         const nextOffset = Number(payload.logOffset);
@@ -248,7 +248,6 @@ export function createTaskController({ toEndpoint, elements, showBanner }) {
         renderDetail({ stickToEnd: false });
     }, 1000);
 
-    void refresh().catch(() => {});
     return {
         handleUpdate,
         refresh,

@@ -57,7 +57,7 @@ function normalizeClientReference(raw) {
     };
 }
 
-function serializeEnvelope({ text = '', attachments = [], references = [] } = {}) {
+function serializeEnvelope({ text = '', attachments = [], references = [], visible = true } = {}) {
     const normalizedAttachments = Array.isArray(attachments)
         ? attachments.map((raw) => {
             if (!raw || typeof raw !== 'object') {
@@ -84,7 +84,8 @@ function serializeEnvelope({ text = '', attachments = [], references = [] } = {}
         [ENVELOPE_FLAG]: ENVELOPE_VERSION,
         version: ENVELOPE_VERSION,
         text: typeof text === 'string' ? text : '',
-        attachments: normalizedAttachments
+        attachments: normalizedAttachments,
+        presentation: { visible: visible !== false },
     };
     if (normalizedReferences.length) {
         payload.references = normalizedReferences;
@@ -155,6 +156,17 @@ function parseInteractionResolutionPayload(text) {
     }
 }
 
+function resolvesVisibleTaskCommand(payload, command) {
+    const normalizedCommand = typeof command === 'string' ? command.trim() : '';
+    if (payload?.event === 'list') {
+        return /^\/tasks(?:\s|$)/.test(normalizedCommand);
+    }
+    if (payload?.event === 'view') {
+        return /^\/task\s+view(?:\s|$)/.test(normalizedCommand);
+    }
+    return false;
+}
+
 Object.assign(__testables, {
     serializeEnvelope,
     normalizeClientReference,
@@ -162,6 +174,7 @@ Object.assign(__testables, {
     parseRuntimeStatePayload,
     parseInteractionPayload,
     parseInteractionResolutionPayload,
+    resolvesVisibleTaskCommand,
 });
 
 export { serializeEnvelope, normalizeClientReference };
@@ -194,6 +207,7 @@ export function createNetwork({
     let es = null;
     let chatBuffer = '';
     let pendingUserPrompt = '';
+    let pendingVisibleCommand = '';
     let reconnectAttempts = 0;
     let reconnectTimer = null;
     let pendingUploads = 0;
@@ -263,6 +277,7 @@ export function createNetwork({
         }
         const displayed = addServerMsg(stripped, { messageIndex: assistantMessageIndex });
         if (displayed && pendingUploads === 0) {
+            pendingVisibleCommand = '';
             hideTypingIndicator();
         }
     }
@@ -403,8 +418,15 @@ export function createNetwork({
         es.addEventListener('task-update', (event) => {
             try {
                 const payload = JSON.parse(event.data);
+                const visibleCommand = resolvesVisibleTaskCommand(payload, pendingVisibleCommand)
+                    ? pendingVisibleCommand
+                    : '';
+                if (visibleCommand) {
+                    pendingVisibleCommand = '';
+                    hideTypingIndicator(true);
+                }
                 if (typeof onTaskUpdate === 'function') {
-                    onTaskUpdate(payload);
+                    onTaskUpdate(payload, { visibleCommand });
                 }
             } catch (error) {
                 dlog('task update error', error);
@@ -457,9 +479,17 @@ export function createNetwork({
         const text = typeof payload.text === 'string' ? payload.text : '';
         const attachments = Array.isArray(payload.attachments) ? payload.attachments : [];
         const references = Array.isArray(payload.references) ? payload.references : [];
-        const serialized = serializeEnvelope({ text, attachments, references });
+        const serialized = serializeEnvelope({
+            text,
+            attachments,
+            references,
+            visible: !silent,
+        });
         const trimmedText = text.trim();
         pendingUserPrompt = trimmedText;
+        if (!silent) {
+            pendingVisibleCommand = trimmedText.startsWith('/') ? trimmedText : '';
+        }
 
         if (!silent) markUserInputSent();
 
@@ -477,6 +507,7 @@ export function createNetwork({
             return response;
         }).catch((error) => {
             dlog('chat error', error);
+            if (!silent) pendingVisibleCommand = '';
             if (pendingUploads === 0) {
                 hideTypingIndicator(true);
             }

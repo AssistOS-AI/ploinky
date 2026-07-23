@@ -28,7 +28,7 @@ function sessionEnvelope(event = 'current') {
             createdAt: '2026-07-23T10:00:00.000Z',
             updatedAt: '2026-07-23T10:01:00.000Z',
             messages: [
-                { role: 'user', text: 'Earlier question', timestamp: '2026-07-23T10:00:00.000Z', attachments: [], references: [] },
+                { role: 'user', text: 'Earlier question', timestamp: '2026-07-23T10:00:00.000Z', attachments: [], references: [], context: false },
                 { role: 'assistant', text: 'Earlier answer', timestamp: '2026-07-23T10:01:00.000Z', attachments: [], references: [] },
             ],
         },
@@ -81,6 +81,7 @@ test('session list envelopes are validated but do not replace the current snapsh
         sessions: [sessionEnvelope().summary],
     });
     assert.equal(current.event, 'current');
+    assert.equal(current.session.messages[0].context, false);
     assert.deepEqual(list.sessions, [sessionEnvelope().summary]);
     assert.equal(parseWebchatSessionState({ ...sessionEnvelope(), version: 2 }), undefined);
     assert.match(serializeSessionStateSseEvent(current), /event: session-state/);
@@ -177,6 +178,62 @@ test('a failed runtime write is rejected and the zombie runtime is removed', asy
     assert.equal(disposed, true);
     assert.equal(appState.runtimes.has(runtimeKey), false);
     assert.doesNotMatch(sseWrites.join(''), /event: user-message/);
+});
+
+test('visible slash commands broadcast as transcript input while UI control commands stay silent', async () => {
+    const workspaceDirectory = '/workspace';
+    const effectiveConfig = { agentName: 'demo-agent', forwardEnvelope: true };
+    const runtimeKey = buildRuntimeKey(workspaceDirectory, effectiveConfig, '');
+    const ttyWrites = [];
+    const sseWrites = [];
+    const tab = {
+        tty: {
+            isAlive: () => true,
+            write: (value) => { ttyWrites.push(value); return true; },
+        },
+        subscribers: new Map([['client', { res: { write: (value) => sseWrites.push(value) } }]]),
+        workspaceDirectory,
+        liveMessageCount: 0,
+        taskProtocolBuffer: '',
+    };
+    const appState = { runtimes: new Map([[runtimeKey, tab]]) };
+
+    const submit = async (text, visible) => {
+        const req = new EventEmitter();
+        req.method = 'POST';
+        req.headers = { host: '127.0.0.1' };
+        let statusCode = null;
+        let resolveEnded;
+        const ended = new Promise((resolve) => { resolveEnded = resolve; });
+        const res = {
+            writeHead(status) { statusCode = status; },
+            end() { resolveEnded(); },
+        };
+        handleRuntimeRoute({
+            pathname: '/input', req, res,
+            parsedUrl: new URL('http://localhost/input?tabId=tab-1'),
+            appState, workspaceDirectory, effectiveConfig, agentQuery: '',
+        });
+        req.emit('data', JSON.stringify({
+            __webchatMessage: 1,
+            version: 1,
+            text,
+            presentation: { visible },
+        }));
+        req.emit('end');
+        await ended;
+        assert.equal(statusCode, 204);
+    };
+
+    await submit('/exec launch-opencode hi', true);
+    await submit('/tasks', false);
+
+    assert.equal(ttyWrites.length, 2);
+    assert.equal(JSON.parse(ttyWrites[0]).presentation.visible, true);
+    assert.equal(JSON.parse(ttyWrites[1]).presentation.visible, false);
+    assert.equal(sseWrites.filter((value) => value.includes('event: user-message')).length, 1);
+    assert.match(sseWrites.join(''), /\/exec launch-opencode hi/);
+    assert.doesNotMatch(sseWrites.join(''), /\/tasks/);
 });
 
 test('an EventSource reconnect replaces a runtime whose TTY is not alive', () => {

@@ -41,3 +41,19 @@ test('new task items remain ordered before the typing indicator', () => {
         typing,
     );
 });
+
+test('slash-command tasks wait for the command response before rendering their item', () => {
+    assert.equal(__testables.shouldDeferUnindexedTask({
+        event: 'started',
+        task: { id: 'task-1' },
+    }), true);
+    assert.equal(__testables.shouldDeferUnindexedTask({
+        event: 'started',
+        messageIndex: 3,
+        task: { id: 'task-1' },
+    }), false);
+    assert.equal(__testables.shouldDeferUnindexedTask({
+        event: 'update',
+        task: { id: 'task-1' },
+    }), false);
+});

@@ -30,11 +30,11 @@ For `/webchat`, the router must treat `agent` as an explicit agent-selection que
 
 WebChat must remain a generic transport. It must not hardcode optional catalog agent ids, backend tags, MCP tool names, or domain-specific dispatch logic. Query parameters such as `feature-mode`, `forward-envelope`, or future agent-owned options are ordinary target-agent launch flags once they pass the router-reserved parameter filter. Their interpretation belongs to the selected agent CLI or to an explicitly configured downstream integration, not to Ploinky's router or WebChat handler.
 
-When `/webchat` is launched with `forward-envelope=1`, messages may be written to the target TTY as the WebChat JSON envelope instead of plain text. The envelope may include sanitized attachment metadata, sanitized structured references (currently only `kind: "workspace-path"` records with `path`, `type`, and optional `label`), a sanitized public origin hint derived from the incoming WebChat request (`origin.publicBaseUrl`), and a short-lived router-minted invocation token scoped to the selected chat agent. It must not include conversation history: session persistence and one-time MainAgent hydration belong to the selected CLI. The public origin hint must be limited to an `http` or `https` origin. Reference paths must be workspace-relative; the server must drop entries containing absolute paths, traversal segments, NUL bytes, or reserved secret-file names before forwarding the envelope.
+When `/webchat` is launched with `forward-envelope=1`, messages may be written to the target TTY as the WebChat JSON envelope instead of plain text. The envelope may include sanitized attachment metadata, sanitized structured references (currently only `kind: "workspace-path"` records with `path`, `type`, and optional `label`), a sanitized public origin hint derived from the incoming WebChat request (`origin.publicBaseUrl`), a sanitized `presentation.visible` boolean, and a short-lived router-minted invocation token scoped to the selected chat agent. It must not include conversation history: session persistence and one-time MainAgent hydration belong to the selected CLI. The public origin hint must be limited to an `http` or `https` origin. Reference paths must be workspace-relative; the server must drop entries containing absolute paths, traversal segments, NUL bytes, or reserved secret-file names before forwarding the envelope.
 
 WebChat is a session presentation and transport surface, not the conversation owner. Ploinky must not create conversation files, a current-conversation pointer, or conversation REST routes. A compatible selected CLI may publish version-1 `__webchatSession` line envelopes with `current`, `list`, or `selected` events. `current` and `selected` carry a complete validated session snapshot plus selector summary; `list` carries the current id and bounded summaries. Ploinky must intercept these control lines before ordinary assistant rendering, retain only the latest non-list snapshot in runtime memory, expose them through the `session-state` EventSource event, and replay that snapshot to reconnecting subscribers. It must never persist the supplied conversation data.
 
-The `Sessions` button must remain unavailable until the selected CLI advertises session state. Opening it sends `/session` to the CLI and renders the returned `list`; `New` sends `/session new`; selecting an existing entry sends `/session resume <session-id>`. A compatible structured command catalog may attach session-id argument completions to the `resume` subcommand; WebChat must render each completion's human-readable label while inserting its opaque value. These commands are control actions and must not be rendered as user turns. A `selected` response immediately replaces the browser transcript with the supplied session. The initial `current` response retains lazy history rendering: a non-empty snapshot presents `Click to load session history` as a centered standalone button, and clicking it renders the already received snapshot without a REST request.
+The `Sessions` button must remain unavailable until the selected CLI advertises session state. Opening it sends `/session` to the CLI and renders the returned `list`; `New` sends `/session new`; selecting an existing entry sends `/session resume <session-id>`. A compatible structured command catalog may attach session-id argument completions to the `resume` subcommand; WebChat must render each completion's human-readable label while inserting its opaque value. These button-originated commands are silent control actions and must not be rendered as user turns. A `selected` response immediately replaces the browser transcript with the supplied session. The initial `current` response retains lazy history rendering: a non-empty snapshot presents `Click to load session history` as a centered standalone button, and clicking it renders the already received snapshot without a REST request.
 
 WebChat's EventSource stream must tolerate brief browser reconnects without killing the target TTY. Runtime identity is the canonical working directory, selected agent, and launch configuration; conversation selection must not replace the TTY runtime. `tabId` identifies only a browser client and must be recovered from `sessionStorage` on refresh. A runtime may have multiple SSE subscribers and remains alive for the bounded reconnect grace window after the last subscriber leaves. The latest session-state, runtime-state, and pending-interaction snapshots are replayed after reconnect.
 
@@ -44,7 +44,7 @@ WebChat may accept a generic `__webchatRuntimeState` line envelope from the sele
 
 The `Tasks` and `Sessions` controls in the WebChat header must use a darker green hover fill that remains visually consistent with the green header, rather than inheriting the theme's neutral panel-hover color.
 
-The selected CLI must restore its own conversation state whenever its process starts. Ploinky must not deliver role-separated history, delimited continuation text, a selected conversation id, or a `PLOINKY_WEBCHAT_HAS_HISTORY` environment flag. Slash commands and natural-language prompts travel over the same TTY, while the selected CLI decides which inputs are conversational and when stored history is supplied to its agent implementation.
+The selected CLI must restore its own conversation state whenever its process starts. Ploinky must not deliver role-separated history, delimited continuation text, a selected conversation id, or a `PLOINKY_WEBCHAT_HAS_HISTORY` environment flag. Slash commands and natural-language prompts travel over the same TTY. Composer submissions default to `presentation.visible: true`, while WebChat-owned control actions use `false`. An invisible control command and its textual acknowledgement or error must not render in the main transcript. The selected CLI decides which visible inputs and outputs enter its presentation transcript and which stored records are supplied to its agent implementation; Ploinky never writes that transcript.
 
 WebChat must provide a generic composer autocomplete surface driven by trigger providers. The composer controller owns menu lifecycle, keyboard navigation (Arrow Up/Down, Enter, Tab, Escape), pointer selection, grouped rendering, positioning, and insertion. Arrow Up/Down navigation must keep the active option inside the visible viewport of the scrollable menu. Trigger providers supply suggestions:
 
@@ -96,79 +96,86 @@ ordered progress strings in its later `__webchatSession` snapshot, allowing the
 browser to render them as a collapsible block above the final answer after
 history is loaded. Progress remains UI metadata rather than assistant text.
 
-WebChat may also receive generic `__webchatTask` lifecycle envelopes from a selected CLI. These envelopes must be intercepted before conversation rendering. Ploinky must store workspace-scoped task metadata as append-only JSON lines in `<cwd>/.copilot_history/agent_tasks`, store per-task logs separately under `.copilot_history/task_logs/`, and expose authenticated `GET /webchat/tasks`, `GET /webchat/tasks/<task-id>/log`, and `GET /webchat/tasks/<task-id>/view` routes. Logs are bounded by default; an asynchronous tool may explicitly declare full retention for tasks whose complete multi-turn transcript must survive. Browser updates must use the existing EventSource stream with a `task-update` event; Ploinky must not hardcode target-agent ids or tool names.
+WebChat may also receive generic `__webchatTask` list, view, lifecycle, log, and action envelopes from a selected CLI. These envelopes must be intercepted before conversation rendering, validated, retained only as volatile runtime state, and forwarded through the existing EventSource stream as `task-update` events. Ploinky must not persist task metadata or logs, hardcode target-agent ids or tool names, or expose task data/action REST routes. It retains only authenticated `GET /webchat/tasks/<task-id>/view`, which serves the generic HTML task page. The selected CLI owns task storage, log retention, reattachment, and actions.
 
 An asynchronous tool may advertise a generic continuation tool. Its structured
 result may return a versioned opaque continuation handle even when execution
-fails after the provider session was created. Ploinky stores that handle with
-the target agent and tool name in the task record. A completed or failed task
-carrying that capability must show a message input in its authenticated task
-view. `POST /webchat/tasks/<task-id>/continue` invokes only
-the stored target and stored tool with that opaque handle and the new message,
-through normal MCP policy evaluation and a newly minted request-bound Router
-Request; it must never forward the browser session token to the target agent.
+fails after the provider session was created. The selected CLI stores that
+handle with the target agent and tool name. A completed or failed task carrying
+that capability must show a message input in its authenticated task view. The
+view sends `/task continue <task-id> <prompt>` to the selected CLI through the
+parent WebChat command bridge; it must not invoke a task REST route.
 The continuation input must submit on unmodified Enter, preserve a newline on
 Ctrl/Cmd+Enter or Shift+Enter, disable manual textarea resizing, and grow
 upward with its content to the same bounded height as the main WebChat
 composer. Beyond that height its own content must scroll, and deleting content
 must shrink it again.
-The provider invocation creates a new remote AgentServer task, but WebChat must
-retain the exact same local `taskId`, increment its positive `turn`, replace its
+The provider invocation creates a new remote AgentServer task, but the selected
+CLI must retain the exact same local `taskId`, increment its positive `turn`, replace its
 current `remoteTaskId`, set the task back to `ongoing`, and append subsequent
-logs to the same task log. Late lifecycle events from an older turn or remote
+logs to the same task log. Before remote output is appended, the CLI must append
+the submitted continuation prompt to the durable log and publish that exact
+delta and its resulting offset so an already open task view shows the prompt in
+sequence. Late lifecycle events from an older turn or remote
 task id must not overwrite the current turn. The original task description and
 creation time remain stable, while `executionStartedAt` tracks the current turn.
-The task view may poll an authenticated refresh route while the continued turn
-is active; parent-stream updates remain the normal live path. If the stored
-agent is installed but has no ready route, including after a general restart
-left a `startup: manual` provider stopped, the task route must activate that
-exact agent in global mode through Ploinky's internal enable lifecycle, publish
-its route, and wait for readiness before invoking or polling it. Concurrent
-requests for the same provider must share one activation. Startup or readiness
-failure must remain explicit instead of changing the local task identity or
-silently selecting another provider.
+The parent stream remains the live update path. If the stored agent is installed
+but has no ready route, including after a general restart left a
+`startup: manual` provider stopped, the selected CLI must activate that exact
+agent in global mode through `AgentMcpClient.ensureAgentRunning()` and wait for
+readiness before invoking it. Startup or readiness failure must remain explicit
+instead of changing the local task identity or silently selecting another
+provider.
 
 The session-owning CLI is responsible for inserting a task reference immediately
 after the active assistant placeholder and may include the resulting session id
 and task-item index on the first `started` envelope. Ploinky forwards that
 correlation on the EventSource event without altering conversation state or
-duplicating it in the task journal. The browser must render every task item as its own compact
+persisting task state. The browser must render every task item as its own compact
 incoming-style chat item. Its first row must show the exact target-agent id,
 description, status, and elapsed whole seconds, and its second row must expose a
 `View task details` link without inline expansion controls or logs. The browser
 must recover the same item after history loading by resolving its `taskId`
-against the task route. A live task
+against the selected CLI's `/tasks` list envelope. A live task
 item may appear before final assistant text arrives; indexed insertion must
 still produce the stable history order `user -> assistant -> task items`. The
 item remains available after terminal completion; a missing task record renders
 as unavailable. Task items are UI references and must not enter
-the continuation context. Legacy assistant-message `taskId` properties are
+the continuation context. The selected CLI must persist a task reference created
+by a visible slash-command turn in that same durable session, so a refresh can
+restore the command, its response, and every associated task item from one
+ordered snapshot. Silent Tasks/session UI queries do not create transcript
+records. Legacy assistant-message `taskId` properties are
 ignored rather than rendered or migrated.
 
 The task link must use WebChat's generic side-panel link mechanism to open the
 authenticated task view. That page must reproduce the task header, error, and
-live-log presentation previously available in the expanded chat item. It must
-load its initial task and log state through the authenticated task APIs, then
-receive updates for the active task from the parent WebChat page through a
-same-origin `postMessage` bridge fed by the parent's existing EventSource. It
-must not open another EventSource or create a task-specific live transport.
-Missing log offsets must be recovered through the existing log route. Direct
-navigation may show the current authenticated snapshot without a parent live
-bridge.
+live-log presentation previously available in the expanded chat item. It loads
+initial state by asking the parent to send `/task view <task-id>` and receives
+later updates for the active task through a same-origin `postMessage` bridge fed
+by the parent's existing EventSource. It must not open another EventSource,
+fetch task data directly, or create a task-specific live transport. Direct
+navigation still serves the authenticated HTML shell but requires its parent
+WebChat runtime for task commands and state.
+If a task-log delta does not begin at the task view's current offset, the view
+must request one complete `/task view` snapshot and wait for that response. It
+must not recursively reapply the same mismatched delta while the snapshot is
+pending.
 
 The task page must expose a direct `Stop` action while the current remote task
-is queued or running. The authenticated WebChat route resolves the already
-stored target agent and remote task id; it must not accept either value from the
-browser, silently choose another provider, or activate an unavailable agent.
-It sends a request-bound Router Request to the target AgentServer
-`POST /task/cancel` surface. Queued work becomes `cancelled` without starting.
+is queued or running. It sends `/task stop <task-id>` to the selected CLI; the
+browser must not supply a target agent or remote task id. The selected CLI
+resolves both values from its own store and signs a request-bound Agent
+Assertion for the router's `POST /<agent>/task/cancel` path. The router verifies
+the assertion and mints a target-scoped Router Request; no browser session token
+reaches the target AgentServer. Queued work becomes `cancelled` without starting.
 Running work first becomes `cancelling`, receives graceful termination, and is
 force-terminated after a two-second cleanup grace period if it has not exited.
 Repeated stop requests and requests against terminal work are idempotent. The
 local task remains `ongoing` while remote cleanup is in progress and becomes
 `stopped` when the remote task reports `cancelled`.
 
-Cancellation never creates a replacement WebChat task. If a running provider
+Cancellation never creates a replacement local task. If a running provider
 created and persisted a continuation handle before it stopped, the same local
 task remains continuable: a later message increments its turn and starts a new
 remote execution exactly as failed-task continuation does. A queued task
@@ -187,11 +194,11 @@ composer.
 The Tasks overlay, compact task item, and task view must share one presentation policy.
 Pending work is shown as `QUEUED`, active work as `RUNNING`, and terminal states
 as `COMPLETED`, `STOPPED`, or `FAILED`. Raw task log files remain unchanged and
-are written only by task-event ingestion. The terminal task envelope may carry
+are written only by the selected CLI's task-event ingestion. The terminal task envelope may carry
 the final MCP result as presentation metadata, but ingestion must never append
 or duplicate that result in the log. Instead, it locates the last identical
 range already present in the persisted raw log and stores only its offset and
-length in `agent_tasks`. Continuation clears that range until the next terminal
+length in its task journal. Continuation clears that range until the next terminal
 result. The Tasks overlay and task view render log lines outside the range with
 the secondary grey text color and lines intersecting it with the primary text
 color, so intermediate provider activity remains visibly distinct from the
@@ -201,7 +208,7 @@ and retains presentation compatibility for historical logs that contain
 recognized stream and runner prefixes; new raw provider output remains
 otherwise unchanged.
 
-When a WebChat runtime has no SSE subscribers but owns a task whose materialized state is `ongoing`, reconnect cleanup must retain that runtime so its agent can continue router-mediated polling and log collection. Once its tasks become terminal, the normal reconnect grace and disposal behavior resumes. If the runtime is recreated after a wider process restart, the selected CLI may reattach from the workspace task journal. Initial task identity is derived from target agent and remote task id; after continuation, the stable local task id plus its monotonically increasing turn select the current remote task. A PID is optional diagnostics only.
+When a WebChat runtime has no SSE subscribers but has received a task whose materialized state is `ongoing`, reconnect cleanup must retain that runtime so the selected CLI can continue router-mediated polling and log collection. Once its tasks become terminal, the normal reconnect grace and disposal behavior resumes. If the runtime is recreated after a wider process restart, the selected CLI reattaches from its workspace task journal. Initial task identity is derived from target agent and remote task id; after continuation, the stable local task id plus its monotonically increasing turn select the current remote task. A PID is optional diagnostics only.
 
 The router must also expose:
 
@@ -277,7 +284,7 @@ The selected CLI must provide the same session behavior when launched directly, 
 ### Question #8: Why does WebChat retain a disconnected runtime with ongoing tasks?
 
 Response:
-The target AgentServer owns the actual delegated process, but the selected chat CLI owns router-mediated polling and conversion of bounded task tails into workspace logs. Retaining that watcher while work remains ongoing preserves live diagnostics across a closed browser tab without making the browser or its `tabId` the task owner.
+The target AgentServer owns the actual delegated process, while the selected chat CLI owns router-mediated polling and task persistence. Retaining that CLI runtime while work remains ongoing preserves live diagnostics across a closed browser tab without making the browser, Ploinky, or its `tabId` the task owner.
 
 ### Question #9: Why must the watchdog recheck maintenance state when a restart timer fires?
 
@@ -316,7 +323,9 @@ the assistant message cannot represent the complete result. Dedicated reference
 items preserve every task and its start order without duplicating task state or
 logs in conversation history. They also keep assistant text semantically clean
 while letting the browser render task progress immediately and later place final
-assistant output before the already visible task items.
+assistant output before the already visible task items. Persisting only the
+reference in the CLI-owned session lets refresh reconstruct the same transcript,
+while the CLI-owned task journal remains the authority for current task state.
 
 ### Question #15: Why does a manual agent route act as an activation marker?
 
@@ -339,8 +348,8 @@ The parent WebChat runtime already receives every `task-update` event and owns
 the selected CLI lifecycle. Opening the general WebChat stream from the task
 view could create or retain another runtime merely to inspect logs. Forwarding
 only the active task through a same-origin `postMessage` bridge preserves one
-live transport, while the authenticated task and log routes provide initial
-state and offset-gap recovery.
+live transport. The iframe asks its parent to send `/task view <task-id>` for
+initial state or log recovery, so Ploinky needs no task data route.
 
 ### Question #18: Why are `@` path suggestions rooted at the WebChat working directory?
 
@@ -398,6 +407,15 @@ The CLI can also run directly without WebChat and is the only component that kno
 
 Response:
 A successful HTTP response and server-originated user-message event tell connected browsers that the selected CLI accepted the prompt. Returning success after writing to a closed or detached stdin leaves the interface waiting for output that cannot exist. Health-aware writes make that acknowledgement truthful, remove the stale runtime immediately, and let the existing EventSource reconnect create a fresh CLI process without changing conversation ownership.
+
+### Question #25: Why does task-log gap recovery wait for a complete snapshot?
+
+Response:
+A delta whose starting offset differs from the browser's current offset cannot
+be merged safely. The selected CLI already provides an authoritative full-log
+snapshot through `/task view`, so one pending snapshot request is sufficient.
+Immediately retrying the same delta before that asynchronous response arrives
+repeats the same mismatch and can create an unbounded browser microtask loop.
 
 ## Conclusion
 

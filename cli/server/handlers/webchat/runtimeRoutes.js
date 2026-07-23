@@ -100,7 +100,7 @@ export function handleRuntimeRoute({
                     workspaceDirectory,
                     webchatSessionSnapshot: null,
                     liveMessageCount: 0,
-                    backgroundTaskIds: new Set(),
+                    webchatTasks: new Map(),
                     taskProtocolBuffer: ''
                 };
                 runtimes.set(runtimeKey, tab);
@@ -191,6 +191,7 @@ export function handleRuntimeRoute({
                 || hasReferences;
             const rawMessage = typeof envelope.text === 'string' ? envelope.text : body;
             const isSlashCommand = rawMessage.trimStart().startsWith('/');
+            const isVisibleMessage = envelope.presentation?.visible !== false;
             const forwardEnvelope = shouldForwardWebchatEnvelope(parsedUrl, effectiveConfig);
             const text = forwardEnvelope
                 ? serializeWebchatEnvelopeForAgent({
@@ -208,7 +209,7 @@ export function handleRuntimeRoute({
                 return;
             }
 
-            if (hasContent && !isSlashCommand) {
+            if (hasContent && (!isSlashCommand || isVisibleMessage)) {
                 const messageIndex = Number.isInteger(tab.liveMessageCount)
                     ? tab.liveMessageCount
                     : null;

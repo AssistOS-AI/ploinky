@@ -77,6 +77,8 @@ const {
     interactionPromptOptions
 } = elements;
 
+let network = null;
+
 const sidePanelApi = createSidePanel({
     chatContainer,
     chatArea,
@@ -85,7 +87,12 @@ const sidePanelApi = createSidePanel({
     sidePanelClose,
     sidePanelTitle,
     sidePanelResizer
-}, { markdown, workspaceBase, webchatBasePath: basePath });
+}, {
+    markdown,
+    workspaceBase,
+    webchatBasePath: basePath,
+    sendQuickCommand: (command) => network?.sendQuickCommand(command) || false,
+});
 
 let sessionController = null;
 let taskController = null;
@@ -93,6 +100,7 @@ let interactionController = null;
 let composerAutocomplete = null;
 taskController = createTaskController({
     toEndpoint,
+    sendQuickCommand: (command) => network?.sendQuickCommand(command) || false,
     elements: {
         tasksBtn,
         tasksBadge,
@@ -129,7 +137,7 @@ dom.setViewMoreChangeHandler((limit) => {
 sidePanelApi.bindLinkDelegation(chatList);
 
 dlog('Initializing network for agent:', dom.agentName);
-const network = createNetwork({
+network = createNetwork({
     TAB_ID,
     toEndpoint,
     dlog,
@@ -148,10 +156,13 @@ const network = createNetwork({
     markUserInputSent: messages.markUserInputSent,
     addRemoteUserMessage: (message, payload) => sessionController?.addRemoteUserMessage(message, payload),
     onSessionState: (payload) => sessionController?.handleSessionState(payload),
-    onTaskUpdate: (payload) => {
+    onTaskUpdate: (payload, { visibleCommand = '' } = {}) => {
         taskController?.handleUpdate(payload);
         sidePanelApi.postTaskUpdate(payload);
         messages.associateTask(payload);
+        if (payload?.event === 'list' && /^\/tasks(?:\s|$)/.test(visibleCommand)) {
+            taskController?.open({ refresh: false });
+        }
     },
     onRuntimeState: (state) => dom.setRuntimeModel(state?.model),
     onInteractionRequest: (interaction) => interactionController?.show(interaction),

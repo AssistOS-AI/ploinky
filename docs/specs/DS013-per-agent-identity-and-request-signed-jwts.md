@@ -65,12 +65,16 @@ User → router (User Session cookie) → router verifies the session, resolves 
 
 Direct agent-to-agent calls are forbidden. The source agent signs an Agent Assertion with its own secret (`Agent/client/AgentMcpClient.mjs`) and posts a direct `tools/call` to the router at `/<target>/mcp` with `Authorization: Bearer <assertion>`. The router verifies the source identity and `rch`, applies MCP policy for `(source agent, target agent, tool)` — agents may invoke only `internal`-classed tools — and mints a Router Request for the target. The same assertion pattern is used for async MCP task polling: the source signs `GET /task` or `GET /getTaskStatus` with pseudo-tool `__task_status__` and `{ taskId }`, and the router mints a matching target-scoped Router Request before proxying the status read. The target AgentServer verifies and executes. The legacy `/auth/agent-token` client-credentials exchange and the shared-key `x-ploinky-caller-jwt` carrier are retired; the carrier is now `Authorization: Bearer`.
 
-Authenticated WebChat cancellation uses the same request-bound trust model
-without exposing it as an agent-to-agent tool. The router resolves the target
-from the stored task, then signs `POST /task/cancel` with pseudo-tool
-`__task_cancel__` and exact arguments `{ taskId }`. AgentServer rejects a
-missing token or any token whose audience, path, method, pseudo-tool, or task id
-does not match before asking its generic task queue to cancel the work.
+Selected-CLI task cancellation uses the same request-bound agent-to-agent trust
+model. `AgentMcpClient.cancelTask()` signs an Agent Assertion for
+`POST /task/cancel` with target agent, pseudo-tool `__task_cancel__`, and exact
+arguments `{ taskId }`, then sends it to `/<target>/task/cancel`. The router
+verifies source identity and request binding before minting the target-audience
+Router Request. AgentServer rejects a missing token or any token whose audience,
+path, method, pseudo-tool, or task id does not match before asking its generic
+task queue to cancel the work. WebChat only sends `/task stop <local-task-id>`
+to the selected CLI and never supplies or forwards browser credentials to the
+target agent.
 
 An agent may use the router-owned Marketplace endpoint to start an installed, inactive agent before making the MCP call. `AgentMcpClient.getAgentStatus()` signs `GET /api/marketplace` with target `ploinky-router` and synthetic tool `marketplace.read`. `ensureAgentRunning()` first performs that read, returns without mutation when the target is already running, and otherwise signs one `POST /api/marketplace` request with synthetic tool `marketplace.enable_agent` and the exact `enable_agent` JSON bytes before polling the read endpoint for runtime readiness. The Marketplace verifier applies the same per-agent secret derivation, exact HTTP `rch` binding, expiry, and single-use `jti` checks as other Agent Assertions. This is a narrow lifecycle capability: an agent assertion authorizes Marketplace reads and enablement only, never repository installation/removal, agent disablement, or general administrator operations.
 

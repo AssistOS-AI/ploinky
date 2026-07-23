@@ -30,7 +30,7 @@ export function createSidePanel({
     sidePanelClose,
     sidePanelTitle,
     sidePanelResizer
-}, { markdown, workspaceBase = '', webchatBasePath = '/webchat' }) {
+}, { markdown, workspaceBase = '', webchatBasePath = '/webchat', sendQuickCommand = null }) {
     let activeBubble = null;
     let activeFrame = null;
     let activeTaskId = '';
@@ -361,6 +361,16 @@ export function createSidePanel({
             // The embedded task view may have closed between the update and delivery.
         }
     }
+
+    window.addEventListener?.('message', (event) => {
+        if (event.origin !== window.location.origin || event.source !== activeFrame?.contentWindow) return;
+        if (event.data?.type !== 'webchat-task-command' || event.data.taskId !== activeTaskId) return;
+        const command = String(event.data.command || '');
+        const escapedTaskId = activeTaskId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const allowed = new RegExp(`^/task (?:view|stop) ${escapedTaskId}$|^/task continue ${escapedTaskId} [\\s\\S]+$`);
+        if (!allowed.test(command)) return;
+        sendQuickCommand?.(command);
+    });
 
     function updateIfActive(bubble, text) {
         if (!bubble || bubble !== activeBubble) {

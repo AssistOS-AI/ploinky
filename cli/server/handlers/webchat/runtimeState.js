@@ -1,7 +1,5 @@
 import crypto from 'crypto';
 
-import { hasOngoingTask, ingestTaskEvent } from '../../webchat/taskStore.js';
-
 const STREAM_RECONNECT_GRACE_MS = 120000;
 const MAX_PENDING_SSE_EVENTS = 200;
 const MAX_RUNTIME_MODEL_LENGTH = 256;
@@ -11,8 +9,82 @@ const WEBCHAT_INTERACTION_FLAG = '__webchatInteraction';
 const WEBCHAT_INTERACTION_RESOLVED_FLAG = '__webchatInteractionResolved';
 const SESSION_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const TASK_ID_RE = /^task_[0-9a-f]{24}$/;
+const TASK_CONTINUATION_HANDLE_RE = /^[A-Za-z0-9_-]{16,200}$/;
+const TASK_TOOL_NAME_RE = /^[A-Za-z0-9._-]{1,160}$/;
 const INTERACTION_ID_RE = /^[A-Za-z0-9_-]{8,128}$/;
 const INTERACTION_TOKEN_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+const TASK_STATUSES = new Set(['ongoing', 'finished', 'stopped', 'error']);
+
+function normalizeTask(raw) {
+    if (!raw || typeof raw !== 'object' || !TASK_ID_RE.test(String(raw.id || ''))) return null;
+    const continuationTarget = String(raw.continuation?.targetAgent || raw.targetAgent || '').trim().slice(0, 160);
+    const continuationTool = String(raw.continuation?.toolName || '').trim();
+    const continuationHandle = String(raw.continuation?.handle || '').trim();
+    const continuation = raw.continuation?.version === 1
+        && continuationTarget
+        && TASK_TOOL_NAME_RE.test(continuationTool)
+        && (!continuationHandle || TASK_CONTINUATION_HANDLE_RE.test(continuationHandle))
+        ? {
+            version: 1,
+            targetAgent: continuationTarget,
+            toolName: continuationTool,
+            ...(continuationHandle ? { handle: continuationHandle } : {}),
+        }
+        : null;
+    return {
+        version: 1,
+        id: String(raw.id),
+        targetAgent: String(raw.targetAgent || '').slice(0, 160),
+        remoteTaskId: String(raw.remoteTaskId || '').slice(0, 200),
+        toolName: String(raw.toolName || '').slice(0, 160),
+        description: String(raw.description || '').replace(/\s+/g, ' ').trim().slice(0, 240),
+        status: TASK_STATUSES.has(raw.status) ? raw.status : 'ongoing',
+        remoteStatus: String(raw.remoteStatus || '').slice(0, 80),
+        createdAt: normalizeTimestamp(raw.createdAt),
+        updatedAt: normalizeTimestamp(raw.updatedAt),
+        executionStartedAt: normalizeTimestamp(raw.executionStartedAt),
+        turn: Number.isSafeInteger(raw.turn) && raw.turn > 0 ? raw.turn : 1,
+        error: String(raw.error || '').slice(0, 1000),
+        finalOutputOffset: Number.isSafeInteger(raw.finalOutputOffset) && raw.finalOutputOffset >= 0
+            ? raw.finalOutputOffset
+            : null,
+        finalOutputLength: Number.isSafeInteger(raw.finalOutputLength) && raw.finalOutputLength > 0
+            ? raw.finalOutputLength
+            : 0,
+        ...(raw.logRetention === 'full' ? { logRetention: 'full' } : {}),
+        ...(continuation ? { continuation } : {}),
+    };
+}
+
+export function parseWebchatTaskState(envelope) {
+    if (!envelope || envelope.__webchatTask !== 1 || envelope.version !== 1) return undefined;
+    if (envelope.event === 'list') {
+        if (!Array.isArray(envelope.tasks)) return undefined;
+        return { event: 'list', tasks: envelope.tasks.map(normalizeTask).filter(Boolean).slice(0, 1000) };
+    }
+    const task = normalizeTask(envelope.task);
+    if (!task) return undefined;
+    if (envelope.event === 'view') {
+        const rawLog = envelope.log && typeof envelope.log === 'object' ? envelope.log : {};
+        return {
+            event: 'view',
+            task,
+            log: {
+                text: typeof rawLog.text === 'string' ? rawLog.text : '',
+                nextOffset: Math.max(0, Number(rawLog.nextOffset) || 0),
+                reset: rawLog.reset === true,
+            },
+        };
+    }
+    return {
+        event: String(envelope.event || 'update').slice(0, 32),
+        task,
+        ...(typeof envelope.logAppend === 'string' ? { logAppend: envelope.logAppend } : {}),
+        ...(Number.isFinite(Number(envelope.logOffset)) ? { logOffset: Number(envelope.logOffset) } : {}),
+        ...(envelope.action ? { action: String(envelope.action).slice(0, 32), ok: envelope.ok === true } : {}),
+        ...(typeof envelope.error === 'string' ? { error: envelope.error.slice(0, 1000) } : {}),
+    };
+}
 
 function stripCtrlAndAnsi(input) {
     try {
@@ -73,16 +145,6 @@ export function writeOrBufferSseEvent(tab, payload) {
         }
     }
     pushPendingSseEvent(tab, payload);
-}
-
-export function broadcastTaskUpdate(appState, workspaceDirectory, update) {
-    if (!update?.task?.id) return;
-    const payload = `event: task-update\ndata: ${JSON.stringify(update)}\n\n`;
-    for (const runtime of getRuntimeMap(appState).values()) {
-        if (runtime?.workspaceDirectory === workspaceDirectory) {
-            writeOrBufferSseEvent(runtime, payload);
-        }
-    }
 }
 
 function normalizeRuntimeModel(value) {
@@ -163,6 +225,7 @@ function normalizeSessionMessage(raw) {
             .filter(Boolean)
             .slice(0, 500);
     }
+    if (raw.context === false) message.context = false;
     return message;
 }
 
@@ -348,9 +411,18 @@ function routeCompleteOutputLine(appState, tab, line) {
         try {
             const envelope = JSON.parse(normalized);
             if (envelope?.__webchatTask) {
-                const update = ingestTaskEvent(tab.workspaceDirectory, envelope);
-                if (!(tab.backgroundTaskIds instanceof Set)) tab.backgroundTaskIds = new Set();
-                tab.backgroundTaskIds.add(update.task.id);
+                const update = parseWebchatTaskState(envelope);
+                if (!update) return;
+                if (!(tab.webchatTasks instanceof Map)) tab.webchatTasks = new Map();
+                if (update.event === 'list') {
+                    tab.webchatTasks.clear();
+                    for (const task of update.tasks) tab.webchatTasks.set(task.id, task);
+                } else if (update.task) {
+                    tab.webchatTasks.set(update.task.id, {
+                        ...tab.webchatTasks.get(update.task.id),
+                        ...update.task,
+                    });
+                }
                 const sessionId = normalizeSessionId(envelope.sessionId);
                 const messageIndex = Number.isInteger(envelope.messageIndex) && envelope.messageIndex >= 0
                     ? envelope.messageIndex
@@ -419,9 +491,8 @@ export function flushPendingSseEvents(tab) {
 }
 
 export function hasRuntimeBackgroundTasks(tab) {
-    const taskIds = tab?.backgroundTaskIds instanceof Set ? [...tab.backgroundTaskIds] : [];
-    if (!tab?.workspaceDirectory || taskIds.length === 0) return false;
-    return hasOngoingTask(tab.workspaceDirectory, taskIds);
+    if (!(tab?.webchatTasks instanceof Map)) return false;
+    return [...tab.webchatTasks.values()].some((task) => task?.status === 'ongoing');
 }
 
 export function scheduleDisconnectedTabCleanup(tab, tabId, session, graceMs = STREAM_RECONNECT_GRACE_MS) {

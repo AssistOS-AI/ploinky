@@ -84,11 +84,10 @@ test('retired session routes still pass through authentication before returning'
     assert.equal(fs.existsSync(path.join(project, '.copilot_history')), false);
 });
 
-test('workspace task API is authenticated and returns materialized metadata', async () => {
+test('task data routes are absent because AchillesCLI owns task state', async () => {
     const appState = { sessions: new Map(), runtimes: new Map() };
     const response = await request(appState, '/webchat/tasks?workspace-dir=project');
-    assert.equal(response.statusCode, 200);
-    assert.deepEqual(JSON.parse(response.body), { ok: true, tasks: [] });
+    assert.equal(response.statusCode, 404);
 
     fs.rmSync(path.join(project, '.copilot_history'), { recursive: true, force: true });
     const denied = await request(appState, '/webchat/tasks?workspace-dir=project', { authenticated: false });

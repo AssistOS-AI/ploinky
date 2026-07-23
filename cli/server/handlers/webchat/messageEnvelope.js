@@ -1,5 +1,9 @@
 import { buildInvocationContextForProviderCall } from '../../mcp-proxy/index.js';
 
+export function normalizeWebchatPresentation(raw) {
+    return { visible: raw?.visible !== false };
+}
+
 export function parseInputEnvelope(rawBody) {
     const fallbackText = typeof rawBody === 'string' ? rawBody : '';
     try {
@@ -8,13 +12,19 @@ export function parseInputEnvelope(rawBody) {
             return {
                 text: typeof parsed.text === 'string' ? parsed.text : '',
                 attachments: Array.isArray(parsed.attachments) ? parsed.attachments : [],
-                references: sanitizeWebchatReferencesForEnvelope(parsed.references)
+                references: sanitizeWebchatReferencesForEnvelope(parsed.references),
+                presentation: normalizeWebchatPresentation(parsed.presentation),
             };
         }
     } catch (_) {
         // Fall back to plain text input.
     }
-    return { text: fallbackText, attachments: [], references: [] };
+    return {
+        text: fallbackText,
+        attachments: [],
+        references: [],
+        presentation: { visible: true },
+    };
 }
 
 export function sanitizeWebchatAttachmentsForEnvelope(attachments = []) {
@@ -72,7 +82,8 @@ function buildWebchatInvocationToken({ req, effectiveConfig, tabId, envelope }) 
                 tabId: String(tabId || ''),
                 text: typeof envelope?.text === 'string' ? envelope.text : '',
                 attachments: sanitizeWebchatAttachmentsForEnvelope(envelope?.attachments),
-                references: sanitizeWebchatReferencesForEnvelope(envelope?.references)
+                references: sanitizeWebchatReferencesForEnvelope(envelope?.references),
+                presentation: normalizeWebchatPresentation(envelope?.presentation),
             }
         });
         return invocation?.token || '';
@@ -109,7 +120,8 @@ export function serializeWebchatEnvelopeForAgent({ req, effectiveConfig, tabId, 
         __webchatMessage: 1,
         version: 1,
         text: (envelope && typeof envelope.text === 'string') ? envelope.text : String(fallbackText || ''),
-        attachments: sanitizeWebchatAttachmentsForEnvelope(envelope?.attachments)
+        attachments: sanitizeWebchatAttachmentsForEnvelope(envelope?.attachments),
+        presentation: normalizeWebchatPresentation(envelope?.presentation),
     };
     if (publicBaseUrl) payload.origin = { publicBaseUrl };
     if (sanitizedReferences.length) payload.references = sanitizedReferences;

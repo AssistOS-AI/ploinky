@@ -7,7 +7,6 @@ import {
 
 const TASK_VIEW_PATH_RE = /^(.*)\/tasks\/(task_[0-9a-f]{24})\/view$/;
 const match = TASK_VIEW_PATH_RE.exec(window.location.pathname);
-const basePath = match?.[1] || '/webchat';
 const taskId = match?.[2] || '';
 const agent = document.getElementById('taskAgent');
 const description = document.getElementById('taskDescription');
@@ -29,7 +28,7 @@ let logText = '';
 let logOffset = 0;
 let initialLoadComplete = false;
 let logSync = null;
-let refreshSync = null;
+let logResyncPending = false;
 let continuationSubmitting = false;
 let stopSubmitting = false;
 const pendingUpdates = [];
@@ -74,12 +73,9 @@ function applyTheme() {
     document.body.dataset.theme = theme;
 }
 
-function endpoint(relativePath, params = {}) {
-    const url = new URL(`${basePath}/${String(relativePath || '').replace(/^\/+/, '')}`, window.location.origin);
-    const current = new URLSearchParams(window.location.search);
-    for (const [key, value] of current.entries()) url.searchParams.append(key, value);
-    for (const [key, value] of Object.entries(params)) url.searchParams.set(key, String(value));
-    return `${url.pathname}${url.search}`;
+function requestCommand(command) {
+    if (window.parent === window) throw new Error('task_parent_unavailable');
+    window.parent.postMessage({ type: 'webchat-task-command', taskId, command }, window.location.origin);
 }
 
 function renderTask() {
@@ -118,29 +114,6 @@ function renderLog({ stickToEnd = true } = {}) {
     else log.scrollTop = previousScrollTop;
 }
 
-async function fetchJson(url, options = {}) {
-    const response = await fetch(url, { credentials: 'include', ...options });
-    const payload = await response.json().catch(() => ({}));
-    if (!response.ok || payload.ok === false) {
-        throw new Error(payload.error || `task_view_${response.status}`);
-    }
-    return payload;
-}
-
-async function refreshTask() {
-    if (refreshSync || task?.status !== 'ongoing') return refreshSync;
-    refreshSync = fetchJson(endpoint(`tasks/${encodeURIComponent(taskId)}/refresh`))
-        .then((payload) => {
-            applyUpdate(payload);
-            return syncLog(logOffset);
-        })
-        .catch(showLoadError)
-        .finally(() => {
-            refreshSync = null;
-        });
-    return refreshSync;
-}
-
 async function stopTask() {
     if (stopSubmitting || task?.status !== 'ongoing') return;
     stopSubmitting = true;
@@ -148,41 +121,33 @@ async function stopTask() {
     actionError.textContent = '';
     renderTask();
     try {
-        const payload = await fetchJson(endpoint(`tasks/${encodeURIComponent(taskId)}/stop`), {
-            method: 'POST',
-        });
-        applyUpdate(payload);
-        await syncLog(logOffset);
+        requestCommand(`/task stop ${taskId}`);
     } catch (stopError) {
+        stopSubmitting = false;
         actionError.hidden = false;
         actionError.textContent = `Unable to stop task: ${stopError?.message || stopError}`;
-    } finally {
-        stopSubmitting = false;
         renderTask();
     }
 }
 
-async function syncLog(offset = logOffset) {
+async function syncLog() {
     if (logSync) return logSync;
-    logSync = fetchJson(endpoint(`tasks/${encodeURIComponent(taskId)}/log`, { offset }))
-        .then((payload) => {
-            if (payload.reset || offset === 0) logText = typeof payload.text === 'string' ? payload.text : '';
-            else logText += typeof payload.text === 'string' ? payload.text : '';
-            logOffset = Number(payload.nextOffset) || 0;
-            renderLog();
-        })
-        .finally(() => {
-            logSync = null;
-        });
+    logSync = Promise.resolve().then(() => requestCommand(`/task view ${taskId}`)).finally(() => {
+        logSync = null;
+    });
     return logSync;
 }
 
 function applyLogUpdate(payload) {
     const merged = mergeTaskLogUpdate({ text: logText, offset: logOffset }, payload);
     if (merged.needsSync) {
-        void syncLog(logOffset)
-            .then(() => applyLogUpdate(payload))
-            .catch(showLoadError);
+        if (!logResyncPending) {
+            logResyncPending = true;
+            void syncLog().catch((syncError) => {
+                logResyncPending = false;
+                showLoadError(syncError);
+            });
+        }
         return;
     }
     if (merged.text === logText && merged.offset === logOffset) return;
@@ -194,6 +159,25 @@ function applyLogUpdate(payload) {
 function applyUpdate(payload) {
     if (payload?.task?.id !== taskId) return;
     task = { ...task, ...payload.task };
+    if (payload.event === 'action' && payload.action === 'stop') stopSubmitting = false;
+    if (payload.event === 'action' && payload.action === 'continue') {
+        continuationSubmitting = false;
+        if (payload.ok === true) {
+            continuationInput.value = '';
+            autoResizeContinuationInput();
+        }
+    }
+    if (task.status !== 'ongoing') stopSubmitting = false;
+    if (payload.event === 'action' && payload.ok === false) {
+        const target = payload.action === 'continue' ? continuationError : actionError;
+        target.hidden = false;
+        target.textContent = payload.error || 'Task action failed.';
+    }
+    if (payload.event === 'view' && payload.log) {
+        logText = typeof payload.log.text === 'string' ? payload.log.text : '';
+        logOffset = Number(payload.log.nextOffset) || 0;
+        logResyncPending = false;
+    }
     renderTask();
     applyLogUpdate(payload);
 }
@@ -213,20 +197,11 @@ async function submitContinuation(event) {
     continuationError.textContent = '';
     renderTask();
     try {
-        const payload = await fetchJson(endpoint(`tasks/${encodeURIComponent(taskId)}/continue`), {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ message }),
-        });
-        continuationInput.value = '';
-        autoResizeContinuationInput();
-        applyUpdate(payload);
-        await syncLog(logOffset);
+        requestCommand(`/task continue ${taskId} ${message}`);
     } catch (submitError) {
+        continuationSubmitting = false;
         continuationError.hidden = false;
         continuationError.textContent = `Unable to continue task: ${submitError?.message || submitError}`;
-    } finally {
-        continuationSubmitting = false;
         renderTask();
     }
 }
@@ -239,12 +214,7 @@ async function initialize() {
         return;
     }
     try {
-        const [tasksPayload] = await Promise.all([
-            fetchJson(endpoint('tasks')),
-            syncLog(0),
-        ]);
-        task = (Array.isArray(tasksPayload.tasks) ? tasksPayload.tasks : [])
-            .find((candidate) => candidate?.id === taskId) || null;
+        await syncLog();
     } catch (loadError) {
         showLoadError(loadError);
     } finally {
@@ -252,7 +222,6 @@ async function initialize() {
         renderTask();
         renderLog();
         for (const payload of pendingUpdates.splice(0)) applyUpdate(payload);
-        void refreshTask();
     }
 }
 
@@ -284,5 +253,4 @@ autoResizeContinuationInput();
 renderTask();
 renderLog();
 setInterval(renderTask, 1000);
-setInterval(() => void refreshTask(), 2000);
 void initialize();

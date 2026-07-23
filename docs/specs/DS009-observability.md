@@ -3,7 +3,7 @@ id: DS009
 title: Observability
 status: implemented
 owner: ploinky-team
-summary: Defines router and watchdog logging, runtime health reporting, and the boundary between operational telemetry and folder-local WebChat continuation state.
+summary: Defines router and watchdog logging, runtime health reporting, and the boundary between operational telemetry and agent-owned conversation and task state.
 ---
 
 # DS009 Observability
@@ -20,7 +20,7 @@ The router health endpoint at `/health` must report process uptime, PID, memory 
 
 Conversation continuation is agent-owned project data, not Ploinky operational telemetry. WebChat may retain the selected CLI's latest session snapshot in runtime memory for rendering and reconnect recovery, but Ploinky must not write conversation files or expose message bodies through Dashboard analytics.
 
-The same folder may contain `agent_tasks` metadata and bounded files under `task_logs/` for user-requested asynchronous agent work. This task state is part of the WebChat project workflow rather than router telemetry. The metadata journal must exclude credentials, invocation grants, raw tool arguments, and live log bodies; log content belongs only in the task-specific bounded files and the authenticated Tasks overlay.
+The same folder may contain selected-CLI-owned task metadata and logs for user-requested asynchronous agent work. This task state is project data rather than router telemetry. WebChat may retain validated task envelopes in runtime memory for the Tasks overlay and EventSource forwarding, but Ploinky must not write the task journal or log files. The selected CLI's persisted metadata must exclude credentials, invocation grants, and raw tool arguments.
 
 Operational logs must not intentionally record raw prompts or assistant replies. An agent-owned session store may contain conversation roles, text, timestamps, attachments, and references, but it remains outside Ploinky observability. The workspace owner remains responsible for the local filesystem trust boundary.
 

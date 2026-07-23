@@ -48,6 +48,7 @@ const moduleSuffix = `?test=${Date.now()}`;
 const {
     verifyDelegatedAgentToolCall,
     verifyDelegatedAgentTaskStatusCall,
+    verifyDelegatedAgentTaskCancelCall,
     buildInvocationContextForProviderCall,
 } = await import(`../../cli/server/mcp-proxy/index.js${moduleSuffix}`);
 const { deriveSubkey } = await import(`../../cli/utils/security/masterKey.js${moduleSuffix}`);
@@ -197,6 +198,35 @@ test('mcp proxy rejects delegated async task status polling for a different task
         taskId: 'task-tampered',
         assertionCache: createMemoryReplayCache(),
     }), /request hash mismatch/);
+});
+
+test('mcp proxy binds delegated task cancellation to the exact task id', () => {
+    const taskId = 'task-cancel-1';
+    const assertion = signAgentAssertion({
+        method: 'POST',
+        path: '/task/cancel',
+        targetAgent: TARGET_ROUTE,
+        tool: '__task_cancel__',
+        argumentsObj: { taskId },
+        env: envFor(SOURCE_AGENT),
+    });
+    const verified = verifyDelegatedAgentTaskCancelCall({
+        req: makeReq({ assertion }),
+        agentName: TARGET_ROUTE,
+        taskId,
+        assertionCache: createMemoryReplayCache(),
+    });
+    const ctx = buildInvocationContextForProviderCall({
+        req: { delegatedAgentVerified: verified },
+        agentName: TARGET_ROUTE,
+        toolName: '__task_cancel__',
+        toolArgs: { taskId },
+        method: 'POST',
+        path: '/task/cancel',
+    });
+    assert.equal(ctx.payload.sub, SOURCE_AGENT);
+    assert.equal(ctx.payload.path, '/task/cancel');
+    assert.equal(ctx.payload.tool, '__task_cancel__');
 });
 
 test('mcp proxy rejects a valid grant from the wrong source agent', () => {

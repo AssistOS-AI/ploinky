@@ -59,6 +59,21 @@ test('task log parsing strips runner prefixes and keeps stderr visually distinct
     ]);
 });
 
+test('task log presentation keeps continuation prompts visible before provider output', () => {
+    const parsed = parseTaskLog([
+        '[Continuation 2]',
+        'User: finish the tests',
+        '',
+        '[worker stdout] Provider output',
+    ].join('\n'));
+    assert.deepEqual(parsed, [
+        { text: '[Continuation 2]', stream: 'stdout' },
+        { text: 'User: finish the tests', stream: 'stdout' },
+        { text: '', stream: 'stdout' },
+        { text: 'Provider output', stream: 'stdout' },
+    ]);
+});
+
 test('task log presentation marks only the terminal result lines as final', () => {
     const text = 'Read package.json\nRan tests\nFinal answer\n';
     const finalOutputOffset = text.indexOf('Final answer');

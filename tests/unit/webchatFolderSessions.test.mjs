@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
+import { createNetwork, __testables as networkTestables } from '../../cli/server/webchat/network.js';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const read = (relative) => fs.readFileSync(path.join(ROOT, relative), 'utf8');
@@ -29,7 +30,7 @@ test('WebChat exposes folder-session controls and lazy history loading', () => {
     assert.match(template, /Click to load session history/);
 });
 
-test('WebChat exposes a workspace task overlay and generic task endpoints', () => {
+test('WebChat exposes a task overlay backed by AchillesCLI commands', () => {
     const template = read('cli/server/webchat/chat.html');
     const network = read('cli/server/webchat/network.js');
     const taskRoutes = read('cli/server/handlers/webchat/taskRoutes.js');
@@ -37,8 +38,7 @@ test('WebChat exposes a workspace task overlay and generic task endpoints', () =
         assert.match(template, new RegExp(`id="${id}"`));
     }
     assert.match(network, /addEventListener\('task-update'/);
-    assert.match(taskRoutes, /pathname === '\/tasks' && req\.method === 'GET'/);
-    assert.match(taskRoutes, /\/tasks\\\/\(task_/);
+    assert.doesNotMatch(taskRoutes, /pathname === '\/tasks'/);
     const messages = read('cli/server/webchat/messages.js');
     const presentation = read('cli/server/webchat/taskPresentation.js');
     const taskView = read('cli/server/webchat/taskView.js');
@@ -54,7 +54,74 @@ test('WebChat exposes a workspace task overlay and generic task endpoints', () =
     assert.match(presentation, /setInterval\(renderSummary, 1000\)/);
     assert.match(taskRoutes, /\/view\$/);
     assert.match(taskView, /webchat-task-update/);
+    assert.match(taskView, /webchat-task-command/);
     assert.doesNotMatch(taskView, /new EventSource/);
+});
+
+test('task control events resolve visible WebChat commands without waiting for chat text', () => {
+    assert.equal(networkTestables.resolvesVisibleTaskCommand({ event: 'list' }, '/tasks'), true);
+    assert.equal(networkTestables.resolvesVisibleTaskCommand({ event: 'view' }, '/task view task-1'), true);
+    assert.equal(networkTestables.resolvesVisibleTaskCommand({ event: 'update' }, '/tasks'), false);
+    assert.equal(networkTestables.resolvesVisibleTaskCommand({ event: 'list' }, ''), false);
+});
+
+test('a visible /tasks command clears Thinking and identifies its list response', async () => {
+    const previousEventSource = globalThis.EventSource;
+    const previousFetch = globalThis.fetch;
+    let eventSource;
+    const hidden = [];
+    const updates = [];
+
+    class FakeEventSource {
+        constructor() {
+            this.listeners = new Map();
+            eventSource = this;
+        }
+
+        addEventListener(name, listener) {
+            this.listeners.set(name, listener);
+        }
+
+        emit(name, payload) {
+            this.listeners.get(name)?.({ data: JSON.stringify(payload) });
+        }
+
+        close() {}
+    }
+
+    globalThis.EventSource = FakeEventSource;
+    globalThis.fetch = async () => ({ ok: true, status: 200 });
+    try {
+        const network = createNetwork({
+            TAB_ID: 'tab-1',
+            toEndpoint: (route) => route,
+            dlog: () => {},
+            showBanner: () => {},
+            hideBanner: () => {},
+            statusEl: null,
+            statusDot: null,
+            agentName: 'AchillesCLI',
+        }, {
+            addClientMsg: () => {},
+            addServerMsg: () => true,
+            showTypingIndicator: () => {},
+            hideTypingIndicator: (force) => hidden.push(force),
+            markUserInputSent: () => {},
+            onTaskUpdate: (payload, metadata) => updates.push({ payload, metadata }),
+        });
+
+        network.start();
+        network.sendCommand('/tasks');
+        eventSource.emit('task-update', { event: 'list', tasks: [] });
+
+        assert.deepEqual(hidden, [true]);
+        assert.equal(updates.length, 1);
+        assert.equal(updates[0].metadata.visibleCommand, '/tasks');
+        network.stop();
+    } finally {
+        globalThis.EventSource = previousEventSource;
+        globalThis.fetch = previousFetch;
+    }
 });
 
 test('WebChat tab identity is restored from sessionStorage before UUID fallback', () => {

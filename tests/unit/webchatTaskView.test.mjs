@@ -2,7 +2,6 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import test from 'node:test';
 
-import { __testables as taskRouteTestables } from '../../cli/server/handlers/webchat/taskRoutes.js';
 import { createSidePanel } from '../../cli/server/webchat/sidePanel.js';
 
 test('side panel forwards only the active task update to its same-origin iframe', (t) => {
@@ -61,7 +60,7 @@ test('side panel forwards only the active task update to its same-origin iframe'
     assert.equal(posted[0].message.payload.task.id, taskId);
 });
 
-test('task view exposes continuation only through the same local task route', () => {
+test('task view sends continuation through the AchillesCLI command bridge', () => {
     const source = fs.readFileSync(
         new URL('../../cli/server/webchat/taskView.js', import.meta.url),
         'utf8',
@@ -71,10 +70,13 @@ test('task view exposes continuation only through the same local task route', ()
         'utf8',
     );
     assert.match(html, /id="taskContinuationInput"/);
-    assert.match(source, /tasks\/\$\{encodeURIComponent\(taskId\)\}\/continue/);
+    assert.match(source, /`\/task continue \$\{taskId\} \$\{message\}`/);
     assert.match(source, /TERMINAL_STATUSES = new Set\(\['finished', 'stopped', 'error'\]\)/);
     assert.match(source, /TERMINAL_STATUSES\.has\(task\?\.status\)/);
     assert.match(source, /applyUpdate\(payload\)/);
+    assert.match(source, /let logResyncPending = false/);
+    assert.match(source, /if \(!logResyncPending\)/);
+    assert.doesNotMatch(source, /\.then\(\(\) => applyLogUpdate\(payload\)\)/);
 });
 
 test('task continuation input submits on Enter and auto-resizes without manual resizing', () => {
@@ -97,7 +99,7 @@ test('task continuation input submits on Enter and auto-resizes without manual r
     );
 });
 
-test('task view stops ongoing work through the local task route', () => {
+test('task view stops ongoing work through the AchillesCLI command bridge', () => {
     const source = fs.readFileSync(
         new URL('../../cli/server/webchat/taskView.js', import.meta.url),
         'utf8',
@@ -109,86 +111,8 @@ test('task view stops ongoing work through the local task route', () => {
     assert.match(html, /id="taskStop"/);
     assert.match(source, /task\?\.status === 'ongoing'/);
     assert.match(source, /remoteStatus \|\| ''\).*=== 'cancelling'/);
-    assert.match(source, /tasks\/\$\{encodeURIComponent\(taskId\)\}\/stop/);
+    assert.match(source, /`\/task stop \$\{taskId\}`/);
     assert.match(source, /Stopping…/);
-});
-
-test('task continuation activates a missing provider globally and waits for readiness', async () => {
-    let route = null;
-    const activations = [];
-    const readiness = [];
-    const resolved = await taskRouteTestables.ensureContinuationAgentRoute('workerAgent', {
-        resolveRoute() {
-            return route;
-        },
-        activateAgent(agent) {
-            activations.push({ agent, mode: 'global' });
-            route = {
-                agentName: 'workerAgent',
-                route: { hostPort: 32123 },
-            };
-            return {
-                repoName: 'workers',
-                shortAgentName: 'workerAgent',
-                runMode: 'global',
-            };
-        },
-        readManifest() {
-            return { readiness: { protocol: 'mcp' } };
-        },
-        async waitUntilReady(agentRoute, options) {
-            readiness.push({ agentRoute, options });
-            return true;
-        },
-    });
-
-    assert.equal(resolved, route);
-    assert.deepEqual(activations, [{ agent: 'workerAgent', mode: 'global' }]);
-    assert.equal(readiness.length, 1);
-    assert.equal(readiness[0].options.protocol, 'mcp');
-    assert.equal(readiness[0].options.timeoutMs, 15_000);
-});
-
-test('concurrent task continuations share one provider activation', async () => {
-    let route = null;
-    let activationCount = 0;
-    let releaseActivation;
-    const activationGate = new Promise((resolve) => {
-        releaseActivation = resolve;
-    });
-    const options = {
-        resolveRoute() {
-            return route;
-        },
-        async activateAgent() {
-            activationCount += 1;
-            await activationGate;
-            route = {
-                agentName: 'sharedWorker',
-                route: { hostPort: 32124 },
-            };
-            return {
-                repoName: 'workers',
-                shortAgentName: 'sharedWorker',
-                runMode: 'global',
-            };
-        },
-        readManifest() {
-            return { readiness: { protocol: 'mcp' } };
-        },
-        async waitUntilReady() {
-            return true;
-        },
-    };
-
-    const first = taskRouteTestables.ensureContinuationAgentRoute('sharedWorker', options);
-    const second = taskRouteTestables.ensureContinuationAgentRoute('sharedWorker', options);
-    releaseActivation();
-    const [firstRoute, secondRoute] = await Promise.all([first, second]);
-
-    assert.equal(activationCount, 1);
-    assert.equal(firstRoute, route);
-    assert.equal(secondRoute, route);
 });
 
 test('generic side panel stops above the floating composer and scrolls its content', () => {
@@ -334,14 +258,4 @@ test('workspace HTML files use a sandboxed iframe', (t) => {
 
     assert.ok(iframe);
     assert.equal(iframe.attributes.get('sandbox'), '');
-});
-test('task refresh extracts terminal text separately from log transport', () => {
-    assert.equal(taskRouteTestables.taskResultText({
-        result: {
-            content: [
-                { type: 'text', text: 'Final answer' },
-                { type: 'image', data: 'ignored' },
-            ],
-        },
-    }), 'Final answer');
 });
