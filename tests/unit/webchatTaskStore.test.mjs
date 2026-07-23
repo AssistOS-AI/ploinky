@@ -16,12 +16,6 @@ import {
     hasRuntimeBackgroundTasks,
     routeWorkspaceRuntimeOutput,
 } from '../../cli/server/handlers/webchat/runtimeState.js';
-import {
-    appendSessionTurn,
-    appendToAssistantMessage,
-    ensureCurrentSession,
-    loadSession,
-} from '../../cli/server/webchat/sessionStore.js';
 
 function workspace() {
     return fs.mkdtempSync(path.join(os.tmpdir(), 'webchat-tasks-'));
@@ -246,45 +240,28 @@ test('structured task output is persisted and broadcast without entering chat hi
     assert.equal(hasRuntimeBackgroundTasks(tab), true);
 });
 
-test('started tasks become separate ordered items after the active assistant placeholder', (t) => {
+test('started task placement supplied by AchillesCLI is forwarded without Ploinky session writes', (t) => {
     const root = workspace();
     t.after(() => fs.rmSync(root, { recursive: true, force: true }));
-    const session = ensureCurrentSession(root);
-    const turn = appendSessionTurn(root, session.sessionId, { text: 'Build project' });
+    const sessionId = '123e4567-e89b-42d3-a456-426614174000';
     const writes = [];
     const tab = {
         workspaceDirectory: root,
-        sessionId: session.sessionId,
         backgroundTaskIds: new Set(),
         subscribers: new Map([['client', { res: { write: (value) => writes.push(value) } }]]),
-        workspaceHistory: {
-            workspaceDirectory: root,
-            sessionId: session.sessionId,
-            lastAssistantMessageIndex: turn.assistantMessageIndex,
-        },
     };
     const appState = { runtimes: new Map([['runtime', tab]]) };
     routeWorkspaceRuntimeOutput(appState, tab, `${JSON.stringify({
         __webchatTask: 1,
         event: 'started',
         task: event().task,
+        sessionId,
+        messageIndex: 2,
     })}\n`);
-    const secondTaskId = 'task_abcdefabcdefabcdefabcdef';
-    routeWorkspaceRuntimeOutput(appState, tab, `${JSON.stringify({
-        __webchatTask: 1,
-        event: 'started',
-        task: event({ id: secondTaskId, remoteTaskId: 'remote-2' }).task,
-    })}\n`);
-    appendToAssistantMessage(root, session.sessionId, turn.assistantMessageIndex, 'Tasks started');
 
-    const messages = loadSession(root, session.sessionId).messages;
-    assert.equal(messages[1].text, 'Tasks started');
-    assert.deepEqual(messages.slice(2), [
-        { type: 'task', taskId: event().task.id },
-        { type: 'task', taskId: secondTaskId },
-    ]);
     const wire = writes.join('');
-    assert.match(wire, new RegExp(`"sessionId":"${session.sessionId}"`));
+    assert.match(wire, new RegExp(`"sessionId":"${sessionId}"`));
     assert.match(wire, /"messageIndex":2/);
-    assert.match(wire, /"messageIndex":3/);
+    assert.equal(fs.existsSync(path.join(root, '.achilles-cli')), false);
+    assert.equal(fs.existsSync(path.join(root, '.copilot_history', `${sessionId}.json`)), false);
 });

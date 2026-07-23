@@ -2,7 +2,7 @@ import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
 
-import { ensureHistoryDirectory } from './sessionStore.js';
+import { ensureTaskHistoryDirectory } from './historyDirectory.js';
 
 const TASK_ID_RE = /^task_[0-9a-f]{24}$/;
 const JOURNAL_NAME = 'agent_tasks';
@@ -27,7 +27,7 @@ function assertRegularFileOrMissing(filePath) {
 }
 
 function ensureTaskStorage(workspaceDirectory) {
-    const { historyDirectory } = ensureHistoryDirectory(workspaceDirectory);
+    const { historyDirectory } = ensureTaskHistoryDirectory(workspaceDirectory);
     const logDirectory = path.join(historyDirectory, LOG_DIRECTORY_NAME);
     try {
         const stat = fs.lstatSync(logDirectory);

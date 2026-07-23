@@ -66,17 +66,19 @@ test('WebChat tab identity is restored from sessionStorage before UUID fallback'
     assert.match(dom, /webchat_tab_id:/);
 });
 
-test('WebChat session API is authenticated before folder files are handled', () => {
+test('WebChat delegates conversation sessions to the agent protocol', () => {
     const handler = read('cli/server/handlers/webchat/index.js');
-    const conversationRoutes = read('cli/server/handlers/webchat/conversationRoutes.js');
     const runtimeRoutes = read('cli/server/handlers/webchat/runtimeRoutes.js');
-    const authGate = handler.indexOf('if (!authorized(req))');
-    const sessionDispatch = handler.indexOf('await handleConversationRoute');
-    assert.ok(authGate >= 0);
-    assert.ok(sessionDispatch > authGate);
-    assert.match(conversationRoutes, /pathname === '\/sessions' && req\.method === 'GET'/);
-    assert.match(runtimeRoutes, /buildRuntimeKey\(workspaceDirectory, currentSession\.sessionId/);
-    assert.match(runtimeRoutes, /ttyFactory\.create\(ssoUser, \{[\s\S]*?hasHistory: currentSession\.messages\.length > 0/);
+    const runtimeState = read('cli/server/handlers/webchat/runtimeState.js');
+    const sessions = read('cli/server/webchat/sessions.js');
+    assert.doesNotMatch(handler, /handleConversationRoute|ensureCurrentSession/);
+    assert.match(runtimeRoutes, /buildRuntimeKey\(workspaceDirectory, effectiveConfig, agentQuery\)/);
+    assert.match(runtimeState, /WEBCHAT_SESSION_FLAG = '__webchatSession'/);
+    assert.match(sessions, /sendQuickCommand\('\/session'\)/);
+    assert.doesNotMatch(sessions, /sendQuickCommand\('\/sessions'\)/);
+    assert.match(sessions, /sendQuickCommand\('\/session new'\)/);
+    assert.match(sessions, /`\/session resume \$\{session\.sessionId\}`/);
+    assert.doesNotMatch(readWebchatHandlers(), /sessionStore\.js/);
     assert.doesNotMatch(readWebchatHandlers(), /PLOINKY_WEBCHAT_SESSION_ID/);
 });
 

@@ -34,19 +34,15 @@ Ploinky is a workspace-local runtime for repository-backed agents.
 
 ## Web surfaces
 
-- `/webchat`: chat surface over a folder-scoped TTY runtime. It keeps selectable
-  continuation JSON under `<cwd>/.copilot_history/`; each submitted turn stores
-  an assistant placeholder whose optional `progress` field is an ordered string
-  array updated from agent progress reasons before final text arrives. Persisted
-  progress remains UI-only and existing messages render only through
-  `Click to load session history`. A newly started agent receives only
-  `PLOINKY_WEBCHAT_HAS_HISTORY=1` or `0` as conversation-start metadata, while
-  the folder session id remains router-owned. An envelope-aware recreated runtime
-  receives the prior user/assistant turns once as ordered `{ role, message }`
-  history with the current message kept separate; plain-text CLIs retain the
-  legacy delimited fallback. When opened as
+- `/webchat`: chat surface over a workspace-scoped TTY runtime. Conversation
+  sessions are owned by the selected CLI, which can publish `current`, `list`,
+  and `selected` snapshots through the generic `__webchatSession` protocol.
+  WebChat validates and retains the latest snapshot only in memory, renders
+  existing messages through `Click to load session history`, and sends
+  `/session`, `/session new`, or `/session resume <id>` for session controls.
+  Ploinky does not persist conversation files or hydrate the CLI's agent. When opened as
   `/webchat?agent=<name>&...`, the router forwards additional query parameters
-  except router-owned `tabId` and `sessionId` to `ploinky cli <name>` as
+  except router-owned `tabId` to `ploinky cli <name>` as
   long-form CLI flags encoded as `--key=value`.
 - `/dashboard`: operational management surface for status, logs, agents, and runtime control.
 - `/status`: read-only browser view that shells out to `ploinky status` and adds router-side server and agent summaries.

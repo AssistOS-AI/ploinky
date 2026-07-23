@@ -23,10 +23,8 @@ import {
     handleLogout,
     redirectToRouterLogin
 } from './browserSession.js';
-import { handleConversationRoute } from './conversationRoutes.js';
 import { handleRuntimeRoute } from './runtimeRoutes.js';
 import { handleTaskRoute } from './taskRoutes.js';
-import { ensureCurrentSession } from '../../webchat/sessionStore.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -103,7 +101,6 @@ export async function handleWebChat(req, res, appConfig, appState) {
     const workspaceBase = resolveWebchatWorkspaceBase(parsedUrl);
     const workspaceDirectory = workspaceBase.base;
 
-    if (await handleConversationRoute({ pathname, req, res, workspaceDirectory, appState })) return;
     if (await handleTaskRoute({
         pathname,
         req,
@@ -138,12 +135,6 @@ export async function handleWebChat(req, res, appConfig, appState) {
     }
 
     if (pathname === '/' || pathname === '/index.html') {
-        try {
-            ensureCurrentSession(workspaceDirectory);
-        } catch (error) {
-            res.writeHead(500, { 'Content-Type': 'text/plain', 'Cache-Control': 'no-store' });
-            return res.end(`Unable to initialize WebChat history: ${error?.message || 'session_store_unavailable'}`);
-        }
         const html = renderTemplate(['chat.html', 'index.html'], {
             '__ASSET_BASE__': `/${appName}/assets`,
             '__AGENT_NAME__': effectiveConfig.agentName || '',

@@ -28,6 +28,8 @@ Host sandbox teardown must be batch-oriented when multiple sandboxed agents are 
 
 Each agent execution environment must expose the shared `Agent/` payload at `/Agent` for container backends or the equivalent runtime location for sandbox backends. If a manifest does not provide an explicit agent command, the runtime must fall back to `Agent/server/AgentServer.sh`, which supervises `AgentServer.mjs` and restarts it after exit.
 
+Non-TTY `ploinky cli` launchers used by WebChat must remain attached only while their inner container or host-sandbox CLI process is alive. The selected backend's interactive exit status must propagate through `runCli`, and the one-shot Ploinky wrapper must terminate after attach returns. This lets the supervising WebChat TTY observe the real lifecycle instead of retaining a live wrapper with no agent process behind it.
+
 Code and skills mounts must be profile-aware. The active profile defaults to `dev`, where code and skills are writable unless overridden. In `qa` and `prod`, code and skills default to read-only unless the profile explicitly relaxes them. The profile merge order is `profiles.default` plus the selected profile overlay. Workspace-root write access must not bypass read-only code, dependency-cache, staged Agent library, or protected Ploinky state paths.
 
 Profiles may declare `additionalServerPort` for an agent-owned browser service, usually as a bare port such as `3000`; `127.0.0.1:3000` is also accepted. The active profile overlay replaces the default profile's additional server declaration as one selected upstream. Container runtimes must record the declaration as a container-local upstream unless the effective network is `network.mode: "host"`; host sandbox runtimes must record it as host-local because they share the host network. This declaration must not imply an `openPorts` publish and must not replace the default AgentServer route used for MCP, agent-card, and readiness.
@@ -63,6 +65,11 @@ Host networking changes the agent's port surface, its DNS resolution, and the wa
 
 Response:
 `stop`, `shutdown`, and `destroy` are workspace-level lifecycle operations. If Ploinky waited for each `bwrap` or Seatbelt process before signaling the next one, one stuck agent could keep the rest of the workspace running for the full timeout. Batch signaling gives every selected sandbox the same shutdown window and keeps the total wait bounded by one shared deadline.
+
+### Question #5: Why must a non-TTY CLI wrapper terminate when its inner attach ends?
+
+Response:
+WebChat supervises the Ploinky wrapper process and cannot otherwise observe that a nested `podman exec`, Bubblewrap, or Seatbelt CLI has ended. Propagating the attach status and terminating the one-shot wrapper turns the existing process-close signal into an accurate runtime-health signal, allowing WebChat to restart or replace the selected CLI without introducing an agent-specific heartbeat.
 
 ## Conclusion
 

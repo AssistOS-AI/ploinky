@@ -43,7 +43,16 @@ test('applySlashSelectionToValue ignores slashes that are not at the start', () 
 
 test('slash provider loads MCP catalog with streamable HTTP headers and preserves slashes in arguments', async () => {
     const originalFetch = globalThis.fetch;
+    const originalDocument = globalThis.document;
     const requests = [];
+    globalThis.document = {
+        body: {
+            dataset: {
+                agentQuery: '',
+                workdir: '/workspace/project',
+            },
+        },
+    };
     globalThis.fetch = async (url, options = {}) => {
         const headers = new Headers(options.headers);
         const payload = JSON.parse(options.body || '{}');
@@ -103,6 +112,8 @@ test('slash provider loads MCP catalog with streamable HTTP headers and preserve
         assert.ok(requests.every(({ headers }) =>
             headers.get('accept') === 'application/json, text/event-stream'
         ));
+        const catalogRequest = requests.find(({ payload }) => payload.method === 'tools/call');
+        assert.equal(catalogRequest.payload.params.arguments.dir, '/workspace/project');
         assert.deepEqual(
             provider.getSuggestions('/model anthropic/claude', '/model anthropic/claude'.length)
                 .map((suggestion) => suggestion.insertText),
@@ -111,6 +122,7 @@ test('slash provider loads MCP catalog with streamable HTTP headers and preserve
         assert.deepEqual(provider.getSuggestions('text /model anthropic', 21), []);
     } finally {
         globalThis.fetch = originalFetch;
+        globalThis.document = originalDocument;
     }
 });
 
@@ -476,6 +488,37 @@ test('buildSuggestions supports subcommand argument completions', () => {
         label: '/remove skill admin-flow',
         insertText: '/remove skill admin-flow ',
         description: 'Admin flow'
+    }]);
+});
+
+test('buildSuggestions displays session names while inserting resume session ids', () => {
+    const sessionId = '123e4567-e89b-42d3-a456-426614174000';
+    const suggestions = buildSuggestions([{
+        name: '/session',
+        description: 'Select a conversation session',
+        subCommands: [{
+            name: 'resume',
+            description: 'Resume a saved session',
+            argCompletions: [{
+                value: sessionId,
+                label: 'Review authentication flow',
+                description: `${sessionId} · 2 hours ago`,
+            }],
+        }],
+    }], {
+        currentToken: 'session',
+        hasSubToken: true,
+        subToken: 'resume ',
+    });
+
+    assert.deepEqual(suggestions.map((suggestion) => ({
+        label: suggestion.label,
+        insertText: suggestion.insertText,
+        description: suggestion.description,
+    })), [{
+        label: '/session resume Review authentication flow',
+        insertText: `/session resume ${sessionId} `,
+        description: `${sessionId} · 2 hours ago`,
     }]);
 });
 

@@ -147,7 +147,7 @@ const network = createNetwork({
     hideTypingIndicator: messages.hideTypingIndicator,
     markUserInputSent: messages.markUserInputSent,
     addRemoteUserMessage: (message, payload) => sessionController?.addRemoteUserMessage(message, payload),
-    onSessionChanged: (session) => sessionController?.handleExternalSessionChange(session),
+    onSessionState: (payload) => sessionController?.handleSessionState(payload),
     onTaskUpdate: (payload) => {
         taskController?.handleUpdate(payload);
         sidePanelApi.postTaskUpdate(payload);
@@ -160,7 +160,6 @@ const network = createNetwork({
 });
 
 sessionController = createSessionController({
-    toEndpoint,
     elements: {
         sessionsBtn,
         historyGate,
@@ -672,13 +671,8 @@ document.addEventListener('keydown', (event) => {
     }
 });
 
-(async () => {
-    try {
-        await sessionController.bootstrap();
-    } catch (error) {
-        showBanner(`Session initialization failed: ${error.message}`, 'err');
-        return;
-    }
+(() => {
+    sessionController.bootstrap();
     composerAutocomplete.refresh();
     network.start();
 })();

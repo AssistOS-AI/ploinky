@@ -30,59 +30,21 @@ For `/webchat`, the router must treat `agent` as an explicit agent-selection que
 
 WebChat must remain a generic transport. It must not hardcode optional catalog agent ids, backend tags, MCP tool names, or domain-specific dispatch logic. Query parameters such as `feature-mode`, `forward-envelope`, or future agent-owned options are ordinary target-agent launch flags once they pass the router-reserved parameter filter. Their interpretation belongs to the selected agent CLI or to an explicitly configured downstream integration, not to Ploinky's router or WebChat handler.
 
-When `/webchat` is launched with `forward-envelope=1`, messages may be written to the target TTY as the WebChat JSON envelope instead of plain text. The envelope may include sanitized attachment metadata, sanitized structured references (currently only `kind: "workspace-path"` records with `path`, `type`, and optional `label`), role-separated continuation history shaped as ordered `{ role, message }` records, a sanitized public origin hint derived from the incoming WebChat request (`origin.publicBaseUrl`), and a short-lived router-minted invocation token scoped to the selected chat agent, allowing that agent to perform delegated MCP calls through the router without WebChat naming the downstream provider. The server, not the browser, must derive continuation history from the selected folder session, and the invocation token must bind that history together with the current text and resource metadata. The public origin hint must be limited to an `http` or `https` origin and is intended only for same-origin user-facing links back through the router. Reference paths must be workspace-relative; the server must drop entries containing absolute paths, traversal segments, NUL bytes, or reserved secret-file names before forwarding the envelope. Target CLIs that opt into this flag must tolerate `__webchatMessage` envelopes and normalize them before invoking their normal prompt flow; CLIs that do not recognize optional envelope fields must ignore them safely.
+When `/webchat` is launched with `forward-envelope=1`, messages may be written to the target TTY as the WebChat JSON envelope instead of plain text. The envelope may include sanitized attachment metadata, sanitized structured references (currently only `kind: "workspace-path"` records with `path`, `type`, and optional `label`), a sanitized public origin hint derived from the incoming WebChat request (`origin.publicBaseUrl`), and a short-lived router-minted invocation token scoped to the selected chat agent. It must not include conversation history: session persistence and one-time MainAgent hydration belong to the selected CLI. The public origin hint must be limited to an `http` or `https` origin. Reference paths must be workspace-relative; the server must drop entries containing absolute paths, traversal segments, NUL bytes, or reserved secret-file names before forwarding the envelope.
 
-WebChat conversation identity must be scoped to the canonical working directory
-resolved from `workspace-dir`/`workspaceDir` or confined `dir`. The router must
-create or reuse `<cwd>/.copilot_history/`, store one JSON file per conversation,
-and keep the selected conversation id in `.copilot_history/current_session.json`.
-Ordinary stored messages contain role, text, timestamp, attachments, and
-references. Assistant messages created for a user turn may additionally contain
-`progress`, whose value must be an ordered array of non-empty strings. A task
-reference is instead stored as its own conversation item containing exactly a
-validated `{ "type": "task", "taskId": "task_..." }` shape, with no role or
-text. Task status and log content must not be copied into the session JSON.
-Writes must be atomic, malformed session files must not appear in the selector,
-and a symlinked history directory must be rejected.
+WebChat is a session presentation and transport surface, not the conversation owner. Ploinky must not create conversation files, a current-conversation pointer, or conversation REST routes. A compatible selected CLI may publish version-1 `__webchatSession` line envelopes with `current`, `list`, or `selected` events. `current` and `selected` carry a complete validated session snapshot plus selector summary; `list` carries the current id and bounded summaries. Ploinky must intercept these control lines before ordinary assistant rendering, retain only the latest non-list snapshot in runtime memory, expose them through the `session-state` EventSource event, and replay that snapshot to reconnecting subscribers. It must never persist the supplied conversation data.
 
-When WebChat accepts a non-empty user turn, it must persist the user message and
-an immediately following assistant placeholder in one session update before
-writing the request to the TTY. The placeholder starts with empty `text` and
-empty `progress`. Final output updates the placeholder text, while an interrupted
-turn may retain an empty final text and any progress accumulated before
-interruption. Legacy messages without `progress` remain valid and must not gain
-the property during normalization.
+The `Sessions` button must remain unavailable until the selected CLI advertises session state. Opening it sends `/session` to the CLI and renders the returned `list`; `New` sends `/session new`; selecting an existing entry sends `/session resume <session-id>`. A compatible structured command catalog may attach session-id argument completions to the `resume` subcommand; WebChat must render each completion's human-readable label while inserting its opaque value. These commands are control actions and must not be rendered as user turns. A `selected` response immediately replaces the browser transcript with the supplied session. The initial `current` response retains lazy history rendering: a non-empty snapshot presents `Click to load session history` as a centered standalone button, and clicking it renders the already received snapshot without a REST request.
 
-WebChat must suppress protocol envelope echoes and an explicit readline prompt
-echo shaped as `you> <submitted text>` before either persistence or browser
-broadcast. It must not classify ordinary assistant output as an echo merely
-because that output is identical to the submitted user text.
+WebChat's EventSource stream must tolerate brief browser reconnects without killing the target TTY. Runtime identity is the canonical working directory, selected agent, and launch configuration; conversation selection must not replace the TTY runtime. `tabId` identifies only a browser client and must be recovered from `sessionStorage` on refresh. A runtime may have multiple SSE subscribers and remains alive for the bounded reconnect grace window after the last subscriber leaves. The latest session-state, runtime-state, and pending-interaction snapshots are replayed after reconnect.
 
-The authenticated session API consists of `GET /webchat/sessions`, `POST /webchat/sessions`, `PUT /webchat/sessions/current`, and `GET /webchat/sessions/<session-id>`. Listing returns the current id and selector metadata without message bodies or counts. Full history is returned only by the per-session GET route. Selector entries expose the first user-message preview and update timestamp; the browser renders that timestamp as relative time.
+Runtime reuse must be conditional on TTY health. A runtime whose child has exited, whose stdin is no longer writable, or whose write operation fails must be disposed and removed from the workspace runtime map. `POST /webchat/input` must write to the selected CLI before broadcasting the optimistic user-message event and must return `409` rather than `204` when delivery fails. A later EventSource reconnect must create a replacement process while preserving the workspace-and-agent runtime identity for healthy processes.
 
-WebChat's EventSource stream must tolerate brief browser reconnects without killing the target TTY. Runtime identity is the canonical working directory, selected folder session, selected agent, and launch configuration; `tabId` identifies only a browser client and must be recovered from `sessionStorage` on refresh. A runtime may have multiple SSE subscribers and remains alive for the bounded reconnect grace window after the last subscriber leaves. Output produced without a subscriber is recovered from folder history on demand rather than replayed automatically from an in-memory tab buffer.
-
-WebChat may accept a generic `__webchatRuntimeState` line envelope from the selected CLI. Version 1 carries an optional selected `model` string or `null`; the envelope must be intercepted before ordinary assistant output, must not enter conversation history, and must be exposed to connected browsers through the `runtime-state` EventSource event. The current runtime-state snapshot must remain memory-only and must be sent to a reconnecting subscriber. The header may show a non-empty model beside the selected agent name and must hide the badge when the model is `null`. Ploinky must not read an agent-owned settings file, infer an effective provider model, or persist this runtime state in folder-session JSON.
-
-Version 1 runtime state may also carry a `runtimeInstanceId` generated once by the selected CLI process as a version-4 UUID. Ploinky must treat this value as an internal process-lifetime marker, must not expose it in browser runtime-state events, and must not persist it in folder-session JSON. The first valid identifier establishes the live process identity. A later identifier change on the same WebChat runtime means that the CLI process was replaced: Ploinky must reload the runtime's selected folder session, rebuild structured and plain-text continuation forms, clear any process-local pending interaction, and rearm one-time continuation delivery for the next non-slash message. Repeated state from the same identifier, including model changes and browser EventSource reconnects, must not rearm history. Agents that omit the optional identifier retain the version-1 compatibility behavior without process-replacement detection.
-
-WebChat must not render existing messages automatically after refresh. A non-empty session presents `Click to load session history` as a centered standalone button inside the scrollable message stream, not as a chat item, while the composer remains usable and new turns append to the current session. This item is browser-only: it must not be written to folder history, sent to the agent, or included in continuation context. Activating it removes it immediately and loads the real history; a failed request may restore it so the user can retry. The `Sessions` header control opens one selector whose first item is the emphasized `New` action; activating it creates and selects an empty session. The remaining items list sessions by recent activity using a first-message preview and relative time, without agent or message-count metadata. Selecting an existing entry makes it current and loads it. Session changes and new turns must be visible to other connected clients using the same working directory.
+WebChat may accept a generic `__webchatRuntimeState` line envelope from the selected CLI. Version 1 carries only an optional selected `model` string or `null`; the envelope must be intercepted before ordinary assistant output and exposed through the `runtime-state` EventSource event. The current runtime-state snapshot remains memory-only and is sent to reconnecting subscribers. The header may show a non-empty model beside the selected agent name and must hide the badge when the model is `null`. Ploinky must not read an agent-owned settings file, infer an effective provider model, or use a process-instance identifier to coordinate conversation restoration.
 
 The `Tasks` and `Sessions` controls in the WebChat header must use a darker green hover fill that remains visually consistent with the green header, rather than inheriting the theme's neutral panel-hover color.
 
-When a folder session has history but no surviving runtime, WebChat must restore
-context without replaying historical user inputs as separate TTY commands. For
-an envelope-aware agent, prior user content and final assistant text must be sent
-once as an ordered `{ role, message }` history array while the first new non-slash
-message remains in the envelope's separate `text` field. Synthetic transcript
-delimiters must not enter that structured history. A plain-text agent retains the
-legacy delimited context block as a compatibility fallback. Progress strings,
-task items, and assistant placeholders with no final content must remain UI-only
-and must not enter either representation. Slash commands remain unchanged and
-defer restoration until a later conversational message. This mechanism must
-remain generic and must not special-case AchillesCLI or another target agent.
-
-Every WebChat CLI process must receive `PLOINKY_WEBCHAT_HAS_HISTORY=1` when the selected folder session already contains messages, otherwise `0`. This variable is the allowlisted startup contract for local and containerized agents; the folder session id remains router-owned and must not be forwarded through the process environment. Arbitrary router environment variables must not be forwarded with the history flag. Agents that generate new-conversation startup content should skip it when history exists. Ploinky must not expose message bodies or history file paths through the process environment.
+The selected CLI must restore its own conversation state whenever its process starts. Ploinky must not deliver role-separated history, delimited continuation text, a selected conversation id, or a `PLOINKY_WEBCHAT_HAS_HISTORY` environment flag. Slash commands and natural-language prompts travel over the same TTY, while the selected CLI decides which inputs are conversational and when stored history is supplied to its agent implementation.
 
 WebChat must provide a generic composer autocomplete surface driven by trigger providers. The composer controller owns menu lifecycle, keyboard navigation (Arrow Up/Down, Enter, Tab, Escape), pointer selection, grouped rendering, positioning, and insertion. Arrow Up/Down navigation must keep the active option inside the visible viewport of the scrollable menu. Trigger providers supply suggestions:
 
@@ -91,8 +53,8 @@ WebChat must provide a generic composer autocomplete surface driven by trigger p
 Selected workspace-path tokens should be visually emphasized in the composer and in rendered user messages when their structured reference metadata is available, while preserving the plain textarea value submitted to the selected chat agent.
 
 Assistant messages must enhance recognizable workspace file paths after Markdown
-rendering without modifying the raw message stored in folder history or supplied
-to continuation context. Detection must cover cwd-relative paths with supported
+rendering without modifying the raw message supplied by the selected CLI.
+Detection must cover cwd-relative paths with supported
 document, text, source, image, PDF, or HTML extensions. Inline-code paths may
 contain spaces, while fenced code blocks, external links, URLs, traversal paths,
 and host-absolute paths must not be rewritten. Existing relative Markdown file
@@ -121,23 +83,20 @@ The session upload directory is a per-session UX convenience scope. It must not 
 
 WebChat must also expose a Cancel button during active agent processing. The Cancel button sends a raw control sequence (ESC, `\x1b`) to the agent's TTY session via a dedicated `/webchat/control` endpoint. The agent must interpret this as an interrupt signal and abort the current operation. The Cancel button replaces the Send button while processing is active and reverts when the agent produces output or the session closes.
 
-WebChat may receive a generic `__webchatInteraction` line envelope from the selected CLI while a turn is running. Version 1 carries a unique interaction id, a kind, bounded title/message/detail text, an ordered list of option ids and labels, and one default option id. The runtime must intercept valid envelopes before transcript rendering or history capture, retain only the currently pending interaction in memory, emit it as a named `interaction-request` SSE event, and replay the pending snapshot after EventSource reconnect. A matching `__webchatInteractionResolved` envelope clears that volatile state and emits `interaction-resolved`.
+WebChat may receive a generic `__webchatInteraction` line envelope from the selected CLI while a turn is running. Version 1 carries a unique interaction id, a kind, bounded title/message/detail text, an ordered list of option ids and labels, and one default option id. The runtime must intercept valid envelopes before transcript rendering, retain only the currently pending interaction in memory, emit it as a named `interaction-request` SSE event, and replay the pending snapshot after EventSource reconnect. A matching `__webchatInteractionResolved` envelope clears that volatile state and emits `interaction-resolved`.
 
 While an interaction is active, the browser must disable ordinary prompt submission and show a dedicated choice selector above the composer. Arrow Up/Down moves through the agent-declared order with wrapping, Enter submits the selected option, and pointer selection submits the clicked option. The default choice must be selected on first render. The selector is control UI: its text and response must not become chat messages.
 
-The browser submits the decision to authenticated `POST /webchat/interaction` with the active tab id, session id, interaction id, and option id. The route must require an active subscriber for the same authenticated runtime, reject unknown or stale interactions and undeclared options, and write a structured interaction response to the selected CLI's TTY. The first valid response clears the browser-visible pending state; later responses for that interaction are rejected and cannot cause duplicate execution. Ploinky transports declared choices generically and must not assign semantics to option ids such as approval or denial.
+The browser submits the decision to authenticated `POST /webchat/interaction` with the active tab id, interaction id, and option id. The route must require an active subscriber for the same authenticated runtime, reject unknown or stale interactions and undeclared options, and write a structured interaction response to the selected CLI's TTY. The first valid response clears the browser-visible pending state; later responses for that interaction are rejected and cannot cause duplicate execution. Ploinky transports declared choices generically and must not assign semantics to option ids such as approval or denial.
 
 WebChat may receive structured progress metadata from chat agents through the
-same stdout/SSE stream. For a valid `__webchatProgress` envelope associated with
-the active assistant placeholder, WebChat must append only the trimmed,
-non-empty `reason` string to that message's `progress` array. It must not persist
-`tool`, `type`, `stepIndex`, or other envelope metadata. The browser must render
-live progress as in-progress status and render persisted progress as a
-collapsible block above the final answer. A progress-only placeholder may render
-that block without an empty text bubble. Progress remains UI metadata rather
-than assistant text and must not enter continuation context.
+same stdout/SSE stream. Ploinky must render a valid `__webchatProgress` envelope
+as live status but must not persist it. A session-owning CLI may include the
+ordered progress strings in its later `__webchatSession` snapshot, allowing the
+browser to render them as a collapsible block above the final answer after
+history is loaded. Progress remains UI metadata rather than assistant text.
 
-WebChat may also receive generic `__webchatTask` lifecycle envelopes from a selected CLI. These envelopes must be intercepted before conversation rendering and history capture. Ploinky must store workspace-scoped task metadata as append-only JSON lines in `<cwd>/.copilot_history/agent_tasks`, store per-task logs separately under `.copilot_history/task_logs/`, and expose authenticated `GET /webchat/tasks`, `GET /webchat/tasks/<task-id>/log`, and `GET /webchat/tasks/<task-id>/view` routes. Logs are bounded by default; an asynchronous tool may explicitly declare full retention for tasks whose complete multi-turn transcript must survive. Browser updates must use the existing EventSource stream with a `task-update` event; Ploinky must not hardcode target-agent ids or tool names.
+WebChat may also receive generic `__webchatTask` lifecycle envelopes from a selected CLI. These envelopes must be intercepted before conversation rendering. Ploinky must store workspace-scoped task metadata as append-only JSON lines in `<cwd>/.copilot_history/agent_tasks`, store per-task logs separately under `.copilot_history/task_logs/`, and expose authenticated `GET /webchat/tasks`, `GET /webchat/tasks/<task-id>/log`, and `GET /webchat/tasks/<task-id>/view` routes. Logs are bounded by default; an asynchronous tool may explicitly declare full retention for tasks whose complete multi-turn transcript must survive. Browser updates must use the existing EventSource stream with a `task-update` event; Ploinky must not hardcode target-agent ids or tool names.
 
 An asynchronous tool may advertise a generic continuation tool. Its structured
 result may return a versioned opaque continuation handle even when execution
@@ -169,12 +128,11 @@ requests for the same provider must share one activation. Startup or readiness
 failure must remain explicit instead of changing the local task identity or
 silently selecting another provider.
 
-Each first `started` envelope for a task in a user turn must insert one task item
-immediately after that turn's existing assistant placeholder. Multiple tasks are
-allowed and remain in start order; reinserting the same task id is idempotent.
-Live correlation may include the folder session id and inserted task-item index
-on the EventSource event, but this transient routing data must not be duplicated
-in the task journal. The browser must render every task item as its own compact
+The session-owning CLI is responsible for inserting a task reference immediately
+after the active assistant placeholder and may include the resulting session id
+and task-item index on the first `started` envelope. Ploinky forwards that
+correlation on the EventSource event without altering conversation state or
+duplicating it in the task journal. The browser must render every task item as its own compact
 incoming-style chat item. Its first row must show the exact target-agent id,
 description, status, and elapsed whole seconds, and its second row must expose a
 `View task details` link without inline expansion controls or logs. The browser
@@ -311,10 +269,10 @@ providers it can launch while Ploinky remains a generic transport.
 Response:
 They are route-access declarations for transparent proxy paths, not service rewrites. Evaluating them before the normal auth gate lets an agent intentionally expose read-only content to anonymous callers or tighten selected paths under an otherwise unauthenticated route, while preserving the router-owned path checks and the regular route authentication fallback for anything not explicitly declared public.
 
-### Question #7: Why is WebChat conversation state folder-scoped instead of tab-scoped?
+### Question #7: Why is WebChat conversation state agent-owned instead of tab-scoped?
 
 Response:
-The working directory is the durable project context shared by CLI agents, while a browser tab is transient. Folder-scoped JSON sessions let refreshes, later visits, and concurrent clients select the same conversation without agent-specific assumptions. `tabId` remains useful for client diagnostics and echo suppression, but it does not select history or own the target process.
+The selected CLI must provide the same session behavior when launched directly, while a browser tab is transient. Agent-owned sessions let CLI and WebChat launches restore the same conversation without giving the router a second persistence implementation. `tabId` remains useful for subscriber ownership and remote-user rendering, but it does not select history or own the target process.
 
 ### Question #8: Why does WebChat retain a disconnected runtime with ongoing tasks?
 
@@ -326,21 +284,21 @@ The target AgentServer owns the actual delegated process, but the selected chat 
 Response:
 A restart timer can be scheduled immediately before an operator command acquires the container maintenance lock. Checking only when the timer is created leaves that already-scheduled callback free to recreate the same container concurrently with reinstall or explicit restart. Rechecking at execution time makes the scheduled callback defer to the active maintenance owner.
 
-### Question #10: Why does persisted progress contain only strings and stay out of continuation context?
+### Question #10: Why does WebChat treat progress as agent-owned session metadata?
 
 Response:
 The progress `reason` is the only part of the envelope rendered as conversational
-status. Persisting only that ordered string array keeps folder history compatible
-and avoids turning transient tool metadata into a new message schema. Excluding
-progress and empty placeholders from continuation context preserves the
-distinction between the agent's final answer and UI-only execution status.
+status. Ploinky renders it live without creating durable conversation state. A
+session-owning CLI can preserve the ordered strings in its own snapshot while
+excluding them from MainAgent hydration, keeping final answers distinct from
+UI-only execution status.
 
 ### Question #11: Why may WebChat retain a large argument catalog while progressively rendering its entries?
 
 Response:
 Keeping agent-provided completions in memory makes local filtering immediate and avoids another authenticated request for every keystroke. The fixed-height viewport keeps the composer compact, while bounded progressive DOM batches make every result reachable through the scrollbar and Arrow Up/Down without inserting the complete catalog into the document at once. Optional fragment matching still lets users narrow catalogs containing hundreds of entries without WebChat learning what those entries represent.
 
-### Question #12: Why does the selected model reach the header through runtime state instead of folder history or direct settings access?
+### Question #12: Why does the selected model reach the header through runtime state instead of session history or direct settings access?
 
 Response:
 The selected CLI owns the meaning and persistence of its model setting, while Ploinky owns only the generic browser transport. A volatile runtime-state envelope lets any compatible agent publish current UI metadata without extending the conversation schema or coupling WebChat to an agent-specific path. Retaining the latest state in the live runtime also restores the header after a brief EventSource reconnect without claiming that the value describes the effective model used for every response.
@@ -418,7 +376,7 @@ avoid duplicate starts and immediate calls to an MCP server that is not ready.
 ### Question #21: Why does a WebChat interaction use a dedicated endpoint and SSE events?
 
 Response:
-An interaction response controls an already running CLI request and is not a new user prompt. A dedicated authenticated endpoint can bind it to the active tab, folder session, request id, and declared option, while named SSE events keep the transient selector out of conversation history and allow it to recover after a transport reconnect.
+An interaction response controls an already running CLI request and is not a new user prompt. A dedicated authenticated endpoint can bind it to the active tab, runtime, request id, and declared option, while named SSE events keep the transient selector out of conversation history and allow it to recover after a transport reconnect.
 
 ### Question #22: Why does assistant file-link enhancement reuse `/workspace-files` without pre-validating every candidate?
 
@@ -431,10 +389,15 @@ syntactic false positive therefore becomes at most a failed preview after an
 explicit user click, while the agent receives no additional filesystem
 capability and the stored assistant text remains unchanged.
 
-### Question #23: Why is continuation rearmed from a CLI-generated runtime instance id rather than a browser reconnect or PID?
+### Question #23: Why does the selected CLI own conversation restoration?
 
 Response:
-A browser EventSource may reconnect while the same CLI and MainAgent session remain alive, so reconnection is not evidence that in-memory conversation state was lost. A host PID may identify a launcher or wrapper rather than the selected CLI and may eventually be reused. A random identifier emitted by the CLI process changes precisely when that process-lifetime memory is replaced. Comparing that identifier lets WebChat reload durable folder history after restart, reinstall, stop/start, disable/enable, destruction, or crash without duplicating history after an ordinary network interruption.
+The CLI can also run directly without WebChat and is the only component that knows how to recreate its agent session safely. Keeping persistence and one-time hydration there gives terminal and browser launches identical semantics. WebChat only transports prompts and validated session-state snapshots, so a browser reconnect cannot accidentally replay history or become a second source of truth.
+
+### Question #24: Why does WebChat verify delivery before broadcasting input acceptance?
+
+Response:
+A successful HTTP response and server-originated user-message event tell connected browsers that the selected CLI accepted the prompt. Returning success after writing to a closed or detached stdin leaves the interface waiting for output that cannot exist. Health-aware writes make that acknowledgement truthful, remove the stale runtime immediately, and let the existing EventSource reconnect create a fresh CLI process without changing conversation ownership.
 
 ## Conclusion
 

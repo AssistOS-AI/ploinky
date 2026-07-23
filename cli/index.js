@@ -437,10 +437,16 @@ function main() {
                 return;
             }
             // Let the promise resolve on its own. Node will wait.
-            handleCommand(args).catch(error => {
-                console.error(`❌ Error: ${error.message}`);
-                process.exit(1);
-            });
+            handleCommand(args)
+                .then((exitCode) => {
+                    if (process.env.PLOINKY_NO_TTY === '1') {
+                        process.exit(Number.isInteger(exitCode) ? exitCode : 0);
+                    }
+                })
+                .catch(error => {
+                    console.error(`❌ Error: ${error.message}`);
+                    process.exit(1);
+                });
         }
     } catch (error) {
         console.error(`❌ Error: ${error.message}`);

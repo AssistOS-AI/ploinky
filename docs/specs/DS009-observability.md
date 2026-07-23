@@ -18,20 +18,20 @@ The watchdog and router must emit structured operational logs under `.ploinky/lo
 
 The router health endpoint at `/health` must report process uptime, PID, memory usage, and active-session counts for first-party browser surfaces and agent MCP sessions. This endpoint is part of the watchdog's health-check loop and therefore forms part of the runtime stability contract.
 
-WebChat continuation state under `<cwd>/.copilot_history/` is folder-local project data, not operational telemetry. Its session files support selection, lazy history rendering, and context restoration. Ploinky must not duplicate that content into a separate workspace-level conversation store or expose it through Dashboard analytics.
+Conversation continuation is agent-owned project data, not Ploinky operational telemetry. WebChat may retain the selected CLI's latest session snapshot in runtime memory for rendering and reconnect recovery, but Ploinky must not write conversation files or expose message bodies through Dashboard analytics.
 
 The same folder may contain `agent_tasks` metadata and bounded files under `task_logs/` for user-requested asynchronous agent work. This task state is part of the WebChat project workflow rather than router telemetry. The metadata journal must exclude credentials, invocation grants, raw tool arguments, and live log bodies; log content belongs only in the task-specific bounded files and the authenticated Tasks overlay.
 
-Operational logs must not intentionally record raw prompts or assistant replies. Folder-history files may contain conversation roles, text, timestamps, attachments, and references because they are the explicit continuation data selected by the user. The generated `.gitignore` reduces accidental publication, but the workspace owner remains responsible for the local filesystem trust boundary.
+Operational logs must not intentionally record raw prompts or assistant replies. An agent-owned session store may contain conversation roles, text, timestamps, attachments, and references, but it remains outside Ploinky observability. The workspace owner remains responsible for the local filesystem trust boundary.
 
 The Dashboard is an operational surface for status, logs, enabled agents, and runtime control. It must not expose conversation history or conversation-rating analytics.
 
 ## Decisions & Questions
 
-### Question #1: Why is folder history excluded from operational observability?
+### Question #1: Why is agent-owned history excluded from operational observability?
 
 Response:
-Folder history exists so a user can continue a conversation in the project where it occurred. Treating message bodies as operational telemetry would create an unrelated workspace-wide data surface and would blur the ownership boundary between project state and runtime diagnostics.
+Agent-owned history exists so a user can continue a conversation in the project where it occurred. Treating message bodies as operational telemetry would create an unrelated workspace-wide data surface and blur the boundary between agent state and runtime diagnostics.
 
 ### Question #2: Why are raw conversation bodies excluded from logs?
 
@@ -40,4 +40,4 @@ Prompts and replies may contain credentials, source fragments, personal data, or
 
 ## Conclusion
 
-Ploinky must continue to expose useful operational logs and health status while keeping raw conversation continuation in the folder-scoped history explicitly controlled by WebChat users.
+Ploinky must continue to expose useful operational logs and health status without taking ownership of raw conversation continuation.

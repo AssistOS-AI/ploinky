@@ -17,21 +17,6 @@ export function parseInputEnvelope(rawBody) {
     return { text: fallbackText, attachments: [], references: [] };
 }
 
-export function sanitizeWebchatHistoryForEnvelope(history = []) {
-    if (!Array.isArray(history)) return [];
-    const sanitized = [];
-    for (const entry of history) {
-        if (!entry || typeof entry !== 'object') continue;
-        const role = entry.role === 'user'
-            ? 'user'
-            : (entry.role === 'assistant' ? 'assistant' : '');
-        const message = typeof entry.message === 'string' ? entry.message : '';
-        if (!role || !message.trim()) continue;
-        sanitized.push({ role, message });
-    }
-    return sanitized;
-}
-
 export function sanitizeWebchatAttachmentsForEnvelope(attachments = []) {
     return Array.isArray(attachments)
         ? attachments
@@ -87,8 +72,7 @@ function buildWebchatInvocationToken({ req, effectiveConfig, tabId, envelope }) 
                 tabId: String(tabId || ''),
                 text: typeof envelope?.text === 'string' ? envelope.text : '',
                 attachments: sanitizeWebchatAttachmentsForEnvelope(envelope?.attachments),
-                references: sanitizeWebchatReferencesForEnvelope(envelope?.references),
-                history: sanitizeWebchatHistoryForEnvelope(envelope?.history)
+                references: sanitizeWebchatReferencesForEnvelope(envelope?.references)
             }
         });
         return invocation?.token || '';
@@ -120,7 +104,6 @@ export function resolveRequestPublicOrigin(req) {
 
 export function serializeWebchatEnvelopeForAgent({ req, effectiveConfig, tabId, envelope, fallbackText = '' }) {
     const sanitizedReferences = sanitizeWebchatReferencesForEnvelope(envelope?.references);
-    const sanitizedHistory = sanitizeWebchatHistoryForEnvelope(envelope?.history);
     const publicBaseUrl = resolveRequestPublicOrigin(req);
     const payload = {
         __webchatMessage: 1,
@@ -130,7 +113,6 @@ export function serializeWebchatEnvelopeForAgent({ req, effectiveConfig, tabId, 
     };
     if (publicBaseUrl) payload.origin = { publicBaseUrl };
     if (sanitizedReferences.length) payload.references = sanitizedReferences;
-    if (sanitizedHistory.length) payload.history = sanitizedHistory;
     const token = buildWebchatInvocationToken({ req, effectiveConfig, tabId, envelope: payload });
     if (token) payload.invocation = { token };
     return JSON.stringify(payload);

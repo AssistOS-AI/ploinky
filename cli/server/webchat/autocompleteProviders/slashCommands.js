@@ -103,12 +103,9 @@ export function applySlashInsertTextToValue(value, insertText) {
 function buildCatalogArguments() {
     const query = globalThis.document?.body?.dataset?.agentQuery || '';
     const args = {};
-    if (!query) {
-        return args;
-    }
     try {
         const params = new URLSearchParams(query);
-        const dir = params.get('dir');
+        const dir = params.get('dir') || globalThis.document?.body?.dataset?.workdir || '';
         if (dir) {
             args.dir = dir;
         }

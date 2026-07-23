@@ -13,7 +13,6 @@ import {
 } from '../../cli/server/handlers/webchat/runtimeState.js';
 import { createInteractionPrompt } from '../../cli/server/webchat/interactionPrompt.js';
 import { __testables as networkTestables } from '../../cli/server/webchat/network.js';
-import { ensureCurrentSession, loadSession } from '../../cli/server/webchat/sessionStore.js';
 
 function approvalEnvelope(id = 'approval_12345678') {
     return {
@@ -36,20 +35,10 @@ function approvalEnvelope(id = 'approval_12345678') {
 test('interaction envelopes become SSE state without entering conversation history', (t) => {
     const workspaceDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'webchat-interaction-'));
     t.after(() => fs.rmSync(workspaceDirectory, { recursive: true, force: true }));
-    const session = ensureCurrentSession(workspaceDirectory);
     const writes = [];
     const tab = {
         workspaceDirectory,
-        sessionId: session.sessionId,
         subscribers: new Map([['client', { res: { write: (value) => writes.push(value) } }]]),
-        workspaceHistory: {
-            workspaceDirectory,
-            sessionId: session.sessionId,
-            buffer: '',
-            lastClientText: '',
-            userInputSent: false,
-            lastAssistantMessageIndex: null,
-        },
         taskProtocolBuffer: '',
     };
     const appState = { runtimes: new Map([['runtime', tab]]) };
@@ -60,7 +49,7 @@ test('interaction envelopes become SSE state without entering conversation histo
 
     assert.equal(tab.pendingInteraction.id, 'approval_12345678');
     assert.match(writes.join(''), /event: interaction-request/);
-    assert.deepEqual(loadSession(workspaceDirectory, session.sessionId).messages, []);
+    assert.equal(fs.existsSync(path.join(workspaceDirectory, '.achilles-cli')), false);
     assert.equal(networkTestables.parseInteractionPayload(JSON.stringify(tab.pendingInteraction)).defaultOptionId, 'always-allow');
 });
 
@@ -75,14 +64,12 @@ test('interaction validation rejects malformed options and preserves the request
 test('an EventSource reconnect receives the pending interaction snapshot', (t) => {
     const workspaceDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'webchat-interaction-reconnect-'));
     t.after(() => fs.rmSync(workspaceDirectory, { recursive: true, force: true }));
-    const session = ensureCurrentSession(workspaceDirectory);
     const effectiveConfig = { agentName: 'demo-agent' };
-    const runtimeKey = buildRuntimeKey(workspaceDirectory, session.sessionId, effectiveConfig, '');
+    const runtimeKey = buildRuntimeKey(workspaceDirectory, effectiveConfig, '');
     const sid = 'browser-session';
     const tab = {
         tty: {},
         subscribers: new Map(),
-        sessionId: session.sessionId,
         workspaceDirectory,
         pendingInteraction: parseWebchatInteraction(approvalEnvelope()),
     };
@@ -119,9 +106,8 @@ test('an EventSource reconnect receives the pending interaction snapshot', (t) =
 test('authenticated interaction responses use the control channel and reject replay', (t) => {
     const workspaceDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'webchat-interaction-response-'));
     t.after(() => fs.rmSync(workspaceDirectory, { recursive: true, force: true }));
-    const session = ensureCurrentSession(workspaceDirectory);
     const effectiveConfig = { agentName: 'demo-agent' };
-    const runtimeKey = buildRuntimeKey(workspaceDirectory, session.sessionId, effectiveConfig, '');
+    const runtimeKey = buildRuntimeKey(workspaceDirectory, effectiveConfig, '');
     const sid = 'browser-session';
     const tabId = 'tab-1';
     const ttyWrites = [];
@@ -129,7 +115,6 @@ test('authenticated interaction responses use the control channel and reject rep
     const tab = {
         tty: { write: (value) => ttyWrites.push(value) },
         workspaceDirectory,
-        sessionId: session.sessionId,
         pendingInteraction: parseWebchatInteraction(approvalEnvelope()),
         subscribers: new Map([['client', { sid, tabId, res: { write: (value) => sseWrites.push(value) } }]]),
     };

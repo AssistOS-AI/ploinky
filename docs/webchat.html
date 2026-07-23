@@ -89,49 +89,47 @@ ploinky webchat --rotate # show the same login URL</code></pre>
 
 # launches the selected agent as:
 ploinky cli achilles-cli --path=/absolute/path</code></pre>
-                    <p>The router reserves <code>agent</code> for agent selection, <code>tabId</code> for the browser client, and <code>sessionId</code> for folder-history routing. These internal values are not forwarded as agent CLI flags. Agent CLIs remain responsible for interpreting ordinary forwarded flags and values.</p>
+                    <p>The router reserves <code>agent</code> for agent selection and <code>tabId</code> for the browser client. These internal values are not forwarded as agent CLI flags. Agent CLIs remain responsible for interpreting ordinary forwarded flags and values.</p>
                 </div>
 
                 <div class="doc-section">
                     <h2>Session Experience</h2>
-                    <h3>Folder Sessions</h3>
-                    <p>WebChat stores its selectable continuation history under <code>&lt;cwd&gt;/.copilot_history/</code>. The folder contains <code>current_session.json</code> plus one JSON file per conversation. Refreshing the page reuses the selected folder session and a surviving agent process, while the browser keeps its client-only <code>tabId</code> in <code>sessionStorage</code>.</p>
+                    <h3>Agent-Owned Sessions</h3>
+                    <p>WebChat does not store conversation history. A compatible selected CLI owns its durable sessions and publishes validated <code>__webchatSession</code> snapshots for browser rendering. Refreshing the page reuses the surviving agent process and its latest in-memory snapshot, while the browser keeps its client-only <code>tabId</code> in <code>sessionStorage</code>.</p>
+                    <p>Runtime reuse is health-aware. WebChat checks that the selected TTY child is alive and its stdin is writable before accepting a prompt. A failed write returns <code>409</code>, removes the stale runtime, and is not broadcast to other subscribers as accepted; the client retries once after reconnect and otherwise stops the thinking indicator with an input error. Healthy runtimes remain shared across browser refreshes.</p>
                     <p>
-                        Each submitted turn is stored as the user message followed immediately by an assistant placeholder.
+                        The selected CLI may store each submitted natural-language turn as the user message followed immediately by an assistant placeholder.
                         The placeholder starts with empty final text and an optional <code>progress</code> array of strings. Task references are separate conversation items rather than properties of the assistant message.
-                        Agent progress reasons are appended to that array while the request is running, and final output updates the same message.
-                        Tool names, step indexes, and other progress-envelope metadata are not stored.
+                        WebChat renders progress live without persisting it; the CLI may include progress reasons and final output in its later session snapshot.
                     </p>
                     <p>
-                        WebChat removes transport echoes such as its structured input envelope and an explicit
-                        <code>you&gt; submitted text</code> readline prompt before storing or displaying output.
+                        WebChat removes transport echoes such as its structured input envelope before displaying output.
                         Ordinary assistant text remains valid when it happens to equal the submitted user message.
                     </p>
                     <ul style="margin-left: 2rem;">
                         <li><strong>Click to load session history</strong> appears as a centered standalone button inside the scrollable conversation, rather than as a chat message, and renders the current session only when requested. It is browser-only, is never stored as a message or sent to the agent, and disappears immediately when activated; the composer remains available while older messages are hidden.</li>
-                        <li><strong>Sessions</strong> opens the session selector. Its first, emphasized <strong>New</strong> item creates an empty session and makes it current for the folder.</li>
+                        <li><strong>Sessions</strong> sends <code>/session</code> to the selected CLI. Its first, emphasized <strong>New</strong> item sends <code>/session new</code>.</li>
                         <li>Existing session items show the first user-message preview and relative activity time, such as <code>2 days ago</code>, without message counts or agent metadata.</li>
                         <li>The <strong>Tasks</strong> and <strong>Sessions</strong> header controls use a darker green hover state that stays visually integrated with the header.</li>
-                        <li>Connected browser clients using the same working directory receive session changes and new turns through the shared EventSource runtime.</li>
+                        <li>Selecting an existing item sends <code>/session resume &lt;session-id&gt;</code>. The slash autocomplete can display the session name supplied by the CLI while inserting its opaque id after <code>/session resume</code>. Connected browser clients receive the CLI's session-state changes through the shared EventSource runtime.</li>
                     </ul>
                     <p>
-                        If the original process no longer exists, an envelope-aware CLI receives prior user content and final assistant text as an ordered role-separated history array, while the next conversational message remains separate.
-                        Historical inputs are not replayed as commands, and synthetic transcript delimiters are not added to structured history. Plain-text CLIs retain the delimited context fallback. Persisted progress, task items, and assistant placeholders without final text remain UI-only and are excluded from both representations.
-                        Slash commands remain unchanged and defer restoration until a later conversational message.
+                        If the original process no longer exists, the selected CLI loads its own current session and supplies prior natural-language turns once when it creates its agent session.
+                        Ploinky does not replay historical commands or append history to the WebChat input envelope. Slash commands do not consume the CLI's pending one-time hydration.
                     </p>
-                    <p>A newly started CLI receives <code>PLOINKY_WEBCHAT_HAS_HISTORY</code>. A value of <code>1</code> tells a generic agent that this is an existing conversation, so it should not emit new-conversation startup content. Empty sessions, including those created through <strong>Sessions → New</strong>, receive <code>0</code>. The selected folder session id remains private to the router instead of being forwarded into the agent process environment.</p>
+                    <p>Ploinky does not set a conversation-history environment flag or forward a selected conversation id. The CLI determines whether its own current session is empty.</p>
 
                     <h3>Interactive Requests</h3>
                     <p>A compatible CLI can pause an active request and publish a generic structured interaction with bounded choices. WebChat displays those choices in a dedicated selector above the composer, selects the CLI-declared default, and supports Arrow Up/Down, Enter, or pointer selection. Ordinary message submission remains disabled until the interaction is resolved.</p>
-                    <p>The decision travels through an authenticated control route and is matched to the active tab, folder session, request id, and one of the declared options. It is not a chat message, is not stored in conversation history, and is restored as a selector after an EventSource reconnect while the CLI still has it pending.</p>
+                    <p>The decision travels through an authenticated control route and is matched to the active tab, runtime, request id, and one of the declared options. It is not a chat message and is restored as a selector after an EventSource reconnect while the CLI still has it pending.</p>
 
                     <h3>Runtime Model Status</h3>
                     <p>A compatible CLI may publish a generic <code>__webchatRuntimeState</code> line envelope containing its currently selected model. WebChat removes that control line from assistant output and history, keeps the latest value only in the live runtime, and shows a compact model badge beside the agent name. The runtime-state snapshot is sent again after an EventSource reconnect. A <code>null</code> model hides the badge.</p>
                     <p>The badge describes agent-declared configuration, not the effective provider model used for an individual answer. WebChat does not read agent settings files, persist the badge in folder history, or attach model metadata to messages.</p>
-                    <p>A compatible CLI may also include a process-lifetime <code>runtimeInstanceId</code>. WebChat keeps this UUID server-side and compares successive runtime-state envelopes. When the identifier changes, WebChat knows that the CLI's in-memory session was replaced, reloads the selected conversation from disk, and sends its continuation once with the next non-slash message. Repeated state from the same process, browser refreshes, and transient EventSource reconnects do not resend history. The identifier is neither persisted nor exposed to the browser.</p>
+                    <p>Conversation restoration does not use a process-instance identifier. The selected CLI owns process startup, current-session loading, and one-time agent hydration; WebChat only retains the latest session snapshot for reconnecting browsers.</p>
 
                     <h3>Background Tasks</h3>
-                    <p>CLIs may publish generic asynchronous task lifecycle envelopes through their stdout stream. WebChat stores task metadata in <code>.copilot_history/agent_tasks</code>, keeps logs in <code>.copilot_history/task_logs/</code>, and presents both through the authenticated <strong>Tasks</strong> overlay. Logs are bounded by default, while tools may opt into full retention for multi-turn task transcripts. Conversation history stores only a small task-reference item shaped as <code>{ "type": "task", "taskId": "task_..." }</code>; task state and logs are not copied there.</p>
+                    <p>CLIs may publish generic asynchronous task lifecycle envelopes through their stdout stream. WebChat stores task metadata in <code>.copilot_history/agent_tasks</code>, keeps logs in <code>.copilot_history/task_logs/</code>, and presents both through the authenticated <strong>Tasks</strong> overlay. The selected CLI owns any task-reference items in conversation history; Ploinky does not copy task state or logs into session snapshots.</p>
                     <p>Every started task appears immediately as its own compact incoming-style chat item. One assistant turn may create multiple task items, kept after its assistant message in task-start order even when final assistant text arrives later. The first row shows the exact agent id, description, current status, and elapsed seconds; the second row provides a <strong>View task details</strong> link instead of inline expansion. The link opens an authenticated task page in WebChat's right-side panel with the same task header, error, and live-log presentation as the former expanded module. The parent WebChat page forwards updates for the active task from its existing EventSource through a same-origin message bridge, while the task page uses the task APIs for initial state and missing-offset recovery. It does not open a second live stream. The item survives completion and history reload. Old assistant messages carrying a <code>taskId</code> property are ignored instead of migrated. Pending tasks show <code>QUEUED</code>, active tasks show <code>RUNNING</code>, and terminal tasks show <code>COMPLETED</code>, <code>STOPPED</code>, or <code>FAILED</code>.</p>
                     <p>The right-side panel is generic for task pages and all other links opened from chat. It ends above the floating composer, follows the composer's dynamic height, and scrolls its own content or embedded page in the remaining space, so no part of the opened page is hidden underneath the input pill.</p>
                     <p>WebChat keeps provider task output byte-for-byte in the task log. When completion supplies the final MCP result separately, ingestion finds the last identical range already present in that log and stores only its offset and length in <code>agent_tasks</code>; it never appends or duplicates result text. The Tasks overlay and task page show intermediate lines in secondary grey and the matching final-answer lines in the normal primary text color. Starting a continuation clears the previous final range until the new turn completes. The browser strips ANSI control sequences and retains display compatibility for historical prefixed logs; new raw provider output is otherwise unchanged.</p>
@@ -179,7 +177,7 @@ ploinky cli achilles-cli --path=/absolute/path</code></pre>
                     <ul style="margin-left: 2rem;">
                         <li>Use HTTPS or SSH tunnels when exposing the WebChat URL beyond localhost.</li>
                         <li>Protect router session cookies and the encrypted <code>.ploinky/.secrets</code> store used by local auth, dashboard tokens, and manifest env.</li>
-                        <li><code>.copilot_history</code> is authenticated, workspace-confined project state but is plaintext. It receives a local <code>.gitignore</code> to reduce accidental commits.</li>
+                        <li><code>.copilot_history</code> contains Ploinky task metadata and logs only. Conversation storage and its filesystem policy belong to the selected CLI.</li>
                     </ul>
                 </div>
 
@@ -190,6 +188,7 @@ ploinky cli achilles-cli --path=/absolute/path</code></pre>
                         <li><strong>401 errors?</strong> Run <code>ploinky webchat</code> again to confirm the token and URL.</li>
                         <li><strong>Need a different command?</strong> Update the agent manifest and restart the workspace so WebChat picks up the change.</li>
                         <li><strong>Custom launch flags ignored?</strong> Confirm you opened <code>/webchat</code> with <code>?agent=&lt;name&gt;</code>; without an explicit agent selection the router uses the default WebChat target and does not synthesize agent-specific CLI flags.</li>
+                        <li><strong>Message does not start?</strong> A <code>409</code> response means the selected CLI process ended or its stdin became unavailable. WebChat disposes that runtime automatically; allow the stream to reconnect before sending again.</li>
                     </ul>
                 </div>
             </div>

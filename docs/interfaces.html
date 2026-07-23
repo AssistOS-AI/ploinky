@@ -46,7 +46,7 @@
             <tbody>
               <tr>
                 <td><code>/webchat</code></td>
-                <td>TTY-backed chat surface with authenticated folder-scoped JSON sessions, lazy history loading, uploads, and generic selected-agent CLI argument forwarding.</td>
+                <td>TTY-backed chat surface with agent-owned session snapshots, lazy history rendering, uploads, and generic selected-agent CLI argument forwarding.</td>
               </tr>
               <tr>
                 <td><code>/dashboard</code></td>
@@ -61,9 +61,9 @@
           <div class="callout">
             <p>The root-level <code>dashboard/</code> directory is not the active fallback for routed <code>/dashboard</code>. The current implementation resolves fallback dashboard assets from <code>cli/server/dashboard/</code>, which is why the product documentation follows that path.</p>
           </div>
-          <p>For <code>/webchat</code>, the router treats <code>agent</code> as the agent selector and preserves ordinary query parameters on the browser session URL. When an explicit agent is selected, those parameters are forwarded to <code>ploinky cli &lt;agent&gt;</code> as single-token <code>--key=value</code> arguments. Router-owned <code>tabId</code> and <code>sessionId</code> values are not forwarded.</p>
-          <p>The authenticated folder-session interface uses <code>GET</code>/<code>POST /webchat/sessions</code>, <code>PUT /webchat/sessions/current</code>, and <code>GET /webchat/sessions/&lt;session-id&gt;</code>. Listing exposes selector metadata only; message bodies are returned by the explicit per-session history request.</p>
-          <p>Generic CLI interactions use named <code>interaction-request</code> and <code>interaction-resolved</code> events on the existing WebChat EventSource. The browser answers through authenticated <code>POST /webchat/interaction</code>; the route validates the active subscriber, tab, folder session, request id, and declared option before delivering control input to the CLI TTY.</p>
+          <p>For <code>/webchat</code>, the router treats <code>agent</code> as the agent selector and preserves ordinary query parameters on the browser session URL. When an explicit agent is selected, those parameters are forwarded to <code>ploinky cli &lt;agent&gt;</code> as single-token <code>--key=value</code> arguments. Router-owned <code>tabId</code> values are not forwarded.</p>
+          <p>Conversation sessions have no WebChat REST API. A compatible CLI publishes <code>current</code>, <code>list</code>, and <code>selected</code> records through <code>__webchatSession</code>; the router validates them and emits <code>session-state</code> events. The browser requests changes with <code>/session</code>, <code>/session new</code>, or <code>/session resume &lt;session-id&gt;</code>.</p>
+          <p>Generic CLI interactions use named <code>interaction-request</code> and <code>interaction-resolved</code> events on the existing WebChat EventSource. The browser answers through authenticated <code>POST /webchat/interaction</code>; the route validates the active subscriber, tab, runtime, request id, and declared option before delivering control input to the CLI TTY.</p>
         </section>
 
         <section class="chapter-section">

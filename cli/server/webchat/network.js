@@ -184,7 +184,7 @@ export function createNetwork({
     hideTypingIndicator,
     markUserInputSent,
     addRemoteUserMessage,
-    onSessionChanged,
+    onSessionState,
     onTaskUpdate,
     onRuntimeState,
     onInteractionRequest,
@@ -197,13 +197,7 @@ export function createNetwork({
     let reconnectAttempts = 0;
     let reconnectTimer = null;
     let pendingUploads = 0;
-    let sessionId = '';
     let assistantMessageIndex = null;
-
-    function sessionEndpoint(path) {
-        const separator = String(path || '').includes('?') ? '&' : '?';
-        return `${path}${separator}sessionId=${encodeURIComponent(sessionId)}`;
-    }
 
     function trackUploadStart() {
         pendingUploads += 1;
@@ -299,7 +293,7 @@ export function createNetwork({
             // Ignore close failures
         }
 
-        es = new EventSource(toEndpoint(sessionEndpoint(`stream?tabId=${TAB_ID}`)));
+        es = new EventSource(toEndpoint(`stream?tabId=${TAB_ID}`));
 
         es.onopen = () => {
             // Reset reconnect attempts on successful connection
@@ -394,12 +388,15 @@ export function createNetwork({
             }
         });
 
-        es.addEventListener('session-changed', (event) => {
+        es.addEventListener('session-state', (event) => {
             try {
                 const payload = JSON.parse(event.data);
-                if (typeof onSessionChanged === 'function') onSessionChanged(payload?.session || null);
+                if ((payload?.event === 'current' || payload?.event === 'selected')) {
+                    assistantMessageIndex = null;
+                }
+                if (typeof onSessionState === 'function') onSessionState(payload);
             } catch (error) {
-                dlog('session changed error', error);
+                dlog('session state error', error);
             }
         });
 
@@ -407,14 +404,7 @@ export function createNetwork({
             try {
                 const payload = JSON.parse(event.data);
                 if (typeof onTaskUpdate === 'function') {
-                    if (payload?.sessionId && payload.sessionId !== sessionId) {
-                        const workspaceUpdate = { ...payload };
-                        delete workspaceUpdate.sessionId;
-                        delete workspaceUpdate.messageIndex;
-                        onTaskUpdate(workspaceUpdate);
-                    } else {
-                        onTaskUpdate(payload);
-                    }
+                    onTaskUpdate(payload);
                 }
             } catch (error) {
                 dlog('task update error', error);
@@ -463,7 +453,7 @@ export function createNetwork({
         es = null;
     }
 
-    function postEnvelope(payload = {}) {
+    function postEnvelope(payload = {}, { silent = false } = {}) {
         const text = typeof payload.text === 'string' ? payload.text : '';
         const attachments = Array.isArray(payload.attachments) ? payload.attachments : [];
         const references = Array.isArray(payload.references) ? payload.references : [];
@@ -471,9 +461,9 @@ export function createNetwork({
         const trimmedText = text.trim();
         pendingUserPrompt = trimmedText;
 
-        markUserInputSent();
+        if (!silent) markUserInputSent();
 
-        const send = () => fetch(toEndpoint(sessionEndpoint(`input?tabId=${TAB_ID}`)), {
+        const send = () => fetch(toEndpoint(`input?tabId=${TAB_ID}`), {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: `${serialized}\n`,
@@ -512,7 +502,7 @@ export function createNetwork({
         if (!message.trim()) {
             return false;
         }
-        postEnvelope({ text: message });
+        postEnvelope({ text: message }, { silent: true });
         return true;
     }
 
@@ -664,7 +654,7 @@ export function createNetwork({
     }
 
     function sendControl(controlSeq) {
-        return fetch(toEndpoint(sessionEndpoint(`control?tabId=${TAB_ID}`)), {
+        return fetch(toEndpoint(`control?tabId=${TAB_ID}`), {
             method: 'POST',
             headers: { 'Content-Type': 'text/plain' },
             body: controlSeq
@@ -674,7 +664,7 @@ export function createNetwork({
     }
 
     function sendInteractionResponse(interactionId, optionId) {
-        return fetch(toEndpoint(sessionEndpoint(`interaction?tabId=${TAB_ID}`)), {
+        return fetch(toEndpoint(`interaction?tabId=${TAB_ID}`), {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ interactionId, optionId }),
@@ -692,18 +682,6 @@ export function createNetwork({
     return {
         start,
         stop,
-        setSession(nextSessionId, { restart = true } = {}) {
-            const normalized = typeof nextSessionId === 'string' ? nextSessionId.trim() : '';
-            if (normalized === sessionId) return;
-            sessionId = normalized;
-            assistantMessageIndex = null;
-            if (typeof onInteractionResolved === 'function') onInteractionResolved({ id: null, status: 'session-changed' });
-            if (restart) {
-                stop();
-                start();
-            }
-        },
-        getSessionId: () => sessionId,
         sendCommand,
         sendQuickCommand,
         sendAttachments,

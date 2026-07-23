@@ -1020,21 +1020,23 @@ async function runCli(agentName, args) {
   const registryEntry = agents[containerName] || {};
   const actualRuntime = registryEntry.runtime;
 
+  let exitCode = 0;
   if (actualRuntime === 'bwrap') {
     const { attachBwrapInteractive } = await import('../sandbox/bwrap/bwrapServiceManager.js');
-    runWithSuspendedInput(() => {
-      attachBwrapInteractive(shortAgentName, manifest, agentDir, projPath, cmd, { containerName });
+    exitCode = runWithSuspendedInput(() => {
+      return attachBwrapInteractive(shortAgentName, manifest, agentDir, projPath, cmd, { containerName });
     });
   } else if (actualRuntime === 'seatbelt') {
     const { attachSeatbeltInteractive } = await import('../sandbox/seatbelt/seatbeltServiceManager.js');
-    runWithSuspendedInput(() => {
-      attachSeatbeltInteractive(shortAgentName, manifest, agentDir, projPath, cmd, { containerName });
+    exitCode = runWithSuspendedInput(() => {
+      return attachSeatbeltInteractive(shortAgentName, manifest, agentDir, projPath, cmd, { containerName });
     });
   } else {
-    runWithSuspendedInput(() => {
-      attachInteractive(containerName, projPath, cmd);
+    exitCode = runWithSuspendedInput(() => {
+      return attachInteractive(containerName, projPath, cmd);
     });
   }
+  return Number.isInteger(exitCode) ? exitCode : 0;
 }
 
 async function runShell(agentName) {

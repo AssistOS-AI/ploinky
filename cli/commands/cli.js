@@ -203,8 +203,7 @@ async function handleCommand(args) {
             break;
         case 'cli':
             if (!options[0]) { showHelp(); break; }
-            await runCli(options[0], options.slice(1));
-            break;
+            return runCli(options[0], options.slice(1));
         // 'agent' command removed; use 'enable agent <agentName>' then 'start'
         case 'add':
             {
