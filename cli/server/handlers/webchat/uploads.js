@@ -1,33 +1,18 @@
 import fs from 'fs';
 import path from 'path';
+import { randomUUID } from 'crypto';
 
 import {
-    buildCwdRelativePath,
-    buildSessionRelativePath,
-    buildSessionUploadMetadataRoot,
-    buildSessionUploadRoot,
-    buildWorkspaceRelativePath,
-    ensureSessionUploadRoot,
-    normalizeWebchatSessionId,
-    resolveNonCollidingTarget,
+    buildWorkspaceFileUrl,
     resolveUploadTarget,
     sanitizeUploadRelativePath,
 } from '../../webchat/uploadPaths.js';
 
-const APP_NAME = 'webchat';
-const ROUTER_RESERVED_QUERY_KEYS = new Set([
-    'tabId',
-    'path',
-    'forward-envelope',
-    'forwardEnvelope',
-]);
-
 function readHeader(req, name) {
     const target = String(name || '').toLowerCase();
-    if (!target || !req?.headers) return '';
-    const direct = req.headers[target];
+    const direct = req?.headers?.[target];
     if (direct) return Array.isArray(direct) ? direct[0] : direct;
-    for (const [key, value] of Object.entries(req.headers)) {
+    for (const [key, value] of Object.entries(req?.headers || {})) {
         if (String(key).toLowerCase() === target) {
             return Array.isArray(value) ? value[0] : value;
         }
@@ -45,18 +30,6 @@ function decodeOptionalHeader(value) {
     }
 }
 
-function buildDownloadUrl(parsedUrl, sessionRelativePath) {
-    const params = new URLSearchParams();
-    if (parsedUrl?.searchParams) {
-        for (const [key, value] of parsedUrl.searchParams.entries()) {
-            if (ROUTER_RESERVED_QUERY_KEYS.has(key)) continue;
-            params.append(key, value);
-        }
-    }
-    params.set('path', sessionRelativePath);
-    return `/${APP_NAME}/uploads?${params.toString()}`;
-}
-
 function normalizeMimeType(value) {
     const raw = String(value || '').trim();
     if (!raw || raw.length > 255 || /[\r\n\0]/.test(raw)) {
@@ -65,61 +38,12 @@ function normalizeMimeType(value) {
     return raw;
 }
 
-function isRelativeInside(relativePath) {
-    return Boolean(relativePath) && !relativePath.startsWith('..') && !path.isAbsolute(relativePath);
-}
-
-function isRealPathInsideRoot(rootPath, candidatePath) {
-    try {
-        const realRoot = fs.realpathSync(rootPath);
-        const realCandidate = fs.realpathSync(candidatePath);
-        const relative = path.relative(realRoot, realCandidate);
-        return relative === '' || isRelativeInside(relative);
-    } catch (_) {
-        return false;
-    }
-}
-
-function resolveUploadMetadataPath(context, sessionRelativePath) {
-    if (!context?.cwd || !context?.sessionId) return null;
-    const safeRelative = sanitizeUploadRelativePath(sessionRelativePath, '');
-    if (!safeRelative) return null;
-    const metadataRoot = buildSessionUploadMetadataRoot(context.cwd, context.sessionId);
-    if (!metadataRoot) return null;
-    const metadataLeaf = `${Buffer.from(safeRelative, 'utf8').toString('base64url')}.json`;
-    const metadataPath = path.resolve(metadataRoot, metadataLeaf);
-    const relative = path.relative(metadataRoot, metadataPath);
-    if (!isRelativeInside(relative)) return null;
-    return { metadataRoot, metadataPath };
-}
-
-function writeUploadMetadata(context, sessionRelativePath, metadata) {
-    const target = resolveUploadMetadataPath(context, sessionRelativePath);
-    if (!target) return false;
-    try {
-        fs.mkdirSync(target.metadataRoot, { recursive: true });
-        if (!isRealPathInsideRoot(context.cwd, target.metadataRoot)) return false;
-        fs.writeFileSync(target.metadataPath, `${JSON.stringify(metadata)}\n`, { encoding: 'utf8', flag: 'wx' });
-        return true;
-    } catch (_) {
-        return false;
-    }
-}
-
-function readUploadMetadata(context, sessionRelativePath) {
-    const target = resolveUploadMetadataPath(context, sessionRelativePath);
-    if (!target) return null;
-    try {
-        if (!isRealPathInsideRoot(context.cwd, target.metadataRoot)) return null;
-        const raw = fs.readFileSync(target.metadataPath, 'utf8');
-        const parsed = JSON.parse(raw);
-        return parsed && typeof parsed === 'object' ? parsed : null;
-    } catch (_) {
-        return null;
-    }
+function allowsOverwrite(value) {
+    return /^(1|true|yes|on)$/i.test(String(value || '').trim());
 }
 
 function writeJson(res, status, payload) {
+    if (res.headersSent) return;
     res.writeHead(status, {
         'Content-Type': 'application/json',
         'Cache-Control': 'no-store',
@@ -128,49 +52,60 @@ function writeJson(res, status, payload) {
     res.end(JSON.stringify(payload));
 }
 
-export function resolveWebchatUploadContext({ workspaceBase, sessionId }) {
-    if (!workspaceBase || !workspaceBase.root || !workspaceBase.base) {
-        return null;
-    }
-    const safeSession = normalizeWebchatSessionId(sessionId);
-    if (!safeSession) return null;
-    const uploadRoot = buildSessionUploadRoot(workspaceBase.base, safeSession);
-    if (!uploadRoot) return null;
+export function resolveWebchatUploadContext({ workspaceBase } = {}) {
+    if (!workspaceBase?.root || !workspaceBase?.base) return null;
     return {
         workspaceRoot: workspaceBase.root,
         cwd: workspaceBase.base,
-        sessionId: safeSession,
-        uploadRoot,
     };
 }
 
-export function handleWebchatUploadPost(req, res, parsedUrl, context) {
-    if (!context) {
-        return writeJson(res, 400, { ok: false, error: 'invalid_session' });
+function inspectExistingTarget(targetPath) {
+    try {
+        const stat = fs.lstatSync(targetPath);
+        if (stat.isSymbolicLink()) return { error: 'invalid_target' };
+        if (!stat.isFile()) return { error: 'target_type_conflict' };
+        return { exists: true };
+    } catch (error) {
+        if (error?.code === 'ENOENT') return { exists: false };
+        return { error: 'target_unavailable' };
     }
+}
+
+function commitTemporaryFile(tempPath, targetPath, overwrite) {
+    if (overwrite) {
+        fs.renameSync(tempPath, targetPath);
+        return;
+    }
+    fs.linkSync(tempPath, targetPath);
+    fs.unlinkSync(tempPath);
+}
+
+export function handleWebchatUploadPost(req, res, parsedUrl, context) {
+    if (!context) return writeJson(res, 400, { ok: false, error: 'invalid_workspace' });
+
     const filenameHeader = decodeOptionalHeader(readHeader(req, 'x-file-name'));
     const relativeHeader = decodeOptionalHeader(readHeader(req, 'x-relative-path'));
-    const mimeHeader = normalizeMimeType(readHeader(req, 'x-mime-type') || readHeader(req, 'content-type'));
-    const fallbackName = filenameHeader || (relativeHeader ? path.basename(relativeHeader) : '');
-
-    const sanitizedRelative = sanitizeUploadRelativePath(relativeHeader, fallbackName)
-        || sanitizeUploadRelativePath(filenameHeader, '');
-
-    if (!sanitizedRelative) {
+    const destinationHeader = decodeOptionalHeader(readHeader(req, 'x-destination-path'));
+    const mime = normalizeMimeType(readHeader(req, 'x-mime-type') || readHeader(req, 'content-type'));
+    const overwrite = allowsOverwrite(readHeader(req, 'x-overwrite'));
+    const relativePath = sanitizeUploadRelativePath(relativeHeader, filenameHeader);
+    if (!relativePath) {
         return writeJson(res, 400, { ok: false, error: 'invalid_relative_path' });
     }
 
-    if (!ensureSessionUploadRoot(context.uploadRoot)) {
-        return writeJson(res, 500, { ok: false, error: 'upload_root_unavailable' });
-    }
-
-    const target = resolveNonCollidingTarget({
-        uploadRoot: context.uploadRoot,
+    let target = resolveUploadTarget({
+        cwd: context.cwd,
         workspaceRoot: context.workspaceRoot,
-        relativePath: sanitizedRelative,
+        destinationPath: destinationHeader,
+        relativePath,
     });
-    if (!target) {
-        return writeJson(res, 400, { ok: false, error: 'invalid_target' });
+    if (!target) return writeJson(res, 400, { ok: false, error: 'invalid_target' });
+
+    const initialTarget = inspectExistingTarget(target.absolutePath);
+    if (initialTarget.error) return writeJson(res, 409, { ok: false, error: initialTarget.error });
+    if (initialTarget.exists && !overwrite) {
+        return writeJson(res, 409, { ok: false, error: 'target_exists', localPath: target.relativePath });
     }
 
     try {
@@ -179,130 +114,85 @@ export function handleWebchatUploadPost(req, res, parsedUrl, context) {
         return writeJson(res, 500, { ok: false, error: 'mkdir_failed' });
     }
 
+    target = resolveUploadTarget({
+        cwd: context.cwd,
+        workspaceRoot: context.workspaceRoot,
+        destinationPath: destinationHeader,
+        relativePath,
+    });
+    if (!target) return writeJson(res, 400, { ok: false, error: 'invalid_target' });
+
+    const tempName = `.${path.basename(target.absolutePath)}.webchat-upload-${process.pid}-${randomUUID()}.tmp`;
+    const tempPath = path.join(path.dirname(target.absolutePath), tempName);
     let size = 0;
-    let aborted = false;
-    const out = fs.createWriteStream(target.absolutePath);
+    let settled = false;
+    let writeFinished = false;
+    let out = null;
+    const cleanupTemp = () => {
+        try { fs.unlinkSync(tempPath); } catch (_) { /* no temporary file */ }
+    };
+    const fail = (status, error) => {
+        if (settled) return;
+        settled = true;
+        try { out?.destroy(); } catch (_) { /* ignore */ }
+        cleanupTemp();
+        writeJson(res, status, { ok: false, error });
+    };
+
+    try {
+        out = fs.createWriteStream(tempPath, { flags: 'wx' });
+    } catch (_) {
+        return writeJson(res, 500, { ok: false, error: 'write_failed' });
+    }
+
     req.on('data', (chunk) => {
         size += chunk.length;
     });
-    req.on('aborted', () => {
-        aborted = true;
+    req.once('aborted', () => {
+        if (settled) return;
+        settled = true;
         try { out.destroy(); } catch (_) { /* ignore */ }
-        try { fs.unlinkSync(target.absolutePath); } catch (_) { /* ignore */ }
+        cleanupTemp();
     });
-    req.pipe(out);
-    out.on('error', () => {
-        try { fs.unlinkSync(target.absolutePath); } catch (_) { /* ignore */ }
-        if (!res.headersSent) {
-            writeJson(res, 500, { ok: false, error: 'write_failed' });
+    req.once('error', () => fail(500, 'read_failed'));
+    out.once('error', () => fail(500, 'write_failed'));
+    out.once('finish', () => {
+        writeFinished = true;
+    });
+    out.once('close', () => {
+        if (settled) {
+            cleanupTemp();
+            return;
         }
-    });
-    out.on('finish', () => {
-        if (aborted) return;
-        const sessionRelative = buildSessionRelativePath(context.uploadRoot, target.absolutePath);
-        const workspaceRelative = buildWorkspaceRelativePath(context.workspaceRoot, target.absolutePath);
-        const cwdRelative = buildCwdRelativePath(context.cwd, target.absolutePath);
+        if (!writeFinished) return fail(500, 'write_failed');
+        try {
+            const latest = inspectExistingTarget(target.absolutePath);
+            if (latest.error) return fail(409, latest.error);
+            if (latest.exists && !overwrite) return fail(409, 'target_exists');
+            commitTemporaryFile(tempPath, target.absolutePath, overwrite);
+        } catch (error) {
+            if (!overwrite && error?.code === 'EEXIST') return fail(409, 'target_exists');
+            return fail(500, 'commit_failed');
+        }
+
+        settled = true;
         const filename = path.basename(target.absolutePath);
-        const mime = mimeHeader;
-        writeUploadMetadata(context, sessionRelative, {
-            filename,
-            relativePath: sessionRelative,
-            localPath: cwdRelative,
-            workspacePath: workspaceRelative,
-            size,
-            mime,
-            uploadedAt: new Date().toISOString(),
-        });
         writeJson(res, 201, {
             ok: true,
             filename,
-            relativePath: sessionRelative,
-            localPath: cwdRelative,
-            workspacePath: workspaceRelative,
-            downloadUrl: buildDownloadUrl(parsedUrl, sessionRelative),
+            relativePath: target.relativePath,
+            localPath: target.relativePath,
+            workspacePath: target.workspacePath,
+            downloadUrl: buildWorkspaceFileUrl(target.workspacePath),
             size,
             mime,
         });
     });
+    req.pipe(out);
 }
 
-function streamFile(req, res, absolutePath, mime, isHead) {
-    let stat;
-    try {
-        stat = fs.statSync(absolutePath);
-    } catch (_) {
-        res.writeHead(404, { 'Content-Type': 'text/plain' });
-        return res.end('Not Found');
-    }
-    const size = stat.size;
-    const range = req.headers['range'];
-    if (range && /^bytes=/.test(range)) {
-        const m = range.match(/bytes=(\d+)-(\d+)?/);
-        if (m) {
-            const start = parseInt(m[1], 10);
-            const end = m[2] ? parseInt(m[2], 10) : size - 1;
-            if (start <= end && start < size) {
-                res.writeHead(206, {
-                    'Content-Type': mime,
-                    'Content-Length': (end - start + 1),
-                    'Content-Range': `bytes ${start}-${end}/${size}`,
-                    'Accept-Ranges': 'bytes',
-                    'X-Content-Type-Options': 'nosniff',
-                    'Cache-Control': 'no-store',
-                });
-                if (isHead) return res.end();
-                return fs.createReadStream(absolutePath, { start, end }).pipe(res);
-            }
-        }
-    }
-    res.writeHead(200, {
-        'Content-Type': mime,
-        'Content-Length': size,
-        'Accept-Ranges': 'bytes',
-        'X-Content-Type-Options': 'nosniff',
-        'Cache-Control': 'no-store',
-    });
-    if (isHead) return res.end();
-    return fs.createReadStream(absolutePath).pipe(res);
-}
-
-export function handleWebchatUploadGet(req, res, parsedUrl, context) {
-    if (!context) {
-        return writeJson(res, 400, { ok: false, error: 'invalid_session' });
-    }
-    const rawPath = parsedUrl?.searchParams?.get('path') || '';
-    if (!rawPath) {
-        return writeJson(res, 400, { ok: false, error: 'missing_path' });
-    }
-    const sanitized = sanitizeUploadRelativePath(rawPath, '');
-    if (!sanitized) {
-        return writeJson(res, 400, { ok: false, error: 'invalid_path' });
-    }
-    if (!ensureSessionUploadRoot(context.uploadRoot)) {
-        return writeJson(res, 500, { ok: false, error: 'upload_root_unavailable' });
-    }
-    const target = resolveUploadTarget({
-        uploadRoot: context.uploadRoot,
-        workspaceRoot: context.workspaceRoot,
-        relativePath: sanitized,
-        allowMissingLeaf: false,
-    });
-    if (!target) {
-        res.writeHead(404, { 'Content-Type': 'text/plain' });
-        return res.end('Not Found');
-    }
-    let stat;
-    try {
-        stat = fs.statSync(target.absolutePath);
-    } catch (_) {
-        res.writeHead(404, { 'Content-Type': 'text/plain' });
-        return res.end('Not Found');
-    }
-    if (!stat.isFile()) {
-        res.writeHead(404, { 'Content-Type': 'text/plain' });
-        return res.end('Not Found');
-    }
-    const metadata = readUploadMetadata(context, target.relativePath);
-    const mime = normalizeMimeType(metadata?.mime);
-    return streamFile(req, res, target.absolutePath, mime, req.method === 'HEAD');
-}
+export const __testables = {
+    allowsOverwrite,
+    commitTemporaryFile,
+    inspectExistingTarget,
+};

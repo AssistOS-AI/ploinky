@@ -255,7 +255,7 @@ const uploader = createUploader({
     folderUploadInput,
     filePreviewContainer,
     attachmentContainer
-}, { composer });
+}, { composer, toEndpoint });
 
 function refocusComposerAfterIcon(btn) {
     if (!btn) {

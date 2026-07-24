@@ -2566,6 +2566,218 @@ body {
     color: var(--wa-icon-color-active);
 }
 
+.wa-upload-destination-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 1100;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 24px;
+    background: rgba(11, 20, 26, 0.72);
+    backdrop-filter: blur(2px);
+}
+
+.wa-upload-destination-overlay[hidden] {
+    display: none;
+}
+
+.wa-upload-destination-dialog {
+    width: min(720px, 100%);
+    max-height: min(720px, calc(100vh - 48px));
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    color: var(--wa-text-primary);
+    background: var(--wa-bg-panel);
+    border: 1px solid var(--wa-border);
+    border-radius: 14px;
+    box-shadow: var(--wa-shadow-md);
+}
+
+.wa-upload-destination-header,
+.wa-upload-directory-toolbar,
+.wa-upload-destination-footer {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 14px 16px;
+}
+
+.wa-upload-destination-header {
+    justify-content: space-between;
+    border-bottom: 1px solid var(--wa-border);
+}
+
+.wa-upload-destination-header h2 {
+    margin: 0;
+    font-size: 18px;
+}
+
+.wa-upload-selection-summary {
+    margin: 4px 0 0;
+    color: var(--wa-text-muted);
+    font-size: 13px;
+}
+
+.wa-upload-destination-close {
+    border: 0;
+    background: transparent;
+    color: var(--wa-text-secondary);
+    cursor: pointer;
+    font-size: 26px;
+}
+
+.wa-upload-breadcrumbs {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    min-height: 42px;
+    padding: 8px 16px;
+    overflow-x: auto;
+    border-bottom: 1px solid var(--wa-border);
+}
+
+.wa-upload-breadcrumbs button {
+    border: 0;
+    padding: 4px 6px;
+    white-space: nowrap;
+    color: var(--wa-accent);
+    background: transparent;
+    cursor: pointer;
+}
+
+.wa-upload-directory-toolbar {
+    justify-content: space-between;
+}
+
+.wa-upload-current-path {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--wa-text-secondary);
+    font-size: 13px;
+}
+
+.wa-upload-new-folder-toggle,
+.wa-upload-new-folder-form button,
+.wa-upload-destination-footer button {
+    border: 1px solid var(--wa-border-light);
+    border-radius: 8px;
+    padding: 8px 12px;
+    color: var(--wa-text-primary);
+    background: var(--wa-bg-secondary);
+    cursor: pointer;
+}
+
+.wa-upload-new-folder-form {
+    display: flex;
+    gap: 8px;
+    padding: 0 16px 12px;
+}
+
+.wa-upload-new-folder-form[hidden] {
+    display: none;
+}
+
+.wa-upload-new-folder-form input {
+    flex: 1;
+    min-width: 0;
+    border: 1px solid var(--wa-border);
+    border-radius: 8px;
+    padding: 8px 10px;
+    color: var(--wa-text-primary);
+    background: var(--wa-bg-input);
+}
+
+.wa-upload-directory-status,
+.wa-upload-overwrite-warning {
+    min-height: 20px;
+    padding: 0 16px 8px;
+    color: var(--wa-text-muted);
+    font-size: 13px;
+}
+
+.wa-upload-overwrite-warning {
+    color: #d97706;
+}
+
+.wa-upload-directory-list {
+    flex: 1;
+    min-height: 260px;
+    overflow: auto;
+    padding: 0 12px 12px;
+}
+
+.wa-upload-directory-entry {
+    width: 100%;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    border: 0;
+    border-radius: 8px;
+    padding: 9px 10px;
+    text-align: left;
+    color: var(--wa-text-primary);
+    background: transparent;
+}
+
+button.wa-upload-directory-entry.folder {
+    cursor: pointer;
+}
+
+button.wa-upload-directory-entry.folder:hover {
+    background: var(--wa-bg-hover);
+}
+
+.wa-upload-directory-entry.file {
+    color: var(--wa-text-muted);
+}
+
+.wa-upload-directory-entry-name {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.wa-upload-directory-empty {
+    padding: 32px 12px;
+    color: var(--wa-text-muted);
+    text-align: center;
+}
+
+.wa-upload-destination-footer {
+    justify-content: flex-end;
+    border-top: 1px solid var(--wa-border);
+}
+
+.wa-upload-destination-footer .wa-upload-confirm {
+    border-color: var(--wa-accent);
+    color: #fff;
+    background: var(--wa-accent);
+}
+
+.wa-upload-destination-footer button:disabled {
+    cursor: not-allowed;
+    opacity: 0.55;
+}
+
+@media (max-width: 640px) {
+    .wa-upload-destination-overlay {
+        align-items: stretch;
+        padding: 12px;
+    }
+
+    .wa-upload-destination-dialog {
+        max-height: calc(100vh - 24px);
+    }
+
+    .wa-upload-directory-list {
+        min-height: 180px;
+    }
+}
+
 .wa-camera-overlay {
     position: fixed;
     inset: 0;

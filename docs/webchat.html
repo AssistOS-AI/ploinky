@@ -163,12 +163,14 @@ ploinky cli achilles-cli --path=/absolute/path</code></pre>
                 </div>
 
                 <div class="doc-section">
-                    <h2>Session Uploads</h2>
-                    <p>WebChat stores uploaded files in a per-session directory under the current working directory: <code>&lt;cwd&gt;/uploads/&lt;webchat_sid&gt;/</code>. <code>webchat_sid</code> is the WebChat session cookie issued to the authenticated browser; it is not the browser tab id.</p>
+                    <h2>Workspace Uploads</h2>
+                    <p>After choosing a file, folder, or camera capture, WebChat opens its own destination explorer at the current working directory. Browse with the breadcrumb, create a folder when needed, and choose <strong>Upload here</strong>. The selection appears above the composer immediately, while its bytes are uploaded only when the message is sent.</p>
                     <ul style="margin-left: 2rem;">
-                        <li>The attachment menu has <strong>Upload file</strong> and <strong>Upload folder</strong> entries. Folder uploads preserve <code>file.webkitRelativePath</code> as the relative path inside the session upload directory.</li>
-                        <li>Composer <code>@</code> suggestions search the WebChat working directory, so uploaded content appears only when its session folder is reached through normal cwd-relative folder navigation.</li>
-                        <li>Uploads use <code>POST /webchat/uploads</code> and are read back via <code>GET /webchat/uploads?path=&lt;session-relative-path&gt;</code>. Downloads reuse stored MIME metadata and set <code>X-Content-Type-Options: nosniff</code>. The server rejects absolute paths, traversal segments, NUL bytes, symlink escapes, and reserved <code>.secrets</code>/<code>*.secrets</code> names.</li>
+                        <li>The explorer lists the immediate contents of the selected directory. Folders can be opened; files are visible for context but cannot be selected as destinations.</li>
+                        <li>Folder uploads preserve <code>file.webkitRelativePath</code>, including the selected folder name. Existing folders are merged after confirmation: colliding files are replaced and unrelated files remain.</li>
+                        <li>An existing file is never replaced without an explicit warning and confirmation. File-versus-folder conflicts remain blocked.</li>
+                        <li><code>POST /webchat/uploads</code> writes directly below the selected working-directory path and returns an authenticated <code>/workspace-files/...</code> link. WebChat does not create an <code>uploads</code> folder, hashed storage path, persistent upload id, or MIME metadata file.</li>
+                        <li>The server rejects absolute paths, traversal segments, NUL bytes, symlink paths, Ploinky runtime state, dependency directories, and reserved <code>.secrets</code>/<code>*.secrets</code> names.</li>
                     </ul>
                 </div>
 

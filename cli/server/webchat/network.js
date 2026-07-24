@@ -5,6 +5,19 @@ const ENVELOPE_VERSION = 1;
 
 export const __testables = {};
 
+export function buildAttachmentUploadHeaders({ file, relativePath, destinationPath, overwrite } = {}) {
+    const mime = file?.type || 'application/octet-stream';
+    const headers = {
+        'Content-Type': mime,
+        'X-Mime-Type': mime,
+        'X-File-Name': encodeURIComponent(file?.name || ''),
+        'X-Destination-Path': encodeURIComponent(String(destinationPath || '').replace(/^\/+|\/+$/g, '')),
+    };
+    if (relativePath) headers['X-Relative-Path'] = encodeURIComponent(relativePath);
+    if (overwrite === true) headers['X-Overwrite'] = '1';
+    return headers;
+}
+
 function stripCtrlAndAnsi(input) {
     try {
         let out = input || '';
@@ -538,7 +551,16 @@ export function createNetwork({
     }
 
     function uploadAttachment(filePayload, caption) {
-        const { file, previewUrl, revokePreview, previewNeedsRevoke, isImage, relativePath } = filePayload || {};
+        const {
+            file,
+            previewUrl,
+            revokePreview,
+            previewNeedsRevoke,
+            isImage,
+            relativePath,
+            destinationPath,
+            overwrite,
+        } = filePayload || {};
         const isFileObject = (typeof File !== 'undefined' && file instanceof File)
             || (file && typeof file.name === 'string' && typeof file.size !== 'undefined');
         if (!isFileObject) {
@@ -553,11 +575,17 @@ export function createNetwork({
         const effectiveRelativePath = typeof relativePath === 'string' && relativePath.trim()
             ? relativePath.trim()
             : (file.name || '');
+        const normalizedDestination = typeof destinationPath === 'string'
+            ? destinationPath.trim().replace(/^\/+|\/+$/g, '')
+            : '';
+        const targetLocalPath = [normalizedDestination, effectiveRelativePath]
+            .filter(Boolean)
+            .join('/');
 
         let clientAttachment = null;
         if (typeof addClientAttachment === 'function') {
             clientAttachment = addClientAttachment({
-                fileName: effectiveRelativePath !== file.name ? effectiveRelativePath : file.name,
+                fileName: targetLocalPath || file.name,
                 size: file.size,
                 mime: file.type,
                 previewUrl,
@@ -571,15 +599,12 @@ export function createNetwork({
 
         const uploadUrl = toEndpoint('uploads');
 
-        const mime = file.type || 'application/octet-stream';
-        const headers = {
-            'Content-Type': mime,
-            'X-Mime-Type': mime,
-            'X-File-Name': encodeURIComponent(file.name),
-        };
-        if (effectiveRelativePath) {
-            headers['X-Relative-Path'] = encodeURIComponent(effectiveRelativePath);
-        }
+        const headers = buildAttachmentUploadHeaders({
+            file,
+            relativePath: effectiveRelativePath,
+            destinationPath: normalizedDestination,
+            overwrite,
+        });
 
         return fetch(uploadUrl, {
             method: 'POST',
@@ -589,7 +614,16 @@ export function createNetwork({
         })
             .then(res => {
                 if (!res.ok) {
-                    return res.text().then(text => { throw new Error(text || 'Upload failed') });
+                    return res.text().then(text => {
+                        let message = text || 'Upload failed';
+                        try {
+                            const payload = JSON.parse(text);
+                            message = payload?.error || message;
+                        } catch (_) {
+                            // Keep the plain response body.
+                        }
+                        throw new Error(message);
+                    });
                 }
                 return res.json();
             })

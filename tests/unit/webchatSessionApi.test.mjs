@@ -76,6 +76,35 @@ test('conversation session REST routes are absent because the selected CLI owns 
     assert.equal(fs.existsSync(path.join(project, '.achilles-cli')), false);
 });
 
+test('WebChat directory routes browse and create folders under the selected working directory', async () => {
+    const appState = { sessions: new Map(), runtimes: new Map() };
+    fs.mkdirSync(path.join(project, 'existing'), { recursive: true });
+    fs.writeFileSync(path.join(project, 'note.txt'), 'note');
+
+    const listing = await request(appState, '/webchat/directories?workspace-dir=project&path=');
+    assert.equal(listing.statusCode, 200);
+    const listingPayload = JSON.parse(listing.body);
+    assert.deepEqual(listingPayload.entries.map(({ name, kind }) => ({ name, kind })), [
+        { name: 'existing', kind: 'folder' },
+        { name: 'note.txt', kind: 'file' },
+    ]);
+
+    const created = await request(appState, '/webchat/directories?workspace-dir=project', {
+        method: 'POST',
+        body: JSON.stringify({ path: 'existing/new-folder' }),
+    });
+    assert.equal(created.statusCode, 201);
+    assert.equal(fs.statSync(path.join(project, 'existing', 'new-folder')).isDirectory(), true);
+});
+
+test('legacy WebChat upload reads are removed without creating an uploads directory', async () => {
+    const appState = { sessions: new Map(), runtimes: new Map() };
+    const response = await request(appState, '/webchat/uploads?workspace-dir=project&path=legacy.txt');
+    assert.equal(response.statusCode, 405);
+    assert.equal(response.getHeader('allow'), 'POST, PUT');
+    assert.equal(fs.existsSync(path.join(project, 'uploads')), false);
+});
+
 test('retired session routes still pass through authentication before returning', async () => {
     fs.rmSync(path.join(project, '.copilot_history'), { recursive: true, force: true });
     const appState = { sessions: new Map(), runtimes: new Map() };

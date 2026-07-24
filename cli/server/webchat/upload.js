@@ -5,6 +5,11 @@ import {
     openCameraInputFallback,
     loadQrLib,
 } from './fileHelpers.js';
+import {
+    buildUploadSelectionRoots,
+    createUploadDestinationDialog,
+    joinUploadPath,
+} from './uploadDestinationDialog.js';
 
 function createCameraOverlay({ composer }) {
     if (!navigator.mediaDevices || typeof navigator.mediaDevices.getUserMedia !== 'function') {
@@ -506,10 +511,11 @@ export function createUploader({
     folderUploadInput,
     filePreviewContainer,
     attachmentContainer,
-}, { composer }) {
+}, { composer, toEndpoint }) {
 
     const selections = [];
     let cameraOverlay;
+    const destinationDialog = createUploadDestinationDialog({ toEndpoint, composer });
     const refocusComposer = () => {
         if (!composer || typeof composer.focus !== 'function') {
             return;
@@ -587,7 +593,7 @@ export function createUploader({
         `;
 
         const relativePath = selection.relativePath;
-        const previewName = relativePath && relativePath !== file.name ? relativePath : file.name;
+        const previewName = joinUploadPath(selection.destinationPath, relativePath) || file.name;
         item.querySelector('.wa-file-preview-name').textContent = previewName;
         item.querySelector('.wa-file-preview-size').textContent = formatBytes(file.size);
 
@@ -627,6 +633,8 @@ export function createUploader({
             previewDataUrl: null,
             domItem: null,
             relativePath,
+            destinationPath: sanitizeRelativePath(options.destinationPath || '', ''),
+            overwrite: options.overwrite === true,
         };
         selections.push(selection);
         createSelectionPreview(selection);
@@ -649,28 +657,52 @@ export function createUploader({
         refocusComposer();
     }
 
-    function handleFileSelection(event) {
+    async function queueSelectedFiles(files, mode) {
+        const pending = files.map((file) => ({
+            file,
+            relativePath: sanitizeRelativePath(
+                mode === 'folder' ? (file.webkitRelativePath || file.name || '') : (file.name || ''),
+                file.name,
+            ),
+        })).filter((selection) => selection.relativePath);
+        if (!pending.length) return;
+        const roots = buildUploadSelectionRoots(pending, mode);
+        const summary = mode === 'folder'
+            ? `Folder: ${roots[0]?.name || 'selected folder'}`
+            : `${pending.length} file${pending.length === 1 ? '' : 's'} selected`;
+        const destination = await destinationDialog.open({ roots, summary });
+        if (!destination) return;
+        const overwriteRoots = new Set(destination.overwriteRoots || []);
+        pending.forEach((selection) => {
+            const rootName = selection.relativePath.split('/')[0];
+            addSelection(selection.file, {
+                relativePath: selection.relativePath,
+                destinationPath: destination.destinationPath,
+                overwrite: overwriteRoots.has(rootName),
+            });
+        });
+    }
+
+    async function handleFileSelection(event) {
         try {
             const files = Array.from(event.target.files || []);
             if (!files.length) {
                 return;
             }
-            files.forEach((file) => addSelection(file));
+            await queueSelectedFiles(files, 'file');
             fileUploadInput.value = '';
         } finally {
             refocusComposer();
         }
     }
 
-    function handleFolderSelection(event) {
+    async function handleFolderSelection(event) {
         try {
             const files = Array.from(event.target.files || []);
             if (!files.length) {
                 return;
             }
-            files.forEach((file) => addSelection(file, {
-                relativePath: file.webkitRelativePath || file.name || '',
-            }));
+            await queueSelectedFiles(files, 'folder');
             if (folderUploadInput) {
                 folderUploadInput.value = '';
             }
@@ -697,7 +729,7 @@ export function createUploader({
                 try {
                     const file = await overlay.open();
                     if (file instanceof File) {
-                        addSelection(file);
+                        await queueSelectedFiles([file], 'file');
                     }
                     return;
                 } catch (error) {
@@ -706,7 +738,7 @@ export function createUploader({
             }
             const fallbackFile = await openCameraInputFallback();
             if (fallbackFile) {
-                addSelection(fallbackFile);
+                await queueSelectedFiles([fallbackFile], 'file');
             }
         } finally {
             refocusComposer();
@@ -773,6 +805,8 @@ export function createUploader({
                     revokePreview,
                     isImage: selection.isImage,
                     relativePath: selection.relativePath || selection.file.name || '',
+                    destinationPath: selection.destinationPath || '',
+                    overwrite: selection.overwrite === true,
                 };
             });
         },

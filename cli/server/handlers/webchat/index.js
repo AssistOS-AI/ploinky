@@ -4,10 +4,13 @@ import { fileURLToPath } from 'url';
 import { resolveWebchatCommandsForAgent } from '../../webchat/commandResolver.js';
 import * as staticSrv from '../../static/index.js';
 import {
-    handleWebchatUploadGet,
     handleWebchatUploadPost,
     resolveWebchatUploadContext,
 } from './uploads.js';
+import {
+    handleWorkspaceDirectoriesGet,
+    handleWorkspaceDirectoriesPost,
+} from './workspaceDirectories.js';
 import {
     buildWebchatQuery,
     resolveWebchatLaunchOptions
@@ -19,7 +22,6 @@ import {
 import {
     authorized,
     ensureAppSession,
-    getSession,
     handleLogout,
     redirectToRouterLogin
 } from './browserSession.js';
@@ -118,18 +120,30 @@ export async function handleWebChat(req, res, appConfig, appState) {
     }
 
     if (pathname === '/uploads') {
-        const sessionId = getSession(req, appState);
-        const uploadContext = resolveWebchatUploadContext({ workspaceBase, sessionId });
+        const uploadContext = resolveWebchatUploadContext({ workspaceBase });
         if (req.method === 'POST' || req.method === 'PUT') {
             return handleWebchatUploadPost(req, res, parsedUrl, uploadContext);
-        }
-        if (req.method === 'GET' || req.method === 'HEAD') {
-            return handleWebchatUploadGet(req, res, parsedUrl, uploadContext);
         }
         res.writeHead(405, {
             'Content-Type': 'application/json',
             'Cache-Control': 'no-store',
-            Allow: 'GET, HEAD, POST, PUT',
+            Allow: 'POST, PUT',
+        });
+        return res.end(JSON.stringify({ ok: false, error: 'method_not_allowed' }));
+    }
+
+    if (pathname === '/directories') {
+        const directoryContext = resolveWebchatUploadContext({ workspaceBase });
+        if (req.method === 'GET' || req.method === 'HEAD') {
+            return handleWorkspaceDirectoriesGet(req, res, parsedUrl, directoryContext);
+        }
+        if (req.method === 'POST') {
+            return handleWorkspaceDirectoriesPost(req, res, directoryContext);
+        }
+        res.writeHead(405, {
+            'Content-Type': 'application/json',
+            'Cache-Control': 'no-store',
+            Allow: 'GET, HEAD, POST',
         });
         return res.end(JSON.stringify({ ok: false, error: 'method_not_allowed' }));
     }
