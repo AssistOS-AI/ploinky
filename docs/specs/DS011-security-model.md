@@ -143,9 +143,14 @@ Browser autocomplete must not treat URL query parameters as authority to call ar
 
 Router-owned workspace file serving sanitizes relative paths and denies `..`
 traversal before resolving under the workspace root. Assistant path enhancement
-in WebChat must not widen this read boundary: it constructs authenticated
-`/workspace-files/...` links and performs the actual read only after an explicit
-user click. Supported text responses must be served inline with an
+in WebChat must not widen this read boundary. CLI-published
+`__webchatWorkspaceFiles` snapshots and deltas are untrusted presentation hints:
+Ploinky must bound their entry counts and path lengths, reject absolute,
+backslash, control-character, and traversal paths, keep the resulting index only
+in volatile runtime memory, and never use it as read authorization. The browser
+constructs authenticated `/workspace-files/...` links only for indexed candidates
+and performs the actual read only after an explicit user click; the router must
+still canonicalize and validate that target independently. Supported text responses must be served inline with an
 extension-derived MIME type and `X-Content-Type-Options: nosniff`; WebChat must
 escape source and plain-text content, render Markdown through its existing
 renderer, and sandbox workspace HTML previews. Agent application static serving

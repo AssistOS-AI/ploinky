@@ -9,9 +9,11 @@ import {
     buildRuntimeKey,
     parseWebchatRuntimeState,
     parseWebchatSessionState,
+    parseWebchatWorkspaceFilesState,
     routeWorkspaceRuntimeOutput,
     serializeRuntimeStateSseEvent,
     serializeSessionStateSseEvent,
+    serializeWorkspaceFilesSseEvent,
 } from '../../cli/server/handlers/webchat/runtimeState.js';
 import { handleRuntimeRoute } from '../../cli/server/handlers/webchat/runtimeRoutes.js';
 import { __testables as networkTestables } from '../../cli/server/webchat/network.js';
@@ -87,6 +89,55 @@ test('session list envelopes are validated but do not replace the current snapsh
     assert.match(serializeSessionStateSseEvent(current), /event: session-state/);
 });
 
+test('workspace file envelopes become hidden in-memory snapshots and deltas', () => {
+    const snapshot = parseWebchatWorkspaceFilesState({
+        __webchatWorkspaceFiles: 1,
+        version: 1,
+        indexVersion: 1,
+        reset: true,
+        files: ['README.md', 'src/index.mjs'],
+    });
+    assert.deepEqual(snapshot, {
+        indexVersion: 1,
+        reset: true,
+        files: ['README.md', 'src/index.mjs'],
+    });
+    assert.match(serializeWorkspaceFilesSseEvent(snapshot), /event: workspace-files/);
+    assert.equal(parseWebchatWorkspaceFilesState({
+        __webchatWorkspaceFiles: 1,
+        version: 1,
+        indexVersion: 2,
+        reset: true,
+        files: ['../outside.md'],
+    }), undefined);
+
+    const writes = [];
+    const tab = {
+        subscribers: new Map([['client', { res: { write: (value) => writes.push(value) } }]]),
+        taskProtocolBuffer: '',
+    };
+    const appState = { runtimes: new Map([['runtime', tab]]) };
+    const delta = JSON.stringify({
+        __webchatWorkspaceFiles: 1,
+        version: 1,
+        indexVersion: 2,
+        reset: false,
+        added: ['reports/final.md'],
+        removed: ['src/index.mjs'],
+    });
+    routeWorkspaceRuntimeOutput(appState, tab, `${JSON.stringify({
+        __webchatWorkspaceFiles: 1,
+        version: 1,
+        indexVersion: 1,
+        reset: true,
+        files: ['README.md', 'src/index.mjs'],
+    })}\n${delta}\n`);
+    assert.equal(tab.webchatWorkspaceFiles.indexVersion, 2);
+    assert.deepEqual([...tab.webchatWorkspaceFiles.files].sort(), ['README.md', 'reports/final.md']);
+    assert.equal(writes.filter((value) => value.includes('event: workspace-files')).length, 2);
+    assert.doesNotMatch(writes.join(''), /__webchatWorkspaceFiles/);
+});
+
 test('runtime identity is independent of the AchillesCLI conversation session', () => {
     const config = { agentName: 'achilles-cli' };
     const first = buildRuntimeKey('/workspace', config, 'agent=achilles-cli');
@@ -105,6 +156,10 @@ test('an EventSource reconnect receives the in-memory session snapshot', (t) => 
         subscribers: new Map(),
         workspaceDirectory,
         webchatSessionSnapshot: parseWebchatSessionState(sessionEnvelope()),
+        webchatWorkspaceFiles: {
+            indexVersion: 4,
+            files: new Set(['README.md', 'reports/final.md']),
+        },
     };
     const sid = 'browser-session';
     const appState = {
@@ -127,6 +182,8 @@ test('an EventSource reconnect receives the in-memory session snapshot', (t) => 
     });
 
     assert.match(writes.join(''), /event: session-state/);
+    assert.match(writes.join(''), /event: workspace-files/);
+    assert.match(writes.join(''), /reports\/final\.md/);
     assert.match(writes.join(''), new RegExp(SESSION_ID));
     req.emit('close');
     if (tab.cleanupTimer) clearTimeout(tab.cleanupTimer);

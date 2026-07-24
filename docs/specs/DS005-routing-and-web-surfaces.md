@@ -57,8 +57,22 @@ rendering without modifying the raw message supplied by the selected CLI.
 Detection must cover cwd-relative paths with supported
 document, text, source, image, PDF, or HTML extensions. Inline-code paths may
 contain spaces, while fenced code blocks, external links, URLs, traversal paths,
-and host-absolute paths must not be rewritten. Existing relative Markdown file
-links may be normalized to the same preview route. The browser must prefix
+and host-absolute paths must not be rewritten. A compatible selected CLI may
+publish version-1 `__webchatWorkspaceFiles` envelopes containing an initial full
+snapshot and later added/removed deltas for its active working directory. Ploinky
+must intercept these control lines before assistant rendering, validate bounded
+normalized relative paths, retain only the latest index in runtime memory, expose
+changes through the named `workspace-files` EventSource event, and replay a full
+snapshot after reconnect. It must not scan on behalf of the CLI or persist the
+index.
+
+The browser must create automatic preview links only for recognized candidates
+present in the current CLI-published index. A candidate seen before the first
+snapshot or absent from the current index remains ordinary text. Additions must
+allow already rendered messages to be enhanced, while removals must turn
+previously inferred links back into text without changing stored conversation
+content. Existing relative Markdown file links may be normalized to the same
+preview route only while their target is indexed. The browser must prefix
 cwd-relative candidates with the WebChat working directory's workspace-relative
 base and point them at the existing authenticated `/workspace-files/...` route.
 Explicit `/workspace-files/...` links remain workspace-root-relative and must not
@@ -66,7 +80,8 @@ receive the cwd prefix a second time. Clicking a detected path must open the sid
 panel: Markdown uses the existing Markdown renderer, text and source content use
 an escaped code view, images use an image preview, PDFs use the browser viewer,
 and HTML uses a sandboxed iframe. Unknown binary types must not trigger a download
-from an automatically detected path.
+from an automatically detected path. The authenticated file route remains the
+final read-time authority even when a path is present in the volatile index.
 
 WebChat must not hardcode optional agent ids, backend tags, or agent-owned tool names for `@` suggestions. It must not offer an `Agents` suggestion group or highlight arbitrary `@word` tokens as provider mentions. Unknown `@word` mentions remain ordinary chat text; semantic provider routing, if any, belongs to the selected chat agent after it receives the message envelope.
 
@@ -388,16 +403,16 @@ avoid duplicate starts and immediate calls to an MCP server that is not ready.
 Response:
 An interaction response controls an already running CLI request and is not a new user prompt. A dedicated authenticated endpoint can bind it to the active tab, runtime, request id, and declared option, while named SSE events keep the transient selector out of conversation history and allow it to recover after a transport reconnect.
 
-### Question #22: Why does assistant file-link enhancement reuse `/workspace-files` without pre-validating every candidate?
+### Question #22: Why does the selected CLI publish workspace file state while the router still validates reads?
 
 Response:
-The assistant may describe files using several ordinary textual forms, and the
-browser can recognize those forms without changing the conversation schema or
-making a request during every streaming update. Reusing the authenticated
-router-owned file route keeps canonical path validation at the read boundary. A
-syntactic false positive therefore becomes at most a failed preview after an
-explicit user click, while the agent receives no additional filesystem
-capability and the stored assistant text remains unchanged.
+The selected CLI owns working-directory semantics and can refresh the index at
+startup, periodically, and immediately before it emits an answer. Ploinky can
+therefore stay a generic transport while the browser avoids turning nonexistent
+textual candidates into links. The index is only an untrusted presentation hint:
+the authenticated router-owned file route still performs canonical confinement
+and existence checks when the user opens a preview. This separation neither
+grants the agent another filesystem capability nor changes stored assistant text.
 
 ### Question #23: Why does the selected CLI own conversation restoration?
 

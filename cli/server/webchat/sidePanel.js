@@ -30,7 +30,13 @@ export function createSidePanel({
     sidePanelClose,
     sidePanelTitle,
     sidePanelResizer
-}, { markdown, workspaceBase = '', webchatBasePath = '/webchat', sendQuickCommand = null }) {
+}, {
+    markdown,
+    workspaceBase = '',
+    webchatBasePath = '/webchat',
+    workspaceFileIndex = null,
+    sendQuickCommand = null,
+}) {
     let activeBubble = null;
     let activeFrame = null;
     let activeFrameUrl = '';
@@ -164,7 +170,11 @@ export function createSidePanel({
             return;
         }
         container.innerHTML = renderMarkdown(markdown, text);
-        enhanceWorkspaceFileLinks(container, { workspaceBase, webchatBasePath });
+        enhanceWorkspaceFileLinks(container, {
+            workspaceBase,
+            webchatBasePath,
+            fileIndex: workspaceFileIndex,
+        });
         bindLinkDelegation(container);
         setPanelTitleText('Full Answer');
         activeFrame = null;
@@ -276,7 +286,11 @@ export function createSidePanel({
         panelWrapper.appendChild(container);
         if (markdownFile) {
             container.innerHTML = renderMarkdown(markdown, text);
-            enhanceWorkspaceFileLinks(container, { workspaceBase, webchatBasePath });
+            enhanceWorkspaceFileLinks(container, {
+                workspaceBase,
+                webchatBasePath,
+                fileIndex: workspaceFileIndex,
+            });
             bindLinkDelegation(container);
             return;
         }
@@ -507,6 +521,17 @@ export function createSidePanel({
         container.dataset.linksBound = 'true';
     }
 
+    function refreshWorkspaceFileLinks() {
+        const containers = panelWrapper?.querySelectorAll?.('.wa-side-panel-body') || [];
+        for (const container of containers) {
+            enhanceWorkspaceFileLinks(container, {
+                workspaceBase,
+                webchatBasePath,
+                fileIndex: workspaceFileIndex,
+            });
+        }
+    }
+
     return {
         openText,
         openIframe,
@@ -514,6 +539,7 @@ export function createSidePanel({
         postTaskUpdate,
         close,
         updateIfActive,
+        refreshWorkspaceFileLinks,
         isActive: (bubble) => bubble === activeBubble,
         applyPanelSizeFromStorage,
         bindLinkDelegation

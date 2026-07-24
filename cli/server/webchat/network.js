@@ -142,6 +142,28 @@ function parseRuntimeStatePayload(text) {
     }
 }
 
+export function parseWorkspaceFilesPayload(text) {
+    try {
+        const payload = typeof text === 'string' ? JSON.parse(text) : text;
+        const indexVersion = Number(payload?.indexVersion);
+        if (!Number.isSafeInteger(indexVersion) || indexVersion < 1) return null;
+        if (payload.reset === true && Array.isArray(payload.files)) {
+            return { indexVersion, reset: true, files: payload.files };
+        }
+        if (payload.reset === false && Array.isArray(payload.added) && Array.isArray(payload.removed)) {
+            return {
+                indexVersion,
+                reset: false,
+                added: payload.added,
+                removed: payload.removed,
+            };
+        }
+        return null;
+    } catch (_) {
+        return null;
+    }
+}
+
 function parseInteractionPayload(text) {
     try {
         const payload = typeof text === 'string' ? JSON.parse(text) : text;
@@ -213,6 +235,7 @@ export function createNetwork({
     onSessionState,
     onTaskUpdate,
     onRuntimeState,
+    onWorkspaceFiles,
     onInteractionRequest,
     onInteractionResolved,
     onConnected
@@ -450,6 +473,13 @@ export function createNetwork({
             const runtimeState = parseRuntimeStatePayload(event.data);
             if (runtimeState !== undefined && typeof onRuntimeState === 'function') {
                 onRuntimeState(runtimeState);
+            }
+        });
+
+        es.addEventListener('workspace-files', (event) => {
+            const update = parseWorkspaceFilesPayload(event.data);
+            if (update && typeof onWorkspaceFiles === 'function') {
+                onWorkspaceFiles(update);
             }
         });
 

@@ -10,6 +10,11 @@ import {
     workspaceFilePreviewKind,
 } from '../../cli/server/webchat/workspaceFileLinks.js';
 
+function fileIndex(...paths) {
+    const files = new Set(paths);
+    return { has: (filePath) => files.has(filePath) };
+}
+
 test('workspace file detection recognizes common assistant path forms', () => {
     const text = [
         'Created report.md and docs/summary.json.',
@@ -98,7 +103,7 @@ test('workspace file enhancement replaces assistant text candidates with preview
         replaceChild(next) { this.replacement = next; },
     };
     const textNode = {
-        nodeValue: 'Created reports/final-report.md and summary.json.',
+        nodeValue: 'Created reports/final-report.md and summary.json; missing.json was not created.',
         parentElement: parent,
         parentNode: parent,
     };
@@ -138,7 +143,10 @@ test('workspace file enhancement replaces assistant text candidates with preview
         querySelectorAll: () => [],
     };
 
-    const count = enhanceWorkspaceFileLinks(container, { workspaceBase: 'project' });
+    const count = enhanceWorkspaceFileLinks(container, {
+        workspaceBase: 'project',
+        fileIndex: fileIndex('reports/final-report.md', 'summary.json'),
+    });
 
     assert.equal(count, 2);
     const anchors = parent.replacement.children.filter((child) => child.tagName === 'A');
@@ -148,7 +156,8 @@ test('workspace file enhancement replaces assistant text candidates with preview
         ['/workspace-files/project/reports/final-report.md', '/workspace-files/project/summary.json'],
     );
     assert.ok(anchors.every((anchor) => anchor.dataset.wcFile === 'true'));
-    assert.equal(textNode.nodeValue, 'Created reports/final-report.md and summary.json.');
+    assert.ok(parent.replacement.children.some((child) => String(child.nodeValue || '').includes('missing.json')));
+    assert.equal(textNode.nodeValue, 'Created reports/final-report.md and summary.json; missing.json was not created.');
 });
 
 test('workspace file enhancement preserves explicit workspace-root file links', () => {
@@ -168,7 +177,10 @@ test('workspace file enhancement preserves explicit workspace-root file links', 
             querySelectorAll: () => [anchor],
         };
 
-        enhanceWorkspaceFileLinks(container, { workspaceBase: 'current-project' });
+        enhanceWorkspaceFileLinks(container, {
+            workspaceBase: 'current-project',
+            fileIndex: fileIndex('.ploinky/repos/tool.mjs'),
+        });
 
         assert.equal(anchor.href, '/workspace-files/.ploinky/repos/tool.mjs');
         assert.equal(anchor.dataset.wcFilePath, '.ploinky/repos/tool.mjs');
@@ -192,11 +204,39 @@ test('workspace file enhancement normalizes relative Markdown file links', () =>
             querySelectorAll: () => [anchor],
         };
 
-        enhanceWorkspaceFileLinks(container, { workspaceBase: 'project' });
+        enhanceWorkspaceFileLinks(container, {
+            workspaceBase: 'project',
+            fileIndex: fileIndex('reports/final.md'),
+        });
 
         assert.equal(anchor.href, '/workspace-files/project/reports/final.md');
         assert.equal(anchor.dataset.wcFilePath, 'reports/final.md');
     } finally {
         globalThis.window = originalWindow;
     }
+});
+
+test('workspace file enhancement turns removed automatic links back into text', () => {
+    const parent = {
+        replacement: null,
+        replaceChild(next) { this.replacement = next; },
+    };
+    const anchor = {
+        dataset: { wcAutoFile: 'true', wcFilePath: 'reports/removed.md' },
+        textContent: 'reports/removed.md',
+        parentNode: parent,
+    };
+    const container = {
+        ownerDocument: {
+            createTextNode: (value) => ({ nodeValue: value }),
+            createTreeWalker: () => ({ nextNode: () => null }),
+        },
+        querySelectorAll(selector) {
+            return selector.includes('wc-auto-file') ? [anchor] : [];
+        },
+    };
+
+    enhanceWorkspaceFileLinks(container, { fileIndex: fileIndex() });
+
+    assert.equal(parent.replacement.nodeValue, 'reports/removed.md');
 });

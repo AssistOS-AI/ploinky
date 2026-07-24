@@ -44,6 +44,7 @@ export function createMessages({
     markdown,
     workspaceBase = '',
     webchatBasePath = '/webchat',
+    workspaceFileIndex = null,
     initialViewMoreLineLimit,
     sidePanel,
     taskController,
@@ -972,7 +973,11 @@ export function createMessages({
             if (bubble.closest('.wa-message.out')) {
                 highlightMentions(textContainer);
             } else {
-                enhanceWorkspaceFileLinks(textContainer, { workspaceBase, webchatBasePath });
+                enhanceWorkspaceFileLinks(textContainer, {
+                    workspaceBase,
+                    webchatBasePath,
+                    fileIndex: workspaceFileIndex,
+                });
             }
             enhanceMarkdownTables(textContainer);
             sidePanel.bindLinkDelegation(textContainer);
@@ -1465,12 +1470,25 @@ export function createMessages({
         userInputSent = false;
     }
 
+    function refreshWorkspaceFileLinks() {
+        const containers = chatList?.querySelectorAll?.('.wa-message-text') || [];
+        for (const container of containers) {
+            if (container.closest?.('.wa-message.out')) continue;
+            enhanceWorkspaceFileLinks(container, {
+                workspaceBase,
+                webchatBasePath,
+                fileIndex: workspaceFileIndex,
+            });
+        }
+    }
+
     return {
         addClientMsg,
         addClientAttachment,
         addServerMsg,
         clearMessages,
         renderHistory,
+        refreshWorkspaceFileLinks,
         associateTask,
         addProgressEvent,
         showTypingIndicator,

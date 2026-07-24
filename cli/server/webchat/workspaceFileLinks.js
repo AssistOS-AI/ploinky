@@ -167,7 +167,20 @@ function isInlineCodeNode(node) {
         && String(parent?.parentElement?.tagName || '').toUpperCase() !== 'PRE';
 }
 
-function createFileAnchor(documentRef, match, workspaceBase) {
+function isKnownWorkspaceFile(fileIndex, filePath, workspaceBase) {
+    if (!fileIndex || typeof fileIndex.has !== 'function') return false;
+    const normalized = normalizeWorkspaceFileCandidate(filePath);
+    if (!normalized) return false;
+    if (fileIndex.has(normalized.path)) return true;
+    const base = normalizeRelativeBase(workspaceBase);
+    if (base && normalized.path.startsWith(`${base}/`)) {
+        return fileIndex.has(normalized.path.slice(base.length + 1));
+    }
+    return false;
+}
+
+function createFileAnchor(documentRef, match, workspaceBase, fileIndex) {
+    if (!isKnownWorkspaceFile(fileIndex, match.path, workspaceBase)) return null;
     const href = buildWorkspaceFileUrl(match.path, workspaceBase);
     if (!href) return null;
     const anchor = documentRef.createElement('a');
@@ -175,6 +188,7 @@ function createFileAnchor(documentRef, match, workspaceBase) {
     anchor.className = 'wa-workspace-file-link';
     anchor.dataset.wcLink = 'true';
     anchor.dataset.wcFile = 'true';
+    anchor.dataset.wcAutoFile = 'true';
     anchor.dataset.wcFilePath = match.path;
     if (match.line !== null) anchor.dataset.wcFileLine = String(match.line);
     if (match.column !== null) anchor.dataset.wcFileColumn = String(match.column);
@@ -183,9 +197,32 @@ function createFileAnchor(documentRef, match, workspaceBase) {
     return anchor;
 }
 
-function enhanceExistingAnchors(container, { workspaceBase, webchatBasePath }) {
+function restoreExistingAnchor(anchor) {
+    if (anchor.dataset?.wcFileEnhanced !== 'true') return;
+    const originalHref = anchor.dataset.wcOriginalHref;
+    if (originalHref) anchor.href = originalHref;
+    delete anchor.dataset.wcFile;
+    delete anchor.dataset.wcFilePath;
+    delete anchor.dataset.wcFileEnhanced;
+    delete anchor.dataset.wcOriginalHref;
+    anchor.classList?.remove?.('wa-workspace-file-link');
+}
+
+function reconcileAutoAnchors(container, { workspaceBase, fileIndex }) {
+    const anchors = container.querySelectorAll?.('a[data-wc-auto-file="true"]') || [];
+    for (const anchor of anchors) {
+        if (anchor.dataset?.wcAutoFile !== 'true') continue;
+        const filePath = anchor.dataset?.wcFilePath || '';
+        if (isKnownWorkspaceFile(fileIndex, filePath, workspaceBase)) continue;
+        const text = container.ownerDocument.createTextNode(anchor.textContent || '');
+        anchor.parentNode?.replaceChild?.(text, anchor);
+    }
+}
+
+function enhanceExistingAnchors(container, { workspaceBase, webchatBasePath, fileIndex }) {
     const anchors = container.querySelectorAll?.('a[data-wc-link="true"]') || [];
     for (const anchor of anchors) {
+        if (anchor.dataset?.wcAutoFile === 'true') continue;
         let url;
         try {
             url = new URL(anchor.href, window.location.origin);
@@ -208,10 +245,18 @@ function enhanceExistingAnchors(container, { workspaceBase, webchatBasePath }) {
             continue;
         }
         if (workspaceFilePreviewKind(candidate) === 'unknown') continue;
+        if (!isKnownWorkspaceFile(fileIndex, candidate, workspaceBase)) {
+            restoreExistingAnchor(anchor);
+            continue;
+        }
         const href = buildWorkspaceFileUrl(candidate, alreadyWorkspaceRelative ? '' : workspaceBase);
         if (!href) continue;
+        if (anchor.dataset.wcFileEnhanced !== 'true') {
+            anchor.dataset.wcOriginalHref = anchor.getAttribute?.('href') || anchor.href;
+        }
         anchor.href = href;
         anchor.dataset.wcFile = 'true';
+        anchor.dataset.wcFileEnhanced = 'true';
         anchor.dataset.wcFilePath = normalizeWorkspaceFileCandidate(candidate)?.path || candidate;
         anchor.classList?.add?.('wa-workspace-file-link');
     }
@@ -220,9 +265,11 @@ function enhanceExistingAnchors(container, { workspaceBase, webchatBasePath }) {
 export function enhanceWorkspaceFileLinks(container, {
     workspaceBase = '',
     webchatBasePath = '/webchat',
+    fileIndex = null,
 } = {}) {
     if (!container || !container.ownerDocument) return 0;
-    enhanceExistingAnchors(container, { workspaceBase, webchatBasePath });
+    reconcileAutoAnchors(container, { workspaceBase, fileIndex });
+    enhanceExistingAnchors(container, { workspaceBase, webchatBasePath, fileIndex });
 
     const documentRef = container.ownerDocument;
     const walker = documentRef.createTreeWalker(container, 4);
@@ -245,7 +292,7 @@ export function enhanceWorkspaceFileLinks(container, {
             if (match.start > cursor) {
                 fragment.appendChild(documentRef.createTextNode(text.slice(cursor, match.start)));
             }
-            const anchor = createFileAnchor(documentRef, match, workspaceBase);
+            const anchor = createFileAnchor(documentRef, match, workspaceBase, fileIndex);
             if (anchor) {
                 fragment.appendChild(anchor);
                 linked += 1;
@@ -261,3 +308,5 @@ export function enhanceWorkspaceFileLinks(container, {
     }
     return linked;
 }
+
+export const __testables = { isKnownWorkspaceFile };

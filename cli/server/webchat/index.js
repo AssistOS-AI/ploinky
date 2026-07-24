@@ -12,6 +12,7 @@ import { createComposerMentionHighlighter } from './composerMentionHighlights.js
 import { createSessionController } from './sessions.js';
 import { createTaskController } from './tasks.js';
 import { createInteractionPrompt } from './interactionPrompt.js';
+import { createWorkspaceFileIndex } from './workspaceFileIndex.js';
 
 const PURGE_TRIGGER_RE = /\bpurge\b/i;
 const EDITABLE_TAGS = ['INPUT', 'TEXTAREA', 'SELECT', 'OPTION'];
@@ -77,6 +78,8 @@ const {
     interactionPromptOptions
 } = elements;
 
+const workspaceFileIndex = createWorkspaceFileIndex();
+
 let network = null;
 
 const sidePanelApi = createSidePanel({
@@ -91,6 +94,7 @@ const sidePanelApi = createSidePanel({
     markdown,
     workspaceBase,
     webchatBasePath: basePath,
+    workspaceFileIndex,
     sendQuickCommand: (command) => network?.sendQuickCommand(command) || false,
 });
 
@@ -121,6 +125,7 @@ const messages = createMessages({
     markdown,
     workspaceBase,
     webchatBasePath: basePath,
+    workspaceFileIndex,
     initialViewMoreLineLimit: getViewMoreLineLimit(),
     sidePanel: sidePanelApi,
     taskController,
@@ -165,6 +170,11 @@ network = createNetwork({
         }
     },
     onRuntimeState: (state) => dom.setRuntimeModel(state?.model),
+    onWorkspaceFiles: (update) => {
+        if (!workspaceFileIndex.applyUpdate(update)) return;
+        messages.refreshWorkspaceFileLinks();
+        sidePanelApi.refreshWorkspaceFileLinks();
+    },
     onInteractionRequest: (interaction) => interactionController?.show(interaction),
     onInteractionResolved: (resolution) => interactionController?.resolve(resolution),
     onConnected: () => taskController?.refresh().catch(() => {})

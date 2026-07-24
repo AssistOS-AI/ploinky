@@ -128,6 +128,21 @@ ploinky cli achilles-cli --path=/absolute/path</code></pre>
                     <p>The badge describes agent-declared configuration, not the effective provider model used for an individual answer. WebChat does not read agent settings files, persist the badge in folder history, or attach model metadata to messages.</p>
                     <p>Conversation restoration does not use a process-instance identifier. The selected CLI owns process startup, current-session loading, and one-time agent hydration; WebChat only retains the latest session snapshot for reconnecting browsers.</p>
 
+                    <h3>Workspace File Index</h3>
+                    <p>
+                        A compatible CLI can publish an initial workspace-file snapshot and later added/removed deltas
+                        for its current working directory. WebChat removes these control records from assistant output,
+                        keeps the index only in live runtime and browser memory, and sends a complete snapshot again
+                        after an EventSource reconnect.
+                    </p>
+                    <p>
+                        Recognizable assistant paths become preview links only when their normalized cwd-relative target
+                        is present in that index. New files can enhance messages already on screen, and deleted files turn
+                        previously inferred links back into text. Opening a link still goes through the authenticated
+                        <code>/workspace-files/...</code> route, which independently validates the path and remains the
+                        final read authority.
+                    </p>
+
                     <h3>Background Tasks</h3>
                     <p>CLIs may publish generic asynchronous task list, view, lifecycle, log, and action envelopes through their stdout stream. The selected CLI owns task metadata, logs, reattachment, and actions in its workspace store. WebChat validates these envelopes, retains only volatile runtime state, and presents it through the authenticated <strong>Tasks</strong> overlay. The Tasks button sends <code>/tasks</code>; selecting a task sends <code>/task view &lt;task-id&gt;</code>. Ploinky does not write task state or logs and exposes no task data REST API.</p>
                     <p>Every started task appears immediately as its own compact incoming-style chat item. One assistant turn may create multiple task items, kept after its assistant message in task-start order even when final assistant text arrives later. For a visible command such as <code>/exec launch-opencode hi</code>, the selected CLI persists the command, its response, and each task reference in the same ordered session snapshot, so refresh restores all three. Silent <code>/tasks</code>, <code>/task view</code>, stop/continue, and session-control requests remain UI actions rather than transcript turns; their textual acknowledgements and errors are also suppressed from the main chat. The first row shows the exact agent id, description, current status, and elapsed seconds; the second row provides a <strong>View task details</strong> link instead of inline expansion. The link opens the authenticated task HTML page in WebChat's right-side panel. The page asks its parent to send <code>/task view</code> for initial state and recovery, then receives matching updates from the parent's existing EventSource through a same-origin message bridge. A mismatched log offset triggers one full snapshot request and waits for the real response instead of recursively replaying the same delta. The page does not open a second live stream or fetch task data directly. The item survives completion and history reload. Old assistant messages carrying a <code>taskId</code> property are ignored instead of migrated. Pending tasks show <code>QUEUED</code>, active tasks show <code>RUNNING</code>, and terminal tasks show <code>COMPLETED</code>, <code>STOPPED</code>, or <code>FAILED</code>.</p>
@@ -145,7 +160,7 @@ ploinky cli achilles-cli --path=/absolute/path</code></pre>
                         <li>✅ Agent progress reasons persisted as an ordered string array and displayed as a collapsible block above the final answer</li>
                         <li>✅ Side panel to inspect full message history</li>
                         <li>✅ Workspace file previews — recognizable cwd-relative paths in assistant output become links
-                            without changing the stored message. Markdown is rendered with the WebChat Markdown renderer,
+                            only when the selected CLI's live workspace index contains the file, without changing the stored message. Markdown is rendered with the WebChat Markdown renderer,
                             text and source files use an escaped code view, images and PDFs use native previews, and HTML
                             opens in a sandboxed frame. All content is read through the existing authenticated
                             <code>/workspace-files/...</code> route.</li>

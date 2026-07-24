@@ -16,6 +16,7 @@ import {
     serializeInteractionResolvedSseEvent,
     serializeRuntimeStateSseEvent,
     serializeSessionStateSseEvent,
+    serializeWorkspaceFilesSseEvent,
     writeOrBufferSseEvent
 } from './runtimeState.js';
 
@@ -101,6 +102,7 @@ export function handleRuntimeRoute({
                     webchatSessionSnapshot: null,
                     liveMessageCount: 0,
                     webchatTasks: new Map(),
+                    webchatWorkspaceFiles: null,
                     taskProtocolBuffer: ''
                 };
                 runtimes.set(runtimeKey, tab);
@@ -148,6 +150,14 @@ export function handleRuntimeRoute({
         if (runtimeStateSnapshot) res.write(runtimeStateSnapshot);
         const sessionStateSnapshot = serializeSessionStateSseEvent(tab.webchatSessionSnapshot);
         if (sessionStateSnapshot) res.write(sessionStateSnapshot);
+        const workspaceFilesSnapshot = tab.webchatWorkspaceFiles
+            ? serializeWorkspaceFilesSseEvent({
+                indexVersion: tab.webchatWorkspaceFiles.indexVersion,
+                reset: true,
+                files: [...tab.webchatWorkspaceFiles.files].sort(),
+            })
+            : '';
+        if (workspaceFilesSnapshot) res.write(workspaceFilesSnapshot);
         const interactionSnapshot = serializeInteractionRequestSseEvent(tab.pendingInteraction);
         if (interactionSnapshot) res.write(interactionSnapshot);
 
