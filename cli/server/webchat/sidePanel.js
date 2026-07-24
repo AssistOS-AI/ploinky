@@ -67,24 +67,18 @@ export function createSidePanel({
         clearPanelTitle();
 
         const anchor = document.createElement('a');
+        anchor.className = 'wa-side-panel-title-link';
         anchor.href = url;
         anchor.target = '_blank';
         anchor.rel = 'noopener noreferrer';
         anchor.textContent = label;
         anchor.title = url;
-        anchor.style.color = 'var(--wa-accent)';
-        anchor.style.textDecoration = 'none';
-        anchor.style.wordBreak = 'break-all';
-        anchor.style.overflowWrap = 'anywhere';
-        anchor.style.fontFamily = 'Menlo, Monaco, Consolas, monospace';
-        anchor.style.fontSize = '13px';
 
         const icon = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+        icon.classList.add('wa-side-panel-title-icon');
         icon.setAttribute('width', '16');
         icon.setAttribute('height', '16');
         icon.setAttribute('viewBox', '0 0 24 24');
-        icon.style.marginLeft = '6px';
-        icon.style.verticalAlign = 'text-bottom';
 
         const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
         path.setAttribute('fill', 'currentColor');
@@ -112,8 +106,7 @@ export function createSidePanel({
         copyBtn.innerHTML = '<svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M16 1H4c-1.1 0-2 .9-2 2v12h2V3h12V1zm3 4H8c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h11c1.1 0 2-.9 2-2V7c0-1.1-.9-2-2-2zm0 16H8V7h11v14z"/></svg>';
 
         const wrap = document.createElement('span');
-        wrap.style.display = 'inline-flex';
-        wrap.style.alignItems = 'center';
+        wrap.className = 'wa-side-panel-title-row';
         wrap.appendChild(anchor);
         wrap.appendChild(icon);
         wrap.appendChild(copyBtn);

@@ -4,10 +4,12 @@ import {
     taskDurationLabel,
     taskStatusPresentation,
 } from './taskPresentation.js';
+import { createTaskViewTransport } from './taskViewTransport.js';
 
 const TASK_VIEW_PATH_RE = /^(.*)\/tasks\/(task_[0-9a-f]{24})\/view$/;
 const match = TASK_VIEW_PATH_RE.exec(window.location.pathname);
 const taskId = match?.[2] || '';
+const basePath = match?.[1] || '/webchat';
 const agent = document.getElementById('taskAgent');
 const description = document.getElementById('taskDescription');
 const status = document.getElementById('taskStatus');
@@ -74,8 +76,7 @@ function applyTheme() {
 }
 
 function requestCommand(command) {
-    if (window.parent === window) throw new Error('task_parent_unavailable');
-    window.parent.postMessage({ type: 'webchat-task-command', taskId, command }, window.location.origin);
+    return transport.requestCommand(command);
 }
 
 function renderTask() {
@@ -121,7 +122,7 @@ async function stopTask() {
     actionError.textContent = '';
     renderTask();
     try {
-        requestCommand(`/task stop ${taskId}`);
+        await requestCommand(`/task stop ${taskId}`);
     } catch (stopError) {
         stopSubmitting = false;
         actionError.hidden = false;
@@ -200,7 +201,7 @@ async function submitContinuation(event) {
     continuationError.textContent = '';
     renderTask();
     try {
-        requestCommand(`/task continue ${taskId} ${message}`);
+        await requestCommand(`/task continue ${taskId} ${message}`);
     } catch (submitError) {
         continuationSubmitting = false;
         continuationError.hidden = false;
@@ -214,13 +215,12 @@ function initialize() {
         initialLoadComplete = true;
         renderTask();
         renderLog();
+        return;
     }
+    transport.start();
 }
 
-window.addEventListener('message', (event) => {
-    if (event.origin !== window.location.origin || event.source !== window.parent) return;
-    if (event.data?.type !== 'webchat-task-update') return;
-    const payload = event.data.payload;
+function receiveUpdate(payload) {
     if (payload?.task?.id !== taskId) return;
     if (!initialLoadComplete) {
         if (payload.event !== 'view') {
@@ -233,7 +233,26 @@ window.addEventListener('message', (event) => {
         return;
     }
     applyUpdate(payload);
+}
+
+const transport = createTaskViewTransport({
+    windowRef: window,
+    basePath,
+    taskId,
+    onOpen: () => {
+        void syncLog().catch(showLoadError);
+    },
+    onUpdate: receiveUpdate,
+    onError: showLoadError,
 });
+
+window.addEventListener('message', (event) => {
+    if (event.origin !== window.location.origin || event.source !== window.parent) return;
+    if (event.data?.type !== 'webchat-task-update') return;
+    receiveUpdate(event.data.payload);
+});
+
+window.addEventListener('pagehide', () => transport.stop());
 
 applyTheme();
 continuationForm.addEventListener('submit', submitContinuation);

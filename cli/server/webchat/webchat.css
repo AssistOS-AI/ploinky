@@ -779,18 +779,39 @@ body {
 }
 
 .wa-side-panel-title {
+    flex: 1 1 auto;
+    min-width: 0;
     font-size: 16px;
     font-weight: 500;
     color: var(--wa-text-primary);
 }
 
+.wa-side-panel-title-row {
+    display: flex;
+    align-items: center;
+    min-width: 0;
+    max-width: 100%;
+}
+
 .wa-side-panel-title a {
+    display: block;
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
     color: var(--wa-accent);
     text-decoration: none;
-    word-break: break-all;
-    overflow-wrap: anywhere;
+    word-break: normal;
+    overflow-wrap: normal;
     font-family: Menlo, Monaco, Consolas, monospace;
     font-size: 13px;
+}
+
+.wa-side-panel-title-icon {
+    flex: 0 0 auto;
+    margin-left: 6px;
+    vertical-align: text-bottom;
 }
 
 .wa-side-panel-title a:hover {
@@ -823,6 +844,7 @@ body {
 }
 
 .wa-side-panel-close {
+    flex: 0 0 auto;
     width: 28px;
     height: 28px;
     background: transparent;
@@ -1264,6 +1286,12 @@ body {
     color: var(--wa-accent);
     text-decoration: underline;
     cursor: pointer;
+    display: inline-block;
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    vertical-align: bottom;
 }
 
 .wa-workspace-file-link {
