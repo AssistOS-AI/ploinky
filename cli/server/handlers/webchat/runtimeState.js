@@ -13,6 +13,7 @@ const TASK_CONTINUATION_HANDLE_RE = /^[A-Za-z0-9_-]{16,200}$/;
 const TASK_TOOL_NAME_RE = /^[A-Za-z0-9._-]{1,160}$/;
 const INTERACTION_ID_RE = /^[A-Za-z0-9_-]{8,128}$/;
 const INTERACTION_TOKEN_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+const PLOINKY_WORKSPACE_BANNER_RE = /^\[ploinky\]\s+using \.ploinky:\s+.+$/;
 const TASK_STATUSES = new Set(['ongoing', 'finished', 'stopped', 'error']);
 
 function normalizeTask(raw) {
@@ -353,6 +354,7 @@ export function broadcastWorkspaceTaskEvent(appState, workspaceDirectory, payloa
 
 function routeCompleteOutputLine(appState, tab, line) {
     const normalized = stripCtrlAndAnsi(String(line || '')).trim();
+    if (PLOINKY_WORKSPACE_BANNER_RE.test(normalized)) return;
     if (normalized.includes(`"${WEBCHAT_SESSION_FLAG}"`)) {
         try {
             const sessionState = parseWebchatSessionState(JSON.parse(normalized));
