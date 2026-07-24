@@ -33,6 +33,7 @@ export function createSidePanel({
 }, { markdown, workspaceBase = '', webchatBasePath = '/webchat', sendQuickCommand = null }) {
     let activeBubble = null;
     let activeFrame = null;
+    let activeFrameUrl = '';
     let activeTaskId = '';
     let activeFileRequest = 0;
     const panelWrapper = sidePanel?.querySelector('.wa-side-panel-content') || null;
@@ -174,6 +175,7 @@ export function createSidePanel({
         bindLinkDelegation(container);
         setPanelTitleText('Full Answer');
         activeFrame = null;
+        activeFrameUrl = '';
         activeTaskId = '';
     }
 
@@ -190,7 +192,18 @@ export function createSidePanel({
 
     function openIframe(url, { taskId = '', sandbox = false, title = url } = {}) {
         if (!panelWrapper || !sidePanel) {
-            return;
+            return null;
+        }
+        const normalizedTaskId = String(taskId || '').trim();
+        const normalizedUrl = String(url || '');
+        if (normalizedTaskId
+            && activeTaskId === normalizedTaskId
+            && activeFrame
+            && activeFrameUrl === normalizedUrl) {
+            ensurePanelVisible();
+            setPanelTitleLink(url, title);
+            applyPanelSizeFromStorage();
+            return activeFrame;
         }
         activeFileRequest += 1;
         panelWrapper.innerHTML = '';
@@ -232,6 +245,11 @@ export function createSidePanel({
         frame.addEventListener('load', () => {
             loaded = true;
             overlay.style.display = 'none';
+            if (normalizedTaskId
+                && activeFrame === frame
+                && activeTaskId === normalizedTaskId) {
+                sendQuickCommand?.(`/task view ${normalizedTaskId}`);
+            }
         });
         setTimeout(() => {
             if (!loaded) {
@@ -241,10 +259,12 @@ export function createSidePanel({
 
         activeBubble = null;
         activeFrame = frame;
-        activeTaskId = String(taskId || '').trim();
+        activeFrameUrl = normalizedUrl;
+        activeTaskId = normalizedTaskId;
         ensurePanelVisible();
         setPanelTitleLink(url, title);
         applyPanelSizeFromStorage();
+        return frame;
     }
 
     function showFileMessage(message, className = '') {
@@ -295,6 +315,7 @@ export function createSidePanel({
         const requestId = ++activeFileRequest;
         activeBubble = null;
         activeFrame = null;
+        activeFrameUrl = '';
         activeTaskId = '';
         ensurePanelVisible();
         applyPanelSizeFromStorage();
@@ -342,6 +363,7 @@ export function createSidePanel({
         chatContainer.classList.remove('side-panel-open');
         activeBubble = null;
         activeFrame = null;
+        activeFrameUrl = '';
         activeTaskId = '';
         activeFileRequest += 1;
         resetChatAreaSizing();

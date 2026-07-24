@@ -60,6 +60,235 @@ test('side panel forwards only the active task update to its same-origin iframe'
     assert.equal(posted[0].message.payload.task.id, taskId);
 });
 
+test('opening the same active task view reuses its iframe and preserves its log state', (t) => {
+    const originalDocument = globalThis.document;
+    const originalWindow = globalThis.window;
+    const originalSetTimeout = globalThis.setTimeout;
+    const createdFrames = [];
+    const makeElement = (tagName = 'div') => {
+        const element = {
+            tagName: tagName.toUpperCase(),
+            children: [],
+            className: '',
+            dataset: {},
+            style: {},
+            contentWindow: tagName === 'iframe' ? {} : null,
+            appendChild(child) {
+                this.children.push(child);
+                return child;
+            },
+            addEventListener() {},
+        };
+        if (tagName === 'iframe') createdFrames.push(element);
+        return element;
+    };
+    const panelWrapper = makeElement();
+    const sidePanel = makeElement();
+    sidePanel.querySelector = () => panelWrapper;
+    const chatContainer = makeElement();
+    chatContainer.classList = { add() {}, remove() {} };
+    globalThis.document = { createElement: (tagName) => makeElement(tagName) };
+    globalThis.window = { location: { origin: 'http://localhost:8080' } };
+    globalThis.setTimeout = () => 0;
+    t.after(() => {
+        globalThis.document = originalDocument;
+        globalThis.window = originalWindow;
+        globalThis.setTimeout = originalSetTimeout;
+    });
+
+    const api = createSidePanel({
+        chatContainer,
+        chatArea: null,
+        sidePanel,
+        sidePanelContent: null,
+        sidePanelClose: null,
+        sidePanelTitle: null,
+        sidePanelResizer: null,
+    }, { markdown: null });
+    const taskId = 'task_1234567890abcdef12345678';
+    const url = `http://localhost:8080/webchat/tasks/${taskId}/view`;
+    const first = api.openIframe(url, { taskId });
+    const second = api.openIframe(url, { taskId });
+
+    assert.equal(second, first);
+    assert.equal(createdFrames.length, 1);
+});
+
+test('switching task views reloads the complete log after each iframe is ready', (t) => {
+    const originalDocument = globalThis.document;
+    const originalWindow = globalThis.window;
+    const originalSetTimeout = globalThis.setTimeout;
+    const commands = [];
+    const createdFrames = [];
+    const makeElement = (tagName = 'div') => {
+        const listeners = new Map();
+        const element = {
+            tagName: tagName.toUpperCase(),
+            children: [],
+            className: '',
+            dataset: {},
+            style: {},
+            contentWindow: tagName === 'iframe' ? {} : null,
+            appendChild(child) {
+                this.children.push(child);
+                return child;
+            },
+            addEventListener(type, listener) {
+                listeners.set(type, listener);
+            },
+            dispatch(type) {
+                listeners.get(type)?.();
+            },
+        };
+        if (tagName === 'iframe') createdFrames.push(element);
+        return element;
+    };
+    const panelWrapper = makeElement();
+    const sidePanel = makeElement();
+    sidePanel.querySelector = () => panelWrapper;
+    const chatContainer = makeElement();
+    chatContainer.classList = { add() {}, remove() {} };
+    globalThis.document = { createElement: (tagName) => makeElement(tagName) };
+    globalThis.window = { location: { origin: 'http://localhost:8080' } };
+    globalThis.setTimeout = () => 0;
+    t.after(() => {
+        globalThis.document = originalDocument;
+        globalThis.window = originalWindow;
+        globalThis.setTimeout = originalSetTimeout;
+    });
+
+    const api = createSidePanel({
+        chatContainer,
+        chatArea: null,
+        sidePanel,
+        sidePanelContent: null,
+        sidePanelClose: null,
+        sidePanelTitle: null,
+        sidePanelResizer: null,
+    }, {
+        markdown: null,
+        sendQuickCommand: (command) => commands.push(command),
+    });
+    const firstTaskId = 'task_1234567890abcdef12345678';
+    const secondTaskId = 'task_abcdefabcdefabcdefabcdef';
+
+    api.openIframe(`http://localhost:8080/webchat/tasks/${firstTaskId}/view`, { taskId: firstTaskId });
+    createdFrames[0].dispatch('load');
+    api.openIframe(`http://localhost:8080/webchat/tasks/${secondTaskId}/view`, { taskId: secondTaskId });
+    createdFrames[1].dispatch('load');
+    api.openIframe(`http://localhost:8080/webchat/tasks/${firstTaskId}/view`, { taskId: firstTaskId });
+    createdFrames[2].dispatch('load');
+
+    assert.deepEqual(commands, [
+        `/task view ${firstTaskId}`,
+        `/task view ${secondTaskId}`,
+        `/task view ${firstTaskId}`,
+    ]);
+});
+
+test('task view renders a complete terminal log snapshot without waiting for another live delta', async (t) => {
+    const originalDocument = globalThis.document;
+    const originalWindow = globalThis.window;
+    const originalLocalStorage = globalThis.localStorage;
+    const originalSetInterval = globalThis.setInterval;
+    const listeners = new Map();
+    const elements = new Map();
+    const makeElement = () => ({
+        children: [],
+        className: '',
+        dataset: {},
+        style: {},
+        hidden: false,
+        disabled: false,
+        textContent: '',
+        value: '',
+        scrollHeight: 40,
+        scrollTop: 0,
+        clientHeight: 100,
+        selectionStart: 0,
+        selectionEnd: 0,
+        addEventListener() {},
+        appendChild(child) {
+            this.children.push(child);
+            return child;
+        },
+        replaceChildren(...children) {
+            this.children = children;
+        },
+        setRangeText() {},
+        dispatchEvent() {},
+        requestSubmit() {},
+    });
+    for (const id of [
+        'taskAgent',
+        'taskDescription',
+        'taskStatus',
+        'taskDuration',
+        'taskError',
+        'taskStop',
+        'taskActionError',
+        'taskLog',
+        'taskContinuation',
+        'taskContinuationInput',
+        'taskContinuationSend',
+        'taskContinuationError',
+    ]) {
+        elements.set(id, makeElement());
+    }
+    const parent = {};
+    globalThis.window = {
+        location: {
+            pathname: '/webchat/tasks/task_1234567890abcdef12345678/view',
+            origin: 'http://localhost:8080',
+        },
+        parent,
+        addEventListener(type, listener) {
+            listeners.set(type, listener);
+        },
+    };
+    globalThis.document = {
+        body: { dataset: {} },
+        title: '',
+        getElementById: (id) => elements.get(id),
+        createElement: () => makeElement(),
+    };
+    globalThis.localStorage = { getItem: () => null };
+    globalThis.setInterval = () => 0;
+    t.after(() => {
+        globalThis.document = originalDocument;
+        globalThis.window = originalWindow;
+        globalThis.localStorage = originalLocalStorage;
+        globalThis.setInterval = originalSetInterval;
+    });
+
+    await import(`../../cli/server/webchat/taskView.js?snapshot=${Date.now()}`);
+    listeners.get('message')?.({
+        origin: 'http://localhost:8080',
+        source: parent,
+        data: {
+            type: 'webchat-task-update',
+            payload: {
+                event: 'view',
+                task: {
+                    id: 'task_1234567890abcdef12345678',
+                    targetAgent: 'opencodeAgent',
+                    description: 'Finished task',
+                    status: 'finished',
+                },
+                log: {
+                    text: 'historical line\nfinal answer\n',
+                    nextOffset: 29,
+                },
+            },
+        },
+    });
+
+    assert.deepEqual(
+        elements.get('taskLog').children.map((child) => child.textContent),
+        ['historical line', 'final answer', '\u00a0'],
+    );
+});
+
 test('task view sends continuation through the AchillesCLI command bridge', () => {
     const source = fs.readFileSync(
         new URL('../../cli/server/webchat/taskView.js', import.meta.url),

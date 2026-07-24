@@ -159,6 +159,7 @@ function applyLogUpdate(payload) {
 function applyUpdate(payload) {
     if (payload?.task?.id !== taskId) return;
     task = { ...task, ...payload.task };
+    let receivedLogSnapshot = false;
     if (payload.event === 'action' && payload.action === 'stop') stopSubmitting = false;
     if (payload.event === 'action' && payload.action === 'continue') {
         continuationSubmitting = false;
@@ -177,8 +178,10 @@ function applyUpdate(payload) {
         logText = typeof payload.log.text === 'string' ? payload.log.text : '';
         logOffset = Number(payload.log.nextOffset) || 0;
         logResyncPending = false;
+        receivedLogSnapshot = true;
     }
     renderTask();
+    if (receivedLogSnapshot) renderLog();
     applyLogUpdate(payload);
 }
 
@@ -206,22 +209,11 @@ async function submitContinuation(event) {
     }
 }
 
-async function initialize() {
+function initialize() {
     if (!taskId) {
         initialLoadComplete = true;
         renderTask();
         renderLog();
-        return;
-    }
-    try {
-        await syncLog();
-    } catch (loadError) {
-        showLoadError(loadError);
-    } finally {
-        initialLoadComplete = true;
-        renderTask();
-        renderLog();
-        for (const payload of pendingUpdates.splice(0)) applyUpdate(payload);
     }
 }
 
@@ -230,8 +222,17 @@ window.addEventListener('message', (event) => {
     if (event.data?.type !== 'webchat-task-update') return;
     const payload = event.data.payload;
     if (payload?.task?.id !== taskId) return;
-    if (!initialLoadComplete) pendingUpdates.push(payload);
-    else applyUpdate(payload);
+    if (!initialLoadComplete) {
+        if (payload.event !== 'view') {
+            pendingUpdates.push(payload);
+            return;
+        }
+        initialLoadComplete = true;
+        applyUpdate(payload);
+        for (const pending of pendingUpdates.splice(0)) applyUpdate(pending);
+        return;
+    }
+    applyUpdate(payload);
 });
 
 applyTheme();
@@ -253,4 +254,4 @@ autoResizeContinuationInput();
 renderTask();
 renderLog();
 setInterval(renderTask, 1000);
-void initialize();
+initialize();
