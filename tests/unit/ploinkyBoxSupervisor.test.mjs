@@ -308,3 +308,74 @@ test('public health connects to the published port with matching authority', asy
     await checkBoxHealth(port);
     assert.equal(observedHost, `127.0.0.1:${port}`);
 });
+
+test('public health accepts the exact active admin-auth challenge', async (t) => {
+    const http = await import('node:http');
+    const server = http.createServer((_request, response) => {
+        response.writeHead(302, {
+            Location: '/auth/login?returnTo=%2Fhealth&agent=explorer',
+        }).end('Authentication required');
+    });
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+    t.after(() => new Promise((resolve) => server.close(resolve)));
+    const { port } = server.address();
+
+    await checkBoxHealth(port);
+});
+
+test('public health waits for an inactive edge generation to become ready', async (t) => {
+    const http = await import('node:http');
+    let requests = 0;
+    const server = http.createServer((_request, response) => {
+        requests += 1;
+        if (requests === 1) {
+            response.writeHead(503).end('{"error":"EDGE_GENERATION_INACTIVE"}');
+            return;
+        }
+        response.writeHead(200).end('{"status":"healthy"}');
+    });
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+    t.after(() => new Promise((resolve) => server.close(resolve)));
+    const { port } = server.address();
+
+    await checkBoxHealth(port, {
+        readinessTimeoutMs: 1_000,
+        retryDelayMs: 1,
+    });
+
+    assert.equal(requests, 2);
+});
+
+test('public health fails immediately for a permanent response', async (t) => {
+    const http = await import('node:http');
+    let requests = 0;
+    const server = http.createServer((_request, response) => {
+        requests += 1;
+        response.writeHead(401).end('{"error":"unauthorized"}');
+    });
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+    t.after(() => new Promise((resolve) => server.close(resolve)));
+    const { port } = server.address();
+
+    await assert.rejects(() => checkBoxHealth(port, {
+        readinessTimeoutMs: 1_000,
+        retryDelayMs: 1,
+    }), /unhealthy \(HTTP 401\)/);
+
+    assert.equal(requests, 1);
+});
+
+test('public health bounds an inactive edge generation wait', async (t) => {
+    const http = await import('node:http');
+    const server = http.createServer((_request, response) => {
+        response.writeHead(503).end('{"error":"EDGE_GENERATION_INACTIVE"}');
+    });
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+    t.after(() => new Promise((resolve) => server.close(resolve)));
+    const { port } = server.address();
+
+    await assert.rejects(() => checkBoxHealth(port, {
+        readinessTimeoutMs: 0,
+        retryDelayMs: 1,
+    }), /did not become ready within 0ms/);
+});

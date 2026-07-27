@@ -4,6 +4,10 @@ import http from 'node:http';
 import { BOX_IMAGE_REFERENCE, BOX_LABELS } from './constants.mjs';
 import { inspectAndValidateExistingImage } from './contract/image.mjs';
 import { discoverBoxOwnership } from './engine/discovery.mjs';
+import {
+    readWorkspaceEdgeDesired,
+    stageWorkspaceEdgeDesired,
+} from './edgeDesired.mjs';
 import { PloinkyBoxError } from './errors.mjs';
 import { resolveWorkspaceIdentity } from './identity.mjs';
 import { createMutationLockManager, withWorkspaceMutationLock } from './locks.mjs';
@@ -43,6 +47,8 @@ export function createBoxSupervisor({
     reconcile = reconcileBoxContainer,
     validateExistingImage = inspectAndValidateExistingImage,
     startCore = runBoundedCoreStart,
+    readEdgeDesired = readWorkspaceEdgeDesired,
+    stageEdgeDesired = stageWorkspaceEdgeDesired,
     healthCheck = checkBoxHealth,
     stdout = process.stdout,
     stderr = process.stderr,
@@ -101,6 +107,15 @@ export function createBoxSupervisor({
             });
             const containerId = prepared.ownership.handles.container.id;
             ensureBoxDependencies(ownership.engine, containerId, runner);
+            const edgeDesired = readEdgeDesired(identity);
+            if (edgeDesired) {
+                stageEdgeDesired({
+                    candidate: edgeDesired,
+                    engine: ownership.engine,
+                    containerId,
+                    runner,
+                });
+            }
             await startCore(
                 ownership.engine,
                 containerId,
@@ -317,35 +332,97 @@ export async function runBoundedCoreStart(
 export function checkBoxHealth(hostPort, {
     httpGet,
     timeoutMs = 5_000,
+    readinessTimeoutMs = 1_800_000,
+    retryDelayMs = 1_000,
+    delay = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)),
 } = {}) {
-    return new Promise((resolve, reject) => {
-        const selectedGet = httpGet || http.get;
-        try {
-            const request = selectedGet({
-                hostname: '127.0.0.1',
-                port: Number(hostPort),
-                path: '/health',
-                headers: { Host: `127.0.0.1:${hostPort}` },
-            }, (response) => {
-                let body = '';
+    const deadline = Date.now() + readinessTimeoutMs;
+
+    async function checkUntilReady() {
+        const result = await checkOnce();
+        if (result.ready) return true;
+        if (!result.retryable) {
+            throw supervisorError(result.message);
+        }
+        if (Date.now() >= deadline) {
+            throw supervisorError(
+                `Public Box health did not become ready within ${readinessTimeoutMs}ms: ${result.message}`,
+            );
+        }
+        await delay(Math.min(retryDelayMs, Math.max(0, deadline - Date.now())));
+        return checkUntilReady();
+    }
+
+    function checkOnce() {
+        return new Promise((resolve, reject) => {
+            const selectedGet = httpGet || http.get;
+            try {
+                const request = selectedGet({
+                    hostname: '127.0.0.1',
+                    port: Number(hostPort),
+                    path: '/health',
+                    headers: { Host: `127.0.0.1:${hostPort}` },
+                }, (response) => {
+                    let body = '';
                 response.setEncoding('utf8');
                 response.on('data', (chunk) => { body += chunk; });
                 response.on('end', () => {
+                    if (response.statusCode === 302 && body === 'Authentication required') {
+                        try {
+                            const location = new URL(
+                                String(response.headers?.location || ''),
+                                `http://127.0.0.1:${hostPort}`,
+                            );
+                            if (location.pathname === '/auth/login'
+                                && location.searchParams.get('returnTo') === '/health') {
+                                resolve({ ready: true });
+                                return;
+                            }
+                        } catch (_) {}
+                    }
                     try {
                         const health = JSON.parse(body);
-                        if (response.statusCode === 200 && health.status === 'healthy') resolve(true);
-                        else reject(supervisorError('Public Box health check was unhealthy'));
-                    } catch (error) {
-                        reject(supervisorError('Public Box health response was malformed'));
-                    }
+                            if (response.statusCode === 200 && health.status === 'healthy') {
+                                resolve({ ready: true });
+                                return;
+                            }
+                            if (response.statusCode === 503
+                                && health.error === 'EDGE_GENERATION_INACTIVE') {
+                                resolve({
+                                    ready: false,
+                                    retryable: true,
+                                    message: 'edge generation is inactive',
+                                });
+                                return;
+                            }
+                            resolve({
+                                ready: false,
+                                retryable: false,
+                                message: `Public Box health check was unhealthy (HTTP ${response.statusCode})`,
+                            });
+                        } catch (error) {
+                            resolve({
+                                ready: false,
+                                retryable: false,
+                                message: 'Public Box health response was malformed',
+                            });
+                        }
+                    });
                 });
+                request.setTimeout(timeoutMs, () => request.destroy(new Error('health timeout')));
+                request.on('error', (error) => resolve({
+                    ready: false,
+                    retryable: ['ECONNREFUSED', 'ECONNRESET', 'ETIMEDOUT'].includes(error?.code)
+                        || error?.message === 'health timeout',
+                    message: `Public Box health check failed: ${error.message}`,
+                }));
+            } catch (error) {
+                reject(supervisorError(`Public Box health check failed: ${error.message}`));
+            }
             });
-            request.setTimeout(timeoutMs, () => request.destroy(new Error('health timeout')));
-            request.on('error', (error) => reject(supervisorError(`Public Box health check failed: ${error.message}`)));
-        } catch (error) {
-            reject(supervisorError(`Public Box health check failed: ${error.message}`));
-        }
-    });
+    }
+
+    return checkUntilReady();
 }
 
 export const defaultBoxSupervisor = createBoxSupervisor;

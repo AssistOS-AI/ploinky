@@ -151,6 +151,26 @@ function containerRecordId(record, name) {
     return id;
 }
 
+function networkAttachmentSetIsExact(record, mode, expectedNames = []) {
+    const attached = record?.NetworkSettings?.Networks || {};
+    const observedNames = Object.keys(attached).sort();
+    const exactExpectedNames = [...expectedNames].sort();
+    if (JSON.stringify(observedNames) === JSON.stringify(exactExpectedNames)) return true;
+    // Podman 6 reports its built-in host/none network as one synthetic
+    // attachment, while Podman 5 reports no attachment for the same exact
+    // HostConfig.NetworkMode. Accept both representations, but no other key.
+    if (!['host', 'none'].includes(mode)
+        || observedNames.length !== 1
+        || observedNames[0] !== mode
+        || exactExpectedNames.length !== 0) {
+        return false;
+    }
+    const attachment = attached[mode];
+    return attachment
+        && typeof attachment === 'object'
+        && String(attachment.NetworkID || mode) === mode;
+}
+
 function processAlive(pid) {
     if (!Number.isInteger(pid) || pid < 1) return false;
     try { process.kill(pid, 0); return true; } catch (error) { return error?.code === 'EPERM'; }
@@ -705,12 +725,15 @@ export function createNetworkLifecycleAdapter({
         }
         assertRequiredLabels(containerName, labelsOf(record), expectedLabels);
         const managedMode = plan?.mode === 'default' || plan?.mode === 'bridge';
+        if (!managedMode && String(record.HostConfig?.NetworkMode || '') !== plan.mode) {
+            throw new Error(`container '${containerName}' network mode is unsupported`);
+        }
         if (managedMode && !managedHostsPolicyIsExact(record)) {
             throw new Error(`container '${containerName}' has unsupported managed hosts policy`);
         }
         const attached = record.NetworkSettings?.Networks || {};
         const expectedNames = (plan.attachments || []).map((entry) => entry.name).sort();
-        if (JSON.stringify(Object.keys(attached).sort()) !== JSON.stringify(expectedNames)) {
+        if (!networkAttachmentSetIsExact(record, plan.mode, expectedNames)) {
             throw new Error(`container '${containerName}' network attachment set is unsupported`);
         }
         for (const attachment of plan.attachments || []) {
@@ -965,7 +988,11 @@ export function createNetworkLifecycleAdapter({
             return { state: 'owned-drift', id };
         }
         const attached = record.NetworkSettings?.Networks || {};
-        if (JSON.stringify(Object.keys(attached).sort()) !== JSON.stringify(expected.map((entry) => entry.name).sort())) {
+        if (!networkAttachmentSetIsExact(
+            record,
+            contract.mode,
+            expected.map((entry) => entry.name),
+        )) {
             return { state: 'owned-drift', id };
         }
         const alias = deriveNetworkAlias(canonicalAgentId);

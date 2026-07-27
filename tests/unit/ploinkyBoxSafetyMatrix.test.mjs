@@ -134,6 +134,68 @@ test('every public verb has the required single-lock depth and release boundary'
     }
 });
 
+test('start stages host-owned edge desired state under the Box lock before core startup', async (t) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-box-edge-start-'));
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+    fs.mkdirSync(path.join(root, '.ploinky'));
+    const identity = buildWorkspaceIdentity(root, { markerFound: true });
+    const events = [];
+    const candidate = {
+        path: path.join(root, '.ploinky', 'edge-desired.json'),
+        digest: 'b'.repeat(64),
+        size: 123,
+    };
+    const stagedSupervisor = createBoxSupervisor({
+        resolveIdentity: () => identity,
+        discover: () => owned(identity),
+        lockManager: {
+            async acquire(instance) {
+                events.push('lock');
+                let released = false;
+                return {
+                    assertHeld(expected) {
+                        assert.equal(expected, instance);
+                        assert.equal(released, false);
+                    },
+                    release() {
+                        released = true;
+                        events.push('release');
+                    },
+                };
+            },
+        },
+        runner: {
+            run(command, args) { events.push(`run:${args.join(' ')}`); },
+            query() { return { ok: true, stdout: '' }; },
+        },
+        reconcile: async () => ({
+            ownership: owned(identity),
+            hostPort: 8080,
+            action: 'reused',
+        }),
+        readEdgeDesired(selectedIdentity) {
+            assert.equal(selectedIdentity, identity);
+            events.push('read-edge-desired');
+            return candidate;
+        },
+        stageEdgeDesired(options) {
+            assert.equal(options.candidate, candidate);
+            assert.equal(options.containerId, 'a'.repeat(64));
+            events.push('stage-edge-desired');
+        },
+        startCore: async () => { events.push('start-core'); },
+        healthCheck: async () => { events.push('health'); },
+    });
+
+    await stagedSupervisor.runStartTransaction(['start', 'Agent', '8080']);
+
+    assert.ok(events.indexOf('lock') < events.indexOf('read-edge-desired'));
+    assert.ok(events.indexOf('read-edge-desired') < events.indexOf('stage-edge-desired'));
+    assert.ok(events.indexOf('stage-edge-desired') < events.indexOf('start-core'));
+    assert.ok(events.indexOf('start-core') < events.indexOf('health'));
+    assert.ok(events.indexOf('health') < events.indexOf('release'));
+});
+
 test('foreign ownership blocks every lifecycle path with zero engine mutation', async (t) => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-box-foreign-matrix-'));
     t.after(() => fs.rmSync(root, { recursive: true, force: true }));

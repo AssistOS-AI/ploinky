@@ -11,6 +11,8 @@
 // already-running blocking stack.
 import fs from 'fs';
 import path from 'path';
+import { randomUUID } from 'node:crypto';
+import { fileURLToPath } from 'node:url';
 import * as dockerSvc from '../sandbox/docker/index.js';
 import { RUNNING_DIR } from '../utils/config.js';
 import { resolveManifestRuntimeProfile } from '../utils/runtime/profileService.js';
@@ -49,31 +51,46 @@ function loadManifest(manifestPath) {
     return JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
 }
 
-function statusPathFor(containerName) {
-    return path.join(RUNNING_DIR, 'no-wait', `${containerName}.json`);
+function statusPathFor(containerName, { runningDir = RUNNING_DIR } = {}) {
+    return path.join(runningDir, 'no-wait', `${containerName}.json`);
 }
 
-function writeStatus(containerName, payload) {
-    const target = statusPathFor(containerName);
-    fs.mkdirSync(path.dirname(target), { recursive: true });
-    fs.writeFileSync(target, JSON.stringify(payload, null, 2));
+export function writeStatus(containerName, payload, { runningDir = RUNNING_DIR } = {}) {
+    const target = statusPathFor(containerName, { runningDir });
+    fs.mkdirSync(path.dirname(target), { recursive: true, mode: 0o700 });
+    const temporary = `${target}.${process.pid}.${randomUUID()}.tmp`;
+    try {
+        fs.writeFileSync(temporary, JSON.stringify(payload, null, 2), {
+            flag: 'wx',
+            mode: 0o600,
+        });
+        fs.renameSync(temporary, target);
+    } finally {
+        try { fs.unlinkSync(temporary); } catch (error) {
+            if (error?.code !== 'ENOENT') throw error;
+        }
+    }
 }
 
 function sleep(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function waitForPriorWorker(rawStatusPath) {
+export async function waitForPriorWorker(rawStatusPath, {
+    runningDir = RUNNING_DIR,
+    timeoutMs = Number.parseInt(
+        process.env.PLOINKY_NO_WAIT_SEQUENCE_TIMEOUT_MS || '900000',
+        10,
+    ),
+    pollIntervalMs = 100,
+    sleepFn = sleep,
+} = {}) {
     if (!rawStatusPath) return;
     const statusPath = path.resolve(rawStatusPath);
-    const allowedRoot = `${path.resolve(RUNNING_DIR, 'no-wait')}${path.sep}`;
+    const allowedRoot = `${path.resolve(runningDir, 'no-wait')}${path.sep}`;
     if (!statusPath.startsWith(allowedRoot) || path.extname(statusPath) !== '.json') {
         throw new Error('no-wait predecessor status must be an exact file in the workspace no-wait status directory');
     }
-    const timeoutMs = Number.parseInt(
-        process.env.PLOINKY_NO_WAIT_SEQUENCE_TIMEOUT_MS || '900000',
-        10,
-    );
     const deadline = Date.now() + Math.max(1000, timeoutMs);
     while (Date.now() < deadline) {
         try {
@@ -87,7 +104,7 @@ async function waitForPriorWorker(rawStatusPath) {
                 throw new Error(`no-wait predecessor status is invalid: ${error?.message || error}`);
             }
         }
-        await sleep(100);
+        await sleepFn(pollIntervalMs);
     }
     throw new Error(`timed out waiting for no-wait predecessor status '${statusPath}'`);
 }
@@ -345,8 +362,10 @@ async function main() {
     }
 }
 
-main().catch((err) => {
-    console.error('[no-wait] worker crashed:', err?.message || err);
-    if (err?.stack) console.error(err.stack);
-    process.exit(1);
-});
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+    main().catch((err) => {
+        console.error('[no-wait] worker crashed:', err?.message || err);
+        if (err?.stack) console.error(err.stack);
+        process.exit(1);
+    });
+}

@@ -43,6 +43,16 @@ function writeMasterProbeHook(dir) {
     return { hookPath, outPath };
 }
 
+function writeAgentLibProbeHook(dir) {
+    const hookPath = path.join(dir, 'agent-lib-probe.sh');
+    const outPath = path.join(dir, 'agent-lib-seen.txt');
+    fs.writeFileSync(
+        hookPath,
+        '#!/usr/bin/env bash\nprintf "%s" "${PLOINKY_AGENT_LIB_DIR:-UNSET}" > "$HOOK_OUT"\n'
+    );
+    return { hookPath, outPath };
+}
+
 function withoutExportedRoot(fn) {
     const previous = process.env.PLOINKY_WORKSPACE_ROOT;
     delete process.env.PLOINKY_WORKSPACE_ROOT; // mirror a normal `ploinky start`
@@ -91,6 +101,23 @@ test('host hook does not override an explicitly provided PLOINKY_WORKSPACE_ROOT'
         assert.equal(result.success, true, result.message);
         assert.equal(fs.readFileSync(outPath, 'utf8'), explicit);
     }));
+});
+
+test('host hook replaces a container-only agent library path with the host Agent tree', () => {
+    withTmpWorkspace((dir) => {
+        const { hookPath, outPath } = writeAgentLibProbeHook(dir);
+        const result = executeHostHook(
+            hookPath,
+            { HOOK_OUT: outPath, PLOINKY_AGENT_LIB_DIR: '/Agent' },
+            { cwd: dir }
+        );
+        assert.equal(result.success, true, result.message);
+        assert.equal(
+            fs.readFileSync(outPath, 'utf8'),
+            path.resolve(import.meta.dirname, '../../Agent'),
+        );
+        assert.ok(RESERVED_AGENT_ENV_NAMES.includes('PLOINKY_AGENT_LIB_DIR'));
+    });
 });
 
 test('host hook receives the generated fallback PLOINKY_MASTER_KEY seed', () => {

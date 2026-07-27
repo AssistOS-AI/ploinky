@@ -26,6 +26,7 @@ Commands:
   ploinky help                    Show this help without engine discovery
 
 Public image, engine, instance-name, and master-key overrides are intentionally unsupported.
+If .ploinky/edge-desired.json exists, start stages it as the host-owned routing/security authority.
 `;
 }
 

@@ -17,6 +17,8 @@ import {
 } from '../workspaceStructure.js';
 import { PLOINKY_WORKSPACE_ROOT } from '../config.js';
 
+const HOST_AGENT_LIB_DIR = path.resolve(import.meta.dirname, '../../../Agent');
+
 function normalizeProfileEnv(env) {
     if (!env || typeof env !== 'object' || Array.isArray(env)) {
         return {};
@@ -154,6 +156,10 @@ export function executeHostHook(scriptPath, env = {}, options = {}) {
     if (!hookEnv.PLOINKY_WORKSPACE_ROOT) {
         hookEnv.PLOINKY_WORKSPACE_ROOT = cwd;
     }
+    // Host hooks execute before the agent container exists, so the container
+    // path /Agent is unavailable. Point shared Ploinky library imports at the
+    // exact host-side Agent tree and do not accept a manifest/profile override.
+    hookEnv.PLOINKY_AGENT_LIB_DIR = HOST_AGENT_LIB_DIR;
     if (!String(hookEnv.PLOINKY_MASTER_KEY || '').trim()) {
         hookEnv.PLOINKY_MASTER_KEY = resolveMasterKeySeed({
             purpose: 'host lifecycle hooks',

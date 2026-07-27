@@ -406,6 +406,15 @@ test('host and none contract inspection does not require managed bridge host fie
             mode,
             { contractHash: networkContractHash(network) },
         ).state, 'exact');
+        record.NetworkSettings.Networks = {
+            [mode]: { NetworkID: mode },
+        };
+        assert.equal(harness.adapter.inspectContainerContract(
+            `${mode}-container`,
+            network,
+            mode,
+            { contractHash: networkContractHash(network) },
+        ).state, 'exact');
         record.HostConfig.NetworkMode = mode === 'host' ? 'none' : 'host';
         assert.equal(harness.adapter.inspectContainerContract(
             `${mode}-container`,
@@ -414,6 +423,31 @@ test('host and none contract inspection does not require managed bridge host fie
             { contractHash: networkContractHash(network) },
         ).state, 'owned-drift');
     }
+});
+
+test('managed host transaction accepts the Podman 6 synthetic host attachment', (t) => {
+    const harness = networkHarness(t);
+    const network = canonicalizeNetwork({ mode: 'host' });
+    const id = 'hostcandidate123456';
+    harness.containers.set(id, managedAgentRecord({
+        id,
+        name: 'host-container',
+        labels: managedAgentLabels(harness.identity, network),
+        networks: { host: { NetworkID: 'host' } },
+        networkMode: 'host',
+    }));
+
+    const finalizedId = harness.adapter.finalizeContainer(
+        'host-container',
+        harness.adapter.preflight(network, 'demo'),
+        {
+            network,
+            runtimeIdentity: TEST_RUNTIME_IDENTITY,
+        },
+    );
+
+    assert.equal(finalizedId, id);
+    assert.equal(harness.containers.get(id).State.Running, true);
 });
 
 test('runtime identity labels bind inspection and label construction to the exact registry tuple', (t) => {
