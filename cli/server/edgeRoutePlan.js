@@ -627,8 +627,14 @@ export function commitRoutePlan(plan) {
     return Boolean(plan?.ok && plan?.lease?.commit?.());
 }
 
+export function httpAccessForEdgeRoutePlan(plan) {
+    if (!plan?.ok) return null;
+    return plan.kind === 'agent-port' ? (plan.access || null) : (plan.decision || null);
+}
+
 export default {
     commitRoutePlan,
+    httpAccessForEdgeRoutePlan,
     isPrivateInterfaceAllowed,
     normalizeExactHost,
     resolveEdgeRoutePlan,

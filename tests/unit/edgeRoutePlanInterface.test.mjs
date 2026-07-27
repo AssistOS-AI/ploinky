@@ -1,7 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { isPrivateInterfaceAllowed } from '../../cli/server/edgeRoutePlan.js';
+import {
+    httpAccessForEdgeRoutePlan,
+    isPrivateInterfaceAllowed,
+} from '../../cli/server/edgeRoutePlan.js';
 
 test('private listener class admits bridge-gateway requests without IP provenance', () => {
     const bridgeRequest = {
@@ -26,4 +29,29 @@ test('loopback provenance cannot turn the public listener into a private listene
     };
 
     assert.equal(isPrivateInterfaceAllowed(loopbackRequest, 'public'), false);
+});
+
+test('edge route access keeps the original relay plan access contract', () => {
+    const publicConventionAccess = Object.freeze({
+        access: 'public',
+        routeKey: 'liveKitServerAgent',
+        source: 'manifest',
+    });
+    const authenticatedAgentAccess = Object.freeze({
+        access: 'authenticated',
+        routeKey: 'explorer',
+        source: 'routeDefault',
+    });
+
+    assert.equal(httpAccessForEdgeRoutePlan({
+        ok: true,
+        kind: 'agent-port',
+        access: publicConventionAccess,
+    }), publicConventionAccess);
+    assert.equal(httpAccessForEdgeRoutePlan({
+        ok: true,
+        kind: 'agent-root',
+        decision: authenticatedAgentAccess,
+    }), authenticatedAgentAccess);
+    assert.equal(httpAccessForEdgeRoutePlan({ ok: false, access: publicConventionAccess }), null);
 });

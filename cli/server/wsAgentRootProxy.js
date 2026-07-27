@@ -1,7 +1,11 @@
 import http from 'node:http';
 
 import { buildIdentityHeaders, ensureHttpRouteAccess } from './authHandlers/authContext.js';
-import { commitRoutePlan, resolveEdgeRoutePlan } from './edgeRoutePlan.js';
+import {
+    commitRoutePlan,
+    httpAccessForEdgeRoutePlan,
+    resolveEdgeRoutePlan,
+} from './edgeRoutePlan.js';
 import {
     buildTrustedForwardingHeaders,
     createLeaseCommittedAgent,
@@ -71,7 +75,7 @@ export async function handleAgentRootUpgrade({
         req,
         captured,
         plan.parsedUrl || parsedUrl,
-        plan.decision,
+        httpAccessForEdgeRoutePlan(plan),
         { routePlan: plan },
     );
     if (!access?.ok) {

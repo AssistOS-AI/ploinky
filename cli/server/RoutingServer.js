@@ -30,6 +30,7 @@ import {
 import { createCapturingRes, handleAgentRootUpgrade } from './wsAgentRootProxy.js';
 import {
     commitRoutePlan,
+    httpAccessForEdgeRoutePlan,
     normalizeExactHost,
     resolveEdgeRoutePlan,
 } from './edgeRoutePlan.js';
@@ -370,7 +371,7 @@ async function processRequest(req, res) {
     });
     const httpRouteAccess = routePlan.ok && (agentName && !isAgentMcpRoute
         || routePlan.kind === 'agent-port')
-        ? routePlan.decision
+        ? httpAccessForEdgeRoutePlan(routePlan)
         : null;
     const isDelegatedAgentTaskStatusRoute = Boolean(
         agentName
@@ -860,7 +861,7 @@ server.on('upgrade', async (req, socket, head) => {
                 req,
                 captured,
                 routePlan.parsedUrl,
-                routePlan.decision,
+                httpAccessForEdgeRoutePlan(routePlan),
                 { routePlan },
             );
             if (!access?.ok) {
