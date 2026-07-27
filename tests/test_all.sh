@@ -49,9 +49,6 @@ if [[ -n "${PLOINKY_BRANCH:-}" ]]; then
       (cd "$PLOINKY_WORKTREE" && npm install --no-audit --no-fund 2>&1 | tail -3 | sed 's/^/  /')
     fi
 
-    # Ensure Agent/node_modules exists (bwrap needs this mount point; not tracked in git)
-    mkdir -p "$PLOINKY_WORKTREE/Agent/node_modules"
-
     # Find .env from the original repo tree and make it available in the worktree.
     # The LLM suggestion tests walk up from TESTS_DIR to find .env, but the worktree
     # is in /tmp (no .env ancestors). Symlink it into the worktree root so tests find it.

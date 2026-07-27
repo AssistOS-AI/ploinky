@@ -24,7 +24,13 @@ The runtime may also execute agents through host sandbox backends when the manif
 
 Host sandbox teardown must be batch-oriented when multiple sandboxed agents are stopped or destroyed. The runtime must send the graceful signal to every selected sandbox process group first, wait once against the shared deadline, and only then force-kill the remaining process groups before clearing their PID records. A slow or stuck sandboxed agent must not delay graceful signal delivery to the other sandboxed agents in the same stop or destroy operation.
 
-`destroy` must remove workspace runtimes and regenerated runtime caches, including `.ploinky/deps`, but it must not remove agent homes under `.data/<agent-or-alias>/`. Starting the workspace after destroy must recreate runtimes and dependency caches while remounting the preserved `.data` directory at `/root` for each agent.
+`destroy` must remove workspace runtimes and regenerated runtime caches, including `.ploinky/deps`, but it must not remove agent homes under `.data/<agent-or-alias>/`. Starting the workspace after destroy must recreate runtimes and dependency caches while remounting the preserved `.data` directory at `/root` for each container or Linux Bubblewrap agent.
+
+The Linux Bubblewrap backend must keep the selected project path separate from the persistent agent home. It must bind `.data/<agent-or-alias>/` read-write at `/root`, set `HOME=/root`, and use the alias when one identifies the enabled instance. Isolated mode must use `/root` for both the project mount and `WORKSPACE_PATH`; global and development modes must bind their selected project independently and keep `WORKSPACE_PATH` at that project path. Daemon startup and interactive CLI or shell attachment must use the same home and project mapping.
+
+Before Bubblewrap mounts the shared Agent runtime read-only at `/Agent`, Ploinky must stage a regenerated copy under `.ploinky/deps/bwrap-runtime/<agent-or-alias>/`. The staged copy must exclude source `Agent/node_modules` content and must contain an empty `node_modules` directory that exists before sandbox construction. The prepared dependency cache must then be mounted read-only at both `/code/node_modules` and `/Agent/node_modules`. Bubblewrap startup must not depend on modifying the installed Ploinky source tree to create this nested mount point.
+
+The Linux Bubblewrap backend must execute the agent with the same Node.js distribution that launched Ploinky and determined the sandbox dependency-cache runtime key. It must expose that distribution read-only at `/opt/ploinky-node`, place `/opt/ploinky-node/bin` first in `PATH`, and keep the system Node installation as a lower-priority fallback. Manifest install hooks may use the mounted `npm`, but neither the Node distribution nor the prepared dependency cache may become writable inside the sandbox.
 
 Each agent execution environment must expose the shared `Agent/` payload at `/Agent` for container backends or the equivalent runtime location for sandbox backends. If a manifest does not provide an explicit agent command, the runtime must fall back to `Agent/server/AgentServer.sh`, which supervises `AgentServer.mjs` and restarts it after exit.
 
@@ -70,6 +76,21 @@ Response:
 
 Response:
 WebChat supervises the Ploinky wrapper process and cannot otherwise observe that a nested `podman exec`, Bubblewrap, or Seatbelt CLI has ended. Propagating the attach status and terminating the one-shot wrapper turns the existing process-close signal into an accurate runtime-health signal, allowing WebChat to restart or replace the selected CLI without introducing an agent-specific heartbeat.
+
+### Question #6: Why does Bubblewrap expose the agent home at `/root` instead of using the project path as `HOME`?
+
+Response:
+The project path determines which files an agent is allowed to work on, while the home stores per-instance authentication, provider configuration, caches, and continuation state. Keeping those paths separate gives Bubblewrap the same persistent-home contract as container runtimes, prevents global and development agents from placing CLI configuration in their project roots, and lets an aliased instance retain independent state across runtime recreation.
+
+### Question #7: Why does Bubblewrap stage the Agent runtime before mounting it read-only?
+
+Response:
+Bubblewrap resolves nested bind destinations sequentially. Once `/Agent` is a read-only bind, it cannot create a missing `/Agent/node_modules` directory for the dependency-cache bind. A regenerated staging copy provides that empty mount point in advance without requiring the installed Ploinky source tree to be writable, while the actual dependency cache remains a separate read-only mount.
+
+### Question #8: Why does Bubblewrap mount Ploinky's Node.js distribution instead of using `/usr/bin/node`?
+
+Response:
+The dependency cache runtime key is derived from the Node.js process that runs Ploinky. Selecting a different system Node inside Bubblewrap can execute a cache prepared for another Node major and can expose an incomplete npm installation. Mounting the same distribution read-only keeps Node, npm, and the cache ABI aligned without granting the agent write access to the host toolchain.
 
 ## Conclusion
 
