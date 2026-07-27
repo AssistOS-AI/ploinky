@@ -523,6 +523,16 @@ function replaceRuntimeRouterEnvFlags(envStrings, routerEnv) {
     appendRuntimeRouterEnvFlags(envStrings, routerEnv);
 }
 
+function stripReservedAndRestoreRuntimeRouterEnvFlags(envStrings, routerEnv) {
+    const reservedPrefixes = RESERVED_AGENT_ENV_NAMES.map((name) => `-e ${name}=`);
+    for (let index = envStrings.length - 1; index >= 0; index -= 1) {
+        if (reservedPrefixes.some((prefix) => String(envStrings[index] || '').startsWith(prefix))) {
+            envStrings.splice(index, 1);
+        }
+    }
+    appendRuntimeRouterEnvFlags(envStrings, routerEnv);
+}
+
 function ensureManifestVolumeHostPaths(manifest, profileConfig = null) {
     for (const { resolvedHostPath, containerPath, options } of collectManifestVolumeEntries(manifest, profileConfig)) {
         ensureManifestVolumeHostPath(resolvedHostPath, containerPath, options);
@@ -1130,14 +1140,10 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
 
     // DS013/DS011: strip any reserved identity/master env FLAG a config layer
     // emitted (manifest env, runtime resources, profile env/secrets), then
-    // re-assert the authoritative agent identity LAST so no config can inject a
-    // master key or override the agent's derived secret.
-    const reservedEnvPrefixes = RESERVED_AGENT_ENV_NAMES.map((name) => `-e ${name}=`);
-    for (let i = envStrings.length - 1; i >= 0; i -= 1) {
-        if (reservedEnvPrefixes.some((prefix) => String(envStrings[i] || '').startsWith(prefix))) {
-            envStrings.splice(i, 1);
-        }
-    }
+    // re-assert the authoritative Router locators and agent identity LAST so no
+    // config can redirect the runtime, inject a master key, or override the
+    // agent's derived secret.
+    stripReservedAndRestoreRuntimeRouterEnvFlags(envStrings, runtimeRouterEnv);
     // Per-agent request-signing identity (DS013). Identity derivation is a
     // launch precondition: a managed runtime must never start without its exact
     // principal and generation-bound secret.
@@ -1999,7 +2005,7 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
                     enableGeneration: String(existingRecord.enableGeneration || ''),
                     routeKey: aliasOverride || agentName,
                     containerName,
-                });
+                }, { preparedCapability: options.preparedHostModeCapability });
             }
             const hostPort = runtimeNetworkPlan.mode === 'host'
                 ? (containerPortCandidates[0] || 0)
@@ -2009,12 +2015,17 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
             const existingPortMappings = resolvePublishedPortMappings(containerName, existingRecord.config?.ports || []);
             const serviceTargets = resolveServiceTargets(existingPortMappings, explicitServicePorts, runtimeNetworkPlan.mode);
             syncAgentMcpConfig(containerName, agentPath, agentName);
+            const registryRecord = {
+                ...existingRecord,
+                runtime,
+                containerId: reuseInspection.id,
+            };
             return {
                 containerName,
                 containerId: reuseInspection.id,
                 hostPort,
                 serviceTargets,
-                registryRecord: structuredClone(existingRecord),
+                registryRecord: structuredClone(registryRecord),
             };
         }
     }
@@ -2159,6 +2170,8 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
         develRepo: existingRecord.develRepo,
         profile: activeProfile,
         type: 'agent',
+        runtime,
+        containerId: started.containerId,
         instanceId: runtimeIdentity.instanceId,
         enableGeneration: runtimeIdentity.enableGeneration,
         config: {
@@ -2477,5 +2490,6 @@ export {
     restartGenerationCapabilityRuntime,
     replaceRuntimeRouterEnvFlags,
     shouldCreateImplicitAgentServerPublish,
-    startAgentContainer
+    startAgentContainer,
+    stripReservedAndRestoreRuntimeRouterEnvFlags,
 };

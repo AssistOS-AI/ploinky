@@ -57,6 +57,7 @@ function containerHandle({ identity, repositoryRoot, imageId, imageRef, hostPort
             user: 'podman',
             createCommand: [
                 'podman', 'container', 'create',
+                '--init',
                 '--device', '/dev/fuse', '--device', '/dev/net/tun',
             ],
             environment: {
@@ -72,6 +73,7 @@ function containerHandle({ identity, repositoryRoot, imageId, imageRef, hostPort
             ],
             running,
             status: running ? 'running' : 'exited',
+            init: true,
             privileged: false,
             securityOptions: ['unmask=ALL'],
             devices: [
@@ -325,6 +327,7 @@ test('container argv is exact, least-privileged, and ends with immutable image I
         cidfile,
     });
     assert.equal(args.at(-1), 'a'.repeat(64));
+    assert.equal(args.filter((value) => value === '--init').length, 1);
     assert.equal(args.includes('--privileged'), false);
     assert.equal(args.some((value) => value.includes('docker.sock') || value.includes('podman.sock')), false);
     assert.equal(args.filter((value) => value === '--publish').length, 2);
@@ -334,6 +337,27 @@ test('container argv is exact, least-privileged, and ends with immutable image I
     assert.equal(args.includes('/dev/fuse'), true);
     assert.equal(args.includes('/dev/net/tun'), true);
     assert.equal(args.filter((value) => value.endsWith(':U')).length, 3);
+});
+
+test('container validation rejects a Box that cannot reap orphaned children', (t) => {
+    const state = fixture(t);
+    const handle = containerHandle({
+        identity: state.identity,
+        repositoryRoot: state.root,
+        imageId: 'd'.repeat(64),
+        imageRef: 'docker.io/assistos/ploinky-box:runtime',
+        hostPort: 8080,
+        id: 'e'.repeat(64),
+    });
+    handle.runtime.init = false;
+
+    assert.throws(() => validateContainerConfiguration(handle, {
+        identity: state.identity,
+        hostPort: 8080,
+        imageId: 'd'.repeat(64),
+        imageRef: 'docker.io/assistos/ploinky-box:runtime',
+        repositoryRoot: state.root,
+    }), /init state is incompatible/);
 });
 
 test('initial transaction preflights before pull, volumes, and container creation', async (t) => {

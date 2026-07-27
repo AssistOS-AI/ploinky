@@ -84,6 +84,7 @@ export function normalizeContainerRuntime(record) {
         publications: normalizePortBindings(hostConfig?.PortBindings),
         running: state?.Running === true || String(state?.Status || '') === 'running',
         status: String(state?.Status ?? ''),
+        init: hostConfig?.Init === true,
         privileged: hostConfig?.Privileged === true,
         securityOptions: Array.isArray(hostConfig?.SecurityOpt)
             ? hostConfig.SecurityOpt.map(String).sort()
@@ -167,8 +168,8 @@ export function validateContainerConfiguration(containerHandle, {
     if (containerHandle.id === '' || runtime.imageId !== imageId) {
         throw publicationError('Owned Box image ID does not match the validated immutable image');
     }
-    if (runtime.user !== 'podman' || runtime.privileged) {
-        throw publicationError('Owned Box user or privilege state is incompatible');
+    if (runtime.user !== 'podman' || runtime.privileged || runtime.init !== true) {
+        throw publicationError('Owned Box user, privilege, or init state is incompatible');
     }
     const expectedLabels = {
         [BOX_LABELS.schema]: '1',

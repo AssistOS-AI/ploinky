@@ -47,6 +47,7 @@ export function containerCreateArgs({
     };
     return [
         'container', 'create',
+        '--init',
         '--name', identity.instance,
         '--user', 'podman',
         '--device', '/dev/fuse',

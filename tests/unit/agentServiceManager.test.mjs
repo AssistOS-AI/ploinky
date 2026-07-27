@@ -11,6 +11,7 @@ import {
     isGenerationCapabilityRuntimeEffective,
     restartGenerationCapabilityRuntime,
     replaceRuntimeRouterEnvFlags,
+    stripReservedAndRestoreRuntimeRouterEnvFlags,
 } from '../../cli/sandbox/docker/agentServiceManager.js';
 import { buildRouterEndpoint } from '../../cli/sandbox/routerPort.js';
 
@@ -93,6 +94,9 @@ test('prepared graph launches suppress intermediate registry persistence only fo
     assert.match(source, /preserveRegistryRecord:\s*preserveRuntimeRegistryRecord/);
     assert.match(source, /if \(!preserveRuntimeRegistryRecord\) saveAgentsMap\(agents\)/);
     assert.match(source, /registryRecord:\s*structuredClone\(agents\[containerName\]\)/);
+    assert.match(source, /const registryRecord = \{\s*\.\.\.existingRecord,\s*runtime,\s*containerId: reuseInspection\.id,/);
+    assert.match(source, /type: 'agent',\s*runtime,\s*containerId: started\.containerId,/);
+    assert.match(source, /assertHostModeGenerationCapability\(\{[\s\S]*containerName,\s*\}, \{ preparedCapability: options\.preparedHostModeCapability \}\)/);
 
     for (const runtime of ['bwrap', 'seatbelt']) {
         const runtimeSource = fs.readFileSync(
@@ -335,6 +339,32 @@ test('runtime router env replaces config values and none mode strips them entire
     replaceRuntimeRouterEnvFlags(supplied, endpoint.env);
     assert.equal(supplied[0], '-e SAFE="kept"');
     for (const [name, value] of Object.entries(endpoint.env)) {
+        assert.deepEqual(
+            supplied.filter((entry) => entry.startsWith(`-e ${name}=`)),
+            [`-e ${name}="${value}"`],
+        );
+    }
+});
+
+test('reserved env filtering restores only the runtime-owned Router authority', () => {
+    const supplied = [
+        '-e SAFE="kept"',
+        '-e PLOINKY_MASTER_KEY="must-be-removed"',
+        '-e PLOINKY_ROUTER_URL="http://manifest.invalid:1"',
+        '-e PLOINKY_AGENT_ID="agent:forged/identity"',
+    ];
+    const runtimeRouterEnv = buildRuntimeRouterEnv('podman', {
+        networkMode: 'bridge',
+        routerEndpoint: buildRouterEndpoint('bridge', 8080),
+        routerPort: 8080,
+    });
+
+    stripReservedAndRestoreRuntimeRouterEnvFlags(supplied, runtimeRouterEnv);
+
+    assert.equal(supplied.includes('-e SAFE="kept"'), true);
+    assert.equal(supplied.some((entry) => entry.startsWith('-e PLOINKY_MASTER_KEY=')), false);
+    assert.equal(supplied.some((entry) => entry.startsWith('-e PLOINKY_AGENT_ID=')), false);
+    for (const [name, value] of Object.entries(runtimeRouterEnv)) {
         assert.deepEqual(
             supplied.filter((entry) => entry.startsWith(`-e ${name}=`)),
             [`-e ${name}="${value}"`],

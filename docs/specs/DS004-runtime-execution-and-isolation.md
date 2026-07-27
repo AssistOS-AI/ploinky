@@ -72,13 +72,14 @@ Runtime inspection is canonicalized before it is compared with the desired
 contract. In particular, Podman's normalized security-option spelling and
 ordering are equivalent to the requested values, and device requests are
 recovered from the inspected create command when `HostConfig.Devices` is empty.
-This normalization is comparison-only: creation still emits the exact
-contract-6 devices, security options, and fixed publications. An actually
-missing or different request is recreate-required drift: reconciliation fails
-before pull, stop, rename, removal, or creation and tells the operator to run
-`ploinky destroy` explicitly before recreating the box. Repeating an unchanged
-host command must therefore reuse the same compliant outer container without
-pulling or replacing it.
+The outer container must also run with an engine-provided init process so PID 1
+reaps orphaned in-box children. This normalization is comparison-only: creation
+still emits the exact contract-6 init, devices, security options, and fixed
+publications. An actually missing or different request is recreate-required
+drift: reconciliation fails before pull, stop, rename, removal, or creation and
+tells the operator to run `ploinky destroy` explicitly before recreating the
+box. Repeating an unchanged host command must therefore reuse the same compliant
+outer container without pulling or replacing it.
 
 Nested Podman belongs to this outer runtime only. Contract-6 self-check requires
 rootless Podman 5.4 or newer, Netavark, and an operational `pasta`; managed
