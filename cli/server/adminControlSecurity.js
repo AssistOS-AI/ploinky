@@ -2,6 +2,7 @@ import crypto from 'node:crypto';
 
 import { deriveSubkey } from '../utils/security/masterKey.js';
 import { isLocalAdminUser } from './auth/localService.js';
+import { resolveSessionBindingId } from './sessionBinding.js';
 import { isRouteMount } from './utils/routeMounts.js';
 
 export const ADMIN_CSRF_HEADER = 'x-ploinky-csrf-token';
@@ -58,7 +59,7 @@ function csrfMac(sessionId, origin) {
 }
 
 export function mintAdminCsrfToken({ sessionId, req } = {}) {
-    const sid = String(sessionId || '');
+    const sid = resolveSessionBindingId(req, sessionId);
     const origin = canonicalControlOrigin(req);
     if (!sid || !origin) {
         const error = new Error('an exact local control origin and authenticated session are required');
@@ -71,7 +72,7 @@ export function mintAdminCsrfToken({ sessionId, req } = {}) {
 export function verifyAdminMutationRequest(req, sessionId = req?.sessionId) {
     const origin = canonicalControlOrigin(req);
     const suppliedOrigin = headerValue(req, 'origin');
-    const sid = String(sessionId || '');
+    const sid = resolveSessionBindingId(req, sessionId);
     if (!origin || !suppliedOrigin || suppliedOrigin !== origin || !sid) {
         return { ok: false, code: 'CONTROL_ORIGIN_REQUIRED' };
     }

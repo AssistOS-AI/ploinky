@@ -66,6 +66,18 @@ test('admin CSRF proof is bound to exact local origin and session', () => {
     assert.equal(verifyAdminMutationRequest(req).code, 'CONTROL_ORIGIN_REQUIRED');
 });
 
+test('admin CSRF proof survives local JWT refresh for the same signed session id', () => {
+    const req = request({ sessionId: 'jwt-before-refresh' });
+    req.session = { _jwtPayload: { sid: 'sess-stable' } };
+    req.headers.origin = 'http://127.0.0.1:8080';
+    req.headers['x-ploinky-csrf-token'] = mintAdminCsrfToken({ sessionId: req.sessionId, req });
+
+    req.sessionId = 'jwt-after-refresh';
+    assert.equal(verifyAdminMutationRequest(req).ok, true);
+    req.session._jwtPayload.sid = 'sess-other';
+    assert.equal(verifyAdminMutationRequest(req).code, 'CSRF_INVALID');
+});
+
 test('non-local, malformed, and suffix-confusable control origins are rejected', () => {
     for (const host of ['example.com', 'localhost.example.com', 'localhost.', '127.0.0.1@attacker.example', 'localhost/evil']) {
         assert.equal(canonicalControlOrigin(request({ host })), null, host);

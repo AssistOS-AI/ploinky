@@ -2,6 +2,7 @@ import crypto from 'node:crypto';
 
 import { deriveSubkey } from '../utils/security/masterKey.js';
 import { canonicalControlOrigin } from './adminControlSecurity.js';
+import { resolveSessionBindingId } from './sessionBinding.js';
 
 export const BROWSER_CSRF_HEADER = 'x-ploinky-browser-csrf-token';
 export const BROWSER_CSRF_COOKIE_NAME = 'ploinky_browser_csrf';
@@ -72,7 +73,7 @@ function bindingForRequest({ req, routePlan, authContext, sessionId }) {
     const origin = canonicalBrowserMutationOrigin(req, routePlan);
     const generation = routeGeneration(routePlan);
     const routeKey = routeBinding(routePlan, authContext);
-    const sid = String(sessionId || '').trim();
+    const sid = resolveSessionBindingId(req, sessionId);
     if (!origin || !generation || !routeKey || !sid) {
         const error = new Error('an exact routed origin, active edge generation, route binding, and authenticated session are required');
         error.code = 'BROWSER_MUTATION_BINDING_REQUIRED';

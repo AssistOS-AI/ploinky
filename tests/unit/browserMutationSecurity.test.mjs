@@ -72,6 +72,32 @@ test('browser mutation proof binds session, exact routed origin, route selector,
     );
 });
 
+test('browser mutation proof survives local JWT refresh for the same signed session id', () => {
+    const routePlan = publicPlan();
+    const authContext = { routeKey: 'identity-owner', boundHostRouteKey: 'example' };
+    const req = request({ origin: 'https://app.example.test' });
+    req.session = { _jwtPayload: { sid: 'sess-stable' } };
+    const token = mintBrowserCsrfToken({
+        req,
+        routePlan,
+        authContext,
+        sessionId: 'jwt-before-refresh',
+    });
+
+    req.headers[BROWSER_CSRF_HEADER] = token;
+    assert.equal(verifyBrowserMutationRequest(req, {
+        routePlan,
+        authContext,
+        sessionId: 'jwt-after-refresh',
+    }).ok, true);
+    req.session._jwtPayload.sid = 'sess-other';
+    assert.equal(verifyBrowserMutationRequest(req, {
+        routePlan,
+        authContext,
+        sessionId: 'jwt-after-refresh',
+    }).code, 'BROWSER_CSRF_INVALID');
+});
+
 test('browser mutation proof requires exact Origin and accepts the HttpOnly proof cookie', () => {
     const routePlan = publicPlan();
     const authContext = { boundHostRouteKey: 'example', routeKey: 'identity-owner' };
