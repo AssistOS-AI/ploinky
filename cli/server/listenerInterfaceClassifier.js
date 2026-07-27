@@ -145,6 +145,16 @@ export function createListenerInterfaceClassifier({
         const observedAt = now();
         if (!force && observedAt - refreshedAt < refreshIntervalMs) return;
         refreshedAt = observedAt;
+        if (!bindsRuntimeBridgeGatewaysLocally) {
+            // Podman bridge gateways live inside a runtime VM on macOS and
+            // Windows. They can neither be bound nor accepted by this host
+            // process, so querying the runtime here cannot change the exact
+            // listener set. Avoid blocking the Router event loop on Podman
+            // every time the private-listener reconciler runs.
+            gateways = new Set();
+            lastError = null;
+            return;
+        }
         const next = new Set();
         try {
             const listed = run(['network', 'ls', '--format', 'json']);
@@ -164,17 +174,10 @@ export function createListenerInterfaceClassifier({
                 const inspected = run(['network', 'inspect', name]);
                 if (!inspected?.ok) throw new Error(`cannot inspect managed network '${name}': ${inspected?.stderr || 'podman failed'}`);
                 const record = parseJsonRecord(inspected.stdout, `network '${name}' inspection`);
-                const gateway = validatedManagedGateway(record, {
+                next.add(validatedManagedGateway(record, {
                     workspaceHash: identity.hash,
                     expectedNamePrefix: namePrefix,
-                });
-                // Podman on macOS and Windows runs its bridge networks inside a
-                // Linux VM. Those gateway addresses are not interfaces of the
-                // host process and cannot be bound there. The VM's
-                // host.containers.internal forwarding reaches host loopback.
-                // A native Linux runtime owns its bridge gateways locally, so
-                // keep the exact per-gateway listeners in that topology.
-                if (bindsRuntimeBridgeGatewaysLocally) next.add(gateway);
+                }));
             }
             gateways = next;
             lastError = null;

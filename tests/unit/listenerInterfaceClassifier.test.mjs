@@ -55,7 +55,7 @@ test('managed interface classifier admits only exact owned bridge gateways and l
     assert.equal(calls.filter((args) => args[1] === 'ls').length, 1);
 });
 
-test('remote-VM host topology validates managed networks without binding their VM-only gateways', () => {
+test('remote-VM host topology does not query or bind VM-only bridge gateways', () => {
     const calls = [];
     const run = (args) => {
         calls.push(args);
@@ -72,7 +72,7 @@ test('remote-VM host topology validates managed networks without binding their V
     assert.equal(classifier.classify('10.89.0.1'), 'unmanaged');
     assert.equal(classifier.classify('127.0.0.1'), 'loopback');
     assert.deepEqual(classifier.snapshot().gateways, []);
-    assert.equal(calls.filter((args) => args[1] === 'inspect').length, 1);
+    assert.deepEqual(calls, []);
 });
 
 test('managed gateway validation rejects foreign labels and non-exact bridge state', () => {
