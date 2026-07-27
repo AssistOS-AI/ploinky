@@ -226,7 +226,7 @@ test('guest routes use the guest agent policy instead of the static Explorer pol
     const tokenReq = makeRequest({
         method: 'GET',
         url: '/auth/token?agent=webAssist',
-        cookie: `ploinky_guest=${guestJwt}`,
+        cookie: `ploinky_jwt=invalid-local-session; ploinky_guest=${guestJwt}`,
     });
     const tokenRes = new MockResponse();
     const tokenParsedUrl = new URL(tokenReq.url, 'http://localhost');
@@ -434,6 +434,41 @@ test('browser token for an auth-none target uses static auth and binds proof to 
     assert.equal(body.ok, true);
     assert.equal(body.user.username, 'admin');
     assert.equal(body.browserMutation.routeKey, 'webAdmin');
+    assert.equal(body.browserMutation.generation, 'guest-auth-test-generation');
+    assert.match(String(res.getHeader('set-cookie') || ''), /^ploinky_browser_csrf=/);
+});
+
+test('browser token for a guest target preserves an authenticated local session', async (t) => {
+    const { authHandlers, localService, createRoutePlan } = await withAuthModules(t);
+    const token = localService.mintSessionJwt({
+        id: 'local:admin',
+        username: 'admin',
+        name: 'Local Admin',
+        email: 'admin@example.test',
+        roles: ['user', 'admin'],
+    }, 1);
+    const req = makeRequest({
+        method: 'GET',
+        url: '/auth/token?agent=webAssist',
+        cookie: `ploinky_jwt=${token}`,
+    });
+    const res = new MockResponse();
+
+    const handled = await authHandlers.handleAuthRoutes(
+        req,
+        res,
+        new URL(req.url, 'http://localhost'),
+        { routePlan: createRoutePlan() },
+    );
+    const body = JSON.parse(res.body || '{}');
+
+    assert.equal(handled, true);
+    assert.equal(res.statusCode, 200);
+    assert.equal(req.authMode, 'local');
+    assert.equal(body.ok, true);
+    assert.equal(body.user.username, 'admin');
+    assert.deepEqual(body.user.roles, ['user', 'admin']);
+    assert.equal(body.browserMutation.routeKey, 'webAssist');
     assert.equal(body.browserMutation.generation, 'guest-auth-test-generation');
     assert.match(String(res.getHeader('set-cookie') || ''), /^ploinky_browser_csrf=/);
 });

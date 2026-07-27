@@ -13,6 +13,7 @@ import {
     authService,
     buildCookie,
     getCookieNameForMode,
+    GUEST_AUTH_COOKIE_NAME,
     GUEST_SESSION_TTL_SECONDS,
     LOCAL_AUTH_COOKIE_NAME,
     normalizeRelativePath,
@@ -20,6 +21,7 @@ import {
     readJsonBody,
     readLoginBody,
     sendJson,
+    sessionTokenService,
     SSO_AUTH_COOKIE_NAME,
 } from './shared.js';
 import {
@@ -107,6 +109,57 @@ function issueBrowserMutationProof(req, res, { routePlan, authContext, sessionId
         sameSite: 'Strict',
     }));
     return csrfToken;
+}
+
+async function resolveBrowserTokenSession(cookies, authContext) {
+    const candidates = authContext.mode === 'guest'
+        ? [
+            {
+                mode: 'local',
+                cookieName: LOCAL_AUTH_COOKIE_NAME,
+                getSession: (sessionId) => sessionTokenService.getUserSession(sessionId, {
+                    policy: authContext.policy,
+                }),
+            },
+            {
+                mode: 'sso',
+                cookieName: SSO_AUTH_COOKIE_NAME,
+                getSession: (sessionId) => authService.isConfigured()
+                    ? authService.getSession(sessionId)
+                    : null,
+            },
+            {
+                mode: 'guest',
+                cookieName: GUEST_AUTH_COOKIE_NAME,
+                getSession: (sessionId) => sessionTokenService.getGuestSession(sessionId, {
+                    policy: authContext.policy,
+                }),
+            },
+        ]
+        : [{
+            mode: authContext.mode,
+            cookieName: getCookieNameForMode(authContext.mode),
+            getSession: (sessionId) => authContext.mode === 'local'
+                ? sessionTokenService.getUserSession(sessionId, { policy: authContext.policy })
+                : authService.getSession(sessionId),
+        }];
+
+    let invalidCookie = null;
+    for (const candidate of candidates) {
+        const sessionId = cookies.get(candidate.cookieName);
+        if (!sessionId) continue;
+        invalidCookie ||= candidate.cookieName;
+        const session = await candidate.getSession(sessionId);
+        if (session && (!session.expiresAt || Date.now() <= session.expiresAt)) {
+            return {
+                mode: candidate.mode,
+                cookieName: candidate.cookieName,
+                sessionId,
+                session,
+            };
+        }
+    }
+    return { invalidCookie };
 }
 
 function denyBrowserMutation(res, decision) {
@@ -560,25 +613,30 @@ export async function handleAuthRoutes(req, res, parsedUrl, { routePlan = null }
                 res.writeHead(405); res.end(); return true;
             }
             const cookies = parseCookies(req);
-            const cookieName = getCookieNameForMode(authContext.mode);
-            const sessionId = cookies.get(cookieName);
-            if (!sessionId) {
+            const tokenSession = await resolveBrowserTokenSession(cookies, authContext);
+            if (!tokenSession.session) {
+                if (tokenSession.invalidCookie) {
+                    const clearCookie = buildCookie(tokenSession.invalidCookie, '', req, '/', {
+                        maxAge: 0,
+                        sameSite: 'Lax',
+                    });
+                    res.writeHead(401, {
+                        'Content-Type': 'application/json',
+                        'Set-Cookie': clearCookie,
+                    });
+                    res.end(JSON.stringify({ ok: false, error: 'session_expired' }));
+                    return true;
+                }
                 sendJson(res, 401, { ok: false, error: 'not_authenticated' });
                 return true;
             }
-            const session = (authContext.mode === 'local' || authContext.mode === 'guest')
-                ? getLocalSession(sessionId, { policy: authContext.policy })
-                : authService.getSession(sessionId);
-            if (!session) {
-                const clearCookie = buildCookie(cookieName, '', req, '/', { maxAge: 0, sameSite: 'Lax' });
-                res.writeHead(401, {
-                    'Content-Type': 'application/json',
-                    'Set-Cookie': clearCookie
-                });
-                res.end(JSON.stringify({ ok: false, error: 'session_expired' }));
-                return true;
-            }
-            setAuthenticatedRequest(req, { session, sessionId, mode: authContext.mode });
+            const {
+                cookieName,
+                mode: sessionMode,
+                sessionId,
+                session,
+            } = tokenSession;
+            setAuthenticatedRequest(req, { session, sessionId, mode: sessionMode });
             let refreshRequested = false;
             if (method === 'POST') {
                 let body = {};
@@ -602,7 +660,7 @@ export async function handleAuthRoutes(req, res, parsedUrl, { routePlan = null }
                 if (!requireCurrentGeneration(res, routePlan)) return true;
             }
             let tokenInfo;
-            if (authContext.mode === 'sso' && refreshRequested) {
+            if (sessionMode === 'sso' && refreshRequested) {
                 tokenInfo = await authService.refreshSession(sessionId);
                 if (!requireCurrentGeneration(res, routePlan)) return true;
             } else {
@@ -613,9 +671,9 @@ export async function handleAuthRoutes(req, res, parsedUrl, { routePlan = null }
                     tokenType: session.tokens?.tokenType || null
                 };
             }
-            const cookieMaxAge = authContext.mode === 'local'
+            const cookieMaxAge = sessionMode === 'local'
                 ? getLocalSessionCookieMaxAge()
-                : authContext.mode === 'guest'
+                : sessionMode === 'guest'
                     ? GUEST_SESSION_TTL_SECONDS
                     : authService.getSessionCookieMaxAge();
             const cookie = buildCookie(cookieName, sessionId, req, '/', {
