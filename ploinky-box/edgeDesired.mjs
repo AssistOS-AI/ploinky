@@ -49,16 +49,9 @@ function validateCandidateDocument(bytes, candidatePath) {
     if (!document || typeof document !== 'object' || Array.isArray(document)
         || !document.hosts
         || typeof document.hosts !== 'object'
-        || Array.isArray(document.hosts)
-        || !document.security
-        || typeof document.security !== 'object'
-        || Array.isArray(document.security)
-        || !Array.isArray(document.security.hostNetworkAllowedInstances)
-        || !document.security.privateRouteConsumers
-        || typeof document.security.privateRouteConsumers !== 'object'
-        || Array.isArray(document.security.privateRouteConsumers)) {
+        || Array.isArray(document.hosts)) {
         throw desiredError(
-            `Box edge desired state lacks the required hosts/security shape: ${candidatePath}`,
+            `Box edge desired state lacks the required hosts shape: ${candidatePath}`,
         );
     }
     return document;

@@ -9,10 +9,9 @@ import {
     PLOINKY_WORKSPACE_ROOT,
     ROUTING_FILE,
 } from '../utils/config.js';
-import { parseAgentPortSelector } from '../server/agentPortConvention/parseSelector.js';
-import { HttpRouteAccessPath } from '../server/policy/HttpRouteAccessPath.js';
 import { normalizeManifestHttpRouteAccess } from '../server/policy/HttpRouteProviders.js';
 import { compileHttpRoutePolicy } from '../server/policy/HttpRoutePolicyCompiler.js';
+import { resolveManifestRuntimeProfile } from '../utils/runtime/profileService.js';
 import { parseRouterHostPort, selectedRouterHostPort } from './routerPort.js';
 
 export const EDGE_GENERATION_SCHEMA_VERSION = 1;
@@ -37,10 +36,6 @@ const EMPTY_POLICY_BYTES = Buffer.from(JSON.stringify({
 }));
 const EMPTY_DESIRED_BYTES = Buffer.from(JSON.stringify({
     hosts: {},
-    security: {
-        hostNetworkAllowedInstances: [],
-        privateRouteConsumers: {},
-    },
 }));
 const EMPTY_AGENTS_BYTES = Buffer.from('{}');
 const AGENT_SEGMENT = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
@@ -589,7 +584,7 @@ function uniqueStrings(values, label, normalizer = (value) => String(value || ''
 
 function normalizeDesired(desired) {
     assertObject(desired, 'edge desired state');
-    assertOnlyKeys(desired, new Set(['hosts', 'cloudflare', 'media', 'turn', 'security']), 'edge desired state');
+    assertOnlyKeys(desired, new Set(['hosts', 'cloudflare', 'media', 'turn']), 'edge desired state');
 
     const hostsInput = assertObject(desired.hosts, 'edge desired hosts');
     const hosts = {};
@@ -674,51 +669,11 @@ function normalizeDesired(desired) {
         };
     }
 
-    const securityInput = assertObject(desired.security, 'edge desired security');
-    assertOnlyKeys(securityInput, new Set([
-        'hostNetworkAllowedInstances',
-        'privateRouteConsumers',
-    ]), 'edge desired security');
-    const hostNetworkAllowedInstances = uniqueStrings(
-        securityInput.hostNetworkAllowedInstances,
-        'edge desired security.hostNetworkAllowedInstances',
-        normalizeAgentReference,
-    );
-    const privateInput = assertObject(
-        securityInput.privateRouteConsumers,
-        'edge desired security.privateRouteConsumers',
-    );
-    const privateRouteConsumers = {};
-    for (const [target, consumers] of Object.entries(privateInput)) {
-        const normalized = HttpRouteAccessPath.normalize(String(target || ''));
-        if (!normalized.ok || !normalized.path.endsWith('/*')) {
-            throw edgeError(`private route target '${target}' must be a canonical wildcard HTTP route`);
-        }
-        let selector;
-        try {
-            selector = parseAgentPortSelector(normalized.path.slice(0, -1));
-        } catch (error) {
-            throw edgeError(`private route target '${target}' is invalid: ${error?.message || error}`);
-        }
-        if (!selector) {
-            throw edgeError(`private route target '${target}' must use the agent-port convention`);
-        }
-        privateRouteConsumers[normalized.path] = uniqueStrings(
-            consumers,
-            `edge desired security.privateRouteConsumers['${target}']`,
-            normalizeAgentReference,
-        );
-    }
-
     return {
         hosts,
         ...(cloudflare !== undefined ? { cloudflare } : {}),
         ...(media ? { media } : {}),
         ...(turn ? { turn } : {}),
-        security: {
-            hostNetworkAllowedInstances,
-            privateRouteConsumers,
-        },
     };
 }
 
@@ -792,14 +747,32 @@ function publicationDisposition(desired) {
     return { mode: 'error', defaultState: 'error', complete: false };
 }
 
+function collectManifestHostNetworkCapabilities(routing, manifests, agents) {
+    const capabilities = [];
+    for (const [routeKey, route] of Object.entries(routing.routes || {})) {
+        if (!route || route.disabled) continue;
+        const manifest = manifests[routeKey];
+        if (!manifest) continue;
+        const agentRef = `${String(route.repo || '').trim()}/${String(route.agent || '').trim()}`;
+        const identity = resolveEnabledIdentity({ routeKey, route, agent: agentRef }, agents);
+        const record = agents?.[identity.containerName];
+        const runtimeProfile = resolveManifestRuntimeProfile(manifest, {
+            agentName: agentRef,
+            persistedProfileName: record?.profile,
+            fallbackProfileName: 'default',
+            path: `manifest(${routeKey})`,
+        });
+        if (runtimeProfile.network.mode === 'host') capabilities.push(identity);
+    }
+    return capabilities;
+}
+
 function compileGeneration({ routing, policy, desired, agents, manifests }) {
     validatePolicy(policy);
     validateRoutingShape(routing, manifests);
     assertObject(agents, 'agents registry');
     const normalizedDesired = normalizeDesired(desired);
-    const hostNetworkCapabilities = normalizedDesired.security.hostNetworkAllowedInstances.map((agentRef) => (
-        resolveEnabledIdentity(resolveAgentRoute(agentRef, routing), agents)
-    ));
+    const hostNetworkCapabilities = collectManifestHostNetworkCapabilities(routing, manifests, agents);
     const turnCredentialConsumers = (normalizedDesired.turn?.credentialConsumers || []).map((agentRef) => (
         resolveEnabledIdentity(resolveAgentRoute(agentRef, routing), agents)
     ));
@@ -825,31 +798,6 @@ function compileGeneration({ routing, policy, desired, agents, manifests }) {
         namespaces: policyNamespaces,
         routeDefaults,
     });
-    const privateRouteConsumers = [];
-    const accessRank = new Map([['public', 1], ['guest', 2], ['authenticated', 3]]);
-    for (const [target, consumers] of Object.entries(normalizedDesired.security.privateRouteConsumers)) {
-        const probePath = `${target.slice(0, -2)}/__ploinky_private_probe__`;
-        const selector = parseAgentPortSelector(probePath);
-        const selectedRoute = routing.routes?.[selector.agent];
-        if (!selectedRoute || selectedRoute.disabled) {
-            throw edgeError(`private route target '${target}' has no enabled owning route`);
-        }
-        const matching = compiledPolicy.entries.filter((entry) => (
-            entry.routeKey === selector.agent && HttpRouteAccessPath.matches(probePath, entry.path)
-        ));
-        const winner = matching.sort((left, right) => (
-            (accessRank.get(right.access) || 0) - (accessRank.get(left.access) || 0)
-        ))[0] || compiledPolicy.routeDefaults[selector.agent];
-        if (winner?.access !== 'authenticated') {
-            throw edgeError(`private route target '${target}' must be authenticated by HTTP route policy`);
-        }
-        privateRouteConsumers.push({
-            routeKey: selector.agent,
-            path: target,
-            callers: consumers.map((agentRef) => resolveEnabledIdentity(resolveAgentRoute(agentRef, routing), agents)),
-        });
-    }
-
     const hosts = {};
     const surfaces = {};
     for (const [hostname, entry] of Object.entries(normalizedDesired.hosts)) {
@@ -870,7 +818,6 @@ function compileGeneration({ routing, policy, desired, agents, manifests }) {
             policy: compiledPolicy,
             security: {
                 hostNetworkCapabilities,
-                privateRouteConsumers,
                 turnCredentialConsumers,
             },
             publication: publicationDisposition(normalizedDesired),

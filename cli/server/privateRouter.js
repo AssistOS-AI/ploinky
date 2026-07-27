@@ -105,16 +105,16 @@ function callerAclForPlan(plan) {
         }
         return null;
     }
-    const route = (security.privateRouteConsumers || []).find((entry) => (
-        entry?.routeKey === plan.routeKey && pathAllowed(String(plan.pathname || ''), [entry?.path])
-    ));
-    if (!route) return null;
-    return {
-        ...route,
-        callers: route.callers || [],
-        methods: ['DELETE', 'GET', 'HEAD', 'OPTIONS', 'PATCH', 'POST', 'PUT'],
-        paths: [route.path],
-    };
+    if (plan.kind === 'agent-port' && plan.access?.access === 'authenticated') {
+        return {
+            routeKey: plan.routeKey,
+            callers: [],
+            anyCurrentCaller: true,
+            methods: ['DELETE', 'GET', 'HEAD', 'OPTIONS', 'PATCH', 'POST', 'PUT'],
+            paths: [String(plan.pathname || '')],
+        };
+    }
+    return null;
 }
 
 export function authorizePrivateRoutePlan({ req, plan, body = Buffer.alloc(0), assertionCache = replayCache } = {}) {
@@ -142,7 +142,7 @@ export function authorizePrivateRoutePlan({ req, plan, body = Buffer.alloc(0), a
         || String(untrusted?.enableGeneration || '') !== current.enableGeneration) {
         throw unauthorized('private assertion instance or generation is stale');
     }
-    if (!(acl.callers || []).some((entry) => exactCaller(entry, current))) {
+    if (!acl.anyCurrentCaller && !(acl.callers || []).some((entry) => exactCaller(entry, current))) {
         throw forbidden('private assertion caller is not in the exact ACL');
     }
     const rch = computeRchHttp({

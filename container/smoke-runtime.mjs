@@ -231,10 +231,6 @@ function installRoutingProbe() {
         }, '/workspace/.ploinky/data/router-security/policy-state.json'],
         [path.join('data', 'edge-routing', 'desired.json'), {
             hosts: {},
-            security: {
-                hostNetworkAllowedInstances: [],
-                privateRouteConsumers: {},
-            },
         }, '/workspace/.ploinky/data/edge-routing/desired.json'],
     ];
     requireOk(
@@ -555,9 +551,8 @@ function runConfiguredFullGraph() {
             + 'Cloudflare host/DNS mutation belongs to the separately authorized external gate',
         );
     }
-    if (!Array.isArray(desiredCandidate?.security?.hostNetworkAllowedInstances)
-        || desiredCandidate.security.hostNetworkAllowedInstances.length !== 1) {
-        throw new Error('SMOKE_EDGE_DESIRED_FILE must select exactly one host-network capability owner');
+    if (desiredCandidate.security !== undefined) {
+        throw new Error('SMOKE_EDGE_DESIRED_FILE must not duplicate manifest or HTTP route policy authority');
     }
 
     const desiredDirectory = '/workspace/.ploinky/data/edge-routing';

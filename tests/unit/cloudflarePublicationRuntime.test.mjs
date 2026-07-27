@@ -13,7 +13,7 @@ import {
 const GENERATION = `sha256:${'a'.repeat(64)}`;
 
 test('edge publication coordinator commits only exact captured desired semantics and states', async () => {
-    const desired = { hosts: {}, security: { hostNetworkAllowedInstances: [], privateRouteConsumers: {} } };
+    const desired = { hosts: {} };
     const calls = [];
     const committed = [];
     const edgeOps = {
@@ -59,7 +59,7 @@ test('publication retry rejects a different inactive selected candidate before r
     let inactive = false;
     let selectedGeneration = GENERATION;
     let inactivationCount = 0;
-    const desired = { hosts: {}, security: { hostNetworkAllowedInstances: [], privateRouteConsumers: {} } };
+    const desired = { hosts: {} };
     const edgeOps = {
         load() {
             if (inactive) throw Object.assign(new Error('inactive'), { code: 'EDGE_GENERATION_INACTIVE' });

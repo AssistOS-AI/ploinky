@@ -15,10 +15,6 @@ import {
 function localDesired(overrides = {}) {
     return {
         hosts: {},
-        security: {
-            hostNetworkAllowedInstances: [],
-            privateRouteConsumers: {},
-        },
         ...overrides,
     };
 }
@@ -131,26 +127,8 @@ test('active topology publishes routes and readiness without service locators or
     }), applied.topology);
 });
 
-test('generation compiles convention policy and exact private caller ACLs', (t) => {
-    const privatePath = '/base-agent-additional-server/alpha/7000/private/*';
-    const fixture = createFixture(t, {
-        alphaManifest: {
-            routerAccess: {
-                httpRoutes: [{
-                    path: '/base-agent-additional-server/alpha/7000/*',
-                    access: 'authenticated',
-                }],
-            },
-        },
-        desired: localDesired({
-            security: {
-                hostNetworkAllowedInstances: [],
-                privateRouteConsumers: {
-                    [privatePath]: ['fixtures/beta'],
-                },
-            },
-        }),
-    });
+test('generation compiles convention access solely from HTTP route policy', (t) => {
+    const fixture = createFixture(t);
     const applied = applyEdgeRoutingGeneration({
         workspaceRoot: fixture.workspace,
         reason: 'private-convention-generation',
@@ -159,17 +137,23 @@ test('generation compiles convention policy and exact private caller ACLs', (t) 
         entry.path === '/base-agent-additional-server/alpha/7000/*'
     ));
     assert.equal(policyEntry.access, 'authenticated');
-    assert.deepEqual(applied.generation.compiled.security.privateRouteConsumers, [{
-        routeKey: 'alpha',
-        path: privatePath,
-        callers: [{
-            agentId: 'agent:fixtures/beta',
-            instanceId: 'beta-instance',
-            enableGeneration: 'beta-enable-generation',
-            routeKey: 'beta',
-            containerName: 'beta-container',
-        }],
-    }]);
+    assert.equal(Object.hasOwn(applied.generation.compiled.security, 'privateRouteConsumers'), false);
+});
+
+test('legacy duplicate route and host-network authority is rejected', (t) => {
+    const fixture = createFixture(t, {
+        desired: {
+            hosts: {},
+            security: {
+                hostNetworkAllowedInstances: ['fixtures/alpha'],
+                privateRouteConsumers: {},
+            },
+        },
+    });
+    assert.throws(() => prepareEdgeRoutingGeneration({
+        workspaceRoot: fixture.workspace,
+        reason: 'reject-duplicate-authority',
+    }), /unsupported field 'security'/);
 });
 
 test('legacy manifest service inventory is rejected instead of silently retained', (t) => {

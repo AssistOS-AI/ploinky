@@ -73,9 +73,8 @@ function readDesiredCandidate(value, fsApi) {
         || document.cloudflare !== undefined) {
         throw smokeError('smoke desired state must be local-only with no selected hosts');
     }
-    if (!Array.isArray(document?.security?.hostNetworkAllowedInstances)
-        || document.security.hostNetworkAllowedInstances.length !== 1) {
-        throw smokeError('smoke desired state must select exactly one host-network capability owner');
+    if (document.security !== undefined) {
+        throw smokeError('smoke desired state must not duplicate manifest or HTTP route policy authority');
     }
     return Object.freeze({
         path: realPath,

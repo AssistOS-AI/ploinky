@@ -28,8 +28,7 @@ fs.mkdirSync(path.join(tempDir, '.ploinky', 'data', 'edge-routing'), { recursive
 fs.writeFileSync(
     path.join(tempDir, '.ploinky', 'data', 'edge-routing', 'desired.json'),
     JSON.stringify({
-                hosts: {},
-        security: { hostNetworkAllowedInstances: [], privateRouteConsumers: {} },
+        hosts: {},
     }, null, 2),
 );
 

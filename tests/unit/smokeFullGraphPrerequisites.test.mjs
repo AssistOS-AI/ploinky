@@ -11,7 +11,7 @@ test('full-graph smoke requires an explicit safe media candidate and real operat
     assert.match(source, /SMOKE_EDGE_DESIRED_FILE/);
     assert.match(source, /SMOKE_MEDIA_PUBLIC_IPV4/);
     assert.match(source, /normalizePublicMediaIPv4\(configuredPublicIPv4\)/);
-    assert.match(source, /hostNetworkAllowedInstances\.length !== 1/);
+    assert.match(source, /must not duplicate manifest or HTTP route policy authority/);
     assert.match(source, /Cloudflare host\/DNS mutation belongs to the separately authorized external gate/);
     assert.match(source, /ploinky\(\['var', 'UMAMI_TELEMETRY_ALLOWED_ORIGINS', telemetryOrigin\]\)/);
     assert.match(source, /ploinky\(\['echo', '\$UMAMI_TELEMETRY_ALLOWED_ORIGINS'\]\)/);

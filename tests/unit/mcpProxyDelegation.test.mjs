@@ -63,11 +63,7 @@ fs.writeFileSync(path.join(ploinkyDir, 'agents.json'), JSON.stringify({
 fs.mkdirSync(path.join(ploinkyDir, 'data', 'edge-routing'), { recursive: true });
 fs.mkdirSync(path.join(ploinkyDir, 'data', 'router-security'), { recursive: true });
 fs.writeFileSync(path.join(ploinkyDir, 'data', 'edge-routing', 'desired.json'), JSON.stringify({
-        hosts: {},
-    security: {
-        hostNetworkAllowedInstances: [],
-        privateRouteConsumers: {},
-    },
+    hosts: {},
 }, null, 2));
 fs.writeFileSync(path.join(ploinkyDir, 'data', 'router-security', 'policy-state.json'), JSON.stringify({
     schema: 'router-policy',

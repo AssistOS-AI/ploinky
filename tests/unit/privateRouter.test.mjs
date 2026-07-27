@@ -47,11 +47,6 @@ function snapshot() {
         },
         compiled: {
             security: {
-                privateRouteConsumers: [{
-                    routeKey: 'alpha',
-                    path: '/base-agent-additional-server/alpha/7000/private/*',
-                    callers: [caller],
-                }],
                 turnCredentialConsumers: [caller],
             },
         },
@@ -99,7 +94,7 @@ function signedRequest(plan, body, overrides = {}) {
     };
 }
 
-test('private route admission requires effective auth plus exact current caller and request binding', () => {
+test('private convention admission derives authority from effective HTTP policy and exact current request binding', () => {
     const plan = privateRoutePlan();
     const body = Buffer.from('{"value":1}');
     const req = signedRequest(plan, body);

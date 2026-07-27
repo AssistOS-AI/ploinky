@@ -26,11 +26,7 @@ test('smoke graph requires exactly seven clean absolute real checkouts at exact 
     const calls = [];
     const desiredCandidate = path.join(root, 'edge-desired.json');
     fs.writeFileSync(desiredCandidate, JSON.stringify({
-                hosts: {},
-        security: {
-            hostNetworkAllowedInstances: ['media/livekit'],
-            privateRouteConsumers: {},
-        },
+        hosts: {},
     }));
     const desiredDigest = crypto.createHash('sha256')
         .update(fs.readFileSync(desiredCandidate))
@@ -113,17 +109,17 @@ test('smoke graph requires exactly seven clean absolute real checkouts at exact 
         SMOKE_GRAPH_EDGE_DESIRED_FILE: desiredSymlink,
     }, { runner }), /non-symlink regular real path/);
 
-    const overGrantedCandidate = path.join(root, 'edge-desired-over-granted.json');
-    fs.writeFileSync(overGrantedCandidate, JSON.stringify({
-                hosts: {},
+    const duplicateAuthorityCandidate = path.join(root, 'edge-desired-duplicate-authority.json');
+    fs.writeFileSync(duplicateAuthorityCandidate, JSON.stringify({
+        hosts: {},
         security: {
-            hostNetworkAllowedInstances: ['media/livekit', 'media/turn'],
+            hostNetworkAllowedInstances: ['media/livekit'],
         },
     }));
     assert.throws(() => readSmokeGraphInputs({
         ...baseEnvironment,
-        SMOKE_GRAPH_EDGE_DESIRED_FILE: overGrantedCandidate,
-    }, { runner }), /exactly one host-network capability owner/);
+        SMOKE_GRAPH_EDGE_DESIRED_FILE: duplicateAuthorityCandidate,
+    }, { runner }), /must not duplicate manifest or HTTP route policy authority/);
 });
 
 test('generated candidate proxy embeds one digest outside the repository and writes NUL-safe traces', (t) => {
