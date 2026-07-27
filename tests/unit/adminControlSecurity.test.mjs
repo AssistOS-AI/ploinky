@@ -9,6 +9,7 @@ const {
     canonicalControlOrigin,
     mintAdminCsrfToken,
     requireAdminControlRequest,
+    usesAdminControlMutationGuard,
     verifyAdminMutationRequest,
 } = await import(`../../cli/server/adminControlSecurity.js?t=${Date.now()}`);
 const { handleDashboard } = await import(`../../cli/server/handlers/dashboard.js?t=${Date.now()}`);
@@ -70,6 +71,14 @@ test('non-local, malformed, and suffix-confusable control origins are rejected',
         assert.equal(canonicalControlOrigin(request({ host })), null, host);
     }
     assert.equal(canonicalControlOrigin(request({ host: '[::1]:8080' })), 'http://[::1]:8080');
+});
+
+test('only Dashboard paths bypass the generic browser mutation guard', () => {
+    assert.equal(usesAdminControlMutationGuard('/dashboard'), true);
+    assert.equal(usesAdminControlMutationGuard('/dashboard/run'), true);
+    for (const path of ['/dashboardish', '/status/run', '/webchat/session', '/upload', '/explorer/mcp']) {
+        assert.equal(usesAdminControlMutationGuard(path), false, path);
+    }
 });
 
 test('dashboard and status independently reject ordinary users and legacy dashboard SID cookies', async () => {

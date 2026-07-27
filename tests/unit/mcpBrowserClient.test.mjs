@@ -132,6 +132,109 @@ test('MCP browser client treats agent-first MCP routes as router proxy endpoints
     assert.equal(seenMethods.includes('GET'), false);
 });
 
+test('browser agent-first MCP mutations use an exact route-scoped proof', async () => {
+    const originalWindow = globalThis.window;
+    const seen = [];
+    const server = http.createServer((req, res) => {
+        const requestUrl = new URL(req.url || '/', `http://${req.headers.host}`);
+        if (req.method === 'GET' && requestUrl.pathname === '/auth/token') {
+            seen.push({
+                method: req.method,
+                path: requestUrl.pathname,
+                agent: requestUrl.searchParams.get('agent'),
+            });
+            res.writeHead(200, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({
+                ok: true,
+                browserMutation: {
+                    origin: `http://${req.headers.host}`,
+                    csrfToken: 'v1.route-scoped-proof',
+                    generation: 'generation-1',
+                    routeKey: 'dpuAgent',
+                },
+            }));
+            return;
+        }
+        if (req.method === 'DELETE') {
+            seen.push({
+                method: req.method,
+                path: requestUrl.pathname,
+                csrf: req.headers['x-ploinky-browser-csrf-token'],
+            });
+            res.writeHead(204);
+            res.end();
+            return;
+        }
+        if (req.method !== 'POST') {
+            res.writeHead(500);
+            res.end('unexpected request');
+            return;
+        }
+        seen.push({
+            method: req.method,
+            path: requestUrl.pathname,
+            csrf: req.headers['x-ploinky-browser-csrf-token'],
+        });
+        if (req.headers['x-ploinky-browser-csrf-token'] !== 'v1.route-scoped-proof') {
+            res.writeHead(403, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({ error: 'browser_csrf_invalid' }));
+            return;
+        }
+        const chunks = [];
+        req.on('data', chunk => chunks.push(chunk));
+        req.on('end', () => {
+            const body = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}');
+            if (body.method === 'initialize') {
+                res.writeHead(200, {
+                    'content-type': 'application/json',
+                    'mcp-session-id': 'session-browser-proof',
+                    'mcp-protocol-version': '2025-06-18',
+                });
+                res.end(JSON.stringify({
+                    jsonrpc: '2.0',
+                    id: body.id,
+                    result: {
+                        protocolVersion: '2025-06-18',
+                        capabilities: {},
+                        serverInfo: { name: 'test', version: '1.0.0' },
+                    },
+                }));
+                return;
+            }
+            if (body.method === 'notifications/initialized') {
+                res.writeHead(204);
+                res.end();
+                return;
+            }
+            res.writeHead(500);
+            res.end('unexpected request');
+        });
+    });
+
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+    try {
+        const { port } = server.address();
+        globalThis.window = {
+            location: {
+                href: `http://127.0.0.1:${port}/dpuAgent/index.html`,
+                origin: `http://127.0.0.1:${port}`,
+            },
+        };
+        const client = createAgentClient(`http://127.0.0.1:${port}/dpuAgent/mcp`);
+        await client.connect();
+        await client.close();
+    } finally {
+        if (originalWindow === undefined) delete globalThis.window;
+        else globalThis.window = originalWindow;
+        await new Promise((resolve) => server.close(resolve));
+    }
+
+    assert.deepEqual(seen[0], { method: 'GET', path: '/auth/token', agent: 'dpuAgent' });
+    assert.ok(seen.filter((entry) => entry.method === 'POST').length >= 2);
+    assert.ok(seen.filter((entry) => entry.method !== 'GET')
+        .every((entry) => entry.csrf === 'v1.route-scoped-proof'));
+});
+
 test('MCP browser client can close while its aggregate SSE probe is pending', async () => {
     let resolveStreamProbe;
     const streamProbeStarted = new Promise((resolve) => {

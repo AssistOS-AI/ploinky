@@ -7,6 +7,11 @@ const DEFAULT_TASK_POLL_INTERVAL_MS = 5000;
 const MARKETPLACE_PATH = '/api/marketplace';
 const DEFAULT_AGENT_START_TIMEOUT_MS = 180000;
 const AGENT_START_POLL_INTERVAL_MS = 250;
+const BROWSER_CSRF_HEADER = 'x-ploinky-browser-csrf-token';
+const BROWSER_MUTATION_RETRY_ERRORS = new Set([
+    'browser_csrf_invalid',
+    'edge_generation_changed',
+]);
 const TASK_POLL_INTERVAL_MS = (() => {
     try {
         if (typeof process !== 'undefined' && process.env) {
@@ -59,6 +64,17 @@ function isAgentProxyMcpEndpoint(endpoint) {
         return /^\/[^/]+\/mcp$/.test(url.pathname || '');
     } catch {
         return false;
+    }
+}
+
+function resolveAgentProxyRouteKey(endpoint) {
+    try {
+        const match = new URL(endpoint).pathname.match(/^\/([^/]+)\/mcp$/);
+        if (!match?.[1]) return '';
+        const routeKey = decodeURIComponent(match[1]).trim();
+        return routeKey && !routeKey.includes('/') ? routeKey : '';
+    } catch {
+        return '';
     }
 }
 
@@ -166,6 +182,9 @@ function createAgentClient(baseUrl, options = {}) {
     const endpoint = resolveBaseUrl(baseUrl);
     const marketplaceBaseUrl = options?.marketplaceBaseUrl || endpoint;
     const disableSseProbe = isAgentProxyMcpEndpoint(endpoint);
+    const browserAgentRouteKey = typeof window !== 'undefined'
+        ? resolveAgentProxyRouteKey(endpoint)
+        : '';
     const requestHeaders = normalizeRequestHeaders(options?.requestHeaders);
 
     let connected = false;
@@ -176,6 +195,8 @@ function createAgentClient(baseUrl, options = {}) {
     let streamUnsupported = disableSseProbe;
     let connectPromise = null;
     let messageId = 0;
+    let browserMutationToken = '';
+    let browserMutationProofPromise = null;
     const requestControllers = new Set();
 
     const pending = new Map();
@@ -191,7 +212,11 @@ function createAgentClient(baseUrl, options = {}) {
     }
 
     function buildHeaders(options = {}) {
-        const { acceptStream = false, includeContentType = false } = options;
+        const {
+            acceptStream = false,
+            includeContentType = false,
+            mutationToken = '',
+        } = options;
 
         const headers = new Headers();
         if (includeContentType) {
@@ -207,7 +232,78 @@ function createAgentClient(baseUrl, options = {}) {
         for (const [key, value] of requestHeaders) {
             headers.set(key, value);
         }
+        if (mutationToken) {
+            headers.set(BROWSER_CSRF_HEADER, mutationToken);
+        }
         return headers;
+    }
+
+    async function loadBrowserMutationProof({ refresh = false } = {}) {
+        if (!browserAgentRouteKey) return '';
+        if (!refresh && browserMutationToken) return browserMutationToken;
+        if (!refresh && browserMutationProofPromise) return browserMutationProofPromise;
+
+        browserMutationProofPromise = (async () => {
+            const proofUrl = new URL('/auth/token', endpoint);
+            proofUrl.searchParams.set('agent', browserAgentRouteKey);
+            const response = await fetch(proofUrl.toString(), {
+                method: 'GET',
+                credentials: 'include',
+                cache: 'no-store',
+                headers: { accept: 'application/json' },
+            });
+            const payload = await response.json().catch(() => ({}));
+            const proof = payload?.browserMutation;
+            const browserOrigin = typeof window !== 'undefined'
+                ? String(window.location?.origin || new URL(window.location?.href || endpoint).origin)
+                : '';
+            if (!response.ok
+                || !proof?.csrfToken
+                || proof.routeKey !== browserAgentRouteKey
+                || proof.origin !== browserOrigin) {
+                const detail = payload?.error || `HTTP ${response.status}`;
+                throw new Error(`Browser mutation proof failed: ${detail}`);
+            }
+            browserMutationToken = proof.csrfToken;
+            return browserMutationToken;
+        })();
+
+        try {
+            return await browserMutationProofPromise;
+        } finally {
+            browserMutationProofPromise = null;
+        }
+    }
+
+    async function isBrowserMutationProofRejection(response) {
+        if (!browserAgentRouteKey || ![403, 503].includes(response.status)) {
+            return false;
+        }
+        const payload = await response.clone().json().catch(() => null);
+        return BROWSER_MUTATION_RETRY_ERRORS.has(String(payload?.error || '').toLowerCase());
+    }
+
+    async function sendMutationRequest({ method, body, signal }) {
+        const request = async (refreshProof = false) => {
+            const mutationToken = await loadBrowserMutationProof({ refresh: refreshProof });
+            return fetch(endpoint, {
+                method,
+                headers: buildHeaders({
+                    includeContentType: method === 'POST',
+                    mutationToken,
+                }),
+                ...(body === undefined ? {} : { body }),
+                credentials: 'include',
+                signal,
+            });
+        };
+
+        let response = await request(false);
+        if (await isBrowserMutationProofRejection(response)) {
+            browserMutationToken = '';
+            response = await request(true);
+        }
+        return response;
     }
 
     function handleJsonrpcMessage(message) {
@@ -511,12 +607,10 @@ function createAgentClient(baseUrl, options = {}) {
         requestControllers.add(requestController);
         const optimisticallyAccepted = message.id === undefined;
         try {
-            const response = await fetch(endpoint, {
+            const response = await sendMutationRequest({
                 method: 'POST',
-                headers: buildHeaders({ includeContentType: true }),
                 body: JSON.stringify(message),
-                credentials: 'include',
-                signal: requestController.signal
+                signal: requestController.signal,
             });
 
             const receivedSession = response.headers.get('mcp-session-id');
@@ -799,23 +893,12 @@ function createAgentClient(baseUrl, options = {}) {
 
         try {
             if (currentSessionId) {
-                const headers = new Headers();
-                headers.set('accept', 'application/json, text/event-stream');
-                headers.set('mcp-session-id', currentSessionId);
-                if (protocolVersion) {
-                    headers.set('mcp-protocol-version', protocolVersion);
-                }
-                for (const [key, value] of requestHeaders) {
-                    headers.set(key, value);
-                }
                 const closeController = new AbortController();
                 const closeTimer = setTimeout(() => closeController.abort(), 1000);
                 closeTimer.unref?.();
                 try {
-                    await fetch(endpoint, {
+                    await sendMutationRequest({
                         method: 'DELETE',
-                        headers,
-                        credentials: 'include',
                         signal: closeController.signal,
                     });
                 } finally {

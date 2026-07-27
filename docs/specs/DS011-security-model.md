@@ -126,7 +126,7 @@ only to the supervisor over an unmounted Unix socket. An authenticated TCP
 summary exposes no private targets, policy source, caller ACL, or topology
 inventory.
 
-`/auth/*` handles login, logout, account, token, and callback flows. `/api/agents/<agent>/users` performs its own local-admin authorization because it must authenticate against the target agent's local-auth policy. `/mcp` is protected by normal route authentication before router-level MCP aggregation. `/<agent>/mcp` defers browser authentication or delegated-caller verification until the JSON-RPC body is available, because secure-wire tokens are body-bound.
+`/auth/*` handles login, logout, account, token, and callback flows. `/api/agents/<agent>/users` performs its own local-admin authorization because it must authenticate against the target agent's local-auth policy. `/mcp` is protected by normal route authentication before router-level MCP aggregation. `/<agent>/mcp` defers browser authentication or delegated-caller verification until the JSON-RPC body is available, because secure-wire tokens are body-bound. Browser clients obtain a mutation proof from `/auth/token?agent=<routeKey>` and send it in `x-ploinky-browser-csrf-token` on each state-changing agent-first MCP request. That proof is bound to the exact authenticated session, browser origin, immutable generation, and agent route; clients refresh it once when the router reports a stale generation or invalid proof.
 
 Dashboard and Status require a real router-authenticated local-admin session on
 an exact local-control Host. They do not accept a surface token, invitation,
@@ -135,7 +135,9 @@ as administrator identity. The Dashboard `/run` endpoint can execute allowlisted
 `ploinky` commands with bounded user-supplied arguments and output; it remains a
 high-trust local control action. Every mutation, including `/run`, additionally
 requires the exact request Origin and the session-bound CSRF header minted by
-the router.
+the router. Dashboard mutations are dispatched to this stricter control guard
+without attempting to commit a policy route plan, because a local control Host
+miss is intentionally not an edge-routed authorization grant.
 
 Status is a control surface, not a route-policy fallback. It requires a real
 authenticated admin session on an allowed local-control host and never becomes

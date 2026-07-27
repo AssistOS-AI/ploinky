@@ -43,7 +43,10 @@ import { handleEdgeTopologyProjection } from './edgeTopologyRoute.js';
 import { createListenerInterfaceClassifier } from './listenerInterfaceClassifier.js';
 import { createPrivateListenerSet } from './privateListenerSet.js';
 import { verifyBrowserMutationRequest } from './browserMutationSecurity.js';
-import { requireAdminControlRequest } from './adminControlSecurity.js';
+import {
+    requireAdminControlRequest,
+    usesAdminControlMutationGuard,
+} from './adminControlSecurity.js';
 
 // Logging
 import { appendLog, logBootEvent, logMemoryUsage } from './utils/logger.js';
@@ -539,7 +542,11 @@ async function processRequest(req, res) {
     const method = String(req.method || 'GET').toUpperCase();
     if (!['GET', 'HEAD', 'OPTIONS'].includes(method)
         && (req.authMode === 'local' || req.authMode === 'sso')
-        && req.authChannel !== 'cli') {
+        && req.authChannel !== 'cli'
+        // Dashboard mutations are guarded by the stricter local-admin Origin
+        // and CSRF check in handleDashboard. Its control route intentionally
+        // has no policy route plan to commit here.
+        && !usesAdminControlMutationGuard(pathname)) {
         const mutationProof = verifyBrowserMutationRequest(req, {
             routePlan,
             authContext: req.edgeAuthContext,
