@@ -1,5 +1,11 @@
 const ACHILLES_COMMAND_CATALOG_TOOL = 'list_achilles_cli_commands';
 const MCP_ACCEPT = 'application/json, text/event-stream';
+const BROWSER_CSRF_HEADER = 'x-ploinky-browser-csrf-token';
+const BROWSER_MUTATION_RETRY_ERRORS = new Set([
+    'browser_csrf_invalid',
+    'edge_generation_changed',
+]);
+const browserMutationProofs = new Map();
 
 function findCommandSlash(value) {
     return String(value || '').startsWith('/') ? 0 : -1;
@@ -11,6 +17,54 @@ function buildMcpHeaders(sessionId = null) {
         Accept: MCP_ACCEPT,
         ...(sessionId ? { 'mcp-session-id': sessionId } : {})
     };
+}
+
+async function loadBrowserMutationProof(agentName, { refresh = false } = {}) {
+    const routeKey = String(agentName || '').trim();
+    if (!routeKey) throw new Error('agent route key is required');
+    if (!refresh && browserMutationProofs.has(routeKey)) {
+        return browserMutationProofs.get(routeKey);
+    }
+    const proofUrl = new URL('/auth/token', globalThis.location?.href || globalThis.location?.origin);
+    proofUrl.searchParams.set('agent', routeKey);
+    const response = await fetch(proofUrl.toString(), {
+        method: 'GET',
+        credentials: 'include',
+        cache: 'no-store',
+        headers: { accept: 'application/json' },
+    });
+    const payload = await response.json().catch(() => ({}));
+    const proof = payload?.browserMutation;
+    if (!response.ok
+        || !proof?.csrfToken
+        || proof.routeKey !== routeKey
+        || proof.origin !== globalThis.location?.origin) {
+        throw new Error(`browser mutation proof unavailable for ${routeKey}`);
+    }
+    browserMutationProofs.set(routeKey, proof.csrfToken);
+    return proof.csrfToken;
+}
+
+async function fetchAgentMcp(agentName, endpoint, options = {}) {
+    const request = async (refreshProof = false) => {
+        const csrfToken = await loadBrowserMutationProof(agentName, { refresh: refreshProof });
+        const headers = new Headers(options.headers || {});
+        headers.set(BROWSER_CSRF_HEADER, csrfToken);
+        return fetch(endpoint, {
+            ...options,
+            headers,
+            credentials: 'include',
+        });
+    };
+    let response = await request(false);
+    if ([403, 503].includes(response.status)) {
+        const payload = await response.clone().json().catch(() => null);
+        if (BROWSER_MUTATION_RETRY_ERRORS.has(String(payload?.error || '').toLowerCase())) {
+            browserMutationProofs.delete(String(agentName || '').trim());
+            response = await request(true);
+        }
+    }
+    return response;
 }
 
 export function applySlashSelectionToValue(value, cmd) {
@@ -299,8 +353,8 @@ export function buildSuggestions(commands, {
     return suggestions;
 }
 
-async function callMcpInitialize(mcpEndpoint) {
-    const initRes = await fetch(mcpEndpoint, {
+async function callMcpInitialize(agentName, mcpEndpoint) {
+    const initRes = await fetchAgentMcp(agentName, mcpEndpoint, {
         method: 'POST',
         headers: buildMcpHeaders(),
         body: JSON.stringify({
@@ -318,7 +372,7 @@ async function callMcpInitialize(mcpEndpoint) {
     const initBody = await initRes.json().catch(() => null);
     if (!initBody || !initBody.result) return null;
     const sessionId = initRes.headers.get('mcp-session-id') || initBody.result?.meta?.sessionId;
-    await fetch(mcpEndpoint, {
+    await fetchAgentMcp(agentName, mcpEndpoint, {
         method: 'POST',
         headers: buildMcpHeaders(sessionId),
         body: JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' })
@@ -326,11 +380,11 @@ async function callMcpInitialize(mcpEndpoint) {
     return sessionId;
 }
 
-async function fetchStructuredCatalog(mcpEndpoint, sessionId, tools, catalogArguments = {}) {
+async function fetchStructuredCatalog(agentName, mcpEndpoint, sessionId, tools, catalogArguments = {}) {
     const catalogTool = tools.find((tool) => tool?.name === ACHILLES_COMMAND_CATALOG_TOOL);
     if (!catalogTool) return [];
 
-    const callRes = await fetch(mcpEndpoint, {
+    const callRes = await fetchAgentMcp(agentName, mcpEndpoint, {
         method: 'POST',
         headers: buildMcpHeaders(sessionId),
         body: JSON.stringify({
@@ -397,10 +451,10 @@ async function fetchCommandsFromAgent(agentName, dlog) {
     if (!agentName) return [];
     try {
         const mcpEndpoint = `/${agentName}/mcp`;
-        const sessionId = await callMcpInitialize(mcpEndpoint);
+        const sessionId = await callMcpInitialize(agentName, mcpEndpoint);
         if (sessionId === null) return [];
 
-        const toolsRes = await fetch(mcpEndpoint, {
+        const toolsRes = await fetchAgentMcp(agentName, mcpEndpoint, {
             method: 'POST',
             headers: buildMcpHeaders(sessionId),
             body: JSON.stringify({ jsonrpc: '2.0', id: 'wc-tools-1', method: 'tools/list' })
@@ -412,7 +466,7 @@ async function fetchCommandsFromAgent(agentName, dlog) {
 
         const tools = toolsBody.result.tools;
         try {
-            const structured = await fetchStructuredCatalog(mcpEndpoint, sessionId, tools, buildCatalogArguments());
+            const structured = await fetchStructuredCatalog(agentName, mcpEndpoint, sessionId, tools, buildCatalogArguments());
             if (structured.length > 0) {
                 return structured.sort((a, b) => a.name.localeCompare(b.name));
             }
