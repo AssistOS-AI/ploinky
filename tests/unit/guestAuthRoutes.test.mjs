@@ -104,7 +104,7 @@ function writeWorkspaceConfig(ploinkyDir, { staticAuthMode = 'local' } = {}) {
             repoName: 'AchillesIDE',
             auth: staticAuthMode === 'local'
                 ? { mode: 'local', usersVar: 'PLOINKY_AUTH_EXPLORER_USERS' }
-                : { mode: 'none' },
+                : { mode: staticAuthMode },
         },
         webAssist: {
             type: 'agent',
@@ -390,6 +390,52 @@ test('route default keeps static-agent auth for routes with auth mode none', asy
 
     assert.equal(result.ok, false);
     assert.equal(res.statusCode, 401);
+});
+
+test('browser token for an auth-none target uses static auth and binds proof to the target', async (t) => {
+    const { authHandlers, authService, createRoutePlan } = await withAuthModules(t, {
+        staticAuthMode: 'sso',
+    });
+    const originalGetSession = authService.getSession;
+    authService.getSession = (sessionId) => sessionId === 'sso-session'
+        ? {
+            user: {
+                id: 'sso:admin',
+                username: 'admin',
+                name: 'Admin',
+                email: 'admin@example.test',
+                roles: ['user', 'admin'],
+            },
+            tokens: null,
+            expiresAt: Date.now() + 60_000,
+        }
+        : null;
+    t.after(() => {
+        authService.getSession = originalGetSession;
+    });
+
+    const req = makeRequest({
+        method: 'GET',
+        url: '/auth/token?agent=webAdmin',
+        cookie: 'ploinky_sso=sso-session',
+    });
+    const res = new MockResponse();
+
+    const handled = await authHandlers.handleAuthRoutes(
+        req,
+        res,
+        new URL(req.url, 'http://localhost'),
+        { routePlan: createRoutePlan() },
+    );
+    const body = JSON.parse(res.body || '{}');
+
+    assert.equal(handled, true);
+    assert.equal(res.statusCode, 200);
+    assert.equal(body.ok, true);
+    assert.equal(body.user.username, 'admin');
+    assert.equal(body.browserMutation.routeKey, 'webAdmin');
+    assert.equal(body.browserMutation.generation, 'guest-auth-test-generation');
+    assert.match(String(res.getHeader('set-cookie') || ''), /^ploinky_browser_csrf=/);
 });
 
 test('route default falls back to guest when no user-authenticated static agent exists', async (t) => {

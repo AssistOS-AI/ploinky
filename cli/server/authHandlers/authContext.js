@@ -253,6 +253,18 @@ function isHostBoundRoutePlan(routePlan) {
     return ['agent-root', 'dedicated-service'].includes(String(routePlan?.hostSelection?.kind || ''));
 }
 
+function resolveControlBrowserProofAuthContext(parsedUrl, options = {}) {
+    if ((parsedUrl.pathname || '/') !== '/auth/token') return null;
+    const targetRouteKey = String(parsedUrl.searchParams.get('agent') || '').trim();
+    if (!targetRouteKey) return null;
+
+    const targetContext = resolveAuthContextForRouteKey(targetRouteKey, options);
+    if (!targetContext.record || targetContext.mode !== 'none') return null;
+
+    const inheritedContext = resolveAuthenticatedRouteAuthContext(targetRouteKey, options);
+    return inheritedContext.error ? null : inheritedContext;
+}
+
 export function resolveAuthContextForRoutePlan(parsedUrl, routePlan, { browserAuth = false } = {}) {
     const snapshot = snapshotFromOptions({ routePlan });
     const selectedRouteKey = routePlanSelectedRouteKey(routePlan);
@@ -262,6 +274,10 @@ export function resolveAuthContextForRoutePlan(parsedUrl, routePlan, { browserAu
             boundHostRouteKey: selectedRouteKey,
             boundGeneration: String(routePlan?.lease?.id || snapshot?.generation || ''),
         };
+    }
+    if (browserAuth) {
+        const proofContext = resolveControlBrowserProofAuthContext(parsedUrl, { snapshot });
+        if (proofContext) return proofContext;
     }
 
     const decision = routePlan?.decision;
