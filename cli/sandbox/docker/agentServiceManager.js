@@ -5,6 +5,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import {
     assertManifestEnvProfileCompleteness,
+    buildEnvMap,
     buildEnvFlags,
     formatEnvFlag,
     getExposedNames,
@@ -1455,8 +1456,15 @@ function resolvePublishedPortMappings(containerName, portMappings) {
     });
 }
 
-function resolveImplicitAgentServerPort(profileConfig = {}) {
-    const rawPort = profileConfig?.env?.PORT;
+function resolveImplicitAgentServerPort(profileConfig = {}, resolvedEnv = null) {
+    let rawPort = resolvedEnv && Object.hasOwn(resolvedEnv, 'PORT')
+        ? resolvedEnv.PORT
+        : profileConfig?.env?.PORT;
+    if (rawPort && typeof rawPort === 'object' && !Array.isArray(rawPort)) {
+        rawPort = Object.hasOwn(rawPort, 'value')
+            ? rawPort.value
+            : rawPort.default;
+    }
     if (rawPort === undefined || rawPort === null || String(rawPort).trim() === '') {
         return 7000;
     }
@@ -1890,7 +1898,13 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
 
     const { publishArgs: manifestPorts, portMappings } = parseManifestPorts(manifest, profileConfig);
     assertHostPortContract(runtimeNetworkPlan.mode, portMappings);
-    const agentServerPort = resolveImplicitAgentServerPort(profileConfig);
+    const resolvedProfileEnv = buildEnvMap(manifest, profileConfig, {
+        agentName,
+        repoName,
+        profileName: activeProfile,
+        forRuntime: true,
+    });
+    const agentServerPort = resolveImplicitAgentServerPort(profileConfig, resolvedProfileEnv);
     const containerPortCandidates = portMappings
         .map((mapping) => mapping?.containerPort)
         .filter((port) => typeof port === 'number' && port > 0);
