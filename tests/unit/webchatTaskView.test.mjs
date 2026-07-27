@@ -305,6 +305,8 @@ test('task view sends continuation through the AchillesCLI command bridge', () =
     assert.match(source, /applyUpdate\(payload\)/);
     assert.match(source, /let logResyncPending = false/);
     assert.match(source, /if \(!logResyncPending\)/);
+    assert.match(source, /if \(!transport\.embedded\) void syncLog\(\)\.catch\(showLoadError\)/);
+    assert.match(source, /Loading task…/);
     assert.doesNotMatch(source, /\.then\(\(\) => applyLogUpdate\(payload\)\)/);
 });
 

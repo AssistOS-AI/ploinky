@@ -13,6 +13,7 @@ import {
     routeWorkspaceRuntimeOutput,
     serializeRuntimeStateSseEvent,
     serializeSessionStateSseEvent,
+    serializeTaskListSseEvent,
     serializeWorkspaceFilesSseEvent,
 } from '../../cli/server/handlers/webchat/runtimeState.js';
 import { handleRuntimeRoute } from '../../cli/server/handlers/webchat/runtimeRoutes.js';
@@ -160,6 +161,12 @@ test('an EventSource reconnect receives the in-memory session snapshot', (t) => 
             indexVersion: 4,
             files: new Set(['README.md', 'reports/final.md']),
         },
+        webchatTasks: new Map([['task_1234567890abcdef12345678', {
+            id: 'task_1234567890abcdef12345678',
+            targetAgent: 'codexAgent',
+            description: 'Cached task',
+            status: 'ongoing',
+        }]]),
     };
     const sid = 'browser-session';
     const appState = {
@@ -182,11 +189,30 @@ test('an EventSource reconnect receives the in-memory session snapshot', (t) => 
     });
 
     assert.match(writes.join(''), /event: session-state/);
+    assert.match(writes.join(''), /event: task-update/);
+    assert.match(writes.join(''), /Cached task/);
     assert.match(writes.join(''), /event: workspace-files/);
     assert.match(writes.join(''), /reports\/final\.md/);
     assert.match(writes.join(''), new RegExp(SESSION_ID));
     req.emit('close');
     if (tab.cleanupTimer) clearTimeout(tab.cleanupTimer);
+});
+
+test('task list snapshots are revalidated before SSE serialization', () => {
+    const serialized = serializeTaskListSseEvent(new Map([
+        ['task_1234567890abcdef12345678', {
+            id: 'task_1234567890abcdef12345678',
+            targetAgent: 'codexAgent',
+            description: 'Safe task',
+            status: 'ongoing',
+            credential: 'must-not-reach-browser',
+        }],
+    ]));
+
+    assert.match(serialized, /event: task-update/);
+    assert.match(serialized, /Safe task/);
+    assert.doesNotMatch(serialized, /credential/);
+    assert.equal(serializeTaskListSseEvent(new Map()), '');
 });
 
 test('a failed runtime write is rejected and the zombie runtime is removed', async () => {

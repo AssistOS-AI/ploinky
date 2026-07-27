@@ -42,6 +42,7 @@ test('WebChat exposes a task overlay backed by AchillesCLI commands', () => {
     const messages = read('cli/server/webchat/messages.js');
     const presentation = read('cli/server/webchat/taskPresentation.js');
     const taskView = read('cli/server/webchat/taskView.js');
+    const taskViewTransport = read('cli/server/webchat/taskViewTransport.js');
     assert.match(messages, /attachTaskSummary/);
     assert.match(messages, /message\?\.type === 'task'/);
     assert.match(messages, /wa-task-item/);
@@ -54,8 +55,9 @@ test('WebChat exposes a task overlay backed by AchillesCLI commands', () => {
     assert.match(presentation, /setInterval\(renderSummary, 1000\)/);
     assert.match(taskRoutes, /\/view\$/);
     assert.match(taskView, /webchat-task-update/);
-    assert.match(taskView, /webchat-task-command/);
+    assert.match(taskViewTransport, /webchat-task-command/);
     assert.doesNotMatch(taskView, /new EventSource/);
+    assert.match(taskViewTransport, /new EventSourceClass/);
 });
 
 test('task control events resolve visible WebChat commands without waiting for chat text', () => {

@@ -1,5 +1,7 @@
 import { serializeEnvelope } from './network.js';
 
+const RUNTIME_RETRY_DELAYS_MS = [100, 250, 500, 1000, 2000, 4000];
+
 function buildTaskEndpoint(windowRef, basePath, path, tabId) {
     const suffix = String(path || '').replace(/^\/+/, '');
     const normalizedBase = String(basePath || '/webchat').replace(/\/+$/, '');
@@ -41,7 +43,6 @@ export function createTaskViewTransport({
     const embedded = windowRef.parent && windowRef.parent !== windowRef;
     const tabId = embedded ? '' : resolveTabId(windowRef, taskId);
     let eventSource = null;
-    let opened = false;
 
     async function postStandaloneCommand(command) {
         const endpoint = buildTaskEndpoint(windowRef, basePath, 'input', tabId);
@@ -52,12 +53,16 @@ export function createTaskViewTransport({
             body,
             credentials: 'include',
         });
-        let response = await send();
-        if (response.status === 409) {
-            await new Promise((resolve) => windowRef.setTimeout(resolve, 250));
-            response = await send();
+        for (let attempt = 0; ; attempt += 1) {
+            const response = await send();
+            if (response.status !== 409) {
+                if (!response.ok) throw new Error(`task_input_failed_${response.status}`);
+                return;
+            }
+            const delay = RUNTIME_RETRY_DELAYS_MS[attempt];
+            if (delay === undefined) throw new Error('task_runtime_unavailable');
+            await new Promise((resolve) => windowRef.setTimeout(resolve, delay));
         }
-        if (!response.ok) throw new Error(`task_input_failed_${response.status}`);
     }
 
     function requestCommand(command) {
@@ -83,16 +88,15 @@ export function createTaskViewTransport({
             buildTaskEndpoint(windowRef, basePath, 'stream', tabId),
         );
         eventSource.onopen = () => {
-            opened = true;
             onOpen?.();
-        };
-        eventSource.onerror = () => {
-            if (!opened) onError?.(new Error('task_stream_unavailable'));
         };
         eventSource.addEventListener('task-update', (event) => {
             try {
                 const payload = JSON.parse(event.data);
-                if (payload?.task?.id === taskId) onUpdate?.(payload);
+                const includesTask = payload?.task?.id === taskId
+                    || (payload?.event === 'list'
+                        && payload.tasks?.some?.((entry) => entry?.id === taskId));
+                if (includesTask) onUpdate?.(payload);
             } catch (_) {
                 // Ignore malformed runtime events and keep the stream alive.
             }
@@ -102,7 +106,6 @@ export function createTaskViewTransport({
     function stop() {
         eventSource?.close?.();
         eventSource = null;
-        opened = false;
     }
 
     return {

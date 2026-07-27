@@ -16,6 +16,7 @@ import {
     serializeInteractionResolvedSseEvent,
     serializeRuntimeStateSseEvent,
     serializeSessionStateSseEvent,
+    serializeTaskListSseEvent,
     serializeWorkspaceFilesSseEvent,
     writeOrBufferSseEvent
 } from './runtimeState.js';
@@ -150,6 +151,8 @@ export function handleRuntimeRoute({
         if (runtimeStateSnapshot) res.write(runtimeStateSnapshot);
         const sessionStateSnapshot = serializeSessionStateSseEvent(tab.webchatSessionSnapshot);
         if (sessionStateSnapshot) res.write(sessionStateSnapshot);
+        const taskListSnapshot = serializeTaskListSseEvent(tab.webchatTasks);
+        if (taskListSnapshot) res.write(taskListSnapshot);
         const workspaceFilesSnapshot = tab.webchatWorkspaceFiles
             ? serializeWorkspaceFilesSseEvent({
                 indexVersion: tab.webchatWorkspaceFiles.indexVersion,

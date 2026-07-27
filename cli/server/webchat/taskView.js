@@ -33,6 +33,7 @@ let logSync = null;
 let logResyncPending = false;
 let continuationSubmitting = false;
 let stopSubmitting = false;
+let loadErrorMessage = '';
 const pendingUpdates = [];
 const TERMINAL_STATUSES = new Set(['finished', 'stopped', 'error']);
 
@@ -81,13 +82,17 @@ function requestCommand(command) {
 
 function renderTask() {
     const presentation = taskStatusPresentation(task);
+    const fallbackDescription = !taskId
+        ? 'Invalid task'
+        : (initialLoadComplete ? 'Task data unavailable' : 'Loading task…');
     agent.textContent = task?.targetAgent || 'Task';
-    description.textContent = task?.description || task?.toolName || (taskId ? 'Task data unavailable' : 'Invalid task');
+    description.textContent = task?.description || task?.toolName || fallbackDescription;
     status.className = `wa-task-status is-${presentation.className}`;
-    status.textContent = task ? presentation.label : 'UNAVAILABLE';
+    status.textContent = task ? presentation.label : (initialLoadComplete ? 'UNAVAILABLE' : 'LOADING');
     duration.textContent = taskDurationLabel(task);
-    error.hidden = !task?.error;
-    error.textContent = task?.error || '';
+    const displayedError = task?.error || loadErrorMessage;
+    error.hidden = !displayedError;
+    error.textContent = displayedError;
     const taskOngoing = task?.status === 'ongoing';
     const taskStopping = String(task?.remoteStatus || '').trim().toLowerCase() === 'cancelling';
     stopButton.hidden = !taskOngoing;
@@ -159,6 +164,7 @@ function applyLogUpdate(payload) {
 
 function applyUpdate(payload) {
     if (payload?.task?.id !== taskId) return;
+    if (payload.event === 'view') loadErrorMessage = '';
     task = { ...task, ...payload.task };
     let receivedLogSnapshot = false;
     if (payload.event === 'action' && payload.action === 'stop') stopSubmitting = false;
@@ -187,8 +193,10 @@ function applyUpdate(payload) {
 }
 
 function showLoadError(loadError) {
-    error.hidden = false;
-    error.textContent = `Unable to load task data: ${loadError?.message || loadError}`;
+    initialLoadComplete = true;
+    loadErrorMessage = `Unable to load task data: ${loadError?.message || loadError}`;
+    renderTask();
+    renderLog();
 }
 
 async function submitContinuation(event) {
@@ -218,9 +226,18 @@ function initialize() {
         return;
     }
     transport.start();
+    if (!transport.embedded) void syncLog().catch(showLoadError);
 }
 
 function receiveUpdate(payload) {
+    if (payload?.event === 'list') {
+        const snapshot = payload.tasks?.find?.((entry) => entry?.id === taskId);
+        if (!snapshot) return;
+        task = { ...task, ...snapshot };
+        renderTask();
+        renderLog();
+        return;
+    }
     if (payload?.task?.id !== taskId) return;
     if (!initialLoadComplete) {
         if (payload.event !== 'view') {

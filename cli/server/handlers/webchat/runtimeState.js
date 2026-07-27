@@ -91,6 +91,20 @@ export function parseWebchatTaskState(envelope) {
     };
 }
 
+export function serializeTaskListSseEvent(tasks) {
+    const values = tasks instanceof Map
+        ? [...tasks.values()]
+        : (Array.isArray(tasks) ? tasks : []);
+    const snapshot = parseWebchatTaskState({
+        __webchatTask: 1,
+        version: 1,
+        event: 'list',
+        tasks: values,
+    });
+    if (!snapshot?.tasks.length) return '';
+    return `event: task-update\ndata: ${JSON.stringify(snapshot)}\n\n`;
+}
+
 function stripCtrlAndAnsi(input) {
     try {
         let out = input || '';

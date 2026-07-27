@@ -112,7 +112,7 @@ ordered progress strings in its later `__webchatSession` snapshot, allowing the
 browser to render them as a collapsible block above the final answer after
 history is loaded. Progress remains UI metadata rather than assistant text.
 
-WebChat may also receive generic `__webchatTask` list, view, lifecycle, log, and action envelopes from a selected CLI. These envelopes must be intercepted before conversation rendering, validated, retained only as volatile runtime state, and forwarded through the existing EventSource stream as `task-update` events. Ploinky must not persist task metadata or logs, hardcode target-agent ids or tool names, or expose task data/action REST routes. It retains only authenticated `GET /webchat/tasks/<task-id>/view`, which serves the generic HTML task page. The selected CLI owns task storage, log retention, reattachment, and actions.
+WebChat may also receive generic `__webchatTask` list, view, lifecycle, log, and action envelopes from a selected CLI. These envelopes must be intercepted before conversation rendering, validated, retained only as volatile runtime state, and forwarded through the existing EventSource stream as `task-update` events. A new subscriber to a surviving runtime must receive a revalidated, non-empty cached task-list snapshot before later live updates so a reconnecting browser can render known task metadata without waiting for another CLI publication. Logs remain CLI-owned and must not be included in that cached list. Ploinky must not persist task metadata or logs, hardcode target-agent ids or tool names, or expose task data/action REST routes. It retains only authenticated `GET /webchat/tasks/<task-id>/view`, which serves the generic HTML task page. The selected CLI owns task storage, log retention, reattachment, and actions.
 
 An asynchronous tool may advertise a generic continuation tool. Its structured
 result may return a versioned opaque continuation handle even when execution
@@ -141,7 +141,8 @@ creation time remain stable, while `executionStartedAt` tracks the current turn.
 Task-log regions must reserve a persistent scrollbar gutter and render a
 high-contrast, theme-aware scrollbar so long histories remain visibly and
 directly navigable in both the Tasks overlay and authenticated task view.
-The parent stream remains the live update path. If the stored agent is installed
+The active embedded-parent or standalone generic stream remains the live update
+path. If the stored agent is installed
 but has no ready route, including after a general restart left a
 `startup: manual` provider stopped, the selected CLI must activate that exact
 agent in global mode through `AgentMcpClient.ensureAgentRunning()` and wait for
@@ -172,13 +173,18 @@ ignored rather than rendered or migrated.
 
 The task link must use WebChat's generic side-panel link mechanism to open the
 authenticated task view. That page must reproduce the task header, error, and
-live-log presentation previously available in the expanded chat item. It loads
-initial state by asking the parent to send `/task view <task-id>` and receives
-later updates for the active task through a same-origin `postMessage` bridge fed
-by the parent's existing EventSource. It must not open another EventSource,
-fetch task data directly, or create a task-specific live transport. Direct
-navigation still serves the authenticated HTML shell but requires its parent
-WebChat runtime for task commands and state.
+live-log presentation previously available in the expanded chat item. When
+embedded, it loads initial state by asking the parent to send
+`/task view <task-id>` and receives later updates for the active task through a
+same-origin `postMessage` bridge fed by the parent's existing EventSource.
+When opened directly in a browser tab, it must preserve the selected agent and
+workspace query, attach to the generic authenticated WebChat EventSource with
+its own browser tab id, and send the same command invisibly through the generic
+input route. The standalone view must request the snapshot immediately, repeat
+the request after stream reconnection, and retry bounded `409` startup races.
+Until a task or terminal loading failure is received it must show a loading
+state rather than claiming that task data is unavailable. Neither mode may
+fetch task data through a task-specific REST endpoint.
 If a task-log delta does not begin at the task view's current offset, the view
 must request one complete `/task view` snapshot and wait for that response. It
 must not recursively reapply the same mismatched delta while the snapshot is
@@ -367,15 +373,18 @@ leaves the browser waiting on an empty placeholder. Echo suppression therefore
 uses explicit transport markers, including WebChat envelopes and the `you>`
 readline prompt, rather than conversational text equality.
 
-### Question #17: Why does the task view reuse the parent WebChat stream instead of opening its own EventSource?
+### Question #17: Why does an embedded task view reuse its parent stream while a standalone view attaches to the generic stream?
 
 Response:
 The parent WebChat runtime already receives every `task-update` event and owns
-the selected CLI lifecycle. Opening the general WebChat stream from the task
-view could create or retain another runtime merely to inspect logs. Forwarding
-only the active task through a same-origin `postMessage` bridge preserves one
-live transport. The iframe asks its parent to send `/task view <task-id>` for
-initial state or log recovery, so Ploinky needs no task data route.
+the selected CLI lifecycle, so forwarding only the active task through a
+same-origin `postMessage` bridge preserves one live transport for the embedded
+page. A directly navigated tab has no parent bridge; attaching it to the same
+workspace-and-agent runtime key preserves CLI ownership and makes the existing
+generic input and EventSource routes sufficient. Replaying cached, revalidated
+task metadata gives that tab immediate context, while an idempotent hidden
+`/task view <task-id>` request obtains the authoritative log and recovers after
+startup or reconnect races without adding a task data REST API.
 
 ### Question #18: Why are `@` path suggestions rooted at the WebChat working directory?
 

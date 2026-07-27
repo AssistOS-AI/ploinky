@@ -64,14 +64,39 @@ test('standalone task view subscribes to the selected runtime and sends hidden c
 
     sources[0].onopen();
     assert.equal(opened, 1);
+    sources[0].emit('task-update', {
+        event: 'list',
+        tasks: [{ id: TASK_ID }, { id: 'task_abcdefabcdefabcdefabcdef' }],
+    });
     sources[0].emit('task-update', { event: 'view', task: { id: TASK_ID } });
-    assert.equal(updates.length, 1);
+    assert.equal(updates.length, 2);
 
     await transport.requestCommand(`/task view ${TASK_ID}`);
     assert.match(requests[0].url, /^\/webchat\/input\?/);
     const envelope = JSON.parse(requests[0].options.body.trim());
     assert.equal(envelope.text, `/task view ${TASK_ID}`);
     assert.equal(envelope.presentation.visible, false);
+});
+
+test('standalone task commands retry while the runtime stream is starting', async () => {
+    const { windowRef, requests } = createStandaloneWindow();
+    const statuses = [409, 409, 204];
+    const delays = [];
+    windowRef.fetch = async (url, options) => {
+        requests.push({ url, options });
+        const status = statuses.shift();
+        return { ok: status === 204, status };
+    };
+    windowRef.setTimeout = (callback, delay) => {
+        delays.push(delay);
+        callback();
+    };
+    const transport = createTaskViewTransport({ windowRef, taskId: TASK_ID });
+
+    await transport.requestCommand(`/task view ${TASK_ID}`);
+
+    assert.equal(requests.length, 3);
+    assert.deepEqual(delays, [100, 250]);
 });
 
 test('embedded task view keeps using the same-origin parent bridge', async () => {
