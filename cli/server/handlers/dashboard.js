@@ -7,6 +7,7 @@ import { readJsonBody } from './common.js';
 import * as staticSrv from '../static/index.js';
 import { requireAdminControlRequest } from '../adminControlSecurity.js';
 import { PLOINKY_WORKSPACE_ROOT } from '../../utils/config.js';
+import { DIRECT_CLI_PATH } from '../../utils/directCli.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -71,7 +72,7 @@ function handleDashboard(req, res, appConfig, appState) {
                     return;
                 }
                 const args = cmd.split(/\s+/).filter(Boolean);
-                const proc = spawn('ploinky', args, { cwd: PLOINKY_WORKSPACE_ROOT, env: { ...process.env, PLOINKY_CWD: PLOINKY_WORKSPACE_ROOT } });
+                const proc = spawn(DIRECT_CLI_PATH, args, { cwd: PLOINKY_WORKSPACE_ROOT, env: { ...process.env, PLOINKY_CWD: PLOINKY_WORKSPACE_ROOT } });
                 let out = ''; let err = '';
                 let outputBytes = 0;
                 let finished = false;

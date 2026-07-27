@@ -6,6 +6,7 @@ import { fileURLToPath } from 'url';
 import * as staticSrv from '../static/index.js';
 import { requireAdminControlRequest } from '../adminControlSecurity.js';
 import { ROUTING_FILE, PLOINKY_WORKSPACE_ROOT } from '../../utils/config.js';
+import { DIRECT_CLI_PATH } from '../../utils/directCli.js';
 import { getAllServerStatuses } from '../serverManager.js';
 import { loadAgents } from '../../utils/workspace.js';
 
@@ -34,7 +35,7 @@ function runStatusCommand() {
             resolve(payload);
         };
         try {
-            const proc = spawn('ploinky', ['status'], {
+            const proc = spawn(DIRECT_CLI_PATH, ['status'], {
                 cwd: PLOINKY_WORKSPACE_ROOT,
                 env: { ...process.env, PLOINKY_CWD: PLOINKY_WORKSPACE_ROOT },
             });
