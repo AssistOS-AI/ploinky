@@ -20,7 +20,6 @@ const COMPLETE = Object.freeze({
 const HOSTS = Object.freeze({
     'office.example.test': {
         agent: 'AssistOSExplorer/onlyOffice',
-        httpService: 'onlyoffice-editor',
     },
     'explorer.example.test': {
         agent: 'AssistOSExplorer/explorer',
@@ -163,7 +162,7 @@ test('host selector must name a validated agent and cannot be a raw scalar', () 
         () => normalizeCloudflarePublicationDesired({
             configurationGeneration: GENERATION,
             cloudflare: COMPLETE,
-            hosts: { 'office.example.test': { httpService: 'onlyoffice-editor' } },
+        hosts: { 'office.example.test': {} },
         }),
         (error) => error.code === 'CLOUDFLARE_HOST_INVALID',
     );

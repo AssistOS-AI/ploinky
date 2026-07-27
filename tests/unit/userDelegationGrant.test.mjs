@@ -18,11 +18,10 @@ const USER = {
     username: 'alice',
     roles: ['user'],
 };
-const SERVICE = {
+const ROUTE = {
     routeKey: 'onlyOffice',
-    externalPrefix: '/services/onlyoffice/',
-    internalPrefix: '/control/',
-    internalPath: '/control/office/session',
+    pathPrefix: '/base-agent-additional-server/onlyOffice/7000/',
+    requestPath: '/control/office/session',
 };
 
 function mint(overrides = {}) {
@@ -32,7 +31,7 @@ function mint(overrides = {}) {
         now,
         ttlSeconds: 1800,
         sourceAgentId: SOURCE_AGENT,
-        service: SERVICE,
+        route: ROUTE,
         user: USER,
         targetAgentId: TARGET_AGENT,
         tools: [TOOL, 'dpu_confidential_update'],

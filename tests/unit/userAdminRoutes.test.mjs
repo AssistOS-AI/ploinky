@@ -11,6 +11,7 @@ const __dirname = path.dirname(__filename);
 const REPO_ROOT = path.resolve(__dirname, '../..');
 const MASTER_KEY = '3'.repeat(64);
 let mintAdminCsrfToken = null;
+let getLocalSession = null;
 
 class MockResponse {
     constructor() {
@@ -54,6 +55,7 @@ function makeRequest({ method = 'GET', url, body, cookie = '', csrf = 'valid' })
     if (['POST', 'PATCH', 'DELETE'].includes(method) && csrf !== 'missing') {
         req.headers.origin = 'http://localhost';
         const sessionId = String(cookie).split(';').map((part) => part.trim()).find((part) => part.startsWith('ploinky_jwt='))?.slice('ploinky_jwt='.length) || '';
+        req.session = getLocalSession?.(sessionId) || null;
         req.headers['x-ploinky-csrf-token'] = csrf === 'valid' && mintAdminCsrfToken
             ? mintAdminCsrfToken({ sessionId, req })
             : 'v1.invalid';
@@ -116,8 +118,9 @@ test('user admin routes enforce admin access, CRUD, rev invalidation, and agent 
 
     const nonce = Date.now();
     const authHandlers = await import(`${pathToFileURL(path.join(REPO_ROOT, 'cli/server/authHandlers/index.js')).href}?test=${nonce}`);
-    ({ mintAdminCsrfToken } = await import(`${pathToFileURL(path.join(REPO_ROOT, 'cli/server/adminControlSecurity.js')).href}?test=${nonce}`));
+    ({ mintAdminCsrfToken } = await import(pathToFileURL(path.join(REPO_ROOT, 'cli/server/adminControlSecurity.js')).href));
     const localService = await import(`${pathToFileURL(path.join(REPO_ROOT, 'cli/server/auth/localService.js')).href}?test=${nonce}`);
+    ({ getSession: getLocalSession } = await import(pathToFileURL(path.join(REPO_ROOT, 'cli/server/auth/localService.js')).href));
     const passwordStore = await import(`${pathToFileURL(path.join(REPO_ROOT, 'cli/utils/security/encryptedPasswordStore.js')).href}?test=${nonce}`);
     const passwords = await import(`${pathToFileURL(path.join(REPO_ROOT, 'cli/utils/security/localAuthPasswords.js')).href}?test=${nonce}`);
 
@@ -188,7 +191,7 @@ test('user admin routes enforce admin access, CRUD, rev invalidation, and agent 
         cookie: authCookie(explorerAdmin.sessionId),
     });
     assert.equal(result.handled, true);
-    assert.equal(result.statusCode, 200);
+    assert.equal(result.statusCode, 200, JSON.stringify(result.body));
     assert.deepEqual(result.body.users.map((user) => user.username), ['admin', 'user']);
     assert.match(String(result.headers.get('set-cookie') || ''), /ploinky_jwt=/);
 
@@ -196,7 +199,7 @@ test('user admin routes enforce admin access, CRUD, rev invalidation, and agent 
         url: '/api/agents/explorer/settings',
         cookie: authCookie(explorerAdmin.sessionId),
     });
-    assert.equal(result.statusCode, 200);
+    assert.equal(result.statusCode, 200, JSON.stringify(result.body));
     assert.equal(result.body.settings.loginBrandingName, 'Login');
 
     result = await invoke(authHandlers.handleUserAdminRoutes, {
@@ -207,7 +210,7 @@ test('user admin routes enforce admin access, CRUD, rev invalidation, and agent 
             loginBrandingName: 'Acme Workspace',
         },
     });
-    assert.equal(result.statusCode, 200);
+    assert.equal(result.statusCode, 200, JSON.stringify(result.body));
     assert.equal(result.body.settings.loginBrandingName, 'Acme Workspace');
 
     result = await invoke(authHandlers.handleUserAdminRoutes, {

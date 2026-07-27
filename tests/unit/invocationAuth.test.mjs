@@ -6,7 +6,7 @@ import { signHmacJwt } from '../../Agent/lib/jwtSign.mjs';
 import { createMemoryReplayCache } from '../../Agent/lib/jwtVerify.mjs';
 import { computeRchHttp, computeRchTool } from '../../Agent/lib/requestHash.mjs';
 import {
-    verifyHttpServiceAuthInfoFromHeaders,
+    verifyHttpRouteAuthInfoFromHeaders,
     verifyRouterRequestFromHeaders,
 } from '../../Agent/lib/invocationAuth.mjs';
 
@@ -22,7 +22,7 @@ const PATH = '/mcp';
 const TOOL = 'secret_put';
 const ARGS = { key: 'GIT_GITHUB_TOKEN', value: 'x' };
 const HTTP_METHOD = 'POST';
-const HTTP_EXTERNAL_PATH = '/services/browser-use/sessions/sess_1';
+const HTTP_EXTERNAL_PATH = '/base-agent-additional-server/browserUseAgent/7000/sessions/sess_1';
 const HTTP_PATH = '/browser-use/sessions/sess_1';
 const HTTP_QUERY = '?view=1';
 
@@ -55,7 +55,7 @@ function sha256BodyHash(body) {
     return crypto.createHash('sha256').update(Buffer.from(body)).digest('base64url');
 }
 
-function mintHttpServiceRequest({ method = HTTP_METHOD, path = HTTP_PATH, query = HTTP_QUERY, bodyHash, overrides = {} } = {}) {
+function mintHttpRouteRequest({ method = HTTP_METHOD, path = HTTP_PATH, query = HTTP_QUERY, bodyHash, overrides = {} } = {}) {
     const now = Math.floor(Date.now() / 1000);
     const rch = computeRchHttp({ method, path, query, bodyHash });
     const payload = {
@@ -66,7 +66,7 @@ function mintHttpServiceRequest({ method = HTTP_METHOD, path = HTTP_PATH, query 
         actor: { kind: 'user', id: 'user:local:admin', roles: ['user'] },
         method,
         path,
-        tool: '__http_service__',
+        tool: '__http_route__',
         rch,
         jti: crypto.randomBytes(12).toString('base64url'),
         iat: now,
@@ -76,7 +76,7 @@ function mintHttpServiceRequest({ method = HTTP_METHOD, path = HTTP_PATH, query 
     return signHmacJwt({ payload, secret: AGENT_SECRET });
 }
 
-function makeHttpServiceAuthInfoHeader(token, bodyHash) {
+function makeHttpRouteAuthInfoHeader(token, bodyHash) {
     return JSON.stringify({
         user: { id: 'local:admin', username: 'admin', roles: ['user'] },
         invocationToken: token,
@@ -163,13 +163,13 @@ test('rejects a replayed jti', () => {
     assert.match(second.reason, /already been consumed/);
 });
 
-test('verifyHttpServiceAuthInfoFromHeaders accepts a body-bound HTTP service token', () => {
+test('verifyHttpRouteAuthInfoFromHeaders accepts a body-bound HTTP route token', () => {
     const body = JSON.stringify({ action: 'create', name: 'body-bound' });
     const bodyHash = sha256BodyHash(body);
-    const token = mintHttpServiceRequest({ bodyHash });
+    const token = mintHttpRouteRequest({ bodyHash });
 
-    const result = verifyHttpServiceAuthInfoFromHeaders(
-        { 'x-ploinky-auth-info': makeHttpServiceAuthInfoHeader(token, bodyHash) },
+    const result = verifyHttpRouteAuthInfoFromHeaders(
+        { 'x-ploinky-auth-info': makeHttpRouteAuthInfoHeader(token, bodyHash) },
         {
             env: makeEnv(),
             replayCache: createMemoryReplayCache(),
@@ -181,19 +181,19 @@ test('verifyHttpServiceAuthInfoFromHeaders accepts a body-bound HTTP service tok
     );
 
     assert.equal(result.ok, true, result.reason);
-    assert.equal(result.payload.tool, '__http_service__');
+    assert.equal(result.payload.tool, '__http_route__');
     assert.equal(result.bodyHash, bodyHash);
     assert.equal(result.invocationBody.externalPath, HTTP_EXTERNAL_PATH);
     assert.equal(result.invocationBody.path, HTTP_PATH);
 });
 
-test('verifyHttpServiceAuthInfoFromHeaders rejects a changed HTTP body', () => {
+test('verifyHttpRouteAuthInfoFromHeaders rejects a changed HTTP body', () => {
     const body = JSON.stringify({ action: 'create', name: 'body-bound' });
     const bodyHash = sha256BodyHash(body);
-    const token = mintHttpServiceRequest({ bodyHash });
+    const token = mintHttpRouteRequest({ bodyHash });
 
-    const result = verifyHttpServiceAuthInfoFromHeaders(
-        { 'x-ploinky-auth-info': makeHttpServiceAuthInfoHeader(token, bodyHash) },
+    const result = verifyHttpRouteAuthInfoFromHeaders(
+        { 'x-ploinky-auth-info': makeHttpRouteAuthInfoHeader(token, bodyHash) },
         {
             env: makeEnv(),
             replayCache: createMemoryReplayCache(),
@@ -208,13 +208,13 @@ test('verifyHttpServiceAuthInfoFromHeaders rejects a changed HTTP body', () => {
     assert.match(result.reason, /body hash mismatch/);
 });
 
-test('verifyHttpServiceAuthInfoFromHeaders rejects the external path for rewritten services', () => {
+test('verifyHttpRouteAuthInfoFromHeaders rejects the external path for rewritten services', () => {
     const body = JSON.stringify({ action: 'create', name: 'body-bound' });
     const bodyHash = sha256BodyHash(body);
-    const token = mintHttpServiceRequest({ bodyHash });
+    const token = mintHttpRouteRequest({ bodyHash });
 
-    const result = verifyHttpServiceAuthInfoFromHeaders(
-        { 'x-ploinky-auth-info': makeHttpServiceAuthInfoHeader(token, bodyHash) },
+    const result = verifyHttpRouteAuthInfoFromHeaders(
+        { 'x-ploinky-auth-info': makeHttpRouteAuthInfoHeader(token, bodyHash) },
         {
             env: makeEnv(),
             replayCache: createMemoryReplayCache(),
@@ -229,13 +229,13 @@ test('verifyHttpServiceAuthInfoFromHeaders rejects the external path for rewritt
     assert.match(result.reason, /path mismatch/);
 });
 
-test('verifyHttpServiceAuthInfoFromHeaders rejects replay by default', () => {
+test('verifyHttpRouteAuthInfoFromHeaders rejects replay by default', () => {
     const body = JSON.stringify({ action: 'create', name: 'body-bound' });
     const bodyHash = sha256BodyHash(body);
-    const token = mintHttpServiceRequest({ bodyHash, overrides: { jti: 'http-service-replay-default' } });
-    const headers = { 'x-ploinky-auth-info': makeHttpServiceAuthInfoHeader(token, bodyHash) };
+    const token = mintHttpRouteRequest({ bodyHash, overrides: { jti: 'http-service-replay-default' } });
+    const headers = { 'x-ploinky-auth-info': makeHttpRouteAuthInfoHeader(token, bodyHash) };
 
-    const first = verifyHttpServiceAuthInfoFromHeaders(headers, {
+    const first = verifyHttpRouteAuthInfoFromHeaders(headers, {
         env: makeEnv(),
         method: HTTP_METHOD,
         path: HTTP_PATH,
@@ -244,7 +244,7 @@ test('verifyHttpServiceAuthInfoFromHeaders rejects replay by default', () => {
     });
     assert.equal(first.ok, true, first.reason);
 
-    const second = verifyHttpServiceAuthInfoFromHeaders(headers, {
+    const second = verifyHttpRouteAuthInfoFromHeaders(headers, {
         env: makeEnv(),
         method: HTTP_METHOD,
         path: HTTP_PATH,

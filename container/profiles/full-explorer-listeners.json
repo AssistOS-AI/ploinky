@@ -229,7 +229,7 @@
       "rationale": "RoutingServer private listener bound exactly once on box loopback and on every exact current managed bridge gateway; it has no wildcard bind or outer publication."
     },
     {
-      "id": "livekit-signal",
+      "id": "livekit-http",
       "namespacePattern": "^outer$",
       "protocols": ["tcp"],
       "ports": [7880],

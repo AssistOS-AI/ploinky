@@ -591,9 +591,8 @@ esac
         fs.writeFileSync(
             path.join(workspaceDir, '.ploinky', 'data', 'edge-routing', 'desired.json'),
             JSON.stringify({
-                schemaVersion: 1,
-                hosts: {},
-                security: { hostNetworkAllowedInstances: [], internalServiceConsumers: {} },
+                                hosts: {},
+                security: { hostNetworkAllowedInstances: [], privateRouteConsumers: {} },
             }),
         );
 

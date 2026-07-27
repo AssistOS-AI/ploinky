@@ -18,7 +18,7 @@ test('UserDelegationGrantService refuses to mint grants for guests', async () =>
             targetAgentId: 'target',
             tools: ['read'],
             scopes: ['files:read'],
-            service: 'docs',
+            route: { routeKey: 'docs' },
         }),
         /USER_DELEGATION_REQUIRES_AUTHENTICATED_USER/,
     );

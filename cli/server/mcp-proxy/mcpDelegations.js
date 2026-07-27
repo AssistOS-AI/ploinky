@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 
-import { loadRoutingConfig } from '../httpServiceRoutes.js';
+import { loadRoutingConfig } from '../routingState.js';
 import { mintUserDelegationGrant, resolveMaxTtlSeconds } from './userDelegationGrant.js';
 import { deriveSubkey } from '../../utils/security/masterKey.js';
 import { deriveAgentPrincipalId } from '../../utils/security/agentIdentity.js';

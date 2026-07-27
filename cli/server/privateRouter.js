@@ -105,15 +105,15 @@ function callerAclForPlan(plan) {
         }
         return null;
     }
-    const service = (security.internalServiceConsumers || []).find((entry) => (
-        entry?.routeKey === plan.definition?.routeKey && entry?.slug === plan.definition?.slug
+    const route = (security.privateRouteConsumers || []).find((entry) => (
+        entry?.routeKey === plan.routeKey && pathAllowed(String(plan.pathname || ''), [entry?.path])
     ));
-    if (!service) return null;
+    if (!route) return null;
     return {
-        ...service,
-        callers: service.callers || [],
+        ...route,
+        callers: route.callers || [],
         methods: ['DELETE', 'GET', 'HEAD', 'OPTIONS', 'PATCH', 'POST', 'PUT'],
-        paths: [`${String(service.canonicalPrefix || '').replace(/\/$/, '')}/*`],
+        paths: [route.path],
     };
 }
 
@@ -121,8 +121,8 @@ export function authorizePrivateRoutePlan({ req, plan, body = Buffer.alloc(0), a
     if (!plan?.ok || plan.listener !== 'private' && plan.kind !== 'private-operation') {
         throw forbidden('request did not resolve on the private listener', 'PRIVATE_LISTENER_REQUIRED');
     }
-    if (plan.kind === 'service' && plan.decision?.access !== 'authenticated') {
-        throw forbidden('private service policy is not effectively authenticated', 'PRIVATE_POLICY_DENIED');
+    if (plan.kind === 'agent-port' && plan.access?.access !== 'authenticated') {
+        throw forbidden('private route policy is not effectively authenticated', 'PRIVATE_POLICY_DENIED');
     }
     const acl = callerAclForPlan(plan);
     if (!acl) throw forbidden('private route has no active caller ACL');

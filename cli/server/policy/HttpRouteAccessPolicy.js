@@ -18,14 +18,6 @@ function normalizedRequest(pathname) {
     return normalized.ok ? normalized.path : '';
 }
 
-function accessPathForEntry(entry) {
-    if (entry?.externalPrefix) {
-        const prefix = String(entry.externalPrefix || '').trim().replace(/\/+$/g, '');
-        return prefix ? `${prefix}/*` : '';
-    }
-    return String(entry?.path || '').trim();
-}
-
 function invalidEntry(strict, label, message) {
     if (!strict) return null;
     const error = new Error(`${label}: ${message}`);
@@ -45,7 +37,7 @@ export function normalizeHttpRoutePolicyEntry(entry, source, {
     }
     const access = normalizeHttpRouteAccess(entry?.access);
     if (!access) return invalidEntry(strict, label, 'access must be public, guest, or authenticated');
-    const path = accessPathForEntry(entry);
+    const path = String(entry?.path || '').trim();
     const normalized = HttpRouteAccessPath.normalize(path);
     if (!normalized.ok) return invalidEntry(strict, label, normalized.error || 'path is invalid');
     const explicitRouteKey = entry.routeKey;
@@ -64,8 +56,8 @@ export function normalizeHttpRoutePolicyEntry(entry, source, {
         access,
         routeKey,
         source: String(entry.source || source),
-        // The guest executor needs the service-declared scope when it creates
-        // a guest identity for this service route.
+        // The guest executor needs the route-declared scope when it creates
+        // a guest identity for this route.
         ...(guestScope ? { guestScope } : {}),
     };
 }
@@ -89,36 +81,32 @@ export class HttpRouteAccessPolicy {
     // wiring; policy/index.js must not import routerHandlers.js because that
     // would be a circular import). evaluate() fails closed with a deny decision
     // while any provider is unbound, so a wiring mistake can never silently
-    // drop manifest or service declarations and fall through to a weaker
+    // drop manifest declarations and fall through to a weaker
     // default.
     constructor({
         repository,
         manifestRouteProvider = null,
-        httpServiceProvider = null,
         routeDefaultProvider = null,
     }) {
         this._repo = repository;
         this._manifestRouteProvider = manifestRouteProvider;
-        this._httpServiceProvider = httpServiceProvider;
         this._routeDefaultProvider = routeDefaultProvider;
     }
 
-    bindProviders({ manifestRouteProvider, httpServiceProvider, routeDefaultProvider }) {
-        if (this._manifestRouteProvider || this._httpServiceProvider || this._routeDefaultProvider) {
+    bindProviders({ manifestRouteProvider, routeDefaultProvider }) {
+        if (this._manifestRouteProvider || this._routeDefaultProvider) {
             throw new Error('HttpRouteAccessPolicy: providers are already bound');
         }
         if (typeof manifestRouteProvider !== 'function'
-            || typeof httpServiceProvider !== 'function'
             || typeof routeDefaultProvider !== 'function') {
-            throw new Error('HttpRouteAccessPolicy: all three providers are required');
+            throw new Error('HttpRouteAccessPolicy: manifest and route-default providers are required');
         }
         this._manifestRouteProvider = manifestRouteProvider;
-        this._httpServiceProvider = httpServiceProvider;
         this._routeDefaultProvider = routeDefaultProvider;
     }
 
     hasProviders() {
-        return Boolean(this._manifestRouteProvider && this._httpServiceProvider && this._routeDefaultProvider);
+        return Boolean(this._manifestRouteProvider && this._routeDefaultProvider);
     }
 
     evaluate({ pathname, method = 'GET', routeKey = '' } = {}) {
@@ -151,10 +139,6 @@ export class HttpRouteAccessPolicy {
         }
         for (const entry of this._manifestRouteProvider() || []) {
             const normalized = normalizeHttpRoutePolicyEntry(entry, 'manifest');
-            if (normalized) yield normalized;
-        }
-        for (const entry of this._httpServiceProvider() || []) {
-            const normalized = normalizeHttpRoutePolicyEntry(entry, 'httpService');
             if (normalized) yield normalized;
         }
     }

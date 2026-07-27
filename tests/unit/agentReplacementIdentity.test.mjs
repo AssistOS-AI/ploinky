@@ -114,7 +114,7 @@ test('ordinary exact runtime reuse preserves the registered tuple without coordi
 test('an assertion from the predecessor tuple is stale after coordinated replacement rotation', () => {
     const { registry, runtimeIdentity } = rotationHarness('envHashChanged');
     const body = Buffer.from('{"room":"fixture"}');
-    const pathname = '/services/private-api/rooms';
+    const pathname = '/base-agent-additional-server/private-owner/7000/private/rooms';
     const token = signPrivateRouterAssertion({
         method: 'POST',
         path: pathname,
@@ -138,19 +138,18 @@ test('an assertion from the predecessor tuple is stale after coordinated replace
     const plan = {
         ok: true,
         listener: 'private',
-        kind: 'service',
+        kind: 'agent-port',
+        routeKey: 'private-owner',
         pathname,
         parsedUrl: new URL(`http://host.containers.internal${pathname}`),
-        definition: { routeKey: 'private-owner', slug: 'private-api' },
-        decision: { access: 'authenticated' },
+        access: { access: 'authenticated' },
         snapshot: {
             agents: registry,
             compiled: {
                 security: {
-                    internalServiceConsumers: [{
+                    privateRouteConsumers: [{
                         routeKey: 'private-owner',
-                        slug: 'private-api',
-                        canonicalPrefix: '/services/private-api/',
+                        path: '/base-agent-additional-server/private-owner/7000/private/*',
                         callers: [currentCaller],
                     }],
                 },

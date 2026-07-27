@@ -104,7 +104,6 @@ import {
     assertRouterEndpoint,
     buildRouterEndpoint,
 } from '../routerPort.js';
-import { explicitHttpServicePorts } from '../httpServicePortConfig.js';
 import {
     abortEdgeRoutingPreparation,
     assertHostModeGenerationCapability,
@@ -768,7 +767,6 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     const activeProfile = profileResolution.resolvedProfileName;
     const profileConfig = profileResolution.profileConfig;
     const manifestNetwork = profileResolution.network;
-    const explicitServicePorts = explicitHttpServicePorts(manifest);
     assertNetworkStartupCompatibility(manifest, profileConfig, manifestNetwork, {
         path: `manifest(${repoName}/${agentName})`,
     });
@@ -1495,38 +1493,6 @@ function shouldCreateImplicitAgentServerPublish(
     return resolveAgentExecutionMode(manifest).type !== 'start_only';
 }
 
-function loopbackMappingFor(portMappings, containerPort) {
-    return (portMappings || []).find((mapping) => (
-        Number(mapping?.containerPort) === Number(containerPort)
-        && String(mapping?.protocol || 'tcp').toLowerCase() === 'tcp'
-        && String(mapping?.hostIp || '').toLowerCase() === '127.0.0.1'
-    )) || null;
-}
-
-function assertNoConflictingExplicitServiceMapping(portMappings, containerPort) {
-    const conflicting = (portMappings || []).find((mapping) => (
-        Number(mapping?.containerPort) === Number(containerPort)
-        && String(mapping?.protocol || 'tcp').toLowerCase() === 'tcp'
-        && String(mapping?.hostIp || '').toLowerCase() !== '127.0.0.1'
-    ));
-    if (conflicting) {
-        throw new Error(`httpServices[].port ${containerPort} must use one Router-private 127.0.0.1 mapping, not ${conflicting.hostIp || 'a wildcard bind'}`);
-    }
-}
-
-function resolveServiceTargets(portMappings, ports, networkMode) {
-    if (networkMode === 'none') return {};
-    return Object.fromEntries(ports.map((containerPort) => {
-        if (networkMode === 'host') return [String(containerPort), containerPort];
-        const mapping = loopbackMappingFor(portMappings, containerPort);
-        const hostPort = Number(mapping?.hostPort || 0);
-        if (!Number.isSafeInteger(hostPort) || hostPort < 1 || hostPort > 65535) {
-            throw new Error(`private mapping for httpServices[].port ${containerPort} was not resolved by the container engine`);
-        }
-        return [String(containerPort), hostPort];
-    }));
-}
-
 function appendUniquePortMapping(portMappings, mapping) {
     const current = Array.isArray(portMappings) ? [...portMappings] : [];
     const containerPort = Number(mapping?.containerPort);
@@ -1754,7 +1720,6 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
     assertNetworkStartupCompatibility(manifest, profileConfig, manifestNetwork, {
         path: `manifest(${repoName}/${agentName})`,
     });
-    const explicitServicePorts = explicitHttpServicePorts(manifest);
     const routerEndpoint = assertRouterEndpoint(routerEndpointOverride, manifestNetwork.mode);
 
     // Host sandboxes share the host network namespace. Fail closed unless the
@@ -1908,9 +1873,6 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
     const containerPortCandidates = portMappings
         .map((mapping) => mapping?.containerPort)
         .filter((port) => typeof port === 'number' && port > 0);
-    for (const servicePort of explicitServicePorts) {
-        if (!containerPortCandidates.includes(servicePort)) containerPortCandidates.push(servicePort);
-    }
     if (shouldCreateImplicitAgentServerPublish(
         manifest,
         manifestPorts,
@@ -1976,14 +1938,6 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
             }
         } catch (err) {
             debugLog(`[ensureAgentService] ${agentName}: LLM reuse-hash check skipped: ${err?.message || err}`);
-        }
-    }
-
-    if (containerExists(containerName) && explicitServicePorts.length && runtimeNetworkPlan.mode !== 'host') {
-        const existingPortMappings = resolvePublishedPortMappings(containerName, existingRecord.config?.ports || []);
-        if (explicitServicePorts.some((servicePort) => !loopbackMappingFor(existingPortMappings, servicePort))) {
-            debugLog(`[ensureAgentService] ${agentName}: explicit HTTP service target is not privately mapped; recreating container`);
-            recreateReason ||= 'serviceTargetMappingChanged';
         }
     }
 
@@ -2057,8 +2011,6 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
                 : (containerPortCandidates.length
                     ? resolveHostPort(containerName, existingRecord, containerPortCandidates)
                     : 0);
-            const existingPortMappings = resolvePublishedPortMappings(containerName, existingRecord.config?.ports || []);
-            const serviceTargets = resolveServiceTargets(existingPortMappings, explicitServicePorts, runtimeNetworkPlan.mode);
             syncAgentMcpConfig(containerName, agentPath, agentName);
             const registryRecord = {
                 ...existingRecord,
@@ -2069,7 +2021,6 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
                 containerName,
                 containerId: reuseInspection.id,
                 hostPort,
-                serviceTargets,
                 registryRecord: structuredClone(registryRecord),
             };
         }
@@ -2099,17 +2050,6 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
         additionalPorts = [`127.0.0.1:${hostPort || ''}:${agentServerPort}`];
         additionalPortMappings.push(agentServerMapping);
         allPortMappings = appendUniquePortMapping(allPortMappings, agentServerMapping);
-    }
-
-    if (runtimeNetworkPlan.mode !== 'host' && runtimeNetworkPlan.mode !== 'none') {
-        for (const servicePort of explicitServicePorts) {
-            assertNoConflictingExplicitServiceMapping(allPortMappings, servicePort);
-            if (loopbackMappingFor(allPortMappings, servicePort)) continue;
-            const mapping = { containerPort: servicePort, hostPort: 0, hostIp: '127.0.0.1', protocol: 'tcp' };
-            additionalPorts.push(`127.0.0.1::${servicePort}`);
-            additionalPortMappings.push(mapping);
-            allPortMappings = appendUniquePortMapping(allPortMappings, mapping);
-        }
     }
 
     const requiresEdgeActivation = !targetedRestart && (
@@ -2179,8 +2119,6 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
             preserveRegistryRecord: preserveRuntimeRegistryRecord,
         });
     allPortMappings = resolvePublishedPortMappings(containerName, allPortMappings);
-    const serviceTargets = resolveServiceTargets(allPortMappings, explicitServicePorts, runtimeNetworkPlan.mode);
-
     const agentCodePath = getAgentCodePath(agentName);
     const agentSkillsPath = getAgentSkillsPath(agentName);
     const profileEnv = normalizeProfileEnv(profileConfig?.env);
@@ -2263,7 +2201,6 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
             containerId: started?.containerId,
             runtimeNetwork: structuredClone(manifestNetwork),
             hostPort: returnPort,
-            serviceTargets,
             registryRecord: structuredClone(agents[containerName]),
             requiresEdgeActivation,
             ...(runtimeIdentity.preparationLease ? { preparationLease: runtimeIdentity.preparationLease } : {}),

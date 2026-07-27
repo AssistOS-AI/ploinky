@@ -3,6 +3,10 @@ import path from 'node:path';
 
 import { resolveEnabledAgentRecord } from '../../utils/agents.js';
 import { findAgent } from '../../utils/utils.js';
+import {
+    AGENT_PORT_ROUTE,
+    parseAgentPortSelector,
+} from '../agentPortConvention/parseSelector.js';
 import { hasInternalAgentSegment } from '../internalAgentPath.js';
 import { normalizeHttpRouteAccess } from './HttpRouteAccessDecision.js';
 import { HttpRouteAccessPath } from './HttpRouteAccessPath.js';
@@ -63,6 +67,37 @@ export function normalizeManifestHttpRouteAccess(spec, { routeKey } = {}) {
 
     const rawPath = String(spec?.path || '').trim();
     const agentRelativePath = rawPath.startsWith('/') ? rawPath : `/${rawPath}`;
+    if (agentRelativePath === `/${AGENT_PORT_ROUTE}`
+        || agentRelativePath.startsWith(`/${AGENT_PORT_ROUTE}/`)) {
+        const normalized = HttpRouteAccessPath.normalize(agentRelativePath);
+        if (!normalized.ok) return normalized;
+        let selector;
+        try {
+            selector = parseAgentPortSelector(normalized.path.endsWith('/*')
+                ? normalized.path.slice(0, -1)
+                : normalized.path);
+        } catch (error) {
+            return {
+                ok: false,
+                code: error?.code || 'INVALID_PATH',
+                error: error?.message || 'invalid agent-port convention path',
+            };
+        }
+        if (!selector || selector.agent !== normalizedRouteKey) {
+            return {
+                ok: false,
+                code: 'ROUTE_OWNERSHIP_MISMATCH',
+                error: 'agent-port convention path must name the declaring route',
+            };
+        }
+        return {
+            ok: true,
+            path: normalized.path,
+            access,
+            routeKey: normalizedRouteKey,
+            source: 'manifest',
+        };
+    }
     if (agentRelativePath === '/' || agentRelativePath === '/*') {
         return { ok: false, code: 'INVALID_PATH', error: 'root path cannot be declared public, guest, or authenticated' };
     }
@@ -132,14 +167,4 @@ export function createManifestRouteProvider(loadRoutes) {
         }
         return manifestRouteCache.entries;
     };
-}
-
-export function createHttpServiceProvider(collectServices) {
-    return () => (collectServices() || []).map((definition) => ({
-        externalPrefix: definition.externalPrefix,
-        access: definition.access,
-        routeKey: definition.routeKey,
-        guestScope: definition.guestScope,
-        source: 'httpService',
-    }));
 }

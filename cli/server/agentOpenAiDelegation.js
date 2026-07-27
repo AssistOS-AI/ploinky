@@ -12,7 +12,7 @@ import {
 import {
     proxyHttpBuffered,
     readRequestBody,
-    resolveHttpServiceInvocationMaxBodyBytes,
+    resolveHttpRouteInvocationMaxBodyBytes,
 } from './routerHandlers.js';
 
 /**
@@ -269,7 +269,7 @@ export function handleDelegatedAgentOpenAiCall(req, res, route, routeKey, agentP
     }
     const token = readAuthorizationBearer(req);
     readRequestBody(req, {
-        maxBytes: resolveHttpServiceInvocationMaxBodyBytes(),
+        maxBytes: resolveHttpRouteInvocationMaxBodyBytes(),
         onSuccess: (body) => {
             const surface = resolveOpenAiSurface(req.method, agentProxyPath);
             if (!surface) {

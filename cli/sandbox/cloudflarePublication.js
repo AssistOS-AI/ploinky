@@ -322,10 +322,10 @@ export class CloudflarePublicationController {
             plan = normalizeCloudflarePublicationDesired(input);
             currentJournal = this.journal.read();
             adoptSelectedLocalState = plan.mode === 'local-only'
-                && input?.selectedPublicationState === 'local-ready'
+                && input?.selectedPublicationState === 'ready'
                 && currentJournal?.mode !== 'cloudflare';
             // A coordinated edge apply already commits local-only generations
-            // as local-ready. Re-applying that same generation from the Router
+            // as ready. Re-applying that same generation from the Router
             // process races normal agent enable operations and does not publish
             // anything. Adopt it only when there is no prior Cloudflare scope
             // to tear down; every Cloudflare transition still inactivates first.
@@ -375,7 +375,7 @@ export class CloudflarePublicationController {
                 if (!adoptSelectedLocalState) {
                     await this.routeCoordinator.commit({
                         mode: 'local-only',
-                        publicationState: 'local-ready',
+                        publicationState: 'ready',
                         configurationGeneration: plan.configurationGeneration,
                         hosts: {},
                         canonicalScheme: 'http',
@@ -398,7 +398,7 @@ export class CloudflarePublicationController {
             }
 
             await this.transition({
-                state: 'cloudflare-reconciling',
+                state: 'reconciling',
                 mode: 'cloudflare',
                 configurationGeneration: plan.configurationGeneration,
                 connectorState: 'stopped',
@@ -453,7 +453,7 @@ export class CloudflarePublicationController {
 
             await this.routeCoordinator.commit({
                 mode: 'cloudflare',
-                publicationState: 'cloudflare-reconciling',
+                publicationState: 'reconciling',
                 configurationGeneration: plan.configurationGeneration,
                 hosts: asHostObject(plan),
                 canonicalScheme: 'https',
@@ -507,25 +507,25 @@ export class CloudflarePublicationController {
             this.assertCurrent(revision, signal);
             await this.routeCoordinator.commit({
                 mode: 'cloudflare',
-                publicationState: 'cloudflare-ready',
+                publicationState: 'ready',
                 configurationGeneration: plan.configurationGeneration,
                 hosts: asHostObject(plan),
                 canonicalScheme: 'https',
             });
             this.assertCurrent(revision, signal);
-            this.journal.write(journalValue(plan, 'cloudflare-ready', { managedDnsRecords }));
-            this.safeAudit('cloudflare-ready', summary);
+            this.journal.write(journalValue(plan, 'ready', { managedDnsRecords }));
+            this.safeAudit('ready', summary);
             return await this.transition({
-                state: 'cloudflare-ready',
+                state: 'ready',
                 mode: 'cloudflare',
                 connectorState: 'running',
-                reconciliation: { desiredDigest: plan.desiredDigest, phase: 'cloudflare-ready' },
+                reconciliation: { desiredDigest: plan.desiredDigest, phase: 'ready' },
                 error: null,
                 retry: null,
             });
         } catch (error) {
-            await this.connector.stop('publication-error');
-            try { await this.inactivate(input, 'cloudflare-publication-error'); } catch (_) {}
+            await this.connector.stop('error');
+            try { await this.inactivate(input, 'cloudflare-error'); } catch (_) {}
             const statusError = errorStatus(error, secretPair ? Object.values(secretPair) : []);
             if (plan?.mode === 'local-only' && currentJournal?.mode === 'cloudflare') {
                 try {
@@ -543,14 +543,14 @@ export class CloudflarePublicationController {
                     } catch (_) {}
                     this.journal.write({
                         ...preservedJournal,
-                        phase: 'publication-error',
+                        phase: 'error',
                         managedDnsRecords: preservedJournal.managedDnsRecords,
                         lastError: statusError,
                     });
                 } catch (_) {}
             } else if (plan) {
                 try {
-                    this.journal.write(journalValue(plan, 'publication-error', {
+                    this.journal.write(journalValue(plan, 'error', {
                         managedDnsRecords,
                         lastError: statusError,
                     }));
@@ -559,20 +559,20 @@ export class CloudflarePublicationController {
                 try {
                     this.journal.write({
                         ...currentJournal,
-                        phase: 'publication-error',
+                        phase: 'error',
                         lastError: statusError,
                     });
                 } catch (_) {}
             }
-            this.safeAudit('cloudflare-publication-error', statusError);
+            this.safeAudit('cloudflare-error', statusError);
             if (revision === this.requestRevision) {
                 await this.transition({
-                    state: 'publication-error',
+                    state: 'error',
                     mode: plan?.mode || 'invalid',
                     configurationGeneration: String(plan?.configurationGeneration || input?.configurationGeneration || ''),
                     connectorState: 'stopped',
                     hostnames: plan?.hosts?.map((entry) => entry.hostname) || [],
-                    reconciliation: plan ? { desiredDigest: plan.desiredDigest, phase: 'publication-error' } : null,
+                    reconciliation: plan ? { desiredDigest: plan.desiredDigest, phase: 'error' } : null,
                     error: statusError,
                     retry: null,
                     scope: plan?.scope ? { ...plan.scope } : null,
@@ -731,7 +731,7 @@ export class CloudflarePublicationController {
 
     async onConnectorExit(event, revision) {
         if (event?.intentional || this.stopped || revision !== this.requestRevision) return;
-        if (this.state.state !== 'cloudflare-ready') return;
+        if (this.state.state !== 'ready') return;
         try { await this.inactivate(this.lastInput, 'cloudflared-exit'); } catch (_) {}
         const now = Date.now();
         this.restartHistory = this.restartHistory
@@ -754,7 +754,7 @@ export class CloudflarePublicationController {
         try {
             const plan = normalizeCloudflarePublicationDesired(this.lastInput);
             const existing = this.journal.read();
-            this.journal.write(journalValue(plan, 'publication-error', {
+            this.journal.write(journalValue(plan, 'error', {
                 managedDnsRecords: sameScope(existing?.scope, plan.scope)
                     ? existing.managedDnsRecords
                     : [],
@@ -762,7 +762,7 @@ export class CloudflarePublicationController {
             }));
         } catch (_) {}
         await this.transition({
-            state: 'publication-error',
+            state: 'error',
             connectorState: 'stopped',
             error: statusError,
             retry: exhausted ? { exhausted: true, attempts: count } : { exhausted: false, attempts: count, backoffMs },

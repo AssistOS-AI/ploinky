@@ -21,7 +21,10 @@ import { mergeRoutingConfig, mergeRuntimeRoute, readRoutingConfig } from '../ser
 import { resolveAgentReadinessProtocol } from '../utils/runtime/startupReadiness.js';
 import { normalizeProbeConfig, runContainerScriptReadiness } from '../sandbox/docker/healthProbes.js';
 import { loadAgents, saveAgents } from '../utils/workspace.js';
-import { waitForAgentReady } from '../server/utils/agentReadiness.js';
+import {
+    buildRelayReadinessRoute,
+    waitForAgentReady,
+} from '../server/utils/agentReadiness.js';
 import {
     abortEdgeRoutingPreparation,
     inactivateEdgeRoutingGeneration,
@@ -125,7 +128,7 @@ async function upsertRoute(routeKey, route, {
         cfg.routes[routeKey] = mergeRuntimeRoute(
             cfg.routes[routeKey],
             route,
-            { hostPort: route.hostPort, serviceTargets: route.serviceTargets },
+            { hostPort: route.hostPort },
         );
         return cfg;
     }, {
@@ -163,8 +166,7 @@ function prepareNoWaitLifecycle({
                 || String(route.repo || '') !== repoName
                 || String(route.agent || '') !== shortAgent
                 || String(route.alias || '') !== alias
-                || Object.prototype.hasOwnProperty.call(route, 'hostPort')
-                || Object.prototype.hasOwnProperty.call(route, 'serviceTargets')) {
+                || Object.prototype.hasOwnProperty.call(route, 'hostPort')) {
                 throw new Error(`no-wait lifecycle requires one exact target-less staged route for '${routeKey}'`);
             }
             prepared = prepareEdgeRoutingGeneration({ reason, applyLockCapability });
@@ -197,7 +199,15 @@ function prepareNoWaitLifecycle({
     }
 }
 
-async function waitForNoWaitReadiness({ manifest, shortAgent, containerName, hostPort }) {
+async function waitForNoWaitReadiness({
+    manifest,
+    shortAgent,
+    containerName,
+    hostPort,
+    runtimeResult,
+    networkMode,
+    generationDigest,
+}) {
     const protocol = resolveAgentReadinessProtocol(manifest);
     if (protocol === 'none') return;
     if (protocol === 'script') {
@@ -208,10 +218,17 @@ async function waitForNoWaitReadiness({ manifest, shortAgent, containerName, hos
         }
         return;
     }
-    if (!Number(hostPort || 0)) {
-        throw new Error(`readiness protocol '${protocol}' requires one resolved private target port`);
+    const readinessRoute = buildRelayReadinessRoute({
+        route: { container: containerName, hostPort: Number(hostPort || 0) },
+        manifest,
+        runtimeResult,
+        networkMode,
+        generationDigest,
+    });
+    if (!readinessRoute.hostPort && !readinessRoute.relay) {
+        throw new Error(`readiness protocol '${protocol}' requires one resolved private target or readiness.port`);
     }
-    const ready = await waitForAgentReady({ hostPort: Number(hostPort) }, {
+    const ready = await waitForAgentReady(readinessRoute, {
         timeoutMs: Number.parseInt(process.env.PLOINKY_NO_WAIT_READY_TIMEOUT_MS || '120000', 10),
         intervalMs: Number.parseInt(process.env.PLOINKY_NO_WAIT_READY_INTERVAL_MS || '250', 10),
         probeTimeoutMs: Number.parseInt(process.env.PLOINKY_NO_WAIT_READY_PROBE_TIMEOUT_MS || '1000', 10),
@@ -296,7 +313,6 @@ async function main() {
         const result = await dockerSvc.ensureAgentService(shortAgent, manifest, agentPath, ensureOptions);
         const resolvedContainerName = (result && result.containerName) || containerName;
         const hostPort = result && result.hostPort;
-        const serviceTargets = result && result.serviceTargets;
         const registryRecord = result && result.registryRecord;
         const routedHostPort = profileResolution.network.mode === 'none'
             ? null
@@ -307,6 +323,9 @@ async function main() {
             shortAgent,
             containerName: resolvedContainerName,
             hostPort,
+            runtimeResult: result,
+            networkMode: profileResolution.network.mode,
+            generationDigest: lifecycle.preparationLease?.preparedGeneration || '',
         });
 
         await upsertRoute(routeKey, {
@@ -316,7 +335,6 @@ async function main() {
             agent: shortAgent,
             ...(alias ? { alias } : {}),
             hostPort: routedHostPort,
-            serviceTargets: serviceTargets || null
         }, {
             containerName: resolvedContainerName,
             registryRecord,

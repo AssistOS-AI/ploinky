@@ -42,7 +42,6 @@ function makeRouteAccessPolicy() {
     return new HttpRouteAccessPolicy({
         repository: repo,
         manifestRouteProvider: () => [],
-        httpServiceProvider: () => [],
         routeDefaultProvider: ({ routeKey }) => ({ access: 'authenticated', routeKey, source: 'routeDefault' }),
     });
 }

@@ -55,11 +55,10 @@ test('one batch stages a non-host dependency and exact host owner before either 
     const initialized = edge.initializeFreshEdgeRoutingSources({ workspaceRoot: workspace });
     routing.writeRoutingConfig({ port: 8080, routes: {} }, { coordinate: false });
     fs.writeFileSync(initialized.paths.desiredFile, JSON.stringify({
-        schemaVersion: edge.EDGE_DESIRED_SCHEMA_VERSION,
-        hosts: {},
+                hosts: {},
         security: {
             hostNetworkAllowedInstances: ['media/livekit'],
-            internalServiceConsumers: {},
+            privateRouteConsumers: {},
         },
     }));
 

@@ -1,4 +1,4 @@
-import { readEnabledAgentManifest, loadRoutingConfig } from './httpServiceRoutes.js';
+import { readEnabledAgentManifest, loadRoutingConfig } from './routingState.js';
 import { resolveEnabledAgentRecord } from '../utils/agents.js';
 import { deriveAgentPrincipalId } from '../utils/security/agentIdentity.js';
 import { verifyAgentAssertion } from './mcp-proxy/invocationMinter.js';

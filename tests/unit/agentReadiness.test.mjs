@@ -2,7 +2,10 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import net from 'node:net';
 
-import { waitForAgentReady } from '../../cli/server/utils/agentReadiness.js';
+import {
+    buildRelayReadinessRoute,
+    waitForAgentReady,
+} from '../../cli/server/utils/agentReadiness.js';
 import {
     buildBlockingReadinessEntryFromNode,
     runCliWithDependencies,
@@ -142,6 +145,80 @@ test('waitForAgentReady resolves false within the timeout for a closed port (tcp
     assert.ok(elapsedMs < 4000, `expected to bail out fast, took ${elapsedMs}ms`);
 });
 
+test('explicit readiness port builds a confined relay target from the exact runtime identity', () => {
+    const containerId = 'a'.repeat(64);
+    const route = buildRelayReadinessRoute({
+        route: { container: 'nested-api' },
+        manifest: {
+            start: 'node server.mjs',
+            readiness: { protocol: 'tcp', port: 7000 },
+        },
+        runtimeResult: {
+            containerName: 'nested-api',
+            registryRecord: {
+                runtime: 'podman',
+                containerId,
+                instanceId: 'instance-1',
+                enableGeneration: 'enable-1',
+                repoName: 'example',
+                agentName: 'api',
+            },
+        },
+        networkMode: 'managed',
+        generationDigest: 'generation-digest',
+    });
+
+    assert.deepEqual(route.primaryService, { port: 7000 });
+    assert.equal(route.relay.runtime, 'podman');
+    assert.equal(route.relay.containerId, containerId);
+    assert.equal(route.relay.containerName, 'nested-api');
+    assert.equal(route.relay.effectiveInstanceId, 'instance-1');
+    assert.equal(route.relay.enableGeneration, 'enable-1');
+    assert.equal(route.owner.effectiveInstanceId, 'instance-1');
+    assert.equal(route.owner.enableGeneration, 'enable-1');
+    assert.equal(route.generationDigest, 'generation-digest');
+    assert.deepEqual(route.deniedPorts, []);
+});
+
+test('waitForAgentReady probes a confined relay without requiring a published host port', async () => {
+    const attempts = [];
+    const progress = [];
+    const ready = await waitForAgentReady({
+        relay: {
+            kind: 'container-exec-stdio',
+            runtime: 'podman',
+            containerId: 'b'.repeat(64),
+            containerName: 'nested-api',
+            targetAgentId: 'agent:example/api',
+            effectiveInstanceId: 'instance-1',
+            enableGeneration: 'enable-1',
+        },
+        owner: {
+            effectiveInstanceId: 'instance-1',
+            enableGeneration: 'enable-1',
+        },
+        primaryService: { port: 7000 },
+        deniedPorts: [],
+        generationDigest: 'generation-digest',
+    }, {
+        protocol: 'tcp',
+        timeoutMs: 1000,
+        intervalMs: 1,
+        relayProbe: async (route, protocol, timeoutMs) => {
+            attempts.push({ route, protocol, timeoutMs });
+            return attempts.length === 2;
+        },
+        onProgress: event => progress.push(event),
+    });
+
+    assert.equal(ready, true);
+    assert.equal(attempts.length, 2);
+    assert.equal(attempts[0].protocol, 'tcp');
+    assert.equal(attempts[0].route.primaryService.port, 7000);
+    assert.equal(progress[0].stage, 'waiting_for_relay');
+    assert.equal(progress[1].stage, 'ready');
+});
+
 test('blocking startup readiness allows protocol none without a host port', () => {
     const entry = buildBlockingReadinessEntryFromNode({
         id: 'worker',
@@ -165,6 +242,28 @@ test('blocking startup readiness still requires a host port for tcp agents', () 
             readiness: { protocol: 'tcp' },
         },
     }, {}, 'explorer'), /did not expose a host port/);
+});
+
+test('blocking startup readiness accepts a confined relay target without a host port', () => {
+    const route = {
+        container: 'api-container',
+        relay: {
+            kind: 'container-exec-stdio',
+        },
+        primaryService: { port: 7000 },
+    };
+    const entry = buildBlockingReadinessEntryFromNode({
+        id: 'api',
+        shortAgentName: 'api',
+        isStatic: false,
+        manifest: {
+            start: 'node server.mjs',
+            readiness: { protocol: 'tcp', port: 7000 },
+        },
+    }, route, 'explorer');
+
+    assert.equal(entry.protocol, 'tcp');
+    assert.equal(entry.route, route);
 });
 
 test('start-only script readiness is blocking without a host port and carries the route container', () => {
@@ -229,7 +328,7 @@ test('start-only readiness without a port, script, or none policy fails with a m
         shortAgentName: 'broken-service',
         isStatic: false,
         manifest: { start: 'node service.mjs' },
-    }, { container: 'broken-service-container', hostPort: 0 }, 'explorer'), /start-only.*health\.readiness\.script.*httpServices\[\]\.port.*readiness\.protocol.*none/i);
+    }, { container: 'broken-service-container', hostPort: 0 }, 'explorer'), /start-only.*readiness\.port.*health\.readiness\.script.*readiness\.protocol none/i);
 });
 
 test('script readiness success is dispatched against the route container', async () => {

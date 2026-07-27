@@ -23,7 +23,6 @@ function desired(hostnames = ['office.example.test'], generationCharacter = 'a',
         },
         hosts: Object.fromEntries(hostnames.map((hostname) => [hostname, {
             agent: `repo/${hostname.split('.')[0]}`,
-            httpService: `${hostname.split('.')[0]}-service`,
         }])),
     };
 }
@@ -221,16 +220,16 @@ test('no tuple selects local-only, commits no public hosts, and never starts clo
     assert.equal(harness.connector.starts, 0);
     assert.deepEqual(harness.routes.hosts, {});
     assert.equal(harness.routes.commits.at(-1).mode, 'local-only');
-    assert.equal(harness.routes.commits.at(-1).publicationState, 'local-ready');
+    assert.equal(harness.routes.commits.at(-1).publicationState, 'ready');
     assert.equal(harness.journal.writes.at(-1).phase, 'local-only');
     assert.equal(harness.events.some((entry) => entry.event.startsWith('api.')), false);
 });
 
-test('selected local-ready state is adopted without a duplicate route apply', async () => {
+test('selected ready state is adopted without a duplicate route apply', async () => {
     const harness = createHarness();
     const status = await harness.controller.reconcile({
         ...localDesired(),
-        selectedPublicationState: 'local-ready',
+        selectedPublicationState: 'ready',
     });
     assert.equal(status.state, 'local-only');
     assert.equal(status.configurationGeneration, localDesired().configurationGeneration);
@@ -239,23 +238,23 @@ test('selected local-ready state is adopted without a duplicate route apply', as
     assert.equal(harness.journal.writes.at(-1).phase, 'local-only');
 });
 
-test('selected local-ready state still coordinates prior Cloudflare teardown', async () => {
+test('selected ready state still coordinates prior Cloudflare teardown', async () => {
     const harness = createHarness();
     await harness.controller.reconcile(desired());
     const status = await harness.controller.reconcile({
         ...localDesired('b'),
-        selectedPublicationState: 'local-ready',
+        selectedPublicationState: 'ready',
     });
     assert.equal(status.state, 'local-only');
     assert.equal(harness.events.filter((entry) => entry.event === 'routes.inactivate').length, 2);
-    assert.equal(harness.routes.commits.at(-1).publicationState, 'local-ready');
+    assert.equal(harness.routes.commits.at(-1).publicationState, 'ready');
 });
 
 test('complete publication verifies remote state before route commit and proves connector plus every host', async () => {
     const harness = createHarness();
     const input = desired(['office.example.test', 'meet.example.test']);
     const status = await harness.controller.reconcile(input);
-    assert.equal(status.state, 'cloudflare-ready');
+    assert.equal(status.state, 'ready');
     assert.equal(status.connectorState, 'running');
     assert.deepEqual(status.hostnames, ['meet.example.test', 'office.example.test']);
     const installedIngress = harness.api.ingress.get('account_123/tunnel_123');
@@ -267,8 +266,8 @@ test('complete publication verifies remote state before route commit and proves 
     const commitIndexes = harness.events
         .map((entry, index) => ({ entry, index }))
         .filter(({ entry }) => entry.event === 'routes.commit');
-    const reconcilingCommit = commitIndexes.find(({ entry }) => entry.input.publicationState === 'cloudflare-reconciling');
-    const readyCommit = commitIndexes.find(({ entry }) => entry.input.publicationState === 'cloudflare-ready');
+    const reconcilingCommit = commitIndexes.find(({ entry }) => entry.input.publicationState === 'reconciling');
+    const readyCommit = commitIndexes.find(({ entry }) => entry.input.publicationState === 'ready');
     const remoteVerifyIndex = harness.events.map((entry) => entry.event).lastIndexOf('api.readIngress');
     const connectorIndex = harness.events.findIndex((entry) => entry.event === 'connector.start');
     const lastProbeIndex = harness.events.map((entry) => entry.event).lastIndexOf('probe.hostname');
@@ -282,7 +281,7 @@ test('complete publication verifies remote state before route commit and proves 
     );
     assert.equal(harness.routes.active, true);
     assert.deepEqual(Object.keys(harness.routes.hosts).sort(), ['meet.example.test', 'office.example.test']);
-    assert.equal(harness.journal.writes.at(-1).phase, 'cloudflare-ready');
+    assert.equal(harness.journal.writes.at(-1).phase, 'ready');
 });
 
 test('tokens and secret handles are absent from status, audit, journal, and route state', async () => {
@@ -315,7 +314,7 @@ test('partial tuple fails closed instead of selecting local-only', async () => {
         (error) => error.code === 'CLOUDFLARE_CONFIGURATION_PARTIAL',
     );
     const status = harness.controller.getStatus();
-    assert.equal(status.state, 'publication-error');
+    assert.equal(status.state, 'error');
     assert.notEqual(status.mode, 'local-only');
     assert.equal(harness.routes.active, false);
     assert.equal(harness.connector.starts, 0);
@@ -367,11 +366,11 @@ test('partial DNS mutation retains an error journal and explicit retry converges
         retryable: true,
     });
     await assert.rejects(harness.controller.reconcile(desired()), /temporary DNS failure/);
-    assert.equal(harness.controller.getStatus().state, 'publication-error');
-    assert.equal(harness.journal.writes.at(-1).phase, 'publication-error');
+    assert.equal(harness.controller.getStatus().state, 'error');
+    assert.equal(harness.journal.writes.at(-1).phase, 'error');
     assert.equal(harness.routes.active, false);
     const status = await harness.controller.retry();
-    assert.equal(status.state, 'cloudflare-ready');
+    assert.equal(status.state, 'ready');
     assert.equal(harness.api.dns.size, 1);
     assert.equal(harness.routes.active, true);
     assert.equal(harness.routes.commits.length, 2);
@@ -448,7 +447,7 @@ test('partial final-host teardown preserves only the still-owned DNS journal ent
     )), true);
     assert.equal(harness.routes.active, false);
     assert.equal(harness.journal.writes.at(-1).mode, 'cloudflare');
-    assert.equal(harness.journal.writes.at(-1).phase, 'publication-error');
+    assert.equal(harness.journal.writes.at(-1).phase, 'error');
     assert.deepEqual(
         harness.journal.writes.at(-1).managedDnsRecords.map((entry) => entry.hostname),
         ['office.example.test'],
@@ -461,7 +460,7 @@ test('a restarted controller preserves Cloudflare ownership journal and fails cl
         mode: 'cloudflare',
         configurationGeneration: `sha256:${'a'.repeat(64)}`,
         desiredDigest: `sha256:${'c'.repeat(64)}`,
-        phase: 'cloudflare-ready',
+        phase: 'ready',
         scope: { accountId: 'account_123', zoneId: 'zone_123', tunnelId: 'tunnel_123' },
         ingressDigest: `sha256:${'d'.repeat(64)}`,
         managedDnsRecords: [{
@@ -482,7 +481,7 @@ test('a restarted controller preserves Cloudflare ownership journal and fails cl
     assert.equal(harness.events.some((entry) => entry.event.startsWith('api.')), false);
     assert.equal(journal.writes.at(-1).mode, 'cloudflare');
     assert.equal(journal.writes.at(-1).managedDnsRecords.length, 1);
-    assert.equal(journal.writes.at(-1).phase, 'publication-error');
+    assert.equal(journal.writes.at(-1).phase, 'error');
 });
 
 test('changed DNS ownership is never deleted during host removal', async () => {
@@ -514,8 +513,8 @@ test('connector or external probe failure stops connector and inactivates commit
     );
     assert.equal(harness.connector.isRunning(), false);
     assert.equal(harness.routes.active, false);
-    assert.equal(harness.controller.getStatus().state, 'publication-error');
-    assert.equal(harness.journal.writes.at(-1).phase, 'publication-error');
+    assert.equal(harness.controller.getStatus().state, 'error');
+    assert.equal(harness.journal.writes.at(-1).phase, 'error');
 });
 
 test('a superseded generation cannot commit routes after its remote call returns', async () => {
@@ -529,12 +528,12 @@ test('a superseded generation cannot commit routes after its remote call returns
     await assert.rejects(first, (error) => error.code === 'CLOUDFLARE_RECONCILIATION_SUPERSEDED');
     harness.api.blockPutIngress = null;
     const status = await second;
-    assert.equal(status.state, 'cloudflare-ready');
+    assert.equal(status.state, 'ready');
     assert.equal(harness.routes.commits.length, 2);
     assert.ok(harness.routes.commits.every((entry) => entry.configurationGeneration === `sha256:${'b'.repeat(64)}`));
     assert.deepEqual(harness.routes.commits.map((entry) => entry.publicationState), [
-        'cloudflare-reconciling',
-        'cloudflare-ready',
+        'reconciling',
+        'ready',
     ]);
     assert.deepEqual(Object.keys(harness.routes.hosts), ['meet.example.test']);
 });
@@ -550,11 +549,11 @@ test('unexpected connector exits use bounded exact-state restart and stop after 
     });
     await harness.controller.reconcile(desired());
     harness.connector.exit({ code: 7 });
-    await waitFor(() => harness.connector.starts === 2 && harness.controller.getStatus().state === 'cloudflare-ready');
+    await waitFor(() => harness.connector.starts === 2 && harness.controller.getStatus().state === 'ready');
     harness.connector.exit({ code: 8 });
     await waitFor(() => harness.controller.getStatus().retry?.exhausted === true);
     await new Promise((resolve) => setTimeout(resolve, 20));
     assert.equal(harness.connector.starts, 2);
     assert.equal(harness.routes.active, false);
-    assert.equal(harness.controller.getStatus().state, 'publication-error');
+    assert.equal(harness.controller.getStatus().state, 'error');
 });

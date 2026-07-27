@@ -40,7 +40,6 @@ import {
     assertHostSandboxNetworkCompatibility,
     assertNetworkStartupCompatibility,
 } from '../networkContract.js';
-import { resolveHostHttpServiceTargets } from '../httpServicePortConfig.js';
 import {
     getAgentWorkDir,
     getAgentCodePath,
@@ -409,7 +408,6 @@ function startSeatbeltProcess(agentName, manifest, agentPath, options = {}) {
 
     // Port resolution — with shared host network, hostPort === containerPort
     const { portMappings } = parseManifestPorts(manifest, profileConfig);
-    const serviceTargets = resolveHostHttpServiceTargets(manifest);
     let allPortMappings = [...portMappings];
     if (!allPortMappings.length) {
         const existingAgents = loadAgentsMap();
@@ -580,7 +578,6 @@ function startSeatbeltProcess(agentName, manifest, agentPath, options = {}) {
             ],
             env: Array.from(new Set(declaredEnvNames)).map((name) => ({ name })),
             ports: allPortMappings,
-            ...(Object.keys(serviceTargets).length ? { serviceTargets } : {})
         }
     };
     if (existingRecord.auth) {
@@ -617,7 +614,6 @@ function startSeatbeltProcess(agentName, manifest, agentPath, options = {}) {
     return {
         containerName,
         hostPort: returnPort,
-        serviceTargets,
         registryRecord: structuredClone(agents[containerName]),
     };
     } catch (error) {
@@ -671,7 +667,6 @@ function ensureSeatbeltService(agentName, manifest, agentPath, options = {}) {
 
     assertManifestEnvProfileCompleteness(manifest, profileConfig, { agentName, repoName, profileName: activeProfile });
     const { portMappings } = parseManifestPorts(manifest, profileConfig);
-    const serviceTargets = resolveHostHttpServiceTargets(manifest);
     let allPortMappings = [...portMappings];
     if (!allPortMappings.length) {
         const hostPort = preferredHostPort || existingRecord?.config?.ports?.[0]?.hostPort || (10000 + Math.floor(Math.random() * 50000));
@@ -705,7 +700,6 @@ function ensureSeatbeltService(agentName, manifest, agentPath, options = {}) {
             return {
                 containerName,
                 hostPort,
-                serviceTargets,
                 registryRecord: structuredClone(existingRecord),
             };
         }

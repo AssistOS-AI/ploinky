@@ -18,8 +18,8 @@ const PHASES = new Set([
     'remote-verified',
     'routes-committed',
     'connector-starting',
-    'cloudflare-ready',
-    'publication-error',
+    'ready',
+    'error',
 ]);
 
 function fail(message, code = 'CLOUDFLARE_JOURNAL_CORRUPT') {

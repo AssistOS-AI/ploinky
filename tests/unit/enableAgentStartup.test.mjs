@@ -2,11 +2,19 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
+    AGENT_LIB_PATH,
     enableAgent,
     preferredHostPortForNetworkMode,
     verifyEnabledAgentStarted,
 } from '../../cli/utils/agents.js';
 import { mergeRuntimeRoute } from '../../cli/server/routingFile.js';
+
+test('enable mounts the tracked Agent runtime from the Ploinky checkout', () => {
+    assert.equal(
+        AGENT_LIB_PATH,
+        new URL('../../Agent', import.meta.url).pathname.replace(/\/$/, ''),
+    );
+});
 
 test('enable agent forwards its selected explicit profile to the service launch', () => {
     assert.match(

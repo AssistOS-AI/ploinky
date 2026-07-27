@@ -26,11 +26,10 @@ test('smoke graph requires exactly seven clean absolute real checkouts at exact 
     const calls = [];
     const desiredCandidate = path.join(root, 'edge-desired.json');
     fs.writeFileSync(desiredCandidate, JSON.stringify({
-        schemaVersion: 1,
-        hosts: {},
+                hosts: {},
         security: {
             hostNetworkAllowedInstances: ['media/livekit'],
-            internalServiceConsumers: {},
+            privateRouteConsumers: {},
         },
     }));
     const desiredDigest = crypto.createHash('sha256')
@@ -116,8 +115,7 @@ test('smoke graph requires exactly seven clean absolute real checkouts at exact 
 
     const overGrantedCandidate = path.join(root, 'edge-desired-over-granted.json');
     fs.writeFileSync(overGrantedCandidate, JSON.stringify({
-        schemaVersion: 1,
-        hosts: {},
+                hosts: {},
         security: {
             hostNetworkAllowedInstances: ['media/livekit', 'media/turn'],
         },

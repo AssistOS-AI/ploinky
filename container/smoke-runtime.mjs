@@ -230,11 +230,10 @@ function installRoutingProbe() {
             mcpTools: [],
         }, '/workspace/.ploinky/data/router-security/policy-state.json'],
         [path.join('data', 'edge-routing', 'desired.json'), {
-            schemaVersion: 1,
             hosts: {},
             security: {
                 hostNetworkAllowedInstances: [],
-                internalServiceConsumers: {},
+                privateRouteConsumers: {},
             },
         }, '/workspace/.ploinky/data/edge-routing/desired.json'],
     ];
@@ -624,7 +623,6 @@ function runConfiguredFullGraph() {
                     agent: String(route?.agent || ''),
                     container: String(route?.container || ''),
                     hasHostPort: Object.hasOwn(route || {}, 'hostPort'),
-                    serviceTargetCount: Object.keys(route?.serviceTargets || {}).length,
                 }]));
             const registry = Object.fromEntries(Object.entries(agents || {})
                 .filter(([key, record]) => key !== '_config' && record?.type === 'agent')

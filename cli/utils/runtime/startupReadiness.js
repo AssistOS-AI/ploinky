@@ -6,6 +6,20 @@ function normalizeProtocol(value) {
     return '';
 }
 
+function resolveAgentReadinessPort(manifest) {
+    const value = manifest?.readiness?.port;
+    if (value === undefined || value === null || value === '') return null;
+    const text = String(value).trim();
+    if (!/^[1-9][0-9]{0,4}$/.test(text)) {
+        throw new Error(`readiness.port must be an integer from 1 through 65535, got '${text}'`);
+    }
+    const port = Number(text);
+    if (!Number.isSafeInteger(port) || port > 65535) {
+        throw new Error(`readiness.port must be an integer from 1 through 65535, got '${text}'`);
+    }
+    return port;
+}
+
 function readManifestStartCommand(manifest) {
     if (!manifest || typeof manifest !== 'object') return '';
     const value = manifest.start;
@@ -84,5 +98,6 @@ export {
     readManifestReadinessScript,
     readManifestStartCommand,
     resolveAgentExecutionMode,
+    resolveAgentReadinessPort,
     resolveAgentReadinessProtocol
 };

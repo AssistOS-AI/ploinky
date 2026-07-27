@@ -38,16 +38,14 @@ test('monitor default-to-none route transition deletes stale ports', () => {
     assert.match(source, /mergeRuntimeRoute/);
 });
 
-test('routable route updates replace primary and explicit service targets', () => {
+test('routable route updates retain only the primary route target', () => {
     assert.deepEqual(
         mergeRuntimeRoute(oldRouted, { container: 'new-container' }, {
             hostPort: 40101,
-            serviceTargets: { '9000': 40102 },
         }),
         {
             container: 'new-container',
             hostPort: 40101,
-            serviceTargets: { '9000': 40102 },
         },
     );
 });

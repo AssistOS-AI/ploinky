@@ -14,15 +14,14 @@ import { buildWorkspaceIdentity } from '../../ploinky-box/identity.mjs';
 
 function desiredDocument() {
     return {
-        schemaVersion: 1,
-        hosts: {},
+                hosts: {},
         media: {
             publicIPv4: '8.8.8.8',
             addressMode: 'nat-forward',
         },
         security: {
             hostNetworkAllowedInstances: ['webmeetInfra/liveKitServerAgent'],
-            internalServiceConsumers: {},
+            privateRouteConsumers: {},
         },
     };
 }
@@ -65,7 +64,7 @@ test('host-owned edge desired state rejects unsafe or malformed authority files'
     fs.writeFileSync(fixture.candidatePath, JSON.stringify({ schemaVersion: 1 }));
     assert.throws(
         () => readWorkspaceEdgeDesired(fixture.identity),
-        /required schema 1 hosts\/security shape/,
+        /required hosts\/security shape/,
     );
 
     fs.writeFileSync(fixture.candidatePath, JSON.stringify(desiredDocument()));

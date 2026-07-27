@@ -67,37 +67,35 @@ function writeWorkspaceConfig(ploinkyDir, { staticAuthMode = 'local' } = {}) {
     mkdirSync(webAssistManifestDir, { recursive: true });
     mkdirSync(staleManifestGuestDir, { recursive: true });
     writeFileSync(path.join(webAssistManifestDir, 'manifest.json'), JSON.stringify({
-        httpServices: [
-            {
-                externalPrefix: '/services/guest-owned/',
-                internalPrefix: '/api/',
+        routerAccess: {
+            httpRoutes: [{
+                path: '/base-agent-additional-server/webAssist/7000/*',
                 access: 'authenticated',
-            },
-        ],
+            }],
+        },
     }, null, 2));
     writeFileSync(path.join(staleManifestGuestDir, 'manifest.json'), JSON.stringify({
         guest: true,
     }, null, 2));
     writeFileSync(path.join(serviceManifestDir, 'manifest.json'), JSON.stringify({
-        httpServices: [
+        routerAccess: {
+            httpRoutes: [
             {
-                externalPrefix: '/public-services/meeting-room/',
-                internalPrefix: '/api/',
+                path: '/base-agent-additional-server/guestAgent/7000/meeting-room/*',
                 access: 'guest',
                 guestScope: 'meeting-room-public-service',
             },
             {
-                externalPrefix: '/public-services/visitor-support/',
-                internalPrefix: '/api/',
+                path: '/base-agent-additional-server/guestAgent/7000/visitor-support/*',
                 access: 'guest',
                 guestScope: 'visitor-support-public-service',
             },
             {
-                externalPrefix: '/services/locked/',
-                internalPrefix: '/api/',
+                path: '/base-agent-additional-server/guestAgent/7000/locked/*',
                 access: 'authenticated',
             },
-        ],
+            ],
+        },
     }, null, 2));
     writeFileSync(path.join(ploinkyDir, 'agents.json'), JSON.stringify({
         explorer: {

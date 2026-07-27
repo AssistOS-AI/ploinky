@@ -25,7 +25,10 @@ import { resolveManifestRuntimeProfile } from './runtime/profileService.js';
 import { resolveRouterEndpoint } from '../sandbox/routerPort.js';
 import { resolveAgentExecutionMode, resolveAgentReadinessProtocol } from './runtime/startupReadiness.js';
 import { normalizeProbeConfig, runContainerScriptReadiness } from '../sandbox/docker/healthProbes.js';
-import { waitForAgentReady } from '../server/utils/agentReadiness.js';
+import {
+    buildRelayReadinessRoute,
+    waitForAgentReady,
+} from '../server/utils/agentReadiness.js';
 import { FileSystemPolicyStateStore } from '../server/policy/FileSystemPolicyStateStore.js';
 import { McpToolPolicy } from '../server/policy/McpToolPolicy.js';
 import { PolicyStateRepository } from '../server/policy/PolicyStateRepository.js';
@@ -55,6 +58,7 @@ import {
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+export const AGENT_LIB_PATH = path.resolve(__dirname, '../../Agent');
 const RESERVED_AGENT_KEYS = new Set(['_config']);
 const ALIAS_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/;
 const AUTH_MODES = new Set(['none', 'local', 'pwd', 'sso', 'guest']);
@@ -127,7 +131,10 @@ export function verifyEnabledAgentStarted(shortAgentName, containerName, {
     log(`Agent '${shortAgentName}' started successfully in container '${containerName}'.`);
 }
 
-async function waitForEnabledAgentReadiness(shortAgentName, manifest, started) {
+async function waitForEnabledAgentReadiness(shortAgentName, manifest, started, {
+    networkMode = '',
+    generationDigest = '',
+} = {}) {
     const protocol = resolveAgentReadinessProtocol(manifest);
     if (protocol === 'none') return;
     if (protocol === 'script') {
@@ -143,11 +150,20 @@ async function waitForEnabledAgentReadiness(shortAgentName, manifest, started) {
         }
         return;
     }
-    const hostPort = Number(started?.hostPort || 0);
-    if (!hostPort) {
-        throw new Error(`readiness protocol '${protocol}' requires one resolved private target port`);
+    const readinessRoute = buildRelayReadinessRoute({
+        route: {
+            container: started?.containerName,
+            hostPort: Number(started?.hostPort || 0),
+        },
+        manifest,
+        runtimeResult: started,
+        networkMode,
+        generationDigest,
+    });
+    if (!readinessRoute.hostPort && !readinessRoute.relay) {
+        throw new Error(`readiness protocol '${protocol}' requires one resolved private target or readiness.port`);
     }
-    const ready = await waitForAgentReady({ hostPort }, {
+    const ready = await waitForAgentReady(readinessRoute, {
         timeoutMs: Number.parseInt(process.env.PLOINKY_ENABLE_AGENT_READY_TIMEOUT_MS || '120000', 10),
         intervalMs: Number.parseInt(process.env.PLOINKY_ENABLE_AGENT_READY_INTERVAL_MS || '250', 10),
         probeTimeoutMs: Number.parseInt(process.env.PLOINKY_ENABLE_AGENT_READY_PROBE_TIMEOUT_MS || '1000', 10),
@@ -422,7 +438,7 @@ function planAgentEnable({
             binds: [
                 { source: projectPath, target: projectMountTarget },
                 ...(runMode === DEFAULT_ENABLE_AGENT_MODE ? [] : [{ source: homePath, target: '/root' }]),
-                { source: path.resolve(__dirname, '../../../Agent'), target: '/Agent' },
+                { source: AGENT_LIB_PATH, target: '/Agent' },
                 { source: agentPath, target: '/code' }
             ],
             env: [],
@@ -497,7 +513,7 @@ function planAgentEnable({
         repo: repoName,
         agent: shortAgentName,
         ...(alias ? { alias } : {}),
-    }, { hostPort: null, serviceTargets: null });
+    }, { hostPort: null });
 
     return {
         agentPath,
@@ -683,12 +699,14 @@ export async function enableAgent(agentName, mode, repoNameParam, aliasParam, au
             preparedHostModeCapability: plan.preparedHostModeCapability,
         });
         verifyEnabledAgentStarted(shortAgentName, started?.containerName || containerName);
-        await waitForEnabledAgentReadiness(shortAgentName, manifest, started);
+        await waitForEnabledAgentReadiness(shortAgentName, manifest, started, {
+            networkMode: profileResolution.network.mode,
+            generationDigest: prepared.preparedGeneration?.preparationLease?.preparedGeneration || '',
+        });
 
         const hostPort = profileResolution.network.mode === 'none'
             ? undefined
             : started?.hostPort || preferredHostPort;
-        const serviceTargets = started?.serviceTargets || null;
         if (!started?.registryRecord) {
             throw new Error(`runtime '${containerName}' returned no exact registry record`);
         }
@@ -703,7 +721,7 @@ export async function enableAgent(agentName, mode, repoNameParam, aliasParam, au
                 repo: repoName,
                 agent: shortAgentName,
                 ...(alias ? { alias } : {}),
-            }, { hostPort, serviceTargets });
+            }, { hostPort });
             return routing;
         }, {
             reason: 'agent-enable-runtime-finalize',

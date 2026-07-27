@@ -10,14 +10,7 @@ import { buildRouterRequest } from './mcp-proxy/invocationMinter.js';
 import { deriveDelegationKey } from './mcp-proxy/mcpDelegations.js';
 import { computeRchHttp, sha256RawBodyHash } from '../../Agent/lib/requestHash.mjs';
 import { policy } from './policy/index.js';
-import { hasInternalAgentSegment } from './internalAgentPath.js';
-import {
-    buildServiceAgentPath,
-    loadRoutingConfig,
-    resolveHttpServiceRoute,
-    resolveHttpServiceTarget,
-} from './httpServiceRoutes.js';
-import { commitRoutePlan, resolveEdgeRoutePlan } from './edgeRoutePlan.js';
+import { loadRoutingConfig } from './routingState.js';
 import { deriveAgentPrincipalId } from '../utils/security/agentIdentity.js';
 import { ROUTING_FILE } from '../utils/config.js';
 import { deriveSubkey } from '../utils/security/masterKey.js';
@@ -26,7 +19,7 @@ import { mintUserDelegationGrant } from './mcp-proxy/userDelegationGrant.js';
 const ROUTER_PROTOCOL_VERSION = '2025-06-18';
 const ROUTER_SERVER_INFO = { name: 'ploinky-router', version: '1.0.0' };
 const ROUTER_INSTRUCTIONS = 'Ploinky Router aggregates tools and resources from registered agents.';
-const DEFAULT_HTTP_SERVICE_INVOCATION_MAX_BODY_BYTES = 10 * 1024 * 1024;
+const DEFAULT_HTTP_ROUTE_INVOCATION_MAX_BODY_BYTES = 10 * 1024 * 1024;
 export const PLOINKY_RATE_SOURCE_HEADER = 'x-ploinky-rate-source';
 
 const routerSessions = new Map();
@@ -184,11 +177,11 @@ export function proxyHttpPassthrough(req, res, targetPort, agentPath, extraHeade
     return upstream;
 }
 
-export function resolveHttpServiceInvocationMaxBodyBytes(env = process.env) {
-    const raw = String(env?.PLOINKY_HTTP_SERVICE_INVOCATION_MAX_BODY_BYTES || '').trim();
-    if (!raw) return DEFAULT_HTTP_SERVICE_INVOCATION_MAX_BODY_BYTES;
+export function resolveHttpRouteInvocationMaxBodyBytes(env = process.env) {
+    const raw = String(env?.PLOINKY_HTTP_ROUTE_INVOCATION_MAX_BODY_BYTES || '').trim();
+    if (!raw) return DEFAULT_HTTP_ROUTE_INVOCATION_MAX_BODY_BYTES;
     const parsed = Number(raw);
-    return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : DEFAULT_HTTP_SERVICE_INVOCATION_MAX_BODY_BYTES;
+    return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : DEFAULT_HTTP_ROUTE_INVOCATION_MAX_BODY_BYTES;
 }
 
 function pathOnly(pathWithQuery = '') {
@@ -236,13 +229,13 @@ export function proxyHttpBuffered(req, res, targetPort, agentPath, body, extraHe
 }
 
 export function readRequestBody(req, {
-    maxBytes = DEFAULT_HTTP_SERVICE_INVOCATION_MAX_BODY_BYTES,
+    maxBytes = DEFAULT_HTTP_ROUTE_INVOCATION_MAX_BODY_BYTES,
     onSuccess,
     onError,
     onTooLarge,
 }) {
     const chunks = [];
-    const limit = Number(maxBytes) || DEFAULT_HTTP_SERVICE_INVOCATION_MAX_BODY_BYTES;
+    const limit = Number(maxBytes) || DEFAULT_HTTP_ROUTE_INVOCATION_MAX_BODY_BYTES;
     let total = 0;
     let settled = false;
     const finish = (callback, value) => {
@@ -333,7 +326,7 @@ function normalizeRateSourceAddress(value) {
  * browser identity. Public-host requests use Cloudflare's connector-provided
  * source address; local aliases use the TCP peer observed by the Router.
  */
-export function buildHttpServiceRateSourceHeader(req, routePlan) {
+export function buildHttpRouteRateSourceHeader(req, routePlan) {
     if (routePlan?.decision?.access !== 'guest') return {};
     const publicConnectorRequest = routePlan?.hostSelection?.source === 'public-host';
     const sourceClass = publicConnectorRequest ? 'cloudflare' : 'socket';
@@ -342,21 +335,21 @@ export function buildHttpServiceRateSourceHeader(req, routePlan) {
         : req?.socket?.remoteAddress;
     const address = normalizeRateSourceAddress(rawAddress);
     if (!address) {
-        const error = new Error('guest service request has no valid canonical transport source');
+        const error = new Error('guest HTTP route has no valid canonical transport source');
         error.code = 'INVALID_RATE_SOURCE';
         error.statusCode = 400;
         throw error;
     }
-    const routeKey = String(routePlan?.definition?.routeKey || '');
-    const externalPrefix = String(routePlan?.definition?.externalPrefix || '');
-    if (!routeKey || !externalPrefix) {
-        const error = new Error('guest service route has no canonical rate-source scope');
+    const routeKey = String(routePlan?.routeKey || routePlan?.authDefinition?.routeKey || '');
+    const pathPrefix = String(routePlan?.authDefinition?.pathPrefix || '');
+    if (!routeKey || !pathPrefix) {
+        const error = new Error('guest HTTP route has no canonical rate-source scope');
         error.code = 'INVALID_RATE_SOURCE';
         error.statusCode = 503;
         throw error;
     }
     const partition = createHmac('sha256', deriveSubkey('router-rate-source', 32))
-        .update(`v1\0${routeKey}\0${externalPrefix}\0${sourceClass}\0${address}`, 'utf8')
+        .update(`http-route-rate-source\0${routeKey}\0${pathPrefix}\0${sourceClass}\0${address}`, 'utf8')
         .digest('hex');
     return { [PLOINKY_RATE_SOURCE_HEADER]: partition };
 }
@@ -382,25 +375,25 @@ function buildPlainAuthInfo(req) {
     };
 }
 
-function resolveHttpServiceActorKind(authInfo = {}) {
+function resolveHttpRouteActorKind(authInfo = {}) {
     const roles = Array.isArray(authInfo.user?.roles)
         ? authInfo.user.roles.map(role => String(role || '').trim().toLowerCase())
         : [];
     return roles.includes('guest') ? 'guest' : 'user';
 }
 
-function buildHttpServiceInvocationBody(req, parsedUrl, definition, { bodyHash = '', servicePath = '' } = {}) {
+function buildHttpRouteInvocationBody(req, parsedUrl, definition, { bodyHash = '', routePath = '' } = {}) {
     return {
         method: String(req.method || 'GET').toUpperCase(),
         externalPath: parsedUrl?.pathname || '',
-        path: pathOnly(servicePath || parsedUrl?.pathname || ''),
+        path: pathOnly(routePath || parsedUrl?.pathname || ''),
         search: parsedUrl?.search || '',
         routeKey: definition.routeKey || '',
         bodyHash: String(bodyHash || sha256RawBodyHash())
     };
 }
 
-function resolveHttpServicePrincipal(definition) {
+function resolveHttpRoutePrincipal(definition) {
     const repoName = String(definition?.route?.repo || '').trim();
     const agentName = String(definition?.route?.agent || '').trim();
     if (!repoName || !agentName) return null;
@@ -432,7 +425,7 @@ function isWithinPathRoot(value, root) {
     return normalizedValue === normalizedRoot || normalizedValue.startsWith(`${normalizedRoot}/`);
 }
 
-function serviceDelegationMatchesRequest(entry = {}, { parsedUrl } = {}) {
+function routeDelegationMatchesRequest(entry = {}, { parsedUrl } = {}) {
     const when = entry.when;
     if (!when) {
         return true;
@@ -446,9 +439,9 @@ function serviceDelegationMatchesRequest(entry = {}, { parsedUrl } = {}) {
     return roots.some((root) => isWithinPathRoot(pathValue, root));
 }
 
-function buildServiceDelegations(req, definition, { servicePath = '', parsedUrl = null } = {}) {
+function buildRouteDelegations(req, definition, { routePath = '', parsedUrl = null } = {}) {
     const authInfo = buildPlainAuthInfo(req);
-    const actorKind = resolveHttpServiceActorKind(authInfo);
+    const actorKind = resolveHttpRouteActorKind(authInfo);
     if (actorKind !== 'user') {
         return undefined;
     }
@@ -461,18 +454,17 @@ function buildServiceDelegations(req, definition, { servicePath = '', parsedUrl 
     const out = {};
     for (let index = 0; index < definition.delegations.length; index += 1) {
         const entry = definition.delegations[index];
-        if (!serviceDelegationMatchesRequest(entry, { parsedUrl })) {
+        if (!routeDelegationMatchesRequest(entry, { parsedUrl })) {
             continue;
         }
         const { token, payload } = mintUserDelegationGrant({
             signingSecret,
             ttlSeconds: entry.ttlSeconds,
-            sourceAgentId: resolveHttpServicePrincipal(definition),
-            service: {
+            sourceAgentId: resolveHttpRoutePrincipal(definition),
+            route: {
                 routeKey: definition.routeKey,
-                externalPrefix: definition.externalPrefix,
-                internalPrefix: definition.internalPrefix,
-                internalPath: pathOnly(servicePath),
+                pathPrefix: definition.pathPrefix,
+                requestPath: pathOnly(routePath),
             },
             user,
             targetAgentId: entry.targetAgentId,
@@ -490,34 +482,34 @@ function buildServiceDelegations(req, definition, { servicePath = '', parsedUrl 
     return Object.keys(out).length ? out : undefined;
 }
 
-export function buildHttpServiceAuthInfoHeader(req, parsedUrl, definition, { bodyHash = '', servicePath = '' } = {}) {
+export function buildHttpRouteAuthInfoHeader(req, parsedUrl, definition, { bodyHash = '', routePath = '' } = {}) {
     if (!definition?.includeAuthInfo || !req.user || typeof req.user !== 'object') {
         return {};
     }
 
     const authInfo = buildPlainAuthInfo(req);
     if (definition.issueInvocation) {
-        const invocationBody = buildHttpServiceInvocationBody(req, parsedUrl, definition, { bodyHash, servicePath });
-        // Fail closed if the service route cannot be resolved to an installed
+        const invocationBody = buildHttpRouteInvocationBody(req, parsedUrl, definition, { bodyHash, routePath });
+        // Fail closed if the route cannot be resolved to an installed
         // agent principal — never forward unsigned identity metadata.
-        const servicePrincipal = resolveHttpServicePrincipal(definition);
-        if (!servicePrincipal) {
+        const routePrincipal = resolveHttpRoutePrincipal(definition);
+        if (!routePrincipal) {
             throw new Error(`invocationMinter: could not resolve provider '${definition.routeKey}'`);
         }
-        // Router Request signed with the SERVICE agent's own secret; rch binds
+        // Router Request signed with the target agent's own secret; rch binds
         // the token to the HTTP request surface, including the raw body hash.
         const sub = authInfo.user?.id ? `user:${authInfo.user.id}` : '';
         const { token } = buildRouterRequest({
-            targetAgentId: servicePrincipal,
+            targetAgentId: routePrincipal,
             sub,
             actor: {
-                kind: resolveHttpServiceActorKind(authInfo),
+                kind: resolveHttpRouteActorKind(authInfo),
                 id: sub,
                 roles: Array.isArray(authInfo.user?.roles) ? authInfo.user.roles : [],
             },
             method: invocationBody.method,
             path: invocationBody.path,
-            tool: '__http_service__',
+            tool: '__http_route__',
             rch: computeRchHttp({
                 method: invocationBody.method,
                 path: invocationBody.path,
@@ -528,8 +520,8 @@ export function buildHttpServiceAuthInfoHeader(req, parsedUrl, definition, { bod
         authInfo.invocationToken = token;
         authInfo.invocationBody = invocationBody;
     }
-    const delegations = buildServiceDelegations(req, definition, {
-        servicePath: servicePath || parsedUrl?.pathname || '',
+    const delegations = buildRouteDelegations(req, definition, {
+        routePath: routePath || parsedUrl?.pathname || '',
         parsedUrl,
     });
     if (delegations) {
@@ -546,138 +538,6 @@ export function readHeaderValue(headers = {}, headerName) {
     if (typeof direct === 'string' && direct.trim()) return direct.trim();
     const lower = headers?.[String(headerName || '').toLowerCase()];
     return typeof lower === 'string' && lower.trim() ? lower.trim() : '';
-}
-
-export function handleHttpServiceRoute(req, res, parsedUrl, routePlan = null) {
-    const plan = routePlan?.kind === 'service'
-        ? routePlan
-        : resolveEdgeRoutePlan({ req, parsedUrl, listener: routePlan?.listener || 'public' });
-    if (!plan?.ok || plan.kind !== 'service') {
-        return false;
-    }
-    const definition = plan.definition;
-    const target = plan.target || resolveHttpServiceTarget(definition, plan.snapshot?.routing);
-    const effectiveUrl = plan.parsedUrl || parsedUrl;
-    const pathname = plan.canonicalPath || effectiveUrl?.pathname || '';
-    if (!target) return false;
-    if (definition.access !== 'public'
-        && (!req.user || typeof req.user !== 'object')
-        && (!req.privateAgentIdentity || plan.listener !== 'private')) {
-        sendJson(res, 401, { ok: false, error: 'not_authenticated' });
-        return true;
-    }
-    let rateSourceHeaders = {};
-    try {
-        rateSourceHeaders = buildHttpServiceRateSourceHeader(req, plan);
-    } catch (err) {
-        sendJson(res, err?.statusCode || 400, {
-            ok: false,
-            error: err?.code || 'INVALID_RATE_SOURCE',
-        });
-        return true;
-    }
-    req.headers = stripRouterIdentityHeaders(req.headers, {
-        preserveAuthorization: plan.listener === 'private',
-        preserveCookie: false,
-    });
-
-    const upstreamPath = plan.upstreamPath || buildServiceAgentPath(pathname, effectiveUrl?.search, definition.externalPrefix, definition.internalPrefix);
-    const forwardingHeaders = buildTrustedForwardingHeaders(plan);
-    // DS014: an http-service `internalPrefix` must never rewrite a request into a
-    // router-owned `__agent` control-plane path. The early dispatch guard only
-    // sees the external request path, so re-check the synthesized upstream here.
-    if (hasInternalAgentSegment(upstreamPath)) {
-        sendJson(res, 404, { ok: false, error: 'not_found' });
-        return true;
-    }
-
-    if (Buffer.isBuffer(req.edgeBufferedBody)) {
-        let identityHeaders = {};
-        try {
-            identityHeaders = buildHttpServiceAuthInfoHeader(req, effectiveUrl, definition, {
-                bodyHash: sha256RawBodyHash(req.edgeBufferedBody),
-                servicePath: upstreamPath,
-            });
-        } catch (err) {
-            sendJson(res, 500, {
-                ok: false,
-                error: 'http_service_invocation_unavailable',
-                message: err?.message || String(err),
-            });
-            return true;
-        }
-        proxyHttpBuffered(req, res, target.hostPort, upstreamPath, req.edgeBufferedBody, {
-            ...rateSourceHeaders,
-            ...identityHeaders,
-            ...forwardingHeaders,
-        }, {
-            beforeDial: () => commitRoutePlan(plan),
-        });
-        return true;
-    }
-
-    if (definition.includeAuthInfo && definition.issueInvocation) {
-        readRequestBody(req, {
-            maxBytes: resolveHttpServiceInvocationMaxBodyBytes(),
-            onSuccess: (body) => {
-                let identityHeaders = {};
-                try {
-                    identityHeaders = buildHttpServiceAuthInfoHeader(req, effectiveUrl, definition, {
-                        bodyHash: sha256RawBodyHash(body),
-                        servicePath: upstreamPath,
-                    });
-                } catch (err) {
-                    sendJson(res, 500, {
-                        ok: false,
-                        error: 'http_service_invocation_unavailable',
-                        message: err?.message || String(err),
-                    });
-                    return;
-                }
-                proxyHttpBuffered(req, res, target.hostPort, upstreamPath, body, {
-                    ...rateSourceHeaders,
-                    ...identityHeaders,
-                    ...forwardingHeaders,
-                }, {
-                    beforeDial: () => commitRoutePlan(plan),
-                });
-            },
-            onTooLarge: ({ limitBytes }) => {
-                sendJson(res, 413, {
-                    ok: false,
-                    error: 'http_service_body_too_large',
-                    limitBytes,
-                });
-            },
-            onError: (err) => {
-                if (!res.headersSent) {
-                    res.writeHead(500, { 'Content-Type': 'application/json' });
-                }
-                res.end(JSON.stringify({ error: 'request error', detail: String(err) }));
-            },
-        });
-        return true;
-    }
-
-    let identityHeaders = {};
-    try {
-        identityHeaders = buildHttpServiceAuthInfoHeader(req, effectiveUrl, definition);
-    } catch (err) {
-        sendJson(res, 500, {
-            ok: false,
-            error: 'http_service_invocation_unavailable',
-            message: err?.message || String(err),
-        });
-        return true;
-    }
-    proxyHttpPassthrough(req, res, target.hostPort, upstreamPath, {
-        ...rateSourceHeaders,
-        ...identityHeaders,
-        ...forwardingHeaders,
-    }, {
-        beforeDial: () => commitRoutePlan(plan),
-    });
-    return true;
 }
 
 export function proxyApi(req, res, targetPort, identityHeaders = {}) {

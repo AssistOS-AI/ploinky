@@ -5,6 +5,7 @@ import {
     readManifestAgentCommand,
     readManifestStartCommand,
     resolveAgentExecutionMode,
+    resolveAgentReadinessPort,
     resolveAgentReadinessProtocol
 } from '../../cli/utils/runtime/startupReadiness.js';
 
@@ -56,6 +57,24 @@ test('resolveAgentReadinessProtocol honors explicit manifest overrides', () => {
         start: 'postgres',
         readiness: { protocol: 'mcp' }
     }), 'mcp');
+});
+
+test('resolveAgentReadinessPort accepts only an explicit valid container port', () => {
+    assert.equal(resolveAgentReadinessPort({}), null);
+    assert.equal(resolveAgentReadinessPort({ readiness: { port: 7000 } }), 7000);
+    assert.equal(resolveAgentReadinessPort({ readiness: { port: '8080' } }), 8080);
+    assert.throws(
+        () => resolveAgentReadinessPort({ readiness: { port: 0 } }),
+        /integer from 1 through 65535/,
+    );
+    assert.throws(
+        () => resolveAgentReadinessPort({ readiness: { port: 65536 } }),
+        /integer from 1 through 65535/,
+    );
+    assert.throws(
+        () => resolveAgentReadinessPort({ readiness: { port: '7000/tcp' } }),
+        /integer from 1 through 65535/,
+    );
 });
 
 test('top-level manifest.run does not affect startup readiness inference', () => {

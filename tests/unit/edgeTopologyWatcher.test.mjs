@@ -11,12 +11,10 @@ const AUTHORIZATION = `sha256:${'a'.repeat(64)}`;
 
 function topology(publicationGeneration) {
     return {
-        schemaVersion: 2,
         configurationGeneration: CONFIGURATION,
         authorizationGeneration: AUTHORIZATION,
         publicationGeneration,
-        state: 'local-ready',
-        services: [],
+        state: 'ready',
     };
 }
 

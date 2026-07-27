@@ -1,8 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 
-const SUPPORTED_SCHEMA_VERSION = 2;
-const ACTIVE_STATES = new Set(['local-ready', 'cloudflare-ready']);
+const TOPOLOGY_STATES = new Set(['ready', 'reconciling', 'error']);
 const GENERATION_PATTERN = /^sha256:[a-f0-9]{64}$/;
 
 function topologyFile(file, env) {
@@ -15,9 +14,6 @@ function validateTopology(document) {
     if (!document || typeof document !== 'object' || Array.isArray(document)) {
         throw new Error('edgeTopology: snapshot must be an object');
     }
-    if (document.schemaVersion !== SUPPORTED_SCHEMA_VERSION) {
-        throw new Error(`edgeTopology: unsupported schemaVersion '${document.schemaVersion}'`);
-    }
     if (!GENERATION_PATTERN.test(String(document.configurationGeneration || ''))) {
         throw new Error('edgeTopology: invalid configurationGeneration');
     }
@@ -27,28 +23,7 @@ function validateTopology(document) {
     if (!Number.isSafeInteger(document.publicationGeneration) || document.publicationGeneration < 1) {
         throw new Error('edgeTopology: invalid publicationGeneration');
     }
-    if (!Array.isArray(document.services)) {
-        throw new Error('edgeTopology: services must be an array');
-    }
-    const keys = new Set();
-    for (const service of document.services) {
-        const routeKey = String(service?.routeKey || '').trim();
-        const slug = String(service?.slug || '').trim();
-        if (!routeKey || !slug) throw new Error('edgeTopology: service routeKey and slug are required');
-        const key = `${routeKey}\0${slug}`;
-        if (keys.has(key)) throw new Error(`edgeTopology: duplicate service '${routeKey}/${slug}'`);
-        keys.add(key);
-        for (const field of ['configuredBrowserUrl', 'activeBrowserUrl']) {
-            if (service[field] === undefined) continue;
-            let value;
-            try { value = new URL(String(service[field])); } catch (_) {
-                throw new Error(`edgeTopology: invalid ${field} for '${routeKey}/${slug}'`);
-            }
-            if (!['http:', 'https:', 'ws:', 'wss:'].includes(value.protocol)) {
-                throw new Error(`edgeTopology: unsupported ${field} scheme for '${routeKey}/${slug}'`);
-            }
-        }
-    }
+    if (!TOPOLOGY_STATES.has(document.state)) throw new Error('edgeTopology: invalid state');
     return document;
 }
 
@@ -61,39 +36,6 @@ export function readEdgeTopology({ file, env = process.env } = {}) {
         throw new Error(`edgeTopology: cannot read current snapshot: ${error?.message || error}`);
     }
     return validateTopology(document);
-}
-
-export function resolveEdgeService({
-    routeKey,
-    slug,
-    requireActive = true,
-    file,
-    env = process.env,
-} = {}) {
-    const wantedRouteKey = String(routeKey || '').trim();
-    const wantedSlug = String(slug || '').trim();
-    if (!wantedRouteKey || !wantedSlug) {
-        throw new Error('edgeTopology: routeKey and slug are required');
-    }
-    const topology = readEdgeTopology({ file, env });
-    const matches = topology.services.filter((service) => (
-        service.routeKey === wantedRouteKey && service.slug === wantedSlug
-    ));
-    if (matches.length !== 1) {
-        throw new Error(`edgeTopology: service '${wantedRouteKey}/${wantedSlug}' is unavailable or ambiguous`);
-    }
-    const service = matches[0];
-    if (requireActive && (!ACTIVE_STATES.has(topology.state) || !service.activeBrowserUrl)) {
-        throw new Error(`edgeTopology: service '${wantedRouteKey}/${wantedSlug}' is not active`);
-    }
-    return Object.freeze({
-        schemaVersion: topology.schemaVersion,
-        configurationGeneration: topology.configurationGeneration,
-        publicationGeneration: topology.publicationGeneration,
-        state: topology.state,
-        service: Object.freeze({ ...service }),
-        ...(topology.media ? { media: Object.freeze(structuredClone(topology.media)) } : {}),
-    });
 }
 
 export function watchEdgeTopology({ file, env = process.env, onChange, onError } = {}) {
@@ -123,11 +65,23 @@ export function watchEdgeTopology({ file, env = process.env, onChange, onError }
     watcher.on('error', (error) => {
         if (typeof onError === 'function') onError(error);
     });
-    return Object.freeze({ close: () => watcher.close() });
+    // Filesystem event delivery is advisory and can coalesce or miss a rapid
+    // atomic replacement under load. Polling keeps the generation watcher
+    // correct without keeping the process alive.
+    const poller = setInterval(publish, 100);
+    poller.unref();
+    let closed = false;
+    return Object.freeze({
+        close: () => {
+            if (closed) return;
+            closed = true;
+            clearInterval(poller);
+            watcher.close();
+        },
+    });
 }
 
 export default {
     readEdgeTopology,
-    resolveEdgeService,
     watchEdgeTopology,
 };

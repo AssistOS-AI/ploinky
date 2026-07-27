@@ -120,16 +120,11 @@ async function mergeRoutingConfig(mutator, {
 
 function mergeRuntimeRoute(existingRoute, route, {
     hostPort = null,
-    serviceTargets = null,
 } = {}) {
     const next = { ...(existingRoute || {}), ...(route || {}) };
+    delete next.serviceTargets;
     if (hostPort) next.hostPort = hostPort;
     else delete next.hostPort;
-    if (serviceTargets && typeof serviceTargets === 'object' && Object.keys(serviceTargets).length) {
-        next.serviceTargets = Object.fromEntries(Object.entries(serviceTargets).map(([port, target]) => [String(port), Number(target)]));
-    } else {
-        delete next.serviceTargets;
-    }
     return next;
 }
 

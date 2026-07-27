@@ -18,9 +18,8 @@ import {
 
 const DEFAULT_STATUS_FILE = path.join(PLOINKY_DIR, 'run', 'cloudflare-publication-status.json');
 const ALLOWED_PUBLICATION_STATES = new Set([
-    'local-ready',
-    'cloudflare-reconciling',
-    'cloudflare-ready',
+    'ready',
+    'reconciling',
 ]);
 
 function publicationRuntimeError(message, code = 'CLOUDFLARE_RUNTIME_COORDINATION_FAILED') {
@@ -105,8 +104,7 @@ export function createEdgePublicationRouteCoordinator({
             }
             const expectedMode = captured.desired?.cloudflare ? 'cloudflare' : 'local-only';
             if (mode !== expectedMode
-                || (mode === 'local-only' && state !== 'local-ready')
-                || (mode === 'cloudflare' && state === 'local-ready')
+                || (mode === 'local-only' && state !== 'ready')
                 || stablePublicationJson(hosts || {}) !== stablePublicationJson(captured.desired?.hosts || {})) {
                 throw publicationRuntimeError('publication commit does not match captured desired semantics');
             }

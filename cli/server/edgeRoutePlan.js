@@ -1,26 +1,28 @@
+import crypto from 'node:crypto';
 import net from 'node:net';
 import { domainToASCII } from 'node:url';
 
 import { captureEdgeRoutingLease } from '../sandbox/edgeGeneration.js';
 import { selectedRouterHostPort } from '../sandbox/routerPort.js';
+import { deriveAgentPrincipalId } from '../utils/security/agentIdentity.js';
 import {
-    buildServiceAgentPath,
-    collectHttpServiceRoutes,
-    resolveHttpServiceTarget,
-} from './httpServiceRoutes.js';
-import { hasInternalAgentSegment } from './internalAgentPath.js';
+    AgentPortSelectorError,
+    parseAgentPortSelector,
+} from './agentPortConvention/parseSelector.js';
+import { normalizeHttpRouteAuthDefinition } from './httpRouteAuth.js';
 import { HttpRouteAccessPolicy } from './policy/HttpRouteAccessPolicy.js';
+import { HttpRouteAccessPath } from './policy/HttpRouteAccessPath.js';
+import { normalizeManifestHttpRouteAccess } from './policy/HttpRouteProviders.js';
+import { compileProxyLimits } from './proxy/limits.js';
+import { createRoutePlan } from './proxy/RoutePlan.js';
 
 const LOCAL_CONTROL_HOSTS = new Set(['localhost', '127.0.0.1', '::1', 'router.localhost']);
 const MANAGED_ROUTER_HOST = 'host.containers.internal';
-const DEDICATED_SERVICE_AUTH_SUPPORT_PATHS = new Set([
+const AGENT_ROOT_AUTH_SUPPORT_PATHS = new Set([
     '/auth/callback',
     '/auth/logged-out',
     '/auth/login',
     '/auth/logout',
-]);
-const AGENT_ROOT_AUTH_SUPPORT_PATHS = new Set([
-    ...DEDICATED_SERVICE_AUTH_SUPPORT_PATHS,
     '/auth/account',
     '/auth/token',
 ]);
@@ -58,62 +60,10 @@ export function normalizeExactHost(hostHeader) {
     return normalizedHostName(hostHeader);
 }
 
-function serviceKey(routeKey, slug) {
-    return `${routeKey}\u0000${slug}`;
-}
-
-function serviceInventoryKey({ routeKey, slug, externalPrefix }) {
-    return slug
-        ? serviceKey(routeKey, slug)
-        : `${routeKey}\u0000prefix:${externalPrefix}`;
-}
-
 function exactRoute(routes, routeKey) {
     const key = String(routeKey || '');
     const route = routes?.[key];
     return route && !route.disabled ? { routeKey: key, route } : null;
-}
-
-function runtimeServices(snapshot) {
-    const definitions = collectHttpServiceRoutes(snapshot.routing, { manifests: snapshot.manifests || {} });
-    const compiled = snapshot.compiled?.services || [];
-    if (definitions.length !== compiled.length) throw new Error('compiled HTTP service inventory mismatch');
-    const compiledByKey = new Map(compiled.map((entry) => [serviceInventoryKey(entry), entry]));
-    if (compiledByKey.size !== compiled.length) throw new Error('compiled HTTP service inventory is ambiguous');
-    for (const definition of definitions) {
-        const expected = compiledByKey.get(serviceInventoryKey(definition));
-        if (!expected
-            || expected.externalPrefix !== definition.externalPrefix
-            || expected.internalPrefix !== definition.internalPrefix
-            || expected.access !== definition.access
-            || expected.port !== definition.port
-            || expected.guestScope !== definition.guestScope
-            || expected.issueInvocation !== definition.issueInvocation
-            || expected.includeAuthInfo !== definition.includeAuthInfo) {
-            throw new Error('compiled HTTP service semantics mismatch');
-        }
-    }
-    return definitions;
-}
-
-function internalServiceKeys(snapshot) {
-    return new Set((snapshot.compiled?.security?.internalServiceConsumers || []).map((entry) => (
-        serviceKey(entry.routeKey, entry.slug)
-    )));
-}
-
-function findService(services, routeKey, slug) {
-    const matches = services.filter((definition) => definition.routeKey === routeKey && definition.slug === slug);
-    return matches.length === 1 ? matches[0] : null;
-}
-
-function serviceForPath(services, pathname) {
-    const normalizedPathname = String(pathname || '');
-    const matches = services.filter((definition) => (
-        normalizedPathname === definition.externalPrefix.replace(/\/$/, '')
-        || normalizedPathname.startsWith(definition.externalPrefix)
-    ));
-    return matches.length === 1 ? matches[0] : null;
 }
 
 function classifyHost({ host, listener, snapshot }) {
@@ -127,21 +77,17 @@ function classifyHost({ host, listener, snapshot }) {
     }
     if (LOCAL_CONTROL_HOSTS.has(host)) return { kind: 'control', host };
     if (host === MANAGED_ROUTER_HOST) return null;
-    const alias = snapshot.compiled?.localAliases?.[host];
-    if (alias) return { kind: 'dedicated-service', source: 'local-alias', host, record: alias };
     const record = snapshot.compiled?.hosts?.[host];
     if (!record) return null;
-    if (snapshot.publicationState !== 'cloudflare-ready') {
+    if (snapshot.publicationState !== 'ready') {
         return { kind: 'inactive-public', host, record };
     }
-    return record.kind === 'dedicated-service'
-        ? { kind: 'dedicated-service', source: 'public-host', host, record }
-        : { kind: 'agent-root', source: 'public-host', host, record };
+    return { kind: 'agent-root', source: 'public-host', host, record };
 }
 
 function snapshotPolicy(snapshot) {
     const compiled = snapshot.compiled?.policy;
-    if (!compiled || compiled.schemaVersion !== 1 || !Array.isArray(compiled.entries)
+    if (!compiled || !Array.isArray(compiled.entries)
         || !compiled.routeDefaults || typeof compiled.routeDefaults !== 'object') return null;
     const repository = {
         listHttpRoutes: () => ({
@@ -152,14 +98,251 @@ function snapshotPolicy(snapshot) {
     return new HttpRouteAccessPolicy({
         repository,
         manifestRouteProvider: () => [],
-        httpServiceProvider: () => [],
         routeDefaultProvider: ({ routeKey }) => compiled.routeDefaults[routeKey] || null,
     });
 }
 
-function canonicalizeDedicatedServicePath(definition, pathname) {
-    const suffix = pathname === '/' ? '' : String(pathname || '').replace(/^\/+/, '');
-    return `${definition.externalPrefix}${suffix}`;
+function exactAgentRuntime(snapshot, routeKey, route) {
+    const containerName = String(route?.container || '').trim();
+    const record = snapshot.agents?.[containerName];
+    if (!containerName || !record || record.type !== 'agent') return null;
+    if (String(record.repoName || '') !== String(route.repo || '')
+        || String(record.agentName || '') !== String(route.agent || '')) return null;
+    const runtime = String(record.runtime || '').trim();
+    const containerId = String(record.containerId || '').trim().toLowerCase();
+    const effectiveInstanceId = String(record.instanceId || '').trim();
+    const enableGeneration = String(record.enableGeneration || '').trim();
+    if (!['docker', 'podman'].includes(runtime)
+        || !/^[a-f0-9]{64}$/.test(containerId)
+        || !effectiveInstanceId
+        || !enableGeneration) return null;
+    let targetAgentId;
+    try {
+        targetAgentId = deriveAgentPrincipalId(record.repoName, record.agentName);
+    } catch (_) {
+        return null;
+    }
+    const manifest = snapshot.manifests?.[routeKey] || {};
+    const profile = manifest.profiles?.[String(record.profile || '')] || {};
+    const networkMode = String(
+        profile?.network?.mode
+        || manifest?.network?.mode
+        || 'bridge',
+    ).trim().toLowerCase();
+    return {
+        runtime,
+        containerId,
+        containerName,
+        targetAgentId,
+        effectiveInstanceId,
+        enableGeneration,
+        networkMode,
+        routeKey,
+    };
+}
+
+function manifestRouteSpecs(manifest = {}) {
+    const raw = manifest?.routerAccess?.httpRoutes;
+    if (Array.isArray(raw)) return raw;
+    if (raw && typeof raw === 'object') {
+        return Object.entries(raw).map(([pathValue, value]) => (
+            value && typeof value === 'object'
+                ? { path: pathValue, ...value }
+                : { path: pathValue, access: String(value || '') }
+        ));
+    }
+    return [];
+}
+
+function conventionAuthDefinition({ snapshot, routeKey, route, selector, decision }) {
+    const matching = manifestRouteSpecs(snapshot.manifests?.[routeKey])
+        .map((spec) => ({
+            spec,
+            normalized: normalizeManifestHttpRouteAccess(spec, { routeKey }),
+        }))
+        .filter(({ normalized }) => (
+            normalized.ok
+            && HttpRouteAccessPath.matches(selector.policyPath, normalized.path)
+        ));
+    const declaration = matching.find(({ normalized }) => normalized.access === decision.access)?.spec || {};
+    return normalizeHttpRouteAuthDefinition(routeKey, route, {
+        port: selector.port,
+        path: `/${selector.convention}/${selector.rawAgent}/${selector.canonicalPort}/`,
+        access: decision.access,
+        ...(Array.isArray(declaration.delegations)
+            ? { delegations: declaration.delegations }
+            : {}),
+    });
+}
+
+function agentPortPlan({
+    req,
+    host,
+    listener,
+    parsedUrl,
+    hostSelection,
+    routes,
+    snapshot,
+    lease,
+    transport = 'http',
+}) {
+    let selector;
+    try {
+        selector = parseAgentPortSelector(req?.url || `${parsedUrl.pathname}${parsedUrl.search}`);
+    } catch (error) {
+        if (error instanceof AgentPortSelectorError) {
+            return deny(error.status, error.code, {
+                matched: true,
+                listener,
+                lease,
+                hostSelection,
+            });
+        }
+        throw error;
+    }
+    if (!selector) return null;
+    const selected = exactRoute(routes, selector.agent);
+    if (!selected) {
+        return deny(404, 'AGENT_OWNER_INACTIVE', {
+            matched: true,
+            listener,
+            lease,
+            hostSelection,
+        });
+    }
+    const runtime = exactAgentRuntime(snapshot, selected.routeKey, selected.route);
+    if (!runtime) {
+        return deny(503, 'AGENT_RUNTIME_INACTIVE', {
+            matched: true,
+            listener,
+            lease,
+            hostSelection,
+        });
+    }
+    const deniedPorts = runtime.networkMode === 'host' ? [8080, 8081] : [];
+    try {
+        selector = parseAgentPortSelector(req?.url || `${parsedUrl.pathname}${parsedUrl.search}`, { deniedPorts });
+    } catch (error) {
+        if (error instanceof AgentPortSelectorError) {
+            return deny(error.status, error.code, {
+                matched: true,
+                listener,
+                lease,
+                hostSelection,
+            });
+        }
+        throw error;
+    }
+    const accessPolicy = snapshotPolicy(snapshot);
+    if (!accessPolicy) {
+        return deny(503, 'POLICY_GENERATION_INVALID', {
+            matched: true,
+            listener,
+            lease,
+            hostSelection,
+        });
+    }
+    const decision = accessPolicy.evaluate({
+        pathname: selector.policyPath,
+        method: req?.method || 'GET',
+        routeKey: selected.routeKey,
+    });
+    if (decision?.access === 'deny') {
+        return deny(decision.status || 403, decision.code || 'HTTP_ROUTE_ACCESS_DENIED', {
+            matched: true,
+            listener,
+            lease,
+            hostSelection,
+            decision,
+        });
+    }
+    const forwarding = canonicalForwardingMetadata({
+        snapshot,
+        host,
+        listener,
+        hostSelection,
+    });
+    let authDefinition;
+    try {
+        authDefinition = conventionAuthDefinition({
+            snapshot,
+            routeKey: selected.routeKey,
+            route: selected.route,
+            selector,
+            decision,
+        });
+    } catch (_) {
+        return deny(503, 'POLICY_GENERATION_INVALID', {
+            matched: true,
+            listener,
+            lease,
+            hostSelection,
+        });
+    }
+    return createRoutePlan({
+        matched: true,
+        ok: true,
+        kind: 'agent-port',
+        listener,
+        listenerClass: listener,
+        host,
+        hostSelection,
+        pathname: selector.policyPath,
+        canonicalPath: selector.policyPath,
+        parsedUrl,
+        routeKey: selected.routeKey,
+        route: selected.route,
+        forwarding,
+        lease,
+        snapshot,
+        authDefinition,
+        authority: forwarding.authority,
+        surfaceKind: 'agent-port-convention',
+        owner: {
+            effectiveInstanceId: runtime.effectiveInstanceId,
+            enableGeneration: runtime.enableGeneration,
+        },
+        port: selector.port,
+        policyPath: selector.policyPath,
+        convention: selector.convention,
+        forwardedPrefix: `/${selector.convention}/${selector.rawAgent}/${selector.canonicalPort}`,
+        unmatchedSuffix: selector.suffix,
+        relay: {
+            kind: 'container-exec-stdio',
+            runtime: runtime.runtime,
+            containerId: runtime.containerId,
+            containerName: runtime.containerName,
+            targetAgentId: runtime.targetAgentId,
+            effectiveInstanceId: runtime.effectiveInstanceId,
+            enableGeneration: runtime.enableGeneration,
+            networkMode: runtime.networkMode === 'host' ? 'host' : '',
+        },
+        deniedPorts,
+        allowedRouterCapabilities: [],
+        access: decision,
+        scheme: forwarding.protocol,
+        origin: `${forwarding.protocol}://${forwarding.authority}`,
+        limits: compileProxyLimits(),
+        generationDigest: lease.id,
+        auditId: crypto.randomUUID(),
+        method: String(req?.method || 'GET').toUpperCase(),
+        query: selector.query,
+        transport,
+        credentialPolicy: {
+            allowApplicationAuthorization: true,
+            allowApplicationCookies: true,
+        },
+        responsePolicy: {
+            allowApplicationCookies: true,
+            allowRedirects: true,
+            allowCaching: true,
+        },
+        originPolicy: {
+            allowedOrigins: [`${forwarding.protocol}://${forwarding.authority}`],
+            allowMissingOrigin: true,
+        },
+        allowRequestStreaming: true,
+    });
 }
 
 function canonicalForwardingMetadata({ snapshot, host, listener, hostSelection }) {
@@ -229,9 +412,6 @@ function surfaceForPath(pathname, selectedSurfaces) {
     if (available.has('marketplace-ui') && isRouteMount(pathname, '/api/marketplace')) {
         return { name: 'marketplace-ui', routerOwned: true };
     }
-    if (available.has('topology-projection') && pathname === '/api/edge/topology') {
-        return { name: 'topology-projection', routerOwned: true };
-    }
     return null;
 }
 
@@ -284,81 +464,7 @@ function routerSurfacePlan({ hostSelection, host, pathname, parsedUrl, lease, sn
     };
 }
 
-function servicePlan({
-    req,
-    host,
-    listener,
-    pathname,
-    parsedUrl,
-    hostSelection,
-    definition,
-    dedicated,
-    services,
-    snapshot,
-    lease,
-}) {
-    const canonicalPath = dedicated ? canonicalizeDedicatedServicePath(definition, pathname) : pathname;
-    const policy = snapshotPolicy(snapshot);
-    if (!policy) return deny(503, 'POLICY_GENERATION_INVALID', { lease, hostSelection });
-    const decision = policy.evaluate({
-        pathname: canonicalPath,
-        method: req?.method || 'GET',
-        routeKey: definition.routeKey,
-    });
-    // A policy denial is terminal route-plan state. In particular, the public
-    // read-only method guard must reject control-plane POSTs before a target is
-    // selected or any HTTP/SSE/WebSocket dial can be attempted.
-    if (decision?.access === 'deny') {
-        return deny(decision.status || 403, decision.code || 'HTTP_ROUTE_ACCESS_DENIED', {
-            matched: true,
-            listener,
-            lease,
-            hostSelection,
-            definition,
-            canonicalPath,
-            decision,
-        });
-    }
-    const target = resolveHttpServiceTarget(definition, snapshot.routing);
-    const inventoryKey = serviceInventoryKey(definition);
-    const compiled = snapshot.compiled.services.find((entry) => (
-        serviceInventoryKey(entry) === inventoryKey
-    ));
-    if (!target || !compiled?.target
-        || target.hostname !== compiled.target.hostname
-        || target.hostPort !== compiled.target.hostPort
-        || target.containerPort !== compiled.target.containerPort) {
-        return deny(503, 'TARGET_INACTIVE', { lease, hostSelection, definition, decision });
-    }
-    const upstreamPath = buildServiceAgentPath(
-        canonicalPath,
-        parsedUrl.search,
-        definition.externalPrefix,
-        definition.internalPrefix,
-    );
-    if (hasInternalAgentSegment(upstreamPath)) return deny(404, 'ROUTE_NOT_FOUND', { lease, hostSelection });
-    return {
-        matched: true,
-        ok: true,
-        kind: 'service',
-        listener,
-        host,
-        hostSelection,
-        pathname,
-        canonicalPath,
-        parsedUrl: new URL(`${canonicalPath}${parsedUrl.search}`, `http://${host === '::1' ? '[::1]' : host}`),
-        definition,
-        target,
-        upstreamPath,
-        decision,
-        policyFingerprint: snapshot.sourceDigests.policy,
-        forwarding: canonicalForwardingMetadata({ snapshot, host, listener, hostSelection }),
-        lease,
-        snapshot,
-    };
-}
-
-function agentRootPlan({ req, host, listener, pathname, parsedUrl, hostSelection, selectedRoot, routes, services, snapshot, lease }) {
+function agentRootPlan({ req, host, listener, pathname, parsedUrl, hostSelection, selectedRoot, routes, snapshot, lease }) {
     const agent = resolveAgentPath(pathname, routes, selectedRoot);
     if (!agent) return deny(404, 'ROUTE_NOT_FOUND', { lease, hostSelection });
     const hostPort = Number(agent.route?.hostPort || 0);
@@ -404,7 +510,12 @@ export function isPrivateInterfaceAllowed(req, listenerClass = 'public') {
     return listenerClass === 'private' && req?.ploinkyListenerClass === 'private';
 }
 
-export function resolveEdgeRoutePlan({ req, parsedUrl = null, listener = 'public' } = {}) {
+export function resolveEdgeRoutePlan({
+    req,
+    parsedUrl = null,
+    listener = 'public',
+    transport = 'http',
+} = {}) {
     let lease;
     try {
         lease = captureEdgeRoutingLease();
@@ -425,20 +536,24 @@ export function resolveEdgeRoutePlan({ req, parsedUrl = null, listener = 'public
     }
     const pathname = url.pathname || '/';
     const routes = snapshot.routing?.routes || {};
-    let services;
-    try {
-        services = runtimeServices(snapshot);
-    } catch (_) {
-        return deny(503, 'EDGE_GENERATION_INVALID', { lease });
-    }
-    const internalKeys = internalServiceKeys(snapshot);
-    const publicServices = services.filter((service) => !internalKeys.has(serviceKey(service.routeKey, service.slug)));
-    const privateServices = services.filter((service) => internalKeys.has(serviceKey(service.routeKey, service.slug)));
     const hostSelection = classifyHost({ host, listener, snapshot });
     if (!hostSelection) return deny(421, 'UNKNOWN_HOST', { lease });
     if (hostSelection.kind === 'inactive-public') {
         return deny(503, 'HOST_SELECTOR_INACTIVE', { lease, hostSelection });
     }
+
+    const conventionPlan = agentPortPlan({
+        req,
+        host,
+        listener,
+        parsedUrl: url,
+        hostSelection,
+        routes,
+        snapshot,
+        lease,
+        transport,
+    });
+    if (conventionPlan) return conventionPlan;
 
     if (listener === 'private') {
         if (pathname === '/api/edge/turn-credentials') {
@@ -456,85 +571,10 @@ export function resolveEdgeRoutePlan({ req, parsedUrl = null, listener = 'public
                 snapshot,
             };
         }
-        const definition = serviceForPath(privateServices, pathname);
-        if (!definition) return deny(404, 'PRIVATE_ROUTE_SURFACE_DENIED', { lease, hostSelection });
-        return servicePlan({
-            req,
-            host,
-            listener,
-            pathname,
-            parsedUrl: url,
-            hostSelection,
-            definition,
-            dedicated: false,
-            services,
-            snapshot,
-            lease,
-        });
-    }
-
-    if (hostSelection.kind === 'dedicated-service') {
-        const definition = findService(
-            publicServices,
-            hostSelection.record.routeKey,
-            hostSelection.record.slug || hostSelection.record.httpService,
-        );
-        if (!definition) return deny(503, 'HOST_SELECTOR_STALE', { lease, hostSelection });
-        const authEnabled = definition.access === 'authenticated'
-            || (definition.access === 'guest' && hostSelection.record.optionalLogin === true);
-        if (DEDICATED_SERVICE_AUTH_SUPPORT_PATHS.has(pathname) && authEnabled) {
-            return routerSurfacePlan({
-                hostSelection,
-                host,
-                pathname,
-                parsedUrl: url,
-                lease,
-                snapshot,
-                surface: 'browser-auth',
-            });
-        }
-        if (isReservedRouterSurface(pathname)) {
-            return deny(404, 'ROUTE_SURFACE_DENIED', { lease, hostSelection });
-        }
-        return servicePlan({
-            req,
-            host,
-            listener,
-            pathname,
-            parsedUrl: url,
-            hostSelection,
-            definition,
-            dedicated: true,
-            services,
-            snapshot,
-            lease,
-        });
+        return deny(404, 'PRIVATE_ROUTE_SURFACE_DENIED', { lease, hostSelection });
     }
 
     if (hostSelection.kind === 'agent-root') {
-        const mountRecords = snapshot.compiled.mounts?.[host] || [];
-        const matchingMounts = mountRecords.filter((mount) => (
-            pathname === mount.externalPrefix.replace(/\/$/, '') || pathname.startsWith(mount.externalPrefix)
-        ));
-        if (matchingMounts.length > 1) return deny(503, 'HOST_SELECTOR_INVALID', { lease, hostSelection });
-        if (matchingMounts.length === 1) {
-            const mount = matchingMounts[0];
-            const definition = findService(publicServices, mount.routeKey, mount.slug);
-            if (!definition) return deny(503, 'HOST_SELECTOR_STALE', { lease, hostSelection });
-            return servicePlan({
-                req,
-                host,
-                listener,
-                pathname,
-                parsedUrl: url,
-                hostSelection,
-                definition,
-                dedicated: false,
-                services,
-                snapshot,
-                lease,
-            });
-        }
         const surface = surfaceForPath(pathname, snapshot.compiled.surfaces?.[host] || []);
         if (surface?.routerOwned) {
             return routerSurfacePlan({
@@ -559,28 +599,11 @@ export function resolveEdgeRoutePlan({ req, parsedUrl = null, listener = 'public
             hostSelection,
             selectedRoot: hostSelection.record,
             routes,
-            services,
             snapshot,
             lease,
         });
     }
 
-    const selectedByPath = serviceForPath(publicServices, pathname);
-    if (selectedByPath) {
-        return servicePlan({
-            req,
-            host,
-            listener,
-            pathname,
-            parsedUrl: url,
-            hostSelection,
-            definition: selectedByPath,
-            dedicated: false,
-            services,
-            snapshot,
-            lease,
-        });
-    }
     if (hostSelection.kind === 'managed-agent' && isReservedRouterSurface(pathname)) {
         return deny(404, 'ROUTE_SURFACE_DENIED', { lease, hostSelection });
     }
@@ -593,7 +616,6 @@ export function resolveEdgeRoutePlan({ req, parsedUrl = null, listener = 'public
         hostSelection,
         selectedRoot: null,
         routes,
-        services,
         snapshot,
         lease,
     });

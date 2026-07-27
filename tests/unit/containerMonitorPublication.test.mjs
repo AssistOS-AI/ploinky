@@ -25,7 +25,6 @@ function preparedRestartResult(overrides = {}) {
     return {
         containerName: 'agent_container',
         hostPort: 43123,
-        serviceTargets: { 3001: 43124 },
         registryRecord: {
             type: 'agent',
             repoName: 'repo',
@@ -264,7 +263,6 @@ test('monitor waits for exact semantic readiness before committing the returned 
             repo: 'repo',
             agent: 'demo',
             hostPort: 43123,
-            serviceTargets: { 3001: 43124 },
         });
         assert.ok(events.indexOf('readiness-start') < events.indexOf('registry-save'));
         assert.ok(events.indexOf('route-candidate-written') < events.indexOf('generation-apply'));
@@ -344,7 +342,7 @@ test('monitor apply failure aborts the exact preparation, cleans only the failed
     try {
         const manifestPath = path.join(root, 'manifest.json');
         fs.writeFileSync(manifestPath, JSON.stringify({ readiness: { protocol: 'none' } }));
-        const result = preparedRestartResult({ hostPort: null, serviceTargets: null });
+        const result = preparedRestartResult({ hostPort: null });
         const events = [];
         const applyError = new Error('selector commit failed');
         const monitor = {

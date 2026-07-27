@@ -63,11 +63,10 @@ fs.writeFileSync(path.join(ploinkyDir, 'agents.json'), JSON.stringify({
 fs.mkdirSync(path.join(ploinkyDir, 'data', 'edge-routing'), { recursive: true });
 fs.mkdirSync(path.join(ploinkyDir, 'data', 'router-security'), { recursive: true });
 fs.writeFileSync(path.join(ploinkyDir, 'data', 'edge-routing', 'desired.json'), JSON.stringify({
-    schemaVersion: 1,
-    hosts: {},
+        hosts: {},
     security: {
         hostNetworkAllowedInstances: [],
-        internalServiceConsumers: {},
+        privateRouteConsumers: {},
     },
 }, null, 2));
 fs.writeFileSync(path.join(ploinkyDir, 'data', 'router-security', 'policy-state.json'), JSON.stringify({
@@ -117,11 +116,10 @@ function mintDelegation(overrides = {}) {
         now: new Date(overrides.now || Date.now()),
         ttlSeconds: overrides.ttlSeconds || 1800,
         sourceAgentId: overrides.sourceAgentId || SOURCE_AGENT,
-        service: {
+        route: {
             routeKey: 'onlyOffice',
-            externalPrefix: '/services/onlyoffice/',
-            internalPrefix: '/control/',
-            internalPath: '/control/office/session',
+            pathPrefix: '/base-agent-additional-server/onlyOffice/7000/',
+            requestPath: '/control/office/session',
         },
         user: overrides.user || { id: 'local:alice', username: 'alice', roles: ['user'] },
         targetAgentId: overrides.targetAgentId || TARGET_AGENT,

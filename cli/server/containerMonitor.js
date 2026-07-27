@@ -24,7 +24,10 @@ import { resolveManifestRuntimeProfile } from '../utils/runtime/profileService.j
 import { resolveRouterEndpoint } from '../sandbox/routerPort.js';
 import { resolveAgentReadinessProtocol } from '../utils/runtime/startupReadiness.js';
 import { runContainerScriptReadiness } from '../sandbox/docker/healthProbes.js';
-import { waitForAgentReady } from './utils/agentReadiness.js';
+import {
+    buildRelayReadinessRoute,
+    waitForAgentReady,
+} from './utils/agentReadiness.js';
 import { applyEdgeRoutingGeneration } from '../sandbox/coordinatedEdgeApply.js';
 import {
     abortEdgeRoutingPreparation,
@@ -477,7 +480,13 @@ function assertRestartPreparationResult(target, result) {
     return { containerName, record };
 }
 
-async function waitForRestartedContainerReadiness(monitor, target, manifest, result) {
+async function waitForRestartedContainerReadiness(
+    monitor,
+    target,
+    manifest,
+    result,
+    networkMode = '',
+) {
     const resolveProtocol = monitor.resolveAgentReadinessProtocol || resolveAgentReadinessProtocol;
     const protocol = resolveProtocol(manifest);
     if (protocol === 'none') return;
@@ -497,12 +506,20 @@ async function waitForRestartedContainerReadiness(monitor, target, manifest, res
     if (protocol !== 'tcp' && protocol !== 'mcp') {
         throw new Error(`watchdog resolved unsupported readiness protocol '${protocol}'`);
     }
-    const hostPort = Number(result.hostPort || 0);
-    if (!Number.isInteger(hostPort) || hostPort < 1 || hostPort > 65535) {
-        throw new Error(`watchdog readiness protocol '${protocol}' requires one resolved private target port`);
+    const readinessRoute = buildRelayReadinessRoute({
+        route: {
+            hostPort: Number(result.hostPort || 0),
+        },
+        manifest,
+        runtimeResult: result,
+        networkMode,
+        generationDigest: result?.preparationLease?.preparedGeneration || '',
+    });
+    if (!readinessRoute.hostPort && !readinessRoute.relay) {
+        throw new Error(`watchdog readiness protocol '${protocol}' requires one resolved private target or readiness.port`);
     }
     const waitUntilReady = monitor.waitForAgentReady || waitForAgentReady;
-    const ready = await waitUntilReady({ hostPort }, {
+    const ready = await waitUntilReady(readinessRoute, {
         timeoutMs: positiveInteger(
             monitor?.config?.CONTAINER_RESTART_READY_TIMEOUT_MS
                 ?? process.env.PLOINKY_CONTAINER_MONITOR_READY_TIMEOUT_MS,
@@ -536,7 +553,6 @@ async function activateRestartedContainerRoute(monitor, target, agentDir, result
         agent: target.agentName,
         ...(target.alias ? { alias: target.alias } : {}),
         hostPort: networkMode === 'none' ? null : result.hostPort || null,
-        serviceTargets: result.serviceTargets || null
     };
 
     const mergeRoute = monitor.mergeRoutingConfig || mergeRoutingConfig;
@@ -556,7 +572,7 @@ async function activateRestartedContainerRoute(monitor, target, agentDir, result
         cfg.routes[routeKey] = mergeRuntimeRoute(
             cfg.routes[routeKey],
             route,
-            { hostPort: route.hostPort, serviceTargets: route.serviceTargets },
+            { hostPort: route.hostPort },
         );
         return cfg;
     }, { coordinate: false });
@@ -730,7 +746,13 @@ export async function performContainerRestart(monitor, target, reason) {
             return;
         }
 
-        await waitForRestartedContainerReadiness(monitor, target, manifest, result);
+        await waitForRestartedContainerReadiness(
+            monitor,
+            target,
+            manifest,
+            result,
+            profileResolution.network.mode,
+        );
         assertManifestUnchanged();
         await activateRestartedContainerRoute(
             monitor,

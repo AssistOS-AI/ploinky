@@ -47,10 +47,9 @@ function snapshot() {
         },
         compiled: {
             security: {
-                internalServiceConsumers: [{
+                privateRouteConsumers: [{
                     routeKey: 'alpha',
-                    slug: 'internal-api',
-                    canonicalPrefix: '/services/internal-api/',
+                    path: '/base-agent-additional-server/alpha/7000/private/*',
                     callers: [caller],
                 }],
                 turnCredentialConsumers: [caller],
@@ -59,15 +58,15 @@ function snapshot() {
     };
 }
 
-function privateServicePlan() {
+function privateRoutePlan() {
     return {
         ok: true,
         listener: 'private',
-        kind: 'service',
-        pathname: '/services/internal-api/items',
-        parsedUrl: new URL('http://host.containers.internal/services/internal-api/items?view=full'),
-        definition: { routeKey: 'alpha', slug: 'internal-api' },
-        decision: { access: 'authenticated' },
+        kind: 'agent-port',
+        routeKey: 'alpha',
+        pathname: '/base-agent-additional-server/alpha/7000/private/items',
+        parsedUrl: new URL('http://host.containers.internal/base-agent-additional-server/alpha/7000/private/items?view=full'),
+        access: { access: 'authenticated' },
         snapshot: snapshot(),
     };
 }
@@ -100,8 +99,8 @@ function signedRequest(plan, body, overrides = {}) {
     };
 }
 
-test('private service admission requires effective auth plus exact current caller and request binding', () => {
-    const plan = privateServicePlan();
+test('private route admission requires effective auth plus exact current caller and request binding', () => {
+    const plan = privateRoutePlan();
     const body = Buffer.from('{"value":1}');
     const req = signedRequest(plan, body);
     const identity = authorizePrivateRoutePlan({
@@ -118,8 +117,8 @@ test('private service admission requires effective auth plus exact current calle
     });
     assert.equal(req.headers['ploinky-agent-assertion'], undefined);
 
-    const publicPolicy = privateServicePlan();
-    publicPolicy.decision = { access: 'guest' };
+    const publicPolicy = privateRoutePlan();
+    publicPolicy.access = { access: 'guest' };
     assert.throws(() => authorizePrivateRoutePlan({
         req: signedRequest(publicPolicy, body),
         plan: publicPolicy,
@@ -129,7 +128,7 @@ test('private service admission requires effective auth plus exact current calle
 });
 
 test('private assertions reject body tampering, replay, stale generations, and unlisted methods', () => {
-    const plan = privateServicePlan();
+    const plan = privateRoutePlan();
     const signedBody = Buffer.from('signed');
     assert.throws(() => authorizePrivateRoutePlan({
         req: signedRequest(plan, signedBody),
@@ -149,7 +148,7 @@ test('private assertions reject body tampering, replay, stale generations, and u
         assertionCache: cache,
     }), /already been consumed/i);
 
-    const stale = privateServicePlan();
+    const stale = privateRoutePlan();
     stale.snapshot.agents['beta-container'].enableGeneration = 'replacement-generation';
     assert.throws(() => authorizePrivateRoutePlan({
         req: signedRequest(plan, signedBody),

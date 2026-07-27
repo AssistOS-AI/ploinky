@@ -554,7 +554,6 @@ async function handleCommand(args) {
                                     route: {
                                         container: result?.containerName || containerName,
                                         hostPort: result?.hostPort || 0,
-                                        ...(result?.serviceTargets ? { serviceTargets: result.serviceTargets } : {}),
                                     },
                                 });
                                 await activatePreparedRuntimeAfterReadiness({
@@ -595,7 +594,6 @@ async function handleCommand(args) {
                             const {
                                 containerName: newContainerName,
                                 hostPort,
-                                serviceTargets,
                             } = restartResult;
                             await waitForManifestReadiness({
                                 key: `restart:${resolved.shortAgentName}`,
@@ -605,7 +603,6 @@ async function handleCommand(args) {
                                 route: {
                                     container: newContainerName,
                                     hostPort: hostPort || 0,
-                                    ...(serviceTargets ? { serviceTargets } : {}),
                                 },
                             });
 
@@ -661,7 +658,6 @@ async function handleCommand(args) {
                                     route: {
                                         container: result?.containerName || containerName,
                                         hostPort: result?.hostPort || 0,
-                                        ...(result?.serviceTargets ? { serviceTargets: result.serviceTargets } : {}),
                                     },
                                 });
                                 await activatePreparedRuntimeAfterReadiness({

@@ -29,7 +29,6 @@ function policy(entries, options = {}) {
     return new HttpRouteAccessPolicy({
         repository: repo(entries),
         manifestRouteProvider: () => options.manifestRoutes || [],
-        httpServiceProvider: () => options.httpServices || [],
         routeDefaultProvider: options.routeDefaultProvider || (() => ({ access: 'authenticated', routeKey: '', source: 'routeDefault' })),
     });
 }
@@ -76,17 +75,15 @@ test('more restrictive overlapping route access wins', () => {
     assert.equal(subject.evaluate({ pathname: '/explorer/work/admin/doc', method: 'GET' }).access, 'authenticated');
 });
 
-test('manifest, service, and route default decisions flow through one evaluator', () => {
+test('manifest and route default decisions flow through one evaluator', () => {
     const subject = policy([], {
         manifestRoutes: [{ path: '/explorer/share/*', access: 'guest', routeKey: 'explorer', source: 'manifest' }],
-        httpServices: [{ externalPrefix: '/services/editor/', access: 'authenticated', routeKey: 'editor', source: 'httpService' }],
         routeDefaultProvider: ({ routeKey }) => routeKey === 'publicAgent'
             ? { access: 'public', routeKey, source: 'routeDefault' }
             : { access: 'none' },
     });
 
     assert.equal(subject.evaluate({ pathname: '/explorer/share/doc', method: 'POST' }).source, 'manifest');
-    assert.equal(subject.evaluate({ pathname: '/services/editor/open', method: 'POST' }).source, 'httpService');
     assert.equal(subject.evaluate({ pathname: '/publicAgent/readme', method: 'GET' }).source, 'routeDefault');
 });
 
@@ -108,21 +105,6 @@ test('evaluate fails closed when providers were never bound', () => {
     assert.equal(decision.status, 503);
 });
 
-test('http-service decisions carry the service guestScope for the guest executor', () => {
-    const subject = policy([], {
-        httpServices: [{
-            externalPrefix: '/public-services/meeting-room/',
-            access: 'guest',
-            routeKey: 'guestAgent',
-            source: 'httpService',
-            guestScope: 'meeting-room-public-service',
-        }],
-    });
-    const decision = subject.evaluate({ pathname: '/public-services/meeting-room/join', method: 'POST' });
-    assert.equal(decision.access, 'guest');
-    assert.equal(decision.guestScope, 'meeting-room-public-service');
-});
-
 test('manifest route access rejects mode alias and accepts guest', () => {
     assert.equal(
         normalizeManifestHttpRouteAccess({ path: '/x', mode: 'guest' }, { routeKey: 'explorer' }).code,
@@ -131,6 +113,29 @@ test('manifest route access rejects mode alias and accepts guest', () => {
     assert.deepEqual(
         normalizeManifestHttpRouteAccess({ path: '/x/*', access: 'guest' }, { routeKey: 'explorer' }),
         { ok: true, path: '/explorer/x/*', access: 'guest', routeKey: 'explorer', source: 'manifest' },
+    );
+});
+
+test('manifest route access accepts only convention paths owned by the declaring agent', () => {
+    assert.deepEqual(
+        normalizeManifestHttpRouteAccess({
+            path: '/base-agent-additional-server/explorer/7681/*',
+            access: 'authenticated',
+        }, { routeKey: 'explorer' }),
+        {
+            ok: true,
+            path: '/base-agent-additional-server/explorer/7681/*',
+            access: 'authenticated',
+            routeKey: 'explorer',
+            source: 'manifest',
+        },
+    );
+    assert.equal(
+        normalizeManifestHttpRouteAccess({
+            path: '/base-agent-additional-server/other/7681/*',
+            access: 'public',
+        }, { routeKey: 'explorer' }).code,
+        'ROUTE_OWNERSHIP_MISMATCH',
     );
 });
 

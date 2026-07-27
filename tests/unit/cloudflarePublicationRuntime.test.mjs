@@ -13,7 +13,7 @@ import {
 const GENERATION = `sha256:${'a'.repeat(64)}`;
 
 test('edge publication coordinator commits only exact captured desired semantics and states', async () => {
-    const desired = { schemaVersion: 1, hosts: {}, security: { hostNetworkAllowedInstances: [], internalServiceConsumers: {} } };
+    const desired = { hosts: {}, security: { hostNetworkAllowedInstances: [], privateRouteConsumers: {} } };
     const calls = [];
     const committed = [];
     const edgeOps = {
@@ -40,15 +40,15 @@ test('edge publication coordinator commits only exact captured desired semantics
     await coordinator.inactivate({ configurationGeneration: GENERATION, reason: 'test' });
     await coordinator.commit({
         mode: 'local-only',
-        publicationState: 'local-ready',
+        publicationState: 'ready',
         configurationGeneration: GENERATION,
         hosts: {},
     });
-    assert.deepEqual(calls, [['inactivate', 'test'], ['apply', 'local-ready', GENERATION]]);
+    assert.deepEqual(calls, [['inactivate', 'test'], ['apply', 'ready', GENERATION]]);
     assert.deepEqual(committed, ['activation-ready']);
     await assert.rejects(() => coordinator.commit({
         mode: 'cloudflare',
-        publicationState: 'cloudflare-ready',
+        publicationState: 'ready',
         configurationGeneration: GENERATION,
         hosts: {},
     }), /does not match captured desired semantics/);
@@ -59,7 +59,7 @@ test('publication retry rejects a different inactive selected candidate before r
     let inactive = false;
     let selectedGeneration = GENERATION;
     let inactivationCount = 0;
-    const desired = { schemaVersion: 1, hosts: {}, security: { hostNetworkAllowedInstances: [], internalServiceConsumers: {} } };
+    const desired = { hosts: {}, security: { hostNetworkAllowedInstances: [], privateRouteConsumers: {} } };
     const edgeOps = {
         load() {
             if (inactive) throw Object.assign(new Error('inactive'), { code: 'EDGE_GENERATION_INACTIVE' });
@@ -152,7 +152,7 @@ test('publication runtime reconciles each successful selected activation once an
         selector: {
             generation: GENERATION,
             activationId: 'activation-one',
-            publicationState: 'local-ready',
+            publicationState: 'ready',
         },
         generation: { desired: { hosts: {} } },
     };
@@ -165,7 +165,7 @@ test('publication runtime reconciles each successful selected activation once an
     };
     await runtime.scan();
     assert.equal(reconciliations, 2);
-    assert.equal(inputs[0].selectedPublicationState, 'local-ready');
+    assert.equal(inputs[0].selectedPublicationState, 'ready');
     assert.deepEqual(runtime.getStatus(), { state: 'fixture' });
     await runtime.stop();
     assert.equal(stops, 1);
@@ -213,7 +213,7 @@ test('workspace start contention defers publication without consuming the select
         selector: {
             generation: GENERATION,
             activationId: 'activation-race',
-            publicationState: 'cloudflare-reconciling',
+            publicationState: 'reconciling',
         },
         generation: { desired: { cloudflare: { tunnelId: 'fixture' }, hosts: {} } },
     };
@@ -317,7 +317,7 @@ test('publication holds the shared workspace lease through the complete asynchro
         selector: {
             generation: GENERATION,
             activationId: 'activation-span',
-            publicationState: 'cloudflare-reconciling',
+            publicationState: 'reconciling',
         },
         generation: { desired: { cloudflare: { tunnelId: 'fixture' }, hosts: {} } },
     };
@@ -379,7 +379,7 @@ test('publication runtime retries a failed selected activation without changing 
         selector: {
             generation: GENERATION,
             activationId: 'activation-retry',
-            publicationState: 'cloudflare-reconciling',
+            publicationState: 'reconciling',
         },
         generation: {
             desired: {
@@ -396,7 +396,7 @@ test('publication runtime retries a failed selected activation without changing 
     assert.equal(inputs.length, 2);
     assert.deepEqual(inputs[1], inputs[0]);
     assert.deepEqual(reasons, ['selected-edge-generation', 'selected-edge-generation-retry']);
-    assert.equal(inputs[1].selectedPublicationState, 'cloudflare-reconciling');
+    assert.equal(inputs[1].selectedPublicationState, 'reconciling');
     assert.deepEqual(inputs[1].cloudflare, { tunnelId: 'fixture-tunnel' });
     await runtime.stop();
 });
@@ -430,13 +430,13 @@ test('a newer selected activation cancels an older scheduled publication retry',
         audit: () => {},
     });
     selected = {
-        selector: { generation: GENERATION, activationId: 'activation-old', publicationState: 'cloudflare-reconciling' },
+        selector: { generation: GENERATION, activationId: 'activation-old', publicationState: 'reconciling' },
         generation: { desired: { cloudflare: { tunnelId: 'old' }, hosts: {} } },
     };
     await runtime.scan();
     const newerGeneration = `sha256:${'b'.repeat(64)}`;
     selected = {
-        selector: { generation: newerGeneration, activationId: 'activation-new', publicationState: 'cloudflare-reconciling' },
+        selector: { generation: newerGeneration, activationId: 'activation-new', publicationState: 'reconciling' },
         generation: { desired: { cloudflare: { tunnelId: 'new' }, hosts: {} } },
     };
     await runtime.scan();

@@ -5,7 +5,6 @@ import { validateSecrets } from '../security/secretInjector.js';
 import { collectManifestEnv, validateManifestEnvProfileCompleteness } from '../security/secretVars.js';
 import { debugLog, findAgent } from '../utils.js';
 import { effectiveManifestNetwork, validateManifestNetworks } from '../../sandbox/networkContract.js';
-import { validateManifestHttpServices } from '../../sandbox/httpServicePortConfig.js';
 
 // Discover all valid profile names from installed agent manifests.
 // Any profile name declared in a manifest's "profiles" section is valid.
@@ -224,7 +223,6 @@ export function resolveManifestProfile(manifest, requestedProfileName, {
     const source = manifest && typeof manifest === 'object' && !Array.isArray(manifest)
         ? manifest
         : {};
-    validateManifestHttpServices(source, { label: manifestPath });
     validateManifestNetworks(source, { path: manifestPath });
 
     const profiles = source.profiles && typeof source.profiles === 'object' && !Array.isArray(source.profiles)

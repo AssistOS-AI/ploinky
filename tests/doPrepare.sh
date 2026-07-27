@@ -260,15 +260,9 @@ cat >"${dep_devel_root}/manifest.json" <<'EOF'
   "lite-sandbox": true,
   "container": "node:20-bullseye",
   "start": "node -e \"require('net').createServer(()=>{}).listen(Number(process.env.PORT||7000), '0.0.0.0'); setInterval(()=>{}, 1_000_000)\"",
-  "httpServices": [
-    {
-      "slug": "dep-devel",
-      "port": 7000,
-      "access": "authenticated"
-    }
-  ],
   "readiness": {
-    "protocol": "tcp"
+    "protocol": "tcp",
+    "port": 7000
   }
 }
 EOF

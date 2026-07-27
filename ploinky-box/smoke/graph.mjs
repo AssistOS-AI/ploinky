@@ -66,13 +66,12 @@ function readDesiredCandidate(value, fsApi) {
     } catch (error) {
         throw smokeError('SMOKE_GRAPH_EDGE_DESIRED_FILE must contain valid JSON', error);
     }
-    if (document?.schemaVersion !== 1
-        || !document.hosts
+    if (!document?.hosts
         || typeof document.hosts !== 'object'
         || Array.isArray(document.hosts)
         || Object.keys(document.hosts).length !== 0
         || document.cloudflare !== undefined) {
-        throw smokeError('smoke desired state must be schema 1 and local-only with no selected hosts');
+        throw smokeError('smoke desired state must be local-only with no selected hosts');
     }
     if (!Array.isArray(document?.security?.hostNetworkAllowedInstances)
         || document.security.hostNetworkAllowedInstances.length !== 1) {

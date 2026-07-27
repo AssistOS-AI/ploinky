@@ -89,9 +89,6 @@ fast_graph_create_start_http_agent() {
   local enable_json="${4:-[]}"
   local response_text="${5:-${agent_name}-ok}"
   local agent_dir="${repo_root}/${agent_name}"
-  local service_slug
-  service_slug=$(printf '%s' "$agent_name" | tr '[:upper:]_' '[:lower:]-')
-
   mkdir -p "$agent_dir"
   fast_graph_write_marker_script "$agent_dir"
   fast_graph_write_http_service_script "$agent_dir"
@@ -102,13 +99,10 @@ fast_graph_create_start_http_agent() {
   "container": "node:20-bullseye",
   "start": "node /code/delayed-http.js",
   "enable": ${enable_json},
-  "httpServices": [
-    {
-      "slug": "${service_slug}",
-      "port": 7000,
-      "access": "authenticated"
-    }
-  ],
+  "readiness": {
+    "protocol": "tcp",
+    "port": 7000
+  },
   "profiles": {
     "default": {
       "env": {
@@ -276,17 +270,18 @@ fast_graph_assert_http_route_contains() {
   local route_path="$3"
   local expected="$4"
   local routing_file="$workspace/.ploinky/routing.json"
-  local host_port
+  local router_port
   local url
   local attempts=20
   local delay=0.25
   local i
 
-  host_port=$(read_route_host_port "$routing_file" "$route_key") || {
+  if ! jq -e --arg route_key "$route_key" '.routes[$route_key] | type == "object"' "$routing_file" >/dev/null; then
     echo "Route '${route_key}' missing from '${routing_file}'." >&2
     return 1
-  }
-  url="http://127.0.0.1:${host_port}${route_path}"
+  fi
+  router_port=$(jq -er '.port | select(type == "number" and . > 0)' "$routing_file")
+  url="http://127.0.0.1:${router_port}/base-agent-additional-server/${route_key}/7000${route_path}"
   for (( i=0; i<attempts; i++ )); do
     if assert_http_response_contains "$url" "$expected" >/dev/null 2>&1; then
       return 0
@@ -296,15 +291,27 @@ fast_graph_assert_http_route_contains() {
   assert_http_response_contains "$url" "$expected"
 }
 
-fast_graph_assert_route_missing() {
+fast_graph_assert_route_unpublished() {
   local workspace="$1"
   local route_key="$2"
   local routing_file="$workspace/.ploinky/routing.json"
+  local selector_file="$workspace/.ploinky/data/edge-routing/active.json"
+  local router_port
+  local status
 
-  if read_route_host_port "$routing_file" "$route_key" >/dev/null 2>&1; then
-    echo "Route '${route_key}' unexpectedly exists in '${routing_file}'." >&2
+  if ! jq -e '.state != "active"' "$selector_file" >/dev/null; then
+    echo "Route '${route_key}' unexpectedly belongs to an active edge generation." >&2
     return 1
   fi
+  router_port=$(jq -er '.port | select(type == "number" and . > 0)' "$routing_file")
+  status=$(curl -sS -o /dev/null -w '%{http_code}' \
+    "http://127.0.0.1:${router_port}/base-agent-additional-server/${route_key}/7000/" 2>/dev/null || true)
+  case "$status" in
+    2??|3??)
+      echo "Route '${route_key}' was reachable through inactive edge generation (HTTP ${status})." >&2
+      return 1
+      ;;
+  esac
 }
 
 fast_test_recursive_dependency_graph_startup() (
@@ -442,7 +449,7 @@ fast_test_dependency_failure_blocks_router_startup() (
   find_file_pattern_line "$start_log" "Dependent agent 'brokenDep' did not become ready within 3000ms." >/dev/null
   assert_port_listening "$router_port"
   assert_file_exists "$workspace/.ploinky/running/router.pid"
-  fast_graph_assert_route_missing "$workspace" "root"
+  fast_graph_assert_route_unpublished "$workspace" "root"
 )
 
 fast_test_startup_config_provider_preflight() (
@@ -503,13 +510,10 @@ EOF
   "lite-sandbox": true,
   "container": "node:20-bullseye",
   "start": "node /code/delayed-http.js",
-  "httpServices": [
-    {
-      "slug": "provider",
-      "port": 7000,
-      "access": "authenticated"
-    }
-  ],
+  "readiness": {
+    "protocol": "tcp",
+    "port": 7000
+  },
   "providesConfig": {
     "command": "node provider.js",
     "outputs": [
@@ -549,13 +553,10 @@ EOF
   "lite-sandbox": true,
   "container": "node:20-bullseye",
   "start": "node /code/root.js",
-  "httpServices": [
-    {
-      "slug": "root",
-      "port": 7000,
-      "access": "authenticated"
-    }
-  ],
+  "readiness": {
+    "protocol": "tcp",
+    "port": 7000
+  },
   "configProviders": [
     { "agent": "graphRepo/provider", "profile": "default" }
   ],

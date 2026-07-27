@@ -32,9 +32,8 @@ function createWorkspace(t) {
     );
     fs.mkdirSync(path.join(ploinky, 'data', 'edge-routing'), { recursive: true });
     fs.writeFileSync(path.join(ploinky, 'data', 'edge-routing', 'desired.json'), JSON.stringify({
-        schemaVersion: 1,
-        hosts: {},
-        security: { hostNetworkAllowedInstances: [], internalServiceConsumers: {} },
+                hosts: {},
+        security: { hostNetworkAllowedInstances: [], privateRouteConsumers: {} },
     }));
     t.after(() => {
         fs.rmSync(workspace, { recursive: true, force: true });
@@ -105,9 +104,8 @@ test('first core command initializes the complete edge source set together', (t)
         path.join(ploinky, 'data', 'edge-routing', 'desired.json'),
         'utf8',
     )), {
-        schemaVersion: 1,
-        hosts: {},
-        security: { hostNetworkAllowedInstances: [], internalServiceConsumers: {} },
+                hosts: {},
+        security: { hostNetworkAllowedInstances: [], privateRouteConsumers: {} },
     });
 });
 

@@ -205,7 +205,6 @@ export function compileHttpRoutePolicy({
         };
     });
     return {
-        schemaVersion: 1,
         entries: normalizedEntries,
         routeDefaults: normalizedDefaults,
         namespaces: compiledNamespaces,

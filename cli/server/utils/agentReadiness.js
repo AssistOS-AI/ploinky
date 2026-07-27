@@ -1,7 +1,16 @@
 import fs from 'fs';
+import crypto from 'node:crypto';
 import http from 'http';
 import net from 'net';
+import { sha256RawBodyHash } from '../../../Agent/lib/requestHash.mjs';
+import { deriveAgentRequestSecret } from '../../utils/security/masterKey.js';
+import { deriveAgentPrincipalId } from '../../utils/security/agentIdentity.js';
+import { resolveAgentReadinessPort } from '../../utils/runtime/startupReadiness.js';
 import { ROUTING_FILE } from '../../utils/config.js';
+import { createRelayHttpAgent, RelayDuplex } from '../proxy/executeHttpPlan.js';
+import { compileProxyLimits } from '../proxy/limits.js';
+import { RuntimeRelayManager } from '../runtimeRelay/RuntimeRelayManager.js';
+import { RelayRequestMinter } from '../runtimeRelay/relayRequestMinter.js';
 
 function readRouting() {
     try {
@@ -21,6 +30,65 @@ function resolvePort(value) {
 
 function wait(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+export function buildRelayReadinessRoute({
+    route = {},
+    manifest = {},
+    runtimeResult = {},
+    networkMode = '',
+    generationDigest = '',
+} = {}) {
+    const port = resolveAgentReadinessPort(manifest);
+    if (!port) return route;
+    const record = runtimeResult?.registryRecord || {};
+    const runtime = String(record.runtime || '').trim();
+    const containerId = String(runtimeResult?.containerId || record.containerId || '').trim().toLowerCase();
+    const containerName = String(runtimeResult?.containerName || route?.container || '').trim();
+    const effectiveInstanceId = String(record.instanceId || '').trim();
+    const enableGeneration = String(record.enableGeneration || '').trim();
+    const repoName = String(record.repoName || '').trim();
+    const agentName = String(record.agentName || '').trim();
+    if (!['docker', 'podman'].includes(runtime)
+        || !/^[a-f0-9]{64}$/.test(containerId)
+        || !containerName
+        || !effectiveInstanceId
+        || !enableGeneration
+        || !repoName
+        || !agentName) {
+        return route;
+    }
+    const targetAgentId = deriveAgentPrincipalId(repoName, agentName);
+    const digest = String(generationDigest || '').trim() || crypto.createHash('sha256')
+        .update(JSON.stringify([
+            targetAgentId,
+            effectiveInstanceId,
+            enableGeneration,
+            containerId,
+            port,
+        ]))
+        .digest('hex');
+    const hostNetwork = String(networkMode || '').trim().toLowerCase() === 'host';
+    return {
+        ...route,
+        relay: {
+            kind: 'container-exec-stdio',
+            runtime,
+            containerId,
+            containerName,
+            targetAgentId,
+            effectiveInstanceId,
+            enableGeneration,
+            networkMode: hostNetwork ? 'host' : '',
+        },
+        owner: {
+            effectiveInstanceId,
+            enableGeneration,
+        },
+        primaryService: { port },
+        deniedPorts: hostNetwork ? [8080, 8081] : [],
+        generationDigest: digest,
+    };
 }
 
 function probeLocalPort(port, timeoutMs = 250) {
@@ -197,6 +265,130 @@ export function resolveAgentPort(agentOrRoute) {
     return null;
 }
 
+function resolveRelayReadinessRoute(agentOrRoute) {
+    const route = typeof agentOrRoute === 'string'
+        ? resolveAgentRoute(agentOrRoute)
+        : agentOrRoute;
+    if (!route?.relay
+        || !route?.owner?.effectiveInstanceId
+        || !route?.owner?.enableGeneration
+        || !Number.isInteger(route?.primaryService?.port)
+        || !String(route?.generationDigest || '')) {
+        return null;
+    }
+    return route;
+}
+
+function relayReadinessPlan(route, protocol) {
+    return Object.freeze({
+        relay: route.relay,
+        owner: Object.freeze({
+            effectiveInstanceId: route.owner.effectiveInstanceId,
+            enableGeneration: route.owner.enableGeneration,
+        }),
+        deniedPorts: Object.freeze([...(route.deniedPorts || [])]),
+        generationDigest: route.generationDigest,
+        limits: compileProxyLimits(),
+        method: protocol === 'tcp' ? 'GET' : 'POST',
+        port: route.primaryService.port,
+        targetPath: protocol === 'tcp' ? '/' : '/mcp',
+        query: '',
+        transport: 'http',
+    });
+}
+
+async function probeRelay(route, protocol, timeoutMs) {
+    const plan = relayReadinessPlan(route, protocol);
+    const minter = new RelayRequestMinter({ resolveAgentSecret: deriveAgentRequestSecret });
+    const manager = new RuntimeRelayManager({ minter, limits: plan.limits });
+    const lease = { commit: () => true, release() {} };
+    const channel = await manager.checkout({ plan, lease, authorized: true });
+    let relayAgent;
+    try {
+        if (protocol === 'tcp') {
+            const stream = await channel.openRequest({
+                plan,
+                bodyMode: 'none',
+                bodyHash: sha256RawBodyHash(),
+                headers: {},
+            });
+            await new Promise((resolve, reject) => {
+                const timer = setTimeout(
+                    () => reject(new Error('readiness connect timeout')),
+                    timeoutMs,
+                );
+                timer.unref?.();
+                stream.once('ready', () => {
+                    clearTimeout(timer);
+                    resolve();
+                });
+                stream.once('error', error => {
+                    clearTimeout(timer);
+                    reject(error);
+                });
+            });
+            stream.cancel();
+            return true;
+        }
+        const body = Buffer.from(JSON.stringify({
+            jsonrpc: '2.0',
+            id: 'agent-readiness',
+            method: 'initialize',
+            params: {
+                protocolVersion: '2025-06-18',
+                capabilities: {},
+                clientInfo: {
+                    name: 'ploinky-readiness',
+                    version: '1.0.0',
+                },
+            },
+        }));
+        const stream = await channel.openRequest({
+            plan,
+            bodyMode: 'buffered',
+            bodyHash: sha256RawBodyHash(body),
+            headers: {},
+        });
+        const connection = new RelayDuplex(stream);
+        relayAgent = createRelayHttpAgent(connection);
+        return await new Promise((resolve) => {
+            const request = http.request({
+                method: 'POST',
+                path: '/mcp',
+                headers: {
+                    'content-type': 'application/json',
+                    accept: 'application/json, text/event-stream',
+                    'content-length': String(body.length),
+                    host: `127.0.0.1:${plan.port}`,
+                },
+                agent: relayAgent,
+            }, response => {
+                const chunks = [];
+                response.on('data', chunk => chunks.push(chunk));
+                response.on('end', () => {
+                    if ((response.statusCode || 0) < 200 || (response.statusCode || 0) >= 300) {
+                        resolve(false);
+                        return;
+                    }
+                    try {
+                        const parsed = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+                        resolve(parsed?.jsonrpc === '2.0' && Boolean(parsed?.result?.protocolVersion));
+                    } catch (_) {
+                        resolve(false);
+                    }
+                });
+            });
+            request.setTimeout(timeoutMs, () => request.destroy());
+            request.on('error', () => resolve(false));
+            request.end(body);
+        });
+    } finally {
+        relayAgent?.destroy();
+        channel.close();
+        manager.close();
+    }
+}
+
 export async function waitForAgentReady(agentOrRoute, {
     timeoutMs = 5000,
     intervalMs = 125,
@@ -204,18 +396,49 @@ export async function waitForAgentReady(agentOrRoute, {
     protocol = 'mcp',
     onProgress = null,
     beforeProbe = null,
+    relayProbe = probeRelay,
 } = {}) {
+    const relayRoute = resolveRelayReadinessRoute(agentOrRoute);
     const port = resolveAgentPort(agentOrRoute);
-    if (!port) {
+    if (!relayRoute && !port) {
         return false;
     }
     const deadline = Date.now() + Math.max(0, timeoutMs);
     const normalizedProtocol = String(protocol || 'mcp').trim().toLowerCase();
+    if (!['tcp', 'mcp'].includes(normalizedProtocol)) return false;
     const startedAt = Date.now();
     let attempt = 0;
     while (true) {
         attempt += 1;
         if (beforeProbe && beforeProbe() !== true) return false;
+        if (relayRoute) {
+            let ready = false;
+            let lastError = '';
+            try {
+                ready = await relayProbe(
+                    relayRoute,
+                    normalizedProtocol,
+                    Math.max(500, probeTimeoutMs),
+                );
+            } catch (error) {
+                lastError = error?.code || error?.message || 'error';
+            }
+            onProgress?.({
+                port: relayRoute.primaryService.port,
+                protocol: normalizedProtocol,
+                elapsedMs: Date.now() - startedAt,
+                timeoutMs,
+                attempt,
+                portOpen: ready,
+                ready,
+                stage: ready ? 'ready' : 'waiting_for_relay',
+                lastError,
+            });
+            if (ready) return true;
+            if (Date.now() >= deadline) return false;
+            await wait(intervalMs);
+            continue;
+        }
         const portProbe = await probeLocalPortDetailed(port, probeTimeoutMs);
         if (portProbe.ok) {
             if (normalizedProtocol === 'tcp') {

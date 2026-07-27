@@ -8,7 +8,7 @@ import {
 import {
     loadRoutingConfig,
     readEnabledAgentManifest,
-} from '../../httpServiceRoutes.js';
+} from '../../routingState.js';
 import {
     invokeAuthenticatedAgentTool,
     readAuthenticatedAgentTask,

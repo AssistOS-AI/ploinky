@@ -20,14 +20,14 @@ import {
     resolveRouteDefaultHttpAccess,
 } from './authHandlers/index.js';
 import {
+    buildHttpRouteAuthInfoHeader,
+    buildHttpRouteRateSourceHeader,
     buildTrustedForwardingHeaders,
     loadApiRoutes,
     handleRouterMcp,
-    handleHttpServiceRoute,
     proxyHttpPassthrough
 } from './routerHandlers.js';
-import { collectHttpServiceRoutes } from './httpServiceRoutes.js';
-import { handleHttpServiceUpgrade } from './wsServiceProxy.js';
+import { createCapturingRes, handleAgentRootUpgrade } from './wsAgentRootProxy.js';
 import {
     commitRoutePlan,
     normalizeExactHost,
@@ -39,10 +39,13 @@ import {
     readPrivateRequestBody,
     sendPrivateError,
 } from './privateRouter.js';
-import { handleEdgeTopologyProjection } from './edgeTopologyRoute.js';
 import { createListenerInterfaceClassifier } from './listenerInterfaceClassifier.js';
 import { createPrivateListenerSet } from './privateListenerSet.js';
 import { verifyBrowserMutationRequest } from './browserMutationSecurity.js';
+import { executeHttpPlan } from './proxy/executeHttpPlan.js';
+import { executeWebSocketPlan } from './proxy/executeWebSocketPlan.js';
+import { RuntimeRelayManager } from './runtimeRelay/RuntimeRelayManager.js';
+import { RelayRequestMinter } from './runtimeRelay/relayRequestMinter.js';
 import {
     requireAdminControlRequest,
     usesAdminControlMutationGuard,
@@ -63,7 +66,7 @@ import {
 import { initializeTTYFactories, createServiceConfig } from './utils/ttyFactories.js';
 import { setupProcessLifecycle } from './utils/processLifecycle.js';
 import { policy } from './policy/index.js';
-import { createHttpServiceProvider, createManifestRouteProvider } from './policy/HttpRouteProviders.js';
+import { createManifestRouteProvider } from './policy/HttpRouteProviders.js';
 import { hasInternalAgentSegment } from './internalAgentPath.js';
 import {
     USER_IDENTITY_KEY_PATH,
@@ -78,6 +81,7 @@ import {
     handleDelegatedAgentOpenAiCall,
 } from './agentOpenAiDelegation.js';
 import { PLOINKY_DIR } from '../utils/config.js';
+import { deriveAgentRequestSecret } from '../utils/security/masterKey.js';
 import { startCloudflarePublicationRuntime } from '../sandbox/cloudflarePublicationRuntime.js';
 import { requestAgentCard } from './agentCardFanout.js';
 import { isInsideBox } from '../../ploinky-box/lib/boxMarker.mjs';
@@ -87,6 +91,9 @@ const __dirname = path.dirname(__filename);
 const MCP_BROWSER_CLIENT_PATH = path.resolve(__dirname, '../../Agent/client/MCPBrowserClient.js');
 const port = 8080;
 const privatePort = 8081;
+const runtimeRelayManager = new RuntimeRelayManager({
+    minter: new RelayRequestMinter({ resolveAgentSecret: deriveAgentRequestSecret }),
+});
 const detailedHealthSocket = process.env.PLOINKY_ROUTER_HEALTH_SOCKET
     || path.join(PLOINKY_DIR, 'run', 'router-health.sock');
 const interfaceClassifier = createListenerInterfaceClassifier();
@@ -201,7 +208,6 @@ function isRouterOwnedPath(pathname) {
         || pathname === '/api/marketplace'
         || pathname.startsWith('/api/marketplace/')
         || pathname.startsWith('/api/router/')
-        || pathname === '/api/edge/topology'
         // Internal, non-policy-routable router-owned routes (DS014).
         || pathname === '/policy/command'
         || pathname === '/metrics'
@@ -362,8 +368,8 @@ async function processRequest(req, res) {
         agentProxyPath,
         req,
     });
-    const serviceDefinition = routePlan.ok && routePlan.kind === 'service' ? routePlan.definition : null;
-    const httpRouteAccess = routePlan.ok && (agentName && !isAgentMcpRoute || serviceDefinition)
+    const httpRouteAccess = routePlan.ok && (agentName && !isAgentMcpRoute
+        || routePlan.kind === 'agent-port')
         ? routePlan.decision
         : null;
     const isDelegatedAgentTaskStatusRoute = Boolean(
@@ -388,8 +394,8 @@ async function processRequest(req, res) {
     // DS014: any `__agent` segment is a router-owned agent control-plane path
     // (e.g. the share authorizer). The router reaches those itself over a direct
     // loopback call carrying a minted Router Request — the PUBLIC listener never
-    // serves them. Refuse here, before any auth, http-service route, or
-    // passthrough handling can forward one to an agent. Generic 404 so the reply
+    // serves them. Refuse here before passthrough handling can forward one to an
+    // agent. Generic 404 so the reply
     // does not confirm the internal route exists.
     if (hasInternalAgentSegment(pathname)) {
         sendJsonResponse(res, 404, { error: 'not_found' });
@@ -475,7 +481,7 @@ async function processRequest(req, res) {
         // Agent Assertion against the buffered body and mints a router-request
         // token. Skip browser/session auth for this path-exact bypass only.
     } else if (httpRouteAccess) {
-        // One executor for transparent agent routes and declared HTTP services.
+        // One authorization path for transparent agent routes and agent-port relays.
         const accessResult = await ensureHttpRouteAccess(req, res, parsedUrl, httpRouteAccess, { routePlan });
         if (!accessResult.ok) return;
     } else {
@@ -564,16 +570,36 @@ async function processRequest(req, res) {
         }
     }
 
+    if (routePlan.ok && routePlan.kind === 'agent-port') {
+        return executeHttpPlan({
+            req,
+            res,
+            plan: routePlan,
+            lease: routePlan.lease,
+            relayManager: runtimeRelayManager,
+            authorized: true,
+            trustedHeadersFactory: ({ bodyHash }) => ({
+                ...(req.user?.id ? { userId: req.user.id } : {}),
+                authInfo: buildHttpRouteAuthInfoHeader(
+                    req,
+                    routePlan.parsedUrl,
+                    routePlan.authDefinition,
+                    {
+                        bodyHash,
+                        routePath: routePlan.unmatchedSuffix,
+                    },
+                )['x-ploinky-auth-info'],
+                applicationHeaders: buildHttpRouteRateSourceHeader(req, routePlan),
+            }),
+            auditSink: event => appendLog(event.event, event),
+        });
+    }
+
     // Router-owned: mint a router-signed user identity key. Reached only after
     // the auth gate above populated req.user (the handler enforces its own 401
     // for any unauthenticated caller and derives admin status internally).
     if (pathname === USER_IDENTITY_KEY_PATH) {
         const handled = await handleUserIdentityKeyRoute(req, res, parsedUrl);
-        if (handled) return;
-    }
-
-    if (pathname === '/api/edge/topology') {
-        const handled = handleEdgeTopologyProjection(req, res, parsedUrl, { routePlan });
         if (handled) return;
     }
 
@@ -589,8 +615,6 @@ async function processRequest(req, res) {
     } else if (isRouteMount(pathname, '/blobs')) {
         return handleBlobs(req, res);
     } else if (staticSrv.serveWorkspaceFileRequest(req, res)) {
-        return;
-    } else if (handleHttpServiceRoute(req, res, parsedUrl, routePlan)) {
         return;
     } else if (routedAggregateAgentCard) {
         return handleRoutedAggregateAgentCard(req, res, routePlan);
@@ -615,8 +639,7 @@ async function processRequest(req, res) {
             });
         }
         // `__agent` control-plane paths are already refused at the top of the
-        // dispatch (before http-service/passthrough handling), so anything that
-        // reaches here is a normal agent request.
+        // dispatch, so anything that reaches here is a normal agent request.
         if (await staticSrv.serveAgentStaticRequest(req, res, {
             routeKey: agentName,
             hostPath: route.hostPath,
@@ -730,9 +753,20 @@ async function processPrivateRequest(req, res) {
         return;
     }
     req.edgeBufferedBody = body;
-    if (!handleHttpServiceRoute(req, res, routePlan.parsedUrl, routePlan)) {
-        sendJsonResponse(res, 404, { error: 'private_route_not_found' }, { 'Cache-Control': 'no-store' });
+    if (routePlan.kind === 'agent-port') {
+        await executeHttpPlan({
+            req,
+            res,
+            plan: routePlan,
+            lease: routePlan.lease,
+            relayManager: runtimeRelayManager,
+            authorized: true,
+            prebufferedBody: body,
+            auditSink: event => appendLog(event.event, event),
+        });
+        return;
     }
+    sendJsonResponse(res, 404, { error: 'private_route_not_found' }, { 'Cache-Control': 'no-store' });
 }
 
 function detailedHealthData() {
@@ -809,13 +843,56 @@ server.on('upgrade', async (req, socket, head) => {
             ? 'managed'
             : 'public';
         req.ploinkyListenerClass = listener;
-        const routePlan = resolveEdgeRoutePlan({ req, parsedUrl, listener });
-        if (!routePlan.ok || !['service', 'agent-root'].includes(routePlan.kind)) {
+        const routePlan = resolveEdgeRoutePlan({
+            req,
+            parsedUrl,
+            listener,
+            transport: 'websocket',
+        });
+        if (!routePlan.ok || !['agent-root', 'agent-port'].includes(routePlan.kind)) {
             socket.write(`HTTP/1.1 ${routePlan.status || 404} Not Found\r\n\r\n`);
             socket.destroy();
             return;
         }
-        const handled = await handleHttpServiceUpgrade({ req, socket, head, parsedUrl: routePlan.parsedUrl, routePlan });
+        if (routePlan.kind === 'agent-port') {
+            const captured = createCapturingRes();
+            const access = await ensureHttpRouteAccess(
+                req,
+                captured,
+                routePlan.parsedUrl,
+                routePlan.decision,
+                { routePlan },
+            );
+            if (!access?.ok) {
+                socket.write(`HTTP/1.1 ${captured.statusCode || 403} Forbidden\r\n\r\n`);
+                socket.destroy();
+                return;
+            }
+            await executeWebSocketPlan({
+                req,
+                socket,
+                head,
+                plan: routePlan,
+                lease: routePlan.lease,
+                relayManager: runtimeRelayManager,
+                authorized: true,
+                trustedHeaders: {
+                    ...(req.user?.id ? { userId: req.user.id } : {}),
+                    authInfo: buildHttpRouteAuthInfoHeader(
+                        req,
+                        routePlan.parsedUrl,
+                        routePlan.authDefinition,
+                        {
+                            routePath: routePlan.unmatchedSuffix,
+                        },
+                    )['x-ploinky-auth-info'],
+                    applicationHeaders: buildHttpRouteRateSourceHeader(req, routePlan),
+                },
+                auditSink: event => appendLog(event.event, event),
+            });
+            return;
+        }
+        const handled = await handleAgentRootUpgrade({ req, socket, head, parsedUrl: routePlan.parsedUrl, routePlan });
         if (!handled) { socket.write('HTTP/1.1 404 Not Found\r\n\r\n'); socket.destroy(); }
     } catch (_) {
         try { socket.destroy(); } catch (_) {}
@@ -832,17 +909,18 @@ privateServer.on('upgrade', async (req, socket, head) => {
         if (!exactHost || !String(req.url || '').startsWith('/')) throw new Error('malformed request');
         const parsedUrl = new URL(req.url, `http://${exactHost === '::1' ? '[::1]' : exactHost}`);
         const routePlan = resolveEdgeRoutePlan({ req, parsedUrl, listener: 'private' });
-        if (!routePlan.ok || routePlan.kind !== 'service') throw new Error('private route denied');
+        if (!routePlan.ok || routePlan.kind !== 'agent-port') throw new Error('private route denied');
         authorizePrivateRoutePlan({ req, plan: routePlan, body: Buffer.alloc(0) });
-        const handled = await handleHttpServiceUpgrade({
+        await executeWebSocketPlan({
             req,
             socket,
             head,
-            parsedUrl: routePlan.parsedUrl,
-            listener: 'private',
-            routePlan,
+            plan: routePlan,
+            lease: routePlan.lease,
+            relayManager: runtimeRelayManager,
+            authorized: true,
+            auditSink: event => appendLog(event.event, event),
         });
-        if (!handled) throw new Error('private route not found');
     } catch (_) {
         try { socket.write('HTTP/1.1 403 Forbidden\r\n\r\n'); } catch (_) {}
         try { socket.destroy(); } catch (_) {}
@@ -869,6 +947,7 @@ const lifecycle = setupProcessLifecycle(
     agentSessionStore,
     {
         beforeClose: [async () => {
+            runtimeRelayManager.close();
             await privateListenerSet.close();
             const runtime = cloudflarePublicationRuntime;
             cloudflarePublicationRuntime = null;
@@ -959,7 +1038,7 @@ server.listen(port, '0.0.0.0', () => {
     console.log('  Status:          /status');
     console.log('  Health:          /health');
     console.log('  Agent routes:    /<agent>/{mcp,task,agent-card,v1/models,v1/chat/completions}');
-    console.log('  Service hosts:   http://<service>.localhost/');
+    console.log('  Agent ports:     /base-agent-additional-server/<agent>/<port>/');
     console.log('  Aggregate cards: /agent-card');
     appendLog('server_start', { port });
     logBootEvent('server_listening', { port });
@@ -978,7 +1057,6 @@ server.listen(port, '0.0.0.0', () => {
     try {
         policy.httpRouteAccessPolicy.bindProviders({
             manifestRouteProvider: createManifestRouteProvider(() => loadApiRoutes()),
-            httpServiceProvider: createHttpServiceProvider(() => collectHttpServiceRoutes()),
             routeDefaultProvider: ({ routeKey }) => resolveRouteDefaultHttpAccess(routeKey),
         });
         appendLog('http_route_access_providers_bound', {});

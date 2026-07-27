@@ -2,7 +2,7 @@ import { createMemoryReplayCache } from './jwtVerify.mjs';
 import { verifyRouterRequestToken } from './requestSignedTokens.mjs';
 import { computeRchHttp, sha256RawBodyHash } from './requestHash.mjs';
 
-const httpServiceReplayCache = createMemoryReplayCache({ maxSize: 4096 });
+const httpRouteReplayCache = createMemoryReplayCache({ maxSize: 4096 });
 const openAiServiceReplayCache = createMemoryReplayCache({ maxSize: 4096 });
 const openAiModelsReplayCache = createMemoryReplayCache({ maxSize: 4096 });
 
@@ -51,9 +51,9 @@ export function readAgentSecret(env = process.env) {
     return hex ? Buffer.from(hex, 'hex') : null;
 }
 
-export const hashHttpServiceBody = sha256RawBodyHash;
+export const hashHttpRouteBody = sha256RawBodyHash;
 
-export function parseHttpServiceAuthInfo(headers = {}) {
+export function parseHttpRouteAuthInfo(headers = {}) {
     const raw = readHeaderValue(headers, 'x-ploinky-auth-info');
     if (!raw) {
         return { ok: false, reason: 'missing x-ploinky-auth-info header' };
@@ -114,11 +114,11 @@ export function verifyRouterRequestFromHeaders(headers = {}, {
     }
 }
 
-// Verify the protected/guest HTTP-service auth-info carrier. The router places a
+// Verify the protected/guest HTTP-route auth-info carrier. The router places a
 // Router Request token inside `x-ploinky-auth-info`; the receiver must compare
 // the signed invocation body to the actual HTTP surface and body bytes before
 // trusting the forwarded identity.
-export function verifyHttpServiceAuthInfoFromHeaders(headers = {}, {
+export function verifyHttpRouteAuthInfoFromHeaders(headers = {}, {
     env = process.env,
     replayCache,
     method,
@@ -127,7 +127,7 @@ export function verifyHttpServiceAuthInfoFromHeaders(headers = {}, {
     body = Buffer.alloc(0),
     bodyHash,
 } = {}) {
-    const parsed = parseHttpServiceAuthInfo(headers);
+    const parsed = parseHttpRouteAuthInfo(headers);
     if (!parsed.ok) {
         return parsed;
     }
@@ -135,20 +135,20 @@ export function verifyHttpServiceAuthInfoFromHeaders(headers = {}, {
     const authInfo = parsed.authInfo;
     const rawToken = typeof authInfo.invocationToken === 'string' ? authInfo.invocationToken.trim() : '';
     if (!rawToken) {
-        return { ok: false, reason: 'missing HTTP service invocation token' };
+        return { ok: false, reason: 'missing HTTP route invocation token' };
     }
     const invocationBody = authInfo.invocationBody;
     if (!invocationBody || typeof invocationBody !== 'object' || Array.isArray(invocationBody)) {
-        return { ok: false, reason: 'missing HTTP service invocation body' };
+        return { ok: false, reason: 'missing HTTP route invocation body' };
     }
 
     const expectedMethod = String(method || '').toUpperCase();
     if (!expectedMethod) {
-        return { ok: false, reason: 'missing HTTP service method' };
+        return { ok: false, reason: 'missing HTTP route method' };
     }
     const expectedPath = String(path || '');
     if (!expectedPath) {
-        return { ok: false, reason: 'missing HTTP service path' };
+        return { ok: false, reason: 'missing HTTP route path' };
     }
     const expectedQuery = query === undefined || query === null ? '' : String(query);
     const expectedBodyHash = bodyHash === undefined || bodyHash === null
@@ -156,29 +156,29 @@ export function verifyHttpServiceAuthInfoFromHeaders(headers = {}, {
         : String(bodyHash);
 
     if (String(invocationBody.method || '').toUpperCase() !== expectedMethod) {
-        return { ok: false, reason: 'HTTP service method mismatch' };
+        return { ok: false, reason: 'HTTP route method mismatch' };
     }
     if (!String(invocationBody.path || '')) {
-        return { ok: false, reason: 'missing HTTP service signed path' };
+        return { ok: false, reason: 'missing HTTP route signed path' };
     }
     if (String(invocationBody.path || '') !== expectedPath) {
-        return { ok: false, reason: 'HTTP service path mismatch' };
+        return { ok: false, reason: 'HTTP route path mismatch' };
     }
     if (String(invocationBody.search ?? '') !== expectedQuery) {
-        return { ok: false, reason: 'HTTP service query mismatch' };
+        return { ok: false, reason: 'HTTP route query mismatch' };
     }
     if (String(invocationBody.bodyHash || '') !== expectedBodyHash) {
-        return { ok: false, reason: 'HTTP service body hash mismatch' };
+        return { ok: false, reason: 'HTTP route body hash mismatch' };
     }
 
     const verified = verifyRouterRequestFromHeaders(
         { authorization: `Bearer ${rawToken}` },
         {
             env,
-            replayCache: replayCache || httpServiceReplayCache,
+            replayCache: replayCache || httpRouteReplayCache,
             method: expectedMethod,
             path: expectedPath,
-            tool: '__http_service__',
+            tool: '__http_route__',
             rch: computeRchHttp({
                 method: expectedMethod,
                 path: expectedPath,
@@ -200,10 +200,10 @@ export function verifyHttpServiceAuthInfoFromHeaders(headers = {}, {
 
 // Verify the router-minted Router Request token for an agent-to-agent OpenAI
 // chat-completions call. The router places the token inside `x-ploinky-auth-info`
-// (an `{ invocationToken, invocationBody }` envelope, like the HTTP-service flow)
+// (an `{ invocationToken, invocationBody }` envelope, like the HTTP-route flow)
 // and the receiving agent rebinds it to the EXACT raw request body bytes it
 // received. The signed surface is the fixed OpenAI tool/path, so a token minted
-// for any other surface (a different path, the `__http_service__` tool, an MCP
+// for any other surface (a different path, the `__http_route__` tool, an MCP
 // call) is rejected even when its HMAC is valid.
 export function verifyOpenAiServiceAuthInfoFromHeaders(headers = {}, {
     env = process.env,
@@ -211,7 +211,7 @@ export function verifyOpenAiServiceAuthInfoFromHeaders(headers = {}, {
     body = Buffer.alloc(0),
     bodyHash,
 } = {}) {
-    const parsed = parseHttpServiceAuthInfo(headers);
+    const parsed = parseHttpRouteAuthInfo(headers);
     if (!parsed.ok) {
         return parsed;
     }
@@ -262,7 +262,7 @@ export function verifyOpenAiModelsAuthInfoFromHeaders(headers = {}, {
     env = process.env,
     replayCache,
 } = {}) {
-    const parsed = parseHttpServiceAuthInfo(headers);
+    const parsed = parseHttpRouteAuthInfo(headers);
     if (!parsed.ok) {
         return parsed;
     }
@@ -310,9 +310,9 @@ export default {
     expectedAudienceForSelf,
     readAgentSecret,
     sha256RawBodyHash,
-    hashHttpServiceBody,
-    parseHttpServiceAuthInfo,
-    verifyHttpServiceAuthInfoFromHeaders,
+    hashHttpRouteBody,
+    parseHttpRouteAuthInfo,
+    verifyHttpRouteAuthInfoFromHeaders,
     verifyOpenAiServiceAuthInfoFromHeaders,
     verifyOpenAiModelsAuthInfoFromHeaders,
     verifyRouterRequestFromHeaders,

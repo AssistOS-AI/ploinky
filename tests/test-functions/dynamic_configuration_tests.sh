@@ -1,10 +1,21 @@
+delete_matching_lines() {
+  local file="$1"
+  local expression="$2"
+  local backup="${file}.bak"
+
+  rm -f "$backup"
+  if ! sed -i.bak "$expression" "$file"; then
+    rm -f "$backup"
+    return 1
+  fi
+  rm -f "$backup"
+}
+
 fast_test_dynamic_app_name() {
   load_state
   require_var "TEST_RUN_DIR" || return 1
-  require_var "TEST_ROUTER_PORT" || return 1
   
   local secrets_file="$TEST_RUN_DIR/.ploinky/.secrets"
-  local router_port="$TEST_ROUTER_PORT"
   
   # Save original APP_NAME if exists
   local original_app_name=""
@@ -13,7 +24,7 @@ fast_test_dynamic_app_name() {
   fi
   
   # Test 1: Server responds before config change
-  if ! curl -fsS "http://127.0.0.1:${router_port}/status/data" >/dev/null 2>&1; then
+  if ! assert_router_status_ok; then
     echo "Server not responding before config change" >&2
     return 1
   fi
@@ -26,11 +37,10 @@ fast_test_dynamic_app_name() {
   sleep 0.5
   
   # Test 3: Server still responds after config change (proves no crash)
-  local response
-  if ! response=$(curl -fsS "http://127.0.0.1:${router_port}/status/data" 2>&1); then
-    echo "Server not responding after APP_NAME change: ${response}" >&2
+  if ! assert_router_status_ok; then
+    echo "Server not responding after APP_NAME change" >&2
     # Restore original
-    sed -i "/^APP_NAME=/d" "$secrets_file"
+    delete_matching_lines "$secrets_file" "/^APP_NAME=/d"
     if [[ -n "$original_app_name" ]]; then
       echo "APP_NAME=${original_app_name}" >> "$secrets_file"
     fi
@@ -39,16 +49,16 @@ fast_test_dynamic_app_name() {
   
   # Test 4: Change APP_NAME again to different value
   local test_app_name2="DynamicTestApp2_$$"
-  sed -i "/^APP_NAME=/d" "$secrets_file"
+  delete_matching_lines "$secrets_file" "/^APP_NAME=/d"
   echo "APP_NAME=${test_app_name2}" >> "$secrets_file"
   
   sleep 0.5
   
   # Test 5: Server still responds after second change
-  if ! curl -fsS "http://127.0.0.1:${router_port}/status/data" >/dev/null 2>&1; then
+  if ! assert_router_status_ok; then
     echo "Server not responding after second APP_NAME change" >&2
     # Restore original
-    sed -i "/^APP_NAME=/d" "$secrets_file"
+    delete_matching_lines "$secrets_file" "/^APP_NAME=/d"
     if [[ -n "$original_app_name" ]]; then
       echo "APP_NAME=${original_app_name}" >> "$secrets_file"
     fi
@@ -56,7 +66,7 @@ fast_test_dynamic_app_name() {
   fi
   
   # Restore original APP_NAME
-  sed -i "/^APP_NAME=/d" "$secrets_file"
+  delete_matching_lines "$secrets_file" "/^APP_NAME=/d"
   if [[ -n "$original_app_name" ]]; then
     echo "APP_NAME=${original_app_name}" >> "$secrets_file"
   fi
@@ -67,7 +77,6 @@ fast_test_dynamic_app_name() {
 fast_test_sso_client_secret_propagation() {
   load_state
   require_var "TEST_RUN_DIR" || return 1
-  require_var "TEST_ROUTER_PORT" || return 1
   
   local secrets_file="$TEST_RUN_DIR/.ploinky/.secrets"
   
@@ -91,10 +100,10 @@ fast_test_sso_client_secret_propagation() {
   fi
   
   # Set test SSO config
-  sed -i "/^SSO_BASE_URL=/d" "$secrets_file"
-  sed -i "/^SSO_REALM=/d" "$secrets_file"
-  sed -i "/^SSO_CLIENT_ID=/d" "$secrets_file"
-  sed -i "/^SSO_CLIENT_SECRET=/d" "$secrets_file"
+  delete_matching_lines "$secrets_file" "/^SSO_BASE_URL=/d"
+  delete_matching_lines "$secrets_file" "/^SSO_REALM=/d"
+  delete_matching_lines "$secrets_file" "/^SSO_CLIENT_ID=/d"
+  delete_matching_lines "$secrets_file" "/^SSO_CLIENT_SECRET=/d"
   
   echo "SSO_BASE_URL=https://test-sso.example.com" >> "$secrets_file"
   echo "SSO_REALM=test-realm" >> "$secrets_file"
@@ -105,10 +114,11 @@ fast_test_sso_client_secret_propagation() {
   
   # Test that server still responds (config was read)
   local response
-  if ! response=$(curl -fsS "http://127.0.0.1:${TEST_ROUTER_PORT}/status/data" 2>&1); then
+  if ! assert_router_status_ok; then
+    response="Router health check failed"
     echo "Server not responding after SSO config change: ${response}" >&2
     # Restore original
-    sed -i "/^SSO_/d" "$secrets_file"
+    delete_matching_lines "$secrets_file" "/^SSO_/d"
     [[ -n "$original_base_url" ]] && echo "SSO_BASE_URL=${original_base_url}" >> "$secrets_file"
     [[ -n "$original_realm" ]] && echo "SSO_REALM=${original_realm}" >> "$secrets_file"
     [[ -n "$original_client_id" ]] && echo "SSO_CLIENT_ID=${original_client_id}" >> "$secrets_file"
@@ -118,16 +128,16 @@ fast_test_sso_client_secret_propagation() {
   
   # Change ONLY the client secret (this was the bug!)
   local new_secret="test-secret-$RANDOM-changed"
-  sed -i "/^SSO_CLIENT_SECRET=/d" "$secrets_file"
+  delete_matching_lines "$secrets_file" "/^SSO_CLIENT_SECRET=/d"
   echo "SSO_CLIENT_SECRET=${new_secret}" >> "$secrets_file"
   
   sleep 0.5
   
   # Verify server still responds after changing ONLY client secret
-  if ! curl -fsS "http://127.0.0.1:${TEST_ROUTER_PORT}/status/data" >/dev/null 2>&1; then
+  if ! assert_router_status_ok; then
     echo "Server not responding after changing ONLY SSO_CLIENT_SECRET" >&2
     # Restore original
-    sed -i "/^SSO_/d" "$secrets_file"
+    delete_matching_lines "$secrets_file" "/^SSO_/d"
     [[ -n "$original_base_url" ]] && echo "SSO_BASE_URL=${original_base_url}" >> "$secrets_file"
     [[ -n "$original_realm" ]] && echo "SSO_REALM=${original_realm}" >> "$secrets_file"
     [[ -n "$original_client_id" ]] && echo "SSO_CLIENT_ID=${original_client_id}" >> "$secrets_file"
@@ -136,7 +146,7 @@ fast_test_sso_client_secret_propagation() {
   fi
   
   # Restore original SSO config
-  sed -i "/^SSO_/d" "$secrets_file"
+  delete_matching_lines "$secrets_file" "/^SSO_/d"
   if [[ -n "$original_base_url" ]]; then
     echo "SSO_BASE_URL=${original_base_url}" >> "$secrets_file"
   fi

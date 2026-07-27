@@ -167,12 +167,13 @@ neither quick tunnels nor tunnels. Partial, invalid, or unauthorized
 configuration fails closed in the selected mode, and connector credentials stay
 out of argv, ordinary process environment, logs, status, and diagnostics.
 
-Graph ports stay private. `httpServices[].port` creates or reuses one private
-mapping per distinct explicit TCP target, while an omitted port preserves the
-owning agent's primary target. A bridged `openPorts` claim overlapping Router
-TCP `8080`/`8081` or reserved UDP `7882` is rejected. Redis, Postgres, Egress,
-OnlyOffice, Umami, health, storage, AgentServer, and other support listeners may
-exist inside private namespaces but never appear in outer PortBindings.
+Graph ports stay private. Additional HTTP listeners are reached only through
+`/base-agent-additional-server/<agent>/<port>/` and the confined runtime relay;
+they receive no host port mapping. A bridged `openPorts` claim overlapping
+Router TCP `8080`/`8081` or reserved UDP `7882` is rejected. Redis, Postgres,
+Egress, OnlyOffice, Umami, health, storage, AgentServer, and other support
+listeners may exist inside private namespaces but never appear in outer
+PortBindings.
 
 ## Source, dependencies, and isolation
 

@@ -42,8 +42,19 @@ test('applySlashSelectionToValue ignores slashes that are not at the start', () 
 
 test('slash provider loads MCP catalog with streamable HTTP headers and preserves slashes in arguments', async () => {
     const originalFetch = globalThis.fetch;
+    const originalLocation = globalThis.location;
     const requests = [];
     globalThis.fetch = async (url, options = {}) => {
+        const parsedUrl = new URL(url, 'http://localhost');
+        if (parsedUrl.pathname === '/auth/token') {
+            return Response.json({
+                browserMutation: {
+                    csrfToken: 'browser-proof',
+                    routeKey: 'achilles-cli',
+                    origin: 'http://localhost',
+                },
+            });
+        }
         const headers = new Headers(options.headers);
         const payload = JSON.parse(options.body || '{}');
         requests.push({ url, headers, payload });
@@ -93,12 +104,17 @@ test('slash provider loads MCP catalog with streamable HTTP headers and preserve
         }
         throw new Error(`Unexpected MCP method: ${payload.method}`);
     };
+    globalThis.location = new URL('http://localhost/');
 
     try {
-        const provider = createSlashCommandsProvider({ agentName: 'achilles-cli' });
+        const logs = [];
+        const provider = createSlashCommandsProvider({
+            agentName: 'achilles-cli',
+            dlog: (...args) => logs.push(args),
+        });
         await provider.refresh();
 
-        assert.ok(requests.length >= 4);
+        assert.ok(requests.length >= 4, JSON.stringify({ requests: requests.map(({ payload }) => payload.method), logs }));
         assert.ok(requests.every(({ headers }) =>
             headers.get('accept') === 'application/json, text/event-stream'
         ));
@@ -110,6 +126,8 @@ test('slash provider loads MCP catalog with streamable HTTP headers and preserve
         assert.deepEqual(provider.getSuggestions('text /model anthropic', 21), []);
     } finally {
         globalThis.fetch = originalFetch;
+        if (originalLocation === undefined) delete globalThis.location;
+        else globalThis.location = originalLocation;
     }
 });
 

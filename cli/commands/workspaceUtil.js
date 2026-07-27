@@ -62,10 +62,12 @@ import {
   removeInactiveManualRoutes,
   resolveManifestStartup,
 } from '../utils/runtime/manifestStartup.js';
-import { waitForAgentReady } from '../server/utils/agentReadiness.js';
+import {
+  buildRelayReadinessRoute,
+  waitForAgentReady,
+} from '../server/utils/agentReadiness.js';
 import { createNetworkLifecycleAdapter } from '../sandbox/networkLifecycle.js';
 import { networkContractHash } from '../sandbox/networkContract.js';
-import { explicitHttpServicePorts } from '../sandbox/httpServicePortConfig.js';
 import { getAgentDataDir } from '../utils/workspaceStructure.js';
 import {
   formatAgentAttachmentBanner,
@@ -564,22 +566,6 @@ function graphNodeRuntimeReplacementReason(plan, {
     }
   }
 
-  if (profileResolution.network.mode !== 'host' && profileResolution.network.mode !== 'none') {
-    const explicitPorts = explicitHttpServicePorts(node.manifest, {
-      label: `manifest(${node.repoName}/${node.shortAgentName})`,
-    });
-    if (explicitPorts.length) {
-      const mappings = resolvePublishedPortMappingsImpl(existing.key, record.config?.ports || []);
-      const missingTarget = explicitPorts.some((port) => !mappings.some((mapping) => (
-        Number(mapping?.containerPort) === port
-        && String(mapping?.protocol || 'tcp').toLowerCase() === 'tcp'
-        && String(mapping?.hostIp || '') === '127.0.0.1'
-        && Number(mapping?.hostPort || 0) > 0
-      )));
-      if (missingTarget) return 'serviceTargetMappingChanged';
-    }
-  }
-
   const inspection = createNetworkLifecycleAdapterImpl({ runtime }).inspectContainerContract(
     existing.key,
     profileResolution.network,
@@ -702,7 +688,7 @@ function ensureGraphNodesEnabled(graph, reg, {
   const changedContainers = changedPlans.map((plan) => plan.existing.key);
   // Every retained route must be target-less in the prelaunch generation,
   // including a healthy blocking runtime that can later be reused. Keeping a
-  // predecessor's resolved hostPort/serviceTargets here would make the topology
+  // predecessor's resolved hostPort here would make the topology
   // prepared for hooks only nominally reconciling rather than truly target-less.
   // Identity rotation and physical removal remain limited to changedPlans.
   const stagedPlans = existingPlans
@@ -749,7 +735,7 @@ function ensureGraphNodesEnabled(graph, reg, {
       repo: plan.node.repoName,
       agent: plan.node.shortAgentName,
       ...(nextRecord.alias ? { alias: nextRecord.alias } : {}),
-    }, { hostPort: null, serviceTargets: null });
+    }, { hostPort: null });
   }
 
   if (stagedPlans.length) {
@@ -932,14 +918,15 @@ function buildBlockingReadinessEntryFromNode(node, route, staticLabel) {
   if (entry.protocol === 'script' && !route?.container) {
     throw new Error(`${node.isStatic ? 'Static agent' : 'Dependent agent'} '${formatGraphNodeLabel(node, staticLabel)}' did not resolve its service container for script readiness.`);
   }
-  if (!route?.hostPort && entry.protocol !== 'none') {
+  const hasRelayTarget = Boolean(route?.relay && route?.primaryService?.port);
+  if (!route?.hostPort && !hasRelayTarget && entry.protocol !== 'none') {
     if (entry.protocol === 'script') {
       return entry;
     }
     if (resolveAgentExecutionMode(node.manifest).type === 'start_only') {
       throw new Error(
         `${node.isStatic ? 'Static agent' : 'Dependent agent'} '${formatGraphNodeLabel(node, staticLabel)}' is start-only but has no reachable readiness contract. `
-        + 'Declare health.readiness.script, an httpServices[].port target, or readiness.protocol none.'
+        + 'Declare readiness.port, health.readiness.script, or readiness.protocol none.'
       );
     }
     throw new Error(`${node.isStatic ? 'Static agent' : 'Dependent agent'} '${formatGraphNodeLabel(node, staticLabel)}' did not expose a host port.`);
@@ -956,6 +943,9 @@ function readinessKindLabel(entry) {
 function formatReadyProgress({ elapsedMs, timeoutMs, portOpen, protocol, stage, lastError }) {
   const elapsedSec = Math.floor(Math.max(0, elapsedMs) / 1000);
   const timeoutSec = Math.floor(Math.max(0, timeoutMs) / 1000);
+  if (stage === 'waiting_for_relay') {
+    return `still waiting (${elapsedSec}s/${timeoutSec}s): confined relay target not ready${lastError ? `, last probe=${lastError}` : ''}`;
+  }
   if (stage === 'waiting_for_port') {
     return `still waiting (${elapsedSec}s/${timeoutSec}s): port not open yet${lastError ? `, last probe=${lastError}` : ''}`;
   }
@@ -1144,14 +1134,8 @@ async function activatePreparedRuntimeAfterReadiness({
         agent: shortAgentName,
         ...(alias ? { alias } : {}),
         ...(result.hostPort ? { hostPort: result.hostPort } : {}),
-        ...(result.serviceTargets && Object.keys(result.serviceTargets).length
-          ? { serviceTargets: result.serviceTargets }
-          : {}),
       };
       if (!result.hostPort) delete cfg.routes[routeKey].hostPort;
-      if (!result.serviceTargets || !Object.keys(result.serviceTargets).length) {
-        delete cfg.routes[routeKey].serviceTargets;
-      }
       return cfg;
     }, {
       reason: 'runtime-replacement-ready',
@@ -1539,7 +1523,7 @@ async function startWorkspace(staticAgentArg, portArg, {
                 containerName: name,
               })
             : undefined;
-          const { containerName, hostPort, serviceTargets, registryRecord } = ensureAgentService(shortAgentName, manifest, agentPath, {
+          const runtimeResult = ensureAgentService(shortAgentName, manifest, agentPath, {
             containerName: name,
             alias: rec.alias,
             routerEndpoint,
@@ -1551,6 +1535,11 @@ async function startWorkspace(staticAgentArg, portArg, {
             preparationLease: workspacePreparationLease,
             preparedHostModeCapability,
           });
+          const {
+            containerName,
+            hostPort,
+            registryRecord,
+          } = runtimeResult;
           if (!registryRecord) {
             throw new Error(`runtime '${containerName}' returned no exact registry record`);
           }
@@ -1566,10 +1555,15 @@ async function startWorkspace(staticAgentArg, portArg, {
             agent: shortAgentName,
             ...(rec.alias ? { alias: rec.alias } : {}),
             ...(resolvedHostPort ? { hostPort: resolvedHostPort } : {}),
-            ...(serviceTargets && Object.keys(serviceTargets).length ? { serviceTargets } : {})
           };
           if (!resolvedHostPort) delete nextRoute.hostPort;
-          if (!serviceTargets || !Object.keys(serviceTargets).length) delete nextRoute.serviceTargets;
+          const readinessRoute = buildRelayReadinessRoute({
+            route: nextRoute,
+            manifest,
+            runtimeResult,
+            networkMode: launchProfile.network.mode,
+            generationDigest: workspacePreparationLease?.preparedGeneration || '',
+          });
           return {
             ok: true,
             containerName,
@@ -1577,6 +1571,7 @@ async function startWorkspace(staticAgentArg, portArg, {
             shortAgentName,
             routeKey,
             route: nextRoute,
+            readinessRoute,
             manifest,
           };
         } catch (agentErr) {
@@ -1663,9 +1658,9 @@ async function startWorkspace(staticAgentArg, portArg, {
 
       deferredNoWaitLaunches.push(...noWaitWaveNodes);
 
-      if (blockingNames.length) {
-        await updateRoutes(blockingNames);
-      }
+      const blockingLaunch = blockingNames.length
+        ? await updateRoutes(blockingNames)
+        : { routeResults: [] };
 
       if (!blockingNodes.length) continue;
 
@@ -1673,7 +1668,8 @@ async function startWorkspace(staticAgentArg, portArg, {
         const registryName = registryNameByNodeId.get(node.id);
         const registryRecord = registryName ? reg[registryName] : null;
         const routeKey = registryRecord?.alias || node.alias || node.shortAgentName;
-        const route = cfg.routes?.[routeKey] || null;
+        const launchResult = blockingLaunch.routeResults.find((result) => result.routeKey === routeKey);
+        const route = launchResult?.readinessRoute || cfg.routes?.[routeKey] || null;
         return buildBlockingReadinessEntryFromNode(node, route, staticAgent);
       });
 
@@ -1718,7 +1714,7 @@ async function startWorkspace(staticAgentArg, portArg, {
           shortAgentName: result.shortAgentName,
           isStatic: false,
           manifest: result.manifest,
-        }, result.route, result.shortAgentName));
+        }, result.readinessRoute || result.route, result.shortAgentName));
         await waitForReadinessEntries(extraReadiness);
       } else {
         throw new Error('additional runtime failure left edge selectors inactive; repair and run start again');
@@ -1901,32 +1897,38 @@ export async function runCliWithDependencies(agentName, args, dependencies) {
   const containerName = (containerInfo && containerInfo.containerName)
     || registryRecord?.containerName
     || getAgentContainerName(shortAgentName, repoName);
+  const cliReadinessRoute = buildRelayReadinessRoute({
+    route: {
+      container: containerName,
+      hostPort: containerInfo?.hostPort || 0,
+    },
+    manifest,
+    runtimeResult: containerInfo,
+    networkMode: routerEndpoint?.mode || '',
+    generationDigest: containerInfo?.preparationLease?.preparedGeneration || '',
+  });
   const readinessProtocol = resolveAgentReadinessProtocolImpl(manifest);
   if (readinessProtocol === 'script') {
     await waitForManifestReadinessImpl({
       key: `cli:${shortAgentName}`,
       label: shortAgentName,
       manifest,
-      route: {
-        container: containerName,
-        hostPort: containerInfo?.hostPort || 0,
-        ...(containerInfo?.serviceTargets ? { serviceTargets: containerInfo.serviceTargets } : {})
-      }
+      route: cliReadinessRoute,
     });
   } else if (readinessProtocol !== 'none') {
-    const hostPort = containerInfo?.hostPort;
-    if (!hostPort) {
+    const hasReadinessTarget = Boolean(cliReadinessRoute.hostPort || cliReadinessRoute.relay);
+    if (!hasReadinessTarget) {
       if (containerInfo?.requiresEdgeActivation) {
         throw new Error(`Agent '${shortAgentName}' replacement cannot activate without a resolved '${readinessProtocol}' readiness target.`);
       }
       if (!suppressLauncherLogs) {
-        warn(`[cli] warning: cannot wait for '${shortAgentName}' readiness because no host port was resolved.`);
+        warn(`[cli] warning: cannot wait for '${shortAgentName}' readiness because no host port or confined relay target was resolved.`);
       }
     } else {
       if (!suppressLauncherLogs) {
-        log(`[cli] Waiting for '${shortAgentName}' readiness (${readinessProtocol}) on port ${hostPort}...`);
+        log(`[cli] Waiting for '${shortAgentName}' readiness (${readinessProtocol})...`);
       }
-      const ready = await waitForAgentReadyImpl({ hostPort }, {
+      const ready = await waitForAgentReadyImpl(cliReadinessRoute, {
         timeoutMs: 600000,
         protocol: readinessProtocol,
       });
@@ -2034,16 +2036,22 @@ async function runShell(agentName) {
   });
   const containerName = (containerInfo && containerInfo.containerName)
     || registeredContainerName;
+  const shellReadinessRoute = buildRelayReadinessRoute({
+    route: {
+      container: containerName,
+      hostPort: containerInfo?.hostPort || 0,
+    },
+    manifest,
+    runtimeResult: containerInfo,
+    networkMode: routerEndpoint?.mode || '',
+    generationDigest: containerInfo?.preparationLease?.preparedGeneration || '',
+  });
   await waitForManifestReadiness({
     key: `shell:${shortAgentName}`,
     label: shortAgentName,
     kind: 'dependency',
     manifest,
-    route: {
-      container: containerName,
-      hostPort: containerInfo?.hostPort || 0,
-      ...(containerInfo?.serviceTargets ? { serviceTargets: containerInfo.serviceTargets } : {}),
-    },
+    route: shellReadinessRoute,
   });
   await activatePreparedRuntimeAfterReadiness({
     result: containerInfo,
@@ -2160,21 +2168,27 @@ async function reinstallAgent(agentName) {
                 forceRecreate: true,
                 routerEndpoint,
             });
-            const { containerName: newContainerName, hostPort, serviceTargets } = reinstallResult;
+            const { containerName: newContainerName, hostPort } = reinstallResult;
 
             const repoName = path.basename(path.dirname(agentPath));
             const routeKey = registryRecord?.record.alias || short;
+            const reinstallReadinessRoute = buildRelayReadinessRoute({
+                route: {
+                    container: newContainerName,
+                    hostPort: hostPort || 0,
+                },
+                manifest,
+                runtimeResult: reinstallResult,
+                networkMode: routerEndpoint?.mode || '',
+                generationDigest: reinstallResult?.preparationLease?.preparedGeneration || '',
+            });
 
             await waitForManifestReadiness({
                 key: `reinstall:${routeKey}`,
                 label: short,
                 kind: 'reinstall',
                 manifest,
-                route: {
-                    container: newContainerName,
-                    hostPort: hostPort || 0,
-                    ...(serviceTargets ? { serviceTargets } : {})
-                }
+                route: reinstallReadinessRoute,
             });
 
             await activatePreparedRuntimeAfterReadiness({

@@ -9,19 +9,13 @@ import {
     PLOINKY_WORKSPACE_ROOT,
     ROUTING_FILE,
 } from '../utils/config.js';
+import { parseAgentPortSelector } from '../server/agentPortConvention/parseSelector.js';
+import { HttpRouteAccessPath } from '../server/policy/HttpRouteAccessPath.js';
 import { normalizeManifestHttpRouteAccess } from '../server/policy/HttpRouteProviders.js';
 import { compileHttpRoutePolicy } from '../server/policy/HttpRoutePolicyCompiler.js';
-import {
-    normalizeHttpServicePort,
-    normalizeHttpServiceSlug,
-    serviceSlug,
-    validateManifestHttpServices,
-} from './httpServicePortConfig.js';
 import { parseRouterHostPort, selectedRouterHostPort } from './routerPort.js';
 
 export const EDGE_GENERATION_SCHEMA_VERSION = 1;
-export const EDGE_DESIRED_SCHEMA_VERSION = 1;
-export const EDGE_TOPOLOGY_SCHEMA_VERSION = 2;
 export const EDGE_TOPOLOGY_CONTAINER_DIR = '/run/ploinky-edge-topology';
 export const EDGE_TOPOLOGY_CONTAINER_FILE = `${EDGE_TOPOLOGY_CONTAINER_DIR}/current.json`;
 export const EDGE_DESIRED_CANDIDATE_MAX_BYTES = 1024 * 1024;
@@ -31,7 +25,6 @@ export const ROUTER_SURFACE_CATALOG = Object.freeze([
     'blob-transfer',
     'browser-auth',
     'marketplace-ui',
-    'topology-projection',
     'workspace-assets',
 ]);
 
@@ -43,24 +36,20 @@ const EMPTY_POLICY_BYTES = Buffer.from(JSON.stringify({
     mcpTools: [],
 }));
 const EMPTY_DESIRED_BYTES = Buffer.from(JSON.stringify({
-    schemaVersion: EDGE_DESIRED_SCHEMA_VERSION,
     hosts: {},
     security: {
         hostNetworkAllowedInstances: [],
-        internalServiceConsumers: {},
+        privateRouteConsumers: {},
     },
 }));
 const EMPTY_AGENTS_BYTES = Buffer.from('{}');
-const SERVICE_SLUG = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 const AGENT_SEGMENT = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const SECRET_HANDLE = /^[a-z0-9](?:[a-z0-9/_-]{0,253}[a-z0-9_-])?$/;
 const RESERVED_OBJECT_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
-const READY_TOPOLOGY_STATES = new Set(['local-ready', 'cloudflare-ready']);
 const TOPOLOGY_STATES = new Set([
-    'local-ready',
-    'cloudflare-reconciling',
-    'cloudflare-ready',
-    'publication-error',
+    'ready',
+    'reconciling',
+    'error',
 ]);
 const EDGE_PREPARATION_LEASE_SCHEMA_VERSION = 2;
 const APPLY_LOCK_CAPABILITIES = new WeakMap();
@@ -456,17 +445,6 @@ function decodeCanonicalBase64(value, label) {
     return bytes;
 }
 
-function asServiceSpecs(value, label) {
-    if (!value) return [];
-    if (Array.isArray(value)) return value;
-    if (isPlainObject(value)) {
-        return Object.entries(value).map(([slug, entry]) => (
-            isPlainObject(entry) ? { slug, ...entry } : { slug, internalPrefix: entry }
-        ));
-    }
-    throw edgeError(`${label} must be an array or object`);
-}
-
 function normalizeServicePort(value, label) {
     if (value === undefined || value === null || value === '') return null;
     if (typeof value === 'boolean') throw edgeError(`${label} must be an integer TCP port`);
@@ -475,81 +453,6 @@ function normalizeServicePort(value, label) {
         throw edgeError(`${label} must be an integer TCP port in 1..65535`);
     }
     return raw;
-}
-
-function normalizePrefix(value, fallback, label) {
-    const raw = String(value || fallback || '').trim();
-    if (!raw || !raw.startsWith('/') || raw.includes('\\') || raw.includes('?') || raw.includes('#')
-        || /[\u0000-\u001f\u007f]/.test(raw)) {
-        throw edgeError(`${label} must be an absolute URL pathname prefix`);
-    }
-    let decoded;
-    try { decoded = decodeURIComponent(raw); } catch (_) {
-        throw edgeError(`${label} contains invalid percent encoding`);
-    }
-    if (decoded.includes('\\') || decoded.split('/').some((segment) => segment === '.' || segment === '..')) {
-        throw edgeError(`${label} contains a forbidden path segment`);
-    }
-    const normalized = raw.replace(/\/{2,}/g, '/');
-    return normalized.endsWith('/') ? normalized : `${normalized}/`;
-}
-
-function normalizeServiceDefinition(routeKey, route, spec, label) {
-    assertObject(spec, label);
-    for (const removed of ['auth', 'mode', 'forceGuest']) {
-        if (Object.prototype.hasOwnProperty.call(spec, removed)) {
-            throw edgeError(`${label}.${removed} was removed; use access`);
-        }
-    }
-    let slug;
-    let port;
-    try {
-        slug = serviceSlug(spec, label);
-        port = normalizeHttpServicePort(spec.port, `${label}.port`);
-    } catch (error) {
-        throw edgeError(error?.message || String(error));
-    }
-    const access = String(spec.access || '').trim().toLowerCase();
-    if (!['public', 'guest', 'authenticated'].includes(access)) {
-        throw edgeError(`${label}.access must be public, guest, or authenticated`);
-    }
-    const externalPrefix = normalizePrefix(
-        spec.externalPrefix || spec.prefix || spec.path,
-        slug ? `${access === 'authenticated' ? '/services' : '/public-services'}/${slug}/` : '',
-        `${label}.externalPrefix`,
-    );
-    const internalPrefix = normalizePrefix(
-        spec.internalPrefix || spec.targetPrefix || spec.upstreamPrefix,
-        '/',
-        `${label}.internalPrefix`,
-    );
-    const hostPort = port === null
-        ? Number(route.hostPort || 0)
-        : Number(route.serviceTargets?.[String(port)] || 0);
-    const target = Number.isSafeInteger(hostPort) && hostPort > 0 && hostPort <= 65535
-        ? { hostname: '127.0.0.1', hostPort, containerPort: port }
-        : null;
-    return {
-        routeKey,
-        slug,
-        externalPrefix,
-        internalPrefix,
-        access,
-        guestScope: String(spec.guestScope || `http-service:${routeKey}:${externalPrefix}`).trim(),
-        issueInvocation: spec.invocation !== false && access !== 'public',
-        includeAuthInfo: spec.includeAuthInfo !== false && access !== 'public',
-        notFoundMessage: String(spec.notFoundMessage || 'HTTP service route not found.'),
-        port,
-        target,
-    };
-}
-
-function serviceKey(routeKey, slug) {
-    return `${routeKey}\u0000${slug}`;
-}
-
-function prefixesOverlap(left, right) {
-    return left === right || left.startsWith(right) || right.startsWith(left);
 }
 
 function validatePolicy(policy) {
@@ -686,10 +589,7 @@ function uniqueStrings(values, label, normalizer = (value) => String(value || ''
 
 function normalizeDesired(desired) {
     assertObject(desired, 'edge desired state');
-    assertOnlyKeys(desired, new Set(['schemaVersion', 'hosts', 'cloudflare', 'media', 'turn', 'security']), 'edge desired state');
-    if (desired.schemaVersion !== EDGE_DESIRED_SCHEMA_VERSION) {
-        throw edgeError(`edge desired state schemaVersion must be ${EDGE_DESIRED_SCHEMA_VERSION}`);
-    }
+    assertOnlyKeys(desired, new Set(['hosts', 'cloudflare', 'media', 'turn', 'security']), 'edge desired state');
 
     const hostsInput = assertObject(desired.hosts, 'edge desired hosts');
     const hosts = {};
@@ -699,56 +599,15 @@ function normalizeDesired(desired) {
             throw edgeError(`duplicate desired hostname '${hostname}'`);
         }
         const entry = assertObject(rawEntry, `edge desired host '${hostname}'`);
-        assertOnlyKeys(entry, new Set(['agent', 'httpService', 'routerSurfaces', 'mounts', 'optionalLogin']), `edge desired host '${hostname}'`);
+        assertOnlyKeys(entry, new Set(['agent', 'routerSurfaces']), `edge desired host '${hostname}'`);
         const agent = normalizeAgentReference(entry.agent, `edge desired host '${hostname}'.agent`);
         const normalized = { agent };
-        if (entry.httpService !== undefined) {
-            let slug;
-            try {
-                slug = normalizeHttpServiceSlug(
-                    entry.httpService,
-                    `edge desired host '${hostname}'.httpService`,
-                    { required: true },
-                );
-            } catch (error) {
-                throw edgeError(error?.message || String(error));
-            }
-            normalized.httpService = slug;
-        }
-        if (entry.optionalLogin !== undefined) {
-            if (typeof entry.optionalLogin !== 'boolean') throw edgeError(`edge desired host '${hostname}'.optionalLogin must be boolean`);
-            normalized.optionalLogin = entry.optionalLogin;
-        }
         if (entry.routerSurfaces !== undefined) {
             const surfaces = uniqueStrings(entry.routerSurfaces, `edge desired host '${hostname}'.routerSurfaces`);
             for (const surface of surfaces) {
                 if (!ROUTER_SURFACES.has(surface)) throw edgeError(`unknown Router surface '${surface}' for '${hostname}'`);
             }
             normalized.routerSurfaces = surfaces.sort();
-        }
-        if (entry.mounts !== undefined) {
-            if (!Array.isArray(entry.mounts)) throw edgeError(`edge desired host '${hostname}'.mounts must be an array`);
-            normalized.mounts = entry.mounts.map((rawMount, index) => {
-                const mount = assertObject(rawMount, `edge desired host '${hostname}'.mounts[${index}]`);
-                assertOnlyKeys(mount, new Set(['agent', 'httpService']), `edge desired host '${hostname}'.mounts[${index}]`);
-                let slug;
-                try {
-                    slug = normalizeHttpServiceSlug(
-                        mount.httpService,
-                        `edge desired host '${hostname}'.mounts[${index}].httpService`,
-                        { required: true },
-                    );
-                } catch (error) {
-                    throw edgeError(error?.message || String(error));
-                }
-                return {
-                    agent: normalizeAgentReference(mount.agent, `edge desired host '${hostname}'.mounts[${index}].agent`),
-                    httpService: slug,
-                };
-            });
-        }
-        if (normalized.httpService && ((normalized.routerSurfaces || []).length || (normalized.mounts || []).length)) {
-            throw edgeError(`dedicated service host '${hostname}' cannot declare routerSurfaces or mounts`);
         }
         hosts[hostname] = normalized;
     }
@@ -818,40 +677,47 @@ function normalizeDesired(desired) {
     const securityInput = assertObject(desired.security, 'edge desired security');
     assertOnlyKeys(securityInput, new Set([
         'hostNetworkAllowedInstances',
-        'internalServiceConsumers',
+        'privateRouteConsumers',
     ]), 'edge desired security');
     const hostNetworkAllowedInstances = uniqueStrings(
         securityInput.hostNetworkAllowedInstances,
         'edge desired security.hostNetworkAllowedInstances',
         normalizeAgentReference,
     );
-    const internalInput = assertObject(
-        securityInput.internalServiceConsumers,
-        'edge desired security.internalServiceConsumers',
+    const privateInput = assertObject(
+        securityInput.privateRouteConsumers,
+        'edge desired security.privateRouteConsumers',
     );
-    const internalServiceConsumers = {};
-    for (const [target, consumers] of Object.entries(internalInput)) {
-        const segments = String(target || '').split('/');
-        if (segments.length !== 3 || !SERVICE_SLUG.test(segments[2])) {
-            throw edgeError(`internal service target '${target}' must be <repo>/<agent>/<service-slug>`);
+    const privateRouteConsumers = {};
+    for (const [target, consumers] of Object.entries(privateInput)) {
+        const normalized = HttpRouteAccessPath.normalize(String(target || ''));
+        if (!normalized.ok || !normalized.path.endsWith('/*')) {
+            throw edgeError(`private route target '${target}' must be a canonical wildcard HTTP route`);
         }
-        const normalizedTarget = `${normalizeAgentReference(segments.slice(0, 2).join('/'), `internal service target '${target}'`)}/${segments[2]}`;
-        internalServiceConsumers[normalizedTarget] = uniqueStrings(
+        let selector;
+        try {
+            selector = parseAgentPortSelector(normalized.path.slice(0, -1));
+        } catch (error) {
+            throw edgeError(`private route target '${target}' is invalid: ${error?.message || error}`);
+        }
+        if (!selector) {
+            throw edgeError(`private route target '${target}' must use the agent-port convention`);
+        }
+        privateRouteConsumers[normalized.path] = uniqueStrings(
             consumers,
-            `edge desired security.internalServiceConsumers['${target}']`,
+            `edge desired security.privateRouteConsumers['${target}']`,
             normalizeAgentReference,
         );
     }
 
     return {
-        schemaVersion: EDGE_DESIRED_SCHEMA_VERSION,
         hosts,
         ...(cloudflare !== undefined ? { cloudflare } : {}),
         ...(media ? { media } : {}),
         ...(turn ? { turn } : {}),
         security: {
             hostNetworkAllowedInstances,
-            internalServiceConsumers,
+            privateRouteConsumers,
         },
     };
 }
@@ -863,61 +729,14 @@ function validateRoutingShape(routing, manifests) {
         if (!routeKey || RESERVED_OBJECT_KEYS.has(routeKey)) throw edgeError(`routing route key '${routeKey}' is invalid`);
         assertObject(route, `routing route '${routeKey}'`);
         if (route.hostPort !== undefined) normalizeServicePort(route.hostPort, `routing.routes.${routeKey}.hostPort`);
-        if (route.serviceTargets !== undefined) {
-            const targets = assertObject(route.serviceTargets, `routing.routes.${routeKey}.serviceTargets`);
-            for (const [containerPort, hostPort] of Object.entries(targets)) {
-                normalizeServicePort(containerPort, `routing.routes.${routeKey}.serviceTargets key`);
-                normalizeServicePort(hostPort, `routing.routes.${routeKey}.serviceTargets.${containerPort}`);
-            }
-        }
         const manifest = manifests[routeKey];
         if (manifest) {
             assertObject(manifest, `manifest(${routeKey})`);
-            try {
-                validateManifestHttpServices(manifest, { label: `manifest(${routeKey})` });
-            } catch (error) {
-                throw edgeError(error?.message || String(error));
+            if (Object.prototype.hasOwnProperty.call(manifest, 'httpServices')) {
+                throw edgeError(`manifest(${routeKey}).httpServices is unsupported; use routerAccess.httpRoutes with agent-port convention paths`);
             }
         }
     }
-}
-
-function collectServices(routing, manifests) {
-    const services = [];
-    const keys = new Set();
-    for (const [routeKey, route] of Object.entries(routing.routes || {}).sort(([left], [right]) => left.localeCompare(right))) {
-        if (!route || route.disabled) continue;
-        const values = [
-            ['routing', route.httpServices],
-            ['manifest', manifests[routeKey]?.httpServices],
-        ];
-        for (const [source, value] of values) {
-            for (const [index, spec] of asServiceSpecs(value, `${source}(${routeKey}).httpServices`).entries()) {
-                const definition = normalizeServiceDefinition(
-                    routeKey,
-                    route,
-                    spec,
-                    `${source}(${routeKey}).httpServices[${index}]`,
-                );
-                if (definition.slug) {
-                    const key = serviceKey(routeKey, definition.slug);
-                    if (keys.has(key)) throw edgeError(`route '${routeKey}' contains duplicate HTTP service slug '${definition.slug}'`);
-                    keys.add(key);
-                }
-                services.push(definition);
-            }
-        }
-    }
-    for (let left = 0; left < services.length; left += 1) {
-        for (let right = left + 1; right < services.length; right += 1) {
-            if (prefixesOverlap(services[left].externalPrefix, services[right].externalPrefix)) {
-                throw edgeError(
-                    `HTTP service prefix overlap '${services[left].externalPrefix}' (${services[left].routeKey}/${services[left].slug}) and '${services[right].externalPrefix}' (${services[right].routeKey}/${services[right].slug})`,
-                );
-            }
-        }
-    }
-    return services;
 }
 
 function routeMatchesAgent(route, agentRef) {
@@ -932,12 +751,6 @@ function resolveAgentRoute(agentRef, routing) {
         throw edgeError(`agent '${agentRef}' must resolve to exactly one enabled effective route`);
     }
     return { routeKey: matches[0][0], route: matches[0][1], agent: agentRef };
-}
-
-function resolveService(services, routeKey, slug, label) {
-    const matches = services.filter((service) => service.routeKey === routeKey && service.slug === slug);
-    if (matches.length !== 1) throw edgeError(`${label} must resolve to exactly one HTTP service`);
-    return matches[0];
 }
 
 function resolveEnabledIdentity(routeSelection, agents) {
@@ -974,47 +787,19 @@ function publicationDisposition(desired) {
     const required = ['accountId', 'zoneId', 'tunnelId', 'tunnelTokenSecret', 'apiTokenSecret'];
     const complete = Boolean(cloudflare) && required.every((key) => Boolean(cloudflare[key])) && hostCount > 0;
     const absent = cloudflare === undefined && hostCount === 0;
-    if (absent) return { mode: 'local-only', defaultState: 'local-ready', complete: true };
-    if (complete) return { mode: 'cloudflare', defaultState: 'cloudflare-reconciling', complete: true };
-    return { mode: 'publication-error', defaultState: 'publication-error', complete: false };
+    if (absent) return { mode: 'local-only', defaultState: 'ready', complete: true };
+    if (complete) return { mode: 'cloudflare', defaultState: 'reconciling', complete: true };
+    return { mode: 'error', defaultState: 'error', complete: false };
 }
 
-function effectiveRouteHostLabel(routeKey) {
-    const label = String(routeKey || '').toLowerCase();
-    if (!SERVICE_SLUG.test(label)) {
-        throw edgeError(`effective route key '${routeKey}' cannot form a collision-safe .localhost service alias`);
-    }
-    return label;
-}
-
-function compileGeneration({ routing, policy, desired, agents, manifests, routerHostPort = selectedRouterHostPort() }) {
+function compileGeneration({ routing, policy, desired, agents, manifests }) {
     validatePolicy(policy);
     validateRoutingShape(routing, manifests);
     assertObject(agents, 'agents registry');
     const normalizedDesired = normalizeDesired(desired);
-    const services = collectServices(routing, manifests);
     const hostNetworkCapabilities = normalizedDesired.security.hostNetworkAllowedInstances.map((agentRef) => (
         resolveEnabledIdentity(resolveAgentRoute(agentRef, routing), agents)
     ));
-    const internalServiceConsumers = [];
-    const internalKeys = new Set();
-    for (const [target, consumers] of Object.entries(normalizedDesired.security.internalServiceConsumers)) {
-        const parts = target.split('/');
-        const targetAgent = parts.slice(0, 2).join('/');
-        const targetRoute = resolveAgentRoute(targetAgent, routing);
-        const service = resolveService(services, targetRoute.routeKey, parts[2], `internal service target '${target}'`);
-        if (service.access !== 'authenticated') {
-            throw edgeError(`internal service '${target}' must declare authenticated access`);
-        }
-        const key = serviceKey(service.routeKey, service.slug);
-        internalKeys.add(key);
-        internalServiceConsumers.push({
-            routeKey: service.routeKey,
-            slug: service.slug,
-            canonicalPrefix: service.externalPrefix,
-            callers: consumers.map((agentRef) => resolveEnabledIdentity(resolveAgentRoute(agentRef, routing), agents)),
-        });
-    }
     const turnCredentialConsumers = (normalizedDesired.turn?.credentialConsumers || []).map((agentRef) => (
         resolveEnabledIdentity(resolveAgentRoute(agentRef, routing), agents)
     ));
@@ -1031,131 +816,61 @@ function compileGeneration({ routing, policy, desired, agents, manifests, router
             prefix: `/${encodeURIComponent(routeKey)}`,
         });
     }
-    for (const service of services) {
-        const internal = internalKeys.has(serviceKey(service.routeKey, service.slug));
-        policyNamespaces.push({
-            id: service.slug
-                ? `${internal ? 'private-service' : 'service'}:${service.routeKey}/${service.slug}`
-                : `prefix-service:${service.routeKey}:${service.externalPrefix}`,
-            kind: internal ? 'private-service' : 'service',
-            routeKey: service.routeKey,
-            slug: service.slug,
-            prefix: service.externalPrefix.replace(/\/$/, ''),
-            requireAuthenticated: internal,
-        });
-    }
+    const manifestPolicyEntries = collectStrictManifestPolicyEntries(routing, manifests);
     const compiledPolicy = compileHttpRoutePolicy({
         entries: [
             ...policy.httpRoutes.map((entry) => ({ ...entry, source: String(entry.source || 'policy') })),
-            ...collectStrictManifestPolicyEntries(routing, manifests),
-            ...services.map((service) => ({
-                externalPrefix: service.externalPrefix,
-                access: service.access,
-                routeKey: service.routeKey,
-                guestScope: service.guestScope,
-                source: 'httpService',
-            })),
+            ...manifestPolicyEntries,
         ],
         namespaces: policyNamespaces,
         routeDefaults,
     });
-
-    const localAliases = {};
-    for (const service of services) {
-        if (!service.slug) continue;
-        if (internalKeys.has(serviceKey(service.routeKey, service.slug))) continue;
-        const alias = `${service.slug}.${effectiveRouteHostLabel(service.routeKey)}.localhost`;
-        if (Object.prototype.hasOwnProperty.call(localAliases, alias)) {
-            throw edgeError(`local service alias collision at '${alias}'`);
+    const privateRouteConsumers = [];
+    const accessRank = new Map([['public', 1], ['guest', 2], ['authenticated', 3]]);
+    for (const [target, consumers] of Object.entries(normalizedDesired.security.privateRouteConsumers)) {
+        const probePath = `${target.slice(0, -2)}/__ploinky_private_probe__`;
+        const selector = parseAgentPortSelector(probePath);
+        const selectedRoute = routing.routes?.[selector.agent];
+        if (!selectedRoute || selectedRoute.disabled) {
+            throw edgeError(`private route target '${target}' has no enabled owning route`);
         }
-        localAliases[alias] = { routeKey: service.routeKey, slug: service.slug };
+        const matching = compiledPolicy.entries.filter((entry) => (
+            entry.routeKey === selector.agent && HttpRouteAccessPath.matches(probePath, entry.path)
+        ));
+        const winner = matching.sort((left, right) => (
+            (accessRank.get(right.access) || 0) - (accessRank.get(left.access) || 0)
+        ))[0] || compiledPolicy.routeDefaults[selector.agent];
+        if (winner?.access !== 'authenticated') {
+            throw edgeError(`private route target '${target}' must be authenticated by HTTP route policy`);
+        }
+        privateRouteConsumers.push({
+            routeKey: selector.agent,
+            path: target,
+            callers: consumers.map((agentRef) => resolveEnabledIdentity(resolveAgentRoute(agentRef, routing), agents)),
+        });
     }
 
     const hosts = {};
     const surfaces = {};
-    const mounts = {};
-    const publicLocators = new Map();
     for (const [hostname, entry] of Object.entries(normalizedDesired.hosts)) {
         const selectedRoute = resolveAgentRoute(entry.agent, routing);
-        if (entry.httpService) {
-            const service = resolveService(services, selectedRoute.routeKey, entry.httpService, `host '${hostname}' service`);
-            if (internalKeys.has(serviceKey(service.routeKey, service.slug))) {
-                throw edgeError(`host '${hostname}' cannot publish internal-only service '${entry.httpService}'`);
-            }
-            hosts[hostname] = {
-                kind: 'dedicated-service',
-                agent: entry.agent,
-                routeKey: selectedRoute.routeKey,
-                httpService: service.slug,
-                optionalLogin: entry.optionalLogin === true,
-            };
-            const key = serviceKey(service.routeKey, service.slug);
-            if (publicLocators.has(key)) throw edgeError(`service '${service.routeKey}/${service.slug}' has multiple public browser locators`);
-            publicLocators.set(key, `https://${hostname}/`);
-            continue;
-        }
-
         hosts[hostname] = {
             kind: 'agent-root',
             agent: entry.agent,
             routeKey: selectedRoute.routeKey,
         };
         surfaces[hostname] = [...(entry.routerSurfaces || [])];
-        const hostMounts = [];
-        const mountKeys = new Set();
-        for (const mount of entry.mounts || []) {
-            const mountRoute = resolveAgentRoute(mount.agent, routing);
-            const service = resolveService(services, mountRoute.routeKey, mount.httpService, `host '${hostname}' mount`);
-            const key = serviceKey(service.routeKey, service.slug);
-            if (internalKeys.has(key)) throw edgeError(`host '${hostname}' cannot mount internal-only service '${mount.httpService}'`);
-            if (mountKeys.has(key)) throw edgeError(`host '${hostname}' contains duplicate mount '${mount.agent}/${mount.httpService}'`);
-            for (const existing of hostMounts) {
-                if (prefixesOverlap(existing.externalPrefix, service.externalPrefix)) {
-                    throw edgeError(`host '${hostname}' has overlapping mounted service prefixes`);
-                }
-            }
-            mountKeys.add(key);
-            hostMounts.push({
-                agent: mount.agent,
-                routeKey: service.routeKey,
-                slug: service.slug,
-                externalPrefix: service.externalPrefix,
-            });
-            if (publicLocators.has(key)) throw edgeError(`service '${service.routeKey}/${service.slug}' has multiple public browser locators`);
-            publicLocators.set(key, `https://${hostname}${service.externalPrefix}`);
-        }
-        mounts[hostname] = hostMounts;
     }
-
-    const locators = services
-        .filter((service) => service.slug && !internalKeys.has(serviceKey(service.routeKey, service.slug)))
-        .map((service) => {
-            const key = serviceKey(service.routeKey, service.slug);
-            const alias = Object.entries(localAliases).find(([, record]) => (
-                record.routeKey === service.routeKey && record.slug === service.slug
-            ))?.[0];
-            const localPort = routerHostPort && routerHostPort !== 80 ? `:${routerHostPort}` : '';
-            return {
-                routeKey: service.routeKey,
-                slug: service.slug,
-                configuredBrowserUrl: publicLocators.get(key) || `http://${alias}${localPort}/`,
-                routerPath: service.externalPrefix,
-            };
-        });
 
     return {
         desired: normalizedDesired,
         compiled: {
-            services,
             hosts,
-            localAliases,
             surfaces,
-            mounts,
-            locators,
             policy: compiledPolicy,
             security: {
                 hostNetworkCapabilities,
-                internalServiceConsumers,
+                privateRouteConsumers,
                 turnCredentialConsumers,
             },
             publication: publicationDisposition(normalizedDesired),
@@ -1183,7 +898,7 @@ function collectCapturedSources(paths) {
         manifestBytes[routeKey] = bytes;
         manifests[routeKey] = parseJsonBytes(bytes, `manifest(${routeKey})`);
     }
-    const semantic = compileGeneration({ routing, policy, desired, agents, manifests, routerHostPort });
+    const semantic = compileGeneration({ routing, policy, desired, agents, manifests });
     const parts = [
         ['routing.json', routingBytes],
         ['policy-state.json', policyBytes],
@@ -1397,7 +1112,7 @@ function loadGenerationById(paths, generationId) {
     }
     return reconstructGeneration(document, {
         generation: generationId,
-        publicationState: 'publication-error',
+        publicationState: 'error',
     });
 }
 
@@ -1466,20 +1181,10 @@ function affectedSelectorIds(generation, owner) {
         `media:${owner.agentId}`,
         `agent-root:${owner.routeKey}`,
     ]);
-    for (const service of generation.compiled.services || []) {
-        if (service.routeKey !== owner.routeKey) continue;
-        selectors.add(service.slug
-            ? `service:${service.routeKey}/${service.slug}`
-            : `prefix:${service.routeKey}:${service.externalPrefix}`);
-    }
     for (const [hostname, record] of Object.entries(generation.compiled.hosts || {})) {
-        if (record?.routeKey === owner.routeKey
-            || (generation.compiled.mounts?.[hostname] || []).some((mount) => mount.routeKey === owner.routeKey)) {
+        if (record?.routeKey === owner.routeKey) {
             selectors.add(`host:${hostname}`);
         }
-    }
-    for (const [hostname, record] of Object.entries(generation.compiled.localAliases || {})) {
-        if (record?.routeKey === owner.routeKey) selectors.add(`host:${hostname}`);
     }
     return Object.freeze([...selectors].sort());
 }
@@ -1591,7 +1296,6 @@ function lifecycleRoutingProjection(routing) {
     for (const route of Object.values(projected?.routes || {})) {
         if (!isPlainObject(route)) continue;
         delete route.hostPort;
-        delete route.serviceTargets;
     }
     return projected;
 }
@@ -1951,14 +1655,14 @@ function selectPublicationState(compiled, requested) {
     const desired = compiled.publication;
     const state = requested === undefined ? desired.defaultState : String(requested || '').trim();
     if (!TOPOLOGY_STATES.has(state)) throw edgeError(`unsupported edge publication state '${state}'`);
-    if (desired.mode === 'local-only' && state !== 'local-ready' && state !== 'publication-error') {
+    if (desired.mode === 'local-only' && state !== 'ready' && state !== 'error') {
         throw edgeError(`publication state '${state}' is impossible in local-only mode`);
     }
-    if (desired.mode === 'cloudflare' && !['cloudflare-reconciling', 'cloudflare-ready', 'publication-error'].includes(state)) {
+    if (desired.mode === 'cloudflare' && !['reconciling', 'ready', 'error'].includes(state)) {
         throw edgeError(`publication state '${state}' is impossible in Cloudflare mode`);
     }
-    if (desired.mode === 'publication-error' && state !== 'publication-error') {
-        throw edgeError('incomplete Cloudflare desired state must remain publication-error');
+    if (desired.mode === 'error' && state !== 'error') {
+        throw edgeError('incomplete Cloudflare desired state must remain in error');
     }
     return state;
 }
@@ -1987,19 +1691,7 @@ function topologyConfigurationGeneration(generation) {
     // are intentionally represented by the separate authorization/publication
     // generations below.
     const media = topologyMedia(generation.desired);
-    const services = generation.compiled.locators
-        .map((locator) => ({
-            routeKey: locator.routeKey,
-            slug: locator.slug,
-            configuredBrowserUrl: locator.configuredBrowserUrl,
-            routerPath: locator.routerPath,
-        }))
-        .sort((left, right) => (
-            left.routeKey.localeCompare(right.routeKey) || left.slug.localeCompare(right.slug)
-        ));
     const configuration = {
-        schemaVersion: EDGE_TOPOLOGY_SCHEMA_VERSION,
-        services,
         ...(media ? { media } : {}),
     };
     return sourceDigest(Buffer.from(stableStringify(configuration)));
@@ -2010,25 +1702,14 @@ function writeTopologyForGeneration(paths, generation, publicationState, options
     try {
         previousPublication = Number(JSON.parse(fs.readFileSync(paths.topologyCurrentFile, 'utf8')).publicationGeneration || 0);
     } catch (_) {}
-    const active = READY_TOPOLOGY_STATES.has(publicationState);
-    const servicesByKey = new Map(generation.compiled.services.map((service) => [serviceKey(service.routeKey, service.slug), service]));
-    const services = generation.compiled.locators.map((locator) => {
-        const service = servicesByKey.get(serviceKey(locator.routeKey, locator.slug));
-        return {
-            ...locator,
-            ...(active && service?.target ? { activeBrowserUrl: locator.configuredBrowserUrl } : {}),
-        };
-    });
     const media = topologyMedia(generation.desired);
     const topology = {
-        schemaVersion: EDGE_TOPOLOGY_SCHEMA_VERSION,
         configurationGeneration: topologyConfigurationGeneration(generation),
         // Router uses this private snapshot binding and never returns it from
         // the authenticated browser locator projection.
         authorizationGeneration: generation.generation,
         publicationGeneration: previousPublication + 1,
         state: publicationState,
-        services,
         ...(media ? { media } : {}),
     };
     fs.mkdirSync(paths.topologyGenerationsDir, { recursive: true });
@@ -2146,7 +1827,7 @@ export function applyEdgeRoutingGeneration(options = {}) {
             options.reason || 'coordinated-apply',
         );
         if (options.activate === false) {
-            const topology = writeTopologyForGeneration(paths, generation, 'publication-error', options);
+            const topology = writeTopologyForGeneration(paths, generation, 'error', options);
             const createdPreparationLease = options.createPreparationLease === true
                 ? createPreparationLease(paths, captured, options.reason)
                 : null;
@@ -2193,7 +1874,7 @@ export function applyEdgeRoutingGeneration(options = {}) {
             // Publish the selected configuration as unavailable before asking
             // its exact runtime owner to drain. No active locator from the old
             // generation survives a failed drain or restart.
-            writeTopologyForGeneration(paths, generation, 'publication-error', options);
+            writeTopologyForGeneration(paths, generation, 'error', options);
             const affectedSelectors = affectedSelectorIds(generation, restartOwner);
             const preparedHostModeCapability = createPreparedHostModeCapability(
                 paths,
@@ -2263,7 +1944,7 @@ export function prepareEdgeRoutingGeneration(options = {}) {
         ...options,
         activate: false,
         createPreparationLease: true,
-        publicationState: 'publication-error',
+        publicationState: 'error',
         reason: options.reason || 'edge-generation-prepare-inactive',
     });
 }
@@ -2372,16 +2053,12 @@ export function readCurrentEdgeTopology(options = {}) {
     } catch (error) {
         throw edgeError(`edge topology is unavailable: ${error?.message || error}`, 'EDGE_TOPOLOGY_INVALID');
     }
-    if (!isPlainObject(document) || document.schemaVersion !== EDGE_TOPOLOGY_SCHEMA_VERSION
-        || !TOPOLOGY_STATES.has(document.state) || !Array.isArray(document.services)
+    if (!isPlainObject(document)
+        || !TOPOLOGY_STATES.has(document.state)
         || !Number.isSafeInteger(document.publicationGeneration) || document.publicationGeneration < 1
         || !/^sha256:[a-f0-9]{64}$/.test(String(document.configurationGeneration || ''))
         || !/^sha256:[a-f0-9]{64}$/.test(String(document.authorizationGeneration || ''))) {
         throw edgeError('edge topology has an unsupported or invalid schema', 'EDGE_TOPOLOGY_INVALID');
-    }
-    if (!READY_TOPOLOGY_STATES.has(document.state)
-        && document.services.some((service) => Object.prototype.hasOwnProperty.call(service || {}, 'activeBrowserUrl'))) {
-        throw edgeError('inactive edge topology contains an active browser locator', 'EDGE_TOPOLOGY_INVALID');
     }
     return deepFreeze(document);
 }

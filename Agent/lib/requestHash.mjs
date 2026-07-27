@@ -95,6 +95,92 @@ export function computeRchTool({ method, path, tool, arguments: args }) {
     });
 }
 
+export function normalizeCanonicalPortSet(values = []) {
+    if (!Array.isArray(values)) {
+        throw new Error('requestHash: denied ports must be an array');
+    }
+    const ports = values.map((value) => {
+        const raw = String(value ?? '');
+        if (!/^[1-9][0-9]{0,4}$/.test(raw)) {
+            throw new Error(`requestHash: invalid canonical port '${raw}'`);
+        }
+        const port = Number(raw);
+        if (port < 1 || port > 65535) {
+            throw new Error(`requestHash: port out of range '${raw}'`);
+        }
+        return port;
+    });
+    return Array.from(new Set(ports)).sort((left, right) => left - right);
+}
+
+export function computeRelayDenySetDigest(deniedPorts = []) {
+    return computeRch({ deniedPorts: normalizeCanonicalPortSet(deniedPorts) });
+}
+
+export function computeRchRelaySession({
+    targetAgentId,
+    effectiveInstanceId,
+    enableGeneration,
+    containerId,
+    generationDigest,
+    relaySessionId,
+    deniedPorts = [],
+    denySetDigest,
+}) {
+    const normalizedDeniedPorts = normalizeCanonicalPortSet(deniedPorts);
+    const computedDenySetDigest = computeRelayDenySetDigest(normalizedDeniedPorts);
+    if (denySetDigest && String(denySetDigest) !== computedDenySetDigest) {
+        throw new Error('requestHash: relay deny-set digest mismatch');
+    }
+    return computeRch({
+        targetAgentId: String(targetAgentId ?? ''),
+        effectiveInstanceId: String(effectiveInstanceId ?? ''),
+        enableGeneration: String(enableGeneration ?? ''),
+        containerId: String(containerId ?? ''),
+        generationDigest: String(generationDigest ?? ''),
+        relaySessionId: String(relaySessionId ?? ''),
+        deniedPorts: normalizedDeniedPorts,
+        denySetDigest: computedDenySetDigest,
+    });
+}
+
+export function computeRchRelayRequest({
+    targetAgentId,
+    effectiveInstanceId,
+    enableGeneration,
+    containerId,
+    generationDigest,
+    relaySessionId,
+    denySetDigest,
+    method,
+    port,
+    path,
+    query = '',
+    bodyMode,
+    bodyHash = '',
+}) {
+    const canonicalPort = String(port ?? '');
+    if (!/^[1-9][0-9]{0,4}$/.test(canonicalPort)
+        || Number(canonicalPort) > 65535) {
+        throw new Error(`requestHash: invalid relay port '${canonicalPort}'`);
+    }
+    return computeRch({
+        targetAgentId: String(targetAgentId ?? ''),
+        effectiveInstanceId: String(effectiveInstanceId ?? ''),
+        enableGeneration: String(enableGeneration ?? ''),
+        containerId: String(containerId ?? ''),
+        generationDigest: String(generationDigest ?? ''),
+        relaySessionId: String(relaySessionId ?? ''),
+        denySetDigest: String(denySetDigest ?? ''),
+        method: String(method ?? '').toUpperCase(),
+        port: canonicalPort,
+        path: String(path ?? ''),
+        query: String(query ?? ''),
+        bodyMode: String(bodyMode ?? ''),
+        bodyHash: String(bodyHash ?? ''),
+    });
+}
+
 export default {
     canonicalJson,
     sha256b64url,
@@ -102,4 +188,8 @@ export default {
     computeRch,
     computeRchHttp,
     computeRchTool,
+    normalizeCanonicalPortSet,
+    computeRelayDenySetDigest,
+    computeRchRelaySession,
+    computeRchRelayRequest,
 };
