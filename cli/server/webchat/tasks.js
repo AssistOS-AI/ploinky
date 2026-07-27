@@ -19,6 +19,8 @@ export function createTaskController({ toEndpoint, sendQuickCommand, elements, s
         tasksList,
         taskDetail,
         taskToast,
+        taskToastText,
+        taskToastClose,
     } = elements;
     const tasks = new Map();
     const logs = new Map();
@@ -73,12 +75,21 @@ export function createTaskController({ toEndpoint, sendQuickCommand, elements, s
         if (tasksBtn) tasksBtn.title = `${ongoing} ongoing task${ongoing === 1 ? '' : 's'}, ${unreadTerminal} unread update${unreadTerminal === 1 ? '' : 's'}`;
     }
 
+    function hideToast() {
+        if (!taskToast) return;
+        taskToast.hidden = true;
+        if (toastTimer) clearTimeout(toastTimer);
+        toastTimer = null;
+    }
+
     function showToast(task) {
         if (!taskToast) return;
-        taskToast.textContent = `${task.description || task.toolName || 'Task'}: ${taskStatusPresentation(task).label}`;
+        const message = `${task.description || task.toolName || 'Task'}: ${taskStatusPresentation(task).label}`;
+        if (taskToastText) taskToastText.textContent = message;
+        else taskToast.textContent = message;
         taskToast.hidden = false;
         if (toastTimer) clearTimeout(toastTimer);
-        toastTimer = setTimeout(() => { taskToast.hidden = true; }, 5000);
+        toastTimer = setTimeout(hideToast, 5000);
     }
 
     function renderDetail({ stickToEnd = true } = {}) {
@@ -236,6 +247,7 @@ export function createTaskController({ toEndpoint, sendQuickCommand, elements, s
 
     tasksBtn?.addEventListener('click', open);
     tasksDialogClose?.addEventListener('click', close);
+    taskToastClose?.addEventListener('click', hideToast);
     tasksDialog?.addEventListener('click', (event) => {
         if (event.target === tasksDialog) close();
     });

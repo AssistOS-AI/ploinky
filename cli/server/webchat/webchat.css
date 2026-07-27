@@ -3286,7 +3286,11 @@ button.wa-upload-directory-entry.folder:hover {
     flex: 1;
     margin: 0;
     padding: 14px;
-    overflow: auto;
+    overflow-x: hidden;
+    overflow-y: scroll;
+    scrollbar-gutter: stable;
+    scrollbar-width: auto;
+    scrollbar-color: color-mix(in srgb, var(--wa-accent) 62%, var(--wa-text-secondary)) var(--wa-bg-panel);
     border: 1px solid var(--wa-border);
     border-radius: 9px;
     background: var(--wa-bg-chat);
@@ -3294,6 +3298,26 @@ button.wa-upload-directory-entry.folder:hover {
     font: 12px/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
     white-space: pre-wrap;
     overflow-wrap: anywhere;
+}
+
+.wa-task-log::-webkit-scrollbar {
+    width: 12px;
+}
+
+.wa-task-log::-webkit-scrollbar-track {
+    background: var(--wa-bg-panel);
+    border-left: 1px solid var(--wa-border);
+}
+
+.wa-task-log::-webkit-scrollbar-thumb {
+    min-height: 36px;
+    border: 2px solid var(--wa-bg-panel);
+    border-radius: 999px;
+    background: color-mix(in srgb, var(--wa-accent) 62%, var(--wa-text-secondary));
+}
+
+.wa-task-log::-webkit-scrollbar-thumb:hover {
+    background: var(--wa-accent-hover);
 }
 
 .wa-task-log-line {
@@ -3312,6 +3336,15 @@ button.wa-upload-directory-entry.folder:hover {
 
 .wa-task-log-line.is-final {
     color: var(--wa-text-primary);
+}
+
+.wa-task-log-line.is-user-prompt {
+    margin: 5px 0;
+    padding: 3px 7px;
+    border-left: 3px solid var(--wa-accent);
+    background: color-mix(in srgb, var(--wa-accent) 9%, transparent);
+    color: var(--wa-text-primary);
+    font-weight: 700;
 }
 
 .wa-task-summary {
@@ -3505,12 +3538,43 @@ button.wa-upload-directory-entry.folder:hover {
     right: 18px;
     z-index: 240;
     max-width: min(420px, calc(100vw - 36px));
-    padding: 12px 16px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 8px 8px 8px 16px;
     border-radius: 9px;
     background: var(--wa-bg-panel);
     color: var(--wa-text-primary);
     border: 1px solid var(--wa-border);
     box-shadow: var(--wa-shadow-md);
+}
+
+.wa-task-toast[hidden] {
+    display: none;
+}
+
+.wa-task-toast-text {
+    min-width: 0;
+    flex: 1;
+}
+
+.wa-task-toast-close {
+    width: 28px;
+    height: 28px;
+    padding: 0;
+    border: 0;
+    border-radius: 6px;
+    background: transparent;
+    color: var(--wa-text-secondary);
+    cursor: pointer;
+    font: 700 20px/1 sans-serif;
+}
+
+.wa-task-toast-close:hover,
+.wa-task-toast-close:focus-visible {
+    background: var(--wa-bg-hover);
+    color: var(--wa-text-primary);
+    outline: none;
 }
 
 @media (max-width: 700px) {

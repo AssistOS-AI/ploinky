@@ -87,6 +87,8 @@ export function initDom() {
     const tasksList = document.getElementById('tasksList');
     const taskDetail = document.getElementById('taskDetail');
     const taskToast = document.getElementById('taskToast');
+    const taskToastText = document.getElementById('taskToastText');
+    const taskToastClose = document.getElementById('taskToastClose');
 
     const agentName = (body.dataset.agent || '').trim();
     const displayName = (body.dataset.title || '').trim();
@@ -310,6 +312,8 @@ export function initDom() {
             tasksList,
             taskDetail,
             taskToast,
+            taskToastText,
+            taskToastClose,
         },
     };
 }

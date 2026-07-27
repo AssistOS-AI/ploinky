@@ -74,7 +74,10 @@ function parseTaskLogEntries(text, finalOutput = null) {
         if (/^\[task log source truncated or restarted\]$/i.test(line.trim())) {
             return [{ text: 'Task log source was truncated or restarted.', stream: 'stderr', tone }];
         }
-        return [{ text: line, stream, tone }];
+        const promptMatch = /^(?:User:\s*|you>\s?)(.*)$/i.exec(line);
+        const kind = promptMatch ? 'user-prompt' : 'output';
+        if (promptMatch) line = `you> ${promptMatch[1]}`;
+        return [{ text: line, stream, tone, kind }];
     });
 }
 
@@ -105,7 +108,7 @@ export function renderTaskLog(container, text, emptyText = 'No log output yet.',
     }
     for (const entry of lines) {
         const line = document.createElement('span');
-        line.className = `wa-task-log-line is-${entry.stream} is-${entry.tone}`;
+        line.className = `wa-task-log-line is-${entry.stream} is-${entry.tone} is-${entry.kind || 'output'}`;
         line.textContent = entry.text || '\u00a0';
         container.appendChild(line);
     }

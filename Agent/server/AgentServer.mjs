@@ -901,6 +901,8 @@ async function handleOpenAiChatCompletions(req, res, body) {
 
 function buildFallbackModelsResponse(manifest) {
     const agentName = process.env.AGENT_NAME || manifest?.name || process.env.PLOINKY_AGENT_ID || 'agent';
+    const declaredTags = normalizeTagList(manifest?.capabilities?.tags);
+    const tags = declaredTags.length > 0 ? declaredTags : ['generic-agent'];
     const supportsStreaming = manifest?.endpoints?.chatCompletions?.stream === true
         || manifest?.endpoints?.chatCompletions?.supportsStream === true
         || !manifest?.endpoints?.chatCompletions?.command;
@@ -915,7 +917,7 @@ function buildFallbackModelsResponse(manifest) {
                 supportsTools: true,
                 supportsStreaming,
                 supportsVision: false,
-                tags: ['chat', 'agentic'],
+                tags,
                 capabilities: {
                     supportsTools: true,
                     supportsStreaming,

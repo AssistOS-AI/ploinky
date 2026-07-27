@@ -71,6 +71,8 @@ const {
     tasksList,
     taskDetail,
     taskToast,
+    taskToastText,
+    taskToastClose,
     interactionPrompt,
     interactionPromptTitle,
     interactionPromptMessage,
@@ -113,6 +115,8 @@ taskController = createTaskController({
         tasksList,
         taskDetail,
         taskToast,
+        taskToastText,
+        taskToastClose,
     },
     showBanner,
 });

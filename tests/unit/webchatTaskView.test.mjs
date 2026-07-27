@@ -328,6 +328,19 @@ test('task continuation input submits on Enter and auto-resizes without manual r
     );
 });
 
+test('task logs expose a persistent high-contrast scrollbar', () => {
+    const css = fs.readFileSync(
+        new URL('../../cli/server/webchat/webchat.css', import.meta.url),
+        'utf8',
+    );
+    assert.match(
+        css,
+        /\.wa-task-log\s*\{[^}]*overflow-y:\s*scroll[^}]*scrollbar-gutter:\s*stable[^}]*scrollbar-color:/s,
+    );
+    assert.match(css, /\.wa-task-log::\-webkit-scrollbar\s*\{[^}]*width:\s*12px/s);
+    assert.match(css, /\.wa-task-log::\-webkit-scrollbar-thumb\s*\{[^}]*background:/s);
+});
+
 test('task view stops ongoing work through the AchillesCLI command bridge', () => {
     const source = fs.readFileSync(
         new URL('../../cli/server/webchat/taskView.js', import.meta.url),

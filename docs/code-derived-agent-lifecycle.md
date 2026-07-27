@@ -626,6 +626,7 @@ The default server provides:
 | `GET /agent-card` | Returns manifest endpoint card when configured. |
 | `GET /getTaskStatus` / `/task` | Returns async task status when authorized by invocation token. |
 | `/mcp` | Streamable HTTP MCP server for configured tools/resources/prompts. |
+| `GET /v1/models` | Runs `endpoints.models` when configured; otherwise returns one `default` model using `manifest.capabilities.tags` or `generic-agent`. |
 | Static files | Serves files from code root for other GET/HEAD paths. |
 | `endpoints.chatCompletions` | Optional OpenAI-style `/v1/chat/completions` backed by a command spec. |
 

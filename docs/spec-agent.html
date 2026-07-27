@@ -82,24 +82,28 @@
 
   // Metadata
   "about": "Express API server",      // Description shown in listings
-  "endpoints": {                     // OpenAI + capability endpoints
+  "endpoints": {                     // OpenAI-compatible endpoints
     "chatCompletions": {
       "command": "node",
       "args": ["/code/openai-chat.js"],
       "supportsStream": true
     },
-    "capabilities": {                // Optional open-ended capability metadata
-      "tags": ["fast", "coding"],
-      "summary": "Short agent summary",
-      "whenToUse": "Use for quick code-focused requests.",
-      "input": {
-        "conventions": "Natural language prompt; supports OpenAI chat payloads.",
-        "schema": {
-          "type": "object",
-          "properties": {
-            "messages": { "type": "array" },
-            "stream": { "type": "boolean" }
-          }
+    "models": {
+      "command": "node",
+      "args": ["/code/openai-models.js"]
+    }
+  },
+  "capabilities": {                  // Optional open-ended capability metadata
+    "tags": ["coding-agent"],
+    "summary": "Short agent summary",
+    "whenToUse": "Use for code-focused requests.",
+    "input": {
+      "conventions": "Natural language prompt; supports OpenAI chat payloads.",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "messages": { "type": "array" },
+          "stream": { "type": "boolean" }
         }
       }
     }
@@ -202,7 +206,12 @@
                             <tr>
                                 <td><code>endpoints</code></td>
                                 <td>No</td>
-                                <td>Endpoint configuration for <code>/v1/chat/completions</code> and <code>/agent-card</code>, including <code>chatCompletions</code> command specs and open-ended <code>capabilities</code> metadata. RoutingServer also aggregates agent capability responses at <code>/agent-card</code> without enforcing a fixed metadata schema.</td>
+                                <td>Endpoint configuration for <code>/v1/chat/completions</code>, <code>/v1/models</code>, and <code>/agent-card</code>. A missing <code>endpoints.models</code> handler produces one fallback model using top-level <code>capabilities.tags</code>, or <code>generic-agent</code> when no tags are declared.</td>
+                            </tr>
+                            <tr>
+                                <td><code>capabilities</code></td>
+                                <td>No</td>
+                                <td>Open-ended agent capability metadata. Normalized <code>tags</code> become the fallback model's functional tags when no custom models handler exists.</td>
                             </tr>
                             <tr>
                                 <td><code>env</code></td>

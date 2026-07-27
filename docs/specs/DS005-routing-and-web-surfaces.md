@@ -132,9 +132,15 @@ current `remoteTaskId`, set the task back to `ongoing`, and append subsequent
 logs to the same task log. Before remote output is appended, the CLI must append
 the submitted continuation prompt to the durable log and publish that exact
 delta and its resulting offset so an already open task view shows the prompt in
-sequence. Late lifecycle events from an older turn or remote
+sequence. The shared browser presentation must normalize historical `User:`
+prompt lines and current `you>` prompt lines to `you> <prompt>`, then render
+them with a bold, accented prompt style that remains visually distinct from
+provider output. Late lifecycle events from an older turn or remote
 task id must not overwrite the current turn. The original task description and
 creation time remain stable, while `executionStartedAt` tracks the current turn.
+Task-log regions must reserve a persistent scrollbar gutter and render a
+high-contrast, theme-aware scrollbar so long histories remain visibly and
+directly navigable in both the Tasks overlay and authenticated task view.
 The parent stream remains the live update path. If the stored agent is installed
 but has no ready route, including after a general restart left a
 `startup: manual` provider stopped, the selected CLI must activate that exact
@@ -223,6 +229,10 @@ with the intermediate style. Browser rendering strips ANSI control sequences
 and retains presentation compatibility for historical logs that contain
 recognized stream and runner prefixes; new raw provider output remains
 otherwise unchanged.
+
+When an ongoing task becomes terminal, WebChat may show the existing transient
+task toast. That toast must include an accessible close button on its right so
+the operator can dismiss it immediately without waiting for automatic expiry.
 
 When a WebChat runtime has no SSE subscribers but has received a task whose materialized state is `ongoing`, reconnect cleanup must retain that runtime so the selected CLI can continue router-mediated polling and log collection. Once its tasks become terminal, the normal reconnect grace and disposal behavior resumes. If the runtime is recreated after a wider process restart, the selected CLI reattaches from its workspace task journal. Initial task identity is derived from target agent and remote task id; after continuation, the stable local task id plus its monotonically increasing turn select the current remote task. A PID is optional diagnostics only.
 

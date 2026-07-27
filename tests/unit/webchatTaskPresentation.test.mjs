@@ -9,6 +9,7 @@ import {
     taskDurationSeconds,
     taskStatusPresentation,
 } from '../../cli/server/webchat/taskPresentation.js';
+import { createTaskController } from '../../cli/server/webchat/tasks.js';
 
 test('task log updates append in order, ignore duplicates, and request gap recovery', () => {
     const current = { text: 'one', offset: 3 };
@@ -68,10 +69,56 @@ test('task log presentation keeps continuation prompts visible before provider o
     ].join('\n'));
     assert.deepEqual(parsed, [
         { text: '[Continuation 2]', stream: 'stdout' },
-        { text: 'User: finish the tests', stream: 'stdout' },
+        { text: 'you> finish the tests', stream: 'stdout' },
         { text: '', stream: 'stdout' },
         { text: 'Provider output', stream: 'stdout' },
     ]);
+    assert.equal(
+        parseTaskLogPresentation('you> run the focused tests')[0].kind,
+        'user-prompt',
+    );
+});
+
+test('terminal task toast can be dismissed immediately', (t) => {
+    const originalDocument = globalThis.document;
+    const originalSetInterval = globalThis.setInterval;
+    const closeListeners = new Map();
+    const taskToast = { hidden: true, textContent: '' };
+    const taskToastText = { textContent: '' };
+    const taskToastClose = {
+        addEventListener(type, listener) {
+            closeListeners.set(type, listener);
+        },
+    };
+    globalThis.document = { addEventListener() {} };
+    globalThis.setInterval = () => 0;
+    t.after(() => {
+        globalThis.document = originalDocument;
+        globalThis.setInterval = originalSetInterval;
+    });
+
+    const controller = createTaskController({
+        toEndpoint: (value) => value,
+        sendQuickCommand: () => true,
+        showBanner() {},
+        elements: { taskToast, taskToastText, taskToastClose },
+    });
+    const task = {
+        id: 'task_1234567890abcdef12345678',
+        description: 'Run tests',
+        status: 'ongoing',
+        updatedAt: '2026-07-27T10:00:00.000Z',
+    };
+    controller.handleUpdate({ event: 'started', task });
+    controller.handleUpdate({
+        event: 'update',
+        task: { ...task, status: 'finished', updatedAt: '2026-07-27T10:00:01.000Z' },
+    });
+
+    assert.equal(taskToast.hidden, false);
+    assert.equal(taskToastText.textContent, 'Run tests: COMPLETED');
+    closeListeners.get('click')();
+    assert.equal(taskToast.hidden, true);
 });
 
 test('task log presentation marks only the terminal result lines as final', () => {
