@@ -2,6 +2,7 @@ import { spawnSync } from 'child_process';
 import { parentPort } from 'worker_threads';
 import {
     getRuntime,
+    isContainerRunning,
     waitForContainerRunning,
     sleepMs
 } from './common.js';
@@ -118,6 +119,14 @@ function runProbeLoop(agentName, containerName, type, probe, options = {}) {
     let consecutiveSuccesses = 0;
     let consecutiveFailures = 0;
     while (true) {
+        const isContainerRunningImpl = options.isContainerRunningImpl || isContainerRunning;
+        if (!isContainerRunningImpl(containerName)) {
+            return {
+                status: 'failed',
+                reason: 'container exited',
+                detail: '',
+            };
+        }
         const result = runProbeOnce(agentName, containerName, probe, options);
 
         const detail = (result.stdout || result.stderr || '').trim();

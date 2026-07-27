@@ -128,6 +128,7 @@ test('blocking container script readiness succeeds after the configured success 
             { status: 0, stdout: 'ready\n', stderr: '' },
         ], calls),
         sleepMsImpl() {},
+        isContainerRunningImpl() { return true; },
     });
 
     assert.equal(result.status, 'success');
@@ -153,6 +154,7 @@ test('blocking container script readiness reports nonzero exhaustion', () => {
             { status: 9, stdout: '', stderr: 'still not ready\n' },
         ], calls),
         sleepMsImpl() {},
+        isContainerRunningImpl() { return true; },
     });
 
     assert.deepEqual(result, {
@@ -175,6 +177,7 @@ test('blocking container script readiness reports per-attempt execution timeout'
             { status: null, signal: 'SIGTERM', error: timeoutError, stdout: '', stderr: '' },
         ], []),
         sleepMsImpl() {},
+        isContainerRunningImpl() { return true; },
     });
 
     assert.deepEqual(result, { status: 'failed', reason: 'timeout', detail: '' });
@@ -190,4 +193,27 @@ test('blocking container script readiness fails fast when the script is missing'
             return { status: 1 };
         },
     }), /missing\.sh not found inside container/);
+});
+
+test('blocking container script readiness fails immediately after the container exits', () => {
+    const calls = [];
+    const result = runContainerScriptReadiness('database', 'database-container', {
+        script: 'healthcheck.sh',
+        interval: 30,
+        failureThreshold: 60,
+    }, {
+        runtime: 'fake-runtime',
+        spawnSyncImpl: fakeSpawnSequence([], calls),
+        isContainerRunningImpl() { return false; },
+        sleepMsImpl() {
+            assert.fail('an exited container must not consume another probe interval');
+        },
+    });
+
+    assert.deepEqual(result, {
+        status: 'failed',
+        reason: 'container exited',
+        detail: '',
+    });
+    assert.equal(calls.length, 1, 'only the initial script existence check should run');
 });
