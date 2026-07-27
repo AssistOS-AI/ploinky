@@ -1,6 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import { ROUTING_FILE } from '../../utils/config.js';
+import { DIRECT_CLI_PATH } from '../../utils/directCli.js';
 
 function trimCommand(value) {
     if (!value) return '';
@@ -93,7 +94,7 @@ function buildHostCliCommand(cliTarget, options = {}) {
     if (!target) {
         return '';
     }
-    let command = `ploinky cli ${target}`;
+    let command = `${shellEscapeCommandArg(DIRECT_CLI_PATH)} cli ${target}`;
     const cliArgs = normalizeCliArgs(options.cliArgs);
     if (cliArgs.length) {
         command += ` ${cliArgs.map((arg) => shellEscapeCommandArg(arg)).join(' ')}`;

@@ -91,7 +91,7 @@ function createWebchatFactoryConfig(webchatTTYModule, resolvedWebchatCommands) {
         unsupportedReason: commands?.unsupportedReason || ''
     });
     const resolveHostWorkdir = (config) => {
-        // webchat hostCommand frequently runs `ploinky cli <agent>`.
+        // webchat hostCommand runs the direct execution-plane CLI for an agent.
         // That command must run from the *workspace root* so it sees the correct
         // `.ploinky/` state (installed repos, enabled agents). If it runs from
         // `agents/<name>/`, Ploinky bootstraps a new `.ploinky/` and then fails
