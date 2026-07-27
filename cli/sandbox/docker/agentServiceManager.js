@@ -1455,9 +1455,33 @@ function resolvePublishedPortMappings(containerName, portMappings) {
     });
 }
 
-function shouldCreateImplicitAgentServerPublish(manifest, manifestPorts = [], networkMode = 'default', portMappings = []) {
+function resolveImplicitAgentServerPort(profileConfig = {}) {
+    const rawPort = profileConfig?.env?.PORT;
+    if (rawPort === undefined || rawPort === null || String(rawPort).trim() === '') {
+        return 7000;
+    }
+    const text = String(rawPort).trim();
+    if (!/^[0-9]+$/.test(text)) {
+        throw new Error(`implicit AgentServer PORT must be an integer from 1 through 65535, got '${text}'`);
+    }
+    const port = Number(text);
+    if (!Number.isSafeInteger(port) || port < 1 || port > 65535) {
+        throw new Error(`implicit AgentServer PORT must be an integer from 1 through 65535, got '${text}'`);
+    }
+    return port;
+}
+
+function shouldCreateImplicitAgentServerPublish(
+    manifest,
+    manifestPorts = [],
+    networkMode = 'default',
+    portMappings = [],
+    agentServerPort = 7000,
+) {
     if (networkMode === 'host' || networkMode === 'none') return false;
-    if (Array.isArray(portMappings) && portMappings.some((mapping) => Number(mapping?.containerPort) === 7000)) {
+    if (Array.isArray(portMappings) && portMappings.some(
+        (mapping) => Number(mapping?.containerPort) === Number(agentServerPort),
+    )) {
         return false;
     }
     return resolveAgentExecutionMode(manifest).type !== 'start_only';
@@ -1866,14 +1890,21 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
 
     const { publishArgs: manifestPorts, portMappings } = parseManifestPorts(manifest, profileConfig);
     assertHostPortContract(runtimeNetworkPlan.mode, portMappings);
+    const agentServerPort = resolveImplicitAgentServerPort(profileConfig);
     const containerPortCandidates = portMappings
         .map((mapping) => mapping?.containerPort)
         .filter((port) => typeof port === 'number' && port > 0);
     for (const servicePort of explicitServicePorts) {
         if (!containerPortCandidates.includes(servicePort)) containerPortCandidates.push(servicePort);
     }
-    if (shouldCreateImplicitAgentServerPublish(manifest, manifestPorts, runtimeNetworkPlan.mode, portMappings)) {
-        containerPortCandidates.unshift(7000);
+    if (shouldCreateImplicitAgentServerPublish(
+        manifest,
+        manifestPorts,
+        runtimeNetworkPlan.mode,
+        portMappings,
+        agentServerPort,
+    )) {
+        containerPortCandidates.unshift(agentServerPort);
     }
 
     const { raw: explicitAgentCmd } = readManifestAgentCommand(manifest);
@@ -2037,10 +2068,21 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
     let additionalPortMappings = [];
     let allPortMappings = [...portMappings];
 
-    if (shouldCreateImplicitAgentServerPublish(manifest, manifestPorts, runtimeNetworkPlan.mode, portMappings)) {
+    if (shouldCreateImplicitAgentServerPublish(
+        manifest,
+        manifestPorts,
+        runtimeNetworkPlan.mode,
+        portMappings,
+        agentServerPort,
+    )) {
         const hostPort = Number(preferredHostPort || 0);
-        const agentServerMapping = { containerPort: 7000, hostPort, hostIp: '127.0.0.1', protocol: 'tcp' };
-        additionalPorts = [`127.0.0.1:${hostPort || ''}:7000`];
+        const agentServerMapping = {
+            containerPort: agentServerPort,
+            hostPort,
+            hostIp: '127.0.0.1',
+            protocol: 'tcp',
+        };
+        additionalPorts = [`127.0.0.1:${hostPort || ''}:${agentServerPort}`];
         additionalPortMappings.push(agentServerMapping);
         allPortMappings = appendUniquePortMapping(allPortMappings, agentServerMapping);
     }
@@ -2196,10 +2238,10 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
 
     syncAgentMcpConfig(containerName, agentPath, finalInstanceName, { workDir: finalAgentWorkDir });
     const returnPort = runtimeNetworkPlan.mode === 'host'
-        ? (allPortMappings.find((p) => p.containerPort === 7000)?.containerPort
+        ? (allPortMappings.find((p) => p.containerPort === agentServerPort)?.containerPort
             || allPortMappings[0]?.containerPort
             || 0)
-        : allPortMappings.find((p) => p.containerPort === 7000)?.hostPort
+        : allPortMappings.find((p) => p.containerPort === agentServerPort)?.hostPort
         || allPortMappings[0]?.hostPort
         || 0;
         return {
@@ -2486,6 +2528,7 @@ export {
     resolveHostPort,
     resolveHostPortFromRecord,
     resolveHostPortFromRuntime,
+    resolveImplicitAgentServerPort,
     resolvePublishedPortMappings,
     restartGenerationCapabilityRuntime,
     replaceRuntimeRouterEnvFlags,

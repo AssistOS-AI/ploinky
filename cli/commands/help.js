@@ -50,7 +50,6 @@ function mainHelpText(surface) {
   sandbox status|disable|enable  Force lite-sandbox agents to use containers, or restore bwrap/seatbelt
   network status [--json]        Show managed network topology (status schema 3)
   network prune                  Remove unused workspace-owned managed networks
-  edge apply <json-file>         Validate and activate one staged edge desired-state file
   vars                           List all variable names (no values)
   var <VAR> <value>              Set a variable value
   echo <VAR|$VAR>                Print the resolved value of a variable
@@ -236,16 +235,6 @@ function showDetailedHelp(topic, subtopic, subsubtopic, { surface = 'core' } = {
             ],
             notes: 'Prune removes only unused networks bearing this workspace\'s exact Ploinky ownership labels. Foreign or attached networks are never removed.'
         },
-        'edge': {
-            description: 'Apply one staged edge publication desired-state document through the serialized generation coordinator.',
-            syntax: 'edge apply <json-file>',
-            examples: [
-                'edge apply ./edge-desired.json',
-            ],
-            notes: 'The input must be one non-symlink regular JSON file no larger than 1 MiB. Apply inactivates the current selector first, validates every captured route and policy source, and has no rollback or previous-generation fallback on failure.'
-        },
-        
-        
         'shutdown': {
             description: 'Stop and remove containers recorded in .ploinky/agents.json',
             syntax: 'shutdown',

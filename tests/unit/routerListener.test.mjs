@@ -45,6 +45,8 @@ test('RoutingServer fixes public 8080 and delegates private 8081 to exact interf
     const tcpHealth = source.indexOf("if (pathname === '/health')", authGate);
     assert.ok(authGate >= 0 && tcpHealth > authGate, 'TCP health must dispatch only after authentication');
     assert.match(source.slice(tcpHealth, tcpHealth + 800), /requireAdminControlRequest\(req, res\)/);
+    assert.match(source, /const task = await readAuthenticatedAgentTask\(\{/);
+    assert.match(source, /sendJsonResponse\(res, 200, \{ task \}, \{ 'Cache-Control': 'no-store' \}\)/);
 
     for (const port of ['', '+8080', '8080x', '0', '65536', '8081']) {
         const env = { ...process.env };

@@ -50,6 +50,7 @@ const {
     reprepareGraphAfterStartupProviders,
     reinstallAgent,
     resolveGraphNodeExecutionRecord,
+    resolveRetainedGraphNodeExecutionRecord,
     resolveManifestRouterEndpoint,
     startWorkspace,
     waitForReadinessEntries,
@@ -1045,6 +1046,143 @@ test('graph execution selection accepts colon mode syntax and alias-specific iso
         }),
         { runMode: 'isolated', projectPath: '/data/blue', develRepo: undefined },
     );
+});
+
+test('saved start stages static promotion and former-static isolation before generation preparation', () => {
+    const dataDir = path.join(tempDir, '.data');
+    const getAgentDataDirImpl = (instanceName) => path.join(dataDir, instanceName);
+    assert.deepEqual(
+        resolveRetainedGraphNodeExecutionRecord({
+            id: 'demo/root',
+            repoName: 'demo',
+            shortAgentName: 'root',
+            alias: '',
+            isStatic: true,
+        }, {
+            runMode: 'isolated',
+            projectPath: getAgentDataDirImpl('root'),
+        }, {
+            workspaceRoot: tempDir,
+            getAgentDataDirImpl,
+        }),
+        { runMode: 'isolated', projectPath: tempDir, develRepo: undefined },
+    );
+    assert.deepEqual(
+        resolveRetainedGraphNodeExecutionRecord({
+            id: 'extra:demo',
+            repoName: 'demo',
+            shortAgentName: 'demo',
+            alias: '',
+            isStatic: false,
+        }, {
+            runMode: 'isolated',
+            projectPath: tempDir,
+        }, {
+            workspaceRoot: tempDir,
+            getAgentDataDirImpl,
+        }),
+        { runMode: 'isolated', projectPath: getAgentDataDirImpl('demo'), develRepo: undefined },
+    );
+
+    const rootNode = {
+        id: 'demo/root',
+        repoName: 'demo',
+        shortAgentName: 'root',
+        alias: '',
+        agentRef: 'demo/root',
+        profile: 'default',
+        isStatic: true,
+    };
+    const formerStaticNode = {
+        id: 'extra:demo_container',
+        repoName: 'demo',
+        shortAgentName: 'demo',
+        alias: '',
+        agentRef: 'demo/demo',
+        profile: 'default',
+        isStatic: false,
+    };
+    const registry = {
+        root_container: {
+            type: 'agent',
+            repoName: 'demo',
+            agentName: 'root',
+            runMode: 'isolated',
+            projectPath: getAgentDataDirImpl('root'),
+            instanceId: 'root-old-instance',
+            enableGeneration: 'root-old-generation',
+        },
+        demo_container: {
+            type: 'agent',
+            repoName: 'demo',
+            agentName: 'demo',
+            runMode: 'isolated',
+            projectPath: tempDir,
+            instanceId: 'demo-old-instance',
+            enableGeneration: 'demo-old-generation',
+        },
+    };
+    const routing = {
+        routes: {
+            root: { container: 'root_container', repo: 'demo', agent: 'root', hostPort: 41001 },
+            demo: { container: 'demo_container', repo: 'demo', agent: 'demo', hostPort: 41002 },
+        },
+    };
+    const events = [];
+    const ids = [
+        'demo-new-instance',
+        'demo-new-generation',
+        'root-new-instance',
+        'root-new-generation',
+    ];
+
+    const result = ensureGraphNodesEnabled({
+        nodes: new Map([[rootNode.id, rootNode]]),
+    }, registry, {
+        additionalNodes: [formerStaticNode],
+        runtimeReplacementReason() { return ''; },
+        inactivateGeneration() { events.push('inactive'); },
+        loadRouting() { return routing; },
+        saveAgents() { events.push('registry'); },
+        saveRouting(next) {
+            events.push('routing');
+            assert.equal(Object.hasOwn(next.routes.root, 'hostPort'), false);
+            assert.equal(Object.hasOwn(next.routes.demo, 'hostPort'), false);
+        },
+        prepareAgentEnableBatch(requests) {
+            events.push('prepared');
+            assert.deepEqual(requests, []);
+            assert.equal(registry.root_container.projectPath, tempDir);
+            assert.equal(registry.demo_container.projectPath, getAgentDataDirImpl('demo'));
+            return {
+                plans: [],
+                preparedGeneration: {
+                    selector: { state: 'inactive' },
+                    preparationLease: { transactionId: 'saved-start-lease' },
+                },
+            };
+        },
+        removeAgentContainerForRecreate(containerName) {
+            events.push(`removed:${containerName}`);
+        },
+        uuid() {
+            return ids.shift();
+        },
+        executionRecordOptions: {
+            workspaceRoot: tempDir,
+            getAgentDataDirImpl,
+        },
+    });
+
+    assert.deepEqual(events, [
+        'inactive',
+        'registry',
+        'routing',
+        'prepared',
+        'removed:root_container',
+        'removed:demo_container',
+    ]);
+    assert.deepEqual(result.changedContainers, ['root_container', 'demo_container']);
 });
 
 test('resolveWorkspaceDependencyGraph resolves same-repo bare dependencies when enabled repos are filtered', (t) => {

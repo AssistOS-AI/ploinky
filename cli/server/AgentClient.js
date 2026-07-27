@@ -13,6 +13,10 @@ const DEFAULT_TOOL_CALL_TIMEOUT_MS = parsePositiveInt(
   process.env.PLOINKY_MCP_TOOL_CALL_TIMEOUT_MS,
   600000
 );
+const DEFAULT_REQUEST_TIMEOUT_MS = parsePositiveInt(
+  process.env.PLOINKY_MCP_REQUEST_TIMEOUT_MS,
+  5000
+);
 
 function createAgentClient(baseUrl, options = {}) {
   let client = null;
@@ -22,6 +26,7 @@ function createAgentClient(baseUrl, options = {}) {
     ? options.requestHeaders
     : null;
   const beforeConnect = typeof options?.beforeConnect === 'function' ? options.beforeConnect : null;
+  const requestTimeoutMs = parsePositiveInt(options?.requestTimeoutMs, DEFAULT_REQUEST_TIMEOUT_MS);
 
   async function connect() {
     if (connected && client && transport) return;
@@ -34,13 +39,13 @@ function createAgentClient(baseUrl, options = {}) {
       ? { requestInit: { headers: requestHeaders } }
       : undefined);
     client = new Client({ name: 'ploinky-router', version: '1.0.0' });
-    await client.connect(transport);
+    await client.connect(transport, { timeout: requestTimeoutMs });
     connected = true;
   }
 
   async function listTools() {
     await connect();
-    const { tools } = await client.listTools({});
+    const { tools } = await client.listTools({}, { timeout: requestTimeoutMs });
     return tools || [];
   }
 
@@ -57,19 +62,19 @@ function createAgentClient(baseUrl, options = {}) {
 
   async function listResources() {
     await connect();
-    const { resources } = await client.listResources({});
+    const { resources } = await client.listResources({}, { timeout: requestTimeoutMs });
     return resources || [];
   }
 
   async function readResource(uri) {
     await connect();
-    const res = await client.readResource({ uri });
+    const res = await client.readResource({ uri }, { timeout: requestTimeoutMs });
     return res?.resource ?? res;
   }
 
   async function ping() {
     await connect();
-    return await client.ping();
+    return await client.ping({ timeout: requestTimeoutMs });
   }
 
   async function close() {

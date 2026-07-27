@@ -310,6 +310,54 @@ process.stdout.write(JSON.stringify({
     });
 });
 
+test('implicit AgentServer publication follows the effective profile PORT', () => {
+    const result = runModuleSnippet(
+        `const {
+  resolveImplicitAgentServerPort,
+  shouldCreateImplicitAgentServerPublish,
+} = await import(${JSON.stringify(agentServiceManagerUrl)});
+const configuredPort = resolveImplicitAgentServerPort({ env: { PORT: '8888' } });
+process.stdout.write(JSON.stringify({
+  defaultPort: resolveImplicitAgentServerPort({}),
+  configuredPort,
+  needsConfiguredPublish: shouldCreateImplicitAgentServerPublish({}, [], 'default', [], configuredPort),
+  reusesConfiguredPublish: shouldCreateImplicitAgentServerPublish(
+    {},
+    [],
+    'default',
+    [{ containerPort: 8888, hostPort: 18888, hostIp: '127.0.0.1', protocol: 'tcp' }],
+    configuredPort,
+  ),
+}));`,
+    );
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(JSON.parse(result.stdout), {
+        defaultPort: 7000,
+        configuredPort: 8888,
+        needsConfiguredPublish: true,
+        reusesConfiguredPublish: false,
+    });
+});
+
+test('implicit AgentServer publication rejects an invalid effective profile PORT', () => {
+    const result = runModuleSnippet(
+        `const { resolveImplicitAgentServerPort } = await import(${JSON.stringify(agentServiceManagerUrl)});
+for (const value of ['abc', '0', '65536']) {
+  try {
+    resolveImplicitAgentServerPort({ env: { PORT: value } });
+  } catch (error) {
+    process.stdout.write(value + ':' + error.message + '\\n');
+  }
+}`,
+    );
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /abc:implicit AgentServer PORT must be an integer/);
+    assert.match(result.stdout, /0:implicit AgentServer PORT must be an integer/);
+    assert.match(result.stdout, /65536:implicit AgentServer PORT must be an integer/);
+});
+
 test('implicit AgentServer mapping appends without erasing or duplicating declared ports', () => {
     const result = runModuleSnippet(
         `const { appendUniquePortMapping, resolveHostPortFromRecord } = await import(${JSON.stringify(agentServiceManagerUrl)});
@@ -405,6 +453,34 @@ process.stdout.write(getConfiguredProjectPath('demo', 'repo', 'demoAlias'));`,
 
         assert.equal(result.status, 0, result.stderr);
         assert.equal(result.stdout, path.join(workspaceDir, '.data', 'demoAlias'));
+    } finally {
+        fs.rmSync(workspaceDir, { recursive: true, force: true });
+    }
+});
+
+test('getConfiguredProjectPath recognizes a qualified static agent identity', () => {
+    const workspaceDir = tempDir();
+    try {
+        fs.mkdirSync(path.join(workspaceDir, '.ploinky'), { recursive: true });
+        fs.writeFileSync(path.join(workspaceDir, '.ploinky/agents.json'), JSON.stringify({
+            _config: { static: { agent: 'repo/demo' } },
+            demoContainer: {
+                type: 'agent',
+                agentName: 'demo',
+                repoName: 'repo',
+                runMode: 'isolated',
+            },
+        }));
+
+        const result = runModuleSnippet(
+            `const { getConfiguredProjectPath } = await import(${JSON.stringify(dockerCommonUrl)});
+process.stdout.write(getConfiguredProjectPath('demo', 'repo'));`,
+            {},
+            { cwd: workspaceDir },
+        );
+
+        assert.equal(result.status, 0, result.stderr);
+        assert.equal(result.stdout, workspaceDir);
     } finally {
         fs.rmSync(workspaceDir, { recursive: true, force: true });
     }

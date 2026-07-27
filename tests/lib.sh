@@ -2,9 +2,18 @@
 set -euo pipefail
 
 TESTS_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+PLOINKY_FAST_CLI="${PLOINKY_FAST_CLI:-$TESTS_DIR/../bin/ploinky-local}"
 
 : "${FAST_STATE_FILE:?FAST_STATE_FILE is not set. Export it before sourcing lib.sh.}"
 touch "$FAST_STATE_FILE"
+
+# The fast suite builds its fixture directly in a temporary host workspace.
+# Use the branch-local CLI so that every command sees that exact fixture,
+# instead of routing through a Box whose workspace mount points elsewhere.
+ploinky() {
+  PLOINKY_ROUTER_HEALTH_SOCKET="${PLOINKY_ROUTER_HEALTH_SOCKET:-${TEST_ROUTER_HEALTH_SOCKET:-}}" \
+    "$PLOINKY_FAST_CLI" "$@"
+}
 
 if [[ -t 1 ]]; then
   FAST_COLOR_STAGE=$'\033[92m'
@@ -557,7 +566,12 @@ assert_container_running() {
     fi
   else
     require_runtime || return 1
-    if ! $FAST_CONTAINER_RUNTIME ps --format '{{.Names}}' | grep -Fxq "$container"; then
+    local container_names
+    if ! container_names=$($FAST_CONTAINER_RUNTIME ps --format '{{.Names}}'); then
+      echo "Unable to list running containers." >&2
+      return 1
+    fi
+    if ! grep -Fxq "$container" <<<"$container_names"; then
       echo "Container '${container}' is not running." >&2
       return 1
     fi
@@ -580,7 +594,12 @@ assert_container_stopped() {
     fi
   else
     require_runtime || return 1
-    if $FAST_CONTAINER_RUNTIME ps --format '{{.Names}}' | grep -Fxq "$container"; then
+    local container_names
+    if ! container_names=$($FAST_CONTAINER_RUNTIME ps --format '{{.Names}}'); then
+      echo "Unable to list running containers." >&2
+      return 1
+    fi
+    if grep -Fxq "$container" <<<"$container_names"; then
       echo "Container '${container}' is still running." >&2
       return 1
     fi
@@ -608,7 +627,12 @@ assert_container_exists() {
     fi
   else
     require_runtime || return 1
-    if ! $FAST_CONTAINER_RUNTIME ps -a --format '{{.Names}}' | grep -Fxq "$container"; then
+    local container_names
+    if ! container_names=$($FAST_CONTAINER_RUNTIME ps -a --format '{{.Names}}'); then
+      echo "Unable to list containers." >&2
+      return 1
+    fi
+    if ! grep -Fxq "$container" <<<"$container_names"; then
       echo "Container '${container}' does not exist." >&2
       return 1
     fi
@@ -635,7 +659,12 @@ assert_container_absent() {
     return 1
   else
     require_runtime || return 1
-    if $FAST_CONTAINER_RUNTIME ps -a --format '{{.Names}}' | grep -Fxq "$container"; then
+    local container_names
+    if ! container_names=$($FAST_CONTAINER_RUNTIME ps -a --format '{{.Names}}'); then
+      echo "Unable to list containers." >&2
+      return 1
+    fi
+    if grep -Fxq "$container" <<<"$container_names"; then
       echo "Container '${container}' still exists." >&2
       return 1
     fi
@@ -914,7 +943,12 @@ wait_for_container() {
   else
     require_runtime || return 1
     for (( i=0; i<attempts; i++ )); do
-      if $FAST_CONTAINER_RUNTIME ps --format '{{.Names}}' | grep -Fxq "$container"; then
+      local container_names
+      if ! container_names=$($FAST_CONTAINER_RUNTIME ps --format '{{.Names}}'); then
+        echo "Unable to list running containers." >&2
+        return 1
+      fi
+      if grep -Fxq "$container" <<<"$container_names"; then
         return 0
       fi
       sleep "$delay"
@@ -976,7 +1010,12 @@ wait_for_container_stop() {
   else
     require_runtime || return 1
     for (( i=0; i<attempts; i++ )); do
-      if ! $FAST_CONTAINER_RUNTIME ps --format '{{.Names}}' | grep -Fxq "$container"; then
+      local container_names
+      if ! container_names=$($FAST_CONTAINER_RUNTIME ps --format '{{.Names}}'); then
+        echo "Unable to list running containers." >&2
+        return 1
+      fi
+      if ! grep -Fxq "$container" <<<"$container_names"; then
         return 0
       fi
       sleep "$delay"
@@ -988,32 +1027,33 @@ wait_for_container_stop() {
 
 wait_for_router() {
   load_state
-  require_var "TEST_ROUTER_PORT" || return 1
-  local port="$TEST_ROUTER_PORT"
+  require_var "TEST_ROUTER_HEALTH_SOCKET" || return 1
+  local socket="$TEST_ROUTER_HEALTH_SOCKET"
   local attempts=120
   local delay=0.5
   local i
   for (( i=0; i<attempts; i++ )); do
-    if curl -fsS "http://127.0.0.1:${port}/status" >/dev/null 2>&1; then
+    if curl -fsS --unix-socket "$socket" "http://localhost/health" 2>/dev/null \
+      | grep -q '"status":"healthy"'; then
       return 0
     fi
     sleep "$delay"
   done
-  echo "Router is not responding on port ${port} after ${attempts} attempts." >&2
+  echo "Router detailed health is not responding on socket ${socket} after ${attempts} attempts." >&2
   return 1
 }
 
 assert_router_status_ok() {
   load_state
-  require_var "TEST_ROUTER_PORT" || return 1
-  local port="$TEST_ROUTER_PORT"
+  require_var "TEST_ROUTER_HEALTH_SOCKET" || return 1
+  local socket="$TEST_ROUTER_HEALTH_SOCKET"
   local response
-  if ! response=$(curl -fsS "http://127.0.0.1:${port}/status/data" 2>/dev/null); then
-    echo "Failed to fetch router status on port ${port}." >&2
+  if ! response=$(curl -fsS --unix-socket "$socket" "http://localhost/health" 2>/dev/null); then
+    echo "Failed to fetch Router detailed health on socket ${socket}." >&2
     return 1
   fi
-  if ! grep -q '"ok":true' <<<"$response"; then
-    echo "Router status missing ok=true flag: ${response}" >&2
+  if ! grep -q '"status":"healthy"' <<<"$response"; then
+    echo "Router health missing status=healthy: ${response}" >&2
     return 1
   fi
 }

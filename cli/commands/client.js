@@ -16,7 +16,7 @@ export function buildLocalCliSessionHeaders() {
             name: 'Local CLI',
             email: '',
             roles: ['user', 'admin'],
-        }, 1);
+        }, 1, { channel: 'cli' });
         return { cookie: `${LOCAL_AUTH_COOKIE_NAME}=${token}` };
     } catch (_) {
         return {};
@@ -221,7 +221,7 @@ class ClientCommands {
 
         try {
             await this.withRouterClient(async (client) => {
-                const result = await client.callTool(toolName, payloadObj);
+                const result = await client.callTool(toolName, payloadObj, { agent });
                 console.log(JSON.stringify(result, null, 2));
             });
         } catch (err) {

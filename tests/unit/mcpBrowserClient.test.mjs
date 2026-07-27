@@ -132,6 +132,66 @@ test('MCP browser client treats agent-first MCP routes as router proxy endpoints
     assert.equal(seenMethods.includes('GET'), false);
 });
 
+test('MCP browser client can close while its aggregate SSE probe is pending', async () => {
+    let resolveStreamProbe;
+    const streamProbeStarted = new Promise((resolve) => {
+        resolveStreamProbe = resolve;
+    });
+    const server = http.createServer((req, res) => {
+        if (req.method === 'GET') {
+            resolveStreamProbe();
+            req.on('close', () => {
+                if (!res.writableEnded) res.end();
+            });
+            return;
+        }
+        if (req.method === 'DELETE') {
+            res.writeHead(204);
+            res.end();
+            return;
+        }
+        const chunks = [];
+        req.on('data', chunk => chunks.push(chunk));
+        req.on('end', () => {
+            const body = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}');
+            if (body.method === 'initialize') {
+                res.writeHead(200, {
+                    'content-type': 'application/json',
+                    'mcp-session-id': 'session-aggregate',
+                });
+                res.end(JSON.stringify({
+                    jsonrpc: '2.0',
+                    id: body.id,
+                    result: {
+                        protocolVersion: '2025-06-18',
+                        capabilities: {},
+                        serverInfo: { name: 'aggregate', version: '1.0.0' },
+                    },
+                }));
+                return;
+            }
+            if (body.method === 'notifications/initialized') {
+                res.writeHead(204);
+                res.end();
+                return;
+            }
+            res.writeHead(500);
+            res.end('unexpected request');
+        });
+    });
+
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+    try {
+        const { port } = server.address();
+        const client = createAgentClient(`http://127.0.0.1:${port}/mcp`);
+        await Promise.all([client.connect(), streamProbeStarted]);
+        await client.close();
+        await new Promise((resolve) => setImmediate(resolve));
+    } finally {
+        await new Promise((resolve) => server.close(resolve));
+    }
+});
+
 test('MCP browser client forwards only a caller-selected enable mode', async () => {
     const requests = [];
     let running = false;
@@ -206,4 +266,168 @@ test('MCP browser client skips enable_agent for an already running agent', async
     }
 
     assert.deepEqual(methods, ['GET']);
+});
+
+test('MCP browser client binds a tool call to the caller-selected Router agent', async () => {
+    let toolCall = null;
+    const server = http.createServer((req, res) => {
+        if (req.method === 'GET') {
+            res.writeHead(405);
+            res.end();
+            return;
+        }
+        if (req.method === 'DELETE') {
+            res.writeHead(204);
+            res.end();
+            return;
+        }
+        const chunks = [];
+        req.on('data', chunk => chunks.push(chunk));
+        req.on('end', () => {
+            const body = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}');
+            const headers = {
+                'content-type': 'application/json',
+                'mcp-session-id': 'session-agent-binding',
+            };
+            if (body.method === 'initialize') {
+                res.writeHead(200, headers);
+                res.end(JSON.stringify({
+                    jsonrpc: '2.0',
+                    id: body.id,
+                    result: {
+                        protocolVersion: '2025-06-18',
+                        capabilities: { tools: {} },
+                        serverInfo: { name: 'router', version: '1.0.0' },
+                    },
+                }));
+                return;
+            }
+            if (body.method === 'notifications/initialized') {
+                res.writeHead(204);
+                res.end();
+                return;
+            }
+            if (body.method === 'tools/call') {
+                toolCall = body.params;
+                res.writeHead(200, headers);
+                res.end(JSON.stringify({
+                    jsonrpc: '2.0',
+                    id: body.id,
+                    result: { content: [{ type: 'text', text: 'ok' }] },
+                }));
+                return;
+            }
+            res.writeHead(500);
+            res.end('unexpected request');
+        });
+    });
+
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+    try {
+        const { port } = server.address();
+        const client = createAgentClient(`http://127.0.0.1:${port}/mcp`);
+        await client.callTool('run_simulation', { iterations: 10 }, { agent: 'simulator' });
+        await client.close();
+    } finally {
+        await new Promise((resolve) => server.close(resolve));
+    }
+
+    assert.equal(toolCall?._meta?.router?.agent, 'simulator');
+});
+
+test('MCP browser client forwards configured authentication while polling an async task', async () => {
+    const taskPollHeaders = [];
+    const server = http.createServer((req, res) => {
+        if (req.method === 'GET' && req.url?.startsWith('/demo/task?')) {
+            taskPollHeaders.push(req.headers['x-test-auth'] || '');
+            res.writeHead(200, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({
+                task: {
+                    id: 'task-1',
+                    toolName: 'demo_async_task',
+                    status: 'completed',
+                    createdAt: '2026-07-27T00:00:00.000Z',
+                    updatedAt: '2026-07-27T00:00:01.000Z',
+                    result: {
+                        content: [{ type: 'text', text: 'Task completed' }],
+                        metadata: {},
+                    },
+                },
+            }));
+            return;
+        }
+        if (req.method === 'DELETE') {
+            res.writeHead(204);
+            res.end();
+            return;
+        }
+        if (req.method !== 'POST') {
+            res.writeHead(500);
+            res.end('unexpected request');
+            return;
+        }
+
+        const chunks = [];
+        req.on('data', chunk => chunks.push(chunk));
+        req.on('end', () => {
+            const body = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}');
+            const headers = {
+                'content-type': 'application/json',
+                'mcp-session-id': 'session-async-task',
+            };
+            if (body.method === 'initialize') {
+                res.writeHead(200, headers);
+                res.end(JSON.stringify({
+                    jsonrpc: '2.0',
+                    id: body.id,
+                    result: {
+                        protocolVersion: '2025-06-18',
+                        capabilities: { tools: {} },
+                        serverInfo: { name: 'router', version: '1.0.0' },
+                    },
+                }));
+                return;
+            }
+            if (body.method === 'notifications/initialized') {
+                res.writeHead(204);
+                res.end();
+                return;
+            }
+            if (body.method === 'tools/call') {
+                res.writeHead(200, headers);
+                res.end(JSON.stringify({
+                    jsonrpc: '2.0',
+                    id: body.id,
+                    result: {
+                        content: [{ type: 'text', text: 'Task queued' }],
+                        metadata: {
+                            taskId: 'task-1',
+                            agent: 'demo',
+                            status: 'queued',
+                        },
+                    },
+                }));
+                return;
+            }
+            res.writeHead(500);
+            res.end('unexpected request');
+        });
+    });
+
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+    try {
+        const { port } = server.address();
+        const client = createAgentClient(`http://127.0.0.1:${port}/demo/mcp`, {
+            requestHeaders: {
+                'x-test-auth': 'router-issued',
+            },
+        });
+        const result = await client.callTool('demo_async_task', {}, { agent: 'demo' });
+        assert.equal(result.content[0].text, 'Task completed');
+        await client.close();
+    } finally {
+        await new Promise((resolve) => server.close(resolve));
+    }
+
+    assert.deepEqual(taskPollHeaders, ['router-issued']);
 });

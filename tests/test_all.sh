@@ -115,8 +115,8 @@ abort_suite() {
   if [[ -z "${TEST_RUN_DIR:-}" && -f "$FAST_STATE_FILE" ]]; then
     TEST_RUN_DIR=$(awk -F'=' '/^TEST_RUN_DIR=/{print substr($0, index($0,$2))}' "$FAST_STATE_FILE" | tail -n1 | xargs printf '%s')
   fi
-  if command -v ploinky >/dev/null 2>&1; then
-    ploinky destroy >/dev/null 2>&1
+  if [[ -x "${PLOINKY_FAST_CLI:-}" ]]; then
+    "$PLOINKY_FAST_CLI" destroy >/dev/null 2>&1
   fi
   if [[ -n "${TEST_RUN_DIR:-}" && -d "$TEST_RUN_DIR" ]]; then
     rm -rf "$TEST_RUN_DIR"
@@ -143,8 +143,11 @@ source "$TESTS_DIR/lib.sh"
 init_results
 
 # Default timeouts (seconds)
-ACTION_TIMEOUT="${FAST_ACTION_TIMEOUT:-240}"
-VERIFY_TIMEOUT="${FAST_VERIFY_TIMEOUT:-300}"
+ACTION_TIMEOUT="${FAST_ACTION_TIMEOUT:-420}"
+# The saved-start verification intentionally reruns the complete start suite
+# before its persistence checks. On Podman this can exceed seven minutes even
+# when every individual check stays within its own bounded timeout.
+VERIFY_TIMEOUT="${FAST_VERIFY_TIMEOUT:-600}"
 # START_ACTION_TIMEOUT increased to 420s to account for container-based dependency installation
 # Each agent runs npm install in a container (~15s), and multiple agents are started
 START_ACTION_TIMEOUT="${FAST_START_ACTION_TIMEOUT:-420}"

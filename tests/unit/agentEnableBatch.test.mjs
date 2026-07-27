@@ -23,6 +23,10 @@ writeManifest('demo', 'nonHostDependency', {
     container: 'node:20-alpine',
     network: { mode: 'default' },
 });
+writeManifest('demo', 'staticRoot', {
+    container: 'node:20-alpine',
+    network: { mode: 'default' },
+});
 writeManifest('media', 'livekit', {
     container: 'node:20-alpine',
     network: { mode: 'host' },
@@ -121,6 +125,54 @@ test('one batch stages a non-host dependency and exact host owner before either 
 
     coordinated.applyEdgeRoutingGeneration({
         reason: 'test-complete-graph-ready',
+        preparationLease: prepared.preparedGeneration.preparationLease,
+    });
+});
+
+test('a configured static agent stages the workspace root as its immutable project path', () => {
+    const initialized = edge.initializeFreshEdgeRoutingSources({ workspaceRoot: workspace });
+    fs.writeFileSync(
+        path.join(workspace, '.ploinky', 'repos', 'demo', 'staticRoot', 'mcp-config.json'),
+        JSON.stringify({
+            tools: [{
+                name: 'inspect_workspace',
+                tags: ['admin'],
+            }],
+        }, null, 2),
+    );
+    const registry = JSON.parse(fs.readFileSync(initialized.paths.agentsFile, 'utf8'));
+    registry._config = {
+        static: {
+            agent: 'staticRoot',
+            port: 8080,
+        },
+    };
+    fs.writeFileSync(initialized.paths.agentsFile, JSON.stringify(registry, null, 2));
+
+    const prepared = agents.prepareAgentEnableBatch([
+        { agentName: 'demo/staticRoot' },
+    ], { reason: 'test-static-workspace-root-prelaunch' });
+
+    const [plan] = prepared.plans;
+    assert.equal(plan.record.projectPath, workspace);
+    assert.equal(
+        prepared.preparedGeneration.generation.agents[plan.containerName].projectPath,
+        workspace,
+    );
+    assert.deepEqual(
+        prepared.preparedGeneration.generation.policy.mcpTools
+            .filter((entry) => entry.agent === 'staticRoot')
+            .map(({ agent, tool, access, source, enabled }) => ({ agent, tool, access, source, enabled })),
+        [{
+            agent: 'staticRoot',
+            tool: 'inspect_workspace',
+            access: 'admin',
+            source: 'mcp-config',
+            enabled: true,
+        }],
+    );
+    coordinated.applyEdgeRoutingGeneration({
+        reason: 'test-static-workspace-root-ready',
         preparationLease: prepared.preparedGeneration.preparationLease,
     });
 });

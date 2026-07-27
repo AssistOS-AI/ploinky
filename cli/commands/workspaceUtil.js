@@ -403,6 +403,44 @@ function resolveGraphNodeExecutionRecord(node, {
   );
 }
 
+function resolveRetainedGraphNodeExecutionRecord(node, record, {
+  workspaceRoot = PLOINKY_WORKSPACE_ROOT,
+  getAgentDataDirImpl = getAgentDataDir,
+} = {}) {
+  const runMode = String(record?.runMode || agentsSvc.DEFAULT_ENABLE_AGENT_MODE).trim().toLowerCase();
+  const instanceName = node.alias || record?.alias || node.shortAgentName;
+  let projectPath;
+  let develRepo;
+
+  if (runMode === agentsSvc.DEFAULT_ENABLE_AGENT_MODE) {
+    projectPath = getAgentDataDirImpl(instanceName);
+  } else if (runMode === 'global') {
+    projectPath = workspaceRoot;
+  } else if (runMode === 'devel') {
+    develRepo = String(record?.develRepo || '').trim();
+    projectPath = String(record?.projectPath || '').trim();
+    if (!develRepo || !projectPath || !fs.existsSync(projectPath) || !fs.statSync(projectPath).isDirectory()) {
+      throw new Error(
+        `Retained graph node '${node.id}' has an incomplete devel execution record; re-enable it with an exact repository.`,
+      );
+    }
+    projectPath = path.resolve(projectPath);
+  } else {
+    throw new Error(
+      `Retained graph node '${node.id}' has unknown mode '${runMode}'. Allowed: ${agentsSvc.ENABLE_AGENT_MODES.join(' | ')}`,
+    );
+  }
+
+  // The static agent owns the workspace-facing process contract even when it
+  // was originally enabled as an isolated instance. Conversely, an isolated
+  // agent that is no longer static must return to its per-instance data root.
+  // Stage that transition before the immutable generation is prepared so
+  // runtime finalization never changes a lifecycle-bound projectPath.
+  if (node.isStatic) projectPath = workspaceRoot;
+
+  return { runMode, projectPath, develRepo };
+}
+
 function executionRecordDiffers(record, expected) {
   const currentProjectPath = String(record?.projectPath || '').trim();
   const expectedProjectPath = String(expected.projectPath || '').trim();
@@ -648,10 +686,8 @@ function ensureGraphNodesEnabled(graph, reg, {
     const hasExplicitExecutionMode = agentsSvc.isEnableAgentMode(normalizedExecution.mode);
     const expectedExecution = hasExplicitExecutionMode
       ? resolveGraphNodeExecutionRecord(node, executionRecordOptions)
-      : null;
-    const executionChanged = Boolean(
-      expectedExecution && executionRecordDiffers(existing.rec, expectedExecution),
-    );
+      : resolveRetainedGraphNodeExecutionRecord(node, existing.rec, executionRecordOptions);
+    const executionChanged = executionRecordDiffers(existing.rec, expectedExecution);
     const profileChanged = Boolean(node.profile && existing.rec.profile !== node.profile);
     const preliminary = { node, existing, expectedExecution, executionChanged, profileChanged };
     const runtimeReason = executionChanged || profileChanged
@@ -2190,6 +2226,7 @@ export {
   resolveManifestRouterEndpoint,
   resolveAndPersistStartRouterPort,
   resolveGraphNodeExecutionRecord,
+  resolveRetainedGraphNodeExecutionRecord,
   waitForRouterReady,
   waitForManifestReadiness,
   waitForReadinessEntries,

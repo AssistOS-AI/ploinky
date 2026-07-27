@@ -43,6 +43,7 @@ function mintSessionJwt(user, rev = 1, options = {}) {
         },
         rev: Number(rev) || 1,
         uvar: usersVar || undefined,
+        chn: options?.channel === 'cli' ? 'cli' : undefined,
         iat,
         exp: iat + SESSION_TTL_SECONDS,
         jti: crypto.randomBytes(16).toString('base64url')

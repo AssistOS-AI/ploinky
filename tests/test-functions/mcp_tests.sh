@@ -33,7 +33,7 @@ fast_mcp_demo_async_task() {
   local attempts=15
   local i output
   for (( i=0; i<attempts; i++ )); do
-    output=$(ploinky client tool demo_async_task 2>&1)
+    output=$(ploinky client tool demo_async_task)
     if echo "$output" | jq -e '.metadata.taskId' >/dev/null 2>&1; then
       if echo "$output" | jq -e '.content[0].text | contains("Task completed")' >/dev/null 2>&1; then
         return 0

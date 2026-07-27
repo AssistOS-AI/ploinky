@@ -35,6 +35,8 @@ if [[ -z "${TEST_RUN_DIR:-}" ]]; then
   TEST_RUN_DIR=$(mktemp -d -t ploinky-fast-XXXXXX)
   write_state_var "TEST_RUN_DIR" "$TEST_RUN_DIR"
 fi
+TEST_ROUTER_HEALTH_SOCKET="/tmp/ploinky-router-${TEST_RUN_DIR##*.}.sock"
+write_state_var "TEST_ROUTER_HEALTH_SOCKET" "$TEST_ROUTER_HEALTH_SOCKET"
 
 test_info "Workspace root: $TEST_RUN_DIR"
 
@@ -56,9 +58,20 @@ if [[ -z "${FAST_CONTAINER_RUNTIME:-}" ]]; then
   test_info "Detected container runtime: $runtime"
 fi
 
-router_port=$(allocate_port)
+# Initialize the complete trusted graph source set before this fixture
+# customizes routing. A partial source set is intentionally rejected. Import
+# the initializer directly so fixture setup does not clone default boot repos.
+edge_generation_module="$TESTS_DIR/../cli/sandbox/edgeGeneration.js"
+node --input-type=module -e '
+  import { pathToFileURL } from "node:url";
+  const edge = await import(pathToFileURL(process.argv[1]).href);
+  edge.initializeFreshEdgeRoutingSources({ workspaceRoot: process.cwd() });
+' "$edge_generation_module"
+
+# The runtime contract exposes one exact Router TCP mapping.
+router_port=8080
 write_state_var "TEST_ROUTER_PORT" "$router_port"
-test_info "Allocated router port: $router_port"
+test_info "Using Router contract port: $router_port"
 
 mkdir -p "$TEST_RUN_DIR/.ploinky"
 cat >"$TEST_RUN_DIR/.ploinky/routing.json" <<EOF
@@ -176,7 +189,10 @@ cat >"${disable_agent_root}/manifest.json" <<'EOF'
 {
   "lite-sandbox": true,
   "container": "node:20-bullseye",
-  "agent": "node -e \"setInterval(()=>{}, 1_000_000)\""
+  "agent": "node -e \"setInterval(()=>{}, 1_000_000)\"",
+  "readiness": {
+    "protocol": "none"
+  }
 }
 EOF
 # Agent used to verify health probe behaviour
@@ -188,7 +204,7 @@ cat >"${health_agent_root}/manifest.json" <<'EOF'
 {
   "lite-sandbox": true,
   "container": "node:20-bullseye",
-  "agent": "node -e \"setInterval(()=>{}, 1_000_000)\"",
+  "start": "node -e \"setInterval(()=>{}, 1_000_000)\"",
   "health": {
     "liveness": {
       "script": "liveness_probe.sh",
@@ -244,6 +260,13 @@ cat >"${dep_devel_root}/manifest.json" <<'EOF'
   "lite-sandbox": true,
   "container": "node:20-bullseye",
   "start": "node -e \"require('net').createServer(()=>{}).listen(Number(process.env.PORT||7000), '0.0.0.0'); setInterval(()=>{}, 1_000_000)\"",
+  "httpServices": [
+    {
+      "slug": "dep-devel",
+      "port": 7000,
+      "access": "authenticated"
+    }
+  ],
   "readiness": {
     "protocol": "tcp"
   }
@@ -283,7 +306,7 @@ preclone_manifest_repo "webmeet" "https://github.com/AssistOS-AI/webmeet.git"
 # simulator/moderator/explorer are running and that explorer's preinstall +
 # npm install ran — none of explorer's transitive deps are exercised.
 slim_manifest_enable ".ploinky/repos/demo/demo/manifest.json" \
-  '["simulator","moderator","explorer global"]'
+  '["demo/simulator","webmeet/moderator","fileExplorer/explorer global"]'
 slim_manifest_enable ".ploinky/repos/fileExplorer/explorer/manifest.json" '[]'
 slim_manifest_enable ".ploinky/repos/webmeet/moderator/manifest.json" '[]'
 
@@ -328,7 +351,7 @@ write_state_var "TEST_GLOBAL_AGENT_CONTAINER_PORT" "$global_agent_internal_port"
 cat >"${global_agent_root}/manifest.json" <<EOF
 {
   "lite-sandbox": true,
-  "container": "node:18-alpine",
+  "container": "node:24.15.0-bullseye",
   "profiles": {
     "default": {
       "env": {

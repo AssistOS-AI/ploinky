@@ -17,7 +17,7 @@ test_logs_tail_router() {
 
   local output=""
   local status=0
-  output=$(timeout 2s ploinky logs tail 2>&1) || status=$?
+  output=$(timeout 2s "$PLOINKY_FAST_CLI" logs tail 2>&1) || status=$?
 
   if (( status != 0 && status != 124 )); then
     echo "'ploinky logs tail' failed with exit status ${status}." >&2
@@ -50,7 +50,7 @@ test_logs_last_five() {
   fi
 
   local output
-  if ! output=$(ploinky logs last 5 2>&1); then
+  if ! output=$(ploinky logs last 5); then
     echo "'ploinky logs last 5' failed." >&2
     printf '%s\n' "$output" >&2
     return 1

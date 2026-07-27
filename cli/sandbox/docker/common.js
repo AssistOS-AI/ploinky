@@ -51,7 +51,11 @@ function getConfiguredProjectPath(agentName, repoName, alias) {
         const staticAgent = typeof map?._config?.static?.agent === 'string'
             ? map._config.static.agent.trim()
             : '';
-        if (staticAgent && staticAgent === agentName) {
+        if (staticAgent && (
+            staticAgent === agentName
+            || staticAgent === `${repoName}/${agentName}`
+            || Boolean(alias && staticAgent === alias)
+        )) {
             return PLOINKY_WORKSPACE_ROOT;
         }
         if (alias) {

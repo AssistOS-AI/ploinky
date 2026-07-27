@@ -54,6 +54,7 @@ import {
     agentSessionStore,
     buildInvocationContextForProviderCall,
     handleAgentMcpRequest,
+    readAuthenticatedAgentTask,
     verifyDelegatedAgentTaskStatusCall,
 } from './mcp-proxy/index.js';
 import { initializeTTYFactories, createServiceConfig } from './utils/ttyFactories.js';
@@ -479,6 +480,46 @@ async function processRequest(req, res) {
         if (!authResult.ok) return;
     }
 
+    if (
+        agentName
+        && !isDelegatedAgentTaskStatusRoute
+        && isAgentTaskStatusProxyPath(agentProxyPath)
+    ) {
+        if ((req.method || 'GET').toUpperCase() !== 'GET') {
+            sendJsonResponse(res, 405, { error: 'method_not_allowed' }, {
+                'Allow': 'GET',
+                'Cache-Control': 'no-store',
+            });
+            return;
+        }
+        const taskId = parsedUrl.searchParams.get('taskId');
+        if (!taskId) {
+            sendJsonResponse(res, 400, { error: 'missing taskId' }, { 'Cache-Control': 'no-store' });
+            return;
+        }
+        if (!commitRoutePlan(routePlan)) {
+            sendJsonResponse(res, 503, { error: 'edge_generation_changed' }, { 'Cache-Control': 'no-store' });
+            return;
+        }
+        try {
+            const task = await readAuthenticatedAgentTask({
+                req,
+                route,
+                agentName,
+                taskId,
+            });
+            sendJsonResponse(res, 200, { task }, { 'Cache-Control': 'no-store' });
+        } catch (error) {
+            sendJsonResponse(
+                res,
+                Number.isInteger(error?.status) ? error.status : 502,
+                { error: error?.message || 'task_status_failed' },
+                { 'Cache-Control': 'no-store' },
+            );
+        }
+        return;
+    }
+
     // The TCP health summary is a local control surface: authenticate first and
     // require a real administrator session. Supervisors use the detailed Unix
     // socket below, so readiness never depends on an anonymous TCP exception.
@@ -497,7 +538,8 @@ async function processRequest(req, res) {
 
     const method = String(req.method || 'GET').toUpperCase();
     if (!['GET', 'HEAD', 'OPTIONS'].includes(method)
-        && (req.authMode === 'local' || req.authMode === 'sso')) {
+        && (req.authMode === 'local' || req.authMode === 'sso')
+        && req.authChannel !== 'cli') {
         const mutationProof = verifyBrowserMutationRequest(req, {
             routePlan,
             authContext: req.edgeAuthContext,

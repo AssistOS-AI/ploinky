@@ -6,7 +6,7 @@ watchdog_restart_services() {
 
   require_runtime || return 1
 
-  if ! assert_container_running "$TEST_AGENT_CONT_NAME"; then
+  if ! wait_for_container "$TEST_AGENT_CONT_NAME"; then
     echo "Container '${TEST_AGENT_CONT_NAME}' is not running before watchdog test." >&2
     return 1
   fi

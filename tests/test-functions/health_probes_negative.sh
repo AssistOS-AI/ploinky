@@ -27,7 +27,7 @@ EOF
   chmod +x "${probe_dir}/liveness_probe.sh" "${probe_dir}/readiness_probe.sh"
 }
 
-health_probes_force_success() {
+health_probes_write_success_scripts() {
   load_state
   require_var "TEST_HEALTH_AGENT_REPO_PATH"
   local probe_dir="$TEST_HEALTH_AGENT_REPO_PATH"
@@ -50,7 +50,11 @@ exit 0
 EOF
 
   chmod +x "${probe_dir}/liveness_probe.sh" "${probe_dir}/readiness_probe.sh"
+}
 
+health_probes_force_success() {
+  health_probes_write_success_scripts || return 1
+  load_state
   require_var "TEST_HEALTH_AGENT_NAME"
   require_var "TEST_REPO_NAME"
   require_var "TEST_HEALTH_AGENT_CONT_NAME"
@@ -62,6 +66,7 @@ EOF
 health_probes_wait_for_failure_logs() {
   load_state
   require_var "TEST_AGENT_START_LOG"
+  local baseline_failures="${1:-0}"
 
   local log_file="$TEST_AGENT_START_LOG"
   if [[ ! -f "$log_file" ]]; then
@@ -73,17 +78,90 @@ health_probes_wait_for_failure_logs() {
   local failure_pattern='liveness probe failed'
   local restart_pattern='restarting container'
 
-  if ! grep -q "$failure_pattern" "$log_file" 2>/dev/null; then
-    echo "Did not find liveness failure log in '$log_file'." >&2
-    tail -n 40 "$log_file" >&2
+  local attempts=120
+  local i
+  for (( i=0; i<attempts; i++ )); do
+    local current_failures
+    current_failures=$(grep -c "$failure_pattern" "$log_file" 2>/dev/null || true)
+    if (( current_failures > baseline_failures )) \
+      && grep -q "$restart_pattern" "$log_file" 2>/dev/null; then
+      return 0
+    fi
+    sleep 0.5
+  done
+
+  echo "Did not find a new liveness failure and managed restart in '$log_file'." >&2
+  tail -n 40 "$log_file" >&2
+  return 1
+}
+
+health_probes_wait_for_edge_recovery() {
+  load_state
+  require_var "TEST_HEALTH_AGENT_CONT_NAME" || return 1
+  require_var "TEST_ROUTER_PORT" || return 1
+
+  wait_for_container "$TEST_HEALTH_AGENT_CONT_NAME" || return 1
+
+  local attempts=240
+  local i
+  for (( i=0; i<attempts; i++ )); do
+    local status
+    status=$(curl -sS -o /dev/null -w '%{http_code}' \
+      "http://127.0.0.1:${TEST_ROUTER_PORT}/status" 2>/dev/null || true)
+    if [[ "$status" == "200" ]]; then
+      return 0
+    fi
+    sleep 0.5
+  done
+
+  echo "Router edge generation did not reactivate after health probe recovery." >&2
+  return 1
+}
+
+health_probes_assert_edge_inactive() {
+  load_state
+  require_var "TEST_ROUTER_PORT" || return 1
+
+  local attempts=40
+  local i
+  for (( i=0; i<attempts; i++ )); do
+    local body_file
+    body_file=$(mktemp -t ploinky-edge-inactive.XXXXXX)
+    local status
+    status=$(curl -sS -o "$body_file" -w '%{http_code}' \
+      "http://127.0.0.1:${TEST_ROUTER_PORT}/status" 2>/dev/null || true)
+    if [[ "$status" == "503" ]] && grep -q 'EDGE_GENERATION_INACTIVE' "$body_file"; then
+      rm -f "$body_file"
+      return 0
+    fi
+    rm -f "$body_file"
+    sleep 0.25
+  done
+
+  echo "Failed health probe did not inactivate Router authorization." >&2
+  return 1
+}
+
+health_probes_fail_closed_and_recovers() {
+  load_state
+  require_var "TEST_AGENT_START_LOG" || return 1
+
+  local baseline_failures
+  baseline_failures=$(grep -c 'liveness probe failed' "$TEST_AGENT_START_LOG" 2>/dev/null || true)
+
+  health_probes_force_failure || return 1
+  if ! health_probes_wait_for_failure_logs "$baseline_failures"; then
+    health_probes_write_success_scripts || true
+    return 1
+  fi
+  if ! health_probes_assert_edge_inactive; then
+    health_probes_write_success_scripts || true
     return 1
   fi
 
-  if ! grep -q "$restart_pattern" "$log_file" 2>/dev/null; then
-    echo "Did not find restart log in '$log_file'." >&2
-    tail -n 40 "$log_file" >&2
-    return 1
-  fi
-
-  return 0
+  # Restore the trusted probe source before the scheduled managed replacement
+  # reaches semantic readiness. The watchdog must then reactivate the exact
+  # generation without an unrelated CLI mutation racing its preparation.
+  health_probes_write_success_scripts || return 1
+  health_probes_wait_for_edge_recovery
 }

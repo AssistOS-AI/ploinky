@@ -287,13 +287,6 @@ Routing configuration (.ploinky/routing.json):
 - Routes:
   demo -&gt; agent=demo method=- hostPort=-</code></pre>
 
-                        <h3>edge apply</h3>
-                        <p>Apply one staged edge desired-state JSON document through the serialized generation coordinator. The input must be a non-symlink regular file no larger than 1 MiB. Apply inactivates affected selectors first, captures and validates the exact route/policy sources, and has no rollback or previous-generation fallback if validation fails.</p>
-                        <pre><code>edge apply &lt;json-file&gt;
-
-# Example
-edge apply ./edge-desired.json</code></pre>
-
                         <h3>restart</h3>
                         <p>Restarts services. If an agent name is provided, it performs a non-destructive stop and start of that agent's container, preserving the container ID. This only affects running containers. If no agent name is provided, it restarts all agents and the router.</p>
                         <pre><code>restart [agentName]</code></pre>

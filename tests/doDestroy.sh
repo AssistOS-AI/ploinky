@@ -12,7 +12,8 @@ require_var "TEST_ROUTER_LOG"
 cd "$TEST_RUN_DIR"
 
 test_info "Destroying workspace for ${TEST_AGENT_NAME}."
-if ! timeout 60s ploinky destroy; then
+if ! PLOINKY_ROUTER_HEALTH_SOCKET="${PLOINKY_ROUTER_HEALTH_SOCKET:-${TEST_ROUTER_HEALTH_SOCKET:-}}" \
+    timeout 60s "$PLOINKY_FAST_CLI" destroy; then
     fail_message "ploinky destroy command failed or timed out after 60 seconds."
 fi
 

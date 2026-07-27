@@ -129,7 +129,12 @@ export function createListenerInterfaceClassifier({
     run = defaultRun,
     now = () => Date.now(),
     refreshIntervalMs = REFRESH_INTERVAL_MS,
+    platform = process.platform,
 } = {}) {
+    if (typeof platform !== 'string' || !platform.trim()) {
+        throw new TypeError('listener interface classifier platform must be a non-empty string');
+    }
+    const bindsRuntimeBridgeGatewaysLocally = platform === 'linux';
     const identity = workspaceNetworkIdentity(workspaceRoot);
     const namePrefix = `ploinky-nw-${identity.hash}-`;
     let gateways = new Set();
@@ -159,10 +164,17 @@ export function createListenerInterfaceClassifier({
                 const inspected = run(['network', 'inspect', name]);
                 if (!inspected?.ok) throw new Error(`cannot inspect managed network '${name}': ${inspected?.stderr || 'podman failed'}`);
                 const record = parseJsonRecord(inspected.stdout, `network '${name}' inspection`);
-                next.add(validatedManagedGateway(record, {
+                const gateway = validatedManagedGateway(record, {
                     workspaceHash: identity.hash,
                     expectedNamePrefix: namePrefix,
-                }));
+                });
+                // Podman on macOS and Windows runs its bridge networks inside a
+                // Linux VM. Those gateway addresses are not interfaces of the
+                // host process and cannot be bound there. The VM's
+                // host.containers.internal forwarding reaches host loopback.
+                // A native Linux runtime owns its bridge gateways locally, so
+                // keep the exact per-gateway listeners in that topology.
+                if (bindsRuntimeBridgeGatewaysLocally) next.add(gateway);
             }
             gateways = next;
             lastError = null;

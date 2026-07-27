@@ -369,7 +369,7 @@ function installImmutableDurable(file, bytes, mode, {
 
 function readDesiredCandidateFile(candidateFile) {
     const raw = String(candidateFile || '').trim();
-    if (!raw) throw edgeError('Usage: edge apply <json-file>', 'EDGE_DESIRED_CANDIDATE_INVALID');
+    if (!raw) throw edgeError('Edge desired-state candidate path is required.', 'EDGE_DESIRED_CANDIDATE_INVALID');
     const file = path.resolve(raw);
     let initial;
     try {
@@ -1627,6 +1627,52 @@ function lifecycleBindingDigest(captured) {
     })));
 }
 
+function lifecycleBindingChangeLabels(prepared, captured) {
+    const labels = [];
+    const preparedRouting = lifecycleRoutingProjection(prepared.routing);
+    const capturedRouting = lifecycleRoutingProjection(captured.routing);
+    if (stableStringify(preparedRouting) !== stableStringify(capturedRouting)) {
+        labels.push('routing');
+    }
+
+    const preparedAgents = lifecycleAgentProjection(prepared.agents);
+    const capturedAgents = lifecycleAgentProjection(captured.agents);
+    const agentNames = new Set([
+        ...Object.keys(preparedAgents),
+        ...Object.keys(capturedAgents),
+    ]);
+    for (const containerName of Array.from(agentNames).sort()) {
+        const before = preparedAgents[containerName];
+        const after = capturedAgents[containerName];
+        if (!before || !after) {
+            labels.push(`agents[${containerName}]`);
+            continue;
+        }
+        for (const field of Object.keys(before)) {
+            if (before[field] !== after[field]) {
+                labels.push(`agents[${containerName}].${field}`);
+            }
+        }
+    }
+
+    const capturedDigests = sourceDigests(captured);
+    for (const source of ['policy', 'desired', 'routerHostPort']) {
+        if (prepared.sourceDigests?.[source] !== capturedDigests[source]) {
+            labels.push(source);
+        }
+    }
+    const manifestKeys = new Set([
+        ...Object.keys(prepared.sourceDigests?.manifests || {}),
+        ...Object.keys(capturedDigests.manifests || {}),
+    ]);
+    for (const routeKey of Array.from(manifestKeys).sort()) {
+        if (prepared.sourceDigests?.manifests?.[routeKey] !== capturedDigests.manifests?.[routeKey]) {
+            labels.push(`manifests[${routeKey}]`);
+        }
+    }
+    return labels;
+}
+
 function readPreparationLease(paths) {
     let before;
     try {
@@ -2114,8 +2160,18 @@ export function applyEdgeRoutingGeneration(options = {}) {
         }
         if (preparationLease
             && preparationLease.lifecycleBindingDigest !== lifecycleBindingDigest(captured)) {
+            let changed = [];
+            try {
+                changed = lifecycleBindingChangeLabels(
+                    loadGenerationById(paths, preparationLease.preparedGeneration),
+                    captured,
+                );
+            } catch (_) {}
+            const detail = changed.length
+                ? ` (changed: ${changed.slice(0, 12).join(', ')}${changed.length > 12 ? ', …' : ''})`
+                : '';
             throw edgeError(
-                'edge lifecycle sources or captured manifests changed after preparation; restart from a fresh inactive generation',
+                `edge lifecycle sources or captured manifests changed after preparation${detail}; restart from a fresh inactive generation`,
                 'EDGE_PREPARATION_SOURCE_CHANGED',
             );
         }

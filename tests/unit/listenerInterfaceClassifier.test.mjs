@@ -40,7 +40,12 @@ test('managed interface classifier admits only exact owned bridge gateways and l
         if (args[1] === 'ls') return { ok: true, stdout: JSON.stringify([{ Name: networkName }]) };
         return { ok: true, stdout: JSON.stringify([networkRecord()]) };
     };
-    const classifier = createListenerInterfaceClassifier({ workspaceRoot, run, now: () => 10_000 });
+    const classifier = createListenerInterfaceClassifier({
+        workspaceRoot,
+        run,
+        now: () => 10_000,
+        platform: 'linux',
+    });
 
     assert.equal(classifier.classify('10.89.0.1'), 'managed');
     assert.equal(classifier.classify('::ffff:10.89.0.1'), 'managed');
@@ -48,6 +53,26 @@ test('managed interface classifier admits only exact owned bridge gateways and l
     assert.equal(classifier.classify('10.89.0.42'), 'unmanaged');
     assert.deepEqual(classifier.snapshot().gateways, ['10.89.0.1']);
     assert.equal(calls.filter((args) => args[1] === 'ls').length, 1);
+});
+
+test('remote-VM host topology validates managed networks without binding their VM-only gateways', () => {
+    const calls = [];
+    const run = (args) => {
+        calls.push(args);
+        if (args[1] === 'ls') return { ok: true, stdout: JSON.stringify([{ Name: networkName }]) };
+        return { ok: true, stdout: JSON.stringify([networkRecord()]) };
+    };
+    const classifier = createListenerInterfaceClassifier({
+        workspaceRoot,
+        run,
+        now: () => 10_000,
+        platform: 'darwin',
+    });
+
+    assert.equal(classifier.classify('10.89.0.1'), 'unmanaged');
+    assert.equal(classifier.classify('127.0.0.1'), 'loopback');
+    assert.deepEqual(classifier.snapshot().gateways, []);
+    assert.equal(calls.filter((args) => args[1] === 'inspect').length, 1);
 });
 
 test('managed gateway validation rejects foreign labels and non-exact bridge state', () => {
@@ -75,6 +100,7 @@ test('classifier clears previously accepted gateways when runtime inspection fai
         run,
         now: () => timestamp,
         refreshIntervalMs: 100,
+        platform: 'linux',
     });
     assert.equal(classifier.classify('10.89.0.1'), 'managed');
     fail = true;

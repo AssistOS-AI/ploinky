@@ -451,8 +451,20 @@ async function ensureAuthenticatedWithContext(req, res, parsedUrl, authContext, 
         return { ok: false, error: authContext.error };
     }
     const cookies = parseCookies(req);
+    const localCookie = cookies.get(LOCAL_AUTH_COOKIE_NAME);
+    if (localCookie) {
+        const localCliSession = await sessionTokenService.getUserSession(localCookie, { policy: {} });
+        if (localCliSession?._jwtPayload?.chn === 'cli'
+            && localCliSession?.user?.id === 'local:admin') {
+            req.user = localCliSession.user;
+            req.session = localCliSession;
+            req.sessionId = localCookie;
+            req.authMode = 'local';
+            req.authChannel = 'cli';
+            return finalizeAuthenticatedRequest(req, res, authContext, options, localCliSession);
+        }
+    }
     if (authContext.mode === 'none') {
-        const localCookie = cookies.get(LOCAL_AUTH_COOKIE_NAME);
         if (localCookie) {
             const localSession = await sessionTokenService.getUserSession(localCookie, { policy: {} });
             if (localSession) {

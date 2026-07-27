@@ -76,7 +76,6 @@ import {
 import { resolvePersistedRouterPort, resolveRouterEndpoint } from '../sandbox/routerPort.js';
 import { runOuterRuntimeShell } from '../sandbox/runtimeShell.js';
 import { createNetworkLifecycleAdapter } from '../sandbox/networkLifecycle.js';
-import { applyEdgeDesiredStateFile } from '../sandbox/coordinatedEdgeApply.js';
 import { inactivateEdgeRoutingGeneration } from '../sandbox/edgeGeneration.js';
 
 let llmAgentsLoadPromise = null;
@@ -454,14 +453,6 @@ async function handleCommand(args) {
                 break;
             }
             throw new Error('Usage: network status [--json] | network prune');
-        }
-        case 'edge': {
-            if (String(options[0] || '') !== 'apply' || options.length !== 2) {
-                throw new Error('Usage: edge apply <json-file>');
-            }
-            const result = applyEdgeDesiredStateFile(options[1]);
-            console.log(`Edge desired state active: ${result.selector.generation} (${result.selector.publicationState})`);
-            break;
         }
         case 'restart': {
             const target = (options[0] || '').trim();

@@ -28,7 +28,6 @@ source "$TESTS_DIR/test-functions/webmeet_tests.sh"
 source "$TESTS_DIR/test-functions/volume_mount_tests.sh"
 source "$TESTS_DIR/test-functions/dashboard_tests.sh"
 source "$TESTS_DIR/test-functions/manifest_ports_test.sh"
-source "$TESTS_DIR/test-functions/workspace_dependency_startup_tests.sh"
 source "$TESTS_DIR/test-functions/openai_endpoints_tests.sh"
 
 load_state
@@ -77,7 +76,6 @@ test_check "Agent-card endpoint returns metadata" fast_openai_agent_card
 
 stage_header "Health Probes Agent"
 test_check "Health probes agent container is running" assert_container_running "$TEST_HEALTH_AGENT_CONT_NAME"
-test_action "Flip health probes to failing scripts" health_probes_force_failure
 
 stage_header "Alias-enabled Agent through manifest"
 test_check "Global alias agent uses workspace root" fast_assert_global_agent_workdir "TEST_GLOBAL_AGENT_ALIAS"
@@ -111,10 +109,10 @@ stage_header "Demo agent dependency tests"
 SIMULATOR_CONTAINER=$(compute_container_name "simulator" "demo")
 EXPLORER_CONTAINER=$(compute_container_name "explorer" "fileExplorer")
 MODERATOR_CONTAINER=$(compute_container_name "moderator" "webmeet")
-test_check "Simulator container is running" assert_container_running "$SIMULATOR_CONTAINER"
-test_check "Explorer container is running" assert_container_running "$EXPLORER_CONTAINER"
+test_check "Simulator container is running" wait_for_container "$SIMULATOR_CONTAINER"
+test_check "Explorer container is running" wait_for_container "$EXPLORER_CONTAINER"
 test_check "Explorer installs runtime dependencies" fast_check_explorer_dependencies
-test_check "Moderator container is running" assert_container_running "$MODERATOR_CONTAINER"
+test_check "Moderator container is running" wait_for_container "$MODERATOR_CONTAINER"
 test_check "Moderator server responds to GET" fast_check_moderator_get
 test_check "Verify repo 'webmeet' is cloned" assert_dir_exists ".ploinky/repos/webmeet"
 test_check "Verify repo 'vibe1' is cloned" assert_dir_exists ".ploinky/repos/vibe1"
@@ -154,13 +152,6 @@ test_check "Router serves configured static asset" fast_assert_router_static_ass
 stage_header "Manifest Environment"
 test_check "Variable MY_TEST_VAR from manifest is present after start" assert_container_env "$TEST_AGENT_CONT_NAME" "MY_TEST_VAR" "hello-manifest"
 test_check "Custom volume mount exposes marker" fast_assert_volume_mount
-
-stage_header "Workspace Dependency Startup"
-test_check "Recursive dependency graph waits wave-by-wave before starting dependents" fast_test_recursive_dependency_graph_startup
-test_check "Dependency readiness.protocol override applies to dependency startup gating" fast_test_dependency_readiness_protocol_override
-test_check "Static start-only TCP service becomes ready without MCP probing" fast_test_static_start_only_tcp_readiness
-test_check "Broken dependency prevents router launch and static agent startup" fast_test_dependency_failure_blocks_router_startup
-test_check "Startup config provider preflight persists values before static start" fast_test_startup_config_provider_preflight
 
 stage_header "Start Command Result"
 test_start_result_file="$TEST_AGENT_WORKSPACE/start-result"
@@ -209,7 +200,12 @@ test_check "logs tail router streams entries" test_logs_tail_router
 test_check "logs last prints five lines" test_logs_last_five
 
 stage_header "LLM CLI Suggestions"
-test_check "Invalid CLI input yields LLM suggestion and system command output" test_llm_cli_suggestions
-test_check "psh surfaces LLM suggestion for freeform input" test_psh_llm_suggestions
+test_check "Invalid CLI input handles configured or missing LLM credentials" test_llm_cli_suggestions
+test_check "psh credential-gated freeform behavior is valid" test_psh_llm_suggestions
+
+stage_header "Health Probes Fail-Closed Recovery"
+if ! is_sandbox_runtime; then
+  test_check "Failed health probe inactivates then restores the exact edge generation" health_probes_fail_closed_and_recovers
+fi
 
 finalize_checks

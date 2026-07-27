@@ -43,4 +43,5 @@ test('local CLI session headers carry an admin user session cookie', async (t) =
     const payload = localService.verifySessionJwt(token);
     assert.equal(payload.usr.username, 'admin');
     assert.deepEqual(payload.usr.roles, ['user', 'admin']);
+    assert.equal(payload.chn, 'cli');
 });

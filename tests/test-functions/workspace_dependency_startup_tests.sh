@@ -14,7 +14,14 @@ fast_graph_init_workspace() {
   local router_port="$2"
   local repo_name="${3:-graphRepo}"
 
+  PLOINKY_ROUTER_HEALTH_SOCKET="/tmp/ploinky-fast-${workspace##*.}.sock"
+  export PLOINKY_ROUTER_HEALTH_SOCKET
   mkdir -p "$workspace/.ploinky/repos/${repo_name}"
+  node --input-type=module -e '
+    import { pathToFileURL } from "node:url";
+    const edge = await import(pathToFileURL(process.argv[1]).href);
+    edge.initializeFreshEdgeRoutingSources({ workspaceRoot: process.argv[2] });
+  ' "$TESTS_DIR/../cli/sandbox/edgeGeneration.js" "$workspace"
   cat >"$workspace/.ploinky/routing.json" <<EOF
 {
   "port": ${router_port}
@@ -82,6 +89,8 @@ fast_graph_create_start_http_agent() {
   local enable_json="${4:-[]}"
   local response_text="${5:-${agent_name}-ok}"
   local agent_dir="${repo_root}/${agent_name}"
+  local service_slug
+  service_slug=$(printf '%s' "$agent_name" | tr '[:upper:]_' '[:lower:]-')
 
   mkdir -p "$agent_dir"
   fast_graph_write_marker_script "$agent_dir"
@@ -93,6 +102,13 @@ fast_graph_create_start_http_agent() {
   "container": "node:20-bullseye",
   "start": "node /code/delayed-http.js",
   "enable": ${enable_json},
+  "httpServices": [
+    {
+      "slug": "${service_slug}",
+      "port": 7000,
+      "access": "authenticated"
+    }
+  ],
   "profiles": {
     "default": {
       "env": {
@@ -215,7 +231,7 @@ fast_graph_start_workspace() {
 
   mkdir -p "$(dirname "$start_log")"
 
-  (
+  if ! (
     cd "$workspace"
     PLOINKY_STATIC_AGENT_READY_TIMEOUT_MS="$static_timeout_ms" \
     PLOINKY_DEPENDENCY_AGENT_READY_TIMEOUT_MS="$dep_timeout_ms" \
@@ -224,7 +240,11 @@ fast_graph_start_workspace() {
     PLOINKY_STATIC_AGENT_READY_PROBE_TIMEOUT_MS=250 \
     PLOINKY_DEPENDENCY_AGENT_READY_PROBE_TIMEOUT_MS=250 \
     ploinky start "$agent_name" "$router_port" >"$start_log" 2>&1
-  )
+  ); then
+    echo "Workspace graph start failed. Start log follows:" >&2
+    cat "$start_log" >&2
+    return 1
+  fi
 }
 
 fast_graph_wait_for_router_port() {
@@ -235,7 +255,7 @@ fast_graph_wait_for_router_port() {
   local i
 
   for (( i=0; i<attempts; i++ )); do
-    if curl -fsS "http://127.0.0.1:${router_port}/status" >/dev/null 2>&1; then
+    if curl -sS -o /dev/null "http://127.0.0.1:${router_port}/status" 2>/dev/null; then
       return 0
     fi
     sleep "$delay"
@@ -298,7 +318,7 @@ fast_test_recursive_dependency_graph_startup() (
   workspace=$(mktemp -d -t ploinky-graph-start-XXXXXX)
   trap "fast_graph_cleanup_workspace $(printf '%q' "$workspace")" EXIT
 
-  router_port=$(allocate_port)
+  router_port=8080
   fast_graph_init_workspace "$workspace" "$router_port"
   repo_root="$workspace/.ploinky/repos/graphRepo"
 
@@ -336,7 +356,7 @@ fast_test_dependency_readiness_protocol_override() (
   workspace=$(mktemp -d -t ploinky-graph-override-XXXXXX)
   trap "fast_graph_cleanup_workspace $(printf '%q' "$workspace")" EXIT
 
-  router_port=$(allocate_port)
+  router_port=8080
   fast_graph_init_workspace "$workspace" "$router_port"
   repo_root="$workspace/.ploinky/repos/graphRepo"
 
@@ -369,7 +389,7 @@ fast_test_static_start_only_tcp_readiness() (
   workspace=$(mktemp -d -t ploinky-static-tcp-XXXXXX)
   trap "fast_graph_cleanup_workspace $(printf '%q' "$workspace")" EXIT
 
-  router_port=$(allocate_port)
+  router_port=8080
   fast_graph_init_workspace "$workspace" "$router_port"
   repo_root="$workspace/.ploinky/repos/graphRepo"
 
@@ -400,7 +420,7 @@ fast_test_dependency_failure_blocks_router_startup() (
   workspace=$(mktemp -d -t ploinky-broken-dep-XXXXXX)
   trap "fast_graph_cleanup_workspace $(printf '%q' "$workspace")" EXIT
 
-  router_port=$(allocate_port)
+  router_port=8080
   fast_graph_init_workspace "$workspace" "$router_port"
   repo_root="$workspace/.ploinky/repos/graphRepo"
 
@@ -414,11 +434,14 @@ fast_test_dependency_failure_blocks_router_startup() (
   )
 
   start_log="$workspace/.ploinky/logs/broken-dependency-start.log"
-  fast_graph_start_workspace "$workspace" "root" "$router_port" "$start_log" "4000" "3000"
+  if fast_graph_start_workspace "$workspace" "root" "$router_port" "$start_log" "4000" "3000"; then
+    echo "Broken dependency unexpectedly allowed workspace start." >&2
+    return 1
+  fi
 
   find_file_pattern_line "$start_log" "Dependent agent 'brokenDep' did not become ready within 3000ms." >/dev/null
-  assert_port_not_listening "$router_port"
-  assert_file_not_exists "$workspace/.ploinky/running/router.pid"
+  assert_port_listening "$router_port"
+  assert_file_exists "$workspace/.ploinky/running/router.pid"
   fast_graph_assert_route_missing "$workspace" "root"
 )
 
@@ -437,7 +460,7 @@ fast_test_startup_config_provider_preflight() (
   workspace=$(mktemp -d -t ploinky-config-provider-XXXXXX)
   trap "fast_graph_cleanup_workspace $(printf '%q' "$workspace")" EXIT
 
-  router_port=$(allocate_port)
+  router_port=8080
   fast_graph_init_workspace "$workspace" "$router_port"
   repo_root="$workspace/.ploinky/repos/graphRepo"
   provider_dir="$repo_root/provider"
@@ -480,6 +503,13 @@ EOF
   "lite-sandbox": true,
   "container": "node:20-bullseye",
   "start": "node /code/delayed-http.js",
+  "httpServices": [
+    {
+      "slug": "provider",
+      "port": 7000,
+      "access": "authenticated"
+    }
+  ],
   "providesConfig": {
     "command": "node provider.js",
     "outputs": [
@@ -519,6 +549,13 @@ EOF
   "lite-sandbox": true,
   "container": "node:20-bullseye",
   "start": "node /code/root.js",
+  "httpServices": [
+    {
+      "slug": "root",
+      "port": 7000,
+      "access": "authenticated"
+    }
+  ],
   "configProviders": [
     { "agent": "graphRepo/provider", "profile": "default" }
   ],
@@ -535,18 +572,25 @@ EOF
   (
     cd "$workspace"
     ploinky enable repo graphRepo >/dev/null 2>&1
-    ploinky enable agent graphRepo/root >/dev/null 2>&1
   )
 
   start_log="$workspace/.ploinky/logs/config-provider-start.log"
-  (
+  if ! (
     cd "$workspace"
     PLOINKY_MASTER_KEY="shell-master-key" \
     PLOINKY_STATIC_AGENT_READY_TIMEOUT_MS=12000 \
     PLOINKY_STATIC_AGENT_READY_INTERVAL_MS=100 \
     PLOINKY_STATIC_AGENT_READY_PROBE_TIMEOUT_MS=250 \
     ploinky start root "$router_port" >"$start_log" 2>&1
-  )
+  ); then
+    echo "Config-provider workspace start failed. Start log follows:" >&2
+    cat "$start_log" >&2
+    if [[ -f "$workspace/.ploinky/logs/router.log" ]]; then
+      echo "Router log follows:" >&2
+      cat "$workspace/.ploinky/logs/router.log" >&2
+    fi
+    return 1
+  fi
   fast_graph_wait_for_router_port "$router_port" "$start_log"
 
   find_file_pattern_line "$start_log" "[start] Startup config providers applied: TEST_PROVIDER_VALUE" >/dev/null

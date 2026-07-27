@@ -90,3 +90,22 @@ test('router AgentClient terminates the upstream MCP session on close', async ()
     assert.ok(deleteRequest, 'expected close() to send DELETE');
     assert.equal(deleteRequest.sessionId, 'session-1');
 });
+
+test('router AgentClient bounds initialization against a non-MCP listener', async () => {
+    const server = http.createServer((req) => {
+        req.resume();
+    });
+
+    const port = await listen(server);
+    const startedAt = Date.now();
+    try {
+        const client = createAgentClient(`http://127.0.0.1:${port}/mcp`, {
+            requestTimeoutMs: 50,
+        });
+        await assert.rejects(client.listTools(), /Request timed out/);
+        await client.close();
+    } finally {
+        await closeServer(server);
+    }
+    assert.ok(Date.now() - startedAt < 1000, 'initialization timeout must be bounded');
+});

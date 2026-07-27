@@ -81,11 +81,14 @@ fast_check_agent_blob_upload() {
 const fs = require('node:fs');
 try {
   const data = JSON.parse(fs.readFileSync(process.env.AGENTS_JSON, 'utf8') || '{}');
-  for (const [, rec] of Object.entries(data)) {
-    if (rec && rec.type === 'agent' && rec.agentName === process.env.AGENT_NAME && rec.projectPath) {
-      process.stdout.write(String(rec.projectPath));
-      return;
-    }
+  const match = Object.values(data).find((rec) => (
+    rec
+    && rec.type === 'agent'
+    && rec.agentName === process.env.AGENT_NAME
+    && rec.projectPath
+  ));
+  if (match) {
+    process.stdout.write(String(match.projectPath));
   }
 } catch (_) {}
 NODE

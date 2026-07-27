@@ -26,6 +26,9 @@ import { resolveRouterEndpoint } from '../sandbox/routerPort.js';
 import { resolveAgentExecutionMode, resolveAgentReadinessProtocol } from './runtime/startupReadiness.js';
 import { normalizeProbeConfig, runContainerScriptReadiness } from '../sandbox/docker/healthProbes.js';
 import { waitForAgentReady } from '../server/utils/agentReadiness.js';
+import { FileSystemPolicyStateStore } from '../server/policy/FileSystemPolicyStateStore.js';
+import { McpToolPolicy } from '../server/policy/McpToolPolicy.js';
+import { PolicyStateRepository } from '../server/policy/PolicyStateRepository.js';
 import {
     mergeRoutingConfig,
     mergeRuntimeRoute,
@@ -380,6 +383,14 @@ function planAgentEnable({
         throw new Error(`Unknown mode '${errorMode}'. Allowed: ${formatEnableAgentModes()}`);
     }
 
+    const configuredStaticAgent = String(map?._config?.static?.agent || '').trim();
+    const isConfiguredStaticAgent = configuredStaticAgent === shortAgentName
+        || configuredStaticAgent === `${repoName}/${shortAgentName}`
+        || Boolean(alias && configuredStaticAgent === alias);
+    if (isConfiguredStaticAgent) {
+        projectPath = PLOINKY_WORKSPACE_ROOT;
+    }
+
     // Capture only ports the selected execution/network contract can own. The
     // runtime will later replace dynamic host-port zeros in one coordinated
     // final generation after every prepared process has launched.
@@ -518,6 +529,23 @@ function createPreparedWorkspaceStructure(plan) {
     }
 }
 
+function bootstrapPreparedMcpToolPolicy(routes) {
+    const policyFile = path.join(
+        PLOINKY_WORKSPACE_ROOT,
+        '.ploinky',
+        'data',
+        'router-security',
+        'policy-state.json',
+    );
+    const repository = new PolicyStateRepository({
+        store: new FileSystemPolicyStateStore({
+            file: () => policyFile,
+            coordinate: false,
+        }),
+    });
+    return new McpToolPolicy({ repository }).bootstrap(routes);
+}
+
 /**
  * Stage exact identities and target-less routes for a set of agents, then
  * compile one immutable generation before any of their processes start.
@@ -565,6 +593,7 @@ export function prepareAgentEnableBatch(requests, {
             }
             saveAgents(map, { coordinate: false, applyLockCapability });
             writeRoutingConfig(routing, { coordinate: false });
+            bootstrapPreparedMcpToolPolicy(routing.routes);
             preparedGeneration = prepareEdgeRoutingGeneration({ reason, applyLockCapability });
             for (const plan of plans) {
                 if (plan.profileResolution.network.mode !== 'host') continue;

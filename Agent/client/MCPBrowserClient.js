@@ -338,11 +338,11 @@ function createAgentClient(baseUrl, options = {}) {
 
     async function fetchTaskStatus(taskId, poller) {
         try {
+            const headers = buildHeaders();
+            headers.set('accept', 'application/json');
             const response = await fetch(buildTaskStatusUrl(taskId, poller?.statusPath), {
                 method: 'GET',
-                headers: {
-                    accept: 'application/json'
-                },
+                headers,
                 credentials: 'include'
             });
             if (!response.ok) {
@@ -470,6 +470,7 @@ function createAgentClient(baseUrl, options = {}) {
         if (!abortController) {
             abortController = new AbortController();
         }
+        const streamController = abortController;
 
         streamTask = (async () => {
             try {
@@ -477,7 +478,7 @@ function createAgentClient(baseUrl, options = {}) {
                 const response = await fetch(endpoint, {
                     method: 'GET',
                     headers,
-                    signal: abortController.signal,
+                    signal: streamController.signal,
                     credentials: 'include'
                 });
 
@@ -496,7 +497,7 @@ function createAgentClient(baseUrl, options = {}) {
 
                 await parseSseStream(response.body);
             } catch (error) {
-                if (!abortController.signal.aborted) {
+                if (!streamController.signal.aborted) {
                     console.warn('MCP SSE stream error', error);
                 }
             } finally {
@@ -691,6 +692,13 @@ function createAgentClient(baseUrl, options = {}) {
                 name,
                 arguments: args ?? {}
             };
+            if (typeof options.agent === 'string' && options.agent.trim()) {
+                params._meta = {
+                    router: {
+                        agent: options.agent.trim(),
+                    },
+                };
+            }
             const result = await sendRequest('tools/call', params);
         const taskMetadata = result?.metadata && typeof result.metadata === 'object' ? result.metadata : null;
         const taskId = typeof taskMetadata?.taskId === 'string' && taskMetadata.taskId.trim().length

@@ -3,7 +3,6 @@
 TESTS_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 source "$TESTS_DIR/lib.sh"
 source "$TESTS_DIR/test-functions/dynamic_configuration_tests.sh"
-source "$TESTS_DIR/test-functions/health_probes_negative.sh"
 source "$TESTS_DIR/test-functions/devel_agent_verification.sh"
 
 load_state
@@ -17,14 +16,6 @@ stage_header "Devel Alias Agent Verification"
 if ! is_sandbox_runtime; then
   test_check "Alias devel agent uses repo workspace" fast_assert_devel_agent_workdir "TEST_ENABLE_ALIAS_AGENT_DEVEL_ALIAS"
 fi
-
-stage_header "Health Probes Failure Verification"
-# Health probe scripts use 'docker exec' which is not available for sandbox agents
-if ! is_sandbox_runtime; then
-  test_check "Health probes retry and fail as expected" health_probes_wait_for_failure_logs
-fi
-test_info "Switching probes back to success"
-test_check "Health probe scripts restored to success" health_probes_force_success
 
 stage_header "Tests after start"
 # Reuse the primary start verification suite.

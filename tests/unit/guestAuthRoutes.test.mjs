@@ -427,6 +427,51 @@ test('auth mode none preserves valid local sessions for router policy', async (t
     assert.equal(res.body, '');
 });
 
+test('local CLI channel crosses configured surface auth without weakening browser sessions', async (t) => {
+    const { authHandlers, localService } = await withAuthModules(t);
+    const user = {
+        id: 'local:admin',
+        username: 'admin',
+        name: 'Local CLI',
+        email: '',
+        roles: ['user', 'admin'],
+    };
+    const cliToken = localService.mintSessionJwt(user, 1, { channel: 'cli' });
+    const cliReq = makeRequest({
+        method: 'POST',
+        url: '/mcp',
+        cookie: `ploinky_jwt=${cliToken}`,
+    });
+    const cliRes = new MockResponse();
+    const cliResult = await authHandlers.ensureAuthenticated(
+        cliReq,
+        cliRes,
+        new URL(cliReq.url, 'http://localhost'),
+    );
+
+    assert.equal(cliResult.ok, true);
+    assert.equal(cliReq.authMode, 'local');
+    assert.equal(cliReq.authChannel, 'cli');
+    assert.equal(cliReq.user?.id, 'local:admin');
+
+    const browserToken = localService.mintSessionJwt(user, 1);
+    const browserReq = makeRequest({
+        method: 'POST',
+        url: '/mcp',
+        cookie: `ploinky_jwt=${browserToken}`,
+    });
+    const browserRes = new MockResponse();
+    const browserResult = await authHandlers.ensureAuthenticated(
+        browserReq,
+        browserRes,
+        new URL(browserReq.url, 'http://localhost'),
+    );
+
+    assert.equal(browserResult.ok, false);
+    assert.equal(browserReq.authChannel, undefined);
+    assert.equal(browserRes.statusCode, 401);
+});
+
 test('ensureHttpRouteAccess denies none, deny, missing, and unknown decisions', async (t) => {
     const { authHandlers } = await withAuthModules(t);
     for (const decision of [

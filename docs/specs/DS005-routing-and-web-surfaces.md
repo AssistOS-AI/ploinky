@@ -47,8 +47,9 @@ repair. Status exposes generation identity and digest, never source contents.
 
 The core `list routes` command reports the staged `.ploinky/routing.json`
 candidate for operator inspection; it does not prove or print the active
-immutable generation. Only coordinated `edge apply <json-file>` can validate
-candidate state and install a generation.
+immutable generation. Workspace lifecycle operations alone invoke the internal
+coordinator that validates candidate state and installs a generation; there is
+no public edge-mutation command.
 
 `ploinky reinstall <agent>` creates new private targets and coordinates a new
 generation before acknowledging the change. HTTP, SSE, and WebSocket requests
