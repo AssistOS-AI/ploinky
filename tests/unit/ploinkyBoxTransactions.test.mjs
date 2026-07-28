@@ -230,7 +230,7 @@ function harness(state, {
     failCreate = false,
     failCandidateReady = false,
     corruptCidfile = false,
-    failCoreStop = false,
+    failLocalStop = false,
 } = {}) {
     const calls = [];
     let current = initial;
@@ -293,9 +293,9 @@ function harness(state, {
         removeContainer(engine, id, selectedRunner) {
             selectedRunner.run(engine.name, ['container', 'rm', '-f', '--volumes', id]);
         },
-        stopCore(engine, id) {
-            calls.push(['seam', 'stop-core', engine.name, id]);
-            if (failCoreStop) throw new Error('graceful core stop failed');
+        stopPloinkyLocal(engine, id) {
+            calls.push(['seam', 'stop-ploinky-local', engine.name, id]);
+            if (failLocalStop) throw new Error('ploinky-local stop failed');
         },
         async waitReady(engine, id) {
             calls.push(['seam', 'wait-ready', id]);
@@ -528,7 +528,7 @@ test('successful replacement gracefully stops core before stopping and removing 
     }, h.seams);
     assert.equal(result.action, 'replaced');
     const events = h.calls.map((call) => call.join(' '));
-    const graceful = events.findIndex((value) => value.includes('seam stop-core'));
+    const graceful = events.findIndex((value) => value.includes('seam stop-ploinky-local'));
     const outerStop = events.findIndex((value) => value.includes('container stop --time 30'));
     const removal = events.findIndex((value) => value.includes('container rm -f --volumes'));
     const creation = events.findIndex((value) => value.includes('container create'));
@@ -536,7 +536,7 @@ test('successful replacement gracefully stops core before stopping and removing 
     assert.ok(outerStop < removal && removal < creation);
 });
 
-test('graceful replacement failure preserves the old same-image Box without candidate cleanup', async (t) => {
+test('ploinky-local replacement stop failure preserves the old same-image Box without candidate cleanup', async (t) => {
     const state = fixture(t);
     const oldImage = 'd'.repeat(64);
     const old = containerHandle({
@@ -550,7 +550,7 @@ test('graceful replacement failure preserves the old same-image Box without cand
     const h = harness(state, {
         initial: old,
         candidateImage: oldImage,
-        failCoreStop: true,
+        failLocalStop: true,
     });
     await assert.rejects(() => reconcileBoxContainer({
         identity: state.identity,
@@ -562,7 +562,7 @@ test('graceful replacement failure preserves the old same-image Box without cand
         explicitPort: 19090,
     }, h.seams), (error) => (
         /Box container transaction failed/.test(error.message)
-            && /graceful core stop failed/.test(error.cause?.message || '')
+            && /ploinky-local stop failed/.test(error.cause?.message || '')
     ));
     assert.equal(h.current(), old);
     assert.equal(old.runtime.running, true);
@@ -580,10 +580,15 @@ test('missing or corrupt cidfiles are fail-closed primitives', (t) => {
     assert.throws(() => readContainerIdFromCidfile(corrupt), /corrupt/);
 });
 
-test('readiness failure preserves bounded container self-check diagnostics', async () => {
+test('readiness failure rereads bounded container self-check diagnostics after exit', async () => {
+    let logReads = 0;
     const runner = {
         query(_command, args) {
             if (args[1] === 'logs') {
+                logReads += 1;
+                if (logReads === 1) {
+                    return { ok: true, stdout: '', stderr: '' };
+                }
                 return {
                     ok: true,
                     stdout: '',
@@ -597,6 +602,7 @@ test('readiness failure preserves bounded container self-check diagnostics', asy
         () => waitForReadyLine({ name: 'podman' }, 'a'.repeat(64), runner),
         /container logs: \[ploinky-box\] SELF-CHECK FAILED: inner runtime is unavailable/,
     );
+    assert.equal(logReads, 2);
 });
 
 test('a corrupt cidfile can recover only through rediscovered immutable image identity', async (t) => {

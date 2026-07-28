@@ -8,6 +8,7 @@ import {
     createPodmanHarness,
     execInBox,
     requirePodmanCandidate,
+    waitForRouterHealth,
 } from '../e2e/ploinkyBox/nativeHelpers.mjs';
 
 const TREE_HASH_SCRIPT = `
@@ -110,10 +111,9 @@ test('pinned seven-repository graph starts through one immutable Box candidate',
     assert.match(routerEnvironment, /^PLOINKY_ROUTER_URL=http:\/\/host\.containers\.internal:8080$/m);
     assert.match(routerEnvironment,
         new RegExp(`^PLOINKY_ROUTER_AUTHORITY=127\\.0\\.0\\.1:${route.hostPort}$`, 'm'));
-    execInBox(harness.runner, started.containerId, [
-        'podman', 'container', 'exec', agent.id, '/usr/local/bin/node', '-e',
-        "const h=require('node:http');h.get({hostname:process.env.PLOINKY_ROUTER_HOST,port:process.env.PLOINKY_ROUTER_PORT,path:'/health',headers:{Host:process.env.PLOINKY_ROUTER_AUTHORITY}},r=>{r.resume();process.exit(r.statusCode===200?0:1)}).on('error',()=>process.exit(2))",
-    ]);
+    waitForRouterHealth(harness.runner, started.containerId, {
+        nestedContainerId: agent.id,
+    });
 
     const nestedImageId = execInBox(harness.runner, started.containerId, [
         'podman', 'container', 'inspect', '--format', '{{.Image}}', agent.id,
@@ -135,13 +135,11 @@ test('pinned seven-repository graph starts through one immutable Box candidate',
         ].join('; '),
     ]);
 
-    execInBox(harness.runner, started.containerId, [
-        '/usr/local/bin/node', '-e', [
-            "const h=require('node:http');",
-            `const r=h.get({hostname:'127.0.0.1',port:8080,path:'/health',headers:{Host:'127.0.0.1:${route.hostPort}'}},s=>{s.resume();process.exit(s.statusCode===200?0:1)});`,
-            "r.on('error',()=>process.exit(2));",
-        ].join(''),
-    ]);
+    waitForRouterHealth(harness.runner, started.containerId, {
+        hostname: '127.0.0.1',
+        port: 8080,
+        authority: `127.0.0.1:${route.hostPort}`,
+    });
 
     execInBox(harness.runner, started.containerId, [
         '/usr/local/bin/node', '-e', [
@@ -153,7 +151,7 @@ test('pinned seven-repository graph starts through one immutable Box candidate',
     const corruptedHash = dependencyTreeHash(harness);
     await harness.supervisor.runStopTransaction();
     assert.equal(dependencyTreeHash(harness), corruptedHash,
-        'dependency-free stop must not repair or rewrite dependency state');
+        'relayed ploinky-local stop must not repair or rewrite dependency state');
     assert.equal(harness.supervisor.inspectBoxStatus().state, 'stopped');
     await harness.supervisor.runDestroyTransaction(started.containerId);
     const recreated = await harness.supervisor.prepareBoxForCommand({ imageRef: candidateReference });

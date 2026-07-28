@@ -278,7 +278,7 @@ test('rootless Podman exercises the complete public lifecycle on one workspace i
         assert.equal(created.ok, true, created.stderr);
         await assert.rejects(
             harness.supervisor.prepareBoxForCommand({ imageRef: candidateReference }),
-            /foreign/i,
+            /exact-name resource .* is not owned by this Box/,
         );
         if (kind === 'container') {
             const record = JSON.parse(harness.runner.query('podman', [

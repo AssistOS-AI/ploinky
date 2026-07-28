@@ -101,6 +101,94 @@ test('partial or wrong-pin installs are repaired as one replacement', (t) => {
     assert.equal(fs.readdirSync(state.targetRoot).some((name) => name.includes('stage')), false);
 });
 
+test('repair backs up a real owner-read-only dependency without losing unrelated data', (t) => {
+    const state = fixture(t);
+    for (const name of ['mcp-sdk', 'achillesAgentLib']) {
+        const directory = path.join(state.targetRoot, name);
+        fs.mkdirSync(directory);
+        fs.writeFileSync(path.join(directory, '.head'), '0'.repeat(40));
+        fs.writeFileSync(path.join(directory, 'payload'), `original:${name}`);
+    }
+    const protectedDirectory = path.join(state.targetRoot, 'achillesAgentLib');
+    fs.chmodSync(protectedDirectory, 0o500);
+    fs.writeFileSync(path.join(state.targetRoot, 'unrelated-canary'), 'retain');
+    const fsApi = new Proxy(fs, {
+        get(target, property) {
+            if (property === 'renameSync') {
+                return (source, destination) => {
+                    if (path.basename(String(destination)).startsWith('.backup-')) {
+                        const stat = fs.lstatSync(source);
+                        if (stat.isDirectory() && (stat.mode & 0o200) === 0) {
+                            const error = new Error(`EACCES: permission denied, rename '${source}'`);
+                            error.code = 'EACCES';
+                            throw error;
+                        }
+                    }
+                    return fs.renameSync(source, destination);
+                };
+            }
+            const value = target[property];
+            return typeof value === 'function' ? value.bind(target) : value;
+        },
+    });
+    const result = installPinnedDependencies({
+        ...state,
+        fsApi,
+        installRepository: fakeInstaller([]),
+        readInstalledHead: readHead,
+        token: 'readonly-repair',
+    });
+    assert.equal(result.changed, true);
+    assert.equal(fs.readFileSync(path.join(state.targetRoot, 'unrelated-canary'), 'utf8'), 'retain');
+    assert.equal(fs.readdirSync(state.targetRoot).some((name) => name.includes('stage')), false);
+    for (const name of ['mcp-sdk', 'achillesAgentLib']) {
+        assert.equal(readHead(path.join(state.targetRoot, name)), result.marker.repositories[name]);
+    }
+});
+
+test('failed swap restores a dependency mode changed only for backup', (t) => {
+    const state = fixture(t);
+    for (const name of ['mcp-sdk', 'achillesAgentLib']) {
+        const directory = path.join(state.targetRoot, name);
+        fs.mkdirSync(directory);
+        fs.writeFileSync(path.join(directory, '.head'), '0'.repeat(40));
+        fs.writeFileSync(path.join(directory, 'payload'), `original:${name}`);
+    }
+    const protectedDirectory = path.join(state.targetRoot, 'achillesAgentLib');
+    fs.chmodSync(protectedDirectory, 0o500);
+    const fsApi = new Proxy(fs, {
+        get(target, property) {
+            if (property === 'renameSync') {
+                return (source, destination) => {
+                    if (path.basename(String(destination)) === '.backup-achillesAgentLib') {
+                        const error = new Error('simulated second backup failure');
+                        error.code = 'EIO';
+                        throw error;
+                    }
+                    return fs.renameSync(source, destination);
+                };
+            }
+            const value = target[property];
+            return typeof value === 'function' ? value.bind(target) : value;
+        },
+    });
+    assert.throws(() => installPinnedDependencies({
+        ...state,
+        fsApi,
+        installRepository: fakeInstaller([]),
+        readInstalledHead: readHead,
+        token: 'rollback-mode',
+    }), /Pinned dependency installation failed/);
+    assert.equal(fs.statSync(protectedDirectory).mode & 0o777, 0o500);
+    for (const name of ['mcp-sdk', 'achillesAgentLib']) {
+        assert.equal(
+            fs.readFileSync(path.join(state.targetRoot, name, 'payload'), 'utf8'),
+            `original:${name}`,
+        );
+    }
+    fs.chmodSync(protectedDirectory, 0o700);
+});
+
 test('failed repair preserves established dependency directories for retry', (t) => {
     const state = fixture(t);
     for (const name of ['mcp-sdk', 'achillesAgentLib']) {

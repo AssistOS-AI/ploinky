@@ -6,7 +6,6 @@ import path from 'node:path';
 import test from 'node:test';
 
 import { readInboxStatus } from '../../ploinky-box/inbox/readStatus.mjs';
-import { stopCoreWithoutBootstrap } from '../../ploinky-box/inbox/stopCore.mjs';
 
 function fixture(t) {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-box-inbox-'));
@@ -72,66 +71,4 @@ test('status exposes allowlisted counts and treats disappearing containers as tr
     assert.equal(JSON.stringify(result).includes('canary'), false);
     assert.equal(result.warnings.some((value) => value.includes('disappeared')), true);
     assert.equal(treeHash(root), before);
-});
-
-test('stop validates same-uid Watchdog and nested immutable IDs before signaling', (t) => {
-    const root = fixture(t);
-    const procRoot = path.join(root, 'proc');
-    const ploinky = path.join(root, '.ploinky');
-    fs.mkdirSync(path.join(ploinky, 'running'), { recursive: true });
-    fs.writeFileSync(path.join(ploinky, 'routing.json'), '{"port":8080}\n');
-    fs.writeFileSync(path.join(ploinky, 'running', 'router.pid'), '123\n');
-    fs.writeFileSync(path.join(ploinky, 'agents.json'), JSON.stringify({
-        alpha: { type: 'agent', runtime: 'podman', containerId: 'a'.repeat(64) },
-        legacy: { type: 'agent', runtime: 'podman' },
-    }));
-    fs.mkdirSync(path.join(procRoot, '123'), { recursive: true });
-    fs.writeFileSync(path.join(procRoot, '123', 'status'), 'Name:\tnode\nUid:\t501\t501\t501\t501\n');
-    fs.writeFileSync(path.join(procRoot, '123', 'cmdline'), `node\0/opt/ploinky/cli/server/Watchdog.js\0`);
-    const events = [];
-    const result = stopCoreWithoutBootstrap({
-        workspaceRoot: root,
-        procRoot,
-        uid: 501,
-        kill(pid, signal) { events.push(['kill', pid, signal]); },
-        runner: {
-            query(command, args) {
-                events.push(['query', command, ...args]);
-                return { ok: true, stdout: JSON.stringify([{
-                    Id: 'a'.repeat(64), Name: 'alpha',
-                }]) };
-            },
-            run(command, args) { events.push(['run', command, ...args]); },
-        },
-    });
-    assert.equal(result.watchdogStopped, true);
-    assert.deepEqual(events[0], ['kill', 123, 'SIGTERM']);
-    assert.equal(events.some((event) => event.join(' ').includes(`container stop --time 10 ${'a'.repeat(64)}`)), true);
-    assert.equal(result.warnings.some((warning) => warning.includes('legacy')), true);
-});
-
-test('changed PIDs and nested names are reported without targeting them', (t) => {
-    const root = fixture(t);
-    const procRoot = path.join(root, 'proc');
-    const ploinky = path.join(root, '.ploinky');
-    fs.mkdirSync(path.join(ploinky, 'running'), { recursive: true });
-    fs.writeFileSync(path.join(ploinky, 'routing.json'), '{}');
-    fs.writeFileSync(path.join(ploinky, 'running', 'router.pid'), '123');
-    fs.writeFileSync(path.join(ploinky, 'agents.json'), JSON.stringify({
-        alpha: { type: 'agent', runtime: 'podman', containerId: 'a'.repeat(64) },
-    }));
-    fs.mkdirSync(path.join(procRoot, '123'), { recursive: true });
-    fs.writeFileSync(path.join(procRoot, '123', 'status'), 'Uid:\t999\t999\t999\t999\n');
-    fs.writeFileSync(path.join(procRoot, '123', 'cmdline'), 'node\0/foreign.js\0');
-    const events = [];
-    const result = stopCoreWithoutBootstrap({
-        workspaceRoot: root, procRoot, uid: 501,
-        kill() { events.push(['kill']); },
-        runner: {
-            query() { return { ok: true, stdout: JSON.stringify([{ Id: 'a'.repeat(64), Name: 'changed' }]) }; },
-            run() { events.push(['stop']); },
-        },
-    });
-    assert.deepEqual(events, []);
-    assert.equal(result.warnings.length, 2);
 });

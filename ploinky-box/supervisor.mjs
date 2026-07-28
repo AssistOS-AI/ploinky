@@ -14,7 +14,7 @@ import { createMutationLockManager, withWorkspaceMutationLock } from './locks.mj
 import { buildEngineProcessEnvironment, createProcessRunner } from './process.mjs';
 import {
     removeContainerById,
-    stopCoreByContainerId,
+    stopPloinkyLocalByContainerId,
 } from './lifecycle/container.mjs';
 import { reconcileBoxContainer } from './lifecycle/transactions.mjs';
 
@@ -136,19 +136,19 @@ export function createBoxSupervisor({
                 return Object.freeze({ identity, action: 'absent' });
             }
             if (container.runtime.running) {
-                let helperError = null;
+                let localStopError = null;
                 try {
-                    stopCoreByContainerId(ownership.engine, container.id, runner);
+                    stopPloinkyLocalByContainerId(ownership.engine, container.id, runner);
                 } catch (error) {
-                    helperError = error;
+                    localStopError = error;
                 } finally {
                     runner.run(ownership.engine.name, [
                         'container', 'stop', '--time', '30', container.id,
                     ]);
                 }
-                if (helperError) {
+                if (localStopError) {
                     throw supervisorError(
-                        `Outer Box stopped after the dependency-free core stop reported: ${helperError.message}`,
+                        `Outer Box stopped after ploinky-local stop reported: ${localStopError.message}`,
                     );
                 }
             }
@@ -387,12 +387,17 @@ export function checkBoxHealth(hostPort, {
                                 resolve({ ready: true });
                                 return;
                             }
+                            const transitionCode = String(health.error || '');
                             if (response.statusCode === 503
-                                && health.error === 'EDGE_GENERATION_INACTIVE') {
+                                && [
+                                    'EDGE_GENERATION_INACTIVE',
+                                    'EDGE_GENERATION_RUNTIME_MISMATCH',
+                                    'edge_generation_changed',
+                                ].includes(transitionCode)) {
                                 resolve({
                                     ready: false,
                                     retryable: true,
-                                    message: 'edge generation is inactive',
+                                    message: `edge generation is not ready (${transitionCode})`,
                                 });
                                 return;
                             }

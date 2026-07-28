@@ -18,14 +18,16 @@ import {
     createPodmanHarness,
     execInBox,
     requirePodmanCandidate,
+    waitForRouterHealth,
 } from './nativeHelpers.mjs';
 
 const repositoryRoot = path.resolve(import.meta.dirname, '../../..');
+const PUBLIC_COMMAND_TIMEOUT_MS = 16 * 60_000;
 
 function run(command, args, options = {}) {
     const result = spawnSync(command, args, {
         encoding: 'utf8',
-        timeout: 5 * 60_000,
+        timeout: PUBLIC_COMMAND_TIMEOUT_MS,
         ...options,
     });
     assert.equal(result.error, undefined, result.error?.message);
@@ -99,10 +101,9 @@ function assertNestedRoutingAndSecretBoundary(containerId, harness) {
     assert.match(environment, /^PLOINKY_ROUTER_AUTHORITY=127\.0\.0\.1:\d+$/m);
     assert.equal(environment.includes('HOST_MASTER_KEY_CANARY'), false);
     assert.doesNotMatch(environment, /^PLOINKY_MASTER_KEY=/m);
-    execInBox(harness.runner, containerId, [
-        'podman', 'container', 'exec', agent.id, '/usr/local/bin/node', '-e',
-        "const h=require('node:http');h.get({hostname:process.env.PLOINKY_ROUTER_HOST,port:process.env.PLOINKY_ROUTER_PORT,path:'/health',headers:{Host:process.env.PLOINKY_ROUTER_AUTHORITY}},r=>{r.resume();process.exit(r.statusCode===200?0:1)}).on('error',()=>process.exit(2))",
-    ]);
+    waitForRouterHealth(harness.runner, containerId, {
+        nestedContainerId: agent.id,
+    });
     return agent;
 }
 

@@ -1,16 +1,20 @@
 import assert from 'node:assert/strict';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 
+import { NETWORK_SCHEMA_VERSION } from '../../cli/sandbox/networkContract.js';
 import {
     BOX_MARKER_CONTENT,
     BOX_READY_LINE,
 } from '../../ploinky-box/constants.mjs';
 import {
     entrypointPaths,
+    formatEntrypointFailure,
     prepareEntrypoint,
+    retireStoppedManagedContainers,
     runEntrypoint,
 } from '../../ploinky-box/entrypoint/entrypoint.mjs';
 import {
@@ -212,12 +216,122 @@ test('ready line is emitted exactly once and only after every required stage', (
             return { address: '10.88.0.17', interface: 'eth0' };
         },
         resetRuntime() { events.push('reset'); },
+        retireContainers() { events.push('retire-containers'); },
         installDependencies() { events.push('dependencies'); },
         selfCheck() { events.push('self-check'); },
         output,
     });
     assert.deepEqual(events, [
-        'initialize', 'transport', 'reset', 'dependencies', 'self-check',
+        'initialize', 'transport', 'reset', 'retire-containers', 'dependencies', 'self-check',
         `output:${BOX_READY_LINE}`,
     ]);
+});
+
+function retainedContainerFixture(t, {
+    running = false,
+    status = 'exited',
+    mutateLabels = (labels) => labels,
+} = {}) {
+    const { paths } = fixture(t);
+    const containerId = 'a'.repeat(64);
+    const instanceId = 'instance-a';
+    const enableGeneration = 'generation-a';
+    const workspaceHash = crypto.createHash('sha256')
+        .update(fs.realpathSync(paths.workspace))
+        .digest('hex')
+        .slice(0, 12);
+    fs.mkdirSync(path.join(paths.workspace, '.ploinky'));
+    fs.writeFileSync(path.join(paths.workspace, '.ploinky', 'agents.json'), JSON.stringify({
+        ploinky_demo: {
+            type: 'agent',
+            runtime: 'podman',
+            containerId,
+            instanceId,
+            enableGeneration,
+        },
+    }));
+    const labels = mutateLabels({
+        'io.assistos.ploinky.managed': '1',
+        'io.assistos.ploinky.resource': 'agent',
+        'io.assistos.ploinky.network-schema': NETWORK_SCHEMA_VERSION,
+        'io.assistos.ploinky.workspace': workspaceHash,
+        'io.assistos.ploinky.network-contract': 'b'.repeat(64),
+        'io.assistos.ploinky.instance-id': instanceId,
+        'io.assistos.ploinky.enable-generation': enableGeneration,
+    });
+    const calls = [];
+    const runner = {
+        query(command, args) {
+            calls.push(['query', command, ...args]);
+            if (args[1] === 'ps') return { ok: true, stdout: `${containerId}\n`, stderr: '' };
+            if (args[1] === 'inspect') {
+                return {
+                    ok: true,
+                    stdout: JSON.stringify([{
+                        Id: containerId,
+                        Name: 'ploinky_demo',
+                        Config: { Labels: labels },
+                        State: { Running: running, Status: status },
+                    }]),
+                    stderr: '',
+                };
+            }
+            throw new Error(`Unexpected query: ${command} ${args.join(' ')}`);
+        },
+        run(command, args) {
+            calls.push(['run', command, ...args]);
+        },
+    };
+    return { paths, containerId, runner, calls };
+}
+
+test('entrypoint retires only an exact stopped managed container without touching retained data', (t) => {
+    const { paths, containerId, runner, calls } = retainedContainerFixture(t);
+
+    assert.deepEqual(retireStoppedManagedContainers(paths, { runner }), [containerId]);
+    assert.equal(calls[0].includes('--no-trunc'), true);
+    assert.deepEqual(calls.at(-1), ['run', 'podman', 'container', 'rm', containerId]);
+    assert.equal(calls.some((call) => call.includes('-f') || call.includes('--volumes')), false);
+});
+
+test('entrypoint rejects running or ownership-drifted retained managed containers', (t) => {
+    const running = retainedContainerFixture(t, { running: true, status: 'running' });
+    assert.throws(
+        () => retireStoppedManagedContainers(running.paths, { runner: running.runner }),
+        /exact stopped state/,
+    );
+    assert.equal(running.calls.some((call) => call[0] === 'run'), false);
+
+    const drifted = retainedContainerFixture(t, {
+        mutateLabels(labels) {
+            return { ...labels, 'io.assistos.ploinky.instance-id': 'foreign' };
+        },
+    });
+    assert.throws(
+        () => retireStoppedManagedContainers(drifted.paths, { runner: drifted.runner }),
+        /exact registry ownership/,
+    );
+    assert.equal(drifted.calls.some((call) => call[0] === 'run'), false);
+
+    const statusSchema = retainedContainerFixture(t, {
+        mutateLabels(labels) {
+            return { ...labels, 'io.assistos.ploinky.network-schema': '3' };
+        },
+    });
+    assert.throws(
+        () => retireStoppedManagedContainers(statusSchema.paths, { runner: statusSchema.runner }),
+        /schema-label/,
+    );
+    assert.equal(statusSchema.calls.some((call) => call[0] === 'run'), false);
+});
+
+test('entrypoint failure diagnostics preserve a bounded normalized cause chain', () => {
+    const native = new Error('EACCES: permission denied,\nrename /deps/old -> /deps/backup');
+    const wrapped = new Error('Pinned dependency installation failed', { cause: native });
+    assert.equal(
+        formatEntrypointFailure(wrapped),
+        'Pinned dependency installation failed; cause: EACCES: permission denied, rename /deps/old -> /deps/backup',
+    );
+    assert.equal(formatEntrypointFailure(wrapped, { limit: 32 }).length, 32);
+    assert.match(formatEntrypointFailure(wrapped, { limit: 32 }), /…$/);
 });

@@ -108,7 +108,7 @@ test('prepare acquires once, reconciles under lock, validates dependencies, then
     ]);
 });
 
-test('stop uses the dependency-free helper and outer stop without dependency repair', async (t) => {
+test('stop relays to ploinky-local before stopping the outer Box without dependency repair', async (t) => {
     const state = fixture(t);
     fs.mkdirSync(path.join(state.workspace, '.ploinky'));
     const identity = buildWorkspaceIdentity(state.workspace, { markerFound: true });
@@ -122,9 +122,11 @@ test('stop uses the dependency-free helper and outer stop without dependency rep
     });
     await supervisor.runStopTransaction();
     assert.equal(events.some((value) => value.includes('ploinky-install-deps')), false);
-    assert.equal(events.some((value) => value.includes('ploinky-local')), false);
-    assert.equal(events.some((value) => value.includes('/opt/ploinky/ploinky-box/inbox/stopCore.mjs')), true);
-    assert.equal(events.some((value) => value.includes('container stop --time 30')), true);
+    const localStop = events.findIndex((value) => (
+        value.includes('/opt/ploinky/bin/ploinky-local stop')
+    ));
+    const outerStop = events.findIndex((value) => value.includes('container stop --time 30'));
+    assert.ok(localStop >= 0 && localStop < outerStop);
 });
 
 test('destroy revalidates the confirmed immutable ID and retains named volumes', async (t) => {
@@ -222,7 +224,7 @@ test('status reports an older owned image as incompatible while destroy remains 
     assert.equal(events.some((value) => value.includes('container rm -f --volumes')), true);
 });
 
-test('dependency-free stop continues to outer stop when inner identity is unverifiable', async (t) => {
+test('failed ploinky-local stop still stops the outer Box', async (t) => {
     const state = fixture(t);
     fs.mkdirSync(path.join(state.workspace, '.ploinky'));
     const identity = buildWorkspaceIdentity(state.workspace, { markerFound: true });
@@ -235,13 +237,16 @@ test('dependency-free stop continues to outer stop when inner identity is unveri
         runner: {
             run(command, args) {
                 events.push(args.join(' '));
-                if (args.includes('/opt/ploinky/ploinky-box/inbox/stopCore.mjs')) {
-                    throw new Error('inner identity changed');
+                if (args.includes('/opt/ploinky/bin/ploinky-local')) {
+                    throw new Error('local stop failed');
                 }
             },
         },
     });
-    await assert.rejects(() => supervisor.runStopTransaction(), /Outer Box stopped/);
+    await assert.rejects(
+        () => supervisor.runStopTransaction(),
+        /Outer Box stopped after ploinky-local stop reported: local stop failed/,
+    );
     assert.equal(events.some((value) => value.includes('container stop --time 30')), true);
 });
 
@@ -336,6 +341,54 @@ test('public health waits for an inactive edge generation to become ready', asyn
             return;
         }
         response.writeHead(200).end('{"status":"healthy"}');
+    });
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+    t.after(() => new Promise((resolve) => server.close(resolve)));
+    const { port } = server.address();
+
+    await checkBoxHealth(port, {
+        readinessTimeoutMs: 1_000,
+        retryDelayMs: 1,
+    });
+
+    assert.equal(requests, 2);
+});
+
+test('public health waits for a preserved generation to match the selected host port', async (t) => {
+    const http = await import('node:http');
+    let requests = 0;
+    const server = http.createServer((_request, response) => {
+        requests += 1;
+        if (requests === 1) {
+            response.writeHead(503).end('{"error":"EDGE_GENERATION_RUNTIME_MISMATCH"}');
+            return;
+        }
+        response.writeHead(200).end('{"status":"healthy"}');
+    });
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+    t.after(() => new Promise((resolve) => server.close(resolve)));
+    const { port } = server.address();
+
+    await checkBoxHealth(port, {
+        readinessTimeoutMs: 1_000,
+        retryDelayMs: 1,
+    });
+
+    assert.equal(requests, 2);
+});
+
+test('public health waits for an authenticated route-plan generation race', async (t) => {
+    const http = await import('node:http');
+    let requests = 0;
+    const server = http.createServer((_request, response) => {
+        requests += 1;
+        if (requests === 1) {
+            response.writeHead(503).end('{"error":"edge_generation_changed"}');
+            return;
+        }
+        response.writeHead(302, {
+            Location: '/auth/login?returnTo=%2Fhealth',
+        }).end('Authentication required');
     });
     await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
     t.after(() => new Promise((resolve) => server.close(resolve)));

@@ -103,11 +103,55 @@ export function createPodmanHarness(t, candidateReference, {
     };
 }
 
-export function execInBox(runner, containerId, argv) {
+export function execInBox(runner, containerId, argv, { timeoutMs = 120_000 } = {}) {
     const result = runner.query('podman', [
         'container', 'exec', '--user', 'podman', '--workdir', '/workspace',
         containerId, ...argv,
-    ], { timeoutMs: 120_000 });
+    ], { timeoutMs });
     assert.equal(result.ok, true, `${argv.join(' ')} failed: ${result.stderr}`);
     return String(result.stdout || '').trim();
+}
+
+const ROUTER_HEALTH_SCRIPT = [
+    "const h=require('node:http');",
+    "const hostname=process.argv[1]||process.env.PLOINKY_ROUTER_HOST;",
+    "const port=process.argv[2]||process.env.PLOINKY_ROUTER_PORT;",
+    "const authority=process.argv[3]||process.env.PLOINKY_ROUTER_AUTHORITY;",
+    "const deadline=Date.now()+Number(process.argv[4]);",
+    "const transient=new Set(['EDGE_GENERATION_INACTIVE','EDGE_GENERATION_RUNTIME_MISMATCH','edge_generation_changed']);",
+    "function fail(code,detail){if(detail)process.stderr.write('PLOINKY_ROUTER_HEALTH_FAILED '+JSON.stringify(detail).slice(0,512)+'\\n');process.exit(code)}",
+    "function check(){",
+    "const q=h.get({hostname,port,path:'/health',headers:{Host:authority}},r=>{",
+    "let body='';r.setEncoding('utf8');r.on('data',c=>body+=c);r.on('end',()=>{",
+    "if(r.statusCode===200){let value;try{value=JSON.parse(body)}catch{fail(3,{status:r.statusCode,bodyBytes:Buffer.byteLength(body)})};fail(value.status==='healthy'?0:4,value.status==='healthy'?null:{status:r.statusCode,healthStatus:String(value.status||'').slice(0,80)})}",
+    "if(r.statusCode===302&&body==='Authentication required'){",
+    "let location;try{location=new URL(String(r.headers.location||''),'http://'+authority)}catch{fail(8,{status:r.statusCode,locationBytes:Buffer.byteLength(String(r.headers.location||''))})};",
+    "if(location.pathname==='/auth/login'&&location.searchParams.get('returnTo')==='/health')fail(0);",
+    "fail(9,{status:r.statusCode,pathname:location.pathname,returnTo:location.searchParams.get('returnTo')});",
+    "}",
+    "let value;try{value=JSON.parse(body)}catch{fail(5,{status:r.statusCode,bodyBytes:Buffer.byteLength(body)})};",
+    "if(r.statusCode!==503||!transient.has(value.error)||Date.now()>=deadline)fail(6,{status:r.statusCode,error:String(value.error||'').slice(0,80),deadlineReached:Date.now()>=deadline});",
+    "setTimeout(check,250);",
+    "});",
+    "});",
+    "q.setTimeout(5000,()=>q.destroy(new Error('timeout')));",
+    "q.on('error',e=>Date.now()<deadline?setTimeout(check,250):fail(7,{errorCode:String(e.code||'').slice(0,40)}));",
+    "}",
+    "check();",
+].join('');
+
+export function waitForRouterHealth(runner, containerId, {
+    nestedContainerId,
+    hostname = '',
+    port = '',
+    authority = '',
+    timeoutMs = 900_000,
+} = {}) {
+    const nodeCommand = [
+        '/usr/local/bin/node', '-e', ROUTER_HEALTH_SCRIPT,
+        hostname, String(port), authority, String(timeoutMs),
+    ];
+    execInBox(runner, containerId, nestedContainerId
+        ? ['podman', 'container', 'exec', nestedContainerId, ...nodeCommand]
+        : nodeCommand, { timeoutMs: timeoutMs + 10_000 });
 }

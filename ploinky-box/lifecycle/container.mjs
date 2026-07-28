@@ -108,17 +108,17 @@ export function removeContainerById(engine, containerId, runner) {
     runner.run(engine.name, ['container', 'rm', '-f', '--volumes', String(containerId)]);
 }
 
-export function stopCoreByContainerId(engine, containerId, runner) {
+export function stopPloinkyLocalByContainerId(engine, containerId, runner) {
     if (!/^[a-f0-9]{12,64}$/.test(String(containerId))) {
-        throw lifecycleError('Refusing to stop in-box core without an immutable container ID');
+        throw lifecycleError('Refusing to relay ploinky-local stop without an immutable container ID');
     }
     runner.run(engine.name, [
         'container', 'exec',
         '--user', 'podman',
         '--workdir', '/workspace',
         String(containerId),
-        '/usr/local/bin/node',
-        '/opt/ploinky/ploinky-box/inbox/stopCore.mjs',
+        '/opt/ploinky/bin/ploinky-local',
+        'stop',
     ]);
 }
 
@@ -138,8 +138,9 @@ export async function waitForReadyLine(engine, containerId, runner, {
             'container', 'inspect', '--format', '{{.State.Status}}', containerId,
         ]);
         if (state.ok && !['created', 'running'].includes(String(state.stdout || '').trim())) {
+            const finalLogs = runner.query(engine.name, ['container', 'logs', containerId]);
             throw lifecycleError(
-                `Box container exited before ${readyLine}; ${containerLogDiagnostic(logs)}`,
+                `Box container exited before ${readyLine}; ${containerLogDiagnostic(finalLogs)}`,
             );
         }
         await delay(intervalMs);

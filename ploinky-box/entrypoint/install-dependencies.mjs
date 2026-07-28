@@ -190,6 +190,17 @@ function safeRemoveWithin(targetRoot, target, fsApi) {
     fsApi.rmSync(target, { recursive: true, force: true });
 }
 
+function prepareDirectoryForBackup(directory, stat, fsApi) {
+    if (stat.isSymbolicLink() || !stat.isDirectory()) return null;
+    if (typeof process.getuid === 'function' && stat.uid !== process.getuid()) {
+        throw dependencyError(`Refusing to repair permissions on an unowned dependency: ${directory}`);
+    }
+    const originalMode = stat.mode & 0o7777;
+    const backupMode = originalMode | 0o700;
+    if (backupMode !== originalMode) fsApi.chmodSync(directory, backupMode);
+    return originalMode;
+}
+
 export function installPinnedDependencies({
     targetRoot = '/opt/ploinky/node_modules',
     markerPath = '/etc/ploinky-box',
@@ -235,9 +246,17 @@ export function installPinnedDependencies({
             const destination = path.join(root, name);
             const backup = path.join(transactionRoot, `.backup-${name}`);
             try {
-                fsApi.lstatSync(destination);
-                fsApi.renameSync(destination, backup);
-                backups.set(name, backup);
+                const stat = fsApi.lstatSync(destination);
+                const originalMode = prepareDirectoryForBackup(destination, stat, fsApi);
+                try {
+                    fsApi.renameSync(destination, backup);
+                } catch (error) {
+                    if (originalMode !== null) {
+                        try { fsApi.chmodSync(destination, originalMode); } catch {}
+                    }
+                    throw error;
+                }
+                backups.set(name, { path: backup, originalMode });
             } catch (error) {
                 if (error.code !== 'ENOENT') throw error;
             }
@@ -252,7 +271,7 @@ export function installPinnedDependencies({
         fsApi.renameSync(markerTemp, path.join(root, DEPENDENCY_MARKER_NAME));
         committed = true;
         for (const backup of backups.values()) {
-            try { safeRemoveWithin(root, backup, fsApi); } catch {}
+            try { safeRemoveWithin(root, backup.path, fsApi); } catch {}
         }
         return Object.freeze({ changed: true, marker: expected });
     } catch (error) {
@@ -264,7 +283,12 @@ export function installPinnedDependencies({
                     try { safeRemoveWithin(root, destination, fsApi); } catch {}
                 }
                 if (backup) {
-                    try { fsApi.renameSync(backup, destination); } catch {}
+                    try {
+                        fsApi.renameSync(backup.path, destination);
+                        if (backup.originalMode !== null) {
+                            fsApi.chmodSync(destination, backup.originalMode);
+                        }
+                    } catch {}
                 }
             }
         }

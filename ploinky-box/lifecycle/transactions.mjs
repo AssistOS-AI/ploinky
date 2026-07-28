@@ -20,7 +20,7 @@ import {
     removeContainerById,
     revalidateAllVolumes,
     secureCidfilePath,
-    stopCoreByContainerId,
+    stopPloinkyLocalByContainerId,
     validateCreatedContainer,
     waitForReadyLine,
 } from './container.mjs';
@@ -178,7 +178,7 @@ export async function reconcileBoxContainer({
         rollbackVolumes: seams.rollbackVolumes || rollbackCreatedVolumes,
         revalidateVolumes: seams.revalidateVolumes || revalidateAllVolumes,
         removeContainer: seams.removeContainer || removeContainerById,
-        stopCore: seams.stopCore || stopCoreByContainerId,
+        stopPloinkyLocal: seams.stopPloinkyLocal || stopPloinkyLocalByContainerId,
         waitReady: seams.waitReady || waitForReadyLine,
         readCidfile: seams.readCidfile || readContainerIdFromCidfile,
         fsApi: seams.fsApi || fs,
@@ -244,7 +244,7 @@ export async function reconcileBoxContainer({
     try {
         if (old) {
             if (currentContainer.runtime.running) {
-                dependencies.stopCore(engine, currentContainer.id, runner);
+                dependencies.stopPloinkyLocal(engine, currentContainer.id, runner);
                 runner.run(engine.name, ['container', 'stop', '--time', '30', currentContainer.id]);
             }
             dependencies.removeContainer(engine, currentContainer.id, runner);

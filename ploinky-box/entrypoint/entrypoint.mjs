@@ -1,8 +1,10 @@
 #!/usr/bin/env node
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { NETWORK_SCHEMA_VERSION } from '../../cli/sandbox/networkContract.js';
 import {
     BOX_MARKER_CONTENT,
     BOX_READY_LINE,
@@ -18,6 +20,24 @@ function entrypointError(message, cause) {
         code: 'PLOINKY_BOX_ENTRYPOINT_FAILED',
         cause,
     });
+}
+
+export function formatEntrypointFailure(error, { limit = 2048 } = {}) {
+    const messages = [];
+    const seen = new Set();
+    let current = error;
+    while (current && typeof current === 'object' && !seen.has(current) && messages.length < 4) {
+        seen.add(current);
+        const message = String(current.message || '')
+            .trim()
+            .replace(/\s+/g, ' ');
+        if (message && messages.at(-1) !== message) messages.push(message);
+        current = current.cause;
+    }
+    const diagnostic = messages.join('; cause: ') || 'unknown Box entrypoint failure';
+    return diagnostic.length <= limit
+        ? diagnostic
+        : `${diagnostic.slice(0, Math.max(0, limit - 1))}…`;
 }
 
 function rooted(root, productionPath) {
@@ -63,6 +83,131 @@ function assertDirectory(target, { writable = false } = {}, fsApi = fs) {
     if (writable) fsApi.accessSync(target, fsApi.constants.W_OK);
 }
 
+const MANAGED_CONTAINER_LABELS = Object.freeze({
+    managed: 'io.assistos.ploinky.managed',
+    resource: 'io.assistos.ploinky.resource',
+    schema: 'io.assistos.ploinky.network-schema',
+    workspace: 'io.assistos.ploinky.workspace',
+    contract: 'io.assistos.ploinky.network-contract',
+    instanceId: 'io.assistos.ploinky.instance-id',
+    enableGeneration: 'io.assistos.ploinky.enable-generation',
+});
+
+function readEntrypointAgentRegistry(workspaceRoot, fsApi) {
+    const target = path.join(workspaceRoot, '.ploinky', 'agents.json');
+    let stat;
+    let bytes;
+    try {
+        stat = fsApi.lstatSync(target);
+        bytes = fsApi.readFileSync(target);
+    } catch (error) {
+        if (error?.code === 'ENOENT') return null;
+        throw entrypointError('Unable to read the retained agent registry', error);
+    }
+    if (stat.isSymbolicLink() || !stat.isFile() || stat.nlink !== 1
+        || bytes.length > 1024 * 1024) {
+        throw entrypointError('Retained agent registry must be one bounded regular file');
+    }
+    try {
+        const registry = JSON.parse(bytes.toString('utf8'));
+        if (!registry || typeof registry !== 'object' || Array.isArray(registry)) {
+            throw new Error('expected an object');
+        }
+        return registry;
+    } catch (error) {
+        throw entrypointError('Retained agent registry is malformed', error);
+    }
+}
+
+function parseSingleContainerInspection(result, containerId) {
+    if (!result?.ok) {
+        throw entrypointError(`Unable to inspect retained managed container ${containerId}`);
+    }
+    let records;
+    try {
+        records = JSON.parse(String(result.stdout || ''));
+    } catch (error) {
+        throw entrypointError(`Retained managed container inspection is malformed for ${containerId}`, error);
+    }
+    if (!Array.isArray(records) || records.length !== 1
+        || !records[0] || typeof records[0] !== 'object') {
+        throw entrypointError(`Retained managed container inspection is not singular for ${containerId}`);
+    }
+    return records[0];
+}
+
+export function retireStoppedManagedContainers(paths, {
+    fsApi = fs,
+    runner = createProcessRunner(),
+} = {}) {
+    const registry = readEntrypointAgentRegistry(paths.workspace, fsApi);
+    if (!registry) return Object.freeze([]);
+    const listed = runner.query('podman', [
+        'container', 'ps', '--all', '--quiet', '--no-trunc',
+        '--filter', 'label=io.assistos.ploinky.managed=1',
+    ]);
+    if (!listed.ok) {
+        throw entrypointError('Unable to enumerate retained Ploinky-managed containers');
+    }
+    const containerIds = String(listed.stdout || '')
+        .split(/\r?\n/)
+        .map((value) => value.trim().toLowerCase())
+        .filter(Boolean);
+    const workspaceHash = crypto.createHash('sha256')
+        .update(fsApi.realpathSync(paths.workspace))
+        .digest('hex')
+        .slice(0, 12);
+    const removed = [];
+    for (const containerId of containerIds) {
+        if (!/^[a-f0-9]{64}$/.test(containerId)) {
+            throw entrypointError('Retained managed container enumeration returned a non-immutable ID');
+        }
+        const record = parseSingleContainerInspection(
+            runner.query('podman', ['container', 'inspect', containerId]),
+            containerId,
+        );
+        const observedId = String(record.Id ?? record.ID ?? '').trim().toLowerCase();
+        const observedName = String(record.Name || '').replace(/^\//, '');
+        const registered = registry[observedName];
+        const labels = record.Config?.Labels || record.Labels || {};
+        const ownershipMismatches = [
+            observedId === containerId || 'container-id',
+            Boolean(registered) || 'registry-record',
+            ['agent', 'agentCore'].includes(registered?.type) || 'registry-type',
+            registered?.runtime === 'podman' || 'registry-runtime',
+            String(registered?.containerId || '').trim().toLowerCase() === containerId
+                || 'registry-container-id',
+            labels[MANAGED_CONTAINER_LABELS.managed] === '1' || 'managed-label',
+            labels[MANAGED_CONTAINER_LABELS.resource] === 'agent' || 'resource-label',
+            labels[MANAGED_CONTAINER_LABELS.schema] === NETWORK_SCHEMA_VERSION || 'schema-label',
+            labels[MANAGED_CONTAINER_LABELS.workspace] === workspaceHash || 'workspace-label',
+            /^[a-f0-9]{64}$/.test(String(labels[MANAGED_CONTAINER_LABELS.contract] || ''))
+                || 'contract-label',
+            Boolean(String(registered?.instanceId || ''))
+                && String(labels[MANAGED_CONTAINER_LABELS.instanceId] || '')
+                    === String(registered.instanceId)
+                || 'instance-label',
+            Boolean(String(registered?.enableGeneration || ''))
+                && String(labels[MANAGED_CONTAINER_LABELS.enableGeneration] || '')
+                    === String(registered.enableGeneration)
+                || 'enable-generation-label',
+        ].filter((value) => value !== true);
+        if (ownershipMismatches.length > 0) {
+            throw entrypointError(
+                `Retained managed container ${containerId} does not match its exact registry ownership (${ownershipMismatches.join(', ')})`,
+            );
+        }
+        if (record.State?.Running === true || String(record.State?.Status || '') !== 'exited') {
+            throw entrypointError(
+                `Retained managed container ${containerId} is not in the exact stopped state`,
+            );
+        }
+        runner.run('podman', ['container', 'rm', containerId]);
+        removed.push(containerId);
+    }
+    return Object.freeze(removed);
+}
+
 export function validateEntrypointMounts(paths, fsApi = fs) {
     try {
         assertDirectory(paths.workspace, { writable: true }, fsApi);
@@ -96,6 +241,7 @@ export function prepareEntrypoint({
     initialize = initializeWorkspaceMasterKey,
     configureTransport = configureBoxTransport,
     resetRuntime = resetTransientNestedRuntime,
+    retireContainers = retireStoppedManagedContainers,
     installDependencies = installPinnedDependencies,
     transportOptions = {},
 } = {}) {
@@ -111,6 +257,7 @@ export function prepareEntrypoint({
         ...transportOptions,
     });
     resetRuntime(paths, { fsApi });
+    retireContainers(paths, { fsApi, runner });
     installDependencies({
         targetRoot: paths.dependencies,
         markerPath: paths.marker,
@@ -138,7 +285,7 @@ if (invokedPath === fileURLToPath(import.meta.url)) {
         if (prepareOnly) prepareEntrypoint();
         else runEntrypoint();
     } catch (error) {
-        process.stderr.write(`[ploinky-box] SELF-CHECK FAILED: ${error.message}\n`);
+        process.stderr.write(`[ploinky-box] SELF-CHECK FAILED: ${formatEntrypointFailure(error)}\n`);
         process.exitCode = 1;
     }
 }
