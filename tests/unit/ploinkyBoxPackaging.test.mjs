@@ -137,5 +137,5 @@ test('repository aliases retain boxed versus local routing and helper rejects no
         encoding: 'utf8',
     });
     assert.notEqual(helper.status, 0);
-    assert.match(helper.stderr, /contract marker|dependency initialization failed/i);
+    assert.match(helper.stderr, /Box marker|dependency initialization failed/i);
 });

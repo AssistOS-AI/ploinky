@@ -6,17 +6,13 @@ import {
     runSupervisorWithBoundary,
 } from '../../container/runtime-supervisor.mjs';
 import {
-    IDENTITY_SCHEMA_LABEL,
-    IDENTITY_SCHEMA_VERSION,
     PATH_HASH_LABEL,
     REQUESTED_IMAGE_LABEL,
     REQUIRED_IMAGE_ENTRYPOINT,
     REQUIRED_IMAGE_ENV,
     REQUIRED_IMAGE_USER,
     REQUIRED_IMAGE_WORKDIR,
-    REQUIRED_RUNTIME_CONTRACT,
     REQUIRED_RUNTIME_IMAGE,
-    RUNTIME_CONTRACT_LABEL,
     VOLUME_ROLE_LABEL,
     VOLUME_ROLES,
     runtimeVolumeNames,
@@ -73,7 +69,7 @@ export function identityFor(cwd = '/workspace/demo') {
     };
 }
 
-export function contract2Image(id = 'sha256:runtime-2') {
+export function compatibleImage(id = 'sha256:runtime-current') {
     return {
         Id: id,
         Config: {
@@ -84,16 +80,14 @@ export function contract2Image(id = 'sha256:runtime-2') {
             Entrypoint: [REQUIRED_IMAGE_ENTRYPOINT],
             Cmd: null,
             Volumes: null,
-            Labels: {
-                [RUNTIME_CONTRACT_LABEL]: REQUIRED_RUNTIME_CONTRACT,
-            },
+            Labels: {},
         },
     };
 }
 
-export function contract1Image(id = 'sha256:runtime-1') {
-    const image = contract2Image(id);
-    image.Config.Labels[RUNTIME_CONTRACT_LABEL] = '1';
+export function incompatibleImage(id = 'sha256:runtime-incompatible') {
+    const image = compatibleImage(id);
+    image.Config.Labels['io.assistos.ploinky.unexpected'] = 'retired';
     return image;
 }
 
@@ -101,18 +95,17 @@ export function ownedVolume(name, pathHash, roleKey) {
     return {
         Name: name,
         Labels: {
-            [IDENTITY_SCHEMA_LABEL]: IDENTITY_SCHEMA_VERSION,
             [PATH_HASH_LABEL]: pathHash,
             [VOLUME_ROLE_LABEL]: VOLUME_ROLES[roleKey],
         },
     };
 }
 
-export function contract2Container({
+export function ownedContainer({
     cwd = '/workspace/demo',
     engine = 'podman',
     state = 'running',
-    imageId = 'sha256:runtime-2',
+    imageId = 'sha256:runtime-current',
     requestedImage = REQUIRED_RUNTIME_IMAGE,
     sourceDir = REPO_ROOT,
     labels = {},
@@ -123,7 +116,6 @@ export function contract2Container({
     const names = runtimeVolumeNames(identity.instance);
     const runtimeLabels = {
         [REQUESTED_IMAGE_LABEL]: requestedImage,
-        [IDENTITY_SCHEMA_LABEL]: IDENTITY_SCHEMA_VERSION,
         [PATH_HASH_LABEL]: identity.pathHash,
         ...labels,
     };
@@ -194,12 +186,12 @@ export function contract2Container({
     };
 }
 
-export function contract2RuntimeFixture(options = {}) {
+export function ownedRuntimeFixture(options = {}) {
     const cwd = options.cwd || '/workspace/demo';
     const identity = identityFor(cwd);
     const names = runtimeVolumeNames(identity.instance);
-    const image = contract2Image(options.imageId);
-    const container = contract2Container({ ...options, cwd, imageId: image.Id });
+    const image = compatibleImage(options.imageId);
+    const container = ownedContainer({ ...options, cwd, imageId: image.Id });
     return {
         container,
         images: {
@@ -325,7 +317,7 @@ function nextPullImage(pullImages, reference) {
     }
     if (typeof configured === 'function') return clone(configured(reference));
     if (configured) return clone(configured);
-    return reference === REQUIRED_RUNTIME_IMAGE ? contract2Image() : null;
+    return reference === REQUIRED_RUNTIME_IMAGE ? compatibleImage() : null;
 }
 
 export function createFakeEngine({
@@ -450,6 +442,21 @@ export function createFakeEngine({
                 }
                 const installed = state.container?.depsInstalled !== false;
                 return result(installed, '', installed ? '' : 'dependencies missing');
+            }
+            if (args[0] === 'run' && args.includes('--network=none')) {
+                if (failureCode(failures, 'image capability probe')) {
+                    return result(false, '', 'image capability probe failed');
+                }
+                return result(true, [
+                    '/usr/bin/node',
+                    '/usr/bin/podman',
+                    '/usr/bin/bash',
+                    '/usr/sbin/ip',
+                    '/usr/bin/fuse-overlayfs',
+                    '/usr/local/bin/ploinky-box-entrypoint',
+                    '/usr/bin/pasta',
+                    '',
+                ].join('\n'));
             }
             return result(false, '', 'unsupported query');
         },

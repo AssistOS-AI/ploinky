@@ -3,7 +3,10 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { BOX_READY_LINE, BOX_RUNTIME_CONTRACT } from '../constants.mjs';
+import {
+    BOX_MARKER_CONTENT,
+    BOX_READY_LINE,
+} from '../constants.mjs';
 import { PloinkyBoxError } from '../errors.mjs';
 import { createProcessRunner } from '../process.mjs';
 import { initializeWorkspaceMasterKey } from './initialize-workspace.mjs';
@@ -26,7 +29,7 @@ function rooted(root, productionPath) {
 
 export function entrypointPaths(root = '/') {
     return Object.freeze({
-        contract: rooted(root, '/etc/ploinky-box'),
+        marker: rooted(root, '/etc/ploinky-box'),
         workspace: rooted(root, '/workspace'),
         dependencies: rooted(root, '/opt/ploinky/node_modules'),
         ploinky: rooted(root, '/opt/ploinky/bin/ploinky'),
@@ -37,18 +40,18 @@ export function entrypointPaths(root = '/') {
     });
 }
 
-export function verifyEntrypointContract(contractPath, fsApi = fs) {
+export function verifyEntrypointMarker(markerPath, fsApi = fs) {
     let stat;
     let bytes;
     try {
-        stat = fsApi.lstatSync(contractPath);
-        bytes = fsApi.readFileSync(contractPath);
+        stat = fsApi.lstatSync(markerPath);
+        bytes = fsApi.readFileSync(markerPath);
     } catch (error) {
-        throw entrypointError(`Unable to read runtime contract marker ${contractPath}`, error);
+        throw entrypointError(`Unable to read Box marker ${markerPath}`, error);
     }
     if (stat.isSymbolicLink() || !stat.isFile() || stat.nlink !== 1
-        || !bytes.equals(Buffer.from(`${BOX_RUNTIME_CONTRACT}\n`))) {
-        throw entrypointError(`Runtime contract marker must contain exactly ${BOX_RUNTIME_CONTRACT}`);
+        || !bytes.equals(Buffer.from(BOX_MARKER_CONTENT))) {
+        throw entrypointError('Box marker has invalid content');
     }
 }
 
@@ -97,7 +100,7 @@ export function prepareEntrypoint({
     transportOptions = {},
 } = {}) {
     const paths = entrypointPaths(root);
-    verifyEntrypointContract(paths.contract, fsApi);
+    verifyEntrypointMarker(paths.marker, fsApi);
     validateEntrypointMounts(paths, fsApi);
     initialize({ workspaceRoot: paths.workspace, fsApi });
     const transport = configureTransport({
@@ -110,7 +113,7 @@ export function prepareEntrypoint({
     resetRuntime(paths, { fsApi });
     installDependencies({
         targetRoot: paths.dependencies,
-        contractPath: paths.contract,
+        markerPath: paths.marker,
         fsApi,
         runner,
     });

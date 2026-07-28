@@ -7,7 +7,6 @@ import {
     BOX_READY_LINE,
     BOX_ROUTER_CONTAINER_PORT,
     BOX_ROLES,
-    BOX_SCHEMA_VERSION,
 } from '../constants.mjs';
 import { validateContainerConfiguration } from '../contract/container.mjs';
 import { PloinkyBoxError } from '../errors.mjs';
@@ -39,7 +38,6 @@ export function containerCreateArgs({
 }) {
     const source = path.resolve(repositoryRoot);
     const labels = {
-        [BOX_LABELS.schema]: BOX_SCHEMA_VERSION,
         [BOX_LABELS.pathHash]: identity.pathHash,
         [BOX_LABELS.role]: BOX_ROLES.container,
         [BOX_LABELS.imageRef]: imageRef,

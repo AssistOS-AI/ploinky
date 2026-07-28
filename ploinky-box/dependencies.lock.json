@@ -1,5 +1,4 @@
 {
-  "contract": 6,
   "repositories": {
     "mcp-sdk": {
       "url": "https://github.com/AssistOS-AI/MCPSDK.git",

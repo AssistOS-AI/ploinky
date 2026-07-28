@@ -198,7 +198,7 @@ test('rootless Podman exercises the complete public lifecycle on one workspace i
         'bash', '-c', [
             "printf workspace-retained > /workspace/t26-workspace-canary",
             "printf dependencies-retained > /opt/ploinky/node_modules/t26-dependencies-canary",
-            "printf 'corrupt\\n' > /opt/ploinky/node_modules/.ploinky-box-dependencies-v6.json",
+            "printf 'corrupt\\n' > /opt/ploinky/node_modules/.ploinky-box-dependencies.json",
             'chmod 500 /opt/ploinky/node_modules/achillesAgentLib',
         ].join('; '),
     ]);
@@ -207,7 +207,7 @@ test('rootless Podman exercises the complete public lifecycle on one workspace i
     assert.equal(harness.supervisor.inspectBoxStatus().state, 'stopped');
     const stoppedContainer = harness.supervisor.inspectBoxStatus().ownership.handles.container.id;
     assert.equal(execInBox(harness.runner, stoppedContainer, [
-        'cat', '/opt/ploinky/node_modules/.ploinky-box-dependencies-v6.json',
+        'cat', '/opt/ploinky/node_modules/.ploinky-box-dependencies.json',
     ]), 'corrupt');
     await harness.supervisor.runDestroyTransaction(stoppedContainer);
     assert.equal(harness.supervisor.inspectBoxStatus().state, 'absent-retained-volumes');

@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 
-import { BOX_LABELS, BOX_ROLES, BOX_SCHEMA_VERSION } from '../../ploinky-box/constants.mjs';
+import { BOX_LABELS, BOX_ROLES } from '../../ploinky-box/constants.mjs';
 import { buildWorkspaceIdentity } from '../../ploinky-box/identity.mjs';
 import {
     discoverBoxOwnership,
@@ -18,11 +18,15 @@ function identityFixture(t) {
 }
 
 function labels(identity, role) {
-    return {
-        [BOX_LABELS.schema]: BOX_SCHEMA_VERSION,
+    const result = {
         [BOX_LABELS.pathHash]: identity.pathHash,
         [BOX_LABELS.role]: role,
     };
+    if (role === BOX_ROLES.container) {
+        result[BOX_LABELS.imageRef] = 'runtime';
+        result[BOX_LABELS.routerHostPort] = '18080';
+    }
+    return result;
 }
 
 function podmanInfo({ rootless = true, osName = 'linux', serviceIsRemote = false } = {}) {
@@ -208,9 +212,9 @@ test('unlabeled exact names, wrong labels, and incomplete fingerprints fail clos
     const unlabeled = ownedRecords(identity);
     unlabeled.container.Labels = {};
     variants.push(unlabeled);
-    const wrongSchema = ownedRecords(identity);
-    wrongSchema.container.Labels[BOX_LABELS.schema] = '999';
-    variants.push(wrongSchema);
+    const extraLabel = ownedRecords(identity);
+    extraLabel.container.Labels['io.assistos.ploinky-box.unexpected'] = 'present';
+    variants.push(extraLabel);
     const wrongPath = ownedRecords(identity);
     wrongPath.volumes.workspace.Labels[BOX_LABELS.pathHash] = '000000000000';
     variants.push(wrongPath);

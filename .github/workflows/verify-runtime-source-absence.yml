@@ -1,4 +1,4 @@
-name: Verify runtime-v5 source absence
+name: Verify retired runtime source absence
 
 on:
   pull_request:
@@ -21,7 +21,7 @@ jobs:
           trap 'rm -f "$report"' EXIT
 
           node --test --test-reporter=tap \
-            tests/unit/runtimeV5SourceAbsence.test.mjs \
+            tests/unit/runtimeSourceAbsence.test.mjs \
             tests/unit/networkHardCutSourceAbsence.test.mjs | tee "$report"
 
           require_summary() {
@@ -35,8 +35,8 @@ jobs:
             fi
           }
 
-          require_summary tests 7
-          require_summary pass 7
+          require_summary tests 9
+          require_summary pass 9
           require_summary fail 0
           require_summary cancelled 0
           require_summary skipped 0

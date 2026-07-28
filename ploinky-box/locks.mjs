@@ -70,7 +70,9 @@ function parseOwner(ownerPath, fsApi) {
     } catch (error) {
         throw lockError(`Mutation lock owner is malformed: ${ownerPath}`, error);
     }
-    if (owner?.schema !== 1
+    const expectedKeys = ['hostname', 'instance', 'pid', 'startedAt'];
+    if (!owner
+        || JSON.stringify(Object.keys(owner).sort()) !== JSON.stringify(expectedKeys)
         || typeof owner.hostname !== 'string'
         || !Number.isSafeInteger(owner.pid)
         || owner.pid <= 0
@@ -170,7 +172,6 @@ export function createMutationLockManager({
                 fsApi.mkdirSync(lockPath, { recursive: false, mode: 0o700 });
                 fsApi.chmodSync(lockPath, 0o700);
                 const owner = {
-                    schema: 1,
                     hostname,
                     pid,
                     instance,

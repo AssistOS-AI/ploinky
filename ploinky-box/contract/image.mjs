@@ -1,6 +1,5 @@
 import {
-    BOX_RUNTIME_CONTRACT,
-    BOX_RUNTIME_CONTRACT_LABEL,
+    BOX_MARKER_CONTENT,
 } from '../constants.mjs';
 import { PloinkyBoxError } from '../errors.mjs';
 
@@ -22,8 +21,6 @@ export const IMAGE_CONTRACT = Object.freeze({
         _CONTAINERS_USERNS_CONFIGURED: '',
         BUILDAH_ISOLATION: 'chroot',
     }),
-    contractLabel: BOX_RUNTIME_CONTRACT_LABEL,
-    contract: BOX_RUNTIME_CONTRACT,
     requiredBinaries: Object.freeze([
         'node',
         'podman',
@@ -34,6 +31,7 @@ export const IMAGE_CONTRACT = Object.freeze({
     ]),
     networkHelpers: Object.freeze(['pasta', 'slirp4netns']),
 });
+export const IMAGE_PROBE_TIMEOUT_MS = 60_000;
 
 function contractError(
     imageRef,
@@ -109,7 +107,9 @@ export function normalizeImageInspect(raw) {
         volumes: config.Volumes === null || config.Volumes === undefined
             ? {}
             : isRecord(config.Volumes) ? { ...config.Volumes } : null,
-        labels: isRecord(config.Labels) ? { ...config.Labels } : {},
+        labels: config.Labels === null || config.Labels === undefined
+            ? {}
+            : isRecord(config.Labels) ? { ...config.Labels } : null,
     });
 }
 
@@ -131,15 +131,14 @@ export function validateImageContract(image, imageRef, {
     if (!image.id) {
         throw contractError(imageRef, 'image ID', 'a nonempty immutable ID', image.id);
     }
-    const observedContract = image.labels?.[BOX_RUNTIME_CONTRACT_LABEL];
-    if (observedContract !== BOX_RUNTIME_CONTRACT) {
+    if (!isRecord(image.labels) || !sameRecord(image.labels, {})) {
         throw contractError(
             imageRef,
-            BOX_RUNTIME_CONTRACT_LABEL,
-            JSON.stringify(BOX_RUNTIME_CONTRACT),
-            observedContract,
+            'Config.Labels',
+            'absent or empty',
+            image.labels,
             'PLOINKY_BOX_IMAGE_CONTRACT_HARD_CUT',
-            '; destroy and recreate the Box with a contract-6 image',
+            '; destroy and recreate the Box with the current runtime image',
         );
     }
     if (image.user !== IMAGE_CONTRACT.user) {
@@ -209,11 +208,18 @@ export function probeImageBinaries(engine, imageId, runner) {
             "for name in node podman bash ip fuse-overlayfs; do command -v \"$name\"; done",
             'test -x /usr/local/bin/ploinky-box-entrypoint',
             "printf '%s\\n' /usr/local/bin/ploinky-box-entrypoint",
+            `test "$(wc -c < /etc/ploinky-box)" -eq ${Buffer.byteLength(BOX_MARKER_CONTENT)}`,
+            `test "$(cat /etc/ploinky-box)" = '${BOX_MARKER_CONTENT.trim()}'`,
             "if command -v pasta >/dev/null 2>&1; then command -v pasta; elif command -v slirp4netns >/dev/null 2>&1; then command -v slirp4netns; else exit 17; fi",
         ].join('; '),
-    ]);
+    ], { timeoutMs: IMAGE_PROBE_TIMEOUT_MS });
     if (!result.ok) {
-        throw contractError(imageId, 'required binaries', 'all contract-6 tools', 'probe failed');
+        throw contractError(
+            imageId,
+            'runtime capabilities and marker',
+            'all required tools and exact marker content',
+            'probe failed',
+        );
     }
     const observedPaths = String(result.stdout || '').split(/\r?\n/).filter(Boolean);
     const available = observedPaths.map((value) => (

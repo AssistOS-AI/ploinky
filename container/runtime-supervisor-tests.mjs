@@ -9,13 +9,10 @@ import { fileURLToPath } from 'node:url';
 import {
     BOX_MEDIA_PORT,
     BOX_ROUTER_PORT,
-    IDENTITY_SCHEMA_LABEL,
-    IDENTITY_SCHEMA_VERSION,
     PATH_HASH_LABEL,
     REQUESTED_IMAGE_LABEL,
     REQUIRED_IMAGE_ENV,
     REQUIRED_RUNTIME_IMAGE,
-    RUNTIME_CONTRACT_LABEL,
     VOLUME_ROLE_LABEL,
     VOLUME_ROLES,
     assertFixedRuntimePublications,
@@ -30,6 +27,7 @@ import {
     runtimeVolumeNames,
     validateImageContract,
 } from './runtime-contract.mjs';
+import { IMAGE_PROBE_TIMEOUT_MS } from '../ploinky-box/contract/image.mjs';
 import { createEngineClient } from './runtime-engine.mjs';
 import {
     assertStateCommandFlags,
@@ -51,10 +49,10 @@ import {
     validateNestedUidMap,
 } from './runtime-supervisor.mjs';
 import {
-    contract1Image,
-    contract2Container,
-    contract2Image,
-    contract2RuntimeFixture,
+    incompatibleImage,
+    ownedContainer,
+    compatibleImage,
+    ownedRuntimeFixture,
     createFakeEngine,
     createSupervisorHarness,
     identityFor,
@@ -120,18 +118,19 @@ function capturedArgv(capture) {
     return fs.readFileSync(capture, 'utf8').trimEnd().split('\n');
 }
 
-test('contract-5 image normalizes and validates every required metadata field', () => {
-    const normalized = normalizeImageInspect(JSON.stringify([contract2Image()]));
-    assert.equal(normalized.id, 'sha256:runtime-2');
-    assert.equal(normalized.contract, '5');
+test('compatible image normalizes and validates every required metadata field', () => {
+    const normalized = normalizeImageInspect(JSON.stringify([compatibleImage()]));
+    assert.equal(normalized.id, 'sha256:runtime-current');
+    assert.deepEqual(normalized.labels, {});
     assert.deepEqual(normalized.env, REQUIRED_IMAGE_ENV);
     assert.equal(validateImageContract(normalized, REQUIRED_RUNTIME_IMAGE), normalized);
 });
 
-test('contract-5 validation emits field-specific failures', async t => {
+test('image configuration validation emits field-specific failures', async t => {
     const cases = [
         ['image ID', raw => { raw.Id = ''; }, /image ID/],
-        ['contract label', raw => { delete raw.Config.Labels[RUNTIME_CONTRACT_LABEL]; }, /runtime-contract/],
+        ['unexpected label', raw => { raw.Config.Labels.unexpected = 'present'; }, /Config\.Labels/],
+        ['malformed labels', raw => { raw.Config.Labels = []; }, /Config\.Labels/],
         ['user', raw => { raw.Config.User = 'root'; }, /Config\.User/],
         ['required env missing', raw => {
             raw.Config.Env = raw.Config.Env.filter(value => !value.startsWith('HOME='));
@@ -148,7 +147,7 @@ test('contract-5 validation emits field-specific failures', async t => {
     ];
     for (const [name, mutate, pattern] of cases) {
         await t.test(name, () => {
-            const raw = contract2Image();
+            const raw = compatibleImage();
             mutate(raw);
             assert.throws(
                 () => validateImageContract(normalizeImageInspect(raw), REQUIRED_RUNTIME_IMAGE),
@@ -165,7 +164,6 @@ test('runtime creation args pin the validated ID and label the logical reference
     const args = buildRuntimeRunArgs(config, { engine: 'podman' });
     assert.equal(args.at(-1), 'sha256:validated');
     assert.ok(args.includes(`${REQUESTED_IMAGE_LABEL}=${REQUIRED_RUNTIME_IMAGE}`));
-    assert.ok(args.includes(`${IDENTITY_SCHEMA_LABEL}=${IDENTITY_SCHEMA_VERSION}`));
     assert.ok(args.includes(`${PATH_HASH_LABEL}=${invocation.pathHash}`));
     for (const name of Object.values(runtimeVolumeNames(invocation.instance))) {
         assert.ok(args.some(value => value.startsWith(`${name}:`)), name);
@@ -220,7 +218,7 @@ test('outer publication escape hatches are rejected before engine discovery', as
         await t.test(prefix.join(' '), async () => {
             const harness = createSupervisorHarness();
             assert.equal(await harness.supervisor.run([...prefix, 'list', 'agents']), 1);
-            assert.match(harness.stderr, /runtime contract 5|forbids physical-host publication|removed/);
+            assert.match(harness.stderr, /managed Box configuration|forbids physical-host publication|removed/);
             assert.equal(harness.calls.length, 0);
         });
     }
@@ -277,7 +275,7 @@ test('outer --port is strict and normalized before publication', async () => {
 });
 
 test('non-start post-command port tokens are forwarded byte-for-byte', async () => {
-    const fixture = contract2RuntimeFixture();
+    const fixture = ownedRuntimeFixture();
     const harness = createSupervisorHarness(fixture);
     const tail = ['tool', 'sample', '--port', '0', '--port=9192'];
     assert.equal(await harness.supervisor.run(['client', ...tail]), 0);
@@ -407,7 +405,7 @@ test('cross-engine discovery rejects split container/volume ownership', () => {
     const names = runtimeVolumeNames(invocation.instance);
     const podman = createFakeEngine({
         engine: 'podman',
-        container: contract2Container(),
+        container: ownedContainer(),
     });
     const docker = createFakeEngine({
         engine: 'docker',
@@ -439,7 +437,7 @@ test('cross-engine discovery rejects exact-name foreign volumes', () => {
 
 test('an unreachable installed engine is unknown even when the peer owns resources', () => {
     const invocation = invocationFor();
-    const podman = createFakeEngine({ engine: 'podman', container: contract2Container() });
+    const podman = createFakeEngine({ engine: 'podman', container: ownedContainer() });
     const docker = createFakeEngine({ engine: 'docker', failures: { info: 1 } });
     const result = resolveEngineOwnership(invocation, {
         installedEngines: ['podman', 'docker'],
@@ -568,7 +566,7 @@ test('every outer mutation route is held by the exact-directory host lock while 
     ];
     for (const entry of cases) {
         await t.test(entry.argv.join(' ') || 'bare', async () => {
-            const fixture = contract2RuntimeFixture();
+            const fixture = ownedRuntimeFixture();
             let locks = 0;
             const harness = createSupervisorHarness({
                 ...fixture,
@@ -586,7 +584,7 @@ test('every outer mutation route is held by the exact-directory host lock while 
 
     for (const argv of [['status'], ['help']]) {
         await t.test(`${argv[0]} is lock-free`, async () => {
-            const fixture = contract2RuntimeFixture();
+            const fixture = ownedRuntimeFixture();
             const harness = createSupervisorHarness({
                 ...fixture,
                 withHostRuntimeLock: async () => {
@@ -600,8 +598,8 @@ test('every outer mutation route is held by the exact-directory host lock while 
 });
 
 test('missing create pulls despite a cached tag, validates, and runs the new ID', async () => {
-    const oldImage = contract2Image('sha256:old');
-    const newImage = contract2Image('sha256:new');
+    const oldImage = compatibleImage('sha256:old');
+    const newImage = compatibleImage('sha256:new');
     const harness = createSupervisorHarness({
         images: { [REQUIRED_RUNTIME_IMAGE]: oldImage, [oldImage.Id]: oldImage },
         pullImages: { [REQUIRED_RUNTIME_IMAGE]: newImage },
@@ -615,13 +613,42 @@ test('missing create pulls despite a cached tag, validates, and runs the new ID'
 
 test('a custom image is pulled, contract-validated, and pinned by ID', async () => {
     const reference = 'registry.example/ploinky/custom:runtime';
-    const image = contract2Image('sha256:custom');
+    const image = compatibleImage('sha256:custom');
     const harness = createSupervisorHarness({ pullImages: { [reference]: image } });
     assert.equal(await harness.supervisor.run(['--image', reference, 'list']), 0);
     assert.deepEqual(runCalls(harness, 'pull')[0].args, ['pull', reference]);
     const create = runCalls(harness, 'run')[0].args;
     assert.equal(create.at(-1), image.Id);
     assert.ok(create.includes(`${REQUESTED_IMAGE_LABEL}=${reference}`));
+});
+
+test('missing marker or runtime capabilities fail before volume or container creation', async () => {
+    const source = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-invalid-image-source-'));
+    try {
+        for (const relative of ['bin/ploinky', 'cli/index.js', 'globalDeps/package.json']) {
+            const target = path.join(source, relative);
+            fs.mkdirSync(path.dirname(target), { recursive: true });
+            fs.writeFileSync(target, '');
+        }
+        const harness = createSupervisorHarness({
+            env: { PLOINKY_BOX_SOURCE: source },
+            failures: { 'image capability probe': 1 },
+        });
+        assert.equal(await harness.supervisor.run(['list', 'agents']), 1);
+        assert.match(harness.stderr, /runtime capabilities and marker/);
+        assert.equal(runCalls(harness, 'pull').length, 1);
+        assert.equal(runCalls(harness, 'volume').length, 0);
+        assert.equal(runCalls(harness, 'run').length, 0);
+        const probe = harness.calls.find((call) => (
+            call.kind === 'query'
+            && call.args[0] === 'run'
+            && call.args.includes('--network=none')
+        ));
+        assert.equal(probe?.options?.timeoutMs, IMAGE_PROBE_TIMEOUT_MS);
+        assert.equal(fs.existsSync(path.join(source, 'node_modules')), false);
+    } finally {
+        fs.rmSync(source, { recursive: true, force: true });
+    }
 });
 
 test('missing create explicitly creates and labels all named volumes before attachment', async () => {
@@ -636,11 +663,9 @@ test('missing create explicitly creates and labels all named volumes before atta
     for (const [role, expectedRole] of Object.entries(VOLUME_ROLES)) {
         const call = creates.find(entry => entry.args.at(-1) === names[role]);
         assert.ok(call, role);
-        assert.ok(call.args.includes(`${IDENTITY_SCHEMA_LABEL}=1`));
         assert.ok(call.args.includes(`${PATH_HASH_LABEL}=${identity.pathHash}`));
         assert.ok(call.args.includes(`${VOLUME_ROLE_LABEL}=${expectedRole}`));
         assert.deepEqual(harness.state.volumes.get(names[role]).Labels, {
-            [IDENTITY_SCHEMA_LABEL]: '1',
             [PATH_HASH_LABEL]: identity.pathHash,
             [VOLUME_ROLE_LABEL]: expectedRole,
         });
@@ -704,7 +729,7 @@ test('new path-hashed create never attaches legacy basename-only volumes', async
 test('compatible running reuse and stopped start perform no registry pull', async t => {
     for (const state of ['running', 'exited']) {
         await t.test(state, async () => {
-            const fixture = contract2RuntimeFixture({ state });
+            const fixture = ownedRuntimeFixture({ state });
             const harness = createSupervisorHarness(fixture);
             assert.equal(await harness.supervisor.run(['list', 'agents']), 0);
             assert.equal(runCalls(harness, 'pull').length, 0);
@@ -713,7 +738,7 @@ test('compatible running reuse and stopped start perform no registry pull', asyn
     }
 });
 
-test('current-contract configuration drift requires explicit destroy before any mutation', async t => {
+test('managed Box configuration drift requires explicit destroy before any mutation', async t => {
     const mountDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-box-drift-mount-'));
     t.after(() => fs.rmSync(mountDir, { recursive: true, force: true }));
     const cases = [
@@ -743,13 +768,13 @@ test('current-contract configuration drift requires explicit destroy before any 
     ];
     for (const entry of cases) {
         await t.test(entry.name, async () => {
-            const fixture = contract2RuntimeFixture();
+            const fixture = ownedRuntimeFixture();
             entry.mutateInspect?.(fixture.container.inspect);
             const harness = createSupervisorHarness(fixture);
             const before = structuredClone(harness.state.container.inspect);
 
             assert.equal(await harness.supervisor.run(entry.argv), 1);
-            assert.match(harness.stderr, /configuration differs from contract-5 desired state/);
+            assert.match(harness.stderr, /configuration differs from managed Box desired state/);
             assert.match(harness.stderr, new RegExp(`\\b${entry.reason}\\b`));
             assert.match(harness.stderr, /run 'ploinky destroy' explicitly/);
             assert.match(harness.stderr, /rerun the original command to recreate the box/);
@@ -761,8 +786,8 @@ test('current-contract configuration drift requires explicit destroy before any 
     }
 });
 
-test('repeated drift reconciliation leaves a stopped current-contract box stopped', async () => {
-    const fixture = contract2RuntimeFixture({ state: 'exited' });
+test('repeated drift reconciliation leaves a stopped compatible box stopped', async () => {
+    const fixture = ownedRuntimeFixture({ state: 'exited' });
     const harness = createSupervisorHarness(fixture);
     const before = structuredClone(harness.state.container.inspect);
 
@@ -775,9 +800,9 @@ test('repeated drift reconciliation leaves a stopped current-contract box stoppe
     assert.equal(harness.state.container.inspect.State.Status, 'exited');
 });
 
-test('contract-1 ordinary commands fail closed without pull or mutation', async () => {
-    const fixture = contract2RuntimeFixture({ imageId: 'sha256:runtime-1' });
-    fixture.images = { 'sha256:runtime-1': contract1Image() };
+test('incompatible-image ordinary commands fail closed without pull or mutation', async () => {
+    const fixture = ownedRuntimeFixture({ imageId: 'sha256:runtime-incompatible' });
+    fixture.images = { 'sha256:runtime-incompatible': incompatibleImage() };
     const harness = createSupervisorHarness(fixture);
     assert.equal(await harness.supervisor.run(['start', 'explorer']), 1);
     assert.match(harness.stderr, /unsupported/);
@@ -785,8 +810,8 @@ test('contract-1 ordinary commands fail closed without pull or mutation', async 
     assert.equal(mutationCalls(harness).length, 0);
 });
 
-test('current-contract box missing router publication fails before core mutation', async () => {
-    const fixture = contract2RuntimeFixture();
+test('compatible box missing router publication fails before core mutation', async () => {
+    const fixture = ownedRuntimeFixture();
     delete fixture.container.inspect.HostConfig.PortBindings[`${BOX_ROUTER_PORT}/tcp`];
     const harness = createSupervisorHarness(fixture);
 
@@ -796,9 +821,9 @@ test('current-contract box missing router publication fails before core mutation
     assert.equal(mutationCalls(harness).length, 0);
 });
 
-test('current-contract boxes fail closed on missing UDP 7882 or any third publication', async t => {
+test('compatible boxes fail closed on missing UDP 7882 or any third publication', async t => {
     await t.test('missing fixed UDP reservation', async () => {
-        const fixture = contract2RuntimeFixture();
+        const fixture = ownedRuntimeFixture();
         delete fixture.container.inspect.HostConfig.PortBindings[`${BOX_MEDIA_PORT}/udp`];
         const harness = createSupervisorHarness(fixture);
         assert.equal(await harness.supervisor.run(['list', 'agents']), 1);
@@ -806,7 +831,7 @@ test('current-contract boxes fail closed on missing UDP 7882 or any third public
         assert.equal(mutationCalls(harness).length, 0);
     });
     await t.test('third physical-host mapping', async () => {
-        const fixture = contract2RuntimeFixture();
+        const fixture = ownedRuntimeFixture();
         fixture.container.inspect.HostConfig.PortBindings['9000/tcp'] = [
             { HostIp: '127.0.0.1', HostPort: '9000' },
         ];
@@ -816,7 +841,7 @@ test('current-contract boxes fail closed on missing UDP 7882 or any third public
         assert.equal(mutationCalls(harness).length, 0);
     });
     await t.test('empty wildcard host IP normalizes to 0.0.0.0', async () => {
-        const fixture = contract2RuntimeFixture();
+        const fixture = ownedRuntimeFixture();
         fixture.container.inspect.HostConfig.PortBindings[`${BOX_MEDIA_PORT}/udp`][0].HostIp = '';
         const harness = createSupervisorHarness(fixture);
         assert.equal(await harness.supervisor.run(['list', 'agents']), 0);
@@ -824,29 +849,25 @@ test('current-contract boxes fail closed on missing UDP 7882 or any third public
     });
 });
 
-test('contracts 2, 3, and 4 require explicit destroy without mutation', async t => {
-    for (const legacyContract of ['2', '3', '4']) {
-        await t.test(`contract ${legacyContract}`, async () => {
-            const imageId = `sha256:runtime-legacy-${legacyContract}`;
-            const fixture = contract2RuntimeFixture({ imageId });
-            const legacyImage = contract2Image(imageId);
-            legacyImage.Config.Labels[RUNTIME_CONTRACT_LABEL] = legacyContract;
-            fixture.images = { [legacyImage.Id]: legacyImage };
-            const harness = createSupervisorHarness(fixture);
+test('images carrying retired metadata require explicit destroy without mutation', async () => {
+    const imageId = 'sha256:runtime-retired-metadata';
+    const fixture = ownedRuntimeFixture({ imageId });
+    const retiredImage = compatibleImage(imageId);
+    retiredImage.Config.Labels['io.assistos.ploinky.unexpected'] = 'retired';
+    fixture.images = { [retiredImage.Id]: retiredImage };
+    const harness = createSupervisorHarness(fixture);
 
-            assert.equal(await harness.supervisor.run(['start', 'explorer']), 1);
-            assert.match(harness.stderr, /runtime-contract/);
-            assert.match(harness.stderr, /ploinky destroy explicitly/);
-            assert.equal(mutationCalls(harness).length, 0);
-        });
-    }
+    assert.equal(await harness.supervisor.run(['start', 'explorer']), 1);
+    assert.match(harness.stderr, /Config\.Labels/);
+    assert.match(harness.stderr, /ploinky destroy explicitly/);
+    assert.equal(mutationCalls(harness).length, 0);
 });
 
-test('status, stop, and destroy remain pull-free for contract-1 boxes', async t => {
+test('status, stop, and destroy remain pull-free for incompatible boxes', async t => {
     for (const command of ['status', 'stop', 'destroy']) {
         await t.test(command, async () => {
-            const fixture = contract2RuntimeFixture({ imageId: 'sha256:runtime-1' });
-            fixture.images = { 'sha256:runtime-1': contract1Image() };
+            const fixture = ownedRuntimeFixture({ imageId: 'sha256:runtime-incompatible' });
+            fixture.images = { 'sha256:runtime-incompatible': incompatibleImage() };
             const harness = createSupervisorHarness({
                 ...fixture,
                 answer: command === 'destroy' ? 'y' : null,
@@ -874,7 +895,7 @@ test('failed initial run removes a partially created box and its anonymous volum
 });
 
 test('destroy directly removes only the outer box, cleans anonymous volumes, and retains named volumes', async () => {
-    const fixture = contract2RuntimeFixture();
+    const fixture = ownedRuntimeFixture();
     const labelsBefore = structuredClone(fixture.volumes);
     const harness = createSupervisorHarness({
         ...fixture,
@@ -896,7 +917,7 @@ test('destroy directly removes only the outer box, cleans anonymous volumes, and
 });
 
 test('destroy refusal mutates nothing', async () => {
-    const fixture = contract2RuntimeFixture();
+    const fixture = ownedRuntimeFixture();
     const harness = createSupervisorHarness({ ...fixture, answer: 'no' });
     assert.equal(await harness.supervisor.run(['destroy']), 1);
     assert.ok(harness.state.container);
@@ -930,7 +951,7 @@ test('foreign retained resources block destroy before confirmation or mutation',
 });
 
 test('destroy is idempotent with a missing box and retained volumes', async () => {
-    const fixture = contract2RuntimeFixture();
+    const fixture = ownedRuntimeFixture();
     const harness = createSupervisorHarness({ container: null, volumes: fixture.volumes, answer: 'y' });
     assert.equal(await harness.supervisor.run(['destroy']), 0);
     assert.equal(harness.prompt, '');
@@ -939,7 +960,7 @@ test('destroy is idempotent with a missing box and retained volumes', async () =
 });
 
 test('retained named volumes are reattached on recreation', async () => {
-    const fixture = contract2RuntimeFixture();
+    const fixture = ownedRuntimeFixture();
     const harness = createSupervisorHarness({ ...fixture, answer: 'y' });
     assert.equal(await harness.supervisor.run(['destroy']), 0);
     assert.equal(await harness.supervisor.run(['list', 'agents']), 0);
@@ -951,7 +972,7 @@ test('retained named volumes are reattached on recreation', async () => {
 });
 
 test('bare ploinky opens p-cli and parameterless cli opens the in-box Bash route', async () => {
-    const fixture = contract2RuntimeFixture();
+    const fixture = ownedRuntimeFixture();
     const bare = createSupervisorHarness({ ...fixture, stdoutIsTTY: true });
     assert.equal(await bare.supervisor.run([]), 0);
     const bareExec = runCalls(bare, 'exec').at(-1).args;
@@ -1008,7 +1029,7 @@ test('status and stop inherit the master key without exposing its value in argv'
     for (const argv of [['status'], ['stop']]) {
         await t.test(argv.join(' '), async () => {
             const secret = `secret-${argv.at(-1)}`;
-            const fixture = contract2RuntimeFixture();
+            const fixture = ownedRuntimeFixture();
             const harness = createSupervisorHarness({
                 ...fixture,
                 env: { PLOINKY_MASTER_KEY: secret },
@@ -1037,17 +1058,17 @@ test('engine query and run seams pass bounded stdin and environment', () => {
         },
     });
     assert.equal(client.query(['exec', 'worker'], {
-        input: '{"schemaVersion":1}',
+        input: '{"probe":"runtime"}',
         env: { TEST_ENV: 'query' },
     }).ok, true);
     assert.equal(client.run(['run', 'worker'], {
-        input: '{"schemaVersion":1}',
+        input: '{"probe":"runtime"}',
         env: { TEST_ENV: 'run' },
         silence: 'all',
     }), 0);
-    assert.equal(calls[0].options.input, '{"schemaVersion":1}');
+    assert.equal(calls[0].options.input, '{"probe":"runtime"}');
     assert.deepEqual(calls[0].options.env, { TEST_ENV: 'query' });
-    assert.equal(calls[1].options.input, '{"schemaVersion":1}');
+    assert.equal(calls[1].options.input, '{"probe":"runtime"}');
     assert.deepEqual(calls[1].options.env, { TEST_ENV: 'run' });
 });
 
@@ -1149,7 +1170,7 @@ test('dependency consent honors environment opt-in and TTY confirmation only', (
 });
 
 test('missing dependencies fail noninteractive commands before core exec', async () => {
-    const fixture = contract2RuntimeFixture();
+    const fixture = ownedRuntimeFixture();
     fixture.container.depsInstalled = false;
     const harness = createSupervisorHarness(fixture);
     assert.equal(await harness.supervisor.run(['list', 'agents']), 1);
@@ -1163,7 +1184,7 @@ test('dependency environment opt-in and TTY approval run the in-box installer', 
         { name: 'TTY prompt', env: {}, stdoutIsTTY: true, answer: 'y' },
     ]) {
         await t.test(scenario.name, async () => {
-            const fixture = contract2RuntimeFixture();
+            const fixture = ownedRuntimeFixture();
             fixture.container.depsInstalled = false;
             const harness = createSupervisorHarness({ ...fixture, ...scenario });
             assert.equal(await harness.supervisor.run(['list']), 0);
@@ -1176,14 +1197,14 @@ test('dependency environment opt-in and TTY approval run the in-box installer', 
     }
 });
 
-test('contract-5 rejects Docker while rootless Podman relies on :U', async () => {
-    const dockerFixture = contract2RuntimeFixture({ engine: 'docker' });
+test('managed Box rejects Docker while rootless Podman relies on :U', async () => {
+    const dockerFixture = ownedRuntimeFixture({ engine: 'docker' });
     const docker = createSupervisorHarness({ ...dockerFixture, engine: 'docker' });
     assert.equal(await docker.supervisor.run(['list']), 1);
     assert.match(docker.stderr, /requires rootless Podman/);
     assert.equal(runCalls(docker, 'exec').length, 0);
 
-    const podmanFixture = contract2RuntimeFixture({ engine: 'podman' });
+    const podmanFixture = ownedRuntimeFixture({ engine: 'podman' });
     const podman = createSupervisorHarness({ ...podmanFixture, engine: 'podman' });
     assert.equal(await podman.supervisor.run(['list']), 0);
     assert.equal(runCalls(podman, 'exec').some(call => call.args.includes('chown')), false);
@@ -1205,7 +1226,7 @@ test('nested rootless maps require exactly 65535 contiguous UID and GID identiti
 });
 
 test('outer capability drift is captured and cleared while SELinux desired state converges', () => {
-    const fixture = contract2RuntimeFixture();
+    const fixture = ownedRuntimeFixture();
     fixture.container.inspect.HostConfig.CapAdd = ['SYS_ADMIN'];
     const normalized = normalizeContainerInspect('podman', JSON.stringify([fixture.container.inspect]));
     assert.deepEqual(normalized.capAdds, ['SYS_ADMIN']);
@@ -1217,13 +1238,13 @@ test('outer capability drift is captured and cleared while SELinux desired state
     assert.ok(desired.securityOpts.includes('label=disable'));
     desired.running = true;
     const converged = mergeDesiredRuntimeConfig(invocation, desired);
-    assert.equal(planReconciliation({ existing: desired, desired: converged, contractMatches: true }).action, 'reuse');
+    assert.equal(planReconciliation({ existing: desired, desired: converged }).action, 'reuse');
     desired.capAdds = ['SYS_ADMIN'];
     assert.throws(() => buildRuntimeRunArgs(desired, { engine: 'podman' }), /forbids added/);
 });
 
 test('Podman-normalized outer devices and security options converge without drift', () => {
-    const fixture = contract2RuntimeFixture();
+    const fixture = ownedRuntimeFixture();
     fixture.container.inspect.HostConfig.Devices = [];
     fixture.container.inspect.HostConfig.SecurityOpt = ['label=disable', 'unmask=all'];
     fixture.container.inspect.Config.CreateCommand = [
@@ -1244,7 +1265,7 @@ test('Podman-normalized outer devices and security options converge without drif
 });
 
 test('interactive exec preserves TTY and non-TTY behavior for cli and shell routes', async () => {
-    const fixture = contract2RuntimeFixture();
+    const fixture = ownedRuntimeFixture();
     const tty = createSupervisorHarness({ ...fixture, stdoutIsTTY: true });
     assert.equal(await tty.supervisor.run(['cli', 'agent', '--field', 'value']), 0);
     const ttyExec = runCalls(tty, 'exec').at(-1).args;
@@ -1269,25 +1290,25 @@ test('interactive exec preserves TTY and non-TTY behavior for cli and shell rout
 });
 
 test('compatible and stopped status preserve streaming health/core behavior without mutation', async () => {
-    const runningFixture = contract2RuntimeFixture();
+    const runningFixture = ownedRuntimeFixture();
     const running = createSupervisorHarness(runningFixture);
     assert.equal(await running.supervisor.run(['status']), 0);
     assert.match(running.stdout, new RegExp(`runtime: ${runningFixture.identity.instance} \\(running\\)`));
-    assert.match(running.stdout, /contract: compatible \(expected 5, observed 5\)/);
+    assert.match(running.stdout, /configuration: compatible/);
     assert.match(running.stdout, /health: healthy/);
     assert.match(running.stdout, /core: running/);
     assert.match(running.stdout, /0\.0\.0\.0:7882 -> 7882\/udp/);
     assert.equal(running.calls.some(call => call.kind === 'streamContains'), true);
     assert.equal(runCalls(running, 'pull').length, 0);
 
-    const stopped = createSupervisorHarness(contract2RuntimeFixture({ state: 'exited' }));
+    const stopped = createSupervisorHarness(ownedRuntimeFixture({ state: 'exited' }));
     assert.equal(await stopped.supervisor.run(['status']), 1);
     assert.equal(runCalls(stopped, 'exec').length, 0);
     assert.equal(stopped.calls.some(call => call.kind === 'streamContains'), false);
 });
 
 test('stop attempts the outer stop after a core shutdown failure and stays pull-free', async () => {
-    const fixture = contract2RuntimeFixture();
+    const fixture = ownedRuntimeFixture();
     const harness = createSupervisorHarness({
         ...fixture,
         failures: { 'exec ploinky stop': 9 },
@@ -1325,7 +1346,7 @@ test('managed start probes the supervisor Unix health socket only after core sta
 });
 
 test('a positional start port requires explicit destroy when an existing box uses another port', async () => {
-    const fixture = contract2RuntimeFixture();
+    const fixture = ownedRuntimeFixture();
     const harness = createSupervisorHarness({
         ...fixture,
         fetchResponse: { ok: true },
@@ -1395,7 +1416,7 @@ test('runtime config requires an explicitly selected host port and never supplie
     );
     const existing = normalizeContainerInspect(
         'podman',
-        contract2RuntimeFixture().container.inspect,
+        ownedRuntimeFixture().container.inspect,
     );
     assert.throws(
         () => mergeDesiredRuntimeConfig(invocation, existing),
@@ -1412,7 +1433,7 @@ test('mount, forbidden publication, and host-port preflight failures occur befor
     await t.test('forbidden publish', async () => {
         const harness = createSupervisorHarness();
         assert.equal(await harness.supervisor.run(['--publish', '70000:70000', 'list']), 1);
-        assert.match(harness.stderr, /runtime contract 5.*exactly two fixed publications/);
+        assert.match(harness.stderr, /managed Box configuration.*exactly two fixed publications/);
         assert.equal(mutationCalls(harness).length, 0);
     });
     await t.test('busy router port', async () => {
@@ -1462,7 +1483,7 @@ test('fixed UDP 7882 conflicts fail before pull with owner-aware diagnostics', a
         assert.equal(runCalls(harness, 'pull').length, 0);
     });
     await t.test('engine inspect normalization and own-name exclusion', () => {
-        const inspect = contract2Container().inspect;
+        const inspect = ownedContainer().inspect;
         inspect.HostConfig.PortBindings['7000/udp'] =
             inspect.HostConfig.PortBindings['7882/udp'];
         delete inspect.HostConfig.PortBindings['7882/udp'];
@@ -1495,20 +1516,19 @@ test('fixed publication assertion rejects additional or altered host mappings', 
 });
 
 test('inspect normalization and reconciliation helpers preserve engine parity and explicit-only changes', () => {
-    const podmanRaw = contract2Container({ engine: 'podman' }).inspect;
-    const dockerRaw = contract2Container({ engine: 'docker' }).inspect;
+    const podmanRaw = ownedContainer({ engine: 'podman' }).inspect;
+    const dockerRaw = ownedContainer({ engine: 'docker' }).inspect;
     const podman = normalizeContainerInspect('podman', [podmanRaw]);
     const docker = normalizeContainerInspect('docker', [dockerRaw]);
     assert.deepEqual(docker, podman);
 
-    podman.contract = '5';
     const omitted = mergeDesiredRuntimeConfig(invocationFor(), podman);
-    assert.equal(planReconciliation({ existing: podman, desired: omitted, contractMatches: true }).action, 'reuse');
+    assert.equal(planReconciliation({ existing: podman, desired: omitted }).action, 'reuse');
     const changedInvocation = invocationFor();
     changedInvocation.port = '9192';
     changedInvocation.explicit.add('--port');
     const changed = mergeDesiredRuntimeConfig(changedInvocation, podman);
-    const plan = planReconciliation({ existing: podman, desired: changed, contractMatches: true });
+    const plan = planReconciliation({ existing: podman, desired: changed });
     assert.equal(plan.action, 'recreate-required');
     assert.deepEqual(plan.reasons, ['routerPublish']);
 });
@@ -1559,7 +1579,7 @@ test('engine and supervisor boundaries preserve nonzero and signal exit details'
 });
 
 test('host help describes automatic identity and direct volume-preserving destroy', () => {
-    assert.match(publicUsageText(), /Contract-5 runtime image/);
+    assert.match(publicUsageText(), /Managed Box runtime image/);
     const help = publicUsageText();
     assert.match(help, /canonical current directory/);
     assert.match(help, /retain named volumes/);

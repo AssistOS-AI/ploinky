@@ -73,7 +73,7 @@ function captureFixtureManifest(repositoryRoot, baseSha, allowlist) {
     })).sort((left, right) => left.path.localeCompare(right.path));
     const paragraphBytes = Buffer.from(PROTECTED_PARAGRAPH);
     const manifest = {
-        schema: 1,
+        kind: 'ploinky-box-boundary-baseline',
         repositoryRoot: fs.realpathSync(repositoryRoot),
         baseSha,
         baseCommitVerified: true,

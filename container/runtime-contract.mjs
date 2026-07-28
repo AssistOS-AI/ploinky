@@ -1,17 +1,11 @@
 export const REQUIRED_RUNTIME_IMAGE =
     'docker.io/assistos/ploinky-box:runtime';
-export const RUNTIME_CONTRACT_LABEL =
-    'io.assistos.ploinky.runtime-contract';
-export const REQUIRED_RUNTIME_CONTRACT = '5';
 export const REQUESTED_IMAGE_LABEL =
     'io.assistos.ploinky.requested-image';
-export const IDENTITY_SCHEMA_LABEL =
-    'io.assistos.ploinky.identity-schema';
 export const PATH_HASH_LABEL =
     'io.assistos.ploinky.path-hash';
 export const VOLUME_ROLE_LABEL =
     'io.assistos.ploinky.volume-role';
-export const IDENTITY_SCHEMA_VERSION = '1';
 export const BOX_ROUTER_PORT = 8080;
 export const BOX_MEDIA_PORT = 7882;
 
@@ -121,12 +115,14 @@ export function normalizeImageInspect(raw) {
         throw new Error('invalid image inspect: missing image record');
     }
     const config = isObjectRecord(value.Config) ? value.Config : {};
-    const labels = config.Labels || value.Labels || {};
+    const rawLabels = config.Labels ?? value.Labels;
+    const labels = rawLabels === null || rawLabels === undefined
+        ? {}
+        : isObjectRecord(rawLabels) ? { ...rawLabels } : null;
     const rawEntrypoint = config.Entrypoint ?? value.Entrypoint;
     return {
         id: String(value.Id || value.ID || ''),
-        labels: { ...(labels || {}) },
-        contract: String(labels?.[RUNTIME_CONTRACT_LABEL] || ''),
+        labels,
         user: String(config.User ?? value.User ?? ''),
         env: envMap(config.Env ?? value.Env ?? []),
         workingDir: String(config.WorkingDir ?? value.WorkingDir ?? ''),
@@ -153,12 +149,12 @@ export function validateImageContract(image, imageRef) {
     if (!String(image.id || '').trim()) {
         contractFailure(imageRef, 'image ID', 'a non-empty local image ID', image.id);
     }
-    if (image.contract !== REQUIRED_RUNTIME_CONTRACT) {
+    if (!isObjectRecord(image.labels) || Object.keys(image.labels).length !== 0) {
         contractFailure(
             imageRef,
-            RUNTIME_CONTRACT_LABEL,
-            JSON.stringify(REQUIRED_RUNTIME_CONTRACT),
-            image.contract,
+            'Config.Labels',
+            'absent or empty',
+            image.labels,
         );
     }
     if (image.user !== REQUIRED_IMAGE_USER) {
@@ -282,7 +278,6 @@ export function normalizeContainerInspect(engine, raw) {
         requestedImage,
         configuredImage: String(value.Config.Image || value.ImageName || ''),
         imageId: String(value.Image || value.ImageID || ''),
-        contract: '',
         state: value.State.Status.trim(),
         running: value.State.Status.trim() === 'running'
             || value.State.Running === true,
@@ -327,7 +322,6 @@ export function expectedVolumeLabels(invocation, roleKey) {
     const role = VOLUME_ROLES[roleKey];
     if (!role) throw new Error(`unknown Ploinky volume role '${roleKey}'`);
     return {
-        [IDENTITY_SCHEMA_LABEL]: IDENTITY_SCHEMA_VERSION,
         [PATH_HASH_LABEL]: String(invocation.pathHash || ''),
         [VOLUME_ROLE_LABEL]: role,
     };
@@ -361,15 +355,13 @@ export function validateVolumeOwnership(volume, invocation, roleKey, expectedNam
         );
     }
     const expected = expectedVolumeLabels(invocation, roleKey);
-    for (const [key, value] of Object.entries(expected)) {
-        if (String(volume.labels?.[key] ?? '') !== value) {
-            const observed = Object.hasOwn(volume.labels || {}, key)
-                ? JSON.stringify(String(volume.labels[key]))
-                : '<missing>';
-            throw new Error(
-                `volume '${expectedName}' is foreign/unsupported: ${key} expected ${JSON.stringify(value)}, observed ${observed}`,
-            );
-        }
+    const observed = Object.fromEntries(Object.entries(volume.labels || {}).sort());
+    const wanted = Object.fromEntries(Object.entries(expected).sort());
+    if (JSON.stringify(observed) !== JSON.stringify(wanted)) {
+        throw new Error(
+            `volume '${expectedName}' is foreign/unsupported: labels expected `
+            + `${JSON.stringify(wanted)}, observed ${JSON.stringify(observed)}`,
+        );
     }
     return volume;
 }
@@ -396,7 +388,6 @@ export function createDefaultRuntimeConfig(invocation) {
     const hostPort = selectedHostPort(invocation, 'outer runtime host port');
     const labels = {
         [REQUESTED_IMAGE_LABEL]: requestedImage,
-        [IDENTITY_SCHEMA_LABEL]: IDENTITY_SCHEMA_VERSION,
         [PATH_HASH_LABEL]: String(invocation.pathHash || ''),
     };
     const config = {
@@ -404,7 +395,6 @@ export function createDefaultRuntimeConfig(invocation) {
         image: requestedImage,
         requestedImage,
         imageId: '',
-        contract: REQUIRED_RUNTIME_CONTRACT,
         state: '',
         running: false,
         user: 'podman',
@@ -460,9 +450,8 @@ export function mergeDesiredRuntimeConfig(invocation, existing) {
         : existing?.requestedImage || existing?.image || REQUIRED_RUNTIME_IMAGE;
     desired.image = selectedImage;
     desired.requestedImage = selectedImage;
-    // Contract 5 is a clean security boundary. Never treat privileged or broad
+    // The managed Box is a clean security boundary. Never treat privileged or broad
     // seccomp settings from an inspected container as desired configuration.
-    desired.contract = REQUIRED_RUNTIME_CONTRACT;
     desired.user = REQUIRED_IMAGE_USER;
     desired.privileged = false;
     desired.devices = [
@@ -474,10 +463,10 @@ export function mergeDesiredRuntimeConfig(invocation, existing) {
         'unmask=ALL',
         ...(invocation._selinuxEnabled ? ['label=disable'] : []),
     ].sort();
-    desired.labels ||= {};
-    desired.labels[REQUESTED_IMAGE_LABEL] = selectedImage;
-    desired.labels[IDENTITY_SCHEMA_LABEL] = IDENTITY_SCHEMA_VERSION;
-    desired.labels[PATH_HASH_LABEL] = String(invocation.pathHash || '');
+    desired.labels = {
+        [REQUESTED_IMAGE_LABEL]: selectedImage,
+        [PATH_HASH_LABEL]: String(invocation.pathHash || ''),
+    };
     desired.routerPublish = {
         hostIp: '127.0.0.1',
         hostPort: explicit.has('--port')
@@ -520,10 +509,9 @@ export function diffRuntimeConfig(actual, desired) {
     );
 }
 
-export function planReconciliation({ existing, desired, contractMatches }) {
+export function planReconciliation({ existing, desired }) {
     if (!existing) return { action: 'create', reasons: ['missing'] };
     const reasons = diffRuntimeConfig(existing, desired);
-    if (!contractMatches) reasons.unshift('runtime-contract');
     if (reasons.length > 0) return { action: 'recreate-required', reasons };
     if (!existing.running) return { action: 'start', reasons: [] };
     return { action: 'reuse', reasons: [] };
@@ -531,10 +519,10 @@ export function planReconciliation({ existing, desired, contractMatches }) {
 
 export function buildRuntimeRunArgs(config, engineOptions = {}) {
     if (config.privileged) {
-        throw new Error('runtime contract 5 forbids privileged outer containers');
+        throw new Error('managed Box configuration forbids privileged outer containers');
     }
     if ((config.capAdds || []).length > 0) {
-        throw new Error('runtime contract 5 forbids added outer-container capabilities');
+        throw new Error('managed Box configuration forbids added outer-container capabilities');
     }
     assertFixedRuntimePublications(config);
     const args = ['run', '-d', '--init', '--name', config.instance];
@@ -581,7 +569,7 @@ export function assertFixedRuntimePublications(config) {
     const router = config?.routerPublish;
     const media = config?.udpReservation;
     const routerPort = String(parseSelectedHostPort(router?.hostPort, {
-        source: 'runtime contract 5 router host port',
+        source: 'managed Box router host port',
     }));
     const expectedRouter = {
         hostIp: '127.0.0.1',
@@ -597,12 +585,12 @@ export function assertFixedRuntimePublications(config) {
     };
     if (JSON.stringify(router) !== JSON.stringify(expectedRouter)) {
         throw new Error(
-            `runtime contract 5 requires ${publishSpec(expectedRouter)} as its only TCP publication`,
+            `managed Box configuration requires ${publishSpec(expectedRouter)} as its only TCP publication`,
         );
     }
     if (JSON.stringify(media) !== JSON.stringify(expectedMedia)) {
         throw new Error(
-            `runtime contract 5 requires ${publishSpec(expectedMedia)} as its fixed UDP reservation`,
+            `managed Box configuration requires ${publishSpec(expectedMedia)} as its fixed UDP reservation`,
         );
     }
     if (Object.hasOwn(config || {}, 'observedPublishes')) {
@@ -618,7 +606,7 @@ export function assertFixedRuntimePublications(config) {
         });
         if (JSON.stringify(config.observedPublishes) !== JSON.stringify(expectedObserved)) {
             throw new Error(
-                'runtime contract 5 requires exactly two outer publications; observed '
+                'managed Box configuration requires exactly two outer publications; observed '
                 + JSON.stringify(config.observedPublishes),
             );
         }

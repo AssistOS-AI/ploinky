@@ -1,6 +1,5 @@
 import fs from 'node:fs';
 
-const PROFILE_SCHEMA_VERSION = 1;
 const SS_COLUMNS = 6;
 
 function immutableArray(values) {
@@ -222,8 +221,8 @@ function validateProfileShape(profile) {
     if (!profile || typeof profile !== 'object' || Array.isArray(profile)) {
         throw new Error('listener profile must be an object');
     }
-    if (profile.schemaVersion !== PROFILE_SCHEMA_VERSION) {
-        throw new Error(`listener profile schemaVersion must equal ${PROFILE_SCHEMA_VERSION}`);
+    if (profile.kind !== 'ploinky-listener-profile') {
+        throw new Error('listener profile kind is invalid');
     }
     if (!String(profile.id || '').trim()) throw new Error('listener profile id is required');
     if (!Array.isArray(profile.requiredContainers)) {

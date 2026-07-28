@@ -10,7 +10,6 @@ import { fileURLToPath } from 'node:url';
 import {
     BOX_MEDIA_PORT,
     BOX_ROUTER_PORT,
-    IDENTITY_SCHEMA_LABEL,
     PATH_HASH_LABEL,
     REQUIRED_RUNTIME_IMAGE,
     VOLUME_ROLE_LABEL,
@@ -190,7 +189,6 @@ function assertRetainedVolumeLabels() {
             invoke('podman', ['volume', 'inspect', name]),
         ).stdout)[0];
         const labels = raw.Labels || raw.labels || {};
-        assert.equal(labels[IDENTITY_SCHEMA_LABEL], '1', `${name} identity schema`);
         assert.equal(labels[PATH_HASH_LABEL], HASH, `${name} path hash`);
         assert.equal(labels[VOLUME_ROLE_LABEL], VOLUME_ROLES[role], `${name} volume role`);
     }
@@ -217,7 +215,7 @@ function installRoutingProbe() {
     );
 
     // The release smoke is the explicit operator for this disposable workspace.
-    // Stage all four v5 sources together so the routing probe cannot rely on a
+    // Stage all four current sources together so the routing probe cannot rely on a
     // missing-source initializer, migration, or partial-state fallback.
     fs.mkdirSync(path.join(fixtureSources, 'data', 'edge-routing'), { recursive: true });
     fs.mkdirSync(path.join(fixtureSources, 'data', 'router-security'), { recursive: true });
@@ -461,7 +459,7 @@ function runConfiguredFullGraph() {
     const encoded = String(process.env.SMOKE_FULL_GRAPH_ARGS_JSON || '').trim();
     if (!encoded) {
         throw new Error(
-            'FULL_EXPLORER_GRAPH is a required runtime-v5 release gate; '
+            'FULL_EXPLORER_GRAPH is a required managed-runtime release gate; '
             + 'set SMOKE_FULL_GRAPH_ARGS_JSON to the exact JSON argv array for a fresh Explorer graph',
         );
     }
@@ -697,7 +695,7 @@ try {
         ploinky(['status']),
         /persisted router port is required.*initial workspace start first/s,
     );
-    assert.match(preStartStatus.stdout, /contract: compatible \(expected 5, observed 5\)/);
+    assert.match(preStartStatus.stdout, /configuration: compatible/);
     assert.match(preStartStatus.stdout, new RegExp(
         `publish: 127\\.0\\.0\\.1:${PORT} -> ${BOX_ROUTER_PORT}/tcp`,
     ));
@@ -776,7 +774,7 @@ try {
     }
     if (independentGateFailures.length) {
         throw new Error(
-            `runtime-v5 release gates failed (${independentGateFailures.length}):\n\n`
+            `managed-runtime release gates failed (${independentGateFailures.length}):\n\n`
             + independentGateFailures.join('\n\n'),
         );
     }

@@ -4,7 +4,10 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 
-import { BOX_READY_LINE } from '../../ploinky-box/constants.mjs';
+import {
+    BOX_MARKER_CONTENT,
+    BOX_READY_LINE,
+} from '../../ploinky-box/constants.mjs';
 import {
     entrypointPaths,
     prepareEntrypoint,
@@ -21,14 +24,14 @@ function fixture(t) {
     t.after(() => fs.rmSync(root, { recursive: true, force: true }));
     const paths = entrypointPaths(root);
     for (const directory of [
-        path.dirname(paths.contract),
+        path.dirname(paths.marker),
         paths.workspace,
         paths.dependencies,
         paths.nestedStore,
         path.dirname(paths.ploinky),
         paths.tmp,
     ]) fs.mkdirSync(directory, { recursive: true });
-    fs.writeFileSync(paths.contract, '6\n', { mode: 0o644 });
+    fs.writeFileSync(paths.marker, BOX_MARKER_CONTENT, { mode: 0o644 });
     fs.writeFileSync(paths.ploinky, '#!/usr/bin/env bash\n', { mode: 0o755 });
     return { root, paths };
 }
@@ -139,20 +142,20 @@ test('failure between final commits restores the complete prior transport pair',
     assert.equal(mode(paths.containersConf), 0o640);
 });
 
-test('entrypoint validates contract and mounts before its first persistent write', (t) => {
+test('entrypoint validates its marker and mounts before its first persistent write', (t) => {
     const { root, paths } = fixture(t);
-    fs.writeFileSync(paths.contract, '5\n');
+    fs.writeFileSync(paths.marker, 'wrong\n');
     let initialized = false;
     assert.throws(() => prepareEntrypoint({
         root,
         initialize() { initialized = true; },
         configureTransport() { throw new Error('must not configure'); },
         installDependencies() { throw new Error('must not install'); },
-    }), /exactly 6/);
+    }), /marker has invalid content/i);
     assert.equal(initialized, false);
     assert.equal(fs.existsSync(path.join(paths.workspace, '.env')), false);
 
-    fs.writeFileSync(paths.contract, '6\n');
+    fs.writeFileSync(paths.marker, BOX_MARKER_CONTENT);
     fs.rmSync(paths.dependencies, { recursive: true });
     fs.symlinkSync(paths.workspace, paths.dependencies);
     assert.throws(() => prepareEntrypoint({ root }), /mount target|mount is missing/);
@@ -176,10 +179,10 @@ test('full preparation creates one stable key, resets only transient runtime, an
     const options = {
         root,
         runner: routeRunner(),
-        installDependencies({ targetRoot, contractPath }) {
+        installDependencies({ targetRoot, markerPath }) {
             events.push('install');
             assert.equal(targetRoot, paths.dependencies);
-            assert.equal(contractPath, paths.contract);
+            assert.equal(markerPath, paths.marker);
         },
     };
     prepareEntrypoint(options);

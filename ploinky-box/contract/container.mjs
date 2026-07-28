@@ -172,7 +172,6 @@ export function validateContainerConfiguration(containerHandle, {
         throw publicationError('Owned Box user, privilege, or init state is incompatible');
     }
     const expectedLabels = {
-        [BOX_LABELS.schema]: '1',
         [BOX_LABELS.pathHash]: identity.pathHash,
         [BOX_LABELS.role]: 'box',
         [BOX_LABELS.imageRef]: imageRef,

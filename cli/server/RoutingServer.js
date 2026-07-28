@@ -100,7 +100,7 @@ const detailedHealthSocket = process.env.PLOINKY_ROUTER_HEALTH_SOCKET
 const interfaceClassifier = createListenerInterfaceClassifier();
 
 if (Object.prototype.hasOwnProperty.call(process.env, 'PORT') && process.env.PORT !== String(port)) {
-    throw new Error('runtime contract v5 requires PORT to be exactly 8080 when set; --port selects only the outer loopback host port');
+    throw new Error('the managed Router requires PORT to be exactly 8080 when set; --port selects only the outer loopback host port');
 }
 
 // Initialize TTY factories

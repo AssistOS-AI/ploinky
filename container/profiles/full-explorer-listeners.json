@@ -1,7 +1,7 @@
 {
-  "schemaVersion": 1,
-  "id": "full-explorer-v5",
-  "description": "Expected listener ownership for a freshly built Ploinky Box v5 running the complete Explorer dependency graph.",
+  "kind": "ploinky-listener-profile",
+  "id": "full-explorer",
+  "description": "Expected listener ownership for a freshly built Ploinky Box running the complete Explorer dependency graph.",
   "requireManagedContainers": true,
   "rejectAdditionalContainers": true,
   "requireProcessOwners": true,

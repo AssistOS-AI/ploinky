@@ -4,8 +4,13 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { REQUIRED_RUNTIME_CONTRACT } from '../../container/runtime-contract.mjs';
-import { BOX_RUNTIME_CONTRACT } from '../../ploinky-box/constants.mjs';
+import {
+    BOX_MARKER_CONTENT,
+    BOX_READY_LINE,
+} from '../../ploinky-box/constants.mjs';
+import {
+    DEPENDENCY_MARKER_NAME,
+} from '../../ploinky-box/entrypoint/install-dependencies.mjs';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 
@@ -13,51 +18,30 @@ function read(relativePath) {
     return fs.readFileSync(path.join(repoRoot, relativePath), 'utf8');
 }
 
-test('canonical runtime documentation distinguishes core v5 from outer Box contract 6', () => {
-    assert.equal(REQUIRED_RUNTIME_CONTRACT, '5');
-    assert.equal(BOX_RUNTIME_CONTRACT, '6');
-    const coreContractDocuments = [
+test('active runtime documentation describes the semantic Box configuration', () => {
+    assert.equal(BOX_MARKER_CONTENT, 'assistos/ploinky-box\n');
+    assert.equal(BOX_READY_LINE, 'PLOINKY_BOX_READY');
+    assert.equal(DEPENDENCY_MARKER_NAME, '.ploinky-box-dependencies.json');
+    const runtimeDocuments = [
         'README.md',
-        'docs/specs/DS003-agent-manifest-and-registry.md',
-        'docs/specs/DS004-runtime-execution-and-isolation.md',
-        'docs/specs/DS007-dependency-caches-and-startup-readiness.md',
-        'docs/specs/DS011-security-model.md',
         'docs/code-derived-agent-lifecycle.md',
         'container/README.md',
     ];
-    for (const relativePath of coreContractDocuments) {
+    for (const relativePath of runtimeDocuments) {
         const content = read(relativePath);
-        assert.match(content, /contract[- ](?:v)?5|runtime-contract=5/i, relativePath);
-        assert.doesNotMatch(content, /runtime-contract=[1-4]/, relativePath);
+        assert.match(content, /assistos\/ploinky-box/, relativePath);
+        assert.match(content, /127\.0\.0\.1:[^`\n]*:8080\/tcp/, relativePath);
+        assert.match(content, /0\.0\.0\.0:7882:7882\/udp/, relativePath);
+        assert.doesNotMatch(content, /io\.assistos\.ploinky\.runtime-contract/, relativePath);
+        assert.doesNotMatch(content, /io\.assistos\.ploinky\.identity-schema/, relativePath);
+        assert.doesNotMatch(content, /contract[- ](?:v)?[56]|runtime[- ]v[56]/i, relativePath);
     }
-
-    for (const relativePath of [
-        'README.md',
-        'docs/specs/DS004-runtime-execution-and-isolation.md',
-        'docs/specs/DS007-dependency-caches-and-startup-readiness.md',
-        'docs/specs/DS011-security-model.md',
-        'container/README.md',
-    ]) {
-        assert.match(
-            read(relativePath),
-            /contract[- ]6|runtime-contract=6|outer-contract-6/i,
-            relativePath,
-        );
-    }
-
-    const isolationSpec = read('docs/specs/DS004-runtime-execution-and-isolation.md');
-    assert.match(isolationSpec, /Every non-contract-6 box[\s\S]*ploinky\s+destroy/);
-    assert.doesNotMatch(isolationSpec, /managed router gateway|gateway preflight|gateway namespace proof/);
-    assert.match(isolationSpec, /--hosts-file=none[\s\S]*host\.containers\.internal:host-gateway/);
-    assert.match(isolationSpec, /RoutingServer\.js[\s\S]*box port `8080`[\s\S]*private listener on `8081`/);
-    assert.match(isolationSpec, /127\.0\.0\.1:<selectedRouterHostPort>:8080\/tcp/);
 });
 
 test('direct/core cutover documentation uses the explicit old core entry', () => {
     for (const relativePath of [
         'README.md',
         'container/README.md',
-        'docs/specs/DS004-runtime-execution-and-isolation.md',
         'docs/code-derived-agent-lifecycle.md',
     ]) {
         const content = read(relativePath);

@@ -3,7 +3,6 @@ import { isDeepStrictEqual } from 'node:util';
 import {
     BOX_LABELS,
     BOX_ROLES,
-    BOX_SCHEMA_VERSION,
 } from '../constants.mjs';
 import { PloinkyBoxError } from '../errors.mjs';
 import { sha256 } from '../boundary/fingerprint.mjs';
@@ -211,8 +210,6 @@ function inventory(engine, kind, pathHash, runner) {
         'ls',
         ...(kind === 'container' ? ['-a'] : []),
         '--filter',
-        `label=${BOX_LABELS.schema}=${BOX_SCHEMA_VERSION}`,
-        '--filter',
         `label=${BOX_LABELS.pathHash}=${pathHash}`,
         '--format',
         '{{json .}}',
@@ -235,14 +232,33 @@ function inventory(engine, kind, pathHash, runner) {
 
 function expectedImmutableLabels(pathHash, role) {
     return {
-        [BOX_LABELS.schema]: BOX_SCHEMA_VERSION,
         [BOX_LABELS.pathHash]: pathHash,
         [BOX_LABELS.role]: role,
     };
 }
 
 function hasExactLabels(labels, expected) {
-    return Object.entries(expected).every(([key, value]) => labels[key] === value);
+    const observed = Object.fromEntries(Object.entries(labels || {})
+        .filter(([key]) => key.startsWith('io.assistos.ploinky-box.'))
+        .sort());
+    const wanted = Object.fromEntries(Object.entries(expected).sort());
+    return isDeepStrictEqual(observed, wanted);
+}
+
+function hasExactResourceLabels(labels, pathHash, role) {
+    if (role !== BOX_ROLES.container) {
+        return hasExactLabels(labels, expectedImmutableLabels(pathHash, role));
+    }
+    const hostPort = String(labels?.[BOX_LABELS.routerHostPort] || '');
+    const imageRef = String(labels?.[BOX_LABELS.imageRef] || '');
+    return /^[1-9][0-9]{0,4}$/.test(hostPort)
+        && Number(hostPort) <= 65535
+        && imageRef.length > 0
+        && hasExactLabels(labels, {
+            ...expectedImmutableLabels(pathHash, role),
+            [BOX_LABELS.imageRef]: imageRef,
+            [BOX_LABELS.routerHostPort]: hostPort,
+        });
 }
 
 function containerHandle(engine, identity, name, record) {
@@ -337,10 +353,7 @@ export function inspectOwnedVolumeHandle(engine, identity, key, runner = createP
         return inspection;
     }
     const labels = labelsFrom(inspection.record);
-    if (!hasExactLabels(
-        labels,
-        expectedImmutableLabels(identity.pathHash, resource.role),
-    )) {
+    if (!hasExactResourceLabels(labels, identity.pathHash, resource.role)) {
         return {
             state: 'foreign',
             message: `${engine.name} exact-name resource ${resource.name} is not owned by this Box`,
@@ -417,10 +430,7 @@ function inspectEngineResources(engine, identity, runner) {
             continue;
         }
         const labels = labelsFrom(inspection.record);
-        if (!hasExactLabels(
-            labels,
-            expectedImmutableLabels(identity.pathHash, resource.role),
-        )) {
+        if (!hasExactResourceLabels(labels, identity.pathHash, resource.role)) {
             return {
                 state: 'foreign',
                 message: `${engine.name} exact-name resource ${resource.name} is not owned by this Box`,

@@ -19,7 +19,7 @@ const ROUTER_HOST_BY_MODE = Object.freeze({
 
 function routerPortError(source, value) {
     const rendered = typeof value === 'string' ? JSON.stringify(value) : String(value);
-    const error = new Error(`${source} must be exactly ${INITIAL_ROUTER_PORT} in runtime contract v5; --port selects only the outer loopback host port; received ${rendered}`);
+    const error = new Error(`${source} must be exactly ${INITIAL_ROUTER_PORT} for the managed Router; --port selects only the outer loopback host port; received ${rendered}`);
     error.code = 'PLOINKY_ROUTER_PORT_INVALID';
     return error;
 }

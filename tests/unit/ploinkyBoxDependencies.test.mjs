@@ -6,19 +6,21 @@ import test from 'node:test';
 
 import {
     canonicalLockJson,
+    DEPENDENCY_MARKER_NAME,
     installPinnedDependencies,
     readDependencyLock,
     validateDependencyLock,
 } from '../../ploinky-box/entrypoint/install-dependencies.mjs';
+import { BOX_MARKER_CONTENT } from '../../ploinky-box/constants.mjs';
 
 function fixture(t) {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-box-deps-'));
     t.after(() => fs.rmSync(root, { recursive: true, force: true }));
     const targetRoot = path.join(root, 'node_modules');
     fs.mkdirSync(targetRoot);
-    const contractPath = path.join(root, 'contract');
-    fs.writeFileSync(contractPath, '6\n');
-    return { root, targetRoot, contractPath };
+    const markerPath = path.join(root, 'ploinky-box');
+    fs.writeFileSync(markerPath, BOX_MARKER_CONTENT);
+    return { root, targetRoot, markerPath };
 }
 
 function fakeInstaller(counter, { failName = '' } = {}) {
@@ -45,6 +47,15 @@ test('dependency lock contains exactly two immutable 40-hex pins', () => {
     const invalid = structuredClone(lock);
     invalid.repositories['mcp-sdk'].commit = 'main';
     assert.throws(() => validateDependencyLock(invalid), /invalid immutable pin/);
+    const unexpected = structuredClone(lock);
+    unexpected.staleMetadata = true;
+    assert.throws(() => validateDependencyLock(unexpected), /declare pinned repositories/);
+    const unexpectedRepositoryField = structuredClone(lock);
+    unexpectedRepositoryField.repositories['mcp-sdk'].staleMetadata = true;
+    assert.throws(
+        () => validateDependencyLock(unexpectedRepositoryField),
+        /invalid immutable pin/,
+    );
 });
 
 test('empty-volume install is transactional and repeat runs are no-ops', (t) => {
@@ -63,9 +74,9 @@ test('empty-volume install is transactional and repeat runs are no-ops', (t) => 
     assert.equal(fs.existsSync(path.join(state.targetRoot, 'achillesAgentLib')), true);
     const marker = JSON.parse(fs.readFileSync(path.join(
         state.targetRoot,
-        '.ploinky-box-dependencies-v6.json',
+        DEPENDENCY_MARKER_NAME,
     ), 'utf8'));
-    assert.equal(marker.contract, 6);
+    assert.deepEqual(Object.keys(marker).sort(), ['fingerprint', 'repositories']);
     assert.match(marker.fingerprint, /^[a-f0-9]{64}$/);
 
     installs.length = 0;
@@ -154,25 +165,25 @@ test('post-commit backup cleanup failure cannot roll back the installed dependen
     assert.equal(fs.readdirSync(state.targetRoot).some((name) => name.includes('stage')), false);
 });
 
-test('contract mismatch and symlink volume roots fail before installation', (t) => {
+test('marker mismatch and symlink volume roots fail before installation', (t) => {
     const state = fixture(t);
-    fs.writeFileSync(state.contractPath, '5\n');
+    fs.writeFileSync(state.markerPath, 'wrong\n');
     const installs = [];
     assert.throws(() => installPinnedDependencies({
         ...state,
         installRepository: fakeInstaller(installs),
         readInstalledHead: readHead,
-    }), /must contain exactly 6/);
+    }), /marker has invalid content/i);
     assert.deepEqual(installs, []);
 
-    fs.writeFileSync(state.contractPath, '6\n');
+    fs.writeFileSync(state.markerPath, BOX_MARKER_CONTENT);
     const realRoot = path.join(state.root, 'real-root');
     fs.mkdirSync(realRoot);
     const linkedRoot = path.join(state.root, 'linked-root');
     fs.symlinkSync(realRoot, linkedRoot, 'dir');
     assert.throws(() => installPinnedDependencies({
         targetRoot: linkedRoot,
-        contractPath: state.contractPath,
+        markerPath: state.markerPath,
         installRepository: fakeInstaller(installs),
         readInstalledHead: readHead,
     }), /not a real directory/);

@@ -35,7 +35,7 @@ outer runtime.
 | `ploinky cli` | Reconcile/start outer runtime; open `/bin/bash` as `podman` in `/workspace` |
 | `ploinky cli <agent>` | Reconcile/start outer runtime; attach to that agent's manifest CLI |
 | `ploinky start ...` | Reconcile/start outer runtime; start the graph behind the fixed boundary |
-| `ploinky status` | Inspect outer contract/publishes/health and running core status without mutation |
+| `ploinky status` | Inspect outer configuration/publishes/health and running core status without mutation |
 | `ploinky stop` | Stop core services, then stop outer runtime; keep volumes |
 | `ploinky destroy` | Confirm exact instance and directly remove its outer container; retain all named volumes |
 | REPL `status`/`stop`/`destroy` | Core workspace/router/agent scope; outer runtime remains |
@@ -43,24 +43,25 @@ outer runtime.
 Host lifecycle commands and same-named REPL commands intentionally have
 different scopes. Exit the REPL before operating on the outer runtime.
 
-## Runtime image contract and reconciliation
+## Runtime image configuration and reconciliation
 
 The required multi-architecture release channel is the mutable reference
-`docker.io/assistos/ploinky-box:runtime`. Its image must satisfy runtime
-contract 6, including the exact label:
+`docker.io/assistos/ploinky-box:runtime`. Its image must satisfy the exact
+source-owned configuration, including an empty image-label set and this exact
+marker content at `/etc/ploinky-box`:
 
 ```text
-io.assistos.ploinky.runtime-contract=6
+assistos/ploinky-box
 ```
 
-The contract also requires user `podman`, working directory `/workspace`, the
+The configuration also requires user `podman`, working directory `/workspace`, the
 `/usr/local/bin/ploinky-box-entrypoint` entrypoint, the exact runtime
 environment validated by `runtime-contract.mjs`, and no default command or
 image-declared volumes. The image is source-free; the selected Ploinky checkout
 is mounted read-only at `/opt/ploinky`.
 
 Creating a missing box unconditionally pulls the selected reference, validates
-its complete contract, resolves its local image ID, and creates the box from
+its complete configuration, resolves its local image ID, and creates the box from
 that ID rather than from the mutable tag.
 Pull failure never falls back to a cached tag. A running compatible box is
 reused, and a stopped compatible box is started, without registry traffic.
@@ -68,18 +69,17 @@ Consequently, publishing a new `:runtime` manifest does not roll existing
 boxes forward. Explicitly destroy the outer box and run an ordinary command to
 pull a refreshed image while reusing its retained named state.
 
-Compatibility is exact after canonical inspection. Any current-contract
+Compatibility is exact after canonical inspection. Any current
 creation drift, including a changed Router host port, image, mount, device, or
 security option, fails before pull or mutation and reports the differences.
 Run `ploinky destroy` explicitly and then recreate; the supervisor has no
 automatic replacement, backup rename, or rollback transaction.
 
-Contract 6 is a hard cut. Every non-contract-6 box, including contract 5 or
-malformed state, fails before pulling, volume creation, restart, upgrade, or
-replacement. The supervisor does not read it as compatible state or
+Every incompatible or malformed Box fails before pulling, volume creation,
+restart, upgrade, or replacement. The supervisor does not read it as compatible state or
 automatically migrate, clean, relabel, adopt, or replace it. Run `ploinky
 destroy` explicitly, then run an ordinary command to recreate the box from
-contract 6 while retaining all three named volumes. Legacy basename-only boxes
+the validated runtime image while retaining all three named volumes. Legacy basename-only boxes
 and volumes are not discoverable through the current identity and remain
 untouched for manual inspection or removal.
 
@@ -109,7 +109,6 @@ Each named volume carries these ownership labels; no absolute path is stored:
 
 | Label | Value |
 | --- | --- |
-| `io.assistos.ploinky.identity-schema` | `1` |
 | `io.assistos.ploinky.path-hash` | The identity's 12-character path hash |
 | `io.assistos.ploinky.volume-role` | `workspace`, `containers`, or `ploinky-deps`, matching the exact volume name |
 
@@ -158,7 +157,7 @@ regardless of the selected physical port. Router private `8081` is never an oute
 publication. LiveKit is the sole capability-approved in-box owner of UDP
 `7882`; the fixed mapping remains idle when LiveKit is absent.
 
-The contract-6 image includes a pinned multi-architecture `cloudflared` binary
+The Box image includes a pinned multi-architecture `cloudflared` binary
 supervised by Ploinky core. Complete credential absence is the explicit
 `local-only` mode: no connector process and no public HTTP hostname. Cloudflare
 mode requires both an existing-tunnel connector token and a separate
@@ -197,7 +196,7 @@ even if older workspace state enabled them. Outside a box, existing runtime
 selection behavior remains unchanged.
 
 Every Ploinky-owned nested container carries the exact label
-`io.assistos.ploinky.managed=1`. Contract-v5 boot enumerates that exact
+`io.assistos.ploinky.managed=1`. Box boot enumerates that exact
 key/value and fails if any retained managed container remains; it never
 deletes, imports, or translates those records. The operator must stop/remove
 managed containers in the old box before explicitly destroying and recreating
@@ -212,7 +211,7 @@ state from the outer container filesystem. These paths are not the named
 nested-storage volume; container records, images, and nested named volumes stay
 retained. Failure to clear stale run state aborts boot.
 
-Core contract-v5 boot requires rootless Podman 5.4 or newer, the Netavark network
+Box boot requires rootless Podman 5.4 or newer, the Netavark network
 backend, and an operational `pasta` executable. Any failed prerequisite aborts
 self-check; managed networking has no `slirp4netns` fallback. The image is
 built from an immutable `quay.io/podman/stable` index digest that contains both
@@ -301,7 +300,7 @@ LEGACY_INSTANCE=ploinky-box-OLDNAME
 $ENGINE rm -f "$LEGACY_INSTANCE"
 ```
 
-For the contract-5 direct/core cutover, invoke the old checkout's core entry
+For a legacy direct/core cutover, invoke the old checkout's core entry
 directly before installing or invoking the new release:
 
 ```sh
@@ -315,8 +314,8 @@ resources rather than adopting them. After confirming no container references
 them, remove only the exact stale `.ploinky/run/router.sock` and
 `.ploinky/run/managed-hosts` paths and the unreferenced cached image
 `docker.io/assistos/ploinky-network-gateway:1@sha256:68c47ce93d16ea1a2d03944f7b50ce82e6f2f9a26b183d2c9c7fbabcc828fb7e`.
-Before v5 activation, revoke the retired publication connector/API tokens and
-delete its plaintext retained state. Contract 5 has no migration or cleanup
+Before activation, revoke the retired publication connector/API tokens and
+delete its plaintext retained state. The current runtime has no migration or cleanup
 reader for it. Do not use a broad container, image, volume, or network prune.
 
 ## Smoke and release ordering
@@ -339,7 +338,7 @@ The supervisor consults that channel only for create and keeps
 existing boxes pinned to their inspected IDs.
 
 The principal functional release gate runs the existing Explorer two-account
-WebMeet smoke against a freshly built v5 box:
+WebMeet smoke against a freshly built Box:
 
 ```bash
 cd ../AssistOSExplorer/tests/smoke

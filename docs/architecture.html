@@ -201,7 +201,7 @@ handleCommand(args) {
 }</code></pre>
 
                         <h3>Runtime Detection</h3>
-                        <p>Outside a marked Ploinky box, runtime selection follows the manifest and host. Inside a contract-v5 marked box, every managed agent, helper, sidecar, probe, and install-container path uses nested Podman; Docker, bwrap, and Seatbelt are not fallbacks:</p>
+                        <p>Outside a marked Ploinky box, runtime selection follows the manifest and host. Inside a marked box, every managed agent, helper, sidecar, probe, and install-container path uses nested Podman; Docker, bwrap, and Seatbelt are not fallbacks:</p>
                         <pre><code>// Runtime preference: podman > docker
 // Default: podman/docker
 // Host sandbox:

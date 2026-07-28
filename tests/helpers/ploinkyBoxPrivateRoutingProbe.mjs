@@ -62,7 +62,7 @@ const nestedNetworkScript = [
 ].join('');
 
 const evidence = {
-    schema: 1,
+    kind: 'ploinky-box-private-routing-probe',
     networkArguments,
     box: {},
     nestedPodman: {},

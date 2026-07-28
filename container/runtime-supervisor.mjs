@@ -12,15 +12,13 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { showHelp } from '../cli/commands/help.js';
 import { loadEnvFile } from '../cli/utils/security/masterKey.js';
+import { probeImageBinaries } from '../ploinky-box/contract/image.mjs';
 import { createEngineClient } from './runtime-engine.mjs';
 import {
-    IDENTITY_SCHEMA_LABEL,
-    IDENTITY_SCHEMA_VERSION,
     BOX_MEDIA_PORT,
     BOX_ROUTER_PORT,
     PATH_HASH_LABEL,
     REQUESTED_IMAGE_LABEL,
-    REQUIRED_RUNTIME_CONTRACT,
     REQUIRED_RUNTIME_IMAGE,
     VOLUME_ROLES,
     assertFixedRuntimePublications,
@@ -89,7 +87,7 @@ Commands:
 
 Outer options (must precede the command):
   --port N          Host port for the router (default 8080)
-  --image I         Contract-5 runtime image (default ${DEFAULT_IMAGE})
+  --image I         Managed Box runtime image (default ${DEFAULT_IMAGE})
   --mount DIR       Bind DIR read-write at /workspace/mounted
   --dry-run         Print mutations instead of executing them
   -h, --help        Show host help
@@ -165,10 +163,10 @@ export function parseHostInvocation(argv, _env = process.env) {
             continue;
         }
         if (token === '--publish' || token.startsWith('--publish=')) {
-            die('--publish is not supported by runtime contract 5; the outer box has exactly two fixed publications');
+            die('--publish is not supported by managed Box configuration; the outer box has exactly two fixed publications');
         }
         if (token === '--expose' || token.startsWith('--expose=')) {
-            die('--expose is not supported by runtime contract 5; the outer box has exactly two fixed publications');
+            die('--expose is not supported by managed Box configuration; the outer box has exactly two fixed publications');
         }
         if (token === '--image') {
             invocation.image = need('--image');
@@ -189,7 +187,7 @@ export function parseHostInvocation(argv, _env = process.env) {
             continue;
         }
         if (token === '--listen-lan' || token.startsWith('--listen-lan=')) {
-            die('--listen-lan is not supported by runtime contract 5; router TCP is physical-host loopback only');
+            die('--listen-lan is not supported by managed Box configuration; router TCP is physical-host loopback only');
         }
         if (token === '--dry-run') {
             invocation.dryRun = true;
@@ -435,7 +433,6 @@ async function acquireHostRuntimeLock(invocation, options = {}) {
             const token = crypto.randomUUID();
             try {
                 fs.writeFileSync(path.join(lockPath, 'owner.json'), JSON.stringify({
-                    schemaVersion: 1,
                     token,
                     pid: process.pid,
                     canonicalPath: invocation.canonicalPath,
@@ -574,11 +571,11 @@ function resultFailure(result) {
 
 export function assertRootlessPodmanEngine(engine) {
     if (!engine || engine.name !== 'podman') {
-        throw new SupervisorError('Ploinky runtime contract 5 requires rootless Podman; Docker and rootful Podman are unsupported');
+        throw new SupervisorError('Ploinky managed Box configuration requires rootless Podman; Docker and rootful Podman are unsupported');
     }
     const result = engine.query(['info', '--format', '{{json .Host.Security.Rootless}}']);
     if (!result.ok || String(result.stdout || '').trim() !== 'true') {
-        throw new SupervisorError('Ploinky runtime contract 5 could not prove that the selected Podman engine is rootless');
+        throw new SupervisorError('Ploinky managed Box configuration could not prove that the selected Podman engine is rootless');
     }
 }
 
@@ -933,8 +930,11 @@ export function resolveHostPloinkySource(env = process.env, scriptDir = HERE) {
     return candidate;
 }
 
-function prepareSource(cfg) {
+function resolveSource(cfg) {
     cfg.sourceDirResolved = resolveHostPloinkySource(runtimeDependencies(cfg).env);
+}
+
+function prepareSourceDependencies(cfg) {
     if (!cfg.dryRun) {
         fs.mkdirSync(path.join(cfg.sourceDirResolved, 'node_modules'), { recursive: true });
     }
@@ -1028,13 +1028,17 @@ function validateExistingRuntime(cfg, existing) {
         die(`runtime '${existing.instance}' is unsupported: ${error.message}; run ploinky destroy explicitly`);
     }
     const expectedIdentity = {
-        [IDENTITY_SCHEMA_LABEL]: IDENTITY_SCHEMA_VERSION,
+        [REQUESTED_IMAGE_LABEL]: existing.requestedImage,
         [PATH_HASH_LABEL]: cfg.pathHash,
     };
-    for (const [key, value] of Object.entries(expectedIdentity)) {
-        if (String(existing.labels?.[key] || '') !== value) {
-            die(`runtime '${existing.instance}' is unsupported: ${key} is missing or mismatched; run ploinky destroy explicitly`);
-        }
+    const observedIdentity = Object.fromEntries(
+        Object.entries(existing.labels || {}).sort(),
+    );
+    const desiredIdentity = Object.fromEntries(
+        Object.entries(expectedIdentity).sort(),
+    );
+    if (JSON.stringify(observedIdentity) !== JSON.stringify(desiredIdentity)) {
+        die(`runtime '${existing.instance}' is unsupported: its ownership labels are missing, mismatched, or unexpected; run ploinky destroy explicitly`);
     }
     if (!existing.requestedImage) {
         die(`runtime '${existing.instance}' is unsupported: ${REQUESTED_IMAGE_LABEL} is missing; run ploinky destroy explicitly`);
@@ -1051,7 +1055,6 @@ function validateExistingRuntime(cfg, existing) {
     } catch (error) {
         die(`runtime '${existing.instance}' is unsupported: ${error.message}; run ploinky destroy explicitly`);
     }
-    existing.contract = image.contract;
     return image;
 }
 
@@ -1065,6 +1068,19 @@ function obtainAndValidateImage(cfg, imageRef, { forcePull = true } = {}) {
     if (!image) die(`Runtime image '${imageRef}' was unavailable after pull`);
     try {
         validateImageContract(image, imageRef);
+        probeImageBinaries(cfg.engine, image.id, {
+            query(engine, args, options) {
+                if (engine !== cfg.engine) {
+                    return {
+                        ok: false,
+                        status: 1,
+                        stdout: '',
+                        stderr: `unexpected runtime engine ${engine}`,
+                    };
+                }
+                return query(cfg, args, options);
+            },
+        });
     } catch (error) {
         throw new SupervisorError(error.message || String(error));
     }
@@ -1338,13 +1354,9 @@ export async function reconcileRuntime(cfg, { fatalOnDepsDecline = false } = {})
     const existing = inspectExistingRuntimeConfig(cfg);
     if (existing) validateExistingRuntime(cfg, existing);
     if (!existing || cfg.explicit.has('--mount')) prepareMount(cfg);
-    if (!existing) prepareSource(cfg);
+    if (!existing) resolveSource(cfg);
     const desired = mergeDesiredRuntimeConfig(cfg, existing);
-    const plan = planReconciliation({
-        existing,
-        desired,
-        contractMatches: existing?.contract === REQUIRED_RUNTIME_CONTRACT,
-    });
+    const plan = planReconciliation({ existing, desired });
     cfg._runtimeConfig = desired;
     cfg._reconciliationPlan = plan;
 
@@ -1381,8 +1393,8 @@ export async function reconcileRuntime(cfg, { fatalOnDepsDecline = false } = {})
             : obtainAndValidateImage(cfg, desired.image, { forcePull: true });
         if (image) {
             desired.imageId = image.id;
-            desired.contract = image.contract;
         }
+        prepareSourceDependencies(cfg);
         ensureRuntimeVolumes(cfg);
         try {
             runEngine(cfg, buildRuntimeRunArgs(desired, {
@@ -1408,7 +1420,7 @@ export async function reconcileRuntime(cfg, { fatalOnDepsDecline = false } = {})
     }
     case 'recreate-required':
         throw new SupervisorError(
-            `runtime '${existing.instance}' configuration differs from contract-5 desired state `
+            `runtime '${existing.instance}' configuration differs from managed Box desired state `
             + `(${plan.reasons.join(', ')}); run 'ploinky destroy' explicitly, then rerun `
             + 'the original command to recreate the box',
         );
@@ -1707,23 +1719,25 @@ export async function reportCombinedStatus({ engine, invocation, stdout }) {
     printRuntimeSummary(stdout, inspected);
     const image = inspectLocalImage(engine, inspected.imageId || inspected.configuredImage);
     let compatible = false;
-    let detail = '<missing>';
     if (image) {
-        detail = image.contract || '<missing>';
         try {
             validateImageContract(image, inspected.imageId || inspected.configuredImage);
             assertFixedRuntimePublications(inspected);
-            compatible = inspected.labels?.[IDENTITY_SCHEMA_LABEL] === IDENTITY_SCHEMA_VERSION
-                && inspected.labels?.[PATH_HASH_LABEL] === invocation.pathHash
-                && Boolean(inspected.requestedImage);
+            const expectedLabels = {
+                [REQUESTED_IMAGE_LABEL]: inspected.requestedImage,
+                [PATH_HASH_LABEL]: invocation.pathHash,
+            };
+            compatible = Boolean(inspected.requestedImage)
+                && JSON.stringify(Object.fromEntries(
+                    Object.entries(inspected.labels || {}).sort(),
+                )) === JSON.stringify(Object.fromEntries(
+                    Object.entries(expectedLabels).sort(),
+                ));
         } catch {
             compatible = false;
         }
     }
-    stdout.write(
-        `contract: ${compatible ? 'compatible' : 'unsupported'}`
-        + ` (expected ${REQUIRED_RUNTIME_CONTRACT}, observed ${detail})\n`,
-    );
+    stdout.write(`configuration: ${compatible ? 'compatible' : 'unsupported'}\n`);
     if (!inspected.running) return 1;
     const healthy = await engine.streamContains(
         ['logs', instance],

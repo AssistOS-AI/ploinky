@@ -1,7 +1,6 @@
 import {
     BOX_LABELS,
     BOX_ROLES,
-    BOX_SCHEMA_VERSION,
     BOX_VOLUME_KEYS,
 } from './constants.mjs';
 import { PloinkyBoxError } from './errors.mjs';
@@ -35,7 +34,6 @@ export function volumeCreateArgs(identity, key) {
     return [
         'volume',
         'create',
-        '--label', `${BOX_LABELS.schema}=${BOX_SCHEMA_VERSION}`,
         '--label', `${BOX_LABELS.pathHash}=${identity.pathHash}`,
         '--label', `${BOX_LABELS.role}=${role}`,
         name,

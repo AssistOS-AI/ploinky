@@ -199,7 +199,10 @@ export async function executeHttpPlan({
         assertSupportedHttp1Request(req, plan);
         const finalized = finalizePlanAfterAdmission(plan);
         const hasBody = !['GET', 'HEAD'].includes(finalized.method);
-        const streaming = hasBody && finalized.allowRequestStreaming === true;
+        const hasPrebufferedBody = prebufferedBody !== undefined;
+        const streaming = hasBody
+            && finalized.allowRequestStreaming === true
+            && !hasPrebufferedBody;
         const body = streaming
             ? null
             : prebufferedBody !== undefined

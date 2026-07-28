@@ -4,12 +4,12 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { BOX_RUNTIME_CONTRACT } from '../constants.mjs';
+import { BOX_MARKER_CONTENT } from '../constants.mjs';
 import { PloinkyBoxError } from '../errors.mjs';
 import { createProcessRunner } from '../process.mjs';
 
 const LOCK_PATH = path.resolve(import.meta.dirname, '../dependencies.lock.json');
-const MARKER_NAME = '.ploinky-box-dependencies-v6.json';
+export const DEPENDENCY_MARKER_NAME = '.ploinky-box-dependencies.json';
 const PIN_PATTERN = /^[a-f0-9]{40}$/;
 
 function dependencyError(message, cause) {
@@ -36,11 +36,12 @@ export function canonicalLockJson(lock) {
 }
 
 export function validateDependencyLock(lock) {
-    if (lock?.contract !== Number(BOX_RUNTIME_CONTRACT)
+    if (!lock
+        || JSON.stringify(Object.keys(lock).sort()) !== JSON.stringify(['repositories'])
         || !lock.repositories
         || typeof lock.repositories !== 'object'
         || Array.isArray(lock.repositories)) {
-        throw dependencyError('Dependency lock must declare contract 6 repositories');
+        throw dependencyError('Dependency lock must declare pinned repositories');
     }
     const expectedNames = ['achillesAgentLib', 'mcp-sdk'];
     const names = Object.keys(lock.repositories).sort();
@@ -49,7 +50,9 @@ export function validateDependencyLock(lock) {
     }
     for (const name of expectedNames) {
         const repository = lock.repositories[name];
-        if (typeof repository?.url !== 'string'
+        if (!repository
+            || JSON.stringify(Object.keys(repository).sort()) !== JSON.stringify(['commit', 'url'])
+            || typeof repository.url !== 'string'
             || !repository.url.startsWith('https://github.com/')
             || !PIN_PATTERN.test(repository.commit)) {
             throw dependencyError(`Dependency lock has an invalid immutable pin for ${name}`);
@@ -78,26 +81,25 @@ function assertRealDirectory(directory, fsApi) {
     }
 }
 
-function assertContractFile(contractPath, fsApi) {
+function assertBoxMarker(markerPath, fsApi) {
     let bytes;
     try {
-        const stat = fsApi.lstatSync(contractPath);
+        const stat = fsApi.lstatSync(markerPath);
         if (stat.isSymbolicLink() || !stat.isFile() || stat.nlink !== 1) {
-            throw dependencyError(`Runtime contract marker is not a regular file: ${contractPath}`);
+            throw dependencyError(`Box marker is not a regular file: ${markerPath}`);
         }
-        bytes = fsApi.readFileSync(contractPath);
+        bytes = fsApi.readFileSync(markerPath);
     } catch (error) {
         if (error instanceof PloinkyBoxError) throw error;
-        throw dependencyError(`Unable to validate runtime contract marker ${contractPath}`, error);
+        throw dependencyError(`Unable to validate Box marker ${markerPath}`, error);
     }
-    if (!bytes.equals(Buffer.from(`${BOX_RUNTIME_CONTRACT}\n`))) {
-        throw dependencyError(`Runtime contract marker must contain exactly ${BOX_RUNTIME_CONTRACT}`);
+    if (!bytes.equals(Buffer.from(BOX_MARKER_CONTENT))) {
+        throw dependencyError('Box marker has invalid content');
     }
 }
 
 function markerFor(lock) {
     return {
-        contract: Number(BOX_RUNTIME_CONTRACT),
         fingerprint: crypto.createHash('sha256').update(canonicalLockJson(lock)).digest('hex'),
         repositories: Object.fromEntries(Object.entries(lock.repositories).map(([name, value]) => (
             [name, value.commit]
@@ -162,7 +164,7 @@ function readMarker(markerPath, fsApi) {
 }
 
 function installationMatches({ targetRoot, expected, lock, fsApi, runner, readInstalledHead }) {
-    if (!markerMatches(readMarker(path.join(targetRoot, MARKER_NAME), fsApi), expected)) {
+    if (!markerMatches(readMarker(path.join(targetRoot, DEPENDENCY_MARKER_NAME), fsApi), expected)) {
         return false;
     }
     for (const [name, repository] of Object.entries(lock.repositories)) {
@@ -190,7 +192,7 @@ function safeRemoveWithin(targetRoot, target, fsApi) {
 
 export function installPinnedDependencies({
     targetRoot = '/opt/ploinky/node_modules',
-    contractPath = '/etc/ploinky-box',
+    markerPath = '/etc/ploinky-box',
     fsApi = fs,
     runner = createProcessRunner(),
     lock = readDependencyLock({ fsApi }),
@@ -199,7 +201,7 @@ export function installPinnedDependencies({
     token = crypto.randomBytes(12).toString('hex'),
 } = {}) {
     validateDependencyLock(lock);
-    assertContractFile(contractPath, fsApi);
+    assertBoxMarker(markerPath, fsApi);
     const root = path.resolve(targetRoot);
     assertRealDirectory(root, fsApi);
     const expected = markerFor(lock);
@@ -242,12 +244,12 @@ export function installPinnedDependencies({
             fsApi.renameSync(staged.get(name), destination);
             movedNames.add(name);
         }
-        const markerTemp = path.join(transactionRoot, MARKER_NAME);
+        const markerTemp = path.join(transactionRoot, DEPENDENCY_MARKER_NAME);
         fsApi.writeFileSync(markerTemp, `${JSON.stringify(expected)}\n`, {
             flag: 'wx',
             mode: 0o600,
         });
-        fsApi.renameSync(markerTemp, path.join(root, MARKER_NAME));
+        fsApi.renameSync(markerTemp, path.join(root, DEPENDENCY_MARKER_NAME));
         committed = true;
         for (const backup of backups.values()) {
             try { safeRemoveWithin(root, backup, fsApi); } catch {}

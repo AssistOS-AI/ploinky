@@ -73,13 +73,13 @@ workspace/router/agent scope; they do not control the containing outer runtime.
 Before a core `start` command is handled, `cli/index.js` parses static-agent,
 port, profile, and branch policy flags and bootstraps the requested agent.
 
-### Outer runtime contract
+### Outer runtime configuration
 
 The required release channel is the mutable
 `docker.io/assistos/ploinky-box:runtime` reference. The source-owned image must
-satisfy the complete outer runtime contract 6 metadata checked by
-`ploinky-box/contract/image.mjs`, including exact label
-`io.assistos.ploinky.runtime-contract=6`, user `podman`, workdir `/workspace`,
+satisfy the complete outer runtime configuration checked by
+`ploinky-box/contract/image.mjs`, including an empty image-label set, the exact
+`assistos/ploinky-box` marker, user `podman`, workdir `/workspace`,
 the box entrypoint, its allowlisted environment, and no image command or
 declared volumes.
 
@@ -92,31 +92,29 @@ them. It selects the sole resource owner, including when only a partial valid
 volume set remains. Split resources, duplicate exact boxes, foreign volume
 labels, or an unknown engine probe fail closed. Podman wins only when neither
 engine owns an identity resource. Engines not installed cannot be inventoried.
-Each volume requires `io.assistos.ploinky.identity-schema=1`, the exact
-`io.assistos.ploinky.path-hash`, and a matching
+Each volume requires the exact `io.assistos.ploinky.path-hash` and a matching
 `io.assistos.ploinky.volume-role` of `workspace`, `containers`, or
 `ploinky-deps`; the canonical absolute path is not stored in labels.
 
-A missing box causes an unconditional pull and full contract validation. The
+A missing box causes an unconditional pull and full configuration validation. The
 supervisor creates the box from the validated image ID, closing a mutable-tag
 race. A stopped compatible box starts and a running compatible box is reused
 without pulling.
 
 Here, compatible means an exact normalized creation-configuration match. Any
-drift in a contract-6 box is reported as recreate-required before pull, stop,
+drift in a compatible box is reported as recreate-required before pull, stop,
 rename, removal, or creation. The operator must run `ploinky destroy`
 explicitly and then recreate it; there is no automatic replacement or rollback
 transaction.
 
-Contract 6 is a hard cut: every non-contract-6 box, including contracts 4 and 5,
-malformed or identity-incompatible state, is blocked before pulling, volume
+Every incompatible, malformed, or identity-incompatible Box is blocked before pulling, volume
 creation, restart, upgrade, or replacement. It requires explicit `ploinky
 destroy`; the supervisor never reads it as compatible state or migrates, cleans,
 relabels, adopts, or automatically replaces it. The next permitted create
 retains and remounts all three named volumes. No old basename-only container or
 volume is copied, adopted, mapped, or discovered by the path-hashed identity.
 
-Direct/core users must invoke the old checkout's core entry before contract 5:
+Direct/core users must invoke the old checkout's core entry before a legacy cutover:
 
 ```sh
 node cli/index.js destroy
@@ -130,7 +128,7 @@ remove only `.ploinky/run/router.sock`,
 `.ploinky/run/managed-hosts`, and the cached exact image
 `docker.io/assistos/ploinky-network-gateway:1@sha256:68c47ce93d16ea1a2d03944f7b50ce82e6f2f9a26b183d2c9c7fbabcc828fb7e`.
 Operators must also revoke retired publication connector/API tokens and delete
-its plaintext state before v5 activation; v5 has no migration or cleanup reader.
+its plaintext state before activation; the current runtime has no migration or cleanup reader.
 No broad container, image, volume, or network prune is part of this cutover.
 
 First create may leave labelled instance volumes when a later startup gate
@@ -336,7 +334,7 @@ and colon-qualified references use normal workspace resolution. The selected
 workspace profile is applied to each graph node; a node that does not define it
 falls back to its own `default` profile. An explicit profile on an `enable` edge
 must exist on that child manifest or graph resolution fails and reports the
-child and its available profiles. None of these choices changes contract 5's
+child and its available profiles. None of these choices changes the Box's
 fixed outer arguments.
 
 ## Auth Mode Processing
@@ -562,7 +560,7 @@ Podman uses a staging directory under `.ploinky/container-runtime/<container>`:
 
 Podman receives `NODE_OPTIONS=--preserve-symlinks --preserve-symlinks-main`. It also receives extra self-mounts for real symlink targets. Manifest volumes that target `/code/node_modules` are rejected. Writable Podman manifest volumes under `.ploinky/data/` are mounted with `:U` so non-root images can own their private runtime state; arbitrary external manifest volumes keep the normal `:z` suffix unless `volumeOptions.<containerPath>.podmanChown` opts in.
 
-Inside contract 5, managed `default` and `bridge` modes require rootless Podman
+Inside the Box, managed `default` and `bridge` modes require rootless Podman
 5.4 or newer, Netavark, and operational `pasta`. There is no
 `slirp4netns` fallback. Each managed bridge is created with exact schema-2
 ownership labels and `isolate=true`; same-network peers can communicate by
@@ -593,8 +591,8 @@ The sole outer `-p` emission constructs exactly two publications for every box:
 `--publish`, `--expose`, and `--listen-lan` are rejected before engine
 discovery. Workspace, graph, profile, manifest, `openPorts`, readiness,
 environment, labels, and persisted state never participate in outer arguments.
-Contract 4 is rejected and requires explicit destroy/recreate; no publication
-provenance or compatibility reader remains.
+Incompatible managed Box configuration is rejected and requires explicit
+destroy/recreate; no publication provenance or compatibility reader remains.
 
 Profile `openPorts` remains private inner-runtime metadata. A normal bridged
 launch rejects TCP intervals overlapping Router `8080`/`8081` and UDP intervals
@@ -644,7 +642,7 @@ and only exact current-generation consumers can obtain rate-limited short-lived
 credentials and expiry through the private broker.
 
 Every Ploinky-created nested agent, helper, and sidecar container receives the
-exact ownership label `io.assistos.ploinky.managed=1`. On contract-v5 boot, the
+exact ownership label `io.assistos.ploinky.managed=1`. On Box boot, the
 entrypoint enumerates that exact key/value and rejects any retained managed
 record, including old managed agent and gateway records. It never deletes,
 imports, or translates them. Operators remove the managed records in the old
@@ -658,7 +656,7 @@ can make the same hard-cut rejection recur after recreation. Recovery is
 explicit: inspect and back up that named volume, remove managed containers in
 the old box before destroy, or—if recovery is impossible—remove only
 `$INSTANCE-containers` from its owning engine after the box is absent and after
-accepting loss of cached nested images, records, and named volumes. Runtime v5
+accepting loss of cached nested images, records, and named volumes. The current runtime
 does not execute either destructive action.
 
 ## Host Sandbox Runtimes

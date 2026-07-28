@@ -87,7 +87,7 @@ function container({ name, networkMode = 'bridge', pids, managed = true }) {
 
 function fixtureProfile() {
     return compileListenerProfile({
-        schemaVersion: 1,
+        kind: 'ploinky-listener-profile',
         id: 'fixture',
         requireManagedContainers: true,
         rejectAdditionalContainers: true,
@@ -341,7 +341,7 @@ test('validator annotates every accepted listener with effective instance and ra
 
 test('private Router bind set is exactly loopback plus every current managed gateway', () => {
     const profile = compileListenerProfile({
-        schemaVersion: 1,
+        kind: 'ploinky-listener-profile',
         id: 'private-router-bind-fixture',
         requireManagedContainers: true,
         rejectAdditionalContainers: true,

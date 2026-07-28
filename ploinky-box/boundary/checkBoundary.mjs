@@ -27,8 +27,8 @@ function readManifest(manifestPath) {
             cause: error,
         });
     }
-    if (manifest?.schema !== 1) {
-        fail('Baseline manifest schema must be exactly 1');
+    if (manifest?.kind !== 'ploinky-box-boundary-baseline') {
+        fail('Baseline manifest kind is invalid');
     }
     if (!Array.isArray(manifest.allowlist) || !Array.isArray(manifest.dirtyFiles)) {
         fail('Baseline manifest is missing its allowlist or dirty-file inventory');

@@ -53,7 +53,6 @@ test('same-host proven-dead locks recover but foreign-host locks do not', async 
     const lockRoot = path.join(root, '.ploinky-box', 'locks', `${identity.instance}.lock`);
     fs.mkdirSync(lockRoot, { recursive: true, mode: 0o700 });
     fs.writeFileSync(path.join(lockRoot, 'owner.json'), `${JSON.stringify({
-        schema: 1,
         hostname: 'local-test',
         pid: 999999,
         instance: identity.instance,
@@ -71,7 +70,6 @@ test('same-host proven-dead locks recover but foreign-host locks do not', async 
 
     fs.mkdirSync(lockRoot, { mode: 0o700 });
     fs.writeFileSync(path.join(lockRoot, 'owner.json'), `${JSON.stringify({
-        schema: 1,
         hostname: 'another-host',
         pid: 123,
         instance: identity.instance,

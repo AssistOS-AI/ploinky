@@ -35,7 +35,7 @@ protected route aliases, manifest-specific route handling, and HTTP-service
 auth branches. The router now evaluates one policy decision and enforces it
 through one executor before proxying.
 
-Runtime contract v5 compiles that decision together with its route target into
+The managed runtime compiles that decision together with its route target into
 one immutable, exact-byte route-and-policy generation. Raw routing, manifest,
 or policy candidate edits have no live authorization effect. A coordinated
 apply first inactivates the affected selectors and installs a fully validated
@@ -620,7 +620,7 @@ A started workspace on port 8080 should satisfy the following probes:
 
 ## Deployment Limits
 
-Runtime contract v5 supports an explicitly configured Cloudflare edge while
+The managed runtime supports an explicitly configured Cloudflare edge while
 remaining an operator-controlled workspace runtime rather than a hostile
 multi-tenant platform. Local-only mode has no connector and no public HTTP
 hostname. Complete Cloudflare mode requires an existing tunnel connector token

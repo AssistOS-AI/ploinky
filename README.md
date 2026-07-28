@@ -61,23 +61,25 @@ dependency volume. Ordinary agent containers run one level inside this runtime.
 | `ploinky cli` | Reconcile/start outer runtime; open `/bin/bash` as `podman` in `/workspace` |
 | `ploinky cli <agent>` | Reconcile/start outer runtime; attach to that agent's manifest CLI |
 | `ploinky start ...` | Reconcile/start outer runtime; start the graph behind the fixed boundary |
-| `ploinky status` | Inspect outer contract/publishes/health and running core status without mutation |
+| `ploinky status` | Inspect outer configuration/publishes/health and running core status without mutation |
 | `ploinky stop` | Stop core services, then stop outer runtime; keep volumes |
 | `ploinky destroy` | Confirm and directly remove the outer container; retain its three named volumes |
 | REPL `status`/`stop`/`destroy` | Core workspace/router/agent scope; outer runtime remains |
 
 The required outer image is the mutable
-`docker.io/assistos/ploinky-box:runtime` reference with the exact label
-`io.assistos.ploinky.runtime-contract=6`. Ploinky pulls that reference only when
+`docker.io/assistos/ploinky-box:runtime` reference. Its image labels must be
+empty, its `/etc/ploinky-box` marker must contain exactly
+`assistos/ploinky-box`, and its complete image configuration and capabilities
+must match the source-owned allowlist. Ploinky pulls that reference only when
 creating a missing box, validates the complete image metadata, and starts the
 captured image ID rather than racing the mutable tag. Compatible reuse,
-stopped-box start, status, stop, and destroy do not pull. Every non-contract-6
-box, including contracts 4 and 5, is rejected before pulling, volume creation,
-restart, upgrade, or replacement. Ploinky does not read, migrate, clean, relabel, adopt,
-or replace it: run `ploinky destroy` explicitly, then recreate contract 6.
-Destroy retains the three named volumes.
+stopped-box start, status, stop, and destroy do not pull. Incompatible images or
+owned resources are rejected before pulling, volume creation, restart, upgrade,
+or replacement. Ploinky does not migrate, clean, relabel, adopt, or replace
+them: run `ploinky destroy` explicitly, then recreate the Box. Destroy retains
+the three named volumes.
 
-A contract-6 box is reused or started only when its creation configuration is
+A compatible box is reused or started only when its creation configuration is
 an exact normalized match. Any port, image, mount, device, security, or other
 creation drift fails before registry traffic or container mutation and requires
 an explicit `ploinky destroy` followed by recreation; there is no transactional
@@ -111,7 +113,7 @@ connector origin is always in-box `http://127.0.0.1:8080`.
 
 Ordinary agent images intentionally contain neither Podman nor Docker. Every
 Ploinky-managed agent and helper container runs through nested Podman inside the
-managed outer runtime. Core contract-v5 managed networking requires rootless Podman
+managed outer runtime. Managed networking requires rootless Podman
 5.4 or newer with Netavark and an operational `pasta`; there is no
 `slirp4netns` fallback. Managed `default` and `bridge` agents receive only the
 exact `host.containers.internal:host-gateway` mapping, private Router locator,
@@ -124,7 +126,7 @@ configuration generation, and a monotonic readiness/publication generation.
 The authenticated browser projection returns only one active `no-store` locator
 plus configuration/publication ids, never the authorization id or inventory.
 
-Before updating a direct/core installation to the contract-5 release, run the
+Before updating a legacy direct/core installation, run the
 old checkout's core entry directly:
 
 ```sh
@@ -139,8 +141,8 @@ still references them, one-time cleanup may remove the exact stale
 `.ploinky/run/router.sock` and `.ploinky/run/managed-hosts` paths and the now
 unreferenced cached image
 `docker.io/assistos/ploinky-network-gateway:1@sha256:68c47ce93d16ea1a2d03944f7b50ce82e6f2f9a26b183d2c9c7fbabcc828fb7e`.
-Before v5 activation, revoke the retired publication connector/API tokens and
-delete its plaintext retained state; contract 5 contains no migration or cleanup
+Before activation, revoke the retired publication connector/API tokens and
+delete its plaintext retained state; the current runtime contains no migration or cleanup
 reader. Do not use a broad container, image, volume, or network prune for this
 cutover.
 

@@ -1,6 +1,6 @@
 {
-  "schemaVersion": 1,
-  "id": "routing-graph-v5",
+  "kind": "ploinky-listener-profile",
+  "id": "routing-graph",
   "description": "Expected outer-namespace Router listeners after the isolated routing probe starts.",
   "requireManagedContainers": true,
   "rejectAdditionalContainers": true,

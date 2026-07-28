@@ -146,7 +146,7 @@ test('pinned seven-repository graph starts through one immutable Box candidate',
     execInBox(harness.runner, started.containerId, [
         '/usr/local/bin/node', '-e', [
             "const f=require('node:fs');",
-            "f.unlinkSync('/opt/ploinky/node_modules/.ploinky-box-dependencies-v6.json');",
+            "f.unlinkSync('/opt/ploinky/node_modules/.ploinky-box-dependencies.json');",
             "f.chmodSync('/opt/ploinky/node_modules/achillesAgentLib',0o500);",
         ].join(''),
     ]);

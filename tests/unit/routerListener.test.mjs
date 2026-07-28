@@ -58,6 +58,6 @@ test('RoutingServer fixes public 8080 and delegates private 8081 to exact interf
             timeout: 5000,
         });
         assert.notEqual(result.status, 0, `PORT=${JSON.stringify(port)} unexpectedly started`);
-        assert.match(`${result.stderr}\n${result.stdout}`, /runtime contract v5 requires PORT to be exactly 8080/);
+        assert.match(`${result.stderr}\n${result.stdout}`, /managed Router requires PORT to be exactly 8080/);
     }
 });

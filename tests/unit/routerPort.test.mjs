@@ -67,7 +67,7 @@ test('only initial resolution may choose 8080 when no port has been persisted', 
     }
 });
 
-test('persisted resolution rejects every pre-v5 non-fixed inner port', () => {
+test('persisted resolution rejects every non-fixed inner port', () => {
     const { root, routingFile } = tempRouting(JSON.stringify({ port: '8080', routes: {} }));
     try {
         assert.equal(resolvePersistedRouterPort({ routingFile }), 8080);

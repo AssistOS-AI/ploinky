@@ -249,7 +249,7 @@ start AchillesIDE/explorer 8080 --branch feature-branch --repo-branch proxies=ma
 # Strict CI/deploy mode through the public wrapper; host loopback 8097, inner 8080
 ploinky --port 8097 start AchillesIDE/explorer --branch feature-branch --branch-fallback fail --reset-repos</code></pre>
                         <div class="alert alert-warning">
-                            Contract v5 always creates exactly <code>127.0.0.1:&lt;hostPort&gt;:8080/tcp</code> and <code>0.0.0.0:7882:7882/udp</code>. Outer <code>--publish</code>, <code>--expose</code>, and <code>--listen-lan</code> are rejected; no manifest, graph, profile, readiness result, environment value, label, or saved state can add a third physical-host mapping.
+                            The managed Box always creates exactly <code>127.0.0.1:&lt;hostPort&gt;:8080/tcp</code> and <code>0.0.0.0:7882:7882/udp</code>. Outer <code>--publish</code>, <code>--expose</code>, and <code>--listen-lan</code> are rejected; no manifest, graph, profile, readiness result, environment value, label, or saved state can add a third physical-host mapping.
                         </div>
 
                         <h3>shell</h3>

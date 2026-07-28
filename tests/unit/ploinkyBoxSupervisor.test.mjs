@@ -204,7 +204,7 @@ test('status reports an older owned image as incompatible while destroy remains 
         lockManager,
         discover: () => ownership,
         validateExistingImage() {
-            const error = new Error('contract 5; destroy and recreate the Box');
+            const error = new Error('image configuration is incompatible; destroy and recreate the Box');
             error.code = 'PLOINKY_BOX_IMAGE_CONTRACT_HARD_CUT';
             throw error;
         },

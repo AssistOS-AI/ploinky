@@ -64,7 +64,7 @@ class Response extends Writable {
     }
 }
 
-function routePlan() {
+function routePlan({ allowRequestStreaming = false } = {}) {
     return createRoutePlan({
         matched: true,
         ok: true,
@@ -99,7 +99,7 @@ function routePlan() {
         auditId: 'audit-http',
         method: 'POST',
         transport: 'http',
-        allowRequestStreaming: false,
+        allowRequestStreaming,
         credentialPolicy: {
             allowApplicationAuthorization: true,
             allowApplicationCookies: true,
@@ -156,4 +156,47 @@ test('HTTP relay uses the admitted convention suffix, port, query, and exact bod
     assert.equal(opened.headers.host, '127.0.0.1:7001');
     assert.equal(opened.headers['x-forwarded-prefix'], '/base-agent-additional-server/alpha/7001');
     assert.equal(released, true);
+});
+
+test('prebuffered private request bodies take precedence over route streaming', async () => {
+    const body = Buffer.from('{"room":"diagnostic-room"}');
+    const request = Readable.from([]);
+    request.method = 'POST';
+    request.headers = {
+        host: 'host.containers.internal:8081',
+        'content-type': 'application/json',
+        'content-length': String(body.length),
+    };
+    const response = new Response();
+    let opened;
+    let relayStream;
+    const relayManager = {
+        checkout: async () => ({
+            openRequest: async options => {
+                opened = options;
+                relayStream = new ApplicationRelayStream();
+                return relayStream;
+            },
+            close() {},
+        }),
+    };
+
+    const handled = await executeHttpPlan({
+        req: request,
+        res: response,
+        plan: routePlan({ allowRequestStreaming: true }),
+        lease: { release() {} },
+        relayManager,
+        authorized: true,
+        prebufferedBody: body,
+    });
+
+    assert.equal(handled, true);
+    assert.equal(response.statusCode, 200);
+    assert.equal(opened.bodyMode, 'buffered');
+    assert.equal(opened.headers['content-length'], String(body.length));
+    assert.equal(
+        relayStream.request.subarray(relayStream.request.indexOf(Buffer.from('\r\n\r\n')) + 4).toString('utf8'),
+        body.toString('utf8'),
+    );
 });

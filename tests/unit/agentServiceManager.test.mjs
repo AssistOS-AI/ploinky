@@ -14,8 +14,9 @@ import {
     stripReservedAndRestoreRuntimeRouterEnvFlags,
 } from '../../cli/sandbox/docker/agentServiceManager.js';
 import { buildRouterEndpoint } from '../../cli/sandbox/routerPort.js';
+import { BOX_MARKER_CONTENT } from '../../ploinky-box/constants.mjs';
 
-function boxMarkerFs(contents = '6\n') {
+function boxMarkerFs(contents = BOX_MARKER_CONTENT) {
     return {
         lstatSync() {
             return {
@@ -53,10 +54,10 @@ test('Box host-gateway compatibility does not duplicate the managed network mapp
     }), ['--add-host', 'host.containers.internal:host-gateway']);
 
     assert.throws(() => buildBoxPodmanHostArgs({
-        fsApi: boxMarkerFs('5\n'),
+        fsApi: boxMarkerFs('wrong\n'),
         markerPath: '/probe/ploinky-box',
         managedNetwork: true,
-    }), /marker must contain exactly contract 6/);
+    }), /marker has invalid content/i);
 });
 
 test('prepared graph launches suppress intermediate registry persistence only for the exact staged identity', () => {

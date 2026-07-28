@@ -185,7 +185,7 @@
 }</code></pre>
 
                         <div class="alert alert-warning">
-                            <strong>Slim edge boundary:</strong> A manifest may retain ordinary <code>httpServices</code> semantics and add only optional <code>httpServices[].port</code> for an explicit private TCP target. <code>additionalServerPort</code> is removed. Do not add <code>edgePorts</code>, outer/physical publication, UDP, Cloudflare, tunnel, DNS, topology, consumer-binding, or generic server-inventory fields. <code>openPorts</code> is inner-runtime metadata only. No manifest field can change contract v5's two fixed outer mappings or publish private Router <code>8081</code>.
+                            <strong>Slim edge boundary:</strong> Active manifests must not use <code>httpServices</code>; routed additional servers follow <code>/base-agent-additional-server/&lt;agent&gt;/&lt;port&gt;/&lt;suffix&gt;</code> and <code>HttpRouteAccessPolicy</code>. Do not add <code>edgePorts</code>, outer/physical publication, UDP, Cloudflare, tunnel, DNS, topology, consumer-binding, or generic server-inventory fields. <code>openPorts</code> is inner-runtime metadata only. No manifest field can change the Box's two fixed outer mappings or publish private Router <code>8081</code>.
                         </div>
 
                         <h3>Field Descriptions</h3>
@@ -283,7 +283,7 @@
                             <tr>
                                 <td><code>lite-sandbox</code></td>
                                 <td>No</td>
-                                <td>Boolean. Outside a marked box, enables host sandbox runtime auto-detection for the whole agent process (selects <code>bwrap</code> on Linux or <code>seatbelt</code> on macOS). Inside a contract-v5 marked box the box marker wins: every Ploinky-managed agent, helper, sidecar, probe, and install-container path uses nested Podman, with no Docker, bwrap, or Seatbelt fallback. For one-off sandboxed jobs from inside a container, use the Basic catalog <code>bwrap-runner</code> agent's <code>sandbox_exec</code> tool instead; it does not change <code>lite-sandbox</code> dispatch.</td>
+                                <td>Boolean. Outside a marked box, enables host sandbox runtime auto-detection for the whole agent process (selects <code>bwrap</code> on Linux or <code>seatbelt</code> on macOS). Inside a marked box the box marker wins: every Ploinky-managed agent, helper, sidecar, probe, and install-container path uses nested Podman, with no Docker, bwrap, or Seatbelt fallback. For one-off sandboxed jobs from inside a container, use the Basic catalog <code>bwrap-runner</code> agent's <code>sandbox_exec</code> tool instead; it does not change <code>lite-sandbox</code> dispatch.</td>
                             </tr>
                             <tr>
                                 <td><code>runtime</code></td>

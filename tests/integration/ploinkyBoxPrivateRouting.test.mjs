@@ -81,7 +81,7 @@ test('one nested rootless-Podman container reaches the unpublished private liste
     let nestedContainerId = '';
     let nestedContainerName = '';
     const evidence = {
-        schema: 1,
+        kind: 'ploinky-box-private-routing',
         candidateReference,
         physicalPodman: {},
         outerBox: {},
@@ -106,7 +106,7 @@ test('one nested rootless-Podman container reaches the unpublished private liste
         ));
         evidence.outerBox = {
             id: prepared.containerId,
-            contract: outerInspection?.Config?.Labels?.['io.assistos.ploinky.runtime-contract'] || '',
+            role: outerInspection?.Config?.Labels?.['io.assistos.ploinky-box.role'] || '',
             exposedPorts: outerInspection?.Config?.ExposedPorts || null,
             rawPortBindings: outerInspection?.HostConfig?.PortBindings || {},
             portBindings: normalizePortBindings(outerInspection?.HostConfig?.PortBindings),
@@ -117,7 +117,18 @@ test('one nested rootless-Podman container reaches the unpublished private liste
             } : null,
         };
 
-        assert.equal(evidence.outerBox.contract, '6');
+        assert.equal(evidence.outerBox.role, 'box');
+        assert.deepEqual(
+            Object.keys(outerInspection?.Config?.Labels || {})
+                .filter((key) => key.startsWith('io.assistos.ploinky-box.'))
+                .sort(),
+            [
+                'io.assistos.ploinky-box.image-ref',
+                'io.assistos.ploinky-box.path-hash',
+                'io.assistos.ploinky-box.role',
+                'io.assistos.ploinky-box.router-host-port',
+            ],
+        );
         assert.equal(evidence.outerBox.exposedPorts, null);
         assert.deepEqual(evidence.outerBox.portBindings, {
             '7882/udp': [{ HostIp: '0.0.0.0', HostPort: '7882' }],

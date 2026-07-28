@@ -7,7 +7,7 @@ EXPECTED_MAPPED_IDS=65535
 MINIMUM_PODMAN_VERSION=5.4
 EXPECTED_CLOUDFLARED_VERSION=2026.7.1
 PREPARE_HELPER='/opt/ploinky/ploinky-box/entrypoint/entrypoint.mjs'
-READY_LINE='PLOINKY_BOX_READY contract=6'
+READY_LINE='PLOINKY_BOX_READY'
 
 fail() {
     echo "[ploinky-box] SELF-CHECK FAILED: $1" >&2
@@ -76,7 +76,7 @@ reject_retained_managed_containers() {
         fail "cannot enumerate Ploinky-managed nested containers: ${managed_ids:-no diagnostic}"
     fi
     test -z "$managed_ids" || fail \
-        "retained Ploinky-managed nested containers were found; stop/remove them explicitly in the old box, destroy it, and recreate with runtime contract 6"
+        "retained Ploinky-managed nested containers were found; stop/remove them explicitly in the old box, destroy it, and recreate it"
 }
 
 require_managed_network_stack() {
@@ -122,9 +122,9 @@ require_cloudflared_contract() {
         || fail "cloudflared $EXPECTED_CLOUDFLARED_VERSION lacks required --token-file support"
 }
 
-test -x "$PREPARE_HELPER" || fail "contract-6 preparation helper missing"
+test -x "$PREPARE_HELPER" || fail "Box preparation helper missing"
 node "$PREPARE_HELPER" --prepare-only \
-    || fail "contract-6 preparation failed"
+    || fail "Box preparation failed"
 
 command -v bash >/dev/null 2>&1 || fail "bash not on PATH"
 command -v node >/dev/null 2>&1 || fail "node not on PATH"

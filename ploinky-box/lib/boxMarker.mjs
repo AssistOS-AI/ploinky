@@ -1,6 +1,9 @@
 import fs from 'node:fs';
 
-import { BOX_MARKER_PATH, BOX_RUNTIME_CONTRACT } from '../constants.mjs';
+import {
+    BOX_MARKER_CONTENT,
+    BOX_MARKER_PATH,
+} from '../constants.mjs';
 import { PloinkyBoxError } from '../errors.mjs';
 
 function markerError(message, cause) {
@@ -30,9 +33,9 @@ export function isInsideBox({
     } catch (error) {
         throw markerError(`Unable to read the Ploinky Box marker ${markerPath}`, error);
     }
-    if (!bytes.equals(Buffer.from(`${BOX_RUNTIME_CONTRACT}\n`))) {
+    if (!bytes.equals(Buffer.from(BOX_MARKER_CONTENT))) {
         throw markerError(
-            `Ploinky Box marker must contain exactly contract ${BOX_RUNTIME_CONTRACT}; destroy and recreate the Box`,
+            'Ploinky Box marker has invalid content; destroy and recreate the Box',
         );
     }
     return true;

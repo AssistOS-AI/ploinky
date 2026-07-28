@@ -7,7 +7,6 @@ import test from 'node:test';
 import {
     BOX_LABELS,
     BOX_READY_LINE,
-    BOX_RUNTIME_CONTRACT_LABEL,
 } from '../../ploinky-box/constants.mjs';
 import { validateContainerConfiguration } from '../../ploinky-box/contract/container.mjs';
 import { IMAGE_CONTRACT } from '../../ploinky-box/contract/image.mjs';
@@ -42,9 +41,7 @@ function containerHandle({ identity, repositoryRoot, imageId, imageRef, hostPort
     return {
         id,
         labels: {
-            [BOX_RUNTIME_CONTRACT_LABEL]: '6',
             'io.buildah.version': '1.43.1',
-            [BOX_LABELS.schema]: '1',
             [BOX_LABELS.pathHash]: identity.pathHash,
             [BOX_LABELS.role]: 'box',
             [BOX_LABELS.imageRef]: imageRef,
@@ -410,7 +407,7 @@ test('validated reuse rechecks pre-existing volume handles without registry or v
     assert.equal(h.calls.some((call) => call.join(' ').includes('volume rm')), false);
 });
 
-test('an older owned image contract hard-cuts before any engine mutation', async (t) => {
+test('an incompatible owned image hard-cuts before any engine mutation', async (t) => {
     const state = fixture(t);
     const current = containerHandle({
         identity: state.identity,
@@ -423,7 +420,7 @@ test('an older owned image contract hard-cuts before any engine mutation', async
     });
     const h = harness(state, { initial: current });
     h.seams.validateExistingImage = () => {
-        const error = new Error('contract 5; destroy and recreate the Box');
+        const error = new Error('image configuration is incompatible; destroy and recreate the Box');
         error.code = 'PLOINKY_BOX_IMAGE_CONTRACT_HARD_CUT';
         throw error;
     };

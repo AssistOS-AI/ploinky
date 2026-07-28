@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 
-import { BOX_LABELS, BOX_ROLES, BOX_SCHEMA_VERSION } from '../../ploinky-box/constants.mjs';
+import { BOX_LABELS, BOX_ROLES } from '../../ploinky-box/constants.mjs';
 import { buildWorkspaceIdentity } from '../../ploinky-box/identity.mjs';
 import {
     ensureNamedVolumes,
@@ -48,7 +48,6 @@ function setup(t) {
                     CreatedAt: `2026-07-21T00:00:0${counter}Z`,
                     Mountpoint: `/private/${counter}`,
                     Labels: {
-                        [BOX_LABELS.schema]: BOX_SCHEMA_VERSION,
                         [BOX_LABELS.pathHash]: identity.pathHash,
                         [BOX_LABELS.role]: roles[key],
                     },
@@ -67,7 +66,6 @@ test('volume create and mount arguments contain immutable labels and :U only', (
     const args = volumeCreateArgs(identity, 'workspace');
     assert.deepEqual(args, [
         'volume', 'create',
-        '--label', `${BOX_LABELS.schema}=1`,
         '--label', `${BOX_LABELS.pathHash}=${identity.pathHash}`,
         '--label', `${BOX_LABELS.role}=workspace`,
         identity.volumes.workspace,
