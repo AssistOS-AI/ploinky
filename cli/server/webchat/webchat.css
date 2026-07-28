@@ -765,8 +765,8 @@ body {
 .wa-chat-container.side-panel-open .wa-side-panel {
     display: flex; /* Shown when class is applied */
     align-self: flex-start;
-    height: calc(100% - var(--wa-floating-composer-space));
-    max-height: calc(100% - var(--wa-floating-composer-space));
+    height: calc(100% - var(--wa-floating-composer-space) + 18px);
+    max-height: calc(100% - var(--wa-floating-composer-space) + 18px);
 }
 
 .wa-side-panel-header {
@@ -774,7 +774,6 @@ body {
     align-items: center;
     justify-content: space-between;
     padding: 16px;
-    border-bottom: 1px solid var(--wa-border);
     flex-shrink: 0;
 }
 
@@ -868,7 +867,7 @@ body {
     min-height: 0;
     overflow: auto;
     overscroll-behavior: contain;
-    padding: 16px;
+    padding: 0 16px 16px 16px;
 }
 
 .wa-side-panel-body {
