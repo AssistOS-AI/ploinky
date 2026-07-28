@@ -22,7 +22,7 @@ Ploinky is a workspace-local runtime for repository-backed agents.
 - `ploinky update repo <name>`: update one repository under `.ploinky/repos/` and refresh `AchillesCopilotBasicSkills` in that repo when it is eligible.
 - `ploinky enable agent <name|repo/name> [global|devel [repo]] [--auth none|pwd|sso] [as <alias>]`: register an agent in `.ploinky/agents.json`. Isolated agents use `.data/<agent-or-alias>/` as their host-side home and work directory.
 - `ploinky start [staticAgent] [hostPort] [--branch <branch>] [--repo-branch <repo=branch>]... [--branch-fallback default|fail] [--reset-repos]`: resolve dependency waves, start automatic enabled agents, retain already running manual agents, write `routing.json`, and launch the fixed inner Router on `8080` under the watchdog. A manifest may declare `startup: "manual"` to stay dormant when it is outside the static dependency graph; absent means automatic, while static/dependency membership always wins. At the public wrapper, the optional positional port selects only the loopback physical-host side of the fixed mapping; direct/core start accepts only `8080`. `--branch` sets a candidate branch for all repos involved in this start; `--repo-branch` overrides it per repo. `--branch-fallback default` (the default) keeps repos on their configured branch when the candidate is missing; `fail` aborts. `--reset-repos` permits hard reset of dirty managed repos.
-- `ploinky status`: show SSO state, router listening state, installed and remembered repositories, and running agent containers.
+- `ploinky status`: show SSO state, router listening state, installed and remembered repositories, and backend-aware state for enabled or running agent runtimes.
 - `ploinky list routes`: inspect the current `.ploinky/routing.json` route table.
 - `ploinky restart`: restart enabled agents and the router.
 - `ploinky shell <agent>`: open `/bin/sh` inside the running agent backend.
@@ -37,20 +37,19 @@ Ploinky is a workspace-local runtime for repository-backed agents.
 
 ## Web surfaces
 
-- `/webchat`: chat surface over a folder-scoped TTY runtime. It keeps selectable
-  continuation JSON under `<cwd>/.copilot_history/`; each submitted turn stores
-  an assistant placeholder whose optional `progress` field is an ordered string
-  array updated from agent progress reasons before final text arrives. Persisted
-  progress remains UI-only and existing messages render only through
-  `Click to load session history`. A newly started agent receives only
-  `PLOINKY_WEBCHAT_HAS_HISTORY=1` or `0` as conversation-start metadata, while
-  the folder session id remains router-owned. When opened as
+- `/webchat`: chat surface over a workspace-scoped TTY runtime. Conversation
+  sessions are owned by the selected CLI, which can publish `current`, `list`,
+  and `selected` snapshots through the generic `__webchatSession` protocol.
+  WebChat validates and retains the latest snapshot only in memory, renders
+  existing messages through `Click to load session history`, and sends
+  `/session`, `/session new`, or `/session resume <id>` for session controls.
+  Ploinky does not persist conversation files or hydrate the CLI's agent. When opened as
   `/webchat?agent=<name>&...`, the router forwards additional query parameters
-  except router-owned `tabId` and `sessionId` to `ploinky cli <name>` as
+  except router-owned `tabId` to `ploinky cli <name>` as
   long-form CLI flags encoded as `--key=value`.
 - `/dashboard`: operational management surface for status, logs, agents, and runtime control.
 - `/status`: read-only browser view that shells out to `ploinky status` and adds router-side server and agent summaries.
-- `/api/marketplace`: JSON endpoint for the first-party agent marketplace. Authenticated local or SSO users may read repository, agent, enabled-record, and runtime state; local admins may perform the complete `install_repo`, `uninstall_repo`, `enable_agent`, and `disable_agent` action set. A running agent may use a request-bound Agent Assertion to read state and submit only `enable_agent`, which supports on-demand dependency startup without granting repository or disable operations. Client helpers check status first and forward `mode` only when the caller supplies it; an omitted mode retains Marketplace's isolated default. Repository uninstall disables agents from that repository and removes the checkout while preserving source metadata for reinstall. Marketplace agent disablement removes the enabled-agent registry record before removing the runtime container so the watchdog does not restart it during the operation.
+- `/api/marketplace`: JSON endpoint for the first-party agent marketplace. Authenticated local or SSO users may read repository, agent, enabled-record, recorded backend, and runtime state; Bubblewrap and Seatbelt liveness comes from tracked PIDs, while Docker and Podman use OCI state. Local admins may perform the complete `install_repo`, `uninstall_repo`, `enable_agent`, and `disable_agent` action set. A running agent may use a request-bound Agent Assertion to read state and submit only `enable_agent`, which supports on-demand dependency startup without granting repository or disable operations. Client helpers check status first and forward `mode` only when the caller supplies it; an omitted mode retains Marketplace's isolated default. Repository uninstall disables agents from that repository and removes the checkout while preserving source metadata for reinstall. Marketplace agent disablement removes the enabled-agent registry record before removing the runtime so the watchdog does not restart it during the operation.
 
 `/webchat` uses the normal router login flow. `/dashboard` and `/status` are
 local-control surfaces that require a real router-authenticated local-admin

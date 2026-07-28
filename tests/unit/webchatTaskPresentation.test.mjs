@@ -5,9 +5,11 @@ import {
     attachTaskSummary,
     mergeTaskLogUpdate,
     parseTaskLog,
+    parseTaskLogPresentation,
     taskDurationSeconds,
     taskStatusPresentation,
 } from '../../cli/server/webchat/taskPresentation.js';
+import { createTaskController } from '../../cli/server/webchat/tasks.js';
 
 test('task log updates append in order, ignore duplicates, and request gap recovery', () => {
     const current = { text: 'one', offset: 3 };
@@ -29,6 +31,7 @@ test('task log updates append in order, ignore duplicates, and request gap recov
 test('task status presentation preserves queued work and maps lifecycle labels', () => {
     assert.equal(taskStatusPresentation({ status: 'ongoing', remoteStatus: 'pending' }).label, 'QUEUED');
     assert.equal(taskStatusPresentation({ status: 'ongoing', remoteStatus: 'running' }).label, 'RUNNING');
+    assert.equal(taskStatusPresentation({ status: 'ongoing', remoteStatus: 'cancelling' }).label, 'STOPPING');
     assert.equal(taskStatusPresentation({ status: 'finished' }).label, 'COMPLETED');
     assert.equal(taskStatusPresentation({ status: 'error' }).label, 'FAILED');
     assert.equal(taskStatusPresentation(null).label, 'UNAVAILABLE');
@@ -55,6 +58,84 @@ test('task log parsing strips runner prefixes and keeps stderr visually distinct
         { text: 'secondary output', stream: 'stderr' },
         { text: 'timeout after 300s; sending SIGTERM', stream: 'stderr' },
     ]);
+});
+
+test('task log presentation keeps continuation prompts visible before provider output', () => {
+    const parsed = parseTaskLog([
+        '[Continuation 2]',
+        'User: finish the tests',
+        '',
+        '[worker stdout] Provider output',
+    ].join('\n'));
+    assert.deepEqual(parsed, [
+        { text: '[Continuation 2]', stream: 'stdout' },
+        { text: 'you> finish the tests', stream: 'stdout' },
+        { text: '', stream: 'stdout' },
+        { text: 'Provider output', stream: 'stdout' },
+    ]);
+    assert.equal(
+        parseTaskLogPresentation('you> run the focused tests')[0].kind,
+        'user-prompt',
+    );
+});
+
+test('terminal task toast can be dismissed immediately', (t) => {
+    const originalDocument = globalThis.document;
+    const originalSetInterval = globalThis.setInterval;
+    const closeListeners = new Map();
+    const taskToast = { hidden: true, textContent: '' };
+    const taskToastText = { textContent: '' };
+    const taskToastClose = {
+        addEventListener(type, listener) {
+            closeListeners.set(type, listener);
+        },
+    };
+    globalThis.document = { addEventListener() {} };
+    globalThis.setInterval = () => 0;
+    t.after(() => {
+        globalThis.document = originalDocument;
+        globalThis.setInterval = originalSetInterval;
+    });
+
+    const controller = createTaskController({
+        toEndpoint: (value) => value,
+        sendQuickCommand: () => true,
+        showBanner() {},
+        elements: { taskToast, taskToastText, taskToastClose },
+    });
+    const task = {
+        id: 'task_1234567890abcdef12345678',
+        description: 'Run tests',
+        status: 'ongoing',
+        updatedAt: '2026-07-27T10:00:00.000Z',
+    };
+    controller.handleUpdate({ event: 'started', task });
+    controller.handleUpdate({
+        event: 'update',
+        task: { ...task, status: 'finished', updatedAt: '2026-07-27T10:00:01.000Z' },
+    });
+
+    assert.equal(taskToast.hidden, false);
+    assert.equal(taskToastText.textContent, 'Run tests: COMPLETED');
+    closeListeners.get('click')();
+    assert.equal(taskToast.hidden, true);
+});
+
+test('task log presentation marks only the terminal result lines as final', () => {
+    const text = 'Read package.json\nRan tests\nFinal answer\n';
+    const finalOutputOffset = text.indexOf('Final answer');
+    assert.deepEqual(
+        parseTaskLogPresentation(text, {
+            finalOutputOffset,
+            finalOutputLength: 'Final answer\n'.length,
+        }).map(({ text: line, tone }) => ({ text: line, tone })),
+        [
+            { text: 'Read package.json', tone: 'intermediate' },
+            { text: 'Ran tests', tone: 'intermediate' },
+            { text: 'Final answer', tone: 'final' },
+            { text: '', tone: 'intermediate' },
+        ],
+    );
 });
 
 test('chat task summary shows metadata and a delegated live-log link without inline expansion', (t) => {
@@ -107,7 +188,7 @@ test('chat task summary shows metadata and a delegated live-log link without inl
         'Build project',
         'RUNNING',
     ]);
-    assert.equal(link.textContent, 'View live logs');
+    assert.equal(link.textContent, 'View task details');
     assert.equal(link.dataset.wcLink, 'true');
     assert.equal(link.dataset.wcTaskId, task.id);
     assert.equal(link.href, `/webchat/tasks/${task.id}/view`);

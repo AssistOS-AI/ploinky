@@ -5,6 +5,19 @@ const ENVELOPE_VERSION = 1;
 
 export const __testables = {};
 
+export function buildAttachmentUploadHeaders({ file, relativePath, destinationPath, overwrite } = {}) {
+    const mime = file?.type || 'application/octet-stream';
+    const headers = {
+        'Content-Type': mime,
+        'X-Mime-Type': mime,
+        'X-File-Name': encodeURIComponent(file?.name || ''),
+        'X-Destination-Path': encodeURIComponent(String(destinationPath || '').replace(/^\/+|\/+$/g, '')),
+    };
+    if (relativePath) headers['X-Relative-Path'] = encodeURIComponent(relativePath);
+    if (overwrite === true) headers['X-Overwrite'] = '1';
+    return headers;
+}
+
 function stripCtrlAndAnsi(input) {
     try {
         let out = input || '';
@@ -57,7 +70,7 @@ function normalizeClientReference(raw) {
     };
 }
 
-function serializeEnvelope({ text = '', attachments = [], references = [] } = {}) {
+function serializeEnvelope({ text = '', attachments = [], references = [], visible = true } = {}) {
     const normalizedAttachments = Array.isArray(attachments)
         ? attachments.map((raw) => {
             if (!raw || typeof raw !== 'object') {
@@ -84,7 +97,8 @@ function serializeEnvelope({ text = '', attachments = [], references = [] } = {}
         [ENVELOPE_FLAG]: ENVELOPE_VERSION,
         version: ENVELOPE_VERSION,
         text: typeof text === 'string' ? text : '',
-        attachments: normalizedAttachments
+        attachments: normalizedAttachments,
+        presentation: { visible: visible !== false },
     };
     if (normalizedReferences.length) {
         payload.references = normalizedReferences;
@@ -128,11 +142,74 @@ function parseRuntimeStatePayload(text) {
     }
 }
 
+export function parseWorkspaceFilesPayload(text) {
+    try {
+        const payload = typeof text === 'string' ? JSON.parse(text) : text;
+        const indexVersion = Number(payload?.indexVersion);
+        if (!Number.isSafeInteger(indexVersion) || indexVersion < 1) return null;
+        if (payload.reset === true && Array.isArray(payload.files)) {
+            return { indexVersion, reset: true, files: payload.files };
+        }
+        if (payload.reset === false && Array.isArray(payload.added) && Array.isArray(payload.removed)) {
+            return {
+                indexVersion,
+                reset: false,
+                added: payload.added,
+                removed: payload.removed,
+            };
+        }
+        return null;
+    } catch (_) {
+        return null;
+    }
+}
+
+function parseInteractionPayload(text) {
+    try {
+        const payload = typeof text === 'string' ? JSON.parse(text) : text;
+        if (!payload || typeof payload !== 'object') return null;
+        const id = typeof payload.id === 'string' ? payload.id.trim() : '';
+        const kind = typeof payload.kind === 'string' ? payload.kind.trim() : '';
+        const title = typeof payload.title === 'string' ? payload.title.trim() : '';
+        const options = Array.isArray(payload.options)
+            ? payload.options.filter((option) => option && typeof option.id === 'string' && typeof option.label === 'string')
+            : [];
+        if (!id || !kind || !title || options.length === 0) return null;
+        return { ...payload, id, kind, title, options };
+    } catch (_) {
+        return null;
+    }
+}
+
+function parseInteractionResolutionPayload(text) {
+    try {
+        const payload = typeof text === 'string' ? JSON.parse(text) : text;
+        const id = typeof payload?.id === 'string' ? payload.id.trim() : '';
+        return id ? { ...payload, id } : null;
+    } catch (_) {
+        return null;
+    }
+}
+
+function resolvesVisibleTaskCommand(payload, command) {
+    const normalizedCommand = typeof command === 'string' ? command.trim() : '';
+    if (payload?.event === 'list') {
+        return /^\/tasks(?:\s|$)/.test(normalizedCommand);
+    }
+    if (payload?.event === 'view') {
+        return /^\/task\s+view(?:\s|$)/.test(normalizedCommand);
+    }
+    return false;
+}
+
 Object.assign(__testables, {
     serializeEnvelope,
     normalizeClientReference,
     parseProgressEnvelope,
     parseRuntimeStatePayload,
+    parseInteractionPayload,
+    parseInteractionResolutionPayload,
+    resolvesVisibleTaskCommand,
 });
 
 export { serializeEnvelope, normalizeClientReference };
@@ -155,24 +232,22 @@ export function createNetwork({
     hideTypingIndicator,
     markUserInputSent,
     addRemoteUserMessage,
-    onSessionChanged,
+    onSessionState,
     onTaskUpdate,
     onRuntimeState,
+    onWorkspaceFiles,
+    onInteractionRequest,
+    onInteractionResolved,
     onConnected
 }) {
     let es = null;
     let chatBuffer = '';
     let pendingUserPrompt = '';
+    let pendingVisibleCommand = '';
     let reconnectAttempts = 0;
     let reconnectTimer = null;
     let pendingUploads = 0;
-    let sessionId = '';
     let assistantMessageIndex = null;
-
-    function sessionEndpoint(path) {
-        const separator = String(path || '').includes('?') ? '&' : '?';
-        return `${path}${separator}sessionId=${encodeURIComponent(sessionId)}`;
-    }
 
     function trackUploadStart() {
         pendingUploads += 1;
@@ -238,6 +313,7 @@ export function createNetwork({
         }
         const displayed = addServerMsg(stripped, { messageIndex: assistantMessageIndex });
         if (displayed && pendingUploads === 0) {
+            pendingVisibleCommand = '';
             hideTypingIndicator();
         }
     }
@@ -268,7 +344,7 @@ export function createNetwork({
             // Ignore close failures
         }
 
-        es = new EventSource(toEndpoint(sessionEndpoint(`stream?tabId=${TAB_ID}`)));
+        es = new EventSource(toEndpoint(`stream?tabId=${TAB_ID}`));
 
         es.onopen = () => {
             // Reset reconnect attempts on successful connection
@@ -363,27 +439,30 @@ export function createNetwork({
             }
         });
 
-        es.addEventListener('session-changed', (event) => {
+        es.addEventListener('session-state', (event) => {
             try {
                 const payload = JSON.parse(event.data);
-                if (typeof onSessionChanged === 'function') onSessionChanged(payload?.session || null);
+                if ((payload?.event === 'current' || payload?.event === 'selected')) {
+                    assistantMessageIndex = null;
+                }
+                if (typeof onSessionState === 'function') onSessionState(payload);
             } catch (error) {
-                dlog('session changed error', error);
+                dlog('session state error', error);
             }
         });
 
         es.addEventListener('task-update', (event) => {
             try {
                 const payload = JSON.parse(event.data);
+                const visibleCommand = resolvesVisibleTaskCommand(payload, pendingVisibleCommand)
+                    ? pendingVisibleCommand
+                    : '';
+                if (visibleCommand) {
+                    pendingVisibleCommand = '';
+                    hideTypingIndicator(true);
+                }
                 if (typeof onTaskUpdate === 'function') {
-                    if (payload?.sessionId && payload.sessionId !== sessionId) {
-                        const workspaceUpdate = { ...payload };
-                        delete workspaceUpdate.sessionId;
-                        delete workspaceUpdate.messageIndex;
-                        onTaskUpdate(workspaceUpdate);
-                    } else {
-                        onTaskUpdate(payload);
-                    }
+                    onTaskUpdate(payload, { visibleCommand });
                 }
             } catch (error) {
                 dlog('task update error', error);
@@ -394,6 +473,27 @@ export function createNetwork({
             const runtimeState = parseRuntimeStatePayload(event.data);
             if (runtimeState !== undefined && typeof onRuntimeState === 'function') {
                 onRuntimeState(runtimeState);
+            }
+        });
+
+        es.addEventListener('workspace-files', (event) => {
+            const update = parseWorkspaceFilesPayload(event.data);
+            if (update && typeof onWorkspaceFiles === 'function') {
+                onWorkspaceFiles(update);
+            }
+        });
+
+        es.addEventListener('interaction-request', (event) => {
+            const interaction = parseInteractionPayload(event.data);
+            if (interaction && typeof onInteractionRequest === 'function') {
+                onInteractionRequest(interaction);
+            }
+        });
+
+        es.addEventListener('interaction-resolved', (event) => {
+            const resolution = parseInteractionResolutionPayload(event.data);
+            if (resolution && typeof onInteractionResolved === 'function') {
+                onInteractionResolved(resolution);
             }
         });
 
@@ -418,17 +518,25 @@ export function createNetwork({
         es = null;
     }
 
-    function postEnvelope(payload = {}) {
+    function postEnvelope(payload = {}, { silent = false } = {}) {
         const text = typeof payload.text === 'string' ? payload.text : '';
         const attachments = Array.isArray(payload.attachments) ? payload.attachments : [];
         const references = Array.isArray(payload.references) ? payload.references : [];
-        const serialized = serializeEnvelope({ text, attachments, references });
+        const serialized = serializeEnvelope({
+            text,
+            attachments,
+            references,
+            visible: !silent,
+        });
         const trimmedText = text.trim();
         pendingUserPrompt = trimmedText;
+        if (!silent) {
+            pendingVisibleCommand = trimmedText.startsWith('/') ? trimmedText : '';
+        }
 
-        markUserInputSent();
+        if (!silent) markUserInputSent();
 
-        const send = () => fetch(toEndpoint(sessionEndpoint(`input?tabId=${TAB_ID}`)), {
+        const send = () => fetch(toEndpoint(`input?tabId=${TAB_ID}`), {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: `${serialized}\n`,
@@ -442,6 +550,7 @@ export function createNetwork({
             return response;
         }).catch((error) => {
             dlog('chat error', error);
+            if (!silent) pendingVisibleCommand = '';
             if (pendingUploads === 0) {
                 hideTypingIndicator(true);
             }
@@ -467,12 +576,21 @@ export function createNetwork({
         if (!message.trim()) {
             return false;
         }
-        postEnvelope({ text: message });
+        postEnvelope({ text: message }, { silent: true });
         return true;
     }
 
     function uploadAttachment(filePayload, caption) {
-        const { file, previewUrl, revokePreview, previewNeedsRevoke, isImage, relativePath } = filePayload || {};
+        const {
+            file,
+            previewUrl,
+            revokePreview,
+            previewNeedsRevoke,
+            isImage,
+            relativePath,
+            destinationPath,
+            overwrite,
+        } = filePayload || {};
         const isFileObject = (typeof File !== 'undefined' && file instanceof File)
             || (file && typeof file.name === 'string' && typeof file.size !== 'undefined');
         if (!isFileObject) {
@@ -487,11 +605,17 @@ export function createNetwork({
         const effectiveRelativePath = typeof relativePath === 'string' && relativePath.trim()
             ? relativePath.trim()
             : (file.name || '');
+        const normalizedDestination = typeof destinationPath === 'string'
+            ? destinationPath.trim().replace(/^\/+|\/+$/g, '')
+            : '';
+        const targetLocalPath = [normalizedDestination, effectiveRelativePath]
+            .filter(Boolean)
+            .join('/');
 
         let clientAttachment = null;
         if (typeof addClientAttachment === 'function') {
             clientAttachment = addClientAttachment({
-                fileName: effectiveRelativePath !== file.name ? effectiveRelativePath : file.name,
+                fileName: targetLocalPath || file.name,
                 size: file.size,
                 mime: file.type,
                 previewUrl,
@@ -505,15 +629,12 @@ export function createNetwork({
 
         const uploadUrl = toEndpoint('uploads');
 
-        const mime = file.type || 'application/octet-stream';
-        const headers = {
-            'Content-Type': mime,
-            'X-Mime-Type': mime,
-            'X-File-Name': encodeURIComponent(file.name),
-        };
-        if (effectiveRelativePath) {
-            headers['X-Relative-Path'] = encodeURIComponent(effectiveRelativePath);
-        }
+        const headers = buildAttachmentUploadHeaders({
+            file,
+            relativePath: effectiveRelativePath,
+            destinationPath: normalizedDestination,
+            overwrite,
+        });
 
         return fetch(uploadUrl, {
             method: 'POST',
@@ -523,7 +644,16 @@ export function createNetwork({
         })
             .then(res => {
                 if (!res.ok) {
-                    return res.text().then(text => { throw new Error(text || 'Upload failed') });
+                    return res.text().then(text => {
+                        let message = text || 'Upload failed';
+                        try {
+                            const payload = JSON.parse(text);
+                            message = payload?.error || message;
+                        } catch (_) {
+                            // Keep the plain response body.
+                        }
+                        throw new Error(message);
+                    });
                 }
                 return res.json();
             })
@@ -619,7 +749,7 @@ export function createNetwork({
     }
 
     function sendControl(controlSeq) {
-        return fetch(toEndpoint(sessionEndpoint(`control?tabId=${TAB_ID}`)), {
+        return fetch(toEndpoint(`control?tabId=${TAB_ID}`), {
             method: 'POST',
             headers: { 'Content-Type': 'text/plain' },
             body: controlSeq
@@ -628,23 +758,29 @@ export function createNetwork({
         });
     }
 
+    function sendInteractionResponse(interactionId, optionId) {
+        return fetch(toEndpoint(`interaction?tabId=${TAB_ID}`), {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ interactionId, optionId }),
+            credentials: 'include'
+        }).then((response) => {
+            if (!response.ok) throw new Error(`interaction_failed_${response.status}`);
+            return response;
+        }).catch((error) => {
+            dlog('interaction response error', error);
+            showBanner('Approval response failed', 'err');
+            throw error;
+        });
+    }
+
     return {
         start,
         stop,
-        setSession(nextSessionId, { restart = true } = {}) {
-            const normalized = typeof nextSessionId === 'string' ? nextSessionId.trim() : '';
-            if (normalized === sessionId) return;
-            sessionId = normalized;
-            assistantMessageIndex = null;
-            if (restart) {
-                stop();
-                start();
-            }
-        },
-        getSessionId: () => sessionId,
         sendCommand,
         sendQuickCommand,
         sendAttachments,
-        sendControl
+        sendControl,
+        sendInteractionResponse
     };
 }

@@ -6,6 +6,36 @@ const BROWSER_MUTATION_RETRY_ERRORS = new Set([
     'edge_generation_changed',
 ]);
 const browserMutationProofs = new Map();
+const INITIAL_CATALOG_RETRY_DELAYS_MS = Object.freeze([
+    250,
+    500,
+    1000,
+    ...Array(14).fill(2000),
+]);
+
+function waitForRetry(delayMs) {
+    return new Promise((resolve) => setTimeout(resolve, delayMs));
+}
+
+function catalogLoadError(message, { retryable = true } = {}) {
+    const error = new Error(message);
+    error.retryable = retryable;
+    return error;
+}
+
+function responseIsAccessDenied(response, body = null) {
+    return response?.status === 401
+        || response?.status === 403
+        || response?.redirected === true
+        || /\/auth\/login(?:[/?#]|$)/.test(String(response?.url || ''))
+        || body?.error?.code === -32003;
+}
+
+function responseFailure(stage, response, body = null) {
+    return catalogLoadError(`Slash command catalog ${stage} failed.`, {
+        retryable: !responseIsAccessDenied(response, body),
+    });
+}
 
 function findCommandSlash(value) {
     return String(value || '').startsWith('/') ? 0 : -1;
@@ -127,12 +157,9 @@ export function applySlashInsertTextToValue(value, insertText) {
 function buildCatalogArguments() {
     const query = globalThis.document?.body?.dataset?.agentQuery || '';
     const args = {};
-    if (!query) {
-        return args;
-    }
     try {
         const params = new URLSearchParams(query);
-        const dir = params.get('dir');
+        const dir = params.get('dir') || globalThis.document?.body?.dataset?.workdir || '';
         if (dir) {
             args.dir = dir;
         }
@@ -368,15 +395,16 @@ async function callMcpInitialize(agentName, mcpEndpoint) {
             }
         })
     });
-    if (!initRes.ok) return null;
+    if (!initRes.ok) throw responseFailure('initialization', initRes);
     const initBody = await initRes.json().catch(() => null);
-    if (!initBody || !initBody.result) return null;
+    if (!initBody || !initBody.result) throw responseFailure('initialization', initRes, initBody);
     const sessionId = initRes.headers.get('mcp-session-id') || initBody.result?.meta?.sessionId;
-    await fetchAgentMcp(agentName, mcpEndpoint, {
+    const initializedRes = await fetchAgentMcp(agentName, mcpEndpoint, {
         method: 'POST',
         headers: buildMcpHeaders(sessionId),
         body: JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' })
     });
+    if (!initializedRes.ok) throw responseFailure('acknowledgement', initializedRes);
     return sessionId;
 }
 
@@ -397,13 +425,14 @@ async function fetchStructuredCatalog(agentName, mcpEndpoint, sessionId, tools, 
             }
         })
     });
-    if (!callRes.ok) return [];
+    if (!callRes.ok) throw responseFailure('tool call', callRes);
     const callBody = await callRes.json().catch(() => null);
+    if (callBody?.error) throw responseFailure('tool call', callRes, callBody);
     const content = callBody?.result?.content || callBody?.result?.result?.content;
-    if (!Array.isArray(content)) return [];
+    if (!Array.isArray(content)) throw responseFailure('tool response', callRes, callBody);
 
     const textPart = content.find((entry) => entry?.type === 'text' && typeof entry.text === 'string');
-    if (!textPart) return [];
+    if (!textPart) throw responseFailure('tool response', callRes, callBody);
 
     const parsed = JSON.parse(textPart.text);
     if (!parsed || parsed.type !== 'achilles-slash-command-catalog' || !Array.isArray(parsed.commands)) {
@@ -449,52 +478,88 @@ async function fetchStructuredCatalog(agentName, mcpEndpoint, sessionId, tools, 
 
 async function fetchCommandsFromAgent(agentName, dlog) {
     if (!agentName) return [];
+    const mcpEndpoint = `/${agentName}/mcp`;
+    const sessionId = await callMcpInitialize(agentName, mcpEndpoint);
+
+    const toolsRes = await fetchAgentMcp(agentName, mcpEndpoint, {
+        method: 'POST',
+        headers: buildMcpHeaders(sessionId),
+        body: JSON.stringify({ jsonrpc: '2.0', id: 'wc-tools-1', method: 'tools/list' })
+    });
+    if (!toolsRes.ok) throw responseFailure('tool listing', toolsRes);
+
+    const toolsBody = await toolsRes.json().catch(() => null);
+    if (!toolsBody || !toolsBody.result || !Array.isArray(toolsBody.result.tools)) {
+        throw responseFailure('tool listing', toolsRes, toolsBody);
+    }
+
+    const tools = toolsBody.result.tools;
+    let structuredCatalogError = null;
     try {
-        const mcpEndpoint = `/${agentName}/mcp`;
-        const sessionId = await callMcpInitialize(agentName, mcpEndpoint);
-        if (sessionId === null) return [];
-
-        const toolsRes = await fetchAgentMcp(agentName, mcpEndpoint, {
-            method: 'POST',
-            headers: buildMcpHeaders(sessionId),
-            body: JSON.stringify({ jsonrpc: '2.0', id: 'wc-tools-1', method: 'tools/list' })
-        });
-        if (!toolsRes.ok) return [];
-
-        const toolsBody = await toolsRes.json().catch(() => null);
-        if (!toolsBody || !toolsBody.result || !Array.isArray(toolsBody.result.tools)) return [];
-
-        const tools = toolsBody.result.tools;
-        try {
-            const structured = await fetchStructuredCatalog(agentName, mcpEndpoint, sessionId, tools, buildCatalogArguments());
-            if (structured.length > 0) {
-                return structured.sort((a, b) => a.name.localeCompare(b.name));
-            }
-        } catch (err) {
-            dlog?.('SlashCommandsProvider: structured catalog parse failed, falling back', err?.message || err);
+        const structured = await fetchStructuredCatalog(
+            agentName,
+            mcpEndpoint,
+            sessionId,
+            tools,
+            buildCatalogArguments(),
+        );
+        if (structured.length > 0) {
+            return structured.sort((a, b) => a.name.localeCompare(b.name));
         }
-
-        const fallback = [];
-        for (const tool of tools) {
-            const toolName = tool.name || '';
-            if (!toolName.startsWith('execute_')) continue;
-            const skillName = toolName.replace('execute_', '').replace(/_/g, '-');
-            fallback.push({
-                name: `/${skillName}`,
-                description: tool.description || '',
-                inputSchema: tool.inputSchema || null,
-                subCommands: extractSubCommands(tool)
-            });
-        }
-        return fallback.sort((a, b) => a.name.localeCompare(b.name));
     } catch (err) {
-        dlog?.('SlashCommandsProvider: MCP catalog fetch failed (silent)', err?.message || err);
-        return [];
+        structuredCatalogError = err;
+        dlog?.('SlashCommandsProvider: structured catalog parse failed, falling back', err?.message || err);
+    }
+
+    const fallback = [];
+    for (const tool of tools) {
+        const toolName = tool.name || '';
+        if (!toolName.startsWith('execute_')) continue;
+        const skillName = toolName.replace('execute_', '').replace(/_/g, '-');
+        fallback.push({
+            name: `/${skillName}`,
+            description: tool.description || '',
+            inputSchema: tool.inputSchema || null,
+            subCommands: extractSubCommands(tool)
+        });
+    }
+    if (fallback.length === 0 && structuredCatalogError) throw structuredCatalogError;
+    return fallback.sort((a, b) => a.name.localeCompare(b.name));
+}
+
+export async function loadSlashCommandsWithRetry(loadCommands, {
+    retryDelays = INITIAL_CATALOG_RETRY_DELAYS_MS,
+    wait = waitForRetry,
+    dlog,
+} = {}) {
+    const delays = Array.isArray(retryDelays) ? retryDelays : [];
+    for (let attempt = 0; ; attempt += 1) {
+        try {
+            return await loadCommands();
+        } catch (error) {
+            const retryable = error?.retryable !== false;
+            if (!retryable || attempt >= delays.length) {
+                dlog?.('SlashCommandsProvider: catalog loading stopped', error?.message || error);
+                return [];
+            }
+            const delayMs = Math.max(0, Number(delays[attempt]) || 0);
+            dlog?.('SlashCommandsProvider: catalog not ready; retrying', {
+                attempt: attempt + 1,
+                delayMs,
+            });
+            await wait(delayMs);
+        }
     }
 }
 
-export function createSlashCommandsProvider({ agentName, dlog } = {}) {
+export function createSlashCommandsProvider({
+    agentName,
+    dlog,
+    retryDelays = INITIAL_CATALOG_RETRY_DELAYS_MS,
+    wait = waitForRetry,
+} = {}) {
     let commands = [];
+    let refreshPromise = null;
 
     function detectTrigger(value, caretIndex) {
         const inputValue = typeof value === 'string' ? value : '';
@@ -538,9 +603,19 @@ export function createSlashCommandsProvider({ agentName, dlog } = {}) {
         return null;
     }
 
-    async function refresh() {
-        commands = await fetchCommandsFromAgent(agentName, dlog);
-        dlog?.('SlashCommandsProvider: loaded', commands.length, 'commands');
+    function refresh() {
+        if (refreshPromise) return refreshPromise;
+        refreshPromise = loadSlashCommandsWithRetry(
+            () => fetchCommandsFromAgent(agentName, dlog),
+            { retryDelays, wait, dlog },
+        ).then((loadedCommands) => {
+            commands = loadedCommands;
+            dlog?.('SlashCommandsProvider: loaded', commands.length, 'commands');
+            return commands;
+        }).finally(() => {
+            refreshPromise = null;
+        });
+        return refreshPromise;
     }
 
     return {

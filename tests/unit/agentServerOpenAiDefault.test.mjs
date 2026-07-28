@@ -257,7 +257,29 @@ test('GET /v1/models returns a default model when endpoints.models is absent', a
         assert.equal(body.object, 'list');
         assert.equal(body.data[0].modelId, 'default');
         assert.equal(body.data[0].displayName, 'llmAssistant');
+        assert.deepEqual(body.data[0].tags, ['generic-agent']);
         assert.equal(body.data[0].metadata.fallback, true);
+    } finally {
+        await srv.stop();
+    }
+});
+
+test('fallback /v1/models uses manifest capability tags when declared', async () => {
+    const srv = await startServer({
+        manifest: {
+            name: 'reasoningAssistant',
+            capabilities: {
+                tags: [' reasoning ', 'reasoning', ''],
+            },
+        },
+        mcpConfig: TOOL_CONFIG,
+        agentId: 'agent:Workspace/reasoningAssistant',
+    });
+    try {
+        const res = await fetch(`http://127.0.0.1:${srv.port}/v1/models`);
+        assert.equal(res.status, 200);
+        const body = await res.json();
+        assert.deepEqual(body.data[0].tags, ['reasoning']);
     } finally {
         await srv.stop();
     }

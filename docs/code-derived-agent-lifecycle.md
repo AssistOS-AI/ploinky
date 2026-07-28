@@ -31,12 +31,13 @@ All relative paths below are relative to the workspace directory where `ploinky`
 | `.ploinky/agents.json` | Enabled-agent registry plus `_config` values such as static start config and sandbox setting. |
 | `.ploinky/repo_sources.json` | Remembered repo URLs, branches, and repository kind for later update/reinstall and Marketplace categorization. |
 | `.ploinky/repos/<repo>` | Cloned agent repositories. Agent manifests are found below this tree. |
-| `.data/<agent-or-alias>` | Per-instance persistent agent home. Containers mount it at `/root` in every run mode. Disable preserves it. |
+| `.data/<agent-or-alias>` | Per-instance persistent agent home. Containers and Linux bwrap mount it at `/root` in every run mode. Disable preserves it. |
 | `.ploinky/code/<agent>` | Symlink to the agent's `code/` directory when present, otherwise to the agent root. |
 | `.ploinky/skills/<agent>` | Symlink to the agent's `skills/` directory when present. |
 | `.ploinky/shared` | Shared writable host directory mounted as `/shared` in containers and host sandboxes. |
 | `.ploinky/deps/global/<runtimeKey>` | Runtime-specific global Node dependency cache. |
 | `.ploinky/deps/agents/<repo>/<agent>/<runtimeKey>` | Runtime-specific merged agent dependency cache. |
+| `.ploinky/deps/bwrap-runtime/<agent-or-alias>` | Regenerated Bubblewrap Agent runtime copies with a pre-created nested dependency mount point. |
 | `.ploinky/logs` | Router, watchdog, no-wait worker, and other logs. |
 | `.ploinky/running` | PID/status files, including router PID and no-wait worker status. |
 | `.ploinky/routing.json` | Router route table written during start/restart. |
@@ -169,10 +170,10 @@ The command surface is split between the registry in `cli/services/commandRegist
 | `update repos` | Updates installed Ploinky repos, refreshes runtime Achilles dependencies, and refreshes `AchillesCopilotBasicSkills` in eligible managed repos. |
 | `update all [folder]` | Updates the Ploinky runtime, installed repos, managed-repo default skills, discovered workspace git repos, and default skills for discovered repos. |
 | `reinstall [agent]` / `reinstall agent <agent>` | Removes the running service for an enabled agent, recreates it with `ensureAgentService`, updates routing, and starts the router if needed. |
-| `enable agent <agent> [global|devel <repo>]` | Resolves an agent manifest, writes an enabled-agent record to `.ploinky/agents.json`, and creates work dirs/symlinks. |
+| `enable agent <agent> [global|devel <repo>]` | Resolves an agent manifest, writes an enabled-agent record, creates work dirs/symlinks, starts the selected runtime, verifies backend-specific liveness and readiness, and publishes its route through coordinated apply. |
 | `enable sandbox` | Outside a Ploinky box, allows host sandbox runtimes for manifests with `lite-sandbox: true`; inside a box, fails because nested Podman is forced. |
-| `disable agent <agent>` | Removes an enabled-agent record only if no live/stopped container or sandbox process exists for it. Symlinks are removed; the work dir is preserved. |
-| `disable agents-all` | Tries to disable all enabled agents and skips ones with live/stopped runtime state. |
+| `disable agent <agent>` | Removes the enabled-agent record and route in an inactive generation, stops/removes the selected container or sandbox process from a captured record snapshot, commits route removal, removes symlinks, and preserves the work dir. |
+| `disable agents-all` | Removes all selected enabled-agent records and routes in one inactive generation, then tears down their runtime instances from captured record snapshots. |
 | `disable sandbox` | Disables host sandbox runtimes, causing `lite-sandbox` agents to fall back to containers; this is already the forced box state. |
 | `sandbox status|enable|disable` | Reads or changes the host-sandbox toggle outside a box; inside a box, status reports forced nested Podman and enable cannot persist an override. |
 | `start [agent] [8080] [branch flags]` | Ensures repos/agents/dependencies, starts dependency graph services, writes routing, and launches the fixed inner Router watchdog. The public wrapper consumes any selected physical-host port and forwards inner `8080`. |
@@ -216,7 +217,7 @@ An agent is discovered by a `manifest.json` file below `.ploinky/repos/<repo>/<a
 
 ## Enabled-Agent Records
 
-`enable agent` does not start a container. It records intent and creates workspace structure.
+`enable agent` records intent, creates workspace structure, starts the selected backend, verifies that backend's liveness, and only then publishes routing state.
 
 ```mermaid
 flowchart TD
@@ -228,6 +229,12 @@ flowchart TD
   F --> G["create .data/<agent-or-alias>"]
   G --> H["create .ploinky/code/<agent> symlink"]
   H --> I["create .ploinky/skills/<agent> symlink when skills/ exists"]
+  I --> J["ensureAgentService selects and starts backend"]
+  J --> K{"recorded runtime"}
+  K -- "container" --> L["verify Docker/Podman container liveness"]
+  K -- "bwrap/seatbelt" --> M["verify tracked sandbox PID"]
+  L --> N["publish route"]
+  M --> N
 ```
 
 The registry key is the generated container name from `getAgentContainerName(aliasOrAgent, repo)`: `ploinky_<repo>_<agentOrAlias>_<workspaceBasename>_<workspaceHash>`.
@@ -242,7 +249,7 @@ The enabled record includes:
 | `projectPath` | Depends on run mode. |
 | `runMode` | `isolated`, `global`, or `devel`. |
 | `type` | Always `agent` for agent records. |
-| `config.binds` | Initial descriptive binds: per-instance home to `/root`, non-isolated project path to itself, repo `Agent/` to `/Agent`, agent source to `/code`. Runtime startup recomputes actual binds. |
+| `config.binds` | Descriptive runtime binds: per-instance home to `/root`, non-isolated project path to itself, the selected staged Agent runtime to `/Agent`, agent source to `/code`, and prepared dependencies to both Node resolution targets. Runtime startup recomputes actual binds. |
 | `config.ports` | Descriptive enable-time port metadata from `parseManifestPorts(manifest)` or fallback `{containerPort: 7000}`. Runtime startup recomputes profile ports and does not turn this fallback into an implicit port-7000 publish for a start-only service. |
 | `auth` | `{mode}` plus local auth metadata when local password auth is enabled. |
 | `alias` | Optional route/record alias. |
@@ -256,7 +263,7 @@ Run modes:
 | `global` | Workspace root. |
 | `devel <repo>` | `.ploinky/repos/<repo>`, which must already exist. |
 
-Disable behavior is conservative. `disable agent` refuses to remove the record when a live container, stopped container, or sandbox process appears to exist. If it can disable, it clears matching static config, removes symlinks, and leaves `.data/<agent-or-alias>` intact.
+Disable removes the registry entry before stopping the runtime so the watchdog cannot restart an intentionally disabled agent. It passes the removed record as an in-memory snapshot to the fleet remover; otherwise the generic instance key would lose its `runtime` discriminator and a Bubblewrap or Seatbelt process could be mistaken for a Docker/Podman container. It also clears matching static config, removes symlinks, and leaves `.data/<agent-or-alias>` intact.
 
 ## Manifest Fields
 
@@ -667,7 +674,7 @@ the forced nested-Podman rule bypasses both implementations.
 
 ### Linux bwrap
 
-The bwrap runtime starts a host process with Bubblewrap. It prepares dependency cache with the `bwrap` runtime family and mounts a constrained filesystem.
+The bwrap runtime starts a host process with Bubblewrap. It prepares dependency cache with the `bwrap` runtime family, stages the shared Agent runtime under `.ploinky/deps/bwrap-runtime/<agent-or-alias>/`, and mounts a constrained filesystem. The staging copy excludes source `Agent/node_modules` content and creates an empty `node_modules` directory before `/Agent` becomes read-only, allowing the prepared cache to be mounted at `/Agent/node_modules` without modifying the installed source tree.
 
 Important bwrap mounts:
 
@@ -677,17 +684,18 @@ Important bwrap mounts:
 | `/proc` | New `/proc`. |
 | `/dev` | Device bind. |
 | tmpfs | `/tmp`. |
-| Ploinky repo `Agent/` | `/Agent` read-only. |
+| Staged Agent runtime under `.ploinky/deps/bwrap-runtime/` | `/Agent` read-only. |
 | Agent code path | `/code`, read-write or read-only by profile. |
 | Prepared dependency cache | `/code/node_modules` and `/Agent/node_modules` read-only. |
 | `.ploinky/shared` | `/shared`. |
 | Agent private key when present | `/run/ploinky-agent.key`. |
-| Project path/current working directory | Same absolute path. |
+| Agent home (`.data/<agent-or-alias>`) | `/root` read-write. |
+| Project path/current working directory | `/root` in isolated mode; the same absolute workspace or repository path in global and development modes. |
 | Agent skills path | `/code/skills` when present. |
 | Manifest volumes | Configured target paths from the root manifest and active profile, with relative host paths resolved against the workspace root and absolute host paths honored as declared. |
 | Runtime persistent storage | Configured container path. |
 
-The bwrap process does not unshare networking, so agent ports bind on the host. It does unshare PID. The runtime explicitly sets env vars with `--clearenv` plus `--setenv`, including `PORT`, router URL, manifest env, profile env/secrets, runtime resource env, `NODE_PATH=/code/node_modules`, `HOME=<resolved projectPath>`, `PATH`, and identity variables.
+The bwrap process does not unshare networking, so agent ports bind on the host. It does unshare PID. The runtime explicitly sets env vars with `--clearenv` plus `--setenv`, including `PORT`, router URL, manifest env, profile env/secrets, runtime resource env, `NODE_PATH=/code/node_modules`, `HOME=/root`, `PATH`, and identity variables. `WORKSPACE_PATH` is `/root` in isolated mode and remains the separately mounted workspace or development checkout in global and development modes.
 
 The bwrap entry command follows the same broad selection as containers. When both `start` and agent command exist, it runs start in the background and execs the agent command.
 
@@ -765,6 +773,8 @@ Startup config providers can write values into encrypted `.ploinky/.secrets` bef
 | Podman startup | repo `Agent/` | `.ploinky/container-runtime/<container>/Agent` | Podman |
 | Podman startup | Agent code entries | `.ploinky/container-runtime/<container>/code` symlink tree | Podman |
 | Podman startup | Prepared deps | staged `Agent/node_modules` and `code/node_modules` | Podman |
+| Bubblewrap startup | repo `Agent/` excluding `Agent/node_modules` | `.ploinky/deps/bwrap-runtime/<agent-or-alias>/Agent-...` | Bubblewrap |
+| Bubblewrap startup | Prepared deps | `/code/node_modules` and staged `/Agent/node_modules` mount point | Bubblewrap |
 | Seatbelt startup | repo `Agent/` | `.ploinky/seatbelt-runtime/<agent>/Agent-...` | Seatbelt |
 | Seatbelt startup | Source MCP config | resolved work directory `mcp-config.seatbelt.json` | Seatbelt |
 | Router start | Runtime route data | `.ploinky/routing.json` | Router |
@@ -850,7 +860,7 @@ private traffic contains only private handlers. Health, admin, policy,
 discovery, aggregate MCP, dashboard, status, WebChat, broker, and private-service
 paths are absent from every host class whose closed allowlist omits them.
 
-`/api/marketplace` is a first-party JSON management API for the Marketplace plugin. GET requires an authenticated local or SSO user and returns repository, source metadata, repository kind, agent, enabled-registry, and live runtime-status data. POST requires a local admin session and supports `install_repo`, `uninstall_repo`, `enable_agent`, and marketplace-specific `disable_agent`. Repository install requires a URL, accepts an optional name and branch, clones the checkout, and records source metadata. Repository uninstall disables enabled agents from that repo by container key, removes their runtime containers, removes the checkout, and preserves `repo_sources.json` metadata so the repo can be installed again. Marketplace deactivation removes the enabled-agent registry entry before removing the runtime container; the ordinary direct `disable agent` CLI command remains conservative and refuses to remove records while runtime state exists.
+`/api/marketplace` is a first-party JSON management API for the Marketplace plugin. GET requires an authenticated local or SSO user and returns repository, source metadata, repository kind, agent, enabled-registry, recorded backend, and live runtime-status data. Marketplace and CLI status share backend-aware collection: Bubblewrap and Seatbelt use their tracked PIDs, while Docker and Podman use OCI inspection; enabled runtimes without a live process remain visible as stopped. POST requires a local admin session and supports `install_repo`, `uninstall_repo`, `enable_agent`, and `disable_agent`. Repository install requires a URL, accepts an optional name and branch, clones the checkout, and records source metadata. Repository uninstall disables enabled agents from that repo by runtime-instance key, removes their runtimes, removes the checkout, and preserves `repo_sources.json` metadata so the repo can be installed again. Marketplace and CLI enable/disable actions delegate to the same lifecycle helpers; backend selection belongs there rather than in the HTTP endpoint.
 
 Candidate routes use the alias as route key when present, otherwise the short
 agent name. They have no request-path effect until coordinated apply captures
@@ -888,6 +898,7 @@ The default server provides:
 | `GET /agent-card` | Returns manifest endpoint card when configured. |
 | `GET /getTaskStatus` / `/task` | Returns async task status when authorized by invocation token. |
 | `/mcp` | Streamable HTTP MCP server for configured tools/resources/prompts. |
+| `GET /v1/models` | Runs `endpoints.models` when configured; otherwise returns one `default` model using `manifest.capabilities.tags` or `generic-agent`. |
 | Static files | Serves files from code root for other GET/HEAD paths. |
 | `endpoints.chatCompletions` | Optional OpenAI-style `/v1/chat/completions` backed by a command spec. |
 
@@ -904,7 +915,7 @@ MCP tool and resource commands require router-minted invocation headers before c
 | `shutdown` | Kills router. | Destroys workspace containers for enabled agents. |
 | `destroy` | Kills router. | Destroys all workspace containers, clears `.ploinky/deps`, and preserves `.data/<agent-or-alias>`. |
 | `clean` | Does not explicitly kill router in command code. | Destroys all workspace containers, clears `.ploinky/deps`, and preserves `.data/<agent-or-alias>`. |
-| `disable agent` | Clears matching static config if disabling succeeds. | Refuses if runtime state exists. |
+| `disable agent` | Clears matching static config if disabling succeeds. | Removes the registry entry, then stops/removes the runtime using the captured record's backend. |
 
 ## Code-Observed Caveats
 

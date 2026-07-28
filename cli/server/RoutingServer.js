@@ -60,6 +60,7 @@ import { isRouteMount } from './utils/routeMounts.js';
 import {
     agentSessionStore,
     buildInvocationContextForProviderCall,
+    handleDelegatedAgentTaskCancel,
     handleAgentMcpRequest,
     readAuthenticatedAgentTask,
     verifyDelegatedAgentTaskStatusCall,
@@ -261,6 +262,10 @@ function isAgentTaskStatusProxyPath(agentProxyPath) {
     return value === '/task' || value === '/getTaskStatus';
 }
 
+function isAgentTaskCancelProxyPath(agentProxyPath) {
+    return pathOnly(agentProxyPath) === '/task/cancel';
+}
+
 function getStaticRouteName(routes, snapshot) {
     const staticAgent = typeof snapshot?.routing?.static?.agent === 'string'
         ? snapshot.routing.static.agent.trim()
@@ -379,6 +384,13 @@ async function processRequest(req, res) {
         && isAgentTaskStatusProxyPath(agentProxyPath)
         && hasDelegatedAgentAssertion(req)
     );
+    const isDelegatedAgentTaskCancelRoute = Boolean(
+        agentName
+        && req.method === 'POST'
+        && !isAgentMcpRoute
+        && isAgentTaskCancelProxyPath(agentProxyPath)
+        && hasDelegatedAgentAssertion(req)
+    );
     let agentProxyExtraHeaders = {};
     appendLog('http_request', { method: req.method, path: pathname });
 
@@ -443,6 +455,15 @@ async function processRequest(req, res) {
         if (!authResult.ok) return;
     } else if (agentName && isAgentMcpRoute && hasDelegatedAgentAssertion(req)) {
         // Agent-to-agent MCP: the MCP proxy verifies the Agent Assertion.
+    } else if (isDelegatedAgentTaskCancelRoute) {
+        await handleDelegatedAgentTaskCancel({
+            req,
+            res,
+            route,
+            agentName,
+            beforeDial: () => commitRoutePlan(routePlan),
+        });
+        return;
     } else if (isDelegatedAgentTaskStatusRoute) {
         // Agent-to-agent async task polling: verify the source assertion, then
         // replace it with a target-scoped Router Request for AgentServer.

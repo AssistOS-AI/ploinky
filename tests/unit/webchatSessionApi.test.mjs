@@ -52,33 +52,60 @@ async function request(appState, url, options = {}) {
 
 test.after(() => fs.rmSync(root, { recursive: true, force: true }));
 
-test('folder-session API creates, lists, selects, and loads history without exposing messages in listings', async () => {
+test('WebChat page exposes the workspace-relative base used by file preview links', async () => {
     const appState = { sessions: new Map(), runtimes: new Map() };
-    const suffix = '?workspace-dir=project';
-    const listed = await request(appState, `/webchat/sessions${suffix}`);
-    assert.equal(listed.statusCode, 200);
-    const initial = JSON.parse(listed.body);
-    assert.equal(initial.sessions.length, 1);
-    assert.equal(Object.hasOwn(initial.sessions[0], 'messages'), false);
-    assert.equal(Object.hasOwn(initial.sessions[0], 'messageCount'), false);
+    const response = await request(appState, '/webchat/?workspace-dir=project');
 
-    const createdResponse = await request(appState, `/webchat/sessions${suffix}`, { method: 'POST' });
-    assert.equal(createdResponse.statusCode, 201);
-    const created = JSON.parse(createdResponse.body).session;
-
-    const selectedResponse = await request(appState, `/webchat/sessions/current${suffix}`, {
-        method: 'PUT',
-        body: JSON.stringify({ sessionId: initial.currentSessionId })
-    });
-    assert.equal(selectedResponse.statusCode, 200);
-    assert.equal(JSON.parse(selectedResponse.body).session.sessionId, initial.currentSessionId);
-
-    const loaded = await request(appState, `/webchat/sessions/${created.sessionId}${suffix}`);
-    assert.equal(loaded.statusCode, 200);
-    assert.deepEqual(JSON.parse(loaded.body).session.messages, []);
+    assert.equal(response.statusCode, 200);
+    assert.match(response.body, /data-workspace-base="project"/);
 });
 
-test('folder-session API redirects unauthenticated requests before touching project history', async () => {
+test('conversation session REST routes are absent because the selected CLI owns sessions', async () => {
+    const appState = { sessions: new Map(), runtimes: new Map() };
+    const suffix = '?workspace-dir=project';
+    for (const [route, options] of [
+        [`/webchat/sessions${suffix}`, {}],
+        [`/webchat/sessions${suffix}`, { method: 'POST' }],
+        [`/webchat/sessions/current${suffix}`, { method: 'PUT' }],
+        [`/webchat/sessions/123e4567-e89b-42d3-a456-426614174000${suffix}`, {}],
+    ]) {
+        const response = await request(appState, route, options);
+        assert.equal(response.statusCode, 404);
+    }
+    assert.equal(fs.existsSync(path.join(project, '.copilot_history')), false);
+    assert.equal(fs.existsSync(path.join(project, '.achilles-cli')), false);
+});
+
+test('WebChat directory routes browse and create folders under the selected working directory', async () => {
+    const appState = { sessions: new Map(), runtimes: new Map() };
+    fs.mkdirSync(path.join(project, 'existing'), { recursive: true });
+    fs.writeFileSync(path.join(project, 'note.txt'), 'note');
+
+    const listing = await request(appState, '/webchat/directories?workspace-dir=project&path=');
+    assert.equal(listing.statusCode, 200);
+    const listingPayload = JSON.parse(listing.body);
+    assert.deepEqual(listingPayload.entries.map(({ name, kind }) => ({ name, kind })), [
+        { name: 'existing', kind: 'folder' },
+        { name: 'note.txt', kind: 'file' },
+    ]);
+
+    const created = await request(appState, '/webchat/directories?workspace-dir=project', {
+        method: 'POST',
+        body: JSON.stringify({ path: 'existing/new-folder' }),
+    });
+    assert.equal(created.statusCode, 201);
+    assert.equal(fs.statSync(path.join(project, 'existing', 'new-folder')).isDirectory(), true);
+});
+
+test('legacy WebChat upload reads are removed without creating an uploads directory', async () => {
+    const appState = { sessions: new Map(), runtimes: new Map() };
+    const response = await request(appState, '/webchat/uploads?workspace-dir=project&path=legacy.txt');
+    assert.equal(response.statusCode, 405);
+    assert.equal(response.getHeader('allow'), 'POST, PUT');
+    assert.equal(fs.existsSync(path.join(project, 'uploads')), false);
+});
+
+test('retired session routes still pass through authentication before returning', async () => {
     fs.rmSync(path.join(project, '.copilot_history'), { recursive: true, force: true });
     const appState = { sessions: new Map(), runtimes: new Map() };
     const response = await request(appState, '/webchat/sessions?workspace-dir=project', { authenticated: false });
@@ -86,11 +113,10 @@ test('folder-session API redirects unauthenticated requests before touching proj
     assert.equal(fs.existsSync(path.join(project, '.copilot_history')), false);
 });
 
-test('workspace task API is authenticated and returns materialized metadata', async () => {
+test('task data routes are absent because AchillesCLI owns task state', async () => {
     const appState = { sessions: new Map(), runtimes: new Map() };
     const response = await request(appState, '/webchat/tasks?workspace-dir=project');
-    assert.equal(response.statusCode, 200);
-    assert.deepEqual(JSON.parse(response.body), { ok: true, tasks: [] });
+    assert.equal(response.statusCode, 404);
 
     fs.rmSync(path.join(project, '.copilot_history'), { recursive: true, force: true });
     const denied = await request(appState, '/webchat/tasks?workspace-dir=project', { authenticated: false });

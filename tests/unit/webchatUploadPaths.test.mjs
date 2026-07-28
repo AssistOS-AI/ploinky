@@ -3,27 +3,23 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { Readable, Writable } from 'node:stream';
+import { PassThrough, Readable, Writable } from 'node:stream';
 
 import {
-    buildSessionUploadMetadataRoot,
-    buildSessionUploadRoot,
-    buildSessionRelativePath,
-    buildCwdRelativePath,
-    ensureSessionUploadRoot,
-    normalizeWebchatSessionId,
-    resolveNonCollidingTarget,
+    buildWorkspaceFileUrl,
     resolveUploadTarget,
+    resolveWorkspaceDirectory,
+    sanitizeUploadDirectoryPath,
     sanitizeUploadRelativePath,
 } from '../../cli/server/webchat/uploadPaths.js';
 import {
-    listWorkspaceSuggestions,
-} from '../../cli/server/handlers/webchat/workspaceSuggestions.js';
-import {
-    handleWebchatUploadGet,
     handleWebchatUploadPost,
     resolveWebchatUploadContext,
 } from '../../cli/server/handlers/webchat/uploads.js';
+import {
+    handleWorkspaceDirectoriesPost,
+    listWorkspaceDirectory,
+} from '../../cli/server/handlers/webchat/workspaceDirectories.js';
 
 function makeTempDir(prefix) {
     return fs.mkdtempSync(path.join(os.tmpdir(), `${prefix}-`));
@@ -51,318 +47,299 @@ class MockResponse extends Writable {
     }
 
     end(chunk, encoding, callback) {
-        if (chunk) {
-            this.chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk), encoding));
-        }
+        if (chunk) this.chunks.push(Buffer.from(String(chunk), encoding));
         return super.end(callback);
     }
 
-    bodyText() {
-        return Buffer.concat(this.chunks).toString('utf8');
+    bodyJson() {
+        return JSON.parse(Buffer.concat(this.chunks).toString('utf8'));
     }
 }
 
-function makeRequest({ method = 'GET', headers = {}, body = '' } = {}) {
-    const chunks = body ? [Buffer.isBuffer(body) ? body : Buffer.from(String(body))] : [];
-    const req = Readable.from(chunks);
+function makeRequest({ method = 'POST', headers = {}, body = '' } = {}) {
+    const req = Readable.from(body ? [Buffer.from(String(body))] : []);
     req.method = method;
     req.headers = headers;
     return req;
 }
 
 function waitForResponse(res) {
-    return new Promise((resolve) => {
-        res.on('finish', resolve);
-    });
+    if (res.writableFinished) return Promise.resolve();
+    return new Promise((resolve) => res.once('finish', resolve));
 }
 
-test('normalizeWebchatSessionId accepts hex-like ids and rejects unsafe values', () => {
-    assert.equal(normalizeWebchatSessionId('a'.repeat(32)), 'a'.repeat(32));
-    assert.equal(normalizeWebchatSessionId('sid-123_ABC'), 'sid-123_ABC');
-    assert.equal(normalizeWebchatSessionId(''), null);
-    assert.equal(normalizeWebchatSessionId('   '), null);
-    assert.equal(normalizeWebchatSessionId('.'), null);
-    assert.equal(normalizeWebchatSessionId('..'), null);
-    assert.equal(normalizeWebchatSessionId('with/slash'), null);
-    assert.equal(normalizeWebchatSessionId('with\\backslash'), null);
-    assert.equal(normalizeWebchatSessionId('with space'), null);
-    assert.equal(normalizeWebchatSessionId('with\0nul'), null);
-});
+async function upload(context, {
+    destination = '',
+    relativePath = 'note.txt',
+    body = 'content',
+    overwrite = false,
+    mime = 'text/plain',
+} = {}) {
+    const req = makeRequest({
+        headers: {
+            'x-file-name': encodeURIComponent(path.basename(relativePath)),
+            'x-relative-path': encodeURIComponent(relativePath),
+            'x-destination-path': encodeURIComponent(destination),
+            'x-mime-type': mime,
+            ...(overwrite ? { 'x-overwrite': '1' } : {}),
+        },
+        body,
+    });
+    const res = new MockResponse();
+    handleWebchatUploadPost(req, res, new URL('/webchat/uploads', 'http://localhost'), context);
+    await waitForResponse(res);
+    return res;
+}
 
-test('sanitizeUploadRelativePath accepts plain and nested safe paths', () => {
-    assert.equal(sanitizeUploadRelativePath('report.pdf', ''), 'report.pdf');
-    assert.equal(sanitizeUploadRelativePath('folder/report.pdf', ''), 'folder/report.pdf');
-    assert.equal(sanitizeUploadRelativePath('deep/nested/folder/file.txt', ''), 'deep/nested/folder/file.txt');
-    assert.equal(sanitizeUploadRelativePath('', 'fallback.txt'), 'fallback.txt');
-    assert.equal(sanitizeUploadRelativePath('folder\\sub\\file.txt', ''), 'folder/sub/file.txt');
-    assert.equal(sanitizeUploadRelativePath('folder//double//slash.txt', ''), 'folder/double/slash.txt');
-});
-
-test('sanitizeUploadRelativePath rejects absolute paths, traversal, NUL, and secret files', () => {
-    assert.equal(sanitizeUploadRelativePath('/absolute', 'fallback.txt'), null);
-    assert.equal(sanitizeUploadRelativePath('../escape', 'fallback.txt'), null);
-    assert.equal(sanitizeUploadRelativePath('folder/../../escape', 'fallback.txt'), null);
-    assert.equal(sanitizeUploadRelativePath('inside/../escape', 'fallback.txt'), null);
-    assert.equal(sanitizeUploadRelativePath('with\0nul', 'fallback.txt'), null);
-    assert.equal(sanitizeUploadRelativePath('.secrets', 'fallback.txt'), null);
-    assert.equal(sanitizeUploadRelativePath('folder/.secrets', 'fallback.txt'), null);
-    assert.equal(sanitizeUploadRelativePath('config.secrets', 'fallback.txt'), null);
-    assert.equal(sanitizeUploadRelativePath('a/config.secrets', 'fallback.txt'), null);
-    assert.equal(sanitizeUploadRelativePath('', ''), null);
-    assert.equal(sanitizeUploadRelativePath(null, null), null);
-});
-
-test('buildSessionUploadRoot composes cwd + uploads + sessionId', () => {
-    const cwd = '/tmp/example';
-    const sid = 'abc123';
-    assert.equal(buildSessionUploadRoot(cwd, sid), path.join(path.resolve(cwd), 'uploads', sid));
-    assert.equal(buildSessionUploadRoot(cwd, ''), null);
-    assert.equal(buildSessionUploadRoot('', sid), null);
-    assert.equal(buildSessionUploadRoot(cwd, 'bad/segment'), null);
-});
-
-test('buildSessionUploadMetadataRoot stores metadata outside the session file tree', () => {
-    const cwd = '/tmp/example';
-    const sid = 'abc123';
-    assert.equal(
-        buildSessionUploadMetadataRoot(cwd, sid),
-        path.join(path.resolve(cwd), 'uploads', '.webchat-upload-metadata', sid)
-    );
-    assert.equal(buildSessionUploadMetadataRoot(cwd, 'bad/segment'), null);
-});
-
-test('resolveUploadTarget rejects paths that escape via .. and accepts safe ones', () => {
-    const cwd = makeTempDir('webchat-upload-target');
-    try {
-        const sid = 'sessabc';
-        const uploadRoot = buildSessionUploadRoot(cwd, sid);
-        ensureSessionUploadRoot(uploadRoot);
-        const canonicalRoot = fs.realpathSync(uploadRoot);
-        const safe = resolveUploadTarget({ uploadRoot, workspaceRoot: cwd, relativePath: 'folder/notes.txt' });
-        assert.ok(safe, 'safe relative path resolves');
-        assert.equal(safe.relativePath, 'folder/notes.txt');
-        assert.equal(path.relative(canonicalRoot, safe.absolutePath), path.join('folder', 'notes.txt'));
-
-        const escape = resolveUploadTarget({ uploadRoot, workspaceRoot: cwd, relativePath: '../escape' });
-        assert.equal(escape, null);
-        const absoluteAttempt = resolveUploadTarget({ uploadRoot, workspaceRoot: cwd, relativePath: '/etc/passwd' });
-        assert.equal(absoluteAttempt, null);
-    } finally {
-        fs.rmSync(cwd, { recursive: true, force: true });
+test('direct upload paths accept normal paths and reject reserved or escaping segments', () => {
+    assert.equal(sanitizeUploadRelativePath('docs/report.pdf'), 'docs/report.pdf');
+    assert.equal(sanitizeUploadDirectoryPath('src/assets'), 'src/assets');
+    assert.equal(sanitizeUploadDirectoryPath(''), '');
+    for (const unsafe of ['/absolute', '../escape', 'a/../b', '.ploinky/x', 'node_modules/x', '.secrets', 'a/key.secrets']) {
+        assert.equal(sanitizeUploadRelativePath(unsafe), null, unsafe);
     }
 });
 
-test('resolveUploadTarget rejects symlink escapes outside the session upload root', () => {
-    const cwd = makeTempDir('webchat-symlink-cwd');
-    const outside = makeTempDir('webchat-symlink-outside');
+test('resolveUploadTarget returns cwd-relative and workspace-relative direct paths', () => {
+    const workspace = makeTempDir('webchat-direct-path');
+    const cwd = path.join(workspace, 'project');
+    fs.mkdirSync(cwd);
     try {
-        const sid = 'sessxyz';
-        const uploadRoot = buildSessionUploadRoot(cwd, sid);
-        ensureSessionUploadRoot(uploadRoot);
-        fs.writeFileSync(path.join(outside, 'leak.txt'), 'never');
-        try {
-            fs.symlinkSync(path.join(outside, 'leak.txt'), path.join(uploadRoot, 'leak.txt'));
-        } catch (err) {
-            if (err.code === 'EPERM' || err.code === 'EACCES') return;
-            throw err;
-        }
-        const resolved = resolveUploadTarget({
-            uploadRoot,
-            workspaceRoot: cwd,
-            relativePath: 'leak.txt',
-            allowMissingLeaf: false,
+        const target = resolveUploadTarget({
+            cwd,
+            workspaceRoot: workspace,
+            destinationPath: 'assets',
+            relativePath: 'docs/readme.md',
         });
-        assert.equal(resolved, null);
+        assert.ok(target);
+        assert.equal(target.relativePath, 'assets/docs/readme.md');
+        assert.equal(target.workspacePath, 'project/assets/docs/readme.md');
+        assert.equal(target.absolutePath, path.join(fs.realpathSync(cwd), 'assets', 'docs', 'readme.md'));
+        assert.equal(buildWorkspaceFileUrl(target.workspacePath), '/workspace-files/project/assets/docs/readme.md');
     } finally {
-        fs.rmSync(cwd, { recursive: true, force: true });
+        fs.rmSync(workspace, { recursive: true, force: true });
+    }
+});
+
+test('direct upload rejects a working directory inside reserved runtime state', () => {
+    const workspace = makeTempDir('webchat-reserved-base');
+    const cwd = path.join(workspace, '.ploinky', 'runtime');
+    fs.mkdirSync(cwd, { recursive: true });
+    try {
+        assert.equal(resolveUploadTarget({
+            cwd,
+            workspaceRoot: workspace,
+            relativePath: 'note.txt',
+        }), null);
+    } finally {
+        fs.rmSync(workspace, { recursive: true, force: true });
+    }
+});
+
+test('direct upload targets reject symlink components', (t) => {
+    const workspace = makeTempDir('webchat-direct-symlink');
+    const cwd = path.join(workspace, 'project');
+    const outside = makeTempDir('webchat-direct-outside');
+    fs.mkdirSync(cwd);
+    try {
+        try {
+            fs.symlinkSync(outside, path.join(cwd, 'linked'), 'dir');
+        } catch (error) {
+            if (error.code === 'EPERM' || error.code === 'EACCES') return t.skip('symlinks unavailable');
+            throw error;
+        }
+        assert.equal(resolveUploadTarget({
+            cwd,
+            workspaceRoot: workspace,
+            destinationPath: 'linked',
+            relativePath: 'escape.txt',
+        }), null);
+    } finally {
+        fs.rmSync(workspace, { recursive: true, force: true });
         fs.rmSync(outside, { recursive: true, force: true });
     }
 });
 
-test('ensureSessionUploadRoot rejects a symlinked uploads parent', () => {
-    const cwd = makeTempDir('webchat-upload-parent-cwd');
-    const outside = makeTempDir('webchat-upload-parent-outside');
+test('directory explorer lists folders first and hides runtime, dependency, secret, and symlink entries', (t) => {
+    const workspace = makeTempDir('webchat-directories');
+    const cwd = path.join(workspace, 'project');
+    fs.mkdirSync(cwd);
+    fs.mkdirSync(path.join(cwd, 'docs'));
+    fs.mkdirSync(path.join(cwd, '.git'));
+    fs.mkdirSync(path.join(cwd, '.ploinky'));
+    fs.mkdirSync(path.join(cwd, 'node_modules'));
+    fs.writeFileSync(path.join(cwd, 'readme.md'), '# readme');
+    fs.writeFileSync(path.join(cwd, '.secrets'), 'hidden');
     try {
         try {
-            fs.symlinkSync(outside, path.join(cwd, 'uploads'), 'dir');
-        } catch (err) {
-            if (err.code === 'EPERM' || err.code === 'EACCES') return;
-            throw err;
+            fs.symlinkSync(path.join(cwd, 'docs'), path.join(cwd, 'docs-link'), 'dir');
+        } catch (error) {
+            if (error.code !== 'EPERM' && error.code !== 'EACCES') throw error;
+            t.diagnostic('symlinks unavailable');
         }
-        const uploadRoot = buildSessionUploadRoot(cwd, 'sessionA');
-        assert.equal(ensureSessionUploadRoot(uploadRoot), false);
-        assert.equal(fs.existsSync(path.join(outside, 'sessionA')), false);
+        const listing = listWorkspaceDirectory({ cwd, workspaceRoot: workspace }, '');
+        assert.deepEqual(listing.entries.map(({ name, kind }) => ({ name, kind })), [
+            { name: '.git', kind: 'folder' },
+            { name: 'docs', kind: 'folder' },
+            { name: 'readme.md', kind: 'file' },
+        ]);
     } finally {
-        fs.rmSync(cwd, { recursive: true, force: true });
-        fs.rmSync(outside, { recursive: true, force: true });
+        fs.rmSync(workspace, { recursive: true, force: true });
     }
 });
 
-test('resolveUploadTarget rejects an upload root that realpaths outside the workspace', () => {
-    const cwd = makeTempDir('webchat-root-symlink-cwd');
-    const outside = makeTempDir('webchat-root-symlink-outside');
+test('directory creation endpoint creates a confined folder', async () => {
+    const workspace = makeTempDir('webchat-create-directory');
+    const cwd = path.join(workspace, 'project');
+    fs.mkdirSync(path.join(cwd, 'docs'), { recursive: true });
+    const context = { cwd, workspaceRoot: workspace };
     try {
-        fs.mkdirSync(path.join(outside, 'sessionA'), { recursive: true });
-        fs.writeFileSync(path.join(outside, 'sessionA', 'leak.txt'), 'outside');
-        try {
-            fs.symlinkSync(outside, path.join(cwd, 'uploads'), 'dir');
-        } catch (err) {
-            if (err.code === 'EPERM' || err.code === 'EACCES') return;
-            throw err;
-        }
-        const uploadRoot = buildSessionUploadRoot(cwd, 'sessionA');
-        const resolved = resolveUploadTarget({
-            uploadRoot,
-            workspaceRoot: cwd,
-            relativePath: 'leak.txt',
-            allowMissingLeaf: false,
-        });
-        assert.equal(resolved, null);
+        const req = makeRequest({ headers: { 'content-type': 'application/json' }, body: '{"path":"docs/new"}' });
+        const res = new MockResponse();
+        await handleWorkspaceDirectoriesPost(req, res, context);
+        await waitForResponse(res);
+        assert.equal(res.statusCode, 201);
+        assert.equal(res.bodyJson().path, 'docs/new');
+        assert.equal(resolveWorkspaceDirectory({ cwd, workspaceRoot: workspace, relativePath: 'docs/new' })?.relativePath, 'docs/new');
     } finally {
-        fs.rmSync(cwd, { recursive: true, force: true });
-        fs.rmSync(outside, { recursive: true, force: true });
+        fs.rmSync(workspace, { recursive: true, force: true });
     }
 });
 
-test('resolveNonCollidingTarget appends " (n)" suffix when leaf already exists', () => {
-    const cwd = makeTempDir('webchat-collision');
+test('directory creation rejects a missing parent instead of creating a hidden tree', async () => {
+    const workspace = makeTempDir('webchat-missing-parent');
+    const cwd = path.join(workspace, 'project');
+    fs.mkdirSync(cwd);
     try {
-        const sid = 'col1';
-        const uploadRoot = buildSessionUploadRoot(cwd, sid);
-        ensureSessionUploadRoot(uploadRoot);
-        fs.writeFileSync(path.join(uploadRoot, 'report.pdf'), 'a');
-        const first = resolveNonCollidingTarget({ uploadRoot, workspaceRoot: cwd, relativePath: 'report.pdf' });
-        assert.ok(first);
-        assert.equal(path.basename(first.absolutePath), 'report (1).pdf');
-        fs.writeFileSync(first.absolutePath, 'b');
-        const second = resolveNonCollidingTarget({ uploadRoot, workspaceRoot: cwd, relativePath: 'report.pdf' });
-        assert.ok(second);
-        assert.equal(path.basename(second.absolutePath), 'report (2).pdf');
-        const nested = resolveNonCollidingTarget({ uploadRoot, workspaceRoot: cwd, relativePath: 'folder/sub.pdf' });
-        assert.ok(nested);
-        assert.equal(nested.relativePath, 'folder/sub.pdf');
-        assert.equal(path.basename(nested.absolutePath), 'sub.pdf');
+        const req = makeRequest({ body: '{"path":"missing/new"}' });
+        const res = new MockResponse();
+        await handleWorkspaceDirectoriesPost(req, res, { cwd, workspaceRoot: workspace });
+        await waitForResponse(res);
+        assert.equal(res.statusCode, 400);
+        assert.equal(res.bodyJson().error, 'invalid_parent');
+        assert.equal(fs.existsSync(path.join(cwd, 'missing')), false);
     } finally {
-        fs.rmSync(cwd, { recursive: true, force: true });
+        fs.rmSync(workspace, { recursive: true, force: true });
     }
 });
 
-test('buildSessionRelativePath and buildCwdRelativePath return forward-slash relative paths', () => {
-    const cwd = makeTempDir('webchat-rel');
+test('upload writes directly to the selected destination without session folders or metadata', async () => {
+    const workspace = makeTempDir('webchat-direct-upload');
+    const cwd = path.join(workspace, 'project');
+    fs.mkdirSync(cwd);
+    const context = resolveWebchatUploadContext({ workspaceBase: { root: workspace, base: cwd } });
     try {
-        const sid = 'sessrel';
-        const uploadRoot = buildSessionUploadRoot(cwd, sid);
-        ensureSessionUploadRoot(uploadRoot);
-        const abs = path.join(uploadRoot, 'folder', 'notes.txt');
-        fs.mkdirSync(path.dirname(abs), { recursive: true });
-        fs.writeFileSync(abs, 'x');
-        assert.equal(buildSessionRelativePath(uploadRoot, abs), 'folder/notes.txt');
-        assert.equal(buildCwdRelativePath(cwd, abs), `uploads/${sid}/folder/notes.txt`);
-    } finally {
-        fs.rmSync(cwd, { recursive: true, force: true });
-    }
-});
-
-test('listWorkspaceSuggestions scoped to session upload root excludes sibling sessions and non-upload files', () => {
-    const cwd = makeTempDir('webchat-session-scope');
-    try {
-        const sidA = 'sessionA';
-        const sidB = 'sessionB';
-        const rootA = buildSessionUploadRoot(cwd, sidA);
-        const rootB = buildSessionUploadRoot(cwd, sidB);
-        ensureSessionUploadRoot(rootA);
-        ensureSessionUploadRoot(rootB);
-        fs.writeFileSync(path.join(rootA, 'in-session.md'), 'a');
-        fs.mkdirSync(path.join(rootA, 'folder'));
-        fs.writeFileSync(path.join(rootA, 'folder', 'nested.txt'), 'a');
-        fs.writeFileSync(path.join(rootB, 'sibling-secret.md'), 'b');
-        fs.writeFileSync(path.join(cwd, 'workspace-only.md'), 'c');
-
-        const result = listWorkspaceSuggestions({
-            workspaceRoot: rootA,
-            base: rootA,
-            folder: '',
-            leaf: '',
-            limit: 20,
-        });
-        assert.equal(result.ok, true);
-        const labels = result.items.map((entry) => entry.label).sort();
-        assert.deepEqual(labels, ['folder', 'in-session.md']);
-        assert.ok(!labels.includes('sibling-secret.md'));
-        assert.ok(!labels.includes('workspace-only.md'));
-    } finally {
-        fs.rmSync(cwd, { recursive: true, force: true });
-    }
-});
-
-test('webchat upload GET preserves MIME metadata written at POST time', async () => {
-    const cwd = makeTempDir('webchat-upload-mime');
-    try {
-        const sid = 'mimeSession';
-        const context = resolveWebchatUploadContext({
-            workspaceBase: { root: cwd, base: cwd },
-            sessionId: sid,
-        });
-        const parsedPost = new URL('/webchat/uploads', 'http://127.0.0.1');
-        const postReq = makeRequest({
-            method: 'POST',
-            headers: {
-                'x-file-name': 'note.md',
-                'x-relative-path': 'folder/note.md',
-                'x-mime-type': 'text/markdown',
-            },
+        const res = await upload(context, {
+            destination: 'incoming',
+            relativePath: 'docs/note.md',
             body: '# hello',
+            mime: 'text/markdown',
         });
-        const postRes = new MockResponse();
-        handleWebchatUploadPost(postReq, postRes, parsedPost, context);
-        await waitForResponse(postRes);
-
-        assert.equal(postRes.statusCode, 201);
-        const payload = JSON.parse(postRes.bodyText());
+        assert.equal(res.statusCode, 201);
+        const payload = res.bodyJson();
+        assert.equal(payload.localPath, 'incoming/docs/note.md');
+        assert.equal(payload.workspacePath, 'project/incoming/docs/note.md');
+        assert.equal(payload.downloadUrl, '/workspace-files/project/incoming/docs/note.md');
         assert.equal(payload.mime, 'text/markdown');
-        assert.equal(payload.relativePath, 'folder/note.md');
-        assert.equal(payload.localPath, `uploads/${sid}/folder/note.md`);
-
-        const parsedGet = new URL(`/webchat/uploads?path=${encodeURIComponent(payload.relativePath)}`, 'http://127.0.0.1');
-        const getReq = makeRequest({ method: 'GET', headers: {} });
-        const getRes = new MockResponse();
-        handleWebchatUploadGet(getReq, getRes, parsedGet, context);
-        await waitForResponse(getRes);
-
-        assert.equal(getRes.statusCode, 200);
-        assert.equal(getRes.headers['Content-Type'], 'text/markdown');
-        assert.equal(getRes.bodyText(), '# hello');
+        assert.equal(fs.readFileSync(path.join(cwd, payload.localPath), 'utf8'), '# hello');
+        assert.equal(fs.existsSync(path.join(cwd, 'uploads')), false);
+        assert.equal(fs.readdirSync(path.dirname(path.join(cwd, payload.localPath))).some((name) => name.includes('.webchat-upload-')), false);
     } finally {
-        fs.rmSync(cwd, { recursive: true, force: true });
+        fs.rmSync(workspace, { recursive: true, force: true });
     }
 });
 
-test('listWorkspaceSuggestions scoped to session upload root rejects symlink escapes to a sibling session', () => {
-    const cwd = makeTempDir('webchat-session-symlink');
+test('upload refuses collisions until overwrite is explicitly confirmed', async () => {
+    const workspace = makeTempDir('webchat-direct-overwrite');
+    const cwd = path.join(workspace, 'project');
+    fs.mkdirSync(path.join(cwd, 'docs'), { recursive: true });
+    fs.writeFileSync(path.join(cwd, 'docs', 'note.txt'), 'old');
+    const context = resolveWebchatUploadContext({ workspaceBase: { root: workspace, base: cwd } });
     try {
-        const sidA = 'sessionA';
-        const sidB = 'sessionB';
-        const rootA = buildSessionUploadRoot(cwd, sidA);
-        const rootB = buildSessionUploadRoot(cwd, sidB);
-        ensureSessionUploadRoot(rootA);
-        ensureSessionUploadRoot(rootB);
-        fs.writeFileSync(path.join(rootB, 'private.txt'), 'shh');
-        try {
-            fs.symlinkSync(path.join(rootB, 'private.txt'), path.join(rootA, 'sibling-escape'));
-        } catch (err) {
-            if (err.code === 'EPERM' || err.code === 'EACCES') return;
-            throw err;
-        }
-        const result = listWorkspaceSuggestions({
-            workspaceRoot: rootA,
-            base: rootA,
-            folder: '',
-            leaf: '',
-            limit: 20,
+        const blocked = await upload(context, { destination: 'docs', relativePath: 'note.txt', body: 'new' });
+        assert.equal(blocked.statusCode, 409);
+        assert.equal(blocked.bodyJson().error, 'target_exists');
+        assert.equal(fs.readFileSync(path.join(cwd, 'docs', 'note.txt'), 'utf8'), 'old');
+
+        const replaced = await upload(context, {
+            destination: 'docs',
+            relativePath: 'note.txt',
+            body: 'new',
+            overwrite: true,
         });
-        const labels = result.items.map((entry) => entry.label);
-        assert.ok(!labels.includes('sibling-escape'), 'must drop symlink escapes to other sessions');
+        assert.equal(replaced.statusCode, 201);
+        assert.equal(fs.readFileSync(path.join(cwd, 'docs', 'note.txt'), 'utf8'), 'new');
     } finally {
-        fs.rmSync(cwd, { recursive: true, force: true });
+        fs.rmSync(workspace, { recursive: true, force: true });
+    }
+});
+
+test('confirmed folder upload merges files and preserves unrelated destination content', async () => {
+    const workspace = makeTempDir('webchat-folder-merge');
+    const cwd = path.join(workspace, 'project');
+    fs.mkdirSync(path.join(cwd, 'target', 'docs'), { recursive: true });
+    fs.writeFileSync(path.join(cwd, 'target', 'docs', 'keep.txt'), 'keep');
+    fs.writeFileSync(path.join(cwd, 'target', 'docs', 'replace.txt'), 'old');
+    const context = resolveWebchatUploadContext({ workspaceBase: { root: workspace, base: cwd } });
+    try {
+        const replaced = await upload(context, {
+            destination: 'target',
+            relativePath: 'docs/replace.txt',
+            body: 'new',
+            overwrite: true,
+        });
+        const added = await upload(context, {
+            destination: 'target',
+            relativePath: 'docs/added.txt',
+            body: 'added',
+            overwrite: true,
+        });
+        assert.equal(replaced.statusCode, 201);
+        assert.equal(added.statusCode, 201);
+        assert.equal(fs.readFileSync(path.join(cwd, 'target', 'docs', 'replace.txt'), 'utf8'), 'new');
+        assert.equal(fs.readFileSync(path.join(cwd, 'target', 'docs', 'added.txt'), 'utf8'), 'added');
+        assert.equal(fs.readFileSync(path.join(cwd, 'target', 'docs', 'keep.txt'), 'utf8'), 'keep');
+    } finally {
+        fs.rmSync(workspace, { recursive: true, force: true });
+    }
+});
+
+test('upload rejects file-versus-folder conflicts even with overwrite enabled', async () => {
+    const workspace = makeTempDir('webchat-type-conflict');
+    const cwd = path.join(workspace, 'project');
+    fs.mkdirSync(path.join(cwd, 'existing'), { recursive: true });
+    const context = resolveWebchatUploadContext({ workspaceBase: { root: workspace, base: cwd } });
+    try {
+        const response = await upload(context, { relativePath: 'existing', overwrite: true });
+        assert.equal(response.statusCode, 409);
+        assert.equal(response.bodyJson().error, 'target_type_conflict');
+    } finally {
+        fs.rmSync(workspace, { recursive: true, force: true });
+    }
+});
+
+test('aborted uploads leave neither a target nor a temporary sibling', async () => {
+    const workspace = makeTempDir('webchat-aborted-upload');
+    const cwd = path.join(workspace, 'project');
+    fs.mkdirSync(cwd);
+    const context = resolveWebchatUploadContext({ workspaceBase: { root: workspace, base: cwd } });
+    try {
+        const req = new PassThrough();
+        req.method = 'POST';
+        req.headers = {
+            'x-file-name': 'partial.txt',
+            'x-relative-path': 'partial.txt',
+            'x-destination-path': '',
+        };
+        const res = new MockResponse();
+        handleWebchatUploadPost(req, res, new URL('/webchat/uploads', 'http://localhost'), context);
+        req.write('partial');
+        req.emit('aborted');
+        await new Promise((resolve) => setTimeout(resolve, 20));
+
+        assert.equal(fs.existsSync(path.join(cwd, 'partial.txt')), false);
+        assert.equal(fs.readdirSync(cwd).some((name) => name.includes('.webchat-upload-')), false);
+    } finally {
+        fs.rmSync(workspace, { recursive: true, force: true });
     }
 });

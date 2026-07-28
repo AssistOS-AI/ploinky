@@ -116,19 +116,27 @@ function buildDefaultLocalAuthVars(routeKey) {
     };
 }
 
-export function verifyEnabledAgentStarted(shortAgentName, containerName, {
+export function verifyEnabledAgentStarted(shortAgentName, runtimeInstanceName, {
+    runtime = 'container',
     isRunning = isContainerRunning,
     waitRunning = waitForContainerRunning,
+    isSandboxRunning = isBwrapProcessRunning,
     log = console.log
 } = {}) {
-    if (!containerName) {
-        throw new Error(`enable agent: failed to start '${shortAgentName}': no container was returned.`);
+    if (!runtimeInstanceName) {
+        throw new Error(`enable agent: failed to start '${shortAgentName}': no runtime instance was returned.`);
     }
-    const running = isRunning(containerName) || waitRunning(containerName, 40, 250);
+    const sandboxRuntime = runtime === 'bwrap' || runtime === 'seatbelt';
+    const running = sandboxRuntime
+        ? isSandboxRunning(runtimeInstanceName)
+        : isRunning(runtimeInstanceName) || waitRunning(runtimeInstanceName, 40, 250);
     if (!running) {
-        throw new Error(`enable agent: failed to start '${shortAgentName}': container '${containerName}' exited during startup. Check container logs for details.`);
+        const details = sandboxRuntime
+            ? `${runtime} process '${shortAgentName}' exited during startup. Check sandbox logs for details.`
+            : `container '${runtimeInstanceName}' exited during startup. Check container logs for details.`;
+        throw new Error(`enable agent: failed to start '${shortAgentName}': ${details}`);
     }
-    log(`Agent '${shortAgentName}' started successfully in container '${containerName}'.`);
+    log(`Agent '${shortAgentName}' started successfully with ${runtime} runtime '${runtimeInstanceName}'.`);
 }
 
 async function waitForEnabledAgentReadiness(shortAgentName, manifest, started, {
@@ -698,7 +706,9 @@ export async function enableAgent(agentName, mode, repoNameParam, aliasParam, au
             preparationLease: prepared.preparedGeneration?.preparationLease,
             preparedHostModeCapability: plan.preparedHostModeCapability,
         });
-        verifyEnabledAgentStarted(shortAgentName, started?.containerName || containerName);
+        verifyEnabledAgentStarted(shortAgentName, started?.containerName || containerName, {
+            runtime: started?.runtime || started?.registryRecord?.runtime || 'container',
+        });
         await waitForEnabledAgentReadiness(shortAgentName, manifest, started, {
             networkMode: profileResolution.network.mode,
             generationDigest: prepared.preparedGeneration?.preparationLease?.preparedGeneration || '',

@@ -206,7 +206,19 @@ Host sandbox teardown must be batch-oriented when multiple sandboxed agents are 
 
 A core `destroy` entered in the REPL must remove workspace agent runtimes and regenerated runtime caches, including `.ploinky/deps`, but it must not remove agent homes under `.data/<agent-or-alias>/` or the containing outer runtime. Starting the workspace afterward must recreate agent runtimes and dependency caches while remounting the preserved `.data` directory at `/root` for each agent. Host `ploinky destroy` is a separate supervisor operation: after exact-instance confirmation it directly removes only the outer container and its attached anonymous volumes; the workspace, nested-container-storage, and outer dependency named volumes remain for recreation.
 
+Runtime lifecycle checks must dispatch by the actual backend recorded in `.ploinky/agents.json`. Enable-time verification checks container liveness only for Docker or Podman and checks the tracked agent PID for Bubblewrap or Seatbelt. Disable-time teardown may remove registry entries first to prevent watchdog resurrection, but it must carry a snapshot of those records into the fleet remover so backend identity remains available after the registry write.
+
+Runtime reporting must use the same backend-aware state model. Marketplace and CLI status surfaces must report every enabled agent from `.ploinky/agents.json`, identify its recorded runtime, and determine liveness from the tracked process PID for Bubblewrap or Seatbelt and from OCI inspection for Docker or Podman. An enabled runtime with no live process or container must remain visible as `stopped`; host-sandbox agents must not be classified as stopped merely because no OCI container exists.
+
+The Linux Bubblewrap backend must keep the selected project path separate from the persistent agent home. It must bind `.data/<agent-or-alias>/` read-write at `/root`, set `HOME=/root`, and use the alias when one identifies the enabled instance. Isolated mode must use `/root` for both the project mount and `WORKSPACE_PATH`; global and development modes must bind their selected project independently and keep `WORKSPACE_PATH` at that project path. Daemon startup and interactive CLI or shell attachment must use the same home and project mapping.
+
+Before Bubblewrap mounts the shared Agent runtime read-only at `/Agent`, Ploinky must stage a regenerated copy under `.ploinky/deps/bwrap-runtime/<agent-or-alias>/`. The staged copy must exclude source `Agent/node_modules` content and must contain an empty `node_modules` directory that exists before sandbox construction. The prepared dependency cache must then be mounted read-only at both `/code/node_modules` and `/Agent/node_modules`. Bubblewrap startup must not depend on modifying the installed Ploinky source tree to create this nested mount point.
+
+The Linux Bubblewrap backend must execute the agent with the same Node.js distribution that launched Ploinky and determined the sandbox dependency-cache runtime key. It must expose that distribution read-only at `/opt/ploinky-node`, place `/opt/ploinky-node/bin` first in `PATH`, and keep the system Node installation as a lower-priority fallback. Manifest install hooks may use the mounted `npm`, but neither the Node distribution nor the prepared dependency cache may become writable inside the sandbox.
+
 Each agent execution environment must expose the shared `Agent/` payload at `/Agent` for container backends or the equivalent runtime location for sandbox backends. If a manifest does not provide an explicit agent command, the runtime must fall back to `Agent/server/AgentServer.sh`, which supervises `AgentServer.mjs` and restarts it after exit.
+
+Non-TTY `ploinky cli` launchers used by WebChat must remain attached only while their inner container or host-sandbox CLI process is alive. The selected backend's interactive exit status must propagate through `runCli`, and the one-shot Ploinky wrapper must terminate after attach returns. This lets the supervising WebChat TTY observe the real lifecycle instead of retaining a live wrapper with no agent process behind it.
 
 Code and skills mounts must be profile-aware. The persisted active profile defaults to `default`; both `default` and `dev` make code and skills writable unless overridden. In `qa` and `prod`, code and skills default to read-only unless the profile explicitly relaxes them. The profile merge order is `profiles.default` plus the selected profile overlay. Workspace-root write access must not bypass read-only code, dependency-cache, staged Agent library, or protected Ploinky state paths. The managed host start path always forwards an explicit selection—`default` when omitted—while a core start entered inside the REPL without `--profile` may retain the persisted profile.
 
@@ -265,13 +277,13 @@ slot and prevents localhost provenance from becoming authorization.
 Response:
 `stop`, `shutdown`, and `destroy` are workspace-level lifecycle operations. If Ploinky waited for each `bwrap` or Seatbelt process before signaling the next one, one stuck agent could keep the rest of the workspace running for the full timeout. Batch signaling gives every selected sandbox the same shutdown window and keeps the total wait bounded by one shared deadline.
 
-### Question #6: Why is an older outer runtime not replaced automatically?
+### Question #6: Why is an incompatible outer runtime not replaced automatically?
 
 Response:
-Contract 6 removes the prior publication model and credential ownership. An
+An incompatible runtime may use a retired publication model or credential ownership. An
 automatic replacement would be a migration and could activate a different host
 boundary before the operator revoked old credentials and removed plaintext
-state. The supervisor therefore rejects every non-contract-6 box and requires
+state. The supervisor therefore rejects incompatible identity or configuration and requires
 explicit destroy and recreate while retaining named volumes.
 
 ### Question #7: Why must read-only and host-hook-only declarations be enforced by every backend?
@@ -292,6 +304,36 @@ instance-and-enable-generation assertion with method, path, body, expiry, and
 replay binding. Outside a marked Box, the listener retains the exact
 loopback/managed-address bind model. This resolves the rootless transport gap
 without adding an outer mapping, compatibility proxy, or firewall dependency.
+
+### Question #9: Why must a non-TTY CLI wrapper terminate when its inner attach ends?
+
+Response:
+WebChat supervises the Ploinky wrapper process and cannot otherwise observe that a nested `podman exec`, Bubblewrap, or Seatbelt CLI has ended. Propagating the attach status and terminating the one-shot wrapper turns the existing process-close signal into an accurate runtime-health signal, allowing WebChat to restart or replace the selected CLI without introducing an agent-specific heartbeat.
+
+### Question #10: Why does Bubblewrap expose the agent home at `/root` instead of using the project path as `HOME`?
+
+Response:
+The project path determines which files an agent is allowed to work on, while the home stores per-instance authentication, provider configuration, caches, and continuation state. Keeping those paths separate gives Bubblewrap the same persistent-home contract as container runtimes, prevents global and development agents from placing CLI configuration in their project roots, and lets an aliased instance retain independent state across runtime recreation.
+
+### Question #11: Why does Bubblewrap stage the Agent runtime before mounting it read-only?
+
+Response:
+Bubblewrap resolves nested bind destinations sequentially. Once `/Agent` is a read-only bind, it cannot create a missing `/Agent/node_modules` directory for the dependency-cache bind. A regenerated staging copy provides that empty mount point in advance without requiring the installed Ploinky source tree to be writable, while the actual dependency cache remains a separate read-only mount.
+
+### Question #12: Why does Bubblewrap mount Ploinky's Node.js distribution instead of using `/usr/bin/node`?
+
+Response:
+The dependency cache runtime key is derived from the Node.js process that runs Ploinky. Selecting a different system Node inside Bubblewrap can execute a cache prepared for another Node major and can expose an incomplete npm installation. Mounting the same distribution read-only keeps Node, npm, and the cache ABI aligned without granting the agent write access to the host toolchain.
+
+### Question #13: Why does disable retain a registry snapshot after deleting the live entry?
+
+Response:
+Deleting the entry first prevents the watchdog from interpreting teardown as an unexpected crash and immediately restarting the agent. The removed record still contains the only reliable backend discriminator, so passing an in-memory snapshot to teardown preserves that identity without making the agent enabled again. This lets the same disable path stop an OCI container or a host-sandbox PID correctly.
+
+### Question #14: Why do Marketplace and CLI status share one runtime-state collector?
+
+Response:
+An enabled-agent record names the selected backend, while backend-specific mechanisms provide liveness. Sharing one collector prevents an API from treating Bubblewrap or Seatbelt as an absent container while another CLI path correctly recognizes its PID, and it preserves stopped enabled entries for operational diagnosis.
 
 ## Conclusion
 

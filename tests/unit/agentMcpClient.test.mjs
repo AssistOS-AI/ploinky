@@ -334,3 +334,19 @@ test('task observer status callbacks stay pinned to the client router', async (t
     assert.equal(firstRouterGets, 1);
     assert.equal(secondRouterRequests, 0);
 });
+
+test('cancelTask sends a request-bound agent assertion through the router', async (t) => {
+    let captured = null;
+    await withCaptureServer(t, (req, body, res) => {
+        captured = { method: req.method, url: req.url, headers: req.headers, body: body.toString('utf8') };
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ task: { id: 'remote-1', status: 'cancelling' } }));
+    });
+    const client = await createAgentClient('asyncAgent');
+    const task = await client.cancelTask('remote-1');
+    assert.equal(task.status, 'cancelling');
+    assert.equal(captured.method, 'POST');
+    assert.equal(captured.url, '/asyncAgent/task/cancel');
+    assert.deepEqual(JSON.parse(captured.body), { taskId: 'remote-1' });
+    assert.match(captured.headers.authorization, /^Bearer /);
+});

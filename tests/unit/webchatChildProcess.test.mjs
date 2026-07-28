@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { buildWebchatSessionEnv, createLocalTTYFactory } from '../../cli/server/webchat/tty.js';
+import { createLocalTTYFactory } from '../../cli/server/webchat/tty.js';
 
 // global.processKill is normally installed by RoutingServer; provide a no-op so
 // the handle's kill()/dispose() paths don't throw when run in isolation.
@@ -13,14 +13,7 @@ function makeSession(command, sessionContext = {}) {
     return factory.create({ username: 'guest', id: 'guest', roles: ['guest'] }, sessionContext);
 }
 
-test('webchat child_process: history state is exposed through env', async () => {
-    assert.deepEqual(buildWebchatSessionEnv({ hasHistory: true }), {
-        PLOINKY_WEBCHAT_HAS_HISTORY: '1'
-    });
-    assert.deepEqual(buildWebchatSessionEnv({ hasHistory: false }), {
-        PLOINKY_WEBCHAT_HAS_HISTORY: '0'
-    });
-
+test('webchat child_process: Ploinky session env is not exposed to the agent', async () => {
     const previousUnrelatedValue = process.env.PLOINKY_WEBCHAT_UNRELATED;
     process.env.PLOINKY_WEBCHAT_UNRELATED = 'must-not-be-forwarded';
     const session = makeSession(
@@ -34,7 +27,7 @@ test('webchat child_process: history state is exposed through env', async () => 
         session.onOutput((data) => chunks.push(data));
         session.onClose(resolve);
     });
-    assert.match(chunks.join(''), /^HISTORY=1\|UNRELATED=unset$/m);
+    assert.match(chunks.join(''), /^HISTORY=\|UNRELATED=unset$/m);
 });
 
 test('webchat child_process: output is delivered as a string, not a Buffer', async () => {
@@ -61,6 +54,9 @@ test('webchat child_process: close fires after the child exits', async () => {
 test('webchat child_process: handle exposes a numeric pid and no resize method', () => {
     const session = makeSession("sh -c 'sleep 0.2'");
     assert.equal(typeof session.pid, 'number');
+    assert.equal(session.isAlive(), true);
     assert.equal(session.resize, undefined, 'resize() must be removed (PTY-only, unused)');
     session.dispose();
+    assert.equal(session.isAlive(), false);
+    assert.equal(session.write('ignored\n'), false);
 });

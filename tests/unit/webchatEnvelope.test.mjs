@@ -79,6 +79,25 @@ test('serializeWebchatEnvelopeForAgent does not name a concrete downstream agent
     assert.doesNotMatch(text, /concreteDownstreamAgent|concrete_downstream_tool/);
 });
 
+test('serializeWebchatEnvelopeForAgent leaves history ownership to AchillesCLI', () => {
+    const payload = JSON.parse(serializeWebchatEnvelopeForAgent({
+        req: { headers: { host: '127.0.0.1:8080' } },
+        effectiveConfig: { agentName: '' },
+        tabId: 'tab-1',
+        envelope: {
+            text: 'Current question',
+            history: [
+                { role: 'user', message: 'Earlier question' },
+                { role: 'assistant', message: 'Earlier answer' },
+            ],
+        },
+    }));
+
+    assert.equal(payload.text, 'Current question');
+    assert.equal(payload.history, undefined);
+    assert.doesNotMatch(JSON.stringify(payload), /Ploinky conversation context|New user message/);
+});
+
 test('serializeWebchatEnvelopeForAgent prefers forwarded public origin headers', () => {
     const text = serializeWebchatEnvelopeForAgent({
         req: {

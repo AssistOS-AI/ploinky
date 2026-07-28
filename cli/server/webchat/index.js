@@ -11,6 +11,9 @@ import { createAutocompleteState } from './autocompleteState.js';
 import { createComposerMentionHighlighter } from './composerMentionHighlights.js';
 import { createSessionController } from './sessions.js';
 import { createTaskController } from './tasks.js';
+import { createInteractionPrompt } from './interactionPrompt.js';
+import { createWorkspaceFileIndex } from './workspaceFileIndex.js';
+import { createHeaderMenu, createResponsiveHeaderActions } from './headerMenu.js';
 
 const PURGE_TRIGGER_RE = /\bpurge\b/i;
 const EDITABLE_TAGS = ['INPUT', 'TEXTAREA', 'SELECT', 'OPTION'];
@@ -21,6 +24,7 @@ const {
     dlog,
     markdown,
     basePath,
+    workspaceBase,
     toEndpoint,
     showBanner,
     hideBanner,
@@ -44,6 +48,10 @@ const {
     cmdInput,
     sendBtn,
     settingsBtn,
+    headerActions,
+    settingsPanel,
+    settingsMobileActions,
+    settingsActionSlot,
     logoutBtn,
     attachmentBtn,
     attachmentMenu,
@@ -67,8 +75,19 @@ const {
     tasksDialogClose,
     tasksList,
     taskDetail,
-    taskToast
+    taskToast,
+    taskToastText,
+    taskToastClose,
+    interactionPrompt,
+    interactionPromptTitle,
+    interactionPromptMessage,
+    interactionPromptDetail,
+    interactionPromptOptions
 } = elements;
+
+const workspaceFileIndex = createWorkspaceFileIndex();
+
+let network = null;
 
 const sidePanelApi = createSidePanel({
     chatContainer,
@@ -78,12 +97,21 @@ const sidePanelApi = createSidePanel({
     sidePanelClose,
     sidePanelTitle,
     sidePanelResizer
-}, { markdown });
+}, {
+    markdown,
+    workspaceBase,
+    webchatBasePath: basePath,
+    workspaceFileIndex,
+    sendQuickCommand: (command) => network?.sendQuickCommand(command) || false,
+});
 
 let sessionController = null;
 let taskController = null;
+let interactionController = null;
+let composerAutocomplete = null;
 taskController = createTaskController({
     toEndpoint,
+    sendQuickCommand: (command) => network?.sendQuickCommand(command) || false,
     elements: {
         tasksBtn,
         tasksBadge,
@@ -92,6 +120,8 @@ taskController = createTaskController({
         tasksList,
         taskDetail,
         taskToast,
+        taskToastText,
+        taskToastClose,
     },
     showBanner,
 });
@@ -102,6 +132,9 @@ const messages = createMessages({
     historyGate
 }, {
     markdown,
+    workspaceBase,
+    webchatBasePath: basePath,
+    workspaceFileIndex,
     initialViewMoreLineLimit: getViewMoreLineLimit(),
     sidePanel: sidePanelApi,
     taskController,
@@ -118,7 +151,7 @@ dom.setViewMoreChangeHandler((limit) => {
 sidePanelApi.bindLinkDelegation(chatList);
 
 dlog('Initializing network for agent:', dom.agentName);
-const network = createNetwork({
+network = createNetwork({
     TAB_ID,
     toEndpoint,
     dlog,
@@ -136,18 +169,27 @@ const network = createNetwork({
     hideTypingIndicator: messages.hideTypingIndicator,
     markUserInputSent: messages.markUserInputSent,
     addRemoteUserMessage: (message, payload) => sessionController?.addRemoteUserMessage(message, payload),
-    onSessionChanged: (session) => sessionController?.handleExternalSessionChange(session),
-    onTaskUpdate: (payload) => {
+    onSessionState: (payload) => sessionController?.handleSessionState(payload),
+    onTaskUpdate: (payload, { visibleCommand = '' } = {}) => {
         taskController?.handleUpdate(payload);
         sidePanelApi.postTaskUpdate(payload);
         messages.associateTask(payload);
+        if (payload?.event === 'list' && /^\/tasks(?:\s|$)/.test(visibleCommand)) {
+            taskController?.open({ refresh: false });
+        }
     },
     onRuntimeState: (state) => dom.setRuntimeModel(state?.model),
+    onWorkspaceFiles: (update) => {
+        if (!workspaceFileIndex.applyUpdate(update)) return;
+        messages.refreshWorkspaceFileLinks();
+        sidePanelApi.refreshWorkspaceFileLinks();
+    },
+    onInteractionRequest: (interaction) => interactionController?.show(interaction),
+    onInteractionResolved: (resolution) => interactionController?.resolve(resolution),
     onConnected: () => taskController?.refresh().catch(() => {})
 });
 
 sessionController = createSessionController({
-    toEndpoint,
     elements: {
         sessionsBtn,
         historyGate,
@@ -170,6 +212,21 @@ const composer = createComposer({
     purgeTriggerRe: PURGE_TRIGGER_RE
 });
 
+interactionController = createInteractionPrompt({
+    root: interactionPrompt,
+    title: interactionPromptTitle,
+    message: interactionPromptMessage,
+    detail: interactionPromptDetail,
+    options: interactionPromptOptions,
+}, {
+    onSubmit: (interactionId, optionId) => network.sendInteractionResponse(interactionId, optionId),
+    onActiveChange: (active) => {
+        composer.setInteractionState(active);
+        attachmentBtn?.toggleAttribute?.('disabled', active);
+        if (active) composerAutocomplete?.hide?.();
+    },
+});
+
 const autocompleteState = createAutocompleteState();
 const mentionHighlighter = createComposerMentionHighlighter({ cmdInput });
 
@@ -184,7 +241,7 @@ const workspacePathsProvider = createWorkspacePathsProvider({
     dlog
 });
 
-const composerAutocomplete = createComposerAutocomplete({
+composerAutocomplete = createComposerAutocomplete({
     cmdInput
 }, {
     providers: [slashProvider, workspacePathsProvider],
@@ -217,7 +274,7 @@ const uploader = createUploader({
     folderUploadInput,
     filePreviewContainer,
     attachmentContainer
-}, { composer });
+}, { composer, toEndpoint });
 
 function refocusComposerAfterIcon(btn) {
     if (!btn) {
@@ -532,8 +589,14 @@ function initMessageToolbar() {
 }
 
 refocusComposerAfterIcon(attachmentBtn);
-refocusComposerAfterIcon(settingsBtn);
 initMessageToolbar();
+createHeaderMenu({ button: settingsBtn, panel: settingsPanel });
+createResponsiveHeaderActions({
+    actions: [tasksBtn, sessionsBtn, logoutBtn],
+    desktopContainer: headerActions,
+    mobileContainer: settingsActionSlot,
+    mobileSection: settingsMobileActions,
+});
 
 function resolveLogoutRedirect(payload) {
     const redirect = typeof payload?.redirect === 'string' ? payload.redirect.trim() : '';
@@ -644,13 +707,8 @@ document.addEventListener('keydown', (event) => {
     }
 });
 
-(async () => {
-    try {
-        await sessionController.bootstrap();
-    } catch (error) {
-        showBanner(`Session initialization failed: ${error.message}`, 'err');
-        return;
-    }
+(() => {
+    sessionController.bootstrap();
     composerAutocomplete.refresh();
     network.start();
 })();

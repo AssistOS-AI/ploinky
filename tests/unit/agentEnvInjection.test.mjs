@@ -32,6 +32,24 @@ function envForAgent(repoName, agentName) {
     return buildFullEnvMap(agentName, {}, {}, workDir, repoName, 'dev', 'bwrap', null, routerEndpoint);
 }
 
+test('bwrap keeps the selected workspace separate from the persistent /root home', () => {
+    const workspacePath = path.join(tempDir, 'workspace');
+    const env = buildFullEnvMap(
+        'codexAgent',
+        {},
+        {},
+        workspacePath,
+        'AchillesCLI',
+        'dev',
+        'bwrap',
+        null,
+        routerEndpoint,
+    );
+    assert.equal(env.WORKSPACE_PATH, workspacePath);
+    assert.equal(env.HOME, '/root');
+    assert.match(env.PATH, /^\/opt\/ploinky-node\/bin:/);
+});
+
 test('injected env carries PLOINKY_AGENT_ID + PLOINKY_AGENT_SECRET = the canonical per-agent values', () => {
     const env = envForAgent('AssistOSExplorer', 'dpuAgent');
     const principal = deriveAgentPrincipalId('AssistOSExplorer', 'dpuAgent');

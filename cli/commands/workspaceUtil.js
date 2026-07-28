@@ -58,8 +58,8 @@ import {
 } from '../sandbox/edgeGeneration.js';
 import { applyEdgeRoutingGeneration } from '../sandbox/coordinatedEdgeApply.js';
 import {
+  finalizeStartupRoutes,
   partitionAdditionalStartupAgents,
-  removeInactiveManualRoutes,
   resolveManifestStartup,
 } from '../utils/runtime/manifestStartup.js';
 import {
@@ -1685,10 +1685,11 @@ async function startWorkspace(staticAgentArg, portArg, {
     });
     if (additionalStartup.inactiveManual.length) {
       cfg = await mergeRoutingConfig((current) => {
-        const routes = removeInactiveManualRoutes({
-          ...(current.routes || {}),
-          ...(cfg.routes || {}),
-        }, additionalStartup.inactiveManual);
+        const routes = finalizeStartupRoutes(
+          cfg.routes,
+          current.routes,
+          additionalStartup.inactiveManual,
+        );
         return {
           ...current,
           ...cfg,
@@ -1953,6 +1954,7 @@ export async function runCliWithDependencies(agentName, args, dependencies) {
   const registryEntry = agents[containerName] || {};
   const actualRuntime = registryEntry.runtime;
 
+  let exitCode = 0;
   if (!suppressLauncherLogs) {
     const identity = resolveAgentAttachmentIdentity(
       shortAgentName,
@@ -1967,20 +1969,21 @@ export async function runCliWithDependencies(agentName, args, dependencies) {
   if (actualRuntime === 'bwrap') {
     const attach = attachBwrapInteractive
       || (await import('../sandbox/bwrap/bwrapServiceManager.js')).attachBwrapInteractive;
-    withSuspendedInput(() => {
-      attach(shortAgentName, manifest, agentDir, projectPath, cmd, { containerName, routerEndpoint });
+    exitCode = withSuspendedInput(() => {
+      return attach(shortAgentName, manifest, agentDir, projectPath, cmd, { containerName, routerEndpoint });
     });
   } else if (actualRuntime === 'seatbelt') {
     const attach = attachSeatbeltInteractive
       || (await import('../sandbox/seatbelt/seatbeltServiceManager.js')).attachSeatbeltInteractive;
-    withSuspendedInput(() => {
-      attach(shortAgentName, manifest, agentDir, projectPath, cmd, { containerName, routerEndpoint });
+    exitCode = withSuspendedInput(() => {
+      return attach(shortAgentName, manifest, agentDir, projectPath, cmd, { containerName, routerEndpoint });
     });
   } else {
-    withSuspendedInput(() => {
-      attachInteractive(containerName, projectPath, cmd);
+    exitCode = withSuspendedInput(() => {
+      return attachInteractive(containerName, projectPath, cmd);
     });
   }
+  return Number.isInteger(exitCode) ? exitCode : 0;
 }
 
 async function runCli(agentName, args) {

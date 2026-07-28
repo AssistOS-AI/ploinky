@@ -1,10 +1,5 @@
 import crypto from 'crypto';
 
-import {
-    appendSessionTurn,
-    ensureCurrentSession,
-    formatContinuationContext
-} from '../../webchat/sessionStore.js';
 import { getSession } from './browserSession.js';
 import {
     parseInputEnvelope,
@@ -12,15 +7,46 @@ import {
     shouldForwardWebchatEnvelope
 } from './messageEnvelope.js';
 import {
-    broadcastWorkspaceRuntimeEvent,
     buildRuntimeKey,
     disposeTab,
     getRuntimeMap,
     scheduleDisconnectedTabCleanup,
     routeWorkspaceRuntimeOutput,
+    serializeInteractionRequestSseEvent,
+    serializeInteractionResolvedSseEvent,
     serializeRuntimeStateSseEvent,
+    serializeSessionStateSseEvent,
+    serializeTaskListSseEvent,
+    serializeWorkspaceFilesSseEvent,
     writeOrBufferSseEvent
 } from './runtimeState.js';
+
+const MAX_INTERACTION_RESPONSE_BYTES = 16 * 1024;
+const INTERACTION_TOKEN_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+
+function isRuntimeWritable(tab) {
+    if (!tab?.tty) return false;
+    try {
+        return typeof tab.tty.isAlive !== 'function' || tab.tty.isAlive();
+    } catch (_) {
+        return false;
+    }
+}
+
+function writeRuntimeInput(tab, data) {
+    if (!isRuntimeWritable(tab)) return false;
+    try {
+        return tab.tty.write(data) !== false;
+    } catch (_) {
+        return false;
+    }
+}
+
+function disposeUnavailableRuntime(tab, runtimeKey, runtimes) {
+    if (!tab) return;
+    tab.ttyClosed = true;
+    disposeTab(tab, runtimeKey, { runtimes });
+}
 
 export function handleRuntimeRoute({
     pathname,
@@ -37,15 +63,14 @@ export function handleRuntimeRoute({
         const tabId = String(parsedUrl.searchParams.get('tabId') || '').trim();
         if (!sid || !tabId) { res.writeHead(400); return res.end(); }
 
-        let currentSession;
-        try {
-            currentSession = ensureCurrentSession(workspaceDirectory);
-        } catch (_) {
-            res.writeHead(500); return res.end('Session store unavailable.');
-        }
         const runtimes = getRuntimeMap(appState);
-        const runtimeKey = buildRuntimeKey(workspaceDirectory, currentSession.sessionId, effectiveConfig, agentQuery);
+        const runtimeKey = buildRuntimeKey(workspaceDirectory, effectiveConfig, agentQuery);
         let tab = runtimes.get(runtimeKey);
+
+        if (tab && !isRuntimeWritable(tab)) {
+            disposeUnavailableRuntime(tab, runtimeKey, runtimes);
+            tab = null;
+        }
 
         if (!tab && runtimes.size >= 20) {
             res.writeHead(503, { 'Content-Type': 'text/plain', 'Retry-After': '30' });
@@ -65,9 +90,7 @@ export function handleRuntimeRoute({
                     roles: req.user.roles || [],
                     sessionId: req.sessionId || null
                 } : null;
-                const tty = effectiveConfig.ttyFactory.create(ssoUser, {
-                    hasHistory: currentSession.messages.length > 0
-                });
+                const tty = effectiveConfig.ttyFactory.create(ssoUser);
                 tab = {
                     tty,
                     subscribers: new Map(),
@@ -76,19 +99,11 @@ export function handleRuntimeRoute({
                     cleanupTimer: null,
                     ttyClosed: false,
                     runtimeKey,
-                    sessionId: currentSession.sessionId,
                     workspaceDirectory,
-                    continuationContext: formatContinuationContext(currentSession),
-                    continuationPending: currentSession.messages.length > 0,
-                    workspaceHistory: {
-                        workspaceDirectory,
-                        sessionId: currentSession.sessionId,
-                        buffer: '',
-                        lastClientText: '',
-                        userInputSent: false,
-                        lastAssistantMessageIndex: null
-                    },
-                    backgroundTaskIds: new Set(),
+                    webchatSessionSnapshot: null,
+                    liveMessageCount: 0,
+                    webchatTasks: new Map(),
+                    webchatWorkspaceFiles: null,
                     taskProtocolBuffer: ''
                 };
                 runtimes.set(runtimeKey, tab);
@@ -129,11 +144,25 @@ export function handleRuntimeRoute({
             'x-accel-buffering': 'no',
             'alt-svc': 'clear'
         });
-        res.write(`: connected session=${currentSession.sessionId}\n\n`);
+        res.write(': connected\n\n');
         const connectionId = crypto.randomUUID();
         tab.subscribers.set(connectionId, { res, sid, tabId });
         const runtimeStateSnapshot = serializeRuntimeStateSseEvent(tab.webchatRuntimeState);
         if (runtimeStateSnapshot) res.write(runtimeStateSnapshot);
+        const sessionStateSnapshot = serializeSessionStateSseEvent(tab.webchatSessionSnapshot);
+        if (sessionStateSnapshot) res.write(sessionStateSnapshot);
+        const taskListSnapshot = serializeTaskListSseEvent(tab.webchatTasks);
+        if (taskListSnapshot) res.write(taskListSnapshot);
+        const workspaceFilesSnapshot = tab.webchatWorkspaceFiles
+            ? serializeWorkspaceFilesSseEvent({
+                indexVersion: tab.webchatWorkspaceFiles.indexVersion,
+                reset: true,
+                files: [...tab.webchatWorkspaceFiles.files].sort(),
+            })
+            : '';
+        if (workspaceFilesSnapshot) res.write(workspaceFilesSnapshot);
+        const interactionSnapshot = serializeInteractionRequestSseEvent(tab.pendingInteraction);
+        if (interactionSnapshot) res.write(interactionSnapshot);
 
         let keepaliveTimer = setInterval(() => {
             try { res.write(': keepalive\n\n'); } catch (_) { }
@@ -144,7 +173,7 @@ export function handleRuntimeRoute({
             if (keepaliveTimer) clearInterval(keepaliveTimer);
             keepaliveTimer = null;
             tab.subscribers.delete(connectionId);
-            console.log(`[webchat] Client ${tabId} disconnected from folder session ${tab.sessionId}, tty pid=${tab.pid || tab.tty?.pid}`);
+            console.log(`[webchat] Client ${tabId} disconnected from folder runtime, tty pid=${tab.pid || tab.tty?.pid}`);
             if (tab.subscribers.size === 0) {
                 scheduleDisconnectedTabCleanup(tab, runtimeKey, { runtimes });
             }
@@ -154,16 +183,16 @@ export function handleRuntimeRoute({
 
     if (pathname === '/input' && req.method === 'POST') {
         const tabId = String(parsedUrl.searchParams.get('tabId') || '').trim();
-        let currentSession;
-        try {
-            currentSession = ensureCurrentSession(workspaceDirectory);
-        } catch (_) {
-            res.writeHead(500); return res.end('Session store unavailable.');
-        }
         const runtimes = getRuntimeMap(appState);
-        const runtimeKey = buildRuntimeKey(workspaceDirectory, currentSession.sessionId, effectiveConfig, agentQuery);
+        const runtimeKey = buildRuntimeKey(workspaceDirectory, effectiveConfig, agentQuery);
         const tab = runtimes.get(runtimeKey);
-        if (!tab?.tty || !tabId) { res.writeHead(409); return res.end('Session runtime unavailable.'); }
+        if (!tabId || !isRuntimeWritable(tab)) {
+            disposeUnavailableRuntime(tab, runtimeKey, runtimes);
+            res.writeHead(409); return res.end('Session runtime unavailable. Reconnect to create a new process.');
+        }
+        if (tab.pendingInteraction) {
+            res.writeHead(409); return res.end('Resolve the active interaction before sending another message.');
+        }
 
         let body = '';
         req.on('data', chunk => body += chunk.toString());
@@ -173,63 +202,134 @@ export function handleRuntimeRoute({
             const hasContent = String(envelope.text || '').trim()
                 || (Array.isArray(envelope.attachments) && envelope.attachments.length)
                 || hasReferences;
-            let appendedHistory = null;
-            if (hasContent) {
-                try {
-                    appendedHistory = appendSessionTurn(workspaceDirectory, currentSession.sessionId, {
-                        text: envelope.text,
-                        attachments: envelope.attachments,
-                        references: envelope.references
-                    });
-                    tab.workspaceHistory.lastClientText = String(envelope.text || '');
-                    tab.workspaceHistory.userInputSent = false;
-                    tab.workspaceHistory.lastAssistantMessageIndex = appendedHistory.assistantMessageIndex;
-                    broadcastWorkspaceRuntimeEvent(appState, workspaceDirectory, currentSession.sessionId, `event: user-message\ndata: ${JSON.stringify({
-                        sourceTabId: tabId,
-                        messageIndex: appendedHistory.userMessageIndex,
-                        message: appendedHistory.userMessage
-                    })}\n\n`);
-                } catch (_) { }
-            }
-
             const rawMessage = typeof envelope.text === 'string' ? envelope.text : body;
-            const shouldRestore = tab.continuationPending
-                && rawMessage.trim()
-                && !rawMessage.trimStart().startsWith('/');
-            const agentMessage = shouldRestore
-                ? `${tab.continuationContext}\n\n[New user message]\n${rawMessage}`
-                : rawMessage;
-            if (shouldRestore) tab.continuationPending = false;
-            const agentEnvelope = { ...envelope, text: agentMessage };
-            const text = shouldForwardWebchatEnvelope(parsedUrl, effectiveConfig)
+            const isSlashCommand = rawMessage.trimStart().startsWith('/');
+            const isVisibleMessage = envelope.presentation?.visible !== false;
+            const forwardEnvelope = shouldForwardWebchatEnvelope(parsedUrl, effectiveConfig);
+            const text = forwardEnvelope
                 ? serializeWebchatEnvelopeForAgent({
                     req,
                     effectiveConfig,
                     tabId,
-                    envelope: agentEnvelope,
-                    fallbackText: agentMessage
+                    envelope,
+                    fallbackText: rawMessage
                 })
-                : agentMessage;
-            tab.tty.write(`${text}\n`);
+                : rawMessage;
+            if (!writeRuntimeInput(tab, `${text}\n`)) {
+                disposeUnavailableRuntime(tab, runtimeKey, runtimes);
+                res.writeHead(409);
+                res.end('Session runtime unavailable. Reconnect to create a new process.');
+                return;
+            }
+
+            if (hasContent && (!isSlashCommand || isVisibleMessage)) {
+                const messageIndex = Number.isInteger(tab.liveMessageCount)
+                    ? tab.liveMessageCount
+                    : null;
+                tab.liveMessageCount = (messageIndex ?? 0) + 2;
+                writeOrBufferSseEvent(tab, `event: user-message\ndata: ${JSON.stringify({
+                    sourceTabId: tabId,
+                    ...(messageIndex !== null ? { messageIndex } : {}),
+                    message: {
+                        role: 'user',
+                        text: envelope.text,
+                        timestamp: new Date().toISOString(),
+                        attachments: envelope.attachments,
+                        references: envelope.references,
+                    },
+                })}\n\n`);
+            }
+
             res.writeHead(204); res.end();
         });
         return;
     }
 
     if (pathname === '/control' && req.method === 'POST') {
-        let currentSession;
-        try {
-            currentSession = ensureCurrentSession(workspaceDirectory);
-        } catch (_) {
-            res.writeHead(500); return res.end();
+        const runtimeKey = buildRuntimeKey(workspaceDirectory, effectiveConfig, agentQuery);
+        const runtimes = getRuntimeMap(appState);
+        const tab = runtimes.get(runtimeKey);
+        if (!isRuntimeWritable(tab)) {
+            disposeUnavailableRuntime(tab, runtimeKey, runtimes);
+            res.writeHead(409); return res.end();
         }
-        const runtimeKey = buildRuntimeKey(workspaceDirectory, currentSession.sessionId, effectiveConfig, agentQuery);
-        const tab = getRuntimeMap(appState).get(runtimeKey);
-        if (!tab?.tty) { res.writeHead(409); return res.end(); }
         let body = '';
         req.on('data', chunk => body += chunk.toString());
         req.on('end', () => {
-            try { tab.tty.write(body); } catch (_) { }
+            if (!writeRuntimeInput(tab, body)) {
+                disposeUnavailableRuntime(tab, runtimeKey, runtimes);
+                res.writeHead(409); res.end();
+                return;
+            }
+            res.writeHead(204); res.end();
+        });
+        return;
+    }
+
+    if (pathname === '/interaction' && req.method === 'POST') {
+        const sid = getSession(req, appState);
+        const tabId = String(parsedUrl.searchParams.get('tabId') || '').trim();
+        const runtimeKey = buildRuntimeKey(workspaceDirectory, effectiveConfig, agentQuery);
+        const runtimes = getRuntimeMap(appState);
+        const tab = runtimes.get(runtimeKey);
+        const ownsSubscriber = tab?.subscribers instanceof Map
+            && [...tab.subscribers.values()].some((subscriber) => subscriber.sid === sid && subscriber.tabId === tabId);
+        if (!sid || !tabId || !isRuntimeWritable(tab) || !ownsSubscriber) {
+            if (tab && !isRuntimeWritable(tab)) {
+                disposeUnavailableRuntime(tab, runtimeKey, runtimes);
+            }
+            res.writeHead(409); return res.end('Session runtime unavailable.');
+        }
+        let body = '';
+        let tooLarge = false;
+        req.on('data', (chunk) => {
+            if (tooLarge) return;
+            body += chunk.toString();
+            if (Buffer.byteLength(body) > MAX_INTERACTION_RESPONSE_BYTES) {
+                tooLarge = true;
+                body = '';
+            }
+        });
+        req.on('end', () => {
+            if (tooLarge) {
+                res.writeHead(413); res.end('Interaction response is too large.');
+                return;
+            }
+            let payload;
+            try {
+                payload = JSON.parse(body);
+            } catch (_) {
+                res.writeHead(400); res.end('Invalid interaction response.');
+                return;
+            }
+            const interactionId = typeof payload?.interactionId === 'string' ? payload.interactionId.trim() : '';
+            const optionId = typeof payload?.optionId === 'string' ? payload.optionId.trim() : '';
+            const pending = tab.pendingInteraction;
+            if (!INTERACTION_TOKEN_RE.test(interactionId) || !INTERACTION_TOKEN_RE.test(optionId)) {
+                res.writeHead(400); res.end('Invalid interaction response.');
+                return;
+            }
+            if (!pending || pending.id !== interactionId) {
+                res.writeHead(409); res.end('Interaction is no longer pending.');
+                return;
+            }
+            if (!pending.options.some((option) => option.id === optionId)) {
+                res.writeHead(400); res.end('Unknown interaction option.');
+                return;
+            }
+            if (!writeRuntimeInput(tab, `${JSON.stringify({
+                    __webchatInteractionResponse: 1,
+                    version: 1,
+                    id: interactionId,
+                    optionId,
+                })}\n`)) {
+                disposeUnavailableRuntime(tab, runtimeKey, runtimes);
+                res.writeHead(409); res.end('Session runtime unavailable.');
+                return;
+            }
+            tab.pendingInteraction = null;
+            const resolution = { id: interactionId, optionId, status: 'submitted' };
+            writeOrBufferSseEvent(tab, serializeInteractionResolvedSseEvent(resolution));
             res.writeHead(204); res.end();
         });
         return;

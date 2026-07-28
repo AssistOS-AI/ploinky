@@ -1,0 +1,186 @@
+name: Release Ploinky
+
+run-name: Release ${{ inputs.tag }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'SemVer release tag matching package.json (for example, v1.1.0)'
+        required: true
+        type: string
+      prerelease:
+        description: 'Publish as a prerelease'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ploinky-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Build, tag, and publish
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      CI: true
+      GH_TOKEN: ${{ github.token }}
+      PRERELEASE: ${{ inputs.prerelease }}
+      RELEASE_TAG: ${{ inputs.tag }}
+
+    steps:
+      - name: Check out master
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Validate release
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ "$GITHUB_REF" != "refs/heads/master" ]]; then
+            echo "::error::Releases must run from the master branch."
+            exit 1
+          fi
+
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?(\+[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$ ]]; then
+            echo "::error::Tag '$RELEASE_TAG' is not a valid v-prefixed SemVer release tag."
+            exit 1
+          fi
+          git check-ref-format "refs/tags/$RELEASE_TAG" >/dev/null
+
+          package_version="$(node --input-type=module -e \
+            'import pkg from "./package.json" with { type: "json" }; process.stdout.write(pkg.version)')"
+          if [[ "$RELEASE_TAG" != "v$package_version" ]]; then
+            echo "::error::Tag '$RELEASE_TAG' does not match package.json version '$package_version'."
+            exit 1
+          fi
+
+          git fetch origin master --tags
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/master; then
+            echo "::error::Commit $GITHUB_SHA is not on origin/master."
+            exit 1
+          fi
+
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::error::Release '$RELEASE_TAG' already exists."
+            exit 1
+          fi
+
+          if git show-ref --verify --quiet "refs/tags/$RELEASE_TAG"; then
+            tag_commit="$(git rev-list -n 1 "$RELEASE_TAG")"
+            if [[ "$tag_commit" != "$GITHUB_SHA" ]]; then
+              echo "::error::Tag '$RELEASE_TAG' already points to $tag_commit, not $GITHUB_SHA."
+              exit 1
+            fi
+            echo "REUSE_RELEASE_TAG=true" >> "$GITHUB_ENV"
+          else
+            echo "REUSE_RELEASE_TAG=false" >> "$GITHUB_ENV"
+          fi
+
+      - name: Install dependencies
+        run: npm install --no-audit --no-fund
+
+      - name: Build release package
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p dist
+          archive_name="$(npm pack --ignore-scripts --pack-destination dist)"
+          archive_path="dist/$archive_name"
+          if [[ ! -f "$archive_path" ]]; then
+            echo "::error::npm pack did not create $archive_path."
+            exit 1
+          fi
+
+          package_root="$(mktemp -d)"
+          trap 'rm -rf "$package_root"' EXIT
+          tar -xzf "$archive_path" -C "$package_root"
+
+          packed_version="$(node -p \
+            'require(process.argv[1]).version' \
+            "$package_root/package/package.json")"
+          if [[ "$packed_version" != "${RELEASE_TAG#v}" ]]; then
+            echo "::error::Built package version '$packed_version' does not match '$RELEASE_TAG'."
+            exit 1
+          fi
+          if [[ ! -x "$package_root/package/bin/ploinky" ]]; then
+            echo "::error::Built package does not contain an executable bin/ploinky."
+            exit 1
+          fi
+
+          (
+            cd dist
+            sha256sum "$archive_name" > SHA256SUMS
+          )
+
+          echo "Built $archive_path"
+          cat dist/SHA256SUMS
+
+      - name: Upload release build
+        uses: actions/upload-artifact@v4
+        with:
+          name: ploinky-${{ inputs.tag }}
+          path: |
+            dist/*.tgz
+            dist/SHA256SUMS
+          if-no-files-found: error
+
+      - name: Create annotated tag
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ "$REUSE_RELEASE_TAG" == "true" ]]; then
+            echo "Reusing existing tag $RELEASE_TAG at $GITHUB_SHA."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$RELEASE_TAG" "$GITHUB_SHA" -m "Ploinky $RELEASE_TAG"
+          git push origin "refs/tags/$RELEASE_TAG"
+
+      - name: Publish GitHub release
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          release_args=(
+            "$RELEASE_TAG"
+            dist/*.tgz
+            dist/SHA256SUMS
+            --repo "$GITHUB_REPOSITORY"
+            --verify-tag
+            --title "Ploinky $RELEASE_TAG"
+            --generate-notes
+          )
+          if [[ "$PRERELEASE" == "true" ]]; then
+            release_args+=(--prerelease)
+          fi
+
+          gh release create "${release_args[@]}"
+
+      - name: Create summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## Ploinky release"
+            echo ""
+            echo "- Tag: \`$RELEASE_TAG\`"
+            echo "- Commit: \`$GITHUB_SHA\`"
+            echo "- Prerelease: \`$PRERELEASE\`"
+          } >> "$GITHUB_STEP_SUMMARY"

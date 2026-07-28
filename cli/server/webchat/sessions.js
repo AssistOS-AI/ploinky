@@ -23,7 +23,6 @@ export function formatRelativeTime(value, now = Date.now()) {
 }
 
 export function createSessionController({
-    toEndpoint,
     elements,
     messages,
     network,
@@ -39,146 +38,115 @@ export function createSessionController({
         sessionList
     } = elements;
     let currentSession = null;
+    let currentSnapshot = null;
     let historyLoaded = false;
+    let sessionsAvailable = false;
 
-    async function request(path, options = {}) {
-        const response = await fetch(toEndpoint(path), {
-            credentials: 'include',
-            ...options,
-            headers: {
-                ...(options.body ? { 'Content-Type': 'application/json' } : {}),
-                ...(options.headers || {})
-            }
-        });
-        const payload = await response.json().catch(() => ({}));
-        if (!response.ok || payload.ok === false) {
-            throw new Error(payload.error || `session_request_failed_${response.status}`);
-        }
-        return payload;
-    }
+    if (sessionsBtn) sessionsBtn.disabled = true;
 
     function showHistoryGate(show) {
         if (historyGate) historyGate.hidden = !show;
     }
 
-    function applySession(summary, { restart = true, clear = true } = {}) {
-        if (!summary?.sessionId) return;
-        const changed = summary.sessionId !== currentSession?.sessionId;
-        currentSession = summary;
-        historyLoaded = false;
-        if (clear) messages.clearMessages();
-        showHistoryGate(Boolean(summary.hasHistory));
-        network.setSession(summary.sessionId, { restart: restart && changed });
+    function bootstrap() {
+        return Promise.resolve(null);
     }
 
-    async function bootstrap() {
-        const payload = await request('sessions');
-        applySession(payload.current, { restart: false, clear: true });
-        return payload.current;
-    }
-
-    async function loadHistory(sessionId = currentSession?.sessionId) {
-        if (!sessionId) return;
+    function loadHistory() {
+        if (!currentSnapshot) return;
+        messages.renderHistory(currentSnapshot.messages || []);
+        historyLoaded = true;
         showHistoryGate(false);
-        showBanner('Loading history…');
-        try {
-            const payload = await request(`sessions/${encodeURIComponent(sessionId)}`);
-            if (payload.session.sessionId !== currentSession?.sessionId) {
-                hideBanner();
-                return;
-            }
-            messages.renderHistory(payload.session.messages || []);
-            currentSession = {
-                ...currentSession,
-                hasHistory: (payload.session.messages || []).length > 0
-            };
-            historyLoaded = true;
-            showHistoryGate(false);
-            hideBanner();
-        } catch (error) {
-            if (sessionId === currentSession?.sessionId && currentSession?.hasHistory) {
-                showHistoryGate(true);
-            }
-            showBanner(`Unable to load history: ${error.message}`, 'err');
-        }
-    }
-
-    async function createNewSession() {
-        showBanner('Creating session…');
-        try {
-            const payload = await request('sessions', { method: 'POST' });
-            applySession(payload.session, { restart: true, clear: true });
-            historyLoaded = true;
-            showHistoryGate(false);
-            hideBanner();
-        } catch (error) {
-            showBanner(`Unable to create session: ${error.message}`, 'err');
-        }
     }
 
     function closeDialog() {
         if (sessionDialog) sessionDialog.hidden = true;
     }
 
-    async function selectAndLoad(sessionId) {
-        try {
-            const payload = await request('sessions/current', {
-                method: 'PUT',
-                body: JSON.stringify({ sessionId })
-            });
+    function appendNewButton() {
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.className = 'wa-session-list-item wa-session-list-new';
+        const label = document.createElement('span');
+        label.className = 'wa-session-list-preview';
+        label.textContent = 'New';
+        button.appendChild(label);
+        button.addEventListener('click', () => {
             closeDialog();
-            applySession(payload.session, { restart: true, clear: true });
-            await loadHistory(payload.session.sessionId);
-        } catch (error) {
-            showBanner(`Unable to select session: ${error.message}`, 'err');
+            showBanner('Creating session…');
+            network.sendQuickCommand('/session new');
+        });
+        sessionList.appendChild(button);
+    }
+
+    function renderSessionList(payload) {
+        if (!sessionList) return;
+        sessionList.replaceChildren();
+        appendNewButton();
+        for (const session of payload.sessions || []) {
+            const button = document.createElement('button');
+            button.type = 'button';
+            button.className = 'wa-session-list-item';
+            button.dataset.current = session.sessionId === payload.currentSessionId ? 'true' : 'false';
+            const preview = document.createElement('span');
+            preview.className = 'wa-session-list-preview';
+            preview.textContent = session.preview || 'New session';
+            const relative = document.createElement('span');
+            relative.className = 'wa-session-list-time';
+            relative.textContent = formatRelativeTime(session.updatedAt);
+            button.append(preview, relative);
+            button.addEventListener('click', () => {
+                closeDialog();
+                showBanner('Loading session…');
+                network.sendQuickCommand(`/session resume ${session.sessionId}`);
+            });
+            sessionList.appendChild(button);
         }
     }
 
-    async function openDialog() {
-        if (!sessionDialog || !sessionList) return;
+    function openDialog() {
+        if (!sessionsAvailable || !sessionDialog || !sessionList) return;
         sessionDialog.hidden = false;
         sessionList.replaceChildren();
-
-        const newSessionButton = document.createElement('button');
-        newSessionButton.type = 'button';
-        newSessionButton.className = 'wa-session-list-item wa-session-list-new';
-        const newSessionLabel = document.createElement('span');
-        newSessionLabel.className = 'wa-session-list-preview';
-        newSessionLabel.textContent = 'New';
-        newSessionButton.appendChild(newSessionLabel);
-        newSessionButton.addEventListener('click', () => {
-            closeDialog();
-            void createNewSession();
-        });
-        sessionList.appendChild(newSessionButton);
-
-        try {
-            const payload = await request('sessions');
-            for (const session of payload.sessions || []) {
-                const button = document.createElement('button');
-                button.type = 'button';
-                button.className = 'wa-session-list-item';
-                button.dataset.current = session.sessionId === payload.currentSessionId ? 'true' : 'false';
-                const preview = document.createElement('span');
-                preview.className = 'wa-session-list-preview';
-                preview.textContent = session.preview || 'New session';
-                const relative = document.createElement('span');
-                relative.className = 'wa-session-list-time';
-                relative.textContent = formatRelativeTime(session.updatedAt);
-                button.append(preview, relative);
-                button.addEventListener('click', () => void selectAndLoad(session.sessionId));
-                sessionList.appendChild(button);
-            }
-        } catch (error) {
-            const line = document.createElement('div');
-            line.textContent = `Unable to list sessions: ${error.message}`;
-            sessionList.appendChild(line);
-        }
+        appendNewButton();
+        const loading = document.createElement('div');
+        loading.className = 'wa-session-list-loading';
+        loading.textContent = 'Loading sessions…';
+        sessionList.appendChild(loading);
+        network.sendQuickCommand('/session');
     }
 
-    function handleExternalSessionChange(summary) {
-        if (!summary?.sessionId || summary.sessionId === currentSession?.sessionId) return;
-        applySession(summary, { restart: true, clear: true });
+    function handleSessionState(payload) {
+        if (!payload || typeof payload !== 'object') return;
+        sessionsAvailable = true;
+        if (sessionsBtn) sessionsBtn.disabled = false;
+
+        if (payload.event === 'list') {
+            renderSessionList(payload);
+            return;
+        }
+        if ((payload.event !== 'current' && payload.event !== 'selected') || !payload.session || !payload.summary) {
+            return;
+        }
+
+        const hadSession = Boolean(currentSession?.sessionId);
+        const changed = payload.summary.sessionId !== currentSession?.sessionId;
+        currentSession = payload.summary;
+        currentSnapshot = payload.session;
+
+        if (payload.event === 'selected' || (hadSession && changed)) {
+            messages.clearMessages();
+            messages.renderHistory(payload.session.messages || []);
+            historyLoaded = true;
+            showHistoryGate(false);
+            closeDialog();
+            hideBanner();
+            return;
+        }
+
+        if (!historyLoaded) {
+            showHistoryGate(Boolean(payload.summary.hasHistory));
+        }
     }
 
     function addRemoteUserMessage(message) {
@@ -189,8 +157,8 @@ export function createSessionController({
         });
     }
 
-    sessionsBtn?.addEventListener('click', () => void openDialog());
-    loadHistoryBtn?.addEventListener('click', () => void loadHistory());
+    sessionsBtn?.addEventListener('click', openDialog);
+    loadHistoryBtn?.addEventListener('click', loadHistory);
     sessionDialogClose?.addEventListener('click', closeDialog);
     sessionDialog?.addEventListener('click', (event) => {
         if (event.target === sessionDialog) closeDialog();
@@ -202,7 +170,7 @@ export function createSessionController({
     return {
         bootstrap,
         loadHistory,
-        handleExternalSessionChange,
+        handleSessionState,
         addRemoteUserMessage,
         getCurrentSession: () => currentSession,
         isHistoryLoaded: () => historyLoaded

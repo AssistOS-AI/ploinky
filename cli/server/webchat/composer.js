@@ -7,6 +7,7 @@ export function createComposer({ cmdInput, sendBtn, cancelBtn }, { purgeTriggerR
     let onSend = null;
     let onCancel = null;
     let isProcessing = false;
+    let isInteractionActive = false;
     const composerEl = cmdInput?.closest?.('.wa-composer') || null;
     const composerMainEl = cmdInput?.closest?.('.wa-composer-main') || null;
     let composerResizeObserver = null;
@@ -136,7 +137,7 @@ export function createComposer({ cmdInput, sendBtn, cancelBtn }, { purgeTriggerR
     }
 
     function submit() {
-        if (!cmdInput) {
+        if (!cmdInput || isInteractionActive) {
             return false;
         }
         const value = cmdInput.value;
@@ -156,7 +157,7 @@ export function createComposer({ cmdInput, sendBtn, cancelBtn }, { purgeTriggerR
     }
 
     function typeFromKeyEvent(event) {
-        if (!cmdInput || !event) {
+        if (!cmdInput || !event || isInteractionActive) {
             return false;
         }
         if (event.metaKey || event.ctrlKey || event.altKey) {
@@ -247,10 +248,17 @@ export function createComposer({ cmdInput, sendBtn, cancelBtn }, { purgeTriggerR
             cancelBtn.setAttribute('aria-hidden', processing ? 'false' : 'true');
         }
         if (sendBtn) {
-            sendBtn.style.display = processing ? 'none' : 'flex';
-            sendBtn.toggleAttribute('hidden', processing);
-            sendBtn.setAttribute('aria-hidden', processing ? 'true' : 'false');
+            const hidden = processing || isInteractionActive;
+            sendBtn.style.display = hidden ? 'none' : 'flex';
+            sendBtn.toggleAttribute('hidden', hidden);
+            sendBtn.setAttribute('aria-hidden', hidden ? 'true' : 'false');
         }
+    }
+
+    function setInteractionState(active) {
+        isInteractionActive = Boolean(active);
+        if (cmdInput) cmdInput.disabled = isInteractionActive;
+        setProcessingState(isProcessing);
     }
 
     return {
@@ -263,6 +271,7 @@ export function createComposer({ cmdInput, sendBtn, cancelBtn }, { purgeTriggerR
         typeFromKeyEvent,
         focus: focusInput,
         setProcessingState,
+        setInteractionState,
         setSendHandler: (handler) => {
             onSend = typeof handler === 'function' ? handler : null;
         },

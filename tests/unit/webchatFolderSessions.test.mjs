@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
+import { createNetwork, __testables as networkTestables } from '../../cli/server/webchat/network.js';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const read = (relative) => fs.readFileSync(path.join(ROOT, relative), 'utf8');
@@ -29,7 +30,26 @@ test('WebChat exposes folder-session controls and lazy history loading', () => {
     assert.match(template, /Click to load session history/);
 });
 
-test('WebChat exposes a workspace task overlay and generic task endpoints', () => {
+test('WebChat keeps desktop actions in the header and moves them into the mobile overflow menu', () => {
+    const template = read('cli/server/webchat/chat.html');
+    const client = read('cli/server/webchat/index.js');
+    const css = read('cli/server/webchat/webchat.css');
+    const header = template.slice(template.indexOf('<div class="wa-header">'), template.indexOf('</div>\n\n<div class="wa-tasks-backdrop"'));
+
+    for (const id of ['titleBar', 'runtimeModel', 'headerWorkdir', 'tasksBtn', 'sessionsBtn', 'settingsBtn', 'logoutBtn']) {
+        assert.match(header, new RegExp(`id="${id}"`));
+    }
+    assert.match(template, /id="settingsMobileActions"[^>]*hidden/);
+    assert.match(template, /id="settingsActionSlot"/);
+    assert.match(template, /id="settingsBtn"[^>]*aria-controls="settingsPanel"/s);
+    assert.match(client, /createHeaderMenu\(\{ button: settingsBtn, panel: settingsPanel \}\)/);
+    assert.match(client, /createResponsiveHeaderActions\(\{[\s\S]*actions: \[tasksBtn, sessionsBtn, logoutBtn\]/);
+    assert.match(css, /\.wa-header-workdir\s*\{[^}]*position:\s*absolute[^}]*top:\s*50%[^}]*left:\s*50%[^}]*transform:\s*translate\(-50%, -50%\)[^}]*text-align:\s*center/s);
+    assert.match(css, /@media \(max-width: 640px\)[\s\S]*?\.wa-header-workdir\s*\{[^}]*position:\s*static[^}]*transform:\s*none[^}]*text-align:\s*left/s);
+    assert.match(css, /@media \(max-width: 640px\)[\s\S]*?\.wa-settings-panel \.wa-responsive-header-action/);
+});
+
+test('WebChat exposes a task overlay backed by AchillesCLI commands', () => {
     const template = read('cli/server/webchat/chat.html');
     const network = read('cli/server/webchat/network.js');
     const taskRoutes = read('cli/server/handlers/webchat/taskRoutes.js');
@@ -37,16 +57,16 @@ test('WebChat exposes a workspace task overlay and generic task endpoints', () =
         assert.match(template, new RegExp(`id="${id}"`));
     }
     assert.match(network, /addEventListener\('task-update'/);
-    assert.match(taskRoutes, /pathname === '\/tasks' && req\.method === 'GET'/);
-    assert.match(taskRoutes, /\/tasks\\\/\(task_/);
+    assert.doesNotMatch(taskRoutes, /pathname === '\/tasks'/);
     const messages = read('cli/server/webchat/messages.js');
     const presentation = read('cli/server/webchat/taskPresentation.js');
     const taskView = read('cli/server/webchat/taskView.js');
+    const taskViewTransport = read('cli/server/webchat/taskViewTransport.js');
     assert.match(messages, /attachTaskSummary/);
     assert.match(messages, /message\?\.type === 'task'/);
     assert.match(messages, /wa-task-item/);
     assert.doesNotMatch(messages, /taskAssociations/);
-    assert.match(presentation, /View live logs/);
+    assert.match(presentation, /View task details/);
     assert.match(presentation, /data.*wcTaskId|dataset\.wcTaskId/);
     assert.doesNotMatch(presentation, /wa-inline-task-arrow|wa-inline-task-log/);
     assert.match(presentation, /\(stdout\|stderr\)/);
@@ -54,7 +74,75 @@ test('WebChat exposes a workspace task overlay and generic task endpoints', () =
     assert.match(presentation, /setInterval\(renderSummary, 1000\)/);
     assert.match(taskRoutes, /\/view\$/);
     assert.match(taskView, /webchat-task-update/);
+    assert.match(taskViewTransport, /webchat-task-command/);
     assert.doesNotMatch(taskView, /new EventSource/);
+    assert.match(taskViewTransport, /new EventSourceClass/);
+});
+
+test('task control events resolve visible WebChat commands without waiting for chat text', () => {
+    assert.equal(networkTestables.resolvesVisibleTaskCommand({ event: 'list' }, '/tasks'), true);
+    assert.equal(networkTestables.resolvesVisibleTaskCommand({ event: 'view' }, '/task view task-1'), true);
+    assert.equal(networkTestables.resolvesVisibleTaskCommand({ event: 'update' }, '/tasks'), false);
+    assert.equal(networkTestables.resolvesVisibleTaskCommand({ event: 'list' }, ''), false);
+});
+
+test('a visible /tasks command clears Thinking and identifies its list response', async () => {
+    const previousEventSource = globalThis.EventSource;
+    const previousFetch = globalThis.fetch;
+    let eventSource;
+    const hidden = [];
+    const updates = [];
+
+    class FakeEventSource {
+        constructor() {
+            this.listeners = new Map();
+            eventSource = this;
+        }
+
+        addEventListener(name, listener) {
+            this.listeners.set(name, listener);
+        }
+
+        emit(name, payload) {
+            this.listeners.get(name)?.({ data: JSON.stringify(payload) });
+        }
+
+        close() {}
+    }
+
+    globalThis.EventSource = FakeEventSource;
+    globalThis.fetch = async () => ({ ok: true, status: 200 });
+    try {
+        const network = createNetwork({
+            TAB_ID: 'tab-1',
+            toEndpoint: (route) => route,
+            dlog: () => {},
+            showBanner: () => {},
+            hideBanner: () => {},
+            statusEl: null,
+            statusDot: null,
+            agentName: 'AchillesCLI',
+        }, {
+            addClientMsg: () => {},
+            addServerMsg: () => true,
+            showTypingIndicator: () => {},
+            hideTypingIndicator: (force) => hidden.push(force),
+            markUserInputSent: () => {},
+            onTaskUpdate: (payload, metadata) => updates.push({ payload, metadata }),
+        });
+
+        network.start();
+        network.sendCommand('/tasks');
+        eventSource.emit('task-update', { event: 'list', tasks: [] });
+
+        assert.deepEqual(hidden, [true]);
+        assert.equal(updates.length, 1);
+        assert.equal(updates[0].metadata.visibleCommand, '/tasks');
+        network.stop();
+    } finally {
+        globalThis.EventSource = previousEventSource;
+        globalThis.fetch = previousFetch;
+    }
 });
 
 test('WebChat tab identity is restored from sessionStorage before UUID fallback', () => {
@@ -66,17 +154,19 @@ test('WebChat tab identity is restored from sessionStorage before UUID fallback'
     assert.match(dom, /webchat_tab_id:/);
 });
 
-test('WebChat session API is authenticated before folder files are handled', () => {
+test('WebChat delegates conversation sessions to the agent protocol', () => {
     const handler = read('cli/server/handlers/webchat/index.js');
-    const conversationRoutes = read('cli/server/handlers/webchat/conversationRoutes.js');
     const runtimeRoutes = read('cli/server/handlers/webchat/runtimeRoutes.js');
-    const authGate = handler.indexOf('if (!authorized(req))');
-    const sessionDispatch = handler.indexOf('await handleConversationRoute');
-    assert.ok(authGate >= 0);
-    assert.ok(sessionDispatch > authGate);
-    assert.match(conversationRoutes, /pathname === '\/sessions' && req\.method === 'GET'/);
-    assert.match(runtimeRoutes, /buildRuntimeKey\(workspaceDirectory, currentSession\.sessionId/);
-    assert.match(runtimeRoutes, /ttyFactory\.create\(ssoUser, \{[\s\S]*?hasHistory: currentSession\.messages\.length > 0/);
+    const runtimeState = read('cli/server/handlers/webchat/runtimeState.js');
+    const sessions = read('cli/server/webchat/sessions.js');
+    assert.doesNotMatch(handler, /handleConversationRoute|ensureCurrentSession/);
+    assert.match(runtimeRoutes, /buildRuntimeKey\(workspaceDirectory, effectiveConfig, agentQuery\)/);
+    assert.match(runtimeState, /WEBCHAT_SESSION_FLAG = '__webchatSession'/);
+    assert.match(sessions, /sendQuickCommand\('\/session'\)/);
+    assert.doesNotMatch(sessions, /sendQuickCommand\('\/sessions'\)/);
+    assert.match(sessions, /sendQuickCommand\('\/session new'\)/);
+    assert.match(sessions, /`\/session resume \$\{session\.sessionId\}`/);
+    assert.doesNotMatch(readWebchatHandlers(), /sessionStore\.js/);
     assert.doesNotMatch(readWebchatHandlers(), /PLOINKY_WEBCHAT_SESSION_ID/);
 });
 

@@ -349,11 +349,39 @@ function getMimeType(filePath) {
     const map = {
         '.js': 'application/javascript',
         '.mjs': 'application/javascript',
+        '.c': 'text/plain; charset=utf-8',
+        '.cc': 'text/plain; charset=utf-8',
+        '.cpp': 'text/plain; charset=utf-8',
+        '.cs': 'text/plain; charset=utf-8',
         '.css': 'text/css',
+        '.csv': 'text/csv; charset=utf-8',
+        '.go': 'text/plain; charset=utf-8',
+        '.h': 'text/plain; charset=utf-8',
+        '.hpp': 'text/plain; charset=utf-8',
         '.svg': 'image/svg+xml',
-        '.html': 'text/html',
-        '.json': 'application/json',
+        '.htm': 'text/html; charset=utf-8',
+        '.html': 'text/html; charset=utf-8',
+        '.java': 'text/plain; charset=utf-8',
+        '.json': 'application/json; charset=utf-8',
+        '.jsx': 'text/plain; charset=utf-8',
+        '.log': 'text/plain; charset=utf-8',
+        '.md': 'text/markdown; charset=utf-8',
+        '.mdx': 'text/markdown; charset=utf-8',
+        '.php': 'text/plain; charset=utf-8',
         '.pdf': 'application/pdf',
+        '.py': 'text/plain; charset=utf-8',
+        '.rb': 'text/plain; charset=utf-8',
+        '.rs': 'text/plain; charset=utf-8',
+        '.scss': 'text/plain; charset=utf-8',
+        '.sh': 'text/plain; charset=utf-8',
+        '.sql': 'text/plain; charset=utf-8',
+        '.toml': 'text/plain; charset=utf-8',
+        '.ts': 'text/plain; charset=utf-8',
+        '.tsx': 'text/plain; charset=utf-8',
+        '.txt': 'text/plain; charset=utf-8',
+        '.xml': 'application/xml; charset=utf-8',
+        '.yaml': 'text/yaml; charset=utf-8',
+        '.yml': 'text/yaml; charset=utf-8',
         '.png': 'image/png',
         '.jpg': 'image/jpeg',
         '.jpeg': 'image/jpeg',
@@ -405,11 +433,7 @@ function sendFile(res, filePath) {
 
 function sendFileStream(res, filePath) {
     try {
-        const mime = getMimeType(filePath);
-        res.writeHead(200, {
-            'Content-Type': mime,
-            'Cache-Control': getCacheControl(filePath)
-        });
+        res.writeHead(200, getWorkspaceFileHeaders(filePath));
         const stream = fs.createReadStream(filePath);
         stream.on('error', () => {
             if (!res.headersSent) {
@@ -422,6 +446,15 @@ function sendFileStream(res, filePath) {
     } catch (_) {
         return false;
     }
+}
+
+function getWorkspaceFileHeaders(filePath) {
+    return {
+        'Content-Type': getMimeType(filePath),
+        'Cache-Control': getCacheControl(filePath),
+        'Content-Disposition': 'inline',
+        'X-Content-Type-Options': 'nosniff',
+    };
 }
 
 function resolveWorkspaceFile(requestPath) {
@@ -555,6 +588,8 @@ export {
     serveWorkspaceFileRequest,
     serveWebLibRequest,
     serveStaticRequest,
+    getMimeType,
+    getWorkspaceFileHeaders,
 };
 
 // --- Agent-specific static routing ---

@@ -2,228 +2,140 @@ import fs from 'fs';
 import path from 'path';
 
 import {
-    resolveCanonicalPathSync,
     isPathWithinRoots,
+    resolveCanonicalPathSync,
 } from '../utils/workspacePaths.js';
 
-const SESSION_ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
 const SECRET_LEAF_RE = /\.secrets$/i;
-const UPLOAD_FOLDER = 'uploads';
-const UPLOAD_METADATA_FOLDER = '.webchat-upload-metadata';
+const RESERVED_DIRECTORY_NAMES = new Set(['.ploinky', 'node_modules']);
 const MAX_SEGMENT_LENGTH = 255;
 const MAX_PATH_LENGTH = 4096;
 
-export function normalizeWebchatSessionId(sessionId) {
-    const value = String(sessionId || '').trim();
-    if (!value) return null;
-    if (!SESSION_ID_RE.test(value)) return null;
-    if (value === '.' || value === '..') return null;
-    return value;
-}
-
-function isReservedSecretSegment(segment) {
-    return segment === '.secrets' || SECRET_LEAF_RE.test(segment);
+function isReservedSegment(segment) {
+    return RESERVED_DIRECTORY_NAMES.has(segment)
+        || segment === '.secrets'
+        || SECRET_LEAF_RE.test(segment);
 }
 
 function isSafeSegment(segment) {
-    if (!segment) return false;
-    if (segment === '.' || segment === '..') return false;
+    if (!segment || segment === '.' || segment === '..') return false;
     if (segment.length > MAX_SEGMENT_LENGTH) return false;
-    if (segment.includes('\0')) return false;
-    if (segment.includes('/') || segment.includes('\\')) return false;
-    if (isReservedSecretSegment(segment)) return false;
-    return true;
+    if (segment.includes('\0') || segment.includes('/') || segment.includes('\\')) return false;
+    return !isReservedSegment(segment);
 }
 
-export function sanitizeUploadRelativePath(rawPath, fallbackName) {
-    const provided = (typeof rawPath === 'string' && rawPath.trim())
-        ? rawPath
-        : fallbackName;
-    if (typeof provided !== 'string') return null;
-    if (!provided.trim()) return null;
-    if (provided.includes('\0')) return null;
-    if (provided.length > MAX_PATH_LENGTH) return null;
+function normalizeRelativePath(rawPath, { allowEmpty = false } = {}) {
+    const provided = typeof rawPath === 'string' ? rawPath.trim() : '';
+    if (!provided) return allowEmpty ? '' : null;
+    if (provided.includes('\0') || provided.length > MAX_PATH_LENGTH) return null;
     const slashOnly = provided.replace(/\\+/g, '/');
-    if (slashOnly.startsWith('/')) return null;
-    if (path.isAbsolute(slashOnly)) return null;
-    const normalized = slashOnly.replace(/\/+/g, '/');
-    if (!normalized) return null;
-    const segments = normalized.split('/').filter((part) => part !== '');
-    if (segments.length === 0) return null;
-    for (const segment of segments) {
-        if (!isSafeSegment(segment)) return null;
-    }
+    if (slashOnly.startsWith('/') || path.isAbsolute(slashOnly)) return null;
+    const segments = slashOnly.split('/').filter(Boolean);
+    if (!segments.length) return allowEmpty ? '' : null;
+    if (segments.some((segment) => !isSafeSegment(segment))) return null;
     const joined = segments.join('/');
-    if (joined.length > MAX_PATH_LENGTH) return null;
-    return joined;
+    return joined.length <= MAX_PATH_LENGTH ? joined : null;
 }
 
-export function buildSessionUploadRoot(cwd, sessionId) {
-    const safeSession = normalizeWebchatSessionId(sessionId);
-    if (!safeSession) return null;
-    if (!cwd || typeof cwd !== 'string') return null;
-    return path.join(path.resolve(cwd), UPLOAD_FOLDER, safeSession);
+export function sanitizeUploadRelativePath(rawPath, fallbackName = '') {
+    const candidate = typeof rawPath === 'string' && rawPath.trim() ? rawPath : fallbackName;
+    return normalizeRelativePath(candidate);
 }
 
-export function buildSessionUploadMetadataRoot(cwd, sessionId) {
-    const safeSession = normalizeWebchatSessionId(sessionId);
-    if (!safeSession) return null;
-    if (!cwd || typeof cwd !== 'string') return null;
-    return path.join(path.resolve(cwd), UPLOAD_FOLDER, UPLOAD_METADATA_FOLDER, safeSession);
-}
-
-export function ensureSessionUploadRoot(uploadRoot) {
-    if (!uploadRoot) return false;
-    try {
-        const resolvedUploadRoot = path.resolve(uploadRoot);
-        const cwd = path.dirname(path.dirname(resolvedUploadRoot));
-        return ensureDirectoryInsideRoot(resolvedUploadRoot, cwd);
-    } catch (_) {
-        return false;
-    }
-}
-
-function realPathOrSelf(value) {
-    try {
-        return fs.realpathSync(value);
-    } catch (_) {
-        return value;
-    }
+export function sanitizeUploadDirectoryPath(rawPath) {
+    return normalizeRelativePath(rawPath, { allowEmpty: true });
 }
 
 function isInsideRoot(targetPath, rootPath) {
-    if (!targetPath || !rootPath) return false;
-    const resolvedTarget = path.resolve(targetPath);
-    const resolvedRoot = path.resolve(rootPath);
-    if (resolvedTarget === resolvedRoot) return true;
-    return resolvedTarget.startsWith(resolvedRoot + path.sep);
+    const relative = path.relative(path.resolve(rootPath), path.resolve(targetPath));
+    return relative === '' || (relative && !relative.startsWith('..') && !path.isAbsolute(relative));
 }
 
-function hasUnsafeExistingPathComponent(rootPath, targetPath) {
+function hasSymlinkOrInvalidParent(rootPath, targetPath, { allowFileLeaf = true } = {}) {
     const relative = path.relative(rootPath, targetPath);
-    if (relative === '') return false;
     if (relative.startsWith('..') || path.isAbsolute(relative)) return true;
+    const segments = relative.split(path.sep).filter(Boolean);
     let current = rootPath;
-    for (const segment of relative.split(path.sep).filter(Boolean)) {
-        current = path.join(current, segment);
-        if (!fs.existsSync(current)) {
-            return false;
-        }
+    for (let index = 0; index < segments.length; index += 1) {
+        current = path.join(current, segments[index]);
+        if (!fs.existsSync(current)) return false;
         const stat = fs.lstatSync(current);
-        if (stat.isSymbolicLink() || !stat.isDirectory()) {
-            return true;
-        }
+        if (stat.isSymbolicLink()) return true;
+        const isLeaf = index === segments.length - 1;
+        if (!stat.isDirectory() && !(isLeaf && allowFileLeaf && stat.isFile())) return true;
     }
     return false;
 }
 
-function ensureDirectoryInsideRoot(targetPath, rootPath) {
-    const resolvedTarget = path.resolve(targetPath);
-    const resolvedRoot = path.resolve(rootPath);
-    if (!isInsideRoot(resolvedTarget, resolvedRoot)) return false;
-    if (hasUnsafeExistingPathComponent(resolvedRoot, resolvedTarget)) return false;
-    fs.mkdirSync(resolvedTarget, { recursive: true });
-    if (hasUnsafeExistingPathComponent(resolvedRoot, resolvedTarget)) return false;
-    const realRoot = fs.realpathSync(resolvedRoot);
-    const realTarget = fs.realpathSync(resolvedTarget);
-    return isInsideRoot(realTarget, realRoot);
-}
-
-export function resolveUploadTarget({
-    uploadRoot,
-    workspaceRoot,
-    relativePath,
-    allowMissingLeaf = true,
-} = {}) {
-    if (!uploadRoot) return null;
-    const safeRelative = sanitizeUploadRelativePath(relativePath, '');
-    if (!safeRelative) return null;
-    const candidate = path.resolve(uploadRoot, safeRelative);
-    if (!isInsideRoot(candidate, uploadRoot)) return null;
-
-    const allowedRoots = workspaceRoot ? [workspaceRoot] : [uploadRoot];
-
-    const canonical = resolveCanonicalPathSync(candidate);
-    if (!canonical) return null;
-    if (!isPathWithinRoots(allowedRoots, canonical, { allowMissing: allowMissingLeaf })) {
+function resolveConfinedBase(cwd, workspaceRoot) {
+    if (!cwd || !workspaceRoot) return null;
+    let resolvedCwd;
+    let resolvedWorkspace;
+    try {
+        resolvedCwd = fs.realpathSync(path.resolve(cwd));
+        resolvedWorkspace = fs.realpathSync(path.resolve(workspaceRoot));
+        if (!fs.statSync(resolvedCwd).isDirectory()) return null;
+    } catch (_) {
         return null;
     }
-    const realUploadRoot = realPathOrSelf(uploadRoot);
-    if (!isInsideRoot(canonical, realUploadRoot)) return null;
+    if (!isPathWithinRoots([resolvedWorkspace], resolvedCwd)) return null;
+    const relativeBase = path.relative(resolvedWorkspace, resolvedCwd);
+    if (relativeBase.split(path.sep).filter(Boolean).some(isReservedSegment)) return null;
+    return { cwd: resolvedCwd, workspaceRoot: resolvedWorkspace };
+}
 
+export function resolveUploadTarget({ cwd, workspaceRoot, destinationPath = '', relativePath } = {}) {
+    const base = resolveConfinedBase(cwd, workspaceRoot);
+    if (!base) return null;
+    const safeDestination = sanitizeUploadDirectoryPath(destinationPath);
+    const safeRelative = sanitizeUploadRelativePath(relativePath, '');
+    if (safeDestination === null || !safeRelative) return null;
+    const cwdRelative = safeDestination ? `${safeDestination}/${safeRelative}` : safeRelative;
+    const absolutePath = path.resolve(base.cwd, cwdRelative);
+    if (!isInsideRoot(absolutePath, base.cwd)) return null;
+    if (hasSymlinkOrInvalidParent(base.cwd, absolutePath)) return null;
+    const canonical = resolveCanonicalPathSync(absolutePath);
+    if (!canonical || !isPathWithinRoots([base.cwd], canonical, { allowMissing: true })) return null;
+    if (!isPathWithinRoots([base.workspaceRoot], canonical, { allowMissing: true })) return null;
     return {
-        relativePath: safeRelative,
         absolutePath: canonical,
+        relativePath: cwdRelative.replace(/\\+/g, '/'),
+        workspacePath: path.relative(base.workspaceRoot, canonical).replace(/\\+/g, '/'),
     };
 }
 
-function splitBaseAndExt(name) {
-    if (!name) return { base: '', ext: '' };
-    const lastDot = name.lastIndexOf('.');
-    if (lastDot <= 0 || lastDot === name.length - 1) {
-        return { base: name, ext: '' };
-    }
-    return { base: name.slice(0, lastDot), ext: name.slice(lastDot) };
-}
-
-export function resolveNonCollidingTarget({ uploadRoot, workspaceRoot, relativePath } = {}) {
-    if (!uploadRoot || !relativePath) return null;
-    const safeRelative = sanitizeUploadRelativePath(relativePath, '');
-    if (!safeRelative) return null;
-    const parts = safeRelative.split('/');
-    const leaf = parts.pop();
-    const parentRelative = parts.join('/');
-    const { base, ext } = splitBaseAndExt(leaf);
-
-    for (let attempt = 0; attempt < 10000; attempt += 1) {
-        const candidateLeaf = attempt === 0 ? leaf : `${base} (${attempt})${ext}`;
-        const candidateRelative = parentRelative
-            ? `${parentRelative}/${candidateLeaf}`
-            : candidateLeaf;
-        const resolved = resolveUploadTarget({
-            uploadRoot,
-            workspaceRoot,
-            relativePath: candidateRelative,
-        });
-        if (!resolved) return null;
-        if (!fs.existsSync(resolved.absolutePath)) {
-            return resolved;
+export function resolveWorkspaceDirectory({ cwd, workspaceRoot, relativePath = '', allowMissing = false } = {}) {
+    const base = resolveConfinedBase(cwd, workspaceRoot);
+    if (!base) return null;
+    const safeRelative = sanitizeUploadDirectoryPath(relativePath);
+    if (safeRelative === null) return null;
+    const absolutePath = path.resolve(base.cwd, safeRelative || '.');
+    if (!isInsideRoot(absolutePath, base.cwd)) return null;
+    if (hasSymlinkOrInvalidParent(base.cwd, absolutePath, { allowFileLeaf: false })) return null;
+    if (!allowMissing) {
+        try {
+            if (!fs.statSync(absolutePath).isDirectory()) return null;
+        } catch (_) {
+            return null;
         }
     }
-    return null;
+    const canonical = resolveCanonicalPathSync(absolutePath);
+    if (!canonical || !isPathWithinRoots([base.cwd], canonical, { allowMissing })) return null;
+    return {
+        absolutePath: canonical,
+        relativePath: safeRelative,
+    };
 }
 
-function relativeIfInside(rootPath, absolutePath) {
-    if (!rootPath || !absolutePath) return '';
-    const resolvedAbsolute = path.resolve(absolutePath);
-    const rootCandidates = [];
-    const resolvedRoot = path.resolve(rootPath);
-    rootCandidates.push(resolvedRoot);
-    const realRoot = realPathOrSelf(resolvedRoot);
-    if (realRoot && realRoot !== resolvedRoot) rootCandidates.push(realRoot);
-    for (const candidate of rootCandidates) {
-        const rel = path.relative(candidate, resolvedAbsolute).replace(/\\+/g, '/');
-        if (rel && !rel.startsWith('..') && !path.isAbsolute(rel)) {
-            return rel;
-        }
-    }
-    return '';
-}
-
-export function buildSessionRelativePath(uploadRoot, absolutePath) {
-    return relativeIfInside(uploadRoot, absolutePath);
-}
-
-export function buildCwdRelativePath(cwd, absolutePath) {
-    return relativeIfInside(cwd, absolutePath);
-}
-
-export function buildWorkspaceRelativePath(workspaceRoot, absolutePath) {
-    return relativeIfInside(workspaceRoot, absolutePath);
+export function buildWorkspaceFileUrl(workspacePath) {
+    const safePath = sanitizeUploadRelativePath(workspacePath, '');
+    if (!safePath) return null;
+    const encoded = safePath.split('/').map((segment) => encodeURIComponent(segment)).join('/');
+    return `/workspace-files/${encoded}`;
 }
 
 export const __testables = {
+    hasSymlinkOrInvalidParent,
     isInsideRoot,
-    splitBaseAndExt,
     isSafeSegment,
 };

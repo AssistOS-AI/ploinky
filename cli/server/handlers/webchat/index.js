@@ -4,10 +4,13 @@ import { fileURLToPath } from 'url';
 import { resolveWebchatCommandsForAgent } from '../../webchat/commandResolver.js';
 import * as staticSrv from '../../static/index.js';
 import {
-    handleWebchatUploadGet,
     handleWebchatUploadPost,
     resolveWebchatUploadContext,
 } from './uploads.js';
+import {
+    handleWorkspaceDirectoriesGet,
+    handleWorkspaceDirectoriesPost,
+} from './workspaceDirectories.js';
 import {
     buildWebchatQuery,
     resolveWebchatLaunchOptions
@@ -19,14 +22,11 @@ import {
 import {
     authorized,
     ensureAppSession,
-    getSession,
     handleLogout,
     redirectToRouterLogin
 } from './browserSession.js';
-import { handleConversationRoute } from './conversationRoutes.js';
 import { handleRuntimeRoute } from './runtimeRoutes.js';
 import { handleTaskRoute } from './taskRoutes.js';
-import { ensureCurrentSession } from '../../webchat/sessionStore.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -103,7 +103,6 @@ export async function handleWebChat(req, res, appConfig, appState) {
     const workspaceBase = resolveWebchatWorkspaceBase(parsedUrl);
     const workspaceDirectory = workspaceBase.base;
 
-    if (await handleConversationRoute({ pathname, req, res, workspaceDirectory, appState })) return;
     if (await handleTaskRoute({
         pathname,
         req,
@@ -121,29 +120,35 @@ export async function handleWebChat(req, res, appConfig, appState) {
     }
 
     if (pathname === '/uploads') {
-        const sessionId = getSession(req, appState);
-        const uploadContext = resolveWebchatUploadContext({ workspaceBase, sessionId });
+        const uploadContext = resolveWebchatUploadContext({ workspaceBase });
         if (req.method === 'POST' || req.method === 'PUT') {
             return handleWebchatUploadPost(req, res, parsedUrl, uploadContext);
-        }
-        if (req.method === 'GET' || req.method === 'HEAD') {
-            return handleWebchatUploadGet(req, res, parsedUrl, uploadContext);
         }
         res.writeHead(405, {
             'Content-Type': 'application/json',
             'Cache-Control': 'no-store',
-            Allow: 'GET, HEAD, POST, PUT',
+            Allow: 'POST, PUT',
+        });
+        return res.end(JSON.stringify({ ok: false, error: 'method_not_allowed' }));
+    }
+
+    if (pathname === '/directories') {
+        const directoryContext = resolveWebchatUploadContext({ workspaceBase });
+        if (req.method === 'GET' || req.method === 'HEAD') {
+            return handleWorkspaceDirectoriesGet(req, res, parsedUrl, directoryContext);
+        }
+        if (req.method === 'POST') {
+            return handleWorkspaceDirectoriesPost(req, res, directoryContext);
+        }
+        res.writeHead(405, {
+            'Content-Type': 'application/json',
+            'Cache-Control': 'no-store',
+            Allow: 'GET, HEAD, POST',
         });
         return res.end(JSON.stringify({ ok: false, error: 'method_not_allowed' }));
     }
 
     if (pathname === '/' || pathname === '/index.html') {
-        try {
-            ensureCurrentSession(workspaceDirectory);
-        } catch (error) {
-            res.writeHead(500, { 'Content-Type': 'text/plain', 'Cache-Control': 'no-store' });
-            return res.end(`Unable to initialize WebChat history: ${error?.message || 'session_store_unavailable'}`);
-        }
         const html = renderTemplate(['chat.html', 'index.html'], {
             '__ASSET_BASE__': `/${appName}/assets`,
             '__AGENT_NAME__': effectiveConfig.agentName || '',
@@ -151,7 +156,8 @@ export async function handleWebChat(req, res, appConfig, appState) {
             '__RUNTIME__': effectiveConfig.runtime || 'local',
             '__BASE_PATH__': `/${appName}`,
             '__AGENT_QUERY__': agentQuery,
-            '__WORKDIR__': workspaceBase.base
+            '__WORKDIR__': workspaceBase.base,
+            '__WORKSPACE_BASE__': encodeURIComponent(workspaceBase.relativeBase || ''),
         });
         if (html) {
             res.writeHead(200, {
@@ -166,7 +172,8 @@ export async function handleWebChat(req, res, appConfig, appState) {
 
     if (pathname === '/stream'
         || (pathname === '/input' && req.method === 'POST')
-        || (pathname === '/control' && req.method === 'POST')) {
+        || (pathname === '/control' && req.method === 'POST')
+        || (pathname === '/interaction' && req.method === 'POST')) {
         return handleRuntimeRoute({
             pathname,
             req,

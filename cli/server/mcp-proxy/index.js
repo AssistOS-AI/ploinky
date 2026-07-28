@@ -21,6 +21,8 @@ const AGENT_PROXY_PROTOCOL_VERSION = '2025-06-18';
 const AGENT_PROXY_SERVER_INFO = { name: 'ploinky-router-proxy', version: '1.0.0' };
 const TOOL_SCHEMA_CACHE_TTL_MS = 30_000;
 const TASK_STATUS_TOOL = '__task_status__';
+const TASK_CANCEL_TOOL = '__task_cancel__';
+const TASK_CANCEL_PATH = '/task/cancel';
 // Replay cache for verified Agent Assertions (agent-to-agent jti single-use).
 const assertionReplayCache = createTokenReplayCache({ maxSize: 4096 });
 
@@ -225,6 +227,65 @@ export async function readAuthenticatedAgentTask({ req, route, agentName, taskId
     });
 }
 
+export async function cancelAuthenticatedAgentTask({ req, route, agentName, taskId }) {
+    const caller = policy.resolveCaller(req);
+    if (caller?.kind !== 'user') {
+        const error = new Error('authenticated_user_required');
+        error.status = 401;
+        throw error;
+    }
+    if (!route?.hostPort) {
+        const error = new Error('task_agent_unavailable');
+        error.status = 409;
+        throw error;
+    }
+    const normalizedTaskId = String(taskId || '').trim();
+    if (!normalizedTaskId) {
+        const error = new Error('invalid_remote_task_id');
+        error.status = 400;
+        throw error;
+    }
+    const args = { taskId: normalizedTaskId };
+    const context = buildInvocationContextForProviderCall({
+        req,
+        agentName,
+        toolName: TASK_CANCEL_TOOL,
+        toolArgs: args,
+        method: 'POST',
+        path: TASK_CANCEL_PATH,
+    });
+    const payload = Buffer.from(JSON.stringify(args), 'utf8');
+    const url = new URL(`http://127.0.0.1:${route.hostPort}${TASK_CANCEL_PATH}`);
+    return await new Promise((resolve, reject) => {
+        const request = http.request(url, {
+            method: 'POST',
+            headers: {
+                accept: 'application/json',
+                'content-type': 'application/json',
+                'content-length': payload.length,
+                ...(context?.token ? { authorization: `Bearer ${context.token}` } : {}),
+            },
+        }, (response) => {
+            const chunks = [];
+            response.on('data', (chunk) => chunks.push(chunk));
+            response.on('end', () => {
+                const text = Buffer.concat(chunks).toString('utf8');
+                let body = null;
+                try { body = JSON.parse(text); } catch (_) { }
+                if ((response.statusCode || 500) >= 400 || !body?.task) {
+                    const error = new Error(body?.reason || body?.error || `task_cancel_${response.statusCode}`);
+                    error.status = response.statusCode || 502;
+                    reject(error);
+                    return;
+                }
+                resolve(body.task);
+            });
+        });
+        request.on('error', reject);
+        request.end(payload);
+    });
+}
+
 export function buildInvocationContextForProviderCall({ req, agentName, toolName, toolArgs, method = 'POST', path = '/mcp' }) {
     if (!isSecureWireEnabled()) return null;
     const canonicalArgs = toolArgs && typeof toolArgs === 'object' && !Array.isArray(toolArgs) ? toolArgs : {};
@@ -341,6 +402,102 @@ export function verifyDelegatedAgentTaskStatusCall({
         }),
         userDelegation: null,
     };
+}
+
+export function verifyDelegatedAgentTaskCancelCall({
+    req,
+    agentName,
+    taskId,
+    assertionCache = assertionReplayCache,
+}) {
+    const normalizedTaskId = String(taskId || '').trim();
+    if (!normalizedTaskId) throw new Error('missing taskId');
+    return {
+        ...verifyAgentAssertion({
+            token: readAuthorizationBearer(req),
+            method: 'POST',
+            path: TASK_CANCEL_PATH,
+            tool: TASK_CANCEL_TOOL,
+            rch: computeRchTool({
+                method: 'POST',
+                path: TASK_CANCEL_PATH,
+                tool: TASK_CANCEL_TOOL,
+                arguments: { taskId: normalizedTaskId },
+            }),
+            targetAgentId: agentName,
+            replayCache: assertionCache,
+        }),
+        userDelegation: null,
+    };
+}
+
+export async function handleDelegatedAgentTaskCancel({
+    req,
+    res,
+    route,
+    agentName,
+    beforeDial = null,
+}) {
+    const chunks = [];
+    let size = 0;
+    for await (const chunk of req) {
+        size += chunk.length;
+        if (size > 8192) {
+            sendJson(res, 413, { error: 'task_cancel_payload_too_large' });
+            return;
+        }
+        chunks.push(chunk);
+    }
+    let body;
+    try {
+        body = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}');
+    } catch (_) {
+        sendJson(res, 400, { error: 'invalid_json' });
+        return;
+    }
+    const taskId = typeof body?.taskId === 'string' ? body.taskId.trim() : '';
+    try {
+        req.delegatedAgentVerified = verifyDelegatedAgentTaskCancelCall({ req, agentName, taskId });
+        if (!route?.hostPort) {
+            sendJson(res, 409, { error: 'task_agent_unavailable' });
+            return;
+        }
+        const context = buildInvocationContextForProviderCall({
+            req,
+            agentName,
+            toolName: TASK_CANCEL_TOOL,
+            toolArgs: { taskId },
+            method: 'POST',
+            path: TASK_CANCEL_PATH,
+        });
+        if (beforeDial && await Promise.resolve(beforeDial()) !== true) {
+            sendJson(res, 503, { error: 'edge_generation_changed' });
+            return;
+        }
+        const payload = Buffer.from(JSON.stringify({ taskId }), 'utf8');
+        const upstream = http.request({
+            hostname: '127.0.0.1',
+            port: route.hostPort,
+            path: TASK_CANCEL_PATH,
+            method: 'POST',
+            headers: {
+                accept: 'application/json',
+                'content-type': 'application/json',
+                'content-length': payload.length,
+                authorization: `Bearer ${context.token}`,
+            },
+        }, (response) => {
+            res.writeHead(response.statusCode || 502, response.headers);
+            response.pipe(res);
+        });
+        upstream.on('error', () => sendJson(res, 502, { error: 'task_cancel_upstream_failed' }));
+        upstream.end(payload);
+    } catch (error) {
+        sendJson(res, 401, {
+            error: 'delegated_task_cancel_rejected',
+            reason: error?.message || 'delegated task cancel verification failed',
+        });
+    }
 }
 
 /**

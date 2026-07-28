@@ -140,10 +140,13 @@ function stopConfiguredAgents({ fast = false } = {}) {
     return [...bwrapStopped, ...stoppedContainers];
 }
 
-function stopAndRemoveMany(names, { fast = false } = {}) {
+function stopAndRemoveMany(names, { fast = false, records = null } = {}) {
     if (!Array.isArray(names) || !names.length) return [];
 
-    const agents = loadAgents();
+    const agents = {
+        ...(loadAgents() || {}),
+        ...(records && typeof records === 'object' ? records : {})
+    };
 
     // Handle sandbox (bwrap/seatbelt) agents first
     const bwrapEntries = [];
@@ -235,9 +238,12 @@ function stopAndRemoveMany(names, { fast = false } = {}) {
     return [...bwrapRemoved, ...removed];
 }
 
-function stopAndRemove(name, fast = false) {
+function stopAndRemove(name, fastOrOptions = false) {
     if (!name) return [];
-    return stopAndRemoveMany([name], { fast }) || [];
+    const options = fastOrOptions && typeof fastOrOptions === 'object'
+        ? fastOrOptions
+        : { fast: fastOrOptions };
+    return stopAndRemoveMany([name], options) || [];
 }
 
 function listAllContainerNames() {

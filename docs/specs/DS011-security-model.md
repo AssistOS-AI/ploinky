@@ -270,11 +270,37 @@ Workspace file reads and uploads must remain confined to the workspace root. `cl
 
 The WebChat composer autocomplete file-suggestion endpoint (`/webchat/suggestions/files`) must apply the same workspace-confinement rules as Explorer's filesystem reads. It narrows its search root to the workspace-confined current directory resolved from the WebChat launch query and rejects absolute caller paths, traversal (`..`), NUL bytes, symlink escapes outside that directory, Ploinky runtime state, dependency directories, and the reserved secret files `.secrets` and `*.secrets`. The endpoint must return only cwd-relative or workspace-relative paths and must not return host absolute paths to the browser. The endpoint provides suggestions only; downstream chat agents must still validate any structured `workspace-path` references they receive before reading file content. WebChat must sanitize references on the way out by dropping absolute paths, traversal, NUL bytes, reserved secret-file names, and any non-string path values.
 
-WebChat session-scoped uploads must follow the same containment rules. `POST /webchat/uploads` accepts file bytes and an optional `X-Relative-Path` header (for browser folder selection via `webkitdirectory`) and writes the result to `<cwd>/uploads/<sessionId>/<sanitized-relative-path>`. The server must reject absolute caller paths, traversal segments, NUL bytes, reserved secret-file names, and any path whose canonical resolution leaves the session upload root via a symlink. Existing target files are not overwritten; a deterministic ` (n)` suffix is appended to the leaf name. Responses report only relative paths scoped to the WebChat working directory or workspace root (e.g. `uploads/<sessionId>/notes.md`) and never expose host absolute paths. Stored MIME metadata for download responses lives in `uploads/.webchat-upload-metadata/<sessionId>/`, outside the user-visible session upload tree. `GET /webchat/uploads?path=...` and `HEAD /webchat/uploads?path=...` stream previously stored content with stored `Content-Type`, `X-Content-Type-Options: nosniff`, and the same unsafe path rejection. The session upload directory is a UX convenience scope, not a security boundary between hostile sessions; the workspace operator trust model still applies.
+WebChat direct uploads must follow the same workspace confinement rules and narrow them to the resolved WebChat working directory. Directory listing, directory creation, and upload targets must reject absolute caller paths, traversal segments, NUL bytes, Ploinky runtime state, dependency directories, reserved secret names, symlink components, and any canonical target outside that working directory. The browser may display only cwd-relative and workspace-relative paths; host absolute paths must never cross the HTTP boundary.
+
+`POST /webchat/uploads` writes browser-selected content directly below an explicitly selected cwd-relative destination. It must not create session-scoped upload trees, hashed storage paths, persistent upload ids, or MIME metadata files. Existing files may be replaced only when the authenticated browser explicitly confirms the collision and sends `X-Overwrite: 1`; folder uploads merge rather than deleting unrelated destination content. Each request must stage bytes in a temporary sibling and commit after successful completion so an interrupted upload does not truncate the previous target. The returned download URL must use the confined authenticated `/workspace-files/...` route. Direct workspace writes remain operator-trusted power and do not introduce a multi-tenant isolation boundary.
+
+WebChat must not expose conversation-history REST routes or write selected-CLI conversation snapshots to disk. Incoming `__webchatSession` control envelopes must use validated UUID session ids, bounded lists, validated message roles, and validated task references before their memory-only snapshot reaches the browser. They must never include cookies, JWTs, user identifiers, or agent secrets. Durable store containment and permissions belong to the session-owning CLI.
+
+WebChat interaction responses are state-changing control traffic and must use the authenticated route session. `POST /webchat/interaction` must bind the caller to an active SSE subscriber for the same tab and runtime, compare the supplied interaction id with the runtime's current pending request, and accept only an option id declared by that request. Browser state is not authority: stale, mismatched, or replayed responses must fail before writing to the CLI TTY. Interaction envelopes and decisions must stay out of agent-owned conversation history and logs.
 
 Browser autocomplete must not treat URL query parameters as authority to call arbitrary MCP tools. Ploinky WebChat must not expose provider tag catalogs from URL parameters; dynamic backend discovery belongs to the selected chat agent or relay during a real delegated request that carries a router-minted invocation token.
 
-Router-owned workspace file serving sanitizes relative paths and denies `..` traversal before resolving under the workspace root. Agent application static serving is no longer implemented by reading `static.hostPath` inside the router; the router forwards `/<agent>/...` to the selected agent, and that agent is responsible for static-file confinement. The shared `AgentServer` serves static files from `PLOINKY_CODE_DIR` or `/code`, denies traversal segments and NUL bytes, and checks resolved paths stay inside that root. Custom agent HTTP servers that serve `index.html` or other application assets must enforce the same containment rule. Operators must not place secrets in directories reachable by agent static roots.
+Router-owned workspace file serving sanitizes relative paths and denies `..`
+traversal before resolving under the workspace root. Assistant path enhancement
+in WebChat must not widen this read boundary. CLI-published
+`__webchatWorkspaceFiles` snapshots and deltas are untrusted presentation hints:
+Ploinky must bound their entry counts and path lengths, reject absolute,
+backslash, control-character, and traversal paths, keep the resulting index only
+in volatile runtime memory, and never use it as read authorization. The browser
+constructs authenticated `/workspace-files/...` links only for indexed candidates
+and performs the actual read only after an explicit user click; the router must
+still canonicalize and validate that target independently. Supported text responses must be served inline with an
+extension-derived MIME type and `X-Content-Type-Options: nosniff`; WebChat must
+escape source and plain-text content, render Markdown through its existing
+renderer, and sandbox workspace HTML previews. Agent application static serving
+is no longer implemented by reading `static.hostPath` inside the router; the
+router forwards `/<agent>/...` to the selected agent, and that agent is
+responsible for static-file confinement. The shared `AgentServer` serves static
+files from `PLOINKY_CODE_DIR` or `/code`, denies traversal segments and NUL bytes,
+and checks resolved paths stay inside that root. Custom agent HTTP servers that
+serve `index.html` or other application assets must enforce the same containment
+rule. Operators must not place secrets in directories reachable by agent static
+roots.
 
 Blob upload and download paths use random hexadecimal ids and reject ids containing characters outside the allowed id set. Original filenames and MIME types are stored as metadata and must not control filesystem paths. Blob and upload handlers currently do not enforce a repository-wide content-size limit or quota. Any deployment that exposes uploads beyond a trusted local user must add request-size limits and storage quotas at the router or proxy layer.
 

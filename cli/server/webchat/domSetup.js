@@ -57,8 +57,11 @@ export function initDom() {
     const sidePanelTitle = document.querySelector('.wa-side-panel-title');
     const sidePanelResizer = document.getElementById('sidePanelResizer');
     const settingsBtn = document.getElementById('settingsBtn');
+    const headerActions = document.getElementById('headerActions');
     const logoutBtn = document.getElementById('logoutBtn');
     const settingsPanel = document.getElementById('settingsPanel');
+    const settingsMobileActions = document.getElementById('settingsMobileActions');
+    const settingsActionSlot = document.getElementById('settingsActionSlot');
     const viewMoreLinesInput = document.getElementById('viewMoreLines');
     const attachmentBtn = document.getElementById('attachmentBtn');
     const attachmentMenu = document.getElementById('attachmentMenu');
@@ -69,6 +72,11 @@ export function initDom() {
     const fileUploadInput = document.getElementById('fileUploadInput');
     const folderUploadInput = document.getElementById('folderUploadInput');
     const filePreviewContainer = document.getElementById('filePreviewContainer');
+    const interactionPrompt = document.getElementById('interactionPrompt');
+    const interactionPromptTitle = document.getElementById('interactionPromptTitle');
+    const interactionPromptMessage = document.getElementById('interactionPromptMessage');
+    const interactionPromptDetail = document.getElementById('interactionPromptDetail');
+    const interactionPromptOptions = document.getElementById('interactionPromptOptions');
     const sessionsBtn = document.getElementById('sessionsBtn');
     const historyGate = document.getElementById('historyGate');
     const loadHistoryBtn = document.getElementById('loadHistoryBtn');
@@ -82,12 +90,20 @@ export function initDom() {
     const tasksList = document.getElementById('tasksList');
     const taskDetail = document.getElementById('taskDetail');
     const taskToast = document.getElementById('taskToast');
+    const taskToastText = document.getElementById('taskToastText');
+    const taskToastClose = document.getElementById('taskToastClose');
 
     const agentName = (body.dataset.agent || '').trim();
     const displayName = (body.dataset.title || '').trim();
     const basePath = (body.dataset.base || '').replace(/\/$/, '') || '';
     const agentQuery = (body.dataset.agentQuery || '').trim();
     const workdir = (body.dataset.workdir || '').trim();
+    let workspaceBase = '';
+    try {
+        workspaceBase = decodeURIComponent((body.dataset.workspaceBase || '').trim());
+    } catch (_) {
+        workspaceBase = '';
+    }
     const tabStorageKey = `webchat_tab_id:${workdir}:${agentQuery}`;
     let TAB_ID = '';
     try {
@@ -238,6 +254,7 @@ export function initDom() {
         agentName,
         displayName: appTitle,
         workdir,
+        workspaceBase,
         launchConfig,
         toEndpoint,
         showBanner,
@@ -268,8 +285,11 @@ export function initDom() {
             sidePanelTitle,
             sidePanelResizer,
             settingsBtn,
+            headerActions,
             logoutBtn,
             settingsPanel,
+            settingsMobileActions,
+            settingsActionSlot,
             viewMoreLinesInput,
             attachmentBtn,
             attachmentMenu,
@@ -279,6 +299,11 @@ export function initDom() {
             fileUploadInput,
             folderUploadInput,
             filePreviewContainer,
+            interactionPrompt,
+            interactionPromptTitle,
+            interactionPromptMessage,
+            interactionPromptDetail,
+            interactionPromptOptions,
             attachmentContainer,
             sessionsBtn,
             historyGate,
@@ -293,6 +318,8 @@ export function initDom() {
             tasksList,
             taskDetail,
             taskToast,
+            taskToastText,
+            taskToastClose,
         },
     };
 }

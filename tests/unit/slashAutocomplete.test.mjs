@@ -5,6 +5,7 @@ import {
     applySlashSelectionToValue,
     buildSuggestions,
     createSlashCommandsProvider,
+    loadSlashCommandsWithRetry,
 } from '../../cli/server/webchat/slashAutocomplete.js';
 
 test('applySlashSelectionToValue replaces a bare slash without leaving a trailing slash', () => {
@@ -43,7 +44,16 @@ test('applySlashSelectionToValue ignores slashes that are not at the start', () 
 test('slash provider loads MCP catalog with streamable HTTP headers and preserves slashes in arguments', async () => {
     const originalFetch = globalThis.fetch;
     const originalLocation = globalThis.location;
+    const originalDocument = globalThis.document;
     const requests = [];
+    globalThis.document = {
+        body: {
+            dataset: {
+                agentQuery: '',
+                workdir: '/workspace/project',
+            },
+        },
+    };
     globalThis.fetch = async (url, options = {}) => {
         const parsedUrl = new URL(url, 'http://localhost');
         if (parsedUrl.pathname === '/auth/token') {
@@ -118,6 +128,8 @@ test('slash provider loads MCP catalog with streamable HTTP headers and preserve
         assert.ok(requests.every(({ headers }) =>
             headers.get('accept') === 'application/json, text/event-stream'
         ));
+        const catalogRequest = requests.find(({ payload }) => payload.method === 'tools/call');
+        assert.equal(catalogRequest.payload.params.arguments.dir, '/workspace/project');
         assert.deepEqual(
             provider.getSuggestions('/model anthropic/claude', '/model anthropic/claude'.length)
                 .map((suggestion) => suggestion.insertText),
@@ -128,6 +140,202 @@ test('slash provider loads MCP catalog with streamable HTTP headers and preserve
         globalThis.fetch = originalFetch;
         if (originalLocation === undefined) delete globalThis.location;
         else globalThis.location = originalLocation;
+        globalThis.document = originalDocument;
+    }
+});
+
+test('slash catalog loading retries transient startup failures with the configured backoff', async () => {
+    const waits = [];
+    let attempts = 0;
+    const commands = await loadSlashCommandsWithRetry(async () => {
+        attempts += 1;
+        if (attempts < 3) throw new Error('Agent is still starting.');
+        return [{ name: '/model' }];
+    }, {
+        retryDelays: [250, 500, 1000],
+        wait: async (delayMs) => waits.push(delayMs),
+    });
+
+    assert.equal(attempts, 3);
+    assert.deepEqual(waits, [250, 500]);
+    assert.deepEqual(commands, [{ name: '/model' }]);
+});
+
+test('slash catalog loading stops after exhausting the retry window', async () => {
+    const waits = [];
+    let attempts = 0;
+    const commands = await loadSlashCommandsWithRetry(async () => {
+        attempts += 1;
+        throw new Error('Agent is still starting.');
+    }, {
+        retryDelays: [250, 500],
+        wait: async (delayMs) => waits.push(delayMs),
+    });
+
+    assert.equal(attempts, 3);
+    assert.deepEqual(waits, [250, 500]);
+    assert.deepEqual(commands, []);
+});
+
+test('slash catalog loading uses the bounded default startup retry window', async () => {
+    const waits = [];
+    let attempts = 0;
+    const commands = await loadSlashCommandsWithRetry(async () => {
+        attempts += 1;
+        throw new Error('Agent is still starting.');
+    }, {
+        wait: async (delayMs) => waits.push(delayMs),
+    });
+
+    assert.equal(attempts, 18);
+    assert.deepEqual(waits.slice(0, 3), [250, 500, 1000]);
+    assert.deepEqual(waits.slice(3), Array(14).fill(2000));
+    assert.equal(waits.reduce((total, delayMs) => total + delayMs, 0), 29_750);
+    assert.deepEqual(commands, []);
+});
+
+test('slash catalog loading does not retry a valid empty catalog or access denial', async () => {
+    let validAttempts = 0;
+    const validCommands = await loadSlashCommandsWithRetry(async () => {
+        validAttempts += 1;
+        return [];
+    }, {
+        retryDelays: [250],
+        wait: async () => assert.fail('valid empty catalogs must not wait'),
+    });
+
+    let deniedAttempts = 0;
+    const deniedCommands = await loadSlashCommandsWithRetry(async () => {
+        deniedAttempts += 1;
+        const error = new Error('Access denied.');
+        error.retryable = false;
+        throw error;
+    }, {
+        retryDelays: [250],
+        wait: async () => assert.fail('access denials must not wait'),
+    });
+
+    assert.equal(validAttempts, 1);
+    assert.deepEqual(validCommands, []);
+    assert.equal(deniedAttempts, 1);
+    assert.deepEqual(deniedCommands, []);
+});
+
+test('slash provider deduplicates concurrent initial catalog refreshes', async () => {
+    let fetchCount = 0;
+    let releaseInitialize;
+    const initializeGate = new Promise((resolve) => {
+        releaseInitialize = resolve;
+    });
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async (_url, options = {}) => {
+        const payload = JSON.parse(options.body || '{}');
+        if (payload.method === 'initialize') {
+            fetchCount += 1;
+            await initializeGate;
+            return new Response(JSON.stringify({
+                jsonrpc: '2.0',
+                id: payload.id,
+                result: { protocolVersion: '2024-11-05', capabilities: {} },
+            }), {
+                status: 200,
+                headers: { 'mcp-session-id': 'deduplicated-session' },
+            });
+        }
+        if (payload.method === 'notifications/initialized') {
+            return new Response(null, { status: 204 });
+        }
+        if (payload.method === 'tools/list') {
+            return Response.json({
+                jsonrpc: '2.0',
+                id: payload.id,
+                result: { tools: [] },
+            });
+        }
+        throw new Error(`Unexpected MCP method: ${payload.method}`);
+    };
+
+    try {
+        const provider = createSlashCommandsProvider({ agentName: 'achilles-cli' });
+        const first = provider.refresh();
+        const second = provider.refresh();
+        releaseInitialize();
+        await Promise.all([first, second]);
+        assert.equal(fetchCount, 1);
+    } finally {
+        globalThis.fetch = originalFetch;
+    }
+});
+
+test('slash provider retries an MCP initialization response while the agent is starting', async () => {
+    const originalFetch = globalThis.fetch;
+    const waits = [];
+    let initializeAttempts = 0;
+    globalThis.fetch = async (_url, options = {}) => {
+        const payload = JSON.parse(options.body || '{}');
+        if (payload.method === 'initialize') {
+            initializeAttempts += 1;
+            if (initializeAttempts === 1) {
+                return Response.json({
+                    jsonrpc: '2.0',
+                    id: payload.id,
+                    error: { code: -32000, message: 'Agent is still starting.' },
+                });
+            }
+            return new Response(JSON.stringify({
+                jsonrpc: '2.0',
+                id: payload.id,
+                result: { protocolVersion: '2024-11-05', capabilities: {} },
+            }), {
+                status: 200,
+                headers: { 'mcp-session-id': 'ready-session' },
+            });
+        }
+        if (payload.method === 'notifications/initialized') {
+            return new Response(null, { status: 204 });
+        }
+        if (payload.method === 'tools/list') {
+            return Response.json({
+                jsonrpc: '2.0',
+                id: payload.id,
+                result: { tools: [] },
+            });
+        }
+        throw new Error(`Unexpected MCP method: ${payload.method}`);
+    };
+
+    try {
+        const provider = createSlashCommandsProvider({
+            agentName: 'achilles-cli',
+            retryDelays: [250],
+            wait: async (delayMs) => waits.push(delayMs),
+        });
+        await provider.refresh();
+        assert.equal(initializeAttempts, 2);
+        assert.deepEqual(waits, [250]);
+    } finally {
+        globalThis.fetch = originalFetch;
+    }
+});
+
+test('slash provider does not retry an MCP access denial', async () => {
+    const originalFetch = globalThis.fetch;
+    let initializeAttempts = 0;
+    globalThis.fetch = async () => {
+        initializeAttempts += 1;
+        return Response.json({ error: 'forbidden' }, { status: 403 });
+    };
+
+    try {
+        const provider = createSlashCommandsProvider({
+            agentName: 'achilles-cli',
+            retryDelays: [250],
+            wait: async () => assert.fail('access denials must not wait'),
+        });
+        await provider.refresh();
+        assert.equal(initializeAttempts, 1);
+    } finally {
+        globalThis.fetch = originalFetch;
     }
 });
 
@@ -298,6 +506,37 @@ test('buildSuggestions supports subcommand argument completions', () => {
         label: '/remove skill admin-flow',
         insertText: '/remove skill admin-flow ',
         description: 'Admin flow'
+    }]);
+});
+
+test('buildSuggestions displays session names while inserting resume session ids', () => {
+    const sessionId = '123e4567-e89b-42d3-a456-426614174000';
+    const suggestions = buildSuggestions([{
+        name: '/session',
+        description: 'Select a conversation session',
+        subCommands: [{
+            name: 'resume',
+            description: 'Resume a saved session',
+            argCompletions: [{
+                value: sessionId,
+                label: 'Review authentication flow',
+                description: `${sessionId} · 2 hours ago`,
+            }],
+        }],
+    }], {
+        currentToken: 'session',
+        hasSubToken: true,
+        subToken: 'resume ',
+    });
+
+    assert.deepEqual(suggestions.map((suggestion) => ({
+        label: suggestion.label,
+        insertText: suggestion.insertText,
+        description: suggestion.description,
+    })), [{
+        label: '/session resume Review authentication flow',
+        insertText: `/session resume ${sessionId} `,
+        description: `${sessionId} · 2 hours ago`,
     }]);
 });
 

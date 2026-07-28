@@ -30,6 +30,17 @@ function buildRawTtyPrefix() {
     return 'command -v stty >/dev/null 2>&1 && stty -icanon -echo 2>/dev/null || true';
 }
 
+function isWritableChild(child) {
+    return Boolean(
+        child
+        && child.exitCode === null
+        && child.signalCode === null
+        && child.stdin
+        && child.stdin.writable
+        && !child.stdin.destroyed
+    );
+}
+
 function shouldAppendIdentityArgs(command) {
     const raw = String(command || '').trim();
     if (!raw) {
@@ -39,26 +50,20 @@ function shouldAppendIdentityArgs(command) {
     return !/^(?:\/bin\/)?(?:ba)?sh$/i.test(firstToken);
 }
 
-function buildWebchatSessionEnv(sessionContext = {}) {
-    return {
-        PLOINKY_WEBCHAT_HAS_HISTORY: sessionContext?.hasHistory === true ? '1' : '0'
-    };
-}
-
-function withWebchatSessionEnv(baseEnv, sessionContext) {
+function withoutWebchatSessionEnv(baseEnv) {
     const env = { ...baseEnv };
     for (const key of Object.keys(env)) {
         if (key.startsWith('PLOINKY_WEBCHAT_')) delete env[key];
     }
-    return Object.assign(env, buildWebchatSessionEnv(sessionContext));
+    return env;
 }
 
 function createTTYFactory({ runtime, containerName, workdir, entry }) {
     const DEBUG = process.env.WEBTTY_DEBUG === '1';
     const log = (...args) => { if (DEBUG) console.log('[webchat][tty]', ...args); };
-    const factory = (ssoUser, sessionContext = {}) => {
+    const factory = (ssoUser) => {
         const wd = workdir || safeProcessCwd();
-        const env = withWebchatSessionEnv({ ...process.env, TERM: 'xterm-256color' }, sessionContext);
+        const env = withoutWebchatSessionEnv({ ...process.env, TERM: 'xterm-256color' });
 
         // Build SSO CLI arguments (no env vars)
         const ssoCliArgs = [];
@@ -99,6 +104,7 @@ function createTTYFactory({ runtime, containerName, workdir, entry }) {
         // to the container process when the host connection closes
         const execArgs = buildExecArgs(containerName, wd, shellCmd, true, false, { env });
         let ptyProc = null;
+        let closed = false;
         const outputHandlers = new Set();
         const closeHandlers = new Set();
 
@@ -126,11 +132,16 @@ function createTTYFactory({ runtime, containerName, workdir, entry }) {
             log('spawned child', { runtime, containerName, pid: ptyProc.pid });
             ptyProc.stdout.on('data', emitOutput);
             ptyProc.stderr.on('data', emitOutput);
+            ptyProc.stdin.on('error', (e) => {
+                log('child stdin error', e?.message || e);
+            });
             ptyProc.on('error', (e) => {
+                closed = true;
                 log('child error', e?.message || e);
                 emitClose();
             });
             ptyProc.on('close', () => {
+                closed = true;
                 log('child close');
                 emitClose();
             });
@@ -149,11 +160,22 @@ function createTTYFactory({ runtime, containerName, workdir, entry }) {
                 if (handler) closeHandlers.add(handler);
                 return () => closeHandlers.delete(handler);
             },
+            isAlive() {
+                return !closed && isWritableChild(ptyProc);
+            },
             write(data) {
+                if (closed || !isWritableChild(ptyProc)) return false;
                 if (DEBUG) log('write', { bytes: Buffer.byteLength(data || '') });
-                try { ptyProc?.stdin?.write?.(data); } catch (e) { log('write error', e?.message || e); }
+                try {
+                    ptyProc.stdin.write(data);
+                    return true;
+                } catch (e) {
+                    log('write error', e?.message || e);
+                    return false;
+                }
             },
             kill() {
+                closed = true;
                 const pid = ptyProc?.pid;
                 try { ptyProc?.kill?.(); } catch (_) { }
                 // Try to kill process group for thorough cleanup
@@ -162,6 +184,7 @@ function createTTYFactory({ runtime, containerName, workdir, entry }) {
                 }
             },
             dispose() {
+                closed = true;
                 const pid = ptyProc?.pid;
                 // First try graceful termination
                 try { ptyProc?.kill?.(); } catch (_) { }
@@ -182,19 +205,19 @@ function createTTYFactory({ runtime, containerName, workdir, entry }) {
     return { create: factory };
 }
 
-export { buildWebchatSessionEnv, createTTYFactory, createLocalTTYFactory };
+export { createTTYFactory, createLocalTTYFactory };
 
 function createLocalTTYFactory({ workdir, command }) {
     const DEBUG = process.env.WEBTTY_DEBUG === '1';
     const log = (...args) => { if (DEBUG) console.log('[webchat][tty-local]', ...args); };
-    const factory = (ssoUser, sessionContext = {}) => {
+    const factory = (ssoUser) => {
         const wd = workdir || process.cwd();
         // PLOINKY_NO_TTY=1 ensures stdin EOF propagates when webchat connection closes.
-        const env = withWebchatSessionEnv({
+        const env = withoutWebchatSessionEnv({
             ...process.env,
             TERM: 'xterm-256color',
             PLOINKY_NO_TTY: '1'
-        }, sessionContext);
+        });
 
         // Build SSO CLI arguments (no env vars)
         const ssoCliArgs = [];
@@ -277,6 +300,9 @@ function createLocalTTYFactory({ workdir, command }) {
                 ptyProc.stderr.setEncoding('utf8');
                 ptyProc.stdout.on('data', emitOutput);
                 ptyProc.stderr.on('data', emitOutput);
+                ptyProc.stdin.on('error', (e) => {
+                    log('local child stdin error', e?.message || e);
+                });
                 ptyProc.on('error', (e) => {
                     log('local child error', e?.message || e);
                     emitClose();
@@ -321,7 +347,17 @@ function createLocalTTYFactory({ workdir, command }) {
             get pid() { return ptyProc?.pid; },
             onOutput(handler) { if (handler) outputHandlers.add(handler); return () => outputHandlers.delete(handler); },
             onClose(handler) { if (handler) closeHandlers.add(handler); return () => closeHandlers.delete(handler); },
-            write(data) { try { ptyProc?.stdin?.write?.(data); } catch (e) { log('write error', e?.message || e); } },
+            isAlive() { return !disposed && isWritableChild(ptyProc); },
+            write(data) {
+                if (disposed || !isWritableChild(ptyProc)) return false;
+                try {
+                    ptyProc.stdin.write(data);
+                    return true;
+                } catch (e) {
+                    log('write error', e?.message || e);
+                    return false;
+                }
+            },
             kill() {
                 disposed = true;
                 const pid = ptyProc?.pid;
