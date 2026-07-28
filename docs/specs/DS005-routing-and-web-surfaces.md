@@ -42,7 +42,20 @@ Runtime reuse must be conditional on TTY health. A runtime whose child has exite
 
 WebChat may accept a generic `__webchatRuntimeState` line envelope from the selected CLI. Version 1 carries only an optional selected `model` string or `null`; the envelope must be intercepted before ordinary assistant output and exposed through the `runtime-state` EventSource event. The current runtime-state snapshot remains memory-only and is sent to reconnecting subscribers. The header may show a non-empty model beside the selected agent name and must hide the badge when the model is `null`. Ploinky must not read an agent-owned settings file, infer an effective provider model, or use a process-instance identifier to coordinate conversation restoration.
 
-The `Tasks` and `Sessions` controls in the WebChat header must use a darker green hover fill that remains visually consistent with the green header, rather than inheriting the theme's neutral panel-hover color.
+At normal desktop widths, the WebChat header must retain its established visible
+`Tasks`, `Sessions`, three-dot settings, and `Logout` controls. At widths of 640
+CSS pixels or less, `Tasks`, `Sessions`, and `Logout` must move into the
+three-dot overflow menu so the selected agent name, current model, working
+directory, and connection state remain visible. Returning above that breakpoint
+must restore the controls to their original header order without duplicating
+them or replacing their event-bound elements. The menu must open on desktop and
+mobile, close after a mobile action, close on outside pointer interaction or
+Escape, and expose its expanded state through ARIA. At mobile widths the agent
+and model remain on the first metadata row, while connection state and the
+ellipsized working directory remain visible on the second row. At desktop
+widths the working directory must retain its original horizontal and vertical
+center position inside the header, with a bounded width and ellipsis preventing
+it from escaping the header. The mobile layout must return it to normal flow.
 
 The selected CLI must restore its own conversation state whenever its process starts. Ploinky must not deliver role-separated history, delimited continuation text, a selected conversation id, or a `PLOINKY_WEBCHAT_HAS_HISTORY` environment flag. Slash commands and natural-language prompts travel over the same TTY. Composer submissions default to `presentation.visible: true`, while WebChat-owned control actions use `false`. An invisible control command and its textual acknowledgement or error must not render in the main transcript. The selected CLI decides which visible inputs and outputs enter its presentation transcript and which stored records are supplied to its agent implementation; Ploinky never writes that transcript.
 
@@ -217,7 +230,10 @@ height must follow the composer height dynamically when the textarea expands
 or attachment previews appear. The panel header remains fixed within that
 bounded region, while its content area and embedded iframe use the remaining
 height and provide their own scrolling instead of extending underneath the
-composer.
+composer. At mobile widths the panel must remain full-width but anchor to the
+WebChat content area below the primary header. Its own title row and close
+action must remain visible and operable instead of being covered by the primary
+header, and the close action must provide a coarse-pointer-friendly target.
 
 The Tasks overlay, compact task item, and task view must share one presentation policy.
 Pending work is shown as `QUEUED`, active work as `RUNNING`, and terminal states

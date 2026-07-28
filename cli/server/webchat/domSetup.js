@@ -57,8 +57,11 @@ export function initDom() {
     const sidePanelTitle = document.querySelector('.wa-side-panel-title');
     const sidePanelResizer = document.getElementById('sidePanelResizer');
     const settingsBtn = document.getElementById('settingsBtn');
+    const headerActions = document.getElementById('headerActions');
     const logoutBtn = document.getElementById('logoutBtn');
     const settingsPanel = document.getElementById('settingsPanel');
+    const settingsMobileActions = document.getElementById('settingsMobileActions');
+    const settingsActionSlot = document.getElementById('settingsActionSlot');
     const viewMoreLinesInput = document.getElementById('viewMoreLines');
     const attachmentBtn = document.getElementById('attachmentBtn');
     const attachmentMenu = document.getElementById('attachmentMenu');
@@ -282,8 +285,11 @@ export function initDom() {
             sidePanelTitle,
             sidePanelResizer,
             settingsBtn,
+            headerActions,
             logoutBtn,
             settingsPanel,
+            settingsMobileActions,
+            settingsActionSlot,
             viewMoreLinesInput,
             attachmentBtn,
             attachmentMenu,

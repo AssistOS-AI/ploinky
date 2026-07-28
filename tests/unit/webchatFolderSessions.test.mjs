@@ -30,6 +30,25 @@ test('WebChat exposes folder-session controls and lazy history loading', () => {
     assert.match(template, /Click to load session history/);
 });
 
+test('WebChat keeps desktop actions in the header and moves them into the mobile overflow menu', () => {
+    const template = read('cli/server/webchat/chat.html');
+    const client = read('cli/server/webchat/index.js');
+    const css = read('cli/server/webchat/webchat.css');
+    const header = template.slice(template.indexOf('<div class="wa-header">'), template.indexOf('</div>\n\n<div class="wa-tasks-backdrop"'));
+
+    for (const id of ['titleBar', 'runtimeModel', 'headerWorkdir', 'tasksBtn', 'sessionsBtn', 'settingsBtn', 'logoutBtn']) {
+        assert.match(header, new RegExp(`id="${id}"`));
+    }
+    assert.match(template, /id="settingsMobileActions"[^>]*hidden/);
+    assert.match(template, /id="settingsActionSlot"/);
+    assert.match(template, /id="settingsBtn"[^>]*aria-controls="settingsPanel"/s);
+    assert.match(client, /createHeaderMenu\(\{ button: settingsBtn, panel: settingsPanel \}\)/);
+    assert.match(client, /createResponsiveHeaderActions\(\{[\s\S]*actions: \[tasksBtn, sessionsBtn, logoutBtn\]/);
+    assert.match(css, /\.wa-header-workdir\s*\{[^}]*position:\s*absolute[^}]*top:\s*50%[^}]*left:\s*50%[^}]*transform:\s*translate\(-50%, -50%\)[^}]*text-align:\s*center/s);
+    assert.match(css, /@media \(max-width: 640px\)[\s\S]*?\.wa-header-workdir\s*\{[^}]*position:\s*static[^}]*transform:\s*none[^}]*text-align:\s*left/s);
+    assert.match(css, /@media \(max-width: 640px\)[\s\S]*?\.wa-settings-panel \.wa-responsive-header-action/);
+});
+
 test('WebChat exposes a task overlay backed by AchillesCLI commands', () => {
     const template = read('cli/server/webchat/chat.html');
     const network = read('cli/server/webchat/network.js');

@@ -13,6 +13,7 @@ import { createSessionController } from './sessions.js';
 import { createTaskController } from './tasks.js';
 import { createInteractionPrompt } from './interactionPrompt.js';
 import { createWorkspaceFileIndex } from './workspaceFileIndex.js';
+import { createHeaderMenu, createResponsiveHeaderActions } from './headerMenu.js';
 
 const PURGE_TRIGGER_RE = /\bpurge\b/i;
 const EDITABLE_TAGS = ['INPUT', 'TEXTAREA', 'SELECT', 'OPTION'];
@@ -47,6 +48,10 @@ const {
     cmdInput,
     sendBtn,
     settingsBtn,
+    headerActions,
+    settingsPanel,
+    settingsMobileActions,
+    settingsActionSlot,
     logoutBtn,
     attachmentBtn,
     attachmentMenu,
@@ -584,8 +589,14 @@ function initMessageToolbar() {
 }
 
 refocusComposerAfterIcon(attachmentBtn);
-refocusComposerAfterIcon(settingsBtn);
 initMessageToolbar();
+createHeaderMenu({ button: settingsBtn, panel: settingsPanel });
+createResponsiveHeaderActions({
+    actions: [tasksBtn, sessionsBtn, logoutBtn],
+    desktopContainer: headerActions,
+    mobileContainer: settingsActionSlot,
+    mobileSection: settingsMobileActions,
+});
 
 function resolveLogoutRedirect(payload) {
     const redirect = typeof payload?.redirect === 'string' ? payload.redirect.trim() : '';

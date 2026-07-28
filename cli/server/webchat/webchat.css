@@ -248,6 +248,10 @@ body {
     gap: 6px;
 }
 
+.wa-header-meta {
+    display: contents;
+}
+
 .wa-header-actions {
     display: flex;
     align-items: center;
@@ -267,6 +271,10 @@ body {
 
 .wa-session-btn:hover {
     background: #086b58;
+}
+
+.wa-responsive-header-action-label {
+    display: none;
 }
 
 .wa-history-gate[hidden] {
@@ -424,17 +432,22 @@ body {
 
 .wa-header-workdir {
     position: absolute;
+    top: 50%;
     left: 50%;
-    transform: translateX(-50%);
+    max-width: 40%;
+    transform: translate(-50%, -50%);
     font-size: 13px;
     font-weight: 600;
     color: #ffffff;
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
-    max-width: 40%;
     text-align: center;
     opacity: 0.95;
+}
+
+.wa-header-workdir:empty {
+    display: none;
 }
 
 .wa-icon-btn {
@@ -556,10 +569,132 @@ body {
     gap: 10px;
 }
 
+.wa-settings-mobile-actions {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+
+.wa-settings-mobile-actions[hidden] {
+    display: none;
+}
+
+.wa-settings-action-slot {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
 .wa-settings-divider {
     height: 1px;
     background: var(--wa-border);
     opacity: 0.6;
+}
+
+@media (max-width: 640px) {
+    .wa-header {
+        padding: 0 8px 0 10px;
+    }
+
+    .wa-header-avatar {
+        width: 36px;
+        height: 36px;
+        margin-right: 10px;
+        font-size: 16px;
+    }
+
+    .wa-header-title-row {
+        gap: 5px;
+    }
+
+    .wa-header-title {
+        font-size: 15px;
+    }
+
+    .wa-runtime-model {
+        max-width: 42vw;
+    }
+
+    .wa-header-meta {
+        min-width: 0;
+        display: flex;
+        align-items: center;
+        gap: 8px;
+    }
+
+    .wa-header-status {
+        flex: 0 0 auto;
+        margin-top: 1px;
+        font-size: 11px;
+    }
+
+    .wa-header-workdir {
+        position: static;
+        flex: 1 1 auto;
+        min-width: 0;
+        max-width: none;
+        padding-left: 8px;
+        border-left: 1px solid rgba(255, 255, 255, 0.28);
+        transform: none;
+        color: rgba(255, 255, 255, 0.86);
+        font-size: 11px;
+        font-weight: 500;
+        text-align: left;
+    }
+
+    .wa-header-actions {
+        flex: 0 0 auto;
+        margin-left: 6px;
+    }
+
+    .wa-settings-panel {
+        top: calc(var(--wa-header-height) + 6px);
+        right: 8px;
+        left: 8px;
+        width: auto;
+        max-height: calc(100dvh - var(--wa-header-height) - 14px);
+        overflow-y: auto;
+    }
+
+    .wa-settings-panel .wa-responsive-header-action {
+        width: 100%;
+        height: auto;
+        min-height: 42px;
+        padding: 9px 10px;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 10px;
+        border: 0;
+        border-radius: 9px;
+        background: transparent;
+        color: var(--wa-text-primary);
+        cursor: pointer;
+        font: inherit;
+        text-align: left;
+    }
+
+    .wa-settings-panel .wa-responsive-header-action:hover,
+    .wa-settings-panel .wa-responsive-header-action:focus-visible {
+        background: var(--wa-bg-hover);
+        color: var(--wa-icon-color-active);
+        outline: none;
+    }
+
+    .wa-settings-panel .wa-responsive-header-action:disabled,
+    .wa-settings-panel .wa-responsive-header-action[aria-disabled="true"] {
+        cursor: default;
+        opacity: 0.5;
+    }
+
+    .wa-settings-panel .wa-responsive-header-action::after {
+        display: none;
+    }
+
+    .wa-settings-panel .wa-responsive-header-action-label {
+        display: inline;
+        margin-right: auto;
+    }
 }
 
 .wa-settings-row input[type="checkbox"] {
@@ -721,12 +856,12 @@ body {
     }
 
     .wa-side-panel {
-        position: fixed !important;
+        position: absolute !important;
         top: 0;
         left: 0;
         width: 100vw !important;
-        height: 100vh !important;
-        height: 100dvh !important;
+        height: calc(100% - var(--wa-floating-composer-space) + 18px) !important;
+        max-height: calc(100% - var(--wa-floating-composer-space) + 18px) !important;
         flex: none !important;
         max-width: none !important;
         border-radius: 0 !important;
@@ -736,8 +871,16 @@ body {
         z-index: 1000 !important;
     }
 
-    .wa-side-panel-header {
-        padding: 18px;
+    .wa-chat-container.side-panel-open .wa-side-panel-header {
+        min-height: 56px;
+        padding: 8px 12px 8px 16px;
+        border-bottom: 1px solid var(--wa-border);
+        background: var(--wa-bg-secondary);
+    }
+
+    .wa-chat-container.side-panel-open .wa-side-panel-close {
+        width: 44px;
+        height: 44px;
     }
 
     .wa-side-panel-content {

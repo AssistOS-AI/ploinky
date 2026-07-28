@@ -366,12 +366,32 @@ test('generic side panel stops above the floating composer and scrolls its conte
     );
     assert.match(
         css,
-        /\.wa-chat-container\.side-panel-open \.wa-side-panel\s*\{[^}]*height:\s*calc\(100% - var\(--wa-floating-composer-space\)\)/s,
+        /\.wa-chat-container\.side-panel-open \.wa-side-panel\s*\{[^}]*height:\s*calc\(100% - var\(--wa-floating-composer-space\) \+ 18px\)/s,
     );
     assert.match(
         css,
         /\.wa-side-panel-content\s*\{[^}]*min-height:\s*0[^}]*overflow:\s*auto/s,
     );
+});
+
+test('mobile side panel keeps its title and close action below the WebChat header', () => {
+    const css = fs.readFileSync(
+        new URL('../../cli/server/webchat/webchat.css', import.meta.url),
+        'utf8',
+    );
+    const html = fs.readFileSync(
+        new URL('../../cli/server/webchat/chat.html', import.meta.url),
+        'utf8',
+    );
+    assert.match(
+        css,
+        /@media \(max-width: 900px\)[\s\S]*?\.wa-side-panel\s*\{[^}]*position:\s*absolute !important[^}]*top:\s*0[^}]*height:\s*calc\(100% - var\(--wa-floating-composer-space\) \+ 18px\) !important/s,
+    );
+    assert.match(
+        css,
+        /@media \(max-width: 900px\)[\s\S]*?\.wa-chat-container\.side-panel-open \.wa-side-panel-close\s*\{[^}]*width:\s*44px[^}]*height:\s*44px/s,
+    );
+    assert.match(html, /id="sidePanelClose"[^>]*aria-label="Close"/);
 });
 
 test('workspace Markdown and text files are fetched and rendered inside the side panel', async (t) => {
