@@ -44,7 +44,7 @@ export function showHelp(args = []) {
   client status <agent>          One-line status (HTTP code, parsed)
 
   status | restart               Show state | restart enabled agents + Router
-  disable agents-all             Disable all enabled agents and remove their containers
+  disable agents-all             Disable all enabled agents and remove their runtime instances
   reinstall <agentName>          Re-create a running agent container (destructive)
   stop | shutdown | clean        Stop containers | remove containers
   destroy                        Stop router and remove workspace containers
@@ -297,7 +297,7 @@ function showDetailedHelp(topic, subtopic, subsubtopic) {
             description: 'Show enabled agents and router configuration',
             syntax: 'status',
             examples: [ 'status' ],
-            notes: 'Reads .ploinky/agents.json and prints container, binds, ports, and static config.'
+            notes: 'Reads .ploinky/agents.json and prints each runtime backend, live or stopped state, binds, ports, and static config. Bubblewrap and Seatbelt use tracked process PIDs; Docker and Podman use OCI state.'
         },
         'reinstall': {
             description: 'Reinstall an agent by re-creating its container.',
@@ -366,14 +366,14 @@ function showDetailedHelp(topic, subtopic, subsubtopic) {
                 },
                 'agent': {
                     syntax: 'disable [agent] <agentName>',
-                    description: 'Remove an enabled agent from .ploinky/agents.json, then stop and remove its container',
+                    description: 'Remove an enabled agent from .ploinky/agents.json, then stop and remove its runtime instance',
                     examples: [ 'disable demo', 'disable agent repoName/demo' ]
                 },
                 'agents-all': {
                     syntax: 'disable agents-all',
-                    description: 'Disable all enabled agents from .ploinky/agents.json and remove their containers',
+                    description: 'Disable all enabled agents from .ploinky/agents.json and remove their runtime instances',
                     examples: [ 'disable agents-all' ],
-                    notes: 'Registry entries are removed before containers are stopped so the watchdog does not restart them.'
+                    notes: 'Registry entries are removed before runtime instances are stopped so the watchdog does not restart them.'
                 }
             }
         },

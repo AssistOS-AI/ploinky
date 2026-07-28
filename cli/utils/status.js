@@ -3,7 +3,7 @@ import path from 'path';
 import net from 'net';
 import { PLOINKY_DIR, ROUTING_FILE } from './config.js';
 import * as reposSvc from './repos.js';
-import { collectLiveAgentContainers, getAgentsRegistry } from '../sandbox/docker/index.js';
+import { collectAgentRuntimeStates } from '../sandbox/agentRuntimeState.js';
 import { findAgent } from './utils.js';
 import { gatherSsoStatus, listAuthProviders } from './security/sso.js';
 
@@ -87,39 +87,13 @@ export function listRepos() {
 }
 
 export function listCurrentAgents() {
-    const live = collectLiveAgentContainers();
-    if (!live.length) {
-        const legacy = getAgentsRegistry();
-        const names = Object.keys(legacy || {});
-        if (!names.length) {
-            console.log(styles.warn('No running agent containers detected.'));
-            return;
-        }
-        console.log(styles.warn('No running agent containers detected. Last recorded registry entries:'));
-        for (const name of names) {
-            const r = legacy[name] || {};
-            const type = r.type || '-';
-            const agent = r.agentName || '-';
-            const repo = r.repoName || '-';
-            const img = r.containerImage || '-';
-            const cwd = r.projectPath || '-';
-            const created = r.createdAt || '-';
-            const binds = r.config?.binds ? r.config.binds.length : 0;
-            const envs = r.config?.env ? r.config.env.length : 0;
-            const ports = r.config?.ports
-                ? r.config.ports.map(p => `${p.containerPort}->${p.hostPort}`).join(', ')
-                : '';
-            console.log(`- ${styles.name(name)}`);
-            console.log(`    ${styles.label('type')}: ${type}  ${styles.label('agent')}: ${styles.accent(agent)}  ${styles.label('repo')}: ${styles.accent(repo)}`);
-            console.log(`    ${styles.label('image')}: ${img}`);
-            console.log(`    ${styles.label('created')}: ${created}`);
-            console.log(`    ${styles.label('cwd')}: ${cwd}`);
-            console.log(`    ${styles.label('binds')}: ${binds}  ${styles.label('env')}: ${envs}${ports ? `  ${styles.label('ports')}: ${ports}` : ''}`);
-        }
+    const runtimes = collectAgentRuntimeStates();
+    if (!runtimes.length) {
+        console.log(styles.warn('No enabled or running agent runtimes detected.'));
         return;
     }
-    console.log(styles.header('Running agent containers:'));
-    for (const entry of live) {
+    console.log(styles.header('Agent runtimes:'));
+    for (const entry of runtimes) {
         const binds = entry.config?.binds?.length || 0;
         const envs = entry.config?.env?.length || 0;
         const ports = (entry.config?.ports || [])
@@ -135,7 +109,8 @@ export function listCurrentAgents() {
             created: styles.info
         })[status] || styles.warn;
         const pidInfo = entry.state?.pid ? ` ${styles.muted(`pid ${entry.state.pid}`)}` : '';
-        console.log(`  ${bulletSymbol} ${styles.name(entry.containerName)} ${statusFormatter(`[${status}]`)}${pidInfo}`);
+        const runtime = entry.runtime || 'container';
+        console.log(`  ${bulletSymbol} ${styles.name(entry.containerName)} ${statusFormatter(`[${status}]`)} ${styles.muted(`[${runtime}]`)}${pidInfo}`);
         console.log(`     ${styles.label('agent')}: ${styles.accent(entry.agentName || '-')}` +
             `  ${styles.label('repo')}: ${styles.accent(entry.repoName || '-')}`);
         console.log(`     ${styles.label('image')}: ${entry.containerImage || '-'}`);

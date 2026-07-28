@@ -70,10 +70,10 @@ The command surface is split between the registry in `cli/commands/commandRegist
 | `update repos` | Updates installed Ploinky repos, refreshes runtime Achilles dependencies, and refreshes `AchillesCopilotBasicSkills` in eligible managed repos. |
 | `update all [folder]` | Updates the Ploinky runtime, installed repos, managed-repo default skills, discovered workspace git repos, and default skills for discovered repos. |
 | `reinstall [agent]` / `reinstall agent <agent>` | Removes the running service for an enabled agent, recreates it with `ensureAgentService`, updates routing, and starts the router if needed. |
-| `enable agent <agent> [global|devel <repo>]` | Resolves an agent manifest, writes an enabled-agent record to `.ploinky/agents.json`, and creates work dirs/symlinks. |
+| `enable agent <agent> [global|devel <repo>]` | Resolves an agent manifest, writes an enabled-agent record, creates work dirs/symlinks, starts the selected runtime, verifies backend-specific liveness, and publishes its route. |
 | `enable sandbox` | Allows host sandbox runtimes for manifests with `lite-sandbox: true`. |
-| `disable agent <agent>` | Removes an enabled-agent record only if no live/stopped container or sandbox process exists for it. Symlinks are removed; the work dir is preserved. |
-| `disable agents-all` | Tries to disable all enabled agents and skips ones with live/stopped runtime state. |
+| `disable agent <agent>` | Removes the enabled-agent record, stops/removes the selected container or sandbox process from a captured record snapshot, removes symlinks, and preserves the work dir. |
+| `disable agents-all` | Removes all selected enabled-agent records, then tears down their runtime instances from the captured record snapshot. |
 | `disable sandbox` | Disables host sandbox runtimes, causing `lite-sandbox` agents to fall back to containers. |
 | `sandbox status|enable|disable` | Reads or changes the host-sandbox toggle stored under `_config.sandbox`. |
 | `start [agent] [port] [branch flags]` | Ensures repos/agents/dependencies, starts dependency graph services, writes routing, and launches the router watchdog. |
@@ -118,7 +118,7 @@ An agent is discovered by a `manifest.json` file below `.ploinky/repos/<repo>/<a
 
 ## Enabled-Agent Records
 
-`enable agent` does not start a container. It records intent and creates workspace structure.
+`enable agent` records intent, creates workspace structure, starts the selected backend, verifies that backend's liveness, and only then publishes routing state.
 
 ```mermaid
 flowchart TD
@@ -130,6 +130,12 @@ flowchart TD
   F --> G["create .data/<agent-or-alias>"]
   G --> H["create .ploinky/code/<agent> symlink"]
   H --> I["create .ploinky/skills/<agent> symlink when skills/ exists"]
+  I --> J["ensureAgentService selects and starts backend"]
+  J --> K{"recorded runtime"}
+  K -- "container" --> L["verify Docker/Podman container liveness"]
+  K -- "bwrap/seatbelt" --> M["verify tracked sandbox PID"]
+  L --> N["publish route"]
+  M --> N
 ```
 
 The registry key is the generated container name from `getAgentContainerName(aliasOrAgent, repo)`: `ploinky_<repo>_<agentOrAlias>_<workspaceBasename>_<workspaceHash>`.
@@ -158,7 +164,7 @@ Run modes:
 | `global` | Workspace root. |
 | `devel <repo>` | `.ploinky/repos/<repo>`, which must already exist. |
 
-Disable behavior is conservative. `disable agent` refuses to remove the record when a live container, stopped container, or sandbox process appears to exist. If it can disable, it clears matching static config, removes symlinks, and leaves `.data/<agent-or-alias>` intact.
+Disable removes the registry entry before stopping the runtime so the watchdog cannot restart an intentionally disabled agent. It passes the removed record as an in-memory snapshot to the fleet remover; otherwise the generic instance key would lose its `runtime` discriminator and a Bubblewrap or Seatbelt process could be mistaken for a Docker/Podman container. It also clears matching static config, removes symlinks, and leaves `.data/<agent-or-alias>` intact.
 
 ## Manifest Fields
 
@@ -598,7 +604,7 @@ sequenceDiagram
 
 Router-owned paths include `/health`, `/mcp`, `/agent-card`, `/auth/*`, `/api/agents/*`, `/api/marketplace`, `/webchat`, `/dashboard`, `/status`, `/upload`, `/blobs`, `/workspace-files`, `/metrics`, `/admin`, and `/__agent`.
 
-`/api/marketplace` is a first-party JSON management API for the Marketplace plugin. GET requires an authenticated local or SSO user and returns repository, source metadata, repository kind, agent, enabled-registry, and live runtime-status data. POST requires a local admin session and supports `install_repo`, `uninstall_repo`, `enable_agent`, and marketplace-specific `disable_agent`. Repository install requires a URL, accepts an optional name and branch, clones the checkout, and records source metadata. Repository uninstall disables enabled agents from that repo by container key, removes their runtime containers, removes the checkout, and preserves `repo_sources.json` metadata so the repo can be installed again. Marketplace deactivation removes the enabled-agent registry entry before removing the runtime container; the ordinary direct `disable agent` CLI command remains conservative and refuses to remove records while runtime state exists.
+`/api/marketplace` is a first-party JSON management API for the Marketplace plugin. GET requires an authenticated local or SSO user and returns repository, source metadata, repository kind, agent, enabled-registry, recorded backend, and live runtime-status data. Marketplace and CLI status share backend-aware collection: Bubblewrap and Seatbelt use their tracked PIDs, while Docker and Podman use OCI inspection; enabled runtimes without a live process remain visible as stopped. POST requires a local admin session and supports `install_repo`, `uninstall_repo`, `enable_agent`, and `disable_agent`. Repository install requires a URL, accepts an optional name and branch, clones the checkout, and records source metadata. Repository uninstall disables enabled agents from that repo by runtime-instance key, removes their runtimes, removes the checkout, and preserves `repo_sources.json` metadata so the repo can be installed again. Marketplace and CLI enable/disable actions delegate to the same lifecycle helpers; backend selection belongs there rather than in the HTTP endpoint.
 
 Agent routes are stored under `routing.routes[routeKey]`. The route key is the alias when present, otherwise the short agent name. A plain `/` request redirects to the static route's `/index.html` when a static route exists.
 
@@ -643,7 +649,7 @@ MCP tool and resource commands require router-minted invocation headers before c
 | `shutdown` | Kills router. | Destroys workspace containers for enabled agents. |
 | `destroy` | Kills router. | Destroys all workspace containers, clears `.ploinky/deps`, and preserves `.data/<agent-or-alias>`. |
 | `clean` | Does not explicitly kill router in command code. | Destroys all workspace containers, clears `.ploinky/deps`, and preserves `.data/<agent-or-alias>`. |
-| `disable agent` | Clears matching static config if disabling succeeds. | Refuses if runtime state exists. |
+| `disable agent` | Clears matching static config if disabling succeeds. | Removes the registry entry, then stops/removes the runtime using the captured record's backend. |
 
 ## Code-Observed Caveats
 

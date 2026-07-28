@@ -4,7 +4,7 @@ import { PLOINKY_DIR } from '../../utils/config.js';
 import * as reposSvc from '../../utils/repos.js';
 import * as agentsSvc from '../../utils/agents.js';
 import * as workspaceSvc from '../../utils/workspace.js';
-import { collectLiveAgentContainers } from '../../sandbox/docker/index.js';
+import { collectAgentRuntimeStates } from '../../sandbox/agentRuntimeState.js';
 import { collectAgentsSummary } from '../../utils/status.js';
 import { isLocalAdminUser } from '../auth/localService.js';
 import { computeRchHttp, sha256RawBodyHash } from '../../../Agent/lib/requestHash.mjs';
@@ -160,19 +160,21 @@ function marketplaceContainerMatchesAgent(containerName, repoName, agentName) {
     return String(containerName || '').startsWith(prefix);
 }
 
-function buildMarketplaceState(user = null) {
+function buildMarketplaceState(user = null, options = {}) {
     const reposDir = path.join(PLOINKY_DIR, 'repos');
     const predefined = reposSvc.getPredefinedRepos();
     const sources = reposSvc.getRepoSources();
     const installed = new Set(reposSvc.getInstalledRepos(reposDir));
-    const enabledAgents = Object.entries(workspaceSvc.loadAgents())
+    const agentsRegistry = options.registry || workspaceSvc.loadAgents();
+    const enabledAgents = Object.entries(agentsRegistry)
         .filter(([, record]) => record && record.type === 'agent')
         .map(([containerName, record]) => ({
             repoName: String(record.repoName || ''),
             agentName: String(record.agentName || ''),
             containerName: String(containerName || ''),
             alias: String(record.alias || ''),
-            runMode: String(record.runMode || agentsSvc.DEFAULT_ENABLE_AGENT_MODE)
+            runMode: String(record.runMode || agentsSvc.DEFAULT_ENABLE_AGENT_MODE),
+            runtime: String(record.runtime || 'container')
         }));
     const activeAgentsByRepo = new Map();
     for (const record of enabledAgents) {
@@ -199,23 +201,29 @@ function buildMarketplaceState(user = null) {
     const enabledKeys = new Set(enabledAgents.map(record => `${record.repoName}/${record.agentName}`));
     const enabledByContainer = new Map(enabledAgents.map(record => [record.containerName, record]));
     const enabledByRef = new Map(enabledAgents.map(record => [`${record.repoName}/${record.agentName}`, record]));
-    const liveEntries = collectLiveAgentContainers() || [];
-    const summaries = collectAgentsSummary({ includeInactive: true });
+    const runtimeEntries = Object.hasOwn(options, 'runtimeEntries')
+        ? (options.runtimeEntries || [])
+        : collectAgentRuntimeStates({ registry: agentsRegistry });
+    const summaries = Object.hasOwn(options, 'summaries')
+        ? (options.summaries || [])
+        : collectAgentsSummary({ includeInactive: true });
     const agents = [];
     for (const repo of summaries) {
         for (const agent of repo.agents || []) {
             const ref = `${agent.repo}/${agent.name}`;
-            const liveEntry = liveEntries.find((entry) => {
+            const runtimeEntry = runtimeEntries.find((entry) => {
                 const containerName = String(entry?.containerName || '');
                 const registryRecord = enabledByContainer.get(containerName);
                 if (registryRecord && `${registryRecord.repoName}/${registryRecord.agentName}` === ref) return true;
                 if (`${entry?.repoName || ''}/${entry?.agentName || ''}` === ref) return true;
                 return marketplaceContainerMatchesAgent(containerName, agent.repo, agent.name);
             });
-            const runtime = liveEntry ? {
-                status: String(liveEntry?.state?.status || '').trim().toLowerCase() || 'unknown',
-                pid: liveEntry?.state?.pid || null,
-                containerName: String(liveEntry?.containerName || '')
+            const runtimeState = runtimeEntry ? {
+                backend: String(runtimeEntry?.runtime || '').trim().toLowerCase() || 'container',
+                status: String(runtimeEntry?.state?.status || '').trim().toLowerCase() || 'unknown',
+                running: Boolean(runtimeEntry?.state?.running),
+                pid: runtimeEntry?.state?.pid || null,
+                containerName: String(runtimeEntry?.containerName || '')
             } : null;
             const active = enabledKeys.has(ref);
             const enabledRecord = enabledByRef.get(ref) || null;
@@ -227,10 +235,11 @@ function buildMarketplaceState(user = null) {
                 active,
                 enableMode: enabledRecord?.runMode || agentsSvc.DEFAULT_ENABLE_AGENT_MODE,
                 enableModes: agentsSvc.ENABLE_AGENT_MODES,
-                status: runtime?.status || (active ? 'stopped' : 'inactive'),
-                running: runtime?.status === 'running',
-                pid: runtime?.pid || null,
-                containerName: runtime?.containerName || '',
+                runtime: runtimeState?.backend || enabledRecord?.runtime || '',
+                status: runtimeState?.status || (active ? 'stopped' : 'inactive'),
+                running: runtimeState?.running || false,
+                pid: runtimeState?.pid || null,
+                containerName: runtimeState?.containerName || enabledRecord?.containerName || '',
                 manifestPath: agent.manifestPath || ''
             });
         }
@@ -417,6 +426,7 @@ export async function handleMarketplaceRoutes(req, res, parsedUrl) {
 }
 
 export const __testables = {
+    buildMarketplaceState,
     readAuthorizationBearer,
     verifyMarketplaceAgentRequest,
 };

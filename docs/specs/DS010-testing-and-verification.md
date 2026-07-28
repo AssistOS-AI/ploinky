@@ -14,6 +14,8 @@ The repository’s test surface is stage-oriented and closely tied to the runtim
 
 ## Core Content
 
+Runtime-state coverage must verify that the shared status collector reports Bubblewrap and Seatbelt from their tracked PIDs, merges Docker and Podman inspection results, retains stopped enabled runtimes, and supplies Marketplace with the same backend and liveness values shown by the CLI.
+
 The main end-to-end harness is `tests/test_all.sh`. It must orchestrate the prepare, start, stop, start-again, restart, destroy, and unit-test flow, while preserving the ability to summarize failures instead of aborting on the first non-fatal verification error. `tests/run-all.sh` is a dispatch wrapper around that main script.
 
 Test stages are intentionally split. Action scripts such as `tests/doPrepare.sh`, `tests/doStart.sh`, and `tests/doRestart.sh` create the runtime state transitions. Verification scripts such as `tests/testsAfterStart.sh` inspect the resulting state. Shared shell assertions live in `tests/test-functions/`, and Node unit tests live in `tests/unit/` and are run through `node --test`.
@@ -44,6 +46,8 @@ downloads.
 Folder-session changes require focused store and surface tests. Tests must verify first-open creation, refresh reuse, invalid-pointer repair, malformed-file exclusion, symlink rejection, selector metadata without message bodies or counts, relative-time formatting, stable `sessionStorage` tab identity, multi-subscriber SSE delivery, lazy history rendering, and reservation of `tabId`/`sessionId` from agent CLI arguments. Continuation coverage must also verify that an envelope-aware recreated runtime receives ordered user/assistant history exactly once with the current message kept separate, browser-supplied history is ignored, UI-only records are excluded, slash commands defer restoration, and plain-text agents retain the legacy fallback. An integration smoke should additionally verify the `Sessions` selector, its first-item `New` action, the `Click to load session history` action, and reuse of a surviving runtime after refresh.
 
 Interactive-control changes require focused runtime, route, and browser tests. Coverage must verify that structured requests and resolutions are intercepted before history, pending state is replayed on reconnect, the endpoint requires the matching active subscriber/session/request/option, replay is rejected, the declared default is selected, Arrow Up/Down wraps, Enter submits, and ordinary composer submission remains disabled while the selector is active.
+
+Agent lifecycle changes require backend-aware unit coverage. Enable tests must prove that container runtimes use container liveness while Bubblewrap and Seatbelt use their tracked process PID without consulting the container daemon. Disable tests must prove that a captured registry record still selects sandbox teardown after the live registry entry has been removed.
 
 When the local workspace includes an application plugin that embeds Ploinky WebChat behavior, a cross-surface smoke should verify parity with the canonical WebChat flow: open the application surface, verify file/folder suggestions, submit text such as `@open-interpreter` through the UI send path, and confirm the application persists the chat content through its own storage. This cross-repository smoke belongs to the integration runbook in the application repository; Ploinky's responsibility is to keep WebChat generic and to preserve the authenticated routing, envelope, reference, and suggestion-endpoint behavior that the application smoke depends on.
 

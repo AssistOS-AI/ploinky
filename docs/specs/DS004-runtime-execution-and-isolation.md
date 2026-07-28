@@ -24,6 +24,10 @@ The runtime may also execute agents through host sandbox backends when the manif
 
 Host sandbox teardown must be batch-oriented when multiple sandboxed agents are stopped or destroyed. The runtime must send the graceful signal to every selected sandbox process group first, wait once against the shared deadline, and only then force-kill the remaining process groups before clearing their PID records. A slow or stuck sandboxed agent must not delay graceful signal delivery to the other sandboxed agents in the same stop or destroy operation.
 
+Runtime lifecycle checks must dispatch by the actual backend recorded in `.ploinky/agents.json`. Enable-time verification checks container liveness only for Docker or Podman and checks the tracked agent PID for Bubblewrap or Seatbelt. Disable-time teardown may remove registry entries first to prevent watchdog resurrection, but it must carry a snapshot of those records into the fleet remover so backend identity remains available after the registry write.
+
+Runtime reporting must use the same backend-aware state model. Marketplace and CLI status surfaces must report every enabled agent from `.ploinky/agents.json`, identify its recorded runtime, and determine liveness from the tracked process PID for Bubblewrap or Seatbelt and from OCI inspection for Docker or Podman. An enabled runtime with no live process or container must remain visible as `stopped`; host-sandbox agents must not be classified as stopped merely because no OCI container exists.
+
 `destroy` must remove workspace runtimes and regenerated runtime caches, including `.ploinky/deps`, but it must not remove agent homes under `.data/<agent-or-alias>/`. Starting the workspace after destroy must recreate runtimes and dependency caches while remounting the preserved `.data` directory at `/root` for each container or Linux Bubblewrap agent.
 
 The Linux Bubblewrap backend must keep the selected project path separate from the persistent agent home. It must bind `.data/<agent-or-alias>/` read-write at `/root`, set `HOME=/root`, and use the alias when one identifies the enabled instance. Isolated mode must use `/root` for both the project mount and `WORKSPACE_PATH`; global and development modes must bind their selected project independently and keep `WORKSPACE_PATH` at that project path. Daemon startup and interactive CLI or shell attachment must use the same home and project mapping.
@@ -91,6 +95,16 @@ Bubblewrap resolves nested bind destinations sequentially. Once `/Agent` is a re
 
 Response:
 The dependency cache runtime key is derived from the Node.js process that runs Ploinky. Selecting a different system Node inside Bubblewrap can execute a cache prepared for another Node major and can expose an incomplete npm installation. Mounting the same distribution read-only keeps Node, npm, and the cache ABI aligned without granting the agent write access to the host toolchain.
+
+### Question #9: Why does disable retain a registry snapshot after deleting the live entry?
+
+Response:
+Deleting the entry first prevents the watchdog from interpreting teardown as an unexpected crash and immediately restarting the agent. The removed record still contains the only reliable backend discriminator, so passing an in-memory snapshot to teardown preserves that identity without making the agent enabled again. This lets the same disable path stop an OCI container or a host-sandbox PID correctly.
+
+### Question #10: Why do Marketplace and CLI status share one runtime-state collector?
+
+Response:
+An enabled-agent record names the selected backend, while backend-specific mechanisms provide liveness. Sharing one collector prevents an API from treating Bubblewrap or Seatbelt as an absent container while another CLI path correctly recognizes its PID, and it preserves stopped enabled entries for operational diagnosis.
 
 ## Conclusion
 

@@ -15,6 +15,7 @@ import {
     stopAndRemoveMany,
     ensureAgentService
 } from '../sandbox/docker/index.js';
+import { isBwrapProcessRunning } from '../sandbox/bwrap/bwrapFleet.js';
 import { findAgent } from './utils.js';
 import { REPOS_DIR, PLOINKY_WORKSPACE_ROOT, ROUTING_FILE } from './config.js';
 import { resolveManifestStartup } from './runtime/manifestStartup.js';
@@ -80,19 +81,27 @@ function buildDefaultLocalAuthVars(routeKey) {
     };
 }
 
-export function verifyEnabledAgentStarted(shortAgentName, containerName, {
+export function verifyEnabledAgentStarted(shortAgentName, runtimeInstanceName, {
+    runtime = 'container',
     isRunning = isContainerRunning,
     waitRunning = waitForContainerRunning,
+    isSandboxRunning = isBwrapProcessRunning,
     log = console.log
 } = {}) {
-    if (!containerName) {
-        throw new Error(`enable agent: failed to start '${shortAgentName}': no container was returned.`);
+    if (!runtimeInstanceName) {
+        throw new Error(`enable agent: failed to start '${shortAgentName}': no runtime instance was returned.`);
     }
-    const running = isRunning(containerName) || waitRunning(containerName, 8, 250);
+    const sandboxRuntime = runtime === 'bwrap' || runtime === 'seatbelt';
+    const running = sandboxRuntime
+        ? isSandboxRunning(shortAgentName)
+        : isRunning(runtimeInstanceName) || waitRunning(runtimeInstanceName, 8, 250);
     if (!running) {
-        throw new Error(`enable agent: failed to start '${shortAgentName}': container '${containerName}' exited during startup. Check container logs for details.`);
+        const details = sandboxRuntime
+            ? `${runtime} process '${shortAgentName}' exited during startup. Check sandbox logs for details.`
+            : `container '${runtimeInstanceName}' exited during startup. Check container logs for details.`;
+        throw new Error(`enable agent: failed to start '${shortAgentName}': ${details}`);
     }
-    log(`Agent '${shortAgentName}' started successfully in container '${containerName}'.`);
+    log(`Agent '${shortAgentName}' started successfully with ${runtime} runtime '${runtimeInstanceName}'.`);
 }
 
 function parsePloinkyDirectives(rawValue) {
@@ -401,7 +410,11 @@ export function enableAgent(agentName, mode, repoNameParam, aliasParam, authMode
     } catch (error) {
         throw new Error(`enable agent: failed to start '${shortAgentName}': ${error?.message || error}`);
     }
-    verifyEnabledAgentStarted(shortAgentName, started?.containerName || containerName);
+    const startedInstanceName = started?.containerName || containerName;
+    const startedRecord = loadAgents()?.[startedInstanceName];
+    verifyEnabledAgentStarted(shortAgentName, startedInstanceName, {
+        runtime: started?.runtime || startedRecord?.runtime || 'container'
+    });
 
     const hostPort = started?.hostPort || preferredHostPort || existingRoute.hostPort;
     const additionalServerPort = started?.additionalServerPort || null;
@@ -543,9 +556,11 @@ export function disableAgent(agentRef) {
     saveAgents(map);
 
     try {
-        stopAndRemove(containerName);
+        stopAndRemove(containerName, {
+            records: { [containerName]: record }
+        });
     } catch (error) {
-        throw new Error(`disable agent: failed to stop and remove container '${containerName}': ${error?.message || error}`);
+        throw new Error(`disable agent: failed to stop and remove runtime instance '${containerName}': ${error?.message || error}`);
     }
 
     // Remove workspace structure for the agent
@@ -576,6 +591,7 @@ export function disableAgentContainers(containerNames = []) {
     const map = loadAgents();
     const config = (map && typeof map._config === 'object') ? map._config : null;
     const disabled = [];
+    const runtimeRecords = {};
 
     const clearStaticConfig = ({ repoName, shortName, containerName }) => {
         if (!config || !config.static) return false;
@@ -614,6 +630,7 @@ export function disableAgentContainers(containerNames = []) {
             continue;
         }
 
+        runtimeRecords[containerName] = record;
         delete map[containerName];
         clearStaticConfig({
             repoName: record.repoName,
@@ -632,9 +649,9 @@ export function disableAgentContainers(containerNames = []) {
     saveAgents(map);
 
     try {
-        stopAndRemoveMany(targets);
+        stopAndRemoveMany(targets, { records: runtimeRecords });
     } catch (error) {
-        throw new Error(`disable agents: failed to stop and remove containers: ${error?.message || error}`);
+        throw new Error(`disable agents: failed to stop and remove runtime instances: ${error?.message || error}`);
     }
 
     for (const item of disabled) {
