@@ -2018,6 +2018,7 @@ export function edgeRuntimeEnvironment(networkMode, options = {}) {
     return {
         PLOINKY_EDGE_TOPOLOGY_FILE: mode === 'host' ? paths.topologyCurrentFile : EDGE_TOPOLOGY_CONTAINER_FILE,
         PLOINKY_ROUTER_URL: `http://${host}:8080`,
+        PLOINKY_ROUTER_AUTHORITY: `127.0.0.1:${selectedRouterHostPort()}`,
         PLOINKY_INTERNAL_ROUTER_URL: `http://${host}:8081`,
     };
 }

@@ -283,6 +283,7 @@ test('container router env builder preserves endpoint parity for every network m
             PLOINKY_ROUTER_PORT: env.PLOINKY_ROUTER_PORT,
             PLOINKY_ROUTER_URL: env.PLOINKY_ROUTER_URL,
         }, endpoint.env);
+        assert.equal(env.PLOINKY_ROUTER_AUTHORITY, '127.0.0.1:8080');
         assert.equal(env.PLOINKY_INTERNAL_ROUTER_URL, `http://${endpoint.host}:8081`);
         assert.equal(typeof env.PLOINKY_EDGE_TOPOLOGY_FILE, 'string');
         assert.notEqual(env.PLOINKY_EDGE_TOPOLOGY_FILE, '');
@@ -352,6 +353,7 @@ test('reserved env filtering restores only the runtime-owned Router authority', 
         '-e SAFE="kept"',
         '-e PLOINKY_MASTER_KEY="must-be-removed"',
         '-e PLOINKY_ROUTER_URL="http://manifest.invalid:1"',
+        '-e PLOINKY_ROUTER_AUTHORITY="attacker.invalid:1"',
         '-e PLOINKY_AGENT_ID="agent:forged/identity"',
     ];
     const runtimeRouterEnv = buildRuntimeRouterEnv('podman', {

@@ -53,7 +53,7 @@ test('buildRuntimeRouterEnv uses the validated managed box-host endpoint', () =>
 const { buildRouterEndpoint } = await import(${JSON.stringify(pathToFileURL(path.join(repoRoot, 'cli/sandbox/routerPort.js')).href)});
 const routerEndpoint = buildRouterEndpoint('default', 8080);
 process.stdout.write(JSON.stringify(buildRuntimeRouterEnv('podman', { networkMode: 'default', routerPort: 8080, routerEndpoint })));`,
-            {},
+            { PLOINKY_ROUTER_HOST_PORT: '19090' },
             { cwd: workspaceDir },
         );
 
@@ -62,6 +62,7 @@ process.stdout.write(JSON.stringify(buildRuntimeRouterEnv('podman', { networkMod
             PLOINKY_ROUTER_PORT: '8080',
             PLOINKY_ROUTER_HOST: 'host.containers.internal',
             PLOINKY_ROUTER_URL: 'http://host.containers.internal:8080',
+            PLOINKY_ROUTER_AUTHORITY: '127.0.0.1:19090',
             PLOINKY_INTERNAL_ROUTER_URL: 'http://host.containers.internal:8081',
             PLOINKY_EDGE_TOPOLOGY_FILE: '/run/ploinky-edge-topology/current.json',
         });
@@ -90,6 +91,7 @@ process.stdout.write(JSON.stringify(buildRuntimeRouterEnv('docker', { networkMod
             PLOINKY_ROUTER_PORT: '8080',
             PLOINKY_ROUTER_HOST: 'host.containers.internal',
             PLOINKY_ROUTER_URL: 'http://host.containers.internal:8080',
+            PLOINKY_ROUTER_AUTHORITY: '127.0.0.1:8080',
             PLOINKY_INTERNAL_ROUTER_URL: 'http://host.containers.internal:8081',
             PLOINKY_EDGE_TOPOLOGY_FILE: '/run/ploinky-edge-topology/current.json',
         });

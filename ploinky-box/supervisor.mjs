@@ -307,6 +307,7 @@ export async function runBoundedCoreStart(
     }
     const result = runner.query(engine.name, [
         'container', 'exec',
+        '--env', `PLOINKY_ROUTER_HOST_PORT=${hostPort}`,
         '--user', 'podman',
         '--workdir', '/workspace',
         containerId,

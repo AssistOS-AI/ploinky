@@ -84,7 +84,7 @@ import {
     readManifestVolumeOptions,
     resolveManifestVolumeHostPath
 } from '../../utils/runtime/manifestVolumePolicy.js';
-import { assertRouterEndpoint } from '../routerPort.js';
+import { assertRouterEndpoint, selectedRouterHostPort } from '../routerPort.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -457,6 +457,7 @@ function buildFullEnvMap(agentName, manifest, profileConfig, agentWorkDir, repoN
     // Router discovery is a runtime contract, not user configuration. Assert it
     // after every manifest, profile, environment, and secret layer.
     Object.assign(env, endpoint.env);
+    env.PLOINKY_ROUTER_AUTHORITY = `127.0.0.1:${selectedRouterHostPort()}`;
 
     return env;
 }

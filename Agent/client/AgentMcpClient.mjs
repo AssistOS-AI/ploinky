@@ -36,6 +36,24 @@ export function getAgentMcpUrl(agentName, routerUrl = getRouterUrl()) {
     return `${routerUrl}/${agentName}/mcp`;
 }
 
+export function getRouterAuthority(routerUrl = getRouterUrl()) {
+    const raw = String(process.env.PLOINKY_ROUTER_AUTHORITY || '').trim();
+    if (!raw) return new URL(routerUrl).host;
+    if (raw.endsWith(':') || /[\s\\/@?#,]/.test(raw)) {
+        throw new Error('AgentMcpClient: invalid PLOINKY_ROUTER_AUTHORITY');
+    }
+    let parsed;
+    try {
+        parsed = new URL(`http://${raw}/`);
+    } catch {
+        throw new Error('AgentMcpClient: invalid PLOINKY_ROUTER_AUTHORITY');
+    }
+    if (parsed.username || parsed.password || parsed.pathname !== '/' || parsed.search || parsed.hash || !parsed.hostname) {
+        throw new Error('AgentMcpClient: invalid PLOINKY_ROUTER_AUTHORITY');
+    }
+    return parsed.host.toLowerCase();
+}
+
 const DEFAULT_TASK_POLL_INTERVAL_MS = 5000;
 const MARKETPLACE_PATH = '/api/marketplace';
 const MARKETPLACE_TARGET = 'ploinky-router';
@@ -150,6 +168,7 @@ function requestMarketplace(method = 'GET', body = null, routerUrl = getRouterUr
             path: MARKETPLACE_PATH,
             method,
             headers: {
+                host: getRouterAuthority(url),
                 accept: 'application/json',
                 authorization: `Bearer ${assertion}`,
                 ...(payload.length ? {
@@ -239,6 +258,7 @@ function postToolCall(agentName, jsonRpcBody, assertion, userDelegationToken = '
             path: `${url.pathname}${url.search || ''}`,
             method: 'POST',
             headers: {
+                host: getRouterAuthority(url),
                 'content-type': 'application/json',
                 'content-length': payload.length,
                 accept: 'application/json',
@@ -283,6 +303,7 @@ function getTaskStatus(agentName, taskId, routerUrl = getRouterUrl()) {
             path: `${url.pathname}${url.search || ''}`,
             method: 'GET',
             headers: {
+                host: getRouterAuthority(url),
                 accept: 'application/json',
                 authorization: `Bearer ${assertion}`,
             },

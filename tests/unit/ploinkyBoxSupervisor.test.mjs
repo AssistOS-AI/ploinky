@@ -268,6 +268,9 @@ test('bounded start requires the external Dashboard URL and preserves normalized
     );
     assert.equal(status, 0);
     assert.deepEqual(calls[0][1].slice(-4), ['--debug', 'start', 'Agent', '8080']);
+    assert.deepEqual(calls[0][1].slice(0, 5), [
+        'container', 'exec', '--env', 'PLOINKY_ROUTER_HOST_PORT=19090', '--user',
+    ]);
     assert.equal(output.value.match(/Debug mode enabled/g)?.length, 1);
 
     const defaultTimeoutCalls = [];

@@ -8,6 +8,7 @@ import path from 'node:path';
 const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-agent-client-'));
 const originalCwd = process.cwd();
 const originalRouterUrl = process.env.PLOINKY_ROUTER_URL;
+const originalRouterAuthority = process.env.PLOINKY_ROUTER_AUTHORITY;
 const originalAgentId = process.env.PLOINKY_AGENT_ID;
 const originalAgentSecret = process.env.PLOINKY_AGENT_SECRET;
 const originalPollInterval = process.env.PLOINKY_MCP_TASK_POLL_INTERVAL_MS;
@@ -19,6 +20,7 @@ process.env.PLOINKY_MCP_TASK_POLL_INTERVAL_MS = '10';
 
 const {
     createAgentClient,
+    getRouterAuthority,
     setAgentTaskObserver,
 } = await import('../../Agent/client/AgentMcpClient.mjs');
 
@@ -38,6 +40,8 @@ test.after(() => {
     fs.rmSync(tempDir, { recursive: true, force: true });
     if (originalRouterUrl === undefined) delete process.env.PLOINKY_ROUTER_URL;
     else process.env.PLOINKY_ROUTER_URL = originalRouterUrl;
+    if (originalRouterAuthority === undefined) delete process.env.PLOINKY_ROUTER_AUTHORITY;
+    else process.env.PLOINKY_ROUTER_AUTHORITY = originalRouterAuthority;
     if (originalAgentId === undefined) delete process.env.PLOINKY_AGENT_ID;
     else process.env.PLOINKY_AGENT_ID = originalAgentId;
     if (originalAgentSecret === undefined) delete process.env.PLOINKY_AGENT_SECRET;
@@ -54,6 +58,7 @@ async function withCaptureServer(t, onRequest) {
     });
     const port = await listen(server);
     process.env.PLOINKY_ROUTER_URL = `http://127.0.0.1:${port}`;
+    delete process.env.PLOINKY_ROUTER_AUTHORITY;
     t.after(async () => {
         await close(server);
     });
@@ -82,6 +87,33 @@ test('createAgentClient requires a valid nonempty PLOINKY_ROUTER_URL without fal
         else process.env.PLOINKY_ROUTER_URL = previousUrl;
         if (previousPort === undefined) delete process.env.PLOINKY_ROUTER_PORT;
         else process.env.PLOINKY_ROUTER_PORT = previousPort;
+    }
+});
+
+test('createAgentClient separates the Router transport address from its canonical authority', async (t) => {
+    let capturedHost = '';
+    await withCaptureServer(t, (req, _body, res) => {
+        capturedHost = req.headers.host || '';
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ jsonrpc: '2.0', id: '1', result: { ok: true } }));
+    });
+    process.env.PLOINKY_ROUTER_AUTHORITY = 'router.example:19090';
+
+    const client = await createAgentClient('dpuAgent');
+    assert.deepEqual(await client.callTool('dpu_workspace_roots', {}), { ok: true });
+    assert.equal(capturedHost, 'router.example:19090');
+});
+
+test('getRouterAuthority rejects unsafe authority syntax', () => {
+    const previous = process.env.PLOINKY_ROUTER_AUTHORITY;
+    try {
+        for (const invalid of ['router.example:', 'user@router.example:8080', 'router.example/path', 'router.example?query']) {
+            process.env.PLOINKY_ROUTER_AUTHORITY = invalid;
+            assert.throws(() => getRouterAuthority('http://127.0.0.1:8080'), /invalid PLOINKY_ROUTER_AUTHORITY/);
+        }
+    } finally {
+        if (previous === undefined) delete process.env.PLOINKY_ROUTER_AUTHORITY;
+        else process.env.PLOINKY_ROUTER_AUTHORITY = previous;
     }
 });
 

@@ -159,9 +159,12 @@ export function buildProviderSubprocessEnv({
         PLOINKY_PROVIDER_DATA_DIR: path.join(workspaceRoot, '.ploinky', 'data', provider.shortAgentName),
         ...manifestEnv,
     };
+    const edgeEnv = edgeRuntimeEnvironment('host', { workspaceRoot });
     return {
         ...stripReservedAgentEnv(env),
-        ...edgeRuntimeEnvironment('host', { workspaceRoot }),
+        PLOINKY_EDGE_TOPOLOGY_FILE: edgeEnv.PLOINKY_EDGE_TOPOLOGY_FILE,
+        PLOINKY_ROUTER_URL: edgeEnv.PLOINKY_ROUTER_URL,
+        PLOINKY_INTERNAL_ROUTER_URL: edgeEnv.PLOINKY_INTERNAL_ROUTER_URL,
     };
 }
 

@@ -152,6 +152,7 @@ test('host lifecycle hooks receive authoritative box edge locators after manifes
             env: [
                 { name: 'PLOINKY_EDGE_TOPOLOGY_FILE', default: '/manifest/spoof.json' },
                 { name: 'PLOINKY_ROUTER_URL', default: 'http://manifest.invalid:1' },
+                { name: 'PLOINKY_ROUTER_AUTHORITY', default: 'attacker.invalid:1' },
                 { name: 'PLOINKY_INTERNAL_ROUTER_URL', default: 'http://manifest.invalid:2' },
             ],
         }));
@@ -171,6 +172,7 @@ test('host lifecycle hooks receive authoritative box edge locators after manifes
             env: {
                 PLOINKY_EDGE_TOPOLOGY_FILE: '/profile/spoof.json',
                 PLOINKY_ROUTER_URL: 'http://profile.invalid:1',
+                PLOINKY_ROUTER_AUTHORITY: 'attacker.invalid:2',
                 PLOINKY_INTERNAL_ROUTER_URL: 'http://profile.invalid:2',
             },
         });
@@ -185,12 +187,14 @@ test('host lifecycle hooks receive authoritative box edge locators after manifes
         for (const env of [manifestEnv, profileEnv]) {
             assert.equal(env.PLOINKY_EDGE_TOPOLOGY_FILE, expectedTopology);
             assert.equal(env.PLOINKY_ROUTER_URL, 'http://127.0.0.1:8080');
+            assert.equal(env.PLOINKY_ROUTER_AUTHORITY, '127.0.0.1:8080');
             assert.equal(env.PLOINKY_INTERNAL_ROUTER_URL, 'http://127.0.0.1:8081');
             assert.equal(env.PLOINKY_AGENT_ID, identity.PLOINKY_AGENT_ID);
         }
         for (const name of [
             'PLOINKY_EDGE_TOPOLOGY_FILE',
             'PLOINKY_ROUTER_URL',
+            'PLOINKY_ROUTER_AUTHORITY',
             'PLOINKY_INTERNAL_ROUTER_URL',
         ]) {
             assert.ok(RESERVED_AGENT_ENV_NAMES.includes(name), `${name} must be reserved`);

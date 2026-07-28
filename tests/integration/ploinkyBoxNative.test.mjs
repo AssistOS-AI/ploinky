@@ -74,6 +74,18 @@ function readNestedVolumeCanary(harness, containerId, volumeName) {
     ]);
 }
 
+function readDependencyVolumeFile(harness, relativePath) {
+    const result = harness.runner.query('podman', [
+        'run', '--rm', '--network=none',
+        '--entrypoint', '/bin/cat',
+        '--volume', `${harness.identity.volumes.dependencies}:/deps:ro`,
+        harness.candidateReference,
+        `/deps/${relativePath}`,
+    ], { timeoutMs: 120_000 });
+    assert.equal(result.ok, true, result.stderr);
+    return String(result.stdout || '').trim();
+}
+
 test('rootless Podman exercises the complete public lifecycle on one workspace identity', {
     timeout: 30 * 60_000,
 }, async (t) => {
@@ -116,6 +128,7 @@ test('rootless Podman exercises the complete public lifecycle on one workspace i
     const genericResult = harness.runner.query('podman', buildContainerExecArgs(
         genericPrepared.containerId,
         generic.coreArgv,
+        { hostPort: genericPrepared.hostPort },
     ), { timeoutMs: 120_000 });
     assert.equal(genericResult.ok, true, genericResult.stderr);
 
@@ -125,6 +138,7 @@ test('rootless Podman exercises the complete public lifecycle on one workspace i
         imageRef: candidateReference,
     });
     const replArgs = buildContainerExecArgs(replPrepared.containerId, repl.coreArgv, {
+        hostPort: replPrepared.hostPort,
         interactive: true,
         inputIsTty: false,
         outputIsTty: false,
@@ -206,9 +220,10 @@ test('rootless Podman exercises the complete public lifecycle on one workspace i
     await harness.supervisor.runStopTransaction();
     assert.equal(harness.supervisor.inspectBoxStatus().state, 'stopped');
     const stoppedContainer = harness.supervisor.inspectBoxStatus().ownership.handles.container.id;
-    assert.equal(execInBox(harness.runner, stoppedContainer, [
-        'cat', '/opt/ploinky/node_modules/.ploinky-box-dependencies.json',
-    ]), 'corrupt');
+    assert.equal(readDependencyVolumeFile(
+        harness,
+        '.ploinky-box-dependencies.json',
+    ), 'corrupt');
     await harness.supervisor.runDestroyTransaction(stoppedContainer);
     assert.equal(harness.supervisor.inspectBoxStatus().state, 'absent-retained-volumes');
     const recreated = await harness.supervisor.prepareBoxForCommand({ imageRef: candidateReference });

@@ -259,7 +259,7 @@ test('master-key and arbitrary host canaries cannot cross outer or agent boundar
         repositoryRoot: '/opt/source',
         cidfile: '/private/lock/candidate.cid',
     });
-    const execArgs = buildContainerExecArgs('a'.repeat(64), ['status']);
+    const execArgs = buildContainerExecArgs('a'.repeat(64), ['status'], { hostPort: 8080 });
     for (const canary of Object.values(host).filter((value) => /CANARY/.test(value))) {
         assert.equal(JSON.stringify(engineEnvironment).includes(canary), false);
         assert.equal(JSON.stringify(createArgs).includes(canary), false);

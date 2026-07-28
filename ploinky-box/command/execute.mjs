@@ -2,6 +2,7 @@ import os from 'node:os';
 import { spawnSync } from 'node:child_process';
 
 import { buildEngineProcessEnvironment } from '../process.mjs';
+import { parseHostPort } from '../ports.mjs';
 
 function signalExitCode(signal) {
     const number = os.constants.signals[signal];
@@ -9,6 +10,7 @@ function signalExitCode(signal) {
 }
 
 export function buildContainerExecArgs(containerId, commandArgv, {
+    hostPort,
     interactive = false,
     inputIsTty = false,
     outputIsTty = false,
@@ -19,6 +21,9 @@ export function buildContainerExecArgs(containerId, commandArgv, {
         args.push('--interactive', '--tty');
     }
     args.push(
+        '--env', `PLOINKY_ROUTER_HOST_PORT=${parseHostPort(hostPort, {
+            source: 'prepared Box host port',
+        })}`,
         '--user', 'podman',
         '--workdir', '/workspace',
         containerId,

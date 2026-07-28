@@ -149,11 +149,13 @@ test('bwrap and seatbelt env builders consume one validated host endpoint withou
                     host: bwrap.PLOINKY_ROUTER_HOST,
                     port: bwrap.PLOINKY_ROUTER_PORT,
                     url: bwrap.PLOINKY_ROUTER_URL,
+                    authority: bwrap.PLOINKY_ROUTER_AUTHORITY,
                 },
                 seatbelt: {
                     host: seatbelt.PLOINKY_ROUTER_HOST,
                     port: seatbelt.PLOINKY_ROUTER_PORT,
                     url: seatbelt.PLOINKY_ROUTER_URL,
+                    authority: seatbelt.PLOINKY_ROUTER_AUTHORITY,
                 },
                 missingCode,
             }));
@@ -163,6 +165,7 @@ test('bwrap and seatbelt env builders consume one validated host endpoint withou
             env: {
                 PLOINKY_WORKSPACE_ROOT: root,
                 PLOINKY_MASTER_KEY: 'ab'.repeat(32),
+                PLOINKY_ROUTER_HOST_PORT: '19090',
             },
             script,
         });
@@ -171,6 +174,7 @@ test('bwrap and seatbelt env builders consume one validated host endpoint withou
             host: '127.0.0.1',
             port: '8080',
             url: 'http://127.0.0.1:8080',
+            authority: '127.0.0.1:19090',
         };
         assert.deepEqual(parseLastJsonLine(result.stdout), {
             bwrap: expected,
@@ -302,8 +306,14 @@ test('profile environment and secrets cannot override sandbox router discovery',
                     PLOINKY_ROUTER_HOST: 'profile.invalid',
                     PLOINKY_ROUTER_PORT: '1',
                     PLOINKY_ROUTER_URL: 'http://profile.invalid:1',
+                    PLOINKY_ROUTER_AUTHORITY: 'profile.invalid:1',
                 },
-                secrets: ['PLOINKY_ROUTER_HOST', 'PLOINKY_ROUTER_PORT', 'PLOINKY_ROUTER_URL'],
+                secrets: [
+                    'PLOINKY_ROUTER_HOST',
+                    'PLOINKY_ROUTER_PORT',
+                    'PLOINKY_ROUTER_URL',
+                    'PLOINKY_ROUTER_AUTHORITY',
+                ],
             };
             const work = ${JSON.stringify(path.join(root, 'work'))};
             const result = {};
@@ -313,6 +323,7 @@ test('profile environment and secrets cannot override sandbox router discovery',
                     host: env.PLOINKY_ROUTER_HOST,
                     port: env.PLOINKY_ROUTER_PORT,
                     url: env.PLOINKY_ROUTER_URL,
+                    authority: env.PLOINKY_ROUTER_AUTHORITY,
                 };
             }
             console.log(JSON.stringify(result));
@@ -325,6 +336,8 @@ test('profile environment and secrets cannot override sandbox router discovery',
                 PLOINKY_ROUTER_HOST: 'secret.invalid',
                 PLOINKY_ROUTER_PORT: '2',
                 PLOINKY_ROUTER_URL: 'http://secret.invalid:2',
+                PLOINKY_ROUTER_AUTHORITY: 'secret.invalid:2',
+                PLOINKY_ROUTER_HOST_PORT: '19090',
             },
             script,
         });
@@ -333,6 +346,7 @@ test('profile environment and secrets cannot override sandbox router discovery',
             host: '127.0.0.1',
             port: '8080',
             url: 'http://127.0.0.1:8080',
+            authority: '127.0.0.1:19090',
         };
         assert.deepEqual(parseLastJsonLine(result.stdout), {
             bwrap: expected,

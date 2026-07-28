@@ -17,6 +17,7 @@ function fakeSupervisor(events, { statusState = 'absent' } = {}) {
     const prepared = {
         containerId: 'a'.repeat(64),
         engine: { name: 'podman' },
+        hostPort: 19090,
     };
     const status = {
         state: statusState,
@@ -109,15 +110,20 @@ test('generic forwarding prepares under the supervisor then execs the fixed targ
     assert.deepEqual(events[1][2].slice(-4), [
         '/opt/ploinky/bin/ploinky-local', 'logs', '--debug', 'tail',
     ]);
+    assert.deepEqual(events[1][2].slice(0, 4), [
+        'container', 'exec', '--env', 'PLOINKY_ROUTER_HOST_PORT=19090',
+    ]);
     assert.equal(JSON.stringify(events[1][3]).includes('HOST_CANARY'), false);
     assert.equal(JSON.stringify(events[1][3]).includes('UNRELATED_CANARY'), false);
 });
 
 test('TTY flags appear only for interactive commands with both terminal ends', async () => {
     assert.deepEqual(buildContainerExecArgs('a'.repeat(64), [], {
+        hostPort: 19090,
         interactive: true, inputIsTty: true, outputIsTty: true, shell: true,
     }).slice(0, 4), ['container', 'exec', '--interactive', '--tty']);
     assert.equal(buildContainerExecArgs('a'.repeat(64), [], {
+        hostPort: 19090,
         interactive: true, inputIsTty: false, outputIsTty: true,
     }).includes('--tty'), false);
 

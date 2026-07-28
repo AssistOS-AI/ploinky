@@ -59,6 +59,7 @@ function executePrepared(prepared, coreArgv, {
         prepared.containerId,
         coreArgv,
         {
+            hostPort: prepared.hostPort,
             shell,
             interactive,
             inputIsTty: input.isTTY === true,
