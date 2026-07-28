@@ -1,4 +1,6 @@
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
 import test from 'node:test';
 
 import {
@@ -135,4 +137,15 @@ test('fresh image capability probes allow a cold rootless container start', () =
     assert.equal(calls.length, 1);
     assert.equal(calls[0].options.timeoutMs, IMAGE_PROBE_TIMEOUT_MS);
     assert.ok(IMAGE_PROBE_TIMEOUT_MS >= 60_000);
+});
+
+test('image contract requires cloudflared and entrypoint validates token-file support', () => {
+    assert.equal(IMAGE_CONTRACT.requiredBinaries.includes('cloudflared'), true);
+    const entrypoint = fs.readFileSync(path.resolve(
+        import.meta.dirname,
+        '../../ploinky-box/entrypoint/ploinky-box-entrypoint',
+    ), 'utf8');
+    assert.match(entrypoint, /cloudflared tunnel run --help/);
+    assert.match(entrypoint, /--token-file/);
+    assert.match(entrypoint, /EXPECTED_CLOUDFLARED_VERSION/);
 });

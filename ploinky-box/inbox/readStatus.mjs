@@ -4,6 +4,14 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { createProcessRunner } from '../process.mjs';
+import { serializeCloudflarePublicationStatus } from '../cloudflared/status.mjs';
+
+const LOCAL_CLOUDFLARE_STATUS = serializeCloudflarePublicationStatus({
+    mode: 'local-only',
+    management: null,
+    state: 'unstarted',
+    connectorState: 'absent',
+});
 
 function readRegular(target, fsApi) {
     const stat = fsApi.lstatSync(target);
@@ -19,6 +27,25 @@ function readJson(target, fsApi, warnings) {
     } catch (error) {
         if (error.code !== 'ENOENT') warnings.push(`${path.basename(target)} is unreadable`);
         return null;
+    }
+}
+
+function readCloudflarePublicationStatus(ploinkyRoot, fsApi, warnings) {
+    const runRoot = path.join(ploinkyRoot, 'run');
+    const statusPath = path.join(runRoot, 'cloudflare-publication-status.json');
+    try {
+        const runStats = fsApi.lstatSync(runRoot);
+        if (!runStats.isDirectory() || runStats.isSymbolicLink()) {
+            throw new Error('run is not a real directory');
+        }
+        const value = JSON.parse(readRegular(statusPath, fsApi));
+        if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('not an object');
+        return serializeCloudflarePublicationStatus(value);
+    } catch (error) {
+        if (error.code !== 'ENOENT') {
+            warnings.push('cloudflare-publication-status.json is unreadable');
+        }
+        return LOCAL_CLOUDFLARE_STATUS;
     }
 }
 
@@ -39,6 +66,7 @@ export function readInboxStatus({
                 routingConfigured: false,
                 trackedAgents: 0,
                 runningAgents: 0,
+                cloudflarePublication: LOCAL_CLOUDFLARE_STATUS,
                 warnings: Object.freeze([]),
             });
         }
@@ -48,11 +76,13 @@ export function readInboxStatus({
         return Object.freeze({
             state: 'invalid-initialization', initialized: false,
             routingConfigured: false, trackedAgents: 0, runningAgents: 0,
+            cloudflarePublication: LOCAL_CLOUDFLARE_STATUS,
             warnings: Object.freeze(['.ploinky is not a real directory']),
         });
     }
     const routing = readJson(path.join(ploinkyRoot, 'routing.json'), fsApi, warnings);
     const agents = readJson(path.join(ploinkyRoot, 'agents.json'), fsApi, warnings) || {};
+    const cloudflarePublication = readCloudflarePublicationStatus(ploinkyRoot, fsApi, warnings);
     const tracked = Object.entries(agents).filter(([, record]) => (
         record && ['agent', 'agentCore'].includes(record.type)
     ));
@@ -88,6 +118,7 @@ export function readInboxStatus({
         routingConfigured: Boolean(routing),
         trackedAgents: tracked.length,
         runningAgents,
+        cloudflarePublication,
         warnings: Object.freeze(warnings),
     });
 }

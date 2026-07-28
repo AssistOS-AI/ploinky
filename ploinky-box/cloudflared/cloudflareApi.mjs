@@ -2,7 +2,7 @@ import {
     CloudflarePublicationError,
     redactCloudflareText,
     toPublicationError,
-} from './cloudflarePublicationPlan.js';
+} from './publicationPlan.mjs';
 
 export const DEFAULT_CLOUDFLARE_API_BASE_URL = 'https://api.cloudflare.com/client/v4';
 

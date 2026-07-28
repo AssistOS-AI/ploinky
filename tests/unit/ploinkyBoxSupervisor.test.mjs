@@ -192,6 +192,56 @@ test('running status uses immutable-ID inbox inspection and allowlists its outpu
     assert.equal(calls[0].includes(ownership.handles.container.id), true);
     assert.equal(JSON.stringify(result).includes('must-not-cross'), false);
     assert.equal(formatBoxStatus(result).includes('must-not-cross'), false);
+    assert.equal(result.inbox.cloudflarePublication.state, 'unstarted');
+    assert.match(formatBoxStatus(result), /Cloudflare mode: local-only/);
+});
+
+test('running status allowlists and renders concise Cloudflare publication state', (t) => {
+    const state = fixture(t);
+    fs.mkdirSync(path.join(state.workspace, '.ploinky'));
+    const identity = buildWorkspaceIdentity(state.workspace, { markerFound: true });
+    const ownership = owned(identity);
+    const supervisor = createBoxSupervisor({
+        resolveIdentity: () => identity,
+        discover: () => ownership,
+        validateExistingImage: () => ({ immutableId: 'b'.repeat(64) }),
+        runner: {
+            query() {
+                return { ok: true, stdout: JSON.stringify({
+                    state: 'initialized',
+                    initialized: true,
+                    routingConfigured: true,
+                    trackedAgents: 1,
+                    runningAgents: 1,
+                    warnings: [],
+                    cloudflarePublication: {
+                        mode: 'cloudflare',
+                        management: 'connector-only',
+                        state: 'error',
+                        connectorState: 'stopped',
+                        configurationGeneration: `sha256:${'a'.repeat(64)}`,
+                        desiredDigest: `sha256:${'b'.repeat(64)}`,
+                        hostnames: ['office.example.test'],
+                        error: {
+                            code: 'CLOUDFLARE_HOST_PROBE_FAILED',
+                            operation: 'probe-hostname',
+                            retryable: true,
+                            message: 'must-not-cross',
+                        },
+                        secret: 'must-not-cross',
+                    },
+                }) };
+            },
+        },
+    });
+    const result = supervisor.inspectBoxStatus();
+    const output = formatBoxStatus(result);
+    assert.equal(JSON.stringify(result).includes('must-not-cross'), false);
+    assert.match(output, /Cloudflare mode: cloudflare/);
+    assert.match(output, /Cloudflare management: connector-only/);
+    assert.match(output, /Cloudflare publication: error/);
+    assert.match(output, /Cloudflare connector: stopped/);
+    assert.match(output, /Cloudflare hosts: 1/);
 });
 
 test('status reports an older owned image as incompatible while destroy remains available', async (t) => {

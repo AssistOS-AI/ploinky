@@ -7,7 +7,7 @@ import {
     normalizeCloudflarePublicationDesired,
     publicPlanSummary,
     redactCloudflareText,
-} from '../../cli/sandbox/cloudflarePublicationPlan.js';
+} from '../../ploinky-box/cloudflared/publicationPlan.mjs';
 
 const GENERATION = `sha256:${'a'.repeat(64)}`;
 const COMPLETE = Object.freeze({
@@ -16,6 +16,9 @@ const COMPLETE = Object.freeze({
     tunnelId: 'tunnel_123',
     tunnelTokenSecret: 'publication/cloudflare-connector',
     apiTokenSecret: 'publication/cloudflare-api',
+});
+const CONNECTOR_ONLY = Object.freeze({
+    tunnelTokenSecret: 'publication/cloudflare-connector',
 });
 const HOSTS = Object.freeze({
     'office.example.test': {
@@ -29,6 +32,7 @@ const HOSTS = Object.freeze({
 test('wholly absent Cloudflare tuple and hosts selects explicit local-only mode', () => {
     const plan = normalizeCloudflarePublicationDesired({ configurationGeneration: GENERATION });
     assert.equal(plan.mode, 'local-only');
+    assert.equal(plan.management, null);
     assert.deepEqual(plan.hosts, []);
     assert.match(plan.desiredDigest, /^sha256:[a-f0-9]{64}$/);
 });
@@ -40,6 +44,7 @@ test('complete tuple produces deterministic fixed-origin ingress and CNAME plan'
         hosts: HOSTS,
     });
     assert.equal(plan.mode, 'cloudflare');
+    assert.equal(plan.management, 'api-managed');
     assert.deepEqual(plan.hosts.map((entry) => entry.hostname), [
         'explorer.example.test',
         'office.example.test',
@@ -59,6 +64,47 @@ test('complete tuple produces deterministic fixed-origin ingress and CNAME plan'
             'office.example.test': HOSTS['office.example.test'],
         },
     }).desiredDigest);
+});
+
+test('connector-only accepts one or multiple exact hosts without API-managed fields', () => {
+    const plan = normalizeCloudflarePublicationDesired({
+        configurationGeneration: GENERATION,
+        cloudflare: CONNECTOR_ONLY,
+        hosts: HOSTS,
+    });
+    assert.equal(plan.mode, 'cloudflare');
+    assert.equal(plan.management, 'connector-only');
+    assert.equal(plan.originService, CLOUDFLARE_ORIGIN);
+    assert.deepEqual(plan.hosts.map((entry) => entry.hostname), [
+        'explorer.example.test',
+        'office.example.test',
+    ]);
+    assert.deepEqual(plan.secretHandles, {
+        tunnelToken: 'publication/cloudflare-connector',
+    });
+    assert.equal(Object.hasOwn(plan, 'scope'), false);
+    assert.equal(Object.hasOwn(plan, 'ingress'), false);
+    assert.equal(Object.hasOwn(plan, 'dns'), false);
+});
+
+test('connector-only and API-managed digests are separated and both summaries omit handles', () => {
+    const connector = normalizeCloudflarePublicationDesired({
+        configurationGeneration: GENERATION,
+        cloudflare: CONNECTOR_ONLY,
+        hosts: HOSTS,
+    });
+    const apiManaged = normalizeCloudflarePublicationDesired({
+        configurationGeneration: GENERATION,
+        cloudflare: COMPLETE,
+        hosts: HOSTS,
+    });
+    assert.notEqual(connector.desiredDigest, apiManaged.desiredDigest);
+    assert.equal(publicPlanSummary(connector).management, 'connector-only');
+    assert.equal(publicPlanSummary(apiManaged).management, 'api-managed');
+    assert.doesNotMatch(
+        JSON.stringify([publicPlanSummary(connector), publicPlanSummary(apiManaged)]),
+        /publication\/cloudflare|TokenSecret|apiToken/i,
+    );
 });
 
 test('secret handle names do not enter the desired-state digest or public summary', () => {
@@ -106,6 +152,40 @@ test('hosts without credentials and credentials without hosts are both partial',
         () => normalizeCloudflarePublicationDesired({ configurationGeneration: GENERATION, cloudflare: COMPLETE }),
         (error) => error.code === 'CLOUDFLARE_CONFIGURATION_PARTIAL',
     );
+    assert.throws(
+        () => normalizeCloudflarePublicationDesired({
+            configurationGeneration: GENERATION,
+            cloudflare: CONNECTOR_ONLY,
+        }),
+        (error) => error.code === 'CLOUDFLARE_CONFIGURATION_PARTIAL',
+    );
+    assert.throws(
+        () => normalizeCloudflarePublicationDesired({
+            configurationGeneration: GENERATION,
+            cloudflare: {},
+        }),
+        (error) => error.code === 'CLOUDFLARE_CONFIGURATION_PARTIAL',
+    );
+});
+
+test('connector-only mixed with incomplete API-managed fields is rejected as partial', () => {
+    for (const [field, value] of [
+        ['accountId', 'fixture-account'],
+        ['zoneId', 'fixture-zone'],
+        ['tunnelId', 'fixture-tunnel'],
+        ['apiTokenSecret', 'fixture-api'],
+        ['apiTokenSecret', ''],
+    ]) {
+        assert.throws(
+            () => normalizeCloudflarePublicationDesired({
+                configurationGeneration: GENERATION,
+                cloudflare: { ...CONNECTOR_ONLY, [field]: value },
+                hosts: HOSTS,
+            }),
+            (error) => error.code === 'CLOUDFLARE_CONFIGURATION_PARTIAL',
+            field,
+        );
+    }
 });
 
 test('connector and API credentials require separate handles', () => {

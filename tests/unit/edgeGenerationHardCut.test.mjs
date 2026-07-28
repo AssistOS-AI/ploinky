@@ -193,3 +193,59 @@ test('durable preparation remains inactive until its exact lease commits', (t) =
     assert.equal(committed.selector.state, 'active');
     assert.equal(committed.selector.generation, prepared.selector.generation);
 });
+
+test('connector-only desired state compiles as Cloudflare reconciling and preserves exact hosts', (t) => {
+    const fixture = createFixture(t, {
+        desired: {
+            hosts: {
+                'office.example.test': {
+                    agent: 'fixtures/alpha',
+                },
+            },
+            cloudflare: {
+                tunnelTokenSecret: 'publication/cloudflare-connector',
+            },
+        },
+    });
+    const applied = applyEdgeRoutingGeneration({
+        workspaceRoot: fixture.workspace,
+        reason: 'connector-only-generation',
+    });
+    assert.deepEqual(applied.generation.compiled.publication, {
+        mode: 'cloudflare',
+        management: 'connector-only',
+        defaultState: 'reconciling',
+        complete: true,
+    });
+    assert.equal(applied.selector.publicationState, 'reconciling');
+    assert.equal(applied.topology.state, 'reconciling');
+    assert.deepEqual(Object.keys(applied.generation.compiled.hosts), ['office.example.test']);
+});
+
+test('partial connector/API desired state remains in fail-closed error publication', (t) => {
+    const fixture = createFixture(t, {
+        desired: {
+            hosts: {
+                'office.example.test': {
+                    agent: 'fixtures/alpha',
+                },
+            },
+            cloudflare: {
+                tunnelTokenSecret: 'publication/cloudflare-connector',
+                accountId: 'account_123',
+            },
+        },
+    });
+    const applied = applyEdgeRoutingGeneration({
+        workspaceRoot: fixture.workspace,
+        reason: 'partial-cloudflare-generation',
+    });
+    assert.deepEqual(applied.generation.compiled.publication, {
+        mode: 'error',
+        management: null,
+        defaultState: 'error',
+        complete: false,
+    });
+    assert.equal(applied.selector.publicationState, 'error');
+    assert.equal(applied.topology.state, 'error');
+});

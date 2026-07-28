@@ -8,7 +8,7 @@ import {
     createEdgePublicationRouteCoordinator,
     createExternalHostnameProbe,
     startCloudflarePublicationRuntime,
-} from '../../cli/sandbox/cloudflarePublicationRuntime.js';
+} from '../../ploinky-box/cloudflared/runtime.mjs';
 
 const GENERATION = `sha256:${'a'.repeat(64)}`;
 
@@ -49,6 +49,93 @@ test('edge publication coordinator commits only exact captured desired semantics
     await assert.rejects(() => coordinator.commit({
         mode: 'cloudflare',
         publicationState: 'ready',
+        configurationGeneration: GENERATION,
+        hosts: {},
+    }), /does not match captured desired semantics/);
+});
+
+test('edge publication coordinator permits error only for the exact captured Cloudflare generation', async () => {
+    const hosts = {
+        'app.example.test': {
+            agent: 'repo/app',
+        },
+    };
+    const desired = {
+        cloudflare: {
+            tunnelTokenSecret: 'publication/cloudflare-connector',
+        },
+        hosts,
+    };
+    const applied = [];
+    const edgeOps = {
+        load() {
+            return {
+                selector: { generation: GENERATION },
+                generation: { desired },
+            };
+        },
+        inactivate() {},
+        apply(options) {
+            applied.push(options);
+            return {
+                selector: { generation: GENERATION, activationId: 'activation-error' },
+                generation: { desired },
+            };
+        },
+    };
+    const coordinator = createEdgePublicationRouteCoordinator({
+        workspaceRoot: '/fixture',
+        edgeOps,
+    });
+    await coordinator.inactivate({ configurationGeneration: GENERATION, reason: 'test' });
+    await coordinator.commit({
+        mode: 'cloudflare',
+        publicationState: 'error',
+        configurationGeneration: GENERATION,
+        hosts,
+    });
+    assert.equal(applied.at(-1).publicationState, 'error');
+
+    await assert.rejects(() => coordinator.commit({
+        mode: 'cloudflare',
+        publicationState: 'error',
+        configurationGeneration: `sha256:${'b'.repeat(64)}`,
+        hosts,
+    }), /outside its captured immutable generation/);
+    await assert.rejects(() => coordinator.commit({
+        mode: 'local-only',
+        publicationState: 'error',
+        configurationGeneration: GENERATION,
+        hosts,
+    }), /does not match captured desired semantics/);
+    await assert.rejects(() => coordinator.commit({
+        mode: 'cloudflare',
+        publicationState: 'error',
+        configurationGeneration: GENERATION,
+        hosts: {},
+    }), /does not match captured desired semantics/);
+});
+
+test('edge publication coordinator rejects error for a captured local-only generation', async () => {
+    const desired = { hosts: {} };
+    const edgeOps = {
+        load() {
+            return {
+                selector: { generation: GENERATION },
+                generation: { desired },
+            };
+        },
+        inactivate() {},
+        apply() { assert.fail('local-only error must not apply'); },
+    };
+    const coordinator = createEdgePublicationRouteCoordinator({
+        workspaceRoot: '/fixture',
+        edgeOps,
+    });
+    await coordinator.inactivate({ configurationGeneration: GENERATION, reason: 'test' });
+    await assert.rejects(() => coordinator.commit({
+        mode: 'local-only',
+        publicationState: 'error',
         configurationGeneration: GENERATION,
         hosts: {},
     }), /does not match captured desired semantics/);
@@ -118,6 +205,46 @@ test('external hostname proof requires exact inactive generation response throug
         hostname: 'app.example.test',
         configurationGeneration: GENERATION,
     })).ok, false);
+});
+
+test('runtime startup replaces stale persisted readiness before scanning a generation', async (t) => {
+    const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-publication-runtime-stale-'));
+    t.after(() => fs.rmSync(workspace, { recursive: true, force: true }));
+    const statusFile = path.join(workspace, 'status.json');
+    fs.writeFileSync(statusFile, JSON.stringify({
+        mode: 'cloudflare',
+        management: 'connector-only',
+        state: 'ready',
+        connectorState: 'running',
+        configurationGeneration: GENERATION,
+        desiredDigest: `sha256:${'b'.repeat(64)}`,
+        hostnames: ['stale.example.test'],
+    }));
+    const inactive = Object.assign(new Error('inactive'), { code: 'EDGE_GENERATION_INACTIVE' });
+    const runtime = startCloudflarePublicationRuntime({
+        workspaceRoot: workspace,
+        statusFile,
+        pollIntervalMs: 60_000,
+        loadActive: () => { throw inactive; },
+        routeCoordinatorFactory: () => ({ inactivate() {}, commit() {} }),
+        controllerFactory: () => ({
+            reconcile: async () => assert.fail('inactive startup must not reconcile'),
+            getStatus: () => ({ state: 'fixture' }),
+            stop: async () => {},
+        }),
+        probeHostname: async () => ({ ok: true }),
+        audit: () => {},
+    });
+    assert.deepEqual(JSON.parse(fs.readFileSync(statusFile, 'utf8')), {
+        mode: 'local-only',
+        management: null,
+        state: 'unstarted',
+        connectorState: 'absent',
+        configurationGeneration: '',
+        desiredDigest: '',
+        hostnames: [],
+    });
+    await runtime.stop();
 });
 
 test('publication runtime reconciles each successful selected activation once and stops its one controller', async (t) => {
@@ -398,6 +525,74 @@ test('publication runtime retries a failed selected activation without changing 
     assert.deepEqual(reasons, ['selected-edge-generation', 'selected-edge-generation-retry']);
     assert.equal(inputs[1].selectedPublicationState, 'reconciling');
     assert.deepEqual(inputs[1].cloudflare, { tunnelId: 'fixture-tunnel' });
+    await runtime.stop();
+});
+
+test('publication runtime follows connector error commits across bounded retry activations', async (t) => {
+    const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-publication-runtime-error-retry-'));
+    t.after(() => fs.rmSync(workspace, { recursive: true, force: true }));
+    const desired = {
+        cloudflare: {
+            tunnelTokenSecret: 'publication/cloudflare-connector',
+        },
+        hosts: {
+            'app.example.test': {
+                agent: 'repo/app',
+            },
+        },
+    };
+    let selected = {
+        selector: {
+            generation: GENERATION,
+            activationId: 'activation-initial',
+            publicationState: 'reconciling',
+        },
+        generation: { desired },
+    };
+    let attempts = 0;
+    let completed;
+    const completion = new Promise((resolve) => { completed = resolve; });
+    const runtime = startCloudflarePublicationRuntime({
+        workspaceRoot: workspace,
+        statusFile: path.join(workspace, 'status.json'),
+        pollIntervalMs: 60_000,
+        retryInitialDelayMs: 1,
+        retryMaximumDelayMs: 2,
+        loadActive: () => selected,
+        routeCoordinatorFactory: () => ({ inactivate() {}, commit() {} }),
+        controllerFactory: () => ({
+            reconcile: async () => {
+                attempts += 1;
+                if (attempts < 3) {
+                    selected = {
+                        ...selected,
+                        selector: {
+                            ...selected.selector,
+                            activationId: `activation-error-${attempts}`,
+                            publicationState: 'error',
+                        },
+                    };
+                    throw Object.assign(new Error('connector fixture failed'), {
+                        code: 'CLOUDFLARE_HOST_PROBE_FAILED',
+                    });
+                }
+                completed();
+            },
+            getStatus: () => ({ state: 'fixture' }),
+            stop: async () => {},
+        }),
+        probeHostname: async () => ({ ok: true }),
+        audit: () => {},
+    });
+    await runtime.scan();
+    await Promise.race([
+        completion,
+        new Promise((_, reject) => setTimeout(
+            () => reject(new Error('error-activation retry did not converge')),
+            1_000,
+        )),
+    ]);
+    assert.equal(attempts, 3);
     await runtime.stop();
 });
 

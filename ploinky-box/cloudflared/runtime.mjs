@@ -1,55 +1,32 @@
-import fs from 'node:fs';
 import path from 'node:path';
 
-import { appendLog } from '../server/utils/logger.js';
-import { PLOINKY_DIR, PLOINKY_WORKSPACE_ROOT } from '../utils/config.js';
-import { createCloudflarePublicationController } from './cloudflarePublication.js';
-import { stablePublicationJson } from './cloudflarePublicationPlan.js';
+import { appendLog } from '../../cli/server/utils/logger.js';
+import { PLOINKY_DIR, PLOINKY_WORKSPACE_ROOT } from '../../cli/utils/config.js';
+import { createCloudflarePublicationController } from './publicationController.mjs';
+import { stablePublicationJson } from './publicationPlan.mjs';
 import {
     inactivateEdgeRoutingGeneration,
     loadActiveEdgeRoutingGeneration,
     readEdgeRoutingSelection,
-} from './edgeGeneration.js';
-import { applyEdgeRoutingGeneration } from './coordinatedEdgeApply.js';
+} from '../../cli/sandbox/edgeGeneration.js';
+import { applyEdgeRoutingGeneration } from '../../cli/sandbox/coordinatedEdgeApply.js';
 import {
     createWorkspaceMutationLease,
     releaseWorkspaceMutationLease,
-} from '../utils/runtime/maintenanceLocks.js';
+} from '../../cli/utils/runtime/maintenanceLocks.js';
+import { writeCloudflarePublicationStatus } from './status.mjs';
 
 const DEFAULT_STATUS_FILE = path.join(PLOINKY_DIR, 'run', 'cloudflare-publication-status.json');
 const ALLOWED_PUBLICATION_STATES = new Set([
     'ready',
     'reconciling',
+    'error',
 ]);
 
 function publicationRuntimeError(message, code = 'CLOUDFLARE_RUNTIME_COORDINATION_FAILED') {
     const error = new Error(message);
     error.code = code;
     return error;
-}
-
-function atomicStatusWrite(filePath, value) {
-    fs.mkdirSync(path.dirname(filePath), { recursive: true, mode: 0o700 });
-    try {
-        const stat = fs.lstatSync(filePath);
-        if (!stat.isFile() || stat.isSymbolicLink()) {
-            throw publicationRuntimeError('Cloudflare status path is not a regular file');
-        }
-    } catch (error) {
-        if (error?.code !== 'ENOENT') throw error;
-    }
-    const temporary = `${filePath}.${process.pid}.${Date.now()}.tmp`;
-    try {
-        fs.writeFileSync(temporary, `${JSON.stringify(value, null, 2)}\n`, {
-            encoding: 'utf8',
-            mode: 0o600,
-            flag: 'wx',
-        });
-        fs.renameSync(temporary, filePath);
-        fs.chmodSync(filePath, 0o600);
-    } finally {
-        try { fs.unlinkSync(temporary); } catch (_) {}
-    }
 }
 
 export function createEdgePublicationRouteCoordinator({
@@ -217,8 +194,18 @@ export function startCloudflarePublicationRuntime({
         workspaceRoot,
         routeCoordinator,
         probeHostname,
-        publishState: (state) => atomicStatusWrite(statusFile, state),
+        publishState: (state) => writeCloudflarePublicationStatus(statusFile, state, {
+            trustedRoot: workspaceRoot,
+        }),
         audit,
+    });
+    writeCloudflarePublicationStatus(statusFile, {
+        mode: 'local-only',
+        management: null,
+        state: 'unstarted',
+        connectorState: 'absent',
+    }, {
+        trustedRoot: workspaceRoot,
     });
 
     function clearScheduledRetry() {
@@ -245,6 +232,17 @@ export function startCloudflarePublicationRuntime({
                 operation: String(lease.operation || 'cloudflare-publication'),
             });
         }
+    }
+
+    function retryActivationFor(input, fallbackActivationId) {
+        try {
+            const selected = loadActive({ workspaceRoot });
+            if (selected.selector.generation === input.configurationGeneration
+                && selected.selector.publicationState === 'error') {
+                return selected.selector.activationId;
+            }
+        } catch (_) {}
+        return fallbackActivationId;
     }
 
     function scheduleRetry({ activationId, input, attempt = 1 }) {
@@ -312,7 +310,11 @@ export function startCloudflarePublicationRuntime({
                     message: String(error?.message || error).slice(0, 1024),
                     retryAttempt: attempt,
                 });
-                scheduleRetry({ activationId, input: retry.input, attempt: attempt + 1 });
+                scheduleRetry({
+                    activationId: retryActivationFor(retry.input, activationId),
+                    input: retry.input,
+                    attempt: attempt + 1,
+                });
             } finally {
                 inFlight = null;
                 releasePublicationLease(workspaceLease);
@@ -388,7 +390,9 @@ export function startCloudflarePublicationRuntime({
             });
             if (active?.selector?.activationId && active?.selector?.generation) {
                 scheduleRetry({
-                    activationId: active.selector.activationId,
+                    activationId: retryActivationFor({
+                        configurationGeneration: active.selector.generation,
+                    }, active.selector.activationId),
                     input: {
                         configurationGeneration: active.selector.generation,
                         selectedPublicationState: active.selector.publicationState,

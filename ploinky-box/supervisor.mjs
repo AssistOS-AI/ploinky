@@ -17,6 +17,7 @@ import {
     stopPloinkyLocalByContainerId,
 } from './lifecycle/container.mjs';
 import { reconcileBoxContainer } from './lifecycle/transactions.mjs';
+import { serializeCloudflarePublicationStatus } from './cloudflared/status.mjs';
 
 function supervisorError(message, code = 'PLOINKY_BOX_SUPERVISOR_FAILED') {
     return new PloinkyBoxError(message, { code });
@@ -222,6 +223,9 @@ export function createBoxSupervisor({
                 routingConfigured: parsed.routingConfigured === true,
                 trackedAgents: Number(parsed.trackedAgents) || 0,
                 runningAgents: Number(parsed.runningAgents) || 0,
+                cloudflarePublication: serializeCloudflarePublicationStatus(
+                    parsed.cloudflarePublication,
+                ),
                 warnings: Object.freeze(Array.isArray(parsed.warnings)
                     ? parsed.warnings.map(String)
                     : []),
@@ -283,6 +287,11 @@ export function formatBoxStatus(status) {
         lines.push(`Routing configured: ${status.inbox.routingConfigured ? 'yes' : 'no'}`);
         lines.push(`Tracked agents: ${status.inbox.trackedAgents}`);
         lines.push(`Running agents: ${status.inbox.runningAgents}`);
+        lines.push(`Cloudflare mode: ${status.inbox.cloudflarePublication.mode}`);
+        lines.push(`Cloudflare management: ${status.inbox.cloudflarePublication.management || 'none'}`);
+        lines.push(`Cloudflare publication: ${status.inbox.cloudflarePublication.state}`);
+        lines.push(`Cloudflare connector: ${status.inbox.cloudflarePublication.connectorState}`);
+        lines.push(`Cloudflare hosts: ${status.inbox.cloudflarePublication.hostnames.length}`);
         for (const warning of status.inbox.warnings) lines.push(`Warning: ${warning}`);
     } else if (status.detail || status.ownership?.message) {
         lines.push(`Detail: ${status.detail || status.ownership.message}`);

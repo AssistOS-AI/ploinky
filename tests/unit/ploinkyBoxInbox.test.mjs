@@ -39,7 +39,106 @@ test('fresh status reports not initialized without changing the tree', (t) => {
     });
     assert.equal(result.state, 'not-initialized');
     assert.equal(result.initialized, false);
+    assert.deepEqual(result.cloudflarePublication, {
+        mode: 'local-only',
+        management: null,
+        state: 'unstarted',
+        connectorState: 'absent',
+        configurationGeneration: '',
+        desiredDigest: '',
+        hostnames: [],
+    });
     assert.equal(treeHash(root), before);
+});
+
+test('status reads only the redacted Cloudflare publication contract', (t) => {
+    const root = fixture(t);
+    const ploinky = path.join(root, '.ploinky');
+    const run = path.join(ploinky, 'run');
+    fs.mkdirSync(run, { recursive: true });
+    fs.writeFileSync(path.join(ploinky, 'agents.json'), '{}');
+    fs.writeFileSync(path.join(run, 'cloudflare-publication-status.json'), JSON.stringify({
+        mode: 'cloudflare',
+        management: 'connector-only',
+        state: 'ready',
+        connectorState: 'running',
+        configurationGeneration: `sha256:${'a'.repeat(64)}`,
+        desiredDigest: `sha256:${'b'.repeat(64)}`,
+        hostnames: ['office.example.test'],
+        secret: 'must-not-cross',
+        tunnelTokenSecret: 'publication/cloudflare-connector',
+    }));
+    const result = readInboxStatus({
+        workspaceRoot: root,
+        runner: { query() { throw new Error('must not query'); } },
+    });
+    assert.deepEqual(result.cloudflarePublication, {
+        mode: 'cloudflare',
+        management: 'connector-only',
+        state: 'ready',
+        connectorState: 'running',
+        configurationGeneration: `sha256:${'a'.repeat(64)}`,
+        desiredDigest: `sha256:${'b'.repeat(64)}`,
+        hostnames: ['office.example.test'],
+    });
+    assert.doesNotMatch(JSON.stringify(result), /must-not-cross|tunnelTokenSecret|publication\/cloudflare/);
+});
+
+test('malformed and symlinked Cloudflare status fail to local unstarted with a warning', (t) => {
+    const root = fixture(t);
+    const ploinky = path.join(root, '.ploinky');
+    const run = path.join(ploinky, 'run');
+    const statusPath = path.join(run, 'cloudflare-publication-status.json');
+    fs.mkdirSync(run, { recursive: true });
+    fs.writeFileSync(path.join(ploinky, 'agents.json'), '{}');
+    fs.writeFileSync(statusPath, '{truncated');
+    let result = readInboxStatus({
+        workspaceRoot: root,
+        runner: { query() { throw new Error('must not query'); } },
+    });
+    assert.equal(result.cloudflarePublication.state, 'unstarted');
+    assert.equal(result.warnings.some((entry) => entry.includes('cloudflare-publication-status')), true);
+
+    fs.unlinkSync(statusPath);
+    const outside = path.join(root, 'outside.json');
+    fs.writeFileSync(outside, JSON.stringify({
+        mode: 'cloudflare',
+        management: 'api-managed',
+        state: 'ready',
+    }));
+    fs.symlinkSync(outside, statusPath);
+    result = readInboxStatus({
+        workspaceRoot: root,
+        runner: { query() { throw new Error('must not query'); } },
+    });
+    assert.equal(result.cloudflarePublication.state, 'unstarted');
+    assert.equal(result.warnings.some((entry) => entry.includes('cloudflare-publication-status')), true);
+});
+
+test('symlinked Cloudflare status parent cannot spoof publication readiness', (t) => {
+    const root = fixture(t);
+    const ploinky = path.join(root, '.ploinky');
+    const outside = path.join(root, 'outside-run');
+    fs.mkdirSync(ploinky);
+    fs.mkdirSync(outside);
+    fs.writeFileSync(path.join(ploinky, 'agents.json'), '{}');
+    fs.writeFileSync(path.join(outside, 'cloudflare-publication-status.json'), JSON.stringify({
+        mode: 'cloudflare',
+        management: 'connector-only',
+        state: 'ready',
+        connectorState: 'running',
+        configurationGeneration: `sha256:${'a'.repeat(64)}`,
+        desiredDigest: `sha256:${'b'.repeat(64)}`,
+        hostnames: ['spoofed.example.test'],
+    }));
+    fs.symlinkSync(outside, path.join(ploinky, 'run'));
+    const result = readInboxStatus({
+        workspaceRoot: root,
+        runner: { query() { throw new Error('must not query'); } },
+    });
+    assert.equal(result.cloudflarePublication.state, 'unstarted');
+    assert.deepEqual(result.cloudflarePublication.hostnames, []);
+    assert.equal(result.warnings.some((entry) => entry.includes('cloudflare-publication-status')), true);
 });
 
 test('status exposes allowlisted counts and treats disappearing containers as transient', (t) => {

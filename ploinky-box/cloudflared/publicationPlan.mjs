@@ -15,6 +15,10 @@ const REQUIRED_CLOUDFLARE_FIELDS = Object.freeze([
     'tunnelTokenSecret',
     'apiTokenSecret',
 ]);
+const CONNECTOR_ONLY_FIELDS = Object.freeze([
+    'tunnelTokenSecret',
+]);
+const SUPPORTED_CLOUDFLARE_FIELDS = new Set(REQUIRED_CLOUDFLARE_FIELDS);
 
 export class CloudflarePublicationError extends Error {
     constructor(message, {
@@ -174,39 +178,54 @@ function normalizeHosts(value) {
 }
 
 function normalizeCloudflareTuple(value) {
-    if (value === undefined || value === null) return null;
+    if (value === undefined || value === null) {
+        return Object.freeze({ management: null, tuple: null });
+    }
     if (!isPlainObject(value)) {
         fail('Cloudflare configuration must be an object of scoped identifiers and secret handles', {
             code: 'CLOUDFLARE_CONFIGURATION_INVALID',
             operation: 'validate',
         });
     }
-    const unexpected = Object.keys(value).filter((field) => !REQUIRED_CLOUDFLARE_FIELDS.includes(field));
+    const unexpected = Object.keys(value).filter((field) => !SUPPORTED_CLOUDFLARE_FIELDS.has(field));
     if (unexpected.length) {
         fail(`Cloudflare configuration contains unsupported field '${unexpected.sort()[0]}'`, {
             code: 'CLOUDFLARE_CONFIGURATION_INVALID',
             operation: 'validate',
         });
     }
-    const tuple = Object.fromEntries(REQUIRED_CLOUDFLARE_FIELDS.map((field) => [field, String(value[field] || '').trim()]));
+    const tuple = Object.fromEntries(
+        REQUIRED_CLOUDFLARE_FIELDS.map((field) => [field, String(value[field] || '').trim()]),
+    );
+    const provided = Object.keys(value);
     const populated = REQUIRED_CLOUDFLARE_FIELDS.filter((field) => tuple[field]);
-    if (!populated.length) return null;
-    const missing = REQUIRED_CLOUDFLARE_FIELDS.filter((field) => !tuple[field]);
-    if (missing.length) {
+    const connectorOnly = provided.length === CONNECTOR_ONLY_FIELDS.length
+        && CONNECTOR_ONLY_FIELDS.every((field) => (
+            Object.prototype.hasOwnProperty.call(value, field) && tuple[field]
+        ));
+    const apiManaged = provided.length === REQUIRED_CLOUDFLARE_FIELDS.length
+        && populated.length === REQUIRED_CLOUDFLARE_FIELDS.length;
+    if (!connectorOnly && !apiManaged) {
+        const missing = REQUIRED_CLOUDFLARE_FIELDS.filter((field) => !tuple[field]);
         fail(`Cloudflare configuration is partial; missing ${missing.join(', ')}`, {
             code: 'CLOUDFLARE_CONFIGURATION_PARTIAL',
             operation: 'validate',
         });
     }
-    for (const field of ['accountId', 'zoneId', 'tunnelId']) {
-        if (!SCOPE_IDENTIFIER.test(tuple[field])) {
-            fail(`Cloudflare ${field} is malformed`, {
-                code: 'CLOUDFLARE_CONFIGURATION_INVALID',
-                operation: 'validate',
-            });
+    if (apiManaged) {
+        for (const field of ['accountId', 'zoneId', 'tunnelId']) {
+            if (!SCOPE_IDENTIFIER.test(tuple[field])) {
+                fail(`Cloudflare ${field} is malformed`, {
+                    code: 'CLOUDFLARE_CONFIGURATION_INVALID',
+                    operation: 'validate',
+                });
+            }
         }
     }
-    for (const field of ['tunnelTokenSecret', 'apiTokenSecret']) {
+    const secretFields = apiManaged
+        ? ['tunnelTokenSecret', 'apiTokenSecret']
+        : CONNECTOR_ONLY_FIELDS;
+    for (const field of secretFields) {
         if (!SECRET_HANDLE.test(tuple[field])) {
             fail(`Cloudflare ${field} must be an opaque encrypted-store handle`, {
                 code: 'CLOUDFLARE_CONFIGURATION_INVALID',
@@ -214,13 +233,16 @@ function normalizeCloudflareTuple(value) {
             });
         }
     }
-    if (tuple.tunnelTokenSecret === tuple.apiTokenSecret) {
+    if (apiManaged && tuple.tunnelTokenSecret === tuple.apiTokenSecret) {
         fail('Cloudflare connector and API tokens require separate secret handles', {
             code: 'CLOUDFLARE_SECRET_SEPARATION_REQUIRED',
             operation: 'validate',
         });
     }
-    return tuple;
+    return Object.freeze({
+        management: apiManaged ? 'api-managed' : 'connector-only',
+        tuple,
+    });
 }
 
 export function normalizeCloudflarePublicationDesired({
@@ -230,25 +252,47 @@ export function normalizeCloudflarePublicationDesired({
 } = {}) {
     const generation = normalizeConfigurationGeneration(configurationGeneration);
     const normalizedHosts = normalizeHosts(hosts);
-    const tuple = normalizeCloudflareTuple(cloudflare);
-    if (!tuple && normalizedHosts.length) {
-        fail('Cloudflare hostnames require the complete Cloudflare credential and scope tuple', {
+    const classified = normalizeCloudflareTuple(cloudflare);
+    const { management, tuple } = classified;
+    if (!management && normalizedHosts.length) {
+        fail('Cloudflare hostnames require Cloudflare publication configuration', {
             code: 'CLOUDFLARE_CONFIGURATION_PARTIAL',
             operation: 'validate',
         });
     }
-    if (!tuple) {
+    if (!management) {
         return deepFreeze({
             mode: 'local-only',
+            management: null,
             configurationGeneration: generation,
             hosts: [],
-            desiredDigest: publicationDigest({ mode: 'local-only', configurationGeneration: generation }),
+            desiredDigest: publicationDigest({
+                mode: 'local-only',
+                management: null,
+                configurationGeneration: generation,
+            }),
         });
     }
     if (!normalizedHosts.length) {
         fail('Complete Cloudflare mode requires at least one valid hostname', {
             code: 'CLOUDFLARE_CONFIGURATION_PARTIAL',
             operation: 'validate',
+        });
+    }
+    if (management === 'connector-only') {
+        const digestInput = {
+            mode: 'cloudflare',
+            management,
+            configurationGeneration: generation,
+            originService: CLOUDFLARE_ORIGIN,
+            hosts: normalizedHosts,
+        };
+        return deepFreeze({
+            ...digestInput,
+            secretHandles: {
+                tunnelToken: tuple.tunnelTokenSecret,
+            },
+            desiredDigest: publicationDigest(digestInput),
         });
     }
     const scope = {
@@ -269,6 +313,7 @@ export function normalizeCloudflarePublicationDesired({
     }));
     const digestInput = {
         mode: 'cloudflare',
+        management,
         configurationGeneration: generation,
         scope,
         hosts: normalizedHosts,
@@ -288,10 +333,14 @@ export function normalizeCloudflarePublicationDesired({
 export function publicPlanSummary(plan) {
     const value = {
         mode: plan?.mode === 'cloudflare' ? 'cloudflare' : 'local-only',
+        management: plan?.mode === 'cloudflare'
+            && ['connector-only', 'api-managed'].includes(plan?.management)
+            ? plan.management
+            : null,
         configurationGeneration: String(plan?.configurationGeneration || ''),
         desiredDigest: String(plan?.desiredDigest || ''),
         hostnames: Array.isArray(plan?.hosts) ? plan.hosts.map((entry) => entry.hostname) : [],
     };
-    if (plan?.mode === 'cloudflare') value.scope = { ...plan.scope };
+    if (plan?.management === 'api-managed') value.scope = { ...plan.scope };
     return deepFreeze(value);
 }

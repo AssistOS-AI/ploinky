@@ -1,7 +1,7 @@
-import { readSecretsFile } from '../utils/security/encryptedSecretsFile.js';
-import { createCloudflarePublicationApi } from './cloudflarePublicationApi.js';
-import { createCloudflaredConnector } from './cloudflarePublicationConnector.js';
-import { createCloudflarePublicationJournal } from './cloudflarePublicationJournal.js';
+import { readSecretsFile } from '../../cli/utils/security/encryptedSecretsFile.js';
+import { createCloudflarePublicationApi } from './cloudflareApi.mjs';
+import { createCloudflaredConnector } from './connector.mjs';
+import { createCloudflarePublicationJournal } from './journal.mjs';
 import {
     CLOUDFLARE_TERMINAL_SERVICE,
     CloudflarePublicationError,
@@ -11,7 +11,7 @@ import {
     redactCloudflareText,
     stablePublicationJson,
     toPublicationError,
-} from './cloudflarePublicationPlan.js';
+} from './publicationPlan.mjs';
 
 const REQUIRED_API_METHODS = Object.freeze([
     'validateScope',
@@ -93,7 +93,7 @@ function journalValue(plan, phase, {
     managedDnsRecords = [],
     lastError = null,
 } = {}) {
-    const cloudflare = plan.mode === 'cloudflare';
+    const cloudflare = plan.management === 'api-managed';
     return {
         mode: plan.mode,
         configurationGeneration: plan.configurationGeneration,
@@ -106,7 +106,7 @@ function journalValue(plan, phase, {
     };
 }
 
-function resolveSecretPair(secretStore, plan) {
+function readSecretStore(secretStore) {
     const secrets = secretStore.readAll();
     if (!secrets || typeof secrets !== 'object' || Array.isArray(secrets)) {
         throw new CloudflarePublicationError('Encrypted secret store is unreadable', {
@@ -114,6 +114,25 @@ function resolveSecretPair(secretStore, plan) {
             operation: 'resolve-secrets',
         });
     }
+    return secrets;
+}
+
+function resolveConnectorSecret(secretStore, plan) {
+    const secrets = readSecretStore(secretStore);
+    const tunnelToken = Object.prototype.hasOwnProperty.call(secrets, plan.secretHandles.tunnelToken)
+        ? String(secrets[plan.secretHandles.tunnelToken] || '').trim()
+        : '';
+    if (!tunnelToken) {
+        throw new CloudflarePublicationError('Cloudflare connector secret handle is unresolved', {
+            code: 'CLOUDFLARE_CONNECTOR_SECRET_UNRESOLVED',
+            operation: 'resolve-secrets',
+        });
+    }
+    return tunnelToken;
+}
+
+function resolveSecretPair(secretStore, plan) {
+    const secrets = readSecretStore(secretStore);
     const tunnelToken = Object.prototype.hasOwnProperty.call(secrets, plan.secretHandles.tunnelToken)
         ? String(secrets[plan.secretHandles.tunnelToken] || '').trim()
         : '';
@@ -192,6 +211,7 @@ export function createCloudflareConnectorProbe({
 export class CloudflarePublicationController {
     constructor({
         api,
+        apiFactory,
         connector,
         journal,
         secretStore,
@@ -202,14 +222,20 @@ export class CloudflarePublicationController {
         audit = () => {},
         restartPolicy = {},
     } = {}) {
-        requireMethods(api, 'Cloudflare publication API', REQUIRED_API_METHODS);
+        if (api !== undefined && api !== null) {
+            requireMethods(api, 'Cloudflare publication API', REQUIRED_API_METHODS);
+        }
+        if (!api && typeof apiFactory !== 'function') {
+            throw new TypeError('Cloudflare publication requires api or apiFactory()');
+        }
         requireMethods(connector, 'cloudflared connector', ['start', 'stop', 'isRunning']);
         requireMethods(journal, 'Cloudflare publication journal', ['read', 'write']);
         requireMethods(secretStore, 'Cloudflare secret store', ['readAll']);
         requireMethods(routeCoordinator, 'Cloudflare route coordinator', ['inactivate', 'commit']);
         if (typeof probeConnector !== 'function') throw new TypeError('Cloudflare publication requires probeConnector()');
         if (typeof probeHostname !== 'function') throw new TypeError('Cloudflare publication requires probeHostname()');
-        this.api = api;
+        this.api = api || null;
+        this.apiFactory = apiFactory;
         this.connector = connector;
         this.journal = journal;
         this.secretStore = secretStore;
@@ -227,6 +253,7 @@ export class CloudflarePublicationController {
         this.state = {
             state: 'local-only',
             mode: 'local-only',
+            management: null,
             configurationGeneration: '',
             publicationGeneration: 0,
             connectorState: 'absent',
@@ -240,7 +267,7 @@ export class CloudflarePublicationController {
         this.requestRevision = 0;
         this.currentAbort = null;
         this.lastInput = null;
-        this.lastCloudflareInput = null;
+        this.lastApiManagedInput = null;
         this.restartHistory = [];
         this.restartTimer = null;
         this.stopped = false;
@@ -248,6 +275,14 @@ export class CloudflarePublicationController {
 
     getStatus() {
         return freezeClone(this.state);
+    }
+
+    requireApi() {
+        if (!this.api) {
+            this.api = this.apiFactory();
+            requireMethods(this.api, 'Cloudflare publication API', REQUIRED_API_METHODS);
+        }
+        return this.api;
     }
 
     async transition(patch) {
@@ -331,20 +366,20 @@ export class CloudflarePublicationController {
             // to tear down; every Cloudflare transition still inactivates first.
             if (!adoptSelectedLocalState) await this.inactivate(input, reason);
             this.lastInput = cloneJson(input);
-            if (plan.mode === 'cloudflare') this.lastCloudflareInput = cloneJson(input);
             const summary = publicPlanSummary(plan);
-            managedDnsRecords = plan.mode === 'cloudflare' && sameScope(currentJournal?.scope, plan.scope)
+            managedDnsRecords = plan.management === 'api-managed'
+                && sameScope(currentJournal?.scope, plan.scope)
                 ? currentJournal.managedDnsRecords.map((entry) => ({ ...entry }))
                 : [];
             if (plan.mode === 'local-only') {
                 if (currentJournal?.mode === 'cloudflare') {
                     let previousPlan;
                     try {
-                        previousPlan = normalizeCloudflarePublicationDesired(this.lastCloudflareInput || {});
+                        previousPlan = normalizeCloudflarePublicationDesired(this.lastApiManagedInput || {});
                     } catch (_) {
                         previousPlan = null;
                     }
-                    if (previousPlan?.mode !== 'cloudflare'
+                    if (previousPlan?.management !== 'api-managed'
                         || !sameScope(previousPlan.scope, currentJournal.scope)) {
                         throw new CloudflarePublicationError(
                             'Local-only activation requires the previously selected Cloudflare credential handles until owned ingress and DNS teardown verifies; reselect the prior Cloudflare state and retry removal',
@@ -355,6 +390,7 @@ export class CloudflarePublicationController {
                         );
                     }
                     secretPair = resolveSecretPair(this.secretStore, previousPlan);
+                    this.requireApi();
                     await this.clearPreviousScope({
                         previous: currentJournal,
                         apiToken: secretPair.apiToken,
@@ -382,11 +418,12 @@ export class CloudflarePublicationController {
                     });
                 }
                 this.journal.write(journalValue(plan, 'local-only'));
-                this.lastCloudflareInput = null;
+                this.lastApiManagedInput = null;
                 this.safeAudit('cloudflare-local-only', summary);
                 return this.transition({
                     state: 'local-only',
                     mode: 'local-only',
+                    management: null,
                     configurationGeneration: plan.configurationGeneration,
                     connectorState: 'absent',
                     hostnames: [],
@@ -397,9 +434,106 @@ export class CloudflarePublicationController {
                 });
             }
 
+            if (plan.management === 'connector-only') {
+                if (currentJournal?.mode === 'cloudflare') {
+                    throw new CloudflarePublicationError(
+                        'Direct API-managed to connector-only transition is unsafe while Ploinky-owned Cloudflare resources remain; apply local-only first -> verify API-managed teardown -> apply connector-only',
+                        {
+                            code: 'CLOUDFLARE_MANAGEMENT_TRANSITION_UNSAFE',
+                            operation: 'transition-management',
+                        },
+                    );
+                }
+                const signal = abortController.signal;
+                await this.transition({
+                    state: 'reconciling',
+                    mode: 'cloudflare',
+                    management: 'connector-only',
+                    configurationGeneration: plan.configurationGeneration,
+                    connectorState: 'stopped',
+                    hostnames: plan.hosts.map((entry) => entry.hostname),
+                    scope: null,
+                    reconciliation: { desiredDigest: plan.desiredDigest, phase: 'routes-committing' },
+                    error: null,
+                    retry: null,
+                });
+                this.assertCurrent(revision, signal);
+                await this.routeCoordinator.commit({
+                    mode: 'cloudflare',
+                    publicationState: 'reconciling',
+                    configurationGeneration: plan.configurationGeneration,
+                    hosts: asHostObject(plan),
+                    canonicalScheme: 'https',
+                });
+                this.assertCurrent(revision, signal);
+                const tunnelToken = resolveConnectorSecret(this.secretStore, plan);
+                secretPair = { tunnelToken };
+                await this.transition({
+                    connectorState: 'starting',
+                    reconciliation: { desiredDigest: plan.desiredDigest, phase: 'connector-starting' },
+                });
+                await this.connector.start({
+                    tunnelToken,
+                    onExit: (event) => { void this.onConnectorExit(event, revision); },
+                    onOutput: ({ stream, message }) => this.safeAudit('cloudflared-output', { stream, message }),
+                });
+                if (!this.connector.isRunning()) {
+                    throw new CloudflarePublicationError('cloudflared exited during readiness verification', {
+                        code: 'CLOUDFLARED_NOT_RUNNING',
+                        operation: 'probe-connector',
+                        retryable: true,
+                    });
+                }
+                for (const host of plan.hosts) {
+                    const proof = await this.probeHostname({
+                        hostname: host.hostname,
+                        selector: cloneJson(host.selector),
+                        canonicalScheme: 'https',
+                        configurationGeneration: plan.configurationGeneration,
+                        signal,
+                    });
+                    if (!proof || proof.ok !== true) {
+                        throw new CloudflarePublicationError(`External route probe failed for ${host.hostname}`, {
+                            code: 'CLOUDFLARE_HOST_PROBE_FAILED',
+                            operation: 'probe-hostname',
+                            retryable: true,
+                        });
+                    }
+                }
+                if (!this.connector.isRunning()) {
+                    throw new CloudflarePublicationError('cloudflared exited during readiness verification', {
+                        code: 'CLOUDFLARED_NOT_RUNNING',
+                        operation: 'probe-hostname',
+                        retryable: true,
+                    });
+                }
+                this.assertCurrent(revision, signal);
+                await this.routeCoordinator.commit({
+                    mode: 'cloudflare',
+                    publicationState: 'ready',
+                    configurationGeneration: plan.configurationGeneration,
+                    hosts: asHostObject(plan),
+                    canonicalScheme: 'https',
+                });
+                this.assertCurrent(revision, signal);
+                this.safeAudit('ready', summary);
+                return this.transition({
+                    state: 'ready',
+                    mode: 'cloudflare',
+                    management: 'connector-only',
+                    connectorState: 'running',
+                    reconciliation: { desiredDigest: plan.desiredDigest, phase: 'ready' },
+                    error: null,
+                    retry: null,
+                    scope: null,
+                });
+            }
+
+            this.lastApiManagedInput = cloneJson(input);
             await this.transition({
                 state: 'reconciling',
                 mode: 'cloudflare',
+                management: 'api-managed',
                 configurationGeneration: plan.configurationGeneration,
                 connectorState: 'stopped',
                 hostnames: plan.hosts.map((entry) => entry.hostname),
@@ -412,7 +546,8 @@ export class CloudflarePublicationController {
             const { apiToken, tunnelToken } = secretPair;
             const signal = abortController.signal;
             this.assertCurrent(revision, signal);
-            await this.api.validateScope({ apiToken, ...plan.scope, signal });
+            const api = this.requireApi();
+            await api.validateScope({ apiToken, ...plan.scope, signal });
             if (currentJournal?.mode === 'cloudflare'
                 && !sameScope(currentJournal.scope, plan.scope)) {
                 await this.clearPreviousScope({
@@ -427,7 +562,7 @@ export class CloudflarePublicationController {
                 ? currentJournal.managedDnsRecords.map((entry) => ({ ...entry }))
                 : [];
             this.journal.write(journalValue(plan, 'prepared', { managedDnsRecords }));
-            await this.api.putTunnelIngress({ apiToken, ...plan.scope, ingress: plan.ingress, signal });
+            await api.putTunnelIngress({ apiToken, ...plan.scope, ingress: plan.ingress, signal });
             this.assertCurrent(revision, signal);
             this.journal.write(journalValue(plan, 'ingress-applied', { managedDnsRecords }));
 
@@ -461,7 +596,7 @@ export class CloudflarePublicationController {
             this.assertCurrent(revision, signal);
             this.journal.write(journalValue(plan, 'routes-committed', { managedDnsRecords }));
 
-            const baselineConnections = await this.api.listTunnelConnections({ apiToken, ...plan.scope, signal });
+            const baselineConnections = await api.listTunnelConnections({ apiToken, ...plan.scope, signal });
             const baselineConnectionIds = baselineConnections.map(connectionId).filter(Boolean);
             this.journal.write(journalValue(plan, 'connector-starting', { managedDnsRecords }));
             await this.transition({
@@ -474,7 +609,7 @@ export class CloudflarePublicationController {
                 onOutput: ({ stream, message }) => this.safeAudit('cloudflared-output', { stream, message }),
             });
             await this.probeConnector({
-                api: this.api,
+                api,
                 apiToken,
                 scope: plan.scope,
                 connector: this.connector,
@@ -504,6 +639,13 @@ export class CloudflarePublicationController {
                     });
                 }
             }
+            if (!this.connector.isRunning()) {
+                throw new CloudflarePublicationError('cloudflared exited during readiness verification', {
+                    code: 'CLOUDFLARED_NOT_RUNNING',
+                    operation: 'probe-hostname',
+                    retryable: true,
+                });
+            }
             this.assertCurrent(revision, signal);
             await this.routeCoordinator.commit({
                 mode: 'cloudflare',
@@ -518,6 +660,7 @@ export class CloudflarePublicationController {
             return await this.transition({
                 state: 'ready',
                 mode: 'cloudflare',
+                management: 'api-managed',
                 connectorState: 'running',
                 reconciliation: { desiredDigest: plan.desiredDigest, phase: 'ready' },
                 error: null,
@@ -525,7 +668,19 @@ export class CloudflarePublicationController {
             });
         } catch (error) {
             await this.connector.stop('error');
-            try { await this.inactivate(input, 'cloudflare-error'); } catch (_) {}
+            try {
+                await this.inactivate(input, 'cloudflare-error');
+                if (plan?.management === 'connector-only') {
+                    this.assertCurrent(revision, abortController.signal);
+                    await this.routeCoordinator.commit({
+                        mode: 'cloudflare',
+                        publicationState: 'error',
+                        configurationGeneration: plan.configurationGeneration,
+                        hosts: asHostObject(plan),
+                        canonicalScheme: 'https',
+                    });
+                }
+            } catch (_) {}
             const statusError = errorStatus(error, secretPair ? Object.values(secretPair) : []);
             if (plan?.mode === 'local-only' && currentJournal?.mode === 'cloudflare') {
                 try {
@@ -548,14 +703,14 @@ export class CloudflarePublicationController {
                         lastError: statusError,
                     });
                 } catch (_) {}
-            } else if (plan) {
+            } else if (plan?.management === 'api-managed') {
                 try {
                     this.journal.write(journalValue(plan, 'error', {
                         managedDnsRecords,
                         lastError: statusError,
                     }));
                 } catch (_) {}
-            } else if (currentJournal) {
+            } else if (!plan && currentJournal) {
                 try {
                     this.journal.write({
                         ...currentJournal,
@@ -569,6 +724,7 @@ export class CloudflarePublicationController {
                 await this.transition({
                     state: 'error',
                     mode: plan?.mode || 'invalid',
+                    management: plan?.management || null,
                     configurationGeneration: String(plan?.configurationGeneration || input?.configurationGeneration || ''),
                     connectorState: 'stopped',
                     hostnames: plan?.hosts?.map((entry) => entry.hostname) || [],
@@ -732,7 +888,21 @@ export class CloudflarePublicationController {
     async onConnectorExit(event, revision) {
         if (event?.intentional || this.stopped || revision !== this.requestRevision) return;
         if (this.state.state !== 'ready') return;
-        try { await this.inactivate(this.lastInput, 'cloudflared-exit'); } catch (_) {}
+        let plan = null;
+        try { plan = normalizeCloudflarePublicationDesired(this.lastInput); } catch (_) {}
+        try {
+            await this.inactivate(this.lastInput, 'cloudflared-exit');
+            if (plan?.management === 'connector-only') {
+                this.assertCurrent(revision);
+                await this.routeCoordinator.commit({
+                    mode: 'cloudflare',
+                    publicationState: 'error',
+                    configurationGeneration: plan.configurationGeneration,
+                    hosts: asHostObject(plan),
+                    canonicalScheme: 'https',
+                });
+            }
+        } catch (_) {}
         const now = Date.now();
         this.restartHistory = this.restartHistory
             .filter((timestamp) => now - timestamp < this.restartPolicy.windowMs);
@@ -751,16 +921,17 @@ export class CloudflarePublicationController {
                 retryable: !exhausted,
             },
         ));
-        try {
-            const plan = normalizeCloudflarePublicationDesired(this.lastInput);
-            const existing = this.journal.read();
-            this.journal.write(journalValue(plan, 'error', {
-                managedDnsRecords: sameScope(existing?.scope, plan.scope)
-                    ? existing.managedDnsRecords
-                    : [],
-                lastError: statusError,
-            }));
-        } catch (_) {}
+        if (plan?.management === 'api-managed') {
+            try {
+                const existing = this.journal.read();
+                this.journal.write(journalValue(plan, 'error', {
+                    managedDnsRecords: sameScope(existing?.scope, plan.scope)
+                        ? existing.managedDnsRecords
+                        : [],
+                    lastError: statusError,
+                }));
+            } catch (_) {}
+        }
         await this.transition({
             state: 'error',
             connectorState: 'stopped',
@@ -790,6 +961,12 @@ export class CloudflarePublicationController {
         this.restartTimer = null;
         await this.connector.stop('controller-stop');
         try { await this.inactivate(this.lastInput || {}, 'cloudflare-controller-stop'); } catch (_) {}
+        await this.transition({
+            state: 'stopped',
+            connectorState: this.state.mode === 'local-only' ? 'absent' : 'stopped',
+            error: null,
+            retry: null,
+        });
     }
 }
 
@@ -803,7 +980,8 @@ export function createCloudflarePublicationController({
     probeHostname,
     publishState,
     audit,
-    api = createCloudflarePublicationApi(),
+    api,
+    apiFactory = createCloudflarePublicationApi,
     connector = createCloudflaredConnector(),
     journal = createCloudflarePublicationJournal({ workspaceRoot }),
     secretStore = createEncryptedCloudflareSecretStore(),
@@ -812,6 +990,7 @@ export function createCloudflarePublicationController({
 } = {}) {
     return new CloudflarePublicationController({
         api,
+        apiFactory,
         connector,
         journal,
         secretStore,
@@ -829,4 +1008,4 @@ export {
     CloudflarePublicationError,
     normalizeCloudflarePublicationDesired,
     publicPlanSummary,
-} from './cloudflarePublicationPlan.js';
+} from './publicationPlan.mjs';

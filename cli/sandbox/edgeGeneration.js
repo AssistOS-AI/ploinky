@@ -740,11 +740,39 @@ function publicationDisposition(desired) {
     const cloudflare = desired.cloudflare;
     const hostCount = Object.keys(desired.hosts).length;
     const required = ['accountId', 'zoneId', 'tunnelId', 'tunnelTokenSecret', 'apiTokenSecret'];
-    const complete = Boolean(cloudflare) && required.every((key) => Boolean(cloudflare[key])) && hostCount > 0;
+    const populated = cloudflare
+        ? required.filter((key) => Boolean(cloudflare[key]))
+        : [];
+    const connectorOnly = Boolean(cloudflare)
+        && populated.length === 1
+        && populated[0] === 'tunnelTokenSecret'
+        && hostCount > 0;
+    const apiManaged = Boolean(cloudflare)
+        && populated.length === required.length
+        && hostCount > 0;
     const absent = cloudflare === undefined && hostCount === 0;
-    if (absent) return { mode: 'local-only', defaultState: 'ready', complete: true };
-    if (complete) return { mode: 'cloudflare', defaultState: 'reconciling', complete: true };
-    return { mode: 'error', defaultState: 'error', complete: false };
+    if (absent) {
+        return {
+            mode: 'local-only',
+            management: null,
+            defaultState: 'ready',
+            complete: true,
+        };
+    }
+    if (connectorOnly || apiManaged) {
+        return {
+            mode: 'cloudflare',
+            management: connectorOnly ? 'connector-only' : 'api-managed',
+            defaultState: 'reconciling',
+            complete: true,
+        };
+    }
+    return {
+        mode: 'error',
+        management: null,
+        defaultState: 'error',
+        complete: false,
+    };
 }
 
 function collectManifestHostNetworkCapabilities(routing, manifests, agents) {

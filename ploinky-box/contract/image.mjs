@@ -27,6 +27,7 @@ export const IMAGE_CONTRACT = Object.freeze({
         'bash',
         'ip',
         'fuse-overlayfs',
+        'cloudflared',
         '/usr/local/bin/ploinky-box-entrypoint',
     ]),
     networkHelpers: Object.freeze(['pasta', 'slirp4netns']),
@@ -205,7 +206,7 @@ export function probeImageBinaries(engine, imageId, runner) {
         '-c',
         [
             'set -eu',
-            "for name in node podman bash ip fuse-overlayfs; do command -v \"$name\"; done",
+            "for name in node podman bash ip fuse-overlayfs cloudflared; do command -v \"$name\"; done",
             'test -x /usr/local/bin/ploinky-box-entrypoint',
             "printf '%s\\n' /usr/local/bin/ploinky-box-entrypoint",
             `test "$(wc -c < /etc/ploinky-box)" -eq ${Buffer.byteLength(BOX_MARKER_CONTENT)}`,

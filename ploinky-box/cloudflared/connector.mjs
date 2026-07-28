@@ -6,9 +6,10 @@ import {
     CloudflarePublicationError,
     redactCloudflareText,
     toPublicationError,
-} from './cloudflarePublicationPlan.js';
+} from './publicationPlan.mjs';
 
 export const DEFAULT_CLOUDFLARED_RUNTIME_DIRECTORY = '/run/ploinky/cloudflared';
+export const DEFAULT_CLOUDFLARED_RUNTIME_ROOT = '/run';
 
 export function buildCloudflaredArguments(tokenFile) {
     const file = String(tokenFile || '').trim();
@@ -37,9 +38,42 @@ function minimalConnectorEnvironment(source = process.env) {
     return environment;
 }
 
-function ensureRuntimeDirectory(runtimeDirectory) {
-    fs.mkdirSync(runtimeDirectory, { recursive: true, mode: 0o700 });
-    const stats = fs.lstatSync(runtimeDirectory);
+function runtimeDirectoryError(message) {
+    return new CloudflarePublicationError(message, {
+        code: 'CLOUDFLARED_RUNTIME_DIRECTORY_INVALID',
+        operation: 'connector-start',
+    });
+}
+
+function ensureRuntimeDirectory(runtimeRoot, runtimeDirectory) {
+    const root = path.resolve(runtimeRoot);
+    const target = path.resolve(runtimeDirectory);
+    const relative = path.relative(root, target);
+    if (relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+        throw runtimeDirectoryError('cloudflared runtime path escapes its trusted root');
+    }
+    const rootStats = fs.lstatSync(root);
+    if (!rootStats.isDirectory() || rootStats.isSymbolicLink()) {
+        throw runtimeDirectoryError('cloudflared runtime root must be a real directory');
+    }
+    let current = root;
+    for (const component of relative.split(path.sep).filter(Boolean)) {
+        current = path.join(current, component);
+        try {
+            const stats = fs.lstatSync(current);
+            if (!stats.isDirectory() || stats.isSymbolicLink()) {
+                throw runtimeDirectoryError('cloudflared runtime path must be a real directory');
+            }
+        } catch (error) {
+            if (error?.code !== 'ENOENT') throw error;
+            fs.mkdirSync(current, { mode: 0o700 });
+            const created = fs.lstatSync(current);
+            if (!created.isDirectory() || created.isSymbolicLink()) {
+                throw runtimeDirectoryError('cloudflared runtime path must be a real directory');
+            }
+        }
+    }
+    const stats = fs.lstatSync(target);
     if (!stats.isDirectory() || stats.isSymbolicLink()) {
         throw new CloudflarePublicationError('cloudflared runtime path must be a real directory', {
             code: 'CLOUDFLARED_RUNTIME_DIRECTORY_INVALID',
@@ -87,11 +121,13 @@ function createOutputForwarder({ token, tokenFile, onOutput }) {
 export function createCloudflaredConnector({
     binary = 'cloudflared',
     runtimeDirectory = process.env.PLOINKY_CLOUDFLARED_RUNTIME_DIR || DEFAULT_CLOUDFLARED_RUNTIME_DIRECTORY,
+    trustedRuntimeRoot = DEFAULT_CLOUDFLARED_RUNTIME_ROOT,
     spawnImpl = spawn,
     environment = process.env,
     stopTimeoutMs = 5000,
 } = {}) {
     const absoluteRuntimeDirectory = path.resolve(String(runtimeDirectory));
+    const absoluteRuntimeRoot = path.resolve(String(trustedRuntimeRoot));
     let active = null;
     const forceStopOnParentExit = () => {
         try { active?.forceStop?.(); } catch (_) {}
@@ -116,7 +152,7 @@ export function createCloudflaredConnector({
                 });
             }
             await stopActive('replace');
-            ensureRuntimeDirectory(absoluteRuntimeDirectory);
+            ensureRuntimeDirectory(absoluteRuntimeRoot, absoluteRuntimeDirectory);
             const runDirectory = fs.mkdtempSync(path.join(absoluteRuntimeDirectory, 'connector-'));
             fs.chmodSync(runDirectory, 0o700);
             const tokenFile = path.join(runDirectory, 'tunnel-token');

@@ -84,7 +84,7 @@ import {
 } from './agentOpenAiDelegation.js';
 import { PLOINKY_DIR } from '../utils/config.js';
 import { deriveAgentRequestSecret } from '../utils/security/masterKey.js';
-import { startCloudflarePublicationRuntime } from '../sandbox/cloudflarePublicationRuntime.js';
+import { createCloudflaredRouterIntegration } from '../../ploinky-box/cloudflared/index.mjs';
 import { requestAgentCard } from './agentCardFanout.js';
 import { isInsideBox } from '../../ploinky-box/lib/boxMarker.mjs';
 
@@ -794,7 +794,7 @@ async function processPrivateRequest(req, res) {
 function detailedHealthData() {
     const memUsage = process.memoryUsage();
     let edgePublication = null;
-    try { edgePublication = cloudflarePublicationRuntime?.getStatus() || null; } catch (_) {}
+    try { edgePublication = cloudflaredRouterIntegration.getStatus(); } catch (_) {}
     return {
         status: 'healthy',
         uptime: process.uptime(),
@@ -833,24 +833,9 @@ const privateListenerSet = createPrivateListenerSet({
     wildcardHost: isInsideBox(),
     audit: (event, value) => appendLog(event, value),
 });
-let cloudflarePublicationRuntime = null;
-let publicListenerReady = false;
-let privateListenerReady = false;
-
-function maybeStartCloudflarePublicationRuntime() {
-    if (!publicListenerReady || !privateListenerReady || cloudflarePublicationRuntime) return;
-    try {
-        cloudflarePublicationRuntime = startCloudflarePublicationRuntime({
-            audit: (event, value) => appendLog(event, value),
-        });
-        appendLog('cloudflare_publication_runtime_start', {});
-    } catch (error) {
-        appendLog('cloudflare_publication_runtime_start_error', {
-            code: error?.code || 'CLOUDFLARE_RUNTIME_START_FAILED',
-            error: String(error?.message || error).slice(0, 1024),
-        });
-    }
-}
+const cloudflaredRouterIntegration = createCloudflaredRouterIntegration({
+    audit: (event, value) => appendLog(event, value),
+});
 
 server.on('upgrade', async (req, socket, head) => {
     try {
@@ -970,10 +955,8 @@ const lifecycle = setupProcessLifecycle(
     {
         beforeClose: [async () => {
             runtimeRelayManager.close();
+            await cloudflaredRouterIntegration.stop();
             await privateListenerSet.close();
-            const runtime = cloudflarePublicationRuntime;
-            cloudflarePublicationRuntime = null;
-            await runtime?.stop();
         }],
     },
 );
@@ -1029,14 +1012,13 @@ healthServer.on('clientError', (_error, socket) => {
 
 try {
     const snapshot = await privateListenerSet.start();
-    privateListenerReady = true;
+    cloudflaredRouterIntegration.markPrivateListenerReady();
     appendLog('private_server_start', {
         port: privatePort,
         addresses: snapshot.addresses,
         classifierError: snapshot.classifierError || undefined,
     });
     logBootEvent('private_server_listening', { port: privatePort, addresses: snapshot.addresses });
-    maybeStartCloudflarePublicationRuntime();
 } catch (error) {
     console.error('[FATAL] Private Router exact listener set failed:', error);
     appendLog('private_server_start_error', {
@@ -1053,7 +1035,7 @@ healthServer.listen(detailedHealthSocket, () => {
 
 // Start server
 server.listen(port, '0.0.0.0', () => {
-    publicListenerReady = true;
+    cloudflaredRouterIntegration.markPublicListenerReady();
     console.log(`[RoutingServer] Ploinky server running on http://127.0.0.1:${port}`);
     console.log('  Dashboard:       /dashboard');
     console.log('  WebChat:         /webchat');
@@ -1064,7 +1046,6 @@ server.listen(port, '0.0.0.0', () => {
     console.log('  Aggregate cards: /agent-card');
     appendLog('server_start', { port });
     logBootEvent('server_listening', { port });
-    maybeStartCloudflarePublicationRuntime();
 
     // Bootstrap MCP tool policy from each enabled agent's mcp-config tags
     // (persisted admin policy always wins). Without this, fail-closed

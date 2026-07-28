@@ -5,7 +5,7 @@ import {
     CLOUDFLARE_ORIGIN,
     CloudflarePublicationController,
     CloudflarePublicationError,
-} from '../../cli/sandbox/cloudflarePublication.js';
+} from '../../ploinky-box/cloudflared/publicationController.mjs';
 
 const CONNECTOR_TOKEN = 'connector-secret-value';
 const API_TOKEN = 'api-secret-value';
@@ -27,6 +27,18 @@ function desired(hostnames = ['office.example.test'], generationCharacter = 'a',
     };
 }
 
+function connectorDesired(hostnames = ['office.example.test'], generationCharacter = 'a') {
+    return {
+        configurationGeneration: `sha256:${generationCharacter.repeat(64)}`,
+        cloudflare: {
+            tunnelTokenSecret: 'publication/cloudflare-connector',
+        },
+        hosts: Object.fromEntries(hostnames.map((hostname) => [hostname, {
+            agent: `repo/${hostname.split('.')[0]}`,
+        }])),
+    };
+}
+
 function localDesired(generationCharacter = 'f') {
     return { configurationGeneration: `sha256:${generationCharacter.repeat(64)}` };
 }
@@ -39,7 +51,6 @@ function createMemoryJournal(initial = null) {
         read() { return value ? structuredClone(value) : null; },
         write(next) {
             value = {
-                schemaVersion: 1,
                 updatedAt: new Date().toISOString(),
                 ...structuredClone(next),
             };
@@ -131,11 +142,13 @@ function createFakeConnector(events) {
         starts: 0,
         async start({ tunnelToken, onExit }) {
             events.push({ event: 'connector.start', tunnelToken });
+            if (connector.failStart) throw connector.failStart;
             connector.starts += 1;
             running = true;
             exitCallback = onExit;
             return { pid: 1000 + connector.starts };
         },
+        failStart: null,
         async stop(reason) {
             events.push({ event: 'connector.stop', reason });
             running = false;
@@ -158,6 +171,7 @@ function createHarness({
     probeHostname,
     probeConnector,
     restartPolicy,
+    lazyApi = false,
 } = {}) {
     const events = [];
     const audits = [];
@@ -180,8 +194,14 @@ function createHarness({
             routes.commits.push(structuredClone(input));
         },
     };
+    let apiFactoryCalls = 0;
     const controller = new CloudflarePublicationController({
-        api,
+        ...(lazyApi ? {
+            apiFactory: () => {
+                apiFactoryCalls += 1;
+                return api;
+            },
+        } : { api }),
         connector,
         journal,
         secretStore: { readAll: () => ({ ...secrets }) },
@@ -199,7 +219,17 @@ function createHarness({
         audit: (event, value) => audits.push({ event, value: structuredClone(value) }),
         restartPolicy,
     });
-    return { controller, events, audits, states, api, connector, journal, routes };
+    return {
+        controller,
+        events,
+        audits,
+        states,
+        api,
+        connector,
+        journal,
+        routes,
+        get apiFactoryCalls() { return apiFactoryCalls; },
+    };
 }
 
 async function waitFor(predicate, timeoutMs = 1000) {
@@ -282,6 +312,177 @@ test('complete publication verifies remote state before route commit and proves 
     assert.equal(harness.routes.active, true);
     assert.deepEqual(Object.keys(harness.routes.hosts).sort(), ['meet.example.test', 'office.example.test']);
     assert.equal(harness.journal.writes.at(-1).phase, 'ready');
+});
+
+test('connector-only proves every host, commits reconciling then ready, and owns no API or journal state', async () => {
+    const harness = createHarness({ lazyApi: true });
+    const writesBefore = harness.journal.writes.length;
+    const status = await harness.controller.reconcile(connectorDesired([
+        'office.example.test',
+        'meet.example.test',
+    ]));
+    assert.equal(status.state, 'ready');
+    assert.equal(status.management, 'connector-only');
+    assert.equal(status.scope, null);
+    assert.equal(harness.apiFactoryCalls, 0);
+    assert.equal(harness.events.some((entry) => entry.event.startsWith('api.')), false);
+    assert.equal(harness.journal.writes.length, writesBefore);
+    assert.deepEqual(harness.routes.commits.map((entry) => entry.publicationState), [
+        'reconciling',
+        'ready',
+    ]);
+    assert.deepEqual(
+        harness.events.filter((entry) => entry.event === 'probe.hostname').map((entry) => entry.hostname),
+        ['meet.example.test', 'office.example.test'],
+    );
+});
+
+test('connector-only unresolved token commits the exact public generation to error without API or journal writes', async () => {
+    const harness = createHarness({
+        secrets: {},
+        lazyApi: true,
+    });
+    await assert.rejects(
+        harness.controller.reconcile(connectorDesired()),
+        (error) => error.code === 'CLOUDFLARE_CONNECTOR_SECRET_UNRESOLVED',
+    );
+    assert.equal(harness.apiFactoryCalls, 0);
+    assert.equal(harness.journal.writes.length, 0);
+    assert.deepEqual(harness.routes.commits.map((entry) => entry.publicationState), [
+        'reconciling',
+        'error',
+    ]);
+    assert.equal(harness.routes.active, true);
+    assert.deepEqual(Object.keys(harness.routes.hosts), ['office.example.test']);
+    assert.equal(harness.controller.getStatus().state, 'error');
+    assert.equal(harness.connector.isRunning(), false);
+});
+
+test('connector-only spawn and external proof failures stop the connector and commit error', async () => {
+    const spawnFailure = createHarness({ lazyApi: true });
+    spawnFailure.connector.failStart = new CloudflarePublicationError('spawn failed', {
+        code: 'CLOUDFLARED_START_FAILED',
+        operation: 'connector-start',
+        retryable: true,
+    });
+    await assert.rejects(
+        spawnFailure.controller.reconcile(connectorDesired()),
+        (error) => error.code === 'CLOUDFLARED_START_FAILED',
+    );
+    assert.deepEqual(spawnFailure.routes.commits.map((entry) => entry.publicationState), [
+        'reconciling',
+        'error',
+    ]);
+    assert.equal(spawnFailure.connector.isRunning(), false);
+
+    const proofFailure = createHarness({
+        lazyApi: true,
+        probeHostname: async () => ({ ok: false, status: 404 }),
+    });
+    await assert.rejects(
+        proofFailure.controller.reconcile(connectorDesired()),
+        (error) => error.code === 'CLOUDFLARE_HOST_PROBE_FAILED',
+    );
+    assert.deepEqual(proofFailure.routes.commits.map((entry) => entry.publicationState), [
+        'reconciling',
+        'error',
+    ]);
+    assert.equal(proofFailure.connector.isRunning(), false);
+    assert.equal(proofFailure.journal.writes.length, 0);
+
+    let exitDuringProof;
+    exitDuringProof = createHarness({
+        lazyApi: true,
+        probeHostname: async () => {
+            exitDuringProof.connector.exit({ code: 9 });
+            return { ok: true };
+        },
+    });
+    await assert.rejects(
+        exitDuringProof.controller.reconcile(connectorDesired()),
+        (error) => error.code === 'CLOUDFLARED_NOT_RUNNING',
+    );
+    assert.deepEqual(exitDuringProof.routes.commits.map((entry) => entry.publicationState), [
+        'reconciling',
+        'error',
+    ]);
+});
+
+test('connector-only superseded generation cannot commit ready or error after its probe returns', async () => {
+    let probeCalls = 0;
+    let releaseFirst;
+    const firstProbe = new Promise((resolve) => { releaseFirst = resolve; });
+    const harness = createHarness({
+        lazyApi: true,
+        probeHostname: async () => {
+            probeCalls += 1;
+            if (probeCalls === 1) await firstProbe;
+            return { ok: true };
+        },
+    });
+    const first = harness.controller.reconcile(connectorDesired(['office.example.test'], 'a'));
+    await waitFor(() => probeCalls === 1);
+    const second = harness.controller.reconcile(connectorDesired(['meet.example.test'], 'b'));
+    releaseFirst();
+    await assert.rejects(
+        first,
+        (error) => error.code === 'CLOUDFLARE_RECONCILIATION_SUPERSEDED',
+    );
+    await second;
+    assert.deepEqual(
+        harness.routes.commits.filter((entry) => entry.publicationState !== 'reconciling')
+            .map((entry) => [entry.configurationGeneration, entry.publicationState]),
+        [[`sha256:${'b'.repeat(64)}`, 'ready']],
+    );
+});
+
+test('API-managed ownership requires verified local-only teardown before connector-only', async () => {
+    const harness = createHarness();
+    await harness.controller.reconcile(desired());
+    const writesBeforeRejectedTransition = harness.journal.writes.length;
+    await assert.rejects(
+        harness.controller.reconcile(connectorDesired(['office.example.test'], 'b')),
+        (error) => error.code === 'CLOUDFLARE_MANAGEMENT_TRANSITION_UNSAFE'
+            && /apply local-only first.*verify API-managed teardown.*apply connector-only/.test(error.message),
+    );
+    assert.equal(harness.journal.writes.length, writesBeforeRejectedTransition);
+    assert.equal(harness.journal.read().mode, 'cloudflare');
+
+    const local = await harness.controller.reconcile(localDesired('c'));
+    assert.equal(local.state, 'local-only');
+    assert.equal(harness.journal.read().mode, 'local-only');
+    const connector = await harness.controller.reconcile(
+        connectorDesired(['office.example.test'], 'd'),
+    );
+    assert.equal(connector.management, 'connector-only');
+    assert.equal(connector.state, 'ready');
+    assert.equal(harness.journal.read().mode, 'local-only');
+});
+
+test('unexpected connector-only exits commit error and use bounded exact-state restart', async () => {
+    const harness = createHarness({
+        lazyApi: true,
+        restartPolicy: {
+            maximumRestarts: 1,
+            windowMs: 10000,
+            initialBackoffMs: 0,
+            maximumBackoffMs: 0,
+        },
+    });
+    await harness.controller.reconcile(connectorDesired());
+    harness.connector.exit({ code: 7 });
+    await waitFor(() => (
+        harness.connector.starts === 2
+        && harness.controller.getStatus().state === 'ready'
+    ));
+    harness.connector.exit({ code: 8 });
+    await waitFor(() => harness.controller.getStatus().retry?.exhausted === true);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(harness.connector.starts, 2);
+    assert.equal(harness.apiFactoryCalls, 0);
+    assert.equal(harness.journal.writes.length, 0);
+    assert.equal(harness.routes.commits.at(-1).publicationState, 'error');
+    assert.equal(harness.controller.getStatus().state, 'error');
 });
 
 test('tokens and secret handles are absent from status, audit, journal, and route state', async () => {
@@ -456,7 +657,6 @@ test('partial final-host teardown preserves only the still-owned DNS journal ent
 
 test('a restarted controller preserves Cloudflare ownership journal and fails closed without teardown handles', async () => {
     const journal = createMemoryJournal({
-        schemaVersion: 1,
         mode: 'cloudflare',
         configurationGeneration: `sha256:${'a'.repeat(64)}`,
         desiredDigest: `sha256:${'c'.repeat(64)}`,
@@ -482,6 +682,16 @@ test('a restarted controller preserves Cloudflare ownership journal and fails cl
     assert.equal(journal.writes.at(-1).mode, 'cloudflare');
     assert.equal(journal.writes.at(-1).managedDnsRecords.length, 1);
     assert.equal(journal.writes.at(-1).phase, 'error');
+});
+
+test('controller stop persists a redacted stopped state after connector teardown', async () => {
+    const harness = createHarness();
+    await harness.controller.reconcile(connectorDesired());
+    await harness.controller.stop();
+    assert.equal(harness.connector.isRunning(), false);
+    assert.equal(harness.states.at(-1).state, 'stopped');
+    assert.equal(harness.states.at(-1).connectorState, 'stopped');
+    assert.equal(harness.controller.getStatus().state, 'stopped');
 });
 
 test('changed DNS ownership is never deleted during host removal', async () => {
