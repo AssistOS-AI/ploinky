@@ -9,6 +9,7 @@ import {
     assertNoWaitRegistryRecord,
     cleanupNoWaitTaskOwnedCandidate,
     waitForNoWaitLifecycle,
+    waitForNoWaitRouteActivation,
     waitForPriorWorker,
     writeStatus,
 } from '../../cli/commands/noWaitWorker.js';
@@ -122,6 +123,55 @@ test('no-wait launch does not retry a corrupt active edge generation', async () 
         /active generation is corrupt/,
     );
     assert.equal(attempts, 1);
+});
+
+test('no-wait route activation rebinds to the same generation after a Router restart', async () => {
+    const identity = { routeKey: 'background' };
+    const lifecycle = {
+        generationDigest: 'sha256:active',
+        selectorActivationId: 'activation-after-restart',
+    };
+    let attempts = 0;
+
+    const rebound = await waitForNoWaitRouteActivation(
+        identity,
+        { generation: 'sha256:active', activationId: 'activation-before-restart' },
+        {
+            timeoutMs: 1_000,
+            pollIntervalMs: 1,
+            loadFn() {
+                attempts += 1;
+                if (attempts < 2) {
+                    const error = new Error('edge routing generation is inactive');
+                    error.code = 'EDGE_GENERATION_INACTIVE';
+                    throw error;
+                }
+                return lifecycle;
+            },
+            async sleepFn() {},
+        },
+    );
+
+    assert.equal(attempts, 2);
+    assert.equal(rebound, lifecycle);
+});
+
+test('no-wait route activation rejects a different generation after restart', async () => {
+    await assert.rejects(
+        () => waitForNoWaitRouteActivation(
+            { routeKey: 'background' },
+            { generation: 'sha256:launch' },
+            {
+                loadFn() {
+                    return {
+                        generationDigest: 'sha256:replacement',
+                        selectorActivationId: 'activation-two',
+                    };
+                },
+            },
+        ),
+        /generation changed before route activation/,
+    );
 });
 
 test('no-wait launch accepts only its exact active target-less identity', () => {

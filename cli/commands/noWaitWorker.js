@@ -118,6 +118,14 @@ async function upsertRoute(routeKey, route, {
         || !expectedSelector?.generation || !expectedSelector?.activationId) {
         throw new Error('no-wait route activation requires one exact runtime registry record and active selector');
     }
+    const activationLifecycle = await waitForNoWaitRouteActivation(
+        expectedIdentity,
+        expectedSelector,
+    );
+    const activationSelector = Object.freeze({
+        generation: activationLifecycle.generationDigest,
+        activationId: activationLifecycle.selectorActivationId,
+    });
     await mergeRoutingConfig((cfg) => {
         const agents = loadAgents();
         assertNoWaitLifecycleSnapshot({
@@ -139,8 +147,8 @@ async function upsertRoute(routeKey, route, {
         reason: `no-wait-runtime-ready:${routeKey}`,
         validateActiveGeneration() {
             const active = assertActiveEdgeRoutingSourcesCurrent();
-            if (active.selector.generation !== expectedSelector?.generation
-                || active.selector.activationId !== expectedSelector?.activationId) {
+            if (active.selector.generation !== activationSelector.generation
+                || active.selector.activationId !== activationSelector.activationId) {
                 throw new Error(`no-wait lifecycle generation changed before route activation for '${routeKey}'`);
             }
             assertNoWaitLifecycleSnapshot(active, expectedIdentity);
@@ -254,6 +262,14 @@ export async function waitForNoWaitLifecycle(identity, {
         await sleepFn(pollIntervalMs);
     }
     throw new Error(`timed out waiting for the active edge generation for '${identity.routeKey}'`);
+}
+
+export async function waitForNoWaitRouteActivation(identity, launchSelector, options = {}) {
+    const lifecycle = await waitForNoWaitLifecycle(identity, options);
+    if (lifecycle.generationDigest !== launchSelector?.generation) {
+        throw new Error(`no-wait lifecycle generation changed before route activation for '${identity.routeKey}'`);
+    }
+    return lifecycle;
 }
 
 async function waitForNoWaitReadiness({

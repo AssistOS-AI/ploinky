@@ -279,7 +279,8 @@ test('prepared runtime records and routes commit together before activation, inc
     assert.match(noWaitSource, /forceRecreate:\s*args\.forceRecreate === '1'/);
     assert.match(noWaitSource, /assertActiveEdgeRoutingSourcesCurrent\(\)/);
     assert.doesNotMatch(noWaitSource, /prepareEdgeRoutingGeneration|inactivateEdgeRoutingGeneration/);
-    assert.match(noWaitSource, /validateActiveGeneration\(\)[\s\S]*selector\.activationId !== expectedSelector\?\.activationId/);
+    assert.match(noWaitSource, /waitForNoWaitRouteActivation\([\s\S]*activationSelector/);
+    assert.match(noWaitSource, /validateActiveGeneration\(\)[\s\S]*selector\.activationId !== activationSelector\.activationId/);
     assert.match(noWaitSource, /captureExpectedGeneration\(active\)[\s\S]*captureEdgeRoutingLifecycleMutationGeneration\(active\)/);
     assert.match(
         noWaitSource,
