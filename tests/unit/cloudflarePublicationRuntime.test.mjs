@@ -838,6 +838,93 @@ test('publication runtime follows connector error commits across bounded retry a
     await runtime.stop();
 });
 
+test('publication runtime retries a failed handled reconciling activation without a later route activation', async (t) => {
+    const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-publication-runtime-reconciling-retry-'));
+    t.after(() => fs.rmSync(workspace, { recursive: true, force: true }));
+    const desired = {
+        cloudflare: {
+            tunnelTokenSecret: 'publication/cloudflare-connector',
+        },
+        hosts: {
+            'app.example.test': {
+                agent: 'repo/app',
+            },
+        },
+    };
+    let selected = {
+        selector: {
+            generation: GENERATION,
+            activationId: 'activation-initial',
+            publicationState: 'reconciling',
+        },
+        generation: { desired },
+    };
+    let rememberActivation = () => {};
+    let attempts = 0;
+    const reasons = [];
+    const audits = [];
+    let completed;
+    const completion = new Promise((resolve) => { completed = resolve; });
+    const runtime = startCloudflarePublicationRuntime({
+        workspaceRoot: workspace,
+        statusFile: path.join(workspace, 'status.json'),
+        pollIntervalMs: 60_000,
+        retryInitialDelayMs: 1,
+        retryMaximumDelayMs: 2,
+        loadActive: () => selected,
+        routeCoordinatorFactory: ({ onCommit }) => {
+            rememberActivation = onCommit;
+            return { inactivate() {}, commit() {} };
+        },
+        controllerFactory: () => ({
+            reconcile: async (_input, options) => {
+                attempts += 1;
+                reasons.push(options?.reason);
+                if (attempts < 3) {
+                    selected = {
+                        ...selected,
+                        selector: {
+                            ...selected.selector,
+                            activationId: `activation-reconciling-commit-${attempts}`,
+                            publicationState: 'reconciling',
+                        },
+                    };
+                    rememberActivation(selected.selector.activationId);
+                    throw Object.assign(new Error('external hostname proof failed'), {
+                        code: 'CLOUDFLARE_HOST_PROBE_FAILED',
+                    });
+                }
+                completed();
+            },
+            getStatus: () => ({ state: 'fixture' }),
+            stop: async () => {},
+        }),
+        probeHostname: async () => ({ ok: true }),
+        audit: (event, value) => audits.push({ event, value }),
+    });
+    await runtime.scan();
+    await Promise.race([
+        completion,
+        new Promise((_, reject) => setTimeout(
+            () => reject(new Error('handled reconciling activation retry did not run')),
+            1_000,
+        )),
+    ]);
+    assert.equal(attempts, 3);
+    assert.deepEqual(reasons, [
+        'selected-edge-generation',
+        'selected-edge-generation-retry',
+        'selected-edge-generation-retry',
+    ]);
+    assert.deepEqual(
+        audits
+            .filter((entry) => entry.event === 'cloudflare-publication-runtime-error')
+            .map((entry) => entry.value.retryAttempt ?? null),
+        [null, 1],
+    );
+    await runtime.stop();
+});
+
 test('a newer selected activation cancels an older scheduled publication retry', async (t) => {
     const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-publication-runtime-supersede-'));
     t.after(() => fs.rmSync(workspace, { recursive: true, force: true }));

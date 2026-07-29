@@ -22,6 +22,10 @@ const ALLOWED_PUBLICATION_STATES = new Set([
     'reconciling',
     'error',
 ]);
+const RETRYABLE_SELECTED_PUBLICATION_STATES = new Set([
+    'reconciling',
+    'error',
+]);
 const DEFAULT_EDGE_APPLY_BUSY_RETRY_ATTEMPTS = 50;
 const DEFAULT_EDGE_APPLY_BUSY_RETRY_DELAY_MS = 100;
 
@@ -275,8 +279,14 @@ export function startCloudflarePublicationRuntime({
     function retryActivationFor(input, fallbackActivationId) {
         try {
             const selected = loadActive({ workspaceRoot });
+            // A failed reconcile can leave its own committed reconciling
+            // activation selected when the fail-closed inactivation races an
+            // edge apply. onCommit already marked that activation handled, so
+            // the retry must follow it instead of delegating back to scan().
             if (selected.selector.generation === input.configurationGeneration
-                && selected.selector.publicationState === 'error') {
+                && RETRYABLE_SELECTED_PUBLICATION_STATES.has(
+                    selected.selector.publicationState,
+                )) {
                 return selected.selector.activationId;
             }
         } catch (_) {}
