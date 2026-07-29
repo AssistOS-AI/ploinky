@@ -284,8 +284,18 @@ test('prepared runtime records and routes commit together before activation, inc
     assert.match(noWaitSource, /captureExpectedGeneration\(active\)[\s\S]*captureEdgeRoutingLifecycleMutationGeneration\(active\)/);
     assert.match(
         noWaitSource,
-        /profileResolution\.network\.mode === 'host'[\s\S]*withEdgeGenerationApplyLock\([\s\S]*return launch\(\)/,
+        /profileResolution\.network\.mode === 'host'[\s\S]*launchNoWaitHostRuntime\(expectedIdentity, lifecycle, launch\)/,
         'host-network process creation must remain bound to one active selector under the edge apply lock',
+    );
+    assert.match(
+        noWaitSource,
+        /launchNoWaitHostRuntime[\s\S]*withApplyLockFn\(async \(\) => \{[\s\S]*lockedLifecycle\.generationDigest !== attemptLifecycle\.generationDigest[\s\S]*lockedLifecycle\.selectorActivationId !== attemptLifecycle\.selectorActivationId[\s\S]*launchStarted = true;\s*return launch\(\)/,
+        'each host launch attempt must validate one unchanged generation and activation inside the apply lock',
+    );
+    assert.match(
+        noWaitSource,
+        /if \(launchStarted \|\| error\?\.code !== 'EDGE_GENERATION_INACTIVE'\) throw error;[\s\S]*await sleepFn/,
+        'only a pre-launch inactive selector may be retried after the apply lock unwinds',
     );
     assert.match(
         routingFileSource,

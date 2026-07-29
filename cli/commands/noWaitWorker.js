@@ -272,6 +272,91 @@ export async function waitForNoWaitRouteActivation(identity, launchSelector, opt
     return lifecycle;
 }
 
+export async function launchNoWaitHostRuntime(identity, initialLifecycle, launch, {
+    timeoutMs = Number.parseInt(
+        process.env.PLOINKY_NO_WAIT_EDGE_TIMEOUT_MS || '180000',
+        10,
+    ),
+    pollIntervalMs = 250,
+    loadFn = loadNoWaitLifecycle,
+    withApplyLockFn = withEdgeGenerationApplyLock,
+    sleepFn = sleep,
+    nowFn = Date.now,
+} = {}) {
+    if (typeof launch !== 'function') {
+        throw new Error('no-wait host launch requires one runtime launch callback');
+    }
+    const launchGeneration = String(initialLifecycle?.generationDigest || '');
+    const initialActivationId = String(initialLifecycle?.selectorActivationId || '');
+    if (!launchGeneration || !initialActivationId) {
+        throw new Error('no-wait host launch requires one exact active selector');
+    }
+    const parsedTimeoutMs = Number(timeoutMs);
+    const boundedTimeoutMs = Number.isFinite(parsedTimeoutMs)
+        ? Math.max(1000, parsedTimeoutMs)
+        : 180000;
+    const parsedPollIntervalMs = Number(pollIntervalMs);
+    const boundedPollIntervalMs = Number.isFinite(parsedPollIntervalMs)
+        ? Math.max(1, parsedPollIntervalMs)
+        : 250;
+    const deadline = nowFn() + boundedTimeoutMs;
+    let attemptLifecycle = initialLifecycle;
+    let lastInactiveError;
+
+    while (nowFn() < deadline) {
+        if (!attemptLifecycle) {
+            try {
+                attemptLifecycle = await Promise.resolve(loadFn(identity));
+            } catch (error) {
+                if (error?.code !== 'EDGE_GENERATION_INACTIVE') throw error;
+                lastInactiveError = error;
+            }
+        }
+
+        if (attemptLifecycle) {
+            if (attemptLifecycle.generationDigest !== launchGeneration) {
+                throw new Error(
+                    `no-wait lifecycle generation changed before host launch for '${identity.routeKey}'`,
+                );
+            }
+            let launchStarted = false;
+            try {
+                return await withApplyLockFn(async () => {
+                    const lockedLifecycle = await Promise.resolve(loadFn(identity));
+                    if (lockedLifecycle.generationDigest !== attemptLifecycle.generationDigest
+                        || lockedLifecycle.selectorActivationId !== attemptLifecycle.selectorActivationId) {
+                        throw new Error(
+                            `no-wait lifecycle activation changed before host launch for '${identity.routeKey}'`,
+                        );
+                    }
+                    launchStarted = true;
+                    return launch();
+                });
+            } catch (error) {
+                // Only the lock-protected lifecycle read is retryable. Once
+                // runtime creation starts, never replay it, even if the runtime
+                // implementation happens to report the same error code.
+                if (launchStarted || error?.code !== 'EDGE_GENERATION_INACTIVE') throw error;
+                lastInactiveError = error;
+                attemptLifecycle = null;
+            }
+        }
+
+        const remainingMs = deadline - nowFn();
+        if (remainingMs <= 0) break;
+        // withApplyLockFn has unwound before this wait, so an edge apply can
+        // finish and publish a selector while the worker is sleeping.
+        await sleepFn(Math.min(boundedPollIntervalMs, remainingMs));
+    }
+
+    const error = new Error(
+        `timed out waiting for the active edge generation before host launch for '${identity.routeKey}'`,
+    );
+    error.code = 'NO_WAIT_HOST_LAUNCH_TIMEOUT';
+    if (lastInactiveError) error.cause = lastInactiveError;
+    throw error;
+}
+
 async function waitForNoWaitReadiness({
     manifest,
     shortAgent,
@@ -391,14 +476,7 @@ async function main() {
         };
         const launch = () => dockerSvc.ensureAgentService(shortAgent, manifest, agentPath, ensureOptions);
         const result = profileResolution.network.mode === 'host'
-            ? await withEdgeGenerationApplyLock(() => {
-                const selected = loadNoWaitLifecycle(expectedIdentity);
-                if (selected.generationDigest !== lifecycle.generationDigest
-                    || selected.selectorActivationId !== lifecycle.selectorActivationId) {
-                    throw new Error(`no-wait lifecycle generation changed before host launch for '${routeKey}'`);
-                }
-                return launch();
-            })
+            ? await launchNoWaitHostRuntime(expectedIdentity, lifecycle, launch)
             : await launch();
         if (result?.createdByThisLaunch === true) taskOwnedCandidate = result;
         const resolvedContainerName = (result && result.containerName) || containerName;

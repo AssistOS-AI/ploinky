@@ -8,6 +8,7 @@ import {
     assertNoWaitLifecycleSnapshot,
     assertNoWaitRegistryRecord,
     cleanupNoWaitTaskOwnedCandidate,
+    launchNoWaitHostRuntime,
     waitForNoWaitLifecycle,
     waitForNoWaitRouteActivation,
     waitForPriorWorker,
@@ -172,6 +173,238 @@ test('no-wait route activation rejects a different generation after restart', as
         ),
         /generation changed before route activation/,
     );
+});
+
+test('no-wait host launch retries an inactive locked read after releasing the apply lock', async () => {
+    const identity = { routeKey: 'liveKitServerAgent' };
+    const initial = {
+        generationDigest: 'sha256:active',
+        selectorActivationId: 'activation-before-apply',
+    };
+    const rebound = {
+        generationDigest: 'sha256:active',
+        selectorActivationId: 'activation-after-apply',
+    };
+    let loadCalls = 0;
+    let lockHeld = false;
+    let lockCalls = 0;
+    let sleeps = 0;
+    let launches = 0;
+
+    const result = await launchNoWaitHostRuntime(identity, initial, async () => {
+        launches += 1;
+        assert.equal(lockHeld, true);
+        return { containerName: 'livekit-runtime' };
+    }, {
+        loadFn(receivedIdentity) {
+            loadCalls += 1;
+            assert.equal(receivedIdentity, identity);
+            if (loadCalls === 1) {
+                const error = new Error('edge routing generation is inactive');
+                error.code = 'EDGE_GENERATION_INACTIVE';
+                throw error;
+            }
+            return rebound;
+        },
+        async withApplyLockFn(callback) {
+            lockCalls += 1;
+            lockHeld = true;
+            try {
+                return await callback();
+            } finally {
+                lockHeld = false;
+            }
+        },
+        async sleepFn() {
+            sleeps += 1;
+            assert.equal(lockHeld, false);
+        },
+    });
+
+    assert.deepEqual(result, { containerName: 'livekit-runtime' });
+    assert.equal(loadCalls, 3);
+    assert.equal(lockCalls, 2);
+    assert.equal(sleeps, 1);
+    assert.equal(launches, 1);
+});
+
+test('no-wait host launch rejects a replacement generation without launching a runtime', async () => {
+    const initial = {
+        generationDigest: 'sha256:launch',
+        selectorActivationId: 'activation-before-apply',
+    };
+    let loadCalls = 0;
+    let lockCalls = 0;
+    let launches = 0;
+
+    await assert.rejects(
+        () => launchNoWaitHostRuntime(
+            { routeKey: 'liveKitServerAgent' },
+            initial,
+            () => {
+                launches += 1;
+            },
+            {
+                loadFn() {
+                    loadCalls += 1;
+                    if (loadCalls === 1) {
+                        const error = new Error('edge routing generation is inactive');
+                        error.code = 'EDGE_GENERATION_INACTIVE';
+                        throw error;
+                    }
+                    return {
+                        generationDigest: 'sha256:replacement',
+                        selectorActivationId: 'activation-after-apply',
+                    };
+                },
+                async withApplyLockFn(callback) {
+                    lockCalls += 1;
+                    return callback();
+                },
+                async sleepFn() {},
+            },
+        ),
+        /generation changed before host launch/,
+    );
+    assert.equal(loadCalls, 2);
+    assert.equal(lockCalls, 1);
+    assert.equal(launches, 0);
+});
+
+test('no-wait host launch requires one unchanged selector inside each apply lock', async () => {
+    const initial = {
+        generationDigest: 'sha256:active',
+        selectorActivationId: 'activation-before-lock',
+    };
+    let launches = 0;
+
+    await assert.rejects(
+        () => launchNoWaitHostRuntime(
+            { routeKey: 'liveKitServerAgent' },
+            initial,
+            () => {
+                launches += 1;
+            },
+            {
+                loadFn() {
+                    return {
+                        generationDigest: 'sha256:active',
+                        selectorActivationId: 'activation-inside-lock',
+                    };
+                },
+                async withApplyLockFn(callback) {
+                    return callback();
+                },
+            },
+        ),
+        /activation changed before host launch/,
+    );
+    assert.equal(launches, 0);
+});
+
+test('no-wait host launch never retries an inactive error after runtime creation starts', async () => {
+    const inactive = new Error('runtime launch reported inactive');
+    inactive.code = 'EDGE_GENERATION_INACTIVE';
+    const initial = {
+        generationDigest: 'sha256:active',
+        selectorActivationId: 'activation-one',
+    };
+    let launches = 0;
+    let sleeps = 0;
+
+    await assert.rejects(
+        () => launchNoWaitHostRuntime(
+            { routeKey: 'liveKitServerAgent' },
+            initial,
+            () => {
+                launches += 1;
+                throw inactive;
+            },
+            {
+                loadFn() {
+                    return initial;
+                },
+                async withApplyLockFn(callback) {
+                    return callback();
+                },
+                async sleepFn() {
+                    sleeps += 1;
+                },
+            },
+        ),
+        (error) => error === inactive,
+    );
+    assert.equal(launches, 1);
+    assert.equal(sleeps, 0);
+});
+
+test('no-wait host launch retries only inactivity and times out within one bounded window', async () => {
+    const initial = {
+        generationDigest: 'sha256:active',
+        selectorActivationId: 'activation-one',
+    };
+    let now = 0;
+    let loadCalls = 0;
+    let lockCalls = 0;
+
+    await assert.rejects(
+        () => launchNoWaitHostRuntime(
+            { routeKey: 'liveKitServerAgent' },
+            initial,
+            () => assert.fail('runtime must not launch while the edge is inactive'),
+            {
+                timeoutMs: 1_000,
+                pollIntervalMs: 250,
+                loadFn() {
+                    loadCalls += 1;
+                    const error = new Error('edge routing generation is inactive');
+                    error.code = 'EDGE_GENERATION_INACTIVE';
+                    throw error;
+                },
+                async withApplyLockFn(callback) {
+                    lockCalls += 1;
+                    return callback();
+                },
+                async sleepFn(ms) {
+                    now += ms;
+                },
+                nowFn() {
+                    return now;
+                },
+            },
+        ),
+        (error) => (
+            error?.code === 'NO_WAIT_HOST_LAUNCH_TIMEOUT'
+            && error?.cause?.code === 'EDGE_GENERATION_INACTIVE'
+        ),
+    );
+    assert.equal(now, 1_000);
+    assert.equal(loadCalls, 4);
+    assert.equal(lockCalls, 1);
+
+    const busy = new Error('edge generation apply is already in progress');
+    busy.code = 'EDGE_GENERATION_BUSY';
+    let busySleeps = 0;
+    await assert.rejects(
+        () => launchNoWaitHostRuntime(
+            { routeKey: 'liveKitServerAgent' },
+            initial,
+            () => assert.fail('runtime must not launch without the apply lock'),
+            {
+                loadFn() {
+                    return initial;
+                },
+                withApplyLockFn() {
+                    throw busy;
+                },
+                async sleepFn() {
+                    busySleeps += 1;
+                },
+            },
+        ),
+        (error) => error === busy,
+    );
+    assert.equal(busySleeps, 0);
 });
 
 test('no-wait launch accepts only its exact active target-less identity', () => {
