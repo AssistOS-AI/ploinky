@@ -8,6 +8,7 @@ import {
     assertNoWaitLifecycleSnapshot,
     assertNoWaitRegistryRecord,
     cleanupNoWaitTaskOwnedCandidate,
+    waitForNoWaitLifecycle,
     waitForPriorWorker,
     writeStatus,
 } from '../../cli/commands/noWaitWorker.js';
@@ -77,6 +78,50 @@ test('no-wait predecessor rejects a path outside the status directory', async (t
         () => waitForPriorWorker(path.join(root, 'foreign.json'), { runningDir }),
         /must be an exact file/,
     );
+});
+
+test('no-wait launch waits for the staged edge generation to become active', async () => {
+    const expected = { generationDigest: 'sha256:active' };
+    const identity = { routeKey: 'background' };
+    let attempts = 0;
+
+    const lifecycle = await waitForNoWaitLifecycle(identity, {
+        timeoutMs: 1_000,
+        pollIntervalMs: 1,
+        loadFn(receivedIdentity) {
+            attempts += 1;
+            assert.equal(receivedIdentity, identity);
+            if (attempts < 3) {
+                const error = new Error('edge routing generation is inactive');
+                error.code = 'EDGE_GENERATION_INACTIVE';
+                throw error;
+            }
+            return expected;
+        },
+        async sleepFn() {},
+    });
+
+    assert.equal(attempts, 3);
+    assert.equal(lifecycle, expected);
+});
+
+test('no-wait launch does not retry a corrupt active edge generation', async () => {
+    let attempts = 0;
+    await assert.rejects(
+        () => waitForNoWaitLifecycle({ routeKey: 'background' }, {
+            timeoutMs: 1_000,
+            pollIntervalMs: 1,
+            loadFn() {
+                attempts += 1;
+                const error = new Error('active generation is corrupt');
+                error.code = 'EDGE_GENERATION_CORRUPT';
+                throw error;
+            },
+            async sleepFn() {},
+        }),
+        /active generation is corrupt/,
+    );
+    assert.equal(attempts, 1);
 });
 
 test('no-wait launch accepts only its exact active target-less identity', () => {

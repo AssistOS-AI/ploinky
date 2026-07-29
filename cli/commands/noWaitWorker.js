@@ -234,6 +234,27 @@ function loadNoWaitLifecycle(identity) {
     return assertNoWaitLifecycleSnapshot(assertActiveEdgeRoutingSourcesCurrent(), identity);
 }
 
+export async function waitForNoWaitLifecycle(identity, {
+    timeoutMs = Number.parseInt(
+        process.env.PLOINKY_NO_WAIT_EDGE_TIMEOUT_MS || '180000',
+        10,
+    ),
+    pollIntervalMs = 250,
+    loadFn = loadNoWaitLifecycle,
+    sleepFn = sleep,
+} = {}) {
+    const deadline = Date.now() + Math.max(1000, timeoutMs);
+    while (Date.now() < deadline) {
+        try {
+            return loadFn(identity);
+        } catch (error) {
+            if (error?.code !== 'EDGE_GENERATION_INACTIVE') throw error;
+        }
+        await sleepFn(pollIntervalMs);
+    }
+    throw new Error(`timed out waiting for the active edge generation for '${identity.routeKey}'`);
+}
+
 async function waitForNoWaitReadiness({
     manifest,
     shortAgent,
@@ -323,7 +344,7 @@ async function main() {
         // identity. Keep that active generation serving while the detached
         // runtime starts; host-network launches are authorized by the exact
         // active-generation capability already compiled for this owner.
-        const lifecycle = loadNoWaitLifecycle(expectedIdentity);
+        const lifecycle = await waitForNoWaitLifecycle(expectedIdentity);
         const manifest = lifecycle.manifest;
         const activeProfile = String(lifecycle.record.profile || '');
         if (profileName && activeProfile && profileName !== activeProfile) {
