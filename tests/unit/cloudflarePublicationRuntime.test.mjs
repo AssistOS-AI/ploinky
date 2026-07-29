@@ -116,6 +116,50 @@ test('edge publication coordinator permits error only for the exact captured Clo
     }), /does not match captured desired semantics/);
 });
 
+test('edge publication coordinator commits API-managed empty hosts as local-only teardown', async () => {
+    const desired = {
+        cloudflare: {
+            accountId: 'account',
+            zoneId: 'zone',
+            tunnelName: 'qa',
+            apiTokenSecret: 'publication/cloudflare-api',
+            deleteTunnelOnTeardown: true,
+        },
+        hosts: {},
+    };
+    const applied = [];
+    const edgeOps = {
+        load() {
+            return {
+                selector: { generation: GENERATION },
+                generation: { desired },
+            };
+        },
+        inactivate() {},
+        apply(options) {
+            applied.push(options);
+            return {
+                selector: { generation: GENERATION, activationId: 'activation-local-only' },
+                generation: { desired },
+            };
+        },
+    };
+    const coordinator = createEdgePublicationRouteCoordinator({
+        workspaceRoot: '/fixture',
+        edgeOps,
+    });
+
+    await coordinator.inactivate({ configurationGeneration: GENERATION, reason: 'teardown' });
+    await coordinator.commit({
+        mode: 'local-only',
+        publicationState: 'ready',
+        configurationGeneration: GENERATION,
+        hosts: {},
+    });
+
+    assert.equal(applied.at(-1).publicationState, 'ready');
+});
+
 test('edge publication coordinator rejects error for a captured local-only generation', async () => {
     const desired = { hosts: {} };
     const edgeOps = {

@@ -79,7 +79,10 @@ export function createEdgePublicationRouteCoordinator({
             if (captured?.generation !== expected || !ALLOWED_PUBLICATION_STATES.has(state)) {
                 throw publicationRuntimeError('publication commit is outside its captured immutable generation');
             }
-            const expectedMode = captured.desired?.cloudflare ? 'cloudflare' : 'local-only';
+            const expectedMode = captured.desired?.cloudflare
+                && Object.keys(captured.desired?.hosts || {}).length > 0
+                ? 'cloudflare'
+                : 'local-only';
             if (mode !== expectedMode
                 || (mode === 'local-only' && state !== 'ready')
                 || stablePublicationJson(hosts || {}) !== stablePublicationJson(captured.desired?.hosts || {})) {
