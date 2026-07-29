@@ -3,6 +3,7 @@ import net from 'node:net';
 const DEFAULT_REFRESH_INTERVAL_MS = 1_000;
 const LOOPBACK_ADDRESS = '127.0.0.1';
 const WILDCARD_ADDRESS = '0.0.0.0';
+const admittedPrivateSockets = new WeakSet();
 
 function errorMessage(error) {
     return String(error?.message || error || 'unknown error');
@@ -30,6 +31,10 @@ function assertDependencies({ httpServer, interfaceClassifier, port, refreshInte
     if (!Number.isFinite(refreshIntervalMs) || refreshIntervalMs < 1) {
         throw new TypeError('private listener refresh interval must be positive');
     }
+}
+
+export function classifyPrivateListenerRequest(req) {
+    return admittedPrivateSockets.has(req?.socket) ? 'private' : 'denied';
 }
 
 /**
@@ -112,6 +117,15 @@ export function createPrivateListenerSet({
 
     function admitSocket(record, socket) {
         const address = normalizeSocketAddress(socket.localAddress);
+        const forwardPrivateSocket = () => {
+            admittedPrivateSockets.add(socket);
+            record.sockets.add(socket);
+            socket.once('close', () => record.sockets.delete(socket));
+            // pauseOnConnect prevents request bytes from racing the HTTP parser.
+            // The shared HTTP server owns all parsing, upgrade, and policy logic.
+            httpServer.emit('connection', socket);
+            socket.resume();
+        };
         if (wildcardHost) {
             const exactRecord = listeners.get(WILDCARD_ADDRESS) === record && record.current && record.ready;
             if (!exactRecord || net.isIP(address) === 0) {
@@ -124,10 +138,7 @@ export function createPrivateListenerSet({
                 socket.destroy();
                 return;
             }
-            record.sockets.add(socket);
-            socket.once('close', () => record.sockets.delete(socket));
-            httpServer.emit('connection', socket);
-            socket.resume();
+            forwardPrivateSocket();
             return;
         }
         let observedClass = 'unmanaged';
@@ -147,13 +158,7 @@ export function createPrivateListenerSet({
             socket.destroy();
             return;
         }
-
-        record.sockets.add(socket);
-        socket.once('close', () => record.sockets.delete(socket));
-        // pauseOnConnect prevents request bytes from racing the HTTP parser.
-        // The shared HTTP server owns all parsing, upgrade, and policy logic.
-        httpServer.emit('connection', socket);
-        socket.resume();
+        forwardPrivateSocket();
     }
 
     async function bindAddress(address, expectedClass) {

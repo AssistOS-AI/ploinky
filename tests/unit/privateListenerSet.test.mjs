@@ -4,7 +4,10 @@ import http from 'node:http';
 import net from 'node:net';
 import os from 'node:os';
 
-import { createPrivateListenerSet } from '../../cli/server/privateListenerSet.js';
+import {
+    classifyPrivateListenerRequest,
+    createPrivateListenerSet,
+} from '../../cli/server/privateListenerSet.js';
 
 function freePort() {
     return new Promise((resolve, reject) => {
@@ -133,8 +136,17 @@ test('private listener startup rejects and closes partial binds when a managed g
 
 test('Box private listener uses one unpublished wildcard socket and relies on assertion admission', async (t) => {
     const port = await freePort();
+    const nonLoopbackAddress = exactNonLoopbackAddress();
     const classifier = fakeClassifier([]);
-    const httpServer = http.createServer((_req, res) => res.end('box-private'));
+    const observed = [];
+    const httpServer = http.createServer((req, res) => {
+        observed.push({
+            admittedClass: classifyPrivateListenerRequest(req),
+            interfaceClass: classifier.classify(req.socket.localAddress),
+            localAddress: req.socket.localAddress,
+        });
+        res.end('box-private');
+    });
     const scheduled = [];
     let activeTimer = null;
     const listenerSet = createPrivateListenerSet({
@@ -158,6 +170,21 @@ test('Box private listener uses one unpublished wildcard socket and relies on as
     assert.deepEqual((await listenerSet.start()).addresses, ['0.0.0.0']);
     assert.equal(scheduled.length, 1);
     assert.deepEqual(await request('127.0.0.1', port), { status: 200, body: 'box-private' });
+    assert.deepEqual(await request(nonLoopbackAddress, port), { status: 200, body: 'box-private' });
+    assert.deepEqual(observed, [{
+        admittedClass: 'private',
+        interfaceClass: 'loopback',
+        localAddress: '127.0.0.1',
+    }, {
+        admittedClass: 'private',
+        interfaceClass: 'unmanaged',
+        localAddress: nonLoopbackAddress,
+    }]);
+    assert.equal(classifyPrivateListenerRequest({
+        socket: {
+            localAddress: nonLoopbackAddress,
+        },
+    }), 'denied');
     assert.deepEqual((await listenerSet.sync()).addresses, ['0.0.0.0']);
 
     const firstTimer = activeTimer;
@@ -167,4 +194,19 @@ test('Box private listener uses one unpublished wildcard socket and relies on as
     await listenerSet.sync();
     assert.equal(scheduled.length, 2);
     assert.equal(activeTimer, scheduled[1]);
+});
+
+test('an ordinary listener socket cannot inherit private provenance from its address', async (t) => {
+    const port = await freePort();
+    const address = exactNonLoopbackAddress();
+    const server = http.createServer((req, res) => {
+        res.end(classifyPrivateListenerRequest(req));
+    });
+    await new Promise((resolve, reject) => {
+        server.once('error', reject);
+        server.listen({ host: address, port }, resolve);
+    });
+    t.after(() => new Promise((resolve) => server.close(resolve)));
+
+    assert.deepEqual(await request(address, port), { status: 200, body: 'denied' });
 });

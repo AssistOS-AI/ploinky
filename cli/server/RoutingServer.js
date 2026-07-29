@@ -41,7 +41,10 @@ import {
     sendPrivateError,
 } from './privateRouter.js';
 import { createListenerInterfaceClassifier } from './listenerInterfaceClassifier.js';
-import { createPrivateListenerSet } from './privateListenerSet.js';
+import {
+    classifyPrivateListenerRequest,
+    createPrivateListenerSet,
+} from './privateListenerSet.js';
 import { verifyBrowserMutationRequest } from './browserMutationSecurity.js';
 import { executeHttpPlan } from './proxy/executeHttpPlan.js';
 import { executeWebSocketPlan } from './proxy/executeWebSocketPlan.js';
@@ -717,10 +720,7 @@ function handleAsyncRequest(processor, eventName) {
 }
 
 async function processPrivateRequest(req, res) {
-    const interfaceClass = interfaceClassifier.classify(req.socket?.localAddress);
-    req.ploinkyListenerClass = interfaceClass === 'managed' || interfaceClass === 'loopback'
-        ? 'private'
-        : 'denied';
+    req.ploinkyListenerClass = classifyPrivateListenerRequest(req);
     const exactHost = normalizeExactHost(req.headers.host);
     if (!exactHost || !String(req.url || '').startsWith('/')) {
         sendJsonResponse(res, 400, { error: 'malformed_request_target_or_host' }, { 'Cache-Control': 'no-store' });
@@ -908,10 +908,7 @@ server.on('upgrade', async (req, socket, head) => {
 
 privateServer.on('upgrade', async (req, socket, head) => {
     try {
-        const interfaceClass = interfaceClassifier.classify(socket.localAddress);
-        req.ploinkyListenerClass = interfaceClass === 'managed' || interfaceClass === 'loopback'
-            ? 'private'
-            : 'denied';
+        req.ploinkyListenerClass = classifyPrivateListenerRequest(req);
         const exactHost = normalizeExactHost(req.headers.host);
         if (!exactHost || !String(req.url || '').startsWith('/')) throw new Error('malformed request');
         const parsedUrl = new URL(req.url, `http://${exactHost === '::1' ? '[::1]' : exactHost}`);
