@@ -145,10 +145,12 @@ current `remoteTaskId`, set the task back to `ongoing`, and append subsequent
 logs to the same task log. Before remote output is appended, the CLI must append
 the submitted continuation prompt to the durable log and publish that exact
 delta and its resulting offset so an already open task view shows the prompt in
-sequence. The shared browser presentation must normalize historical `User:`
-prompt lines and current `you>` prompt lines to `you> <prompt>`, then render
-them with a bold, accented prompt style that remains visually distinct from
-provider output. Late lifecycle events from an older turn or remote
+sequence. New continuation deltas must not add a synthetic
+`[Continuation <turn>]` label. The shared browser presentation must suppress
+that label in historical logs, normalize historical `User:` prompt lines and
+current `you>` prompt lines to `you> <prompt>`, then render them with a bold,
+accented prompt style that remains visually distinct from provider output.
+Late lifecycle events from an older turn or remote
 task id must not overwrite the current turn. The original task description and
 creation time remain stable, while `executionStartedAt` tracks the current turn.
 Task-log regions must reserve a persistent scrollbar gutter and render a
@@ -242,15 +244,21 @@ are written only by the selected CLI's task-event ingestion. The terminal task e
 the final MCP result as presentation metadata, but ingestion must never append
 or duplicate that result in the log. Instead, it locates the last identical
 range already present in the persisted raw log and stores only its offset and
-length in its task journal. Continuation clears that range until the next terminal
-result. The Tasks overlay and task view render log lines outside the range with
-the secondary grey text color and lines intersecting it with the primary text
-color, so intermediate provider activity remains visibly distinct from the
-final answer. If no exact range is available, the raw output remains visible
-with the intermediate style. Browser rendering strips ANSI control sequences
-and retains presentation compatibility for historical logs that contain
-recognized stream and runner prefixes; new raw provider output remains
-otherwise unchanged.
+length in its task journal. The journal retains a bounded ordered set with one
+final-output range per retained continuation turn, and continuation must
+preserve every earlier retained range while the next turn is running. The Tasks
+overlay and task view render
+log lines outside all retained ranges with the lighter muted-grey text color
+and lines intersecting any range with bold primary text, so intermediate
+provider activity remains visibly distinct from every final answer. Legacy
+tasks carrying only one final-output offset and length remain compatible. If
+no exact range is available for a turn, its raw output remains visible with the
+intermediate style. Browser rendering strips ANSI control sequences and
+retains presentation compatibility for historical logs that contain recognized
+stream and runner prefixes; new raw provider output remains otherwise unchanged.
+When a live task update changes final-output range metadata without appending
+log text, an open task view must rerender its existing log immediately so the
+newly classified final answer receives final styling without a page refresh.
 
 When an ongoing task becomes terminal, WebChat may show the existing transient
 task toast. That toast must include an accessible close button on its right so

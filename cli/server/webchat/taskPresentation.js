@@ -32,10 +32,30 @@ export function taskDurationLabel(task, now = Date.now()) {
     return seconds === null ? '' : `${seconds}s`;
 }
 
-function parseTaskLogEntries(text, finalOutput = null) {
+function taskFinalOutputRanges(task) {
+    const declared = Array.isArray(task?.finalOutputRanges)
+        ? task.finalOutputRanges
+        : [];
+    const legacy = {
+        turn: task?.turn,
+        offset: task?.finalOutputOffset,
+        length: task?.finalOutputLength,
+    };
+    return [...declared, legacy].filter((range) => {
+        return Number.isSafeInteger(range?.offset)
+            && range.offset >= 0
+            && Number.isSafeInteger(range?.length)
+            && range.length > 0;
+    });
+}
+
+function parseTaskLogEntries(text, finalOutputs = []) {
     const rawText = String(text || '');
     const lines = rawText.split(/\r?\n/);
+    const orderedFinalOutputs = [...finalOutputs]
+        .sort((left, right) => left.offset - right.offset);
     let cursor = 0;
+    let finalOutputIndex = 0;
     return lines.flatMap((unstrippedLine) => {
         const lineStart = cursor;
         const lineEnd = lineStart + unstrippedLine.length;
@@ -43,13 +63,16 @@ function parseTaskLogEntries(text, finalOutput = null) {
             ? 2
             : (rawText[lineEnd] === '\n' ? 1 : 0);
         cursor = lineEnd + separatorLength;
-        const finalStart = Number.isSafeInteger(finalOutput?.offset)
-            ? finalOutput.offset
-            : null;
-        const finalEnd = finalStart === null
-            ? null
-            : finalStart + Math.max(0, Number(finalOutput?.length) || 0);
-        const tone = finalStart !== null && finalEnd > lineStart && finalStart < lineEnd
+        while (finalOutputIndex < orderedFinalOutputs.length
+            && orderedFinalOutputs[finalOutputIndex].offset
+                + orderedFinalOutputs[finalOutputIndex].length <= lineStart) {
+            finalOutputIndex += 1;
+        }
+        const finalOutput = orderedFinalOutputs[finalOutputIndex];
+        const isFinal = finalOutput
+            && finalOutput.offset + finalOutput.length > lineStart
+            && finalOutput.offset < lineEnd;
+        const tone = isFinal
             ? 'final'
             : 'intermediate';
         const rawLine = unstrippedLine.replace(ANSI_RE, '');
@@ -66,6 +89,7 @@ function parseTaskLogEntries(text, finalOutput = null) {
             if (/^(?:timeout|error|crashed)\b/i.test(line)) stream = 'stderr';
             if (/^(?:start\b|exit\b)/i.test(line)) return [];
         }
+        if (/^\[Continuation \d+\]$/i.test(line.trim())) return [];
         if (/^\[(?:task result|older task log content truncated)\]$/i.test(line.trim())) {
             return line.trim().toLowerCase() === '[task result]'
                 ? []
@@ -89,10 +113,7 @@ export function parseTaskLog(text) {
 }
 
 export function parseTaskLogPresentation(text, task = null) {
-    return parseTaskLogEntries(text, {
-        offset: task?.finalOutputOffset,
-        length: task?.finalOutputLength,
-    });
+    return parseTaskLogEntries(text, taskFinalOutputRanges(task));
 }
 
 export function renderTaskLog(container, text, emptyText = 'No log output yet.', task = null) {

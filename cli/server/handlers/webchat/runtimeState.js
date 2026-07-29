@@ -12,6 +12,7 @@ const SESSION_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[
 const TASK_ID_RE = /^task_[0-9a-f]{24}$/;
 const TASK_CONTINUATION_HANDLE_RE = /^[A-Za-z0-9_-]{16,200}$/;
 const TASK_TOOL_NAME_RE = /^[A-Za-z0-9._-]{1,160}$/;
+const MAX_TASK_FINAL_OUTPUT_RANGES = 1000;
 const INTERACTION_ID_RE = /^[A-Za-z0-9_-]{8,128}$/;
 const INTERACTION_TOKEN_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 const PLOINKY_WORKSPACE_BANNER_RE = /^\[ploinky\]\s+using \.ploinky:\s+.+$/;
@@ -20,7 +21,32 @@ const MAX_WORKSPACE_FILE_PATHS = 100000;
 const MAX_WORKSPACE_FILE_DELTA_PATHS = 20000;
 const MAX_WORKSPACE_FILE_PATH_LENGTH = 4096;
 
-function normalizeTask(raw) {
+function normalizeFinalOutputRanges(raw) {
+    const byTurn = new Map();
+    const declared = Array.isArray(raw?.finalOutputRanges)
+        ? raw.finalOutputRanges.slice(-MAX_TASK_FINAL_OUTPUT_RANGES)
+        : [];
+    const legacy = {
+        turn: raw?.turn,
+        offset: raw?.finalOutputOffset,
+        length: raw?.finalOutputLength,
+    };
+    for (const candidate of [...declared, legacy]) {
+        if (!Number.isSafeInteger(candidate?.turn) || candidate.turn < 1) continue;
+        if (!Number.isSafeInteger(candidate.offset) || candidate.offset < 0) continue;
+        if (!Number.isSafeInteger(candidate.length) || candidate.length < 1) continue;
+        byTurn.set(candidate.turn, {
+            turn: candidate.turn,
+            offset: candidate.offset,
+            length: candidate.length,
+        });
+    }
+    return [...byTurn.values()]
+        .sort((left, right) => left.turn - right.turn || left.offset - right.offset)
+        .slice(-MAX_TASK_FINAL_OUTPUT_RANGES);
+}
+
+function normalizeTask(raw, { includeFinalOutputRanges = true } = {}) {
     if (!raw || typeof raw !== 'object' || !TASK_ID_RE.test(String(raw.id || ''))) return null;
     const continuationTarget = String(raw.continuation?.targetAgent || raw.targetAgent || '').trim().slice(0, 160);
     const continuationTool = String(raw.continuation?.toolName || '').trim();
@@ -36,6 +62,9 @@ function normalizeTask(raw) {
             ...(continuationHandle ? { handle: continuationHandle } : {}),
         }
         : null;
+    const finalOutputRanges = includeFinalOutputRanges
+        ? normalizeFinalOutputRanges(raw)
+        : [];
     return {
         version: 1,
         id: String(raw.id),
@@ -56,6 +85,7 @@ function normalizeTask(raw) {
         finalOutputLength: Number.isSafeInteger(raw.finalOutputLength) && raw.finalOutputLength > 0
             ? raw.finalOutputLength
             : 0,
+        ...(finalOutputRanges.length ? { finalOutputRanges } : {}),
         ...(raw.logRetention === 'full' ? { logRetention: 'full' } : {}),
         ...(continuation ? { continuation } : {}),
     };
@@ -65,7 +95,13 @@ export function parseWebchatTaskState(envelope) {
     if (!envelope || envelope.__webchatTask !== 1 || envelope.version !== 1) return undefined;
     if (envelope.event === 'list') {
         if (!Array.isArray(envelope.tasks)) return undefined;
-        return { event: 'list', tasks: envelope.tasks.map(normalizeTask).filter(Boolean).slice(0, 1000) };
+        return {
+            event: 'list',
+            tasks: envelope.tasks
+                .map((task) => normalizeTask(task, { includeFinalOutputRanges: false }))
+                .filter(Boolean)
+                .slice(0, 1000),
+        };
     }
     const task = normalizeTask(envelope.task);
     if (!task) return undefined;

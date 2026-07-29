@@ -3473,11 +3473,12 @@ button.wa-upload-directory-entry.folder:hover {
 }
 
 .wa-task-log-line.is-intermediate {
-    color: var(--wa-text-secondary);
+    color: var(--wa-text-muted);
 }
 
 .wa-task-log-line.is-final {
     color: var(--wa-text-primary);
+    font-weight: 600;
 }
 
 .wa-task-log-line.is-user-prompt {

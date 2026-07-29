@@ -287,6 +287,28 @@ test('task view renders a complete terminal log snapshot without waiting for ano
         elements.get('taskLog').children.map((child) => child.textContent),
         ['historical line', 'final answer', '\u00a0'],
     );
+    assert.match(elements.get('taskLog').children[1].className, /is-intermediate/);
+
+    listeners.get('message')?.({
+        origin: 'http://localhost:8080',
+        source: parent,
+        data: {
+            type: 'webchat-task-update',
+            payload: {
+                event: 'update',
+                task: {
+                    id: 'task_1234567890abcdef12345678',
+                    targetAgent: 'piAgent',
+                    description: 'Finished task',
+                    status: 'finished',
+                    turn: 1,
+                    finalOutputRanges: [{ turn: 1, offset: 16, length: 12 }],
+                },
+            },
+        },
+    });
+
+    assert.match(elements.get('taskLog').children[1].className, /is-final/);
 });
 
 test('task view sends continuation through the AchillesCLI command bridge', () => {

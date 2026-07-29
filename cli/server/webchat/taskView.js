@@ -154,18 +154,29 @@ function applyLogUpdate(payload) {
                 showLoadError(syncError);
             });
         }
-        return;
+        return false;
     }
-    if (merged.text === logText && merged.offset === logOffset) return;
+    if (merged.text === logText && merged.offset === logOffset) return false;
     logText = merged.text;
     logOffset = merged.offset;
     renderLog();
+    return true;
 }
 
 function applyUpdate(payload) {
     if (payload?.task?.id !== taskId) return;
     if (payload.event === 'view') loadErrorMessage = '';
+    const previousFinalOutputState = JSON.stringify([
+        task?.finalOutputOffset,
+        task?.finalOutputLength,
+        task?.finalOutputRanges,
+    ]);
     task = { ...task, ...payload.task };
+    const finalOutputStateChanged = previousFinalOutputState !== JSON.stringify([
+        task?.finalOutputOffset,
+        task?.finalOutputLength,
+        task?.finalOutputRanges,
+    ]);
     let receivedLogSnapshot = false;
     if (payload.event === 'action' && payload.action === 'stop') stopSubmitting = false;
     if (payload.event === 'action' && payload.action === 'continue') {
@@ -189,7 +200,10 @@ function applyUpdate(payload) {
     }
     renderTask();
     if (receivedLogSnapshot) renderLog();
-    applyLogUpdate(payload);
+    const renderedLogUpdate = applyLogUpdate(payload);
+    if (!receivedLogSnapshot && finalOutputStateChanged && !renderedLogUpdate) {
+        renderLog();
+    }
 }
 
 function showLoadError(loadError) {

@@ -23,12 +23,18 @@ test('WebChat validates AchillesCLI task lists without owning task storage', () 
         __webchatTask: 1,
         version: 1,
         event: 'list',
-        tasks: [{ ...task, credential: 'must-not-reach-browser', arguments: { prompt: 'secret' } }],
+        tasks: [{
+            ...task,
+            finalOutputRanges: [{ turn: 1, offset: 10, length: 5 }],
+            credential: 'must-not-reach-browser',
+            arguments: { prompt: 'secret' },
+        }],
     });
     assert.equal(parsed.tasks[0].status, 'ongoing');
     assert.equal(parsed.tasks[0].remoteStatus, 'queued');
     assert.equal('credential' in parsed.tasks[0], false);
     assert.equal('arguments' in parsed.tasks[0], false);
+    assert.equal('finalOutputRanges' in parsed.tasks[0], false);
 });
 
 test('WebChat validates task view snapshots and live log deltas', () => {
@@ -36,10 +42,22 @@ test('WebChat validates task view snapshots and live log deltas', () => {
         __webchatTask: 1,
         version: 1,
         event: 'view',
-        task,
+        task: {
+            ...task,
+            turn: 2,
+            finalOutputRanges: [
+                { turn: 1, offset: 10, length: 5 },
+                { turn: 2, offset: 30, length: 7 },
+                { turn: 3, offset: -1, length: 4 },
+            ],
+        },
         log: { text: 'full log', nextOffset: 8 },
     });
     assert.deepEqual(view.log, { text: 'full log', nextOffset: 8, reset: false });
+    assert.deepEqual(view.task.finalOutputRanges, [
+        { turn: 1, offset: 10, length: 5 },
+        { turn: 2, offset: 30, length: 7 },
+    ]);
 
     const update = parseWebchatTaskState({
         __webchatTask: 1,
@@ -57,11 +75,12 @@ test('WebChat validates task view snapshots and live log deltas', () => {
         version: 1,
         event: 'continued',
         task: { ...task, remoteTaskId: 'remote-2', turn: 2 },
-        logAppend: '\n[Continuation 2]\nUser: finish the tests\n\n',
+        logAppend: '\nyou> finish the tests\n\n',
         logOffset: 58,
     });
     assert.equal(continued.event, 'continued');
-    assert.match(continued.logAppend, /User: finish the tests/);
+    assert.match(continued.logAppend, /you> finish the tests/);
+    assert.doesNotMatch(continued.logAppend, /\[Continuation \d+\]/);
     assert.equal(continued.logOffset, 58);
 });
 

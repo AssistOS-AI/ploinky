@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
 import test from 'node:test';
 
 import {
@@ -10,6 +11,11 @@ import {
     taskStatusPresentation,
 } from '../../cli/server/webchat/taskPresentation.js';
 import { createTaskController } from '../../cli/server/webchat/tasks.js';
+
+const WEBCHAT_CSS = fs.readFileSync(
+    new URL('../../cli/server/webchat/webchat.css', import.meta.url),
+    'utf8',
+);
 
 test('task log updates append in order, ignore duplicates, and request gap recovery', () => {
     const current = { text: 'one', offset: 3 };
@@ -68,7 +74,6 @@ test('task log presentation keeps continuation prompts visible before provider o
         '[worker stdout] Provider output',
     ].join('\n'));
     assert.deepEqual(parsed, [
-        { text: '[Continuation 2]', stream: 'stdout' },
         { text: 'you> finish the tests', stream: 'stdout' },
         { text: '', stream: 'stdout' },
         { text: 'Provider output', stream: 'stdout' },
@@ -135,6 +140,50 @@ test('task log presentation marks only the terminal result lines as final', () =
             { text: 'Final answer', tone: 'final' },
             { text: '', tone: 'intermediate' },
         ],
+    );
+});
+
+test('task log presentation preserves final results from every continuation turn', () => {
+    const text = [
+        'First intermediate',
+        'First answer',
+        '[Continuation 2]',
+        'you> continue',
+        'Second intermediate',
+        'Second answer',
+        '',
+    ].join('\n');
+    const firstOffset = text.indexOf('First answer');
+    const secondOffset = text.indexOf('Second answer');
+    assert.deepEqual(
+        parseTaskLogPresentation(text, {
+            turn: 2,
+            finalOutputOffset: secondOffset,
+            finalOutputLength: 'Second answer'.length,
+            finalOutputRanges: [
+                { turn: 1, offset: firstOffset, length: 'First answer'.length },
+                { turn: 2, offset: secondOffset, length: 'Second answer'.length },
+            ],
+        }).map(({ text: line, tone }) => ({ text: line, tone })),
+        [
+            { text: 'First intermediate', tone: 'intermediate' },
+            { text: 'First answer', tone: 'final' },
+            { text: 'you> continue', tone: 'intermediate' },
+            { text: 'Second intermediate', tone: 'intermediate' },
+            { text: 'Second answer', tone: 'final' },
+            { text: '', tone: 'intermediate' },
+        ],
+    );
+});
+
+test('task log styling mutes intermediate output and emphasizes the final result', () => {
+    assert.match(
+        WEBCHAT_CSS,
+        /\.wa-task-log-line\.is-intermediate\s*\{[^}]*color:\s*var\(--wa-text-muted\)/s,
+    );
+    assert.match(
+        WEBCHAT_CSS,
+        /\.wa-task-log-line\.is-final\s*\{[^}]*color:\s*var\(--wa-text-primary\)[^}]*font-weight:\s*600/s,
     );
 });
 
