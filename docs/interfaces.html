@@ -94,7 +94,7 @@
 
         <section class="chapter-section">
           <h2>MCP and HTTP Service Paths</h2>
-          <p>The router aggregates tools and resources at <code>/mcp</code>, while agent-specific MCP endpoints are exposed under <code>/&lt;agent&gt;/mcp</code>. Agent task-status passthrough lives at <code>/&lt;agent&gt;/task</code>. Public and authenticated HTTP service routes are defined separately and may inject compact auth headers for downstream agents; protected service invocation tokens bind the forwarded method, rewritten service path, query string, and body hash.</p>
+          <p>The router aggregates tools and resources at <code>/mcp</code>, while agent-specific MCP endpoints are exposed under <code>/&lt;agent&gt;/mcp</code>. A public agent-root host that selects the <code>agent-mcp</code> capability compiles an exact allowlist from the selected root and its transitive active-manifest dependency closure; unrelated enabled routes cannot become MCP targets, and non-MCP dependency-looking paths remain selected-root content. Agent task-status passthrough lives at <code>/&lt;agent&gt;/task</code>. Public and authenticated HTTP service routes are defined separately and may inject compact auth headers for downstream agents; protected service invocation tokens bind the forwarded method, rewritten service path, query string, and body hash.</p>
           <p>This split lets Ploinky expose first-party routing behavior and agent-specific protocol proxies without forcing every browser surface through the same transport semantics.</p>
         </section>
       </article>

@@ -167,6 +167,14 @@ fail before dialing. Incoming `Forwarded`, every `X-Forwarded-*`, cookies,
 handled at their exact trusted boundary; canonical forwarding and identity
 values are synthesized from the selected topology and authenticated context.
 
+The `agent-mcp` capability on an agent-root host is compiled from the selected
+root and its transitive active-manifest dependency closure. Only root `/mcp`,
+exact `/<routeKey>/mcp` mounts in that closure, and MCP browser support assets
+may select the MCP surface. A route that is merely enabled elsewhere in the
+workspace cannot become the target through that public Host, and non-MCP paths
+under dependency-looking prefixes continue to target the selected root rather
+than exposing dependency content.
+
 Private services use listener `8081` and require both the compiled canonical
 service policy to resolve effectively to `authenticated` and an exact
 current-instance/current-enable-generation caller ACL. The private assertion is

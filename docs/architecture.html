@@ -488,7 +488,7 @@ observability.js    // Monitoring views</code></pre>
                             <li><strong>RouterServer abstraction:</strong> RouterServer talks to agents through <code>cli/server/AgentClient.js</code>, which wraps MCP transports.</li>
                             <li><strong>MCP protocol:</strong> AgentClient builds a <code>StreamableHTTPClientTransport</code> towards <code>http://127.0.0.1:&lt;hostPort&gt;/mcp</code> and exposes <code>listTools()</code>, <code>callTool()</code>, <code>listResources()</code>, and <code>readResource()</code>.</li>
                             <li><strong>Unified routing:</strong> Requests hitting <code>/mcp</code> carry commands such as <code>list_tools</code>, <code>list_resources</code>, or <code>tool</code>. RouterServer fans these calls out to every registered MCP endpoint and aggregates the replies.</li>
-                            <li><strong>Per-agent routes:</strong> Agent-prefixed paths like <code>/&lt;agent&gt;/mcp</code> provide direct access when needed.</li>
+                            <li><strong>Per-agent routes:</strong> Agent-prefixed paths like <code>/&lt;agent&gt;/mcp</code> provide direct access when needed. On a public agent-root host with the <code>agent-mcp</code> capability, the immutable edge generation admits only the selected root and its transitive active-manifest dependency closure; unrelated enabled agents and arbitrary dependency content are not selected.</li>
                             <li><strong>Transport independence:</strong> RouterServer stays agnostic of protocol details; AgentClient encapsulates the MCP implementation.</li>
                         </ul>
 

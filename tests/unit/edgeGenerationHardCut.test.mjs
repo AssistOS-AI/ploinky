@@ -160,6 +160,55 @@ test('agent-mcp exposes only the selected root manifest dependency closure', (t)
             enable: ['beta global no-wait'],
         },
     });
+    const routingFile = path.join(fixture.ploinkyDir, 'routing.json');
+    const agentsFile = path.join(fixture.ploinkyDir, 'agents.json');
+    const betaDir = path.join(fixture.ploinkyDir, 'repos', 'fixtures', 'beta');
+    const gammaDir = path.join(fixture.ploinkyDir, 'repos', 'fixtures', 'gamma');
+    const unrelatedDir = path.join(fixture.ploinkyDir, 'repos', 'fixtures', 'unrelated');
+    fs.mkdirSync(gammaDir, { recursive: true });
+    fs.mkdirSync(unrelatedDir, { recursive: true });
+    fs.writeFileSync(path.join(betaDir, 'manifest.json'), JSON.stringify({
+        enable: ['gamma global'],
+    }, null, 2));
+    fs.writeFileSync(path.join(gammaDir, 'manifest.json'), '{}');
+    fs.writeFileSync(path.join(unrelatedDir, 'manifest.json'), '{}');
+
+    const routing = JSON.parse(fs.readFileSync(routingFile, 'utf8'));
+    routing.routes.gamma = {
+        repo: 'fixtures',
+        agent: 'gamma',
+        container: 'gamma-container',
+        hostPath: gammaDir,
+        hostPort: 43103,
+    };
+    routing.routes.unrelated = {
+        repo: 'fixtures',
+        agent: 'unrelated',
+        container: 'unrelated-container',
+        hostPath: unrelatedDir,
+        hostPort: 43104,
+    };
+    fs.writeFileSync(routingFile, JSON.stringify(routing, null, 2));
+
+    const agents = JSON.parse(fs.readFileSync(agentsFile, 'utf8'));
+    agents['gamma-container'] = {
+        type: 'agent',
+        repoName: 'fixtures',
+        agentName: 'gamma',
+        instanceId: 'gamma-instance',
+        enableGeneration: 'gamma-enable-generation',
+        auth: { mode: 'local' },
+    };
+    agents['unrelated-container'] = {
+        type: 'agent',
+        repoName: 'fixtures',
+        agentName: 'unrelated',
+        instanceId: 'unrelated-instance',
+        enableGeneration: 'unrelated-enable-generation',
+        auth: { mode: 'local' },
+    };
+    fs.writeFileSync(agentsFile, JSON.stringify(agents, null, 2));
+
     const applied = applyEdgeRoutingGeneration({
         workspaceRoot: fixture.workspace,
         reason: 'agent-mcp-dependency-closure',
@@ -167,8 +216,20 @@ test('agent-mcp exposes only the selected root manifest dependency closure', (t)
     });
     assert.deepEqual(
         applied.generation.compiled.agentMcpRoutes['explorer.example.test'],
-        ['alpha', 'beta'],
+        ['alpha', 'beta', 'gamma'],
     );
+
+    const rootMcp = resolveEdgeRoutePlan({
+        req: {
+            method: 'POST',
+            url: '/mcp',
+            headers: { host: 'explorer.example.test' },
+        },
+        listener: 'public',
+    });
+    assert.equal(rootMcp.ok, true);
+    assert.equal(rootMcp.routeKey, 'alpha');
+    assert.equal(rootMcp.upstreamPath, '/mcp');
 
     const dependencyMcp = resolveEdgeRoutePlan({
         req: {
@@ -194,6 +255,30 @@ test('agent-mcp exposes only the selected root manifest dependency closure', (t)
     assert.equal(dependencyContent.ok, true);
     assert.equal(dependencyContent.routeKey, 'alpha');
     assert.equal(dependencyContent.upstreamPath, '/beta/index.html');
+
+    const transitiveDependencyMcp = resolveEdgeRoutePlan({
+        req: {
+            method: 'POST',
+            url: '/gamma/mcp',
+            headers: { host: 'explorer.example.test' },
+        },
+        listener: 'public',
+    });
+    assert.equal(transitiveDependencyMcp.ok, true);
+    assert.equal(transitiveDependencyMcp.routeKey, 'gamma');
+    assert.equal(transitiveDependencyMcp.upstreamPath, '/mcp');
+
+    const unrelatedMcp = resolveEdgeRoutePlan({
+        req: {
+            method: 'POST',
+            url: '/unrelated/mcp',
+            headers: { host: 'explorer.example.test' },
+        },
+        listener: 'public',
+    });
+    assert.equal(unrelatedMcp.ok, true);
+    assert.equal(unrelatedMcp.routeKey, 'alpha');
+    assert.equal(unrelatedMcp.upstreamPath, '/unrelated/mcp');
 });
 
 test('legacy duplicate route and host-network authority is rejected', (t) => {

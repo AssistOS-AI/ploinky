@@ -324,6 +324,15 @@ policy, discovery, aggregate MCP, dashboard, status, WebChat, broker, and privat
 service routes are absent unless the selected class and closed allowlist permit
 them. Raw capability names are invalid configuration.
 
+When an agent-root host selects `agent-mcp`, the active edge generation compiles
+an exact MCP route allowlist containing the selected root route and the
+transitive closure of enabled routes named by its active manifest dependency
+graph. Root `/mcp`, `/<routeKey>/mcp` for that compiled closure, and the
+browser MCP support assets are admitted. An enabled route outside the closure
+cannot become the MCP target. Non-MCP dependency-looking paths remain ordinary
+selected-root application paths, so the capability does not expose another
+agent's arbitrary content.
+
 Router-owned paths such as `/policy/command`, `/auth/*`, `/admin/*`, `/metrics`,
 and `/__agent/*` never become reachable merely because a caller supplies a local
 or configured Host. Every TCP admin/control/status handler still requires a real
