@@ -6,6 +6,7 @@ import {
     CloudflarePublicationController,
     CloudflarePublicationError,
 } from '../../ploinky-box/cloudflared/publicationController.mjs';
+import { createEdgePublicationRouteCoordinator } from '../../ploinky-box/cloudflared/runtime.mjs';
 
 const CONNECTOR_TOKEN = 'connector-secret-value';
 const API_TOKEN = 'api-secret-value';
@@ -297,6 +298,7 @@ function createHarness({
     restartPolicy,
     lazyApi = false,
     managedTunnelRegistry = createMemoryManagedTunnelRegistry(),
+    routeCoordinator = null,
 } = {}) {
     const events = [];
     const audits = [];
@@ -331,7 +333,7 @@ function createHarness({
         journal,
         managedTunnelRegistry,
         secretStore: { readAll: () => ({ ...secrets }) },
-        routeCoordinator: routes,
+        routeCoordinator: routeCoordinator || routes,
         probeConnector: probeConnector || (async (input) => {
             events.push({ event: 'probe.connector', tunnelId: input.scope.tunnelId });
             assert.equal(input.connector.isRunning(), true);
@@ -709,6 +711,85 @@ test('connector-only proves every host, commits reconciling then ready, and owns
         harness.events.filter((entry) => entry.event === 'probe.hostname').map((entry) => entry.hostname),
         ['meet.example.test', 'office.example.test'],
     );
+});
+
+test('ready apply-lock contention recovers without a new activation or duplicate connector launch', async () => {
+    const input = connectorDesired();
+    const generationDesired = {
+        cloudflare: structuredClone(input.cloudflare),
+        hosts: structuredClone(input.hosts),
+    };
+    let inactive = false;
+    let activation = 0;
+    let readyApplyAttempts = 0;
+    const committedStates = [];
+    const inactivations = [];
+    const busy = Object.assign(new Error('edge generation apply is already in progress'), {
+        code: 'EDGE_GENERATION_BUSY',
+    });
+    const edgeOps = {
+        load() {
+            if (inactive) {
+                throw Object.assign(new Error('edge generation inactive'), {
+                    code: 'EDGE_GENERATION_INACTIVE',
+                });
+            }
+            return {
+                selector: {
+                    state: 'active',
+                    generation: input.configurationGeneration,
+                    activationId: `activation-${activation}`,
+                },
+                generation: { desired: generationDesired },
+            };
+        },
+        selection() {
+            return {
+                selector: {
+                    state: 'inactive',
+                    generation: input.configurationGeneration,
+                },
+            };
+        },
+        inactivate(reason) {
+            inactive = true;
+            inactivations.push(reason);
+        },
+        apply(options) {
+            if (options.publicationState === 'ready') {
+                readyApplyAttempts += 1;
+                if (readyApplyAttempts === 1) throw busy;
+            }
+            inactive = false;
+            activation += 1;
+            committedStates.push(options.publicationState);
+            return {
+                selector: {
+                    state: 'active',
+                    generation: input.configurationGeneration,
+                    activationId: `activation-${activation}`,
+                },
+                generation: { desired: generationDesired },
+            };
+        },
+    };
+    const routeCoordinator = createEdgePublicationRouteCoordinator({
+        workspaceRoot: '/fixture',
+        edgeOps,
+        edgeApplyBusyRetryAttempts: 2,
+        sleep: async () => {},
+    });
+    const harness = createHarness({ lazyApi: true, routeCoordinator });
+
+    const status = await harness.controller.reconcile(input);
+
+    assert.equal(status.state, 'ready');
+    assert.equal(status.connectorState, 'running');
+    assert.equal(harness.connector.starts, 1);
+    assert.equal(readyApplyAttempts, 2);
+    assert.deepEqual(committedStates, ['reconciling', 'ready']);
+    assert.deepEqual(inactivations, ['coordinated-apply']);
+    assert.equal(harness.controller.getStatus().error, null);
 });
 
 test('connector-only unresolved token commits the exact public generation to error without API or journal writes', async () => {

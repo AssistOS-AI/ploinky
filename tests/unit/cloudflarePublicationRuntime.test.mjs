@@ -54,6 +54,204 @@ test('edge publication coordinator commits only exact captured desired semantics
     }), /does not match captured desired semantics/);
 });
 
+test('edge publication coordinator retries only a busy pre-mutation apply and commits once', async () => {
+    const desired = { hosts: {} };
+    const busy = Object.assign(new Error('edge generation apply is already in progress'), {
+        code: 'EDGE_GENERATION_BUSY',
+    });
+    const calls = [];
+    const waits = [];
+    const committed = [];
+    let applyAttempts = 0;
+    const edgeOps = {
+        load() {
+            return {
+                selector: { generation: GENERATION },
+                generation: { desired },
+            };
+        },
+        inactivate(reason) { calls.push(['inactivate', reason]); },
+        apply(options) {
+            applyAttempts += 1;
+            calls.push(['apply', options.publicationState, options.expectedGeneration]);
+            if (applyAttempts < 3) throw busy;
+            return {
+                selector: { generation: GENERATION, activationId: 'activation-ready' },
+                generation: { desired },
+            };
+        },
+    };
+    const coordinator = createEdgePublicationRouteCoordinator({
+        workspaceRoot: '/fixture',
+        edgeOps,
+        edgeApplyBusyRetryAttempts: 3,
+        edgeApplyBusyRetryDelayMs: 7,
+        sleep: async (delayMs) => { waits.push(delayMs); },
+        onCommit: (id) => committed.push(id),
+    });
+
+    await coordinator.inactivate({ configurationGeneration: GENERATION, reason: 'test' });
+    await coordinator.commit({
+        mode: 'local-only',
+        publicationState: 'ready',
+        configurationGeneration: GENERATION,
+        hosts: {},
+    });
+
+    assert.equal(applyAttempts, 3);
+    assert.deepEqual(waits, [7, 7]);
+    assert.deepEqual(
+        calls.filter(([operation]) => operation === 'inactivate'),
+        [['inactivate', 'test']],
+        'a transient busy apply must not trigger fail-closed inactivation',
+    );
+    assert.deepEqual(committed, ['activation-ready']);
+});
+
+test('edge publication coordinator fails closed after bounded busy retries', async () => {
+    const desired = { hosts: {} };
+    const busy = Object.assign(new Error('edge generation apply is already in progress'), {
+        code: 'EDGE_GENERATION_BUSY',
+    });
+    const inactivations = [];
+    let applyAttempts = 0;
+    let waits = 0;
+    const edgeOps = {
+        load() {
+            return {
+                selector: { generation: GENERATION },
+                generation: { desired },
+            };
+        },
+        inactivate(reason) { inactivations.push(reason); },
+        apply() {
+            applyAttempts += 1;
+            throw busy;
+        },
+    };
+    const coordinator = createEdgePublicationRouteCoordinator({
+        workspaceRoot: '/fixture',
+        edgeOps,
+        edgeApplyBusyRetryAttempts: 3,
+        edgeApplyBusyRetryDelayMs: 0,
+        sleep: async () => { waits += 1; },
+    });
+
+    await coordinator.inactivate({ configurationGeneration: GENERATION, reason: 'test' });
+    await assert.rejects(
+        coordinator.commit({
+            mode: 'local-only',
+            publicationState: 'ready',
+            configurationGeneration: GENERATION,
+            hosts: {},
+        }),
+        (error) => error === busy,
+    );
+    assert.equal(applyAttempts, 3);
+    assert.equal(waits, 2);
+    assert.deepEqual(inactivations, ['test', 'publication-commit-failed']);
+});
+
+test('edge publication coordinator does not retry generation or connector identity drift', async () => {
+    const desired = {
+        cloudflare: { tunnelTokenSecret: 'publication/cloudflare-connector' },
+        hosts: { 'app.example.test': { routeKey: 'app' } },
+    };
+    const changedDesired = {
+        cloudflare: { tunnelTokenSecret: 'publication/different-connector' },
+        hosts: desired.hosts,
+    };
+    const busy = Object.assign(new Error('edge generation apply is already in progress'), {
+        code: 'EDGE_GENERATION_BUSY',
+    });
+    let applyAttempts = 0;
+    let waits = 0;
+    const inactivations = [];
+    const edgeOps = {
+        load() {
+            return {
+                selector: { generation: GENERATION },
+                generation: { desired },
+            };
+        },
+        inactivate(reason) { inactivations.push(reason); },
+        apply() {
+            applyAttempts += 1;
+            if (applyAttempts === 1) throw busy;
+            return {
+                selector: { generation: GENERATION, activationId: 'activation-drifted' },
+                generation: { desired: changedDesired },
+            };
+        },
+    };
+    const coordinator = createEdgePublicationRouteCoordinator({
+        workspaceRoot: '/fixture',
+        edgeOps,
+        edgeApplyBusyRetryAttempts: 5,
+        sleep: async () => { waits += 1; },
+    });
+
+    await coordinator.inactivate({ configurationGeneration: GENERATION, reason: 'test' });
+    await assert.rejects(
+        coordinator.commit({
+            mode: 'cloudflare',
+            publicationState: 'ready',
+            configurationGeneration: GENERATION,
+            hosts: desired.hosts,
+        }),
+        /edge sources changed before publication commit/,
+    );
+    assert.equal(applyAttempts, 2);
+    assert.equal(waits, 1);
+    assert.deepEqual(inactivations, ['test', 'publication-commit-failed']);
+});
+
+test('edge publication coordinator fails immediately when a busy retry observes generation drift', async () => {
+    const desired = { hosts: {} };
+    const busy = Object.assign(new Error('edge generation apply is already in progress'), {
+        code: 'EDGE_GENERATION_BUSY',
+    });
+    const race = Object.assign(new Error('edge routing sources no longer match'), {
+        code: 'EDGE_GENERATION_RACE',
+    });
+    let applyAttempts = 0;
+    let waits = 0;
+    const edgeOps = {
+        load() {
+            return {
+                selector: { generation: GENERATION },
+                generation: { desired },
+            };
+        },
+        inactivate() {},
+        apply(options) {
+            assert.equal(options.expectedGeneration, GENERATION);
+            applyAttempts += 1;
+            if (applyAttempts === 1) throw busy;
+            throw race;
+        },
+    };
+    const coordinator = createEdgePublicationRouteCoordinator({
+        workspaceRoot: '/fixture',
+        edgeOps,
+        edgeApplyBusyRetryAttempts: 5,
+        sleep: async () => { waits += 1; },
+    });
+
+    await coordinator.inactivate({ configurationGeneration: GENERATION, reason: 'test' });
+    await assert.rejects(
+        coordinator.commit({
+            mode: 'local-only',
+            publicationState: 'ready',
+            configurationGeneration: GENERATION,
+            hosts: {},
+        }),
+        (error) => error === race,
+    );
+    assert.equal(applyAttempts, 2);
+    assert.equal(waits, 1);
+});
+
 test('edge publication coordinator permits error only for the exact captured Cloudflare generation', async () => {
     const hosts = {
         'app.example.test': {

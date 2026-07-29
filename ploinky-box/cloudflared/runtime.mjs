@@ -22,6 +22,8 @@ const ALLOWED_PUBLICATION_STATES = new Set([
     'reconciling',
     'error',
 ]);
+const DEFAULT_EDGE_APPLY_BUSY_RETRY_ATTEMPTS = 50;
+const DEFAULT_EDGE_APPLY_BUSY_RETRY_DELAY_MS = 100;
 
 function publicationRuntimeError(message, code = 'CLOUDFLARE_RUNTIME_COORDINATION_FAILED') {
     const error = new Error(message);
@@ -29,9 +31,16 @@ function publicationRuntimeError(message, code = 'CLOUDFLARE_RUNTIME_COORDINATIO
     return error;
 }
 
+function sleepFor(delayMs) {
+    return new Promise((resolve) => setTimeout(resolve, delayMs));
+}
+
 export function createEdgePublicationRouteCoordinator({
     workspaceRoot = PLOINKY_WORKSPACE_ROOT,
     onCommit = () => {},
+    edgeApplyBusyRetryAttempts = DEFAULT_EDGE_APPLY_BUSY_RETRY_ATTEMPTS,
+    edgeApplyBusyRetryDelayMs = DEFAULT_EDGE_APPLY_BUSY_RETRY_DELAY_MS,
+    sleep = sleepFor,
     edgeOps = {
         apply: applyEdgeRoutingGeneration,
         inactivate: inactivateEdgeRoutingGeneration,
@@ -40,6 +49,32 @@ export function createEdgePublicationRouteCoordinator({
     },
 } = {}) {
     let captured = null;
+    const maximumApplyAttempts = Math.max(
+        1,
+        Math.min(100, Math.trunc(Number(edgeApplyBusyRetryAttempts) || 1)),
+    );
+    const applyRetryDelayMs = Math.max(
+        0,
+        Math.min(1_000, Math.trunc(Number(edgeApplyBusyRetryDelayMs) || 0)),
+    );
+
+    async function applyCapturedGeneration(options) {
+        // EDGE_GENERATION_BUSY is raised before the caller acquires the apply
+        // lock or mutates selector state. Retry only that pre-mutation outcome;
+        // expectedGeneration and the captured desired comparison below remain
+        // authoritative on every fresh lock attempt.
+        for (let attempt = 1; attempt <= maximumApplyAttempts; attempt += 1) {
+            try {
+                return await edgeOps.apply(options);
+            } catch (error) {
+                if (error?.code !== 'EDGE_GENERATION_BUSY' || attempt === maximumApplyAttempts) {
+                    throw error;
+                }
+                await sleep(applyRetryDelayMs);
+            }
+        }
+        throw publicationRuntimeError('edge generation apply retry exhausted');
+    }
 
     return Object.freeze({
         async inactivate({ configurationGeneration, reason } = {}) {
@@ -90,7 +125,7 @@ export function createEdgePublicationRouteCoordinator({
             }
             let result;
             try {
-                result = edgeOps.apply({
+                result = await applyCapturedGeneration({
                     workspaceRoot,
                     reason: `publication-${state}`,
                     publicationState: state,
