@@ -46,7 +46,8 @@ test('browser mutation proof binds session, exact routed origin, route selector,
             ok: true,
             origin: 'https://app.example.test',
             generation: 'edge-generation-a',
-            routeKey: 'example',
+            hostRouteKey: 'example',
+            routeKey: 'identity-owner',
         },
     );
 
@@ -70,6 +71,76 @@ test('browser mutation proof binds session, exact routed origin, route selector,
         verifyBrowserMutationRequest(req, { routePlan, authContext, sessionId: 'session-b' }).code,
         'BROWSER_CSRF_INVALID',
     );
+});
+
+test('service mutation proof stays bound to both the public host root and allowed service route', () => {
+    const routePlan = publicPlan({ routeKey: 'explorer' });
+    const serviceContext = {
+        routeKey: 'explorer',
+        boundHostRouteKey: 'explorer',
+        serviceRouteKey: 'dpuAgent',
+    };
+    const req = request({ origin: 'https://app.example.test' });
+    const token = mintBrowserCsrfToken({
+        req,
+        routePlan,
+        authContext: serviceContext,
+        sessionId: 'session-a',
+    });
+    req.headers[BROWSER_CSRF_HEADER] = token;
+
+    assert.deepEqual(
+        verifyBrowserMutationRequest(req, {
+            routePlan,
+            authContext: serviceContext,
+            sessionId: 'session-a',
+        }),
+        {
+            ok: true,
+            origin: 'https://app.example.test',
+            generation: 'edge-generation-a',
+            hostRouteKey: 'explorer',
+            routeKey: 'dpuAgent',
+        },
+    );
+    assert.equal(verifyBrowserMutationRequest(req, {
+        routePlan,
+        authContext: { ...serviceContext, serviceRouteKey: 'onlyOffice' },
+        sessionId: 'session-a',
+    }).code, 'BROWSER_CSRF_INVALID');
+    assert.equal(verifyBrowserMutationRequest(req, {
+        routePlan: publicPlan({ routeKey: 'other-root' }),
+        authContext: {
+            ...serviceContext,
+            boundHostRouteKey: 'other-root',
+        },
+        sessionId: 'session-a',
+    }).code, 'BROWSER_CSRF_INVALID');
+});
+
+test('named router-surface proof cannot be substituted with a general root proof', () => {
+    const routePlan = publicPlan({ routeKey: 'explorer' });
+    const rootContext = {
+        routeKey: 'explorer',
+        boundHostRouteKey: 'explorer',
+    };
+    const userAdminContext = {
+        ...rootContext,
+        mutationRouteKey: 'user-admin:explorer',
+    };
+    const req = request({ origin: 'https://app.example.test' });
+    req.headers[BROWSER_CSRF_HEADER] = mintBrowserCsrfToken({
+        req,
+        routePlan,
+        authContext: rootContext,
+        sessionId: 'session-a',
+    });
+
+    assert.equal(verifyBrowserMutationRequest(req, {
+        routePlan,
+        authContext: userAdminContext,
+        sessionId: 'session-a',
+    }).code, 'BROWSER_CSRF_INVALID');
 });
 
 test('browser mutation proof survives local JWT refresh for the same signed session id', () => {

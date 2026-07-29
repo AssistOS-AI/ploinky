@@ -7,7 +7,7 @@ import { resolveSessionBindingId } from './sessionBinding.js';
 export const BROWSER_CSRF_HEADER = 'x-ploinky-browser-csrf-token';
 export const BROWSER_CSRF_COOKIE_NAME = 'ploinky_browser_csrf';
 
-const BROWSER_CSRF_VERSION = 'v1';
+const BROWSER_CSRF_VERSION = 'v2';
 
 function headerValue(req, name) {
     const value = req?.headers?.[name];
@@ -28,11 +28,20 @@ function routeGeneration(routePlan) {
     return String(routePlan?.lease?.id || routePlan?.snapshot?.generation || '').trim();
 }
 
-function routeBinding(routePlan, authContext = {}) {
+function hostRouteBinding(routePlan, authContext = {}) {
     return String(
         authContext.boundHostRouteKey
+        || routePlan?.hostSelection?.record?.routeKey
+        || 'control',
+    ).trim() || 'control';
+}
+
+function mutationRouteBinding(routePlan, authContext = {}) {
+    return String(
+        authContext.mutationRouteKey
         || authContext.serviceRouteKey
         || authContext.routeKey
+        || routePlan?.routeKey
         || routePlan?.hostSelection?.record?.routeKey
         || 'control',
     ).trim() || 'control';
@@ -54,7 +63,13 @@ export function canonicalBrowserMutationOrigin(req, routePlan) {
     }
 }
 
-function browserCsrfMac({ sessionId, origin, generation, routeKey }) {
+function browserCsrfMac({
+    sessionId,
+    origin,
+    generation,
+    hostRouteKey,
+    routeKey,
+}) {
     return crypto
         .createHmac('sha256', deriveSubkey('router-browser-csrf'))
         .update(BROWSER_CSRF_VERSION)
@@ -65,6 +80,8 @@ function browserCsrfMac({ sessionId, origin, generation, routeKey }) {
         .update('\0')
         .update(String(generation || ''))
         .update('\0')
+        .update(String(hostRouteKey || ''))
+        .update('\0')
         .update(String(routeKey || ''))
         .digest('base64url');
 }
@@ -72,14 +89,21 @@ function browserCsrfMac({ sessionId, origin, generation, routeKey }) {
 function bindingForRequest({ req, routePlan, authContext, sessionId }) {
     const origin = canonicalBrowserMutationOrigin(req, routePlan);
     const generation = routeGeneration(routePlan);
-    const routeKey = routeBinding(routePlan, authContext);
+    const hostRouteKey = hostRouteBinding(routePlan, authContext);
+    const routeKey = mutationRouteBinding(routePlan, authContext);
     const sid = resolveSessionBindingId(req, sessionId);
-    if (!origin || !generation || !routeKey || !sid) {
-        const error = new Error('an exact routed origin, active edge generation, route binding, and authenticated session are required');
+    if (!origin || !generation || !hostRouteKey || !routeKey || !sid) {
+        const error = new Error('an exact routed origin, active edge generation, host and mutation route bindings, and authenticated session are required');
         error.code = 'BROWSER_MUTATION_BINDING_REQUIRED';
         throw error;
     }
-    return { origin, generation, routeKey, sessionId: sid };
+    return {
+        origin,
+        generation,
+        hostRouteKey,
+        routeKey,
+        sessionId: sid,
+    };
 }
 
 export function mintBrowserCsrfToken({ req, routePlan, authContext, sessionId } = {}) {
@@ -120,6 +144,7 @@ export function verifyBrowserMutationRequest(req, {
         ok: true,
         origin: binding.origin,
         generation: binding.generation,
+        hostRouteKey: binding.hostRouteKey,
         routeKey: binding.routeKey,
     };
 }

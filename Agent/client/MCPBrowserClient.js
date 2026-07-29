@@ -245,7 +245,7 @@ function createAgentClient(baseUrl, options = {}) {
 
         browserMutationProofPromise = (async () => {
             const proofUrl = new URL('/auth/token', endpoint);
-            proofUrl.searchParams.set('agent', browserAgentRouteKey);
+            proofUrl.searchParams.set('mutationRoute', browserAgentRouteKey);
             const response = await fetch(proofUrl.toString(), {
                 method: 'GET',
                 credentials: 'include',

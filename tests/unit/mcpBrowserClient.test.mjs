@@ -142,6 +142,7 @@ test('browser agent-first MCP mutations use an exact route-scoped proof', async 
                 method: req.method,
                 path: requestUrl.pathname,
                 agent: requestUrl.searchParams.get('agent'),
+                mutationRoute: requestUrl.searchParams.get('mutationRoute'),
             });
             res.writeHead(200, { 'content-type': 'application/json' });
             res.end(JSON.stringify({
@@ -229,7 +230,12 @@ test('browser agent-first MCP mutations use an exact route-scoped proof', async 
         await new Promise((resolve) => server.close(resolve));
     }
 
-    assert.deepEqual(seen[0], { method: 'GET', path: '/auth/token', agent: 'dpuAgent' });
+    assert.deepEqual(seen[0], {
+        method: 'GET',
+        path: '/auth/token',
+        agent: null,
+        mutationRoute: 'dpuAgent',
+    });
     assert.ok(seen.filter((entry) => entry.method === 'POST').length >= 2);
     assert.ok(seen.filter((entry) => entry.method !== 'GET')
         .every((entry) => entry.csrf === 'v1.route-scoped-proof'));

@@ -711,7 +711,13 @@ export async function handleAuthRoutes(req, res, parsedUrl, { routePlan = null }
                     origin: baseUrl,
                     csrfToken: browserCsrfToken,
                     generation: String(routePlan.lease.id),
-                    routeKey: authContext.boundHostRouteKey || authContext.serviceRouteKey || authContext.routeKey || 'control',
+                    hostRouteKey: authContext.boundHostRouteKey
+                        || routePlan?.hostSelection?.record?.routeKey
+                        || 'control',
+                    routeKey: authContext.serviceRouteKey
+                        || authContext.routeKey
+                        || authContext.boundHostRouteKey
+                        || 'control',
                 },
                 ...(adminControl ? { adminControl } : {}),
             }));

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { Readable } from 'node:stream';
@@ -40,23 +40,31 @@ class MockResponse {
     }
 }
 
-function makeRequest({ method = 'GET', url, body, cookie = '', csrf = 'valid' }) {
+function makeRequest({
+    method = 'GET',
+    url,
+    body,
+    cookie = '',
+    csrf = 'valid',
+    host = 'localhost',
+    origin = '',
+}) {
     const chunks = body === undefined ? [] : [Buffer.from(JSON.stringify(body), 'utf8')];
     const req = Readable.from(chunks);
     req.method = method;
     req.url = url;
     req.headers = {
         accept: 'application/json',
-        host: 'localhost',
+        host,
         ...(cookie ? { cookie } : {}),
         ...(body === undefined ? {} : { 'content-type': 'application/json' }),
     };
     req.socket = { encrypted: false };
     if (['POST', 'PATCH', 'DELETE'].includes(method) && csrf !== 'missing') {
-        req.headers.origin = 'http://localhost';
+        req.headers.origin = origin || 'http://localhost';
         const sessionId = String(cookie).split(';').map((part) => part.trim()).find((part) => part.startsWith('ploinky_jwt='))?.slice('ploinky_jwt='.length) || '';
         req.session = getLocalSession?.(sessionId) || null;
-        req.headers['x-ploinky-csrf-token'] = csrf === 'valid' && mintAdminCsrfToken
+        if (csrf !== 'browser') req.headers['x-ploinky-csrf-token'] = csrf === 'valid' && mintAdminCsrfToken
             ? mintAdminCsrfToken({ sessionId, req })
             : 'v1.invalid';
     }
@@ -66,8 +74,10 @@ function makeRequest({ method = 'GET', url, body, cookie = '', csrf = 'valid' })
 async function invoke(handler, options) {
     const req = makeRequest(options);
     const res = new MockResponse();
-    const parsedUrl = new URL(options.url, 'http://localhost');
-    const handled = await handler(req, res, parsedUrl);
+    const parsedUrl = new URL(options.url, options.origin || `http://${options.host || 'localhost'}`);
+    const handled = await handler(req, res, parsedUrl, {
+        routePlan: options.routePlan || null,
+    });
     return {
         handled,
         statusCode: res.statusCode,
@@ -78,6 +88,16 @@ async function invoke(handler, options) {
 
 function authCookie(sessionId) {
     return `ploinky_jwt=${sessionId}`;
+}
+
+function responseCookie(result, name) {
+    const header = result.headers.get('set-cookie');
+    const values = Array.isArray(header) ? header : [header];
+    for (const value of values.filter(Boolean)) {
+        const match = String(value).match(new RegExp(`(?:^|;\\s*)${name}=([^;]+)`));
+        if (match) return `${name}=${match[1]}`;
+    }
+    return '';
 }
 
 function userRecord(passwords, {
@@ -311,4 +331,170 @@ test('user admin routes enforce admin access, CRUD, rev invalidation, and agent 
     });
     assert.equal(result.statusCode, 400);
     assert.equal(result.body.error, 'last_admin_required');
+
+    const publicSnapshot = {
+        generation: 'public-generation-a',
+        routing: {
+            static: { agent: 'explorer' },
+            routes: {
+                explorer: { repo: 'AssistOSExplorer', agent: 'explorer' },
+                dpuAgent: { repo: 'AssistOSExplorer', agent: 'dpuAgent' },
+            },
+        },
+        agents: JSON.parse(readFileSync(path.join(ploinkyDir, 'agents.json'), 'utf8')),
+        manifests: {},
+    };
+    const publicRoutePlan = (generation = publicSnapshot.generation, commit = () => true) => ({
+        ok: true,
+        kind: 'router-surface',
+        surface: 'user-admin',
+        listener: 'public',
+        host: 'explorer.example.test',
+        hostSelection: {
+            kind: 'agent-root',
+            source: 'public-host',
+            host: 'explorer.example.test',
+            record: { routeKey: 'explorer' },
+        },
+        forwarding: {
+            protocol: 'https',
+            authority: 'explorer.example.test',
+        },
+        snapshot: { ...publicSnapshot, generation },
+        lease: {
+            id: generation,
+            snapshot: { ...publicSnapshot, generation },
+            commit,
+        },
+    });
+
+    result = await invoke(authHandlers.handleUserAdminRoutes, {
+        url: '/api/agents/explorer/users',
+        host: 'explorer.example.test',
+        origin: 'https://explorer.example.test',
+        cookie: authCookie(explorerAdmin.sessionId),
+        routePlan: publicRoutePlan(),
+    });
+    assert.equal(result.statusCode, 200, JSON.stringify(result.body));
+    assert.deepEqual(result.body.users.map((user) => user.username), ['admin', 'user']);
+    const userAdminProof = responseCookie(result, 'ploinky_user_admin_csrf');
+    assert.match(userAdminProof, /^ploinky_user_admin_csrf=v2\./);
+    assert.match(
+        String(result.headers.get('set-cookie')),
+        /ploinky_user_admin_csrf=.*Path=\/api\/agents\/explorer; HttpOnly; SameSite=Strict/,
+    );
+
+    result = await invoke(authHandlers.handleUserAdminRoutes, {
+        url: '/api/agents/explorer/settings',
+        host: 'explorer.example.test',
+        origin: 'https://explorer.example.test',
+        cookie: authCookie(explorerAdmin.sessionId),
+        routePlan: publicRoutePlan(),
+    });
+    assert.equal(result.statusCode, 200, JSON.stringify(result.body));
+    assert.equal(result.body.settings.loginBrandingName, 'Acme Workspace');
+
+    result = await invoke(authHandlers.handleUserAdminRoutes, {
+        method: 'POST',
+        url: '/api/agents/explorer/users',
+        host: 'explorer.example.test',
+        origin: 'https://explorer.example.test',
+        cookie: `${authCookie(explorerAdmin.sessionId)}; ${
+            userAdminProof.replace('ploinky_user_admin_csrf=', 'ploinky_browser_csrf=')
+        }`,
+        csrf: 'browser',
+        body: {
+            username: 'wrong-proof-cookie',
+            password: 'wrong-proof-cookie-pass',
+        },
+        routePlan: publicRoutePlan(),
+    });
+    assert.equal(result.statusCode, 403);
+    assert.equal(result.body.error, 'browser_csrf_invalid');
+
+    result = await invoke(authHandlers.handleUserAdminRoutes, {
+        method: 'POST',
+        url: '/api/agents/explorer/users',
+        host: 'explorer.example.test',
+        origin: 'https://explorer.example.test',
+        cookie: `${authCookie(explorerAdmin.sessionId)}; ${userAdminProof}`,
+        csrf: 'browser',
+        body: {
+            username: 'qa-editor',
+            password: 'qa-editor-pass',
+            roles: ['editor'],
+        },
+        routePlan: publicRoutePlan(),
+    });
+    assert.equal(result.statusCode, 201, JSON.stringify(result.body));
+    assert.equal(result.body.user.username, 'qa-editor');
+    const publicUserId = result.body.user.id;
+
+    result = await invoke(authHandlers.handleUserAdminRoutes, {
+        method: 'PATCH',
+        url: `/api/agents/explorer/users/${encodeURIComponent(publicUserId)}`,
+        host: 'explorer.example.test',
+        origin: 'https://explorer.example.test',
+        cookie: `${authCookie(explorerAdmin.sessionId)}; ${userAdminProof}`,
+        csrf: 'browser',
+        body: { roles: ['admin'] },
+        routePlan: publicRoutePlan(),
+    });
+    assert.equal(result.statusCode, 200, JSON.stringify(result.body));
+    assert.deepEqual(result.body.user.roles, ['user', 'admin']);
+
+    result = await invoke(authHandlers.handleUserAdminRoutes, {
+        method: 'DELETE',
+        url: `/api/agents/explorer/users/${encodeURIComponent(publicUserId)}`,
+        host: 'explorer.example.test',
+        origin: 'https://explorer.example.test',
+        cookie: `${authCookie(explorerAdmin.sessionId)}; ${userAdminProof}`,
+        csrf: 'browser',
+        routePlan: publicRoutePlan(),
+    });
+    assert.equal(result.statusCode, 200, JSON.stringify(result.body));
+    assert.equal(result.body.deleted, true);
+
+    result = await invoke(authHandlers.handleUserAdminRoutes, {
+        method: 'POST',
+        url: '/api/agents/explorer/users',
+        host: 'explorer.example.test',
+        origin: 'https://cross-origin.invalid',
+        cookie: `${authCookie(explorerAdmin.sessionId)}; ${userAdminProof}`,
+        csrf: 'browser',
+        body: {
+            username: 'cross-origin',
+            password: 'cross-origin-pass',
+        },
+        routePlan: publicRoutePlan(),
+    });
+    assert.equal(result.statusCode, 403);
+    assert.equal(result.body.error, 'browser_origin_required');
+
+    result = await invoke(authHandlers.handleUserAdminRoutes, {
+        method: 'POST',
+        url: '/api/agents/explorer/users',
+        host: 'explorer.example.test',
+        origin: 'https://explorer.example.test',
+        cookie: `${authCookie(explorerAdmin.sessionId)}; ${userAdminProof}`,
+        csrf: 'browser',
+        body: {
+            username: 'stale-generation',
+            password: 'stale-generation-pass',
+        },
+        routePlan: publicRoutePlan('public-generation-b'),
+    });
+    assert.equal(result.statusCode, 403);
+    assert.equal(result.body.error, 'browser_csrf_invalid');
+
+    result = await invoke(authHandlers.handleUserAdminRoutes, {
+        url: '/api/agents/explorer/users',
+        host: 'explorer.example.test',
+        origin: 'https://explorer.example.test',
+        cookie: authCookie(explorerUser.sessionId),
+        routePlan: publicRoutePlan(),
+    });
+    assert.equal(result.statusCode, 403);
+    assert.equal(result.body.error, 'admin_required');
+    assert.equal(responseCookie(result, 'ploinky_user_admin_csrf'), '');
 });

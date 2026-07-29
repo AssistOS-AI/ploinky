@@ -253,13 +253,32 @@ function isHostBoundRoutePlan(routePlan) {
     return ['agent-root', 'dedicated-service'].includes(String(routePlan?.hostSelection?.kind || ''));
 }
 
+function requestedMutationRouteKey(parsedUrl) {
+    return (parsedUrl.pathname || '/') === '/auth/token'
+        ? String(parsedUrl.searchParams.get('mutationRoute') || '').trim()
+        : '';
+}
+
+function hostBoundMutationRouteKey(parsedUrl, routePlan, snapshot) {
+    const requested = requestedMutationRouteKey(parsedUrl);
+    if (!requested) return '';
+    const host = String(routePlan?.hostSelection?.host || routePlan?.host || '').trim();
+    const allowed = snapshot?.compiled?.agentMcpRoutes?.[host];
+    return Array.isArray(allowed) && allowed.includes(requested) ? requested : null;
+}
+
 function resolveControlBrowserProofAuthContext(parsedUrl, options = {}) {
     if ((parsedUrl.pathname || '/') !== '/auth/token') return null;
-    const targetRouteKey = String(parsedUrl.searchParams.get('agent') || '').trim();
+    const targetRouteKey = String(
+        parsedUrl.searchParams.get('mutationRoute')
+        || parsedUrl.searchParams.get('agent')
+        || '',
+    ).trim();
     if (!targetRouteKey) return null;
 
     const targetContext = resolveAuthContextForRouteKey(targetRouteKey, options);
-    if (!targetContext.record || targetContext.mode !== 'none') return null;
+    if (!targetContext.record) return null;
+    if (targetContext.mode !== 'none') return targetContext;
 
     const inheritedContext = resolveAuthenticatedRouteAuthContext(targetRouteKey, options);
     return inheritedContext.error ? null : inheritedContext;
@@ -269,10 +288,22 @@ export function resolveAuthContextForRoutePlan(parsedUrl, routePlan, { browserAu
     const snapshot = snapshotFromOptions({ routePlan });
     const selectedRouteKey = routePlanSelectedRouteKey(routePlan);
     if (browserAuth && isHostBoundRoutePlan(routePlan) && selectedRouteKey) {
+        const mutationRouteKey = hostBoundMutationRouteKey(parsedUrl, routePlan, snapshot);
+        if (mutationRouteKey === null) {
+            return {
+                routeKey: selectedRouteKey,
+                mode: 'authenticated-unconfigured',
+                policy: { mode: 'authenticated-unconfigured' },
+                record: null,
+                error: 'browser_mutation_route_denied',
+                errorDetail: 'The requested browser mutation route is outside the selected host service closure.',
+            };
+        }
         return {
             ...resolveAuthenticatedRouteAuthContext(selectedRouteKey, { snapshot }),
             boundHostRouteKey: selectedRouteKey,
             boundGeneration: String(routePlan?.lease?.id || snapshot?.generation || ''),
+            ...(mutationRouteKey ? { serviceRouteKey: mutationRouteKey } : {}),
         };
     }
     if (browserAuth) {

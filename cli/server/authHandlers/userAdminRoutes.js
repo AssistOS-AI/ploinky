@@ -1,8 +1,21 @@
 import { createLocalAuthUser, deleteLocalAuthUser, getSession as getLocalSession, getSessionCookieMaxAge as getLocalSessionCookieMaxAge, isLocalAdminUser, listLocalAuthRoles, listLocalAuthUsers, updateLocalAuthUser } from '../auth/localService.js';
 import { verifyAdminMutationRequest } from '../adminControlSecurity.js';
+import {
+    mintBrowserCsrfToken,
+    verifyBrowserMutationRequest,
+} from '../browserMutationSecurity.js';
 import { readRouterSettings, updateRouterSettings } from '../auth/routerSettings.js';
-import { buildCookie, LOCAL_AUTH_COOKIE_NAME, parseCookies, readJsonBody, sendJson } from './shared.js';
+import {
+    appendSetCookie,
+    buildCookie,
+    LOCAL_AUTH_COOKIE_NAME,
+    parseCookies,
+    readJsonBody,
+    sendJson,
+} from './shared.js';
 import { resolveAuthContextForRouteKey } from './authContext.js';
+
+export const USER_ADMIN_CSRF_COOKIE_NAME = 'ploinky_user_admin_csrf';
 
 function getUserAdminErrorStatus(code = '') {
     switch (String(code || '').trim()) {
@@ -98,6 +111,24 @@ async function readUserAdminBody(req) {
     }
 }
 
+function publicUserAdminAuthContext(routePlan, route, authContext) {
+    const selectedRouteKey = String(routePlan?.hostSelection?.record?.routeKey || '').trim();
+    if (routePlan?.ok !== true
+        || routePlan?.kind !== 'router-surface'
+        || routePlan?.surface !== 'user-admin'
+        || routePlan?.listener !== 'public'
+        || routePlan?.hostSelection?.kind !== 'agent-root'
+        || !selectedRouteKey
+        || selectedRouteKey !== route.agent) {
+        return null;
+    }
+    return {
+        ...authContext,
+        boundHostRouteKey: selectedRouteKey,
+        mutationRouteKey: `user-admin:${selectedRouteKey}`,
+    };
+}
+
 export async function handleUserAdminRoutes(req, res, parsedUrl, { routePlan = null } = {}) {
     const pathname = parsedUrl.pathname || '/';
     const route = parseUserAdminPath(pathname);
@@ -130,8 +161,21 @@ export async function handleUserAdminRoutes(req, res, parsedUrl, { routePlan = n
     req.user = session.user;
     req.session = session;
     req.sessionId = sessionId;
+    const publicAuthContext = publicUserAdminAuthContext(routePlan, route, authContext);
     if (['POST', 'PATCH', 'DELETE'].includes(method)) {
-        const mutationDecision = verifyAdminMutationRequest(req, sessionId);
+        const publicCsrfToken = publicAuthContext
+            ? cookies.get(USER_ADMIN_CSRF_COOKIE_NAME) || ''
+            : '';
+        const mutationDecision = publicAuthContext
+            ? (publicCsrfToken
+                ? verifyBrowserMutationRequest(req, {
+                    routePlan,
+                    authContext: publicAuthContext,
+                    sessionId,
+                    token: publicCsrfToken,
+                })
+                : { ok: false, code: 'BROWSER_CSRF_INVALID' })
+            : verifyAdminMutationRequest(req, sessionId);
         if (!mutationDecision.ok) {
             sendJson(res, 403, {
                 ok: false,
@@ -148,6 +192,24 @@ export async function handleUserAdminRoutes(req, res, parsedUrl, { routePlan = n
             sameSite: 'Lax'
         });
         res.setHeader('Set-Cookie', cookie);
+        if (publicAuthContext) {
+            const userAdminCsrfToken = mintBrowserCsrfToken({
+                req,
+                routePlan,
+                authContext: publicAuthContext,
+                sessionId,
+            });
+            appendSetCookie(res, buildCookie(
+                USER_ADMIN_CSRF_COOKIE_NAME,
+                userAdminCsrfToken,
+                req,
+                `/api/agents/${encodeURIComponent(route.agent)}`,
+                {
+                    maxAge: getLocalSessionCookieMaxAge(),
+                    sameSite: 'Strict',
+                },
+            ));
+        }
 
         if (route.resource === 'settings') {
             if (route.userId) {

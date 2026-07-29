@@ -374,6 +374,109 @@ test('browser auth host binding rejects selector switches and ignores raw candid
     assert.equal(JSON.parse(staleRes.body).error, 'edge_generation_changed');
 });
 
+test('host-bound browser token mints only an admitted service mutation proof', async (t) => {
+    const { authHandlers, authService, createRoutePlan } = await withAuthModules(t, {
+        staticAuthMode: 'sso',
+    });
+    const originalGetSession = authService.getSession;
+    authService.getSession = (sessionId) => sessionId === 'sso-session'
+        ? {
+            user: {
+                id: 'sso:admin',
+                username: 'admin',
+                name: 'Admin',
+                email: 'admin@example.test',
+                roles: ['user', 'admin'],
+            },
+            tokens: null,
+            expiresAt: Date.now() + 60_000,
+        }
+        : null;
+    t.after(() => {
+        authService.getSession = originalGetSession;
+    });
+
+    const base = createRoutePlan();
+    const snapshot = {
+        ...base.snapshot,
+        compiled: {
+            agentMcpRoutes: {
+                'explorer.localhost': ['explorer', 'webAdmin'],
+            },
+        },
+    };
+    const routePlan = createRoutePlan({
+        ok: true,
+        kind: 'router-surface',
+        surface: 'browser-auth',
+        host: 'explorer.localhost',
+        hostSelection: {
+            kind: 'agent-root',
+            source: 'public-host',
+            host: 'explorer.localhost',
+            record: { routeKey: 'explorer' },
+        },
+        forwarding: { protocol: 'https', authority: 'explorer.localhost' },
+        snapshot,
+        lease: {
+            id: snapshot.generation,
+            snapshot,
+            commit: () => true,
+        },
+    });
+
+    const allowedReq = makeRequest({
+        method: 'GET',
+        url: '/auth/token?mutationRoute=webAdmin',
+        host: 'explorer.localhost',
+        cookie: 'ploinky_sso=sso-session',
+    });
+    const allowedRes = new MockResponse();
+    await authHandlers.handleAuthRoutes(
+        allowedReq,
+        allowedRes,
+        new URL(allowedReq.url, 'https://explorer.localhost'),
+        { routePlan },
+    );
+    const allowedBody = JSON.parse(allowedRes.body || '{}');
+    assert.equal(allowedRes.statusCode, 200, allowedRes.body);
+    assert.equal(allowedBody.browserMutation.hostRouteKey, 'explorer');
+    assert.equal(allowedBody.browserMutation.routeKey, 'webAdmin');
+    assert.equal(allowedBody.browserMutation.generation, snapshot.generation);
+
+    const unrelatedReq = makeRequest({
+        method: 'GET',
+        url: '/auth/token?mutationRoute=guestAgent',
+        host: 'explorer.localhost',
+        cookie: 'ploinky_sso=sso-session',
+    });
+    const unrelatedRes = new MockResponse();
+    await authHandlers.handleAuthRoutes(
+        unrelatedReq,
+        unrelatedRes,
+        new URL(unrelatedReq.url, 'https://explorer.localhost'),
+        { routePlan },
+    );
+    assert.equal(unrelatedRes.statusCode, 503);
+    assert.equal(JSON.parse(unrelatedRes.body).error, 'browser_mutation_route_denied');
+
+    const switchedReq = makeRequest({
+        method: 'GET',
+        url: '/auth/token?agent=webAdmin',
+        host: 'explorer.localhost',
+        cookie: 'ploinky_sso=sso-session',
+    });
+    const switchedRes = new MockResponse();
+    await authHandlers.handleAuthRoutes(
+        switchedReq,
+        switchedRes,
+        new URL(switchedReq.url, 'https://explorer.localhost'),
+        { routePlan },
+    );
+    assert.equal(switchedRes.statusCode, 400);
+    assert.equal(JSON.parse(switchedRes.body).error, 'auth_route_context_mismatch');
+});
+
 test('SSO login and callback keep every return target inside the normalized same-origin boundary', async (t) => {
     const { authHandlers, authService, createRoutePlan } = await withAuthModules(t, {
         staticAuthMode: 'sso',
@@ -508,7 +611,7 @@ test('browser token for an auth-none target uses static auth and binds proof to 
 
     const req = makeRequest({
         method: 'GET',
-        url: '/auth/token?agent=webAdmin',
+        url: '/auth/token?mutationRoute=webAdmin',
         cookie: 'ploinky_sso=sso-session',
     });
     const res = new MockResponse();
@@ -541,7 +644,7 @@ test('browser token for a guest target preserves an authenticated local session'
     }, 1);
     const req = makeRequest({
         method: 'GET',
-        url: '/auth/token?agent=webAssist',
+        url: '/auth/token?mutationRoute=webAssist',
         cookie: `ploinky_jwt=${token}`,
     });
     const res = new MockResponse();
