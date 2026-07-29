@@ -309,8 +309,10 @@ test('bounded start requires the external Dashboard URL and preserves normalized
         ['--debug', 'start', 'Agent', '8080'],
         19090,
         {
-            query(command, args, options) {
+            async stream(command, args, options) {
                 calls.push([command, args, options]);
+                options.stdout.write('[INFO] Debug mode enabled.\n');
+                options.stdout.write('[start] Dashboard: http://127.0.0.1:19090/dashboard\n');
                 return {
                     ok: true,
                     status: 0,
@@ -326,13 +328,15 @@ test('bounded start requires the external Dashboard URL and preserves normalized
     assert.deepEqual(calls[0][1].slice(0, 5), [
         'container', 'exec', '--env', 'PLOINKY_ROUTER_HOST_PORT=19090', '--user',
     ]);
+    assert.equal(calls[0][2].stdout, output);
+    assert.equal(calls[0][2].stderr, output);
     assert.equal(output.value.match(/Debug mode enabled/g)?.length, 1);
 
     const defaultTimeoutCalls = [];
     await runBoundedCoreStart(
         { name: 'podman' }, 'a'.repeat(64), ['start', 'Agent', '8080'], 8080,
         {
-            query(command, args, options) {
+            async stream(command, args, options) {
                 defaultTimeoutCalls.push(options);
                 return {
                     ok: true,
@@ -348,7 +352,7 @@ test('bounded start requires the external Dashboard URL and preserves normalized
 
     await assert.rejects(() => runBoundedCoreStart(
         { name: 'podman' }, 'a'.repeat(64), ['start', 'Agent', '8080'], 19090,
-        { query: () => ({ ok: true, status: 0, stdout: '[start] Dashboard: http://127.0.0.1:8080/dashboard\n', stderr: '' }) },
+        { stream: async () => ({ ok: true, status: 0, stdout: '[start] Dashboard: http://127.0.0.1:8080/dashboard\n', stderr: '' }) },
         { stdout: { write() {} }, stderr: { write() {} } },
     ), /public Dashboard URL/);
 });

@@ -2,9 +2,11 @@ import { readSecretsFile } from '../../cli/utils/security/encryptedSecretsFile.j
 import { createCloudflarePublicationApi } from './cloudflareApi.mjs';
 import { createCloudflaredConnector } from './connector.mjs';
 import { createCloudflarePublicationJournal } from './journal.mjs';
+import { createCloudflareManagedTunnelRegistry } from './managedTunnelRegistry.mjs';
 import {
     CLOUDFLARE_TERMINAL_SERVICE,
     CloudflarePublicationError,
+    materializeManagedCloudflarePublicationPlan,
     normalizeCloudflarePublicationDesired,
     publicationDigest,
     publicPlanSummary,
@@ -14,7 +16,12 @@ import {
 } from './publicationPlan.mjs';
 
 const REQUIRED_API_METHODS = Object.freeze([
+    'validateAccountZone',
     'validateScope',
+    'listTunnels',
+    'createTunnel',
+    'getTunnelToken',
+    'deleteTunnel',
     'putTunnelIngress',
     'readTunnelIngress',
     'listDnsRecords',
@@ -53,6 +60,15 @@ function sameScope(left, right) {
         && left.tunnelId === right.tunnelId);
 }
 
+function journalManagedIngressHostnames(journal) {
+    if (Array.isArray(journal?.managedIngressHostnames)) {
+        return journal.managedIngressHostnames.map(String);
+    }
+    return Array.isArray(journal?.managedDnsRecords)
+        ? journal.managedDnsRecords.map((entry) => String(entry.hostname || '')).filter(Boolean)
+        : [];
+}
+
 function connectionId(connection) {
     return String(connection?.id || connection?.uuid || connection?.client_id || '').trim();
 }
@@ -89,18 +105,112 @@ function asHostObject(plan) {
     return Object.fromEntries(plan.hosts.map(({ hostname, selector }) => [hostname, cloneJson(selector)]));
 }
 
+function ingressHostname(entry) {
+    return String(entry?.hostname || '').trim().toLowerCase();
+}
+
+function isTerminalIngress(entry) {
+    return Boolean(entry && typeof entry === 'object' && !Array.isArray(entry))
+        && !String(entry.hostname || '').trim()
+        && !String(entry.path || '').trim();
+}
+
+function splitTunnelIngress(ingress) {
+    if (!Array.isArray(ingress)) {
+        throw new CloudflarePublicationError('Cloudflare tunnel ingress is not an array', {
+            code: 'CLOUDFLARE_INGRESS_INVALID',
+            operation: 'reconcile-ingress',
+        });
+    }
+    if (!ingress.length) {
+        return {
+            rules: [],
+            terminal: { service: CLOUDFLARE_TERMINAL_SERVICE },
+        };
+    }
+    const terminal = ingress.at(-1);
+    if (!isTerminalIngress(terminal)
+        || ingress.slice(0, -1).some(isTerminalIngress)) {
+        throw new CloudflarePublicationError(
+            'Cloudflare tunnel ingress must have exactly one terminal catch-all rule at the end',
+            {
+                code: 'CLOUDFLARE_INGRESS_INVALID',
+                operation: 'reconcile-ingress',
+            },
+        );
+    }
+    return {
+        rules: ingress.slice(0, -1).map(cloneJson),
+        terminal: cloneJson(terminal),
+    };
+}
+
+export function mergeOwnedTunnelIngress({
+    installedIngress,
+    desiredIngress,
+    previouslyManagedHostnames = [],
+} = {}) {
+    const installed = splitTunnelIngress(installedIngress);
+    const desired = splitTunnelIngress(desiredIngress);
+    const desiredHostnames = new Set(
+        desired.rules.map(ingressHostname).filter(Boolean),
+    );
+    const ownedHostnames = new Set([
+        ...previouslyManagedHostnames.map((hostname) => String(hostname || '').trim().toLowerCase()),
+        ...desiredHostnames,
+    ].filter(Boolean));
+    const preserved = installed.rules.filter((entry) => {
+        const hostname = ingressHostname(entry);
+        return !hostname || !ownedHostnames.has(hostname);
+    });
+    return [
+        ...preserved,
+        ...desired.rules,
+        installed.terminal,
+    ];
+}
+
+function assertNoUnmanagedTunnelRoutes({
+    installedIngress,
+    desiredIngress,
+    previouslyManagedHostnames = [],
+} = {}) {
+    const installed = splitTunnelIngress(installedIngress);
+    const desired = splitTunnelIngress(desiredIngress);
+    const ownedHostnames = new Set([
+        ...previouslyManagedHostnames,
+        ...desired.rules.map(ingressHostname),
+    ].map((hostname) => String(hostname || '').trim().toLowerCase()).filter(Boolean));
+    const unmanaged = installed.rules.filter((entry) => {
+        const hostname = ingressHostname(entry);
+        return !hostname || !ownedHostnames.has(hostname);
+    });
+    if (unmanaged.length) {
+        throw new CloudflarePublicationError(
+            'Refusing to start an integrated connector on a tunnel with routes not owned by this Ploinky Box; select a dedicated tunnel or migrate every route into this desired state',
+            {
+                code: 'CLOUDFLARE_SHARED_TUNNEL_UNSAFE',
+                operation: 'reconcile-ingress',
+            },
+        );
+    }
+}
+
 function journalValue(plan, phase, {
+    managedIngressHostnames = plan.hosts?.map((entry) => entry.hostname) || [],
     managedDnsRecords = [],
+    ingress = plan.ingress,
     lastError = null,
 } = {}) {
-    const cloudflare = plan.management === 'api-managed';
+    const cloudflare = plan.mode === 'cloudflare' && plan.management === 'api-managed';
     return {
         mode: plan.mode,
         configurationGeneration: plan.configurationGeneration,
         desiredDigest: plan.desiredDigest,
         phase,
         scope: cloudflare ? plan.scope : null,
-        ingressDigest: cloudflare ? publicationDigest(plan.ingress) : '',
+        ingressDigest: cloudflare ? publicationDigest(ingress) : '',
+        managedIngressHostnames: cloudflare ? managedIngressHostnames : [],
         managedDnsRecords: cloudflare ? managedDnsRecords : [],
         lastError,
     };
@@ -160,6 +270,20 @@ function resolveSecretPair(secretStore, plan) {
     return { tunnelToken, apiToken };
 }
 
+function resolveApiSecret(secretStore, plan) {
+    const secrets = readSecretStore(secretStore);
+    const apiToken = Object.prototype.hasOwnProperty.call(secrets, plan.secretHandles.apiToken)
+        ? String(secrets[plan.secretHandles.apiToken] || '').trim()
+        : '';
+    if (!apiToken) {
+        throw new CloudflarePublicationError('Cloudflare API secret handle is unresolved', {
+            code: 'CLOUDFLARE_API_SECRET_UNRESOLVED',
+            operation: 'resolve-secrets',
+        });
+    }
+    return apiToken;
+}
+
 async function delay(milliseconds, signal) {
     if (signal?.aborted) throw signal.reason || new Error('aborted');
     await new Promise((resolve, reject) => {
@@ -214,6 +338,7 @@ export class CloudflarePublicationController {
         apiFactory,
         connector,
         journal,
+        managedTunnelRegistry,
         secretStore,
         routeCoordinator,
         probeConnector,
@@ -230,6 +355,13 @@ export class CloudflarePublicationController {
         }
         requireMethods(connector, 'cloudflared connector', ['start', 'stop', 'isRunning']);
         requireMethods(journal, 'Cloudflare publication journal', ['read', 'write']);
+        requireMethods(managedTunnelRegistry, 'Cloudflare managed tunnel registry', [
+            'findDesired',
+            'findScope',
+            'begin',
+            'commit',
+            'remove',
+        ]);
         requireMethods(secretStore, 'Cloudflare secret store', ['readAll']);
         requireMethods(routeCoordinator, 'Cloudflare route coordinator', ['inactivate', 'commit']);
         if (typeof probeConnector !== 'function') throw new TypeError('Cloudflare publication requires probeConnector()');
@@ -238,6 +370,7 @@ export class CloudflarePublicationController {
         this.apiFactory = apiFactory;
         this.connector = connector;
         this.journal = journal;
+        this.managedTunnelRegistry = managedTunnelRegistry;
         this.secretStore = secretStore;
         this.routeCoordinator = routeCoordinator;
         this.probeConnector = probeConnector;
@@ -283,6 +416,200 @@ export class CloudflarePublicationController {
             requireMethods(this.api, 'Cloudflare publication API', REQUIRED_API_METHODS);
         }
         return this.api;
+    }
+
+    async ensureManagedTunnel(plan, { apiToken, signal } = {}) {
+        const desired = {
+            accountId: plan.accountId,
+            zoneId: plan.zoneId,
+            tunnelName: plan.managedTunnel.name,
+            deleteOnTeardown: plan.managedTunnel.deleteOnTeardown,
+        };
+        let allocation = this.managedTunnelRegistry.begin(desired);
+        const candidates = (await this.api.listTunnels({
+            apiToken,
+            accountId: plan.accountId,
+            name: allocation.cloudflareName,
+            signal,
+        })).filter((tunnel) => (
+            String(tunnel?.name || '') === allocation.cloudflareName
+            && !tunnel?.deleted_at
+        ));
+        if (candidates.length > 1) {
+            throw new CloudflarePublicationError(
+                `Managed tunnel name ${allocation.cloudflareName} resolved ambiguously`,
+                {
+                    code: 'CLOUDFLARE_MANAGED_TUNNEL_AMBIGUOUS',
+                    operation: 'resolve-managed-tunnel',
+                },
+            );
+        }
+        let tunnel = candidates[0] || null;
+        if (allocation.tunnelId && tunnel
+            && String(tunnel.id || '') !== allocation.tunnelId) {
+            throw new CloudflarePublicationError(
+                'Cloudflare managed tunnel identity changed outside Ploinky',
+                {
+                    code: 'CLOUDFLARE_MANAGED_TUNNEL_OWNERSHIP_LOST',
+                    operation: 'resolve-managed-tunnel',
+                },
+            );
+        }
+        if (allocation.tunnelId && !tunnel) {
+            throw new CloudflarePublicationError(
+                'Cloudflare managed tunnel no longer exists under its Ploinky ownership record',
+                {
+                    code: 'CLOUDFLARE_MANAGED_TUNNEL_OWNERSHIP_LOST',
+                    operation: 'resolve-managed-tunnel',
+                },
+            );
+        }
+        if (!tunnel) {
+            tunnel = await this.api.createTunnel({
+                apiToken,
+                accountId: plan.accountId,
+                name: allocation.cloudflareName,
+                signal,
+            });
+        }
+        const tunnelId = String(tunnel?.id || '').trim();
+        const accountId = String(tunnel?.account_tag || plan.accountId);
+        const configSource = String(tunnel?.config_src || '').trim();
+        if (!tunnelId
+            || accountId !== plan.accountId
+            || String(tunnel?.name || '') !== allocation.cloudflareName
+            || tunnel?.deleted_at
+            || (configSource && configSource !== 'cloudflare')
+            || (!configSource && tunnel?.remote_config === false)) {
+            throw new CloudflarePublicationError(
+                'Cloudflare returned an invalid managed tunnel allocation',
+                {
+                    code: 'CLOUDFLARE_MANAGED_TUNNEL_INVALID',
+                    operation: 'resolve-managed-tunnel',
+                },
+            );
+        }
+        allocation = this.managedTunnelRegistry.commit({
+            ownershipId: allocation.ownershipId,
+            tunnelId,
+        });
+        const tunnelToken = await this.api.getTunnelToken({
+            apiToken,
+            accountId: plan.accountId,
+            tunnelId,
+            signal,
+        });
+        this.safeAudit('cloudflare-managed-tunnel-ready', {
+            accountId: plan.accountId,
+            zoneId: plan.zoneId,
+            tunnelId,
+            tunnelName: allocation.cloudflareName,
+            created: candidates.length === 0,
+        });
+        return {
+            allocation,
+            plan: materializeManagedCloudflarePublicationPlan(plan, tunnelId),
+            tunnelToken,
+        };
+    }
+
+    materializeManagedTeardown(plan, currentJournal) {
+        let allocation = this.managedTunnelRegistry.findDesired({
+            accountId: plan.accountId,
+            zoneId: plan.zoneId,
+            tunnelName: plan.managedTunnel.name,
+        });
+        if (!allocation?.tunnelId) {
+            if (currentJournal?.mode !== 'cloudflare') return plan;
+            throw new CloudflarePublicationError(
+                'Managed tunnel teardown requires the exact Ploinky ownership record',
+                {
+                    code: 'CLOUDFLARE_MANAGED_TUNNEL_OWNERSHIP_REQUIRED',
+                    operation: 'resolve-managed-tunnel',
+                },
+            );
+        }
+        if (currentJournal?.mode === 'cloudflare'
+            && (allocation.tunnelId !== currentJournal.scope?.tunnelId
+                || allocation.accountId !== currentJournal.scope?.accountId
+                || allocation.zoneId !== currentJournal.scope?.zoneId)) {
+            throw new CloudflarePublicationError(
+                'Managed tunnel teardown does not match the selected Cloudflare scope',
+                {
+                    code: 'CLOUDFLARE_MANAGED_TUNNEL_OWNERSHIP_REQUIRED',
+                    operation: 'resolve-managed-tunnel',
+                },
+            );
+        }
+        allocation = this.managedTunnelRegistry.begin({
+            accountId: plan.accountId,
+            zoneId: plan.zoneId,
+            tunnelName: plan.managedTunnel.name,
+            deleteOnTeardown: plan.managedTunnel.deleteOnTeardown,
+        });
+        return materializeManagedCloudflarePublicationPlan(plan, allocation.tunnelId);
+    }
+
+    async deleteManagedTunnelIfOwned({ scope, apiToken, signal } = {}) {
+        const allocation = this.managedTunnelRegistry.findScope(scope);
+        if (!allocation?.deleteOnTeardown) return false;
+        const candidates = (await this.api.listTunnels({
+            apiToken,
+            accountId: scope.accountId,
+            name: allocation.cloudflareName,
+            signal,
+        })).filter((tunnel) => (
+            String(tunnel?.name || '') === allocation.cloudflareName
+            && !tunnel?.deleted_at
+        ));
+        if (candidates.length > 1
+            || (candidates.length === 1 && String(candidates[0]?.id || '') !== allocation.tunnelId)) {
+            throw new CloudflarePublicationError(
+                'Refusing to delete a managed tunnel after Cloudflare ownership changed',
+                {
+                    code: 'CLOUDFLARE_MANAGED_TUNNEL_OWNERSHIP_LOST',
+                    operation: 'delete-managed-tunnel',
+                },
+            );
+        }
+        if (candidates.length === 1) {
+            await this.api.deleteTunnel({
+                apiToken,
+                accountId: scope.accountId,
+                tunnelId: allocation.tunnelId,
+                signal,
+            });
+        }
+        const remaining = (await this.api.listTunnels({
+            apiToken,
+            accountId: scope.accountId,
+            name: allocation.cloudflareName,
+            signal,
+        })).filter((tunnel) => (
+            String(tunnel?.name || '') === allocation.cloudflareName
+            && !tunnel?.deleted_at
+        ));
+        if (remaining.length) {
+            throw new CloudflarePublicationError(
+                'Cloudflare managed tunnel deletion did not verify',
+                {
+                    code: 'CLOUDFLARE_MANAGED_TUNNEL_DELETE_UNVERIFIED',
+                    operation: 'delete-managed-tunnel',
+                    retryable: true,
+                },
+            );
+        }
+        this.managedTunnelRegistry.remove({
+            ownershipId: allocation.ownershipId,
+            tunnelId: allocation.tunnelId,
+        });
+        this.safeAudit('cloudflare-managed-tunnel-deleted', {
+            accountId: allocation.accountId,
+            zoneId: allocation.zoneId,
+            tunnelId: allocation.tunnelId,
+            tunnelName: allocation.cloudflareName,
+        });
+        return true;
     }
 
     async transition(patch) {
@@ -349,7 +676,9 @@ export class CloudflarePublicationController {
         this.currentAbort = abortController;
         let plan = null;
         let secretPair = null;
+        let managedIngressHostnames = [];
         let managedDnsRecords = [];
+        let reconciledIngress = null;
         let currentJournal = null;
         let adoptSelectedLocalState = false;
         await this.connector.stop('reconcile');
@@ -366,16 +695,43 @@ export class CloudflarePublicationController {
             // to tear down; every Cloudflare transition still inactivates first.
             if (!adoptSelectedLocalState) await this.inactivate(input, reason);
             this.lastInput = cloneJson(input);
+            if (plan.tunnelManagement === 'ploinky-managed') {
+                const apiToken = resolveApiSecret(this.secretStore, plan);
+                const api = this.requireApi();
+                const signal = abortController.signal;
+                secretPair = { apiToken };
+                await api.validateAccountZone({
+                    apiToken,
+                    accountId: plan.accountId,
+                    zoneId: plan.zoneId,
+                    signal,
+                });
+                if (plan.mode === 'cloudflare') {
+                    const managed = await this.ensureManagedTunnel(plan, { apiToken, signal });
+                    plan = managed.plan;
+                    secretPair = { apiToken, tunnelToken: managed.tunnelToken };
+                } else {
+                    plan = this.materializeManagedTeardown(plan, currentJournal);
+                }
+            }
             const summary = publicPlanSummary(plan);
             managedDnsRecords = plan.management === 'api-managed'
                 && sameScope(currentJournal?.scope, plan.scope)
                 ? currentJournal.managedDnsRecords.map((entry) => ({ ...entry }))
                 : [];
+            managedIngressHostnames = plan.management === 'api-managed'
+                && sameScope(currentJournal?.scope, plan.scope)
+                ? journalManagedIngressHostnames(currentJournal)
+                : [];
             if (plan.mode === 'local-only') {
                 if (currentJournal?.mode === 'cloudflare') {
                     let previousPlan;
                     try {
-                        previousPlan = normalizeCloudflarePublicationDesired(this.lastApiManagedInput || {});
+                        previousPlan = plan.tunnelManagement === 'ploinky-managed' && plan.scope
+                            ? plan
+                            : normalizeCloudflarePublicationDesired(
+                                this.lastApiManagedInput || input || {},
+                            );
                     } catch (_) {
                         previousPlan = null;
                     }
@@ -389,7 +745,9 @@ export class CloudflarePublicationController {
                             },
                         );
                     }
-                    secretPair = resolveSecretPair(this.secretStore, previousPlan);
+                    if (previousPlan.tunnelManagement !== 'ploinky-managed') {
+                        secretPair = resolveSecretPair(this.secretStore, previousPlan);
+                    }
                     this.requireApi();
                     await this.clearPreviousScope({
                         previous: currentJournal,
@@ -417,7 +775,14 @@ export class CloudflarePublicationController {
                         canonicalScheme: 'http',
                     });
                 }
-                this.journal.write(journalValue(plan, 'local-only'));
+                currentJournal = this.journal.write(journalValue(plan, 'local-only'));
+                if (plan.tunnelManagement === 'ploinky-managed' && plan.scope) {
+                    await this.deleteManagedTunnelIfOwned({
+                        scope: plan.scope,
+                        apiToken: secretPair.apiToken,
+                        signal: abortController.signal,
+                    });
+                }
                 this.lastApiManagedInput = null;
                 this.safeAudit('cloudflare-local-only', summary);
                 return this.transition({
@@ -542,7 +907,9 @@ export class CloudflarePublicationController {
                 error: null,
                 retry: null,
             });
-            secretPair = resolveSecretPair(this.secretStore, plan);
+            if (plan.tunnelManagement !== 'ploinky-managed') {
+                secretPair = resolveSecretPair(this.secretStore, plan);
+            }
             const { apiToken, tunnelToken } = secretPair;
             const signal = abortController.signal;
             this.assertCurrent(revision, signal);
@@ -561,10 +928,42 @@ export class CloudflarePublicationController {
             managedDnsRecords = sameScope(currentJournal?.scope, plan.scope)
                 ? currentJournal.managedDnsRecords.map((entry) => ({ ...entry }))
                 : [];
-            this.journal.write(journalValue(plan, 'prepared', { managedDnsRecords }));
-            await api.putTunnelIngress({ apiToken, ...plan.scope, ingress: plan.ingress, signal });
+            managedIngressHostnames = sameScope(currentJournal?.scope, plan.scope)
+                ? journalManagedIngressHostnames(currentJournal)
+                : [];
+            const installedIngress = await api.readTunnelIngress({
+                apiToken,
+                ...plan.scope,
+                signal,
+            });
+            assertNoUnmanagedTunnelRoutes({
+                installedIngress,
+                desiredIngress: plan.ingress,
+                previouslyManagedHostnames: managedIngressHostnames,
+            });
+            reconciledIngress = mergeOwnedTunnelIngress({
+                installedIngress,
+                desiredIngress: plan.ingress,
+                previouslyManagedHostnames: managedIngressHostnames,
+            });
+            managedIngressHostnames = plan.hosts.map((entry) => entry.hostname);
+            this.journal.write(journalValue(plan, 'prepared', {
+                managedIngressHostnames,
+                managedDnsRecords,
+                ingress: reconciledIngress,
+            }));
+            await api.putTunnelIngress({
+                apiToken,
+                ...plan.scope,
+                ingress: reconciledIngress,
+                signal,
+            });
             this.assertCurrent(revision, signal);
-            this.journal.write(journalValue(plan, 'ingress-applied', { managedDnsRecords }));
+            this.journal.write(journalValue(plan, 'ingress-applied', {
+                managedIngressHostnames,
+                managedDnsRecords,
+                ingress: reconciledIngress,
+            }));
 
             for (const dns of plan.dns) {
                 const existingManaged = managedDnsRecords.find((entry) => entry.hostname === dns.hostname) || null;
@@ -573,18 +972,40 @@ export class CloudflarePublicationController {
                     ...managedDnsRecords.filter((entry) => entry.hostname !== dns.hostname),
                     saved,
                 ].sort((left, right) => left.hostname.localeCompare(right.hostname));
-                this.journal.write(journalValue(plan, 'ingress-applied', { managedDnsRecords }));
+                this.journal.write(journalValue(plan, 'ingress-applied', {
+                    managedIngressHostnames,
+                    managedDnsRecords,
+                    ingress: reconciledIngress,
+                }));
             }
             const desiredHostnames = new Set(plan.dns.map((entry) => entry.hostname));
             for (const stale of managedDnsRecords.filter((entry) => !desiredHostnames.has(entry.hostname))) {
                 await this.removeOwnedDns({ record: stale, apiToken, signal });
                 managedDnsRecords = managedDnsRecords.filter((entry) => entry.hostname !== stale.hostname);
-                this.journal.write(journalValue(plan, 'ingress-applied', { managedDnsRecords }));
+                this.journal.write(journalValue(plan, 'ingress-applied', {
+                    managedIngressHostnames,
+                    managedDnsRecords,
+                    ingress: reconciledIngress,
+                }));
             }
-            this.journal.write(journalValue(plan, 'dns-reconciled', { managedDnsRecords }));
-            await this.verifyRemote({ plan, apiToken, managedDnsRecords, signal });
+            this.journal.write(journalValue(plan, 'dns-reconciled', {
+                managedIngressHostnames,
+                managedDnsRecords,
+                ingress: reconciledIngress,
+            }));
+            await this.verifyRemote({
+                plan,
+                apiToken,
+                managedDnsRecords,
+                expectedIngress: reconciledIngress,
+                signal,
+            });
             this.assertCurrent(revision, signal);
-            this.journal.write(journalValue(plan, 'remote-verified', { managedDnsRecords }));
+            this.journal.write(journalValue(plan, 'remote-verified', {
+                managedIngressHostnames,
+                managedDnsRecords,
+                ingress: reconciledIngress,
+            }));
 
             await this.routeCoordinator.commit({
                 mode: 'cloudflare',
@@ -594,11 +1015,19 @@ export class CloudflarePublicationController {
                 canonicalScheme: 'https',
             });
             this.assertCurrent(revision, signal);
-            this.journal.write(journalValue(plan, 'routes-committed', { managedDnsRecords }));
+            this.journal.write(journalValue(plan, 'routes-committed', {
+                managedIngressHostnames,
+                managedDnsRecords,
+                ingress: reconciledIngress,
+            }));
 
             const baselineConnections = await api.listTunnelConnections({ apiToken, ...plan.scope, signal });
             const baselineConnectionIds = baselineConnections.map(connectionId).filter(Boolean);
-            this.journal.write(journalValue(plan, 'connector-starting', { managedDnsRecords }));
+            this.journal.write(journalValue(plan, 'connector-starting', {
+                managedIngressHostnames,
+                managedDnsRecords,
+                ingress: reconciledIngress,
+            }));
             await this.transition({
                 connectorState: 'starting',
                 reconciliation: { desiredDigest: plan.desiredDigest, phase: 'connector-starting' },
@@ -655,7 +1084,11 @@ export class CloudflarePublicationController {
                 canonicalScheme: 'https',
             });
             this.assertCurrent(revision, signal);
-            this.journal.write(journalValue(plan, 'ready', { managedDnsRecords }));
+            this.journal.write(journalValue(plan, 'ready', {
+                managedIngressHostnames,
+                managedDnsRecords,
+                ingress: reconciledIngress,
+            }));
             this.safeAudit('ready', summary);
             return await this.transition({
                 state: 'ready',
@@ -706,7 +1139,9 @@ export class CloudflarePublicationController {
             } else if (plan?.management === 'api-managed') {
                 try {
                     this.journal.write(journalValue(plan, 'error', {
+                        managedIngressHostnames,
                         managedDnsRecords,
+                        ...(reconciledIngress ? { ingress: reconciledIngress } : {}),
                         lastError: statusError,
                     }));
                 } catch (_) {}
@@ -832,14 +1267,24 @@ export class CloudflarePublicationController {
 
     async clearPreviousScope({ previous, apiToken, signal, revision }) {
         await this.api.validateScope({ apiToken, ...previous.scope, signal });
+        const installedBefore = await this.api.readTunnelIngress({
+            apiToken,
+            ...previous.scope,
+            signal,
+        });
+        const clearedIngress = mergeOwnedTunnelIngress({
+            installedIngress: installedBefore,
+            desiredIngress: [{ service: CLOUDFLARE_TERMINAL_SERVICE }],
+            previouslyManagedHostnames: journalManagedIngressHostnames(previous),
+        });
         await this.api.putTunnelIngress({
             apiToken,
             ...previous.scope,
-            ingress: [{ service: CLOUDFLARE_TERMINAL_SERVICE }],
+            ingress: clearedIngress,
             signal,
         });
         const installed = await this.api.readTunnelIngress({ apiToken, ...previous.scope, signal });
-        if (stablePublicationJson(installed) !== stablePublicationJson([{ service: CLOUDFLARE_TERMINAL_SERVICE }])) {
+        if (stablePublicationJson(installed) !== stablePublicationJson(clearedIngress)) {
             throw new CloudflarePublicationError('Previous tunnel ingress teardown did not verify', {
                 code: 'CLOUDFLARE_PREVIOUS_SCOPE_NOT_CLEARED',
                 operation: 'clear-previous-scope',
@@ -853,6 +1298,8 @@ export class CloudflarePublicationController {
             this.journal.write({
                 ...previous,
                 phase: 'previous-scope-cleared',
+                ingressDigest: publicationDigest(clearedIngress),
+                managedIngressHostnames: [],
                 managedDnsRecords: remaining,
                 lastError: null,
             });
@@ -860,9 +1307,15 @@ export class CloudflarePublicationController {
         this.assertCurrent(revision, signal);
     }
 
-    async verifyRemote({ plan, apiToken, managedDnsRecords, signal }) {
+    async verifyRemote({
+        plan,
+        apiToken,
+        managedDnsRecords,
+        expectedIngress = plan.ingress,
+        signal,
+    }) {
         const installedIngress = await this.api.readTunnelIngress({ apiToken, ...plan.scope, signal });
-        if (stablePublicationJson(installedIngress) !== stablePublicationJson(plan.ingress)) {
+        if (stablePublicationJson(installedIngress) !== stablePublicationJson(expectedIngress)) {
             throw new CloudflarePublicationError('Cloudflare tunnel ingress does not match the selected desired state', {
                 code: 'CLOUDFLARE_INGRESS_MISMATCH',
                 operation: 'verify-remote',
@@ -890,6 +1343,18 @@ export class CloudflarePublicationController {
         if (this.state.state !== 'ready') return;
         let plan = null;
         try { plan = normalizeCloudflarePublicationDesired(this.lastInput); } catch (_) {}
+        if (plan?.tunnelManagement === 'ploinky-managed') {
+            try {
+                const allocation = this.managedTunnelRegistry.findDesired({
+                    accountId: plan.accountId,
+                    zoneId: plan.zoneId,
+                    tunnelName: plan.managedTunnel.name,
+                });
+                if (allocation?.tunnelId) {
+                    plan = materializeManagedCloudflarePublicationPlan(plan, allocation.tunnelId);
+                }
+            } catch (_) {}
+        }
         try {
             await this.inactivate(this.lastInput, 'cloudflared-exit');
             if (plan?.management === 'connector-only') {
@@ -924,12 +1389,21 @@ export class CloudflarePublicationController {
         if (plan?.management === 'api-managed') {
             try {
                 const existing = this.journal.read();
-                this.journal.write(journalValue(plan, 'error', {
-                    managedDnsRecords: sameScope(existing?.scope, plan.scope)
-                        ? existing.managedDnsRecords
-                        : [],
-                    lastError: statusError,
-                }));
+                if (existing?.mode === 'cloudflare'
+                    && sameScope(existing.scope, plan.scope)) {
+                    this.journal.write({
+                        ...existing,
+                        configurationGeneration: plan.configurationGeneration,
+                        desiredDigest: plan.desiredDigest,
+                        phase: 'error',
+                        lastError: statusError,
+                    });
+                } else {
+                    this.journal.write(journalValue(plan, 'error', {
+                        managedDnsRecords: [],
+                        lastError: statusError,
+                    }));
+                }
             } catch (_) {}
         }
         await this.transition({
@@ -984,6 +1458,7 @@ export function createCloudflarePublicationController({
     apiFactory = createCloudflarePublicationApi,
     connector = createCloudflaredConnector(),
     journal = createCloudflarePublicationJournal({ workspaceRoot }),
+    managedTunnelRegistry = createCloudflareManagedTunnelRegistry({ workspaceRoot }),
     secretStore = createEncryptedCloudflareSecretStore(),
     probeConnector = createCloudflareConnectorProbe(),
     restartPolicy,
@@ -993,6 +1468,7 @@ export function createCloudflarePublicationController({
         apiFactory,
         connector,
         journal,
+        managedTunnelRegistry,
         secretStore,
         routeCoordinator,
         probeConnector,

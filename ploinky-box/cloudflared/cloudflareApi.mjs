@@ -42,6 +42,17 @@ function normalizeRecords(result) {
     return Array.isArray(result) ? result : [];
 }
 
+function normalizeTunnels(result) {
+    return Array.isArray(result) ? result : [];
+}
+
+function tokenVerificationPath(apiToken, accountId) {
+    const token = String(apiToken || '').trim();
+    return token.startsWith('cfat_')
+        ? `/accounts/${encode(accountId)}/tokens/verify`
+        : '/user/tokens/verify';
+}
+
 export class CloudflarePublicationApiClient {
     constructor({
         fetchImpl = globalThis.fetch,
@@ -110,24 +121,20 @@ export class CloudflarePublicationApiClient {
         }
     }
 
-    async validateScope({ apiToken, accountId, zoneId, tunnelId, signal } = {}) {
-        const tokenStatus = await this.request(apiToken, 'GET', '/user/tokens/verify', {
-            operation: 'verify-api-token',
-            signal,
-        });
+    async validateAccountZone({ apiToken, accountId, zoneId, signal } = {}) {
+        const tokenStatus = await this.request(
+            apiToken,
+            'GET',
+            tokenVerificationPath(apiToken, accountId),
+            {
+                operation: 'verify-api-token',
+                signal,
+            },
+        );
         if (String(tokenStatus?.status || '').toLowerCase() !== 'active') {
             throw new CloudflarePublicationError('Cloudflare API token is not active', {
                 code: 'CLOUDFLARE_API_TOKEN_INACTIVE',
                 operation: 'verify-api-token',
-            });
-        }
-        const tunnel = await this.readTunnel({ apiToken, accountId, tunnelId, signal });
-        if (String(tunnel?.id || '') !== String(tunnelId)
-            || (tunnel?.account_tag && String(tunnel.account_tag) !== String(accountId))
-            || tunnel?.deleted_at) {
-            throw new CloudflarePublicationError('Selected Cloudflare tunnel does not exist in the configured account', {
-                code: 'CLOUDFLARE_TUNNEL_SCOPE_INVALID',
-                operation: 'read-existing-tunnel',
             });
         }
         const zone = await this.readZone({ apiToken, zoneId, signal });
@@ -139,7 +146,26 @@ export class CloudflarePublicationApiClient {
                 operation: 'read-zone',
             });
         }
-        return { tokenStatus: 'active', tunnel, zone };
+        return { tokenStatus: 'active', zone };
+    }
+
+    async validateScope({ apiToken, accountId, zoneId, tunnelId, signal } = {}) {
+        const validated = await this.validateAccountZone({
+            apiToken,
+            accountId,
+            zoneId,
+            signal,
+        });
+        const tunnel = await this.readTunnel({ apiToken, accountId, tunnelId, signal });
+        if (String(tunnel?.id || '') !== String(tunnelId)
+            || (tunnel?.account_tag && String(tunnel.account_tag) !== String(accountId))
+            || tunnel?.deleted_at) {
+            throw new CloudflarePublicationError('Selected Cloudflare tunnel does not exist in the configured account', {
+                code: 'CLOUDFLARE_TUNNEL_SCOPE_INVALID',
+                operation: 'read-existing-tunnel',
+            });
+        }
+        return { ...validated, tunnel };
     }
 
     readTunnel({ apiToken, accountId, tunnelId, signal } = {}) {
@@ -148,6 +174,58 @@ export class CloudflarePublicationApiClient {
             'GET',
             `/accounts/${encode(accountId)}/cfd_tunnel/${encode(tunnelId)}`,
             { operation: 'read-existing-tunnel', signal },
+        );
+    }
+
+    async listTunnels({ apiToken, accountId, name, signal } = {}) {
+        const query = new URLSearchParams({
+            name: String(name),
+            is_deleted: 'false',
+            per_page: '100',
+        });
+        const result = await this.request(
+            apiToken,
+            'GET',
+            `/accounts/${encode(accountId)}/cfd_tunnel?${query.toString()}`,
+            { operation: 'list-managed-tunnels', signal },
+        );
+        return normalizeTunnels(result);
+    }
+
+    createTunnel({ apiToken, accountId, name, signal } = {}) {
+        return this.request(apiToken, 'POST', `/accounts/${encode(accountId)}/cfd_tunnel`, {
+            body: {
+                name: String(name),
+                config_src: 'cloudflare',
+            },
+            operation: 'create-managed-tunnel',
+            signal,
+        });
+    }
+
+    async getTunnelToken({ apiToken, accountId, tunnelId, signal } = {}) {
+        const token = await this.request(
+            apiToken,
+            'GET',
+            `/accounts/${encode(accountId)}/cfd_tunnel/${encode(tunnelId)}/token`,
+            { operation: 'get-managed-tunnel-token', signal },
+        );
+        const normalized = String(token || '').trim();
+        if (!normalized) {
+            throw new CloudflarePublicationError('Cloudflare returned an empty managed tunnel token', {
+                code: 'CLOUDFLARE_MANAGED_TUNNEL_TOKEN_INVALID',
+                operation: 'get-managed-tunnel-token',
+            });
+        }
+        return normalized;
+    }
+
+    deleteTunnel({ apiToken, accountId, tunnelId, signal } = {}) {
+        return this.request(
+            apiToken,
+            'DELETE',
+            `/accounts/${encode(accountId)}/cfd_tunnel/${encode(tunnelId)}`,
+            { operation: 'delete-managed-tunnel', signal },
         );
     }
 

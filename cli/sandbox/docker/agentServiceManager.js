@@ -2021,6 +2021,7 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
                 containerName,
                 containerId: reuseInspection.id,
                 hostPort,
+                createdByThisLaunch: false,
                 registryRecord: structuredClone(registryRecord),
             };
         }
@@ -2201,6 +2202,7 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
             containerId: started?.containerId,
             runtimeNetwork: structuredClone(manifestNetwork),
             hostPort: returnPort,
+            createdByThisLaunch: true,
             registryRecord: structuredClone(agents[containerName]),
             requiresEdgeActivation,
             ...(runtimeIdentity.preparationLease ? { preparationLease: runtimeIdentity.preparationLease } : {}),

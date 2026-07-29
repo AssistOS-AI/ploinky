@@ -26,6 +26,7 @@ const JOURNAL_KEYS = Object.freeze([
     'phase',
     'scope',
     'ingressDigest',
+    'managedIngressHostnames',
     'managedDnsRecords',
     'lastError',
     'updatedAt',
@@ -120,6 +121,17 @@ function normalizeManagedDnsRecords(value, scope) {
     }).sort((left, right) => left.hostname.localeCompare(right.hostname));
 }
 
+function normalizeManagedIngressHostnames(value) {
+    if (!Array.isArray(value)) {
+        fail('Cloudflare reconciliation journal has invalid ingress hostnames');
+    }
+    const hostnames = value.map(normalizePublicHostname);
+    if (new Set(hostnames).size !== hostnames.length) {
+        fail('Cloudflare reconciliation journal contains duplicate ingress hostnames');
+    }
+    return hostnames.sort();
+}
+
 function normalizeError(value) {
     if (value === undefined || value === null) return null;
     if (!hasExactKeys(value, ERROR_KEYS) || typeof value.retryable !== 'boolean') {
@@ -134,7 +146,9 @@ function normalizeError(value) {
 }
 
 export function normalizeCloudflareJournal(value) {
-    if (!hasExactKeys(value, JOURNAL_KEYS)) {
+    const legacyKeys = JOURNAL_KEYS.filter((key) => key !== 'managedIngressHostnames');
+    const legacy = hasExactKeys(value, legacyKeys);
+    if (!legacy && !hasExactKeys(value, JOURNAL_KEYS)) {
         fail('Cloudflare reconciliation journal has an invalid contract');
     }
     const mode = safeString(value.mode, 'mode', { maximum: 32 });
@@ -142,6 +156,7 @@ export function normalizeCloudflareJournal(value) {
     const phase = safeString(value.phase, 'phase', { maximum: 64 });
     if (!PHASES.has(phase)) fail('Cloudflare reconciliation journal has invalid phase');
     const scope = normalizeScope(value.scope, { optional: mode === 'local-only' });
+    const managedDnsRecords = normalizeManagedDnsRecords(value.managedDnsRecords, scope);
     const normalized = {
         mode,
         configurationGeneration: normalizeDigest(value.configurationGeneration, 'configuration generation'),
@@ -151,7 +166,10 @@ export function normalizeCloudflareJournal(value) {
         ingressDigest: mode === 'cloudflare'
             ? normalizeDigest(value.ingressDigest, 'ingress digest')
             : safeString(value.ingressDigest, 'ingress digest', { maximum: 71, optional: true }),
-        managedDnsRecords: normalizeManagedDnsRecords(value.managedDnsRecords, scope),
+        managedIngressHostnames: legacy
+            ? managedDnsRecords.map((entry) => entry.hostname)
+            : normalizeManagedIngressHostnames(value.managedIngressHostnames),
+        managedDnsRecords,
         lastError: normalizeError(value.lastError),
         updatedAt: normalizeTimestamp(value.updatedAt),
     };
@@ -159,6 +177,7 @@ export function normalizeCloudflareJournal(value) {
         if (value.scope !== null
             || normalized.phase !== 'local-only'
             || normalized.ingressDigest !== ''
+            || normalized.managedIngressHostnames.length !== 0
             || normalized.managedDnsRecords.length !== 0
             || normalized.lastError !== null) {
             fail('Cloudflare reconciliation journal has inconsistent local-only state');

@@ -4,6 +4,7 @@ import test from 'node:test';
 import {
     CLOUDFLARE_ORIGIN,
     CLOUDFLARE_TERMINAL_SERVICE,
+    materializeManagedCloudflarePublicationPlan,
     normalizeCloudflarePublicationDesired,
     publicPlanSummary,
     redactCloudflareText,
@@ -19,6 +20,12 @@ const COMPLETE = Object.freeze({
 });
 const CONNECTOR_ONLY = Object.freeze({
     tunnelTokenSecret: 'publication/cloudflare-connector',
+});
+const MANAGED = Object.freeze({
+    accountId: 'account_123',
+    zoneId: 'zone_123',
+    tunnelName: 'explorer-qa',
+    apiTokenSecret: 'publication/cloudflare-api',
 });
 const HOSTS = Object.freeze({
     'office.example.test': {
@@ -45,6 +52,7 @@ test('complete tuple produces deterministic fixed-origin ingress and CNAME plan'
     });
     assert.equal(plan.mode, 'cloudflare');
     assert.equal(plan.management, 'api-managed');
+    assert.equal(plan.tunnelManagement, 'existing');
     assert.deepEqual(plan.hosts.map((entry) => entry.hostname), [
         'explorer.example.test',
         'office.example.test',
@@ -64,6 +72,42 @@ test('complete tuple produces deterministic fixed-origin ingress and CNAME plan'
             'office.example.test': HOSTS['office.example.test'],
         },
     }).desiredDigest);
+});
+
+test('managed tunnel desired state materializes only after Cloudflare assigns its id', () => {
+    const desired = normalizeCloudflarePublicationDesired({
+        configurationGeneration: GENERATION,
+        cloudflare: MANAGED,
+        hosts: HOSTS,
+    });
+    assert.equal(desired.mode, 'cloudflare');
+    assert.equal(desired.management, 'api-managed');
+    assert.equal(desired.tunnelManagement, 'ploinky-managed');
+    assert.deepEqual(desired.managedTunnel, {
+        name: 'explorer-qa',
+        deleteOnTeardown: false,
+    });
+    assert.equal(Object.hasOwn(desired, 'scope'), false);
+    assert.equal(Object.hasOwn(desired, 'dns'), false);
+    assert.deepEqual(desired.secretHandles, {
+        apiToken: 'publication/cloudflare-api',
+    });
+
+    const materialized = materializeManagedCloudflarePublicationPlan(desired, 'managed_tunnel_123');
+    assert.deepEqual(materialized.scope, {
+        accountId: 'account_123',
+        zoneId: 'zone_123',
+        tunnelId: 'managed_tunnel_123',
+    });
+    assert.ok(materialized.dns.every(
+        (entry) => entry.content === 'managed_tunnel_123.cfargotunnel.com',
+    ));
+    assert.equal(materialized.desiredDigest, desired.desiredDigest);
+    assert.deepEqual(publicPlanSummary(materialized).scope, materialized.scope);
+    assert.doesNotMatch(
+        JSON.stringify(publicPlanSummary(materialized)),
+        /publication\/cloudflare-api/,
+    );
 });
 
 test('connector-only accepts one or multiple exact hosts without API-managed fields', () => {
@@ -143,15 +187,23 @@ test('every partial Cloudflare tuple is rejected instead of falling back to loca
     }
 });
 
-test('hosts without credentials and credentials without hosts are both partial', () => {
+test('hosts require credentials while complete API credentials without hosts select teardown', () => {
     assert.throws(
         () => normalizeCloudflarePublicationDesired({ configurationGeneration: GENERATION, hosts: HOSTS }),
         (error) => error.code === 'CLOUDFLARE_CONFIGURATION_PARTIAL',
     );
-    assert.throws(
-        () => normalizeCloudflarePublicationDesired({ configurationGeneration: GENERATION, cloudflare: COMPLETE }),
-        (error) => error.code === 'CLOUDFLARE_CONFIGURATION_PARTIAL',
-    );
+    const teardown = normalizeCloudflarePublicationDesired({
+        configurationGeneration: GENERATION,
+        cloudflare: COMPLETE,
+    });
+    assert.equal(teardown.mode, 'local-only');
+    assert.equal(teardown.management, 'api-managed');
+    assert.deepEqual(teardown.hosts, []);
+    assert.deepEqual(teardown.scope, {
+        accountId: 'account_123',
+        zoneId: 'zone_123',
+        tunnelId: 'tunnel_123',
+    });
     assert.throws(
         () => normalizeCloudflarePublicationDesired({
             configurationGeneration: GENERATION,
@@ -165,6 +217,32 @@ test('hosts without credentials and credentials without hosts are both partial',
             cloudflare: {},
         }),
         (error) => error.code === 'CLOUDFLARE_CONFIGURATION_PARTIAL',
+    );
+});
+
+test('managed tunnel credentials without hosts select an explicit ownership-aware teardown', () => {
+    const teardown = normalizeCloudflarePublicationDesired({
+        configurationGeneration: GENERATION,
+        cloudflare: {
+            ...MANAGED,
+            deleteTunnelOnTeardown: true,
+        },
+    });
+    assert.equal(teardown.mode, 'local-only');
+    assert.equal(teardown.management, 'api-managed');
+    assert.equal(teardown.tunnelManagement, 'ploinky-managed');
+    assert.deepEqual(teardown.managedTunnel, {
+        name: 'explorer-qa',
+        deleteOnTeardown: true,
+    });
+    assert.equal(Object.hasOwn(teardown, 'scope'), false);
+    assert.deepEqual(
+        materializeManagedCloudflarePublicationPlan(teardown, 'managed_tunnel_123').scope,
+        {
+            accountId: 'account_123',
+            zoneId: 'zone_123',
+            tunnelId: 'managed_tunnel_123',
+        },
     );
 });
 
@@ -188,6 +266,39 @@ test('connector-only mixed with incomplete API-managed fields is rejected as par
     }
 });
 
+test('existing and Ploinky-managed tunnel declarations cannot be mixed', () => {
+    for (const cloudflare of [
+        { ...COMPLETE, tunnelName: 'explorer-qa' },
+        { ...MANAGED, tunnelId: 'tunnel_123' },
+        { ...MANAGED, tunnelTokenSecret: 'publication/cloudflare-connector' },
+    ]) {
+        assert.throws(
+            () => normalizeCloudflarePublicationDesired({
+                configurationGeneration: GENERATION,
+                cloudflare,
+                hosts: HOSTS,
+            }),
+            (error) => error.code === 'CLOUDFLARE_CONFIGURATION_PARTIAL',
+        );
+    }
+});
+
+test('managed tunnel names reserve room for the Ploinky ownership suffix', () => {
+    assert.doesNotThrow(() => normalizeCloudflarePublicationDesired({
+        configurationGeneration: GENERATION,
+        cloudflare: { ...MANAGED, tunnelName: 'a'.repeat(48) },
+        hosts: HOSTS,
+    }));
+    assert.throws(
+        () => normalizeCloudflarePublicationDesired({
+            configurationGeneration: GENERATION,
+            cloudflare: { ...MANAGED, tunnelName: 'a'.repeat(49) },
+            hosts: HOSTS,
+        }),
+        (error) => error.code === 'CLOUDFLARE_CONFIGURATION_INVALID',
+    );
+});
+
 test('connector and API credentials require separate handles', () => {
     assert.throws(
         () => normalizeCloudflarePublicationDesired({
@@ -200,7 +311,7 @@ test('connector and API credentials require separate handles', () => {
 });
 
 test('literal or legacy Cloudflare configuration fields are rejected by the hard-cut schema', () => {
-    for (const field of ['apiToken', 'tunnelToken', 'tunnelName', 'apiBaseUrl', 'mode']) {
+    for (const field of ['apiToken', 'tunnelToken', 'tunnelLabel', 'apiBaseUrl', 'mode']) {
         assert.throws(
             () => normalizeCloudflarePublicationDesired({
                 configurationGeneration: GENERATION,

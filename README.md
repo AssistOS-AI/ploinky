@@ -105,11 +105,19 @@ image configuration.
 
 The box image includes pinned multi-architecture `cloudflared`, supervised by
 Ploinky core. No Cloudflare credentials selects explicit `local-only` mode: the
-connector is absent and no public HTTP hostname exists. Complete Cloudflare mode
-requires an existing-tunnel connector token plus a separate least-privilege API
-token for DNS/ingress. Invalid or partial configuration fails closed without
-changing modes; Ploinky never creates a quick tunnel or a new tunnel, and the
+connector is absent and no public HTTP hostname exists. Cloudflare mode may use
+an existing tunnel, run only an existing connector whose routes are maintained
+externally, or explicitly opt into a Ploinky-managed tunnel. The managed form
+uses `accountId`, `zoneId`, `tunnelName`, and `apiTokenSecret`; Ploinky creates a
+uniquely owned remotely configured tunnel, obtains its connector token only in
+memory, and reconciles ingress and DNS. `deleteTunnelOnTeardown` defaults to
+`false`; when set to `true`, teardown deletes the tunnel only when the durable
+ownership registry proves Ploinky created it. Invalid or partial configuration
+fails closed without changing modes. Quick tunnels are never used, and the
 connector origin is always in-box `http://127.0.0.1:8080`.
+Managed names are 1-48 characters; Ploinky appends a unique ownership suffix.
+Changing the requested name retains the previous tunnel until that name is
+selected with an explicit empty-host teardown.
 
 Ordinary agent images intentionally contain neither Podman nor Docker. Every
 Ploinky-managed agent and helper container runs through nested Podman inside the

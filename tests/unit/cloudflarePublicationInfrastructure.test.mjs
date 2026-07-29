@@ -17,6 +17,9 @@ import {
     createCloudflarePublicationJournal,
 } from '../../ploinky-box/cloudflared/journal.mjs';
 import {
+    createCloudflareManagedTunnelRegistry,
+} from '../../ploinky-box/cloudflared/managedTunnelRegistry.mjs';
+import {
     serializeCloudflarePublicationStatus,
     writeCloudflarePublicationStatus,
 } from '../../ploinky-box/cloudflared/status.mjs';
@@ -250,7 +253,102 @@ test('journal rejects malformed integrity fields and inconsistent nested ownersh
     assert.deepEqual(fs.readdirSync(root), []);
 });
 
-test('API client validates exact account/tunnel/zone scope without exposing tunnel creation', async () => {
+test('managed tunnel registry persists ownership intent atomically before a tunnel id exists', (t) => {
+    const root = temporaryDirectory(t);
+    const ownershipId = '123e4567-e89b-42d3-a456-426614174000';
+    const registry = createCloudflareManagedTunnelRegistry({
+        workspaceRoot: root,
+        ownershipIdFactory: () => ownershipId,
+        now: () => new Date('2026-07-29T12:00:00.000Z'),
+    });
+    const intent = registry.begin({
+        accountId: 'account_123',
+        zoneId: 'zone_123',
+        tunnelName: 'explorer-qa',
+        deleteOnTeardown: false,
+    });
+    assert.deepEqual(intent, {
+        ownershipId,
+        accountId: 'account_123',
+        zoneId: 'zone_123',
+        requestedName: 'explorer-qa',
+        cloudflareName: `explorer-qa--ploinky-${ownershipId}`,
+        tunnelId: '',
+        deleteOnTeardown: false,
+        createdAt: '2026-07-29T12:00:00.000Z',
+        updatedAt: '2026-07-29T12:00:00.000Z',
+    });
+    assert.equal(fs.statSync(registry.path).mode & 0o777, 0o600);
+
+    const restarted = createCloudflareManagedTunnelRegistry({ workspaceRoot: root });
+    assert.deepEqual(restarted.findDesired({
+        accountId: 'account_123',
+        zoneId: 'zone_123',
+        tunnelName: 'explorer-qa',
+    }), intent);
+    const committed = restarted.commit({
+        ownershipId,
+        tunnelId: 'managed_tunnel_123',
+    });
+    assert.equal(committed.tunnelId, 'managed_tunnel_123');
+    assert.deepEqual(restarted.findScope({
+        accountId: 'account_123',
+        tunnelId: 'managed_tunnel_123',
+    }), committed);
+    assert.throws(
+        () => restarted.remove({ ownershipId, tunnelId: 'other_tunnel' }),
+        (error) => error.code === 'CLOUDFLARE_MANAGED_TUNNEL_REGISTRY_CORRUPT',
+    );
+    assert.equal(restarted.remove({ ownershipId, tunnelId: 'managed_tunnel_123' }), true);
+    assert.deepEqual(restarted.list(), []);
+});
+
+test('managed tunnel registry rejects corruption and symlinked storage', (t) => {
+    const root = temporaryDirectory(t);
+    const registry = createCloudflareManagedTunnelRegistry({ workspaceRoot: root });
+    fs.mkdirSync(path.dirname(registry.path), { recursive: true });
+    fs.writeFileSync(registry.path, JSON.stringify({
+        entries: [{
+            ownershipId: '123e4567-e89b-42d3-a456-426614174000',
+            accountId: 'account_123',
+            zoneId: 'zone_123',
+            requestedName: 'explorer-qa',
+            cloudflareName: 'unowned-name',
+            tunnelId: '',
+            deleteOnTeardown: false,
+            createdAt: '2026-07-29T12:00:00.000Z',
+            updatedAt: '2026-07-29T12:00:00.000Z',
+        }],
+        updatedAt: '2026-07-29T12:00:00.000Z',
+    }));
+    assert.throws(
+        () => registry.list(),
+        (error) => error.code === 'CLOUDFLARE_MANAGED_TUNNEL_REGISTRY_CORRUPT',
+    );
+
+    fs.unlinkSync(registry.path);
+    const outside = path.join(root, 'outside.json');
+    fs.writeFileSync(outside, '{}');
+    fs.symlinkSync(outside, registry.path);
+    assert.throws(
+        () => registry.list(),
+        (error) => error.code === 'CLOUDFLARE_MANAGED_TUNNEL_REGISTRY_CORRUPT',
+    );
+});
+
+test('managed tunnel registry rejects a multiply-linked ownership file', (t) => {
+    const root = temporaryDirectory(t);
+    const registry = createCloudflareManagedTunnelRegistry({ workspaceRoot: root });
+    fs.mkdirSync(path.dirname(registry.path), { recursive: true });
+    fs.writeFileSync(registry.path, '{}');
+    fs.linkSync(registry.path, path.join(root, 'ownership-alias.json'));
+    assert.throws(
+        () => registry.list(),
+        (error) => error.code === 'CLOUDFLARE_MANAGED_TUNNEL_REGISTRY_CORRUPT',
+    );
+});
+
+test('API client validates exact account/tunnel/zone scope', async () => {
     const calls = [];
     const fetchImpl = async (url, options) => {
         calls.push({ url, options });
@@ -274,11 +372,119 @@ test('API client validates exact account/tunnel/zone scope without exposing tunn
         zoneId: 'zone_123',
         tunnelId: 'tunnel_123',
     });
-    assert.equal(typeof api.createTunnel, 'undefined');
     assert.equal(calls.length, 3);
     assert.ok(calls.every((call) => call.options.headers.Authorization === 'Bearer api-token'));
     assert.ok(calls.some((call) => call.url.includes('/accounts/account_123/cfd_tunnel/tunnel_123')));
     assert.ok(calls.some((call) => call.url.endsWith('/zones/zone_123')));
+});
+
+test('API client creates, discovers, authenticates, and deletes managed tunnels in one account', async () => {
+    const calls = [];
+    const connectorToken = 'managed-connector-token-value';
+    const fetchImpl = async (url, options) => {
+        calls.push({ url, options });
+        const parsed = new URL(url);
+        let result;
+        if (options.method === 'GET' && parsed.pathname.endsWith('/cfd_tunnel')) {
+            result = [{
+                id: 'managed_tunnel_123',
+                account_tag: 'account_123',
+                name: parsed.searchParams.get('name'),
+                config_src: 'cloudflare',
+                deleted_at: null,
+            }];
+        } else if (options.method === 'POST' && parsed.pathname.endsWith('/cfd_tunnel')) {
+            result = {
+                id: 'managed_tunnel_123',
+                account_tag: 'account_123',
+                name: JSON.parse(options.body).name,
+                config_src: 'cloudflare',
+                token: connectorToken,
+            };
+        } else if (options.method === 'GET' && parsed.pathname.endsWith('/managed_tunnel_123/token')) {
+            result = connectorToken;
+        } else if (options.method === 'DELETE' && parsed.pathname.endsWith('/managed_tunnel_123')) {
+            result = { id: 'managed_tunnel_123' };
+        } else {
+            throw new Error(`unexpected API call ${options.method} ${url}`);
+        }
+        return {
+            ok: true,
+            status: 200,
+            text: async () => JSON.stringify({ success: true, result }),
+        };
+    };
+    const api = new CloudflarePublicationApiClient({ fetchImpl, baseUrl: 'https://api.example.test' });
+    const cloudflareName = 'explorer-qa--ploinky-123e4567-e89b-42d3-a456-426614174000';
+    const tunnels = await api.listTunnels({
+        apiToken: 'api-token',
+        accountId: 'account_123',
+        name: cloudflareName,
+    });
+    const created = await api.createTunnel({
+        apiToken: 'api-token',
+        accountId: 'account_123',
+        name: cloudflareName,
+    });
+    const token = await api.getTunnelToken({
+        apiToken: 'api-token',
+        accountId: 'account_123',
+        tunnelId: created.id,
+    });
+    await api.deleteTunnel({
+        apiToken: 'api-token',
+        accountId: 'account_123',
+        tunnelId: created.id,
+    });
+
+    assert.equal(tunnels[0].id, 'managed_tunnel_123');
+    assert.equal(token, connectorToken);
+    assert.equal(calls.length, 4);
+    assert.ok(calls.every((call) => call.options.headers.Authorization === 'Bearer api-token'));
+    const listUrl = new URL(calls[0].url);
+    assert.equal(listUrl.searchParams.get('name'), cloudflareName);
+    assert.equal(listUrl.searchParams.get('is_deleted'), 'false');
+    assert.deepEqual(JSON.parse(calls[1].options.body), {
+        name: cloudflareName,
+        config_src: 'cloudflare',
+    });
+    assert.equal(calls[2].options.method, 'GET');
+    assert.match(calls[2].url, /\/cfd_tunnel\/managed_tunnel_123\/token$/);
+    assert.equal(calls[3].options.method, 'DELETE');
+});
+
+test('API client verifies account-owned tokens in their exact account scope', async () => {
+    const calls = [];
+    const fetchImpl = async (url, options) => {
+        calls.push({ url, options });
+        let result;
+        if (url.endsWith('/accounts/account_123/tokens/verify')) result = { status: 'active' };
+        else if (url.includes('/cfd_tunnel/tunnel_123') && !url.endsWith('/configurations')) {
+            result = { id: 'tunnel_123', account_tag: 'account_123', deleted_at: null };
+        } else if (url.endsWith('/zones/zone_123')) {
+            result = { id: 'zone_123', account: { id: 'account_123' } };
+        } else throw new Error(`unexpected URL ${url}`);
+        return {
+            ok: true,
+            status: 200,
+            text: async () => JSON.stringify({ success: true, result }),
+        };
+    };
+    const api = new CloudflarePublicationApiClient({ fetchImpl, baseUrl: 'https://api.example.test' });
+    await api.validateScope({
+        apiToken: 'cfat_account-token-for-test',
+        accountId: 'account_123',
+        zoneId: 'zone_123',
+        tunnelId: 'tunnel_123',
+    });
+    assert.equal(calls.length, 3);
+    assert.ok(calls.every(
+        (call) => call.options.headers.Authorization === 'Bearer cfat_account-token-for-test',
+    ));
+    assert.ok(calls.some(
+        (call) => call.url.endsWith('/accounts/account_123/tokens/verify'),
+    ));
+    assert.ok(calls.every((call) => !call.url.endsWith('/user/tokens/verify')));
 });
 
 test('API errors identify the failed capability while redacting the API token', async () => {

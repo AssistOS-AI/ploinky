@@ -39,6 +39,29 @@ function connectorDesired(hostnames = ['office.example.test'], generationCharact
     };
 }
 
+function managedDesired(
+    hostnames = ['office.example.test'],
+    generationCharacter = 'a',
+    {
+        deleteTunnelOnTeardown = false,
+        tunnelName = 'explorer-qa',
+    } = {},
+) {
+    return {
+        configurationGeneration: `sha256:${generationCharacter.repeat(64)}`,
+        cloudflare: {
+            accountId: 'account_123',
+            zoneId: 'zone_123',
+            tunnelName,
+            apiTokenSecret: 'publication/cloudflare-api',
+            deleteTunnelOnTeardown,
+        },
+        hosts: Object.fromEntries(hostnames.map((hostname) => [hostname, {
+            agent: `repo/${hostname.split('.')[0]}`,
+        }])),
+    };
+}
+
 function localDesired(generationCharacter = 'f') {
     return { configurationGeneration: `sha256:${generationCharacter.repeat(64)}` };
 }
@@ -60,17 +83,86 @@ function createMemoryJournal(initial = null) {
     };
 }
 
+function createMemoryManagedTunnelRegistry() {
+    const entries = [];
+    let nextOwnership = 1;
+    return {
+        entries,
+        findDesired({ accountId, zoneId, tunnelName }) {
+            return structuredClone(entries.find((entry) => (
+                entry.accountId === accountId
+                && entry.zoneId === zoneId
+                && entry.requestedName === tunnelName
+            )) || null);
+        },
+        findScope({ accountId, tunnelId }) {
+            return structuredClone(entries.find((entry) => (
+                entry.accountId === accountId && entry.tunnelId === tunnelId
+            )) || null);
+        },
+        begin({ accountId, zoneId, tunnelName, deleteOnTeardown }) {
+            const existing = entries.find((entry) => (
+                entry.accountId === accountId
+                && entry.zoneId === zoneId
+                && entry.requestedName === tunnelName
+            ));
+            if (existing) {
+                existing.deleteOnTeardown = deleteOnTeardown === true;
+                return structuredClone(existing);
+            }
+            const ownershipId = `00000000-0000-4000-8000-${String(nextOwnership++).padStart(12, '0')}`;
+            const entry = {
+                ownershipId,
+                accountId,
+                zoneId,
+                requestedName: tunnelName,
+                cloudflareName: `${tunnelName}--ploinky-${ownershipId}`,
+                tunnelId: '',
+                deleteOnTeardown: deleteOnTeardown === true,
+            };
+            entries.push(entry);
+            return structuredClone(entry);
+        },
+        commit({ ownershipId, tunnelId }) {
+            const entry = entries.find((candidate) => candidate.ownershipId === ownershipId);
+            assert.ok(entry);
+            if (entry.tunnelId) assert.equal(entry.tunnelId, tunnelId);
+            entry.tunnelId = tunnelId;
+            return structuredClone(entry);
+        },
+        remove({ ownershipId, tunnelId }) {
+            const index = entries.findIndex((entry) => entry.ownershipId === ownershipId);
+            if (index < 0) return false;
+            assert.equal(entries[index].tunnelId, tunnelId);
+            entries.splice(index, 1);
+            return true;
+        },
+    };
+}
+
 function createFakeApi(events) {
     const ingress = new Map();
     const dns = new Map();
+    const tunnels = new Map();
     let nextRecordId = 1;
+    let nextTunnelId = 1;
     const api = {
         ingress,
         dns,
+        tunnels,
         failValidate: null,
         failCreateDnsOnce: null,
         failDeleteDnsRecordIdOnce: null,
         blockPutIngress: null,
+        async validateAccountZone(input) {
+            events.push({
+                event: 'api.validateAccountZone',
+                accountId: input.accountId,
+                zoneId: input.zoneId,
+            });
+            if (api.failValidate) throw api.failValidate;
+            return { ok: true };
+        },
         async validateScope(input) {
             events.push({ event: 'api.validateScope', scope: {
                 accountId: input.accountId,
@@ -79,6 +171,38 @@ function createFakeApi(events) {
             } });
             if (api.failValidate) throw api.failValidate;
             return { ok: true };
+        },
+        async listTunnels({ accountId, name }) {
+            events.push({ event: 'api.listTunnels', accountId, name });
+            return [...tunnels.values()]
+                .filter((tunnel) => tunnel.account_tag === accountId
+                    && tunnel.name === name
+                    && !tunnel.deleted_at)
+                .map((tunnel) => structuredClone(tunnel));
+        },
+        async createTunnel({ accountId, name }) {
+            events.push({ event: 'api.createTunnel', accountId, name });
+            const tunnel = {
+                id: `managed_tunnel_${nextTunnelId++}`,
+                account_tag: accountId,
+                name,
+                config_src: 'cloudflare',
+                deleted_at: null,
+            };
+            tunnels.set(tunnel.id, tunnel);
+            return structuredClone(tunnel);
+        },
+        async getTunnelToken({ tunnelId }) {
+            events.push({ event: 'api.getTunnelToken', tunnelId });
+            assert.ok(tunnels.has(tunnelId));
+            return `managed-connector-token-${tunnelId}`;
+        },
+        async deleteTunnel({ accountId, tunnelId }) {
+            events.push({ event: 'api.deleteTunnel', accountId, tunnelId });
+            const tunnel = tunnels.get(tunnelId);
+            assert.equal(tunnel?.account_tag, accountId);
+            tunnel.deleted_at = new Date().toISOString();
+            return structuredClone(tunnel);
         },
         async putTunnelIngress(input) {
             events.push({ event: 'api.putIngress', tunnelId: input.tunnelId, ingress: structuredClone(input.ingress) });
@@ -172,6 +296,7 @@ function createHarness({
     probeConnector,
     restartPolicy,
     lazyApi = false,
+    managedTunnelRegistry = createMemoryManagedTunnelRegistry(),
 } = {}) {
     const events = [];
     const audits = [];
@@ -204,6 +329,7 @@ function createHarness({
         } : { api }),
         connector,
         journal,
+        managedTunnelRegistry,
         secretStore: { readAll: () => ({ ...secrets }) },
         routeCoordinator: routes,
         probeConnector: probeConnector || (async (input) => {
@@ -227,6 +353,7 @@ function createHarness({
         api,
         connector,
         journal,
+        managedTunnelRegistry,
         routes,
         get apiFactoryCalls() { return apiFactoryCalls; },
     };
@@ -312,6 +439,253 @@ test('complete publication verifies remote state before route commit and proves 
     assert.equal(harness.routes.active, true);
     assert.deepEqual(Object.keys(harness.routes.hosts).sort(), ['meet.example.test', 'office.example.test']);
     assert.equal(harness.journal.writes.at(-1).phase, 'ready');
+});
+
+test('managed publication creates one owned tunnel and reuses it without persisting a connector token', async () => {
+    const harness = createHarness({
+        secrets: { 'publication/cloudflare-api': API_TOKEN },
+    });
+    const first = await harness.controller.reconcile(managedDesired());
+    assert.equal(first.state, 'ready');
+    assert.equal(first.management, 'api-managed');
+    assert.equal(first.scope.tunnelId, 'managed_tunnel_1');
+    assert.equal(
+        harness.events.filter((entry) => entry.event === 'api.createTunnel').length,
+        1,
+    );
+    assert.equal(
+        harness.events.find((entry) => entry.event === 'connector.start').tunnelToken,
+        'managed-connector-token-managed_tunnel_1',
+    );
+    assert.equal(harness.managedTunnelRegistry.entries.length, 1);
+    assert.equal(harness.managedTunnelRegistry.entries[0].tunnelId, 'managed_tunnel_1');
+    assert.equal(
+        JSON.stringify(harness.journal.writes).includes('managed-connector-token'),
+        false,
+    );
+
+    await harness.controller.reconcile(managedDesired(['office.example.test'], 'b'));
+    assert.equal(
+        harness.events.filter((entry) => entry.event === 'api.createTunnel').length,
+        1,
+    );
+    assert.equal(
+        harness.events.filter((entry) => entry.event === 'api.getTunnelToken').length,
+        2,
+    );
+});
+
+test('managed creation recovers an API response loss from its durable ownership intent', async () => {
+    const harness = createHarness({
+        secrets: { 'publication/cloudflare-api': API_TOKEN },
+    });
+    const originalCreate = harness.api.createTunnel.bind(harness.api);
+    let failResponseOnce = true;
+    harness.api.createTunnel = async (input) => {
+        const created = await originalCreate(input);
+        if (failResponseOnce) {
+            failResponseOnce = false;
+            throw new CloudflarePublicationError('response lost after create', {
+                code: 'CLOUDFLARE_API_UNREACHABLE',
+                operation: 'create-managed-tunnel',
+                retryable: true,
+            });
+        }
+        return created;
+    };
+
+    await assert.rejects(
+        harness.controller.reconcile(managedDesired()),
+        (error) => error.code === 'CLOUDFLARE_API_UNREACHABLE',
+    );
+    assert.equal(harness.api.tunnels.size, 1);
+    assert.equal(harness.managedTunnelRegistry.entries[0].tunnelId, '');
+
+    const status = await harness.controller.reconcile(managedDesired(['office.example.test'], 'b'));
+    assert.equal(status.state, 'ready');
+    assert.equal(harness.api.tunnels.size, 1);
+    assert.equal(
+        harness.events.filter((entry) => entry.event === 'api.createTunnel').length,
+        1,
+    );
+    assert.equal(harness.managedTunnelRegistry.entries[0].tunnelId, 'managed_tunnel_1');
+});
+
+test('managed publication refuses to replace an owned tunnel deleted outside Ploinky', async () => {
+    const harness = createHarness({
+        secrets: { 'publication/cloudflare-api': API_TOKEN },
+    });
+    await harness.controller.reconcile(managedDesired());
+    harness.api.tunnels.get('managed_tunnel_1').deleted_at = new Date().toISOString();
+
+    await assert.rejects(
+        harness.controller.reconcile(managedDesired(['office.example.test'], 'b')),
+        (error) => error.code === 'CLOUDFLARE_MANAGED_TUNNEL_OWNERSHIP_LOST',
+    );
+    assert.equal(
+        harness.events.filter((entry) => entry.event === 'api.createTunnel').length,
+        1,
+    );
+    assert.equal(harness.managedTunnelRegistry.entries[0].tunnelId, 'managed_tunnel_1');
+});
+
+test('managed teardown deletes only an owned tunnel when explicitly requested', async () => {
+    const harness = createHarness({
+        secrets: { 'publication/cloudflare-api': API_TOKEN },
+    });
+    await harness.controller.reconcile(managedDesired(
+        ['office.example.test'],
+        'a',
+        { deleteTunnelOnTeardown: true },
+    ));
+    const status = await harness.controller.reconcile(managedDesired(
+        [],
+        'b',
+        { deleteTunnelOnTeardown: true },
+    ));
+    assert.equal(status.state, 'local-only');
+    assert.equal(harness.journal.read().mode, 'local-only');
+    assert.equal(harness.managedTunnelRegistry.entries.length, 0);
+    assert.equal(harness.api.tunnels.get('managed_tunnel_1').deleted_at !== null, true);
+    assert.equal(
+        harness.events.filter((entry) => entry.event === 'api.deleteTunnel').length,
+        1,
+    );
+});
+
+test('managed teardown can opt into deletion after an earlier retained deployment', async () => {
+    const harness = createHarness({
+        secrets: { 'publication/cloudflare-api': API_TOKEN },
+    });
+    await harness.controller.reconcile(managedDesired());
+    await harness.controller.reconcile(managedDesired(
+        [],
+        'b',
+        { deleteTunnelOnTeardown: true },
+    ));
+    assert.equal(harness.managedTunnelRegistry.entries.length, 0);
+    assert.ok(harness.api.tunnels.get('managed_tunnel_1').deleted_at);
+    assert.equal(
+        harness.events.filter((entry) => entry.event === 'api.deleteTunnel').length,
+        1,
+    );
+});
+
+test('managed teardown retains its allocation by default for a later redeploy', async () => {
+    const harness = createHarness({
+        secrets: { 'publication/cloudflare-api': API_TOKEN },
+    });
+    await harness.controller.reconcile(managedDesired());
+    await harness.controller.reconcile(managedDesired([], 'b'));
+    assert.equal(
+        harness.events.filter((entry) => entry.event === 'api.deleteTunnel').length,
+        0,
+    );
+    assert.equal(harness.managedTunnelRegistry.entries.length, 1);
+
+    await harness.controller.reconcile(managedDesired(['office.example.test'], 'c'));
+    assert.equal(
+        harness.events.filter((entry) => entry.event === 'api.createTunnel').length,
+        1,
+    );
+});
+
+test('managed scope replacement retains the old allocation until its own explicit teardown', async () => {
+    const harness = createHarness({
+        secrets: { 'publication/cloudflare-api': API_TOKEN },
+    });
+    await harness.controller.reconcile(managedDesired(
+        ['office.example.test'],
+        'a',
+        { deleteTunnelOnTeardown: true },
+    ));
+    const status = await harness.controller.reconcile(managedDesired(
+        ['office.example.test'],
+        'b',
+        { tunnelName: 'explorer-qa-replacement' },
+    ));
+
+    assert.equal(status.state, 'ready');
+    assert.equal(status.scope.tunnelId, 'managed_tunnel_2');
+    assert.equal(harness.api.tunnels.get('managed_tunnel_1').deleted_at, null);
+    assert.equal(harness.api.tunnels.get('managed_tunnel_2').deleted_at, null);
+    assert.equal(
+        harness.events.filter((entry) => entry.event === 'api.deleteTunnel').length,
+        0,
+    );
+    assert.deepEqual(
+        harness.managedTunnelRegistry.entries.map((entry) => entry.tunnelId),
+        ['managed_tunnel_1', 'managed_tunnel_2'],
+    );
+
+    await harness.controller.reconcile(managedDesired(
+        [],
+        'c',
+        { tunnelName: 'explorer-qa-replacement' },
+    ));
+    await harness.controller.reconcile(managedDesired(
+        [],
+        'd',
+        { tunnelName: 'explorer-qa', deleteTunnelOnTeardown: true },
+    ));
+    assert.ok(harness.api.tunnels.get('managed_tunnel_1').deleted_at);
+    assert.equal(harness.api.tunnels.get('managed_tunnel_2').deleted_at, null);
+    assert.deepEqual(
+        harness.managedTunnelRegistry.entries.map((entry) => entry.tunnelId),
+        ['managed_tunnel_2'],
+    );
+});
+
+test('API-managed reconciliation refuses an integrated connector on a shared tunnel', async () => {
+    const harness = createHarness();
+    const sharedIngress = [
+        { hostname: 'soul.example.test', service: 'http://localhost:8042' },
+        {
+            hostname: 'search.example.test',
+            path: '^/api/',
+            service: 'http://localhost:8043',
+            originRequest: { connectTimeout: 30 },
+        },
+        { service: 'http_status:418' },
+    ];
+    harness.api.ingress.set('account_123/tunnel_123', structuredClone(sharedIngress));
+
+    await assert.rejects(
+        harness.controller.reconcile(desired(['office.example.test'])),
+        (error) => error.code === 'CLOUDFLARE_SHARED_TUNNEL_UNSAFE'
+            && error.operation === 'reconcile-ingress',
+    );
+    assert.deepEqual(harness.api.ingress.get('account_123/tunnel_123'), sharedIngress);
+    assert.equal(harness.events.some((entry) => entry.event === 'api.putIngress'), false);
+    assert.equal(harness.connector.starts, 0);
+});
+
+test('owned-route teardown preserves routes another controller added later', async () => {
+    const harness = createHarness();
+    await harness.controller.reconcile(desired(['office.example.test']));
+    harness.api.ingress.set('account_123/tunnel_123', [
+        { hostname: 'soul.example.test', service: 'http://localhost:8042' },
+        {
+            hostname: 'search.example.test',
+            path: '^/api/',
+            service: 'http://localhost:8043',
+            originRequest: { connectTimeout: 30 },
+        },
+        { hostname: 'office.example.test', service: CLOUDFLARE_ORIGIN },
+        { service: 'http_status:418' },
+    ]);
+
+    await harness.controller.reconcile(localDesired('b'));
+    assert.deepEqual(harness.api.ingress.get('account_123/tunnel_123'), [
+        { hostname: 'soul.example.test', service: 'http://localhost:8042' },
+        {
+            hostname: 'search.example.test',
+            path: '^/api/',
+            service: 'http://localhost:8043',
+            originRequest: { connectTimeout: 30 },
+        },
+        { service: 'http_status:418' },
+    ]);
 });
 
 test('connector-only proves every host, commits reconciling then ready, and owns no API or journal state', async () => {
@@ -622,7 +996,9 @@ test('removing the final hostname verifies terminal ingress and owned DNS deleti
 
     const events = harness.events.slice(eventStart);
     const ingressWrite = events.findIndex((entry) => entry.event === 'api.putIngress');
-    const ingressVerify = events.findIndex((entry) => entry.event === 'api.readIngress');
+    const ingressVerify = events.findIndex((entry, index) => (
+        index > ingressWrite && entry.event === 'api.readIngress'
+    ));
     const dnsDelete = events.findIndex((entry) => entry.event === 'api.deleteDns' && entry.recordId === owned.id);
     const localCommit = events.findIndex((entry) => (
         entry.event === 'routes.commit' && entry.input.mode === 'local-only'
@@ -682,6 +1058,39 @@ test('a restarted controller preserves Cloudflare ownership journal and fails cl
     assert.equal(journal.writes.at(-1).mode, 'cloudflare');
     assert.equal(journal.writes.at(-1).managedDnsRecords.length, 1);
     assert.equal(journal.writes.at(-1).phase, 'error');
+});
+
+test('a restarted controller uses an explicit API-managed empty-host state to tear down owned routes', async () => {
+    const first = createHarness();
+    await first.controller.reconcile(desired(['office.example.test']));
+    const journal = first.journal;
+    const second = createHarness({ journal });
+    second.api.ingress.set(
+        'account_123/tunnel_123',
+        structuredClone(first.api.ingress.get('account_123/tunnel_123')),
+    );
+    second.api.dns.set(
+        'zone_123/office.example.test',
+        structuredClone(first.api.dns.get('zone_123/office.example.test')),
+    );
+
+    const status = await second.controller.reconcile({
+        configurationGeneration: `sha256:${'b'.repeat(64)}`,
+        cloudflare: {
+            accountId: 'account_123',
+            zoneId: 'zone_123',
+            tunnelId: 'tunnel_123',
+            tunnelTokenSecret: 'publication/cloudflare-connector',
+            apiTokenSecret: 'publication/cloudflare-api',
+        },
+        hosts: {},
+    });
+    assert.equal(status.state, 'local-only');
+    assert.deepEqual(second.api.ingress.get('account_123/tunnel_123'), [
+        { service: 'http_status:404' },
+    ]);
+    assert.equal(second.api.dns.has('zone_123/office.example.test'), false);
+    assert.equal(journal.read().mode, 'local-only');
 });
 
 test('controller stop persists a redacted stopped state after connector teardown', async () => {

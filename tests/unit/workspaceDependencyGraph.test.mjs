@@ -271,12 +271,38 @@ test('prepared runtime records and routes commit together before activation, inc
         new URL('../../cli/commands/noWaitWorker.js', import.meta.url),
         'utf8',
     );
+    const routingFileSource = fs.readFileSync(
+        new URL('../../cli/server/routingFile.js', import.meta.url),
+        'utf8',
+    );
     assert.match(noWaitSource, /agents\[containerName\] = registryRecord;\s*saveAgents\(agents, \{ coordinate: false \}\)/);
     assert.match(noWaitSource, /forceRecreate:\s*args\.forceRecreate === '1'/);
-    assert.match(noWaitSource, /prepareEdgeRoutingGeneration\(\{ reason, applyLockCapability \}\)/);
-    assert.match(noWaitSource, /preparedHostModeCapability:\s*lifecycle\.preparedHostModeCapability/);
-    assert.match(noWaitSource, /preparationLease:\s*lifecycle\.preparationLease/);
+    assert.match(noWaitSource, /assertActiveEdgeRoutingSourcesCurrent\(\)/);
+    assert.doesNotMatch(noWaitSource, /prepareEdgeRoutingGeneration|inactivateEdgeRoutingGeneration/);
+    assert.match(noWaitSource, /validateActiveGeneration\(\)[\s\S]*selector\.activationId !== expectedSelector\?\.activationId/);
+    assert.match(noWaitSource, /captureExpectedGeneration\(active\)[\s\S]*captureEdgeRoutingLifecycleMutationGeneration\(active\)/);
+    assert.match(
+        noWaitSource,
+        /profileResolution\.network\.mode === 'host'[\s\S]*withEdgeGenerationApplyLock\([\s\S]*return launch\(\)/,
+        'host-network process creation must remain bound to one active selector under the edge apply lock',
+    );
+    assert.match(
+        routingFileSource,
+        /await validateActiveGeneration\(\);[\s\S]*inactivateEdgeRoutingGeneration\(reason/,
+        'the active-generation binding must be checked under the apply lock before fail-closed mutation begins',
+    );
+    assert.match(
+        routingFileSource,
+        /writeRoutingConfig\(next, \{ coordinate: false \}\);[\s\S]*captureExpectedGeneration\(validatedActiveGeneration\)[\s\S]*expectedGeneration/,
+        'the exact post-mutation generation must be captured and bound to the coordinated apply',
+    );
     assert.match(noWaitSource, /await waitForPriorWorker\(waitForStatus\)/);
+    assert.doesNotMatch(source, /await waitForPriorWorker|Waiting for .*background route activation/);
+    assert.ok(
+        source.indexOf('spawnNoWaitWorker({')
+            < source.indexOf('Watchdog will automatically restart the server'),
+        'detached no-wait launch must begin before public-ready output',
+    );
     assert.ok(
         noWaitSource.indexOf('await waitForNoWaitReadiness({')
             < noWaitSource.indexOf('await upsertRoute(routeKey'),

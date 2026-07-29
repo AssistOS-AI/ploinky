@@ -41,6 +41,7 @@ const ERROR_OPERATIONS = new Set([
     'update-dns-record',
     'delete-dns-record',
     'cloudflare-api',
+    'reconcile-ingress',
     'reconcile-dns',
     'remove-dns-record',
     'verify-remote',

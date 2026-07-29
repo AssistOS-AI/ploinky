@@ -614,6 +614,7 @@ function startSeatbeltProcess(agentName, manifest, agentPath, options = {}) {
     return {
         containerName,
         hostPort: returnPort,
+        createdByThisLaunch: true,
         registryRecord: structuredClone(agents[containerName]),
     };
     } catch (error) {
@@ -700,6 +701,7 @@ function ensureSeatbeltService(agentName, manifest, agentPath, options = {}) {
             return {
                 containerName,
                 hostPort,
+                createdByThisLaunch: false,
                 registryRecord: structuredClone(existingRecord),
             };
         }

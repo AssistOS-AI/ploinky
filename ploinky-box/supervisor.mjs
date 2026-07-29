@@ -314,7 +314,7 @@ export async function runBoundedCoreStart(
     if (!Array.isArray(coreArgv) || !coreArgv.includes('start')) {
         throw supervisorError('Bounded core start requires normalized start argv');
     }
-    const result = runner.query(engine.name, [
+    const result = await runner.stream(engine.name, [
         'container', 'exec',
         '--env', `PLOINKY_ROUTER_HOST_PORT=${hostPort}`,
         '--user', 'podman',
@@ -322,9 +322,7 @@ export async function runBoundedCoreStart(
         containerId,
         '/opt/ploinky/bin/ploinky-local',
         ...coreArgv,
-    ], { timeoutMs });
-    if (result.stdout) stdout.write(result.stdout);
-    if (result.stderr) stderr.write(result.stderr);
+    ], { timeoutMs, stdout, stderr });
     if (!result.ok) {
         throw supervisorError(`In-box start failed with status ${result.status}`);
     }

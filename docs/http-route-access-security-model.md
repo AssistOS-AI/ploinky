@@ -623,9 +623,17 @@ A started workspace on port 8080 should satisfy the following probes:
 The managed runtime supports an explicitly configured Cloudflare edge while
 remaining an operator-controlled workspace runtime rather than a hostile
 multi-tenant platform. Local-only mode has no connector and no public HTTP
-hostname. Complete Cloudflare mode requires an existing tunnel connector token
-and a separate least-privilege API token; invalid or incomplete configuration
-fails closed and never creates a quick or new tunnel.
+hostname. An existing tunnel uses separate connector-token and least-privilege
+API-token handles. A connector-only declaration leaves ingress and DNS under
+external operator control. A Ploinky-managed declaration instead supplies
+account, zone, requested tunnel name, and an API-token handle. Ploinky records a
+unique ownership intent before creation, fetches the resulting connector token
+only into memory, and manages ingress and DNS. Managed tunnel deletion is
+disabled by default and, when explicitly enabled, requires an exact ownership
+registry match. A name change allocates a new tunnel but does not delete the old
+allocation; the old requested name must receive its own explicit empty-host
+teardown. Invalid or incomplete configuration fails closed; quick tunnels are
+never created.
 
 | Limit | Impact |
 | --- | --- |

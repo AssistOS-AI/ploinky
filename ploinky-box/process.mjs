@@ -1,4 +1,4 @@
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 
 import { PloinkyBoxError } from './errors.mjs';
 
@@ -16,6 +16,14 @@ const ENGINE_ENV_ALLOWLIST = Object.freeze([
     'TERM',
 ]);
 
+const MAX_PROCESS_OUTPUT_BYTES = 16 * 1024 * 1024;
+
+function assertProcessArguments(args) {
+    if (!Array.isArray(args) || args.some((argument) => typeof argument !== 'string')) {
+        throw new TypeError('Process arguments must be an array of strings');
+    }
+}
+
 export function buildEngineProcessEnvironment(env = process.env) {
     return Object.fromEntries(ENGINE_ENV_ALLOWLIST
         .filter((name) => env[name] !== undefined)
@@ -27,15 +35,13 @@ export function runProcess(command, args, {
     encoding = 'buffer',
     env,
 } = {}) {
-    if (!Array.isArray(args) || args.some((argument) => typeof argument !== 'string')) {
-        throw new TypeError('Process arguments must be an array of strings');
-    }
+    assertProcessArguments(args);
 
     const result = spawnSync(command, args, {
         cwd,
         encoding: encoding === 'buffer' ? null : encoding,
         env,
-        maxBuffer: 16 * 1024 * 1024,
+        maxBuffer: MAX_PROCESS_OUTPUT_BYTES,
     });
 
     if (result.error) {
@@ -63,16 +69,14 @@ export function queryProcess(command, args, {
     input,
     timeoutMs = 10_000,
 } = {}) {
-    if (!Array.isArray(args) || args.some((argument) => typeof argument !== 'string')) {
-        throw new TypeError('Process arguments must be an array of strings');
-    }
+    assertProcessArguments(args);
     const result = spawnSync(command, args, {
         cwd,
         encoding: 'utf8',
         env,
         input,
         timeout: timeoutMs,
-        maxBuffer: 16 * 1024 * 1024,
+        maxBuffer: MAX_PROCESS_OUTPUT_BYTES,
     });
     return {
         ok: result.status === 0 && !result.error,
@@ -82,6 +86,85 @@ export function queryProcess(command, args, {
         error: result.error || null,
         signal: result.signal || null,
     };
+}
+
+export function streamProcess(command, args, {
+    cwd,
+    env,
+    timeoutMs = 10_000,
+    stdout = process.stdout,
+    stderr = process.stderr,
+} = {}) {
+    assertProcessArguments(args);
+
+    return new Promise((resolve) => {
+        const stdoutChunks = [];
+        const stderrChunks = [];
+        let stdoutBytes = 0;
+        let stderrBytes = 0;
+        let processError = null;
+        let settled = false;
+        let timeout = null;
+        let child;
+
+        const capture = (chunk, chunks, byteCount, streamName) => {
+            const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk));
+            const nextByteCount = byteCount + buffer.length;
+            if (nextByteCount > MAX_PROCESS_OUTPUT_BYTES && !processError) {
+                processError = new Error(`${streamName} exceeded the process output limit`);
+                processError.code = 'ENOBUFS';
+                child?.kill();
+            }
+            if (nextByteCount <= MAX_PROCESS_OUTPUT_BYTES) chunks.push(buffer);
+            return nextByteCount;
+        };
+
+        const finish = (status, signal) => {
+            if (settled) return;
+            settled = true;
+            if (timeout) clearTimeout(timeout);
+            resolve({
+                ok: status === 0 && !processError,
+                status: Number.isInteger(status) ? status : 1,
+                stdout: Buffer.concat(stdoutChunks).toString('utf8'),
+                stderr: Buffer.concat(stderrChunks).toString('utf8'),
+                error: processError,
+                signal: signal || null,
+            });
+        };
+
+        try {
+            child = spawn(command, args, {
+                cwd,
+                env,
+                stdio: ['ignore', 'pipe', 'pipe'],
+            });
+        } catch (error) {
+            processError = error;
+            finish(1, null);
+            return;
+        }
+
+        child.stdout.on('data', (chunk) => {
+            stdout.write(chunk);
+            stdoutBytes = capture(chunk, stdoutChunks, stdoutBytes, 'stdout');
+        });
+        child.stderr.on('data', (chunk) => {
+            stderr.write(chunk);
+            stderrBytes = capture(chunk, stderrChunks, stderrBytes, 'stderr');
+        });
+        child.once('error', (error) => {
+            processError ||= error;
+        });
+        child.once('close', finish);
+
+        timeout = setTimeout(() => {
+            if (settled) return;
+            processError = new Error(`Process timed out after ${timeoutMs}ms`);
+            processError.code = 'ETIMEDOUT';
+            child.kill();
+        }, timeoutMs);
+    });
 }
 
 export function createProcessRunner(options = {}) {
@@ -96,6 +179,12 @@ export function createProcessRunner(options = {}) {
             return runProcess(command, args, {
                 ...options,
                 ...runOptions,
+            });
+        },
+        stream(command, args, streamOptions = {}) {
+            return streamProcess(command, args, {
+                ...options,
+                ...streamOptions,
             });
         },
     };

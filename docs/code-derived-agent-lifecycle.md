@@ -624,9 +624,16 @@ is not outer-published. Detailed health is on an unmounted supervisor Unix
 socket. Cloudflared is pinned in the outer image and always targets in-box
 `http://127.0.0.1:8080`; no separate publication agent or nginx layer exists.
 Credential absence is explicit local-only mode with no connector or public HTTP
-hostname. Complete Cloudflare mode requires an existing-tunnel connector token
-and a separate least-privilege DNS/ingress API token; partial or invalid state
-fails closed and Ploinky never creates a quick tunnel or new tunnel.
+hostname. Existing-tunnel API mode uses separate connector-token and
+least-privilege DNS/ingress API-token handles. Connector-only mode supervises a
+token-selected tunnel while an operator maintains its Cloudflare routes.
+Ploinky-managed mode takes account, zone, requested tunnel name, and an
+API-token handle; it persists a unique ownership intent before creation,
+retrieves the connector token only in memory, and reconciles ingress and DNS.
+Deletion is opt-in and is allowed only for the exact registry-owned tunnel.
+Changing the requested name retains the former allocation until its own
+empty-host teardown is selected.
+Partial or invalid state fails closed, and Ploinky never creates a quick tunnel.
 An already-selected `local-ready` generation is adopted by the publication
 supervisor without a duplicate route apply when no previous Cloudflare ownership
 journal exists. Cloudflare activation and teardown still inactivate first and

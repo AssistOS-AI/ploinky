@@ -614,8 +614,10 @@ function normalizeDesired(desired) {
             'accountId',
             'zoneId',
             'tunnelId',
+            'tunnelName',
             'tunnelTokenSecret',
             'apiTokenSecret',
+            'deleteTunnelOnTeardown',
         ]), 'edge desired cloudflare');
         cloudflare = {};
         for (const key of ['accountId', 'zoneId', 'tunnelId']) {
@@ -625,8 +627,21 @@ function normalizeDesired(desired) {
                 cloudflare[key] = value;
             }
         }
+        if (input.tunnelName !== undefined) {
+            const value = String(input.tunnelName || '').trim();
+            if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,47}$/.test(value)) {
+                throw edgeError('edge desired cloudflare.tunnelName is invalid');
+            }
+            cloudflare.tunnelName = value;
+        }
         for (const key of ['tunnelTokenSecret', 'apiTokenSecret']) {
             if (input[key] !== undefined) cloudflare[key] = normalizeSecretHandle(input[key], `edge desired cloudflare.${key}`);
+        }
+        if (input.deleteTunnelOnTeardown !== undefined) {
+            if (typeof input.deleteTunnelOnTeardown !== 'boolean') {
+                throw edgeError('edge desired cloudflare.deleteTunnelOnTeardown must be a boolean');
+            }
+            cloudflare.deleteTunnelOnTeardown = input.deleteTunnelOnTeardown;
         }
     }
 
@@ -739,17 +754,21 @@ function resolveEnabledIdentity(routeSelection, agents) {
 function publicationDisposition(desired) {
     const cloudflare = desired.cloudflare;
     const hostCount = Object.keys(desired.hosts).length;
-    const required = ['accountId', 'zoneId', 'tunnelId', 'tunnelTokenSecret', 'apiTokenSecret'];
-    const populated = cloudflare
-        ? required.filter((key) => Boolean(cloudflare[key]))
-        : [];
+    const existingRequired = ['accountId', 'zoneId', 'tunnelId', 'tunnelTokenSecret', 'apiTokenSecret'];
+    const managedRequired = ['accountId', 'zoneId', 'tunnelName', 'apiTokenSecret'];
+    const keys = cloudflare ? Object.keys(cloudflare) : [];
     const connectorOnly = Boolean(cloudflare)
-        && populated.length === 1
-        && populated[0] === 'tunnelTokenSecret'
+        && keys.length === 1
+        && keys[0] === 'tunnelTokenSecret'
         && hostCount > 0;
-    const apiManaged = Boolean(cloudflare)
-        && populated.length === required.length
-        && hostCount > 0;
+    const existingTunnel = Boolean(cloudflare)
+        && keys.length === existingRequired.length
+        && existingRequired.every((key) => Boolean(cloudflare[key]));
+    const managedAllowed = new Set([...managedRequired, 'deleteTunnelOnTeardown']);
+    const managedTunnel = Boolean(cloudflare)
+        && keys.every((key) => managedAllowed.has(key))
+        && managedRequired.every((key) => Boolean(cloudflare[key]));
+    const apiManaged = existingTunnel || managedTunnel;
     const absent = cloudflare === undefined && hostCount === 0;
     if (absent) {
         return {
@@ -1295,7 +1314,7 @@ function lifecycleAgentProjection(agents) {
 }
 
 function lifecycleBindingDigest(captured) {
-    const digests = sourceDigests(captured);
+    const digests = captured?.sourceDigests || sourceDigests(captured);
     return sourceDigest(Buffer.from(stableStringify({
         routing: lifecycleRoutingProjection(captured.routing),
         agents: lifecycleAgentProjection(captured.agents),
@@ -1979,6 +1998,49 @@ export function loadActiveEdgeRoutingGeneration(options = {}) {
 }
 
 /**
+ * Prove that the mutable lifecycle inputs still contain the exact bytes used
+ * by the active generation. Callers use this under the edge apply lock before
+ * beginning a fail-closed mutation after asynchronous runtime work.
+ */
+export function assertActiveEdgeRoutingSourcesCurrent(options = {}) {
+    const active = loadActiveEdgeRoutingGeneration(options);
+    const captured = collectCapturedSources(active.paths);
+    if (captured.generation !== active.selector.generation) {
+        throw edgeError(
+            'edge routing sources changed since the active generation was selected',
+            'EDGE_GENERATION_SOURCE_CHANGED',
+        );
+    }
+    return active;
+}
+
+/**
+ * Validate the post-runtime route/registry candidate against the lifecycle
+ * inputs used to launch the runtime, while allowing only the route locator and
+ * runtime-only registry metadata excluded by lifecycleBindingDigest().
+ * Returning the exact candidate digest lets the subsequent coordinated apply
+ * reject any source race before it can publish a different generation.
+ */
+export function captureEdgeRoutingLifecycleMutationGeneration(active, options = {}) {
+    const expected = active?.generation || active;
+    if (!expected?.generation || !expected?.sourceDigests) {
+        throw edgeError(
+            'edge lifecycle mutation requires one validated active generation',
+            'EDGE_GENERATION_INVALID',
+        );
+    }
+    const paths = active?.paths || resolveEdgeGenerationPaths(options);
+    const captured = collectCapturedSources(paths);
+    if (lifecycleBindingDigest(captured) !== lifecycleBindingDigest(expected)) {
+        throw edgeError(
+            'edge lifecycle sources changed during runtime route activation',
+            'EDGE_GENERATION_SOURCE_CHANGED',
+        );
+    }
+    return captured.generation;
+}
+
+/**
  * Return the validated selector even while authorization is inactive. This is
  * intentionally narrower than loading a generation: coordinators use it only
  * to prove that a retry still refers to the exact selected candidate (or, for
@@ -2127,6 +2189,8 @@ export default {
     edgeTopologyMount,
     inactivateEdgeRoutingGeneration,
     initializeFreshEdgeRoutingSources,
+    assertActiveEdgeRoutingSourcesCurrent,
+    captureEdgeRoutingLifecycleMutationGeneration,
     loadActiveEdgeRoutingGeneration,
     readEdgeRoutingSelection,
     prepareEdgeRoutingGeneration,

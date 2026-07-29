@@ -6,6 +6,8 @@ import test from 'node:test';
 
 import {
     applyEdgeRoutingGeneration,
+    assertActiveEdgeRoutingSourcesCurrent,
+    captureEdgeRoutingLifecycleMutationGeneration,
     initializeFreshEdgeRoutingSources,
     loadActiveEdgeRoutingGeneration,
     prepareEdgeRoutingGeneration,
@@ -194,6 +196,56 @@ test('durable preparation remains inactive until its exact lease commits', (t) =
     assert.equal(committed.selector.generation, prepared.selector.generation);
 });
 
+test('live source drift is rejected without inactivating the selected generation', (t) => {
+    const fixture = createFixture(t);
+    const applied = applyEdgeRoutingGeneration({
+        workspaceRoot: fixture.workspace,
+        reason: 'source-drift-baseline',
+    });
+    fs.writeFileSync(path.join(fixture.alphaDir, 'manifest.json'), JSON.stringify({
+        routerAccess: { httpRoutes: [] },
+    }, null, 2));
+
+    assert.throws(
+        () => assertActiveEdgeRoutingSourcesCurrent({ workspaceRoot: fixture.workspace }),
+        { code: 'EDGE_GENERATION_SOURCE_CHANGED' },
+    );
+    const stillActive = loadActiveEdgeRoutingGeneration({ workspaceRoot: fixture.workspace });
+    assert.equal(stillActive.selector.generation, applied.selector.generation);
+    assert.equal(stillActive.selector.activationId, applied.selector.activationId);
+});
+
+test('runtime locator mutation remains bound to the launch generation lifecycle', (t) => {
+    const fixture = createFixture(t);
+    const applied = applyEdgeRoutingGeneration({
+        workspaceRoot: fixture.workspace,
+        reason: 'runtime-locator-baseline',
+    });
+    const routingFile = path.join(fixture.ploinkyDir, 'routing.json');
+    const routing = JSON.parse(fs.readFileSync(routingFile, 'utf8'));
+    routing.routes.alpha.hostPort = 43199;
+    fs.writeFileSync(routingFile, JSON.stringify(routing, null, 2));
+    const agentsFile = path.join(fixture.ploinkyDir, 'agents.json');
+    const agents = JSON.parse(fs.readFileSync(agentsFile, 'utf8'));
+    agents['alpha-container'].containerId = 'runtime-alpha';
+    fs.writeFileSync(agentsFile, JSON.stringify(agents, null, 2));
+
+    const candidate = captureEdgeRoutingLifecycleMutationGeneration(applied, {
+        workspaceRoot: fixture.workspace,
+    });
+    assert.match(candidate, /^sha256:[a-f0-9]{64}$/);
+
+    fs.writeFileSync(path.join(fixture.alphaDir, 'manifest.json'), JSON.stringify({
+        routerAccess: { httpRoutes: [] },
+    }, null, 2));
+    assert.throws(
+        () => captureEdgeRoutingLifecycleMutationGeneration(applied, {
+            workspaceRoot: fixture.workspace,
+        }),
+        { code: 'EDGE_GENERATION_SOURCE_CHANGED' },
+    );
+});
+
 test('connector-only desired state compiles as Cloudflare reconciling and preserves exact hosts', (t) => {
     const fixture = createFixture(t, {
         desired: {
@@ -220,6 +272,97 @@ test('connector-only desired state compiles as Cloudflare reconciling and preser
     assert.equal(applied.selector.publicationState, 'reconciling');
     assert.equal(applied.topology.state, 'reconciling');
     assert.deepEqual(Object.keys(applied.generation.compiled.hosts), ['office.example.test']);
+});
+
+test('complete API-managed desired state with no hosts compiles as an explicit teardown', (t) => {
+    const fixture = createFixture(t, {
+        desired: {
+            hosts: {},
+            cloudflare: {
+                accountId: 'account_123',
+                zoneId: 'zone_123',
+                tunnelId: 'tunnel_123',
+                tunnelTokenSecret: 'publication/cloudflare-connector',
+                apiTokenSecret: 'publication/cloudflare-api',
+            },
+        },
+    });
+    const applied = applyEdgeRoutingGeneration({
+        workspaceRoot: fixture.workspace,
+        reason: 'api-managed-teardown-generation',
+    });
+    assert.deepEqual(applied.generation.compiled.publication, {
+        mode: 'cloudflare',
+        management: 'api-managed',
+        defaultState: 'reconciling',
+        complete: true,
+    });
+    assert.equal(applied.selector.publicationState, 'reconciling');
+    assert.equal(applied.topology.state, 'reconciling');
+    assert.deepEqual(applied.generation.compiled.hosts, {});
+});
+
+test('Ploinky-managed tunnel desired state compiles without a connector-token handle', (t) => {
+    const fixture = createFixture(t, {
+        desired: {
+            hosts: {
+                'office.example.test': {
+                    agent: 'fixtures/alpha',
+                },
+            },
+            cloudflare: {
+                accountId: 'account_123',
+                zoneId: 'zone_123',
+                tunnelName: 'explorer-qa',
+                apiTokenSecret: 'publication/cloudflare-api',
+                deleteTunnelOnTeardown: true,
+            },
+        },
+    });
+    const applied = applyEdgeRoutingGeneration({
+        workspaceRoot: fixture.workspace,
+        reason: 'managed-tunnel-generation',
+    });
+    assert.deepEqual(applied.generation.compiled.publication, {
+        mode: 'cloudflare',
+        management: 'api-managed',
+        defaultState: 'reconciling',
+        complete: true,
+    });
+    assert.equal(applied.selector.publicationState, 'reconciling');
+    assert.deepEqual(applied.generation.desired.cloudflare, {
+        accountId: 'account_123',
+        zoneId: 'zone_123',
+        tunnelName: 'explorer-qa',
+        apiTokenSecret: 'publication/cloudflare-api',
+        deleteTunnelOnTeardown: true,
+    });
+});
+
+test('Ploinky-managed tunnel with no hosts compiles as an explicit teardown', (t) => {
+    const fixture = createFixture(t, {
+        desired: {
+            hosts: {},
+            cloudflare: {
+                accountId: 'account_123',
+                zoneId: 'zone_123',
+                tunnelName: 'explorer-qa',
+                apiTokenSecret: 'publication/cloudflare-api',
+                deleteTunnelOnTeardown: true,
+            },
+        },
+    });
+    const applied = applyEdgeRoutingGeneration({
+        workspaceRoot: fixture.workspace,
+        reason: 'managed-tunnel-teardown-generation',
+    });
+    assert.deepEqual(applied.generation.compiled.publication, {
+        mode: 'cloudflare',
+        management: 'api-managed',
+        defaultState: 'reconciling',
+        complete: true,
+    });
+    assert.deepEqual(applied.generation.compiled.hosts, {});
 });
 
 test('partial connector/API desired state remains in fail-closed error publication', (t) => {

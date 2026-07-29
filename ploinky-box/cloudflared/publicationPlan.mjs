@@ -8,17 +8,31 @@ const CONFIGURATION_GENERATION = /^sha256:[a-f0-9]{64}$/;
 const SCOPE_IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
 const SECRET_HANDLE = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$/;
 const HOST_LABEL = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
-const REQUIRED_CLOUDFLARE_FIELDS = Object.freeze([
+const EXISTING_TUNNEL_FIELDS = Object.freeze([
     'accountId',
     'zoneId',
     'tunnelId',
     'tunnelTokenSecret',
     'apiTokenSecret',
 ]);
+const MANAGED_TUNNEL_REQUIRED_FIELDS = Object.freeze([
+    'accountId',
+    'zoneId',
+    'tunnelName',
+    'apiTokenSecret',
+]);
+const MANAGED_TUNNEL_OPTIONAL_FIELDS = Object.freeze([
+    'deleteTunnelOnTeardown',
+]);
 const CONNECTOR_ONLY_FIELDS = Object.freeze([
     'tunnelTokenSecret',
 ]);
-const SUPPORTED_CLOUDFLARE_FIELDS = new Set(REQUIRED_CLOUDFLARE_FIELDS);
+const SUPPORTED_CLOUDFLARE_FIELDS = new Set([
+    ...EXISTING_TUNNEL_FIELDS,
+    ...MANAGED_TUNNEL_REQUIRED_FIELDS,
+    ...MANAGED_TUNNEL_OPTIONAL_FIELDS,
+]);
+const MANAGED_TUNNEL_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,47}$/;
 
 export class CloudflarePublicationError extends Error {
     constructor(message, {
@@ -179,7 +193,7 @@ function normalizeHosts(value) {
 
 function normalizeCloudflareTuple(value) {
     if (value === undefined || value === null) {
-        return Object.freeze({ management: null, tuple: null });
+        return Object.freeze({ management: null, tunnelManagement: null, tuple: null });
     }
     if (!isPlainObject(value)) {
         fail('Cloudflare configuration must be an object of scoped identifiers and secret handles', {
@@ -194,26 +208,42 @@ function normalizeCloudflareTuple(value) {
             operation: 'validate',
         });
     }
+    const stringFields = new Set([
+        ...EXISTING_TUNNEL_FIELDS,
+        ...MANAGED_TUNNEL_REQUIRED_FIELDS,
+    ]);
     const tuple = Object.fromEntries(
-        REQUIRED_CLOUDFLARE_FIELDS.map((field) => [field, String(value[field] || '').trim()]),
+        [...stringFields].map((field) => [field, String(value[field] || '').trim()]),
     );
     const provided = Object.keys(value);
-    const populated = REQUIRED_CLOUDFLARE_FIELDS.filter((field) => tuple[field]);
     const connectorOnly = provided.length === CONNECTOR_ONLY_FIELDS.length
         && CONNECTOR_ONLY_FIELDS.every((field) => (
             Object.prototype.hasOwnProperty.call(value, field) && tuple[field]
         ));
-    const apiManaged = provided.length === REQUIRED_CLOUDFLARE_FIELDS.length
-        && populated.length === REQUIRED_CLOUDFLARE_FIELDS.length;
-    if (!connectorOnly && !apiManaged) {
-        const missing = REQUIRED_CLOUDFLARE_FIELDS.filter((field) => !tuple[field]);
+    const existingTunnel = provided.length === EXISTING_TUNNEL_FIELDS.length
+        && EXISTING_TUNNEL_FIELDS.every((field) => (
+            Object.prototype.hasOwnProperty.call(value, field) && tuple[field]
+        ));
+    const managedAllowed = new Set([
+        ...MANAGED_TUNNEL_REQUIRED_FIELDS,
+        ...MANAGED_TUNNEL_OPTIONAL_FIELDS,
+    ]);
+    const managedTunnel = provided.every((field) => managedAllowed.has(field))
+        && MANAGED_TUNNEL_REQUIRED_FIELDS.every((field) => (
+            Object.prototype.hasOwnProperty.call(value, field) && tuple[field]
+        ));
+    if (!connectorOnly && !existingTunnel && !managedTunnel) {
+        const expected = Object.prototype.hasOwnProperty.call(value, 'tunnelName')
+            ? MANAGED_TUNNEL_REQUIRED_FIELDS
+            : EXISTING_TUNNEL_FIELDS;
+        const missing = expected.filter((field) => !tuple[field]);
         fail(`Cloudflare configuration is partial; missing ${missing.join(', ')}`, {
             code: 'CLOUDFLARE_CONFIGURATION_PARTIAL',
             operation: 'validate',
         });
     }
-    if (apiManaged) {
-        for (const field of ['accountId', 'zoneId', 'tunnelId']) {
+    if (existingTunnel || managedTunnel) {
+        for (const field of ['accountId', 'zoneId']) {
             if (!SCOPE_IDENTIFIER.test(tuple[field])) {
                 fail(`Cloudflare ${field} is malformed`, {
                     code: 'CLOUDFLARE_CONFIGURATION_INVALID',
@@ -222,9 +252,33 @@ function normalizeCloudflareTuple(value) {
             }
         }
     }
-    const secretFields = apiManaged
+    if (existingTunnel && !SCOPE_IDENTIFIER.test(tuple.tunnelId)) {
+        fail('Cloudflare tunnelId is malformed', {
+            code: 'CLOUDFLARE_CONFIGURATION_INVALID',
+            operation: 'validate',
+        });
+    }
+    if (managedTunnel) {
+        if (!MANAGED_TUNNEL_NAME.test(tuple.tunnelName)) {
+            fail('Cloudflare tunnelName must use 1-48 letters, digits, dots, underscores, or hyphens', {
+                code: 'CLOUDFLARE_CONFIGURATION_INVALID',
+                operation: 'validate',
+            });
+        }
+        if (Object.prototype.hasOwnProperty.call(value, 'deleteTunnelOnTeardown')
+            && typeof value.deleteTunnelOnTeardown !== 'boolean') {
+            fail('Cloudflare deleteTunnelOnTeardown must be a boolean', {
+                code: 'CLOUDFLARE_CONFIGURATION_INVALID',
+                operation: 'validate',
+            });
+        }
+        tuple.deleteTunnelOnTeardown = value.deleteTunnelOnTeardown === true;
+    }
+    const secretFields = existingTunnel
         ? ['tunnelTokenSecret', 'apiTokenSecret']
-        : CONNECTOR_ONLY_FIELDS;
+        : managedTunnel
+            ? ['apiTokenSecret']
+            : CONNECTOR_ONLY_FIELDS;
     for (const field of secretFields) {
         if (!SECRET_HANDLE.test(tuple[field])) {
             fail(`Cloudflare ${field} must be an opaque encrypted-store handle`, {
@@ -233,14 +287,19 @@ function normalizeCloudflareTuple(value) {
             });
         }
     }
-    if (apiManaged && tuple.tunnelTokenSecret === tuple.apiTokenSecret) {
+    if (existingTunnel && tuple.tunnelTokenSecret === tuple.apiTokenSecret) {
         fail('Cloudflare connector and API tokens require separate secret handles', {
             code: 'CLOUDFLARE_SECRET_SEPARATION_REQUIRED',
             operation: 'validate',
         });
     }
     return Object.freeze({
-        management: apiManaged ? 'api-managed' : 'connector-only',
+        management: existingTunnel || managedTunnel ? 'api-managed' : 'connector-only',
+        tunnelManagement: existingTunnel
+            ? 'existing'
+            : managedTunnel
+                ? 'ploinky-managed'
+                : null,
         tuple,
     });
 }
@@ -253,7 +312,7 @@ export function normalizeCloudflarePublicationDesired({
     const generation = normalizeConfigurationGeneration(configurationGeneration);
     const normalizedHosts = normalizeHosts(hosts);
     const classified = normalizeCloudflareTuple(cloudflare);
-    const { management, tuple } = classified;
+    const { management, tunnelManagement, tuple } = classified;
     if (!management && normalizedHosts.length) {
         fail('Cloudflare hostnames require Cloudflare publication configuration', {
             code: 'CLOUDFLARE_CONFIGURATION_PARTIAL',
@@ -273,7 +332,7 @@ export function normalizeCloudflarePublicationDesired({
             }),
         });
     }
-    if (!normalizedHosts.length) {
+    if (!normalizedHosts.length && management === 'connector-only') {
         fail('Complete Cloudflare mode requires at least one valid hostname', {
             code: 'CLOUDFLARE_CONFIGURATION_PARTIAL',
             operation: 'validate',
@@ -295,39 +354,103 @@ export function normalizeCloudflarePublicationDesired({
             desiredDigest: publicationDigest(digestInput),
         });
     }
-    const scope = {
+    const existingTunnel = tunnelManagement === 'existing';
+    const scope = existingTunnel ? {
         accountId: tuple.accountId,
         zoneId: tuple.zoneId,
         tunnelId: tuple.tunnelId,
+    } : null;
+    const managedTunnel = existingTunnel ? null : {
+        name: tuple.tunnelName,
+        deleteOnTeardown: tuple.deleteTunnelOnTeardown === true,
     };
+    if (!normalizedHosts.length) {
+        const digestInput = {
+            mode: 'local-only',
+            management: 'api-managed',
+            tunnelManagement,
+            configurationGeneration: generation,
+            ...(scope ? { scope } : {
+                accountId: tuple.accountId,
+                zoneId: tuple.zoneId,
+                managedTunnel,
+            }),
+            hosts: [],
+        };
+        return deepFreeze({
+            ...digestInput,
+            secretHandles: {
+                apiToken: tuple.apiTokenSecret,
+                ...(existingTunnel ? { tunnelToken: tuple.tunnelTokenSecret } : {}),
+            },
+            desiredDigest: publicationDigest(digestInput),
+        });
+    }
     const ingress = [
         ...normalizedHosts.map(({ hostname }) => ({ hostname, service: CLOUDFLARE_ORIGIN })),
         { service: CLOUDFLARE_TERMINAL_SERVICE },
     ];
-    const dns = normalizedHosts.map(({ hostname }) => ({
+    const dns = scope ? normalizedHosts.map(({ hostname }) => ({
         hostname,
         type: 'CNAME',
         content: `${scope.tunnelId}.cfargotunnel.com`,
         proxied: true,
         ttl: 1,
-    }));
+    })) : null;
     const digestInput = {
         mode: 'cloudflare',
         management,
+        tunnelManagement,
         configurationGeneration: generation,
-        scope,
+        ...(scope ? { scope } : {
+            accountId: tuple.accountId,
+            zoneId: tuple.zoneId,
+            managedTunnel,
+        }),
         hosts: normalizedHosts,
         ingress,
-        dns,
+        ...(scope ? { dns } : {}),
     };
     return deepFreeze({
         ...digestInput,
         secretHandles: {
-            tunnelToken: tuple.tunnelTokenSecret,
             apiToken: tuple.apiTokenSecret,
+            ...(existingTunnel ? { tunnelToken: tuple.tunnelTokenSecret } : {}),
         },
         desiredDigest: publicationDigest(digestInput),
     });
+}
+
+export function materializeManagedCloudflarePublicationPlan(plan, tunnelId) {
+    if (plan?.management !== 'api-managed' || plan?.tunnelManagement !== 'ploinky-managed') {
+        return plan;
+    }
+    const normalizedTunnelId = String(tunnelId || '').trim();
+    if (!SCOPE_IDENTIFIER.test(normalizedTunnelId)) {
+        fail('Cloudflare managed tunnel resolution returned a malformed tunnel id', {
+            code: 'CLOUDFLARE_MANAGED_TUNNEL_INVALID',
+            operation: 'resolve-managed-tunnel',
+        });
+    }
+    const scope = {
+        accountId: plan.accountId,
+        zoneId: plan.zoneId,
+        tunnelId: normalizedTunnelId,
+    };
+    const materialized = {
+        ...plan,
+        scope,
+    };
+    if (plan.mode === 'cloudflare') {
+        materialized.dns = plan.hosts.map(({ hostname }) => ({
+            hostname,
+            type: 'CNAME',
+            content: `${normalizedTunnelId}.cfargotunnel.com`,
+            proxied: true,
+            ttl: 1,
+        }));
+    }
+    return deepFreeze(materialized);
 }
 
 export function publicPlanSummary(plan) {
@@ -337,10 +460,14 @@ export function publicPlanSummary(plan) {
             && ['connector-only', 'api-managed'].includes(plan?.management)
             ? plan.management
             : null,
+        tunnelManagement: plan?.management === 'api-managed'
+            && ['existing', 'ploinky-managed'].includes(plan?.tunnelManagement)
+            ? plan.tunnelManagement
+            : null,
         configurationGeneration: String(plan?.configurationGeneration || ''),
         desiredDigest: String(plan?.desiredDigest || ''),
         hostnames: Array.isArray(plan?.hosts) ? plan.hosts.map((entry) => entry.hostname) : [],
     };
-    if (plan?.management === 'api-managed') value.scope = { ...plan.scope };
+    if (plan?.management === 'api-managed' && plan?.scope) value.scope = { ...plan.scope };
     return deepFreeze(value);
 }

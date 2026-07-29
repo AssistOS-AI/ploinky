@@ -91,10 +91,16 @@ async function mergeRoutingConfig(mutator, {
     coordinate = true,
     reason = 'routing-merge',
     preparationLease,
+    validateActiveGeneration,
+    captureExpectedGeneration,
 } = {}) {
     const release = await acquireRoutingLock();
     try {
         const mutate = async (applyLockCapability = undefined) => {
+            let validatedActiveGeneration;
+            if (coordinate && typeof validateActiveGeneration === 'function') {
+                validatedActiveGeneration = await validateActiveGeneration();
+            }
             if (coordinate && !preparationLease) {
                 inactivateEdgeRoutingGeneration(reason, { applyLockCapability });
             }
@@ -102,10 +108,14 @@ async function mergeRoutingConfig(mutator, {
             const next = await mutator(current) || current;
             writeRoutingConfig(next, { coordinate: false });
             if (coordinate) {
+                const expectedGeneration = typeof captureExpectedGeneration === 'function'
+                    ? await captureExpectedGeneration(validatedActiveGeneration)
+                    : undefined;
                 applyEdgeRoutingGeneration({
                     reason,
                     preparationLease,
                     applyLockCapability,
+                    ...(expectedGeneration === undefined ? {} : { expectedGeneration }),
                 });
             }
             return next;

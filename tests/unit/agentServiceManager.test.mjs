@@ -95,6 +95,8 @@ test('prepared graph launches suppress intermediate registry persistence only fo
     assert.match(source, /preserveRegistryRecord:\s*preserveRuntimeRegistryRecord/);
     assert.match(source, /if \(!preserveRuntimeRegistryRecord\) saveAgentsMap\(agents\)/);
     assert.match(source, /registryRecord:\s*structuredClone\(agents\[containerName\]\)/);
+    assert.match(source, /returning early \(container exists\)[\s\S]*createdByThisLaunch:\s*false/);
+    assert.match(source, /runtimeNetwork:\s*structuredClone\(manifestNetwork\),[\s\S]*createdByThisLaunch:\s*true/);
     assert.match(source, /const registryRecord = \{\s*\.\.\.existingRecord,\s*runtime,\s*containerId: reuseInspection\.id,/);
     assert.match(source, /type: 'agent',\s*runtime,\s*containerId: started\.containerId,/);
     assert.match(source, /assertHostModeGenerationCapability\(\{[\s\S]*containerName,\s*\}, \{ preparedCapability: options\.preparedHostModeCapability \}\)/);

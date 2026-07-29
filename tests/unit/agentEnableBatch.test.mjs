@@ -122,6 +122,13 @@ test('one batch stages a non-host dependency and exact host owner before either 
         reason: 'test-complete-graph-ready',
         preparationLease: prepared.preparedGeneration.preparationLease,
     });
+    assert.doesNotThrow(() => edge.assertHostModeGenerationCapability({
+        agentId: 'agent:media/livekit',
+        instanceId: hostPlan.instanceId,
+        enableGeneration: hostPlan.enableGeneration,
+        routeKey: hostPlan.routeKey,
+        containerName: hostPlan.containerName,
+    }), 'the committed target-less graph must authorize its exact no-wait host runtime');
 });
 
 test('a configured static agent stages the workspace root as its immutable project path', () => {
