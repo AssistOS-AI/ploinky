@@ -13,6 +13,7 @@ import {
     prepareEdgeRoutingGeneration,
     readCurrentEdgeTopology,
 } from '../../cli/sandbox/edgeGeneration.js';
+import { resolveEdgeRoutePlan } from '../../cli/server/edgeRoutePlan.js';
 
 function localDesired(overrides = {}) {
     return {
@@ -140,6 +141,59 @@ test('generation compiles convention access solely from HTTP route policy', (t) 
     ));
     assert.equal(policyEntry.access, 'authenticated');
     assert.equal(Object.hasOwn(applied.generation.compiled.security, 'privateRouteConsumers'), false);
+});
+
+test('agent-mcp exposes only the selected root manifest dependency closure', (t) => {
+    const fixture = createFixture(t, {
+        desired: {
+            hosts: {
+                'explorer.example.test': {
+                    agent: 'fixtures/alpha',
+                    routerSurfaces: ['agent-mcp'],
+                },
+            },
+            cloudflare: {
+                tunnelTokenSecret: 'publication/test-connector',
+            },
+        },
+        alphaManifest: {
+            enable: ['beta global no-wait'],
+        },
+    });
+    const applied = applyEdgeRoutingGeneration({
+        workspaceRoot: fixture.workspace,
+        reason: 'agent-mcp-dependency-closure',
+        publicationState: 'ready',
+    });
+    assert.deepEqual(
+        applied.generation.compiled.agentMcpRoutes['explorer.example.test'],
+        ['alpha', 'beta'],
+    );
+
+    const dependencyMcp = resolveEdgeRoutePlan({
+        req: {
+            method: 'POST',
+            url: '/beta/mcp',
+            headers: { host: 'explorer.example.test' },
+        },
+        listener: 'public',
+    });
+    assert.equal(dependencyMcp.ok, true);
+    assert.equal(dependencyMcp.kind, 'agent-root');
+    assert.equal(dependencyMcp.routeKey, 'beta');
+    assert.equal(dependencyMcp.upstreamPath, '/mcp');
+
+    const dependencyContent = resolveEdgeRoutePlan({
+        req: {
+            method: 'GET',
+            url: '/beta/index.html',
+            headers: { host: 'explorer.example.test' },
+        },
+        listener: 'public',
+    });
+    assert.equal(dependencyContent.ok, true);
+    assert.equal(dependencyContent.routeKey, 'alpha');
+    assert.equal(dependencyContent.upstreamPath, '/beta/index.html');
 });
 
 test('legacy duplicate route and host-network authority is rejected', (t) => {

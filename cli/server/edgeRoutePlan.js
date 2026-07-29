@@ -392,13 +392,25 @@ function isRouteMount(pathname, root) {
     return pathname === root || pathname.startsWith(`${root}/`);
 }
 
-function surfaceForPath(pathname, selectedSurfaces) {
+function selectedAgentMcpRoute(pathname, routeKeys) {
+    const segments = String(pathname || '').split('/').filter(Boolean);
+    if (segments.length < 2) return '';
+    let routeKey = '';
+    try { routeKey = decodeURIComponent(segments[0]); } catch (_) { return ''; }
+    if (!new Set(routeKeys || []).has(routeKey)) return '';
+    const prefix = `/${segments[0]}/mcp`;
+    return isRouteMount(pathname, prefix) ? routeKey : '';
+}
+
+function surfaceForPath(pathname, selectedSurfaces, agentMcpRoutes = []) {
     const available = new Set(selectedSurfaces || []);
     if (available.has('browser-auth') && (
         AGENT_ROOT_AUTH_SUPPORT_PATHS.has(pathname)
     )) return { name: 'browser-auth', routerOwned: true };
     if (available.has('agent-mcp')) {
         if (isRouteMount(pathname, '/mcp')) return { name: 'agent-mcp', routerOwned: false };
+        const routeKey = selectedAgentMcpRoute(pathname, agentMcpRoutes);
+        if (routeKey) return { name: 'agent-mcp', routerOwned: false, routeKey };
         if (pathname === '/MCPBrowserClient.js' || isRouteMount(pathname, '/web-libs')) {
             return { name: 'agent-mcp', routerOwned: true };
         }
@@ -575,7 +587,11 @@ export function resolveEdgeRoutePlan({
     }
 
     if (hostSelection.kind === 'agent-root') {
-        const surface = surfaceForPath(pathname, snapshot.compiled.surfaces?.[host] || []);
+        const surface = surfaceForPath(
+            pathname,
+            snapshot.compiled.surfaces?.[host] || [],
+            snapshot.compiled.agentMcpRoutes?.[host] || [],
+        );
         if (surface?.routerOwned) {
             return routerSurfacePlan({
                 hostSelection,
@@ -585,6 +601,20 @@ export function resolveEdgeRoutePlan({
                 lease,
                 snapshot,
                 surface: surface.name,
+            });
+        }
+        if (surface?.name === 'agent-mcp' && surface.routeKey) {
+            return agentRootPlan({
+                req,
+                host,
+                listener,
+                pathname,
+                parsedUrl: url,
+                hostSelection,
+                selectedRoot: null,
+                routes,
+                snapshot,
+                lease,
             });
         }
         if (isReservedRouterSurface(pathname) && !surface) {

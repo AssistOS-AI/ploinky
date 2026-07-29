@@ -814,6 +814,94 @@ function collectManifestHostNetworkCapabilities(routing, manifests, agents) {
     return capabilities;
 }
 
+function manifestEnableReference(entry) {
+    const raw = entry && typeof entry === 'object' && !Array.isArray(entry)
+        ? (entry.agent ?? entry.ref ?? entry.spec ?? entry.name)
+        : entry;
+    const token = String(raw || '').trim().split(/\s+/).find((part) => (
+        part && part.toLowerCase() !== 'no-wait'
+    )) || '';
+    if (!token) return '';
+    const slashIndex = token.indexOf('/');
+    const colonIndex = token.indexOf(':');
+    if (slashIndex >= 0 && colonIndex > slashIndex) {
+        return token.slice(0, colonIndex);
+    }
+    return token;
+}
+
+function routeAgentRecord(route, agents) {
+    const direct = route?.container ? agents?.[route.container] : null;
+    if (direct && direct.type === 'agent') return direct;
+    const matches = Object.values(agents || {}).filter((record) => (
+        record
+        && record.type === 'agent'
+        && record.repoName === route?.repo
+        && record.agentName === route?.agent
+    ));
+    return matches.length === 1 ? matches[0] : null;
+}
+
+function manifestEnableEntriesForRoute(manifest, route, agents) {
+    const entries = Array.isArray(manifest?.enable) ? [...manifest.enable] : [];
+    const profile = String(routeAgentRecord(route, agents)?.profile || '').trim().toLowerCase();
+    const profiles = manifest?.profiles && typeof manifest.profiles === 'object'
+        ? manifest.profiles
+        : {};
+    const profileBlock = profiles[profile] || profiles.default;
+    if (Array.isArray(profileBlock?.enable)) entries.push(...profileBlock.enable);
+    return entries;
+}
+
+function resolveEnabledRouteKey(reference, routes, parentRoute) {
+    const value = String(reference || '').trim();
+    if (!value) return '';
+    if (Object.hasOwn(routes, value) && routes[value] && !routes[value].disabled) return value;
+
+    const separator = value.includes('/') ? '/' : (value.includes(':') ? ':' : '');
+    let matches;
+    if (separator) {
+        const [repo, agent] = value.split(separator, 2);
+        matches = Object.entries(routes).filter(([, route]) => (
+            route
+            && !route.disabled
+            && route.repo === repo
+            && route.agent === agent
+        ));
+    } else {
+        matches = Object.entries(routes).filter(([, route]) => (
+            route && !route.disabled && route.agent === value
+        ));
+        const sameRepo = matches.filter(([, route]) => route.repo === parentRoute?.repo);
+        if (sameRepo.length === 1) matches = sameRepo;
+    }
+    return matches.length === 1 ? matches[0][0] : '';
+}
+
+function compileAgentMcpRouteClosure(rootRouteKey, routing, manifests, agents) {
+    const routes = routing?.routes || {};
+    const allowed = new Set();
+    const pending = [rootRouteKey];
+    while (pending.length) {
+        const routeKey = pending.shift();
+        if (allowed.has(routeKey)) continue;
+        const route = routes[routeKey];
+        if (!route || route.disabled) continue;
+        allowed.add(routeKey);
+        for (const entry of manifestEnableEntriesForRoute(manifests?.[routeKey], route, agents)) {
+            const dependencyRouteKey = resolveEnabledRouteKey(
+                manifestEnableReference(entry),
+                routes,
+                route,
+            );
+            if (dependencyRouteKey && !allowed.has(dependencyRouteKey)) {
+                pending.push(dependencyRouteKey);
+            }
+        }
+    }
+    return [...allowed].sort();
+}
+
 function compileGeneration({ routing, policy, desired, agents, manifests }) {
     validatePolicy(policy);
     validateRoutingShape(routing, manifests);
@@ -847,6 +935,7 @@ function compileGeneration({ routing, policy, desired, agents, manifests }) {
     });
     const hosts = {};
     const surfaces = {};
+    const agentMcpRoutes = {};
     for (const [hostname, entry] of Object.entries(normalizedDesired.hosts)) {
         const selectedRoute = resolveAgentRoute(entry.agent, routing);
         hosts[hostname] = {
@@ -855,6 +944,14 @@ function compileGeneration({ routing, policy, desired, agents, manifests }) {
             routeKey: selectedRoute.routeKey,
         };
         surfaces[hostname] = [...(entry.routerSurfaces || [])];
+        agentMcpRoutes[hostname] = surfaces[hostname].includes('agent-mcp')
+            ? compileAgentMcpRouteClosure(
+                selectedRoute.routeKey,
+                routing,
+                manifests,
+                agents,
+            )
+            : [];
     }
 
     return {
@@ -862,6 +959,7 @@ function compileGeneration({ routing, policy, desired, agents, manifests }) {
         compiled: {
             hosts,
             surfaces,
+            agentMcpRoutes,
             policy: compiledPolicy,
             security: {
                 hostNetworkCapabilities,
