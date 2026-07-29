@@ -275,7 +275,7 @@ export async function handleAuthRoutes(req, res, parsedUrl, { routePlan = null }
             if (method !== 'GET') {
                 res.writeHead(405); res.end(); return true;
             }
-            const returnTo = parsedUrl.searchParams.get('returnTo') || '/';
+            const returnTo = normalizeRelativePath(parsedUrl.searchParams.get('returnTo') || '/', '/');
             const prompt = parsedUrl.searchParams.get('prompt') || undefined;
             if (!requireCurrentGeneration(res, routePlan)) return true;
             const { redirectUrl } = await authService.beginLogin({ baseUrl, returnTo, prompt });
@@ -513,7 +513,7 @@ export async function handleAuthRoutes(req, res, parsedUrl, { routePlan = null }
             });
             appendSetCookie(res, cookie);
             res.writeHead(302, {
-                Location: result.redirectTo || '/',
+                Location: normalizeRelativePath(result.redirectTo || '/', '/'),
             });
             res.end('Login successful');
             appendLog('auth_callback_success', { user: result.user?.id });

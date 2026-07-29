@@ -1,5 +1,9 @@
 import { readRouterSettings } from '../auth/routerSettings.js';
-import { escapeHtml, normalizeRelativePath } from './shared.js';
+import {
+    appendLocationHashToRelativeTarget,
+    escapeHtml,
+    normalizeRelativePath,
+} from './shared.js';
 
 function renderLoggedOutHtml(nextPath) {
     const safeNext = normalizeRelativePath(nextPath, '/webchat/');
@@ -309,6 +313,11 @@ function renderLocalLoginHtml({
       const button = form?.querySelector('button[type="submit"]');
       if (!form || !button) return;
       form.addEventListener('submit', () => {
+        const returnTo = form.elements.namedItem('returnTo');
+        if (returnTo) {
+          const appendLocationHash = (${appendLocationHashToRelativeTarget.toString()});
+          returnTo.value = appendLocationHash(returnTo.value, window.location.hash);
+        }
         if (button.classList.contains('is-loading')) return;
         button.classList.add('is-loading');
         button.disabled = true;

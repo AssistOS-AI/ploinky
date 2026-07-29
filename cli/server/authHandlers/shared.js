@@ -46,19 +46,127 @@ function wantsJsonResponse(req, pathname) {
     return pathname.startsWith('/apis/') || pathname.startsWith('/api/') || pathname.startsWith('/blobs');
 }
 
-function normalizeRelativePath(value, fallback = '/') {
-    const raw = typeof value === 'string' ? value.trim() : '';
-    if (!raw) return fallback;
-    try {
-        const parsed = new URL(raw, 'http://localhost');
-        if (parsed.origin !== 'http://localhost') {
-            return fallback;
+const RELATIVE_PATH_BASE_URL = 'http://localhost';
+const RAW_CONTROL_CHARACTER = /[\u0000-\u001f\u007f]/;
+const RAW_WHITESPACE = /\s/;
+const INVALID_PERCENT_ESCAPE = /%(?![0-9a-f]{2})/i;
+const ENCODED_CONTROL_CHARACTER = /%(?:0[0-9a-f]|1[0-9a-f]|7f)/i;
+const ENCODED_PATH_SEPARATOR = /%(?:2f|5c)/i;
+const AUTHORITY_LIKE_FRAGMENT = /^(?:[/\\]{2}|[a-z][a-z0-9+.-]*:)/i;
+
+function containsUnsafeEncoding(value, { rejectSeparators = false } = {}) {
+    let current = String(value || '');
+    for (let depth = 0; depth < 8; depth += 1) {
+        if (ENCODED_CONTROL_CHARACTER.test(current)) return true;
+        if (rejectSeparators && ENCODED_PATH_SEPARATOR.test(current)) return true;
+        if (!current.includes('%')) return false;
+        try {
+            const decoded = decodeURIComponent(current);
+            if (decoded === current) return false;
+            current = decoded;
+        } catch (_) {
+            return depth === 0;
         }
-        const normalized = `${parsed.pathname || '/'}${parsed.search || ''}${parsed.hash || ''}`;
-        return normalized.startsWith('/') ? normalized : fallback;
+    }
+    return true;
+}
+
+function fragmentLooksLikeAuthority(fragment) {
+    let current = String(fragment || '');
+    for (let depth = 0; depth < 8; depth += 1) {
+        if (current !== current.trim()) return true;
+        if (RAW_CONTROL_CHARACTER.test(current) || AUTHORITY_LIKE_FRAGMENT.test(current)) return true;
+        if (!current.includes('%')) return false;
+        try {
+            const decoded = decodeURIComponent(current);
+            if (decoded === current) return false;
+            current = decoded;
+        } catch (_) {
+            return depth === 0;
+        }
+    }
+    return true;
+}
+
+function normalizeRelativePath(value, fallback = '/') {
+    const raw = typeof value === 'string' ? value : '';
+    if (!raw || raw !== raw.trim()) return fallback;
+    if (!raw.startsWith('/') || raw.startsWith('//') || raw.includes('\\')) return fallback;
+    if (RAW_CONTROL_CHARACTER.test(raw) || RAW_WHITESPACE.test(raw) || INVALID_PERCENT_ESCAPE.test(raw)) {
+        return fallback;
+    }
+    try {
+        decodeURIComponent(raw);
     } catch (_) {
         return fallback;
     }
+
+    const queryIndex = raw.indexOf('?');
+    const fragmentIndex = raw.indexOf('#');
+    const pathEnd = [queryIndex, fragmentIndex]
+        .filter(index => index >= 0)
+        .reduce((lowest, index) => Math.min(lowest, index), raw.length);
+    const rawPath = raw.slice(0, pathEnd);
+    const rawFragment = fragmentIndex >= 0 ? raw.slice(fragmentIndex + 1) : '';
+
+    if (containsUnsafeEncoding(raw)) return fallback;
+    if (containsUnsafeEncoding(rawPath, { rejectSeparators: true })) return fallback;
+    if (containsUnsafeEncoding(rawFragment, { rejectSeparators: true })) return fallback;
+    if (fragmentLooksLikeAuthority(rawFragment)) return fallback;
+
+    try {
+        const parsed = new URL(raw, RELATIVE_PATH_BASE_URL);
+        if (parsed.origin !== RELATIVE_PATH_BASE_URL || parsed.username || parsed.password) {
+            return fallback;
+        }
+        const normalized = `${parsed.pathname || '/'}${parsed.search || ''}${parsed.hash || ''}`;
+        return normalized.startsWith('/') && !normalized.startsWith('//') ? normalized : fallback;
+    } catch (_) {
+        return fallback;
+    }
+}
+
+function appendLocationHashToRelativeTarget(returnTo, locationHash) {
+    const target = typeof returnTo === 'string' ? returnTo : '';
+    const hash = typeof locationHash === 'string' ? locationHash : '';
+    if (!target || !hash.startsWith('#') || hash === '#' || target.includes('#')) return target;
+    if (/\s/.test(hash) || /[\u0000-\u001f\u007f]/.test(hash) || /%(?![0-9a-f]{2})/i.test(hash)) {
+        return target;
+    }
+
+    let routeState = hash.slice(1);
+    for (let depth = 0; depth < 8; depth += 1) {
+        if (/%(?:0[0-9a-f]|1[0-9a-f]|7f|2f|5c)/i.test(routeState)) return target;
+        if (routeState !== routeState.trim()) return target;
+        if (/[\u0000-\u001f\u007f]/.test(routeState)) return target;
+        if (/^(?:[/\\]{2}|[a-z][a-z0-9+.-]*:)/i.test(routeState)) return target;
+        if (!routeState.includes('%')) break;
+        try {
+            const decoded = decodeURIComponent(routeState);
+            if (decoded === routeState) break;
+            routeState = decoded;
+        } catch (_) {
+            if (depth === 0) return target;
+            break;
+        }
+        if (depth === 7) return target;
+    }
+
+    try {
+        const parsed = new URL(target, 'http://localhost');
+        if (
+            !target.startsWith('/')
+            || target.startsWith('//')
+            || target.includes('\\')
+            || parsed.origin !== 'http://localhost'
+            || parsed.hash
+        ) {
+            return target;
+        }
+    } catch (_) {
+        return target;
+    }
+    return `${target}${hash}`;
 }
 
 function escapeHtml(value = '') {
@@ -97,6 +205,7 @@ function getCookieNameForMode(mode) {
 
 export {
     escapeHtml,
+    appendLocationHashToRelativeTarget,
     getCookieNameForMode,
     getRequestBaseUrl,
     normalizeRelativePath,

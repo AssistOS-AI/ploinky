@@ -374,6 +374,98 @@ test('browser auth host binding rejects selector switches and ignores raw candid
     assert.equal(JSON.parse(staleRes.body).error, 'edge_generation_changed');
 });
 
+test('SSO login and callback keep every return target inside the normalized same-origin boundary', async (t) => {
+    const { authHandlers, authService, createRoutePlan } = await withAuthModules(t, {
+        staticAuthMode: 'sso',
+    });
+    const originals = {
+        isConfigured: authService.isConfigured,
+        beginLogin: authService.beginLogin,
+        handleCallback: authService.handleCallback,
+        getSessionCookieMaxAge: authService.getSessionCookieMaxAge,
+    };
+    t.after(() => {
+        Object.assign(authService, originals);
+    });
+
+    const observedReturnTargets = [];
+    authService.isConfigured = () => true;
+    authService.beginLogin = async ({ returnTo }) => {
+        observedReturnTargets.push(returnTo);
+        return {
+            redirectUrl: 'https://identity.example.test/authorize',
+        };
+    };
+
+    for (const requested of [
+        'https://evil.example/explorer',
+        '//evil.example/explorer',
+        '/%252f%252fevil.example/explorer',
+        '/safe%0dLocation:%20https://evil.example',
+        '/safe#https://evil.example',
+    ]) {
+        const req = makeRequest({
+            method: 'GET',
+            url: `/auth/login?returnTo=${encodeURIComponent(requested)}`,
+            accept: 'text/html',
+        });
+        const res = new MockResponse();
+        await authHandlers.handleAuthRoutes(
+            req,
+            res,
+            new URL(req.url, 'http://localhost'),
+            { routePlan: createRoutePlan() },
+        );
+        assert.equal(res.statusCode, 200);
+        assert.doesNotMatch(res.body, /evil\.example/);
+    }
+    assert.deepEqual(observedReturnTargets, Array(5).fill('/'));
+
+    const validTarget = '/explorer/index.html?view=list#file-exp/Confidential/My%20Space';
+    const validReq = makeRequest({
+        method: 'GET',
+        url: `/auth/login?returnTo=${encodeURIComponent(validTarget)}`,
+        accept: 'text/html',
+    });
+    const validRes = new MockResponse();
+    await authHandlers.handleAuthRoutes(
+        validReq,
+        validRes,
+        new URL(validReq.url, 'http://localhost'),
+        { routePlan: createRoutePlan() },
+    );
+    assert.equal(validRes.statusCode, 200);
+    assert.equal(observedReturnTargets.at(-1), validTarget);
+
+    authService.handleCallback = async () => ({
+        sessionId: 'sso-test-session',
+        user: {
+            id: 'sso:test-user',
+            username: 'test-user',
+            roles: ['user'],
+        },
+        redirectTo: 'https://evil.example/callback-escape',
+    });
+    authService.getSessionCookieMaxAge = () => 60;
+
+    const callbackPlan = createRoutePlan();
+    callbackPlan.snapshot.routing.routes.explorer.hostPort = 0;
+    const callbackReq = makeRequest({
+        method: 'GET',
+        url: '/auth/callback?code=test-code&state=test-state',
+        accept: 'text/html',
+    });
+    const callbackRes = new MockResponse();
+    await authHandlers.handleAuthRoutes(
+        callbackReq,
+        callbackRes,
+        new URL(callbackReq.url, 'http://localhost'),
+        { routePlan: callbackPlan },
+    );
+    assert.equal(callbackRes.statusCode, 302);
+    assert.equal(callbackRes.getHeader('location'), '/');
+});
+
 test('route default keeps static-agent auth for routes with auth mode none', async (t) => {
     const { authHandlers } = await withAuthModules(t);
     const decision = authHandlers.resolveRouteDefaultHttpAccess('webAdmin');
