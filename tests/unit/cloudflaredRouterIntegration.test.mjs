@@ -158,6 +158,7 @@ test('RoutingServer is a thin facade consumer and stops publication before liste
         1,
     );
     const stop = source.indexOf('await cloudflaredRouterIntegration.stop()');
+    const classifierClose = source.indexOf('await interfaceClassifier.close()');
     const privateClose = source.indexOf('await privateListenerSet.close()');
-    assert.ok(stop >= 0 && stop < privateClose);
+    assert.ok(stop >= 0 && stop < classifierClose && classifierClose < privateClose);
 });

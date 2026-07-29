@@ -453,6 +453,7 @@ export function createFakeEngine({
                     '/usr/bin/bash',
                     '/usr/sbin/ip',
                     '/usr/bin/fuse-overlayfs',
+                    '/usr/local/bin/cloudflared',
                     '/usr/local/bin/ploinky-box-entrypoint',
                     '/usr/bin/pasta',
                     '',

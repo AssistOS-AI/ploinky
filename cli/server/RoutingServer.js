@@ -956,6 +956,7 @@ const lifecycle = setupProcessLifecycle(
         beforeClose: [async () => {
             runtimeRelayManager.close();
             await cloudflaredRouterIntegration.stop();
+            await interfaceClassifier.close();
             await privateListenerSet.close();
         }],
     },
@@ -1011,6 +1012,7 @@ healthServer.on('clientError', (_error, socket) => {
 });
 
 try {
+    await interfaceClassifier.start();
     const snapshot = await privateListenerSet.start();
     cloudflaredRouterIntegration.markPrivateListenerReady();
     appendLog('private_server_start', {

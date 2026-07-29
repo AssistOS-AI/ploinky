@@ -6,12 +6,13 @@ import { NETWORK_LABELS, workspaceNetworkIdentity } from '../sandbox/networkLife
 
 const REFRESH_INTERVAL_MS = 1_000;
 
-function defaultRun(args) {
+function defaultRun(args, { signal } = {}) {
     return new Promise((resolve) => {
         execFile('podman', args, {
             encoding: 'utf8',
             timeout: 5_000,
             maxBuffer: 4 * 1024 * 1024,
+            signal,
         }, (error, stdout, stderr) => {
             resolve({
                 ok: !error,
@@ -22,18 +23,18 @@ function defaultRun(args) {
     });
 }
 
-function parseJsonRecord(source, description) {
+function parseJsonRecords(source, description) {
     let parsed;
     try {
         parsed = JSON.parse(String(source || ''));
     } catch (error) {
         throw new Error(`${description} returned malformed JSON: ${error.message}`);
     }
-    const record = Array.isArray(parsed) ? parsed[0] : parsed;
-    if (!record || typeof record !== 'object' || Array.isArray(record)) {
-        throw new Error(`${description} returned no record`);
+    const records = Array.isArray(parsed) ? parsed : [parsed];
+    if (records.some((record) => !record || typeof record !== 'object' || Array.isArray(record))) {
+        throw new Error(`${description} returned an invalid record set`);
     }
-    return record;
+    return records;
 }
 
 function labelsOf(record) {
@@ -133,21 +134,40 @@ export function createListenerInterfaceClassifier({
     now = () => Date.now(),
     refreshIntervalMs = REFRESH_INTERVAL_MS,
     platform = process.platform,
+    schedule = (callback, delay) => setTimeout(callback, delay),
+    cancelSchedule = (timer) => clearTimeout(timer),
 } = {}) {
     if (typeof platform !== 'string' || !platform.trim()) {
         throw new TypeError('listener interface classifier platform must be a non-empty string');
     }
+    if (!Number.isFinite(refreshIntervalMs) || refreshIntervalMs < 1) {
+        throw new TypeError('listener interface classifier refresh interval must be positive');
+    }
+    if (typeof schedule !== 'function' || typeof cancelSchedule !== 'function') {
+        throw new TypeError('listener interface classifier scheduler must be callable');
+    }
     const bindsRuntimeBridgeGatewaysLocally = platform === 'linux';
     const identity = workspaceNetworkIdentity(workspaceRoot);
     const namePrefix = `ploinky-nw-${identity.hash}-`;
-    let gateways = new Set();
-    let refreshedAt = Number.NEGATIVE_INFINITY;
-    let lastError = null;
+    let state = Object.freeze({
+        gateways: new Set(),
+        lastError: null,
+        refreshedAt: Number.NEGATIVE_INFINITY,
+        expiresAt: Number.NEGATIVE_INFINITY,
+        durationMs: 0,
+    });
     let inFlight = null;
+    let activeController = null;
+    let timer = null;
+    let started = false;
+    let closing = false;
+    let closePromise = null;
 
-    async function collectGateways() {
-        const next = new Set();
-        const listed = await Promise.resolve(run(['network', 'ls', '--format', 'json']));
+    async function collectGateways(signal) {
+        const listed = await Promise.resolve(run(
+            ['network', 'ls', '--format', 'json'],
+            { signal },
+        ));
         if (!listed?.ok) throw new Error(`cannot list managed networks: ${listed?.stderr || 'podman failed'}`);
         let summaries;
         try {
@@ -160,10 +180,32 @@ export function createListenerInterfaceClassifier({
             .map((record) => String(record?.Name || record?.name || record?.NetworkName || ''))
             .filter((name) => name.startsWith(namePrefix))
             .sort();
+        if (names.length === 0) return new Set();
+
+        const inspected = await Promise.resolve(run(
+            ['network', 'inspect', ...names],
+            { signal },
+        ));
+        if (!inspected?.ok) {
+            throw new Error(`cannot inspect managed networks: ${inspected?.stderr || 'podman failed'}`);
+        }
+        const records = parseJsonRecords(inspected.stdout, 'managed network inspection');
+        const recordsByName = new Map();
+        for (const record of records) {
+            const name = String(record?.Name || record?.name || '');
+            if (!name || recordsByName.has(name)) {
+                throw new Error('managed network inspection returned missing or duplicate names');
+            }
+            recordsByName.set(name, record);
+        }
+        if (recordsByName.size !== names.length
+            || names.some((name) => !recordsByName.has(name))) {
+            throw new Error('managed network inspection did not match the requested network set');
+        }
+
+        const next = new Set();
         for (const name of names) {
-            const inspected = await Promise.resolve(run(['network', 'inspect', name]));
-            if (!inspected?.ok) throw new Error(`cannot inspect managed network '${name}': ${inspected?.stderr || 'podman failed'}`);
-            const record = parseJsonRecord(inspected.stdout, `network '${name}' inspection`);
+            const record = recordsByName.get(name);
             next.add(validatedManagedGateway(record, {
                 workspaceHash: identity.hash,
                 expectedNamePrefix: namePrefix,
@@ -172,61 +214,131 @@ export function createListenerInterfaceClassifier({
         return next;
     }
 
+    function effectiveGateways(observedAt = now()) {
+        if (state.lastError || observedAt >= state.expiresAt) return null;
+        return state.gateways;
+    }
+
+    function nextRefreshDelay() {
+        if (state.lastError) return refreshIntervalMs;
+        const maximumLead = Math.max(0, refreshIntervalMs - 1);
+        const adaptiveLead = Math.min(
+            maximumLead,
+            Math.max(1, Math.ceil(state.durationMs * 2)),
+        );
+        return Math.max(1, refreshIntervalMs - adaptiveLead);
+    }
+
+    function clearRefreshTimer() {
+        if (timer === null) return;
+        cancelSchedule(timer);
+        timer = null;
+    }
+
+    function scheduleRefresh() {
+        clearRefreshTimer();
+        if (!started || closing) return;
+        timer = schedule(() => {
+            timer = null;
+            void refresh({ force: true });
+        }, nextRefreshDelay());
+        timer?.unref?.();
+    }
+
     function refresh({ force = false } = {}) {
+        if (closing) return Promise.resolve();
         if (inFlight) return inFlight;
         const observedAt = now();
-        if (!force && observedAt - refreshedAt < refreshIntervalMs) return Promise.resolve();
-        refreshedAt = observedAt;
-        if (!bindsRuntimeBridgeGatewaysLocally) {
-            // Podman bridge gateways live inside a runtime VM on macOS and
-            // Windows. They can neither be bound nor accepted by this host
-            // process, so querying the runtime here cannot change the exact
-            // listener set. Avoid blocking the Router event loop on Podman
-            // every time the private-listener reconciler runs.
-            gateways = new Set();
-            lastError = null;
+        if (!force && observedAt < state.expiresAt && !state.lastError) {
             return Promise.resolve();
         }
-        // The runtime sweep runs asynchronously and single-flight so the
-        // request, upgrade, and socket-admission paths that call classify()
-        // never block the Router event loop on Podman. classify() serves the
-        // last validated gateway set while a sweep is in flight; staleness can
-        // only downgrade a classification (managed -> public/denied), never
-        // grant one.
+        clearRefreshTimer();
+        const controller = new AbortController();
+        activeController = controller;
         inFlight = (async () => {
+            const startedAt = now();
             try {
-                gateways = await collectGateways();
-                lastError = null;
+                const next = bindsRuntimeBridgeGatewaysLocally
+                    ? await collectGateways(controller.signal)
+                    : await Promise.resolve(new Set());
+                if (closing || controller.signal.aborted) return;
+                const completedAt = now();
+                state = Object.freeze({
+                    gateways: next,
+                    lastError: null,
+                    refreshedAt: completedAt,
+                    expiresAt: completedAt + refreshIntervalMs,
+                    durationMs: Math.max(0, completedAt - startedAt),
+                });
             } catch (error) {
-                // Transport classification is fail closed. A stale gateway set
-                // is never retained after Podman or ownership validation fails.
-                gateways = new Set();
-                lastError = error;
+                if (closing || controller.signal.aborted) return;
+                const completedAt = now();
+                state = Object.freeze({
+                    gateways: new Set(),
+                    lastError: error,
+                    refreshedAt: completedAt,
+                    expiresAt: Number.NEGATIVE_INFINITY,
+                    durationMs: Math.max(0, completedAt - startedAt),
+                });
             } finally {
+                activeController = null;
                 inFlight = null;
+                scheduleRefresh();
             }
         })();
         return inFlight;
     }
 
     function classify(localAddress) {
-        void refresh();
         const address = normalizeAddress(localAddress);
         if (isLoopback(address)) return 'loopback';
-        if (gateways.has(address)) return 'managed';
+        if (effectiveGateways()?.has(address)) return 'managed';
         return 'unmanaged';
+    }
+
+    async function start() {
+        if (closing) throw new Error('listener interface classifier is closing');
+        if (started) {
+            if (inFlight) await inFlight;
+            return snapshot();
+        }
+        started = true;
+        await refresh({ force: true });
+        if (closing) throw new Error('listener interface classifier closed during startup');
+        return snapshot();
+    }
+
+    function close() {
+        if (closePromise) return closePromise;
+        closing = true;
+        started = false;
+        clearRefreshTimer();
+        activeController?.abort();
+        closePromise = (async () => {
+            await inFlight?.catch(() => {});
+        })();
+        return closePromise;
+    }
+
+    function snapshot() {
+        const observedAt = now();
+        const gateways = effectiveGateways(observedAt);
+        return Object.freeze({
+            gateways: Object.freeze([...(gateways || [])].sort()),
+            lastError: state.lastError ? String(state.lastError.message || state.lastError) : '',
+            refreshedAt: state.refreshedAt,
+            expiresAt: state.expiresAt,
+            expired: observedAt >= state.expiresAt,
+            refreshing: Boolean(inFlight),
+        });
     }
 
     return {
         classify,
         refresh,
-        snapshot() {
-            return Object.freeze({
-                gateways: Object.freeze([...gateways].sort()),
-                lastError: lastError ? String(lastError.message || lastError) : '',
-                refreshedAt,
-            });
-        },
+        start,
+        close,
+        snapshot,
     };
 }
 

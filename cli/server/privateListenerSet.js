@@ -47,10 +47,15 @@ export function createPrivateListenerSet({
     createServer = (options) => net.createServer(options),
     audit = () => {},
     wildcardHost = false,
+    schedule = (callback, delay) => setTimeout(callback, delay),
+    cancelSchedule = (timer) => clearTimeout(timer),
 } = {}) {
     assertDependencies({ httpServer, interfaceClassifier, port, refreshIntervalMs });
     if (typeof createServer !== 'function') throw new TypeError('private listener server factory must be a function');
     if (typeof audit !== 'function') throw new TypeError('private listener audit sink must be a function');
+    if (typeof schedule !== 'function' || typeof cancelSchedule !== 'function') {
+        throw new TypeError('private listener scheduler must be callable');
+    }
 
     const listeners = new Map();
     if (typeof wildcardHost !== 'boolean') throw new TypeError('private listener wildcardHost must be boolean');
@@ -201,7 +206,6 @@ export function createPrivateListenerSet({
         if (wildcardHost) {
             nextDesired.set(WILDCARD_ADDRESS, 'box-wildcard');
         } else {
-            await interfaceClassifier.refresh({ force: true });
             classifierSnapshot = interfaceClassifier.snapshot();
             nextDesired.set(LOOPBACK_ADDRESS, 'loopback');
             for (const gateway of classifierSnapshot?.gateways || []) {
@@ -266,19 +270,27 @@ export function createPrivateListenerSet({
         return operation;
     }
 
+    function scheduleReconcile() {
+        if (!started || closing || timer !== null) return;
+        timer = schedule(() => {
+            timer = null;
+            void enqueueReconcile({ strict: false })
+                .catch((error) => {
+                    lastError = errorMessage(error);
+                    emitAudit('private_listener_reconcile_failed', { error: lastError });
+                })
+                .finally(() => scheduleReconcile());
+        }, refreshIntervalMs);
+        timer?.unref?.();
+    }
+
     async function start() {
         if (started) return publicSnapshot();
         if (closing) throw new Error('private listener set is closing');
         try {
             const snapshot = await enqueueReconcile({ strict: true });
             started = true;
-            timer = setInterval(() => {
-                void enqueueReconcile({ strict: false }).catch((error) => {
-                    lastError = errorMessage(error);
-                    emitAudit('private_listener_reconcile_failed', { error: lastError });
-                });
-            }, refreshIntervalMs);
-            timer.unref?.();
+            scheduleReconcile();
             return snapshot;
         } catch (error) {
             await close();
@@ -290,7 +302,7 @@ export function createPrivateListenerSet({
         if (closing) return;
         closing = true;
         started = false;
-        if (timer) clearInterval(timer);
+        if (timer !== null) cancelSchedule(timer);
         timer = null;
         await syncTail.catch(() => {});
         const records = [...listeners.values()];

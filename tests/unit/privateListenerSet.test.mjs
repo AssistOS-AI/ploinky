@@ -135,16 +135,36 @@ test('Box private listener uses one unpublished wildcard socket and relies on as
     const port = await freePort();
     const classifier = fakeClassifier([]);
     const httpServer = http.createServer((_req, res) => res.end('box-private'));
+    const scheduled = [];
+    let activeTimer = null;
     const listenerSet = createPrivateListenerSet({
         httpServer,
         interfaceClassifier: classifier,
         port,
         wildcardHost: true,
         refreshIntervalMs: 60_000,
+        schedule(callback, delay) {
+            assert.equal(activeTimer, null, 'only one reconciliation timer may be active');
+            activeTimer = { callback, delay, unref() {} };
+            scheduled.push(activeTimer);
+            return activeTimer;
+        },
+        cancelSchedule(timer) {
+            if (activeTimer === timer) activeTimer = null;
+        },
     });
     t.after(() => listenerSet.close());
 
     assert.deepEqual((await listenerSet.start()).addresses, ['0.0.0.0']);
+    assert.equal(scheduled.length, 1);
     assert.deepEqual(await request('127.0.0.1', port), { status: 200, body: 'box-private' });
     assert.deepEqual((await listenerSet.sync()).addresses, ['0.0.0.0']);
+
+    const firstTimer = activeTimer;
+    activeTimer = null;
+    firstTimer.callback();
+    assert.equal(scheduled.length, 1, 'next timer must wait for reconciliation to settle');
+    await listenerSet.sync();
+    assert.equal(scheduled.length, 2);
+    assert.equal(activeTimer, scheduled[1]);
 });

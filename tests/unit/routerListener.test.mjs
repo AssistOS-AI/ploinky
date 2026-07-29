@@ -39,6 +39,17 @@ test('RoutingServer fixes public 8080 and delegates private 8081 to exact interf
     assert.match(source, /createPrivateListenerSet\(\{/);
     assert.match(source, /port: privatePort/);
     assert.match(source, /privateListenerSet\.start\(\)/);
+    const classifierStart = source.indexOf('await interfaceClassifier.start()');
+    const privateStart = source.indexOf('await privateListenerSet.start()');
+    assert.ok(
+        classifierStart >= 0 && classifierStart < privateStart,
+        'interface classification must be primed before private listener readiness',
+    );
+    assert.doesNotMatch(
+        fs.readFileSync(path.join(repoRoot, 'cli/server/listenerInterfaceClassifier.js'), 'utf8')
+            .match(/function classify[\s\S]*?\n    }/)?.[0] || '',
+        /\brefresh\(/,
+    );
     assert.doesNotMatch(source, /privateServer\.listen\(/);
     assert.doesNotMatch(source, /privateServer\.prependListener\('connection'/);
     const authGate = source.indexOf('const authResult = await ensureAuthenticated(req, res, parsedUrl, { routePlan });');
