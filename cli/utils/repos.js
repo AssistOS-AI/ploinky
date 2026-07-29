@@ -824,7 +824,7 @@ export function ensureRepoOnBranch(name, { branch, resetRepos = false, fallback 
     if (!fs.existsSync(repoPath) || !isGitRepository(repoPath)) return { status: 'missing', branch: null };
 
     const current = currentBranch(repoPath);
-    if (current === branch) {
+    if (current === branch && !resetRepos) {
         recordRepoSource(name, resolveRepoSourceUrl(name), branch);
         return { status: 'current', branch };
     }

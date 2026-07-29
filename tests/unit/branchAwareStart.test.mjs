@@ -477,6 +477,31 @@ test('ensureRepoOnBranch: dirty repo with --reset-repos succeeds', () => {
     assert.equal(fs.existsSync(path.join(repoPath, 'dirty.txt')), false);
 });
 
+test('ensureRepoOnBranch: --reset-repos updates an existing checkout on the requested branch', () => {
+    const barePath = createBareRepo('test-current-reset', { branches: ['release'] });
+    const repoPath = path.join(tempDir, '.ploinky', 'repos', 'test-current-reset');
+    fs.mkdirSync(path.dirname(repoPath), { recursive: true });
+    execFileSync('git', ['clone', '--branch', 'release', barePath, repoPath], { stdio: 'ignore' });
+    const before = String(execFileSync('git', ['-C', repoPath, 'rev-parse', 'HEAD'])).trim();
+
+    const updaterPath = path.join(tempDir, 'work', 'test-current-reset-updater');
+    execFileSync('git', ['clone', '--branch', 'release', barePath, updaterPath], { stdio: 'ignore' });
+    execFileSync('git', ['-C', updaterPath, 'commit', '--allow-empty', '-m', 'remote update'], { stdio: 'ignore' });
+    execFileSync('git', ['-C', updaterPath, 'push', 'origin', 'release'], { stdio: 'ignore' });
+    const expected = String(execFileSync('git', ['-C', updaterPath, 'rev-parse', 'HEAD'])).trim();
+
+    ensureRepoOnBranch('test-current-reset', {
+        branch: 'release',
+        resetRepos: true,
+        fallback: 'fail',
+        stdio: 'ignore',
+    });
+
+    const current = String(execFileSync('git', ['-C', repoPath, 'rev-parse', 'HEAD'])).trim();
+    assert.notEqual(current, before);
+    assert.equal(current, expected);
+});
+
 test('ensureRepoOnBranch: missing branch with fallback=fail throws', () => {
     const barePath = createBareRepo('test-missing-fail', { branches: [] });
     const repoPath = path.join(tempDir, '.ploinky', 'repos', 'test-missing-fail');
