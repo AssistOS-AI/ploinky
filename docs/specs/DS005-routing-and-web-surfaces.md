@@ -255,7 +255,13 @@ tasks carrying only one final-output offset and length remain compatible. If
 no exact range is available for a turn, its raw output remains visible with the
 intermediate style. Browser rendering strips ANSI control sequences and
 retains presentation compatibility for historical logs that contain recognized
-stream and runner prefixes; new raw provider output remains otherwise unchanged.
+stream and runner prefixes. It may divide displayed lines into non-interactive
+visual spans that show generic path-like text in green without bold weight and
+backtick-delimited fragments with the accent color used for file-link text,
+without link decoration. This presentation must preserve the exact displayed
+text, must not modify persisted task logs or their offsets, and must not create
+links or interactive behavior. New raw provider output remains otherwise
+unchanged.
 When a live task update changes final-output range metadata without appending
 log text, an open task view must rerender its existing log immediately so the
 newly classified final answer receives final styling without a page refresh.

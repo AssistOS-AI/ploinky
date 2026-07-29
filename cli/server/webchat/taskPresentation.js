@@ -2,6 +2,68 @@ const TERMINAL_STATUSES = new Set(['finished', 'stopped', 'error']);
 const ANSI_RE = /[\u001b\u009b][[\]()#;?]*(?:[0-9]{1,4}(?:;[0-9]{0,4})*)?[0-9A-ORZcf-nqry=><]/g;
 const STREAM_PREFIX_RE = /^\[([^\]]+)\s+(stdout|stderr)\]\s?/i;
 const RUNNER_PREFIX_RE = /^\[[^\]]+\/[^\]]+\]\s?/;
+const TASK_LOG_INLINE_CODE_RE = /`[^`\r\n]+`/gu;
+const TASK_LOG_PATH_RE = /(?:[A-Za-z]:[\\/][^\s"'`<>|]+|(?:\/|~\/|\.{1,2}\/)[^\s"'`<>|]+|[\p{L}\p{N}_+.-]+(?:[\\/][\p{L}\p{N}_+.@-]+)+(?::\d+(?::\d+)?)?)/gu;
+const TASK_LOG_FILE_RE = /(?:^|[\s([{<"'`])([\p{L}\p{N}_+-]+\.(?:c|cc|cpp|cs|css|csv|go|h|hpp|htm|html|java|jpeg|jpg|js|json|jsx|log|md|mdx|mjs|pdf|php|png|py|rb|rs|scss|sh|sql|svg|toml|ts|tsx|txt|webp|xml|yaml|yml)(?::\d+(?::\d+)?)?)(?=$|[\s)\]}>.,'";!?`])/giu;
+const TASK_LOG_TRAILING_PATH_PUNCTUATION_RE = /[),.;!?}\]]+$/u;
+
+function addTaskLogHighlight(matches, start, end, kind) {
+    if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || end <= start) return;
+    if (matches.some((match) => start < match.end && end > match.start)) return;
+    matches.push({ start, end, kind });
+}
+
+function addTaskLogRegexHighlights(text, regex, matches, kind) {
+    regex.lastIndex = 0;
+    let match;
+    while ((match = regex.exec(text)) !== null) {
+        addTaskLogHighlight(matches, match.index, match.index + match[0].length, kind);
+    }
+}
+
+function taskLogPathLength(value) {
+    const trimmed = value.replace(TASK_LOG_TRAILING_PATH_PUNCTUATION_RE, '');
+    if (!trimmed) return 0;
+    if (trimmed.startsWith('/') && !trimmed.slice(1).includes('/')
+        && !/\.[\p{L}\p{N}]{1,10}(?::\d+(?::\d+)?)?$/u.test(trimmed)) {
+        return 0;
+    }
+    return trimmed.length;
+}
+
+export function tokenizeTaskLogText(value) {
+    const text = String(value || '');
+    if (!text) return [{ text, kind: null }];
+    const matches = [];
+    addTaskLogRegexHighlights(text, TASK_LOG_INLINE_CODE_RE, matches, 'code');
+
+    TASK_LOG_PATH_RE.lastIndex = 0;
+    let pathMatch;
+    while ((pathMatch = TASK_LOG_PATH_RE.exec(text)) !== null) {
+        const length = taskLogPathLength(pathMatch[0]);
+        addTaskLogHighlight(matches, pathMatch.index, pathMatch.index + length, 'path');
+    }
+
+    TASK_LOG_FILE_RE.lastIndex = 0;
+    let fileMatch;
+    while ((fileMatch = TASK_LOG_FILE_RE.exec(text)) !== null) {
+        const start = fileMatch.index + fileMatch[0].indexOf(fileMatch[1]);
+        addTaskLogHighlight(matches, start, start + fileMatch[1].length, 'path');
+    }
+
+    matches.sort((left, right) => left.start - right.start);
+    const tokens = [];
+    let cursor = 0;
+    for (const match of matches) {
+        if (match.start > cursor) {
+            tokens.push({ text: text.slice(cursor, match.start), kind: null });
+        }
+        tokens.push({ text: text.slice(match.start, match.end), kind: match.kind });
+        cursor = match.end;
+    }
+    if (cursor < text.length) tokens.push({ text: text.slice(cursor), kind: null });
+    return tokens.length ? tokens : [{ text, kind: null }];
+}
 
 export function taskStatusPresentation(task) {
     if (!task) return { label: 'UNAVAILABLE', className: 'unavailable' };
@@ -130,7 +192,20 @@ export function renderTaskLog(container, text, emptyText = 'No log output yet.',
     for (const entry of lines) {
         const line = document.createElement('span');
         line.className = `wa-task-log-line is-${entry.stream} is-${entry.tone} is-${entry.kind || 'output'}`;
-        line.textContent = entry.text || '\u00a0';
+        const text = entry.text || '\u00a0';
+        line.textContent = text;
+        const tokens = tokenizeTaskLogText(text);
+        if (tokens.some((token) => token.kind) && typeof line.replaceChildren === 'function') {
+            const fragments = tokens.map((token) => {
+                const fragment = document.createElement('span');
+                fragment.className = token.kind
+                    ? `wa-task-log-token is-${token.kind}`
+                    : 'wa-task-log-fragment';
+                fragment.textContent = token.text;
+                return fragment;
+            });
+            line.replaceChildren(...fragments);
+        }
         container.appendChild(line);
     }
 }

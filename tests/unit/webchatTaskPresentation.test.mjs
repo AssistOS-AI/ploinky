@@ -7,8 +7,10 @@ import {
     mergeTaskLogUpdate,
     parseTaskLog,
     parseTaskLogPresentation,
+    renderTaskLog,
     taskDurationSeconds,
     taskStatusPresentation,
+    tokenizeTaskLogText,
 } from '../../cli/server/webchat/taskPresentation.js';
 import { createTaskController } from '../../cli/server/webchat/tasks.js';
 
@@ -185,6 +187,79 @@ test('task log styling mutes intermediate output and emphasizes the final result
         WEBCHAT_CSS,
         /\.wa-task-log-line\.is-final\s*\{[^}]*color:\s*var\(--wa-text-primary\)[^}]*font-weight:\s*600/s,
     );
+});
+
+test('task log highlighting preserves text while classifying paths and backticks', () => {
+    const text = 'warning: updated src/index.js:12 and `/workspace/output.log`; tests passed';
+    const tokens = tokenizeTaskLogText(text);
+    assert.equal(tokens.map((token) => token.text).join(''), text);
+    assert.deepEqual(
+        tokens.filter((token) => token.kind),
+        [
+            { text: 'src/index.js:12', kind: 'path' },
+            { text: '`/workspace/output.log`', kind: 'code' },
+        ],
+    );
+});
+
+test('task log highlighting recognizes absolute paths without treating slash commands as paths', () => {
+    const text = 'failed in /home/runner/project/main.py:44; retry with /task view';
+    const tokens = tokenizeTaskLogText(text);
+    assert.equal(tokens.map((token) => token.text).join(''), text);
+    assert.deepEqual(
+        tokens.filter((token) => token.kind),
+        [
+            { text: '/home/runner/project/main.py:44', kind: 'path' },
+        ],
+    );
+});
+
+test('task log token styles remain visual-only spans with no link behavior', () => {
+    assert.match(
+        WEBCHAT_CSS,
+        /\.wa-task-log-token\.is-path\s*\{[^}]*color:\s*#5fbf72[^}]*font-weight:\s*400/s,
+    );
+    assert.match(
+        WEBCHAT_CSS,
+        /\.wa-task-log-token\.is-code\s*\{[^}]*color:\s*var\(--wa-accent\)[^}]*\}/s,
+    );
+    assert.doesNotMatch(WEBCHAT_CSS, /\.wa-task-log-token[^}]*text-decoration:\s*underline/);
+    assert.doesNotMatch(WEBCHAT_CSS, /\.wa-task-log-token[^}]*cursor:\s*pointer/);
+});
+
+test('task log renderer creates styled spans without anchors or text changes', (t) => {
+    const originalDocument = globalThis.document;
+    const makeElement = (tagName = 'div') => ({
+        tagName: tagName.toUpperCase(),
+        children: [],
+        className: '',
+        textContent: '',
+        appendChild(child) {
+            this.children.push(child);
+            return child;
+        },
+        replaceChildren(...children) {
+            this.children = children;
+        },
+    });
+    globalThis.document = { createElement: (tagName) => makeElement(tagName) };
+    t.after(() => { globalThis.document = originalDocument; });
+
+    const container = makeElement();
+    const text = 'warning in src/index.js';
+    renderTaskLog(container, text);
+
+    const [line] = container.children;
+    assert.equal(line.textContent, text);
+    assert.equal(line.children.map((child) => child.textContent).join(''), text);
+    assert.deepEqual(
+        line.children.filter((child) => child.className.includes('wa-task-log-token'))
+            .map((child) => [child.textContent, child.className]),
+        [
+            ['src/index.js', 'wa-task-log-token is-path'],
+        ],
+    );
+    assert.equal(line.children.some((child) => child.tagName === 'A'), false);
 });
 
 test('chat task summary shows metadata and a delegated live-log link without inline expansion', (t) => {

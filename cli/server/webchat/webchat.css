@@ -3481,6 +3481,15 @@ button.wa-upload-directory-entry.folder:hover {
     font-weight: 600;
 }
 
+.wa-task-log-token.is-path {
+    color: #5fbf72;
+    font-weight: 400;
+}
+
+.wa-task-log-token.is-code {
+    color: var(--wa-accent);
+}
+
 .wa-task-log-line.is-user-prompt {
     margin: 5px 0;
     padding: 3px 7px;
