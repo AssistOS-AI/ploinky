@@ -333,6 +333,14 @@ cannot become the MCP target. Non-MCP dependency-looking paths remain ordinary
 selected-root application paths, so the capability does not expose another
 agent's arbitrary content.
 
+When an agent-root host selects `user-admin`, only
+`/api/agents/<selectedRouteKey>/users[/<userId>]` and
+`/api/agents/<selectedRouteKey>/settings` are admitted. The route key is fixed
+by the compiled host selector; request input cannot select another enabled
+agent. Reachability does not replace authorization: the existing local-session
+administrator check still applies, and mutations retain their exact Origin and
+CSRF requirements.
+
 Router-owned paths such as `/policy/command`, `/auth/*`, `/admin/*`, `/metrics`,
 and `/__agent/*` never become reachable merely because a caller supplies a local
 or configured Host. Every TCP admin/control/status handler still requires a real

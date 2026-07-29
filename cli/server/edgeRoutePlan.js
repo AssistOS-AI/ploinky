@@ -402,11 +402,44 @@ function selectedAgentMcpRoute(pathname, routeKeys) {
     return isRouteMount(pathname, prefix) ? routeKey : '';
 }
 
-function surfaceForPath(pathname, selectedSurfaces, agentMcpRoutes = []) {
+function isSelectedRootUserAdminPath(pathname, selectedRootRouteKey) {
+    const routeKey = String(selectedRootRouteKey || '');
+    if (!routeKey) return false;
+    const segments = String(pathname || '').split('/');
+    if ((segments.length !== 5 && segments.length !== 6)
+        || segments[0] !== '' || segments[1] !== 'api'
+        || segments[2] !== 'agents') return false;
+    let requestedRouteKey = '';
+    let requestedUserId = '';
+    try {
+        requestedRouteKey = decodeURIComponent(segments[3]);
+        if (segments.length === 6) requestedUserId = decodeURIComponent(segments[5]);
+    } catch (_) {
+        return false;
+    }
+    if (requestedRouteKey !== routeKey) return false;
+    if (segments[4] === 'settings') return segments.length === 5;
+    if (segments[4] !== 'users') return false;
+    return segments.length === 5 || (
+        Boolean(requestedUserId)
+        && !requestedUserId.includes('/')
+        && !requestedUserId.includes('\\')
+    );
+}
+
+function surfaceForPath(
+    pathname,
+    selectedSurfaces,
+    agentMcpRoutes = [],
+    selectedRootRouteKey = '',
+) {
     const available = new Set(selectedSurfaces || []);
     if (available.has('browser-auth') && (
         AGENT_ROOT_AUTH_SUPPORT_PATHS.has(pathname)
     )) return { name: 'browser-auth', routerOwned: true };
+    if (available.has('user-admin') && (
+        isSelectedRootUserAdminPath(pathname, selectedRootRouteKey)
+    )) return { name: 'user-admin', routerOwned: true };
     if (available.has('agent-mcp')) {
         if (isRouteMount(pathname, '/mcp')) return { name: 'agent-mcp', routerOwned: false };
         const routeKey = selectedAgentMcpRoute(pathname, agentMcpRoutes);
@@ -591,6 +624,7 @@ export function resolveEdgeRoutePlan({
             pathname,
             snapshot.compiled.surfaces?.[host] || [],
             snapshot.compiled.agentMcpRoutes?.[host] || [],
+            hostSelection.record?.routeKey,
         );
         if (surface?.routerOwned) {
             return routerSurfacePlan({

@@ -479,6 +479,12 @@ observability.js    // Monitoring views</code></pre>
    → Display as chat bubble</code></pre>
                     </div>
 
+                    <div class="doc-section" id="user-admin">
+                        <h2>Selected-root User Administration</h2>
+                        <p>A public agent-root host may select the closed <code>user-admin</code> Router surface. The immutable edge plan admits only the selected route key's users collection, one optional user-id child, and settings endpoint. Other agents and Router control paths remain absent from that host.</p>
+                        <p>The route plan grants reachability only. The existing handler still requires a real local administrator session for reads and mutations, and every mutation still requires an exact Origin plus a session-bound CSRF proof.</p>
+                    </div>
+
                     <div class="doc-section" id="agent-mcp">
                         <h2>Agent MCP Bridge</h2>
                         <p>AgentServer (<code>Agent/server/AgentServer.mjs</code>) exposes capabilities through the <strong>Model Context Protocol (MCP)</strong> using <em>Streamable HTTP</em> at <code>/mcp</code> on the container port (default <code>7000</code>).</p>

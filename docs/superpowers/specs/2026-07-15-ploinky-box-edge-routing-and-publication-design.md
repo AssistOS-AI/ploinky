@@ -867,6 +867,7 @@ dedicated host root:
         "workspace-assets",
         "blob-transfer",
         "marketplace-ui",
+        "user-admin",
         "topology-projection"
       ],
       "mounts": [
@@ -912,6 +913,7 @@ paths and unknown names are rejected:
 | `workspace-assets` | The authenticated, path-sanitized workspace static-file surface only. |
 | `blob-transfer` | Authenticated upload/blob handlers with their existing route, quota, and origin checks. |
 | `marketplace-ui` | The existing authenticated marketplace handler only; user/agent administration and policy commands are not included. |
+| `user-admin` | The selected root's exact local-user and router-settings paths only; the existing local-admin session, Origin, and CSRF checks remain mandatory. |
 | `topology-projection` | One authenticated locator query, restricted to the selected root or one of this host's named mounts. |
 
 The default list is empty. This explicit list is required because Explorer uses

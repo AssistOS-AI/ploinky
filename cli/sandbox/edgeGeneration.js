@@ -24,6 +24,7 @@ export const ROUTER_SURFACE_CATALOG = Object.freeze([
     'blob-transfer',
     'browser-auth',
     'marketplace-ui',
+    'user-admin',
     'workspace-assets',
 ]);
 

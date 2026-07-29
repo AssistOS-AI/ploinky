@@ -175,6 +175,13 @@ workspace cannot become the target through that public Host, and non-MCP paths
 under dependency-looking prefixes continue to target the selected root rather
 than exposing dependency content.
 
+The `user-admin` capability admits only the selected root's exact local-user
+and router-settings handler paths. The compiled host route key, rather than a
+request-selected agent, determines the only allowed administration namespace.
+Handlers still require a valid local administrator session, and every mutation
+still requires the exact control Origin and CSRF proof. Other agents and other
+Router administration paths remain outside the public host's surface.
+
 Private services use listener `8081` and require both the compiled canonical
 service policy to resolve effectively to `authenticated` and an exact
 current-instance/current-enable-generation caller ACL. The private assertion is

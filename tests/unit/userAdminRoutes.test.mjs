@@ -214,6 +214,12 @@ test('user admin routes enforce admin access, CRUD, rev invalidation, and agent 
     assert.equal(result.body.settings.loginBrandingName, 'Acme Workspace');
 
     result = await invoke(authHandlers.handleUserAdminRoutes, {
+        url: '/api/agents/explorer/users',
+    });
+    assert.equal(result.statusCode, 401);
+    assert.equal(result.body.error, 'authentication_required');
+
+    result = await invoke(authHandlers.handleUserAdminRoutes, {
         method: 'PATCH',
         url: '/api/agents/explorer/settings',
         cookie: authCookie(explorerAdmin.sessionId),
@@ -222,6 +228,16 @@ test('user admin routes enforce admin access, CRUD, rev invalidation, and agent 
     });
     assert.equal(result.statusCode, 403);
     assert.equal(result.body.error, 'control_origin_required');
+
+    result = await invoke(authHandlers.handleUserAdminRoutes, {
+        method: 'PATCH',
+        url: '/api/agents/explorer/settings',
+        cookie: authCookie(explorerAdmin.sessionId),
+        csrf: 'invalid',
+        body: { loginBrandingName: 'Invalid mutation proof' },
+    });
+    assert.equal(result.statusCode, 403);
+    assert.equal(result.body.error, 'csrf_invalid');
 
     result = await invoke(authHandlers.handleUserAdminRoutes, {
         url: '/api/agents/explorer/users',

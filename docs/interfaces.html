@@ -82,6 +82,12 @@
         </section>
 
         <section class="chapter-section">
+          <h2>Selected-root User Administration API</h2>
+          <p>An agent-root public host may opt into the <code>user-admin</code> Router surface. That surface admits only <code>/api/agents/&lt;selectedRouteKey&gt;/users</code>, one optional encoded user-id child, and <code>/api/agents/&lt;selectedRouteKey&gt;/settings</code>. The route key comes from the immutable host selector, so request input cannot select another enabled agent or another Router control API.</p>
+          <p>Reachability does not authorize a caller. Reads and mutations still require a valid local administrator session for the selected agent. <code>POST</code>, <code>PATCH</code>, and <code>DELETE</code> additionally retain the exact Origin and session-bound CSRF checks enforced by the user-administration handler.</p>
+        </section>
+
+        <section class="chapter-section">
           <h2>Agent Cards and Secure Delegation</h2>
           <p>Ploinky reads installed manifests into a small agent index for route names, principals, runtime resources, and SSO-provider markers. Provider-specific domain authorization lives in the target agent.</p>
           <p>The router exposes agent-card discovery at <code>/agent-card</code> and <code>/&lt;agent&gt;/agent-card</code>. The aggregate endpoint queries each active route's agent-side <code>/agent-card</code> endpoint and returns successful responses without requiring a fixed metadata schema; per-agent failures are reported separately. Agent metadata can include tags, summaries, input conventions, schemas, or any other JSON fields useful to an orchestration layer.</p>

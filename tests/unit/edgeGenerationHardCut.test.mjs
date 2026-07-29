@@ -281,6 +281,102 @@ test('agent-mcp exposes only the selected root manifest dependency closure', (t)
     assert.equal(unrelatedMcp.upstreamPath, '/unrelated/mcp');
 });
 
+test('user-admin exposes only the selected root administration routes', (t) => {
+    const fixture = createFixture(t, {
+        desired: {
+            hosts: {
+                'explorer.example.test': {
+                    agent: 'fixtures/alpha',
+                    routerSurfaces: ['user-admin'],
+                },
+            },
+            cloudflare: {
+                tunnelTokenSecret: 'publication/test-connector',
+            },
+        },
+    });
+    applyEdgeRoutingGeneration({
+        workspaceRoot: fixture.workspace,
+        reason: 'selected-root-user-administration',
+        publicationState: 'ready',
+    });
+
+    for (const pathname of [
+        '/api/agents/alpha/users',
+        '/api/agents/alpha/users/local%3Auser',
+        '/api/agents/alpha/settings',
+    ]) {
+        const plan = resolveEdgeRoutePlan({
+            req: {
+                method: 'GET',
+                url: pathname,
+                headers: { host: 'explorer.example.test' },
+            },
+            listener: 'public',
+        });
+        assert.equal(plan.ok, true, pathname);
+        assert.equal(plan.kind, 'router-surface', pathname);
+        assert.equal(plan.surface, 'user-admin', pathname);
+    }
+
+    for (const pathname of [
+        '/api/agents/beta/users',
+        '/api/agents/alpha/users/',
+        '/api/agents//users',
+        '/api/agents/alpha/settings/unexpected',
+        '/api/agents/alpha/users/id/unexpected',
+        '/api/agents/alpha/%75sers',
+        '/api/agents/alpha/users/local%2Fuser',
+        '/api/agents/alpha/users/%E0%A4%A',
+        '/api/router/settings',
+        '/policy/command',
+        '/admin',
+        '/__agent',
+    ]) {
+        const plan = resolveEdgeRoutePlan({
+            req: {
+                method: 'GET',
+                url: pathname,
+                headers: { host: 'explorer.example.test' },
+            },
+            listener: 'public',
+        });
+        assert.equal(plan.ok, false, pathname);
+        assert.equal(plan.code, 'ROUTE_SURFACE_DENIED', pathname);
+    }
+});
+
+test('selected root administration routes remain closed without user-admin', (t) => {
+    const fixture = createFixture(t, {
+        desired: {
+            hosts: {
+                'explorer.example.test': {
+                    agent: 'fixtures/alpha',
+                    routerSurfaces: [],
+                },
+            },
+            cloudflare: {
+                tunnelTokenSecret: 'publication/test-connector',
+            },
+        },
+    });
+    applyEdgeRoutingGeneration({
+        workspaceRoot: fixture.workspace,
+        reason: 'closed-user-administration',
+        publicationState: 'ready',
+    });
+    const plan = resolveEdgeRoutePlan({
+        req: {
+            method: 'GET',
+            url: '/api/agents/alpha/users',
+            headers: { host: 'explorer.example.test' },
+        },
+        listener: 'public',
+    });
+    assert.equal(plan.ok, false);
+    assert.equal(plan.code, 'ROUTE_SURFACE_DENIED');
+});
+
 test('legacy duplicate route and host-network authority is rejected', (t) => {
     const fixture = createFixture(t, {
         desired: {
