@@ -4,6 +4,7 @@ import {
     taskDurationLabel,
     taskStatusPresentation,
 } from './taskPresentation.js';
+import { createTaskLogFollower } from './taskLogFollow.js';
 import { createTaskViewTransport } from './taskViewTransport.js';
 
 const TASK_VIEW_PATH_RE = /^(.*)\/tasks\/(task_[0-9a-f]{24})\/view$/;
@@ -22,6 +23,7 @@ const continuationForm = document.getElementById('taskContinuation');
 const continuationInput = document.getElementById('taskContinuationInput');
 const continuationSend = document.getElementById('taskContinuationSend');
 const continuationError = document.getElementById('taskContinuationError');
+const logFollower = createTaskLogFollower(log);
 const MIN_CONTINUATION_INPUT_HEIGHT_PX = 40;
 const MAX_CONTINUATION_INPUT_HEIGHT_PX = 132;
 
@@ -107,17 +109,15 @@ function renderTask() {
     document.title = `${description.textContent} · Task logs`;
 }
 
-function renderLog({ stickToEnd = true } = {}) {
+function renderLog() {
     const previousScrollTop = log.scrollTop;
-    const wasAtEnd = log.scrollHeight - log.scrollTop - log.clientHeight < 24;
     renderTaskLog(
         log,
         logText,
         initialLoadComplete ? 'No log output yet.' : 'Loading log…',
         task,
     );
-    if (stickToEnd && wasAtEnd) log.scrollTop = log.scrollHeight;
-    else log.scrollTop = previousScrollTop;
+    logFollower.restoreAfterRender(previousScrollTop);
 }
 
 async function stopTask() {
@@ -166,6 +166,7 @@ function applyLogUpdate(payload) {
 function applyUpdate(payload) {
     if (payload?.task?.id !== taskId) return;
     if (payload.event === 'view') loadErrorMessage = '';
+    const previousStatus = task?.status;
     const previousFinalOutputState = JSON.stringify([
         task?.finalOutputOffset,
         task?.finalOutputLength,
@@ -203,6 +204,11 @@ function applyUpdate(payload) {
     const renderedLogUpdate = applyLogUpdate(payload);
     if (!receivedLogSnapshot && finalOutputStateChanged && !renderedLogUpdate) {
         renderLog();
+    }
+    if (payload.event !== 'view'
+        && previousStatus === 'ongoing'
+        && TERMINAL_STATUSES.has(task.status)) {
+        void syncLog().catch(showLoadError);
     }
 }
 

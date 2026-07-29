@@ -193,6 +193,7 @@ test('task view renders a complete terminal log snapshot without waiting for ano
     const originalSetInterval = globalThis.setInterval;
     const listeners = new Map();
     const elements = new Map();
+    const commands = [];
     const makeElement = () => ({
         children: [],
         className: '',
@@ -235,7 +236,11 @@ test('task view renders a complete terminal log snapshot without waiting for ano
     ]) {
         elements.set(id, makeElement());
     }
-    const parent = {};
+    const parent = {
+        postMessage(message) {
+            commands.push(message.command);
+        },
+    };
     globalThis.window = {
         location: {
             pathname: '/webchat/tasks/task_1234567890abcdef12345678/view',
@@ -273,7 +278,7 @@ test('task view renders a complete terminal log snapshot without waiting for ano
                     id: 'task_1234567890abcdef12345678',
                     targetAgent: 'opencodeAgent',
                     description: 'Finished task',
-                    status: 'finished',
+                    status: 'ongoing',
                 },
                 log: {
                     text: 'historical line\nfinal answer\n',
@@ -309,6 +314,8 @@ test('task view renders a complete terminal log snapshot without waiting for ano
     });
 
     assert.match(elements.get('taskLog').children[1].className, /is-final/);
+    await Promise.resolve();
+    assert.deepEqual(commands, ['/task view task_1234567890abcdef12345678']);
 });
 
 test('task view sends continuation through the AchillesCLI command bridge', () => {

@@ -259,6 +259,11 @@ stream and runner prefixes; new raw provider output remains otherwise unchanged.
 When a live task update changes final-output range metadata without appending
 log text, an open task view must rerender its existing log immediately so the
 newly classified final answer receives final styling without a page refresh.
+When an open task transitions from `ongoing` to any terminal state, the view
+must also request one authoritative `/task view` snapshot. This terminal
+reconciliation recovers final-range metadata or a last log delta that was not
+available in the live transition event, without waiting for another provider
+poll or a browser refresh.
 
 When an ongoing task becomes terminal, WebChat may show the existing transient
 task toast. That toast must include an accessible close button on its right so
