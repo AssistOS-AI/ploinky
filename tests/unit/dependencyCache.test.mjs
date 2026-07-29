@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import crypto from 'node:crypto';
 
 import {
     STAMP_VERSION,
@@ -22,6 +23,7 @@ import {
     isAgentCacheValid,
     getGlobalCachePath,
     getAgentCachePath,
+    acquireLock,
     ensureCacheDir,
     ensureAgentCacheForFamily,
     nodeModulesDir,
@@ -283,6 +285,67 @@ test('cache paths follow .ploinky/deps layout', () => {
     assert.ok(globalPath.includes(path.join('.ploinky', 'deps', 'global', rk)));
     const agentPath = getAgentCachePath('repoX', 'agentY', rk);
     assert.ok(agentPath.includes(path.join('.ploinky', 'deps', 'agents', 'repoX', 'agentY', rk)));
+});
+
+test('acquireLock reclaims a legacy lock owned by a dead process', () => {
+    const dir = tempDir();
+    const lockFile = path.join(dir, '.lock');
+    try {
+        fs.writeFileSync(lockFile, JSON.stringify({
+            pid: 2_147_483_647,
+            at: '2020-01-01T00:00:00.000Z',
+        }));
+        const lock = acquireLock(dir, { timeoutMs: 20, pollMs: 1 });
+        const owner = JSON.parse(fs.readFileSync(lock.path, 'utf8'));
+        assert.equal(owner.pid, process.pid);
+        assert.ok(owner.ownerId);
+        lock.release();
+        assert.equal(fs.existsSync(lockFile), false);
+    } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+test('acquireLock waits without a busy loop while a live owner holds the lock', () => {
+    const dir = tempDir();
+    try {
+        const held = acquireLock(dir);
+        let clock = 0;
+        const sleeps = [];
+        assert.throws(
+            () => acquireLock(dir, {
+                timeoutMs: 10,
+                pollMs: 4,
+                now: () => clock,
+                sleep(milliseconds) {
+                    sleeps.push(milliseconds);
+                    clock += milliseconds;
+                },
+            }),
+            /Timed out waiting for cache lock/,
+        );
+        assert.deepEqual(sleeps, [4, 4, 4]);
+        held.release();
+    } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+test('release does not remove a lock record owned by a successor', () => {
+    const dir = tempDir();
+    const lockFile = path.join(dir, '.lock');
+    try {
+        const lock = acquireLock(dir);
+        const successor = {
+            ...JSON.parse(fs.readFileSync(lockFile, 'utf8')),
+            ownerId: crypto.randomUUID(),
+        };
+        fs.writeFileSync(lockFile, JSON.stringify(successor));
+        lock.release();
+        assert.equal(fs.existsSync(lockFile), true);
+    } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
 });
 
 test('ensureAgentCacheForFamily prepares cache and returns node_modules path', () => {

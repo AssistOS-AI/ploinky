@@ -22,6 +22,9 @@ export const CORE_MARKER_MODULE = 'mcp-sdk';
 export const GIT_DEPS_MARKER_FILENAME = 'git-deps.json';
 export const NPM_INSTALL_ARGS = ['install', '--no-package-lock', '--no-audit', '--no-fund'];
 const INSTALL_TIMEOUT_MS = 10 * 60 * 1000;
+const LOCK_VERSION = 1;
+const MALFORMED_LOCK_GRACE_MS = 30 * 1000;
+const LOCK_SLEEP_BUFFER = new Int32Array(new SharedArrayBuffer(4));
 
 function assertRuntimeKey(runtimeKey) {
     const parsed = parseRuntimeKey(runtimeKey);
@@ -276,29 +279,180 @@ export function isAgentCacheValid(cachePath, { runtimeKey, mergedPackageHash, in
     return { valid: true, reason: 'ok' };
 }
 
-export function acquireLock(cachePath, { timeoutMs = 10 * 60 * 1000, pollMs = 250 } = {}) {
+function blockingSleep(milliseconds) {
+    const duration = Math.max(0, Number(milliseconds) || 0);
+    if (duration > 0) {
+        Atomics.wait(LOCK_SLEEP_BUFFER, 0, 0, duration);
+    }
+}
+
+function readLinuxProcessStartTime(pid) {
+    try {
+        const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
+        // The process name is parenthesized and may contain spaces or closing
+        // parentheses, so split after the final ") ". The first remaining
+        // value is field 3 (state); starttime is field 22.
+        const commandEnd = stat.lastIndexOf(') ');
+        if (commandEnd < 0) return null;
+        return stat.slice(commandEnd + 2).trim().split(/\s+/)[19] || null;
+    } catch (_) {
+        return null;
+    }
+}
+
+function readLinuxBootId() {
+    try {
+        return fs.readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim() || null;
+    } catch (_) {
+        return null;
+    }
+}
+
+function processExists(pid) {
+    try {
+        process.kill(pid, 0);
+        return true;
+    } catch (err) {
+        return err?.code !== 'ESRCH';
+    }
+}
+
+function lockOwnerIsAlive(record) {
+    const pid = Number(record?.pid);
+    if (!Number.isInteger(pid) || pid <= 0 || !processExists(pid)) {
+        return false;
+    }
+
+    // Legacy lock records only contain pid/at. Preserve them while that PID is
+    // alive, but reclaim them as soon as it disappears.
+    if (!record?.processStartTime) {
+        return true;
+    }
+
+    const currentBootId = readLinuxBootId();
+    if (record.bootId && currentBootId && record.bootId !== currentBootId) {
+        return false;
+    }
+    const currentStartTime = readLinuxProcessStartTime(pid);
+    // On non-Linux hosts /proc is unavailable. A live PID is the safest signal
+    // there; Linux additionally protects against PID reuse across Box restarts.
+    return currentStartTime == null || currentStartTime === String(record.processStartTime);
+}
+
+function readLockSnapshot(lockFile) {
+    try {
+        const stat = fs.lstatSync(lockFile);
+        if (!stat.isFile() || stat.isSymbolicLink()) {
+            return { stat, record: null, malformed: true };
+        }
+        const raw = fs.readFileSync(lockFile, 'utf8');
+        try {
+            return { stat, raw, record: JSON.parse(raw), malformed: false };
+        } catch (_) {
+            return { stat, raw, record: null, malformed: true };
+        }
+    } catch (err) {
+        if (err?.code === 'ENOENT') return null;
+        throw err;
+    }
+}
+
+function sameLockSnapshot(lockFile, snapshot) {
+    try {
+        const current = fs.lstatSync(lockFile);
+        return current.isFile()
+            && !current.isSymbolicLink()
+            && current.dev === snapshot.stat.dev
+            && current.ino === snapshot.stat.ino
+            && current.size === snapshot.stat.size
+            && current.mtimeMs === snapshot.stat.mtimeMs;
+    } catch (err) {
+        if (err?.code === 'ENOENT') return false;
+        throw err;
+    }
+}
+
+function reclaimAbandonedLock(lockFile, nowMs) {
+    const snapshot = readLockSnapshot(lockFile);
+    if (!snapshot) return true;
+
+    // A contender can observe the file between the owner's exclusive create
+    // and its first write. Give incomplete records time to settle before
+    // treating them as debris from a crashed process.
+    if (snapshot.malformed) {
+        if (nowMs - snapshot.stat.mtimeMs < MALFORMED_LOCK_GRACE_MS) {
+            return false;
+        }
+    } else if (lockOwnerIsAlive(snapshot.record)) {
+        return false;
+    }
+
+    // Recheck the inode immediately before removal. release() also checks its
+    // owner id, preventing an old owner from deleting a successor's lock.
+    if (!sameLockSnapshot(lockFile, snapshot)) {
+        return false;
+    }
+    try {
+        fs.unlinkSync(lockFile);
+        return true;
+    } catch (err) {
+        if (err?.code === 'ENOENT') return true;
+        throw err;
+    }
+}
+
+export function acquireLock(cachePath, {
+    timeoutMs = 10 * 60 * 1000,
+    pollMs = 250,
+    now = Date.now,
+    sleep = blockingSleep,
+} = {}) {
     fs.mkdirSync(cachePath, { recursive: true });
     const lockFile = path.join(cachePath, LOCK_FILENAME);
-    const start = Date.now();
+    const owner = {
+        version: LOCK_VERSION,
+        ownerId: crypto.randomUUID(),
+        pid: process.pid,
+        processStartTime: readLinuxProcessStartTime(process.pid),
+        bootId: readLinuxBootId(),
+        at: new Date(now()).toISOString(),
+    };
+    const serializedOwner = JSON.stringify(owner);
+    const start = now();
     while (true) {
+        let fd = null;
         try {
-            const fd = fs.openSync(lockFile, 'wx');
-            fs.writeSync(fd, JSON.stringify({ pid: process.pid, at: new Date().toISOString() }));
+            fd = fs.openSync(lockFile, 'wx', 0o600);
+            fs.writeSync(fd, serializedOwner);
+            fs.fsyncSync(fd);
             fs.closeSync(fd);
+            fd = null;
             return {
                 release() {
-                    try { fs.unlinkSync(lockFile); } catch (_) {}
+                    try {
+                        const snapshot = readLockSnapshot(lockFile);
+                        if (snapshot?.record?.ownerId === owner.ownerId
+                            && sameLockSnapshot(lockFile, snapshot)) {
+                            fs.unlinkSync(lockFile);
+                        }
+                    } catch (_) {}
                 },
                 path: lockFile,
             };
         } catch (err) {
+            if (fd != null) {
+                try { fs.closeSync(fd); } catch (_) {}
+                try { fs.unlinkSync(lockFile); } catch (_) {}
+            }
             if (err && err.code !== 'EEXIST') throw err;
         }
-        if (Date.now() - start > timeoutMs) {
+        if (reclaimAbandonedLock(lockFile, now())) {
+            continue;
+        }
+        if (now() - start >= timeoutMs) {
             throw new Error(`Timed out waiting for cache lock at ${lockFile}`);
         }
-        const deadline = Date.now() + pollMs;
-        while (Date.now() < deadline) { /* busy wait without a timer */ }
+        sleep(pollMs);
     }
 }
 
