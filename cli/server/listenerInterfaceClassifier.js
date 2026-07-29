@@ -1,5 +1,5 @@
 import net from 'node:net';
-import { spawnSync } from 'node:child_process';
+import { execFile } from 'node:child_process';
 
 import { NETWORK_SCHEMA_VERSION } from '../sandbox/networkContract.js';
 import { NETWORK_LABELS, workspaceNetworkIdentity } from '../sandbox/networkLifecycle.js';
@@ -7,16 +7,19 @@ import { NETWORK_LABELS, workspaceNetworkIdentity } from '../sandbox/networkLife
 const REFRESH_INTERVAL_MS = 1_000;
 
 function defaultRun(args) {
-    const result = spawnSync('podman', args, {
-        encoding: 'utf8',
-        stdio: ['ignore', 'pipe', 'pipe'],
-        timeout: 5_000,
+    return new Promise((resolve) => {
+        execFile('podman', args, {
+            encoding: 'utf8',
+            timeout: 5_000,
+            maxBuffer: 4 * 1024 * 1024,
+        }, (error, stdout, stderr) => {
+            resolve({
+                ok: !error,
+                stdout: String(stdout || ''),
+                stderr: String(stderr || error?.message || ''),
+            });
+        });
     });
-    return {
-        ok: result.status === 0 && !result.error,
-        stdout: String(result.stdout || ''),
-        stderr: String(result.stderr || result.error?.message || ''),
-    };
 }
 
 function parseJsonRecord(source, description) {
@@ -140,10 +143,39 @@ export function createListenerInterfaceClassifier({
     let gateways = new Set();
     let refreshedAt = Number.NEGATIVE_INFINITY;
     let lastError = null;
+    let inFlight = null;
+
+    async function collectGateways() {
+        const next = new Set();
+        const listed = await Promise.resolve(run(['network', 'ls', '--format', 'json']));
+        if (!listed?.ok) throw new Error(`cannot list managed networks: ${listed?.stderr || 'podman failed'}`);
+        let summaries;
+        try {
+            summaries = JSON.parse(String(listed.stdout || '[]'));
+        } catch (error) {
+            throw new Error(`managed network list returned malformed JSON: ${error.message}`);
+        }
+        if (!Array.isArray(summaries)) summaries = [summaries];
+        const names = summaries
+            .map((record) => String(record?.Name || record?.name || record?.NetworkName || ''))
+            .filter((name) => name.startsWith(namePrefix))
+            .sort();
+        for (const name of names) {
+            const inspected = await Promise.resolve(run(['network', 'inspect', name]));
+            if (!inspected?.ok) throw new Error(`cannot inspect managed network '${name}': ${inspected?.stderr || 'podman failed'}`);
+            const record = parseJsonRecord(inspected.stdout, `network '${name}' inspection`);
+            next.add(validatedManagedGateway(record, {
+                workspaceHash: identity.hash,
+                expectedNamePrefix: namePrefix,
+            }));
+        }
+        return next;
+    }
 
     function refresh({ force = false } = {}) {
+        if (inFlight) return inFlight;
         const observedAt = now();
-        if (!force && observedAt - refreshedAt < refreshIntervalMs) return;
+        if (!force && observedAt - refreshedAt < refreshIntervalMs) return Promise.resolve();
         refreshedAt = observedAt;
         if (!bindsRuntimeBridgeGatewaysLocally) {
             // Podman bridge gateways live inside a runtime VM on macOS and
@@ -153,44 +185,32 @@ export function createListenerInterfaceClassifier({
             // every time the private-listener reconciler runs.
             gateways = new Set();
             lastError = null;
-            return;
+            return Promise.resolve();
         }
-        const next = new Set();
-        try {
-            const listed = run(['network', 'ls', '--format', 'json']);
-            if (!listed?.ok) throw new Error(`cannot list managed networks: ${listed?.stderr || 'podman failed'}`);
-            let summaries;
+        // The runtime sweep runs asynchronously and single-flight so the
+        // request, upgrade, and socket-admission paths that call classify()
+        // never block the Router event loop on Podman. classify() serves the
+        // last validated gateway set while a sweep is in flight; staleness can
+        // only downgrade a classification (managed -> public/denied), never
+        // grant one.
+        inFlight = (async () => {
             try {
-                summaries = JSON.parse(String(listed.stdout || '[]'));
+                gateways = await collectGateways();
+                lastError = null;
             } catch (error) {
-                throw new Error(`managed network list returned malformed JSON: ${error.message}`);
+                // Transport classification is fail closed. A stale gateway set
+                // is never retained after Podman or ownership validation fails.
+                gateways = new Set();
+                lastError = error;
+            } finally {
+                inFlight = null;
             }
-            if (!Array.isArray(summaries)) summaries = [summaries];
-            const names = summaries
-                .map((record) => String(record?.Name || record?.name || record?.NetworkName || ''))
-                .filter((name) => name.startsWith(namePrefix))
-                .sort();
-            for (const name of names) {
-                const inspected = run(['network', 'inspect', name]);
-                if (!inspected?.ok) throw new Error(`cannot inspect managed network '${name}': ${inspected?.stderr || 'podman failed'}`);
-                const record = parseJsonRecord(inspected.stdout, `network '${name}' inspection`);
-                next.add(validatedManagedGateway(record, {
-                    workspaceHash: identity.hash,
-                    expectedNamePrefix: namePrefix,
-                }));
-            }
-            gateways = next;
-            lastError = null;
-        } catch (error) {
-            // Transport classification is fail closed. A stale gateway set is
-            // never retained after Podman or ownership validation fails.
-            gateways = new Set();
-            lastError = error;
-        }
+        })();
+        return inFlight;
     }
 
     function classify(localAddress) {
-        refresh();
+        void refresh();
         const address = normalizeAddress(localAddress);
         if (isLoopback(address)) return 'loopback';
         if (gateways.has(address)) return 'managed';

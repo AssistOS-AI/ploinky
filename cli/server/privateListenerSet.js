@@ -201,7 +201,7 @@ export function createPrivateListenerSet({
         if (wildcardHost) {
             nextDesired.set(WILDCARD_ADDRESS, 'box-wildcard');
         } else {
-            interfaceClassifier.refresh({ force: true });
+            await interfaceClassifier.refresh({ force: true });
             classifierSnapshot = interfaceClassifier.snapshot();
             nextDesired.set(LOOPBACK_ADDRESS, 'loopback');
             for (const gateway of classifierSnapshot?.gateways || []) {
