@@ -142,6 +142,7 @@ test('no-wait launch accepts only its exact active target-less identity', () => 
                 },
             },
             routing: {
+                port: 8080,
                 routes: {
                     background: {
                         container: 'ploinky_demo_worker',
@@ -157,7 +158,7 @@ test('no-wait launch accepts only its exact active target-less identity', () => 
                     container: 'node:24',
                 },
             },
-            routerHostPort: 8080,
+            routerHostPort: 19090,
         },
     };
     const identity = {
@@ -173,7 +174,8 @@ test('no-wait launch accepts only its exact active target-less identity', () => 
     assert.equal(lifecycle.record.instanceId, 'instance-one');
     assert.equal(lifecycle.generationDigest, 'sha256:active-generation');
     assert.equal(lifecycle.selectorActivationId, 'activation-one');
-    assert.equal(lifecycle.routerHostPort, 8080);
+    assert.equal(lifecycle.routerPort, 8080);
+    assert.equal(lifecycle.routerHostPort, 19090);
     assert.throws(
         () => assertNoWaitLifecycleSnapshot({
             generation: {

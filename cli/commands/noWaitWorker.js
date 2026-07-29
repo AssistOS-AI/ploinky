@@ -226,6 +226,7 @@ export function assertNoWaitLifecycleSnapshot(active, {
         manifest,
         generationDigest: String(active?.selector?.generation || ''),
         selectorActivationId: String(active?.selector?.activationId || ''),
+        routerPort: Number(active?.generation?.routing?.port || 0),
         routerHostPort: Number(active?.generation?.routerHostPort || 0),
     });
 }
@@ -350,7 +351,7 @@ async function main() {
         if (profileName && activeProfile && profileName !== activeProfile) {
             throw new Error(`no-wait lifecycle profile changed before launch for '${routeKey}'`);
         }
-        if (routerPort && Number(routerPort) !== lifecycle.routerHostPort) {
+        if (routerPort && Number(routerPort) !== lifecycle.routerPort) {
             throw new Error(`no-wait lifecycle Router port changed before launch for '${routeKey}'`);
         }
         const profileResolution = resolveManifestRuntimeProfile(manifest, {
@@ -359,7 +360,7 @@ async function main() {
             path: `manifest(${repoName}/${shortAgent})`,
         });
         const routerEndpoint = resolveRouterEndpoint(profileResolution.network.mode, {
-            explicitPort: lifecycle.routerHostPort || undefined,
+            explicitPort: lifecycle.routerPort || undefined,
         });
         const ensureOptions = {
             containerName,
