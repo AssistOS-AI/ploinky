@@ -116,6 +116,36 @@ test('manifest route access rejects mode alias and accepts guest', () => {
     );
 });
 
+test('manifest route access validates parameter-bound guest scopes', () => {
+    assert.deepEqual(
+        normalizeManifestHttpRouteAccess({
+            path: '/roomLoader.html',
+            access: 'guest',
+            guestScope: 'webmeet:room',
+            guestScopeParam: 'roomId',
+        }, { routeKey: 'webmeetAgent' }),
+        {
+            ok: true,
+            path: '/webmeetAgent/roomLoader.html',
+            access: 'guest',
+            routeKey: 'webmeetAgent',
+            source: 'manifest',
+            guestScope: 'webmeet:room',
+            guestScopeParam: 'roomId',
+        },
+    );
+    for (const spec of [
+        { path: '/x', access: 'guest', guestScopeParam: 'roomId' },
+        { path: '/x', access: 'authenticated', guestScope: 'x', guestScopeParam: 'roomId' },
+        { path: '/x', access: 'guest', guestScope: 'x', guestScopeParam: 'bad.name' },
+    ]) {
+        assert.equal(
+            normalizeManifestHttpRouteAccess(spec, { routeKey: 'webmeetAgent' }).code,
+            'INVALID_GUEST_SCOPE_PARAM',
+        );
+    }
+});
+
 test('manifest route access accepts only convention paths owned by the declaring agent', () => {
     assert.deepEqual(
         normalizeManifestHttpRouteAccess({

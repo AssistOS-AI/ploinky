@@ -72,8 +72,18 @@ export class SessionTokenService {
         if (!payload || payload.typ !== 'guest-session' || !payload.usr || this._isRevoked(payload)) {
             return null;
         }
+        const expectedRouteKey = String(options?.routeKey || options?.policy?.routeKey || '').trim();
+        const payloadRouteKey = String(payload.groute || payload.guestRouteKey || '').trim();
+        if (expectedRouteKey && payloadRouteKey !== expectedRouteKey) {
+            return null;
+        }
         const expectedGuestScope = String(options?.guestScope || options?.policy?.guestScope || '').trim();
         const payloadGuestScope = String(payload.gscope || payload.guestScope || '').trim();
+        if (options?.allowAnyGuestScope === true) {
+            return payloadGuestScope
+                ? this._sessionFromPayload(token, payload, { kind: 'guest' })
+                : null;
+        }
         if (expectedGuestScope) {
             if (payloadGuestScope !== expectedGuestScope) return null;
         } else if (payloadGuestScope) {

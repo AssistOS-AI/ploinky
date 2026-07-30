@@ -402,6 +402,18 @@ function selectedAgentMcpRoute(pathname, routeKeys) {
     return isRouteMount(pathname, prefix) ? routeKey : '';
 }
 
+function selectedDependencyHttpRoute(pathname, routes, selectedRootRouteKey, routeSpecs) {
+    const candidate = resolveAgentPath(pathname, routes, null);
+    if (!candidate || candidate.routeKey === String(selectedRootRouteKey || '')) return '';
+    const admitted = (routeSpecs || []).some((entry) => (
+        entry
+        && entry.routeKey === candidate.routeKey
+        && typeof entry.path === 'string'
+        && HttpRouteAccessPath.matches(candidate.canonicalPath, entry.path)
+    ));
+    return admitted ? candidate.routeKey : '';
+}
+
 function isSelectedRootUserAdminPath(pathname, selectedRootRouteKey) {
     const routeKey = String(selectedRootRouteKey || '');
     if (!routeKey) return false;
@@ -638,6 +650,26 @@ export function resolveEdgeRoutePlan({
             });
         }
         if (surface?.name === 'agent-mcp' && surface.routeKey) {
+            return agentRootPlan({
+                req,
+                host,
+                listener,
+                pathname,
+                parsedUrl: url,
+                hostSelection,
+                selectedRoot: null,
+                routes,
+                snapshot,
+                lease,
+            });
+        }
+        const dependencyHttpRoute = selectedDependencyHttpRoute(
+            pathname,
+            routes,
+            hostSelection.record?.routeKey,
+            snapshot.compiled.dependencyHttpRoutes?.[host] || [],
+        );
+        if (dependencyHttpRoute) {
             return agentRootPlan({
                 req,
                 host,

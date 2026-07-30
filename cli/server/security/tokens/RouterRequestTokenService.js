@@ -43,6 +43,12 @@ export function normalizeUserClaims(usr) {
     };
 }
 
+export function normalizeScope(scope) {
+    if (!Array.isArray(scope)) return undefined;
+    const normalized = [...new Set(scope.map((entry) => String(entry || '').trim()).filter(Boolean))];
+    return normalized.length ? normalized : undefined;
+}
+
 export function normalizeDelegation(delegation) {
     if (!delegation || typeof delegation !== 'object') return undefined;
     const jti = String(delegation.jti || '').trim();
@@ -101,6 +107,7 @@ export class RouterRequestTokenService {
         actor,
         caller,
         usr,
+        scope,
         method,
         path,
         tool,
@@ -136,6 +143,8 @@ export class RouterRequestTokenService {
         if (normalizedCaller) payload.caller = normalizedCaller;
         const normalizedUser = normalizeUserClaims(usr);
         if (normalizedUser) payload.usr = normalizedUser;
+        const normalizedRequestScope = normalizeScope(scope);
+        if (normalizedRequestScope) payload.scope = normalizedRequestScope;
         const normalizedDelegation = normalizeDelegation(delegation);
         if (normalizedDelegation) payload.delegation = normalizedDelegation;
         const normalizedDelegations = normalizeDelegations(delegations);

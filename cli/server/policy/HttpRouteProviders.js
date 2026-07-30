@@ -64,6 +64,29 @@ export function normalizeManifestHttpRouteAccess(spec, { routeKey } = {}) {
     const hasAccess = Object.prototype.hasOwnProperty.call(spec || {}, 'access');
     const access = hasAccess ? normalizeHttpRouteAccess(spec?.access) : 'authenticated';
     if (!access) return { ok: false, code: 'INVALID_ACCESS', error: 'access must be public, guest, or authenticated' };
+    const guestScope = spec?.guestScope === undefined ? '' : String(spec.guestScope || '').trim();
+    if (spec?.guestScope !== undefined && (typeof spec.guestScope !== 'string' || !guestScope)) {
+        return { ok: false, code: 'INVALID_GUEST_SCOPE', error: 'guestScope must be a non-empty string when present' };
+    }
+    const guestScopeParam = spec?.guestScopeParam === undefined
+        ? ''
+        : String(spec.guestScopeParam || '').trim();
+    if (spec?.guestScopeParam !== undefined
+        && (typeof spec.guestScopeParam !== 'string'
+            || !/^[A-Za-z][A-Za-z0-9_-]{0,63}$/.test(guestScopeParam))) {
+        return {
+            ok: false,
+            code: 'INVALID_GUEST_SCOPE_PARAM',
+            error: 'guestScopeParam must be a valid query parameter name when present',
+        };
+    }
+    if (guestScopeParam && (access !== 'guest' || !guestScope)) {
+        return {
+            ok: false,
+            code: 'INVALID_GUEST_SCOPE_PARAM',
+            error: 'guestScopeParam requires guest access and an explicit guestScope',
+        };
+    }
 
     const rawPath = String(spec?.path || '').trim();
     const agentRelativePath = rawPath.startsWith('/') ? rawPath : `/${rawPath}`;
@@ -96,6 +119,8 @@ export function normalizeManifestHttpRouteAccess(spec, { routeKey } = {}) {
             access,
             routeKey: normalizedRouteKey,
             source: 'manifest',
+            ...(guestScope ? { guestScope } : {}),
+            ...(guestScopeParam ? { guestScopeParam } : {}),
         };
     }
     if (agentRelativePath === '/' || agentRelativePath === '/*') {
@@ -107,7 +132,15 @@ export function normalizeManifestHttpRouteAccess(spec, { routeKey } = {}) {
     const expandedPath = `/${encodeURIComponent(normalizedRouteKey)}${agentRelativePath}`;
     const normalized = HttpRouteAccessPath.normalize(expandedPath);
     if (!normalized.ok) return normalized;
-    return { ok: true, path: normalized.path, access, routeKey: normalizedRouteKey, source: 'manifest' };
+    return {
+        ok: true,
+        path: normalized.path,
+        access,
+        routeKey: normalizedRouteKey,
+        source: 'manifest',
+        ...(guestScope ? { guestScope } : {}),
+        ...(guestScopeParam ? { guestScopeParam } : {}),
+    };
 }
 
 export function collectManifestHttpRouteAccess(routes = {}, { manifests = null } = {}) {
@@ -126,6 +159,8 @@ export function collectManifestHttpRouteAccess(routes = {}, { manifests = null }
                 access: normalized.access,
                 routeKey: normalized.routeKey,
                 source: 'manifest',
+                ...(normalized.guestScope ? { guestScope: normalized.guestScope } : {}),
+                ...(normalized.guestScopeParam ? { guestScopeParam: normalized.guestScopeParam } : {}),
             });
         }
     }

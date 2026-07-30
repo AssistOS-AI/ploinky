@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -14,6 +15,18 @@ import {
     readCurrentEdgeTopology,
 } from '../../cli/sandbox/edgeGeneration.js';
 import { resolveEdgeRoutePlan } from '../../cli/server/edgeRoutePlan.js';
+
+function stableValue(value) {
+    if (Array.isArray(value)) return value.map(stableValue);
+    if (value && typeof value === 'object') {
+        return Object.fromEntries(Object.keys(value).sort().map((key) => [key, stableValue(value[key])]));
+    }
+    return value;
+}
+
+function compiledDigest(compiled) {
+    return `sha256:${crypto.createHash('sha256').update(JSON.stringify(stableValue(compiled))).digest('hex')}`;
+}
 
 function localDesired(overrides = {}) {
     return {
@@ -151,6 +164,10 @@ test('agent-mcp exposes only the selected root manifest dependency closure', (t)
                     agent: 'fixtures/alpha',
                     routerSurfaces: ['agent-mcp'],
                 },
+                'standalone.example.test': {
+                    agent: 'fixtures/alpha',
+                    routerSurfaces: [],
+                },
             },
             cloudflare: {
                 tunnelTokenSecret: 'publication/test-connector',
@@ -158,6 +175,14 @@ test('agent-mcp exposes only the selected root manifest dependency closure', (t)
         },
         alphaManifest: {
             enable: ['beta global no-wait'],
+        },
+        policy: {
+            schema: 'router-policy',
+            httpRoutes: [{
+                path: '/beta/restricted.html',
+                access: 'authenticated',
+            }],
+            mcpTools: [],
         },
     });
     const routingFile = path.join(fixture.ploinkyDir, 'routing.json');
@@ -169,9 +194,30 @@ test('agent-mcp exposes only the selected root manifest dependency closure', (t)
     fs.mkdirSync(unrelatedDir, { recursive: true });
     fs.writeFileSync(path.join(betaDir, 'manifest.json'), JSON.stringify({
         enable: ['gamma global'],
+        routerAccess: {
+            httpRoutes: [
+                {
+                    path: '/roomLoader.html',
+                    access: 'guest',
+                    guestScope: 'webmeet:room',
+                    guestScopeParam: 'roomId',
+                },
+                { path: '/restricted.html', access: 'guest' },
+                { path: '/static-files/*', access: 'public' },
+                { path: '/disabled.html', access: 'authenticated', enabled: false },
+            ],
+        },
     }, null, 2));
-    fs.writeFileSync(path.join(gammaDir, 'manifest.json'), '{}');
-    fs.writeFileSync(path.join(unrelatedDir, 'manifest.json'), '{}');
+    fs.writeFileSync(path.join(gammaDir, 'manifest.json'), JSON.stringify({
+        routerAccess: {
+            httpRoutes: [{ path: '/guest.html', access: 'guest' }],
+        },
+    }, null, 2));
+    fs.writeFileSync(path.join(unrelatedDir, 'manifest.json'), JSON.stringify({
+        routerAccess: {
+            httpRoutes: [{ path: '/roomLoader.html', access: 'public' }],
+        },
+    }, null, 2));
 
     const routing = JSON.parse(fs.readFileSync(routingFile, 'utf8'));
     routing.routes.gamma = {
@@ -218,6 +264,35 @@ test('agent-mcp exposes only the selected root manifest dependency closure', (t)
         applied.generation.compiled.agentMcpRoutes['explorer.example.test'],
         ['alpha', 'beta', 'gamma'],
     );
+    assert.deepEqual(
+        applied.generation.compiled.dependencyHttpRoutes['explorer.example.test'],
+        [
+            { path: '/beta/restricted.html', routeKey: 'beta' },
+            { path: '/beta/roomLoader.html', routeKey: 'beta' },
+            { path: '/beta/static-files/*', routeKey: 'beta' },
+            { path: '/gamma/guest.html', routeKey: 'gamma' },
+        ],
+    );
+    assert.equal(
+        applied.generation.compiled.policy.entries.find((entry) => (
+            entry.path === '/beta/roomLoader.html'
+        ))?.guestScope,
+        'webmeet:room',
+    );
+    assert.equal(
+        applied.generation.compiled.policy.entries.find((entry) => (
+            entry.path === '/beta/roomLoader.html'
+        ))?.guestScopeParam,
+        'roomId',
+    );
+    assert.deepEqual(
+        applied.generation.compiled.agentMcpRoutes['standalone.example.test'],
+        [],
+    );
+    assert.deepEqual(
+        applied.generation.compiled.dependencyHttpRoutes['standalone.example.test'],
+        applied.generation.compiled.dependencyHttpRoutes['explorer.example.test'],
+    );
 
     const rootMcp = resolveEdgeRoutePlan({
         req: {
@@ -256,6 +331,98 @@ test('agent-mcp exposes only the selected root manifest dependency closure', (t)
     assert.equal(dependencyContent.routeKey, 'alpha');
     assert.equal(dependencyContent.upstreamPath, '/beta/index.html');
 
+    const dependencyManifestGuestRoute = resolveEdgeRoutePlan({
+        req: {
+            method: 'GET',
+            url: '/beta/roomLoader.html',
+            headers: { host: 'explorer.example.test' },
+        },
+        listener: 'public',
+    });
+    assert.equal(dependencyManifestGuestRoute.ok, true);
+    assert.equal(dependencyManifestGuestRoute.routeKey, 'beta');
+    assert.equal(dependencyManifestGuestRoute.upstreamPath, '/roomLoader.html');
+    assert.equal(dependencyManifestGuestRoute.decision.access, 'guest');
+    assert.equal(dependencyManifestGuestRoute.decision.source, 'manifest');
+
+    const dependencyManifestRouteWithoutMcpSurface = resolveEdgeRoutePlan({
+        req: {
+            method: 'GET',
+            url: '/beta/roomLoader.html',
+            headers: { host: 'standalone.example.test' },
+        },
+        listener: 'public',
+    });
+    assert.equal(dependencyManifestRouteWithoutMcpSurface.ok, true);
+    assert.equal(dependencyManifestRouteWithoutMcpSurface.routeKey, 'beta');
+    assert.equal(dependencyManifestRouteWithoutMcpSurface.upstreamPath, '/roomLoader.html');
+    assert.equal(dependencyManifestRouteWithoutMcpSurface.decision.access, 'guest');
+
+    const dependencyMcpWithoutMcpSurface = resolveEdgeRoutePlan({
+        req: {
+            method: 'POST',
+            url: '/beta/mcp',
+            headers: { host: 'standalone.example.test' },
+        },
+        listener: 'public',
+    });
+    assert.equal(dependencyMcpWithoutMcpSurface.ok, true);
+    assert.equal(dependencyMcpWithoutMcpSurface.routeKey, 'alpha');
+    assert.equal(dependencyMcpWithoutMcpSurface.upstreamPath, '/beta/mcp');
+
+    const dependencyManifestAssetRoute = resolveEdgeRoutePlan({
+        req: {
+            method: 'GET',
+            url: '/beta/static-files/roomLoader.js',
+            headers: { host: 'explorer.example.test' },
+        },
+        listener: 'public',
+    });
+    assert.equal(dependencyManifestAssetRoute.ok, true);
+    assert.equal(dependencyManifestAssetRoute.routeKey, 'beta');
+    assert.equal(dependencyManifestAssetRoute.upstreamPath, '/static-files/roomLoader.js');
+    assert.equal(dependencyManifestAssetRoute.decision.access, 'public');
+
+    const dependencyManifestAssetWrite = resolveEdgeRoutePlan({
+        req: {
+            method: 'POST',
+            url: '/beta/static-files/roomLoader.js',
+            headers: { host: 'explorer.example.test' },
+        },
+        listener: 'public',
+    });
+    assert.equal(dependencyManifestAssetWrite.ok, true);
+    assert.equal(dependencyManifestAssetWrite.routeKey, 'beta');
+    assert.equal(dependencyManifestAssetWrite.decision.access, 'deny');
+    assert.equal(dependencyManifestAssetWrite.decision.status, 403);
+    assert.equal(dependencyManifestAssetWrite.decision.code, 'PUBLIC_ROUTE_WRITE_DENIED');
+
+    const restrictedDependencyManifestRoute = resolveEdgeRoutePlan({
+        req: {
+            method: 'GET',
+            url: '/beta/restricted.html',
+            headers: { host: 'explorer.example.test' },
+        },
+        listener: 'public',
+    });
+    assert.equal(restrictedDependencyManifestRoute.ok, true);
+    assert.equal(restrictedDependencyManifestRoute.routeKey, 'beta');
+    assert.equal(restrictedDependencyManifestRoute.upstreamPath, '/restricted.html');
+    assert.equal(restrictedDependencyManifestRoute.decision.access, 'authenticated');
+    assert.equal(restrictedDependencyManifestRoute.decision.source, 'policy');
+
+    const disabledDependencyManifestRoute = resolveEdgeRoutePlan({
+        req: {
+            method: 'GET',
+            url: '/beta/disabled.html',
+            headers: { host: 'explorer.example.test' },
+        },
+        listener: 'public',
+    });
+    assert.equal(disabledDependencyManifestRoute.ok, true);
+    assert.equal(disabledDependencyManifestRoute.routeKey, 'alpha');
+    assert.equal(disabledDependencyManifestRoute.upstreamPath, '/beta/disabled.html');
+
     const transitiveDependencyMcp = resolveEdgeRoutePlan({
         req: {
             method: 'POST',
@@ -268,6 +435,19 @@ test('agent-mcp exposes only the selected root manifest dependency closure', (t)
     assert.equal(transitiveDependencyMcp.routeKey, 'gamma');
     assert.equal(transitiveDependencyMcp.upstreamPath, '/mcp');
 
+    const transitiveDependencyManifestRoute = resolveEdgeRoutePlan({
+        req: {
+            method: 'GET',
+            url: '/gamma/guest.html',
+            headers: { host: 'explorer.example.test' },
+        },
+        listener: 'public',
+    });
+    assert.equal(transitiveDependencyManifestRoute.ok, true);
+    assert.equal(transitiveDependencyManifestRoute.routeKey, 'gamma');
+    assert.equal(transitiveDependencyManifestRoute.upstreamPath, '/guest.html');
+    assert.equal(transitiveDependencyManifestRoute.decision.access, 'guest');
+
     const unrelatedMcp = resolveEdgeRoutePlan({
         req: {
             method: 'POST',
@@ -279,6 +459,18 @@ test('agent-mcp exposes only the selected root manifest dependency closure', (t)
     assert.equal(unrelatedMcp.ok, true);
     assert.equal(unrelatedMcp.routeKey, 'alpha');
     assert.equal(unrelatedMcp.upstreamPath, '/unrelated/mcp');
+
+    const unrelatedManifestRoute = resolveEdgeRoutePlan({
+        req: {
+            method: 'GET',
+            url: '/unrelated/roomLoader.html',
+            headers: { host: 'explorer.example.test' },
+        },
+        listener: 'public',
+    });
+    assert.equal(unrelatedManifestRoute.ok, true);
+    assert.equal(unrelatedManifestRoute.routeKey, 'alpha');
+    assert.equal(unrelatedManifestRoute.upstreamPath, '/unrelated/roomLoader.html');
 });
 
 test('user-admin exposes only the selected root administration routes', (t) => {
@@ -429,6 +621,50 @@ test('durable preparation remains inactive until its exact lease commits', (t) =
     });
     assert.equal(committed.selector.state, 'active');
     assert.equal(committed.selector.generation, prepared.selector.generation);
+});
+
+test('legacy generation without dependency HTTP routes remains loadable until replacement', (t) => {
+    const fixture = createFixture(t, {
+        desired: {
+            hosts: {
+                'explorer.example.test': {
+                    agent: 'fixtures/alpha',
+                    routerSurfaces: [],
+                },
+            },
+        },
+    });
+    const applied = applyEdgeRoutingGeneration({
+        workspaceRoot: fixture.workspace,
+        reason: 'legacy-generation-baseline',
+    });
+    const generationFile = path.join(
+        fixture.edgeDir,
+        'generations',
+        `${applied.selector.generation.replace(/^sha256:/, '')}.json`,
+    );
+    const legacyDocument = JSON.parse(fs.readFileSync(generationFile, 'utf8'));
+    delete legacyDocument.compiled.dependencyHttpRoutes;
+    legacyDocument.compiledDigest = compiledDigest(legacyDocument.compiled);
+    fs.writeFileSync(generationFile, JSON.stringify(legacyDocument, null, 2));
+
+    const legacyActive = loadActiveEdgeRoutingGeneration({ workspaceRoot: fixture.workspace });
+    assert.equal(Object.hasOwn(legacyActive.generation.compiled, 'dependencyHttpRoutes'), false);
+
+    fs.writeFileSync(path.join(fixture.edgeDir, 'desired.json'), JSON.stringify({
+        hosts: {
+            'replacement.example.test': {
+                agent: 'fixtures/alpha',
+                routerSurfaces: [],
+            },
+        },
+    }, null, 2));
+    const replacement = applyEdgeRoutingGeneration({
+        workspaceRoot: fixture.workspace,
+        reason: 'legacy-generation-replacement',
+    });
+    assert.notEqual(replacement.selector.generation, applied.selector.generation);
+    assert.equal(Object.hasOwn(replacement.generation.compiled, 'dependencyHttpRoutes'), true);
 });
 
 test('live source drift is rejected without inactivating the selected generation', (t) => {

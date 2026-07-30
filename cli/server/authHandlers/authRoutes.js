@@ -176,7 +176,11 @@ export async function handleAuthRoutes(req, res, parsedUrl, { routePlan = null }
     if (!requireCurrentGeneration(res, routePlan)) return true;
     const authContext = resolveAuthContextForRoutePlan(parsedUrl, routePlan, { browserAuth: true });
     if (authContext.error) {
-        sendJson(res, 503, { ok: false, error: authContext.error });
+        sendJson(res, authContext.errorStatus || 503, {
+            ok: false,
+            error: authContext.error,
+            ...(authContext.errorDetail ? { detail: authContext.errorDetail } : {}),
+        });
         return true;
     }
     if (rejectMismatchedHostSelector(res, authContext, parsedUrl.searchParams.get('agent'))) return true;

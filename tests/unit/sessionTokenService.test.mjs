@@ -8,7 +8,15 @@ function serviceWithSessions() {
     return new SessionTokenService({
         verifySessionJwt: (token) => {
             if (token === 'user-token') return { typ: 'user-session', usr: { id: 'u1', username: 'u1', roles: ['user'] }, rev: 1 };
-            if (token === 'guest-token') return { typ: 'guest-session', usr: { id: 'guest:g1', username: 'visitor', roles: ['guest'] }, rev: 0 };
+            if (token === 'guest-token') {
+                return {
+                    typ: 'guest-session',
+                    usr: { id: 'guest:g1', username: 'visitor', roles: ['guest'] },
+                    rev: 0,
+                    gscope: 'guest-scope',
+                    groute: 'guestAgent',
+                };
+            }
             throw new Error('Not a session JWT');
         },
         resolveUserRev: () => 1,
@@ -26,8 +34,20 @@ test('getUserSession accepts only typ user-session', async () => {
 
 test('getGuestSession accepts only typ guest-session', async () => {
     const service = serviceWithSessions();
-    const guestSession = await service.getGuestSession('guest-token');
+    const guestSession = await service.getGuestSession('guest-token', {
+        policy: { routeKey: 'guestAgent', guestScope: 'guest-scope' },
+    });
     assert.equal(guestSession.kind, 'guest');
     assert.deepEqual(guestSession.user.roles, ['guest']);
+    const preserved = await service.getGuestSession('guest-token', {
+        routeKey: 'guestAgent',
+        allowAnyGuestScope: true,
+    });
+    assert.equal(preserved.kind, 'guest');
+    assert.equal(preserved._jwtPayload.gscope, 'guest-scope');
+    assert.equal(await service.getGuestSession('guest-token', {
+        routeKey: 'otherAgent',
+        allowAnyGuestScope: true,
+    }), null);
     assert.equal(await service.getGuestSession('user-token'), null);
 });

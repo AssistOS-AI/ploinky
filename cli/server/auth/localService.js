@@ -73,6 +73,7 @@ const GUEST_SESSION_TTL_SECONDS = 60 * 60;
 function mintGuestSessionJwt(options = {}) {
     const guestId = crypto.randomUUID();
     const guestScope = String(options?.guestScope || options?.policy?.guestScope || '').trim();
+    const guestRouteKey = String(options?.routeKey || options?.policy?.routeKey || '').trim();
     const iat = Math.floor(Date.now() / 1000);
     const payload = {
         typ: 'guest-session',
@@ -81,6 +82,7 @@ function mintGuestSessionJwt(options = {}) {
         sub: `user:guest:${guestId}`,
         sid: `gsess_${guestId}`,
         gscope: guestScope || undefined,
+        groute: guestRouteKey || undefined,
         usr: {
             id: `guest:${guestId}`,
             username: 'visitor',
@@ -293,9 +295,16 @@ function getSession(sessionId, options = {}) {
     const roles = Array.isArray(payload.usr?.roles) ? payload.usr.roles : [];
     const isGuestSession = roles.some((role) => String(role || '').trim().toLowerCase() === 'guest');
     if (isGuestSession) {
+        const expectedRouteKey = String(options?.routeKey || options?.policy?.routeKey || '').trim();
+        const payloadRouteKey = String(payload.groute || payload.guestRouteKey || '').trim();
+        if (expectedRouteKey && payloadRouteKey !== expectedRouteKey) {
+            return null;
+        }
         const expectedGuestScope = String(options?.guestScope || options?.policy?.guestScope || '').trim();
         const payloadGuestScope = String(payload.gscope || payload.guestScope || '').trim();
-        if (expectedGuestScope) {
+        if (options?.allowAnyGuestScope === true) {
+            if (!payloadGuestScope) return null;
+        } else if (expectedGuestScope) {
             if (payloadGuestScope !== expectedGuestScope) {
                 return null;
             }

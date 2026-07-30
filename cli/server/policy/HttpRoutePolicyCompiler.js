@@ -94,6 +94,7 @@ function executionMetadata(decision) {
         return {
             access: 'guest',
             guestScope: decision.guestScope || `http-route:${decision.routeKey}`,
+            ...(decision.guestScopeParam ? { guestScopeParam: decision.guestScopeParam } : {}),
         };
     }
     return { access: 'authenticated', routeKey: decision.routeKey };
@@ -144,6 +145,7 @@ function evaluateRepresentative({ representative, entries, routeDefault }) {
             routeKey: entry.routeKey,
             source: entry.source,
             ...(entry.guestScope ? { guestScope: entry.guestScope } : {}),
+            ...(entry.guestScopeParam ? { guestScopeParam: entry.guestScopeParam } : {}),
         })),
         winner: {
             ...winner,

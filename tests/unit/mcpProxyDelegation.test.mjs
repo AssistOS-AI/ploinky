@@ -442,12 +442,30 @@ test('user call to an unconfigured tool mints no delegations', () => {
 
 test('browser guest MCP invocation carries guest actor kind and no delegations', () => {
     const ctx = buildInvocationContextForProviderCall({
-        req: { user: { id: 'guest-1', username: 'guest', roles: ['guest'] } },
+        req: {
+            user: { id: 'guest-1', username: 'guest', roles: ['guest'] },
+            session: { _jwtPayload: { gscope: 'public:webmeet:room' } },
+        },
         agentName: 'gitAgent',
         toolName: 'git_auth_store_token',
         toolArgs: { token: 'redacted-by-test' },
     });
     assert.equal(ctx.payload.actor.kind, 'guest');
+    assert.deepEqual(ctx.payload.scope, ['public:webmeet:room']);
     assert.equal(ctx.payload.usr, undefined);
     assert.equal(ctx.payload.delegations, undefined);
+});
+
+test('browser user MCP invocation cannot project a guest session scope', () => {
+    const ctx = buildInvocationContextForProviderCall({
+        req: {
+            user: { id: 'local:admin', username: 'admin', roles: ['user', 'admin'] },
+            session: { _jwtPayload: { gscope: 'untrusted-guest-scope' } },
+        },
+        agentName: 'gitAgent',
+        toolName: 'git_status',
+        toolArgs: {},
+    });
+    assert.equal(ctx.payload.actor.kind, 'user');
+    assert.equal(ctx.payload.scope, undefined);
 });

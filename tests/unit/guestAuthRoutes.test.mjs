@@ -668,6 +668,224 @@ test('browser token for a guest target preserves an authenticated local session'
     assert.match(String(res.getHeader('set-cookie') || ''), /^ploinky_browser_csrf=/);
 });
 
+test('browser token accepts an exact manifest guest path without widening dependency access', async (t) => {
+    const { authHandlers, localService, createRoutePlan } = await withAuthModules(t);
+    const roomId = 'room_11111111-1111-4111-8111-111111111111';
+    const guestToken = localService.mintGuestSessionJwt({
+        guestScope: `webmeet:room:${roomId}`,
+        routeKey: 'webAssist',
+    });
+    const base = createRoutePlan();
+    const snapshot = {
+        ...base.snapshot,
+        compiled: {
+            agentMcpRoutes: {
+                'explorer.localhost': ['explorer', 'webAssist'],
+            },
+            dependencyHttpRoutes: {
+                'explorer.localhost': [
+                    { path: '/webAssist/roomLoader.html', routeKey: 'webAssist' },
+                ],
+            },
+            policy: {
+                entries: [
+                    {
+                        path: '/webAssist/roomLoader.html',
+                        access: 'guest',
+                        routeKey: 'webAssist',
+                        source: 'manifest',
+                        guestScope: 'webmeet:room',
+                        guestScopeParam: 'roomId',
+                    },
+                    {
+                        path: '/webAssist/private.html',
+                        access: 'authenticated',
+                        routeKey: 'webAssist',
+                        source: 'manifest',
+                    },
+                ],
+                routeDefaults: {
+                    explorer: {
+                        access: 'authenticated',
+                        routeKey: 'explorer',
+                        source: 'routeDefault',
+                    },
+                    webAssist: {
+                        access: 'guest',
+                        routeKey: 'webAssist',
+                        source: 'routeDefault',
+                    },
+                },
+                namespaces: [
+                    {
+                        id: 'route:webAssist',
+                        kind: 'route',
+                        routeKey: 'webAssist',
+                        prefix: '/webAssist',
+                        partitions: [
+                            {
+                                representative: '/webAssist/roomLoader.html',
+                                winner: {
+                                    access: 'guest',
+                                    routeKey: 'webAssist',
+                                    source: 'manifest',
+                                    guestScope: 'webmeet:room',
+                                    guestScopeParam: 'roomId',
+                                },
+                            },
+                        ],
+                    },
+                ],
+            },
+        },
+    };
+    const routePlan = createRoutePlan({
+        ok: true,
+        kind: 'router-surface',
+        surface: 'browser-auth',
+        host: 'explorer.localhost',
+        hostSelection: {
+            kind: 'agent-root',
+            source: 'public-host',
+            host: 'explorer.localhost',
+            record: { routeKey: 'explorer' },
+        },
+        forwarding: { protocol: 'https', authority: 'explorer.localhost' },
+        snapshot,
+        lease: {
+            id: snapshot.generation,
+            snapshot,
+            commit: () => true,
+        },
+    });
+
+    const allowedReq = makeRequest({
+        method: 'GET',
+        url: `/auth/token?mutationRoute=webAssist&mutationPath=%2FwebAssist%2FroomLoader.html&roomId=${roomId}`,
+        host: 'explorer.localhost',
+        cookie: `ploinky_guest=${guestToken}`,
+    });
+    const allowedRes = new MockResponse();
+    await authHandlers.handleAuthRoutes(
+        allowedReq,
+        allowedRes,
+        new URL(allowedReq.url, 'https://explorer.localhost'),
+        { routePlan },
+    );
+    const allowedBody = JSON.parse(allowedRes.body || '{}');
+    assert.equal(allowedRes.statusCode, 200, allowedRes.body);
+    assert.equal(allowedReq.authMode, 'guest');
+    assert.equal(allowedBody.user.username, 'visitor');
+    assert.equal(allowedBody.browserMutation.hostRouteKey, 'explorer');
+    assert.equal(allowedBody.browserMutation.routeKey, 'webAssist');
+    assert.equal(allowedBody.browserMutation.generation, snapshot.generation);
+
+    for (const suffix of [
+        '',
+        '&roomId=room_22222222-2222-4222-8222-222222222222',
+    ]) {
+        const deniedScopeReq = makeRequest({
+            method: 'GET',
+            url: `/auth/token?mutationRoute=webAssist&mutationPath=%2FwebAssist%2FroomLoader.html${suffix}`,
+            host: 'explorer.localhost',
+            cookie: `ploinky_guest=${guestToken}`,
+        });
+        const deniedScopeRes = new MockResponse();
+        await authHandlers.handleAuthRoutes(
+            deniedScopeReq,
+            deniedScopeRes,
+            new URL(deniedScopeReq.url, 'https://explorer.localhost'),
+            { routePlan },
+        );
+        assert.equal(deniedScopeRes.statusCode, 401, deniedScopeRes.body);
+    }
+
+    const mcpRoutePlan = {
+        ...routePlan,
+        decision: {
+            access: 'guest',
+            routeKey: 'webAssist',
+            source: 'routeDefault',
+        },
+    };
+    const mcpReq = makeRequest({
+        method: 'POST',
+        url: '/webAssist/mcp',
+        host: 'explorer.localhost',
+        cookie: `ploinky_guest=${guestToken}`,
+    });
+    const mcpRes = new MockResponse();
+    const mcpResult = await authHandlers.ensureAuthenticated(
+        mcpReq,
+        mcpRes,
+        new URL(mcpReq.url, 'https://explorer.localhost'),
+        { routePlan: mcpRoutePlan },
+    );
+    assert.equal(mcpResult.ok, true);
+    assert.equal(mcpReq.sessionId, guestToken);
+    assert.equal(mcpReq.session?._jwtPayload?.gscope, `webmeet:room:${roomId}`);
+    assert.equal(mcpReq.session?._jwtPayload?.groute, 'webAssist');
+
+    for (const mutationPath of [
+        '/webAssist/private.html',
+        '/webAssist/undeclared.html',
+        '/guestAgent/meeting-room/example',
+    ]) {
+        const deniedReq = makeRequest({
+            method: 'GET',
+            url: `/auth/token?mutationRoute=webAssist&mutationPath=${encodeURIComponent(mutationPath)}`,
+            host: 'explorer.localhost',
+            cookie: `ploinky_guest=${guestToken}`,
+        });
+        const deniedRes = new MockResponse();
+        await authHandlers.handleAuthRoutes(
+            deniedReq,
+            deniedRes,
+            new URL(deniedReq.url, 'https://explorer.localhost'),
+            { routePlan },
+        );
+        assert.equal(deniedRes.statusCode, 503, `${mutationPath}: ${deniedRes.body}`);
+        assert.equal(
+            JSON.parse(deniedRes.body).error,
+            'browser_mutation_guest_route_denied',
+            mutationPath,
+        );
+    }
+
+    const outsideClosure = {
+        ...routePlan,
+        snapshot: {
+            ...snapshot,
+            compiled: {
+                ...snapshot.compiled,
+                dependencyHttpRoutes: {
+                    'explorer.localhost': [],
+                },
+            },
+        },
+    };
+    outsideClosure.lease = {
+        id: outsideClosure.snapshot.generation,
+        snapshot: outsideClosure.snapshot,
+        commit: () => true,
+    };
+    const outsideReq = makeRequest({
+        method: 'GET',
+        url: '/auth/token?mutationRoute=webAssist&mutationPath=%2FwebAssist%2FroomLoader.html',
+        host: 'explorer.localhost',
+        cookie: `ploinky_guest=${guestToken}`,
+    });
+    const outsideRes = new MockResponse();
+    await authHandlers.handleAuthRoutes(
+        outsideReq,
+        outsideRes,
+        new URL(outsideReq.url, 'https://explorer.localhost'),
+        { routePlan: outsideClosure },
+    );
+    assert.equal(outsideRes.statusCode, 503, outsideRes.body);
+    assert.equal(JSON.parse(outsideRes.body).error, 'browser_mutation_guest_route_denied');
+});
+
 test('route default falls back to guest when no user-authenticated static agent exists', async (t) => {
     const { authHandlers } = await withAuthModules(t, { staticAuthMode: 'none' });
     const decision = authHandlers.resolveRouteDefaultHttpAccess('webAdmin');
@@ -761,6 +979,75 @@ test('ensureHttpRouteAccess denies none, deny, missing, and unknown decisions', 
         assert.equal(res.statusCode >= 400, true, JSON.stringify(decision));
         assert.doesNotMatch(String(res.getHeader('set-cookie') || ''), /^ploinky_guest=/);
     }
+});
+
+test('parameterized guest routes mint an exact scope and reject unbound guest entry', async (t) => {
+    const { authHandlers, localService } = await withAuthModules(t);
+    const roomId = 'room_11111111-1111-4111-8111-111111111111';
+    const decision = {
+        access: 'guest',
+        routeKey: 'webAssist',
+        source: 'manifest',
+        guestScope: 'webmeet:room',
+        guestScopeParam: 'roomId',
+    };
+    const req = makeRequest({
+        method: 'GET',
+        url: `/webAssist/roomLoader.html?roomId=${roomId}`,
+    });
+    const res = new MockResponse();
+    const result = await authHandlers.ensureHttpRouteAccess(
+        req,
+        res,
+        new URL(req.url, 'http://localhost'),
+        decision,
+    );
+
+    assert.equal(result.ok, true);
+    assert.equal(req.authMode, 'guest');
+    assert.equal(req.session?._jwtPayload?.gscope, `webmeet:room:${roomId}`);
+    assert.equal(req.session?._jwtPayload?.groute, 'webAssist');
+
+    for (const url of [
+        '/webAssist/roomLoader.html',
+        `/webAssist/roomLoader.html?roomId=${roomId}&roomId=other`,
+        '/webAssist/roomLoader.html?roomId=%2Fnot-a-capability',
+    ]) {
+        const deniedReq = makeRequest({ method: 'GET', url });
+        const deniedRes = new MockResponse();
+        const denied = await authHandlers.ensureHttpRouteAccess(
+            deniedReq,
+            deniedRes,
+            new URL(url, 'http://localhost'),
+            decision,
+        );
+        assert.equal(denied.ok, false, url);
+        assert.equal(deniedRes.statusCode, 403, url);
+        assert.equal(JSON.parse(deniedRes.body).error, 'guest_scope_parameter_invalid', url);
+        assert.doesNotMatch(String(deniedRes.getHeader('set-cookie') || ''), /^ploinky_guest=/);
+    }
+
+    const admin = {
+        id: 'local:admin',
+        username: 'admin',
+        roles: ['user', 'admin'],
+    };
+    const adminToken = localService.mintSessionJwt(admin, 1);
+    const adminReq = makeRequest({
+        method: 'GET',
+        url: '/webAssist/roomLoader.html',
+        cookie: `ploinky_jwt=${adminToken}`,
+    });
+    const adminRes = new MockResponse();
+    const adminResult = await authHandlers.ensureHttpRouteAccess(
+        adminReq,
+        adminRes,
+        new URL(adminReq.url, 'http://localhost'),
+        decision,
+    );
+    assert.equal(adminResult.ok, true);
+    assert.equal(adminReq.authMode, 'local');
+    assert.doesNotMatch(String(adminRes.getHeader('set-cookie') || ''), /^ploinky_guest=/);
 });
 
 test('a guest-session JWT in the ploinky_jwt cookie never satisfies an authenticated route', async (t) => {

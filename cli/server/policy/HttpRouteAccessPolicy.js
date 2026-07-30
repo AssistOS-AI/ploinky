@@ -50,6 +50,17 @@ export function normalizeHttpRoutePolicyEntry(entry, source, {
     if (entry.guestScope !== undefined && (typeof entry.guestScope !== 'string' || !guestScope)) {
         return invalidEntry(strict, label, 'guestScope must be a non-empty string when present');
     }
+    const guestScopeParam = entry.guestScopeParam === undefined
+        ? ''
+        : String(entry.guestScopeParam || '').trim();
+    if (entry.guestScopeParam !== undefined
+        && (typeof entry.guestScopeParam !== 'string'
+            || !/^[A-Za-z][A-Za-z0-9_-]{0,63}$/.test(guestScopeParam))) {
+        return invalidEntry(strict, label, 'guestScopeParam must be a valid query parameter name when present');
+    }
+    if (guestScopeParam && (access !== 'guest' || !guestScope)) {
+        return invalidEntry(strict, label, 'guestScopeParam requires guest access and an explicit guestScope');
+    }
     if (entry?.enabled === false) return null;
     return {
         path: normalized.path,
@@ -59,6 +70,7 @@ export function normalizeHttpRoutePolicyEntry(entry, source, {
         // The guest executor needs the route-declared scope when it creates
         // a guest identity for this route.
         ...(guestScope ? { guestScope } : {}),
+        ...(guestScopeParam ? { guestScopeParam } : {}),
     };
 }
 

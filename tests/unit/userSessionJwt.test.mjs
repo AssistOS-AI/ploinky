@@ -89,12 +89,26 @@ test('getSession resolves a valid user-session, then null after sid revocation',
 });
 
 test('getSession resolves a guest-session and honors jti revocation', () => {
-    const guestToken = localService.mintGuestSessionJwt({ guestScope: 'demo-scope' });
+    const guestToken = localService.mintGuestSessionJwt({
+        guestScope: 'demo-scope',
+        routeKey: 'demoAgent',
+    });
     const payload = localService.verifySessionJwt(guestToken);
     assert.equal(payload.typ, 'guest-session');
-    const session = localService.getSession(guestToken, { policy: { mode: 'guest', guestScope: 'demo-scope' } });
+    assert.equal(payload.groute, 'demoAgent');
+    const session = localService.getSession(guestToken, {
+        policy: { mode: 'guest', routeKey: 'demoAgent', guestScope: 'demo-scope' },
+    });
     assert.equal(session?.user?.roles?.includes('guest'), true);
+    assert.equal(localService.getSession(guestToken, {
+        policy: { mode: 'guest', routeKey: 'otherAgent', guestScope: 'demo-scope' },
+    }), null);
+    assert.equal(localService.getSession(guestToken, {
+        policy: { mode: 'guest', routeKey: 'demoAgent', guestScope: 'other-scope' },
+    }), null);
 
     revokeSessionId({ jti: payload.jti, reason: 'logout' });
-    assert.equal(localService.getSession(guestToken, { policy: { mode: 'guest', guestScope: 'demo-scope' } }), null);
+    assert.equal(localService.getSession(guestToken, {
+        policy: { mode: 'guest', routeKey: 'demoAgent', guestScope: 'demo-scope' },
+    }), null);
 });

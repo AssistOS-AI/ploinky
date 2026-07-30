@@ -105,6 +105,12 @@ function actorKindForRequestUser(user) {
     return roles.includes('guest') ? 'guest' : 'user';
 }
 
+function resolveGuestInvocationScope(req) {
+    if (actorKindForRequestUser(req?.user) !== 'guest') return undefined;
+    const guestScope = String(req?.session?._jwtPayload?.gscope || '').trim();
+    return guestScope ? [guestScope] : undefined;
+}
+
 async function getToolSchemasForAgent(agentName, agentClient) {
     const now = Date.now();
     const cached = agentToolSchemaCache.get(agentName);
@@ -332,6 +338,7 @@ export function buildInvocationContextForProviderCall({ req, agentName, toolName
             targetAgentId,
             sub,
             actor,
+            scope: resolveGuestInvocationScope(req),
             delegations,
             method,
             path,

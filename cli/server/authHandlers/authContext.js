@@ -7,6 +7,8 @@ import { findAgent } from '../../utils/utils.js';
 import { GUEST_SESSION_TTL_SECONDS, getSessionCookieMaxAge as getLocalSessionCookieMaxAge, mintGuestSessionJwt, mintSessionJwt } from '../auth/localService.js';
 import { waitForAgentReady } from '../utils/agentReadiness.js';
 import { BROWSER_CSRF_COOKIE_NAME, mintBrowserCsrfToken } from '../browserMutationSecurity.js';
+import { HttpRouteAccessPath } from '../policy/HttpRouteAccessPath.js';
+import { HttpRouteAccessPolicy } from '../policy/HttpRouteAccessPolicy.js';
 import {
     appendLog,
     appendSetCookie,
@@ -267,6 +269,86 @@ function hostBoundMutationRouteKey(parsedUrl, routePlan, snapshot) {
     return Array.isArray(allowed) && allowed.includes(requested) ? requested : null;
 }
 
+function snapshotHttpRoutePolicy(snapshot) {
+    const compiled = snapshot?.compiled?.policy;
+    if (!compiled || !Array.isArray(compiled.entries)
+        || !compiled.routeDefaults || typeof compiled.routeDefaults !== 'object') return null;
+    return new HttpRouteAccessPolicy({
+        repository: {
+            listHttpRoutes: () => ({
+                corrupt: false,
+                entries: compiled.entries.map((entry) => ({ ...entry })),
+            }),
+        },
+        manifestRouteProvider: () => [],
+        routeDefaultProvider: ({ routeKey }) => compiled.routeDefaults[routeKey] || null,
+    });
+}
+
+function deniedGuestMutationContext() {
+    return {
+        error: 'browser_mutation_guest_route_denied',
+        errorDetail: 'The requested browser mutation guest path is not an admitted guest route.',
+    };
+}
+
+function resolveGuestBrowserProofAuthContext(parsedUrl, {
+    routePlan = null,
+    snapshot = null,
+    targetRouteKey = '',
+} = {}) {
+    const requestedPath = String(parsedUrl.searchParams.get('mutationPath') || '').trim();
+    if (!requestedPath) return null;
+
+    const normalized = HttpRouteAccessPath.normalize(requestedPath, { allowWildcard: false });
+    const routeKey = String(targetRouteKey || '').trim();
+    if (!normalized.ok || HttpRouteAccessPath.routeKeyForPath(normalized.path) !== routeKey) {
+        return deniedGuestMutationContext();
+    }
+
+    const manifestEntry = snapshot?.compiled?.policy?.entries?.find((entry) => (
+        entry?.source === 'manifest'
+        && entry.routeKey === routeKey
+        && typeof entry.path === 'string'
+        && HttpRouteAccessPath.matches(normalized.path, entry.path)
+    ));
+    if (!manifestEntry) return deniedGuestMutationContext();
+
+    if (isHostBoundRoutePlan(routePlan)) {
+        const host = String(routePlan?.hostSelection?.host || routePlan?.host || '').trim();
+        const selectedRouteKey = routePlanSelectedRouteKey(routePlan);
+        if (routeKey !== selectedRouteKey) {
+            const admittedDependency = snapshot?.compiled?.dependencyHttpRoutes?.[host]?.some((entry) => (
+                entry?.routeKey === routeKey
+                && typeof entry.path === 'string'
+                && HttpRouteAccessPath.matches(normalized.path, entry.path)
+            ));
+            if (!admittedDependency) return deniedGuestMutationContext();
+        }
+    }
+
+    const policy = snapshotHttpRoutePolicy(snapshot);
+    const decision = policy?.evaluate({
+        pathname: normalized.path,
+        method: 'GET',
+        routeKey,
+    });
+    if (decision?.access !== 'guest' || decision.routeKey !== routeKey) {
+        return deniedGuestMutationContext();
+    }
+
+    return {
+        ...resolveGuestRouteAuthContext(routeKey, decision, parsedUrl),
+        ...(isHostBoundRoutePlan(routePlan)
+            ? {
+                boundHostRouteKey: routePlanSelectedRouteKey(routePlan),
+                boundGeneration: String(routePlan?.lease?.id || snapshot?.generation || ''),
+                serviceRouteKey: routeKey,
+            }
+            : {}),
+    };
+}
+
 function resolveControlBrowserProofAuthContext(parsedUrl, options = {}) {
     if ((parsedUrl.pathname || '/') !== '/auth/token') return null;
     const targetRouteKey = String(
@@ -278,6 +360,11 @@ function resolveControlBrowserProofAuthContext(parsedUrl, options = {}) {
 
     const targetContext = resolveAuthContextForRouteKey(targetRouteKey, options);
     if (!targetContext.record) return null;
+    const guestContext = resolveGuestBrowserProofAuthContext(parsedUrl, {
+        snapshot: snapshotFromOptions(options),
+        targetRouteKey,
+    });
+    if (guestContext) return guestContext;
     if (targetContext.mode !== 'none') return targetContext;
 
     const inheritedContext = resolveAuthenticatedRouteAuthContext(targetRouteKey, options);
@@ -299,6 +386,14 @@ export function resolveAuthContextForRoutePlan(parsedUrl, routePlan, { browserAu
                 errorDetail: 'The requested browser mutation route is outside the selected host service closure.',
             };
         }
+        if (mutationRouteKey) {
+            const guestContext = resolveGuestBrowserProofAuthContext(parsedUrl, {
+                routePlan,
+                snapshot,
+                targetRouteKey: mutationRouteKey,
+            });
+            if (guestContext) return guestContext;
+        }
         return {
             ...resolveAuthenticatedRouteAuthContext(selectedRouteKey, { snapshot }),
             boundHostRouteKey: selectedRouteKey,
@@ -313,7 +408,7 @@ export function resolveAuthContextForRoutePlan(parsedUrl, routePlan, { browserAu
 
     const decision = routePlan?.decision;
     if (decision?.access === 'guest') {
-        return resolveGuestRouteAuthContext(decision.routeKey, decision);
+        return resolveGuestRouteAuthContext(decision.routeKey, decision, parsedUrl);
     }
     if (decision?.access === 'authenticated') {
         return resolveAuthenticatedRouteAuthContext(decision.routeKey, { snapshot });
@@ -324,22 +419,101 @@ export function resolveAuthContextForRoutePlan(parsedUrl, routePlan, { browserAu
             return resolveAuthenticatedRouteAuthContext(selectedRouteKey, { snapshot });
         }
         if (routeDefault?.access === 'guest') {
-            return resolveGuestRouteAuthContext(selectedRouteKey, routeDefault);
+            return resolveGuestRouteAuthContext(selectedRouteKey, routeDefault, parsedUrl);
         }
     }
     return resolveAuthContext(parsedUrl, { snapshot });
 }
 
-function resolveGuestRouteAuthContext(routeKey, options = {}) {
+function resolveGuestRouteAuthContext(routeKey, options = {}, parsedUrl = null) {
+    const normalizedRouteKey = String(routeKey || '').trim();
+    const guestScopeBase = String(options.guestScope || `http-route:${normalizedRouteKey}`).trim();
+    const guestScopeParam = String(options.guestScopeParam || '').trim();
+    let guestScope = guestScopeBase;
+    if (guestScopeParam) {
+        const values = parsedUrl?.searchParams?.getAll?.(guestScopeParam) || [];
+        const value = values.length === 1 ? String(values[0] || '').trim() : '';
+        if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(value)) {
+            return {
+                routeKey: normalizedRouteKey,
+                mode: 'guest',
+                policy: {
+                    mode: 'guest',
+                    routeKey: normalizedRouteKey,
+                    guestScope: '',
+                    guestScopeError: 'guest_scope_parameter_invalid',
+                    guestScopeErrorDetail: `The guest route requires one valid '${guestScopeParam}' query parameter.`,
+                },
+                record: null,
+            };
+        }
+        guestScope = `${guestScopeBase}:${value}`;
+    }
     return {
-        routeKey: String(routeKey || '').trim(),
+        routeKey: normalizedRouteKey,
         mode: 'guest',
         policy: {
             mode: 'guest',
-            guestScope: String(options.guestScope || `http-route:${routeKey || ''}`).trim(),
+            routeKey: normalizedRouteKey,
+            guestScope,
         },
         record: null,
     };
+}
+
+function isAgentMcpRequestForRoute(parsedUrl, routeKey) {
+    const pathname = String(parsedUrl?.pathname || '').replace(/\/+$/g, '') || '/';
+    if (pathname === '/mcp') return true;
+    const parts = pathname.split('/').filter(Boolean);
+    if (parts.length !== 2 || parts[1] !== 'mcp') return false;
+    try {
+        return decodeURIComponent(parts[0]) === String(routeKey || '').trim();
+    } catch (_) {
+        return false;
+    }
+}
+
+function effectiveGuestScopeSpecsForRoute(routeKey, options = {}) {
+    const normalizedRouteKey = String(routeKey || '').trim();
+    const compiled = snapshotFromOptions(options)?.compiled?.policy;
+    if (!normalizedRouteKey || !compiled) return [];
+    const specs = new Map();
+    for (const namespace of compiled.namespaces || []) {
+        if (namespace?.routeKey !== normalizedRouteKey) continue;
+        for (const partition of namespace.partitions || []) {
+            const winner = partition?.winner;
+            if (winner?.access !== 'guest' || winner.routeKey !== normalizedRouteKey) continue;
+            const guestScope = String(winner.guestScope || `http-route:${normalizedRouteKey}`).trim();
+            const guestScopeParam = String(winner.guestScopeParam || '').trim();
+            specs.set(`${guestScope}\0${guestScopeParam}`, { guestScope, guestScopeParam });
+        }
+    }
+    return [...specs.values()];
+}
+
+function matchesEffectiveGuestScope(guestScope, specs) {
+    return specs.some((spec) => {
+        if (!spec.guestScopeParam) return guestScope === spec.guestScope;
+        const prefix = `${spec.guestScope}:`;
+        return guestScope.startsWith(prefix)
+            && /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(guestScope.slice(prefix.length));
+    });
+}
+
+async function resolveRouteBoundGuestMcpSession(guestCookie, parsedUrl, authContext, options = {}) {
+    if (!guestCookie
+        || !isAgentMcpRequestForRoute(parsedUrl, authContext?.routeKey)) return null;
+    const session = await sessionTokenService.getGuestSession(guestCookie, {
+        routeKey: authContext.routeKey,
+        allowAnyGuestScope: true,
+    });
+    const guestScope = String(session?._jwtPayload?.gscope || '').trim();
+    if (!guestScope
+        || !matchesEffectiveGuestScope(
+            guestScope,
+            effectiveGuestScopeSpecsForRoute(authContext.routeKey, options),
+        )) return null;
+    return session;
 }
 
 export function resolveRouteDefaultHttpAccess(routeKey, options = {}) {
@@ -497,6 +671,14 @@ async function ensureAuthenticatedWithContext(req, res, parsedUrl, authContext, 
         });
         return { ok: false, error: authContext.error };
     }
+    if (authContext.error) {
+        sendJson(res, authContext.errorStatus || 503, {
+            ok: false,
+            error: authContext.error,
+            ...(authContext.errorDetail ? { detail: authContext.errorDetail } : {}),
+        });
+        return { ok: false, error: authContext.error };
+    }
     const cookies = parseCookies(req);
     const localCookie = cookies.get(LOCAL_AUTH_COOKIE_NAME);
     if (localCookie) {
@@ -552,9 +734,24 @@ async function ensureAuthenticatedWithContext(req, res, parsedUrl, authContext, 
                 return finalizeAuthenticatedRequest(req, res, authContext, options, ssoSession);
             }
         }
+        if (authContext.policy?.guestScopeError) {
+            sendJson(res, 403, {
+                ok: false,
+                error: authContext.policy.guestScopeError,
+                ...(authContext.policy.guestScopeErrorDetail
+                    ? { detail: authContext.policy.guestScopeErrorDetail }
+                    : {}),
+            });
+            return { ok: false, error: authContext.policy.guestScopeError };
+        }
         const guestCookie = cookies.get(GUEST_AUTH_COOKIE_NAME);
         if (guestCookie) {
-            const guestSession = await sessionTokenService.getGuestSession(guestCookie, { policy: authContext.policy });
+            const guestSession = await resolveRouteBoundGuestMcpSession(
+                guestCookie,
+                parsedUrl,
+                authContext,
+                options,
+            ) || await sessionTokenService.getGuestSession(guestCookie, { policy: authContext.policy });
             if (guestSession) {
                 req.user = guestSession.user;
                 req.session = guestSession;
@@ -639,7 +836,7 @@ export async function ensureHttpRouteAccess(req, res, parsedUrl, decision, optio
             req,
             res,
             parsedUrl,
-            resolveGuestRouteAuthContext(decision.routeKey, decision),
+            resolveGuestRouteAuthContext(decision.routeKey, decision, parsedUrl),
             options,
         );
     }

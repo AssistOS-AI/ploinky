@@ -23,6 +23,7 @@ test('RouterRequestTokenService mints byte-compatible router-request payloads', 
         sub: 'user:guest:g1',
         actor: { kind: 'guest', id: 'user:guest:g1', roles: ['guest'] },
         caller: { kind: 'user', id: 'user:guest:g1' },
+        scope: ['public:webmeet:room', 'public:webmeet:room', ''],
         method: 'GET',
         path: '/agent-a/readme',
         tool: null,
@@ -35,6 +36,7 @@ test('RouterRequestTokenService mints byte-compatible router-request payloads', 
     assert.equal(payload.aud, 'agent-a');
     assert.equal(payload.sub, 'user:guest:g1');
     assert.deepEqual(payload.actor, { kind: 'guest', id: 'user:guest:g1', roles: ['guest'] });
+    assert.deepEqual(payload.scope, ['public:webmeet:room']);
     assert.equal(payload.method, 'GET');
     assert.equal(payload.path, '/agent-a/readme');
     assert.equal(payload.rch, 'browser');

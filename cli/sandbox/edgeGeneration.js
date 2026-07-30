@@ -509,6 +509,8 @@ function collectStrictManifestPolicyEntries(routing, manifests) {
                 access: normalized.access,
                 routeKey: normalized.routeKey,
                 source: 'manifest',
+                ...(normalized.guestScope ? { guestScope: normalized.guestScope } : {}),
+                ...(normalized.guestScopeParam ? { guestScopeParam: normalized.guestScopeParam } : {}),
             });
         }
     }
@@ -937,8 +939,16 @@ function compileGeneration({ routing, policy, desired, agents, manifests }) {
     const hosts = {};
     const surfaces = {};
     const agentMcpRoutes = {};
+    const dependencyHttpRoutes = {};
     for (const [hostname, entry] of Object.entries(normalizedDesired.hosts)) {
         const selectedRoute = resolveAgentRoute(entry.agent, routing);
+        const dependencyRouteKeys = compileAgentMcpRouteClosure(
+            selectedRoute.routeKey,
+            routing,
+            manifests,
+            agents,
+        );
+        const dependencyRouteKeySet = new Set(dependencyRouteKeys);
         hosts[hostname] = {
             kind: 'agent-root',
             agent: entry.agent,
@@ -946,13 +956,21 @@ function compileGeneration({ routing, policy, desired, agents, manifests }) {
         };
         surfaces[hostname] = [...(entry.routerSurfaces || [])];
         agentMcpRoutes[hostname] = surfaces[hostname].includes('agent-mcp')
-            ? compileAgentMcpRouteClosure(
-                selectedRoute.routeKey,
-                routing,
-                manifests,
-                agents,
-            )
+            ? dependencyRouteKeys
             : [];
+        dependencyHttpRoutes[hostname] = manifestPolicyEntries
+            .filter((routeEntry) => (
+                routeEntry.routeKey !== selectedRoute.routeKey
+                && dependencyRouteKeySet.has(routeEntry.routeKey)
+            ))
+            .map((routeEntry) => ({
+                path: routeEntry.path,
+                routeKey: routeEntry.routeKey,
+            }))
+            .sort((left, right) => (
+                left.routeKey.localeCompare(right.routeKey)
+                || left.path.localeCompare(right.path)
+            ));
     }
 
     return {
@@ -961,6 +979,7 @@ function compileGeneration({ routing, policy, desired, agents, manifests }) {
             hosts,
             surfaces,
             agentMcpRoutes,
+            dependencyHttpRoutes,
             policy: compiledPolicy,
             security: {
                 hostNetworkCapabilities,
@@ -1724,9 +1743,18 @@ function reconstructGeneration(document, selector) {
         throw edgeError('active edge routing generation digest verification failed', 'EDGE_GENERATION_CORRUPT');
     }
     const expectedDigests = sourceDigests({ bytes });
+    const storedCompiled = assertObject(document.compiled, 'generation compiled state');
+    // Generations written before dependency HTTP routing was introduced do not
+    // contain this derived allowlist. Accept only that exact additive omission
+    // so a running workspace can load its previous generation long enough to
+    // commit a newly compiled one. Runtime behavior remains unchanged for the
+    // legacy generation because its stored compiled state is returned below.
+    const semanticForStoredShape = Object.hasOwn(storedCompiled, 'dependencyHttpRoutes')
+        ? semantic.compiled
+        : Object.fromEntries(Object.entries(semantic.compiled).filter(([key]) => key !== 'dependencyHttpRoutes'));
     if (stableStringify(document.sourceDigests) !== stableStringify(expectedDigests)
-        || document.compiledDigest !== compiledDigest(semantic.compiled)
-        || stableStringify(document.compiled) !== stableStringify(semantic.compiled)) {
+        || document.compiledDigest !== compiledDigest(semanticForStoredShape)
+        || stableStringify(storedCompiled) !== stableStringify(semanticForStoredShape)) {
         throw edgeError('active edge routing generation semantic verification failed', 'EDGE_GENERATION_CORRUPT');
     }
     return {
@@ -1740,7 +1768,9 @@ function reconstructGeneration(document, selector) {
         agents,
         manifests,
         routerHostPort,
-        compiled: semantic.compiled,
+        compiled: Object.hasOwn(storedCompiled, 'dependencyHttpRoutes')
+            ? semantic.compiled
+            : storedCompiled,
     };
 }
 
