@@ -368,6 +368,23 @@ function resolveAgentPath(pathname, routes, selectedRoot = null) {
     if (selectedRoot) {
         const route = exactRoute(routes, selectedRoot.routeKey);
         if (!route) return null;
+        const segments = String(pathname || '').split('/').filter(Boolean);
+        let explicitlySelectedRoot = false;
+        if (segments.length) {
+            try {
+                explicitlySelectedRoot = decodeURIComponent(segments[0]) === route.routeKey;
+            } catch (_) {
+                return null;
+            }
+        }
+        if (explicitlySelectedRoot) {
+            const firstSlash = pathname.indexOf('/', 1);
+            return {
+                ...route,
+                canonicalPath: pathname,
+                upstreamPath: firstSlash < 0 ? '/' : pathname.slice(firstSlash) || '/',
+            };
+        }
         return {
             ...route,
             canonicalPath: `/${encodeURIComponent(route.routeKey)}${pathname === '/' ? '/' : pathname}`,

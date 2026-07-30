@@ -175,6 +175,12 @@ test('agent-mcp exposes only the selected root manifest dependency closure', (t)
         },
         alphaManifest: {
             enable: ['beta global no-wait'],
+            routerAccess: {
+                httpRoutes: [{
+                    path: '/shared/*',
+                    access: 'public',
+                }],
+            },
         },
         policy: {
             schema: 'router-policy',
@@ -330,6 +336,21 @@ test('agent-mcp exposes only the selected root manifest dependency closure', (t)
     assert.equal(dependencyContent.ok, true);
     assert.equal(dependencyContent.routeKey, 'alpha');
     assert.equal(dependencyContent.upstreamPath, '/beta/index.html');
+
+    const explicitlyPrefixedRootContent = resolveEdgeRoutePlan({
+        req: {
+            method: 'GET',
+            url: '/alpha/shared/app.js',
+            headers: { host: 'explorer.example.test' },
+        },
+        listener: 'public',
+    });
+    assert.equal(explicitlyPrefixedRootContent.ok, true);
+    assert.equal(explicitlyPrefixedRootContent.routeKey, 'alpha');
+    assert.equal(explicitlyPrefixedRootContent.canonicalPath, '/alpha/shared/app.js');
+    assert.equal(explicitlyPrefixedRootContent.upstreamPath, '/shared/app.js');
+    assert.equal(explicitlyPrefixedRootContent.decision.access, 'public');
+    assert.equal(explicitlyPrefixedRootContent.decision.source, 'manifest');
 
     const dependencyManifestGuestRoute = resolveEdgeRoutePlan({
         req: {
