@@ -420,12 +420,31 @@ export async function applyManifestDirectives(agentNameOrPath, {
     });
 }
 
+export function prepareExplicitRepositoryBranches(branchPolicy, {
+    stdio = 'inherit',
+} = {}) {
+    const prepared = [];
+    for (const [name, branch] of Object.entries(branchPolicy?.repoBranches || {})) {
+        const result = repos.ensureRepoOnBranch(name, {
+            branch,
+            resetRepos: branchPolicy?.resetRepos || false,
+            fallback: branchPolicy?.fallback || 'default',
+            stdio,
+        });
+        if (result?.status !== 'missing') {
+            prepared.push({ name, branch: result?.branch || branch });
+        }
+    }
+    return prepared;
+}
+
 export async function prepareManifestRepositories(agentNameOrPath, {
     branchPolicy,
     profile = '',
     stdio = 'ignore',
     logError = () => {},
 } = {}) {
+    prepareExplicitRepositoryBranches(branchPolicy, { stdio });
     return applyManifestDirectivesInternal(agentNameOrPath, {
         branchPolicy,
         profile,

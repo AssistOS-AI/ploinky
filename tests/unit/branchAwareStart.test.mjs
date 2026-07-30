@@ -50,7 +50,11 @@ const {
     ensureRepoOnBranch,
     loadEnabledRepos,
 } = reposMod;
-const { applyManifestDirectives, manifestEnableEntries } = bootstrapManifestMod;
+const {
+    applyManifestDirectives,
+    manifestEnableEntries,
+    prepareExplicitRepositoryBranches,
+} = bootstrapManifestMod;
 const { bootstrap } = ploinkybootMod;
 
 // ---------------------------------------------------------------------------
@@ -500,6 +504,50 @@ test('ensureRepoOnBranch: --reset-repos updates an existing checkout on the requ
     const current = String(execFileSync('git', ['-C', repoPath, 'rev-parse', 'HEAD'])).trim();
     assert.notEqual(current, before);
     assert.equal(current, expected);
+});
+
+test('prepareExplicitRepositoryBranches updates a named repo outside manifest traversal', () => {
+    const barePath = createBareRepo('test-explicit-existing', { branches: ['release'] });
+    const repoPath = path.join(tempDir, '.ploinky', 'repos', 'test-explicit-existing');
+    fs.mkdirSync(path.dirname(repoPath), { recursive: true });
+    execFileSync('git', ['clone', '--branch', 'release', barePath, repoPath], { stdio: 'ignore' });
+    const before = String(execFileSync('git', ['-C', repoPath, 'rev-parse', 'HEAD'])).trim();
+
+    const updaterPath = path.join(tempDir, 'work', 'test-explicit-existing-updater');
+    execFileSync('git', ['clone', '--branch', 'release', barePath, updaterPath], { stdio: 'ignore' });
+    execFileSync('git', ['-C', updaterPath, 'commit', '--allow-empty', '-m', 'remote update'], { stdio: 'ignore' });
+    execFileSync('git', ['-C', updaterPath, 'push', 'origin', 'release'], { stdio: 'ignore' });
+    const expected = String(execFileSync('git', ['-C', updaterPath, 'rev-parse', 'HEAD'])).trim();
+
+    const prepared = prepareExplicitRepositoryBranches({
+        repoBranches: { 'test-explicit-existing': 'release' },
+        resetRepos: true,
+        fallback: 'fail',
+    }, { stdio: 'ignore' });
+
+    assert.deepEqual(prepared, [{ name: 'test-explicit-existing', branch: 'release' }]);
+    assert.notEqual(before, expected);
+    assert.equal(String(execFileSync('git', ['-C', repoPath, 'rev-parse', 'HEAD'])).trim(), expected);
+});
+
+test('ensureRepoOnBranch fails closed when a strict fetch cannot refresh the branch', () => {
+    const barePath = createBareRepo('test-fetch-failure', { branches: ['release'] });
+    const repoPath = path.join(tempDir, '.ploinky', 'repos', 'test-fetch-failure');
+    fs.mkdirSync(path.dirname(repoPath), { recursive: true });
+    execFileSync('git', ['clone', '--branch', 'release', barePath, repoPath], { stdio: 'ignore' });
+    execFileSync('git', ['-C', repoPath, 'remote', 'set-url', 'origin', path.join(tempDir, 'absent.git')], {
+        stdio: 'ignore',
+    });
+
+    assert.throws(
+        () => ensureRepoOnBranch('test-fetch-failure', {
+            branch: 'release',
+            resetRepos: true,
+            fallback: 'fail',
+            stdio: 'ignore',
+        }),
+        /Unable to fetch branch 'release'/,
+    );
 });
 
 test('ensureRepoOnBranch: missing branch with fallback=fail throws', () => {

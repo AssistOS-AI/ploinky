@@ -840,7 +840,13 @@ export function ensureRepoOnBranch(name, { branch, resetRepos = false, fallback 
 
     try {
         execFileSync('git', ['-C', repoPath, 'fetch', '--prune'], { stdio });
-    } catch (_) {}
+    } catch (_) {
+        if (fallback === 'fail') {
+            throw new Error(
+                `Unable to fetch branch '${branch}' for repo '${name}'. Aborting (--branch-fallback fail).`
+            );
+        }
+    }
 
     const localBranchExists = (() => {
         try {

@@ -223,15 +223,15 @@ ploinky [--port &lt;hostPort&gt;] start [staticAgent] [branch-options...]</code>
                             </tr>
                             <tr>
                                 <td><code>--repo-branch &lt;repo=branch&gt;</code></td>
-                                <td>Override the candidate branch for one repo (repeatable)</td>
+                                <td>Reconcile an existing named repo before manifest traversal and override that repo if traversal installs it (repeatable)</td>
                             </tr>
                             <tr>
                                 <td><code>--branch-fallback</code></td>
-                                <td><code>default</code> (keep configured branch when candidate is missing) or <code>fail</code> (abort startup). Default: <code>default</code></td>
+                                <td><code>default</code> (keep configured branch when candidate is missing) or <code>fail</code> (abort when the targeted branch is missing or cannot be refreshed). Default: <code>default</code></td>
                             </tr>
                             <tr>
                                 <td><code>--reset-repos</code></td>
-                                <td>Allow hard reset of dirty managed repos under <code>.ploinky/repos/</code></td>
+                                <td>Hard-reset targeted managed repos under <code>.ploinky/repos/</code> to the refreshed remote branch</td>
                             </tr>
                         </table>
                         <pre><code># First time setup
