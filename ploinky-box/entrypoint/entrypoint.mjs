@@ -182,12 +182,17 @@ export function retireStoppedManagedContainers(paths, {
         const exactLifecycleOwnership = hasRegisteredLifecycleOwnership
             && observedInstanceId === registeredInstanceId
             && observedEnableGeneration === registeredEnableGeneration;
-        // Containers created before lifecycle labels were emitted still have
-        // exact immutable registry ownership. Accept only the all-absent label
-        // shape so the stopped predecessor can be retired during upgrade.
-        const legacyLifecycleOwnership = hasRegisteredLifecycleOwnership
+        // A stopped predecessor can have no lifecycle labels (older runtime)
+        // or a complete stale pair after the registry staged its successor.
+        // Partial or mixed pairs remain ownership drift and fail closed.
+        const absentLifecycleOwnership = hasRegisteredLifecycleOwnership
             && observedInstanceId === ''
             && observedEnableGeneration === '';
+        const staleLifecycleOwnership = hasRegisteredLifecycleOwnership
+            && observedInstanceId !== ''
+            && observedEnableGeneration !== ''
+            && observedInstanceId !== registeredInstanceId
+            && observedEnableGeneration !== registeredEnableGeneration;
         const ownershipMismatches = [
             observedId === containerId || 'container-id',
             Boolean(registered) || 'registry-record',
@@ -201,7 +206,11 @@ export function retireStoppedManagedContainers(paths, {
             labels[MANAGED_CONTAINER_LABELS.workspace] === workspaceHash || 'workspace-label',
             /^[a-f0-9]{64}$/.test(String(labels[MANAGED_CONTAINER_LABELS.contract] || ''))
                 || 'contract-label',
-            (exactLifecycleOwnership || legacyLifecycleOwnership)
+            (
+                exactLifecycleOwnership
+                || absentLifecycleOwnership
+                || staleLifecycleOwnership
+            )
                 || 'lifecycle-ownership-labels',
         ].filter((value) => value !== true);
         if (ownershipMismatches.length > 0) {

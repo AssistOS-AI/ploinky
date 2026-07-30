@@ -314,6 +314,27 @@ test('entrypoint retires a stopped pre-lifecycle-label container with exact lega
     );
 });
 
+test('entrypoint retires a stopped predecessor with a complete stale lifecycle pair', (t) => {
+    const predecessor = retainedContainerFixture(t, {
+        mutateLabels(labels) {
+            return {
+                ...labels,
+                'io.assistos.ploinky.instance-id': 'predecessor-instance',
+                'io.assistos.ploinky.enable-generation': 'predecessor-generation',
+            };
+        },
+    });
+
+    assert.deepEqual(
+        retireStoppedManagedContainers(predecessor.paths, { runner: predecessor.runner }),
+        [predecessor.containerId],
+    );
+    assert.deepEqual(
+        predecessor.calls.at(-1),
+        ['run', 'podman', 'container', 'rm', predecessor.containerId],
+    );
+});
+
 test('entrypoint rejects running or ownership-drifted retained managed containers', (t) => {
     const running = retainedContainerFixture(t, { running: true, status: 'running' });
     assert.throws(
