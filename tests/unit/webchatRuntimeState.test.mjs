@@ -14,6 +14,7 @@ import {
     serializeRuntimeStateSseEvent,
     serializeSessionStateSseEvent,
     serializeTaskListSseEvent,
+    serializeTaskUpdateSseEvents,
     serializeWorkspaceFilesSseEvent,
 } from '../../cli/server/handlers/webchat/runtimeState.js';
 import { handleRuntimeRoute } from '../../cli/server/handlers/webchat/runtimeRoutes.js';
@@ -213,6 +214,33 @@ test('task list snapshots are revalidated before SSE serialization', () => {
     assert.match(serialized, /Safe task/);
     assert.doesNotMatch(serialized, /credential/);
     assert.equal(serializeTaskListSseEvent(new Map()), '');
+});
+
+test('large task log snapshots are split into bounded ordered SSE events', () => {
+    const text = `${'a'.repeat(150_000)}final`;
+    const events = serializeTaskUpdateSseEvents({
+        event: 'view',
+        task: {
+            id: 'task_1234567890abcdef12345678',
+            targetAgent: 'codexAgent',
+            status: 'finished',
+        },
+        log: { text, nextOffset: text.length, reset: false },
+    }, 64 * 1024);
+    const payloads = events.map((event) => JSON.parse(event.match(/data: (.*)\n\n$/s)[1]));
+
+    assert.equal(payloads[0].event, 'view');
+    assert.equal(payloads[0].log.text, '');
+    assert.equal(payloads[0].logChunk.phase, 'start');
+    assert.ok(events.every((event) => event.length < 70 * 1024));
+    assert.equal(
+        payloads.slice(1).map((payload) => payload.logChunk.text).join(''),
+        text,
+    );
+    assert.deepEqual(
+        payloads.slice(1).map((payload) => payload.logChunk.index),
+        [0, 1, 2],
+    );
 });
 
 test('a failed runtime write is rejected and the zombie runtime is removed', async () => {

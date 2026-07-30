@@ -82,6 +82,9 @@ const {
     interactionPromptTitle,
     interactionPromptMessage,
     interactionPromptDetail,
+    interactionPromptInputRow,
+    interactionPromptInput,
+    interactionPromptSubmit,
     interactionPromptOptions
 } = elements;
 
@@ -103,6 +106,11 @@ const sidePanelApi = createSidePanel({
     webchatBasePath: basePath,
     workspaceFileIndex,
     sendQuickCommand: (command) => network?.sendQuickCommand(command) || false,
+    sendInteractionResponse: (interactionId, optionId, response) => network?.sendInteractionResponse(
+        interactionId,
+        optionId,
+        response,
+    ),
 });
 
 let sessionController = null;
@@ -184,8 +192,17 @@ network = createNetwork({
         messages.refreshWorkspaceFileLinks();
         sidePanelApi.refreshWorkspaceFileLinks();
     },
-    onInteractionRequest: (interaction) => interactionController?.show(interaction),
-    onInteractionResolved: (resolution) => interactionController?.resolve(resolution),
+    onInteractionRequest: (interaction) => {
+        if (interaction?.targetTaskId) {
+            sidePanelApi.postTaskInteraction(interaction);
+            return;
+        }
+        interactionController?.show(interaction);
+    },
+    onInteractionResolved: (resolution) => {
+        sidePanelApi.postTaskInteractionResolved(resolution);
+        interactionController?.resolve(resolution);
+    },
     onConnected: () => taskController?.refresh().catch(() => {})
 });
 
@@ -217,9 +234,12 @@ interactionController = createInteractionPrompt({
     title: interactionPromptTitle,
     message: interactionPromptMessage,
     detail: interactionPromptDetail,
+    inputRow: interactionPromptInputRow,
+    input: interactionPromptInput,
+    submitButton: interactionPromptSubmit,
     options: interactionPromptOptions,
 }, {
-    onSubmit: (interactionId, optionId) => network.sendInteractionResponse(interactionId, optionId),
+    onSubmit: (interactionId, optionId, response) => network.sendInteractionResponse(interactionId, optionId, response),
     onActiveChange: (active) => {
         composer.setInteractionState(active);
         attachmentBtn?.toggleAttribute?.('disabled', active);

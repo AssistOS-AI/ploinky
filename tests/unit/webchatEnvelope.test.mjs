@@ -66,6 +66,7 @@ test('serializeWebchatEnvelopeForAgent does not name a concrete downstream agent
     const payload = JSON.parse(text);
     assert.equal(payload.__webchatMessage, 1);
     assert.equal(payload.text, '@example-task hello');
+    assert.equal(payload.sourceTabId, 'tab-1');
     assert.deepEqual(payload.attachments, [{
         id: null,
         filename: 'note.md',

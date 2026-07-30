@@ -191,6 +191,11 @@ function parseInteractionResolutionPayload(text) {
     }
 }
 
+function interactionTargetsTab(interaction, tabId) {
+    const target = typeof interaction?.targetTabId === 'string' ? interaction.targetTabId : '';
+    return !target || target === tabId;
+}
+
 function resolvesVisibleTaskCommand(payload, command) {
     const normalizedCommand = typeof command === 'string' ? command.trim() : '';
     if (payload?.event === 'list') {
@@ -209,10 +214,11 @@ Object.assign(__testables, {
     parseRuntimeStatePayload,
     parseInteractionPayload,
     parseInteractionResolutionPayload,
+    interactionTargetsTab,
     resolvesVisibleTaskCommand,
 });
 
-export { serializeEnvelope, normalizeClientReference };
+export { serializeEnvelope, normalizeClientReference, interactionTargetsTab };
 
 export function createNetwork({
     TAB_ID,
@@ -485,6 +491,7 @@ export function createNetwork({
 
         es.addEventListener('interaction-request', (event) => {
             const interaction = parseInteractionPayload(event.data);
+            if (!interactionTargetsTab(interaction, TAB_ID)) return;
             if (interaction && typeof onInteractionRequest === 'function') {
                 onInteractionRequest(interaction);
             }
@@ -758,18 +765,21 @@ export function createNetwork({
         });
     }
 
-    function sendInteractionResponse(interactionId, optionId) {
+    function sendInteractionResponse(interactionId, optionId = null, responseValue = null) {
         return fetch(toEndpoint(`interaction?tabId=${TAB_ID}`), {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ interactionId, optionId }),
+            body: JSON.stringify({
+                interactionId,
+                ...(typeof responseValue === 'string' ? { response: responseValue } : { optionId }),
+            }),
             credentials: 'include'
         }).then((response) => {
             if (!response.ok) throw new Error(`interaction_failed_${response.status}`);
             return response;
         }).catch((error) => {
             dlog('interaction response error', error);
-            showBanner('Approval response failed', 'err');
+            showBanner('Interaction response failed', 'err');
             throw error;
         });
     }

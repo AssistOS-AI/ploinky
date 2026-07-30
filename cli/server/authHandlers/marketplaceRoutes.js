@@ -1,11 +1,15 @@
+import fs from 'fs';
 import path from 'path';
 
 import { PLOINKY_DIR } from '../../utils/config.js';
 import * as reposSvc from '../../utils/repos.js';
 import * as agentsSvc from '../../utils/agents.js';
 import * as workspaceSvc from '../../utils/workspace.js';
+import { findAgent } from '../../utils/utils.js';
+import { resolveAgentReadinessProtocol } from '../../utils/runtime/startupReadiness.js';
 import { collectAgentRuntimeStates } from '../../sandbox/agentRuntimeState.js';
 import { collectAgentsSummary } from '../../utils/status.js';
+import { waitForAgentReady } from '../utils/agentReadiness.js';
 import { isLocalAdminUser } from '../auth/localService.js';
 import { computeRchHttp, sha256RawBodyHash } from '../../../Agent/lib/requestHash.mjs';
 import { verifyAgentAssertion } from '../mcp-proxy/invocationMinter.js';
@@ -140,6 +144,24 @@ function normalizeMarketplaceEnableMode(value) {
         throw new Error('invalid_enable_mode');
     }
     return mode;
+}
+
+async function waitForMarketplaceAgentReadiness(manifest, result, {
+    agentRef = '',
+    waitForReady = waitForAgentReady,
+} = {}) {
+    const protocol = resolveAgentReadinessProtocol(manifest);
+    if (protocol === 'none') return;
+
+    const hostPort = result?.hostPort;
+    if (!hostPort) {
+        throw new Error(`Agent '${agentRef}' did not expose a host port for ${protocol} readiness.`);
+    }
+
+    const ready = await waitForReady({ hostPort }, { protocol });
+    if (!ready) {
+        throw new Error(`Agent '${agentRef}' did not become ready after Marketplace enable.`);
+    }
 }
 
 function disableMarketplaceAgentsForRepo(repoName) {
@@ -385,7 +407,10 @@ export async function handleMarketplaceRoutes(req, res, parsedUrl) {
                 const ref = normalizeMarketplaceAgentRef(body?.agentRef);
                 const mode = normalizeMarketplaceEnableMode(body?.mode || body?.enableMode);
                 const repoName = ref.split('/')[0];
+                const { manifestPath } = findAgent(ref);
+                const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
                 const result = agentsSvc.enableAgent(ref, mode === 'isolated' ? undefined : mode, mode === 'devel' ? repoName : undefined);
+                await waitForMarketplaceAgentReadiness(manifest, result, { agentRef: ref });
                 sendJson(res, 200, {
                     ok: true,
                     action,
@@ -429,4 +454,5 @@ export const __testables = {
     buildMarketplaceState,
     readAuthorizationBearer,
     verifyMarketplaceAgentRequest,
+    waitForMarketplaceAgentReadiness,
 };

@@ -1,4 +1,4 @@
-import { serializeEnvelope } from './network.js';
+import { interactionTargetsTab, serializeEnvelope } from './network.js';
 
 const RUNTIME_RETRY_DELAYS_MS = [100, 250, 500, 1000, 2000, 4000];
 
@@ -39,6 +39,8 @@ export function createTaskViewTransport({
     onOpen = null,
     onUpdate = null,
     onError = null,
+    onInteractionRequest = null,
+    onInteractionResolved = null,
 } = {}) {
     const embedded = windowRef.parent && windowRef.parent !== windowRef;
     const tabId = embedded ? '' : resolveTabId(windowRef, taskId);
@@ -77,6 +79,31 @@ export function createTaskViewTransport({
         return postStandaloneCommand(command);
     }
 
+    async function sendInteractionResponse(interactionId, optionId = null, responseValue = null) {
+        if (embedded) {
+            windowRef.parent.postMessage({
+                type: 'webchat-task-interaction-response',
+                taskId,
+                interactionId,
+                ...(typeof responseValue === 'string' ? { response: responseValue } : { optionId }),
+            }, windowRef.location.origin);
+            return;
+        }
+        const response = await windowRef.fetch(
+            buildTaskEndpoint(windowRef, basePath, 'interaction', tabId),
+            {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    interactionId,
+                    ...(typeof responseValue === 'string' ? { response: responseValue } : { optionId }),
+                }),
+                credentials: 'include',
+            },
+        );
+        if (!response.ok) throw new Error(`task_interaction_failed_${response.status}`);
+    }
+
     function start() {
         if (embedded || eventSource) return;
         const EventSourceClass = windowRef.EventSource;
@@ -101,6 +128,16 @@ export function createTaskViewTransport({
                 // Ignore malformed runtime events and keep the stream alive.
             }
         });
+        eventSource.addEventListener('interaction-request', (event) => {
+            try {
+                const interaction = JSON.parse(event.data);
+                if (!interactionTargetsTab(interaction, tabId)) return;
+                onInteractionRequest?.(interaction);
+            } catch (_) { }
+        });
+        eventSource.addEventListener('interaction-resolved', (event) => {
+            try { onInteractionResolved?.(JSON.parse(event.data)); } catch (_) { }
+        });
     }
 
     function stop() {
@@ -111,6 +148,7 @@ export function createTaskViewTransport({
     return {
         embedded,
         requestCommand,
+        sendInteractionResponse,
         start,
         stop,
     };

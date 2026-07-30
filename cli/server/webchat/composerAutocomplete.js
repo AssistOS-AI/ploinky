@@ -57,7 +57,12 @@ export function nextAutocompleteRenderCount(currentCount, totalCount, batchSize 
     return Math.min(total, Math.max(current, 0) + batch);
 }
 
-export function createComposerAutocomplete({ cmdInput }, { providers = [], dlog, onSelectionApplied } = {}) {
+export function createComposerAutocomplete({ cmdInput }, {
+    providers = [],
+    dlog,
+    onSelectionApplied,
+    positionStrategy = 'composer',
+} = {}) {
     let providerList = Array.isArray(providers) ? providers.slice() : [];
     let menuEl = null;
     let active = false;
@@ -95,6 +100,13 @@ export function createComposerAutocomplete({ cmdInput }, { providers = [], dlog,
     function positionMenu() {
         if (!menuEl || !cmdInput) return;
         const rect = cmdInput.getBoundingClientRect();
+        if (positionStrategy === 'viewport') {
+            menuEl.style.position = 'fixed';
+            menuEl.style.left = `${rect.left}px`;
+            menuEl.style.bottom = `${Math.max(4, window.innerHeight - rect.top + 4)}px`;
+            menuEl.style.width = `${Math.max(280, rect.width)}px`;
+            return;
+        }
         const composerRect = cmdInput.closest('.wa-composer')?.getBoundingClientRect();
         if (!composerRect) return;
         menuEl.style.left = `${rect.left - composerRect.left}px`;
@@ -158,7 +170,7 @@ export function createComposerAutocomplete({ cmdInput }, { providers = [], dlog,
     }
 
     function applySelection(suggestion) {
-        if (!suggestion || !cmdInput) return;
+        if (!suggestion || suggestion.disabled === true || !cmdInput) return;
         const value = cmdInput.value || '';
         const triggerInfo = activeTrigger();
         let next = null;
@@ -251,8 +263,10 @@ export function createComposerAutocomplete({ cmdInput }, { providers = [], dlog,
 
             const item = document.createElement('div');
             item.className = 'wa-slash-menu-item' + (absoluteIdx === selectedIndex ? ' wa-slash-menu-item-active' : '');
+            if (suggestion.disabled === true) item.classList.add('is-disabled');
             item.setAttribute('role', 'option');
             item.setAttribute('aria-selected', absoluteIdx === selectedIndex ? 'true' : 'false');
+            if (suggestion.disabled === true) item.setAttribute('aria-disabled', 'true');
             item.setAttribute('data-suggestion-index', String(absoluteIdx));
             if (absoluteIdx === selectedIndex) {
                 activeItem = item;
@@ -272,6 +286,7 @@ export function createComposerAutocomplete({ cmdInput }, { providers = [], dlog,
             item.addEventListener('pointerdown', (event) => {
                 event.preventDefault();
                 event.stopPropagation();
+                if (suggestion.disabled === true) return;
                 selectedIndex = absoluteIdx;
                 applySelection(suggestionsCache[absoluteIdx]);
             });

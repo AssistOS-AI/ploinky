@@ -11,6 +11,7 @@ import http from 'node:http';
 import https from 'node:https';
 
 import { signAgentAssertion, signAgentHttpAssertion } from '../lib/agentAssertion.mjs';
+import { OPENAI_MODELS_PATH, OPENAI_MODELS_TOOL } from '../lib/invocationAuth.mjs';
 
 export function getRouterUrl() {
     const routerUrl = process.env.PLOINKY_ROUTER_URL;
@@ -283,6 +284,48 @@ function getTaskStatus(agentName, taskId) {
                     return;
                 }
                 resolve(json.task || json);
+            });
+        });
+        req.on('error', reject);
+        req.end();
+    });
+}
+
+function getAgentModels(agentName) {
+    const url = new URL(getRouterUrl());
+    url.pathname = `/${agentName}${OPENAI_MODELS_PATH}`;
+    const httpModule = url.protocol === 'https:' ? https : http;
+    const assertion = signAgentHttpAssertion({
+        method: 'GET',
+        path: OPENAI_MODELS_PATH,
+        query: '',
+        body: Buffer.alloc(0),
+        targetAgent: agentName,
+        tool: OPENAI_MODELS_TOOL,
+    });
+    return new Promise((resolve, reject) => {
+        const req = httpModule.request({
+            hostname: url.hostname,
+            port: url.port || (url.protocol === 'https:' ? 443 : 80),
+            path: url.pathname,
+            method: 'GET',
+            headers: {
+                accept: 'application/json',
+                authorization: `Bearer ${assertion}`,
+            },
+        }, (res) => {
+            const chunks = [];
+            res.on('data', (chunk) => chunks.push(chunk));
+            res.on('end', () => {
+                const text = Buffer.concat(chunks).toString('utf8');
+                let json = null;
+                try { json = text ? JSON.parse(text) : null; } catch (_) { }
+                if ((res.statusCode || 500) >= 400 || !json || !Array.isArray(json.data)) {
+                    const detail = json?.error?.message || json?.error || text || `HTTP ${res.statusCode}`;
+                    reject(new Error(`agent models failed: ${String(detail).slice(0, 300)}`));
+                    return;
+                }
+                resolve(json);
             });
         });
         req.on('error', reject);
@@ -622,6 +665,7 @@ export async function createAgentClient(agentName, options = {}) {
         getAgentStatus: (agentRef = agentName) => getAgentStatus(agentRef),
         ensureAgentRunning: (agentRef = agentName, startOptions = {}) => ensureAgentRunning(agentRef, startOptions),
         getTaskStatus: (taskId) => getTaskStatus(agentName, taskId),
+        getModels: () => getAgentModels(agentName),
         cancelTask: (taskId) => cancelTask(agentName, taskId),
         connect: async () => {},
         listTools: unsupported('listTools'),

@@ -61,6 +61,32 @@ test('interaction validation rejects malformed options and preserves the request
     assert.equal(parseWebchatInteraction({ ...approvalEnvelope(), id: '../bad' }), undefined);
 });
 
+test('generic secret-input interactions are validated without carrying the entered value', () => {
+    const parsed = parseWebchatInteraction({
+        __webchatInteraction: 1,
+        version: 1,
+        id: 'task_control_12345678',
+        kind: 'input',
+        title: 'Connect provider',
+        message: 'Enter API key',
+        targetTaskId: 'task_111111111111111111111111',
+        targetTabId: 'tab_origin',
+        options: [],
+        input: { type: 'secret', placeholder: 'API key', maxLength: 1024 },
+    });
+    assert.deepEqual(parsed.input, { type: 'secret', placeholder: 'API key', maxLength: 1024 });
+    assert.equal(parsed.targetTaskId, 'task_111111111111111111111111');
+    assert.equal(parsed.targetTabId, 'tab_origin');
+    assert.equal(JSON.stringify(parsed).includes('entered-secret'), false);
+});
+
+test('task interactions are visible only in the browser tab that initiated them', () => {
+    const interaction = { id: 'task_control_12345678', targetTabId: 'tab_origin' };
+    assert.equal(networkTestables.interactionTargetsTab(interaction, 'tab_origin'), true);
+    assert.equal(networkTestables.interactionTargetsTab(interaction, 'tab_other'), false);
+    assert.equal(networkTestables.interactionTargetsTab({ id: 'approval_12345678' }, 'tab_other'), true);
+});
+
 test('an EventSource reconnect receives the pending interaction snapshot', (t) => {
     const workspaceDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'webchat-interaction-reconnect-'));
     t.after(() => fs.rmSync(workspaceDirectory, { recursive: true, force: true }));
@@ -159,6 +185,48 @@ test('authenticated interaction responses use the control channel and reject rep
     assert.equal(replay.status, 409);
 });
 
+test('generic input responses use the authenticated interaction control channel', (t) => {
+    const workspaceDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'webchat-interaction-input-'));
+    t.after(() => fs.rmSync(workspaceDirectory, { recursive: true, force: true }));
+    const effectiveConfig = { agentName: 'demo-agent' };
+    const runtimeKey = buildRuntimeKey(workspaceDirectory, effectiveConfig, '');
+    const sid = 'browser-session';
+    const tabId = 'tab-1';
+    const ttyWrites = [];
+    const interaction = parseWebchatInteraction({
+        __webchatInteraction: 1,
+        version: 1,
+        id: 'task_control_12345678',
+        kind: 'input',
+        title: 'Provider input',
+        options: [],
+        input: { type: 'secret', maxLength: 64 },
+    });
+    const tab = {
+        tty: { write: (value) => ttyWrites.push(value) },
+        workspaceDirectory,
+        pendingInteraction: interaction,
+        subscribers: new Map([['client', { sid, tabId, res: { write() {} } }]]),
+    };
+    const appState = {
+        runtimes: new Map([[runtimeKey, tab]]),
+        sessions: new Map([[sid, { tabs: new Map() }]]),
+    };
+
+    const result = postInteraction({
+        appState,
+        workspaceDirectory,
+        effectiveConfig,
+        sid,
+        tabId,
+        interactionId: interaction.id,
+        optionId: null,
+        response: 'entered-value',
+    });
+    assert.equal(result.status, 204);
+    assert.match(ttyWrites[0], /"response":"entered-value"/);
+});
+
 test('approval selector starts on Always approve and supports arrow plus Enter', async () => {
     const originalDocument = globalThis.document;
     const submitted = [];
@@ -187,6 +255,38 @@ test('approval selector starts on Always approve and supports arrow plus Enter',
     }
 });
 
+test('generic input prompt submits text responses instead of option ids', async () => {
+    const originalDocument = globalThis.document;
+    const submitted = [];
+    const dom = createPromptDom();
+    globalThis.document = dom.document;
+    try {
+        const prompt = createInteractionPrompt(dom.elements, {
+            onSubmit: (interactionId, optionId, response) => submitted.push({ interactionId, optionId, response }),
+        });
+        prompt.show(parseWebchatInteraction({
+            __webchatInteraction: 1,
+            version: 1,
+            id: 'task_control_12345678',
+            kind: 'input',
+            title: 'Provider input',
+            options: [],
+            input: { type: 'secret', maxLength: 64 },
+        }));
+        dom.elements.input.value = 'entered-value';
+        prompt.submit();
+        await Promise.resolve();
+        assert.deepEqual(submitted, [{
+            interactionId: 'task_control_12345678',
+            optionId: null,
+            response: 'entered-value',
+        }]);
+        assert.equal(dom.elements.input.type, 'password');
+    } finally {
+        globalThis.document = originalDocument;
+    }
+});
+
 function postInteraction({
     appState,
     workspaceDirectory,
@@ -195,6 +295,7 @@ function postInteraction({
     tabId,
     interactionId = 'approval_12345678',
     optionId = 'always-allow',
+    response,
 }) {
     const req = new EventEmitter();
     req.method = 'POST';
@@ -214,7 +315,7 @@ function postInteraction({
         effectiveConfig,
         agentQuery: '',
     });
-    req.emit('data', JSON.stringify({ interactionId, optionId }));
+    req.emit('data', JSON.stringify({ interactionId, optionId, ...(response !== undefined ? { response } : {}) }));
     req.emit('end');
     return result;
 }
@@ -273,8 +374,11 @@ function createPromptDom() {
     const message = makeElement();
     const detail = makeElement();
     const options = makeElement();
+    const inputRow = makeElement();
+    const input = makeElement();
+    const submitButton = makeElement();
     return {
         document: { createElement: makeElement },
-        elements: { root, title, message, detail, options },
+        elements: { root, title, message, detail, inputRow, input, submitButton, options },
     };
 }

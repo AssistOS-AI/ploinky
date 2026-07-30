@@ -13,6 +13,7 @@ const TASK_ID_RE = /^task_[0-9a-f]{24}$/;
 const TASK_CONTINUATION_HANDLE_RE = /^[A-Za-z0-9_-]{16,200}$/;
 const TASK_TOOL_NAME_RE = /^[A-Za-z0-9._-]{1,160}$/;
 const MAX_TASK_FINAL_OUTPUT_RANGES = 1000;
+const TASK_LOG_SSE_CHUNK_CHARS = 64 * 1024;
 const INTERACTION_ID_RE = /^[A-Za-z0-9_-]{8,128}$/;
 const INTERACTION_TOKEN_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 const PLOINKY_WORKSPACE_BANNER_RE = /^\[ploinky\]\s+using \.ploinky:\s+.+$/;
@@ -46,6 +47,48 @@ function normalizeFinalOutputRanges(raw) {
         .slice(-MAX_TASK_FINAL_OUTPUT_RANGES);
 }
 
+function normalizeTaskCommands(raw, taskId) {
+    if (!Array.isArray(raw)) return [];
+    const commands = [];
+    const seen = new Set();
+    for (const entry of raw.slice(0, 20)) {
+        const name = String(entry?.name || '').trim();
+        const command = String(entry?.command || '').trim();
+        const description = String(entry?.description || '').replace(/\s+/g, ' ').trim().slice(0, 300);
+        const loadingLabel = String(entry?.loadingLabel || '').replace(/\s+/g, ' ').trim().slice(0, 100);
+        const argCompletions = Array.isArray(entry?.argCompletions)
+            ? entry.argCompletions.slice(0, 2000).map((completion) => {
+                const value = String(completion?.value || '').trim().slice(0, 300);
+                if (!value || /[\u0000-\u001f\u007f]/.test(value)) return null;
+                const label = String(completion?.label || value).replace(/\s+/g, ' ').trim().slice(0, 300);
+                const completionDescription = String(completion?.description || '')
+                    .replace(/\s+/g, ' ').trim().slice(0, 500);
+                return { value, label: label || value, description: completionDescription };
+            }).filter(Boolean)
+            : [];
+        const argMatchMode = entry?.argMatchMode === 'fragment' ? 'fragment' : 'prefix';
+        const rawSuggestionLimit = Number(entry?.argSuggestionLimit);
+        const argSuggestionLimit = Number.isInteger(rawSuggestionLimit) && rawSuggestionLimit > 0
+            ? Math.min(rawSuggestionLimit, 2000)
+            : null;
+        const commandMatch = command.match(/^\/task [A-Za-z0-9][A-Za-z0-9_-]{0,63} (task_[0-9a-f]{24})$/);
+        if (!/^\/[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/.test(name)
+            || commandMatch?.[1] !== taskId || command.length > 1000
+            || /[\u0000-\u001f\u007f]/.test(command) || seen.has(name)) continue;
+        seen.add(name);
+        commands.push({
+            name,
+            command,
+            description,
+            ...(loadingLabel ? { loadingLabel } : {}),
+            ...(argCompletions.length ? { argCompletions } : {}),
+            ...(argMatchMode === 'fragment' ? { argMatchMode } : {}),
+            ...(argSuggestionLimit ? { argSuggestionLimit } : {}),
+        });
+    }
+    return commands;
+}
+
 function normalizeTask(raw, { includeFinalOutputRanges = true } = {}) {
     if (!raw || typeof raw !== 'object' || !TASK_ID_RE.test(String(raw.id || ''))) return null;
     const continuationTarget = String(raw.continuation?.targetAgent || raw.targetAgent || '').trim().slice(0, 160);
@@ -65,6 +108,11 @@ function normalizeTask(raw, { includeFinalOutputRanges = true } = {}) {
     const finalOutputRanges = includeFinalOutputRanges
         ? normalizeFinalOutputRanges(raw)
         : [];
+    const modelKey = String(raw.execution?.model?.key || '').trim().slice(0, 300);
+    const executionModel = String(raw.execution?.model?.model || '').trim().slice(0, 300);
+    const executionProvider = String(raw.execution?.model?.provider || '').trim().slice(0, 160);
+    const executionLabel = String(raw.execution?.model?.label || '').replace(/\s+/g, ' ').trim().slice(0, 300);
+    const commands = normalizeTaskCommands(raw.commands, String(raw.id));
     return {
         version: 1,
         id: String(raw.id),
@@ -88,6 +136,17 @@ function normalizeTask(raw, { includeFinalOutputRanges = true } = {}) {
         ...(finalOutputRanges.length ? { finalOutputRanges } : {}),
         ...(raw.logRetention === 'full' ? { logRetention: 'full' } : {}),
         ...(continuation ? { continuation } : {}),
+        ...(modelKey && executionModel ? {
+            execution: {
+                model: {
+                    key: modelKey,
+                    model: executionModel,
+                    ...(executionProvider ? { provider: executionProvider } : {}),
+                    ...(executionLabel ? { label: executionLabel } : {}),
+                },
+            },
+        } : {}),
+        ...(commands.length ? { commands } : {}),
     };
 }
 
@@ -139,6 +198,40 @@ export function serializeTaskListSseEvent(tasks) {
     });
     if (!snapshot?.tasks.length) return '';
     return `event: task-update\ndata: ${JSON.stringify(snapshot)}\n\n`;
+}
+
+export function serializeTaskUpdateSseEvents(update, chunkSize = TASK_LOG_SSE_CHUNK_CHARS) {
+    const serialize = (payload) => `event: task-update\ndata: ${JSON.stringify(payload)}\n\n`;
+    const logText = update?.event === 'view' && typeof update?.log?.text === 'string'
+        ? update.log.text
+        : '';
+    const safeChunkSize = Math.max(1024, Number(chunkSize) || TASK_LOG_SSE_CHUNK_CHARS);
+    if (!logText || logText.length <= safeChunkSize) return [serialize(update)];
+
+    const chunks = [];
+    for (let offset = 0; offset < logText.length; offset += safeChunkSize) {
+        chunks.push(logText.slice(offset, offset + safeChunkSize));
+    }
+    const nextOffset = Math.max(0, Number(update.log.nextOffset) || 0);
+    const start = {
+        ...update,
+        log: { ...update.log, text: '' },
+        logChunk: { phase: 'start', count: chunks.length, nextOffset },
+    };
+    return [
+        serialize(start),
+        ...chunks.map((text, index) => serialize({
+            event: 'view-log-chunk',
+            task: update.task,
+            logChunk: {
+                phase: 'chunk',
+                index,
+                count: chunks.length,
+                text,
+                nextOffset,
+            },
+        })),
+    ];
 }
 
 function stripCtrlAndAnsi(input) {
@@ -395,23 +488,57 @@ export function parseWebchatInteraction(envelope) {
     const detail = normalizeInteractionText(envelope.detail, 4000);
     if (!id || !INTERACTION_ID_RE.test(id) || !kind || !INTERACTION_TOKEN_RE.test(kind) || !title) return undefined;
     if (message === undefined || detail === undefined) return undefined;
-    if (!Array.isArray(envelope.options) || envelope.options.length < 1 || envelope.options.length > 8) return undefined;
+    if (!Array.isArray(envelope.options) || envelope.options.length > 256) return undefined;
+    let input = null;
+    if (envelope.input !== undefined) {
+        if (!envelope.input || typeof envelope.input !== 'object' || Array.isArray(envelope.input)) return undefined;
+        const inputType = envelope.input.type === 'secret' ? 'secret' : (envelope.input.type === 'text' ? 'text' : '');
+        const placeholder = normalizeInteractionText(envelope.input.placeholder, 300);
+        const maxLength = Number(envelope.input.maxLength);
+        if (!inputType || placeholder === undefined || !Number.isInteger(maxLength) || maxLength < 1 || maxLength > 65536) {
+            return undefined;
+        }
+        input = { type: inputType, placeholder, maxLength };
+    }
+    if (!input && envelope.options.length < 1) return undefined;
     const seen = new Set();
     const options = [];
     for (const raw of envelope.options) {
         const optionId = normalizeInteractionText(raw?.id, 64, { required: true });
         const label = normalizeInteractionText(raw?.label, 100, { required: true });
-        if (!optionId || !INTERACTION_TOKEN_RE.test(optionId) || !label || seen.has(optionId)) return undefined;
+        const description = normalizeInteractionText(raw?.description, 500);
+        if (!optionId || !INTERACTION_TOKEN_RE.test(optionId) || !label
+            || description === undefined || seen.has(optionId)) return undefined;
         seen.add(optionId);
         options.push({
             id: optionId,
             label,
+            description,
             tone: raw?.tone === 'danger' ? 'danger' : 'default',
         });
     }
     const requestedDefault = normalizeInteractionText(envelope.defaultOptionId, 64);
-    const defaultOptionId = seen.has(requestedDefault) ? requestedDefault : options[0].id;
-    return { id, kind, title, message, detail, options, defaultOptionId };
+    const defaultOptionId = seen.has(requestedDefault) ? requestedDefault : (options[0]?.id || null);
+    const targetTaskId = typeof envelope.targetTaskId === 'string' && TASK_ID_RE.test(envelope.targetTaskId)
+        ? envelope.targetTaskId
+        : '';
+    const targetTabId = typeof envelope.targetTabId === 'string'
+        && /^[A-Za-z0-9_-]{1,128}$/.test(envelope.targetTabId)
+        ? envelope.targetTabId
+        : '';
+    return {
+        id,
+        kind,
+        title,
+        message,
+        detail,
+        options,
+        defaultOptionId,
+        ...(input ? { input } : {}),
+        ...(envelope.searchable === true && options.length ? { searchable: true } : {}),
+        ...(targetTaskId ? { targetTaskId } : {}),
+        ...(targetTabId ? { targetTabId } : {}),
+    };
 }
 
 export function parseWebchatInteractionResolved(envelope) {
@@ -557,14 +684,13 @@ function routeCompleteOutputLine(appState, tab, line) {
                 const messageIndex = Number.isInteger(envelope.messageIndex) && envelope.messageIndex >= 0
                     ? envelope.messageIndex
                     : null;
-                broadcastWorkspaceTaskEvent(
-                    appState,
-                    tab.workspaceDirectory,
-                    `event: task-update\ndata: ${JSON.stringify({
-                        ...update,
-                        ...(sessionId && messageIndex !== null ? { sessionId, messageIndex } : {}),
-                    })}\n\n`,
-                );
+                const outgoing = {
+                    ...update,
+                    ...(sessionId && messageIndex !== null ? { sessionId, messageIndex } : {}),
+                };
+                for (const payload of serializeTaskUpdateSseEvents(outgoing)) {
+                    broadcastWorkspaceTaskEvent(appState, tab.workspaceDirectory, payload);
+                }
                 return;
             }
         } catch (_) {

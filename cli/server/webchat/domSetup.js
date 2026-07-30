@@ -76,6 +76,9 @@ export function initDom() {
     const interactionPromptTitle = document.getElementById('interactionPromptTitle');
     const interactionPromptMessage = document.getElementById('interactionPromptMessage');
     const interactionPromptDetail = document.getElementById('interactionPromptDetail');
+    const interactionPromptInputRow = document.getElementById('interactionPromptInputRow');
+    const interactionPromptInput = document.getElementById('interactionPromptInput');
+    const interactionPromptSubmit = document.getElementById('interactionPromptSubmit');
     const interactionPromptOptions = document.getElementById('interactionPromptOptions');
     const sessionsBtn = document.getElementById('sessionsBtn');
     const historyGate = document.getElementById('historyGate');
@@ -303,6 +306,9 @@ export function initDom() {
             interactionPromptTitle,
             interactionPromptMessage,
             interactionPromptDetail,
+            interactionPromptInputRow,
+            interactionPromptInput,
+            interactionPromptSubmit,
             interactionPromptOptions,
             attachmentContainer,
             sessionsBtn,

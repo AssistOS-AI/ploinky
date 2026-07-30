@@ -10,6 +10,7 @@
 <main class="wa-task-view">
     <header class="wa-task-view-header">
         <strong class="wa-task-summary-agent" id="taskAgent">Task</strong>
+        <span class="wa-task-summary-model" id="taskModel">default</span>
         <span class="wa-task-summary-description" id="taskDescription">Loading task…</span>
         <span class="wa-task-status is-unavailable" id="taskStatus">LOADING</span>
         <span class="wa-task-summary-duration" id="taskDuration"></span>
@@ -18,6 +19,18 @@
     <div class="wa-task-error" id="taskError" hidden></div>
     <div class="wa-task-action-error" id="taskActionError" hidden></div>
     <div class="wa-task-log" id="taskLog"></div>
+    <section id="taskInteractionPrompt" class="wa-interaction-prompt" role="dialog" aria-modal="true" aria-labelledby="taskInteractionPromptTitle" tabindex="-1" hidden>
+        <div class="wa-interaction-copy">
+            <strong id="taskInteractionPromptTitle"></strong>
+            <span id="taskInteractionPromptMessage"></span>
+            <code id="taskInteractionPromptDetail"></code>
+        </div>
+        <div class="wa-interaction-input-row" id="taskInteractionPromptInputRow" hidden>
+            <input id="taskInteractionPromptInput" autocomplete="off"/>
+            <button type="button" id="taskInteractionPromptSubmit">Continue</button>
+        </div>
+        <div id="taskInteractionPromptOptions" class="wa-interaction-options" role="listbox" aria-label="Available actions"></div>
+    </section>
     <form class="wa-task-continuation" id="taskContinuation" hidden>
         <label for="taskContinuationInput">Continue this agent session</label>
         <div class="wa-task-continuation-row">

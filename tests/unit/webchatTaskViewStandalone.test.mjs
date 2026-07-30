@@ -44,6 +44,8 @@ function createStandaloneWindow() {
 test('standalone task view subscribes to the selected runtime and sends hidden commands', async () => {
     const { windowRef, requests, sources } = createStandaloneWindow();
     const updates = [];
+    const interactions = [];
+    const resolutions = [];
     let opened = 0;
     const transport = createTaskViewTransport({
         windowRef,
@@ -51,6 +53,8 @@ test('standalone task view subscribes to the selected runtime and sends hidden c
         taskId: TASK_ID,
         onOpen: () => { opened += 1; },
         onUpdate: (payload) => updates.push(payload),
+        onInteractionRequest: (payload) => interactions.push(payload),
+        onInteractionResolved: (payload) => resolutions.push(payload),
     });
 
     transport.start();
@@ -76,6 +80,30 @@ test('standalone task view subscribes to the selected runtime and sends hidden c
     const envelope = JSON.parse(requests[0].options.body.trim());
     assert.equal(envelope.text, `/task view ${TASK_ID}`);
     assert.equal(envelope.presentation.visible, false);
+
+    sources[0].emit('interaction-request', {
+        id: 'task_control_other',
+        targetTabId: 'another-tab',
+        options: [],
+    });
+    sources[0].emit('interaction-request', {
+        id: 'task_control_12345678',
+        targetTabId: 'standalone-tab-id',
+        options: [],
+    });
+    sources[0].emit('interaction-resolved', { id: 'task_control_12345678', status: 'submitted' });
+    assert.deepEqual(interactions, [{
+        id: 'task_control_12345678',
+        targetTabId: 'standalone-tab-id',
+        options: [],
+    }]);
+    assert.deepEqual(resolutions, [{ id: 'task_control_12345678', status: 'submitted' }]);
+    await transport.sendInteractionResponse('task_control_12345678', 'choice_0');
+    assert.match(requests[1].url, /^\/webchat\/interaction\?/);
+    assert.deepEqual(JSON.parse(requests[1].options.body), {
+        interactionId: 'task_control_12345678',
+        optionId: 'choice_0',
+    });
 });
 
 test('standalone task commands retry while the runtime stream is starting', async () => {
@@ -116,12 +144,21 @@ test('embedded task view keeps using the same-origin parent bridge', async () =>
 
     transport.start();
     await transport.requestCommand(`/task view ${TASK_ID}`);
+    await transport.sendInteractionResponse('task_control_12345678', 'choice_0');
 
     assert.deepEqual(posted, [{
         message: {
             type: 'webchat-task-command',
             taskId: TASK_ID,
             command: `/task view ${TASK_ID}`,
+        },
+        origin: 'http://localhost:8080',
+    }, {
+        message: {
+            type: 'webchat-task-interaction-response',
+            taskId: TASK_ID,
+            interactionId: 'task_control_12345678',
+            optionId: 'choice_0',
         },
         origin: 'http://localhost:8080',
     }]);

@@ -304,8 +304,13 @@ export function handleRuntimeRoute({
             }
             const interactionId = typeof payload?.interactionId === 'string' ? payload.interactionId.trim() : '';
             const optionId = typeof payload?.optionId === 'string' ? payload.optionId.trim() : '';
+            const response = typeof payload?.response === 'string' ? payload.response : null;
             const pending = tab.pendingInteraction;
-            if (!INTERACTION_TOKEN_RE.test(interactionId) || !INTERACTION_TOKEN_RE.test(optionId)) {
+            const optionResponse = Boolean(optionId) && response === null;
+            const inputResponse = !optionId && response !== null;
+            if (!INTERACTION_TOKEN_RE.test(interactionId)
+                || (!optionResponse && !inputResponse)
+                || (optionResponse && !INTERACTION_TOKEN_RE.test(optionId))) {
                 res.writeHead(400); res.end('Invalid interaction response.');
                 return;
             }
@@ -313,22 +318,26 @@ export function handleRuntimeRoute({
                 res.writeHead(409); res.end('Interaction is no longer pending.');
                 return;
             }
-            if (!pending.options.some((option) => option.id === optionId)) {
+            if (optionResponse && !pending.options.some((option) => option.id === optionId)) {
                 res.writeHead(400); res.end('Unknown interaction option.');
+                return;
+            }
+            if (inputResponse && (!pending.input || response.length > pending.input.maxLength)) {
+                res.writeHead(400); res.end('Invalid interaction input.');
                 return;
             }
             if (!writeRuntimeInput(tab, `${JSON.stringify({
                     __webchatInteractionResponse: 1,
                     version: 1,
                     id: interactionId,
-                    optionId,
+                    ...(optionResponse ? { optionId } : { response }),
                 })}\n`)) {
                 disposeUnavailableRuntime(tab, runtimeKey, runtimes);
                 res.writeHead(409); res.end('Session runtime unavailable.');
                 return;
             }
             tab.pendingInteraction = null;
-            const resolution = { id: interactionId, optionId, status: 'submitted' };
+            const resolution = { id: interactionId, optionId: optionResponse ? optionId : null, status: 'submitted' };
             writeOrBufferSseEvent(tab, serializeInteractionResolvedSseEvent(resolution));
             res.writeHead(204); res.end();
         });

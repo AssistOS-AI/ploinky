@@ -1,9 +1,12 @@
 import fs from 'fs';
 import path from 'path';
+import { randomUUID } from 'crypto';
 
 import { RUNNING_DIR } from '../config.js';
 
 const DEFAULT_TTL_MS = 10 * 60 * 1000;
+const DEFAULT_WAIT_TIMEOUT_MS = 10 * 60 * 1000;
+const DEFAULT_RETRY_INTERVAL_MS = 100;
 const MAINTENANCE_DIR = path.join(RUNNING_DIR, 'maintenance');
 
 function lockPathFor(containerName) {
@@ -34,10 +37,17 @@ function readMaintenanceLock(containerName) {
     }
 }
 
-function removeMaintenanceLock(containerName) {
+function removeMaintenanceLock(containerName, { lockId: expectedLockId } = {}) {
+    if (expectedLockId) {
+        const current = readMaintenanceLock(containerName);
+        if (current?.lockId !== expectedLockId) return false;
+    }
     try {
         fs.unlinkSync(lockPathFor(containerName));
-    } catch (_) {}
+        return true;
+    } catch (_) {
+        return false;
+    }
 }
 
 function createMaintenanceLock(containerName, {
@@ -50,25 +60,69 @@ function createMaintenanceLock(containerName, {
     }
     const now = Date.now();
     const lock = {
+        ...metadata,
         containerName,
         operation,
         ownerPid: process.pid,
+        lockId: randomUUID(),
         startedAt: new Date(now).toISOString(),
         expiresAt: new Date(now + ttlMs).toISOString(),
-        ...metadata,
     };
     fs.mkdirSync(MAINTENANCE_DIR, { recursive: true });
-    fs.writeFileSync(lockPathFor(containerName), JSON.stringify(lock, null, 2));
-    return lock;
+    const filePath = lockPathFor(containerName);
+    let fd;
+    try {
+        fd = fs.openSync(filePath, 'wx', 0o600);
+        fs.writeFileSync(fd, JSON.stringify(lock, null, 2), 'utf8');
+        fs.fsyncSync(fd);
+    } catch (error) {
+        if (fd !== undefined) {
+            try { fs.closeSync(fd); } catch (_) {}
+            try { fs.unlinkSync(filePath); } catch (_) {}
+        }
+        throw error;
+    }
+    fs.closeSync(fd);
+    return { ...lock, filePath };
 }
 
-function withMaintenanceLock(containerName, options, fn) {
-    createMaintenanceLock(containerName, options);
-    return Promise.resolve()
-        .then(fn)
-        .finally(() => {
-            removeMaintenanceLock(containerName);
-        });
+function wait(delayMs) {
+    return new Promise((resolve) => setTimeout(resolve, delayMs));
+}
+
+async function acquireMaintenanceLock(containerName, {
+    waitTimeoutMs = DEFAULT_WAIT_TIMEOUT_MS,
+    retryIntervalMs = DEFAULT_RETRY_INTERVAL_MS,
+    ...lockOptions
+} = {}) {
+    const deadline = Date.now() + Math.max(0, Number(waitTimeoutMs) || 0);
+    while (true) {
+        try {
+            return createMaintenanceLock(containerName, lockOptions);
+        } catch (error) {
+            if (error?.code !== 'EEXIST') throw error;
+        }
+
+        const state = inspectMaintenanceLock(containerName);
+        if (!state.active && !fs.existsSync(lockPathFor(containerName))) continue;
+        if (Date.now() >= deadline) {
+            const error = new Error(
+                `Timed out waiting for maintenance lock on '${containerName}' held by ${state.lock?.operation || 'maintenance'}.`
+            );
+            error.code = 'maintenance_lock_timeout';
+            throw error;
+        }
+        await wait(Math.max(1, Number(retryIntervalMs) || DEFAULT_RETRY_INTERVAL_MS));
+    }
+}
+
+async function withMaintenanceLock(containerName, options, fn) {
+    const lock = await acquireMaintenanceLock(containerName, options);
+    try {
+        return await fn();
+    } finally {
+        removeMaintenanceLock(containerName, { lockId: lock.lockId });
+    }
 }
 
 function inspectMaintenanceLock(containerName) {
@@ -83,7 +137,7 @@ function inspectMaintenanceLock(containerName) {
     const stale = expired || !ownerAlive;
 
     if (stale) {
-        removeMaintenanceLock(containerName);
+        removeMaintenanceLock(containerName, { lockId: lock.lockId });
         return { active: false, stale: true, lock };
     }
 
@@ -91,6 +145,7 @@ function inspectMaintenanceLock(containerName) {
 }
 
 export {
+    acquireMaintenanceLock,
     createMaintenanceLock,
     inspectMaintenanceLock,
     removeMaintenanceLock,

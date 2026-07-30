@@ -7,13 +7,14 @@ export function nextInteractionOptionIndex(currentIndex, optionCount, direction)
     return current;
 }
 
-export function createInteractionPrompt({ root, title, message, detail, options }, {
+export function createInteractionPrompt({ root, title, message, detail, inputRow, input, submitButton, options }, {
     onSubmit,
     onActiveChange,
 } = {}) {
     let interaction = null;
     let selectedIndex = 0;
     let submitting = false;
+    let visibleOptions = [];
 
     function notifyActive(active) {
         if (typeof onActiveChange === 'function') onActiveChange(active);
@@ -21,8 +22,14 @@ export function createInteractionPrompt({ root, title, message, detail, options 
 
     function renderOptions() {
         if (!options || !interaction) return;
+        if (input) input.disabled = submitting;
+        if (submitButton) submitButton.disabled = submitting;
         options.replaceChildren();
-        interaction.options.forEach((option, index) => {
+        const query = interaction.searchable ? String(input?.value || '').trim().toLowerCase() : '';
+        visibleOptions = interaction.options.filter((option) => !query
+            || [option.label, option.description].some((value) => String(value || '').toLowerCase().includes(query)));
+        if (selectedIndex >= visibleOptions.length) selectedIndex = Math.max(0, visibleOptions.length - 1);
+        visibleOptions.forEach((option, index) => {
             const button = document.createElement('button');
             button.type = 'button';
             button.id = `interaction-option-${interaction.id}-${index}`;
@@ -32,7 +39,15 @@ export function createInteractionPrompt({ root, title, message, detail, options 
             button.setAttribute('role', 'option');
             button.setAttribute('aria-selected', index === selectedIndex ? 'true' : 'false');
             button.disabled = submitting;
-            button.textContent = option.label;
+            const label = document.createElement('span');
+            label.textContent = option.label;
+            button.appendChild(label);
+            if (option.description) {
+                const description = document.createElement('span');
+                description.className = 'wa-interaction-option-description';
+                description.textContent = option.description;
+                button.appendChild(description);
+            }
             button.addEventListener('click', () => {
                 selectedIndex = index;
                 renderOptions();
@@ -45,19 +60,24 @@ export function createInteractionPrompt({ root, title, message, detail, options 
     }
 
     function select(index) {
-        if (!interaction || interaction.options.length === 0) return;
-        selectedIndex = Math.max(0, Math.min(index, interaction.options.length - 1));
+        if (!interaction || visibleOptions.length === 0) return;
+        selectedIndex = Math.max(0, Math.min(index, visibleOptions.length - 1));
         renderOptions();
     }
 
     function submit() {
         if (!interaction || submitting) return false;
-        const option = interaction.options[selectedIndex];
-        if (!option) return false;
+        const inputInteraction = Boolean(interaction.input);
+        const option = visibleOptions[selectedIndex];
+        if (!inputInteraction && !option) return false;
         submitting = true;
         root?.classList?.add('is-submitting');
         renderOptions();
-        Promise.resolve(onSubmit?.(interaction.id, option.id)).catch(() => {
+        Promise.resolve(onSubmit?.(
+            interaction.id,
+            inputInteraction ? null : option.id,
+            inputInteraction ? String(input?.value || '') : null,
+        )).catch(() => {
             submitting = false;
             root?.classList?.remove('is-submitting');
             renderOptions();
@@ -68,10 +88,10 @@ export function createInteractionPrompt({ root, title, message, detail, options 
 
     function handleKeydown(event) {
         if (!interaction) return false;
-        if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+        if (!interaction.input && (event.key === 'ArrowDown' || event.key === 'ArrowUp')) {
             event.preventDefault();
             const direction = event.key === 'ArrowDown' ? 1 : -1;
-            select(nextInteractionOptionIndex(selectedIndex, interaction.options.length, direction));
+            select(nextInteractionOptionIndex(selectedIndex, visibleOptions.length, direction));
             return true;
         }
         if (event.key === 'Enter') {
@@ -83,7 +103,8 @@ export function createInteractionPrompt({ root, title, message, detail, options 
     }
 
     function show(nextInteraction) {
-        if (!nextInteraction?.id || !Array.isArray(nextInteraction.options) || nextInteraction.options.length === 0) return;
+        if (!nextInteraction?.id || !Array.isArray(nextInteraction.options)
+            || (!nextInteraction.input && nextInteraction.options.length === 0)) return;
         interaction = nextInteraction;
         submitting = false;
         selectedIndex = Math.max(0, interaction.options.findIndex((option) => option.id === interaction.defaultOptionId));
@@ -100,9 +121,19 @@ export function createInteractionPrompt({ root, title, message, detail, options 
             root.hidden = false;
             root.classList.remove('is-submitting');
         }
+        if (inputRow) inputRow.hidden = !interaction.input && !interaction.searchable;
+        if (input) {
+            input.value = '';
+            input.type = interaction.input?.type === 'secret' ? 'password' : (interaction.searchable ? 'search' : 'text');
+            input.placeholder = interaction.input?.placeholder || (interaction.searchable ? 'Filter options…' : '');
+            input.maxLength = interaction.input?.maxLength || 300;
+            input.disabled = false;
+        }
+        if (submitButton) submitButton.hidden = !interaction.input;
         renderOptions();
         notifyActive(true);
-        root?.focus?.({ preventScroll: true });
+        if (interaction.input || interaction.searchable) input?.focus?.({ preventScroll: true });
+        else root?.focus?.({ preventScroll: true });
     }
 
     function resolve(resolution = {}) {
@@ -115,10 +146,18 @@ export function createInteractionPrompt({ root, title, message, detail, options 
             root.classList.remove('is-submitting');
         }
         options?.replaceChildren?.();
+        if (inputRow) inputRow.hidden = true;
+        if (input) input.value = '';
         notifyActive(false);
     }
 
     root?.addEventListener?.('keydown', handleKeydown);
+    input?.addEventListener?.('input', () => {
+        if (!interaction?.searchable) return;
+        selectedIndex = 0;
+        renderOptions();
+    });
+    submitButton?.addEventListener?.('click', submit);
 
     return {
         show,
@@ -129,7 +168,7 @@ export function createInteractionPrompt({ root, title, message, detail, options 
             return Boolean(interaction);
         },
         get selectedOptionId() {
-            return interaction?.options?.[selectedIndex]?.id || null;
+            return visibleOptions[selectedIndex]?.id || null;
         },
     };
 }

@@ -234,3 +234,23 @@ test('cancelTask sends a request-bound agent assertion through the router', asyn
     assert.deepEqual(JSON.parse(captured.body), { taskId: 'remote-1' });
     assert.match(captured.headers.authorization, /^Bearer /);
 });
+
+test('getModels reads the target agent model endpoint through a signed router request', async (t) => {
+    let captured = null;
+    const catalog = {
+        object: 'list',
+        data: [{ id: 'provider/model', execution: { model: 'provider/model' } }],
+    };
+    await withCaptureServer(t, (req, body, res) => {
+        captured = { method: req.method, url: req.url, headers: req.headers, body };
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(catalog));
+    });
+
+    const client = await createAgentClient('codingAgent');
+    assert.deepEqual(await client.getModels(), catalog);
+    assert.equal(captured.method, 'GET');
+    assert.equal(captured.url, '/codingAgent/v1/models');
+    assert.equal(captured.body.length, 0);
+    assert.match(captured.headers.authorization, /^Bearer /);
+});

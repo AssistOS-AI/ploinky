@@ -122,6 +122,7 @@ export function serializeWebchatEnvelopeForAgent({ req, effectiveConfig, tabId, 
         text: (envelope && typeof envelope.text === 'string') ? envelope.text : String(fallbackText || ''),
         attachments: sanitizeWebchatAttachmentsForEnvelope(envelope?.attachments),
         presentation: normalizeWebchatPresentation(envelope?.presentation),
+        sourceTabId: String(tabId || '').slice(0, 128),
     };
     if (publicBaseUrl) payload.origin = { publicBaseUrl };
     if (sanitizedReferences.length) payload.references = sanitizedReferences;

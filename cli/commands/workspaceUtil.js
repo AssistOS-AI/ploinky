@@ -961,57 +961,76 @@ async function runCli(agentName, args) {
   const { ensureAgentService, attachInteractive, getConfiguredProjectPath, getAgentContainerName } = dockerSvc;
   const agentDir = path.dirname(manifestPath);
   const repoName = path.basename(path.dirname(agentDir));
-  utils.debugLog(`[runCli] agent=${agentName} container=${registryRecord?.containerName || getAgentContainerName(shortAgentName, repoName)}`);
-  const containerInfo = ensureAgentService(shortAgentName, manifest, agentDir, { containerName: registryRecord?.containerName, alias: registryRecord?.record?.alias });
-  const containerName = (containerInfo && containerInfo.containerName)
-    || registryRecord?.containerName
-    || getAgentContainerName(shortAgentName, repoName);
-  if (containerInfo?.hostPort) {
-    const routeRepoName = registryRecord?.record?.repoName || repoName;
-    const routeKey = registryRecord?.record?.alias || shortAgentName;
-    await mergeRoutingConfig((current) => {
-      const nextRoute = {
-        ...(current.routes?.[routeKey] || {}),
-        container: containerName,
-        hostPath: agentDir,
-        repo: routeRepoName,
-        agent: shortAgentName,
-        ...(registryRecord?.record?.alias ? { alias: registryRecord.record.alias } : {}),
-        hostPort: containerInfo.hostPort,
-        ...(containerInfo.additionalServerPort ? {
-          additionalServerPort: containerInfo.additionalServerPort,
-        } : {}),
-      };
-      if (!containerInfo.additionalServerPort) delete nextRoute.additionalServerPort;
-      return {
-        ...current,
-        routes: {
-          ...(current.routes || {}),
-          [routeKey]: nextRoute,
-        },
-      };
+  const initialContainerName = registryRecord?.containerName || getAgentContainerName(shortAgentName, repoName);
+  utils.debugLog(`[runCli] agent=${agentName} container=${initialContainerName}`);
+  let containerInfo = null;
+  let containerName = initialContainerName;
+  await withMaintenanceLock(initialContainerName, {
+    operation: 'cli-start',
+    metadata: {
+      agent: shortAgentName,
+      repo: repoName,
+    },
+  }, async () => {
+    const refreshedRecord = loadAgentsMap()?.[initialContainerName];
+    if (refreshedRecord?.type === 'agent') {
+      registryRecord = { containerName: initialContainerName, record: refreshedRecord };
+    }
+
+    containerInfo = ensureAgentService(shortAgentName, manifest, agentDir, {
+      containerName: registryRecord?.containerName,
+      alias: registryRecord?.record?.alias,
     });
-  }
-  const readinessProtocol = resolveAgentReadinessProtocol(manifest);
-  if (readinessProtocol !== 'none') {
-    const hostPort = containerInfo?.hostPort;
-    if (!hostPort) {
-      if (!suppressLauncherLogs) {
-        console.warn(`[cli] warning: cannot wait for '${shortAgentName}' readiness because no host port was resolved.`);
-      }
-    } else {
-      if (!suppressLauncherLogs) {
-        console.log(`[cli] Waiting for '${shortAgentName}' readiness (${readinessProtocol}) on port ${hostPort}...`);
-      }
-      const ready = await waitForAgentReady({ hostPort }, {
-        timeoutMs: 600000,
-        protocol: readinessProtocol,
+    containerName = containerInfo?.containerName
+      || registryRecord?.containerName
+      || initialContainerName;
+    if (containerInfo?.hostPort) {
+      const routeRepoName = registryRecord?.record?.repoName || repoName;
+      const routeKey = registryRecord?.record?.alias || shortAgentName;
+      await mergeRoutingConfig((current) => {
+        const nextRoute = {
+          ...(current.routes?.[routeKey] || {}),
+          container: containerName,
+          hostPath: agentDir,
+          repo: routeRepoName,
+          agent: shortAgentName,
+          ...(registryRecord?.record?.alias ? { alias: registryRecord.record.alias } : {}),
+          hostPort: containerInfo.hostPort,
+          ...(containerInfo.additionalServerPort ? {
+            additionalServerPort: containerInfo.additionalServerPort,
+          } : {}),
+        };
+        if (!containerInfo.additionalServerPort) delete nextRoute.additionalServerPort;
+        return {
+          ...current,
+          routes: {
+            ...(current.routes || {}),
+            [routeKey]: nextRoute,
+          },
+        };
       });
-      if (!ready) {
-        throw new Error(`Agent '${shortAgentName}' did not become ready before CLI attach.`);
+    }
+    const readinessProtocol = resolveAgentReadinessProtocol(manifest);
+    if (readinessProtocol !== 'none') {
+      const hostPort = containerInfo?.hostPort;
+      if (!hostPort) {
+        if (!suppressLauncherLogs) {
+          console.warn(`[cli] warning: cannot wait for '${shortAgentName}' readiness because no host port was resolved.`);
+        }
+      } else {
+        if (!suppressLauncherLogs) {
+          console.log(`[cli] Waiting for '${shortAgentName}' readiness (${readinessProtocol}) on port ${hostPort}...`);
+        }
+        const ready = await waitForAgentReady({ hostPort }, {
+          timeoutMs: 600000,
+          protocol: readinessProtocol,
+        });
+        if (!ready) {
+          throw new Error(`Agent '${shortAgentName}' did not become ready before CLI attach.`);
+        }
       }
     }
-  }
+  });
   const projPath = PLOINKY_CWD;
 
   // Determine actual runtime from registry (may differ from manifest if sandbox

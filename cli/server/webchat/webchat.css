@@ -2169,15 +2169,55 @@ body {
     display: flex;
     flex-wrap: wrap;
     gap: 8px;
+    max-height: min(38vh, 360px);
+    overflow-y: auto;
+}
+
+.wa-interaction-input-row {
+    display: flex;
+    gap: 8px;
+    margin-bottom: 10px;
+}
+
+.wa-interaction-input-row[hidden] {
+    display: none;
+}
+
+.wa-interaction-input-row input {
+    min-width: 0;
+    flex: 1;
+    padding: 9px 12px;
+    border: 1px solid var(--wa-border);
+    border-radius: 10px;
+    background: var(--wa-bg-input);
+    color: var(--wa-text-primary);
+    font: inherit;
+}
+
+.wa-interaction-input-row button {
+    padding: 8px 14px;
+    border: 0;
+    border-radius: 10px;
+    background: var(--wa-accent);
+    color: white;
+    cursor: pointer;
 }
 
 .wa-interaction-option {
+    display: grid;
+    gap: 2px;
     padding: 8px 14px;
     border: 1px solid var(--wa-border);
     border-radius: 999px;
     background: transparent;
     color: var(--wa-text-primary);
     cursor: pointer;
+}
+
+.wa-interaction-option-description {
+    color: inherit;
+    font-size: 11px;
+    opacity: 0.72;
 }
 
 .wa-interaction-option.is-selected {
@@ -2411,6 +2451,33 @@ body {
 .wa-slash-menu-item:hover {
     background: var(--wa-accent, #2196f3);
     color: #ffffff;
+}
+
+.wa-slash-menu-item.is-disabled {
+    cursor: wait;
+    opacity: 0.72;
+}
+
+.wa-slash-menu-item.is-disabled:hover,
+.wa-slash-menu-item.is-disabled.wa-slash-menu-item-active {
+    background: transparent;
+}
+
+.wa-slash-menu-item.is-disabled .wa-slash-menu-label::before {
+    display: inline-block;
+    width: 10px;
+    height: 10px;
+    margin-right: 8px;
+    border: 2px solid currentColor;
+    border-right-color: transparent;
+    border-radius: 50%;
+    content: '';
+    vertical-align: -1px;
+    animation: wa-spin 0.8s linear infinite;
+}
+
+@keyframes wa-spin {
+    to { transform: rotate(360deg); }
 }
 
 .wa-slash-menu-label {
@@ -3526,11 +3593,24 @@ button.wa-upload-directory-entry.folder:hover {
 }
 
 .wa-task-view-header {
-    grid-template-columns: auto minmax(0, 1fr) auto auto auto;
+    grid-template-columns: auto auto minmax(0, 1fr) auto auto auto;
 }
 
 .wa-task-summary-agent {
     font-size: 12px;
+}
+
+.wa-task-summary-model {
+    max-width: min(32vw, 280px);
+    overflow: hidden;
+    padding: 2px 6px;
+    border: 1px solid color-mix(in srgb, var(--wa-border) 72%, transparent);
+    border-radius: 999px;
+    color: var(--wa-text-muted);
+    font-size: 11px;
+    line-height: 1.25;
+    text-overflow: ellipsis;
+    white-space: nowrap;
 }
 
 .wa-task-summary-description {
