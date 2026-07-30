@@ -19,6 +19,7 @@ import { isBwrapProcessRunning } from '../sandbox/bwrap/bwrapFleet.js';
 import { findAgent } from './utils.js';
 import { REPOS_DIR, PLOINKY_WORKSPACE_ROOT, ROUTING_FILE } from './config.js';
 import { resolveManifestStartup } from './runtime/manifestStartup.js';
+import { policy } from '../server/policy/index.js';
 import {
     createAgentSymlinks,
     removeAgentSymlinks,
@@ -432,6 +433,9 @@ export function enableAgent(agentName, mode, repoNameParam, aliasParam, authMode
         delete routing.routes[routeKey].additionalServerPort;
     }
     saveRoutingConfig(routing);
+    policy.mcpToolPolicy.bootstrap({
+        [routeKey]: routing.routes[routeKey]
+    });
 
     return { containerName: started?.containerName || containerName, repoName, shortAgentName, alias: alias || undefined, auth: record.auth, runMode, hostPort };
 }

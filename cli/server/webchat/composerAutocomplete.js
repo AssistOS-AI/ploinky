@@ -264,9 +264,13 @@ export function createComposerAutocomplete({ cmdInput }, {
             const item = document.createElement('div');
             item.className = 'wa-slash-menu-item' + (absoluteIdx === selectedIndex ? ' wa-slash-menu-item-active' : '');
             if (suggestion.disabled === true) item.classList.add('is-disabled');
+            if (suggestion.loading === true) item.classList.add('is-loading');
             item.setAttribute('role', 'option');
             item.setAttribute('aria-selected', absoluteIdx === selectedIndex ? 'true' : 'false');
             if (suggestion.disabled === true) item.setAttribute('aria-disabled', 'true');
+            if (suggestion.loading === true) {
+                item.setAttribute('aria-label', suggestion.loadingLabel || suggestion.label || 'Loading');
+            }
             item.setAttribute('data-suggestion-index', String(absoluteIdx));
             if (absoluteIdx === selectedIndex) {
                 activeItem = item;
@@ -280,8 +284,14 @@ export function createComposerAutocomplete({ cmdInput }, {
             desc.className = 'wa-slash-menu-desc';
             desc.textContent = suggestion.description || '';
 
+            if (suggestion.loading === true) {
+                const spinner = document.createElement('span');
+                spinner.className = 'wa-slash-menu-spinner';
+                spinner.setAttribute('aria-hidden', 'true');
+                item.appendChild(spinner);
+            }
             item.appendChild(label);
-            item.appendChild(desc);
+            if (suggestion.loading !== true) item.appendChild(desc);
 
             item.addEventListener('pointerdown', (event) => {
                 event.preventDefault();

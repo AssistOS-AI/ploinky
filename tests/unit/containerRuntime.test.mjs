@@ -287,6 +287,12 @@ esac
             start: 'sleep 3600',
             readiness: { protocol: 'none' },
         }));
+        fs.writeFileSync(path.join(agentDir, 'mcp-config.json'), JSON.stringify({
+            tools: [
+                { name: 'demo_internal', tags: ['internal'] },
+                { name: 'demo_authenticated' },
+            ],
+        }));
 
         const result = runModuleSnippet(
             `const { enableAgent } = await import(${JSON.stringify(pathToFileURL(path.join(repoRoot, 'cli/utils/agents.js')).href)});
@@ -295,13 +301,14 @@ const fs = await import('node:fs');
 const path = await import('node:path');
 const agents = JSON.parse(fs.readFileSync(path.join(process.cwd(), '.ploinky', 'agents.json'), 'utf8'));
 const record = Object.values(agents).find((entry) => entry && entry.agentName === 'demo');
-console.log(JSON.stringify(record));`,
+const policyState = JSON.parse(fs.readFileSync(path.join(process.cwd(), '.ploinky', 'data', 'router-security', 'policy-state.json'), 'utf8'));
+console.log(JSON.stringify({ record, mcpTools: policyState.mcpTools }));`,
             { PATH: `${binDir}${path.delimiter}${process.env.PATH || ''}` },
             { cwd: workspaceDir },
         );
 
         assert.equal(result.status, 0, result.stderr);
-        const record = JSON.parse(result.stdout.trim().split('\n').at(-1));
+        const { record, mcpTools } = JSON.parse(result.stdout.trim().split('\n').at(-1));
         assert.equal(record.runMode, 'global');
         assert.equal(record.projectPath, workspaceDir);
         assert.ok(record.config.binds.some((bind) => (
@@ -310,6 +317,13 @@ console.log(JSON.stringify(record));`,
         assert.ok(record.config.binds.some((bind) => (
             bind.source === path.join(workspaceDir, '.data', 'demo') && bind.target === '/root'
         )));
+        assert.deepEqual(
+            mcpTools.map(({ agent, tool, access, enabled }) => ({ agent, tool, access, enabled })),
+            [
+                { agent: 'demo', tool: 'demo_internal', access: 'internal', enabled: true },
+                { agent: 'demo', tool: 'demo_authenticated', access: 'authenticated', enabled: true },
+            ],
+        );
     } finally {
         fs.rmSync(workspaceDir, { recursive: true, force: true });
         fs.rmSync(binDir, { recursive: true, force: true });

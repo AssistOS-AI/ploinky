@@ -139,7 +139,9 @@ test('disabled autocomplete loading row consumes Enter without selecting or subm
         providers: [{
             trigger: '/',
             getSuggestions: () => [{
-                label: 'Loading models…',
+                label: 'Loading...',
+                loadingLabel: 'Loading models…',
+                loading: true,
                 disabled: true,
                 onSelected: () => { selected = true; },
             }],
@@ -154,6 +156,8 @@ test('disabled autocomplete loading row consumes Enter without selecting or subm
 
     assert.equal(bodyChildren.length, 1);
     assert.equal(bodyChildren[0].style.display, 'block');
+    assert.equal(bodyChildren[0].children[0].children[0].className, 'wa-slash-menu-spinner');
+    assert.equal(bodyChildren[0].children[0].children[1].textContent, 'Loading...');
     assert.equal(handled, true);
     assert.equal(prevented, true);
     assert.equal(selected, false);

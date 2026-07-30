@@ -37,8 +37,9 @@ test('task command autocomplete uses the classic slash lifecycle and loads argum
     });
     assert.equal(suggestions[0].keepMenuOpen, true);
     const [loading] = provider.getSuggestions('/model ');
-    assert.equal(loading.label, 'Loading models…');
-    assert.equal(loading.description, 'Choose model');
+    assert.equal(loading.label, 'Loading...');
+    assert.equal(loading.loadingLabel, 'Loading models…');
+    assert.equal(loading.loading, true);
     assert.equal(loading.disabled, true);
     await provider.requestSuggestions('/model ');
     assert.deepEqual(loads, ['/model']);
@@ -57,6 +58,30 @@ test('task command autocomplete uses the classic slash lifecycle and loads argum
         value: '/model anthropic/claude-test ', cursor: 29,
     });
     assert.equal(provider.requestSuggestions('/model claude'), null);
+});
+
+test('task login uses the same centered loading presentation as task model', () => {
+    const provider = createTaskCommandAutocompleteProvider({
+        getCommands: () => [{
+            name: '/login',
+            command: '/task login task_111111111111111111111111',
+            loadingLabel: 'Loading providers…',
+        }],
+        getLoadingCommand: () => '/login',
+    });
+
+    const [loading] = provider.getSuggestions('/login ');
+    assert.deepEqual(loading, {
+        label: 'Loading...',
+        loadingLabel: 'Loading providers…',
+        loading: true,
+        disabled: true,
+        command: {
+            name: '/login',
+            command: '/task login task_111111111111111111111111',
+            loadingLabel: 'Loading providers…',
+        },
+    });
 });
 
 test('task model Enter completes command, then model, and only the following Enter can submit', async (t) => {

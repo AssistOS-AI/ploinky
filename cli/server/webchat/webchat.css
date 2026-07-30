@@ -2463,6 +2463,39 @@ body {
     background: transparent;
 }
 
+.wa-slash-menu-item.is-loading {
+    min-height: 112px;
+    flex-direction: column;
+    justify-content: center;
+    gap: 10px;
+    color: var(--wa-text-secondary, #667781);
+    opacity: 1;
+}
+
+.wa-slash-menu-item.is-loading:hover,
+.wa-slash-menu-item.is-loading.wa-slash-menu-item-active {
+    background: transparent;
+    color: var(--wa-text-secondary, #667781);
+}
+
+.wa-slash-menu-spinner {
+    width: 24px;
+    height: 24px;
+    border: 3px solid color-mix(in srgb, var(--wa-accent, #2196f3) 24%, transparent);
+    border-top-color: var(--wa-accent, #2196f3);
+    border-radius: 50%;
+    animation: wa-spin 0.8s linear infinite;
+}
+
+.wa-slash-menu-item.is-loading .wa-slash-menu-label {
+    font-family: inherit;
+    font-weight: 600;
+}
+
+.wa-slash-menu-item.is-disabled.is-loading .wa-slash-menu-label::before {
+    display: none;
+}
+
 .wa-slash-menu-item.is-disabled .wa-slash-menu-label::before {
     display: inline-block;
     width: 10px;

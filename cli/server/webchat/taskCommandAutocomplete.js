@@ -45,8 +45,9 @@ export function createTaskCommandAutocompleteProvider({
                 && argumentCommand.argCompletions.length > 0;
             if (argumentCommand?.loadingLabel && !hasCompletions) {
                 return [{
-                    label: argumentCommand.loadingLabel,
-                    description: argumentCommand.description || '',
+                    label: 'Loading...',
+                    loadingLabel: argumentCommand.loadingLabel,
+                    loading: true,
                     disabled: true,
                     command: argumentCommand,
                 }];
@@ -86,8 +87,9 @@ export function createTaskInteractionAutocompleteProvider({ getInteraction, onSe
             if (!interaction) return [];
             if (interaction.loading === true) {
                 return [{
-                    label: interaction.loadingLabel || 'Loading options…',
-                    description: interaction.message || '',
+                    label: 'Loading...',
+                    loadingLabel: interaction.loadingLabel || 'Loading options…',
+                    loading: true,
                     disabled: true,
                 }];
             }
