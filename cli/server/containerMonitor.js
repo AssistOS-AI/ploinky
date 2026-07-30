@@ -241,7 +241,8 @@ function readNoWaitStatus(containerName) {
 }
 
 function shouldDeferNoWaitRestart(monitor, target) {
-    const status = readNoWaitStatus(target?.containerName || '');
+    const readStatus = monitor?.readNoWaitStatus || readNoWaitStatus;
+    const status = readStatus(target?.containerName || '');
     const state = String(status?.state || '').trim().toLowerCase();
     if (state !== 'starting' && state !== 'failed') {
         target.noWaitDeferredState = null;
@@ -886,7 +887,6 @@ export function monitorTick(monitor) {
         if (running) {
             const now = Date.now();
             target.lastSeenRunningAt = now;
-            target.noWaitDeferredState = null;
             if (!target.lastStartTime) target.lastStartTime = now;
             const resetAfter = 60000;
             if ((now - target.lastStartTime) > resetAfter && target.currentBackoff !== (monitor?.config?.INITIAL_BACKOFF_MS ?? 1000)) {
@@ -898,6 +898,15 @@ export function monitorTick(monitor) {
                     agent: target.agentName,
                     repo: target.repoName
                 });
+            }
+            // Detached no-wait launches own activation readiness until their
+            // status becomes terminal. A running OCI container can still be
+            // only partially initialized during that window, so recurring
+            // liveness must not race activation and restart it underneath the
+            // no-wait worker.
+            if (shouldDeferNoWaitRestart(monitor, target)) {
+                stopProbeWorker(target);
+                continue;
             }
             const continuousProbeIntervalMs = positiveInteger(
                 monitor?.config?.CONTINUOUS_PROBE_INTERVAL_MS

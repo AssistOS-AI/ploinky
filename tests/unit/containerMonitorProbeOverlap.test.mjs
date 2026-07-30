@@ -75,6 +75,44 @@ test('successive monitor ticks preserve one in-flight probe worker', () => {
     assert.deepEqual(events, []);
 });
 
+test('a running no-wait container is not probed until activation readiness publishes running', () => {
+    const { monitor, events } = monitorRecorder();
+    const target = {
+        containerName: 'activating-container',
+        agentName: 'activating-agent',
+        repoName: 'demo-repo',
+        runtime: 'container',
+        probeWorker: null,
+        probeState: 'pending',
+        isRestarting: false,
+        pendingRestartTimer: null,
+    };
+    monitor.targets.set(target.containerName, target);
+    monitor.inspectWorkspaceStartLock = () => ({ active: false, stale: false });
+    monitor.syncManagedContainers = () => {};
+    monitor.listRunningContainerNames = () => [target.containerName];
+    let lifecycleState = 'starting';
+    monitor.readNoWaitStatus = () => ({ state: lifecycleState });
+    const probeStarts = [];
+    monitor.startProbeWorker = (_monitor, current) => {
+        probeStarts.push(current.containerName);
+    };
+
+    monitorTick(monitor);
+
+    assert.deepEqual(probeStarts, []);
+    assert.equal(target.probeState, 'pending');
+    assert.deepEqual(events.map(({ event }) => event), [
+        'container_no_wait_restart_deferred',
+    ]);
+
+    lifecycleState = 'running';
+    monitorTick(monitor);
+
+    assert.deepEqual(probeStarts, [target.containerName]);
+    assert.equal(target.noWaitDeferredState, null);
+});
+
 test('a fresh success blocks re-probing until the monitor tick resets probe state', () => {
     const { monitor, events } = monitorRecorder();
     const target = {
