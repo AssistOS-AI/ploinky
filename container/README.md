@@ -198,8 +198,10 @@ selection behavior remains unchanged.
 Every Ploinky-owned nested container carries the exact label
 `io.assistos.ploinky.managed=1`. Box boot enumerates that exact key/value and
 retires only non-running records whose immutable registry ownership is exact,
-including complete predecessor lifecycle pairs, or legacy helper records whose
-only Ploinky label is the historical managed marker. Running, paused,
+or superseded predecessors whose name and stable labels are exact and whose
+immutable ID and complete lifecycle pair were both replaced in the registry.
+It also retires legacy helper records whose only Ploinky label is the
+historical managed marker. Running, paused,
 transitional, partially labelled, ambiguous, and foreign records fail the Box
 self-check without removal. Unlabelled containers, other values or near-name
 labels, nested images, nested named volumes, and retained workspace data remain

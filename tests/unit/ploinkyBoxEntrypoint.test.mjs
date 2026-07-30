@@ -231,6 +231,7 @@ function retainedContainerFixture(t, {
     running = false,
     status = 'exited',
     includeRegistry = true,
+    mutateRegistry = (record) => record,
     mutateLabels = (labels) => labels,
 } = {}) {
     const { paths } = fixture(t);
@@ -242,16 +243,15 @@ function retainedContainerFixture(t, {
         .digest('hex')
         .slice(0, 12);
     fs.mkdirSync(path.join(paths.workspace, '.ploinky'));
+    const registryRecord = mutateRegistry({
+        type: 'agent',
+        runtime: 'podman',
+        containerId,
+        instanceId,
+        enableGeneration,
+    });
     fs.writeFileSync(path.join(paths.workspace, '.ploinky', 'agents.json'), JSON.stringify(
-        includeRegistry ? {
-            ploinky_demo: {
-                type: 'agent',
-                runtime: 'podman',
-                containerId,
-                instanceId,
-                enableGeneration,
-            },
-        } : {},
+        includeRegistry ? { ploinky_demo: registryRecord } : {},
     ));
     const labels = mutateLabels({
         'io.assistos.ploinky.managed': '1',
@@ -336,6 +336,37 @@ test('entrypoint retires a stopped predecessor with a complete stale lifecycle p
         predecessor.calls.at(-1),
         ['run', 'podman', 'container', 'rm', predecessor.containerId],
     );
+});
+
+test('entrypoint retires only a fully superseded staged predecessor', (t) => {
+    const predecessor = retainedContainerFixture(t, {
+        mutateRegistry(record) {
+            return {
+                ...record,
+                containerId: 'c'.repeat(64),
+                instanceId: 'successor-instance',
+                enableGeneration: 'successor-generation',
+            };
+        },
+    });
+
+    assert.deepEqual(
+        retireStoppedManagedContainers(predecessor.paths, { runner: predecessor.runner }),
+        [predecessor.containerId],
+    );
+
+    const duplicateIdentity = retainedContainerFixture(t, {
+        mutateRegistry(record) {
+            return { ...record, containerId: 'c'.repeat(64) };
+        },
+    });
+    assert.throws(
+        () => retireStoppedManagedContainers(duplicateIdentity.paths, {
+            runner: duplicateIdentity.runner,
+        }),
+        /registry-container-id/,
+    );
+    assert.equal(duplicateIdentity.calls.some((call) => call[0] === 'run'), false);
 });
 
 test('entrypoint retires only a stopped legacy helper with the exact historical label', (t) => {

@@ -658,10 +658,12 @@ credentials and expiry through the private broker.
 Every Ploinky-created nested agent, helper, and sidecar container receives the
 exact ownership label `io.assistos.ploinky.managed=1`. On Box boot, the
 entrypoint enumerates that exact key/value and retires only non-running records
-whose immutable registry ownership is exact, including complete predecessor
-lifecycle pairs, or legacy helper records whose only Ploinky label is the
-historical managed marker. Running, paused, transitional, partially labelled,
-ambiguous, and foreign records fail the Box self-check without removal.
+whose immutable registry ownership is exact, or superseded predecessors whose
+name and stable labels are exact and whose immutable ID and complete lifecycle
+pair were both replaced in the registry. It also retires legacy helper records
+whose only Ploinky label is the historical managed marker. Running, paused,
+transitional, partially labelled, ambiguous, and foreign records fail the Box
+self-check without removal.
 Unlabelled, other-value, and near-name containers, nested images, nested named
 volumes, valid schema-2 networks, and retained workspace data remain untouched.
 Enumeration failure fails the box self-check. Manual containers have no Ploinky

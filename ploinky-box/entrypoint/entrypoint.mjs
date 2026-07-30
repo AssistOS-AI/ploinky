@@ -179,6 +179,7 @@ export function retireStoppedManagedContainers(paths, {
             && ploinkyLabelKeys.length === 1;
         const registeredInstanceId = String(registered?.instanceId || '');
         const registeredEnableGeneration = String(registered?.enableGeneration || '');
+        const registeredContainerId = String(registered?.containerId || '').trim().toLowerCase();
         const observedInstanceId = String(labels[MANAGED_CONTAINER_LABELS.instanceId] || '');
         const observedEnableGeneration = String(
             labels[MANAGED_CONTAINER_LABELS.enableGeneration] || '',
@@ -205,8 +206,7 @@ export function retireStoppedManagedContainers(paths, {
             Boolean(registered) || 'registry-record',
             ['agent', 'agentCore'].includes(registered?.type) || 'registry-type',
             registered?.runtime === 'podman' || 'registry-runtime',
-            String(registered?.containerId || '').trim().toLowerCase() === containerId
-                || 'registry-container-id',
+            registeredContainerId === containerId || 'registry-container-id',
             labels[MANAGED_CONTAINER_LABELS.managed] === '1' || 'managed-label',
             labels[MANAGED_CONTAINER_LABELS.resource] === 'agent' || 'resource-label',
             labels[MANAGED_CONTAINER_LABELS.schema] === NETWORK_SCHEMA_VERSION || 'schema-label',
@@ -220,7 +220,15 @@ export function retireStoppedManagedContainers(paths, {
             )
                 || 'lifecycle-ownership-labels',
         ].filter((value) => value !== true);
-        if (ownershipMismatches.length > 0 && !legacyHelperOwnership) {
+        const stagedPredecessorOwnership = staleLifecycleOwnership
+            && /^[a-f0-9]{64}$/.test(registeredContainerId)
+            && ownershipMismatches.length === 1
+            && ownershipMismatches[0] === 'registry-container-id';
+        if (
+            ownershipMismatches.length > 0
+            && !legacyHelperOwnership
+            && !stagedPredecessorOwnership
+        ) {
             throw entrypointError(
                 `Retained managed container ${containerId} does not match its exact registry ownership (${ownershipMismatches.join(', ')})`,
             );
