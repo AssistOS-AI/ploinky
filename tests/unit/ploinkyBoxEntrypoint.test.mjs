@@ -230,6 +230,7 @@ test('ready line is emitted exactly once and only after every required stage', (
 function retainedContainerFixture(t, {
     running = false,
     status = 'exited',
+    includeRegistry = true,
     mutateLabels = (labels) => labels,
 } = {}) {
     const { paths } = fixture(t);
@@ -241,15 +242,17 @@ function retainedContainerFixture(t, {
         .digest('hex')
         .slice(0, 12);
     fs.mkdirSync(path.join(paths.workspace, '.ploinky'));
-    fs.writeFileSync(path.join(paths.workspace, '.ploinky', 'agents.json'), JSON.stringify({
-        ploinky_demo: {
-            type: 'agent',
-            runtime: 'podman',
-            containerId,
-            instanceId,
-            enableGeneration,
-        },
-    }));
+    fs.writeFileSync(path.join(paths.workspace, '.ploinky', 'agents.json'), JSON.stringify(
+        includeRegistry ? {
+            ploinky_demo: {
+                type: 'agent',
+                runtime: 'podman',
+                containerId,
+                instanceId,
+                enableGeneration,
+            },
+        } : {},
+    ));
     const labels = mutateLabels({
         'io.assistos.ploinky.managed': '1',
         'io.assistos.ploinky.resource': 'agent',
@@ -333,6 +336,53 @@ test('entrypoint retires a stopped predecessor with a complete stale lifecycle p
         predecessor.calls.at(-1),
         ['run', 'podman', 'container', 'rm', predecessor.containerId],
     );
+});
+
+test('entrypoint retires only a stopped legacy helper with the exact historical label', (t) => {
+    const helper = retainedContainerFixture(t, {
+        includeRegistry: false,
+        mutateLabels() {
+            return { 'io.assistos.ploinky.managed': '1' };
+        },
+    });
+
+    assert.deepEqual(
+        retireStoppedManagedContainers(helper.paths, { runner: helper.runner }),
+        [helper.containerId],
+    );
+    assert.deepEqual(
+        helper.calls.at(-1),
+        ['run', 'podman', 'container', 'rm', helper.containerId],
+    );
+
+    const running = retainedContainerFixture(t, {
+        includeRegistry: false,
+        running: true,
+        status: 'running',
+        mutateLabels() {
+            return { 'io.assistos.ploinky.managed': '1' };
+        },
+    });
+    assert.throws(
+        () => retireStoppedManagedContainers(running.paths, { runner: running.runner }),
+        /exact stopped state/,
+    );
+    assert.equal(running.calls.some((call) => call[0] === 'run'), false);
+
+    const extraLabel = retainedContainerFixture(t, {
+        includeRegistry: false,
+        mutateLabels() {
+            return {
+                'io.assistos.ploinky.managed': '1',
+                'io.assistos.ploinky.unrecognized': '1',
+            };
+        },
+    });
+    assert.throws(
+        () => retireStoppedManagedContainers(extraLabel.paths, { runner: extraLabel.runner }),
+        /exact registry ownership/,
+    );
+    assert.equal(extraLabel.calls.some((call) => call[0] === 'run'), false);
 });
 
 test('entrypoint rejects running or ownership-drifted retained managed containers', (t) => {

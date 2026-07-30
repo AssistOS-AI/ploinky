@@ -170,6 +170,12 @@ export function retireStoppedManagedContainers(paths, {
         const observedName = String(record.Name || '').replace(/^\//, '');
         const registered = registry[observedName];
         const labels = record.Config?.Labels || record.Labels || {};
+        const ploinkyLabelKeys = Object.keys(labels)
+            .filter((key) => key.startsWith('io.assistos.ploinky.'));
+        const legacyHelperOwnership = !registered
+            && observedId === containerId
+            && labels[MANAGED_CONTAINER_LABELS.managed] === '1'
+            && ploinkyLabelKeys.length === 1;
         const registeredInstanceId = String(registered?.instanceId || '');
         const registeredEnableGeneration = String(registered?.enableGeneration || '');
         const observedInstanceId = String(labels[MANAGED_CONTAINER_LABELS.instanceId] || '');
@@ -213,7 +219,7 @@ export function retireStoppedManagedContainers(paths, {
             )
                 || 'lifecycle-ownership-labels',
         ].filter((value) => value !== true);
-        if (ownershipMismatches.length > 0) {
+        if (ownershipMismatches.length > 0 && !legacyHelperOwnership) {
             throw entrypointError(
                 `Retained managed container ${containerId} does not match its exact registry ownership (${ownershipMismatches.join(', ')})`,
             );
