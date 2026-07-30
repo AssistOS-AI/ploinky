@@ -657,21 +657,23 @@ credentials and expiry through the private broker.
 
 Every Ploinky-created nested agent, helper, and sidecar container receives the
 exact ownership label `io.assistos.ploinky.managed=1`. On Box boot, the
-entrypoint enumerates that exact key/value and rejects any retained managed
-record, including old managed agent and gateway records. It never deletes,
-imports, or translates them. Operators remove the managed records in the old
-box before explicit destroy/recreate. Unlabelled, other-value, and near-name
-containers, nested images, nested named volumes, and valid schema-2 networks
-remain untouched. Enumeration failure fails the box self-check. Manual
-containers have no Ploinky restart or repair guarantee.
+entrypoint enumerates that exact key/value and retires only non-running records
+whose immutable registry ownership is exact, including complete predecessor
+lifecycle pairs, or legacy helper records whose only Ploinky label is the
+historical managed marker. Running, paused, transitional, partially labelled,
+ambiguous, and foreign records fail the Box self-check without removal.
+Unlabelled, other-value, and near-name containers, nested images, nested named
+volumes, valid schema-2 networks, and retained workspace data remain untouched.
+Enumeration failure fails the box self-check. Manual containers have no Ploinky
+restart or repair guarantee.
 
-Because host destroy retains the `-containers` volume, retained managed state
-can make the same hard-cut rejection recur after recreation. Recovery is
-explicit: inspect and back up that named volume, remove managed containers in
-the old box before destroy, or—if recovery is impossible—remove only
+Because host destroy retains the `-containers` volume, an ambiguous or active
+retained record can make the same hard-cut rejection recur after recreation.
+Recovery remains explicit: inspect and back up that named volume, remove the
+record in the old box before destroy, or—if recovery is impossible—remove only
 `$INSTANCE-containers` from its owning engine after the box is absent and after
-accepting loss of cached nested images, records, and named volumes. The current runtime
-does not execute either destructive action.
+accepting loss of cached nested images, records, and named volumes. The runtime
+does not perform that data-loss recovery path.
 
 ## Host Sandbox Runtimes
 

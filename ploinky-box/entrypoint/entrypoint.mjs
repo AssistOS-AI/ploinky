@@ -92,6 +92,7 @@ const MANAGED_CONTAINER_LABELS = Object.freeze({
     instanceId: 'io.assistos.ploinky.instance-id',
     enableGeneration: 'io.assistos.ploinky.enable-generation',
 });
+const REMOVABLE_RETAINED_STATES = new Set(['configured', 'created', 'exited', 'stopped']);
 
 function readEntrypointAgentRegistry(workspaceRoot, fsApi) {
     const target = path.join(workspaceRoot, '.ploinky', 'agents.json');
@@ -224,9 +225,10 @@ export function retireStoppedManagedContainers(paths, {
                 `Retained managed container ${containerId} does not match its exact registry ownership (${ownershipMismatches.join(', ')})`,
             );
         }
-        if (record.State?.Running === true || String(record.State?.Status || '') !== 'exited') {
+        const retainedState = String(record.State?.Status || '').toLowerCase();
+        if (record.State?.Running === true || !REMOVABLE_RETAINED_STATES.has(retainedState)) {
             throw entrypointError(
-                `Retained managed container ${containerId} is not in the exact stopped state`,
+                `Retained managed container ${containerId} is not in an exact non-running removable state`,
             );
         }
         runner.run('podman', ['container', 'rm', containerId]);

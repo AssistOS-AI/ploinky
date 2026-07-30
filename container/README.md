@@ -196,14 +196,16 @@ even if older workspace state enabled them. Outside a box, existing runtime
 selection behavior remains unchanged.
 
 Every Ploinky-owned nested container carries the exact label
-`io.assistos.ploinky.managed=1`. Box boot enumerates that exact
-key/value and fails if any retained managed container remains; it never
-deletes, imports, or translates those records. The operator must stop/remove
-managed containers in the old box before explicitly destroying and recreating
-it. Unlabelled containers, other values or near-name labels, nested images, and
-nested named volumes remain untouched. Enumeration failure also fails the box
-self-check. Manual containers are outside Ploinky lifecycle ownership and are
-not promised automatic restart or repair.
+`io.assistos.ploinky.managed=1`. Box boot enumerates that exact key/value and
+retires only non-running records whose immutable registry ownership is exact,
+including complete predecessor lifecycle pairs, or legacy helper records whose
+only Ploinky label is the historical managed marker. Running, paused,
+transitional, partially labelled, ambiguous, and foreign records fail the Box
+self-check without removal. Unlabelled containers, other values or near-name
+labels, nested images, nested named volumes, and retained workspace data remain
+untouched. Enumeration failure also fails the self-check. Manual containers are
+outside Ploinky lifecycle ownership and are not promised automatic restart or
+repair.
 
 Before Podman opens the retained graph root, the entrypoint removes only its
 transient `/tmp/storage-run-<uid>` and `/tmp/podman-run-<uid>` process/lock

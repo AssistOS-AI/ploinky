@@ -365,9 +365,34 @@ test('entrypoint retires only a stopped legacy helper with the exact historical 
     });
     assert.throws(
         () => retireStoppedManagedContainers(running.paths, { runner: running.runner }),
-        /exact stopped state/,
+        /exact non-running removable state/,
     );
     assert.equal(running.calls.some((call) => call[0] === 'run'), false);
+
+    const configured = retainedContainerFixture(t, {
+        includeRegistry: false,
+        status: 'configured',
+        mutateLabels() {
+            return { 'io.assistos.ploinky.managed': '1' };
+        },
+    });
+    assert.deepEqual(
+        retireStoppedManagedContainers(configured.paths, { runner: configured.runner }),
+        [configured.containerId],
+    );
+
+    const paused = retainedContainerFixture(t, {
+        includeRegistry: false,
+        status: 'paused',
+        mutateLabels() {
+            return { 'io.assistos.ploinky.managed': '1' };
+        },
+    });
+    assert.throws(
+        () => retireStoppedManagedContainers(paused.paths, { runner: paused.runner }),
+        /exact non-running removable state/,
+    );
+    assert.equal(paused.calls.some((call) => call[0] === 'run'), false);
 
     const extraLabel = retainedContainerFixture(t, {
         includeRegistry: false,
@@ -389,7 +414,7 @@ test('entrypoint rejects running or ownership-drifted retained managed container
     const running = retainedContainerFixture(t, { running: true, status: 'running' });
     assert.throws(
         () => retireStoppedManagedContainers(running.paths, { runner: running.runner }),
-        /exact stopped state/,
+        /exact non-running removable state/,
     );
     assert.equal(running.calls.some((call) => call[0] === 'run'), false);
 
