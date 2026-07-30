@@ -15,6 +15,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const PLOINKY_BOX_MARKER_PATH = '/etc/ploinky-box';
 const PLOINKY_MANAGED_LABEL = 'io.assistos.ploinky.managed=1';
+const CONTAINER_CONTROL_PLANE_TIMEOUT_MS = 5_000;
 
 function isPloinkyBoxRuntime(markerPath = process.env.PLOINKY_BOX_MARKER_PATH || PLOINKY_BOX_MARKER_PATH) {
     try {
@@ -305,20 +306,52 @@ function getAgentContainerName(agentName, repoName) {
     return containerName;
 }
 
-function isContainerRunning(containerName) {
-    const runtime = probeContainerRuntime();
+function isContainerRunning(containerName, options = {}) {
+    const runtime = options.runtime || probeContainerRuntime();
     if (!runtime) return false;
-    const command = `${runtime} ps --format "{{.Names}}" | grep -x "${containerName}"`;
-    debugLog(`Checking if container is running with command: ${command}`);
+    debugLog(`Checking if container '${containerName}' is running via ${runtime}.`);
     try {
-        const result = execSync(command, { stdio: 'pipe' }).toString();
-        const running = result.trim().length > 0;
+        const running = listRunningContainerNames({
+            ...options,
+            runtime,
+        }).has(containerName);
         debugLog(`Container '${containerName}' is running: ${running}`);
         return running;
     } catch (error) {
-        debugLog(`Container '${containerName}' is not running (grep failed)`);
+        debugLog(`Unable to prove container '${containerName}' is running: ${error?.message || error}`);
         return false;
     }
+}
+
+function listRunningContainerNames(options = {}) {
+    const runtime = options.runtime || probeContainerRuntime();
+    if (!runtime) return new Set();
+    const spawnSyncImpl = options.spawnSyncImpl || spawnSync;
+    const result = spawnSyncImpl(
+        runtime,
+        ['ps', '--format', '{{.Names}}'],
+        {
+            encoding: 'utf8',
+            stdio: ['ignore', 'pipe', 'pipe'],
+            timeout: options.timeoutMs || CONTAINER_CONTROL_PLANE_TIMEOUT_MS,
+            killSignal: 'SIGKILL',
+        },
+    );
+    if (result.error || result.status !== 0) {
+        const detail = String(
+            result.error?.message
+            || result.stderr
+            || result.stdout
+            || `exit ${result.status ?? 'unknown'}`,
+        ).trim();
+        throw new Error(`cannot list running containers: ${detail}`);
+    }
+    return new Set(
+        String(result.stdout || '')
+            .split(/\r?\n/)
+            .map((name) => name.trim().replace(/^\//, ''))
+            .filter(Boolean),
+    );
 }
 
 function containerExists(containerName) {
@@ -575,19 +608,41 @@ function getContainerLabel(containerName, key) {
     }
 }
 
-function waitForContainerRunning(containerName, maxAttempts = 20, delayMs = 250) {
-    const runtime = requireContainerRuntime();
+function waitForContainerRunning(containerName, maxAttempts = 20, delayMs = 250, options = {}) {
+    const runtime = options.runtime || requireContainerRuntime();
+    const spawnSyncImpl = options.spawnSyncImpl || spawnSync;
+    const sleepMsImpl = options.sleepMsImpl || sleepMs;
+    const totalTimeoutMs = options.totalTimeoutMs
+        || Math.max(1, maxAttempts * Math.max(1, delayMs));
+    const deadline = Date.now() + totalTimeoutMs;
     for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+        const remainingMs = deadline - Date.now();
+        if (remainingMs <= 0) break;
         try {
-            const status = execSync(`${runtime} inspect ${containerName} --format '{{ .State.Status }}'`, { stdio: 'pipe' })
-                .toString()
+            const result = spawnSyncImpl(
+                runtime,
+                ['inspect', containerName, '--format', '{{ .State.Status }}'],
+                {
+                    encoding: 'utf8',
+                    stdio: ['ignore', 'pipe', 'pipe'],
+                    timeout: Math.max(1, Math.min(
+                        options.timeoutMs || CONTAINER_CONTROL_PLANE_TIMEOUT_MS,
+                        remainingMs,
+                    )),
+                    killSignal: 'SIGKILL',
+                },
+            );
+            const status = String(result.stdout || '')
                 .trim()
                 .toLowerCase();
-            if (status === 'running') {
+            if (!result.error && result.status === 0 && status === 'running') {
                 return true;
             }
         } catch (_) {}
-        sleepMs(delayMs);
+        const remainingAfterInspectMs = deadline - Date.now();
+        if (attempt + 1 < maxAttempts && remainingAfterInspectMs > 0) {
+            sleepMsImpl(Math.min(delayMs, remainingAfterInspectMs));
+        }
     }
     return false;
 }
@@ -625,6 +680,7 @@ export {
     getHostSandboxDisableHint,
     getHostSandboxInstallHint,
     isContainerRunning,
+    listRunningContainerNames,
     isPloinkyBoxRuntime,
     isSandboxRuntime,
     probeContainerRuntime,

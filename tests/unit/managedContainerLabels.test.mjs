@@ -60,6 +60,7 @@ test('persistent agent run builder carries the exact managed label', () => {
         cwdMountTarget: '/root',
     });
     assertExactManagedArgv(args);
+    assert.equal(args.filter((value) => value === '--init').length, 1);
 });
 
 test('both interactive create/retry command families carry the exact managed label', () => {

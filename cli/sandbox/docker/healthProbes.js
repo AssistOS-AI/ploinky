@@ -1,4 +1,5 @@
 import { spawnSync } from 'child_process';
+import { randomUUID } from 'node:crypto';
 import { parentPort } from 'worker_threads';
 import {
     getRuntime,
@@ -11,6 +12,13 @@ const DEFAULT_INTERVAL_SECONDS = 1;
 const DEFAULT_TIMEOUT_SECONDS = 5;
 const DEFAULT_FAILURE_THRESHOLD = 5;
 const DEFAULT_SUCCESS_THRESHOLD = 1;
+const DEFAULT_PROBE_KILL_GRACE_SECONDS = 1;
+const PROBE_CONTROL_PLANE_GRACE_MS = 15_000;
+const PROBE_CONTROL_PLANE_TIMEOUT_MS = 5_000;
+const PROBE_CONTAINER_WAIT_TIMEOUT_MS = 10_000;
+const PROBE_CLEANUP_TIMEOUT_MS = 5_000;
+const PROBE_RUNNER_PATH = '/Agent/server/HealthProbeRunner.sh';
+const PROBE_MARKER_PREFIX = '/tmp/.ploinky-health-probe-';
 const BACKOFF_BASE_DELAY_MS = 10_000;
 const BACKOFF_MAX_DELAY_MS = 300_000;
 const BACKOFF_RESET_MS = 600_000;
@@ -63,27 +71,111 @@ function normalizeProbeConfig(type, manifestProbeConfig = null) {
         interval: coercePositiveNumber(manifestProbeConfig.interval, DEFAULT_INTERVAL_SECONDS),
         timeout: coercePositiveNumber(manifestProbeConfig.timeout, DEFAULT_TIMEOUT_SECONDS),
         failureThreshold: coercePositiveInteger(manifestProbeConfig.failureThreshold, DEFAULT_FAILURE_THRESHOLD),
-        successThreshold: coercePositiveInteger(manifestProbeConfig.successThreshold, DEFAULT_SUCCESS_THRESHOLD)
+        successThreshold: coercePositiveInteger(manifestProbeConfig.successThreshold, DEFAULT_SUCCESS_THRESHOLD),
+        continuous: manifestProbeConfig.continuous !== false,
     };
+}
+
+function probeToken(options = {}) {
+    const createToken = options.tokenFactory || randomUUID;
+    const token = String(createToken()).trim();
+    if (!/^[A-Za-z0-9._-]+$/.test(token)) {
+        throw new Error('[probe] generated probe token is invalid');
+    }
+    return token;
+}
+
+function cleanupExactProbe(agentName, containerName, markerPath, token, options = {}) {
+    const runtime = options.runtime || getRuntime();
+    const spawnSyncImpl = options.spawnSyncImpl || spawnSync;
+    const cleanupRes = spawnSyncImpl(
+        runtime,
+        [
+            'exec',
+            containerName,
+            'sh',
+            PROBE_RUNNER_PATH,
+            'cleanup',
+            markerPath,
+            token,
+        ],
+        {
+            encoding: 'utf8',
+            stdio: ['ignore', 'pipe', 'pipe'],
+            timeout: options.cleanupTimeoutMs || PROBE_CLEANUP_TIMEOUT_MS,
+            killSignal: 'SIGKILL',
+        },
+    );
+    if (cleanupRes.error || cleanupRes.status !== 0) {
+        const detail = String(
+            cleanupRes.error?.message
+            || cleanupRes.stderr
+            || cleanupRes.stdout
+            || `exit ${cleanupRes.status ?? 'unknown'}`,
+        ).trim();
+        const error = new Error(
+            `[probe] ${agentName}: exact probe cleanup failed for '${containerName}': ${detail}`,
+        );
+        error.code = 'PLOINKY_PROBE_CLEANUP_FAILED';
+        throw error;
+    }
 }
 
 function runProbeOnce(agentName, containerName, probe, options = {}) {
     const runtime = options.runtime || getRuntime();
     const spawnSyncImpl = options.spawnSyncImpl || spawnSync;
-    const execCommand = ['exec', containerName, 'sh', '-lc', `cd /code && sh "./${probe.script}"`];
+    const token = probeToken(options);
+    const markerPath = `${PROBE_MARKER_PREFIX}${token}`;
+    const killGraceSeconds = coercePositiveNumber(
+        options.killGraceSeconds,
+        DEFAULT_PROBE_KILL_GRACE_SECONDS,
+    );
+    const execCommand = [
+        'exec',
+        containerName,
+        'sh',
+        PROBE_RUNNER_PATH,
+        'run',
+        markerPath,
+        token,
+        probe.script,
+        String(probe.timeout),
+        String(killGraceSeconds),
+    ];
     const execRes = spawnSyncImpl(
         runtime,
         execCommand,
-        { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: probe.timeout * 1000 }
+        {
+            encoding: 'utf8',
+            stdio: ['ignore', 'pipe', 'pipe'],
+            timeout: Math.ceil(probe.timeout * 1000) + PROBE_CONTROL_PLANE_GRACE_MS,
+            killSignal: 'SIGKILL',
+        },
     );
-    if (execRes.error && execRes.error.code !== 'ETIMEDOUT') {
-        throw new Error(`[probe] ${agentName}: failed to run '${probe.script}': ${execRes.error.message || execRes.error}`);
-    }
-
     const stdout = (execRes.stdout || '').trim();
     const stderr = (execRes.stderr || '').trim();
-    const timedOut = Boolean(execRes.error && execRes.error.code === 'ETIMEDOUT');
-    const exitCode = typeof execRes.status === 'number' ? execRes.status : (timedOut ? 124 : 0);
+    const outerTimedOut = Boolean(execRes.error && execRes.error.code === 'ETIMEDOUT');
+    const outerCompletionUncertain = Boolean(execRes.error)
+        || typeof execRes.status !== 'number';
+    if (outerCompletionUncertain) {
+        cleanupExactProbe(agentName, containerName, markerPath, token, options);
+    }
+    if (execRes.error && !outerTimedOut) {
+        throw new Error(`[probe] ${agentName}: failed to run '${probe.script}': ${execRes.error.message || execRes.error}`);
+    }
+    if (execRes.status === 125) {
+        cleanupExactProbe(agentName, containerName, markerPath, token, options);
+        const detail = String(stderr || stdout || 'runner exited 125').trim();
+        const error = new Error(
+            `[probe] ${agentName}: exact cleanup was not proved for '${probe.script}': ${detail}`,
+        );
+        error.code = 'PLOINKY_PROBE_EXECUTION_UNSAFE';
+        throw error;
+    }
+    const timedOut = outerTimedOut || execRes.status === 124;
+    const exitCode = typeof execRes.status === 'number'
+        ? execRes.status
+        : (timedOut ? 124 : 125);
 
     return {
         success: !timedOut && exitCode === 0,
@@ -101,11 +193,21 @@ function ensureScriptExists(agentName, containerName, probe, options = {}) {
     const exists = spawnSyncImpl(
         runtime,
         ['exec', containerName, 'sh', '-lc', `[ -f "${scriptPath}" ]`],
-        { stdio: 'ignore' }
+        {
+            stdio: 'ignore',
+            timeout: options.controlPlaneTimeoutMs || PROBE_CONTROL_PLANE_TIMEOUT_MS,
+            killSignal: 'SIGKILL',
+        },
     );
 
     if (exists.error) {
-        throw new Error(`[probe] ${agentName}: unable to inspect ${probe.script}: ${exists.error.message || exists.error}`);
+        const error = new Error(
+            `[probe] ${agentName}: unable to inspect ${probe.script}: ${exists.error.message || exists.error}`,
+        );
+        error.code = exists.error.code === 'ETIMEDOUT'
+            ? 'PLOINKY_PROBE_CONTROL_PLANE_TIMEOUT'
+            : 'PLOINKY_PROBE_CONTROL_PLANE_FAILED';
+        throw error;
     }
 
     if (exists.status !== 0) {
@@ -115,12 +217,14 @@ function ensureScriptExists(agentName, containerName, probe, options = {}) {
 
 function runProbeLoop(agentName, containerName, type, probe, options = {}) {
     ensureScriptExists(agentName, containerName, probe, options);
-    postProbeLog('info', `[probe] ${agentName}: ${type} probe -> script='${probe.script}', interval=${probe.interval}s, timeout=${probe.timeout}s, successThreshold=${probe.successThreshold}, failureThreshold=${probe.failureThreshold}`);
+    postProbeLog('info', `[probe] ${agentName}: ${type} probe -> script='${probe.script}', interval=${probe.interval}s, timeout=${probe.timeout}s, successThreshold=${probe.successThreshold}, failureThreshold=${probe.failureThreshold}, continuous=${probe.continuous}`);
     let consecutiveSuccesses = 0;
     let consecutiveFailures = 0;
     while (true) {
         const isContainerRunningImpl = options.isContainerRunningImpl || isContainerRunning;
-        if (!isContainerRunningImpl(containerName)) {
+        if (!isContainerRunningImpl(containerName, {
+            timeoutMs: options.controlPlaneTimeoutMs || PROBE_CONTROL_PLANE_TIMEOUT_MS,
+        })) {
             return {
                 status: 'failed',
                 reason: 'container exited',
@@ -199,7 +303,7 @@ export function clearLivenessState(containerName) {
     LIVENESS_BACKOFF_STATE.delete(containerName);
 }
 
-function ensureLiveness(agentName, containerName, probe) {
+function ensureLiveness(agentName, containerName, probe, options = {}) {
     if (!probe) {
         postProbeLog('info', `[probe] ${agentName}: no liveness probe declared. Assuming live.`);
         clearLivenessState(containerName);
@@ -211,7 +315,7 @@ function ensureLiveness(agentName, containerName, probe) {
         state.startedAt = Date.now();
     }
 
-    const result = runProbeLoop(agentName, containerName, 'liveness', probe);
+    const result = runProbeLoop(agentName, containerName, 'liveness', probe, options);
     if (result.status === 'success') {
         postProbeLog('info', `[probe] ${agentName}: liveness confirmed.`);
         clearLivenessState(containerName);
@@ -226,31 +330,48 @@ function ensureLiveness(agentName, containerName, probe) {
     throw error;
 }
 
-function ensureReadiness(agentName, containerName, probe) {
+function ensureReadiness(agentName, containerName, probe, options = {}) {
     if (!probe) {
         postProbeLog('info', `[probe] ${agentName}: no readiness probe declared. Assuming ready.`);
         return;
     }
 
-    const result = runProbeLoop(agentName, containerName, 'readiness', probe);
+    const result = runProbeLoop(agentName, containerName, 'readiness', probe, options);
     if (result.status === 'success') {
         postProbeLog('info', `[probe] ${agentName}: readiness confirmed.`);
         return;
     }
 
     const detail = `${result.reason}${result.detail ? `, output='${result.detail}'` : ''}`;
-    const yellow = (msg) => `\x1b[33m${msg}\x1b[0m`;
-    console.warn(yellow(`[probe] ${agentName}: Container failed to become ready (${detail}).`));
+    const error = new Error(
+        `[probe] ${agentName}: readiness probe failed (${detail}); managed restart required`,
+    );
+    error.code = 'PLOINKY_READINESS_FAILED';
+    throw error;
 }
 
-export function runHealthProbes(agentName, containerName, manifest = {}) {
-    if (!waitForContainerRunning(containerName, 40, 250)) {
+export function runHealthProbes(agentName, containerName, manifest = {}, options = {}) {
+    const waitForRunning = options.waitForContainerRunningImpl || waitForContainerRunning;
+    if (!waitForRunning(containerName, 40, 250, {
+        timeoutMs: options.controlPlaneTimeoutMs || PROBE_CONTROL_PLANE_TIMEOUT_MS,
+        totalTimeoutMs: options.containerWaitTimeoutMs || PROBE_CONTAINER_WAIT_TIMEOUT_MS,
+    })) {
         throw new Error(`[probe] ${agentName}: failed to start; container is not running.`);
     }
 
     const healthConfig = manifest?.health || {};
     const livenessProbe = normalizeProbeConfig('liveness', healthConfig.liveness);
-    const readinessProbe = normalizeProbeConfig('readiness', healthConfig.readiness);
+    const configuredReadinessProbe = normalizeProbeConfig('readiness', healthConfig.readiness);
+    const readinessProbe = configuredReadinessProbe?.continuous === false
+        ? null
+        : configuredReadinessProbe;
+    if (configuredReadinessProbe?.continuous === false && !livenessProbe) {
+        const error = new Error(
+            `[probe] ${agentName}: activation-only readiness requires a recurring health.liveness.script.`,
+        );
+        error.code = 'PLOINKY_CONTINUOUS_PROBE_REQUIRED';
+        throw error;
+    }
 
     if (livenessProbe) {
         noteContainerStarted(containerName);
@@ -263,8 +384,12 @@ export function runHealthProbes(agentName, containerName, manifest = {}) {
         return;
     }
 
-    ensureLiveness(agentName, containerName, livenessProbe);
-    ensureReadiness(agentName, containerName, readinessProbe);
+    ensureLiveness(agentName, containerName, livenessProbe, options);
+    if (!readinessProbe && configuredReadinessProbe) {
+        postProbeLog('info', `[probe] ${agentName}: readiness is activation-only (continuous=false); recurring cycle relies on liveness.`);
+        return;
+    }
+    ensureReadiness(agentName, containerName, readinessProbe, options);
 }
 
 export { normalizeProbeConfig, runContainerScriptReadiness };
@@ -274,7 +399,10 @@ export const __testHooks = {
     coercePositiveInteger,
     validateScriptName,
     normalizeProbeConfig,
+    runProbeOnce,
     runContainerScriptReadiness,
+    cleanupExactProbe,
+    probeToken,
     computeBackoffDelay,
     maybeResetBackoff,
     getLivenessState,
@@ -287,6 +415,11 @@ export const __testConstants = {
     DEFAULT_TIMEOUT_SECONDS,
     DEFAULT_FAILURE_THRESHOLD,
     DEFAULT_SUCCESS_THRESHOLD,
+    DEFAULT_PROBE_KILL_GRACE_SECONDS,
+    PROBE_CONTROL_PLANE_GRACE_MS,
+    PROBE_CLEANUP_TIMEOUT_MS,
+    PROBE_RUNNER_PATH,
+    PROBE_MARKER_PREFIX,
     BACKOFF_BASE_DELAY_MS,
     BACKOFF_MAX_DELAY_MS,
     BACKOFF_RESET_MS

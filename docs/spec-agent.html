@@ -797,11 +797,12 @@ app.get('/mcp/status', (req, res) => {
     "readiness": {
       "script": "readiness_probe.sh",
       "timeout": 5,
-      "failureThreshold": 5
+      "failureThreshold": 5,
+      "continuous": false
     }
   }
 }</code></pre>
-                        <p>Scripts must live in the agent root (mounted as <code>/code</code>) and return exit code 0 for success. <code>interval</code> controls how often the probe runs (seconds), <code>timeout</code> caps each execution, and the thresholds set how many consecutive results are required. During startup an explicit manifest <code>readiness.protocol</code> of <code>tcp</code>, <code>mcp</code>, or <code>none</code> wins. Without an explicit protocol, a start-only service with <code>health.readiness.script</code> uses that script as its blocking startup probe. A configured but missing script, execution error, or exhausted failure threshold fails the dependency wave and prevents its dependents from starting. Later watchdog reuse of the readiness probe is warning-oriented; that does not weaken the blocking startup decision. Repeated liveness failures trigger automatic container restarts that follow a CrashLoopBackOff curve (base 10s delay, doubling up to five minutes, reset after 10 minutes of stable uptime or any manual stop/restart/refresh).</p>
+                        <p>Scripts must live in the agent root (mounted as <code>/code</code>) and return exit code 0 for success. <code>interval</code> controls how often the probe runs (seconds), <code>timeout</code> caps each execution, and the thresholds set how many consecutive results are required. During startup an explicit manifest <code>readiness.protocol</code> of <code>tcp</code>, <code>mcp</code>, or <code>none</code> wins. Without an explicit protocol, a start-only service with <code>health.readiness.script</code> uses that script as its blocking startup probe. A configured but missing script, execution error, or exhausted failure threshold fails the dependency wave and prevents its dependents from starting. Later watchdog reuse of readiness is fail-closed by default: an exhausted recurring readiness or liveness probe inactivates routing and schedules managed recovery. Setting readiness <code>continuous: false</code> keeps an expensive full readiness attestation activation-only and requires a separate recurring liveness script. Every probe has an in-container hard deadline, runs in an exact process session inside an init-reaped managed container, and fails closed when process-tree cleanup cannot be proved. Repeated health failures trigger automatic container restarts that follow a CrashLoopBackOff curve (base 10s delay, doubling up to five minutes, reset after 10 minutes of stable uptime or any manual stop/restart/refresh).</p>
                     </div>
 
                     <div class="doc-section">

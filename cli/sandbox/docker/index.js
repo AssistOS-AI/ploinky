@@ -42,6 +42,7 @@ export {
     getConfiguredProjectPath,
     getRuntime,
     isContainerRunning,
+    listRunningContainerNames,
     parseManifestPorts,
     waitForContainerRunning
 } from './common.js';

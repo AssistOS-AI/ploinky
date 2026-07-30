@@ -114,6 +114,7 @@ function managedAgentRecord({ id, name, labels, networks, running = false, hosts
         Name: name,
         Config: { Labels: labels, CreateCommand: ['podman', 'create', '--arbitrary-history'] },
         HostConfig: {
+            Init: true,
             HostsFile: hostsFile,
             ExtraHosts: extraHosts || ['host.containers.internal:host-gateway'],
             ...(networkMode ? { NetworkMode: networkMode } : {}),
@@ -498,6 +499,40 @@ test('runtime identity labels bind inspection and label construction to the exac
     assert.throws(
         () => harness.adapter.finalizeContainer('demo-container', { mode: 'host', attachments: [] }),
         /requires exact ownership and runtime-identity labels/,
+    );
+});
+
+test('managed reuse and finalize fail closed when the init reaper is absent', (t) => {
+    const harness = networkHarness(t);
+    const network = canonicalizeNetwork({ mode: 'host' });
+    const id = 'withoutinit123456';
+    const record = managedAgentRecord({
+        id,
+        name: 'demo-container',
+        labels: managedAgentLabels(harness.identity, network),
+        networks: {},
+        networkMode: 'host',
+        running: true,
+    });
+    record.HostConfig.Init = false;
+    harness.containers.set(id, record);
+
+    assert.deepEqual(
+        harness.adapter.inspectContainerContract('demo-container', network, 'demo', {
+            contractHash: networkContractHash(network),
+        }),
+        { state: 'owned-drift', id, reason: 'init-reaper' },
+    );
+    assert.throws(
+        () => harness.adapter.finalizeContainer(
+            'demo-container',
+            harness.adapter.preflight(network, 'demo'),
+            {
+                network,
+                runtimeIdentity: TEST_RUNTIME_IDENTITY,
+            },
+        ),
+        /must use the managed init reaper/,
     );
 });
 

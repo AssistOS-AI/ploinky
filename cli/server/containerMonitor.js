@@ -15,7 +15,7 @@ import {
 import {
     cleanupExactAgentRuntimeCandidate,
     ensureAgentService,
-    isContainerRunning,
+    listRunningContainerNames,
 } from '../sandbox/docker/index.js';
 import { shouldMonitorManifestRuntime } from '../utils/runtime/manifestStartup.js';
 import { isSandboxRuntime } from '../sandbox/docker/common.js';
@@ -141,7 +141,7 @@ function handleProbeFailure(monitor, target, message, { runtimeHealth = false } 
     }
 }
 
-function startProbeWorker(monitor, target) {
+export function startProbeWorker(monitor, target) {
     if (!monitor || !target) return;
     if (target.circuitBreakerTripped) return;
     if (target.probeWorker || target.probeState === 'success') return;
@@ -161,7 +161,8 @@ function startProbeWorker(monitor, target) {
     }
 
     try {
-        target.probeWorker = new Worker(PROBE_WORKER_URL, {
+        const WorkerClass = monitor.Worker || Worker;
+        target.probeWorker = new WorkerClass(PROBE_WORKER_URL, {
             workerData: {
                 agentName: target.agentName,
                 containerName: target.containerName,
@@ -808,10 +809,28 @@ export async function performContainerRestart(monitor, target, reason) {
     target.isRestarting = false;
 }
 
-function monitorTick(monitor) {
+export function snapshotRunningContainerNames(monitor) {
+    if (![...monitor.targets.values()].some((target) => (
+        target && !isSandboxRuntime(target.runtime)
+    ))) {
+        return null;
+    }
+    try {
+        const listRunning = monitor.listRunningContainerNames || listRunningContainerNames;
+        return new Set(listRunning());
+    } catch (error) {
+        logEvent(monitor, 'error', 'container_status_snapshot_failed', {
+            error: error?.message || error,
+        });
+        return null;
+    }
+}
+
+export function monitorTick(monitor) {
     if (!monitor || monitor.isShuttingDown()) return;
 
-    const workspaceStart = inspectWorkspaceStartLock();
+    const inspectStartLock = monitor.inspectWorkspaceStartLock || inspectWorkspaceStartLock;
+    const workspaceStart = inspectStartLock();
     if (workspaceStart.stale) {
         logEvent(monitor, 'info', 'workspace_start_lock_removed', {
             ownerPid: workspaceStart.lock?.ownerPid || null,
@@ -830,7 +849,10 @@ function monitorTick(monitor) {
     }
     monitor.workspaceStartDeferred = false;
 
-    syncManagedContainers(monitor);
+    const syncContainers = monitor.syncManagedContainers || syncManagedContainers;
+    syncContainers(monitor);
+
+    const runningContainerNames = snapshotRunningContainerNames(monitor);
 
     for (const target of monitor.targets.values()) {
         if (!target || target.circuitBreakerTripped) continue;
@@ -844,8 +866,13 @@ function monitorTick(monitor) {
                         instanceId: target.instanceId,
                         enableGeneration: target.enableGeneration,
                     });
+            } else if (runningContainerNames) {
+                running = runningContainerNames.has(target.containerName);
             } else {
-                running = isContainerRunning(target.containerName);
+                // A failed shared runtime snapshot means container state is
+                // unknown. Defer this tick instead of multiplying the outage
+                // into one blocking runtime call (or false restart) per target.
+                continue;
             }
         } catch (error) {
             logEvent(monitor, 'error', 'container_status_check_failed', {
@@ -882,7 +909,8 @@ function monitorTick(monitor) {
                     || now - target.probeLastSuccessAt >= continuousProbeIntervalMs)) {
                 target.probeState = 'pending';
             }
-            startProbeWorker(monitor, target);
+            const startWorker = monitor.startProbeWorker || startProbeWorker;
+            startWorker(monitor, target);
             continue;
         }
 

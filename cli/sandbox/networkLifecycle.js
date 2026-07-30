@@ -724,6 +724,9 @@ export function createNetworkLifecycleAdapter({
             throw new Error(`container '${containerName}' changed identity during managed verification`);
         }
         assertRequiredLabels(containerName, labelsOf(record), expectedLabels);
+        if (record?.HostConfig?.Init !== true) {
+            throw new Error(`container '${containerName}' must use the managed init reaper`);
+        }
         const managedMode = plan?.mode === 'default' || plan?.mode === 'bridge';
         if (!managedMode && String(record.HostConfig?.NetworkMode || '') !== plan.mode) {
             throw new Error(`container '${containerName}' network mode is unsupported`);
@@ -963,6 +966,9 @@ export function createNetworkLifecycleAdapter({
                 || String(labels?.[NETWORK_LABELS.enableGeneration] || '') !== expectedEnableGeneration) {
                 return { state: 'owned-drift', id, reason: 'runtime-identity' };
             }
+        }
+        if (record?.HostConfig?.Init !== true) {
+            return { state: 'owned-drift', id, reason: 'init-reaper' };
         }
         const contract = canonicalizeNetwork(network, { path: 'network' });
         const managedMode = contract.mode === 'default' || contract.mode === 'bridge';

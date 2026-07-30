@@ -521,7 +521,7 @@ process.stdout.write(JSON.stringify([{
   Id: 'candidate1234567890',
   Name: fs.readFileSync(statePath, 'utf8').trim(),
   Config: { Labels: labels },
-  HostConfig: { NetworkMode: 'none' },
+  HostConfig: { Init: args.includes('--init'), NetworkMode: 'none' },
   NetworkSettings: { Networks: {} },
   State: { Running: running, Status: running ? 'running' : 'configured' },
 }]));
@@ -614,6 +614,7 @@ console.log(JSON.stringify(record));`,
         assert.equal(record.runMode, 'global');
         assert.equal(record.projectPath, workspaceDir);
         assert.deepEqual(record.config.ports, []);
+        assert.match(fs.readFileSync(argsFile, 'utf8'), /(?:^|\n)--init(?:\n|$)/);
         assert.doesNotMatch(fs.readFileSync(argsFile, 'utf8'), /(?:^|:)7000(?:$|\s)/);
         assert.ok(record.config.binds.some((bind) => (
             bind.source === workspaceDir && bind.target === workspaceDir

@@ -707,7 +707,7 @@ function buildPersistentAgentRunArgs({
 } = {}) {
     const nodeModulesMount = runtime === 'podman' ? ':z,ro' : ':ro';
     const args = [
-        'run', '-d', '--name', containerName,
+        'run', '-d', '--init', '--name', containerName,
         ...managedContainerLabelArgs(),
         '--label', `ploinky.envhash=${envHash}`,
         '-w', containerWorkdir,
