@@ -170,6 +170,24 @@ export function retireStoppedManagedContainers(paths, {
         const observedName = String(record.Name || '').replace(/^\//, '');
         const registered = registry[observedName];
         const labels = record.Config?.Labels || record.Labels || {};
+        const registeredInstanceId = String(registered?.instanceId || '');
+        const registeredEnableGeneration = String(registered?.enableGeneration || '');
+        const observedInstanceId = String(labels[MANAGED_CONTAINER_LABELS.instanceId] || '');
+        const observedEnableGeneration = String(
+            labels[MANAGED_CONTAINER_LABELS.enableGeneration] || '',
+        );
+        const hasRegisteredLifecycleOwnership = Boolean(
+            registeredInstanceId && registeredEnableGeneration,
+        );
+        const exactLifecycleOwnership = hasRegisteredLifecycleOwnership
+            && observedInstanceId === registeredInstanceId
+            && observedEnableGeneration === registeredEnableGeneration;
+        // Containers created before lifecycle labels were emitted still have
+        // exact immutable registry ownership. Accept only the all-absent label
+        // shape so the stopped predecessor can be retired during upgrade.
+        const legacyLifecycleOwnership = hasRegisteredLifecycleOwnership
+            && observedInstanceId === ''
+            && observedEnableGeneration === '';
         const ownershipMismatches = [
             observedId === containerId || 'container-id',
             Boolean(registered) || 'registry-record',
@@ -183,14 +201,8 @@ export function retireStoppedManagedContainers(paths, {
             labels[MANAGED_CONTAINER_LABELS.workspace] === workspaceHash || 'workspace-label',
             /^[a-f0-9]{64}$/.test(String(labels[MANAGED_CONTAINER_LABELS.contract] || ''))
                 || 'contract-label',
-            Boolean(String(registered?.instanceId || ''))
-                && String(labels[MANAGED_CONTAINER_LABELS.instanceId] || '')
-                    === String(registered.instanceId)
-                || 'instance-label',
-            Boolean(String(registered?.enableGeneration || ''))
-                && String(labels[MANAGED_CONTAINER_LABELS.enableGeneration] || '')
-                    === String(registered.enableGeneration)
-                || 'enable-generation-label',
+            (exactLifecycleOwnership || legacyLifecycleOwnership)
+                || 'lifecycle-ownership-labels',
         ].filter((value) => value !== true);
         if (ownershipMismatches.length > 0) {
             throw entrypointError(

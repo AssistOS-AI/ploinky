@@ -294,6 +294,26 @@ test('entrypoint retires only an exact stopped managed container without touchin
     assert.equal(calls.some((call) => call.includes('-f') || call.includes('--volumes')), false);
 });
 
+test('entrypoint retires a stopped pre-lifecycle-label container with exact legacy ownership', (t) => {
+    const legacy = retainedContainerFixture(t, {
+        mutateLabels(labels) {
+            const copy = { ...labels };
+            delete copy['io.assistos.ploinky.instance-id'];
+            delete copy['io.assistos.ploinky.enable-generation'];
+            return copy;
+        },
+    });
+
+    assert.deepEqual(
+        retireStoppedManagedContainers(legacy.paths, { runner: legacy.runner }),
+        [legacy.containerId],
+    );
+    assert.deepEqual(
+        legacy.calls.at(-1),
+        ['run', 'podman', 'container', 'rm', legacy.containerId],
+    );
+});
+
 test('entrypoint rejects running or ownership-drifted retained managed containers', (t) => {
     const running = retainedContainerFixture(t, { running: true, status: 'running' });
     assert.throws(
@@ -312,6 +332,21 @@ test('entrypoint rejects running or ownership-drifted retained managed container
         /exact registry ownership/,
     );
     assert.equal(drifted.calls.some((call) => call[0] === 'run'), false);
+
+    const partiallyLabeled = retainedContainerFixture(t, {
+        mutateLabels(labels) {
+            const copy = { ...labels };
+            delete copy['io.assistos.ploinky.enable-generation'];
+            return copy;
+        },
+    });
+    assert.throws(
+        () => retireStoppedManagedContainers(partiallyLabeled.paths, {
+            runner: partiallyLabeled.runner,
+        }),
+        /lifecycle-ownership-labels/,
+    );
+    assert.equal(partiallyLabeled.calls.some((call) => call[0] === 'run'), false);
 
     const statusSchema = retainedContainerFixture(t, {
         mutateLabels(labels) {
