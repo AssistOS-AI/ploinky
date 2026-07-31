@@ -2259,6 +2259,55 @@ export function captureEdgeRoutingLease(options = {}) {
     });
 }
 
+export function captureEdgeRoutingObservationLease({ expectedGeneration, ...options } = {}) {
+    const expected = String(expectedGeneration || '');
+    if (!/^sha256:[a-f0-9]{64}$/.test(expected)) {
+        throw edgeError(
+            'Router authority observation requires one exact registered generation',
+            'EDGE_GENERATION_INVALID',
+        );
+    }
+    const paths = resolveEdgeGenerationPaths(options);
+    const capture = () => {
+        const selector = readSelector(paths);
+        if (!selector || selector.generation !== expected || !selector.activationId) {
+            throw edgeError(
+                'registered Router authority observation generation is no longer selected',
+                'EDGE_GENERATION_RACE',
+            );
+        }
+        const generation = selector.state === 'active'
+            ? loadActiveEdgeRoutingGeneration(options).generation
+            : loadGenerationById(paths, expected);
+        if (generation.routerHostPort !== selectedRouterHostPort()) {
+            throw edgeError(
+                'registered Router authority observation generation targets a different physical Router port',
+                'EDGE_GENERATION_RUNTIME_MISMATCH',
+            );
+        }
+        return { selector, generation };
+    };
+    const initial = capture();
+    const isCurrent = () => {
+        try {
+            const current = capture();
+            return current.selector.state === initial.selector.state
+                && current.selector.generation === initial.selector.generation
+                && current.selector.activationId === initial.selector.activationId
+                && current.selector.selectorDigest === initial.selector.selectorDigest;
+        } catch (_) {
+            return false;
+        }
+    };
+    return Object.freeze({
+        id: expected,
+        activationId: initial.selector.activationId,
+        snapshot: initial.generation,
+        commit: isCurrent,
+        isCurrent,
+    });
+}
+
 const ROUTER_ATTESTATION_CHECKPOINTS = Object.freeze([
     'post-observation',
     'pre-credentials',
@@ -2488,6 +2537,7 @@ export default {
     abortEdgeRoutingPreparation,
     applyEdgeRoutingGeneration,
     captureEdgeRoutingLease,
+    captureEdgeRoutingObservationLease,
     createRouterAttestationGenerationLease,
     edgeRuntimeEnvironment,
     edgeTopologyMount,

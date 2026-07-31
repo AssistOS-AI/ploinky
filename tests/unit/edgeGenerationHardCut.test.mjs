@@ -9,6 +9,7 @@ import {
     applyEdgeRoutingGeneration,
     assertActiveEdgeRoutingSourcesCurrent,
     captureEdgeRoutingLifecycleMutationGeneration,
+    captureEdgeRoutingObservationLease,
     createRouterAttestationGenerationLease,
     initializeFreshEdgeRoutingSources,
     loadActiveEdgeRoutingGeneration,
@@ -758,6 +759,44 @@ test('prepared Router attestation remains inactive and binds exact lease, owner,
         () => loadActiveEdgeRoutingGeneration({ workspaceRoot: fixture.workspace }),
         { code: 'EDGE_GENERATION_INACTIVE' },
     );
+});
+
+test('a registered authority observation classifies only its exact selected inactive generation', (t) => {
+    const fixture = createFixture(t);
+    const prepared = prepareEdgeRoutingGeneration({
+        workspaceRoot: fixture.workspace,
+        reason: 'prepared-observation',
+    });
+    const generation = prepared.selector.generation;
+    const lease = captureEdgeRoutingObservationLease({
+        workspaceRoot: fixture.workspace,
+        expectedGeneration: generation,
+    });
+    assert.equal(lease.id, generation);
+    assert.equal(lease.commit(), true);
+
+    const ordinary = resolveEdgeRoutePlan({
+        req: { headers: { host: '127.0.0.1:18080' }, url: '/health' },
+        listener: 'public',
+    });
+    assert.equal(ordinary.status, 503);
+    assert.equal(ordinary.code, 'EDGE_GENERATION_INACTIVE');
+
+    const observed = resolveEdgeRoutePlan({
+        req: { headers: { host: '127.0.0.1:18080' }, url: '/health' },
+        listener: 'public',
+        authorityObservationGeneration: generation,
+    });
+    assert.equal(observed.status, 404);
+    assert.equal(observed.code, 'ROUTE_NOT_FOUND');
+    assert.equal(observed.hostSelection?.kind, 'control');
+    assert.equal(observed.lease?.id, generation);
+    assert.equal(observed.lease?.commit(), true);
+
+    assert.throws(() => captureEdgeRoutingObservationLease({
+        workspaceRoot: fixture.workspace,
+        expectedGeneration: `sha256:${'f'.repeat(64)}`,
+    }), { code: 'EDGE_GENERATION_RACE' });
 });
 
 test('prepared Router attestation fails closed when lifecycle sources change between checkpoints', (t) => {

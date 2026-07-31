@@ -9,6 +9,7 @@ export const AUTHORITY_ATTESTATION_MAX_PENDING = 16;
 export const AUTHORITY_ATTESTATION_TTL_MS = 10_000;
 
 const NONCE_PATTERN = /^[0-9a-f]{64}$/;
+const GENERATION_PATTERN = /^sha256:[0-9a-f]{64}$/;
 
 function isValidNonce(value) {
     return typeof value === 'string' && NONCE_PATTERN.test(value);
@@ -74,17 +75,27 @@ export function createRouterAuthorityAttestationRegistry({
         }
     }
 
-    function register(nonce) {
+    function register(nonce, generationLeaseId) {
         const observedAt = monotonicNow();
         expire(observedAt);
-        if (!isValidNonce(nonce)) return Object.freeze({ ok: false, status: 'invalid' });
+        if (!isValidNonce(nonce) || !GENERATION_PATTERN.test(String(generationLeaseId || ''))) {
+            return Object.freeze({ ok: false, status: 'invalid' });
+        }
         if (pending.has(nonce)) return Object.freeze({ ok: false, status: 'exists' });
         if (pending.size >= maximumPending) return Object.freeze({ ok: false, status: 'capacity' });
         pending.set(nonce, {
             expiresAt: observedAt + ttlMs,
+            generationLeaseId,
             records: [],
         });
         return Object.freeze({ ok: true, status: 'registered' });
+    }
+
+    function registeredGeneration(nonce) {
+        const observedAt = monotonicNow();
+        expire(observedAt);
+        if (!isValidNonce(nonce)) return null;
+        return pending.get(nonce)?.generationLeaseId || null;
     }
 
     function record(nonce, observation) {
@@ -122,6 +133,7 @@ export function createRouterAuthorityAttestationRegistry({
 
     return Object.freeze({
         register,
+        registeredGeneration,
         record,
         consume,
         pendingCount,
@@ -237,9 +249,16 @@ function parseRegistration(bytes) {
     }
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
     if (Object.getPrototypeOf(parsed) !== Object.prototype) return null;
-    const keys = Object.keys(parsed);
-    if (keys.length !== 1 || keys[0] !== 'nonce' || !isValidNonce(parsed.nonce)) return null;
-    return parsed.nonce;
+    const keys = Object.keys(parsed).sort();
+    if (keys.length !== 2
+        || keys[0] !== 'generationLeaseId'
+        || keys[1] !== 'nonce'
+        || !isValidNonce(parsed.nonce)
+        || !GENERATION_PATTERN.test(String(parsed.generationLeaseId || ''))) return null;
+    return Object.freeze({
+        nonce: parsed.nonce,
+        generationLeaseId: parsed.generationLeaseId,
+    });
 }
 
 export async function handleRouterAuthorityAttestationRequest(req, res, {
@@ -267,20 +286,23 @@ export async function handleRouterAuthorityAttestationRequest(req, res, {
             });
             return true;
         }
-        const nonce = parseRegistration(body);
-        if (!nonce) {
+        const registration = parseRegistration(body);
+        if (!registration) {
             sendJson(res, 400, { ok: false, error: 'INVALID_AUTHORITY_ATTESTATION_REGISTRATION' });
             return true;
         }
         let result;
         try {
-            result = registry?.register?.(nonce);
+            result = registry?.register?.(
+                registration.nonce,
+                registration.generationLeaseId,
+            );
         } catch (_) {
             sendJson(res, 503, { ok: false, error: 'AUTHORITY_ATTESTATION_REGISTRY_UNAVAILABLE' });
             return true;
         }
         if (result?.ok) {
-            sendJson(res, 201, { ok: true, nonce });
+            sendJson(res, 201, { ok: true, nonce: registration.nonce });
             return true;
         }
         const code = result?.status === 'capacity'

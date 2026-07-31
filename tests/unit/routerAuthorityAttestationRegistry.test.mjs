@@ -18,6 +18,8 @@ function nonce(index) {
     return index.toString(16).padStart(64, '0');
 }
 
+const GENERATION_LEASE_ID = `sha256:${'a'.repeat(64)}`;
+
 function observation(overrides = {}) {
     return {
         rawHost: '127.0.0.1:18080',
@@ -93,16 +95,17 @@ test('registry enforces exact nonces, sixteen pending entries, and monotonic ten
     const registry = createRouterAuthorityAttestationRegistry({ now: () => now });
 
     for (const malformed of ['', 'a'.repeat(63), 'A'.repeat(64), `${'a'.repeat(64)}\n`, 42, null]) {
-        assert.deepEqual(registry.register(malformed), { ok: false, status: 'invalid' });
+        assert.deepEqual(registry.register(malformed, GENERATION_LEASE_ID), { ok: false, status: 'invalid' });
     }
+    assert.deepEqual(registry.register(nonce(0), 'generation-1'), { ok: false, status: 'invalid' });
     assert.equal(registry.pendingCount(), 0);
 
     for (let index = 0; index < AUTHORITY_ATTESTATION_MAX_PENDING; index += 1) {
-        assert.deepEqual(registry.register(nonce(index)), { ok: true, status: 'registered' });
+        assert.deepEqual(registry.register(nonce(index), GENERATION_LEASE_ID), { ok: true, status: 'registered' });
     }
     assert.equal(registry.pendingCount(), AUTHORITY_ATTESTATION_MAX_PENDING);
-    assert.deepEqual(registry.register(nonce(16)), { ok: false, status: 'capacity' });
-    assert.deepEqual(registry.register(nonce(0)), { ok: false, status: 'exists' });
+    assert.deepEqual(registry.register(nonce(16), GENERATION_LEASE_ID), { ok: false, status: 'capacity' });
+    assert.deepEqual(registry.register(nonce(0), GENERATION_LEASE_ID), { ok: false, status: 'exists' });
 
     now += AUTHORITY_ATTESTATION_TTL_MS - 1;
     assert.equal(registry.pendingCount(), AUTHORITY_ATTESTATION_MAX_PENDING);
@@ -115,7 +118,8 @@ test('registry records exactly two restricted observations and consumes only com
     let now = 0;
     const registry = createRouterAuthorityAttestationRegistry({ now: () => now });
     const registeredNonce = nonce(1);
-    assert.equal(registry.register(registeredNonce).ok, true);
+    assert.equal(registry.register(registeredNonce, GENERATION_LEASE_ID).ok, true);
+    assert.equal(registry.registeredGeneration(registeredNonce), GENERATION_LEASE_ID);
 
     assert.equal(registry.record('not-a-nonce', observation()), false);
     assert.equal(registry.record(nonce(2), observation()), false);
@@ -159,6 +163,7 @@ test('registry records exactly two restricted observations and consumes only com
     assert.equal(Object.hasOwn(complete.records[0], 'forbiddenSecret'), false);
     assert.equal(complete.records[1].hostSelectionKind, null);
     assert.equal(registry.pendingCount(), 0);
+    assert.equal(registry.registeredGeneration(registeredNonce), null);
     assert.deepEqual(registry.consume(registeredNonce), { ok: false, status: 'not-found' });
 });
 
@@ -198,7 +203,10 @@ test('private endpoint strictly registers, preserves incomplete records, consume
     let req = request({
         method: 'POST',
         url: '/authority-attestations',
-        body: JSON.stringify({ nonce: registeredNonce }),
+        body: JSON.stringify({
+            nonce: registeredNonce,
+            generationLeaseId: GENERATION_LEASE_ID,
+        }),
     });
     let res = response();
     assert.equal(await handleRouterAuthorityAttestationRequest(req, res, { registry }), true);

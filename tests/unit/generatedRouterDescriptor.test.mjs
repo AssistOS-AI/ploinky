@@ -369,6 +369,28 @@ test('fixed public and managed attestation fixtures validate only in their exact
             generationId: publicFixture.evidence.generationId,
         }), /socket\/interface evidence|socket address class/);
     }
+
+    const nestedBoxHairpinRecords = publicFixture.evidence.records.map((record) => ({
+        ...record,
+        socketRemoteAddress: record.socketLocalAddress,
+    }));
+    assert.doesNotThrow(() => validateRouterAuthorityObservation({
+        intent: publicIntent,
+        nonce: publicFixture.evidence.nonce,
+        records: nestedBoxHairpinRecords,
+        external: publicFixture.evidence.external,
+        generationId: publicFixture.evidence.generationId,
+    }));
+    assert.throws(() => validateRouterAuthorityObservation({
+        intent: managedIntent,
+        nonce: managedFixture.evidence.nonce,
+        records: managedFixture.evidence.records.map((record) => ({
+            ...record,
+            socketRemoteAddress: record.socketLocalAddress,
+        })),
+        external: managedFixture.evidence.external,
+        generationId: managedFixture.evidence.generationId,
+    }), /socket address class/);
 });
 
 test('attestation registers, probes, consumes, then commits the generation before returning', () => {
@@ -390,7 +412,11 @@ test('attestation registers, probes, consumes, then commits the generation befor
             commit() { order.push('commit'); return true; },
         },
         registryClient: {
-            register() { order.push('register'); },
+            register(nonceValue, generationValue) {
+                assert.match(nonceValue, /^[a-f0-9]{64}$/);
+                assert.equal(generationValue, fixture.evidence.generationId);
+                order.push('register');
+            },
             consume() { order.push('consume'); return fixture.evidence.records; },
         },
         runProbe() {

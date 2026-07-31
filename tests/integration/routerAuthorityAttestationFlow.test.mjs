@@ -107,7 +107,15 @@ function createObservedRouterHandler({ registry, rawInterfaceClass }) {
         }
         const requestedUrl = new URL(req.url || '/', `http://${exactHost === '::1' ? '[::1]' : exactHost}`);
         const listener = rawInterfaceClass === 'managed' ? 'managed' : 'public';
-        const routePlan = resolveEdgeRoutePlan({ req, parsedUrl: requestedUrl, listener });
+        const authorityObservationGeneration = requestedUrl.pathname === '/health'
+            ? registry.registeredGeneration(req.headers['x-ploinky-authority-probe']) || ''
+            : '';
+        const routePlan = resolveEdgeRoutePlan({
+            req,
+            parsedUrl: requestedUrl,
+            listener,
+            authorityObservationGeneration,
+        });
         const controlMiss = !routePlan.ok
             && routePlan.code === 'ROUTE_NOT_FOUND'
             && routePlan.hostSelection?.kind === 'control';
@@ -278,7 +286,10 @@ test('registered observation headers are response-neutral in all four listener a
     const publicNonce = nonce('b');
     const managedNonce = nonce('c');
     for (const registeredNonce of [publicNonce, managedNonce]) {
-        const registrationBody = JSON.stringify({ nonce: registeredNonce });
+        const registrationBody = JSON.stringify({
+            nonce: registeredNonce,
+            generationLeaseId,
+        });
         const registration = await privateRequest(
             socketPath,
             'POST',

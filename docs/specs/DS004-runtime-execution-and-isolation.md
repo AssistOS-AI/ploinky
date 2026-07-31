@@ -132,11 +132,24 @@ the agent image reference to one immutable image ID and reads only the bounded
 `Config.User` projection from that image. The image must declare an exact
 numeric, non-root `UID:GID`; an empty, symbolic, root, or out-of-range identity
 fails closed. The confined authority helper runs the immutable image as that
-same user. The real nested Podman container then uses
+same user. Helper creation and cleanup are verified through a fixed bounded
+container-inspection projection rather than unbounded engine JSON. Before it
+issues either Router request, the started helper also proves from
+`/proc/self/status` that its effective and bounding capability sets are zero
+and `NoNewPrivs` is active. The real nested Podman container then uses
 `--userns=keep-id:uid=<UID>,gid=<GID>` so its attested non-root identity maps to
 the outer rootless owner of writable bind mounts such as `/root`. Creation,
 adoption, and final inspection must agree on the immutable image, `Config.User`,
 and exact Podman user-namespace annotation.
+
+The helper's two Router observations are authorized only by a private,
+TTL-bounded registration that binds a cryptographically random nonce to the
+exact selected preparation-generation lease. Only `GET /health` carrying that
+live registered nonce may capture an observation lease for the exact selected
+inactive generation. An unregistered request, a different generation, any
+other method or path, an expired nonce, or an inactive ordinary Router request
+continues to fail closed. This narrow observation path classifies the prepared
+snapshot without activating it or widening normal routing.
 
 Container reuse proves the exact hosts arguments, attachments, aliases, labels,
 versioned network-contract hash, and immutable `instanceId` plus
@@ -177,6 +190,13 @@ Host are resolved before pathname dispatch. Routed calls retain JWT
 issuer/audience validation, policy, request binding, expiry, and replay
 protection; TCP control/status still requires a real admin session, and
 mutations require Origin/CSRF even when a caller can reach box loopback.
+
+Rootless nested Podman may NAT a `box-public-loopback` authority probe so the
+Router observes the same non-loopback local and remote address. That exact
+hairpin is accepted only for the raw unmanaged interface class in the fixed
+`box-public-loopback` topology. Loopback, managed, and host-network cells still
+reject equal local and remote addresses, and the exception does not grant
+authority without the registered nonce and exact socket evidence.
 
 Every contract-6 outer box has exactly two engine publications, constructed by
 the outer wrapper without reading graph state:

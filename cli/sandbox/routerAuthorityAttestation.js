@@ -17,9 +17,17 @@ const MAX_OUTPUT_BYTES = 8 * 1024;
 const LOOPBACK_LOGIN_BODY = '{"ok":false,"error":"not_authenticated","login":"/auth/login?returnTo=%2Fhealth&agent=explorer"}';
 
 const PROBE_SCRIPT = String.raw`
+const fs = require('node:fs');
 const http = require('node:http');
 const https = require('node:https');
 const [originText, firstHost, secondHost, nonce] = process.argv.slice(1);
+const processStatus = fs.readFileSync('/proc/self/status', 'utf8');
+const statusField = (name) => new RegExp('^' + name + ':\\s+(.+)$', 'm').exec(processStatus)?.[1]?.trim() || '';
+if (!/^0+$/.test(statusField('CapBnd'))
+    || !/^0+$/.test(statusField('CapEff'))
+    || statusField('NoNewPrivs') !== '1') {
+  throw new Error('helper process confinement proof failed');
+}
 const origin = new URL(originText);
 const client = origin.protocol === 'https:' ? https : http;
 const run = (host) => new Promise((resolve, reject) => {
@@ -201,10 +209,22 @@ function assertExactSocketEvidence(intent, records) {
             fail('PLOINKY_ROUTER_ATTESTATION_MISMATCH', 'internal socket/interface evidence did not match the fixed topology cell');
         }
         const expectsLoopback = expectedRawClass === 'loopback';
+        const exactBoxNatHairpin = intent.topology === 'box-public-loopback'
+            && expectedRawClass === 'unmanaged'
+            && !isLoopbackAddress(local)
+            && local === remote;
         if (isLoopbackAddress(local) !== expectsLoopback
             || (expectsLoopback ? !isLoopbackAddress(remote) : isLoopbackAddress(remote))
-            || local === remote) {
-            fail('PLOINKY_ROUTER_ATTESTATION_MISMATCH', 'internal socket address class did not match the fixed topology cell');
+            || (local === remote && !exactBoxNatHairpin)) {
+            fail(
+                'PLOINKY_ROUTER_ATTESTATION_MISMATCH',
+                `internal socket address class did not match the fixed topology cell (${JSON.stringify({
+                    expectedRawClass,
+                    rawInterfaceClass: record?.rawInterfaceClass,
+                    local,
+                    remote,
+                })})`,
+            );
         }
     }
 }
@@ -319,8 +339,13 @@ export function createPrivateAuthorityRegistryClient({
     socketPath = process.env.PLOINKY_ROUTER_HEALTH_SOCKET || HEALTH_SOCKET,
 } = {}) {
     return Object.freeze({
-        register(nonce) {
-            const result = privateSocketRequest(socketPath, 'POST', '/authority-attestations', JSON.stringify({ nonce }));
+        register(nonce, generationLeaseId) {
+            const result = privateSocketRequest(
+                socketPath,
+                'POST',
+                '/authority-attestations',
+                JSON.stringify({ nonce, generationLeaseId }),
+            );
             if (result.status !== 201) fail('PLOINKY_ROUTER_ATTESTATION_REGISTRY', 'authority nonce registration failed');
         },
         consume(nonce) {
@@ -336,13 +361,18 @@ export function createPrivateAuthorityRegistryClient({
     });
 }
 
-function inspectJson(runtime, id) {
-    const raw = runBounded(runtime, ['container', 'inspect', id]);
+const AUTHORITY_HELPER_INSPECT_FORMAT = String.raw`{"id":{{json .ID}},"image":{{json .Image}},"user":{{json .Config.User}},"init":{{json .HostConfig.Init}},"readonlyRootfs":{{json .HostConfig.ReadonlyRootfs}},"pidsLimit":{{json .HostConfig.PidsLimit}},"memory":{{json .HostConfig.Memory}},"nanoCpus":{{json .HostConfig.NanoCpus}},"networkMode":{{json .HostConfig.NetworkMode}},"extraHosts":{{json .HostConfig.ExtraHosts}},"mountCount":{{len .Mounts}},"bindCount":{{len .HostConfig.Binds}},"tmpfsCount":{{len .HostConfig.Tmpfs}},"portBindingCount":{{len .HostConfig.PortBindings}},"capDrop":{{json .HostConfig.CapDrop}},"capAdd":{{json .HostConfig.CapAdd}},"securityOpt":{{json .HostConfig.SecurityOpt}},"env":{{json .Config.Env}},"helperLabel":{{json (index .Config.Labels "io.assistos.ploinky.authority-helper")}},"networks":{{json .NetworkSettings.Networks}},"running":{{json .State.Running}},"status":{{json .State.Status}}}`;
+
+function inspectAuthorityHelper(runtime, id) {
+    const raw = runBounded(runtime, [
+        'container', 'inspect', '--format', AUTHORITY_HELPER_INSPECT_FORMAT, id,
+    ]);
     let parsed;
-    try { parsed = JSON.parse(raw); } catch (error) { fail('PLOINKY_ROUTER_ATTESTATION_HELPER', 'helper inspection returned malformed JSON', error); }
-    const record = Array.isArray(parsed) ? parsed[0] : parsed;
-    if (!record || typeof record !== 'object') fail('PLOINKY_ROUTER_ATTESTATION_HELPER', 'helper inspection returned no record');
-    return record;
+    try { parsed = JSON.parse(raw); } catch (error) { fail('PLOINKY_ROUTER_ATTESTATION_HELPER', 'helper projected inspection returned malformed JSON', error); }
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        fail('PLOINKY_ROUTER_ATTESTATION_HELPER', 'helper projected inspection returned no record');
+    }
+    return parsed;
 }
 
 export function runContainerAuthorityProbe({ runtime, plan, image, intent, nonce } = {}) {
@@ -391,33 +421,36 @@ export function runContainerAuthorityProbe({ runtime, plan, image, intent, nonce
             intent.physicalOrigin, firstHost, secondHost, nonce,
         ]);
         if (!helperId) fail('PLOINKY_ROUTER_ATTESTATION_HELPER', 'helper creation did not return an immutable ID');
-        const inspected = inspectJson(runtime, helperId);
-        const inspectedNetworks = Object.keys(inspected.NetworkSettings?.Networks || {}).sort();
-        const extraHosts = [...(inspected.HostConfig?.ExtraHosts || [])].map(String);
-        const capDrop = [...(inspected.HostConfig?.CapDrop || [])].map((value) => String(value).toUpperCase());
-        const capAdd = [...(inspected.HostConfig?.CapAdd || [])];
-        const securityOpt = [...(inspected.HostConfig?.SecurityOpt || [])].map(String);
-        const helperEnv = [...(inspected.Config?.Env || [])].map(String);
-        if (String(inspected.Id || inspected.ID || '') !== helperId
-            || String(inspected.Image || inspected.ImageID || '') !== imageId
-            || String(inspected.Config?.User || '') !== finalUser
-            || inspected.HostConfig?.Init !== true
-            || inspected.HostConfig?.ReadonlyRootfs !== true
-            || Number(inspected.HostConfig?.PidsLimit) !== 32
-            || Number(inspected.HostConfig?.Memory) !== 64 * 1024 * 1024
-            || Number(inspected.HostConfig?.NanoCpus) !== 250_000_000
+        const inspected = inspectAuthorityHelper(runtime, helperId);
+        const inspectedNetworks = Object.keys(inspected.networks || {}).sort();
+        const extraHosts = [...(inspected.extraHosts || [])].map(String);
+        const capDrop = [...(inspected.capDrop || [])].map((value) => String(value).toUpperCase());
+        const capAdd = [...(inspected.capAdd || [])];
+        const securityOpt = [...(inspected.securityOpt || [])].map(String);
+        const helperEnv = [...(inspected.env || [])].map(String);
+        const portableCapDrop = capDrop.length > 0 && capDrop.every((value) => (
+            value === 'ALL' || /^CAP_[A-Z0-9_]+$/.test(value)
+        ));
+        if (String(inspected.id || '') !== helperId
+            || String(inspected.image || '') !== imageId
+            || String(inspected.user || '') !== finalUser
+            || inspected.init !== true
+            || inspected.readonlyRootfs !== true
+            || Number(inspected.pidsLimit) !== 32
+            || Number(inspected.memory) !== 64 * 1024 * 1024
+            || Number(inspected.nanoCpus) !== 250_000_000
             || JSON.stringify(inspectedNetworks) !== JSON.stringify(expectedNetworks)
-            || String(inspected.HostConfig?.NetworkMode || '') !== primaryNetwork
+            || !['bridge', primaryNetwork].includes(String(inspected.networkMode || ''))
             || extraHosts.length !== 1 || extraHosts[0] !== expectedHostMapping
-            || !Array.isArray(inspected.Mounts) || inspected.Mounts.length !== 0
-            || (inspected.HostConfig?.Binds || []).length !== 0
-            || Object.keys(inspected.HostConfig?.Tmpfs || {}).length !== 0
-            || Object.keys(inspected.HostConfig?.PortBindings || {}).length !== 0
-            || capDrop.length !== 1 || capDrop[0] !== 'ALL'
+            || Number(inspected.mountCount) !== 0
+            || Number(inspected.bindCount) !== 0
+            || Number(inspected.tmpfsCount) !== 0
+            || Number(inspected.portBindingCount) !== 0
+            || !portableCapDrop
             || capAdd.length !== 0
             || securityOpt.length !== 1 || !['no-new-privileges', 'no-new-privileges=true'].includes(securityOpt[0])
             || helperEnv.some((entry) => /^(?:PLOINKY_|AUTHORIZATION=|BEARER_)/i.test(entry))
-            || String(inspected.Config?.Labels?.['io.assistos.ploinky.authority-helper'] || '') !== nonce) {
+            || String(inspected.helperLabel || '') !== nonce) {
             fail('PLOINKY_ROUTER_ATTESTATION_HELPER', 'helper confinement inspection failed');
         }
         const output = runBounded(runtime, ['start', '--attach', helperId]);
@@ -436,17 +469,17 @@ export function runContainerAuthorityProbe({ runtime, plan, image, intent, nonce
         });
     } finally {
         if (helperId) {
-            const inspected = inspectJson(runtime, helperId);
-            if (String(inspected.Id || inspected.ID || '') !== helperId
-                || String(inspected.Config?.Labels?.['io.assistos.ploinky.authority-helper'] || '') !== nonce) {
+            const inspected = inspectAuthorityHelper(runtime, helperId);
+            if (String(inspected.id || '') !== helperId
+                || String(inspected.helperLabel || '') !== nonce) {
                 fail('PLOINKY_ROUTER_ATTESTATION_CLEANUP', 'helper cleanup could not prove exact immutable ID and nonce ownership');
             }
-            if (inspected.State?.Running === true || inspected.State?.Status === 'running') {
+            if (inspected.running === true || inspected.status === 'running') {
                 runBounded(runtime, ['stop', '--time', '2', helperId], { timeout: 4_000 });
-                const stopped = inspectJson(runtime, helperId);
-                if (String(stopped.Id || stopped.ID || '') !== helperId
-                    || String(stopped.Config?.Labels?.['io.assistos.ploinky.authority-helper'] || '') !== nonce
-                    || stopped.State?.Running === true || stopped.State?.Status === 'running') {
+                const stopped = inspectAuthorityHelper(runtime, helperId);
+                if (String(stopped.id || '') !== helperId
+                    || String(stopped.helperLabel || '') !== nonce
+                    || stopped.running === true || stopped.status === 'running') {
                     fail('PLOINKY_ROUTER_ATTESTATION_CLEANUP', 'helper remained running after bounded exact-ID stop');
                 }
             }
@@ -470,7 +503,7 @@ export function attestRouterAuthority({
         fail('PLOINKY_ROUTER_ATTESTATION_INVALID', 'attestation requires fixed intent, generation lease, registry, and exact probe runner');
     }
     const nonce = crypto.randomBytes(32).toString('hex');
-    registryClient.register(nonce);
+    registryClient.register(nonce, generationLease.id);
     const probe = runProbe({ intent, nonce });
     const records = registryClient.consume(nonce);
     const evidence = validateRouterAuthorityObservation({

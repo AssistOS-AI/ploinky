@@ -2,7 +2,10 @@ import crypto from 'node:crypto';
 import net from 'node:net';
 import { domainToASCII } from 'node:url';
 
-import { captureEdgeRoutingLease } from '../sandbox/edgeGeneration.js';
+import {
+    captureEdgeRoutingLease,
+    captureEdgeRoutingObservationLease,
+} from '../sandbox/edgeGeneration.js';
 import { selectedRouterHostPort } from '../sandbox/routerPort.js';
 import { deriveAgentPrincipalId } from '../utils/security/agentIdentity.js';
 import {
@@ -592,10 +595,15 @@ export function resolveEdgeRoutePlan({
     parsedUrl = null,
     listener = 'public',
     transport = 'http',
+    authorityObservationGeneration = '',
 } = {}) {
     let lease;
     try {
-        lease = captureEdgeRoutingLease();
+        lease = authorityObservationGeneration
+            ? captureEdgeRoutingObservationLease({
+                expectedGeneration: authorityObservationGeneration,
+            })
+            : captureEdgeRoutingLease();
     } catch (error) {
         return deny(503, error?.code || 'EDGE_GENERATION_INACTIVE');
     }

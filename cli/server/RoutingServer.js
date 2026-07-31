@@ -47,6 +47,7 @@ import {
     createPrivateListenerSet,
 } from './privateListenerSet.js';
 import {
+    AUTHORITY_ATTESTATION_HEADER,
     createRouterAuthorityAttestationRegistry,
     handleRouterAuthorityAttestationRequest,
     recordRouterAuthorityObservation,
@@ -353,7 +354,18 @@ async function processRequest(req, res) {
         ? 'managed'
         : 'public';
     req.ploinkyListenerClass = listener;
-    const routePlan = resolveEdgeRoutePlan({ req, parsedUrl: requestedUrl, listener });
+    const authorityObservationGeneration = (req.method || 'GET').toUpperCase() === 'GET'
+        && requestedUrl.pathname === '/health'
+        ? routerAuthorityAttestationRegistry.registeredGeneration(
+            req.headers[AUTHORITY_ATTESTATION_HEADER],
+        ) || ''
+        : '';
+    const routePlan = resolveEdgeRoutePlan({
+        req,
+        parsedUrl: requestedUrl,
+        listener,
+        authorityObservationGeneration,
+    });
     const controlMiss = !routePlan.ok
         && routePlan.code === 'ROUTE_NOT_FOUND'
         && routePlan.hostSelection?.kind === 'control';

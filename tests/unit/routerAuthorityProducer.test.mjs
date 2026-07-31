@@ -56,7 +56,12 @@ test('authority helper uses the exact image, init, final user, namespace, and ma
     assert.match(source, /exact numeric non-root UID:GID/);
     assert.match(source, /'--read-only', '--cap-drop=ALL', '--security-opt=no-new-privileges'/);
     assert.match(source, /\.\.\.\(plan\?\.args \|\| \[\]\)/);
-    assert.match(source, /String\(inspected\.Config\?\.User \|\| ''\) !== finalUser/);
+    assert.match(source, /AUTHORITY_HELPER_INSPECT_FORMAT/);
+    assert.match(source, /'container', 'inspect', '--format', AUTHORITY_HELPER_INSPECT_FORMAT, id/);
+    assert.doesNotMatch(source, /runBounded\(runtime, \['container', 'inspect', id\]\)/);
+    assert.match(source, /String\(inspected\.user \|\| ''\) !== finalUser/);
+    assert.match(source, /statusField\('CapBnd'\)/);
+    assert.match(source, /statusField\('NoNewPrivs'\) !== '1'/);
     assert.match(source, /helper cleanup could not prove exact immutable ID and nonce ownership/);
     assert.match(source, /\['container', 'exists', helperId\]/);
 });
