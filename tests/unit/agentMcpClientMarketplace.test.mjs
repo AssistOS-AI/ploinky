@@ -1,18 +1,21 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
 import http from 'node:http';
-
-import { createAgentClient } from '../../Agent/client/AgentMcpClient.mjs';
+import os from 'node:os';
+import path from 'node:path';
 
 test('AgentMcpClient signs Marketplace reads and leaves enable mode caller-controlled', async () => {
-    const original = {
-        id: process.env.PLOINKY_AGENT_ID,
-        secret: process.env.PLOINKY_AGENT_SECRET,
-        router: process.env.PLOINKY_ROUTER_URL,
-    };
+    const originalCwd = process.cwd();
+    const originalEnvironment = { ...process.env };
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-agent-marketplace-'));
+    process.chdir(tempDir);
+    process.env.PLOINKY_MASTER_KEY = 'd'.repeat(64);
     process.env.PLOINKY_AGENT_ID = 'agent:repo/caller';
     process.env.PLOINKY_AGENT_SECRET = 'caller-secret';
 
+    const { installGeneratedRouterRuntime } = await import('../helpers/generatedRouterRuntime.mjs');
+    const { createAgentClient } = await import('../../Agent/client/AgentMcpClient.mjs');
     const requests = [];
     let running = false;
     const server = http.createServer((req, res) => {
@@ -39,7 +42,11 @@ test('AgentMcpClient signs Marketplace reads and leaves enable mode caller-contr
     await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
     try {
         const { port } = server.address();
-        process.env.PLOINKY_ROUTER_URL = `http://127.0.0.1:${port}`;
+        installGeneratedRouterRuntime({
+            origin: `http://127.0.0.1:${port}`,
+            tempDir,
+            agentPrincipal: 'agent:repo/caller',
+        });
         const client = await createAgentClient('worker');
         const status = await client.ensureAgentRunning('repo/worker');
         assert.equal(status.running, true);
@@ -48,12 +55,12 @@ test('AgentMcpClient signs Marketplace reads and leaves enable mode caller-contr
         await client.ensureAgentRunning('repo/worker', { mode: 'global' });
     } finally {
         await new Promise((resolve) => server.close(resolve));
-        if (original.id === undefined) delete process.env.PLOINKY_AGENT_ID;
-        else process.env.PLOINKY_AGENT_ID = original.id;
-        if (original.secret === undefined) delete process.env.PLOINKY_AGENT_SECRET;
-        else process.env.PLOINKY_AGENT_SECRET = original.secret;
-        if (original.router === undefined) delete process.env.PLOINKY_ROUTER_URL;
-        else process.env.PLOINKY_ROUTER_URL = original.router;
+        process.chdir(originalCwd);
+        fs.rmSync(tempDir, { recursive: true, force: true });
+        for (const name of Object.keys(process.env)) {
+            if (!Object.prototype.hasOwnProperty.call(originalEnvironment, name)) delete process.env[name];
+        }
+        Object.assign(process.env, originalEnvironment);
     }
 
     assert.deepEqual(requests.map(({ method }) => method), ['GET', 'POST', 'GET', 'GET', 'POST']);

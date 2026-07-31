@@ -8,6 +8,9 @@ import {
     buildRuntimeNetworkPlan,
     buildRuntimeRouterEnv,
     ensureAgentService,
+    expectedBindMountsFromArgs,
+    hasExactManagedEnv,
+    hasExactManagedMountContract,
     isGenerationCapabilityRuntimeEffective,
     restartGenerationCapabilityRuntime,
     replaceRuntimeRouterEnvFlags,
@@ -96,7 +99,8 @@ test('prepared graph launches suppress intermediate registry persistence only fo
     assert.match(source, /if \(!preserveRuntimeRegistryRecord\) saveAgentsMap\(agents\)/);
     assert.match(source, /registryRecord:\s*structuredClone\(agents\[containerName\]\)/);
     assert.match(source, /returning early \(container exists\)[\s\S]*createdByThisLaunch:\s*false/);
-    assert.match(source, /runtimeNetwork:\s*structuredClone\(manifestNetwork\),[\s\S]*createdByThisLaunch:\s*true/);
+    assert.match(source, /runtimeNetwork:\s*structuredClone\(manifestNetwork\),[\s\S]*createdByThisLaunch:\s*!adoptedExistingRuntime/);
+    assert.match(source, /createdByThisLaunch:\s*started\?\.createdByThisLaunch !== false/);
     assert.match(source, /const registryRecord = \{\s*\.\.\.existingRecord,\s*runtime,\s*containerId: reuseInspection\.id,/);
     assert.match(source, /type: 'agent',\s*runtime,\s*containerId: started\.containerId,/);
     assert.match(source, /assertHostModeGenerationCapability\(\{[\s\S]*containerName,\s*\}, \{ preparedCapability: options\.preparedHostModeCapability \}\)/);
@@ -210,12 +214,17 @@ test('targeted capability restart cannot activate before exact semantic readines
     };
     let readinessCalls = 0;
     const cleanupCalls = [];
+    const networkLifecycleCapability = Object.freeze({ test: 'network-lifecycle' });
+    const assertLifecycleCapability = (capability) => {
+        assert.equal(capability, networkLifecycleCapability);
+    };
     assert.throws(() => restartGenerationCapabilityRuntime({
         generation,
         owner,
         affectedSelectors: ['media:agent:media/livekit'],
         assertSelectorsInactive: () => true,
         preparedHostModeCapability: Object.freeze({}),
+        networkLifecycleCapability,
     }, {
         resolveProfile: () => ({ network: { mode: 'host' }, resolvedProfileName: 'default' }),
         resolveReadinessProtocol: () => 'script',
@@ -232,6 +241,7 @@ test('targeted capability restart cannot activate before exact semantic readines
             cleanupCalls.push(candidate);
             return { removed: true };
         },
+        assertLifecycleCapability,
     }), /semantic readiness failed.*udp owner mismatch/);
     assert.equal(readinessCalls, 1);
     assert.equal(cleanupCalls.length, 1);
@@ -246,6 +256,7 @@ test('targeted capability restart cannot activate before exact semantic readines
         affectedSelectors: ['media:agent:media/livekit'],
         assertSelectorsInactive: () => true,
         preparedHostModeCapability: Object.freeze({}),
+        networkLifecycleCapability,
     }, {
         resolveProfile: () => ({ network: { mode: 'host' }, resolvedProfileName: 'default' }),
         resolveReadinessProtocol: () => 'script',
@@ -257,6 +268,7 @@ test('targeted capability restart cannot activate before exact semantic readines
         isRunning: () => true,
         runScriptReadiness: () => ({ status: 'success' }),
         removeCandidate: () => assert.fail('ready candidate must not be removed'),
+        assertLifecycleCapability,
     }), {
         containerName: owner.containerName,
         containerId: 'candidate-ready',
@@ -266,10 +278,49 @@ test('targeted capability restart cannot activate before exact semantic readines
 
 test('managed Docker identity derivation is a fail-closed launch precondition', () => {
     const source = fs.readFileSync(new URL('../../cli/sandbox/docker/agentServiceManager.js', import.meta.url), 'utf8');
-    assert.equal((source.match(/buildAgentIdentityEnv\(/g) || []).length, 1);
+    assert.equal((source.match(/buildAgentPrincipalEnv\(/g) || []).length, 1);
+    assert.equal((source.match(/buildAgentCredentialEnv\(/g) || []).length, 2);
     assert.doesNotMatch(source, /could not set agent identity/);
-    assert.doesNotMatch(source, /try\s*\{[\s\S]{0,500}buildAgentIdentityEnv\(/);
-    assert.match(source, /for \(const \[key, value\] of Object\.entries\(buildAgentIdentityEnv\([\s\S]*?runtimeIdentity,[\s\S]*?\)\)\) \{\s*envStrings\.push\(formatEnvFlag\(key, value\)\);\s*\}/);
+    assert.match(source, /Only non-secret principal fields exist before topology attestation/);
+    assert.match(source, /generationLease\.checkpoint\('pre-credentials'\)[\s\S]*?signGeneratedRouterDescriptorEnvelope\(payload\)[\s\S]*?buildAgentCredentialEnv\(principalId, runtimeIdentity\)/);
+    assert.match(source, /computeSemanticEnvHash[\s\S]*PLOINKY_ROUTER_SEMANTIC_TOPOLOGY_DIGEST[\s\S]*PLOINKY_AGENT_ENABLE_GENERATION/);
+    assert.match(source, /canReuseExisting && runtimeNetworkPlan\.requiresManagedNetwork[\s\S]*prepareEdgeRoutingGenerationRaw/);
+});
+
+test('managed semantic adoption requires exact mounts and singleton generated env values', () => {
+    const descriptor = '/tmp/router-descriptor.json';
+    const mounts = expectedBindMountsFromArgs([
+        'run', '-v', '/tmp/agent:/Agent:ro',
+        '-v', '/tmp/code:/code:rw',
+    ], descriptor);
+    const record = {
+        Mounts: mounts.map((mount) => ({
+            Type: 'bind',
+            Source: mount.source,
+            Destination: mount.destination,
+            RW: mount.rw,
+        })),
+        Config: {
+            Env: ['PLOINKY_AGENT_API_KEY=exact-key', 'PLOINKY_ROUTER_URL=http://router.invalid'],
+        },
+    };
+    assert.equal(hasExactManagedMountContract(record, mounts), true);
+    assert.equal(hasExactManagedEnv(record, {
+        PLOINKY_AGENT_API_KEY: 'exact-key',
+        PLOINKY_ROUTER_URL: 'http://router.invalid',
+    }), true);
+
+    const writableDescriptor = structuredClone(record);
+    writableDescriptor.Mounts.at(-1).RW = true;
+    assert.equal(hasExactManagedMountContract(writableDescriptor, mounts), false);
+
+    const extraMount = structuredClone(record);
+    extraMount.Mounts.push({ Type: 'bind', Source: '/tmp/extra', Destination: '/extra', RW: false });
+    assert.equal(hasExactManagedMountContract(extraMount, mounts), false);
+
+    const duplicateCredential = structuredClone(record);
+    duplicateCredential.Config.Env.push('PLOINKY_AGENT_API_KEY=attacker-key');
+    assert.equal(hasExactManagedEnv(duplicateCredential, { PLOINKY_AGENT_API_KEY: 'exact-key' }), false);
 });
 
 test('container router env builder preserves endpoint parity for every network mode', () => {

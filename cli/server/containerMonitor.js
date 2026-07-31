@@ -29,6 +29,7 @@ import {
     waitForAgentReady,
 } from './utils/agentReadiness.js';
 import { applyEdgeRoutingGeneration } from '../sandbox/coordinatedEdgeApply.js';
+import { withNetworkLifecycleLock } from '../sandbox/networkLifecycle.js';
 import {
     abortEdgeRoutingPreparation,
     inactivateEdgeRoutingGeneration,
@@ -588,6 +589,22 @@ async function activateRestartedContainerRoute(monitor, target, agentDir, result
 }
 
 async function abortFailedRestartPreparation(monitor, target, result, reason) {
+    if (result?.requiresEdgeActivation === true && result?.exactCleanupPerformed !== true) {
+        try {
+            if (typeof monitor.cleanupFailedRuntime === 'function') {
+                await Promise.resolve(monitor.cleanupFailedRuntime(result.containerName || target.containerName, target));
+            } else {
+                await Promise.resolve(cleanupExactAgentRuntimeCandidate(result));
+            }
+        } catch (error) {
+            logEvent(monitor, 'error', 'container_restart_candidate_cleanup_failed', {
+                container: result.containerName || target.containerName,
+                agent: target.agentName,
+                repo: target.repoName,
+                error: error?.message || error,
+            });
+        }
+    }
     if (result?.preparationLease) {
         const abortPreparation = monitor.abortEdgeRoutingPreparation || abortEdgeRoutingPreparation;
         try {
@@ -602,21 +619,6 @@ async function abortFailedRestartPreparation(monitor, target, result, reason) {
                 error: error?.message || error,
             });
         }
-    }
-    if (result?.requiresEdgeActivation !== true || result?.exactCleanupPerformed === true) return;
-    try {
-        if (typeof monitor.cleanupFailedRuntime === 'function') {
-            await Promise.resolve(monitor.cleanupFailedRuntime(result.containerName || target.containerName, target));
-        } else {
-            await Promise.resolve(cleanupExactAgentRuntimeCandidate(result));
-        }
-    } catch (error) {
-        logEvent(monitor, 'error', 'container_restart_candidate_cleanup_failed', {
-            container: result.containerName || target.containerName,
-            agent: target.agentName,
-            repo: target.repoName,
-            error: error?.message || error,
-        });
     }
 }
 
@@ -672,8 +674,11 @@ export async function performContainerRestart(monitor, target, reason) {
         throw error;
     }
 
-    let result = null;
+    const runNetworkLifecycle = monitor.withNetworkLifecycleLock || withNetworkLifecycleLock;
     try {
+        await runNetworkLifecycle(async (networkLifecycleCapability) => {
+        let result = null;
+        try {
         let manifestBytes;
         let manifest;
         try {
@@ -727,6 +732,7 @@ export async function performContainerRestart(monitor, target, reason) {
             profileResolution,
             routerEndpoint,
             forceRecreate: reason === 'semantic_probe_failed',
+            networkLifecycleCapability,
         }));
         // Preparation rereads the manifest for generation capture, while the
         // physical launch consumes the object above. Exact-byte comparisons on
@@ -789,7 +795,7 @@ export async function performContainerRestart(monitor, target, reason) {
             repo: target.repoName,
             reason
         });
-    } catch (error) {
+        } catch (error) {
         const failedResult = result || error?.ploinkyRestartCandidate || null;
         await abortFailedRestartPreparation(monitor, target, failedResult, reason);
         target.lastError = error?.message || error;
@@ -803,6 +809,8 @@ export async function performContainerRestart(monitor, target, reason) {
         if (error && typeof error === 'object') LOGGED_RESTART_FAILURES.add(error);
         target.isRestarting = false;
         throw error;
+        }
+        });
     } finally {
         releaseWorkspaceLease(workspaceLease);
     }

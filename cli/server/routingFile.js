@@ -3,6 +3,7 @@ import path from 'path';
 
 import { ROUTING_FILE } from '../utils/config.js';
 import {
+    captureEdgeRoutingCandidateGeneration,
     inactivateEdgeRoutingGeneration,
     withEdgeGenerationApplyLock,
 } from '../sandbox/edgeGeneration.js';
@@ -72,7 +73,7 @@ function writeRoutingConfig(config, {
         return target;
     };
     if (!coordinate) return write();
-    return withEdgeGenerationApplyLock((applyLockCapability) => {
+    const expectedGeneration = withEdgeGenerationApplyLock((applyLockCapability) => {
         // A lifecycle preparation lease is bound to one exact inactive
         // selector. Re-inactivating here would rotate that selector before the
         // prepared apply can validate it. The preparation phase has already
@@ -82,9 +83,10 @@ function writeRoutingConfig(config, {
             inactivateEdgeRoutingGeneration(reason, { applyLockCapability });
         }
         write();
-        applyEdgeRoutingGeneration({ reason, preparationLease, applyLockCapability });
-        return target;
+        return captureEdgeRoutingCandidateGeneration({ applyLockCapability });
     }, { preparationLease });
+    applyEdgeRoutingGeneration({ reason, preparationLease, expectedGeneration });
+    return target;
 }
 
 async function mergeRoutingConfig(mutator, {
@@ -107,22 +109,24 @@ async function mergeRoutingConfig(mutator, {
             const current = readRoutingConfig();
             const next = await mutator(current) || current;
             writeRoutingConfig(next, { coordinate: false });
-            if (coordinate) {
-                const expectedGeneration = typeof captureExpectedGeneration === 'function'
+            const expectedGeneration = coordinate
+                ? (typeof captureExpectedGeneration === 'function'
                     ? await captureExpectedGeneration(validatedActiveGeneration)
-                    : undefined;
-                applyEdgeRoutingGeneration({
-                    reason,
-                    preparationLease,
-                    applyLockCapability,
-                    ...(expectedGeneration === undefined ? {} : { expectedGeneration }),
-                });
-            }
-            return next;
+                    : captureEdgeRoutingCandidateGeneration({ applyLockCapability }))
+                : undefined;
+            return { next, expectedGeneration };
         };
-        return coordinate
+        const { next, expectedGeneration } = coordinate
             ? await withEdgeGenerationApplyLock(mutate, { preparationLease })
             : await mutate();
+        if (coordinate) {
+            applyEdgeRoutingGeneration({
+                reason,
+                preparationLease,
+                expectedGeneration,
+            });
+        }
+        return next;
     } finally {
         release();
     }

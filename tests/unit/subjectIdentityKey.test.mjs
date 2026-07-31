@@ -19,8 +19,11 @@ const {
     getSubjectIdentityPublicKey,
     buildSubjectIdentityKey,
     verifySubjectIdentityKey,
+    signGeneratedRouterDescriptor,
+    verifyGeneratedRouterDescriptorSignature,
     SubjectIdentityKeyError,
 } = await import(`../../cli/utils/security/subjectIdentityKey.js${moduleSuffix}`);
+const { canonicalJsonBytes } = await import(`../../cli/utils/security/generatedRouterDescriptor.js${moduleSuffix}`);
 
 test.after(() => {
     process.chdir(originalCwd);
@@ -96,6 +99,54 @@ test('the signed payload is exactly the subjectId bytes (independently verifiabl
     assert.equal(crypto.verify(null, Buffer.from(subjectId, 'utf8'), keyObject, signature), true);
     // The same signature must NOT validate over any other message.
     assert.equal(crypto.verify(null, Buffer.from(`${subjectId}x`, 'utf8'), keyObject, signature), false);
+});
+
+test('generated Router descriptors use the frozen domain-separated signature vector', () => {
+    const fixtureRoot = path.join(originalCwd, 'tests', 'fixtures', 'router-descriptor');
+    const envelope = JSON.parse(fs.readFileSync(path.join(fixtureRoot, 'public-envelope.json'), 'utf8'));
+    const environment = JSON.parse(fs.readFileSync(path.join(fixtureRoot, 'public-environment.json'), 'utf8'));
+    const payloadBytes = canonicalJsonBytes(envelope.payload);
+
+    assert.equal(
+        verifyGeneratedRouterDescriptorSignature(
+            payloadBytes,
+            envelope.signature,
+            environment.PLOINKY_AGENT_API_PUBLIC_KEY,
+        ),
+        true,
+    );
+    assert.equal(
+        verifyGeneratedRouterDescriptorSignature(
+            Buffer.concat([payloadBytes, Buffer.from(' ')]),
+            envelope.signature,
+            environment.PLOINKY_AGENT_API_PUBLIC_KEY,
+        ),
+        false,
+    );
+});
+
+test('generated Router descriptor signer exposes only a canonical signature string', () => {
+    const payload = Buffer.from('{"test":true}', 'utf8');
+    const signature = signGeneratedRouterDescriptor(payload);
+    assert.match(signature, /^[A-Za-z0-9_-]+$/);
+    assert.equal(Buffer.from(signature, 'base64url').length, 64);
+    assert.equal(
+        verifyGeneratedRouterDescriptorSignature(payload, signature, getSubjectIdentityPublicKey()),
+        true,
+    );
+});
+
+test('generated Router descriptor verification rejects malformed signature and trust anchor encodings', () => {
+    const payload = Buffer.from('{}', 'utf8');
+    assert.throws(
+        () => verifyGeneratedRouterDescriptorSignature(payload, 'AA', getSubjectIdentityPublicKey()),
+        (error) => error instanceof SubjectIdentityKeyError && error.code === 'MALFORMED_DESCRIPTOR_SIGNATURE',
+    );
+    const signature = signGeneratedRouterDescriptor(payload);
+    assert.throws(
+        () => verifyGeneratedRouterDescriptorSignature(payload, signature, 'AA'),
+        (error) => error instanceof SubjectIdentityKeyError && error.code === 'INVALID_PUBLIC_KEY',
+    );
 });
 
 test('verifySubjectIdentityKey(validKey, publicKey) returns subjectId and subjectType', () => {

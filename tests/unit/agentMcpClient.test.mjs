@@ -7,6 +7,8 @@ import path from 'node:path';
 
 const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-agent-client-'));
 const originalCwd = process.cwd();
+const originalEnvironment = { ...process.env };
+const generatedEnvNames = new Set();
 const originalRouterUrl = process.env.PLOINKY_ROUTER_URL;
 const originalRouterAuthority = process.env.PLOINKY_ROUTER_AUTHORITY;
 const originalAgentId = process.env.PLOINKY_AGENT_ID;
@@ -14,6 +16,7 @@ const originalAgentSecret = process.env.PLOINKY_AGENT_SECRET;
 const originalPollInterval = process.env.PLOINKY_MCP_TASK_POLL_INTERVAL_MS;
 
 process.chdir(tempDir);
+process.env.PLOINKY_MASTER_KEY = 'e'.repeat(64);
 process.env.PLOINKY_AGENT_ID = 'agent:AssistOSExplorer/onlyOffice';
 process.env.PLOINKY_AGENT_SECRET = 'a'.repeat(64);
 process.env.PLOINKY_MCP_TASK_POLL_INTERVAL_MS = '10';
@@ -23,6 +26,14 @@ const {
     getRouterAuthority,
     setAgentTaskObserver,
 } = await import('../../Agent/client/AgentMcpClient.mjs');
+const { installGeneratedRouterRuntime } = await import('../helpers/generatedRouterRuntime.mjs');
+const { loadVerifiedGeneratedRouterDescriptor } = await import('../../Agent/client/generatedRouterDescriptor.mjs');
+
+function installRuntime(options) {
+    const runtime = installGeneratedRouterRuntime({ tempDir, ...options });
+    for (const name of Object.keys(runtime.env)) generatedEnvNames.add(name);
+    return runtime;
+}
 
 function listen(server) {
     return new Promise((resolve, reject) => {
@@ -48,45 +59,44 @@ test.after(() => {
     else process.env.PLOINKY_AGENT_SECRET = originalAgentSecret;
     if (originalPollInterval === undefined) delete process.env.PLOINKY_MCP_TASK_POLL_INTERVAL_MS;
     else process.env.PLOINKY_MCP_TASK_POLL_INTERVAL_MS = originalPollInterval;
+    for (const name of generatedEnvNames) {
+        if (Object.prototype.hasOwnProperty.call(originalEnvironment, name)) process.env[name] = originalEnvironment[name];
+        else delete process.env[name];
+    }
+    if (originalEnvironment.PLOINKY_MASTER_KEY === undefined) delete process.env.PLOINKY_MASTER_KEY;
+    else process.env.PLOINKY_MASTER_KEY = originalEnvironment.PLOINKY_MASTER_KEY;
 });
 
-async function withCaptureServer(t, onRequest) {
+async function withCaptureServer(t, onRequest, runtimeOptions = {}) {
     const server = http.createServer((req, res) => {
         const chunks = [];
         req.on('data', (chunk) => chunks.push(Buffer.from(chunk)));
         req.on('end', () => onRequest(req, Buffer.concat(chunks), res));
     });
     const port = await listen(server);
-    process.env.PLOINKY_ROUTER_URL = `http://127.0.0.1:${port}`;
-    delete process.env.PLOINKY_ROUTER_AUTHORITY;
+    installRuntime({ origin: `http://127.0.0.1:${port}`, ...runtimeOptions });
     t.after(async () => {
         await close(server);
     });
 }
 
-test('createAgentClient requires a valid nonempty PLOINKY_ROUTER_URL without fallback synthesis', async () => {
-    const previousUrl = process.env.PLOINKY_ROUTER_URL;
-    const previousPort = process.env.PLOINKY_ROUTER_PORT;
+test('createAgentClient requires a verified generated descriptor without URL fallback synthesis', async () => {
+    const previousDescriptor = process.env.PLOINKY_ROUTER_DESCRIPTOR_FILE;
+    const previousMarker = process.env.PLOINKY_ENV_SOURCE_PLOINKY_ROUTER_DESCRIPTOR_FILE;
     try {
-        delete process.env.PLOINKY_ROUTER_URL;
+        process.env.PLOINKY_ROUTER_URL = 'http://127.0.0.1:65535';
         process.env.PLOINKY_ROUTER_PORT = '65535';
+        delete process.env.PLOINKY_ROUTER_DESCRIPTOR_FILE;
+        delete process.env.PLOINKY_ENV_SOURCE_PLOINKY_ROUTER_DESCRIPTOR_FILE;
         await assert.rejects(
             () => createAgentClient('dpuAgent'),
-            /PLOINKY_ROUTER_URL is required/,
+            /PLOINKY_ROUTER_DESCRIPTOR_FILE/,
         );
-
-        for (const invalid of ['', '   ', 'not-a-url', 'file:///tmp/router', 'http://user:pass@localhost:8080', 'http://localhost:8080/router']) {
-            process.env.PLOINKY_ROUTER_URL = invalid;
-            await assert.rejects(
-                () => createAgentClient('dpuAgent'),
-                /PLOINKY_ROUTER_URL/,
-            );
-        }
     } finally {
-        if (previousUrl === undefined) delete process.env.PLOINKY_ROUTER_URL;
-        else process.env.PLOINKY_ROUTER_URL = previousUrl;
-        if (previousPort === undefined) delete process.env.PLOINKY_ROUTER_PORT;
-        else process.env.PLOINKY_ROUTER_PORT = previousPort;
+        if (previousDescriptor === undefined) delete process.env.PLOINKY_ROUTER_DESCRIPTOR_FILE;
+        else process.env.PLOINKY_ROUTER_DESCRIPTOR_FILE = previousDescriptor;
+        if (previousMarker === undefined) delete process.env.PLOINKY_ENV_SOURCE_PLOINKY_ROUTER_DESCRIPTOR_FILE;
+        else process.env.PLOINKY_ENV_SOURCE_PLOINKY_ROUTER_DESCRIPTOR_FILE = previousMarker;
     }
 });
 
@@ -97,24 +107,15 @@ test('createAgentClient separates the Router transport address from its canonica
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ jsonrpc: '2.0', id: '1', result: { ok: true } }));
     });
-    process.env.PLOINKY_ROUTER_AUTHORITY = 'router.example:19090';
-
     const client = await createAgentClient('dpuAgent');
     assert.deepEqual(await client.callTool('dpu_workspace_roots', {}), { ok: true });
-    assert.equal(capturedHost, 'router.example:19090');
+    assert.equal(capturedHost, '127.0.0.1:19090');
 });
 
-test('getRouterAuthority rejects unsafe authority syntax', () => {
-    const previous = process.env.PLOINKY_ROUTER_AUTHORITY;
-    try {
-        for (const invalid of ['router.example:', 'user@router.example:8080', 'router.example/path', 'router.example?query']) {
-            process.env.PLOINKY_ROUTER_AUTHORITY = invalid;
-            assert.throws(() => getRouterAuthority('http://127.0.0.1:8080'), /invalid PLOINKY_ROUTER_AUTHORITY/);
-        }
-    } finally {
-        if (previous === undefined) delete process.env.PLOINKY_ROUTER_AUTHORITY;
-        else process.env.PLOINKY_ROUTER_AUTHORITY = previous;
-    }
+test('getRouterAuthority rejects an unsigned authority mirror override', () => {
+    installRuntime({ origin: 'http://127.0.0.1:65535' });
+    process.env.PLOINKY_ROUTER_REQUEST_AUTHORITY = 'attacker.invalid:8080';
+    assert.throws(() => getRouterAuthority(), /disagrees with the signed descriptor/);
 });
 
 test('createAgentClient sends no delegation header by default', async (t) => {
@@ -310,16 +311,14 @@ test('task observer status callbacks stay pinned to the client router', async (t
     });
     const firstPort = await listen(firstRouter);
     const secondPort = await listen(secondRouter);
-    const previousRouterUrl = process.env.PLOINKY_ROUTER_URL;
     t.after(async () => {
-        if (previousRouterUrl === undefined) delete process.env.PLOINKY_ROUTER_URL;
-        else process.env.PLOINKY_ROUTER_URL = previousRouterUrl;
         await Promise.all([close(firstRouter), close(secondRouter)]);
     });
 
-    process.env.PLOINKY_ROUTER_URL = `http://127.0.0.1:${firstPort}`;
-    const client = await createAgentClient('asyncAgent');
-    process.env.PLOINKY_ROUTER_URL = `http://127.0.0.1:${secondPort}`;
+    installRuntime({ origin: `http://127.0.0.1:${firstPort}` });
+    const firstDescriptor = loadVerifiedGeneratedRouterDescriptor();
+    const client = await createAgentClient('asyncAgent', { routerDescriptor: firstDescriptor });
+    installRuntime({ origin: `http://127.0.0.1:${secondPort}` });
     const removeObserver = setAgentTaskObserver(async (task) => {
         const status = await task.getTaskStatus();
         assert.equal(status.id, 'task-pinned');
@@ -349,4 +348,113 @@ test('cancelTask sends a request-bound agent assertion through the router', asyn
     assert.equal(captured.url, '/asyncAgent/task/cancel');
     assert.deepEqual(JSON.parse(captured.body), { taskId: 'remote-1' });
     assert.match(captured.headers.authorization, /^Bearer /);
+});
+
+test('callTool gives a hanging initial request a typed total-timeout error', async (t) => {
+    await withCaptureServer(t, (_req, _body, _res) => {
+        // Deliberately leave the response open until AgentMcpClient enforces
+        // the caller's total deadline and destroys its request.
+    });
+    const client = await createAgentClient('slowAgent');
+    t.after(() => client.close());
+
+    await assert.rejects(
+        () => client.callTool('slow_tool', {}, { timeoutMs: 60 }),
+        (error) => {
+            assert.equal(error?.code, 'PLOINKY_AGENT_MCP_TIMEOUT');
+            assert.match(error?.message || '', /timed out after 60ms/);
+            return true;
+        },
+    );
+});
+
+test('callTool gives a hanging asynchronous task poll a typed total-timeout error', async (t) => {
+    await withCaptureServer(t, (req, _body, res) => {
+        if (req.method === 'GET') {
+            // The queued task never returns status. The status request must
+            // inherit the remaining call deadline instead of hanging forever.
+            return;
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+            jsonrpc: '2.0',
+            id: '1',
+            result: { metadata: { taskId: 'task-hangs', status: 'queued' } },
+        }));
+    });
+    const client = await createAgentClient('slowAsyncAgent');
+    t.after(() => client.close());
+
+    await assert.rejects(
+        () => client.callTool('slow_async_tool', {}, { timeoutMs: 80 }),
+        (error) => {
+            assert.equal(error?.code, 'PLOINKY_AGENT_MCP_TIMEOUT');
+            assert.match(error?.message || '', /timed out after 80ms/);
+            return true;
+        },
+    );
+});
+
+test('closing one client does not cancel a concurrent asynchronous call on another client', async (t) => {
+    const statusRequests = new Map();
+    let allowClientBToComplete = false;
+    let resolveBothPolling;
+    const bothPolling = new Promise((resolve) => {
+        resolveBothPolling = resolve;
+    });
+
+    await withCaptureServer(t, (req, body, res) => {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        if (req.method === 'GET') {
+            const taskId = new URL(req.url, 'http://router.invalid').searchParams.get('taskId');
+            statusRequests.set(taskId, (statusRequests.get(taskId) || 0) + 1);
+            if (statusRequests.has('task-client-a') && statusRequests.has('task-client-b')) {
+                resolveBothPolling();
+            }
+            const completed = taskId === 'task-client-b' && allowClientBToComplete;
+            res.end(JSON.stringify({
+                task: completed
+                    ? {
+                        id: taskId,
+                        status: 'completed',
+                        result: {
+                            content: [{ type: 'text', text: JSON.stringify({ ok: true, client: 'b' }) }],
+                        },
+                    }
+                    : { id: taskId, status: 'running' },
+            }));
+            return;
+        }
+
+        const request = JSON.parse(body.toString('utf8'));
+        const clientName = request.params?.arguments?.client;
+        const taskId = clientName === 'a' ? 'task-client-a' : 'task-client-b';
+        res.end(JSON.stringify({
+            jsonrpc: '2.0',
+            id: request.id,
+            result: { metadata: { taskId, status: 'queued' } },
+        }));
+    });
+
+    const clientA = await createAgentClient('asyncAgent');
+    const clientB = await createAgentClient('asyncAgent');
+    t.after(() => Promise.all([clientA.close(), clientB.close()]));
+
+    const callA = clientA.callTool('execute-task', { client: 'a' }, { timeoutMs: 1000 });
+    const callAClosed = assert.rejects(callA, /client closed/);
+    const callB = clientB.callTool('execute-task', { client: 'b' }, { timeoutMs: 1000 });
+
+    await Promise.race([
+        bothPolling,
+        new Promise((_, reject) => setTimeout(() => reject(new Error('both clients did not begin polling')), 500)),
+    ]);
+    await clientA.close();
+    allowClientBToComplete = true;
+
+    await callAClosed;
+    const resultB = await callB;
+    assert.equal(resultB.status, 'completed');
+    assert.equal(resultB.ok, true);
+    assert.equal(resultB.client, 'b');
+    assert.ok(statusRequests.get('task-client-b') >= 2);
 });

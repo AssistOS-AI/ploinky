@@ -2,11 +2,164 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { isDeepStrictEqual } from 'node:util';
 
 import { buildEngineProcessEnvironment, createProcessRunner } from '../../../ploinky-box/process.mjs';
 import { resolveWorkspaceIdentity } from '../../../ploinky-box/identity.mjs';
-import { createMutationLockManager } from '../../../ploinky-box/locks.mjs';
+import { createMutationLockManager, withWorkspaceMutationLock } from '../../../ploinky-box/locks.mjs';
 import { createBoxSupervisor } from '../../../ploinky-box/supervisor.mjs';
+import {
+    discoverBoxOwnership,
+    inspectOwnedVolumeHandle,
+    volumeHandleMatches,
+} from '../../../ploinky-box/engine/discovery.mjs';
+
+const ABSENT_RESOURCE = /(?:no such|not found|does not exist|no volume with name)/i;
+
+function cleanupError(message) {
+    const error = new Error(message);
+    error.code = 'PLOINKY_BOX_TEST_CLEANUP_REFUSED';
+    return error;
+}
+
+function assertSameWorkspaceIdentity(expected, current) {
+    if (!current
+        || expected.workspaceRoot !== current.workspaceRoot
+        || expected.instance !== current.instance
+        || expected.pathHash !== current.pathHash
+        || !isDeepStrictEqual(expected.rootFingerprint, current.rootFingerprint)) {
+        throw cleanupError('Workspace identity changed during native Box cleanup');
+    }
+}
+
+function assertSameContainerHandle(expected, current) {
+    if (!current
+        || expected.id !== current.id
+        || expected.engine !== current.engine
+        || expected.engineIdentity !== current.engineIdentity
+        || expected.name !== current.name
+        || expected.pathHash !== current.pathHash
+        || !isDeepStrictEqual(expected.labels, current.labels)) {
+        throw cleanupError('Native Box container changed during cleanup');
+    }
+}
+
+function confirmResourceAbsent(runner, engineName, kind, identifier) {
+    const inspection = runner.query(engineName, [kind, 'inspect', identifier]);
+    if (inspection.ok || !ABSENT_RESOURCE.test(String(inspection.stderr || inspection.stdout || ''))) {
+        throw cleanupError(`${kind} ${identifier} absence could not be proven`);
+    }
+}
+
+function listVolumeConsumers(runner, engineName, volumeName) {
+    const result = runner.query(engineName, [
+        'container', 'ls', '--all', '--filter', `volume=${volumeName}`, '--format', 'json',
+    ]);
+    if (!result.ok) {
+        throw cleanupError(`Unable to inventory consumers of volume ${volumeName}`);
+    }
+    let records;
+    try {
+        records = JSON.parse(String(result.stdout || ''));
+    } catch {
+        throw cleanupError(`Consumer inventory for volume ${volumeName} is malformed`);
+    }
+    if (!Array.isArray(records)) {
+        throw cleanupError(`Consumer inventory for volume ${volumeName} is not an array`);
+    }
+    return records;
+}
+
+export async function cleanupNativeHarnessResources({
+    resolveIdentity,
+    expectedIdentity,
+    runner,
+    lockManager,
+    platform = process.platform,
+    env = {},
+    discover = (identity) => discoverBoxOwnership(identity, { runner, platform, env }),
+    inspectVolume = (engine, identity, key) => inspectOwnedVolumeHandle(
+        engine,
+        identity,
+        key,
+        runner,
+    ),
+    withLock = withWorkspaceMutationLock,
+} = {}) {
+    if (!expectedIdentity || typeof resolveIdentity !== 'function' || !runner || !lockManager) {
+        throw new TypeError('Native Box cleanup requires captured identity, resolver, runner, and lock manager');
+    }
+    return withLock({
+        resolveIdentity,
+        lockManager,
+        materializeAnchor: () => undefined,
+        execute: async (lockedIdentity, lock) => {
+            assertSameWorkspaceIdentity(expectedIdentity, lockedIdentity);
+            lock.assertHeld(lockedIdentity.instance);
+            const captured = discover(lockedIdentity);
+            if (captured.state === 'absent') {
+                return Object.freeze({ action: 'absent', removedContainerId: null, removedVolumes: [] });
+            }
+            if (captured.state !== 'owned' || !captured.engine) {
+                throw cleanupError(captured.message || `Native Box ownership is ${captured.state}`);
+            }
+            const engine = captured.engine;
+            const container = captured.handles?.container || null;
+            const volumes = Object.entries(captured.handles?.volumes || {})
+                .filter(([, handle]) => handle);
+
+            if (container) {
+                assertSameWorkspaceIdentity(expectedIdentity, resolveIdentity());
+                lock.assertHeld(lockedIdentity.instance);
+                const current = discover(lockedIdentity);
+                if (current.state !== 'owned'
+                    || current.engine?.name !== engine.name
+                    || current.engine?.identity !== engine.identity) {
+                    throw cleanupError('Native Box engine or ownership changed before container removal');
+                }
+                assertSameContainerHandle(container, current.handles?.container);
+                const removed = runner.query(engine.name, [
+                    'container', 'rm', '--force', '--time', '0', container.id,
+                ], { timeoutMs: 120_000 });
+                if (!removed.ok) {
+                    throw cleanupError(`Failed to remove native Box container ${container.id}`);
+                }
+                confirmResourceAbsent(runner, engine.name, 'container', container.id);
+            }
+
+            const removedVolumes = [];
+            for (const [key, handle] of volumes) {
+                assertSameWorkspaceIdentity(expectedIdentity, resolveIdentity());
+                lock.assertHeld(lockedIdentity.instance);
+                const current = inspectVolume(engine, lockedIdentity, key);
+                if (current.state !== 'owned' || !volumeHandleMatches(handle, current.handle)) {
+                    throw cleanupError(`Native Box volume ${handle.name} changed before removal`);
+                }
+                const consumers = listVolumeConsumers(runner, engine.name, handle.name);
+                if (consumers.length !== 0) {
+                    throw cleanupError(`Native Box volume ${handle.name} has active or foreign consumers`);
+                }
+                assertSameWorkspaceIdentity(expectedIdentity, resolveIdentity());
+                lock.assertHeld(lockedIdentity.instance);
+                const finalCurrent = inspectVolume(engine, lockedIdentity, key);
+                if (finalCurrent.state !== 'owned' || !volumeHandleMatches(handle, finalCurrent.handle)) {
+                    throw cleanupError(`Native Box volume ${handle.name} changed after consumer inventory`);
+                }
+                const removed = runner.query(engine.name, ['volume', 'rm', handle.name]);
+                if (!removed.ok) {
+                    throw cleanupError(`Native Box volume ${handle.name} became in-use or could not be removed`);
+                }
+                confirmResourceAbsent(runner, engine.name, 'volume', handle.name);
+                removedVolumes.push(handle.name);
+            }
+            return Object.freeze({
+                action: 'removed',
+                removedContainerId: container?.id || null,
+                removedVolumes: Object.freeze(removedVolumes),
+            });
+        },
+    });
+}
 
 export function requirePodmanCandidate(t, env = process.env) {
     if (env.PLOINKY_BOX_REQUIRE_PODMAN !== '1') {
@@ -51,9 +204,10 @@ export function createPodmanHarness(t, candidateReference, {
         cwd: () => launchDirectory,
     });
     const output = { bytes: '', write(chunk) { this.bytes += String(chunk); } };
+    const lockManager = createMutationLockManager({ homeDirectory: lockHome });
     const supervisorOptions = {
         runner,
-        lockManager: createMutationLockManager({ homeDirectory: lockHome }),
+        lockManager,
         resolveIdentity,
         platform: process.platform,
         env: {},
@@ -64,25 +218,14 @@ export function createPodmanHarness(t, candidateReference, {
     const supervisor = createBoxSupervisor(supervisorOptions);
     const identity = resolveIdentity();
     async function cleanup() {
-        const inspect = runner.query('podman', ['container', 'inspect', identity.instance]);
-        if (inspect.ok) {
-            let records;
-            try {
-                records = JSON.parse(inspect.stdout);
-            } catch {
-                assert.fail(`native Box inspection returned invalid JSON for ${identity.instance}`);
-            }
-            const id = String(records[0]?.Id || records[0]?.ID || '');
-            assert.match(id, /^[a-f0-9]{12,64}$/,
-                `native Box inspection returned an invalid ID for ${identity.instance}`);
-            const removed = runner.query('podman', [
-                'container', 'rm', '-f', '--time', '0', '--volumes', id,
-            ], { timeoutMs: 120_000 });
-            assert.equal(removed.ok, true, `failed to clean native Box ${id}: ${removed.stderr}`);
-        }
-        for (const name of Object.values(identity.volumes)) {
-            runner.query('podman', ['volume', 'rm', '-f', name]);
-        }
+        await cleanupNativeHarnessResources({
+            resolveIdentity,
+            expectedIdentity: identity,
+            runner,
+            lockManager,
+            platform: process.platform,
+            env: {},
+        });
     }
     t.after(cleanup);
     return {

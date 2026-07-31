@@ -11,50 +11,43 @@ import http from 'node:http';
 import https from 'node:https';
 
 import { signAgentAssertion, signAgentHttpAssertion } from '../lib/agentAssertion.mjs';
+import {
+    assertVerifiedGeneratedRouterDescriptor,
+    loadVerifiedGeneratedRouterDescriptor,
+    resolveGeneratedRouterOperation,
+} from './generatedRouterDescriptor.mjs';
 
-export function getRouterUrl() {
-    const raw = process.env.PLOINKY_ROUTER_URL;
-    if (typeof raw !== 'string' || !raw.trim()) {
-        throw new Error('AgentMcpClient: PLOINKY_ROUTER_URL is required and must be a valid nonempty HTTP(S) URL');
-    }
-    let url;
-    try {
-        url = new URL(raw.trim());
-    } catch (error) {
-        throw new Error('AgentMcpClient: PLOINKY_ROUTER_URL must be a valid nonempty HTTP(S) URL', { cause: error });
-    }
-    if (!['http:', 'https:'].includes(url.protocol) || !url.hostname || url.username || url.password) {
-        throw new Error('AgentMcpClient: PLOINKY_ROUTER_URL must be a valid nonempty HTTP(S) URL without credentials');
-    }
-    if ((url.pathname && url.pathname !== '/') || url.search || url.hash) {
-        throw new Error('AgentMcpClient: PLOINKY_ROUTER_URL must identify the router origin without a path, query, or fragment');
-    }
-    return url.origin;
+function trustedDescriptor(descriptor) {
+    return descriptor === undefined
+        ? loadVerifiedGeneratedRouterDescriptor()
+        : assertVerifiedGeneratedRouterDescriptor(descriptor);
 }
 
-export function getAgentMcpUrl(agentName, routerUrl = getRouterUrl()) {
-    return `${routerUrl}/${agentName}/mcp`;
+function normalizeAgentName(agentName) {
+    const value = String(agentName || '').trim();
+    if (!/^[A-Za-z0-9._:-]+$/.test(value)) {
+        throw new Error('AgentMcpClient: agentName is invalid');
+    }
+    return value;
 }
 
-export function getRouterAuthority(routerUrl = getRouterUrl()) {
-    const raw = String(process.env.PLOINKY_ROUTER_AUTHORITY || '').trim();
-    if (!raw) return new URL(routerUrl).host;
-    if (raw.endsWith(':') || /[\s\\/@?#,]/.test(raw)) {
-        throw new Error('AgentMcpClient: invalid PLOINKY_ROUTER_AUTHORITY');
-    }
-    let parsed;
-    try {
-        parsed = new URL(`http://${raw}/`);
-    } catch {
-        throw new Error('AgentMcpClient: invalid PLOINKY_ROUTER_AUTHORITY');
-    }
-    if (parsed.username || parsed.password || parsed.pathname !== '/' || parsed.search || parsed.hash || !parsed.hostname) {
-        throw new Error('AgentMcpClient: invalid PLOINKY_ROUTER_AUTHORITY');
-    }
-    return parsed.host.toLowerCase();
+export function getRouterUrl(descriptor) {
+    return trustedDescriptor(descriptor).physicalOrigin;
+}
+
+export function getAgentMcpUrl(agentName, descriptor) {
+    return resolveGeneratedRouterOperation(
+        trustedDescriptor(descriptor),
+        `/${normalizeAgentName(agentName)}/mcp`,
+    ).toString();
+}
+
+export function getRouterAuthority(descriptor) {
+    return trustedDescriptor(descriptor).requestAuthority;
 }
 
 const DEFAULT_TASK_POLL_INTERVAL_MS = 5000;
+const DEFAULT_CALL_TIMEOUT_MS = 450000;
 const MARKETPLACE_PATH = '/api/marketplace';
 const MARKETPLACE_TARGET = 'ploinky-router';
 const MARKETPLACE_READ_TOOL = 'marketplace.read';
@@ -76,8 +69,20 @@ const TASK_POLL_INTERVAL_MS = (() => {
     return DEFAULT_TASK_POLL_INTERVAL_MS;
 })();
 
-const taskPollers = new Map();
 let taskObserver = null;
+
+function normalizeCallTimeout(value) {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) && parsed > 0
+        ? Math.max(1, Math.floor(parsed))
+        : DEFAULT_CALL_TIMEOUT_MS;
+}
+
+function callTimeoutError(timeoutMs) {
+    const error = new Error(`AgentMcpClient: tool call timed out after ${timeoutMs}ms`);
+    error.code = 'PLOINKY_AGENT_MCP_TIMEOUT';
+    return error;
+}
 
 export function setAgentTaskObserver(observer) {
     if (observer !== null && typeof observer !== 'function') {
@@ -98,7 +103,8 @@ async function applyTaskObserver({
     toolName,
     toolArgs,
     metadata,
-    routerUrl,
+    descriptor,
+    descriptorProvider,
 }) {
     if (typeof taskObserver !== 'function') return null;
     const observation = await taskObserver({
@@ -107,7 +113,11 @@ async function applyTaskObserver({
         toolName,
         arguments: toolArgs,
         metadata: metadata || {},
-        getTaskStatus: () => getTaskStatus(agentName, taskId, routerUrl),
+        getTaskStatus: () => getTaskStatus(
+            agentName,
+            taskId,
+            typeof descriptorProvider === 'function' ? descriptorProvider() : descriptor,
+        ),
     });
     if (observation?.detached !== true) return null;
     return {
@@ -137,8 +147,8 @@ function sleep(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function marketplaceUrl(routerUrl = getRouterUrl()) {
-    return new URL(MARKETPLACE_PATH, `${routerUrl.replace(/\/+$/, '')}/`);
+function marketplaceUrl(descriptor) {
+    return resolveGeneratedRouterOperation(trustedDescriptor(descriptor), MARKETPLACE_PATH);
 }
 
 function marketplaceToolForRequest(method, body) {
@@ -147,8 +157,9 @@ function marketplaceToolForRequest(method, body) {
         : MARKETPLACE_READ_TOOL;
 }
 
-function requestMarketplace(method = 'GET', body = null, routerUrl = getRouterUrl()) {
-    const url = marketplaceUrl(routerUrl);
+function requestMarketplace(method = 'GET', body = null, descriptor) {
+    const verified = trustedDescriptor(descriptor);
+    const url = marketplaceUrl(verified);
     const httpModule = url.protocol === 'https:' ? https : http;
     const payload = body ? Buffer.from(JSON.stringify(body), 'utf8') : Buffer.alloc(0);
     const tool = marketplaceToolForRequest(method, body);
@@ -168,7 +179,7 @@ function requestMarketplace(method = 'GET', body = null, routerUrl = getRouterUr
             path: MARKETPLACE_PATH,
             method,
             headers: {
-                host: getRouterAuthority(url),
+                host: getRouterAuthority(verified),
                 accept: 'application/json',
                 authorization: `Bearer ${assertion}`,
                 ...(payload.length ? {
@@ -215,13 +226,15 @@ function findMarketplaceAgent(marketplace, agentRef) {
     return null;
 }
 
-export async function getAgentStatus(agentRef, routerUrl = getRouterUrl()) {
-    const marketplace = await requestMarketplace('GET', null, routerUrl);
+export async function getAgentStatus(agentRef, descriptor) {
+    const verified = trustedDescriptor(descriptor);
+    const marketplace = await requestMarketplace('GET', null, verified);
     return findMarketplaceAgent(marketplace, agentRef);
 }
 
-export async function ensureAgentRunning(agentRef, options = {}, routerUrl = getRouterUrl()) {
-    const initial = await getAgentStatus(agentRef, routerUrl);
+export async function ensureAgentRunning(agentRef, options = {}, descriptor) {
+    const verified = trustedDescriptor(descriptor);
+    const initial = await getAgentStatus(agentRef, verified);
     if (!initial) {
         throw new Error(`AgentMcpClient: agent '${agentRef}' is not installed`);
     }
@@ -232,7 +245,7 @@ export async function ensureAgentRunning(agentRef, options = {}, routerUrl = get
         action: 'enable_agent',
         agentRef: initial.ref,
         ...(mode ? { mode } : {}),
-    }, routerUrl);
+    }, verified);
     const enabled = findMarketplaceAgent(marketplace, initial.ref);
     if (enabled?.running === true) return enabled;
 
@@ -240,25 +253,28 @@ export async function ensureAgentRunning(agentRef, options = {}, routerUrl = get
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
         await sleep(AGENT_START_POLL_INTERVAL_MS);
-        const status = await getAgentStatus(initial.ref, routerUrl);
+        const status = await getAgentStatus(initial.ref, verified);
         if (status?.running === true) return status;
     }
     throw new Error(`AgentMcpClient: agent '${initial.ref}' did not start within ${timeoutMs}ms`);
 }
 
-function postToolCall(agentName, jsonRpcBody, assertion, userDelegationToken = '', routerUrl = getRouterUrl()) {
-    const url = new URL(getAgentMcpUrl(agentName, routerUrl));
+function postToolCall(agentName, jsonRpcBody, assertion, userDelegationToken = '', descriptor, timeoutMs = DEFAULT_CALL_TIMEOUT_MS) {
+    const verified = trustedDescriptor(descriptor);
+    const url = resolveGeneratedRouterOperation(verified, `/${normalizeAgentName(agentName)}/mcp`);
     const httpModule = url.protocol === 'https:' ? https : http;
     const payload = Buffer.from(JSON.stringify(jsonRpcBody), 'utf8');
     const delegationToken = normalizeDelegationToken(userDelegationToken);
     return new Promise((resolve, reject) => {
-        const req = httpModule.request({
+        let req;
+        const timeout = setTimeout(() => req?.destroy(callTimeoutError(timeoutMs)), timeoutMs);
+        req = httpModule.request({
             hostname: url.hostname,
             port: url.port || (url.protocol === 'https:' ? 443 : 80),
             path: `${url.pathname}${url.search || ''}`,
             method: 'POST',
             headers: {
-                host: getRouterAuthority(url),
+                host: getRouterAuthority(verified),
                 'content-type': 'application/json',
                 'content-length': payload.length,
                 accept: 'application/json',
@@ -269,24 +285,28 @@ function postToolCall(agentName, jsonRpcBody, assertion, userDelegationToken = '
             const chunks = [];
             res.on('data', (chunk) => chunks.push(chunk));
             res.on('end', () => {
+                clearTimeout(timeout);
                 const text = Buffer.concat(chunks).toString('utf8');
                 let json = null;
                 try { json = text ? JSON.parse(text) : null; } catch { json = null; }
                 resolve({ status: res.statusCode, json, text });
             });
         });
-        req.on('error', reject);
+        req.on('error', (error) => {
+            clearTimeout(timeout);
+            reject(error);
+        });
         req.end(payload);
     });
 }
 
-function getTaskStatus(agentName, taskId, routerUrl = getRouterUrl()) {
+function getTaskStatus(agentName, taskId, descriptor, timeoutMs = DEFAULT_CALL_TIMEOUT_MS) {
+    const verified = trustedDescriptor(descriptor);
     const normalizedTaskId = String(taskId || '').trim();
     if (!normalizedTaskId) {
         throw new Error('AgentMcpClient: taskId is required');
     }
-    const url = new URL(routerUrl);
-    url.pathname = `/${agentName}/task`;
+    const url = resolveGeneratedRouterOperation(verified, `/${normalizeAgentName(agentName)}/task`);
     url.searchParams.set('taskId', normalizedTaskId);
     const httpModule = url.protocol === 'https:' ? https : http;
     const assertion = signAgentAssertion({
@@ -297,13 +317,15 @@ function getTaskStatus(agentName, taskId, routerUrl = getRouterUrl()) {
         argumentsObj: { taskId: normalizedTaskId },
     });
     return new Promise((resolve, reject) => {
-        const req = httpModule.request({
+        let req;
+        const timeout = setTimeout(() => req?.destroy(callTimeoutError(timeoutMs)), timeoutMs);
+        req = httpModule.request({
             hostname: url.hostname,
             port: url.port || (url.protocol === 'https:' ? 443 : 80),
             path: `${url.pathname}${url.search || ''}`,
             method: 'GET',
             headers: {
-                host: getRouterAuthority(url),
+                host: getRouterAuthority(verified),
                 accept: 'application/json',
                 authorization: `Bearer ${assertion}`,
             },
@@ -311,6 +333,7 @@ function getTaskStatus(agentName, taskId, routerUrl = getRouterUrl()) {
             const chunks = [];
             res.on('data', (chunk) => chunks.push(chunk));
             res.on('end', () => {
+                clearTimeout(timeout);
                 const text = Buffer.concat(chunks).toString('utf8');
                 let json = null;
                 try { json = text ? JSON.parse(text) : null; } catch { json = null; }
@@ -325,17 +348,20 @@ function getTaskStatus(agentName, taskId, routerUrl = getRouterUrl()) {
                 resolve(json.task || json);
             });
         });
-        req.on('error', reject);
+        req.on('error', (error) => {
+            clearTimeout(timeout);
+            reject(error);
+        });
         req.end();
     });
 }
 
-function cancelTask(agentName, taskId, routerUrl = getRouterUrl()) {
+function cancelTask(agentName, taskId, descriptor) {
+    const verified = trustedDescriptor(descriptor);
     const normalizedTaskId = String(taskId || '').trim();
     if (!normalizedTaskId) throw new Error('AgentMcpClient: taskId is required');
     const args = { taskId: normalizedTaskId };
-    const url = new URL(routerUrl);
-    url.pathname = `/${agentName}/task/cancel`;
+    const url = resolveGeneratedRouterOperation(verified, `/${normalizeAgentName(agentName)}/task/cancel`);
     const payload = Buffer.from(JSON.stringify(args), 'utf8');
     const httpModule = url.protocol === 'https:' ? https : http;
     const assertion = signAgentAssertion({
@@ -352,7 +378,7 @@ function cancelTask(agentName, taskId, routerUrl = getRouterUrl()) {
             path: url.pathname,
             method: 'POST',
             headers: {
-                host: getRouterAuthority(url),
+                host: getRouterAuthority(verified),
                 accept: 'application/json',
                 'content-type': 'application/json',
                 'content-length': payload.length,
@@ -445,7 +471,7 @@ function isTaskNotFoundError(error) {
     return normalized.includes('not_found') || normalized.includes('task not found') || normalized.includes('status 404');
 }
 
-function stopTaskPoller(taskId) {
+function stopTaskPoller(taskPollers, taskId, reason = null) {
     const poller = taskPollers.get(taskId);
     if (!poller) {
         return;
@@ -454,19 +480,19 @@ function stopTaskPoller(taskId) {
         clearTimeout(poller.timer);
     }
     taskPollers.delete(taskId);
-}
-
-function stopAllTaskPollers() {
-    for (const poller of taskPollers.values()) {
-        if (poller.timer) {
-            clearTimeout(poller.timer);
-        }
+    if (reason && typeof poller.cancel === 'function') {
+        poller.cancel(reason);
     }
-    taskPollers.clear();
 }
 
-function parseTaskStatusResponse(agentName, taskId, routerUrl) {
-    return getTaskStatus(agentName, taskId, routerUrl)
+function stopAllTaskPollers(taskPollers, reason = new Error('AgentMcpClient: client closed')) {
+    for (const taskId of [...taskPollers.keys()]) {
+        stopTaskPoller(taskPollers, taskId, reason);
+    }
+}
+
+function parseTaskStatusResponse(agentName, taskId, descriptor, timeoutMs) {
+    return getTaskStatus(agentName, taskId, descriptor, timeoutMs)
         .then((task) => ({ state: 'ok', task }))
         .catch((error) => {
             if (isTaskNotFoundError(error)) {
@@ -476,15 +502,28 @@ function parseTaskStatusResponse(agentName, taskId, routerUrl) {
         });
 }
 
-async function pollTaskStatus(agentName, taskId, callback, options = {}) {
+async function pollTaskStatus(taskPollers, agentName, taskId, callback, options = {}) {
     const poller = taskPollers.get(taskId);
     if (!poller) {
         return;
     }
+    const remainingMs = Number(options.deadline || 0) - Date.now();
+    if (Number(options.deadline || 0) > 0 && remainingMs <= 0) {
+        stopTaskPoller(taskPollers, taskId, callTimeoutError(options.timeoutMs));
+        return;
+    }
     try {
-        const result = await parseTaskStatusResponse(agentName, taskId, options.routerUrl);
+        const requestDescriptor = typeof options.descriptorProvider === 'function'
+            ? options.descriptorProvider()
+            : options.descriptor;
+        const result = await parseTaskStatusResponse(
+            agentName,
+            taskId,
+            requestDescriptor,
+            Number(options.deadline || 0) > 0 ? Math.max(1, remainingMs) : DEFAULT_CALL_TIMEOUT_MS,
+        );
         if (result.state === 'not_found') {
-            stopTaskPoller(taskId);
+            stopTaskPoller(taskPollers, taskId);
             callback({
                 id: taskId,
                 status: 'failed',
@@ -509,7 +548,7 @@ async function pollTaskStatus(agentName, taskId, callback, options = {}) {
             }
             const isTerminal = status === 'completed' || status === 'failed' || status === 'cancelled';
             if (isTerminal) {
-                stopTaskPoller(taskId);
+                stopTaskPoller(taskPollers, taskId);
                 return;
             }
         }
@@ -519,9 +558,12 @@ async function pollTaskStatus(agentName, taskId, callback, options = {}) {
     }
 
     if (taskPollers.has(taskId)) {
+        const delayMs = Number(options.deadline || 0) > 0
+            ? Math.min(TASK_POLL_INTERVAL_MS, Math.max(1, Number(options.deadline) - Date.now()))
+            : TASK_POLL_INTERVAL_MS;
         const timer = setTimeout(() => {
-            void pollTaskStatus(agentName, taskId, callback, options);
-        }, TASK_POLL_INTERVAL_MS);
+            void pollTaskStatus(taskPollers, agentName, taskId, callback, options);
+        }, delayMs);
         const pollerRef = taskPollers.get(taskId);
         if (pollerRef) {
             pollerRef.timer = timer;
@@ -529,7 +571,7 @@ async function pollTaskStatus(agentName, taskId, callback, options = {}) {
     }
 }
 
-function startTaskPolling(agentName, taskId, callback, _options = {}) {
+function startTaskPolling(taskPollers, agentName, taskId, callback, _options = {}) {
     if (!taskId || typeof callback !== 'function' || taskPollers.has(taskId)) {
         return;
     }
@@ -538,8 +580,9 @@ function startTaskPolling(agentName, taskId, callback, _options = {}) {
         lastStatus: null,
         lastLogSeq: null,
         lastError: null,
+        cancel: _options.onCancel,
     });
-    void pollTaskStatus(agentName, taskId, callback, _options);
+    void pollTaskStatus(taskPollers, agentName, taskId, callback, _options);
 }
 
 /**
@@ -549,10 +592,22 @@ function startTaskPolling(agentName, taskId, callback, _options = {}) {
  * (use a user/session surface for discovery).
  */
 export async function createAgentClient(agentName, options = {}) {
-    const routerUrl = getRouterUrl();
+    // Validate provenance before assertion signing can read the agent secret
+    // and before a request can construct a socket.
+    const injectedDescriptor = options?.routerDescriptor;
+    const descriptor = trustedDescriptor(injectedDescriptor);
+    const descriptorForRequest = () => injectedDescriptor === undefined
+        ? loadVerifiedGeneratedRouterDescriptor()
+        : descriptor;
+    normalizeAgentName(agentName);
     const defaultDelegationToken = normalizeDelegationToken(options?.userDelegationToken);
+    const taskPollers = new Map();
 
     async function requestToolCall(name, args = {}, callOptions = {}) {
+        const timeoutMs = normalizeCallTimeout(callOptions.timeoutMs);
+        const deadline = Date.now() + timeoutMs;
+        const requestDescriptor = descriptorForRequest();
+        resolveGeneratedRouterOperation(requestDescriptor, `/${normalizeAgentName(agentName)}/mcp`);
         const toolArgs = args && typeof args === 'object' && !Array.isArray(args) ? args : {};
         const assertion = signAgentAssertion({
             method: 'POST',
@@ -570,7 +625,14 @@ export async function createAgentClient(agentName, options = {}) {
         const delegationToken = Object.prototype.hasOwnProperty.call(callOptions || {}, 'userDelegationToken')
             ? callOptions.userDelegationToken
             : defaultDelegationToken;
-        const { status, json, text } = await postToolCall(agentName, body, assertion, delegationToken, routerUrl);
+        const { status, json, text } = await postToolCall(
+            agentName,
+            body,
+            assertion,
+            delegationToken,
+            requestDescriptor,
+            timeoutMs,
+        );
         if (json && json.error) {
             const err = new Error(json.error.message || 'agent-to-agent call failed');
             err.code = json.error.code;
@@ -583,11 +645,13 @@ export async function createAgentClient(agentName, options = {}) {
         return {
             result: unwrapToolResult(json.result),
             toolArgs,
+            timeoutMs,
+            deadline,
         };
     }
 
     async function callTool(name, args = {}, callOptions = {}) {
-        const { result } = await requestToolCall(name, args, callOptions);
+        const { result, timeoutMs, deadline } = await requestToolCall(name, args, callOptions);
         const taskId = normalizeTaskId(result);
         if (!taskId) {
             return result;
@@ -605,12 +669,14 @@ export async function createAgentClient(agentName, options = {}) {
 
         const finalTask = await new Promise((resolve, reject) => {
             let settled = false;
+            let deadlineTimer = null;
             const finalize = (task, isError = false) => {
                 if (settled) {
                     return;
                 }
                 settled = true;
-                stopTaskPoller(taskId);
+                if (deadlineTimer) clearTimeout(deadlineTimer);
+                stopTaskPoller(taskPollers, taskId);
                 if (isError) {
                     reject(task);
                 } else {
@@ -618,7 +684,15 @@ export async function createAgentClient(agentName, options = {}) {
                 }
             };
 
-            startTaskPolling(agentName, taskId, (task) => {
+            const remainingMs = deadline - Date.now();
+            if (remainingMs <= 0) {
+                finalize(callTimeoutError(timeoutMs), true);
+                return;
+            }
+            deadlineTimer = setTimeout(() => {
+                finalize(callTimeoutError(timeoutMs), true);
+            }, remainingMs);
+            startTaskPolling(taskPollers, agentName, taskId, (task) => {
                 emitTaskUpdate(callOptions.onTaskUpdate, task);
                 if (!task || typeof task !== 'object') {
                     return;
@@ -629,7 +703,12 @@ export async function createAgentClient(agentName, options = {}) {
                 } else if (status === 'failed' || status === 'cancelled' || status === 'not_found') {
                     finalize(taskError(task), true);
                 }
-            }, { routerUrl });
+            }, {
+                descriptorProvider: descriptorForRequest,
+                deadline,
+                timeoutMs,
+                onCancel: (error) => finalize(error, true),
+            });
         });
 
         return parseTaskPayload(finalTask);
@@ -650,7 +729,7 @@ export async function createAgentClient(agentName, options = {}) {
             toolName: metadata?.toolName || name,
             toolArgs,
             metadata,
-            routerUrl,
+            descriptorProvider: descriptorForRequest,
         });
         return observedResult || result;
     }
@@ -662,17 +741,17 @@ export async function createAgentClient(agentName, options = {}) {
     return {
         callTool,
         callToolWithoutWait,
-        getAgentStatus: (agentRef = agentName) => getAgentStatus(agentRef, routerUrl),
-        ensureAgentRunning: (agentRef = agentName, startOptions = {}) => ensureAgentRunning(agentRef, startOptions, routerUrl),
-        getTaskStatus: (taskId) => getTaskStatus(agentName, taskId, routerUrl),
-        cancelTask: (taskId) => cancelTask(agentName, taskId, routerUrl),
+        getAgentStatus: (agentRef = agentName) => getAgentStatus(agentRef, descriptorForRequest()),
+        ensureAgentRunning: (agentRef = agentName, startOptions = {}) => ensureAgentRunning(agentRef, startOptions, descriptorForRequest()),
+        getTaskStatus: (taskId) => getTaskStatus(agentName, taskId, descriptorForRequest()),
+        cancelTask: (taskId) => cancelTask(agentName, taskId, descriptorForRequest()),
         connect: async () => {},
         listTools: unsupported('listTools'),
         listResources: unsupported('listResources'),
         readResource: unsupported('readResource'),
         ping: unsupported('ping'),
         close: async () => {
-            stopAllTaskPollers();
+            stopAllTaskPollers(taskPollers);
         },
     };
 }

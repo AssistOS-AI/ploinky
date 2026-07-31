@@ -15,6 +15,7 @@ import {
     reinstallAgent,
     waitForManifestReadiness,
     activatePreparedRuntimeAfterReadiness,
+    cleanupFailedPreparedRuntime,
 } from './workspaceUtil.js';
 import { withMaintenanceLock } from '../utils/runtime/maintenanceLocks.js';
 import { printComponentAccess } from '../server/utils/routerEnv.js';
@@ -75,7 +76,7 @@ import {
 } from '../utils/runtime/profileService.js';
 import { resolvePersistedRouterPort, resolveRouterEndpoint } from '../sandbox/routerPort.js';
 import { runOuterRuntimeShell } from '../sandbox/runtimeShell.js';
-import { createNetworkLifecycleAdapter } from '../sandbox/networkLifecycle.js';
+import { createNetworkLifecycleAdapter, withNetworkLifecycleLock } from '../sandbox/networkLifecycle.js';
 import { inactivateEdgeRoutingGeneration } from '../sandbox/edgeGeneration.js';
 
 let llmAgentsLoadPromise = null;
@@ -385,8 +386,9 @@ async function handleCommand(args) {
                 }
             }
             // The global --branch also drives the achillesAgentLib used by agent
-            // containers (best-effort: the branch when the achillesAgentLib remote
-            // has it, else the pinned #master). Propagated via PLOINKY_AGENTLIB_REF,
+            // containers (the branch must exist on the achillesAgentLib remote;
+            // missing AgentLib branches abort without a pinned-ref fallback).
+            // Propagated via PLOINKY_AGENTLIB_REF,
             // read host-side by readGlobalDepsPackage and inherited by the
             // Watchdog/router via buildRouterEnv.
             const agentlibRef = resolveAgentlibBranchRef(startParsed.branchPolicy);
@@ -538,33 +540,39 @@ async function handleCommand(args) {
                                     agent: resolved.shortAgentName,
                                     repo: resolved.repo,
                                 },
-                            }, async () => {
+                            }, async () => withNetworkLifecycleLock(async (networkLifecycleCapability) => {
                                 const result = ensureAgentService(resolved.shortAgentName, manifest, path.dirname(resolved.manifestPath), {
                                     containerName,
                                     alias: registryRecord?.record?.alias,
                                     profileName: profileResolution.resolvedProfileName,
                                     profileResolution,
                                     routerEndpoint,
+                                    networkLifecycleCapability,
                                 });
-                                await waitForManifestReadiness({
-                                    key: `start:${resolved.shortAgentName}`,
-                                    label: resolved.shortAgentName,
-                                    kind: 'reinstall',
-                                    manifest,
-                                    route: {
-                                        container: result?.containerName || containerName,
-                                        hostPort: result?.hostPort || 0,
-                                    },
-                                });
-                                await activatePreparedRuntimeAfterReadiness({
-                                    result,
-                                    routeKey: registryRecord?.record?.alias || resolved.shortAgentName,
-                                    repoName: registryRecord?.record?.repoName || resolved.repo,
-                                    shortAgentName: resolved.shortAgentName,
-                                    agentPath: path.dirname(resolved.manifestPath),
-                                    alias: registryRecord?.record?.alias || '',
-                                });
-                            });
+                                try {
+                                    await waitForManifestReadiness({
+                                        key: `start:${resolved.shortAgentName}`,
+                                        label: resolved.shortAgentName,
+                                        kind: 'reinstall',
+                                        manifest,
+                                        route: {
+                                            container: result?.containerName || containerName,
+                                            hostPort: result?.hostPort || 0,
+                                        },
+                                    });
+                                    await activatePreparedRuntimeAfterReadiness({
+                                        result,
+                                        routeKey: registryRecord?.record?.alias || resolved.shortAgentName,
+                                        repoName: registryRecord?.record?.repoName || resolved.repo,
+                                        shortAgentName: resolved.shortAgentName,
+                                        agentPath: path.dirname(resolved.manifestPath),
+                                        alias: registryRecord?.record?.alias || '',
+                                    });
+                                } catch (error) {
+                                    cleanupFailedPreparedRuntime(result, error, 'manual-start-readiness-failed');
+                                    throw error;
+                                }
+                            }));
                             console.log('✓ Agent started.');
                         } catch (e) {
                             console.error(`Failed to start container ${containerName}: ${e.message}`);
@@ -581,7 +589,7 @@ async function handleCommand(args) {
                                 agent: resolved.shortAgentName,
                                 repo: resolved.repo,
                             },
-                        }, async () => {
+                        }, async () => withNetworkLifecycleLock(async (networkLifecycleCapability) => {
                             const agentPath = path.dirname(resolved.manifestPath);
                             const restartResult = ensureAgentService(resolved.shortAgentName, manifest, agentPath, {
                                 containerName,
@@ -590,31 +598,37 @@ async function handleCommand(args) {
                                 profileName: profileResolution.resolvedProfileName,
                                 profileResolution,
                                 routerEndpoint,
+                                networkLifecycleCapability,
                             });
                             const {
                                 containerName: newContainerName,
                                 hostPort,
                             } = restartResult;
-                            await waitForManifestReadiness({
-                                key: `restart:${resolved.shortAgentName}`,
-                                label: resolved.shortAgentName,
-                                kind: 'reinstall',
-                                manifest,
-                                route: {
-                                    container: newContainerName,
-                                    hostPort: hostPort || 0,
-                                },
-                            });
+                            try {
+                                await waitForManifestReadiness({
+                                    key: `restart:${resolved.shortAgentName}`,
+                                    label: resolved.shortAgentName,
+                                    kind: 'reinstall',
+                                    manifest,
+                                    route: {
+                                        container: newContainerName,
+                                        hostPort: hostPort || 0,
+                                    },
+                                });
 
-                            await activatePreparedRuntimeAfterReadiness({
-                                result: restartResult,
-                                routeKey: registryRecord?.record?.alias || resolved.shortAgentName,
-                                repoName: registryRecord?.record?.repoName || resolved.repo,
-                                shortAgentName: resolved.shortAgentName,
-                                agentPath,
-                                alias: registryRecord?.record?.alias || '',
-                            });
-                        });
+                                await activatePreparedRuntimeAfterReadiness({
+                                    result: restartResult,
+                                    routeKey: registryRecord?.record?.alias || resolved.shortAgentName,
+                                    repoName: registryRecord?.record?.repoName || resolved.repo,
+                                    shortAgentName: resolved.shortAgentName,
+                                    agentPath,
+                                    alias: registryRecord?.record?.alias || '',
+                                });
+                            } catch (error) {
+                                cleanupFailedPreparedRuntime(restartResult, error, 'manual-restart-readiness-failed');
+                                throw error;
+                            }
+                        }));
 
                         console.log(`✓ Agent restarted (${agentRuntime}).`);
                     } catch (e) {
@@ -640,7 +654,7 @@ async function handleCommand(args) {
                                 agent: resolved.shortAgentName,
                                 repo: resolved.repo,
                             },
-                        }, async () => {
+                        }, async () => withNetworkLifecycleLock(async (networkLifecycleCapability) => {
                             try {
                                 const result = ensureAgentService(resolved.shortAgentName, manifest, path.dirname(resolved.manifestPath), {
                                     containerName,
@@ -649,29 +663,35 @@ async function handleCommand(args) {
                                     profileName: profileResolution.resolvedProfileName,
                                     profileResolution,
                                     routerEndpoint,
+                                    networkLifecycleCapability,
                                 });
-                                await waitForManifestReadiness({
-                                    key: `restart:${resolved.shortAgentName}`,
-                                    label: resolved.shortAgentName,
-                                    kind: 'reinstall',
-                                    manifest,
-                                    route: {
-                                        container: result?.containerName || containerName,
-                                        hostPort: result?.hostPort || 0,
-                                    },
-                                });
-                                await activatePreparedRuntimeAfterReadiness({
-                                    result,
-                                    routeKey: registryRecord?.record?.alias || resolved.shortAgentName,
-                                    repoName: registryRecord?.record?.repoName || resolved.repo,
-                                    shortAgentName: resolved.shortAgentName,
-                                    agentPath: path.dirname(resolved.manifestPath),
-                                    alias: registryRecord?.record?.alias || '',
-                                });
+                                try {
+                                    await waitForManifestReadiness({
+                                        key: `restart:${resolved.shortAgentName}`,
+                                        label: resolved.shortAgentName,
+                                        kind: 'reinstall',
+                                        manifest,
+                                        route: {
+                                            container: result?.containerName || containerName,
+                                            hostPort: result?.hostPort || 0,
+                                        },
+                                    });
+                                    await activatePreparedRuntimeAfterReadiness({
+                                        result,
+                                        routeKey: registryRecord?.record?.alias || resolved.shortAgentName,
+                                        repoName: registryRecord?.record?.repoName || resolved.repo,
+                                        shortAgentName: resolved.shortAgentName,
+                                        agentPath: path.dirname(resolved.manifestPath),
+                                        alias: registryRecord?.record?.alias || '',
+                                    });
+                                } catch (error) {
+                                    cleanupFailedPreparedRuntime(result, error, 'manual-restart-readiness-failed');
+                                    throw error;
+                                }
                             } catch (routeError) {
                                 throw new Error(`managed restart failed: ${routeError?.message || routeError}`);
                             }
-                        });
+                        }));
                         console.log('✓ Agent restarted.');
                     } catch (e) {
                         console.error(`Failed to ${runtimeAction} container ${containerName}: ${e.message}`);

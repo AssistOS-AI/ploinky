@@ -164,8 +164,8 @@ test('monitor rejects manifest bytes changed during ensure before readiness or a
         );
         assert.deepEqual(events.slice(0, 3), [
             'ensure',
-            'preparation-abort',
             'candidate-cleanup:agent_container',
+            'preparation-abort',
         ]);
         assert.equal(events.includes('container_restart_success'), false);
     } finally {
@@ -327,7 +327,7 @@ test('monitor readiness failure aborts the exact preparation, applies no route, 
             /watchdog readiness script failed \(exit 1, output='not ready'\)/,
         );
 
-        assert.deepEqual(events.slice(0, 4), ['ensure', 'readiness', 'preparation-abort', 'candidate-cleanup']);
+        assert.deepEqual(events.slice(0, 4), ['ensure', 'readiness', 'candidate-cleanup', 'preparation-abort']);
         assert.equal(events.includes('container_restart_failed'), true);
         assert.equal(events.includes('container_restart_success'), false);
         assert.equal(target.isRestarting, false);
@@ -399,8 +399,8 @@ test('monitor apply failure aborts the exact preparation, cleans only the failed
             'registry-save',
             'route-candidate-written',
             'generation-apply',
-            'preparation-abort',
             'candidate-cleanup:agent_container',
+            'preparation-abort',
         ]);
         assert.equal(events.includes('container_restart_failed'), true);
         assert.equal(events.includes('container_restart_success'), false);

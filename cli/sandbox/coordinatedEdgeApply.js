@@ -6,23 +6,39 @@ import {
     isGenerationCapabilityRuntimeEffective,
     restartGenerationCapabilityRuntime,
 } from './docker/agentServiceManager.js';
+import { withNetworkLifecycleLock } from './networkLifecycle.js';
 
-export function applyEdgeRoutingGeneration(options = {}) {
-    return applyEdgeRoutingGenerationRaw({
+function coordinatedOptions(options, networkLifecycleCapability) {
+    return {
         ...options,
+        networkLifecycleCapability,
         isCapabilityRuntimeEffective: options.isCapabilityRuntimeEffective
             || isGenerationCapabilityRuntimeEffective,
         restartCapabilityRuntime: options.restartCapabilityRuntime || restartGenerationCapabilityRuntime,
-    });
+    };
+}
+
+export function applyEdgeRoutingGeneration(options = {}) {
+    return withNetworkLifecycleLock(
+        (networkLifecycleCapability) => applyEdgeRoutingGenerationRaw(
+            coordinatedOptions(options, networkLifecycleCapability),
+        ),
+        options.networkLifecycleCapability === undefined
+            ? {}
+            : { capability: options.networkLifecycleCapability },
+    );
 }
 
 export function applyEdgeDesiredStateFile(candidateFile, options = {}) {
-    return applyEdgeDesiredStateFileRaw(candidateFile, {
-        ...options,
-        isCapabilityRuntimeEffective: options.isCapabilityRuntimeEffective
-            || isGenerationCapabilityRuntimeEffective,
-        restartCapabilityRuntime: options.restartCapabilityRuntime || restartGenerationCapabilityRuntime,
-    });
+    return withNetworkLifecycleLock(
+        (networkLifecycleCapability) => applyEdgeDesiredStateFileRaw(
+            candidateFile,
+            coordinatedOptions(options, networkLifecycleCapability),
+        ),
+        options.networkLifecycleCapability === undefined
+            ? {}
+            : { capability: options.networkLifecycleCapability },
+    );
 }
 
 export default applyEdgeRoutingGeneration;

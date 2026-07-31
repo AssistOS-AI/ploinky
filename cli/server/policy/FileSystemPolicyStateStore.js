@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { PLOINKY_WORKSPACE_ROOT } from '../../utils/config.js';
 import {
+    captureEdgeRoutingCandidateGeneration,
     inactivateEdgeRoutingGeneration,
     withEdgeGenerationApplyLock,
 } from '../../sandbox/edgeGeneration.js';
@@ -114,19 +115,28 @@ export class FileSystemPolicyStateStore extends PolicyStateStore {
             installDurableCandidate(file, bytes, {
                 beforeReplace: this._testHooks.beforeCandidateReplace,
             });
-            if (this._coordinate) {
-                applyEdgeRoutingGeneration({
-                    reason: 'policy-write',
-                    workspaceRoot: PLOINKY_WORKSPACE_ROOT,
-                    applyLockCapability,
-                });
-            }
-            return this._version(fs.statSync(file));
+            return {
+                version: this._version(fs.statSync(file)),
+                expectedGeneration: this._coordinate
+                    ? captureEdgeRoutingCandidateGeneration({
+                        workspaceRoot: PLOINKY_WORKSPACE_ROOT,
+                        applyLockCapability,
+                    })
+                    : undefined,
+            };
         };
-        if (!this._coordinate) return install(undefined);
+        if (!this._coordinate) return install(undefined).version;
         const workspaceLease = this._createWorkspaceLease({ operation: 'policy-write' });
         try {
-            return withEdgeGenerationApplyLock(install, { workspaceRoot: PLOINKY_WORKSPACE_ROOT });
+            const installed = withEdgeGenerationApplyLock(install, {
+                workspaceRoot: PLOINKY_WORKSPACE_ROOT,
+            });
+            applyEdgeRoutingGeneration({
+                reason: 'policy-write',
+                workspaceRoot: PLOINKY_WORKSPACE_ROOT,
+                expectedGeneration: installed.expectedGeneration,
+            });
+            return installed.version;
         } finally {
             if (!this._releaseWorkspaceLease(workspaceLease)) {
                 const error = new Error('policy write could not release the workspace mutation lease');

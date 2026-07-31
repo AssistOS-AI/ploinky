@@ -10,20 +10,23 @@ const { resolveAgentlibBranchRef } = await import(`${depInstallerUrl.href}${suff
 const yes = () => true;   // stub: branch exists on the achillesAgentLib remote
 const no = () => false;   // stub: branch absent
 
-// resolveAgentlibBranchRef — best-effort: use the branch if the remote has it,
-// otherwise honor --branch-fallback (default → null/pinned master, fail → throw).
+// resolveAgentlibBranchRef — use the branch if the remote has it and reject a
+// missing branch without silently substituting the pinned dependency spec.
 test('resolveAgentlibBranchRef: branch present on remote returns the branch', () => {
     assert.equal(resolveAgentlibBranchRef({ branch: 'feat', fallback: 'default' }, { branchExists: yes, url: 'u' }), 'feat');
 });
 
-test('resolveAgentlibBranchRef: branch absent with default fallback returns null (pinned master)', () => {
-    assert.equal(resolveAgentlibBranchRef({ branch: 'feat', fallback: 'default' }, { branchExists: no, url: 'u' }), null);
+test('resolveAgentlibBranchRef: branch absent with default fallback throws', () => {
+    assert.throws(
+        () => resolveAgentlibBranchRef({ branch: 'feat', fallback: 'default' }, { branchExists: no, url: 'u' }),
+        /refusing AgentLib dependency fallback/,
+    );
 });
 
 test('resolveAgentlibBranchRef: branch absent with fail fallback throws', () => {
     assert.throws(
         () => resolveAgentlibBranchRef({ branch: 'feat', fallback: 'fail' }, { branchExists: no, url: 'u' }),
-        /not found/,
+        /refusing AgentLib dependency fallback/,
     );
 });
 

@@ -17,7 +17,7 @@ const BRANCH = 'soul-gateway-local-integration';
 test('readGlobalDepsPackage honors an explicit env argument', () => {
     const base = readGlobalDepsPackage({});
     const over = readGlobalDepsPackage({ PLOINKY_AGENTLIB_REF: BRANCH });
-    assert.match(base.dependencies.achillesAgentLib, /#master$/);
+    assert.match(base.dependencies.achillesAgentLib, /#[0-9a-f]{40}$/);
     assert.match(over.dependencies.achillesAgentLib, new RegExp(`#${BRANCH}$`));
 });
 
@@ -32,9 +32,9 @@ test('resolveGlobalCacheManifest: override changes both the package and the cach
     assert.equal(over.hash.length, 64);
 });
 
-test('resolveGlobalCacheManifest: no override resolves master with a stable hash', () => {
+test('resolveGlobalCacheManifest: no override resolves the immutable baseline with a stable hash', () => {
     const a = resolveGlobalCacheManifest({});
     const b = resolveGlobalCacheManifest({});
-    assert.match(a.pkg.dependencies.achillesAgentLib, /#master$/);
+    assert.match(a.pkg.dependencies.achillesAgentLib, /#[0-9a-f]{40}$/);
     assert.equal(a.hash, b.hash);
 });

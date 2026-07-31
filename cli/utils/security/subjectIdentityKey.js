@@ -37,6 +37,10 @@ const SUBKEY_PURPOSE = `storage/${KEYPAIR_NAME}`;
 // a usable KeyObject by re-prepending this prefix. Keep encode/decode symmetric.
 const ED25519_SPKI_PREFIX = Buffer.from('302a300506032b6570032100', 'hex');
 const ED25519_PUBLIC_KEY_BYTES = 32;
+const GENERATED_ROUTER_DESCRIPTOR_DOMAIN = Buffer.from(
+    'PLOINKY\0GENERATED_LOCAL_ROUTER_DESCRIPTOR\0V1\0',
+    'utf8',
+);
 
 // Separate validators per subject type. Each is anchored end-to-end so a single
 // extra delimiter, whitespace, or empty segment fails the match. The allowed
@@ -148,8 +152,11 @@ function decodePublicKey(publicKeyBase64url) {
     }
     // Buffer.from(..., 'base64url') never throws on malformed input; the
     // 32-byte length check below is the real guard against bad public keys.
+    if (!/^[A-Za-z0-9_-]+$/.test(publicKeyBase64url)) {
+        throw new SubjectIdentityKeyError('INVALID_PUBLIC_KEY', 'Subject identity public key must use canonical unpadded base64url.');
+    }
     const raw = Buffer.from(publicKeyBase64url, 'base64url');
-    if (raw.length !== ED25519_PUBLIC_KEY_BYTES) {
+    if (raw.length !== ED25519_PUBLIC_KEY_BYTES || raw.toString('base64url') !== publicKeyBase64url) {
         throw new SubjectIdentityKeyError('INVALID_PUBLIC_KEY', 'Subject identity public key must decode to 32 raw Ed25519 bytes.');
     }
     const spki = Buffer.concat([ED25519_SPKI_PREFIX, raw]);
@@ -158,6 +165,23 @@ function decodePublicKey(publicKeyBase64url) {
     } catch (_) {
         throw new SubjectIdentityKeyError('INVALID_PUBLIC_KEY', 'Subject identity public key could not be parsed as Ed25519.');
     }
+}
+
+function normalizeDescriptorPayloadBytes(payloadBytes) {
+    if (!Buffer.isBuffer(payloadBytes) && !(payloadBytes instanceof Uint8Array)) {
+        throw new SubjectIdentityKeyError(
+            'INVALID_DESCRIPTOR_PAYLOAD',
+            'Generated Router descriptor payload must be supplied as exact bytes.',
+        );
+    }
+    return Buffer.from(payloadBytes);
+}
+
+function buildGeneratedRouterDescriptorSigningBytes(payloadBytes) {
+    const payload = normalizeDescriptorPayloadBytes(payloadBytes);
+    const length = Buffer.alloc(8);
+    length.writeBigUInt64BE(BigInt(payload.length));
+    return Buffer.concat([GENERATED_ROUTER_DESCRIPTOR_DOMAIN, length, payload]);
 }
 
 // Validate a subject id and classify it. Returns { subjectId, subjectType }.
@@ -271,6 +295,41 @@ function verifySubjectIdentityKey(apiKey, publicKey) {
     return { subjectId: validSubjectId, subjectType };
 }
 
+// Sign an already-canonicalized generated-local Router descriptor payload.
+// Domain separation and the explicit UINT64_BE byte length prevent the
+// signature from being confused with subject keys or another content type.
+// The private key never leaves this module.
+function signGeneratedRouterDescriptor(payloadBytes) {
+    const signingBytes = buildGeneratedRouterDescriptorSigningBytes(payloadBytes);
+    const { privateKeyObject } = loadOrCreateKeyObjects();
+    return crypto.sign(null, signingBytes, privateKeyObject).toString('base64url');
+}
+
+function verifyGeneratedRouterDescriptorSignature(payloadBytes, signature, publicKey) {
+    if (typeof signature !== 'string'
+        || !/^[A-Za-z0-9_-]+$/.test(signature)
+        || Buffer.from(signature, 'base64url').toString('base64url') !== signature) {
+        throw new SubjectIdentityKeyError(
+            'MALFORMED_DESCRIPTOR_SIGNATURE',
+            'Generated Router descriptor signature must use canonical unpadded base64url.',
+        );
+    }
+    const decodedSignature = Buffer.from(signature, 'base64url');
+    if (decodedSignature.length !== 64) {
+        throw new SubjectIdentityKeyError(
+            'MALFORMED_DESCRIPTOR_SIGNATURE',
+            'Generated Router descriptor signature must be a 64-byte Ed25519 signature.',
+        );
+    }
+    const publicKeyObject = decodePublicKey(publicKey);
+    const signingBytes = buildGeneratedRouterDescriptorSigningBytes(payloadBytes);
+    try {
+        return crypto.verify(null, signingBytes, publicKeyObject, decodedSignature);
+    } catch (_) {
+        return false;
+    }
+}
+
 export {
     SubjectIdentityKeyError,
     KEYPAIR_NAME,
@@ -278,4 +337,6 @@ export {
     getSubjectIdentityPublicKey,
     buildSubjectIdentityKey,
     verifySubjectIdentityKey,
+    signGeneratedRouterDescriptor,
+    verifyGeneratedRouterDescriptorSignature,
 };

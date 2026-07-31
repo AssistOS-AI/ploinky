@@ -5,7 +5,6 @@ import os from 'node:os';
 import path from 'node:path';
 
 import { RESERVED_AGENT_ENV_NAMES } from '../../cli/utils/security/agentIdentityEnv.js';
-import { PLOINKY_WORKSPACE_ROOT } from '../../cli/utils/config.js';
 import { buildLifecycleHookEnv, executeHostHook } from '../../cli/utils/runtime/lifecycleHooks.js';
 
 // Host hooks (preinstall, hosthook_aftercreation, hosthook_postinstall) run on the
@@ -120,19 +119,18 @@ test('host hook replaces a container-only agent library path with the host Agent
     });
 });
 
-test('host hook receives the generated fallback PLOINKY_MASTER_KEY seed', () => {
+test('host hook does not create or receive a fallback PLOINKY_MASTER_KEY seed', () => {
     withoutExportedRootOrMaster(() => withTmpWorkspace((dir) => {
         const { hookPath, outPath } = writeMasterProbeHook(dir);
         const result = executeHostHook(hookPath, { HOOK_OUT: outPath }, { cwd: dir });
         assert.equal(result.success, true, result.message);
 
-        const generatedSeed = fs.readFileSync(path.join(dir, '.ploinky', 'master-key'), 'utf8').trim();
-        assert.ok(generatedSeed.length > 0);
-        assert.equal(fs.readFileSync(outPath, 'utf8'), generatedSeed);
+        assert.equal(fs.existsSync(path.join(dir, '.ploinky', 'master-key')), false);
+        assert.equal(fs.readFileSync(outPath, 'utf8'), 'UNSET');
     }));
 });
 
-test('host hook preserves an explicitly provided PLOINKY_MASTER_KEY', () => {
+test('host hook strips an explicitly provided PLOINKY_MASTER_KEY', () => {
     withoutExportedRootOrMaster(() => withTmpWorkspace((dir) => {
         const { hookPath, outPath } = writeMasterProbeHook(dir);
         const result = executeHostHook(
@@ -141,12 +139,12 @@ test('host hook preserves an explicitly provided PLOINKY_MASTER_KEY', () => {
             { cwd: dir }
         );
         assert.equal(result.success, true, result.message);
-        assert.equal(fs.readFileSync(outPath, 'utf8'), 'explicit-master');
+        assert.equal(fs.readFileSync(outPath, 'utf8'), 'UNSET');
         assert.equal(fs.existsSync(path.join(dir, '.ploinky', 'master-key')), false);
     }));
 });
 
-test('host lifecycle hooks receive authoritative box edge locators after manifest and profile env', () => {
+test('host lifecycle hooks remain principal-only after manifest, profile, and identity injection', () => {
     withTmpWorkspace((dir) => {
         fs.writeFileSync(path.join(dir, 'manifest.json'), JSON.stringify({
             env: [
@@ -156,7 +154,15 @@ test('host lifecycle hooks receive authoritative box edge locators after manifes
                 { name: 'PLOINKY_INTERNAL_ROUTER_URL', default: 'http://manifest.invalid:2' },
             ],
         }));
-        const identity = { PLOINKY_AGENT_ID: 'agent:demo/fixture' };
+        const identity = {
+            PLOINKY_AGENT_ID: 'agent:demo/fixture',
+            PLOINKY_AGENT_PRINCIPAL: 'agent:demo/fixture',
+            PLOINKY_AGENT_API_KEY: 'forbidden-api-key',
+            PLOINKY_AGENT_SECRET: 'forbidden-request-secret',
+            PLOINKY_AGENT_PRIVATE_SECRET: 'forbidden-private-secret',
+            PLOINKY_AGENT_API_PUBLIC_KEY: 'forbidden-trust-anchor',
+            PLOINKY_ROUTER_DESCRIPTOR_FILE: '/forbidden/descriptor.json',
+        };
         const build = (profileConfig) => buildLifecycleHookEnv({
             agentName: 'fixture',
             repoName: 'demo',
@@ -176,20 +182,21 @@ test('host lifecycle hooks receive authoritative box edge locators after manifes
                 PLOINKY_INTERNAL_ROUTER_URL: 'http://profile.invalid:2',
             },
         });
-        const expectedTopology = path.join(
-            PLOINKY_WORKSPACE_ROOT,
-            '.ploinky',
-            'run',
-            'edge-topology',
-            'current.json',
-        );
-
         for (const env of [manifestEnv, profileEnv]) {
-            assert.equal(env.PLOINKY_EDGE_TOPOLOGY_FILE, expectedTopology);
-            assert.equal(env.PLOINKY_ROUTER_URL, 'http://127.0.0.1:8080');
-            assert.equal(env.PLOINKY_ROUTER_AUTHORITY, '127.0.0.1:8080');
-            assert.equal(env.PLOINKY_INTERNAL_ROUTER_URL, 'http://127.0.0.1:8081');
             assert.equal(env.PLOINKY_AGENT_ID, identity.PLOINKY_AGENT_ID);
+            assert.equal(env.PLOINKY_AGENT_PRINCIPAL, identity.PLOINKY_AGENT_PRINCIPAL);
+            for (const name of [
+                'PLOINKY_MASTER_KEY',
+                'PLOINKY_AGENT_API_KEY',
+                'PLOINKY_AGENT_SECRET',
+                'PLOINKY_AGENT_PRIVATE_SECRET',
+                'PLOINKY_AGENT_API_PUBLIC_KEY',
+                'PLOINKY_ROUTER_DESCRIPTOR_FILE',
+                'PLOINKY_EDGE_TOPOLOGY_FILE',
+                'PLOINKY_ROUTER_URL',
+                'PLOINKY_ROUTER_AUTHORITY',
+                'PLOINKY_INTERNAL_ROUTER_URL',
+            ]) assert.equal(env[name], undefined, `${name} must not exist before attestation`);
         }
         for (const name of [
             'PLOINKY_EDGE_TOPOLOGY_FILE',
@@ -198,6 +205,47 @@ test('host lifecycle hooks receive authoritative box edge locators after manifes
             'PLOINKY_INTERNAL_ROUTER_URL',
         ]) {
             assert.ok(RESERVED_AGENT_ENV_NAMES.includes(name), `${name} must be reserved`);
+        }
+    });
+});
+
+test('executed host hook observes no inherited or caller-supplied key, descriptor, trust, or Router state', () => {
+    withTmpWorkspace((dir) => {
+        const hookPath = path.join(dir, 'env-probe.sh');
+        const outPath = path.join(dir, 'env-seen.txt');
+        fs.writeFileSync(hookPath, '#!/usr/bin/env bash\nenv | LC_ALL=C sort > "$HOOK_OUT"\n');
+        const sensitive = {
+            PLOINKY_MASTER_KEY: 'master',
+            PLOINKY_AGENT_API_KEY: 'api',
+            PLOINKY_AGENT_SECRET: 'request',
+            PLOINKY_AGENT_PRIVATE_SECRET: 'private',
+            PLOINKY_AGENT_API_PUBLIC_KEY: 'trust',
+            PLOINKY_ROUTER_DESCRIPTOR_FILE: '/descriptor',
+            PLOINKY_EDGE_TOPOLOGY_FILE: '/topology',
+            PLOINKY_ROUTER_URL: 'http://router.invalid',
+            PLOINKY_INTERNAL_ROUTER_URL: 'http://router.invalid/internal',
+        };
+        const previous = Object.fromEntries(Object.keys(sensitive).map((name) => [name, process.env[name]]));
+        Object.assign(process.env, sensitive);
+        try {
+            const result = executeHostHook(hookPath, {
+                ...sensitive,
+                HOOK_OUT: outPath,
+                PLOINKY_AGENT_ID: 'agent:demo/fixture',
+                PLOINKY_AGENT_PRINCIPAL: 'agent:demo/fixture',
+            }, { cwd: dir });
+            assert.equal(result.success, true, result.message);
+            const observed = fs.readFileSync(outPath, 'utf8');
+            for (const name of Object.keys(sensitive)) {
+                assert.doesNotMatch(observed, new RegExp(`^${name}=`, 'm'), `${name} leaked to executed hook`);
+            }
+            assert.match(observed, /^PLOINKY_AGENT_ID=agent:demo\/fixture$/m);
+            assert.match(observed, /^PLOINKY_AGENT_PRINCIPAL=agent:demo\/fixture$/m);
+        } finally {
+            for (const [name, value] of Object.entries(previous)) {
+                if (value === undefined) delete process.env[name];
+                else process.env[name] = value;
+            }
         }
     });
 });

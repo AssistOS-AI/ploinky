@@ -13,7 +13,7 @@
         "clean": "rm -rf test_run_dir",
         "test": "./tests/run-all.sh",
         "e2e:routing-proxy": "node tests/e2e/routingProxy/run.mjs",
-        "postinstall": "cd node_modules; git clone https://github.com/AssistOS-AI/AchillesAgentLib.git achillesAgentLib"
+        "postinstall": "node ./ploinky-box/entrypoint/install-dependencies.mjs"
     },
     "keywords": [
         "ploinky",

@@ -46,6 +46,11 @@ import {
     classifyPrivateListenerRequest,
     createPrivateListenerSet,
 } from './privateListenerSet.js';
+import {
+    createRouterAuthorityAttestationRegistry,
+    handleRouterAuthorityAttestationRequest,
+    recordRouterAuthorityObservation,
+} from './routerAuthorityAttestationRegistry.js';
 import { verifyBrowserMutationRequest } from './browserMutationSecurity.js';
 import { executeHttpPlan } from './proxy/executeHttpPlan.js';
 import { executeWebSocketPlan } from './proxy/executeWebSocketPlan.js';
@@ -103,6 +108,7 @@ const runtimeRelayManager = new RuntimeRelayManager({
 const detailedHealthSocket = process.env.PLOINKY_ROUTER_HEALTH_SOCKET
     || path.join(PLOINKY_DIR, 'run', 'router-health.sock');
 const interfaceClassifier = createListenerInterfaceClassifier();
+const routerAuthorityAttestationRegistry = createRouterAuthorityAttestationRegistry();
 
 if (Object.prototype.hasOwnProperty.call(process.env, 'PORT') && process.env.PORT !== String(port)) {
     throw new Error('the managed Router requires PORT to be exactly 8080 when set; --port selects only the outer loopback host port');
@@ -342,7 +348,8 @@ async function processRequest(req, res) {
         sendJsonResponse(res, 400, { error: 'malformed_request_target_or_host' }, { 'Cache-Control': 'no-store' });
         return;
     }
-    const listener = interfaceClassifier.classify(req.socket?.localAddress) === 'managed'
+    const rawInterfaceClass = interfaceClassifier.classify(req.socket?.localAddress);
+    const listener = rawInterfaceClass === 'managed'
         ? 'managed'
         : 'public';
     req.ploinkyListenerClass = listener;
@@ -350,6 +357,14 @@ async function processRequest(req, res) {
     const controlMiss = !routePlan.ok
         && routePlan.code === 'ROUTE_NOT_FOUND'
         && routePlan.hostSelection?.kind === 'control';
+    recordRouterAuthorityObservation(routerAuthorityAttestationRegistry, {
+        req,
+        normalizedHost: exactHost,
+        effectiveListener: listener,
+        rawInterfaceClass,
+        routePlan,
+        controlMiss,
+    });
     if (!routePlan.ok && !controlMiss) {
         const proofHeaders = routePlan.code === 'HOST_SELECTOR_INACTIVE' && routePlan.lease?.id
             ? { 'X-Ploinky-Edge-Generation': routePlan.lease.id }
@@ -817,6 +832,9 @@ function detailedHealthData() {
 }
 
 async function processDetailedHealthRequest(req, res) {
+    if (await handleRouterAuthorityAttestationRequest(req, res, {
+        registry: routerAuthorityAttestationRegistry,
+    })) return;
     if ((req.method || 'GET').toUpperCase() !== 'GET' || req.url !== '/health') {
         sendJsonResponse(res, 404, { error: 'not_found' }, { 'Cache-Control': 'no-store' });
         return;
@@ -827,6 +845,10 @@ async function processDetailedHealthRequest(req, res) {
 const server = http.createServer(handleAsyncRequest(processRequest, 'request_error'));
 const privateServer = http.createServer(handleAsyncRequest(processPrivateRequest, 'private_request_error'));
 const healthServer = http.createServer(handleAsyncRequest(processDetailedHealthRequest, 'health_request_error'));
+healthServer.requestTimeout = 3_000;
+healthServer.headersTimeout = 3_000;
+healthServer.keepAliveTimeout = 1_000;
+healthServer.setTimeout(3_000, (socket) => socket.destroy());
 const privateListenerSet = createPrivateListenerSet({
     httpServer: privateServer,
     interfaceClassifier,

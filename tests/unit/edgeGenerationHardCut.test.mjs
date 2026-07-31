@@ -9,6 +9,7 @@ import {
     applyEdgeRoutingGeneration,
     assertActiveEdgeRoutingSourcesCurrent,
     captureEdgeRoutingLifecycleMutationGeneration,
+    createRouterAttestationGenerationLease,
     initializeFreshEdgeRoutingSources,
     loadActiveEdgeRoutingGeneration,
     prepareEdgeRoutingGeneration,
@@ -722,6 +723,70 @@ test('durable preparation remains inactive until its exact lease commits', (t) =
     });
     assert.equal(committed.selector.state, 'active');
     assert.equal(committed.selector.generation, prepared.selector.generation);
+});
+
+test('prepared Router attestation remains inactive and binds exact lease, owner, sources, and checkpoint order', (t) => {
+    const fixture = createFixture(t);
+    const prepared = prepareEdgeRoutingGeneration({
+        workspaceRoot: fixture.workspace,
+        reason: 'prepared-attestation',
+    });
+    const owner = {
+        containerName: 'alpha-container',
+        principal: 'agent:fixtures/alpha',
+        instanceId: 'alpha-instance',
+        enableGeneration: 'alpha-enable-generation',
+    };
+    const lease = createRouterAttestationGenerationLease({
+        workspaceRoot: fixture.workspace,
+        preparationLease: prepared.preparationLease,
+        expectedOwner: owner,
+    });
+    assert.equal(lease.id, prepared.selector.generation);
+    assert.deepEqual(lease.owner, owner);
+    assert.throws(
+        () => loadActiveEdgeRoutingGeneration({ workspaceRoot: fixture.workspace }),
+        { code: 'EDGE_GENERATION_INACTIVE' },
+    );
+    assert.throws(() => lease.checkpoint('pre-credentials'), { code: 'EDGE_GENERATION_CHECKPOINT_INVALID' });
+    assert.equal(lease.commit(), true);
+    assert.equal(lease.checkpoint('pre-credentials'), true);
+    assert.equal(lease.checkpoint('pre-runtime'), true);
+    assert.equal(lease.checkpoint('post-inspection'), true);
+    assert.equal(lease.complete, true);
+    assert.throws(
+        () => loadActiveEdgeRoutingGeneration({ workspaceRoot: fixture.workspace }),
+        { code: 'EDGE_GENERATION_INACTIVE' },
+    );
+});
+
+test('prepared Router attestation fails closed when lifecycle sources change between checkpoints', (t) => {
+    const fixture = createFixture(t);
+    const prepared = prepareEdgeRoutingGeneration({
+        workspaceRoot: fixture.workspace,
+        reason: 'prepared-attestation-race',
+    });
+    const lease = createRouterAttestationGenerationLease({
+        workspaceRoot: fixture.workspace,
+        preparationLease: prepared.preparationLease,
+        expectedOwner: {
+            containerName: 'alpha-container',
+            principal: 'agent:fixtures/alpha',
+            instanceId: 'alpha-instance',
+            enableGeneration: 'alpha-enable-generation',
+        },
+    });
+    assert.equal(lease.commit(), true);
+    const agentsFile = path.join(fixture.ploinkyDir, 'agents.json');
+    const agents = JSON.parse(fs.readFileSync(agentsFile, 'utf8'));
+    agents['alpha-container'].enableGeneration = 'competing-generation';
+    fs.writeFileSync(agentsFile, JSON.stringify(agents, null, 2));
+    assert.throws(() => lease.checkpoint('pre-credentials'), { code: 'EDGE_GENERATION_RACE' });
+    assert.equal(lease.complete, false);
+    assert.throws(
+        () => loadActiveEdgeRoutingGeneration({ workspaceRoot: fixture.workspace }),
+        { code: 'EDGE_GENERATION_INACTIVE' },
+    );
 });
 
 test('legacy generation without dependency HTTP routes remains loadable until replacement', (t) => {

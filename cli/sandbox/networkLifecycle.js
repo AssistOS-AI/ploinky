@@ -3,6 +3,7 @@ import fs from 'fs';
 import path from 'path';
 import { randomUUID } from 'crypto';
 import { spawnSync } from 'child_process';
+import { AsyncLocalStorage } from 'node:async_hooks';
 
 import { PLOINKY_DIR, PLOINKY_WORKSPACE_ROOT } from '../utils/config.js';
 import {
@@ -29,8 +30,48 @@ const MANAGED_HOST_NAME = 'host.containers.internal';
 const MANAGED_HOST_MAPPING = `${MANAGED_HOST_NAME}:host-gateway`;
 const LOCK_PATH = path.join(PLOINKY_DIR, 'run', 'network.lock');
 const LOCK_REAPER_SUFFIX = '.reaper';
+const GENERATED_ROUTER_DESCRIPTOR_TARGET = '/run/ploinky/router-descriptor.json';
+const GENERATED_ROUTER_DESCRIPTOR_ROOT = path.join(PLOINKY_DIR, 'run', 'router-descriptors');
 export const NETWORK_LOCK_STALE_GRACE_MS = 5_000;
 export const NETWORK_LOCK_WAIT_MS = 60_000;
+const NETWORK_LIFECYCLE_CAPABILITIES = new WeakMap();
+const NETWORK_LIFECYCLE_CONTEXT = new AsyncLocalStorage();
+
+function captureGeneratedRouterDescriptorArtifact(record) {
+    const mounts = (record?.Mounts || []).filter((mount) => (
+        String(mount?.Destination || '') === GENERATED_ROUTER_DESCRIPTOR_TARGET
+    ));
+    if (!mounts.length) return null;
+    if (mounts.length !== 1 || mounts[0]?.RW !== false) {
+        throw new Error('generated Router descriptor mount ownership is ambiguous');
+    }
+    const source = path.resolve(String(mounts[0]?.Source || ''));
+    const root = path.resolve(GENERATED_ROUTER_DESCRIPTOR_ROOT);
+    const relative = path.relative(root, source);
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.json$/i.test(relative)
+        || relative.startsWith('..') || path.isAbsolute(relative) || relative.includes(path.sep)) {
+        throw new Error('generated Router descriptor source is outside its runtime-owned root');
+    }
+    const stat = fs.lstatSync(source);
+    if (!stat.isFile() || stat.isSymbolicLink() || (stat.mode & 0o777) !== 0o600) {
+        throw new Error('generated Router descriptor source is not an exact 0600 regular file');
+    }
+    const realRoot = fs.realpathSync.native(root);
+    const realSource = fs.realpathSync.native(source);
+    if (realSource !== path.join(realRoot, relative)) {
+        throw new Error('generated Router descriptor source failed real-path confinement');
+    }
+    return Object.freeze({ source, dev: stat.dev, ino: stat.ino });
+}
+
+function cleanupCapturedGeneratedRouterDescriptor(artifact) {
+    if (!artifact) return;
+    const stat = fs.lstatSync(artifact.source);
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.dev !== artifact.dev || stat.ino !== artifact.ino) {
+        throw new Error('generated Router descriptor identity changed before cleanup');
+    }
+    fs.unlinkSync(artifact.source);
+}
 
 function hash12(value) {
     return crypto.createHash('sha256').update(String(value)).digest('hex').slice(0, 12);
@@ -264,19 +305,47 @@ export function acquireNetworkLifecycleLock({
         }
     }
     let released = false;
+    const capability = Object.freeze({});
+    NETWORK_LIFECYCLE_CAPABILITIES.set(capability, lockPath);
     return {
         token,
         owner,
         lockPath,
+        capability,
         release() {
             if (released) return;
             released = true;
+            NETWORK_LIFECYCLE_CAPABILITIES.delete(capability);
             releaseOwnedFile(lockPath, token);
         },
     };
 }
 
+export function assertNetworkLifecycleCapability(capability, {
+    lockPath = LOCK_PATH,
+} = {}) {
+    if (!capability || NETWORK_LIFECYCLE_CAPABILITIES.get(capability) !== lockPath) {
+        const error = new Error('network lifecycle mutation requires the exact live path-bound capability');
+        error.code = 'PLOINKY_NETWORK_LIFECYCLE_CAPABILITY_REQUIRED';
+        throw error;
+    }
+    return capability;
+}
+
 export function withNetworkLifecycleLock(callback, options = {}) {
+    if (typeof callback !== 'function') {
+        throw new Error('network lifecycle mutation requires a callback');
+    }
+    const inheritedCapability = options.capability === undefined
+        ? NETWORK_LIFECYCLE_CONTEXT.getStore()
+        : undefined;
+    if (options.capability !== undefined || inheritedCapability !== undefined) {
+        const capability = assertNetworkLifecycleCapability(
+            options.capability === undefined ? inheritedCapability : options.capability,
+            options,
+        );
+        return callback(capability);
+    }
     const waitMs = Math.max(0, Number(options.waitMs || 0));
     const pollMs = Math.max(10, Number(options.pollMs || 50));
     const deadline = Date.now() + waitMs;
@@ -300,7 +369,21 @@ export function withNetworkLifecycleLock(callback, options = {}) {
             Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, Math.min(pollMs, deadline - Date.now()));
         }
     }
-    try { return callback(lock); } finally { lock.release(); }
+    let result;
+    try {
+        result = NETWORK_LIFECYCLE_CONTEXT.run(
+            lock.capability,
+            () => callback(lock.capability),
+        );
+    } catch (error) {
+        lock.release();
+        throw error;
+    }
+    if (result && typeof result.then === 'function') {
+        return Promise.resolve(result).finally(() => lock.release());
+    }
+    lock.release();
+    return result;
 }
 
 function defaultRun(runtime, args, options = {}) {
@@ -452,6 +535,16 @@ export function createNetworkLifecycleAdapter({
     const execute = (args, options) => run(runtime, args, options);
     let rootlessPodmanVerified = false;
     let managedPodmanVerified = false;
+    let managedPodmanProof = null;
+
+    function stableDigest(value) {
+        const visit = (entry) => {
+            if (entry === null || typeof entry !== 'object') return JSON.stringify(entry);
+            if (Array.isArray(entry)) return `[${entry.map(visit).join(',')}]`;
+            return `{${Object.keys(entry).sort().map((key) => `${JSON.stringify(key)}:${visit(entry[key])}`).join(',')}}`;
+        };
+        return `sha256:${crypto.createHash('sha256').update(visit(value)).digest('hex')}`;
+    }
 
     const inspectNetwork = (name) => {
         const result = execute(['network', 'inspect', name]);
@@ -483,7 +576,7 @@ export function createNetworkLifecycleAdapter({
     }
 
     function ensureManagedPodman() {
-        if (managedPodmanVerified) return;
+        if (managedPodmanVerified) return managedPodmanProof;
         ensureRootlessPodman();
         const version = execute(['version', '--format', '{{.Server.Version}}']);
         if (!version.ok || !versionAtLeast(jsonScalar(version.stdout), 5, 4)) {
@@ -528,7 +621,18 @@ export function createNetworkLifecycleAdapter({
         // this client. The managed transaction therefore verifies the exact
         // HostConfig and running /etc/hosts entry after remote container creation
         // and removes the candidate on any mismatch.
+        managedPodmanProof = Object.freeze({
+            engine: 'podman',
+            rootless: true,
+            version: jsonScalar(version.stdout),
+            backend: 'netavark',
+            remote: remoteServiceValue === 'true',
+            pastaExecutable,
+            pastaVersion,
+            platform: process.platform,
+        });
         managedPodmanVerified = true;
+        return managedPodmanProof;
     }
 
     function assertSupportedNetwork(record, name, labels) {
@@ -640,11 +744,12 @@ export function createNetworkLifecycleAdapter({
         if (contract.mode === 'host') {
             return { mode: 'host', alias, args: ['--network', 'host'], attachments: [] };
         }
-        ensureManagedPodman();
+        const runtimeProof = ensureManagedPodman();
         return {
             mode: contract.mode,
             alias,
             attachments: validateExpectedBridges(contract, canonicalAgentId, instanceKey),
+            runtimeProof,
         };
     }
 
@@ -690,6 +795,13 @@ export function createNetworkLifecycleAdapter({
                 '--hosts-file=none',
                 '--add-host', MANAGED_HOST_MAPPING,
             ];
+            plan.networkFingerprint = stableDigest({
+                mode: plan.mode,
+                alias: plan.alias,
+                attachments: plan.attachments.map(({ name, logicalName, primary }) => ({ name, logicalName, primary })),
+                runtimeProof: plan.runtimeProof,
+                workspace: identity.hash,
+            });
             return plan;
         } catch (error) {
             rollbackResources(plan, error);
@@ -753,6 +865,7 @@ export function createNetworkLifecycleAdapter({
         expectedLabels = null,
         network = null,
         runtimeIdentity = null,
+        beforeStart = null,
     } = {}) {
         const exactLabels = expectedLabels || (network && runtimeIdentity
             ? expectedAgentLabels(identity.hash, networkContractHash(network), runtimeIdentity)
@@ -781,6 +894,10 @@ export function createNetworkLifecycleAdapter({
             const configured = inspectContainer(ownedContainerId);
             if (!configured) throw new Error(`container '${containerName}' disappeared during network verification`);
             assertManagedContainerRecord(configured, containerName, plan, exactLabels, ownedContainerId);
+            if (beforeStart !== null && typeof beforeStart !== 'function') {
+                throw new Error(`finalizing managed container '${containerName}' received an invalid pre-start checkpoint`);
+            }
+            if (beforeStart) beforeStart({ plan, containerId: ownedContainerId, record: configured });
             const started = execute(['start', ownedContainerId], { inherit: true });
             if (!started.ok) throw new Error(`cannot start '${containerName}': ${failure(started)}`);
             const running = inspectContainer(ownedContainerId);
@@ -816,9 +933,26 @@ export function createNetworkLifecycleAdapter({
         containerName,
         runtimeIdentity,
         createContainer,
+        inspectAdoption = null,
+        prepareLaunch = null,
+        preStartLaunch = null,
+        finalizeLaunch = null,
         networkLockWaitMs = NETWORK_LOCK_WAIT_MS,
+        networkLifecycleCapability,
     }) {
         if (typeof createContainer !== 'function') throw new Error('managed container transaction requires createContainer');
+        if (inspectAdoption !== null && typeof inspectAdoption !== 'function') {
+            throw new Error('managed container transaction inspectAdoption must be a function');
+        }
+        if (prepareLaunch !== null && typeof prepareLaunch !== 'function') {
+            throw new Error('managed container transaction prepareLaunch must be a function');
+        }
+        if (preStartLaunch !== null && typeof preStartLaunch !== 'function') {
+            throw new Error('managed container transaction preStartLaunch must be a function');
+        }
+        if (finalizeLaunch !== null && typeof finalizeLaunch !== 'function') {
+            throw new Error('managed container transaction finalizeLaunch must be a function');
+        }
         return withNetworkLifecycleLock(() => {
             const checked = preflight(network, canonicalAgentId, { instanceKey });
             if (!['default', 'bridge'].includes(checked.mode)) {
@@ -834,13 +968,45 @@ export function createNetworkLifecycleAdapter({
             }
             let candidateCreationAttempted = false;
             let plan = null;
+            let launch = null;
             try {
+                plan = prepareFromPreflight(checked);
+                if (previous && inspectAdoption
+                    && hasRequiredLabels(labelsOf(previous), agentLabels)
+                    && (previous?.State?.Running === true || previous?.State?.Status === 'running')) {
+                    const adoption = inspectAdoption({
+                        plan,
+                        record: previous,
+                        containerId: previousId,
+                    });
+                    if (!adoption || adoption.adopted !== true) {
+                        const mismatch = new Error(
+                            `managed candidate '${containerName}' failed fresh semantic descriptor adoption: ${String(adoption?.reason || 'mismatch')}`,
+                        );
+                        mismatch.code = 'PLOINKY_SEMANTIC_ADOPTION_MISMATCH';
+                        throw mismatch;
+                    }
+                    const finalRecord = inspectContainer(previousId);
+                    if (!finalRecord) throw new Error(`managed adoption candidate '${containerName}' disappeared`);
+                    assertManagedContainerRecord(finalRecord, containerName, plan, agentLabels, previousId);
+                    if (!(finalRecord?.State?.Running === true || finalRecord?.State?.Status === 'running')) {
+                        throw new Error(`managed adoption candidate '${containerName}' stopped during final inspection`);
+                    }
+                    if (typeof adoption.finalize === 'function') adoption.finalize(finalRecord);
+                    return {
+                        ...plan,
+                        adopted: true,
+                        containerId: previousId,
+                        launch: adoption.launch || null,
+                    };
+                }
                 if (previous) {
                     const current = inspectContainer(containerName);
                     if (!current || containerRecordId(current, containerName) !== previousId) {
                         throw new Error(`resource '${containerName}' changed identity before managed replacement`);
                     }
                     assertRequiredLabels(containerName, labelsOf(current), ownershipLabels);
+                    const previousDescriptor = captureGeneratedRouterDescriptorArtifact(current);
                     if (previous?.State?.Running === true || previous?.State?.Status === 'running') {
                         const stopped = execute(['stop', previousId]);
                         if (!stopped.ok) {
@@ -866,10 +1032,19 @@ export function createNetworkLifecycleAdapter({
                     if (!removed.ok && !missing(removed)) {
                         throw new Error(`cannot remove predecessor '${containerName}' for managed replacement: ${failure(removed)}`);
                     }
+                    if (previousDescriptor) {
+                        if (!removed.ok || inspectContainer(previousId)) {
+                            throw new Error(`cannot prove exact predecessor '${containerName}' removal for descriptor cleanup`);
+                        }
+                        cleanupCapturedGeneratedRouterDescriptor(previousDescriptor);
+                    }
                 }
-                plan = prepareFromPreflight(checked);
+                // This hook remains under the canonical network mutation lock.
+                // It may perform the credentialless final-namespace authority
+                // attestation and only then construct key-capable launch state.
+                launch = prepareLaunch ? prepareLaunch(plan) : null;
                 candidateCreationAttempted = true;
-                createContainer(plan);
+                createContainer(plan, launch);
                 const candidate = inspectContainer(containerName);
                 if (!candidate) throw new Error(`managed candidate '${containerName}' disappeared after creation`);
                 assertRequiredLabels(containerName, labelsOf(candidate), agentLabels);
@@ -877,14 +1052,29 @@ export function createNetworkLifecycleAdapter({
                 const containerId = finalizeContainer(containerName, plan, {
                     expectedContainerId: candidateId,
                     expectedLabels: agentLabels,
+                    beforeStart: preStartLaunch
+                        ? (context) => preStartLaunch({ ...context, launch })
+                        : null,
                 });
-                return { ...plan, containerId };
+                const finalRecord = inspectContainer(containerId);
+                if (!finalRecord || containerRecordId(finalRecord, containerName) !== containerId) {
+                    throw new Error(`managed candidate '${containerName}' changed identity after final inspection`);
+                }
+                if (finalizeLaunch) finalizeLaunch({ plan, launch, containerId, record: finalRecord });
+                return { ...plan, containerId, launch };
             } catch (error) {
                 let candidate = null;
-                try { candidate = inspectContainer(containerName); } catch (inspectError) {
+                let candidateInspectionComplete = false;
+                let launchArtifactCleanupSafe = false;
+                try {
+                    candidate = inspectContainer(containerName);
+                    candidateInspectionComplete = true;
+                } catch (inspectError) {
                     error.message += `; failure cleanup could not inspect candidate '${containerName}': ${inspectError.message}`;
                 }
-                if (candidateCreationAttempted
+                if (candidateCreationAttempted && candidateInspectionComplete && !candidate) {
+                    launchArtifactCleanupSafe = true;
+                } else if (candidateCreationAttempted
                     && candidate
                     && hasRequiredLabels(labelsOf(candidate), agentLabels)) {
                     const candidateId = String(candidate?.Id || candidate?.ID || '');
@@ -892,13 +1082,101 @@ export function createNetworkLifecycleAdapter({
                         error.message += `; failure cleanup preserved candidate '${containerName}' because its immutable ID was unavailable`;
                     } else {
                         const removed = execute(['rm', '-f', candidateId]);
-                        if (!removed.ok && !missing(removed)) error.message += `; failure cleanup could not remove candidate '${containerName}': ${failure(removed)}`;
+                        if (!removed.ok && !missing(removed)) {
+                            error.message += `; failure cleanup could not remove candidate '${containerName}': ${failure(removed)}`;
+                        } else {
+                            try {
+                                const remaining = inspectContainer(candidateId);
+                                if (!remaining) launchArtifactCleanupSafe = true;
+                                else error.message += `; failure cleanup preserved candidate '${containerName}' because immutable-ID absence was not proven`;
+                            } catch (inspectError) {
+                                error.message += `; failure cleanup could not prove immutable-ID absence for '${containerName}': ${inspectError.message}`;
+                            }
+                        }
+                    }
+                } else if (candidateCreationAttempted && candidate) {
+                    error.message += `; failure cleanup preserved candidate '${containerName}' because exact ownership labels were not proven`;
+                }
+                if (launch && typeof launch.cleanup === 'function') {
+                    if (!launchArtifactCleanupSafe) {
+                        error.message += '; launch artifact preserved because exact candidate absence was not proven';
+                    } else {
+                        try { launch.cleanup(); } catch (cleanupError) {
+                            error.message += `; launch artifact cleanup failed: ${cleanupError.message}`;
+                        }
                     }
                 }
                 if (plan) rollbackResources(plan, error);
                 throw error;
             }
-        }, { lockPath, waitMs: networkLockWaitMs });
+        }, {
+            lockPath,
+            waitMs: networkLockWaitMs,
+            ...(networkLifecycleCapability ? { capability: networkLifecycleCapability } : {}),
+        });
+    }
+
+    function adoptManagedContainerTransaction({
+        network,
+        canonicalAgentId,
+        instanceKey = canonicalAgentId,
+        containerName,
+        runtimeIdentity,
+        inspectAdoption,
+        networkLockWaitMs = NETWORK_LOCK_WAIT_MS,
+        networkLifecycleCapability,
+    }) {
+        if (typeof inspectAdoption !== 'function') {
+            throw new Error('managed container adoption requires inspectAdoption');
+        }
+        return withNetworkLifecycleLock(() => {
+            const checked = preflight(network, canonicalAgentId, { instanceKey });
+            if (!['default', 'bridge'].includes(checked.mode)) {
+                throw new Error(`managed container adoption cannot run network mode '${checked.mode}'`);
+            }
+            const plan = prepareFromPreflight(checked);
+            try {
+                const expectedLabels = expectedAgentLabels(
+                    identity.hash,
+                    networkContractHash(network),
+                    runtimeIdentity,
+                );
+                const initial = inspectContainer(containerName);
+                if (!initial) return Object.freeze({ adopted: false, reason: 'absent' });
+                const containerId = assertManagedContainerRecord(
+                    initial,
+                    containerName,
+                    plan,
+                    expectedLabels,
+                );
+                if (!(initial?.State?.Running === true || initial?.State?.Status === 'running')) {
+                    return Object.freeze({ adopted: false, reason: 'not-running', containerId });
+                }
+                const adoption = inspectAdoption({ plan, record: initial, containerId });
+                if (!adoption || adoption.adopted !== true) {
+                    return Object.freeze({
+                        adopted: false,
+                        reason: String(adoption?.reason || 'semantic-mismatch'),
+                        containerId,
+                    });
+                }
+                const finalRecord = inspectContainer(containerId);
+                if (!finalRecord) throw new Error(`managed adoption candidate '${containerName}' disappeared`);
+                assertManagedContainerRecord(finalRecord, containerName, plan, expectedLabels, containerId);
+                if (!(finalRecord?.State?.Running === true || finalRecord?.State?.Status === 'running')) {
+                    throw new Error(`managed adoption candidate '${containerName}' stopped during final inspection`);
+                }
+                if (typeof adoption.finalize === 'function') adoption.finalize(finalRecord);
+                return Object.freeze({ ...plan, adopted: true, containerId, adoption });
+            } catch (error) {
+                rollbackResources(plan, error);
+                throw error;
+            }
+        }, {
+            lockPath,
+            waitMs: networkLockWaitMs,
+            ...(networkLifecycleCapability ? { capability: networkLifecycleCapability } : {}),
+        });
     }
 
     function attachmentIsOwnedAgent(labels) {
@@ -1071,9 +1349,20 @@ export function createNetworkLifecycleAdapter({
                 reason: inspection.reason || 'ownership-mismatch',
             };
         }
+        const exactRecord = inspectContainer(exactContainerId);
+        if (!exactRecord || containerRecordId(exactRecord, containerName) !== exactContainerId) {
+            return { removed: false, state: 'identity-drift', id: exactContainerId, reason: 'immutable-id-mismatch' };
+        }
+        const descriptorArtifact = captureGeneratedRouterDescriptorArtifact(exactRecord);
         const removed = execute(['rm', '-f', exactContainerId]);
         if (!removed.ok && !missing(removed)) {
             throw new Error(`cannot remove exact failed candidate '${containerName}' (${exactContainerId}): ${failure(removed)}`);
+        }
+        if (descriptorArtifact) {
+            if (!removed.ok || inspectContainer(exactContainerId)) {
+                throw new Error(`cannot prove exact failed candidate '${containerName}' removal for descriptor cleanup`);
+            }
+            cleanupCapturedGeneratedRouterDescriptor(descriptorArtifact);
         }
         return { removed: true, state: 'removed', id: exactContainerId };
     }
@@ -1120,6 +1409,7 @@ export function createNetworkLifecycleAdapter({
         prepare,
         finalizeContainer,
         runManagedContainerTransaction,
+        adoptManagedContainerTransaction,
         inspectContainerContract,
         verifyContainerContract,
         agentIdentityLabelArgs,

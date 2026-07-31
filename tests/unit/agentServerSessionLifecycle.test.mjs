@@ -15,6 +15,20 @@ import { computeRchTool } from '../../Agent/lib/requestHash.mjs';
 const REPO_ROOT = path.resolve(new URL('../..', import.meta.url).pathname);
 const AGENT_SERVER = path.join(REPO_ROOT, 'Agent/server/AgentServer.mjs');
 
+function isolatedAgentServerEnv() {
+    const env = { ...process.env };
+    for (const name of Object.keys(env)) {
+        if (name.startsWith('PLOINKY_AGENT_')
+            || name.startsWith('PLOINKY_ROUTER_')
+            || name.startsWith('PLOINKY_ENV_SOURCE_PLOINKY_')
+            || name === 'PLOINKY_INTERNAL_ROUTER_URL'
+            || name === 'PLOINKY_EDGE_TOPOLOGY_FILE') {
+            delete env[name];
+        }
+    }
+    return env;
+}
+
 async function createTempDir(t) {
     const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'agent-server-session-'));
     t.after(async () => {
@@ -50,7 +64,7 @@ async function startAgentServer(t, { tmp, configPath, env = {} }) {
     const child = spawn(process.execPath, [AGENT_SERVER], {
         cwd: tmp,
         env: {
-            ...process.env,
+            ...isolatedAgentServerEnv(),
             PORT: String(port),
             PLOINKY_AGENT_BIND_HOST: '127.0.0.1',
             PLOINKY_AGENT_CONFIG: configPath,

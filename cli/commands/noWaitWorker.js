@@ -27,10 +27,12 @@ import {
     waitForAgentReady,
 } from '../server/utils/agentReadiness.js';
 import {
+    abortEdgeRoutingPreparation,
     assertActiveEdgeRoutingSourcesCurrent,
     captureEdgeRoutingLifecycleMutationGeneration,
     withEdgeGenerationApplyLock,
 } from '../sandbox/edgeGeneration.js';
+import { withNetworkLifecycleLock } from '../sandbox/networkLifecycle.js';
 
 function parseArgs(argv) {
     const out = {};
@@ -115,28 +117,37 @@ async function upsertRoute(routeKey, route, {
     expectedIdentity,
     expectedLifecycle,
     expectedSelector,
+    preparationLease,
 } = {}) {
     if (!containerName || !registryRecord || !expectedIdentity || !expectedLifecycle
         || !expectedSelector?.generation || !expectedSelector?.activationId) {
         throw new Error('no-wait route activation requires one exact runtime registry record and active selector');
     }
-    const activationLifecycle = await waitForNoWaitRouteActivation(
-        expectedIdentity,
-        expectedSelector,
-        { expectedLifecycle },
-    );
-    const activationSelector = Object.freeze({
-        generation: activationLifecycle.generationDigest,
-        activationId: activationLifecycle.selectorActivationId,
-    });
+    let validatedActivationSelector = null;
+    if (!preparationLease) {
+        const activationLifecycle = await waitForNoWaitRouteActivation(
+            expectedIdentity,
+            expectedSelector,
+            { expectedLifecycle },
+        );
+        validatedActivationSelector = Object.freeze({
+            generation: activationLifecycle.generationDigest,
+            activationId: activationLifecycle.selectorActivationId,
+        });
+    }
     await mergeRoutingConfig((cfg) => {
         const agents = loadAgents();
-        assertNoWaitLifecycleSnapshot({
+        const snapshot = {
             generation: {
                 agents,
                 routing: cfg,
             },
-        }, expectedIdentity);
+        };
+        if (expectedLifecycle.targetState === 'ready') {
+            assertNoWaitAdoptableLifecycleSnapshot(snapshot, expectedIdentity);
+        } else {
+            assertNoWaitLifecycleSnapshot(snapshot, expectedIdentity);
+        }
         agents[containerName] = registryRecord;
         saveAgents(agents, { coordinate: false });
         cfg.routes = cfg.routes || {};
@@ -148,18 +159,18 @@ async function upsertRoute(routeKey, route, {
         return cfg;
     }, {
         reason: `no-wait-runtime-ready:${routeKey}`,
-        validateActiveGeneration() {
+        ...(preparationLease ? { preparationLease } : {}),
+        ...(preparationLease ? {} : { validateActiveGeneration() {
             const active = assertActiveEdgeRoutingSourcesCurrent();
-            if (active.selector.generation !== activationSelector.generation
-                || active.selector.activationId !== activationSelector.activationId) {
+            if (active.selector.generation !== validatedActivationSelector.generation
+                || active.selector.activationId !== validatedActivationSelector.activationId) {
                 throw new Error(`no-wait lifecycle generation changed before route activation for '${routeKey}'`);
             }
             assertNoWaitLifecycleSnapshot(active, expectedIdentity);
             return active;
-        },
-        captureExpectedGeneration(active) {
+        }, captureExpectedGeneration(active) {
             return captureEdgeRoutingLifecycleMutationGeneration(active);
-        },
+        } }),
     });
 }
 
@@ -192,9 +203,30 @@ export function assertNoWaitRegistryRecord(record, stagedRecord, {
 
 export async function cleanupNoWaitTaskOwnedCandidate(candidate, {
     cleanup = dockerSvc.cleanupExactAgentRuntimeCandidate,
+    abortPreparation = abortEdgeRoutingPreparation,
 } = {}) {
-    if (candidate?.createdByThisLaunch !== true) return false;
-    await Promise.resolve(cleanup(candidate));
+    if (candidate?.createdByThisLaunch !== true
+        && !(candidate?.requiresEdgeActivation === true && candidate?.preparationLease)) return false;
+    let cleanupFailure = null;
+    try {
+        await Promise.resolve(cleanup(candidate));
+    } catch (error) {
+        cleanupFailure = error;
+    }
+    try {
+        if (candidate?.preparationLease) {
+            await Promise.resolve(abortPreparation(candidate.preparationLease));
+        }
+    } catch (abortFailure) {
+        if (cleanupFailure) {
+            throw new AggregateError(
+                [cleanupFailure, abortFailure],
+                'exact no-wait runtime cleanup and preparation abort both failed',
+            );
+        }
+        throw abortFailure;
+    }
+    if (cleanupFailure) throw cleanupFailure;
     return true;
 }
 
@@ -421,17 +453,24 @@ export async function launchNoWaitHostRuntime(identity, initialLifecycle, launch
             }
             let launchStarted = false;
             try {
-                return await withApplyLockFn(async () => {
-                    const lockedLifecycle = await Promise.resolve(loadFn(identity));
+                await withApplyLockFn(() => {
+                    const lockedLifecycle = loadFn(identity);
+                    if (lockedLifecycle && typeof lockedLifecycle.then === 'function') {
+                        throw new Error('no-wait edge lifecycle inspection must be synchronous under the apply lock');
+                    }
                     if (lockedLifecycle.generationDigest !== attemptLifecycle.generationDigest
                         || lockedLifecycle.selectorActivationId !== attemptLifecycle.selectorActivationId) {
                         throw new Error(
                             `no-wait lifecycle activation changed before host launch for '${identity.routeKey}'`,
                         );
                     }
-                    launchStarted = true;
-                    return launch();
                 });
+                // Runtime creation is serialized by the already-held network
+                // lifecycle capability. The edge lock protects only the exact
+                // selector revalidation above and is never held across runtime
+                // mutation or readiness.
+                launchStarted = true;
+                return await launch();
             } catch (error) {
                 // Only the lock-protected lifecycle read is retryable. Once
                 // runtime creation starts, never replay it, even if the runtime
@@ -563,7 +602,8 @@ async function main() {
         const routerEndpoint = resolveRouterEndpoint(profileResolution.network.mode, {
             explicitPort: lifecycle.routerPort || undefined,
         });
-        if (lifecycle.targetState === 'ready') {
+        if (lifecycle.targetState === 'ready'
+            && !['default', 'bridge'].includes(profileResolution.network.mode)) {
             const hostPort = Number(lifecycle.route.hostPort);
             await waitForNoWaitReadiness({
                 manifest,
@@ -594,6 +634,8 @@ async function main() {
             );
             return;
         }
+        await withNetworkLifecycleLock(async (networkLifecycleCapability) => {
+        try {
         const ensureOptions = {
             containerName,
             alias: alias || undefined,
@@ -604,12 +646,16 @@ async function main() {
             preservePreparedRegistryRecord: true,
             instanceId: lifecycle.record.instanceId,
             enableGeneration: lifecycle.record.enableGeneration,
+            networkLifecycleCapability,
         };
         const launch = () => dockerSvc.ensureAgentService(shortAgent, manifest, agentPath, ensureOptions);
         const result = profileResolution.network.mode === 'host'
             ? await launchNoWaitHostRuntime(expectedIdentity, lifecycle, launch)
             : await launch();
-        if (result?.createdByThisLaunch === true) taskOwnedCandidate = result;
+        if (result?.createdByThisLaunch === true
+            || (result?.requiresEdgeActivation === true && result?.preparationLease)) {
+            taskOwnedCandidate = result;
+        }
         const resolvedContainerName = (result && result.containerName) || containerName;
         if (resolvedContainerName !== containerName) {
             throw new Error(`no-wait runtime resolved an unexpected container identity for '${routeKey}'`);
@@ -647,6 +693,7 @@ async function main() {
                 generation: lifecycle.generationDigest,
                 activationId: lifecycle.selectorActivationId,
             },
+            preparationLease: result?.preparationLease,
         });
         taskOwnedCandidate = null;
 
@@ -659,6 +706,12 @@ async function main() {
             hostPort: routedHostPort
         });
         console.log(`[no-wait] ${shortAgent}: launch succeeded (container=${resolvedContainerName}${hostPort ? `, hostPort=${hostPort}` : ''})`);
+        } catch (error) {
+            await cleanupNoWaitTaskOwnedCandidate(taskOwnedCandidate);
+            taskOwnedCandidate = null;
+            throw error;
+        }
+        });
     } catch (err) {
         const failure = err instanceof Error ? err : new Error(String(err));
         try {

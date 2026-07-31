@@ -129,7 +129,7 @@ export function gitDepsMarkerPath(depsDir = DEPS_DIR) {
 
 /**
  * Read the workspace-level moving-git-dependency marker. It records the commit
- * each moving git dependency (e.g. achillesAgentLib `#master`, mcp-sdk `#main`)
+ * each moving git dependency (e.g. mcp-sdk `#main` or an explicit deploy-time override)
  * was last built against, so `ploinky update` can tell whether any of those
  * refs actually advanced even though their package.json spec strings did not.
  *

@@ -24,11 +24,11 @@ import {
 import { isBwrapProcessRunning } from '../sandbox/bwrap/bwrapFleet.js';
 import * as inputState from './inputState.js';
 import { prepareManifestRepositories } from '../utils/runtime/bootstrapManifest.js';
-import { executeHostHook, markPreinstallRunInProcess, resetPreinstallRunInProcess, isInlineCommand } from '../utils/runtime/lifecycleHooks.js';
-import { getActiveProfile, getProfileConfig, getProfileEnvVars, resolveManifestRuntimeProfile } from '../utils/runtime/profileService.js';
-import { getSecrets, createEnvWithSecrets, loadEnvFile } from '../utils/security/secretInjector.js';
+import { buildLifecycleHookEnv, executeHostHook, markPreinstallRunInProcess, resetPreinstallRunInProcess, isInlineCommand } from '../utils/runtime/lifecycleHooks.js';
+import { getActiveProfile, getProfileConfig, resolveManifestRuntimeProfile } from '../utils/runtime/profileService.js';
+import { loadEnvFile } from '../utils/security/secretInjector.js';
 import { readSecretsFile } from '../utils/security/encryptedSecretsFile.js';
-import { buildEnvMap, getExposedNames, getManifestEnvNames } from '../utils/security/secretVars.js';
+import { getExposedNames, getManifestEnvNames } from '../utils/security/secretVars.js';
 import { isLlmRuntimeManifest, prepareLlmStartup } from '../sandbox/docker/llmRuntimeIntegration.js';
 import { resolveAgentExecutionMode, resolveAgentReadinessProtocol } from '../utils/runtime/startupReadiness.js';
 import { normalizeProbeConfig, runContainerScriptReadiness } from '../sandbox/docker/healthProbes.js';
@@ -51,7 +51,6 @@ import {
 } from '../server/routingFile.js';
 import {
   abortEdgeRoutingPreparation,
-  edgeRuntimeEnvironment,
   initializeFreshEdgeRoutingSources,
   inactivateEdgeRoutingGeneration,
   prepareHostModeCapabilityForInactiveGeneration,
@@ -66,7 +65,10 @@ import {
   buildRelayReadinessRoute,
   waitForAgentReady,
 } from '../server/utils/agentReadiness.js';
-import { createNetworkLifecycleAdapter } from '../sandbox/networkLifecycle.js';
+import {
+  createNetworkLifecycleAdapter,
+  withNetworkLifecycleLock,
+} from '../sandbox/networkLifecycle.js';
 import { networkContractHash } from '../sandbox/networkContract.js';
 import { getAgentDataDir } from '../utils/workspaceStructure.js';
 import {
@@ -1144,6 +1146,11 @@ async function activatePreparedRuntimeAfterReadiness({
     return true;
   } catch (error) {
     try {
+      dockerSvc.cleanupExactAgentRuntimeCandidate(result);
+    } catch (cleanupError) {
+      error.message += `; exact activation-failure cleanup: ${cleanupError?.message || cleanupError}`;
+    }
+    try {
       inactivateEdgeRoutingGeneration('runtime-replacement-activation-failed', {
         preserveSelectedGeneration: true,
       });
@@ -1155,6 +1162,24 @@ async function activatePreparedRuntimeAfterReadiness({
     } catch (_) {}
     throw error;
   }
+}
+
+export function cleanupFailedPreparedRuntime(result, error, reason = 'runtime-replacement-readiness-failed') {
+  if (!result) return;
+  if (result.preparationLease && result.containerName && result.containerId && result.registryRecord) {
+    try {
+      dockerSvc.cleanupExactAgentRuntimeCandidate(result);
+    } catch (cleanupError) {
+      error.message += `; exact readiness-failure cleanup: ${cleanupError?.message || cleanupError}`;
+    }
+  }
+  if (!result.preparationLease) return;
+  try {
+    inactivateEdgeRoutingGeneration(reason, { preserveSelectedGeneration: true });
+  } catch (_) {}
+  try {
+    abortEdgeRoutingPreparation(result.preparationLease, { reason });
+  } catch (_) {}
 }
 
 async function resolveAndPersistStartRouterPort(staticAgentArg, portArg, {
@@ -1211,6 +1236,9 @@ async function startWorkspace(staticAgentArg, portArg, {
   resetPreinstallRunInProcess();
   const workspaceStartLock = createWorkspaceStartLock();
   let workspacePreparationLease = null;
+  const workspaceRuntimeCandidates = [];
+  try {
+  return await withNetworkLifecycleLock(async (networkLifecycleCapability) => {
   try {
   initializeFreshEdgeRoutingSources({ workspaceRoot: PLOINKY_WORKSPACE_ROOT });
   inactivateEdgeRoutingGeneration('workspace-start-prepare', { workspaceRoot: PLOINKY_WORKSPACE_ROOT });
@@ -1388,20 +1416,13 @@ async function startWorkspace(staticAgentArg, portArg, {
               ? profileConfig.preinstall
               : path.join(agentPath, profileConfig.preinstall);
 
-            const envVars = getProfileEnvVars(resolved.shortAgentName, resolved.repo, activeProfile, {});
-            let manifestEnv = {};
-            try {
-              const manifest = JSON.parse(fs.readFileSync(resolved.manifestPath, 'utf8'));
-              manifestEnv = buildEnvMap(manifest, profileConfig, {
-                agentName: resolved.shortAgentName,
-                repoName: resolved.repo,
-              });
-            } catch (_) {}
-            const secrets = profileConfig.secrets ? getSecrets(profileConfig.secrets) : {};
-            const hookEnv = {
-              ...createEnvWithSecrets({ ...envVars, ...manifestEnv }, secrets),
-              ...edgeRuntimeEnvironment('host', { workspaceRoot: PLOINKY_WORKSPACE_ROOT }),
-            };
+            const hookEnv = buildLifecycleHookEnv({
+              agentName: resolved.shortAgentName,
+              repoName: resolved.repo,
+              profileName: activeProfile,
+              profileConfig,
+              agentPath,
+            });
 
             const result = executeHostHook(hookValue, hookEnv, { cwd: PLOINKY_WORKSPACE_ROOT });
             assertStaticPreinstallSucceeded(result);
@@ -1534,7 +1555,13 @@ async function startWorkspace(staticAgentArg, portArg, {
             preservePreparedRegistryRecord: true,
             preparationLease: workspacePreparationLease,
             preparedHostModeCapability,
+            networkLifecycleCapability,
           });
+          if (runtimeResult?.requiresEdgeActivation === true
+              && runtimeResult?.preparationLease
+              && runtimeResult?.containerId) {
+            workspaceRuntimeCandidates.push(runtimeResult);
+          }
           const {
             containerName,
             hostPort,
@@ -1734,6 +1761,7 @@ async function startWorkspace(staticAgentArg, portArg, {
       preparationLease: workspacePreparationLease,
     });
     workspacePreparationLease = null;
+    workspaceRuntimeCandidates.length = 0;
 
     let previousNoWaitStatusFile = '';
     for (const { node, registryName } of deferredNoWaitLaunches) {
@@ -1765,6 +1793,18 @@ async function startWorkspace(staticAgentArg, portArg, {
     console.log(`[start] Watchdog logs: ${path.join(LOGS_DIR, 'watchdog.log')}`);
     console.log(`[start] Dashboard: ${buildDashboardUrl(staticPort)}`);
   } catch (e) {
+    const cleanedCandidateIds = new Set();
+    for (const candidate of workspaceRuntimeCandidates.reverse()) {
+      const candidateId = String(candidate?.containerId || '');
+      if (!candidateId || cleanedCandidateIds.has(candidateId)) continue;
+      cleanedCandidateIds.add(candidateId);
+      try {
+        dockerSvc.cleanupExactAgentRuntimeCandidate(candidate);
+      } catch (cleanupError) {
+        e.message += `; exact workspace candidate cleanup: ${cleanupError?.message || cleanupError}`;
+      }
+    }
+    workspaceRuntimeCandidates.length = 0;
     if (workspacePreparationLease) {
       try {
         abortEdgeRoutingPreparation(workspacePreparationLease, {
@@ -1778,6 +1818,8 @@ async function startWorkspace(staticAgentArg, portArg, {
       throw e;
     }
     throw new Error(`start (workspace) failed: ${message}`);
+  }
+  });
   } finally {
     releaseWorkspaceStartLock(workspaceStartLock);
   }
@@ -1890,62 +1932,72 @@ export async function runCliWithDependencies(agentName, args, dependencies) {
   const agentDir = path.dirname(manifestPath);
   const repoName = path.basename(path.dirname(agentDir));
   debugLog(`[runCli] agent=${agentName} container=${registryRecord?.containerName || getAgentContainerName(shortAgentName, repoName)}`);
-  const containerInfo = ensureAgentService(shortAgentName, manifest, agentDir, {
-    containerName: registryRecord?.containerName,
-    alias: registryRecord?.record?.alias,
-    routerEndpoint,
-  });
-  const containerName = (containerInfo && containerInfo.containerName)
-    || registryRecord?.containerName
-    || getAgentContainerName(shortAgentName, repoName);
-  const cliReadinessRoute = buildRelayReadinessRoute({
-    route: {
-      container: containerName,
-      hostPort: containerInfo?.hostPort || 0,
-    },
-    manifest,
-    runtimeResult: containerInfo,
-    networkMode: routerEndpoint?.mode || '',
-    generationDigest: containerInfo?.preparationLease?.preparedGeneration || '',
-  });
-  const readinessProtocol = resolveAgentReadinessProtocolImpl(manifest);
-  if (readinessProtocol === 'script') {
-    await waitForManifestReadinessImpl({
-      key: `cli:${shortAgentName}`,
-      label: shortAgentName,
-      manifest,
-      route: cliReadinessRoute,
+  const { containerInfo, containerName } = await withNetworkLifecycleLock(async (networkLifecycleCapability) => {
+    let result = null;
+    try {
+    result = ensureAgentService(shortAgentName, manifest, agentDir, {
+      containerName: registryRecord?.containerName,
+      alias: registryRecord?.record?.alias,
+      routerEndpoint,
+      networkLifecycleCapability,
     });
-  } else if (readinessProtocol !== 'none') {
-    const hasReadinessTarget = Boolean(cliReadinessRoute.hostPort || cliReadinessRoute.relay);
-    if (!hasReadinessTarget) {
-      if (containerInfo?.requiresEdgeActivation) {
-        throw new Error(`Agent '${shortAgentName}' replacement cannot activate without a resolved '${readinessProtocol}' readiness target.`);
-      }
-      if (!suppressLauncherLogs) {
-        warn(`[cli] warning: cannot wait for '${shortAgentName}' readiness because no host port or confined relay target was resolved.`);
-      }
-    } else {
-      if (!suppressLauncherLogs) {
-        log(`[cli] Waiting for '${shortAgentName}' readiness (${readinessProtocol})...`);
-      }
-      const ready = await waitForAgentReadyImpl(cliReadinessRoute, {
-        timeoutMs: 600000,
-        protocol: readinessProtocol,
+    const exactContainerName = (result && result.containerName)
+      || registryRecord?.containerName
+      || getAgentContainerName(shortAgentName, repoName);
+    const cliReadinessRoute = buildRelayReadinessRoute({
+      route: {
+        container: exactContainerName,
+        hostPort: result?.hostPort || 0,
+      },
+      manifest,
+      runtimeResult: result,
+      networkMode: routerEndpoint?.mode || '',
+      generationDigest: result?.preparationLease?.preparedGeneration || '',
+    });
+    const readinessProtocol = resolveAgentReadinessProtocolImpl(manifest);
+    if (readinessProtocol === 'script') {
+      await waitForManifestReadinessImpl({
+        key: `cli:${shortAgentName}`,
+        label: shortAgentName,
+        manifest,
+        route: cliReadinessRoute,
       });
-      if (!ready) {
-        throw new Error(`Agent '${shortAgentName}' did not become ready before CLI attach.`);
+    } else if (readinessProtocol !== 'none') {
+      const hasReadinessTarget = Boolean(cliReadinessRoute.hostPort || cliReadinessRoute.relay);
+      if (!hasReadinessTarget) {
+        if (result?.requiresEdgeActivation) {
+          throw new Error(`Agent '${shortAgentName}' replacement cannot activate without a resolved '${readinessProtocol}' readiness target.`);
+        }
+        if (!suppressLauncherLogs) {
+          warn(`[cli] warning: cannot wait for '${shortAgentName}' readiness because no host port or confined relay target was resolved.`);
+        }
+      } else {
+        if (!suppressLauncherLogs) {
+          log(`[cli] Waiting for '${shortAgentName}' readiness (${readinessProtocol})...`);
+        }
+        const ready = await waitForAgentReadyImpl(cliReadinessRoute, {
+          timeoutMs: 600000,
+          protocol: readinessProtocol,
+        });
+        if (!ready) {
+          throw new Error(`Agent '${shortAgentName}' did not become ready before CLI attach.`);
+        }
       }
     }
-  }
-
-  await activateRuntimeAfterReadinessImpl({
-    result: containerInfo,
-    routeKey: registryRecord?.record?.alias || shortAgentName,
-    repoName,
-    shortAgentName,
-    agentPath: agentDir,
-    alias: registryRecord?.record?.alias || '',
+    await activateRuntimeAfterReadinessImpl({
+      result,
+      routeKey: registryRecord?.record?.alias || shortAgentName,
+      repoName,
+      shortAgentName,
+      agentPath: agentDir,
+      alias: registryRecord?.record?.alias || '',
+      networkLifecycleCapability,
+    });
+    return { containerInfo: result, containerName: exactContainerName };
+    } catch (error) {
+      cleanupFailedPreparedRuntime(result, error);
+      throw error;
+    }
   });
 
   // Determine actual runtime from registry (may differ from manifest if sandbox
@@ -2032,37 +2084,46 @@ async function runShell(agentName) {
   const agentDir = path.dirname(manifestPath);
   const repoName = path.basename(path.dirname(agentDir));
   const registeredContainerName = registryRecord?.containerName || getAgentContainerName(shortAgentName, repoName);
-  const containerInfo = ensureAgentService(shortAgentName, manifest, agentDir, {
-    containerName: registeredContainerName,
-    alias: registryRecord?.record?.alias,
-    routerEndpoint,
-  });
-  const containerName = (containerInfo && containerInfo.containerName)
-    || registeredContainerName;
-  const shellReadinessRoute = buildRelayReadinessRoute({
-    route: {
-      container: containerName,
-      hostPort: containerInfo?.hostPort || 0,
-    },
-    manifest,
-    runtimeResult: containerInfo,
-    networkMode: routerEndpoint?.mode || '',
-    generationDigest: containerInfo?.preparationLease?.preparedGeneration || '',
-  });
-  await waitForManifestReadiness({
-    key: `shell:${shortAgentName}`,
-    label: shortAgentName,
-    kind: 'dependency',
-    manifest,
-    route: shellReadinessRoute,
-  });
-  await activatePreparedRuntimeAfterReadiness({
-    result: containerInfo,
-    routeKey: registryRecord?.record?.alias || shortAgentName,
-    repoName,
-    shortAgentName,
-    agentPath: agentDir,
-    alias: registryRecord?.record?.alias || '',
+  const { containerInfo, containerName } = await withNetworkLifecycleLock(async (networkLifecycleCapability) => {
+    let result = null;
+    try {
+      result = ensureAgentService(shortAgentName, manifest, agentDir, {
+        containerName: registeredContainerName,
+        alias: registryRecord?.record?.alias,
+        routerEndpoint,
+        networkLifecycleCapability,
+      });
+      const exactContainerName = result?.containerName || registeredContainerName;
+      const shellReadinessRoute = buildRelayReadinessRoute({
+        route: {
+          container: exactContainerName,
+          hostPort: result?.hostPort || 0,
+        },
+        manifest,
+        runtimeResult: result,
+        networkMode: routerEndpoint?.mode || '',
+        generationDigest: result?.preparationLease?.preparedGeneration || '',
+      });
+      await waitForManifestReadiness({
+        key: `shell:${shortAgentName}`,
+        label: shortAgentName,
+        kind: 'dependency',
+        manifest,
+        route: shellReadinessRoute,
+      });
+      await activatePreparedRuntimeAfterReadiness({
+        result,
+        routeKey: registryRecord?.record?.alias || shortAgentName,
+        repoName,
+        shortAgentName,
+        agentPath: agentDir,
+        alias: registryRecord?.record?.alias || '',
+      });
+      return { containerInfo: result, containerName: exactContainerName };
+    } catch (error) {
+      cleanupFailedPreparedRuntime(result, error);
+      throw error;
+    }
   });
   const cmd = '/bin/sh';
   const projPath = getConfiguredProjectPath(shortAgentName, repoName, registryRecord?.record?.alias);
@@ -2160,16 +2221,20 @@ async function reinstallAgent(agentName) {
                 repo: resolved.repo,
             },
         }, async () => {
+          return await withNetworkLifecycleLock(async (networkLifecycleCapability) => {
+            let reinstallResult = null;
+            try {
             const short = resolved.shortAgentName;
             const agentPath = path.dirname(resolved.manifestPath);
 
             // The shared runtime manager owns inactivation and physical
             // replacement for every backend, including host sandboxes.
-            const reinstallResult = await ensureAgentService(short, manifest, agentPath, {
+            reinstallResult = await ensureAgentService(short, manifest, agentPath, {
                 containerName,
                 alias: registryRecord?.record?.alias,
                 forceRecreate: true,
                 routerEndpoint,
+                networkLifecycleCapability,
             });
             const { containerName: newContainerName, hostPort } = reinstallResult;
 
@@ -2225,6 +2290,11 @@ async function reinstallAgent(agentName) {
                 console.log(`[reinstall] Watchdog will automatically restart the server if needed.`);
             }
             console.log(`[reinstall] reinstalled '${short}' [container: ${newContainerName}]`);
+            } catch (error) {
+              cleanupFailedPreparedRuntime(reinstallResult, error, 'runtime-reinstall-readiness-failed');
+              throw error;
+            }
+          });
         });
     } catch (e) {
         console.error(`[reinstall] ${agentName}: ${e?.message||e}`);

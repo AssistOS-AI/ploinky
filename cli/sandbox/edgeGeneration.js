@@ -1859,7 +1859,12 @@ function writeTopologyForGeneration(paths, generation, publicationState, options
 
 export function applyEdgeRoutingGeneration(options = {}) {
     const paths = resolveEdgeGenerationPaths(options);
-    const { capability: applyLockCapability, release } = acquireApplyLockCapability(paths, options);
+    const receivedApplyLockCapability = hasApplyLockCapability(paths, options.applyLockCapability);
+    let {
+        capability: applyLockCapability,
+        release: releaseApplyLock,
+    } = acquireApplyLockCapability(paths, options);
+    let applyLockHeld = true;
     let transactionStarted = false;
     try {
         const expectedGeneration = options.expectedGeneration === undefined
@@ -2011,6 +2016,19 @@ export function applyEdgeRoutingGeneration(options = {}) {
                 && stableStringify(payload?.affectedSelectors) === stableStringify(affectedSelectors)
                 && selectorMatchesInactiveApply(paths, inactiveSelector)
             );
+            if (receivedApplyLockCapability) {
+                throw edgeError(
+                    'coordinated capability-runtime restart cannot run inside a caller-owned edge apply lock',
+                    'EDGE_GENERATION_LOCK_ORDER',
+                );
+            }
+            // The network lifecycle transaction remains authoritative across
+            // the entire apply. Release the short edge lock before physical
+            // runtime mutation/readiness, then reacquire and revalidate the
+            // exact candidate and inactive selector before authorization.
+            releaseApplyLock();
+            applyLockHeld = false;
+            let restartError;
             try {
                 options.restartCapabilityRuntime(Object.freeze({
                     generation,
@@ -2018,10 +2036,22 @@ export function applyEdgeRoutingGeneration(options = {}) {
                     affectedSelectors,
                     assertSelectorsInactive,
                     preparedHostModeCapability,
+                    networkLifecycleCapability: options.networkLifecycleCapability,
                 }));
+            } catch (error) {
+                restartError = error;
             } finally {
                 PREPARED_HOST_MODE_CAPABILITIES.delete(preparedHostModeCapability);
             }
+            ({
+                capability: applyLockCapability,
+                release: releaseApplyLock,
+            } = acquireApplyLockCapability(paths, {
+                ...options,
+                applyLockCapability: undefined,
+            }));
+            applyLockHeld = true;
+            if (restartError) throw restartError;
             const afterRestart = collectCapturedSources(paths);
             if (afterRestart.generation !== captured.generation) {
                 throw edgeError('edge routing sources changed during coordinated targeted restart', 'EDGE_GENERATION_RACE');
@@ -2044,7 +2074,7 @@ export function applyEdgeRoutingGeneration(options = {}) {
         atomicWrite(paths.activeSelectorFile, Buffer.from(JSON.stringify(selector, null, 2)), { mode: 0o600 });
         return { selector: deepFreeze(selector), generation, topology, paths };
     } catch (error) {
-        if (transactionStarted) {
+        if (transactionStarted && applyLockHeld) {
             inactivateEdgeRoutingGeneration(error?.code || 'apply-failed', {
                 ...options,
                 applyLockCapability,
@@ -2053,7 +2083,7 @@ export function applyEdgeRoutingGeneration(options = {}) {
         }
         throw error;
     } finally {
-        release();
+        if (applyLockHeld) releaseApplyLock();
     }
 }
 
@@ -2171,6 +2201,23 @@ export function captureEdgeRoutingLifecycleMutationGeneration(active, options = 
 }
 
 /**
+ * Capture the exact digest of the complete mutable edge candidate while the
+ * caller owns the apply lock. A later apply must supply this digest so a
+ * competing source mutation cannot be committed accidentally after the short
+ * mutation lock has been released for lifecycle work.
+ */
+export function captureEdgeRoutingCandidateGeneration(options = {}) {
+    const paths = resolveEdgeGenerationPaths(options);
+    if (!hasApplyLockCapability(paths, options.applyLockCapability)) {
+        throw edgeError(
+            'edge candidate capture requires the exact live apply-lock capability',
+            'EDGE_GENERATION_CAPABILITY_REQUIRED',
+        );
+    }
+    return collectCapturedSources(paths).generation;
+}
+
+/**
  * Return the validated selector even while authorization is inactive. This is
  * intentionally narrower than loading a generation: coordinators use it only
  * to prove that a retry still refers to the exact selected candidate (or, for
@@ -2209,6 +2256,132 @@ export function captureEdgeRoutingLease(options = {}) {
                 return false;
             }
         },
+    });
+}
+
+const ROUTER_ATTESTATION_CHECKPOINTS = Object.freeze([
+    'post-observation',
+    'pre-credentials',
+    'pre-runtime',
+    'post-inspection',
+]);
+
+function preparedRouterAttestationSnapshot(paths, preparationLease, expectedOwner) {
+    const current = assertPreparationLeaseForApply(paths, preparationLease);
+    assertPreparedSelectorStillSelected(paths, current);
+    const generation = loadGenerationById(paths, current.preparedGeneration);
+    const captured = collectCapturedSources(paths);
+    if (captured.generation !== current.preparedGeneration
+        || lifecycleBindingDigest(captured) !== current.lifecycleBindingDigest) {
+        throw edgeError(
+            'prepared Router attestation lifecycle sources changed before its checkpoint',
+            'EDGE_PREPARATION_SOURCE_CHANGED',
+        );
+    }
+    const owner = Object.freeze({
+        containerName: String(expectedOwner?.containerName || '').trim(),
+        principal: String(expectedOwner?.principal || '').trim(),
+        instanceId: String(expectedOwner?.instanceId || '').trim(),
+        enableGeneration: String(expectedOwner?.enableGeneration || '').trim(),
+    });
+    if (Object.values(owner).some((value) => !value)) {
+        throw edgeError(
+            'prepared Router attestation requires one complete exact runtime owner',
+            'EDGE_GENERATION_INVALID',
+        );
+    }
+    const record = generation.agents?.[owner.containerName];
+    const recordPrincipal = record
+        ? `agent:${String(record.repoName || '')}/${String(record.agentName || '')}`
+        : '';
+    if (!record || record.type !== 'agent'
+        || recordPrincipal !== owner.principal
+        || String(record.instanceId || '') !== owner.instanceId
+        || String(record.enableGeneration || '') !== owner.enableGeneration) {
+        throw edgeError(
+            'prepared Router attestation owner does not match its immutable generation record',
+            'EDGE_PREPARATION_STALE',
+        );
+    }
+    return Object.freeze({
+        current,
+        generation,
+        owner,
+    });
+}
+
+function capturePreparedRouterAttestationLease(options) {
+    const paths = resolveEdgeGenerationPaths(options);
+    const expectedOwner = options.expectedOwner;
+    const initial = withEdgeGenerationApplyLock(
+        () => preparedRouterAttestationSnapshot(
+            paths,
+            options.preparationLease,
+            expectedOwner,
+        ),
+        { ...options, preparationLease: options.preparationLease },
+    );
+    const isCurrent = () => {
+        try {
+            const current = withEdgeGenerationApplyLock(
+                () => preparedRouterAttestationSnapshot(
+                    paths,
+                    options.preparationLease,
+                    expectedOwner,
+                ),
+                { ...options, preparationLease: options.preparationLease },
+            );
+            return current.current.transactionId === initial.current.transactionId
+                && current.generation.generation === initial.generation.generation;
+        } catch (_) {
+            return false;
+        }
+    };
+    return Object.freeze({
+        id: initial.generation.generation,
+        activationId: initial.current.selectorActivationId,
+        transactionId: initial.current.transactionId,
+        snapshot: initial.generation,
+        owner: initial.owner,
+        commit: isCurrent,
+        isCurrent,
+    });
+}
+
+export function createRouterAttestationGenerationLease(options = {}) {
+    const lease = options.preparationLease
+        ? capturePreparedRouterAttestationLease(options)
+        : captureEdgeRoutingLease(options);
+    let checkpointIndex = 0;
+    const checkpoint = (name) => {
+        const expected = ROUTER_ATTESTATION_CHECKPOINTS[checkpointIndex];
+        if (name !== expected) {
+            throw edgeError(
+                `Router attestation generation checkpoint '${name}' is out of order; expected '${expected || 'none'}'`,
+                'EDGE_GENERATION_CHECKPOINT_INVALID',
+            );
+        }
+        if (lease.commit() !== true) {
+            throw edgeError(
+                `edge routing generation changed at Router attestation checkpoint '${name}'`,
+                'EDGE_GENERATION_RACE',
+            );
+        }
+        checkpointIndex += 1;
+        return true;
+    };
+    return Object.freeze({
+        id: lease.id,
+        activationId: lease.activationId,
+        ...(lease.transactionId ? { transactionId: lease.transactionId } : {}),
+        snapshot: lease.snapshot,
+        ...(lease.owner ? { owner: lease.owner } : {}),
+        // attestRouterAuthority owns the first checkpoint through its existing
+        // generationLease.commit() contract.
+        commit: () => checkpoint('post-observation'),
+        checkpoint,
+        isCurrent: () => lease.isCurrent(),
+        get complete() { return checkpointIndex === ROUTER_ATTESTATION_CHECKPOINTS.length; },
     });
 }
 
@@ -2315,12 +2488,14 @@ export default {
     abortEdgeRoutingPreparation,
     applyEdgeRoutingGeneration,
     captureEdgeRoutingLease,
+    createRouterAttestationGenerationLease,
     edgeRuntimeEnvironment,
     edgeTopologyMount,
     inactivateEdgeRoutingGeneration,
     initializeFreshEdgeRoutingSources,
     assertActiveEdgeRoutingSourcesCurrent,
     captureEdgeRoutingLifecycleMutationGeneration,
+    captureEdgeRoutingCandidateGeneration,
     loadActiveEdgeRoutingGeneration,
     readEdgeRoutingSelection,
     prepareEdgeRoutingGeneration,

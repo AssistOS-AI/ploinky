@@ -9,6 +9,7 @@ import {
     NETWORK_STATUS_SCHEMA_VERSION,
     createNetworkLifecycleAdapter,
     physicalNetworkName,
+    withNetworkLifecycleLock,
     workspaceNetworkIdentity,
 } from '../../cli/sandbox/networkLifecycle.js';
 import {
@@ -745,6 +746,153 @@ test('managed transaction creates multiple attachments, verifies start, and comm
     assert.equal(Object.keys(candidate.NetworkSettings.Networks).length, 2);
 });
 
+test('managed launch hooks remain ordered under the transaction and failed attestation creates no runtime', (t) => {
+    const harness = networkHarness(t);
+    const network = canonicalizeNetwork({ mode: 'default' });
+    const order = [];
+    const result = harness.adapter.runManagedContainerTransaction({
+        network,
+        canonicalAgentId: 'demo',
+        containerName: 'demo-container',
+        runtimeIdentity: TEST_RUNTIME_IDENTITY,
+        prepareLaunch(plan) {
+            order.push('attest-and-credentials');
+            return Object.freeze({ proof: plan.networkFingerprint });
+        },
+        createContainer(plan, launch) {
+            order.push('create');
+            assert.equal(launch.proof, plan.networkFingerprint);
+            const id = 'candidatehook123456';
+            const primary = plan.attachments[0];
+            const record = managedAgentRecord({
+                id,
+                name: 'demo-container',
+                labels: managedAgentLabels(harness.identity, network),
+                networks: { [primary.name]: { Aliases: [plan.alias, id.slice(0, 12)] } },
+            });
+            harness.containers.set(id, record);
+            harness.networks.get(primary.name).Containers[id] = { Name: record.Name };
+        },
+        preStartLaunch({ launch, record }) {
+            order.push('generation-check-before-start');
+            assert.match(launch.proof, /^sha256:[a-f0-9]{64}$/);
+            assert.equal(record.State.Running, false);
+        },
+        finalizeLaunch({ launch, record }) {
+            order.push('inspect-and-commit');
+            assert.match(launch.proof, /^sha256:[a-f0-9]{64}$/);
+            assert.equal(record.State.Running, true);
+        },
+    });
+    assert.equal(result.containerId, 'candidatehook123456');
+    assert.deepEqual(order, [
+        'attest-and-credentials',
+        'create',
+        'generation-check-before-start',
+        'inspect-and-commit',
+    ]);
+
+    let creates = 0;
+    assert.throws(() => harness.adapter.runManagedContainerTransaction({
+        network,
+        canonicalAgentId: 'blocked',
+        containerName: 'blocked-container',
+        runtimeIdentity: TEST_RUNTIME_IDENTITY,
+        prepareLaunch() { throw new Error('attestation denied before key state'); },
+        createContainer() { creates += 1; },
+    }), /attestation denied before key state/);
+    assert.equal(creates, 0);
+
+    assert.throws(() => harness.adapter.runManagedContainerTransaction({
+        network,
+        canonicalAgentId: 'stale',
+        containerName: 'stale-container',
+        runtimeIdentity: TEST_RUNTIME_IDENTITY,
+        prepareLaunch() { return Object.freeze({ proof: 'stale' }); },
+        createContainer(plan) {
+            const id = 'stalecandidate1234';
+            const primary = plan.attachments[0];
+            const record = managedAgentRecord({
+                id,
+                name: 'stale-container',
+                labels: managedAgentLabels(harness.identity, network),
+                networks: { [primary.name]: { Aliases: [plan.alias, id.slice(0, 12)] } },
+            });
+            harness.containers.set(id, record);
+            harness.networks.get(primary.name).Containers[id] = { Name: record.Name };
+        },
+        preStartLaunch() { throw new Error('generation changed before start'); },
+    }), /generation changed before start/);
+    assert.equal(
+        [...harness.containers.values()].some((record) => record.Name === 'stale-container'),
+        false,
+    );
+});
+
+test('fresh semantic adoption reuses one exact immutable runtime without stop, remove, or create', (t) => {
+    const harness = networkHarness(t);
+    const network = canonicalizeNetwork({ mode: 'default' });
+    const plan = harness.adapter.prepare(network, 'demo');
+    const id = 'adopted123456789';
+    harness.containers.set(id, managedAgentRecord({
+        id,
+        name: 'demo-container',
+        labels: managedAgentLabels(harness.identity, network),
+        networks: { [plan.attachments[0].name]: { Aliases: [plan.alias, id.slice(0, 12)] } },
+        running: true,
+    }));
+    const callsBefore = harness.calls.length;
+    let finalized = false;
+    const result = harness.adapter.runManagedContainerTransaction({
+        network,
+        canonicalAgentId: 'demo',
+        containerName: 'demo-container',
+        runtimeIdentity: TEST_RUNTIME_IDENTITY,
+        inspectAdoption({ record, containerId }) {
+            assert.equal(containerId, id);
+            assert.equal(record.State.Running, true);
+            return {
+                adopted: true,
+                launch: { semanticTopologyDigest: `sha256:${'a'.repeat(64)}` },
+                finalize(finalRecord) {
+                    assert.equal(finalRecord.Id, id);
+                    finalized = true;
+                },
+            };
+        },
+        createContainer: () => assert.fail('exact adoption must not create a runtime'),
+    });
+    assert.equal(result.adopted, true);
+    assert.equal(result.containerId, id);
+    assert.equal(finalized, true);
+    assert.equal(harness.calls.slice(callsBefore).some((args) => ['stop', 'rm', 'create'].includes(args[0])), false);
+});
+
+test('semantic adoption mismatch preserves the exact predecessor for identity rotation', (t) => {
+    const harness = networkHarness(t);
+    const network = canonicalizeNetwork({ mode: 'default' });
+    const plan = harness.adapter.prepare(network, 'demo');
+    const id = 'mismatch12345678';
+    harness.containers.set(id, managedAgentRecord({
+        id,
+        name: 'demo-container',
+        labels: managedAgentLabels(harness.identity, network),
+        networks: { [plan.attachments[0].name]: { Aliases: [plan.alias, id.slice(0, 12)] } },
+        running: true,
+    }));
+    const callsBefore = harness.calls.length;
+    assert.throws(() => harness.adapter.runManagedContainerTransaction({
+        network,
+        canonicalAgentId: 'demo',
+        containerName: 'demo-container',
+        runtimeIdentity: TEST_RUNTIME_IDENTITY,
+        inspectAdoption: () => ({ adopted: false, reason: 'descriptor-semantics' }),
+        createContainer: () => assert.fail('mismatch must rotate before replacement'),
+    }), { code: 'PLOINKY_SEMANTIC_ADOPTION_MISMATCH' });
+    assert.equal(harness.containers.has(id), true);
+    assert.equal(harness.calls.slice(callsBefore).some((args) => ['stop', 'rm', 'create'].includes(args[0])), false);
+});
+
 test('managed replacement reconciles a failed stop only after the exact owned container exited', (t) => {
     const harness = networkHarness(t);
     const network = canonicalizeNetwork({ mode: 'default' });
@@ -891,6 +1039,50 @@ test('host-gateway start failure removes the candidate and never restores the pr
     assert.equal(harness.calls.some((args) => args[0] === 'start' && args[1] === previousId), false);
 });
 
+test('managed failure preserves launch artifacts when exact candidate removal cannot be proven', (t) => {
+    const harness = networkHarness(t);
+    const network = canonicalizeNetwork({ mode: 'default' });
+    const candidateId = 'preservedcandidate1';
+    const baseRun = harness.run;
+    const run = (runtime, args) => {
+        if (args[0] === 'rm' && args.at(-1) === candidateId) {
+            harness.calls.push([...args]);
+            return { ok: false, status: 1, stdout: '', stderr: 'injected removal refusal' };
+        }
+        return baseRun(runtime, args);
+    };
+    const adapter = createNetworkLifecycleAdapter({
+        runtime: 'podman',
+        run,
+        workspaceRoot: harness.identity.canonical,
+        lockPath: path.join(harness.dir, 'preserved-artifact.lock'),
+    });
+    let artifactCleanups = 0;
+    assert.throws(() => adapter.runManagedContainerTransaction({
+        network,
+        canonicalAgentId: 'demo',
+        containerName: 'demo-container',
+        runtimeIdentity: TEST_RUNTIME_IDENTITY,
+        prepareLaunch() {
+            return Object.freeze({ cleanup: () => { artifactCleanups += 1; } });
+        },
+        createContainer(plan) {
+            const primary = plan.attachments[0];
+            const candidate = managedAgentRecord({
+                id: candidateId,
+                name: 'demo-container',
+                labels: managedAgentLabels(harness.identity, network),
+                networks: { [primary.name]: { Aliases: [plan.alias, candidateId.slice(0, 12)] } },
+            });
+            harness.containers.set(candidateId, candidate);
+            harness.networks.get(primary.name).Containers[candidateId] = { Name: candidate.Name };
+        },
+        preStartLaunch() { throw new Error('injected pre-start failure'); },
+    }), /failure cleanup could not remove candidate.*launch artifact preserved/);
+    assert.equal(artifactCleanups, 0);
+    assert.equal(harness.containers.has(candidateId), true);
+});
+
 test('old contract hashes remain foreign and block replacement before mutation', (t) => {
     const harness = networkHarness(t);
     const network = canonicalizeNetwork({ mode: 'default' });
@@ -926,4 +1118,50 @@ test('network lifecycle source contains no removed gateway, socket, managed-host
     ]) {
         assert.equal(source.includes(forbidden), false, `unexpected removed transport residue: ${forbidden}`);
     }
+});
+
+test('async network lifecycle ownership is retained until readiness-style work settles', async (t) => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-network-async-lock-'));
+    t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+    const lockPath = path.join(dir, 'network.lock');
+    let releasePending;
+    const pending = new Promise((resolve) => { releasePending = resolve; });
+    let entered = false;
+    const owner = withNetworkLifecycleLock(async () => {
+        entered = true;
+        await pending;
+        return 'ready-and-activated';
+    }, { lockPath });
+    await Promise.resolve();
+    assert.equal(entered, true);
+    assert.throws(
+        () => withNetworkLifecycleLock(() => 'competing-actor', { lockPath }),
+        { code: 'PLOINKY_NETWORK_LIFECYCLE_BUSY' },
+    );
+    releasePending();
+    assert.equal(await owner, 'ready-and-activated');
+    assert.equal(withNetworkLifecycleLock(() => 'next-actor', { lockPath }), 'next-actor');
+});
+
+test('network lifecycle capability is exact-path reentrant and invalid after outer release', async (t) => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-network-capability-'));
+    t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+    const lockPath = path.join(dir, 'network.lock');
+    const otherPath = path.join(dir, 'other.lock');
+    let captured;
+    await withNetworkLifecycleLock(async (capability) => {
+        captured = capability;
+        assert.equal(
+            withNetworkLifecycleLock((same) => same === capability, { lockPath, capability }),
+            true,
+        );
+        assert.throws(
+            () => withNetworkLifecycleLock(() => {}, { lockPath: otherPath, capability }),
+            { code: 'PLOINKY_NETWORK_LIFECYCLE_CAPABILITY_REQUIRED' },
+        );
+    }, { lockPath });
+    assert.throws(
+        () => withNetworkLifecycleLock(() => {}, { lockPath, capability: captured }),
+        { code: 'PLOINKY_NETWORK_LIFECYCLE_CAPABILITY_REQUIRED' },
+    );
 });

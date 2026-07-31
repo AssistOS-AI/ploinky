@@ -1,5 +1,8 @@
-import { execSync } from 'child_process';
+import { execSync, spawnSync } from 'child_process';
+import fs from 'fs';
+import path from 'path';
 import { debugLog } from '../../utils/utils.js';
+import { PLOINKY_DIR } from '../../utils/config.js';
 import { loadAgents } from '../../utils/workspace.js';
 import {
     containerExists,
@@ -11,6 +14,215 @@ import {
 } from './common.js';
 import { clearLivenessState } from './healthProbes.js';
 import { stopBwrapProcesses, isBwrapProcessRunning } from '../bwrap/bwrapFleet.js';
+import {
+    NETWORK_LABELS,
+    withNetworkLifecycleLock,
+    workspaceNetworkIdentity,
+} from '../networkLifecycle.js';
+import { NETWORK_SCHEMA_VERSION } from '../networkContract.js';
+
+const GENERATED_ROUTER_DESCRIPTOR_TARGET = '/run/ploinky/router-descriptor.json';
+const GENERATED_ROUTER_DESCRIPTOR_ROOT = path.join(PLOINKY_DIR, 'run', 'router-descriptors');
+const CONTROL_TIMEOUT_MS = 5_000;
+
+function runContainerControl(runtime, args) {
+    return spawnSync(runtime, args, {
+        encoding: 'utf8',
+        timeout: CONTROL_TIMEOUT_MS,
+        maxBuffer: 128 * 1024,
+        killSignal: 'SIGKILL',
+    });
+}
+
+function inspectExactContainer(runtime, identifier) {
+    const result = runContainerControl(runtime, ['container', 'inspect', identifier]);
+    if (result.error) throw result.error;
+    if (result.status !== 0) return null;
+    let parsed;
+    try { parsed = JSON.parse(String(result.stdout || '')); } catch (error) {
+        throw new Error(`container inspection returned malformed JSON: ${error.message}`);
+    }
+    const record = Array.isArray(parsed) ? parsed[0] : parsed;
+    return record && typeof record === 'object' ? record : null;
+}
+
+function captureRecordedGeneratedRouterDescriptor(record) {
+    const binds = (record?.config?.binds || []).filter((bind) => (
+        bind?.generatedRouterDescriptor === true
+        || String(bind?.target || '') === GENERATED_ROUTER_DESCRIPTOR_TARGET
+    ));
+    if (!binds.length) return null;
+    if (binds.length !== 1
+        || binds[0]?.generatedRouterDescriptor !== true
+        || binds[0]?.ro !== true
+        || String(binds[0]?.target || '') !== GENERATED_ROUTER_DESCRIPTOR_TARGET) {
+        throw new Error('generated Router descriptor registry ownership is ambiguous');
+    }
+    const source = path.resolve(String(binds[0]?.source || ''));
+    const root = path.resolve(GENERATED_ROUTER_DESCRIPTOR_ROOT);
+    const relative = path.relative(root, source);
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.json$/i.test(relative)
+        || relative.startsWith('..') || path.isAbsolute(relative) || relative.includes(path.sep)) {
+        throw new Error('generated Router descriptor registry source is outside its runtime-owned root');
+    }
+    const stat = fs.lstatSync(source);
+    if (!stat.isFile() || stat.isSymbolicLink() || (stat.mode & 0o777) !== 0o600) {
+        throw new Error('generated Router descriptor registry source is not an exact 0600 regular file');
+    }
+    const realRoot = fs.realpathSync.native(root);
+    const realSource = fs.realpathSync.native(source);
+    if (realSource !== path.join(realRoot, relative)) {
+        throw new Error('generated Router descriptor registry source failed real-path confinement');
+    }
+    return Object.freeze({ source, dev: stat.dev, ino: stat.ino });
+}
+
+function labelsOf(record) {
+    return record?.Config?.Labels || record?.Labels || record?.labels || {};
+}
+
+function defaultPause(milliseconds) {
+    if (!(milliseconds > 0)) return;
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, milliseconds);
+}
+
+function assertExactContainerOwnership(name, record, inspected, expectedId, workspaceHash) {
+    const actualId = String(inspected?.Id || inspected?.ID || '');
+    const actualName = String(inspected?.Name || '').replace(/^\//, '');
+    if (actualId !== expectedId || actualName !== name) {
+        throw new Error(`fleet lifecycle for '${name}' could not prove exact immutable container identity`);
+    }
+    if (record?.type !== 'agent') {
+        throw new Error(`fleet lifecycle for '${name}' requires a current managed-agent registry record`);
+    }
+    const expectedInstanceId = String(record?.instanceId || '').trim();
+    const expectedEnableGeneration = String(record?.enableGeneration || '').trim();
+    const labels = labelsOf(inspected);
+    if (!expectedInstanceId || !expectedEnableGeneration
+        || labels?.[NETWORK_LABELS.managed] !== '1'
+        || labels?.[NETWORK_LABELS.resource] !== 'agent'
+        || labels?.[NETWORK_LABELS.schema] !== NETWORK_SCHEMA_VERSION
+        || labels?.[NETWORK_LABELS.workspace] !== workspaceHash
+        || !/^[a-f0-9]{64}$/.test(String(labels?.[NETWORK_LABELS.contract] || ''))
+        || String(labels?.[NETWORK_LABELS.instanceId] || '') !== expectedInstanceId
+        || String(labels?.[NETWORK_LABELS.enableGeneration] || '') !== expectedEnableGeneration
+        || inspected?.HostConfig?.Init !== true) {
+        throw new Error(`fleet lifecycle for '${name}' could not prove exact managed ownership labels and runtime identity`);
+    }
+    return inspected;
+}
+
+function assertExactDescriptorMount(name, inspected, artifact) {
+    const descriptorMounts = (inspected?.Mounts || []).filter((mount) => (
+        String(mount?.Destination || '') === GENERATED_ROUTER_DESCRIPTOR_TARGET
+    ));
+    if (!artifact) {
+        if (descriptorMounts.length) {
+            throw new Error(`fleet lifecycle for '${name}' found an unrecorded generated Router descriptor mount`);
+        }
+        return;
+    }
+    if (descriptorMounts.length !== 1
+        || descriptorMounts[0]?.RW !== false
+        || path.resolve(String(descriptorMounts[0]?.Source || '')) !== artifact.source) {
+        throw new Error(`descriptor cleanup for '${name}' could not prove exact container/mount ownership`);
+    }
+}
+
+function controlSucceeded(result) {
+    return !result?.error && result?.status === 0;
+}
+
+function removeExactContainerAndDescriptor(name, record, runtime, {
+    fast = false,
+    remove = true,
+    inspect = inspectExactContainer,
+    control = runContainerControl,
+    withLock = withNetworkLifecycleLock,
+    pause = defaultPause,
+    now = Date.now,
+    workspaceIdentity = workspaceNetworkIdentity,
+} = {}) {
+    const expectedId = String(record?.containerId || '').trim();
+    if (!/^[a-f0-9]{64}$/.test(expectedId)) {
+        throw new Error(`fleet lifecycle for '${name}' requires its immutable registry container ID`);
+    }
+    if (record?.type !== 'agent'
+        || !String(record?.instanceId || '').trim()
+        || !String(record?.enableGeneration || '').trim()) {
+        throw new Error(`fleet lifecycle for '${name}' requires a complete managed-agent registry identity`);
+    }
+    return withLock(() => {
+        const artifact = captureRecordedGeneratedRouterDescriptor(record);
+        const workspaceHash = String(workspaceIdentity()?.hash || '');
+        if (!workspaceHash) {
+            throw new Error(`fleet lifecycle for '${name}' could not resolve the workspace identity`);
+        }
+        let inspected = inspect(runtime, expectedId);
+        if (!inspected) {
+            // Without a live immutable-ID inspection there is no container
+            // ownership evidence that permits deleting even a recorded
+            // descriptor artifact. Preserve both registry state and artifact.
+            return Object.freeze({ found: false, stopped: false, removed: false });
+        }
+
+        const revalidate = () => {
+            const current = inspect(runtime, expectedId);
+            if (!current) return null;
+            assertExactContainerOwnership(name, record, current, expectedId, workspaceHash);
+            assertExactDescriptorMount(name, current, artifact);
+            return current;
+        };
+        inspected = assertExactContainerOwnership(name, record, inspected, expectedId, workspaceHash);
+        assertExactDescriptorMount(name, inspected, artifact);
+
+        if (inspected?.State?.Running === true) {
+            const signaled = control(runtime, ['kill', '--signal', 'SIGTERM', expectedId]);
+            if (!controlSucceeded(signaled)) {
+                const raced = revalidate();
+                if (raced) throw new Error(`fleet lifecycle for '${name}' could not send SIGTERM by immutable ID`);
+            }
+        }
+
+        const deadline = now() + (fast ? 100 : 5_000);
+        inspected = revalidate();
+        while (inspected?.State?.Running === true && now() < deadline) {
+            pause(Math.min(fast ? 10 : 100, Math.max(1, deadline - now())));
+            inspected = revalidate();
+        }
+        if (inspected?.State?.Running === true) {
+            const killed = control(runtime, ['kill', expectedId]);
+            if (!controlSucceeded(killed)) {
+                const raced = revalidate();
+                if (raced) throw new Error(`fleet lifecycle for '${name}' could not force-stop by immutable ID`);
+            }
+            inspected = revalidate();
+            if (inspected?.State?.Running === true) {
+                throw new Error(`fleet lifecycle for '${name}' remained running after immutable-ID kill`);
+            }
+        }
+
+        if (!remove) {
+            return Object.freeze({ found: true, stopped: true, removed: false });
+        }
+        inspected = revalidate();
+        if (inspected) {
+            const removed = control(runtime, ['rm', '-f', expectedId]);
+            if (!controlSucceeded(removed) || inspect(runtime, expectedId)) {
+                throw new Error(`descriptor cleanup for '${name}' could not prove exact container removal`);
+            }
+        }
+        if (artifact) {
+            const current = fs.lstatSync(artifact.source);
+            if (!current.isFile() || current.isSymbolicLink()
+                || current.dev !== artifact.dev || current.ino !== artifact.ino) {
+                throw new Error(`descriptor cleanup for '${name}' detected artifact identity drift`);
+            }
+            fs.unlinkSync(artifact.source);
+        }
+        return Object.freeze({ found: true, stopped: true, removed: true });
+    });
+}
 
 function chunkArray(list, size = 8) {
     const chunks = [];
@@ -111,32 +323,29 @@ function stopConfiguredAgents({ fast = false } = {}) {
         }
     }
 
-    // Handle container agents
-    const candidateSet = new Set();
+    // Handle container agents. Registry names are diagnostic only: every
+    // signal targets a revalidated immutable container ID while the shared
+    // network lifecycle lock is held.
+    const stoppedContainers = [];
+    let runtime = null;
     for (const [name, rec] of containerEntries) {
-        const candidates = getContainerCandidates(name, rec).filter((candidate) => candidate && containerExists(candidate));
-        if (!candidates.length) {
-            const label = rec?.agentName ? `${rec.agentName}` : name;
-            console.log(`[stop] ${label}: no running container found.`);
+        try {
+            runtime ||= getRuntime();
+            const result = removeExactContainerAndDescriptor(name, rec, runtime, {
+                fast,
+                remove: false,
+            });
+            if (!result.found) {
+                console.log(`[stop] ${rec?.agentName || name}: no exact registered container found.`);
+                continue;
+            }
+            console.log(`[stop] Stopped ${name}`);
+            clearLivenessState(name);
+            stoppedContainers.push(name);
+        } catch (error) {
+            console.log(`[stop] Preserved ${name}: ${error?.message || error}`);
         }
-        for (const candidate of candidates) candidateSet.add(candidate);
     }
-
-    const allCandidates = Array.from(candidateSet);
-    if (allCandidates.length) {
-        allCandidates.forEach((name) => gracefulStopContainer(name, { prefix: '[stop]' }));
-        const remaining = waitForContainers(allCandidates, 5);
-        if (remaining.length) {
-            forceStopContainers(remaining, { prefix: '[stop]' });
-            waitForContainers(remaining, 2);
-        }
-    }
-
-    const stoppedContainers = allCandidates.filter((name) => !isContainerRunning(name));
-    stoppedContainers.forEach((name) => {
-        console.log(`[stop] Stopped ${name}`);
-        clearLivenessState(name);
-    });
     return [...bwrapStopped, ...stoppedContainers];
 }
 
@@ -167,71 +376,28 @@ function stopAndRemoveMany(names, { fast = false, records = null } = {}) {
     }
     const bwrapRemoved = bwrapEntries.map((entry) => entry.agentName);
 
-    const removalSet = new Set();
-    const runningSet = new Set();
-
-    for (const agentName of containerNames) {
-        if (!agentName) continue;
-        const rec = agents ? agents[agentName] : null;
-        const candidates = getContainerCandidates(agentName, rec);
-        for (const candidate of candidates) {
-            if (!candidate || !containerExists(candidate)) continue;
-            removalSet.add(candidate);
-            if (isContainerRunning(candidate)) {
-                runningSet.add(candidate);
-            }
-        }
-    }
-
-    if (!removalSet.size) return bwrapRemoved;
-
     const prefix = fast ? '[destroy-fast]' : '[destroy]';
-    const runningList = Array.from(runningSet);
-    const runtime = getRuntime();
-    if (runningList.length) {
-        console.log(`${prefix} Sending SIGTERM to ${runningList.length} container(s)...`);
-        for (const chunk of chunkArray(runningList)) {
-            try {
-                execSync(`${runtime} kill --signal SIGTERM ${chunk.join(' ')}`, { stdio: 'ignore' });
-            } catch (e) {
-                debugLog(`batch SIGTERM failed for ${chunk.join(', ')}: ${e?.message || e}`);
-                for (const name of chunk) {
-                    gracefulStopContainer(name, { prefix });
-                }
-            }
-        }
-    }
-
-    const waitSeconds = fast ? 0.1 : 5;
-    const stillRunning = runningList.length ? waitForContainers(runningList, waitSeconds) : [];
-    if (stillRunning.length) {
-        forceStopContainers(stillRunning, { prefix });
-    }
-
-    const removalList = Array.from(removalSet);
+    let runtime = null;
     const removed = [];
-    for (const chunk of chunkArray(removalList)) {
+    for (const name of containerNames) {
+        const record = agents?.[name];
+        if (!record) {
+            console.log(`${prefix} Preserved ${name}: no exact registry record.`);
+            continue;
+        }
         try {
-            console.log(`${prefix} Removing containers: ${chunk.join(', ')}`);
-            execSync(`${runtime} rm -f ${chunk.join(' ')}`, { stdio: 'ignore' });
-            chunk.forEach((name) => {
+            runtime ||= getRuntime();
+            const result = removeExactContainerAndDescriptor(name, record, runtime, {
+                fast,
+                remove: true,
+            });
+            if (result.removed) {
                 console.log(`${prefix} ✓ removed ${name}`);
                 clearLivenessState(name);
                 removed.push(name);
-            });
-        } catch (e) {
-            debugLog(`batch rm failed for ${chunk.join(', ')}: ${e?.message || e}`);
-            for (const name of chunk) {
-                try {
-                    console.log(`${prefix} Removing container: ${name}`);
-                    execSync(`${runtime} rm -f ${name}`, { stdio: 'ignore' });
-                    console.log(`${prefix} ✓ removed ${name}`);
-                    clearLivenessState(name);
-                    removed.push(name);
-                } catch (err) {
-                    console.log(`${prefix} rm failed for ${name}: ${err?.message || err}`);
-                }
             }
+        } catch (error) {
+            console.log(`${prefix} Preserved ${name}: ${error?.message || error}`);
         }
     }
 
@@ -260,8 +426,7 @@ function listAllContainerNames() {
 
 function destroyAllPloinky({ fast = false } = {}) {
     const names = listAllContainerNames().filter((n) => n.startsWith('ploinky_'));
-    stopAndRemoveMany(names, { fast });
-    return names.length;
+    return stopAndRemoveMany(names, { fast }).length;
 }
 
 function destroyWorkspaceContainers({ fast = false } = {}) {
@@ -301,6 +466,7 @@ export {
     getContainerCandidates,
     gracefulStopContainer,
     listAllContainerNames,
+    removeExactContainerAndDescriptor,
     stopAndRemove,
     stopAndRemoveMany,
     stopConfiguredAgents,

@@ -135,16 +135,16 @@ function pinnedAgentlibUrl() {
 /**
  * Resolve the achillesAgentLib ref implied by a global --branch policy.
  *
- * Best-effort, mirroring per-repo branch resolution: if the branch exists on the
- * achillesAgentLib remote, use it; otherwise honor the branch fallback
- * (`default` → null so the pinned #master is kept, `fail` → throw). Called from
- * `ploinky start` with the parsed --branch policy.
+ * If the branch exists on the achillesAgentLib remote, use it. A missing branch
+ * is always fatal: silently substituting the default dependency spec makes it
+ * impossible to prove which AgentLib implementation a release candidate ran.
+ * Called from `ploinky start` with the parsed --branch policy.
  *
  * @param {object} branchPolicy - parsed --branch policy ({ branch, fallback, ... }).
  * @param {object} [opts]
  * @param {(url: string, branch: string) => boolean} [opts.branchExists] - remote-branch probe (injectable for tests).
  * @param {string} [opts.url] - achillesAgentLib remote URL (defaults to the pinned globalDeps URL).
- * @returns {string|null} branch to use, or null to keep the pinned default.
+ * @returns {string|null} branch to use, or null when no branch was requested.
  */
 function resolveAgentlibBranchRef(branchPolicy, { branchExists = remoteBranchExists, url } = {}) {
     const branch = branchPolicy?.branch;
@@ -155,13 +155,11 @@ function resolveAgentlibBranchRef(branchPolicy, { branchExists = remoteBranchExi
     if (remoteUrl && branchExists(remoteUrl, branch)) {
         return branch;
     }
-    if (branchPolicy.fallback === 'fail') {
-        throw new Error(
-            `Branch '${branch}' not found on the achillesAgentLib remote (${remoteUrl || 'unknown'}); `
-            + `aborting (--branch-fallback fail).`,
-        );
-    }
-    return null;
+    const fallback = branchPolicy?.fallback || 'default';
+    throw new Error(
+        `Branch '${branch}' not found on the achillesAgentLib remote (${remoteUrl || 'unknown'}); `
+        + `refusing AgentLib dependency fallback (requested --branch-fallback ${fallback}).`,
+    );
 }
 
 export {

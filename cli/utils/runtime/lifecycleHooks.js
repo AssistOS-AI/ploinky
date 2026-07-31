@@ -6,10 +6,8 @@ import { debugLog } from '../utils.js';
 import { getProfileConfig, getProfileEnvVars, getHookNames, getActiveProfile } from './profileService.js';
 import { validateSecrets, getSecrets, createEnvWithSecrets, formatMissingSecretsError } from '../security/secretInjector.js';
 import { buildEnvMap } from '../security/secretVars.js';
-import { buildAgentIdentityEnv, stripReservedAgentEnv } from '../security/agentIdentityEnv.js';
+import { buildAgentPrincipalEnv, stripReservedAgentEnv } from '../security/agentIdentityEnv.js';
 import { deriveAgentPrincipalId } from '../security/agentIdentity.js';
-import { edgeRuntimeEnvironment } from '../../sandbox/edgeGeneration.js';
-import { resolveMasterKeySeed } from '../security/masterKey.js';
 import {
     initWorkspaceStructure,
     createAgentSymlinks,
@@ -54,7 +52,7 @@ function readManifest(agentPath) {
 
 export function buildLifecycleHookEnv(
     { agentName, repoName, profileName, profileConfig, agentPath, containerInfo = {} },
-    { buildIdentityEnv = buildAgentIdentityEnv } = {},
+    { buildIdentityEnv = buildAgentPrincipalEnv } = {},
 ) {
     const envVars = getProfileEnvVars(agentName, repoName, profileName || getActiveProfile(), containerInfo);
     const manifest = readManifest(agentPath);
@@ -62,19 +60,21 @@ export function buildLifecycleHookEnv(
     const profileEnv = normalizeProfileEnv(profileConfig?.env);
     const secrets = profileConfig?.secrets ? getSecrets(profileConfig.secrets) : {};
     const merged = createEnvWithSecrets({ ...envVars, ...profileEnv, ...manifestEnv }, secrets);
-    // Host lifecycle hooks run as the owning agent, so they receive that agent's
-    // own per-agent identity + signing secret (DS013), asserted LAST — never the
-    // shared key, and never an override from profile/manifest/secret config.
+    // Pre-attestation host hooks receive only the non-secret principal identity.
+    // Credential, descriptor, trust-anchor, and Router locator state is created
+    // only after the final listener/Host observation has succeeded.
     stripReservedAgentEnv(merged);
     try {
-        Object.assign(merged, buildIdentityEnv(deriveAgentPrincipalId(repoName, agentName)));
+        const proposedPrincipal = buildIdentityEnv(deriveAgentPrincipalId(repoName, agentName));
+        const principal = Object.fromEntries([
+            'PLOINKY_AGENT_ID',
+            'PLOINKY_AGENT_PRINCIPAL',
+            'PLOINKY_AGENT_INSTANCE_ID',
+            'PLOINKY_AGENT_ENABLE_GENERATION',
+        ].filter((name) => typeof proposedPrincipal?.[name] === 'string' && proposedPrincipal[name])
+            .map((name) => [name, proposedPrincipal[name]]));
+        Object.assign(merged, principal);
     } catch (_) { }
-    // The topology locator and both Router URLs are box-owned runtime values.
-    // Assert them after every manifest/profile/secret and identity layer so a
-    // host hook always observes the exact loopback listeners for this box.
-    Object.assign(merged, edgeRuntimeEnvironment('host', {
-        workspaceRoot: PLOINKY_WORKSPACE_ROOT,
-    }));
     return merged;
 }
 
@@ -147,6 +147,14 @@ export function executeHostHook(scriptPath, env = {}, options = {}) {
         ...env,
         PLOINKY_HOOK_TYPE: 'host'
     };
+    const principalEnv = Object.fromEntries([
+        'PLOINKY_AGENT_ID',
+        'PLOINKY_AGENT_PRINCIPAL',
+        'PLOINKY_AGENT_INSTANCE_ID',
+        'PLOINKY_AGENT_ENABLE_GENERATION',
+    ].filter((name) => typeof env?.[name] === 'string' && env[name]).map((name) => [name, env[name]]));
+    stripReservedAgentEnv(hookEnv);
+    Object.assign(hookEnv, principalEnv);
 
     // Host hooks run on the HOST BEFORE the container exists, so the container-only
     // PLOINKY_WORKSPACE_ROOT injection (see agentServiceManager/bwrapServiceManager)
@@ -160,12 +168,6 @@ export function executeHostHook(scriptPath, env = {}, options = {}) {
     // path /Agent is unavailable. Point shared Ploinky library imports at the
     // exact host-side Agent tree and do not accept a manifest/profile override.
     hookEnv.PLOINKY_AGENT_LIB_DIR = HOST_AGENT_LIB_DIR;
-    if (!String(hookEnv.PLOINKY_MASTER_KEY || '').trim()) {
-        hookEnv.PLOINKY_MASTER_KEY = resolveMasterKeySeed({
-            purpose: 'host lifecycle hooks',
-            startDir: hookEnv.PLOINKY_WORKSPACE_ROOT || cwd,
-        });
-    }
 
     // Check if this is an inline command
     if (isInlineCommand(scriptPath)) {

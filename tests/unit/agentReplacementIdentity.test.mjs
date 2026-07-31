@@ -38,8 +38,13 @@ function existingRecord() {
 function rotationHarness(reason, request = {}) {
     let registry = { [containerName]: existingRecord() };
     const events = [];
+    const networkLifecycleCapability = Object.freeze({ fixture: 'network-capability' });
     const minted = [`instance-new-${reason}`, `enable-new-${reason}`];
     const dependencies = {
+        assertNetworkCapability: (received) => {
+            assert.equal(received, networkLifecycleCapability);
+            events.push('network-capability');
+        },
         withApplyLock: (callback) => callback(Object.freeze({})),
         inactivate: (value) => {
             events.push(`inactivate:${value}`);
@@ -66,6 +71,7 @@ function rotationHarness(reason, request = {}) {
         existingRecord: existingRecord(),
         existingRuntime: true,
         recreateReason: reason,
+        networkLifecycleCapability,
         ...request,
     }, dependencies);
     return { dependencies, events, registry, runtimeIdentity };
@@ -84,6 +90,7 @@ test('every ordinary existing-container recreate rotates both identities before 
         assert.equal(registry[containerName].instanceId, runtimeIdentity.instanceId, reason);
         assert.equal(registry[containerName].enableGeneration, runtimeIdentity.enableGeneration, reason);
         assert.deepEqual(events.map((entry) => entry.split(':')[0]), [
+            'network-capability',
             'inactivate',
             'load',
             'save',
@@ -230,12 +237,15 @@ test('the explicit targeted restart contract preserves its captured tuple', () =
 test('failed coordinated prepare retains the new candidate tuple and leaves the selector inactive', () => {
     let registry = { [containerName]: existingRecord() };
     const inactivations = [];
+    const networkLifecycleCapability = Object.freeze({ fixture: 'network-capability' });
     assert.throws(() => resolveReplacementRuntimeIdentity({
         containerName,
         existingRecord: existingRecord(),
         existingRuntime: true,
         recreateReason: 'networkContractDrift',
+        networkLifecycleCapability,
     }, {
+        assertNetworkCapability: (received) => assert.equal(received, networkLifecycleCapability),
         inactivate: (reason) => inactivations.push(reason),
         loadRegistry: () => structuredClone(registry),
         saveRegistry: (value) => { registry = structuredClone(value); },
@@ -249,4 +259,22 @@ test('failed coordinated prepare retains the new candidate tuple and leaves the 
     assert.equal(registry[containerName].enableGeneration, 'enable-failed-candidate');
     assert.equal(inactivations.length, 2);
     assert.match(inactivations[1], /prepare-failed/);
+});
+
+test('coordinated replacement rejects a missing network capability before mutation', () => {
+    assert.throws(() => resolveReplacementRuntimeIdentity({
+        containerName,
+        existingRecord: existingRecord(),
+        existingRuntime: true,
+        recreateReason: 'envHashChanged',
+    }, {
+        assertNetworkCapability: (received) => {
+            assert.equal(received, undefined);
+            throw new Error('network lifecycle capability required');
+        },
+        inactivate: () => assert.fail('must reject before edge mutation'),
+        loadRegistry: () => assert.fail('must reject before registry access'),
+        saveRegistry: () => assert.fail('must reject before registry mutation'),
+        prepare: () => assert.fail('must reject before generation preparation'),
+    }), /network lifecycle capability required/);
 });

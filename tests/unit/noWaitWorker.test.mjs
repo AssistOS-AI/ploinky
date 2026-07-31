@@ -256,7 +256,7 @@ test('no-wait host launch retries an inactive locked read after releasing the ap
 
     const result = await launchNoWaitHostRuntime(identity, initial, async () => {
         launches += 1;
-        assert.equal(lockHeld, true);
+        assert.equal(lockHeld, false);
         return { containerName: 'livekit-runtime' };
     }, {
         loadFn(receivedIdentity) {
@@ -731,16 +731,63 @@ test('queued no-wait launch rejects incomplete or foreign published targets', ()
 
 test('no-wait failure cleanup removes only a runtime created by this launch', async () => {
     const cleaned = [];
+    const aborted = [];
     const cleanup = async (candidate) => cleaned.push(candidate.containerName);
+    const abortPreparation = async (lease) => aborted.push(lease.leaseId);
 
     assert.equal(await cleanupNoWaitTaskOwnedCandidate({
         containerName: 'new-runtime',
         createdByThisLaunch: true,
-    }, { cleanup }), true);
+    }, { cleanup, abortPreparation }), true);
     assert.equal(await cleanupNoWaitTaskOwnedCandidate({
         containerName: 'reused-runtime',
         createdByThisLaunch: false,
-    }, { cleanup }), false);
-    assert.equal(await cleanupNoWaitTaskOwnedCandidate(null, { cleanup }), false);
-    assert.deepEqual(cleaned, ['new-runtime']);
+    }, { cleanup, abortPreparation }), false);
+    assert.equal(await cleanupNoWaitTaskOwnedCandidate({
+        containerName: 'prepared-adoption',
+        requiresEdgeActivation: true,
+        preparationLease: { leaseId: 'exact-lease' },
+    }, { cleanup, abortPreparation }), true);
+    assert.equal(await cleanupNoWaitTaskOwnedCandidate(null, { cleanup, abortPreparation }), false);
+    assert.deepEqual(cleaned, ['new-runtime', 'prepared-adoption']);
+    assert.deepEqual(aborted, ['exact-lease']);
+});
+
+test('no-wait cleanup aborts the exact preparation after candidate cleanup', async () => {
+    const events = [];
+    const preparationLease = { leaseId: 'prepared-exact' };
+    await cleanupNoWaitTaskOwnedCandidate({
+        containerName: 'prepared-runtime',
+        requiresEdgeActivation: true,
+        preparationLease,
+    }, {
+        cleanup(candidate) {
+            events.push(`cleanup:${candidate.containerName}`);
+        },
+        abortPreparation(received) {
+            assert.equal(received, preparationLease);
+            events.push(`abort:${received.leaseId}`);
+        },
+    });
+    assert.deepEqual(events, ['cleanup:prepared-runtime', 'abort:prepared-exact']);
+});
+
+test('no-wait cleanup still aborts preparation when exact candidate removal fails', async () => {
+    const events = [];
+    const preparationLease = { leaseId: 'prepared-cleanup-failure' };
+    await assert.rejects(cleanupNoWaitTaskOwnedCandidate({
+        containerName: 'prepared-runtime',
+        requiresEdgeActivation: true,
+        preparationLease,
+    }, {
+        cleanup() {
+            events.push('cleanup');
+            throw new Error('cleanup failed');
+        },
+        abortPreparation(received) {
+            assert.equal(received, preparationLease);
+            events.push('abort');
+        },
+    }), /cleanup failed/);
+    assert.deepEqual(events, ['cleanup', 'abort']);
 });

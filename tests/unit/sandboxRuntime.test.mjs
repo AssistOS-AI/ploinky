@@ -122,7 +122,7 @@ test('sandbox profile resolution honors explicit profiles and requires host netw
     }
 });
 
-test('bwrap and seatbelt env builders consume one validated host endpoint without rereading or defaulting', () => {
+test('bwrap and seatbelt validate the host endpoint but emit no uncertified Router env', () => {
     for (const relativePath of [
         'cli/sandbox/bwrap/bwrapServiceManager.js',
         'cli/sandbox/seatbelt/seatbeltServiceManager.js',
@@ -170,15 +170,9 @@ test('bwrap and seatbelt env builders consume one validated host endpoint withou
             script,
         });
         assert.equal(result.status, 0, result.stderr || result.stdout);
-        const expected = {
-            host: '127.0.0.1',
-            port: '8080',
-            url: 'http://127.0.0.1:8080',
-            authority: '127.0.0.1:19090',
-        };
         assert.deepEqual(parseLastJsonLine(result.stdout), {
-            bwrap: expected,
-            seatbelt: expected,
+            bwrap: {},
+            seatbelt: {},
             missingCode: 'PLOINKY_ROUTER_ENDPOINT_REQUIRED',
         });
     } finally {
@@ -242,12 +236,12 @@ test('managed sandbox env identity is bound to one exact instance and enable gen
                 bwrap: {
                     instanceId: 'instance-exact-1',
                     enableGeneration: 'enable-exact-1',
-                    privateSecretMatches: true,
+                    privateSecretMatches: false,
                 },
                 seatbelt: {
                     instanceId: 'instance-exact-1',
                     enableGeneration: 'enable-exact-1',
-                    privateSecretMatches: true,
+                    privateSecretMatches: false,
                 },
             },
             incompleteError: 'sandbox runtime identity requires exact instanceId and enableGeneration',
@@ -257,7 +251,7 @@ test('managed sandbox env identity is bound to one exact instance and enable gen
     }
 });
 
-test('sandbox env construction fails closed when identity key material cannot be loaded', () => {
+test('uncertified sandbox env construction never reads identity key material', () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-sandbox-identity-failure-'));
     try {
         fs.writeFileSync(path.join(root, '.ploinky'), 'not-a-directory');
@@ -287,14 +281,13 @@ test('sandbox env construction fails closed when identity key material cannot be
         });
         assert.equal(result.status, 0, result.stderr || result.stdout);
         const evidence = parseLastJsonLine(result.stdout);
-        assert.ok(evidence.failure, 'identity key-store failure must escape env construction');
-        assert.match(evidence.failure.message, /not a directory|ENOTDIR|EEXIST/i);
+        assert.equal(evidence.failure, null);
     } finally {
         fs.rmSync(root, { recursive: true, force: true });
     }
 });
 
-test('profile environment and secrets cannot override sandbox router discovery', () => {
+test('profile environment and secrets cannot re-enable sandbox Router discovery', () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-sandbox-router-env-'));
     try {
         const script = `
@@ -342,15 +335,9 @@ test('profile environment and secrets cannot override sandbox router discovery',
             script,
         });
         assert.equal(result.status, 0, result.stderr || result.stdout);
-        const expected = {
-            host: '127.0.0.1',
-            port: '8080',
-            url: 'http://127.0.0.1:8080',
-            authority: '127.0.0.1:19090',
-        };
         assert.deepEqual(parseLastJsonLine(result.stdout), {
-            bwrap: expected,
-            seatbelt: expected,
+            bwrap: {},
+            seatbelt: {},
         });
     } finally {
         fs.rmSync(root, { recursive: true, force: true });

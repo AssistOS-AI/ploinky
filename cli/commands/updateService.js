@@ -336,7 +336,7 @@ export function resolveGitRefCommit(url, ref, { execFile = execFileSync } = {}) 
 
 /**
  * Resolve the upstream commit of every *moving* git dependency in a package's
- * dependency map (e.g. achillesAgentLib `#master`, mcp-sdk `#main`).
+ * dependency map (e.g. mcp-sdk `#main` or an explicit deploy-time override).
  *
  * `ploinky update` uses this to detect when a moving ref advanced even though
  * its package.json spec string — and therefore the dependency-cache hash — is

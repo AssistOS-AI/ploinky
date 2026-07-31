@@ -48,6 +48,7 @@ import {
 } from '../sandbox/edgeGeneration.js';
 import { applyEdgeRoutingGeneration } from '../sandbox/coordinatedEdgeApply.js';
 import { resolveManifestStartup } from './runtime/manifestStartup.js';
+import { withNetworkLifecycleLock } from '../sandbox/networkLifecycle.js';
 import {
     createAgentSymlinks,
     removeAgentSymlinks,
@@ -658,6 +659,7 @@ export function prepareAgentEnableBatch(requests, {
 }
 
 export async function enableAgent(agentName, mode, repoNameParam, aliasParam, authModeParam, authOptions = {}) {
+    return withNetworkLifecycleLock(async (networkLifecycleCapability) => {
     let prepared;
     try {
         prepared = prepareAgentEnableBatch([{
@@ -705,6 +707,7 @@ export async function enableAgent(agentName, mode, repoNameParam, aliasParam, au
             preservePreparedRegistryRecord: true,
             preparationLease: prepared.preparedGeneration?.preparationLease,
             preparedHostModeCapability: plan.preparedHostModeCapability,
+            networkLifecycleCapability,
         });
         verifyEnabledAgentStarted(shortAgentName, started?.containerName || containerName, {
             runtime: started?.runtime || started?.registryRecord?.runtime || 'container',
@@ -735,7 +738,8 @@ export async function enableAgent(agentName, mode, repoNameParam, aliasParam, au
             return routing;
         }, {
             reason: 'agent-enable-runtime-finalize',
-            preparationLease: prepared.preparedGeneration?.preparationLease,
+            preparationLease: started?.preparationLease
+                || prepared.preparedGeneration?.preparationLease,
         });
 
         return { containerName: started?.containerName || containerName, repoName, shortAgentName, alias: alias || undefined, auth: record.auth, runMode, hostPort };
@@ -753,14 +757,17 @@ export async function enableAgent(agentName, mode, repoNameParam, aliasParam, au
         // readiness check.
         try { inactivateEdgeRoutingGeneration('agent-enable-start-failed', { preserveSelectedGeneration: true }); } catch (_) {}
         try {
-            if (prepared?.preparedGeneration?.preparationLease) {
-                abortEdgeRoutingPreparation(prepared.preparedGeneration.preparationLease, {
+            const failedLease = started?.preparationLease
+                || prepared?.preparedGeneration?.preparationLease;
+            if (failedLease) {
+                abortEdgeRoutingPreparation(failedLease, {
                     reason: 'agent-enable-start-failed',
                 });
             }
         } catch (_) {}
         throw new Error(`enable agent: failed to start '${shortAgentName}': ${error?.message || error}`);
     }
+    });
 }
 
 function routeKeyForEnabledRecord(record) {

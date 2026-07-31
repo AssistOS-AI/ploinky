@@ -6,7 +6,6 @@ import { parseEnableDirective } from '../utils/runtime/bootstrapManifest.js';
 import { stripReservedAgentEnv } from '../utils/security/agentIdentityEnv.js';
 import { PLOINKY_WORKSPACE_ROOT } from '../utils/config.js';
 import { readSecretsFile, setSecretValue } from '../utils/security/encryptedSecretsFile.js';
-import { edgeRuntimeEnvironment } from './edgeGeneration.js';
 import { getProfileConfig } from '../utils/runtime/profileService.js';
 import { buildEnvMap, getManifestEnvSpecs } from '../utils/security/secretVars.js';
 import { findAgent } from '../utils/utils.js';
@@ -21,6 +20,12 @@ const RESERVED_OUTPUT_NAMES = new Set([
     'PLOINKY_AGENT_SECRET',
     'PLOINKY_AGENT_API_KEY',
     'PLOINKY_AGENT_API_PUBLIC_KEY',
+    'PLOINKY_ROUTER_DESCRIPTOR_FILE',
+    'PLOINKY_ROUTER_REQUEST_AUTHORITY',
+    'PLOINKY_ROUTER_LISTENER_CLASS',
+    'PLOINKY_ROUTER_ATTESTATION_ID',
+    'PLOINKY_ROUTER_TRANSPORT_VERSION',
+    'PLOINKY_ROUTER_LOCAL_STREAMING',
 ]);
 
 function normalizeEnvName(name) {
@@ -159,13 +164,7 @@ export function buildProviderSubprocessEnv({
         PLOINKY_PROVIDER_DATA_DIR: path.join(workspaceRoot, '.ploinky', 'data', provider.shortAgentName),
         ...manifestEnv,
     };
-    const edgeEnv = edgeRuntimeEnvironment('host', { workspaceRoot });
-    return {
-        ...stripReservedAgentEnv(env),
-        PLOINKY_EDGE_TOPOLOGY_FILE: edgeEnv.PLOINKY_EDGE_TOPOLOGY_FILE,
-        PLOINKY_ROUTER_URL: edgeEnv.PLOINKY_ROUTER_URL,
-        PLOINKY_INTERNAL_ROUTER_URL: edgeEnv.PLOINKY_INTERNAL_ROUTER_URL,
-    };
+    return stripReservedAgentEnv(env);
 }
 
 export function redactProviderValue(_name, _value, _sensitive = false) {

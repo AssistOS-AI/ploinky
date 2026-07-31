@@ -212,7 +212,9 @@ test('coordinated graph topology precedes startup preinstall and config provider
     assert.ok(providerIndex > preinstallIndex, 'providers must run after static preinstall has populated shared values');
     assert.ok(finalPreparationIndex > providerIndex, 'provider output must be captured by a fresh identity generation');
     assert.ok(launchIndex > finalPreparationIndex, 'no managed process may start before consumer hooks and final identity preparation finish');
-    assert.match(source, /edgeRuntimeEnvironment\('host', \{ workspaceRoot: PLOINKY_WORKSPACE_ROOT \}\)/);
+    assert.match(source, /buildLifecycleHookEnv\(\{/);
+    assert.doesNotMatch(source, /edgeRuntimeEnvironment\(/,
+        'pre-attestation hooks must not receive Router descriptors, locators, or credentials');
     assert.doesNotMatch(source, /applyManifestDirectives/, 'workspace start must not use sequential manifest enable/start');
 });
 
@@ -279,8 +281,9 @@ test('prepared runtime records and routes commit together before activation, inc
     assert.match(noWaitSource, /forceRecreate:\s*args\.forceRecreate === '1'/);
     assert.match(noWaitSource, /assertActiveEdgeRoutingSourcesCurrent\(\)/);
     assert.doesNotMatch(noWaitSource, /prepareEdgeRoutingGeneration|inactivateEdgeRoutingGeneration/);
-    assert.match(noWaitSource, /waitForNoWaitRouteActivation\([\s\S]*activationSelector/);
-    assert.match(noWaitSource, /validateActiveGeneration\(\)[\s\S]*selector\.activationId !== activationSelector\.activationId/);
+    assert.match(noWaitSource, /waitForNoWaitRouteActivation\([\s\S]*validatedActivationSelector/);
+    assert.match(noWaitSource, /validateActiveGeneration\(\)[\s\S]*selector\.activationId !== validatedActivationSelector\.activationId/);
+    assert.match(noWaitSource, /preparationLease: result\?\.preparationLease/);
     assert.match(noWaitSource, /captureExpectedGeneration\(active\)[\s\S]*captureEdgeRoutingLifecycleMutationGeneration\(active\)/);
     assert.match(
         noWaitSource,
@@ -289,8 +292,8 @@ test('prepared runtime records and routes commit together before activation, inc
     );
     assert.match(
         noWaitSource,
-        /launchNoWaitHostRuntime[\s\S]*withApplyLockFn\(async \(\) => \{[\s\S]*lockedLifecycle\.generationDigest !== attemptLifecycle\.generationDigest[\s\S]*lockedLifecycle\.selectorActivationId !== attemptLifecycle\.selectorActivationId[\s\S]*launchStarted = true;\s*return launch\(\)/,
-        'each host launch attempt must validate one unchanged generation and activation inside the apply lock',
+        /launchNoWaitHostRuntime[\s\S]*withApplyLockFn\(\(\) => \{[\s\S]*lockedLifecycle\.generationDigest !== attemptLifecycle\.generationDigest[\s\S]*lockedLifecycle\.selectorActivationId !== attemptLifecycle\.selectorActivationId[\s\S]*\}\);[\s\S]*launchStarted = true;\s*return await launch\(\)/,
+        'each host launch must validate one unchanged selector under the edge lock, release it, then create the runtime under the network capability',
     );
     assert.match(
         noWaitSource,

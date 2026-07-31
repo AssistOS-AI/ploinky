@@ -22,39 +22,74 @@ import { buildSubjectIdentityKey, getSubjectIdentityPublicKey } from './subjectI
  * key set instead of duplicating the construction. Only public/derived material
  * is returned; the private signing key never leaves subjectIdentityKey.js.
  */
-export function buildAgentIdentityEnv(principalId, { instanceId = '', enableGeneration = '' } = {}) {
+function normalizePrincipal(principalId) {
     const id = String(principalId || '').trim();
     if (!id) {
         throw new Error('agentIdentityEnv: principalId is required');
     }
-    // `id` is the canonical `agent:<repo>/<agentName>` subject, so we can sign it
-    // directly.
-    // `buildSubjectIdentityKey`/`getSubjectIdentityPublicKey` touch the
-    // encrypted keypair store (.ploinky/), so corrupt or unwritable key
-    // material throws. Runtime callers must propagate that failure: a process
-    // may not start as a partially initialized authorization principal.
-    const apiKey = buildSubjectIdentityKey(id);
-    const publicKey = getSubjectIdentityPublicKey();
+    return id;
+}
+
+function normalizeRuntimeIdentity(instanceId, enableGeneration) {
+    const instance = String(instanceId || '').trim();
+    const generation = String(enableGeneration || '').trim();
+    if (Boolean(instance) !== Boolean(generation)) {
+        throw new Error('agentIdentityEnv: instanceId and enableGeneration must be provided together');
+    }
+    return { instance, generation };
+}
+
+function markGenerated(env, names) {
+    for (const name of names) env[`PLOINKY_ENV_SOURCE_${name}`] = 'generated';
+    return env;
+}
+
+// Non-secret identity fields may be prepared before topology attestation. They
+// carry no signing key, API key, agent request secret, or private request
+// secret, so a failed attestation cannot leave a key-capable partial env.
+export function buildAgentPrincipalEnv(principalId, { instanceId = '', enableGeneration = '' } = {}) {
+    const id = normalizePrincipal(principalId);
+    const { instance, generation } = normalizeRuntimeIdentity(instanceId, enableGeneration);
     const identity = {
         PLOINKY_AGENT_ID: id,
         PLOINKY_AGENT_PRINCIPAL: id,
+    };
+    if (instance || generation) {
+        identity.PLOINKY_AGENT_INSTANCE_ID = instance;
+        identity.PLOINKY_AGENT_ENABLE_GENERATION = generation;
+    }
+    return markGenerated(identity, Object.keys(identity));
+}
+
+// Credential material is deliberately a separate post-attestation operation.
+// Callers must not invoke this until the listener/Host observation and
+// descriptor signature have succeeded and the observed generation is current.
+export function buildAgentCredentialEnv(principalId, { instanceId = '', enableGeneration = '' } = {}) {
+    const id = normalizePrincipal(principalId);
+    const { instance, generation } = normalizeRuntimeIdentity(instanceId, enableGeneration);
+    // Retrieve only the public trust anchor first, then mint the subject API
+    // key. Neither helper returns the private signing key.
+    const publicKey = getSubjectIdentityPublicKey();
+    const apiKey = buildSubjectIdentityKey(id);
+    const identity = {
         PLOINKY_AGENT_SECRET: deriveAgentRequestSecret(id),
         PLOINKY_AGENT_API_KEY: apiKey,
         PLOINKY_AGENT_API_PUBLIC_KEY: publicKey,
-        PLOINKY_ENV_SOURCE_PLOINKY_AGENT_API_KEY: 'generated',
-        PLOINKY_ENV_SOURCE_PLOINKY_AGENT_API_PUBLIC_KEY: 'generated',
     };
-    const instance = String(instanceId || '').trim();
-    const generation = String(enableGeneration || '').trim();
     if (instance || generation) {
-        if (!instance || !generation) {
-            throw new Error('agentIdentityEnv: instanceId and enableGeneration must be provided together');
-        }
-        identity.PLOINKY_AGENT_INSTANCE_ID = instance;
-        identity.PLOINKY_AGENT_ENABLE_GENERATION = generation;
         identity.PLOINKY_AGENT_PRIVATE_SECRET = derivePrivateAgentRequestSecret(id, instance, generation);
     }
+    markGenerated(identity, ['PLOINKY_AGENT_API_KEY', 'PLOINKY_AGENT_API_PUBLIC_KEY']);
     return identity;
+}
+
+// Backward-compatible aggregate used by non-generated-local callers. New
+// lifecycle code must use the two phases above around topology attestation.
+export function buildAgentIdentityEnv(principalId, options = {}) {
+    return {
+        ...buildAgentPrincipalEnv(principalId, options),
+        ...buildAgentCredentialEnv(principalId, options),
+    };
 }
 
 // Env names that are router-managed and must NEVER be settable by agent-supplied
@@ -65,27 +100,40 @@ export function buildAgentIdentityEnv(principalId, { instanceId = '', enableGene
 // must come only from the owning runtime layer, never an override — a manifest
 // must not be able to redirect a hook, substitute its own signed key, public
 // key, or forge a `generated` provenance claim.
+export const GENERATED_RUNTIME_ENV_NAMES = Object.freeze([
+    'PLOINKY_ROUTER_DESCRIPTOR_FILE',
+    'PLOINKY_ROUTER_HOST',
+    'PLOINKY_ROUTER_PORT',
+    'PLOINKY_ROUTER_URL',
+    'PLOINKY_ROUTER_REQUEST_AUTHORITY',
+    'PLOINKY_ROUTER_AUTHORITY',
+    'PLOINKY_INTERNAL_ROUTER_URL',
+    'PLOINKY_EDGE_TOPOLOGY_FILE',
+    'PLOINKY_ROUTER_LISTENER_CLASS',
+    'PLOINKY_ROUTER_ATTESTATION_ID',
+    'PLOINKY_ROUTER_TRANSPORT_VERSION',
+    'PLOINKY_ROUTER_LOCAL_STREAMING',
+    'PLOINKY_AGENT_ID',
+    'PLOINKY_AGENT_PRINCIPAL',
+    'PLOINKY_AGENT_INSTANCE_ID',
+    'PLOINKY_AGENT_ENABLE_GENERATION',
+    'PLOINKY_AGENT_API_PUBLIC_KEY',
+    'PLOINKY_AGENT_API_KEY',
+]);
+
+const GENERATED_RUNTIME_SOURCE_NAMES = GENERATED_RUNTIME_ENV_NAMES.map((name) => `PLOINKY_ENV_SOURCE_${name}`);
+
 export const RESERVED_AGENT_ENV_NAMES = Object.freeze([
     'PLOINKY_MASTER_KEY',
     'PLOINKY_DERIVED_MASTER_KEY',
     'PLOINKY_TURN_SHARED_SECRET',
     'PLOINKY_CLOUDFLARE_TUNNEL_TOKEN',
     'PLOINKY_CLOUDFLARE_API_TOKEN',
-    'PLOINKY_EDGE_TOPOLOGY_FILE',
-    'PLOINKY_ROUTER_URL',
-    'PLOINKY_ROUTER_AUTHORITY',
-    'PLOINKY_INTERNAL_ROUTER_URL',
+    ...GENERATED_RUNTIME_ENV_NAMES,
+    ...GENERATED_RUNTIME_SOURCE_NAMES,
     'PLOINKY_AGENT_LIB_DIR',
-    'PLOINKY_AGENT_ID',
-    'PLOINKY_AGENT_PRINCIPAL',
     'PLOINKY_AGENT_SECRET',
-    'PLOINKY_AGENT_INSTANCE_ID',
-    'PLOINKY_AGENT_ENABLE_GENERATION',
     'PLOINKY_AGENT_PRIVATE_SECRET',
-    'PLOINKY_AGENT_API_KEY',
-    'PLOINKY_AGENT_API_PUBLIC_KEY',
-    'PLOINKY_ENV_SOURCE_PLOINKY_AGENT_API_KEY',
-    'PLOINKY_ENV_SOURCE_PLOINKY_AGENT_API_PUBLIC_KEY',
 ]);
 
 const RESERVED = new Set(RESERVED_AGENT_ENV_NAMES);
@@ -100,11 +148,10 @@ const RESERVED = new Set(RESERVED_AGENT_ENV_NAMES);
 export function stripReservedAgentEnv(env) {
     if (!env || typeof env !== 'object') return env;
     let dropped = null;
-    for (const key of RESERVED) {
-        if (Object.prototype.hasOwnProperty.call(env, key)) {
-            (dropped ||= []).push(key);
-            delete env[key];
-        }
+    for (const key of Object.keys(env)) {
+        if (!RESERVED.has(key) && !key.startsWith('PLOINKY_ENV_SOURCE_PLOINKY_')) continue;
+        (dropped ||= []).push(key);
+        delete env[key];
     }
     if (dropped) {
         console.error(`[ploinky] ignored reserved agent env name(s) ${dropped.join(', ')} from runtime config — these are router-managed (DS011/DS013).`);
@@ -112,4 +159,11 @@ export function stripReservedAgentEnv(env) {
     return env;
 }
 
-export default { buildAgentIdentityEnv, stripReservedAgentEnv, RESERVED_AGENT_ENV_NAMES };
+export default {
+    buildAgentPrincipalEnv,
+    buildAgentCredentialEnv,
+    buildAgentIdentityEnv,
+    stripReservedAgentEnv,
+    GENERATED_RUNTIME_ENV_NAMES,
+    RESERVED_AGENT_ENV_NAMES,
+};

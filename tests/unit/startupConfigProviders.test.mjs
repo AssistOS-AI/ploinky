@@ -134,19 +134,10 @@ test('buildProviderSubprocessEnv includes only allowlisted runtime and provider 
     assert.equal(env.PLOINKY_PROVIDER_AGENT, 'example/config-provider');
     assert.equal(env.PLOINKY_PROVIDER_AGENT_ID, 'agent:example/config-provider');
     assert.equal(env.EXAMPLE_REGION, 'eu-test-1');
-    assert.equal(
-        env.PLOINKY_EDGE_TOPOLOGY_FILE,
-        path.join(tempDir, '.ploinky', 'run', 'edge-topology', 'current.json'),
-    );
-    assert.equal(env.PLOINKY_ROUTER_URL, 'http://127.0.0.1:8080');
-    assert.equal(env.PLOINKY_INTERNAL_ROUTER_URL, 'http://127.0.0.1:8081');
-    const authoritativeProviderRuntimeNames = new Set([
-        'PLOINKY_EDGE_TOPOLOGY_FILE',
-        'PLOINKY_ROUTER_URL',
-        'PLOINKY_INTERNAL_ROUTER_URL',
-    ]);
+    assert.equal(env.PLOINKY_EDGE_TOPOLOGY_FILE, undefined);
+    assert.equal(env.PLOINKY_ROUTER_URL, undefined);
+    assert.equal(env.PLOINKY_INTERNAL_ROUTER_URL, undefined);
     for (const name of RESERVED_AGENT_ENV_NAMES) {
-        if (authoritativeProviderRuntimeNames.has(name)) continue;
         assert.equal(env[name], undefined, `${name} must not reach a config-provider process`);
     }
 });

@@ -16,8 +16,7 @@ const { buildFullEnvMap } = await import(`../../cli/sandbox/bwrap/bwrapServiceMa
 const { buildRouterEndpoint } = await import(`../../cli/sandbox/routerPort.js${moduleSuffix}`);
 const { deriveAgentRequestSecret, deriveDerivedMasterKey } = await import(`../../cli/utils/security/masterKey.js${moduleSuffix}`);
 const { deriveAgentPrincipalId } = await import(`../../cli/utils/security/agentIdentity.js${moduleSuffix}`);
-// The single identity injector that docker, bwrap, and lifecycle all route through.
-const { buildAgentIdentityEnv, stripReservedAgentEnv } = await import(`../../cli/utils/security/agentIdentityEnv.js${moduleSuffix}`);
+const { buildAgentIdentityEnv, buildAgentPrincipalEnv, stripReservedAgentEnv } = await import(`../../cli/utils/security/agentIdentityEnv.js${moduleSuffix}`);
 const { verifySubjectIdentityKey, getSubjectIdentityPublicKey } = await import(`../../cli/utils/security/subjectIdentityKey.js${moduleSuffix}`);
 const routerEndpoint = buildRouterEndpoint('host', 8080);
 
@@ -50,19 +49,22 @@ test('bwrap keeps the selected workspace separate from the persistent /root home
     assert.match(env.PATH, /^\/opt\/ploinky-node\/bin:/);
 });
 
-test('injected env carries PLOINKY_AGENT_ID + PLOINKY_AGENT_SECRET = the canonical per-agent values', () => {
+test('uncertified bwrap env carries only the canonical non-secret principal', () => {
     const env = envForAgent('AssistOSExplorer', 'dpuAgent');
     const principal = deriveAgentPrincipalId('AssistOSExplorer', 'dpuAgent');
     assert.equal(env.PLOINKY_AGENT_ID, principal);
     assert.equal(env.PLOINKY_AGENT_ID, 'agent:AssistOSExplorer/dpuAgent');
-    assert.equal(env.PLOINKY_AGENT_SECRET, deriveAgentRequestSecret(principal));
-    assert.match(env.PLOINKY_AGENT_SECRET, /^[0-9a-f]{64}$/);
+    assert.equal(env.PLOINKY_AGENT_SECRET, undefined);
+    assert.equal(env.PLOINKY_AGENT_API_KEY, undefined);
+    assert.equal(env.PLOINKY_AGENT_API_PUBLIC_KEY, undefined);
+    assert.equal(env.PLOINKY_ROUTER_URL, undefined);
 });
 
-test('two different agents receive DIFFERENT per-agent secrets', () => {
+test('two different uncertified bwrap agents receive different principals and no secrets', () => {
     const a = envForAgent('AssistOSExplorer', 'dpuAgent');
     const b = envForAgent('AssistOSExplorer', 'gitAgent');
-    assert.notEqual(a.PLOINKY_AGENT_SECRET, b.PLOINKY_AGENT_SECRET);
+    assert.equal(a.PLOINKY_AGENT_SECRET, undefined);
+    assert.equal(b.PLOINKY_AGENT_SECRET, undefined);
     assert.notEqual(a.PLOINKY_AGENT_ID, b.PLOINKY_AGENT_ID);
 });
 
@@ -78,7 +80,7 @@ test('the workspace master key is NEVER injected into an agent', () => {
     assert.equal(env.PLOINKY_MASTER_KEY, undefined);
 });
 
-test('buildAgentIdentityEnv is the single shared injector (docker, bwrap, lifecycle)', () => {
+test('buildAgentIdentityEnv remains the explicit aggregate credential injector', () => {
     const principal = deriveAgentPrincipalId('AssistOSExplorer', 'dpuAgent');
     const idEnv = buildAgentIdentityEnv(principal);
     // Exactly this key set — no master / derived-master / private material ever
@@ -92,6 +94,8 @@ test('buildAgentIdentityEnv is the single shared injector (docker, bwrap, lifecy
         'PLOINKY_AGENT_SECRET',
         'PLOINKY_ENV_SOURCE_PLOINKY_AGENT_API_KEY',
         'PLOINKY_ENV_SOURCE_PLOINKY_AGENT_API_PUBLIC_KEY',
+        'PLOINKY_ENV_SOURCE_PLOINKY_AGENT_ID',
+        'PLOINKY_ENV_SOURCE_PLOINKY_AGENT_PRINCIPAL',
     ]);
     assert.equal(idEnv.PLOINKY_AGENT_ID, principal);
     assert.equal(idEnv.PLOINKY_AGENT_PRINCIPAL, principal);
@@ -138,15 +142,15 @@ test('stripReservedAgentEnv drops master + identity names, keeps the rest', () =
         FOO: 'keep', BAR: 'also-keep',
         PLOINKY_MASTER_KEY: 'x', PLOINKY_DERIVED_MASTER_KEY: 'y',
         PLOINKY_AGENT_ID: 'z', PLOINKY_AGENT_PRINCIPAL: 'p', PLOINKY_AGENT_SECRET: 's',
+        PLOINKY_ENV_SOURCE_PLOINKY_FUTURE_PROTECTED_FIELD: 'manifest',
     };
     stripReservedAgentEnv(env);
     assert.deepEqual(Object.keys(env).sort(), ['BAR', 'FOO']);
 });
 
-test('profile config cannot inject a master key or override the agent secret (bwrap)', () => {
+test('profile config cannot inject a master key or add an uncertified bwrap secret', () => {
     const workDir = path.join(tempDir, 'work', 'hardened');
     fs.mkdirSync(workDir, { recursive: true });
-    const principal = deriveAgentPrincipalId('AssistOSExplorer', 'dpuAgent');
     // A profile that maliciously tries to leak the master and override the secret.
     const env = buildFullEnvMap('dpuAgent', {}, {
         env: { PLOINKY_MASTER_KEY: 'leak', PLOINKY_AGENT_SECRET: 'override', SAFE: 'ok' },
@@ -154,14 +158,12 @@ test('profile config cannot inject a master key or override the agent secret (bw
     assert.equal(env.SAFE, 'ok');                              // ordinary env survives
     assert.equal(env.PLOINKY_MASTER_KEY, undefined);          // master never injected
     assert.equal(env.PLOINKY_DERIVED_MASTER_KEY, undefined);
-    assert.equal(env.PLOINKY_AGENT_SECRET, deriveAgentRequestSecret(principal)); // authoritative wins
+    assert.equal(env.PLOINKY_AGENT_SECRET, undefined);
 });
 
-test('manifest/profile cannot override the generated signed identity key or public key (bwrap)', () => {
+test('manifest/profile cannot add generated signed identity material to uncertified bwrap', () => {
     const workDir = path.join(tempDir, 'work', 'hardened-soul');
     fs.mkdirSync(workDir, { recursive: true });
-    const principal = deriveAgentPrincipalId('AssistOSExplorer', 'dpuAgent');
-    const idEnv = buildAgentIdentityEnv(principal);
     // A manifest env and a profile env that both try to substitute their own signed
     // key / public key and forge a provenance marker. The reserved-name
     // strip runs before the authoritative identity is asserted, so all are dropped.
@@ -177,35 +179,22 @@ test('manifest/profile cannot override the generated signed identity key or publ
         },
     }, workDir, 'AssistOSExplorer', 'dev', 'bwrap', null, routerEndpoint);
     assert.equal(env.SAFE, 'ok');                                     // ordinary env survives
-    // The authoritative generated values win for every reserved name.
-    assert.equal(env.PLOINKY_AGENT_API_KEY, idEnv.PLOINKY_AGENT_API_KEY);
-    assert.equal(env.PLOINKY_AGENT_API_PUBLIC_KEY, idEnv.PLOINKY_AGENT_API_PUBLIC_KEY);
-    assert.equal(env.PLOINKY_ENV_SOURCE_PLOINKY_AGENT_API_KEY, 'generated');
-    assert.equal(env.PLOINKY_ENV_SOURCE_PLOINKY_AGENT_API_PUBLIC_KEY, 'generated');
+    assert.equal(env.PLOINKY_AGENT_API_KEY, undefined);
+    assert.equal(env.PLOINKY_AGENT_API_PUBLIC_KEY, undefined);
+    assert.equal(env.PLOINKY_ENV_SOURCE_PLOINKY_AGENT_API_KEY, undefined);
+    assert.equal(env.PLOINKY_ENV_SOURCE_PLOINKY_AGENT_API_PUBLIC_KEY, undefined);
     assert.equal(env.SOUL_GATEWAY_API_KEY, undefined);
     assert.equal(env.PLOINKY_SOUL_GATEWAY_API_PUBLIC_KEY, undefined);
-    // The forged values are gone; the surviving key still verifies as the agent.
-    assert.ok(!env.PLOINKY_AGENT_API_KEY.includes('forged'));
-    assert.notEqual(env.PLOINKY_AGENT_API_PUBLIC_KEY, 'attacker-public-key');
-    assert.deepEqual(
-        verifySubjectIdentityKey(env.PLOINKY_AGENT_API_KEY, env.PLOINKY_AGENT_API_PUBLIC_KEY),
-        { subjectId: principal, subjectType: 'agent' },
-    );
 });
 
-test('the bwrap full env map matches the shared identity injector exactly', () => {
-    // Docker and lifecycle build identity env through the same helper, so proving
-    // bwrap's full env map equals buildAgentIdentityEnv covers all three paths.
+test('the bwrap full env map matches the non-secret principal phase exactly', () => {
     const env = envForAgent('AssistOSExplorer', 'gitAgent');
-    const idEnv = buildAgentIdentityEnv(deriveAgentPrincipalId('AssistOSExplorer', 'gitAgent'));
+    const idEnv = buildAgentPrincipalEnv(deriveAgentPrincipalId('AssistOSExplorer', 'gitAgent'));
     assert.equal(env.PLOINKY_AGENT_ID, idEnv.PLOINKY_AGENT_ID);
     assert.equal(env.PLOINKY_AGENT_PRINCIPAL, idEnv.PLOINKY_AGENT_PRINCIPAL);
-    assert.equal(env.PLOINKY_AGENT_SECRET, idEnv.PLOINKY_AGENT_SECRET);
-    // The generated identity material flows through the bwrap path too.
-    assert.equal(env.PLOINKY_AGENT_API_KEY, idEnv.PLOINKY_AGENT_API_KEY);
-    assert.equal(env.PLOINKY_AGENT_API_PUBLIC_KEY, idEnv.PLOINKY_AGENT_API_PUBLIC_KEY);
-    assert.equal(env.PLOINKY_ENV_SOURCE_PLOINKY_AGENT_API_KEY, 'generated');
-    assert.equal(env.PLOINKY_ENV_SOURCE_PLOINKY_AGENT_API_PUBLIC_KEY, 'generated');
+    assert.equal(env.PLOINKY_AGENT_SECRET, undefined);
+    assert.equal(env.PLOINKY_AGENT_API_KEY, undefined);
+    assert.equal(env.PLOINKY_AGENT_API_PUBLIC_KEY, undefined);
     assert.equal(env.SOUL_GATEWAY_API_KEY, undefined);
     assert.equal(env.PLOINKY_SOUL_GATEWAY_API_PUBLIC_KEY, undefined);
 });

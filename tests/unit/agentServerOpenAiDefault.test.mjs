@@ -39,6 +39,20 @@ const OPENAI_TOOL = '__openai_chat_completions__';
 const MODELS_PATH = '/v1/models';
 const MODELS_TOOL = '__openai_models__';
 
+function isolatedAgentServerEnv() {
+    const env = { ...process.env };
+    for (const name of Object.keys(env)) {
+        if (name.startsWith('PLOINKY_AGENT_')
+            || name.startsWith('PLOINKY_ROUTER_')
+            || name.startsWith('PLOINKY_ENV_SOURCE_PLOINKY_')
+            || name === 'PLOINKY_INTERNAL_ROUTER_URL'
+            || name === 'PLOINKY_EDGE_TOPOLOGY_FILE') {
+            delete env[name];
+        }
+    }
+    return env;
+}
+
 // Master key shared by the parent (token signer) and the spawned AgentServer
 // child (token verifier). Set in the parent BEFORE deriveAgentRequestSecret is
 // imported/called, and passed to the child via env.
@@ -115,7 +129,7 @@ async function startServer({ manifest, mcpConfig, agentId, extraEnv = {} }) {
     }
     const port = await getFreePort();
     const env = {
-        ...process.env,
+        ...isolatedAgentServerEnv(),
         PORT: String(port),
         PLOINKY_AGENT_BIND_HOST: '127.0.0.1',
         PLOINKY_AGENT_ID: agentId || '',

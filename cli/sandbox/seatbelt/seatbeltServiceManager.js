@@ -106,6 +106,25 @@ function resolveSeatbeltRouterEndpoint(options = {}, networkMode = 'host') {
 }
 const DEFAULT_SEATBELT_PATH = '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin';
 const SEATBELT_RUNTIME_ROOT = path.join(PLOINKY_DIR, 'seatbelt-runtime');
+const UNATTESTED_GENERATED_LOCAL_ENV = Object.freeze([
+    'PLOINKY_ROUTER_DESCRIPTOR_FILE',
+    'PLOINKY_ROUTER_URL',
+    'PLOINKY_ROUTER_REQUEST_AUTHORITY',
+    'PLOINKY_ROUTER_AUTHORITY',
+    'PLOINKY_AGENT_SECRET',
+    'PLOINKY_AGENT_PRIVATE_SECRET',
+    'PLOINKY_AGENT_API_KEY',
+    'PLOINKY_AGENT_API_PUBLIC_KEY',
+]);
+
+function assertSeatbeltGeneratedLocalDisabled(env) {
+    const leaked = UNATTESTED_GENERATED_LOCAL_ENV.filter((name) => (
+        Object.prototype.hasOwnProperty.call(env || {}, name)
+    ));
+    if (leaked.length) {
+        throw new Error(`seatbelt generated-local routing is uncertified; refusing key-capable env (${leaked.join(', ')})`);
+    }
+}
 
 function resolveSymlinkPath(symlinkPath) {
     try {
@@ -422,6 +441,7 @@ function startSeatbeltProcess(agentName, manifest, agentPath, options = {}) {
 
     // Build environment map (reuse bwrap's builder with 'seatbelt' runtimeName)
     const envMap = buildFullEnvMap(agentName, manifest, profileConfig, agentWorkDir, repoName, activeProfile, 'seatbelt', runtimeResourcePlan, routerEndpoint, runtimeIdentity);
+    assertSeatbeltGeneratedLocalDisabled(envMap);
 
     // Set PORT env var
     if (hostPort) {
@@ -786,6 +806,7 @@ function attachSeatbeltInteractive(agentName, manifest, agentPath, workdir, entr
     // Build environment (same as running agent)
     assertManifestEnvProfileCompleteness(manifest, profileConfig, { agentName, repoName, profileName: activeProfile });
     const envMap = buildFullEnvMap(agentName, manifest, profileConfig, agentWorkDir, repoName, activeProfile, 'seatbelt', runtimeResourcePlan, routerEndpoint, runtimeIdentity);
+    assertSeatbeltGeneratedLocalDisabled(envMap);
     const hostPort = record.config?.ports?.[0]?.hostPort;
     if (hostPort) envMap.PORT = String(hostPort);
     envMap.PLOINKY_AGENT_LIB_DIR = seatbeltAgentLibPath;

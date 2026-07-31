@@ -39,12 +39,16 @@ function formatModelOption(entry) {
 }
 
 export async function loadSoulModelCatalog() {
-    const apiKey = String(getSecret('PLOINKY_AGENT_API_KEY') || '').trim();
+    // This menu talks to the public Soul Gateway directly. The generated
+    // The generated local-agent credential is valid only for the
+    // descriptor-attested Router transport and must never be attached to this
+    // external request.
+    const apiKey = String(getSecret('SOUL_GATEWAY_API_KEY') || '').trim();
     if (!apiKey) {
         return {
             models: [],
             tags: [],
-            warning: 'PLOINKY_AGENT_API_KEY is not set. Add it in .secrets or .env to load models.',
+            warning: 'SOUL_GATEWAY_API_KEY is not set. Add it in .secrets or .env to load models.',
         };
     }
 

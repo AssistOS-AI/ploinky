@@ -10,7 +10,7 @@ import {
     getManifestEnvNames,
     resolveVarValue
 } from '../../utils/security/secretVars.js';
-import { buildAgentIdentityEnv, stripReservedAgentEnv } from '../../utils/security/agentIdentityEnv.js';
+import { buildAgentPrincipalEnv, stripReservedAgentEnv } from '../../utils/security/agentIdentityEnv.js';
 import { debugLog } from '../../utils/utils.js';
 import {
     CONTAINER_CONFIG_PATH,
@@ -84,7 +84,7 @@ import {
     readManifestVolumeOptions,
     resolveManifestVolumeHostPath
 } from '../../utils/runtime/manifestVolumePolicy.js';
-import { assertRouterEndpoint, selectedRouterHostPort } from '../routerPort.js';
+import { assertRouterEndpoint } from '../routerPort.js';
 import {
     pruneStaleRuntimeEntries,
     runtimeSegment
@@ -520,25 +520,21 @@ function buildFullEnvMap(agentName, manifest, profileConfig, workspacePath, repo
     env.HOME = '/root';
     env.PATH = `${BWRAP_NODE_RUNTIME_PATH}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`;
 
-    // Final, authoritative agent identity (DS013): strip any reserved name a
-    // config layer may have set (master keys, or an identity override) and assert
-    // this agent's id + derived secret last so nothing can override them.
+    // Exact final-runner equivalence is not yet available for bwrap/seatbelt.
+    // Strip every reserved input and emit only non-secret principal fields;
+    // no descriptor, Router mirror, request secret, API key, or trust anchor is
+    // constructed. Generated-local use therefore fails before key/socket work.
     stripReservedAgentEnv(env);
     const exactRuntimeIdentity = runtimeIdentity === undefined
         ? undefined
         : normalizeSandboxRuntimeIdentity(runtimeIdentity);
     Object.assign(
         env,
-        buildAgentIdentityEnv(
+        buildAgentPrincipalEnv(
             deriveAgentPrincipalId(repoName, agentName),
             exactRuntimeIdentity,
         ),
     );
-
-    // Router discovery is a runtime contract, not user configuration. Assert it
-    // after every manifest, profile, environment, and secret layer.
-    Object.assign(env, endpoint.env);
-    env.PLOINKY_ROUTER_AUTHORITY = `127.0.0.1:${selectedRouterHostPort()}`;
 
     return env;
 }

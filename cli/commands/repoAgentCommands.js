@@ -143,7 +143,7 @@ function refreshRuntimeAchillesForUpdate(failed, ploinkyRoot = resolvePloinkyRoo
         const result = refreshPloinkyRuntimeAchillesDependency({ ploinkyRoot });
         console.log(`  ✓ ${path.relative(ploinkyRoot, result.installedPath)} (${result.method})`);
         // The prepared dependency caches under .ploinky/deps embed the global git
-        // dependencies (achillesAgentLib `#master`, mcp-sdk `#main`) but are keyed
+        // dependencies (mcp-sdk `#main` or explicit deploy-time overrides) but are keyed
         // on the package.json spec string, so a moving ref that advanced upstream
         // would otherwise serve a stale copy to containers. Resolve each moving git
         // dep's upstream commit and invalidate the caches only when one changed.
