@@ -5,7 +5,10 @@ import {
     createTaskCommandAutocompleteProvider,
     createTaskInteractionAutocompleteProvider,
 } from '../../cli/server/webchat/taskCommandAutocomplete.js';
-import { createComposerAutocomplete } from '../../cli/server/webchat/composerAutocomplete.js';
+import {
+    appendAutocompleteContext,
+    createComposerAutocomplete,
+} from '../../cli/server/webchat/composerAutocomplete.js';
 import { parseWebchatTaskState } from '../../cli/server/handlers/webchat/runtimeState.js';
 
 test('task command autocomplete uses the classic slash lifecycle and loads arguments in place', async () => {
@@ -189,6 +192,11 @@ test('task interaction options reuse the contextual autocomplete provider', () =
     const interaction = {
         id: 'task_control_12345678',
         message: 'Select the execution model for this task.',
+        challenge: {
+            type: 'device_code',
+            verificationUri: 'https://example.com/device',
+            userCode: 'ABCD-EFGH',
+        },
         options: [
             { id: 'choice_0', label: 'GPT Test', description: 'openai/gpt-test' },
             { id: 'choice_1', label: 'Claude Test', description: 'anthropic/claude-test' },
@@ -201,8 +209,60 @@ test('task interaction options reuse the contextual autocomplete provider', () =
     const suggestions = provider.getSuggestions('/claude');
     assert.deepEqual(suggestions.map((entry) => entry.label), ['Claude Test']);
     assert.equal(suggestions[0].applySelection().value, '');
+    assert.deepEqual(suggestions[0].contextPanel, interaction.challenge);
     suggestions[0].onSelected();
     assert.deepEqual(selected, [['task_control_12345678', 'choice_1']]);
+});
+
+test('device-code autocomplete context renders and copies one link in its steps', async () => {
+    const originalDocument = globalThis.document;
+    const originalNavigator = Object.getOwnPropertyDescriptor(globalThis, 'navigator');
+    const clipboardWrites = [];
+    const element = (tagName) => ({
+        tagName,
+        children: [],
+        listeners: {},
+        className: '',
+        textContent: '',
+        appendChild(child) { this.children.push(child); },
+        addEventListener(type, handler) { this.listeners[type] = handler; },
+    });
+    globalThis.document = { createElement: element };
+    Object.defineProperty(globalThis, 'navigator', {
+        configurable: true,
+        value: { clipboard: { writeText: async (value) => clipboardWrites.push(value) } },
+    });
+    try {
+        const menu = element('div');
+        appendAutocompleteContext(menu, {
+            type: 'device_code',
+            verificationUri: 'https://example.com/device\u001b[0m',
+            userCode: 'ABCD-EFGH',
+            instructions: 'Enter the code in your browser.',
+        });
+        const panel = menu.children[0];
+        const descendants = (node) => [node, ...node.children.flatMap(descendants)];
+        const rendered = descendants(panel);
+        assert.equal(panel.className, 'wa-slash-menu-context');
+        assert.equal(panel.children[0].textContent, 'Authorization');
+        assert.equal(rendered.filter((node) => node.href === 'https://example.com/device').length, 1);
+        assert.equal(rendered.filter((node) => node.textContent === 'https://example.com/device').length, 1);
+        const copyLink = rendered.find((node) => node.textContent === 'Copy link');
+        assert.ok(copyLink);
+        await copyLink.listeners.click({ preventDefault() {}, stopPropagation() {} });
+        assert.deepEqual(clipboardWrites, ['https://example.com/device']);
+        assert.equal(copyLink.textContent, 'Copied');
+        assert.equal(rendered.some((node) => node.textContent === 'ABCD-EFGH'), true);
+        assert.equal(rendered.some((node) => node.textContent === 'Copy code'), true);
+        assert.equal(rendered.some((node) => node.textContent === 'Enter the code in your browser.'), false);
+    } finally {
+        globalThis.document = originalDocument;
+        if (originalNavigator) {
+            Object.defineProperty(globalThis, 'navigator', originalNavigator);
+        } else {
+            delete globalThis.navigator;
+        }
+    }
 });
 
 test('task runtime state preserves validated model and generic task commands', () => {

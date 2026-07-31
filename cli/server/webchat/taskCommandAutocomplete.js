@@ -101,6 +101,7 @@ export function createTaskInteractionAutocompleteProvider({ getInteraction, onSe
                 .map((option) => ({
                     label: option.label,
                     description: option.description || interaction.message || '',
+                    ...(interaction.challenge ? { contextPanel: interaction.challenge } : {}),
                     applySelection: replaceValue(''),
                     onSelected: () => onSelect?.(interaction, option),
                 }));

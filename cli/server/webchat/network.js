@@ -174,7 +174,8 @@ function parseInteractionPayload(text) {
         const options = Array.isArray(payload.options)
             ? payload.options.filter((option) => option && typeof option.id === 'string' && typeof option.label === 'string')
             : [];
-        if (!id || !kind || !title || options.length === 0) return null;
+        const input = payload.input && typeof payload.input === 'object' ? payload.input : null;
+        if (!id || !kind || !title || (options.length === 0 && !input)) return null;
         return { ...payload, id, kind, title, options };
     } catch (_) {
         return null;

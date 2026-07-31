@@ -32,6 +32,124 @@ function clearChildren(node) {
     }
 }
 
+function safeHttpUrl(value) {
+    try {
+        const withoutAnsi = String(value || '').replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, '');
+        const parsed = new URL(withoutAnsi);
+        const host = parsed.hostname.toLowerCase();
+        const loopback = host === 'localhost' || host.endsWith('.localhost')
+            || host === '::1' || host === '[::1]' || host === '0.0.0.0' || /^127(?:\.|$)/.test(host);
+        return parsed.protocol === 'https:' && !loopback ? parsed.toString() : '';
+    } catch (_) {
+        return '';
+    }
+}
+
+async function copyAutocompleteContextValue(value) {
+    try {
+        const clipboard = globalThis.navigator?.clipboard;
+        if (typeof clipboard?.writeText === 'function') {
+            await clipboard.writeText(value);
+            return true;
+        }
+    } catch (_) { /* fall through to the legacy browser fallback */ }
+
+    const textarea = document.createElement('textarea');
+    textarea.value = value;
+    textarea.setAttribute('readonly', '');
+    textarea.style.position = 'fixed';
+    textarea.style.opacity = '0';
+    document.body.appendChild(textarea);
+    textarea.select();
+    let copied = false;
+    try {
+        copied = document.execCommand?.('copy') === true;
+    } catch (_) { /* clipboard access is best-effort */ }
+    textarea.remove();
+    return copied;
+}
+
+function createAutocompleteContextCopyButton(value, label) {
+    const copy = document.createElement('button');
+    copy.type = 'button';
+    copy.className = 'wa-slash-menu-context-copy';
+    copy.textContent = label;
+    copy.addEventListener('pointerdown', (event) => event.stopPropagation());
+    copy.addEventListener('click', async (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        if (await copyAutocompleteContextValue(value)) {
+            copy.textContent = 'Copied';
+        }
+    });
+    return copy;
+}
+
+function createAutocompleteContextStep(number, label) {
+    const row = document.createElement('div');
+    row.className = 'wa-slash-menu-context-step';
+
+    const index = document.createElement('span');
+    index.className = 'wa-slash-menu-context-step-index';
+    index.textContent = `${number}.`;
+
+    const content = document.createElement('div');
+    content.className = 'wa-slash-menu-context-step-content';
+    const stepLabel = document.createElement('span');
+    stepLabel.className = 'wa-slash-menu-context-step-label';
+    stepLabel.textContent = label;
+    content.appendChild(stepLabel);
+
+    row.appendChild(index);
+    row.appendChild(content);
+    return { row, content };
+}
+
+export function appendAutocompleteContext(menu, raw) {
+    if (!menu || !raw || typeof raw !== 'object') return;
+    const url = safeHttpUrl(raw.type === 'device_code' ? raw.verificationUri : raw.url);
+    if (!url) return;
+    const panel = document.createElement('div');
+    panel.className = 'wa-slash-menu-context';
+
+    const heading = document.createElement('strong');
+    heading.className = 'wa-slash-menu-context-title';
+    heading.textContent = 'Authorization';
+    panel.appendChild(heading);
+
+    const linkStep = createAutocompleteContextStep(1, 'Open this link in your browser');
+    const link = document.createElement('a');
+    link.className = 'wa-slash-menu-context-link';
+    link.href = url;
+    link.target = '_blank';
+    link.rel = 'noopener noreferrer';
+    link.textContent = url;
+    link.addEventListener('pointerdown', (event) => event.stopPropagation());
+    linkStep.content.appendChild(link);
+    linkStep.row.appendChild(createAutocompleteContextCopyButton(url, 'Copy link'));
+    panel.appendChild(linkStep.row);
+
+    const userCode = String(raw.userCode || '').trim();
+    if (userCode) {
+        const codeStep = createAutocompleteContextStep(2, 'Enter this code');
+        const code = document.createElement('code');
+        code.className = 'wa-slash-menu-context-code';
+        code.textContent = userCode;
+        codeStep.content.appendChild(code);
+        codeStep.row.appendChild(createAutocompleteContextCopyButton(userCode, 'Copy code'));
+        panel.appendChild(codeStep.row);
+    }
+
+    const instructions = String(raw.instructions || '').trim();
+    if (instructions && (raw.type !== 'device_code' || !userCode)) {
+        const detail = document.createElement('span');
+        detail.className = 'wa-slash-menu-context-detail';
+        detail.textContent = instructions;
+        panel.appendChild(detail);
+    }
+    menu.appendChild(panel);
+}
+
 export function keepAutocompleteItemVisible(menu, item) {
     if (!menu || !item) return;
     const viewportHeight = Number(menu.clientHeight) || 0;
@@ -246,6 +364,8 @@ export function createComposerAutocomplete({ cmdInput }, {
         renderingMenu = true;
         clearChildren(menu);
         const visible = suggestionsCache.slice(0, renderedSuggestionCount);
+
+        appendAutocompleteContext(menu, suggestionsCache.find((entry) => entry.contextPanel)?.contextPanel);
 
         let lastGroup = null;
         let activeItem = null;

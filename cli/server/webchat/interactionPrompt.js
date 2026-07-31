@@ -16,6 +16,32 @@ export function createInteractionPrompt({ root, title, message, detail, inputRow
     let submitting = false;
     let visibleOptions = [];
 
+    function renderDetail() {
+        if (!detail || !interaction) return;
+        const challenge = interaction.challenge;
+        const challengeUrl = challenge?.type === 'device_code'
+            ? challenge.verificationUri
+            : challenge?.url;
+        detail.replaceChildren?.();
+        if (challengeUrl) {
+            const link = document.createElement('a');
+            link.href = challengeUrl;
+            link.target = '_blank';
+            link.rel = 'noopener noreferrer';
+            link.textContent = challengeUrl;
+            detail.appendChild(link);
+            const instructions = String(challenge.instructions || '').trim();
+            if (instructions) {
+                const text = document.createElement('span');
+                text.textContent = instructions;
+                detail.appendChild(text);
+            }
+        } else {
+            detail.textContent = interaction.detail || '';
+        }
+        detail.hidden = !challengeUrl && !interaction.detail;
+    }
+
     function notifyActive(active) {
         if (typeof onActiveChange === 'function') onActiveChange(active);
     }
@@ -114,8 +140,7 @@ export function createInteractionPrompt({ root, title, message, detail, inputRow
             message.hidden = !interaction.message;
         }
         if (detail) {
-            detail.textContent = interaction.detail || '';
-            detail.hidden = !interaction.detail;
+            renderDetail();
         }
         if (root) {
             root.hidden = false;

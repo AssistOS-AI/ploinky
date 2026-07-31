@@ -478,6 +478,48 @@ function normalizeInteractionText(value, maxLength, { required = false } = {}) {
     return text;
 }
 
+function normalizeInteractionUrl(value) {
+    const url = normalizeInteractionText(value, 4000, { required: true });
+    if (!url) return undefined;
+    try {
+        const parsed = new URL(url);
+        const host = parsed.hostname.toLowerCase();
+        const loopback = host === 'localhost' || host.endsWith('.localhost')
+            || host === '::1' || host === '[::1]' || host === '0.0.0.0' || /^127(?:\.|$)/.test(host);
+        return parsed.protocol === 'https:' && !loopback ? parsed.toString() : undefined;
+    } catch (_) {
+        return undefined;
+    }
+}
+
+function normalizeInteractionChallenge(raw) {
+    if (raw === undefined) return null;
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+    const instructions = normalizeInteractionText(raw.instructions, 2000);
+    if (instructions === undefined) return undefined;
+    if (raw.type === 'device_code') {
+        const verificationUri = normalizeInteractionUrl(raw.verificationUri);
+        const userCode = normalizeInteractionText(raw.userCode, 100);
+        const expiresInSeconds = Number(raw.expiresInSeconds);
+        if (!verificationUri || userCode === undefined || (!userCode && !instructions)) return undefined;
+        return {
+            type: 'device_code',
+            verificationUri,
+            userCode,
+            instructions,
+            ...(Number.isFinite(expiresInSeconds) && expiresInSeconds > 0
+                ? { expiresInSeconds: Math.min(expiresInSeconds, 86400) }
+                : {}),
+        };
+    }
+    if (raw.type === 'manual_oauth_code') {
+        const url = normalizeInteractionUrl(raw.url);
+        if (!url) return undefined;
+        return { type: 'manual_oauth_code', url, instructions };
+    }
+    return undefined;
+}
+
 export function parseWebchatInteraction(envelope) {
     if (!envelope || typeof envelope !== 'object' || !envelope[WEBCHAT_INTERACTION_FLAG]) return undefined;
     if (envelope.version !== 1) return undefined;
@@ -486,8 +528,9 @@ export function parseWebchatInteraction(envelope) {
     const title = normalizeInteractionText(envelope.title, 120, { required: true });
     const message = normalizeInteractionText(envelope.message, 1000);
     const detail = normalizeInteractionText(envelope.detail, 4000);
+    const challenge = normalizeInteractionChallenge(envelope.challenge);
     if (!id || !INTERACTION_ID_RE.test(id) || !kind || !INTERACTION_TOKEN_RE.test(kind) || !title) return undefined;
-    if (message === undefined || detail === undefined) return undefined;
+    if (message === undefined || detail === undefined || challenge === undefined) return undefined;
     if (!Array.isArray(envelope.options) || envelope.options.length > 256) return undefined;
     let input = null;
     if (envelope.input !== undefined) {
@@ -535,6 +578,7 @@ export function parseWebchatInteraction(envelope) {
         options,
         defaultOptionId,
         ...(input ? { input } : {}),
+        ...(challenge ? { challenge } : {}),
         ...(envelope.searchable === true && options.length ? { searchable: true } : {}),
         ...(targetTaskId ? { targetTaskId } : {}),
         ...(targetTabId ? { targetTabId } : {}),

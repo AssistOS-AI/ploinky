@@ -78,6 +78,36 @@ test('generic secret-input interactions are validated without carrying the enter
     assert.equal(parsed.targetTaskId, 'task_111111111111111111111111');
     assert.equal(parsed.targetTabId, 'tab_origin');
     assert.equal(JSON.stringify(parsed).includes('entered-secret'), false);
+    assert.equal(networkTestables.parseInteractionPayload(JSON.stringify(parsed)).kind, 'input');
+});
+
+test('device-code challenges are normalized for authenticated task UI transport', () => {
+    const parsed = parseWebchatInteraction({
+        __webchatInteraction: 1,
+        version: 1,
+        id: 'task_control_12345678',
+        kind: 'select',
+        title: 'Complete provider authentication',
+        options: [{ id: 'check', label: 'Check status' }],
+        challenge: {
+            type: 'device_code',
+            verificationUri: 'https://example.com/device',
+            userCode: 'ABCD-EFGH',
+            instructions: 'Enter this code.',
+            expiresInSeconds: 900,
+        },
+    });
+    assert.deepEqual(parsed.challenge, {
+        type: 'device_code',
+        verificationUri: 'https://example.com/device',
+        userCode: 'ABCD-EFGH',
+        instructions: 'Enter this code.',
+        expiresInSeconds: 900,
+    });
+    assert.equal(parseWebchatInteraction({
+        ...approvalEnvelope(),
+        challenge: { type: 'manual_oauth_code', url: 'javascript:alert(1)' },
+    }), undefined);
 });
 
 test('task interactions are visible only in the browser tab that initiated them', () => {

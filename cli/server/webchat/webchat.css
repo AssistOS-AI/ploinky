@@ -2165,6 +2165,17 @@ body {
     overflow-wrap: anywhere;
 }
 
+.wa-interaction-copy code a,
+.wa-interaction-copy code span {
+    display: block;
+    overflow-wrap: anywhere;
+}
+
+.wa-interaction-copy code a {
+    color: var(--wa-accent);
+    margin-bottom: 6px;
+}
+
 .wa-interaction-options {
     display: flex;
     flex-wrap: wrap;
@@ -2424,6 +2435,74 @@ body {
     cursor: pointer;
     transition: background 0.12s;
     gap: 12px;
+}
+
+.wa-slash-menu-context {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding: 12px 14px;
+    border-bottom: 1px solid var(--wa-border, #e0e0e0);
+    background: color-mix(in srgb, var(--wa-accent, #2196f3) 6%, var(--wa-bg-panel, #ffffff));
+}
+
+.wa-slash-menu-context-title {
+    color: var(--wa-text-primary, #111827);
+    font-size: 13px;
+}
+
+.wa-slash-menu-context-link {
+    color: var(--wa-accent, #2196f3);
+    font-size: 12px;
+    overflow-wrap: anywhere;
+}
+
+.wa-slash-menu-context-step {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr) auto;
+    align-items: center;
+    gap: 8px;
+}
+
+.wa-slash-menu-context-step-index {
+    align-self: start;
+    color: var(--wa-text-secondary, #667781);
+    font-size: 12px;
+    line-height: 1.5;
+}
+
+.wa-slash-menu-context-step-content {
+    display: flex;
+    min-width: 0;
+    flex-direction: column;
+    gap: 3px;
+}
+
+.wa-slash-menu-context-step-label {
+    color: var(--wa-text-secondary, #667781);
+    font-size: 12px;
+}
+
+.wa-slash-menu-context-code {
+    color: var(--wa-text-primary, #111827);
+    font-size: 17px;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+}
+
+.wa-slash-menu-context-copy {
+    border: 1px solid var(--wa-border, #e0e0e0);
+    border-radius: 6px;
+    padding: 5px 9px;
+    background: var(--wa-bg-panel, #ffffff);
+    color: var(--wa-text-primary, #111827);
+    cursor: pointer;
+}
+
+.wa-slash-menu-context-detail {
+    color: var(--wa-text-secondary, #667781);
+    font-size: 12px;
+    line-height: 1.4;
 }
 
 .wa-slash-menu-group {
