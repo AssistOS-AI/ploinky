@@ -16,6 +16,7 @@ import {
     serializeInteractionResolvedSseEvent,
     serializeRuntimeStateSseEvent,
     serializeSessionStateSseEvent,
+    serializeSkillsStateSseEvent,
     serializeTaskListSseEvent,
     serializeWorkspaceFilesSseEvent,
     writeOrBufferSseEvent
@@ -110,6 +111,7 @@ export function handleRuntimeRoute({
                     liveMessageCount: 0,
                     webchatTasks: new Map(),
                     webchatWorkspaceFiles: null,
+                    webchatSkillsSnapshot: null,
                     taskProtocolBuffer: ''
                 };
                 runtimes.set(runtimeKey, tab);
@@ -187,6 +189,8 @@ export function handleRuntimeRoute({
             })
             : '';
         if (workspaceFilesSnapshot) res.write(workspaceFilesSnapshot);
+        const skillsStateSnapshot = serializeSkillsStateSseEvent(tab.webchatSkillsSnapshot);
+        if (skillsStateSnapshot) res.write(skillsStateSnapshot);
         const interactionSnapshot = serializeInteractionRequestSseEvent(tab.pendingInteraction);
         if (interactionSnapshot) res.write(interactionSnapshot);
 

@@ -9,10 +9,12 @@ import {
     buildRuntimeKey,
     parseWebchatRuntimeState,
     parseWebchatSessionState,
+    parseWebchatSkillsState,
     parseWebchatWorkspaceFilesState,
     routeWorkspaceRuntimeOutput,
     serializeRuntimeStateSseEvent,
     serializeSessionStateSseEvent,
+    serializeSkillsStateSseEvent,
     serializeTaskListSseEvent,
     serializeTaskUpdateSseEvents,
     serializeWorkspaceFilesSseEvent,
@@ -51,6 +53,62 @@ test('runtime state contains only the selected model', () => {
     assert.equal(parseWebchatRuntimeState({ __webchatRuntimeState: 1, version: 1, model: 42 }), undefined);
     assert.equal(serializeRuntimeStateSseEvent({ model: 'deep' }), 'event: runtime-state\ndata: {"model":"deep"}\n\n');
     assert.deepEqual(networkTestables.parseRuntimeStatePayload('{"model":"deep"}'), { model: 'deep' });
+});
+
+test('skill envelopes expose only validated workspace-relative catalog state', () => {
+    const envelope = {
+        __webchatSkills: 1,
+        version: 1,
+        event: 'changed',
+        operation: { scope: 'directory', action: 'disable', target: 'packages/tools' },
+        skills: [{
+            name: 'alpha-cskill',
+            displayName: 'alpha',
+            relativePath: 'packages/tools/alpha',
+            type: 'cskill',
+            enabled: false,
+        }],
+    };
+    assert.deepEqual(parseWebchatSkillsState(envelope), {
+        event: 'changed',
+        operation: envelope.operation,
+        skills: envelope.skills,
+    });
+    assert.match(serializeSkillsStateSseEvent(parseWebchatSkillsState(envelope)), /event: skills-state/);
+    assert.equal(parseWebchatSkillsState({
+        ...envelope,
+        skills: [{ ...envelope.skills[0], relativePath: '../outside' }],
+    }), undefined);
+    assert.equal(parseWebchatSkillsState({
+        ...envelope,
+        skills: [{ ...envelope.skills[0], type: 'anthropic' }],
+    }), undefined);
+    assert.equal(parseWebchatSkillsState({
+        ...envelope,
+        operation: { ...envelope.operation, target: '../outside' },
+    }), undefined);
+    assert.equal(parseWebchatSkillsState({
+        ...envelope,
+        operation: { scope: 'skill', action: 'enable', target: 'not a canonical name' },
+    }), undefined);
+});
+
+test('skill state is intercepted, cached, and omitted from ordinary output', () => {
+    const writes = [];
+    const tab = {
+        subscribers: new Map([['client', { res: { write: (value) => writes.push(value) } }]]),
+        taskProtocolBuffer: '',
+    };
+    const appState = { runtimes: new Map([['runtime', tab]]) };
+    routeWorkspaceRuntimeOutput(appState, tab, `${JSON.stringify({
+        __webchatSkills: 1,
+        version: 1,
+        event: 'list',
+        skills: [{ name: 'alpha-cskill', displayName: 'alpha', relativePath: 'skills/alpha', type: 'cskill', enabled: true }],
+    })}\n`);
+    assert.equal(tab.webchatSkillsSnapshot.skills[0].name, 'alpha-cskill');
+    assert.match(writes.join(''), /event: skills-state/);
+    assert.doesNotMatch(writes.join(''), /__webchatSkills/);
 });
 
 test('AchillesCLI session envelopes become in-memory SSE state without disk writes', (t) => {
@@ -168,6 +226,10 @@ test('an EventSource reconnect receives the in-memory session snapshot', (t) => 
             description: 'Cached task',
             status: 'ongoing',
         }]]),
+        webchatSkillsSnapshot: {
+            event: 'list',
+            skills: [{ name: 'alpha-cskill', displayName: 'alpha', relativePath: 'skills/alpha', type: 'cskill', enabled: true }],
+        },
     };
     const sid = 'browser-session';
     const appState = {
@@ -193,6 +255,7 @@ test('an EventSource reconnect receives the in-memory session snapshot', (t) => 
     assert.match(writes.join(''), /event: task-update/);
     assert.match(writes.join(''), /Cached task/);
     assert.match(writes.join(''), /event: workspace-files/);
+    assert.match(writes.join(''), /event: skills-state/);
     assert.match(writes.join(''), /reports\/final\.md/);
     assert.match(writes.join(''), new RegExp(SESSION_ID));
     req.emit('close');

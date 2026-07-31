@@ -81,6 +81,13 @@ export function initDom() {
     const interactionPromptSubmit = document.getElementById('interactionPromptSubmit');
     const interactionPromptOptions = document.getElementById('interactionPromptOptions');
     const sessionsBtn = document.getElementById('sessionsBtn');
+    const skillsBtn = document.getElementById('skillsBtn');
+    const skillsDialog = document.getElementById('skillsDialog');
+    const skillsDialogClose = document.getElementById('skillsDialogClose');
+    const skillsTree = document.getElementById('skillsTree');
+    const skillsSaveBtn = document.getElementById('skillsSaveBtn');
+    const skillsSaveStatus = document.getElementById('skillsSaveStatus');
+    const skillsSummary = document.getElementById('skillsSummary');
     const historyGate = document.getElementById('historyGate');
     const loadHistoryBtn = document.getElementById('loadHistoryBtn');
     const sessionDialog = document.getElementById('sessionDialog');
@@ -315,6 +322,13 @@ export function initDom() {
             interactionPromptOptions,
             attachmentContainer,
             sessionsBtn,
+            skillsBtn,
+            skillsDialog,
+            skillsDialogClose,
+            skillsTree,
+            skillsSaveBtn,
+            skillsSaveStatus,
+            skillsSummary,
             historyGate,
             loadHistoryBtn,
             sessionDialog,
