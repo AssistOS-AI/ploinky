@@ -33,9 +33,12 @@ test('managed producer source enforces attestation, ordered generation checkpoin
     const preStartHook = source.indexOf('const preStartGeneratedRouterLaunch', credentialMint);
     const preRuntime = source.indexOf("launch.generationLease.checkpoint('pre-runtime')", preStartHook);
     const postInspection = source.indexOf("launch.generationLease.checkpoint('post-inspection')", preRuntime);
+    const imagePreparation = source.indexOf('ensureImagePresent(image, { runtime })');
+    const managedTransaction = source.indexOf('networkLifecycle.runManagedContainerTransaction({', imagePreparation);
     assert.ok(attestation > 0 && attestation < preCredentials);
     assert.ok(preCredentials < signing && signing < credentialMint);
     assert.ok(credentialMint < preStartHook && preStartHook < preRuntime && preRuntime < postInspection);
+    assert.ok(imagePreparation > 0 && imagePreparation < managedTransaction);
     assert.match(source, /preStartLaunch: preStartGeneratedRouterLaunch/);
     assert.match(source, /managed generated-local launch state is required before container creation/);
     assert.match(source, /`--userns=\$\{managedKeepIdUserNamespace\(launch\.attested\)\}`/);

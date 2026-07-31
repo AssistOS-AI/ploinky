@@ -128,9 +128,11 @@ box-owned non-secret snapshot named by `PLOINKY_EDGE_TOPOLOGY_FILE` and injects
 endpoint.
 
 Before a managed-network launch can receive Router authority, Ploinky resolves
-the agent image reference to one immutable image ID and reads only the bounded
-`Config.User` projection from that image. The image must declare an exact
-numeric, non-root `UID:GID`; an empty, symbolic, root, or out-of-range identity
+the agent image reference locally, pulling a missing image before the managed
+network transaction and failing before network mutation if preparation cannot
+complete. It then resolves that local reference to one immutable image ID and
+reads only the bounded `Config.User` projection from that image. The image must
+declare an exact numeric, non-root `UID:GID`; an empty, symbolic, root, or out-of-range identity
 fails closed. The confined authority helper runs the immutable image as that
 same user. Helper creation and cleanup are verified through a fixed bounded
 container-inspection projection rather than unbounded engine JSON. Before it

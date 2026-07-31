@@ -42,6 +42,7 @@ import {
     getContainerLabel,
     getRuntime,
     getRuntimeForAgent,
+    ensureImagePresent,
     isContainerRunning,
     isSandboxRuntime,
     loadAgentsMap,
@@ -1592,6 +1593,11 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     let generatedLaunch = null;
     let adoptedExistingRuntime = false;
     if (runtimeNetworkPlan.requiresManagedNetwork) {
+        // The authority probe intentionally inspects by immutable local image ID
+        // and never lets its confined helper pull. Ensure start-only/no-Node
+        // images are present before entering the managed-network transaction;
+        // dependency-cache preparation already does this for Node images.
+        ensureImagePresent(image, { runtime });
         const launched = networkLifecycle.runManagedContainerTransaction({
             network: manifestNetwork,
             canonicalAgentId: agentName,
