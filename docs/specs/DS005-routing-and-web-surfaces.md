@@ -73,15 +73,19 @@ WebChat is a session presentation and transport surface, not the conversation ow
 
 The `Sessions` button must remain unavailable until the selected CLI advertises session state. Opening it sends `/session` to the CLI and renders the returned `list`; `New` sends `/session new`; selecting an existing entry sends `/session resume <session-id>`. A compatible structured command catalog may attach session-id argument completions to the `resume` subcommand; WebChat must render each completion's human-readable label while inserting its opaque value. These button-originated commands are silent control actions and must not be rendered as user turns. A `selected` response immediately replaces the browser transcript with the supplied session. The initial `current` response retains lazy history rendering: a non-empty snapshot presents `Click to load session history` as a centered standalone button, and clicking it renders the already received snapshot without a REST request.
 
-WebChat's EventSource stream must tolerate brief browser reconnects without killing the target TTY. Runtime identity is the canonical working directory, selected agent, and launch configuration; conversation selection must not replace the TTY runtime. `tabId` identifies only a browser client and must be recovered from `sessionStorage` on refresh. A runtime may have multiple SSE subscribers and remains alive for the bounded reconnect grace window after the last subscriber leaves. The latest session-state, runtime-state, and pending-interaction snapshots are replayed after reconnect.
+A compatible selected CLI may publish version-1 `__webchatSkills` line envelopes containing the complete bounded list of registered workspace skills, including disabled entries. Every item carries a canonical name, display name, safe working-directory-relative skill path, one supported type label (`cskill`, `dcgskill`, `oskill`, or `tskill`), and an enabled boolean. Ploinky must intercept valid envelopes before ordinary assistant rendering, retain the latest snapshot only in runtime memory, expose it through the `skills-state` EventSource event, and replay it to reconnecting subscribers. Absolute or escaping paths, duplicate canonical names, unsupported types, malformed operations, and oversized lists must be rejected without leaking the control line into chat.
+
+The `Skills` button opens a file-explorer-style tree built only from the returned skill paths and shows the total and currently enabled counts. The tree is fully expanded by default, after which branches can be collapsed or reopened; traversal stops at each skill directory, and terminal labels show `name (type)`. Directories that do not contain a skill and have no branching value must not produce nested rows: a chain such as `example/path/skill-name` renders the compact folder `/example/path` followed by the `skill-name` leaf. Opening the overlay silently sends `/skills`. Each folder and skill has a checkbox immediately before its name; folder checkboxes are tri-state and update every descendant in a browser-local draft. Checkbox changes must not send CLI commands. The footer Save action compares the draft with the opening snapshot, emits a compact ordered sequence of `/skills enable|disable <relative-directory>` operations and `/skill enable|disable <canonical-name>` exceptions, then silently sends `/skills` and adopts only that final authoritative list. Closing before Save discards the draft. The selected CLI owns discovery, directory-to-skill resolution, enablement, and persistence; Ploinky only plans and transports commands and renders the authoritative returned snapshot.
+
+WebChat's EventSource stream must tolerate brief browser reconnects without killing the target TTY. Runtime identity is the canonical working directory, selected agent, and launch configuration; conversation selection must not replace the TTY runtime. `tabId` identifies only a browser client and must be recovered from `sessionStorage` on refresh. A runtime may have multiple SSE subscribers and remains alive for the bounded reconnect grace window after the last subscriber leaves. The latest session-state, skills-state, runtime-state, and pending-interaction snapshots are replayed after reconnect.
 
 Runtime reuse must be conditional on TTY health. A runtime whose child has exited, whose stdin is no longer writable, or whose write operation fails must be disposed and removed from the workspace runtime map. `POST /webchat/input` must write to the selected CLI before broadcasting the optimistic user-message event and must return `409` rather than `204` when delivery fails. A later EventSource reconnect must create a replacement process while preserving the workspace-and-agent runtime identity for healthy processes.
 
 WebChat may accept a generic `__webchatRuntimeState` line envelope from the selected CLI. Version 1 carries only an optional selected `model` string or `null`; the envelope must be intercepted before ordinary assistant output and exposed through the `runtime-state` EventSource event. The current runtime-state snapshot remains memory-only and is sent to reconnecting subscribers. The header may show a non-empty model beside the selected agent name and must hide the badge when the model is `null`. Ploinky must not read an agent-owned settings file, infer an effective provider model, or use a process-instance identifier to coordinate conversation restoration.
 
 At normal desktop widths, the WebChat header must retain its established visible
-`Tasks`, `Sessions`, three-dot settings, and `Logout` controls. At widths of 640
-CSS pixels or less, `Tasks`, `Sessions`, and `Logout` must move into the
+`Tasks`, `Skills`, `Sessions`, three-dot settings, and `Logout` controls. At widths of 640
+CSS pixels or less, `Tasks`, `Skills`, `Sessions`, and `Logout` must move into the
 three-dot overflow menu so the selected agent name, current model, working
 directory, and connection state remain visible. Returning above that breakpoint
 must restore the controls to their original header order without duplicating
@@ -182,10 +186,12 @@ current `remoteTaskId`, set the task back to `ongoing`, and append subsequent
 logs to the same task log. Before remote output is appended, the CLI must append
 the submitted continuation prompt to the durable log and publish that exact
 delta and its resulting offset so an already open task view shows the prompt in
-sequence. The shared browser presentation must normalize historical `User:`
-prompt lines and current `you>` prompt lines to `you> <prompt>`, then render
-them with a bold, accented prompt style that remains visually distinct from
-provider output. Late lifecycle events from an older turn or remote
+sequence. New continuation deltas must not add a synthetic
+`[Continuation <turn>]` label. The shared browser presentation must suppress
+that label in historical logs, normalize historical `User:` prompt lines and
+current `you>` prompt lines to `you> <prompt>`, then render them with a bold,
+accented prompt style that remains visually distinct from provider output.
+Late lifecycle events from an older turn or remote
 task id must not overwrite the current turn. The original task description and
 creation time remain stable, while `executionStartedAt` tracks the current turn.
 Task-log regions must reserve a persistent scrollbar gutter and render a
@@ -279,15 +285,32 @@ are written only by the selected CLI's task-event ingestion. The terminal task e
 the final MCP result as presentation metadata, but ingestion must never append
 or duplicate that result in the log. Instead, it locates the last identical
 range already present in the persisted raw log and stores only its offset and
-length in its task journal. Continuation clears that range until the next terminal
-result. The Tasks overlay and task view render log lines outside the range with
-the secondary grey text color and lines intersecting it with the primary text
-color, so intermediate provider activity remains visibly distinct from the
-final answer. If no exact range is available, the raw output remains visible
-with the intermediate style. Browser rendering strips ANSI control sequences
-and retains presentation compatibility for historical logs that contain
-recognized stream and runner prefixes; new raw provider output remains
-otherwise unchanged.
+length in its task journal. The journal retains a bounded ordered set with one
+final-output range per retained continuation turn, and continuation must
+preserve every earlier retained range while the next turn is running. The Tasks
+overlay and task view render
+log lines outside all retained ranges with the lighter muted-grey text color
+and lines intersecting any range with bold primary text, so intermediate
+provider activity remains visibly distinct from every final answer. Legacy
+tasks carrying only one final-output offset and length remain compatible. If
+no exact range is available for a turn, its raw output remains visible with the
+intermediate style. Browser rendering strips ANSI control sequences and
+retains presentation compatibility for historical logs that contain recognized
+stream and runner prefixes. It may divide displayed lines into non-interactive
+visual spans that show generic path-like text in green without bold weight and
+backtick-delimited fragments with the accent color used for file-link text,
+without link decoration. This presentation must preserve the exact displayed
+text, must not modify persisted task logs or their offsets, and must not create
+links or interactive behavior. New raw provider output remains otherwise
+unchanged.
+When a live task update changes final-output range metadata without appending
+log text, an open task view must rerender its existing log immediately so the
+newly classified final answer receives final styling without a page refresh.
+When an open task transitions from `ongoing` to any terminal state, the view
+must also request one authoritative `/task view` snapshot. This terminal
+reconciliation recovers final-range metadata or a last log delta that was not
+available in the live transition event, without waiting for another provider
+poll or a browser refresh.
 
 When an ongoing task becomes terminal, WebChat may show the existing transient
 task toast. That toast must include an accessible close button on its right so

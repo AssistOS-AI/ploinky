@@ -603,8 +603,23 @@ export async function handleAuthRoutes(req, res, parsedUrl, { routePlan = null }
             const redirectTarget = outcome.redirect || requestedReturnTo || '/';
             appendSetCookie(res, clearCookie);
             appendSetCookie(res, clearCsrfCookie);
-            res.writeHead(302, { Location: redirectTarget || '/' });
-            res.end('Logged out');
+            const wantsJson = !outcome.redirect
+                && String(req.headers?.accept || '').toLowerCase().includes('application/json');
+            if (!wantsJson) {
+                res.writeHead(302, {
+                    Location: redirectTarget || '/',
+                    'Cache-Control': 'no-store, no-cache, must-revalidate',
+                    'Clear-Site-Data': '"cache"',
+                });
+                res.end('Logged out');
+            } else {
+                res.writeHead(200, {
+                    'Content-Type': 'application/json',
+                    'Cache-Control': 'no-store, no-cache, must-revalidate',
+                    'Clear-Site-Data': '"cache"',
+                });
+                res.end(JSON.stringify({ ok: true }));
+            }
             appendLog('auth_logout', { sessionId: sessionId ? '[redacted]' : null });
             return true;
         }

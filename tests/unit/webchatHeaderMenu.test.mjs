@@ -100,10 +100,11 @@ function createContainer(initialChildren = []) {
 
 test('responsive header actions stay on desktop and move into the menu only at the mobile breakpoint', () => {
     const tasks = {};
+    const skills = {};
     const sessions = {};
     const settings = {};
     const logout = {};
-    const desktopContainer = createContainer([tasks, sessions, settings, logout]);
+    const desktopContainer = createContainer([tasks, skills, sessions, settings, logout]);
     const mobileContainer = createContainer();
     const mobileSection = { hidden: false };
     const listeners = new Map();
@@ -117,7 +118,7 @@ test('responsive header actions stay on desktop and move into the menu only at t
         },
     };
     const controller = createResponsiveHeaderActions({
-        actions: [tasks, sessions, logout],
+        actions: [tasks, skills, sessions, logout],
         desktopContainer,
         mobileContainer,
         mobileSection,
@@ -127,18 +128,18 @@ test('responsive header actions stay on desktop and move into the menu only at t
         } },
     });
 
-    assert.deepEqual(desktopContainer.children, [tasks, sessions, settings, logout]);
+    assert.deepEqual(desktopContainer.children, [tasks, skills, sessions, settings, logout]);
     assert.equal(mobileSection.hidden, true);
 
     mediaQuery.matches = true;
     listeners.get('change')();
     assert.deepEqual(desktopContainer.children, [settings]);
-    assert.deepEqual(mobileContainer.children, [tasks, sessions, logout]);
+    assert.deepEqual(mobileContainer.children, [tasks, skills, sessions, logout]);
     assert.equal(mobileSection.hidden, false);
 
     mediaQuery.matches = false;
     listeners.get('change')();
-    assert.deepEqual(desktopContainer.children, [tasks, sessions, settings, logout]);
+    assert.deepEqual(desktopContainer.children, [tasks, skills, sessions, settings, logout]);
     assert.equal(mobileSection.hidden, true);
 
     controller.destroy();

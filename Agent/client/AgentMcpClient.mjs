@@ -11,6 +11,7 @@ import http from 'node:http';
 import https from 'node:https';
 
 import { signAgentAssertion, signAgentHttpAssertion } from '../lib/agentAssertion.mjs';
+import { OPENAI_MODELS_PATH, OPENAI_MODELS_TOOL } from '../lib/invocationAuth.mjs';
 import {
     assertVerifiedGeneratedRouterDescriptor,
     loadVerifiedGeneratedRouterDescriptor,
@@ -346,6 +347,56 @@ function getTaskStatus(agentName, taskId, descriptor, timeoutMs = DEFAULT_CALL_T
                     return;
                 }
                 resolve(json.task || json);
+            });
+        });
+        req.on('error', (error) => {
+            clearTimeout(timeout);
+            reject(error);
+        });
+        req.end();
+    });
+}
+
+function getAgentModels(agentName, descriptor, timeoutMs = DEFAULT_CALL_TIMEOUT_MS) {
+    const verified = trustedDescriptor(descriptor);
+    const normalizedAgentName = normalizeAgentName(agentName);
+    const url = resolveGeneratedRouterOperation(verified, `/${normalizedAgentName}${OPENAI_MODELS_PATH}`);
+    const httpModule = url.protocol === 'https:' ? https : http;
+    const assertion = signAgentHttpAssertion({
+        method: 'GET',
+        path: OPENAI_MODELS_PATH,
+        query: '',
+        body: Buffer.alloc(0),
+        targetAgent: normalizedAgentName,
+        tool: OPENAI_MODELS_TOOL,
+    });
+    return new Promise((resolve, reject) => {
+        let req;
+        const timeout = setTimeout(() => req?.destroy(callTimeoutError(timeoutMs)), timeoutMs);
+        req = httpModule.request({
+            hostname: url.hostname,
+            port: url.port || (url.protocol === 'https:' ? 443 : 80),
+            path: `${url.pathname}${url.search || ''}`,
+            method: 'GET',
+            headers: {
+                host: getRouterAuthority(verified),
+                accept: 'application/json',
+                authorization: `Bearer ${assertion}`,
+            },
+        }, (res) => {
+            const chunks = [];
+            res.on('data', (chunk) => chunks.push(chunk));
+            res.on('end', () => {
+                clearTimeout(timeout);
+                const text = Buffer.concat(chunks).toString('utf8');
+                let json = null;
+                try { json = text ? JSON.parse(text) : null; } catch { json = null; }
+                if ((res.statusCode || 500) >= 400 || !json || !Array.isArray(json.data)) {
+                    const detail = json?.error?.message || json?.error || text || `HTTP ${res.statusCode}`;
+                    reject(new Error(`agent models failed: ${String(detail).slice(0, 300)}`));
+                    return;
+                }
+                resolve(json);
             });
         });
         req.on('error', (error) => {
@@ -744,6 +795,7 @@ export async function createAgentClient(agentName, options = {}) {
         getAgentStatus: (agentRef = agentName) => getAgentStatus(agentRef, descriptorForRequest()),
         ensureAgentRunning: (agentRef = agentName, startOptions = {}) => ensureAgentRunning(agentRef, startOptions, descriptorForRequest()),
         getTaskStatus: (taskId) => getTaskStatus(agentName, taskId, descriptorForRequest()),
+        getModels: () => getAgentModels(agentName, descriptorForRequest()),
         cancelTask: (taskId) => cancelTask(agentName, taskId, descriptorForRequest()),
         connect: async () => {},
         listTools: unsupported('listTools'),

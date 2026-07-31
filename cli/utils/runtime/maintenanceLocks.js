@@ -5,6 +5,8 @@ import { randomUUID } from 'crypto';
 import { RUNNING_DIR } from '../config.js';
 
 const DEFAULT_TTL_MS = 10 * 60 * 1000;
+const DEFAULT_WAIT_TIMEOUT_MS = 10 * 60 * 1000;
+const DEFAULT_RETRY_INTERVAL_MS = 100;
 const MAINTENANCE_DIR = path.join(RUNNING_DIR, 'maintenance');
 const WORKSPACE_START_LOCK_PATH = path.join(RUNNING_DIR, 'workspace-start.json');
 const WORKSPACE_START_TTL_MS = 24 * 60 * 60 * 1000;
@@ -208,13 +210,43 @@ function createMaintenanceLock(containerName, {
     return lock;
 }
 
-function withMaintenanceLock(containerName, options, fn) {
-    const lock = createMaintenanceLock(containerName, options);
-    return Promise.resolve()
-        .then(fn)
-        .finally(() => {
-            removeMaintenanceLock(containerName, lock.token);
-        });
+function wait(delayMs) {
+    return new Promise((resolve) => setTimeout(resolve, delayMs));
+}
+
+async function acquireMaintenanceLock(containerName, {
+    waitTimeoutMs = DEFAULT_WAIT_TIMEOUT_MS,
+    retryIntervalMs = DEFAULT_RETRY_INTERVAL_MS,
+    ...lockOptions
+} = {}) {
+    const deadline = Date.now() + Math.max(0, Number(waitTimeoutMs) || 0);
+    while (true) {
+        try {
+            return createMaintenanceLock(containerName, lockOptions);
+        } catch (error) {
+            if (error?.code !== 'EEXIST' && error?.code !== 'PLOINKY_MAINTENANCE_BUSY') throw error;
+        }
+
+        const state = inspectMaintenanceLock(containerName);
+        if (!state.active && !fs.existsSync(lockPathFor(containerName))) continue;
+        if (Date.now() >= deadline) {
+            const error = new Error(
+                `Timed out waiting for maintenance lock on '${containerName}' held by ${state.lock?.operation || 'maintenance'}.`
+            );
+            error.code = 'maintenance_lock_timeout';
+            throw error;
+        }
+        await wait(Math.max(1, Number(retryIntervalMs) || DEFAULT_RETRY_INTERVAL_MS));
+    }
+}
+
+async function withMaintenanceLock(containerName, options, fn) {
+    const lock = await acquireMaintenanceLock(containerName, options);
+    try {
+        return await fn();
+    } finally {
+        removeMaintenanceLock(containerName, lock.token);
+    }
 }
 
 function inspectMaintenanceLock(containerName, attempt = 0) {
@@ -240,6 +272,7 @@ function inspectMaintenanceLock(containerName, attempt = 0) {
 
 export {
     WORKSPACE_START_LOCK_PATH,
+    acquireMaintenanceLock,
     createMaintenanceLock,
     createWorkspaceMutationLease,
     createWorkspaceStartLock,

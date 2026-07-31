@@ -1,8 +1,5 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import fs from 'node:fs';
-import os from 'node:os';
-import path from 'node:path';
 import { createLocalTTYFactory } from '../../cli/server/webchat/tty.js';
 
 // global.processKill is normally installed by RoutingServer; provide a no-op so
@@ -54,6 +51,23 @@ test('webchat child_process: close fires after the child exits', async () => {
     assert.equal(closed, true);
 });
 
+test('webchat child_process: an exited CLI is not restarted inside the same TTY handle', async () => {
+    const session = makeSession("sh -c 'printf one-run'");
+    const chunks = [];
+    let closeCount = 0;
+    await new Promise((resolve) => {
+        session.onOutput((data) => chunks.push(data));
+        session.onClose(() => {
+            closeCount += 1;
+            resolve();
+        });
+    });
+
+    assert.equal(chunks.join(''), 'one-run');
+    assert.equal(closeCount, 1);
+    assert.equal(session.isAlive(), false);
+});
+
 test('webchat child_process: handle exposes a numeric pid and no resize method', () => {
     const session = makeSession("sh -c 'sleep 0.2'");
     assert.equal(typeof session.pid, 'number');
@@ -62,45 +76,4 @@ test('webchat child_process: handle exposes a numeric pid and no resize method',
     session.dispose();
     assert.equal(session.isAlive(), false);
     assert.equal(session.write('ignored\n'), false);
-});
-
-test('webchat child_process: input during a bounded launcher restart is delivered once', async (t) => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-webchat-restart-'));
-    t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
-    const marker = path.join(dir, 'started');
-    const command = [
-        'sh -c',
-        `'if [ ! -f "${marker}" ]; then`,
-        `touch "${marker}";`,
-        'printf "FIRST_EXIT\\n";',
-        'exit 1;',
-        'fi;',
-        'IFS= read -r line;',
-        'printf "RESTART_INPUT=%s\\n" "$line";',
-        'sleep 1\'',
-    ].join(' ');
-    const session = makeSession(command);
-    const chunks = [];
-    const received = new Promise((resolve) => {
-        session.onOutput((data) => {
-            chunks.push(data);
-            if (chunks.join('').includes('RESTART_INPUT=queued-message')) resolve();
-        });
-    });
-
-    await new Promise((resolve) => {
-        const inspect = (data) => {
-            if (!String(data).includes('FIRST_EXIT')) return;
-            setTimeout(resolve, 50);
-        };
-        session.onOutput(inspect);
-    });
-    assert.equal(session.isAlive(), true);
-    assert.equal(session.write('queued-message\n'), true);
-    await received;
-    assert.equal(
-        chunks.join('').match(/RESTART_INPUT=queued-message/g)?.length,
-        1,
-    );
-    session.dispose();
 });

@@ -402,6 +402,45 @@ test('runCli no-tty suppresses banners but preserves attachment', async () => {
     assert.ok(harness.events.some(event => event[0] === 'attach'));
 });
 
+test('runCli holds its maintenance transaction through readiness and activation', async () => {
+    const harness = agentCliHarness();
+    let releaseReadiness;
+    let markReadinessEntered;
+    const readinessEntered = new Promise((resolve) => { markReadinessEntered = resolve; });
+    const readinessGate = new Promise((resolve) => { releaseReadiness = resolve; });
+    harness.dependencies.withMaintenanceLock = async (_containerName, _options, fn) => {
+        harness.events.push(['lock-enter']);
+        try {
+            return await fn();
+        } finally {
+            harness.events.push(['lock-exit']);
+        }
+    };
+    harness.dependencies.waitForAgentReady = async () => {
+        harness.events.push(['ready-enter']);
+        markReadinessEntered();
+        await readinessGate;
+        harness.events.push(['ready-exit']);
+        return true;
+    };
+    harness.dependencies.activateRuntimeAfterReadiness = async () => {
+        harness.events.push(['activate']);
+    };
+
+    const running = runCliWithDependencies('explorer', [], harness.dependencies);
+    await readinessEntered;
+    assert.deepEqual(
+        harness.events.map(([name]) => name),
+        ['enable', 'lock-enter', 'ensure', 'ready-enter'],
+    );
+    releaseReadiness();
+    await running;
+    assert.deepEqual(
+        harness.events.map(([name]) => name),
+        ['enable', 'lock-enter', 'ensure', 'ready-enter', 'ready-exit', 'activate', 'lock-exit', 'banner', 'attach'],
+    );
+});
+
 test('runCli resolves the router endpoint before auto-enable mutation', async () => {
     const harness = agentCliHarness({ endpointError: new Error('persisted router port is invalid') });
     await assert.rejects(

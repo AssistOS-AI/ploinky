@@ -6,12 +6,16 @@ const MAX_RUNTIME_MODEL_LENGTH = 256;
 const WEBCHAT_RUNTIME_STATE_FLAG = '__webchatRuntimeState';
 const WEBCHAT_SESSION_FLAG = '__webchatSession';
 const WEBCHAT_WORKSPACE_FILES_FLAG = '__webchatWorkspaceFiles';
+const WEBCHAT_SKILLS_FLAG = '__webchatSkills';
 const WEBCHAT_INTERACTION_FLAG = '__webchatInteraction';
 const WEBCHAT_INTERACTION_RESOLVED_FLAG = '__webchatInteractionResolved';
 const SESSION_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const TASK_ID_RE = /^task_[0-9a-f]{24}$/;
 const TASK_CONTINUATION_HANDLE_RE = /^[A-Za-z0-9_-]{16,200}$/;
 const TASK_TOOL_NAME_RE = /^[A-Za-z0-9._-]{1,160}$/;
+const SKILL_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,199}$/;
+const MAX_TASK_FINAL_OUTPUT_RANGES = 1000;
+const TASK_LOG_SSE_CHUNK_CHARS = 64 * 1024;
 const INTERACTION_ID_RE = /^[A-Za-z0-9_-]{8,128}$/;
 const INTERACTION_TOKEN_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 const PLOINKY_WORKSPACE_BANNER_RE = /^\[ploinky\]\s+using \.ploinky:\s+.+$/;
@@ -19,8 +23,78 @@ const TASK_STATUSES = new Set(['ongoing', 'finished', 'stopped', 'error']);
 const MAX_WORKSPACE_FILE_PATHS = 100000;
 const MAX_WORKSPACE_FILE_DELTA_PATHS = 20000;
 const MAX_WORKSPACE_FILE_PATH_LENGTH = 4096;
+const MAX_WEBCHAT_SKILLS = 10000;
+const SKILL_TYPES = new Set(['cskill', 'dcgskill', 'oskill', 'tskill']);
+const SKILL_EVENTS = new Set(['list', 'changed', 'error']);
 
-function normalizeTask(raw) {
+function normalizeFinalOutputRanges(raw) {
+    const byTurn = new Map();
+    const declared = Array.isArray(raw?.finalOutputRanges)
+        ? raw.finalOutputRanges.slice(-MAX_TASK_FINAL_OUTPUT_RANGES)
+        : [];
+    const legacy = {
+        turn: raw?.turn,
+        offset: raw?.finalOutputOffset,
+        length: raw?.finalOutputLength,
+    };
+    for (const candidate of [...declared, legacy]) {
+        if (!Number.isSafeInteger(candidate?.turn) || candidate.turn < 1) continue;
+        if (!Number.isSafeInteger(candidate.offset) || candidate.offset < 0) continue;
+        if (!Number.isSafeInteger(candidate.length) || candidate.length < 1) continue;
+        byTurn.set(candidate.turn, {
+            turn: candidate.turn,
+            offset: candidate.offset,
+            length: candidate.length,
+        });
+    }
+    return [...byTurn.values()]
+        .sort((left, right) => left.turn - right.turn || left.offset - right.offset)
+        .slice(-MAX_TASK_FINAL_OUTPUT_RANGES);
+}
+
+function normalizeTaskCommands(raw, taskId) {
+    if (!Array.isArray(raw)) return [];
+    const commands = [];
+    const seen = new Set();
+    for (const entry of raw.slice(0, 20)) {
+        const name = String(entry?.name || '').trim();
+        const command = String(entry?.command || '').trim();
+        const description = String(entry?.description || '').replace(/\s+/g, ' ').trim().slice(0, 300);
+        const loadingLabel = String(entry?.loadingLabel || '').replace(/\s+/g, ' ').trim().slice(0, 100);
+        const argCompletions = Array.isArray(entry?.argCompletions)
+            ? entry.argCompletions.slice(0, 2000).map((completion) => {
+                const value = String(completion?.value || '').trim().slice(0, 300);
+                if (!value || /[\u0000-\u001f\u007f]/.test(value)) return null;
+                const label = String(completion?.label || value).replace(/\s+/g, ' ').trim().slice(0, 300);
+                const completionDescription = String(completion?.description || '')
+                    .replace(/\s+/g, ' ').trim().slice(0, 500);
+                return { value, label: label || value, description: completionDescription };
+            }).filter(Boolean)
+            : [];
+        const argMatchMode = entry?.argMatchMode === 'fragment' ? 'fragment' : 'prefix';
+        const rawSuggestionLimit = Number(entry?.argSuggestionLimit);
+        const argSuggestionLimit = Number.isInteger(rawSuggestionLimit) && rawSuggestionLimit > 0
+            ? Math.min(rawSuggestionLimit, 2000)
+            : null;
+        const commandMatch = command.match(/^\/task [A-Za-z0-9][A-Za-z0-9_-]{0,63} (task_[0-9a-f]{24})$/);
+        if (!/^\/[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/.test(name)
+            || commandMatch?.[1] !== taskId || command.length > 1000
+            || /[\u0000-\u001f\u007f]/.test(command) || seen.has(name)) continue;
+        seen.add(name);
+        commands.push({
+            name,
+            command,
+            description,
+            ...(loadingLabel ? { loadingLabel } : {}),
+            ...(argCompletions.length ? { argCompletions } : {}),
+            ...(argMatchMode === 'fragment' ? { argMatchMode } : {}),
+            ...(argSuggestionLimit ? { argSuggestionLimit } : {}),
+        });
+    }
+    return commands;
+}
+
+function normalizeTask(raw, { includeFinalOutputRanges = true } = {}) {
     if (!raw || typeof raw !== 'object' || !TASK_ID_RE.test(String(raw.id || ''))) return null;
     const continuationTarget = String(raw.continuation?.targetAgent || raw.targetAgent || '').trim().slice(0, 160);
     const continuationTool = String(raw.continuation?.toolName || '').trim();
@@ -36,6 +110,14 @@ function normalizeTask(raw) {
             ...(continuationHandle ? { handle: continuationHandle } : {}),
         }
         : null;
+    const finalOutputRanges = includeFinalOutputRanges
+        ? normalizeFinalOutputRanges(raw)
+        : [];
+    const modelKey = String(raw.execution?.model?.key || '').trim().slice(0, 300);
+    const executionModel = String(raw.execution?.model?.model || '').trim().slice(0, 300);
+    const executionProvider = String(raw.execution?.model?.provider || '').trim().slice(0, 160);
+    const executionLabel = String(raw.execution?.model?.label || '').replace(/\s+/g, ' ').trim().slice(0, 300);
+    const commands = normalizeTaskCommands(raw.commands, String(raw.id));
     return {
         version: 1,
         id: String(raw.id),
@@ -56,8 +138,20 @@ function normalizeTask(raw) {
         finalOutputLength: Number.isSafeInteger(raw.finalOutputLength) && raw.finalOutputLength > 0
             ? raw.finalOutputLength
             : 0,
+        ...(finalOutputRanges.length ? { finalOutputRanges } : {}),
         ...(raw.logRetention === 'full' ? { logRetention: 'full' } : {}),
         ...(continuation ? { continuation } : {}),
+        ...(modelKey && executionModel ? {
+            execution: {
+                model: {
+                    key: modelKey,
+                    model: executionModel,
+                    ...(executionProvider ? { provider: executionProvider } : {}),
+                    ...(executionLabel ? { label: executionLabel } : {}),
+                },
+            },
+        } : {}),
+        ...(commands.length ? { commands } : {}),
     };
 }
 
@@ -65,7 +159,13 @@ export function parseWebchatTaskState(envelope) {
     if (!envelope || envelope.__webchatTask !== 1 || envelope.version !== 1) return undefined;
     if (envelope.event === 'list') {
         if (!Array.isArray(envelope.tasks)) return undefined;
-        return { event: 'list', tasks: envelope.tasks.map(normalizeTask).filter(Boolean).slice(0, 1000) };
+        return {
+            event: 'list',
+            tasks: envelope.tasks
+                .map((task) => normalizeTask(task, { includeFinalOutputRanges: false }))
+                .filter(Boolean)
+                .slice(0, 1000),
+        };
     }
     const task = normalizeTask(envelope.task);
     if (!task) return undefined;
@@ -103,6 +203,40 @@ export function serializeTaskListSseEvent(tasks) {
     });
     if (!snapshot?.tasks.length) return '';
     return `event: task-update\ndata: ${JSON.stringify(snapshot)}\n\n`;
+}
+
+export function serializeTaskUpdateSseEvents(update, chunkSize = TASK_LOG_SSE_CHUNK_CHARS) {
+    const serialize = (payload) => `event: task-update\ndata: ${JSON.stringify(payload)}\n\n`;
+    const logText = update?.event === 'view' && typeof update?.log?.text === 'string'
+        ? update.log.text
+        : '';
+    const safeChunkSize = Math.max(1024, Number(chunkSize) || TASK_LOG_SSE_CHUNK_CHARS);
+    if (!logText || logText.length <= safeChunkSize) return [serialize(update)];
+
+    const chunks = [];
+    for (let offset = 0; offset < logText.length; offset += safeChunkSize) {
+        chunks.push(logText.slice(offset, offset + safeChunkSize));
+    }
+    const nextOffset = Math.max(0, Number(update.log.nextOffset) || 0);
+    const start = {
+        ...update,
+        log: { ...update.log, text: '' },
+        logChunk: { phase: 'start', count: chunks.length, nextOffset },
+    };
+    return [
+        serialize(start),
+        ...chunks.map((text, index) => serialize({
+            event: 'view-log-chunk',
+            task: update.task,
+            logChunk: {
+                phase: 'chunk',
+                index,
+                count: chunks.length,
+                text,
+                nextOffset,
+            },
+        })),
+    ];
 }
 
 function stripCtrlAndAnsi(input) {
@@ -250,6 +384,63 @@ export function serializeWorkspaceFilesSseEvent(state) {
     return `event: workspace-files\ndata: ${JSON.stringify(payload)}\n\n`;
 }
 
+function normalizeWebchatSkill(raw) {
+    if (!raw || typeof raw !== 'object') return null;
+    const name = typeof raw.name === 'string' ? raw.name.trim() : '';
+    const displayName = typeof raw.displayName === 'string' ? raw.displayName.trim() : '';
+    const relativePath = normalizeWorkspaceFilePath(raw.relativePath);
+    if (!SKILL_NAME_RE.test(name)
+        || !displayName || displayName.length > 300 || /[\0\r\n]/.test(displayName)
+        || !relativePath || !SKILL_TYPES.has(raw.type) || typeof raw.enabled !== 'boolean') {
+        return null;
+    }
+    return { name, displayName, relativePath, type: raw.type, enabled: raw.enabled };
+}
+
+export function parseWebchatSkillsState(envelope) {
+    if (!envelope || envelope[WEBCHAT_SKILLS_FLAG] !== 1 || envelope.version !== 1
+        || !SKILL_EVENTS.has(envelope.event) || !Array.isArray(envelope.skills)
+        || envelope.skills.length > MAX_WEBCHAT_SKILLS) {
+        return undefined;
+    }
+    const skills = [];
+    const names = new Set();
+    for (const raw of envelope.skills) {
+        const skill = normalizeWebchatSkill(raw);
+        if (!skill || names.has(skill.name)) return undefined;
+        names.add(skill.name);
+        skills.push(skill);
+    }
+    const state = { event: envelope.event, skills };
+    if (envelope.operation !== undefined) {
+        const scope = envelope.operation?.scope;
+        const action = envelope.operation?.action;
+        const target = typeof envelope.operation?.target === 'string' ? envelope.operation.target.trim() : '';
+        if (!['skill', 'directory'].includes(scope) || !['enable', 'disable'].includes(action)
+            || !target || target.length > MAX_WORKSPACE_FILE_PATH_LENGTH || /[\0\r\n]/.test(target)
+            || (scope === 'skill' && !SKILL_NAME_RE.test(target))
+            || (scope === 'directory' && target !== '.' && !normalizeWorkspaceFilePath(target))) {
+            return undefined;
+        }
+        state.operation = { scope, action, target };
+    }
+    if (envelope.event === 'error') {
+        const error = typeof envelope.error === 'string' ? envelope.error.trim().slice(0, 1000) : '';
+        if (!error) return undefined;
+        state.error = error;
+    }
+    return state;
+}
+
+export function serializeSkillsStateSseEvent(state) {
+    const normalized = parseWebchatSkillsState({
+        [WEBCHAT_SKILLS_FLAG]: 1,
+        version: 1,
+        ...state,
+    });
+    return normalized ? `event: skills-state\ndata: ${JSON.stringify(normalized)}\n\n` : '';
+}
+
 function normalizeSessionId(value) {
     const sessionId = typeof value === 'string' ? value.trim().toLowerCase() : '';
     return SESSION_ID_RE.test(sessionId) ? sessionId : '';
@@ -349,6 +540,48 @@ function normalizeInteractionText(value, maxLength, { required = false } = {}) {
     return text;
 }
 
+function normalizeInteractionUrl(value) {
+    const url = normalizeInteractionText(value, 4000, { required: true });
+    if (!url) return undefined;
+    try {
+        const parsed = new URL(url);
+        const host = parsed.hostname.toLowerCase();
+        const loopback = host === 'localhost' || host.endsWith('.localhost')
+            || host === '::1' || host === '[::1]' || host === '0.0.0.0' || /^127(?:\.|$)/.test(host);
+        return parsed.protocol === 'https:' && !loopback ? parsed.toString() : undefined;
+    } catch (_) {
+        return undefined;
+    }
+}
+
+function normalizeInteractionChallenge(raw) {
+    if (raw === undefined) return null;
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+    const instructions = normalizeInteractionText(raw.instructions, 2000);
+    if (instructions === undefined) return undefined;
+    if (raw.type === 'device_code') {
+        const verificationUri = normalizeInteractionUrl(raw.verificationUri);
+        const userCode = normalizeInteractionText(raw.userCode, 100);
+        const expiresInSeconds = Number(raw.expiresInSeconds);
+        if (!verificationUri || userCode === undefined || (!userCode && !instructions)) return undefined;
+        return {
+            type: 'device_code',
+            verificationUri,
+            userCode,
+            instructions,
+            ...(Number.isFinite(expiresInSeconds) && expiresInSeconds > 0
+                ? { expiresInSeconds: Math.min(expiresInSeconds, 86400) }
+                : {}),
+        };
+    }
+    if (raw.type === 'manual_oauth_code') {
+        const url = normalizeInteractionUrl(raw.url);
+        if (!url) return undefined;
+        return { type: 'manual_oauth_code', url, instructions };
+    }
+    return undefined;
+}
+
 export function parseWebchatInteraction(envelope) {
     if (!envelope || typeof envelope !== 'object' || !envelope[WEBCHAT_INTERACTION_FLAG]) return undefined;
     if (envelope.version !== 1) return undefined;
@@ -357,25 +590,66 @@ export function parseWebchatInteraction(envelope) {
     const title = normalizeInteractionText(envelope.title, 120, { required: true });
     const message = normalizeInteractionText(envelope.message, 1000);
     const detail = normalizeInteractionText(envelope.detail, 4000);
+    const challenge = normalizeInteractionChallenge(envelope.challenge);
     if (!id || !INTERACTION_ID_RE.test(id) || !kind || !INTERACTION_TOKEN_RE.test(kind) || !title) return undefined;
-    if (message === undefined || detail === undefined) return undefined;
-    if (!Array.isArray(envelope.options) || envelope.options.length < 1 || envelope.options.length > 8) return undefined;
+    if (message === undefined || detail === undefined || challenge === undefined) return undefined;
+    if (!Array.isArray(envelope.options) || envelope.options.length > 256) return undefined;
+    let input = null;
+    if (envelope.input !== undefined) {
+        if (!envelope.input || typeof envelope.input !== 'object' || Array.isArray(envelope.input)) return undefined;
+        const inputType = envelope.input.type === 'secret' ? 'secret' : (envelope.input.type === 'text' ? 'text' : '');
+        const placeholder = normalizeInteractionText(envelope.input.placeholder, 300);
+        const maxLength = Number(envelope.input.maxLength);
+        if (!inputType || placeholder === undefined || !Number.isInteger(maxLength) || maxLength < 1 || maxLength > 65536) {
+            return undefined;
+        }
+        input = { type: inputType, placeholder, maxLength };
+    }
+    if (!input && envelope.options.length < 1) return undefined;
     const seen = new Set();
     const options = [];
     for (const raw of envelope.options) {
         const optionId = normalizeInteractionText(raw?.id, 64, { required: true });
         const label = normalizeInteractionText(raw?.label, 100, { required: true });
-        if (!optionId || !INTERACTION_TOKEN_RE.test(optionId) || !label || seen.has(optionId)) return undefined;
+        const description = normalizeInteractionText(raw?.description, 500);
+        if (!optionId || !INTERACTION_TOKEN_RE.test(optionId) || !label
+            || description === undefined || seen.has(optionId)) return undefined;
         seen.add(optionId);
         options.push({
             id: optionId,
             label,
+            description,
             tone: raw?.tone === 'danger' ? 'danger' : 'default',
         });
     }
     const requestedDefault = normalizeInteractionText(envelope.defaultOptionId, 64);
-    const defaultOptionId = seen.has(requestedDefault) ? requestedDefault : options[0].id;
-    return { id, kind, title, message, detail, options, defaultOptionId };
+    const defaultOptionId = seen.has(requestedDefault) ? requestedDefault : (options[0]?.id || null);
+    const targetTaskId = typeof envelope.targetTaskId === 'string' && TASK_ID_RE.test(envelope.targetTaskId)
+        ? envelope.targetTaskId
+        : '';
+    const targetTabId = typeof envelope.targetTabId === 'string'
+        && /^[A-Za-z0-9_-]{1,128}$/.test(envelope.targetTabId)
+        ? envelope.targetTabId
+        : '';
+    const targetPageInstanceId = typeof envelope.targetPageInstanceId === 'string'
+        && /^[A-Za-z0-9_-]{1,128}$/.test(envelope.targetPageInstanceId)
+        ? envelope.targetPageInstanceId
+        : '';
+    return {
+        id,
+        kind,
+        title,
+        message,
+        detail,
+        options,
+        defaultOptionId,
+        ...(input ? { input } : {}),
+        ...(challenge ? { challenge } : {}),
+        ...(envelope.searchable === true && options.length ? { searchable: true } : {}),
+        ...(targetTaskId ? { targetTaskId } : {}),
+        ...(targetTabId ? { targetTabId } : {}),
+        ...(targetPageInstanceId ? { targetPageInstanceId } : {}),
+    };
 }
 
 export function parseWebchatInteractionResolved(envelope) {
@@ -501,6 +775,17 @@ function routeCompleteOutputLine(appState, tab, line) {
             // Invalid workspace-file envelopes fall through as ordinary agent output.
         }
     }
+    if (normalized.includes(`"${WEBCHAT_SKILLS_FLAG}"`)) {
+        try {
+            const skillsState = parseWebchatSkillsState(JSON.parse(normalized));
+            if (!skillsState) return;
+            tab.webchatSkillsSnapshot = skillsState;
+            writeOrBufferSseEvent(tab, serializeSkillsStateSseEvent(skillsState));
+            return;
+        } catch (_) {
+            return;
+        }
+    }
     if (normalized.includes('"__webchatTask"')) {
         try {
             const envelope = JSON.parse(normalized);
@@ -521,14 +806,13 @@ function routeCompleteOutputLine(appState, tab, line) {
                 const messageIndex = Number.isInteger(envelope.messageIndex) && envelope.messageIndex >= 0
                     ? envelope.messageIndex
                     : null;
-                broadcastWorkspaceTaskEvent(
-                    appState,
-                    tab.workspaceDirectory,
-                    `event: task-update\ndata: ${JSON.stringify({
-                        ...update,
-                        ...(sessionId && messageIndex !== null ? { sessionId, messageIndex } : {}),
-                    })}\n\n`,
-                );
+                const outgoing = {
+                    ...update,
+                    ...(sessionId && messageIndex !== null ? { sessionId, messageIndex } : {}),
+                };
+                for (const payload of serializeTaskUpdateSseEvents(outgoing)) {
+                    broadcastWorkspaceTaskEvent(appState, tab.workspaceDirectory, payload);
+                }
                 return;
             }
         } catch (_) {
@@ -558,12 +842,14 @@ export function routeWorkspaceRuntimeOutput(appState, tab, data) {
         || trimmed.includes(`"${WEBCHAT_SESSION_FLAG}"`);
     const isWorkspaceFilesProtocol = `{"${WEBCHAT_WORKSPACE_FILES_FLAG}"`.startsWith(trimmed)
         || trimmed.includes(`"${WEBCHAT_WORKSPACE_FILES_FLAG}"`);
+    const isSkillsProtocol = `{"${WEBCHAT_SKILLS_FLAG}"`.startsWith(trimmed)
+        || trimmed.includes(`"${WEBCHAT_SKILLS_FLAG}"`);
     const isInteractionProtocol = `{"${WEBCHAT_INTERACTION_FLAG}"`.startsWith(trimmed)
         || trimmed.includes(`"${WEBCHAT_INTERACTION_FLAG}"`)
         || `{"${WEBCHAT_INTERACTION_RESOLVED_FLAG}"`.startsWith(trimmed)
         || trimmed.includes(`"${WEBCHAT_INTERACTION_RESOLVED_FLAG}"`);
     if (trimmed.startsWith('{') && (isTaskProtocol || isRuntimeStateProtocol || isSessionProtocol
-        || isWorkspaceFilesProtocol || isInteractionProtocol)) {
+        || isWorkspaceFilesProtocol || isSkillsProtocol || isInteractionProtocol)) {
         tab.taskProtocolBuffer = pending;
         return;
     }
@@ -619,7 +905,7 @@ export function disposeTab(tab, tabId, session) {
     if (!tab) {
         return;
     }
-    const pid = tab.pid || tab.tty?.pid;
+    const pid = tab.tty?.pid || tab.pid;
     if (tab.disposed) {
         if (session?.runtimes instanceof Map) session.runtimes.delete(tabId);
         if (session?.tabs instanceof Map) {

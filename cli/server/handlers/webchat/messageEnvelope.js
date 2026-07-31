@@ -69,7 +69,7 @@ export function sanitizeWebchatReferencesForEnvelope(references = []) {
     return out;
 }
 
-function buildWebchatInvocationToken({ req, effectiveConfig, tabId, envelope }) {
+function buildWebchatInvocationToken({ req, effectiveConfig, tabId, pageInstanceId, envelope }) {
     const agentName = String(effectiveConfig?.agentName || '').trim();
     if (!agentName) return '';
     try {
@@ -80,6 +80,7 @@ function buildWebchatInvocationToken({ req, effectiveConfig, tabId, envelope }) 
             toolArgs: {
                 surface: 'webchat',
                 tabId: String(tabId || ''),
+                pageInstanceId: String(pageInstanceId || ''),
                 text: typeof envelope?.text === 'string' ? envelope.text : '',
                 attachments: sanitizeWebchatAttachmentsForEnvelope(envelope?.attachments),
                 references: sanitizeWebchatReferencesForEnvelope(envelope?.references),
@@ -113,7 +114,7 @@ export function resolveRequestPublicOrigin(req) {
     }
 }
 
-export function serializeWebchatEnvelopeForAgent({ req, effectiveConfig, tabId, envelope, fallbackText = '' }) {
+export function serializeWebchatEnvelopeForAgent({ req, effectiveConfig, tabId, pageInstanceId = '', envelope, fallbackText = '' }) {
     const sanitizedReferences = sanitizeWebchatReferencesForEnvelope(envelope?.references);
     const publicBaseUrl = resolveRequestPublicOrigin(req);
     const payload = {
@@ -122,10 +123,12 @@ export function serializeWebchatEnvelopeForAgent({ req, effectiveConfig, tabId, 
         text: (envelope && typeof envelope.text === 'string') ? envelope.text : String(fallbackText || ''),
         attachments: sanitizeWebchatAttachmentsForEnvelope(envelope?.attachments),
         presentation: normalizeWebchatPresentation(envelope?.presentation),
+        sourceTabId: String(tabId || '').slice(0, 128),
+        sourcePageInstanceId: String(pageInstanceId || '').slice(0, 128),
     };
     if (publicBaseUrl) payload.origin = { publicBaseUrl };
     if (sanitizedReferences.length) payload.references = sanitizedReferences;
-    const token = buildWebchatInvocationToken({ req, effectiveConfig, tabId, envelope: payload });
+    const token = buildWebchatInvocationToken({ req, effectiveConfig, tabId, pageInstanceId, envelope: payload });
     if (token) payload.invocation = { token };
     return JSON.stringify(payload);
 }

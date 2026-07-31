@@ -1840,6 +1840,7 @@ export async function runCliWithDependencies(agentName, args, dependencies) {
     waitForAgentReady: waitForAgentReadyImpl,
     activateRuntimeAfterReadiness: activateRuntimeAfterReadinessImpl = activatePreparedRuntimeAfterReadiness,
     loadAgentsMap: loadAgentsMapImpl,
+    withMaintenanceLock: withMaintenanceLockImpl = withMaintenanceLock,
     attachInteractive,
     attachBwrapInteractive,
     attachSeatbeltInteractive,
@@ -1931,73 +1932,90 @@ export async function runCliWithDependencies(agentName, args, dependencies) {
   const cmd = wrapCliWithWebchat(rawCmd, env);
   const agentDir = path.dirname(manifestPath);
   const repoName = path.basename(path.dirname(agentDir));
-  debugLog(`[runCli] agent=${agentName} container=${registryRecord?.containerName || getAgentContainerName(shortAgentName, repoName)}`);
-  const { containerInfo, containerName } = await withNetworkLifecycleLock(async (networkLifecycleCapability) => {
-    let result = null;
-    try {
-    result = ensureAgentService(shortAgentName, manifest, agentDir, {
-      containerName: registryRecord?.containerName,
-      alias: registryRecord?.record?.alias,
-      routerEndpoint,
-      networkLifecycleCapability,
-    });
-    const exactContainerName = (result && result.containerName)
-      || registryRecord?.containerName
-      || getAgentContainerName(shortAgentName, repoName);
-    const cliReadinessRoute = buildRelayReadinessRoute({
-      route: {
-        container: exactContainerName,
-        hostPort: result?.hostPort || 0,
-      },
-      manifest,
-      runtimeResult: result,
-      networkMode: routerEndpoint?.mode || '',
-      generationDigest: result?.preparationLease?.preparedGeneration || '',
-    });
-    const readinessProtocol = resolveAgentReadinessProtocolImpl(manifest);
-    if (readinessProtocol === 'script') {
-      await waitForManifestReadinessImpl({
-        key: `cli:${shortAgentName}`,
-        label: shortAgentName,
-        manifest,
-        route: cliReadinessRoute,
-      });
-    } else if (readinessProtocol !== 'none') {
-      const hasReadinessTarget = Boolean(cliReadinessRoute.hostPort || cliReadinessRoute.relay);
-      if (!hasReadinessTarget) {
-        if (result?.requiresEdgeActivation) {
-          throw new Error(`Agent '${shortAgentName}' replacement cannot activate without a resolved '${readinessProtocol}' readiness target.`);
-        }
-        if (!suppressLauncherLogs) {
-          warn(`[cli] warning: cannot wait for '${shortAgentName}' readiness because no host port or confined relay target was resolved.`);
-        }
-      } else {
-        if (!suppressLauncherLogs) {
-          log(`[cli] Waiting for '${shortAgentName}' readiness (${readinessProtocol})...`);
-        }
-        const ready = await waitForAgentReadyImpl(cliReadinessRoute, {
-          timeoutMs: 600000,
-          protocol: readinessProtocol,
+  const initialContainerName = registryRecord?.containerName || getAgentContainerName(shortAgentName, repoName);
+  debugLog(`[runCli] agent=${agentName} container=${initialContainerName}`);
+  let containerInfo = null;
+  let containerName = initialContainerName;
+  await withMaintenanceLockImpl(initialContainerName, {
+    operation: 'cli-start',
+    metadata: {
+      agent: shortAgentName,
+      repo: repoName,
+    },
+  }, async () => {
+    const refreshedRecord = loadAgentsMapImpl()?.[initialContainerName];
+    if (refreshedRecord?.type === 'agent') {
+      registryRecord = { containerName: initialContainerName, record: refreshedRecord };
+    }
+    const lifecycleResult = await withNetworkLifecycleLock(async (networkLifecycleCapability) => {
+      let result = null;
+      try {
+        result = ensureAgentService(shortAgentName, manifest, agentDir, {
+          containerName: registryRecord?.containerName,
+          alias: registryRecord?.record?.alias,
+          routerEndpoint,
+          networkLifecycleCapability,
         });
-        if (!ready) {
-          throw new Error(`Agent '${shortAgentName}' did not become ready before CLI attach.`);
+        const exactContainerName = result?.containerName
+          || registryRecord?.containerName
+          || initialContainerName;
+        const cliReadinessRoute = buildRelayReadinessRoute({
+          route: {
+            container: exactContainerName,
+            hostPort: result?.hostPort || 0,
+          },
+          manifest,
+          runtimeResult: result,
+          networkMode: routerEndpoint?.mode || '',
+          generationDigest: result?.preparationLease?.preparedGeneration || '',
+        });
+        const readinessProtocol = resolveAgentReadinessProtocolImpl(manifest);
+        if (readinessProtocol === 'script') {
+          await waitForManifestReadinessImpl({
+            key: `cli:${shortAgentName}`,
+            label: shortAgentName,
+            manifest,
+            route: cliReadinessRoute,
+          });
+        } else if (readinessProtocol !== 'none') {
+          const hasReadinessTarget = Boolean(cliReadinessRoute.hostPort || cliReadinessRoute.relay);
+          if (!hasReadinessTarget) {
+            if (result?.requiresEdgeActivation) {
+              throw new Error(`Agent '${shortAgentName}' replacement cannot activate without a resolved '${readinessProtocol}' readiness target.`);
+            }
+            if (!suppressLauncherLogs) {
+              warn(`[cli] warning: cannot wait for '${shortAgentName}' readiness because no host port or confined relay target was resolved.`);
+            }
+          } else {
+            if (!suppressLauncherLogs) {
+              log(`[cli] Waiting for '${shortAgentName}' readiness (${readinessProtocol})...`);
+            }
+            const ready = await waitForAgentReadyImpl(cliReadinessRoute, {
+              timeoutMs: 600000,
+              protocol: readinessProtocol,
+            });
+            if (!ready) {
+              throw new Error(`Agent '${shortAgentName}' did not become ready before CLI attach.`);
+            }
+          }
         }
+        await activateRuntimeAfterReadinessImpl({
+          result,
+          routeKey: registryRecord?.record?.alias || shortAgentName,
+          repoName,
+          shortAgentName,
+          agentPath: agentDir,
+          alias: registryRecord?.record?.alias || '',
+          networkLifecycleCapability,
+        });
+        return { containerInfo: result, containerName: exactContainerName };
+      } catch (error) {
+        cleanupFailedPreparedRuntime(result, error);
+        throw error;
       }
-    }
-    await activateRuntimeAfterReadinessImpl({
-      result,
-      routeKey: registryRecord?.record?.alias || shortAgentName,
-      repoName,
-      shortAgentName,
-      agentPath: agentDir,
-      alias: registryRecord?.record?.alias || '',
-      networkLifecycleCapability,
     });
-    return { containerInfo: result, containerName: exactContainerName };
-    } catch (error) {
-      cleanupFailedPreparedRuntime(result, error);
-      throw error;
-    }
+    containerInfo = lifecycleResult.containerInfo;
+    containerName = lifecycleResult.containerName;
   });
 
   // Determine actual runtime from registry (may differ from manifest if sandbox

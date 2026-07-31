@@ -32,6 +32,124 @@ function clearChildren(node) {
     }
 }
 
+function safeHttpUrl(value) {
+    try {
+        const withoutAnsi = String(value || '').replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, '');
+        const parsed = new URL(withoutAnsi);
+        const host = parsed.hostname.toLowerCase();
+        const loopback = host === 'localhost' || host.endsWith('.localhost')
+            || host === '::1' || host === '[::1]' || host === '0.0.0.0' || /^127(?:\.|$)/.test(host);
+        return parsed.protocol === 'https:' && !loopback ? parsed.toString() : '';
+    } catch (_) {
+        return '';
+    }
+}
+
+async function copyAutocompleteContextValue(value) {
+    try {
+        const clipboard = globalThis.navigator?.clipboard;
+        if (typeof clipboard?.writeText === 'function') {
+            await clipboard.writeText(value);
+            return true;
+        }
+    } catch (_) { /* fall through to the legacy browser fallback */ }
+
+    const textarea = document.createElement('textarea');
+    textarea.value = value;
+    textarea.setAttribute('readonly', '');
+    textarea.style.position = 'fixed';
+    textarea.style.opacity = '0';
+    document.body.appendChild(textarea);
+    textarea.select();
+    let copied = false;
+    try {
+        copied = document.execCommand?.('copy') === true;
+    } catch (_) { /* clipboard access is best-effort */ }
+    textarea.remove();
+    return copied;
+}
+
+function createAutocompleteContextCopyButton(value, label) {
+    const copy = document.createElement('button');
+    copy.type = 'button';
+    copy.className = 'wa-slash-menu-context-copy';
+    copy.textContent = label;
+    copy.addEventListener('pointerdown', (event) => event.stopPropagation());
+    copy.addEventListener('click', async (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        if (await copyAutocompleteContextValue(value)) {
+            copy.textContent = 'Copied';
+        }
+    });
+    return copy;
+}
+
+function createAutocompleteContextStep(number, label) {
+    const row = document.createElement('div');
+    row.className = 'wa-slash-menu-context-step';
+
+    const index = document.createElement('span');
+    index.className = 'wa-slash-menu-context-step-index';
+    index.textContent = `${number}.`;
+
+    const content = document.createElement('div');
+    content.className = 'wa-slash-menu-context-step-content';
+    const stepLabel = document.createElement('span');
+    stepLabel.className = 'wa-slash-menu-context-step-label';
+    stepLabel.textContent = label;
+    content.appendChild(stepLabel);
+
+    row.appendChild(index);
+    row.appendChild(content);
+    return { row, content };
+}
+
+export function appendAutocompleteContext(menu, raw) {
+    if (!menu || !raw || typeof raw !== 'object') return;
+    const url = safeHttpUrl(raw.type === 'device_code' ? raw.verificationUri : raw.url);
+    if (!url) return;
+    const panel = document.createElement('div');
+    panel.className = 'wa-slash-menu-context';
+
+    const heading = document.createElement('strong');
+    heading.className = 'wa-slash-menu-context-title';
+    heading.textContent = 'Authorization';
+    panel.appendChild(heading);
+
+    const linkStep = createAutocompleteContextStep(1, 'Open this link in your browser');
+    const link = document.createElement('a');
+    link.className = 'wa-slash-menu-context-link';
+    link.href = url;
+    link.target = '_blank';
+    link.rel = 'noopener noreferrer';
+    link.textContent = url;
+    link.addEventListener('pointerdown', (event) => event.stopPropagation());
+    linkStep.content.appendChild(link);
+    linkStep.row.appendChild(createAutocompleteContextCopyButton(url, 'Copy link'));
+    panel.appendChild(linkStep.row);
+
+    const userCode = String(raw.userCode || '').trim();
+    if (userCode) {
+        const codeStep = createAutocompleteContextStep(2, 'Enter this code');
+        const code = document.createElement('code');
+        code.className = 'wa-slash-menu-context-code';
+        code.textContent = userCode;
+        codeStep.content.appendChild(code);
+        codeStep.row.appendChild(createAutocompleteContextCopyButton(userCode, 'Copy code'));
+        panel.appendChild(codeStep.row);
+    }
+
+    const instructions = String(raw.instructions || '').trim();
+    if (instructions && (raw.type !== 'device_code' || !userCode)) {
+        const detail = document.createElement('span');
+        detail.className = 'wa-slash-menu-context-detail';
+        detail.textContent = instructions;
+        panel.appendChild(detail);
+    }
+    menu.appendChild(panel);
+}
+
 export function keepAutocompleteItemVisible(menu, item) {
     if (!menu || !item) return;
     const viewportHeight = Number(menu.clientHeight) || 0;
@@ -57,7 +175,12 @@ export function nextAutocompleteRenderCount(currentCount, totalCount, batchSize 
     return Math.min(total, Math.max(current, 0) + batch);
 }
 
-export function createComposerAutocomplete({ cmdInput }, { providers = [], dlog, onSelectionApplied } = {}) {
+export function createComposerAutocomplete({ cmdInput }, {
+    providers = [],
+    dlog,
+    onSelectionApplied,
+    positionStrategy = 'composer',
+} = {}) {
     let providerList = Array.isArray(providers) ? providers.slice() : [];
     let menuEl = null;
     let active = false;
@@ -95,6 +218,13 @@ export function createComposerAutocomplete({ cmdInput }, { providers = [], dlog,
     function positionMenu() {
         if (!menuEl || !cmdInput) return;
         const rect = cmdInput.getBoundingClientRect();
+        if (positionStrategy === 'viewport') {
+            menuEl.style.position = 'fixed';
+            menuEl.style.left = `${rect.left}px`;
+            menuEl.style.bottom = `${Math.max(4, window.innerHeight - rect.top + 4)}px`;
+            menuEl.style.width = `${Math.max(280, rect.width)}px`;
+            return;
+        }
         const composerRect = cmdInput.closest('.wa-composer')?.getBoundingClientRect();
         if (!composerRect) return;
         menuEl.style.left = `${rect.left - composerRect.left}px`;
@@ -158,7 +288,7 @@ export function createComposerAutocomplete({ cmdInput }, { providers = [], dlog,
     }
 
     function applySelection(suggestion) {
-        if (!suggestion || !cmdInput) return;
+        if (!suggestion || suggestion.disabled === true || !cmdInput) return;
         const value = cmdInput.value || '';
         const triggerInfo = activeTrigger();
         let next = null;
@@ -235,6 +365,8 @@ export function createComposerAutocomplete({ cmdInput }, { providers = [], dlog,
         clearChildren(menu);
         const visible = suggestionsCache.slice(0, renderedSuggestionCount);
 
+        appendAutocompleteContext(menu, suggestionsCache.find((entry) => entry.contextPanel)?.contextPanel);
+
         let lastGroup = null;
         let activeItem = null;
         const showGroupHeaders = groups.length > 1 || triggerInfo.trigger === '@';
@@ -251,8 +383,14 @@ export function createComposerAutocomplete({ cmdInput }, { providers = [], dlog,
 
             const item = document.createElement('div');
             item.className = 'wa-slash-menu-item' + (absoluteIdx === selectedIndex ? ' wa-slash-menu-item-active' : '');
+            if (suggestion.disabled === true) item.classList.add('is-disabled');
+            if (suggestion.loading === true) item.classList.add('is-loading');
             item.setAttribute('role', 'option');
             item.setAttribute('aria-selected', absoluteIdx === selectedIndex ? 'true' : 'false');
+            if (suggestion.disabled === true) item.setAttribute('aria-disabled', 'true');
+            if (suggestion.loading === true) {
+                item.setAttribute('aria-label', suggestion.loadingLabel || suggestion.label || 'Loading');
+            }
             item.setAttribute('data-suggestion-index', String(absoluteIdx));
             if (absoluteIdx === selectedIndex) {
                 activeItem = item;
@@ -266,12 +404,19 @@ export function createComposerAutocomplete({ cmdInput }, { providers = [], dlog,
             desc.className = 'wa-slash-menu-desc';
             desc.textContent = suggestion.description || '';
 
+            if (suggestion.loading === true) {
+                const spinner = document.createElement('span');
+                spinner.className = 'wa-slash-menu-spinner';
+                spinner.setAttribute('aria-hidden', 'true');
+                item.appendChild(spinner);
+            }
             item.appendChild(label);
-            item.appendChild(desc);
+            if (suggestion.loading !== true) item.appendChild(desc);
 
             item.addEventListener('pointerdown', (event) => {
                 event.preventDefault();
                 event.stopPropagation();
+                if (suggestion.disabled === true) return;
                 selectedIndex = absoluteIdx;
                 applySelection(suggestionsCache[absoluteIdx]);
             });

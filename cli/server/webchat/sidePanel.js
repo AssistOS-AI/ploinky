@@ -36,11 +36,14 @@ export function createSidePanel({
     webchatBasePath = '/webchat',
     workspaceFileIndex = null,
     sendQuickCommand = null,
+    sendInteractionResponse = null,
 }) {
     let activeBubble = null;
     let activeFrame = null;
     let activeFrameUrl = '';
     let activeTaskId = '';
+    let activeTaskCommands = [];
+    let activeTaskInteractionId = '';
     let activeFileRequest = 0;
     const panelWrapper = sidePanel?.querySelector('.wa-side-panel-content') || null;
 
@@ -180,6 +183,8 @@ export function createSidePanel({
         activeFrame = null;
         activeFrameUrl = '';
         activeTaskId = '';
+        activeTaskCommands = [];
+        activeTaskInteractionId = '';
     }
 
     function openText(bubble, text) {
@@ -264,6 +269,8 @@ export function createSidePanel({
         activeFrame = frame;
         activeFrameUrl = normalizedUrl;
         activeTaskId = normalizedTaskId;
+        activeTaskCommands = [];
+        activeTaskInteractionId = '';
         ensurePanelVisible();
         setPanelTitleLink(url, title);
         applyPanelSizeFromStorage();
@@ -324,6 +331,8 @@ export function createSidePanel({
         activeFrame = null;
         activeFrameUrl = '';
         activeTaskId = '';
+        activeTaskCommands = [];
+        activeTaskInteractionId = '';
         ensurePanelVisible();
         applyPanelSizeFromStorage();
         setPanelTitleLink(url, path || url);
@@ -372,6 +381,8 @@ export function createSidePanel({
         activeFrame = null;
         activeFrameUrl = '';
         activeTaskId = '';
+        activeTaskCommands = [];
+        activeTaskInteractionId = '';
         activeFileRequest += 1;
         resetChatAreaSizing();
     }
@@ -380,6 +391,11 @@ export function createSidePanel({
         const taskId = String(payload?.task?.id || '').trim();
         if (!activeFrame?.contentWindow || !activeTaskId || taskId !== activeTaskId) {
             return;
+        }
+        if (Array.isArray(payload?.task?.commands)) {
+            activeTaskCommands = payload.task.commands
+                .map((entry) => String(entry?.command || '').trim())
+                .filter(Boolean);
         }
         try {
             activeFrame.contentWindow.postMessage({
@@ -391,13 +407,58 @@ export function createSidePanel({
         }
     }
 
+    function postTaskInteraction(interaction) {
+        if (!activeFrame?.contentWindow || interaction?.targetTaskId !== activeTaskId) return false;
+        activeTaskInteractionId = String(interaction.id || '');
+        try {
+            activeFrame.contentWindow.postMessage({
+                type: 'webchat-task-interaction-request',
+                payload: interaction,
+            }, window.location.origin);
+            return true;
+        } catch (_) {
+            activeTaskInteractionId = '';
+            return false;
+        }
+    }
+
+    function postTaskInteractionResolved(resolution) {
+        if (!activeFrame?.contentWindow || resolution?.id !== activeTaskInteractionId) return false;
+        try {
+            activeFrame.contentWindow.postMessage({
+                type: 'webchat-task-interaction-resolved',
+                payload: resolution,
+            }, window.location.origin);
+        } catch (_) {
+            return false;
+        } finally {
+            activeTaskInteractionId = '';
+        }
+        return true;
+    }
+
     window.addEventListener?.('message', (event) => {
         if (event.origin !== window.location.origin || event.source !== activeFrame?.contentWindow) return;
+        if (event.data?.type === 'webchat-task-interaction-response') {
+            if (event.data.taskId !== activeTaskId || event.data.interactionId !== activeTaskInteractionId) return;
+            const optionId = typeof event.data.optionId === 'string' ? event.data.optionId : null;
+            const response = typeof event.data.response === 'string' ? event.data.response : null;
+            const cancelled = event.data.cancelled === true;
+            if ((!cancelled && !optionId && response === null)
+                || (cancelled && (optionId || response !== null))
+                || (optionId && response !== null)) return;
+            if (cancelled) sendInteractionResponse?.(activeTaskInteractionId, null, null, true);
+            else sendInteractionResponse?.(activeTaskInteractionId, optionId, response);
+            return;
+        }
         if (event.data?.type !== 'webchat-task-command' || event.data.taskId !== activeTaskId) return;
         const command = String(event.data.command || '');
         const escapedTaskId = activeTaskId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
         const allowed = new RegExp(`^/task (?:view|stop) ${escapedTaskId}$|^/task continue ${escapedTaskId} [\\s\\S]+$`);
-        if (!allowed.test(command)) return;
+        const declaredTaskCommand = activeTaskCommands.some((baseCommand) => (
+            command === baseCommand || command.startsWith(`${baseCommand} `)
+        ));
+        if (!allowed.test(command) && !declaredTaskCommand) return;
         sendQuickCommand?.(command);
     });
 
@@ -537,6 +598,8 @@ export function createSidePanel({
         openIframe,
         openWorkspaceFile,
         postTaskUpdate,
+        postTaskInteraction,
+        postTaskInteractionResolved,
         close,
         updateIfActive,
         refreshWorkspaceFileLinks,

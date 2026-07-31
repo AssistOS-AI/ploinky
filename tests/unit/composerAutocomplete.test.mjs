@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
+    createComposerAutocomplete,
     findTriggerAt,
     keepAutocompleteItemVisible,
     nextAutocompleteRenderCount,
@@ -75,6 +76,91 @@ test('findTriggerAt ignores trigger characters embedded in words', () => {
 test('findTriggerAt ignores trigger after a newline boundary between caret and token', () => {
     const result = findTriggerAt('@line1\n more', 11, ['@']);
     assert.equal(result, null);
+});
+
+test('disabled autocomplete loading row consumes Enter without selecting or submitting', (t) => {
+    const originalDocument = globalThis.document;
+    const originalWindow = globalThis.window;
+    const bodyChildren = [];
+    const createElement = () => {
+        const classes = new Set();
+        return {
+            children: [],
+            className: '',
+            classList: {
+                add: (name) => classes.add(name),
+                remove: (name) => classes.delete(name),
+            },
+            style: {},
+            clientHeight: 0,
+            scrollTop: 0,
+            appendChild(child) {
+                this.children.push(child);
+                this.firstChild = this.children[0] || null;
+                return child;
+            },
+            removeChild(child) {
+                this.children.splice(this.children.indexOf(child), 1);
+                this.firstChild = this.children[0] || null;
+            },
+            addEventListener() {},
+            setAttribute() {},
+            querySelector() { return null; },
+            remove() {},
+        };
+    };
+    globalThis.document = {
+        createElement,
+        body: {
+            appendChild(child) {
+                bodyChildren.push(child);
+                return child;
+            },
+        },
+    };
+    globalThis.window = { innerHeight: 800 };
+    t.after(() => {
+        globalThis.document = originalDocument;
+        globalThis.window = originalWindow;
+    });
+
+    let selected = false;
+    const cmdInput = {
+        value: '/',
+        selectionStart: 1,
+        getBoundingClientRect: () => ({ left: 10, top: 700, width: 400 }),
+        closest: () => null,
+        focus() {},
+        dispatchEvent() {},
+        setSelectionRange() {},
+    };
+    const autocomplete = createComposerAutocomplete({ cmdInput }, {
+        positionStrategy: 'viewport',
+        providers: [{
+            trigger: '/',
+            getSuggestions: () => [{
+                label: 'Loading...',
+                loadingLabel: 'Loading models…',
+                loading: true,
+                disabled: true,
+                onSelected: () => { selected = true; },
+            }],
+        }],
+    });
+    autocomplete.onInputChange();
+    let prevented = false;
+    const handled = autocomplete.handleKeydown({
+        key: 'Enter',
+        preventDefault: () => { prevented = true; },
+    });
+
+    assert.equal(bodyChildren.length, 1);
+    assert.equal(bodyChildren[0].style.display, 'block');
+    assert.equal(bodyChildren[0].children[0].children[0].className, 'wa-slash-menu-spinner');
+    assert.equal(bodyChildren[0].children[0].children[1].textContent, 'Loading...');
+    assert.equal(handled, true);
+    assert.equal(prevented, true);
+    assert.equal(selected, false);
 });
 
 test('extractMentionTokenAt returns a selected plain @ path token', () => {

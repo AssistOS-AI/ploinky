@@ -32,6 +32,8 @@
                 title="View background tasks" data-menu-action>
             Tasks <span class="wa-tasks-badge" id="tasksBadge" hidden></span>
         </button>
+        <button class="wa-session-btn wa-responsive-header-action" id="skillsBtn" type="button"
+                title="View workspace skills" data-menu-action>Skills</button>
         <button class="wa-session-btn wa-responsive-header-action" id="sessionsBtn" type="button"
                 title="View sessions" data-menu-action>Sessions</button>
         <button class="wa-icon-btn" id="settingsBtn" type="button" title="Menu" data-tooltip="Menu"
@@ -63,6 +65,23 @@
             <div class="wa-task-detail" id="taskDetail">
                 <div class="wa-task-empty">Select a task to view its log.</div>
             </div>
+        </div>
+    </section>
+</div>
+
+<div class="wa-skills-dialog-backdrop" id="skillsDialog" hidden>
+    <section class="wa-skills-dialog" role="dialog" aria-modal="true" aria-labelledby="skillsDialogTitle">
+        <div class="wa-skills-dialog-header">
+            <div class="wa-skills-dialog-heading">
+                <h2 id="skillsDialogTitle">Skills</h2>
+                <span id="skillsSummary" class="wa-skills-summary">0 skills · 0 enabled</span>
+            </div>
+            <button type="button" id="skillsDialogClose" aria-label="Close">×</button>
+        </div>
+        <div class="wa-skills-tree" id="skillsTree" role="tree"></div>
+        <div class="wa-skills-dialog-footer">
+            <span id="skillsSaveStatus" class="wa-skills-save-status" aria-live="polite">No unsaved changes</span>
+            <button type="button" id="skillsSaveBtn" class="wa-skills-save-btn" disabled>Save</button>
         </div>
     </section>
 </div>
@@ -160,6 +179,11 @@
             <strong id="interactionPromptTitle"></strong>
             <span id="interactionPromptMessage"></span>
             <code id="interactionPromptDetail"></code>
+        </div>
+        <div class="wa-interaction-input-row" id="interactionPromptInputRow" hidden>
+            <input id="interactionPromptInput" autocomplete="off"/>
+            <button type="button" id="interactionPromptSubmit">Continue</button>
+            <button type="button" id="interactionPromptCancel" class="wa-interaction-cancel">Cancel</button>
         </div>
         <div id="interactionPromptOptions" class="wa-interaction-options" role="listbox" aria-label="Available actions"></div>
     </section>

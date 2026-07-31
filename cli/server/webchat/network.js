@@ -282,7 +282,8 @@ function parseInteractionPayload(text) {
         const options = Array.isArray(payload.options)
             ? payload.options.filter((option) => option && typeof option.id === 'string' && typeof option.label === 'string')
             : [];
-        if (!id || !kind || !title || options.length === 0) return null;
+        const input = payload.input && typeof payload.input === 'object' ? payload.input : null;
+        if (!id || !kind || !title || (options.length === 0 && !input)) return null;
         return { ...payload, id, kind, title, options };
     } catch (_) {
         return null;
@@ -297,6 +298,14 @@ function parseInteractionResolutionPayload(text) {
     } catch (_) {
         return null;
     }
+}
+
+function interactionTargetsTab(interaction, tabId, pageInstanceId = '') {
+    const target = typeof interaction?.targetTabId === 'string' ? interaction.targetTabId : '';
+    const targetPage = typeof interaction?.targetPageInstanceId === 'string'
+        ? interaction.targetPageInstanceId
+        : '';
+    return (!target || target === tabId) && (!targetPage || targetPage === pageInstanceId);
 }
 
 function resolvesVisibleTaskCommand(payload, command) {
@@ -317,13 +326,15 @@ Object.assign(__testables, {
     parseRuntimeStatePayload,
     parseInteractionPayload,
     parseInteractionResolutionPayload,
+    interactionTargetsTab,
     resolvesVisibleTaskCommand,
 });
 
-export { serializeEnvelope, normalizeClientReference };
+export { serializeEnvelope, normalizeClientReference, interactionTargetsTab };
 
 export function createNetwork({
     TAB_ID,
+    PAGE_INSTANCE_ID,
     toEndpoint,
     dlog,
     showBanner,
@@ -342,6 +353,7 @@ export function createNetwork({
     addRemoteUserMessage,
     onSessionState,
     onTaskUpdate,
+    onSkillsState,
     onRuntimeState,
     onWorkspaceFiles,
     onInteractionRequest,
@@ -356,6 +368,9 @@ export function createNetwork({
     let reconnectTimer = null;
     let pendingUploads = 0;
     let assistantMessageIndex = null;
+    let pendingPageInteractionId = '';
+
+    const runtimePath = (path) => `${path}${path.includes('?') ? '&' : '?'}pageInstanceId=${encodeURIComponent(PAGE_INSTANCE_ID || '')}`;
 
     function trackUploadStart() {
         pendingUploads += 1;
@@ -452,7 +467,7 @@ export function createNetwork({
             // Ignore close failures
         }
 
-        es = new EventSource(toEndpoint(`stream?tabId=${TAB_ID}`));
+        es = new EventSource(toEndpoint(runtimePath(`stream?tabId=${encodeURIComponent(TAB_ID)}`)));
 
         es.onopen = () => {
             // Reset reconnect attempts on successful connection
@@ -577,6 +592,15 @@ export function createNetwork({
             }
         });
 
+        es.addEventListener('skills-state', (event) => {
+            try {
+                const payload = JSON.parse(event.data);
+                if (typeof onSkillsState === 'function') onSkillsState(payload);
+            } catch (error) {
+                dlog('skills state error', error);
+            }
+        });
+
         es.addEventListener('runtime-state', (event) => {
             const runtimeState = parseRuntimeStatePayload(event.data);
             if (runtimeState !== undefined && typeof onRuntimeState === 'function') {
@@ -593,6 +617,10 @@ export function createNetwork({
 
         es.addEventListener('interaction-request', (event) => {
             const interaction = parseInteractionPayload(event.data);
+            if (!interactionTargetsTab(interaction, TAB_ID, PAGE_INSTANCE_ID)) return;
+            if (interaction?.targetPageInstanceId === PAGE_INSTANCE_ID) {
+                pendingPageInteractionId = interaction.id;
+            }
             if (interaction && typeof onInteractionRequest === 'function') {
                 onInteractionRequest(interaction);
             }
@@ -600,6 +628,7 @@ export function createNetwork({
 
         es.addEventListener('interaction-resolved', (event) => {
             const resolution = parseInteractionResolutionPayload(event.data);
+            if (resolution?.id === pendingPageInteractionId) pendingPageInteractionId = '';
             if (resolution && typeof onInteractionResolved === 'function') {
                 onInteractionResolved(resolution);
             }
@@ -646,7 +675,7 @@ export function createNetwork({
 
         const send = () => fetchWithBrowserMutationProof(
             agentName,
-            toEndpoint(`input?tabId=${TAB_ID}`),
+            toEndpoint(runtimePath(`input?tabId=${encodeURIComponent(TAB_ID)}`)),
             {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
@@ -688,6 +717,17 @@ export function createNetwork({
             return false;
         }
         postEnvelope({ text: message }, { silent: true });
+        return true;
+    }
+
+    async function sendQuickCommands(commands) {
+        if (!Array.isArray(commands) || commands.length === 0
+            || commands.some((command) => typeof command !== 'string' || !command.trim())) {
+            return false;
+        }
+        for (const command of commands) {
+            await postEnvelope({ text: command }, { silent: true });
+        }
         return true;
     }
 
@@ -860,7 +900,7 @@ export function createNetwork({
     }
 
     function sendControl(controlSeq) {
-        return fetch(toEndpoint(`control?tabId=${TAB_ID}`), {
+        return fetch(toEndpoint(runtimePath(`control?tabId=${encodeURIComponent(TAB_ID)}`)), {
             method: 'POST',
             headers: { 'Content-Type': 'text/plain' },
             body: controlSeq
@@ -869,29 +909,58 @@ export function createNetwork({
         });
     }
 
-    function sendInteractionResponse(interactionId, optionId) {
-        return fetch(toEndpoint(`interaction?tabId=${TAB_ID}`), {
+    function sendInteractionResponse(interactionId, optionId = null, responseValue = null) {
+        return fetch(toEndpoint(runtimePath(`interaction?tabId=${encodeURIComponent(TAB_ID)}`)), {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ interactionId, optionId }),
+            body: JSON.stringify({
+                interactionId,
+                ...(typeof responseValue === 'string' ? { response: responseValue } : { optionId }),
+            }),
             credentials: 'include'
         }).then((response) => {
             if (!response.ok) throw new Error(`interaction_failed_${response.status}`);
             return response;
         }).catch((error) => {
             dlog('interaction response error', error);
-            showBanner('Approval response failed', 'err');
+            showBanner('Interaction response failed', 'err');
             throw error;
         });
     }
+
+    function sendInteractionCancel(interactionId, { keepalive = false, silent = false } = {}) {
+        if (!interactionId) return Promise.resolve(null);
+        return fetch(toEndpoint(runtimePath(`interaction?tabId=${encodeURIComponent(TAB_ID)}`)), {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ interactionId, cancelled: true }),
+            credentials: 'include',
+            keepalive,
+        }).then((response) => {
+            if (!response.ok) throw new Error(`interaction_cancel_failed_${response.status}`);
+            if (pendingPageInteractionId === interactionId) pendingPageInteractionId = '';
+            return response;
+        }).catch((error) => {
+            dlog('interaction cancel error', error);
+            if (!silent) showBanner('Interaction cancellation failed', 'err');
+            throw error;
+        });
+    }
+
+    globalThis.addEventListener?.('pagehide', (event) => {
+        if (event?.persisted === true || !pendingPageInteractionId) return;
+        void sendInteractionCancel(pendingPageInteractionId, { keepalive: true, silent: true }).catch(() => {});
+    });
 
     return {
         start,
         stop,
         sendCommand,
         sendQuickCommand,
+        sendQuickCommands,
         sendAttachments,
         sendControl,
-        sendInteractionResponse
+        sendInteractionResponse,
+        sendInteractionCancel
     };
 }

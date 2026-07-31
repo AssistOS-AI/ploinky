@@ -42,12 +42,14 @@ function controlledNodeFixture(root) {
     };
 }
 
-test('package metadata changes only the exact two-command bin map', () => {
+test('package metadata changes only the exact bin map and immutable postinstall', () => {
     const current = JSON.parse(fs.readFileSync(path.join(repositoryRoot, 'package.json'), 'utf8'));
     const baseline = JSON.parse(run('git', ['show', `${BASE_SHA}:package.json`]).stdout);
     const { bin: currentBin, ...currentRest } = current;
     const { bin: baselineBin, ...baselineRest } = baseline;
-    assert.deepEqual(currentRest, baselineRest);
+    const expectedRest = structuredClone(baselineRest);
+    expectedRest.scripts.postinstall = 'node ./ploinky-box/entrypoint/install-dependencies.mjs';
+    assert.deepEqual(currentRest, expectedRest);
     assert.notDeepEqual(currentBin, baselineBin);
     assert.deepEqual(currentBin, {
         ploinky: './bin/ploinky',

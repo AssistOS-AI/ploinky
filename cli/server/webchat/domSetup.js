@@ -76,8 +76,18 @@ export function initDom() {
     const interactionPromptTitle = document.getElementById('interactionPromptTitle');
     const interactionPromptMessage = document.getElementById('interactionPromptMessage');
     const interactionPromptDetail = document.getElementById('interactionPromptDetail');
+    const interactionPromptInputRow = document.getElementById('interactionPromptInputRow');
+    const interactionPromptInput = document.getElementById('interactionPromptInput');
+    const interactionPromptSubmit = document.getElementById('interactionPromptSubmit');
     const interactionPromptOptions = document.getElementById('interactionPromptOptions');
     const sessionsBtn = document.getElementById('sessionsBtn');
+    const skillsBtn = document.getElementById('skillsBtn');
+    const skillsDialog = document.getElementById('skillsDialog');
+    const skillsDialogClose = document.getElementById('skillsDialogClose');
+    const skillsTree = document.getElementById('skillsTree');
+    const skillsSaveBtn = document.getElementById('skillsSaveBtn');
+    const skillsSaveStatus = document.getElementById('skillsSaveStatus');
+    const skillsSummary = document.getElementById('skillsSummary');
     const historyGate = document.getElementById('historyGate');
     const loadHistoryBtn = document.getElementById('loadHistoryBtn');
     const sessionDialog = document.getElementById('sessionDialog');
@@ -113,6 +123,7 @@ export function initDom() {
         TAB_ID = crypto.randomUUID();
         try { sessionStorage.setItem(tabStorageKey, TAB_ID); } catch (_) { }
     }
+    const PAGE_INSTANCE_ID = crypto.randomUUID();
 
     const launchConfig = {};
     try {
@@ -248,6 +259,7 @@ export function initDom() {
 
     return {
         TAB_ID,
+        PAGE_INSTANCE_ID,
         dlog,
         markdown,
         basePath,
@@ -303,9 +315,20 @@ export function initDom() {
             interactionPromptTitle,
             interactionPromptMessage,
             interactionPromptDetail,
+            interactionPromptInputRow,
+            interactionPromptInput,
+            interactionPromptSubmit,
+            interactionPromptCancel: document.getElementById('interactionPromptCancel'),
             interactionPromptOptions,
             attachmentContainer,
             sessionsBtn,
+            skillsBtn,
+            skillsDialog,
+            skillsDialogClose,
+            skillsTree,
+            skillsSaveBtn,
+            skillsSaveStatus,
+            skillsSummary,
             historyGate,
             loadHistoryBtn,
             sessionDialog,

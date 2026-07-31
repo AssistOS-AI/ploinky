@@ -66,6 +66,7 @@ test('serializeWebchatEnvelopeForAgent does not name a concrete downstream agent
     const payload = JSON.parse(text);
     assert.equal(payload.__webchatMessage, 1);
     assert.equal(payload.text, '@example-task hello');
+    assert.equal(payload.sourceTabId, 'tab-1');
     assert.deepEqual(payload.attachments, [{
         id: null,
         filename: 'note.md',
@@ -96,6 +97,18 @@ test('serializeWebchatEnvelopeForAgent leaves history ownership to AchillesCLI',
     assert.equal(payload.text, 'Current question');
     assert.equal(payload.history, undefined);
     assert.doesNotMatch(JSON.stringify(payload), /Ploinky conversation context|New user message/);
+});
+
+test('serializeWebchatEnvelopeForAgent binds task interactions to the current page instance', () => {
+    const payload = JSON.parse(serializeWebchatEnvelopeForAgent({
+        req: { headers: { host: 'localhost' }, socket: {} },
+        effectiveConfig: { agentName: 'achilles-cli' },
+        tabId: 'tab_origin',
+        pageInstanceId: 'page_origin',
+        envelope: { text: '/task login task_111111111111111111111111' },
+    }));
+    assert.equal(payload.sourceTabId, 'tab_origin');
+    assert.equal(payload.sourcePageInstanceId, 'page_origin');
 });
 
 test('serializeWebchatEnvelopeForAgent prefers forwarded public origin headers', () => {

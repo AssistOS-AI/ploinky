@@ -9,11 +9,14 @@ import {
     buildRuntimeKey,
     parseWebchatRuntimeState,
     parseWebchatSessionState,
+    parseWebchatSkillsState,
     parseWebchatWorkspaceFilesState,
     routeWorkspaceRuntimeOutput,
     serializeRuntimeStateSseEvent,
     serializeSessionStateSseEvent,
+    serializeSkillsStateSseEvent,
     serializeTaskListSseEvent,
+    serializeTaskUpdateSseEvents,
     serializeWorkspaceFilesSseEvent,
 } from '../../cli/server/handlers/webchat/runtimeState.js';
 import { handleRuntimeRoute } from '../../cli/server/handlers/webchat/runtimeRoutes.js';
@@ -50,6 +53,62 @@ test('runtime state contains only the selected model', () => {
     assert.equal(parseWebchatRuntimeState({ __webchatRuntimeState: 1, version: 1, model: 42 }), undefined);
     assert.equal(serializeRuntimeStateSseEvent({ model: 'deep' }), 'event: runtime-state\ndata: {"model":"deep"}\n\n');
     assert.deepEqual(networkTestables.parseRuntimeStatePayload('{"model":"deep"}'), { model: 'deep' });
+});
+
+test('skill envelopes expose only validated workspace-relative catalog state', () => {
+    const envelope = {
+        __webchatSkills: 1,
+        version: 1,
+        event: 'changed',
+        operation: { scope: 'directory', action: 'disable', target: 'packages/tools' },
+        skills: [{
+            name: 'alpha-cskill',
+            displayName: 'alpha',
+            relativePath: 'packages/tools/alpha',
+            type: 'cskill',
+            enabled: false,
+        }],
+    };
+    assert.deepEqual(parseWebchatSkillsState(envelope), {
+        event: 'changed',
+        operation: envelope.operation,
+        skills: envelope.skills,
+    });
+    assert.match(serializeSkillsStateSseEvent(parseWebchatSkillsState(envelope)), /event: skills-state/);
+    assert.equal(parseWebchatSkillsState({
+        ...envelope,
+        skills: [{ ...envelope.skills[0], relativePath: '../outside' }],
+    }), undefined);
+    assert.equal(parseWebchatSkillsState({
+        ...envelope,
+        skills: [{ ...envelope.skills[0], type: 'anthropic' }],
+    }), undefined);
+    assert.equal(parseWebchatSkillsState({
+        ...envelope,
+        operation: { ...envelope.operation, target: '../outside' },
+    }), undefined);
+    assert.equal(parseWebchatSkillsState({
+        ...envelope,
+        operation: { scope: 'skill', action: 'enable', target: 'not a canonical name' },
+    }), undefined);
+});
+
+test('skill state is intercepted, cached, and omitted from ordinary output', () => {
+    const writes = [];
+    const tab = {
+        subscribers: new Map([['client', { res: { write: (value) => writes.push(value) } }]]),
+        taskProtocolBuffer: '',
+    };
+    const appState = { runtimes: new Map([['runtime', tab]]) };
+    routeWorkspaceRuntimeOutput(appState, tab, `${JSON.stringify({
+        __webchatSkills: 1,
+        version: 1,
+        event: 'list',
+        skills: [{ name: 'alpha-cskill', displayName: 'alpha', relativePath: 'skills/alpha', type: 'cskill', enabled: true }],
+    })}\n`);
+    assert.equal(tab.webchatSkillsSnapshot.skills[0].name, 'alpha-cskill');
+    assert.match(writes.join(''), /event: skills-state/);
+    assert.doesNotMatch(writes.join(''), /__webchatSkills/);
 });
 
 test('AchillesCLI session envelopes become in-memory SSE state without disk writes', (t) => {
@@ -167,6 +226,10 @@ test('an EventSource reconnect receives the in-memory session snapshot', (t) => 
             description: 'Cached task',
             status: 'ongoing',
         }]]),
+        webchatSkillsSnapshot: {
+            event: 'list',
+            skills: [{ name: 'alpha-cskill', displayName: 'alpha', relativePath: 'skills/alpha', type: 'cskill', enabled: true }],
+        },
     };
     const sid = 'browser-session';
     const appState = {
@@ -192,6 +255,7 @@ test('an EventSource reconnect receives the in-memory session snapshot', (t) => 
     assert.match(writes.join(''), /event: task-update/);
     assert.match(writes.join(''), /Cached task/);
     assert.match(writes.join(''), /event: workspace-files/);
+    assert.match(writes.join(''), /event: skills-state/);
     assert.match(writes.join(''), /reports\/final\.md/);
     assert.match(writes.join(''), new RegExp(SESSION_ID));
     req.emit('close');
@@ -213,6 +277,33 @@ test('task list snapshots are revalidated before SSE serialization', () => {
     assert.match(serialized, /Safe task/);
     assert.doesNotMatch(serialized, /credential/);
     assert.equal(serializeTaskListSseEvent(new Map()), '');
+});
+
+test('large task log snapshots are split into bounded ordered SSE events', () => {
+    const text = `${'a'.repeat(150_000)}final`;
+    const events = serializeTaskUpdateSseEvents({
+        event: 'view',
+        task: {
+            id: 'task_1234567890abcdef12345678',
+            targetAgent: 'codexAgent',
+            status: 'finished',
+        },
+        log: { text, nextOffset: text.length, reset: false },
+    }, 64 * 1024);
+    const payloads = events.map((event) => JSON.parse(event.match(/data: (.*)\n\n$/s)[1]));
+
+    assert.equal(payloads[0].event, 'view');
+    assert.equal(payloads[0].log.text, '');
+    assert.equal(payloads[0].logChunk.phase, 'start');
+    assert.ok(events.every((event) => event.length < 70 * 1024));
+    assert.equal(
+        payloads.slice(1).map((payload) => payload.logChunk.text).join(''),
+        text,
+    );
+    assert.deepEqual(
+        payloads.slice(1).map((payload) => payload.logChunk.index),
+        [0, 1, 2],
+    );
 });
 
 test('a failed runtime write is rejected and the zombie runtime is removed', async () => {
@@ -372,6 +463,74 @@ test('an EventSource reconnect replaces a runtime whose TTY is not alive', () =>
     req.emit('close');
     const replacement = appState.runtimes.get(runtimeKey);
     if (replacement?.cleanupTimer) clearTimeout(replacement.cleanupTimer);
+});
+
+test('a CLI child close invalidates its runtime before EventSource reconnect', () => {
+    const workspaceDirectory = '/workspace';
+    const closeHandlers = [];
+    const disposedPids = [];
+    let createCount = 0;
+    const effectiveConfig = {
+        agentName: 'demo-agent',
+        ttyFactory: {
+            create() {
+                createCount += 1;
+                const pid = 300 + createCount;
+                return {
+                    pid,
+                    isAlive: () => true,
+                    onOutput() {},
+                    onClose(handler) { closeHandlers.push(handler); },
+                    dispose() { disposedPids.push(pid); },
+                    write: () => true,
+                };
+            },
+        },
+    };
+    const runtimeKey = buildRuntimeKey(workspaceDirectory, effectiveConfig, '');
+    const sid = 'browser-session';
+    const appState = {
+        runtimes: new Map(),
+        sessions: new Map([[sid, { tabs: new Map() }]]),
+    };
+
+    const connect = (tabId) => {
+        const req = new EventEmitter();
+        req.headers = { cookie: `webchat_sid=${sid}` };
+        const writes = [];
+        let ended = 0;
+        const res = {
+            writeHead(status) { assert.equal(status, 200); },
+            write(value) { writes.push(value); },
+            end() { ended += 1; },
+        };
+        handleRuntimeRoute({
+            pathname: '/stream', req, res,
+            parsedUrl: new URL(`http://localhost/stream?tabId=${tabId}`),
+            appState, workspaceDirectory, effectiveConfig, agentQuery: '',
+        });
+        return { req, writes, get ended() { return ended; } };
+    };
+
+    const firstConnection = connect('tab-1');
+    const firstRuntime = appState.runtimes.get(runtimeKey);
+    assert.equal(createCount, 1);
+    assert.equal(Object.hasOwn(firstRuntime, 'pid'), false);
+
+    closeHandlers[0]();
+
+    assert.equal(appState.runtimes.has(runtimeKey), false);
+    assert.match(firstConnection.writes.join(''), /event: close/);
+    assert.equal(firstConnection.ended, 1);
+    assert.deepEqual(disposedPids, [301]);
+
+    const secondConnection = connect('tab-1');
+    const secondRuntime = appState.runtimes.get(runtimeKey);
+    assert.equal(createCount, 2);
+    assert.notEqual(secondRuntime, firstRuntime);
+
+    secondConnection.req.emit('close');
+    if (secondRuntime?.cleanupTimer) clearTimeout(secondRuntime.cleanupTimer);
 });
 
 test('WebChat renders generic runtime model state beside the agent title', () => {

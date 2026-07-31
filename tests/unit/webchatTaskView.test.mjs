@@ -60,6 +60,110 @@ test('side panel forwards only the active task update to its same-origin iframe'
     assert.equal(posted[0].message.payload.task.id, taskId);
 });
 
+test('side panel forwards task commands declared by AchillesCLI and rejects undeclared commands', (t) => {
+    const originalDocument = globalThis.document;
+    const originalWindow = globalThis.window;
+    const originalSetTimeout = globalThis.setTimeout;
+    const commands = [];
+    const posted = [];
+    const interactionResponses = [];
+    let messageHandler = null;
+    const makeElement = (tagName = 'div') => ({
+        children: [],
+        className: '',
+        dataset: {},
+        style: {},
+        contentWindow: tagName === 'iframe' ? { postMessage(message) { posted.push(message); } } : null,
+        appendChild(child) { this.children.push(child); return child; },
+        addEventListener() {},
+    });
+    const panelWrapper = makeElement();
+    const sidePanel = makeElement();
+    sidePanel.querySelector = () => panelWrapper;
+    const chatContainer = makeElement();
+    chatContainer.classList = { add() {}, remove() {} };
+    globalThis.document = { createElement: (tagName) => makeElement(tagName) };
+    globalThis.window = {
+        location: { origin: 'http://localhost:8080' },
+        addEventListener(type, listener) {
+            if (type === 'message') messageHandler = listener;
+        },
+    };
+    globalThis.setTimeout = () => 0;
+    t.after(() => {
+        globalThis.document = originalDocument;
+        globalThis.window = originalWindow;
+        globalThis.setTimeout = originalSetTimeout;
+    });
+
+    const api = createSidePanel({
+        chatContainer,
+        chatArea: null,
+        sidePanel,
+        sidePanelContent: null,
+        sidePanelClose: null,
+        sidePanelTitle: null,
+        sidePanelResizer: null,
+    }, {
+        markdown: null,
+        sendQuickCommand: (command) => commands.push(command),
+        sendInteractionResponse: (...args) => interactionResponses.push(args),
+    });
+    const taskId = 'task_1234567890abcdef12345678';
+    const frame = api.openIframe(`http://localhost:8080/webchat/tasks/${taskId}/view`, { taskId });
+    api.postTaskUpdate({
+        task: {
+            id: taskId,
+            commands: [{ name: '/model', command: `/task model ${taskId}` }],
+        },
+    });
+    const send = (command) => messageHandler({
+        origin: 'http://localhost:8080',
+        source: frame.contentWindow,
+        data: { type: 'webchat-task-command', taskId, command },
+    });
+    send(`/task login ${taskId}`);
+    send(`/task model ${taskId}`);
+
+    assert.deepEqual(commands, [`/task model ${taskId}`]);
+    assert.equal(api.postTaskInteraction({
+        id: 'task_control_12345678',
+        targetTaskId: taskId,
+        options: [{ id: 'choice_0', label: 'GPT Test' }],
+    }), true);
+    assert.equal(posted.at(-1).type, 'webchat-task-interaction-request');
+    messageHandler({
+        origin: 'http://localhost:8080',
+        source: frame.contentWindow,
+        data: {
+            type: 'webchat-task-interaction-response',
+            taskId,
+            interactionId: 'task_control_12345678',
+            optionId: 'choice_0',
+        },
+    });
+    assert.equal(api.postTaskInteraction({
+        id: 'task_control_87654321',
+        targetTaskId: taskId,
+        options: [],
+        input: { type: 'secret', maxLength: 1024 },
+    }), true);
+    messageHandler({
+        origin: 'http://localhost:8080',
+        source: frame.contentWindow,
+        data: {
+            type: 'webchat-task-interaction-response',
+            taskId,
+            interactionId: 'task_control_87654321',
+            cancelled: true,
+        },
+    });
+    assert.deepEqual(interactionResponses, [
+        ['task_control_12345678', 'choice_0', null],
+        ['task_control_87654321', null, null, true],
+    ]);
+});
+
 test('opening the same active task view reuses its iframe and preserves its log state', (t) => {
     const originalDocument = globalThis.document;
     const originalWindow = globalThis.window;
@@ -193,6 +297,7 @@ test('task view renders a complete terminal log snapshot without waiting for ano
     const originalSetInterval = globalThis.setInterval;
     const listeners = new Map();
     const elements = new Map();
+    const commands = [];
     const makeElement = () => ({
         children: [],
         className: '',
@@ -221,6 +326,7 @@ test('task view renders a complete terminal log snapshot without waiting for ano
     });
     for (const id of [
         'taskAgent',
+        'taskModel',
         'taskDescription',
         'taskStatus',
         'taskDuration',
@@ -235,7 +341,11 @@ test('task view renders a complete terminal log snapshot without waiting for ano
     ]) {
         elements.set(id, makeElement());
     }
-    const parent = {};
+    const parent = {
+        postMessage(message) {
+            commands.push(message.command);
+        },
+    };
     globalThis.window = {
         location: {
             pathname: '/webchat/tasks/task_1234567890abcdef12345678/view',
@@ -273,7 +383,7 @@ test('task view renders a complete terminal log snapshot without waiting for ano
                     id: 'task_1234567890abcdef12345678',
                     targetAgent: 'opencodeAgent',
                     description: 'Finished task',
-                    status: 'finished',
+                    status: 'ongoing',
                 },
                 log: {
                     text: 'historical line\nfinal answer\n',
@@ -283,10 +393,80 @@ test('task view renders a complete terminal log snapshot without waiting for ano
         },
     });
 
+    assert.equal(elements.get('taskAgent').textContent, 'opencodeAgent');
+    assert.equal(elements.get('taskModel').textContent, 'default');
+    assert.equal(elements.get('taskDescription').textContent, 'Finished task');
     assert.deepEqual(
         elements.get('taskLog').children.map((child) => child.textContent),
         ['historical line', 'final answer', '\u00a0'],
     );
+    assert.match(elements.get('taskLog').children[1].className, /is-intermediate/);
+
+    listeners.get('message')?.({
+        origin: 'http://localhost:8080',
+        source: parent,
+        data: {
+            type: 'webchat-task-update',
+            payload: {
+                event: 'update',
+                task: {
+                    id: 'task_1234567890abcdef12345678',
+                    targetAgent: 'piAgent',
+                    description: 'Finished task',
+                    status: 'finished',
+                    execution: {
+                        model: {
+                            key: 'anthropic/claude-sonnet-4',
+                            model: 'claude-sonnet-4',
+                            label: 'Claude Sonnet 4',
+                        },
+                    },
+                    turn: 1,
+                    finalOutputRanges: [{ turn: 1, offset: 16, length: 12 }],
+                },
+            },
+        },
+    });
+
+    assert.equal(elements.get('taskAgent').textContent, 'piAgent');
+    assert.equal(elements.get('taskModel').textContent, 'Claude Sonnet 4');
+    assert.equal(elements.get('taskDescription').textContent, 'Finished task');
+    assert.match(elements.get('taskLog').children[1].className, /is-final/);
+
+    const chunkedTask = {
+        id: 'task_1234567890abcdef12345678',
+        targetAgent: 'piAgent',
+        description: 'Finished task',
+        status: 'finished',
+    };
+    const sendTaskPayload = (payload) => listeners.get('message')?.({
+        origin: 'http://localhost:8080',
+        source: parent,
+        data: { type: 'webchat-task-update', payload },
+    });
+    sendTaskPayload({
+        event: 'view',
+        task: chunkedTask,
+        log: { text: '', nextOffset: 24, reset: true },
+        logChunk: { phase: 'start', count: 2, nextOffset: 24 },
+    });
+    sendTaskPayload({
+        event: 'view-log-chunk',
+        task: chunkedTask,
+        logChunk: { phase: 'chunk', index: 0, count: 2, text: 'chunked historical\n', nextOffset: 24 },
+    });
+    assert.notEqual(elements.get('taskLog').children[0].textContent, 'chunked historical');
+    sendTaskPayload({
+        event: 'view-log-chunk',
+        task: chunkedTask,
+        logChunk: { phase: 'chunk', index: 1, count: 2, text: 'done\n', nextOffset: 24 },
+    });
+    assert.deepEqual(
+        elements.get('taskLog').children.map((child) => child.textContent),
+        ['chunked historical', 'done', '\u00a0'],
+    );
+    await Promise.resolve();
+    assert.deepEqual(commands, ['/task view task_1234567890abcdef12345678']);
 });
 
 test('task view sends continuation through the AchillesCLI command bridge', () => {
@@ -299,10 +479,17 @@ test('task view sends continuation through the AchillesCLI command bridge', () =
         'utf8',
     );
     assert.match(html, /id="taskContinuationInput"/);
+    assert.ok(html.indexOf('id="taskAgent"') < html.indexOf('id="taskModel"'));
+    assert.ok(html.indexOf('id="taskModel"') < html.indexOf('id="taskDescription"'));
     assert.match(source, /`\/task continue \$\{taskId\} \$\{message\}`/);
     assert.match(source, /TERMINAL_STATUSES = new Set\(\['finished', 'stopped', 'error'\]\)/);
     assert.match(source, /TERMINAL_STATUSES\.has\(task\?\.status\)/);
     assert.match(source, /applyUpdate\(payload\)/);
+    assert.match(source, /task\?\.commands/);
+    assert.match(source, /requestCommand\(`\$\{taskCommand\.command\}/);
+    assert.match(source, /if \(taskCommand\) \{[\s\S]*?await startTaskCommand\(taskCommand, suffix\);[\s\S]*?return;[\s\S]*?\}/);
+    assert.doesNotMatch(source, /taskControlClient|set_model|login_start/);
+    assert.doesNotMatch(source, /Task model set to/);
     assert.match(source, /let logResyncPending = false/);
     assert.match(source, /if \(!logResyncPending\)/);
     assert.match(source, /if \(!transport\.embedded\) void syncLog\(\)\.catch\(showLoadError\)/);
