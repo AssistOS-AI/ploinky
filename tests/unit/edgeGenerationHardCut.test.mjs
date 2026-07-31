@@ -761,6 +761,40 @@ test('prepared Router attestation remains inactive and binds exact lease, owner,
     );
 });
 
+test('later startup waves retain the prepared attestation across runtime-only locator updates', (t) => {
+    const fixture = createFixture(t);
+    const prepared = prepareEdgeRoutingGeneration({
+        workspaceRoot: fixture.workspace,
+        reason: 'prepared-attestation-runtime-locators',
+    });
+    const routingFile = path.join(fixture.ploinkyDir, 'routing.json');
+    const routing = JSON.parse(fs.readFileSync(routingFile, 'utf8'));
+    routing.routes.beta.hostPort = 43999;
+    fs.writeFileSync(routingFile, JSON.stringify(routing, null, 2));
+    const agentsFile = path.join(fixture.ploinkyDir, 'agents.json');
+    const agents = JSON.parse(fs.readFileSync(agentsFile, 'utf8'));
+    agents['beta-container'].runtime = 'podman';
+    agents['beta-container'].containerId = 'beta-runtime-id';
+    fs.writeFileSync(agentsFile, JSON.stringify(agents, null, 2));
+
+    const lease = createRouterAttestationGenerationLease({
+        workspaceRoot: fixture.workspace,
+        preparationLease: prepared.preparationLease,
+        expectedOwner: {
+            containerName: 'alpha-container',
+            principal: 'agent:fixtures/alpha',
+            instanceId: 'alpha-instance',
+            enableGeneration: 'alpha-enable-generation',
+        },
+    });
+    assert.equal(lease.id, prepared.selector.generation);
+    assert.equal(lease.commit(), true);
+    assert.equal(lease.checkpoint('pre-credentials'), true);
+    assert.equal(lease.checkpoint('pre-runtime'), true);
+    assert.equal(lease.checkpoint('post-inspection'), true);
+    assert.equal(lease.complete, true);
+});
+
 test('a registered authority observation classifies only its exact selected inactive generation', (t) => {
     const fixture = createFixture(t);
     const prepared = prepareEdgeRoutingGeneration({

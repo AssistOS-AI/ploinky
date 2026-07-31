@@ -149,7 +149,11 @@ live registered nonce may capture an observation lease for the exact selected
 inactive generation. An unregistered request, a different generation, any
 other method or path, an expired nonce, or an inactive ordinary Router request
 continues to fail closed. This narrow observation path classifies the prepared
-snapshot without activating it or widening normal routing.
+snapshot without activating it or widening normal routing. Later blocking
+waves remain bound to that same prepared generation after earlier waves record
+runtime-only container IDs and route locators; those fields are excluded from
+the lifecycle binding, while any owner, policy, desired-state, manifest, or
+other lifecycle mutation still invalidates the lease.
 
 Container reuse proves the exact hosts arguments, attachments, aliases, labels,
 versioned network-contract hash, and immutable `instanceId` plus

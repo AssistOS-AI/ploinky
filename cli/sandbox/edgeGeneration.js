@@ -2320,8 +2320,7 @@ function preparedRouterAttestationSnapshot(paths, preparationLease, expectedOwne
     assertPreparedSelectorStillSelected(paths, current);
     const generation = loadGenerationById(paths, current.preparedGeneration);
     const captured = collectCapturedSources(paths);
-    if (captured.generation !== current.preparedGeneration
-        || lifecycleBindingDigest(captured) !== current.lifecycleBindingDigest) {
+    if (lifecycleBindingDigest(captured) !== current.lifecycleBindingDigest) {
         throw edgeError(
             'prepared Router attestation lifecycle sources changed before its checkpoint',
             'EDGE_PREPARATION_SOURCE_CHANGED',
