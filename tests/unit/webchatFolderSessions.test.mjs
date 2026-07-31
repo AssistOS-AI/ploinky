@@ -89,9 +89,11 @@ test('task control events resolve visible WebChat commands without waiting for c
 test('a visible /tasks command clears Thinking and identifies its list response', async () => {
     const previousEventSource = globalThis.EventSource;
     const previousFetch = globalThis.fetch;
+    const previousLocation = globalThis.location;
     let eventSource;
     const hidden = [];
     const updates = [];
+    const mutations = [];
 
     class FakeEventSource {
         constructor() {
@@ -111,17 +113,35 @@ test('a visible /tasks command clears Thinking and identifies its list response'
     }
 
     globalThis.EventSource = FakeEventSource;
-    globalThis.fetch = async () => ({ ok: true, status: 200 });
+    globalThis.location = {
+        href: 'https://explorer.example/webchat?agent=achilles-cli',
+        origin: 'https://explorer.example',
+    };
+    globalThis.fetch = async (input, options = {}) => {
+        const url = new URL(input, globalThis.location.href);
+        if (url.pathname === '/auth/token') {
+            return Response.json({
+                ok: true,
+                browserMutation: {
+                    origin: globalThis.location.origin,
+                    routeKey: 'achilles-cli',
+                    csrfToken: 'route-proof',
+                },
+            });
+        }
+        mutations.push({ url, options });
+        return new Response(null, { status: 204 });
+    };
     try {
         const network = createNetwork({
             TAB_ID: 'tab-1',
-            toEndpoint: (route) => route,
+            toEndpoint: (route) => `/webchat/${route}`,
             dlog: () => {},
             showBanner: () => {},
             hideBanner: () => {},
             statusEl: null,
             statusDot: null,
-            agentName: 'AchillesCLI',
+            agentName: 'achilles-cli',
         }, {
             addClientMsg: () => {},
             addServerMsg: () => true,
@@ -134,14 +154,23 @@ test('a visible /tasks command clears Thinking and identifies its list response'
         network.start();
         network.sendCommand('/tasks');
         eventSource.emit('task-update', { event: 'list', tasks: [] });
+        await new Promise((resolve) => setImmediate(resolve));
 
         assert.deepEqual(hidden, [true]);
         assert.equal(updates.length, 1);
         assert.equal(updates[0].metadata.visibleCommand, '/tasks');
+        assert.equal(mutations.length, 1);
+        assert.equal(mutations[0].url.pathname, '/webchat/input');
+        assert.equal(
+            mutations[0].options.headers.get('x-ploinky-browser-csrf-token'),
+            'route-proof',
+        );
         network.stop();
     } finally {
         globalThis.EventSource = previousEventSource;
         globalThis.fetch = previousFetch;
+        if (previousLocation === undefined) delete globalThis.location;
+        else globalThis.location = previousLocation;
     }
 });
 

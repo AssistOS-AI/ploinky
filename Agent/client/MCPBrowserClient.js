@@ -195,7 +195,6 @@ function createAgentClient(baseUrl, options = {}) {
     let streamUnsupported = disableSseProbe;
     let connectPromise = null;
     let messageId = 0;
-    let browserMutationToken = '';
     let browserMutationProofPromise = null;
     const requestControllers = new Set();
 
@@ -240,7 +239,6 @@ function createAgentClient(baseUrl, options = {}) {
 
     async function loadBrowserMutationProof({ refresh = false } = {}) {
         if (!browserAgentRouteKey) return '';
-        if (!refresh && browserMutationToken) return browserMutationToken;
         if (!refresh && browserMutationProofPromise) return browserMutationProofPromise;
 
         browserMutationProofPromise = (async () => {
@@ -264,8 +262,7 @@ function createAgentClient(baseUrl, options = {}) {
                 const detail = payload?.error || `HTTP ${response.status}`;
                 throw new Error(`Browser mutation proof failed: ${detail}`);
             }
-            browserMutationToken = proof.csrfToken;
-            return browserMutationToken;
+            return proof.csrfToken;
         })();
 
         try {
@@ -300,7 +297,6 @@ function createAgentClient(baseUrl, options = {}) {
 
         let response = await request(false);
         if (await isBrowserMutationProofRejection(response)) {
-            browserMutationToken = '';
             response = await request(true);
         }
         return response;

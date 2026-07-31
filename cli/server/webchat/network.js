@@ -2,8 +2,116 @@ const PROCESS_PREFIX_RE = /^(?:\s*\.+\s*){3,}/;
 const ENVELOPE_FLAG = '__webchatMessage';
 const PROGRESS_FLAG = '__webchatProgress';
 const ENVELOPE_VERSION = 1;
+const BROWSER_CSRF_HEADER = 'x-ploinky-browser-csrf-token';
+const BROWSER_MUTATION_RETRY_ERRORS = new Set([
+    'browser_csrf_invalid',
+    'edge_generation_changed',
+]);
+const BROWSER_MUTATION_RETRY_DELAYS_MS = Object.freeze([
+    100,
+    250,
+    500,
+    1000,
+    1500,
+    2000,
+    2500,
+    3000,
+    3000,
+]);
 
 export const __testables = {};
+
+function waitForRetry(delayMs) {
+    return new Promise((resolve) => setTimeout(resolve, delayMs));
+}
+
+function browserMutationError(message, code = '') {
+    const error = new Error(message);
+    error.code = String(code || '').toLowerCase();
+    return error;
+}
+
+async function loadBrowserMutationProof(agentName, {
+    fetchImpl = globalThis.fetch,
+    locationRef = globalThis.location,
+} = {}) {
+    const routeKey = String(agentName || '').trim();
+    if (!routeKey) throw browserMutationError('agent route key is required');
+    if (typeof fetchImpl !== 'function') {
+        throw browserMutationError('browser mutation proof transport is unavailable');
+    }
+    const proofUrl = new URL('/auth/token', locationRef?.href || locationRef?.origin);
+    proofUrl.searchParams.set('agent', routeKey);
+    const response = await fetchImpl(proofUrl.toString(), {
+        method: 'GET',
+        credentials: 'include',
+        cache: 'no-store',
+        headers: { accept: 'application/json' },
+    });
+    const payload = await response.json().catch(() => ({}));
+    const failureCode = String(payload?.error || '').toLowerCase();
+    if (!response.ok) {
+        throw browserMutationError(
+            `browser mutation proof unavailable for ${routeKey}`,
+            failureCode,
+        );
+    }
+    const proof = payload?.browserMutation;
+    if (!proof?.csrfToken
+        || proof.routeKey !== routeKey
+        || proof.origin !== locationRef?.origin) {
+        throw browserMutationError(`browser mutation proof unavailable for ${routeKey}`);
+    }
+    return proof.csrfToken;
+}
+
+async function readMutationFailureCode(response) {
+    if (![403, 503].includes(response?.status)) return '';
+    const payload = await response.clone().json().catch(() => null);
+    return String(payload?.error || '').toLowerCase();
+}
+
+export async function fetchWithBrowserMutationProof(
+    agentName,
+    endpoint,
+    options = {},
+    {
+        fetchImpl = globalThis.fetch,
+        locationRef = globalThis.location,
+        wait = waitForRetry,
+        retryDelays = BROWSER_MUTATION_RETRY_DELAYS_MS,
+    } = {},
+) {
+    const delays = Array.isArray(retryDelays) ? retryDelays : [];
+    for (let attempt = 0; attempt <= delays.length; attempt += 1) {
+        if (attempt > 0) await wait(delays[attempt - 1]);
+        let csrfToken;
+        try {
+            csrfToken = await loadBrowserMutationProof(agentName, {
+                fetchImpl,
+                locationRef,
+            });
+        } catch (error) {
+            if (attempt < delays.length && BROWSER_MUTATION_RETRY_ERRORS.has(error?.code)) {
+                continue;
+            }
+            throw error;
+        }
+        const headers = new Headers(options.headers || {});
+        headers.set(BROWSER_CSRF_HEADER, csrfToken);
+        const response = await fetchImpl(endpoint, {
+            ...options,
+            headers,
+            credentials: 'include',
+        });
+        const failureCode = await readMutationFailureCode(response);
+        if (attempt < delays.length && BROWSER_MUTATION_RETRY_ERRORS.has(failureCode)) {
+            continue;
+        }
+        return response;
+    }
+    throw browserMutationError('browser mutation request exhausted its retry budget');
+}
 
 export function buildAttachmentUploadHeaders({ file, relativePath, destinationPath, overwrite } = {}) {
     const mime = file?.type || 'application/octet-stream';
@@ -536,12 +644,15 @@ export function createNetwork({
 
         if (!silent) markUserInputSent();
 
-        const send = () => fetch(toEndpoint(`input?tabId=${TAB_ID}`), {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: `${serialized}\n`,
-            credentials: 'include'
-        });
+        const send = () => fetchWithBrowserMutationProof(
+            agentName,
+            toEndpoint(`input?tabId=${TAB_ID}`),
+            {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: `${serialized}\n`,
+            },
+        );
         return send().then((response) => {
             if (response.status === 409) {
                 return new Promise((resolve) => setTimeout(resolve, 250)).then(send);

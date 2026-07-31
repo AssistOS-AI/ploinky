@@ -189,6 +189,26 @@ function resolveAuthRouteKey(parsedUrl, options = {}) {
     return staticAgent || null;
 }
 
+function bindWebchatSurfaceServiceRoute(parsedUrl, authContext, options = {}) {
+    const parts = String(parsedUrl.pathname || '/').split('/').filter(Boolean);
+    const explicitRouteKey = String(parsedUrl.searchParams.get('agent') || '').trim();
+    if (parts[0] !== 'webchat'
+        || !explicitRouteKey
+        || !authContext?.routeKey
+        || authContext.routeKey === explicitRouteKey) {
+        return authContext;
+    }
+    const authRouteKey = resolveSurfaceAuthRouteKey(
+        'webchat',
+        explicitRouteKey,
+        readRouting(options),
+        options,
+    );
+    return authRouteKey === authContext.routeKey
+        ? { ...authContext, serviceRouteKey: explicitRouteKey }
+        : authContext;
+}
+
 function resolveAuthContext(parsedUrl, options = {}) {
     const routeKey = resolveAuthRouteKey(parsedUrl, options);
     if (!routeKey) {
@@ -198,7 +218,8 @@ function resolveAuthContext(parsedUrl, options = {}) {
     const record = resolved?.record || null;
     const policy = record?.auth || { mode: 'none' };
     const mode = String(policy.mode || 'none').trim().toLowerCase() || 'none';
-    return { routeKey, mode, policy, record };
+    const context = { routeKey, mode, policy, record };
+    return bindWebchatSurfaceServiceRoute(parsedUrl, context, options);
 }
 
 function resolveAuthContextForRouteKey(routeKey, options = {}) {
@@ -394,12 +415,12 @@ export function resolveAuthContextForRoutePlan(parsedUrl, routePlan, { browserAu
             });
             if (guestContext) return guestContext;
         }
-        return {
+        return bindWebchatSurfaceServiceRoute(parsedUrl, {
             ...resolveAuthenticatedRouteAuthContext(selectedRouteKey, { snapshot }),
             boundHostRouteKey: selectedRouteKey,
             boundGeneration: String(routePlan?.lease?.id || snapshot?.generation || ''),
             ...(mutationRouteKey ? { serviceRouteKey: mutationRouteKey } : {}),
-        };
+        }, { snapshot });
     }
     if (browserAuth) {
         const proofContext = resolveControlBrowserProofAuthContext(parsedUrl, { snapshot });
@@ -408,18 +429,34 @@ export function resolveAuthContextForRoutePlan(parsedUrl, routePlan, { browserAu
 
     const decision = routePlan?.decision;
     if (decision?.access === 'guest') {
-        return resolveGuestRouteAuthContext(decision.routeKey, decision, parsedUrl);
+        return bindWebchatSurfaceServiceRoute(
+            parsedUrl,
+            resolveGuestRouteAuthContext(decision.routeKey, decision, parsedUrl),
+            { snapshot },
+        );
     }
     if (decision?.access === 'authenticated') {
-        return resolveAuthenticatedRouteAuthContext(decision.routeKey, { snapshot });
+        return bindWebchatSurfaceServiceRoute(
+            parsedUrl,
+            resolveAuthenticatedRouteAuthContext(decision.routeKey, { snapshot }),
+            { snapshot },
+        );
     }
     if (selectedRouteKey && routePlan?.kind === 'agent-root') {
         const routeDefault = snapshot?.compiled?.policy?.routeDefaults?.[selectedRouteKey];
         if (routeDefault?.access === 'authenticated') {
-            return resolveAuthenticatedRouteAuthContext(selectedRouteKey, { snapshot });
+            return bindWebchatSurfaceServiceRoute(
+                parsedUrl,
+                resolveAuthenticatedRouteAuthContext(selectedRouteKey, { snapshot }),
+                { snapshot },
+            );
         }
         if (routeDefault?.access === 'guest') {
-            return resolveGuestRouteAuthContext(selectedRouteKey, routeDefault, parsedUrl);
+            return bindWebchatSurfaceServiceRoute(
+                parsedUrl,
+                resolveGuestRouteAuthContext(selectedRouteKey, routeDefault, parsedUrl),
+                { snapshot },
+            );
         }
     }
     return resolveAuthContext(parsedUrl, { snapshot });

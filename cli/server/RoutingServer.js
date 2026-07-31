@@ -29,6 +29,7 @@ import {
 } from './routerHandlers.js';
 import { createCapturingRes, handleAgentRootUpgrade } from './wsAgentRootProxy.js';
 import {
+    commitRouteGeneration,
     commitRoutePlan,
     httpAccessForEdgeRoutePlan,
     normalizeExactHost,
@@ -589,7 +590,7 @@ async function processRequest(req, res) {
             }, { 'Cache-Control': 'no-store' });
             return;
         }
-        if (!commitRoutePlan(routePlan)) {
+        if (!commitRouteGeneration(routePlan)) {
             sendJsonResponse(res, 503, { error: 'edge_generation_changed' }, { 'Cache-Control': 'no-store' });
             return;
         }

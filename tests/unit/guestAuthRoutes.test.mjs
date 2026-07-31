@@ -633,6 +633,59 @@ test('browser token for an auth-none target uses static auth and binds proof to 
     assert.match(String(res.getHeader('set-cookie') || ''), /^ploinky_browser_csrf=/);
 });
 
+test('static-auth webchat input preserves the target mutation route binding', async (t) => {
+    const { authHandlers, authService, createRoutePlan } = await withAuthModules(t, {
+        staticAuthMode: 'sso',
+    });
+    const originalGetSession = authService.getSession;
+    const originalIsConfigured = authService.isConfigured;
+    authService.isConfigured = () => true;
+    authService.getSession = (sessionId) => sessionId === 'sso-session'
+        ? {
+            user: {
+                id: 'sso:admin',
+                username: 'admin',
+                name: 'Admin',
+                email: 'admin@example.test',
+                roles: ['user', 'admin'],
+            },
+            tokens: null,
+            expiresAt: Date.now() + 60_000,
+        }
+        : null;
+    t.after(() => {
+        authService.getSession = originalGetSession;
+        authService.isConfigured = originalIsConfigured;
+    });
+    const req = makeRequest({
+        method: 'POST',
+        url: '/webchat/input?agent=webAdmin',
+        cookie: 'ploinky_sso=sso-session',
+    });
+    const res = new MockResponse();
+    const routePlan = createRoutePlan({
+        decision: {
+            access: 'authenticated',
+            routeKey: 'explorer',
+        },
+    });
+    routePlan.snapshot.manifests.webAdmin = {
+        webchat: { auth: 'static' },
+    };
+
+    const result = await authHandlers.ensureAuthenticated(
+        req,
+        res,
+        new URL(req.url, 'http://localhost'),
+        { routePlan },
+    );
+
+    assert.equal(result.ok, true);
+    assert.equal(req.edgeAuthContext.routeKey, 'explorer');
+    assert.equal(req.edgeAuthContext.serviceRouteKey, 'webAdmin');
+    assert.match(String(req.browserCsrfToken || ''), /^v2\./);
+});
+
 test('browser token for a guest target preserves an authenticated local session', async (t) => {
     const { authHandlers, localService, createRoutePlan } = await withAuthModules(t);
     const token = localService.mintSessionJwt({
