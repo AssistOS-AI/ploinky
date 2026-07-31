@@ -27,13 +27,15 @@ The harness may create a temporary git worktree for another branch when `PLOINKY
 Browser-surface changes require a targeted smoke test in addition to shell and unit checks. For WebChat composer/autocomplete changes, the smoke must run against an authenticated `/webchat` session for a selected chat agent and verify workspace file/folder suggestions without exposing agent tag suggestions. Slash-catalog unit coverage must verify transient startup retries, configured backoff order, bounded exhaustion, immediate acceptance of a valid empty catalog, immediate termination on access denial, and deduplication of concurrent initial refresh calls. A research-relay integration smoke may use generic launch parameters such as `forward-envelope=1` and `workspace-dir`, but the WebChat implementation itself must remain generic: optional relay agent ids, backend tags, and downstream tool names belong to the selected chat agent, not to Ploinky core. The browser smoke must prove that selecting a cwd-relative `@path` records a structured `workspace-path` reference, selected path tokens are visually emphasized from their reference metadata, arbitrary `@word` tokens are ordinary chat text, and provider routing is not triggered by Ploinky WebChat.
 
 WebChat header changes require focused coverage of responsive overflow-menu
-placement and lifecycle. Tests must verify that Tasks, Sessions, and Logout keep
+placement and lifecycle. Tests must verify that Tasks, Skills, Sessions, and Logout keep
 their established positions in the desktop header, move as the same DOM elements
 into the three-dot menu at the 640-pixel mobile breakpoint, and return in their
 original order above it. Tests must also verify that the menu toggles its ARIA
 expanded state, closes after mobile actions, outside pointer interaction, and
 Escape, and that the mobile header keeps the agent name, current model, and
 ellipsized working directory visible.
+
+Workspace-skill controls require focused protocol and browser-model coverage. Tests must verify strict `__webchatSkills` validation and interception, volatile snapshot replay through `skills-state`, rejection of absolute or escaping paths and unsupported types, total/enabled counts, tree construction that stops at skill directories and compacts directory-only chains, tri-state folder drafts, individual canonical-name commands, plural relative-directory commands, folder-before-exception ordering, no commands before Save, and final authoritative refresh. Header coverage must keep the Skills control between Tasks and Sessions on desktop and move the same bound element through the mobile overflow menu.
 
 Assistant workspace-file preview coverage must verify candidate extraction,
 rejection of traversal and host-absolute paths, cwd-prefix construction,

@@ -11,6 +11,7 @@ import { createAutocompleteState } from './autocompleteState.js';
 import { createComposerMentionHighlighter } from './composerMentionHighlights.js';
 import { createSessionController } from './sessions.js';
 import { createTaskController } from './tasks.js';
+import { createSkillsController } from './skills.js';
 import { createInteractionPrompt } from './interactionPrompt.js';
 import { createWorkspaceFileIndex } from './workspaceFileIndex.js';
 import { createHeaderMenu, createResponsiveHeaderActions } from './headerMenu.js';
@@ -65,6 +66,13 @@ const {
     attachmentContainer,
     cancelBtn,
     sessionsBtn,
+    skillsBtn,
+    skillsDialog,
+    skillsDialogClose,
+    skillsTree,
+    skillsSaveBtn,
+    skillsSaveStatus,
+    skillsSummary,
     historyGate,
     loadHistoryBtn,
     sessionDialog,
@@ -115,6 +123,7 @@ const sidePanelApi = createSidePanel({
 
 let sessionController = null;
 let taskController = null;
+let skillsController = null;
 let interactionController = null;
 let composerAutocomplete = null;
 taskController = createTaskController({
@@ -130,6 +139,20 @@ taskController = createTaskController({
         taskToast,
         taskToastText,
         taskToastClose,
+    },
+    showBanner,
+});
+skillsController = createSkillsController({
+    sendQuickCommand: (command) => network?.sendQuickCommand(command) || false,
+    sendQuickCommands: (commands) => network?.sendQuickCommands(commands) || Promise.resolve(false),
+    elements: {
+        skillsBtn,
+        skillsDialog,
+        skillsDialogClose,
+        skillsTree,
+        skillsSaveBtn,
+        skillsSaveStatus,
+        skillsSummary,
     },
     showBanner,
 });
@@ -187,6 +210,7 @@ network = createNetwork({
             taskController?.open({ refresh: false });
         }
     },
+    onSkillsState: (payload) => skillsController?.handleState(payload),
     onRuntimeState: (state) => dom.setRuntimeModel(state?.model),
     onWorkspaceFiles: (update) => {
         if (!workspaceFileIndex.applyUpdate(update)) return;
@@ -615,7 +639,7 @@ refocusComposerAfterIcon(attachmentBtn);
 initMessageToolbar();
 createHeaderMenu({ button: settingsBtn, panel: settingsPanel });
 createResponsiveHeaderActions({
-    actions: [tasksBtn, sessionsBtn, logoutBtn],
+    actions: [tasksBtn, skillsBtn, sessionsBtn, logoutBtn],
     desktopContainer: headerActions,
     mobileContainer: settingsActionSlot,
     mobileSection: settingsMobileActions,

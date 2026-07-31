@@ -245,6 +245,7 @@ export function createNetwork({
     addRemoteUserMessage,
     onSessionState,
     onTaskUpdate,
+    onSkillsState,
     onRuntimeState,
     onWorkspaceFiles,
     onInteractionRequest,
@@ -483,6 +484,15 @@ export function createNetwork({
             }
         });
 
+        es.addEventListener('skills-state', (event) => {
+            try {
+                const payload = JSON.parse(event.data);
+                if (typeof onSkillsState === 'function') onSkillsState(payload);
+            } catch (error) {
+                dlog('skills state error', error);
+            }
+        });
+
         es.addEventListener('runtime-state', (event) => {
             const runtimeState = parseRuntimeStatePayload(event.data);
             if (runtimeState !== undefined && typeof onRuntimeState === 'function') {
@@ -596,6 +606,17 @@ export function createNetwork({
             return false;
         }
         postEnvelope({ text: message }, { silent: true });
+        return true;
+    }
+
+    async function sendQuickCommands(commands) {
+        if (!Array.isArray(commands) || commands.length === 0
+            || commands.some((command) => typeof command !== 'string' || !command.trim())) {
+            return false;
+        }
+        for (const command of commands) {
+            await postEnvelope({ text: command }, { silent: true });
+        }
         return true;
     }
 
@@ -825,6 +846,7 @@ export function createNetwork({
         stop,
         sendCommand,
         sendQuickCommand,
+        sendQuickCommands,
         sendAttachments,
         sendControl,
         sendInteractionResponse,

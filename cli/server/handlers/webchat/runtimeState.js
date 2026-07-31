@@ -6,12 +6,14 @@ const MAX_RUNTIME_MODEL_LENGTH = 256;
 const WEBCHAT_RUNTIME_STATE_FLAG = '__webchatRuntimeState';
 const WEBCHAT_SESSION_FLAG = '__webchatSession';
 const WEBCHAT_WORKSPACE_FILES_FLAG = '__webchatWorkspaceFiles';
+const WEBCHAT_SKILLS_FLAG = '__webchatSkills';
 const WEBCHAT_INTERACTION_FLAG = '__webchatInteraction';
 const WEBCHAT_INTERACTION_RESOLVED_FLAG = '__webchatInteractionResolved';
 const SESSION_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const TASK_ID_RE = /^task_[0-9a-f]{24}$/;
 const TASK_CONTINUATION_HANDLE_RE = /^[A-Za-z0-9_-]{16,200}$/;
 const TASK_TOOL_NAME_RE = /^[A-Za-z0-9._-]{1,160}$/;
+const SKILL_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,199}$/;
 const MAX_TASK_FINAL_OUTPUT_RANGES = 1000;
 const TASK_LOG_SSE_CHUNK_CHARS = 64 * 1024;
 const INTERACTION_ID_RE = /^[A-Za-z0-9_-]{8,128}$/;
@@ -21,6 +23,9 @@ const TASK_STATUSES = new Set(['ongoing', 'finished', 'stopped', 'error']);
 const MAX_WORKSPACE_FILE_PATHS = 100000;
 const MAX_WORKSPACE_FILE_DELTA_PATHS = 20000;
 const MAX_WORKSPACE_FILE_PATH_LENGTH = 4096;
+const MAX_WEBCHAT_SKILLS = 10000;
+const SKILL_TYPES = new Set(['cskill', 'dcgskill', 'oskill', 'tskill']);
+const SKILL_EVENTS = new Set(['list', 'changed', 'error']);
 
 function normalizeFinalOutputRanges(raw) {
     const byTurn = new Map();
@@ -379,6 +384,63 @@ export function serializeWorkspaceFilesSseEvent(state) {
     return `event: workspace-files\ndata: ${JSON.stringify(payload)}\n\n`;
 }
 
+function normalizeWebchatSkill(raw) {
+    if (!raw || typeof raw !== 'object') return null;
+    const name = typeof raw.name === 'string' ? raw.name.trim() : '';
+    const displayName = typeof raw.displayName === 'string' ? raw.displayName.trim() : '';
+    const relativePath = normalizeWorkspaceFilePath(raw.relativePath);
+    if (!SKILL_NAME_RE.test(name)
+        || !displayName || displayName.length > 300 || /[\0\r\n]/.test(displayName)
+        || !relativePath || !SKILL_TYPES.has(raw.type) || typeof raw.enabled !== 'boolean') {
+        return null;
+    }
+    return { name, displayName, relativePath, type: raw.type, enabled: raw.enabled };
+}
+
+export function parseWebchatSkillsState(envelope) {
+    if (!envelope || envelope[WEBCHAT_SKILLS_FLAG] !== 1 || envelope.version !== 1
+        || !SKILL_EVENTS.has(envelope.event) || !Array.isArray(envelope.skills)
+        || envelope.skills.length > MAX_WEBCHAT_SKILLS) {
+        return undefined;
+    }
+    const skills = [];
+    const names = new Set();
+    for (const raw of envelope.skills) {
+        const skill = normalizeWebchatSkill(raw);
+        if (!skill || names.has(skill.name)) return undefined;
+        names.add(skill.name);
+        skills.push(skill);
+    }
+    const state = { event: envelope.event, skills };
+    if (envelope.operation !== undefined) {
+        const scope = envelope.operation?.scope;
+        const action = envelope.operation?.action;
+        const target = typeof envelope.operation?.target === 'string' ? envelope.operation.target.trim() : '';
+        if (!['skill', 'directory'].includes(scope) || !['enable', 'disable'].includes(action)
+            || !target || target.length > MAX_WORKSPACE_FILE_PATH_LENGTH || /[\0\r\n]/.test(target)
+            || (scope === 'skill' && !SKILL_NAME_RE.test(target))
+            || (scope === 'directory' && target !== '.' && !normalizeWorkspaceFilePath(target))) {
+            return undefined;
+        }
+        state.operation = { scope, action, target };
+    }
+    if (envelope.event === 'error') {
+        const error = typeof envelope.error === 'string' ? envelope.error.trim().slice(0, 1000) : '';
+        if (!error) return undefined;
+        state.error = error;
+    }
+    return state;
+}
+
+export function serializeSkillsStateSseEvent(state) {
+    const normalized = parseWebchatSkillsState({
+        [WEBCHAT_SKILLS_FLAG]: 1,
+        version: 1,
+        ...state,
+    });
+    return normalized ? `event: skills-state\ndata: ${JSON.stringify(normalized)}\n\n` : '';
+}
+
 function normalizeSessionId(value) {
     const sessionId = typeof value === 'string' ? value.trim().toLowerCase() : '';
     return SESSION_ID_RE.test(sessionId) ? sessionId : '';
@@ -713,6 +775,17 @@ function routeCompleteOutputLine(appState, tab, line) {
             // Invalid workspace-file envelopes fall through as ordinary agent output.
         }
     }
+    if (normalized.includes(`"${WEBCHAT_SKILLS_FLAG}"`)) {
+        try {
+            const skillsState = parseWebchatSkillsState(JSON.parse(normalized));
+            if (!skillsState) return;
+            tab.webchatSkillsSnapshot = skillsState;
+            writeOrBufferSseEvent(tab, serializeSkillsStateSseEvent(skillsState));
+            return;
+        } catch (_) {
+            return;
+        }
+    }
     if (normalized.includes('"__webchatTask"')) {
         try {
             const envelope = JSON.parse(normalized);
@@ -769,12 +842,14 @@ export function routeWorkspaceRuntimeOutput(appState, tab, data) {
         || trimmed.includes(`"${WEBCHAT_SESSION_FLAG}"`);
     const isWorkspaceFilesProtocol = `{"${WEBCHAT_WORKSPACE_FILES_FLAG}"`.startsWith(trimmed)
         || trimmed.includes(`"${WEBCHAT_WORKSPACE_FILES_FLAG}"`);
+    const isSkillsProtocol = `{"${WEBCHAT_SKILLS_FLAG}"`.startsWith(trimmed)
+        || trimmed.includes(`"${WEBCHAT_SKILLS_FLAG}"`);
     const isInteractionProtocol = `{"${WEBCHAT_INTERACTION_FLAG}"`.startsWith(trimmed)
         || trimmed.includes(`"${WEBCHAT_INTERACTION_FLAG}"`)
         || `{"${WEBCHAT_INTERACTION_RESOLVED_FLAG}"`.startsWith(trimmed)
         || trimmed.includes(`"${WEBCHAT_INTERACTION_RESOLVED_FLAG}"`);
     if (trimmed.startsWith('{') && (isTaskProtocol || isRuntimeStateProtocol || isSessionProtocol
-        || isWorkspaceFilesProtocol || isInteractionProtocol)) {
+        || isWorkspaceFilesProtocol || isSkillsProtocol || isInteractionProtocol)) {
         tab.taskProtocolBuffer = pending;
         return;
     }

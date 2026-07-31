@@ -430,6 +430,182 @@ body {
     font-size: 12px;
 }
 
+.wa-skills-dialog-backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 1000;
+    display: grid;
+    place-items: center;
+    padding: 20px;
+    background: rgba(0, 0, 0, 0.45);
+}
+
+.wa-skills-dialog-backdrop[hidden] {
+    display: none;
+}
+
+.wa-skills-dialog {
+    width: min(720px, 100%);
+    max-height: min(78vh, 760px);
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    border: 1px solid var(--wa-border);
+    border-radius: 12px;
+    background: var(--wa-bg-panel);
+    color: var(--wa-text-primary);
+    box-shadow: var(--wa-shadow-md);
+}
+
+.wa-skills-dialog-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 14px 16px;
+    border-bottom: 1px solid var(--wa-border);
+}
+
+.wa-skills-dialog-header h2 {
+    margin: 0;
+    font-size: 17px;
+}
+
+.wa-skills-dialog-heading {
+    min-width: 0;
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+}
+
+.wa-skills-summary {
+    color: var(--wa-text-muted);
+    font-size: 12px;
+    white-space: nowrap;
+}
+
+.wa-skills-dialog-header button {
+    border: 0;
+    background: transparent;
+    color: inherit;
+    font-size: 26px;
+    cursor: pointer;
+}
+
+.wa-skills-tree {
+    min-height: 180px;
+    overflow: auto;
+    padding: 10px 8px 14px;
+}
+
+.wa-skills-empty {
+    padding: 28px 18px;
+    color: var(--wa-text-muted);
+    text-align: center;
+}
+
+.wa-skill-tree-row {
+    min-height: 40px;
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    padding: 4px 8px 4px calc(8px + var(--skill-depth, 0) * 18px);
+    border-radius: 8px;
+}
+
+.wa-skill-tree-row:hover {
+    background: var(--wa-bg-hover);
+}
+
+.wa-skill-tree-expand,
+.wa-skill-tree-folder-label {
+    border: 0;
+    background: transparent;
+    color: inherit;
+    cursor: pointer;
+}
+
+.wa-skill-tree-expand,
+.wa-skill-tree-spacer {
+    width: 24px;
+    flex: 0 0 24px;
+    padding: 0;
+    color: var(--wa-text-muted);
+}
+
+.wa-skill-tree-folder-label,
+.wa-skill-tree-label {
+    min-width: 0;
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    text-align: left;
+}
+
+.wa-skill-tree-folder-label {
+    padding: 6px 0;
+    font: inherit;
+    font-weight: 600;
+}
+
+.wa-skill-checkbox {
+    width: 17px;
+    height: 17px;
+    flex: 0 0 17px;
+    margin: 0 1px 0 0;
+    accent-color: var(--wa-accent);
+    cursor: pointer;
+}
+
+.wa-skill-checkbox:disabled {
+    cursor: wait;
+    opacity: 0.55;
+}
+
+.wa-skills-dialog-footer {
+    min-height: 58px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+    padding: 10px 16px;
+    border-top: 1px solid var(--wa-border);
+}
+
+.wa-skills-save-status {
+    min-width: 0;
+    color: var(--wa-text-muted);
+    font-size: 12px;
+}
+
+.wa-skills-save-btn {
+    min-width: 88px;
+    min-height: 38px;
+    padding: 8px 18px;
+    border: 1px solid transparent;
+    border-radius: 8px;
+    background: var(--wa-accent);
+    color: var(--wa-accent-contrast, #fff);
+    font: inherit;
+    font-weight: 600;
+    cursor: pointer;
+}
+
+.wa-skills-save-btn:disabled {
+    cursor: default;
+    opacity: 0.45;
+}
+
+@media (max-width: 640px) {
+    .wa-skills-dialog-backdrop {
+        padding: 10px;
+    }
+
+    .wa-skills-dialog {
+        max-height: calc(100vh - 20px);
+    }
+}
+
 .wa-header-workdir {
     position: absolute;
     top: 50%;
