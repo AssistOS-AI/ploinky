@@ -38,6 +38,7 @@ const interactionPrompt = createInteractionPrompt({
     inputRow: document.getElementById('taskInteractionPromptInputRow'),
     input: document.getElementById('taskInteractionPromptInput'),
     submitButton: document.getElementById('taskInteractionPromptSubmit'),
+    cancelButton: document.getElementById('taskInteractionPromptCancel'),
     options: document.getElementById('taskInteractionPromptOptions'),
 }, {
     onSubmit: (interactionId, optionId, response) => transport.sendInteractionResponse(
@@ -45,6 +46,7 @@ const interactionPrompt = createInteractionPrompt({
         optionId,
         response,
     ),
+    onCancel: (interactionId) => transport.sendInteractionCancel(interactionId),
 });
 const logFollower = createTaskLogFollower(log);
 const MIN_CONTINUATION_INPUT_HEIGHT_PX = 40;

@@ -9,6 +9,8 @@ function createStandaloneWindow() {
     const requests = [];
     const sources = [];
     const storage = new Map();
+    const listeners = new Map();
+    const uuids = ['standalone-tab-id', 'standalone-page-id'];
     class FakeEventSource {
         constructor(url) {
             this.url = url;
@@ -25,7 +27,7 @@ function createStandaloneWindow() {
             pathname: `/webchat/tasks/${TASK_ID}/view`,
             search: '?agent=achilles-cli&forward-envelope=1&dir=%2Fworkspace&sessionId=ignored',
         },
-        crypto: { randomUUID: () => 'standalone-tab-id' },
+        crypto: { randomUUID: () => uuids.shift() || 'next-page-id' },
         sessionStorage: {
             getItem: (key) => storage.get(key) || null,
             setItem: (key, value) => storage.set(key, value),
@@ -36,9 +38,10 @@ function createStandaloneWindow() {
             return { ok: true, status: 204 };
         },
         setTimeout: (callback) => callback(),
+        addEventListener: (type, listener) => listeners.set(type, listener),
     };
     windowRef.parent = windowRef;
-    return { windowRef, requests, sources };
+    return { windowRef, requests, sources, listeners };
 }
 
 test('standalone task view subscribes to the selected runtime and sends hidden commands', async () => {
@@ -64,6 +67,7 @@ test('standalone task view subscribes to the selected runtime and sends hidden c
     assert.match(sources[0].url, /forward-envelope=1/);
     assert.match(sources[0].url, /dir=%2Fworkspace/);
     assert.match(sources[0].url, /tabId=standalone-tab-id/);
+    assert.match(sources[0].url, /pageInstanceId=standalone-page-id/);
     assert.doesNotMatch(sources[0].url, /sessionId/);
 
     sources[0].onopen();
@@ -89,12 +93,14 @@ test('standalone task view subscribes to the selected runtime and sends hidden c
     sources[0].emit('interaction-request', {
         id: 'task_control_12345678',
         targetTabId: 'standalone-tab-id',
+        targetPageInstanceId: 'standalone-page-id',
         options: [],
     });
     sources[0].emit('interaction-resolved', { id: 'task_control_12345678', status: 'submitted' });
     assert.deepEqual(interactions, [{
         id: 'task_control_12345678',
         targetTabId: 'standalone-tab-id',
+        targetPageInstanceId: 'standalone-page-id',
         options: [],
     }]);
     assert.deepEqual(resolutions, [{ id: 'task_control_12345678', status: 'submitted' }]);
@@ -103,6 +109,30 @@ test('standalone task view subscribes to the selected runtime and sends hidden c
     assert.deepEqual(JSON.parse(requests[1].options.body), {
         interactionId: 'task_control_12345678',
         optionId: 'choice_0',
+    });
+});
+
+test('standalone task refresh sends a keepalive cancellation for pending login input', async () => {
+    const { windowRef, requests, sources, listeners } = createStandaloneWindow();
+    const transport = createTaskViewTransport({ windowRef, taskId: TASK_ID });
+    transport.start();
+    sources[0].emit('interaction-request', {
+        id: 'task_control_12345678',
+        targetTabId: 'standalone-tab-id',
+        targetPageInstanceId: 'standalone-page-id',
+        options: [],
+        input: { type: 'secret', maxLength: 1024 },
+    });
+
+    listeners.get('pagehide')?.({ persisted: false });
+    await Promise.resolve();
+
+    assert.equal(requests.length, 1);
+    assert.match(requests[0].url, /interaction/);
+    assert.equal(requests[0].options.keepalive, true);
+    assert.deepEqual(JSON.parse(requests[0].options.body), {
+        interactionId: 'task_control_12345678',
+        cancelled: true,
     });
 });
 
@@ -145,6 +175,7 @@ test('embedded task view keeps using the same-origin parent bridge', async () =>
     transport.start();
     await transport.requestCommand(`/task view ${TASK_ID}`);
     await transport.sendInteractionResponse('task_control_12345678', 'choice_0');
+    await transport.sendInteractionCancel('task_control_87654321');
 
     assert.deepEqual(posted, [{
         message: {
@@ -159,6 +190,14 @@ test('embedded task view keeps using the same-origin parent bridge', async () =>
             taskId: TASK_ID,
             interactionId: 'task_control_12345678',
             optionId: 'choice_0',
+        },
+        origin: 'http://localhost:8080',
+    }, {
+        message: {
+            type: 'webchat-task-interaction-response',
+            taskId: TASK_ID,
+            interactionId: 'task_control_87654321',
+            cancelled: true,
         },
         origin: 'http://localhost:8080',
     }]);

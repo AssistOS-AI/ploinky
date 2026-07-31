@@ -2214,6 +2214,12 @@ body {
     cursor: pointer;
 }
 
+.wa-interaction-input-row .wa-interaction-cancel {
+    border: 1px solid var(--wa-border);
+    background: transparent;
+    color: var(--wa-text-primary);
+}
+
 .wa-interaction-option {
     display: grid;
     gap: 2px;

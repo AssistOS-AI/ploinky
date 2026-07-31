@@ -116,6 +116,7 @@ export function initDom() {
         TAB_ID = crypto.randomUUID();
         try { sessionStorage.setItem(tabStorageKey, TAB_ID); } catch (_) { }
     }
+    const PAGE_INSTANCE_ID = crypto.randomUUID();
 
     const launchConfig = {};
     try {
@@ -251,6 +252,7 @@ export function initDom() {
 
     return {
         TAB_ID,
+        PAGE_INSTANCE_ID,
         dlog,
         markdown,
         basePath,
@@ -309,6 +311,7 @@ export function initDom() {
             interactionPromptInputRow,
             interactionPromptInput,
             interactionPromptSubmit,
+            interactionPromptCancel: document.getElementById('interactionPromptCancel'),
             interactionPromptOptions,
             attachmentContainer,
             sessionsBtn,

@@ -2,7 +2,7 @@ import { interactionTargetsTab, serializeEnvelope } from './network.js';
 
 const RUNTIME_RETRY_DELAYS_MS = [100, 250, 500, 1000, 2000, 4000];
 
-function buildTaskEndpoint(windowRef, basePath, path, tabId) {
+function buildTaskEndpoint(windowRef, basePath, path, tabId, pageInstanceId = '') {
     const suffix = String(path || '').replace(/^\/+/, '');
     const normalizedBase = String(basePath || '/webchat').replace(/\/+$/, '');
     const url = new URL(`${normalizedBase}/${suffix}`, windowRef.location.origin);
@@ -11,6 +11,7 @@ function buildTaskEndpoint(windowRef, basePath, path, tabId) {
     sourceParams.delete('sessionId');
     for (const [key, value] of sourceParams.entries()) url.searchParams.append(key, value);
     if (tabId) url.searchParams.set('tabId', tabId);
+    if (pageInstanceId) url.searchParams.set('pageInstanceId', pageInstanceId);
     return `${url.pathname}${url.search}`;
 }
 
@@ -44,10 +45,13 @@ export function createTaskViewTransport({
 } = {}) {
     const embedded = windowRef.parent && windowRef.parent !== windowRef;
     const tabId = embedded ? '' : resolveTabId(windowRef, taskId);
+    const pageInstanceId = embedded ? '' : (windowRef.crypto?.randomUUID?.()
+        || `task-page-${Date.now()}-${Math.random().toString(16).slice(2)}`);
     let eventSource = null;
+    let pendingPageInteractionId = '';
 
     async function postStandaloneCommand(command) {
-        const endpoint = buildTaskEndpoint(windowRef, basePath, 'input', tabId);
+        const endpoint = buildTaskEndpoint(windowRef, basePath, 'input', tabId, pageInstanceId);
         const body = `${serializeEnvelope({ text: command, visible: false })}\n`;
         const send = () => windowRef.fetch(endpoint, {
             method: 'POST',
@@ -90,7 +94,7 @@ export function createTaskViewTransport({
             return;
         }
         const response = await windowRef.fetch(
-            buildTaskEndpoint(windowRef, basePath, 'interaction', tabId),
+            buildTaskEndpoint(windowRef, basePath, 'interaction', tabId, pageInstanceId),
             {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
@@ -104,6 +108,30 @@ export function createTaskViewTransport({
         if (!response.ok) throw new Error(`task_interaction_failed_${response.status}`);
     }
 
+    async function sendInteractionCancel(interactionId, { keepalive = false } = {}) {
+        if (embedded) {
+            windowRef.parent.postMessage({
+                type: 'webchat-task-interaction-response',
+                taskId,
+                interactionId,
+                cancelled: true,
+            }, windowRef.location.origin);
+            return;
+        }
+        const response = await windowRef.fetch(
+            buildTaskEndpoint(windowRef, basePath, 'interaction', tabId, pageInstanceId),
+            {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ interactionId, cancelled: true }),
+                credentials: 'include',
+                keepalive,
+            },
+        );
+        if (!response.ok) throw new Error(`task_interaction_cancel_failed_${response.status}`);
+        if (pendingPageInteractionId === interactionId) pendingPageInteractionId = '';
+    }
+
     function start() {
         if (embedded || eventSource) return;
         const EventSourceClass = windowRef.EventSource;
@@ -112,7 +140,7 @@ export function createTaskViewTransport({
             return;
         }
         eventSource = new EventSourceClass(
-            buildTaskEndpoint(windowRef, basePath, 'stream', tabId),
+            buildTaskEndpoint(windowRef, basePath, 'stream', tabId, pageInstanceId),
         );
         eventSource.onopen = () => {
             onOpen?.();
@@ -131,14 +159,26 @@ export function createTaskViewTransport({
         eventSource.addEventListener('interaction-request', (event) => {
             try {
                 const interaction = JSON.parse(event.data);
-                if (!interactionTargetsTab(interaction, tabId)) return;
+                if (!interactionTargetsTab(interaction, tabId, pageInstanceId)) return;
+                if (interaction?.targetPageInstanceId === pageInstanceId) {
+                    pendingPageInteractionId = interaction.id;
+                }
                 onInteractionRequest?.(interaction);
             } catch (_) { }
         });
         eventSource.addEventListener('interaction-resolved', (event) => {
-            try { onInteractionResolved?.(JSON.parse(event.data)); } catch (_) { }
+            try {
+                const resolution = JSON.parse(event.data);
+                if (resolution?.id === pendingPageInteractionId) pendingPageInteractionId = '';
+                onInteractionResolved?.(resolution);
+            } catch (_) { }
         });
     }
+
+    windowRef.addEventListener?.('pagehide', (event) => {
+        if (embedded || event?.persisted === true || !pendingPageInteractionId) return;
+        void sendInteractionCancel(pendingPageInteractionId, { keepalive: true }).catch(() => {});
+    });
 
     function stop() {
         eventSource?.close?.();
@@ -149,6 +189,7 @@ export function createTaskViewTransport({
         embedded,
         requestCommand,
         sendInteractionResponse,
+        sendInteractionCancel,
         start,
         stop,
     };

@@ -21,6 +21,7 @@ const EDITABLE_TAGS = ['INPUT', 'TEXTAREA', 'SELECT', 'OPTION'];
 const dom = initDom();
 const {
     TAB_ID,
+    PAGE_INSTANCE_ID,
     dlog,
     markdown,
     basePath,
@@ -85,6 +86,7 @@ const {
     interactionPromptInputRow,
     interactionPromptInput,
     interactionPromptSubmit,
+    interactionPromptCancel,
     interactionPromptOptions
 } = elements;
 
@@ -106,11 +108,9 @@ const sidePanelApi = createSidePanel({
     webchatBasePath: basePath,
     workspaceFileIndex,
     sendQuickCommand: (command) => network?.sendQuickCommand(command) || false,
-    sendInteractionResponse: (interactionId, optionId, response) => network?.sendInteractionResponse(
-        interactionId,
-        optionId,
-        response,
-    ),
+    sendInteractionResponse: (interactionId, optionId, response, cancelled) => cancelled
+        ? network?.sendInteractionCancel(interactionId)
+        : network?.sendInteractionResponse(interactionId, optionId, response),
 });
 
 let sessionController = null;
@@ -161,6 +161,7 @@ sidePanelApi.bindLinkDelegation(chatList);
 dlog('Initializing network for agent:', dom.agentName);
 network = createNetwork({
     TAB_ID,
+    PAGE_INSTANCE_ID,
     toEndpoint,
     dlog,
     showBanner,
@@ -237,9 +238,11 @@ interactionController = createInteractionPrompt({
     inputRow: interactionPromptInputRow,
     input: interactionPromptInput,
     submitButton: interactionPromptSubmit,
+    cancelButton: interactionPromptCancel,
     options: interactionPromptOptions,
 }, {
     onSubmit: (interactionId, optionId, response) => network.sendInteractionResponse(interactionId, optionId, response),
+    onCancel: (interactionId) => network.sendInteractionCancel(interactionId),
     onActiveChange: (active) => {
         composer.setInteractionState(active);
         attachmentBtn?.toggleAttribute?.('disabled', active);

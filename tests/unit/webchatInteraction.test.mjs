@@ -71,12 +71,14 @@ test('generic secret-input interactions are validated without carrying the enter
         message: 'Enter API key',
         targetTaskId: 'task_111111111111111111111111',
         targetTabId: 'tab_origin',
+        targetPageInstanceId: 'page_origin',
         options: [],
         input: { type: 'secret', placeholder: 'API key', maxLength: 1024 },
     });
     assert.deepEqual(parsed.input, { type: 'secret', placeholder: 'API key', maxLength: 1024 });
     assert.equal(parsed.targetTaskId, 'task_111111111111111111111111');
     assert.equal(parsed.targetTabId, 'tab_origin');
+    assert.equal(parsed.targetPageInstanceId, 'page_origin');
     assert.equal(JSON.stringify(parsed).includes('entered-secret'), false);
     assert.equal(networkTestables.parseInteractionPayload(JSON.stringify(parsed)).kind, 'input');
 });
@@ -111,10 +113,63 @@ test('device-code challenges are normalized for authenticated task UI transport'
 });
 
 test('task interactions are visible only in the browser tab that initiated them', () => {
-    const interaction = { id: 'task_control_12345678', targetTabId: 'tab_origin' };
-    assert.equal(networkTestables.interactionTargetsTab(interaction, 'tab_origin'), true);
-    assert.equal(networkTestables.interactionTargetsTab(interaction, 'tab_other'), false);
+    const interaction = {
+        id: 'task_control_12345678',
+        targetTabId: 'tab_origin',
+        targetPageInstanceId: 'page_origin',
+    };
+    assert.equal(networkTestables.interactionTargetsTab(interaction, 'tab_origin', 'page_origin'), true);
+    assert.equal(networkTestables.interactionTargetsTab(interaction, 'tab_origin', 'page_other'), false);
+    assert.equal(networkTestables.interactionTargetsTab(interaction, 'tab_other', 'page_origin'), false);
     assert.equal(networkTestables.interactionTargetsTab({ id: 'approval_12345678' }, 'tab_other'), true);
+});
+
+test('a refreshed page cancels its previous page-owned interaction before replay', (t) => {
+    const workspaceDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'webchat-interaction-refresh-'));
+    t.after(() => fs.rmSync(workspaceDirectory, { recursive: true, force: true }));
+    const effectiveConfig = { agentName: 'demo-agent' };
+    const runtimeKey = buildRuntimeKey(workspaceDirectory, effectiveConfig, '');
+    const sid = 'browser-session';
+    const ttyWrites = [];
+    const tab = {
+        tty: { write: (value) => ttyWrites.push(value) },
+        subscribers: new Map(),
+        workspaceDirectory,
+        pendingInteraction: parseWebchatInteraction({
+            ...approvalEnvelope('task_control_12345678'),
+            targetTabId: 'tab-1',
+            targetPageInstanceId: 'page-before-refresh',
+        }),
+    };
+    const appState = {
+        runtimes: new Map([[runtimeKey, tab]]),
+        sessions: new Map([[sid, { tabs: new Map() }]]),
+    };
+    const req = new EventEmitter();
+    req.headers = { cookie: `webchat_sid=${sid}` };
+    const writes = [];
+    const res = {
+        writeHead(status) { assert.equal(status, 200); },
+        write(value) { writes.push(value); },
+        end() {},
+    };
+
+    handleRuntimeRoute({
+        pathname: '/stream',
+        req,
+        res,
+        parsedUrl: new URL('http://localhost/stream?tabId=tab-1&pageInstanceId=page-after-refresh'),
+        appState,
+        workspaceDirectory,
+        effectiveConfig,
+        agentQuery: '',
+    });
+
+    assert.match(ttyWrites[0], /"cancelled":true/);
+    assert.equal(tab.pendingInteraction, null);
+    assert.doesNotMatch(writes.join(''), /event: interaction-request/);
+    req.emit('close');
+    if (tab.cleanupTimer) clearTimeout(tab.cleanupTimer);
 });
 
 test('an EventSource reconnect receives the pending interaction snapshot', (t) => {
@@ -257,6 +312,52 @@ test('generic input responses use the authenticated interaction control channel'
     assert.match(ttyWrites[0], /"response":"entered-value"/);
 });
 
+test('authenticated interaction cancellation reaches the runtime and clears the prompt', (t) => {
+    const workspaceDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'webchat-interaction-cancel-'));
+    t.after(() => fs.rmSync(workspaceDirectory, { recursive: true, force: true }));
+    const effectiveConfig = { agentName: 'demo-agent' };
+    const runtimeKey = buildRuntimeKey(workspaceDirectory, effectiveConfig, '');
+    const sid = 'browser-session';
+    const tabId = 'tab-1';
+    const pageInstanceId = 'page-1';
+    const ttyWrites = [];
+    const interaction = parseWebchatInteraction({
+        ...approvalEnvelope('task_control_12345678'),
+        targetTabId: tabId,
+        targetPageInstanceId: pageInstanceId,
+    });
+    const tab = {
+        tty: { write: (value) => ttyWrites.push(value) },
+        workspaceDirectory,
+        pendingInteraction: interaction,
+        subscribers: new Map([['client', {
+            sid,
+            tabId,
+            pageInstanceId,
+            res: { write() {} },
+        }]]),
+    };
+    const appState = {
+        runtimes: new Map([[runtimeKey, tab]]),
+        sessions: new Map([[sid, { tabs: new Map() }]]),
+    };
+
+    const result = postInteraction({
+        appState,
+        workspaceDirectory,
+        effectiveConfig,
+        sid,
+        tabId,
+        pageInstanceId,
+        interactionId: interaction.id,
+        optionId: null,
+        cancelled: true,
+    });
+    assert.equal(result.status, 204);
+    assert.match(ttyWrites[0], /"cancelled":true/);
+    assert.equal(tab.pendingInteraction, null);
+});
+
 test('approval selector starts on Always approve and supports arrow plus Enter', async () => {
     const originalDocument = globalThis.document;
     const submitted = [];
@@ -317,6 +418,34 @@ test('generic input prompt submits text responses instead of option ids', async 
     }
 });
 
+test('generic input prompt exposes cancellation without submitting its secret', async () => {
+    const originalDocument = globalThis.document;
+    const cancelled = [];
+    const dom = createPromptDom();
+    globalThis.document = dom.document;
+    try {
+        const prompt = createInteractionPrompt(dom.elements, {
+            onCancel: (interactionId) => cancelled.push(interactionId),
+        });
+        prompt.show(parseWebchatInteraction({
+            __webchatInteraction: 1,
+            version: 1,
+            id: 'task_control_12345678',
+            kind: 'input',
+            title: 'Provider input',
+            options: [],
+            input: { type: 'secret', maxLength: 64 },
+        }));
+        dom.elements.input.value = 'must-not-be-sent';
+        prompt.cancel();
+        await Promise.resolve();
+        assert.deepEqual(cancelled, ['task_control_12345678']);
+        assert.equal(dom.elements.cancelButton.hidden, false);
+    } finally {
+        globalThis.document = originalDocument;
+    }
+});
+
 function postInteraction({
     appState,
     workspaceDirectory,
@@ -326,6 +455,8 @@ function postInteraction({
     interactionId = 'approval_12345678',
     optionId = 'always-allow',
     response,
+    pageInstanceId = '',
+    cancelled = false,
 }) {
     const req = new EventEmitter();
     req.method = 'POST';
@@ -339,13 +470,15 @@ function postInteraction({
         pathname: '/interaction',
         req,
         res,
-        parsedUrl: new URL(`http://localhost/interaction?tabId=${tabId}`),
+        parsedUrl: new URL(`http://localhost/interaction?tabId=${tabId}${pageInstanceId ? `&pageInstanceId=${pageInstanceId}` : ''}`),
         appState,
         workspaceDirectory,
         effectiveConfig,
         agentQuery: '',
     });
-    req.emit('data', JSON.stringify({ interactionId, optionId, ...(response !== undefined ? { response } : {}) }));
+    req.emit('data', JSON.stringify(cancelled
+        ? { interactionId, cancelled: true }
+        : { interactionId, optionId, ...(response !== undefined ? { response } : {}) }));
     req.emit('end');
     return result;
 }
@@ -407,8 +540,9 @@ function createPromptDom() {
     const inputRow = makeElement();
     const input = makeElement();
     const submitButton = makeElement();
+    const cancelButton = makeElement();
     return {
         document: { createElement: makeElement },
-        elements: { root, title, message, detail, inputRow, input, submitButton, options },
+        elements: { root, title, message, detail, inputRow, input, submitButton, cancelButton, options },
     };
 }

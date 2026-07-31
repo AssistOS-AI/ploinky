@@ -569,6 +569,10 @@ export function parseWebchatInteraction(envelope) {
         && /^[A-Za-z0-9_-]{1,128}$/.test(envelope.targetTabId)
         ? envelope.targetTabId
         : '';
+    const targetPageInstanceId = typeof envelope.targetPageInstanceId === 'string'
+        && /^[A-Za-z0-9_-]{1,128}$/.test(envelope.targetPageInstanceId)
+        ? envelope.targetPageInstanceId
+        : '';
     return {
         id,
         kind,
@@ -582,6 +586,7 @@ export function parseWebchatInteraction(envelope) {
         ...(envelope.searchable === true && options.length ? { searchable: true } : {}),
         ...(targetTaskId ? { targetTaskId } : {}),
         ...(targetTabId ? { targetTabId } : {}),
+        ...(targetPageInstanceId ? { targetPageInstanceId } : {}),
     };
 }
 

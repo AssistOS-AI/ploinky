@@ -443,8 +443,12 @@ export function createSidePanel({
             if (event.data.taskId !== activeTaskId || event.data.interactionId !== activeTaskInteractionId) return;
             const optionId = typeof event.data.optionId === 'string' ? event.data.optionId : null;
             const response = typeof event.data.response === 'string' ? event.data.response : null;
-            if ((!optionId && response === null) || (optionId && response !== null)) return;
-            sendInteractionResponse?.(activeTaskInteractionId, optionId, response);
+            const cancelled = event.data.cancelled === true;
+            if ((!cancelled && !optionId && response === null)
+                || (cancelled && (optionId || response !== null))
+                || (optionId && response !== null)) return;
+            if (cancelled) sendInteractionResponse?.(activeTaskInteractionId, null, null, true);
+            else sendInteractionResponse?.(activeTaskInteractionId, optionId, response);
             return;
         }
         if (event.data?.type !== 'webchat-task-command' || event.data.taskId !== activeTaskId) return;

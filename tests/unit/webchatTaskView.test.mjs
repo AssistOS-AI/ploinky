@@ -142,7 +142,26 @@ test('side panel forwards task commands declared by AchillesCLI and rejects unde
             optionId: 'choice_0',
         },
     });
-    assert.deepEqual(interactionResponses, [['task_control_12345678', 'choice_0', null]]);
+    assert.equal(api.postTaskInteraction({
+        id: 'task_control_87654321',
+        targetTaskId: taskId,
+        options: [],
+        input: { type: 'secret', maxLength: 1024 },
+    }), true);
+    messageHandler({
+        origin: 'http://localhost:8080',
+        source: frame.contentWindow,
+        data: {
+            type: 'webchat-task-interaction-response',
+            taskId,
+            interactionId: 'task_control_87654321',
+            cancelled: true,
+        },
+    });
+    assert.deepEqual(interactionResponses, [
+        ['task_control_12345678', 'choice_0', null],
+        ['task_control_87654321', null, null, true],
+    ]);
 });
 
 test('opening the same active task view reuses its iframe and preserves its log state', (t) => {

@@ -7,8 +7,9 @@ export function nextInteractionOptionIndex(currentIndex, optionCount, direction)
     return current;
 }
 
-export function createInteractionPrompt({ root, title, message, detail, inputRow, input, submitButton, options }, {
+export function createInteractionPrompt({ root, title, message, detail, inputRow, input, submitButton, cancelButton, options }, {
     onSubmit,
+    onCancel,
     onActiveChange,
 } = {}) {
     let interaction = null;
@@ -50,6 +51,7 @@ export function createInteractionPrompt({ root, title, message, detail, inputRow
         if (!options || !interaction) return;
         if (input) input.disabled = submitting;
         if (submitButton) submitButton.disabled = submitting;
+        if (cancelButton) cancelButton.disabled = submitting;
         options.replaceChildren();
         const query = interaction.searchable ? String(input?.value || '').trim().toLowerCase() : '';
         visibleOptions = interaction.options.filter((option) => !query
@@ -112,6 +114,20 @@ export function createInteractionPrompt({ root, title, message, detail, inputRow
         return true;
     }
 
+    function cancel() {
+        if (!interaction || submitting || typeof onCancel !== 'function') return false;
+        submitting = true;
+        root?.classList?.add('is-submitting');
+        renderOptions();
+        Promise.resolve(onCancel(interaction.id)).catch(() => {
+            submitting = false;
+            root?.classList?.remove('is-submitting');
+            renderOptions();
+            root?.focus?.({ preventScroll: true });
+        });
+        return true;
+    }
+
     function handleKeydown(event) {
         if (!interaction) return false;
         if (!interaction.input && (event.key === 'ArrowDown' || event.key === 'ArrowUp')) {
@@ -155,6 +171,7 @@ export function createInteractionPrompt({ root, title, message, detail, inputRow
             input.disabled = false;
         }
         if (submitButton) submitButton.hidden = !interaction.input;
+        if (cancelButton) cancelButton.hidden = !interaction.input;
         renderOptions();
         notifyActive(true);
         if (interaction.input || interaction.searchable) input?.focus?.({ preventScroll: true });
@@ -183,11 +200,13 @@ export function createInteractionPrompt({ root, title, message, detail, inputRow
         renderOptions();
     });
     submitButton?.addEventListener?.('click', submit);
+    cancelButton?.addEventListener?.('click', cancel);
 
     return {
         show,
         resolve,
         submit,
+        cancel,
         handleKeydown,
         get active() {
             return Boolean(interaction);
