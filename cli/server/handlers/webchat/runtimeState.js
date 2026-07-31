@@ -825,7 +825,7 @@ export function disposeTab(tab, tabId, session) {
     if (!tab) {
         return;
     }
-    const pid = tab.pid || tab.tty?.pid;
+    const pid = tab.tty?.pid || tab.pid;
     if (tab.disposed) {
         if (session?.runtimes instanceof Map) session.runtimes.delete(tabId);
         if (session?.tabs instanceof Map) {

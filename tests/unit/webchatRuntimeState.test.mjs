@@ -402,6 +402,74 @@ test('an EventSource reconnect replaces a runtime whose TTY is not alive', () =>
     if (replacement?.cleanupTimer) clearTimeout(replacement.cleanupTimer);
 });
 
+test('a CLI child close invalidates its runtime before EventSource reconnect', () => {
+    const workspaceDirectory = '/workspace';
+    const closeHandlers = [];
+    const disposedPids = [];
+    let createCount = 0;
+    const effectiveConfig = {
+        agentName: 'demo-agent',
+        ttyFactory: {
+            create() {
+                createCount += 1;
+                const pid = 300 + createCount;
+                return {
+                    pid,
+                    isAlive: () => true,
+                    onOutput() {},
+                    onClose(handler) { closeHandlers.push(handler); },
+                    dispose() { disposedPids.push(pid); },
+                    write: () => true,
+                };
+            },
+        },
+    };
+    const runtimeKey = buildRuntimeKey(workspaceDirectory, effectiveConfig, '');
+    const sid = 'browser-session';
+    const appState = {
+        runtimes: new Map(),
+        sessions: new Map([[sid, { tabs: new Map() }]]),
+    };
+
+    const connect = (tabId) => {
+        const req = new EventEmitter();
+        req.headers = { cookie: `webchat_sid=${sid}` };
+        const writes = [];
+        let ended = 0;
+        const res = {
+            writeHead(status) { assert.equal(status, 200); },
+            write(value) { writes.push(value); },
+            end() { ended += 1; },
+        };
+        handleRuntimeRoute({
+            pathname: '/stream', req, res,
+            parsedUrl: new URL(`http://localhost/stream?tabId=${tabId}`),
+            appState, workspaceDirectory, effectiveConfig, agentQuery: '',
+        });
+        return { req, writes, get ended() { return ended; } };
+    };
+
+    const firstConnection = connect('tab-1');
+    const firstRuntime = appState.runtimes.get(runtimeKey);
+    assert.equal(createCount, 1);
+    assert.equal(Object.hasOwn(firstRuntime, 'pid'), false);
+
+    closeHandlers[0]();
+
+    assert.equal(appState.runtimes.has(runtimeKey), false);
+    assert.match(firstConnection.writes.join(''), /event: close/);
+    assert.equal(firstConnection.ended, 1);
+    assert.deepEqual(disposedPids, [301]);
+
+    const secondConnection = connect('tab-1');
+    const secondRuntime = appState.runtimes.get(runtimeKey);
+    assert.equal(createCount, 2);
+    assert.notEqual(secondRuntime, firstRuntime);
+
+    secondConnection.req.emit('close');
+    if (secondRuntime?.cleanupTimer) clearTimeout(secondRuntime.cleanupTimer);
+});
+
 test('WebChat renders generic runtime model state beside the agent title', () => {
     const read = (relativePath) => fs.readFileSync(new URL(relativePath, import.meta.url), 'utf8');
     const template = read('../../cli/server/webchat/chat.html');

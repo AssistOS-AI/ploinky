@@ -51,6 +51,23 @@ test('webchat child_process: close fires after the child exits', async () => {
     assert.equal(closed, true);
 });
 
+test('webchat child_process: an exited CLI is not restarted inside the same TTY handle', async () => {
+    const session = makeSession("sh -c 'printf one-run'");
+    const chunks = [];
+    let closeCount = 0;
+    await new Promise((resolve) => {
+        session.onOutput((data) => chunks.push(data));
+        session.onClose(() => {
+            closeCount += 1;
+            resolve();
+        });
+    });
+
+    assert.equal(chunks.join(''), 'one-run');
+    assert.equal(closeCount, 1);
+    assert.equal(session.isAlive(), false);
+});
+
 test('webchat child_process: handle exposes a numeric pid and no resize method', () => {
     const session = makeSession("sh -c 'sleep 0.2'");
     assert.equal(typeof session.pid, 'number');

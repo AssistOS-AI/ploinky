@@ -95,7 +95,6 @@ export function handleRuntimeRoute({
                     tty,
                     subscribers: new Map(),
                     createdAt: Date.now(),
-                    pid: tty.pid || null,
                     cleanupTimer: null,
                     ttyClosed: false,
                     runtimeKey,
@@ -114,7 +113,6 @@ export function handleRuntimeRoute({
                 tty.onClose(() => {
                     writeOrBufferSseEvent(tab, 'event: close\ndata: {}\n\n');
                     tab.ttyClosed = true;
-                    tab.tty = null;
                     disposeTab(tab, runtimeKey, { runtimes });
                 });
             } catch (error) {
@@ -173,7 +171,7 @@ export function handleRuntimeRoute({
             if (keepaliveTimer) clearInterval(keepaliveTimer);
             keepaliveTimer = null;
             tab.subscribers.delete(connectionId);
-            console.log(`[webchat] Client ${tabId} disconnected from folder runtime, tty pid=${tab.pid || tab.tty?.pid}`);
+            console.log(`[webchat] Client ${tabId} disconnected from folder runtime, tty pid=${tab.tty?.pid || 'closed'}`);
             if (tab.subscribers.size === 0) {
                 scheduleDisconnectedTabCleanup(tab, runtimeKey, { runtimes });
             }

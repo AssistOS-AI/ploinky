@@ -247,37 +247,25 @@ function createLocalTTYFactory({ workdir, command }) {
         let disposed = false;
         const outputHandlers = new Set();
         const closeHandlers = new Set();
-        const restartWindowMs = 60 * 1000;
-        const maxRestartsInWindow = 5;
-        const restartTimestamps = [];
+        let closeEmitted = false;
         const emitOutput = (data) => {
             for (const h of outputHandlers) {
                 try { h(data); } catch (_) { }
             }
         };
         const emitClose = () => {
+            if (closeEmitted) return;
+            closeEmitted = true;
             for (const h of closeHandlers) {
                 try { h(); } catch (_) { }
             }
         };
 
-        function canRestart() {
-            const now = Date.now();
-            while (restartTimestamps.length > 0 && (now - restartTimestamps[0]) > restartWindowMs) {
-                restartTimestamps.shift();
-            }
-            if (restartTimestamps.length >= maxRestartsInWindow) {
-                return false;
-            }
-            restartTimestamps.push(now);
-            return true;
-        }
-
         const hasCustom = !!(command && String(command).trim());
         const parentShell = process.env.WEBCHAT_SHELL || process.env.SHELL || '/bin/sh';
         const fallbackEntry = 'command -v /bin/bash >/dev/null 2>&1 && exec /bin/bash || exec /bin/sh';
 
-        function startProc({ entry, isFallback } = {}) {
+        function startProc({ entry } = {}) {
             let useEntry = entry && String(entry).trim() ? String(entry) : fallbackEntry;
 
             // Append SSO args to command
@@ -308,30 +296,7 @@ function createLocalTTYFactory({ workdir, command }) {
                     emitClose();
                 });
                 ptyProc.on('close', () => {
-                    log('local child close', { isFallback: !!isFallback });
-                    if (disposed) {
-                        emitClose();
-                        return;
-                    }
-                    if (!isFallback && hasCustom) {
-                        if (canRestart()) {
-                            setTimeout(() => {
-                                if (disposed) {
-                                    emitClose();
-                                    return;
-                                }
-                                try {
-                                    startProc({ entry: String(command), isFallback: false });
-                                } catch (_) {
-                                    emitClose();
-                                }
-                            }, 250);
-                            return;
-                        }
-                        emitOutput('[webchat] Agent process exited repeatedly. Closing session.\n');
-                        emitClose();
-                        return;
-                    }
+                    log('local child close');
                     emitClose();
                 });
             } catch (e) {
@@ -341,7 +306,7 @@ function createLocalTTYFactory({ workdir, command }) {
         }
 
         // Start with custom command if provided; otherwise open a local shell.
-        startProc({ entry: hasCustom ? String(command) : fallbackEntry, isFallback: !hasCustom });
+        startProc({ entry: hasCustom ? String(command) : fallbackEntry });
 
         return {
             get pid() { return ptyProc?.pid; },
