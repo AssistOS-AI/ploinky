@@ -38,6 +38,10 @@ test('managed producer source enforces attestation, ordered generation checkpoin
     assert.ok(credentialMint < preStartHook && preStartHook < preRuntime && preRuntime < postInspection);
     assert.match(source, /preStartLaunch: preStartGeneratedRouterLaunch/);
     assert.match(source, /managed generated-local launch state is required before container creation/);
+    assert.match(source, /`--userns=\$\{managedKeepIdUserNamespace\(launch\.attested\)\}`/);
+    assert.match(source, /return `keep-id:uid=\$\{uid\},gid=\$\{gid\}`/);
+    assert.match(source, /io\.podman\.annotations\.userns/);
+    assert.match(source, /managed candidate attestation lacks an exact numeric non-root UID:GID/);
 });
 
 test('authority helper uses the exact image, init, final user, namespace, and mandatory immutable cleanup', () => {
@@ -46,6 +50,10 @@ test('authority helper uses the exact image, init, final user, namespace, and ma
         'utf8',
     );
     assert.match(source, /'--init'/);
+    assert.match(source, /\['image', 'inspect', '--format', '\{\{\.Config\.User\}\}', imageId\]/);
+    assert.doesNotMatch(source, /runBounded\(runtime, \['image', 'inspect', imageId\]\)/);
+    assert.match(source, /\^\(\[1-9\]\[0-9\]\*\):\(\[1-9\]\[0-9\]\*\)\$/);
+    assert.match(source, /exact numeric non-root UID:GID/);
     assert.match(source, /'--read-only', '--cap-drop=ALL', '--security-opt=no-new-privileges'/);
     assert.match(source, /\.\.\.\(plan\?\.args \|\| \[\]\)/);
     assert.match(source, /String\(inspected\.Config\?\.User \|\| ''\) !== finalUser/);

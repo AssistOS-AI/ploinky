@@ -126,6 +126,18 @@ endpoint is injected through `PLOINKY_ROUTER_HOST`, `PLOINKY_ROUTER_PORT`, and
 box-owned non-secret snapshot named by `PLOINKY_EDGE_TOPOLOGY_FILE` and injects
 `PLOINKY_INTERNAL_ROUTER_URL`. `host` uses `127.0.0.1`; `none` receives no
 endpoint.
+
+Before a managed-network launch can receive Router authority, Ploinky resolves
+the agent image reference to one immutable image ID and reads only the bounded
+`Config.User` projection from that image. The image must declare an exact
+numeric, non-root `UID:GID`; an empty, symbolic, root, or out-of-range identity
+fails closed. The confined authority helper runs the immutable image as that
+same user. The real nested Podman container then uses
+`--userns=keep-id:uid=<UID>,gid=<GID>` so its attested non-root identity maps to
+the outer rootless owner of writable bind mounts such as `/root`. Creation,
+adoption, and final inspection must agree on the immutable image, `Config.User`,
+and exact Podman user-namespace annotation.
+
 Container reuse proves the exact hosts arguments, attachments, aliases, labels,
 versioned network-contract hash, and immutable `instanceId` plus
 `enableGeneration` ownership labels. A mutable registry record cannot make an

@@ -761,6 +761,16 @@ function buildPersistentAgentRunArgs({
     return args;
 }
 
+function managedKeepIdUserNamespace(attested) {
+    const { uid, gid, user } = attested?.evidence?.helper || {};
+    if (!/^[1-9][0-9]*$/.test(String(uid || ''))
+        || !/^[1-9][0-9]*$/.test(String(gid || ''))
+        || String(user || '') !== `${uid}:${gid}`) {
+        throw new Error('managed candidate attestation lacks an exact numeric non-root UID:GID');
+    }
+    return `keep-id:uid=${uid},gid=${gid}`;
+}
+
 function expectedBindMountsFromArgs(args, descriptorHostFile = '') {
     const specs = [];
     for (let index = 0; index < args.length - 1; index += 1) {
@@ -1475,6 +1485,8 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
             if (record?.HostConfig?.Init !== true
                 || String(record?.Image || '') !== String(attested.evidence.helper.image || '')
                 || String(record?.Config?.User || '') !== String(attested.evidence.helper.user || '')
+                || String(record?.HostConfig?.Annotations?.['io.podman.annotations.userns'] || '')
+                    !== managedKeepIdUserNamespace(attested)
                 || String(record?.Config?.WorkingDir || '') !== containerWorkdir
                 || String(record?.Config?.Labels?.['ploinky.envhash'] || record?.Labels?.['ploinky.envhash'] || '') !== expectedEnvHash
                 || !hasExactManagedMountContract(record, expectedMounts)) {
@@ -1537,6 +1549,8 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
             || record?.HostConfig?.Init !== true
             || String(record?.Image || '') !== String(launch.attested.evidence.helper.image || '')
             || String(record?.Config?.User || '') !== String(launch.attested.evidence.helper.user || '')
+            || String(record?.HostConfig?.Annotations?.['io.podman.annotations.userns'] || '')
+                !== managedKeepIdUserNamespace(launch.attested)
             || String(record?.Config?.WorkingDir || '') !== containerWorkdir
             || String(record?.Config?.Labels?.['ploinky.envhash'] || record?.Labels?.['ploinky.envhash'] || '') !== launch.envHash
             || !hasExactManagedMountContract(record, expectedMounts)) {
@@ -1564,6 +1578,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
             const imageIndex = createArgs.indexOf(image);
             if (imageIndex < 1) throw new Error('managed candidate image position is unavailable');
             createArgs.splice(imageIndex, 0,
+                `--userns=${managedKeepIdUserNamespace(launch.attested)}`,
                 '-v', `${launch.descriptorHostFile}:${GENERATED_ROUTER_DESCRIPTOR_CONTAINER_FILE}:z,ro`,
                 ...flagsToArgs(Object.entries(launch.env).map(([name, value]) => formatEnvFlag(name, value))),
             );

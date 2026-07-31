@@ -349,12 +349,16 @@ export function runContainerAuthorityProbe({ runtime, plan, image, intent, nonce
     if (runtime !== 'podman') fail('PLOINKY_ROUTER_ATTESTATION_UNSUPPORTED', 'container attestation requires verified Podman');
     const imageId = runBounded(runtime, ['image', 'inspect', '--format', '{{.Id}}', image]);
     if (!imageId || !/^(sha256:)?[a-f0-9]{64}$/.test(imageId)) fail('PLOINKY_ROUTER_ATTESTATION_HELPER', 'actual agent image did not resolve to an immutable image ID');
-    const imageRecordRaw = runBounded(runtime, ['image', 'inspect', imageId]);
-    let imageRecord;
-    try { imageRecord = (JSON.parse(imageRecordRaw) || [])[0]; } catch (error) { fail('PLOINKY_ROUTER_ATTESTATION_HELPER', 'image inspection was malformed', error); }
-    const finalUser = String(imageRecord?.Config?.User || '').trim();
-    if (!finalUser || finalUser === '0' || finalUser === 'root' || finalUser.startsWith('0:')) {
-        fail('PLOINKY_ROUTER_ATTESTATION_UNSUPPORTED', 'actual agent image does not declare a final unprivileged user for the confined helper');
+    const finalUser = runBounded(runtime, ['image', 'inspect', '--format', '{{.Config.User}}', imageId]);
+    const finalUserMatch = /^([1-9][0-9]*):([1-9][0-9]*)$/.exec(finalUser);
+    const maxLinuxId = 4_294_967_294n;
+    if (!finalUserMatch
+        || BigInt(finalUserMatch[1]) > maxLinuxId
+        || BigInt(finalUserMatch[2]) > maxLinuxId) {
+        fail(
+            'PLOINKY_ROUTER_ATTESTATION_UNSUPPORTED',
+            'actual agent image must declare an exact numeric non-root UID:GID for the confined helper and rootless bind mapping',
+        );
     }
     const helperName = `ploinky-authority-${nonce.slice(0, 16)}`;
     const firstHost = intent.requestAuthority;
@@ -420,7 +424,16 @@ export function runContainerAuthorityProbe({ runtime, plan, image, intent, nonce
         let external;
         try { external = JSON.parse(output); } catch (error) { fail('PLOINKY_ROUTER_ATTESTATION_HELPER', 'helper probe output was malformed', error); }
         if (!Array.isArray(external) || external.length !== 2) fail('PLOINKY_ROUTER_ATTESTATION_HELPER', 'helper did not produce exactly two observations');
-        return Object.freeze({ external, helper: Object.freeze({ id: helperId, image: imageId, user: finalUser }) });
+        return Object.freeze({
+            external,
+            helper: Object.freeze({
+                id: helperId,
+                image: imageId,
+                user: finalUser,
+                uid: finalUserMatch[1],
+                gid: finalUserMatch[2],
+            }),
+        });
     } finally {
         if (helperId) {
             const inspected = inspectJson(runtime, helperId);
