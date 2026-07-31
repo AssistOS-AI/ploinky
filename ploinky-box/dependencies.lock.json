@@ -6,7 +6,7 @@
     },
     "achillesAgentLib": {
       "url": "https://github.com/AssistOS-AI/AchillesAgentLib.git",
-      "commit": "899fa6ca9fad28bdd565cab6b1a9c9fc7009fd76"
+      "commit": "6283dbbeb9f43d77e4432bd0286a8671ea1a8389"
     }
   }
 }
