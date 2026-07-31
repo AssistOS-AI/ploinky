@@ -6,6 +6,7 @@ import test from 'node:test';
 
 import { runOuterCli } from '../../ploinky-box/bin/ploinky-box.mjs';
 import { buildContainerExecArgs } from '../../ploinky-box/command/execute.mjs';
+import { BOX_LABELS } from '../../ploinky-box/constants.mjs';
 import { containerCreateArgs } from '../../ploinky-box/lifecycle/container.mjs';
 import { buildWorkspaceIdentity, resolveWorkspaceIdentity } from '../../ploinky-box/identity.mjs';
 import { buildEngineProcessEnvironment } from '../../ploinky-box/process.mjs';
@@ -26,7 +27,11 @@ function owned(identity, { running = true } = {}) {
         state: 'owned',
         engine: { name: 'podman', identity: 'engine-fingerprint' },
         handles: {
-            container: { id: 'a'.repeat(64), runtime: { running } },
+            container: {
+                id: 'a'.repeat(64),
+                labels: { [BOX_LABELS.routerHostPort]: '8080' },
+                runtime: { running },
+            },
             volumes: {},
         },
     };

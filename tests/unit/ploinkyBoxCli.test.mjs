@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import { buildContainerExecArgs } from '../../ploinky-box/command/execute.mjs';
+import { BOX_LABELS } from '../../ploinky-box/constants.mjs';
 import { runOuterCli } from '../../ploinky-box/bin/ploinky-box.mjs';
 
 function bufferStream(isTTY = false) {
@@ -23,7 +24,15 @@ function fakeSupervisor(events, { statusState = 'absent' } = {}) {
         state: statusState,
         identity: { instance: 'ploinky-box-workspace-123456789abc' },
         ownership: statusState === 'running-initialized'
-            ? { handles: { container: { id: prepared.containerId } } }
+            ? {
+                engine: prepared.engine,
+                handles: {
+                    container: {
+                        id: prepared.containerId,
+                        labels: { [BOX_LABELS.routerHostPort]: String(prepared.hostPort) },
+                    },
+                },
+            }
             : { state: statusState, handles: null },
     };
     return {
@@ -36,7 +45,7 @@ function fakeSupervisor(events, { statusState = 'absent' } = {}) {
     };
 }
 
-test('help is local and status/stop never prepare or invoke current core', async () => {
+test('help, unavailable status, and stop never prepare or invoke current core', async () => {
     for (const argv of [['help'], ['status'], ['--debug', 'stop']]) {
         const events = [];
         const output = bufferStream();
@@ -53,6 +62,45 @@ test('help is local and status/stop never prepare or invoke current core', async
             assert.equal(output.value().match(/Debug mode enabled/g)?.length, 1);
         }
     }
+});
+
+test('running status uses the read-only core renderer without preparing the Box', async () => {
+    const events = [];
+    const output = bufferStream();
+    const code = await runOuterCli(['status'], {
+        env: {},
+        input: { isTTY: false },
+        output,
+        errorOutput: bufferStream(),
+        supervisor: fakeSupervisor(events, { statusState: 'running-initialized' }),
+        execute(command, args) {
+            events.push(['execute', command, args]);
+            return 0;
+        },
+    });
+    assert.equal(code, 0);
+    assert.equal(events.includes('prepare'), false);
+    assert.deepEqual(events[0], 'status');
+    assert.equal(events[1][1], 'podman');
+    assert.deepEqual(events[1][2].slice(-2), [
+        '/opt/ploinky/bin/ploinky-local', 'status',
+    ]);
+    assert.equal(output.value(), '');
+});
+
+test('running status falls back to the Box summary when the core renderer fails', async () => {
+    const events = [];
+    const output = bufferStream();
+    const code = await runOuterCli(['status'], {
+        env: {},
+        input: { isTTY: false },
+        output,
+        errorOutput: bufferStream(),
+        supervisor: fakeSupervisor(events, { statusState: 'running-initialized' }),
+        execute() { return 17; },
+    });
+    assert.equal(code, 17);
+    assert.match(output.value(), /Ploinky Box: running-initialized/);
 });
 
 test('the image marker bypasses outer parsing and dispatches original argv directly', async () => {

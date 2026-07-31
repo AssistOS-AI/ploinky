@@ -242,7 +242,8 @@ test('installed public shims use only the fixed logical image through the candid
 
     const running = publicCommand(['status']);
     assert.equal(running.status, 0, running.stderr);
-    assert.match(running.stdout, /running-initialized/);
+    assert.match(running.stdout, /Workspace status:/);
+    assert.match(running.stdout, /Agent runtimes:/);
     const runningIdentity = harness.resolveIdentity();
     const runningInspection = harness.runner.query('podman', [
         'container', 'inspect', runningIdentity.instance,

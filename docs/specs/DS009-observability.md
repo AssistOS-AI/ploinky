@@ -14,7 +14,7 @@ Ploinky exposes operational state through router and watchdog logs, health check
 
 ## Core Content
 
-The watchdog and router must emit structured operational logs under `.ploinky/logs/`. The CLI currently exposes router-log streaming and tail retrieval through `logs tail` and `logs last`, and the browser status surface may shell out to `ploinky status` to present a CLI-consistent view of workspace state.
+The watchdog and router must emit structured operational logs under `.ploinky/logs/`. The CLI currently exposes router-log streaming and tail retrieval through `logs tail` and `logs last`, and the browser status surface may shell out to `ploinky status` to present a CLI-consistent view of workspace state. For a compatible running Box, the public host command uses the same read-only workspace renderer as the core command, including SSO, Router, repository, and per-agent runtime details. This status-only entrypoint bypasses core initialization and bootstrap so inspection cannot create workspace state, refresh repositories, or reconcile runtimes. Missing, stopped, incompatible, uninitialized, and transient Box states retain the dependency-free outer summary.
 
 Detailed Router health reports process uptime, PID, memory use, listener state,
 active-session counts, route-generation identity, and target status only through

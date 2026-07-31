@@ -8,10 +8,17 @@ import { runOuterRuntimeShell } from './sandbox/runtimeShell.js';
 export async function launchCli(args = process.argv.slice(2), {
     showHelpImpl = showHelp,
     runOuterRuntimeShellImpl = runOuterRuntimeShell,
+    statusWorkspaceImpl,
     importCoreImpl = () => import('./main.js'),
 } = {}) {
     if (args[0] === 'help' || args[0] === '--help' || args[0] === '-h') {
         showHelpImpl(args[0] === 'help' ? args.slice(1) : [], { surface: 'core' });
+        return 0;
+    }
+    if (args.length === 1 && args[0] === 'status') {
+        const renderStatus = statusWorkspaceImpl
+            || (await import('./utils/status.js')).statusWorkspace;
+        await renderStatus();
         return 0;
     }
     if (args.length === 1 && args[0] === 'cli') {

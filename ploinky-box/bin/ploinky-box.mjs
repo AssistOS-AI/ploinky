@@ -6,6 +6,7 @@ import { createInterface } from 'node:readline/promises';
 import { parseOuterArguments } from '../command/parse.mjs';
 import { routeOuterCommand } from '../command/route.mjs';
 import { buildContainerExecArgs, executeProcess } from '../command/execute.mjs';
+import { BOX_LABELS } from '../constants.mjs';
 import { buildEngineProcessEnvironment } from '../process.mjs';
 import { createBoxSupervisor, formatBoxStatus } from '../supervisor.mjs';
 import { isInsideBox } from '../lib/boxMarker.mjs';
@@ -93,6 +94,22 @@ export async function runOuterCli(argv, {
     }
     if (route.kind === 'status') {
         const status = selectedSupervisor.inspectBoxStatus();
+        const container = status.ownership?.handles?.container;
+        if (status.state === 'running-initialized' && container) {
+            const coreStatus = executePrepared({
+                containerId: container.id,
+                engine: status.ownership.engine,
+                hostPort: Number(container.labels?.[BOX_LABELS.routerHostPort]),
+            }, ['status'], {
+                execute,
+                input,
+                output,
+                engineEnv,
+            });
+            if (coreStatus === 0) return 0;
+            output.write(formatBoxStatus(status));
+            return coreStatus;
+        }
         output.write(formatBoxStatus(status));
         return ['foreign', 'incompatible', 'unknown', 'unsupported'].includes(status.state) ? 1 : 0;
     }

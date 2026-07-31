@@ -261,10 +261,13 @@ issuer/audience identity where specified.
 
 ## Status, shutdown, and destruction
 
-`ploinky status` is strictly read-only. It reports missing, stopped, compatible,
-unsupported, and unhealthy outer state, normalized exact publications, the observed image
-contract, and core status only when the outer runtime is already running. It
-does not pull, create, start, stop, remove, or reconcile.
+`ploinky status` is strictly read-only. It validates the outer state without
+mutation. Missing, stopped, unsupported, and unhealthy states use the
+dependency-free Box summary; when the outer runtime is compatible, initialized,
+and already running, the command prints the same detailed SSO, Router,
+repository, and per-agent runtime view as the core status command. The
+status-only core entrypoint bypasses workspace initialization and bootstrap. It
+does not pull, create, start, stop, remove, refresh, or reconcile.
 
 `ploinky stop` skips reconciliation. It attempts core shutdown first and then
 stops the outer runtime even when core shutdown fails, reporting both phases.
