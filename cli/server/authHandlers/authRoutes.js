@@ -368,13 +368,17 @@ export async function handleAuthRoutes(req, res, parsedUrl) {
             if (method === 'GET' || redirectTarget) {
                 res.writeHead(302, {
                     Location: redirectTarget || '/',
-                    'Set-Cookie': clearCookie
+                    'Set-Cookie': clearCookie,
+                    'Cache-Control': 'no-store, no-cache, must-revalidate',
+                    'Clear-Site-Data': '"cache"',
                 });
                 res.end('Logged out');
             } else {
                 res.writeHead(200, {
                     'Content-Type': 'application/json',
-                    'Set-Cookie': clearCookie
+                    'Set-Cookie': clearCookie,
+                    'Cache-Control': 'no-store, no-cache, must-revalidate',
+                    'Clear-Site-Data': '"cache"',
                 });
                 res.end(JSON.stringify({ ok: true }));
             }
