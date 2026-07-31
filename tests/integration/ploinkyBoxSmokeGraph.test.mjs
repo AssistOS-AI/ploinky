@@ -87,7 +87,6 @@ test('pinned seven-repository graph starts through one immutable Box candidate',
     ]);
     assert.equal(containersConf, [
         '[containers]',
-        'volumes=["/proc:/proc"]',
         'default_sysctls=[]',
     ].join('\n'));
     const agent = JSON.parse(execInBox(harness.runner, started.containerId, [
@@ -111,6 +110,24 @@ test('pinned seven-repository graph starts through one immutable Box candidate',
     assert.match(routerEnvironment, /^PLOINKY_ROUTER_URL=http:\/\/host\.containers\.internal:8080$/m);
     assert.match(routerEnvironment,
         new RegExp(`^PLOINKY_ROUTER_AUTHORITY=127\\.0\\.0\\.1:${route.hostPort}$`, 'm'));
+    const nestedPidMode = execInBox(harness.runner, started.containerId, [
+        'podman', 'container', 'inspect', '--format', '{{.HostConfig.PidMode}}', agent.id,
+    ]);
+    assert.equal(nestedPidMode, 'private');
+    const nestedProcfs = JSON.parse(execInBox(harness.runner, started.containerId, [
+        'podman', 'container', 'exec', agent.id,
+        '/usr/local/bin/node', '-e', [
+            "const f=require('node:fs');",
+            "const p=process.pid;",
+            "const s=Number(f.readlinkSync('/proc/self'));",
+            "const n=f.existsSync('/proc/'+p+'/ns/pid');",
+            "process.stdout.write(JSON.stringify({pid:p,procSelf:s,pidNamespaceVisible:n}));",
+        ].join(''),
+    ]));
+    assert.equal(nestedProcfs.procSelf, nestedProcfs.pid,
+        'nested procfs must represent the nested container PID namespace');
+    assert.equal(nestedProcfs.pidNamespaceVisible, true,
+        'the nested process namespace handle must be visible through its own procfs');
     waitForRouterHealth(harness.runner, started.containerId, {
         nestedContainerId: agent.id,
     });

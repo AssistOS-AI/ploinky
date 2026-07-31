@@ -745,6 +745,100 @@ test('managed transaction creates multiple attachments, verifies start, and comm
     assert.equal(Object.keys(candidate.NetworkSettings.Networks).length, 2);
 });
 
+test('managed replacement reconciles a failed stop only after the exact owned container exited', (t) => {
+    const harness = networkHarness(t);
+    const network = canonicalizeNetwork({ mode: 'default' });
+    const previousId = 'previous123456789';
+    harness.containers.set(previousId, managedAgentRecord({
+        id: previousId,
+        name: 'demo-container',
+        labels: managedAgentLabels(harness.identity, network),
+        running: true,
+    }));
+    const baseRun = harness.run;
+    const run = (runtime, args) => {
+        const result = baseRun(runtime, args);
+        if (args[0] === 'stop' && args[1] === previousId) {
+            return {
+                ...absent('runtime cleanup'),
+                stderr: 'openByHandleAt failed: operation not permitted',
+            };
+        }
+        return result;
+    };
+    const adapter = createNetworkLifecycleAdapter({
+        runtime: 'podman',
+        run,
+        workspaceRoot: harness.identity.canonical,
+        lockPath: path.join(harness.dir, 'reconciled-stop.lock'),
+    });
+
+    const result = adapter.runManagedContainerTransaction({
+        network,
+        canonicalAgentId: 'demo',
+        containerName: 'demo-container',
+        runtimeIdentity: TEST_RUNTIME_IDENTITY,
+        createContainer(plan) {
+            const id = 'candidate123456789';
+            const primary = plan.attachments[0];
+            const candidate = managedAgentRecord({
+                id,
+                name: 'demo-container',
+                labels: managedAgentLabels(harness.identity, network),
+                networks: { [primary.name]: { Aliases: [plan.alias, id.slice(0, 12)] } },
+            });
+            harness.containers.set(id, candidate);
+            harness.networks.get(primary.name).Containers[id] = { Name: candidate.Name };
+        },
+    });
+
+    assert.equal(result.containerId, 'candidate123456789');
+    assert.equal(harness.containers.has(previousId), false);
+    assert.equal(harness.containers.get(result.containerId).State.Running, true);
+    assert.equal(harness.calls.some((args) => (
+        args[0] === 'container' && args[1] === 'inspect' && args[2] === previousId
+    )), true);
+});
+
+test('managed replacement preserves a still-running container after a failed stop', (t) => {
+    const harness = networkHarness(t);
+    const network = canonicalizeNetwork({ mode: 'default' });
+    const previousId = 'previous123456789';
+    harness.containers.set(previousId, managedAgentRecord({
+        id: previousId,
+        name: 'demo-container',
+        labels: managedAgentLabels(harness.identity, network),
+        running: true,
+    }));
+    const baseRun = harness.run;
+    const run = (runtime, args) => {
+        if (args[0] === 'stop' && args[1] === previousId) {
+            harness.calls.push([...args]);
+            return {
+                ...absent('runtime cleanup'),
+                stderr: 'openByHandleAt failed: operation not permitted',
+            };
+        }
+        return baseRun(runtime, args);
+    };
+    const adapter = createNetworkLifecycleAdapter({
+        runtime: 'podman',
+        run,
+        workspaceRoot: harness.identity.canonical,
+        lockPath: path.join(harness.dir, 'failed-stop.lock'),
+    });
+
+    assert.throws(() => adapter.runManagedContainerTransaction({
+        network,
+        canonicalAgentId: 'demo',
+        containerName: 'demo-container',
+        runtimeIdentity: TEST_RUNTIME_IDENTITY,
+        createContainer: () => assert.fail('candidate creation must remain blocked'),
+    }), /cannot stop.*openByHandleAt failed/);
+    assert.equal(harness.containers.get(previousId).State.Running, true);
+    assert.equal(harness.calls.some((args) => args[0] === 'rm'), false);
+});
+
 test('host-gateway start failure removes the candidate and never restores the predecessor runtime', (t) => {
     const harness = networkHarness(t);
     const network = canonicalizeNetwork({ mode: 'default' });

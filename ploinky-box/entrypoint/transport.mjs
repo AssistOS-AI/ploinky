@@ -193,7 +193,6 @@ export function writeTransportPair({
         Buffer.from(`${JSON.stringify(transport)}\n`),
         Buffer.from([
             '[containers]',
-            'volumes=["/proc:/proc"]',
             'default_sysctls=[]',
             '',
         ].join('\n')),

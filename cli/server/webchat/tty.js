@@ -245,6 +245,11 @@ function createLocalTTYFactory({ workdir, command }) {
 
         let ptyProc = null;
         let disposed = false;
+        let restarting = false;
+        let restartTimer = null;
+        const pendingInput = [];
+        let pendingInputBytes = 0;
+        const maxPendingInputBytes = 256 * 1024;
         const outputHandlers = new Set();
         const closeHandlers = new Set();
         const restartWindowMs = 60 * 1000;
@@ -258,6 +263,25 @@ function createLocalTTYFactory({ workdir, command }) {
         const emitClose = () => {
             for (const h of closeHandlers) {
                 try { h(); } catch (_) { }
+            }
+        };
+        const clearPendingInput = () => {
+            pendingInput.length = 0;
+            pendingInputBytes = 0;
+        };
+        const queuePendingInput = (data) => {
+            const chunk = Buffer.isBuffer(data) ? data : Buffer.from(String(data || ''));
+            if (pendingInputBytes + chunk.length > maxPendingInputBytes) return false;
+            pendingInput.push(chunk);
+            pendingInputBytes += chunk.length;
+            return true;
+        };
+        const flushPendingInput = () => {
+            if (!isWritableChild(ptyProc) || pendingInput.length === 0) return;
+            const chunks = pendingInput.splice(0);
+            pendingInputBytes = 0;
+            for (const chunk of chunks) {
+                ptyProc.stdin.write(chunk);
             }
         };
 
@@ -298,6 +322,7 @@ function createLocalTTYFactory({ workdir, command }) {
                 });
                 ptyProc.stdout.setEncoding('utf8');
                 ptyProc.stderr.setEncoding('utf8');
+                restarting = false;
                 ptyProc.stdout.on('data', emitOutput);
                 ptyProc.stderr.on('data', emitOutput);
                 ptyProc.stdin.on('error', (e) => {
@@ -315,19 +340,29 @@ function createLocalTTYFactory({ workdir, command }) {
                     }
                     if (!isFallback && hasCustom) {
                         if (canRestart()) {
-                            setTimeout(() => {
+                            restarting = true;
+                            restartTimer = setTimeout(() => {
+                                restartTimer = null;
                                 if (disposed) {
+                                    restarting = false;
+                                    clearPendingInput();
                                     emitClose();
                                     return;
                                 }
                                 try {
                                     startProc({ entry: String(command), isFallback: false });
+                                    flushPendingInput();
                                 } catch (_) {
+                                    restarting = false;
+                                    clearPendingInput();
                                     emitClose();
                                 }
                             }, 250);
+                            restartTimer.unref?.();
                             return;
                         }
+                        restarting = false;
+                        clearPendingInput();
                         emitOutput('[webchat] Agent process exited repeatedly. Closing session.\n');
                         emitClose();
                         return;
@@ -347,9 +382,13 @@ function createLocalTTYFactory({ workdir, command }) {
             get pid() { return ptyProc?.pid; },
             onOutput(handler) { if (handler) outputHandlers.add(handler); return () => outputHandlers.delete(handler); },
             onClose(handler) { if (handler) closeHandlers.add(handler); return () => closeHandlers.delete(handler); },
-            isAlive() { return !disposed && isWritableChild(ptyProc); },
+            isAlive() { return !disposed && (restarting || isWritableChild(ptyProc)); },
             write(data) {
-                if (disposed || !isWritableChild(ptyProc)) return false;
+                if (disposed) return false;
+                if (restarting && !isWritableChild(ptyProc)) {
+                    return queuePendingInput(data);
+                }
+                if (!isWritableChild(ptyProc)) return false;
                 try {
                     ptyProc.stdin.write(data);
                     return true;
@@ -360,6 +399,10 @@ function createLocalTTYFactory({ workdir, command }) {
             },
             kill() {
                 disposed = true;
+                restarting = false;
+                if (restartTimer) clearTimeout(restartTimer);
+                restartTimer = null;
+                clearPendingInput();
                 const pid = ptyProc?.pid;
                 try { ptyProc?.kill?.(); } catch (_) { }
                 // Try to kill process group for thorough cleanup
@@ -369,6 +412,10 @@ function createLocalTTYFactory({ workdir, command }) {
             },
             dispose() {
                 disposed = true;
+                restarting = false;
+                if (restartTimer) clearTimeout(restartTimer);
+                restartTimer = null;
+                clearPendingInput();
                 const pid = ptyProc?.pid;
                 // First try graceful termination
                 try { ptyProc?.kill?.(); } catch (_) { }

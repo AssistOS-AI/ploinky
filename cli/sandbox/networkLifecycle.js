@@ -843,7 +843,24 @@ export function createNetworkLifecycleAdapter({
                     assertRequiredLabels(containerName, labelsOf(current), ownershipLabels);
                     if (previous?.State?.Running === true || previous?.State?.Status === 'running') {
                         const stopped = execute(['stop', previousId]);
-                        if (!stopped.ok) throw new Error(`cannot stop '${containerName}' for managed replacement: ${failure(stopped)}`);
+                        if (!stopped.ok) {
+                            const reconciled = inspectContainer(previousId);
+                            const reconciledId = reconciled
+                                ? containerRecordId(reconciled, containerName)
+                                : '';
+                            const reconciledRunning = reconciled?.State?.Running === true
+                                || reconciled?.State?.Status === 'running';
+                            if (!reconciled
+                                || reconciledId !== previousId
+                                || reconciledRunning) {
+                                throw new Error(`cannot stop '${containerName}' for managed replacement: ${failure(stopped)}`);
+                            }
+                            assertRequiredLabels(
+                                containerName,
+                                labelsOf(reconciled),
+                                ownershipLabels,
+                            );
+                        }
                     }
                     const removed = execute(['rm', '-f', previousId]);
                     if (!removed.ok && !missing(removed)) {
