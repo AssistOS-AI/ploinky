@@ -486,6 +486,9 @@ function surfaceForPath(
     if (available.has('marketplace-ui') && isRouteMount(pathname, '/api/marketplace')) {
         return { name: 'marketplace-ui', routerOwned: true };
     }
+    if (available.has('webchat') && isRouteMount(pathname, '/webchat')) {
+        return { name: 'webchat', routerOwned: true };
+    }
     return null;
 }
 

@@ -590,6 +590,86 @@ test('selected root administration routes remain closed without user-admin', (t)
     assert.equal(plan.code, 'ROUTE_SURFACE_DENIED');
 });
 
+test('webchat exposes only the WebChat router mount for the selected root', (t) => {
+    const fixture = createFixture(t, {
+        desired: {
+            hosts: {
+                'explorer.example.test': {
+                    agent: 'fixtures/alpha',
+                    routerSurfaces: ['webchat'],
+                },
+            },
+            cloudflare: {
+                tunnelTokenSecret: 'publication/test-connector',
+            },
+        },
+    });
+    const applied = applyEdgeRoutingGeneration({
+        workspaceRoot: fixture.workspace,
+        reason: 'selected-root-webchat',
+        publicationState: 'ready',
+    });
+    assert.deepEqual(applied.generation.compiled.surfaces['explorer.example.test'], ['webchat']);
+
+    for (const pathname of ['/webchat', '/webchat/', '/webchat/input']) {
+        const plan = resolveEdgeRoutePlan({
+            req: {
+                method: 'GET',
+                url: pathname,
+                headers: { host: 'explorer.example.test' },
+            },
+            listener: 'public',
+        });
+        assert.equal(plan.ok, true, pathname);
+        assert.equal(plan.kind, 'router-surface', pathname);
+        assert.equal(plan.surface, 'webchat', pathname);
+    }
+
+    for (const pathname of ['/dashboard', '/status', '/workspace-files']) {
+        const plan = resolveEdgeRoutePlan({
+            req: {
+                method: 'GET',
+                url: pathname,
+                headers: { host: 'explorer.example.test' },
+            },
+            listener: 'public',
+        });
+        assert.equal(plan.ok, false, pathname);
+        assert.equal(plan.code, 'ROUTE_SURFACE_DENIED', pathname);
+    }
+});
+
+test('WebChat router mount remains closed without the webchat surface', (t) => {
+    const fixture = createFixture(t, {
+        desired: {
+            hosts: {
+                'explorer.example.test': {
+                    agent: 'fixtures/alpha',
+                    routerSurfaces: [],
+                },
+            },
+            cloudflare: {
+                tunnelTokenSecret: 'publication/test-connector',
+            },
+        },
+    });
+    applyEdgeRoutingGeneration({
+        workspaceRoot: fixture.workspace,
+        reason: 'closed-webchat',
+        publicationState: 'ready',
+    });
+    const plan = resolveEdgeRoutePlan({
+        req: {
+            method: 'GET',
+            url: '/webchat?agent=alpha',
+            headers: { host: 'explorer.example.test' },
+        },
+        listener: 'public',
+    });
+    assert.equal(plan.ok, false);
+    assert.equal(plan.code, 'ROUTE_SURFACE_DENIED');
+});
+
 test('legacy duplicate route and host-network authority is rejected', (t) => {
     const fixture = createFixture(t, {
         desired: {
