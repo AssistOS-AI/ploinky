@@ -4,9 +4,10 @@ export const DEFAULT_PROXY_LIMITS = Object.freeze({
     bufferedBodyBytes: 8 * 1024 * 1024,
     streamedBodyBytes: 64 * 1024 * 1024,
     connectTimeoutMs: 5_000,
-    headerTimeoutMs: 15_000,
+    headerTimeoutMs: 455_000,
     idleTimeoutMs: 60_000,
     longLivedTimeoutMs: 30 * 60_000,
+    webSocketHandshakeTimeoutMs: 15_000,
     webSocketFrameBytes: 1024 * 1024,
     webSocketMessageBytes: 8 * 1024 * 1024,
     concurrentStreamsPerAgent: 64,
@@ -42,6 +43,9 @@ export function compileProxyLimits(overrides = {}) {
     }
     if (limits.connectTimeoutMs > limits.headerTimeoutMs) {
         throw new Error('proxyLimits: connect timeout cannot exceed header timeout');
+    }
+    if (limits.connectTimeoutMs > limits.webSocketHandshakeTimeoutMs) {
+        throw new Error('proxyLimits: connect timeout cannot exceed WebSocket handshake timeout');
     }
     return Object.freeze(limits);
 }

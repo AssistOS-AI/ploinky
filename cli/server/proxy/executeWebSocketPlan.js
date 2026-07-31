@@ -197,7 +197,7 @@ export async function executeWebSocketPlan({
             });
             headerTimer = setTimeout(
                 () => fail(new Error('proxy: WebSocket handshake timeout')),
-                finalized.limits.headerTimeoutMs,
+                finalized.limits.webSocketHandshakeTimeoutMs,
             );
             headerTimer.unref?.();
             upstream.once('upgrade', (response, selectedUpstreamSocket, upstreamHead) => {

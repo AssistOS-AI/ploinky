@@ -9,6 +9,7 @@ import { sanitizeResponseHeaders } from './sanitizeResponseHeaders.js';
 import { recordProxyOutcome } from './recordProxyOutcome.js';
 
 const READ_ONLY = new Set(['GET', 'HEAD', 'OPTIONS']);
+const ABANDONED_REQUEST_CLOSE_GRACE_MS = 1_000;
 
 class ByteLimitTransform extends Transform {
     constructor(limit, message, code = 'STREAM_TOO_LARGE') {
@@ -130,24 +131,64 @@ export function assertSupportedHttp1Request(req, plan) {
 }
 
 function readBoundedBody(req, limit) {
-    return new Promise((resolve, reject) => {
-        const chunks = [];
-        let size = 0;
-        req.on('data', chunk => {
-            size += chunk.length;
-            if (size > limit) {
-                const error = new Error('proxy: buffered request body limit exceeded');
-                error.code = 'REQUEST_TOO_LARGE';
-                reject(error);
-                req.pause();
-                return;
-            }
-            chunks.push(Buffer.from(chunk));
-        });
-        req.once('end', () => resolve(Buffer.concat(chunks)));
-        req.once('aborted', () => reject(new Error('proxy: client aborted')));
-        req.once('error', reject);
+    const chunks = [];
+    let size = 0;
+    let settled = false;
+    let closeAfterResponse = false;
+    let resolveBody;
+    let rejectBody;
+    const cleanup = () => {
+        req.off('data', onData);
+        req.off('end', onEnd);
+        req.off('aborted', onAborted);
+        req.off('error', onError);
+    };
+    const resolve = value => {
+        if (settled) return false;
+        settled = true;
+        cleanup();
+        resolveBody(value);
+        return true;
+    };
+    const reject = (error, { abandon = false } = {}) => {
+        if (settled) return false;
+        settled = true;
+        closeAfterResponse = abandon && !req.complete && !req.destroyed;
+        cleanup();
+        chunks.length = 0;
+        if (abandon) {
+            try { req.pause(); } catch (_) {}
+        }
+        rejectBody(error);
+        return true;
+    };
+    const cancel = error => reject(error, { abandon: true });
+    const onData = chunk => {
+        size += chunk.length;
+        if (size > limit) {
+            const error = new Error('proxy: buffered request body limit exceeded');
+            error.code = 'REQUEST_TOO_LARGE';
+            cancel(error);
+            return;
+        }
+        chunks.push(Buffer.from(chunk));
+    };
+    const onEnd = () => resolve(Buffer.concat(chunks));
+    const onAborted = () => cancel(new Error('proxy: client aborted'));
+    const onError = error => reject(error);
+    const promise = new Promise((resolvePromise, rejectPromise) => {
+        resolveBody = resolvePromise;
+        rejectBody = rejectPromise;
+        req.once('end', onEnd);
+        req.once('aborted', onAborted);
+        req.once('error', onError);
+        req.on('data', onData);
     });
+    return {
+        promise,
+        cancel,
+        shouldCloseAfterResponse: () => closeAfterResponse,
+    };
 }
 
 export function proxyErrorStatus(error) {
@@ -162,17 +203,36 @@ export function proxyErrorStatus(error) {
     return 502;
 }
 
-function sendError(res, error) {
+function sendError(res, error, { abandonedRequest } = {}) {
+    let closeTimer;
+    const closeRequest = () => {
+        clearTimeout(closeTimer);
+        closeTimer = null;
+        if (!abandonedRequest || abandonedRequest.destroyed || abandonedRequest.complete) return;
+        try { abandonedRequest.destroy(); } catch (_) {}
+    };
+    if (res.destroyed || res.writableEnded) {
+        closeRequest();
+        return;
+    }
     if (res.headersSent) {
         try { res.destroy(error); } catch (_) {}
+        closeRequest();
         return;
     }
     const status = proxyErrorStatus(error);
-    res.writeHead(status, { 'content-type': 'application/json', 'cache-control': 'no-store' });
+    const headers = { 'content-type': 'application/json', 'cache-control': 'no-store' };
+    if (abandonedRequest && !abandonedRequest.complete && !abandonedRequest.destroyed) {
+        headers.connection = 'close';
+        res.shouldKeepAlive = false;
+        closeTimer = setTimeout(closeRequest, ABANDONED_REQUEST_CLOSE_GRACE_MS);
+        closeTimer.unref?.();
+    }
+    res.writeHead(status, headers);
     const responseError = status === 403 ? 'request_rejected'
         : status === 413 ? 'request_too_large'
             : status === 504 ? 'upstream_timeout' : 'upstream_unavailable';
-    res.end(JSON.stringify({ error: responseError }));
+    res.end(JSON.stringify({ error: responseError }), closeRequest);
 }
 
 export async function executeHttpPlan({
@@ -190,50 +250,146 @@ export async function executeHttpPlan({
     const startedAt = Date.now();
     let channel;
     let relayAgent;
+    let upstream;
+    let bodyReader;
     let leaseOutcome = 'uncommitted';
     let requestBytes = 0;
     let responseBytes = 0;
     let responseStatus = 0;
+    let cancellationError;
+    let resolveCancellation;
+    const cancellationPromise = new Promise(resolve => { resolveCancellation = resolve; });
+    let headerDeadlineError;
+    let resolveHeaderDeadline;
+    const headerDeadlinePromise = new Promise(resolve => { resolveHeaderDeadline = resolve; });
+    let headerDeadlineAt;
+    let headerDeadlineTimer;
+    let cancelActiveRequest;
+    const observeCancellation = error => {
+        if (!cancellationError) {
+            cancellationError = error;
+            resolveCancellation(error);
+        }
+        cancelActiveRequest?.(cancellationError);
+    };
+    const onRequestAborted = () => observeCancellation(new Error('proxy: client aborted'));
+    const onResponseClosed = () => {
+        if (!res.writableEnded) observeCancellation(new Error('proxy: downstream cancelled'));
+    };
+    const expireHeaderDeadline = () => {
+        if (!headerDeadlineError) {
+            headerDeadlineError = new Error('proxy: upstream response header timeout');
+            resolveHeaderDeadline(headerDeadlineError);
+        }
+        cancelActiveRequest?.(headerDeadlineError);
+    };
+    const clearHeaderDeadline = () => {
+        clearTimeout(headerDeadlineTimer);
+        headerDeadlineTimer = null;
+    };
+    const currentInterruptionError = () => {
+        if (cancellationError) return cancellationError;
+        if (!headerDeadlineError && headerDeadlineAt !== undefined && Date.now() >= headerDeadlineAt) {
+            expireHeaderDeadline();
+        }
+        return headerDeadlineError;
+    };
+    const throwIfInterrupted = () => {
+        const error = currentInterruptionError();
+        if (error) throw error;
+    };
+    const closeCheckout = checkout => {
+        try { checkout?.close?.(); } catch (_) {}
+    };
+    const awaitSetup = async (setupPromise, { onInterrupt, onLateResolve } = {}) => {
+        const completion = Promise.resolve(setupPromise).then(
+            value => ({ type: 'resolved', value }),
+            error => ({ type: 'rejected', error }),
+        );
+        const outcome = await Promise.race([
+            cancellationPromise.then(error => ({ type: 'interrupted', error })),
+            headerDeadlinePromise.then(error => ({ type: 'interrupted', error })),
+            completion,
+        ]);
+        const interruptionError = outcome.type === 'interrupted'
+            ? outcome.error
+            : currentInterruptionError();
+        if (interruptionError) {
+            try { onInterrupt?.(interruptionError); } catch (_) {}
+            if (outcome.type === 'resolved') {
+                try { onLateResolve?.(outcome.value); } catch (_) {}
+            } else {
+                void completion.then(lateOutcome => {
+                    if (lateOutcome.type !== 'resolved') return;
+                    try { onLateResolve?.(lateOutcome.value); } catch (_) {}
+                });
+            }
+            throw interruptionError;
+        }
+        if (outcome.type === 'resolved') return outcome.value;
+        if (outcome.type === 'rejected') throw outcome.error;
+        throw new Error('proxy: setup interrupted');
+    };
+    req.once('aborted', onRequestAborted);
+    res.once('close', onResponseClosed);
+    if (req.aborted) onRequestAborted();
+    if (res.destroyed && !res.writableEnded) onResponseClosed();
     try {
         if (authorized !== true) throw Object.assign(new Error('proxy: request not authorized'), { code: 'AUTH_REQUIRED' });
         assertSupportedHttp1Request(req, plan);
         const finalized = finalizePlanAfterAdmission(plan);
+        headerDeadlineAt = startedAt + finalized.limits.headerTimeoutMs;
+        const headerDeadlineDelay = Math.max(0, headerDeadlineAt - Date.now());
+        headerDeadlineTimer = setTimeout(expireHeaderDeadline, headerDeadlineDelay);
+        headerDeadlineTimer.unref?.();
+        throwIfInterrupted();
         const hasBody = !['GET', 'HEAD'].includes(finalized.method);
         const hasPrebufferedBody = prebufferedBody !== undefined;
         const streaming = hasBody
             && finalized.allowRequestStreaming === true
             && !hasPrebufferedBody;
-        const body = streaming
-            ? null
-            : prebufferedBody !== undefined
-                ? Buffer.from(prebufferedBody)
-                : await readBoundedBody(req, finalized.limits.bufferedBodyBytes);
+        if (!streaming && prebufferedBody === undefined) {
+            bodyReader = readBoundedBody(req, finalized.limits.bufferedBodyBytes);
+        }
+        const body = streaming ? null
+            : prebufferedBody !== undefined ? Buffer.from(prebufferedBody)
+                : await awaitSetup(bodyReader.promise, { onInterrupt: bodyReader.cancel });
+        throwIfInterrupted();
         if (body && body.length > finalized.limits.bufferedBodyBytes) {
             throw Object.assign(new Error('proxy: buffered request body limit exceeded'), { code: 'REQUEST_TOO_LARGE' });
         }
         requestBytes = body?.length || 0;
         const bodyMode = streaming ? 'stream' : body?.length ? 'buffered' : 'none';
         const bodyHash = streaming ? '' : sha256RawBodyHash(body || Buffer.alloc(0));
+        throwIfInterrupted();
         const resolvedTrustedHeaders = typeof trustedHeadersFactory === 'function'
-            ? await trustedHeadersFactory({ body, bodyMode, bodyHash, plan: finalized })
+            ? await awaitSetup(trustedHeadersFactory({ body, bodyMode, bodyHash, plan: finalized }))
             : trustedHeaders;
+        throwIfInterrupted();
         const headers = sanitizeRequestHeaders(req.headers, finalized, resolvedTrustedHeaders || {});
         if (!streaming) headers['content-length'] = String(body?.length || 0);
         if (measureHeaderBytes(headers) > finalized.limits.requestHeaderBytes) {
             throw Object.assign(new Error('proxy: request header limit exceeded'), { code: 'REQUEST_TOO_LARGE' });
         }
-        channel = await relayManager.checkout({ plan: finalized, lease, authorized: true });
+        throwIfInterrupted();
+        channel = await awaitSetup(
+            relayManager.checkout({ plan: finalized, lease, authorized: true }),
+            { onLateResolve: closeCheckout },
+        );
         leaseOutcome = 'committed';
-        const relayStream = await channel.openRequest({ plan: finalized, bodyMode, bodyHash, headers });
+        throwIfInterrupted();
+        const relayStream = await awaitSetup(
+            channel.openRequest({ plan: finalized, bodyMode, bodyHash, headers }),
+            { onLateResolve: () => closeCheckout(channel) },
+        );
+        throwIfInterrupted();
         const connection = new RelayDuplex(relayStream);
         relayAgent = createRelayHttpAgent(connection);
         await new Promise((resolve, reject) => {
             let settled = false;
-            let headerTimer;
             let idleTimer;
             let lifetimeTimer;
             const clearTimers = () => {
-                clearTimeout(headerTimer);
                 clearTimeout(idleTimer);
                 clearTimeout(lifetimeTimer);
             };
@@ -241,13 +397,17 @@ export async function executeHttpPlan({
                 if (settled) return;
                 settled = true;
                 clearTimers();
+                clearHeaderDeadline();
+                if (cancelActiveRequest === fail) cancelActiveRequest = null;
                 resolve();
             };
             const fail = error => {
                 if (settled) return;
                 settled = true;
                 clearTimers();
-                try { upstream.destroy(error); } catch (_) {}
+                clearHeaderDeadline();
+                if (cancelActiveRequest === fail) cancelActiveRequest = null;
+                try { upstream?.destroy(error); } catch (_) {}
                 reject(error);
             };
             const resetIdleTimer = () => {
@@ -255,14 +415,25 @@ export async function executeHttpPlan({
                 idleTimer = setTimeout(() => fail(new Error('proxy: upstream idle timeout')), finalized.limits.idleTimeoutMs);
                 idleTimer.unref?.();
             };
-            const upstream = http.request({
+            cancelActiveRequest = fail;
+            const interruptionError = currentInterruptionError();
+            if (interruptionError) {
+                fail(interruptionError);
+                return;
+            }
+            upstream = http.request({
                 method: finalized.method,
                 path: `${finalized.targetPath}${finalized.query ? `?${finalized.query}` : ''}`,
                 headers,
                 maxHeaderSize: finalized.limits.responseHeaderBytes,
                 agent: relayAgent,
             }, upstreamRes => {
-                clearTimeout(headerTimer);
+                const responseInterruptionError = currentInterruptionError();
+                if (responseInterruptionError) {
+                    fail(responseInterruptionError);
+                    return;
+                }
+                clearHeaderDeadline();
                 res.writeHead(upstreamRes.statusCode || 502, sanitizeResponseHeaders(upstreamRes.headers, finalized));
                 responseStatus = upstreamRes.statusCode || 502;
                 const contentType = String(upstreamRes.headers['content-type'] || '').toLowerCase();
@@ -285,16 +456,12 @@ export async function executeHttpPlan({
                 resetIdleTimer();
                 pipeline(upstreamRes, responseLimiter, res).then(finish, fail);
             });
-            headerTimer = setTimeout(
-                () => fail(new Error('proxy: upstream response header timeout')),
-                finalized.limits.headerTimeoutMs,
-            );
-            headerTimer.unref?.();
             upstream.once('error', fail);
-            req.once('aborted', () => fail(new Error('proxy: client aborted')));
-            res.once('close', () => {
-                if (!res.writableEnded) fail(new Error('proxy: downstream cancelled'));
-            });
+            const postRequestInterruptionError = currentInterruptionError();
+            if (postRequestInterruptionError) {
+                fail(postRequestInterruptionError);
+                return;
+            }
             if (streaming) {
                 const requestLimiter = new ByteLimitTransform(
                     finalized.limits.streamedBodyBytes,
@@ -322,10 +489,12 @@ export async function executeHttpPlan({
             upstreamOutcome: 'success',
             sink: auditSink,
         });
-        channel.close();
+        closeCheckout(channel);
         lease.release?.();
         return true;
     } catch (error) {
+        clearHeaderDeadline();
+        try { upstream?.destroy(error); } catch (_) {}
         relayAgent?.destroy();
         recordProxyOutcome({
             plan,
@@ -340,10 +509,17 @@ export async function executeHttpPlan({
             upstreamOutcome: 'failure',
             sink: auditSink,
         });
-        channel?.close();
+        closeCheckout(channel);
         lease?.release?.();
-        sendError(res, error);
+        sendError(res, error, {
+            abandonedRequest: bodyReader?.shouldCloseAfterResponse() ? req : undefined,
+        });
         return false;
+    } finally {
+        clearHeaderDeadline();
+        cancelActiveRequest = null;
+        req.off('aborted', onRequestAborted);
+        res.off('close', onResponseClosed);
     }
 }
 

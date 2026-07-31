@@ -270,6 +270,18 @@ captured route plan and revalidate its generation immediately before opening
 the upstream connection. No secondary-target proxy or separate publication
 component exists.
 
+The generic Router proxy bounds upstream connection establishment at 5 seconds,
+the complete ingress-to-HTTP-response-header interval at 455 seconds, and a
+WebSocket upgrade handshake at 15 seconds. The absolute HTTP deadline is a hard
+outer cap sized to cover bounded relay setup, target connection, a 60-second
+application queue, three 120-second application attempts, two maximum-jitter
+default retry delays, and forwarding margin. It may truncate application
+policies configured beyond those defaults or application work that ignores
+cancellation. Separating the WebSocket deadline prevents the longer
+buffered-HTTP allowance from extending upgrade exposure. All limits remain
+finite and do not alter authority, admission, target selection, body-size,
+idle-body, or concurrency enforcement.
+
 Manifest volume declarations from the root manifest and active profile must create missing host directories before startup. Relative host paths are resolved against the workspace root, absolute host paths are honored as declared, and manifest volumes are not limited to `.ploinky/`. A manifest volume with `volumeOptions.<containerPath>.readOnly: true` must be enforced as read-only by every runtime backend: Podman uses a read-only relabelled bind, Docker uses a read-only bind, bwrap uses `--ro-bind`, and Seatbelt grants read access while overlaying an explicit write deny. The explicit deny must protect the read-only volume even when its path is beneath a broader writable workspace path. Writable Podman manifest volumes under `.ploinky/data/` are mounted with the Podman `:U` option so non-root images can write their private runtime state; external manifest volumes keep normal ownership unless the volume option explicitly opts into Podman chowning. Runtime resources declared under `runtime.resources` may create persistent storage under `.ploinky/data/<key>/` and may materialize environment variables from workspace paths, persisted secrets, and variable references.
 
 The static agent’s preinstall host hook must be allowed to run before dependency startup begins. This is part of the current startup contract because dependent services may require variables or files that the static agent’s preinstall hook creates before the dependency graph is expanded into startup waves.
