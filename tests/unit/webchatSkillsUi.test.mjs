@@ -135,9 +135,11 @@ test('checkbox changes remain local until Save sends the ordered command batch',
     };
     const quickCommands = [];
     const batches = [];
+    let catalogRefreshes = 0;
     const controller = createSkillsController({
         sendQuickCommand: (command) => { quickCommands.push(command); return true; },
         sendQuickCommands: async (commands) => { batches.push(commands); return true; },
+        refreshCommandCatalog: async () => { catalogRefreshes += 1; },
         elements,
         showBanner() {},
     });
@@ -163,6 +165,8 @@ test('checkbox changes remain local until Save sends the ordered command batch',
     controller.handleState({ event: 'list', skills: skills.map((skill) => (
         skill.relativePath.startsWith('packages/') ? { ...skill, enabled: true } : skill
     )) });
+    await Promise.resolve();
+    assert.equal(catalogRefreshes, 1);
     assert.equal(elements.skillsSaveBtn.disabled, true);
     assert.equal(elements.skillsSaveStatus.textContent, 'No unsaved changes');
 });

@@ -100,7 +100,13 @@ function folderState(node) {
     return 'mixed';
 }
 
-export function createSkillsController({ sendQuickCommand, sendQuickCommands, elements, showBanner }) {
+export function createSkillsController({
+    sendQuickCommand,
+    sendQuickCommands,
+    refreshCommandCatalog,
+    elements,
+    showBanner,
+}) {
     const {
         skillsBtn,
         skillsDialog,
@@ -312,6 +318,7 @@ export function createSkillsController({ sendQuickCommand, sendQuickCommands, el
         if (payload.event === 'error' && payload.error) showBanner(payload.error, 'err');
         if (saving && payload.event !== 'list') return;
         const expandByDefault = loading;
+        const completedSave = saving;
         originalSkills = cloneSkills(payload.skills);
         draftSkills = cloneSkills(payload.skills);
         folderIntents.clear();
@@ -322,6 +329,11 @@ export function createSkillsController({ sendQuickCommand, sendQuickCommands, el
         loading = false;
         saving = false;
         render();
+        if (completedSave && typeof refreshCommandCatalog === 'function') {
+            Promise.resolve(refreshCommandCatalog()).catch(() => {
+                showBanner('Skill state was saved, but command autocomplete could not be refreshed.', 'err');
+            });
+        }
     }
 
     skillsBtn?.addEventListener('click', open);

@@ -145,6 +145,7 @@ taskController = createTaskController({
 skillsController = createSkillsController({
     sendQuickCommand: (command) => network?.sendQuickCommand(command) || false,
     sendQuickCommands: (commands) => network?.sendQuickCommands(commands) || Promise.resolve(false),
+    refreshCommandCatalog: () => composerAutocomplete?.refresh(),
     elements: {
         skillsBtn,
         skillsDialog,
