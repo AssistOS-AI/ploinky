@@ -13,6 +13,7 @@ import fs from 'fs';
 import path from 'path';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
+import { isDeepStrictEqual } from 'node:util';
 import * as dockerSvc from '../sandbox/docker/index.js';
 import { RUNNING_DIR } from '../utils/config.js';
 import { resolveManifestRuntimeProfile } from '../utils/runtime/profileService.js';
@@ -112,15 +113,17 @@ async function upsertRoute(routeKey, route, {
     containerName,
     registryRecord,
     expectedIdentity,
+    expectedLifecycle,
     expectedSelector,
 } = {}) {
-    if (!containerName || !registryRecord || !expectedIdentity
+    if (!containerName || !registryRecord || !expectedIdentity || !expectedLifecycle
         || !expectedSelector?.generation || !expectedSelector?.activationId) {
         throw new Error('no-wait route activation requires one exact runtime registry record and active selector');
     }
     const activationLifecycle = await waitForNoWaitRouteActivation(
         expectedIdentity,
         expectedSelector,
+        { expectedLifecycle },
     );
     const activationSelector = Object.freeze({
         generation: activationLifecycle.generationDigest,
@@ -195,7 +198,7 @@ export async function cleanupNoWaitTaskOwnedCandidate(candidate, {
     return true;
 }
 
-export function assertNoWaitLifecycleSnapshot(active, {
+function assertNoWaitLifecycleIdentity(active, {
     containerName,
     repoName,
     shortAgent,
@@ -220,10 +223,8 @@ export function assertNoWaitLifecycleSnapshot(active, {
         || String(route.alias || '') !== alias
         || !String(route.hostPath || '')
         || !String(agentPath || '')
-        || path.resolve(String(route.hostPath)) !== path.resolve(String(agentPath))
-        || Object.prototype.hasOwnProperty.call(route, 'hostPort')
-        || Object.prototype.hasOwnProperty.call(route, 'serviceTargets')) {
-        throw new Error(`no-wait lifecycle requires one exact target-less staged route for '${routeKey}'`);
+        || path.resolve(String(route.hostPath)) !== path.resolve(String(agentPath))) {
+        throw new Error(`no-wait lifecycle requires one exact staged route identity for '${routeKey}'`);
     }
     const manifest = active?.generation?.manifests?.[routeKey];
     if (active?.selector && (!manifest || typeof manifest !== 'object' || Array.isArray(manifest))) {
@@ -231,6 +232,7 @@ export function assertNoWaitLifecycleSnapshot(active, {
     }
     return Object.freeze({
         record,
+        route,
         manifest,
         generationDigest: String(active?.selector?.generation || ''),
         selectorActivationId: String(active?.selector?.activationId || ''),
@@ -239,8 +241,82 @@ export function assertNoWaitLifecycleSnapshot(active, {
     });
 }
 
+export function assertNoWaitLifecycleSnapshot(active, identity) {
+    const lifecycle = assertNoWaitLifecycleIdentity(active, identity);
+    if (Object.prototype.hasOwnProperty.call(lifecycle.route, 'hostPort')
+        || Object.prototype.hasOwnProperty.call(lifecycle.route, 'serviceTargets')) {
+        throw new Error(`no-wait lifecycle requires one exact target-less staged route for '${identity.routeKey}'`);
+    }
+    return Object.freeze({
+        ...lifecycle,
+        targetState: 'staged',
+    });
+}
+
+export function assertNoWaitAdoptableLifecycleSnapshot(active, identity) {
+    const lifecycle = assertNoWaitLifecycleIdentity(active, identity);
+    const hostPort = Number(lifecycle.route.hostPort);
+    const runtime = String(lifecycle.record.runtime || '').trim();
+    const containerId = String(lifecycle.record.containerId || '').trim().toLowerCase();
+    if (!Number.isInteger(hostPort) || hostPort <= 0 || hostPort > 65535
+        || Object.prototype.hasOwnProperty.call(lifecycle.route, 'serviceTargets')
+        || !['docker', 'podman'].includes(runtime)
+        || !/^[a-f0-9]{64}$/.test(containerId)) {
+        throw new Error(
+            `no-wait lifecycle cannot adopt an existing target for '${identity.routeKey}' without one exact container runtime and private host port`,
+        );
+    }
+    return Object.freeze({
+        ...lifecycle,
+        route: Object.freeze({ ...lifecycle.route }),
+        targetState: 'ready',
+    });
+}
+
+export function resolveNoWaitWorkerLifecycleSnapshot(active, identity) {
+    const route = active?.generation?.routing?.routes?.[identity.routeKey];
+    const hasPublishedTarget = Object.prototype.hasOwnProperty.call(route || {}, 'hostPort')
+        || Object.prototype.hasOwnProperty.call(route || {}, 'serviceTargets');
+    return hasPublishedTarget
+        ? assertNoWaitAdoptableLifecycleSnapshot(active, identity)
+        : assertNoWaitLifecycleSnapshot(active, identity);
+}
+
+export function assertNoWaitAdoptionStillCurrent(initialLifecycle, currentLifecycle, identity) {
+    if (initialLifecycle?.targetState !== 'ready' || currentLifecycle?.targetState !== 'ready'
+        || !isDeepStrictEqual(currentLifecycle.record, initialLifecycle.record)
+        || !isDeepStrictEqual(currentLifecycle.route, initialLifecycle.route)
+        || !isDeepStrictEqual(currentLifecycle.manifest, initialLifecycle.manifest)
+        || Number(currentLifecycle.routerPort) !== Number(initialLifecycle.routerPort)
+        || Number(currentLifecycle.routerHostPort) !== Number(initialLifecycle.routerHostPort)) {
+        throw new Error(`no-wait adopted runtime changed before readiness completed for '${identity.routeKey}'`);
+    }
+    return currentLifecycle;
+}
+
+export function assertNoWaitLifecycleRebase(initialLifecycle, currentLifecycle, identity) {
+    if (initialLifecycle?.targetState !== 'staged' || currentLifecycle?.targetState !== 'staged'
+        || !isDeepStrictEqual(currentLifecycle.record, initialLifecycle.record)
+        || !isDeepStrictEqual(currentLifecycle.route, initialLifecycle.route)
+        || !isDeepStrictEqual(currentLifecycle.manifest, initialLifecycle.manifest)
+        || Number(currentLifecycle.routerPort) !== Number(initialLifecycle.routerPort)
+        || Number(currentLifecycle.routerHostPort) !== Number(initialLifecycle.routerHostPort)) {
+        throw new Error(
+            `no-wait lifecycle changed before route activation for '${identity.routeKey}'`,
+        );
+    }
+    return currentLifecycle;
+}
+
 function loadNoWaitLifecycle(identity) {
     return assertNoWaitLifecycleSnapshot(assertActiveEdgeRoutingSourcesCurrent(), identity);
+}
+
+function loadNoWaitWorkerLifecycle(identity) {
+    return resolveNoWaitWorkerLifecycleSnapshot(
+        assertActiveEdgeRoutingSourcesCurrent(),
+        identity,
+    );
 }
 
 export async function waitForNoWaitLifecycle(identity, {
@@ -264,10 +340,34 @@ export async function waitForNoWaitLifecycle(identity, {
     throw new Error(`timed out waiting for the active edge generation for '${identity.routeKey}'`);
 }
 
+export async function waitForNoWaitWorkerLifecycle(identity, {
+    timeoutMs = Number.parseInt(
+        process.env.PLOINKY_NO_WAIT_EDGE_TIMEOUT_MS || '180000',
+        10,
+    ),
+    pollIntervalMs = 250,
+    loadFn = loadNoWaitWorkerLifecycle,
+    sleepFn = sleep,
+} = {}) {
+    const deadline = Date.now() + Math.max(1000, timeoutMs);
+    while (Date.now() < deadline) {
+        try {
+            return loadFn(identity);
+        } catch (error) {
+            if (error?.code !== 'EDGE_GENERATION_INACTIVE') throw error;
+        }
+        await sleepFn(pollIntervalMs);
+    }
+    throw new Error(`timed out waiting for the active edge generation for '${identity.routeKey}'`);
+}
+
 export async function waitForNoWaitRouteActivation(identity, launchSelector, options = {}) {
     const lifecycle = await waitForNoWaitLifecycle(identity, options);
     if (lifecycle.generationDigest !== launchSelector?.generation) {
-        throw new Error(`no-wait lifecycle generation changed before route activation for '${identity.routeKey}'`);
+        if (!options.expectedLifecycle) {
+            throw new Error(`no-wait lifecycle generation changed before route activation for '${identity.routeKey}'`);
+        }
+        assertNoWaitLifecycleRebase(options.expectedLifecycle, lifecycle, identity);
     }
     return lifecycle;
 }
@@ -446,7 +546,7 @@ async function main() {
         // identity. Keep that active generation serving while the detached
         // runtime starts; host-network launches are authorized by the exact
         // active-generation capability already compiled for this owner.
-        const lifecycle = await waitForNoWaitLifecycle(expectedIdentity);
+        const lifecycle = await waitForNoWaitWorkerLifecycle(expectedIdentity);
         const manifest = lifecycle.manifest;
         const activeProfile = String(lifecycle.record.profile || '');
         if (profileName && activeProfile && profileName !== activeProfile) {
@@ -463,6 +563,37 @@ async function main() {
         const routerEndpoint = resolveRouterEndpoint(profileResolution.network.mode, {
             explicitPort: lifecycle.routerPort || undefined,
         });
+        if (lifecycle.targetState === 'ready') {
+            const hostPort = Number(lifecycle.route.hostPort);
+            await waitForNoWaitReadiness({
+                manifest,
+                shortAgent,
+                containerName,
+                hostPort,
+                runtimeResult: {
+                    containerName,
+                    containerId: lifecycle.record.containerId,
+                    registryRecord: lifecycle.record,
+                },
+                networkMode: profileResolution.network.mode,
+                generationDigest: lifecycle.generationDigest,
+            });
+            const currentLifecycle = loadNoWaitWorkerLifecycle(expectedIdentity);
+            assertNoWaitAdoptionStillCurrent(lifecycle, currentLifecycle, expectedIdentity);
+            const finishedAt = new Date().toISOString();
+            writeStatus(containerName, {
+                ...baseStatus,
+                state: 'running',
+                finishedAt,
+                container: containerName,
+                hostPort,
+                adopted: true,
+            });
+            console.log(
+                `[no-wait] ${shortAgent}: adopted existing ready runtime (container=${containerName}, hostPort=${hostPort})`,
+            );
+            return;
+        }
         const ensureOptions = {
             containerName,
             alias: alias || undefined,
@@ -511,6 +642,7 @@ async function main() {
             containerName: resolvedContainerName,
             registryRecord,
             expectedIdentity,
+            expectedLifecycle: lifecycle,
             expectedSelector: {
                 generation: lifecycle.generationDigest,
                 activationId: lifecycle.selectorActivationId,

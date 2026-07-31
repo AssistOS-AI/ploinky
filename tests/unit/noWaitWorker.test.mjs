@@ -5,10 +5,14 @@ import path from 'node:path';
 import test from 'node:test';
 
 import {
+    assertNoWaitAdoptableLifecycleSnapshot,
+    assertNoWaitAdoptionStillCurrent,
+    assertNoWaitLifecycleRebase,
     assertNoWaitLifecycleSnapshot,
     assertNoWaitRegistryRecord,
     cleanupNoWaitTaskOwnedCandidate,
     launchNoWaitHostRuntime,
+    resolveNoWaitWorkerLifecycleSnapshot,
     waitForNoWaitLifecycle,
     waitForNoWaitRouteActivation,
     waitForPriorWorker,
@@ -172,6 +176,65 @@ test('no-wait route activation rejects a different generation after restart', as
             },
         ),
         /generation changed before route activation/,
+    );
+});
+
+test('no-wait route activation rebases only across an unchanged staged lifecycle', async () => {
+    const identity = { routeKey: 'background' };
+    const initial = {
+        targetState: 'staged',
+        generationDigest: 'sha256:launch',
+        selectorActivationId: 'activation-one',
+        record: {
+            type: 'agent',
+            instanceId: 'instance-one',
+            enableGeneration: 'enable-one',
+        },
+        route: {
+            container: 'ploinky_demo_worker',
+            hostPath: '/workspace/demo/worker',
+        },
+        manifest: {
+            container: 'node:24',
+        },
+        routerPort: 8080,
+        routerHostPort: 19090,
+    };
+    const rebound = {
+        ...initial,
+        generationDigest: 'sha256:unrelated-route-update',
+        selectorActivationId: 'activation-two',
+    };
+
+    assert.equal(
+        await waitForNoWaitRouteActivation(
+            identity,
+            { generation: initial.generationDigest },
+            {
+                expectedLifecycle: initial,
+                loadFn: () => rebound,
+            },
+        ),
+        rebound,
+    );
+    assert.equal(assertNoWaitLifecycleRebase(initial, rebound, identity), rebound);
+
+    await assert.rejects(
+        () => waitForNoWaitRouteActivation(
+            identity,
+            { generation: initial.generationDigest },
+            {
+                expectedLifecycle: initial,
+                loadFn: () => ({
+                    ...rebound,
+                    manifest: {
+                        ...rebound.manifest,
+                        container: 'node:25',
+                    },
+                }),
+            },
+        ),
+        /lifecycle changed before route activation/,
     );
 });
 
@@ -486,6 +549,183 @@ test('no-wait launch accepts only its exact active target-less identity', () => 
             enableGeneration: 'different-enable-generation',
         }, active.generation.agents.ploinky_demo_worker, identity),
         /registry identity inconsistent/,
+    );
+});
+
+test('queued no-wait launch adopts the exact ready runtime published by a foreground start', () => {
+    const identity = {
+        containerName: 'ploinky_demo_worker',
+        repoName: 'demo',
+        shortAgent: 'worker',
+        alias: 'background',
+        routeKey: 'background',
+        agentPath: '/workspace/demo/worker',
+    };
+    const ready = {
+        selector: {
+            generation: 'sha256:foreground-start',
+            activationId: 'activation-one',
+        },
+        generation: {
+            agents: {
+                ploinky_demo_worker: {
+                    type: 'agent',
+                    repoName: 'demo',
+                    agentName: 'worker',
+                    alias: 'background',
+                    instanceId: 'instance-one',
+                    enableGeneration: 'enable-one',
+                    runtime: 'podman',
+                    containerId: 'a'.repeat(64),
+                },
+            },
+            routing: {
+                port: 8080,
+                routes: {
+                    background: {
+                        container: 'ploinky_demo_worker',
+                        repo: 'demo',
+                        agent: 'worker',
+                        alias: 'background',
+                        hostPath: '/workspace/demo/worker',
+                        hostPort: 43123,
+                    },
+                },
+            },
+            manifests: {
+                background: {
+                    container: 'node:24',
+                },
+            },
+            routerHostPort: 19090,
+        },
+    };
+
+    const lifecycle = resolveNoWaitWorkerLifecycleSnapshot(ready, identity);
+    assert.equal(lifecycle.targetState, 'ready');
+    assert.equal(lifecycle.route.hostPort, 43123);
+    assert.equal(lifecycle.record.containerId, 'a'.repeat(64));
+    assert.equal(
+        assertNoWaitAdoptionStillCurrent(lifecycle, {
+            ...lifecycle,
+            generationDigest: 'sha256:unrelated-route-update',
+            selectorActivationId: 'activation-two',
+        }, identity).selectorActivationId,
+        'activation-two',
+    );
+
+    const changedTarget = assertNoWaitAdoptableLifecycleSnapshot({
+        ...ready,
+        selector: {
+            generation: 'sha256:replacement',
+            activationId: 'activation-three',
+        },
+        generation: {
+            ...ready.generation,
+            routing: {
+                ...ready.generation.routing,
+                routes: {
+                    background: {
+                        ...ready.generation.routing.routes.background,
+                        hostPort: 43124,
+                    },
+                },
+            },
+        },
+    }, identity);
+    assert.throws(
+        () => assertNoWaitAdoptionStillCurrent(lifecycle, changedTarget, identity),
+        /adopted runtime changed/,
+    );
+    assert.throws(
+        () => assertNoWaitAdoptionStillCurrent(lifecycle, {
+            ...lifecycle,
+            record: {
+                ...lifecycle.record,
+                enableGeneration: 'replacement-enable-generation',
+            },
+        }, identity),
+        /adopted runtime changed/,
+    );
+    assert.throws(
+        () => assertNoWaitAdoptionStillCurrent(lifecycle, {
+            ...lifecycle,
+            manifest: {
+                ...lifecycle.manifest,
+                container: 'node:25',
+            },
+        }, identity),
+        /adopted runtime changed/,
+    );
+});
+
+test('queued no-wait launch rejects incomplete or foreign published targets', () => {
+    const identity = {
+        containerName: 'ploinky_demo_worker',
+        repoName: 'demo',
+        shortAgent: 'worker',
+        alias: '',
+        routeKey: 'worker',
+        agentPath: '/workspace/demo/worker',
+    };
+    const active = {
+        selector: {
+            generation: 'sha256:active',
+            activationId: 'activation-one',
+        },
+        generation: {
+            agents: {
+                ploinky_demo_worker: {
+                    type: 'agent',
+                    repoName: 'demo',
+                    agentName: 'worker',
+                    alias: '',
+                    instanceId: 'instance-one',
+                    enableGeneration: 'enable-one',
+                    runtime: 'podman',
+                    containerId: 'b'.repeat(64),
+                },
+            },
+            routing: {
+                routes: {
+                    worker: {
+                        container: 'ploinky_demo_worker',
+                        repo: 'demo',
+                        agent: 'worker',
+                        hostPath: '/workspace/demo/worker',
+                        hostPort: 0,
+                    },
+                },
+            },
+            manifests: {
+                worker: {
+                    container: 'node:24',
+                },
+            },
+        },
+    };
+
+    assert.throws(
+        () => resolveNoWaitWorkerLifecycleSnapshot(active, identity),
+        /cannot adopt an existing target/,
+    );
+    assert.throws(
+        () => resolveNoWaitWorkerLifecycleSnapshot({
+            ...active,
+            generation: {
+                ...active.generation,
+                routing: {
+                    routes: {
+                        worker: {
+                            ...active.generation.routing.routes.worker,
+                            hostPort: 43123,
+                            container: 'ploinky_foreign_worker',
+                        },
+                    },
+                },
+            },
+        }, identity),
+        /exact staged route identity/,
     );
 });
 
