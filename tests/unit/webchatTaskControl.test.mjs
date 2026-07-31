@@ -214,6 +214,32 @@ test('task interaction options reuse the contextual autocomplete provider', () =
     assert.deepEqual(selected, [['task_control_12345678', 'choice_1']]);
 });
 
+test('task login interaction keeps its command prefix while selecting providers', () => {
+    const selected = [];
+    const interaction = {
+        id: 'task_control_12345678',
+        message: 'Choose a provider.',
+        options: [
+            { id: 'choice_0', label: 'OpenAI', description: 'openai' },
+            { id: 'choice_1', label: 'Anthropic', description: 'anthropic' },
+        ],
+    };
+    const provider = createTaskInteractionAutocompleteProvider({
+        getInteraction: () => interaction,
+        getCommandPrefix: () => '/login ',
+        onSelect: (request, option) => selected.push([request.id, option.id]),
+    });
+
+    const suggestions = provider.getSuggestions('/login open');
+    assert.deepEqual(suggestions.map((entry) => entry.label), ['OpenAI']);
+    assert.deepEqual(suggestions[0].applySelection(), {
+        value: '/login ',
+        cursor: 7,
+    });
+    suggestions[0].onSelected();
+    assert.deepEqual(selected, [['task_control_12345678', 'choice_0']]);
+});
+
 test('device-code autocomplete context renders and copies one link in its steps', async () => {
     const originalDocument = globalThis.document;
     const originalNavigator = Object.getOwnPropertyDescriptor(globalThis, 'navigator');

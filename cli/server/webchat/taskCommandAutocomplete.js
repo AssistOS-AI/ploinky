@@ -78,7 +78,11 @@ export function createTaskCommandAutocompleteProvider({
     };
 }
 
-export function createTaskInteractionAutocompleteProvider({ getInteraction, onSelect } = {}) {
+export function createTaskInteractionAutocompleteProvider({
+    getInteraction,
+    getCommandPrefix,
+    onSelect,
+} = {}) {
     return {
         trigger: '/',
         groupLabel: 'Available options',
@@ -94,7 +98,11 @@ export function createTaskInteractionAutocompleteProvider({ getInteraction, onSe
                 }];
             }
             if (!Array.isArray(interaction.options)) return [];
-            const query = String(value || '').replace(/^\//, '').trim().toLowerCase();
+            const commandPrefix = String(getCommandPrefix?.() || '');
+            const inputValue = String(value || '');
+            const query = (commandPrefix && inputValue.startsWith(commandPrefix)
+                ? inputValue.slice(commandPrefix.length)
+                : inputValue.replace(/^\//, '')).trim().toLowerCase();
             return interaction.options
                 .filter((option) => !query || [option.label, option.description]
                     .some((text) => String(text || '').toLowerCase().includes(query)))
@@ -102,7 +110,7 @@ export function createTaskInteractionAutocompleteProvider({ getInteraction, onSe
                     label: option.label,
                     description: option.description || interaction.message || '',
                     ...(interaction.challenge ? { contextPanel: interaction.challenge } : {}),
-                    applySelection: replaceValue(''),
+                    applySelection: replaceValue(commandPrefix),
                     onSelected: () => onSelect?.(interaction, option),
                 }));
         },

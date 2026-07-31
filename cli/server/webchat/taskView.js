@@ -63,6 +63,7 @@ let stopSubmitting = false;
 let loadErrorMessage = '';
 let pendingSelectInteraction = null;
 let loadingTaskCommandName = '';
+let interactionCommandPrefix = '';
 let logSnapshotChunks = null;
 const pendingUpdates = [];
 const TERMINAL_STATUSES = new Set(['finished', 'stopped', 'error']);
@@ -72,10 +73,13 @@ const taskAutocomplete = createComposerAutocomplete({ cmdInput: continuationInpu
     providers: [
         createTaskInteractionAutocompleteProvider({
             getInteraction: () => pendingSelectInteraction,
+            getCommandPrefix: () => interactionCommandPrefix,
             onSelect: (interaction, option) => void submitInteractionOption(interaction, option),
         }),
         createTaskCommandAutocompleteProvider({
-            getCommands: () => pendingSelectInteraction ? [] : (task?.commands || []),
+            getCommands: () => (pendingSelectInteraction || interactionCommandPrefix)
+                ? []
+                : (task?.commands || []),
             getLoadingCommand: () => loadingTaskCommandName,
             onLoadOptions: (taskCommand) => loadTaskCommandOptions(taskCommand),
         }),
@@ -84,6 +88,7 @@ const taskAutocomplete = createComposerAutocomplete({ cmdInput: continuationInpu
 
 function clearPendingTaskInteraction() {
     pendingSelectInteraction = null;
+    interactionCommandPrefix = '';
     continuationInput.value = '';
     continuationInput.dispatchEvent(new Event('input', { bubbles: true }));
     taskAutocomplete.hide();
@@ -125,7 +130,7 @@ async function loadTaskCommandOptions(taskCommand) {
 async function submitInteractionOption(interaction, option) {
     if (pendingSelectInteraction?.id !== interaction?.id) return;
     pendingSelectInteraction = null;
-    continuationInput.value = '';
+    continuationInput.value = interactionCommandPrefix;
     continuationInput.dispatchEvent(new Event('input', { bubbles: true }));
     try {
         await transport.sendInteractionResponse(interaction.id, option.id);
@@ -137,12 +142,20 @@ async function submitInteractionOption(interaction, option) {
 
 function handleInteractionRequest(interaction) {
     if (interaction?.targetTaskId && interaction.targetTaskId !== taskId) return;
+    if (!interactionCommandPrefix) {
+        const commandName = loadingTaskCommandName
+            || String(continuationInput.value || '').trim().split(/\s+/, 1)[0];
+        interactionCommandPrefix = commandName.startsWith('/') ? `${commandName} ` : '/';
+    }
     loadingTaskCommandName = '';
     if (!interaction?.input && Array.isArray(interaction?.options) && interaction.options.length) {
         interactionPrompt.resolve();
         pendingSelectInteraction = interaction;
-        continuationInput.value = '/';
-        continuationInput.setSelectionRange?.(1, 1);
+        continuationInput.value = interactionCommandPrefix;
+        continuationInput.setSelectionRange?.(
+            interactionCommandPrefix.length,
+            interactionCommandPrefix.length,
+        );
         continuationInput.dispatchEvent(new Event('input', { bubbles: true }));
         continuationInput.focus?.();
         return;
@@ -155,7 +168,7 @@ function handleInteractionRequest(interaction) {
 function handleInteractionResolved(resolution) {
     if (pendingSelectInteraction?.id === resolution?.id) {
         pendingSelectInteraction = null;
-        continuationInput.value = '';
+        continuationInput.value = interactionCommandPrefix;
         continuationInput.dispatchEvent(new Event('input', { bubbles: true }));
         taskAutocomplete.hide();
     }
@@ -355,6 +368,10 @@ function applyUpdate(payload) {
         const target = payload.action === 'continue' ? continuationError : actionError;
         target.hidden = false;
         target.textContent = payload.error || 'Task action failed.';
+    }
+    if ((payload.event === 'action' || payload.event === 'control')
+        && payload.action === 'login') {
+        clearPendingTaskInteraction();
     }
     if (payload.event === 'view' && payload.log && chunkPhase !== 'start') {
         logText = typeof payload.log.text === 'string' ? payload.log.text : '';
