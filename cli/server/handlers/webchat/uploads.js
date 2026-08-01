@@ -80,6 +80,10 @@ function publicUploadError(code) {
     return code === 'upload_target_exists' ? 'target_exists' : code;
 }
 
+function isAdmissibleWorkspaceEntry({ relativePath } = {}) {
+    return sanitizeUploadRelativePath(relativePath, '') !== null;
+}
+
 export function handleWebchatUploadPost(req, res, parsedUrl, context, { policy, timers } = {}) {
     if (!context) return writeJson(res, 400, { ok: false, error: 'invalid_workspace' });
 
@@ -142,6 +146,7 @@ export function handleWebchatUploadPost(req, res, parsedUrl, context, { policy, 
         policy: policy || UPLOAD_ROUTE_POLICIES.webchat,
         timers,
         replaceExisting: overwrite,
+        includeEntry: isAdmissibleWorkspaceEntry,
         finalize: ({ size }) => {
             responseDetails = {
                 filename: path.basename(target.absolutePath),

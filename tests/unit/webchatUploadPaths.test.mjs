@@ -95,7 +95,7 @@ test('direct upload paths accept normal paths and reject reserved or escaping se
     assert.equal(sanitizeUploadRelativePath('docs/report.pdf'), 'docs/report.pdf');
     assert.equal(sanitizeUploadDirectoryPath('src/assets'), 'src/assets');
     assert.equal(sanitizeUploadDirectoryPath(''), '');
-    for (const unsafe of ['/absolute', '../escape', 'a/../b', '.ploinky/x', 'node_modules/x', '.secrets', 'a/key.secrets']) {
+    for (const unsafe of ['/absolute', '../escape', 'a/../b', '.data/x', '.ploinky/x', 'node_modules/x', '.secrets', 'a/key.secrets']) {
         assert.equal(sanitizeUploadRelativePath(unsafe), null, unsafe);
     }
 });
@@ -166,6 +166,7 @@ test('directory explorer lists folders first and hides runtime, dependency, secr
     fs.mkdirSync(cwd);
     fs.mkdirSync(path.join(cwd, 'docs'));
     fs.mkdirSync(path.join(cwd, '.git'));
+    fs.mkdirSync(path.join(cwd, '.data'));
     fs.mkdirSync(path.join(cwd, '.ploinky'));
     fs.mkdirSync(path.join(cwd, 'node_modules'));
     fs.writeFileSync(path.join(cwd, 'readme.md'), '# readme');

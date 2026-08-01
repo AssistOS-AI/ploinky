@@ -362,6 +362,39 @@ test('webchat upload rejects stored-file count exhaustion', async (t) => {
     assert.deepEqual(regularFiles(context.uploadRoot), ['existing.txt']);
 });
 
+test('webchat upload quota ignores workspace paths that direct uploads cannot target', async (t) => {
+    const root = temporaryDirectory(t, 'webchat-reserved-quota');
+    const context = webchatContext(root);
+    for (const reserved of ['.data', '.ploinky', 'node_modules']) {
+        const directory = path.join(root, reserved);
+        fs.mkdirSync(directory, { recursive: true });
+        fs.writeFileSync(path.join(directory, 'runtime-state.txt'), 'not upload storage');
+    }
+    fs.writeFileSync(path.join(root, '.secrets'), 'not upload storage');
+    const request = endedRequest({
+        url: '/webchat/uploads',
+        headers: {
+            'content-length': '1',
+            'x-file-name': 'new.txt',
+        },
+        chunks: ['a'],
+    });
+    const response = new MockResponse();
+
+    handleWebchatUploadPost(
+        request,
+        response,
+        new URL('/webchat/uploads', 'http://127.0.0.1'),
+        context,
+        { policy: testPolicy('/webchat/uploads', { maxFiles: 1 }) },
+    );
+    await responseFinished(response);
+
+    assert.equal(response.statusCode, 201);
+    assert.equal(JSON.parse(response.bodyText()).relativePath, 'new.txt');
+    assert.equal(fs.readFileSync(path.join(root, 'new.txt'), 'utf8'), 'a');
+});
+
 test('webchat upload rejects stored-byte exhaustion without changing existing files', async (t) => {
     const root = temporaryDirectory(t, 'webchat-storage-quota');
     const context = webchatContext(root);

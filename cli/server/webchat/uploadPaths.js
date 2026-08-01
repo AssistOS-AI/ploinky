@@ -7,7 +7,7 @@ import {
 } from '../utils/workspacePaths.js';
 
 const SECRET_LEAF_RE = /\.secrets$/i;
-const RESERVED_DIRECTORY_NAMES = new Set(['.ploinky', 'node_modules']);
+const RESERVED_DIRECTORY_NAMES = new Set(['.data', '.ploinky', 'node_modules']);
 const MAX_SEGMENT_LENGTH = 255;
 const MAX_PATH_LENGTH = 4096;
 
