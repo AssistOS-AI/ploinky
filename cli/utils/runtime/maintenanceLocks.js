@@ -7,6 +7,8 @@ import { RUNNING_DIR } from '../config.js';
 const DEFAULT_TTL_MS = 10 * 60 * 1000;
 const DEFAULT_WAIT_TIMEOUT_MS = 10 * 60 * 1000;
 const DEFAULT_RETRY_INTERVAL_MS = 100;
+const MAX_WORKSPACE_MUTATION_WAIT_MS = 15 * 60 * 1000;
+const MAX_WORKSPACE_MUTATION_RETRY_INTERVAL_MS = 1_000;
 const MAINTENANCE_DIR = path.join(RUNNING_DIR, 'maintenance');
 const WORKSPACE_START_LOCK_PATH = path.join(RUNNING_DIR, 'workspace-start.json');
 const WORKSPACE_START_TTL_MS = 24 * 60 * 60 * 1000;
@@ -131,6 +133,67 @@ function createWorkspaceMutationLease({
         throw error;
     }
     return lock;
+}
+
+async function acquireWorkspaceMutationLease({
+    waitTimeoutMs = DEFAULT_WAIT_TIMEOUT_MS,
+    retryIntervalMs = DEFAULT_RETRY_INTERVAL_MS,
+    ...lockOptions
+} = {}) {
+    // Detached startup workers intentionally contend with their still-running
+    // parent and with publication. Bound the wait rather than treating either
+    // expected owner as an immediate failure or waiting forever.
+    const requestedWaitMs = Number(waitTimeoutMs);
+    const boundedWaitMs = Number.isFinite(requestedWaitMs)
+        ? Math.max(0, Math.min(MAX_WORKSPACE_MUTATION_WAIT_MS, requestedWaitMs))
+        : DEFAULT_WAIT_TIMEOUT_MS;
+    const requestedRetryMs = Number(retryIntervalMs);
+    const boundedRetryMs = Number.isFinite(requestedRetryMs)
+        ? Math.max(1, Math.min(MAX_WORKSPACE_MUTATION_RETRY_INTERVAL_MS, requestedRetryMs))
+        : DEFAULT_RETRY_INTERVAL_MS;
+    const deadline = Date.now() + boundedWaitMs;
+    while (true) {
+        try {
+            return createWorkspaceMutationLease(lockOptions);
+        } catch (error) {
+            if (error?.code !== 'PLOINKY_WORKSPACE_MUTATION_BUSY') throw error;
+        }
+
+        const state = inspectWorkspaceStartLock();
+        if (!state.active && !fs.existsSync(WORKSPACE_START_LOCK_PATH)) continue;
+        if (Date.now() >= deadline) {
+            const error = new Error(
+                `Timed out waiting for ${state.lock?.operation || 'workspace mutation'} to release the workspace mutation lease.`
+            );
+            error.code = 'workspace_mutation_lock_timeout';
+            throw error;
+        }
+        await wait(boundedRetryMs);
+    }
+}
+
+async function withWorkspaceMutationLease(options, fn) {
+    if (typeof fn !== 'function') throw new TypeError('workspace mutation lease requires a callback');
+    const lease = await acquireWorkspaceMutationLease(options);
+    let callbackError = null;
+    try {
+        return await fn();
+    } catch (error) {
+        callbackError = error;
+        throw error;
+    } finally {
+        if (!releaseWorkspaceMutationLease(lease)) {
+            const releaseError = new Error(
+                `workspace mutation '${lease.operation}' could not release its exact lease`
+            );
+            releaseError.code = 'workspace_mutation_lock_release_failed';
+            if (callbackError) {
+                callbackError.message += `; ${releaseError.message}`;
+            } else {
+                throw releaseError;
+            }
+        }
+    }
 }
 
 function createWorkspaceStartLock(options = {}) {
@@ -273,6 +336,7 @@ function inspectMaintenanceLock(containerName, attempt = 0) {
 export {
     WORKSPACE_START_LOCK_PATH,
     acquireMaintenanceLock,
+    acquireWorkspaceMutationLease,
     createMaintenanceLock,
     createWorkspaceMutationLease,
     createWorkspaceStartLock,
@@ -283,4 +347,5 @@ export {
     renewWorkspaceMutationLease,
     removeMaintenanceLock,
     withMaintenanceLock,
+    withWorkspaceMutationLease,
 };

@@ -33,6 +33,7 @@ import {
     withEdgeGenerationApplyLock,
 } from '../sandbox/edgeGeneration.js';
 import { withNetworkLifecycleLock } from '../sandbox/networkLifecycle.js';
+import { withWorkspaceMutationLease } from '../utils/runtime/maintenanceLocks.js';
 
 function parseArgs(argv) {
     const out = {};
@@ -573,6 +574,13 @@ async function main() {
     let taskOwnedCandidate = null;
     try {
         await waitForPriorWorker(waitForStatus);
+        // The parent start may still own this lease while detached workers are
+        // spawned, and Cloudflare publication uses the same lease afterward.
+        // Wait within the shared bounded contract so Router attestation and
+        // route activation cannot race either mutation owner.
+        await withWorkspaceMutationLease({
+            operation: `no-wait-runtime:${containerName}`,
+        }, async () => {
         const expectedIdentity = Object.freeze({
             containerName,
             repoName,
@@ -711,6 +719,7 @@ async function main() {
             taskOwnedCandidate = null;
             throw error;
         }
+        });
         });
     } catch (err) {
         const failure = err instanceof Error ? err : new Error(String(err));

@@ -86,6 +86,21 @@ test('no-wait predecessor rejects a path outside the status directory', async (t
     );
 });
 
+test('no-wait runtime holds the workspace mutation lease through route activation', () => {
+    const source = fs.readFileSync(
+        path.resolve('cli/commands/noWaitWorker.js'),
+        'utf8',
+    );
+    const acquire = source.indexOf('await withWorkspaceMutationLease({');
+    const lifecycle = source.indexOf('const lifecycle = await waitForNoWaitWorkerLifecycle', acquire);
+    const activation = source.indexOf('await upsertRoute(', lifecycle);
+    const release = source.indexOf('\n        });\n    } catch (err)', activation);
+    assert.ok(acquire > 0, 'no-wait worker must acquire the shared workspace mutation lease');
+    assert.ok(lifecycle > acquire, 'lifecycle capture must occur under the workspace mutation lease');
+    assert.ok(activation > lifecycle, 'route activation must remain in the same critical section');
+    assert.ok(release > activation, 'the workspace mutation callback must close only after route activation');
+});
+
 test('no-wait launch waits for the staged edge generation to become active', async () => {
     const expected = { generationDigest: 'sha256:active' };
     const identity = { routeKey: 'background' };

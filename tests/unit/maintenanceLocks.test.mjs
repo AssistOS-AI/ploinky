@@ -110,6 +110,129 @@ test('workspace start lock excludes concurrent startup and releases only by toke
     assert.equal(fs.existsSync(locks.WORKSPACE_START_LOCK_PATH), false);
 });
 
+test('no-wait workspace mutation waits for its parent workspace-start owner', async () => {
+    const first = locks.createWorkspaceStartLock();
+    let entered = false;
+    const waiting = locks.withWorkspaceMutationLease({
+        operation: 'no-wait-runtime:test',
+        waitTimeoutMs: 1_000,
+        retryIntervalMs: 5,
+    }, async () => {
+        entered = true;
+        assert.equal(locks.inspectWorkspaceStartLock().lock.operation, 'no-wait-runtime:test');
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(entered, false);
+    assert.equal(locks.inspectWorkspaceStartLock().lock.token, first.token);
+    assert.equal(locks.releaseWorkspaceStartLock(first), true);
+
+    await waiting;
+    assert.equal(locks.inspectWorkspaceStartLock().active, false);
+});
+
+test('no-wait route activation waits for Cloudflare publication and never overlaps it', async () => {
+    const events = [];
+    let releasePublication;
+    let publicationEntered;
+    const entered = new Promise((resolve) => { publicationEntered = resolve; });
+    const gate = new Promise((resolve) => { releasePublication = resolve; });
+
+    const publication = locks.withWorkspaceMutationLease({
+        operation: 'cloudflare-publication:test',
+        retryIntervalMs: 5,
+    }, async () => {
+        events.push('publication-enter');
+        publicationEntered();
+        await gate;
+        events.push('publication-exit');
+    });
+    await entered;
+
+    const noWait = locks.withWorkspaceMutationLease({
+        operation: 'no-wait-runtime:test',
+        waitTimeoutMs: 1_000,
+        retryIntervalMs: 5,
+    }, async () => {
+        events.push('route-activation-enter');
+        events.push('route-activation-exit');
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.deepEqual(events, ['publication-enter']);
+    releasePublication();
+    await Promise.all([publication, noWait]);
+    assert.deepEqual(events, [
+        'publication-enter',
+        'publication-exit',
+        'route-activation-enter',
+        'route-activation-exit',
+    ]);
+});
+
+test('two no-wait route activations cannot enter concurrently', async () => {
+    const events = [];
+    let releaseFirst;
+    let firstEntered;
+    const entered = new Promise((resolve) => { firstEntered = resolve; });
+    const gate = new Promise((resolve) => { releaseFirst = resolve; });
+
+    const first = locks.withWorkspaceMutationLease({
+        operation: 'no-wait-runtime:first',
+        retryIntervalMs: 5,
+    }, async () => {
+        events.push('first-enter');
+        firstEntered();
+        await gate;
+        events.push('first-exit');
+    });
+    await entered;
+    const second = locks.withWorkspaceMutationLease({
+        operation: 'no-wait-runtime:second',
+        waitTimeoutMs: 1_000,
+        retryIntervalMs: 5,
+    }, async () => {
+        events.push('second-enter');
+        events.push('second-exit');
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.deepEqual(events, ['first-enter']);
+    releaseFirst();
+    await Promise.all([first, second]);
+    assert.deepEqual(events, ['first-enter', 'first-exit', 'second-enter', 'second-exit']);
+});
+
+test('workspace mutation contention times out fail-closed within its bound', async () => {
+    const owner = locks.createWorkspaceMutationLease({ operation: 'cloudflare-publication:stuck' });
+    await assert.rejects(
+        () => locks.acquireWorkspaceMutationLease({
+            operation: 'no-wait-runtime:bounded',
+            waitTimeoutMs: 0,
+            retryIntervalMs: 1,
+        }),
+        (error) => error?.code === 'workspace_mutation_lock_timeout',
+    );
+    assert.equal(locks.inspectWorkspaceStartLock().lock.token, owner.token);
+    assert.equal(locks.releaseWorkspaceMutationLease(owner), true);
+});
+
+test('workspace mutation callback releases its lease on success and failure', async () => {
+    await locks.withWorkspaceMutationLease({ operation: 'no-wait-success' }, async () => {
+        assert.equal(locks.inspectWorkspaceStartLock().active, true);
+    });
+    assert.equal(locks.inspectWorkspaceStartLock().active, false);
+
+    await assert.rejects(
+        () => locks.withWorkspaceMutationLease({ operation: 'no-wait-failure' }, async () => {
+            assert.equal(locks.inspectWorkspaceStartLock().active, true);
+            throw new Error('adversarial route activation failure');
+        }),
+        /adversarial route activation failure/,
+    );
+    assert.equal(locks.inspectWorkspaceStartLock().active, false);
+});
+
 test('expired workspace lease is not reaped while the owner is alive and can renew', () => {
     const expired = locks.createWorkspaceStartLock({ ttlMs: -1 });
     const result = locks.inspectWorkspaceStartLock();
