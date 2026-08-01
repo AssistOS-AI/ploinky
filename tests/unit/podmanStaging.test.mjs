@@ -16,6 +16,7 @@ import {
     mergeNodeOptions,
     podmanManifestVolumeMountSuffix,
     podmanMountSuffix,
+    resolveReusablePodmanStagedMounts,
 } from '../../cli/sandbox/docker/agentServiceManager.js';
 import { PLOINKY_DIR, PLOINKY_WORKSPACE_ROOT } from '../../cli/utils/config.js';
 import { resolveManifestVolumeHostPath } from '../../cli/utils/runtime/manifestVolumePolicy.js';
@@ -89,6 +90,57 @@ test('ensurePodmanStagedCodeDir rejects manifest overrides below /code/node_modu
             ]), { runtimeRoot: path.join(root, 'runtime') }),
             /reserved \/code\/node_modules/,
         );
+    } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+    }
+});
+
+test('resolveReusablePodmanStagedMounts preserves exact managed Agent and code directories', () => {
+    const root = tempDir();
+    try {
+        const runtimeRoot = path.join(root, 'container-runtime', 'demo');
+        const agentSource = path.join(runtimeRoot, 'Agent-123-456');
+        const codeSource = path.join(runtimeRoot, 'code-123-457');
+        fs.mkdirSync(agentSource, { recursive: true });
+        fs.mkdirSync(codeSource, { recursive: true });
+
+        assert.deepEqual(resolveReusablePodmanStagedMounts({
+            config: {
+                binds: [
+                    { source: agentSource, target: '/Agent', ro: true },
+                    { source: codeSource, target: '/code', ro: false },
+                ],
+            },
+        }, runtimeRoot), { agentLibMountPath: agentSource, codeMountPath: codeSource });
+    } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+    }
+});
+
+test('resolveReusablePodmanStagedMounts rejects duplicate and escaping staged sources', () => {
+    const root = tempDir();
+    try {
+        const runtimeRoot = path.join(root, 'container-runtime', 'demo');
+        const agentSource = path.join(runtimeRoot, 'Agent-123-456');
+        const codeSource = path.join(runtimeRoot, 'code-123-457');
+        const outside = path.join(root, 'Agent-999-999');
+        fs.mkdirSync(agentSource, { recursive: true });
+        fs.mkdirSync(codeSource, { recursive: true });
+        fs.mkdirSync(outside, { recursive: true });
+
+        assert.equal(resolveReusablePodmanStagedMounts({
+            config: { binds: [
+                { source: outside, target: '/Agent' },
+                { source: codeSource, target: '/code' },
+            ] },
+        }, runtimeRoot), null);
+        assert.equal(resolveReusablePodmanStagedMounts({
+            config: { binds: [
+                { source: agentSource, target: '/Agent' },
+                { source: agentSource, target: '/Agent' },
+                { source: codeSource, target: '/code' },
+            ] },
+        }, runtimeRoot), null);
     } finally {
         fs.rmSync(root, { recursive: true, force: true });
     }

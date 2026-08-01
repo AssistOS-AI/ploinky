@@ -401,6 +401,35 @@ function ensurePodmanStagedCodeDir(agentName, agentCodePath, nodeModulesDir, cod
     return stagedCodePath;
 }
 
+function resolveReusablePodmanStagedMounts(existingRecord, runtimeRoot) {
+    const binds = Array.isArray(existingRecord?.config?.binds) ? existingRecord.config.binds : [];
+    const resolvedRoot = path.resolve(String(runtimeRoot || ''));
+    if (!resolvedRoot || !fs.existsSync(resolvedRoot)) return null;
+
+    const resolveTarget = (target, prefix) => {
+        const matches = binds.filter((bind) => String(bind?.target || '') === target);
+        if (matches.length !== 1) return null;
+        const source = path.resolve(String(matches[0]?.source || ''));
+        if (!isPathWithin(source, resolvedRoot)
+            || !new RegExp(`^${prefix}-\\d+-\\d+$`).test(path.basename(source))) return null;
+        try {
+            const identity = fs.lstatSync(source);
+            if (!identity.isDirectory() || identity.isSymbolicLink()) return null;
+            const realSource = fs.realpathSync(source);
+            const realRoot = fs.realpathSync(resolvedRoot);
+            if (!isPathWithin(realSource, realRoot)) return null;
+        } catch (_) {
+            return null;
+        }
+        return source;
+    };
+
+    const agentLibMountPath = resolveTarget('/Agent', 'Agent');
+    const codeMountPath = resolveTarget('/code', 'code');
+    if (!agentLibMountPath || !codeMountPath) return null;
+    return Object.freeze({ agentLibMountPath, codeMountPath });
+}
+
 function codeRelativeMountPath(containerPath) {
     const normalized = String(containerPath || '').replace(/\\/g, '/').replace(/\/+/g, '/');
     if (!normalized.startsWith('/code/')) return null;
@@ -1048,16 +1077,22 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     let podmanStagedTargetMounts = [];
     if (runtime === 'podman') {
         fs.mkdirSync(PODMAN_RUNTIME_ROOT, { recursive: true });
-        const podmanRuntimeRoot = prepareFreshRuntimeRoot(
-            path.join(PODMAN_RUNTIME_ROOT, runtimeSegment(containerName)),
-            PODMAN_RUNTIME_ROOT
-        );
-        agentLibMountPath = ensurePodmanStagedAgentLibDir(agentName, preparedNodeModulesDir, {
-            runtimeRoot: podmanRuntimeRoot
-        });
-        codeMountPath = ensurePodmanStagedCodeDir(agentName, agentCodePath, preparedNodeModulesDir, podmanCodeLinks, {
-            runtimeRoot: podmanRuntimeRoot
-        });
+        const podmanRuntimeRoot = path.join(PODMAN_RUNTIME_ROOT, runtimeSegment(containerName));
+        const reusableStagedMounts = options.reuseStagedMounts === true
+            ? resolveReusablePodmanStagedMounts(existingRecord, podmanRuntimeRoot)
+            : null;
+        if (reusableStagedMounts) {
+            agentLibMountPath = reusableStagedMounts.agentLibMountPath;
+            codeMountPath = reusableStagedMounts.codeMountPath;
+        } else {
+            prepareFreshRuntimeRoot(podmanRuntimeRoot, PODMAN_RUNTIME_ROOT);
+            agentLibMountPath = ensurePodmanStagedAgentLibDir(agentName, preparedNodeModulesDir, {
+                runtimeRoot: podmanRuntimeRoot
+            });
+            codeMountPath = ensurePodmanStagedCodeDir(agentName, agentCodePath, preparedNodeModulesDir, podmanCodeLinks, {
+                runtimeRoot: podmanRuntimeRoot
+            });
+        }
         // Podman cannot use Docker-style nested /code/node_modules mounts on the
         // staged symlink tree. Mount each symlink target at its real path instead,
         // with source/dependency targets read-only when the profile requires it.
@@ -2561,6 +2596,7 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
             runtimeIdentity,
             preparedHostModeCapability,
             preserveRegistryRecord: preserveRuntimeRegistryRecord,
+            reuseStagedMounts: existingRuntimeAtEntry && !recreateReason,
             networkLifecycleCapability: options.networkLifecycleCapability,
         });
     allPortMappings = resolvePublishedPortMappings(containerName, allPortMappings);
@@ -2944,6 +2980,7 @@ export {
     ensureAgentService,
     ensureManifestVolumeHostPath,
     ensurePodmanStagedCodeDir,
+    resolveReusablePodmanStagedMounts,
     expectedBindMountsFromArgs,
     hasExactManagedEnv,
     hasExactManagedMountContract,
