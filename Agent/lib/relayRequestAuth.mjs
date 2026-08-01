@@ -12,12 +12,19 @@ function requireEqual(actual, expected, label) {
     }
 }
 
-function verifyBase(token, { secret, expectedAudience, replayCache, clockSkewSeconds } = {}) {
+function verifyBase(token, {
+    secret,
+    expectedAudience,
+    replayCache,
+    clockSkewSeconds,
+    now,
+} = {}) {
     return verifyRelayJws(token, {
         secret,
         expectedAudience,
         replayCache,
         clockSkewSeconds,
+        now,
     });
 }
 

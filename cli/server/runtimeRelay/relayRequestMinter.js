@@ -47,14 +47,16 @@ export class RelayRequestMinter {
         this.ttlSeconds = Math.max(5, Math.min(Number(ttlSeconds) || RELAY_TOKEN_TTL_SECONDS, RELAY_TOKEN_TTL_SECONDS));
     }
 
-    async _sign(targetAgentId, payload) {
+    async _sign(targetAgentId, payload, signingSecret) {
         return signHmacJwt({
             payload,
-            secret: normalizeSecret(await this.resolveAgentSecret(targetAgentId)),
+            secret: signingSecret === undefined
+                ? normalizeSecret(await this.resolveAgentSecret(targetAgentId))
+                : normalizeSecret(signingSecret),
         });
     }
 
-    async mintSession(input = {}) {
+    async mintSession(input = {}, { signingSecret } = {}) {
         const targetAgentId = requireText(input.targetAgentId, 'targetAgentId');
         const effectiveInstanceId = requireText(input.effectiveInstanceId, 'effectiveInstanceId');
         const enableGeneration = requireText(input.enableGeneration, 'enableGeneration');
@@ -91,10 +93,13 @@ export class RelayRequestMinter {
             exp: iat + this.ttlSeconds,
             jti: this.createNonce(),
         };
-        return { token: await this._sign(targetAgentId, payload), payload };
+        return {
+            token: await this._sign(targetAgentId, payload, signingSecret),
+            payload,
+        };
     }
 
-    async mintRequest(input = {}) {
+    async mintRequest(input = {}, { signingSecret } = {}) {
         const targetAgentId = requireText(input.targetAgentId, 'targetAgentId');
         const effectiveInstanceId = requireText(input.effectiveInstanceId, 'effectiveInstanceId');
         const enableGeneration = requireText(input.enableGeneration, 'enableGeneration');
@@ -146,7 +151,10 @@ export class RelayRequestMinter {
             exp: iat + this.ttlSeconds,
             jti: this.createNonce(),
         };
-        return { token: await this._sign(targetAgentId, payload), payload };
+        return {
+            token: await this._sign(targetAgentId, payload, signingSecret),
+            payload,
+        };
     }
 }
 

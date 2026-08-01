@@ -5,6 +5,7 @@ import http from 'node:http';
 import { Readable, Writable } from 'node:stream';
 
 import { executeHttpPlan } from '../../cli/server/proxy/executeHttpPlan.js';
+import { executeWebSocketPlan } from '../../cli/server/proxy/executeWebSocketPlan.js';
 import { compileProxyLimits } from '../../cli/server/proxy/limits.js';
 import { createRoutePlan } from '../../cli/server/proxy/RoutePlan.js';
 
@@ -65,6 +66,18 @@ class Response extends Writable {
     }
 }
 
+class UpgradeSocket extends Writable {
+    constructor() {
+        super();
+        this.body = Buffer.alloc(0);
+    }
+
+    _write(chunk, _encoding, callback) {
+        this.body = Buffer.concat([this.body, Buffer.from(chunk)]);
+        callback();
+    }
+}
+
 function deferred() {
     let resolve;
     let reject;
@@ -93,7 +106,12 @@ function flushTurn() {
     return new Promise(resolve => setImmediate(resolve));
 }
 
-function routePlan({ allowRequestStreaming = false, limitOverrides = {} } = {}) {
+function routePlan({
+    allowRequestStreaming = false,
+    limitOverrides = {},
+    method = 'POST',
+    transport = 'http',
+} = {}) {
     return createRoutePlan({
         matched: true,
         ok: true,
@@ -126,8 +144,8 @@ function routePlan({ allowRequestStreaming = false, limitOverrides = {} } = {}) 
         limits: compileProxyLimits(limitOverrides),
         generationDigest: 'sha256:generation',
         auditId: 'audit-http',
-        method: 'POST',
-        transport: 'http',
+        method,
+        transport,
         allowRequestStreaming,
         credentialPolicy: {
             allowApplicationAuthorization: true,
@@ -228,6 +246,70 @@ test('prebuffered private request bodies take precedence over route streaming', 
         relayStream.request.subarray(relayStream.request.indexOf(Buffer.from('\r\n\r\n')) + 4).toString('utf8'),
         body.toString('utf8'),
     );
+});
+
+test('a stale per-OPEN generation lease returns HTTP 503 without upstream construction', async () => {
+    const request = Readable.from([]);
+    request.method = 'POST';
+    request.headers = { host: '127.0.0.1:8080' };
+    const response = new Response();
+    let released = false;
+    const stale = Object.assign(new Error('runtimeRelay: generation lease is stale'), {
+        code: 'EDGE_GENERATION_CHANGED',
+    });
+    const handled = await executeHttpPlan({
+        req: request,
+        res: response,
+        plan: routePlan(),
+        lease: { release() { released = true; } },
+        relayManager: {
+            checkout: async () => ({
+                openRequest: async () => { throw stale; },
+                close() {},
+            }),
+        },
+        authorized: true,
+        prebufferedBody: Buffer.alloc(0),
+    });
+    assert.equal(handled, false);
+    assert.equal(response.statusCode, 503);
+    assert.deepEqual(JSON.parse(response.body.toString('utf8')), { error: 'upstream_unavailable' });
+    assert.equal(released, true);
+});
+
+test('a stale per-OPEN generation lease rejects a WebSocket upgrade with 503', async () => {
+    const request = {
+        method: 'GET',
+        headers: {
+            host: '127.0.0.1:8080',
+            origin: 'http://127.0.0.1:8080',
+            connection: 'Upgrade',
+            upgrade: 'websocket',
+            'sec-websocket-version': '13',
+            'sec-websocket-key': Buffer.alloc(16, 7).toString('base64'),
+        },
+    };
+    const socket = new UpgradeSocket();
+    let released = false;
+    const stale = Object.assign(new Error('runtimeRelay: generation lease is stale'), {
+        code: 'EDGE_GENERATION_CHANGED',
+    });
+    const handled = await executeWebSocketPlan({
+        req: request,
+        socket,
+        plan: routePlan({ method: 'GET', transport: 'websocket' }),
+        lease: { release() { released = true; } },
+        relayManager: {
+            checkout: async () => ({
+                openRequest: async () => { throw stale; },
+                close() {},
+            }),
+        },
+        authorized: true,
+    });
+    assert.equal(handled, false);
+    assert.match(socket.body.toString('utf8'), /^HTTP\/1\.1 503 Service Unavailable\r\n/);
+    assert.equal(released, true);
 });
 
 test('client abort during relay checkout closes the acquired checkout without opening a request', {

@@ -1,7 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import crypto from 'node:crypto';
+import net from 'node:net';
 import { fileURLToPath } from 'node:url';
 
 import { createRelayReplayCache } from '../../Agent/lib/relayTokenVerify.mjs';
@@ -10,6 +11,12 @@ import {
     verifyRelaySessionToken,
 } from '../../Agent/lib/relayRequestAuth.mjs';
 import { RelayRequestMinter } from '../../cli/server/runtimeRelay/relayRequestMinter.js';
+import { RuntimeRelayManager } from '../../cli/server/runtimeRelay/RuntimeRelayManager.js';
+import { NETWORK_LABELS } from '../../cli/sandbox/networkLifecycle.js';
+import {
+    RelayFrameDecoder,
+    encodeRelayFrame,
+} from '../../Agent/lib/runtimeRelayProtocol.mjs';
 
 const AGENT_SECRET = crypto.randomBytes(32);
 const CONTAINER_ID = 'a'.repeat(64);
@@ -26,10 +33,44 @@ const identity = {
     containerId: CONTAINER_ID,
     generationDigest: 'generation-one',
 };
+const RELAY_HELPER_PATH = fileURLToPath(new URL('../../Agent/server/RuntimeHttpRelay.mjs', import.meta.url));
+
+function decodeFrames(bytes) {
+    const frames = [];
+    const decoder = new RelayFrameDecoder();
+    decoder.on('frame', frame => frames.push(frame));
+    decoder.push(bytes);
+    decoder.end();
+    return frames;
+}
+
+function runRuntimeRelaySync(frames) {
+    const result = spawnSync(process.execPath, [RELAY_HELPER_PATH], {
+        env: {
+            PATH: process.env.PATH || '',
+            PLOINKY_AGENT_ID: identity.targetAgentId,
+        },
+        input: Buffer.concat(frames.map(encodeRelayFrame)),
+        timeout: 5_000,
+    });
+    if (result.error) throw result.error;
+    return { ...result, frames: decodeFrames(result.stdout) };
+}
+
+function trackChildInputFrames(child, frames) {
+    const decoder = new RelayFrameDecoder();
+    decoder.on('frame', frame => frames.push(frame));
+    const write = child.stdin.write.bind(child.stdin);
+    child.stdin.write = (chunk, ...args) => {
+        decoder.push(Buffer.from(chunk));
+        return write(chunk, ...args);
+    };
+    return child;
+}
 
 test('runtime relay starts with only the tracked Agent library available', () => {
     const result = spawnSync(process.execPath, [
-        fileURLToPath(new URL('../../Agent/server/RuntimeHttpRelay.mjs', import.meta.url)),
+        RELAY_HELPER_PATH,
     ], {
         env: {
             ...process.env,
@@ -79,6 +120,369 @@ test('relay session token binds owner, runtime identity, generation, session, an
         deniedPorts: [22],
         replayCache: createRelayReplayCache(),
     }), /deny set mismatch/);
+});
+
+test('relay tokens accept a channel-scoped signing key without resolving the reusable agent secret', async () => {
+    const signingSecret = crypto.randomBytes(32);
+    const isolatedMinter = new RelayRequestMinter({
+        resolveAgentSecret: () => assert.fail('channel-scoped relay signing must not resolve the agent secret'),
+        createNonce: () => `isolated-${++nonce}`,
+    });
+    const session = await isolatedMinter.mintSession({
+        ...identity,
+        relaySessionId: 'isolated-session',
+        deniedPorts: [22],
+    }, { signingSecret });
+    verifyRelaySessionToken(session.token, {
+        secret: signingSecret,
+        expectedAudience: identity.targetAgentId,
+        ...identity,
+        relaySessionId: 'isolated-session',
+        deniedPorts: [22],
+        replayCache: createRelayReplayCache(),
+    });
+    assert.throws(() => verifyRelaySessionToken(session.token, {
+        secret: crypto.randomBytes(32),
+        expectedAudience: identity.targetAgentId,
+        ...identity,
+        relaySessionId: 'isolated-session',
+        deniedPorts: [22],
+        replayCache: createRelayReplayCache(),
+    }), /signature invalid/);
+
+    const request = await isolatedMinter.mintRequest({
+        ...identity,
+        relaySessionId: 'isolated-session',
+        denySetDigest: session.payload.denySetDigest,
+        method: 'GET',
+        port: 7880,
+        path: '/',
+        query: '',
+        bodyMode: 'none',
+        bodyHash: '',
+    }, { signingSecret });
+    verifyRelayRequestToken(request.token, {
+        secret: signingSecret,
+        expectedAudience: identity.targetAgentId,
+        ...identity,
+        relaySessionId: 'isolated-session',
+        denySetDigest: session.payload.denySetDigest,
+        method: 'GET',
+        port: 7880,
+        path: '/',
+        query: '',
+        bodyMode: 'none',
+        bodyHash: '',
+        replayCache: createRelayReplayCache(),
+    });
+});
+
+test('runtime relay verifies HELLO with only its principal and the channel-scoped key', async (t) => {
+    const signingSecret = crypto.randomBytes(32);
+    const isolatedMinter = new RelayRequestMinter({
+        resolveAgentSecret: () => assert.fail('runtime relay bootstrap must not resolve the agent secret'),
+        createNonce: () => `bootstrap-${++nonce}`,
+    });
+    const session = await isolatedMinter.mintSession({
+        ...identity,
+        relaySessionId: 'bootstrap-session',
+        deniedPorts: [22],
+    }, { signingSecret });
+    const child = spawn(process.execPath, [
+        fileURLToPath(new URL('../../Agent/server/RuntimeHttpRelay.mjs', import.meta.url)),
+    ], {
+        env: {
+            PATH: process.env.PATH || '',
+            PLOINKY_AGENT_ID: identity.targetAgentId,
+        },
+        stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    t.after(() => {
+        if (child.exitCode === null) child.kill('SIGKILL');
+    });
+
+    const decoder = new RelayFrameDecoder();
+    child.stdout.on('data', (chunk) => decoder.push(chunk));
+    const ready = new Promise((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error('runtime relay READY timeout')), 5_000);
+        const cleanup = () => clearTimeout(timer);
+        decoder.once('frame', (frame) => {
+            cleanup();
+            if (frame.type === 'READY') resolve(frame);
+            else reject(new Error(`unexpected runtime relay frame ${frame.type}`));
+        });
+        child.once('error', (error) => {
+            cleanup();
+            reject(error);
+        });
+        child.once('exit', (code) => {
+            if (code === 0) return;
+            cleanup();
+            reject(new Error(`runtime relay exited ${code}`));
+        });
+    });
+    child.stdin.write(encodeRelayFrame({
+        type: 'HELLO',
+        ...identity,
+        relaySessionId: session.payload.relaySessionId,
+        deniedPorts: session.payload.deniedPorts,
+        denySetDigest: session.payload.denySetDigest,
+        verificationKey: signingSecret.toString('hex'),
+        token: session.token,
+    }));
+    const frame = await ready;
+    assert.equal(frame.targetAgentId, identity.targetAgentId);
+    assert.equal(frame.relaySessionId, 'bootstrap-session');
+    assert.equal(Object.hasOwn(frame, 'verificationKey'), false);
+    child.stdin.end();
+});
+
+test('runtime relay rejects missing, malformed, wrong, and duplicate channel keys', async () => {
+    const signingSecret = crypto.randomBytes(32);
+    const isolatedMinter = new RelayRequestMinter({
+        resolveAgentSecret: () => assert.fail('runtime relay bootstrap must not resolve the agent secret'),
+        createNonce: () => `key-rejection-${++nonce}`,
+    });
+    const session = await isolatedMinter.mintSession({
+        ...identity,
+        relaySessionId: 'key-rejection-session',
+        deniedPorts: [22],
+    }, { signingSecret });
+    const hello = {
+        type: 'HELLO',
+        ...identity,
+        relaySessionId: session.payload.relaySessionId,
+        deniedPorts: session.payload.deniedPorts,
+        denySetDigest: session.payload.denySetDigest,
+        verificationKey: signingSecret.toString('hex'),
+        token: session.token,
+    };
+
+    for (const invalidKey of [undefined, 'not-a-32-byte-hex-key', crypto.randomBytes(32).toString('hex')]) {
+        const frame = { ...hello };
+        if (invalidKey === undefined) delete frame.verificationKey;
+        else frame.verificationKey = invalidKey;
+        const result = runRuntimeRelaySync([frame]);
+        assert.equal(result.status, 1);
+        assert.equal(result.frames.at(-1)?.type, 'ERROR');
+        assert.equal(result.frames.at(-1)?.code, 'RELAY_REJECTED');
+    }
+
+    const duplicate = runRuntimeRelaySync([hello, hello]);
+    assert.equal(duplicate.status, 1);
+    assert.deepEqual(duplicate.frames.map(frame => frame.type), ['READY', 'ERROR']);
+    assert.match(duplicate.frames[1].message, /duplicate HELLO/);
+});
+
+test('runtime relay manager rechecks a principal-only host-mode lease immediately before OPEN', async (t) => {
+    const isolatedMinter = new RelayRequestMinter({
+        resolveAgentSecret: () => assert.fail('host-mode relay must not resolve the reusable agent secret'),
+        createNonce: () => `manager-bootstrap-${++nonce}`,
+    });
+    const containerName = 'alpha-container';
+    let generationCurrent = true;
+    let commitCalls = 0;
+    const routerFrames = [];
+    const manager = new RuntimeRelayManager({
+        minter: isolatedMinter,
+        inspectContainer: async () => {
+            generationCurrent = false;
+            return {
+                Id: CONTAINER_ID,
+                Name: `/${containerName}`,
+                State: { Running: true },
+                HostConfig: { NetworkMode: 'host' },
+                Config: {
+                    Labels: {
+                        [NETWORK_LABELS.managed]: '1',
+                        [NETWORK_LABELS.resource]: 'agent',
+                        [NETWORK_LABELS.instanceId]: identity.effectiveInstanceId,
+                        [NETWORK_LABELS.enableGeneration]: identity.enableGeneration,
+                    },
+                },
+            };
+        },
+        spawnProcess: (runtime, args, options) => {
+            assert.equal(runtime, 'podman');
+            assert.deepEqual(args, [
+                'exec', '-i', CONTAINER_ID,
+                'node', '/Agent/server/RuntimeHttpRelay.mjs',
+            ]);
+            return trackChildInputFrames(spawn(process.execPath, [RELAY_HELPER_PATH], {
+                env: {
+                    PATH: process.env.PATH || '',
+                    PLOINKY_AGENT_ID: identity.targetAgentId,
+                },
+                stdio: options.stdio,
+            }), routerFrames);
+        },
+        channelIdleTimeoutMs: 5_000,
+    });
+    t.after(() => manager.close());
+    const plan = {
+        owner: {
+            effectiveInstanceId: identity.effectiveInstanceId,
+            enableGeneration: identity.enableGeneration,
+        },
+        relay: {
+            kind: 'container-exec-stdio',
+            runtime: 'podman',
+            containerId: CONTAINER_ID,
+            containerName,
+            targetAgentId: identity.targetAgentId,
+            effectiveInstanceId: identity.effectiveInstanceId,
+            enableGeneration: identity.enableGeneration,
+            networkMode: 'host',
+        },
+        generationDigest: identity.generationDigest,
+        deniedPorts: [22],
+        method: 'GET',
+        port: 7880,
+        targetPath: '/',
+        query: '',
+        transport: 'http',
+        limits: {
+            connectTimeoutMs: 5_000,
+            concurrentStreamsPerAgent: 4,
+            concurrentStreamsTotal: 8,
+        },
+    };
+    const checkout = await manager.checkout({
+        authorized: true,
+        lease: {
+            commit: () => {
+                commitCalls += 1;
+                return generationCurrent;
+            },
+        },
+        plan,
+    });
+    assert.equal(checkout.channel.session.payload.aud, identity.targetAgentId);
+    await assert.rejects(
+        checkout.openRequest({ plan }),
+        error => error?.code === 'EDGE_GENERATION_CHANGED',
+    );
+    assert.equal(commitCalls, 2);
+    assert.deepEqual(routerFrames.map(frame => frame.type), ['HELLO']);
+    assert.equal(checkout.channel.streams.size, 0);
+    checkout.close();
+});
+
+test('a reused relay channel rechecks the new checkout lease before a second target dial', async (t) => {
+    let targetConnections = 0;
+    const target = net.createServer(socket => {
+        targetConnections += 1;
+        socket.on('error', () => {});
+    });
+    await new Promise((resolve, reject) => {
+        target.once('error', reject);
+        target.listen(0, '127.0.0.1', resolve);
+    });
+    t.after(() => target.close());
+    const targetPort = target.address().port;
+    const containerName = 'alpha-pooled-container';
+    const routerFrames = [];
+    const isolatedMinter = new RelayRequestMinter({
+        resolveAgentSecret: () => assert.fail('pooled host-mode relay must not resolve the reusable agent secret'),
+        createNonce: () => `pooled-${++nonce}`,
+    });
+    const manager = new RuntimeRelayManager({
+        minter: isolatedMinter,
+        inspectContainer: async () => ({
+            Id: CONTAINER_ID,
+            Name: `/${containerName}`,
+            State: { Running: true },
+            HostConfig: { NetworkMode: 'host' },
+            Config: {
+                Labels: {
+                    [NETWORK_LABELS.managed]: '1',
+                    [NETWORK_LABELS.resource]: 'agent',
+                    [NETWORK_LABELS.instanceId]: identity.effectiveInstanceId,
+                    [NETWORK_LABELS.enableGeneration]: identity.enableGeneration,
+                },
+            },
+        }),
+        spawnProcess: (_runtime, _args, options) => trackChildInputFrames(
+            spawn(process.execPath, [RELAY_HELPER_PATH], {
+                env: {
+                    PATH: process.env.PATH || '',
+                    PLOINKY_AGENT_ID: identity.targetAgentId,
+                },
+                stdio: options.stdio,
+            }),
+            routerFrames,
+        ),
+        channelIdleTimeoutMs: 5_000,
+    });
+    t.after(() => manager.close());
+    const plan = {
+        owner: {
+            effectiveInstanceId: identity.effectiveInstanceId,
+            enableGeneration: identity.enableGeneration,
+        },
+        relay: {
+            kind: 'container-exec-stdio',
+            runtime: 'podman',
+            containerId: CONTAINER_ID,
+            containerName,
+            targetAgentId: identity.targetAgentId,
+            effectiveInstanceId: identity.effectiveInstanceId,
+            enableGeneration: identity.enableGeneration,
+            networkMode: 'host',
+        },
+        generationDigest: identity.generationDigest,
+        deniedPorts: [22],
+        method: 'GET',
+        port: targetPort,
+        targetPath: '/',
+        query: '',
+        transport: 'http',
+        limits: {
+            connectTimeoutMs: 5_000,
+            idleTimeoutMs: 5_000,
+            streamedBodyBytes: 64 * 1024,
+            bufferedBodyBytes: 64 * 1024,
+            requestHeaderBytes: 8 * 1024,
+            responseHeaderBytes: 8 * 1024,
+            concurrentStreamsPerAgent: 4,
+            concurrentStreamsTotal: 8,
+        },
+    };
+    const firstCheckout = await manager.checkout({
+        authorized: true,
+        lease: { commit: () => true },
+        plan,
+    });
+    const pooledChannel = firstCheckout.channel;
+    const firstStream = await firstCheckout.openRequest({ plan });
+    await new Promise((resolve, reject) => {
+        firstStream.once('ready', resolve);
+        firstStream.once('error', reject);
+    });
+    assert.equal(targetConnections, 1);
+    firstStream.cancel();
+    await new Promise((resolve, reject) => {
+        firstStream.once('end', resolve);
+        firstStream.once('error', reject);
+    });
+    firstCheckout.close();
+
+    let secondGenerationCurrent = true;
+    const secondCheckout = await manager.checkout({
+        authorized: true,
+        lease: { commit: () => secondGenerationCurrent },
+        plan,
+    });
+    assert.equal(secondCheckout.channel, pooledChannel);
+    secondGenerationCurrent = false;
+    await assert.rejects(
+        secondCheckout.openRequest({ plan }),
+        error => error?.code === 'EDGE_GENERATION_CHANGED',
+    );
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(targetConnections, 1);
+    assert.deepEqual(routerFrames.map(frame => frame.type), ['HELLO', 'OPEN', 'CANCEL']);
+    secondCheckout.close();
 });
 
 test('relay request token binds every HTTP target and body selector without a protocol version', async () => {
@@ -165,4 +569,57 @@ test('relay tokens expire and reject replay', async () => {
         relaySessionId: 'expired',
         replayCache: createRelayReplayCache(),
     }), /expired/i);
+});
+
+test('relay replay cache fails closed at capacity without evicting live JTIs', async () => {
+    const relaySessionIds = ['capacity-one', 'capacity-two', 'capacity-three'];
+    const minted = await Promise.all(relaySessionIds.map(relaySessionId => minter.mintSession({
+        ...identity,
+        relaySessionId,
+        deniedPorts: [],
+    })));
+    const replayCache = createRelayReplayCache({ maxSize: 2 });
+    const verifyAt = (index) => verifyRelaySessionToken(minted[index].token, {
+        secret: AGENT_SECRET,
+        expectedAudience: identity.targetAgentId,
+        ...identity,
+        relaySessionId: relaySessionIds[index],
+        deniedPorts: [],
+        replayCache,
+    });
+    verifyAt(0);
+    verifyAt(1);
+    assert.throws(() => verifyAt(2), /capacity exhausted/);
+    assert.throws(() => verifyAt(0), /already been consumed/);
+});
+
+test('relay replay cache retains JTIs throughout the accepted clock-skew window', async () => {
+    let fakeNow = Date.now();
+    const skewMinter = new RelayRequestMinter({
+        resolveAgentSecret: async () => AGENT_SECRET,
+        now: () => new Date(fakeNow),
+        createNonce: () => `skew-${++nonce}`,
+        ttlSeconds: 5,
+    });
+    const minted = await skewMinter.mintSession({
+        ...identity,
+        relaySessionId: 'skew-window',
+        deniedPorts: [],
+    });
+    const replayCache = createRelayReplayCache({ now: () => fakeNow });
+    const expected = {
+        secret: AGENT_SECRET,
+        expectedAudience: identity.targetAgentId,
+        ...identity,
+        relaySessionId: 'skew-window',
+        deniedPorts: [],
+        replayCache,
+        clockSkewSeconds: 30,
+    };
+    verifyRelaySessionToken(minted.token, { ...expected, now: fakeNow });
+    fakeNow += 6_000;
+    assert.throws(
+        () => verifyRelaySessionToken(minted.token, { ...expected, now: fakeNow }),
+        /already been consumed/,
+    );
 });

@@ -17,7 +17,7 @@ DS011 §Security Scope and Questions #2/#5 recorded that the shared-HMAC invocat
 
 ### Identity Types
 
-The model has exactly two authenticated identity types — `user` and `agent` — plus `guest` (a router-issued session without user or agent privileges). A user authenticates to the router and holds the base role `user` and, when applicable, `admin`. The legacy base role `local` is mapped to `user` on read by `normalizeRoles` in `cli/server/auth/localService.js`; user records, stored ids (`local:<username>`), and `isLocalAdminUser` are unchanged. Admin is resolved by `isLocalAdminUser` (role `admin`, username `admin`, or id `local:admin`); a guest is never admin. An agent is a Ploinky runtime process that receives a canonical id `agent:<repo>/<agent>` and one secret at startup.
+The model has exactly two authenticated identity types — `user` and `agent` — plus `guest` (a router-issued session without user or agent privileges). A user authenticates to the router and holds the base role `user` and, when applicable, `admin`. The legacy base role `local` is mapped to `user` on read by `normalizeRoles` in `cli/server/auth/localService.js`; user records, stored ids (`local:<username>`), and `isLocalAdminUser` are unchanged. Admin is resolved by `isLocalAdminUser` (role `admin`, username `admin`, or id `local:admin`); a guest is never admin. An agent is a Ploinky runtime process that receives a canonical id `agent:<repo>/<agent>`. Reusable request-signing credentials are a separate, post-attestation capability rather than an unconditional consequence of receiving that principal.
 
 ### Per-Agent Secret Derivation
 
@@ -29,7 +29,7 @@ PLOINKY_AGENT_SECRET = HKDF_SHA256(ikm = master, salt = "", info = "ploinky/agen
 
 `deriveAgentRequestSecret(agentId, { encoding })` in `cli/utils/security/masterKey.js` implements this by delegating to `deriveSubkey('agent-secret/' + agentId)`, keeping the workspace's single derivation story; it is router/launcher-only. It is distinct from the pre-existing `deriveAgentSecret` (which derives agent-OWNED generated secrets from the `derived-master` subkey and a per-secret name) and from `deriveDerivedMasterKey`, which remains in use only for agent-owned generated secrets (`generatedSecret`/`sharedGeneratedSecret`), never for invocation signing.
 
-The master key never enters an agent. At startup the runtime managers inject only `PLOINKY_AGENT_ID` (the principal) and `PLOINKY_AGENT_SECRET` (hex), plus the retained principal alias `PLOINKY_AGENT_PRINCIPAL`; the shared `PLOINKY_DERIVED_MASTER_KEY` is no longer injected. Injection sites: `cli/sandbox/docker/agentServiceManager.js`, `cli/sandbox/bwrap/bwrapServiceManager.js`, and `cli/utils/runtime/lifecycleHooks.js` (host lifecycle hooks act as the owning agent and receive that agent's id + secret).
+The master key never enters an agent. Before runtime/network attestation, launchers inject only the canonical `PLOINKY_AGENT_ID`, its `PLOINKY_AGENT_PRINCIPAL` alias, and the exact instance/enable-generation tuple. A managed default/bridge Podman launch receives `PLOINKY_AGENT_SECRET` and the other reusable credential fields only after the Router authority, immutable runtime owner, current generation, and generated-local descriptor have been attested under the launch transaction. Host/none containers, bwrap and Seatbelt runtimes, and host lifecycle hooks remain principal-only and cannot mint Router-facing credentials. The shared `PLOINKY_DERIVED_MASTER_KEY` is never injected. The relevant enforcement sites are `cli/sandbox/docker/agentServiceManager.js`, `cli/sandbox/bwrap/bwrapServiceManager.js`, `cli/sandbox/seatbelt/seatbeltServiceManager.js`, and `cli/utils/runtime/lifecycleHooks.js`.
 
 ### The Three JWT Families
 
@@ -68,6 +68,12 @@ mints a user/guest identity.
 
 **Router Request** (`buildRouterRequest` in `cli/server/mcp-proxy/invocationMinter.js`; `verifyRouterRequestFromHeaders` in `Agent/lib/invocationAuth.mjs`): claims `typ:router-request`, `iss:ploinky-router`, `aud:agent:<repo>/<agent>`, `sub`, `actor{kind,id,roles}`, `method`, `path`, optional `tool`, `rch`, `iat`, `exp` (≤30s), `jti`, optional singular `delegation`, and optional plural `delegations`. The singular `delegation` claim describes the delegation this request is running under after the router has verified a User Delegation Grant. The plural `delegations` claim carries router-minted downstream grants that the target agent may present back to the router later. These two claims are intentionally independent and must not be normalized into each other. The router signs with the TARGET agent's secret. The target agent verifies with its own `PLOINKY_AGENT_SECRET` and `PLOINKY_AGENT_ID` audience: signature, `typ:router-request`, `iss:ploinky-router`, `aud == PLOINKY_AGENT_ID`, `method`/`path`/`tool` match, recompute and match `rch`, time validity, `jti` single-use. A valid HMAC with the wrong type, audience, method, path, tool, or `rch` is not valid for execution.
 
+### Confined Agent-Port Relay Sessions
+
+The agent-port relay uses short-lived HS256 transport tokens, but it does not add an identity family and does not give an unattested runtime a Router-facing credential. After route-policy admission, an initial current authorization-generation lease commit, and verification of the exact immutable container id, owner labels, enable generation, and network mode, `RuntimeRelayManager` starts the read-only `/Agent/server/RuntimeHttpRelay.mjs` helper through the selected Docker or Podman engine's `exec -i` transport. The Router creates a fresh random 32-byte key for that one relay channel and sends it only in the framed `HELLO` message over the private exec stdio stream. The key is not placed in the target environment or argv, returned in `READY`, written to logs, or included in token claims, and both ends clear their in-memory key buffer when the channel closes. Because inspection, channel creation, and token minting are asynchronous, the checkout re-commits the same captured authorization-generation lease at the last Router-controlled point immediately before each `OPEN`; a generation that changed during setup or while a pooled channel was idle therefore creates no target socket.
+
+The channel key signs one `relay-session` token and its `relay-request` tokens. Session claims bind the target principal, effective instance, enable generation, immutable container id, authorization generation, relay session id, and canonical denied-port-set digest. Each request additionally binds method, port, path, query, body mode, and body hash; TTL and replay caches remain mandatory. Replay ids are retained for the whole validity interval including accepted clock skew, and cache saturation rejects new tokens instead of evicting a still-live id. Missing or malformed channel keys, a token from another channel, stale owner/generation data, deny-set changes, replay-cache exhaustion, and attempts to supply a replacement key on `OPEN` all fail closed. This narrow transport-integrity key lets the Router reach a host-networked service on that container's loopback without restoring the long-lived `PLOINKY_AGENT_SECRET` to host/none runtimes or granting the helper authority over Router APIs or other agents.
+
 ### Router-Issued User Delegation Grant
 
 Some authenticated HTTP-service routes and user-initiated MCP tools need the router to preserve the authenticated acting user across a subsequent agent-to-agent tool call. For those flows the router mints a fourth token type for router verification only: a compact HS256 User Delegation Grant with `typ:user-delegation`, `iss:ploinky-router`, `aud:ploinky-router`, `sub:<user id>`, `usr{...}`, `sourceAgentId`, `allowedTargets`, `allowedTools`, `scope`, `iat`, `exp`, and `jti`. The grant is signed with a router-held delegation subkey and is never verified by target agents. A source HTTP service receives it only through verified `x-ploinky-auth-info` on an `httpServices` declaration with `access: "authenticated"`; public and guest services cannot receive delegation grants. A source MCP tool receives it only in the target-audience Router Request's plural `delegations` claim, after the router has verified the user's session, checked MCP policy for the user call, read the source tool's `mcp-config.json` delegation entries, and minted entries for a non-guest user. The source agent may present the grant back to the router together with its own Agent Assertion. HTTP-service manifest delegation entries may additionally declare a `when` condition with a `queryParam` and `pathRoots`; the router evaluates that condition against the authenticated HTTP-service request before minting, so a route can limit grants to a boundary-aware request path such as `/Confidential`. MCP delegation entries are tool-scoped by the source tool name and declare explicit target agent, target tools, scopes, key, and TTL in `mcp-config.json`. The router verifies the Agent Assertion first, then verifies that the grant's source agent, target agent, tool, scope, and expiry all match the live call before minting the target-audience Router Request with the original acting user in `usr`. A User Delegation Grant is a short-lived scoped lease for the authenticated service session or MCP tool execution, not a per-call replay token; per-call replay protection remains on Agent Assertions and Router Requests.
@@ -103,29 +109,32 @@ An agent may use the router-owned Marketplace endpoint to start an installed, in
 
 ### Secret Boundaries and Injected Environment
 
-Every agent container receives the following reserved environment variables from the Ploinky launcher. Manifest-declared values with these names are stripped before injection:
+The following names are reserved to the Ploinky launcher; manifest-declared values are stripped before any authoritative values are injected. Principal fields are available before attestation. Credential fields are present only for a managed default/bridge Podman launch after its generated-local Router transaction succeeds; unsupported, host/none, bwrap, Seatbelt, and host-hook paths remain principal-only.
 
-| Variable | Description |
-| --- | --- |
-| `PLOINKY_AGENT_ID` | Canonical agent principal: `agent:<repo>/<agentName>` |
-| `PLOINKY_AGENT_PRINCIPAL` | Alias for `PLOINKY_AGENT_ID` |
-| `PLOINKY_AGENT_SECRET` | Per-agent HMAC signing secret (hex) derived from master via HKDF |
-| `PLOINKY_AGENT_INSTANCE_ID` | Exact effective runtime instance bound into private Router assertions |
-| `PLOINKY_AGENT_ENABLE_GENERATION` | Exact enable generation bound into private Router assertions and caller ACLs |
-| `PLOINKY_AGENT_PRIVATE_SECRET` | 32-byte hex assertion secret derived for this exact agent/instance/enable-generation tuple |
-| `PLOINKY_AGENT_API_KEY` | Signed-subject identity key: `<subjectId>|<base64url-ed25519-sig>` |
-| `PLOINKY_AGENT_API_PUBLIC_KEY` | Ed25519 public key for verifying signed-subject identity keys |
-| `PLOINKY_ENV_SOURCE_PLOINKY_AGENT_API_KEY` | Always `generated` (provenance marker) |
-| `PLOINKY_ENV_SOURCE_PLOINKY_AGENT_API_PUBLIC_KEY` | Always `generated` (provenance marker) |
+| Variable | Availability | Description |
+| --- | --- | --- |
+| `PLOINKY_AGENT_ID` | Principal | Canonical agent principal: `agent:<repo>/<agentName>` |
+| `PLOINKY_AGENT_PRINCIPAL` | Principal | Alias for `PLOINKY_AGENT_ID` |
+| `PLOINKY_AGENT_INSTANCE_ID` | Principal | Exact effective runtime instance bound into private Router assertions |
+| `PLOINKY_AGENT_ENABLE_GENERATION` | Principal | Exact enable generation bound into private Router assertions and caller ACLs |
+| `PLOINKY_AGENT_SECRET` | Post-attestation credential | Per-agent HMAC signing secret (hex) derived from master via HKDF |
+| `PLOINKY_AGENT_PRIVATE_SECRET` | Post-attestation credential | 32-byte hex assertion secret derived for this exact agent/instance/enable-generation tuple |
+| `PLOINKY_AGENT_API_KEY` | Post-attestation credential | Signed-subject identity key: `<subjectId>|<base64url-ed25519-sig>` |
+| `PLOINKY_AGENT_API_PUBLIC_KEY` | Post-attestation credential | Ed25519 public key for verifying signed-subject identity keys |
+| `PLOINKY_ENV_SOURCE_PLOINKY_AGENT_API_KEY` | Post-attestation provenance | Always `generated` |
+| `PLOINKY_ENV_SOURCE_PLOINKY_AGENT_API_PUBLIC_KEY` | Post-attestation provenance | Always `generated` |
 
 `PLOINKY_MASTER_KEY` and `PLOINKY_DERIVED_MASTER_KEY` are never injected into an agent (asserted by `tests/unit/agentEnvInjection.test.mjs`). Ordinary Agent Assertions and Router Requests use only `PLOINKY_AGENT_SECRET`; private service calls use only the exact tuple's `PLOINKY_AGENT_PRIVATE_SECRET`. Neither path falls back to the master, the other assertion secret, or a shared key. Router and agent logs must not record secrets or whole JWTs.
 
-This injection contract is identical for container, bwrap, and Seatbelt
-runtimes. Identity construction is mandatory and fail-closed. Container labels
-and sandbox PID records persist the exact instance/enable-generation tuple so a
-name or mutable registry entry cannot reuse credentials for an older process.
+Identity construction is mandatory and fail-closed across container, bwrap, and
+Seatbelt runtimes, but credential capability is intentionally not identical.
+Container labels and sandbox PID records persist the exact
+instance/enable-generation tuple so a name or mutable registry entry cannot
+reuse credentials for an older process. Only the attested managed-container
+transaction may cross from principal-only preparation to reusable credential
+injection.
 
-This remains true even for delegated-user flows. Agents do not receive the router's session key or delegation-signing key and cannot mint User Delegation Grants themselves; they still receive only their own per-agent secret.
+This remains true even for delegated-user flows. Agents do not receive the router's session key or delegation-signing key and cannot mint User Delegation Grants themselves. Credential-capable managed containers receive only their own per-agent and exact tuple secrets; principal-only runtimes receive neither reusable credential.
 
 ### Router Discovery Endpoint and Delegated OpenAI Route
 

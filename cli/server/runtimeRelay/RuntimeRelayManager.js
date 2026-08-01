@@ -9,6 +9,12 @@ import { normalizeRelayDescriptor, verifyInspectedContainer } from './confinemen
 const DEFAULT_CHANNEL_IDLE_TIMEOUT_MS = 30_000;
 const MAX_RELAY_STDERR_BYTES = 4096;
 
+function staleGenerationError() {
+    const error = new Error('runtimeRelay: generation lease is stale');
+    error.code = 'EDGE_GENERATION_CHANGED';
+    return error;
+}
+
 class RelayRequestStream extends EventEmitter {
     constructor(channel, requestId) {
         super();
@@ -48,11 +54,12 @@ class RelayRequestStream extends EventEmitter {
 }
 
 class RuntimeRelayChannel extends EventEmitter {
-    constructor({ child, relay, session, minter, idleTimeoutMs, onClose }) {
+    constructor({ child, relay, session, signingSecret, minter, idleTimeoutMs, onClose }) {
         super();
         this.child = child;
         this.relay = relay;
         this.session = session;
+        this.signingSecret = signingSecret;
         this.minter = minter;
         this.idleTimeoutMs = idleTimeoutMs;
         this.onClose = onClose;
@@ -115,7 +122,7 @@ class RuntimeRelayChannel extends EventEmitter {
         return this.child.stdin.write(encodeRelayFrame(frame));
     }
 
-    async openRequest({ plan, bodyMode = 'none', bodyHash = '', headers = {} } = {}) {
+    async openRequest({ plan, bodyMode = 'none', bodyHash = '', headers = {} } = {}, { lease } = {}) {
         if (!plan?.targetPath) throw new Error('runtimeRelay: finalized route plan required');
         const requestId = crypto.randomUUID();
         const minted = await this.minter.mintRequest({
@@ -132,7 +139,11 @@ class RuntimeRelayChannel extends EventEmitter {
             query: plan.query || '',
             bodyMode,
             bodyHash,
-        });
+        }, { signingSecret: this.signingSecret });
+        // Token minting and channel creation are asynchronous. Revalidate the
+        // captured authorization generation at the last Router-controlled
+        // point before OPEN can make the helper create a target TCP socket.
+        if (!lease || lease.commit() !== true) throw staleGenerationError();
         const stream = new RelayRequestStream(this, requestId);
         this.streams.set(requestId, stream);
         try {
@@ -171,6 +182,7 @@ class RuntimeRelayChannel extends EventEmitter {
         this.closed = true;
         clearTimeout(this.idleTimer);
         this.idleTimer = null;
+        this.signingSecret?.fill?.(0);
         try { this.child.stdin.end(); } catch (_) {}
         try { this.child.kill(); } catch (_) {}
         this.onClose?.(this);
@@ -178,8 +190,9 @@ class RuntimeRelayChannel extends EventEmitter {
 }
 
 class RuntimeRelayCheckout {
-    constructor({ channel, release }) {
+    constructor({ channel, lease, release }) {
         this.channel = channel;
+        this.lease = lease;
         this.release = release;
         this.stream = null;
         this.closed = false;
@@ -189,7 +202,7 @@ class RuntimeRelayCheckout {
     async openRequest(options) {
         if (this.closed) throw new Error('runtimeRelay: checkout is closed');
         if (this.stream) throw new Error('runtimeRelay: checkout already opened a request');
-        const stream = await this.channel.openRequest(options);
+        const stream = await this.channel.openRequest(options, { lease: this.lease });
         if (this.closed) {
             stream.cancel();
             throw new Error('runtimeRelay: checkout closed while opening request');
@@ -279,7 +292,13 @@ export class RuntimeRelayManager {
             'exec', '-i', relay.containerId,
             'node', '/Agent/server/RuntimeHttpRelay.mjs',
         ], { stdio: ['pipe', 'pipe', 'pipe'] });
+        let signingSecret = null;
         try {
+            // The relay receives a fresh channel key only after the route lease
+            // and exact managed-container identity have been verified. It does
+            // not need the target agent's reusable request-signing secret in
+            // its ambient environment.
+            signingSecret = crypto.randomBytes(32);
             const session = await this.minter.mintSession({
                 targetAgentId: relay.targetAgentId,
                 effectiveInstanceId: relay.effectiveInstanceId,
@@ -287,12 +306,13 @@ export class RuntimeRelayManager {
                 containerId: relay.containerId,
                 generationDigest: plan.generationDigest,
                 deniedPorts: plan.deniedPorts || [],
-            });
+            }, { signingSecret });
             let channel;
             channel = new RuntimeRelayChannel({
                 child,
                 relay,
                 session,
+                signingSecret,
                 minter: this.minter,
                 idleTimeoutMs: this.channelIdleTimeoutMs,
                 onClose: () => {
@@ -306,6 +326,13 @@ export class RuntimeRelayManager {
                 );
                 timer.unref?.();
                 const onFrame = frame => {
+                    if (frame.type === 'ERROR' && !frame.requestId) {
+                        cleanup();
+                        const error = new Error(frame.message || 'runtimeRelay: HELLO rejected');
+                        error.code = frame.code || 'RELAY_REJECTED';
+                        reject(error);
+                        return;
+                    }
                     if (frame.type !== 'READY' || frame.requestId) return;
                     cleanup();
                     if (frame.containerId !== relay.containerId
@@ -337,6 +364,7 @@ export class RuntimeRelayManager {
                 relaySessionId: session.payload.relaySessionId,
                 deniedPorts: session.payload.deniedPorts,
                 denySetDigest: session.payload.denySetDigest,
+                verificationKey: signingSecret.toString('hex'),
                 token: session.token,
             });
             await ready;
@@ -347,6 +375,7 @@ export class RuntimeRelayManager {
             this.channels.set(key, channel);
             return channel;
         } catch (error) {
+            signingSecret?.fill?.(0);
             try { child.kill(); } catch (_) {}
             throw error;
         }
@@ -370,7 +399,7 @@ export class RuntimeRelayManager {
     async checkout({ plan, lease, authorized = false } = {}) {
         if (authorized !== true) throw new Error('runtimeRelay: authorization must complete before checkout');
         if (this.closed) throw new Error('runtimeRelay: manager is closed');
-        if (!lease || lease.commit() !== true) throw new Error('runtimeRelay: generation lease is stale');
+        if (!lease || lease.commit() !== true) throw staleGenerationError();
         const relay = normalizeRelayDescriptor(plan?.relay);
         if (relay.containerId !== plan.relay.containerId
             || relay.effectiveInstanceId !== plan.owner.effectiveInstanceId
@@ -382,7 +411,7 @@ export class RuntimeRelayManager {
             const key = this._poolKey(plan, relay);
             const channel = await this._getOrCreateChannel({ plan, relay, key });
             if (this.closed || channel.closed) throw new Error('runtimeRelay: channel is closed');
-            return new RuntimeRelayCheckout({ channel, release });
+            return new RuntimeRelayCheckout({ channel, lease, release });
         } catch (error) {
             release();
             throw error;

@@ -8,8 +8,6 @@ import {
     encodeRelayFrame,
 } from '../lib/runtimeRelayProtocol.mjs';
 
-const secretHex = String(process.env.PLOINKY_AGENT_SECRET || '').trim();
-const secret = /^[0-9a-f]{64}$/i.test(secretHex) ? Buffer.from(secretHex, 'hex') : null;
 const effectiveAgentId = String(process.env.PLOINKY_AGENT_ID || process.env.PLOINKY_AGENT_PRINCIPAL || '');
 const sessionReplayCache = createRelayReplayCache();
 const requestReplayCache = createRelayReplayCache();
@@ -29,6 +27,7 @@ function terminate(error) {
     if (terminating) return;
     try { fail(error?.message || error); } catch (_) {}
     terminating = true;
+    session?.verificationKey?.fill?.(0);
     for (const state of streams.values()) state.socket.destroy();
     streams.clear();
     process.exitCode = 1;
@@ -41,10 +40,13 @@ function requireSession() {
 
 function handleHello(frame) {
     if (session) throw new Error('duplicate HELLO');
-    if (!secret || !effectiveAgentId) throw new Error('runtime agent identity is unavailable');
+    if (!effectiveAgentId) throw new Error('runtime agent identity is unavailable');
     if (String(frame.targetAgentId || '') !== effectiveAgentId) throw new Error('effective agent identity mismatch');
+    const verificationKeyHex = String(frame.verificationKey || '').trim();
+    if (!/^[0-9a-f]{64}$/i.test(verificationKeyHex)) throw new Error('relay verification key is unavailable');
+    const verificationKey = Buffer.from(verificationKeyHex, 'hex');
     const verified = verifyRelaySessionToken(frame.token, {
-        secret,
+        secret: verificationKey,
         expectedAudience: effectiveAgentId,
         effectiveInstanceId: frame.effectiveInstanceId,
         enableGeneration: frame.enableGeneration,
@@ -63,10 +65,18 @@ function handleHello(frame) {
         relaySessionId: String(frame.relaySessionId),
         deniedPorts: Object.freeze(verified.deniedPorts),
         denySetDigest: verified.denySetDigest,
+        verificationKey,
     });
     send({
         type: 'READY',
-        ...session,
+        targetAgentId: session.targetAgentId,
+        effectiveInstanceId: session.effectiveInstanceId,
+        enableGeneration: session.enableGeneration,
+        containerId: session.containerId,
+        generationDigest: session.generationDigest,
+        relaySessionId: session.relaySessionId,
+        deniedPorts: session.deniedPorts,
+        denySetDigest: session.denySetDigest,
     });
 }
 
@@ -83,7 +93,8 @@ function handleOpen(frame) {
     const requestId = String(frame.requestId || '');
     if (!requestId || streams.has(requestId)) throw new Error('invalid or duplicate request id');
     if (Object.prototype.hasOwnProperty.call(frame, 'deniedPorts')
-        || Object.prototype.hasOwnProperty.call(frame, 'denySetDigest')) {
+        || Object.prototype.hasOwnProperty.call(frame, 'denySetDigest')
+        || Object.prototype.hasOwnProperty.call(frame, 'verificationKey')) {
         throw new Error('request frame cannot alter the trusted deny set');
     }
     const portText = String(frame.port || '');
@@ -94,7 +105,7 @@ function handleOpen(frame) {
     if (!['buffered', 'stream', 'none'].includes(frame.bodyMode)) throw new Error('invalid body mode');
 
     verifyRelayRequestToken(frame.token, {
-        secret,
+        secret: session.verificationKey,
         expectedAudience: session.targetAgentId,
         effectiveInstanceId: session.effectiveInstanceId,
         enableGeneration: session.enableGeneration,
@@ -214,6 +225,7 @@ process.stdin.on('data', chunk => {
 });
 process.stdin.on('end', () => {
     try { decoder.end(); } catch (_) {}
+    session?.verificationKey?.fill?.(0);
     for (const state of streams.values()) state.socket.destroy();
 });
 process.stdin.on('error', terminate);

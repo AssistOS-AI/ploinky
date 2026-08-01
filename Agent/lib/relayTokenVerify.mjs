@@ -65,7 +65,7 @@ function assertAudience(payload, expectedAudience) {
     }
 }
 
-function assertReplayProtected(payload, replayCache) {
+function assertReplayProtected(payload, replayCache, { clockSkewSeconds, now } = {}) {
     const tokenId = String(payload?.jti || '').trim();
     if (!tokenId) {
         throw new Error('relayTokenVerify: jti missing');
@@ -74,7 +74,13 @@ function assertReplayProtected(payload, replayCache) {
     if (replayCache.seen(tokenId)) {
         throw new Error('relayTokenVerify: jti has already been consumed');
     }
-    const ttlMs = Math.max(1, (Number(payload.exp) * 1000) - Date.now()) + 1000;
+    // Keep the JTI for the entire interval in which time validation can still
+    // accept the token, including the configured clock-skew allowance.
+    const nowMs = Number(now ?? Date.now());
+    const ttlMs = Math.max(
+        1,
+        (Number(payload.exp) * 1000) + (clockSkewSeconds * 1000) - nowMs,
+    ) + 1000;
     replayCache.remember(tokenId, ttlMs);
 }
 
@@ -92,21 +98,19 @@ export function verifyRelayJws(token, {
     assertSignatureMatches({ ...decoded, secret });
     assertTimeValid(decoded.payload, { clockSkewSeconds, now });
     assertAudience(decoded.payload, expectedAudience);
-    assertReplayProtected(decoded.payload, replayCache);
+    assertReplayProtected(decoded.payload, replayCache, { clockSkewSeconds, now });
     return { header: decoded.header, payload: decoded.payload };
 }
 
-export function createRelayReplayCache({ maxSize = 2048 } = {}) {
+export function createRelayReplayCache({ maxSize = 2048, now = () => Date.now() } = {}) {
+    const capacity = Number.isSafeInteger(Number(maxSize)) && Number(maxSize) > 0
+        ? Number(maxSize)
+        : 2048;
     const entries = new Map();
     function prune() {
-        const now = Date.now();
+        const currentTime = Number(now());
         for (const [tokenId, expiresAt] of entries) {
-            if (expiresAt <= now) entries.delete(tokenId);
-        }
-        while (entries.size > maxSize) {
-            const oldest = entries.keys().next().value;
-            if (oldest === undefined) break;
-            entries.delete(oldest);
+            if (expiresAt <= currentTime) entries.delete(tokenId);
         }
     }
     return {
@@ -116,7 +120,10 @@ export function createRelayReplayCache({ maxSize = 2048 } = {}) {
         },
         remember(tokenId, ttlMs) {
             prune();
-            entries.set(tokenId, Date.now() + Math.max(1, Number(ttlMs) || 1));
+            if (!entries.has(tokenId) && entries.size >= capacity) {
+                throw new Error('relayTokenVerify: replay cache capacity exhausted');
+            }
+            entries.set(tokenId, Number(now()) + Math.max(1, Number(ttlMs) || 1));
         },
         reset() {
             entries.clear();

@@ -57,7 +57,7 @@ mutually hostile tenants.
 | Router public/control listener `8080` | Browser routes, public HTTP services, first-party surfaces, policy commands, MCP entry points. | Exact control, agent-root, and dedicated-service Hosts select closed route surfaces before path dispatch. The outer wrapper publishes this listener only through the selected physical-host loopback port; cloudflared, when explicitly configured, always dials in-box `127.0.0.1:8080`. |
 | Router private listener `8081` | Current-generation agent-to-service HTTP, SSE, and WebSocket calls. | It is never an outer publication. Effective authenticated policy and an exact caller instance/enable-generation ACL plus request-bound replay-protected private assertion are all required. |
 | Workspace master key | Session signing, encrypted stores, per-agent request secrets, generated secrets. | The resolved master seed is high trust; explicit `PLOINKY_MASTER_KEY` / `.env` values and the generated `.ploinky/master-key` fallback all root the same HKDF tree. |
-| Agent environment | Agent identity and per-agent signing. | Agents receive only `PLOINKY_AGENT_ID`, `PLOINKY_AGENT_PRINCIPAL`, and their own `PLOINKY_AGENT_SECRET`; they never receive the master or shared derived-master request key. |
+| Agent environment | Agent identity and per-agent signing. | Every runtime receives only its canonical principal and exact runtime tuple before attestation. Reusable per-agent/private/API credentials are added only to managed default/bridge Podman launches after generated-local Router attestation; host/none, bwrap, Seatbelt, and host-hook paths remain principal-only. No runtime receives the master or shared derived-master request key. |
 | Policy state | Operator/admin HTTP and MCP policy. | Corrupt or old schema state fails the whole document closed. |
 | Manifest declarations | Candidate agent-owned routing/service intent. | Manifests may declare route access and slim HTTP services in the new vocabulary. Exact bytes are effective only after coordinated generation apply; invalid candidate state installs nothing and leaves affected selectors inactive. |
 
@@ -403,6 +403,33 @@ verified by the target agent.
 Router Requests are the only tokens agents trust for executing router-mediated
 MCP tools, resource reads, task status operations, and scoped HTTP-service
 invocations.
+
+### Confined Agent-Port Relay
+
+An admitted agent-port route may need to reach a service bound to the target
+container's loopback, including a host-networked service. After an initial
+current authorization-generation lease commit and exact immutable container,
+owner, generation, label, and network-mode inspection, the Router starts
+`/Agent/server/RuntimeHttpRelay.mjs` through private exec stdio. A fresh random
+32-byte key exists only for that relay channel: it is carried in the framed
+`HELLO`, never injected into the runtime environment or argv, never echoed in
+`READY` or logs, and cleared on channel close.
+
+Inspection, helper setup, channel pooling, and token minting do not extend the
+captured authorization lease. The Router re-commits that same lease after
+request-token minting and immediately before every `OPEN`, which is the final
+Router-controlled operation before the helper can create the target socket. A
+generation that changes during setup or while a channel is idle therefore
+fails with no upstream connection.
+
+The key signs replay-protected `relay-session` and `relay-request` transport
+tokens that bind the exact principal/instance/generation/container and denied
+port set; each request also binds method, port, path, query, body mode, and body
+hash. Replay ids remain recorded through the accepted clock-skew interval, and
+cache saturation fails closed rather than evicting a live id. These tokens
+establish transport integrity only. They are not a fourth
+identity family, cannot authenticate to Router APIs or other agents, and do not
+restore `PLOINKY_AGENT_SECRET` to an unattested host/none runtime.
 
 ### User Delegation Grant
 

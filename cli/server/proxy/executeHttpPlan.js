@@ -196,7 +196,7 @@ export function proxyErrorStatus(error) {
     if (error?.code === 'METHOD_REJECTED') return 405;
     if (error?.code === 'REQUEST_TOO_LARGE') return 413;
     if (['AUTH_REQUIRED', 'ORIGIN_REJECTED', 'CSRF_REJECTED'].includes(error?.code)) return 403;
-    if (['RELAY_BUSY', 'ROUTING_UNAVAILABLE'].includes(error?.code)
+    if (['EDGE_GENERATION_CHANGED', 'RELAY_BUSY', 'ROUTING_UNAVAILABLE'].includes(error?.code)
         || /lease|concurrenc|routing unavailable/i.test(String(error?.message || ''))) return 503;
     if (error?.code === 'TARGET_TIMEOUT'
         || /timeout|lifetime exceeded/i.test(String(error?.message || ''))) return 504;
