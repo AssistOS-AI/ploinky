@@ -16,6 +16,7 @@ import {
     waitForNoWaitLifecycle,
     waitForNoWaitRouteActivation,
     waitForPriorWorker,
+    withActiveNoWaitWorkerLifecycleLease,
     writeStatus,
 } from '../../cli/commands/noWaitWorker.js';
 
@@ -91,14 +92,187 @@ test('no-wait runtime holds the workspace mutation lease through route activatio
         path.resolve('cli/commands/noWaitWorker.js'),
         'utf8',
     );
-    const acquire = source.indexOf('await withWorkspaceMutationLease({');
-    const lifecycle = source.indexOf('const lifecycle = await waitForNoWaitWorkerLifecycle', acquire);
-    const activation = source.indexOf('await upsertRoute(', lifecycle);
+    const acquire = source.indexOf(
+        'await withActiveNoWaitWorkerLifecycleLease(expectedIdentity, async (lifecycle) => {',
+    );
+    const activation = source.indexOf('await upsertRoute(', acquire);
     const release = source.indexOf('\n        });\n    } catch (err)', activation);
     assert.ok(acquire > 0, 'no-wait worker must acquire the shared workspace mutation lease');
-    assert.ok(lifecycle > acquire, 'lifecycle capture must occur under the workspace mutation lease');
-    assert.ok(activation > lifecycle, 'route activation must remain in the same critical section');
+    assert.ok(activation > acquire, 'route activation must remain in the same critical section');
     assert.ok(release > activation, 'the workspace mutation callback must close only after route activation');
+});
+
+test('no-wait worker never owns the workspace lease while waiting for an active generation', async () => {
+    const identity = { containerName: 'ploinky_demo_worker', routeKey: 'background' };
+    const lifecycle = {
+        generationDigest: 'sha256:active',
+        selectorActivationId: 'activation-ready',
+    };
+    let now = 0;
+    let loads = 0;
+    let leaseHeld = false;
+    let leaseCalls = 0;
+    const result = await withActiveNoWaitWorkerLifecycleLease(identity, async (locked) => {
+        assert.equal(leaseHeld, true);
+        assert.deepEqual(locked, lifecycle);
+        return 'launched';
+    }, {
+        timeoutMs: 1_000,
+        pollIntervalMs: 10,
+        nowFn: () => now,
+        loadFn() {
+            loads += 1;
+            if (loads <= 2) {
+                assert.equal(leaseHeld, false, 'inactive selector polling must occur without the lease');
+                throw Object.assign(new Error('publication inactive'), {
+                    code: 'EDGE_GENERATION_INACTIVE',
+                });
+            }
+            return lifecycle;
+        },
+        async withLeaseFn(options, callback) {
+            assert.match(options.operation, /^no-wait-runtime:/);
+            leaseCalls += 1;
+            leaseHeld = true;
+            try {
+                return await callback();
+            } finally {
+                leaseHeld = false;
+            }
+        },
+        async sleepFn(delayMs) {
+            assert.equal(leaseHeld, false, 'publication recovery delay must not retain the lease');
+            now += delayMs;
+        },
+    });
+
+    assert.equal(result, 'launched');
+    assert.equal(leaseCalls, 1);
+    assert.equal(leaseHeld, false);
+});
+
+test('retryable publication recovery reacquires between exact worker lease attempts', async () => {
+    const identity = { containerName: 'ploinky_demo_worker', routeKey: 'background' };
+    const beforeFailure = {
+        generationDigest: 'sha256:active',
+        selectorActivationId: 'activation-reconciling',
+    };
+    const afterRecovery = {
+        generationDigest: 'sha256:active',
+        selectorActivationId: 'activation-ready',
+    };
+    let now = 0;
+    let state = 'before-failure';
+    let leaseHeld = false;
+    let acquisitions = 0;
+    let releases = 0;
+    let launches = 0;
+    const result = await withActiveNoWaitWorkerLifecycleLease(identity, async (lifecycle) => {
+        launches += 1;
+        assert.equal(leaseHeld, true);
+        assert.deepEqual(lifecycle, afterRecovery);
+        return lifecycle.selectorActivationId;
+    }, {
+        timeoutMs: 1_000,
+        pollIntervalMs: 10,
+        nowFn: () => now,
+        loadFn() {
+            if (state === 'inactive') {
+                throw Object.assign(new Error('publication retry pending'), {
+                    code: 'EDGE_GENERATION_INACTIVE',
+                });
+            }
+            return state === 'before-failure' ? beforeFailure : afterRecovery;
+        },
+        async withLeaseFn(_options, callback) {
+            acquisitions += 1;
+            leaseHeld = true;
+            if (acquisitions === 1) state = 'inactive';
+            try {
+                return await callback();
+            } finally {
+                leaseHeld = false;
+                releases += 1;
+            }
+        },
+        async sleepFn(delayMs) {
+            assert.equal(leaseHeld, false, 'publication must be able to reacquire between worker attempts');
+            now += delayMs;
+            if (state === 'inactive') state = 'recovered';
+        },
+    });
+
+    assert.equal(result, 'activation-ready');
+    assert.equal(acquisitions, 2);
+    assert.equal(releases, 2);
+    assert.equal(launches, 1);
+    assert.equal(leaseHeld, false);
+});
+
+test('selector change inside the lease releases and retries the exact lifecycle capture', async () => {
+    const identity = { containerName: 'ploinky_demo_worker', routeKey: 'background' };
+    const initial = {
+        generationDigest: 'sha256:active',
+        selectorActivationId: 'activation-reconciling',
+    };
+    const ready = {
+        generationDigest: 'sha256:active',
+        selectorActivationId: 'activation-ready',
+    };
+    let current = initial;
+    let acquisitions = 0;
+    let releases = 0;
+    let launches = 0;
+    let now = 0;
+    await withActiveNoWaitWorkerLifecycleLease(identity, async (lifecycle) => {
+        launches += 1;
+        assert.deepEqual(lifecycle, ready);
+    }, {
+        timeoutMs: 1_000,
+        pollIntervalMs: 10,
+        nowFn: () => now,
+        loadFn: () => current,
+        async withLeaseFn(_options, callback) {
+            acquisitions += 1;
+            if (acquisitions === 1) current = ready;
+            try {
+                return await callback();
+            } finally {
+                releases += 1;
+            }
+        },
+        async sleepFn(delayMs) { now += delayMs; },
+    });
+
+    assert.equal(acquisitions, 2);
+    assert.equal(releases, 2);
+    assert.equal(launches, 1);
+});
+
+test('inactive selector polling fails closed within one bound without acquiring a lease', async () => {
+    let now = 0;
+    let leaseCalls = 0;
+    await assert.rejects(
+        () => withActiveNoWaitWorkerLifecycleLease(
+            { containerName: 'ploinky_demo_worker', routeKey: 'background' },
+            async () => assert.fail('inactive selector must not launch'),
+            {
+                timeoutMs: 1_000,
+                pollIntervalMs: 250,
+                nowFn: () => now,
+                loadFn() {
+                    throw Object.assign(new Error('publication inactive'), {
+                        code: 'EDGE_GENERATION_INACTIVE',
+                    });
+                },
+                async withLeaseFn() { leaseCalls += 1; },
+                async sleepFn(delayMs) { now += delayMs; },
+            },
+        ),
+        (error) => error?.code === 'NO_WAIT_EDGE_LEASE_TIMEOUT',
+    );
+    assert.equal(now, 1_000);
+    assert.equal(leaseCalls, 0);
 });
 
 test('no-wait launch waits for the staged edge generation to become active', async () => {

@@ -394,6 +394,84 @@ export async function waitForNoWaitWorkerLifecycle(identity, {
     throw new Error(`timed out waiting for the active edge generation for '${identity.routeKey}'`);
 }
 
+export async function withActiveNoWaitWorkerLifecycleLease(identity, callback, {
+    timeoutMs = Number.parseInt(
+        process.env.PLOINKY_NO_WAIT_EDGE_TIMEOUT_MS || '180000',
+        10,
+    ),
+    pollIntervalMs = 250,
+    loadFn = loadNoWaitWorkerLifecycle,
+    withLeaseFn = withWorkspaceMutationLease,
+    sleepFn = sleep,
+    nowFn = Date.now,
+    operation = `no-wait-runtime:${String(identity?.containerName || identity?.routeKey || 'unknown')}`,
+} = {}) {
+    if (typeof callback !== 'function') {
+        throw new TypeError('no-wait lifecycle lease requires a callback');
+    }
+    const parsedTimeoutMs = Number(timeoutMs);
+    const boundedTimeoutMs = Number.isFinite(parsedTimeoutMs)
+        ? Math.max(1000, parsedTimeoutMs)
+        : 180000;
+    const parsedPollIntervalMs = Number(pollIntervalMs);
+    const boundedPollIntervalMs = Number.isFinite(parsedPollIntervalMs)
+        ? Math.max(1, parsedPollIntervalMs)
+        : 250;
+    const deadline = nowFn() + boundedTimeoutMs;
+
+    while (nowFn() < deadline) {
+        let observedLifecycle;
+        try {
+            // Publication must be able to reacquire the shared lease while a
+            // retryable failure has left the selector inactive. Never wait for
+            // an active selector from inside the workspace mutation lease.
+            observedLifecycle = loadFn(identity);
+        } catch (error) {
+            if (error?.code !== 'EDGE_GENERATION_INACTIVE') throw error;
+            const remainingMs = deadline - nowFn();
+            if (remainingMs <= 0) break;
+            await sleepFn(Math.min(boundedPollIntervalMs, remainingMs));
+            continue;
+        }
+
+        const remainingMs = deadline - nowFn();
+        if (remainingMs <= 0) break;
+        const result = await withLeaseFn({
+            operation,
+            waitTimeoutMs: remainingMs,
+            retryIntervalMs: Math.min(1000, boundedPollIntervalMs),
+        }, async () => {
+            let lockedLifecycle;
+            try {
+                lockedLifecycle = loadFn(identity);
+            } catch (error) {
+                if (error?.code === 'EDGE_GENERATION_INACTIVE') return { retry: true };
+                throw error;
+            }
+            // Publication or another exact workspace mutation may have
+            // changed the selector while this worker waited for the lease.
+            // Release and sample again instead of adopting a mixed snapshot.
+            if (!isDeepStrictEqual(lockedLifecycle, observedLifecycle)) {
+                return { retry: true };
+            }
+            return { retry: false, value: await callback(lockedLifecycle) };
+        });
+        if (!result.retry) return result.value;
+
+        const retryRemainingMs = deadline - nowFn();
+        if (retryRemainingMs <= 0) break;
+        // withLeaseFn has released the exact lease before this delay, leaving
+        // a fair recovery window for publication to reactivate the selector.
+        await sleepFn(Math.min(boundedPollIntervalMs, retryRemainingMs));
+    }
+
+    const error = new Error(
+        `timed out waiting for an exact active edge generation lease for '${identity.routeKey}'`,
+    );
+    error.code = 'NO_WAIT_EDGE_LEASE_TIMEOUT';
+    throw error;
+}
+
 export async function waitForNoWaitRouteActivation(identity, launchSelector, options = {}) {
     const lifecycle = await waitForNoWaitLifecycle(identity, options);
     if (lifecycle.generationDigest !== launchSelector?.generation) {
@@ -574,13 +652,6 @@ async function main() {
     let taskOwnedCandidate = null;
     try {
         await waitForPriorWorker(waitForStatus);
-        // The parent start may still own this lease while detached workers are
-        // spawned, and Cloudflare publication uses the same lease afterward.
-        // Wait within the shared bounded contract so Router attestation and
-        // route activation cannot race either mutation owner.
-        await withWorkspaceMutationLease({
-            operation: `no-wait-runtime:${containerName}`,
-        }, async () => {
         const expectedIdentity = Object.freeze({
             containerName,
             repoName,
@@ -589,11 +660,16 @@ async function main() {
             routeKey,
             agentPath,
         });
+        // The parent start may still own this lease while detached workers are
+        // spawned, and Cloudflare publication uses the same lease afterward.
+        // Observe inactive publication recovery without a lease, then capture
+        // one exact active selector under the lease and retain it through
+        // Router attestation, runtime readiness, and route activation.
+        await withActiveNoWaitWorkerLifecycleLease(expectedIdentity, async (lifecycle) => {
         // The workspace graph has already committed this exact target-less
         // identity. Keep that active generation serving while the detached
         // runtime starts; host-network launches are authorized by the exact
         // active-generation capability already compiled for this owner.
-        const lifecycle = await waitForNoWaitWorkerLifecycle(expectedIdentity);
         const manifest = lifecycle.manifest;
         const activeProfile = String(lifecycle.record.profile || '');
         if (profileName && activeProfile && profileName !== activeProfile) {
