@@ -421,7 +421,11 @@ test('attestation registers, probes, consumes, then commits the generation befor
         },
         runProbe() {
             order.push('probe');
-            return { external: fixture.evidence.external, helper: fixture.evidence.helper };
+            return {
+                external: fixture.evidence.external,
+                helper: fixture.evidence.helper,
+                target: { image: 'sha256:target', user: 'root' },
+            };
         },
         now: () => fixture.evidence.observedAtUnixMs,
     });
@@ -429,4 +433,5 @@ test('attestation registers, probes, consumes, then commits the generation befor
     assert.deepEqual(order, ['register', 'probe', 'consume', 'commit']);
     assert.match(result.attestationId, /^sha256:[a-f0-9]{64}$/);
     assert.equal(result.evidence.generationId, fixture.evidence.generationId);
+    assert.deepEqual(result.evidence.target, { image: 'sha256:target', user: 'root' });
 });

@@ -130,19 +130,22 @@ endpoint.
 Before a managed-network launch can receive Router authority, Ploinky resolves
 the agent image reference locally, pulling a missing image before the managed
 network transaction and failing before network mutation if preparation cannot
-complete. It then resolves that local reference to one immutable image ID and
-reads only the bounded `Config.User` projection from that image. The image must
-declare an exact numeric, non-root `UID:GID`; an empty, symbolic, root, or out-of-range identity
-fails closed. The confined authority helper runs the immutable image as that
-same user. Helper creation and cleanup are verified through a fixed bounded
-container-inspection projection rather than unbounded engine JSON. Before it
+complete. It then resolves that local reference to one immutable target image
+ID and reads only the bounded `Config.User` projection from that image. The image must
+not satisfy a Ploinky-specific user declaration: empty, symbolic, root, and
+numeric identities are all admitted. The confined authority helper runs a
+pinned, separately resolved Node image as fixed numeric non-root user
+`65534:65534`; it never executes the target image or its entrypoint. Helper
+creation and cleanup are verified through a fixed bounded container-inspection
+projection rather than unbounded engine JSON. Before it
 issues either Router request, the started helper also proves from
 `/proc/self/status` that its effective and bounding capability sets are zero
-and `NoNewPrivs` is active. The real nested Podman container then uses
-`--userns=keep-id:uid=<UID>,gid=<GID>` so its attested non-root identity maps to
-the outer rootless owner of writable bind mounts such as `/root`. Creation,
-adoption, and final inspection must agree on the immutable image, `Config.User`,
-and exact Podman user-namespace annotation.
+and `NoNewPrivs` is active. When the image declares an exact numeric, non-root
+`UID:GID`, the real nested Podman container uses the corresponding
+`--userns=keep-id:uid=<UID>,gid=<GID>` mapping. Other image identities use the
+image default without a Ploinky user-namespace override. Creation, adoption,
+and final inspection must agree on the immutable target image, `Config.User`, and
+the optional Podman user-namespace annotation.
 
 The helper's two Router observations are authorized only by a private,
 TTL-bounded registration that binds a cryptographically random nonce to the

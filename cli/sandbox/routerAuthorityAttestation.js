@@ -15,6 +15,8 @@ const REQUEST_TIMEOUT_MS = 3_000;
 const HELPER_TIMEOUT_MS = 15_000;
 const MAX_OUTPUT_BYTES = 8 * 1024;
 const LOOPBACK_LOGIN_BODY = '{"ok":false,"error":"not_authenticated","login":"/auth/login?returnTo=%2Fhealth&agent=explorer"}';
+const AUTHORITY_HELPER_USER = '65534:65534';
+export const ROUTER_AUTHORITY_HELPER_IMAGE = 'docker.io/library/node:24-bookworm-slim@sha256:6f7b03f7c2c8e2e784dcf9295400527b9b1270fd37b7e9a7285cf83b6951452d';
 
 const PROBE_SCRIPT = String.raw`
 const fs = require('node:fs');
@@ -361,7 +363,7 @@ export function createPrivateAuthorityRegistryClient({
     });
 }
 
-const AUTHORITY_HELPER_INSPECT_FORMAT = String.raw`{"id":{{json .ID}},"image":{{json .Image}},"user":{{json .Config.User}},"init":{{json .HostConfig.Init}},"readonlyRootfs":{{json .HostConfig.ReadonlyRootfs}},"pidsLimit":{{json .HostConfig.PidsLimit}},"memory":{{json .HostConfig.Memory}},"nanoCpus":{{json .HostConfig.NanoCpus}},"networkMode":{{json .HostConfig.NetworkMode}},"extraHosts":{{json .HostConfig.ExtraHosts}},"mountCount":{{len .Mounts}},"bindCount":{{len .HostConfig.Binds}},"tmpfsCount":{{len .HostConfig.Tmpfs}},"portBindingCount":{{len .HostConfig.PortBindings}},"capDrop":{{json .HostConfig.CapDrop}},"capAdd":{{json .HostConfig.CapAdd}},"securityOpt":{{json .HostConfig.SecurityOpt}},"env":{{json .Config.Env}},"helperLabel":{{json (index .Config.Labels "io.assistos.ploinky.authority-helper")}},"networks":{{json .NetworkSettings.Networks}},"running":{{json .State.Running}},"status":{{json .State.Status}}}`;
+const AUTHORITY_HELPER_INSPECT_FORMAT = String.raw`{"id":{{json .ID}},"image":{{json .Image}},"user":{{json .Config.User}},"entrypoint":{{json .Config.Entrypoint}},"init":{{json .HostConfig.Init}},"readonlyRootfs":{{json .HostConfig.ReadonlyRootfs}},"pidsLimit":{{json .HostConfig.PidsLimit}},"memory":{{json .HostConfig.Memory}},"nanoCpus":{{json .HostConfig.NanoCpus}},"networkMode":{{json .HostConfig.NetworkMode}},"extraHosts":{{json .HostConfig.ExtraHosts}},"mountCount":{{len .Mounts}},"bindCount":{{len .HostConfig.Binds}},"tmpfsCount":{{len .HostConfig.Tmpfs}},"portBindingCount":{{len .HostConfig.PortBindings}},"capDrop":{{json .HostConfig.CapDrop}},"capAdd":{{json .HostConfig.CapAdd}},"securityOpt":{{json .HostConfig.SecurityOpt}},"env":{{json .Config.Env}},"helperLabel":{{json (index .Config.Labels "io.assistos.ploinky.authority-helper")}},"networks":{{json .NetworkSettings.Networks}},"running":{{json .State.Running}},"status":{{json .State.Status}}}`;
 
 function inspectAuthorityHelper(runtime, id) {
     const raw = runBounded(runtime, [
@@ -375,21 +377,24 @@ function inspectAuthorityHelper(runtime, id) {
     return parsed;
 }
 
+export function managedImageUserNamespace(imageUser) {
+    const match = /^([1-9][0-9]*):([1-9][0-9]*)$/.exec(String(imageUser || ''));
+    const maxLinuxId = 4_294_967_294n;
+    if (!match
+        || BigInt(match[1]) > maxLinuxId
+        || BigInt(match[2]) > maxLinuxId) {
+        return '';
+    }
+    return `keep-id:uid=${match[1]},gid=${match[2]}`;
+}
+
 export function runContainerAuthorityProbe({ runtime, plan, image, intent, nonce } = {}) {
     if (runtime !== 'podman') fail('PLOINKY_ROUTER_ATTESTATION_UNSUPPORTED', 'container attestation requires verified Podman');
-    const imageId = runBounded(runtime, ['image', 'inspect', '--format', '{{.Id}}', image]);
-    if (!imageId || !/^(sha256:)?[a-f0-9]{64}$/.test(imageId)) fail('PLOINKY_ROUTER_ATTESTATION_HELPER', 'actual agent image did not resolve to an immutable image ID');
-    const finalUser = runBounded(runtime, ['image', 'inspect', '--format', '{{.Config.User}}', imageId]);
-    const finalUserMatch = /^([1-9][0-9]*):([1-9][0-9]*)$/.exec(finalUser);
-    const maxLinuxId = 4_294_967_294n;
-    if (!finalUserMatch
-        || BigInt(finalUserMatch[1]) > maxLinuxId
-        || BigInt(finalUserMatch[2]) > maxLinuxId) {
-        fail(
-            'PLOINKY_ROUTER_ATTESTATION_UNSUPPORTED',
-            'actual agent image must declare an exact numeric non-root UID:GID for the confined helper and rootless bind mapping',
-        );
-    }
+    const targetImageId = runBounded(runtime, ['image', 'inspect', '--format', '{{.Id}}', image]);
+    if (!targetImageId || !/^(sha256:)?[a-f0-9]{64}$/.test(targetImageId)) fail('PLOINKY_ROUTER_ATTESTATION_HELPER', 'actual agent image did not resolve to an immutable image ID');
+    const targetImageUser = runBounded(runtime, ['image', 'inspect', '--format', '{{.Config.User}}', targetImageId]);
+    const helperImageId = runBounded(runtime, ['image', 'inspect', '--format', '{{.Id}}', ROUTER_AUTHORITY_HELPER_IMAGE]);
+    if (!helperImageId || !/^(sha256:)?[a-f0-9]{64}$/.test(helperImageId)) fail('PLOINKY_ROUTER_ATTESTATION_HELPER', 'authority helper image did not resolve to an immutable image ID');
     const helperName = `ploinky-authority-${nonce.slice(0, 16)}`;
     const firstHost = intent.requestAuthority;
     const secondHost = firstHost === intent.publicAuthority ? 'host.containers.internal:8080' : intent.publicAuthority;
@@ -414,10 +419,11 @@ export function runContainerAuthorityProbe({ runtime, plan, image, intent, nonce
             '--init',
             '--read-only', '--cap-drop=ALL', '--security-opt=no-new-privileges',
             '--pids-limit', '32', '--memory', '64m', '--cpus', '0.25',
-            '--user', finalUser,
+            '--user', AUTHORITY_HELPER_USER,
+            '--entrypoint', 'node',
             ...(plan?.args || []),
             ...additionalNetworkArgs,
-            imageId, 'node', '-e', PROBE_SCRIPT,
+            helperImageId, '-e', PROBE_SCRIPT,
             intent.physicalOrigin, firstHost, secondHost, nonce,
         ]);
         if (!helperId) fail('PLOINKY_ROUTER_ATTESTATION_HELPER', 'helper creation did not return an immutable ID');
@@ -432,8 +438,9 @@ export function runContainerAuthorityProbe({ runtime, plan, image, intent, nonce
             value === 'ALL' || /^CAP_[A-Z0-9_]+$/.test(value)
         ));
         if (String(inspected.id || '') !== helperId
-            || String(inspected.image || '') !== imageId
-            || String(inspected.user || '') !== finalUser
+            || String(inspected.image || '') !== helperImageId
+            || String(inspected.user || '') !== AUTHORITY_HELPER_USER
+            || JSON.stringify(inspected.entrypoint || []) !== JSON.stringify(['node'])
             || inspected.init !== true
             || inspected.readonlyRootfs !== true
             || Number(inspected.pidsLimit) !== 32
@@ -461,11 +468,10 @@ export function runContainerAuthorityProbe({ runtime, plan, image, intent, nonce
             external,
             helper: Object.freeze({
                 id: helperId,
-                image: imageId,
-                user: finalUser,
-                uid: finalUserMatch[1],
-                gid: finalUserMatch[2],
+                image: helperImageId,
+                user: AUTHORITY_HELPER_USER,
             }),
+            target: Object.freeze({ image: targetImageId, user: targetImageUser }),
         });
     } finally {
         if (helperId) {
@@ -519,6 +525,7 @@ export function attestRouterAuthority({
         records: evidence.records,
         external: evidence.external,
         helper: probe.helper,
+        target: probe.target,
         generationId: generationLease.id,
         observedAtUnixMs: now(),
     });
@@ -533,6 +540,8 @@ export default {
     buildRouterAuthorityTopologyIntent,
     validateRouterAuthorityObservation,
     createPrivateAuthorityRegistryClient,
+    managedImageUserNamespace,
+    ROUTER_AUTHORITY_HELPER_IMAGE,
     runContainerAuthorityProbe,
     attestRouterAuthority,
 };

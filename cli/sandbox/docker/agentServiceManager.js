@@ -139,6 +139,8 @@ import {
 import {
     attestRouterAuthority,
     buildRouterAuthorityTopologyIntent,
+    managedImageUserNamespace,
+    ROUTER_AUTHORITY_HELPER_IMAGE,
     runContainerAuthorityProbe,
 } from '../routerAuthorityAttestation.js';
 import { isInsideBox } from '../../../ploinky-box/lib/boxMarker.mjs';
@@ -791,14 +793,12 @@ function buildPersistentAgentRunArgs({
     return args;
 }
 
-function managedKeepIdUserNamespace(attested) {
-    const { uid, gid, user } = attested?.evidence?.helper || {};
-    if (!/^[1-9][0-9]*$/.test(String(uid || ''))
-        || !/^[1-9][0-9]*$/.test(String(gid || ''))
-        || String(user || '') !== `${uid}:${gid}`) {
-        throw new Error('managed candidate attestation lacks an exact numeric non-root UID:GID');
+function managedUserNamespaceFromAttestation(attested) {
+    const target = attested?.evidence?.target;
+    if (!target || typeof target.user !== 'string') {
+        throw new Error('managed candidate attestation lacks the image user projection');
     }
-    return `keep-id:uid=${uid},gid=${gid}`;
+    return managedImageUserNamespace(target.user);
 }
 
 function expectedBindMountsFromArgs(args, descriptorHostFile = '') {
@@ -1519,10 +1519,10 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
                 return { adopted: false, reason: 'generated-env-contract' };
             }
             if (record?.HostConfig?.Init !== true
-                || String(record?.Image || '') !== String(attested.evidence.helper.image || '')
-                || String(record?.Config?.User || '') !== String(attested.evidence.helper.user || '')
+                || String(record?.Image || '') !== String(attested.evidence.target.image || '')
+                || String(record?.Config?.User || '') !== String(attested.evidence.target.user || '')
                 || String(record?.HostConfig?.Annotations?.['io.podman.annotations.userns'] || '')
-                    !== managedKeepIdUserNamespace(attested)
+                    !== managedUserNamespaceFromAttestation(attested)
                 || String(record?.Config?.WorkingDir || '') !== containerWorkdir
                 || String(record?.Config?.Labels?.['ploinky.envhash'] || record?.Labels?.['ploinky.envhash'] || '') !== expectedEnvHash
                 || !hasExactManagedMountContract(record, expectedMounts)) {
@@ -1583,10 +1583,10 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
             || path.resolve(String(descriptorMounts[0]?.Source || '')) !== path.resolve(launch.descriptorHostFile)
             || descriptorMounts[0]?.RW !== false
             || record?.HostConfig?.Init !== true
-            || String(record?.Image || '') !== String(launch.attested.evidence.helper.image || '')
-            || String(record?.Config?.User || '') !== String(launch.attested.evidence.helper.user || '')
+            || String(record?.Image || '') !== String(launch.attested.evidence.target.image || '')
+            || String(record?.Config?.User || '') !== String(launch.attested.evidence.target.user || '')
             || String(record?.HostConfig?.Annotations?.['io.podman.annotations.userns'] || '')
-                !== managedKeepIdUserNamespace(launch.attested)
+                !== managedUserNamespaceFromAttestation(launch.attested)
             || String(record?.Config?.WorkingDir || '') !== containerWorkdir
             || String(record?.Config?.Labels?.['ploinky.envhash'] || record?.Labels?.['ploinky.envhash'] || '') !== launch.envHash
             || !hasExactManagedMountContract(record, expectedMounts)) {
@@ -1613,8 +1613,9 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
             }
             const imageIndex = createArgs.indexOf(image);
             if (imageIndex < 1) throw new Error('managed candidate image position is unavailable');
+            const userNamespace = managedUserNamespaceFromAttestation(launch.attested);
             createArgs.splice(imageIndex, 0,
-                `--userns=${managedKeepIdUserNamespace(launch.attested)}`,
+                ...(userNamespace ? [`--userns=${userNamespace}`] : []),
                 '-v', `${launch.descriptorHostFile}:${GENERATED_ROUTER_DESCRIPTOR_CONTAINER_FILE}:z,ro`,
                 ...flagsToArgs(Object.entries(launch.env).map(([name, value]) => formatEnvFlag(name, value))),
             );
@@ -1628,11 +1629,11 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     let generatedLaunch = null;
     let adoptedExistingRuntime = false;
     if (runtimeNetworkPlan.requiresManagedNetwork) {
-        // The authority probe intentionally inspects by immutable local image ID
-        // and never lets its confined helper pull. Ensure start-only/no-Node
-        // images are present before entering the managed-network transaction;
-        // dependency-cache preparation already does this for Node images.
+        // Resolve both the target and fixed probe images before the network
+        // transaction. The helper never pulls and never executes target-image
+        // entrypoints, including start-only images without Node.js.
         ensureImagePresent(image, { runtime });
+        ensureImagePresent(ROUTER_AUTHORITY_HELPER_IMAGE, { runtime });
         const launched = networkLifecycle.runManagedContainerTransaction({
             network: manifestNetwork,
             canonicalAgentId: agentName,
