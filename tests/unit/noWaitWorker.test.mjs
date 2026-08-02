@@ -152,6 +152,151 @@ test('no-wait predecessor reports failure published during the bounded grace win
     assert.deepEqual(status, { state: 'failed' });
 });
 
+test('no-wait predecessor budget follows the one active worker across a cumulative sequence', async (t) => {
+    const { runningDir } = fixture(t);
+    const statusDir = path.join(runningDir, 'no-wait');
+    const target = path.join(statusDir, 'target.json');
+    writeStatus('first', {
+        state: 'starting',
+        sequencePhase: 'active',
+        sequencePhaseStartedAtMs: 0,
+    }, { runningDir });
+    writeStatus('second', {
+        state: 'starting',
+        sequencePhase: 'waiting-predecessor',
+        waitForStatusFile: 'first.json',
+    }, { runningDir });
+    writeStatus('target', {
+        state: 'starting',
+        sequencePhase: 'waiting-predecessor',
+        waitForStatusFile: 'second.json',
+    }, { runningDir });
+    let now = 0;
+
+    const status = await waitForPriorWorker(target, {
+        runningDir,
+        timeoutMs: 1_000,
+        terminalPublicationGraceMs: 500,
+        pollIntervalMs: 100,
+        nowFn: () => now,
+        async sleepFn(intervalMs) {
+            now += intervalMs;
+            if (now === 900) {
+                writeStatus('first', { state: 'running', finishedAtMs: now }, { runningDir });
+            }
+            if (now === 1_000) {
+                writeStatus('second', {
+                    state: 'starting',
+                    sequencePhase: 'active',
+                    sequencePhaseStartedAtMs: now,
+                }, { runningDir });
+            }
+            if (now === 1_800) {
+                writeStatus('second', { state: 'running', finishedAtMs: now }, { runningDir });
+            }
+            if (now === 1_900) {
+                writeStatus('target', {
+                    state: 'starting',
+                    sequencePhase: 'active',
+                    sequencePhaseStartedAtMs: now,
+                }, { runningDir });
+            }
+            if (now === 2_700) {
+                writeStatus('target', { state: 'running', finishedAtMs: now }, { runningDir });
+            }
+        },
+    });
+
+    assert.equal(now, 2_700, 'the common spawn-time legacy deadline must not truncate valid progress');
+    assert.deepEqual(status, { state: 'running' });
+});
+
+test('no-wait predecessor active phase remains independently bounded and fail-closed', async (t) => {
+    const { runningDir } = fixture(t);
+    const target = path.join(runningDir, 'no-wait', 'stuck-active.json');
+    writeStatus('stuck-active', {
+        state: 'starting',
+        sequencePhase: 'active',
+        sequencePhaseStartedAtMs: 0,
+    }, { runningDir });
+    let now = 0;
+
+    await assert.rejects(
+        () => waitForPriorWorker(target, {
+            runningDir,
+            timeoutMs: 1_000,
+            terminalPublicationGraceMs: 500,
+            pollIntervalMs: 100,
+            nowFn: () => now,
+            async sleepFn(intervalMs) { now += intervalMs; },
+        }),
+        /timed out waiting for no-wait predecessor status/,
+    );
+    assert.equal(now, 1_500);
+});
+
+test('no-wait predecessor chain rejects cycles instead of extending a wait', async (t) => {
+    const { runningDir } = fixture(t);
+    const target = path.join(runningDir, 'no-wait', 'cycle-a.json');
+    writeStatus('cycle-a', {
+        state: 'starting',
+        sequencePhase: 'waiting-predecessor',
+        waitForStatusFile: 'cycle-b.json',
+    }, { runningDir });
+    writeStatus('cycle-b', {
+        state: 'starting',
+        sequencePhase: 'waiting-predecessor',
+        waitForStatusFile: 'cycle-a.json',
+    }, { runningDir });
+
+    await assert.rejects(
+        () => waitForPriorWorker(target, { runningDir }),
+        /status chain contains a cycle/,
+    );
+});
+
+test('no-wait predecessor chain rejects traversal references', async (t) => {
+    const { runningDir } = fixture(t);
+    const target = path.join(runningDir, 'no-wait', 'traversal.json');
+    writeStatus('traversal', {
+        state: 'starting',
+        sequencePhase: 'waiting-predecessor',
+        waitForStatusFile: '../foreign.json',
+    }, { runningDir });
+
+    await assert.rejects(
+        () => waitForPriorWorker(target, { runningDir }),
+        /waiting phase has an invalid status reference/,
+    );
+});
+
+test('no-wait predecessor chain rejects a stale terminal handoff', async (t) => {
+    const { runningDir } = fixture(t);
+    const target = path.join(runningDir, 'no-wait', 'waiting.json');
+    writeStatus('finished', {
+        state: 'running',
+        finishedAtMs: 0,
+    }, { runningDir });
+    writeStatus('waiting', {
+        state: 'starting',
+        sequencePhase: 'waiting-predecessor',
+        waitForStatusFile: 'finished.json',
+    }, { runningDir });
+    let now = 600;
+
+    await assert.rejects(
+        () => waitForPriorWorker(target, {
+            runningDir,
+            timeoutMs: 1_000,
+            terminalPublicationGraceMs: 500,
+            nowFn: () => now,
+            async sleepFn(intervalMs) { now += intervalMs; },
+        }),
+        /timed out waiting for no-wait predecessor status/,
+    );
+    assert.equal(now, 600);
+});
+
 test('no-wait predecessor rejects a path outside the status directory', async (t) => {
     const { root, runningDir } = fixture(t);
     await assert.rejects(

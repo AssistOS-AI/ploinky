@@ -77,6 +77,83 @@ function sleep(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function parseSequenceTimestamp(status, numericField, isoField) {
+    const numeric = Number(status?.[numericField]);
+    if (Number.isFinite(numeric) && numeric >= 0) return numeric;
+    const parsed = Date.parse(String(status?.[isoField] || ''));
+    return Number.isFinite(parsed) ? parsed : NaN;
+}
+
+function resolveSequenceObservation(statusPath, status, {
+    statusRoot,
+    timeoutMs,
+    terminalPublicationGraceMs,
+    legacyDeadline,
+    nowMs,
+    maxDepth = 128,
+} = {}) {
+    let currentPath = statusPath;
+    let current = status;
+    const visited = new Set();
+
+    for (let depth = 0; depth < maxDepth; depth += 1) {
+        if (visited.has(currentPath)) {
+            throw new Error('no-wait predecessor status chain contains a cycle');
+        }
+        visited.add(currentPath);
+
+        if (current?.state === 'running' || current?.state === 'failed') {
+            if (currentPath === statusPath) return { terminal: current.state };
+            const finishedAtMs = parseSequenceTimestamp(current, 'finishedAtMs', 'finishedAt');
+            if (!Number.isFinite(finishedAtMs) || finishedAtMs > nowMs + terminalPublicationGraceMs) {
+                throw new Error('no-wait predecessor terminal status has an invalid completion timestamp');
+            }
+            return { deadline: finishedAtMs + terminalPublicationGraceMs };
+        }
+        if (current?.state && current.state !== 'starting') {
+            throw new Error(`no-wait predecessor has invalid state '${current.state}'`);
+        }
+        if (!current?.state) {
+            throw new Error('no-wait predecessor status is missing its state');
+        }
+
+        // Legacy workers did not publish a sequence phase. Keep their original
+        // single bounded window so mixed-version state fails closed.
+        if (!current.sequencePhase) return { deadline: legacyDeadline };
+
+        if (current.sequencePhase === 'active') {
+            const phaseStartedAtMs = parseSequenceTimestamp(
+                current,
+                'sequencePhaseStartedAtMs',
+                'sequencePhaseStartedAt',
+            );
+            if (!Number.isFinite(phaseStartedAtMs)
+                || phaseStartedAtMs > nowMs + terminalPublicationGraceMs) {
+                throw new Error('no-wait predecessor active phase has an invalid start timestamp');
+            }
+            return { deadline: phaseStartedAtMs + timeoutMs + terminalPublicationGraceMs };
+        }
+
+        if (current.sequencePhase !== 'waiting-predecessor') {
+            throw new Error(`no-wait predecessor has invalid sequence phase '${current.sequencePhase}'`);
+        }
+        const predecessorFile = String(current.waitForStatusFile || '');
+        if (!predecessorFile
+            || path.basename(predecessorFile) !== predecessorFile
+            || path.extname(predecessorFile) !== '.json') {
+            throw new Error('no-wait predecessor waiting phase has an invalid status reference');
+        }
+        currentPath = path.join(statusRoot, predecessorFile);
+        try {
+            current = JSON.parse(fs.readFileSync(currentPath, 'utf8'));
+        } catch (error) {
+            if (error?.code === 'ENOENT') return { deadline: legacyDeadline };
+            throw new Error(`no-wait predecessor status chain is invalid: ${error?.message || error}`);
+        }
+    }
+    throw new Error('no-wait predecessor status chain exceeds the maximum depth');
+}
+
 export async function waitForPriorWorker(rawStatusPath, {
     runningDir = RUNNING_DIR,
     timeoutMs = Number.parseInt(
@@ -103,22 +180,30 @@ export async function waitForPriorWorker(rawStatusPath, {
     const boundedTerminalPublicationGraceMs = Number.isFinite(terminalPublicationGraceMs)
         ? Math.min(Math.max(0, terminalPublicationGraceMs), 300000)
         : 60000;
-    const deadline = nowFn() + boundedTimeoutMs + boundedTerminalPublicationGraceMs;
-    while (nowFn() < deadline) {
+    const legacyDeadline = nowFn() + boundedTimeoutMs + boundedTerminalPublicationGraceMs;
+    const statusRoot = path.resolve(runningDir, 'no-wait');
+    while (true) {
+        const nowMs = nowFn();
+        let observation = { deadline: legacyDeadline };
         try {
             const status = JSON.parse(fs.readFileSync(statusPath, 'utf8'));
-            if (status?.state === 'running' || status?.state === 'failed') {
-                return Object.freeze({ state: status.state });
-            }
-            if (status?.state && status.state !== 'starting') {
-                throw new Error(`no-wait predecessor has invalid state '${status.state}'`);
-            }
+            observation = resolveSequenceObservation(statusPath, status, {
+                statusRoot,
+                timeoutMs: boundedTimeoutMs,
+                terminalPublicationGraceMs: boundedTerminalPublicationGraceMs,
+                legacyDeadline,
+                nowMs,
+            });
         } catch (error) {
             if (error?.code !== 'ENOENT') {
                 throw new Error(`no-wait predecessor status is invalid: ${error?.message || error}`);
             }
         }
-        await sleepFn(pollIntervalMs);
+        if (observation.terminal) {
+            return Object.freeze({ state: observation.terminal });
+        }
+        if (nowMs >= observation.deadline) break;
+        await sleepFn(Math.min(pollIntervalMs, observation.deadline - nowMs));
     }
     throw new Error(`timed out waiting for no-wait predecessor status '${statusPath}'`);
 }
@@ -644,8 +729,9 @@ async function main() {
         process.exit(2);
     }
 
-    const startedAt = new Date().toISOString();
-    const baseStatus = {
+    const startedAtMs = Date.now();
+    const startedAt = new Date(startedAtMs).toISOString();
+    let baseStatus = {
         containerName,
         shortAgent,
         repoName,
@@ -654,7 +740,12 @@ async function main() {
         manifestPath,
         agentPath,
         pid: process.pid,
-        startedAt
+        startedAt,
+        startedAtMs,
+        sequencePhase: waitForStatus ? 'waiting-predecessor' : 'active',
+        sequencePhaseStartedAt: startedAt,
+        sequencePhaseStartedAtMs: startedAtMs,
+        ...(waitForStatus ? { waitForStatusFile: path.basename(waitForStatus) } : {}),
     };
     writeStatus(containerName, { ...baseStatus, state: 'starting' });
 
@@ -663,6 +754,17 @@ async function main() {
     let taskOwnedCandidate = null;
     try {
         await waitForPriorWorker(waitForStatus);
+        if (waitForStatus) {
+            const sequencePhaseStartedAtMs = Date.now();
+            baseStatus = {
+                ...baseStatus,
+                sequencePhase: 'active',
+                sequencePhaseStartedAt: new Date(sequencePhaseStartedAtMs).toISOString(),
+                sequencePhaseStartedAtMs,
+            };
+            delete baseStatus.waitForStatusFile;
+            writeStatus(containerName, { ...baseStatus, state: 'starting' });
+        }
         const expectedIdentity = Object.freeze({
             containerName,
             repoName,
@@ -715,11 +817,13 @@ async function main() {
             });
             const currentLifecycle = loadNoWaitWorkerLifecycle(expectedIdentity);
             assertNoWaitAdoptionStillCurrent(lifecycle, currentLifecycle, expectedIdentity);
-            const finishedAt = new Date().toISOString();
+            const finishedAtMs = Date.now();
+            const finishedAt = new Date(finishedAtMs).toISOString();
             writeStatus(containerName, {
                 ...baseStatus,
                 state: 'running',
                 finishedAt,
+                finishedAtMs,
                 container: containerName,
                 hostPort,
                 adopted: true,
@@ -792,11 +896,13 @@ async function main() {
         });
         taskOwnedCandidate = null;
 
-        const finishedAt = new Date().toISOString();
+        const finishedAtMs = Date.now();
+        const finishedAt = new Date(finishedAtMs).toISOString();
         writeStatus(containerName, {
             ...baseStatus,
             state: 'running',
             finishedAt,
+            finishedAtMs,
             container: resolvedContainerName,
             hostPort: routedHostPort
         });
@@ -815,7 +921,8 @@ async function main() {
         } catch (_) {
             failure.message = `${failure.message}; exact task-owned runtime cleanup failed`;
         }
-        const finishedAt = new Date().toISOString();
+        const finishedAtMs = Date.now();
+        const finishedAt = new Date(finishedAtMs).toISOString();
         const error = {
             message: failure.message,
             stack: failure.stack || null
@@ -824,6 +931,7 @@ async function main() {
             ...baseStatus,
             state: 'failed',
             finishedAt,
+            finishedAtMs,
             error
         });
         console.error(`[no-wait] ${shortAgent}: launch failed: ${error.message}`);
