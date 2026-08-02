@@ -39,6 +39,25 @@ function sleepFor(delayMs) {
     return new Promise((resolve) => setTimeout(resolve, delayMs));
 }
 
+function sleepForWithSignal(delayMs, signal) {
+    return new Promise((resolve, reject) => {
+        if (signal?.aborted) {
+            reject(signal.reason || new Error('external Cloudflare hostname proof aborted'));
+            return;
+        }
+        let timer;
+        const onAbort = () => {
+            clearTimeout(timer);
+            reject(signal.reason || new Error('external Cloudflare hostname proof aborted'));
+        };
+        timer = setTimeout(() => {
+            signal?.removeEventListener?.('abort', onAbort);
+            resolve();
+        }, delayMs);
+        signal?.addEventListener?.('abort', onAbort, { once: true });
+    });
+}
+
 export function createEdgePublicationRouteCoordinator({
     workspaceRoot = PLOINKY_WORKSPACE_ROOT,
     onCommit = () => {},
@@ -170,31 +189,62 @@ function combineAbortSignal(externalSignal, timeoutMs) {
 
 export function createExternalHostnameProbe({
     fetchImpl = globalThis.fetch,
-    timeoutMs = 15_000,
+    timeoutMs = 30_000,
+    pollIntervalMs = 500,
+    now = Date.now,
+    sleep = sleepForWithSignal,
 } = {}) {
     if (typeof fetchImpl !== 'function') throw new TypeError('external hostname proof requires fetch');
-    return async function probeHostname({ hostname, configurationGeneration, signal } = {}) {
+    if (typeof now !== 'function') throw new TypeError('external hostname proof requires now()');
+    if (typeof sleep !== 'function') throw new TypeError('external hostname proof requires sleep()');
+    const maximumWaitMs = Math.max(1, Math.trunc(Number(timeoutMs) || 1));
+    const retryDelayMs = Math.max(1, Math.min(
+        maximumWaitMs,
+        Math.trunc(Number(pollIntervalMs) || 1),
+    ));
+    return async function probeHostname({
+        hostname,
+        configurationGeneration,
+        connector,
+        signal,
+    } = {}) {
         const generation = String(configurationGeneration || '');
-        const timed = combineAbortSignal(signal, timeoutMs);
+        const timed = combineAbortSignal(signal, maximumWaitMs);
+        const deadline = now() + maximumWaitMs;
+        let lastStatus = 0;
         try {
-            const response = await fetchImpl(
-                `https://${hostname}/.well-known/ploinky-edge-proof/${generation.replace(/^sha256:/, '')}`,
-                {
-                    method: 'GET',
-                    headers: { Accept: 'application/json' },
-                    redirect: 'manual',
-                    signal: timed.signal,
-                },
-            );
-            const body = (await response.text()).slice(0, 4096);
-            let parsed = null;
-            try { parsed = JSON.parse(body); } catch (_) {}
-            return {
-                ok: response.status === 503
-                    && response.headers.get('x-ploinky-edge-generation') === generation
-                    && parsed?.error === 'HOST_SELECTOR_INACTIVE',
-                status: response.status,
-            };
+            for (;;) {
+                if (connector && !connector.isRunning()) return { ok: false, status: lastStatus };
+                try {
+                    const response = await fetchImpl(
+                        `https://${hostname}/.well-known/ploinky-edge-proof/${generation.replace(/^sha256:/, '')}`,
+                        {
+                            method: 'GET',
+                            headers: { Accept: 'application/json' },
+                            redirect: 'manual',
+                            signal: timed.signal,
+                        },
+                    );
+                    lastStatus = response.status;
+                    const body = (await response.text()).slice(0, 4096);
+                    let parsed = null;
+                    try { parsed = JSON.parse(body); } catch (_) {}
+                    if (connector && !connector.isRunning()) {
+                        return { ok: false, status: lastStatus };
+                    }
+                    if (response.status === 503
+                        && response.headers.get('x-ploinky-edge-generation') === generation
+                        && parsed?.error === 'HOST_SELECTOR_INACTIVE') {
+                        return { ok: true, status: response.status };
+                    }
+                } catch (error) {
+                    if (timed.signal.aborted) throw timed.signal.reason || error;
+                    lastStatus = 0;
+                }
+                const remainingMs = deadline - now();
+                if (remainingMs <= 0) return { ok: false, status: lastStatus };
+                await sleep(Math.min(retryDelayMs, remainingMs), timed.signal);
+            }
         } finally {
             timed.release();
         }

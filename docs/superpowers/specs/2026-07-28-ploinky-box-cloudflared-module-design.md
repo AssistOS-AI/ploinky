@@ -133,7 +133,7 @@ Reuses the existing reconcile skeleton; the delta is only which steps run:
 | Route commit (`reconciling`, canonical scheme `https`) | Unchanged. |
 | Connector start (`--token-file`, `0600`, redaction, minimal env) | Unchanged — same `connector.mjs`. |
 | Connection proof (`listTunnelConnections` polling) | Replaced: requires the API token, so unavailable. Readiness = connector output signal (registered-connection log line under cloudflared 2026.7.1 — exact format to be pinned during implementation) with a bounded process-alive grace fallback. |
-| External hostname proof (`/.well-known/ploinky-edge-proof/<generation>`) | Kept, mandatory. This proves the operator's dashboard ingress actually reaches *this* router for *this* generation before the final commit — remote mode stays verified, not fire-and-forget. |
+| External hostname proof (`/.well-known/ploinky-edge-proof/<generation>`) | Kept, mandatory. This proves the operator's dashboard ingress actually reaches *this* router for *this* generation before the final commit — remote mode stays verified, not fire-and-forget. One authenticated connector remains alive through a bounded proof window so edge propagation can converge; every stale generation, wrong status/body/application, timeout, or connector exit remains fail-closed. |
 | Final commit `ready` + journal + status file | Unchanged. |
 | Exit handling / bounded restart (5 per 60s, 1s→30s backoff) | Unchanged. |
 

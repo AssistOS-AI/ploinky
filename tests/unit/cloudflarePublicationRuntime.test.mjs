@@ -437,7 +437,12 @@ test('external hostname proof requires exact inactive generation response throug
     assert.match(seen[0].url, /^https:\/\/app\.example\.test\//);
     assert.equal(seen[0].options.redirect, 'manual');
 
+    let wrongClock = 0;
     const wrong = createExternalHostnameProbe({
+        timeoutMs: 1,
+        pollIntervalMs: 1,
+        now: () => wrongClock,
+        sleep: async (delayMs) => { wrongClock += delayMs; },
         fetchImpl: async () => new Response(JSON.stringify({ error: 'HOST_SELECTOR_INACTIVE' }), {
             status: 503,
             headers: { 'X-Ploinky-Edge-Generation': `sha256:${'b'.repeat(64)}` },
@@ -447,6 +452,81 @@ test('external hostname proof requires exact inactive generation response throug
         hostname: 'app.example.test',
         configurationGeneration: GENERATION,
     })).ok, false);
+});
+
+test('external hostname proof retains one connector while stale edge responses converge', async () => {
+    let clock = 0;
+    let requests = 0;
+    const connector = { isRunning: () => true };
+    const probe = createExternalHostnameProbe({
+        timeoutMs: 5_000,
+        pollIntervalMs: 500,
+        now: () => clock,
+        sleep: async (delayMs) => { clock += delayMs; },
+        fetchImpl: async () => {
+            requests += 1;
+            const generation = requests < 3 ? `sha256:${'b'.repeat(64)}` : GENERATION;
+            return new Response(JSON.stringify({ error: 'HOST_SELECTOR_INACTIVE' }), {
+                status: 503,
+                headers: { 'X-Ploinky-Edge-Generation': generation },
+            });
+        },
+    });
+    assert.deepEqual(await probe({
+        hostname: 'app.example.test',
+        configurationGeneration: GENERATION,
+        connector,
+    }), { ok: true, status: 503 });
+    assert.equal(requests, 3);
+    assert.equal(clock, 1_000);
+});
+
+test('external hostname proof never admits a wrong application during bounded retries', async () => {
+    let clock = 0;
+    let requests = 0;
+    const probe = createExternalHostnameProbe({
+        timeoutMs: 1_000,
+        pollIntervalMs: 500,
+        now: () => clock,
+        sleep: async (delayMs) => { clock += delayMs; },
+        fetchImpl: async () => {
+            requests += 1;
+            return new Response('<html>wrong application</html>', {
+                status: 200,
+                headers: { 'X-Ploinky-Edge-Generation': GENERATION },
+            });
+        },
+    });
+    assert.deepEqual(await probe({
+        hostname: 'app.example.test',
+        configurationGeneration: GENERATION,
+    }), { ok: false, status: 200 });
+    assert.equal(requests, 3);
+    assert.equal(clock, 1_000);
+});
+
+test('external hostname proof fails when its connector exits before exact proof', async () => {
+    let requests = 0;
+    let running = true;
+    const probe = createExternalHostnameProbe({
+        timeoutMs: 5_000,
+        pollIntervalMs: 500,
+        sleep: async () => {},
+        fetchImpl: async () => {
+            requests += 1;
+            running = false;
+            return new Response(JSON.stringify({ error: 'HOST_SELECTOR_INACTIVE' }), {
+                status: 503,
+                headers: { 'X-Ploinky-Edge-Generation': GENERATION },
+            });
+        },
+    });
+    assert.deepEqual(await probe({
+        hostname: 'app.example.test',
+        configurationGeneration: GENERATION,
+        connector: { isRunning: () => running },
+    }), { ok: false, status: 503 });
+    assert.equal(requests, 1);
 });
 
 test('runtime startup replaces stale persisted readiness before scanning a generation', async (t) => {

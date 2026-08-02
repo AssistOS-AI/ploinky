@@ -939,9 +939,17 @@ export class CloudflarePublicationController {
                         selector: cloneJson(host.selector),
                         canonicalScheme: 'https',
                         configurationGeneration: plan.configurationGeneration,
+                        connector: this.connector,
                         signal,
                     });
                     if (!proof || proof.ok !== true) {
+                        if (!this.connector.isRunning()) {
+                            throw new CloudflarePublicationError('cloudflared exited during hostname verification', {
+                                code: 'CLOUDFLARED_NOT_RUNNING',
+                                operation: 'probe-hostname',
+                                retryable: true,
+                            });
+                        }
                         throw new CloudflarePublicationError(`External route probe failed for ${host.hostname}`, {
                             code: 'CLOUDFLARE_HOST_PROBE_FAILED',
                             operation: 'probe-hostname',
@@ -1142,9 +1150,17 @@ export class CloudflarePublicationController {
                     selector: cloneJson(host.selector),
                     canonicalScheme: 'https',
                     configurationGeneration: plan.configurationGeneration,
+                    connector: this.connector,
                     signal,
                 });
                 if (!proof || proof.ok !== true) {
+                    if (!this.connector.isRunning()) {
+                        throw new CloudflarePublicationError('cloudflared exited during hostname verification', {
+                            code: 'CLOUDFLARED_NOT_RUNNING',
+                            operation: 'probe-hostname',
+                            retryable: true,
+                        });
+                    }
                     throw new CloudflarePublicationError(`External route probe failed for ${host.hostname}`, {
                         code: 'CLOUDFLARE_HOST_PROBE_FAILED',
                         operation: 'probe-hostname',
