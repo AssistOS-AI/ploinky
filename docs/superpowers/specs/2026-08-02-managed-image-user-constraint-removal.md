@@ -30,6 +30,7 @@ root filesystem, no added capabilities, all capabilities dropped, and
 | F5 | Exact non-root `UID:GID` images benefit from Podman `keep-id`; other identities cannot be mapped exactly from `Config.User` alone. | Emit exact `keep-id` only when safely derivable; otherwise preserve the image default and omit the override. |
 | F6 | PREPARE enables a managed agent before the Router private Unix socket exists, so `npm test` cannot complete lifecycle stages. | Reproduced the same socket failure on the untouched base, proving it is pre-existing. |
 | F7 | A target image may declare OCI `VOLUME` paths. Nested Podman then creates anonymous mounts that are outside the exact reviewed manifest contract and correctly fail final managed-mount inspection. | Managed nested Podman launches use `--image-volume=ignore`; explicit Ploinky and manifest binds remain the only mounted paths, and the exact inspection remains fail closed. |
+| F8 | A global agent may repeat Ploinky's exact workspace bind in its manifest. Podman represents the duplicate target once, while the expected mount set correctly treats duplicate authorization targets as invalid. | Collapse only an exact duplicate bind before creation; reject every same-target source or option conflict before invoking the runtime. |
 
 Podman's current `keep-id` behavior is documented in the
 [official `podman run` reference](https://docs.podman.io/en/latest/markdown/podman-run.1.html#userns-mode).

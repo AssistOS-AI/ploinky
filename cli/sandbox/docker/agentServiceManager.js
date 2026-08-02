@@ -804,21 +804,35 @@ function managedUserNamespaceFromAttestation(attested) {
     return managedImageUserNamespace(target.user);
 }
 
+function managedBindMountFromValue(value) {
+    const text = String(value || '');
+    const parts = text.split(':');
+    if (parts.length < 2) throw new Error(`managed runtime volume '${text}' is invalid`);
+    const source = path.resolve(parts.shift());
+    const destination = String(parts.shift() || '');
+    const options = parts.join(':').split(',').filter(Boolean);
+    return Object.freeze({ source, destination, rw: !options.includes('ro') });
+}
+
+function appendExactManagedBindMount(args, value) {
+    const incoming = managedBindMountFromValue(value);
+    for (let index = 0; index < args.length - 1; index += 1) {
+        if (args[index] !== '-v' && args[index] !== '--volume') continue;
+        const existingValue = String(args[index + 1] || '');
+        const existing = managedBindMountFromValue(existingValue);
+        if (existing.destination !== incoming.destination) continue;
+        if (existingValue === String(value)) return false;
+        throw new Error(`managed runtime volume target '${incoming.destination}' has conflicting bind grants`);
+    }
+    args.push('-v', String(value));
+    return true;
+}
+
 function expectedBindMountsFromArgs(args, descriptorHostFile = '') {
     const specs = [];
     for (let index = 0; index < args.length - 1; index += 1) {
         if (args[index] !== '-v' && args[index] !== '--volume') continue;
-        const value = String(args[index + 1] || '');
-        const parts = value.split(':');
-        if (parts.length < 2) throw new Error(`managed runtime volume '${value}' is invalid`);
-        const source = path.resolve(parts.shift());
-        const destination = String(parts.shift() || '');
-        const options = parts.join(':').split(',').filter(Boolean);
-        specs.push(Object.freeze({
-            source,
-            destination,
-            rw: !options.includes('ro'),
-        }));
+        specs.push(managedBindMountFromValue(args[index + 1]));
     }
     if (descriptorHostFile) {
         specs.push(Object.freeze({
@@ -1189,7 +1203,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
 
     for (const { resolvedHostPath, containerPath, options } of manifestVolumeMounts) {
         const mountSuffix = manifestVolumeMountSuffix(runtime, resolvedHostPath, options);
-        args.push('-v', `${resolvedHostPath}:${containerPath}${mountSuffix}`);
+        appendExactManagedBindMount(args, `${resolvedHostPath}:${containerPath}${mountSuffix}`);
     }
     if (runtime === 'podman') {
         const boxHostArgs = buildBoxPodmanHostArgs({
@@ -2972,6 +2986,7 @@ export function isGenerationCapabilityRuntimeEffective({
 
 export {
     assertPodmanCodeMountAllowed,
+    appendExactManagedBindMount,
     appendUniquePortMapping,
     buildPersistentAgentRunArgs,
     buildBoxPodmanHostArgs,

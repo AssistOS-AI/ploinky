@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 
 import {
+    appendExactManagedBindMount,
     assertPreparedRegistryRecordPreservation,
     buildBoxPodmanHostArgs,
     buildRuntimeNetworkPlan,
@@ -321,6 +322,24 @@ test('managed semantic adoption requires exact mounts and singleton generated en
     const duplicateCredential = structuredClone(record);
     duplicateCredential.Config.Env.push('PLOINKY_AGENT_API_KEY=attacker-key');
     assert.equal(hasExactManagedEnv(duplicateCredential, { PLOINKY_AGENT_API_KEY: 'exact-key' }), false);
+});
+
+test('managed manifest binds collapse only an exact duplicate and reject target conflicts', () => {
+    const args = ['run', '-v', '/workspace:/workspace:z'];
+    assert.equal(appendExactManagedBindMount(args, '/workspace:/workspace:z'), false);
+    assert.deepEqual(args, ['run', '-v', '/workspace:/workspace:z']);
+
+    assert.throws(
+        () => appendExactManagedBindMount(args, '/other:/workspace:z'),
+        /target '\/workspace' has conflicting bind grants/,
+    );
+    assert.throws(
+        () => appendExactManagedBindMount(args, '/workspace:/workspace:z,ro'),
+        /target '\/workspace' has conflicting bind grants/,
+    );
+
+    assert.equal(appendExactManagedBindMount(args, '/data:/data:z'), true);
+    assert.deepEqual(args.slice(-2), ['-v', '/data:/data:z']);
 });
 
 test('container router env builder preserves endpoint parity for every network mode', () => {
