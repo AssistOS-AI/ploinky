@@ -638,9 +638,10 @@ export class CloudflarePublicationController {
         }
         const captured = cloneJson(input);
         let requestKey = null;
+        let requestPlan = null;
         try {
-            const plan = normalizeCloudflarePublicationDesired(captured);
-            requestKey = `${plan.configurationGeneration}:${plan.desiredDigest}`;
+            requestPlan = normalizeCloudflarePublicationDesired(captured);
+            requestKey = `${requestPlan.configurationGeneration}:${requestPlan.desiredDigest}`;
         } catch (_) {}
         if (requestKey && this.activeRequest?.key === requestKey) {
             this.safeAudit('cloudflare-reconcile-coalesced', {
@@ -657,11 +658,54 @@ export class CloudflarePublicationController {
             && this.state.state === 'ready'
             && this.state.connectorState === 'running'
             && this.connector.isRunning()) {
-            this.safeAudit('cloudflare-reconcile-adopted-ready', {
-                configurationGeneration: String(captured.configurationGeneration || ''),
-                reason,
+            const run = this.queue.then(async () => {
+                if (this.readyRequestKey !== requestKey
+                    || this.state.state !== 'ready'
+                    || this.state.connectorState !== 'running'
+                    || !this.connector.isRunning()) {
+                    throw new CloudflarePublicationError(
+                        'Exact ready Cloudflare publication changed before route adoption',
+                        {
+                            code: 'CLOUDFLARE_RECONCILIATION_SUPERSEDED',
+                            operation: 'adopt-ready-route',
+                            retryable: true,
+                        },
+                    );
+                }
+                await this.routeCoordinator.commit({
+                    mode: 'cloudflare',
+                    publicationState: 'ready',
+                    configurationGeneration: requestPlan.configurationGeneration,
+                    hosts: asHostObject(requestPlan),
+                    canonicalScheme: 'https',
+                });
+                if (this.readyRequestKey !== requestKey
+                    || this.state.state !== 'ready'
+                    || this.state.connectorState !== 'running'
+                    || !this.connector.isRunning()) {
+                    await this.inactivate(captured, 'cloudflared-exit-during-route-adoption');
+                    throw new CloudflarePublicationError(
+                        'Cloudflare connector changed during exact ready route adoption',
+                        {
+                            code: 'CLOUDFLARED_NOT_RUNNING',
+                            operation: 'adopt-ready-route',
+                            retryable: true,
+                        },
+                    );
+                }
+                this.safeAudit('cloudflare-reconcile-adopted-ready', {
+                    configurationGeneration: String(captured.configurationGeneration || ''),
+                    reason,
+                });
+                return this.getStatus();
             });
-            return Promise.resolve(this.getStatus());
+            this.queue = run.catch(() => {});
+            this.activeRequest = { key: requestKey, promise: run };
+            const clearActiveRequest = () => {
+                if (this.activeRequest?.promise === run) this.activeRequest = null;
+            };
+            run.then(clearActiveRequest, clearActiveRequest);
+            return run;
         }
         const revision = ++this.requestRevision;
         this.currentAbort?.abort(new CloudflarePublicationError('Cloudflare publication was superseded', {

@@ -367,7 +367,12 @@ For a Cloudflare generation, simultaneous reconciliation requests with the
 same immutable configuration and desired digests share one in-flight operation.
 After that exact selected generation is ready and its connector is still
 running, a later selected-generation scan or retry adopts the ready state
-without stopping or replacing the connector. Changed generations, explicit
+without stopping or replacing the connector. Adoption still commits the exact
+selected route back to `ready`, because an agent lifecycle may have staged the
+same generation as `reconciling` under a new activation id. That route commit
+is coalesced, remains fail-closed on contention, and revalidates the connector
+before and after mutation; a connector change in that interval inactivates the
+route instead of leaving a stale public selector. Changed generations, explicit
 coordinated applies, error recovery, and unexpected connector exits still run
 the complete fail-closed reconciliation and readiness sequence.
 

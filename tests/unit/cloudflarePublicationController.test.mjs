@@ -309,6 +309,8 @@ function createHarness({
         active: false,
         hosts: {},
         commits: [],
+        failCommitOnce: null,
+        onCommitOnce: null,
         async inactivate(input) {
             events.push({ event: 'routes.inactivate', input: structuredClone(input) });
             routes.active = false;
@@ -316,6 +318,16 @@ function createHarness({
         },
         async commit(input) {
             events.push({ event: 'routes.commit', input: structuredClone(input) });
+            if (routes.failCommitOnce) {
+                const error = routes.failCommitOnce;
+                routes.failCommitOnce = null;
+                throw error;
+            }
+            if (routes.onCommitOnce) {
+                const callback = routes.onCommitOnce;
+                routes.onCommitOnce = null;
+                callback();
+            }
             routes.active = true;
             routes.hosts = structuredClone(input.hosts);
             routes.commits.push(structuredClone(input));
@@ -1071,29 +1083,102 @@ test('concurrent identical selected-generation reconciliation coalesces without 
     );
 });
 
-test('an exact ready selected generation preserves its healthy connector while explicit reconcile remains available', async () => {
+test('an exact ready selected generation restores its route without replacing its healthy connector', async () => {
     const harness = createHarness();
     const input = desired();
     await harness.controller.reconcile(input, { reason: 'selected-edge-generation' });
     const eventCount = harness.events.length;
     const commitCount = harness.routes.commits.length;
+    harness.routes.active = false;
+    harness.routes.hosts = {};
 
-    const adopted = await harness.controller.reconcile({
+    const adoptedRequest = harness.controller.reconcile({
         ...input,
-        selectedPublicationState: 'ready',
+        selectedPublicationState: 'reconciling',
     }, { reason: 'selected-edge-generation-retry' });
+    const coalescedRequest = harness.controller.reconcile({
+        ...input,
+        selectedPublicationState: 'reconciling',
+    }, { reason: 'selected-edge-generation-retry' });
+    assert.equal(coalescedRequest, adoptedRequest);
+    const adopted = await adoptedRequest;
 
     assert.equal(adopted.state, 'ready');
     assert.equal(harness.connector.starts, 1);
-    assert.equal(harness.events.length, eventCount);
-    assert.equal(harness.routes.commits.length, commitCount);
+    assert.equal(harness.events.length, eventCount + 1);
+    assert.equal(harness.routes.commits.length, commitCount + 1);
+    assert.equal(harness.routes.commits.at(-1).publicationState, 'ready');
+    assert.equal(harness.routes.active, true);
+    assert.deepEqual(Object.keys(harness.routes.hosts), ['office.example.test']);
     assert.equal(
         harness.audits.filter((entry) => entry.event === 'cloudflare-reconcile-adopted-ready').length,
+        1,
+    );
+    assert.equal(
+        harness.audits.filter((entry) => entry.event === 'cloudflare-reconcile-coalesced').length,
         1,
     );
 
     await harness.controller.reconcile(input, { reason: 'coordinated-apply' });
     assert.equal(harness.connector.starts, 2, 'an explicit coordinated apply must still execute');
+});
+
+test('an exact ready route-adoption failure stays fail-closed and retries without replacing the connector', async () => {
+    const harness = createHarness();
+    const input = desired();
+    await harness.controller.reconcile(input, { reason: 'selected-edge-generation' });
+    harness.routes.active = false;
+    harness.routes.hosts = {};
+    const contention = new CloudflarePublicationError('route apply remained busy', {
+        code: 'EDGE_GENERATION_BUSY',
+        operation: 'adopt-ready-route',
+        retryable: true,
+    });
+    harness.routes.failCommitOnce = contention;
+
+    await assert.rejects(
+        harness.controller.reconcile(input, { reason: 'selected-edge-generation-retry' }),
+        (error) => error === contention,
+    );
+    assert.equal(harness.routes.active, false);
+    assert.equal(harness.connector.starts, 1);
+    assert.equal(
+        harness.audits.filter((entry) => entry.event === 'cloudflare-reconcile-adopted-ready').length,
+        0,
+    );
+
+    const recovered = await harness.controller.reconcile(
+        input,
+        { reason: 'selected-edge-generation-retry' },
+    );
+    assert.equal(recovered.state, 'ready');
+    assert.equal(harness.routes.active, true);
+    assert.equal(harness.routes.commits.at(-1).publicationState, 'ready');
+    assert.equal(harness.connector.starts, 1);
+});
+
+test('connector exit during exact ready route adoption cannot leave a public route active', async () => {
+    const harness = createHarness({
+        restartPolicy: { maximumRestarts: 0 },
+    });
+    const input = desired();
+    await harness.controller.reconcile(input, { reason: 'selected-edge-generation' });
+    harness.routes.active = false;
+    harness.routes.hosts = {};
+    harness.routes.onCommitOnce = () => harness.connector.exit({ code: 7 });
+
+    await assert.rejects(
+        harness.controller.reconcile(input, { reason: 'selected-edge-generation-retry' }),
+        (error) => error.code === 'CLOUDFLARED_NOT_RUNNING'
+            && error.operation === 'adopt-ready-route',
+    );
+    await waitFor(() => harness.controller.getStatus().state === 'error');
+    assert.equal(harness.routes.active, false);
+    assert.equal(harness.connector.starts, 1);
+    assert.equal(harness.routes.commits.at(-1).publicationState, 'ready');
+    assert.ok(
+        harness.events.filter((entry) => entry.event === 'routes.inactivate').length >= 2,
+    );
 });
 
 test('host removal first removes ingress, then deletes only the journal-owned DNS record', async () => {
