@@ -127,14 +127,18 @@ function handleOpen(frame) {
     const requestHeaderBytes = Number(frame.limits?.requestHeaderBytes || 0);
     const responseHeaderBytes = Number(frame.limits?.responseHeaderBytes || 0);
     const connectTimeoutMs = Number(frame.limits?.connectTimeoutMs || 0);
+    const headerTimeoutMs = Number(frame.limits?.headerTimeoutMs || 0);
     const idleTimeoutMs = Number(frame.limits?.idleTimeoutMs || 0);
+    const webSocketHandshakeTimeoutMs = Number(frame.limits?.webSocketHandshakeTimeoutMs || 0);
     for (const [name, value] of Object.entries({
         streamedBodyBytes,
         bufferedBodyBytes,
         requestHeaderBytes,
         responseHeaderBytes,
         connectTimeoutMs,
+        headerTimeoutMs,
         idleTimeoutMs,
+        webSocketHandshakeTimeoutMs,
     })) {
         if (!Number.isSafeInteger(value) || value <= 0) throw new Error(`invalid ${name} limit`);
     }
@@ -155,12 +159,13 @@ function handleOpen(frame) {
     streams.set(requestId, state);
     state.connectTimer = setTimeout(() => socket.destroy(new Error('target connect timeout')), connectTimeoutMs);
     state.connectTimer.unref?.();
-    socket.setTimeout(idleTimeoutMs);
+    socket.setTimeout(frame.mode === 'websocket' ? webSocketHandshakeTimeoutMs : headerTimeoutMs);
     socket.once('connect', () => {
         clearTimeout(state.connectTimer);
         send({ type: 'READY', requestId });
     });
     socket.on('data', data => {
+        socket.setTimeout(idleTimeoutMs);
         state.responseBytes += data.length;
         if (state.responseBytes > state.responseMaxBytes) {
             socket.destroy(new Error('response byte limit exceeded'));

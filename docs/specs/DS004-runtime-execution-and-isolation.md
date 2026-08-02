@@ -283,7 +283,10 @@ policies configured beyond those defaults or application work that ignores
 cancellation. Separating the WebSocket deadline prevents the longer
 buffered-HTTP allowance from extending upgrade exposure. All limits remain
 finite and do not alter authority, admission, target selection, body-size,
-idle-body, or concurrency enforcement.
+idle-body, or concurrency enforcement. The confined relay applies the HTTP
+response-header budget until the first upstream response bytes arrive, then
+switches that socket to the shorter idle-body budget; it must not apply the
+idle-body timer while an admitted buffered inference is still awaiting headers.
 
 Manifest volume declarations from the root manifest and active profile must create missing host directories before startup. Relative host paths are resolved against the workspace root, absolute host paths are honored as declared, and manifest volumes are not limited to `.ploinky/`. A manifest bind that is byte-for-byte identical to an existing Ploinky bind is represented once; any same-target bind with a different source or option string must fail before container creation. Inside a Box, nested Podman must use `--image-volume=ignore` for managed agent launches: OCI image `VOLUME` declarations must not auto-materialize anonymous mounts outside the reviewed manifest contract, and final inspection must continue to reject any mount beyond the exact Ploinky-generated bind set. A manifest volume with `volumeOptions.<containerPath>.readOnly: true` must be enforced as read-only by every runtime backend: Podman uses a read-only relabelled bind, Docker uses a read-only bind, bwrap uses `--ro-bind`, and Seatbelt grants read access while overlaying an explicit write deny. The explicit deny must protect the read-only volume even when its path is beneath a broader writable workspace path. Writable Podman manifest volumes under `.ploinky/data/` are mounted with the Podman `:U` option so non-root images can write their private runtime state; external manifest volumes keep normal ownership unless the volume option explicitly opts into Podman chowning. Runtime resources declared under `runtime.resources` may create persistent storage under `.ploinky/data/<key>/` and may materialize environment variables from workspace paths, persisted secrets, and variable references.
 

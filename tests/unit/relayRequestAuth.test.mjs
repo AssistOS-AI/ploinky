@@ -439,7 +439,9 @@ test('a reused relay channel rechecks the new checkout lease before a second tar
         transport: 'http',
         limits: {
             connectTimeoutMs: 5_000,
+            headerTimeoutMs: 5_000,
             idleTimeoutMs: 5_000,
+            webSocketHandshakeTimeoutMs: 5_000,
             streamedBodyBytes: 64 * 1024,
             bufferedBodyBytes: 64 * 1024,
             requestHeaderBytes: 8 * 1024,
@@ -483,6 +485,203 @@ test('a reused relay channel rechecks the new checkout lease before a second tar
     assert.equal(targetConnections, 1);
     assert.deepEqual(routerFrames.map(frame => frame.type), ['HELLO', 'OPEN', 'CANCEL']);
     secondCheckout.close();
+});
+
+test('runtime relay preserves the HTTP response-header budget before applying body idle timeout', async (t) => {
+    let responseSent = false;
+    const target = net.createServer(socket => {
+        socket.on('error', () => {});
+        socket.once('data', () => {
+            setTimeout(() => {
+                responseSent = true;
+                socket.end('HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK');
+            }, 60);
+        });
+    });
+    await new Promise((resolve, reject) => {
+        target.once('error', reject);
+        target.listen(0, '127.0.0.1', resolve);
+    });
+    t.after(() => target.close());
+
+    const containerName = 'alpha-header-budget-container';
+    const isolatedMinter = new RelayRequestMinter({
+        resolveAgentSecret: () => assert.fail('header-budget relay must use its channel key'),
+        createNonce: () => `header-budget-${++nonce}`,
+    });
+    const manager = new RuntimeRelayManager({
+        minter: isolatedMinter,
+        inspectContainer: async () => ({
+            Id: CONTAINER_ID,
+            Name: `/${containerName}`,
+            State: { Running: true },
+            HostConfig: { NetworkMode: 'host' },
+            Config: {
+                Labels: {
+                    [NETWORK_LABELS.managed]: '1',
+                    [NETWORK_LABELS.resource]: 'agent',
+                    [NETWORK_LABELS.instanceId]: identity.effectiveInstanceId,
+                    [NETWORK_LABELS.enableGeneration]: identity.enableGeneration,
+                },
+            },
+        }),
+        spawnProcess: (_runtime, _args, options) => spawn(process.execPath, [RELAY_HELPER_PATH], {
+            env: {
+                PATH: process.env.PATH || '',
+                PLOINKY_AGENT_ID: identity.targetAgentId,
+            },
+            stdio: options.stdio,
+        }),
+        channelIdleTimeoutMs: 5_000,
+    });
+    t.after(() => manager.close());
+    const plan = {
+        owner: {
+            effectiveInstanceId: identity.effectiveInstanceId,
+            enableGeneration: identity.enableGeneration,
+        },
+        relay: {
+            kind: 'container-exec-stdio',
+            runtime: 'podman',
+            containerId: CONTAINER_ID,
+            containerName,
+            targetAgentId: identity.targetAgentId,
+            effectiveInstanceId: identity.effectiveInstanceId,
+            enableGeneration: identity.enableGeneration,
+            networkMode: 'host',
+        },
+        generationDigest: identity.generationDigest,
+        deniedPorts: [22],
+        method: 'GET',
+        port: target.address().port,
+        targetPath: '/',
+        query: '',
+        transport: 'http',
+        limits: {
+            connectTimeoutMs: 200,
+            headerTimeoutMs: 200,
+            idleTimeoutMs: 20,
+            webSocketHandshakeTimeoutMs: 30,
+            streamedBodyBytes: 64 * 1024,
+            bufferedBodyBytes: 64 * 1024,
+            requestHeaderBytes: 8 * 1024,
+            responseHeaderBytes: 8 * 1024,
+            concurrentStreamsPerAgent: 4,
+            concurrentStreamsTotal: 8,
+        },
+    };
+    const checkout = await manager.checkout({
+        authorized: true,
+        lease: { commit: () => true },
+        plan,
+    });
+    const startedAt = Date.now();
+    const stream = await checkout.openRequest({ plan });
+    await new Promise((resolve, reject) => {
+        stream.once('ready', () => stream.write('GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n'));
+        stream.once('end', resolve);
+        stream.once('error', reject);
+    });
+    assert.equal(responseSent, true);
+    assert.ok(Date.now() - startedAt >= 50);
+    checkout.close();
+});
+
+test('runtime relay applies the body idle timeout after the first HTTP response bytes', async (t) => {
+    const target = net.createServer(socket => {
+        socket.on('error', () => {});
+        socket.once('data', () => {
+            socket.write('HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\n');
+        });
+    });
+    await new Promise((resolve, reject) => {
+        target.once('error', reject);
+        target.listen(0, '127.0.0.1', resolve);
+    });
+    t.after(() => target.close());
+
+    const containerName = 'alpha-idle-budget-container';
+    const isolatedMinter = new RelayRequestMinter({
+        resolveAgentSecret: () => assert.fail('idle-budget relay must use its channel key'),
+        createNonce: () => `idle-budget-${++nonce}`,
+    });
+    const manager = new RuntimeRelayManager({
+        minter: isolatedMinter,
+        inspectContainer: async () => ({
+            Id: CONTAINER_ID,
+            Name: `/${containerName}`,
+            State: { Running: true },
+            HostConfig: { NetworkMode: 'host' },
+            Config: {
+                Labels: {
+                    [NETWORK_LABELS.managed]: '1',
+                    [NETWORK_LABELS.resource]: 'agent',
+                    [NETWORK_LABELS.instanceId]: identity.effectiveInstanceId,
+                    [NETWORK_LABELS.enableGeneration]: identity.enableGeneration,
+                },
+            },
+        }),
+        spawnProcess: (_runtime, _args, options) => spawn(process.execPath, [RELAY_HELPER_PATH], {
+            env: {
+                PATH: process.env.PATH || '',
+                PLOINKY_AGENT_ID: identity.targetAgentId,
+            },
+            stdio: options.stdio,
+        }),
+        channelIdleTimeoutMs: 5_000,
+    });
+    t.after(() => manager.close());
+    const plan = {
+        owner: {
+            effectiveInstanceId: identity.effectiveInstanceId,
+            enableGeneration: identity.enableGeneration,
+        },
+        relay: {
+            kind: 'container-exec-stdio',
+            runtime: 'podman',
+            containerId: CONTAINER_ID,
+            containerName,
+            targetAgentId: identity.targetAgentId,
+            effectiveInstanceId: identity.effectiveInstanceId,
+            enableGeneration: identity.enableGeneration,
+            networkMode: 'host',
+        },
+        generationDigest: identity.generationDigest,
+        deniedPorts: [22],
+        method: 'GET',
+        port: target.address().port,
+        targetPath: '/',
+        query: '',
+        transport: 'http',
+        limits: {
+            connectTimeoutMs: 200,
+            headerTimeoutMs: 200,
+            idleTimeoutMs: 25,
+            webSocketHandshakeTimeoutMs: 30,
+            streamedBodyBytes: 64 * 1024,
+            bufferedBodyBytes: 64 * 1024,
+            requestHeaderBytes: 8 * 1024,
+            responseHeaderBytes: 8 * 1024,
+            concurrentStreamsPerAgent: 4,
+            concurrentStreamsTotal: 8,
+        },
+    };
+    const checkout = await manager.checkout({
+        authorized: true,
+        lease: { commit: () => true },
+        plan,
+    });
+    const stream = await checkout.openRequest({ plan });
+    const startedAt = Date.now();
+    const failure = await new Promise((resolve, reject) => {
+        stream.once('ready', () => stream.write('GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n'));
+        stream.once('error', resolve);
+        stream.once('end', () => reject(new Error('expected response-body idle failure')));
+    });
+    assert.equal(failure.code, 'TARGET_FAILURE');
+    assert.match(failure.message, /target idle timeout/);
+    assert.ok(Date.now() - startedAt >= 20);
+    checkout.close();
 });
 
 test('relay request token binds every HTTP target and body selector without a protocol version', async () => {
