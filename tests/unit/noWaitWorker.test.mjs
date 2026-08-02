@@ -79,6 +79,79 @@ test('no-wait predecessor returns a terminal failure without exposing its detail
     assert.deepEqual(status, { state: 'failed' });
 });
 
+test('no-wait predecessor permits one bounded terminal-publication grace window', async (t) => {
+    const { runningDir } = fixture(t);
+    const containerName = 'ploinky_demo_slow_predecessor';
+    const target = path.join(runningDir, 'no-wait', `${containerName}.json`);
+    writeStatus(containerName, { state: 'starting' }, { runningDir });
+    let now = 0;
+
+    const status = await waitForPriorWorker(target, {
+        runningDir,
+        timeoutMs: 1_000,
+        terminalPublicationGraceMs: 500,
+        pollIntervalMs: 100,
+        nowFn: () => now,
+        async sleepFn(intervalMs) {
+            now += intervalMs;
+            if (now === 1_200) {
+                writeStatus(containerName, { state: 'running' }, { runningDir });
+            }
+        },
+    });
+
+    assert.equal(now, 1_200);
+    assert.deepEqual(status, { state: 'running' });
+});
+
+test('no-wait predecessor terminal-publication grace remains bounded and fail-closed', async (t) => {
+    const { runningDir } = fixture(t);
+    const containerName = 'ploinky_demo_stuck_predecessor';
+    const target = path.join(runningDir, 'no-wait', `${containerName}.json`);
+    writeStatus(containerName, { state: 'starting' }, { runningDir });
+    let now = 0;
+
+    await assert.rejects(
+        () => waitForPriorWorker(target, {
+            runningDir,
+            timeoutMs: 1_000,
+            terminalPublicationGraceMs: 500,
+            pollIntervalMs: 100,
+            nowFn: () => now,
+            async sleepFn(intervalMs) {
+                now += intervalMs;
+            },
+        }),
+        /timed out waiting for no-wait predecessor status/,
+    );
+    assert.equal(now, 1_500);
+});
+
+test('no-wait predecessor reports failure published during the bounded grace window', async (t) => {
+    const { runningDir } = fixture(t);
+    const containerName = 'ploinky_demo_late_failed_predecessor';
+    const target = path.join(runningDir, 'no-wait', `${containerName}.json`);
+    writeStatus(containerName, { state: 'starting' }, { runningDir });
+    let now = 0;
+
+    const status = await waitForPriorWorker(target, {
+        runningDir,
+        timeoutMs: 1_000,
+        terminalPublicationGraceMs: 500,
+        pollIntervalMs: 100,
+        nowFn: () => now,
+        async sleepFn(intervalMs) {
+            now += intervalMs;
+            if (now === 1_100) {
+                writeStatus(containerName, { state: 'failed' }, { runningDir });
+            }
+        },
+    });
+
+    assert.equal(now, 1_100);
+    assert.deepEqual(status, { state: 'failed' });
+});
+
 test('no-wait predecessor rejects a path outside the status directory', async (t) => {
     const { root, runningDir } = fixture(t);
     await assert.rejects(

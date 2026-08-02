@@ -83,8 +83,13 @@ export async function waitForPriorWorker(rawStatusPath, {
         process.env.PLOINKY_NO_WAIT_SEQUENCE_TIMEOUT_MS || '900000',
         10,
     ),
+    terminalPublicationGraceMs = Number.parseInt(
+        process.env.PLOINKY_NO_WAIT_SEQUENCE_TERMINAL_GRACE_MS || '60000',
+        10,
+    ),
     pollIntervalMs = 100,
     sleepFn = sleep,
+    nowFn = Date.now,
 } = {}) {
     if (!rawStatusPath) return;
     const statusPath = path.resolve(rawStatusPath);
@@ -92,8 +97,14 @@ export async function waitForPriorWorker(rawStatusPath, {
     if (!statusPath.startsWith(allowedRoot) || path.extname(statusPath) !== '.json') {
         throw new Error('no-wait predecessor status must be an exact file in the workspace no-wait status directory');
     }
-    const deadline = Date.now() + Math.max(1000, timeoutMs);
-    while (Date.now() < deadline) {
+    const boundedTimeoutMs = Number.isFinite(timeoutMs)
+        ? Math.min(Math.max(1000, timeoutMs), 3600000)
+        : 900000;
+    const boundedTerminalPublicationGraceMs = Number.isFinite(terminalPublicationGraceMs)
+        ? Math.min(Math.max(0, terminalPublicationGraceMs), 300000)
+        : 60000;
+    const deadline = nowFn() + boundedTimeoutMs + boundedTerminalPublicationGraceMs;
+    while (nowFn() < deadline) {
         try {
             const status = JSON.parse(fs.readFileSync(statusPath, 'utf8'));
             if (status?.state === 'running' || status?.state === 'failed') {
