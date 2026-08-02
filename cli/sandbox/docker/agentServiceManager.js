@@ -771,6 +771,9 @@ function buildPersistentAgentRunArgs({
         'run', '-d', '--init', '--name', containerName,
         ...managedContainerLabelArgs(),
         '--label', `ploinky.envhash=${envHash}`,
+        // Nested Podman must materialize only the binds authorized below. OCI
+        // VOLUME declarations would otherwise create unmanaged anonymous mounts.
+        ...(runtime === 'podman' ? ['--image-volume=ignore'] : []),
         '-w', containerWorkdir,
         // Agent library (always ro)
         '-v', `${agentLibMountPath}:/Agent${runtime === 'podman' ? ':z,ro' : ':ro'}`,

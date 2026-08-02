@@ -47,7 +47,7 @@ test('dependency-install helper containers carry the exact managed label', () =>
 });
 
 test('persistent agent run builder carries the exact managed label', () => {
-    const args = buildPersistentAgentRunArgs({
+    const options = {
         runtime: 'podman',
         containerName: 'ploinky_demo',
         envHash: 'hash',
@@ -58,9 +58,15 @@ test('persistent agent run builder carries the exact managed label', () => {
         sharedDir: '/workspace/.ploinky/shared',
         cwd: '/workspace/.data/demo',
         cwdMountTarget: '/root',
-    });
+    };
+    const args = buildPersistentAgentRunArgs(options);
     assertExactManagedArgv(args);
     assert.equal(args.filter((value) => value === '--init').length, 1);
+    assert.equal(args.filter((value) => value === '--image-volume=ignore').length, 1);
+
+    const dockerArgs = buildPersistentAgentRunArgs({ ...options, runtime: 'docker' });
+    assertExactManagedArgv(dockerArgs);
+    assert.equal(dockerArgs.includes('--image-volume=ignore'), false);
 });
 
 test('both interactive create/retry command families carry the exact managed label', () => {

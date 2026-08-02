@@ -29,6 +29,7 @@ root filesystem, no added capabilities, all capabilities dropped, and
 | F4 | The first revision returned target evidence from the probe but dropped it from the final attestation envelope. | Added it to the digested envelope and added a behavioral regression assertion. |
 | F5 | Exact non-root `UID:GID` images benefit from Podman `keep-id`; other identities cannot be mapped exactly from `Config.User` alone. | Emit exact `keep-id` only when safely derivable; otherwise preserve the image default and omit the override. |
 | F6 | PREPARE enables a managed agent before the Router private Unix socket exists, so `npm test` cannot complete lifecycle stages. | Reproduced the same socket failure on the untouched base, proving it is pre-existing. |
+| F7 | A target image may declare OCI `VOLUME` paths. Nested Podman then creates anonymous mounts that are outside the exact reviewed manifest contract and correctly fail final managed-mount inspection. | Managed nested Podman launches use `--image-volume=ignore`; explicit Ploinky and manifest binds remain the only mounted paths, and the exact inspection remains fail closed. |
 
 Podman's current `keep-id` behavior is documented in the
 [official `podman run` reference](https://docs.podman.io/en/latest/markdown/podman-run.1.html#userns-mode).
@@ -58,6 +59,7 @@ Podman's current `keep-id` behavior is documented in the
 | Repeated helper cleanup check | Zero authority-helper containers remained |
 | Numeric-user Podman check | Exact `1000:1000` produced `keep-id:uid=1000,gid=1000` |
 | Empty-user Podman check | Image default was preserved and no userns annotation was added |
+| OCI `VOLUME` Podman check | A never-started diagnostic launch reproduced anonymous mounts; the same exact launch with `--image-volume=ignore` produced zero mounts and no new volumes. The diagnostic volumes were removed by exact ID. |
 | Diff hygiene | `git diff --check` passed; no stale strict-user wording remained |
 | Full `npm test` lifecycle | PREPARE/START/STOP/RESTART failed because the Router private socket was absent; identical PREPARE failure reproduced from untouched base |
 
