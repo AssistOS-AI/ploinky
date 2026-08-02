@@ -403,6 +403,8 @@ export class CloudflarePublicationController {
         this.lastApiManagedInput = null;
         this.restartHistory = [];
         this.restartTimer = null;
+        this.activeRequest = null;
+        this.readyRequestKey = null;
         this.stopped = false;
     }
 
@@ -635,6 +637,32 @@ export class CloudflarePublicationController {
             }));
         }
         const captured = cloneJson(input);
+        let requestKey = null;
+        try {
+            const plan = normalizeCloudflarePublicationDesired(captured);
+            requestKey = `${plan.configurationGeneration}:${plan.desiredDigest}`;
+        } catch (_) {}
+        if (requestKey && this.activeRequest?.key === requestKey) {
+            this.safeAudit('cloudflare-reconcile-coalesced', {
+                configurationGeneration: String(captured.configurationGeneration || ''),
+                reason,
+            });
+            return this.activeRequest.promise;
+        }
+        const selectedGenerationRequest = reason === 'selected-edge-generation'
+            || reason === 'selected-edge-generation-retry';
+        if (requestKey
+            && selectedGenerationRequest
+            && this.readyRequestKey === requestKey
+            && this.state.state === 'ready'
+            && this.state.connectorState === 'running'
+            && this.connector.isRunning()) {
+            this.safeAudit('cloudflare-reconcile-adopted-ready', {
+                configurationGeneration: String(captured.configurationGeneration || ''),
+                reason,
+            });
+            return Promise.resolve(this.getStatus());
+        }
         const revision = ++this.requestRevision;
         this.currentAbort?.abort(new CloudflarePublicationError('Cloudflare publication was superseded', {
             code: 'CLOUDFLARE_RECONCILIATION_SUPERSEDED',
@@ -642,6 +670,18 @@ export class CloudflarePublicationController {
         }));
         const run = this.queue.then(() => this.runReconcile(captured, { revision, reason }));
         this.queue = run.catch(() => {});
+        if (requestKey) this.activeRequest = { key: requestKey, promise: run };
+        run.then(
+            (status) => {
+                if (requestKey && status?.state === 'ready' && status?.connectorState === 'running') {
+                    this.readyRequestKey = requestKey;
+                }
+                if (this.activeRequest?.promise === run) this.activeRequest = null;
+            },
+            () => {
+                if (this.activeRequest?.promise === run) this.activeRequest = null;
+            },
+        );
         return run;
     }
 

@@ -1044,6 +1044,58 @@ test('reapplying the same selected state is idempotent and does not duplicate DN
     assert.equal(harness.events.filter((entry) => entry.event === 'api.updateDns').length, 1);
 });
 
+test('concurrent identical selected-generation reconciliation coalesces without replacing its connector', async () => {
+    const harness = createHarness();
+    const input = desired();
+    let releaseIngress;
+    harness.api.blockPutIngress = new Promise((resolve) => { releaseIngress = resolve; });
+
+    const first = harness.controller.reconcile(input, { reason: 'selected-edge-generation' });
+    await waitFor(() => harness.events.some((entry) => entry.event === 'api.putIngress'));
+    const second = harness.controller.reconcile(input, { reason: 'selected-edge-generation-retry' });
+
+    assert.equal(second, first, 'an exact in-flight selected generation must share one reconciliation');
+    releaseIngress();
+    const [firstStatus, secondStatus] = await Promise.all([first, second]);
+    assert.equal(firstStatus.state, 'ready');
+    assert.deepEqual(secondStatus, firstStatus);
+    assert.equal(harness.connector.starts, 1);
+    assert.equal(harness.events.filter((entry) => entry.event === 'connector.stop').length, 1);
+    assert.deepEqual(harness.routes.commits.map((entry) => entry.publicationState), [
+        'reconciling',
+        'ready',
+    ]);
+    assert.equal(
+        harness.audits.filter((entry) => entry.event === 'cloudflare-reconcile-coalesced').length,
+        1,
+    );
+});
+
+test('an exact ready selected generation preserves its healthy connector while explicit reconcile remains available', async () => {
+    const harness = createHarness();
+    const input = desired();
+    await harness.controller.reconcile(input, { reason: 'selected-edge-generation' });
+    const eventCount = harness.events.length;
+    const commitCount = harness.routes.commits.length;
+
+    const adopted = await harness.controller.reconcile({
+        ...input,
+        selectedPublicationState: 'ready',
+    }, { reason: 'selected-edge-generation-retry' });
+
+    assert.equal(adopted.state, 'ready');
+    assert.equal(harness.connector.starts, 1);
+    assert.equal(harness.events.length, eventCount);
+    assert.equal(harness.routes.commits.length, commitCount);
+    assert.equal(
+        harness.audits.filter((entry) => entry.event === 'cloudflare-reconcile-adopted-ready').length,
+        1,
+    );
+
+    await harness.controller.reconcile(input, { reason: 'coordinated-apply' });
+    assert.equal(harness.connector.starts, 2, 'an explicit coordinated apply must still execute');
+});
+
 test('host removal first removes ingress, then deletes only the journal-owned DNS record', async () => {
     const harness = createHarness();
     await harness.controller.reconcile(desired(['office.example.test', 'meet.example.test']));

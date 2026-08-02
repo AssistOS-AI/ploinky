@@ -363,6 +363,14 @@ Cloudflare input still fails closed, and a prior Cloudflare ownership journal
 always forces the normal inactivate, remote teardown, and coordinated commit
 sequence before local-only is reported.
 
+For a Cloudflare generation, simultaneous reconciliation requests with the
+same immutable configuration and desired digests share one in-flight operation.
+After that exact selected generation is ready and its connector is still
+running, a later selected-generation scan or retry adopts the ready state
+without stopping or replacing the connector. Changed generations, explicit
+coordinated applies, error recovery, and unexpected connector exits still run
+the complete fail-closed reconciliation and readiness sequence.
+
 The box-owned topology snapshot is non-secret and generation-based. It records
 the immutable route-and-policy `authorizationGeneration`, a content-derived
 `configurationGeneration` for stable non-secret consumer inputs, and a
