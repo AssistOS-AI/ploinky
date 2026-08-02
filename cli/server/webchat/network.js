@@ -41,7 +41,7 @@ async function loadBrowserMutationProof(agentName, {
         throw browserMutationError('browser mutation proof transport is unavailable');
     }
     const proofUrl = new URL('/auth/token', locationRef?.href || locationRef?.origin);
-    proofUrl.searchParams.set('agent', routeKey);
+    proofUrl.searchParams.set('mutationRoute', routeKey);
     const response = await fetchImpl(proofUrl.toString(), {
         method: 'GET',
         credentials: 'include',

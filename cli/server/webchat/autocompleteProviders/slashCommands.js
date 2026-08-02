@@ -56,7 +56,7 @@ async function loadBrowserMutationProof(agentName, { refresh = false } = {}) {
         return browserMutationProofs.get(routeKey);
     }
     const proofUrl = new URL('/auth/token', globalThis.location?.href || globalThis.location?.origin);
-    proofUrl.searchParams.set('agent', routeKey);
+    proofUrl.searchParams.set('mutationRoute', routeKey);
     const response = await fetch(proofUrl.toString(), {
         method: 'GET',
         credentials: 'include',

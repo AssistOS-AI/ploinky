@@ -14,7 +14,11 @@ test('WebChat slash-command MCP discovery sends an exact route-scoped browser pr
     globalThis.fetch = async (input, options = {}) => {
         const url = new URL(input, globalThis.location.href);
         if (url.pathname === '/auth/token') {
-            calls.push({ path: url.pathname, agent: url.searchParams.get('agent') });
+            calls.push({
+                path: url.pathname,
+                mutationRoute: url.searchParams.get('mutationRoute'),
+                agent: url.searchParams.get('agent'),
+            });
             return new Response(JSON.stringify({
                 ok: true,
                 browserMutation: {
@@ -78,7 +82,11 @@ test('WebChat slash-command MCP discovery sends an exact route-scoped browser pr
         else globalThis.location = originalLocation;
     }
 
-    assert.deepEqual(calls[0], { path: '/auth/token', agent: 'achilles-cli' });
+    assert.deepEqual(calls[0], {
+        path: '/auth/token',
+        mutationRoute: 'achilles-cli',
+        agent: null,
+    });
     const mcpCalls = calls.slice(1);
     assert.equal(mcpCalls.length, 3);
     assert.ok(mcpCalls.every((call) => (

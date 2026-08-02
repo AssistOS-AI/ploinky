@@ -58,7 +58,7 @@ test('webchat mutation uses a route-bound browser proof', async () => {
     assert.equal(calls.length, 2);
     assert.equal(
         calls[0].endpoint,
-        'https://explorer.example/auth/token?agent=achilles-cli',
+        'https://explorer.example/auth/token?mutationRoute=achilles-cli',
     );
     assert.equal(calls[1].endpoint, '/webchat/input?tabId=tab-1');
     assert.equal(
