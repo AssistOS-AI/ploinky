@@ -18,6 +18,7 @@ import {
 } from './lifecycle/container.mjs';
 import { reconcileBoxContainer } from './lifecycle/transactions.mjs';
 import { serializeCloudflarePublicationStatus } from './cloudflared/status.mjs';
+import { removeOwnedNamedVolumes } from './volumes.mjs';
 
 function supervisorError(message, code = 'PLOINKY_BOX_SUPERVISOR_FAILED') {
     return new PloinkyBoxError(message, { code });
@@ -51,6 +52,7 @@ export function createBoxSupervisor({
     readEdgeDesired = readWorkspaceEdgeDesired,
     stageEdgeDesired = stageWorkspaceEdgeDesired,
     healthCheck = checkBoxHealth,
+    destroyNamedVolumes = removeOwnedNamedVolumes,
     stdout = process.stdout,
     stderr = process.stderr,
 } = {}) {
@@ -157,17 +159,37 @@ export function createBoxSupervisor({
         });
     }
 
-    async function runDestroyTransaction(expectedContainerId) {
+    async function runDestroyTransaction(expectedContainerId, { deleteVolumes = false } = {}) {
         return lockedMutation(async (identity, lock, ownership) => {
             const container = ownership.handles?.container;
-            if (!container) {
+            const volumes = ownership.handles?.volumes;
+            if (!container && expectedContainerId) {
+                throw supervisorError('Box changed before destroy; nothing was removed');
+            }
+            if (!container && !deleteVolumes) {
                 return Object.freeze({ identity, action: 'absent' });
             }
-            if (!expectedContainerId || container.id !== expectedContainerId) {
+            if (container && (!expectedContainerId || container.id !== expectedContainerId)) {
                 throw supervisorError('Box changed after destroy confirmation; nothing was removed');
             }
-            removeContainerById(ownership.engine, container.id, runner);
-            return Object.freeze({ identity, action: 'destroyed', containerId: container.id });
+            if (container) {
+                removeContainerById(ownership.engine, container.id, runner);
+            }
+            const deletedVolumes = deleteVolumes
+                ? destroyNamedVolumes({
+                    engine: ownership.engine,
+                    identity,
+                    runner,
+                    lock,
+                    knownHandles: volumes,
+                })
+                : Object.freeze([]);
+            return Object.freeze({
+                identity,
+                action: container ? 'destroyed' : 'deleted-retained-volumes',
+                containerId: container?.id || null,
+                deletedVolumes,
+            });
         });
     }
 

@@ -81,6 +81,29 @@ test('dispatch order keeps marker, built-ins, explicit start, REPL, bash, and ge
     }
 });
 
+test('destroy accepts only one explicit trailing volume-deletion flag', () => {
+    assert.deepEqual(routeOuterCommand(parseOuterArguments(['destroy'])), {
+        kind: 'destroy',
+        deleteVolumes: false,
+    });
+    assert.deepEqual(routeOuterCommand(parseOuterArguments(['destroy', '--delete-volumes'])), {
+        kind: 'destroy',
+        deleteVolumes: true,
+    });
+    assert.throws(
+        () => routeOuterCommand(parseOuterArguments(['destroy', '--delete-volumes', '--delete-volumes'])),
+        /supplied more than once/,
+    );
+    assert.throws(
+        () => routeOuterCommand(parseOuterArguments(['destroy', '--volumes'])),
+        /unexpected trailing argument/,
+    );
+    assert.throws(
+        () => routeOuterCommand(parseOuterArguments(['--dry-run', 'destroy', '--delete-volumes'])),
+        /--dry-run is not supported/,
+    );
+});
+
 test('unsupported public override surfaces reject before routing', () => {
     for (const argv of [
         ['--image', 'candidate', 'start', 'Agent'],

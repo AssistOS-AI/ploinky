@@ -8,6 +8,7 @@ import { BOX_LABELS, BOX_ROLES } from '../../ploinky-box/constants.mjs';
 import { buildWorkspaceIdentity } from '../../ploinky-box/identity.mjs';
 import {
     ensureNamedVolumes,
+    removeOwnedNamedVolumes,
     revalidateVolumeHandle,
     rollbackCreatedVolumes,
     volumeCreateArgs,
@@ -159,4 +160,61 @@ test('foreign exact-name volumes cause zero volume mutation', (t) => {
     }), /not owned/);
     assert.equal(state.calls.some((call) => call[0] === 'run'), false);
     assert.equal(JSON.stringify(state.calls).includes('/secret/mount'), false);
+});
+
+test('owned named volumes are revalidated as a complete set before exact-name deletion', (t) => {
+    const state = setup(t);
+    const created = ensureNamedVolumes({
+        engine: { name: 'podman', identity: 'engine-one' },
+        identity: state.identity,
+        runner: state.runner,
+        lock: state.lock,
+    });
+    state.calls.length = 0;
+    const deleted = removeOwnedNamedVolumes({
+        engine: { name: 'podman', identity: 'engine-one' },
+        identity: state.identity,
+        runner: state.runner,
+        lock: state.lock,
+        knownHandles: created.handles,
+    });
+    assert.deepEqual(deleted, Object.values(state.identity.volumes));
+    assert.equal(state.records.size, 0);
+    assert.deepEqual(
+        state.calls.filter((call) => call[0] === 'run').map((call) => call.slice(-1)[0]),
+        Object.values(state.identity.volumes),
+    );
+});
+
+test('changed or incomplete named-volume sets fail before any deletion', (t) => {
+    const state = setup(t);
+    const created = ensureNamedVolumes({
+        engine: { name: 'podman', identity: 'engine-one' },
+        identity: state.identity,
+        runner: state.runner,
+        lock: state.lock,
+    });
+    state.calls.length = 0;
+    const containers = state.records.get(state.identity.volumes.containers);
+    state.records.set(state.identity.volumes.containers, {
+        ...containers,
+        CreatedAt: '2026-07-22T00:00:00Z',
+    });
+    assert.throws(() => removeOwnedNamedVolumes({
+        engine: { name: 'podman', identity: 'engine-one' },
+        identity: state.identity,
+        runner: state.runner,
+        lock: state.lock,
+        knownHandles: created.handles,
+    }), /changed before mutation/);
+    assert.equal(state.calls.some((call) => call[0] === 'run'), false);
+
+    assert.throws(() => removeOwnedNamedVolumes({
+        engine: { name: 'podman', identity: 'engine-one' },
+        identity: state.identity,
+        runner: state.runner,
+        lock: state.lock,
+        knownHandles: { workspace: created.handles.workspace },
+    }), /incomplete named-volume set/);
+    assert.equal(state.calls.some((call) => call[0] === 'run'), false);
 });

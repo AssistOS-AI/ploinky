@@ -154,3 +154,40 @@ export function rollbackCreatedVolumes({
         );
     }
 }
+
+export function removeOwnedNamedVolumes({
+    engine,
+    identity,
+    runner,
+    lock,
+    knownHandles,
+}) {
+    assertLock(lock, identity);
+    const handles = {};
+    for (const key of BOX_VOLUME_KEYS) {
+        if (!knownHandles?.[key]) {
+            throw volumeError(
+                `Cannot delete an incomplete named-volume set for Box ${identity.instance}`,
+                'PLOINKY_BOX_VOLUME_SET_INCOMPLETE',
+            );
+        }
+        handles[key] = revalidateVolumeHandle(knownHandles[key], {
+            engine, identity, key, runner, lock,
+        });
+    }
+
+    for (const key of BOX_VOLUME_KEYS) {
+        const handle = revalidateVolumeHandle(handles[key], {
+            engine, identity, key, runner, lock,
+        });
+        runner.run(engine.name, ['volume', 'rm', handle.name]);
+        const after = inspectOwnedVolumeHandle(engine, identity, key, runner);
+        if (after.state !== 'absent') {
+            throw volumeError(
+                `Named volume ${handle.name} still exists after deletion`,
+                'PLOINKY_BOX_VOLUME_REMOVE_FAILED',
+            );
+        }
+    }
+    return Object.freeze(BOX_VOLUME_KEYS.map((key) => handles[key].name));
+}

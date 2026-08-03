@@ -150,6 +150,59 @@ test('destroy revalidates the confirmed immutable ID and retains named volumes',
     assert.equal(events.some((value) => value.includes('volume rm')), false);
 });
 
+test('destructive volume reset removes the container before the locked owned-volume set', async (t) => {
+    const state = fixture(t);
+    fs.mkdirSync(path.join(state.workspace, '.ploinky'));
+    const identity = buildWorkspaceIdentity(state.workspace, { markerFound: true });
+    const events = [];
+    const ownership = owned(identity);
+    ownership.handles.volumes = { workspace: { name: identity.volumes.workspace } };
+    const supervisor = createBoxSupervisor({
+        resolveIdentity: () => identity,
+        lockManager: fakeLockManager(state.root, events),
+        discover: () => ownership,
+        runner: { run(command, args) { events.push(args.join(' ')); } },
+        destroyNamedVolumes(options) {
+            options.lock.assertHeld(identity.instance);
+            assert.equal(options.knownHandles, ownership.handles.volumes);
+            events.push('delete-named-volumes');
+            return Object.freeze(Object.values(identity.volumes));
+        },
+    });
+    const result = await supervisor.runDestroyTransaction(
+        ownership.handles.container.id,
+        { deleteVolumes: true },
+    );
+    const containerRemoval = events.findIndex((value) => value.includes('container rm'));
+    const volumeRemoval = events.indexOf('delete-named-volumes');
+    assert.ok(containerRemoval >= 0 && containerRemoval < volumeRemoval);
+    assert.deepEqual(result.deletedVolumes, Object.values(identity.volumes));
+});
+
+test('destructive volume reset works when only the complete retained set remains', async (t) => {
+    const state = fixture(t);
+    fs.mkdirSync(path.join(state.workspace, '.ploinky'));
+    const identity = buildWorkspaceIdentity(state.workspace, { markerFound: true });
+    const events = [];
+    const ownership = owned(identity);
+    ownership.handles.container = null;
+    ownership.handles.volumes = { workspace: { name: identity.volumes.workspace } };
+    const supervisor = createBoxSupervisor({
+        resolveIdentity: () => identity,
+        lockManager: fakeLockManager(state.root, events),
+        discover: () => ownership,
+        runner: { run(command, args) { events.push(args.join(' ')); } },
+        destroyNamedVolumes() {
+            events.push('delete-named-volumes');
+            return Object.freeze(Object.values(identity.volumes));
+        },
+    });
+    const result = await supervisor.runDestroyTransaction(null, { deleteVolumes: true });
+    assert.equal(result.action, 'deleted-retained-volumes');
+    assert.equal(events.some((value) => value.includes('container rm')), false);
+    assert.equal(events.includes('delete-named-volumes'), true);
+});
+
 test('status and dry-run inspect without acquiring a lock or creating an anchor', (t) => {
     const state = fixture(t);
     const identity = resolveWorkspaceIdentity({ env: {}, cwd: () => state.workspace });

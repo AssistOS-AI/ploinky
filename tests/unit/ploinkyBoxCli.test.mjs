@@ -23,14 +23,16 @@ function fakeSupervisor(events, { statusState = 'absent' } = {}) {
     const status = {
         state: statusState,
         identity: { instance: 'ploinky-box-workspace-123456789abc' },
-        ownership: statusState === 'running-initialized'
+        ownership: ['running-initialized', 'absent-retained-volumes'].includes(statusState)
             ? {
+                state: 'owned',
                 engine: prepared.engine,
                 handles: {
-                    container: {
+                    container: statusState === 'running-initialized' ? {
                         id: prepared.containerId,
                         labels: { [BOX_LABELS.routerHostPort]: String(prepared.hostPort) },
-                    },
+                    } : null,
+                    volumes: {},
                 },
             }
             : { state: statusState, handles: null },
@@ -39,7 +41,7 @@ function fakeSupervisor(events, { statusState = 'absent' } = {}) {
         prepareBoxForCommand: async () => { events.push('prepare'); return prepared; },
         runStartTransaction: async (argv, options) => events.push(['start', argv, options]),
         runStopTransaction: async () => events.push('stop'),
-        runDestroyTransaction: async (id) => events.push(['destroy', id]),
+        runDestroyTransaction: async (id, options) => events.push(['destroy', id, options]),
         inspectBoxStatus: () => { events.push('status'); return status; },
         planDryRun: (options) => { events.push(['dry-run', options]); return { mutationPerformed: false }; },
     };
@@ -194,7 +196,44 @@ test('destroy confirmation occurs after read-only inspect and before its single 
         confirmDestroy: async () => { events.push('confirm'); return true; },
     });
     assert.equal(code, 0);
-    assert.deepEqual(events, ['status', 'confirm', ['destroy', 'a'.repeat(64)]]);
+    assert.deepEqual(events, [
+        'status',
+        'confirm',
+        ['destroy', 'a'.repeat(64), { deleteVolumes: false }],
+    ]);
+});
+
+test('destroy --delete-volumes skips confirmation and deletes retained-volume-only state', async () => {
+    for (const statusState of ['running-initialized', 'absent-retained-volumes']) {
+        const events = [];
+        const output = bufferStream();
+        const code = await runOuterCli(['destroy', '--delete-volumes'], {
+            env: {}, input: { isTTY: false }, output, errorOutput: bufferStream(),
+            supervisor: fakeSupervisor(events, { statusState }),
+            confirmDestroy: async () => { throw new Error('must not prompt'); },
+        });
+        assert.equal(code, 0);
+        assert.deepEqual(events, [
+            'status',
+            ['destroy', statusState === 'running-initialized' ? 'a'.repeat(64) : null, {
+                deleteVolumes: true,
+            }],
+        ]);
+        assert.match(output.value(), /named volumes were deleted/);
+    }
+});
+
+test('public help documents explicit no-prompt volume deletion', async () => {
+    const output = bufferStream();
+    const code = await runOuterCli(['help'], {
+        env: {}, input: { isTTY: false }, output, errorOutput: bufferStream(),
+        supervisor: new Proxy({}, {
+            get() { throw new Error('help must not inspect the supervisor'); },
+        }),
+    });
+    assert.equal(code, 0);
+    assert.match(output.value(), /destroy --delete-volumes/);
+    assert.match(output.value(), /without prompting/);
 });
 
 test('dry-run and invalid arguments cause no preparation or execution', async () => {

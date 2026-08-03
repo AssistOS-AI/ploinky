@@ -22,6 +22,8 @@ Commands:
   ploinky status                  Inspect Box and core state without mutation
   ploinky stop                    Stop core services and the outer Box
   ploinky destroy                 Remove the outer Box after confirmation; retain data volumes
+  ploinky destroy --delete-volumes
+                                  Remove the outer Box and its data volumes without prompting
   ploinky cli                     Open Bash in the Box
   ploinky cli AGENT [ARGS]        Run an agent CLI through ploinky-local
   ploinky help                    Show this help without engine discovery
@@ -120,16 +122,24 @@ export async function runOuterCli(argv, {
     if (route.kind === 'destroy') {
         const status = selectedSupervisor.inspectBoxStatus();
         const container = status.ownership?.handles?.container;
-        if (!container) {
+        const volumes = status.ownership?.handles?.volumes;
+        if (!container && !(route.deleteVolumes && volumes)) {
             output.write(formatBoxStatus(status));
             return ['foreign', 'incompatible', 'unknown', 'unsupported'].includes(status.state) ? 1 : 0;
         }
-        const confirmed = await confirmDestroy(status.identity.instance, { input, output });
-        if (!confirmed) {
-            output.write('Destroy cancelled; no resources changed.\n');
-            return 0;
+        if (!route.deleteVolumes) {
+            const confirmed = await confirmDestroy(status.identity.instance, { input, output });
+            if (!confirmed) {
+                output.write('Destroy cancelled; no resources changed.\n');
+                return 0;
+            }
         }
-        await selectedSupervisor.runDestroyTransaction(container.id);
+        await selectedSupervisor.runDestroyTransaction(container?.id || null, {
+            deleteVolumes: route.deleteVolumes,
+        });
+        if (route.deleteVolumes) {
+            output.write(`Ploinky Box ${status.identity.instance} and its named volumes were deleted.\n`);
+        }
         return 0;
     }
     if (route.kind === 'dry-run') {

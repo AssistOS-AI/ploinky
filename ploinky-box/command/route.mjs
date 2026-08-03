@@ -13,6 +13,28 @@ function requireNoArgs(parsed, command) {
     }
 }
 
+function routeDestroy(parsed) {
+    if (parsed.dryRun) {
+        throw routeError('destroy: --dry-run is not supported');
+    }
+    if (parsed.explicitPort !== null) {
+        throw routeError('destroy: --port is not supported');
+    }
+    if (parsed.commandArgs.length === 0) {
+        return Object.freeze({ kind: 'destroy', deleteVolumes: false });
+    }
+    if (parsed.commandArgs[0] !== '--delete-volumes') {
+        throw routeError(`destroy: unexpected trailing argument '${parsed.commandArgs[0]}'`);
+    }
+    if (parsed.commandArgs.length > 1) {
+        const message = parsed.commandArgs[1] === '--delete-volumes'
+            ? 'destroy: --delete-volumes was supplied more than once'
+            : `destroy: unexpected trailing argument '${parsed.commandArgs[1]}'`;
+        throw routeError(message);
+    }
+    return Object.freeze({ kind: 'destroy', deleteVolumes: true });
+}
+
 export function routeOuterCommand(parsed) {
     if (parsed.help || parsed.command === 'help') {
         return Object.freeze({ kind: 'help', topic: parsed.commandArgs });
@@ -26,8 +48,7 @@ export function routeOuterCommand(parsed) {
         return Object.freeze({ kind: 'stop' });
     }
     if (parsed.command === 'destroy') {
-        requireNoArgs(parsed, 'destroy');
-        return Object.freeze({ kind: 'destroy' });
+        return routeDestroy(parsed);
     }
     if (parsed.command === 'start') {
         return Object.freeze({

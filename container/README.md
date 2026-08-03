@@ -38,6 +38,7 @@ outer runtime.
 | `ploinky status` | Inspect outer configuration/publishes/health and running core status without mutation |
 | `ploinky stop` | Stop core services, then stop outer runtime; keep volumes |
 | `ploinky destroy` | Confirm exact instance and directly remove its outer container; retain all named volumes |
+| `ploinky destroy --delete-volumes` | Directly remove the exact outer container and its three owned named volumes without prompting |
 | REPL `status`/`stop`/`destroy` | Core workspace/router/agent scope; outer runtime remains |
 
 Host lifecycle commands and same-named REPL commands intentionally have
@@ -132,7 +133,10 @@ unresolved; other commands make no change.
 confirms and directly removes only the box, using engine volume cleanup to
 remove attached anonymous volumes while retaining all explicitly named
 volumes. If the box is absent, destroy reports any retained named volumes and
-succeeds without prompting or deleting them.
+succeeds without prompting or deleting them. `ploinky destroy --delete-volumes`
+uses the same workspace lock and fail-closed ownership checks, skips the prompt,
+and removes the exact three owned named volumes even when only retained volumes
+remain.
 
 ## Fixed ports and graph-independent start
 
@@ -273,26 +277,25 @@ does not pull, create, start, stop, remove, refresh, or reconcile.
 stops the outer runtime even when core shutdown fails, reporting both phases.
 Repeated stop is an idempotent success. `ploinky destroy` also skips
 reconciliation, directly removes the selected outer container and its attached
-anonymous volumes, and retains the three managed named volumes.
+anonymous volumes, and retains the three managed named volumes. The explicit
+`--delete-volumes` form revalidates and deletes those volumes after removing the
+outer container.
 
 Commands entered in the Ploinky REPL stay at core workspace/router/agent scope.
 REPL `stop` leaves outer runtime state and volumes in place; REPL `destroy`
 clears workspace agent runtimes and regenerated core dependency caches while
 the outer runtime remains alive.
 
-For a deliberate complete reset, first destroy the box, then remove the named
-volumes from their owning engine after accepting data loss:
+For a deliberate complete reset after accepting data loss, run:
 
 ```bash
-ENGINE=podman # or docker, as reported by status
-INSTANCE=ploinky-box-WORKSPACE-PATHHASH
-$ENGINE volume rm "$INSTANCE-workspace" "$INSTANCE-containers" "$INSTANCE-ploinky-deps"
+ploinky destroy --delete-volumes
 ```
 
-A failed first create may leave only labelled instance volumes. Remove an exact
-volume with the same engine command only when its retained state is not needed.
+A failed first create may leave only labelled instance volumes. The same command
+removes that complete retained set after revalidating its ownership.
 If boot cleanup repeatedly fails because nested storage is corrupt, inspect and
-back up `$INSTANCE-containers`, remove the outer box, and
+back up the instance's `-containers` volume, remove the outer box, and
 remove only that volume when its cached images, container records, and nested
 volumes may be lost; ordinary destroy/recreate deliberately preserves it and
 can repeat the failure.
