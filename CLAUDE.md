@@ -19,9 +19,11 @@ Treat executable code and tests as the only source of truth for current Ploinky 
 9. A `ploinky-proxy` deployment must use the exact remote `ploinky-proxy` branch in every affected repository, including the AchillesAgentLib checkout actually loaded at runtime. Prove the loaded AgentLib bytes and repository revisions; a manifest claim alone is insufficient. Branch fallback is forbidden.
 10. Preserve the versionless semantic Box identity. Do not turn schema or runtime revisions into incrementing public Box names.
 
-## Mandatory cross-repository `ploinky-proxy` gate
+## On-demand cross-repository `ploinky-proxy` gate
 
-Every new code, configuration, manifest, dependency, workflow, or documentation change on `ploinky-proxy` in any repository must pass this gate. There is no docs-only or presumed-low-risk exemption. A change is not complete, mergeable, releasable, or eligible for a later environment until all steps below pass against the exact pushed candidate revisions.
+Do not automatically deploy Explorer or run the Playwright E2E gates after each `ploinky-proxy` change. Run this cross-repository gate only when the user explicitly requests the deployment or E2E validation in the current task. Normal scoped unit, integration, and static verification still applies to every change.
+
+When the user requests this gate, all steps below are mandatory against the exact pushed candidate revisions. Do not infer an E2E request from a code change, a prior task, or the existence of this procedure.
 
 ### 1. Pin the candidate
 
@@ -70,4 +72,4 @@ Each command must discover exactly one intended test and finish `1 passed`, with
 
 Save the candidate commit map, image identity, generation, deployment/readiness proof, Playwright output, traces, screenshots, and cleanup result. Do not store credentials in evidence.
 
-If deployment or any gate fails, do not waive, retry around, or narrow the invariant. Fix the cause, commit and push the new candidate, delete the failed fixture, redeploy from scratch, and rerun all three gates. Passing results from an earlier generation or revision cannot be carried forward.
+If a requested deployment or gate fails, do not waive, retry around, or narrow the invariant. Stop, preserve the evidence, report the failure, and wait for an explicit user request before another deployment or E2E run. If the user requests a retry after a fix, commit and push the new candidate, delete the failed fixture, redeploy from scratch, and rerun all three gates. Passing results from an earlier generation or revision cannot be carried forward.
