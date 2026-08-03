@@ -890,6 +890,55 @@ test('additive Router attestation checkpoints use the immutable candidate bytes'
     abortEdgeRoutingPreparation(prepared.preparationLease, { workspaceRoot: fixture.workspace });
 });
 
+test('registered authority observation accepts only the exact additive preparation candidate', (t) => {
+    const fixture = createFixture(t);
+    const predecessor = applyEdgeRoutingGeneration({
+        workspaceRoot: fixture.workspace,
+        reason: 'additive-observation-predecessor',
+    });
+    const candidateRouting = structuredClone(predecessor.generation.routing);
+    candidateRouting.routes.alpha.hostPort = 45104;
+    let prepared;
+    withEdgeGenerationApplyLock((applyLockCapability) => {
+        prepared = prepareAdditiveEdgeRoutingGeneration({
+            workspaceRoot: fixture.workspace,
+            routing: candidateRouting,
+            agents: predecessor.generation.agents,
+            applyLockCapability,
+            reason: 'additive-observation-candidate',
+        });
+    }, { workspaceRoot: fixture.workspace });
+
+    const generation = prepared.generation.generation;
+    const ordinary = resolveEdgeRoutePlan({
+        req: { headers: { host: '127.0.0.1:18080' }, url: '/health' },
+        listener: 'public',
+    });
+    assert.equal(ordinary.lease?.id, predecessor.selector.generation);
+
+    const observed = resolveEdgeRoutePlan({
+        req: { headers: { host: '127.0.0.1:18080' }, url: '/health' },
+        listener: 'public',
+        authorityObservationGeneration: generation,
+    });
+    assert.equal(observed.status, 404);
+    assert.equal(observed.code, 'ROUTE_NOT_FOUND');
+    assert.equal(observed.hostSelection?.kind, 'control');
+    assert.equal(observed.lease?.id, generation);
+    assert.equal(observed.lease?.commit(), true);
+    assert.equal(
+        loadActiveEdgeRoutingGeneration({ workspaceRoot: fixture.workspace }).selector.generation,
+        predecessor.selector.generation,
+    );
+
+    abortEdgeRoutingPreparation(prepared.preparationLease, { workspaceRoot: fixture.workspace });
+    assert.equal(observed.lease?.commit(), false);
+    assert.throws(() => captureEdgeRoutingObservationLease({
+        workspaceRoot: fixture.workspace,
+        expectedGeneration: generation,
+    }), { code: 'EDGE_GENERATION_RACE' });
+});
+
 test('later startup waves retain the prepared attestation across runtime-only locator updates', (t) => {
     const fixture = createFixture(t);
     const prepared = prepareEdgeRoutingGeneration({

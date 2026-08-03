@@ -2653,22 +2653,46 @@ export function captureEdgeRoutingObservationLease({ expectedGeneration, ...opti
     const paths = resolveEdgeGenerationPaths(options);
     const capture = () => {
         const selector = readSelector(paths);
-        if (!selector || selector.generation !== expected || !selector.activationId) {
+        if (!selector || !selector.activationId) {
             throw edgeError(
                 'registered Router authority observation generation is no longer selected',
                 'EDGE_GENERATION_RACE',
             );
         }
-        const generation = selector.state === 'active'
-            ? loadActiveEdgeRoutingGeneration(options).generation
-            : loadGenerationById(paths, expected);
+        let generation;
+        let preparationTransactionId = '';
+        if (selector.generation === expected) {
+            generation = selector.state === 'active'
+                ? loadActiveEdgeRoutingGeneration(options).generation
+                : loadGenerationById(paths, expected);
+        } else {
+            const preparationLease = readPreparationLease(paths);
+            if (preparationLease?.mode !== 'additive'
+                || preparationLease.preparedGeneration !== expected) {
+                throw edgeError(
+                    'registered Router authority observation generation is no longer selected',
+                    'EDGE_GENERATION_RACE',
+                );
+            }
+            assertPreparedSelectorStillSelected(paths, preparationLease);
+            const prepared = loadCapturedGeneration(paths, expected);
+            if (lifecycleBindingDigest(prepared.generation)
+                !== preparationLease.lifecycleBindingDigest) {
+                throw edgeError(
+                    'registered Router authority observation preparation changed',
+                    'EDGE_PREPARATION_SOURCE_CHANGED',
+                );
+            }
+            generation = prepared.generation;
+            preparationTransactionId = preparationLease.transactionId;
+        }
         if (generation.routerHostPort !== selectedRouterHostPort()) {
             throw edgeError(
                 'registered Router authority observation generation targets a different physical Router port',
                 'EDGE_GENERATION_RUNTIME_MISMATCH',
             );
         }
-        return { selector, generation };
+        return { selector, generation, preparationTransactionId };
     };
     const initial = capture();
     const isCurrent = () => {
@@ -2677,7 +2701,9 @@ export function captureEdgeRoutingObservationLease({ expectedGeneration, ...opti
             return current.selector.state === initial.selector.state
                 && current.selector.generation === initial.selector.generation
                 && current.selector.activationId === initial.selector.activationId
-                && current.selector.selectorDigest === initial.selector.selectorDigest;
+                && current.selector.selectorDigest === initial.selector.selectorDigest
+                && current.generation.generation === initial.generation.generation
+                && current.preparationTransactionId === initial.preparationTransactionId;
         } catch (_) {
             return false;
         }
