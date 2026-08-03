@@ -1362,6 +1362,9 @@ async function startWorkspace(staticAgentArg, portArg, {
   const requestedStaticAgent = String(
     staticAgentArg || workspaceSvc.getConfig()?.static?.agent || '',
   ).trim();
+  if (!requestedStaticAgent) {
+    throw new Error('start: missing static agent or port. Usage: start <staticAgent> <port> (first time).');
+  }
   try {
     prepareDefaultBootRepositories({
       branchPolicy,

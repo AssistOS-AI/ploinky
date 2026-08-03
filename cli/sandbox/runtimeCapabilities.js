@@ -377,9 +377,11 @@ export function assertRuntimeCapabilitiesAllowed(descriptor, {
     let box = insideBox;
     if (box === undefined) box = isInsideBox(boxMarkerOptions);
     const unsupported = unsupportedDimensions(descriptor, runtimeKind);
-    if (box && descriptor.capabilities.hostNetwork) {
-        unsupported.push('host-network');
-    }
+    // Host networking is not an ordinary Box capability: the runtime boundary
+    // separately requires an exact prepared or active generation grant before
+    // it can render `--network host`.  Keep it in the immutable descriptor so
+    // that grant is bound to the admitted bytes, but do not reject it during
+    // graph admission before the generation authority exists.
     if (runtimeKind !== 'container' && descriptor.capabilities.hostNetwork !== true) {
         unsupported.push('isolated-network-host-sandbox');
     }

@@ -112,7 +112,7 @@ test('argument renderers reject a forged public-version descriptor', () => {
     );
 });
 
-test('strict Box marker rejects privileged, device, host IPC, and security-option capabilities', () => {
+test('strict Box marker rejects unsupported capabilities but defers host-network authority to the exact generation grant', () => {
     const fixture = markerFixture();
     try {
         const cases = [
@@ -120,7 +120,6 @@ test('strict Box marker rejects privileged, device, host IPC, and security-optio
             { llmRuntime: { runtimePolicy: { devices: [{ type: 'cdi', value: 'nvidia.com/gpu=all' }] } } },
             { llmRuntime: { runtimePolicy: { ipc: 'host' } } },
             { llmRuntime: { runtimePolicy: { securityOpt: ['label=disable'] } } },
-            { network: { mode: 'host' } },
         ];
         for (const manifest of cases) {
             const descriptor = resolveEffectiveRuntimeCapabilities(manifest);
@@ -131,6 +130,11 @@ test('strict Box marker rejects privileged, device, host IPC, and security-optio
                 (error) => error.code === 'PLOINKY_BOX_RUNTIME_CAPABILITY_UNSUPPORTED',
             );
         }
+        const hostNetwork = resolveEffectiveRuntimeCapabilities({ network: { mode: 'host' } });
+        assert.equal(hostNetwork.capabilities.hostNetwork, true);
+        assert.doesNotThrow(() => assertRuntimeCapabilitiesAllowed(hostNetwork, {
+            boxMarkerOptions: { markerPath: fixture.markerPath },
+        }));
     } finally {
         fs.rmSync(fixture.root, { recursive: true, force: true });
     }
