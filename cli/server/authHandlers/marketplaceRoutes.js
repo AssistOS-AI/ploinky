@@ -11,6 +11,7 @@ import { verifyAdminMutationRequest } from '../adminControlSecurity.js';
 import { computeRchHttp, sha256RawBodyHash } from '../../../Agent/lib/requestHash.mjs';
 import { verifyAgentAssertion } from '../mcp-proxy/invocationMinter.js';
 import { createTokenReplayCache } from '../security/tokens/JwsCodec.js';
+import { runMarketplaceEnableWorker } from '../marketplaceEnableWorker.js';
 import { authService, LOCAL_AUTH_COOKIE_NAME, parseCookies, sendJson, sessionTokenService, SSO_AUTH_COOKIE_NAME } from './shared.js';
 
 export const MARKETPLACE_PATH = '/api/marketplace';
@@ -27,7 +28,10 @@ const SAFE_LIFECYCLE_ERRORS = new Map([
     ['PLOINKY_RUNTIME_INPUT_CHANGED', { status: 409, message: 'The admitted runtime input changed before launch.' }],
     ['PLOINKY_BWRAP_CAPABILITY_UNAVAILABLE', { status: 422, message: 'The required Bubblewrap capability is unavailable.' }],
     ['PLOINKY_OPEN_INTERPRETER_BOX_UNAVAILABLE', { status: 422, message: 'Open Interpreter is unavailable in this Ploinky Box.' }],
+    ['PLOINKY_MARKETPLACE_ENABLE_TIMEOUT', { status: 504, message: 'Agent activation timed out.' }],
 ]);
+const marketplaceEnableFlights = new Map();
+let marketplaceEnableQueue = Promise.resolve();
 
 function parseMarketplacePath(pathname = '') {
     const parts = String(pathname || '').split('/').filter(Boolean);
@@ -169,13 +173,30 @@ function normalizeMarketplaceEnableMode(value) {
     return mode;
 }
 
+function enqueueMarketplaceEnable(agentRef, mode, runEnableWorker) {
+    const key = `${agentRef}\u0000${mode}`;
+    const existing = marketplaceEnableFlights.get(key);
+    if (existing) return existing;
+
+    const scheduled = marketplaceEnableQueue.then(() => runEnableWorker({ agentRef, mode }));
+    marketplaceEnableQueue = scheduled.catch(() => {});
+    const tracked = scheduled.finally(() => {
+        if (marketplaceEnableFlights.get(key) === tracked) marketplaceEnableFlights.delete(key);
+    });
+    marketplaceEnableFlights.set(key, tracked);
+    return tracked;
+}
+
 export async function enableMarketplaceAgent(body, {
-    enable = agentsSvc.enableAgent,
+    enable,
+    runEnableWorker = runMarketplaceEnableWorker,
 } = {}) {
     const ref = normalizeMarketplaceAgentRef(body?.agentRef);
     const mode = normalizeMarketplaceEnableMode(body?.mode || body?.enableMode);
     const repoName = ref.split('/')[0];
-    const result = await enable(ref, mode === 'isolated' ? undefined : mode, mode === 'devel' ? repoName : undefined);
+    const result = typeof enable === 'function'
+        ? await enable(ref, mode === 'isolated' ? undefined : mode, mode === 'devel' ? repoName : undefined)
+        : await enqueueMarketplaceEnable(ref, mode, runEnableWorker);
     return { ref, mode, result };
 }
 
