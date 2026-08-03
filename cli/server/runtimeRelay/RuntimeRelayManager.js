@@ -21,6 +21,17 @@ class RelayRequestStream extends EventEmitter {
         this.channel = channel;
         this.requestId = requestId;
         this.terminal = false;
+        this.failure = null;
+        this.failureDelivered = false;
+    }
+
+    on(eventName, listener) {
+        const result = super.on(eventName, listener);
+        if (eventName === 'error' && this.failure && !this.failureDelivered) {
+            this.failureDelivered = true;
+            queueMicrotask(() => this.emit('error', this.failure));
+        }
+        return result;
     }
 
     write(data) {
@@ -41,14 +52,23 @@ class RelayRequestStream extends EventEmitter {
         if (frame.type === 'DATA') this.emit('data', frame.data);
         if (frame.type === 'READY') this.emit('ready');
         if (frame.type === 'ERROR') {
-            this.terminal = true;
             const error = new Error(frame.message || 'runtime relay request failed');
             error.code = frame.code || 'RELAY_FAILURE';
-            this.emit('error', error);
+            this._fail(error);
         }
         if (frame.type === 'END') {
             this.terminal = true;
             this.emit('end', frame);
+        }
+    }
+
+    _fail(error) {
+        if (this.terminal) return;
+        this.terminal = true;
+        this.failure = error;
+        if (this.listenerCount('error')) {
+            this.failureDelivered = true;
+            this.emit('error', error);
         }
     }
 }
@@ -170,7 +190,7 @@ class RuntimeRelayChannel extends EventEmitter {
 
     _fail(error) {
         for (const stream of this.streams.values()) {
-            if (!stream.terminal) stream.emit('error', error);
+            stream._fail(error);
         }
         this.streams.clear();
         if (this.listenerCount('error')) this.emit('error', error);
