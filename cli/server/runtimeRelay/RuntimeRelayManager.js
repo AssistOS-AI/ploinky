@@ -48,6 +48,22 @@ class RelayRequestStream extends EventEmitter {
         if (!this.terminal) this.channel._write({ type: 'CANCEL', requestId: this.requestId });
     }
 
+    abandon() {
+        if (this.terminal) return;
+        try {
+            this.channel._write({ type: 'CANCEL', requestId: this.requestId });
+        } finally {
+            // The Router-side consumer is gone. Do not retain the stream until
+            // the helper acknowledges CANCEL: a concurrent managed-container
+            // restart can terminate the helper first, and forwarding that
+            // channel failure to an abandoned downstream stream would create
+            // an unhandled error.
+            this.terminal = true;
+            this.channel.streams.delete(this.requestId);
+            this.channel._scheduleIdleClose();
+        }
+    }
+
     _frame(frame) {
         if (frame.type === 'DATA') this.emit('data', frame.data);
         if (frame.type === 'READY') this.emit('ready');

@@ -65,7 +65,7 @@ export class RelayDuplex extends Duplex {
             clearTimeout(this._timeout);
             this._timeout = null;
         }
-        try { this.relayStream.cancel(); } catch (_) {}
+        try { this.relayStream.abandon(); } catch (_) {}
         callback(error);
     }
 
