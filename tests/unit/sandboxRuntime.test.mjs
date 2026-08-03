@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { BOX_MARKER_CONTENT } from '../../ploinky-box/constants.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -570,21 +571,21 @@ test('Ploinky box marker forces every manifest through nested Podman', () => {
     try {
         const binDir = makeFakeRuntimeBin(root, 'podman');
         const marker = path.join(root, 'ploinky-box');
-        fs.writeFileSync(marker, '1\n');
+        fs.writeFileSync(marker, BOX_MARKER_CONTENT);
         const script = `
             const { getSandboxStatus } = await import(${JSON.stringify(sandboxRuntimeUrl)});
             const { getRuntimeForAgent } = await import(${JSON.stringify(dockerCommonUrl)});
+            const boxOptions = { boxMarkerPath: ${JSON.stringify(marker)} };
             console.log(JSON.stringify({
-                status: getSandboxStatus(),
-                lite: getRuntimeForAgent({ 'lite-sandbox': true }),
-                legacy: getRuntimeForAgent({ runtime: 'bwrap' }),
+                status: getSandboxStatus(boxOptions.boxMarkerPath),
+                lite: getRuntimeForAgent({ 'lite-sandbox': true }, boxOptions),
+                legacy: getRuntimeForAgent({ runtime: 'bwrap' }, boxOptions),
             }));
         `;
         const result = runModuleScript({
             cwd: root,
             env: {
                 PATH: `${binDir}${path.delimiter}${process.env.PATH || ''}`,
-                PLOINKY_BOX_MARKER_PATH: marker,
             },
             script,
         });
@@ -605,15 +606,15 @@ test('Ploinky box never falls back to Docker when nested Podman is missing', () 
     try {
         const binDir = makeFakeRuntimeBin(root, 'docker');
         const marker = path.join(root, 'ploinky-box');
-        fs.writeFileSync(marker, '1\n');
+        fs.writeFileSync(marker, BOX_MARKER_CONTENT);
         const script = `
             const { getRuntime } = await import(${JSON.stringify(dockerCommonUrl)});
-            try { getRuntime(); console.log(JSON.stringify({ ok: true })); }
+            try { getRuntime(${JSON.stringify(marker)}); console.log(JSON.stringify({ ok: true })); }
             catch (error) { console.log(JSON.stringify({ ok: false, code: error.code, message: error.message })); }
         `;
         const result = runModuleScript({
             cwd: root,
-            env: { PATH: binDir, PLOINKY_BOX_MARKER_PATH: marker },
+            env: { PATH: binDir },
             script,
         });
         assert.equal(result.status, 0, result.stderr || result.stdout);

@@ -224,6 +224,14 @@ function removeExactContainerAndDescriptor(name, record, runtime, {
     });
 }
 
+function removeExactRegisteredContainer(name, record, options = {}) {
+    const runtime = options.runtime || getRuntime();
+    return removeExactContainerAndDescriptor(name, record, runtime, {
+        ...options,
+        remove: true,
+    });
+}
+
 function chunkArray(list, size = 8) {
     const chunks = [];
     if (!Array.isArray(list) || size <= 0) return chunks;
@@ -469,6 +477,7 @@ export {
     removeExactContainerAndDescriptor,
     stopAndRemove,
     stopAndRemoveMany,
+    removeExactRegisteredContainer,
     stopConfiguredAgents,
     waitForContainers
 };

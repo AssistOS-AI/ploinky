@@ -23,17 +23,17 @@ test('enable agent forwards its selected explicit profile to the service launch'
     );
 });
 
-test('enable keeps the prepared selector inactive until semantic readiness succeeds', () => {
+test('enable keeps the predecessor active until semantic readiness succeeds', () => {
     const source = enableAgent.toString();
     const prepare = source.indexOf('prepareAgentEnableBatch');
     const launch = source.indexOf('ensureAgentService');
     const readiness = source.indexOf('await waitForEnabledAgentReadiness');
-    const activation = source.indexOf("reason: 'agent-enable-runtime-finalize'");
+    const activation = source.indexOf('commitAdditiveEdgeRoutingGeneration');
     assert.ok(prepare >= 0 && launch > prepare);
     assert.ok(readiness > launch);
     assert.ok(activation > readiness);
     assert.match(source, /preparationLease:\s*prepared\.preparedGeneration\?\.preparationLease/);
-    assert.match(source, /preserveSelectedGeneration: true/);
+    assert.doesNotMatch(source, /inactivateEdgeRoutingGeneration/);
 });
 
 test('enable transition to none neither prefers nor retains the old routed host port', () => {

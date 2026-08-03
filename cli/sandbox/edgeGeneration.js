@@ -48,7 +48,7 @@ const TOPOLOGY_STATES = new Set([
     'reconciling',
     'error',
 ]);
-const EDGE_PREPARATION_LEASE_SCHEMA_VERSION = 2;
+const EDGE_PREPARATION_LEASE_SCHEMA_VERSION = 3;
 const APPLY_LOCK_CAPABILITIES = new WeakMap();
 const PREPARED_HOST_MODE_CAPABILITIES = new WeakMap();
 
@@ -1034,6 +1034,81 @@ function collectCapturedSources(paths) {
     };
 }
 
+function jsonSourceBytes(value) {
+    return Buffer.from(JSON.stringify(value, null, 2), 'utf8');
+}
+
+function candidateSourceBytes(value, file, label) {
+    if (value === undefined) return readExact(file, { label });
+    return Buffer.isBuffer(value) ? Buffer.from(value) : jsonSourceBytes(value);
+}
+
+function collectCandidateSources(paths, {
+    routing,
+    policy,
+    desired,
+    agents,
+    manifestBytes = {},
+} = {}) {
+    const routingBytes = candidateSourceBytes(routing, paths.routingFile, 'routing.json');
+    const policyBytes = candidateSourceBytes(policy, paths.policyFile, 'policy-state.json');
+    const desiredBytes = candidateSourceBytes(desired, paths.desiredFile, 'edge desired state');
+    const agentsBytes = candidateSourceBytes(agents, paths.agentsFile, 'agents.json');
+    const parsedRouting = parseJsonBytes(routingBytes, 'routing.json');
+    const parsedPolicy = parseJsonBytes(policyBytes, 'policy-state.json');
+    const parsedDesired = parseJsonBytes(desiredBytes, 'edge desired state');
+    const parsedAgents = parseJsonBytes(agentsBytes, 'agents.json');
+    const routerHostPort = selectedRouterHostPort();
+    const routerHostPortBytes = Buffer.from(String(routerHostPort), 'utf8');
+    const exactManifestBytes = {};
+    const manifests = {};
+    for (const [routeKey, route] of Object.entries(parsedRouting?.routes || {}).sort(([left], [right]) => left.localeCompare(right))) {
+        const hostPath = String(route?.hostPath || '').trim();
+        if (!hostPath) continue;
+        const supplied = manifestBytes[routeKey];
+        const bytes = supplied === undefined
+            ? readExact(path.join(hostPath, 'manifest.json'), { label: `manifest(${routeKey})` })
+            : (Buffer.isBuffer(supplied) ? Buffer.from(supplied) : Buffer.from(String(supplied), 'utf8'));
+        exactManifestBytes[routeKey] = bytes;
+        manifests[routeKey] = parseJsonBytes(bytes, `manifest(${routeKey})`);
+    }
+    const semantic = compileGeneration({
+        routing: parsedRouting,
+        policy: parsedPolicy,
+        desired: parsedDesired,
+        agents: parsedAgents,
+        manifests,
+    });
+    const parts = [
+        ['routing.json', routingBytes],
+        ['policy-state.json', policyBytes],
+        ['edge-desired.json', desiredBytes],
+        ['agents.json', agentsBytes],
+        ['router-host-port', routerHostPortBytes],
+        ...Object.entries(exactManifestBytes).sort(([left], [right]) => left.localeCompare(right))
+            .map(([routeKey, bytes]) => [`manifest:${routeKey}`, bytes]),
+    ];
+    return {
+        generation: digestParts(parts),
+        parts,
+        routing: parsedRouting,
+        policy: parsedPolicy,
+        desired: semantic.desired,
+        agents: parsedAgents,
+        manifests,
+        routerHostPort,
+        compiled: semantic.compiled,
+        bytes: {
+            routingBytes,
+            policyBytes,
+            desiredBytes,
+            agentsBytes,
+            routerHostPortBytes,
+            manifestBytes: exactManifestBytes,
+        },
+    };
+}
+
 function generationFile(paths, generation) {
     const hex = String(generation || '').replace(/^sha256:/, '');
     if (!/^[a-f0-9]{64}$/.test(hex)) throw edgeError('invalid edge generation id', 'EDGE_GENERATION_CORRUPT');
@@ -1327,24 +1402,33 @@ function selectInactiveCandidate(paths, expected, generationId, reason) {
     return deepFreeze(selector);
 }
 
-function createPreparedHostModeCapability(paths, selector, generation, owner) {
+function createPreparedHostModeCapability(paths, selector, generation, owner, preparationLease = null) {
     const token = Object.freeze({});
     PREPARED_HOST_MODE_CAPABILITIES.set(token, Object.freeze({
         paths,
         selector,
         generation: generation.generation,
         owner: Object.freeze({ ...owner }),
+        preparationLease,
     }));
     return token;
 }
 
 export function prepareHostModeCapabilityForInactiveGeneration(owner, options = {}) {
     const paths = resolveEdgeGenerationPaths(options);
+    const preparationLease = options.preparationLease
+        ? assertPreparationLeaseForApply(paths, options.preparationLease)
+        : null;
+    if (preparationLease) assertPreparedSelectorStillSelected(paths, preparationLease);
     const selector = readSelector(paths);
-    if (!selector || selector.state !== 'inactive' || !selector.generation) {
-        throw edgeError('host network launch requires one selected inactive configuration generation', 'HOST_MODE_CAPABILITY_DENIED');
+    const generationId = preparationLease?.mode === 'additive'
+        ? preparationLease.preparedGeneration
+        : selector?.generation;
+    if (!generationId
+        || (!preparationLease && selector?.state !== 'inactive')) {
+        throw edgeError('host network launch requires one selected prepared configuration generation', 'HOST_MODE_CAPABILITY_DENIED');
     }
-    const generation = loadGenerationById(paths, selector.generation);
+    const generation = loadGenerationById(paths, generationId);
     const exact = (generation.compiled?.security?.hostNetworkCapabilities || []).find((entry) => (
         entry.agentId === String(owner?.agentId || '')
         && entry.instanceId === String(owner?.instanceId || '')
@@ -1355,7 +1439,7 @@ export function prepareHostModeCapabilityForInactiveGeneration(owner, options = 
     if (!exact) {
         throw edgeError('inactive generation does not grant this exact host-network runtime owner', 'HOST_MODE_CAPABILITY_DENIED');
     }
-    return createPreparedHostModeCapability(paths, selector, generation, exact);
+    return createPreparedHostModeCapability(paths, selector, generation, exact, preparationLease);
 }
 
 function sealSelector(selector) {
@@ -1508,7 +1592,9 @@ function readPreparationLease(paths) {
         const expectedKeys = [
             'createdAt',
             'lifecycleBindingDigest',
+            'mode',
             'pid',
+            'predecessorGeneration',
             'preparedGeneration',
             'reason',
             'schemaVersion',
@@ -1523,6 +1609,9 @@ function readPreparationLease(paths) {
             || !/^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i.test(String(lease.transactionId || ''))
             || !/^sha256:[a-f0-9]{64}$/.test(String(lease.preparedGeneration || ''))
             || !/^sha256:[a-f0-9]{64}$/.test(String(lease.lifecycleBindingDigest || ''))
+            || !['replacement', 'additive'].includes(String(lease.mode || ''))
+            || (lease.mode === 'additive' && !/^sha256:[a-f0-9]{64}$/.test(String(lease.predecessorGeneration || '')))
+            || (lease.mode === 'replacement' && String(lease.predecessorGeneration || '') !== '')
             || !/^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i.test(String(lease.selectorActivationId || ''))
             || !/^sha256:[a-f0-9]{64}$/.test(String(lease.selectorDigest || ''))
             || !Number.isSafeInteger(lease.pid) || lease.pid < 1
@@ -1544,27 +1633,36 @@ function normalizePreparationLease(value) {
     const binding = String(value.lifecycleBindingDigest || '');
     const selectorActivationId = String(value.selectorActivationId || '');
     const selectorDigest = String(value.selectorDigest || '');
-    if (!transactionId || !preparedGeneration || !binding || !selectorActivationId || !selectorDigest) return null;
+    const mode = String(value.mode || '');
+    const predecessorGeneration = String(value.predecessorGeneration || '');
+    if (!transactionId || !preparedGeneration || !binding || !selectorActivationId || !selectorDigest
+        || !['replacement', 'additive'].includes(mode)
+        || (mode === 'additive' && !predecessorGeneration)
+        || (mode === 'replacement' && predecessorGeneration)) return null;
     return {
         transactionId,
         preparedGeneration,
         lifecycleBindingDigest: binding,
         selectorActivationId,
         selectorDigest,
+        mode,
+        predecessorGeneration,
     };
 }
 
-function createPreparationLease(paths, captured, reason) {
+function createPreparationLease(paths, captured, reason, { mode = 'replacement', selector: suppliedSelector } = {}) {
     if (readPreparationLease(paths)) {
         throw edgeError('another edge lifecycle preparation is already outstanding', 'EDGE_PREPARATION_BUSY');
     }
-    const selector = readSelector(paths);
-    if (selector?.state !== 'inactive'
-        || selector.generation !== captured.generation
-        || !selector.activationId
-        || !selector.selectorDigest) {
+    const selector = suppliedSelector || readSelector(paths);
+    const validSelector = mode === 'additive'
+        ? selector?.state === 'active' && Boolean(selector.generation)
+        : selector?.state === 'inactive' && selector.generation === captured.generation;
+    if (!validSelector || !selector.activationId || !selector.selectorDigest) {
         throw edgeError(
-            'edge preparation requires the exact captured generation to remain selected and inactive',
+            mode === 'additive'
+                ? 'additive edge preparation requires the exact predecessor generation to remain active'
+                : 'edge preparation requires the exact captured generation to remain selected and inactive',
             'EDGE_PREPARATION_RACE',
         );
     }
@@ -1573,6 +1671,8 @@ function createPreparationLease(paths, captured, reason) {
         transactionId: crypto.randomUUID(),
         preparedGeneration: captured.generation,
         lifecycleBindingDigest: lifecycleBindingDigest(captured),
+        mode,
+        predecessorGeneration: mode === 'additive' ? selector.generation : '',
         selectorActivationId: selector.activationId,
         selectorDigest: selector.selectorDigest,
         reason: String(reason || 'edge-generation-prepare-inactive'),
@@ -1589,6 +1689,8 @@ function createPreparationLease(paths, captured, reason) {
         lifecycleBindingDigest: document.lifecycleBindingDigest,
         selectorActivationId: document.selectorActivationId,
         selectorDigest: document.selectorDigest,
+        mode: document.mode,
+        predecessorGeneration: document.predecessorGeneration,
     });
 }
 
@@ -1608,7 +1710,9 @@ function assertPreparationLeaseForApply(paths, provided, { preparing = false } =
         || current.preparedGeneration !== normalized.preparedGeneration
         || current.lifecycleBindingDigest !== normalized.lifecycleBindingDigest
         || current.selectorActivationId !== normalized.selectorActivationId
-        || current.selectorDigest !== normalized.selectorDigest) {
+        || current.selectorDigest !== normalized.selectorDigest
+        || current.mode !== normalized.mode
+        || current.predecessorGeneration !== normalized.predecessorGeneration) {
         throw edgeError('edge lifecycle preparation is outstanding; unrelated apply is denied', 'EDGE_PREPARATION_BUSY');
     }
     return current;
@@ -1617,12 +1721,16 @@ function assertPreparationLeaseForApply(paths, provided, { preparing = false } =
 function assertPreparedSelectorStillSelected(paths, lease) {
     if (!lease) return;
     const selector = readSelector(paths);
-    if (selector?.state !== 'inactive'
-        || selector.generation !== lease.preparedGeneration
+    const expectedGeneration = lease.mode === 'additive'
+        ? lease.predecessorGeneration
+        : lease.preparedGeneration;
+    const expectedState = lease.mode === 'additive' ? 'active' : 'inactive';
+    if (selector?.state !== expectedState
+        || selector.generation !== expectedGeneration
         || selector.activationId !== lease.selectorActivationId
         || selector.selectorDigest !== lease.selectorDigest) {
         throw edgeError(
-            'edge lifecycle preparation no longer owns the exact inactive selector; restart preparation',
+            `edge lifecycle preparation no longer owns the exact ${expectedState} selector; restart preparation`,
             'EDGE_PREPARATION_STALE',
         );
     }
@@ -1656,6 +1764,42 @@ function buildGenerationDocument(captured) {
         compiledDigest: compiledDigest(captured.compiled),
         compiled: captured.compiled,
     };
+}
+
+function persistCapturedGeneration(paths, captured, options = {}) {
+    const persisted = buildGenerationDocument(captured);
+    const file = generationFile(paths, captured.generation);
+    fs.mkdirSync(paths.generationsDir, { recursive: true });
+    const output = Buffer.from(JSON.stringify(persisted, null, 2));
+    installImmutableDurable(file, output, 0o600, {
+        conflictMessage: 'immutable edge generation file already exists with different bytes',
+        conflictCode: 'EDGE_GENERATION_CORRUPT',
+        afterTempFsync: typeof options.testHooks?.afterGenerationTempFsync === 'function'
+            ? ({ file: immutableFile, tmp }) => options.testHooks.afterGenerationTempFsync({
+                paths,
+                captured,
+                file: immutableFile,
+                tmp,
+            })
+            : null,
+    });
+    return file;
+}
+
+function capturedGenerationSnapshot(captured, publicationState) {
+    return deepFreeze({
+        schemaVersion: EDGE_GENERATION_SCHEMA_VERSION,
+        generation: captured.generation,
+        publicationState,
+        sourceDigests: sourceDigests(captured),
+        routing: captured.routing,
+        policy: captured.policy,
+        desired: captured.desired,
+        agents: captured.agents,
+        manifests: captured.manifests,
+        routerHostPort: captured.routerHostPort,
+        compiled: captured.compiled,
+    });
 }
 
 function decodeGenerationSources(document) {
@@ -1775,6 +1919,32 @@ function reconstructGeneration(document, selector) {
     };
 }
 
+function loadCapturedGeneration(paths, generationId) {
+    let document;
+    try {
+        document = JSON.parse(fs.readFileSync(generationFile(paths, generationId), 'utf8'));
+    } catch (error) {
+        throw edgeError(`prepared edge routing generation is corrupt: ${error?.message || error}`, 'EDGE_GENERATION_CORRUPT');
+    }
+    const generation = reconstructGeneration(document, {
+        generation: generationId,
+        publicationState: 'error',
+    });
+    return { generation, bytes: decodeGenerationSources(document) };
+}
+
+function writeCapturedMutableSources(paths, captured) {
+    atomicWrite(paths.routingFile, captured.bytes.routingBytes, { mode: 0o600 });
+    atomicWrite(paths.policyFile, captured.bytes.policyBytes, { mode: 0o600 });
+    atomicWrite(paths.desiredFile, captured.bytes.desiredBytes, { mode: 0o600 });
+    atomicWrite(paths.agentsFile, captured.bytes.agentsBytes, { mode: 0o600 });
+}
+
+function restoreMutableSourcesFromGeneration(paths, generationId) {
+    const prepared = loadCapturedGeneration(paths, generationId);
+    writeCapturedMutableSources(paths, { bytes: prepared.bytes });
+}
+
 function selectPublicationState(compiled, requested) {
     const desired = compiled.publication;
     const state = requested === undefined ? desired.defaultState : String(requested || '').trim();
@@ -1853,7 +2023,9 @@ function writeTopologyForGeneration(paths, generation, publicationState, options
             })
             : null,
     });
-    atomicWrite(paths.topologyCurrentFile, output, { mode: 0o644 });
+    if (options.publishCurrent !== false) {
+        atomicWrite(paths.topologyCurrentFile, output, { mode: 0o644 });
+    }
     return deepFreeze(topology);
 }
 
@@ -2103,12 +2275,223 @@ export function prepareEdgeRoutingGeneration(options = {}) {
     });
 }
 
+/**
+ * Install an immutable additive candidate while leaving the exact predecessor
+ * selector and all mutable lifecycle sources untouched. The preparation lease
+ * is the only authority that can later flip this candidate active.
+ */
+export function prepareAdditiveEdgeRoutingGeneration(options = {}) {
+    const paths = resolveEdgeGenerationPaths(options);
+    if (!hasApplyLockCapability(paths, options.applyLockCapability)) {
+        throw edgeError(
+            'additive edge preparation requires the exact live apply-lock capability',
+            'EDGE_GENERATION_CAPABILITY_REQUIRED',
+        );
+    }
+    assertPreparationLeaseForApply(paths, undefined, { preparing: true });
+    const active = loadActiveEdgeRoutingGeneration(options);
+    if (options.expectedActiveGeneration !== undefined
+        && active.selector.generation !== String(options.expectedActiveGeneration || '')) {
+        throw edgeError('active predecessor changed before additive preparation', 'EDGE_GENERATION_RACE');
+    }
+    const mutable = collectCapturedSources(paths);
+    if (mutable.generation !== active.selector.generation) {
+        throw edgeError(
+            'mutable edge sources no longer match the active predecessor',
+            'EDGE_GENERATION_SOURCE_CHANGED',
+        );
+    }
+    const captured = collectCandidateSources(paths, options);
+    persistCapturedGeneration(paths, captured, options);
+    const generation = capturedGenerationSnapshot(captured, 'error');
+    const preparationLease = createPreparationLease(
+        paths,
+        captured,
+        options.reason || 'edge-generation-prepare-additive',
+        { mode: 'additive', selector: active.selector },
+    );
+    return {
+        selector: active.selector,
+        generation,
+        paths,
+        preparationLease,
+    };
+}
+
+export function assertAdditivePreparedRuntimeIdentity(preparationLease, {
+    containerName,
+    instanceId,
+    enableGeneration,
+    ...options
+} = {}) {
+    const paths = resolveEdgeGenerationPaths(options);
+    const lease = assertPreparationLeaseForApply(paths, preparationLease);
+    if (!lease || lease.mode !== 'additive') {
+        throw edgeError('prepared runtime identity requires one additive preparation lease', 'EDGE_PREPARATION_STALE');
+    }
+    assertPreparedSelectorStillSelected(paths, lease);
+    const prepared = loadCapturedGeneration(paths, lease.preparedGeneration);
+    const record = prepared.generation?.agents?.[String(containerName || '')];
+    if (!record
+        || record.type !== 'agent'
+        || String(record.instanceId || '') !== String(instanceId || '')
+        || String(record.enableGeneration || '') !== String(enableGeneration || '')) {
+        throw edgeError(
+            'additive preparation does not authorize the exact runtime identity',
+            'EDGE_PREPARATION_SOURCE_CHANGED',
+        );
+    }
+    return Object.freeze(structuredClone(record));
+}
+
+/**
+ * Commit one prepared additive candidate. Only locator/runtime-only fields may
+ * differ from preparation, so the launched runtime can supply its final port
+ * and registry metadata without changing the admitted lifecycle identity.
+ */
+export function commitAdditiveEdgeRoutingGeneration(preparationLease, options = {}) {
+    const paths = resolveEdgeGenerationPaths(options);
+    if (!hasApplyLockCapability(paths, options.applyLockCapability)) {
+        throw edgeError(
+            'additive edge commit requires the exact live apply-lock capability',
+            'EDGE_GENERATION_CAPABILITY_REQUIRED',
+        );
+    }
+    const lease = assertPreparationLeaseForApply(paths, preparationLease);
+    if (!lease || lease.mode !== 'additive') {
+        throw edgeError('additive edge commit requires one additive preparation lease', 'EDGE_PREPARATION_STALE');
+    }
+    assertPreparedSelectorStillSelected(paths, lease);
+    const prepared = loadCapturedGeneration(paths, lease.preparedGeneration);
+    const captured = collectCandidateSources(paths, {
+        routing: options.routing === undefined ? prepared.bytes.routingBytes : options.routing,
+        policy: options.policy === undefined ? prepared.bytes.policyBytes : options.policy,
+        desired: options.desired === undefined ? prepared.bytes.desiredBytes : options.desired,
+        agents: options.agents === undefined ? prepared.bytes.agentsBytes : options.agents,
+        manifestBytes: options.manifestBytes === undefined ? prepared.bytes.manifestBytes : options.manifestBytes,
+    });
+    if (lease.lifecycleBindingDigest !== lifecycleBindingDigest(captured)) {
+        const changed = lifecycleBindingChangeLabels(prepared.generation, captured);
+        const detail = changed.length
+            ? ` (changed: ${changed.slice(0, 12).join(', ')}${changed.length > 12 ? ', …' : ''})`
+            : '';
+        throw edgeError(
+            `additive edge lifecycle identity changed after preparation${detail}`,
+            'EDGE_PREPARATION_SOURCE_CHANGED',
+        );
+    }
+    const liveManifestCandidate = collectCandidateSources(paths, {
+        routing: captured.routing,
+        policy: captured.policy,
+        desired: captured.desired,
+        agents: captured.agents,
+    });
+    if (stableStringify(sourceDigests(liveManifestCandidate).manifests)
+        !== stableStringify(sourceDigests(captured).manifests)) {
+        throw edgeError(
+            'captured manifest bytes changed before additive authorization commit',
+            'EDGE_PREPARATION_SOURCE_CHANGED',
+        );
+    }
+    const predecessorSources = collectCapturedSources(paths);
+    if (predecessorSources.generation !== lease.predecessorGeneration) {
+        throw edgeError(
+            'mutable edge sources changed while the additive predecessor remained active',
+            'EDGE_GENERATION_SOURCE_CHANGED',
+        );
+    }
+
+    let selectorCommitted = false;
+    let beforeSelectorRollback = null;
+    const predecessorTopology = fs.existsSync(paths.topologyCurrentFile)
+        ? { exists: true, bytes: fs.readFileSync(paths.topologyCurrentFile) }
+        : { exists: false, bytes: null };
+    try {
+        persistCapturedGeneration(paths, captured, options);
+        writeCapturedMutableSources(paths, captured);
+        const recaptured = collectCapturedSources(paths);
+        if (recaptured.generation !== captured.generation) {
+            throw edgeError('edge routing sources changed during additive commit', 'EDGE_GENERATION_RACE');
+        }
+        const publicationState = selectPublicationState(captured.compiled, options.publicationState);
+        const generation = capturedGenerationSnapshot(captured, publicationState);
+        const selector = sealSelector({
+            schemaVersion: EDGE_GENERATION_SCHEMA_VERSION,
+            state: 'active',
+            generation: captured.generation,
+            publicationState,
+            activationId: crypto.randomUUID(),
+            activatedAt: new Date().toISOString(),
+        });
+        const topology = writeTopologyForGeneration(paths, generation, publicationState, options);
+        const beforeSelectorCommit = options.beforeSelectorCommit || options.testHooks?.beforeSelectorCommit;
+        if (typeof beforeSelectorCommit === 'function') {
+            const rollback = beforeSelectorCommit({ paths, generation, topology, selector });
+            if (rollback !== undefined && typeof rollback !== 'function') {
+                throw edgeError(
+                    'additive pre-selector commit callback returned an invalid rollback callback',
+                    'EDGE_ADDITIVE_CALLBACK_INVALID',
+                );
+            }
+            beforeSelectorRollback = rollback || null;
+        }
+        if (typeof options.testHooks?.afterBeforeSelectorCommit === 'function') {
+            options.testHooks.afterBeforeSelectorCommit({ paths, generation, topology, selector });
+        }
+        assertPreparedSelectorStillSelected(paths, lease);
+        atomicWrite(paths.activeSelectorFile, Buffer.from(JSON.stringify(selector, null, 2)), { mode: 0o600 });
+        selectorCommitted = true;
+        removePreparationLease(paths, lease);
+        return { selector: deepFreeze(selector), generation, topology, paths };
+    } catch (error) {
+        if (!selectorCommitted) {
+            const restoreErrors = [];
+            if (beforeSelectorRollback) {
+                try { beforeSelectorRollback(); } catch (restoreError) { restoreErrors.push(restoreError); }
+            }
+            try {
+                restoreMutableSourcesFromGeneration(paths, lease.predecessorGeneration);
+            } catch (restoreError) {
+                restoreErrors.push(restoreError);
+            }
+            try {
+                if (predecessorTopology.exists) {
+                    atomicWrite(paths.topologyCurrentFile, predecessorTopology.bytes, { mode: 0o644 });
+                } else {
+                    try { fs.unlinkSync(paths.topologyCurrentFile); } catch (restoreError) {
+                        if (restoreError?.code !== 'ENOENT') throw restoreError;
+                    }
+                    fsyncDirectory(path.dirname(paths.topologyCurrentFile));
+                }
+            } catch (restoreError) {
+                restoreErrors.push(restoreError);
+            }
+            if (restoreErrors.length > 0) {
+                const restoreFailure = edgeError(
+                    `additive edge predecessor restoration failed: ${restoreErrors.map((item) => item?.message || item).join('; ')}`,
+                    'EDGE_ADDITIVE_RESTORE_FAILED',
+                );
+                restoreFailure.cause = error;
+                restoreFailure.restoreCauses = Object.freeze([...restoreErrors]);
+                throw restoreFailure;
+            }
+        }
+        throw error;
+    }
+}
+
 export function abortEdgeRoutingPreparation(preparationLease, options = {}) {
     const paths = resolveEdgeGenerationPaths(options);
     const { capability: applyLockCapability, release } = acquireApplyLockCapability(paths, options);
     try {
         const current = assertPreparationLeaseForApply(paths, preparationLease);
         if (!current) throw edgeError('no edge lifecycle preparation is outstanding', 'EDGE_PREPARATION_STALE');
+        if (current.mode === 'additive') {
+            assertPreparedSelectorStillSelected(paths, current);
+            const selector = readSelector(paths);
+            removePreparationLease(paths, current);
+            return { selector: deepFreeze(selector), paths };
+        }
         const selector = inactivateEdgeRoutingGeneration(
             options.reason || 'edge-lifecycle-preparation-aborted',
             { ...options, applyLockCapability, preserveSelectedGeneration: true },
@@ -2318,13 +2701,34 @@ const ROUTER_ATTESTATION_CHECKPOINTS = Object.freeze([
 function preparedRouterAttestationSnapshot(paths, preparationLease, expectedOwner) {
     const current = assertPreparationLeaseForApply(paths, preparationLease);
     assertPreparedSelectorStillSelected(paths, current);
-    const generation = loadGenerationById(paths, current.preparedGeneration);
-    const captured = collectCapturedSources(paths);
+    const prepared = current.mode === 'additive'
+        ? loadCapturedGeneration(paths, current.preparedGeneration)
+        : null;
+    const generation = prepared?.generation
+        || loadGenerationById(paths, current.preparedGeneration);
+    const captured = prepared
+        ? { ...generation, bytes: prepared.bytes }
+        : collectCapturedSources(paths);
     if (lifecycleBindingDigest(captured) !== current.lifecycleBindingDigest) {
         throw edgeError(
             'prepared Router attestation lifecycle sources changed before its checkpoint',
             'EDGE_PREPARATION_SOURCE_CHANGED',
         );
+    }
+    if (prepared) {
+        const liveManifests = collectCandidateSources(paths, {
+            routing: prepared.bytes.routingBytes,
+            policy: prepared.bytes.policyBytes,
+            desired: prepared.bytes.desiredBytes,
+            agents: prepared.bytes.agentsBytes,
+        });
+        if (stableStringify(sourceDigests(liveManifests).manifests)
+            !== stableStringify(generation.sourceDigests.manifests)) {
+            throw edgeError(
+                'prepared Router attestation manifest bytes changed before its checkpoint',
+                'EDGE_PREPARATION_SOURCE_CHANGED',
+            );
+        }
     }
     const owner = Object.freeze({
         containerName: String(expectedOwner?.containerName || '').trim(),
@@ -2488,13 +2892,23 @@ export function assertHostModeGenerationCapability({
     }
     if (options.preparedCapability !== undefined) {
         const prepared = PREPARED_HOST_MODE_CAPABILITIES.get(options.preparedCapability);
+        let selectorCurrent = false;
+        if (prepared?.preparationLease?.mode === 'additive') {
+            try {
+                const current = assertPreparationLeaseForApply(prepared.paths, prepared.preparationLease);
+                assertPreparedSelectorStillSelected(prepared.paths, current);
+                selectorCurrent = true;
+            } catch (_) {}
+        } else if (prepared) {
+            selectorCurrent = selectorMatchesInactiveApply(prepared.paths, prepared.selector);
+        }
         const matches = prepared
             && prepared.owner.agentId === requestedOwner.agentId
             && prepared.owner.instanceId === requestedOwner.instanceId
             && prepared.owner.enableGeneration === requestedOwner.enableGeneration
             && prepared.owner.routeKey === requestedOwner.routeKey
             && prepared.owner.containerName === requestedOwner.containerName
-            && selectorMatchesInactiveApply(prepared.paths, prepared.selector);
+            && selectorCurrent;
         if (!matches) {
             throw edgeError('host network mode requires an exact prepared-generation capability', 'HOST_MODE_CAPABILITY_DENIED');
         }
@@ -2535,6 +2949,7 @@ export function defaultEdgeDesiredStateBytes() {
 export default {
     abortEdgeRoutingPreparation,
     applyEdgeRoutingGeneration,
+    commitAdditiveEdgeRoutingGeneration,
     captureEdgeRoutingLease,
     captureEdgeRoutingObservationLease,
     createRouterAttestationGenerationLease,
@@ -2547,6 +2962,7 @@ export default {
     captureEdgeRoutingCandidateGeneration,
     loadActiveEdgeRoutingGeneration,
     readEdgeRoutingSelection,
+    prepareAdditiveEdgeRoutingGeneration,
     prepareEdgeRoutingGeneration,
     prepareHostModeCapabilityForInactiveGeneration,
     readCurrentEdgeTopology,

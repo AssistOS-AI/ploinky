@@ -17,6 +17,12 @@ import { isDeepStrictEqual } from 'node:util';
 import * as dockerSvc from '../sandbox/docker/index.js';
 import { RUNNING_DIR } from '../utils/config.js';
 import { resolveManifestRuntimeProfile } from '../utils/runtime/profileService.js';
+import { getRuntimeForAgent, isSandboxRuntime } from '../sandbox/docker/common.js';
+import { resolveLlmRuntimeAdmissionContext } from '../sandbox/docker/llmRuntimeIntegration.js';
+import {
+    admitManifestRuntimeCapabilities,
+    assertRuntimeAdmissionCurrent,
+} from '../sandbox/runtimeCapabilities.js';
 import { resolveRouterEndpoint } from '../sandbox/routerPort.js';
 import { mergeRoutingConfig, mergeRuntimeRoute } from '../server/routingFile.js';
 import { resolveAgentReadinessProtocol } from '../utils/runtime/startupReadiness.js';
@@ -729,6 +735,46 @@ async function main() {
         process.exit(2);
     }
 
+    // Detached workers write status immediately so predecessor workers can
+    // sequence behind them. Admission therefore has to precede even that
+    // first status write, not merely the eventual physical start boundary.
+    const admittedManifestBytes = fs.readFileSync(manifestPath);
+    const admittedManifest = JSON.parse(admittedManifestBytes.toString('utf8'));
+    const admittedProfileResolution = resolveManifestRuntimeProfile(admittedManifest, {
+        agentName: `${repoName}/${shortAgent}`,
+        profileName: profileName || undefined,
+        path: `manifest(${repoName}/${shortAgent})`,
+    });
+    const admittedRuntime = getRuntimeForAgent(admittedManifest);
+    const admittedRuntimeKind = isSandboxRuntime(admittedRuntime) ? admittedRuntime : 'container';
+    const llmAdmissionContext = admittedRuntimeKind === 'container'
+        ? resolveLlmRuntimeAdmissionContext({
+            runtime: admittedRuntime,
+            manifest: admittedManifest,
+            profileConfig: admittedProfileResolution.profileConfig,
+            agentName: shortAgent,
+            alias,
+            env: process.env,
+        })
+        : { catalogPolicy: null, catalogIdentity: null };
+    const runtimeAdmission = admitManifestRuntimeCapabilities(admittedManifest, {
+        manifestBytes: admittedManifestBytes,
+        manifestPath,
+        agentId: `${repoName}/${shortAgent}`,
+        profileName: admittedProfileResolution.resolvedProfileName,
+        profileConfig: admittedProfileResolution.profileConfig,
+        network: admittedProfileResolution.network,
+        runtime: admittedRuntime,
+        runtimeKind: admittedRuntimeKind,
+        catalogPolicy: llmAdmissionContext.catalogPolicy,
+        catalogIdentity: llmAdmissionContext.catalogIdentity,
+    });
+    assertRuntimeAdmissionCurrent(runtimeAdmission, {
+        manifestBytes: fs.readFileSync(manifestPath),
+        profileName: admittedProfileResolution.resolvedProfileName,
+        runtimeKind: admittedRuntimeKind,
+    });
+
     const startedAtMs = Date.now();
     const startedAt = new Date(startedAtMs).toISOString();
     let baseStatus = {
@@ -795,6 +841,18 @@ async function main() {
             agentName: `${repoName}/${shortAgent}`,
             profileName: activeProfile || profileName || undefined,
             path: `manifest(${repoName}/${shortAgent})`,
+        });
+        if (!isDeepStrictEqual(manifest, admittedManifest)
+            || profileResolution.resolvedProfileName !== admittedProfileResolution.resolvedProfileName) {
+            const changed = new Error(`no-wait runtime input changed before launch for '${routeKey}'`);
+            changed.code = 'PLOINKY_RUNTIME_INPUT_CHANGED';
+            changed.status = 409;
+            throw changed;
+        }
+        assertRuntimeAdmissionCurrent(runtimeAdmission, {
+            manifestBytes: fs.readFileSync(manifestPath),
+            profileName: profileResolution.resolvedProfileName,
+            runtimeKind: admittedRuntimeKind,
         });
         const routerEndpoint = resolveRouterEndpoint(profileResolution.network.mode, {
             explicitPort: lifecycle.routerPort || undefined,

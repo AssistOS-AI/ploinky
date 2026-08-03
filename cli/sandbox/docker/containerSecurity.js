@@ -1,26 +1,24 @@
-function isPlainObject(value) {
-    return value !== null && typeof value === 'object' && !Array.isArray(value);
-}
-
-function readContainerSecurityBlock(source) {
-    if (!isPlainObject(source)) return null;
-    const security = source.containerSecurity;
-    if (!isPlainObject(security)) return null;
-    return security;
-}
+import {
+    admitManifestRuntimeCapabilities,
+    renderContainerSecurityArgs,
+    resolveEffectiveRuntimeCapabilities,
+    validateManifestRuntimeCapabilities,
+} from '../runtimeCapabilities.js';
 
 export function resolveContainerSecurity(manifest, profileConfig) {
-    const profileSecurity = readContainerSecurityBlock(profileConfig);
-    const rootSecurity = readContainerSecurityBlock(manifest);
-    const source = profileSecurity || rootSecurity || {};
-    return {
-        privileged: source.privileged === true,
-    };
+    validateManifestRuntimeCapabilities(manifest);
+    if (profileConfig && Object.prototype.hasOwnProperty.call(profileConfig, 'containerSecurity')) {
+        const synthetic = { ...manifest, profiles: { selected: profileConfig } };
+        validateManifestRuntimeCapabilities(synthetic);
+    }
+    return resolveEffectiveRuntimeCapabilities(manifest, { profileConfig }).containerSecurity;
 }
 
 export function buildContainerSecurityArgs(containerSecurity) {
-    if (!containerSecurity || containerSecurity.privileged !== true) {
-        return [];
-    }
-    return ['--privileged'];
+    const manifest = { containerSecurity };
+    const admission = admitManifestRuntimeCapabilities(manifest, {
+        manifestBytes: Buffer.from(JSON.stringify(manifest), 'utf8'),
+        insideBox: false,
+    });
+    return renderContainerSecurityArgs(admission.descriptor);
 }

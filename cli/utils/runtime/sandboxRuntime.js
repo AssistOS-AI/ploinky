@@ -50,8 +50,8 @@ function isHostSandboxDisabled() {
     return getSandboxConfig().disableHostRuntimes;
 }
 
-function getSandboxStatus() {
-    if (isForcedBoxSandboxPolicy()) {
+function getSandboxStatus(boxMarkerPath) {
+    if (isForcedBoxSandboxPolicy(boxMarkerPath)) {
         return {
             disabled: true,
             forced: true,
@@ -71,7 +71,7 @@ function getSandboxStatus() {
     };
 }
 
-function isForcedBoxSandboxPolicy(markerPath = process.env.PLOINKY_BOX_MARKER_PATH || BOX_MARKER_PATH) {
+function isForcedBoxSandboxPolicy(markerPath = BOX_MARKER_PATH) {
     try {
         return fs.statSync(markerPath).isFile();
     } catch (_) {

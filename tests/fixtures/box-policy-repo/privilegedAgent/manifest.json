@@ -1,0 +1,9 @@
+{
+  "container": "docker.io/library/node:20-alpine",
+  "containerSecurity": {
+    "privileged": true
+  },
+  "network": {
+    "mode": "default"
+  }
+}

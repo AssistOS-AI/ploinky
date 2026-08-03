@@ -54,6 +54,27 @@ test('encrypted password store round-trips and enforces the master key', async (
     assert.match(encryptedText, /^[A-Za-z0-9+/]+={0,2}\n?$/);
     assert.doesNotMatch(encryptedText, /alice|alice@example\.com|scrypt\$secret-hash|PLOINKY_AUTH_ALPHA_USERS/);
 
+    const rollback = store.setUsersPayloadBatchTransactional([{
+        usersVar: 'PLOINKY_AUTH_ALPHA_USERS',
+        payload: {
+            version: 1,
+            users: [{
+                id: 'local:bob',
+                username: 'bob',
+                name: 'Bob',
+                email: null,
+                passwordHash: 'scrypt$candidate-hash',
+                roles: ['local'],
+                rev: 1,
+            }],
+        },
+    }]);
+    assert.equal(store.getUsersPayload('PLOINKY_AUTH_ALPHA_USERS').users[0].username, 'bob');
+    rollback();
+    assert.deepEqual(readFileSync(store.PASSWORD_STORE_FILE), Buffer.from(encryptedText));
+    assert.equal(store.getUsersPayload('PLOINKY_AUTH_ALPHA_USERS').users[0].username, 'alice');
+    assert.throws(rollback, /already consumed/);
+
     // process.env wins over .env: the file was encrypted with ENV_KEY (set in
     // process.env above), so removing process.env should leave only FILE_KEY
     // available from the on-disk .env, which can no longer decrypt.

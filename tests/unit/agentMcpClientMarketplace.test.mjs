@@ -75,3 +75,56 @@ test('AgentMcpClient signs Marketplace reads and leaves enable mode caller-contr
         mode: 'global',
     });
 });
+
+test('AgentMcpClient preserves safe Marketplace lifecycle code, status, and cause', async () => {
+    const originalCwd = process.cwd();
+    const originalEnvironment = { ...process.env };
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-agent-marketplace-error-'));
+    process.chdir(tempDir);
+    process.env.PLOINKY_MASTER_KEY = 'e'.repeat(64);
+    process.env.PLOINKY_AGENT_ID = 'agent:repo/caller';
+    process.env.PLOINKY_AGENT_SECRET = 'caller-secret';
+
+    const { installGeneratedRouterRuntime } = await import('../helpers/generatedRouterRuntime.mjs');
+    const { createAgentClient } = await import(`../../Agent/client/AgentMcpClient.mjs?error=${Date.now()}`);
+    let requests = 0;
+    const server = http.createServer((req, res) => {
+        requests += 1;
+        req.resume();
+        req.on('end', () => {
+            res.writeHead(requests === 1 ? 200 : 422, { 'content-type': 'application/json' });
+            res.end(JSON.stringify(requests === 1 ? {
+                ok: true,
+                marketplace: { agents: [{ ref: 'repo/worker', name: 'worker', running: false }] },
+            } : {
+                ok: false,
+                error: 'PLOINKY_BOX_RUNTIME_CAPABILITY_UNSUPPORTED',
+                message: 'The requested runtime capability is unavailable in Ploinky Box.',
+                cause: { code: 'PLOINKY_MANIFEST_SECURITY_INVALID' },
+            }));
+        });
+    });
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+    try {
+        installGeneratedRouterRuntime({
+            origin: `http://127.0.0.1:${server.address().port}`,
+            tempDir,
+            agentPrincipal: 'agent:repo/caller',
+        });
+        const client = await createAgentClient('worker');
+        await assert.rejects(
+            () => client.ensureAgentRunning('repo/worker'),
+            (error) => error.code === 'PLOINKY_BOX_RUNTIME_CAPABILITY_UNSUPPORTED'
+                && error.status === 422
+                && error.cause?.code === 'PLOINKY_MANIFEST_SECURITY_INVALID',
+        );
+    } finally {
+        await new Promise((resolve) => server.close(resolve));
+        process.chdir(originalCwd);
+        fs.rmSync(tempDir, { recursive: true, force: true });
+        for (const name of Object.keys(process.env)) {
+            if (!Object.prototype.hasOwnProperty.call(originalEnvironment, name)) delete process.env[name];
+        }
+        Object.assign(process.env, originalEnvironment);
+    }
+});

@@ -71,10 +71,10 @@ test('one-shot start without initial configuration exits nonzero', (t) => {
     const result = runPloinky(t, ['start']);
 
     assert.notEqual(result.status, 0);
-    assert.match(`${result.stdout}\n${result.stderr}`, /persisted router port is required/);
+    assert.match(`${result.stdout}\n${result.stderr}`, /missing static agent or port/);
 });
 
-test('first core command initializes the complete edge source set together', (t) => {
+test('read-only core commands do not initialize authoritative edge sources', (t) => {
     const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-cli-fresh-sources-'));
     for (const repoName of bootRepos) {
         fs.mkdirSync(path.join(workspace, '.ploinky', 'repos', repoName), { recursive: true });
@@ -93,18 +93,10 @@ test('first core command initializes the complete edge source set together', (t)
 
     assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
     const ploinky = path.join(workspace, '.ploinky');
-    assert.deepEqual(JSON.parse(fs.readFileSync(path.join(ploinky, 'agents.json'), 'utf8')), {});
-    assert.deepEqual(JSON.parse(fs.readFileSync(path.join(ploinky, 'routing.json'), 'utf8')), { routes: {} });
-    assert.deepEqual(JSON.parse(fs.readFileSync(
-        path.join(ploinky, 'data', 'router-security', 'policy-state.json'),
-        'utf8',
-    )), { schema: 'router-policy', httpRoutes: [], mcpTools: [] });
-    assert.deepEqual(JSON.parse(fs.readFileSync(
-        path.join(ploinky, 'data', 'edge-routing', 'desired.json'),
-        'utf8',
-    )), {
-        hosts: {},
-    });
+    assert.equal(fs.existsSync(path.join(ploinky, 'agents.json')), false);
+    assert.equal(fs.existsSync(path.join(ploinky, 'routing.json')), false);
+    assert.equal(fs.existsSync(path.join(ploinky, 'data', 'router-security', 'policy-state.json')), false);
+    assert.equal(fs.existsSync(path.join(ploinky, 'data', 'edge-routing', 'desired.json')), false);
 });
 
 test('removed component-token rotation flags fail hard', (t) => {

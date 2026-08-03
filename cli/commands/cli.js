@@ -16,6 +16,7 @@ import {
     waitForManifestReadiness,
     activatePreparedRuntimeAfterReadiness,
     cleanupFailedPreparedRuntime,
+    admitDirectAgentRuntimeManifest,
 } from './workspaceUtil.js';
 import { withMaintenanceLock } from '../utils/runtime/maintenanceLocks.js';
 import { printComponentAccess } from '../server/utils/routerEnv.js';
@@ -498,8 +499,10 @@ async function handleCommand(args) {
 
                 // Read manifest and determine runtime
                 let manifest;
+                let manifestBytes;
                 try {
-                    manifest = JSON.parse(fs.readFileSync(resolved.manifestPath, 'utf8'));
+                    manifestBytes = fs.readFileSync(resolved.manifestPath);
+                    manifest = JSON.parse(manifestBytes.toString('utf8'));
                 } catch (err) {
                     console.error(`Failed to read manifest for '${agentName}': ${err?.message || err}`);
                     return;
@@ -509,6 +512,12 @@ async function handleCommand(args) {
                     agentName: `${registryRecord?.record?.repoName || resolved.repo}/${resolved.shortAgentName}`,
                     profileName: registryRecord?.record?.profile || undefined,
                     path: `manifest(${registryRecord?.record?.repoName || resolved.repo}/${resolved.shortAgentName})`,
+                });
+                const directAdmission = admitDirectAgentRuntimeManifest(manifest, {
+                    manifestPath: resolved.manifestPath,
+                    manifestBytes,
+                    agentId: `${registryRecord?.record?.repoName || resolved.repo}/${resolved.shortAgentName}`,
+                    profileName: profileResolution.resolvedProfileName,
                 });
                 const routerEndpoint = resolveRouterEndpoint(profileResolution.network.mode);
 
@@ -547,6 +556,7 @@ async function handleCommand(args) {
                                     profileName: profileResolution.resolvedProfileName,
                                     profileResolution,
                                     routerEndpoint,
+                                    runtimeAdmission: directAdmission.runtimeAdmission,
                                     networkLifecycleCapability,
                                 });
                                 try {
@@ -598,6 +608,7 @@ async function handleCommand(args) {
                                 profileName: profileResolution.resolvedProfileName,
                                 profileResolution,
                                 routerEndpoint,
+                                runtimeAdmission: directAdmission.runtimeAdmission,
                                 networkLifecycleCapability,
                             });
                             const {
@@ -663,6 +674,7 @@ async function handleCommand(args) {
                                     profileName: profileResolution.resolvedProfileName,
                                     profileResolution,
                                     routerEndpoint,
+                                    runtimeAdmission: directAdmission.runtimeAdmission,
                                     networkLifecycleCapability,
                                 });
                                 try {

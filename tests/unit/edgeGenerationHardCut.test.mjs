@@ -6,15 +6,19 @@ import path from 'node:path';
 import test from 'node:test';
 
 import {
+    abortEdgeRoutingPreparation,
     applyEdgeRoutingGeneration,
     assertActiveEdgeRoutingSourcesCurrent,
     captureEdgeRoutingLifecycleMutationGeneration,
     captureEdgeRoutingObservationLease,
+    commitAdditiveEdgeRoutingGeneration,
     createRouterAttestationGenerationLease,
     initializeFreshEdgeRoutingSources,
     loadActiveEdgeRoutingGeneration,
+    prepareAdditiveEdgeRoutingGeneration,
     prepareEdgeRoutingGeneration,
     readCurrentEdgeTopology,
+    withEdgeGenerationApplyLock,
 } from '../../cli/sandbox/edgeGeneration.js';
 import { resolveEdgeRoutePlan } from '../../cli/server/edgeRoutePlan.js';
 
@@ -143,6 +147,91 @@ test('active topology publishes routes and readiness without service locators or
     assert.deepEqual(readCurrentEdgeTopology({
         workspaceRoot: fixture.workspace,
     }), applied.topology);
+});
+
+test('additive preparation and failed commit preserve the exact active predecessor', (t) => {
+    const fixture = createFixture(t);
+    const predecessor = applyEdgeRoutingGeneration({
+        workspaceRoot: fixture.workspace,
+        reason: 'additive-predecessor',
+    });
+    const selectorBefore = fs.readFileSync(predecessor.paths.activeSelectorFile);
+    const routingBefore = fs.readFileSync(predecessor.paths.routingFile);
+    const topologyBefore = fs.readFileSync(predecessor.paths.topologyCurrentFile);
+    const candidateRouting = structuredClone(predecessor.generation.routing);
+    candidateRouting.routes.alpha.hostPort = 45101;
+    let prepared;
+    withEdgeGenerationApplyLock((applyLockCapability) => {
+        prepared = prepareAdditiveEdgeRoutingGeneration({
+            workspaceRoot: fixture.workspace,
+            routing: candidateRouting,
+            applyLockCapability,
+            reason: 'additive-runtime-candidate',
+        });
+    }, { workspaceRoot: fixture.workspace });
+
+    assert.deepEqual(fs.readFileSync(predecessor.paths.activeSelectorFile), selectorBefore);
+    assert.deepEqual(fs.readFileSync(predecessor.paths.routingFile), routingBefore);
+    assert.equal(prepared.preparationLease.predecessorGeneration, predecessor.selector.generation);
+
+    let callbackState = 'predecessor';
+    assert.throws(() => withEdgeGenerationApplyLock((applyLockCapability) => (
+        commitAdditiveEdgeRoutingGeneration(prepared.preparationLease, {
+            workspaceRoot: fixture.workspace,
+            routing: candidateRouting,
+            applyLockCapability,
+            beforeSelectorCommit() {
+                callbackState = 'candidate';
+                return () => { callbackState = 'predecessor'; };
+            },
+            testHooks: {
+                afterBeforeSelectorCommit() { throw new Error('readiness revoked'); },
+            },
+        })
+    ), {
+        workspaceRoot: fixture.workspace,
+        preparationLease: prepared.preparationLease,
+    }), /readiness revoked/);
+    assert.deepEqual(fs.readFileSync(predecessor.paths.activeSelectorFile), selectorBefore);
+    assert.deepEqual(fs.readFileSync(predecessor.paths.routingFile), routingBefore);
+    assert.deepEqual(fs.readFileSync(predecessor.paths.topologyCurrentFile), topologyBefore);
+    assert.equal(callbackState, 'predecessor');
+    assert.equal(loadActiveEdgeRoutingGeneration({ workspaceRoot: fixture.workspace }).selector.generation,
+        predecessor.selector.generation);
+    abortEdgeRoutingPreparation(prepared.preparationLease, { workspaceRoot: fixture.workspace });
+});
+
+test('additive commit rejects manifest byte drift without changing active routing', (t) => {
+    const fixture = createFixture(t);
+    const predecessor = applyEdgeRoutingGeneration({
+        workspaceRoot: fixture.workspace,
+        reason: 'manifest-drift-predecessor',
+    });
+    const selectorBefore = fs.readFileSync(predecessor.paths.activeSelectorFile);
+    const routingBefore = fs.readFileSync(predecessor.paths.routingFile);
+    let prepared;
+    withEdgeGenerationApplyLock((applyLockCapability) => {
+        prepared = prepareAdditiveEdgeRoutingGeneration({
+            workspaceRoot: fixture.workspace,
+            routing: predecessor.generation.routing,
+            agents: predecessor.generation.agents,
+            applyLockCapability,
+        });
+    }, { workspaceRoot: fixture.workspace });
+    fs.appendFileSync(path.join(fixture.alphaDir, 'manifest.json'), '\n');
+
+    assert.throws(() => withEdgeGenerationApplyLock((applyLockCapability) => (
+        commitAdditiveEdgeRoutingGeneration(prepared.preparationLease, {
+            workspaceRoot: fixture.workspace,
+            applyLockCapability,
+        })
+    ), {
+        workspaceRoot: fixture.workspace,
+        preparationLease: prepared.preparationLease,
+    }), { code: 'EDGE_PREPARATION_SOURCE_CHANGED' });
+    assert.deepEqual(fs.readFileSync(predecessor.paths.activeSelectorFile), selectorBefore);
+    assert.deepEqual(fs.readFileSync(predecessor.paths.routingFile), routingBefore);
+    abortEdgeRoutingPreparation(prepared.preparationLease, { workspaceRoot: fixture.workspace });
 });
 
 test('generation compiles convention access solely from HTTP route policy', (t) => {
@@ -759,6 +848,46 @@ test('prepared Router attestation remains inactive and binds exact lease, owner,
         () => loadActiveEdgeRoutingGeneration({ workspaceRoot: fixture.workspace }),
         { code: 'EDGE_GENERATION_INACTIVE' },
     );
+});
+
+test('additive Router attestation checkpoints use the immutable candidate bytes', (t) => {
+    const fixture = createFixture(t);
+    const predecessor = applyEdgeRoutingGeneration({
+        workspaceRoot: fixture.workspace,
+        reason: 'additive-attestation-predecessor',
+    });
+    const candidateRouting = structuredClone(predecessor.generation.routing);
+    candidateRouting.routes.alpha.hostPort = 45103;
+    let prepared;
+    withEdgeGenerationApplyLock((applyLockCapability) => {
+        prepared = prepareAdditiveEdgeRoutingGeneration({
+            workspaceRoot: fixture.workspace,
+            routing: candidateRouting,
+            agents: predecessor.generation.agents,
+            applyLockCapability,
+            reason: 'additive-attestation-candidate',
+        });
+    }, { workspaceRoot: fixture.workspace });
+
+    const lease = createRouterAttestationGenerationLease({
+        workspaceRoot: fixture.workspace,
+        preparationLease: prepared.preparationLease,
+        expectedOwner: {
+            containerName: 'alpha-container',
+            principal: 'agent:fixtures/alpha',
+            instanceId: 'alpha-instance',
+            enableGeneration: 'alpha-enable-generation',
+        },
+    });
+    assert.equal(lease.id, prepared.generation.generation);
+    assert.equal(lease.commit(), true);
+    assert.equal(lease.checkpoint('pre-credentials'), true);
+    assert.equal(lease.checkpoint('pre-runtime'), true);
+    assert.equal(lease.checkpoint('post-inspection'), true);
+    assert.equal(lease.complete, true);
+    assert.equal(loadActiveEdgeRoutingGeneration({ workspaceRoot: fixture.workspace }).selector.generation,
+        predecessor.selector.generation);
+    abortEdgeRoutingPreparation(prepared.preparationLease, { workspaceRoot: fixture.workspace });
 });
 
 test('later startup waves retain the prepared attestation across runtime-only locator updates', (t) => {

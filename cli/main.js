@@ -4,7 +4,6 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import {
     HISTORY_FILE,
-    PLOINKY_WORKSPACE_ROOT,
     initEnvironment,
     logPloinkyDirectory,
     setDebugMode,
@@ -17,10 +16,17 @@ import { runReplCommand } from './sandbox/replCommandRunner.js';
 import { bootstrap } from './commands/ploinkyboot.js';
 import { enableMultilineNavigation } from './commands/multilineNavigation.js';
 import { getPredefinedRepos, parseStartArgs } from './utils/repos.js';
-import { initializeFreshEdgeRoutingSources } from './sandbox/edgeGeneration.js';
 
 const COMMANDS = getCommandRegistry();
 const PLOINKY_ROOT = process.env.PLOINKY_ROOT || path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+
+function commandOwnsRuntimeAdmission(args) {
+    const command = String(args?.[0] || '').trim().toLowerCase();
+    if (['start', 'restart', 'reinstall', 'cli', 'shell'].includes(command)) return true;
+    if (command !== 'enable') return false;
+    const targetKind = String(args?.[1] || '').trim().toLowerCase();
+    return !['repo', 'repository', 'sandbox', 'host-sandbox', 'lite-sandbox'].includes(targetKind);
+}
 
 function assertRuntimeDependencies() {
     const missing = ['achillesAgentLib', 'mcp-sdk'].filter((dep) => {
@@ -419,8 +425,8 @@ export async function runCoreCli(args = []) {
     }
 
     debugLog('Raw arguments:', args);
-    initEnvironment();
-    initializeFreshEdgeRoutingSources({ workspaceRoot: PLOINKY_WORKSPACE_ROOT });
+    const runtimeAdmissionOwned = commandOwnsRuntimeAdmission(args);
+    if (!runtimeAdmissionOwned) initEnvironment();
     let startParsed;
     let branchPolicy;
     if (args.length && args[0] === 'start') {
@@ -429,10 +435,12 @@ export async function runCoreCli(args = []) {
             branchPolicy = startParsed.branchPolicy;
         } catch (_) {}
     }
-    try {
-        bootstrap({ branchPolicy, staticAgent: startParsed?.staticAgent });
-    } catch (error) {
-        if (branchPolicy?.fallback === 'fail') throw error;
+    if (!runtimeAdmissionOwned) {
+        try {
+            bootstrap({ branchPolicy, staticAgent: startParsed?.staticAgent });
+        } catch (error) {
+            if (branchPolicy?.fallback === 'fail') throw error;
+        }
     }
 
     if (args.length === 0) return startInteractiveMode();

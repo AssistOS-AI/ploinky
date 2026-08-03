@@ -137,6 +137,70 @@ function setUsersPayload(usersVar, payload = {}) {
     return store.usersByVar[key];
 }
 
+/**
+ * Atomically publish a set of local-auth payloads and return an exact-byte
+ * rollback callback for transactions whose authorization selector has not yet
+ * committed. The rollback is intentionally file-scoped: encrypted envelopes
+ * use random IVs, so rebuilding the same logical store would not restore the
+ * exact predecessor bytes.
+ */
+function setUsersPayloadBatchTransactional(updates = []) {
+    if (!Array.isArray(updates)) {
+        throw new Error('setUsersPayloadBatchTransactional requires an array.');
+    }
+    if (updates.length === 0) {
+        let rollbackAvailable = true;
+        return () => {
+            if (!rollbackAvailable) {
+                throw new Error('password store transaction rollback was already consumed.');
+            }
+            rollbackAvailable = false;
+        };
+    }
+    const passwordStoreFile = resolvePasswordStoreFile();
+    const existed = fs.existsSync(passwordStoreFile);
+    const predecessorBytes = existed ? fs.readFileSync(passwordStoreFile) : null;
+    const store = readPasswordStore();
+    for (const update of updates) {
+        const key = String(update?.usersVar || '').trim();
+        if (!key) {
+            throw new Error('setUsersPayloadBatchTransactional requires usersVar.');
+        }
+        const payload = update?.payload || {};
+        store.usersByVar[key] = {
+            version: Number(payload?.version) || 1,
+            users: Array.isArray(payload?.users) ? payload.users : [],
+        };
+    }
+    writePasswordStore(store);
+
+    let rollbackAvailable = true;
+    return () => {
+        if (!rollbackAvailable) {
+            throw new Error('password store transaction rollback was already consumed.');
+        }
+        rollbackAvailable = false;
+        if (!existed) {
+            try {
+                fs.unlinkSync(passwordStoreFile);
+            } catch (error) {
+                if (error?.code !== 'ENOENT') throw error;
+            }
+            return;
+        }
+        fs.mkdirSync(path.dirname(passwordStoreFile), { recursive: true });
+        const tempPath = `${passwordStoreFile}.${process.pid}.${Date.now()}.rollback.tmp`;
+        try {
+            fs.writeFileSync(tempPath, predecessorBytes, { mode: 0o600 });
+            fs.renameSync(tempPath, passwordStoreFile);
+            try { fs.chmodSync(passwordStoreFile, 0o600); } catch (_) {}
+        } catch (error) {
+            try { fs.unlinkSync(tempPath); } catch (_) {}
+            throw error;
+        }
+    };
+}
+
 function deleteUsersPayload(usersVar) {
     const key = String(usersVar || '').trim();
     if (!key) return false;
@@ -157,5 +221,6 @@ export {
     readPasswordStore,
     resolveMasterKey,
     setUsersPayload,
+    setUsersPayloadBatchTransactional,
     writePasswordStore,
 };

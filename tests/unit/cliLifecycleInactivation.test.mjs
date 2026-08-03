@@ -42,13 +42,25 @@ test('whole-workspace and Router lifecycle commands inactivate edge authorizatio
     ]);
 });
 
-test('start persists the fixed Router port only inside the inactive workspace transaction', () => {
+test('start admits prepared repositories before persisting the fixed Router port in the inactive transaction', () => {
     assert.doesNotMatch(cliSource, /resolveAndPersistStartRouterPort/);
+    const startWorkspaceSource = workspaceSource.slice(
+        workspaceSource.indexOf('async function startWorkspace('),
+        workspaceSource.indexOf('\nasync function stopWorkspace(', workspaceSource.indexOf('async function startWorkspace(')),
+    );
+    assert.ok(
+        startWorkspaceSource.indexOf('preflightWorkspaceStartRuntimeCapabilities')
+            > startWorkspaceSource.indexOf('prepareManifestRepositories'),
+        'fresh dependency repositories must be acquired before complete-graph admission',
+    );
     assertOrdered(workspaceSource, [
+        'prepareManifestRepositories',
+        'const admittedStart = preflightWorkspaceStartRuntimeCapabilities',
+        'createWorkspaceStartLock()',
+        'assertWorkspaceGraphAdmissionsCurrent(admittedStart.admissions)',
         "inactivateEdgeRoutingGeneration('workspace-start-prepare'",
         'resolveAndPersistStartRouterPort(staticAgentArg, portArg, {',
         'coordinate: false',
-        'prepareManifestRepositories',
         'ensureGraphNodesEnabled(dependencyGraph, reg, {',
         'executeHostHook(hookValue, hookEnv',
         'applyStartupConfigProvidersForGraph({',

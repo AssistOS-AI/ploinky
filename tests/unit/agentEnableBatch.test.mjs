@@ -64,8 +64,10 @@ test('one batch stages a non-host dependency and exact host owner before either 
     ], { reason: 'test-complete-graph-prelaunch' });
 
     assert.equal(prepared.plans.length, 2);
-    const registry = JSON.parse(fs.readFileSync(initialized.paths.agentsFile, 'utf8'));
-    const routingState = JSON.parse(fs.readFileSync(initialized.paths.routingFile, 'utf8'));
+    const predecessorRegistry = JSON.parse(fs.readFileSync(initialized.paths.agentsFile, 'utf8'));
+    const predecessorRouting = JSON.parse(fs.readFileSync(initialized.paths.routingFile, 'utf8'));
+    const registry = prepared.preparedGeneration.generation.agents;
+    const routingState = prepared.preparedGeneration.generation.routing;
     const nonHostPlan = prepared.plans.find((plan) => plan.shortAgentName === 'nonHostDependency');
     const hostPlan = prepared.plans.find((plan) => plan.shortAgentName === 'livekit');
     assert.ok(nonHostPlan);
@@ -75,11 +77,13 @@ test('one batch stages a non-host dependency and exact host owner before either 
         assert.equal(Object.hasOwn(routingState.routes[plan.routeKey], 'serviceTargets'), false);
         assert.equal(registry[plan.containerName].instanceId, plan.instanceId);
         assert.equal(registry[plan.containerName].enableGeneration, plan.enableGeneration);
+        assert.equal(Object.hasOwn(predecessorRegistry, plan.containerName), false);
+        assert.equal(Object.hasOwn(predecessorRouting.routes, plan.routeKey), false);
     }
 
-    // Prelaunch compilation is immutable but inactive. The exact host owner
-    // receives only a selector-bound capability for process creation; normal
-    // route authorization cannot activate until readiness succeeds.
+    // Prelaunch compilation is immutable while the predecessor remains active.
+    // The exact host owner receives only a lease-bound capability for process
+    // creation; normal route authorization cannot activate until readiness.
     assert.equal(manager.assertPreparedRegistryRecordPreservation(
         registry[nonHostPlan.containerName],
         {
@@ -105,11 +109,9 @@ test('one batch stages a non-host dependency and exact host owner before either 
     }, { preparedCapability: hostPlan.preparedHostModeCapability }), { code: 'HOST_MODE_CAPABILITY_DENIED' });
 
     const selector = JSON.parse(fs.readFileSync(initialized.paths.activeSelectorFile, 'utf8'));
-    assert.equal(selector.state, 'inactive');
-    assert.throws(
-        () => edge.loadActiveEdgeRoutingGeneration({ workspaceRoot: workspace }),
-        { code: 'EDGE_GENERATION_INACTIVE' },
-    );
+    assert.equal(selector.state, 'active');
+    assert.equal(selector.generation, prepared.preparedGeneration.preparationLease.predecessorGeneration);
+    assert.doesNotThrow(() => edge.loadActiveEdgeRoutingGeneration({ workspaceRoot: workspace }));
     assert.deepEqual(prepared.preparedGeneration.generation.compiled.security.hostNetworkCapabilities, [{
         agentId: 'agent:media/livekit',
         instanceId: hostPlan.instanceId,
@@ -118,8 +120,14 @@ test('one batch stages a non-host dependency and exact host owner before either 
         containerName: hostPlan.containerName,
     }]);
 
-    coordinated.applyEdgeRoutingGeneration({
-        reason: 'test-complete-graph-ready',
+    edge.withEdgeGenerationApplyLock((applyLockCapability) => edge.commitAdditiveEdgeRoutingGeneration(
+        prepared.preparedGeneration.preparationLease,
+        {
+            routing: routingState,
+            agents: registry,
+            applyLockCapability,
+        },
+    ), {
         preparationLease: prepared.preparedGeneration.preparationLease,
     });
     assert.doesNotThrow(() => edge.assertHostModeGenerationCapability({
@@ -150,6 +158,7 @@ test('a configured static agent stages the workspace root as its immutable proje
         },
     };
     fs.writeFileSync(initialized.paths.agentsFile, JSON.stringify(registry, null, 2));
+    coordinated.applyEdgeRoutingGeneration({ reason: 'test-static-config-baseline' });
 
     const prepared = agents.prepareAgentEnableBatch([
         { agentName: 'demo/staticRoot' },
@@ -173,8 +182,10 @@ test('a configured static agent stages the workspace root as its immutable proje
             enabled: true,
         }],
     );
-    coordinated.applyEdgeRoutingGeneration({
-        reason: 'test-static-workspace-root-ready',
+    edge.withEdgeGenerationApplyLock((applyLockCapability) => edge.commitAdditiveEdgeRoutingGeneration(
+        prepared.preparedGeneration.preparationLease,
+        { applyLockCapability },
+    ), {
         preparationLease: prepared.preparedGeneration.preparationLease,
     });
 });
@@ -217,4 +228,21 @@ test('a later batch validation failure cannot mutate credentials consumed by the
         fs.readFileSync(edge.resolveEdgeGenerationPaths({ workspaceRoot: workspace }).activeSelectorFile, 'utf8'),
         selectorBefore,
     );
+});
+
+test('same-name re-enable uses fail-closed replacement instead of an additive shadow', () => {
+    const prepared = agents.prepareAgentEnableBatch([
+        { agentName: 'demo/nonHostDependency', mode: 'global' },
+    ], { reason: 'test-same-name-replacement' });
+
+    assert.equal(prepared.availabilityMode, 'replacement');
+    assert.equal(prepared.preparedGeneration.preparationLease.mode, 'replacement');
+    assert.equal(prepared.preparedGeneration.selector.state, 'inactive');
+    assert.throws(
+        () => edge.loadActiveEdgeRoutingGeneration({ workspaceRoot: workspace }),
+        { code: 'EDGE_GENERATION_INACTIVE' },
+    );
+    edge.abortEdgeRoutingPreparation(prepared.preparedGeneration.preparationLease, {
+        reason: 'test-same-name-replacement-complete',
+    });
 });

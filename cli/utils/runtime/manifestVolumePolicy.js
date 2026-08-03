@@ -2,6 +2,8 @@ import fs from 'fs';
 import path from 'path';
 
 import { PLOINKY_WORKSPACE_ROOT } from '../config.js';
+import { isInsideBox } from '../../../ploinky-box/lib/boxMarker.mjs';
+import { isManagedManifestVolumeSource } from '../../sandbox/runtimeCapabilities.js';
 
 export function readManifestVolumeOptions(manifest) {
     return manifest?.volumeOptions && typeof manifest.volumeOptions === 'object'
@@ -10,6 +12,12 @@ export function readManifestVolumeOptions(manifest) {
 }
 
 export function resolveManifestVolumeHostPath(hostPath, workspaceRoot = PLOINKY_WORKSPACE_ROOT) {
+    if (isInsideBox() && !isManagedManifestVolumeSource(String(hostPath), { workspaceRoot })) {
+        const error = new Error(`manifest volume source '${hostPath}' is outside the managed Ploinky workspace`);
+        error.code = 'PLOINKY_BOX_RUNTIME_CAPABILITY_UNSUPPORTED';
+        error.status = 422;
+        throw error;
+    }
     return path.isAbsolute(hostPath)
         ? path.resolve(hostPath)
         : path.resolve(workspaceRoot, hostPath);

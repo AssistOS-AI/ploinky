@@ -89,6 +89,10 @@ import {
     pruneStaleRuntimeEntries,
     runtimeSegment
 } from '../../utils/runtime/runtimeStaging.js';
+import {
+    admitManifestRuntimeCapabilities,
+    assertRuntimeAdmissionCurrent,
+} from '../runtimeCapabilities.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -98,6 +102,38 @@ const BWRAP_RUNTIME_ROOT = path.join(DEPS_DIR, 'bwrap-runtime');
 const BWRAP_NODE_RUNTIME_PATH = '/opt/ploinky-node';
 
 const BWRAP_PATH = '/usr/bin/bwrap';
+
+function admitBwrapBoundary(agentName, manifest, agentPath, options, profileResolution) {
+    const repoName = path.basename(path.dirname(agentPath));
+    const optionBag = options && typeof options === 'object' ? options : {};
+    const manifestPath = path.join(agentPath, 'manifest.json');
+    const manifestBytes = optionBag.manifestBytes !== undefined
+        ? Buffer.from(optionBag.manifestBytes)
+        : (fs.existsSync(manifestPath)
+            ? fs.readFileSync(manifestPath)
+            : Buffer.from(JSON.stringify(manifest), 'utf8'));
+    const admission = admitManifestRuntimeCapabilities(manifest, {
+        manifestBytes,
+        manifestPath,
+        agentId: `${repoName}/${agentName}`,
+        profileName: profileResolution.resolvedProfileName,
+        profileConfig: profileResolution.profileConfig,
+        network: profileResolution.network,
+        runtimeKind: 'bwrap',
+    });
+    if (optionBag.runtimeAdmission) {
+        assertRuntimeAdmissionCurrent(optionBag.runtimeAdmission, {
+            manifestBytes,
+            profileName: profileResolution.resolvedProfileName,
+            runtimeKind: 'bwrap',
+            descriptor: admission.descriptor,
+        });
+    }
+    return Object.freeze({
+        admission: optionBag.runtimeAdmission || admission,
+        manifestBytes,
+    });
+}
 
 function resolveBwrapRuntimeProfile(agentName, manifest, agentPath, options = {}, existingRecord = {}) {
     const repoName = path.basename(path.dirname(agentPath));
@@ -619,24 +655,25 @@ function startBwrapProcess(agentName, manifest, agentPath, options = {}) {
     const alias = options.alias || existingRecord.alias;
     const instanceName = alias || agentName;
     const runtimeIdentity = normalizeSandboxRuntimeIdentity(options);
-    assertBwrapPidSlotAvailable(containerName);
     const cwd = getConfiguredProjectPath(agentName, repoName, alias);
     const isolatedHome = (existingRecord.runMode || 'isolated') === 'isolated';
     const agentHomeDir = getAgentWorkDir(instanceName);
     const cwdMountTarget = isolatedHome ? '/root' : cwd;
     const workspacePath = isolatedHome ? '/root' : cwd;
-    const sharedDir = ensureSharedHostDir();
 
     // Profile and network are resolved atomically before any sandbox work.
     const profileRecord = existingRecord;
     const profileResolution = resolveBwrapRuntimeProfile(agentName, manifest, agentPath, options, profileRecord);
     const activeProfile = profileResolution.resolvedProfileName;
     const profileConfig = profileResolution.profileConfig;
+    admitBwrapBoundary(agentName, manifest, agentPath, options, profileResolution);
+    assertBwrapPidSlotAvailable(containerName);
     const routerEndpoint = resolveSandboxRouterEndpoint(options, profileResolution.network.mode);
 
     assertManifestEnvProfileCompleteness(manifest, profileConfig, { agentName, repoName, profileName: activeProfile });
     const envHash = computeEnvHash(manifest, profileConfig, routerEndpoint.env, { agentName, repoName });
     const { codeReadOnly, skillsReadOnly } = getProfileMountModes(activeProfile, profileConfig || {});
+    const sharedDir = ensureSharedHostDir();
 
     // Resolve paths
     const agentCodePath = resolveSymlinkPath(getAgentCodePath(agentName));
@@ -905,6 +942,13 @@ function ensureBwrapService(agentName, manifest, agentPath, options = {}) {
     }, existingRecord);
     const activeProfile = profileResolution.resolvedProfileName;
     const profileConfig = profileResolution.profileConfig;
+    const runtimeBoundary = admitBwrapBoundary(
+        agentName,
+        manifest,
+        agentPath,
+        options,
+        profileResolution,
+    );
     const routerEndpoint = resolveSandboxRouterEndpoint(options, profileResolution.network.mode);
 
     assertManifestEnvProfileCompleteness(manifest, profileConfig, { agentName, repoName, profileName: activeProfile });
@@ -963,6 +1007,8 @@ function ensureBwrapService(agentName, manifest, agentPath, options = {}) {
         instanceId: runtimeIdentity.instanceId,
         enableGeneration: runtimeIdentity.enableGeneration,
         preservePreparedRegistryRecord: options.preservePreparedRegistryRecord,
+        runtimeAdmission: runtimeBoundary.admission,
+        manifestBytes: runtimeBoundary.manifestBytes,
     });
 }
 

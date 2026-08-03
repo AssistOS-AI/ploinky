@@ -15,7 +15,6 @@ test('container security emits only the allowlisted privileged flag', () => {
     const manifest = {
         containerSecurity: {
             privileged: true,
-            raw: ['--cap-add=SYS_ADMIN'],
         },
     };
 
@@ -23,10 +22,29 @@ test('container security emits only the allowlisted privileged flag', () => {
     assert.deepEqual(buildContainerSecurityArgs(resolveContainerSecurity(manifest, null)), ['--privileged']);
 });
 
-test('profile container security overrides root security', () => {
+test('profile container security is rejected instead of diverging from root rendering', () => {
     const manifest = { containerSecurity: { privileged: true } };
     const profile = { containerSecurity: { privileged: false } };
 
-    assert.deepEqual(resolveContainerSecurity(manifest, profile), { privileged: false });
-    assert.deepEqual(buildContainerSecurityArgs(resolveContainerSecurity(manifest, profile)), []);
+    assert.throws(
+        () => resolveContainerSecurity(manifest, profile),
+        (error) => error.code === 'PLOINKY_MANIFEST_SECURITY_PROFILE_UNSUPPORTED',
+    );
+});
+
+test('container security rejects malformed and unknown root fields', () => {
+    for (const containerSecurity of [null, [], 'true', 1]) {
+        assert.throws(
+            () => resolveContainerSecurity({ containerSecurity }, null),
+            (error) => error.code === 'PLOINKY_MANIFEST_SECURITY_INVALID',
+        );
+    }
+    assert.throws(
+        () => resolveContainerSecurity({ containerSecurity: { privileged: 'true' } }, null),
+        (error) => error.code === 'PLOINKY_MANIFEST_SECURITY_INVALID',
+    );
+    assert.throws(
+        () => resolveContainerSecurity({ containerSecurity: { rawArgs: ['--privileged'] } }, null),
+        (error) => error.code === 'PLOINKY_MANIFEST_SECURITY_INVALID',
+    );
 });

@@ -19,6 +19,16 @@ export const MARKETPLACE_READ_TOOL = 'marketplace.read';
 export const MARKETPLACE_ENABLE_TOOL = 'marketplace.enable_agent';
 const marketplaceAssertionReplayCache = createTokenReplayCache({ maxSize: 4096 });
 
+const SAFE_LIFECYCLE_ERRORS = new Map([
+    ['PLOINKY_BOX_RUNTIME_CAPABILITY_UNSUPPORTED', { status: 422, message: 'The requested runtime capability is unavailable in Ploinky Box.' }],
+    ['PLOINKY_MANIFEST_SECURITY_INVALID', { status: 422, message: 'The agent manifest contains invalid runtime security settings.' }],
+    ['PLOINKY_MANIFEST_SECURITY_PROFILE_UNSUPPORTED', { status: 422, message: 'Runtime security settings are only supported at the manifest root.' }],
+    ['PLOINKY_BOX_MARKER_INVALID', { status: 409, message: 'The Ploinky Box identity marker is invalid.' }],
+    ['PLOINKY_RUNTIME_INPUT_CHANGED', { status: 409, message: 'The admitted runtime input changed before launch.' }],
+    ['PLOINKY_BWRAP_CAPABILITY_UNAVAILABLE', { status: 422, message: 'The required Bubblewrap capability is unavailable.' }],
+    ['PLOINKY_OPEN_INTERPRETER_BOX_UNAVAILABLE', { status: 422, message: 'Open Interpreter is unavailable in this Ploinky Box.' }],
+]);
+
 function parseMarketplacePath(pathname = '') {
     const parts = String(pathname || '').split('/').filter(Boolean);
     if (parts.length < 2 || parts[0] !== 'api' || parts[1] !== 'marketplace') {
@@ -30,12 +40,28 @@ function parseMarketplacePath(pathname = '') {
     };
 }
 
-function sendMarketplaceError(res, status, code, message = '') {
+function sendMarketplaceError(res, status, code, message = '', details = {}) {
     sendJson(res, status, {
         ok: false,
         error: code,
-        ...(message ? { message } : {})
+        ...(message ? { message } : {}),
+        ...(details.cause ? { cause: details.cause } : {}),
     });
+}
+
+function safeLifecycleCause(error) {
+    const code = String(error?.cause?.code || '');
+    return SAFE_LIFECYCLE_ERRORS.has(code) ? { code } : null;
+}
+
+function sendLifecycleError(res, error) {
+    const code = String(error?.code || '');
+    const contract = SAFE_LIFECYCLE_ERRORS.get(code);
+    if (!contract) return false;
+    sendMarketplaceError(res, contract.status, code, contract.message, {
+        cause: safeLifecycleCause(error),
+    });
+    return true;
 }
 
 function readAuthorizationBearer(req) {
@@ -440,6 +466,7 @@ export async function handleMarketplaceRoutes(req, res, parsedUrl, {
             sendMarketplaceError(res, 400, 'unknown_action', 'Unsupported marketplace action.');
             return true;
         } catch (error) {
+            if (sendLifecycleError(res, error)) return true;
             sendMarketplaceError(res, 400, 'marketplace_action_failed', error?.message || 'Marketplace action failed.');
             return true;
         }
@@ -454,5 +481,6 @@ export async function handleMarketplaceRoutes(req, res, parsedUrl, {
 export const __testables = {
     buildMarketplaceState,
     readAuthorizationBearer,
+    sendLifecycleError,
     verifyMarketplaceAgentRequest,
 };

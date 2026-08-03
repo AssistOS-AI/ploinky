@@ -1,8 +1,9 @@
 import { execSync, spawnSync } from 'child_process';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { isDeepStrictEqual } from 'node:util';
 import {
     assertManifestEnvProfileCompleteness,
     buildEnvMap,
@@ -53,13 +54,18 @@ import {
     syncAgentMcpConfig
 } from './common.js';
 import { clearLivenessState, runContainerScriptReadiness } from './healthProbes.js';
-import { stopAndRemove } from './containerFleet.js';
+import { removeExactRegisteredContainer, stopAndRemove } from './containerFleet.js';
 import {
     TARGETED_DRAIN_ACKNOWLEDGEMENT,
     drainAndRemoveTargetedContainer,
     drainTargetedContainer,
 } from './targetedContainerLifecycle.js';
-import { buildContainerSecurityArgs, resolveContainerSecurity } from './containerSecurity.js';
+import {
+    admitManifestRuntimeCapabilities,
+    assertRuntimeAdmissionCurrent,
+    renderContainerSecurityArgs,
+    renderRuntimePolicyArgs,
+} from '../runtimeCapabilities.js';
 import { DEFAULT_AGENT_ENTRY, launchAgentSidecar, readManifestAgentCommand, readManifestStartCommand, splitCommandArgs } from './agentCommands.js';
 import { AGENTS_DATA_DIR, PLOINKY_DIR, PLOINKY_WORKSPACE_ROOT } from '../../utils/config.js';
 import {
@@ -106,6 +112,7 @@ import {
 import {
     isLlmRuntimeManifest,
     prepareLlmStartup,
+    resolveLlmRuntimeAdmissionContext,
 } from './llmRuntimeIntegration.js';
 import {
     assertHostSandboxNetworkCompatibility,
@@ -127,6 +134,7 @@ import {
 } from '../routerPort.js';
 import {
     abortEdgeRoutingPreparation,
+    assertAdditivePreparedRuntimeIdentity,
     assertHostModeGenerationCapability,
     createRouterAttestationGenerationLease,
     edgeRuntimeEnvironment,
@@ -144,11 +152,116 @@ import {
     runContainerAuthorityProbe,
 } from '../routerAuthorityAttestation.js';
 import { isInsideBox } from '../../../ploinky-box/lib/boxMarker.mjs';
+import {
+    assertCandidateLifecycleTransition,
+    isCandidateCleanupReceiptDocument,
+    RUNTIME_CLEANUP_RECEIPT_VERSION,
+} from '../runtimeCleanupReceipt.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const AGENT_LIB_PATH = path.resolve(__dirname, '../../../Agent');
 const LLM_RUNTIME_SHARED_PATH = path.join(PLOINKY_WORKSPACE_ROOT, 'llm-runtime', 'shared');
+const AUTHORIZED_CLEANUP_RECEIPTS = new WeakMap();
+const CONSUMED_CLEANUP_RECEIPTS = new WeakSet();
+
+function freezeCleanupReceipt(value) {
+    if (!value || typeof value !== 'object' || Object.isFrozen(value)) return value;
+    for (const child of Object.values(value)) freezeCleanupReceipt(child);
+    return Object.freeze(value);
+}
+
+function invalidCleanupReceipt(message) {
+    const error = new Error(message);
+    error.code = 'PLOINKY_RUNTIME_CLEANUP_RECEIPT_INVALID';
+    return error;
+}
+
+// Receipt minting remains inside the lifecycle owner. No exported helper can
+// authorize cleanup by constructing a field-identical object.
+function issueCandidateCleanupReceipt(document) {
+    const receipt = freezeCleanupReceipt({
+        version: RUNTIME_CLEANUP_RECEIPT_VERSION,
+        scope: 'candidate',
+        ...document,
+    });
+    if (!isCandidateCleanupReceiptDocument(receipt)) {
+        throw invalidCleanupReceipt('candidate cleanup lifecycle produced an invalid receipt');
+    }
+    AUTHORIZED_CLEANUP_RECEIPTS.set(receipt, Object.freeze({ operationId: receipt.operationId }));
+    return receipt;
+}
+
+function beginCandidateLifecycle({
+    runtimeKind,
+    candidateName,
+    contractHash,
+    runtimeIdentity,
+    predecessorId = '',
+} = {}) {
+    return issueCandidateCleanupReceipt({
+        operationId: randomUUID(),
+        runtimeKind,
+        phase: 'resolve',
+        creationAttempted: false,
+        candidateName,
+        contractHash,
+        runtimeIdentity: structuredClone(runtimeIdentity || {}),
+        state: 'not-created-proven',
+        ...(predecessorId ? { predecessorId } : {}),
+        inspectionComplete: false,
+        ownershipProof: {},
+    });
+}
+
+function assertCandidateCleanupReceipt(receipt, expected = {}) {
+    if (!receipt || !AUTHORIZED_CLEANUP_RECEIPTS.has(receipt)
+        || CONSUMED_CLEANUP_RECEIPTS.has(receipt)
+        || !isCandidateCleanupReceiptDocument(receipt)) {
+        throw invalidCleanupReceipt('candidate cleanup requires one live internally-issued phase receipt');
+    }
+    for (const field of ['runtimeKind', 'candidateName', 'candidateId', 'contractHash']) {
+        if (expected[field] !== undefined
+            && String(receipt[field] || '') !== String(expected[field] || '')) {
+            throw invalidCleanupReceipt(`candidate cleanup receipt ${field} does not match the exact runtime candidate`);
+        }
+    }
+    if (expected.runtimeIdentity) {
+        for (const [field, value] of Object.entries(expected.runtimeIdentity)) {
+            if (String(receipt.runtimeIdentity?.[field] || '') !== String(value || '')) {
+                throw invalidCleanupReceipt(`candidate cleanup receipt runtimeIdentity.${field} does not match the exact runtime candidate`);
+            }
+        }
+    }
+    return receipt;
+}
+
+function advanceCandidateLifecycle(receipt, changes = {}) {
+    assertCandidateCleanupReceipt(receipt);
+    const nextDocument = {
+        ...receipt,
+        ...changes,
+        version: RUNTIME_CLEANUP_RECEIPT_VERSION,
+        operationId: receipt.operationId,
+        runtimeKind: receipt.runtimeKind,
+        scope: 'candidate',
+        candidateName: receipt.candidateName,
+        contractHash: receipt.contractHash,
+        runtimeIdentity: structuredClone(receipt.runtimeIdentity),
+        ownershipProof: structuredClone(changes.ownershipProof ?? receipt.ownershipProof),
+    };
+    const candidate = freezeCleanupReceipt(nextDocument);
+    assertCandidateLifecycleTransition(receipt, candidate);
+    CONSUMED_CLEANUP_RECEIPTS.add(receipt);
+    AUTHORIZED_CLEANUP_RECEIPTS.set(candidate, Object.freeze({ operationId: candidate.operationId }));
+    return candidate;
+}
+
+function consumeCandidateCleanupReceipt(receipt, expected = {}) {
+    const validated = assertCandidateCleanupReceipt(receipt, expected);
+    CONSUMED_CLEANUP_RECEIPTS.add(receipt);
+    return validated;
+}
 
 function attachRestartCandidate(error, candidate) {
     const failure = error && typeof error === 'object'
@@ -164,6 +277,16 @@ function attachRestartCandidate(error, candidate) {
         value: Object.freeze({ ...prior, ...candidate }),
     });
     return failure;
+}
+
+function runtimeCandidateContractHash(admission, runtimeIdentity, network, runtimeKind) {
+    const bytes = Buffer.from(JSON.stringify({
+        admission: admission?.descriptor || null,
+        runtimeIdentity,
+        network,
+        runtimeKind,
+    }));
+    return `sha256:${createHash('sha256').update(bytes).digest('hex')}`;
 }
 function resolveLlmRuntimeSharedPath(agentPath) {
     // Prefer the shared runtime that ships inside the agent's own repo so
@@ -688,39 +811,24 @@ function appendEnvFlagsFromMap(envFlags, envMap) {
     }
 }
 
-function isMissingContainerRemoval(stderr) {
-    return /no such container|no container with name|does not exist|not found/i.test(String(stderr || ''));
-}
-
-function describeRuntimeFailure(result) {
-    if (result?.error) return result.error.message;
-    const stderr = String(result?.stderr || '').trim();
-    return stderr || `exit code ${result?.status}`;
-}
-
-function removeContainerForRecreate(runtime, containerName, label) {
-    spawnSync(runtime, ['stop', containerName], { stdio: 'ignore' });
-    const rmResult = spawnSync(runtime, ['rm', '-f', containerName], {
-        stdio: ['ignore', 'ignore', 'pipe'],
-        encoding: 'utf8'
-    });
-    const rmFailed = Boolean(rmResult.error) || rmResult.status !== 0;
-    const rmStderr = String(rmResult.stderr || '').trim();
-    if (rmFailed && !isMissingContainerRemoval(rmStderr)) {
-        throw new Error(
-            `[${label}] container '${containerName}' could not be removed by ${runtime} rm -f. `
-            + 'Refusing to recreate because the existing container may still hold staged bind mounts. '
-            + describeRuntimeFailure(rmResult)
+function removeContainerForRecreate(runtime, containerName, label, record = null) {
+    if (!containerExists(containerName)) return { removed: false, state: 'absent' };
+    const exactRecord = record || loadAgentsMap()[containerName];
+    try {
+        const result = removeExactRegisteredContainer(containerName, exactRecord, { runtime });
+        if (result?.removed !== true) {
+            throw new Error(`exact predecessor removal returned '${result?.state || 'unknown'}'`);
+        }
+        clearLivenessState(containerName);
+        return result;
+    } catch (cause) {
+        const error = new Error(
+            `[${label}] preserved container '${containerName}' because exact immutable ownership/removal was not proven`,
+            { cause },
         );
+        error.code = 'PLOINKY_RUNTIME_OWNERSHIP_AMBIGUOUS';
+        throw error;
     }
-    if (containerExists(containerName)) {
-        throw new Error(
-            `[${label}] container '${containerName}' still exists after ${runtime} rm -f. `
-            + 'Refusing to recreate; investigate the runtime before retrying.'
-            + (rmStderr ? ` Last rm error: ${rmStderr}` : '')
-        );
-    }
-    clearLivenessState(containerName);
 }
 
 function normalizeTargetedRestart(value) {
@@ -747,7 +855,7 @@ function normalizeTargetedRestart(value) {
 
 export function removeAgentContainerForRecreate(containerName, label = 'executionModeChanged') {
     const runtime = getRuntime();
-    removeContainerForRecreate(runtime, containerName, label);
+    return removeContainerForRecreate(runtime, containerName, label);
 }
 
 function buildPersistentAgentRunArgs({
@@ -885,40 +993,98 @@ function hasExactManagedEnv(record, expectedEnv) {
 }
 
 function startAgentContainer(agentName, manifest, agentPath, options = {}) {
-    const runtime = getRuntime();
     const repoName = path.basename(path.dirname(agentPath));
     const containerName = options.containerName || getAgentContainerName(agentName, repoName);
     const agentSnapshot = loadAgentsMap();
     const existingRecord = agentSnapshot[containerName] || {};
+    const preservePreparedRegistryRecord = assertPreparedRegistryRecordPreservation(
+        existingRecord,
+        options,
+        { ownerRef: `${repoName}/${agentName}` },
+    );
+    const launchRecord = preservePreparedRegistryRecord
+        ? (options.preparedRegistryRecord || existingRecord)
+        : existingRecord;
     const runtimeIdentity = options.runtimeIdentity;
     if (!runtimeIdentity?.instanceId || !runtimeIdentity?.enableGeneration) {
         throw new Error(`startAgentContainer(${agentName}) requires an exact instanceId and enableGeneration`);
     }
-    const instanceName = options.alias || existingRecord.alias || agentName;
-    const { raw: explicitAgentCmd } = readManifestAgentCommand(manifest);
-    const startCmd = readManifestStartCommand(manifest);
-    const useStartEntry = Boolean(startCmd);
-    const launchExplicitSidecar = Boolean(startCmd && explicitAgentCmd);
-    const cwd = getConfiguredProjectPath(agentName, path.basename(path.dirname(agentPath)), options.alias);
-    const isolatedHome = (existingRecord.runMode || 'isolated') === 'isolated';
-    const agentHomeDir = getAgentWorkDir(instanceName);
-    const containerCwd = isolatedHome ? '/root' : cwd;
-    const cwdMountTarget = isolatedHome ? '/root' : cwd;
-    const sharedDir = ensureSharedHostDir();
-    const llmRuntimeSharedPath = resolveLlmRuntimeSharedPath(agentPath);
-
     // Resolve profile and network as one selection. Explicit CLI and persisted
     // profile names fail closed; only a missing global profile falls back to
     // this manifest's default profile.
     const profileResolution = options.profileResolution || resolveManifestRuntimeProfile(manifest, {
         agentName: `${repoName}/${agentName}`,
         profileName: options.profileName,
-        persistedProfileName: existingRecord.profile,
+        persistedProfileName: launchRecord.profile,
         path: `manifest(${repoName}/${agentName})`,
     });
     const activeProfile = profileResolution.resolvedProfileName;
     const profileConfig = profileResolution.profileConfig;
     const manifestNetwork = profileResolution.network;
+    const manifestPath = path.join(agentPath, 'manifest.json');
+    const exactManifestBytes = fs.existsSync(manifestPath)
+        ? fs.readFileSync(manifestPath)
+        : Buffer.from(JSON.stringify(manifest || {}));
+    const exactManifest = JSON.parse(exactManifestBytes.toString('utf8'));
+    if (!isDeepStrictEqual(exactManifest, manifest)) {
+        const error = new Error(`startAgentContainer(${agentName}) manifest bytes changed before physical admission`);
+        error.code = 'PLOINKY_RUNTIME_INPUT_CHANGED';
+        error.status = 409;
+        throw error;
+    }
+    // The backend executable is resolved only after generic policy admission;
+    // runtime-specific argument rendering is then compiled from the same bytes.
+    admitManifestRuntimeCapabilities(manifest, {
+        manifestBytes: exactManifestBytes,
+        manifestPath,
+        agentId: `${repoName}/${agentName}`,
+        profileName: activeProfile,
+        profileConfig,
+        network: manifestNetwork,
+        runtimeKind: 'container',
+    });
+    const runtime = getRuntime();
+    const llmAdmissionContext = resolveLlmRuntimeAdmissionContext({
+        runtime,
+        manifest,
+        profileConfig,
+        agentName,
+        alias: options.alias,
+        env: process.env,
+    });
+    const runtimeAdmission = admitManifestRuntimeCapabilities(manifest, {
+        manifestBytes: exactManifestBytes,
+        manifestPath,
+        agentId: `${repoName}/${agentName}`,
+        profileName: activeProfile,
+        profileConfig,
+        network: manifestNetwork,
+        runtime,
+        runtimeKind: 'container',
+        catalogPolicy: llmAdmissionContext.catalogPolicy,
+        catalogIdentity: llmAdmissionContext.catalogIdentity,
+    });
+    if (options.runtimeAdmission) {
+        assertRuntimeAdmissionCurrent(options.runtimeAdmission, {
+            manifestBytes: exactManifestBytes,
+            profileName: activeProfile,
+            runtimeKind: 'container',
+            descriptor: runtimeAdmission.descriptor,
+        });
+    }
+    const instanceName = options.alias || launchRecord.alias || agentName;
+    const { raw: explicitAgentCmd } = readManifestAgentCommand(manifest);
+    const startCmd = readManifestStartCommand(manifest);
+    const useStartEntry = Boolean(startCmd);
+    const launchExplicitSidecar = Boolean(startCmd && explicitAgentCmd);
+    const cwd = preservePreparedRegistryRecord && launchRecord.projectPath
+        ? launchRecord.projectPath
+        : getConfiguredProjectPath(agentName, path.basename(path.dirname(agentPath)), options.alias);
+    const isolatedHome = (launchRecord.runMode || 'isolated') === 'isolated';
+    const agentHomeDir = getAgentWorkDir(instanceName);
+    const containerCwd = isolatedHome ? '/root' : cwd;
+    const cwdMountTarget = isolatedHome ? '/root' : cwd;
+    const llmRuntimeSharedPath = resolveLlmRuntimeSharedPath(agentPath);
     assertNetworkStartupCompatibility(manifest, profileConfig, manifestNetwork, {
         path: `manifest(${repoName}/${agentName})`,
     });
@@ -935,6 +1101,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
             containerName,
         }, { preparedCapability: options.preparedHostModeCapability });
     }
+    const sharedDir = ensureSharedHostDir();
     // Ensure workspace structure exists and run preinstall [HOST] before any
     // image-dependent work. Hooks may build local images or seed vars that image
     // resolution and dependency-cache probes consume.
@@ -987,6 +1154,9 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
             ],
             envHash,
             effectiveNetwork: effectiveNetworkForLlm,
+            resolvedSelection: llmAdmissionContext.startup?.selection,
+            resolvedHardware: llmAdmissionContext.startup?.hardware,
+            admittedRuntimePolicy: runtimeAdmission.descriptor.runtimePolicy,
         });
         if (llmStartup.enabled && llmStartup.imageRef) {
             image = llmStartup.imageRef;
@@ -1171,9 +1341,13 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         args.push('-v', `${agentSkillsPath}:/code/skills${skillsMountMode}`);
     }
     const useHostNetwork = runtimeNetworkPlan.useHostNetwork;
-    const containerSecurityArgs = buildContainerSecurityArgs(resolveContainerSecurity(manifest, profileConfig));
+    const containerSecurityArgs = renderContainerSecurityArgs(runtimeAdmission.descriptor);
     if (containerSecurityArgs.length) {
         args.splice(1, 0, ...containerSecurityArgs);
+    }
+    const runtimePolicyArgs = renderRuntimePolicyArgs(runtimeAdmission.descriptor, { runtime });
+    if (runtimePolicyArgs.length) {
+        args.splice(1, 0, ...runtimePolicyArgs);
     }
 
     // LLM runtime: emit catalog-derived runtime policy args (platform, devices,
@@ -1181,9 +1355,6 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     // image digest, reuse hash). These go BEFORE the image so they apply to
     // `run`. Non-LLM agents are untouched.
     if (llmStartup.enabled) {
-        if (Array.isArray(llmStartup.runArgs) && llmStartup.runArgs.length) {
-            args.splice(1, 0, ...llmStartup.runArgs);
-        }
         for (const [labelKey, labelValue] of Object.entries(llmStartup.labels || {})) {
             if (labelValue === '' || labelValue === null || labelValue === undefined) continue;
             args.splice(1, 0, '--label', `${labelKey}=${labelValue}`);
@@ -1639,12 +1810,40 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         } else if (['default', 'bridge'].includes(plan?.mode)) {
             throw new Error('managed generated-local launch state is required before container creation');
         }
+        if (cleanupReceipt.phase !== 'pre-create') {
+            cleanupReceipt = advanceCandidateLifecycle(cleanupReceipt, { phase: 'pre-create' });
+        }
+        cleanupReceipt = advanceCandidateLifecycle(cleanupReceipt, {
+            phase: 'create-attempted',
+            creationAttempted: true,
+            state: 'preserved-ambiguous',
+            inspectionComplete: false,
+        });
         const res = spawnSync(runtime, createArgs, { stdio: 'inherit' });
         if (res.status !== 0) throw new Error(`${runtime} create failed with code ${res.status}`);
     };
+    let cleanupReceipt = beginCandidateLifecycle({
+        runtimeKind: 'container',
+        candidateName: containerName,
+        contractHash: runtimeCandidateContractHash(
+            runtimeAdmission,
+            runtimeIdentity,
+            manifestNetwork,
+            'container',
+        ),
+        runtimeIdentity: {
+            instanceId: runtimeIdentity.instanceId,
+            enableGeneration: runtimeIdentity.enableGeneration,
+            profile: activeProfile,
+            backend: runtime,
+            network: manifestNetwork,
+        },
+        predecessorId: String(existingRecord.containerId || ''),
+    });
     let launchedContainerId = '';
     let generatedLaunch = null;
     let adoptedExistingRuntime = false;
+    try {
     if (runtimeNetworkPlan.requiresManagedNetwork) {
         // Resolve both the target and fixed probe images before the network
         // transaction. The helper never pulls and never executes target-image
@@ -1672,7 +1871,22 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     } else {
         // All manifest/profile/port/image/mount validation above is complete.
         // Only now is the old host/none container deliberately replaced.
-        removeContainerForRecreate(runtime, containerName, `startAgentContainer:${agentName}`);
+        cleanupReceipt = advanceCandidateLifecycle(cleanupReceipt, {
+            phase: 'predecessor-inspected',
+            inspectionComplete: true,
+            ownershipProof: { predecessorRegistryIdentity: true },
+        });
+        const predecessorRemoval = removeContainerForRecreate(
+            runtime,
+            containerName,
+            `startAgentContainer:${agentName}`,
+            existingRecord,
+        );
+        cleanupReceipt = advanceCandidateLifecycle(cleanupReceipt, {
+            phase: 'predecessor-removed',
+            predecessorId: String(existingRecord.containerId || ''),
+            ownershipProof: { predecessorRegistryIdentity: true, predecessorRemoved: predecessorRemoval.state },
+        });
         createContainer(unmanagedNetworkLifecyclePlan);
         launchedContainerId = String(networkLifecycle.finalizeContainer(containerName, unmanagedNetworkLifecyclePlan, {
             network: manifestNetwork,
@@ -1682,10 +1896,46 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     if (!launchedContainerId) {
         throw new Error(`startAgentContainer(${agentName}) did not capture an immutable container ID`);
     }
+    } catch (error) {
+        throw attachRestartCandidate(error, {
+            containerName,
+            runtimeNetwork: structuredClone(manifestNetwork),
+            registryRecord: {
+                type: 'agent',
+                agentName,
+                repoName,
+                ...(options.alias ? { alias: options.alias } : {}),
+                instanceId: runtimeIdentity.instanceId,
+                enableGeneration: runtimeIdentity.enableGeneration,
+            },
+            cleanupReceipt,
+            exactCleanupPerformed: false,
+        });
+    }
+    cleanupReceipt = advanceCandidateLifecycle(cleanupReceipt, adoptedExistingRuntime
+        ? {
+            phase: 'candidate-observed',
+            state: 'not-created-proven',
+            inspectionComplete: true,
+            ownershipProof: { adoptedExistingRuntime: true },
+        }
+        : {
+            phase: 'candidate-observed',
+            creationAttempted: true,
+            state: 'retryable-exact-id',
+            candidateId: launchedContainerId,
+            inspectionComplete: true,
+            ownershipProof: {
+                immutableId: true,
+                instanceId: runtimeIdentity.instanceId,
+                enableGeneration: runtimeIdentity.enableGeneration,
+            },
+        });
     const exactLaunchReceipt = Object.freeze({
         containerName,
         containerId: launchedContainerId,
         runtimeNetwork: structuredClone(manifestNetwork),
+        cleanupReceipt,
         registryRecord: Object.freeze({
             type: 'agent',
             agentName,
@@ -1697,6 +1947,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     });
     const cleanupExactLaunch = (error) => {
         let exactCleanupPerformed = false;
+        let finalCleanupReceipt = cleanupReceipt;
         try {
             const cleanup = networkLifecycle.removeExactContainer(
                 containerName,
@@ -1717,6 +1968,22 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         } catch (cleanupError) {
             appendExactCleanupFailure(error, cleanupError?.message || cleanupError);
         }
+        try {
+            finalCleanupReceipt = advanceCandidateLifecycle(cleanupReceipt, exactCleanupPerformed
+                ? {
+                    phase: 'readiness',
+                    state: 'removed-proven',
+                    inspectionComplete: true,
+                    ownershipProof: { ...cleanupReceipt.ownershipProof, exactAbsenceProven: true },
+                }
+                : {
+                    phase: 'readiness',
+                    state: 'preserved-ambiguous',
+                    ownershipProof: { ...cleanupReceipt.ownershipProof, exactAbsenceProven: false },
+                });
+        } catch (receiptError) {
+            appendExactCleanupFailure(error, `receipt transition: ${receiptError?.message || receiptError}`);
+        }
         if (exactCleanupPerformed && generatedLaunch?.cleanup) {
             try { generatedLaunch.cleanup(); } catch (cleanupError) {
                 appendExactCleanupFailure(error, `descriptor cleanup: ${cleanupError?.message || cleanupError}`);
@@ -1727,6 +1994,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         clearLivenessState(containerName);
         throw attachRestartCandidate(error, {
             ...exactLaunchReceipt,
+            cleanupReceipt: finalCleanupReceipt,
             exactCleanupPerformed,
         });
     };
@@ -1739,7 +2007,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     const llmRuntimeEnvNames = llmStartup.enabled
         ? ['HF_HOME', 'PLOINKY_MODELS_DIR', 'PLOINKY_DERIVED_DIR', 'PLOINKY_RUNTIME_DIR', 'PLOINKY_LAUNCHERS_DIR', 'PLOINKY_MCP_PORT', 'PLOINKY_LLM_PUBLIC_PORT', 'PLOINKY_LLM_MCP_PORT', 'PLOINKY_LLM_CONTROL_PORT', 'PLOINKY_INFERENCE_PORT']
         : [];
-    const persistedRecord = agents[containerName] || existingRecord;
+    const persistedRecord = agents[containerName] || launchRecord;
     agents[containerName] = {
         agentName,
         repoName,
@@ -1842,6 +2110,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         createdByThisLaunch: !adoptedExistingRuntime,
         runtimeNetwork: structuredClone(manifestNetwork),
         registryRecord,
+        cleanupReceipt,
     };
 }
 
@@ -1969,6 +2238,25 @@ export function assertPreparedRegistryRecordPreservation(existingRecord, options
     const stagedEnableGeneration = String(existingRecord?.enableGeneration || '');
     const requestedInstanceId = String(options.instanceId || stagedInstanceId);
     const requestedEnableGeneration = String(options.enableGeneration || stagedEnableGeneration);
+    if ((!stagedInstanceId || !stagedEnableGeneration)
+        && options.preparationLease?.mode === 'additive'
+        && requestedInstanceId
+        && requestedEnableGeneration) {
+        const preparedRecord = assertAdditivePreparedRuntimeIdentity(options.preparationLease, {
+            containerName: options.containerName,
+            instanceId: requestedInstanceId,
+            enableGeneration: requestedEnableGeneration,
+        });
+        const canonicalProvided = options.preparedRegistryRecord
+            ? JSON.parse(JSON.stringify(options.preparedRegistryRecord))
+            : null;
+        if (!canonicalProvided || !isDeepStrictEqual(preparedRecord, canonicalProvided)) {
+            throw new Error(
+                `preserving the additive registry record for ${ownerRef} requires the exact immutable prepared record`,
+            );
+        }
+        return true;
+    }
     if (!stagedInstanceId || !stagedEnableGeneration
         || requestedInstanceId !== stagedInstanceId
         || requestedEnableGeneration !== stagedEnableGeneration) {
@@ -2129,12 +2417,79 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
         error.code = 'PLOINKY_ROUTER_ENDPOINT_REQUIRED';
         throw error;
     }
+    const preflightRepoName = path.basename(path.dirname(agentPath));
+    const preflightManifestPath = path.join(agentPath, 'manifest.json');
+    const preflightManifestBytes = fs.existsSync(preflightManifestPath)
+        ? fs.readFileSync(preflightManifestPath)
+        : Buffer.from(JSON.stringify(manifest || {}));
+    const preflightExactManifest = JSON.parse(preflightManifestBytes.toString('utf8'));
+    if (!isDeepStrictEqual(preflightExactManifest, manifest)) {
+        const error = new Error(`ensureAgentService(${agentName}) manifest bytes changed before admission`);
+        error.code = 'PLOINKY_RUNTIME_INPUT_CHANGED';
+        error.status = 409;
+        throw error;
+    }
+    const preflightContainerName = options.containerName
+        || getAgentContainerName(agentName, preflightRepoName);
+    const preflightRecord = loadAgentsMap()[preflightContainerName] || {};
+    const preflightProfile = resolveManifestRuntimeProfile(manifest, {
+        agentName: `${preflightRepoName}/${agentName}`,
+        profileName: options.profileName,
+        persistedProfileName: preflightRecord.profile,
+        path: `manifest(${preflightRepoName}/${agentName})`,
+    });
+    // Reject manifest-declared capabilities before even selecting a backend.
+    // A second admission below adds the read-only catalog selection.
+    admitManifestRuntimeCapabilities(manifest, {
+        manifestBytes: preflightManifestBytes,
+        manifestPath: preflightManifestPath,
+        agentId: `${preflightRepoName}/${agentName}`,
+        profileName: preflightProfile.resolvedProfileName,
+        profileConfig: preflightProfile.profileConfig,
+        network: preflightProfile.network,
+        runtimeKind: 'container',
+    });
+    const preflightAgentRuntime = getRuntimeForAgent(manifest);
+    const preflightRuntimeKind = isSandboxRuntime(preflightAgentRuntime)
+        ? preflightAgentRuntime
+        : 'container';
+    const preflightLlmAdmissionContext = preflightRuntimeKind === 'container'
+        ? resolveLlmRuntimeAdmissionContext({
+            runtime: preflightAgentRuntime,
+            manifest,
+            profileConfig: preflightProfile.profileConfig,
+            agentName,
+            alias: options.alias,
+            env: process.env,
+        })
+        : { catalogPolicy: null, catalogIdentity: null };
+    const preflightAdmission = admitManifestRuntimeCapabilities(manifest, {
+        manifestBytes: preflightManifestBytes,
+        manifestPath: preflightManifestPath,
+        agentId: `${preflightRepoName}/${agentName}`,
+        profileName: preflightProfile.resolvedProfileName,
+        profileConfig: preflightProfile.profileConfig,
+        network: preflightProfile.network,
+        runtime: preflightAgentRuntime,
+        runtimeKind: preflightRuntimeKind,
+        catalogPolicy: preflightLlmAdmissionContext.catalogPolicy,
+        catalogIdentity: preflightLlmAdmissionContext.catalogIdentity,
+    });
+    if (options.runtimeAdmission) {
+        assertRuntimeAdmissionCurrent(options.runtimeAdmission, {
+            manifestBytes: preflightManifestBytes,
+            profileName: preflightProfile.resolvedProfileName,
+            runtimeKind: preflightRuntimeKind,
+            descriptor: preflightAdmission.descriptor,
+        });
+    }
     const targetedRestart = normalizeTargetedRestart(options.targetedRestart);
     if (!options.networkLifecycleCapability) {
         return withNetworkLifecycleLock(
             (networkLifecycleCapability) => ensureAgentService(agentName, manifest, agentPath, {
                 ...options,
                 networkLifecycleCapability,
+                runtimeAdmission: options.runtimeAdmission || preflightAdmission,
             }),
             { waitMs: Math.max(0, Number(options.networkLockWaitMs || 0)) },
         );
@@ -2167,8 +2522,11 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
         options,
         { ownerRef: `${repoName}/${agentName}` },
     );
-    if (!aliasOverride && existingRecord.alias) {
-        aliasOverride = existingRecord.alias;
+    const launchRecord = preservePreparedRegistryRecord
+        ? (options.preparedRegistryRecord || existingRecord)
+        : existingRecord;
+    if (!aliasOverride && launchRecord.alias) {
+        aliasOverride = launchRecord.alias;
     }
 
     // Resolve profile and network before backend dispatch so every runtime uses
@@ -2177,12 +2535,42 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
     const profileResolution = resolveManifestRuntimeProfile(manifest, {
         agentName: `${repoName}/${agentName}`,
         profileName: profileNameOverride,
-        persistedProfileName: existingRecord.profile,
+        persistedProfileName: launchRecord.profile,
         path: `manifest(${repoName}/${agentName})`,
     });
     const activeProfile = profileResolution.resolvedProfileName;
     const profileConfig = profileResolution.profileConfig;
     const manifestNetwork = profileResolution.network;
+    const serviceLlmAdmissionContext = preflightRuntimeKind === 'container'
+        ? resolveLlmRuntimeAdmissionContext({
+            runtime: preflightAgentRuntime,
+            manifest,
+            profileConfig,
+            agentName,
+            alias: aliasOverride,
+            env: process.env,
+        })
+        : { catalogPolicy: null, catalogIdentity: null };
+    const serviceAdmission = admitManifestRuntimeCapabilities(manifest, {
+        manifestBytes: preflightManifestBytes,
+        manifestPath: preflightManifestPath,
+        agentId: `${repoName}/${agentName}`,
+        profileName: activeProfile,
+        profileConfig,
+        network: manifestNetwork,
+        runtime: preflightAgentRuntime,
+        runtimeKind: 'container',
+        catalogPolicy: serviceLlmAdmissionContext.catalogPolicy,
+        catalogIdentity: serviceLlmAdmissionContext.catalogIdentity,
+    });
+    if (options.runtimeAdmission && preflightRuntimeKind === 'container') {
+        assertRuntimeAdmissionCurrent(options.runtimeAdmission, {
+            manifestBytes: preflightManifestBytes,
+            profileName: activeProfile,
+            runtimeKind: 'container',
+            descriptor: serviceAdmission.descriptor,
+        });
+    }
     assertNetworkStartupCompatibility(manifest, profileConfig, manifestNetwork, {
         path: `manifest(${repoName}/${agentName})`,
     });
@@ -2191,9 +2579,29 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
     // Host sandboxes share the host network namespace. Fail closed unless the
     // effective manifest/profile contract explicitly selects host networking.
     const agentRuntime = getRuntimeForAgent(manifest);
+    let sandboxAdmission = null;
+    if (agentRuntime === 'bwrap' || agentRuntime === 'seatbelt') {
+        if (options.runtimeAdmission) {
+            assertRuntimeAdmissionCurrent(options.runtimeAdmission, {
+                manifestBytes: preflightManifestBytes,
+                profileName: activeProfile,
+                runtimeKind: agentRuntime,
+            });
+        }
+        sandboxAdmission = options.runtimeAdmission || admitManifestRuntimeCapabilities(manifest, {
+            manifestBytes: preflightManifestBytes,
+            manifestPath: preflightManifestPath,
+            agentId: `${repoName}/${agentName}`,
+            profileName: activeProfile,
+            profileConfig,
+            network: manifestNetwork,
+            runtimeKind: agentRuntime,
+        });
+    }
     if (agentRuntime === 'bwrap' || agentRuntime === 'seatbelt') {
         let sandboxRuntimeIdentity = null;
         let sandboxRequiresEdgeActivation = false;
+        let sandboxCleanupReceipt = null;
         try {
             assertHostSandboxNetworkCompatibility(manifestNetwork, {
                 path: `manifest(${repoName}/${agentName}).network`,
@@ -2235,6 +2643,23 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
             }, { preparationLease: options.preparationLease });
             sandboxRuntimeIdentity = runtimeIdentity;
             sandboxRequiresEdgeActivation = requiresEdgeActivation;
+            sandboxCleanupReceipt = beginCandidateLifecycle({
+                runtimeKind: agentRuntime,
+                candidateName: containerName,
+                contractHash: runtimeCandidateContractHash(
+                    sandboxAdmission,
+                    runtimeIdentity,
+                    manifestNetwork,
+                    agentRuntime,
+                ),
+                runtimeIdentity: {
+                    instanceId: runtimeIdentity.instanceId,
+                    enableGeneration: runtimeIdentity.enableGeneration,
+                    profile: activeProfile,
+                    backend: agentRuntime,
+                    network: manifestNetwork,
+                },
+            });
             let preparedHostModeCapability = options.preparedHostModeCapability;
             const exactOwner = {
                 agentId: deriveAgentPrincipalId(repoName, agentName),
@@ -2259,14 +2684,33 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
                 enableGeneration: runtimeIdentity.enableGeneration,
                 preservePreparedRegistryRecord: preservePreparedRegistryRecord || requiresEdgeActivation,
                 preparedHostModeCapability,
+                runtimeAdmission: sandboxAdmission,
+                manifestBytes: preflightManifestBytes,
             };
+            sandboxCleanupReceipt = advanceCandidateLifecycle(sandboxCleanupReceipt, {
+                phase: 'create-attempted',
+                creationAttempted: true,
+                state: 'preserved-ambiguous',
+            });
             const result = agentRuntime === 'bwrap'
                 ? ensureBwrapService(agentName, manifest, agentPath, sandboxOptions)
                 : ensureSeatbeltService(agentName, manifest, agentPath, sandboxOptions);
+            sandboxCleanupReceipt = advanceCandidateLifecycle(sandboxCleanupReceipt, {
+                phase: 'candidate-observed',
+                state: 'retryable-exact-id',
+                candidateId: `${runtimeIdentity.instanceId}:${runtimeIdentity.enableGeneration}`,
+                inspectionComplete: true,
+                ownershipProof: {
+                    processIdentity: true,
+                    instanceId: runtimeIdentity.instanceId,
+                    enableGeneration: runtimeIdentity.enableGeneration,
+                },
+            });
             return {
                 ...result,
                 runtimeNetwork: structuredClone(manifestNetwork),
                 requiresEdgeActivation,
+                cleanupReceipt: sandboxCleanupReceipt,
                 ...(runtimeIdentity.preparationLease ? { preparationLease: runtimeIdentity.preparationLease } : {}),
             };
         } catch (err) {
@@ -2286,6 +2730,24 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
                     appendExactCleanupFailure(failure, cleanupError?.message || cleanupError);
                 }
             }
+            if (sandboxCleanupReceipt) {
+                try {
+                    sandboxCleanupReceipt = advanceCandidateLifecycle(sandboxCleanupReceipt, exactCleanupPerformed
+                        ? {
+                            phase: 'readiness',
+                            state: 'removed-proven',
+                            inspectionComplete: true,
+                            ownershipProof: { processIdentity: true, exactAbsenceProven: true },
+                        }
+                        : {
+                            phase: 'readiness',
+                            state: 'preserved-ambiguous',
+                            ownershipProof: { processIdentity: false, exactAbsenceProven: false },
+                        });
+                } catch (receiptError) {
+                    appendExactCleanupFailure(failure, `receipt transition: ${receiptError?.message || receiptError}`);
+                }
+            }
             throw attachRestartCandidate(failure, {
                 containerName,
                 runtimeNetwork: structuredClone(manifestNetwork),
@@ -2299,6 +2761,7 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
                 },
                 requiresEdgeActivation: sandboxRequiresEdgeActivation,
                 exactCleanupPerformed,
+                ...(sandboxCleanupReceipt ? { cleanupReceipt: sandboxCleanupReceipt } : {}),
                 ...((sandboxRuntimeIdentity?.preparationLease || options.preparationLease)
                     ? { preparationLease: sandboxRuntimeIdentity?.preparationLease || options.preparationLease }
                     : {}),
@@ -2612,10 +3075,16 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
             routerEndpoint,
             networkLockWaitMs,
             runtimeIdentity,
+            instanceId: runtimeIdentity.instanceId,
+            enableGeneration: runtimeIdentity.enableGeneration,
             preparedHostModeCapability,
             preserveRegistryRecord: preserveRuntimeRegistryRecord,
             reuseStagedMounts: existingRuntimeAtEntry && !recreateReason,
             networkLifecycleCapability: options.networkLifecycleCapability,
+            runtimeAdmission: options.runtimeAdmission || serviceAdmission,
+            preparedRegistryRecord: launchRecord,
+            preservePreparedRegistryRecord,
+            preparationLease: options.preparationLease,
         });
     allPortMappings = resolvePublishedPortMappings(containerName, allPortMappings);
     const agentCodePath = getAgentCodePath(agentName);
@@ -2630,12 +3099,14 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
         ...getExposedNames(manifest, profileConfig, { forRuntime: true }),
         ...Object.keys(profileEnv)
     ];
-    let projPath = getConfiguredProjectPath(agentName, path.basename(path.dirname(agentPath)), aliasOverride);
+    let projPath = preservePreparedRegistryRecord && launchRecord.projectPath
+        ? launchRecord.projectPath
+        : getConfiguredProjectPath(agentName, path.basename(path.dirname(agentPath)), aliasOverride);
     if (!projPath) {
-        projPath = existingRecord.projectPath;
+        projPath = launchRecord.projectPath;
     }
-    const finalInstanceName = aliasOverride || existingRecord.alias || agentName;
-    const finalIsolatedHome = (existingRecord.runMode || 'isolated') === 'isolated';
+    const finalInstanceName = aliasOverride || launchRecord.alias || agentName;
+    const finalIsolatedHome = (launchRecord.runMode || 'isolated') === 'isolated';
     const finalAgentWorkDir = getAgentWorkDir(finalInstanceName);
     const finalWorkTarget = finalIsolatedHome ? '/root' : projPath;
     const hasStartedBinds = Array.isArray(startedRecord.config?.binds) && startedRecord.config.binds.length > 0;
@@ -2657,10 +3128,10 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
         containerImage: startedRecord.containerImage || image,
         ...(startedRecord.manifestImage ? { manifestImage: startedRecord.manifestImage } : {}),
         ...(startedRecord.llmRuntime ? { llmRuntime: startedRecord.llmRuntime } : {}),
-        createdAt: existingRecord.createdAt || new Date().toISOString(),
+        createdAt: launchRecord.createdAt || new Date().toISOString(),
         projectPath: projPath,
-        runMode: existingRecord.runMode,
-        develRepo: existingRecord.develRepo,
+        runMode: launchRecord.runMode,
+        develRepo: launchRecord.develRepo,
         profile: activeProfile,
         type: 'agent',
         runtime,
@@ -2679,8 +3150,8 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
             ports: runtimeNetworkPlan.mode === 'host' || runtimeNetworkPlan.mode === 'none' ? [] : allPortMappings,
         }
     };
-    if (existingRecord.auth) {
-        agents[containerName].auth = existingRecord.auth;
+    if (launchRecord.auth) {
+        agents[containerName].auth = launchRecord.auth;
     }
     if (aliasOverride) {
         agents[containerName].alias = aliasOverride;
@@ -2702,6 +3173,7 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
             hostPort: returnPort,
             createdByThisLaunch: started?.createdByThisLaunch !== false,
             registryRecord: structuredClone(agents[containerName]),
+            cleanupReceipt: started?.cleanupReceipt,
             requiresEdgeActivation,
             ...(runtimeIdentity.preparationLease ? { preparationLease: runtimeIdentity.preparationLease } : {}),
         };
@@ -2730,6 +3202,8 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
             });
         }
         let exactCleanupPerformed = error?.ploinkyRestartCandidate?.exactCleanupPerformed === true;
+        const cleanupReceipt = started?.cleanupReceipt
+            || error?.ploinkyRestartCandidate?.cleanupReceipt;
         const candidateId = String(started?.containerId || error?.ploinkyRestartCandidate?.containerId || '');
         const candidateRecord = started?.registryRecord || error?.ploinkyRestartCandidate?.registryRecord || {
             type: 'agent',
@@ -2759,6 +3233,7 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
             registryRecord: structuredClone(candidateRecord),
             requiresEdgeActivation,
             exactCleanupPerformed,
+            ...(cleanupReceipt ? { cleanupReceipt } : {}),
             ...(runtimeIdentity.preparationLease ? { preparationLease: runtimeIdentity.preparationLease } : {}),
         });
     }
@@ -2796,6 +3271,29 @@ export function cleanupExactAgentRuntimeCandidate(candidate) {
         || !String(record.instanceId || '').trim()
         || !String(record.enableGeneration || '').trim()) {
         throw new Error('exact runtime candidate cleanup requires its name and immutable registry identity');
+    }
+    const runtimeKind = record.runtime === 'bwrap' || record.runtime === 'seatbelt'
+        ? record.runtime
+        : 'container';
+    const cleanupReceipt = consumeCandidateCleanupReceipt(candidate?.cleanupReceipt, {
+        runtimeKind,
+        candidateName: containerName,
+        runtimeIdentity: {
+            instanceId: String(record.instanceId),
+            enableGeneration: String(record.enableGeneration),
+        },
+        ...(runtimeKind === 'container' && candidate?.containerId
+            ? { candidateId: String(candidate.containerId) }
+            : {}),
+    });
+    if (cleanupReceipt.state === 'absent-proven' || cleanupReceipt.state === 'removed-proven'
+        || cleanupReceipt.state === 'not-created-proven') {
+        return { removed: false, state: cleanupReceipt.state };
+    }
+    if (cleanupReceipt.state !== 'retryable-exact-id' || cleanupReceipt.inspectionComplete !== true) {
+        const error = new Error('exact runtime candidate ownership is ambiguous; preserving it for operator reconciliation');
+        error.code = 'PLOINKY_RUNTIME_OWNERSHIP_AMBIGUOUS';
+        throw error;
     }
     if (record.runtime === 'bwrap' || record.runtime === 'seatbelt') {
         const identity = {

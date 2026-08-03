@@ -113,6 +113,11 @@ function prepareLlmStartup(input) {
         envHash,
         effectiveNetwork = null,
         writeState = true,
+        createDirectories = true,
+        resolvedSelection = null,
+        resolvedHardware = null,
+        admittedRuntimePolicy = null,
+        emitRuntimeArgs = true,
     } = input || {};
 
     if (!isLlmRuntimeManifest(manifest, profileConfig)) {
@@ -124,24 +129,28 @@ function prepareLlmStartup(input) {
         throw new Error(`[llm-runtime] ${agentName}: agent name/alias must match /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/`);
     }
 
-    const catalog = loadCatalog({ env });
-    const hardware = detectHardware({ runtime, env });
-    const selection = selectArchitecture(catalog, hardware, {
-        agentName,
-        alias,
-        env,
-        allowExperimental: Boolean(profileConfig?.llmRuntime?.allowExperimental || manifest?.llmRuntime?.allowExperimental),
-    });
+    const hardware = resolvedHardware || detectHardware({ runtime, env });
+    const selection = resolvedSelection || (() => {
+        const catalog = loadCatalog({ env });
+        return selectArchitecture(catalog, hardware, {
+            agentName,
+            alias,
+            env,
+            allowExperimental: Boolean(profileConfig?.llmRuntime?.allowExperimental || manifest?.llmRuntime?.allowExperimental),
+        });
+    })();
 
-    const policy = buildEffectivePolicy({
-        manifestPolicy: extractManifestPolicy(manifest, profileConfig),
-        catalogPolicy: selection.runtimePolicy,
-        profilePolicy: null,
-        overridePolicy: null,
-    }, { runtime });
+    const policy = admittedRuntimePolicy
+        ? buildEffectivePolicy({ overridePolicy: admittedRuntimePolicy }, { runtime })
+        : buildEffectivePolicy({
+            manifestPolicy: manifest?.llmRuntime?.runtimePolicy || null,
+            catalogPolicy: selection.runtimePolicy,
+            profilePolicy: profileConfig?.llmRuntime?.runtimePolicy || null,
+            overridePolicy: null,
+        }, { runtime });
 
     const policyHash = computeRuntimePolicyHash(policy);
-    const runArgs = emitRunArgs(policy, { runtime });
+    const runArgs = emitRuntimeArgs ? emitRunArgs(policy, { runtime }) : [];
 
     const statePayload = buildSelectedArchitectureState({
         selection,
@@ -156,7 +165,7 @@ function prepareLlmStartup(input) {
         stateDir = ensureRuntimeStateDir(agentWorkDirRoot, identity);
         writeSelectedArchitectureFile(stateDir, statePayload);
     }
-    const modelDir = ensureModelsDir(agentWorkDirRoot, identity);
+    const modelDir = createDirectories ? ensureModelsDir(agentWorkDirRoot, identity) : null;
 
     const reuseKey = {
         envHash: envHash || '',
@@ -201,7 +210,38 @@ function prepareLlmStartup(input) {
     };
 }
 
+function resolveLlmRuntimeAdmissionContext(input = {}) {
+    const { manifest, profileConfig, runtime } = input;
+    if (!isLlmRuntimeManifest(manifest, profileConfig)) {
+        return Object.freeze({ catalogPolicy: null, catalogIdentity: null, startup: null });
+    }
+    if (runtime !== 'docker' && runtime !== 'podman') {
+        const error = new Error(`LLM runtime catalog admission requires a container backend, received '${runtime || 'unknown'}'`);
+        error.code = 'PLOINKY_BOX_RUNTIME_CAPABILITY_UNSUPPORTED';
+        error.status = 422;
+        throw error;
+    }
+    const startup = prepareLlmStartup({
+        ...input,
+        writeState: false,
+        createDirectories: false,
+        emitRuntimeArgs: false,
+    });
+    return Object.freeze({
+        catalogPolicy: startup.selection?.runtimePolicy || null,
+        catalogIdentity: Object.freeze({
+            catalogId: String(startup.selection?.catalogId || ''),
+            catalogRef: String(startup.selection?.catalogRef || ''),
+            architectureId: String(startup.selection?.architectureId || ''),
+            imageRef: String(startup.selection?.imageRef || ''),
+            imageDigest: String(startup.selection?.imageDigest || ''),
+        }),
+        startup,
+    });
+}
+
 export {
     isLlmRuntimeManifest,
     prepareLlmStartup,
+    resolveLlmRuntimeAdmissionContext,
 };

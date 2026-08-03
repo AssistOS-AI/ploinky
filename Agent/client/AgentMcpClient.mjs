@@ -197,7 +197,15 @@ function requestMarketplace(method = 'GET', body = null, descriptor) {
                 try { json = text ? JSON.parse(text) : null; } catch { json = null; }
                 if ((res.statusCode || 0) >= 400 || !json || json.ok === false) {
                     const detail = json?.message || json?.error || text || `HTTP ${res.statusCode}`;
-                    reject(new Error(`Marketplace request failed: ${String(detail).slice(0, 300)}`));
+                    const error = new Error(`Marketplace request failed: ${String(detail).slice(0, 300)}`);
+                    error.code = typeof json?.error === 'string' ? json.error : 'MARKETPLACE_REQUEST_FAILED';
+                    error.status = Number(res.statusCode || 0);
+                    if (typeof json?.cause?.code === 'string') {
+                        const cause = new Error(json.cause.code);
+                        cause.code = json.cause.code;
+                        error.cause = cause;
+                    }
+                    reject(error);
                     return;
                 }
                 resolve(json.marketplace || json);

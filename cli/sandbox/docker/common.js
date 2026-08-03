@@ -10,6 +10,7 @@ import { loadAgents, saveAgents } from '../../utils/workspace.js';
 import { debugLog } from '../../utils/utils.js';
 import { isHostSandboxDisabled } from '../../utils/runtime/sandboxRuntime.js';
 import { intervalsOverlap, parseManifestOpenPortSpec } from '../../../container/publish-spec.mjs';
+import { isInsideBox } from '../../../ploinky-box/lib/boxMarker.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -17,12 +18,8 @@ const PLOINKY_BOX_MARKER_PATH = '/etc/ploinky-box';
 const PLOINKY_MANAGED_LABEL = 'io.assistos.ploinky.managed=1';
 const CONTAINER_CONTROL_PLANE_TIMEOUT_MS = 5_000;
 
-function isPloinkyBoxRuntime(markerPath = process.env.PLOINKY_BOX_MARKER_PATH || PLOINKY_BOX_MARKER_PATH) {
-    try {
-        return fs.statSync(markerPath).isFile();
-    } catch (_) {
-        return false;
-    }
+function isPloinkyBoxRuntime(markerPath = PLOINKY_BOX_MARKER_PATH) {
+    return isInsideBox({ markerPath });
 }
 
 function isPathUnderRoot(candidate) {
@@ -98,8 +95,8 @@ function isRuntimeInstalled(runtime) {
 
 let containerRuntime = null;
 
-function probeContainerRuntime() {
-    if (isPloinkyBoxRuntime()) {
+function probeContainerRuntime(boxMarkerPath) {
+    if (isPloinkyBoxRuntime(boxMarkerPath)) {
         if (isRuntimeInstalled('podman')) {
             containerRuntime = 'podman';
             return containerRuntime;
@@ -118,10 +115,10 @@ function probeContainerRuntime() {
     return null;
 }
 
-function requireContainerRuntime() {
-    const rt = probeContainerRuntime();
+function requireContainerRuntime(boxMarkerPath) {
+    const rt = probeContainerRuntime(boxMarkerPath);
     if (!rt) {
-        if (isPloinkyBoxRuntime()) {
+        if (isPloinkyBoxRuntime(boxMarkerPath)) {
             const error = new Error('Ploinky box requires nested Podman, but podman was not found in PATH. Docker fallback is not permitted inside the box.');
             error.code = 'PLOINKY_BOX_PODMAN_REQUIRED';
             throw error;
@@ -699,8 +696,8 @@ export {
     managedContainerLabelArgs,
 };
 
-function getRuntime() {
-    return requireContainerRuntime();
+function getRuntime(boxMarkerPath) {
+    return requireContainerRuntime(boxMarkerPath);
 }
 
 function getHostSandboxInstallHint() {
@@ -752,9 +749,9 @@ function createLegacyRuntimeStringError(runtimeValue) {
     return error;
 }
 
-function getRuntimeForAgent(manifest) {
-    if (isPloinkyBoxRuntime()) {
-        return requireContainerRuntime();
+function getRuntimeForAgent(manifest, { boxMarkerPath } = {}) {
+    if (isPloinkyBoxRuntime(boxMarkerPath)) {
+        return requireContainerRuntime(boxMarkerPath);
     }
     if (typeof manifest?.runtime === 'string') {
         throw createLegacyRuntimeStringError(manifest.runtime);

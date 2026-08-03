@@ -1,4 +1,5 @@
 import fs from 'fs';
+import crypto from 'node:crypto';
 import path from 'path';
 import { Worker } from 'worker_threads';
 import { fileURLToPath } from 'url';
@@ -18,9 +19,15 @@ import {
     listRunningContainerNames,
 } from '../sandbox/docker/index.js';
 import { shouldMonitorManifestRuntime } from '../utils/runtime/manifestStartup.js';
-import { isSandboxRuntime } from '../sandbox/docker/common.js';
+import { getRuntimeForAgent, isSandboxRuntime } from '../sandbox/docker/common.js';
+import { resolveLlmRuntimeAdmissionContext } from '../sandbox/docker/llmRuntimeIntegration.js';
 import { isBwrapProcessRunning } from '../sandbox/bwrap/bwrapFleet.js';
 import { resolveManifestRuntimeProfile } from '../utils/runtime/profileService.js';
+import {
+    admitManifestRuntimeCapabilities,
+    assertRuntimeAdmissionCurrent,
+    RUNTIME_CAPABILITY_POLICY_VERSION,
+} from '../sandbox/runtimeCapabilities.js';
 import { resolveRouterEndpoint } from '../sandbox/routerPort.js';
 import { resolveAgentReadinessProtocol } from '../utils/runtime/startupReadiness.js';
 import { runContainerScriptReadiness } from '../sandbox/docker/healthProbes.js';
@@ -33,14 +40,152 @@ import { withNetworkLifecycleLock } from '../sandbox/networkLifecycle.js';
 import {
     abortEdgeRoutingPreparation,
     inactivateEdgeRoutingGeneration,
+    withEdgeGenerationApplyLock,
 } from '../sandbox/edgeGeneration.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const PROBE_WORKER_URL = new URL('./probeWorker.js', import.meta.url);
 const LOGGED_RESTART_FAILURES = new WeakSet();
+const TERMINAL_POLICY_CODES = new Set([
+    'PLOINKY_BOX_RUNTIME_CAPABILITY_UNSUPPORTED',
+    'PLOINKY_MANIFEST_SECURITY_INVALID',
+    'PLOINKY_MANIFEST_SECURITY_PROFILE_UNSUPPORTED',
+    'PLOINKY_BOX_MARKER_INVALID',
+    'PLOINKY_BWRAP_CAPABILITY_UNAVAILABLE',
+    'PLOINKY_OPEN_INTERPRETER_BOX_UNAVAILABLE',
+]);
+const TERMINAL_LEDGER_SCHEMA_VERSION = 1;
+// Terminal blockers survive monitor restarts while their registry entry is
+// present. Once the entry disappears, retain the tombstone only long enough
+// to suppress a short remove/re-add race; it must not grow without bound.
+const DEFAULT_TERMINAL_TOMBSTONE_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 
 function noopLog() {}
+
+function stableValue(value) {
+    if (Array.isArray(value)) return value.map(stableValue);
+    if (value && typeof value === 'object') {
+        return Object.fromEntries(Object.keys(value).sort().map((key) => [key, stableValue(value[key])]));
+    }
+    return value;
+}
+
+function digestValue(value) {
+    return `sha256:${crypto.createHash('sha256').update(JSON.stringify(stableValue(value))).digest('hex')}`;
+}
+
+function terminalLedgerFile(monitor) {
+    return monitor?.terminalLedgerFile || path.join(RUNNING_DIR, 'container-monitor-terminal.json');
+}
+
+function loadTerminalLedger(monitor) {
+    try {
+        const parsed = JSON.parse(fs.readFileSync(terminalLedgerFile(monitor), 'utf8'));
+        if (parsed?.schemaVersion !== TERMINAL_LEDGER_SCHEMA_VERSION || !parsed.entries
+            || typeof parsed.entries !== 'object' || Array.isArray(parsed.entries)) return new Map();
+        return new Map(Object.entries(parsed.entries));
+    } catch (_) {
+        return new Map();
+    }
+}
+
+function persistTerminalLedger(monitor) {
+    const file = terminalLedgerFile(monitor);
+    fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+    const document = {
+        schemaVersion: TERMINAL_LEDGER_SCHEMA_VERSION,
+        entries: Object.fromEntries(Array.from(monitor.terminalLedger || new Map()).sort(([a], [b]) => a.localeCompare(b))),
+    };
+    const tmp = `${file}.${process.pid}.${crypto.randomUUID()}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(document, null, 2), { mode: 0o600 });
+    fs.renameSync(tmp, file);
+}
+
+function terminalTombstoneRetentionMs(monitor) {
+    const configured = Number(monitor?.config?.TERMINAL_TOMBSTONE_RETENTION_MS);
+    return Number.isSafeInteger(configured) && configured >= 0
+        ? configured
+        : DEFAULT_TERMINAL_TOMBSTONE_RETENTION_MS;
+}
+
+function pruneTerminalLedger(monitor, presentRegistryNames, now = Date.now()) {
+    monitor.terminalLedger ||= loadTerminalLedger(monitor);
+    const retentionMs = terminalTombstoneRetentionMs(monitor);
+    let changed = false;
+    for (const [containerName, entry] of monitor.terminalLedger.entries()) {
+        if (presentRegistryNames.has(containerName)) {
+            if (entry?.absentSince || entry?.expiresAt) {
+                monitor.terminalLedger.set(containerName, Object.freeze({
+                    ...entry,
+                    absentSince: null,
+                    expiresAt: null,
+                }));
+                changed = true;
+            }
+            continue;
+        }
+        const absentSinceMs = Date.parse(String(entry?.absentSince || ''));
+        const effectiveAbsentSince = Number.isFinite(absentSinceMs)
+            ? absentSinceMs
+            : now;
+        const expiresAtMs = Number.isFinite(Date.parse(String(entry?.expiresAt || '')))
+            ? Date.parse(String(entry.expiresAt))
+            : effectiveAbsentSince + retentionMs;
+        if (expiresAtMs <= now) {
+            monitor.terminalLedger.delete(containerName);
+            changed = true;
+            continue;
+        }
+        if (!entry?.absentSince || !entry?.expiresAt) {
+            monitor.terminalLedger.set(containerName, Object.freeze({
+                ...entry,
+                absentSince: new Date(effectiveAbsentSince).toISOString(),
+                expiresAt: new Date(expiresAtMs).toISOString(),
+            }));
+            changed = true;
+        }
+    }
+    if (changed) persistTerminalLedger(monitor);
+}
+
+function classifyTerminalFailure(error) {
+    const code = String(error?.code || '');
+    if (TERMINAL_POLICY_CODES.has(code)) return 'policy';
+    if (code === 'PLOINKY_RUNTIME_OWNERSHIP_AMBIGUOUS') return 'identity';
+    return '';
+}
+
+function recordTerminalFailure(monitor, info, error, restartInputDigest) {
+    monitor.terminalLedger ||= loadTerminalLedger(monitor);
+    const code = String(error?.code || 'PLOINKY_WATCHDOG_TERMINAL');
+    const blockerFingerprint = digestValue({
+        code,
+        cause: String(error?.cause?.code || ''),
+        identity: {
+            containerName: info.containerName,
+            repoName: info.repoName,
+            agentName: info.agentName,
+            instanceId: info.instanceId,
+            enableGeneration: info.enableGeneration,
+        },
+    });
+    const entry = Object.freeze({
+        containerName: info.containerName,
+        repoName: info.repoName,
+        agentName: info.agentName,
+        restartInputDigest,
+        blockerFingerprint,
+        code,
+        classification: classifyTerminalFailure(error) || 'policy',
+        recordedAt: new Date().toISOString(),
+        absentSince: null,
+        expiresAt: null,
+    });
+    monitor.terminalLedger.set(info.containerName, entry);
+    persistTerminalLedger(monitor);
+    return entry;
+}
 
 function logEvent(monitor, level, event, data = {}) {
     const logger = typeof monitor?.log === 'function' ? monitor.log : noopLog;
@@ -91,7 +236,103 @@ function createContainerTarget(info, monitor) {
         probeState: 'pending',
         probeWorker: null,
         probeLastSuccessAt: null,
+        attemptEpoch: 0,
+        restartInputDigest: info.restartInputDigest,
+        runtimeAdmission: info.runtimeAdmission,
+        restartSnapshot: info.restartSnapshot,
+        terminalState: null,
     };
+}
+
+function resolveWatchdogRestartInput(record, info, monitor) {
+    const manifestBytes = fs.readFileSync(info.manifestPath);
+    const manifest = JSON.parse(manifestBytes.toString('utf8') || '{}');
+    const routeKey = info.alias || info.agentName;
+    if (!shouldMonitorManifestRuntime(manifest, {
+        hasRoute: Boolean(info.routing?.routes?.[routeKey]),
+    })) return null;
+    const resolveRuntimeProfile = monitor.resolveManifestRuntimeProfile || resolveManifestRuntimeProfile;
+    const profileResolution = resolveRuntimeProfile(manifest, {
+        agentName: `${info.repoName}/${info.agentName}`,
+        profileName: info.profile || undefined,
+        path: `manifest(${info.repoName}/${info.agentName})`,
+    });
+    const runtimeKind = info.runtime === 'bwrap' || info.runtime === 'seatbelt'
+        ? info.runtime
+        : 'container';
+    const selectedRuntime = runtimeKind === 'container'
+        ? getRuntimeForAgent(manifest)
+        : info.runtime;
+    const llmAdmissionContext = runtimeKind === 'container'
+        ? resolveLlmRuntimeAdmissionContext({
+            runtime: selectedRuntime,
+            manifest,
+            profileConfig: profileResolution.profileConfig,
+            agentName: info.agentName,
+            alias: info.alias,
+            env: process.env,
+        })
+        : { catalogPolicy: null, catalogIdentity: null };
+    const runtimeAdmission = admitManifestRuntimeCapabilities(manifest, {
+        manifestBytes,
+        manifestPath: info.manifestPath,
+        agentId: `${info.repoName}/${info.agentName}`,
+        profileName: profileResolution.resolvedProfileName,
+        profileConfig: profileResolution.profileConfig,
+        network: profileResolution.network,
+        runtime: selectedRuntime,
+        runtimeKind,
+        catalogPolicy: llmAdmissionContext.catalogPolicy,
+        catalogIdentity: llmAdmissionContext.catalogIdentity,
+    });
+    const stat = fs.statSync(info.manifestPath, { bigint: true });
+    const restartInputDigest = digestValue({
+        registryRecordDigest: digestValue(record),
+        manifestDigest: runtimeAdmission.manifestDigest,
+        manifestPath: path.resolve(info.manifestPath),
+        manifestIdentity: `${stat.dev}:${stat.ino}`,
+        profileName: profileResolution.resolvedProfileName,
+        profileConfig: profileResolution.profileConfig,
+        capabilityDescriptor: runtimeAdmission.descriptor,
+        capabilityPolicyVersion: RUNTIME_CAPABILITY_POLICY_VERSION,
+        runtimeKind,
+        runtime: info.runtime,
+        imageDigest: String(record.imageDigest || record.containerImageDigest || record.containerImage || ''),
+        runnerAbi: String(record.runnerAbi || ''),
+        network: profileResolution.network,
+        instanceId: info.instanceId,
+        enableGeneration: info.enableGeneration,
+        alias: info.alias,
+        containerName: info.containerName,
+        retainedNodeIdentity: String(record.retainedNodeIdentity || ''),
+    });
+    const restartSnapshot = deepFreezeSnapshot({
+        digest: restartInputDigest,
+        manifestBytesBase64: manifestBytes.toString('base64'),
+        manifestPath: info.manifestPath,
+        profileResolution,
+        runtimeAdmission,
+        registryRecord: structuredClone(record),
+        registryRecordDigest: digestValue(record),
+        info: {
+            containerName: info.containerName,
+            agentName: info.agentName,
+            repoName: info.repoName,
+            alias: info.alias || null,
+            profile: info.profile || null,
+            runtime: info.runtime,
+            instanceId: info.instanceId || null,
+            enableGeneration: info.enableGeneration || null,
+            manifestPath: info.manifestPath,
+        },
+    });
+    return { manifest, profileResolution, runtimeAdmission, restartInputDigest, restartSnapshot };
+}
+
+function deepFreezeSnapshot(value) {
+    if (!value || typeof value !== 'object' || Object.isFrozen(value)) return value;
+    for (const child of Object.values(value)) deepFreezeSnapshot(child);
+    return Object.freeze(value);
 }
 
 function stopProbeWorker(target) {
@@ -292,20 +533,27 @@ function shouldDeferMaintenanceRestart(monitor, target) {
     return true;
 }
 
-function syncManagedContainers(monitor) {
+export function syncManagedContainers(monitor) {
     const monitorRef = monitor;
     if (!monitorRef) return;
 
     let agentsMap = {};
     try {
-        agentsMap = workspaceSvc.loadAgents() || {};
+        const loadAgents = monitorRef.loadAgents || workspaceSvc.loadAgents;
+        agentsMap = loadAgents() || {};
     } catch (error) {
         logEvent(monitorRef, 'error', 'container_sync_failed', { error: error?.message || error });
         return;
     }
 
+    const presentRegistryNames = new Set(Object.keys(agentsMap).filter((name) => (
+        name !== '_config' && !name.startsWith('_')
+    )));
+    pruneTerminalLedger(monitorRef, presentRegistryNames);
+
     const desired = new Map();
-    const routing = readRoutingConfig();
+    const readRouting = monitorRef.readRoutingConfig || readRoutingConfig;
+    const routing = readRouting();
 
     for (const [containerName, record] of Object.entries(agentsMap)) {
         if (!record || typeof record !== 'object') continue;
@@ -330,22 +578,64 @@ function syncManagedContainers(monitor) {
             continue;
         }
 
-        let manifest;
+        let restartInput;
         try {
-            manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
-            const routeKey = alias || agentName;
-            if (!shouldMonitorManifestRuntime(manifest, {
-                hasRoute: Boolean(routing.routes?.[routeKey]),
-            })) {
-                continue;
-            }
+            restartInput = resolveWatchdogRestartInput(record, {
+                containerName,
+                agentName,
+                repoName,
+                alias,
+                profile: record.profile || null,
+                runtime: record.runtime || 'container',
+                instanceId: String(record.instanceId || '').trim() || null,
+                enableGeneration: String(record.enableGeneration || '').trim() || null,
+                manifestPath,
+                routing,
+            }, monitorRef);
+            if (!restartInput) continue;
         } catch (error) {
-            logEvent(monitorRef, 'error', 'container_manifest_invalid', {
+            const terminal = classifyTerminalFailure(error);
+            const fallbackDigest = digestValue({
+                containerName,
+                repoName,
+                agentName,
+                manifestPath,
+                code: String(error?.code || 'manifest-invalid'),
+                manifestDigest: (() => {
+                    try { return digestValue(fs.readFileSync(manifestPath).toString('base64')); } catch (_) { return ''; }
+                })(),
+                profile: record.profile || null,
+                runtime: record.runtime || 'container',
+                instanceId: String(record.instanceId || ''),
+                enableGeneration: String(record.enableGeneration || ''),
+            });
+            if (terminal) {
+                const info = {
+                    containerName,
+                    agentName,
+                    repoName,
+                    instanceId: String(record.instanceId || '').trim() || null,
+                    enableGeneration: String(record.enableGeneration || '').trim() || null,
+                };
+                const existing = monitorRef.terminalLedger?.get(containerName);
+                if (existing?.restartInputDigest !== fallbackDigest) {
+                    recordTerminalFailure(monitorRef, info, error, fallbackDigest);
+                }
+                const target = monitorRef.targets.get(containerName);
+                if (target?.pendingRestartTimer) clearTimeout(target.pendingRestartTimer);
+                if (target) stopProbeWorker(target);
+                monitorRef.targets.delete(containerName);
+            }
+            logEvent(monitorRef, terminal ? 'warn' : 'error', terminal
+                ? 'container_runtime_policy_terminal'
+                : 'container_manifest_invalid', {
                 container: containerName,
                 agent: agentName,
                 repo: repoName,
                 manifest: manifestPath,
                 error: error?.message || String(error),
+                code: error?.code || null,
+                restartInputDigest: fallbackDigest,
             });
             continue;
         }
@@ -365,7 +655,19 @@ function syncManagedContainers(monitor) {
             runtime,
             instanceId,
             enableGeneration,
+            restartInputDigest: restartInput.restartInputDigest,
+            runtimeAdmission: restartInput.runtimeAdmission,
+            restartSnapshot: restartInput.restartSnapshot,
         };
+        monitorRef.terminalLedger ||= loadTerminalLedger(monitorRef);
+        const terminal = monitorRef.terminalLedger.get(containerName);
+        if (terminal?.restartInputDigest === restartInput.restartInputDigest) {
+            continue;
+        }
+        if (terminal) {
+            monitorRef.terminalLedger.delete(containerName);
+            persistTerminalLedger(monitorRef);
+        }
         desired.set(containerName, info);
 
         let target = monitorRef.targets.get(containerName);
@@ -380,6 +682,15 @@ function syncManagedContainers(monitor) {
                 runtime
             });
         } else {
+            if (target.restartInputDigest !== restartInput.restartInputDigest) {
+                target.attemptEpoch += 1;
+                if (target.pendingRestartTimer) clearTimeout(target.pendingRestartTimer);
+                target.pendingRestartTimer = null;
+                target.isRestarting = false;
+                target.restartHistory = [];
+                target.circuitBreakerTripped = false;
+                target.currentBackoff = monitorRef?.config?.INITIAL_BACKOFF_MS ?? 1000;
+            }
             target.agentName = agentName;
             target.repoName = repoName;
             target.alias = alias;
@@ -389,6 +700,9 @@ function syncManagedContainers(monitor) {
             target.type = type;
             target.manifestPath = manifestPath;
             target.runtime = runtime;
+            target.restartInputDigest = restartInput.restartInputDigest;
+            target.runtimeAdmission = restartInput.runtimeAdmission;
+            target.restartSnapshot = restartInput.restartSnapshot;
         }
     }
 
@@ -398,6 +712,7 @@ function syncManagedContainers(monitor) {
                 clearTimeout(target.pendingRestartTimer);
             }
             stopProbeWorker(target);
+            target.attemptEpoch += 1;
             monitorRef.targets.delete(containerName);
             logEvent(monitorRef, 'info', 'container_watch_removed', { container: containerName });
         }
@@ -439,9 +754,18 @@ function scheduleContainerRestart(monitor, target, reason) {
     });
 
     target.isRestarting = true;
+    const attempt = target.restartInputDigest && target.restartSnapshot
+        ? Object.freeze({
+            target,
+            epoch: (target.attemptEpoch || 0) + 1,
+            digest: target.restartInputDigest,
+            snapshot: target.restartSnapshot,
+        })
+        : null;
+    if (attempt) target.attemptEpoch = attempt.epoch;
     target.pendingRestartTimer = setTimeout(() => {
         target.pendingRestartTimer = null;
-        performContainerRestart(monitor, target, reason).catch((error) => {
+        performContainerRestart(monitor, target, reason, attempt).catch((error) => {
             target.lastError = error?.message || error;
             if (!error || typeof error !== 'object' || !LOGGED_RESTART_FAILURES.has(error)) {
                 logEvent(monitor, 'error', 'container_restart_failed', {
@@ -453,9 +777,61 @@ function scheduleContainerRestart(monitor, target, reason) {
                 });
             }
             target.isRestarting = false;
+            if (error?.code === 'PLOINKY_RESTART_ATTEMPT_STALE') return;
+            if (classifyTerminalFailure(error)) {
+                target.terminalState = recordTerminalFailure(
+                    monitor,
+                    target,
+                    error,
+                    attempt?.digest || target.restartInputDigest || '',
+                );
+                target.circuitBreakerTripped = true;
+                return;
+            }
             scheduleContainerRestart(monitor, target, 'restart_failed');
         });
     }, backoff);
+}
+
+function assertRestartAttemptCurrent(monitor, target, attempt, checkpoint, {
+    expectedRegistryRecord = null,
+} = {}) {
+    if (!attempt) return;
+    let currentBytes;
+    try {
+        currentBytes = fs.readFileSync(attempt.snapshot.manifestPath);
+    } catch (_) {}
+    let recomputedDigest = '';
+    try {
+        const readRouting = monitor.readRoutingConfig || readRoutingConfig;
+        const recomputed = resolveWatchdogRestartInput(
+            attempt.snapshot.registryRecord,
+            { ...attempt.snapshot.info, routing: readRouting() },
+            monitor,
+        );
+        recomputedDigest = recomputed?.restartInputDigest || '';
+    } catch (_) {}
+    let registryRecordMatches = true;
+    try {
+        const loadAgents = monitor.loadAgents || workspaceSvc.loadAgents;
+        const currentRecord = loadAgents()?.[attempt.snapshot.info.containerName];
+        const expectedDigest = digestValue(expectedRegistryRecord || attempt.snapshot.registryRecord);
+        registryRecordMatches = Boolean(currentRecord) && digestValue(currentRecord) === expectedDigest;
+    } catch (_) {
+        registryRecordMatches = false;
+    }
+    if (attempt.target !== target
+        || monitor.targets.get(target.containerName) !== target
+        || target.attemptEpoch !== attempt.epoch
+        || target.restartInputDigest !== attempt.digest
+        || attempt.snapshot?.digest !== attempt.digest
+        || currentBytes?.toString('base64') !== attempt.snapshot.manifestBytesBase64
+        || recomputedDigest !== attempt.digest
+        || !registryRecordMatches) {
+        const error = new Error(`watchdog restart attempt became stale at ${checkpoint}`);
+        error.code = 'PLOINKY_RESTART_ATTEMPT_STALE';
+        throw error;
+    }
 }
 
 function positiveInteger(value, fallback) {
@@ -545,7 +921,10 @@ async function waitForRestartedContainerReadiness(
     }
 }
 
-async function activateRestartedContainerRoute(monitor, target, agentDir, result, networkMode) {
+async function activateRestartedContainerRoute(monitor, target, agentDir, result, networkMode, {
+    assertCurrent = () => {},
+    onCommitted = () => {},
+} = {}) {
     const prepared = assertRestartPreparationResult(target, result);
     if (!prepared) return false;
     const routeKey = target.alias || target.agentName;
@@ -561,30 +940,44 @@ async function activateRestartedContainerRoute(monitor, target, agentDir, result
     const mergeRoute = monitor.mergeRoutingConfig || mergeRoutingConfig;
     const loadAgents = monitor.loadAgents || workspaceSvc.loadAgents;
     const saveAgents = monitor.saveAgents || workspaceSvc.saveAgents;
-    await mergeRoute((cfg) => {
-        const agents = loadAgents();
-        const staged = agents?.[prepared.containerName];
-        if (!staged || staged.type !== 'agent'
-            || String(staged.instanceId || '') !== String(prepared.record.instanceId)
-            || String(staged.enableGeneration || '') !== String(prepared.record.enableGeneration)) {
-            throw new Error(`watchdog runtime replacement lost its staged registry identity for '${prepared.containerName}'`);
-        }
-        agents[prepared.containerName] = structuredClone(prepared.record);
-        saveAgents(agents, { coordinate: false });
-        cfg.routes = cfg.routes || {};
-        cfg.routes[routeKey] = mergeRuntimeRoute(
-            cfg.routes[routeKey],
-            route,
-            { hostPort: route.hostPort },
-        );
-        return cfg;
-    }, { coordinate: false });
-
     const applyGeneration = monitor.applyEdgeRoutingGeneration || applyEdgeRoutingGeneration;
-    await Promise.resolve(applyGeneration({
-        reason: `watchdog-runtime-ready:${routeKey}`,
-        preparationLease: result.preparationLease,
-    }));
+    const runWithApplyLock = monitor.withEdgeGenerationApplyLock
+        || (monitor.applyEdgeRoutingGeneration
+            ? (callback) => callback(Object.freeze({ testOnly: true }))
+            : withEdgeGenerationApplyLock);
+    await runWithApplyLock(async (applyLockCapability) => {
+        await mergeRoute((cfg) => {
+            assertCurrent('route-registry-commit');
+            const agents = loadAgents();
+            const staged = agents?.[prepared.containerName];
+            if (!staged || staged.type !== 'agent'
+                || String(staged.instanceId || '') !== String(prepared.record.instanceId)
+                || String(staged.enableGeneration || '') !== String(prepared.record.enableGeneration)) {
+                throw new Error(`watchdog runtime replacement lost its staged registry identity for '${prepared.containerName}'`);
+            }
+            agents[prepared.containerName] = structuredClone(prepared.record);
+            saveAgents(agents, { coordinate: false });
+            cfg.routes = cfg.routes || {};
+            cfg.routes[routeKey] = mergeRuntimeRoute(
+                cfg.routes[routeKey],
+                route,
+                { hostPort: route.hostPort },
+            );
+            return cfg;
+        }, { coordinate: false });
+
+        await Promise.resolve(applyGeneration({
+            reason: `watchdog-runtime-ready:${routeKey}`,
+            preparationLease: result.preparationLease,
+            applyLockCapability,
+            testHooks: {
+                beforeSelectorCommit() {
+                    assertCurrent('selector-commit');
+                },
+            },
+        }));
+        onCommitted();
+    }, { preparationLease: result.preparationLease });
     return true;
 }
 
@@ -622,8 +1015,9 @@ async function abortFailedRestartPreparation(monitor, target, result, reason) {
     }
 }
 
-export async function performContainerRestart(monitor, target, reason) {
+export async function performContainerRestart(monitor, target, reason, attempt = null) {
     if (!monitor || !target) return;
+    assertRestartAttemptCurrent(monitor, target, attempt, 'pre-mutation-lock');
     if (monitor.isShuttingDown()) {
         target.isRestarting = false;
         return;
@@ -678,7 +1072,9 @@ export async function performContainerRestart(monitor, target, reason) {
     try {
         await runNetworkLifecycle(async (networkLifecycleCapability) => {
         let result = null;
+        let activationCommitted = false;
         try {
+        assertRestartAttemptCurrent(monitor, target, attempt, 'pre-physical-ensure');
         let manifestBytes;
         let manifest;
         try {
@@ -724,6 +1120,15 @@ export async function performContainerRestart(monitor, target, reason) {
         const routerEndpoint = resolveEndpoint(profileResolution.network.mode);
         const agentDir = path.dirname(target.manifestPath);
         const ensureAgentServiceImpl = monitor.ensureAgentService || ensureAgentService;
+        if (target.runtimeAdmission) {
+            assertRuntimeAdmissionCurrent(target.runtimeAdmission, {
+                manifestBytes,
+                profileName: profileResolution.resolvedProfileName,
+                runtimeKind: target.runtime === 'bwrap' || target.runtime === 'seatbelt'
+                    ? target.runtime
+                    : 'container',
+            });
+        }
         result = await Promise.resolve(ensureAgentServiceImpl(target.agentName, manifest, agentDir, {
             containerName: target.containerName,
             commandHint: `ploinky restart ${target.alias || target.agentName}`,
@@ -733,7 +1138,11 @@ export async function performContainerRestart(monitor, target, reason) {
             routerEndpoint,
             forceRecreate: reason === 'semantic_probe_failed',
             networkLifecycleCapability,
+            runtimeAdmission: target.runtimeAdmission,
         }));
+        assertRestartAttemptCurrent(monitor, target, attempt, 'post-physical-ensure', {
+            expectedRegistryRecord: result?.registryRecord || null,
+        });
         // Preparation rereads the manifest for generation capture, while the
         // physical launch consumes the object above. Exact-byte comparisons on
         // both sides of semantic readiness prevent those inputs from diverging.
@@ -761,33 +1170,50 @@ export async function performContainerRestart(monitor, target, reason) {
             result,
             profileResolution.network.mode,
         );
+        assertRestartAttemptCurrent(monitor, target, attempt, 'post-readiness', {
+            expectedRegistryRecord: result?.registryRecord || null,
+        });
         assertManifestUnchanged();
+        assertRestartAttemptCurrent(monitor, target, attempt, 'pre-route-activation', {
+            expectedRegistryRecord: result?.registryRecord || null,
+        });
         await activateRestartedContainerRoute(
             monitor,
             target,
             agentDir,
             result,
             profileResolution.network.mode,
+            {
+                assertCurrent(checkpoint) {
+                    assertRestartAttemptCurrent(monitor, target, attempt, checkpoint, {
+                        expectedRegistryRecord: result?.registryRecord || null,
+                    });
+                    assertManifestUnchanged();
+                },
+                onCommitted() {
+                    activationCommitted = true;
+                    target.instanceId = String(result?.registryRecord?.instanceId || '') || null;
+                    target.enableGeneration = String(result?.registryRecord?.enableGeneration || '') || null;
+
+                    if (prepared.containerName !== target.containerName) {
+                        const oldName = target.containerName;
+                        monitor.targets.delete(oldName);
+                        target.containerName = prepared.containerName;
+                        monitor.targets.set(target.containerName, target);
+                    }
+
+                    stopProbeWorker(target);
+                    target.probeState = 'pending';
+
+                    const now = Date.now();
+                    target.lastStartTime = now;
+                    target.lastSeenRunningAt = now;
+                    target.currentBackoff = monitor?.config?.INITIAL_BACKOFF_MS ?? 1000;
+                    target.circuitBreakerTripped = false;
+                    target.lastError = null;
+                },
+            },
         );
-        target.instanceId = String(result?.registryRecord?.instanceId || '') || null;
-        target.enableGeneration = String(result?.registryRecord?.enableGeneration || '') || null;
-
-        if (prepared.containerName !== target.containerName) {
-            const oldName = target.containerName;
-            monitor.targets.delete(oldName);
-            target.containerName = prepared.containerName;
-            monitor.targets.set(target.containerName, target);
-        }
-
-        stopProbeWorker(target);
-        target.probeState = 'pending';
-
-        const now = Date.now();
-        target.lastStartTime = now;
-        target.lastSeenRunningAt = now;
-        target.currentBackoff = monitor?.config?.INITIAL_BACKOFF_MS ?? 1000;
-        target.circuitBreakerTripped = false;
-        target.lastError = null;
 
         logEvent(monitor, 'info', 'container_restart_success', {
             container: target.containerName,
@@ -797,7 +1223,9 @@ export async function performContainerRestart(monitor, target, reason) {
         });
         } catch (error) {
         const failedResult = result || error?.ploinkyRestartCandidate || null;
-        await abortFailedRestartPreparation(monitor, target, failedResult, reason);
+        if (!activationCommitted) {
+            await abortFailedRestartPreparation(monitor, target, failedResult, reason);
+        }
         target.lastError = error?.message || error;
         logEvent(monitor, 'error', 'container_restart_failed', {
             container: target.containerName,
@@ -807,6 +1235,9 @@ export async function performContainerRestart(monitor, target, reason) {
             error: target.lastError
         });
         if (error && typeof error === 'object') LOGGED_RESTART_FAILURES.add(error);
+        assertRestartAttemptCurrent(monitor, target, attempt, 'pre-failure-record', {
+            expectedRegistryRecord: failedResult?.registryRecord || null,
+        });
         target.isRestarting = false;
         throw error;
         }
@@ -948,14 +1379,18 @@ export function monitorTick(monitor) {
     }
 }
 
-export function createContainerMonitor({ config, log, isShuttingDown } = {}) {
-    return {
+export function createContainerMonitor({ config, log, isShuttingDown, terminalLedgerFile: ledgerFile } = {}) {
+    const monitor = {
         config: config || {},
         log,
         isShuttingDown: typeof isShuttingDown === 'function' ? isShuttingDown : () => false,
         targets: new Map(),
-        timer: null
+        timer: null,
+        ...(ledgerFile ? { terminalLedgerFile: ledgerFile } : {}),
+        terminalLedger: null,
     };
+    monitor.terminalLedger = loadTerminalLedger(monitor);
+    return monitor;
 }
 
 export function startContainerMonitor(monitor) {

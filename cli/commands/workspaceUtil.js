@@ -29,7 +29,11 @@ import { getActiveProfile, getProfileConfig, resolveManifestRuntimeProfile } fro
 import { loadEnvFile } from '../utils/security/secretInjector.js';
 import { readSecretsFile } from '../utils/security/encryptedSecretsFile.js';
 import { getExposedNames, getManifestEnvNames } from '../utils/security/secretVars.js';
-import { isLlmRuntimeManifest, prepareLlmStartup } from '../sandbox/docker/llmRuntimeIntegration.js';
+import {
+  isLlmRuntimeManifest,
+  prepareLlmStartup,
+  resolveLlmRuntimeAdmissionContext,
+} from '../sandbox/docker/llmRuntimeIntegration.js';
 import { resolveAgentExecutionMode, resolveAgentReadinessProtocol } from '../utils/runtime/startupReadiness.js';
 import { normalizeProbeConfig, runContainerScriptReadiness } from '../sandbox/docker/healthProbes.js';
 import { applyStartupConfigProvidersForGraph } from '../sandbox/startupConfigProviders.js';
@@ -70,6 +74,10 @@ import {
   withNetworkLifecycleLock,
 } from '../sandbox/networkLifecycle.js';
 import { networkContractHash } from '../sandbox/networkContract.js';
+import {
+  admitManifestRuntimeCapabilities,
+  assertRuntimeAdmissionCurrent,
+} from '../sandbox/runtimeCapabilities.js';
 import { getAgentDataDir } from '../utils/workspaceStructure.js';
 import {
   formatAgentAttachmentBanner,
@@ -637,6 +645,82 @@ function isRegistryRuntimeRunning(containerName, record) {
   return dockerSvc.isContainerRunning(containerName);
 }
 
+export function admitWorkspaceGraphRuntimeCapabilities(graph, {
+  additionalNodes = [],
+} = {}) {
+  const nodes = [
+    ...Array.from(graph?.nodes?.values?.() || []),
+    ...(Array.isArray(additionalNodes) ? additionalNodes : []),
+  ].sort((a, b) => a.id.localeCompare(b.id));
+
+  const admissions = [];
+  for (const node of nodes) {
+    const manifestPath = node.manifestPath
+      || (node.agentPath ? path.join(node.agentPath, 'manifest.json') : '');
+    const hasExactManifestFile = manifestPath && fs.existsSync(manifestPath);
+    const manifestBytes = hasExactManifestFile
+      ? fs.readFileSync(manifestPath)
+      : Buffer.from(JSON.stringify(node.manifest || {}));
+    const manifest = hasExactManifestFile
+      ? JSON.parse(manifestBytes.toString('utf8'))
+      : node.manifest || {};
+    const profileResolution = resolveManifestRuntimeProfile(manifest, {
+      agentName: `${node.repoName}/${node.shortAgentName}`,
+      // In-memory graph fixtures have no independent profile namespace to
+      // resolve. Production graph nodes always carry the exact manifest path.
+      profileName: hasExactManifestFile ? (node.profile || undefined) : undefined,
+      path: `manifest(${node.repoName}/${node.shortAgentName})`,
+    });
+    const runtime = getRuntimeForAgent(manifest);
+    const runtimeKind = isSandboxRuntime(runtime) ? runtime : 'container';
+    const llmAdmissionContext = runtimeKind === 'container'
+      ? resolveLlmRuntimeAdmissionContext({
+        runtime,
+        manifest,
+        profileConfig: profileResolution.profileConfig,
+        agentName: node.shortAgentName,
+        alias: node.alias,
+        env: process.env,
+      })
+      : { catalogPolicy: null, catalogIdentity: null };
+    const admission = admitManifestRuntimeCapabilities(manifest, {
+      manifestBytes,
+      manifestPath: manifestPath || `manifest(${node.repoName}/${node.shortAgentName})`,
+      agentId: `${node.repoName}/${node.shortAgentName}`,
+      profileName: profileResolution.resolvedProfileName,
+      profileConfig: profileResolution.profileConfig,
+      network: profileResolution.network,
+      runtime,
+      runtimeKind,
+      catalogPolicy: llmAdmissionContext.catalogPolicy,
+      catalogIdentity: llmAdmissionContext.catalogIdentity,
+    });
+    admissions.push(Object.freeze({
+      nodeId: node.id,
+      manifestPath: hasExactManifestFile ? manifestPath : '',
+      manifestBytesBase64: Buffer.from(manifestBytes).toString('base64'),
+      profileName: profileResolution.resolvedProfileName,
+      runtimeKind,
+      admission,
+    }));
+  }
+  return Object.freeze(admissions);
+}
+
+export function assertWorkspaceGraphAdmissionsCurrent(admissions) {
+  for (const record of admissions || []) {
+    const manifestBytes = record.manifestPath
+      ? fs.readFileSync(record.manifestPath)
+      : Buffer.from(record.manifestBytesBase64, 'base64');
+    assertRuntimeAdmissionCurrent(record.admission, {
+      manifestBytes,
+      profileName: record.profileName,
+      runtimeKind: record.runtimeKind,
+    });
+  }
+  return admissions;
+}
+
 function ensureGraphNodesEnabled(graph, reg, {
   prepareAgentEnableBatch = agentsSvc.prepareAgentEnableBatch,
   removeAgentContainerForRecreate = dockerSvc.removeAgentContainerForRecreate,
@@ -662,6 +746,10 @@ function ensureGraphNodesEnabled(graph, reg, {
   // later devel target is invalid, the complete existing stack is left alone.
   const existingPlans = [];
   const missingNodes = [];
+
+  // Keep the physical preparation boundary independently fail-closed even
+  // though startWorkspace performs the same complete-graph gate before locks.
+  admitWorkspaceGraphRuntimeCapabilities(graph, { additionalNodes });
 
   for (const node of nodes) {
     const existing = findRegistryEntryForGraphNode(reg, node, dockerSvc.getAgentContainerName);
@@ -751,7 +839,10 @@ function ensureGraphNodesEnabled(graph, reg, {
     authOptions: {
       profile: node.profile || undefined,
     },
-  })), { reason: 'workspace-graph-enable-prelaunch' });
+  })), {
+    reason: 'workspace-graph-enable-prelaunch',
+    availabilityMode: 'replacement',
+  });
   if (prepared?.preparedGeneration?.selector
       && prepared.preparedGeneration.selector.state !== 'inactive') {
     throw new Error('workspace graph prelaunch generation unexpectedly became active');
@@ -1226,10 +1317,59 @@ function buildDashboardUrl(staticPort, env = process.env) {
     : `http://127.0.0.1:${staticPort}/dashboard`;
 }
 
+export function preflightWorkspaceStartRuntimeCapabilities(staticAgentArg) {
+  const configured = workspaceSvc.getConfig()?.static?.agent || '';
+  let staticAgent = String(staticAgentArg || configured || '').trim();
+  if (!staticAgent) {
+    throw new Error('start: missing static agent or port. Usage: start <staticAgent> <port> (first time).');
+  }
+  try {
+    const aliasRecord = agentsSvc.resolveEnabledAgentRecord(staticAgent);
+    if (aliasRecord?.record?.alias) {
+      staticAgent = `${aliasRecord.record.repoName}/${aliasRecord.record.agentName}`;
+    }
+  } catch (_) {
+    // Graph resolution below owns the canonical not-found/ambiguity error.
+  }
+  const registry = deduplicateAgentRegistry(
+    workspaceSvc.loadAgents(),
+    dockerSvc.getAgentContainerName,
+  );
+  const graph = resolveWorkspaceDependencyGraph({
+    staticAgentRef: staticAgent,
+    registry,
+  });
+  const additionalNodes = resolveExtraEnabledRuntimeNodes(
+    graph,
+    registry,
+    dockerSvc.getAgentContainerName,
+  );
+  const admissions = admitWorkspaceGraphRuntimeCapabilities(graph, { additionalNodes });
+  return Object.freeze({ graph, registry, additionalNodes, admissions });
+}
+
 async function startWorkspace(staticAgentArg, portArg, {
   killRouterIfRunning,
   branchPolicy,
 } = {}) {
+  // Acquire every declared dependency source before resolving the complete
+  // graph. A fresh workspace cannot admit repositories that do not exist yet.
+  // Repository preparation remains ahead of authoritative workspace mutation,
+  // then the exact resulting graph is admitted and retained.
+  // The same admission is revalidated under the start lock before the first
+  // selector, route, config, or Router write.
+  const requestedStaticAgent = String(
+    staticAgentArg || workspaceSvc.getConfig()?.static?.agent || '',
+  ).trim();
+  try {
+    await prepareManifestRepositories(requestedStaticAgent, {
+      branchPolicy,
+      profile: getActiveProfile(),
+    });
+  } catch (err) {
+    throw new Error(`Failed to prepare manifest repositories for '${requestedStaticAgent}': ${err?.message || err}`);
+  }
+  const admittedStart = preflightWorkspaceStartRuntimeCapabilities(staticAgentArg);
   // The workspace mutation lease covers source initialization, candidate
   // writes, both inactive prelaunch preparations, and every subsequent start.
   // Only the final post-provider lease may authorize runtime targets.
@@ -1240,6 +1380,8 @@ async function startWorkspace(staticAgentArg, portArg, {
   try {
   return await withNetworkLifecycleLock(async (networkLifecycleCapability) => {
   try {
+  assertWorkspaceGraphAdmissionsCurrent(admittedStart.admissions);
+  const lockedStart = preflightWorkspaceStartRuntimeCapabilities(staticAgentArg);
   initializeFreshEdgeRoutingSources({ workspaceRoot: PLOINKY_WORKSPACE_ROOT });
   inactivateEdgeRoutingGeneration('workspace-start-prepare', { workspaceRoot: PLOINKY_WORKSPACE_ROOT });
   const resolvedStartPort = await resolveAndPersistStartRouterPort(staticAgentArg, portArg, {
@@ -1352,31 +1494,13 @@ async function startWorkspace(staticAgentArg, portArg, {
       shortAgentName: staticShortAgent,
     });
 
-    // Install/prepare the complete manifest repo graph without starting any
-    // consumer, then compile one target-less inactive edge generation. Static
+    // Compile the already prepared and admitted complete manifest graph into
+    // one target-less inactive edge generation. Static
     // preinstall and config-provider hooks receive that exact topology before
     // any agent process or container is allowed to start.
-    try {
-      await prepareManifestRepositories(cfg0.static.agent, {
-        branchPolicy,
-        profile: getActiveProfile(),
-      });
-    } catch (err) {
-      throw new Error(`Failed to prepare manifest repositories for '${cfg0.static.agent}': ${err?.message || err}`);
-    }
-    const providerRegistry = deduplicateAgentRegistry(
-      workspaceSvc.loadAgents(),
-      dockerSvc.getAgentContainerName,
-    );
-    let dependencyGraph;
-    try {
-      dependencyGraph = resolveWorkspaceDependencyGraph({
-        staticAgentRef: staticAgent,
-        registry: providerRegistry,
-      });
-    } catch (graphErr) {
-      throw new Error(`Failed to resolve dependency graph for '${staticAgent}': ${graphErr.message}`);
-    }
+    assertWorkspaceGraphAdmissionsCurrent(lockedStart.admissions);
+    const providerRegistry = lockedStart.registry;
+    const dependencyGraph = lockedStart.graph;
 
     let reg = providerRegistry;
     workspaceSvc.saveAgents(reg);
@@ -1384,11 +1508,7 @@ async function startWorkspace(staticAgentArg, portArg, {
     const { getAgentContainerName, ensureAgentService } = dockerSvc;
 
     const waitClassification = classifyDependencyGraphWaitMode(dependencyGraph);
-    const extraRuntimeNodes = resolveExtraEnabledRuntimeNodes(
-      dependencyGraph,
-      reg,
-      dockerSvc.getAgentContainerName,
-    );
+    const extraRuntimeNodes = lockedStart.additionalNodes;
     let preparedGraph = ensureGraphNodesEnabled(dependencyGraph, reg, {
       deferredNodeIds: waitClassification.noWait,
       additionalNodes: extraRuntimeNodes,
@@ -1825,6 +1945,57 @@ async function startWorkspace(staticAgentArg, portArg, {
   }
 }
 
+export function admitDirectAgentRuntimeManifest(manifest, {
+  manifestPath = '',
+  manifestBytes,
+  agentId = '',
+  profileName,
+  persistedProfileName,
+} = {}) {
+  const exactBytes = manifestBytes === undefined
+    ? (manifestPath && fs.existsSync(manifestPath)
+      ? fs.readFileSync(manifestPath)
+      : Buffer.from(JSON.stringify(manifest || {})))
+    : manifestBytes;
+  const exactManifest = JSON.parse(Buffer.from(exactBytes).toString('utf8'));
+  if (JSON.stringify(exactManifest) !== JSON.stringify(manifest)) {
+    const error = new Error(`runtime manifest bytes changed before admission for '${agentId || manifestPath}'`);
+    error.code = 'PLOINKY_RUNTIME_INPUT_CHANGED';
+    error.status = 409;
+    throw error;
+  }
+  const profileResolution = resolveManifestRuntimeProfile(exactManifest, {
+    agentName: agentId,
+    profileName,
+    persistedProfileName,
+    path: `manifest(${agentId || manifestPath})`,
+  });
+  const runtime = getRuntimeForAgent(exactManifest);
+  const runtimeKind = isSandboxRuntime(runtime) ? runtime : 'container';
+  const llmAdmissionContext = runtimeKind === 'container'
+    ? resolveLlmRuntimeAdmissionContext({
+      runtime,
+      manifest: exactManifest,
+      profileConfig: profileResolution.profileConfig,
+      agentName: String(agentId || '').split('/').pop(),
+      env: process.env,
+    })
+    : { catalogPolicy: null, catalogIdentity: null };
+  const runtimeAdmission = admitManifestRuntimeCapabilities(exactManifest, {
+    manifestBytes: exactBytes,
+    manifestPath,
+    agentId,
+    profileName: profileResolution.resolvedProfileName,
+    profileConfig: profileResolution.profileConfig,
+    network: profileResolution.network,
+    runtime,
+    runtimeKind,
+    catalogPolicy: llmAdmissionContext.catalogPolicy,
+    catalogIdentity: llmAdmissionContext.catalogIdentity,
+  });
+  return Object.freeze({ runtimeAdmission, profileResolution, runtime, runtimeKind });
+}
+
 export async function runCliWithDependencies(agentName, args, dependencies) {
   if (!agentName) { throw new Error('Usage: cli <agentName> [args...]'); }
   const {
@@ -1851,6 +2022,7 @@ export async function runCliWithDependencies(agentName, args, dependencies) {
     warn = () => {},
     error = () => {},
     withSuspendedInput = callback => callback(),
+    admitRuntimeManifest = admitDirectAgentRuntimeManifest,
   } = dependencies;
   const suppressLauncherLogs = env.PLOINKY_NO_TTY === '1';
   let registryRecord = null;
@@ -1907,6 +2079,11 @@ export async function runCliWithDependencies(agentName, args, dependencies) {
     : manifestLookup;
   const { manifestPath, shortAgentName } = findAgent(resolvedManifestRef);
   const manifest = readManifest(manifestPath);
+  const directAdmission = admitRuntimeManifest(manifest, {
+    manifestPath,
+    agentId: resolvedManifestRef,
+    persistedProfileName: registryRecord?.record?.profile,
+  });
   resolveManifestStartup(manifest);
   if (routerEndpoint === undefined) {
     routerEndpoint = resolveRouterEndpointForManifestImpl(manifest, {
@@ -1954,6 +2131,7 @@ export async function runCliWithDependencies(agentName, args, dependencies) {
           containerName: registryRecord?.containerName,
           alias: registryRecord?.record?.alias,
           routerEndpoint,
+          runtimeAdmission: directAdmission.runtimeAdmission,
           networkLifecycleCapability,
         });
         const exactContainerName = result?.containerName
@@ -2094,6 +2272,11 @@ async function runShell(agentName) {
     : agentName;
   const { manifestPath, shortAgentName } = utils.findAgent(manifestLookup);
   const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+  const directAdmission = admitDirectAgentRuntimeManifest(manifest, {
+    manifestPath,
+    agentId: manifestLookup,
+    persistedProfileName: registryRecord?.record?.profile,
+  });
   const routerEndpoint = resolveManifestRouterEndpoint(manifest, {
     persistedProfileName: registryRecord?.record?.profile,
     path: `manifest(${manifestLookup})`,
@@ -2109,6 +2292,7 @@ async function runShell(agentName) {
         containerName: registeredContainerName,
         alias: registryRecord?.record?.alias,
         routerEndpoint,
+        runtimeAdmission: directAdmission.runtimeAdmission,
         networkLifecycleCapability,
       });
       const exactContainerName = result?.containerName || registeredContainerName;
@@ -2215,6 +2399,11 @@ async function reinstallAgent(agentName) {
         persistedProfileName: registryRecord?.record?.profile,
         path: `manifest(${resolved.repo}/${resolved.shortAgentName})`,
     });
+    const directAdmission = admitDirectAgentRuntimeManifest(manifest, {
+        manifestPath: resolved.manifestPath,
+        agentId: `${resolved.repo}/${resolved.shortAgentName}`,
+        persistedProfileName: registryRecord?.record?.profile,
+    });
 
     const agentRuntime = getRuntimeForAgent(manifest);
     const bwrapRunning = isSandboxRuntime(agentRuntime)
@@ -2252,6 +2441,7 @@ async function reinstallAgent(agentName) {
                 alias: registryRecord?.record?.alias,
                 forceRecreate: true,
                 routerEndpoint,
+                runtimeAdmission: directAdmission.runtimeAdmission,
                 networkLifecycleCapability,
             });
             const { containerName: newContainerName, hostPort } = reinstallResult;

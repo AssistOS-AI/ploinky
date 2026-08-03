@@ -45,6 +45,8 @@ const { applyManifestDirectives, parseEnableDirective } = bootstrapModule;
 const workspaceUtilModuleUrl = new URL('../../cli/commands/workspaceUtil.js', import.meta.url);
 const {
     assertStaticPreinstallSucceeded,
+    admitWorkspaceGraphRuntimeCapabilities,
+    assertWorkspaceGraphAdmissionsCurrent,
     buildBlockingReadinessEntryFromNode,
     ensureGraphNodesEnabled,
     reprepareGraphAfterStartupProviders,
@@ -65,6 +67,28 @@ test('parseManifestDependencyRef strips mode and alias syntax down to the agent 
     assert.equal(parseManifestDependencyRef('gitAgent global'), 'gitAgent');
     assert.equal(parseManifestDependencyRef('basic/keycloak as auth'), 'basic/keycloak');
     assert.equal(parseManifestDependencyRef('repo/agent:dev'), 'repo/agent');
+});
+
+test('workspace graph admission retains exact manifest bytes for under-lock revalidation', () => {
+    writeManifest('demo', 'admitted', { container: 'node:20-alpine' });
+    const manifestPath = path.join(tempDir, '.ploinky', 'repos', 'demo', 'admitted', 'manifest.json');
+    const graph = {
+        nodes: new Map([['demo/admitted', {
+            id: 'demo/admitted',
+            repoName: 'demo',
+            shortAgentName: 'admitted',
+            agentPath: path.dirname(manifestPath),
+            manifestPath,
+            manifest: JSON.parse(fs.readFileSync(manifestPath, 'utf8')),
+        }]]),
+    };
+    const admissions = admitWorkspaceGraphRuntimeCapabilities(graph);
+    assert.doesNotThrow(() => assertWorkspaceGraphAdmissionsCurrent(admissions));
+    fs.appendFileSync(manifestPath, '\n');
+    assert.throws(
+        () => assertWorkspaceGraphAdmissionsCurrent(admissions),
+        { code: 'PLOINKY_RUNTIME_INPUT_CHANGED' },
+    );
 });
 
 test('resolveEnabledAgentRegistryRecord matches core direct, alias, canonical, and ambiguity semantics', () => {
@@ -1026,7 +1050,7 @@ test('a stopped enabled runtime outside the dependency graph is staged target-le
     assert.equal(registry.outside_container.enableGeneration, 'outside-new-generation');
     assert.deepEqual(registry.outside_container.auth, { mode: 'sso', retained: true });
     const source = startWorkspace.toString();
-    assert.match(source, /resolveExtraEnabledRuntimeNodes\([\s\S]*?additionalNodes:\s*extraRuntimeNodes/);
+    assert.match(source, /const extraRuntimeNodes = lockedStart\.additionalNodes;[\s\S]*?additionalNodes:\s*extraRuntimeNodes/);
 });
 
 test('devel execution preflight fails before removing any retained graph container', () => {
