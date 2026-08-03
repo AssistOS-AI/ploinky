@@ -23,6 +23,7 @@ import {
 } from '../sandbox/docker/agentServiceManager.js';
 import { isBwrapProcessRunning } from '../sandbox/bwrap/bwrapFleet.js';
 import * as inputState from './inputState.js';
+import { prepareDefaultBootRepositories } from './ploinkyboot.js';
 import { prepareManifestRepositories } from '../utils/runtime/bootstrapManifest.js';
 import { buildLifecycleHookEnv, executeHostHook, markPreinstallRunInProcess, resetPreinstallRunInProcess, isInlineCommand } from '../utils/runtime/lifecycleHooks.js';
 import { getActiveProfile, getProfileConfig, resolveManifestRuntimeProfile } from '../utils/runtime/profileService.js';
@@ -1362,6 +1363,10 @@ async function startWorkspace(staticAgentArg, portArg, {
     staticAgentArg || workspaceSvc.getConfig()?.static?.agent || '',
   ).trim();
   try {
+    prepareDefaultBootRepositories({
+      branchPolicy,
+      staticAgent: requestedStaticAgent,
+    });
     await prepareManifestRepositories(requestedStaticAgent, {
       branchPolicy,
       profile: getActiveProfile(),

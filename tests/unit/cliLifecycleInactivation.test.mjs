@@ -54,6 +54,7 @@ test('start admits prepared repositories before persisting the fixed Router port
         'fresh dependency repositories must be acquired before complete-graph admission',
     );
     assertOrdered(workspaceSource, [
+        'prepareDefaultBootRepositories',
         'prepareManifestRepositories',
         'const admittedStart = preflightWorkspaceStartRuntimeCapabilities',
         'createWorkspaceStartLock()',
