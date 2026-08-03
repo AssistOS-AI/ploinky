@@ -148,7 +148,7 @@ test_run_dir/
 # JetBrains IDEs
 .idea/
 
-CLAUDE.md
+# CLAUDE.md is the versioned canonical repository contract.
 # >>> ploinky default-skills >>>
 .claude
 .agents/skills/achilles-specs/
