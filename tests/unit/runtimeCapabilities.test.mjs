@@ -135,6 +135,14 @@ test('strict Box marker rejects unsupported capabilities but defers host-network
         assert.doesNotThrow(() => assertRuntimeCapabilitiesAllowed(hostNetwork, {
             boxMarkerOptions: { markerPath: fixture.markerPath },
         }));
+        assert.throws(
+            () => assertRuntimeCapabilitiesAllowed(hostNetwork, {
+                runtimeKind: 'bwrap',
+                boxMarkerOptions: { markerPath: fixture.markerPath },
+            }),
+            (error) => error.code === 'PLOINKY_BOX_RUNTIME_CAPABILITY_UNSUPPORTED'
+                && error.context.unsupported.includes('box-host-sandbox'),
+        );
     } finally {
         fs.rmSync(fixture.root, { recursive: true, force: true });
     }

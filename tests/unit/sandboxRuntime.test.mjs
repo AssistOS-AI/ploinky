@@ -123,6 +123,115 @@ test('sandbox profile resolution honors explicit profiles and requires host netw
     }
 });
 
+test('every host-sandbox launch boundary revalidates exact generation authority before physical launch', () => {
+    const checks = [
+        {
+            relativePath: 'cli/sandbox/bwrap/bwrapServiceManager.js',
+            functions: [
+                ['startBwrapProcess', 'spawn(BWRAP_PATH'],
+                ['ensureBwrapService', 'startBwrapProcess('],
+                ['attachBwrapInteractive', 'spawnBwrapInteractive('],
+            ],
+        },
+        {
+            relativePath: 'cli/sandbox/seatbelt/seatbeltServiceManager.js',
+            functions: [
+                ['startSeatbeltProcess', "spawn('sandbox-exec'"],
+                ['ensureSeatbeltService', 'startSeatbeltProcess('],
+                ['attachSeatbeltInteractive', "spawnSync('sandbox-exec'"],
+            ],
+        },
+    ];
+    for (const { relativePath, functions } of checks) {
+        const source = fs.readFileSync(path.join(repoRoot, relativePath), 'utf8');
+        for (const [functionName, launchCall] of functions) {
+            const start = source.indexOf(`function ${functionName}(`);
+            assert.notEqual(start, -1, `${relativePath} must define ${functionName}`);
+            const next = source.indexOf('\nfunction ', start + 1);
+            const body = source.slice(start, next === -1 ? source.length : next);
+            const admission = body.indexOf('admit');
+            const authority = body.indexOf('assertHostModeGenerationCapability(');
+            const launch = body.indexOf(launchCall);
+            assert.ok(admission >= 0 && admission < launch, `${functionName} must admit exact manifest bytes before launch`);
+            assert.ok(authority >= 0 && authority < launch, `${functionName} must authorize the exact host-mode generation before launch`);
+        }
+    }
+});
+
+test('host-sandbox service and interactive boundaries deny an inactive generation before hooks or spawn', () => {
+    for (const runtime of ['bwrap', 'seatbelt']) {
+        const root = fs.mkdtempSync(path.join(os.tmpdir(), `ploinky-${runtime}-authority-`));
+        try {
+            const repoDir = path.join(root, '.ploinky', 'repos', 'repo');
+            const agentDir = path.join(repoDir, 'agent');
+            const hookMarker = path.join(root, `${runtime}-hook-ran`);
+            fs.mkdirSync(agentDir, { recursive: true });
+            fs.writeFileSync(path.join(agentDir, 'preinstall.sh'), `#!/bin/sh\nprintf ran > ${JSON.stringify(hookMarker)}\n`);
+            fs.chmodSync(path.join(agentDir, 'preinstall.sh'), 0o755);
+            const manifest = {
+                network: { mode: 'host' },
+                start: 'sleep 3600',
+                profiles: { default: { preinstall: 'preinstall.sh' } },
+                readiness: { protocol: 'none' },
+            };
+            fs.writeFileSync(path.join(agentDir, 'manifest.json'), JSON.stringify(manifest));
+            fs.writeFileSync(path.join(root, '.ploinky', 'agents.json'), JSON.stringify({
+                'test-sandbox': {
+                    type: 'agent',
+                    runtime,
+                    repoName: 'repo',
+                    agentName: 'agent',
+                    projectPath: root,
+                    runMode: 'global',
+                    profile: 'default',
+                    instanceId: 'instance-current',
+                    enableGeneration: 'enable-current',
+                },
+            }));
+            const managerUrl = runtime === 'bwrap' ? bwrapServiceManagerUrl : seatbeltServiceManagerUrl;
+            const startName = runtime === 'bwrap' ? 'startBwrapProcess' : 'startSeatbeltProcess';
+            const attachName = runtime === 'bwrap' ? 'attachBwrapInteractive' : 'attachSeatbeltInteractive';
+            const script = `
+                const fs = await import('node:fs');
+                const manager = await import(${JSON.stringify(managerUrl)});
+                const { buildRouterEndpoint } = await import(${JSON.stringify(pathToFileURL(path.join(repoRoot, 'cli/sandbox/routerPort.js')).href)});
+                const manifest = JSON.parse(fs.readFileSync(${JSON.stringify(path.join(agentDir, 'manifest.json'))}, 'utf8'));
+                const options = {
+                    containerName: 'test-sandbox',
+                    profileName: 'default',
+                    routerEndpoint: buildRouterEndpoint('host', 8080),
+                    instanceId: 'instance-current',
+                    enableGeneration: 'enable-current',
+                };
+                const failures = {};
+                for (const [name, invoke] of [
+                    ['start', () => manager[${JSON.stringify(startName)}]('agent', manifest, ${JSON.stringify(agentDir)}, options)],
+                    ['attach', () => manager[${JSON.stringify(attachName)}]('agent', manifest, ${JSON.stringify(agentDir)}, ${JSON.stringify(root)}, '/bin/sh', options)],
+                ]) {
+                    try { invoke(); failures[name] = 'UNEXPECTED_SUCCESS'; }
+                    catch (error) { failures[name] = error.code || error.message; }
+                }
+                console.log(JSON.stringify(failures));
+            `;
+            const result = runModuleScript({
+                cwd: root,
+                env: {
+                    PLOINKY_WORKSPACE_ROOT: root,
+                    PLOINKY_MASTER_KEY: 'ac'.repeat(32),
+                },
+                script,
+            });
+            assert.equal(result.status, 0, result.stderr || result.stdout);
+            const failures = parseLastJsonLine(result.stdout);
+            assert.match(failures.start, /EDGE_GENERATION_INACTIVE|HOST_MODE_CAPABILITY_DENIED/);
+            assert.match(failures.attach, /EDGE_GENERATION_INACTIVE|HOST_MODE_CAPABILITY_DENIED/);
+            assert.equal(fs.existsSync(hookMarker), false, `${runtime} denial must precede the manifest hook`);
+        } finally {
+            fs.rmSync(root, { recursive: true, force: true });
+        }
+    }
+});
+
 test('bwrap and seatbelt validate the host endpoint but emit no uncertified Router env', () => {
     for (const relativePath of [
         'cli/sandbox/bwrap/bwrapServiceManager.js',

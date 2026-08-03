@@ -93,6 +93,7 @@ import {
     admitManifestRuntimeCapabilities,
     assertRuntimeAdmissionCurrent,
 } from '../runtimeCapabilities.js';
+import { assertHostModeGenerationCapability } from '../edgeGeneration.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -667,6 +668,13 @@ function startBwrapProcess(agentName, manifest, agentPath, options = {}) {
     const activeProfile = profileResolution.resolvedProfileName;
     const profileConfig = profileResolution.profileConfig;
     admitBwrapBoundary(agentName, manifest, agentPath, options, profileResolution);
+    assertHostModeGenerationCapability({
+        agentId: deriveAgentPrincipalId(repoName, agentName),
+        instanceId: runtimeIdentity.instanceId,
+        enableGeneration: runtimeIdentity.enableGeneration,
+        routeKey: alias || agentName,
+        containerName,
+    }, { preparedCapability: options.preparedHostModeCapability });
     assertBwrapPidSlotAvailable(containerName);
     const routerEndpoint = resolveSandboxRouterEndpoint(options, profileResolution.network.mode);
 
@@ -768,6 +776,13 @@ function startBwrapProcess(agentName, manifest, agentPath, options = {}) {
     debugLog(`[bwrap] ${agentName}: log file: ${logFile}`);
 
     // Spawn detached bwrap process
+    assertHostModeGenerationCapability({
+        agentId: deriveAgentPrincipalId(repoName, agentName),
+        instanceId: runtimeIdentity.instanceId,
+        enableGeneration: runtimeIdentity.enableGeneration,
+        routeKey: alias || agentName,
+        containerName,
+    }, { preparedCapability: options.preparedHostModeCapability });
     const logFd = fs.openSync(logFile, 'a');
     const child = spawn(BWRAP_PATH, bwrapArgs, {
         detached: true,
@@ -949,6 +964,13 @@ function ensureBwrapService(agentName, manifest, agentPath, options = {}) {
         options,
         profileResolution,
     );
+    assertHostModeGenerationCapability({
+        agentId: deriveAgentPrincipalId(repoName, agentName),
+        instanceId: runtimeIdentity.instanceId,
+        enableGeneration: runtimeIdentity.enableGeneration,
+        routeKey: aliasOverride || agentName,
+        containerName,
+    }, { preparedCapability: options.preparedHostModeCapability });
     const routerEndpoint = resolveSandboxRouterEndpoint(options, profileResolution.network.mode);
 
     assertManifestEnvProfileCompleteness(manifest, profileConfig, { agentName, repoName, profileName: activeProfile });
@@ -1009,6 +1031,7 @@ function ensureBwrapService(agentName, manifest, agentPath, options = {}) {
         preservePreparedRegistryRecord: options.preservePreparedRegistryRecord,
         runtimeAdmission: runtimeBoundary.admission,
         manifestBytes: runtimeBoundary.manifestBytes,
+        preparedHostModeCapability: options.preparedHostModeCapability,
     });
 }
 
@@ -1034,6 +1057,14 @@ function attachBwrapInteractive(agentName, manifest, agentPath, workdir, entryCo
     const profileResolution = resolveBwrapRuntimeProfile(agentName, manifest, agentPath, options, record);
     const activeProfile = profileResolution.resolvedProfileName;
     const profileConfig = profileResolution.profileConfig;
+    admitBwrapBoundary(agentName, manifest, agentPath, options, profileResolution);
+    assertHostModeGenerationCapability({
+        agentId: deriveAgentPrincipalId(repoName, agentName),
+        instanceId: runtimeIdentity.instanceId,
+        enableGeneration: runtimeIdentity.enableGeneration,
+        routeKey: record.alias || agentName,
+        containerName,
+    });
     const routerEndpoint = resolveSandboxRouterEndpoint(options, profileResolution.network.mode);
 
     // Resolve paths
@@ -1118,6 +1149,13 @@ function attachBwrapInteractive(agentName, manifest, agentPath, workdir, entryCo
     debugLog(`[bwrap] ${agentName}: interactive session: sh -lc ${JSON.stringify(shellCommand)}`);
 
     try {
+        assertHostModeGenerationCapability({
+            agentId: deriveAgentPrincipalId(repoName, agentName),
+            instanceId: runtimeIdentity.instanceId,
+            enableGeneration: runtimeIdentity.enableGeneration,
+            routeKey: record.alias || agentName,
+            containerName,
+        });
         const result = spawnBwrapInteractive(bwrapArgs, { usePty: process.stdin.isTTY });
         return result.status ?? 0;
     } finally {

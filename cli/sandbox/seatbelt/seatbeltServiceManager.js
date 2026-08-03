@@ -3,6 +3,7 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { debugLog } from '../../utils/utils.js';
+import { deriveAgentPrincipalId } from '../../utils/security/agentIdentity.js';
 import {
     CONTAINER_CONFIG_PATH,
     computeEnvHash,
@@ -78,6 +79,7 @@ import {
     admitManifestRuntimeCapabilities,
     assertRuntimeAdmissionCurrent,
 } from '../runtimeCapabilities.js';
+import { assertHostModeGenerationCapability } from '../edgeGeneration.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -425,6 +427,13 @@ function startSeatbeltProcess(agentName, manifest, agentPath, options = {}) {
     const activeProfile = profileResolution.resolvedProfileName;
     const profileConfig = profileResolution.profileConfig;
     admitSeatbeltBoundary(agentName, manifest, agentPath, options, profileResolution);
+    assertHostModeGenerationCapability({
+        agentId: deriveAgentPrincipalId(repoName, agentName),
+        instanceId: runtimeIdentity.instanceId,
+        enableGeneration: runtimeIdentity.enableGeneration,
+        routeKey: options.alias || profileRecord.alias || agentName,
+        containerName,
+    }, { preparedCapability: options.preparedHostModeCapability });
     assertBwrapPidSlotAvailable(containerName);
     const routerEndpoint = resolveSeatbeltRouterEndpoint(options, profileResolution.network.mode);
 
@@ -549,6 +558,13 @@ function startSeatbeltProcess(agentName, manifest, agentPath, options = {}) {
     debugLog(`[seatbelt] ${agentName}: log file: ${logFile}`);
 
     // Spawn detached sandbox-exec process
+    assertHostModeGenerationCapability({
+        agentId: deriveAgentPrincipalId(repoName, agentName),
+        instanceId: runtimeIdentity.instanceId,
+        enableGeneration: runtimeIdentity.enableGeneration,
+        routeKey: options.alias || profileRecord.alias || agentName,
+        containerName,
+    }, { preparedCapability: options.preparedHostModeCapability });
     const logFd = fs.openSync(logFile, 'a');
     const child = spawn('sandbox-exec', ['-f', profilePath, 'sh', '-c', entryCmd], {
         detached: true,
@@ -728,6 +744,13 @@ function ensureSeatbeltService(agentName, manifest, agentPath, options = {}) {
         options,
         profileResolution,
     );
+    assertHostModeGenerationCapability({
+        agentId: deriveAgentPrincipalId(repoName, agentName),
+        instanceId: runtimeIdentity.instanceId,
+        enableGeneration: runtimeIdentity.enableGeneration,
+        routeKey: aliasOverride || agentName,
+        containerName,
+    }, { preparedCapability: options.preparedHostModeCapability });
     const routerEndpoint = resolveSeatbeltRouterEndpoint(options, profileResolution.network.mode);
 
     assertManifestEnvProfileCompleteness(manifest, profileConfig, { agentName, repoName, profileName: activeProfile });
@@ -791,6 +814,7 @@ function ensureSeatbeltService(agentName, manifest, agentPath, options = {}) {
         preservePreparedRegistryRecord: options.preservePreparedRegistryRecord,
         runtimeAdmission: runtimeBoundary.admission,
         manifestBytes: runtimeBoundary.manifestBytes,
+        preparedHostModeCapability: options.preparedHostModeCapability,
     });
 }
 
@@ -813,6 +837,14 @@ function attachSeatbeltInteractive(agentName, manifest, agentPath, workdir, entr
     const profileResolution = resolveSeatbeltRuntimeProfile(agentName, manifest, agentPath, options, record);
     const activeProfile = profileResolution.resolvedProfileName;
     const profileConfig = profileResolution.profileConfig;
+    admitSeatbeltBoundary(agentName, manifest, agentPath, options, profileResolution);
+    assertHostModeGenerationCapability({
+        agentId: deriveAgentPrincipalId(repoName, agentName),
+        instanceId: runtimeIdentity.instanceId,
+        enableGeneration: runtimeIdentity.enableGeneration,
+        routeKey: record.alias || agentName,
+        containerName,
+    });
     const routerEndpoint = resolveSeatbeltRouterEndpoint(options, profileResolution.network.mode);
 
     // Resolve paths
@@ -911,6 +943,13 @@ function attachSeatbeltInteractive(agentName, manifest, agentPath, workdir, entr
 
     debugLog(`[seatbelt] ${agentName}: interactive session: sh -lc "cd '${wd}' && ${rewrittenCmd}"`);
 
+    assertHostModeGenerationCapability({
+        agentId: deriveAgentPrincipalId(repoName, agentName),
+        instanceId: runtimeIdentity.instanceId,
+        enableGeneration: runtimeIdentity.enableGeneration,
+        routeKey: record.alias || agentName,
+        containerName,
+    });
     const result = spawnSync('sandbox-exec', ['-f', profilePath, 'sh', '-lc', `cd '${wd}' && ${rewrittenCmd}`], {
         stdio: 'inherit',
         env: envMap,

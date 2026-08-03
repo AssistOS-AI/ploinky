@@ -382,6 +382,9 @@ export function assertRuntimeCapabilitiesAllowed(descriptor, {
     // it can render `--network host`.  Keep it in the immutable descriptor so
     // that grant is bound to the admitted bytes, but do not reject it during
     // graph admission before the generation authority exists.
+    if (box && runtimeKind !== 'container' && descriptor.capabilities.hostNetwork) {
+        unsupported.push('box-host-sandbox');
+    }
     if (runtimeKind !== 'container' && descriptor.capabilities.hostNetwork !== true) {
         unsupported.push('isolated-network-host-sandbox');
     }
