@@ -95,7 +95,6 @@ fast_graph_create_start_http_agent() {
 
   cat >"$agent_dir/manifest.json" <<EOF
 {
-  "lite-sandbox": true,
   "container": "node:20-bullseye",
   "start": "node /code/delayed-http.js",
   "enable": ${enable_json},
@@ -141,7 +140,6 @@ EOF
 
   cat >"$agent_dir/manifest.json" <<EOF
 {
-  "lite-sandbox": true,
   "container": "node:20-bullseye",
   "agent": "node /code/delayed-http.js",
   "enable": ${enable_json},
@@ -200,7 +198,6 @@ EOF
 
   cat >"$agent_dir/manifest.json" <<EOF
 {
-  "lite-sandbox": true,
   "container": "node:20-bullseye",
   "agent": "sh /code/start-delayed-mcp.sh",
   "enable": ${enable_json},
@@ -507,7 +504,6 @@ EOF
 
   cat >"$provider_dir/manifest.json" <<'EOF'
 {
-  "lite-sandbox": true,
   "container": "node:20-bullseye",
   "start": "node /code/delayed-http.js",
   "readiness": {
@@ -550,7 +546,6 @@ EOF
 
   cat >"$root_dir/manifest.json" <<'EOF'
 {
-  "lite-sandbox": true,
   "container": "node:20-bullseye",
   "start": "node /code/root.js",
   "readiness": {

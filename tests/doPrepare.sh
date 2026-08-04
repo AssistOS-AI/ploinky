@@ -42,13 +42,7 @@ test_info "Workspace root: $TEST_RUN_DIR"
 
 cd "$TEST_RUN_DIR"
 
-if command -v bwrap >/dev/null 2>&1; then
-  FAST_AGENT_RUNTIME="bwrap"
-elif [[ "$(uname -s)" == "Darwin" ]] && command -v sandbox-exec >/dev/null 2>&1; then
-  FAST_AGENT_RUNTIME="seatbelt"
-else
-  FAST_AGENT_RUNTIME="container"
-fi
+FAST_AGENT_RUNTIME="container"
 write_state_var "FAST_AGENT_RUNTIME" "$FAST_AGENT_RUNTIME"
 test_info "Agent runtime: $FAST_AGENT_RUNTIME"
 
@@ -154,7 +148,6 @@ EOF
 
 cat >"${openai_agent_root}/manifest.json" <<EOF
 {
-  "lite-sandbox": true,
   "container": "node:20-bullseye",
   "endpoints": {
     "chatCompletions": {
@@ -187,7 +180,6 @@ mkdir -p "$disable_agent_root"
 
 cat >"${disable_agent_root}/manifest.json" <<'EOF'
 {
-  "lite-sandbox": true,
   "container": "node:20-bullseye",
   "agent": "node -e \"setInterval(()=>{}, 1_000_000)\"",
   "readiness": {
@@ -202,7 +194,6 @@ write_state_var "TEST_HEALTH_AGENT_REPO_PATH" "$health_agent_root"
 
 cat >"${health_agent_root}/manifest.json" <<'EOF'
 {
-  "lite-sandbox": true,
   "container": "node:20-bullseye",
   "start": "node -e \"setInterval(()=>{}, 1_000_000)\"",
   "health": {
@@ -241,7 +232,6 @@ mkdir -p "$dep_agent_root"
 
 cat >"${dep_agent_root}/manifest.json" <<'EOF'
 {
-  "lite-sandbox": true,
   "container": "node:20-bullseye",
   "profiles": {
     "default": {
@@ -257,7 +247,6 @@ mkdir -p "$dep_devel_root"
 
 cat >"${dep_devel_root}/manifest.json" <<'EOF'
 {
-  "lite-sandbox": true,
   "container": "node:20-bullseye",
   "start": "node -e \"require('net').createServer(()=>{}).listen(Number(process.env.PORT||7000), '0.0.0.0'); setInterval(()=>{}, 1_000_000)\"",
   "readiness": {
@@ -273,7 +262,6 @@ mkdir -p "$enable_alias_agent_root"
 
 cat >"${enable_alias_agent_root}/manifest.json" <<'EOF'
 {
-  "lite-sandbox": true,
   "container": "node:20-bullseye"
 }
 EOF
@@ -344,7 +332,6 @@ write_state_var "TEST_GLOBAL_AGENT_CONTAINER_PORT" "$global_agent_internal_port"
 
 cat >"${global_agent_root}/manifest.json" <<EOF
 {
-  "lite-sandbox": true,
   "container": "node:24.15.0-bullseye",
   "profiles": {
     "default": {
@@ -374,7 +361,6 @@ mkdir -p "$global_alias_agent_root"
 
 cat >"${global_alias_agent_root}/manifest.json" <<'EOF'
 {
-  "lite-sandbox": true,
   "container": "node:20-bullseye"
 }
 EOF
@@ -388,7 +374,6 @@ mkdir -p "$devel_agent_root"
 
 cat >"${devel_agent_root}/manifest.json" <<'EOF'
 {
-  "lite-sandbox": true,
   "container": "node:20-bullseye"
 }
 EOF
