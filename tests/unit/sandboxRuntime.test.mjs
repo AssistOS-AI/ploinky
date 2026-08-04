@@ -134,7 +134,7 @@ test('every host-sandbox launch boundary revalidates exact generation authority 
         {
             relativePath: 'cli/sandbox/bwrap/bwrapServiceManager.js',
             functions: [
-                ['startBwrapProcess', 'spawn(BWRAP_PATH'],
+                ['startBwrapProcess', 'spawnTrustedServiceLaunch(trustedLaunch'],
                 ['ensureBwrapService', 'startBwrapProcess('],
                 ['attachBwrapInteractive', 'spawnBwrapInteractive('],
             ],
@@ -800,7 +800,7 @@ test('Ploinky box marker reports hybrid capability and strictly selects bwrap', 
         fs.writeFileSync(helper, `#!/bin/sh
 case "$1" in
   --version) printf '%s\\n' 'ploinky-bwrap-launch-v1 source-sha=0123456789012345678901234567890123456789' ;;
-  --capabilities) printf '%s\\n' 'ploinky-bwrap-launch-v1 protocol=1 descriptor-fd=3 path-resolution=openat2-beneath-no-magiclinks-no-symlinks bwrap-fd-options=bind-fd,ro-bind-fd,ro-bind-data,perms' ;;
+  --capabilities) printf '%s\\n' 'ploinky-bwrap-launch-v1 protocol=1 descriptor-fd=3 path-resolution=openat2-beneath-no-magiclinks-no-symlinks bwrap-fd-options=bind-fd,ro-bind-fd,ro-bind-data,perms typed-fs=dir,tmpfs,proc,dev,system-symlink,ro-data-path-file ro-data-path-hardening=sealed-memfd-ro-bind-data' ;;
   *) exit 64 ;;
 esac
 `);
@@ -897,7 +897,7 @@ test('Box status exposes an invalid helper capability without selecting Podman f
         assert.equal(result.status, 0, result.stderr || result.stdout);
         const output = parseLastJsonLine(result.stdout);
         assert.equal(output.helper.available, false);
-        assert.equal(output.helper.missingCapabilities.length, 2);
+        assert.equal(output.helper.missingCapabilities.length, 4);
         assert.equal(output.podman.available, true);
         assert.deepEqual(output.agents[0], {
             runtimeKey: 'coding-codex',

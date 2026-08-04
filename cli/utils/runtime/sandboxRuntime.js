@@ -14,6 +14,8 @@ const REQUIRED_BWRAP_HELPER_CAPABILITIES = Object.freeze([
     'protocol=1 descriptor-fd=3',
     'path-resolution=openat2-beneath-no-magiclinks-no-symlinks',
     'bwrap-fd-options=bind-fd,ro-bind-fd,ro-bind-data,perms',
+    'typed-fs=dir,tmpfs,proc,dev,system-symlink,ro-data-path-file',
+    'ro-data-path-hardening=sealed-memfd-ro-bind-data',
 ]);
 
 function parseBooleanEnv(value) {

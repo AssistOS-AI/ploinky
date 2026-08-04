@@ -24,6 +24,7 @@ const RECORD = Object.freeze({
     DEV: 9,
     SYMLINK: 10,
     PREEXEC_BARRIER: 11,
+    RO_DATA_PATH: 12,
 });
 
 let fixtureRoot;
@@ -81,6 +82,17 @@ function roPathRecord(source, target, sourceType = 1) {
     sourceBytes.copy(payload, 5);
     targetBytes.copy(payload, 5 + sourceBytes.length);
     return record(RECORD.RO_PATH, payload);
+}
+
+function roDataPathRecord(source, target) {
+    const sourceBytes = Buffer.from(source);
+    const targetBytes = Buffer.from(target);
+    const payload = Buffer.alloc(4 + sourceBytes.length + targetBytes.length);
+    payload.writeUInt16BE(sourceBytes.length, 0);
+    payload.writeUInt16BE(targetBytes.length, 2);
+    sourceBytes.copy(payload, 4);
+    targetBytes.copy(payload, 4 + sourceBytes.length);
+    return record(RECORD.RO_DATA_PATH, payload);
 }
 
 function launchWithDescriptor(bytes, {
@@ -167,7 +179,9 @@ test('version and capability output expose the fixed source and fd ABI', () => {
     assert.match(capabilities.stdout,
         /bwrap-fd-options=bind-fd,ro-bind-fd,ro-bind-data,perms/);
     assert.match(capabilities.stdout,
-        /typed-fs=dir,tmpfs,proc,dev,system-symlink preexec-barrier=R\/G/);
+        /typed-fs=dir,tmpfs,proc,dev,system-symlink,ro-data-path-file/);
+    assert.match(capabilities.stdout, /ro-data-path-hardening=sealed-memfd-ro-bind-data/);
+    assert.match(capabilities.stdout, /preexec-barrier=R\/G/);
     assert.match(capabilities.stdout, /credential-bound=4096/);
 });
 
@@ -465,6 +479,33 @@ test('typed filesystem records enforce exact destinations, collisions, and paren
     }
 });
 
+test('read-only data records admit only fixed system mappings through helper-owned fds', async () => {
+    const valid = await launchWithDescriptor(descriptor([
+        roDataPathRecord('/etc/hosts', '/etc/hosts'),
+        record(RECORD.ARG, '--'),
+        record(RECORD.ARG, '/bin/true'),
+    ]));
+    if (process.platform !== 'linux') {
+        assert.equal(valid.status, 70, valid.stderr);
+    } else {
+        assert.notEqual(valid.status, 64, valid.stderr);
+        assert.notEqual(valid.status, 73, valid.stderr);
+    }
+
+    for (const invalid of [
+        roDataPathRecord('/etc/hosts', '/tmp/hosts'),
+        roDataPathRecord('/etc/passwd', '/etc/hosts'),
+    ]) {
+        const result = await launchWithDescriptor(descriptor([
+            invalid,
+            record(RECORD.ARG, '--'),
+            record(RECORD.ARG, '/bin/true'),
+        ]));
+        assert.equal(result.status, 73, result.stderr);
+        assert.match(result.stderr, /^PLOINKY_MOUNT_DESTINATION_UNSUPPORTED:/);
+    }
+});
+
 test('private readiness uses an exact empty workspace tmpfs and ordered readiness directory', async () => {
     const result = await launchWithDescriptor(descriptor([
         record(RECORD.TMPFS, '/workspace'),
@@ -614,6 +655,12 @@ test('source pins every path with openat2 flags and has no pathname fallback', (
     assert.match(source, /RESOLVE_BENEATH \| RESOLVE_NO_MAGICLINKS \| RESOLVE_NO_SYMLINKS/);
     assert.match(source, /O_PATH \| O_CLOEXEC/);
     assert.match(source, /"--bind-fd" : "--ro-bind-fd"/);
+    assert.match(source, /MOUNT_RO_DATA_PATH/);
+    assert.match(source, /MOUNT_RO_DATA_PATH[\s\S]+"--ro-bind-data"/);
+    assert.match(source, /reopen_pinned_regular_readonly/);
+    assert.match(source, /memfd_create\("ploinky-ro-data", MFD_CLOEXEC \| MFD_ALLOW_SEALING\)/);
+    assert.match(source, /F_SEAL_SEAL \| F_SEAL_SHRINK/);
+    assert.doesNotMatch(source, /mount->kind == MOUNT_RO_DATA_PATH[\s\S]+argv\[count\+\+\] = "--file"/);
     assert.doesNotMatch(source, /\brealpath\s*\(/);
     assert.doesNotMatch(source, /\blstat\s*\(/);
     assert.doesNotMatch(source, /PLOINKY_DISABLE_HOST_SANDBOX/);

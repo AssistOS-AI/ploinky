@@ -269,6 +269,8 @@ export function probeImageBinaries(engine, imageId, runner, {
             "printf '%s\\n' \"$helper_capabilities\" | grep -F -- 'protocol=1 descriptor-fd=3' >/dev/null",
             "printf '%s\\n' \"$helper_capabilities\" | grep -F -- 'path-resolution=openat2-beneath-no-magiclinks-no-symlinks' >/dev/null",
             "printf '%s\\n' \"$helper_capabilities\" | grep -F -- 'bwrap-fd-options=bind-fd,ro-bind-fd,ro-bind-data,perms' >/dev/null",
+            "printf '%s\\n' \"$helper_capabilities\" | grep -F -- 'typed-fs=dir,tmpfs,proc,dev,system-symlink,ro-data-path-file' >/dev/null",
+            "printf '%s\\n' \"$helper_capabilities\" | grep -F -- 'ro-data-path-hardening=sealed-memfd-ro-bind-data' >/dev/null",
             "if command -v pasta >/dev/null 2>&1; then command -v pasta; elif command -v slirp4netns >/dev/null 2>&1; then command -v slirp4netns; else exit 17; fi",
         ].join('; '),
     ], { timeoutMs: IMAGE_PROBE_TIMEOUT_MS });

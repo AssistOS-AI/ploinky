@@ -176,6 +176,10 @@ require_bubblewrap_contract() {
         || fail "Bubblewrap launcher lacks fd-pinned openat2 resolution"
     [[ "$helper_capabilities" == *"bwrap-fd-options=bind-fd,ro-bind-fd,ro-bind-data,perms"* ]] \
         || fail "Bubblewrap launcher lacks required fd/data mount capabilities"
+    [[ "$helper_capabilities" == *"typed-fs=dir,tmpfs,proc,dev,system-symlink,ro-data-path-file"* ]] \
+        || fail "Bubblewrap launcher lacks required typed filesystem records"
+    [[ "$helper_capabilities" == *"ro-data-path-hardening=sealed-memfd-ro-bind-data"* ]] \
+        || fail "Bubblewrap launcher lacks immutable read-only data-path hardening"
 }
 
 test -x "$PREPARE_HELPER" || fail "Box preparation helper missing"

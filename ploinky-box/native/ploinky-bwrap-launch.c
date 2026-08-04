@@ -19,6 +19,7 @@
 #include <unistd.h>
 
 #ifdef __linux__
+#include <sys/mman.h>
 #include <sys/syscall.h>
 #endif
 
@@ -97,8 +98,11 @@
  * after it, which makes provider arguments data for bwrap rather than helper
  * options. Every filesystem mutation is a typed record; all raw filesystem
  * mutation, path-bind, and fd-argument injection options are rejected.
- * --ro-bind-data is the sole inherited-fd exception and is restricted to the
- * fixed 0400 generation credential mount.
+ * Externally inherited --ro-bind-data remains restricted to the fixed 0400
+ * generation credential. Typed RO_DATA_PATH records are opened and pinned by
+ * this helper itself, copied into a sealed anonymous memfd, and mounted with
+ * --ro-bind-data. The sandbox receives exact fd-derived bytes on a real
+ * read-only mount; bwrap never resolves a host source pathname for the copy.
  */
 
 enum {
@@ -110,6 +114,7 @@ enum {
     MAX_ARGUMENT_BYTES = 16 * 1024,
     MAX_PATH_BYTES = 4096,
     MAX_PRESERVED_FDS = 16,
+    MAX_RO_DATA_FILE_BYTES = 4 * 1024 * 1024,
 };
 
 enum record_type {
@@ -124,6 +129,7 @@ enum record_type {
     RECORD_DEV = 9,
     RECORD_SYMLINK = 10,
     RECORD_PREEXEC_BARRIER = 11,
+    RECORD_RO_DATA_PATH = 12,
 };
 
 enum mount_kind {
@@ -131,6 +137,7 @@ enum mount_kind {
     MOUNT_WORKDIR,
     MOUNT_HOME,
     MOUNT_RO_PATH,
+    MOUNT_RO_DATA_PATH,
     MOUNT_DIR,
     MOUNT_TMPFS,
     MOUNT_PROC,
@@ -480,6 +487,41 @@ static void validate_mount_target(const unsigned char *bytes, size_t length)
              "mount destination requires a dedicated policy record");
     }
     free(target);
+}
+
+static void validate_ro_data_path(const unsigned char *source,
+                                  size_t source_length,
+                                  const unsigned char *target,
+                                  size_t target_length)
+{
+    static const struct {
+        const char *source;
+        const char *target;
+    } approved[] = {
+        {"/etc/resolv.conf", "/etc/resolv.conf"},
+        {"/etc/hosts", "/etc/hosts"},
+        {"/etc/passwd", "/etc/passwd"},
+        {"/etc/group", "/etc/group"},
+        {"/etc/authselect/nsswitch.conf", "/etc/nsswitch.conf"},
+        {"/etc/ld.so.cache", "/etc/ld.so.cache"},
+    };
+    size_t i;
+
+    if (!is_clean_absolute_path(source, source_length) ||
+        !is_clean_absolute_path(target, target_length)) {
+        fail(EXIT_PATH_INVALID, "PLOINKY_MOUNT_DESTINATION_UNSUPPORTED",
+             "read-only data path must use normalized absolute paths");
+    }
+    for (i = 0; i < sizeof(approved) / sizeof(approved[0]); i++) {
+        if (strlen(approved[i].source) == source_length &&
+            memcmp(approved[i].source, source, source_length) == 0 &&
+            strlen(approved[i].target) == target_length &&
+            memcmp(approved[i].target, target, target_length) == 0) {
+            return;
+        }
+    }
+    fail(EXIT_PATH_INVALID, "PLOINKY_MOUNT_DESTINATION_UNSUPPORTED",
+         "read-only data path is not an exact fixed system mapping");
 }
 
 static bool target_seen(const struct launch *launch, const char *target,
@@ -1130,6 +1172,37 @@ static void parse_descriptor(struct launch *launch)
             mount->source = source;
             mount->source_length = source_length;
             mount->target = target_string;
+        } else if (record->type == RECORD_RO_DATA_PATH) {
+            struct mount *mount;
+            uint16_t source_length;
+            uint16_t target_length;
+            const unsigned char *source;
+            const unsigned char *target;
+            char *target_string;
+
+            if (payload_length < 4) {
+                fail(EXIT_PROTOCOL_INVALID, "PLOINKY_BWRAP_PROTOCOL_INVALID",
+                     "invalid read-only data path record");
+            }
+            source_length = read_u16_be(record->payload);
+            target_length = read_u16_be(record->payload + 2);
+            if ((size_t)source_length + (size_t)target_length + 4 != payload_length) {
+                fail(EXIT_PROTOCOL_INVALID, "PLOINKY_BWRAP_PROTOCOL_INVALID",
+                     "invalid read-only data path lengths");
+            }
+            source = record->payload + 4;
+            target = source + source_length;
+            validate_ro_data_path(source, source_length, target, target_length);
+            target_string = copy_string(target, target_length,
+                                        "PLOINKY_MOUNT_DESTINATION_UNSUPPORTED");
+            reject_duplicate_target(launch, target_string);
+            reject_hiding_prior_target(launch, target_string);
+            mount = new_mount(launch);
+            mount->kind = MOUNT_RO_DATA_PATH;
+            mount->source_type = SOURCE_REGULAR;
+            mount->source = source;
+            mount->source_length = source_length;
+            mount->target = target_string;
         } else if (record->type == RECORD_DIR) {
             struct mount *mount;
             char *target;
@@ -1311,7 +1384,111 @@ static char *copy_path_without_prefix(const unsigned char *bytes, size_t length,
 static bool mount_needs_fd(const struct mount *mount)
 {
     return mount->kind == MOUNT_WORKSPACE || mount->kind == MOUNT_WORKDIR ||
-           mount->kind == MOUNT_HOME || mount->kind == MOUNT_RO_PATH;
+           mount->kind == MOUNT_HOME || mount->kind == MOUNT_RO_PATH ||
+           mount->kind == MOUNT_RO_DATA_PATH;
+}
+
+#ifdef __linux__
+static int reopen_pinned_regular_readonly(int path_fd)
+{
+    char proc_path[64];
+    struct stat pinned;
+    struct stat readable;
+    int fd;
+
+    if (fstat(path_fd, &pinned) != 0 || !S_ISREG(pinned.st_mode)) {
+        fail(EXIT_PATH_INVALID, "PLOINKY_PATH_INVALID",
+             "cannot inspect pinned read-only data source");
+    }
+    if (snprintf(proc_path, sizeof(proc_path), "/proc/self/fd/%d", path_fd) < 0) {
+        fail(EXIT_PATHFD_UNAVAILABLE, "PLOINKY_PATHFD_UNAVAILABLE",
+             "cannot address pinned read-only data fd");
+    }
+    fd = open(proc_path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0 || fstat(fd, &readable) != 0 ||
+        readable.st_dev != pinned.st_dev || readable.st_ino != pinned.st_ino ||
+        !S_ISREG(readable.st_mode)) {
+        if (fd >= 0) close(fd);
+        fail(EXIT_PATHFD_UNAVAILABLE, "PLOINKY_PATHFD_UNAVAILABLE",
+             "cannot reopen the exact pinned read-only data source");
+    }
+    return fd;
+}
+#endif
+
+static int snapshot_pinned_regular_readonly(int path_fd)
+{
+#ifdef __linux__
+    unsigned char buffer[16384];
+    const int required_seals = F_SEAL_SEAL | F_SEAL_SHRINK |
+                               F_SEAL_GROW | F_SEAL_WRITE;
+    int readable_fd = reopen_pinned_regular_readonly(path_fd);
+    int snapshot_fd = memfd_create("ploinky-ro-data", MFD_CLOEXEC | MFD_ALLOW_SEALING);
+    int installed_seals;
+    size_t total = 0;
+
+    if (snapshot_fd < 0) {
+        close(readable_fd);
+        fail(EXIT_PATHFD_UNAVAILABLE, "PLOINKY_PATHFD_UNAVAILABLE",
+             "cannot create sealed read-only data snapshot");
+    }
+    for (;;) {
+        ssize_t count = read(readable_fd, buffer, sizeof(buffer));
+        size_t written = 0;
+        if (count < 0 && errno == EINTR) {
+            continue;
+        }
+        if (count < 0) {
+            close(readable_fd);
+            close(snapshot_fd);
+            fail(EXIT_PATHFD_UNAVAILABLE, "PLOINKY_PATHFD_UNAVAILABLE",
+                 "cannot read pinned read-only data source");
+        }
+        if (count == 0) {
+            break;
+        }
+        if ((size_t)count > MAX_RO_DATA_FILE_BYTES - total) {
+            close(readable_fd);
+            close(snapshot_fd);
+            fail(EXIT_PATH_INVALID, "PLOINKY_PATH_INVALID",
+                 "read-only data source exceeds its fixed byte limit");
+        }
+        total += (size_t)count;
+        while (written < (size_t)count) {
+            ssize_t result = write(snapshot_fd, buffer + written,
+                                   (size_t)count - written);
+            if (result < 0 && errno == EINTR) {
+                continue;
+            }
+            if (result <= 0) {
+                close(readable_fd);
+                close(snapshot_fd);
+                fail(EXIT_PATHFD_UNAVAILABLE, "PLOINKY_PATHFD_UNAVAILABLE",
+                     "cannot populate sealed read-only data snapshot");
+            }
+            written += (size_t)result;
+        }
+    }
+    close(readable_fd);
+    if (lseek(snapshot_fd, 0, SEEK_SET) != 0 ||
+        fcntl(snapshot_fd, F_ADD_SEALS, required_seals) != 0) {
+        close(snapshot_fd);
+        fail(EXIT_PATHFD_UNAVAILABLE, "PLOINKY_PATHFD_UNAVAILABLE",
+             "cannot seal read-only data snapshot");
+    }
+    installed_seals = fcntl(snapshot_fd, F_GET_SEALS);
+    if (installed_seals < 0 ||
+        (installed_seals & required_seals) != required_seals) {
+        close(snapshot_fd);
+        fail(EXIT_PATHFD_UNAVAILABLE, "PLOINKY_PATHFD_UNAVAILABLE",
+             "cannot verify read-only data snapshot seals");
+    }
+    return snapshot_fd;
+#else
+    (void)path_fd;
+    fail(EXIT_PATHFD_UNAVAILABLE, "PLOINKY_PATHFD_UNAVAILABLE",
+         "Linux sealed memfd support is required for read-only data snapshots");
+#endif
 }
 
 static void open_mount_sources(struct launch *launch)
@@ -1330,7 +1507,7 @@ static void open_mount_sources(struct launch *launch)
 
         if (mount->kind == MOUNT_WORKSPACE || mount->kind == MOUNT_WORKDIR ||
             mount->kind == MOUNT_HOME ||
-            (mount->kind == MOUNT_RO_PATH &&
+            ((mount->kind == MOUNT_RO_PATH || mount->kind == MOUNT_RO_DATA_PATH) &&
              mount->source_length > workspace_prefix_length &&
              memcmp(mount->source, PLOINKY_WORKSPACE_ROOT,
                     workspace_prefix_length) == 0 &&
@@ -1356,7 +1533,8 @@ static void open_mount_sources(struct launch *launch)
                                             ? "PLOINKY_WORKDIR_INVALID"
                                             : "PLOINKY_HOME_PATH_INVALID");
             free(relative);
-        } else if (mount->kind == MOUNT_RO_PATH) {
+        } else if (mount->kind == MOUNT_RO_PATH ||
+                   mount->kind == MOUNT_RO_DATA_PATH) {
             char *relative;
             bool inside_workspace =
                 mount->source_length > workspace_prefix_length &&
@@ -1396,6 +1574,11 @@ static void open_mount_sources(struct launch *launch)
                             mount->kind == MOUNT_WORKDIR
                                 ? "PLOINKY_WORKDIR_INVALID"
                                 : "PLOINKY_PATH_INVALID");
+        if (mount->kind == MOUNT_RO_DATA_PATH) {
+            int snapshot_fd = snapshot_pinned_regular_readonly(mount->fd);
+            close(mount->fd);
+            mount->fd = snapshot_fd;
+        }
         if (mount->kind == MOUNT_HOME) {
             struct stat status;
             if (fstat(mount->fd, &status) != 0 || status.st_uid != geteuid()) {
@@ -1612,7 +1795,7 @@ static void close_unlisted_fds(const struct launch *launch)
 
 static char **build_bwrap_argv(struct launch *launch)
 {
-    size_t maximum = 2 + launch->arg_count + launch->mount_count * 3;
+    size_t maximum = 2 + launch->arg_count + launch->mount_count * 5;
     char **argv = calloc(maximum, sizeof(char *));
     size_t count = 0;
     size_t i;
@@ -1628,7 +1811,14 @@ static char **build_bwrap_argv(struct launch *launch)
             argv[count++] = launch->args[record->mount_index];
         } else if (record->type != RECORD_PREEXEC_BARRIER) {
             struct mount *mount = &launch->mounts[record->mount_index];
-            if (mount_needs_fd(mount)) {
+            if (mount->kind == MOUNT_RO_DATA_PATH) {
+                argv[count++] = "--perms";
+                argv[count++] = "0444";
+                argv[count++] = "--ro-bind-data";
+                snprintf(mount->fd_string, sizeof(mount->fd_string), "%d", mount->fd);
+                argv[count++] = mount->fd_string;
+                argv[count++] = mount->target;
+            } else if (mount_needs_fd(mount)) {
                 argv[count++] = mount->writable ? "--bind-fd" : "--ro-bind-fd";
                 snprintf(mount->fd_string, sizeof(mount->fd_string), "%d", mount->fd);
                 argv[count++] = mount->fd_string;
@@ -1736,7 +1926,8 @@ int main(int argc, char **argv)
         printf("ploinky-bwrap-launch-v1 source-sha=%s protocol=1 descriptor-fd=3 "
                "path-resolution=openat2-beneath-no-magiclinks-no-symlinks "
                "bwrap-fd-options=bind-fd,ro-bind-fd,ro-bind-data,perms "
-               "typed-fs=dir,tmpfs,proc,dev,system-symlink "
+               "typed-fs=dir,tmpfs,proc,dev,system-symlink,ro-data-path-file "
+               "ro-data-path-hardening=sealed-memfd-ro-bind-data "
                "preexec-barrier=R/G credential-bound=4096\n",
                PLOINKY_SOURCE_SHA);
         return 0;

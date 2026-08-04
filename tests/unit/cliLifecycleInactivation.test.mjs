@@ -92,6 +92,7 @@ test('sandbox ownership checks use exact runtime keys rather than short agent na
     assert.match(cliSource, /isBwrapProcessRunning\(containerName, \{/);
     assert.match(workspaceSource, /isSandboxRunningImpl\(existing\.key, \{/);
     assert.match(workspaceSource, /isBwrapProcessRunning\(containerName, \{/);
+    assert.doesNotMatch(workspaceSource, /isBwrapProcessRunning\(containerName\);/);
     for (const source of [cliSource, workspaceSource]) {
         assert.match(source, /instanceId:/);
         assert.match(source, /enableGeneration:/);

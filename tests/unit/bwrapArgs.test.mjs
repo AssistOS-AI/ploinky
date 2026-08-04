@@ -5,9 +5,11 @@ import os from 'node:os';
 import path from 'node:path';
 
 import {
+    BWRAP_HELPER_PATH,
     buildBwrapArgs,
     buildBwrapInteractiveCommand,
     buildShellCommand,
+    buildTrustedServiceLaunch,
     ensureBwrapAgentLibDir,
     resolveBwrapNodeRuntime,
 } from '../../cli/sandbox/bwrap/bwrapServiceManager.js';
@@ -33,6 +35,55 @@ function hasBind(args, source, target = source) {
     }
     return false;
 }
+
+test('trusted service launch uses the fd launcher and fixed clean-HOME policy', () => {
+    const launch = buildTrustedServiceLaunch({
+        runtimeKey: 'ploinky_demo_01234567',
+        command: ['node', '/Agent/server/AgentServer.mjs'],
+        nodeRuntimePath: '/opt/ploinky',
+        agentRuntimePath: '/workspace/.ploinky/deps/bwrap-runtime/demo/Agent',
+        codePath: '/workspace/.ploinky/repos/repo/demo',
+        codeDependenciesPath: '/workspace/.ploinky/deps/agents/repo/demo/node_modules',
+        agentDependenciesPath: '/workspace/.ploinky/deps/agents/repo/demo/node_modules',
+        environment: {
+            HOME: '/home/agent',
+            PORT: '17000',
+        },
+    });
+
+    assert.equal(BWRAP_HELPER_PATH, '/usr/local/libexec/ploinky-bwrap-launch');
+    assert.equal(launch.helperPath, BWRAP_HELPER_PATH);
+    assert.equal(launch.descriptor.subarray(0, 8).toString('ascii'), 'PLBWLP01');
+    assert.equal(launch.env.HOME, '/home/agent');
+    assert.equal(launch.env.PORT, '17000');
+    assert.equal(Object.isFrozen(launch.records), true);
+
+    const mounts = launch.records.filter((record) => record.type !== 'ARG');
+    assert.ok(mounts.some((record) => record.type === 'WORKSPACE' && record.mode === 'rw'));
+    assert.ok(mounts.some((record) => record.type === 'HOME' && record.runtimeKey === 'ploinky_demo_01234567'));
+    assert.ok(mounts.some((record) => record.type === 'RO_PATH' && record.target === '/opt/ploinky-node'));
+    assert.ok(mounts.some((record) => record.type === 'RO_PATH' && record.target === '/Agent'));
+    assert.ok(mounts.some((record) => record.type === 'RO_PATH' && record.target === '/code'));
+    assert.equal(mounts.some((record) => JSON.stringify(record).includes('/root')), false);
+    assert.equal(mounts.some((record) => JSON.stringify(record).includes('/shared')), false);
+
+    const args = launch.records.filter((record) => record.type === 'ARG').map((record) => record.value);
+    assert.ok(args.includes('--share-net'));
+    assert.ok(args.includes('--clearenv'));
+    assert.deepEqual(args.slice(-3), ['--', 'node', '/Agent/server/AgentServer.mjs']);
+});
+
+test('long-lived bwrap service has no raw bwrap or legacy argument-builder route', () => {
+    const source = fs.readFileSync(new URL('../../cli/sandbox/bwrap/bwrapServiceManager.js', import.meta.url), 'utf8');
+    const start = source.indexOf('function startBwrapProcess(');
+    const end = source.indexOf('function ensureBwrapService(', start);
+    assert.ok(start >= 0 && end > start);
+    const body = source.slice(start, end);
+    assert.match(body, /spawnTrustedServiceLaunch\(trustedLaunch, logFd\)/);
+    assert.doesNotMatch(body, /spawn\(BWRAP_PATH|buildBwrapArgs\(/);
+    assert.match(body, /target: '\/home\/agent'/);
+    assert.doesNotMatch(body, /target: '\/root'|target: '\/shared'/);
+});
 
 test('buildBwrapArgs overlays protected workspace paths read-only after cwd bind', () => {
     const root = tempDir();

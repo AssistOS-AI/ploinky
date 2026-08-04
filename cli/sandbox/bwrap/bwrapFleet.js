@@ -1,308 +1,854 @@
-import fs from 'fs';
-import path from 'path';
-import { execFileSync } from 'child_process';
+import crypto from 'node:crypto';
+import fs from 'node:fs';
+import path from 'node:path';
+import { execFileSync } from 'node:child_process';
+
 import { PLOINKY_DIR } from '../../utils/config.js';
 import { debugLog } from '../../utils/utils.js';
 
 const BWRAP_PIDS_DIR = path.join(PLOINKY_DIR, 'bwrap-pids');
-const BWRAP_PID_SCHEMA_VERSION = 2;
-const BWRAP_PID_RECORD_KEYS = Object.freeze([
+const SANDBOX_OWNER_SCHEMA_VERSION = 3;
+const BWRAP_PID_SCHEMA_VERSION = SANDBOX_OWNER_SCHEMA_VERSION;
+const SANDBOX_OWNER_ROLES = Object.freeze({
+    service: 'service',
+    providerTask: 'provider-task',
+});
+const OWNER_RECORD_SUFFIX = '.owner.json';
+const LEGACY_PID_SUFFIX = '.pid';
+const MAX_OWNER_RECORD_BYTES = 16 * 1024;
+const MAX_PATH_BYTES = 4096;
+const MAX_TEXT_BYTES = 512;
+const OWNER_RECORD_KEYS = Object.freeze([
     'enableGeneration',
+    'homeKey',
     'instanceId',
+    'logPath',
+    'ownerKey',
     'pid',
     'processIdentity',
+    'provider',
+    'role',
     'runtimeKey',
     'schemaVersion',
+    'taskId',
+    'workdir',
 ]);
 const SLEEP_ARRAY = new Int32Array(new SharedArrayBuffer(4));
+
+function ownerError(message, code = 'PLOINKY_SANDBOX_OWNER_INVALID') {
+    const error = new Error(message);
+    error.code = code;
+    return error;
+}
 
 function sleepMs(ms) {
     Atomics.wait(SLEEP_ARRAY, 0, 0, ms);
 }
 
-function ensurePidDir() {
-    if (!fs.existsSync(BWRAP_PIDS_DIR)) {
-        fs.mkdirSync(BWRAP_PIDS_DIR, { recursive: true, mode: 0o700 });
-    }
+function isPlainObject(value) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+    const prototype = Object.getPrototypeOf(value);
+    return prototype === Object.prototype || prototype === null;
 }
 
-function normalizeBwrapRuntimeKey(runtimeKey) {
-    const normalized = String(runtimeKey || '').trim();
-    if (!normalized || normalized.length > 255 || !/^[A-Za-z0-9_.-]+$/.test(normalized)) {
-        throw new Error('sandbox runtime key must be an exact safe container name');
+function currentProcessUid() {
+    if (typeof process.getuid !== 'function') {
+        throw ownerError(
+            'sandbox ownership requires an exact process uid',
+            'PLOINKY_SANDBOX_OWNER_STORE_INVALID',
+        );
+    }
+    const uid = process.getuid();
+    if (!Number.isSafeInteger(uid) || uid < 0) {
+        throw ownerError(
+            'sandbox ownership process uid is invalid',
+            'PLOINKY_SANDBOX_OWNER_STORE_INVALID',
+        );
+    }
+    return uid;
+}
+
+function exactText(value, label, {
+    allowEmpty = false,
+    maxBytes = MAX_TEXT_BYTES,
+    safeKey = false,
+} = {}) {
+    if (typeof value !== 'string'
+        || value !== value.trim()
+        || (!allowEmpty && !value)
+        || Buffer.byteLength(value, 'utf8') > maxBytes
+        || /[\u0000-\u001f\u007f]/.test(value)
+        || (safeKey && value && !/^[A-Za-z0-9_.-]+$/.test(value))) {
+        throw ownerError(`sandbox owner ${label} is invalid`);
+    }
+    return value;
+}
+
+function exactAbsolutePath(value, label) {
+    const normalized = exactText(value, label, { maxBytes: MAX_PATH_BYTES });
+    if (!path.isAbsolute(normalized) || path.normalize(normalized) !== normalized) {
+        throw ownerError(`sandbox owner ${label} must be an exact normalized absolute path`);
     }
     return normalized;
 }
 
+function ensureOwnerDir() {
+    const expectedUid = currentProcessUid();
+    if (!fs.existsSync(BWRAP_PIDS_DIR)) {
+        fs.mkdirSync(BWRAP_PIDS_DIR, { recursive: true, mode: 0o700 });
+        fs.chmodSync(BWRAP_PIDS_DIR, 0o700);
+    }
+    const stat = fs.lstatSync(BWRAP_PIDS_DIR);
+    if (!stat.isDirectory()
+        || stat.isSymbolicLink()
+        || stat.uid !== expectedUid
+        || (stat.mode & 0o777) !== 0o700) {
+        throw ownerError(
+            'sandbox owner directory is not an exact private directory',
+            'PLOINKY_SANDBOX_OWNER_STORE_INVALID',
+        );
+    }
+}
+
+function normalizeBwrapRuntimeKey(runtimeKey) {
+    if (typeof runtimeKey !== 'string'
+        || !runtimeKey
+        || runtimeKey !== runtimeKey.trim()
+        || Buffer.byteLength(runtimeKey, 'utf8') > 255
+        || !/^[A-Za-z0-9_.-]+$/.test(runtimeKey)
+        || runtimeKey === '.'
+        || runtimeKey === '..') {
+        throw ownerError('sandbox runtime key must be an exact safe container name');
+    }
+    return runtimeKey;
+}
+
 function normalizeSandboxRuntimeIdentity(identity) {
-    if (!identity || typeof identity !== 'object' || Array.isArray(identity)) {
-        throw new Error('sandbox runtime identity requires exact instanceId and enableGeneration');
+    if (!isPlainObject(identity)
+        || typeof identity.instanceId !== 'string'
+        || identity.instanceId.length === 0
+        || typeof identity.enableGeneration !== 'string'
+        || identity.enableGeneration.length === 0) {
+        throw ownerError('sandbox runtime identity requires exact instanceId and enableGeneration');
     }
-    const rawInstanceId = typeof identity.instanceId === 'string' ? identity.instanceId : '';
-    const rawEnableGeneration = typeof identity.enableGeneration === 'string'
-        ? identity.enableGeneration
-        : '';
-    const instanceId = rawInstanceId.trim();
-    const enableGeneration = rawEnableGeneration.trim();
-    if (
-        !instanceId
-        || !enableGeneration
-        || instanceId !== rawInstanceId
-        || enableGeneration !== rawEnableGeneration
-    ) {
-        throw new Error('sandbox runtime identity requires exact instanceId and enableGeneration');
-    }
+    const instanceId = exactText(identity.instanceId, 'instanceId');
+    const enableGeneration = exactText(identity.enableGeneration, 'enableGeneration');
     return Object.freeze({ instanceId, enableGeneration });
 }
 
-function getPidFile(runtimeKey) {
-    return path.join(BWRAP_PIDS_DIR, `${normalizeBwrapRuntimeKey(runtimeKey)}.pid`);
+function ownerDigest(namespace, fields) {
+    const payload = JSON.stringify([namespace, ...fields]);
+    return crypto.createHash('sha256').update(payload).digest('hex');
 }
 
-function readProcessIdentity(pid) {
-    if (!Number.isSafeInteger(pid) || pid <= 0) return '';
+function serviceOwnerKey(runtimeKey) {
+    const normalized = normalizeBwrapRuntimeKey(runtimeKey);
+    return `service-${ownerDigest('service', [normalized])}`;
+}
+
+function providerTaskOwnerKey(runtimeKey, taskId) {
+    const normalized = normalizeBwrapRuntimeKey(runtimeKey);
+    const exactTaskId = exactText(taskId, 'taskId');
+    return `provider-task-${ownerDigest('provider-task', [normalized, exactTaskId])}`;
+}
+
+function normalizeRole(role) {
+    if (role !== SANDBOX_OWNER_ROLES.service && role !== SANDBOX_OWNER_ROLES.providerTask) {
+        throw ownerError("sandbox owner role must be exactly 'service' or 'provider-task'");
+    }
+    return role;
+}
+
+function canonicalOwnerKey({ role, runtimeKey, taskId }) {
+    return role === SANDBOX_OWNER_ROLES.service
+        ? serviceOwnerKey(runtimeKey)
+        : providerTaskOwnerKey(runtimeKey, taskId);
+}
+
+function normalizeOwnerMetadata(value) {
+    if (!isPlainObject(value)) throw ownerError('sandbox owner record must be a plain object');
+    const role = normalizeRole(value.role);
+    const runtimeKey = normalizeBwrapRuntimeKey(value.runtimeKey);
+    const identity = normalizeSandboxRuntimeIdentity(value);
+    const homeKey = exactText(value.homeKey, 'homeKey', { safeKey: true, maxBytes: 255 });
+    if (homeKey === '.' || homeKey === '..') {
+        throw ownerError('sandbox owner homeKey is invalid');
+    }
+    const workdir = exactAbsolutePath(value.workdir, 'workdir');
+    const logPath = exactAbsolutePath(value.logPath, 'logPath');
+    const taskId = exactText(value.taskId ?? '', 'taskId', {
+        allowEmpty: role === SANDBOX_OWNER_ROLES.service,
+    });
+    const provider = exactText(value.provider ?? '', 'provider', {
+        allowEmpty: role === SANDBOX_OWNER_ROLES.service,
+    });
+    if (role === SANDBOX_OWNER_ROLES.service && (taskId || provider)) {
+        throw ownerError('sandbox service owner requires empty taskId and provider');
+    }
+    if (role === SANDBOX_OWNER_ROLES.providerTask && (!taskId || !provider)) {
+        throw ownerError('sandbox provider-task owner requires exact taskId and provider');
+    }
+    const ownerKey = canonicalOwnerKey({ role, runtimeKey, taskId });
+    if (value.ownerKey !== undefined && value.ownerKey !== ownerKey) {
+        throw ownerError('sandbox ownerKey does not match the canonical role/runtime identity');
+    }
+    return Object.freeze({
+        role,
+        runtimeKey,
+        ownerKey,
+        ...identity,
+        homeKey,
+        workdir,
+        logPath,
+        taskId,
+        provider,
+    });
+}
+
+function ownerFile(ownerKey) {
+    const normalized = exactText(ownerKey, 'ownerKey', { safeKey: true });
+    return path.join(BWRAP_PIDS_DIR, `${normalized}${OWNER_RECORD_SUFFIX}`);
+}
+
+function legacyPidFile(runtimeKey) {
+    return path.join(BWRAP_PIDS_DIR, `${normalizeBwrapRuntimeKey(runtimeKey)}${LEGACY_PID_SUFFIX}`);
+}
+
+function readProcessIdentityInspection(pid) {
+    if (!Number.isSafeInteger(pid) || pid <= 0) return Object.freeze({ state: 'dead' });
     try {
         const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
         const commandEnd = stat.lastIndexOf(')');
-        if (commandEnd < 0) return '';
+        if (commandEnd < 0) return Object.freeze({ state: 'unknown' });
         const fields = stat.slice(commandEnd + 1).trim().split(/\s+/);
+        if (fields[0] === 'Z') return Object.freeze({ state: 'dead' });
         const startTicks = String(fields[19] || '').trim();
-        return startTicks ? `linux-proc:${startTicks}` : '';
+        return startTicks
+            ? Object.freeze({ state: 'identified', processIdentity: `linux-proc:${startTicks}` })
+            : Object.freeze({ state: 'unknown' });
     } catch (_) {
         try {
-            const startedAt = execFileSync('ps', ['-p', String(pid), '-o', 'lstart='], {
+            const processState = execFileSync('ps', ['-p', String(pid), '-o', 'state=', '-o', 'lstart='], {
                 encoding: 'utf8',
                 stdio: ['ignore', 'pipe', 'ignore'],
             }).trim().replace(/\s+/g, ' ');
-            return startedAt ? `ps-lstart:${startedAt}` : '';
+            const match = processState.match(/^(\S+)\s+(.+)$/);
+            if (match?.[1]?.startsWith('Z')) return Object.freeze({ state: 'dead' });
+            return match
+                ? Object.freeze({ state: 'identified', processIdentity: `ps-lstart:${match[2]}` })
+                : Object.freeze({ state: 'unknown' });
         } catch (_) {
-            return '';
+            return Object.freeze({ state: 'unknown' });
         }
     }
 }
 
-function readBwrapPidRecord(runtimeKey) {
-    const normalized = normalizeBwrapRuntimeKey(runtimeKey);
-    const pidFile = getPidFile(normalized);
-    if (!fs.existsSync(pidFile)) return null;
+function readProcessIdentity(pid) {
+    const inspection = readProcessIdentityInspection(pid);
+    return inspection.state === 'identified' ? inspection.processIdentity : '';
+}
+
+function inspectSandboxOwnerProcess(record) {
     try {
-        const stat = fs.lstatSync(pidFile);
-        if (!stat.isFile() || stat.isSymbolicLink()) return null;
-        const parsed = JSON.parse(fs.readFileSync(pidFile, 'utf8'));
-        const pid = Number(parsed?.pid);
-        if (
-            !parsed
-            || typeof parsed !== 'object'
-            || Array.isArray(parsed)
-            || JSON.stringify(Object.keys(parsed).sort()) !== JSON.stringify(BWRAP_PID_RECORD_KEYS)
-            || parsed.schemaVersion !== BWRAP_PID_SCHEMA_VERSION
-            || parsed?.runtimeKey !== normalized
-            || typeof parsed?.pid !== 'number'
-            || !Number.isSafeInteger(pid)
-            || pid <= 0
-            || typeof parsed?.processIdentity !== 'string'
-            || !parsed.processIdentity
-            || typeof parsed?.instanceId !== 'string'
-            || !parsed.instanceId
-            || parsed.instanceId !== parsed.instanceId.trim()
-            || typeof parsed?.enableGeneration !== 'string'
-            || !parsed.enableGeneration
-            || parsed.enableGeneration !== parsed.enableGeneration.trim()
-        ) {
-            return null;
+        process.kill(record.pid, 0);
+    } catch (error) {
+        if (error?.code !== 'EPERM') return Object.freeze({ state: 'dead' });
+    }
+    const identityInspection = readProcessIdentityInspection(record.pid);
+    if (identityInspection.state === 'dead') return Object.freeze({ state: 'dead' });
+    if (identityInspection.state !== 'identified') {
+        try {
+            process.kill(record.pid, 0);
+        } catch (error) {
+            if (error?.code !== 'EPERM') return Object.freeze({ state: 'dead' });
+        }
+        return Object.freeze({ state: 'unknown' });
+    }
+    const processIdentity = identityInspection.processIdentity;
+    return Object.freeze({
+        state: processIdentity === record.processIdentity ? 'exact' : 'pid-reused',
+        processIdentity,
+    });
+}
+
+function validateStoredOwner(parsed, expectedOwnerKey) {
+    if (!isPlainObject(parsed)
+        || JSON.stringify(Object.keys(parsed).sort()) !== JSON.stringify(OWNER_RECORD_KEYS)
+        || parsed.schemaVersion !== SANDBOX_OWNER_SCHEMA_VERSION) {
+        throw ownerError(
+            `sandbox owner ${expectedOwnerKey} has an invalid or pre-v${SANDBOX_OWNER_SCHEMA_VERSION} record`,
+            'PLOINKY_SANDBOX_OWNER_RECORD_INVALID',
+        );
+    }
+    const metadata = normalizeOwnerMetadata(parsed);
+    const pid = Number(parsed.pid);
+    const processIdentity = exactText(parsed.processIdentity, 'processIdentity');
+    if (metadata.ownerKey !== expectedOwnerKey
+        || parsed.ownerKey !== expectedOwnerKey
+        || typeof parsed.pid !== 'number'
+        || !Number.isSafeInteger(pid)
+        || pid <= 0) {
+        throw ownerError(
+            `sandbox owner ${expectedOwnerKey} record does not match its exact authority key`,
+            'PLOINKY_SANDBOX_OWNER_RECORD_INVALID',
+        );
+    }
+    return Object.freeze({
+        schemaVersion: SANDBOX_OWNER_SCHEMA_VERSION,
+        ...metadata,
+        pid,
+        processIdentity,
+    });
+}
+
+function canonicalOwnerPayload(record) {
+    return `${JSON.stringify(record)}\n`;
+}
+
+function readOwnerSnapshotAt(file, expectedOwnerKey, {
+    minimumLinks = 1,
+    maximumLinks = 1,
+} = {}) {
+    const expectedUid = currentProcessUid();
+    let fd = -1;
+    try {
+        fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
+        const stat = fs.fstatSync(fd);
+        if (!stat.isFile()
+            || stat.nlink < minimumLinks
+            || stat.nlink > maximumLinks
+            || stat.uid !== expectedUid
+            || stat.size <= 0
+            || stat.size > MAX_OWNER_RECORD_BYTES
+            || (stat.mode & 0o777) !== 0o600) {
+            throw ownerError(
+                `sandbox owner ${expectedOwnerKey} file is not an exact private bounded record`,
+                'PLOINKY_SANDBOX_OWNER_RECORD_INVALID',
+            );
+        }
+        const bytes = fs.readFileSync(fd, 'utf8');
+        let parsed;
+        try {
+            parsed = JSON.parse(bytes);
+        } catch (cause) {
+            throw ownerError(
+                `sandbox owner ${expectedOwnerKey} record is malformed: ${cause?.message || cause}`,
+                'PLOINKY_SANDBOX_OWNER_RECORD_INVALID',
+            );
+        }
+        const record = validateStoredOwner(parsed, expectedOwnerKey);
+        if (bytes !== canonicalOwnerPayload(record)) {
+            throw ownerError(
+                `sandbox owner ${expectedOwnerKey} record is not exact canonical v${SANDBOX_OWNER_SCHEMA_VERSION} JSON`,
+                'PLOINKY_SANDBOX_OWNER_RECORD_INVALID',
+            );
         }
         return Object.freeze({
-            runtimeKey: normalized,
-            pid,
-            processIdentity: parsed.processIdentity,
-            instanceId: parsed.instanceId,
-            enableGeneration: parsed.enableGeneration,
+            record,
+            raw: bytes,
+            dev: stat.dev,
+            ino: stat.ino,
+            mode: stat.mode,
+            size: stat.size,
         });
-    } catch (_) {
-        return null;
-    }
-}
-
-function recordMatchesRuntimeIdentity(record, expectedIdentity) {
-    if (expectedIdentity === undefined) return true;
-    const expected = normalizeSandboxRuntimeIdentity(expectedIdentity);
-    return record?.instanceId === expected.instanceId
-        && record?.enableGeneration === expected.enableGeneration;
-}
-
-function getBwrapPid(runtimeKey, expectedIdentity = undefined) {
-    const record = readBwrapPidRecord(runtimeKey);
-    return record && recordMatchesRuntimeIdentity(record, expectedIdentity) ? record.pid : 0;
-}
-
-function assertBwrapPidSlotAvailable(runtimeKey) {
-    const normalized = normalizeBwrapRuntimeKey(runtimeKey);
-    const pidFile = getPidFile(normalized);
-    if (!fs.existsSync(pidFile)) return;
-    const record = readBwrapPidRecord(normalized);
-    if (!record) {
-        const error = new Error(
-            `sandbox runtime ${normalized} has an invalid or pre-v${BWRAP_PID_SCHEMA_VERSION} PID record; remove it only after confirming no sandbox process still owns the runtime`,
-        );
-        error.code = 'PLOINKY_SANDBOX_PID_RECORD_INVALID';
-        throw error;
-    }
-    if (isExactBwrapProcess(record)) {
-        const error = new Error(`sandbox runtime ${normalized} is already bound to a live process`);
-        error.code = 'PLOINKY_SANDBOX_PID_SLOT_BUSY';
-        throw error;
-    }
-    clearBwrapPid(normalized);
-}
-
-function saveBwrapPid(runtimeKey, pid, runtimeIdentity) {
-    const normalized = normalizeBwrapRuntimeKey(runtimeKey);
-    const identity = normalizeSandboxRuntimeIdentity(runtimeIdentity);
-    const numericPid = Number(pid);
-    const processIdentity = readProcessIdentity(numericPid);
-    if (!Number.isSafeInteger(numericPid) || numericPid <= 0 || !processIdentity) {
-        throw new Error(`cannot bind sandbox runtime ${normalized} to a live process identity`);
-    }
-    const existingFile = getPidFile(normalized);
-    if (fs.existsSync(existingFile)) {
-        const existing = readBwrapPidRecord(normalized);
-        if (!existing) {
-            const error = new Error(
-                `sandbox runtime ${normalized} has an invalid or pre-v${BWRAP_PID_SCHEMA_VERSION} PID record; refusing to replace it`,
+    } catch (error) {
+        if (error?.code === 'ENOENT') return null;
+        if (error?.code === 'ELOOP') {
+            throw ownerError(
+                `sandbox owner ${expectedOwnerKey} file must not be a symlink`,
+                'PLOINKY_SANDBOX_OWNER_RECORD_INVALID',
             );
-            error.code = 'PLOINKY_SANDBOX_PID_RECORD_INVALID';
-            throw error;
         }
-        if (isExactBwrapProcess(existing)) {
-            if (
-                existing.pid === numericPid
-                && existing.processIdentity === processIdentity
-                && existing.instanceId === identity.instanceId
-                && existing.enableGeneration === identity.enableGeneration
-            ) {
-                return;
-            }
-            const error = new Error(`sandbox runtime ${normalized} is already bound to a live process`);
-            error.code = 'PLOINKY_SANDBOX_PID_SLOT_BUSY';
-            throw error;
-        }
-        clearBwrapPid(normalized);
+        throw error;
+    } finally {
+        if (fd >= 0) fs.closeSync(fd);
     }
-    ensurePidDir();
-    const pidFile = getPidFile(normalized);
+}
+
+function readOwnerSnapshot(expectedOwnerKey, options = {}) {
+    return readOwnerSnapshotAt(ownerFile(expectedOwnerKey), expectedOwnerKey, options);
+}
+
+function readOwnerFile(expectedOwnerKey) {
+    return readOwnerSnapshot(expectedOwnerKey)?.record ?? null;
+}
+
+function ownerOperationId(snapshot) {
+    return crypto.createHash('sha256').update(snapshot.raw).digest('hex').slice(0, 32);
+}
+
+function recoverOwnerOperationArtifacts() {
+    const pattern = /^(?<ownerKey>[A-Za-z0-9_.-]+\.owner\.json)\.operation-(?<operationId>[a-f0-9]{32})\.(?<kind>claim|quarantine)$/;
+    const names = fs.readdirSync(BWRAP_PIDS_DIR)
+        .filter((name) => name.includes('.owner.json.operation-'));
+    const groups = new Map();
+    for (const name of names) {
+        const match = name.match(pattern);
+        if (!match?.groups) {
+            throw ownerError(
+                `sandbox ownership store contains malformed operation entry '${name}'`,
+                'PLOINKY_SANDBOX_OWNER_STORE_INVALID',
+            );
+        }
+        const canonicalOwnerKey = match.groups.ownerKey.slice(0, -OWNER_RECORD_SUFFIX.length);
+        const groupKey = `${canonicalOwnerKey}:${match.groups.operationId}`;
+        if (!groups.has(groupKey)) {
+            groups.set(groupKey, {
+                ownerKey: canonicalOwnerKey,
+                operationId: match.groups.operationId,
+                artifacts: new Map(),
+            });
+        }
+        const group = groups.get(groupKey);
+        if (group.artifacts.has(match.groups.kind)) {
+            throw ownerError(
+                `sandbox owner ${canonicalOwnerKey} has duplicate operation state`,
+                'PLOINKY_SANDBOX_OWNER_STORE_INVALID',
+            );
+        }
+        group.artifacts.set(match.groups.kind, path.join(BWRAP_PIDS_DIR, name));
+    }
+
+    const ownerKeys = new Set();
+    for (const group of groups.values()) {
+        if (ownerKeys.has(group.ownerKey)) {
+            throw ownerError(
+                `sandbox owner ${group.ownerKey} has multiple interrupted operations`,
+                'PLOINKY_SANDBOX_OWNER_STORE_INVALID',
+            );
+        }
+        ownerKeys.add(group.ownerKey);
+        const claim = group.artifacts.has('claim')
+            ? readOwnerSnapshotAt(group.artifacts.get('claim'), group.ownerKey, {
+                minimumLinks: 1,
+                maximumLinks: 2,
+            })
+            : null;
+        const quarantine = group.artifacts.has('quarantine')
+            ? readOwnerSnapshotAt(group.artifacts.get('quarantine'), group.ownerKey, {
+                minimumLinks: 1,
+                maximumLinks: 2,
+            })
+            : null;
+        const operationSnapshot = claim || quarantine;
+        if (
+            !operationSnapshot
+            || ownerOperationId(operationSnapshot) !== group.operationId
+            || (claim && quarantine && !sameOwnerSnapshot(claim, quarantine))
+        ) {
+            throw ownerError(
+                `sandbox owner ${group.ownerKey} operation state is not exact`,
+                'PLOINKY_SANDBOX_OWNER_STORE_INVALID',
+            );
+        }
+        if (isExactSandboxOwnerProcess(operationSnapshot.record)) {
+            throw ownerError(
+                `sandbox owner ${group.ownerKey} interrupted removal still belongs to a live process`,
+                'PLOINKY_SANDBOX_OWNER_SLOT_BUSY',
+            );
+        }
+
+        // Operation paths are not owner authorities. Clean only these exact
+        // dead/PID-reused artifacts and never the canonical successor path.
+        if (quarantine) fs.unlinkSync(group.artifacts.get('quarantine'));
+        if (claim) fs.unlinkSync(group.artifacts.get('claim'));
+    }
+}
+
+function assertOwnerDirectoryCurrent() {
+    if (!fs.existsSync(BWRAP_PIDS_DIR)) return;
+    ensureOwnerDir();
+    recoverOwnerOperationArtifacts();
+    for (const name of fs.readdirSync(BWRAP_PIDS_DIR)) {
+        if (name.startsWith('.') && name.endsWith('.tmp')) continue;
+        if (name.endsWith(LEGACY_PID_SUFFIX)) {
+            throw ownerError(
+                `sandbox ownership store contains a pre-v${SANDBOX_OWNER_SCHEMA_VERSION} PID record`,
+                'PLOINKY_SANDBOX_OWNER_RECORD_INVALID',
+            );
+        }
+        if (!name.endsWith(OWNER_RECORD_SUFFIX)) {
+            throw ownerError(
+                `sandbox ownership store contains unexpected entry '${name}'`,
+                'PLOINKY_SANDBOX_OWNER_STORE_INVALID',
+            );
+        }
+        const key = name.slice(0, -OWNER_RECORD_SUFFIX.length);
+        readOwnerFile(key);
+    }
+}
+
+function readSandboxOwner(ownerKey) {
+    assertOwnerDirectoryCurrent();
+    return readOwnerFile(ownerKey);
+}
+
+function readServiceOwner(runtimeKey) {
+    const normalized = normalizeBwrapRuntimeKey(runtimeKey);
+    if (fs.existsSync(legacyPidFile(normalized))) {
+        throw ownerError(
+            `sandbox runtime ${normalized} has a pre-v${SANDBOX_OWNER_SCHEMA_VERSION} PID record`,
+            'PLOINKY_SANDBOX_OWNER_RECORD_INVALID',
+        );
+    }
+    return readSandboxOwner(serviceOwnerKey(normalized));
+}
+
+function readProviderTaskOwner(runtimeKey, taskId) {
+    return readSandboxOwner(providerTaskOwnerKey(runtimeKey, taskId));
+}
+
+function sameOwnerRecord(left, right) {
+    return Boolean(left && right)
+        && OWNER_RECORD_KEYS.every((key) => left[key] === right[key]);
+}
+
+function sameOwnerSnapshot(left, right) {
+    return Boolean(left && right)
+        && left.dev === right.dev
+        && left.ino === right.ino
+        && left.mode === right.mode
+        && left.size === right.size
+        && left.raw === right.raw;
+}
+
+function ownerMatchesExpected(record, expected) {
+    if (expected === undefined) return true;
+    const identity = normalizeSandboxRuntimeIdentity(expected);
+    if (record.instanceId !== identity.instanceId
+        || record.enableGeneration !== identity.enableGeneration) return false;
+    for (const field of ['role', 'runtimeKey', 'ownerKey', 'homeKey', 'workdir', 'logPath', 'taskId', 'provider']) {
+        if (expected[field] !== undefined && expected[field] !== record[field]) return false;
+    }
+    return true;
+}
+
+function isExactSandboxOwnerProcess(record) {
+    if (!record) return false;
+    const inspection = inspectSandboxOwnerProcess(record);
+    if (inspection.state === 'unknown') {
+        throw ownerError(
+            `cannot prove sandbox owner ${record.ownerKey} process identity`,
+            'PLOINKY_SANDBOX_OWNER_IDENTITY_UNVERIFIED',
+        );
+    }
+    return inspection.state === 'exact';
+}
+
+function clearOwnerIfExact(record) {
+    const file = ownerFile(record.ownerKey);
+    const snapshot = readOwnerSnapshot(record.ownerKey);
+    if (!snapshot || !sameOwnerRecord(snapshot.record, record)) return false;
+    const operationId = ownerOperationId(snapshot);
+    const operationBase = `${file}.operation-${operationId}`;
+    const claimFile = `${operationBase}.claim`;
+    const quarantineFile = `${operationBase}.quarantine`;
+    let claimCreated = false;
+    let primaryRenamed = false;
+
+    try {
+        try {
+            fs.linkSync(file, claimFile);
+            claimCreated = true;
+        } catch (error) {
+            if (error?.code === 'ENOENT') return false;
+            throw error;
+        }
+
+        const operationPrefix = `${path.basename(file)}.operation-`;
+        const competingArtifacts = fs.readdirSync(BWRAP_PIDS_DIR)
+            .filter((name) => name.startsWith(operationPrefix))
+            .filter((name) => name !== path.basename(claimFile));
+        if (competingArtifacts.length > 0) {
+            throw ownerError(
+                `sandbox owner ${record.ownerKey} has concurrent exact-removal operations`,
+                'PLOINKY_SANDBOX_OWNER_STORE_INVALID',
+            );
+        }
+
+        const claim = readOwnerSnapshotAt(claimFile, record.ownerKey, {
+            minimumLinks: 2,
+            maximumLinks: 2,
+        });
+        if (!sameOwnerSnapshot(claim, snapshot)) return false;
+
+        // Rename is the atomic release point. A successor may claim the
+        // primary path immediately; cleanup never touches that path again.
+        primaryRenamed = true;
+        fs.renameSync(file, quarantineFile);
+        const postClaim = readOwnerSnapshotAt(claimFile, record.ownerKey, {
+            minimumLinks: 2,
+            maximumLinks: 2,
+        });
+        const quarantined = readOwnerSnapshotAt(quarantineFile, record.ownerKey, {
+            minimumLinks: 2,
+            maximumLinks: 2,
+        });
+        if (
+            !sameOwnerSnapshot(postClaim, snapshot)
+            || !sameOwnerSnapshot(quarantined, snapshot)
+        ) {
+            throw ownerError(
+                `sandbox owner ${record.ownerKey} changed during exact removal`,
+                'PLOINKY_SANDBOX_OWNER_STORE_INVALID',
+            );
+        }
+
+        fs.unlinkSync(quarantineFile);
+        fs.unlinkSync(claimFile);
+        return true;
+    } catch (error) {
+        if (claimCreated && !primaryRenamed) {
+            try { fs.unlinkSync(claimFile); } catch (_) { }
+        }
+        throw error;
+    }
+}
+
+function publishOwnerRecord(record) {
+    ensureOwnerDir();
+    const file = ownerFile(record.ownerKey);
     const tempFile = path.join(
         BWRAP_PIDS_DIR,
-        `.${normalized}.${process.pid}.${Date.now()}.tmp`,
+        `.${record.ownerKey}.${process.pid}.${Date.now()}.tmp`,
     );
-    const payload = `${JSON.stringify({
-        schemaVersion: BWRAP_PID_SCHEMA_VERSION,
-        runtimeKey: normalized,
-        pid: numericPid,
-        processIdentity,
-        instanceId: identity.instanceId,
-        enableGeneration: identity.enableGeneration,
-    })}\n`;
+    const payload = canonicalOwnerPayload(record);
     try {
         fs.writeFileSync(tempFile, payload, { encoding: 'utf8', flag: 'wx', mode: 0o600 });
         try {
-            // A hard-link publish is atomic and never replaces an ownership
-            // record created by a concurrent launcher.
-            fs.linkSync(tempFile, pidFile);
+            fs.linkSync(tempFile, file);
         } catch (error) {
             if (error?.code !== 'EEXIST') throw error;
-            const busy = new Error(`sandbox runtime ${normalized} PID slot was claimed concurrently`);
-            busy.code = 'PLOINKY_SANDBOX_PID_SLOT_BUSY';
-            throw busy;
+            throw ownerError(
+                `sandbox owner ${record.ownerKey} was claimed concurrently`,
+                'PLOINKY_SANDBOX_OWNER_SLOT_BUSY',
+            );
         }
-        fs.chmodSync(pidFile, 0o600);
+        fs.chmodSync(file, 0o600);
     } finally {
         try { fs.unlinkSync(tempFile); } catch (_) { }
     }
 }
 
-function clearBwrapPid(runtimeKey) {
-    const pidFile = getPidFile(runtimeKey);
-    try { fs.unlinkSync(pidFile); } catch (_) { }
-}
-
-function isExactBwrapProcess(record) {
-    if (!record) return false;
-    try {
-        process.kill(record.pid, 0);
-    } catch (error) {
-        if (error?.code !== 'EPERM') return false;
+function saveSandboxOwner(value) {
+    assertOwnerDirectoryCurrent();
+    const metadata = normalizeOwnerMetadata(value);
+    const pid = Number(value.pid);
+    const processIdentity = readProcessIdentity(pid);
+    if (typeof value.pid !== 'number'
+        || !Number.isSafeInteger(pid)
+        || pid <= 0
+        || !processIdentity) {
+        throw ownerError(`cannot bind sandbox owner ${metadata.ownerKey} to a live process identity`);
     }
-    return readProcessIdentity(record.pid) === record.processIdentity;
-}
-
-function isBwrapProcessRunning(runtimeKey, expectedIdentity = undefined) {
-    const record = readBwrapPidRecord(runtimeKey);
-    if (!isExactBwrapProcess(record)) {
-        // A stale or PID-reused record never grants ownership of the process.
-        if (record) clearBwrapPid(runtimeKey);
-        return false;
-    }
-    return recordMatchesRuntimeIdentity(record, expectedIdentity);
-}
-
-function isPidAlive(entry) {
-    return isExactBwrapProcess(entry);
-}
-
-function samePidRecord(left, right) {
-    return Boolean(left && right)
-        && left.runtimeKey === right.runtimeKey
-        && left.pid === right.pid
-        && left.processIdentity === right.processIdentity
-        && left.instanceId === right.instanceId
-        && left.enableGeneration === right.enableGeneration;
-}
-
-function clearBwrapPidIfExact(entry) {
-    const current = readBwrapPidRecord(entry?.runtimeKey);
-    if (!samePidRecord(current, entry)) return false;
-    clearBwrapPid(entry.runtimeKey);
-    return true;
-}
-
-function sendSignalToBwrapEntry(entry, signal) {
-    const { runtimeKey, pid } = entry;
-    if (!isExactBwrapProcess(entry)) {
-        clearBwrapPidIfExact(entry);
-        entry.stopped = true;
-        return true;
-    }
-    try {
-        process.kill(-pid, signal);
-        console.log(`[bwrap] ${runtimeKey}: sent ${signal} to process group ${pid}`);
-        return true;
-    } catch (e) {
-        if (e?.code === 'ESRCH') {
-            console.log(`[bwrap] ${runtimeKey}: process ${pid} already exited`);
-            clearBwrapPidIfExact(entry);
-            entry.stopped = true;
-            return true;
+    const record = Object.freeze({
+        schemaVersion: SANDBOX_OWNER_SCHEMA_VERSION,
+        ...metadata,
+        pid,
+        processIdentity,
+    });
+    const existing = readOwnerFile(metadata.ownerKey);
+    if (existing) {
+        if (sameOwnerRecord(existing, record) && isExactSandboxOwnerProcess(existing)) return existing;
+        if (isExactSandboxOwnerProcess(existing)) {
+            throw ownerError(
+                `sandbox owner ${metadata.ownerKey} is already bound to a live process`,
+                'PLOINKY_SANDBOX_OWNER_SLOT_BUSY',
+            );
         }
-        // EPERM can happen when the process group signal is denied; try the root PID.
+        clearOwnerIfExact(existing);
+    }
+    publishOwnerRecord(record);
+    return record;
+}
+
+function saveServiceOwner(value) {
+    return saveSandboxOwner({
+        ...value,
+        role: SANDBOX_OWNER_ROLES.service,
+        ownerKey: serviceOwnerKey(value?.runtimeKey),
+        taskId: '',
+        provider: '',
+    });
+}
+
+function saveProviderTaskOwner(value) {
+    return saveSandboxOwner({
+        ...value,
+        role: SANDBOX_OWNER_ROLES.providerTask,
+        ownerKey: providerTaskOwnerKey(value?.runtimeKey, value?.taskId),
+    });
+}
+
+function isSandboxOwnerRunning(ownerKey, expected) {
+    if (expected === undefined) {
+        throw ownerError('exact sandbox owner check requires instanceId and enableGeneration');
+    }
+    const record = readSandboxOwner(ownerKey);
+    if (!record || !ownerMatchesExpected(record, expected)) return false;
+    if (isExactSandboxOwnerProcess(record)) return true;
+    clearOwnerIfExact(record);
+    return false;
+}
+
+function listSandboxOwners({ role, runtimeKey } = {}) {
+    assertOwnerDirectoryCurrent();
+    if (!fs.existsSync(BWRAP_PIDS_DIR)) return Object.freeze([]);
+    const exactRole = role === undefined ? '' : normalizeRole(role);
+    const exactRuntimeKey = runtimeKey === undefined ? '' : normalizeBwrapRuntimeKey(runtimeKey);
+    const owners = fs.readdirSync(BWRAP_PIDS_DIR)
+        .filter((name) => name.endsWith(OWNER_RECORD_SUFFIX))
+        .map((name) => readOwnerFile(name.slice(0, -OWNER_RECORD_SUFFIX.length)))
+        .filter((record) => record
+            && (!exactRole || record.role === exactRole)
+            && (!exactRuntimeKey || record.runtimeKey === exactRuntimeKey))
+        .sort((left, right) => left.ownerKey.localeCompare(right.ownerKey));
+    return Object.freeze(owners);
+}
+
+function listServiceOwners(options = {}) {
+    return listSandboxOwners({ ...options, role: SANDBOX_OWNER_ROLES.service });
+}
+
+function listProviderTaskOwners(options = {}) {
+    return listSandboxOwners({ ...options, role: SANDBOX_OWNER_ROLES.providerTask });
+}
+
+function signalExactOwner(record, signal) {
+    if (!isExactSandboxOwnerProcess(record)) return true;
+    try {
+        process.kill(-record.pid, signal);
+        debugLog(`[sandbox] ${record.ownerKey}: sent ${signal} to process group ${record.pid}`);
+        return true;
+    } catch (groupError) {
+        if (groupError?.code === 'ESRCH') return true;
+        if (!isExactSandboxOwnerProcess(record)) return true;
         try {
-            if (!isExactBwrapProcess(entry)) {
-                clearBwrapPidIfExact(entry);
-                entry.stopped = true;
-                return true;
-            }
-            process.kill(pid, signal);
-            console.log(`[bwrap] ${runtimeKey}: sent ${signal} to process ${pid}`);
+            process.kill(record.pid, signal);
+            debugLog(`[sandbox] ${record.ownerKey}: sent ${signal} to process ${record.pid}`);
             return true;
-        } catch (e2) {
-            if (e2?.code === 'ESRCH') {
-                clearBwrapPidIfExact(entry);
-                entry.stopped = true;
-                return true;
-            }
-            debugLog(`[bwrap] ${runtimeKey}: kill failed: ${e2?.message || e2}`);
+        } catch (processError) {
+            if (processError?.code === 'ESRCH') return true;
+            debugLog(`[sandbox] ${record.ownerKey}: signal failed: ${processError?.message || processError}`);
             return false;
         }
     }
+}
+
+function waitForOwnerExit(record, timeout) {
+    const deadline = Date.now() + Math.max(0, timeout);
+    while (Date.now() < deadline) {
+        if (!isExactSandboxOwnerProcess(record)) return true;
+        sleepMs(Math.min(50, Math.max(1, deadline - Date.now())));
+    }
+    return !isExactSandboxOwnerProcess(record);
+}
+
+function stopSandboxOwner(ownerKey, {
+    expected,
+    signal = 'SIGTERM',
+    timeout = 5000,
+    killTimeout = 1000,
+} = {}) {
+    if (expected === undefined) {
+        throw ownerError('exact sandbox owner stop requires instanceId and enableGeneration');
+    }
+    const record = readSandboxOwner(ownerKey);
+    if (!record || !ownerMatchesExpected(record, expected)) return false;
+    if (!isExactSandboxOwnerProcess(record)) {
+        clearOwnerIfExact(record);
+        return true;
+    }
+    if (!signalExactOwner(record, signal)) return false;
+    if (!waitForOwnerExit(record, timeout)) {
+        if (!isExactSandboxOwnerProcess(record)) {
+            clearOwnerIfExact(record);
+            return true;
+        }
+        if (!signalExactOwner(record, 'SIGKILL') || !waitForOwnerExit(record, killTimeout)) {
+            return false;
+        }
+    }
+    clearOwnerIfExact(record);
+    return true;
+}
+
+function stopSandboxOwners(owners, options = {}) {
+    if (!Array.isArray(owners)) throw ownerError('sandbox owners must be an array');
+    const stopped = [];
+    for (const owner of owners) {
+        if (!owner || typeof owner.ownerKey !== 'string') {
+            throw ownerError('sandbox owner stop list requires exact owner records');
+        }
+        if (stopSandboxOwner(owner.ownerKey, { ...options, expected: owner })) {
+            stopped.push(owner.ownerKey);
+        }
+    }
+    return stopped;
+}
+
+/** Stop every exact service/task owner and return the stopped ownerKey values. */
+function stopAllSandboxOwners(options = {}) {
+    return stopSandboxOwners([...listSandboxOwners()], options);
+}
+
+function assertBwrapPidSlotAvailable(runtimeKey) {
+    const normalized = normalizeBwrapRuntimeKey(runtimeKey);
+    const record = readServiceOwner(normalized);
+    if (!record) return;
+    if (isExactSandboxOwnerProcess(record)) {
+        throw ownerError(
+            `sandbox service ${normalized} is already bound to a live process`,
+            'PLOINKY_SANDBOX_OWNER_SLOT_BUSY',
+        );
+    }
+    clearOwnerIfExact(record);
+}
+
+function saveBwrapPid(runtimeKey, pid, runtimeIdentity) {
+    return saveServiceOwner({
+        ...runtimeIdentity,
+        runtimeKey,
+        pid,
+    });
+}
+
+function getBwrapPid(runtimeKey, expectedIdentity = undefined) {
+    const record = readServiceOwner(runtimeKey);
+    if (!record || !ownerMatchesExpected(record, expectedIdentity)) return 0;
+    if (!isExactSandboxOwnerProcess(record)) {
+        clearOwnerIfExact(record);
+        return 0;
+    }
+    return record.pid;
+}
+
+function clearBwrapPid(runtimeKey, expectedIdentity = undefined) {
+    const record = readServiceOwner(runtimeKey);
+    if (!record || !ownerMatchesExpected(record, expectedIdentity)) return false;
+    return clearOwnerIfExact(record);
+}
+
+function isBwrapProcessRunning(runtimeKey, expectedIdentity = undefined) {
+    const record = readServiceOwner(runtimeKey);
+    if (!record || !ownerMatchesExpected(record, expectedIdentity)) return false;
+    if (isExactSandboxOwnerProcess(record)) return true;
+    clearOwnerIfExact(record);
+    return false;
+}
+
+function stopBwrapProcess(runtimeKey, {
+    signal = 'SIGTERM',
+    timeout = 5000,
+    expectedIdentity = undefined,
+} = {}) {
+    const record = readServiceOwner(runtimeKey);
+    if (!record || !ownerMatchesExpected(record, expectedIdentity)) return false;
+    return stopSandboxOwner(record.ownerKey, {
+        expected: record,
+        signal,
+        timeout,
+    });
 }
 
 function stopBwrapProcesses(runtimeKeys, {
@@ -311,98 +857,68 @@ function stopBwrapProcesses(runtimeKeys, {
     expectedIdentities = undefined,
 } = {}) {
     if (!Array.isArray(runtimeKeys) || !runtimeKeys.length) return [];
-
-    const entries = [];
+    const stopped = [];
     const seen = new Set();
     for (const requestedKey of runtimeKeys) {
         const runtimeKey = normalizeBwrapRuntimeKey(requestedKey);
         if (seen.has(runtimeKey)) continue;
         seen.add(runtimeKey);
-
-        const record = readBwrapPidRecord(runtimeKey);
-        if (!record || !isExactBwrapProcess(record)) {
-            debugLog(`[bwrap] ${runtimeKey}: no exact live PID record found`);
-            if (record) clearBwrapPid(runtimeKey);
-            continue;
-        }
+        const record = readServiceOwner(runtimeKey);
+        if (!record) continue;
         const expectedIdentity = expectedIdentities instanceof Map
             ? expectedIdentities.get(runtimeKey)
             : undefined;
-        if (expectedIdentity !== undefined && !recordMatchesRuntimeIdentity(record, expectedIdentity)) {
-            debugLog(`[bwrap] ${runtimeKey}: exact generation does not own the live PID record`);
-            continue;
+        if (!ownerMatchesExpected(record, expectedIdentity)) continue;
+        if (stopSandboxOwner(record.ownerKey, {
+            expected: record,
+            signal,
+            timeout,
+        })) {
+            stopped.push(runtimeKey);
         }
-        entries.push({ ...record, stopped: false });
     }
-
-    for (const entry of entries) {
-        sendSignalToBwrapEntry(entry, signal);
-    }
-
-    const deadline = Date.now() + Math.max(0, timeout);
-    while (Date.now() < deadline) {
-        let hasRunningProcesses = false;
-        for (const entry of entries) {
-            if (entry.stopped) continue;
-            if (isPidAlive(entry)) {
-                hasRunningProcesses = true;
-                continue;
-            }
-            console.log(`[bwrap] ${entry.runtimeKey}: process ${entry.pid} exited`);
-            clearBwrapPidIfExact(entry);
-            entry.stopped = true;
-        }
-        if (!hasRunningProcesses) break;
-        sleepMs(200);
-    }
-
-    for (const entry of entries) {
-        if (entry.stopped) continue;
-        if (isExactBwrapProcess(entry)) {
-            console.log(`[bwrap] ${entry.runtimeKey}: force killing process ${entry.pid}`);
-            try { process.kill(-entry.pid, 'SIGKILL'); } catch (_) { }
-            if (isExactBwrapProcess(entry)) {
-                try { process.kill(entry.pid, 'SIGKILL'); } catch (_) { }
-            }
-        }
-        clearBwrapPidIfExact(entry);
-        entry.stopped = true;
-    }
-
-    return entries.filter((entry) => entry.stopped).map((entry) => entry.runtimeKey);
+    return stopped;
 }
 
-function stopBwrapProcess(runtimeKey, {
-    signal = 'SIGTERM',
-    timeout = 5000,
-    expectedIdentity = undefined,
-} = {}) {
-    const normalized = normalizeBwrapRuntimeKey(runtimeKey);
-    const expectedIdentities = expectedIdentity === undefined
-        ? undefined
-        : new Map([[normalized, normalizeSandboxRuntimeIdentity(expectedIdentity)]]);
-    return stopBwrapProcesses([normalized], { signal, timeout, expectedIdentities }).includes(normalized);
-}
-
-function stopAllBwrapProcesses() {
-    if (!fs.existsSync(BWRAP_PIDS_DIR)) return [];
-    const runtimeKeys = fs.readdirSync(BWRAP_PIDS_DIR)
-        .filter((file) => file.endsWith('.pid'))
-        .map((file) => file.slice(0, -'.pid'.length));
-    return stopBwrapProcesses(runtimeKeys);
+/** Stop exact service owners only and preserve the historical runtimeKey[] result shape. */
+function stopAllBwrapProcesses(options = {}) {
+    const stopped = [];
+    for (const owner of listServiceOwners()) {
+        if (stopSandboxOwner(owner.ownerKey, { ...options, expected: owner })) {
+            stopped.push(owner.runtimeKey);
+        }
+    }
+    return stopped;
 }
 
 export {
     BWRAP_PIDS_DIR,
     BWRAP_PID_SCHEMA_VERSION,
+    SANDBOX_OWNER_ROLES,
+    SANDBOX_OWNER_SCHEMA_VERSION,
+    assertBwrapPidSlotAvailable,
+    clearBwrapPid,
+    getBwrapPid,
+    isBwrapProcessRunning,
+    isSandboxOwnerRunning,
+    listProviderTaskOwners,
+    listSandboxOwners,
+    listServiceOwners,
     normalizeBwrapRuntimeKey,
     normalizeSandboxRuntimeIdentity,
-    assertBwrapPidSlotAvailable,
-    getBwrapPid,
+    providerTaskOwnerKey,
+    readProviderTaskOwner,
+    readSandboxOwner,
+    readServiceOwner,
     saveBwrapPid,
-    clearBwrapPid,
-    isBwrapProcessRunning,
-    stopBwrapProcesses,
+    saveProviderTaskOwner,
+    saveSandboxOwner,
+    saveServiceOwner,
+    serviceOwnerKey,
+    stopAllBwrapProcesses,
+    stopAllSandboxOwners,
     stopBwrapProcess,
-    stopAllBwrapProcesses
+    stopBwrapProcesses,
+    stopSandboxOwner,
+    stopSandboxOwners,
 };

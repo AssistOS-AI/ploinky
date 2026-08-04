@@ -641,7 +641,12 @@ function loadRegistryManifest(record) {
 
 function isRegistryRuntimeRunning(containerName, record) {
   if (isSandboxRuntime(record?.runtime)) {
-    return isBwrapProcessRunning(record.agentName);
+    if (!String(record?.instanceId || '').trim()
+        || !String(record?.enableGeneration || '').trim()) return false;
+    return isBwrapProcessRunning(containerName, {
+      instanceId: record.instanceId,
+      enableGeneration: record.enableGeneration,
+    });
   }
   return dockerSvc.isContainerRunning(containerName);
 }

@@ -4,8 +4,9 @@ import test from 'node:test';
 import { collectAgentRuntimeStates } from '../../cli/sandbox/agentRuntimeState.js';
 import { __testables as marketplaceTestables } from '../../cli/server/authHandlers/marketplaceRoutes.js';
 
-test('collectAgentRuntimeStates reports live and stopped host sandboxes from tracked PIDs', () => {
-    const checked = [];
+test('collectAgentRuntimeStates uses exact registry runtime ownership and surfaces host metadata', () => {
+    const reads = [];
+    const checks = [];
     const registry = {
         bwrapKey: {
             type: 'agent',
@@ -13,6 +14,8 @@ test('collectAgentRuntimeStates reports live and stopped host sandboxes from tra
             repoName: 'Agents',
             agentName: 'codexAgent',
             projectPath: '/workspace',
+            instanceId: 'instance-bwrap',
+            enableGeneration: 'generation-bwrap',
         },
         seatbeltKey: {
             type: 'agent',
@@ -20,20 +23,66 @@ test('collectAgentRuntimeStates reports live and stopped host sandboxes from tra
             repoName: 'Agents',
             agentName: 'piAgent',
             projectPath: '/workspace',
+            instanceId: 'instance-seatbelt',
+            enableGeneration: 'generation-seatbelt',
+        },
+    };
+    const owners = {
+        bwrapKey: {
+            schemaVersion: 3,
+            role: 'service',
+            runtimeKey: 'bwrapKey',
+            ownerKey: 'service-bwrap-owner',
+            pid: 4242,
+            processIdentity: 'linux-proc:101',
+            instanceId: 'instance-bwrap',
+            enableGeneration: 'generation-bwrap',
+            homeKey: 'bwrapKey',
+            workdir: '/workspace/projects/current',
+            logPath: '/workspace/.ploinky/logs/bwrapKey-bwrap.log',
+            taskId: '',
+            provider: '',
+        },
+        seatbeltKey: {
+            schemaVersion: 3,
+            role: 'service',
+            runtimeKey: 'seatbeltKey',
+            ownerKey: 'service-seatbelt-owner',
+            pid: 4343,
+            processIdentity: 'ps-lstart:Tue Aug 4 10:00:00 2026',
+            instanceId: 'instance-seatbelt',
+            enableGeneration: 'stale-seatbelt-generation',
+            homeKey: 'seatbeltKey',
+            workdir: '/workspace',
+            logPath: '/workspace/.ploinky/logs/seatbeltKey-seatbelt.log',
+            taskId: '',
+            provider: '',
         },
     };
 
     const states = collectAgentRuntimeStates({
         registry,
         liveContainers: [],
-        isSandboxRunning(agentName) {
-            checked.push(agentName);
-            return agentName === 'codexAgent';
+        readSandboxServiceOwner(runtimeKey) {
+            reads.push(runtimeKey);
+            return owners[runtimeKey] || null;
         },
-        getSandboxPid: () => 4242,
+        isSandboxOwnerRunning(ownerKey, expected) {
+            checks.push({ ownerKey, expected });
+            return ownerKey === owners.bwrapKey.ownerKey;
+        },
     });
 
-    assert.deepEqual(checked, ['codexAgent', 'piAgent']);
+    assert.deepEqual(reads, ['bwrapKey', 'seatbeltKey']);
+    assert.deepEqual(checks, [{
+        ownerKey: 'service-bwrap-owner',
+        expected: {
+            instanceId: 'instance-bwrap',
+            enableGeneration: 'generation-bwrap',
+            role: 'service',
+            runtimeKey: 'bwrapKey',
+        },
+    }]);
     assert.deepEqual(states.map((entry) => ({
         name: entry.agentName,
         runtime: entry.runtime,
@@ -44,6 +93,31 @@ test('collectAgentRuntimeStates reports live and stopped host sandboxes from tra
         { name: 'codexAgent', runtime: 'bwrap', status: 'running', running: true, pid: 4242 },
         { name: 'piAgent', runtime: 'seatbelt', status: 'stopped', running: false, pid: 0 },
     ]);
+    assert.deepEqual({
+        role: states[0].role,
+        runtimeKey: states[0].runtimeKey,
+        ownerKey: states[0].ownerKey,
+        instanceId: states[0].instanceId,
+        enableGeneration: states[0].enableGeneration,
+        homeKey: states[0].homeKey,
+        workdir: states[0].workdir,
+        logPath: states[0].logPath,
+        taskId: states[0].taskId,
+        provider: states[0].provider,
+        processIdentity: states[0].processIdentity,
+    }, {
+        role: 'service',
+        runtimeKey: 'bwrapKey',
+        ownerKey: 'service-bwrap-owner',
+        instanceId: 'instance-bwrap',
+        enableGeneration: 'generation-bwrap',
+        homeKey: 'bwrapKey',
+        workdir: '/workspace/projects/current',
+        logPath: '/workspace/.ploinky/logs/bwrapKey-bwrap.log',
+        taskId: '',
+        provider: '',
+        processIdentity: 'linux-proc:101',
+    });
 });
 
 test('collectAgentRuntimeStates merges OCI state and retains stopped enabled containers', () => {
@@ -75,6 +149,23 @@ test('collectAgentRuntimeStates merges OCI state and retains stopped enabled con
     assert.equal(states[0].state.running, true);
     assert.equal(states[1].runtime, 'docker');
     assert.equal(states[1].state.status, 'stopped');
+    for (const state of states) {
+        for (const hostOnlyField of [
+            'role',
+            'runtimeKey',
+            'ownerKey',
+            'instanceId',
+            'enableGeneration',
+            'homeKey',
+            'workdir',
+            'logPath',
+            'taskId',
+            'provider',
+            'processIdentity',
+        ]) {
+            assert.equal(Object.hasOwn(state, hostOnlyField), false, `${hostOnlyField} must remain host-only`);
+        }
+    }
 });
 
 test('Marketplace reports an enabled bwrap agent as running from generic runtime state', () => {

@@ -31,7 +31,7 @@ function envForAgent(repoName, agentName) {
     return buildFullEnvMap(agentName, {}, {}, workDir, repoName, 'dev', 'bwrap', null, routerEndpoint);
 }
 
-test('bwrap keeps the selected workspace separate from the persistent /root home', () => {
+test('bwrap exposes the fixed workspace and direct clean HOME ABI', () => {
     const workspacePath = path.join(tempDir, 'workspace');
     const env = buildFullEnvMap(
         'codexAgent',
@@ -44,9 +44,12 @@ test('bwrap keeps the selected workspace separate from the persistent /root home
         null,
         routerEndpoint,
     );
-    assert.equal(env.WORKSPACE_PATH, workspacePath);
-    assert.equal(env.HOME, '/root');
-    assert.match(env.PATH, /^\/opt\/ploinky-node\/bin:/);
+    assert.equal(env.WORKSPACE_PATH, '/workspace');
+    assert.equal(env.PLOINKY_WORKSPACE_ROOT, '/workspace');
+    assert.equal(env.HOME, '/home/agent');
+    assert.equal(env.XDG_CONFIG_HOME, '/home/agent/.config');
+    assert.equal(env.PATH, '/opt/ploinky-node/bin:/usr/bin:/bin');
+    assert.equal(env.PATH.includes('/home/agent'), false);
 });
 
 test('uncertified bwrap env carries only the canonical non-secret principal', () => {

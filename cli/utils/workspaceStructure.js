@@ -2,6 +2,209 @@ import fs from 'fs';
 import path from 'path';
 import { PLOINKY_WORKSPACE_ROOT, PLOINKY_DIR, AGENTS_DATA_DIR, CODE_DIR, SKILLS_DIR, REPOS_DIR } from './config.js';
 
+export const AGENT_HOME_ABI = 'ploinky-home-v2';
+export const AGENT_HOME_ABI_SCHEMA_VERSION = 2;
+export const AGENT_HOME_ABI_MARKER = '.ploinky-home-abi.json';
+
+const AGENT_HOME_KEY_PATTERN = /^[A-Za-z0-9_.-]{1,255}$/;
+const AGENT_HOME_MARKER_KEYS = Object.freeze([
+    'abi',
+    'createdByGeneration',
+    'homeKey',
+    'schemaVersion',
+]);
+const AGENT_HOME_MARKER_MAX_BYTES = 4096;
+
+export class AgentHomeStateIncompatibleError extends Error {
+    constructor(reason) {
+        super([
+            'Agent HOME state is incompatible with the ploinky-home-v2 ABI.',
+            'Archive or reset this agent HOME explicitly, then retry.',
+            'Ploinky did not migrate, rewrite, or remove the existing HOME state.',
+        ].join(' '));
+        this.name = 'AgentHomeStateIncompatibleError';
+        this.code = 'PLOINKY_HOME_STATE_INCOMPATIBLE';
+        this.context = Object.freeze({ reason });
+    }
+}
+
+function homeStateError(reason) {
+    return new AgentHomeStateIncompatibleError(reason);
+}
+
+function requireAgentHomeKey(homeKey) {
+    if (typeof homeKey !== 'string'
+        || !AGENT_HOME_KEY_PATTERN.test(homeKey)
+        || homeKey === '.'
+        || homeKey === '..') {
+        throw homeStateError('invalid-home-key');
+    }
+    return homeKey;
+}
+
+function requireGeneration(generation) {
+    if (typeof generation !== 'string'
+        || generation.length === 0
+        || Buffer.byteLength(generation, 'utf8') > 255
+        || generation.trim() !== generation
+        || /[\u0000-\u001f\u007f]/.test(generation)) {
+        throw homeStateError('invalid-generation');
+    }
+    return generation;
+}
+
+function currentUid() {
+    if (typeof process.getuid !== 'function') {
+        throw homeStateError('uid-unavailable');
+    }
+    const uid = process.getuid();
+    if (!Number.isSafeInteger(uid) || uid < 0) {
+        throw homeStateError('uid-unavailable');
+    }
+    return uid;
+}
+
+function sameFilesystemObject(left, right) {
+    return left.dev === right.dev && left.ino === right.ino;
+}
+
+function exactMode(stats) {
+    return stats.mode & 0o7777;
+}
+
+function inspectDataRoot(agentsDataDir, expectedUid) {
+    let dataPath;
+    let stats;
+    let realPath;
+    let realStats;
+    try {
+        dataPath = path.resolve(agentsDataDir);
+        stats = fs.lstatSync(dataPath);
+        realPath = fs.realpathSync(dataPath);
+        realStats = fs.statSync(realPath);
+    } catch (_) {
+        throw homeStateError('invalid-data-root');
+    }
+    if (stats.isSymbolicLink()
+        || !stats.isDirectory()
+        || !realStats.isDirectory()
+        || !sameFilesystemObject(stats, realStats)
+        || stats.uid !== expectedUid) {
+        throw homeStateError('invalid-data-root');
+    }
+    return Object.freeze({ dataPath, realPath, stats });
+}
+
+function inspectHome(homePath, homeKey, dataRoot, expectedUid) {
+    let stats;
+    let realPath;
+    let realStats;
+    try {
+        stats = fs.lstatSync(homePath);
+        realPath = fs.realpathSync(homePath);
+        realStats = fs.statSync(realPath);
+    } catch (_) {
+        throw homeStateError('invalid-home-root');
+    }
+    if (stats.isSymbolicLink()
+        || !stats.isDirectory()
+        || !realStats.isDirectory()
+        || !sameFilesystemObject(stats, realStats)
+        || stats.uid !== expectedUid
+        || exactMode(stats) !== 0o700
+        || path.dirname(realPath) !== dataRoot.realPath
+        || path.basename(realPath) !== homeKey) {
+        throw homeStateError('invalid-home-root');
+    }
+    return Object.freeze({ realPath, stats });
+}
+
+function canonicalHomeMarker(marker) {
+    return `${JSON.stringify({
+        abi: marker.abi,
+        createdByGeneration: marker.createdByGeneration,
+        homeKey: marker.homeKey,
+        schemaVersion: marker.schemaVersion,
+    })}\n`;
+}
+
+function expectedHomeMarker(homeKey, createdByGeneration) {
+    return Object.freeze({
+        abi: AGENT_HOME_ABI,
+        createdByGeneration,
+        homeKey,
+        schemaVersion: AGENT_HOME_ABI_SCHEMA_VERSION,
+    });
+}
+
+function inspectHomeMarker(markerPath, homeKey, expectedUid) {
+    let stats;
+    let raw;
+    let marker;
+    try {
+        stats = fs.lstatSync(markerPath);
+        if (stats.isSymbolicLink()
+            || !stats.isFile()
+            || stats.uid !== expectedUid
+            || exactMode(stats) !== 0o600
+            || stats.size > AGENT_HOME_MARKER_MAX_BYTES) {
+            throw homeStateError('invalid-home-marker');
+        }
+        raw = fs.readFileSync(markerPath, 'utf8');
+        marker = JSON.parse(raw);
+    } catch (error) {
+        if (error?.code === 'PLOINKY_HOME_STATE_INCOMPATIBLE') throw error;
+        throw homeStateError('invalid-home-marker');
+    }
+    if (!marker || typeof marker !== 'object' || Array.isArray(marker)) {
+        throw homeStateError('invalid-home-marker');
+    }
+    const keys = Object.keys(marker).sort();
+    const expectedKeys = [...AGENT_HOME_MARKER_KEYS].sort();
+    if (keys.length !== expectedKeys.length
+        || keys.some((key, index) => key !== expectedKeys[index])
+        || marker.abi !== AGENT_HOME_ABI
+        || typeof marker.createdByGeneration !== 'string'
+        || marker.createdByGeneration.length === 0
+        || marker.homeKey !== homeKey
+        || marker.schemaVersion !== AGENT_HOME_ABI_SCHEMA_VERSION
+        || raw !== canonicalHomeMarker(marker)) {
+        throw homeStateError('invalid-home-marker');
+    }
+    return Object.freeze(marker);
+}
+
+function createHomeMarker(markerPath, marker, expectedUid) {
+    const noFollow = fs.constants.O_NOFOLLOW;
+    if (!Number.isInteger(noFollow)) {
+        throw homeStateError('atomic-marker-unavailable');
+    }
+    const flags = fs.constants.O_WRONLY
+        | fs.constants.O_CREAT
+        | fs.constants.O_EXCL
+        | noFollow;
+    let fd;
+    try {
+        fd = fs.openSync(markerPath, flags, 0o600);
+        fs.fchmodSync(fd, 0o600);
+        const stats = fs.fstatSync(fd);
+        if (!stats.isFile() || stats.uid !== expectedUid || exactMode(stats) !== 0o600) {
+            throw homeStateError('invalid-created-marker');
+        }
+        fs.writeFileSync(fd, canonicalHomeMarker(marker), 'utf8');
+        fs.fsyncSync(fd);
+    } catch (error) {
+        if (error?.code === 'PLOINKY_HOME_STATE_INCOMPATIBLE') throw error;
+        throw homeStateError('marker-creation-race');
+    } finally {
+        if (fd !== undefined) {
+            try {
+                fs.closeSync(fd);
+            } catch (_) {}
+        }
+    }
+}
+
 /**
  * Initialize the workspace directory structure.
  * Creates: .ploinky/, .ploinky/code/, .ploinky/skills/, .ploinky/logs/, .ploinky/shared/, .data/
@@ -143,6 +346,116 @@ export function getAgentWorkDir(agentName) {
 
 export function getAgentDataDir(instanceName) {
     return path.join(AGENTS_DATA_DIR, sanitizeAgentDataName(instanceName));
+}
+
+/**
+ * Resolve the clean provider HOME backing directory without sanitizing or
+ * otherwise changing the admitted runtime key.
+ *
+ * @param {string} homeKey - Exact effective container/runtime key
+ * @param {{ agentsDataDir?: string }} [options]
+ * @returns {string} The physical HOME path below .data
+ */
+export function getAgentHomeAbiPath(homeKey, {
+    agentsDataDir = AGENTS_DATA_DIR,
+} = {}) {
+    const exactHomeKey = requireAgentHomeKey(homeKey);
+    if (typeof agentsDataDir !== 'string' || agentsDataDir.length === 0) {
+        throw homeStateError('invalid-data-root');
+    }
+    return path.join(path.resolve(agentsDataDir), exactHomeKey);
+}
+
+/**
+ * Create or validate the clean provider HOME ABI. Existing marked provider
+ * state is accepted without rewriting its immutable creation provenance.
+ * Existing unmarked state is never migrated or removed.
+ *
+ * @param {string} homeKey - Exact effective container/runtime key
+ * @param {string} createdByGeneration - Exact nonempty creation generation
+ * @param {{ agentsDataDir?: string }} [options]
+ * @returns {{ homePath: string, homeKey: string, createdByGeneration: string, markerPath: string }}
+ */
+export function ensureAgentHomeAbi(homeKey, createdByGeneration, {
+    agentsDataDir = AGENTS_DATA_DIR,
+} = {}) {
+    const exactHomeKey = requireAgentHomeKey(homeKey);
+    const exactGeneration = requireGeneration(createdByGeneration);
+    const expectedUid = currentUid();
+    const dataRootBefore = inspectDataRoot(agentsDataDir, expectedUid);
+    const homePath = getAgentHomeAbiPath(exactHomeKey, {
+        agentsDataDir: dataRootBefore.dataPath,
+    });
+
+    let createdHome = false;
+    try {
+        fs.mkdirSync(homePath, { mode: 0o700 });
+        createdHome = true;
+        fs.chmodSync(homePath, 0o700);
+    } catch (error) {
+        if (error?.code !== 'EEXIST') {
+            throw homeStateError('home-creation-failed');
+        }
+    }
+
+    const homeBefore = inspectHome(
+        homePath,
+        exactHomeKey,
+        dataRootBefore,
+        expectedUid,
+    );
+    const markerPath = path.join(homePath, AGENT_HOME_ABI_MARKER);
+    let entries;
+    try {
+        entries = fs.readdirSync(homePath);
+    } catch (_) {
+        throw homeStateError('home-read-failed');
+    }
+    let createdMarker = false;
+    if (!entries.includes(AGENT_HOME_ABI_MARKER)) {
+        if (entries.length !== 0) {
+            throw homeStateError('unmarked-home-not-empty');
+        }
+        createHomeMarker(
+            markerPath,
+            expectedHomeMarker(exactHomeKey, exactGeneration),
+            expectedUid,
+        );
+        createdMarker = true;
+    } else if (createdHome || entries.filter((entry) => entry === AGENT_HOME_ABI_MARKER).length !== 1) {
+        throw homeStateError('home-creation-race');
+    }
+
+    const dataRootAfter = inspectDataRoot(agentsDataDir, expectedUid);
+    const homeAfter = inspectHome(
+        homePath,
+        exactHomeKey,
+        dataRootAfter,
+        expectedUid,
+    );
+    if (!sameFilesystemObject(dataRootBefore.stats, dataRootAfter.stats)
+        || !sameFilesystemObject(homeBefore.stats, homeAfter.stats)) {
+        throw homeStateError('home-identity-race');
+    }
+    if (createdMarker) {
+        let initializedEntries;
+        try {
+            initializedEntries = fs.readdirSync(homePath);
+        } catch (_) {
+            throw homeStateError('home-read-failed');
+        }
+        if (initializedEntries.length !== 1
+            || initializedEntries[0] !== AGENT_HOME_ABI_MARKER) {
+            throw homeStateError('home-creation-race');
+        }
+    }
+    const marker = inspectHomeMarker(markerPath, exactHomeKey, expectedUid);
+    return Object.freeze({
+        homePath,
+        homeKey: exactHomeKey,
+        createdByGeneration: marker.createdByGeneration,
+        markerPath,
+    });
 }
 
 function sanitizeAgentDataName(value) {

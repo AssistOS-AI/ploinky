@@ -772,7 +772,9 @@ function probeBoxBwrapHelper(helperPath = IMAGE_CONTRACT.bwrapHelper, spawnSyncI
     return !result.error && result.status === 0
         && output.includes('protocol=1 descriptor-fd=3')
         && output.includes('path-resolution=openat2-beneath-no-magiclinks-no-symlinks')
-        && output.includes('bwrap-fd-options=bind-fd,ro-bind-fd,ro-bind-data,perms');
+        && output.includes('bwrap-fd-options=bind-fd,ro-bind-fd,ro-bind-data,perms')
+        && output.includes('typed-fs=dir,tmpfs,proc,dev,system-symlink,ro-data-path-file')
+        && output.includes('ro-data-path-hardening=sealed-memfd-ro-bind-data');
 }
 
 function getRuntimeForAgent(manifest, {
