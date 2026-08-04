@@ -78,7 +78,7 @@
  *                length, u16 target length, then absolute source and target
  *   6 DIR        one normalized absolute directory target
  *   7 TMPFS      one exact approved target: /tmp, /tmp/cache, /run,
- *                /workspace/.ploinky, or /workspace/.data
+ *                /workspace, /workspace/.ploinky, or /workspace/.data
  *   8 PROC       empty payload; fixed target /proc
  *   9 DEV        empty payload; fixed target /dev
  *  10 SYMLINK    one-byte fixed system mapping: 1=usr/bin->/bin,
@@ -539,7 +539,8 @@ static void require_workspace_parent_before_child(const struct launch *launch,
 {
     if (path_has_prefix(target, "/workspace") &&
         strcmp(target, "/workspace") != 0 &&
-        !target_seen(launch, "/workspace", -1)) {
+        !target_seen(launch, "/workspace", MOUNT_WORKSPACE) &&
+        !target_seen(launch, "/workspace", MOUNT_TMPFS)) {
         fail(EXIT_PROTOCOL_INVALID, "PLOINKY_BWRAP_MOUNT_ORDER_INVALID",
              "workspace root must precede descendant target %s", target);
     }
@@ -555,7 +556,7 @@ static void validate_dir_target(const unsigned char *bytes, size_t length)
     }
     target = copy_string(bytes, length, "PLOINKY_MOUNT_DESTINATION_UNSUPPORTED");
     if (!(strcmp(target, "/opt") == 0 ||
-          strcmp(target, "/workspace") == 0 ||
+          strcmp(target, "/home") == 0 ||
           strcmp(target, "/workspace/readiness") == 0 ||
           strcmp(target, "/run/ploinky-agent") == 0 ||
           path_has_prefix(target, "/workspace/.ploinky/repos"))) {
@@ -572,6 +573,7 @@ static bool approved_tmpfs_target(const unsigned char *bytes, size_t length)
         "/tmp",
         "/tmp/cache",
         "/run",
+        "/workspace",
         "/workspace/.ploinky",
         "/workspace/.data",
     };
@@ -1058,6 +1060,10 @@ static void parse_descriptor(struct launch *launch)
             validate_workdir(record->payload, payload_length);
             target = workdir_target(record->payload, payload_length);
             require_workspace_parent_before_child(launch, target);
+            if (!target_seen(launch, "/workspace", MOUNT_WORKSPACE)) {
+                fail(EXIT_PROTOCOL_INVALID, "PLOINKY_BWRAP_MOUNT_ORDER_INVALID",
+                     "WORKDIR requires the bound workspace root first");
+            }
             require_managed_repo_parent(launch, target, true);
             reject_duplicate_target(launch, target);
             reject_hiding_prior_target(launch, target);
@@ -1131,6 +1137,11 @@ static void parse_descriptor(struct launch *launch)
             target = copy_string(record->payload, payload_length,
                                  "PLOINKY_MOUNT_DESTINATION_UNSUPPORTED");
             require_workspace_parent_before_child(launch, target);
+            if (strcmp(target, "/workspace/readiness") == 0 &&
+                !target_seen(launch, "/workspace", MOUNT_TMPFS)) {
+                fail(EXIT_PROTOCOL_INVALID, "PLOINKY_BWRAP_MOUNT_ORDER_INVALID",
+                     "private readiness requires the /workspace tmpfs first");
+            }
             if (path_has_prefix(target, "/run") && strcmp(target, "/run") != 0 &&
                 !target_seen(launch, "/run", MOUNT_TMPFS)) {
                 fail(EXIT_PROTOCOL_INVALID, "PLOINKY_BWRAP_MOUNT_ORDER_INVALID",
@@ -1138,6 +1149,7 @@ static void parse_descriptor(struct launch *launch)
             }
             require_managed_repo_parent(launch, target, false);
             reject_duplicate_target(launch, target);
+            reject_hiding_prior_target(launch, target);
             mount = new_mount(launch);
             mount->kind = MOUNT_DIR;
             mount->target = target;

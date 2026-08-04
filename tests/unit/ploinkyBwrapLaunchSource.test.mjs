@@ -320,6 +320,7 @@ test('typed filesystem records enforce exact destinations, collisions, and paren
         record(RECORD.TMPFS, '/run'),
         record(RECORD.DIR, '/run/ploinky-agent'),
         record(RECORD.DIR, '/opt'),
+        record(RECORD.DIR, '/home'),
         record(RECORD.HOME, '.data/codex'),
         roPathRecord('/tmp', '/home/agent/.local'),
         record(RECORD.PROC, ''),
@@ -348,7 +349,7 @@ test('typed filesystem records enforce exact destinations, collisions, and paren
 
     const invalidFixtures = [
         {
-            records: [record(RECORD.TMPFS, '/workspace')],
+            records: [record(RECORD.DIR, '/workspace')],
             status: 73,
             code: 'PLOINKY_MOUNT_DESTINATION_UNSUPPORTED',
         },
@@ -407,6 +408,43 @@ test('typed filesystem records enforce exact destinations, collisions, and paren
             code: 'PLOINKY_MOUNT_DESTINATION_UNSUPPORTED',
         },
         {
+            records: [record(RECORD.DIR, '/workspace/readiness')],
+            status: 64,
+            code: 'PLOINKY_BWRAP_MOUNT_ORDER_INVALID',
+        },
+        {
+            records: [
+                record(RECORD.WORKSPACE, Buffer.from([1])),
+                record(RECORD.DIR, '/workspace/readiness'),
+            ],
+            status: 64,
+            code: 'PLOINKY_BWRAP_MOUNT_ORDER_INVALID',
+        },
+        {
+            records: [
+                record(RECORD.TMPFS, '/workspace'),
+                record(RECORD.WORKDIR, 'project-a'),
+            ],
+            status: 64,
+            code: 'PLOINKY_BWRAP_MOUNT_ORDER_INVALID',
+        },
+        {
+            records: [
+                record(RECORD.TMPFS, '/workspace'),
+                record(RECORD.WORKSPACE, Buffer.from([1])),
+            ],
+            status: 64,
+            code: 'PLOINKY_BWRAP_DUPLICATE_MOUNT',
+        },
+        {
+            records: [
+                record(RECORD.WORKSPACE, Buffer.from([1])),
+                record(RECORD.TMPFS, '/workspace'),
+            ],
+            status: 64,
+            code: 'PLOINKY_BWRAP_DUPLICATE_MOUNT',
+        },
+        {
             records: [
                 record(RECORD.WORKSPACE, Buffer.from([1])),
                 record(RECORD.WORKDIR, 'project-a'),
@@ -425,6 +463,22 @@ test('typed filesystem records enforce exact destinations, collisions, and paren
         assert.equal(result.status, fixture.status, result.stderr);
         assert.match(result.stderr, new RegExp(`^${fixture.code}:`));
     }
+});
+
+test('private readiness uses an exact empty workspace tmpfs and ordered readiness directory', async () => {
+    const result = await launchWithDescriptor(descriptor([
+        record(RECORD.TMPFS, '/workspace'),
+        record(RECORD.DIR, '/workspace/readiness'),
+        record(RECORD.ARG, '--chdir'),
+        record(RECORD.ARG, '/workspace/readiness'),
+        record(RECORD.ARG, '--'),
+        record(RECORD.ARG, '/bin/true'),
+    ]));
+
+    assert.notEqual(result.status, 64, result.stderr);
+    assert.notEqual(result.status, 73, result.stderr);
+    assert.doesNotMatch(result.stderr,
+        /PLOINKY_BWRAP_(?:PROTOCOL_INVALID|MOUNT_ORDER_INVALID|DUPLICATE_MOUNT)|PLOINKY_MOUNT_DESTINATION_UNSUPPORTED/);
 });
 
 test('pre-exec barrier accepts only distinct anonymous IPC fds and cannot alias credentials', async () => {
