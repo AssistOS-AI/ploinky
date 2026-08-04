@@ -1,7 +1,11 @@
-import { execFileSync } from 'node:child_process';
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
+
+import {
+    inspectProcessIdentity,
+    normalizeProcessIdentity,
+} from '../../cli/sandbox/processIdentity.js';
 
 export const BWRAP_LAUNCH_PROTOCOL = 'PLBWLP01';
 export const BWRAP_LAUNCH_LIMITS = Object.freeze({
@@ -35,12 +39,13 @@ export const BWRAP_SYMLINK_MAPPINGS = Object.freeze({
 export const DEFAULT_PROVIDER_HOME_LEASE_ROOT = '/workspace/.ploinky/run/provider-home-leases';
 
 const RECORD_NAMES = new Set(Object.keys(BWRAP_RECORD_TYPES));
+const TRUSTED_CREDENTIAL_RECORDS = new WeakSet();
 const MAX_INT32 = 0x7fffffff;
 const MAX_LEASE_BYTES = 8192;
 const MAX_METADATA_BYTES = 4096;
 const MAX_METADATA_KEYS = 32;
 const MAX_METADATA_DEPTH = 3;
-const LEASE_SCHEMA_VERSION = 1;
+const LEASE_SCHEMA_VERSION = 2;
 const LEASE_KEYS = Object.freeze([
     'acquiredAt',
     'generation',
@@ -49,6 +54,7 @@ const LEASE_KEYS = Object.freeze([
     'ownerPid',
     'ownerStartIdentity',
     'ownerToken',
+    'ownerUid',
     'role',
     'schemaVersion',
 ]);
@@ -97,17 +103,72 @@ export const TRUSTED_SERVICE_ENV = Object.freeze({
     XDG_STATE_HOME: '/home/agent/.local/state',
     TMPDIR: '/tmp',
     PLOINKY_WORKSPACE_ROOT: '/workspace',
+    WORKSPACE_PATH: '/workspace',
+    NODE_PATH: '/code/node_modules',
+    PLOINKY_MCP_CONFIG_PATH: '/home/agent/mcp-config.json',
+    PLOINKY_CODE_DIR: '/code',
+    PLOINKY_RUNTIME: 'bwrap',
+    PLOINKY_AGENT_BIND_HOST: '127.0.0.1',
+    PLOINKY_AGENT_CREDENTIAL_FILE: '/run/ploinky-agent/credential.json',
+    PLOINKY_ENV_SOURCE_PLOINKY_AGENT_CREDENTIAL_FILE: 'generated',
 });
 
 const MAX_TRUSTED_ENV_ENTRIES = 64;
 const MAX_TRUSTED_ENV_BYTES = 32 * 1024;
-const FORBIDDEN_TRUSTED_ENV_NAMES = new Set([
+const TRUSTED_SERVICE_RESERVED_ENV_NAMES = new Set([
+    'AGENT_NAME',
+    'HOME',
+    'PATH',
+    'PORT',
+    'TMPDIR',
+    'WORKSPACE_PATH',
+    'NODE_PATH',
+    'XDG_CONFIG_HOME',
+    'XDG_CACHE_HOME',
+    'XDG_DATA_HOME',
+    'XDG_STATE_HOME',
     'PLOINKY_MASTER_KEY',
     'PLOINKY_DERIVED_MASTER_KEY',
+    'PLOINKY_TURN_SHARED_SECRET',
+    'PLOINKY_CLOUDFLARE_TUNNEL_TOKEN',
+    'PLOINKY_CLOUDFLARE_API_TOKEN',
+    'PLOINKY_AGENT_NAME',
+    'PLOINKY_REPO_NAME',
+    'PLOINKY_AGENT_ID',
+    'PLOINKY_AGENT_PRINCIPAL',
+    'PLOINKY_AGENT_INSTANCE_ID',
+    'PLOINKY_AGENT_ENABLE_GENERATION',
+    'PLOINKY_AGENT_API_KEY',
+    'PLOINKY_AGENT_API_PUBLIC_KEY',
     'PLOINKY_AGENT_SECRET',
+    'PLOINKY_AGENT_PRIVATE_SECRET',
     'PLOINKY_AGENT_PRIVATE_KEY',
+    'PLOINKY_INTERNAL_ROUTER_URL',
+    'PLOINKY_EDGE_TOPOLOGY_FILE',
+    'PLOINKY_RUNTIME',
+    'PLOINKY_WORKSPACE_ROOT',
+    'PLOINKY_CWD',
+    'PLOINKY_MCP_CONFIG_PATH',
+    'PLOINKY_CODE_DIR',
+    'PLOINKY_AGENT_CONFIG',
+    'PLOINKY_AGENT_MANIFEST',
+    'PLOINKY_MANIFEST_FILE',
+    'PLOINKY_AGENT_LIB_DIR',
+    'PLOINKY_INVOCATION_AUTH_MODULE',
+    'PLOINKY_AGENT_BIND_HOST',
+    'PLOINKY_CONTAINER_NAME',
+    'PLOINKY_CONTAINER_ID',
     'PLOINKY_AGENT_CREDENTIAL_FILE',
+    '__PLOINKY_AGENT_PRIVATE_KEY_HOST_PATH',
 ]);
+
+export function isTrustedServiceReservedEnvName(value) {
+    const name = typeof value === 'string' ? value : '';
+    return TRUSTED_SERVICE_RESERVED_ENV_NAMES.has(name)
+        || name.startsWith('PLOINKY_ROUTER_')
+        || name.startsWith('PLOINKY_AGENT_CREDENTIAL_')
+        || name.startsWith('PLOINKY_ENV_SOURCE_PLOINKY_');
+}
 
 function compareText(left, right) {
     return left < right ? -1 : left > right ? 1 : 0;
@@ -394,6 +455,8 @@ function validateRecordPolicy(records) {
     let argCount = 0;
     let mountCount = 0;
     let preexecSeen = false;
+    let credentialDataSeen = false;
+    const allowCredentialData = TRUSTED_CREDENTIAL_RECORDS.has(records);
     const targets = new Set();
     const targetKinds = new Map();
 
@@ -415,8 +478,46 @@ function validateRecordPolicy(records) {
                 commandSeen = true;
                 continue;
             }
+            if (record.value === '--perms' && allowCredentialData) {
+                const sequence = records.slice(index, index + 5);
+                if (sequence.length !== 5
+                    || sequence.some((item) => item?.type !== 'ARG')
+                    || sequence[1].value !== '0400'
+                    || sequence[2].value !== '--ro-bind-data'
+                    || sequence[4].value !== '/run/ploinky-agent/credential.json') {
+                    throw policyError(
+                        'trusted credential data requires exact --perms 0400 --ro-bind-data grammar',
+                        'PLOINKY_BWRAP_CREDENTIAL_TRANSPORT_INVALID',
+                    );
+                }
+                const credentialFd = Number(sequence[3].value);
+                if (credentialDataSeen
+                    || !Number.isSafeInteger(credentialFd)
+                    || credentialFd <= 3
+                    || credentialFd > MAX_INT32
+                    || String(credentialFd) !== sequence[3].value
+                    || !targets.has('/run/ploinky-agent')
+                    || targets.has('/run/ploinky-agent/credential.json')) {
+                    throw policyError(
+                        'trusted credential data fd, directory, or destination is invalid',
+                        'PLOINKY_BWRAP_CREDENTIAL_TRANSPORT_INVALID',
+                    );
+                }
+                for (const item of sequence.slice(1)) {
+                    encodeRecordPayload(item);
+                }
+                argCount += 4;
+                if (argCount > BWRAP_LAUNCH_LIMITS.args) throw policyError('too many ARG records');
+                credentialDataSeen = true;
+                targets.add('/run/ploinky-agent/credential.json');
+                index += 4;
+                continue;
+            }
             if (record.value === '--perms' || record.value.startsWith('--perms=')) {
-                throw policyError('credential data arguments require the dedicated trusted credential builder');
+                throw policyError(
+                    'credential data arguments require the dedicated trusted credential builder',
+                    'PLOINKY_BWRAP_CREDENTIAL_TRANSPORT_INVALID',
+                );
             }
             if (isForbiddenBwrapOption(record.value)) {
                 throw policyError(`raw filesystem/fd bwrap option ${record.value} is forbidden`, 'PLOINKY_BWRAP_OPTION_FORBIDDEN');
@@ -475,6 +576,12 @@ function validateRecordPolicy(records) {
         targetKinds.set(target, record.type);
     }
     if (!separator || !commandSeen) throw policyError('launch requires -- followed by an explicit command');
+    if (allowCredentialData && !credentialDataSeen) {
+        throw policyError(
+            'trusted credential record set is missing its exact data mount',
+            'PLOINKY_BWRAP_CREDENTIAL_TRANSPORT_INVALID',
+        );
+    }
 }
 
 export function encodeBwrapLaunchDescriptor(records) {
@@ -503,15 +610,64 @@ export function encodeBwrapLaunchDescriptor(records) {
     return descriptor;
 }
 
+function normalizeTrustedServiceText(value, label, pattern) {
+    try {
+        utf8(value, label, { maxBytes: 256 });
+    } catch (_) {
+        throw policyError(`${label} is invalid`, 'PLOINKY_BWRAP_SERVICE_IDENTITY_INVALID');
+    }
+    if (value !== value.trim() || !pattern.test(value)) {
+        throw policyError(`${label} is invalid`, 'PLOINKY_BWRAP_SERVICE_IDENTITY_INVALID');
+    }
+    return value;
+}
+
+function buildTrustedServicePlatformEnvironment(input) {
+    assertExactKeys(
+        input.identity,
+        new Set(['principalId', 'instanceId', 'enableGeneration']),
+        new Set(['principalId', 'instanceId', 'enableGeneration']),
+        'trusted service identity',
+    );
+    const identityPattern = /^[A-Za-z0-9][A-Za-z0-9:._/-]*$/;
+    const namePattern = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+    const principalId = normalizeTrustedServiceText(input.identity.principalId, 'trusted service principalId', identityPattern);
+    const instanceId = normalizeTrustedServiceText(input.identity.instanceId, 'trusted service instanceId', identityPattern);
+    const enableGeneration = normalizeTrustedServiceText(input.identity.enableGeneration, 'trusted service enableGeneration', identityPattern);
+    const agentName = normalizeTrustedServiceText(input.agentName, 'trusted service agentName', namePattern);
+    const repoName = normalizeTrustedServiceText(input.repoName, 'trusted service repoName', namePattern);
+    if (!Number.isSafeInteger(input.listenPort) || input.listenPort < 1 || input.listenPort > 65535) {
+        throw policyError('trusted service listenPort is invalid', 'PLOINKY_BWRAP_ROOT_PORT_INVALID');
+    }
+    const identityEnvironment = {
+        PLOINKY_AGENT_ID: principalId,
+        PLOINKY_AGENT_PRINCIPAL: principalId,
+        PLOINKY_AGENT_INSTANCE_ID: instanceId,
+        PLOINKY_AGENT_ENABLE_GENERATION: enableGeneration,
+    };
+    for (const name of Object.keys(identityEnvironment)) {
+        identityEnvironment[`PLOINKY_ENV_SOURCE_${name}`] = 'generated';
+    }
+    return Object.freeze({
+        ...TRUSTED_SERVICE_ENV,
+        AGENT_NAME: agentName,
+        PLOINKY_AGENT_NAME: agentName,
+        PLOINKY_REPO_NAME: repoName,
+        ...identityEnvironment,
+        PORT: String(input.listenPort),
+    });
+}
+
 export function buildTrustedServicePolicy(input) {
     const allowed = new Set([
         'runtimeKey', 'command', 'nodeRuntimePath', 'agentRuntimePath',
         'codePath', 'codeDependenciesPath', 'agentDependenciesPath', 'preexecBarrier',
-        'environment',
+        'environment', 'credentialFd', 'identity', 'agentName', 'repoName', 'listenPort',
     ]);
     const required = new Set([
         'runtimeKey', 'command', 'nodeRuntimePath', 'agentRuntimePath',
         'codePath', 'codeDependenciesPath', 'agentDependenciesPath',
+        'identity', 'agentName', 'repoName', 'listenPort',
     ]);
     assertExactKeys(input, allowed, required, 'trusted service policy input');
     validateRuntimeKey(input.runtimeKey);
@@ -527,6 +683,7 @@ export function buildTrustedServicePolicy(input) {
     const codePath = requireAbsolutePath(input.codePath, 'agent code source');
     const codeDependenciesPath = requireAbsolutePath(input.codeDependenciesPath, 'code dependency source');
     const agentDependenciesPath = requireAbsolutePath(input.agentDependenciesPath, 'Agent dependency source');
+    const platformEnvironment = buildTrustedServicePlatformEnvironment(input);
     const suppliedEnvironment = input.environment ?? {};
     assertPlainObject(suppliedEnvironment, 'trusted service environment');
     const environmentEntries = Object.entries(suppliedEnvironment);
@@ -539,20 +696,32 @@ export function buildTrustedServicePolicy(input) {
         if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name) || Buffer.byteLength(name) > 128) {
             throw policyError(`trusted service environment name ${name} is invalid`);
         }
-        if (FORBIDDEN_TRUSTED_ENV_NAMES.has(name)) {
-            throw policyError(`trusted service environment ${name} is forbidden`);
+        if (isTrustedServiceReservedEnvName(name)) {
+            throw policyError(
+                `trusted service environment ${name} is reserved`,
+                'PLOINKY_BWRAP_SERVICE_ENV_RESERVED',
+            );
         }
         if (typeof value !== 'string') throw policyError(`trusted service environment ${name} must be a string`);
         const valueBytes = utf8(value, `trusted service environment ${name}`, { allowEmpty: true, maxBytes: 4096 });
         environmentBytes += Buffer.byteLength(name) + valueBytes.length;
         if (environmentBytes > MAX_TRUSTED_ENV_BYTES) throw policyError('trusted service environment exceeds its byte limit');
-        if (Object.prototype.hasOwnProperty.call(TRUSTED_SERVICE_ENV, name)) {
-            if (TRUSTED_SERVICE_ENV[name] !== value) throw policyError(`trusted service environment cannot override ${name}`);
-            continue;
-        }
         dynamicEnvironment[name] = value;
     }
-    const env = Object.freeze({ ...TRUSTED_SERVICE_ENV, ...dynamicEnvironment });
+    const env = Object.freeze({ ...platformEnvironment, ...dynamicEnvironment });
+    let credentialFd = null;
+    if (input.credentialFd !== undefined) {
+        credentialFd = Number(input.credentialFd);
+        if (!Number.isSafeInteger(credentialFd)
+            || credentialFd <= 3
+            || credentialFd > MAX_INT32
+            || credentialFd !== input.credentialFd) {
+            throw policyError(
+                'trusted service credentialFd must be an exact inherited fd above 3',
+                'PLOINKY_BWRAP_CREDENTIAL_TRANSPORT_INVALID',
+            );
+        }
+    }
 
     const records = [
         ...FIXED_SYSTEM_PATHS.map((entry) => entry.dataFile
@@ -573,8 +742,16 @@ export function buildTrustedServicePolicy(input) {
         createHomeRecord(input.runtimeKey),
         createTmpfsRecord('/tmp'),
         createTmpfsRecord('/run'),
+        ...(credentialFd === null ? [] : [createDirectoryRecord('/run/ploinky-agent')]),
         createProcRecord(),
         createDevRecord(),
+        ...(credentialFd === null ? [] : [
+            createArgRecord('--perms'),
+            createArgRecord('0400'),
+            createArgRecord('--ro-bind-data'),
+            createArgRecord(String(credentialFd)),
+            createArgRecord('/run/ploinky-agent/credential.json'),
+        ]),
         createArgRecord('--unshare-user'),
         createArgRecord('--unshare-pid'),
         createArgRecord('--unshare-ipc'),
@@ -594,6 +771,7 @@ export function buildTrustedServicePolicy(input) {
         records.push(createPreexecBarrierRecord(input.preexecBarrier.readyFd, input.preexecBarrier.releaseFd));
     }
     records.push(createArgRecord('--'), ...command.map(createArgRecord));
+    if (credentialFd !== null) TRUSTED_CREDENTIAL_RECORDS.add(records);
     validateRecordPolicy(records);
     return Object.freeze({ records: Object.freeze(records), env, command });
 }
@@ -654,59 +832,23 @@ function normalizeLeaseRoot(value) {
     return value;
 }
 
-function readLinuxIdentity(pid, fsImpl) {
-    try {
-        const stat = fsImpl.readFileSync(`/proc/${pid}/stat`, 'utf8');
-        const commandEnd = stat.lastIndexOf(') ');
-        if (commandEnd < 0) return null;
-        const fields = stat.slice(commandEnd + 2).trim().split(/\s+/);
-        if (fields[0] === 'Z') return { state: 'dead' };
-        const startTicks = fields[19];
-        if (!startTicks) return null;
-        let bootId = '';
-        try { bootId = fsImpl.readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim(); } catch (_) { }
-        return { state: 'live', startIdentity: `linux-proc:${bootId || 'unknown-boot'}:${startTicks}` };
-    } catch (_) {
-        return null;
-    }
-}
-
-export function inspectProviderLeaseProcess(pid, {
-    fsImpl = fs,
-    execFileSyncImpl = execFileSync,
-    killImpl = process.kill.bind(process),
-} = {}) {
-    if (!Number.isSafeInteger(pid) || pid <= 0 || pid > MAX_INT32) return Object.freeze({ state: 'dead' });
-    try {
-        killImpl(pid, 0);
-    } catch (error) {
-        if (error?.code === 'ESRCH') return Object.freeze({ state: 'dead' });
-        if (error?.code !== 'EPERM') return Object.freeze({ state: 'unknown' });
-    }
-    const linux = readLinuxIdentity(pid, fsImpl);
-    if (linux) return Object.freeze(linux);
-    try {
-        const startedAt = execFileSyncImpl('ps', ['-p', String(pid), '-o', 'lstart='], {
-            encoding: 'utf8',
-            stdio: ['ignore', 'pipe', 'ignore'],
-        }).trim().replace(/\s+/g, ' ');
-        if (startedAt) return Object.freeze({ state: 'live', startIdentity: `ps-lstart:${startedAt}` });
-    } catch (_) { }
-    return Object.freeze({ state: 'unknown' });
+export function inspectProviderLeaseProcess(pid, options = {}) {
+    return inspectProcessIdentity(pid, options);
 }
 
 function leaseDependencies(overrides = {}) {
-    assertExactKeys(overrides, new Set(['fs', 'inspectProcessIdentity', 'randomBytes', 'now']), new Set(), 'lease dependencies');
+    assertExactKeys(overrides, new Set(['fs', 'inspectProcessIdentity', 'randomBytes', 'now', 'getUid']), new Set(), 'lease dependencies');
     return {
         fs: overrides.fs || fs,
         inspectProcessIdentity: overrides.inspectProcessIdentity || inspectProviderLeaseProcess,
         randomBytes: overrides.randomBytes || randomBytes,
         now: overrides.now || Date.now,
+        getUid: overrides.getUid || (() => (typeof process.getuid === 'function' ? process.getuid() : null)),
     };
 }
 
 function normalizeLeaseInput(input, dependencies) {
-    const allowed = new Set(['homeKey', 'generation', 'role', 'metadata', 'leaseRoot', 'ownerPid', 'ownerStartIdentity', 'ownerToken']);
+    const allowed = new Set(['homeKey', 'generation', 'role', 'metadata', 'leaseRoot', 'ownerPid', 'ownerToken']);
     assertExactKeys(input, allowed, new Set(['homeKey', 'generation', 'role']), 'provider HOME lease input');
     const homeKey = validateRuntimeKey(input.homeKey);
     const generation = normalizeBoundedText(input.generation, 'lease generation', 256, /^[A-Za-z0-9][A-Za-z0-9:._-]*$/);
@@ -719,15 +861,23 @@ function normalizeLeaseInput(input, dependencies) {
     if (!Number.isSafeInteger(ownerPid) || ownerPid <= 0 || ownerPid > MAX_INT32) {
         throw leaseError('PLOINKY_PROVIDER_HOME_LEASE_INVALID', 'lease owner pid is invalid');
     }
-    let ownerStartIdentity = input.ownerStartIdentity;
-    if (ownerStartIdentity === undefined) {
-        const current = dependencies.inspectProcessIdentity(ownerPid);
-        if (current?.state !== 'live' || !current.startIdentity) {
-            throw leaseError('PLOINKY_PROVIDER_HOME_LEASE_INVALID', 'cannot prove lease owner process identity');
-        }
-        ownerStartIdentity = current.startIdentity;
+    const currentUid = dependencies.getUid();
+    if (!Number.isSafeInteger(currentUid) || currentUid < 0) {
+        throw leaseError('PLOINKY_PROVIDER_HOME_LEASE_INVALID', 'cannot prove the effective lease owner uid');
     }
-    ownerStartIdentity = normalizeBoundedText(ownerStartIdentity, 'lease owner start identity', 256, /^[A-Za-z0-9][A-Za-z0-9:._+ -]*$/);
+    const current = dependencies.inspectProcessIdentity(ownerPid);
+    if (current?.state !== 'identified'
+        || !Number.isSafeInteger(current.processUid)
+        || current.processUid < 0
+        || current.processUid !== currentUid) {
+        throw leaseError('PLOINKY_PROVIDER_HOME_LEASE_INVALID', 'cannot prove lease owner process identity and uid');
+    }
+    let ownerStartIdentity;
+    try {
+        ownerStartIdentity = normalizeProcessIdentity(current.processIdentity);
+    } catch (_) {
+        throw leaseError('PLOINKY_PROVIDER_HOME_LEASE_INVALID', 'lease owner start identity is not boot-bound and canonical');
+    }
     let ownerToken = input.ownerToken;
     if (ownerToken === undefined) {
         ownerToken = dependencies.randomBytes(32).toString('base64')
@@ -741,6 +891,7 @@ function normalizeLeaseInput(input, dependencies) {
         metadata,
         leaseRoot: normalizeLeaseRoot(input.leaseRoot ?? DEFAULT_PROVIDER_HOME_LEASE_ROOT),
         ownerPid,
+        ownerUid: currentUid,
         ownerStartIdentity,
         ownerToken,
     };
@@ -764,6 +915,7 @@ function canonicalLeaseRecord(value) {
         ownerPid: value.ownerPid,
         ownerStartIdentity: value.ownerStartIdentity,
         ownerToken: value.ownerToken,
+        ownerUid: value.ownerUid,
         role: value.role,
         schemaVersion: value.schemaVersion,
     };
@@ -781,10 +933,17 @@ function validateLeaseRecord(parsed, expectedHomeKey) {
     validateRuntimeKey(parsed.homeKey);
     normalizeBoundedText(parsed.generation, 'lease generation', 256, /^[A-Za-z0-9][A-Za-z0-9:._-]*$/);
     normalizeBoundedText(parsed.role, 'lease role', 64, /^[a-z][a-z0-9-]*$/);
-    normalizeBoundedText(parsed.ownerStartIdentity, 'lease owner start identity', 256, /^[A-Za-z0-9][A-Za-z0-9:._+ -]*$/);
+    try {
+        normalizeProcessIdentity(parsed.ownerStartIdentity);
+    } catch (_) {
+        throw leaseError('PLOINKY_PROVIDER_HOME_LEASE_INVALID', 'lease owner start identity is not boot-bound and canonical');
+    }
     normalizeBoundedText(parsed.ownerToken, 'lease owner token', 128, /^[A-Za-z0-9_-]{32,128}$/);
     if (!Number.isSafeInteger(parsed.ownerPid) || parsed.ownerPid <= 0 || parsed.ownerPid > MAX_INT32) {
         throw leaseError('PLOINKY_PROVIDER_HOME_LEASE_INVALID', 'lease owner pid is invalid');
+    }
+    if (!Number.isSafeInteger(parsed.ownerUid) || parsed.ownerUid < 0) {
+        throw leaseError('PLOINKY_PROVIDER_HOME_LEASE_INVALID', 'lease owner uid is invalid');
     }
     if (typeof parsed.acquiredAt !== 'string') {
         throw leaseError('PLOINKY_PROVIDER_HOME_LEASE_INVALID', 'lease timestamp is invalid');
@@ -882,6 +1041,33 @@ function operationSnapshotId(snapshot) {
     return createHash('sha256').update(snapshot.raw).digest('hex').slice(0, 32);
 }
 
+function inspectLeaseOwner(record, dependencies) {
+    const owner = dependencies.inspectProcessIdentity(record.ownerPid);
+    if (!owner || !['dead', 'identified', 'uid-diverged', 'unknown'].includes(owner.state)) {
+        throw leaseError('PLOINKY_PROVIDER_HOME_LEASE_INVALID', 'process identity inspector returned an invalid result');
+    }
+    if (owner.state === 'dead') return Object.freeze({ state: 'stale', reason: 'dead' });
+    if (owner.state === 'unknown' || owner.state === 'uid-diverged') {
+        return Object.freeze({ state: 'busy', uncertain: true });
+    }
+    if (!Number.isSafeInteger(owner.processUid) || owner.processUid < 0) {
+        throw leaseError('PLOINKY_PROVIDER_HOME_LEASE_INVALID', 'process identity inspector returned an invalid uid');
+    }
+    let processIdentity;
+    try {
+        processIdentity = normalizeProcessIdentity(owner.processIdentity);
+    } catch (_) {
+        throw leaseError('PLOINKY_PROVIDER_HOME_LEASE_INVALID', 'process identity inspector returned an unbootbound identity');
+    }
+    if (processIdentity !== record.ownerStartIdentity) {
+        return Object.freeze({ state: 'stale', reason: 'pid-reused' });
+    }
+    if (owner.processUid !== record.ownerUid) {
+        return Object.freeze({ state: 'busy', uncertain: true });
+    }
+    return Object.freeze({ state: 'busy', uncertain: false });
+}
+
 function recoverLeaseOperationArtifacts(leasePath, homeKey, dependencies) {
     const names = leaseOperationArtifacts(leasePath, dependencies.fs);
     if (names.length === 0) return;
@@ -919,14 +1105,8 @@ function recoverLeaseOperationArtifacts(leasePath, homeKey, dependencies) {
         throw leaseError('PLOINKY_PROVIDER_HOME_LEASE_INVALID', 'provider HOME lease operation state is not exact');
     }
 
-    const owner = dependencies.inspectProcessIdentity(operationSnapshot.record.ownerPid);
-    if (!owner || !['dead', 'live', 'unknown'].includes(owner.state)) {
-        throw leaseError('PLOINKY_PROVIDER_HOME_LEASE_INVALID', 'process identity inspector returned an invalid result');
-    }
-    if (owner.state === 'unknown') throw busyLease(operationSnapshot.record, true);
-    if (owner.state === 'live' && (!owner.startIdentity || owner.startIdentity === operationSnapshot.record.ownerStartIdentity)) {
-        throw busyLease(operationSnapshot.record, !owner.startIdentity);
-    }
+    const owner = inspectLeaseOwner(operationSnapshot.record, dependencies);
+    if (owner.state === 'busy') throw busyLease(operationSnapshot.record, owner.uncertain);
 
     // Operation paths are never acquisition authorities. Once their recorded
     // owner is proved dead or PID-reused, removing only these paths is safe;
@@ -1014,6 +1194,7 @@ function busyLease(record, uncertain = false) {
         metadata: record.metadata,
         ownerPid: record.ownerPid,
         ownerStartIdentity: record.ownerStartIdentity,
+        ownerUid: record.ownerUid,
         role: record.role,
         uncertain,
     });
@@ -1036,6 +1217,7 @@ export function acquireProviderHomeLease(input, dependencyOverrides = {}) {
             ownerToken: normalized.ownerToken,
             ownerPid: normalized.ownerPid,
             ownerStartIdentity: normalized.ownerStartIdentity,
+            ownerUid: normalized.ownerUid,
             generation: normalized.generation,
             role: normalized.role,
             metadata: normalized.metadata,
@@ -1059,24 +1241,16 @@ export function acquireProviderHomeLease(input, dependencyOverrides = {}) {
 
         const snapshot = readLeaseSnapshot(leasePath, normalized.homeKey, dependencies.fs);
         if (!snapshot) continue;
-        const owner = dependencies.inspectProcessIdentity(snapshot.record.ownerPid);
-        if (!owner || !['dead', 'live', 'unknown'].includes(owner.state)) {
-            throw leaseError('PLOINKY_PROVIDER_HOME_LEASE_INVALID', 'process identity inspector returned an invalid result');
-        }
-        if (owner.state === 'live' && (typeof owner.startIdentity !== 'string' || owner.startIdentity.length === 0)) {
-            throw busyLease(snapshot.record, true);
-        }
-        if (owner.state === 'live' && owner.startIdentity === snapshot.record.ownerStartIdentity) {
-            throw busyLease(snapshot.record);
-        }
-        if (owner.state === 'unknown') throw busyLease(snapshot.record, true);
+        const owner = inspectLeaseOwner(snapshot.record, dependencies);
+        if (owner.state === 'busy') throw busyLease(snapshot.record, owner.uncertain);
         if (removeExactLeaseSnapshot(leasePath, normalized.homeKey, snapshot, dependencies.fs)) {
             recoveredStaleOwner = Object.freeze({
                 generation: snapshot.record.generation,
                 ownerPid: snapshot.record.ownerPid,
                 ownerStartIdentity: snapshot.record.ownerStartIdentity,
+                ownerUid: snapshot.record.ownerUid,
                 role: snapshot.record.role,
-                reason: owner.state === 'dead' ? 'dead' : 'pid-reused',
+                reason: owner.reason,
             });
         }
     }

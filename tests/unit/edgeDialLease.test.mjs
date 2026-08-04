@@ -9,9 +9,12 @@ import {
     createAgentRouteEntries,
     createLeaseCommittedAgent,
     handleRouterMcp,
+    pinAggregateAsyncTaskRoute,
     proxyHttpBuffered,
     proxyHttpPassthrough,
 } from '../../cli/server/routerHandlers.js';
+import { createRootAgentDialContext } from '../../cli/server/rootAgentDial.js';
+import { createAgentRootUpgradeDialAgent } from '../../cli/server/wsAgentRootProxy.js';
 import { serveAgentStaticRequest } from '../../cli/server/static/index.js';
 
 function responseCapture() {
@@ -36,13 +39,45 @@ function responseCapture() {
     };
 }
 
+test('aggregate async task metadata is pinned to the captured Router route key', () => {
+    const upstream = {
+        content: [{ type: 'text', text: 'Task queued' }],
+        metadata: {
+            taskId: 'task-1',
+            agent: 'agent:demo/demo',
+            status: 'queued',
+        },
+    };
+
+    assert.deepEqual(pinAggregateAsyncTaskRoute(upstream, 'demo'), {
+        content: upstream.content,
+        metadata: {
+            taskId: 'task-1',
+            agent: 'demo',
+            status: 'queued',
+        },
+    });
+    assert.equal(pinAggregateAsyncTaskRoute({ content: [] }, 'demo').metadata, undefined);
+    assert.equal(upstream.metadata.agent, 'agent:demo/demo');
+});
+
 test('lease guard runs synchronously inside the actual connection factory', async () => {
     let guardCalls = 0;
     let connectionFactoryCalls = 0;
-    const agent = createLeaseCommittedAgent(() => {
-        guardCalls += 1;
-        return false;
-    }, {
+    const dialContext = createRootAgentDialContext({
+        routePlan: {
+            lease: {
+                snapshot: { agents: {} },
+                commit: () => {
+                    guardCalls += 1;
+                    return false;
+                },
+            },
+        },
+        route: { hostPort: 9 },
+        targetPort: 9,
+    });
+    const agent = createLeaseCommittedAgent(dialContext, {
         createConnection() {
             connectionFactoryCalls += 1;
             throw new Error('connection factory must not run for a stale lease');
@@ -64,13 +99,330 @@ test('lease guard runs synchronously inside the actual connection factory', asyn
     });
 });
 
+test('fabricated unbranded dial contexts cannot authorize a root socket', () => {
+    const agent = createLeaseCommittedAgent({ targetPort: 9, commit: () => true });
+    assert.equal(agent, undefined);
+});
+
+test('guarded root agents reject non-loopback hosts and non-numeric ports before commit or socket', async () => {
+    let leaseCommits = 0;
+    let connectionFactoryCalls = 0;
+    const dialContext = createRootAgentDialContext({
+        routePlan: {
+            lease: {
+                snapshot: { agents: {} },
+                commit: () => {
+                    leaseCommits += 1;
+                    return true;
+                },
+            },
+        },
+        route: { hostPort: 4127 },
+        targetPort: 4127,
+    });
+    const agent = createLeaseCommittedAgent(dialContext, {
+        createConnection() {
+            connectionFactoryCalls += 1;
+            throw new Error('invalid target must never reach the socket factory');
+        },
+    });
+
+    for (const options of [
+        { host: '203.0.113.1', port: 4127 },
+        { host: '127.0.0.1', port: '4127' },
+    ]) {
+        await new Promise((resolve, reject) => {
+            agent.createConnection(options, (error) => {
+                try {
+                    assert.equal(error.code, 'EDGE_GENERATION_CHANGED');
+                    resolve();
+                } catch (assertionError) {
+                    reject(assertionError);
+                }
+            });
+        });
+    }
+    assert.equal(leaseCommits, 0);
+    assert.equal(connectionFactoryCalls, 0);
+    assert.throws(
+        () => createRootAgentDialContext({
+            routePlan: { lease: { snapshot: { agents: {} }, commit: () => true } },
+            route: { hostPort: '4127' },
+        }),
+        /exact target port/,
+    );
+});
+
+test('stale bwrap owner assertion prevents the kernel socket after the captured lease commits', async () => {
+    let leaseCommits = 0;
+    let ownerAssertions = 0;
+    let connectionFactoryCalls = 0;
+    const owner = Object.freeze({
+        role: 'service',
+        pid: 1234,
+        runtimeKey: 'alpha-runtime',
+        routeKey: 'alpha',
+        rootPort: 4123,
+        instanceId: 'instance-1',
+        enableGeneration: 'generation-1',
+    });
+    const route = Object.freeze({
+        container: 'alpha-runtime',
+        repo: 'repo',
+        agent: 'alpha-agent',
+        hostPort: 4123,
+    });
+    const routePlan = Object.freeze({
+        lease: Object.freeze({
+            snapshot: Object.freeze({
+                agents: Object.freeze({
+                    'alpha-runtime': Object.freeze({
+                        type: 'agent',
+                        runtime: 'bwrap',
+                        pid: 1234,
+                        repoName: 'repo',
+                        agentName: 'alpha-agent',
+                        instanceId: 'instance-1',
+                        enableGeneration: 'generation-1',
+                        bwrapOwner: owner,
+                    }),
+                }),
+            }),
+            commit: () => {
+                leaseCommits += 1;
+                return true;
+            },
+        }),
+    });
+    const dialContext = createRootAgentDialContext({
+        routePlan,
+        routeKey: 'alpha',
+        route,
+        targetPort: 4123,
+    });
+    const agent = createLeaseCommittedAgent(dialContext, {
+        assertServiceOwner() {
+            ownerAssertions += 1;
+            throw new Error('pid start time changed');
+        },
+        createConnection() {
+            connectionFactoryCalls += 1;
+            throw new Error('stale owner must never reach the socket factory');
+        },
+    });
+
+    await new Promise((resolve, reject) => {
+        agent.createConnection({ host: '127.0.0.1', port: 4123 }, (error) => {
+            try {
+                assert.equal(error.code, 'EDGE_GENERATION_CHANGED');
+                resolve();
+            } catch (assertionError) {
+                reject(assertionError);
+            }
+        });
+    });
+    assert.equal(leaseCommits, 1);
+    assert.equal(ownerAssertions, 1);
+    assert.equal(connectionFactoryCalls, 0);
+});
+
+test('a plan owner that differs from the captured bwrap record is rejected before dialing', async () => {
+    let connectionFactoryCalls = 0;
+    let ownerAssertions = 0;
+    const targetPort = 4126;
+    const recordOwner = Object.freeze({
+        role: 'service',
+        pid: 1234,
+        runtimeKey: 'alpha-runtime',
+        routeKey: 'alpha',
+        rootPort: targetPort,
+        instanceId: 'instance-1',
+        enableGeneration: 'generation-1',
+    });
+    const route = Object.freeze({
+        container: 'alpha-runtime',
+        repo: 'repo',
+        agent: 'alpha-agent',
+        hostPort: targetPort,
+    });
+    const routePlan = Object.freeze({
+        routeKey: 'alpha',
+        route,
+        target: Object.freeze({ hostPort: targetPort }),
+        ownerAttestation: Object.freeze({ ...recordOwner, pid: 9999 }),
+        lease: Object.freeze({
+            snapshot: Object.freeze({
+                agents: Object.freeze({
+                    'alpha-runtime': Object.freeze({
+                        type: 'agent',
+                        runtime: 'bwrap',
+                        pid: 1234,
+                        repoName: 'repo',
+                        agentName: 'alpha-agent',
+                        instanceId: 'instance-1',
+                        enableGeneration: 'generation-1',
+                        bwrapOwner: recordOwner,
+                    }),
+                }),
+            }),
+            commit: () => true,
+        }),
+    });
+    const agent = createLeaseCommittedAgent(createRootAgentDialContext({ routePlan }), {
+        assertServiceOwner() {
+            ownerAssertions += 1;
+        },
+        createConnection() {
+            connectionFactoryCalls += 1;
+        },
+    });
+
+    await new Promise((resolve, reject) => {
+        agent.createConnection({ host: '127.0.0.1', port: targetPort }, (error) => {
+            try {
+                assert.equal(error.code, 'EDGE_GENERATION_CHANGED');
+                resolve();
+            } catch (assertionError) {
+                reject(assertionError);
+            }
+        });
+    });
+    assert.equal(ownerAssertions, 0);
+    assert.equal(connectionFactoryCalls, 0);
+});
+
+test('container root dials commit the lease without running the bwrap owner assertion', () => {
+    let ownerAssertions = 0;
+    let connectionFactoryCalls = 0;
+    const route = Object.freeze({
+        container: 'alpha-runtime',
+        repo: 'repo',
+        agent: 'alpha-agent',
+        hostPort: 4124,
+    });
+    const dialContext = createRootAgentDialContext({
+        routePlan: Object.freeze({
+            lease: Object.freeze({
+                snapshot: Object.freeze({
+                    agents: Object.freeze({
+                        'alpha-runtime': Object.freeze({
+                            type: 'agent',
+                            runtime: 'docker',
+                            repoName: 'repo',
+                            agentName: 'alpha-agent',
+                        }),
+                    }),
+                }),
+                commit: () => true,
+            }),
+        }),
+        routeKey: 'alpha',
+        route,
+        targetPort: 4124,
+    });
+    const sentinel = {};
+    const agent = createLeaseCommittedAgent(dialContext, {
+        assertServiceOwner() {
+            ownerAssertions += 1;
+        },
+        createConnection() {
+            connectionFactoryCalls += 1;
+            return sentinel;
+        },
+    });
+
+    assert.equal(
+        agent.createConnection({ host: '127.0.0.1', port: 4124 }, () => {}),
+        sentinel,
+    );
+    assert.equal(connectionFactoryCalls, 1);
+    assert.equal(ownerAssertions, 0);
+});
+
+test('websocket root upgrade refuses a stale bwrap owner before creating its socket', async () => {
+    let ownerAssertions = 0;
+    let connectionFactoryCalls = 0;
+    const targetPort = 4125;
+    const plan = Object.freeze({
+        kind: 'agent-root',
+        routeKey: 'alpha',
+        route: Object.freeze({
+            container: 'alpha-runtime',
+            repo: 'repo',
+            agent: 'alpha-agent',
+        }),
+        target: Object.freeze({ hostPort: targetPort }),
+        ownerAttestation: Object.freeze({
+            role: 'service',
+            pid: 1234,
+            runtimeKey: 'alpha-runtime',
+            routeKey: 'alpha',
+            rootPort: targetPort,
+            instanceId: 'instance-1',
+            enableGeneration: 'generation-1',
+        }),
+        lease: Object.freeze({
+            snapshot: Object.freeze({
+                agents: Object.freeze({
+                    'alpha-runtime': Object.freeze({
+                        type: 'agent',
+                        runtime: 'bwrap',
+                        pid: 1234,
+                        repoName: 'repo',
+                        agentName: 'alpha-agent',
+                        instanceId: 'instance-1',
+                        enableGeneration: 'generation-1',
+                        bwrapOwner: Object.freeze({
+                            role: 'service',
+                            pid: 1234,
+                            runtimeKey: 'alpha-runtime',
+                            routeKey: 'alpha',
+                            rootPort: targetPort,
+                            instanceId: 'instance-1',
+                            enableGeneration: 'generation-1',
+                        }),
+                    }),
+                }),
+            }),
+            commit: () => true,
+        }),
+    });
+    const agent = createAgentRootUpgradeDialAgent(plan, targetPort, {
+        assertServiceOwner() {
+            ownerAssertions += 1;
+            throw new Error('stale websocket owner');
+        },
+        createConnection() {
+            connectionFactoryCalls += 1;
+            throw new Error('stale websocket owner must not dial');
+        },
+    });
+
+    await new Promise((resolve, reject) => {
+        agent.createConnection({ host: '127.0.0.1', port: targetPort }, (error) => {
+            try {
+                assert.equal(error.code, 'EDGE_GENERATION_CHANGED');
+                resolve();
+            } catch (assertionError) {
+                reject(assertionError);
+            }
+        });
+    });
+    assert.equal(ownerAssertions, 1);
+    assert.equal(connectionFactoryCalls, 0);
+});
+
 test('stale HTTP/SSE and buffered leases return 503 before opening a target connection', async () => {
     const streamingReq = new PassThrough();
     streamingReq.method = 'GET';
     streamingReq.headers = { accept: 'text/event-stream' };
     const streamingRes = responseCapture();
     proxyHttpPassthrough(streamingReq, streamingRes, 9, '/events', {}, {
-        beforeDial: () => false,
+        dialContext: createRootAgentDialContext({
+            routePlan: { lease: { snapshot: { agents: {} }, commit: () => false } },
+            route: { hostPort: 9 },
+            targetPort: 9,
+        }),
     });
     streamingReq.end();
     await streamingRes.completed;
@@ -88,7 +440,13 @@ test('stale HTTP/SSE and buffered leases return 503 before opening a target conn
         '/submit',
         Buffer.from('{"ok":true}'),
         {},
-        { beforeDial: () => false },
+        {
+            dialContext: createRootAgentDialContext({
+                routePlan: { lease: { snapshot: { agents: {} }, commit: () => false } },
+                route: { hostPort: 9 },
+                targetPort: 9,
+            }),
+        },
     );
     await bufferedRes.completed;
     assert.equal(bufferedRes.statusCode, 503);

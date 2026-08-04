@@ -21,6 +21,7 @@ import {
     withEdgeGenerationApplyLock,
 } from '../../cli/sandbox/edgeGeneration.js';
 import { resolveEdgeRoutePlan } from '../../cli/server/edgeRoutePlan.js';
+import { serviceOwnerKey } from '../../cli/sandbox/bwrap/bwrapFleet.js';
 
 function stableValue(value) {
     if (Array.isArray(value)) return value.map(stableValue);
@@ -245,6 +246,93 @@ test('generation compiles convention access solely from HTTP route policy', (t) 
     ));
     assert.equal(policyEntry.access, 'authenticated');
     assert.equal(Object.hasOwn(applied.generation.compiled.security, 'privateRouteConsumers'), false);
+});
+
+test('bwrap publishes only an owner-attested root route and rejects additional ports', (t) => {
+    const fixture = createFixture(t);
+    const agentsFile = path.join(fixture.ploinkyDir, 'agents.json');
+    const agents = JSON.parse(fs.readFileSync(agentsFile, 'utf8'));
+    const ownerAttestation = {
+        schemaVersion: 5,
+        role: 'service',
+        runtimeKey: 'alpha-container',
+        ownerKey: serviceOwnerKey('alpha-container'),
+        instanceId: 'alpha-instance',
+        enableGeneration: 'alpha-enable-generation',
+        homeKey: 'alpha',
+        workdir: '/code',
+        logPath: '/workspace/.ploinky/logs/alpha-bwrap.log',
+        taskId: '',
+        provider: '',
+        routeKey: 'alpha',
+        rootPort: 43101,
+        credentialNonceDigest: `sha256:${'1'.repeat(64)}`,
+        credentialExpiresAt: 4102444800,
+        manifestDigest: `sha256:${'2'.repeat(64)}`,
+        admissionDigest: `sha256:${'3'.repeat(64)}`,
+        networkHash: `sha256:${'4'.repeat(64)}`,
+        pid: 1234,
+        processUid: typeof process.getuid === 'function' ? process.getuid() : 0,
+        processIdentity: 'linux-proc:123e4567-e89b-12d3-a456-426614174000:1234',
+    };
+    agents['alpha-container'] = {
+        ...agents['alpha-container'],
+        pid: 1234,
+        runtime: 'bwrap',
+        bwrapOwner: ownerAttestation,
+    };
+    fs.writeFileSync(agentsFile, JSON.stringify(agents, null, 2));
+    applyEdgeRoutingGeneration({
+        workspaceRoot: fixture.workspace,
+        reason: 'bwrap-root-owner',
+    });
+
+    const rootPlan = resolveEdgeRoutePlan({
+        req: {
+            method: 'POST',
+            url: '/alpha/mcp',
+            headers: { host: '127.0.0.1:18080' },
+        },
+        listener: 'public',
+    });
+    assert.equal(rootPlan.ok, true);
+    assert.equal(rootPlan.kind, 'agent-root');
+    assert.deepEqual(rootPlan.ownerAttestation, ownerAttestation);
+
+    const additionalPortPlan = resolveEdgeRoutePlan({
+        req: {
+            method: 'GET',
+            url: '/base-agent-additional-server/alpha/7000/status',
+            headers: { host: '127.0.0.1:18080' },
+        },
+        listener: 'public',
+    });
+    assert.equal(additionalPortPlan.ok, false);
+    assert.equal(additionalPortPlan.status, 403);
+    assert.equal(additionalPortPlan.code, 'BWRAP_AGENT_PORT_UNSUPPORTED');
+});
+
+test('bwrap root route refuses a mismatched immutable owner before generation publication', (t) => {
+    const fixture = createFixture(t);
+    const agentsFile = path.join(fixture.ploinkyDir, 'agents.json');
+    const agents = JSON.parse(fs.readFileSync(agentsFile, 'utf8'));
+    agents['alpha-container'] = {
+        ...agents['alpha-container'],
+        runtime: 'bwrap',
+        bwrapOwner: {
+            role: 'service',
+            runtimeKey: 'alpha-container',
+            routeKey: 'alpha',
+            rootPort: 43102,
+            instanceId: 'alpha-instance',
+            enableGeneration: 'alpha-enable-generation',
+        },
+    };
+    fs.writeFileSync(agentsFile, JSON.stringify(agents, null, 2));
+    assert.throws(() => applyEdgeRoutingGeneration({
+        workspaceRoot: fixture.workspace,
+        reason: 'bwrap-root-owner-mismatch',
+    }), { code: 'BWRAP_AGENT_OWNER_INVALID' });
 });
 
 test('agent-mcp exposes only the selected root manifest dependency closure', (t) => {

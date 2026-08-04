@@ -5,13 +5,20 @@ import path from 'node:path';
 import { createRequire } from 'node:module';
 import { spawn } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
-import { zod } from 'mcp-sdk';
-import { TaskQueue } from './TaskQueue.mjs';
+import {
+    assertAgentCredentialContext,
+    createBwrapAgentCredentialContext,
+    createContainerAgentCredentialContext,
+} from '../lib/agentCredentialContext.mjs';
 import {
     createMemoryReplayCache
 } from '../lib/jwtVerify.mjs';
 import {
     hasInvocationTokenHeader,
+    MCP_READINESS_PROBE_HEADER,
+    MCP_READINESS_PROBE_PATH,
+    MCP_READINESS_PROBE_TOOL,
+    MCP_READINESS_PROBE_VALUE,
     verifyRouterRequestFromHeaders,
     verifyOpenAiServiceAuthInfoFromHeaders,
     verifyOpenAiModelsAuthInfoFromHeaders
@@ -23,6 +30,28 @@ import {
     buildDefaultStreamRejection
 } from './openAiDefaultResponder.mjs';
 import { buildLoopToolsFromMcp } from './mcpToolBridge.mjs';
+
+function bootstrapAgentCredentialContext(env = process.env) {
+    const runtimeKind = String(env?.PLOINKY_RUNTIME || '').trim().toLowerCase();
+    if (runtimeKind === 'bwrap') {
+        return assertAgentCredentialContext(createBwrapAgentCredentialContext());
+    }
+    if (env?.PLOINKY_ROUTER_DESCRIPTOR_FILE) {
+        return assertAgentCredentialContext(createContainerAgentCredentialContext(env));
+    }
+    return assertAgentCredentialContext(null);
+}
+
+// Credential validation is the first runtime bootstrap operation. In the
+// bwrap path it reads the pipe-materialized descriptor exactly once and fails
+// before SDK loading, queue construction, timers, or socket creation.
+const agentCredentialContext = bootstrapAgentCredentialContext();
+const agentPrincipalId = agentCredentialContext.identity.principalId;
+const agentRouteKey = agentCredentialContext.runtime.routeKey;
+const [{ zod }, { TaskQueue }] = await Promise.all([
+    import('mcp-sdk'),
+    import('./TaskQueue.mjs'),
+]);
 const { z } = zod;
 const require = createRequire(import.meta.url);
 const achillesAgentLibRoot = path.dirname(require.resolve('achillesAgentLib/package.json'));
@@ -40,17 +69,37 @@ const TASK_CANCEL_PATH = '/task/cancel';
 const TASK_CANCEL_TOOL = '__task_cancel__';
 const TAG_NAME_RE = /^[a-z][a-z0-9_-]{0,63}$/;
 
+function resolveAgentDisplayName(manifest, fallback = 'agent') {
+    const manifestName = typeof manifest?.name === 'string' ? manifest.name.trim() : '';
+    return manifestName || agentRouteKey || agentPrincipalId || fallback;
+}
+
 function verifyInvocationForRequest({ requestHeaders, method, path, tool, argumentsObj }) {
     // Recompute the request-content-hash from the actual request surface and
     // verify the router-minted token binds exactly this method/path/tool/rch.
     const rch = computeRchTool({ method, path, tool, arguments: argumentsObj || {} });
     return verifyRouterRequestFromHeaders(requestHeaders, {
-        env: process.env,
+        credentialContext: agentCredentialContext,
         replayCache: invocationReplayCache,
         method,
         path,
         tool,
         rch,
+    });
+}
+
+function isAuthenticatedReadinessInitialize(requestHeaders) {
+    const value = requestHeaders?.[MCP_READINESS_PROBE_HEADER];
+    return typeof value === 'string' && value === MCP_READINESS_PROBE_VALUE;
+}
+
+function verifyReadinessInitialize({ requestHeaders, params }) {
+    return verifyInvocationForRequest({
+        requestHeaders,
+        method: 'POST',
+        path: MCP_READINESS_PROBE_PATH,
+        tool: MCP_READINESS_PROBE_TOOL,
+        argumentsObj: params,
     });
 }
 
@@ -701,7 +750,7 @@ function rejectInvalidOpenAiRouterToken(req, res, rawBody) {
         return false;
     }
     const verified = verifyOpenAiServiceAuthInfoFromHeaders(req.headers, {
-        env: process.env,
+        credentialContext: agentCredentialContext,
         replayCache: invocationReplayCache,
         body: rawBody,
         bodyHash: sha256RawBodyHash(rawBody),
@@ -720,7 +769,7 @@ function rejectInvalidOpenAiModelsRouterToken(req, res) {
         return false;
     }
     const verified = verifyOpenAiModelsAuthInfoFromHeaders(req.headers, {
-        env: process.env,
+        credentialContext: agentCredentialContext,
         replayCache: invocationReplayCache,
     });
     if (!verified.ok) {
@@ -762,7 +811,7 @@ async function handleOpenAiChatCompletions(req, res, body) {
             requestBody: body,
             manifest,
             toolNames: collectMcpToolNames(),
-            agentId: process.env.PLOINKY_AGENT_ID
+            agentId: agentPrincipalId,
         });
         const data = Buffer.from(JSON.stringify(response));
         res.writeHead(200, { 'Content-Type': 'application/json', 'Content-Length': data.length });
@@ -778,7 +827,7 @@ async function handleOpenAiChatCompletions(req, res, body) {
                 body,
                 manifest,
                 config: configResult ? configResult.config : null,
-                agentId: process.env.PLOINKY_AGENT_ID,
+                agentId: agentPrincipalId,
             });
         } catch (error) {
             sendOpenAiError(res, 502, `Default LLM responder failed: ${error.message}`, 'server_error');
@@ -806,7 +855,7 @@ async function handleOpenAiChatCompletions(req, res, body) {
         endpoint: 'openai.chat.completions',
         request: body,
         metadata: {
-            agent: process.env.AGENT_NAME || '',
+            agent: agentPrincipalId,
             authInfo: parseAuthInfoHeader(req.headers)
         }
     };
@@ -900,7 +949,7 @@ async function handleOpenAiChatCompletions(req, res, body) {
 }
 
 function buildFallbackModelsResponse(manifest) {
-    const agentName = process.env.AGENT_NAME || manifest?.name || process.env.PLOINKY_AGENT_ID || 'agent';
+    const agentName = resolveAgentDisplayName(manifest);
     const declaredTags = normalizeTagList(manifest?.capabilities?.tags);
     const tags = declaredTags.length > 0 ? declaredTags : ['generic-agent'];
     const supportsStreaming = manifest?.endpoints?.chatCompletions?.stream === true
@@ -925,7 +974,7 @@ function buildFallbackModelsResponse(manifest) {
                 },
                 metadata: {
                     fallback: true,
-                    agent: process.env.PLOINKY_AGENT_ID || null,
+                    agent: agentPrincipalId,
                 },
             },
         ],
@@ -948,7 +997,7 @@ async function handleOpenAiModels(req, res) {
     const payload = {
         endpoint: 'openai.models',
         metadata: {
-            agent: process.env.AGENT_NAME || '',
+            agent: agentPrincipalId,
             authInfo: parseAuthInfoHeader(req.headers),
         },
     };
@@ -1146,7 +1195,7 @@ async function registerFromConfig(server, config, helpers) {
                     return {
                         content: [{ type: 'text', text: `Task '${name}' queued with id ${enqueued.id}` }],
                         metadata: {
-                            agent: process.env.AGENT_NAME || name,
+                            agent: agentPrincipalId,
                             taskId: enqueued.id,
                             toolName: enqueued.toolName,
                             status: enqueued.status,
@@ -1172,7 +1221,7 @@ async function registerFromConfig(server, config, helpers) {
                 if (result.stderr && result.stderr.trim()) {
                     content.push({ type: 'text', text: `stderr:\n${result.stderr}` });
                 }
-                return { content, metadata: { agent: process.env.AGENT_NAME || name } };
+                return { content, metadata: { agent: agentPrincipalId } };
             };
 
             const registeredTool = server.registerTool(name, definition, invocation);
@@ -1368,7 +1417,7 @@ async function main() {
                     return sendJson(404, { error: 'agent-card not configured' });
                 }
                 return sendJson(200, {
-                    agent: process.env.AGENT_NAME || manifest?.name || 'unknown-agent',
+                    agent: resolveAgentDisplayName(manifest, 'unknown-agent'),
                     about: typeof manifest?.about === 'string' ? manifest.about : '',
                     'agent-card': agentCard
                 });
@@ -1455,6 +1504,18 @@ async function main() {
                         if (!entry) {
                             if (!isInitializeRequest(body)) {
                                 return sendJson(400, { jsonrpc: '2.0', error: { code: -32000, message: 'Missing session; send initialize first' }, id: null });
+                            }
+                            if (isAuthenticatedReadinessInitialize(req.headers)) {
+                                const readinessAuth = verifyReadinessInitialize({
+                                    requestHeaders: req.headers,
+                                    params: body.params,
+                                });
+                                if (!readinessAuth.ok) {
+                                    return sendJson(401, {
+                                        error: 'invocation_rejected',
+                                        reason: readinessAuth.reason,
+                                    });
+                                }
                             }
                             // Build the per-session record outside the transport closures so
                             // its `server` field is the *only* strong reference to the McpServer.

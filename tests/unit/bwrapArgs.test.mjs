@@ -45,10 +45,14 @@ test('trusted service launch uses the fd launcher and fixed clean-HOME policy', 
         codePath: '/workspace/.ploinky/repos/repo/demo',
         codeDependenciesPath: '/workspace/.ploinky/deps/agents/repo/demo/node_modules',
         agentDependenciesPath: '/workspace/.ploinky/deps/agents/repo/demo/node_modules',
-        environment: {
-            HOME: '/home/agent',
-            PORT: '17000',
+        identity: {
+            principalId: 'agent:repo/demo',
+            instanceId: 'ploinky_demo_01234567',
+            enableGeneration: 'generation:1',
         },
+        agentName: 'demo',
+        repoName: 'repo',
+        listenPort: 17000,
     });
 
     assert.equal(BWRAP_HELPER_PATH, '/usr/local/libexec/ploinky-bwrap-launch');
@@ -56,6 +60,14 @@ test('trusted service launch uses the fd launcher and fixed clean-HOME policy', 
     assert.equal(launch.descriptor.subarray(0, 8).toString('ascii'), 'PLBWLP01');
     assert.equal(launch.env.HOME, '/home/agent');
     assert.equal(launch.env.PORT, '17000');
+    assert.equal(launch.env.PLOINKY_RUNTIME, 'bwrap');
+    assert.equal(launch.env.PLOINKY_AGENT_BIND_HOST, '127.0.0.1');
+    assert.equal(launch.env.PLOINKY_AGENT_PRINCIPAL, 'agent:repo/demo');
+    assert.equal(launch.env.PLOINKY_ENV_SOURCE_PLOINKY_AGENT_PRINCIPAL, 'generated');
+    assert.equal(launch.env.PLOINKY_CONTAINER_NAME, undefined);
+    assert.equal(launch.env.PLOINKY_CONTAINER_ID, undefined);
+    assert.equal(launch.env.PLOINKY_ROUTER_URL, undefined);
+    assert.equal(launch.env.PLOINKY_MASTER_KEY, undefined);
     assert.equal(Object.isFrozen(launch.records), true);
 
     const mounts = launch.records.filter((record) => record.type !== 'ARG');
@@ -73,16 +85,72 @@ test('trusted service launch uses the fd launcher and fixed clean-HOME policy', 
     assert.deepEqual(args.slice(-3), ['--', 'node', '/Agent/server/AgentServer.mjs']);
 });
 
+test('trusted service launch emits the fixed 0400 pipe-fed credential data mount', () => {
+    const launch = buildTrustedServiceLaunch({
+        runtimeKey: 'ploinky_demo_01234567',
+        command: ['node', '/Agent/server/AgentServer.mjs'],
+        nodeRuntimePath: '/opt/ploinky',
+        agentRuntimePath: '/workspace/.ploinky/deps/bwrap-runtime/demo/Agent',
+        codePath: '/workspace/.ploinky/repos/repo/demo',
+        codeDependenciesPath: '/workspace/.ploinky/deps/agents/repo/demo/node_modules',
+        agentDependenciesPath: '/workspace/.ploinky/deps/agents/repo/demo/node_modules',
+        identity: {
+            principalId: 'agent:repo/demo',
+            instanceId: 'ploinky_demo_01234567',
+            enableGeneration: 'generation:1',
+        },
+        agentName: 'demo',
+        repoName: 'repo',
+        listenPort: 17000,
+        credentialFd: 4,
+    });
+
+    assert.ok(launch.records.some((record) => (
+        record.type === 'DIR' && record.target === '/run/ploinky-agent'
+    )));
+    const args = launch.records.filter((record) => record.type === 'ARG').map((record) => record.value);
+    const start = args.indexOf('--perms');
+    assert.deepEqual(
+        args.slice(start, start + 5),
+        ['--perms', '0400', '--ro-bind-data', '4', '/run/ploinky-agent/credential.json'],
+    );
+    assert.equal(args.filter((value) => value === '--ro-bind-data').length, 1);
+});
+
 test('long-lived bwrap service has no raw bwrap or legacy argument-builder route', () => {
     const source = fs.readFileSync(new URL('../../cli/sandbox/bwrap/bwrapServiceManager.js', import.meta.url), 'utf8');
     const start = source.indexOf('function startBwrapProcess(');
     const end = source.indexOf('function ensureBwrapService(', start);
     assert.ok(start >= 0 && end > start);
     const body = source.slice(start, end);
-    assert.match(body, /spawnTrustedServiceLaunch\(trustedLaunch, logFd\)/);
+    assert.match(body, /spawnTrustedServiceLaunch\(trustedLaunch, logFd, agentCredential\.bytes\)/);
     assert.doesNotMatch(body, /spawn\(BWRAP_PATH|buildBwrapArgs\(/);
+    assert.match(body, /credentialFd:\s*4/);
+    assert.match(body, /credentialNonceDigest:\s*agentCredential\.publicAttestation\.nonceDigest/);
+    assert.match(body, /bwrapOwner\s*=\s*saveBwrapPid/);
     assert.match(body, /target: '\/home\/agent'/);
     assert.doesNotMatch(body, /target: '\/root'|target: '\/shared'/);
+});
+
+test('bwrap reuse rejects raw reserved environment before resolution or runtime inspection', () => {
+    const source = fs.readFileSync(new URL('../../cli/sandbox/bwrap/bwrapServiceManager.js', import.meta.url), 'utf8');
+    const start = source.indexOf('function ensureBwrapService(');
+    const end = source.indexOf('\nfunction attachBwrapInteractive(', start);
+    assert.ok(start >= 0 && end > start);
+    const body = source.slice(start, end);
+
+    const profileResolved = body.indexOf('const profileConfig = profileResolution.profileConfig;');
+    const rawAdmission = body.indexOf('assertTrustedServiceRawConfiguration(manifest, profileConfig);');
+    const boundaryAdmission = body.indexOf('const runtimeBoundary = admitBwrapBoundary(');
+    const runtimeInspection = body.indexOf('isBwrapProcessRunning(containerName, runtimeIdentity)');
+    const environmentResolution = body.indexOf('computeEnvHash(manifest, profileConfig');
+
+    assert.ok(profileResolved >= 0);
+    assert.ok(rawAdmission > profileResolved);
+    assert.ok(boundaryAdmission > rawAdmission);
+    assert.ok(runtimeInspection > rawAdmission);
+    assert.ok(environmentResolution > rawAdmission);
+    assert.equal(body.match(/assertTrustedServiceRawConfiguration\(manifest, profileConfig\);/g)?.length, 1);
 });
 
 test('buildBwrapArgs overlays protected workspace paths read-only after cwd bind', () => {

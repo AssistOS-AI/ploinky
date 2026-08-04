@@ -27,6 +27,15 @@ import {
 const TOKEN_A = 'a'.repeat(43);
 const TOKEN_B = 'b'.repeat(43);
 const FIXED_NOW = Date.parse('2026-08-04T12:00:00.000Z');
+const CURRENT_UID = typeof process.getuid === 'function' ? process.getuid() : 501;
+const BOOT_A = '11111111-1111-4111-8111-111111111111';
+const BOOT_B = '22222222-2222-4222-8222-222222222222';
+const IDENTITY_A = `linux-proc:${BOOT_A}:100`;
+const IDENTITY_B = `linux-proc:${BOOT_B}:200`;
+
+function identified(processIdentity = IDENTITY_A, processUid = CURRENT_UID) {
+    return { state: 'identified', processIdentity, processUid };
+}
 
 function parseDescriptor(descriptor) {
     assert.equal(descriptor.subarray(0, 8).toString('ascii'), 'PLBWLP01');
@@ -57,6 +66,14 @@ function basePolicy(overrides = {}) {
         codePath: '/workspace/.ploinky/deps/coding-agent/code',
         codeDependenciesPath: '/workspace/.ploinky/deps/coding-agent/code-node-modules',
         agentDependenciesPath: '/opt/ploinky/node_modules',
+        identity: {
+            principalId: 'agent:repo/coding-agent',
+            instanceId: 'coding-agent_alias-1',
+            enableGeneration: 'generation:1',
+        },
+        agentName: 'coding-agent',
+        repoName: 'repo',
+        listenPort: 7000,
         ...overrides,
     });
 }
@@ -76,17 +93,18 @@ function leaseInput(root, overrides = {}) {
         metadata: { provider: 'codex', task: 7 },
         leaseRoot: root,
         ownerPid: 4242,
-        ownerStartIdentity: 'linux-proc:boot:100',
         ownerToken: TOKEN_A,
         ...overrides,
     };
 }
 
-function leaseDeps(state = { state: 'live', startIdentity: 'linux-proc:boot:100' }) {
+function leaseDeps(state = identified()) {
+    const inspect = typeof state === 'function' ? state : () => state;
     return {
-        inspectProcessIdentity: () => state,
+        inspectProcessIdentity: inspect,
         randomBytes: () => Buffer.alloc(32, 1),
         now: () => FIXED_NOW,
+        getUid: () => CURRENT_UID,
     };
 }
 
@@ -202,12 +220,7 @@ test('encoder rejects unknown fields, raw bind/fd injection, duplicates, invalid
 });
 
 test('trusted service policy is fixed, frozen, explicit-network, and ends with command argv', () => {
-    const policy = basePolicy({
-        environment: {
-            PORT: '7000',
-            PLOINKY_AGENT_PRINCIPAL: 'agent:alias-1:generation-1',
-        },
-    });
+    const policy = basePolicy();
     assert.equal(Object.isFrozen(policy), true);
     assert.equal(Object.isFrozen(policy.records), true);
     assert.equal(Object.isFrozen(policy.env), true);
@@ -216,6 +229,12 @@ test('trusted service policy is fixed, frozen, explicit-network, and ends with c
     assert.equal(policy.env.PATH, '/opt/ploinky-node/bin:/usr/bin:/bin');
     assert.equal(policy.env.PATH.includes('/home/agent'), false);
     assert.equal(policy.env.PORT, '7000');
+    assert.equal(policy.env.PLOINKY_RUNTIME, 'bwrap');
+    assert.equal(policy.env.PLOINKY_AGENT_BIND_HOST, '127.0.0.1');
+    assert.equal(policy.env.PLOINKY_AGENT_PRINCIPAL, 'agent:repo/coding-agent');
+    assert.equal(policy.env.PLOINKY_ENV_SOURCE_PLOINKY_AGENT_PRINCIPAL, 'generated');
+    assert.equal(policy.env.PLOINKY_CONTAINER_NAME, undefined);
+    assert.equal(policy.env.PLOINKY_CONTAINER_ID, undefined);
 
     const workspace = policy.records.filter((record) => record.type === 'WORKSPACE');
     const home = policy.records.filter((record) => record.type === 'HOME');
@@ -252,16 +271,81 @@ test('trusted service policy is fixed, frozen, explicit-network, and ends with c
     }
 });
 
+test('trusted service credential transport is singular, fd-only, and unavailable to generic records', () => {
+    const policy = basePolicy({ credentialFd: 4 });
+    const credentialDirectoryIndex = policy.records.findIndex((record) => (
+        record.type === 'DIR' && record.target === '/run/ploinky-agent'
+    ));
+    const credentialArgs = policy.records
+        .filter((record) => record.type === 'ARG')
+        .map((record) => record.value);
+    const credentialArgIndex = credentialArgs.indexOf('--perms');
+
+    assert.ok(credentialDirectoryIndex >= 0);
+    assert.ok(credentialArgIndex >= 0);
+    assert.deepEqual(
+        credentialArgs.slice(credentialArgIndex, credentialArgIndex + 5),
+        ['--perms', '0400', '--ro-bind-data', '4', '/run/ploinky-agent/credential.json'],
+    );
+    assert.equal(credentialArgs.filter((value) => value === '--ro-bind-data').length, 1);
+    assert.equal(JSON.stringify(policy.records).includes('credential.json'), true);
+    assert.doesNotThrow(() => encodeBwrapLaunchDescriptor(policy.records));
+
+    for (const credentialFd of [3, 4.5, '4', Number.MAX_SAFE_INTEGER]) {
+        assert.throws(
+            () => basePolicy({ credentialFd }),
+            (error) => error?.code === 'PLOINKY_BWRAP_CREDENTIAL_TRANSPORT_INVALID',
+        );
+    }
+    assert.throws(
+        () => encodeBwrapLaunchDescriptor([
+            createArgRecord('--perms'),
+            createArgRecord('0400'),
+            createArgRecord('--ro-bind-data'),
+            createArgRecord('4'),
+            createArgRecord('/run/ploinky-agent/credential.json'),
+            createArgRecord('--'),
+            createArgRecord('/bin/true'),
+        ]),
+        (error) => error?.code === 'PLOINKY_BWRAP_CREDENTIAL_TRANSPORT_INVALID',
+    );
+});
+
 test('trusted service dynamic env is deterministic, bounded, and cannot weaken fixed values or mounts', () => {
     const left = basePolicy({ environment: { Z_VALUE: 'last', A_VALUE: 'first' } });
     const right = basePolicy({ environment: { A_VALUE: 'first', Z_VALUE: 'last' } });
     assert.deepEqual(encodeBwrapLaunchDescriptor(left.records), encodeBwrapLaunchDescriptor(right.records));
-    assert.deepEqual(left.env, { ...TRUSTED_SERVICE_ENV, A_VALUE: 'first', Z_VALUE: 'last' });
-    assert.doesNotThrow(() => basePolicy({ environment: { HOME: TRUSTED_SERVICE_ENV.HOME } }));
-    assert.throws(() => basePolicy({ environment: { HOME: '/root' } }), /cannot override HOME/);
+    assert.equal(left.env.A_VALUE, 'first');
+    assert.equal(left.env.Z_VALUE, 'last');
+    assert.equal(left.env.HOME, TRUSTED_SERVICE_ENV.HOME);
+    assert.equal(left.env.PORT, '7000');
+    assert.equal(left.env.PLOINKY_AGENT_ID, 'agent:repo/coding-agent');
+    for (const name of [
+        'HOME',
+        'PORT',
+        'PLOINKY_RUNTIME',
+        'PLOINKY_AGENT_PRIVATE_SECRET',
+        'PLOINKY_AGENT_API_KEY',
+        'PLOINKY_ROUTER_URL',
+        'PLOINKY_AGENT_CREDENTIAL_FILE',
+        'PLOINKY_ENV_SOURCE_PLOINKY_AGENT_ID',
+        'PLOINKY_CONTAINER_NAME',
+        'PLOINKY_AGENT_BIND_HOST',
+    ]) {
+        assert.throws(
+            () => basePolicy({ environment: { [name]: name === 'HOME' ? TRUSTED_SERVICE_ENV.HOME : 'attacker' } }),
+            (error) => error?.code === 'PLOINKY_BWRAP_SERVICE_ENV_RESERVED'
+                && error.message.includes(name)
+                && !error.message.includes('attacker'),
+            name,
+        );
+    }
+    assert.doesNotThrow(() => basePolicy({ environment: {
+        PLOINKY_AGENT_CLIENT_ID: 'client-id',
+        PLOINKY_AGENT_CLIENT_SECRET: 'client-secret',
+    } }));
     assert.throws(() => basePolicy({ environment: { 'BAD-NAME': 'x' } }), /name BAD-NAME is invalid/);
-    assert.throws(() => basePolicy({ environment: { PORT: 7000 } }), /must be a string/);
-    assert.throws(() => basePolicy({ environment: { PLOINKY_MASTER_KEY: 'must-not-cross' } }), /is forbidden/);
+    assert.throws(() => basePolicy({ environment: { ORDINARY_VALUE: 7000 } }), /must be a string/);
     assert.throws(() => basePolicy({ volumes: { '/engine': '/engine' } }), /unknown field volumes/);
     assert.throws(() => basePolicy({ sharedDir: '/workspace/.ploinky/shared' }), /unknown field sharedDir/);
 });
@@ -276,8 +360,10 @@ test('exclusive HOME lease uses canonical wx state and reports a live exact owne
     assert.equal(raw.endsWith('\n'), true);
     assert.deepEqual(Object.keys(JSON.parse(raw)), [
         'acquiredAt', 'generation', 'homeKey', 'metadata', 'ownerPid',
-        'ownerStartIdentity', 'ownerToken', 'role', 'schemaVersion',
+        'ownerStartIdentity', 'ownerToken', 'ownerUid', 'role', 'schemaVersion',
     ]);
+    assert.equal(JSON.parse(raw).schemaVersion, 2);
+    assert.equal(JSON.parse(raw).ownerUid, CURRENT_UID);
     assert.throws(
         () => acquireProviderHomeLease(leaseInput(root, { ownerToken: TOKEN_B, role: 'interactive-cli' }), leaseDeps()),
         (error) => error?.code === 'PLOINKY_PROVIDER_HOME_BUSY'
@@ -299,11 +385,10 @@ test('HOME lease recovery requires proof of dead or PID-reused ownership', (t) =
     const afterDeath = acquireProviderHomeLease(
         leaseInput(deadRoot, {
             ownerPid: 5252,
-            ownerStartIdentity: 'linux-proc:boot:200',
             ownerToken: TOKEN_B,
             generation: 'generation:2',
         }),
-        leaseDeps({ state: 'dead' }),
+        leaseDeps((pid) => pid === 5252 ? identified(IDENTITY_B) : { state: 'dead' }),
     );
     assert.equal(afterDeath.recoveredStaleOwner.reason, 'dead');
     assert.equal(afterDeath.recoveredStaleOwner.ownerPid, deadOwner.ownerPid);
@@ -314,10 +399,9 @@ test('HOME lease recovery requires proof of dead or PID-reused ownership', (t) =
     const afterReuse = acquireProviderHomeLease(
         leaseInput(reusedRoot, {
             ownerPid: 5252,
-            ownerStartIdentity: 'linux-proc:boot:200',
             ownerToken: TOKEN_B,
         }),
-        leaseDeps({ state: 'live', startIdentity: 'linux-proc:boot:999' }),
+        leaseDeps(() => identified(IDENTITY_B)),
     );
     assert.equal(afterReuse.recoveredStaleOwner.reason, 'pid-reused');
     releaseProviderHomeLease(afterReuse);
@@ -325,18 +409,37 @@ test('HOME lease recovery requires proof of dead or PID-reused ownership', (t) =
     const unknownRoot = leaseRoot(t);
     const unknown = acquireProviderHomeLease(leaseInput(unknownRoot), leaseDeps());
     assert.throws(
-        () => acquireProviderHomeLease(leaseInput(unknownRoot, { ownerToken: TOKEN_B }), leaseDeps({ state: 'unknown' })),
+        () => acquireProviderHomeLease(
+            leaseInput(unknownRoot, { ownerPid: 5252, ownerToken: TOKEN_B }),
+            leaseDeps((pid) => pid === 5252 ? identified(IDENTITY_B) : { state: 'unknown' }),
+        ),
         (error) => error?.code === 'PLOINKY_PROVIDER_HOME_BUSY' && error.owner?.uncertain === true,
     );
     releaseProviderHomeLease(unknown);
 
-    const unprovedRoot = leaseRoot(t);
-    const unproved = acquireProviderHomeLease(leaseInput(unprovedRoot), leaseDeps());
+    const uidDivergedRoot = leaseRoot(t);
+    const uidDiverged = acquireProviderHomeLease(leaseInput(uidDivergedRoot), leaseDeps());
     assert.throws(
-        () => acquireProviderHomeLease(leaseInput(unprovedRoot, { ownerToken: TOKEN_B }), leaseDeps({ state: 'live', startIdentity: '' })),
+        () => acquireProviderHomeLease(
+            leaseInput(uidDivergedRoot, { ownerPid: 5252, ownerToken: TOKEN_B }),
+            leaseDeps((pid) => pid === 5252 ? identified(IDENTITY_B) : { state: 'uid-diverged', processUid: CURRENT_UID }),
+        ),
         (error) => error?.code === 'PLOINKY_PROVIDER_HOME_BUSY' && error.owner?.uncertain === true,
     );
-    releaseProviderHomeLease(unproved);
+    releaseProviderHomeLease(uidDiverged);
+
+    const uidMismatchRoot = leaseRoot(t);
+    const uidMismatch = acquireProviderHomeLease(leaseInput(uidMismatchRoot), leaseDeps());
+    assert.throws(
+        () => acquireProviderHomeLease(
+            leaseInput(uidMismatchRoot, { ownerPid: 5252, ownerToken: TOKEN_B }),
+            leaseDeps((pid) => pid === 5252
+                ? identified(IDENTITY_B)
+                : identified(IDENTITY_A, CURRENT_UID + 1)),
+        ),
+        (error) => error?.code === 'PLOINKY_PROVIDER_HOME_BUSY' && error.owner?.uncertain === true,
+    );
+    releaseProviderHomeLease(uidMismatch);
 });
 
 test('HOME lease exact removal never unlinks a successor at the primary path', (t) => {
@@ -346,7 +449,7 @@ test('HOME lease exact removal never unlinks a successor at the primary path', (
         ...JSON.parse(fs.readFileSync(first.leasePath, 'utf8')),
         generation: 'generation:2',
         ownerPid: 5252,
-        ownerStartIdentity: 'linux-proc:boot:200',
+        ownerStartIdentity: IDENTITY_B,
         ownerToken: TOKEN_B,
     };
     const successorRaw = `${JSON.stringify(successorRecord)}\n`;
@@ -404,10 +507,9 @@ test('HOME lease acquisition recovers a crashed exact-removal operation only aft
     );
     const recovered = acquireProviderHomeLease(leaseInput(root, {
         ownerPid: 5252,
-        ownerStartIdentity: 'linux-proc:boot:200',
         ownerToken: TOKEN_B,
         generation: 'generation:2',
-    }), leaseDeps({ state: 'dead' }));
+    }), leaseDeps((pid) => pid === 5252 ? identified(IDENTITY_B) : { state: 'dead' }));
     assert.equal(fs.readdirSync(root).some((name) => name.includes('.operation-')), false);
     assert.equal(releaseProviderHomeLease(recovered), true);
 });
@@ -417,7 +519,7 @@ test('malformed, noncanonical, and symlink lease state fails closed without reco
     const malformedPath = path.join(malformedRoot, 'agent_alias-1.lease.json');
     fs.writeFileSync(malformedPath, '{"schemaVersion":1}\n', { mode: 0o600 });
     assert.throws(
-        () => acquireProviderHomeLease(leaseInput(malformedRoot), leaseDeps({ state: 'dead' })),
+        () => acquireProviderHomeLease(leaseInput(malformedRoot), leaseDeps()),
         (error) => error?.code === 'PLOINKY_PROVIDER_HOME_LEASE_INVALID',
     );
     assert.equal(fs.existsSync(malformedPath), true);
@@ -427,10 +529,61 @@ test('malformed, noncanonical, and symlink lease state fails closed without reco
     fs.writeFileSync(outside, 'do-not-remove', { mode: 0o600 });
     fs.symlinkSync(outside, path.join(symlinkRoot, 'agent_alias-1.lease.json'));
     assert.throws(
-        () => acquireProviderHomeLease(leaseInput(symlinkRoot), leaseDeps({ state: 'dead' })),
+        () => acquireProviderHomeLease(leaseInput(symlinkRoot), leaseDeps()),
         (error) => error?.code === 'PLOINKY_PROVIDER_HOME_LEASE_INVALID',
     );
     assert.equal(fs.readFileSync(outside, 'utf8'), 'do-not-remove');
+});
+
+test('HOME lease clean break rejects caller identities, schema v1, and unbootbound schema v2 records', (t) => {
+    const inputRoot = leaseRoot(t);
+    assert.throws(
+        () => acquireProviderHomeLease({
+            ...leaseInput(inputRoot),
+            ownerStartIdentity: IDENTITY_A,
+        }, leaseDeps()),
+        /unknown field ownerStartIdentity/,
+    );
+    assert.equal(fs.readdirSync(inputRoot).length, 0);
+
+    const v1Root = leaseRoot(t);
+    const v1Lease = acquireProviderHomeLease(leaseInput(v1Root), leaseDeps());
+    const v1Record = JSON.parse(fs.readFileSync(v1Lease.leasePath, 'utf8'));
+    v1Record.schemaVersion = 1;
+    delete v1Record.ownerUid;
+    fs.writeFileSync(v1Lease.leasePath, `${JSON.stringify(v1Record)}\n`, { mode: 0o600 });
+    assert.throws(
+        () => acquireProviderHomeLease(leaseInput(v1Root, { ownerToken: TOKEN_B }), leaseDeps()),
+        (error) => error?.code === 'PLOINKY_PROVIDER_HOME_LEASE_INVALID',
+    );
+    assert.equal(JSON.parse(fs.readFileSync(v1Lease.leasePath, 'utf8')).schemaVersion, 1);
+
+    const unboundRoot = leaseRoot(t);
+    const unboundLease = acquireProviderHomeLease(leaseInput(unboundRoot), leaseDeps());
+    const unboundRecord = JSON.parse(fs.readFileSync(unboundLease.leasePath, 'utf8'));
+    unboundRecord.ownerStartIdentity = 'linux-proc:100';
+    fs.writeFileSync(unboundLease.leasePath, `${JSON.stringify(unboundRecord)}\n`, { mode: 0o600 });
+    assert.throws(
+        () => acquireProviderHomeLease(leaseInput(unboundRoot, { ownerToken: TOKEN_B }), leaseDeps()),
+        (error) => error?.code === 'PLOINKY_PROVIDER_HOME_LEASE_INVALID',
+    );
+    assert.equal(fs.readFileSync(unboundLease.leasePath, 'utf8').includes('linux-proc:100'), true);
+});
+
+test('HOME lease requires a boot-bound same-UID acquisition identity', (t) => {
+    for (const state of [
+        { state: 'unknown' },
+        { state: 'uid-diverged', processUid: CURRENT_UID },
+        identified('linux-proc:100'),
+        identified(IDENTITY_A, CURRENT_UID + 1),
+    ]) {
+        const root = leaseRoot(t);
+        assert.throws(
+            () => acquireProviderHomeLease(leaseInput(root), leaseDeps(state)),
+            (error) => error?.code === 'PLOINKY_PROVIDER_HOME_LEASE_INVALID',
+        );
+        assert.equal(fs.readdirSync(root).length, 0);
+    }
 });
 
 test('different HOME keys proceed independently and callback release runs on failure', async (t) => {

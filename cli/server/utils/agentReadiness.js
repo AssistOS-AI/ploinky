@@ -2,11 +2,16 @@ import fs from 'fs';
 import crypto from 'node:crypto';
 import http from 'http';
 import net from 'net';
-import { sha256RawBodyHash } from '../../../Agent/lib/requestHash.mjs';
+import {
+    computeRchTool,
+    sha256RawBodyHash,
+} from '../../../Agent/lib/requestHash.mjs';
+import { assertExactServiceOwner } from '../../sandbox/bwrap/bwrapFleet.js';
 import { deriveAgentRequestSecret } from '../../utils/security/masterKey.js';
 import { deriveAgentPrincipalId } from '../../utils/security/agentIdentity.js';
 import { resolveAgentReadinessPort } from '../../utils/runtime/startupReadiness.js';
 import { ROUTING_FILE } from '../../utils/config.js';
+import { buildRouterRequest } from '../mcp-proxy/invocationMinter.js';
 import { createRelayHttpAgent, RelayDuplex } from '../proxy/executeHttpPlan.js';
 import { compileProxyLimits } from '../proxy/limits.js';
 import { RuntimeRelayManager } from '../runtimeRelay/RuntimeRelayManager.js';
@@ -32,6 +37,82 @@ function wait(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function bwrapReadinessError(message, code = 'BWRAP_AGENT_READINESS_INVALID') {
+    const error = new Error(message);
+    error.code = code;
+    return error;
+}
+
+function exactBwrapReadinessRoute({ route, manifest, runtimeResult, record }) {
+    const containerName = String(runtimeResult?.containerName || route?.container || '').trim();
+    const routeContainer = String(route?.container || '').trim();
+    const effectiveInstanceId = String(record.instanceId || '').trim();
+    const enableGeneration = String(record.enableGeneration || '').trim();
+    const repoName = String(record.repoName || '').trim();
+    const agentName = String(record.agentName || '').trim();
+    const owner = record.bwrapOwner;
+    const runtimeHostPort = resolvePort(runtimeResult?.hostPort);
+    const routeHostPort = resolvePort(route?.hostPort);
+    const ownerHostPort = resolvePort(owner?.rootPort);
+    const explicitReadinessPort = resolveAgentReadinessPort(manifest);
+
+    if (!containerName
+        || (routeContainer && routeContainer !== containerName)
+        || !effectiveInstanceId
+        || !enableGeneration
+        || !repoName
+        || !agentName
+        || !owner
+        || typeof owner !== 'object'
+        || Array.isArray(owner)
+        || owner.role !== 'service'
+        || owner.runtimeKey !== containerName
+        || typeof owner.routeKey !== 'string'
+        || !owner.routeKey
+        || owner.instanceId !== effectiveInstanceId
+        || owner.enableGeneration !== enableGeneration
+        || !runtimeHostPort
+        || !routeHostPort
+        || !ownerHostPort
+        || !Number.isSafeInteger(runtimeHostPort)
+        || runtimeHostPort > 65535
+        || !Number.isSafeInteger(routeHostPort)
+        || routeHostPort > 65535
+        || !Number.isSafeInteger(ownerHostPort)
+        || ownerHostPort > 65535
+        || runtimeHostPort !== routeHostPort
+        || runtimeHostPort !== ownerHostPort) {
+        throw bwrapReadinessError('bwrap readiness requires one exact owner-bound principal, generation, route, and root port');
+    }
+    if (explicitReadinessPort && explicitReadinessPort !== runtimeHostPort) {
+        throw bwrapReadinessError(
+            'bwrap readiness supports only the authenticated root MCP port',
+            'BWRAP_AGENT_PORT_UNSUPPORTED',
+        );
+    }
+
+    let targetAgentId;
+    try {
+        targetAgentId = deriveAgentPrincipalId(repoName, agentName);
+    } catch (cause) {
+        throw bwrapReadinessError(`bwrap readiness principal is invalid: ${cause?.message || cause}`);
+    }
+    const bwrapOwner = Object.freeze({ ...owner });
+    return {
+        ...route,
+        container: containerName,
+        hostPort: runtimeHostPort,
+        bwrapReadiness: Object.freeze({
+            kind: 'bwrap-root-mcp',
+            targetAgentId,
+            effectiveInstanceId,
+            enableGeneration,
+            hostPort: runtimeHostPort,
+            bwrapOwner,
+        }),
+    };
+}
+
 export function buildRelayReadinessRoute({
     route = {},
     manifest = {},
@@ -39,10 +120,13 @@ export function buildRelayReadinessRoute({
     networkMode = '',
     generationDigest = '',
 } = {}) {
-    const port = resolveAgentReadinessPort(manifest);
-    if (!port) return route;
     const record = runtimeResult?.registryRecord || {};
     const runtime = String(record.runtime || '').trim();
+    if (runtime === 'bwrap') {
+        return exactBwrapReadinessRoute({ route, manifest, runtimeResult, record });
+    }
+    const port = resolveAgentReadinessPort(manifest);
+    if (!port) return route;
     const containerId = String(runtimeResult?.containerId || record.containerId || '').trim().toLowerCase();
     const containerName = String(runtimeResult?.containerName || route?.container || '').trim();
     const effectiveInstanceId = String(record.instanceId || '').trim();
@@ -240,6 +324,138 @@ async function probeAgentMcp(port, timeoutMs = 700) {
     }
 }
 
+function resolveBwrapReadinessRoute(agentOrRoute) {
+    const route = typeof agentOrRoute === 'string'
+        ? resolveAgentRoute(agentOrRoute)
+        : agentOrRoute;
+    const readiness = route?.bwrapReadiness;
+    if (readiness?.kind !== 'bwrap-root-mcp'
+        || !String(readiness.targetAgentId || '').trim()
+        || !String(readiness.effectiveInstanceId || '').trim()
+        || !String(readiness.enableGeneration || '').trim()
+        || !Number.isInteger(readiness.hostPort)
+        || readiness.hostPort < 1
+        || readiness.hostPort > 65535
+        || readiness.hostPort !== resolvePort(route?.hostPort)
+        || !readiness.bwrapOwner
+        || typeof readiness.bwrapOwner !== 'object'
+        || Array.isArray(readiness.bwrapOwner)) {
+        return null;
+    }
+    return route;
+}
+
+function hasBwrapReadinessMarker(agentOrRoute) {
+    const route = typeof agentOrRoute === 'string'
+        ? resolveAgentRoute(agentOrRoute)
+        : agentOrRoute;
+    return Boolean(route && Object.prototype.hasOwnProperty.call(route, 'bwrapReadiness'));
+}
+
+function verifyBwrapReadinessOwner(route) {
+    assertExactServiceOwner(route.bwrapReadiness.bwrapOwner);
+    return true;
+}
+
+const BWRAP_READINESS_TOOL = '__ploinky_readiness__';
+
+function bwrapInitializeParams() {
+    return {
+        protocolVersion: '2025-06-18',
+        capabilities: {},
+        clientInfo: {
+            name: 'ploinky-readiness',
+            version: '1.0.0',
+        },
+    };
+}
+
+async function probeBwrapMcp(route, timeoutMs, {
+    beforeDial = verifyBwrapReadinessOwner,
+    createConnection = net.createConnection,
+    mintRouterRequest = buildRouterRequest,
+} = {}) {
+    const readiness = route.bwrapReadiness;
+    const params = bwrapInitializeParams();
+    const payload = {
+        jsonrpc: '2.0',
+        id: 'agent-readiness',
+        method: 'initialize',
+        params,
+    };
+    const body = Buffer.from(JSON.stringify(payload), 'utf8');
+    const rch = computeRchTool({
+        method: 'POST',
+        path: '/mcp',
+        tool: BWRAP_READINESS_TOOL,
+        arguments: params,
+    });
+    const minted = await mintRouterRequest({
+        targetAgentId: readiness.targetAgentId,
+        sub: 'ploinky-router',
+        actor: { kind: 'agent', id: 'ploinky-router', roles: [] },
+        method: 'POST',
+        path: '/mcp',
+        tool: BWRAP_READINESS_TOOL,
+        rch,
+    });
+    const token = typeof minted === 'string' ? minted : minted?.token;
+    if (typeof token !== 'string' || !token) {
+        throw bwrapReadinessError('bwrap readiness minter returned no router-request token');
+    }
+
+    const ownerCheckedAgent = new http.Agent({ keepAlive: false });
+    ownerCheckedAgent.createConnection = (options, callback) => {
+        if (beforeDial(route) !== true) {
+            throw bwrapReadinessError(
+                'bwrap readiness owner verification rejected the socket',
+                'BWRAP_AGENT_OWNER_INVALID',
+            );
+        }
+        return createConnection(options, callback);
+    };
+
+    try {
+        return await new Promise((resolve) => {
+            const request = http.request({
+                host: '127.0.0.1',
+                port: readiness.hostPort,
+                path: '/mcp',
+                method: 'POST',
+                headers: {
+                    authorization: `Bearer ${token}`,
+                    'x-ploinky-readiness-probe': 'v1',
+                    'content-type': 'application/json',
+                    accept: 'application/json, text/event-stream',
+                    'content-length': String(body.length),
+                },
+                timeout: timeoutMs,
+                agent: ownerCheckedAgent,
+            }, (response) => {
+                const chunks = [];
+                response.on('data', (chunk) => chunks.push(chunk));
+                response.on('end', () => {
+                    if ((response.statusCode || 0) < 200 || (response.statusCode || 0) >= 300) {
+                        resolve(false);
+                        return;
+                    }
+                    try {
+                        const parsed = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+                        resolve(parsed?.jsonrpc === '2.0' && Boolean(parsed?.result?.protocolVersion));
+                    } catch (_) {
+                        resolve(false);
+                    }
+                });
+            });
+            request.setTimeout(timeoutMs, () => request.destroy(new Error('timeout')));
+            request.on('error', () => resolve(false));
+            request.end(body);
+        });
+    } finally {
+        ownerCheckedAgent.destroy();
+    }
+}
+
 export function resolveAgentRoute(agentName) {
     if (!agentName || typeof agentName !== 'string') {
         return null;
@@ -397,20 +613,63 @@ export async function waitForAgentReady(agentOrRoute, {
     onProgress = null,
     beforeProbe = null,
     relayProbe = probeRelay,
+    bwrapProbe = probeBwrapMcp,
+    bwrapBeforeDial = verifyBwrapReadinessOwner,
+    bwrapCreateConnection = net.createConnection,
+    bwrapMintRouterRequest = buildRouterRequest,
 } = {}) {
-    const relayRoute = resolveRelayReadinessRoute(agentOrRoute);
-    const port = resolveAgentPort(agentOrRoute);
-    if (!relayRoute && !port) {
+    const readinessTarget = typeof agentOrRoute === 'string'
+        && !/^\d+$/.test(agentOrRoute.trim())
+        ? resolveAgentRoute(agentOrRoute.trim())
+        : agentOrRoute;
+    const bwrapRoute = resolveBwrapReadinessRoute(readinessTarget);
+    if (hasBwrapReadinessMarker(readinessTarget) && !bwrapRoute) return false;
+    const relayRoute = resolveRelayReadinessRoute(readinessTarget);
+    const port = resolveAgentPort(readinessTarget);
+    if (!bwrapRoute && !relayRoute && !port) {
         return false;
     }
     const deadline = Date.now() + Math.max(0, timeoutMs);
     const normalizedProtocol = String(protocol || 'mcp').trim().toLowerCase();
     if (!['tcp', 'mcp'].includes(normalizedProtocol)) return false;
+    if (bwrapRoute && normalizedProtocol !== 'mcp') return false;
     const startedAt = Date.now();
     let attempt = 0;
     while (true) {
         attempt += 1;
         if (beforeProbe && beforeProbe() !== true) return false;
+        if (bwrapRoute) {
+            let ready = false;
+            let lastError = '';
+            try {
+                ready = await bwrapProbe(
+                    bwrapRoute,
+                    Math.max(500, probeTimeoutMs * 2),
+                    {
+                        beforeDial: bwrapBeforeDial,
+                        createConnection: bwrapCreateConnection,
+                        mintRouterRequest: bwrapMintRouterRequest,
+                    },
+                );
+            } catch (error) {
+                lastError = error?.code || error?.message || 'error';
+            }
+            onProgress?.({
+                port: bwrapRoute.bwrapReadiness.hostPort,
+                protocol: normalizedProtocol,
+                elapsedMs: Date.now() - startedAt,
+                timeoutMs,
+                attempt,
+                portOpen: ready,
+                ready,
+                stage: ready ? 'ready' : 'waiting_for_authenticated_mcp',
+                lastError,
+            });
+            if (ready) return true;
+            if (Date.now() >= deadline) return false;
+            await wait(intervalMs);
+            continue;
+        }
         if (relayRoute) {
             let ready = false;
             let lastError = '';

@@ -8,6 +8,7 @@ import {
 } from '../sandbox/edgeGeneration.js';
 import { selectedRouterHostPort } from '../sandbox/routerPort.js';
 import { deriveAgentPrincipalId } from '../utils/security/agentIdentity.js';
+import { assertExactServiceOwner } from '../sandbox/bwrap/bwrapFleet.js';
 import {
     AgentPortSelectorError,
     parseAgentPortSelector,
@@ -144,6 +145,36 @@ function exactAgentRuntime(snapshot, routeKey, route) {
     };
 }
 
+function exactRouteAgentRecord(snapshot, route) {
+    const containerName = String(route?.container || '').trim();
+    const record = snapshot.agents?.[containerName];
+    if (!containerName || !record || record.type !== 'agent') return null;
+    if (String(record.repoName || '') !== String(route.repo || '')
+        || String(record.agentName || '') !== String(route.agent || '')) return null;
+    if (!String(record.instanceId || '').trim()
+        || !String(record.enableGeneration || '').trim()) return null;
+    return { containerName, record };
+}
+
+function bwrapRootOwnerAttestation(snapshot, routeKey, route, hostPort) {
+    const matched = exactRouteAgentRecord(snapshot, route);
+    if (!matched || String(matched.record.runtime || '').trim() !== 'bwrap') {
+        return { kind: 'not-bwrap' };
+    }
+    const owner = matched.record.bwrapOwner;
+    if (!owner || typeof owner !== 'object' || Array.isArray(owner)
+        || owner.role !== 'service'
+        || owner.runtimeKey !== matched.containerName
+        || owner.routeKey !== routeKey
+        || owner.rootPort !== hostPort
+        || owner.pid !== matched.record.pid
+        || owner.instanceId !== String(matched.record.instanceId || '').trim()
+        || owner.enableGeneration !== String(matched.record.enableGeneration || '').trim()) {
+        return { kind: 'invalid' };
+    }
+    return { kind: 'bwrap', owner };
+}
+
 function manifestRouteSpecs(manifest = {}) {
     const raw = manifest?.routerAccess?.httpRoutes;
     if (Array.isArray(raw)) return raw;
@@ -207,6 +238,15 @@ function agentPortPlan({
     const selected = exactRoute(routes, selector.agent);
     if (!selected) {
         return deny(404, 'AGENT_OWNER_INACTIVE', {
+            matched: true,
+            listener,
+            lease,
+            hostSelection,
+        });
+    }
+    const selectedRuntime = exactRouteAgentRecord(snapshot, selected.route);
+    if (String(selectedRuntime?.record?.runtime || '').trim() === 'bwrap') {
+        return deny(403, 'BWRAP_AGENT_PORT_UNSUPPORTED', {
             matched: true,
             listener,
             lease,
@@ -551,6 +591,19 @@ function agentRootPlan({ req, host, listener, pathname, parsedUrl, hostSelection
     if (!Number.isSafeInteger(hostPort) || hostPort < 1 || hostPort > 65535) {
         return deny(503, 'TARGET_INACTIVE', { lease, hostSelection });
     }
+    const bwrapOwner = bwrapRootOwnerAttestation(
+        snapshot,
+        agent.routeKey,
+        agent.route,
+        hostPort,
+    );
+    if (bwrapOwner.kind === 'invalid') {
+        return deny(503, 'BWRAP_AGENT_OWNER_INVALID', {
+            matched: true,
+            lease,
+            hostSelection,
+        });
+    }
     const policy = snapshotPolicy(snapshot);
     if (!policy) return deny(503, 'POLICY_GENERATION_INVALID', { lease, hostSelection });
     const decision = policy.evaluate({
@@ -571,6 +624,9 @@ function agentRootPlan({ req, host, listener, pathname, parsedUrl, hostSelection
         routeKey: agent.routeKey,
         route: agent.route,
         target: { hostname: '127.0.0.1', hostPort },
+        ...(bwrapOwner.kind === 'bwrap'
+            ? { ownerAttestation: bwrapOwner.owner }
+            : {}),
         upstreamPath: `${agent.upstreamPath}${parsedUrl.search || ''}`,
         decision,
         forwarding: canonicalForwardingMetadata({
@@ -743,12 +799,16 @@ export function resolveEdgeRoutePlan({
         snapshot,
         lease,
     });
-    if (agentPlan.ok || hostSelection.kind !== 'control') return agentPlan;
+    if (agentPlan.ok || agentPlan.matched || hostSelection.kind !== 'control') return agentPlan;
     return deny(404, 'ROUTE_NOT_FOUND', { lease, hostSelection });
 }
 
-export function commitRoutePlan(plan) {
-    return Boolean(plan?.ok && plan?.lease?.commit?.());
+export function commitRoutePlan(plan, {
+    assertServiceOwner = assertExactServiceOwner,
+} = {}) {
+    if (!plan?.ok || plan?.lease?.commit?.() !== true) return false;
+    if (plan.ownerAttestation) assertServiceOwner(plan.ownerAttestation);
+    return true;
 }
 
 export function commitRouteGeneration(plan) {

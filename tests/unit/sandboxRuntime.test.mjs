@@ -426,15 +426,18 @@ test('profile environment and secrets cannot re-enable sandbox Router discovery'
             };
             const work = ${JSON.stringify(path.join(root, 'work'))};
             const result = {};
-            for (const runtime of ['bwrap', 'seatbelt']) {
-                const env = buildFullEnvMap('agent', {}, profile, work, 'repo', 'default', runtime, null, endpoint);
-                result[runtime] = {
-                    host: env.PLOINKY_ROUTER_HOST,
-                    port: env.PLOINKY_ROUTER_PORT,
-                    url: env.PLOINKY_ROUTER_URL,
-                    authority: env.PLOINKY_ROUTER_AUTHORITY,
-                };
+            try {
+                buildFullEnvMap('agent', {}, profile, work, 'repo', 'default', 'bwrap', null, endpoint);
+            } catch (error) {
+                result.bwrapError = error.code;
             }
+            const env = buildFullEnvMap('agent', {}, profile, work, 'repo', 'default', 'seatbelt', null, endpoint);
+            result.seatbelt = {
+                host: env.PLOINKY_ROUTER_HOST,
+                port: env.PLOINKY_ROUTER_PORT,
+                url: env.PLOINKY_ROUTER_URL,
+                authority: env.PLOINKY_ROUTER_AUTHORITY,
+            };
             console.log(JSON.stringify(result));
         `;
         const result = runModuleScript({
@@ -452,7 +455,7 @@ test('profile environment and secrets cannot re-enable sandbox Router discovery'
         });
         assert.equal(result.status, 0, result.stderr || result.stdout);
         assert.deepEqual(parseLastJsonLine(result.stdout), {
-            bwrap: {},
+            bwrapError: 'PLOINKY_BWRAP_SERVICE_ENV_RESERVED',
             seatbelt: {},
         });
     } finally {

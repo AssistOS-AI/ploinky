@@ -864,6 +864,7 @@ function ensureGraphNodesEnabled(graph, reg, {
       removeAgentContainerForRecreate(
         plan.existing.key,
         `workspaceGraph:${plan.node.id}:${reasons.join('+')}`,
+        plan.existing.rec,
       );
     }
   } catch (error) {
@@ -1263,7 +1264,10 @@ async function activatePreparedRuntimeAfterReadiness({
 
 export function cleanupFailedPreparedRuntime(result, error, reason = 'runtime-replacement-readiness-failed') {
   if (!result) return;
-  if (result.preparationLease && result.containerName && result.containerId && result.registryRecord) {
+  if (result.preparationLease
+      && result.containerName
+      && result.registryRecord
+      && result.cleanupReceipt) {
     try {
       dockerSvc.cleanupExactAgentRuntimeCandidate(result);
     } catch (cleanupError) {
@@ -1277,6 +1281,45 @@ export function cleanupFailedPreparedRuntime(result, error, reason = 'runtime-re
   try {
     abortEdgeRoutingPreparation(result.preparationLease, { reason });
   } catch (_) {}
+}
+
+export function shouldTrackWorkspaceRuntimeCandidate(result) {
+  return result?.requiresEdgeActivation === true
+    && Boolean(result.preparationLease)
+    && Boolean(result.containerName)
+    && Boolean(result.registryRecord)
+    && Boolean(result.cleanupReceipt);
+}
+
+export function cleanupWorkspaceRuntimeCandidates(candidates, error, {
+  cleanupExactAgentRuntimeCandidateImpl = dockerSvc.cleanupExactAgentRuntimeCandidate,
+} = {}) {
+  if (!Array.isArray(candidates)) return;
+  const cleanedCandidateIds = new Set();
+  for (const candidate of candidates.reverse()) {
+    if (!shouldTrackWorkspaceRuntimeCandidate(candidate)) continue;
+    const candidateId = String(candidate.containerId || '') || [
+      candidate.registryRecord.runtime,
+      candidate.containerName,
+      candidate.registryRecord.instanceId,
+      candidate.registryRecord.enableGeneration,
+    ].map((part) => String(part || '')).join(':');
+    if (cleanedCandidateIds.has(candidateId)) continue;
+    cleanedCandidateIds.add(candidateId);
+    try {
+      cleanupExactAgentRuntimeCandidateImpl(candidate);
+    } catch (cleanupError) {
+      error.message += `; exact workspace candidate cleanup: ${cleanupError?.message || cleanupError}`;
+    }
+  }
+  candidates.length = 0;
+}
+
+export function buildWorkspaceRuntimeRegistry(preflightRegistry, workspaceConfig) {
+  return {
+    ...(preflightRegistry || {}),
+    _config: structuredClone(workspaceConfig || {}),
+  };
 }
 
 async function resolveAndPersistStartRouterPort(staticAgentArg, portArg, {
@@ -1512,7 +1555,7 @@ async function startWorkspace(staticAgentArg, portArg, {
     // preinstall and config-provider hooks receive that exact topology before
     // any agent process or container is allowed to start.
     assertWorkspaceGraphAdmissionsCurrent(lockedStart.admissions);
-    const providerRegistry = lockedStart.registry;
+    const providerRegistry = buildWorkspaceRuntimeRegistry(lockedStart.registry, cfg0);
     const dependencyGraph = lockedStart.graph;
 
     let reg = providerRegistry;
@@ -1690,9 +1733,7 @@ async function startWorkspace(staticAgentArg, portArg, {
             preparedHostModeCapability,
             networkLifecycleCapability,
           });
-          if (runtimeResult?.requiresEdgeActivation === true
-              && runtimeResult?.preparationLease
-              && runtimeResult?.containerId) {
+          if (shouldTrackWorkspaceRuntimeCandidate(runtimeResult)) {
             workspaceRuntimeCandidates.push(runtimeResult);
           }
           const {
@@ -1926,18 +1967,7 @@ async function startWorkspace(staticAgentArg, portArg, {
     console.log(`[start] Watchdog logs: ${path.join(LOGS_DIR, 'watchdog.log')}`);
     console.log(`[start] Dashboard: ${buildDashboardUrl(staticPort)}`);
   } catch (e) {
-    const cleanedCandidateIds = new Set();
-    for (const candidate of workspaceRuntimeCandidates.reverse()) {
-      const candidateId = String(candidate?.containerId || '');
-      if (!candidateId || cleanedCandidateIds.has(candidateId)) continue;
-      cleanedCandidateIds.add(candidateId);
-      try {
-        dockerSvc.cleanupExactAgentRuntimeCandidate(candidate);
-      } catch (cleanupError) {
-        e.message += `; exact workspace candidate cleanup: ${cleanupError?.message || cleanupError}`;
-      }
-    }
-    workspaceRuntimeCandidates.length = 0;
+    cleanupWorkspaceRuntimeCandidates(workspaceRuntimeCandidates, e);
     if (workspacePreparationLease) {
       try {
         abortEdgeRoutingPreparation(workspacePreparationLease, {

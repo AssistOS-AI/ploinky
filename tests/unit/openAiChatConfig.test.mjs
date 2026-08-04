@@ -1,7 +1,22 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { resolveOpenAiChatKind } from '../../Agent/server/AgentServer.mjs';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 
+import { createAgentServerContainerEnvironment } from '../helpers/agentServerCredentialRuntime.mjs';
+
+const credentialDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-server-config-'));
+Object.assign(process.env, await createAgentServerContainerEnvironment({
+    tempDir: credentialDir,
+    agentPrincipal: 'agent:test/openai-config',
+}));
+const {
+    __buildAgenticCompletion,
+    resolveOpenAiChatKind,
+} = await import(`../../Agent/server/AgentServer.mjs?credential=${Date.now()}`);
+
+test.after(() => fs.rmSync(credentialDir, { recursive: true, force: true }));
 test('absent chatCompletions → llm with null model (default)', () => {
     assert.deepEqual(resolveOpenAiChatKind({}), { kind: 'llm', model: null });
 });
@@ -21,9 +36,6 @@ test('command spec → command kind', () => {
     assert.equal(r.supportsStream, true);
     assert.ok(r.commandSpec);
 });
-
-// append to tests/unit/openAiChatConfig.test.mjs
-import { __buildAgenticCompletion } from '../../Agent/server/AgentServer.mjs';
 
 test('__buildAgenticCompletion returns a chat.completion using injected responder', async () => {
     const completion = await __buildAgenticCompletion({

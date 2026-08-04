@@ -29,12 +29,13 @@ test('collectAgentRuntimeStates uses exact registry runtime ownership and surfac
     };
     const owners = {
         bwrapKey: {
-            schemaVersion: 3,
+            schemaVersion: 5,
             role: 'service',
             runtimeKey: 'bwrapKey',
             ownerKey: 'service-bwrap-owner',
             pid: 4242,
-            processIdentity: 'linux-proc:101',
+            processIdentity: 'linux-proc:123e4567-e89b-12d3-a456-426614174000:101',
+            processUid: 501,
             instanceId: 'instance-bwrap',
             enableGeneration: 'generation-bwrap',
             homeKey: 'bwrapKey',
@@ -42,14 +43,22 @@ test('collectAgentRuntimeStates uses exact registry runtime ownership and surfac
             logPath: '/workspace/.ploinky/logs/bwrapKey-bwrap.log',
             taskId: '',
             provider: '',
+            routeKey: 'codexAgent',
+            rootPort: 8080,
+            credentialNonceDigest: 'sha256:' + 'a'.repeat(64),
+            credentialExpiresAt: 1_800_000_000,
+            manifestDigest: 'sha256:' + 'b'.repeat(64),
+            admissionDigest: 'sha256:' + 'c'.repeat(64),
+            networkHash: 'sha256:' + 'd'.repeat(64),
         },
         seatbeltKey: {
-            schemaVersion: 3,
+            schemaVersion: 5,
             role: 'service',
             runtimeKey: 'seatbeltKey',
             ownerKey: 'service-seatbelt-owner',
             pid: 4343,
-            processIdentity: 'ps-lstart:Tue Aug 4 10:00:00 2026',
+            processIdentity: 'darwin-ps:1785220336:610367:Tue Aug 4 10:00:00 2026',
+            processUid: 501,
             instanceId: 'instance-seatbelt',
             enableGeneration: 'stale-seatbelt-generation',
             homeKey: 'seatbeltKey',
@@ -57,6 +66,13 @@ test('collectAgentRuntimeStates uses exact registry runtime ownership and surfac
             logPath: '/workspace/.ploinky/logs/seatbeltKey-seatbelt.log',
             taskId: '',
             provider: '',
+            routeKey: 'piAgent',
+            rootPort: 8080,
+            credentialNonceDigest: 'sha256:' + 'e'.repeat(64),
+            credentialExpiresAt: 1_800_000_000,
+            manifestDigest: 'sha256:' + 'f'.repeat(64),
+            admissionDigest: 'sha256:' + '0'.repeat(64),
+            networkHash: 'sha256:' + '1'.repeat(64),
         },
     };
 
@@ -116,7 +132,7 @@ test('collectAgentRuntimeStates uses exact registry runtime ownership and surfac
         logPath: '/workspace/.ploinky/logs/bwrapKey-bwrap.log',
         taskId: '',
         provider: '',
-        processIdentity: 'linux-proc:101',
+        processIdentity: 'linux-proc:123e4567-e89b-12d3-a456-426614174000:101',
     });
 });
 

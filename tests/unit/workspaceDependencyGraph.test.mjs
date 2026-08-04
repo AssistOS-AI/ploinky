@@ -950,7 +950,12 @@ test('an existing stopped no-wait node rotates identity and loses stale targets 
                 },
             };
         },
-        removeAgentContainerForRecreate(containerName) {
+        removeAgentContainerForRecreate(containerName, _reason, predecessorRecord) {
+            assert.equal(containerName, 'background_container');
+            assert.equal(predecessorRecord.instanceId, 'old-instance');
+            assert.equal(predecessorRecord.enableGeneration, 'old-enable');
+            assert.equal(predecessorRecord.projectPath, tempDir);
+            assert.notEqual(predecessorRecord, registry[containerName]);
             events.push(`removed:${containerName}`);
         },
         uuid: (() => {

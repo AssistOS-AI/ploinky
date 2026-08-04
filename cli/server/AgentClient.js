@@ -2,6 +2,7 @@
 // Not a class; exposes factory returning concrete methods for MCP interactions.
 
 import { client as mcpClient, StreamableHTTPClientTransport } from 'mcp-sdk';
+import { createLeaseCommittedAgent, createRootAgentFetch } from './rootAgentDial.js';
 const { Client } = mcpClient;
 
 function parsePositiveInt(value, fallback) {
@@ -19,25 +20,27 @@ const DEFAULT_REQUEST_TIMEOUT_MS = parsePositiveInt(
 );
 
 function createAgentClient(baseUrl, options = {}) {
+  if (!options?.dialContext || typeof options.dialContext.commit !== 'function') {
+    throw new TypeError('router AgentClient requires a captured root AgentServer dial context');
+  }
   let client = null;
   let transport = null;
   let connected = false;
   const requestHeaders = options && typeof options === 'object' && options.requestHeaders && typeof options.requestHeaders === 'object'
     ? options.requestHeaders
     : null;
-  const beforeConnect = typeof options?.beforeConnect === 'function' ? options.beforeConnect : null;
+  // Streamable HTTP keeps an independently guarded SSE socket open while MCP
+  // requests may run concurrently. A single-socket Agent deadlocks requests
+  // behind the stream; every admitted socket still passes the same guard.
+  const guardedAgent = createLeaseCommittedAgent(options.dialContext, { maxSockets: Infinity });
+  const guardedFetch = createRootAgentFetch(guardedAgent);
   const requestTimeoutMs = parsePositiveInt(options?.requestTimeoutMs, DEFAULT_REQUEST_TIMEOUT_MS);
 
   async function connect() {
     if (connected && client && transport) return;
-    if (beforeConnect && beforeConnect() !== true) {
-      const error = new Error('edge routing generation changed before upstream connection');
-      error.code = 'EDGE_GENERATION_CHANGED';
-      throw error;
-    }
     transport = new StreamableHTTPClientTransport(new URL(baseUrl), requestHeaders
-      ? { requestInit: { headers: requestHeaders } }
-      : undefined);
+      ? { requestInit: { headers: requestHeaders }, fetch: guardedFetch }
+      : { fetch: guardedFetch });
     client = new Client({ name: 'ploinky-router', version: '1.0.0' });
     await client.connect(transport, { timeout: requestTimeoutMs });
     connected = true;
@@ -81,6 +84,7 @@ function createAgentClient(baseUrl, options = {}) {
     try { if (transport?.terminateSession) await transport.terminateSession(); } catch (_) {}
     try { if (client) await client.close(); } catch (_) {}
     try { if (transport) await transport.close?.(); } catch (_) {}
+    try { guardedAgent?.destroy(); } catch (_) {}
     connected = false; client = null; transport = null;
   }
 

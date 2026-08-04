@@ -280,6 +280,12 @@ preclone_manifest_repo "fileExplorer" "https://github.com/AssistOS-AI/AssistOSEx
 preclone_manifest_repo "soplangBuilder" "https://github.com/AssistOS-AI/SOPLangBuilder.git"
 preclone_manifest_repo "webmeet" "https://github.com/AssistOS-AI/webmeet.git"
 
+# These external main-branch manifests are disposable fast-suite fixtures, not
+# selector-authority source checkouts. Keep the two exercised services on the
+# container path so strict true-plus-container admission is tested, not bypassed.
+set_fast_fixture_container_runtime ".ploinky/repos/demo/simulator/manifest.json"
+set_fast_fixture_container_runtime ".ploinky/repos/webmeet/moderator/manifest.json"
+
 # Trim cloned manifests to the minimum dependency surface required by
 # testsAfterStart.sh. Without this, dependency-gated startup (see
 # docs/dependency-gated-startup-implementation.md) cold-installs the entire
@@ -383,13 +389,14 @@ health_agent_container_name=$(compute_container_name "$HEALTH_AGENT_NAME" "$TEST
 write_state_var "TEST_HEALTH_AGENT_CONT_NAME" "$health_agent_container_name"
 test_info "Health probe container will be named: $health_agent_container_name"
 
-workspace_project="$TEST_RUN_DIR/.data/$TEST_AGENT_NAME"
-write_state_var "TEST_AGENT_WORKSPACE" "$workspace_project"
-write_state_var "TEST_PERSIST_FILE" "$workspace_project/data/fast-persist.txt"
-write_state_var "TEST_AGENT_LOG" "$workspace_project/fast-start.log"
-write_state_var "TEST_PERSIST_MARKER" "$workspace_project/data/manual-marker.txt"
+runtime_workspace="$TEST_RUN_DIR"
+agent_dependency_storage="$TEST_RUN_DIR/.data/$TEST_AGENT_NAME"
+write_state_var "TEST_AGENT_WORKSPACE" "$runtime_workspace"
+write_state_var "TEST_PERSIST_FILE" "$runtime_workspace/data/fast-persist.txt"
+write_state_var "TEST_AGENT_LOG" "$runtime_workspace/fast-start.log"
+write_state_var "TEST_PERSIST_MARKER" "$runtime_workspace/data/manual-marker.txt"
 write_state_var "TEST_AGENT_CONTAINER_PORT" "7000"
 
-mkdir -p "$workspace_project/data"
+mkdir -p "$agent_dependency_storage"
 
 test_info "Preparation step complete."

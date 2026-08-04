@@ -1,13 +1,13 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
-import { execFileSync } from 'node:child_process';
 
 import { PLOINKY_DIR } from '../../utils/config.js';
 import { debugLog } from '../../utils/utils.js';
+import { inspectProcessIdentity, normalizeProcessIdentity } from '../processIdentity.js';
 
 const BWRAP_PIDS_DIR = path.join(PLOINKY_DIR, 'bwrap-pids');
-const SANDBOX_OWNER_SCHEMA_VERSION = 3;
+const SANDBOX_OWNER_SCHEMA_VERSION = 5;
 const BWRAP_PID_SCHEMA_VERSION = SANDBOX_OWNER_SCHEMA_VERSION;
 const SANDBOX_OWNER_ROLES = Object.freeze({
     service: 'service',
@@ -18,16 +18,25 @@ const LEGACY_PID_SUFFIX = '.pid';
 const MAX_OWNER_RECORD_BYTES = 16 * 1024;
 const MAX_PATH_BYTES = 4096;
 const MAX_TEXT_BYTES = 512;
+const SHA256_DIGEST_PATTERN = /^sha256:[a-f0-9]{64}$/;
 const OWNER_RECORD_KEYS = Object.freeze([
+    'admissionDigest',
+    'credentialExpiresAt',
+    'credentialNonceDigest',
     'enableGeneration',
     'homeKey',
     'instanceId',
     'logPath',
+    'manifestDigest',
+    'networkHash',
     'ownerKey',
     'pid',
     'processIdentity',
+    'processUid',
     'provider',
     'role',
+    'rootPort',
+    'routeKey',
     'runtimeKey',
     'schemaVersion',
     'taskId',
@@ -90,6 +99,13 @@ function exactAbsolutePath(value, label) {
         throw ownerError(`sandbox owner ${label} must be an exact normalized absolute path`);
     }
     return normalized;
+}
+
+function exactSha256Digest(value, label) {
+    if (typeof value !== 'string' || !SHA256_DIGEST_PATTERN.test(value)) {
+        throw ownerError(`sandbox owner ${label} must be an exact sha256 digest`);
+    }
+    return value;
 }
 
 function ensureOwnerDir() {
@@ -165,7 +181,84 @@ function canonicalOwnerKey({ role, runtimeKey, taskId }) {
         : providerTaskOwnerKey(runtimeKey, taskId);
 }
 
-function normalizeOwnerMetadata(value) {
+function normalizeRoutingAttestation(value, role, {
+    allowUnroutedService = false,
+    requireFuture = false,
+} = {}) {
+    if (role === SANDBOX_OWNER_ROLES.providerTask) {
+        if (value.routeKey !== ''
+            || value.rootPort !== 0
+            || value.credentialNonceDigest !== ''
+            || value.credentialExpiresAt !== 0
+            || value.manifestDigest !== ''
+            || value.admissionDigest !== ''
+            || value.networkHash !== '') {
+            throw ownerError('sandbox provider-task owner must not carry service routing authority');
+        }
+        return Object.freeze({
+            routeKey: '',
+            rootPort: 0,
+            credentialNonceDigest: '',
+            credentialExpiresAt: 0,
+            manifestDigest: '',
+            admissionDigest: '',
+            networkHash: '',
+        });
+    }
+
+    const unroutedService = (value.routeKey === undefined || value.routeKey === '')
+        && (value.rootPort === undefined || value.rootPort === 0)
+        && (value.credentialNonceDigest === undefined || value.credentialNonceDigest === '')
+        && (value.credentialExpiresAt === undefined || value.credentialExpiresAt === 0)
+        && (value.manifestDigest === undefined || value.manifestDigest === '')
+        && (value.admissionDigest === undefined || value.admissionDigest === '')
+        && (value.networkHash === undefined || value.networkHash === '');
+    if (unroutedService && allowUnroutedService) {
+        return Object.freeze({
+            routeKey: '',
+            rootPort: 0,
+            credentialNonceDigest: '',
+            credentialExpiresAt: 0,
+            manifestDigest: '',
+            admissionDigest: '',
+            networkHash: '',
+        });
+    }
+
+    const routeKey = exactText(value.routeKey, 'routeKey', {
+        maxBytes: 255,
+        safeKey: true,
+    });
+    if (routeKey === '.' || routeKey === '..') {
+        throw ownerError('sandbox service owner routeKey is not a safe key');
+    }
+    if (typeof value.rootPort !== 'number'
+        || !Number.isSafeInteger(value.rootPort)
+        || value.rootPort < 1
+        || value.rootPort > 65535) {
+        throw ownerError('sandbox service owner rootPort must be an exact TCP port');
+    }
+    if (typeof value.credentialExpiresAt !== 'number'
+        || !Number.isSafeInteger(value.credentialExpiresAt)
+        || value.credentialExpiresAt <= 0
+        || (requireFuture && value.credentialExpiresAt <= Math.floor(Date.now() / 1000))) {
+        throw ownerError('sandbox service owner credentialExpiresAt must be an exact future timestamp');
+    }
+    return Object.freeze({
+        routeKey,
+        rootPort: value.rootPort,
+        credentialNonceDigest: exactSha256Digest(
+            value.credentialNonceDigest,
+            'credentialNonceDigest',
+        ),
+        credentialExpiresAt: value.credentialExpiresAt,
+        manifestDigest: exactSha256Digest(value.manifestDigest, 'manifestDigest'),
+        admissionDigest: exactSha256Digest(value.admissionDigest, 'admissionDigest'),
+        networkHash: exactSha256Digest(value.networkHash, 'networkHash'),
+    });
+}
+
+function normalizeOwnerMetadata(value, options = {}) {
     if (!isPlainObject(value)) throw ownerError('sandbox owner record must be a plain object');
     const role = normalizeRole(value.role);
     const runtimeKey = normalizeBwrapRuntimeKey(value.runtimeKey);
@@ -192,6 +285,7 @@ function normalizeOwnerMetadata(value) {
     if (value.ownerKey !== undefined && value.ownerKey !== ownerKey) {
         throw ownerError('sandbox ownerKey does not match the canonical role/runtime identity');
     }
+    const routingAttestation = normalizeRoutingAttestation(value, role, options);
     return Object.freeze({
         role,
         runtimeKey,
@@ -202,6 +296,7 @@ function normalizeOwnerMetadata(value) {
         logPath,
         taskId,
         provider,
+        ...routingAttestation,
     });
 }
 
@@ -214,48 +309,21 @@ function legacyPidFile(runtimeKey) {
     return path.join(BWRAP_PIDS_DIR, `${normalizeBwrapRuntimeKey(runtimeKey)}${LEGACY_PID_SUFFIX}`);
 }
 
-function readProcessIdentityInspection(pid) {
-    if (!Number.isSafeInteger(pid) || pid <= 0) return Object.freeze({ state: 'dead' });
-    try {
-        const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
-        const commandEnd = stat.lastIndexOf(')');
-        if (commandEnd < 0) return Object.freeze({ state: 'unknown' });
-        const fields = stat.slice(commandEnd + 1).trim().split(/\s+/);
-        if (fields[0] === 'Z') return Object.freeze({ state: 'dead' });
-        const startTicks = String(fields[19] || '').trim();
-        return startTicks
-            ? Object.freeze({ state: 'identified', processIdentity: `linux-proc:${startTicks}` })
-            : Object.freeze({ state: 'unknown' });
-    } catch (_) {
-        try {
-            const processState = execFileSync('ps', ['-p', String(pid), '-o', 'state=', '-o', 'lstart='], {
-                encoding: 'utf8',
-                stdio: ['ignore', 'pipe', 'ignore'],
-            }).trim().replace(/\s+/g, ' ');
-            const match = processState.match(/^(\S+)\s+(.+)$/);
-            if (match?.[1]?.startsWith('Z')) return Object.freeze({ state: 'dead' });
-            return match
-                ? Object.freeze({ state: 'identified', processIdentity: `ps-lstart:${match[2]}` })
-                : Object.freeze({ state: 'unknown' });
-        } catch (_) {
-            return Object.freeze({ state: 'unknown' });
-        }
-    }
-}
-
-function readProcessIdentity(pid) {
-    const inspection = readProcessIdentityInspection(pid);
-    return inspection.state === 'identified' ? inspection.processIdentity : '';
-}
-
 function inspectSandboxOwnerProcess(record) {
+    const expectedUid = currentProcessUid();
     try {
         process.kill(record.pid, 0);
     } catch (error) {
         if (error?.code !== 'EPERM') return Object.freeze({ state: 'dead' });
     }
-    const identityInspection = readProcessIdentityInspection(record.pid);
+    const identityInspection = inspectProcessIdentity(record.pid);
     if (identityInspection.state === 'dead') return Object.freeze({ state: 'dead' });
+    if (identityInspection.state === 'uid-diverged') {
+        return Object.freeze({
+            state: 'unknown',
+            processUid: identityInspection.processUid,
+        });
+    }
     if (identityInspection.state !== 'identified') {
         try {
             process.kill(record.pid, 0);
@@ -265,9 +333,13 @@ function inspectSandboxOwnerProcess(record) {
         return Object.freeze({ state: 'unknown' });
     }
     const processIdentity = identityInspection.processIdentity;
+    const processUid = identityInspection.processUid;
+    const identityMatches = processIdentity === record.processIdentity;
+    const uidMatches = processUid === record.processUid && record.processUid === expectedUid;
     return Object.freeze({
-        state: processIdentity === record.processIdentity ? 'exact' : 'pid-reused',
+        state: identityMatches ? (uidMatches ? 'exact' : 'unknown') : 'pid-reused',
         processIdentity,
+        processUid,
     });
 }
 
@@ -280,14 +352,26 @@ function validateStoredOwner(parsed, expectedOwnerKey) {
             'PLOINKY_SANDBOX_OWNER_RECORD_INVALID',
         );
     }
-    const metadata = normalizeOwnerMetadata(parsed);
+    const metadata = normalizeOwnerMetadata(parsed, { allowUnroutedService: true });
     const pid = Number(parsed.pid);
-    const processIdentity = exactText(parsed.processIdentity, 'processIdentity');
+    const processUid = Number(parsed.processUid);
+    let processIdentity;
+    try {
+        processIdentity = normalizeProcessIdentity(parsed.processIdentity);
+    } catch (cause) {
+        throw ownerError(
+            `sandbox owner ${expectedOwnerKey} processIdentity is invalid: ${cause?.message || cause}`,
+            'PLOINKY_SANDBOX_OWNER_RECORD_INVALID',
+        );
+    }
     if (metadata.ownerKey !== expectedOwnerKey
         || parsed.ownerKey !== expectedOwnerKey
         || typeof parsed.pid !== 'number'
         || !Number.isSafeInteger(pid)
-        || pid <= 0) {
+        || pid <= 0
+        || typeof parsed.processUid !== 'number'
+        || !Number.isSafeInteger(processUid)
+        || processUid < 0) {
         throw ownerError(
             `sandbox owner ${expectedOwnerKey} record does not match its exact authority key`,
             'PLOINKY_SANDBOX_OWNER_RECORD_INVALID',
@@ -297,6 +381,7 @@ function validateStoredOwner(parsed, expectedOwnerKey) {
         schemaVersion: SANDBOX_OWNER_SCHEMA_VERSION,
         ...metadata,
         pid,
+        processUid,
         processIdentity,
     });
 }
@@ -517,7 +602,26 @@ function ownerMatchesExpected(record, expected) {
     const identity = normalizeSandboxRuntimeIdentity(expected);
     if (record.instanceId !== identity.instanceId
         || record.enableGeneration !== identity.enableGeneration) return false;
-    for (const field of ['role', 'runtimeKey', 'ownerKey', 'homeKey', 'workdir', 'logPath', 'taskId', 'provider']) {
+    for (const field of [
+        'role',
+        'runtimeKey',
+        'ownerKey',
+        'homeKey',
+        'workdir',
+        'logPath',
+        'taskId',
+        'provider',
+        'pid',
+        'processIdentity',
+        'processUid',
+        'routeKey',
+        'rootPort',
+        'credentialNonceDigest',
+        'credentialExpiresAt',
+        'manifestDigest',
+        'admissionDigest',
+        'networkHash',
+    ]) {
         if (expected[field] !== undefined && expected[field] !== record[field]) return false;
     }
     return true;
@@ -533,6 +637,53 @@ function isExactSandboxOwnerProcess(record) {
         );
     }
     return inspection.state === 'exact';
+}
+
+function normalizeExactServiceOwnerAttestation(expected) {
+    try {
+        if (!isPlainObject(expected)) throw ownerError('expected service owner must be a plain object');
+        const expectedOwnerKey = serviceOwnerKey(expected.runtimeKey);
+        const expectedRecord = validateStoredOwner(expected, expectedOwnerKey);
+        if (expectedRecord.role !== SANDBOX_OWNER_ROLES.service) {
+            throw ownerError('expected owner must be an exact service record');
+        }
+        return expectedRecord;
+    } catch (cause) {
+        throw ownerError(
+            `exact service owner expectation is invalid: ${cause?.message || cause}`,
+            'PLOINKY_SANDBOX_OWNER_ATTESTATION_MISMATCH',
+        );
+    }
+}
+
+function assertExactServiceOwner(expected, { now = Math.floor(Date.now() / 1000) } = {}) {
+    const expectedRecord = normalizeExactServiceOwnerAttestation(expected);
+    if (!Number.isSafeInteger(now) || now < 0) {
+        throw ownerError(
+            'exact service owner verification time is invalid',
+            'PLOINKY_SANDBOX_OWNER_ATTESTATION_MISMATCH',
+        );
+    }
+    const record = readServiceOwner(expectedRecord.runtimeKey);
+    if (!record || !sameOwnerRecord(record, expectedRecord)) {
+        throw ownerError(
+            `sandbox service owner ${expectedRecord.ownerKey} does not match its immutable attestation`,
+            'PLOINKY_SANDBOX_OWNER_ATTESTATION_MISMATCH',
+        );
+    }
+    if (record.credentialExpiresAt <= now) {
+        throw ownerError(
+            `sandbox service owner ${record.ownerKey} credential attestation expired`,
+            'PLOINKY_SANDBOX_OWNER_ATTESTATION_EXPIRED',
+        );
+    }
+    if (!isExactSandboxOwnerProcess(record)) {
+        throw ownerError(
+            `sandbox service owner ${record.ownerKey} process no longer matches its immutable attestation`,
+            'PLOINKY_SANDBOX_OWNER_ATTESTATION_MISMATCH',
+        );
+    }
+    return record;
 }
 
 function clearOwnerIfExact(record) {
@@ -630,21 +781,29 @@ function publishOwnerRecord(record) {
     }
 }
 
-function saveSandboxOwner(value) {
+function saveSandboxOwner(value, { allowUnroutedService = false } = {}) {
     assertOwnerDirectoryCurrent();
-    const metadata = normalizeOwnerMetadata(value);
+    const metadata = normalizeOwnerMetadata(value, {
+        allowUnroutedService,
+        requireFuture: true,
+    });
     const pid = Number(value.pid);
-    const processIdentity = readProcessIdentity(pid);
+    const processUid = currentProcessUid();
+    const processInspection = inspectProcessIdentity(pid);
+    const processIdentity = processInspection.processIdentity || '';
     if (typeof value.pid !== 'number'
         || !Number.isSafeInteger(pid)
         || pid <= 0
+        || processInspection.state !== 'identified'
+        || processInspection.processUid !== processUid
         || !processIdentity) {
-        throw ownerError(`cannot bind sandbox owner ${metadata.ownerKey} to a live process identity`);
+        throw ownerError(`cannot bind sandbox owner ${metadata.ownerKey} to an exact live uid/process identity`);
     }
     const record = Object.freeze({
         schemaVersion: SANDBOX_OWNER_SCHEMA_VERSION,
         ...metadata,
         pid,
+        processUid,
         processIdentity,
     });
     const existing = readOwnerFile(metadata.ownerKey);
@@ -677,6 +836,13 @@ function saveProviderTaskOwner(value) {
         ...value,
         role: SANDBOX_OWNER_ROLES.providerTask,
         ownerKey: providerTaskOwnerKey(value?.runtimeKey, value?.taskId),
+        routeKey: '',
+        rootPort: 0,
+        credentialNonceDigest: '',
+        credentialExpiresAt: 0,
+        manifestDigest: '',
+        admissionDigest: '',
+        networkHash: '',
     });
 }
 
@@ -806,6 +972,25 @@ function assertBwrapPidSlotAvailable(runtimeKey) {
 }
 
 function saveBwrapPid(runtimeKey, pid, runtimeIdentity) {
+    const hasRoutingAttestation = Boolean(runtimeIdentity?.routeKey);
+    if (!hasRoutingAttestation) {
+        return saveSandboxOwner({
+            ...runtimeIdentity,
+            role: SANDBOX_OWNER_ROLES.service,
+            ownerKey: serviceOwnerKey(runtimeKey),
+            runtimeKey,
+            pid,
+            taskId: '',
+            provider: '',
+            routeKey: '',
+            rootPort: 0,
+            credentialNonceDigest: '',
+            credentialExpiresAt: 0,
+            manifestDigest: '',
+            admissionDigest: '',
+            networkHash: '',
+        }, { allowUnroutedService: true });
+    }
     return saveServiceOwner({
         ...runtimeIdentity,
         runtimeKey,
@@ -896,6 +1081,7 @@ export {
     BWRAP_PID_SCHEMA_VERSION,
     SANDBOX_OWNER_ROLES,
     SANDBOX_OWNER_SCHEMA_VERSION,
+    assertExactServiceOwner,
     assertBwrapPidSlotAvailable,
     clearBwrapPid,
     getBwrapPid,
@@ -904,6 +1090,7 @@ export {
     listProviderTaskOwners,
     listSandboxOwners,
     listServiceOwners,
+    normalizeExactServiceOwnerAttestation,
     normalizeBwrapRuntimeKey,
     normalizeSandboxRuntimeIdentity,
     providerTaskOwnerKey,

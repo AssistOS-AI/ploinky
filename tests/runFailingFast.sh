@@ -48,6 +48,17 @@ require_var "TEST_AGENT_NAME"
 require_var "TEST_ROUTER_PORT"
 cd "$TEST_RUN_DIR"
 
+# The full suite runs dependency-workspace startup checks after preparation and
+# before the primary Router owns the fixed local port. Preserve that ordering:
+# a nested workspace must never borrow or tear down another workspace's Router.
+source "$TESTS_DIR/test-functions/workspace_dependency_startup_tests.sh"
+FAST_CHECK_ERRORS=0
+stage_header "Workspace dependency startup"
+test_check "Recursive dependency graph waits wave-by-wave before starting dependents" \
+  fast_test_recursive_dependency_graph_startup
+test_check "Dependency readiness.protocol override applies to dependency startup gating" \
+  fast_test_dependency_readiness_protocol_override
+
 # ---- Stage: Start workspace + demo ----
 stage_header "START STAGE"
 bash "$TESTS_DIR/doStart.sh" "$TEST_AGENT_NAME" "$TEST_ROUTER_PORT"
@@ -58,7 +69,6 @@ source "$TESTS_DIR/test-functions/check_preinstall_run.sh"
 source "$TESTS_DIR/test-functions/routingserver_aggregation_test.sh"
 source "$TESTS_DIR/test-functions/router_static_assets.sh"
 source "$TESTS_DIR/test-functions/volume_mount_tests.sh"
-source "$TESTS_DIR/test-functions/workspace_dependency_startup_tests.sh"
 source "$TESTS_DIR/test-functions/install_command_verification.sh"
 source "$TESTS_DIR/test-functions/agent_blob_upload_and_download.sh"
 source "$TESTS_DIR/test-functions/demo_agent_dir_perm.sh"
@@ -78,8 +88,6 @@ EXPLORER_CONTAINER=$(compute_container_name "explorer" "fileExplorer")
 MODERATOR_CONTAINER=$(compute_container_name "moderator" "webmeet")
 test_start_result_file="$TEST_AGENT_WORKSPACE/start-result"
 
-FAST_CHECK_ERRORS=0
-
 # ---- Failures observed in lastRun.results from the most recent test_all.sh run ----
 stage_header "Demo dependency cascade"
 test_check "Moderator container is running" assert_container_running "$MODERATOR_CONTAINER"
@@ -92,12 +100,6 @@ stage_header "Router & manifest"
 test_check "Router serves configured static asset" fast_assert_router_static_asset
 test_check "Custom volume mount exposes marker" fast_assert_volume_mount
 test_check "Manifest defined ports map correctly" fast_assert_manifest_ports
-
-stage_header "Workspace dependency startup"
-test_check "Recursive dependency graph waits wave-by-wave before starting dependents" \
-  fast_test_recursive_dependency_graph_startup
-test_check "Dependency readiness.protocol override applies to dependency startup gating" \
-  fast_test_dependency_readiness_protocol_override
 
 stage_header "Start command artifacts"
 test_check "Start command creates start-result file" assert_file_exists "$test_start_result_file"

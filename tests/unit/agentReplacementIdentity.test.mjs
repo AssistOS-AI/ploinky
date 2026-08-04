@@ -2,6 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import { signPrivateRouterAssertion } from '../../Agent/lib/agentAssertion.mjs';
+import { __testables as credentialContextTestables } from '../../Agent/lib/agentCredentialContext.mjs';
+import { computeAgentCredentialAdmissionDigest } from '../../Agent/lib/agentCredentialDescriptor.mjs';
 import { createMemoryReplayCache } from '../../Agent/lib/jwtVerify.mjs';
 import { authorizePrivateRoutePlan } from '../../cli/server/privateRouter.js';
 import {
@@ -23,6 +25,49 @@ const oldIdentity = Object.freeze({
     enableGeneration: 'enable-old',
     routeKey: 'caller',
 });
+
+function oldBwrapCredentialContext() {
+    const issuedAt = Math.floor(Date.now() / 1000) - 1;
+    const admission = {
+        runtimeKind: 'bwrap',
+        manifestDigest: `sha256:${'1'.repeat(64)}`,
+        capabilityDigest: `sha256:${'2'.repeat(64)}`,
+        networkHash: `sha256:${'3'.repeat(64)}`,
+    };
+    const descriptor = {
+        schemaVersion: 1,
+        principalId: oldIdentity.agentId,
+        instanceId: oldIdentity.instanceId,
+        enableGeneration: oldIdentity.enableGeneration,
+        runtimeKey: 'runtime-old',
+        routeKey: oldIdentity.routeKey,
+        router: {
+            physicalOrigin: 'http://127.0.0.1:8080',
+            requestAuthority: '127.0.0.1:8080',
+            host: '127.0.0.1',
+            port: 8080,
+        },
+        admission,
+        admissionDigest: computeAgentCredentialAdmissionDigest(admission),
+        nonce: Buffer.alloc(32, 4).toString('base64url'),
+        issuedAt,
+        expiresAt: issuedAt + 86400,
+        credentials: {
+            agentSecret: 'a'.repeat(64),
+            privateSecret: derivePrivateAgentRequestSecret(
+                oldIdentity.agentId,
+                oldIdentity.instanceId,
+                oldIdentity.enableGeneration,
+            ),
+            apiKey: `${oldIdentity.agentId}|fixture`,
+            apiPublicKey: Buffer.alloc(32, 5).toString('base64url'),
+        },
+    };
+    return credentialContextTestables.createBwrapContextFromRead({
+        descriptor,
+        publicAttestation: {},
+    });
+}
 
 function existingRecord() {
     return {
@@ -126,16 +171,7 @@ test('an assertion from the predecessor tuple is stale after coordinated replace
         method: 'POST',
         path: pathname,
         body,
-        env: {
-            PLOINKY_AGENT_ID: oldIdentity.agentId,
-            PLOINKY_AGENT_INSTANCE_ID: oldIdentity.instanceId,
-            PLOINKY_AGENT_ENABLE_GENERATION: oldIdentity.enableGeneration,
-            PLOINKY_AGENT_PRIVATE_SECRET: derivePrivateAgentRequestSecret(
-                oldIdentity.agentId,
-                oldIdentity.instanceId,
-                oldIdentity.enableGeneration,
-            ),
-        },
+        credentialContext: oldBwrapCredentialContext(),
     });
     const plan = {
         ok: true,

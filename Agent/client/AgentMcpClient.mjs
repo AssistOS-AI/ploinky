@@ -1,7 +1,7 @@
 // AgentMcpClient: lets an agent call another agent's tools THROUGH the router.
 //
 // Agent-to-agent is always router-mediated (DS013): the source agent signs a
-// per-call Agent Assertion with its OWN PLOINKY_AGENT_SECRET, posts a direct
+// per-call Agent Assertion with the source's explicit credential context, posts a direct
 // JSON-RPC tools/call to the router at /<target>/mcp with the assertion as
 // `Authorization: Bearer`, and the router verifies the assertion, applies MCP
 // policy, and mints a Router Request for the target. There is no shared key and
@@ -11,17 +11,65 @@ import http from 'node:http';
 import https from 'node:https';
 
 import { signAgentAssertion, signAgentHttpAssertion } from '../lib/agentAssertion.mjs';
+import { assertAgentCredentialContext } from '../lib/agentCredentialContext.mjs';
 import { OPENAI_MODELS_PATH, OPENAI_MODELS_TOOL } from '../lib/invocationAuth.mjs';
 import {
     assertVerifiedGeneratedRouterDescriptor,
-    loadVerifiedGeneratedRouterDescriptor,
     resolveGeneratedRouterOperation,
 } from './generatedRouterDescriptor.mjs';
 
 function trustedDescriptor(descriptor) {
-    return descriptor === undefined
-        ? loadVerifiedGeneratedRouterDescriptor()
-        : assertVerifiedGeneratedRouterDescriptor(descriptor);
+    return assertVerifiedGeneratedRouterDescriptor(descriptor);
+}
+
+const CLIENT_TOPOLOGIES = new WeakSet();
+
+function trustedClientTopology(descriptor, credentialContext) {
+    const context = assertAgentCredentialContext(credentialContext);
+    context.assertActive();
+    let verifiedDescriptor = null;
+    if (context.source === 'bwrap-credential-v1') {
+        if (descriptor !== undefined) {
+            throw new Error('AgentMcpClient: bwrap topology comes only from the credential context');
+        }
+    } else if (context.source === 'container-generated-env-v1') {
+        if (descriptor === undefined) {
+            throw new Error('AgentMcpClient: container clients require an explicit verified Router descriptor');
+        }
+        verifiedDescriptor = trustedDescriptor(descriptor);
+        if (verifiedDescriptor.physicalOrigin !== context.router.physicalOrigin
+            || verifiedDescriptor.requestAuthority !== context.router.requestAuthority) {
+            throw new Error('AgentMcpClient: Router descriptor does not match the credential context');
+        }
+    } else {
+        throw new Error('AgentMcpClient: credential context source is unsupported');
+    }
+    const topology = Object.freeze({
+        physicalOrigin: context.router.physicalOrigin,
+        requestAuthority: context.router.requestAuthority,
+        descriptor: verifiedDescriptor,
+    });
+    CLIENT_TOPOLOGIES.add(topology);
+    return topology;
+}
+
+function resolveClientRouterOperation(topology, absolutePath) {
+    if (!topology || !CLIENT_TOPOLOGIES.has(topology)) {
+        throw new Error('AgentMcpClient: trusted Router topology is required');
+    }
+    if (topology.descriptor) {
+        return resolveGeneratedRouterOperation(topology.descriptor, absolutePath);
+    }
+    if (typeof absolutePath !== 'string' || !absolutePath.startsWith('/')
+        || absolutePath.includes('?') || absolutePath.includes('#') || absolutePath.includes('\\')) {
+        throw new Error('AgentMcpClient: Router operation path must be an exact absolute path');
+    }
+    const url = new URL(absolutePath, topology.physicalOrigin);
+    if (url.origin !== topology.physicalOrigin || url.pathname !== absolutePath
+        || url.search || url.hash || url.username || url.password) {
+        throw new Error('AgentMcpClient: Router operation escaped its credential-bound origin');
+    }
+    return url;
 }
 
 function normalizeAgentName(agentName) {
@@ -106,6 +154,7 @@ async function applyTaskObserver({
     metadata,
     descriptor,
     descriptorProvider,
+    credentialContext,
 }) {
     if (typeof taskObserver !== 'function') return null;
     const observation = await taskObserver({
@@ -118,6 +167,7 @@ async function applyTaskObserver({
             agentName,
             taskId,
             typeof descriptorProvider === 'function' ? descriptorProvider() : descriptor,
+            credentialContext,
         ),
     });
     if (observation?.detached !== true) return null;
@@ -148,8 +198,8 @@ function sleep(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function marketplaceUrl(descriptor) {
-    return resolveGeneratedRouterOperation(trustedDescriptor(descriptor), MARKETPLACE_PATH);
+function marketplaceUrl(topology) {
+    return resolveClientRouterOperation(topology, MARKETPLACE_PATH);
 }
 
 function marketplaceToolForRequest(method, body) {
@@ -158,8 +208,8 @@ function marketplaceToolForRequest(method, body) {
         : MARKETPLACE_READ_TOOL;
 }
 
-function requestMarketplace(method = 'GET', body = null, descriptor) {
-    const verified = trustedDescriptor(descriptor);
+function requestMarketplace(method = 'GET', body = null, descriptor, credentialContext) {
+    const verified = trustedClientTopology(descriptor, credentialContext);
     const url = marketplaceUrl(verified);
     const httpModule = url.protocol === 'https:' ? https : http;
     const payload = body ? Buffer.from(JSON.stringify(body), 'utf8') : Buffer.alloc(0);
@@ -171,6 +221,7 @@ function requestMarketplace(method = 'GET', body = null, descriptor) {
         body: payload,
         targetAgent: MARKETPLACE_TARGET,
         tool,
+        credentialContext,
     });
 
     return new Promise((resolve, reject) => {
@@ -180,7 +231,7 @@ function requestMarketplace(method = 'GET', body = null, descriptor) {
             path: MARKETPLACE_PATH,
             method,
             headers: {
-                host: getRouterAuthority(verified),
+                host: verified.requestAuthority,
                 accept: 'application/json',
                 authorization: `Bearer ${assertion}`,
                 ...(payload.length ? {
@@ -235,42 +286,42 @@ function findMarketplaceAgent(marketplace, agentRef) {
     return null;
 }
 
-export async function getAgentStatus(agentRef, descriptor) {
-    const verified = trustedDescriptor(descriptor);
-    const marketplace = await requestMarketplace('GET', null, verified);
+export async function getAgentStatus(agentRef, { descriptor, credentialContext } = {}) {
+    trustedClientTopology(descriptor, credentialContext);
+    const marketplace = await requestMarketplace('GET', null, descriptor, credentialContext);
     return findMarketplaceAgent(marketplace, agentRef);
 }
 
-export async function ensureAgentRunning(agentRef, options = {}, descriptor) {
-    const verified = trustedDescriptor(descriptor);
-    const initial = await getAgentStatus(agentRef, verified);
+export async function ensureAgentRunning(agentRef, { descriptor, credentialContext, mode, timeoutMs: requestedTimeoutMs } = {}) {
+    trustedClientTopology(descriptor, credentialContext);
+    const initial = await getAgentStatus(agentRef, { descriptor, credentialContext });
     if (!initial) {
         throw new Error(`AgentMcpClient: agent '${agentRef}' is not installed`);
     }
     if (initial.running === true) return initial;
 
-    const mode = typeof options.mode === 'string' ? options.mode.trim() : '';
+    const normalizedMode = typeof mode === 'string' ? mode.trim() : '';
     const marketplace = await requestMarketplace('POST', {
         action: 'enable_agent',
         agentRef: initial.ref,
-        ...(mode ? { mode } : {}),
-    }, verified);
+        ...(normalizedMode ? { mode: normalizedMode } : {}),
+    }, descriptor, credentialContext);
     const enabled = findMarketplaceAgent(marketplace, initial.ref);
     if (enabled?.running === true) return enabled;
 
-    const timeoutMs = Math.max(1000, Number(options.timeoutMs) || DEFAULT_AGENT_START_TIMEOUT_MS);
+    const timeoutMs = Math.max(1000, Number(requestedTimeoutMs) || DEFAULT_AGENT_START_TIMEOUT_MS);
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
         await sleep(AGENT_START_POLL_INTERVAL_MS);
-        const status = await getAgentStatus(initial.ref, verified);
+        const status = await getAgentStatus(initial.ref, { descriptor, credentialContext });
         if (status?.running === true) return status;
     }
     throw new Error(`AgentMcpClient: agent '${initial.ref}' did not start within ${timeoutMs}ms`);
 }
 
-function postToolCall(agentName, jsonRpcBody, assertion, userDelegationToken = '', descriptor, timeoutMs = DEFAULT_CALL_TIMEOUT_MS) {
-    const verified = trustedDescriptor(descriptor);
-    const url = resolveGeneratedRouterOperation(verified, `/${normalizeAgentName(agentName)}/mcp`);
+function postToolCall(agentName, jsonRpcBody, assertion, userDelegationToken = '', descriptor, credentialContext, timeoutMs = DEFAULT_CALL_TIMEOUT_MS) {
+    const verified = trustedClientTopology(descriptor, credentialContext);
+    const url = resolveClientRouterOperation(verified, `/${normalizeAgentName(agentName)}/mcp`);
     const httpModule = url.protocol === 'https:' ? https : http;
     const payload = Buffer.from(JSON.stringify(jsonRpcBody), 'utf8');
     const delegationToken = normalizeDelegationToken(userDelegationToken);
@@ -283,7 +334,7 @@ function postToolCall(agentName, jsonRpcBody, assertion, userDelegationToken = '
             path: `${url.pathname}${url.search || ''}`,
             method: 'POST',
             headers: {
-                host: getRouterAuthority(verified),
+                host: verified.requestAuthority,
                 'content-type': 'application/json',
                 'content-length': payload.length,
                 accept: 'application/json',
@@ -309,13 +360,13 @@ function postToolCall(agentName, jsonRpcBody, assertion, userDelegationToken = '
     });
 }
 
-function getTaskStatus(agentName, taskId, descriptor, timeoutMs = DEFAULT_CALL_TIMEOUT_MS) {
-    const verified = trustedDescriptor(descriptor);
+function getTaskStatus(agentName, taskId, descriptor, credentialContext, timeoutMs = DEFAULT_CALL_TIMEOUT_MS) {
+    const verified = trustedClientTopology(descriptor, credentialContext);
     const normalizedTaskId = String(taskId || '').trim();
     if (!normalizedTaskId) {
         throw new Error('AgentMcpClient: taskId is required');
     }
-    const url = resolveGeneratedRouterOperation(verified, `/${normalizeAgentName(agentName)}/task`);
+    const url = resolveClientRouterOperation(verified, `/${normalizeAgentName(agentName)}/task`);
     url.searchParams.set('taskId', normalizedTaskId);
     const httpModule = url.protocol === 'https:' ? https : http;
     const assertion = signAgentAssertion({
@@ -324,6 +375,7 @@ function getTaskStatus(agentName, taskId, descriptor, timeoutMs = DEFAULT_CALL_T
         targetAgent: agentName,
         tool: '__task_status__',
         argumentsObj: { taskId: normalizedTaskId },
+        credentialContext,
     });
     return new Promise((resolve, reject) => {
         let req;
@@ -334,7 +386,7 @@ function getTaskStatus(agentName, taskId, descriptor, timeoutMs = DEFAULT_CALL_T
             path: `${url.pathname}${url.search || ''}`,
             method: 'GET',
             headers: {
-                host: getRouterAuthority(verified),
+                host: verified.requestAuthority,
                 accept: 'application/json',
                 authorization: `Bearer ${assertion}`,
             },
@@ -365,10 +417,10 @@ function getTaskStatus(agentName, taskId, descriptor, timeoutMs = DEFAULT_CALL_T
     });
 }
 
-function getAgentModels(agentName, descriptor, timeoutMs = DEFAULT_CALL_TIMEOUT_MS) {
-    const verified = trustedDescriptor(descriptor);
+function getAgentModels(agentName, descriptor, credentialContext, timeoutMs = DEFAULT_CALL_TIMEOUT_MS) {
+    const verified = trustedClientTopology(descriptor, credentialContext);
     const normalizedAgentName = normalizeAgentName(agentName);
-    const url = resolveGeneratedRouterOperation(verified, `/${normalizedAgentName}${OPENAI_MODELS_PATH}`);
+    const url = resolveClientRouterOperation(verified, `/${normalizedAgentName}${OPENAI_MODELS_PATH}`);
     const httpModule = url.protocol === 'https:' ? https : http;
     const assertion = signAgentHttpAssertion({
         method: 'GET',
@@ -377,6 +429,7 @@ function getAgentModels(agentName, descriptor, timeoutMs = DEFAULT_CALL_TIMEOUT_
         body: Buffer.alloc(0),
         targetAgent: normalizedAgentName,
         tool: OPENAI_MODELS_TOOL,
+        credentialContext,
     });
     return new Promise((resolve, reject) => {
         let req;
@@ -387,7 +440,7 @@ function getAgentModels(agentName, descriptor, timeoutMs = DEFAULT_CALL_TIMEOUT_
             path: `${url.pathname}${url.search || ''}`,
             method: 'GET',
             headers: {
-                host: getRouterAuthority(verified),
+                host: verified.requestAuthority,
                 accept: 'application/json',
                 authorization: `Bearer ${assertion}`,
             },
@@ -415,12 +468,12 @@ function getAgentModels(agentName, descriptor, timeoutMs = DEFAULT_CALL_TIMEOUT_
     });
 }
 
-function cancelTask(agentName, taskId, descriptor) {
-    const verified = trustedDescriptor(descriptor);
+function cancelTask(agentName, taskId, descriptor, credentialContext) {
+    const verified = trustedClientTopology(descriptor, credentialContext);
     const normalizedTaskId = String(taskId || '').trim();
     if (!normalizedTaskId) throw new Error('AgentMcpClient: taskId is required');
     const args = { taskId: normalizedTaskId };
-    const url = resolveGeneratedRouterOperation(verified, `/${normalizeAgentName(agentName)}/task/cancel`);
+    const url = resolveClientRouterOperation(verified, `/${normalizeAgentName(agentName)}/task/cancel`);
     const payload = Buffer.from(JSON.stringify(args), 'utf8');
     const httpModule = url.protocol === 'https:' ? https : http;
     const assertion = signAgentAssertion({
@@ -429,6 +482,7 @@ function cancelTask(agentName, taskId, descriptor) {
         targetAgent: agentName,
         tool: '__task_cancel__',
         argumentsObj: args,
+        credentialContext,
     });
     return new Promise((resolve, reject) => {
         const req = httpModule.request({
@@ -437,7 +491,7 @@ function cancelTask(agentName, taskId, descriptor) {
             path: url.pathname,
             method: 'POST',
             headers: {
-                host: getRouterAuthority(verified),
+                host: verified.requestAuthority,
                 accept: 'application/json',
                 'content-type': 'application/json',
                 'content-length': payload.length,
@@ -550,8 +604,8 @@ function stopAllTaskPollers(taskPollers, reason = new Error('AgentMcpClient: cli
     }
 }
 
-function parseTaskStatusResponse(agentName, taskId, descriptor, timeoutMs) {
-    return getTaskStatus(agentName, taskId, descriptor, timeoutMs)
+function parseTaskStatusResponse(agentName, taskId, descriptor, credentialContext, timeoutMs) {
+    return getTaskStatus(agentName, taskId, descriptor, credentialContext, timeoutMs)
         .then((task) => ({ state: 'ok', task }))
         .catch((error) => {
             if (isTaskNotFoundError(error)) {
@@ -579,6 +633,7 @@ async function pollTaskStatus(taskPollers, agentName, taskId, callback, options 
             agentName,
             taskId,
             requestDescriptor,
+            options.credentialContext,
             Number(options.deadline || 0) > 0 ? Math.max(1, remainingMs) : DEFAULT_CALL_TIMEOUT_MS,
         );
         if (result.state === 'not_found') {
@@ -653,11 +708,11 @@ function startTaskPolling(taskPollers, agentName, taskId, callback, _options = {
 export async function createAgentClient(agentName, options = {}) {
     // Validate provenance before assertion signing can read the agent secret
     // and before a request can construct a socket.
-    const injectedDescriptor = options?.routerDescriptor;
-    const descriptor = trustedDescriptor(injectedDescriptor);
-    const descriptorForRequest = () => injectedDescriptor === undefined
-        ? loadVerifiedGeneratedRouterDescriptor()
-        : descriptor;
+    const credentialContext = assertAgentCredentialContext(options?.credentialContext);
+    credentialContext.assertActive();
+    const injectedDescriptor = options?.descriptor;
+    trustedClientTopology(injectedDescriptor, credentialContext);
+    const descriptorForRequest = () => injectedDescriptor;
     normalizeAgentName(agentName);
     const defaultDelegationToken = normalizeDelegationToken(options?.userDelegationToken);
     const taskPollers = new Map();
@@ -666,7 +721,10 @@ export async function createAgentClient(agentName, options = {}) {
         const timeoutMs = normalizeCallTimeout(callOptions.timeoutMs);
         const deadline = Date.now() + timeoutMs;
         const requestDescriptor = descriptorForRequest();
-        resolveGeneratedRouterOperation(requestDescriptor, `/${normalizeAgentName(agentName)}/mcp`);
+        resolveClientRouterOperation(
+            trustedClientTopology(requestDescriptor, credentialContext),
+            `/${normalizeAgentName(agentName)}/mcp`,
+        );
         const toolArgs = args && typeof args === 'object' && !Array.isArray(args) ? args : {};
         const assertion = signAgentAssertion({
             method: 'POST',
@@ -674,6 +732,7 @@ export async function createAgentClient(agentName, options = {}) {
             targetAgent: agentName,
             tool: name,
             argumentsObj: toolArgs,
+            credentialContext,
         });
         const body = {
             jsonrpc: '2.0',
@@ -690,6 +749,7 @@ export async function createAgentClient(agentName, options = {}) {
             assertion,
             delegationToken,
             requestDescriptor,
+            credentialContext,
             timeoutMs,
         );
         if (json && json.error) {
@@ -764,6 +824,7 @@ export async function createAgentClient(agentName, options = {}) {
                 }
             }, {
                 descriptorProvider: descriptorForRequest,
+                credentialContext,
                 deadline,
                 timeoutMs,
                 onCancel: (error) => finalize(error, true),
@@ -789,6 +850,7 @@ export async function createAgentClient(agentName, options = {}) {
             toolArgs,
             metadata,
             descriptorProvider: descriptorForRequest,
+            credentialContext,
         });
         return observedResult || result;
     }
@@ -800,11 +862,18 @@ export async function createAgentClient(agentName, options = {}) {
     return {
         callTool,
         callToolWithoutWait,
-        getAgentStatus: (agentRef = agentName) => getAgentStatus(agentRef, descriptorForRequest()),
-        ensureAgentRunning: (agentRef = agentName, startOptions = {}) => ensureAgentRunning(agentRef, startOptions, descriptorForRequest()),
-        getTaskStatus: (taskId) => getTaskStatus(agentName, taskId, descriptorForRequest()),
-        getModels: () => getAgentModels(agentName, descriptorForRequest()),
-        cancelTask: (taskId) => cancelTask(agentName, taskId, descriptorForRequest()),
+        getAgentStatus: (agentRef = agentName) => getAgentStatus(agentRef, {
+            descriptor: descriptorForRequest(),
+            credentialContext,
+        }),
+        ensureAgentRunning: (agentRef = agentName, startOptions = {}) => ensureAgentRunning(agentRef, {
+            ...startOptions,
+            descriptor: descriptorForRequest(),
+            credentialContext,
+        }),
+        getTaskStatus: (taskId) => getTaskStatus(agentName, taskId, descriptorForRequest(), credentialContext),
+        getModels: () => getAgentModels(agentName, descriptorForRequest(), credentialContext),
+        cancelTask: (taskId) => cancelTask(agentName, taskId, descriptorForRequest(), credentialContext),
         connect: async () => {},
         listTools: unsupported('listTools'),
         listResources: unsupported('listResources'),

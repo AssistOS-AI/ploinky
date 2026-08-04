@@ -1,5 +1,4 @@
 import http from 'http';
-import net from 'node:net';
 import path from 'node:path';
 import { createHmac, randomUUID } from 'node:crypto';
 
@@ -15,6 +14,12 @@ import { deriveAgentPrincipalId } from '../utils/security/agentIdentity.js';
 import { ROUTING_FILE } from '../utils/config.js';
 import { deriveSubkey } from '../utils/security/masterKey.js';
 import { mintUserDelegationGrant } from './mcp-proxy/userDelegationGrant.js';
+import {
+    createLeaseCommittedAgent,
+    createRootAgentDialContext,
+} from './rootAgentDial.js';
+
+export { createLeaseCommittedAgent } from './rootAgentDial.js';
 
 const ROUTER_PROTOCOL_VERSION = '2025-06-18';
 const ROUTER_SERVER_INFO = { name: 'ploinky-router', version: '1.0.0' };
@@ -28,107 +33,11 @@ export function loadApiRoutes() {
     return loadRoutingConfig().routes || {};
 }
 
-export function buildAgentPath(parsedUrl, includeSearch = true) {
-    if (!parsedUrl || typeof parsedUrl !== 'object') return '/mcp';
-    const pathname = parsedUrl.pathname && parsedUrl.pathname !== '/' ? parsedUrl.pathname : '';
-    const search = includeSearch && parsedUrl.search ? parsedUrl.search : '';
-    return `/mcp${pathname}${search}`;
-}
-
-export function postJsonToAgent(targetPort, payload, res, agentPath, extraHeaders = {}) {
-    try {
-        const data = Buffer.from(JSON.stringify(payload || {}));
-        const opts = {
-            hostname: '127.0.0.1',
-            port: targetPort,
-            path: agentPath && agentPath.length ? agentPath : '/mcp',
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'Content-Length': data.length,
-                ...extraHeaders
-            }
-        };
-        const upstream = http.request(opts, upstreamRes => {
-            res.writeHead(upstreamRes.statusCode || 200, upstreamRes.headers);
-            upstreamRes.pipe(res, { end: true });
-        });
-        upstream.on('error', err => {
-            res.statusCode = 502;
-            res.end(JSON.stringify({ error: 'upstream error', detail: String(err) }));
-        });
-        upstream.end(data);
-    } catch (err) {
-        res.statusCode = 500;
-        res.end(JSON.stringify({ error: 'proxy failure', detail: String(err) }));
-    }
-}
-
-export function proxyMcpPassthrough(req, res, targetPort, agentPath) {
-    const pathWithLeadingSlash = agentPath.startsWith('/') ? agentPath : `/${agentPath}`;
-    const opts = {
-        hostname: '127.0.0.1',
-        port: targetPort,
-        path: pathWithLeadingSlash,
-        method: req.method,
-        headers: {
-            ...req.headers,
-            host: `127.0.0.1:${targetPort}`
-        }
-    };
-
-    const upstream = http.request(opts, upstreamRes => {
-        res.writeHead(upstreamRes.statusCode || 200, upstreamRes.headers);
-        upstreamRes.pipe(res, { end: true });
-    });
-
-    upstream.on('error', err => {
-        if (!res.headersSent) {
-            res.writeHead(502, { 'Content-Type': 'application/json' });
-        }
-        res.end(JSON.stringify({ error: 'upstream error', detail: String(err) }));
-    });
-
-    req.on('aborted', () => {
-        upstream.destroy();
-    });
-
-    req.pipe(upstream, { end: true });
-}
-
 function rejectStaleLease(res) {
     if (!res.headersSent) {
         res.writeHead(503, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
     }
     res.end(JSON.stringify({ error: 'edge_generation_changed' }));
-}
-
-function staleLeaseError(cause = null) {
-    const error = new Error('edge routing generation changed before upstream connection creation', cause ? { cause } : undefined);
-    error.code = 'EDGE_GENERATION_CHANGED';
-    error.statusCode = 503;
-    return error;
-}
-
-export function createLeaseCommittedAgent(beforeDial, { createConnection = net.createConnection } = {}) {
-    if (typeof beforeDial !== 'function') return undefined;
-    const agent = new http.Agent({ keepAlive: false, maxSockets: 1 });
-    agent.createConnection = (options, callback) => {
-        let committed = false;
-        let failure = null;
-        try {
-            committed = beforeDial() === true;
-        } catch (error) {
-            failure = error;
-        }
-        if (!committed) {
-            const error = staleLeaseError(failure);
-            queueMicrotask(() => callback(error));
-            return undefined;
-        }
-        return createConnection(options, callback);
-    };
-    return agent;
 }
 
 function handleProxyError(res, error) {
@@ -142,7 +51,11 @@ function handleProxyError(res, error) {
     res.end(JSON.stringify({ error: 'upstream error', detail: String(error) }));
 }
 
-export function proxyHttpPassthrough(req, res, targetPort, agentPath, extraHeaders = {}, { beforeDial = null } = {}) {
+export function proxyHttpPassthrough(req, res, targetPort, agentPath, extraHeaders = {}, {
+    dialContext = null,
+} = {}) {
+    const guardedAgent = createLeaseCommittedAgent(dialContext);
+    if (!guardedAgent) throw new TypeError('root HTTP proxy requires a captured dial context');
     const pathWithLeadingSlash = agentPath.startsWith('/') ? agentPath : `/${agentPath}`;
     const headers = {
         ...stripRouterIdentityHeaders(req.headers, {
@@ -159,7 +72,7 @@ export function proxyHttpPassthrough(req, res, targetPort, agentPath, extraHeade
         path: pathWithLeadingSlash,
         method: req.method,
         headers,
-        agent: createLeaseCommittedAgent(beforeDial),
+        agent: guardedAgent,
     }, upstreamRes => {
         res.writeHead(upstreamRes.statusCode || 200, upstreamRes.headers);
         upstreamRes.pipe(res, { end: true });
@@ -168,6 +81,7 @@ export function proxyHttpPassthrough(req, res, targetPort, agentPath, extraHeade
     upstream.on('error', err => {
         handleProxyError(res, err);
     });
+    upstream.once('close', () => guardedAgent.destroy());
 
     req.on('aborted', () => {
         upstream.destroy();
@@ -206,7 +120,11 @@ function buildBufferedProxyHeaders(req, targetPort, body, extraHeaders = {}) {
     return headers;
 }
 
-export function proxyHttpBuffered(req, res, targetPort, agentPath, body, extraHeaders = {}, { beforeDial = null } = {}) {
+export function proxyHttpBuffered(req, res, targetPort, agentPath, body, extraHeaders = {}, {
+    dialContext = null,
+} = {}) {
+    const guardedAgent = createLeaseCommittedAgent(dialContext);
+    if (!guardedAgent) throw new TypeError('root buffered HTTP proxy requires a captured dial context');
     const pathWithLeadingSlash = agentPath.startsWith('/') ? agentPath : `/${agentPath}`;
     const upstream = http.request({
         hostname: '127.0.0.1',
@@ -214,7 +132,7 @@ export function proxyHttpBuffered(req, res, targetPort, agentPath, body, extraHe
         path: pathWithLeadingSlash,
         method: req.method,
         headers: buildBufferedProxyHeaders(req, targetPort, body, extraHeaders),
-        agent: createLeaseCommittedAgent(beforeDial),
+        agent: guardedAgent,
     }, upstreamRes => {
         res.writeHead(upstreamRes.statusCode || 200, upstreamRes.headers);
         upstreamRes.pipe(res, { end: true });
@@ -223,6 +141,7 @@ export function proxyHttpBuffered(req, res, targetPort, agentPath, body, extraHe
     upstream.on('error', err => {
         handleProxyError(res, err);
     });
+    upstream.once('close', () => guardedAgent.destroy());
 
     upstream.end(body);
     return upstream;
@@ -540,56 +459,6 @@ export function readHeaderValue(headers = {}, headerName) {
     return typeof lower === 'string' && lower.trim() ? lower.trim() : '';
 }
 
-export function proxyApi(req, res, targetPort, identityHeaders = {}) {
-    const method = (req.method || 'GET').toUpperCase();
-    const parsed = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
-    const includeSearch = method !== 'GET';
-    const agentPath = buildAgentPath(parsed, includeSearch);
-    if (method === 'GET') {
-        // Convert URLSearchParams to plain object
-        const params = {};
-        parsed.searchParams.forEach((value, key) => {
-            params[key] = value;
-        });
-        return postJsonToAgent(targetPort, params, res, agentPath, identityHeaders);
-    }
-
-    const chunks = [];
-    req.on('data', chunk => chunks.push(chunk));
-    req.on('end', () => {
-        const body = Buffer.concat(chunks);
-        const data = body.length ? body : Buffer.from('{}');
-        const opts = {
-            hostname: '127.0.0.1',
-            port: targetPort,
-            path: agentPath,
-            method: method,
-            headers: {
-                'Content-Type': req.headers['content-type'] || 'application/json',
-                'Content-Length': data.length,
-                ...identityHeaders
-            }
-        };
-        const upstream = http.request(opts, upstreamRes => {
-            res.writeHead(upstreamRes.statusCode || 200, upstreamRes.headers);
-            upstreamRes.pipe(res, { end: true });
-        });
-        upstream.on('error', err => {
-            res.statusCode = 502;
-            res.end(JSON.stringify({ error: 'upstream error', detail: String(err) }));
-        });
-        upstream.end(data);
-    });
-    req.on('error', err => {
-        res.statusCode = 500;
-        res.end(JSON.stringify({ error: 'request error', detail: String(err) }));
-    });
-}
-
-function commitAggregateLease(routePlan) {
-    return routePlan?.lease?.commit?.() === true;
-}
-
 export function createAgentRouteEntries(routePlan) {
     const routes = routePlan?.lease?.snapshot?.routing?.routes;
     if (!routes || typeof routes !== 'object') {
@@ -602,15 +471,20 @@ export function createAgentRouteEntries(routePlan) {
     for (const [agentName, route] of Object.entries(routes || {})) {
         if (!route || route.disabled) continue;
         const port = Number(route.hostPort);
-        if (!Number.isFinite(port)) continue;
+        if (!Number.isSafeInteger(port) || port < 1 || port > 65535) continue;
         const baseUrl = `http://127.0.0.1:${port}/mcp`;
-        const beforeConnect = () => commitAggregateLease(routePlan);
+        const dialContext = createRootAgentDialContext({
+            routePlan,
+            routeKey: agentName,
+            route,
+            targetPort: port,
+        });
         entries.push({
             agentName,
             port,
             baseUrl,
-            beforeConnect,
-            client: createAgentClient(baseUrl, { beforeConnect }),
+            dialContext,
+            client: createAgentClient(baseUrl, { dialContext }),
         });
     }
     return entries;
@@ -648,6 +522,27 @@ function annotateResource(resource, agentName) {
         }
     };
     return { ...resource, annotations };
+}
+
+export function pinAggregateAsyncTaskRoute(response, agentName) {
+    if (!response || typeof response !== 'object' || Array.isArray(response)) {
+        return response;
+    }
+    const metadata = response.metadata;
+    const taskId = typeof metadata?.taskId === 'string' ? metadata.taskId.trim() : '';
+    if (!taskId) {
+        return response;
+    }
+    return {
+        ...response,
+        metadata: {
+            ...metadata,
+            // AgentServer reports its canonical runtime identity (for example
+            // `agent:repo/agent`). Browser/CLI task polling must instead use the
+            // exact Router route key captured by this aggregate entry.
+            agent: agentName,
+        },
+    };
 }
 
 function isJsonRpcMessage(payload) {
@@ -793,14 +688,16 @@ function buildToolRequestHeaders(req, agentName, toolName, toolArgs) {
 async function callEntryTool(entry, toolName, args, req) {
     const requestHeaders = buildToolRequestHeaders(req, entry.agentName, toolName, args);
     if (!requestHeaders) {
-        return await entry.client.callTool(toolName, args);
+        const response = await entry.client.callTool(toolName, args);
+        return pinAggregateAsyncTaskRoute(response, entry.agentName);
     }
     const client = createAgentClient(entry.baseUrl, {
         requestHeaders,
-        beforeConnect: entry.beforeConnect,
+        dialContext: entry.dialContext,
     });
     try {
-        return await client.callTool(toolName, args);
+        const response = await client.callTool(toolName, args);
+        return pinAggregateAsyncTaskRoute(response, entry.agentName);
     } finally {
         await client.close().catch(() => {});
     }
@@ -813,7 +710,7 @@ async function readEntryResource(entry, uri, req) {
     }
     const client = createAgentClient(entry.baseUrl, {
         requestHeaders,
-        beforeConnect: entry.beforeConnect,
+        dialContext: entry.dialContext,
     });
     try {
         return await client.readResource(uri);

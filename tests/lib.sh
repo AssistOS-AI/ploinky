@@ -1376,6 +1376,32 @@ preclone_manifest_repo() {
   fi
 }
 
+# Make an external manifest used as fast-suite test data an explicit container
+# fixture. The mutation is confined to the disposable TEST_RUN_DIR checkout;
+# production source manifests and runtime selector behavior remain untouched.
+set_fast_fixture_container_runtime() {
+  local manifest_path="$1"
+  if [[ "$PWD" != "$TEST_RUN_DIR" || "$manifest_path" != .ploinky/repos/* ]]; then
+    echo "Fast-suite fixture mutation must stay inside TEST_RUN_DIR/.ploinky/repos: ${manifest_path}" >&2
+    return 1
+  fi
+  if [[ ! -f "$manifest_path" ]]; then
+    echo "Fast-suite container fixture manifest not found: ${manifest_path}" >&2
+    return 1
+  fi
+  MANIFEST_PATH="$manifest_path" node <<'NODE'
+const fs = require('node:fs');
+const target = process.env.MANIFEST_PATH;
+const manifest = JSON.parse(fs.readFileSync(target, 'utf8'));
+if (typeof manifest.container !== 'string' || !manifest.container.trim()) {
+  throw new Error(`fast-suite fixture must retain an explicit container: ${target}`);
+}
+delete manifest['lite-sandbox'];
+fs.writeFileSync(target, JSON.stringify(manifest, null, 4) + '\n');
+NODE
+  test_info "Container fixture runtime selected for ${manifest_path}."
+}
+
 # Replace the `enable` array of a cloned manifest with the supplied JSON list.
 # Used by the fast suite to keep the dependency-gated startup wave bounded:
 # the demo / explorer / moderator manifests upstream enable a transitive chain

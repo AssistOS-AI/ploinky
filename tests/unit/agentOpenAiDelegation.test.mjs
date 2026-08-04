@@ -9,6 +9,7 @@ import { signHmacJwt } from '../../Agent/lib/jwtSign.mjs';
 import { createMemoryReplayCache } from '../../Agent/lib/jwtVerify.mjs';
 import { computeRchHttp, computeRchTool, sha256RawBodyHash } from '../../Agent/lib/requestHash.mjs';
 import { signAgentAssertion, signAgentHttpAssertion } from '../../Agent/lib/agentAssertion.mjs';
+import { createContainerAgentCredentialContext } from '../../Agent/lib/agentCredentialContext.mjs';
 import {
     verifyRouterRequestFromHeaders,
     verifyOpenAiServiceAuthInfoFromHeaders,
@@ -38,12 +39,14 @@ process.chdir(tempDir);
 process.env.PLOINKY_MASTER_KEY = '7'.repeat(64);
 
 const moduleSuffix = `?test=${Date.now()}-${Math.random()}`;
+const { installGeneratedRouterRuntime } = await import(`../helpers/generatedRouterRuntime.mjs${moduleSuffix}`);
 const {
     isDelegatedAgentOpenAiCall,
     verifyAndMintAgentOpenAiCall,
 } = await import(`../../cli/server/agentOpenAiDelegation.js${moduleSuffix}`);
 const { verifyAgentAssertion } = await import(`../../cli/server/mcp-proxy/invocationMinter.js${moduleSuffix}`);
 const { deriveAgentRequestSecret } = await import(`../../cli/utils/security/masterKey.js${moduleSuffix}`);
+const { createRootAgentDialContext } = await import('../../cli/server/rootAgentDial.js');
 
 const SOURCE_AGENT = 'agent:AssistOSExplorer/soulGateway';
 const TARGET_ROUTE = 'llmAssistant';
@@ -51,13 +54,19 @@ const TARGET_AGENT = 'agent:AssistOSExplorer/llmAssistant';
 const ROUTE = { repo: 'AssistOSExplorer', agent: 'llmAssistant', hostPath: targetAgentDir, hostPort: 7501 };
 const BODY = Buffer.from(JSON.stringify({ model: 'axl/fast', messages: [{ role: 'user', content: 'hi' }] }));
 
-function envFor(agentId) {
-    return { PLOINKY_AGENT_ID: agentId, PLOINKY_AGENT_SECRET: deriveAgentRequestSecret(agentId) };
-}
-
-// The target agent's env: holds ONLY its own per-agent secret + id (DS013).
-function targetEnv() {
-    return { PLOINKY_AGENT_ID: TARGET_AGENT, PLOINKY_AGENT_SECRET: deriveAgentRequestSecret(TARGET_AGENT) };
+function contextFor(agentId) {
+    const runtime = installGeneratedRouterRuntime({
+        origin: 'http://127.0.0.1:8080',
+        publicAuthority: '127.0.0.1:8080',
+        tempDir,
+        agentPrincipal: agentId,
+    });
+    return createContainerAgentCredentialContext({
+        ...runtime.env,
+        PLOINKY_RUNTIME: 'container',
+        PLOINKY_AGENT_SECRET: deriveAgentRequestSecret(agentId),
+        PLOINKY_AGENT_PRIVATE_SECRET: 'b'.repeat(64),
+    });
 }
 
 function makeReq({ method = 'POST', bearer, headers = {} } = {}) {
@@ -89,7 +98,7 @@ test('signAgentHttpAssertion verifies via verifyAgentAssertion with computeRchHt
         body: BODY,
         targetAgent: TARGET_ROUTE,
         tool: OPENAI_TOOL,
-        env: envFor(SOURCE_AGENT),
+        credentialContext: contextFor(SOURCE_AGENT),
     });
     const rch = computeRchHttp({
         method: 'POST',
@@ -120,7 +129,7 @@ test('a computeRchTool assertion is rejected on the HTTP surface (proves body bi
         tool: OPENAI_TOOL,
         argumentsObj: JSON.parse(BODY.toString('utf8')),
         targetAgent: TARGET_ROUTE,
-        env: envFor(SOURCE_AGENT),
+        credentialContext: contextFor(SOURCE_AGENT),
     });
     const httpRch = computeRchHttp({
         method: 'POST',
@@ -148,7 +157,7 @@ test('a computeRchTool assertion is rejected on the HTTP surface (proves body bi
 // ---------------------------------------------------------------------------
 
 test('isDelegatedAgentOpenAiCall is path-exact and method-exact', () => {
-    const bearer = signAgentHttpAssertion({ path: OPENAI_PATH, body: BODY, targetAgent: TARGET_ROUTE, tool: OPENAI_TOOL, env: envFor(SOURCE_AGENT) });
+    const bearer = signAgentHttpAssertion({ path: OPENAI_PATH, body: BODY, targetAgent: TARGET_ROUTE, tool: OPENAI_TOOL, credentialContext: contextFor(SOURCE_AGENT) });
     const baseReq = makeReq({ bearer });
     // Exact match.
     assert.equal(isDelegatedAgentOpenAiCall({ agentName: TARGET_ROUTE, method: 'POST', agentProxyPath: OPENAI_PATH, req: baseReq }), true);
@@ -165,7 +174,7 @@ test('isDelegatedAgentOpenAiCall is path-exact and method-exact', () => {
 });
 
 test('isDelegatedAgentOpenAiCall accepts only exact delegated GET /v1/models', () => {
-    const bearer = signAgentHttpAssertion({ method: 'GET', path: MODELS_PATH, body: Buffer.alloc(0), targetAgent: TARGET_ROUTE, tool: MODELS_TOOL, env: envFor(SOURCE_AGENT) });
+    const bearer = signAgentHttpAssertion({ method: 'GET', path: MODELS_PATH, body: Buffer.alloc(0), targetAgent: TARGET_ROUTE, tool: MODELS_TOOL, credentialContext: contextFor(SOURCE_AGENT) });
     const baseReq = makeReq({ method: 'GET', bearer });
     assert.equal(isDelegatedAgentOpenAiCall({ agentName: TARGET_ROUTE, method: 'GET', agentProxyPath: MODELS_PATH, req: baseReq }), true);
     assert.equal(isDelegatedAgentOpenAiCall({ agentName: TARGET_ROUTE, method: 'GET', agentProxyPath: '/v1/models/x', req: baseReq }), false);
@@ -178,7 +187,7 @@ test('isDelegatedAgentOpenAiCall accepts only exact delegated GET /v1/models', (
 // ---------------------------------------------------------------------------
 
 test('verifyAndMintAgentOpenAiCall accepts a valid assertion and mints a body-bound router token', () => {
-    const bearer = signAgentHttpAssertion({ path: OPENAI_PATH, body: BODY, targetAgent: TARGET_ROUTE, tool: OPENAI_TOOL, env: envFor(SOURCE_AGENT) });
+    const bearer = signAgentHttpAssertion({ path: OPENAI_PATH, body: BODY, targetAgent: TARGET_ROUTE, tool: OPENAI_TOOL, credentialContext: contextFor(SOURCE_AGENT) });
     const result = verifyAndMintAgentOpenAiCall({
         token: bearer,
         routeKey: TARGET_ROUTE,
@@ -197,7 +206,7 @@ test('verifyAndMintAgentOpenAiCall accepts a valid assertion and mints a body-bo
     const expectedRch = computeRchHttp({ method: 'POST', path: OPENAI_PATH, query: '', bodyHash: sha256RawBodyHash(BODY) });
 
     const verified = verifyOpenAiServiceAuthInfoFromHeaders(result.authInfoHeader, {
-        env: targetEnv(),
+        credentialContext: contextFor(TARGET_AGENT),
         replayCache: createMemoryReplayCache(),
         body: BODY,
     });
@@ -212,7 +221,7 @@ test('verifyAndMintAgentOpenAiCall accepts a valid assertion and mints a body-bo
 
 test('verifyAndMintAgentOpenAiCall accepts GET /v1/models and mints a models-bound router token', () => {
     const empty = Buffer.alloc(0);
-    const bearer = signAgentHttpAssertion({ method: 'GET', path: MODELS_PATH, body: empty, targetAgent: TARGET_ROUTE, tool: MODELS_TOOL, env: envFor(SOURCE_AGENT) });
+    const bearer = signAgentHttpAssertion({ method: 'GET', path: MODELS_PATH, body: empty, targetAgent: TARGET_ROUTE, tool: MODELS_TOOL, credentialContext: contextFor(SOURCE_AGENT) });
     const result = verifyAndMintAgentOpenAiCall({
         token: bearer,
         routeKey: TARGET_ROUTE,
@@ -227,7 +236,7 @@ test('verifyAndMintAgentOpenAiCall accepts GET /v1/models and mints a models-bou
     assert.equal(authInfo.invocationBody.bodyHash, sha256RawBodyHash(empty));
 
     const verified = verifyOpenAiModelsAuthInfoFromHeaders(result.authInfoHeader, {
-        env: targetEnv(),
+        credentialContext: contextFor(TARGET_AGENT),
         replayCache: createMemoryReplayCache(),
     });
     assert.equal(verified.ok, true, verified.reason);
@@ -263,7 +272,7 @@ test('verifyAndMintAgentOpenAiCall rejects a wrong-secret (forged) assertion', (
 });
 
 test('verifyAndMintAgentOpenAiCall rejects a body changed after signing (wrong bodyHash)', () => {
-    const bearer = signAgentHttpAssertion({ path: OPENAI_PATH, body: BODY, targetAgent: TARGET_ROUTE, tool: OPENAI_TOOL, env: envFor(SOURCE_AGENT) });
+    const bearer = signAgentHttpAssertion({ path: OPENAI_PATH, body: BODY, targetAgent: TARGET_ROUTE, tool: OPENAI_TOOL, credentialContext: contextFor(SOURCE_AGENT) });
     const tamperedBody = Buffer.from(JSON.stringify({ model: 'axl/fast', messages: [{ role: 'user', content: 'TAMPERED' }] }));
     const result = verifyAndMintAgentOpenAiCall({ token: bearer, routeKey: TARGET_ROUTE, route: ROUTE, body: tamperedBody, replayCache: createMemoryReplayCache() });
     assert.equal(result.ok, false);
@@ -272,21 +281,21 @@ test('verifyAndMintAgentOpenAiCall rejects a body changed after signing (wrong b
 
 test('verifyAndMintAgentOpenAiCall rejects an assertion bound to a different target agent', () => {
     // Source signs for a DIFFERENT route; router resolves THIS route's principal.
-    const bearer = signAgentHttpAssertion({ path: OPENAI_PATH, body: BODY, targetAgent: 'someOtherRoute', tool: OPENAI_TOOL, env: envFor(SOURCE_AGENT) });
+    const bearer = signAgentHttpAssertion({ path: OPENAI_PATH, body: BODY, targetAgent: 'someOtherRoute', tool: OPENAI_TOOL, credentialContext: contextFor(SOURCE_AGENT) });
     const result = verifyAndMintAgentOpenAiCall({ token: bearer, routeKey: TARGET_ROUTE, route: ROUTE, body: BODY, replayCache: createMemoryReplayCache() });
     assert.equal(result.ok, false);
     assert.equal(result.status, 401);
 });
 
 test('verifyAndMintAgentOpenAiCall rejects an assertion signed for the wrong path', () => {
-    const bearer = signAgentHttpAssertion({ path: '/v1/embeddings', body: BODY, targetAgent: TARGET_ROUTE, tool: OPENAI_TOOL, env: envFor(SOURCE_AGENT) });
+    const bearer = signAgentHttpAssertion({ path: '/v1/embeddings', body: BODY, targetAgent: TARGET_ROUTE, tool: OPENAI_TOOL, credentialContext: contextFor(SOURCE_AGENT) });
     const result = verifyAndMintAgentOpenAiCall({ token: bearer, routeKey: TARGET_ROUTE, route: ROUTE, body: BODY, replayCache: createMemoryReplayCache() });
     assert.equal(result.ok, false);
     assert.equal(result.status, 401);
 });
 
 test('verifyAndMintAgentOpenAiCall rejects a replayed assertion jti (shared cache)', () => {
-    const bearer = signAgentHttpAssertion({ path: OPENAI_PATH, body: BODY, targetAgent: TARGET_ROUTE, tool: OPENAI_TOOL, env: envFor(SOURCE_AGENT) });
+    const bearer = signAgentHttpAssertion({ path: OPENAI_PATH, body: BODY, targetAgent: TARGET_ROUTE, tool: OPENAI_TOOL, credentialContext: contextFor(SOURCE_AGENT) });
     const replayCache = createMemoryReplayCache();
     const first = verifyAndMintAgentOpenAiCall({ token: bearer, routeKey: TARGET_ROUTE, route: ROUTE, body: BODY, replayCache });
     assert.equal(first.ok, true, first.error);
@@ -296,7 +305,7 @@ test('verifyAndMintAgentOpenAiCall rejects a replayed assertion jti (shared cach
 });
 
 test('verifyAndMintAgentOpenAiCall fails closed when the route principal cannot be resolved', () => {
-    const bearer = signAgentHttpAssertion({ path: OPENAI_PATH, body: BODY, targetAgent: TARGET_ROUTE, tool: OPENAI_TOOL, env: envFor(SOURCE_AGENT) });
+    const bearer = signAgentHttpAssertion({ path: OPENAI_PATH, body: BODY, targetAgent: TARGET_ROUTE, tool: OPENAI_TOOL, credentialContext: contextFor(SOURCE_AGENT) });
     const result = verifyAndMintAgentOpenAiCall({ token: bearer, routeKey: 'orphan', route: { hostPort: 7777 }, body: BODY, replayCache: createMemoryReplayCache() });
     assert.equal(result.ok, false);
     assert.equal(result.status, 404);
@@ -308,12 +317,12 @@ test('verifyAndMintAgentOpenAiCall fails closed when the route principal cannot 
 // ---------------------------------------------------------------------------
 
 test('the minted router token is rejected when the agent recomputes a different body hash', () => {
-    const bearer = signAgentHttpAssertion({ path: OPENAI_PATH, body: BODY, targetAgent: TARGET_ROUTE, tool: OPENAI_TOOL, env: envFor(SOURCE_AGENT) });
+    const bearer = signAgentHttpAssertion({ path: OPENAI_PATH, body: BODY, targetAgent: TARGET_ROUTE, tool: OPENAI_TOOL, credentialContext: contextFor(SOURCE_AGENT) });
     const result = verifyAndMintAgentOpenAiCall({ token: bearer, routeKey: TARGET_ROUTE, route: ROUTE, body: BODY, replayCache: createMemoryReplayCache() });
     assert.equal(result.ok, true, result.error);
 
     const verified = verifyOpenAiServiceAuthInfoFromHeaders(result.authInfoHeader, {
-        env: targetEnv(),
+        credentialContext: contextFor(TARGET_AGENT),
         replayCache: createMemoryReplayCache(),
         body: Buffer.from(JSON.stringify({ model: 'axl/fast', messages: [{ role: 'user', content: 'different' }] })),
     });
@@ -322,14 +331,14 @@ test('the minted router token is rejected when the agent recomputes a different 
 });
 
 test('the minted router token is rejected by the MCP/tool router-request verifier (tool mismatch)', () => {
-    const bearer = signAgentHttpAssertion({ path: OPENAI_PATH, body: BODY, targetAgent: TARGET_ROUTE, tool: OPENAI_TOOL, env: envFor(SOURCE_AGENT) });
+    const bearer = signAgentHttpAssertion({ path: OPENAI_PATH, body: BODY, targetAgent: TARGET_ROUTE, tool: OPENAI_TOOL, credentialContext: contextFor(SOURCE_AGENT) });
     const result = verifyAndMintAgentOpenAiCall({ token: bearer, routeKey: TARGET_ROUTE, route: ROUTE, body: BODY, replayCache: createMemoryReplayCache() });
     assert.equal(result.ok, true, result.error);
     const token = JSON.parse(result.authInfoHeader['x-ploinky-auth-info']).invocationToken;
 
     // Try to pass it off as a generic bearer router-request for an MCP tool call.
     const verified = verifyRouterRequestFromHeaders({ authorization: `Bearer ${token}` }, {
-        env: targetEnv(),
+        credentialContext: contextFor(TARGET_AGENT),
         replayCache: createMemoryReplayCache(),
         method: 'POST',
         path: '/mcp',
@@ -346,7 +355,7 @@ test('the minted router token is rejected by the MCP/tool router-request verifie
 
 test('verifyOpenAiServiceAuthInfoFromHeaders rejects an absent token envelope', () => {
     const verified = verifyOpenAiServiceAuthInfoFromHeaders({ 'x-ploinky-auth-info': JSON.stringify({ user: { id: 'x' } }) }, {
-        env: targetEnv(),
+        credentialContext: contextFor(TARGET_AGENT),
         replayCache: createMemoryReplayCache(),
         body: BODY,
     });
@@ -355,13 +364,14 @@ test('verifyOpenAiServiceAuthInfoFromHeaders rejects an absent token envelope', 
 });
 
 test('verifyOpenAiServiceAuthInfoFromHeaders rejects a replayed router token', () => {
-    const bearer = signAgentHttpAssertion({ path: OPENAI_PATH, body: BODY, targetAgent: TARGET_ROUTE, tool: OPENAI_TOOL, env: envFor(SOURCE_AGENT) });
+    const bearer = signAgentHttpAssertion({ path: OPENAI_PATH, body: BODY, targetAgent: TARGET_ROUTE, tool: OPENAI_TOOL, credentialContext: contextFor(SOURCE_AGENT) });
     const result = verifyAndMintAgentOpenAiCall({ token: bearer, routeKey: TARGET_ROUTE, route: ROUTE, body: BODY, replayCache: createMemoryReplayCache() });
     assert.equal(result.ok, true, result.error);
     const replayCache = createMemoryReplayCache();
-    const first = verifyOpenAiServiceAuthInfoFromHeaders(result.authInfoHeader, { env: targetEnv(), replayCache, body: BODY });
+    const credentialContext = contextFor(TARGET_AGENT);
+    const first = verifyOpenAiServiceAuthInfoFromHeaders(result.authInfoHeader, { credentialContext, replayCache, body: BODY });
     assert.equal(first.ok, true, first.reason);
-    const second = verifyOpenAiServiceAuthInfoFromHeaders(result.authInfoHeader, { env: targetEnv(), replayCache, body: BODY });
+    const second = verifyOpenAiServiceAuthInfoFromHeaders(result.authInfoHeader, { credentialContext, replayCache, body: BODY });
     assert.equal(second.ok, false);
     assert.match(second.reason, /already been consumed/);
 });
@@ -372,7 +382,7 @@ test('verifyOpenAiServiceAuthInfoFromHeaders rejects a replayed router token', (
 // ---------------------------------------------------------------------------
 
 test('the minted header set contains only x-ploinky-auth-info and no legacy identity headers', () => {
-    const bearer = signAgentHttpAssertion({ path: OPENAI_PATH, body: BODY, targetAgent: TARGET_ROUTE, tool: OPENAI_TOOL, env: envFor(SOURCE_AGENT) });
+    const bearer = signAgentHttpAssertion({ path: OPENAI_PATH, body: BODY, targetAgent: TARGET_ROUTE, tool: OPENAI_TOOL, credentialContext: contextFor(SOURCE_AGENT) });
     const result = verifyAndMintAgentOpenAiCall({ token: bearer, routeKey: TARGET_ROUTE, route: ROUTE, body: BODY, replayCache: createMemoryReplayCache() });
     assert.equal(result.ok, true, result.error);
     const headerNames = Object.keys(result.authInfoHeader).map((name) => name.toLowerCase());
@@ -402,7 +412,7 @@ test('handleDelegatedAgentOpenAiCall forwards identical bytes the upstream agent
             // The upstream agent recomputes the hash over the EXACT bytes it got
             // and verifies the router-minted token (as AgentServer does).
             upstreamVerified = verifyOpenAiServiceAuthInfoFromHeaders(req.headers, {
-                env: targetEnv(),
+                credentialContext: contextFor(TARGET_AGENT),
                 replayCache: createMemoryReplayCache(),
                 body: rawBody,
             });
@@ -413,12 +423,25 @@ test('handleDelegatedAgentOpenAiCall forwards identical bytes the upstream agent
     const upstreamPort = await new Promise((resolve) => upstream.listen(0, '127.0.0.1', () => resolve(upstream.address().port)));
     t.after(() => new Promise((resolve) => upstream.close(() => resolve())));
 
-    const bearer = signAgentHttpAssertion({ path: OPENAI_PATH, body: BODY, targetAgent: TARGET_ROUTE, tool: OPENAI_TOOL, env: envFor(SOURCE_AGENT) });
+    const bearer = signAgentHttpAssertion({ path: OPENAI_PATH, body: BODY, targetAgent: TARGET_ROUTE, tool: OPENAI_TOOL, credentialContext: contextFor(SOURCE_AGENT) });
 
     // Drive a real router that calls the handler, so body buffering + proxy run
     // over a real socket.
     const router = http.createServer((req, res) => {
-        handleDelegatedAgentOpenAiCall(req, res, { repo: 'AssistOSExplorer', agent: 'llmAssistant', hostPort: upstreamPort }, TARGET_ROUTE, OPENAI_PATH);
+        handleDelegatedAgentOpenAiCall(
+            req,
+            res,
+            { repo: 'AssistOSExplorer', agent: 'llmAssistant', hostPort: upstreamPort },
+            TARGET_ROUTE,
+            OPENAI_PATH,
+            {
+                dialContext: createRootAgentDialContext({
+                    routePlan: { lease: { snapshot: { agents: {} }, commit: () => true } },
+                    route: { hostPort: upstreamPort },
+                    targetPort: upstreamPort,
+                }),
+            },
+        );
     });
     const routerPort = await new Promise((resolve) => router.listen(0, '127.0.0.1', () => resolve(router.address().port)));
     t.after(() => new Promise((resolve) => router.close(() => resolve())));

@@ -7,6 +7,7 @@ import { Readable } from 'node:stream';
 
 import { createMemoryReplayCache } from '../../Agent/lib/jwtVerify.mjs';
 import { signAgentAssertion } from '../../Agent/lib/agentAssertion.mjs';
+import { createContainerAgentCredentialContext } from '../../Agent/lib/agentCredentialContext.mjs';
 import { deriveAgentRequestSecret } from '../../cli/utils/security/masterKey.js';
 import { mintUserDelegationGrant } from '../../cli/server/mcp-proxy/userDelegationGrant.js';
 
@@ -77,6 +78,7 @@ process.env.PLOINKY_WORKSPACE_ROOT = tempDir;
 process.env.PLOINKY_ROUTER_HOST_PORT = '18080';
 
 const moduleSuffix = `?test=${Date.now()}`;
+const { installGeneratedRouterRuntime } = await import(`../helpers/generatedRouterRuntime.mjs${moduleSuffix}`);
 const { applyEdgeRoutingGeneration } = await import(`../../cli/sandbox/edgeGeneration.js${moduleSuffix}`);
 applyEdgeRoutingGeneration({ workspaceRoot: tempDir, reason: 'mcp-delegation-test-fixture' });
 const {
@@ -88,6 +90,7 @@ const {
 } = await import(`../../cli/server/mcp-proxy/index.js${moduleSuffix}`);
 const { deriveSubkey } = await import(`../../cli/utils/security/masterKey.js${moduleSuffix}`);
 const { verifyUserDelegationGrant } = await import(`../../cli/server/mcp-proxy/userDelegationGrant.js${moduleSuffix}`);
+const { createRootAgentDialContext } = await import('../../cli/server/rootAgentDial.js');
 
 const SOURCE_AGENT = 'agent:AssistOSExplorer/onlyOffice';
 const TARGET_ROUTE = 'dpuAgent';
@@ -95,9 +98,22 @@ const TARGET_AGENT = 'agent:AssistOSExplorer/dpuAgent';
 const TOOL = 'dpu_confidential_get';
 const ARGS = { id: 'doc-1' };
 
-function envFor(agentId) {
-    return { PLOINKY_AGENT_ID: agentId, PLOINKY_AGENT_SECRET: deriveAgentRequestSecret(agentId) };
+function credentialContextFor(agentId) {
+    const runtime = installGeneratedRouterRuntime({
+        origin: 'http://127.0.0.1:8080',
+        publicAuthority: '127.0.0.1:8080',
+        tempDir,
+        agentPrincipal: agentId,
+    });
+    return createContainerAgentCredentialContext({
+        ...runtime.env,
+        PLOINKY_RUNTIME: 'container',
+        PLOINKY_AGENT_SECRET: deriveAgentRequestSecret(agentId),
+        PLOINKY_AGENT_PRIVATE_SECRET: 'b'.repeat(64),
+    });
 }
+
+const sourceCredentialContext = credentialContextFor(SOURCE_AGENT);
 
 function makeReq({ assertion, delegationToken }) {
     return {
@@ -115,16 +131,20 @@ function makeJsonRequest({ assertion, body }) {
 }
 
 function makeJsonResponse() {
+    let resolveCompleted;
+    const completed = new Promise((resolve) => { resolveCompleted = resolve; });
     return {
         statusCode: null,
         headers: null,
         body: '',
+        completed,
         writeHead(statusCode, headers) {
             this.statusCode = statusCode;
             this.headers = headers;
         },
         end(chunk = '') {
             this.body += String(chunk);
+            resolveCompleted();
         },
     };
 }
@@ -165,7 +185,7 @@ test('mcp proxy verifies agent assertion before user delegation grant', () => {
         targetAgent: TARGET_ROUTE,
         tool: TOOL,
         argumentsObj: ARGS,
-        env: envFor(SOURCE_AGENT),
+        credentialContext: sourceCredentialContext,
     });
     assert.throws(() => verifyDelegatedAgentToolCall({
         req: makeReq({ assertion, delegationToken }),
@@ -183,7 +203,7 @@ test('mcp proxy mints router request with caller agent and usr user claims', () 
         targetAgent: TARGET_ROUTE,
         tool: TOOL,
         argumentsObj: ARGS,
-        env: envFor(SOURCE_AGENT),
+        credentialContext: sourceCredentialContext,
     });
     const verified = verifyDelegatedAgentToolCall({
         req: makeReq({ assertion, delegationToken }),
@@ -217,7 +237,7 @@ test('mcp proxy mints router request for delegated async task status polling', (
         targetAgent: TARGET_ROUTE,
         tool: '__task_status__',
         argumentsObj: { taskId },
-        env: envFor(SOURCE_AGENT),
+        credentialContext: sourceCredentialContext,
     });
     const verified = verifyDelegatedAgentTaskStatusCall({
         req: makeReq({ assertion }),
@@ -248,7 +268,7 @@ test('mcp proxy rejects delegated async task status polling for a different task
         targetAgent: TARGET_ROUTE,
         tool: '__task_status__',
         argumentsObj: { taskId: 'task-original' },
-        env: envFor(SOURCE_AGENT),
+        credentialContext: sourceCredentialContext,
     });
 
     assert.throws(() => verifyDelegatedAgentTaskStatusCall({
@@ -267,7 +287,7 @@ test('mcp proxy binds delegated task cancellation to the exact task id', () => {
         targetAgent: TARGET_ROUTE,
         tool: '__task_cancel__',
         argumentsObj: { taskId },
-        env: envFor(SOURCE_AGENT),
+        credentialContext: sourceCredentialContext,
     });
     const verified = verifyDelegatedAgentTaskCancelCall({
         req: makeReq({ assertion }),
@@ -296,24 +316,34 @@ test('delegated task cancellation refuses to dial after its edge generation chan
         targetAgent: TARGET_ROUTE,
         tool: '__task_cancel__',
         argumentsObj: { taskId },
-        env: envFor(SOURCE_AGENT),
+        credentialContext: sourceCredentialContext,
     });
     const req = makeJsonRequest({ assertion, body: { taskId } });
     const res = makeJsonResponse();
-    let beforeDialCalls = 0;
+    let commitCalls = 0;
 
     await handleDelegatedAgentTaskCancel({
         req,
         res,
         route: { hostPort: 65535 },
         agentName: TARGET_ROUTE,
-        beforeDial: () => {
-            beforeDialCalls += 1;
-            return false;
-        },
+        dialContext: createRootAgentDialContext({
+            routePlan: {
+                lease: {
+                    snapshot: { agents: {} },
+                    commit: () => {
+                        commitCalls += 1;
+                        return false;
+                    },
+                },
+            },
+            route: { hostPort: 65535 },
+            targetPort: 65535,
+        }),
     });
+    await res.completed;
 
-    assert.equal(beforeDialCalls, 1);
+    assert.equal(commitCalls, 1);
     assert.equal(res.statusCode, 503);
     assert.deepEqual(JSON.parse(res.body), { error: 'edge_generation_changed' });
 });
@@ -324,7 +354,7 @@ test('mcp proxy rejects a valid grant from the wrong source agent', () => {
         targetAgent: TARGET_ROUTE,
         tool: TOOL,
         argumentsObj: ARGS,
-        env: envFor(SOURCE_AGENT),
+        credentialContext: sourceCredentialContext,
     });
     assert.throws(() => verifyDelegatedAgentToolCall({
         req: makeReq({ assertion, delegationToken }),
@@ -342,7 +372,7 @@ test('mcp proxy rejects a grant for the wrong target agent', () => {
         targetAgent: TARGET_ROUTE,
         tool: TOOL,
         argumentsObj: ARGS,
-        env: envFor(SOURCE_AGENT),
+        credentialContext: sourceCredentialContext,
     });
     assert.throws(() => verifyDelegatedAgentToolCall({
         req: makeReq({ assertion, delegationToken }),
@@ -360,14 +390,14 @@ test('mcp proxy reuses one delegation grant across multiple scoped tool calls un
         targetAgent: TARGET_ROUTE,
         tool: TOOL,
         argumentsObj: ARGS,
-        env: envFor(SOURCE_AGENT),
+        credentialContext: sourceCredentialContext,
     });
     const updateArgs = { id: 'doc-1', content: 'updated' };
     const secondAssertion = signAgentAssertion({
         targetAgent: TARGET_ROUTE,
         tool: 'dpu_confidential_update',
         argumentsObj: updateArgs,
-        env: envFor(SOURCE_AGENT),
+        credentialContext: sourceCredentialContext,
     });
     const delegationCache = createMemoryReplayCache();
     const first = verifyDelegatedAgentToolCall({
@@ -395,7 +425,7 @@ test('mcp proxy rejects expired delegation grants', () => {
         targetAgent: TARGET_ROUTE,
         tool: TOOL,
         argumentsObj: ARGS,
-        env: envFor(SOURCE_AGENT),
+        credentialContext: sourceCredentialContext,
     });
     const { token: expiredToken } = mintDelegation({ now: '2026-06-09T10:00:00.000Z', ttlSeconds: 30 });
     assert.throws(() => verifyDelegatedAgentToolCall({

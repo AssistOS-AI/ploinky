@@ -2,7 +2,10 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
+    buildWorkspaceRuntimeRegistry,
+    cleanupWorkspaceRuntimeCandidates,
     reinstallAgent,
+    shouldTrackWorkspaceRuntimeCandidate,
     startWorkspace,
     waitForManifestReadiness,
 } from '../../cli/commands/workspaceUtil.js';
@@ -96,4 +99,56 @@ test('reinstall and workspace restart paths both use the shared blocking readine
     assert.ok(success > activation, 'success must be logged only after generation activation');
     assert.match(reinstallSource, /catch \(e\) \{[\s\S]*?throw e;/);
     assert.match(startWorkspace.toString(), /waitForReadinessEntries/);
+});
+
+test('workspace start tracks exact bwrap candidates without requiring a Docker container id', () => {
+    const bwrapCandidate = {
+        requiresEdgeActivation: true,
+        preparationLease: Object.freeze({ preparedGeneration: 'generation-one' }),
+        containerName: 'bwrap-agent',
+        registryRecord: Object.freeze({
+            runtime: 'bwrap',
+            instanceId: 'instance-one',
+            enableGeneration: 'enable-one',
+        }),
+        cleanupReceipt: Object.freeze({ phase: 'candidate-observed' }),
+    };
+
+    assert.equal(shouldTrackWorkspaceRuntimeCandidate(bwrapCandidate), true);
+    assert.equal(shouldTrackWorkspaceRuntimeCandidate({
+        ...bwrapCandidate,
+        cleanupReceipt: undefined,
+    }), false);
+    assert.match(startWorkspace.toString(), /shouldTrackWorkspaceRuntimeCandidate\(runtimeResult\)/);
+
+    const cleaned = [];
+    const candidates = [bwrapCandidate];
+    cleanupWorkspaceRuntimeCandidates(candidates, new Error('readiness failed'), {
+        cleanupExactAgentRuntimeCandidateImpl(candidate) {
+            cleaned.push(candidate);
+        },
+    });
+    assert.deepEqual(cleaned, [bwrapCandidate]);
+    assert.deepEqual(candidates, []);
+    assert.match(startWorkspace.toString(), /cleanupWorkspaceRuntimeCandidates\(workspaceRuntimeCandidates, e\)/);
+});
+
+test('workspace runtime registry preserves the newly persisted saved-start configuration', () => {
+    const stalePreflightRegistry = {
+        existing_agent: { agentName: 'existing' },
+    };
+    const currentConfig = {
+        static: { agent: 'testAgent', port: 8080 },
+    };
+
+    const runtimeRegistry = buildWorkspaceRuntimeRegistry(stalePreflightRegistry, currentConfig);
+    assert.deepEqual(runtimeRegistry, {
+        ...stalePreflightRegistry,
+        _config: currentConfig,
+    });
+    assert.notEqual(runtimeRegistry._config, currentConfig);
+    assert.match(
+        startWorkspace.toString(),
+        /buildWorkspaceRuntimeRegistry\(lockedStart\.registry, cfg0\)/,
+    );
 });

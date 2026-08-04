@@ -16,6 +16,7 @@ import { getAgentDescriptorByPrincipal } from '../../utils/agentRegistry.js';
 import { policy } from '../policy/index.js';
 import { deriveSubkey } from '../../utils/security/masterKey.js';
 import { verifyUserDelegationGrant } from './userDelegationGrant.js';
+import { createLeaseCommittedAgent } from '../rootAgentDial.js';
 
 const AGENT_PROXY_PROTOCOL_VERSION = '2025-06-18';
 const AGENT_PROXY_SERVER_INFO = { name: 'ploinky-router-proxy', version: '1.0.0' };
@@ -29,6 +30,25 @@ const assertionReplayCache = createTokenReplayCache({ maxSize: 4096 });
 // Session store for agent MCP connections
 const agentSessionStore = new Map();
 const agentToolSchemaCache = new Map();
+
+function requireRootDialAgent(dialContext) {
+    const agent = createLeaseCommittedAgent(dialContext);
+    if (agent) return agent;
+    const error = new Error('captured root AgentServer dial context is required');
+    error.code = 'EDGE_GENERATION_CHANGED';
+    error.status = 503;
+    throw error;
+}
+
+function requireRootDialContext(dialContext) {
+    if (dialContext && typeof dialContext === 'object' && typeof dialContext.commit === 'function') {
+        return dialContext;
+    }
+    const error = new Error('captured root AgentServer dial context is required');
+    error.code = 'EDGE_GENERATION_CHANGED';
+    error.status = 503;
+    throw error;
+}
 
 /**
  * Read MCP session ID from request headers
@@ -137,6 +157,7 @@ export async function invokeAuthenticatedAgentTool({
     agentName,
     toolName,
     arguments: rawArguments = {},
+    dialContext,
 }) {
     const caller = policy.resolveCaller(req);
     if (caller?.kind !== 'user') {
@@ -159,8 +180,9 @@ export async function invokeAuthenticatedAgentTool({
         error.status = 409;
         throw error;
     }
+    requireRootDialContext(dialContext);
     const baseUrl = `http://127.0.0.1:${route.hostPort}/mcp`;
-    const agentClient = createAgentClient(baseUrl);
+    const agentClient = createAgentClient(baseUrl, { dialContext });
     try {
         const args = await canonicalizeToolArguments(agentName, agentClient, toolName, rawArguments);
         const context = buildInvocationContextForProviderCall({
@@ -169,9 +191,12 @@ export async function invokeAuthenticatedAgentTool({
             toolName,
             toolArgs: args,
         });
-        const toolClient = createAgentClient(baseUrl, context?.token
-            ? { requestHeaders: { authorization: `Bearer ${context.token}` } }
-            : undefined);
+        const toolClient = createAgentClient(baseUrl, {
+            dialContext,
+            ...(context?.token
+                ? { requestHeaders: { authorization: `Bearer ${context.token}` } }
+                : {}),
+        });
         try {
             return await toolClient.callTool(toolName, args);
         } finally {
@@ -182,7 +207,7 @@ export async function invokeAuthenticatedAgentTool({
     }
 }
 
-export async function readAuthenticatedAgentTask({ req, route, agentName, taskId }) {
+export async function readAuthenticatedAgentTask({ req, route, agentName, taskId, dialContext }) {
     const caller = policy.resolveCaller(req);
     if (caller?.kind !== 'user') {
         const error = new Error('authenticated_user_required');
@@ -205,6 +230,7 @@ export async function readAuthenticatedAgentTask({ req, route, agentName, taskId
     });
     const url = new URL(`http://127.0.0.1:${route.hostPort}/task`);
     url.searchParams.set('taskId', normalizedTaskId);
+    const dialAgent = requireRootDialAgent(dialContext);
     return await new Promise((resolve, reject) => {
         const request = http.request(url, {
             method: 'GET',
@@ -212,6 +238,7 @@ export async function readAuthenticatedAgentTask({ req, route, agentName, taskId
                 accept: 'application/json',
                 ...(context?.token ? { authorization: `Bearer ${context.token}` } : {}),
             },
+            agent: dialAgent,
         }, (response) => {
             const chunks = [];
             response.on('data', (chunk) => chunks.push(chunk));
@@ -229,11 +256,12 @@ export async function readAuthenticatedAgentTask({ req, route, agentName, taskId
             });
         });
         request.on('error', reject);
+        request.once('close', () => dialAgent.destroy());
         request.end();
     });
 }
 
-export async function cancelAuthenticatedAgentTask({ req, route, agentName, taskId }) {
+export async function cancelAuthenticatedAgentTask({ req, route, agentName, taskId, dialContext }) {
     const caller = policy.resolveCaller(req);
     if (caller?.kind !== 'user') {
         const error = new Error('authenticated_user_required');
@@ -262,6 +290,7 @@ export async function cancelAuthenticatedAgentTask({ req, route, agentName, task
     });
     const payload = Buffer.from(JSON.stringify(args), 'utf8');
     const url = new URL(`http://127.0.0.1:${route.hostPort}${TASK_CANCEL_PATH}`);
+    const dialAgent = requireRootDialAgent(dialContext);
     return await new Promise((resolve, reject) => {
         const request = http.request(url, {
             method: 'POST',
@@ -271,6 +300,7 @@ export async function cancelAuthenticatedAgentTask({ req, route, agentName, task
                 'content-length': payload.length,
                 ...(context?.token ? { authorization: `Bearer ${context.token}` } : {}),
             },
+            agent: dialAgent,
         }, (response) => {
             const chunks = [];
             response.on('data', (chunk) => chunks.push(chunk));
@@ -288,6 +318,7 @@ export async function cancelAuthenticatedAgentTask({ req, route, agentName, task
             });
         });
         request.on('error', reject);
+        request.once('close', () => dialAgent.destroy());
         request.end(payload);
     });
 }
@@ -443,7 +474,7 @@ export async function handleDelegatedAgentTaskCancel({
     res,
     route,
     agentName,
-    beforeDial = null,
+    dialContext = null,
 }) {
     const chunks = [];
     let size = 0;
@@ -477,28 +508,48 @@ export async function handleDelegatedAgentTaskCancel({
             method: 'POST',
             path: TASK_CANCEL_PATH,
         });
-        if (beforeDial && await Promise.resolve(beforeDial()) !== true) {
+        const payload = Buffer.from(JSON.stringify({ taskId }), 'utf8');
+        const agent = createLeaseCommittedAgent(dialContext);
+        if (!agent) {
             sendJson(res, 503, { error: 'edge_generation_changed' });
             return;
         }
-        const payload = Buffer.from(JSON.stringify({ taskId }), 'utf8');
-        const upstream = http.request({
-            hostname: '127.0.0.1',
-            port: route.hostPort,
-            path: TASK_CANCEL_PATH,
-            method: 'POST',
-            headers: {
-                accept: 'application/json',
-                'content-type': 'application/json',
-                'content-length': payload.length,
-                authorization: `Bearer ${context.token}`,
-            },
-        }, (response) => {
-            res.writeHead(response.statusCode || 502, response.headers);
-            response.pipe(res);
+        await new Promise((resolve) => {
+            let settled = false;
+            const finish = () => {
+                if (settled) return;
+                settled = true;
+                resolve();
+            };
+            const upstream = http.request({
+                hostname: '127.0.0.1',
+                port: route.hostPort,
+                path: TASK_CANCEL_PATH,
+                method: 'POST',
+                headers: {
+                    accept: 'application/json',
+                    'content-type': 'application/json',
+                    'content-length': payload.length,
+                    authorization: `Bearer ${context.token}`,
+                },
+                agent,
+            }, (response) => {
+                res.writeHead(response.statusCode || 502, response.headers);
+                response.once('end', finish);
+                response.once('error', finish);
+                response.pipe(res);
+            });
+            upstream.on('error', (error) => {
+                sendJson(
+                    res,
+                    error?.code === 'EDGE_GENERATION_CHANGED' ? 503 : 502,
+                    { error: error?.code === 'EDGE_GENERATION_CHANGED' ? 'edge_generation_changed' : 'task_cancel_upstream_failed' },
+                );
+                finish();
+            });
+            upstream.once('close', () => agent.destroy());
+            upstream.end(payload);
         });
-        upstream.on('error', () => sendJson(res, 502, { error: 'task_cancel_upstream_failed' }));
-        upstream.end(payload);
     } catch (error) {
         sendJson(res, 401, {
             error: 'delegated_task_cancel_rejected',
@@ -510,7 +561,9 @@ export async function handleDelegatedAgentTaskCancel({
 /**
  * Handle JSON-RPC requests to agent MCP endpoints
  */
-async function handleAgentJsonRpc(req, res, route, agentName, payload, { beforeDial = null } = {}) {
+async function handleAgentJsonRpc(req, res, route, agentName, payload, {
+    dialContext = null,
+} = {}) {
     const isBatch = Array.isArray(payload);
     const messages = isBatch ? payload : [payload];
     if (messages.length !== 1) {
@@ -584,7 +637,7 @@ async function handleAgentJsonRpc(req, res, route, agentName, payload, { beforeD
         return null;
     }
 
-    const clientOptions = beforeDial ? { beforeConnect: beforeDial } : undefined;
+    const clientOptions = dialContext ? { dialContext } : undefined;
     const agentClient = createAgentClient(baseUrl, clientOptions);
     try {
         switch (message.method) {
@@ -630,7 +683,7 @@ async function handleAgentJsonRpc(req, res, route, agentName, payload, { beforeD
                 const toolHeaders = buildRequestHeadersForToolCall(name, canonicalArgs);
                 const toolClient = createAgentClient(baseUrl, {
                     ...(toolHeaders ? { requestHeaders: toolHeaders } : {}),
-                    ...(beforeDial ? { beforeConnect: beforeDial } : {}),
+                    ...(dialContext ? { dialContext } : {}),
                 });
 
                 try {
@@ -657,7 +710,7 @@ async function handleAgentJsonRpc(req, res, route, agentName, payload, { beforeD
                 const resourceHeaders = buildRequestHeadersForToolCall('resources/read', { uri });
                 const resourceClient = createAgentClient(baseUrl, {
                     ...(resourceHeaders ? { requestHeaders: resourceHeaders } : {}),
-                    ...(beforeDial ? { beforeConnect: beforeDial } : {}),
+                    ...(dialContext ? { dialContext } : {}),
                 });
                 try {
                     const result = await resourceClient.readResource(uri);
@@ -687,7 +740,7 @@ async function handleAgentJsonRpc(req, res, route, agentName, payload, { beforeD
  * Handle HTTP requests to agent MCP endpoints
  */
 async function handleAgentMcpRequest(req, res, route, agentName, {
-    beforeDial = null,
+    dialContext = null,
     routePlan = null,
 } = {}) {
     const method = (req.method || 'GET').toUpperCase();
@@ -801,11 +854,12 @@ async function handleAgentMcpRequest(req, res, route, agentName, {
             }
         }
 
-        const isReady = await waitForAgentReady(route, {
+        const bwrapRootDial = Boolean(dialContext?.ownerAttestation || dialContext?.invalidOwner);
+        const isReady = bwrapRootDial || await waitForAgentReady(route, {
             timeoutMs: 5000,
             intervalMs: 125,
             probeTimeoutMs: 250,
-            beforeProbe: beforeDial,
+            beforeProbe: dialContext?.commit,
         });
         if (!isReady) {
             if (isJsonRpc) {
@@ -830,7 +884,7 @@ async function handleAgentMcpRequest(req, res, route, agentName, {
 
         try {
             if (isJsonRpc) {
-                await handleAgentJsonRpc(req, res, route, agentName, payload, { beforeDial });
+                await handleAgentJsonRpc(req, res, route, agentName, payload, { dialContext });
                 return;
             }
 

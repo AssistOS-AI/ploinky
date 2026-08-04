@@ -853,9 +853,13 @@ function normalizeTargetedRestart(value) {
     });
 }
 
-export function removeAgentContainerForRecreate(containerName, label = 'executionModeChanged') {
+export function removeAgentContainerForRecreate(
+    containerName,
+    label = 'executionModeChanged',
+    predecessorRecord = null,
+) {
     const runtime = getRuntime();
-    return removeContainerForRecreate(runtime, containerName, label);
+    return removeContainerForRecreate(runtime, containerName, label, predecessorRecord);
 }
 
 function buildPersistentAgentRunArgs({

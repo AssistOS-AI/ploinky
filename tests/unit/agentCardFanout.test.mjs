@@ -3,6 +3,7 @@ import http from 'node:http';
 import test from 'node:test';
 
 import { requestAgentCard } from '../../cli/server/agentCardFanout.js';
+import { createRootAgentDialContext } from '../../cli/server/rootAgentDial.js';
 
 test('public aggregate agent-card fanout strips credentials, identity, forwarding, and hop-by-hop headers on the wire', async (t) => {
     let observed = null;
@@ -38,6 +39,12 @@ test('public aggregate agent-card fanout strips credentials, identity, forwardin
         'x-safe-correlation': 'correlation-1',
         'accept-language': 'en-US',
         'user-agent': 'ploinky-agent-card-test',
+    }, {
+        dialContext: createRootAgentDialContext({
+            routePlan: { lease: { snapshot: { agents: {} }, commit: () => true } },
+            route: { hostPort: port },
+            targetPort: port,
+        }),
     });
 
     assert.equal(result.ok, true);
@@ -70,11 +77,41 @@ test('agent-card fanout revalidates the captured generation immediately before e
         { hostPort: upstream.address().port },
         'alpha',
         {},
-        { beforeDial: () => false },
+        {
+            dialContext: createRootAgentDialContext({
+                routePlan: { lease: { snapshot: { agents: {} }, commit: () => false } },
+                route: { hostPort: upstream.address().port },
+                targetPort: upstream.address().port,
+            }),
+        },
     );
 
     assert.equal(result.ok, false);
     assert.equal(result.generationChanged, true);
     assert.equal(result.error.error, 'edge_generation_changed');
+    assert.equal(connections, 0);
+});
+
+test('agent-card fanout rejects fabricated contexts without falling back to the global agent', async (t) => {
+    let connections = 0;
+    const upstream = http.createServer((_req, res) => {
+        connections += 1;
+        res.end(JSON.stringify({ name: 'must-not-be-reached' }));
+    });
+    await new Promise((resolve) => upstream.listen(0, '127.0.0.1', resolve));
+    t.after(() => new Promise((resolve) => upstream.close(resolve)));
+
+    const result = await requestAgentCard(
+        { hostPort: upstream.address().port },
+        'alpha',
+        {},
+        { dialContext: { targetPort: upstream.address().port, commit: () => true } },
+    );
+
+    assert.deepEqual(result, {
+        ok: false,
+        generationChanged: true,
+        error: { name: 'alpha', error: 'edge_generation_changed' },
+    });
     assert.equal(connections, 0);
 });

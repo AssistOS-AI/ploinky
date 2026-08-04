@@ -124,10 +124,16 @@ test('native trusted AgentServer uses only fd launcher policy and direct HOME', 
             codeDependenciesPath: dependenciesPath,
             agentDependenciesPath: dependenciesPath,
             environment: {
-                HOME: '/home/agent',
-                PORT: String(port),
                 NATIVE_TRUSTED_SENTINEL: 'phase4',
             },
+            identity: {
+                principalId: 'agent:native/trusted-service',
+                instanceId: runtimeKey,
+                enableGeneration: 'native-phase4',
+            },
+            agentName: 'trusted-service',
+            repoName: 'native',
+            listenPort: port,
         });
         const descriptor = encodeBwrapLaunchDescriptor(policy.records);
         const log = fs.openSync(path.join(fixtureRoot, 'trusted-service.log'), 'a');
