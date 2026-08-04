@@ -5,7 +5,9 @@ import test from 'node:test';
 import {
     assertHostSandboxNetworkCompatibility,
     assertNetworkStartupCompatibility,
+    canonicalizeEffectiveNetwork,
     canonicalizeNetwork,
+    deriveHostSandboxNetworkContract,
     deriveNetworkAlias,
     effectiveManifestNetwork,
     logicalNetworkAttachments,
@@ -26,13 +28,15 @@ test('network contract hash hard-cuts to the box host-gateway runtime policy', (
 });
 
 test('host sandboxes fail closed unless the effective network mode is host', () => {
+    const derived = deriveHostSandboxNetworkContract({ 'lite-sandbox': true });
     assert.deepEqual(
-        assertHostSandboxNetworkCompatibility({ mode: 'host' }, { runtime: 'bwrap' }),
-        { mode: 'host' },
+        assertHostSandboxNetworkCompatibility(derived, { runtime: 'bwrap' }),
+        { mode: 'host', source: 'platform-lite-sandbox' },
     );
 
     for (const network of [
         undefined,
+        { mode: 'host' },
         { mode: 'default' },
         { mode: 'none' },
         { mode: 'bridge', attachments: [{ name: 'private', primary: true }] },
@@ -40,7 +44,29 @@ test('host sandboxes fail closed unless the effective network mode is host', () 
         assert.throws(
             () => assertHostSandboxNetworkCompatibility(network, { runtime: 'seatbelt' }),
             (error) => error?.code === 'PLOINKY_NETWORK_CONTRACT_INVALID'
-                && /requires an explicit network\.mode 'host'/.test(error.message),
+                && /requires (?:the platform-derived host network contract|network source)/.test(error.message),
+        );
+    }
+});
+
+test('strict lite-sandbox derives immutable host networking and rejects every declaration surface', () => {
+    const derived = deriveHostSandboxNetworkContract({
+        'lite-sandbox': true,
+        profiles: { default: { env: { SAFE: '1' } } },
+    });
+    assert.equal(Object.isFrozen(derived), true);
+    assert.deepEqual(canonicalizeEffectiveNetwork(derived), derived);
+    assert.notEqual(networkContractHash(derived), networkContractHash({ mode: 'host' }));
+
+    for (const manifest of [
+        { 'lite-sandbox': true, network: { mode: 'host' } },
+        { 'lite-sandbox': true, profiles: { default: { network: { mode: 'host' } } } },
+        { 'lite-sandbox': true, profiles: { unused: { network: { mode: 'none' } } } },
+    ]) {
+        assert.throws(
+            () => deriveHostSandboxNetworkContract(manifest),
+            (error) => error.code === 'PLOINKY_NETWORK_CONTRACT_INVALID'
+                && /forbids .*network declarations/.test(error.message),
         );
     }
 });

@@ -2417,6 +2417,16 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
         error.code = 'PLOINKY_ROUTER_ENDPOINT_REQUIRED';
         throw error;
     }
+    if (!options.networkLifecycleCapability) {
+        return withNetworkLifecycleLock(
+            (networkLifecycleCapability) => ensureAgentService(agentName, manifest, agentPath, {
+                ...options,
+                networkLifecycleCapability,
+            }),
+            { waitMs: Math.max(0, Number(options.networkLockWaitMs || 0)) },
+        );
+    }
+    assertNetworkLifecycleCapability(options.networkLifecycleCapability);
     const preflightRepoName = path.basename(path.dirname(agentPath));
     const preflightManifestPath = path.join(agentPath, 'manifest.json');
     const preflightManifestBytes = fs.existsSync(preflightManifestPath)
@@ -2437,17 +2447,6 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
         profileName: options.profileName,
         persistedProfileName: preflightRecord.profile,
         path: `manifest(${preflightRepoName}/${agentName})`,
-    });
-    // Reject manifest-declared capabilities before even selecting a backend.
-    // A second admission below adds the read-only catalog selection.
-    admitManifestRuntimeCapabilities(manifest, {
-        manifestBytes: preflightManifestBytes,
-        manifestPath: preflightManifestPath,
-        agentId: `${preflightRepoName}/${agentName}`,
-        profileName: preflightProfile.resolvedProfileName,
-        profileConfig: preflightProfile.profileConfig,
-        network: preflightProfile.network,
-        runtimeKind: 'container',
     });
     const preflightAgentRuntime = getRuntimeForAgent(manifest);
     const preflightRuntimeKind = isSandboxRuntime(preflightAgentRuntime)
@@ -2484,17 +2483,6 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
         });
     }
     const targetedRestart = normalizeTargetedRestart(options.targetedRestart);
-    if (!options.networkLifecycleCapability) {
-        return withNetworkLifecycleLock(
-            (networkLifecycleCapability) => ensureAgentService(agentName, manifest, agentPath, {
-                ...options,
-                networkLifecycleCapability,
-                runtimeAdmission: options.runtimeAdmission || preflightAdmission,
-            }),
-            { waitMs: Math.max(0, Number(options.networkLockWaitMs || 0)) },
-        );
-    }
-    assertNetworkLifecycleCapability(options.networkLifecycleCapability);
     let preferredHostPort;
     let containerOverride;
     let aliasOverride;
@@ -2551,23 +2539,25 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
             env: process.env,
         })
         : { catalogPolicy: null, catalogIdentity: null };
-    const serviceAdmission = admitManifestRuntimeCapabilities(manifest, {
-        manifestBytes: preflightManifestBytes,
-        manifestPath: preflightManifestPath,
-        agentId: `${repoName}/${agentName}`,
-        profileName: activeProfile,
-        profileConfig,
-        network: manifestNetwork,
-        runtime: preflightAgentRuntime,
-        runtimeKind: 'container',
-        catalogPolicy: serviceLlmAdmissionContext.catalogPolicy,
-        catalogIdentity: serviceLlmAdmissionContext.catalogIdentity,
-    });
-    if (options.runtimeAdmission && preflightRuntimeKind === 'container') {
+    const serviceAdmission = preflightRuntimeKind === 'container'
+        ? admitManifestRuntimeCapabilities(manifest, {
+            manifestBytes: preflightManifestBytes,
+            manifestPath: preflightManifestPath,
+            agentId: `${repoName}/${agentName}`,
+            profileName: activeProfile,
+            profileConfig,
+            network: manifestNetwork,
+            runtime: preflightAgentRuntime,
+            runtimeKind: preflightRuntimeKind,
+            catalogPolicy: serviceLlmAdmissionContext.catalogPolicy,
+            catalogIdentity: serviceLlmAdmissionContext.catalogIdentity,
+        })
+        : preflightAdmission;
+    if (options.runtimeAdmission) {
         assertRuntimeAdmissionCurrent(options.runtimeAdmission, {
             manifestBytes: preflightManifestBytes,
             profileName: activeProfile,
-            runtimeKind: 'container',
+            runtimeKind: preflightRuntimeKind,
             descriptor: serviceAdmission.descriptor,
         });
     }
@@ -2578,7 +2568,7 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
 
     // Host sandboxes share the host network namespace. Fail closed unless the
     // effective manifest/profile contract explicitly selects host networking.
-    const agentRuntime = getRuntimeForAgent(manifest);
+    const agentRuntime = preflightAgentRuntime;
     let sandboxAdmission = null;
     if (agentRuntime === 'bwrap' || agentRuntime === 'seatbelt') {
         if (options.runtimeAdmission) {
@@ -2588,15 +2578,7 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
                 runtimeKind: agentRuntime,
             });
         }
-        sandboxAdmission = options.runtimeAdmission || admitManifestRuntimeCapabilities(manifest, {
-            manifestBytes: preflightManifestBytes,
-            manifestPath: preflightManifestPath,
-            agentId: `${repoName}/${agentName}`,
-            profileName: activeProfile,
-            profileConfig,
-            network: manifestNetwork,
-            runtimeKind: agentRuntime,
-        });
+        sandboxAdmission = options.runtimeAdmission || serviceAdmission;
     }
     if (agentRuntime === 'bwrap' || agentRuntime === 'seatbelt') {
         let sandboxRuntimeIdentity = null;

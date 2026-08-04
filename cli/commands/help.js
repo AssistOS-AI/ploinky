@@ -47,7 +47,7 @@ function mainHelpText(surface) {
   webchat                        Print the authenticated WebChat access URL
   dashboard                      Print the administrator-only Dashboard access URL
   sso enable|disable|status  Bind or inspect SSO provider agents
-  sandbox status|disable|enable  Force lite-sandbox agents to use containers, or restore bwrap/seatbelt
+  sandbox status|disable|enable  Inspect or set the strict host-sandbox availability policy
   network status [--json]        Show managed network topology (status schema 3)
   network prune                  Remove unused workspace-owned managed networks
   vars                           List all variable names (no values)
@@ -219,11 +219,9 @@ function showDetailedHelp(topic, subtopic, subsubtopic, { surface = 'core' } = {
             examples: [
                 'sandbox status',
                 'sandbox disable',
-                'disable sandbox',
-                'sandbox enable',
-                'enable sandbox'
+                'sandbox enable'
             ],
-            notes: 'Host sandbox is disabled by default; agents whose manifests request `lite-sandbox: true` use podman/docker. Run `sandbox enable` to opt into bwrap (Linux) / seatbelt (macOS). Restart running agents to apply the change. Environment override: PLOINKY_DISABLE_HOST_SANDBOX=1 forces disabled regardless of workspace setting.'
+            notes: '`lite-sandbox: true` strictly selects bwrap on Linux/Ploinky Box and seatbelt on macOS. Missing/false selects podman/docker. An explicit disable policy conflicts with true and never causes container fallback.'
         },
         'network': {
             description: 'Inspect and prune workspace-owned rootless Podman networks.',
@@ -263,12 +261,6 @@ function showDetailedHelp(topic, subtopic, subsubtopic, { surface = 'core' } = {
         'enable': {
             description: 'Enable features for agents',
             subcommands: {
-                'sandbox': {
-                    syntax: 'enable sandbox',
-                    description: 'Restore manifest-driven bwrap/seatbelt selection for this workspace.',
-                    examples: [ 'enable sandbox' ],
-                    notes: 'Equivalent to `sandbox enable`. Restart running agents to apply the change.'
-                },
                 'agent': {
                     syntax: 'enable [agent] <name|repo/name> [isolated|global|devel [repoName]] [--auth none|pwd|sso] [--user <name> --password <value>] [as <alias>]',
                     description: 'Register and start an agent without changing the configured primary/static agent. Modes: isolated (omitted) creates a subfolder <agentName>; global uses current project; devel uses a repo under .ploinky/repos. Use "as <alias>" to create an additional instance with its own container name.',
@@ -386,12 +378,6 @@ function showDetailedHelp(topic, subtopic, subsubtopic, { surface = 'core' } = {
         'disable': {
             description: 'Disable features',
             subcommands: {
-                'sandbox': {
-                    syntax: 'disable sandbox',
-                    description: 'Disable bwrap/seatbelt selection for all agents in this workspace; lite-sandbox agents will use podman/docker.',
-                    examples: [ 'disable sandbox' ],
-                    notes: 'Equivalent to `sandbox disable`. Restart running agents to apply the change.'
-                },
                 'agent': {
                     syntax: 'disable [agent] <agentName>',
                     description: 'Remove an enabled agent from .ploinky/agents.json, then stop and remove its runtime instance',

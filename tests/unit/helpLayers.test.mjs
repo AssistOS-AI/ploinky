@@ -73,6 +73,15 @@ test('layer-aware main help preserves unrelated command lines', () => {
     }
 });
 
+test('sandbox help documents only the clean-break command grammar', () => {
+    const text = captureHelp(['sandbox'], { surface: 'core' });
+    assert.match(text, /^SYNTAX:\s+sandbox status \| sandbox disable \| sandbox enable$/m);
+    assert.doesNotMatch(text, /enable sandbox|disable sandbox/);
+    for (const alias of ['show', 'off', 'container', 'containers', 'on', 'auto', 'manifest']) {
+        assert.doesNotMatch(text, new RegExp(`sandbox ${alias}(?:\\s|$)`));
+    }
+});
+
 test('all help aliases bypass dependencies and workspace initialization', () => {
     const emptyRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-help-root-'));
     const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-help-cwd-'));

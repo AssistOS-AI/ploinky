@@ -347,7 +347,6 @@ function resolveAgentEnableInput({
         profileConfig: profileResolution.profileConfig,
         network: profileResolution.network,
     };
-    admitManifestRuntimeCapabilities(manifest, admissionOptions);
     const selectedRuntime = getRuntimeForAgent(manifest);
     const runtimeKind = isSandboxRuntime(selectedRuntime) ? selectedRuntime : 'container';
     const llmAdmissionContext = runtimeKind === 'container'

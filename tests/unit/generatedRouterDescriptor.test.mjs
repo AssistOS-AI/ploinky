@@ -297,6 +297,17 @@ test('topology selection freezes public and managed request-authority rules', ()
         ['remote-public-loopback', 'public', '127.0.0.1:18080'],
     );
 
+    const macosRemote = buildRouterAuthorityTopologyIntent({
+        ...base,
+        runtimeProof: { ...runtimeProof, remote: true },
+        platform: 'darwin',
+        fsApi: missingBoxFs(),
+    });
+    assert.deepEqual(
+        [macosRemote.topology, macosRemote.listenerClass, macosRemote.requestAuthority],
+        ['macos-remote-public-loopback', 'public', '127.0.0.1:18080'],
+    );
+
     const host = buildRouterAuthorityTopologyIntent({
         ...base,
         networkMode: 'host',
@@ -391,6 +402,66 @@ test('fixed public and managed attestation fixtures validate only in their exact
         external: managedFixture.evidence.external,
         generationId: managedFixture.evidence.generationId,
     }), /socket address class/);
+});
+
+test('macOS remote attestation accepts only the exact stable AppleHV loopback proxy cell', () => {
+    const fixture = fixtureJson('macos-remote-attestation.json');
+    assert.equal(fixture.attestationId, sha256(canonicalJsonBytes(fixture.evidence)));
+    assert.deepEqual(fixture.evidence.helper, {
+        id: `sha256:${'5'.repeat(64)}`,
+        image: `sha256:${'6'.repeat(64)}`,
+        user: '65534:65534',
+    });
+
+    const intent = buildRouterAuthorityTopologyIntent({
+        networkMode: 'default',
+        runtimeProof: { ...runtimeProof, remote: true },
+        networkFingerprint,
+        routerHostPort: 18080,
+        edgeTopologyFile: '/run/ploinky/edge-topology/current.json',
+        platform: 'darwin',
+        fsApi: missingBoxFs(),
+    });
+    const validate = ({
+        nonce = fixture.evidence.nonce,
+        records = fixture.evidence.records,
+        external = fixture.evidence.external,
+        generationId = fixture.evidence.generationId,
+    } = {}) => validateRouterAuthorityObservation({ intent, nonce, records, external, generationId });
+
+    assert.doesNotThrow(() => validate());
+    for (const [name, mutate] of [
+        ['raw class', (record) => ({ ...record, rawInterfaceClass: 'unmanaged' })],
+        ['local alias', (record) => ({ ...record, socketLocalAddress: '127.0.0.2' })],
+        ['remote alias', (record) => ({ ...record, socketRemoteAddress: '127.0.0.2' })],
+        ['IPv6 loopback', (record) => ({ ...record, socketRemoteAddress: '::1' })],
+    ]) {
+        assert.throws(
+            () => validate({ records: fixture.evidence.records.map((record, index) => index === 0 ? mutate(record) : record) }),
+            /exact VM proxy cell/,
+            name,
+        );
+    }
+    assert.throws(
+        () => validate({ nonce: 'not-a-nonce' }),
+        /evidence is incomplete/,
+    );
+    assert.throws(
+        () => validate({ records: fixture.evidence.records.map((record, index) => index === 0 ? { ...record, generationLeaseId: `sha256:${'f'.repeat(64)}` } : record) }),
+        /generation changed/,
+    );
+    assert.throws(
+        () => validate({ records: fixture.evidence.records.map((record, index) => index === 0 ? { ...record, rawHost: 'vm.proxy.invalid:8080' } : record) }),
+        /exactly one internal observation/,
+    );
+    assert.throws(
+        () => validate({ records: fixture.evidence.records.map((record, index) => index === 0 ? { ...record, routePlanStatus: 200 } : record) }),
+        /fixed topology cell/,
+    );
+    assert.throws(
+        () => validate({ external: fixture.evidence.external.map((record, index) => index === 0 ? { ...record, body: '{"error":"different"}' } : record) }),
+        /external status\/body/,
+    );
 });
 
 test('attestation registers, probes, consumes, then commits the generation before returning', () => {

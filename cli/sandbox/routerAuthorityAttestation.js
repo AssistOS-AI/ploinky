@@ -15,6 +15,7 @@ const REQUEST_TIMEOUT_MS = 3_000;
 const HELPER_TIMEOUT_MS = 15_000;
 const MAX_OUTPUT_BYTES = 8 * 1024;
 const LOOPBACK_LOGIN_BODY = '{"ok":false,"error":"not_authenticated","login":"/auth/login?returnTo=%2Fhealth&agent=explorer"}';
+const MACOS_REMOTE_LOOPBACK_BODY = '{"ok":false,"error":{"code":"AUTH_REQUIRED"}}';
 const AUTHORITY_HELPER_USER = '65534:65534';
 export const ROUTER_AUTHORITY_HELPER_IMAGE = 'docker.io/library/node:24-bookworm-slim@sha256:6f7b03f7c2c8e2e784dcf9295400527b9b1270fd37b7e9a7285cf83b6951452d';
 
@@ -193,7 +194,26 @@ function isLoopbackAddress(value) {
     return net.isIP(address) === 4 && address.startsWith('127.');
 }
 
+function assertExactMacosRemoteSocketEvidence(intent, records) {
+    if (intent.listenerClass !== 'public'
+        || intent.socketLocalAddressClass !== 'public'
+        || intent.runtimeProof?.remote !== true) {
+        fail('PLOINKY_ROUTER_ATTESTATION_MISMATCH', 'macOS remote intent did not match the fixed public topology cell');
+    }
+    for (const record of records) {
+        if (record?.rawInterfaceClass !== 'loopback'
+            || record?.socketLocalAddress !== '127.0.0.1'
+            || record?.socketRemoteAddress !== '127.0.0.1') {
+            fail('PLOINKY_ROUTER_ATTESTATION_MISMATCH', 'macOS remote socket/interface evidence did not match the exact VM proxy cell');
+        }
+    }
+}
+
 function assertExactSocketEvidence(intent, records) {
+    if (intent.topology === 'macos-remote-public-loopback') {
+        assertExactMacosRemoteSocketEvidence(intent, records);
+        return;
+    }
     const expectedRawClass = intent.listenerClass === 'managed'
         ? 'managed'
         : (['host-public-loopback', 'bwrap-public-loopback', 'seatbelt-public-loopback'].includes(intent.topology)
@@ -265,7 +285,10 @@ export function validateRouterAuthorityObservation({ intent, nonce, records, ext
             hostSelectionKind: null,
             controlMiss: false,
         });
-        assertExternal(externalByHost(external, loopback), 401, LOOPBACK_LOGIN_BODY);
+        const loopbackBody = intent.topology === 'macos-remote-public-loopback'
+            ? MACOS_REMOTE_LOOPBACK_BODY
+            : LOOPBACK_LOGIN_BODY;
+        assertExternal(externalByHost(external, loopback), 401, loopbackBody);
         assertExternal(externalByHost(external, hci), 421, '{"error":"UNKNOWN_HOST"}');
     } else {
         assertRecord(hciRecord, {

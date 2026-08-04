@@ -18,14 +18,14 @@ const presentBox = {
     readFileSync() { return Buffer.from(BOX_MARKER_CONTENT); },
 };
 
-function intent(fsApi, runtimeProof = proof) {
+function intent(fsApi, runtimeProof = proof, platform = 'linux') {
     return buildRouterAuthorityTopologyIntent({
         networkMode: 'default',
         runtimeProof,
         networkFingerprint,
         routerHostPort: 18080,
         edgeTopologyFile: '/run/ploinky/edge-topology/current.json',
-        platform: 'linux',
+        platform,
         fsApi,
     });
 }
@@ -38,6 +38,31 @@ test('Box/remote select public+loopback authority while native managed selects H
     assert.deepEqual([remote.listenerClass, remote.requestAuthority], ['public', '127.0.0.1:18080']);
     assert.deepEqual([managed.listenerClass, managed.requestAuthority], ['managed', 'host.containers.internal:8080']);
     assert.equal(managed.publicAuthority, '127.0.0.1:18080');
+});
+
+test('AppleHV remote uses its dedicated exact loopback proxy evidence cell', () => {
+    const macosFixture = JSON.parse(fs.readFileSync(path.join(FIXTURES, 'macos-remote-attestation.json')));
+    const macosRemote = intent(missingBox, { ...proof, remote: true }, 'darwin');
+    assert.deepEqual(
+        [macosRemote.topology, macosRemote.listenerClass, macosRemote.requestAuthority],
+        ['macos-remote-public-loopback', 'public', '127.0.0.1:18080'],
+    );
+    assert.doesNotThrow(() => validateRouterAuthorityObservation({
+        intent: macosRemote,
+        nonce: macosFixture.evidence.nonce,
+        records: macosFixture.evidence.records,
+        external: macosFixture.evidence.external,
+        generationId: macosFixture.evidence.generationId,
+    }));
+
+    const linuxRemote = intent(missingBox, { ...proof, remote: true }, 'linux');
+    assert.throws(() => validateRouterAuthorityObservation({
+        intent: linuxRemote,
+        nonce: macosFixture.evidence.nonce,
+        records: macosFixture.evidence.records,
+        external: macosFixture.evidence.external,
+        generationId: macosFixture.evidence.generationId,
+    }), /fixed topology cell/);
 });
 
 test('frozen public and managed two-Host evidence validates only in its intended topology cell', () => {

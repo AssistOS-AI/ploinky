@@ -67,7 +67,7 @@ import {
 } from './sessionControl.js';
 import { handleSsoCommand } from './ssoCommands.js';
 import { handleDepsCommand } from './depsCommands.js';
-import { disableHostSandbox, enableHostSandbox, handleSandboxCommand } from './sandboxCommands.js';
+import { handleSandboxCommand, sandboxCommandUsageError } from './sandboxCommands.js';
 import ClientCommands from './client.js';
 import {
     getValidProfiles,
@@ -292,6 +292,9 @@ async function handleCommand(args) {
             break;
         }
         case 'enable':
+            if (['sandbox', 'host-sandbox', 'lite-sandbox'].includes(String(options[0] || '').toLowerCase())) {
+                throw sandboxCommandUsageError(`enable ${options[0]}`);
+            }
             if (String(options[0] || '').toLowerCase() === 'repo' || String(options[0] || '').toLowerCase() === 'repository') {
                 const parsed = parseRepoToggleArgs(options);
                 enableRepo(parsed.repoName, parsed.branch);
@@ -299,9 +302,6 @@ async function handleCommand(args) {
             else if (options[0] === 'agent') {
                 const parsed = parseEnableAgentArgs(options.slice(1));
                 await enableAgent(parsed.agentName, parsed.mode, parsed.repoName, parsed.alias, parsed.authMode, parsed.username, parsed.password);
-            }
-            else if (['sandbox', 'host-sandbox', 'lite-sandbox'].includes(String(options[0] || '').toLowerCase())) {
-                enableHostSandbox();
             }
             else {
                 if (!options.length) {
@@ -324,6 +324,10 @@ async function handleCommand(args) {
                 break;
             }
 
+            if (['sandbox', 'host-sandbox', 'lite-sandbox'].includes(String(options[0] || '').toLowerCase())) {
+                throw sandboxCommandUsageError(`disable ${options[0]}`);
+            }
+
             if (String(options[0] || '').toLowerCase() === 'agents-all') {
                 disableAllAgents();
                 break;
@@ -332,11 +336,6 @@ async function handleCommand(args) {
             if (String(options[0] || '').toLowerCase() === 'repo' || String(options[0] || '').toLowerCase() === 'repository') {
                 const parsed = parseRepoToggleArgs(options);
                 disableRepo(parsed.repoName);
-                break;
-            }
-
-            if (['sandbox', 'host-sandbox', 'lite-sandbox'].includes(String(options[0] || '').toLowerCase())) {
-                disableHostSandbox();
                 break;
             }
 

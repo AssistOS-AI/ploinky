@@ -7,6 +7,10 @@ import { isInsideBox } from '../../ploinky-box/lib/boxMarker.mjs';
 import { BOX_MARKER_PATH } from '../../ploinky-box/constants.mjs';
 import { PLOINKY_WORKSPACE_ROOT } from '../utils/config.js';
 import {
+    deriveHostSandboxNetworkContract,
+    networkContractHash,
+} from './networkContract.js';
+import {
     buildEffectivePolicy,
     canonicalize,
     emitRunArgs,
@@ -14,6 +18,7 @@ import {
 } from './docker/containerRuntimePolicy.js';
 
 export const RUNTIME_CAPABILITY_POLICY_VERSION = 'ploinky-runtime-capabilities-v1';
+export const RUNTIME_ADMISSION_SCHEMA_VERSION = 2;
 const ADMITTED_DESCRIPTORS = new WeakSet();
 
 const CONTAINER_SECURITY_KEYS = new Set(['privileged']);
@@ -207,6 +212,16 @@ export function validateManifestRuntimeCapabilities(manifest, {
         throw securityError(`${path} must be a plain object`, { agentId, path });
     }
     const context = { agentId: String(agentId || ''), path: String(path || 'manifest') };
+    if (manifest['lite-sandbox'] === true
+        && Object.prototype.hasOwnProperty.call(manifest, 'container')) {
+        throw new RuntimeCapabilityError(
+            `${path}.container is incompatible with lite-sandbox: true`,
+            {
+                code: 'PLOINKY_SANDBOX_CONTAINER_CONFLICT',
+                context,
+            },
+        );
+    }
     rejectDirectCapabilityFields(manifest, path, context);
     const containerSecurity = validateContainerSecurityBlock(manifest.containerSecurity, context);
     validateLlmRuntimeBlock(manifest.llmRuntime, `${path}.llmRuntime`, context);
@@ -238,6 +253,9 @@ export function validateManifestRuntimeCapabilities(manifest, {
             `${path}.profiles.${profileName}.volumes`,
             { ...context, profileName },
         );
+    }
+    if (manifest['lite-sandbox'] === true) {
+        deriveHostSandboxNetworkContract(manifest, { path });
     }
     return deepFreeze({
         policyVersion: RUNTIME_CAPABILITY_POLICY_VERSION,
@@ -377,14 +395,6 @@ export function assertRuntimeCapabilitiesAllowed(descriptor, {
     let box = insideBox;
     if (box === undefined) box = isInsideBox(boxMarkerOptions);
     const unsupported = unsupportedDimensions(descriptor, runtimeKind);
-    // Host networking is not an ordinary Box capability: the runtime boundary
-    // separately requires an exact prepared or active generation grant before
-    // it can render `--network host`.  Keep it in the immutable descriptor so
-    // that grant is bound to the admitted bytes, but do not reject it during
-    // graph admission before the generation authority exists.
-    if (box && runtimeKind !== 'container' && descriptor.capabilities.hostNetwork) {
-        unsupported.push('box-host-sandbox');
-    }
     if (runtimeKind !== 'container' && descriptor.capabilities.hostNetwork !== true) {
         unsupported.push('isolated-network-host-sandbox');
     }
@@ -441,12 +451,46 @@ export function admitManifestRuntimeCapabilities(manifest, {
     const exactDigest = manifestBytes === undefined
         ? stableDigest(exactManifest)
         : manifestBytesDigest(manifestBytes);
+    const hostSandboxRuntime = runtimeKind === 'bwrap' || runtimeKind === 'seatbelt';
+    if (hostSandboxRuntime && exactManifest['lite-sandbox'] !== true) {
+        throw new RuntimeCapabilityError(
+            `runtime '${runtimeKind}' requires lite-sandbox: true`,
+            {
+                code: 'PLOINKY_SANDBOX_POLICY_CONFLICT',
+                context: { agentId: String(agentId || ''), runtimeKind },
+            },
+        );
+    }
+    if (!hostSandboxRuntime && exactManifest['lite-sandbox'] === true) {
+        throw new RuntimeCapabilityError(
+            'lite-sandbox: true cannot be admitted as a container runtime',
+            {
+                code: 'PLOINKY_SANDBOX_POLICY_CONFLICT',
+                context: { agentId: String(agentId || ''), runtimeKind },
+            },
+        );
+    }
+    const effectiveNetwork = hostSandboxRuntime
+        ? deriveHostSandboxNetworkContract(exactManifest, {
+            path: agentId ? `manifest(${agentId})` : 'manifest',
+        })
+        : network;
+    if (hostSandboxRuntime && network !== null && network !== undefined
+        && !isDeepStrictEqual(network, effectiveNetwork)) {
+        throw new RuntimeCapabilityError(
+            'effective host-sandbox network does not match immutable platform policy',
+            {
+                code: 'PLOINKY_NETWORK_CONTRACT_INVALID',
+                context: { agentId: String(agentId || ''), runtimeKind },
+            },
+        );
+    }
     const boxContext = captureBoxContext({ boxMarkerOptions, insideBox });
     const descriptor = resolveEffectiveRuntimeCapabilities(exactManifest, {
         agentId,
         profileName,
         profileConfig,
-        network,
+        network: effectiveNetwork,
         runtime,
         catalogPolicy,
         catalogIdentity,
@@ -461,12 +505,17 @@ export function admitManifestRuntimeCapabilities(manifest, {
     });
     ADMITTED_DESCRIPTORS.add(descriptor);
     return deepFreeze({
-        schemaVersion: 1,
+        schemaVersion: RUNTIME_ADMISSION_SCHEMA_VERSION,
         manifestPath: String(manifestPath || ''),
         manifestDigest: exactDigest,
         agentId: String(agentId || ''),
         profileName: String(profileName || ''),
         runtimeKind,
+        networkAdmission: hostSandboxRuntime ? {
+            declaration: 'absent',
+            effectiveContract: effectiveNetwork,
+            effectiveHash: networkContractHash(effectiveNetwork),
+        } : null,
         descriptor,
     });
 }
@@ -478,7 +527,7 @@ export function assertRuntimeAdmissionCurrent(admission, {
     descriptor,
     boxMarkerOptions,
 } = {}) {
-    if (!admission || admission.schemaVersion !== 1 || !admission.descriptor) {
+    if (!admission || admission.schemaVersion !== RUNTIME_ADMISSION_SCHEMA_VERSION || !admission.descriptor) {
         throw new RuntimeCapabilityError('runtime admission is missing or invalid', {
             code: 'PLOINKY_RUNTIME_INPUT_CHANGED',
         });
@@ -504,6 +553,26 @@ export function assertRuntimeAdmissionCurrent(admission, {
     if (descriptor !== undefined
         && runtimeCapabilityDigest(descriptor) !== runtimeCapabilityDigest(admission.descriptor)) {
         throw new RuntimeCapabilityError('effective runtime capabilities changed after admission', {
+            code: 'PLOINKY_RUNTIME_INPUT_CHANGED',
+            context: { agentId: admission.agentId },
+        });
+    }
+    if (admission.runtimeKind === 'bwrap' || admission.runtimeKind === 'seatbelt') {
+        const networkAdmission = admission.networkAdmission;
+        const expectedEffectiveContract = deriveHostSandboxNetworkContract({
+            'lite-sandbox': true,
+        }, { path: 'runtime admission' });
+        const expectedEffectiveHash = networkContractHash(expectedEffectiveContract);
+        if (networkAdmission?.declaration !== 'absent'
+            || !isDeepStrictEqual(networkAdmission?.effectiveContract, expectedEffectiveContract)
+            || networkAdmission?.effectiveHash !== expectedEffectiveHash) {
+            throw new RuntimeCapabilityError('host-sandbox network admission is missing or invalid', {
+                code: 'PLOINKY_RUNTIME_INPUT_CHANGED',
+                context: { agentId: admission.agentId },
+            });
+        }
+    } else if (admission.networkAdmission !== null) {
+        throw new RuntimeCapabilityError('container runtime admission contains host-sandbox network state', {
             code: 'PLOINKY_RUNTIME_INPUT_CHANGED',
             context: { agentId: admission.agentId },
         });

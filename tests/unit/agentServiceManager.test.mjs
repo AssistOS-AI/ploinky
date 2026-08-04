@@ -64,6 +64,13 @@ test('Box host-gateway compatibility does not duplicate the managed network mapp
     }), /marker has invalid content/i);
 });
 
+test('service dispatch selects the strict runtime once and reuses that admission decision', () => {
+    const source = ensureAgentService.toString();
+    assert.equal(source.match(/getRuntimeForAgent\(manifest\)/g)?.length, 1);
+    assert.match(source, /const agentRuntime = preflightAgentRuntime/);
+    assert.match(source, /sandboxAdmission = options\.runtimeAdmission \|\| serviceAdmission/);
+});
+
 test('prepared graph launches suppress intermediate registry persistence only for the exact staged identity', () => {
     const staged = {
         instanceId: 'instance-current',
