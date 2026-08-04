@@ -299,20 +299,9 @@ slim_manifest_enable ".ploinky/repos/webmeet/moderator/manifest.json" '[]'
 # does GET / over HTTP). Force the probe to TCP for the test workspace.
 set_manifest_readiness_protocol ".ploinky/repos/webmeet/moderator/manifest.json" "tcp"
 
-test_info "Enabling agent ${TEST_AGENT_QUALIFIED}."
-ploinky enable agent "$TEST_AGENT_QUALIFIED"
-
-test_info "Enabling OpenAI test agent ${TEST_REPO_NAME}/${OPENAI_AGENT_NAME}."
-ploinky enable agent "${TEST_REPO_NAME}/${OPENAI_AGENT_NAME}"
-
-test_info "Enabling agent ${TEST_AGENT_TO_DISABLE_QUALIFIED}."
-ploinky enable agent "$TEST_AGENT_TO_DISABLE_QUALIFIED"
-
-test_info "Enabling agent ${TEST_REPO_NAME}/${HEALTH_AGENT_NAME}."
-ploinky enable agent "${TEST_REPO_NAME}/${HEALTH_AGENT_NAME}"
-
-test_info "Enabling alias test agent ${ENABLE_ALIAS_AGENT_NAME} as ${ENABLE_ALIAS_AGENT_ALIAS}."
-ploinky enable agent "${ENABLE_ALIAS_AGENT_NAME}" as "$ENABLE_ALIAS_AGENT_ALIAS"
+# Agent enables start their runtimes and synchronously attest the Router
+# authority. The real Router is launched by doStart.sh, so all non-static
+# enables are intentionally deferred until its private health socket is ready.
 alias_agent_container=$(compute_container_name "$ENABLE_ALIAS_AGENT_ALIAS" "$TEST_REPO_NAME")
 write_state_var "TEST_ENABLE_ALIAS_AGENT_CONTAINER" "$alias_agent_container"
 
@@ -346,8 +335,6 @@ cat >"${global_agent_root}/manifest.json" <<EOF
 }
 EOF
 
-test_info "Enabling agent ${GLOBAL_AGENT_NAME} in global mode."
-ploinky enable agent "$GLOBAL_AGENT_NAME" global
 global_agent_container=$(compute_container_name "$GLOBAL_AGENT_NAME" "$TEST_REPO_NAME")
 write_state_var "TEST_GLOBAL_AGENT_CONT_NAME" "$global_agent_container"
 
@@ -377,9 +364,6 @@ cat >"${devel_agent_root}/manifest.json" <<'EOF'
   "container": "node:20-bullseye"
 }
 EOF
-
-test_info "Enabling agent ${DEVEL_AGENT_NAME} in devel mode."
-ploinky enable agent "${DEVEL_AGENT_NAME}" devel "${TEST_REPO_NAME}"
 
 test_info "Setting workspace-only env var FAST_PLOINKY_ONLY"
 ploinky var FAST_PLOINKY_ONLY host-secret-value

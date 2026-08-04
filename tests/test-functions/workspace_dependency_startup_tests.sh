@@ -334,7 +334,6 @@ fast_test_recursive_dependency_graph_startup() (
   (
     cd "$workspace"
     ploinky enable repo graphRepo >/dev/null 2>&1
-    ploinky enable agent graphRepo/root >/dev/null 2>&1
   )
 
   start_log="$workspace/.ploinky/logs/recursive-dependency-start.log"
@@ -370,7 +369,6 @@ fast_test_dependency_readiness_protocol_override() (
   (
     cd "$workspace"
     ploinky enable repo graphRepo >/dev/null 2>&1
-    ploinky enable agent graphRepo/root >/dev/null 2>&1
   )
 
   start_log="$workspace/.ploinky/logs/override-start.log"
@@ -402,7 +400,6 @@ fast_test_static_start_only_tcp_readiness() (
   (
     cd "$workspace"
     ploinky enable repo graphRepo >/dev/null 2>&1
-    ploinky enable agent graphRepo/root >/dev/null 2>&1
   )
 
   start_log="$workspace/.ploinky/logs/static-start.log"
@@ -434,7 +431,6 @@ fast_test_dependency_failure_blocks_router_startup() (
   (
     cd "$workspace"
     ploinky enable repo graphRepo >/dev/null 2>&1
-    ploinky enable agent graphRepo/root >/dev/null 2>&1
   )
 
   start_log="$workspace/.ploinky/logs/broken-dependency-start.log"

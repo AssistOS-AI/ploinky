@@ -1086,6 +1086,70 @@ if (!found) {
 NODE
 }
 
+assert_agent_not_registered() {
+  load_state
+  require_var "TEST_RUN_DIR" || return 1
+  require_var "TEST_AGENT_NAME" || return 1
+  require_var "TEST_REPO_NAME" || return 1
+  local registry="$TEST_RUN_DIR/.ploinky/agents.json"
+  if [[ ! -f "$registry" ]]; then
+    return 0
+  fi
+  if FAST_TMP_REGISTRY="$registry" FAST_TMP_AGENT="$TEST_AGENT_NAME" FAST_TMP_REPO="$TEST_REPO_NAME" node <<'NODE'
+const fs = require('fs');
+
+const data = JSON.parse(fs.readFileSync(process.env.FAST_TMP_REGISTRY, 'utf8') || '{}');
+const found = Object.values(data || {}).some((entry) => entry
+  && entry.agentName === process.env.FAST_TMP_AGENT
+  && entry.repoName === process.env.FAST_TMP_REPO);
+process.exit(found ? 0 : 1);
+NODE
+  then
+    echo "Agent '${TEST_REPO_NAME}/${TEST_AGENT_NAME}' was registered before Router startup." >&2
+    return 1
+  fi
+}
+
+enable_fast_suite_agents_after_router() {
+  load_state
+  if [[ "${TEST_POST_ROUTER_AGENTS_ENABLED:-0}" == "1" ]]; then
+    return 0
+  fi
+  require_var "TEST_REPO_NAME" || return 1
+  require_var "TEST_OPENAI_AGENT_NAME" || return 1
+  require_var "TEST_AGENT_TO_DISABLE_QUALIFIED" || return 1
+  require_var "TEST_HEALTH_AGENT_NAME" || return 1
+  require_var "TEST_ENABLE_ALIAS_AGENT_NAME" || return 1
+  require_var "TEST_ENABLE_ALIAS_AGENT_ALIAS" || return 1
+  require_var "TEST_GLOBAL_AGENT_NAME" || return 1
+  require_var "TEST_DEVEL_AGENT_NAME" || return 1
+
+  if ! assert_router_status_ok; then
+    echo "Refusing to enable fast-suite agents before the Router health socket is ready." >&2
+    return 1
+  fi
+
+  test_info "Enabling OpenAI test agent ${TEST_REPO_NAME}/${TEST_OPENAI_AGENT_NAME}."
+  ploinky enable agent "${TEST_REPO_NAME}/${TEST_OPENAI_AGENT_NAME}"
+
+  test_info "Enabling agent ${TEST_AGENT_TO_DISABLE_QUALIFIED}."
+  ploinky enable agent "$TEST_AGENT_TO_DISABLE_QUALIFIED"
+
+  test_info "Enabling agent ${TEST_REPO_NAME}/${TEST_HEALTH_AGENT_NAME}."
+  ploinky enable agent "${TEST_REPO_NAME}/${TEST_HEALTH_AGENT_NAME}"
+
+  test_info "Enabling alias test agent ${TEST_ENABLE_ALIAS_AGENT_NAME} as ${TEST_ENABLE_ALIAS_AGENT_ALIAS}."
+  ploinky enable agent "$TEST_ENABLE_ALIAS_AGENT_NAME" as "$TEST_ENABLE_ALIAS_AGENT_ALIAS"
+
+  test_info "Enabling agent ${TEST_GLOBAL_AGENT_NAME} in global mode."
+  ploinky enable agent "$TEST_GLOBAL_AGENT_NAME" global
+
+  test_info "Enabling agent ${TEST_DEVEL_AGENT_NAME} in devel mode."
+  ploinky enable agent "$TEST_DEVEL_AGENT_NAME" devel "$TEST_REPO_NAME"
+
+  write_state_var "TEST_POST_ROUTER_AGENTS_ENABLED" "1"
+}
+
 assert_enabled_repo() {
   load_state
   require_var "TEST_RUN_DIR" || return 1

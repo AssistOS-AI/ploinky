@@ -65,3 +65,34 @@ test('dynamic fast-suite fixtures remain explicit containers with deterministic 
     assert.match(prepareSource, /^FAST_AGENT_RUNTIME="container"$/m);
     assert.doesNotMatch(prepareSource, /FAST_AGENT_RUNTIME="(?:bwrap|seatbelt)"/);
 });
+
+test('fast-suite container enables wait for the real Router authority socket', async () => {
+    const prepareSource = await fs.readFile(path.join(testsRoot, 'doPrepare.sh'), 'utf8');
+    const startSource = await fs.readFile(path.join(testsRoot, 'doStart.sh'), 'utf8');
+    const stopSource = await fs.readFile(path.join(testsRoot, 'doStop.sh'), 'utf8');
+    const librarySource = await fs.readFile(path.join(testsRoot, 'lib.sh'), 'utf8');
+    const graphSource = await fs.readFile(
+        path.join(testsRoot, 'test-functions', 'workspace_dependency_startup_tests.sh'),
+        'utf8'
+    );
+
+    assert.doesNotMatch(prepareSource, /^\s*ploinky enable agent\b/m);
+    assert.doesNotMatch(graphSource, /^\s*ploinky enable agent\b/m);
+
+    const startRouterReady = startSource.indexOf('\nwait_for_router\n');
+    const startDeferredEnables = startSource.indexOf('\nenable_fast_suite_agents_after_router\n');
+    assert.ok(startRouterReady >= 0);
+    assert.ok(startDeferredEnables > startRouterReady);
+
+    const helperStart = librarySource.indexOf('\nenable_fast_suite_agents_after_router()');
+    const helperRouterGuard = librarySource.indexOf('\n  if ! assert_router_status_ok;', helperStart);
+    const helperFirstEnable = librarySource.indexOf('\n  ploinky enable agent ', helperStart);
+    assert.ok(helperStart >= 0);
+    assert.ok(helperRouterGuard > helperStart);
+    assert.ok(helperFirstEnable > helperRouterGuard);
+
+    const stopEnable = stopSource.indexOf('\nploinky enable agent ');
+    const stopRouter = stopSource.indexOf('\nploinky stop\n');
+    assert.ok(stopEnable >= 0);
+    assert.ok(stopRouter > stopEnable);
+});
