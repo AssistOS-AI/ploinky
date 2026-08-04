@@ -1067,7 +1067,7 @@ function obtainAndValidateImage(cfg, imageRef, { forcePull = true } = {}) {
     const image = inspectedImage(cfg, imageRef);
     if (!image) die(`Runtime image '${imageRef}' was unavailable after pull`);
     try {
-        validateImageContract(image, imageRef);
+        const validatedImage = validateImageContract(image, imageRef);
         probeImageBinaries(cfg.engine, image.id, {
             query(engine, args, options) {
                 if (engine !== cfg.engine) {
@@ -1080,6 +1080,8 @@ function obtainAndValidateImage(cfg, imageRef, { forcePull = true } = {}) {
                 }
                 return query(cfg, args, options);
             },
+        }, {
+            expectedSourceSha: validatedImage.sourceSha,
         });
     } catch (error) {
         throw new SupervisorError(error.message || String(error));

@@ -16,7 +16,6 @@ export const IMAGE_CONTRACT = Object.freeze({
         USER: 'podman',
         HOME: '/home/podman',
         PLOINKY_WORKSPACE_ROOT: '/workspace',
-        PLOINKY_DISABLE_HOST_SANDBOX: '1',
         container: 'oci',
         _CONTAINERS_USERNS_CONFIGURED: '',
         BUILDAH_ISOLATION: 'chroot',
@@ -28,9 +27,28 @@ export const IMAGE_CONTRACT = Object.freeze({
         'ip',
         'fuse-overlayfs',
         'cloudflared',
+        'bwrap',
+        'git',
+        'curl',
+        'ffmpeg',
+        'ssh',
+        'python3',
+        'script',
+        'unshare',
+        'ps',
+        'setsid',
+        'timeout',
+        'npm',
+        'npx',
+        'getcap',
+        'rpm',
         '/usr/local/bin/ploinky-box-entrypoint',
+        '/usr/local/libexec/ploinky-bwrap-launch',
     ]),
     networkHelpers: Object.freeze(['pasta', 'slirp4netns']),
+    sourceShaLabel: 'io.assistos.ploinky.source-sha',
+    bubblewrapNevra: 'bubblewrap-0:0.11.0-4.fc44',
+    bwrapHelper: '/usr/local/libexec/ploinky-bwrap-launch',
 });
 export const IMAGE_PROBE_TIMEOUT_MS = 60_000;
 
@@ -123,6 +141,25 @@ function sameRecord(left, right) {
         ));
 }
 
+function validateSourceLabel(labels, imageRef) {
+    const label = IMAGE_CONTRACT.sourceShaLabel;
+    const keys = isRecord(labels) ? Object.keys(labels) : [];
+    const sourceSha = keys.length === 1 && keys[0] === label
+        ? String(labels[label] ?? '')
+        : '';
+    if (!/^[0-9a-f]{40}$/.test(sourceSha)) {
+        throw contractError(
+            imageRef,
+            'Config.Labels',
+            `exactly ${label}=<40 lowercase hexadecimal Ploinky commit>`,
+            labels,
+            'PLOINKY_BOX_IMAGE_CONTRACT_HARD_CUT',
+            '; destroy and recreate the Box with the current runtime image',
+        );
+    }
+    return sourceSha;
+}
+
 export function validateImageContract(image, imageRef, {
     availableBinaries,
 } = {}) {
@@ -132,16 +169,7 @@ export function validateImageContract(image, imageRef, {
     if (!image.id) {
         throw contractError(imageRef, 'image ID', 'a nonempty immutable ID', image.id);
     }
-    if (!isRecord(image.labels) || !sameRecord(image.labels, {})) {
-        throw contractError(
-            imageRef,
-            'Config.Labels',
-            'absent or empty',
-            image.labels,
-            'PLOINKY_BOX_IMAGE_CONTRACT_HARD_CUT',
-            '; destroy and recreate the Box with the current runtime image',
-        );
-    }
+    const sourceSha = validateSourceLabel(image.labels, imageRef);
     if (image.user !== IMAGE_CONTRACT.user) {
         throw contractError(imageRef, 'Config.User', JSON.stringify(IMAGE_CONTRACT.user), image.user);
     }
@@ -175,7 +203,7 @@ export function validateImageContract(image, imageRef, {
     if (availableBinaries !== undefined) {
         validateImageBinaries(availableBinaries, imageRef);
     }
-    return Object.freeze({ ...image, immutableId: image.id });
+    return Object.freeze({ ...image, immutableId: image.id, sourceSha });
 }
 
 export function validateImageBinaries(availableBinaries, imageRef) {
@@ -196,7 +224,19 @@ export function validateImageBinaries(availableBinaries, imageRef) {
     return Object.freeze([...available]);
 }
 
-export function probeImageBinaries(engine, imageId, runner) {
+export function probeImageBinaries(engine, imageId, runner, {
+    expectedSourceSha,
+} = {}) {
+    if (!/^[0-9a-f]{40}$/.test(expectedSourceSha ?? '')) {
+        throw contractError(
+            imageId,
+            'Ploinky source SHA',
+            'a 40-character lowercase hexadecimal commit',
+            expectedSourceSha,
+        );
+    }
+    const sourceMatch =
+        `test "$helper_version" = 'ploinky-bwrap-launch-v1 source-sha=${expectedSourceSha}'`;
     const result = runner.query(engine, [
         'run',
         '--rm',
@@ -206,11 +246,29 @@ export function probeImageBinaries(engine, imageId, runner) {
         '-c',
         [
             'set -eu',
-            "for name in node podman bash ip fuse-overlayfs cloudflared; do command -v \"$name\"; done",
+            "for name in node podman bash ip fuse-overlayfs cloudflared bwrap git curl ffmpeg ssh python3 script unshare ps setsid timeout npm npx getcap rpm; do command -v \"$name\"; done",
             'test -x /usr/local/bin/ploinky-box-entrypoint',
             "printf '%s\\n' /usr/local/bin/ploinky-box-entrypoint",
+            `test -x ${IMAGE_CONTRACT.bwrapHelper}`,
+            `printf '%s\\n' ${IMAGE_CONTRACT.bwrapHelper}`,
             `test "$(wc -c < /etc/ploinky-box)" -eq ${Buffer.byteLength(BOX_MARKER_CONTENT)}`,
             `test "$(cat /etc/ploinky-box)" = '${BOX_MARKER_CONTENT.trim()}'`,
+            "case \"$(uname -m)\" in x86_64) rpm_arch=x86_64 ;; aarch64) rpm_arch=aarch64 ;; *) exit 18 ;; esac",
+            `test "$(rpm -q --qf '%{NAME}-%{EPOCHNUM}:%{VERSION}-%{RELEASE}.%{ARCH}' bubblewrap)" = '${IMAGE_CONTRACT.bubblewrapNevra}.'"$rpm_arch"`,
+            "test \"$(stat -c '%a:%u:%g' /usr/bin/bwrap)\" = '755:0:0'",
+            "bwrap_capabilities=\"$(getcap /usr/bin/bwrap)\"",
+            "test -z \"$bwrap_capabilities\"",
+            "bwrap_help=\"$(bwrap --help 2>&1)\"",
+            "for option in '--bind-fd FD DEST' '--ro-bind-fd FD DEST' '--ro-bind-data FD DEST' '--perms OCTAL'; do printf '%s\\n' \"$bwrap_help\" | grep -F -- \"$option\" >/dev/null; done",
+            `test "$(stat -c '%a:%u:%g' ${IMAGE_CONTRACT.bwrapHelper})" = '755:0:0'`,
+            `helper_file_capabilities="$(getcap ${IMAGE_CONTRACT.bwrapHelper})"`,
+            'test -z "$helper_file_capabilities"',
+            `helper_version="$(${IMAGE_CONTRACT.bwrapHelper} --version)"`,
+            sourceMatch,
+            `helper_capabilities="$(${IMAGE_CONTRACT.bwrapHelper} --capabilities)"`,
+            "printf '%s\\n' \"$helper_capabilities\" | grep -F -- 'protocol=1 descriptor-fd=3' >/dev/null",
+            "printf '%s\\n' \"$helper_capabilities\" | grep -F -- 'path-resolution=openat2-beneath-no-magiclinks-no-symlinks' >/dev/null",
+            "printf '%s\\n' \"$helper_capabilities\" | grep -F -- 'bwrap-fd-options=bind-fd,ro-bind-fd,ro-bind-data,perms' >/dev/null",
             "if command -v pasta >/dev/null 2>&1; then command -v pasta; elif command -v slirp4netns >/dev/null 2>&1; then command -v slirp4netns; else exit 17; fi",
         ].join('; '),
     ], { timeoutMs: IMAGE_PROBE_TIMEOUT_MS });
@@ -224,7 +282,7 @@ export function probeImageBinaries(engine, imageId, runner) {
     }
     const observedPaths = String(result.stdout || '').split(/\r?\n/).filter(Boolean);
     const available = observedPaths.map((value) => (
-        value === IMAGE_CONTRACT.entrypoint ? value : value.split('/').pop()
+        IMAGE_CONTRACT.requiredBinaries.includes(value) ? value : value.split('/').pop()
     ));
     return validateImageBinaries(available, imageId);
 }
@@ -237,8 +295,10 @@ export function inspectAndValidateImage(engine, imageRef, runner) {
         });
     }
     const image = normalizeImageInspect(result.stdout);
-    validateImageContract(image, imageRef);
-    const availableBinaries = probeImageBinaries(engine, image.id, runner);
+    const validatedImage = validateImageContract(image, imageRef);
+    const availableBinaries = probeImageBinaries(engine, image.id, runner, {
+        expectedSourceSha: validatedImage.sourceSha,
+    });
     return validateImageContract(image, imageRef, { availableBinaries });
 }
 
