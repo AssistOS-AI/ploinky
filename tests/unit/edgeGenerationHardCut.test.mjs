@@ -9,6 +9,7 @@ import {
     abortEdgeRoutingPreparation,
     applyEdgeRoutingGeneration,
     assertActiveEdgeRoutingSourcesCurrent,
+    assertPreparedRuntimeIdentity,
     captureEdgeRoutingLifecycleMutationGeneration,
     captureEdgeRoutingObservationLease,
     commitAdditiveEdgeRoutingGeneration,
@@ -901,6 +902,34 @@ test('durable preparation remains inactive until its exact lease commits', (t) =
     });
     assert.equal(committed.selector.state, 'active');
     assert.equal(committed.selector.generation, prepared.selector.generation);
+});
+
+test('prepared runtime identity returns the immutable staged registry record', (t) => {
+    const fixture = createFixture(t);
+    const prepared = prepareEdgeRoutingGeneration({
+        workspaceRoot: fixture.workspace,
+        reason: 'runtime-record-preparation',
+    });
+    const staged = assertPreparedRuntimeIdentity(prepared.preparationLease, {
+        workspaceRoot: fixture.workspace,
+        containerName: 'alpha-container',
+        instanceId: 'alpha-instance',
+        enableGeneration: 'alpha-enable-generation',
+    });
+    assert.deepEqual(staged, prepared.generation.agents['alpha-container']);
+
+    const agentsFile = path.join(fixture.ploinkyDir, 'agents.json');
+    const live = JSON.parse(fs.readFileSync(agentsFile, 'utf8'));
+    live['alpha-container'].containerId = 'same-tuple-runtime-only-drift';
+    fs.writeFileSync(agentsFile, JSON.stringify(live, null, 2));
+
+    assert.deepEqual(assertPreparedRuntimeIdentity(prepared.preparationLease, {
+        workspaceRoot: fixture.workspace,
+        containerName: 'alpha-container',
+        instanceId: 'alpha-instance',
+        enableGeneration: 'alpha-enable-generation',
+    }), staged);
+    abortEdgeRoutingPreparation(prepared.preparationLease, { workspaceRoot: fixture.workspace });
 });
 
 test('prepared Router attestation remains inactive and binds exact lease, owner, sources, and checkpoint order', (t) => {

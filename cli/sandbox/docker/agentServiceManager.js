@@ -136,6 +136,7 @@ import {
     abortEdgeRoutingPreparation,
     assertAdditivePreparedRuntimeIdentity,
     assertHostModeGenerationCapability,
+    assertPreparedRuntimeIdentity,
     createRouterAttestationGenerationLease,
     edgeRuntimeEnvironment,
     edgeTopologyMount,
@@ -2271,6 +2272,31 @@ export function assertPreparedRegistryRecordPreservation(existingRecord, options
     return true;
 }
 
+function capturePreparedRegistryRecord(containerName, runtimeIdentity) {
+    if (!runtimeIdentity?.preparationLease) return null;
+    const prepared = assertPreparedRuntimeIdentity(runtimeIdentity.preparationLease, {
+        containerName,
+        instanceId: runtimeIdentity.instanceId,
+        enableGeneration: runtimeIdentity.enableGeneration,
+    });
+    // Additive preparation deliberately leaves the active predecessor's
+    // mutable registry untouched. Its immutable candidate record is therefore
+    // the staged launch authority until the additive commit publishes it.
+    if (runtimeIdentity.preparationLease.mode === 'additive') {
+        return structuredClone(prepared);
+    }
+    const record = loadAgentsMap()?.[containerName];
+    if (!record || record.type !== 'agent'
+        || String(record.instanceId || '') !== String(runtimeIdentity.instanceId || '')
+        || String(record.enableGeneration || '') !== String(runtimeIdentity.enableGeneration || '')
+        || !isDeepStrictEqual(record, prepared)) {
+        throw new Error(
+            `prepared runtime for '${containerName}' lost its exact immutable staged registry record before launch`,
+        );
+    }
+    return structuredClone(record);
+}
+
 function mintReplacementRuntimeIdentity(existingRecord, uuid = randomUUID) {
     const instanceId = String(uuid() || '').trim();
     const enableGeneration = String(uuid() || '').trim();
@@ -2586,6 +2612,7 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
     }
     if (agentRuntime === 'bwrap' || agentRuntime === 'seatbelt') {
         let sandboxRuntimeIdentity = null;
+        let sandboxStagedRegistryRecord = null;
         let sandboxRequiresEdgeActivation = false;
         let sandboxCleanupReceipt = null;
         try {
@@ -2628,6 +2655,7 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
                 requestedEnableGeneration: String(options.enableGeneration || existingRecord.enableGeneration || ''),
             }, { preparationLease: options.preparationLease });
             sandboxRuntimeIdentity = runtimeIdentity;
+            sandboxStagedRegistryRecord = capturePreparedRegistryRecord(containerName, runtimeIdentity);
             sandboxRequiresEdgeActivation = requiresEdgeActivation;
             sandboxCleanupReceipt = beginCandidateLifecycle({
                 runtimeKind: agentRuntime,
@@ -2698,6 +2726,9 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
                 requiresEdgeActivation,
                 cleanupReceipt: sandboxCleanupReceipt,
                 ...(runtimeIdentity.preparationLease ? { preparationLease: runtimeIdentity.preparationLease } : {}),
+                ...(sandboxStagedRegistryRecord
+                    ? { stagedRegistryRecord: structuredClone(sandboxStagedRegistryRecord) }
+                    : {}),
             };
         } catch (err) {
             const failure = createHostSandboxStartupError(agentName, agentRuntime, err);
@@ -2747,6 +2778,9 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
                 },
                 requiresEdgeActivation: sandboxRequiresEdgeActivation,
                 exactCleanupPerformed,
+                ...(sandboxStagedRegistryRecord
+                    ? { stagedRegistryRecord: structuredClone(sandboxStagedRegistryRecord) }
+                    : {}),
                 ...(sandboxCleanupReceipt ? { cleanupReceipt: sandboxCleanupReceipt } : {}),
                 ...((sandboxRuntimeIdentity?.preparationLease || options.preparationLease)
                     ? { preparationLease: sandboxRuntimeIdentity?.preparationLease || options.preparationLease }
@@ -3012,6 +3046,10 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
         requestedInstanceId,
         requestedEnableGeneration,
     }, { preparationLease: managedReconciliationPreparationLease });
+    let started = null;
+    let stagedRegistryRecord = null;
+    try {
+    stagedRegistryRecord = capturePreparedRegistryRecord(containerName, runtimeIdentity);
     const preserveRuntimeRegistryRecord = Boolean(targetedRestart)
         || preservePreparedRegistryRecord
         || Boolean(runtimeIdentity.preparationLease);
@@ -3049,8 +3087,6 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
         clearLivenessState(containerName);
     }
 
-    let started = null;
-    try {
         started = startAgentContainer(agentName, manifest, agentPath, {
             publish: additionalPorts,
             publishMappings: additionalPortMappings,
@@ -3162,6 +3198,9 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
             cleanupReceipt: started?.cleanupReceipt,
             requiresEdgeActivation,
             ...(runtimeIdentity.preparationLease ? { preparationLease: runtimeIdentity.preparationLease } : {}),
+            ...(stagedRegistryRecord
+                ? { stagedRegistryRecord: structuredClone(stagedRegistryRecord) }
+                : {}),
         };
     } catch (error) {
         if (error?.code === 'PLOINKY_SEMANTIC_ADOPTION_MISMATCH'
@@ -3219,6 +3258,9 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
             registryRecord: structuredClone(candidateRecord),
             requiresEdgeActivation,
             exactCleanupPerformed,
+            ...(stagedRegistryRecord
+                ? { stagedRegistryRecord: structuredClone(stagedRegistryRecord) }
+                : {}),
             ...(cleanupReceipt ? { cleanupReceipt } : {}),
             ...(runtimeIdentity.preparationLease ? { preparationLease: runtimeIdentity.preparationLease } : {}),
         });

@@ -33,6 +33,13 @@ function preparedRestartResult(overrides = {}) {
             enableGeneration: 'enable-v2',
             config: { ports: [{ containerPort: 7000, hostPort: 43123 }] },
         },
+        stagedRegistryRecord: {
+            type: 'agent',
+            repoName: 'repo',
+            agentName: 'demo',
+            instanceId: 'instance-v2',
+            enableGeneration: 'enable-v2',
+        },
         requiresEdgeActivation: true,
         preparationLease: Object.freeze({
             transactionId: 'restart-lease',
@@ -181,6 +188,7 @@ test('monitor waits for exact semantic readiness before committing the returned 
         const result = preparedRestartResult();
         const events = [];
         let savedAgents = null;
+        let registryState = structuredClone(result.stagedRegistryRecord);
         let savedRouting = null;
         let releaseReadiness;
         const readinessGate = new Promise((resolve) => { releaseReadiness = resolve; });
@@ -209,20 +217,13 @@ test('monitor waits for exact semantic readiness before committing the returned 
             },
             loadAgents() {
                 events.push('registry-load');
-                return {
-                    agent_container: {
-                        type: 'agent',
-                        repoName: 'repo',
-                        agentName: 'demo',
-                        instanceId: 'instance-v2',
-                        enableGeneration: 'enable-v2',
-                    },
-                };
+                return { agent_container: structuredClone(registryState) };
             },
             saveAgents(agents, options) {
                 events.push('registry-save');
                 assert.deepEqual(options, { coordinate: false });
                 savedAgents = structuredClone(agents);
+                registryState = structuredClone(agents.agent_container);
             },
             async mergeRoutingConfig(mutator, options) {
                 events.push('route-merge-start');
@@ -270,6 +271,65 @@ test('monitor waits for exact semantic readiness before committing the returned 
         assert.equal(events.includes('container_restart_failed'), false);
         assert.equal(target.isRestarting, false);
         assert.equal(target.lastError, null);
+    } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+    }
+});
+
+test('monitor rejects staged registry metadata drift before committing the runtime candidate', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-monitor-staged-drift-'));
+    try {
+        const manifestPath = path.join(root, 'manifest.json');
+        fs.writeFileSync(manifestPath, JSON.stringify({ readiness: { protocol: 'none' } }));
+        const result = preparedRestartResult({ hostPort: null });
+        const events = [];
+        const monitor = {
+            config: {},
+            targets: new Map(),
+            isShuttingDown: () => false,
+            log(_level, event) { events.push(event); },
+            createWorkspaceMutationLease: () => ({ token: 'workspace' }),
+            releaseWorkspaceMutationLease() {},
+            resolveRouterEndpoint: () => Object.freeze({
+                mode: 'default',
+                host: 'host.containers.internal',
+                port: 8080,
+                url: 'http://host.containers.internal:8080',
+            }),
+            ensureAgentService: () => result,
+            loadAgents: () => ({
+                agent_container: {
+                    ...structuredClone(result.stagedRegistryRecord),
+                    projectPath: '/changed-after-launch',
+                },
+            }),
+            saveAgents() { assert.fail('drifted staged registry must not be overwritten'); },
+            async mergeRoutingConfig(mutator) {
+                await mutator({ routes: {} });
+            },
+            applyEdgeRoutingGeneration() {
+                assert.fail('drifted staged registry must not activate');
+            },
+            abortEdgeRoutingPreparation(lease) {
+                events.push('preparation-abort');
+                assert.equal(lease, result.preparationLease);
+            },
+            cleanupFailedRuntime(containerName) {
+                events.push(`candidate-cleanup:${containerName}`);
+            },
+        };
+        const target = restartTarget(manifestPath);
+
+        await assert.rejects(
+            performContainerRestart(monitor, target, 'not_running'),
+            /lost its staged registry identity/,
+        );
+
+        assert.deepEqual(events.slice(0, 2), [
+            'candidate-cleanup:agent_container',
+            'preparation-abort',
+        ]);
+        assert.equal(events.includes('container_restart_success'), false);
     } finally {
         fs.rmSync(root, { recursive: true, force: true });
     }
@@ -359,15 +419,7 @@ test('monitor apply failure aborts the exact preparation, cleans only the failed
                 url: 'http://host.containers.internal:8080',
             }),
             ensureAgentService: () => result,
-            loadAgents: () => ({
-                agent_container: {
-                    type: 'agent',
-                    repoName: 'repo',
-                    agentName: 'demo',
-                    instanceId: 'instance-v2',
-                    enableGeneration: 'enable-v2',
-                },
-            }),
+            loadAgents: () => ({ agent_container: structuredClone(result.stagedRegistryRecord) }),
             saveAgents() { events.push('registry-save'); },
             async mergeRoutingConfig(mutator, options) {
                 assert.deepEqual(options, { coordinate: false });

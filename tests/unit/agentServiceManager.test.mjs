@@ -106,6 +106,7 @@ test('prepared graph launches suppress intermediate registry persistence only fo
     assert.match(source, /preserveRegistryRecord:\s*preserveRuntimeRegistryRecord/);
     assert.match(source, /if \(!preserveRuntimeRegistryRecord\) saveAgentsMap\(agents\)/);
     assert.match(source, /registryRecord:\s*structuredClone\(agents\[containerName\]\)/);
+    assert.match(source, /stagedRegistryRecord:\s*structuredClone\(stagedRegistryRecord\)/);
     assert.match(source, /returning early \(container exists\)[\s\S]*createdByThisLaunch:\s*false/);
     assert.match(source, /runtimeNetwork:\s*structuredClone\(manifestNetwork\),[\s\S]*createdByThisLaunch:\s*!adoptedExistingRuntime/);
     assert.match(source, /createdByThisLaunch:\s*started\?\.createdByThisLaunch !== false/);
