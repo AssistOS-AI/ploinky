@@ -11,18 +11,20 @@ const { readGlobalDepsPackage } = await import(`${depInstUrl.href}${suffix}`);
 const { resolveGlobalCacheManifest } = await import(`${depCacheUrl.href}${suffix}`);
 
 const BRANCH = 'soul-gateway-local-integration';
+const DEFAULT_SPEC = 'git+https://github.com/AssistOS-AI/achillesAgentLib.git';
 
 // readGlobalDepsPackage must honor an explicitly passed env so the cache layer
 // (which may run in any process) can resolve the override deterministically.
 test('readGlobalDepsPackage honors an explicit env argument', () => {
     const base = readGlobalDepsPackage({});
     const over = readGlobalDepsPackage({ PLOINKY_AGENTLIB_REF: BRANCH });
-    assert.match(base.dependencies.achillesAgentLib, /#[0-9a-f]{40}$/);
+    assert.equal(base.dependencies.achillesAgentLib, DEFAULT_SPEC);
     assert.match(over.dependencies.achillesAgentLib, new RegExp(`#${BRANCH}$`));
 });
 
 // The shared global cache key AND package contents must reflect the override,
-// so the cache invalidates and rebuilds on the branch instead of serving master.
+// so the cache invalidates and rebuilds on the branch instead of serving the
+// unpinned remote default.
 test('resolveGlobalCacheManifest: override changes both the package and the cache key', () => {
     const base = resolveGlobalCacheManifest({});
     const over = resolveGlobalCacheManifest({ PLOINKY_AGENTLIB_REF: BRANCH });
@@ -32,9 +34,9 @@ test('resolveGlobalCacheManifest: override changes both the package and the cach
     assert.equal(over.hash.length, 64);
 });
 
-test('resolveGlobalCacheManifest: no override resolves the immutable baseline with a stable hash', () => {
+test('resolveGlobalCacheManifest: no override resolves the unpinned baseline with a stable hash', () => {
     const a = resolveGlobalCacheManifest({});
     const b = resolveGlobalCacheManifest({});
-    assert.match(a.pkg.dependencies.achillesAgentLib, /#[0-9a-f]{40}$/);
+    assert.equal(a.pkg.dependencies.achillesAgentLib, DEFAULT_SPEC);
     assert.equal(a.hash, b.hash);
 });

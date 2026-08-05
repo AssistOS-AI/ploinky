@@ -191,6 +191,19 @@ function parseExactGitCommitSpec(value, label = 'dependency spec') {
     });
 }
 
+function parseUnpinnedGitDependencySpec(value, label = 'dependency spec') {
+    if (typeof value !== 'string' || value !== value.trim()) {
+        throw bundleError(`${label} must be an unpinned git+https dependency spec`);
+    }
+    const match = /^git\+(https:\/\/[^#\s]+)$/.exec(value);
+    if (!match) {
+        throw bundleError(`${label} must be an unpinned git+https dependency spec without a branch or commit fragment`);
+    }
+    return Object.freeze({
+        repositoryUrl: canonicalGitUrl(match[1], label),
+    });
+}
+
 function validateAgentlibDeliveryMetadata({
     globalPackage,
     dependencyLock,
@@ -199,7 +212,7 @@ function validateAgentlibDeliveryMetadata({
     assertExactSha(expectedCommit, 'expected AgentLib commit');
     assertPlainObject(globalPackage, 'globalDeps package');
     assertPlainObject(globalPackage.dependencies, 'globalDeps dependencies');
-    const pinned = parseExactGitCommitSpec(
+    const configured = parseUnpinnedGitDependencySpec(
         globalPackage.dependencies.achillesAgentLib,
         'globalDeps achillesAgentLib dependency',
     );
@@ -217,11 +230,11 @@ function validateAgentlibDeliveryMetadata({
         'Box dependency lock achillesAgentLib',
     );
 
-    if (pinned.commit !== expectedCommit || lockedCommit !== expectedCommit) {
-        throw bundleError('manifest, globalDeps pin, and Box lock must name the same AgentLib commit');
+    if (lockedCommit !== expectedCommit) {
+        throw bundleError('manifest and Box lock must name the same AgentLib commit');
     }
-    if (pinned.repositoryUrl !== lockedUrl) {
-        throw bundleError('globalDeps pin and Box lock must name the same AgentLib repository');
+    if (configured.repositoryUrl !== lockedUrl) {
+        throw bundleError('globalDeps source and Box lock must name the same AgentLib repository');
     }
     return Object.freeze({ commit: expectedCommit, repositoryUrl: lockedUrl });
 }

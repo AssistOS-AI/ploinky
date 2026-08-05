@@ -4,7 +4,7 @@
   "type": "module",
   "description": "Global dependencies available to all ploinky agents",
   "dependencies": {
-    "achillesAgentLib": "git+https://github.com/AssistOS-AI/achillesAgentLib.git#975e7a318e1c8c8d1792ec96fe7b820fc465d1f5",
+    "achillesAgentLib": "git+https://github.com/AssistOS-AI/achillesAgentLib.git",
     "mcp-sdk": "git+https://github.com/AssistOS-AI/MCPSDK.git#main"
   }
 }

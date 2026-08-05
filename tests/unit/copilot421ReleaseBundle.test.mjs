@@ -34,10 +34,10 @@ function manifest() {
     };
 }
 
-function globalPackage(commit = SHAS.achillesAgentLib) {
+function globalPackage(ref = null) {
     return {
         dependencies: {
-            achillesAgentLib: `git+https://github.com/AssistOS-AI/achillesAgentLib.git#${commit}`,
+            achillesAgentLib: `git+https://github.com/AssistOS-AI/achillesAgentLib.git${ref ? `#${ref}` : ''}`,
         },
     };
 }
@@ -137,7 +137,7 @@ test('release manifest rejects missing, extra, branch, and non-immutable identit
     }
 });
 
-test('delivery metadata requires one exact AgentLib commit and repository', () => {
+test('delivery metadata requires an unpinned AgentLib source and exact locked release commit', () => {
     const result = validateAgentlibDeliveryMetadata({
         globalPackage: globalPackage(),
         dependencyLock: dependencyLock(),
@@ -149,13 +149,19 @@ test('delivery metadata requires one exact AgentLib commit and repository', () =
         globalPackage: globalPackage('master'),
         dependencyLock: dependencyLock(),
         expectedCommit: SHAS.achillesAgentLib,
-    }), /branch\/spec fallback is forbidden/);
+    }), /must be an unpinned git\+https dependency spec/);
+
+    assert.throws(() => validateAgentlibDeliveryMetadata({
+        globalPackage: globalPackage(SHAS.achillesAgentLib),
+        dependencyLock: dependencyLock(),
+        expectedCommit: SHAS.achillesAgentLib,
+    }), /must be an unpinned git\+https dependency spec/);
 
     assert.throws(() => validateAgentlibDeliveryMetadata({
         globalPackage: { dependencies: {} },
         dependencyLock: dependencyLock(),
         expectedCommit: SHAS.achillesAgentLib,
-    }), /exact git\+https dependency spec/);
+    }), /unpinned git\+https dependency spec/);
 
     assert.throws(() => validateAgentlibDeliveryMetadata({
         globalPackage: globalPackage(),

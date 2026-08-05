@@ -13,7 +13,7 @@ const { overrideGlobalDeps } = await import(`${depInstallerUrl.href}${moduleSuff
 // overrideGlobalDeps: rewrite the achillesAgentLib dependency from env
 // ---------------------------------------------------------------------------
 
-const BASE = 'git+https://github.com/AssistOS-AI/achillesAgentLib.git#master';
+const BASE = 'git+https://github.com/AssistOS-AI/achillesAgentLib.git';
 function freshPkg() {
     return {
         dependencies: {

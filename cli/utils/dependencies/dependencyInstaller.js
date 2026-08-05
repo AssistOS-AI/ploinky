@@ -1,6 +1,5 @@
 import fs from 'fs';
 import path from 'path';
-import { spawnSync } from 'child_process';
 import { GLOBAL_DEPS_PATH } from '../config.js';
 import { debugLog } from '../utils.js';
 import { remoteBranchExists } from '../repos.js';
@@ -74,11 +73,11 @@ function readGlobalDepsPackage(env = process.env) {
 /**
  * Apply deploy-time overrides to the global dependency set.
  *
- * achillesAgentLib is normally pinned to a fixed git ref in
- * globalDeps/package.json. `PLOINKY_AGENTLIB_REF` (set by `ploinky start` from
- * the global --branch, or exported directly) points every agent's
- * achillesAgentLib at a different branch or source for a single deploy without
- * editing tracked files.
+ * achillesAgentLib normally follows its remote default branch through the
+ * unpinned spec in globalDeps/package.json. `PLOINKY_AGENTLIB_REF` (set by
+ * `ploinky start` from the global --branch, or exported directly) points every
+ * agent's achillesAgentLib at a different branch or source for a single deploy
+ * without editing tracked files.
  *
  * A bare value (e.g. "my-feature") is treated as a branch
  * and swapped onto the existing dependency URL. A full npm spec (git+..., a
@@ -112,12 +111,12 @@ function overrideGlobalDeps(pkg, env = process.env) {
 }
 
 /**
- * The pinned achillesAgentLib remote URL from globalDeps/package.json, stripped
+ * The configured achillesAgentLib remote URL from globalDeps/package.json, stripped
  * of the npm `git+` scheme prefix and any `#ref`, suitable for `git ls-remote`.
  *
  * @returns {string|null}
  */
-function pinnedAgentlibUrl() {
+function configuredAgentlibUrl() {
     try {
         const raw = JSON.parse(fs.readFileSync(path.join(GLOBAL_DEPS_PATH, 'package.json'), 'utf8'));
         const dep = String(raw?.dependencies?.achillesAgentLib || '');
@@ -135,31 +134,33 @@ function pinnedAgentlibUrl() {
 /**
  * Resolve the achillesAgentLib ref implied by a global --branch policy.
  *
- * If the branch exists on the achillesAgentLib remote, use it. A missing branch
- * is always fatal: silently substituting the default dependency spec makes it
- * impossible to prove which AgentLib implementation a release candidate ran.
- * Called from `ploinky start` with the parsed --branch policy.
+ * If the branch exists on the achillesAgentLib remote, use it. Otherwise honor
+ * the branch fallback policy: `default` keeps the unpinned dependency on its
+ * remote default branch, while `fail` aborts. Called from `ploinky start` with
+ * the parsed --branch policy.
  *
  * @param {object} branchPolicy - parsed --branch policy ({ branch, fallback, ... }).
  * @param {object} [opts]
  * @param {(url: string, branch: string) => boolean} [opts.branchExists] - remote-branch probe (injectable for tests).
- * @param {string} [opts.url] - achillesAgentLib remote URL (defaults to the pinned globalDeps URL).
- * @returns {string|null} branch to use, or null when no branch was requested.
+ * @param {string} [opts.url] - achillesAgentLib remote URL (defaults to the configured globalDeps URL).
+ * @returns {string|null} branch to use, or null to keep the unpinned default dependency spec.
  */
 function resolveAgentlibBranchRef(branchPolicy, { branchExists = remoteBranchExists, url } = {}) {
     const branch = branchPolicy?.branch;
     if (!branch) {
         return null;
     }
-    const remoteUrl = url === undefined ? pinnedAgentlibUrl() : url;
+    const remoteUrl = url === undefined ? configuredAgentlibUrl() : url;
     if (remoteUrl && branchExists(remoteUrl, branch)) {
         return branch;
     }
-    const fallback = branchPolicy?.fallback || 'default';
-    throw new Error(
-        `Branch '${branch}' not found on the achillesAgentLib remote (${remoteUrl || 'unknown'}); `
-        + `refusing AgentLib dependency fallback (requested --branch-fallback ${fallback}).`,
-    );
+    if (branchPolicy?.fallback === 'fail') {
+        throw new Error(
+            `Branch '${branch}' not found on the achillesAgentLib remote (${remoteUrl || 'unknown'}); `
+            + `aborting (--branch-fallback fail).`,
+        );
+    }
+    return null;
 }
 
 export {

@@ -387,8 +387,8 @@ async function handleCommand(args) {
                 }
             }
             // The global --branch also drives the achillesAgentLib used by agent
-            // containers (the branch must exist on the achillesAgentLib remote;
-            // missing AgentLib branches abort without a pinned-ref fallback).
+            // containers (when the branch is absent, the default fallback keeps
+            // the unpinned AgentLib dependency on its remote default branch).
             // Propagated via PLOINKY_AGENTLIB_REF,
             // read host-side by readGlobalDepsPackage and inherited by the
             // Watchdog/router via buildRouterEnv.
