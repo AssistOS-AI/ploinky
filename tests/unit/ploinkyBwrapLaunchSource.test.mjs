@@ -462,7 +462,10 @@ test('sandbox HOME validates its fd-pinned directory and exact ABI marker before
     assert.equal(boundaryGeneration.status, 0, boundaryGeneration.stderr);
 
     const containerNative = await launchHomeRecord(homeRecord(2), '/root');
-    if (typeof process.getuid === 'function' && process.getuid() === 0) {
+    const rootStatus = fs.statSync('/root');
+    if (typeof process.geteuid === 'function'
+        && process.geteuid() === rootStatus.uid
+        && (rootStatus.mode & 0o7777) === 0o700) {
         assert.equal(containerNative.status, 0, containerNative.stderr);
     } else {
         assert.equal(containerNative.status, 76, containerNative.stderr);
@@ -602,6 +605,13 @@ test('workspace root, traversal, protected state, and duplicate targets fail bef
     assert.equal(duplicate.status, 64);
     assert.match(duplicate.stderr, /^PLOINKY_BWRAP_DUPLICATE_MOUNT:/);
 
+    const managedWorkspace = path.join(fixtureRoot, 'managed-workspace');
+    fs.mkdirSync(path.join(managedWorkspace, '.ploinky/repos/example repo/src'), {
+        recursive: true,
+    });
+    const managedHelper = path.join(fixtureRoot, 'ploinky-bwrap-managed-workdir');
+    const managedCompiled = compile(managedHelper, { workspaceRoot: managedWorkspace });
+    assert.equal(managedCompiled.status, 0, managedCompiled.stderr);
     const managedRepo = await launchWithDescriptor(descriptor([
         record(RECORD.WORKSPACE, Buffer.from([1])),
         record(RECORD.TMPFS, '/workspace/.ploinky'),
@@ -611,7 +621,7 @@ test('workspace root, traversal, protected state, and duplicate targets fail bef
         record(RECORD.WORKDIR, '.ploinky/repos/example repo/src'),
         record(RECORD.ARG, '--'),
         record(RECORD.ARG, '/bin/true'),
-    ]));
+    ]), { executable: managedHelper });
     if (process.platform !== 'linux') {
         assert.equal(managedRepo.status, 70);
         assert.match(managedRepo.stderr, /^PLOINKY_PATHFD_UNAVAILABLE:/);
