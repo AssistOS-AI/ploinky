@@ -775,7 +775,8 @@ function publishOwnerRecord(record) {
                 'PLOINKY_SANDBOX_OWNER_SLOT_BUSY',
             );
         }
-        fs.chmodSync(file, 0o600);
+        // The hard link retains the private temporary inode's 0600 mode. The
+        // canonical path is the publication boundary and is never mutated.
     } finally {
         try { fs.unlinkSync(tempFile); } catch (_) { }
     }

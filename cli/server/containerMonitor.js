@@ -1007,23 +1007,7 @@ async function activateRestartedContainerRoute(monitor, target, agentDir, result
     return true;
 }
 
-async function abortFailedRestartPreparation(monitor, target, result, reason) {
-    if (result?.requiresEdgeActivation === true && result?.exactCleanupPerformed !== true) {
-        try {
-            if (typeof monitor.cleanupFailedRuntime === 'function') {
-                await Promise.resolve(monitor.cleanupFailedRuntime(result.containerName || target.containerName, target));
-            } else {
-                await Promise.resolve(cleanupExactAgentRuntimeCandidate(result));
-            }
-        } catch (error) {
-            logEvent(monitor, 'error', 'container_restart_candidate_cleanup_failed', {
-                container: result.containerName || target.containerName,
-                agent: target.agentName,
-                repo: target.repoName,
-                error: error?.message || error,
-            });
-        }
-    }
+async function abortFailedRestartPreparation(monitor, target, result, reason, originalFailure) {
     if (result?.preparationLease) {
         const abortPreparation = monitor.abortEdgeRoutingPreparation || abortEdgeRoutingPreparation;
         try {
@@ -1032,6 +1016,43 @@ async function abortFailedRestartPreparation(monitor, target, result, reason) {
             }));
         } catch (error) {
             logEvent(monitor, 'error', 'container_restart_preparation_abort_failed', {
+                container: result.containerName || target.containerName,
+                agent: target.agentName,
+                repo: target.repoName,
+                error: error?.message || error,
+            });
+            const recoveryError = new Error(
+                `watchdog recovery could not abort the exact edge preparation for '${result.containerName || target.containerName}'; preserving its failed runtime candidate: ${error?.message || error}`,
+                { cause: error },
+            );
+            recoveryError.code = 'PLOINKY_RECOVERY_ABORT_FAILED';
+            Object.defineProperty(recoveryError, 'originalFailure', {
+                configurable: false,
+                enumerable: false,
+                writable: false,
+                value: originalFailure,
+            });
+            Object.defineProperty(recoveryError, 'ploinkyRestartCandidate', {
+                configurable: false,
+                enumerable: false,
+                writable: false,
+                value: Object.freeze({
+                    ...result,
+                    exactCleanupPerformed: false,
+                    preparationAbortFailed: true,
+                    preparationAbortedBeforeCleanup: false,
+                }),
+            });
+            throw recoveryError;
+        }
+    }
+    if (result?.requiresEdgeActivation === true && result?.exactCleanupPerformed !== true) {
+        const cleanupCandidate = monitor.cleanupExactAgentRuntimeCandidate
+            || cleanupExactAgentRuntimeCandidate;
+        try {
+            await Promise.resolve(cleanupCandidate(result));
+        } catch (error) {
+            logEvent(monitor, 'error', 'container_restart_candidate_cleanup_failed', {
                 container: result.containerName || target.containerName,
                 agent: target.agentName,
                 repo: target.repoName,
@@ -1048,16 +1069,6 @@ export async function performContainerRestart(monitor, target, reason, attempt =
         target.isRestarting = false;
         return;
     }
-    if (inspectWorkspaceStartLock().active) {
-        target.isRestarting = false;
-        logEvent(monitor, 'info', 'container_restart_deferred_workspace_start', {
-            container: target.containerName,
-            agent: target.agentName,
-            repo: target.repoName,
-        });
-        return;
-    }
-
     // A restart timer may have been scheduled immediately before a CLI
     // maintenance operation acquired its lock. Recheck at execution time so
     // the stale timer cannot race reinstall/restart staging.
@@ -1253,25 +1264,31 @@ export async function performContainerRestart(monitor, target, reason, attempt =
         });
         } catch (error) {
         const failedResult = result || error?.ploinkyRestartCandidate || null;
+        let surfacedError = error;
         if (!activationCommitted) {
-            await abortFailedRestartPreparation(monitor, target, failedResult, reason);
+            try {
+                await abortFailedRestartPreparation(monitor, target, failedResult, reason, error);
+            } catch (recoveryError) {
+                surfacedError = recoveryError;
+            }
         }
-        target.lastError = error?.message || error;
+        target.lastError = surfacedError?.message || surfacedError;
         logEvent(monitor, 'error', 'container_restart_failed', {
             container: target.containerName,
             agent: target.agentName,
             repo: target.repoName,
             reason,
-            error: target.lastError
+            error: target.lastError,
+            code: surfacedError?.code || null,
         });
-        if (error && typeof error === 'object') LOGGED_RESTART_FAILURES.add(error);
+        if (surfacedError && typeof surfacedError === 'object') LOGGED_RESTART_FAILURES.add(surfacedError);
         assertRestartAttemptCurrent(monitor, target, attempt, 'pre-failure-record', {
             expectedRegistryRecord: registryCandidateCommitted
                 ? failedResult?.registryRecord || null
                 : preActivationRegistryRecord(failedResult),
         });
         target.isRestarting = false;
-        throw error;
+        throw surfacedError;
         }
         });
     } finally {

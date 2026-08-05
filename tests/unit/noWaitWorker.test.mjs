@@ -13,6 +13,7 @@ import {
     cleanupNoWaitTaskOwnedCandidate,
     launchNoWaitHostRuntime,
     resolveNoWaitWorkerLifecycleSnapshot,
+    recoverNoWaitTaskOwnedCandidate,
     waitForNoWaitLifecycle,
     waitForNoWaitRouteActivation,
     waitForPriorWorker,
@@ -1160,7 +1161,7 @@ test('no-wait failure cleanup removes only a runtime created by this launch', as
     assert.deepEqual(aborted, ['exact-lease']);
 });
 
-test('no-wait cleanup aborts the exact preparation after candidate cleanup', async () => {
+test('no-wait cleanup aborts the exact preparation before candidate cleanup', async () => {
     const events = [];
     const preparationLease = { leaseId: 'prepared-exact' };
     await cleanupNoWaitTaskOwnedCandidate({
@@ -1176,10 +1177,10 @@ test('no-wait cleanup aborts the exact preparation after candidate cleanup', asy
             events.push(`abort:${received.leaseId}`);
         },
     });
-    assert.deepEqual(events, ['cleanup:prepared-runtime', 'abort:prepared-exact']);
+    assert.deepEqual(events, ['abort:prepared-exact', 'cleanup:prepared-runtime']);
 });
 
-test('no-wait cleanup still aborts preparation when exact candidate removal fails', async () => {
+test('no-wait cleanup reports candidate removal failure only after preparation abort', async () => {
     const events = [];
     const preparationLease = { leaseId: 'prepared-cleanup-failure' };
     await assert.rejects(cleanupNoWaitTaskOwnedCandidate({
@@ -1196,5 +1197,131 @@ test('no-wait cleanup still aborts preparation when exact candidate removal fail
             events.push('abort');
         },
     }), /cleanup failed/);
-    assert.deepEqual(events, ['cleanup', 'abort']);
+    assert.deepEqual(events, ['abort', 'cleanup']);
+});
+
+test('no-wait cleanup preserves the exact candidate when preparation abort fails', async () => {
+    const preparationLease = { leaseId: 'prepared-abort-failure' };
+    const originalFailure = new Error('no-wait launch failed');
+    const abortFailure = new Error('durable abort failed');
+    let cleanupCalls = 0;
+
+    await assert.rejects(cleanupNoWaitTaskOwnedCandidate({
+        containerName: 'preserved-no-wait-runtime',
+        requiresEdgeActivation: true,
+        preparationLease,
+        cleanupReceipt: { operationId: 'preserved-no-wait-cleanup' },
+    }, {
+        originalFailure,
+        cleanup() { cleanupCalls += 1; },
+        abortPreparation(received, options) {
+            assert.equal(received, preparationLease);
+            assert.deepEqual(options, { reason: 'no-wait-task-runtime-failed' });
+            throw abortFailure;
+        },
+    }), (error) => (
+        error?.code === 'PLOINKY_RECOVERY_ABORT_FAILED'
+        && error.cause === abortFailure
+        && error.originalFailure === originalFailure
+        && error.ploinkyRestartCandidate?.containerName === 'preserved-no-wait-runtime'
+        && error.ploinkyRestartCandidate?.preparationAbortFailed === true
+    ));
+
+    assert.equal(cleanupCalls, 0);
+});
+
+test('no-wait recovery propagates abort failure without retrying abort or cleanup', async () => {
+    const preparationLease = { leaseId: 'prepared-abort-propagation' };
+    const originalFailure = new Error('no-wait launch failed');
+    let abortCalls = 0;
+    let cleanupCalls = 0;
+    const candidate = {
+        containerName: 'preserved-no-wait-runtime',
+        requiresEdgeActivation: true,
+        preparationLease,
+    };
+
+    const recoveryFailure = await recoverNoWaitTaskOwnedCandidate(candidate, originalFailure, {
+        abortPreparation() {
+            abortCalls += 1;
+            throw new Error('durable abort failed');
+        },
+        cleanup() { cleanupCalls += 1; },
+    });
+    assert.equal(recoveryFailure.code, 'PLOINKY_RECOVERY_ABORT_FAILED');
+    assert.equal(recoveryFailure.originalFailure, originalFailure);
+    assert.equal(recoveryFailure.ploinkyRestartCandidate.containerName, candidate.containerName);
+
+    const propagated = await recoverNoWaitTaskOwnedCandidate(candidate, recoveryFailure, {
+        abortPreparation() { abortCalls += 1; },
+        cleanup() { cleanupCalls += 1; },
+    });
+    assert.equal(propagated, recoveryFailure);
+    assert.equal(abortCalls, 1);
+    assert.equal(cleanupCalls, 0);
+});
+
+test('no-wait recovery reports cleanup failure after one successful abort', async () => {
+    const originalFailure = new Error('no-wait launch failed');
+    const events = [];
+    const failure = await recoverNoWaitTaskOwnedCandidate({
+        containerName: 'cleanup-failed-no-wait-runtime',
+        requiresEdgeActivation: true,
+        preparationLease: { leaseId: 'prepared-cleanup-propagation' },
+    }, originalFailure, {
+        abortPreparation() { events.push('abort'); },
+        cleanup(candidate) {
+            events.push('cleanup');
+            assert.equal(candidate.preparationAbortedBeforeCleanup, true);
+            throw new Error('runtime removal failed');
+        },
+    });
+
+    assert.equal(failure, originalFailure);
+    assert.match(failure.message, /runtime removal failed/);
+    assert.equal(failure.ploinkyRestartCandidate.preparationAbortedBeforeCleanup, true);
+    assert.deepEqual(events, ['abort', 'cleanup']);
+
+    const replayed = await recoverNoWaitTaskOwnedCandidate(
+        failure.ploinkyRestartCandidate,
+        failure,
+        {
+            abortPreparation() { events.push('abort-replay'); },
+            cleanup(candidate) {
+                events.push('cleanup-replay');
+                assert.equal(candidate.preparationAbortedBeforeCleanup, true);
+                throw new Error('runtime removal still failed');
+            },
+        },
+    );
+    assert.equal(replayed, failure);
+    assert.deepEqual(events, ['abort', 'cleanup', 'cleanup-replay']);
+});
+
+test('no-wait successful recovery replay neither aborts nor cleans the exact candidate twice', async () => {
+    const originalFailure = new Error('no-wait launch failed');
+    const candidate = Object.freeze({
+        containerName: 'successfully-cleaned-no-wait-runtime',
+        requiresEdgeActivation: true,
+        preparationLease: Object.freeze({ leaseId: 'successful-no-wait-recovery' }),
+        cleanupReceipt: Object.freeze({ operationId: 'successful-no-wait-cleanup' }),
+    });
+    const events = [];
+    const options = {
+        abortPreparation() { events.push('abort'); },
+        cleanup() { events.push('cleanup'); },
+    };
+
+    assert.equal(
+        await recoverNoWaitTaskOwnedCandidate(candidate, originalFailure, options),
+        originalFailure,
+    );
+    assert.equal(
+        await recoverNoWaitTaskOwnedCandidate(candidate, originalFailure, options),
+        originalFailure,
+    );
+    assert.deepEqual(events, ['abort', 'cleanup']);
+    assert.equal(originalFailure.ploinkyRestartCandidate.preparationAbortedBeforeCleanup, true);
+    assert.equal(originalFailure.ploinkyRestartCandidate.exactCleanupPerformed, true);
+    assert.equal(Object.isFrozen(originalFailure.ploinkyRestartCandidate), true);
 });

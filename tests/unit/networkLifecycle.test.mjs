@@ -829,6 +829,254 @@ test('managed launch hooks remain ordered under the transaction and failed attes
     );
 });
 
+test('prepared managed launch aborts its exact preparation before runtime and descriptor cleanup', (t) => {
+    const harness = networkHarness(t);
+    const network = canonicalizeNetwork({ mode: 'default' });
+    const candidateId = 'abortordered12345';
+    const events = [];
+    let callsAtAbort = -1;
+
+    assert.throws(() => harness.adapter.runManagedContainerTransaction({
+        network,
+        canonicalAgentId: 'demo',
+        containerName: 'demo-container',
+        runtimeIdentity: TEST_RUNTIME_IDENTITY,
+        prepareLaunch() {
+            return Object.freeze({
+                cleanup() {
+                    events.push('descriptor-cleanup');
+                    assert.equal(harness.containers.has(candidateId), false);
+                },
+            });
+        },
+        createContainer(plan) {
+            const primary = plan.attachments[0];
+            const candidate = managedAgentRecord({
+                id: candidateId,
+                name: 'demo-container',
+                labels: managedAgentLabels(harness.identity, network),
+                networks: { [primary.name]: { Aliases: [plan.alias, candidateId.slice(0, 12)] } },
+            });
+            harness.containers.set(candidateId, candidate);
+            harness.networks.get(primary.name).Containers[candidateId] = { Name: candidate.Name };
+        },
+        preStartLaunch() { throw new Error('injected prepared launch failure'); },
+        beforeFailureCleanup(evidence) {
+            events.push('preparation-abort');
+            callsAtAbort = harness.calls.length;
+            assert.equal(evidence.candidateId, candidateId);
+            assert.equal(evidence.candidateOwned, true);
+            assert.equal(harness.containers.has(candidateId), true);
+        },
+    }), (error) => (
+        /injected prepared launch failure/.test(error.message)
+        && error.ploinkyManagedFailureRecovery?.preparationAbortedBeforeCleanup === true
+        && error.ploinkyManagedFailureRecovery?.exactCleanupPerformed === true
+    ));
+
+    assert.deepEqual(events, ['preparation-abort', 'descriptor-cleanup']);
+    const destructiveAfterAbort = harness.calls.slice(callsAtAbort)
+        .findIndex((args) => args[0] === 'rm' && args.at(-1) === candidateId);
+    assert.ok(destructiveAfterAbort >= 0, 'exact candidate removal must occur only after preparation abort');
+});
+
+test('prepared managed launch preserves runtime descriptor and network evidence when abort fails', (t) => {
+    const harness = networkHarness(t);
+    const network = canonicalizeNetwork({ mode: 'default' });
+    const candidateId = 'abortpreserved123';
+    const abortFailure = new Error('injected durable abort failure');
+    abortFailure.code = 'PLOINKY_RECOVERY_ABORT_FAILED';
+    let artifactCleanups = 0;
+    const callsBefore = harness.calls.length;
+
+    assert.throws(() => harness.adapter.runManagedContainerTransaction({
+        network,
+        canonicalAgentId: 'demo',
+        containerName: 'demo-container',
+        runtimeIdentity: TEST_RUNTIME_IDENTITY,
+        prepareLaunch() {
+            return Object.freeze({ cleanup() { artifactCleanups += 1; } });
+        },
+        createContainer(plan) {
+            const primary = plan.attachments[0];
+            const candidate = managedAgentRecord({
+                id: candidateId,
+                name: 'demo-container',
+                labels: managedAgentLabels(harness.identity, network),
+                networks: { [primary.name]: { Aliases: [plan.alias, candidateId.slice(0, 12)] } },
+            });
+            harness.containers.set(candidateId, candidate);
+            harness.networks.get(primary.name).Containers[candidateId] = { Name: candidate.Name };
+        },
+        preStartLaunch() { throw new Error('injected pre-start failure'); },
+        beforeFailureCleanup() { throw abortFailure; },
+    }), (error) => (
+        error === abortFailure
+        && error.ploinkyManagedFailureRecovery?.preparationAbortFailed === true
+        && error.ploinkyManagedFailureRecovery?.candidateId === candidateId
+        && error.ploinkyManagedFailureRecovery?.exactCleanupPerformed === false
+    ));
+
+    assert.equal(harness.containers.has(candidateId), true);
+    assert.equal(artifactCleanups, 0);
+    assert.ok(harness.networks.size > 0);
+    assert.equal(harness.calls.slice(callsBefore).some((args) => (
+        args[0] === 'rm' && args.at(-1) === candidateId
+    )), false);
+});
+
+test('partial two-attachment preparation abort failure preserves every created network before rollback', (t) => {
+    const harness = networkHarness(t);
+    const network = canonicalizeNetwork({
+        mode: 'bridge',
+        attachments: [{ name: 'front', primary: true }, { name: 'data' }],
+    });
+    const abortFailure = Object.assign(new Error('durable partial-network abort failed'), {
+        code: 'PLOINKY_RECOVERY_ABORT_FAILED',
+    });
+    let createCount = 0;
+    const run = (runtime, args) => {
+        if (args[0] === 'network' && args[1] === 'create') {
+            createCount += 1;
+            if (createCount === 2) {
+                harness.calls.push([...args]);
+                return { ...absent('network'), stderr: 'injected second attachment creation failure' };
+            }
+        }
+        return harness.run(runtime, args);
+    };
+    const adapter = createNetworkLifecycleAdapter({
+        runtime: 'podman',
+        run,
+        workspaceRoot: harness.identity.canonical,
+        lockPath: path.join(harness.dir, 'partial-two-attachment.lock'),
+    });
+    const callsBefore = harness.calls.length;
+
+    assert.throws(() => adapter.runManagedContainerTransaction({
+        network,
+        canonicalAgentId: 'demo',
+        containerName: 'demo-container',
+        runtimeIdentity: TEST_RUNTIME_IDENTITY,
+        createContainer() { assert.fail('container creation must not run'); },
+        beforeFailureCleanup(evidence) {
+            assert.equal(harness.networks.size, 1);
+            assert.equal(evidence.createdNetworks.length, 1);
+            assert.equal(Object.isFrozen(evidence.createdNetworks), true);
+            throw abortFailure;
+        },
+    }), (error) => (
+        error === abortFailure
+        && error.ploinkyManagedFailureRecovery?.preparationAbortFailed === true
+        && error.ploinkyManagedFailureRecovery?.resourcesRolledBack === false
+        && error.ploinkyManagedFailureRecovery?.createdNetworks?.length === 1
+        && Object.isFrozen(error.ploinkyManagedFailureRecovery.createdNetworks)
+        && Object.isFrozen(
+            error.ploinkyManagedFailureRecovery.createdNetworks[0].cleanupReceipt,
+        )
+    ));
+
+    assert.equal(harness.networks.size, 1);
+    assert.equal(harness.calls.slice(callsBefore).some((args) => (
+        args[0] === 'network' && args[1] === 'rm'
+    )), false);
+});
+
+test('successful abort removes a policy-invalid new network using its exact cleanup receipt', (t) => {
+    const harness = networkHarness(t);
+    const network = canonicalizeNetwork({ mode: 'default' });
+    let createdName = '';
+    let invalidated = false;
+    let callsAtAbort = -1;
+    const run = (runtime, args) => {
+        const result = harness.run(runtime, args);
+        if (args[0] === 'network' && args[1] === 'create' && result.ok) {
+            createdName = args.at(-1);
+        }
+        if (args[0] === 'network' && args[1] === 'inspect'
+            && args[2] === createdName && createdName && !invalidated) {
+            invalidated = true;
+            harness.networks.get(createdName).Options.isolate = 'false';
+            return ok(JSON.stringify([harness.networks.get(createdName)]));
+        }
+        return result;
+    };
+    const adapter = createNetworkLifecycleAdapter({
+        runtime: 'podman',
+        run,
+        workspaceRoot: harness.identity.canonical,
+        lockPath: path.join(harness.dir, 'invalid-new-network.lock'),
+    });
+
+    assert.throws(() => adapter.runManagedContainerTransaction({
+        network,
+        canonicalAgentId: 'demo',
+        containerName: 'demo-container',
+        runtimeIdentity: TEST_RUNTIME_IDENTITY,
+        createContainer() { assert.fail('container creation must not run'); },
+        beforeFailureCleanup(evidence) {
+            callsAtAbort = harness.calls.length;
+            assert.equal(harness.networks.has(createdName), true);
+            assert.equal(evidence.createdNetworks[0].cleanupReceipt.name, createdName);
+        },
+    }), (error) => (
+        /isolate=true/.test(error.message)
+        && error.ploinkyManagedFailureRecovery?.preparationAbortedBeforeCleanup === true
+        && error.ploinkyManagedFailureRecovery?.resourcesRolledBack === true
+    ));
+
+    assert.equal(harness.networks.has(createdName), false);
+    assert.ok(harness.calls.slice(callsAtAbort).some((args) => (
+        args[0] === 'network' && args[1] === 'rm' && args[2] === createdName
+    )));
+});
+
+test('successful abort preserves a policy-invalid new network after ownership labels become foreign', (t) => {
+    const harness = networkHarness(t);
+    const network = canonicalizeNetwork({ mode: 'default' });
+    let createdName = '';
+    let replaced = false;
+    const run = (runtime, args) => {
+        const result = harness.run(runtime, args);
+        if (args[0] === 'network' && args[1] === 'create' && result.ok) {
+            createdName = args.at(-1);
+        }
+        if (args[0] === 'network' && args[1] === 'inspect'
+            && args[2] === createdName && createdName && !replaced) {
+            replaced = true;
+            harness.networks.get(createdName).Labels.foreign = 'replacement';
+            return ok(JSON.stringify([harness.networks.get(createdName)]));
+        }
+        return result;
+    };
+    const adapter = createNetworkLifecycleAdapter({
+        runtime: 'podman',
+        run,
+        workspaceRoot: harness.identity.canonical,
+        lockPath: path.join(harness.dir, 'foreign-new-network.lock'),
+    });
+
+    assert.throws(() => adapter.runManagedContainerTransaction({
+        network,
+        canonicalAgentId: 'demo',
+        containerName: 'demo-container',
+        runtimeIdentity: TEST_RUNTIME_IDENTITY,
+        createContainer() { assert.fail('container creation must not run'); },
+        beforeFailureCleanup(evidence) {
+            assert.equal(evidence.createdNetworks[0].cleanupReceipt.name, createdName);
+        },
+    }), (error) => (
+        /exact label keys/.test(error.message)
+        && /rollback preserved/.test(error.message)
+        && error.ploinkyManagedFailureRecovery?.preparationAbortedBeforeCleanup === true
+    ));
+
+    assert.equal(harness.networks.has(createdName), true);
+    assert.equal(harness.calls.some((args) => (
+        args[0] === 'network' && args[1] === 'rm' && args[2] === createdName
+    )), false);
+});
+
 test('fresh semantic adoption reuses one exact immutable runtime without stop, remove, or create', (t) => {
     const harness = networkHarness(t);
     const network = canonicalizeNetwork({ mode: 'default' });

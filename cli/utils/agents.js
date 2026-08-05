@@ -55,6 +55,7 @@ import {
 import { applyEdgeRoutingGeneration } from '../sandbox/coordinatedEdgeApply.js';
 import { resolveManifestStartup } from './runtime/manifestStartup.js';
 import { withNetworkLifecycleLock } from '../sandbox/networkLifecycle.js';
+import { withWorkspaceMutationLease } from './runtime/maintenanceLocks.js';
 import {
     admitManifestRuntimeCapabilities,
     assertRuntimeAdmissionCurrent,
@@ -83,6 +84,114 @@ function wrapLifecycleError(message, cause) {
         if (cause?.[field] !== undefined) error[field] = cause[field];
     }
     return error;
+}
+
+function attachAgentRecoveryCandidate(error, candidate) {
+    if (!error || typeof error !== 'object' || !candidate) return error;
+    const frozenCandidate = Object.isFrozen(candidate)
+        ? candidate
+        : Object.freeze({ ...candidate });
+    const descriptor = Object.getOwnPropertyDescriptor(error, 'ploinkyRestartCandidate');
+    if (!descriptor || descriptor.configurable === true) {
+        Object.defineProperty(error, 'ploinkyRestartCandidate', {
+            configurable: true,
+            enumerable: false,
+            writable: false,
+            value: frozenCandidate,
+        });
+    }
+    return error;
+}
+
+export function recoverFailedAgentEnableCandidate(failedCandidate, failedLease, originalFailure, {
+    abortPreparation = abortEdgeRoutingPreparation,
+    cleanupCandidate: cleanupCandidateImpl = cleanupExactAgentRuntimeCandidate,
+    reason = 'agent-enable-start-failed',
+    operation = 'enable-agent recovery',
+} = {}) {
+    if (originalFailure?.code === 'PLOINKY_RECOVERY_ABORT_FAILED') {
+        throw originalFailure;
+    }
+    const attachedDescriptor = originalFailure && typeof originalFailure === 'object'
+        ? Object.getOwnPropertyDescriptor(originalFailure, 'ploinkyRestartCandidate')
+        : null;
+    const attachedCandidate = attachedDescriptor
+        && attachedDescriptor.writable === false
+        && attachedDescriptor.value
+        && typeof attachedDescriptor.value === 'object'
+        && Object.isFrozen(attachedDescriptor.value)
+        ? attachedDescriptor.value
+        : null;
+    if (attachedCandidate) failedCandidate = attachedCandidate;
+    const preparationLease = failedCandidate?.preparationLease || failedLease || null;
+    let cleanupCandidate = failedCandidate;
+    if (preparationLease && failedCandidate?.preparationAbortedBeforeCleanup !== true) {
+        try {
+            abortPreparation(preparationLease, { reason });
+        } catch (abortError) {
+            const recoveryError = new Error(
+                `${operation} could not abort the exact edge preparation; preserving its failed runtime state: ${abortError?.message || abortError}`,
+                { cause: abortError },
+            );
+            recoveryError.code = 'PLOINKY_RECOVERY_ABORT_FAILED';
+            Object.defineProperty(recoveryError, 'originalFailure', {
+                configurable: false,
+                enumerable: false,
+                writable: false,
+                value: originalFailure,
+            });
+            Object.defineProperty(recoveryError, 'ploinkyRecoveryPreparation', {
+                configurable: false,
+                enumerable: false,
+                writable: false,
+                value: Object.freeze({
+                    preparationLease,
+                    reason,
+                    preparationAbortFailed: true,
+                    preparationAbortedBeforeCleanup: false,
+                }),
+            });
+            if (failedCandidate) {
+                Object.defineProperty(recoveryError, 'ploinkyRestartCandidate', {
+                    configurable: false,
+                    enumerable: false,
+                    writable: false,
+                    value: Object.freeze({
+                        ...failedCandidate,
+                        exactCleanupPerformed: false,
+                        preparationAbortFailed: true,
+                        preparationAbortedBeforeCleanup: false,
+                    }),
+                });
+            }
+            throw recoveryError;
+        }
+        if (failedCandidate) {
+            cleanupCandidate = Object.freeze({
+                ...failedCandidate,
+                preparationAbortFailed: false,
+                preparationAbortedBeforeCleanup: true,
+            });
+        }
+    } else if (failedCandidate && !Object.isFrozen(failedCandidate)) {
+        cleanupCandidate = Object.freeze({ ...failedCandidate });
+    }
+    if (cleanupCandidate) attachAgentRecoveryCandidate(originalFailure, cleanupCandidate);
+    if (cleanupCandidate?.containerName
+        && cleanupCandidate?.cleanupReceipt
+        && cleanupCandidate.exactCleanupPerformed !== true) {
+        try {
+            cleanupCandidateImpl(cleanupCandidate);
+            cleanupCandidate = Object.freeze({
+                ...cleanupCandidate,
+                exactCleanupPerformed: true,
+            });
+            attachAgentRecoveryCandidate(originalFailure, cleanupCandidate);
+        } catch (cleanupError) {
+            originalFailure.message = `${originalFailure.message}; exact candidate cleanup failed: ${cleanupError?.message || cleanupError}`;
+        }
+    }
+    return cleanupCandidate || true;
 }
 
 export function preferredHostPortForNetworkMode(existingRoute, networkMode) {
@@ -735,13 +844,15 @@ export function prepareAgentEnableBatch(requests, {
             }
         });
     } catch (error) {
-        try {
-            if (preparedGeneration?.preparationLease) {
-                abortEdgeRoutingPreparation(preparedGeneration.preparationLease, {
-                    reason: 'agent-enable-batch-prepare-failed',
-                });
-            }
-        } catch (_) {}
+        recoverFailedAgentEnableCandidate(
+            null,
+            preparedGeneration?.preparationLease,
+            error,
+            {
+                reason: 'agent-enable-batch-prepare-failed',
+                operation: 'prepare-agent-enable-batch recovery',
+            },
+        );
         throw wrapLifecycleError(
             `prepare agent enable batch: candidate generation rejected: ${error?.message || error}`,
             error,
@@ -759,6 +870,7 @@ export function prepareAgentEnableBatch(requests, {
 }
 
 export async function enableAgent(agentName, mode, repoNameParam, aliasParam, authModeParam, authOptions = {}) {
+    return withWorkspaceMutationLease({ operation: 'agent-enable' }, async () => {
     let prepared;
     try {
         prepared = prepareAgentEnableBatch([{
@@ -878,29 +990,15 @@ export async function enableAgent(agentName, mode, repoNameParam, aliasParam, au
         });
     } catch (error) {
         const failedCandidate = started || error?.ploinkyRestartCandidate || null;
-        if (failedCandidate?.containerName
-            && failedCandidate?.cleanupReceipt
-            && failedCandidate.exactCleanupPerformed !== true) {
-            try {
-                cleanupExactAgentRuntimeCandidate(failedCandidate);
-            } catch (cleanupError) {
-                error.message = `${error.message}; exact candidate cleanup failed: ${cleanupError?.message || cleanupError}`;
-            }
-        }
-        try {
-            const failedLease = started?.preparationLease
-                || prepared?.preparedGeneration?.preparationLease;
-            if (failedLease) {
-                abortEdgeRoutingPreparation(failedLease, {
-                    reason: 'agent-enable-start-failed',
-                });
-            }
-        } catch (_) {}
+        const failedLease = started?.preparationLease
+            || prepared?.preparedGeneration?.preparationLease;
+        recoverFailedAgentEnableCandidate(failedCandidate, failedLease, error);
         throw wrapLifecycleError(
             `enable agent: failed to start '${shortAgentName}': ${error?.message || error}`,
             error,
         );
     }
+    });
 }
 
 function routeKeyForEnabledRecord(record) {
@@ -934,6 +1032,7 @@ function stageAgentDisableGeneration(map, disabledRecords, {
     readRoutingImpl = loadRoutingConfig,
     writeRoutingImpl = (routing) => writeRoutingConfig(routing, { coordinate: false }),
     prepareGeneration = prepareEdgeRoutingGeneration,
+    abortPreparation = abortEdgeRoutingPreparation,
     withApplyLock = withEdgeGenerationApplyLock,
 } = {}) {
     return withApplyLock((applyLockCapability) => {
@@ -943,7 +1042,20 @@ function stageAgentDisableGeneration(map, disabledRecords, {
         writeRoutingImpl(routing, { coordinate: false, applyLockCapability });
         const prepared = prepareGeneration({ reason, applyLockCapability });
         if (prepared?.selector?.state !== 'inactive') {
-            throw new Error('disable agent: prepared route-removal generation did not remain inactive');
+            const invalidPreparation = new Error(
+                'disable agent: prepared route-removal generation did not remain inactive',
+            );
+            recoverFailedAgentEnableCandidate(
+                null,
+                prepared?.preparationLease,
+                invalidPreparation,
+                {
+                    abortPreparation,
+                    reason: `${reason}-invalid`,
+                    operation: 'disable-agent generation-preparation recovery',
+                },
+            );
+            throw invalidPreparation;
         }
         return prepared;
     });
@@ -966,11 +1078,11 @@ function commitAgentDisableGeneration(prepared, {
                 preserveSelectedGeneration: true,
             });
         } catch (_) {}
-        try {
-            if (prepared?.preparationLease) {
-                abortPreparation(prepared.preparationLease, { reason: `${reason}-failed` });
-            }
-        } catch (_) {}
+        recoverFailedAgentEnableCandidate(null, prepared?.preparationLease, error, {
+            abortPreparation,
+            reason: `${reason}-failed`,
+            operation: 'disable-agent generation-commit recovery',
+        });
         throw error;
     }
 }
@@ -1106,6 +1218,7 @@ export function disableAgent(agentRef, dependencies = {}) {
             const prepared = stageAgentDisableGeneration(map, disabledStaticRecords, {
                 ...dependencies,
                 inactivateGeneration,
+                abortPreparation,
                 reason: 'agent-disable-static-prepare',
             });
             try {
@@ -1116,12 +1229,16 @@ export function disableAgent(agentRef, dependencies = {}) {
                         preserveSelectedGeneration: true,
                     });
                 } catch (_) {}
-                try {
-                    abortPreparation(prepared.preparationLease, {
-                        reason: 'agent-disable-static-runtime-removal-failed',
-                    });
-                } catch (_) {}
-                throw new Error(`disable agent: failed to stop and remove static runtime '${staticContainer}': ${error?.message || error}`);
+                const removalFailure = new Error(
+                    `disable agent: failed to stop and remove static runtime '${staticContainer}': ${error?.message || error}`,
+                    { cause: error },
+                );
+                recoverFailedAgentEnableCandidate(null, prepared.preparationLease, removalFailure, {
+                    abortPreparation,
+                    reason: 'agent-disable-static-runtime-removal-failed',
+                    operation: 'disable-agent static-runtime recovery',
+                });
+                throw removalFailure;
             }
             commitAgentDisableGeneration(prepared, {
                 reason: 'agent-disable-static-commit',
@@ -1163,6 +1280,7 @@ export function disableAgent(agentRef, dependencies = {}) {
     const prepared = stageAgentDisableGeneration(map, disabledRecords, {
         ...dependencies,
         inactivateGeneration,
+        abortPreparation,
         reason: 'agent-disable-prepare',
     });
     try {
@@ -1173,8 +1291,16 @@ export function disableAgent(agentRef, dependencies = {}) {
                 preserveSelectedGeneration: true,
             });
         } catch (_) {}
-        try { abortPreparation(prepared.preparationLease, { reason: 'agent-disable-runtime-removal-failed' }); } catch (_) {}
-        throw new Error(`disable agent: failed to stop and remove container '${containerName}': ${error?.message || error}`);
+        const removalFailure = new Error(
+            `disable agent: failed to stop and remove container '${containerName}': ${error?.message || error}`,
+            { cause: error },
+        );
+        recoverFailedAgentEnableCandidate(null, prepared.preparationLease, removalFailure, {
+            abortPreparation,
+            reason: 'agent-disable-runtime-removal-failed',
+            operation: 'disable-agent runtime recovery',
+        });
+        throw removalFailure;
     }
     commitAgentDisableGeneration(prepared, {
         reason: 'agent-disable-commit',
@@ -1275,6 +1401,7 @@ export function disableAgentContainers(containerNames = [], dependencies = {}) {
     const prepared = stageAgentDisableGeneration(map, disabledRecords, {
         ...dependencies,
         inactivateGeneration,
+        abortPreparation,
         reason: 'agent-disable-batch-prepare',
     });
     try {
@@ -1285,8 +1412,16 @@ export function disableAgentContainers(containerNames = [], dependencies = {}) {
                 preserveSelectedGeneration: true,
             });
         } catch (_) {}
-        try { abortPreparation(prepared.preparationLease, { reason: 'agent-disable-batch-runtime-removal-failed' }); } catch (_) {}
-        throw new Error(`disable agents: failed to stop and remove containers: ${error?.message || error}`);
+        const removalFailure = new Error(
+            `disable agents: failed to stop and remove containers: ${error?.message || error}`,
+            { cause: error },
+        );
+        recoverFailedAgentEnableCandidate(null, prepared.preparationLease, removalFailure, {
+            abortPreparation,
+            reason: 'agent-disable-batch-runtime-removal-failed',
+            operation: 'disable-agents batch-runtime recovery',
+        });
+        throw removalFailure;
     }
     commitAgentDisableGeneration(prepared, {
         reason: 'agent-disable-batch-commit',

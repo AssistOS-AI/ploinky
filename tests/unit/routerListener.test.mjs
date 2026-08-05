@@ -2,32 +2,86 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import fs from 'node:fs';
+import http from 'node:http';
+import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
-import { waitForRouterReady } from '../../cli/commands/workspaceUtil.js';
+import { probeRouterHealthSocket, waitForRouterReady } from '../../cli/commands/workspaceUtil.js';
 
 const repoRoot = path.resolve(fileURLToPath(new URL('../..', import.meta.url)));
 const routingServerPath = path.join(repoRoot, 'cli/server/RoutingServer.js');
 
-test('router readiness is TCP-only against 127.0.0.1', async () => {
+function connectedSocket(attempts) {
+    return (options) => {
+        attempts.push(options);
+        const socket = new EventEmitter();
+        socket.destroy = () => {};
+        socket.setTimeout = () => {};
+        queueMicrotask(() => socket.emit('connect'));
+        return socket;
+    };
+}
+
+test('router readiness requires both loopback TCP and the exact workspace health socket', async () => {
     const attempts = [];
+    const healthAttempts = [];
     await waitForRouterReady(8080, null, 500, {
-        createConnection(options) {
-            attempts.push(options);
-            const socket = new EventEmitter();
-            socket.destroy = () => {};
-            socket.setTimeout = () => {};
-            queueMicrotask(() => socket.emit('connect'));
-            return socket;
+        createConnection: connectedSocket(attempts),
+        healthSocketPath: '/exact/workspace/router-health.sock',
+        async probeHealthSocket(socketPath) {
+            healthAttempts.push(socketPath);
+            return true;
         },
     });
     assert.deepEqual(attempts, [{ host: '127.0.0.1', port: 8080 }]);
+    assert.deepEqual(healthAttempts, ['/exact/workspace/router-health.sock']);
+
+    await assert.rejects(
+        () => waitForRouterReady(8080, null, 10, {
+            createConnection: connectedSocket([]),
+            healthSocketPath: '/foreign/workspace/router-health.sock',
+            probeHealthSocket: async () => false,
+        }),
+        (error) => {
+            assert.equal(error.code, 'PLOINKY_ROUTER_WORKSPACE_MISMATCH');
+            assert.match(error.message, /occupied without the exact workspace Router health socket/);
+            return true;
+        },
+    );
     await assert.rejects(
         () => waitForRouterReady(42817, null, 1),
         /must be exactly 8080/,
     );
+});
+
+test('exact Router health probe requires an owned mode-0600 socket and canonical response', async (t) => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-router-health-'));
+    const socketPath = path.join(dir, 'router-health.sock');
+    const server = http.createServer((_request, response) => {
+        response.writeHead(200, { 'content-type': 'application/json' });
+        response.end(JSON.stringify({ status: 'healthy', pid: process.pid }));
+    });
+    await new Promise((resolve, reject) => {
+        server.once('error', reject);
+        server.listen(socketPath, resolve);
+    });
+    t.after(async () => {
+        await new Promise((resolve) => server.close(resolve));
+        fs.rmSync(dir, { recursive: true, force: true });
+    });
+
+    fs.chmodSync(socketPath, 0o666);
+    assert.equal(await probeRouterHealthSocket(socketPath), false);
+    fs.chmodSync(socketPath, 0o600);
+    assert.equal(await probeRouterHealthSocket(socketPath), true);
+});
+
+test('Router shutdown never infers process ownership from a shared TCP port', () => {
+    const source = fs.readFileSync(path.join(repoRoot, 'cli/commands/sessionControl.js'), 'utf8');
+    assert.doesNotMatch(source, /\blsof\b|\bss -ltnp\b|port_scan|findPids/);
+    assert.match(source, /path\.join\(RUNNING_DIR, 'router\.pid'\)/);
 });
 
 test('RoutingServer fixes public 8080 and delegates private 8081 to exact interface listeners', () => {

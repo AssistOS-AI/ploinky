@@ -304,33 +304,129 @@ export function assertNoWaitRegistryRecord(record, stagedRecord, {
     return record;
 }
 
+function attachNoWaitRecoveryCandidate(error, candidate) {
+    if (!error || typeof error !== 'object' || !candidate) return error;
+    const frozenCandidate = Object.isFrozen(candidate)
+        ? candidate
+        : Object.freeze({ ...candidate });
+    const descriptor = Object.getOwnPropertyDescriptor(error, 'ploinkyRestartCandidate');
+    if (!descriptor || descriptor.configurable === true) {
+        Object.defineProperty(error, 'ploinkyRestartCandidate', {
+            configurable: true,
+            enumerable: false,
+            writable: false,
+            value: frozenCandidate,
+        });
+    }
+    return error;
+}
+
 export async function cleanupNoWaitTaskOwnedCandidate(candidate, {
     cleanup = dockerSvc.cleanupExactAgentRuntimeCandidate,
     abortPreparation = abortEdgeRoutingPreparation,
+    originalFailure = null,
 } = {}) {
     if (candidate?.createdByThisLaunch !== true
         && !(candidate?.requiresEdgeActivation === true && candidate?.preparationLease)) return false;
-    let cleanupFailure = null;
-    try {
-        await Promise.resolve(cleanup(candidate));
-    } catch (error) {
-        cleanupFailure = error;
+    if (candidate?.preparationAbortFailed === true
+        && originalFailure?.code === 'PLOINKY_RECOVERY_ABORT_FAILED') {
+        throw originalFailure;
     }
-    try {
-        if (candidate?.preparationLease) {
-            await Promise.resolve(abortPreparation(candidate.preparationLease));
-        }
-    } catch (abortFailure) {
-        if (cleanupFailure) {
-            throw new AggregateError(
-                [cleanupFailure, abortFailure],
-                'exact no-wait runtime cleanup and preparation abort both failed',
+    let cleanupCandidate = candidate;
+    if (candidate?.preparationLease
+        && candidate?.preparationAbortedBeforeCleanup !== true) {
+        try {
+            await Promise.resolve(abortPreparation(candidate.preparationLease, {
+                reason: 'no-wait-task-runtime-failed',
+            }));
+            cleanupCandidate = Object.freeze({
+                ...candidate,
+                preparationAbortedBeforeCleanup: true,
+                preparationAbortFailed: false,
+            });
+            attachNoWaitRecoveryCandidate(originalFailure, cleanupCandidate);
+        } catch (abortFailure) {
+            const recoveryError = new Error(
+                `no-wait recovery could not abort the exact edge preparation; preserving its failed runtime candidate: ${abortFailure?.message || abortFailure}`,
+                { cause: abortFailure },
             );
+            recoveryError.code = 'PLOINKY_RECOVERY_ABORT_FAILED';
+            Object.defineProperty(recoveryError, 'originalFailure', {
+                configurable: false,
+                enumerable: false,
+                writable: false,
+                value: originalFailure,
+            });
+            Object.defineProperty(recoveryError, 'ploinkyRestartCandidate', {
+                configurable: false,
+                enumerable: false,
+                writable: false,
+                value: Object.freeze({
+                    ...candidate,
+                    exactCleanupPerformed: false,
+                    preparationAbortFailed: true,
+                    preparationAbortedBeforeCleanup: false,
+                }),
+            });
+            throw recoveryError;
         }
-        throw abortFailure;
     }
-    if (cleanupFailure) throw cleanupFailure;
+    if (candidate.exactCleanupPerformed !== true) {
+        try {
+            await Promise.resolve(cleanup(cleanupCandidate));
+            cleanupCandidate = Object.freeze({
+                ...cleanupCandidate,
+                exactCleanupPerformed: true,
+            });
+            attachNoWaitRecoveryCandidate(originalFailure, cleanupCandidate);
+        } catch (cleanupFailure) {
+            if (cleanupFailure instanceof Error
+                && !cleanupFailure.ploinkyRestartCandidate) {
+                Object.defineProperty(cleanupFailure, 'ploinkyRestartCandidate', {
+                    configurable: false,
+                    enumerable: false,
+                    writable: false,
+                    value: cleanupCandidate,
+                });
+            }
+            throw cleanupFailure;
+        }
+    }
     return true;
+}
+
+export async function recoverNoWaitTaskOwnedCandidate(candidate, originalFailure, options = {}) {
+    const failure = originalFailure instanceof Error
+        ? originalFailure
+        : new Error(String(originalFailure));
+    if (failure.code === 'PLOINKY_RECOVERY_ABORT_FAILED') return failure;
+    const attachedDescriptor = Object.getOwnPropertyDescriptor(
+        failure,
+        'ploinkyRestartCandidate',
+    );
+    const attachedCandidate = attachedDescriptor
+        && attachedDescriptor.writable === false
+        && attachedDescriptor.value
+        && typeof attachedDescriptor.value === 'object'
+        && Object.isFrozen(attachedDescriptor.value)
+        ? attachedDescriptor.value
+        : null;
+    const recoveryCandidate = attachedCandidate || candidate;
+    try {
+        await cleanupNoWaitTaskOwnedCandidate(recoveryCandidate, {
+            ...options,
+            originalFailure: failure,
+        });
+        return failure;
+    } catch (recoveryFailure) {
+        if (recoveryFailure?.code === 'PLOINKY_RECOVERY_ABORT_FAILED') {
+            return recoveryFailure;
+        }
+        failure.message = `${failure.message}; exact task-owned runtime cleanup failed: ${recoveryFailure?.message || recoveryFailure}`;
+        const preservedCandidate = recoveryFailure?.ploinkyRestartCandidate || recoveryCandidate;
+        if (preservedCandidate) attachNoWaitRecoveryCandidate(failure, preservedCandidate);
+        return failure;
+    }
 }
 
 function assertNoWaitLifecycleIdentity(active, {
@@ -966,24 +1062,22 @@ async function main() {
         });
         console.log(`[no-wait] ${shortAgent}: launch succeeded (container=${resolvedContainerName}${hostPort ? `, hostPort=${hostPort}` : ''})`);
         } catch (error) {
-            await cleanupNoWaitTaskOwnedCandidate(taskOwnedCandidate);
+            const failure = await recoverNoWaitTaskOwnedCandidate(taskOwnedCandidate, error);
             taskOwnedCandidate = null;
-            throw error;
+            throw failure;
         }
         });
         });
     } catch (err) {
-        const failure = err instanceof Error ? err : new Error(String(err));
-        try {
-            await cleanupNoWaitTaskOwnedCandidate(taskOwnedCandidate);
-        } catch (_) {
-            failure.message = `${failure.message}; exact task-owned runtime cleanup failed`;
-        }
+        let failure = err instanceof Error ? err : new Error(String(err));
+        failure = await recoverNoWaitTaskOwnedCandidate(taskOwnedCandidate, failure);
+        taskOwnedCandidate = null;
         const finishedAtMs = Date.now();
         const finishedAt = new Date(finishedAtMs).toISOString();
         const error = {
             message: failure.message,
-            stack: failure.stack || null
+            stack: failure.stack || null,
+            ...(failure.code ? { code: failure.code } : {}),
         };
         writeStatus(containerName, {
             ...baseStatus,
@@ -993,7 +1087,7 @@ async function main() {
             error
         });
         console.error(`[no-wait] ${shortAgent}: launch failed: ${error.message}`);
-        if (err?.stack) console.error(err.stack);
+        if (failure.stack) console.error(failure.stack);
         process.exit(1);
     }
 }

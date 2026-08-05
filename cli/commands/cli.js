@@ -63,6 +63,7 @@ import {
     cleanupSessionContainers,
     destroyAll,
     killRouterIfRunning,
+    requireRouterStopCompleted,
     shutdownSession,
 } from './sessionControl.js';
 import { handleSsoCommand } from './ssoCommands.js';
@@ -88,6 +89,12 @@ const ENABLE_AGENT_CLI_TOKENS = Object.freeze({
     password: '--password',
 });
 const ENABLE_AGENT_CLI_TOKEN_SET = new Set(Object.values(ENABLE_AGENT_CLI_TOKENS));
+
+function stopExactRouterForLifecycle(label, {
+    stopRouter = killRouterIfRunning,
+} = {}) {
+    return requireRouterStopCompleted(stopRouter(), label);
+}
 
 async function ensureLlmAgentsLoaded() {
     if (!llmAgentsLoadPromise) {
@@ -467,10 +474,10 @@ async function handleCommand(args) {
                 inactivateEdgeRoutingGeneration('cli-router-restart');
                 console.log('[restart] Restarting RoutingServer (containers untouched)...');
                 resolvePersistedRouterPort();
-                killRouterIfRunning();
+                const routerStopResult = stopExactRouterForLifecycle('restart router');
                 await startWorkspace(undefined, undefined, {
                     enableAgent,
-                    killRouterIfRunning: () => { },
+                    killRouterIfRunning: () => routerStopResult,
                 });
                 console.log('[restart] RoutingServer restarted.');
                 break;
@@ -714,7 +721,7 @@ async function handleCommand(args) {
                 resolvePersistedRouterPort();
                 inactivateEdgeRoutingGeneration('cli-workspace-restart');
                 console.log('[restart] Stopping Router and configured agents...');
-                killRouterIfRunning();
+                const routerStopResult = stopExactRouterForLifecycle('restart');
                 console.log('[restart] Stopping configured agent containers...');
                 const list = stopConfiguredAgents();
                 if (list.length) { console.log('[restart] Stopped containers:'); list.forEach(n => console.log(` - ${n}`)); }
@@ -722,7 +729,7 @@ async function handleCommand(args) {
                 console.log('[restart] Starting workspace...');
                 await startWorkspace(undefined, undefined, {
                     enableAgent,
-                    killRouterIfRunning,
+                    killRouterIfRunning: () => routerStopResult,
                 });
                 console.log('[restart] Done.');
             }
@@ -734,7 +741,7 @@ async function handleCommand(args) {
         case 'shutdown': {
             inactivateEdgeRoutingGeneration('cli-workspace-shutdown');
             console.log('[shutdown] Stopping RoutingServer...');
-            killRouterIfRunning();
+            stopExactRouterForLifecycle('shutdown');
             console.log('[shutdown] Removing workspace containers...');
             const list = destroyWorkspaceContainers();
             if (list.length) {
@@ -751,7 +758,7 @@ async function handleCommand(args) {
             }
             inactivateEdgeRoutingGeneration('cli-workspace-stop');
             console.log('[stop] Stopping RoutingServer...');
-            killRouterIfRunning();
+            stopExactRouterForLifecycle('stop');
             console.log('[stop] Stopping configured agent containers...');
             const list = stopConfiguredAgents();
             if (list.length) {
@@ -764,7 +771,7 @@ async function handleCommand(args) {
         case 'destroy':
             inactivateEdgeRoutingGeneration('cli-workspace-destroy');
             console.log('[destroy] Stopping RoutingServer...');
-            killRouterIfRunning();
+            stopExactRouterForLifecycle('destroy');
             console.log('[destroy] Removing all workspace containers...');
             await destroyAll();
             break;
@@ -924,6 +931,7 @@ function disableAllAgents() {
 }
 
 export {
+    stopExactRouterForLifecycle,
     handleCommand,
     getAgentNames,
     getRepoNames,

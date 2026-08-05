@@ -66,6 +66,7 @@ function agentCliHarness({ noTTY = false, endpointError = null } = {}) {
                 events.push(['ready']);
                 return true;
             },
+            withNetworkLifecycleLock: callback => callback(Object.freeze({ test: 'network-lifecycle' })),
             loadAgentsMap: () => ({
                 'nested-explorer': {
                     runtime: 'container',

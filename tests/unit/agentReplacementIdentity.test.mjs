@@ -314,3 +314,51 @@ test('coordinated replacement rejects a missing network capability before mutati
         prepare: () => assert.fail('must reject before generation preparation'),
     }), /network lifecycle capability required/);
 });
+
+test('invalid coordinated replacement propagates abort failure and preserves exact evidence', () => {
+    let registry = { [containerName]: existingRecord() };
+    const inactivations = [];
+    const preparationLease = Object.freeze({ transactionId: 'invalid-identity-preparation' });
+    const abortFailure = new Error('durable abort fsync failed');
+    const networkLifecycleCapability = Object.freeze({ fixture: 'network-capability' });
+    const minted = ['instance-invalid-candidate', 'enable-invalid-candidate'];
+    let abortCalls = 0;
+
+    assert.throws(() => resolveReplacementRuntimeIdentity({
+        containerName,
+        existingRecord: existingRecord(),
+        existingRuntime: true,
+        recreateReason: 'networkContractDrift',
+        networkLifecycleCapability,
+    }, {
+        assertNetworkCapability: (received) => assert.equal(received, networkLifecycleCapability),
+        withApplyLock: (callback) => callback(Object.freeze({})),
+        inactivate: (reason) => inactivations.push(reason),
+        loadRegistry: () => structuredClone(registry),
+        saveRegistry: (value) => { registry = structuredClone(value); },
+        prepare: () => ({
+            selector: { state: 'active' },
+            generation: { agents: structuredClone(registry) },
+            preparationLease,
+        }),
+        abortPreparation(lease, options) {
+            abortCalls += 1;
+            assert.equal(lease, preparationLease);
+            assert.match(options.reason, /identity-mismatch$/);
+            throw abortFailure;
+        },
+        uuid: () => minted.shift(),
+    }), (error) => (
+        error?.code === 'PLOINKY_RECOVERY_ABORT_FAILED'
+        && error.cause === abortFailure
+        && /did not remain inactive/.test(error.originalFailure?.message || '')
+        && Object.isFrozen(error.ploinkyRestartCandidate)
+        && error.ploinkyRestartCandidate?.containerName === containerName
+        && error.ploinkyRestartCandidate?.preparationLease === preparationLease
+        && error.ploinkyRestartCandidate?.preparationAbortFailed === true
+    ));
+
+    assert.equal(abortCalls, 1);
+    assert.equal(inactivations.length, 1, 'abort failure must not trigger fallback inactivation');
+    assert.equal(registry[containerName].instanceId, 'instance-invalid-candidate');
+});
